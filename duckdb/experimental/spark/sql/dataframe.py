@@ -1133,7 +1133,7 @@ class DataFrame:  # noqa: D101
 
             df2 = other.select(
                 *[
-                    spark_sql_functions.col(c) if c in df1.relation.columns else spark_sql_functions.lit(None).alias(c)
+                    spark_sql_functions.col(c) if c in other.relation.columns else spark_sql_functions.lit(None).alias(c)
                     for c in df1.relation.columns
                 ]
             )
