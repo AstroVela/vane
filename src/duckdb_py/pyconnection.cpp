@@ -286,7 +286,8 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      py::arg("extension"), py::kw_only(), py::arg("force_install") = false, py::arg("repository") = py::none(),
 	      py::arg("repository_url") = py::none(), py::arg("version") = py::none());
 	m.def("load_extension", &DuckDBPyConnection::LoadExtension, "Load an installed extension", py::arg("extension"));
-	m.def("get_profiling_information", &DuckDBPyConnection::GetProfilingInformation, "Get profiling information for a query", py::arg("format") = "json");
+	m.def("get_profiling_information", &DuckDBPyConnection::GetProfilingInformation,
+	      "Get profiling information for a query", py::arg("format") = "json");
 	m.def("enable_profiling", &DuckDBPyConnection::EnableProfiling, "Enable profiling for subsequent queries");
 	m.def("disable_profiling", &DuckDBPyConnection::DisableProfiling, "Disable profiling for subsequent queries");
 } // END_OF_CONNECTION_METHODS
@@ -351,7 +352,9 @@ py::str DuckDBPyConnection::GetProfilingInformation(const py::str &format) {
 	} else if (format == "graphviz") {
 		format_enum = ProfilerPrintFormat::GRAPHVIZ;
 	} else {
-		throw InvalidInputException("Invalid ProfilerPrintFormat string: " + std::string(format) + ". Valid options are: query_tree, json, query_tree_optimizer, no_output, html, graphviz.");
+		throw InvalidInputException(
+		    "Invalid ProfilerPrintFormat string: " + std::string(format) +
+		    ". Valid options are: query_tree, json, query_tree_optimizer, no_output, html, graphviz.");
 	}
 	auto &connection = con.GetConnection();
 	py::str profiling_info = connection.GetProfilingInformation(format_enum);

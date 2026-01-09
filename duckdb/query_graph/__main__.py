@@ -264,7 +264,7 @@ strong {
     color: #b3b3b3;
   }
 }
-"""
+"""  # noqa: W293
 
 
 class NodeTiming:  # noqa: D101
@@ -325,8 +325,7 @@ def get_child_timings(top_node: object, query_timings: object, depth: int = 0) -
 
 
 def get_f7fff0_shade_hex(fraction: float) -> str:
-    """
-    Returns a shade between very light (#f7fff0) and a slightly darker green-yellow,
+    """Returns a shade between very light (#f7fff0) and a slightly darker green-yellow,
     depending on the fraction (0..1)
     """
     fraction = max(0, min(1, fraction))
@@ -345,10 +344,8 @@ def get_f7fff0_shade_hex(fraction: float) -> str:
 
 def get_node_body(
     name: str, result: str, cpu_time: float, card: int, est: int, result_size: int, extra_info: str
-) -> str:  # noqa: D103
-    """
-    Generate the HTML body for a single node in the tree.
-    """
+) -> str:
+    """Generate the HTML body for a single node in the tree."""
     node_style = f"background-color: {get_f7fff0_shade_hex(float(result) / cpu_time)};"
     new_name = "BRIDGE" if (name == "INVALID") else name.replace("_", " ")
     formatted_num = f"{float(result):.4f}"
@@ -362,7 +359,7 @@ def get_node_body(
         body += f"<p>estimate: {est}</p>"
         body += f"<p>result size: {result_size} bytes</p>"
     body += "<details>"
-    body += f"<summary>Extra info</summary>"
+    body += "<summary>Extra info</summary>"
     body += '<div class="node-details">'
     body += f"<p>{extra_info}</p>"
     # TODO: Expand on timing. Usually available from a detailed profiling  # noqa: TD002, TD003
@@ -411,6 +408,7 @@ def generate_tree_recursive(json_graph: object, cpu_time: float) -> str:  # noqa
 
 # For generating the table in the top left with expandable phases
 def generate_timing_html(graph_json: object, query_timings: object) -> object:
+    """Generates timing HTML table with expandable phases."""
     json_graph = json.loads(graph_json)
     gather_timing_information(json_graph, query_timings)
     table_head = """
@@ -500,7 +498,7 @@ def generate_metric_grid_html(graph_json: str) -> str:  # noqa: D103
         else "N/A",
     }
     metric_grid_html = """<div class="metrics-grid">"""
-    for key in metrics.keys():
+    for key in metrics:
         metric_grid_html += f"""
         <div class="metric-box">
             <div class="metric-title">{key}</div>

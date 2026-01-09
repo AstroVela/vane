@@ -132,8 +132,8 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    }
 		    return conn->GetProfilingInformation(format);
 	    },
-	    "Get profiling information from a query", py::kw_only(), py::arg("format") = "json", 
-		py::arg("connection") = py::none());
+	    "Get profiling information from a query", py::kw_only(), py::arg("format") = "json",
+	    py::arg("connection") = py::none());
 	m.def(
 	    "enable_profiling",
 	    [](shared_ptr<DuckDBPyConnection> conn = nullptr) {
