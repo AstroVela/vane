@@ -95,6 +95,23 @@ tbody tr:hover {
   background: var(--doc-codebox-border-color);
 }
 
+tbody tr.phase-details-row {
+  border-bottom: none;
+}
+
+tbody tr.phase-details-row:hover {
+  background: transparent;
+}
+
+tbody tr.phase-details-row details summary {
+  font-size: 12px;
+  padding: 4px 0;
+}
+
+tbody tr.phase-details-row details[open] summary {
+  margin-bottom: 4px;
+}
+
 /* === Chart/Card Section === */
 .chart {
   padding: 20px;
@@ -242,6 +259,7 @@ strong {
     color: #1a1a1a !important;
   }
   
+  /* Fix metric title visibility in dark mode */
   .chart .metric-title {
     color: #b3b3b3;
   }
@@ -315,7 +333,7 @@ def get_f7fff0_shade_hex(fraction: float) -> str:
 
     # Define RGB for light and dark end
     light_color = (247, 255, 240)  # #f7fff0
-    dark_color = (200, 255, 150)   # slightly darker/more saturated green-yellow
+    dark_color = (200, 255, 150)  # slightly darker/more saturated green-yellow
 
     # Interpolate RGB channels
     r = int(light_color[0] + (dark_color[0] - light_color[0]) * fraction)
@@ -325,7 +343,9 @@ def get_f7fff0_shade_hex(fraction: float) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
-def get_node_body(name: str, result: str, cpu_time: float, card: int, est: int, result_size: int, extra_info: str) -> str:  # noqa: D103
+def get_node_body(
+    name: str, result: str, cpu_time: float, card: int, est: int, result_size: int, extra_info: str
+) -> str:  # noqa: D103
     """
     Generate the HTML body for a single node in the tree.
     """
@@ -389,8 +409,8 @@ def generate_tree_recursive(json_graph: object, cpu_time: float) -> str:  # noqa
     return node_prefix_html + node_body + children_html + node_suffix_html
 
 
-# For generating the table in the top left.
-def generate_timing_html(graph_json: object, query_timings: object) -> object:  # noqa: D103
+# For generating the table in the top left with expandable phases
+def generate_timing_html(graph_json: object, query_timings: object) -> object:
     json_graph = json.loads(graph_json)
     gather_timing_information(json_graph, query_timings)
     table_head = """
@@ -411,10 +431,13 @@ def generate_timing_html(graph_json: object, query_timings: object) -> object:  
     all_phases = query_timings.get_phases()
     query_timings.add_node_timing(NodeTiming("Execution Time (CPU)", execution_time, None))
     all_phases = ["Execution Time (CPU)", *all_phases]
+
     for phase in all_phases:
         summarized_phase = query_timings.get_summary_phase_timings(phase)
         summarized_phase.calculate_percentage(execution_time)
         phase_column = f"<b>{phase}</b>" if phase == "Execution Time (CPU)" else phase
+
+        # Main phase row
         table_body += f"""
 	<tr>
 			<td>{phase_column}</td>
@@ -422,17 +445,59 @@ def generate_timing_html(graph_json: object, query_timings: object) -> object:  
             <td>{str(summarized_phase.percentage * 100)[:6]}%</td>
     </tr>
 """
+
+        # Add expandable details for individual nodes (except for Execution Time)
+        if phase != "Execution Time (CPU)":
+            phase_timings = query_timings.get_phase_timings(phase)
+            if len(phase_timings) > 1:  # Only show details if there are multiple nodes
+                table_body += f"""
+    <tr class="phase-details-row">
+        <td colspan="3">
+            <details>
+                <summary style="cursor: pointer; padding: 4px 0; color: var(--text-secondary-color);">
+                    Show {len(phase_timings)} nodes
+                </summary>
+                <table style="margin: 8px 0; width: 100%; border: none; box-shadow: none;">
+                    <tbody>
+"""
+                for node_timing in sorted(phase_timings, key=lambda x: x.time, reverse=True):
+                    node_timing.calculate_percentage(execution_time)
+                    depth_indent = "&nbsp;" * (node_timing.depth * 4)
+                    table_body += f"""
+                        <tr style="background: var(--doc-codebox-background-color);">
+                            <td style="padding: 4px 12px; border: none;">{depth_indent}↳ Depth {node_timing.depth}</td>
+                            <td style="padding: 4px 12px; border: none;">{round(node_timing.time, 8)}</td>
+                            <td style="padding: 4px 12px; border: none;">{str(node_timing.percentage * 100)[:6]}%</td>
+                        </tr>
+"""
+                table_body += """
+                    </tbody>
+                </table>
+            </details>
+        </td>
+    </tr>
+"""
+
     table_body += table_end
     return table_head + table_body
+
 
 def generate_metric_grid_html(graph_json: str) -> str:  # noqa: D103
     json_graph = json.loads(graph_json)
     metrics = {
-        "Execution Time (s)": f"{float(json_graph.get("latency", "N/A")):.4f}",
-        "Total GB Read": f"{float(json_graph.get("total_bytes_read", "N/A")) / (1024 ** 3):.4f}" if json_graph.get("total_bytes_read", "N/A") != "N/A" else "N/A",
-        "Total GB Written": f"{float(json_graph.get("total_bytes_written", "N/A")) / (1024 ** 3):.4f}" if json_graph.get("total_bytes_written", "N/A") != "N/A" else "N/A",
-        "Peak Memory (GB)": f"{float(json_graph.get("system_peak_buffer_memory", "N/A")) / (1024 ** 3):.4f}" if json_graph.get("system_peak_buffer_memory", "N/A") != "N/A" else "N/A",
-        "Rows Scanned": f"{json_graph.get("cumulative_rows_scanned", "N/A"):,}" if json_graph.get("cumulative_rows_scanned", "N/A") != "N/A" else "N/A",
+        "Execution Time (s)": f"{float(json_graph.get('latency', 'N/A')):.4f}",
+        "Total GB Read": f"{float(json_graph.get('total_bytes_read', 'N/A')) / (1024**3):.4f}"
+        if json_graph.get("total_bytes_read", "N/A") != "N/A"
+        else "N/A",
+        "Total GB Written": f"{float(json_graph.get('total_bytes_written', 'N/A')) / (1024**3):.4f}"
+        if json_graph.get("total_bytes_written", "N/A") != "N/A"
+        else "N/A",
+        "Peak Memory (GB)": f"{float(json_graph.get('system_peak_buffer_memory', 'N/A')) / (1024**3):.4f}"
+        if json_graph.get("system_peak_buffer_memory", "N/A") != "N/A"
+        else "N/A",
+        "Rows Scanned": f"{json_graph.get('cumulative_rows_scanned', 'N/A'):,}"
+        if json_graph.get("cumulative_rows_scanned", "N/A") != "N/A"
+        else "N/A",
     }
     metric_grid_html = """<div class="metrics-grid">"""
     for key in metrics.keys():
@@ -444,6 +509,7 @@ def generate_metric_grid_html(graph_json: str) -> str:  # noqa: D103
         """
     metric_grid_html += "</div>"
     return metric_grid_html
+
 
 def generate_sql_query_html(graph_json: str) -> str:  # noqa: D103
     json_graph = json.loads(graph_json)
@@ -458,6 +524,7 @@ def generate_sql_query_html(graph_json: str) -> str:  # noqa: D103
     </details><br>
     """
     return sql_html
+
 
 def generate_tree_html(graph_json: object) -> str:  # noqa: D103
     json_graph = json.loads(graph_json)
@@ -485,9 +552,7 @@ def generate_ipython(json_input: str) -> str:  # noqa: D103
 
 def generate_style_html(graph_json: str, include_meta_info: bool) -> None:  # noqa: D103, FBT001
     treeflex_css = '<link rel="stylesheet" href="https://unpkg.com/treeflex/dist/css/treeflex.css">\n'
-    libraries = (
-        '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">\n'
-    )
+    libraries = '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">\n'
     return {"treeflex_css": treeflex_css, "duckdb_css": qgraph_css, "libraries": libraries, "chart_script": ""}
 
 
