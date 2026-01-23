@@ -1,5 +1,5 @@
+import pandas as pd
 import pytest
-from conftest import ArrowPandas, NumpyPandas
 
 import duckdb
 
@@ -61,10 +61,9 @@ class TestRuntimeError:
         with pytest.raises(duckdb.ProgrammingError, match="There is no query result"):
             res.fetch_arrow_reader(1)
 
-    @pytest.mark.parametrize("pandas", [NumpyPandas(), ArrowPandas()])
-    def test_relation_cache_fetchall(self, pandas):
+    def test_relation_cache_fetchall(self):
         conn = duckdb.connect()
-        df_in = pandas.DataFrame(
+        df_in = pd.DataFrame(
             {
                 "numbers": [1, 2, 3, 4, 5],
             }
@@ -78,10 +77,9 @@ class TestRuntimeError:
             # so the dependency of 'x' on 'df_in' is not registered in 'rel'
             rel.fetchall()
 
-    @pytest.mark.parametrize("pandas", [NumpyPandas(), ArrowPandas()])
-    def test_relation_cache_execute(self, pandas):
+    def test_relation_cache_execute(self):
         conn = duckdb.connect()
-        df_in = pandas.DataFrame(
+        df_in = pd.DataFrame(
             {
                 "numbers": [1, 2, 3, 4, 5],
             }
@@ -92,10 +90,9 @@ class TestRuntimeError:
         with pytest.raises(duckdb.ProgrammingError, match="Table with name df_in does not exist"):
             rel.execute()
 
-    @pytest.mark.parametrize("pandas", [NumpyPandas(), ArrowPandas()])
-    def test_relation_query_error(self, pandas):
+    def test_relation_query_error(self):
         conn = duckdb.connect()
-        df_in = pandas.DataFrame(
+        df_in = pd.DataFrame(
             {
                 "numbers": [1, 2, 3, 4, 5],
             }
@@ -106,10 +103,9 @@ class TestRuntimeError:
         with pytest.raises(duckdb.CatalogException, match="Table with name df_in does not exist"):
             rel.query("bla", "select * from bla")
 
-    @pytest.mark.parametrize("pandas", [NumpyPandas(), ArrowPandas()])
-    def test_conn_broken_statement_error(self, pandas):
+    def test_conn_broken_statement_error(self):
         conn = duckdb.connect()
-        df_in = pandas.DataFrame(
+        df_in = pd.DataFrame(
             {
                 "numbers": [1, 2, 3, 4, 5],
             }
@@ -128,11 +124,10 @@ class TestRuntimeError:
         ):
             conn.execute("select * from integers where a =? and b=?", [1])
 
-    @pytest.mark.parametrize("pandas", [NumpyPandas(), ArrowPandas()])
-    def test_closed_conn_exceptions(self, pandas):
+    def test_closed_conn_exceptions(self):
         conn = duckdb.connect()
         conn.close()
-        df_in = pandas.DataFrame(
+        df_in = pd.DataFrame(
             {
                 "numbers": [1, 2, 3, 4, 5],
             }

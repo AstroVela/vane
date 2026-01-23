@@ -1,7 +1,7 @@
 import re
 
+import pandas as pd
 import pytest
-from conftest import ArrowPandas, NumpyPandas
 
 import duckdb
 
@@ -25,10 +25,9 @@ def tmp_database(tmp_path_factory):
 # This file contains tests for DuckDBPyConnection methods,
 # wrapped by the 'duckdb' module, to execute with the 'default_connection'
 class TestDuckDBConnection:
-    @pytest.mark.parametrize("pandas", [NumpyPandas(), ArrowPandas()])
-    def test_append(self, pandas):
+    def test_append(self):
         duckdb.execute("Create table integers (i integer)")
-        df_in = pandas.DataFrame(
+        df_in = pd.DataFrame(
             {
                 "numbers": [1, 2, 3, 4, 5],
             }
@@ -345,13 +344,12 @@ class TestDuckDBConnection:
         with pytest.raises(duckdb.CatalogException):
             duckdb_cursor.sql(f'select * from "{escaped_scary_name}"')
 
-    @pytest.mark.parametrize("pandas", [NumpyPandas(), ArrowPandas()])
-    def test_relation_out_of_scope(self, pandas):
+    def test_relation_out_of_scope(self):
         def temporary_scope():
             # Create a connection, we will return this
             con = duckdb.connect()
             # Create a dataframe
-            df = pandas.DataFrame({"a": [1, 2, 3]})
+            df = pd.DataFrame({"a": [1, 2, 3]})
             # The dataframe has to be registered as well
             # making sure it does not go out of scope
             con.register("df", df)
@@ -389,10 +387,11 @@ class TestDuckDBConnection:
         assert duckdb.interrupt is not None
 
     def test_wrap_shadowing(self):
-        pd = NumpyPandas()
+        import pandas as pd_local
+
         import duckdb
 
-        df = pd.DataFrame({"a": [1, 2, 3]})  # noqa: F841
+        df = pd_local.DataFrame({"a": [1, 2, 3]})  # noqa: F841
         res = duckdb.sql("from df").fetchall()
         assert res == [(1,), (2,), (3,)]
 

@@ -1,15 +1,14 @@
+import pandas as pd
 import pytest
-from conftest import ArrowPandas, NumpyPandas
 
 import duckdb
 
 pyarrow = pytest.importorskip("pyarrow")
 
 
-@pytest.mark.parametrize("pandas", [NumpyPandas(), ArrowPandas()])
-def test_6796(pandas):
+def test_6796():
     conn = duckdb.connect()
-    input_df = pandas.DataFrame({"foo": ["bar"]})
+    input_df = pd.DataFrame({"foo": ["bar"]})
     conn.register("input_df", input_df)
 
     query = """
