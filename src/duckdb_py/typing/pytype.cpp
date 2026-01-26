@@ -122,7 +122,13 @@ static LogicalType FromString(const string &type_str, shared_ptr<DuckDBPyConnect
 		pycon = DuckDBPyConnection::DefaultConnection();
 	}
 	auto &connection = pycon->con.GetConnection();
-	return TransformStringToLogicalType(type_str, *connection.context);
+	if (connection.HasActiveTransaction()) {
+		return TransformStringToLogicalType(type_str, *connection.context);
+	}
+	connection.BeginTransaction();
+	auto type = TransformStringToLogicalType(type_str, *connection.context);
+	connection.Commit();
+	return type;
 }
 
 static bool FromNumpyType(const py::object &type, LogicalType &result) {
