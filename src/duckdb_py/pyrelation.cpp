@@ -134,7 +134,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::ProjectFromTypes(const py::object
 			auto *type_p = item.cast<DuckDBPyType *>();
 			type = type_p->Type();
 		} else {
-			string actual_type = py::str(item.get_type());
+			string actual_type = py::str(py::type::of(item));
 			throw InvalidInputException("Can only project on objects of type DuckDBPyType or str, not '%s'",
 			                            actual_type);
 		}
@@ -219,7 +219,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Sort(const py::args &args) {
 	for (auto arg : args) {
 		shared_ptr<DuckDBPyExpression> py_expr;
 		if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(arg, py_expr)) {
-			string actual_type = py::str(arg.get_type());
+			string actual_type = py::str(py::type::of(arg));
 			throw InvalidInputException("Expected argument of type Expression, received '%s' instead", actual_type);
 		}
 		auto expr = py_expr->GetExpression().Copy();
@@ -248,7 +248,7 @@ vector<unique_ptr<ParsedExpression>> GetExpressions(ClientContext &context, cons
 		auto aggregate_list = std::string(py::str(expr));
 		return Parser::ParseExpressionList(aggregate_list, context.GetParserOptions());
 	} else {
-		string actual_type = py::str(expr.get_type());
+		string actual_type = py::str(py::type::of(expr));
 		throw InvalidInputException("Please provide either a string or list of Expression objects, not %s",
 		                            actual_type);
 	}
@@ -1183,7 +1183,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Join(DuckDBPyRelation *other, con
 		auto using_list_p = py::list(condition);
 		for (auto &item : using_list_p) {
 			if (!py::isinstance<py::str>(item)) {
-				string actual_type = py::str(item.get_type());
+				string actual_type = py::str(py::type::of(item));
 				throw InvalidInputException("Using clause should be a list of strings, not %s", actual_type);
 			}
 			using_list.push_back(std::string(py::str(item)));
@@ -1594,7 +1594,7 @@ void DuckDBPyRelation::Update(const py::object &set_p, const py::object &where) 
 		}
 		shared_ptr<DuckDBPyExpression> py_expr;
 		if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(item_value, py_expr)) {
-			string actual_type = py::str(item_value.get_type());
+			string actual_type = py::str(py::type::of(item_value));
 			throw InvalidInputException("Please provide an object of type Expression as the value, not %s",
 			                            actual_type);
 		}

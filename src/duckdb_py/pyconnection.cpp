@@ -755,7 +755,7 @@ static void ParseMultiFileOptions(named_parameter_map_t &options, const Optional
 
 	if (!py::none().is(hive_partitioning)) {
 		if (!py::isinstance<py::bool_>(hive_partitioning)) {
-			string actual_type = py::str(hive_partitioning.get_type());
+			string actual_type = py::str(py::type::of(hive_partitioning));
 			throw BinderException("read_json only accepts 'hive_partitioning' as a boolean, not '%s'", actual_type);
 		}
 		auto val = TransformPythonValue(hive_partitioning, LogicalTypeId::BOOLEAN);
@@ -764,7 +764,7 @@ static void ParseMultiFileOptions(named_parameter_map_t &options, const Optional
 
 	if (!py::none().is(union_by_name)) {
 		if (!py::isinstance<py::bool_>(union_by_name)) {
-			string actual_type = py::str(union_by_name.get_type());
+			string actual_type = py::str(py::type::of(union_by_name));
 			throw BinderException("read_json only accepts 'union_by_name' as a boolean, not '%s'", actual_type);
 		}
 		auto val = TransformPythonValue(union_by_name, LogicalTypeId::BOOLEAN);
@@ -773,7 +773,7 @@ static void ParseMultiFileOptions(named_parameter_map_t &options, const Optional
 
 	if (!py::none().is(hive_types_autocast)) {
 		if (!py::isinstance<py::bool_>(hive_types_autocast)) {
-			string actual_type = py::str(hive_types_autocast.get_type());
+			string actual_type = py::str(py::type::of(hive_types_autocast));
 			throw BinderException("read_json only accepts 'hive_types_autocast' as a boolean, not '%s'", actual_type);
 		}
 		auto val = TransformPythonValue(hive_types_autocast, LogicalTypeId::BOOLEAN);
@@ -812,11 +812,11 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
 			auto &column_name = kv.first;
 			auto &type = kv.second;
 			if (!py::isinstance<py::str>(column_name)) {
-				string actual_type = py::str(column_name.get_type());
+				string actual_type = py::str(py::type::of(column_name));
 				throw BinderException("The provided column name must be a str, not of type '%s'", actual_type);
 			}
 			if (!py::isinstance<py::str>(type)) {
-				string actual_type = py::str(column_name.get_type());
+				string actual_type = py::str(py::type::of(column_name));
 				throw BinderException("The provided column type must be a str, not of type '%s'", actual_type);
 			}
 			struct_fields.emplace_back(py::str(column_name), Value(py::str(type)));
@@ -827,7 +827,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
 
 	if (!py::none().is(records)) {
 		if (!py::isinstance<py::str>(records)) {
-			string actual_type = py::str(records.get_type());
+			string actual_type = py::str(py::type::of(records));
 			throw BinderException("read_json only accepts 'records' as a string, not '%s'", actual_type);
 		}
 		auto records_s = py::reinterpret_borrow<py::str>(records);
@@ -837,7 +837,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
 
 	if (!py::none().is(format)) {
 		if (!py::isinstance<py::str>(format)) {
-			string actual_type = py::str(format.get_type());
+			string actual_type = py::str(py::type::of(format));
 			throw BinderException("read_json only accepts 'format' as a string, not '%s'", actual_type);
 		}
 		auto format_s = py::reinterpret_borrow<py::str>(format);
@@ -847,7 +847,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
 
 	if (!py::none().is(date_format)) {
 		if (!py::isinstance<py::str>(date_format)) {
-			string actual_type = py::str(date_format.get_type());
+			string actual_type = py::str(py::type::of(date_format));
 			throw BinderException("read_json only accepts 'date_format' as a string, not '%s'", actual_type);
 		}
 		auto date_format_s = py::reinterpret_borrow<py::str>(date_format);
@@ -857,7 +857,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
 
 	if (!py::none().is(timestamp_format)) {
 		if (!py::isinstance<py::str>(timestamp_format)) {
-			string actual_type = py::str(timestamp_format.get_type());
+			string actual_type = py::str(py::type::of(timestamp_format));
 			throw BinderException("read_json only accepts 'timestamp_format' as a string, not '%s'", actual_type);
 		}
 		auto timestamp_format_s = py::reinterpret_borrow<py::str>(timestamp_format);
@@ -867,7 +867,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
 
 	if (!py::none().is(compression)) {
 		if (!py::isinstance<py::str>(compression)) {
-			string actual_type = py::str(compression.get_type());
+			string actual_type = py::str(py::type::of(compression));
 			throw BinderException("read_json only accepts 'compression' as a string, not '%s'", actual_type);
 		}
 		auto compression_s = py::reinterpret_borrow<py::str>(compression);
@@ -877,7 +877,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
 
 	if (!py::none().is(sample_size)) {
 		if (!py::isinstance<py::int_>(sample_size)) {
-			string actual_type = py::str(sample_size.get_type());
+			string actual_type = py::str(py::type::of(sample_size));
 			throw BinderException("read_json only accepts 'sample_size' as an integer, not '%s'", actual_type);
 		}
 		options["sample_size"] = Value::INTEGER(py::int_(sample_size));
@@ -885,7 +885,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
 
 	if (!py::none().is(maximum_depth)) {
 		if (!py::isinstance<py::int_>(maximum_depth)) {
-			string actual_type = py::str(maximum_depth.get_type());
+			string actual_type = py::str(py::type::of(maximum_depth));
 			throw BinderException("read_json only accepts 'maximum_depth' as an integer, not '%s'", actual_type);
 		}
 		options["maximum_depth"] = Value::INTEGER(py::int_(maximum_depth));
@@ -893,7 +893,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
 
 	if (!py::none().is(maximum_object_size)) {
 		if (!py::isinstance<py::int_>(maximum_object_size)) {
-			string actual_type = py::str(maximum_object_size.get_type());
+			string actual_type = py::str(py::type::of(maximum_object_size));
 			throw BinderException("read_json only accepts 'maximum_object_size' as an unsigned integer, not '%s'",
 			                      actual_type);
 		}
@@ -903,7 +903,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
 
 	if (!py::none().is(ignore_errors)) {
 		if (!py::isinstance<py::bool_>(ignore_errors)) {
-			string actual_type = py::str(ignore_errors.get_type());
+			string actual_type = py::str(py::type::of(ignore_errors));
 			throw BinderException("read_json only accepts 'ignore_errors' as a boolean, not '%s'", actual_type);
 		}
 		auto val = TransformPythonValue(ignore_errors, LogicalTypeId::BOOLEAN);
@@ -912,7 +912,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
 
 	if (!py::none().is(convert_strings_to_integers)) {
 		if (!py::isinstance<py::bool_>(convert_strings_to_integers)) {
-			string actual_type = py::str(convert_strings_to_integers.get_type());
+			string actual_type = py::str(py::type::of(convert_strings_to_integers));
 			throw BinderException("read_json only accepts 'convert_strings_to_integers' as a boolean, not '%s'",
 			                      actual_type);
 		}
@@ -922,7 +922,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
 
 	if (!py::none().is(field_appearance_threshold)) {
 		if (!py::isinstance<py::float_>(field_appearance_threshold)) {
-			string actual_type = py::str(field_appearance_threshold.get_type());
+			string actual_type = py::str(py::type::of(field_appearance_threshold));
 			throw BinderException("read_json only accepts 'field_appearance_threshold' as a float, not '%s'",
 			                      actual_type);
 		}
@@ -932,7 +932,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
 
 	if (!py::none().is(map_inference_threshold)) {
 		if (!py::isinstance<py::int_>(map_inference_threshold)) {
-			string actual_type = py::str(map_inference_threshold.get_type());
+			string actual_type = py::str(py::type::of(map_inference_threshold));
 			throw BinderException("read_json only accepts 'map_inference_threshold' as an integer, not '%s'",
 			                      actual_type);
 		}
@@ -942,7 +942,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
 
 	if (!py::none().is(maximum_sample_files)) {
 		if (!py::isinstance<py::int_>(maximum_sample_files)) {
-			string actual_type = py::str(maximum_sample_files.get_type());
+			string actual_type = py::str(py::type::of(maximum_sample_files));
 			throw BinderException("read_json only accepts 'maximum_sample_files' as an integer, not '%s'", actual_type);
 		}
 		auto val = TransformPythonValue(maximum_sample_files, LogicalTypeId::BIGINT);
@@ -1395,7 +1395,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 	if (!py::none().is(lineterminator)) {
 		PythonCSVLineTerminator::Type new_line_type;
 		if (!py::try_cast<PythonCSVLineTerminator::Type>(lineterminator, new_line_type)) {
-			string actual_type = py::str(lineterminator.get_type());
+			string actual_type = py::str(py::type::of(lineterminator));
 			throw BinderException("read_csv only accepts 'lineterminator' as a string or CSVLineTerminator, not '%s'",
 			                      actual_type);
 		}
@@ -1404,7 +1404,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 
 	if (!py::none().is(max_line_size)) {
 		if (!py::isinstance<py::str>(max_line_size) && !py::isinstance<py::int_>(max_line_size)) {
-			string actual_type = py::str(max_line_size.get_type());
+			string actual_type = py::str(py::type::of(max_line_size));
 			throw BinderException("read_csv only accepts 'max_line_size' as a string or an integer, not '%s'",
 			                      actual_type);
 		}
@@ -1414,7 +1414,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 
 	if (!py::none().is(auto_type_candidates)) {
 		if (!py::isinstance<py::list>(auto_type_candidates)) {
-			string actual_type = py::str(auto_type_candidates.get_type());
+			string actual_type = py::str(py::type::of(auto_type_candidates));
 			throw BinderException("read_csv only accepts 'auto_type_candidates' as a list[str], not '%s'", actual_type);
 		}
 		auto val = TransformPythonValue(auto_type_candidates, LogicalType::LIST(LogicalTypeId::VARCHAR));
@@ -1423,7 +1423,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 
 	if (!py::none().is(ignore_errors)) {
 		if (!py::isinstance<py::bool_>(ignore_errors)) {
-			string actual_type = py::str(ignore_errors.get_type());
+			string actual_type = py::str(py::type::of(ignore_errors));
 			throw BinderException("read_csv only accepts 'ignore_errors' as a bool, not '%s'", actual_type);
 		}
 		auto val = TransformPythonValue(ignore_errors, LogicalTypeId::BOOLEAN);
@@ -1432,7 +1432,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 
 	if (!py::none().is(store_rejects)) {
 		if (!py::isinstance<py::bool_>(store_rejects)) {
-			string actual_type = py::str(store_rejects.get_type());
+			string actual_type = py::str(py::type::of(store_rejects));
 			throw BinderException("read_csv only accepts 'store_rejects' as a bool, not '%s'", actual_type);
 		}
 		auto val = TransformPythonValue(store_rejects, LogicalTypeId::BOOLEAN);
@@ -1441,7 +1441,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 
 	if (!py::none().is(rejects_table)) {
 		if (!py::isinstance<py::str>(rejects_table)) {
-			string actual_type = py::str(rejects_table.get_type());
+			string actual_type = py::str(py::type::of(rejects_table));
 			throw BinderException("read_csv only accepts 'rejects_table' as a string, not '%s'", actual_type);
 		}
 		auto val = TransformPythonValue(rejects_table, LogicalTypeId::VARCHAR);
@@ -1450,7 +1450,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 
 	if (!py::none().is(rejects_scan)) {
 		if (!py::isinstance<py::str>(rejects_scan)) {
-			string actual_type = py::str(rejects_scan.get_type());
+			string actual_type = py::str(py::type::of(rejects_scan));
 			throw BinderException("read_csv only accepts 'rejects_scan' as a string, not '%s'", actual_type);
 		}
 		auto val = TransformPythonValue(rejects_scan, LogicalTypeId::VARCHAR);
@@ -1459,7 +1459,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 
 	if (!py::none().is(rejects_limit)) {
 		if (!py::isinstance<py::int_>(rejects_limit)) {
-			string actual_type = py::str(rejects_limit.get_type());
+			string actual_type = py::str(py::type::of(rejects_limit));
 			throw BinderException("read_csv only accepts 'rejects_limit' as an int, not '%s'", actual_type);
 		}
 		auto val = TransformPythonValue(rejects_limit, LogicalTypeId::BIGINT);
@@ -1468,7 +1468,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 
 	if (!py::none().is(force_not_null)) {
 		if (!py::isinstance<py::list>(force_not_null)) {
-			string actual_type = py::str(force_not_null.get_type());
+			string actual_type = py::str(py::type::of(force_not_null));
 			throw BinderException("read_csv only accepts 'force_not_null' as a list[str], not '%s'", actual_type);
 		}
 		auto val = TransformPythonValue(force_not_null, LogicalType::LIST(LogicalTypeId::VARCHAR));
@@ -1477,7 +1477,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 
 	if (!py::none().is(buffer_size)) {
 		if (!py::isinstance<py::int_>(buffer_size)) {
-			string actual_type = py::str(buffer_size.get_type());
+			string actual_type = py::str(py::type::of(buffer_size));
 			throw BinderException("read_csv only accepts 'buffer_size' as a list[str], not '%s'", actual_type);
 		}
 		auto val = TransformPythonValue(buffer_size, LogicalTypeId::UBIGINT);
@@ -1486,7 +1486,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 
 	if (!py::none().is(decimal)) {
 		if (!py::isinstance<py::str>(decimal)) {
-			string actual_type = py::str(decimal.get_type());
+			string actual_type = py::str(py::type::of(decimal));
 			throw BinderException("read_csv only accepts 'decimal' as a string, not '%s'", actual_type);
 		}
 		auto val = TransformPythonValue(decimal, LogicalTypeId::VARCHAR);
@@ -1495,7 +1495,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 
 	if (!py::none().is(allow_quoted_nulls)) {
 		if (!py::isinstance<py::bool_>(allow_quoted_nulls)) {
-			string actual_type = py::str(allow_quoted_nulls.get_type());
+			string actual_type = py::str(py::type::of(allow_quoted_nulls));
 			throw BinderException("read_csv only accepts 'allow_quoted_nulls' as a bool, not '%s'", actual_type);
 		}
 		auto val = TransformPythonValue(allow_quoted_nulls, LogicalTypeId::BOOLEAN);
@@ -1513,11 +1513,11 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 			auto &column_name = kv.first;
 			auto &type = kv.second;
 			if (!py::isinstance<py::str>(column_name)) {
-				string actual_type = py::str(column_name.get_type());
+				string actual_type = py::str(py::type::of(column_name));
 				throw BinderException("The provided column name must be a str, not of type '%s'", actual_type);
 			}
 			if (!py::isinstance<py::str>(type)) {
-				string actual_type = py::str(column_name.get_type());
+				string actual_type = py::str(py::type::of(column_name));
 				throw BinderException("The provided column type must be a str, not of type '%s'", actual_type);
 			}
 			struct_fields.emplace_back(py::str(column_name), Value(py::str(type)));
@@ -1671,7 +1671,7 @@ static vector<vector<unique_ptr<ParsedExpression>>> ValueListsFromTuples(const p
 	for (idx_t i = 0; i < arg_count; i++) {
 		py::handle arg = tuples[i];
 		if (!py::isinstance<py::tuple>(arg)) {
-			string actual_type = py::str(arg.get_type());
+			string actual_type = py::str(py::type::of(arg));
 			throw InvalidInputException("Expected objects of type tuple, not %s", actual_type);
 		}
 		auto expressions = py::cast<py::args>(arg);
@@ -1794,7 +1794,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromArrow(py::object &arrow_obj
 	auto &connection = con.GetConnection();
 	string name = "arrow_object_" + StringUtil::GenerateRandomName();
 	if (!IsAcceptedArrowObject(arrow_object)) {
-		auto py_object_type = string(py::str(arrow_object.get_type().attr("__name__")));
+		auto py_object_type = string(py::str(py::type::of(arrow_object).attr("__name__")));
 		throw InvalidInputException("Python Object Type %s is not an accepted Arrow Object.", py_object_type);
 	}
 	auto tableref = PythonReplacementScan::ReplacementObject(arrow_object, name, *connection.context, true);
@@ -2180,7 +2180,7 @@ static string GetPathString(const py::object &path) {
 	if (is_path || py::isinstance<py::str>(path)) {
 		return std::string(py::str(path));
 	}
-	string actual_type = py::str(path.get_type());
+	string actual_type = py::str(py::type::of(path));
 	throw InvalidInputException("Please provide either a str or a pathlib.Path, not %s", actual_type);
 }
 

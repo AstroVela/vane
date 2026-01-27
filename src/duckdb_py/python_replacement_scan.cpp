@@ -80,7 +80,7 @@ static void CreateArrowScan(const string &name, py::object entry, TableFunctionR
 
 static void ThrowScanFailureError(const py::object &entry, const string &name, const string &location = "") {
 	string error;
-	auto py_object_type = string(py::str(entry.get_type().attr("__name__")));
+	auto py_object_type = string(py::str(py::type::of(entry).attr("__name__")));
 	error += StringUtil::Format("Python Object \"%s\" of type \"%s\"", name, py_object_type);
 	if (!location.empty()) {
 		error += StringUtil::Format(" found on line \"%s\"", location);

@@ -332,20 +332,23 @@ static scalar_function_t CreateNativeFunction(PyObject *function, PythonExceptio
 				ret = py::reinterpret_steal<py::object>(PyObject_CallObject(function, nullptr));
 			}
 
-			if (ret == nullptr && PyErr_Occurred()) {
-				if (exception_handling == PythonExceptionHandling::FORWARD_ERROR) {
-					auto exception = py::error_already_set();
-					throw InvalidInputException("Python exception occurred while executing the UDF: %s",
-					                            exception.what());
-				} else if (exception_handling == PythonExceptionHandling::RETURN_NULL) {
-					PyErr_Clear();
-					FlatVector::SetNull(result, row, true);
-					continue;
-				} else {
+			if (!ret || ret.is_none()) {
+				if (PyErr_Occurred()) {
+					if (exception_handling == PythonExceptionHandling::FORWARD_ERROR) {
+						auto exception = py::error_already_set();
+						throw InvalidInputException("Python exception occurred while executing the UDF: %s",
+						                            exception.what());
+					}
+					if (exception_handling == PythonExceptionHandling::RETURN_NULL) {
+						PyErr_Clear();
+						FlatVector::SetNull(result, row, true);
+						continue;
+					}
 					throw NotImplementedException("Exception handling type not implemented");
 				}
-			} else if ((!ret || ret == Py_None) && default_null_handling) {
-				throw InvalidInputException(NullHandlingError());
+				if (default_null_handling) {
+					throw InvalidInputException(NullHandlingError());
+				}
 			}
 			TransformPythonObject(ret, result, row);
 		}

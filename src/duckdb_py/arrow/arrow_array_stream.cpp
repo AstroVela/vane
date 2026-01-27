@@ -109,7 +109,7 @@ unique_ptr<ArrowArrayStreamWrapper> PythonTableArrowArrayStreamFactory::Produce(
 		break;
 	}
 	default: {
-		auto py_object_type = string(py::str(arrow_obj_handle.get_type().attr("__name__")));
+		auto py_object_type = string(py::str(py::type::of(arrow_obj_handle).attr("__name__")));
 		throw InvalidInputException("Object of type '%s' is not a recognized Arrow object", py_object_type);
 	}
 	}

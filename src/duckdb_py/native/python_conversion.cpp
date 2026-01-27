@@ -606,7 +606,7 @@ struct PythonValueConversion {
 			auto type = ele.attr("type");
 			shared_ptr<DuckDBPyType> internal_type;
 			if (!py::try_cast<shared_ptr<DuckDBPyType>>(type, internal_type)) {
-				string actual_type = py::str(type.get_type());
+				string actual_type = py::str(py::type::of(type));
 				throw InvalidInputException("The 'type' of a Value should be of type DuckDBPyType, not '%s'",
 				                            actual_type);
 			}
@@ -1062,7 +1062,7 @@ void TransformPythonObjectInternal(py::handle ele, A &result, const B &param, bo
 	}
 	case PythonObjectType::Other:
 		throw NotImplementedException("Unable to transform python value of type '%s' to DuckDB LogicalType",
-		                              py::str(ele.get_type()).cast<string>());
+		                              py::str(py::type::of(ele)).cast<string>());
 	default:
 		throw InternalException("Object type recognized but not implemented!");
 	}
