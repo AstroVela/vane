@@ -122,11 +122,14 @@ class TestMap:
                 dates = x["date"].to_numpy("datetime64[us]")
                 days = x["days_to_add"].to_numpy("int")
                 x["result1"] = pd.Series(
-                    [pd.to_datetime(y[0]).date() + timedelta(days=y[1].item()) for y in zip(dates, days)],
+                    [pd.to_datetime(y[0]).date() + timedelta(days=y[1].item()) for y in zip(dates, days, strict=False)],
                     dtype="datetime64[us]",
                 )
                 x["result2"] = pd.Series(
-                    [pd.to_datetime(y[0]).date() + timedelta(days=-y[1].item()) for y in zip(dates, days)],
+                    [
+                        pd.to_datetime(y[0]).date() + timedelta(days=-y[1].item())
+                        for y in zip(dates, days, strict=False)
+                    ],
                     dtype="datetime64[us]",
                 )
                 return x

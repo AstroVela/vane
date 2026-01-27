@@ -411,6 +411,8 @@ strict = true
 
 [tool.ruff.lint.per-file-ignores]
 "duckdb/experimental/spark/**.py" = [
+    # No need for moduledocstrings for spark
+    'D100',
     # Ignore boolean positional args in the Spark API
     'FBT001'
 ]
