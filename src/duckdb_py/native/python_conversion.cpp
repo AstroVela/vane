@@ -953,18 +953,18 @@ void TransformPythonObjectInternal(py::handle ele, A &result, const B &param, bo
 			default:
 				break;
 			}
-			if (overflow == 1) {
+			if (overflow == 1) { // value is > LLONG_MAX
 				uint64_t unsigned_value = PyLong_AsUnsignedLongLong(ptr);
 				if (!PyErr_Occurred()) {
 					// value does not fit within an int64, but it fits within a uint64
 					OP::HandleUnsignedBigint(result, param, unsigned_value);
 					break;
 				}
+				PyErr_Clear();
 				if (conversion_target.id() == LogicalTypeId::UBIGINT) {
 					throw InvalidInputException("Python Conversion Failure: Value out of range for type %s",
 					                            conversion_target);
 				}
-				PyErr_Clear();
 			}
 			double number = PyLong_AsDouble(ele.ptr());
 			if (number == -1.0 && PyErr_Occurred()) {

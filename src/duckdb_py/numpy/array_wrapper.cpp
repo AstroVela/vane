@@ -112,7 +112,7 @@ struct IntervalConvert {
 	template <class DUCKDB_T, class NUMPY_T>
 	static int64_t ConvertValue(interval_t val, NumpyAppendData &append_data) {
 		(void)append_data;
-		return Interval::GetNanoseconds(val);
+		return Interval::GetMicro(val);
 	}
 
 	template <class NUMPY_T, bool PANDAS>

@@ -4,7 +4,6 @@ import re
 import webbrowser
 from functools import reduce
 from pathlib import Path
-from typing import Optional
 
 from duckdb import DuckDBPyConnection
 
@@ -321,7 +320,7 @@ def open_utf8(fpath: str, flags: str) -> object:  # noqa: D103
 
 
 class ProfilingInfo:  # noqa: D101
-    def __init__(self, conn: Optional[DuckDBPyConnection] = None, from_file: Optional[str] = None) -> None:  # noqa: D107
+    def __init__(self, conn: DuckDBPyConnection | None = None, from_file: str | None = None) -> None:  # noqa: D107
         self.conn = conn
         self.from_file = from_file
 
@@ -580,7 +579,7 @@ class ProfilingInfo:  # noqa: D101
         self._get_child_timings(json["children"][0], query_timings)
 
     def _translate_json_to_html(
-        self, input_file: Optional[str] = None, input_text: Optional[str] = None, output_file: str = "profile.html"
+        self, input_file: str | None = None, input_text: str | None = None, output_file: str = "profile.html"
     ) -> None:
         query_timings = AllTimings()
         if input_text is not None:

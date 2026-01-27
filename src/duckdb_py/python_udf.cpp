@@ -307,26 +307,31 @@ static scalar_function_t CreateNativeFunction(PyObject *function, PythonExceptio
 
 		for (idx_t row = 0; row < input.size(); row++) {
 
-			auto bundled_parameters = py::tuple((int)input.ColumnCount());
-			bool contains_null = false;
-			for (idx_t i = 0; i < input.ColumnCount(); i++) {
-				// Fill the tuple with the arguments for this row
-				auto &column = input.data[i];
-				auto value = column.GetValue(row);
-				if (value.IsNull() && default_null_handling) {
-					contains_null = true;
-					break;
+			py::object ret;
+			if (input.ColumnCount() > 0) {
+				auto bundled_parameters = py::tuple((int)input.ColumnCount());
+				bool contains_null = false;
+				for (idx_t i = 0; i < input.ColumnCount(); i++) {
+					// Fill the tuple with the arguments for this row
+					auto &column = input.data[i];
+					auto value = column.GetValue(row);
+					if (value.IsNull() && default_null_handling) {
+						contains_null = true;
+						break;
+					}
+					bundled_parameters[i] = PythonObject::FromValue(value, column.GetType(), client_properties);
 				}
-				bundled_parameters[i] = PythonObject::FromValue(value, column.GetType(), client_properties);
-			}
-			if (contains_null) {
-				// Immediately insert None, no need to call the function
-				FlatVector::SetNull(result, row, true);
-				continue;
+				if (contains_null) {
+					// Immediately insert None, no need to call the function
+					FlatVector::SetNull(result, row, true);
+					continue;
+				}
+				// Call the function
+				ret = py::reinterpret_steal<py::object>(PyObject_CallObject(function, bundled_parameters.ptr()));
+			} else {
+				ret = py::reinterpret_steal<py::object>(PyObject_CallObject(function, nullptr));
 			}
 
-			// Call the function
-			auto ret = py::reinterpret_steal<py::object>(PyObject_CallObject(function, bundled_parameters.ptr()));
 			if (ret == nullptr && PyErr_Occurred()) {
 				if (exception_handling == PythonExceptionHandling::FORWARD_ERROR) {
 					auto exception = py::error_already_set();

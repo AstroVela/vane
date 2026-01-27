@@ -303,7 +303,7 @@ class TestArrowREE:
         # Create a (chunked) StructArray from the chunked arrays (columns) of the ArrowTable
         names = unstructured.column_names
         iterables = [x.iterchunks() for x in columns]
-        zipped = zip(*iterables)
+        zipped = zip(*iterables, strict=False)
 
         structured_chunks = [pa.StructArray.from_arrays(list(x), names=names) for x in zipped]
         structured = pa.chunked_array(structured_chunks)
@@ -345,7 +345,7 @@ class TestArrowREE:
         # Create a (chunked) UnionArray from the chunked arrays (columns) of the ArrowTable
         names = unstructured.column_names
         iterables = [x.iterchunks() for x in columns]
-        zipped = zip(*iterables)
+        zipped = zip(*iterables, strict=False)
 
         structured_chunks = []
         for chunk in zipped:
@@ -400,7 +400,7 @@ class TestArrowREE:
 
         # Create a (chunked) MapArray from the chunked arrays (columns) of the ArrowTable
         iterables = [x.iterchunks() for x in columns]
-        zipped = zip(*iterables)
+        zipped = zip(*iterables, strict=False)
 
         structured_chunks = []
         for chunk in zipped:

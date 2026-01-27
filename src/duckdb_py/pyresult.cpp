@@ -304,7 +304,7 @@ void DuckDBPyResult::ConvertDateTimeTypes(PandasDataFrame &df, bool date_as_obje
 			// We need to create the column anew because the exact dt changed to a new timezone
 			ReplaceDFColumn(df, names[i].c_str(), i, new_value);
 		} else if (date_as_object && result->types[i] == LogicalType::DATE) {
-			auto new_value = df[names[i].c_str()].attr("dt").attr("date");
+			py::object new_value = df[names[i].c_str()].attr("dt").attr("date");
 			ReplaceDFColumn(df, names[i].c_str(), i, new_value);
 		}
 	}

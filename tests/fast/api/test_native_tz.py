@@ -1,4 +1,5 @@
 import datetime
+import zoneinfo
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,17 @@ pd = pytest.importorskip("pandas")
 pa = pytest.importorskip("pyarrow")
 
 filename = str(Path(__file__).parent / ".." / "data" / "tz.parquet")
+
+
+def get_tz_string(obj):
+    if isinstance(obj, zoneinfo.ZoneInfo):
+        # Pandas 3.0.0 creates ZoneInfo objects
+        return obj.key
+    if hasattr(obj, "zone"):
+        # Before 3.0.0 Pandas created tzdata objects
+        return obj.zone
+    msg = f"Can't get tz string from {obj}"
+    raise ValueError(msg)
 
 
 class TestNativeTimeZone:
@@ -46,7 +58,7 @@ class TestNativeTimeZone:
     def test_pandas_timestamp_timezone(self, duckdb_cursor):
         res = duckdb_cursor.execute("SET timezone='America/Los_Angeles';")
         res = duckdb_cursor.execute(f"select TimeRecStart as tz  from '{filename}'").df()
-        assert res.dtypes["tz"].tz.zone == "America/Los_Angeles"
+        assert get_tz_string(res.dtypes["tz"].tz) == "America/Los_Angeles"
         assert res["tz"][0].hour == 14
         assert res["tz"][0].minute == 52
 
@@ -65,16 +77,16 @@ class TestNativeTimeZone:
         Version(pa.__version__) < Version("15.0.0"), reason="pyarrow 14.0.2 'to_pandas' causes a DeprecationWarning"
     )
     def test_arrow_timestamp_timezone(self, duckdb_cursor):
-        res = duckdb_cursor.execute("SET timezone='America/Los_Angeles';")
+        duckdb_cursor.execute("SET timezone='America/Los_Angeles';")
         table = duckdb_cursor.execute(f"select TimeRecStart as tz  from '{filename}'").fetch_arrow_table()
         res = table.to_pandas()
-        assert res.dtypes["tz"].tz.zone == "America/Los_Angeles"
+        assert get_tz_string(res.dtypes["tz"].tz) == "America/Los_Angeles"
         assert res["tz"][0].hour == 14
         assert res["tz"][0].minute == 52
 
         duckdb_cursor.execute("SET timezone='UTC';")
         res = duckdb_cursor.execute(f"select TimeRecStart as tz  from '{filename}'").fetch_arrow_table().to_pandas()
-        assert res.dtypes["tz"].tz.zone == "UTC"
+        assert get_tz_string(res.dtypes["tz"].tz) == "UTC"
         assert res["tz"][0].hour == 21
         assert res["tz"][0].minute == 52
 
