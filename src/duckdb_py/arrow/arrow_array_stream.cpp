@@ -27,15 +27,15 @@ void VerifyArrowDatasetLoaded() {
 	}
 }
 
-py::object PythonTableArrowArrayStreamFactory::ProduceScanner(DBConfig &config, py::object &arrow_scanner,
-                                                              py::handle &arrow_obj_handle,
+py::object PythonTableArrowArrayStreamFactory::ProduceScanner(py::object &arrow_scanner, py::handle &arrow_obj_handle,
                                                               ArrowStreamParameters &parameters,
                                                               const ClientProperties &client_properties) {
 	D_ASSERT(!py::isinstance<py::capsule>(arrow_obj_handle));
 	ArrowSchemaWrapper schema;
 	PythonTableArrowArrayStreamFactory::GetSchemaInternal(arrow_obj_handle, schema);
 	ArrowTableSchema arrow_table;
-	ArrowTableFunction::PopulateArrowTableSchema(config, arrow_table, schema.arrow_schema);
+	ArrowTableFunction::PopulateArrowTableSchema(*client_properties.client_context.get_mutable(), arrow_table,
+	                                             schema.arrow_schema);
 
 	auto filters = parameters.filters;
 	auto &column_list = parameters.projected_columns.columns;
@@ -86,26 +86,23 @@ unique_ptr<ArrowArrayStreamWrapper> PythonTableArrowArrayStreamFactory::Produce(
 		auto arrow_dataset = import_cache.pyarrow.dataset().attr("dataset");
 		auto dataset = arrow_dataset(arrow_obj_handle);
 		py::object arrow_scanner = dataset.attr("__class__").attr("scanner");
-		scanner = ProduceScanner(factory->config, arrow_scanner, dataset, parameters, factory->client_properties);
+		scanner = ProduceScanner(arrow_scanner, dataset, parameters, factory->client_properties);
 		break;
 	}
 	case PyArrowObjectType::RecordBatchReader: {
-		scanner = ProduceScanner(factory->config, arrow_batch_scanner, arrow_obj_handle, parameters,
-		                         factory->client_properties);
+		scanner = ProduceScanner(arrow_batch_scanner, arrow_obj_handle, parameters, factory->client_properties);
 		break;
 	}
 	case PyArrowObjectType::Scanner: {
 		// If it's a scanner we have to turn it to a record batch reader, and then a scanner again since we can't stack
 		// scanners on arrow Otherwise pushed-down projections and filters will disappear like tears in the rain
 		auto record_batches = arrow_obj_handle.attr("to_reader")();
-		scanner = ProduceScanner(factory->config, arrow_batch_scanner, record_batches, parameters,
-		                         factory->client_properties);
+		scanner = ProduceScanner(arrow_batch_scanner, record_batches, parameters, factory->client_properties);
 		break;
 	}
 	case PyArrowObjectType::Dataset: {
 		py::object arrow_scanner = arrow_obj_handle.attr("__class__").attr("scanner");
-		scanner =
-		    ProduceScanner(factory->config, arrow_scanner, arrow_obj_handle, parameters, factory->client_properties);
+		scanner = ProduceScanner(arrow_scanner, arrow_obj_handle, parameters, factory->client_properties);
 		break;
 	}
 	default: {
