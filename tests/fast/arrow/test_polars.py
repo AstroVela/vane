@@ -702,3 +702,40 @@ class TestPolars:
           } }
         """
         assert _pl_tree_to_sql(json.loads(scalar_decimal_scale)) == "1"
+
+    def test_cast_node_unwraps_inner_expression(self):
+        """Cast nodes should be unwrapped to process the inner expression."""
+        # A Cast wrapping a Column reference
+        cast_column = json.loads(
+            '{"Cast": {"expr": {"Column": "a"}, "dtype": {"Decimal": [20, 0]}, "options": "NonStrict"}}'
+        )
+        assert _pl_tree_to_sql(cast_column) == '"a"'
+
+        # A Cast wrapping a full binary expression
+        cast_expr = json.loads("""
+        {
+            "BinaryExpr": {
+                "left": {"Cast": {"expr": {"Column": "a"}, "dtype": {"Decimal": [20, 0]}, "options": "NonStrict"}},
+                "op": "Eq",
+                "right": {"Literal": {"Int": 1}}
+            }
+        }
+        """)
+        assert _pl_tree_to_sql(cast_expr) == '("a" = 1)'
+
+    def test_cast_node_predicate_pushdown(self):
+        """Predicates with Cast nodes should be successfully pushed down."""
+        # A decimal with non-38 precision produces a Cast node in Polars
+        expr = pl.col("a") == pl.lit(1, dtype=pl.Decimal(precision=20, scale=0))
+        valid_filter(expr)
+
+    def test_polars_lazy_pushdown_decimal_with_cast(self):
+        """End-to-end test: decimal columns with non-38 precision should push down filters."""
+        con = duckdb.connect()
+        con.execute("CREATE TABLE test_cast (a DECIMAL(20,0))")
+        con.execute("INSERT INTO test_cast VALUES (1), (10), (100), (NULL)")
+        rel = con.sql("FROM test_cast")
+        lazy_df = rel.pl(lazy=True)
+
+        assert lazy_df.filter(pl.col("a") == 1).collect().to_dicts() == [{"a": 1}]
+        assert lazy_df.filter(pl.col("a") > 1).collect().to_dicts() == [{"a": 10}, {"a": 100}]
