@@ -159,6 +159,16 @@ def _pl_tree_to_sql(tree: _ExpressionTree) -> str:
         msg = f"Unsupported function type: {func_dict}"
         raise NotImplementedError(msg)
 
+    if node_type == "Cast":
+        cast_tree = tree[node_type]
+        assert isinstance(cast_tree, dict), f"A {node_type} should be a dict but got {type(cast_tree)}"
+        if cast_tree.get("options") != "NonStrict":
+            msg = f"Only NonStrict casts can be safely unwrapped, got {cast_tree.get('options')!r}"
+            raise NotImplementedError(msg)
+        cast_expr = cast_tree["expr"]
+        assert isinstance(cast_expr, dict), f"A {node_type} should be a dict but got {type(cast_expr)}"
+        return _pl_tree_to_sql(cast_expr)
+
     if node_type == "Scalar":
         # Detect format: old style (dtype/value) or new style (direct type key)
         scalar_tree = tree[node_type]
