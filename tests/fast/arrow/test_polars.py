@@ -739,3 +739,9 @@ class TestPolars:
 
         assert lazy_df.filter(pl.col("a") == 1).collect().to_dicts() == [{"a": 1}]
         assert lazy_df.filter(pl.col("a") > 1).collect().to_dicts() == [{"a": 10}, {"a": 100}]
+
+    def test_explicit_cast_not_pushed_down(self):
+        """Explicit user .cast() (Strict) should not be pushed down - falls back to Polars."""
+        # pl.col("a").cast(pl.Int64) produces a Strict Cast node
+        expr = pl.col("a").cast(pl.Int64) > 5
+        invalid_filter(expr)
