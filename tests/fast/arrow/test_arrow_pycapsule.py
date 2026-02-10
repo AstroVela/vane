@@ -68,6 +68,16 @@ class TestArrowPyCapsule:
         assert len(res1) == 100
         assert res1 == res2
 
+    def test_pycapsule_rescan_error_type(self, duckdb_cursor):
+        """Issue #105: re-executing a relation backed by a consumed PyCapsule."""
+        pa = pytest.importorskip("pyarrow")
+        tbl = pa.table({"a": [1]})
+        capsule = tbl.__arrow_c_stream__()  # noqa: F841
+        rel = duckdb_cursor.sql("SELECT * FROM capsule")
+        rel.fetchall()  # consumes the capsule
+        with pytest.raises(duckdb.InvalidInputException):
+            rel.fetchall()  # re-execution should be InvalidInputException, not InternalException
+
     def test_consumer_interface_roundtrip(self, duckdb_cursor):
         def create_table():
             class MyTable:
