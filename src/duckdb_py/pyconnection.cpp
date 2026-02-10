@@ -2383,26 +2383,16 @@ PyArrowObjectType DuckDBPyConnection::GetArrowType(const py::handle &obj) {
 
 	if (ModuleIsLoaded<PyarrowCacheItem>()) {
 		auto &import_cache = *DuckDBPyConnection::ImportCache();
-		// First Verify Lib Types
-		auto table_class = import_cache.pyarrow.Table();
-		auto record_batch_reader_class = import_cache.pyarrow.RecordBatchReader();
-		auto message_reader_class = import_cache.pyarrow.ipc.MessageReader();
-		if (py::isinstance(obj, table_class)) {
-			return PyArrowObjectType::Table;
-		} else if (py::isinstance(obj, record_batch_reader_class)) {
-			return PyArrowObjectType::RecordBatchReader;
-		} else if (py::isinstance(obj, message_reader_class)) {
+		// MessageReader requires nanoarrow, separate scan function
+		if (py::isinstance(obj, import_cache.pyarrow.ipc.MessageReader())) {
 			return PyArrowObjectType::MessageReader;
 		}
 
 		if (ModuleIsLoaded<PyarrowDatasetCacheItem>()) {
-			// Then Verify dataset types
-			auto dataset_class = import_cache.pyarrow.dataset.Dataset();
-			auto scanner_class = import_cache.pyarrow.dataset.Scanner();
-
-			if (py::isinstance(obj, scanner_class)) {
+			// Scanner/Dataset don't have __arrow_c_stream__, need dedicated handling
+			if (py::isinstance(obj, import_cache.pyarrow.dataset.Scanner())) {
 				return PyArrowObjectType::Scanner;
-			} else if (py::isinstance(obj, dataset_class)) {
+			} else if (py::isinstance(obj, import_cache.pyarrow.dataset.Dataset())) {
 				return PyArrowObjectType::Dataset;
 			}
 		}

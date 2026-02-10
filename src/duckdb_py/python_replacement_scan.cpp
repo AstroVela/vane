@@ -51,11 +51,6 @@ static void CreateArrowScan(const string &name, py::object entry, TableFunctionR
 		auto dependency_item = PythonDependencyItem::Create(stream_messages);
 		external_dependency->AddDependency("replacement_cache", std::move(dependency_item));
 	} else {
-		if (type == PyArrowObjectType::PyCapsuleInterface) {
-			entry = entry.attr("__arrow_c_stream__")();
-			type = PyArrowObjectType::PyCapsule;
-		}
-
 		auto stream_factory = make_uniq<PythonTableArrowArrayStreamFactory>(entry.ptr(), client_properties);
 		auto stream_factory_produce = PythonTableArrowArrayStreamFactory::Produce;
 		auto stream_factory_get_schema = PythonTableArrowArrayStreamFactory::GetSchema;
@@ -66,8 +61,17 @@ static void CreateArrowScan(const string &name, py::object entry, TableFunctionR
 		    make_uniq<ConstantExpression>(Value::POINTER(CastPointerToValue(stream_factory_get_schema))));
 
 		if (type == PyArrowObjectType::PyCapsule) {
-			// Disable projection+filter pushdown
+			// Disable projection+filter pushdown for bare capsules (single-use, no PyArrow wrapper)
 			table_function.function = make_uniq<FunctionExpression>("arrow_scan_dumb", std::move(children));
+		} else if (type == PyArrowObjectType::PyCapsuleInterface) {
+			// Try to load pyarrow.dataset for pushdown support
+			auto &cache = *DuckDBPyConnection::ImportCache();
+			if (!cache.pyarrow.dataset()) {
+				// No pyarrow.dataset: scan without pushdown, DuckDB handles projection/filter post-scan
+				table_function.function = make_uniq<FunctionExpression>("arrow_scan_dumb", std::move(children));
+			} else {
+				table_function.function = make_uniq<FunctionExpression>("arrow_scan", std::move(children));
+			}
 		} else {
 			table_function.function = make_uniq<FunctionExpression>("arrow_scan", std::move(children));
 		}
@@ -141,6 +145,9 @@ unique_ptr<TableRef> PythonReplacementScan::TryReplacementObject(const py::objec
 		subquery->external_dependency = std::move(dependency);
 		return std::move(subquery);
 	} else if (PolarsDataFrame::IsDataFrame(entry)) {
+		// Polars DataFrames always go through one-time .to_arrow() materialization.
+		// Polars's __arrow_c_stream__() serializes from its internal layout on every call,
+		// which is expensive for repeated scans. The .to_arrow() path converts once.
 		auto arrow_dataset = entry.attr("to_arrow")();
 		CreateArrowScan(name, arrow_dataset, *table_function, children, client_properties, PyArrowObjectType::Table,
 		                *context.db);
@@ -149,9 +156,8 @@ unique_ptr<TableRef> PythonReplacementScan::TryReplacementObject(const py::objec
 		auto arrow_dataset = materialized.attr("to_arrow")();
 		CreateArrowScan(name, arrow_dataset, *table_function, children, client_properties, PyArrowObjectType::Table,
 		                *context.db);
-	} else if (DuckDBPyConnection::GetArrowType(entry) != PyArrowObjectType::Invalid &&
-	           !(DuckDBPyConnection::GetArrowType(entry) == PyArrowObjectType::MessageReader && !relation)) {
-		arrow_type = DuckDBPyConnection::GetArrowType(entry);
+	} else if ((arrow_type = DuckDBPyConnection::GetArrowType(entry)) != PyArrowObjectType::Invalid &&
+	           !(arrow_type == PyArrowObjectType::MessageReader && !relation)) {
 		CreateArrowScan(name, entry, *table_function, children, client_properties, arrow_type, *context.db);
 	} else if (DuckDBPyConnection::IsAcceptedNumpyObject(entry) != NumpyObjectType::INVALID) {
 		numpytype = DuckDBPyConnection::IsAcceptedNumpyObject(entry);
