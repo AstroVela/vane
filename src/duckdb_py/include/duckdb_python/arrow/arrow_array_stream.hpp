@@ -51,16 +51,7 @@ public:
 
 } // namespace pyarrow
 
-enum class PyArrowObjectType {
-	Invalid,
-	Table,
-	RecordBatchReader,
-	Scanner,
-	Dataset,
-	PyCapsule,
-	PyCapsuleInterface,
-	MessageReader
-};
+enum class PyArrowObjectType { Invalid, Table, Scanner, Dataset, PyCapsule, PyCapsuleInterface, MessageReader };
 
 void TransformDuckToArrowChunk(ArrowSchema &arrow_schema, ArrowArray &data, py::list &batches);
 

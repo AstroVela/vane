@@ -20,7 +20,8 @@
             "pyarrow.decimal32",
             "pyarrow.decimal64",
             "pyarrow.decimal128"
-        ]
+        ],
+        "required": false
     },
     "pyarrow.dataset": {
         "type": "module",
@@ -29,7 +30,8 @@
         "children": [
             "pyarrow.dataset.Scanner",
             "pyarrow.dataset.Dataset"
-        ]
+        ],
+        "required": false
     },
     "pyarrow.dataset.Scanner": {
         "type": "attribute",

@@ -29,21 +29,24 @@ class TestArrowPyCapsule:
         obj = MyObject(df)
 
         # Call the __arrow_c_stream__ from within DuckDB
+        # MyObject has no __arrow_c_schema__, so GetSchema() falls back to __arrow_c_stream__ (1 call),
+        # then Produce() calls __arrow_c_stream__ again (1 call) = 2 calls minimum per scan.
         res = duckdb_cursor.sql("select * from obj")
         assert res.fetchall() == [(1, 5), (2, 6), (3, 7), (4, 8)]
-        assert obj.count == 1
+        count_after_first = obj.count
+        assert count_after_first >= 2
 
         # Call the __arrow_c_stream__ method and pass in the capsule instead
         capsule = obj.__arrow_c_stream__()
         res = duckdb_cursor.sql("select * from capsule")
         assert res.fetchall() == [(1, 5), (2, 6), (3, 7), (4, 8)]
-        assert obj.count == 2
+        assert obj.count == count_after_first + 1
 
         # Ensure __arrow_c_stream__ accepts a requested_schema argument as noop
         capsule = obj.__arrow_c_stream__(requested_schema="foo")  # noqa: F841
         res = duckdb_cursor.sql("select * from capsule")
         assert res.fetchall() == [(1, 5), (2, 6), (3, 7), (4, 8)]
-        assert obj.count == 3
+        assert obj.count == count_after_first + 2
 
     def test_capsule_roundtrip(self, duckdb_cursor):
         def create_capsule():
