@@ -74,7 +74,8 @@ static void ConvertArrowTableToVector(const py::object &table, Vector &out, Clie
 	D_ASSERT(py::gil_check());
 	py::gil_scoped_release gil;
 
-	auto stream_factory = make_uniq<PythonTableArrowArrayStreamFactory>(ptr, context.GetClientProperties());
+	auto stream_factory =
+	    make_uniq<PythonTableArrowArrayStreamFactory>(ptr, context.GetClientProperties(), PyArrowObjectType::Table);
 	auto stream_factory_produce = PythonTableArrowArrayStreamFactory::Produce;
 	auto stream_factory_get_schema = PythonTableArrowArrayStreamFactory::GetSchema;
 

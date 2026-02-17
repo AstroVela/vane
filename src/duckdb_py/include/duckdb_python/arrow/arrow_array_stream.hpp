@@ -59,8 +59,9 @@ PyArrowObjectType GetArrowType(const py::handle &obj);
 
 class PythonTableArrowArrayStreamFactory {
 public:
-	explicit PythonTableArrowArrayStreamFactory(PyObject *arrow_table, const ClientProperties &client_properties_p)
-	    : arrow_object(arrow_table), client_properties(client_properties_p) {};
+	explicit PythonTableArrowArrayStreamFactory(PyObject *arrow_table, const ClientProperties &client_properties_p,
+	                                            PyArrowObjectType arrow_type_p)
+	    : arrow_object(arrow_table), client_properties(client_properties_p), cached_arrow_type(arrow_type_p) {};
 
 	//! Produces an Arrow Scanner, should be only called once when initializing Scan States
 	static unique_ptr<ArrowArrayStreamWrapper> Produce(uintptr_t factory, ArrowStreamParameters &parameters);
@@ -73,6 +74,7 @@ public:
 	PyObject *arrow_object;
 
 	const ClientProperties client_properties;
+	const PyArrowObjectType cached_arrow_type;
 
 private:
 	static py::object ProduceScanner(py::object &arrow_scanner, py::handle &arrow_obj_handle,

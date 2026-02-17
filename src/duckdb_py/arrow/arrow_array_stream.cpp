@@ -64,9 +64,9 @@ unique_ptr<ArrowArrayStreamWrapper> PythonTableArrowArrayStreamFactory::Produce(
 	auto factory = static_cast<PythonTableArrowArrayStreamFactory *>(reinterpret_cast<void *>(factory_ptr)); // NOLINT
 	D_ASSERT(factory->arrow_object);
 	py::handle arrow_obj_handle(factory->arrow_object);
-	auto arrow_object_type = DuckDBPyConnection::GetArrowType(arrow_obj_handle);
+	auto arrow_object_type = factory->cached_arrow_type;
 
-	if (arrow_object_type == PyArrowObjectType::PyCapsuleInterface) {
+	if (arrow_object_type == PyArrowObjectType::PyCapsuleInterface || arrow_object_type == PyArrowObjectType::Table) {
 		py::object capsule_obj = arrow_obj_handle.attr("__arrow_c_stream__")();
 		auto capsule = py::reinterpret_borrow<py::capsule>(capsule_obj);
 		auto stream = capsule.get_pointer<struct ArrowArrayStream>();
@@ -181,8 +181,8 @@ void PythonTableArrowArrayStreamFactory::GetSchema(uintptr_t factory_ptr, ArrowS
 	D_ASSERT(factory->arrow_object);
 	py::handle arrow_obj_handle(factory->arrow_object);
 
-	auto type = DuckDBPyConnection::GetArrowType(arrow_obj_handle);
-	if (type == PyArrowObjectType::PyCapsuleInterface) {
+	auto type = factory->cached_arrow_type;
+	if (type == PyArrowObjectType::PyCapsuleInterface || type == PyArrowObjectType::Table) {
 		// Get __arrow_c_schema__ if it exists
 		if (py::hasattr(arrow_obj_handle, "__arrow_c_schema__")) {
 			auto schema_capsule = arrow_obj_handle.attr("__arrow_c_schema__")();
