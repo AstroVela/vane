@@ -61,7 +61,15 @@ class PythonTableArrowArrayStreamFactory {
 public:
 	explicit PythonTableArrowArrayStreamFactory(PyObject *arrow_table, const ClientProperties &client_properties_p,
 	                                            PyArrowObjectType arrow_type_p)
-	    : arrow_object(arrow_table), client_properties(client_properties_p), cached_arrow_type(arrow_type_p) {};
+	    : arrow_object(arrow_table), client_properties(client_properties_p), cached_arrow_type(arrow_type_p) {
+		cached_schema.release = nullptr;
+	}
+
+	~PythonTableArrowArrayStreamFactory() {
+		if (cached_schema.release) {
+			cached_schema.release(&cached_schema);
+		}
+	}
 
 	//! Produces an Arrow Scanner, should be only called once when initializing Scan States
 	static unique_ptr<ArrowArrayStreamWrapper> Produce(uintptr_t factory, ArrowStreamParameters &parameters);
@@ -77,6 +85,9 @@ public:
 	const PyArrowObjectType cached_arrow_type;
 
 private:
+	ArrowSchema cached_schema;
+	bool schema_cached = false;
+
 	static py::object ProduceScanner(py::object &arrow_scanner, py::handle &arrow_obj_handle,
 	                                 ArrowStreamParameters &parameters, const ClientProperties &client_properties);
 };

@@ -176,8 +176,16 @@ void PythonTableArrowArrayStreamFactory::GetSchemaInternal(py::handle arrow_obj_
 }
 
 void PythonTableArrowArrayStreamFactory::GetSchema(uintptr_t factory_ptr, ArrowSchemaWrapper &schema) {
-	py::gil_scoped_acquire acquire;
 	auto factory = static_cast<PythonTableArrowArrayStreamFactory *>(reinterpret_cast<void *>(factory_ptr)); // NOLINT
+
+	// Fast path: return cached schema without GIL or Python calls
+	if (factory->schema_cached) {
+		schema.arrow_schema = factory->cached_schema; // struct copy
+		schema.arrow_schema.release = nullptr;        // non-owning copy
+		return;
+	}
+
+	py::gil_scoped_acquire acquire;
 	D_ASSERT(factory->arrow_object);
 	py::handle arrow_obj_handle(factory->arrow_object);
 
@@ -188,8 +196,11 @@ void PythonTableArrowArrayStreamFactory::GetSchema(uintptr_t factory_ptr, ArrowS
 			auto schema_capsule = arrow_obj_handle.attr("__arrow_c_schema__")();
 			auto capsule = py::reinterpret_borrow<py::capsule>(schema_capsule);
 			auto arrow_schema = capsule.get_pointer<struct ArrowSchema>();
-			schema.arrow_schema = *arrow_schema;
-			arrow_schema->release = nullptr; // take ownership
+			factory->cached_schema = *arrow_schema; // factory takes ownership
+			arrow_schema->release = nullptr;
+			factory->schema_cached = true;
+			schema.arrow_schema = factory->cached_schema; // non-owning copy
+			schema.arrow_schema.release = nullptr;
 			return;
 		}
 		// Otherwise try to use .schema with _export_to_c
@@ -211,6 +222,13 @@ void PythonTableArrowArrayStreamFactory::GetSchema(uintptr_t factory_ptr, ArrowS
 		return; // stream_capsule goes out of scope, stream released by capsule destructor
 	}
 	GetSchemaInternal(arrow_obj_handle, schema);
+
+	// Cache for Table and Dataset (immutable schema)
+	if (type == PyArrowObjectType::Table || type == PyArrowObjectType::Dataset) {
+		factory->cached_schema = schema.arrow_schema; // factory takes ownership
+		schema.arrow_schema.release = nullptr;        // caller gets non-owning copy
+		factory->schema_cached = true;
+	}
 }
 
 } // namespace duckdb
