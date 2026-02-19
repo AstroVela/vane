@@ -270,17 +270,17 @@ bool TryTransformPythonIntegerToDouble(Value &res, py::handle ele) {
 	return true;
 }
 
-// Converts a Python integer that overflows int64/uint64 into a HUGEINT or UHUGEINT Value by decomposing it into upper
-// and lower 64-bit components. Tries HUGEINT first; falls back to UHUGEINT for large positive values.
-static Value TransformPythonLongToHugeInt(py::handle ele, const LogicalType &target_type) {
+// Tries to convert a Python integer that overflows int64/uint64 into a HUGEINT or UHUGEINT Value
+// by decomposing it into upper and lower 64-bit components. Tries HUGEINT first; falls back to
+// UHUGEINT for large positive values. Returns false if the value doesn't fit in 128 bits.
+static bool TryTransformPythonLongToHugeInt(py::handle ele, const LogicalType &target_type, Value &result) {
 	auto ptr = ele.ptr();
 
 	// Extract lower 64 bits (two's complement, works for negative values too)
 	uint64_t lower = PyLong_AsUnsignedLongLongMask(ptr);
 	if (lower == static_cast<uint64_t>(-1) && PyErr_Occurred()) {
 		PyErr_Clear();
-		throw InvalidInputException("Failed to convert Python integer to 128-bit integer: %s",
-		                            std::string(py::str(ele)));
+		return false;
 	}
 
 	// Extract upper bits by right-shifting by 64
@@ -293,9 +293,11 @@ static Value TransformPythonLongToHugeInt(py::handle ele, const LogicalType &tar
 	if (overflow == 0 && !(upper_signed == -1 && PyErr_Occurred())) {
 		auto val = Value::HUGEINT(hugeint_t {upper_signed, lower});
 		if (target_type.id() == LogicalTypeId::UNKNOWN || target_type.id() == LogicalTypeId::HUGEINT) {
-			return val;
+			result = val;
+		} else {
+			result = CastToTarget(std::move(val), target_type);
 		}
-		return CastToTarget(std::move(val), target_type);
+		return true;
 	}
 	PyErr_Clear();
 
@@ -303,14 +305,25 @@ static Value TransformPythonLongToHugeInt(py::handle ele, const LogicalType &tar
 	uint64_t upper_unsigned = PyLong_AsUnsignedLongLong(upper_obj.ptr());
 	if (PyErr_Occurred()) {
 		PyErr_Clear();
-		throw InvalidInputException("Python integer too large for 128-bit integer type: %s", std::string(py::str(ele)));
+		return false;
 	}
 
 	auto val = Value::UHUGEINT(uhugeint_t {upper_unsigned, lower});
 	if (target_type.id() == LogicalTypeId::UNKNOWN || target_type.id() == LogicalTypeId::UHUGEINT) {
-		return val;
+		result = val;
+	} else {
+		result = CastToTarget(std::move(val), target_type);
 	}
-	return CastToTarget(std::move(val), target_type);
+	return true;
+}
+
+// Throwing wrapper for contexts that require a result (e.g. prepared statement parameters).
+static Value TransformPythonLongToHugeInt(py::handle ele, const LogicalType &target_type) {
+	Value result;
+	if (!TryTransformPythonLongToHugeInt(ele, target_type, result)) {
+		throw InvalidInputException("Python integer too large for 128-bit integer type: %s", std::string(py::str(ele)));
+	}
+	return result;
 }
 
 void TransformPythonUnsigned(uint64_t value, Value &res) {
@@ -347,8 +360,7 @@ bool TryTransformPythonNumeric(Value &res, py::handle ele, const LogicalType &ta
 			throw InvalidInputException(StringUtil::Format("Failed to cast value: Python value '%s' to INT64",
 			                                               std::string(pybind11::str(ele))));
 		}
-		res = TransformPythonLongToHugeInt(ele, target_type);
-		return true;
+		return TryTransformPythonLongToHugeInt(ele, target_type, res);
 	} else if (overflow == 1) {
 		if (target_type.InternalType() == PhysicalType::INT64) {
 			throw InvalidInputException(StringUtil::Format("Failed to cast value: Python value '%s' to INT64",
@@ -357,8 +369,7 @@ bool TryTransformPythonNumeric(Value &res, py::handle ele, const LogicalType &ta
 		uint64_t unsigned_value = PyLong_AsUnsignedLongLong(ptr);
 		if (PyErr_Occurred()) {
 			PyErr_Clear();
-			res = TransformPythonLongToHugeInt(ele, target_type);
-			return true;
+			return TryTransformPythonLongToHugeInt(ele, target_type, res);
 		}
 		TransformPythonUnsigned(unsigned_value, res);
 		PyErr_Clear();
