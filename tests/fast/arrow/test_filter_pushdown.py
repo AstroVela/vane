@@ -921,6 +921,33 @@ class TestArrowFilterPushdown:
         duckdb_conn.register("duck_probe_arrow", duck_probe_arrow)
         assert duckdb_conn.execute("SELECT * from duck_probe_arrow where a = any([1,999])").fetchall() == [(1,), (999,)]
 
+    @pytest.mark.timeout(10)
+    def test_in_filter_pushdown_large_list(self, duckdb_cursor):
+        """Large IN lists must not hang. Regression test for https://github.com/duckdb/duckdb-python/issues/52."""
+        arrow_table = pa.table({"a": pa.array(range(5000))})
+        in_list = ", ".join(str(i) for i in range(0, 5000, 2))
+        result = duckdb.sql(f"SELECT count(*) FROM arrow_table WHERE a IN ({in_list})").fetchone()
+        assert result == (2500,)
+
+    def test_in_filter_pushdown_with_nulls(self, duckdb_cursor):
+        arrow_table = pa.table({"a": pa.array([1, 2, None, 4, None, 6])})
+        # IN list without NULL: null rows should not match
+        result = duckdb.sql("SELECT a FROM arrow_table WHERE a IN (1, 4) ORDER BY a").fetchall()
+        assert result == [(1,), (4,)]
+        # IN list with NULL: null rows still should not match (SQL semantics)
+        result = duckdb.sql("SELECT a FROM arrow_table WHERE a IN (1, 4, NULL) ORDER BY a").fetchall()
+        assert result == [(1,), (4,)]
+
+    def test_in_filter_pushdown_varchar(self, duckdb_cursor):
+        arrow_table = pa.table({"s": pa.array(["alice", "bob", "charlie", "dave", None])})
+        result = duckdb.sql("SELECT s FROM arrow_table WHERE s IN ('bob', 'dave') ORDER BY s").fetchall()
+        assert result == [("bob",), ("dave",)]
+
+    def test_in_filter_pushdown_float(self, duckdb_cursor):
+        arrow_table = pa.table({"f": pa.array([1.0, 2.5, 3.75, 4.0, None], type=pa.float64())})
+        result = duckdb.sql("SELECT f FROM arrow_table WHERE f IN (2.5, 4.0) ORDER BY f").fetchall()
+        assert result == [(2.5,), (4.0,)]
+
     def test_pushdown_of_optional_filter(self, duckdb_cursor):
         cardinality_table = pa.Table.from_pydict(
             {
