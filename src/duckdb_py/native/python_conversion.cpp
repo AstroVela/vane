@@ -260,16 +260,6 @@ Value TransformTupleToStruct(py::handle ele, const LogicalType &target_type = Lo
 	return result;
 }
 
-bool TryTransformPythonIntegerToDouble(Value &res, py::handle ele) {
-	double number = PyLong_AsDouble(ele.ptr());
-	if (number == -1.0 && PyErr_Occurred()) {
-		PyErr_Clear();
-		return false;
-	}
-	res = Value::DOUBLE(number);
-	return true;
-}
-
 // Tries to convert a Python integer that overflows int64/uint64 into a HUGEINT or UHUGEINT Value
 // by decomposing it into upper and lower 64-bit components. Tries HUGEINT first; falls back to
 // UHUGEINT for large positive values. Returns false if the value doesn't fit in 128 bits.
@@ -326,135 +316,52 @@ static Value TransformPythonLongToHugeInt(py::handle ele, const LogicalType &tar
 	return result;
 }
 
-void TransformPythonUnsigned(uint64_t value, Value &res) {
-	if (value > (uint64_t)std::numeric_limits<uint32_t>::max()) {
-		res = Value::UBIGINT(value);
-	} else if (value > (int64_t)std::numeric_limits<uint16_t>::max()) {
-		res = Value::UINTEGER(value);
-	} else if (value > (int64_t)std::numeric_limits<uint16_t>::max()) {
-		res = Value::USMALLINT(value);
-	} else {
-		res = Value::UTINYINT(value);
-	}
-}
-
-bool TrySniffPythonNumeric(Value &res, int64_t value) {
+// Picks the tightest DuckDB integer type (>=INT32) for an int64 value when no target type is specified.
+static Value SniffIntegerValue(int64_t value) {
 	if (value < (int64_t)std::numeric_limits<int32_t>::min() || value > (int64_t)std::numeric_limits<int32_t>::max()) {
-		res = Value::BIGINT(value);
-	} else {
-		// To match default duckdb behavior, numeric values without a specified type should not become a smaller type
-		// than INT32
-		res = Value::INTEGER(value);
+		return Value::BIGINT(value);
 	}
-	return true;
+	return Value::INTEGER(value);
 }
 
-bool TryTransformPythonNumeric(Value &res, py::handle ele, const LogicalType &target_type) {
+// Sniffs the tightest DuckDB integer type for a Python integer.
+// Progressively widens: int64 → uint64 → hugeint → uhugeint.
+// Returns SQLNULL if the value doesn't fit in any DuckDB integer type (> 128-bit).
+LogicalType SniffPythonIntegerType(py::handle ele) {
 	auto ptr = ele.ptr();
 
+	// Step 1: Try int64
 	int overflow;
-	int64_t value = PyLong_AsLongLongAndOverflow(ptr, &overflow);
-	if (overflow == -1) {
-		PyErr_Clear();
-		if (target_type.id() == LogicalTypeId::BIGINT) {
-			throw InvalidInputException(StringUtil::Format("Failed to cast value: Python value '%s' to INT64",
-			                                               std::string(pybind11::str(ele))));
-		}
-		return TryTransformPythonLongToHugeInt(ele, target_type, res);
-	} else if (overflow == 1) {
-		if (target_type.InternalType() == PhysicalType::INT64) {
-			throw InvalidInputException(StringUtil::Format("Failed to cast value: Python value '%s' to INT64",
-			                                               std::string(pybind11::str(ele))));
-		}
-		uint64_t unsigned_value = PyLong_AsUnsignedLongLong(ptr);
-		if (PyErr_Occurred()) {
+	const int64_t value = PyLong_AsLongLongAndOverflow(ptr, &overflow);
+
+	if (overflow == 0) {
+		if (value == -1 && PyErr_Occurred()) {
 			PyErr_Clear();
-			return TryTransformPythonLongToHugeInt(ele, target_type, res);
+			return LogicalType::SQLNULL;
 		}
-		TransformPythonUnsigned(unsigned_value, res);
-		PyErr_Clear();
-		return true;
+		if (value < static_cast<int64_t>(std::numeric_limits<int32_t>::min()) ||
+		    value > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+			return LogicalType::BIGINT;
+		}
+		return LogicalType::INTEGER;
 	}
-	if (value == -1 && PyErr_Occurred()) {
-		return false;
+	PyErr_Clear();
+
+	// Step 2: For positive overflow, try uint64
+	if (overflow == 1) {
+		(void)PyLong_AsUnsignedLongLong(ptr);
+		if (!PyErr_Occurred()) {
+			return LogicalType::UBIGINT;
+		}
+		PyErr_Clear();
 	}
 
-	// The value is int64_t or smaller
-	switch (target_type.id()) {
-	case LogicalTypeId::UNKNOWN:
-		return TrySniffPythonNumeric(res, value);
-	case LogicalTypeId::HUGEINT: {
-		res = Value::HUGEINT(value);
-		return true;
+	// Step 3: Try 128-bit (hugeint/uhugeint)
+	Value res;
+	if (!TryTransformPythonLongToHugeInt(ele, LogicalType::UNKNOWN, res)) {
+		return LogicalType::SQLNULL;
 	}
-	case LogicalTypeId::UHUGEINT: {
-		if (value < 0) {
-			return false;
-		}
-		res = Value::UHUGEINT(value);
-		return true;
-	}
-	case LogicalTypeId::BIGINT: {
-		res = Value::BIGINT(value);
-		return true;
-	}
-	case LogicalTypeId::INTEGER: {
-		if (value < NumericLimits<int32_t>::Minimum() || value > NumericLimits<int32_t>::Maximum()) {
-			return false;
-		}
-		res = Value::INTEGER(value);
-		return true;
-	}
-	case LogicalTypeId::SMALLINT: {
-		if (value < NumericLimits<int16_t>::Minimum() || value > NumericLimits<int16_t>::Maximum()) {
-			return false;
-		}
-		res = Value::SMALLINT(value);
-		return true;
-	}
-	case LogicalTypeId::TINYINT: {
-		if (value < NumericLimits<int8_t>::Minimum() || value > NumericLimits<int8_t>::Maximum()) {
-			return false;
-		}
-		res = Value::TINYINT(value);
-		return true;
-	}
-	case LogicalTypeId::UBIGINT: {
-		if (value < 0) {
-			return false;
-		}
-		res = Value::UBIGINT(value);
-		return true;
-	}
-	case LogicalTypeId::UINTEGER: {
-		if (value < 0 || value > (int64_t)NumericLimits<uint32_t>::Maximum()) {
-			return false;
-		}
-		res = Value::UINTEGER(value);
-		return true;
-	}
-	case LogicalTypeId::USMALLINT: {
-		if (value < 0 || value > (int64_t)NumericLimits<uint16_t>::Maximum()) {
-			return false;
-		}
-		res = Value::USMALLINT(value);
-		return true;
-	}
-	case LogicalTypeId::UTINYINT: {
-		if (value < 0 || value > (int64_t)NumericLimits<uint8_t>::Maximum()) {
-			return false;
-		}
-		res = Value::UTINYINT(value);
-		return true;
-	}
-	default: {
-		if (!TrySniffPythonNumeric(res, value)) {
-			return false;
-		}
-		res = CastToTarget(std::move(res), target_type);
-		return true;
-	}
-	}
+	return res.type();
 }
 
 Value TransformDictionary(const PyDictionary &dict) {
@@ -561,10 +468,6 @@ struct PythonValueConversion {
 			break;
 		}
 	}
-	static void HandleLongAsDouble(Value &result, const LogicalType &target_type, double val) {
-		auto cast_as = target_type.id() == LogicalTypeId::UNKNOWN ? LogicalType::DOUBLE : target_type;
-		result = CastToTarget(Value::DOUBLE(val), cast_as);
-	}
 	static void HandleLongOverflow(Value &result, const LogicalType &target_type, py::handle ele) {
 		result = TransformPythonLongToHugeInt(ele, target_type);
 	}
@@ -573,21 +476,10 @@ struct PythonValueConversion {
 		result = CastToTarget(Value::UBIGINT(val), cast_as);
 	}
 	static void HandleBigint(Value &res, const LogicalType &target_type, int64_t value) {
-		switch (target_type.id()) {
-		case LogicalTypeId::UNKNOWN: {
-			if (value < (int64_t)std::numeric_limits<int32_t>::min() ||
-			    value > (int64_t)std::numeric_limits<int32_t>::max()) {
-				res = Value::BIGINT(value);
-			} else {
-				// To match default duckdb behavior, numeric values without a specified type should not become a smaller
-				// type than INT32
-				res = Value::INTEGER(value);
-			}
-			break;
-		}
-		default:
-			res = CastToTarget(Value::BIGINT(value), target_type);
-			break;
+		if (target_type.id() == LogicalTypeId::UNKNOWN) {
+			res = SniffIntegerValue(value);
+		} else {
+			res = CastToTarget(SniffIntegerValue(value), target_type);
 		}
 	}
 
@@ -736,9 +628,6 @@ struct PythonVectorConversion {
 			FallbackValueConversion(result, result_offset, CastToTarget(Value::DOUBLE(val), result.GetType()));
 			break;
 		}
-	}
-	static void HandleLongAsDouble(Vector &result, const idx_t &result_offset, double val) {
-		FallbackValueConversion(result, result_offset, Value::DOUBLE(val));
 	}
 	static void HandleLongOverflow(Vector &result, const idx_t &result_offset, py::handle ele) {
 		Value result_val = TransformPythonLongToHugeInt(ele, result.GetType());
