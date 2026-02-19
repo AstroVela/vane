@@ -223,14 +223,12 @@ void PythonFilesystem::CreateDirectory(const string &directory, optional_ptr<Fil
 }
 bool PythonFilesystem::ListFiles(const string &directory, const std::function<void(const string &, bool)> &callback,
                                  FileOpener *opener) {
-	static py::str DIRECTORY("directory");
-
 	D_ASSERT(!py::gil_check());
 	PythonGILWrapper gil;
 	bool nonempty = false;
 
 	for (auto item : filesystem.attr("ls")(py::str(directory))) {
-		bool is_dir = DIRECTORY.equal(item["type"]);
+		bool is_dir = py::cast<std::string>(item["type"]) == "directory";
 		callback(py::str(item["name"]), is_dir);
 		nonempty = true;
 	}
