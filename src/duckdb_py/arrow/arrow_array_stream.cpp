@@ -1,4 +1,5 @@
 #include "duckdb_python/arrow/arrow_array_stream.hpp"
+#include "duckdb_python/arrow/polars_filter_pushdown.hpp"
 #include "duckdb_python/arrow/pyarrow_filter_pushdown.hpp"
 
 #include "duckdb_python/pyconnection/pyconnection.hpp"
@@ -65,6 +66,55 @@ unique_ptr<ArrowArrayStreamWrapper> PythonTableArrowArrayStreamFactory::Produce(
 	D_ASSERT(factory->arrow_object);
 	py::handle arrow_obj_handle(factory->arrow_object);
 	auto arrow_object_type = factory->cached_arrow_type;
+
+	if (arrow_object_type == PyArrowObjectType::PolarsLazyFrame) {
+		py::object lf = py::reinterpret_borrow<py::object>(arrow_obj_handle);
+
+		auto filters = parameters.filters;
+		bool filters_pushed = false;
+
+		// Translate DuckDB filters to Polars expressions and push into the lazy plan
+		if (filters && !filters->filters.empty()) {
+			try {
+				auto filter_expr = PolarsFilterPushdown::TransformFilter(
+				    *filters, parameters.projected_columns.projection_map, parameters.projected_columns.filter_to_col,
+				    factory->client_properties);
+				if (!filter_expr.is(py::none())) {
+					lf = lf.attr("filter")(filter_expr);
+					filters_pushed = true;
+				}
+			} catch (...) {
+				// Fallback: DuckDB handles filtering post-scan
+			}
+		}
+
+		// If no filters were pushed and we have a cached Arrow table, reuse it. This avoids re-reading from source and
+		// re-converting on repeated unfiltered scans.
+		py::object arrow_table;
+		if (!filters_pushed && factory->cached_arrow_table.ptr() != nullptr) {
+			arrow_table = factory->cached_arrow_table;
+		} else {
+			arrow_table = lf.attr("collect")().attr("to_arrow")();
+			// Cache only unfiltered results (filtered results are partial)
+			if (!filters_pushed) {
+				factory->cached_arrow_table = arrow_table;
+			}
+		}
+
+		// Apply column projection
+		auto &column_list = parameters.projected_columns.columns;
+		if (!column_list.empty()) {
+			arrow_table = arrow_table.attr("select")(py::cast(column_list));
+		}
+
+		auto capsule_obj = arrow_table.attr("__arrow_c_stream__")();
+		auto capsule = py::reinterpret_borrow<py::capsule>(capsule_obj);
+		auto stream = capsule.get_pointer<struct ArrowArrayStream>();
+		auto res = make_uniq<ArrowArrayStreamWrapper>();
+		res->arrow_array_stream = *stream;
+		stream->release = nullptr;
+		return res;
+	}
 
 	if (arrow_object_type == PyArrowObjectType::PyCapsuleInterface || arrow_object_type == PyArrowObjectType::Table) {
 		py::object capsule_obj = arrow_obj_handle.attr("__arrow_c_stream__")();
@@ -190,6 +240,20 @@ void PythonTableArrowArrayStreamFactory::GetSchema(uintptr_t factory_ptr, ArrowS
 	py::handle arrow_obj_handle(factory->arrow_object);
 
 	auto type = factory->cached_arrow_type;
+	if (type == PyArrowObjectType::PolarsLazyFrame) {
+		// head(0).collect().to_arrow() gives the Arrow-exported schema (e.g. large_string) without materializing data.
+		// collect_schema() would give Polars-native types (e.g. string_view) that don't match the actual export.
+		const auto empty_arrow = arrow_obj_handle.attr("head")(0).attr("collect")().attr("to_arrow")();
+		const auto schema_capsule = empty_arrow.attr("schema").attr("__arrow_c_schema__")();
+		const auto capsule = py::reinterpret_borrow<py::capsule>(schema_capsule);
+		const auto arrow_schema = capsule.get_pointer<struct ArrowSchema>();
+		factory->cached_schema = *arrow_schema;
+		arrow_schema->release = nullptr;
+		factory->schema_cached = true;
+		schema.arrow_schema = factory->cached_schema;
+		schema.arrow_schema.release = nullptr;
+		return;
+	}
 	if (type == PyArrowObjectType::PyCapsuleInterface || type == PyArrowObjectType::Table) {
 		// Get __arrow_c_schema__ if it exists
 		if (py::hasattr(arrow_obj_handle, "__arrow_c_schema__")) {

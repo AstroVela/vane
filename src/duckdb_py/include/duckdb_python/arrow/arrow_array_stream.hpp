@@ -51,7 +51,16 @@ public:
 
 } // namespace pyarrow
 
-enum class PyArrowObjectType { Invalid, Table, Scanner, Dataset, PyCapsule, PyCapsuleInterface, MessageReader };
+enum class PyArrowObjectType {
+	Invalid,
+	Table,
+	Scanner,
+	Dataset,
+	PyCapsule,
+	PyCapsuleInterface,
+	MessageReader,
+	PolarsLazyFrame
+};
 
 void TransformDuckToArrowChunk(ArrowSchema &arrow_schema, ArrowArray &data, py::list &batches);
 
@@ -66,6 +75,10 @@ public:
 	}
 
 	~PythonTableArrowArrayStreamFactory() {
+		if (cached_arrow_table.ptr() != nullptr) {
+			py::gil_scoped_acquire acquire;
+			cached_arrow_table = py::object();
+		}
 		if (cached_schema.release) {
 			cached_schema.release(&cached_schema);
 		}
@@ -83,6 +96,10 @@ public:
 
 	const ClientProperties client_properties;
 	const PyArrowObjectType cached_arrow_type;
+
+	//! Cached Arrow table from an unfiltered .collect().to_arrow() on a LazyFrame.
+	//! Avoids re-reading from source and re-converting on repeated scans without filters.
+	py::object cached_arrow_table;
 
 private:
 	ArrowSchema cached_schema;

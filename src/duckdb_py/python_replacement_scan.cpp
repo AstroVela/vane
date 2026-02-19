@@ -152,9 +152,7 @@ unique_ptr<TableRef> PythonReplacementScan::TryReplacementObject(const py::objec
 		CreateArrowScan(name, arrow_dataset, *table_function, children, client_properties, PyArrowObjectType::Table,
 		                *context.db);
 	} else if (PolarsDataFrame::IsLazyFrame(entry)) {
-		auto materialized = entry.attr("collect")();
-		auto arrow_dataset = materialized.attr("to_arrow")();
-		CreateArrowScan(name, arrow_dataset, *table_function, children, client_properties, PyArrowObjectType::Table,
+		CreateArrowScan(name, entry, *table_function, children, client_properties, PyArrowObjectType::PolarsLazyFrame,
 		                *context.db);
 	} else if ((arrow_type = DuckDBPyConnection::GetArrowType(entry)) != PyArrowObjectType::Invalid &&
 	           !(arrow_type == PyArrowObjectType::MessageReader && !relation)) {
