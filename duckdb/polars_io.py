@@ -130,6 +130,14 @@ def _pl_tree_to_sql(tree: _ExpressionTree) -> str:
         )
         return str(int_literal)
 
+    if node_type == "Float":
+        # Direct float literals
+        float_literal = tree[node_type]
+        assert isinstance(float_literal, (float, int, str)), (
+            f"The value of a Float should be a float, int or str but got {type(float_literal)}"
+        )
+        return str(float_literal)
+
     if node_type == "Function":
         # Handle boolean functions like IsNull, IsNotNull
         func_tree = tree[node_type]
@@ -162,8 +170,8 @@ def _pl_tree_to_sql(tree: _ExpressionTree) -> str:
     if node_type == "Cast":
         cast_tree = tree[node_type]
         assert isinstance(cast_tree, dict), f"A {node_type} should be a dict but got {type(cast_tree)}"
-        if cast_tree.get("options") != "NonStrict":
-            msg = f"Only NonStrict casts can be safely unwrapped, got {cast_tree.get('options')!r}"
+        if cast_tree.get("options") not in ("NonStrict", "Strict"):
+            msg = f"Only NonStrict/Strict casts can be safely unwrapped, got {cast_tree.get('options')!r}"
             raise NotImplementedError(msg)
         cast_expr = cast_tree["expr"]
         assert isinstance(cast_expr, dict), f"A {node_type} should be a dict but got {type(cast_expr)}"
