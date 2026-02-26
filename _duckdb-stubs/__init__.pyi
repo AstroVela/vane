@@ -16,23 +16,23 @@ if typing.TYPE_CHECKING:
     from duckdb import sqltypes, func
 
     # the field_ids argument to to_parquet and write_parquet has a recursive structure
-    ParquetFieldIdsType = Mapping[str, typing.Union[int, "ParquetFieldIdsType"]]
+    ParquetFieldIdsType = Mapping[str, int | "ParquetFieldIdsType"]
 
-_ExpressionLike: typing.TypeAlias = typing.Union[
-    "Expression",
-    str,
-    int,
-    float,
-    bool,
-    bytes,
-    None,
-    datetime.date,
-    datetime.datetime,
-    datetime.time,
-    datetime.timedelta,
-    decimal.Decimal,
-    uuid.UUID,
-]
+_ExpressionLike: typing.TypeAlias = (
+    "Expression"
+    | str
+    | int
+    | float
+    | bool
+    | bytes
+    | None
+    | datetime.date
+    | datetime.datetime
+    | datetime.time
+    | datetime.timedelta
+    | decimal.Decimal
+    | uuid.UUID
+)
 
 __all__: list[str] = [
     "BinderException",
@@ -358,7 +358,7 @@ class DuckDBPyConnection:
     @typing.overload
     def pl(
         self, rows_per_batch: typing.SupportsInt = 1000000, *, lazy: bool = False
-    ) -> typing.Union[polars.DataFrame, polars.LazyFrame]: ...
+    ) -> polars.DataFrame | polars.LazyFrame: ...
     def query(self, query: str, *, alias: str = "", params: object = None) -> DuckDBPyRelation: ...
     def query_progress(self) -> float: ...
     def read_csv(
@@ -587,11 +587,14 @@ class DuckDBPyRelation:
     def histogram(
         self, expression: str, groups: str = "", window_spec: str = "", projected_columns: str = ""
     ) -> DuckDBPyRelation: ...
-    def insert(self, values: typing.List[object]) -> None: ...
+    def insert(self, values: list[object]) -> None: ...
     def insert_into(self, table_name: str) -> None: ...
     def intersect(self, other_rel: DuckDBPyRelation) -> DuckDBPyRelation: ...
     def join(
-        self, other_rel: DuckDBPyRelation, condition: Expression | str, how: str = "inner"
+        self,
+        other_rel: DuckDBPyRelation,
+        condition: Expression | str,
+        how: typing.Literal["inner", "left", "right", "outer", "semi", "anti"] = "inner",
     ) -> DuckDBPyRelation: ...
     def lag(
         self,
@@ -657,7 +660,7 @@ class DuckDBPyRelation:
     @typing.overload
     def pl(
         self, batch_size: typing.SupportsInt = 1000000, *, lazy: bool = False
-    ) -> typing.Union[polars.DataFrame, polars.LazyFrame]: ...
+    ) -> polars.DataFrame | polars.LazyFrame: ...
     def product(
         self, expression: str, groups: str = "", window_spec: str = "", projected_columns: str = ""
     ) -> DuckDBPyRelation: ...
@@ -665,7 +668,7 @@ class DuckDBPyRelation:
     def quantile(
         self,
         expression: str,
-        q: float | typing.List[float] = 0.5,
+        q: float | list[float] = 0.5,
         groups: str = "",
         window_spec: str = "",
         projected_columns: str = "",
@@ -673,7 +676,7 @@ class DuckDBPyRelation:
     def quantile_cont(
         self,
         expression: str,
-        q: float | typing.List[float] = 0.5,
+        q: float | list[float] = 0.5,
         groups: str = "",
         window_spec: str = "",
         projected_columns: str = "",
@@ -681,7 +684,7 @@ class DuckDBPyRelation:
     def quantile_disc(
         self,
         expression: str,
-        q: float | typing.List[float] = 0.5,
+        q: float | list[float] = 0.5,
         groups: str = "",
         window_spec: str = "",
         projected_columns: str = "",
@@ -691,8 +694,8 @@ class DuckDBPyRelation:
     def rank_dense(self, window_spec: str, projected_columns: str = "") -> DuckDBPyRelation: ...
     def row_number(self, window_spec: str, projected_columns: str = "") -> DuckDBPyRelation: ...
     def select(self, *args: _ExpressionLike, groups: str = "") -> DuckDBPyRelation: ...
-    def select_dtypes(self, types: typing.List[sqltypes.DuckDBPyType | str]) -> DuckDBPyRelation: ...
-    def select_types(self, types: typing.List[sqltypes.DuckDBPyType | str]) -> DuckDBPyRelation: ...
+    def select_dtypes(self, types: list[sqltypes.DuckDBPyType | str]) -> DuckDBPyRelation: ...
+    def select_types(self, types: list[sqltypes.DuckDBPyType | str]) -> DuckDBPyRelation: ...
     def set_alias(self, alias: str) -> DuckDBPyRelation: ...
     def show(
         self,
@@ -741,7 +744,7 @@ class DuckDBPyRelation:
         overwrite: bool | None = None,
         per_thread_output: bool | None = None,
         use_tmp_file: bool | None = None,
-        partition_by: typing.List[str] | None = None,
+        partition_by: list[str] | None = None,
         write_partition_columns: bool | None = None,
     ) -> None: ...
     def to_df(self, *, date_as_object: bool = False) -> pandas.DataFrame: ...
@@ -756,7 +759,7 @@ class DuckDBPyRelation:
         overwrite: bool | None = None,
         per_thread_output: bool | None = None,
         use_tmp_file: bool | None = None,
-        partition_by: typing.List[str] | None = None,
+        partition_by: list[str] | None = None,
         write_partition_columns: bool | None = None,
         append: bool | None = None,
         filename_pattern: str | None = None,
@@ -798,7 +801,7 @@ class DuckDBPyRelation:
         overwrite: bool | None = None,
         per_thread_output: bool | None = None,
         use_tmp_file: bool | None = None,
-        partition_by: typing.List[str] | None = None,
+        partition_by: list[str] | None = None,
         write_partition_columns: bool | None = None,
     ) -> None: ...
     def write_parquet(
@@ -812,7 +815,7 @@ class DuckDBPyRelation:
         overwrite: bool | None = None,
         per_thread_output: bool | None = None,
         use_tmp_file: bool | None = None,
-        partition_by: typing.List[str] | None = None,
+        partition_by: list[str] | None = None,
         write_partition_columns: bool | None = None,
         append: bool | None = None,
         filename_pattern: str | None = None,
@@ -821,17 +824,17 @@ class DuckDBPyRelation:
     @property
     def alias(self) -> str: ...
     @property
-    def columns(self) -> typing.List[str]: ...
+    def columns(self) -> list[str]: ...
     @property
-    def description(self) -> typing.List[tuple[str, sqltypes.DuckDBPyType, None, None, None, None, None]]: ...
+    def description(self) -> list[tuple[str, sqltypes.DuckDBPyType, None, None, None, None, None]]: ...
     @property
-    def dtypes(self) -> typing.List[sqltypes.DuckDBPyType]: ...
+    def dtypes(self) -> list[sqltypes.DuckDBPyType]: ...
     @property
     def shape(self) -> tuple[int, int]: ...
     @property
     def type(self) -> str: ...
     @property
-    def types(self) -> typing.List[sqltypes.DuckDBPyType]: ...
+    def types(self) -> list[sqltypes.DuckDBPyType]: ...
 
 class Error(Exception): ...
 
@@ -1341,7 +1344,7 @@ def pl(
     *,
     lazy: bool = False,
     connection: DuckDBPyConnection | None = None,
-) -> typing.Union[polars.DataFrame, polars.LazyFrame]: ...
+) -> polars.DataFrame | polars.LazyFrame: ...
 def project(
     df: pandas.DataFrame, *args: _ExpressionLike, groups: str = "", connection: DuckDBPyConnection | None = None
 ) -> DuckDBPyRelation: ...
