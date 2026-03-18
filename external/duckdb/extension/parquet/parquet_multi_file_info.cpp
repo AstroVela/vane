@@ -114,6 +114,7 @@ struct ParquetReadGlobalState : public GlobalTableFunctionState {
 
 struct ParquetReadLocalState : public LocalTableFunctionState {
 	ParquetReaderScanState scan_state;
+	vector<idx_t> group_indexes;
 };
 
 static void ParseFileRowNumberOption(MultiFileReaderBindData &bind_data, ParquetOptions &options,
@@ -901,9 +902,14 @@ bool ParquetReader::TryInitializeScan(ClientContext &context, GlobalTableFunctio
 		row_group_idx = gstate.row_group_index++;
 	}
 	// The current reader has rowgroups left to be scanned
-	vector<idx_t> group_indexes {row_group_idx};
-	InitializeScan(context, lstate.scan_state, group_indexes);
+	lstate.group_indexes = {row_group_idx};
 	return true;
+}
+
+void ParquetReader::PrepareScan(ClientContext &context, GlobalTableFunctionState &gstate_p,
+                                LocalTableFunctionState &lstate_p) {
+	auto &lstate = lstate_p.Cast<ParquetReadLocalState>();
+	InitializeScan(context, lstate.scan_state, lstate.group_indexes);
 }
 
 void ParquetReader::FinishFile(ClientContext &context, GlobalTableFunctionState &gstate_p) {
@@ -925,7 +931,6 @@ AsyncResult ParquetReader::Scan(ClientContext &context, GlobalTableFunctionState
 		}
 	}
 #endif
-
 	auto &gstate = gstate_p.Cast<ParquetReadGlobalState>();
 	auto &local_state = local_state_p.Cast<ParquetReadLocalState>();
 	local_state.scan_state.op = gstate.op;
