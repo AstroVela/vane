@@ -95,9 +95,9 @@ void ExecutePullBasedUDFPlan(Connection &con, const Value &payload) {
 	prepared->memory_type = QueryResultMemoryType::IN_MEMORY;
 	prepared->physical_plan = std::move(physical_plan);
 
-	auto &sink = PhysicalResultCollector::GetResultCollector(context, *prepared);
+	auto sink = PhysicalResultCollector::GetResultCollector(context, *prepared);
 	Executor executor(context);
-	executor.Initialize(sink);
+	executor.Initialize(std::move(sink));
 	while (!executor.ExecutionIsFinished()) {
 		auto result = executor.ExecuteTask();
 		if (result == PendingExecutionResult::BLOCKED || result == PendingExecutionResult::NO_TASKS_AVAILABLE) {

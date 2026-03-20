@@ -21,7 +21,7 @@ using namespace std;
 namespace {
 
 get_result_collector_t CountingResultCollector(idx_t &calls) {
-	return [&calls](ClientContext &context, PreparedStatementData &data) -> PhysicalOperator & {
+	return [&calls](ClientContext &context, PreparedStatementData &data) -> duckdb::unique_ptr<PhysicalOperator> {
 		calls++;
 		return PhysicalResultCollector::GetResultCollector(context, data);
 	};
@@ -95,8 +95,9 @@ TEST_CASE("ClientContext drains executor tasks during exception unwinding", "[ap
 	try {
 		Connection connection(db);
 		PendingQueryParameters parameters;
-		parameters.get_result_collector = [](ClientContext &, PreparedStatementData &data) -> PhysicalOperator & {
-			return data.physical_plan->Make<PhysicalBatchCollector>(data);
+		parameters.get_result_collector = [](ClientContext &,
+		                                     PreparedStatementData &data) -> duckdb::unique_ptr<PhysicalOperator> {
+			return make_uniq<PhysicalBatchCollector>(*data.physical_plan, data);
 		};
 		auto pending = connection.PendingQuery("SELECT 42", parameters);
 		if (pending->HasError()) {
@@ -288,8 +289,8 @@ TEST_CASE("Pending query result collector overrides are query-local", "[api][res
 	}
 
 	SECTION("collector initialization failure") {
-		parameters.get_result_collector = [&query_collector_calls](ClientContext &,
-		                                                           PreparedStatementData &) -> PhysicalOperator & {
+		parameters.get_result_collector =
+		    [&query_collector_calls](ClientContext &, PreparedStatementData &) -> duckdb::unique_ptr<PhysicalOperator> {
 			query_collector_calls++;
 			throw InvalidInputException("injected result collector failure");
 		};

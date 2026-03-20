@@ -149,7 +149,7 @@ public:
 	CountingResultCollectorForTest() : calls(make_shared_ptr<std::atomic<idx_t>>(0)) {
 	}
 
-	PhysicalOperator &operator()(ClientContext &context, PreparedStatementData &data) const {
+	unique_ptr<PhysicalOperator> operator()(ClientContext &context, PreparedStatementData &data) const {
 		calls->fetch_add(1, std::memory_order_relaxed);
 		return PhysicalResultCollector::GetResultCollector(context, data);
 	}

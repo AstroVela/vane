@@ -903,18 +903,18 @@ TEST_CASE("Executor: Manually built PhysicalPlan with direct Executor API",
 		prepared_data->memory_type = QueryResultMemoryType::IN_MEMORY;
 		prepared_data->physical_plan = std::move(physical_plan);
 
-		auto &sink = PhysicalResultCollector::GetResultCollector(client_context, *prepared_data);
-		std::cerr << "[3] Added sink: " << PhysicalOperatorToString(sink.type) << std::endl;
+		auto sink = PhysicalResultCollector::GetResultCollector(client_context, *prepared_data);
+		std::cerr << "[3] Added sink: " << PhysicalOperatorToString(sink->type) << std::endl;
 
 		// Print complete plan
 		std::cerr << "\n[Plan Structure]" << std::endl;
-		print_plan_recursive(sink, 0);
+		print_plan_recursive(*sink, 0);
 
 		//=============================================================
 		// STEP 4: Initialize Executor and execute via ExecuteTask()
 		//=============================================================
 		Executor executor(client_context);
-		executor.Initialize(sink);
+		executor.Initialize(std::move(sink));
 
 		idx_t total_pipelines = executor.GetTotalPipelines();
 		std::cerr << "\n[4] Executor: " << total_pipelines << " pipeline(s)" << std::endl;
@@ -1001,18 +1001,18 @@ TEST_CASE("Executor: Manually built PhysicalPlan with direct Executor API",
 		prepared_data->memory_type = QueryResultMemoryType::IN_MEMORY;
 		prepared_data->physical_plan = std::move(physical_plan);
 
-		auto &sink = PhysicalResultCollector::GetResultCollector(client_context, *prepared_data);
-		std::cerr << "[3] Added sink: " << PhysicalOperatorToString(sink.type) << std::endl;
+		auto sink = PhysicalResultCollector::GetResultCollector(client_context, *prepared_data);
+		std::cerr << "[3] Added sink: " << PhysicalOperatorToString(sink->type) << std::endl;
 
 		// Print complete plan
 		std::cerr << "\n[Plan Structure]" << std::endl;
-		print_plan_recursive(sink, 0);
+		print_plan_recursive(*sink, 0);
 
 		//=============================================================
 		// STEP 4: Initialize Executor and execute via ExecuteTask()
 		//=============================================================
 		Executor executor(client_context);
-		executor.Initialize(sink);
+		executor.Initialize(std::move(sink));
 
 		idx_t total_pipelines = executor.GetTotalPipelines();
 		std::cerr << "\n[4] Executor: " << total_pipelines << " pipeline(s)" << std::endl;

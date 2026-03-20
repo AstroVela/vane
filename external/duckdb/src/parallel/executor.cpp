@@ -460,6 +460,12 @@ void Executor::VerifyPipelines() {
 #endif
 }
 
+void Executor::Initialize(unique_ptr<PhysicalOperator> physical_plan_p) {
+	Reset();
+	owned_plan = std::move(physical_plan_p);
+	InitializeInternal(*owned_plan, true);
+}
+
 void Executor::Initialize(PhysicalOperator &plan) {
 	Reset();
 	InitializeInternal(plan, true);

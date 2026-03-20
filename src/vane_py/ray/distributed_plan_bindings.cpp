@@ -3091,12 +3091,13 @@ struct PyPhysicalPlanWrapperRunner {
 			PendingQueryParameters parameters;
 			// execute_native always returns a materialized result. Keep that collector contract query-local,
 			// while only allowing parallel collection when the plan does not require order preservation.
-			parameters.get_result_collector = [](duckdb::ClientContext &context,
-			                                     duckdb::PreparedStatementData &data) -> duckdb::PhysicalOperator & {
+			parameters.get_result_collector =
+			    [](duckdb::ClientContext &context,
+			       duckdb::PreparedStatementData &data) -> duckdb::unique_ptr<duckdb::PhysicalOperator> {
 				auto &physical_plan = *data.physical_plan;
 				const bool preserve_order =
 				    duckdb::PhysicalPlanGenerator::PreserveInsertionOrder(context, physical_plan.Root());
-				return physical_plan.Make<duckdb::PhysicalMaterializedCollector>(data, !preserve_order);
+				return duckdb::make_uniq<duckdb::PhysicalMaterializedCollector>(physical_plan, data, !preserve_order);
 			};
 			std::unique_ptr<QueryResult> query_result;
 			vector<PipelineProgressSnapshot> stable_pipeline_snapshots;
