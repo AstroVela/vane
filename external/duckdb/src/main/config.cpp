@@ -72,6 +72,7 @@ bool DBConfigOptions::debug_print_bindings = false;
 
 static const ConfigurationOption internal_options[] = {
 
+    DUCKDB_GLOBAL(DeltaOnlyVariantEncodingEnabledSetting),
     DUCKDB_GLOBAL(AccessModeSetting),
     DUCKDB_SETTING_CALLBACK(AllocatorBackgroundThreadsSetting),
     DUCKDB_GLOBAL(AllocatorBulkDeallocationFlushThresholdSetting),
@@ -217,12 +218,12 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_SETTING(ZstdMinStringLengthSetting),
     FINAL_SETTING};
 
-static const ConfigurationAlias setting_aliases[] = {DUCKDB_SETTING_ALIAS("memory_limit", 102),
-                                                     DUCKDB_SETTING_ALIAS("null_order", 42),
-                                                     DUCKDB_SETTING_ALIAS("profiling_output", 121),
-                                                     DUCKDB_SETTING_ALIAS("user", 136),
-                                                     DUCKDB_SETTING_ALIAS("wal_autocheckpoint", 24),
-                                                     DUCKDB_SETTING_ALIAS("worker_threads", 135),
+static const ConfigurationAlias setting_aliases[] = {DUCKDB_SETTING_ALIAS("memory_limit", 103),
+                                                     DUCKDB_SETTING_ALIAS("null_order", 43),
+                                                     DUCKDB_SETTING_ALIAS("profiling_output", 122),
+                                                     DUCKDB_SETTING_ALIAS("user", 137),
+                                                     DUCKDB_SETTING_ALIAS("wal_autocheckpoint", 25),
+                                                     DUCKDB_SETTING_ALIAS("worker_threads", 136),
                                                      FINAL_ALIAS};
 
 vector<ConfigurationOption> DBConfig::GetOptions() {
