@@ -202,6 +202,9 @@ unique_ptr<LogicalOperator> LogicalOperator::Deserialize(Deserializer &deseriali
 	}
 	deserializer.Unset<LogicalOperatorType>();
 	result->children = std::move(children);
+	if (type == LogicalOperatorType::LOGICAL_UPDATE) {
+		LogicalUpdate::RewriteInPlaceUpdates(*result);
+	}
 	return result;
 }
 
