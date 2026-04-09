@@ -21,6 +21,7 @@ CONFIGS_DIR = ./test/configs
 
 MKFILE_PATH := $(abspath $(lastword $(MAKEFILE_LIST)))
 PROJ_DIR := $(dir $(MKFILE_PATH))
+VANE_PROJECT_ROOT := $(abspath $(PROJ_DIR)/../..)
 
 PYTHON ?= python3
 
@@ -510,7 +511,31 @@ bloaty: reldebug bloaty/bloaty
 
 # Generate compile commands without actually building
 clangd:
-	cmake -DCMAKE_BUILD_TYPE=Debug ${CMAKE_VARS} -B .cache/clangd/debug .
+	@if test -f "$(VANE_PROJECT_ROOT)/DUCKDB_UPSTREAM_VERSION" && \
+		test -f "$(VANE_PROJECT_ROOT)/scripts/sync_duckdb_source_id.py" && \
+		test -f "$(VANE_PROJECT_ROOT)/scripts/resolve_duckdb_fork_version.py"; then \
+		duckdb_source_id="$$($(PYTHON) "$(VANE_PROJECT_ROOT)/scripts/sync_duckdb_source_id.py" --print)" && \
+		duckdb_upstream_version="$$(cat "$(VANE_PROJECT_ROOT)/DUCKDB_UPSTREAM_VERSION")" && \
+		duckdb_fork_version="$$($(PYTHON) "$(VANE_PROJECT_ROOT)/scripts/resolve_duckdb_fork_version.py" --print-version)" && \
+		short_source_id="$$(printf '%.10s' "$$duckdb_source_id")" && \
+		vcpkg_install_root="$${VCPKG_INSTALLED_DIR:-$(VANE_PROJECT_ROOT)/vcpkg_installed}" && \
+		case "$$vcpkg_install_root" in /*) ;; *) vcpkg_install_root="$(VANE_PROJECT_ROOT)/$$vcpkg_install_root";; esac && \
+		vcpkg_prefix="$$vcpkg_install_root/$${VCPKG_TARGET_TRIPLET:-x64-linux}" && \
+		test -f "$$vcpkg_prefix/share/arrow/ArrowConfig.cmake" || { \
+			echo "Pinned Arrow package not found at $$vcpkg_prefix/share/arrow/ArrowConfig.cmake" >&2; \
+			echo "Run 'bash scripts/bootstrap_vcpkg.sh' from the Vane repository root first." >&2; \
+			exit 1; \
+		} && \
+		cmake -DCMAKE_BUILD_TYPE=Debug ${CMAKE_VARS} \
+			-DCMAKE_PREFIX_PATH="$$vcpkg_prefix" \
+			-DOVERRIDE_GIT_DESCRIBE="$$duckdb_upstream_version-0-g$$short_source_id" \
+			-DDUCKDB_EXPLICIT_VERSION="$$duckdb_fork_version" \
+			-DGIT_COMMIT_HASH="$$short_source_id" \
+			-B .cache/clangd/debug .; \
+	else \
+		cmake -DCMAKE_BUILD_TYPE=Debug ${CMAKE_VARS} -B .cache/clangd/debug .; \
+	fi
+	cp .cache/clangd/debug/compile_commands.json .cache/clangd/compile_commands.json
 
 coverage-check:
 	./scripts/coverage_check.sh
