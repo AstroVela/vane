@@ -382,8 +382,6 @@ def test_release_runtime_is_self_contained_by_default():
     }
 
     expected_extensions = {"core_functions", "httpfs", "icu", "json", "parquet"}
-    if platform.system() == "Linux" and sys.maxsize > 2**32:
-        expected_extensions.add("jemalloc")
 
     assert settings == {
         "allow_unsigned_extensions": "false",

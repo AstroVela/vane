@@ -17,7 +17,7 @@ Vane is not affiliated with, endorsed by, or maintained by the DuckDB Foundation
 
 DuckDB vendors permissively licensed native libraries below `external/duckdb/third_party/` and selected extensions below `external/duckdb/extension/`. Their license files are preserved in those directories and included in Python release metadata.
 
-The release allowlist includes only dependencies needed by the core engine and the `core_functions`, `icu`, `jemalloc`, `json`, and `parquet` extensions. In particular, release artifacts exclude:
+The release allowlist includes only dependencies needed by the core engine and the `core_functions`, `icu`, `json`, and `parquet` extensions. In particular, release artifacts exclude:
 
 - `external/duckdb/extension/tpch/`
 - `external/duckdb/extension/tpcds/`

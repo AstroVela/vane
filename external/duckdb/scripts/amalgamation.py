@@ -133,7 +133,9 @@ def get_includes(fpath, text):
             or included_file == 'generated_extension_headers.hpp'
         ):
             continue
-        if 'allocator.cpp' in fpath and included_file.endswith('jemalloc_extension.hpp'):
+        if 'allocator_jemalloc.cpp' in fpath and (
+            included_file.endswith('jemalloc.h') or included_file.endswith('malloc_ncpus.h')
+        ):
             continue
         if x[0] in include_statements:
             raise Exception(f"duplicate include {x[0]} in file {fpath}")

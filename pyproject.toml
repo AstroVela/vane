@@ -22,7 +22,7 @@ license-files = [
     "external/duckdb/third_party/tdigest/NOTICES",
     "external/duckdb/third_party/thrift/thrift/LICENSE",
     "external/duckdb/extension/icu/third_party/icu/LICENSE",
-    "external/duckdb/extension/jemalloc/jemalloc/LICENSE",
+    "external/duckdb/third_party/jemalloc/LICENSE",
 ]
 keywords = ["Vane", "DuckDB", "Ray", "Distributed", "Database", "SQL", "OLAP"]
 requires-python = ">=3.10,<3.15"
@@ -125,7 +125,7 @@ exclude = [
 ]
 
 [tool.scikit-build.cmake.define]
-BUILD_EXTENSIONS = "core_functions;json;parquet;icu;jemalloc;httpfs"
+BUILD_EXTENSIONS = "core_functions;json;parquet;icu;httpfs"
 
 # Override: if COVERAGE is set then:
 # - we create a RelWithDebInfo build
@@ -272,7 +272,7 @@ include = [
     "external/duckdb/extension/loader/**",
     "external/duckdb/extension/core_functions/**",
     "external/duckdb/extension/icu/**",
-    "external/duckdb/extension/jemalloc/**",
+    "external/duckdb/third_party/jemalloc/**",
     "external/duckdb/extension/json/**",
     "external/duckdb/extension/parquet/**",
 
