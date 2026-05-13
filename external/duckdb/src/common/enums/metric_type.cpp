@@ -20,6 +20,7 @@ profiler_settings_t MetricsUtils::GetAllMetrics() {
 		MetricType::CUMULATIVE_ROWS_SCANNED,
 		MetricType::CUMULATIVE_ROW_GROUPS_SCANNED,
 		MetricType::CUMULATIVE_TOTAL_ROW_GROUPS_TO_SCAN,
+		MetricType::CUMULATIVE_VACUUM_TIME,
 		MetricType::EXTRA_INFO,
 		MetricType::LATENCY,
 		MetricType::OPERATOR_CARDINALITY,
@@ -232,6 +233,7 @@ profiler_settings_t MetricsUtils::GetFileMetrics() {
 		MetricType::ATTACH_REPLAY_WAL_LATENCY,
 		MetricType::CHECKPOINT_LATENCY,
 		MetricType::COMMIT_LOCAL_STORAGE_LATENCY,
+		MetricType::CUMULATIVE_VACUUM_TIME,
 		MetricType::TOTAL_BYTES_READ,
 		MetricType::TOTAL_BYTES_WRITTEN,
 		MetricType::WAITING_TO_ATTACH_LATENCY,
@@ -246,6 +248,7 @@ bool MetricsUtils::IsFileMetric(MetricType type) {
 	case MetricType::ATTACH_REPLAY_WAL_LATENCY:
 	case MetricType::CHECKPOINT_LATENCY:
 	case MetricType::COMMIT_LOCAL_STORAGE_LATENCY:
+	case MetricType::CUMULATIVE_VACUUM_TIME:
 	case MetricType::TOTAL_BYTES_READ:
 	case MetricType::TOTAL_BYTES_WRITTEN:
 	case MetricType::WAITING_TO_ATTACH_LATENCY:
@@ -359,6 +362,7 @@ profiler_settings_t MetricsUtils::GetRootScopeMetrics() {
 		MetricType::BLOCKED_THREAD_TIME,
 		MetricType::CHECKPOINT_LATENCY,
 		MetricType::COMMIT_LOCAL_STORAGE_LATENCY,
+		MetricType::CUMULATIVE_VACUUM_TIME,
 		MetricType::LATENCY,
 		MetricType::QUERY_NAME,
 		MetricType::ROWS_RETURNED,
@@ -378,6 +382,7 @@ bool MetricsUtils::IsRootScopeMetric(MetricType type) {
 	case MetricType::BLOCKED_THREAD_TIME:
 	case MetricType::CHECKPOINT_LATENCY:
 	case MetricType::COMMIT_LOCAL_STORAGE_LATENCY:
+	case MetricType::CUMULATIVE_VACUUM_TIME:
 	case MetricType::LATENCY:
 	case MetricType::QUERY_NAME:
 	case MetricType::ROWS_RETURNED:
