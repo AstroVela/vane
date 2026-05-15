@@ -88,6 +88,7 @@ OptionValueSet GetValueForOption(const string &name, const LogicalType &type) {
 	    {"extension_directory", {"test"}},
 	    {"extension_directories", {"[test]"}},
 	    {"max_expression_depth", {50}},
+	    {"write_buffer_row_group_memory_limit", {"4.0 GiB"}},
 	    {"max_memory", {"4.0 GiB"}},
 	    {"max_temp_directory_size", {"10.0 GiB"}},
 	    {"local_exchange_buffer_bytes", {"64.0 MiB"}},
