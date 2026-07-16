@@ -18,6 +18,11 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb_python/python_conversion.hpp"
+#include <mutex>
+#include "duckdb_python/pybind11/gil_wrapper.hpp"
+
+#include <thread>
+#include <unordered_map>
 
 namespace duckdb {
 
@@ -171,7 +176,7 @@ static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExce
 	// Through the capture of the lambda, we have access to the function pointer
 	// We just need to make sure that it doesn't get garbage collected
 	scalar_function_t func = [=](DataChunk &input, ExpressionState &state, Vector &result) -> void {
-		py::gil_scoped_acquire gil;
+		PythonGILWrapper gil;
 
 		const bool default_null_handling = null_handling == FunctionNullHandling::DEFAULT_NULL_HANDLING;
 
@@ -301,7 +306,7 @@ static scalar_function_t CreateNativeFunction(PyObject *function, PythonExceptio
 	// Through the capture of the lambda, we have access to the function pointer
 	// We just need to make sure that it doesn't get garbage collected
 	scalar_function_t func = [=](DataChunk &input, ExpressionState &state, Vector &result) -> void { // NOLINT
-		py::gil_scoped_acquire gil;
+		PythonGILWrapper gil;
 
 		const bool default_null_handling = null_handling == FunctionNullHandling::DEFAULT_NULL_HANDLING;
 
@@ -390,6 +395,28 @@ static bool NumpyDeprecatesAccessToCore(const py::tuple &numpy_version) {
 		return true;
 	}
 	return false;
+}
+
+static std::pair<bool, idx_t> ParseOptionalPositiveIdx(const py::object &value, const char *label) {
+	if (value.is_none()) {
+		return std::make_pair(false, idx_t(0));
+	}
+	auto parsed = py::cast<int64_t>(value);
+	if (parsed <= 0) {
+		throw InvalidInputException("%s must be a positive integer", label);
+	}
+	return std::make_pair(true, static_cast<idx_t>(parsed));
+}
+
+static std::pair<bool, double> ParseOptionalNonNegativeDouble(const py::object &value, const char *label) {
+	if (value.is_none()) {
+		return std::make_pair(false, 0.0);
+	}
+	auto parsed = py::cast<double>(value);
+	if (parsed < 0) {
+		throw InvalidInputException("%s must be a non-negative number", label);
+	}
+	return std::make_pair(true, parsed);
 }
 
 struct PythonUDFData {
@@ -538,7 +565,9 @@ ScalarFunction DuckDBPyConnection::CreateScalarUDF(const string &name, const py:
 	data.OverrideParameters(parameters);
 	data.OverrideReturnType(return_type);
 	data.Verify();
-	return data.GetFunction(udf, exception_handling, side_effects, connection.context->GetClientProperties());
+	auto scalar_function =
+	    data.GetFunction(udf, exception_handling, side_effects, connection.context->GetClientProperties());
+	return scalar_function;
 }
 
 } // namespace duckdb

@@ -1,4 +1,5 @@
 //===----------------------------------------------------------------------===//
+#include "duckdb_python/pybind11/gil_wrapper.hpp"
 //                         DuckDB
 //
 // duckdb_python/pybind11/registered_py_object.hpp
@@ -16,8 +17,11 @@ public:
 	explicit RegisteredObject(py::object obj_p) : obj(std::move(obj_p)) {
 	}
 	virtual ~RegisteredObject() {
-		py::gil_scoped_acquire acquire;
-		obj = py::none();
+		if (!obj) {
+			return;
+		}
+		PythonGILWrapper acquire;
+		obj = py::object();
 	}
 
 	py::object obj;

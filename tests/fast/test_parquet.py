@@ -34,6 +34,37 @@ class TestParquet:
         res = rel.execute().fetchall()
         assert res[0] == (b"foo",)
 
+    def test_read_parquet_holds_gil_for_relation_construction(self, duckdb_cursor):
+        rel = duckdb_cursor.read_parquet(filename)
+        assert rel.types == ["BLOB"]
+
+        res = rel.execute().fetchall()
+        assert res[0] == (b"foo",)
+
+    def test_topn_late_materialization_with_list_payload(self, tmp_path):
+        parquet_path = tmp_path / "topn_list_payload.parquet"
+        conn = duckdb.connect()
+        conn.sql(
+            """
+            SELECT *
+            FROM (
+                VALUES
+                    (1, [1.0::FLOAT, 2.0::FLOAT]),
+                    (2, [3.0::FLOAT, 4.0::FLOAT])
+            ) AS t(id, embedding)
+            """
+        ).write_parquet(str(parquet_path))
+
+        result = conn.sql(
+            f"""
+            SELECT id, embedding
+            FROM read_parquet('{parquet_path}')
+            ORDER BY id
+            LIMIT 1
+            """
+        ).fetchall()
+        assert result == [(1, [1.0, 2.0])]
+
     def test_scan_binary_as_string(self, duckdb_cursor):
         conn = duckdb.connect()
         res = conn.execute(

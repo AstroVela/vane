@@ -622,7 +622,55 @@ class DuckDBPyRelation:
         self, expression: str, groups: str = "", window_spec: str = "", projected_columns: str = ""
     ) -> DuckDBPyRelation: ...
     def map(
-        self, map_function: Callable[..., typing.Any], *, schema: dict[str, sqltypes.DuckDBPyType] | None = None
+        self,
+        map_function: Callable[..., typing.Any],
+        *,
+        return_type: sqltypes.DuckDBPyType,
+        batch_size: int | None = None,
+        cpus: float | None = None,
+        gpus: float | None = None,
+        execution_backend: typing.Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None = None,
+        actor_number: int | None = None,
+        side_effects: bool = False,
+    ) -> DuckDBPyRelation: ...
+    def map_batches(
+        self,
+        function: Callable[..., typing.Any],
+        schema: dict[str, sqltypes.DuckDBPyType] | None = None,
+        *,
+        batch_size: int | None = None,
+        output_batch_size: int | None = None,
+        min_task_batch_size: int | None = None,
+        preserve_compute_batch_boundaries: bool | None = None,
+        cpus: float | None = None,
+        gpus: float | None = None,
+        memory_bytes: int | None = None,
+        execution_backend: typing.Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None = None,
+        actor_number: int | None = None,
+        ray_actor_thread_policy: typing.Literal["managed", "ray_native"] | None = None,
+        streaming_breaker: bool | None = None,
+        target_max_batch_bytes: int | None = None,
+        task_input_max_bytes: int | None = None,
+        output_target_max_bytes: int | None = None,
+    ) -> DuckDBPyRelation: ...
+    def flat_map(
+        self,
+        function: Callable[..., typing.Any],
+        schema: dict[str, sqltypes.DuckDBPyType] | None = None,
+        *,
+        batch_size: int | None = None,
+        output_batch_size: int | None = None,
+        min_task_batch_size: int | None = None,
+        preserve_compute_batch_boundaries: bool | None = None,
+        cpus: float | None = None,
+        gpus: float | None = None,
+        memory_bytes: int | None = None,
+        execution_backend: typing.Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None = None,
+        actor_number: int | None = None,
+        streaming_breaker: bool | None = None,
+        target_max_batch_bytes: int | None = None,
+        task_input_max_bytes: int | None = None,
+        output_target_max_bytes: int | None = None,
     ) -> DuckDBPyRelation: ...
     def max(
         self, expression: str, groups: str = "", window_spec: str = "", projected_columns: str = ""
@@ -1084,6 +1132,27 @@ def ColumnExpression(*args: str) -> Expression: ...
 def ConstantExpression(value: typing.Any) -> Expression: ...
 def DefaultExpression() -> Expression: ...
 def FunctionExpression(function_name: str, *args: _ExpressionLike) -> Expression: ...
+def _VaneUDFMapExpression(
+    function: typing.Callable[..., typing.Any],
+    name: str,
+    return_type: typing.Any,
+    execution_backend: str,
+    *args: Expression,
+) -> Expression: ...
+def _VaneUDFMapBatchesExpression(
+    function: typing.Callable[..., typing.Any],
+    name: str,
+    schema: typing.Mapping[str, typing.Any],
+    execution_backend: str,
+    input_names: typing.Sequence[str],
+    batch_size: typing.SupportsInt | None = None,
+    streaming_output_mode: str = "local_shm_ref_bundle",
+    row_preserving: bool = False,
+    gpus: float | None = None,
+    actor_number: int | None = None,
+    stateful: bool = False,
+    *args: Expression,
+) -> Expression: ...
 def LambdaExpression(lhs: typing.Any, rhs: _ExpressionLike) -> Expression: ...
 def SQLExpression(expression: str) -> Expression: ...
 def StarExpression(*, exclude: Iterable[str | Expression] | None = None) -> Expression: ...

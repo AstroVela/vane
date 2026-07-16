@@ -34,6 +34,15 @@ void InitializeStaticMethods(py::module_ &m) {
 	docs = "";
 	m.def("FunctionExpression", &DuckDBPyExpression::FunctionExpression, py::arg("function_name"), docs);
 
+	// Vane Python UDF Expression builders
+	docs = "";
+	m.def("_VaneUDFMapExpression", &DuckDBPyExpression::UDFMapExpression, py::arg("function"), py::arg("name"),
+	      py::arg("return_type"), py::arg("execution_backend"), docs);
+	m.def("_VaneUDFMapBatchesExpression", &DuckDBPyExpression::UDFMapBatchesExpression, py::arg("function"),
+	      py::arg("name"), py::arg("schema"), py::arg("execution_backend"), py::arg("input_names"),
+	      py::arg("batch_size") = py::none(), py::arg("row_preserving") = false, py::arg("gpus") = py::none(),
+	      py::arg("actor_number") = py::none(), py::arg("stateful") = false, docs);
+
 	// Coalesce Operator
 	docs = "";
 	m.def("CoalesceOperator", &DuckDBPyExpression::Coalesce, docs);

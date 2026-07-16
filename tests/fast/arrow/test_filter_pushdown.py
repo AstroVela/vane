@@ -923,7 +923,7 @@ class TestArrowFilterPushdown:
 
     @pytest.mark.timeout(10)
     def test_in_filter_pushdown_large_list(self, duckdb_cursor):
-        """Large IN lists must not hang. Regression test for https://github.com/duckdb/duckdb-python/issues/52."""
+        """Large IN lists must not hang."""
         arrow_table = pa.table({"a": pa.array(range(5000))})
         in_list = ", ".join(str(i) for i in range(0, 5000, 2))
         result = duckdb.sql(f"SELECT count(*) FROM arrow_table WHERE a IN ({in_list})").fetchone()

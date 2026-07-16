@@ -2,6 +2,7 @@
 #include "duckdb_python/import_cache/python_import_cache_item.hpp"
 #include "duckdb/common/stack.hpp"
 #include "duckdb_python/import_cache/importer.hpp"
+#include "duckdb_python/pybind11/gil_wrapper.hpp"
 
 namespace duckdb {
 
@@ -80,7 +81,7 @@ py::handle PythonImportCacheItem::Load(PythonImportCache &cache, py::handle sour
 
 PythonImportCache::~PythonImportCache() {
 	try {
-		py::gil_scoped_acquire acquire;
+		PythonGILWrapper acquire;
 		owned_objects.clear();
 	} catch (...) { // NOLINT
 	}

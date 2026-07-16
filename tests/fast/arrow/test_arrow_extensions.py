@@ -12,6 +12,20 @@ pa = pytest.importorskip("pyarrow", "18.0.0")
 
 
 class TestCanonicalExtensionTypes:
+    def test_fixed_shape_tensor_roundtrip(self):
+        np = pytest.importorskip("numpy")
+
+        duckdb_cursor = duckdb.connect()
+        tensor = np.arange(2 * 3 * 4, dtype=np.float32).reshape(2, 3, 4)
+        tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(tensor)
+        arrow_table = pa.Table.from_arrays([tensor_array], names=["tensor_col"])
+
+        duck_arrow = duckdb_cursor.execute("FROM arrow_table").to_arrow_table()
+
+        assert duck_arrow.column("tensor_col").combine_chunks().type == tensor_array.type
+        assert duck_arrow.column("tensor_col").combine_chunks().to_numpy_ndarray().tolist() == tensor.tolist()
+        assert duck_arrow.equals(arrow_table)
+
     def test_uuid(self):
         duckdb_cursor = duckdb.connect()
         duckdb_cursor.execute("SET arrow_lossless_conversion = true")

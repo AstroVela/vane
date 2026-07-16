@@ -1,0 +1,7 @@
+{
+    global:
+        PyInit__duckdb;
+        duckdb_adbc_init;
+    local:
+        *;
+};

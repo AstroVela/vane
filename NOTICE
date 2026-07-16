@@ -1,0 +1,20 @@
+Vane
+====
+
+Copyright 2026 Vane contributors
+
+This product includes software developed by the Vane contributors and
+distributed under the Apache License, Version 2.0.
+
+Portions of Vane are derived from DuckDB:
+
+  DuckDB
+  Copyright 2018-2025 Stichting DuckDB Foundation
+  License: MIT
+  https://github.com/duckdb/duckdb
+
+Vane is not affiliated with, endorsed by, or maintained by the DuckDB
+Foundation. DuckDB is a trademark of the DuckDB Foundation.
+
+The corresponding MIT license and additional third-party notices are in
+LICENSES/ and THIRD_PARTY.md.

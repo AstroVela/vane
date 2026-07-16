@@ -16,6 +16,7 @@
 .DS_store
 #VSCode specifics
 .vscode/
+.cache/
 
 #==============================================================================#
 # Build artifacts
@@ -45,9 +46,33 @@ cmake_build
 cmake-build-debug
 cmake-build-release
 cmake-build-relwithdebinfo
+vcpkg_installed/
 duckdb_packaging/duckdb_version.txt
 test.db
 tmp/
+.bench_out/
+tmp_*.parquet
+.worktrees/
+multimodal_inference_benchmarks/image_classification/vane/
+vane/session_*/
+
+# Rust build artifacts
+**/target/
+
+# Skill/agent config
+.rca_skill/
+.copilot/
+.githooks/
+AGENTS.md
+Agents.md
+CLAUDE.md
+*.skill
+
+# Model weights and large local artifacts
+*.pt
+*.pth
+*.onnx
+*.safetensors
 
 #==============================================================================#
 # Python
@@ -55,6 +80,8 @@ tmp/
 
 *.pyc
 .venv
+.venv-*/
+__pycache__/
 uv.lock
 dist
 duckdb.egg-info
@@ -62,3 +89,4 @@ duckdb.egg-info
 .pytest_cache
 .coverage
 duckdb_build
+build-asan

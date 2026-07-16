@@ -3,6 +3,7 @@
 #include "duckdb_python/pyresult.hpp"
 #include "duckdb_python/python_objects.hpp"
 #include "duckdb_python/numpy/numpy_type.hpp"
+#include "duckdb_python/pybind11/gil_wrapper.hpp"
 
 #include "duckdb_python/arrow/arrow_array_stream.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
@@ -79,7 +80,7 @@ unique_ptr<DataChunk> DuckDBPyResult::FetchNext(QueryResult &query_result) {
 		StreamExecutionResult execution_result;
 		while (!StreamQueryResult::IsChunkReady(execution_result = stream_result.ExecuteTask())) {
 			{
-				py::gil_scoped_acquire gil;
+				PythonGILWrapper gil;
 				if (PyErr_CheckSignals() != 0) {
 					throw std::runtime_error("Query interrupted");
 				}
@@ -294,14 +295,17 @@ void DuckDBPyResult::ConvertDateTimeTypes(PandasDataFrame &df, bool date_as_obje
 	auto names = df.attr("columns").cast<vector<string>>();
 
 	for (idx_t i = 0; i < result->ColumnCount(); i++) {
+		auto column = df.attr("__getitem__")(names[i].c_str());
 		if (result->types[i] == LogicalType::TIMESTAMP_TZ) {
 			// first localize to UTC then convert to timezone_config
-			auto utc_local = df[names[i].c_str()].attr("dt").attr("tz_localize")("UTC");
+			auto utc_local = column.attr("dt").attr("tz_localize")("UTC");
 			auto new_value = utc_local.attr("dt").attr("tz_convert")(result->client_properties.time_zone);
 			// We need to create the column anew because the exact dt changed to a new timezone
 			ReplaceDFColumn(df, names[i].c_str(), i, new_value);
 		} else if (date_as_object && result->types[i] == LogicalType::DATE) {
-			py::object new_value = df[names[i].c_str()].attr("dt").attr("date");
+			// Convert through numpy datetime64[D] to avoid pandas accessor lifetime issues on pandas>=3
+			auto numpy_dates = column.attr("to_numpy")("dtype"_a = "datetime64[D]");
+			auto new_value = numpy_dates.attr("astype")("object");
 			ReplaceDFColumn(df, names[i].c_str(), i, new_value);
 		}
 	}
@@ -488,7 +492,7 @@ duckdb::pyarrow::RecordBatchReader DuckDBPyResult::FetchRecordBatchReader(idx_t 
 	if (!result) {
 		throw InvalidInputException("There is no query result");
 	}
-	py::gil_scoped_acquire acquire;
+	PythonGILWrapper acquire;
 	auto pyarrow_lib_module = py::module::import("pyarrow").attr("lib");
 	auto record_batch_reader_func = pyarrow_lib_module.attr("RecordBatchReader").attr("_import_from_c");
 	auto stream = FetchArrowArrayStream(rows_per_batch);

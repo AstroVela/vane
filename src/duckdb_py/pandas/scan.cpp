@@ -8,6 +8,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb_python/pandas/column/pandas_numpy_column.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb_python/pybind11/gil_wrapper.hpp"
 
 #include "duckdb/common/atomic.hpp"
 
@@ -28,7 +29,7 @@ struct PandasScanFunctionData : public TableFunctionData {
 
 	~PandasScanFunctionData() override {
 		try {
-			py::gil_scoped_acquire acquire;
+			PythonGILWrapper acquire;
 			pandas_bind_data.clear();
 		} catch (...) { // NOLINT
 		}
@@ -81,7 +82,7 @@ OperatorPartitionData PandasScanFunction::PandasScanGetPartitionData(ClientConte
 
 unique_ptr<FunctionData> PandasScanFunction::PandasScanBind(ClientContext &context, TableFunctionBindInput &input,
                                                             vector<LogicalType> &return_types, vector<string> &names) {
-	py::gil_scoped_acquire acquire;
+	PythonGILWrapper acquire;
 	py::handle df(reinterpret_cast<PyObject *>(input.inputs[0].GetPointer()));
 
 	vector<PandasColumnBindData> pandas_bind_data;

@@ -25,11 +25,16 @@
 
 namespace duckdb {
 
+class DuckDBPyType;
+
 struct DuckDBPyRelation {
 public:
 	explicit DuckDBPyRelation(shared_ptr<Relation> rel);
 	explicit DuckDBPyRelation(shared_ptr<DuckDBPyResult> result);
 	~DuckDBPyRelation();
+
+	// Expose underlying Relation for C++ consumers
+	shared_ptr<Relation> GetRelation();
 
 public:
 	static void Initialize(py::handle &m);
@@ -53,6 +58,8 @@ public:
 	unique_ptr<DuckDBPyRelation> Filter(const py::object &expr);
 	unique_ptr<DuckDBPyRelation> FilterFromExpression(const string &expr);
 	unique_ptr<DuckDBPyRelation> Limit(int64_t n, int64_t offset = 0);
+	unique_ptr<DuckDBPyRelation> Repartition(const py::args &args, const py::kwargs &kwargs);
+	unique_ptr<DuckDBPyRelation> LocalExchange(const py::object &num_partitions);
 	unique_ptr<DuckDBPyRelation> Order(const string &expr);
 	unique_ptr<DuckDBPyRelation> Sort(const py::args &args);
 
@@ -204,7 +211,38 @@ public:
 
 	unique_ptr<DuckDBPyRelation> Intersect(DuckDBPyRelation *other);
 
-	unique_ptr<DuckDBPyRelation> Map(py::function fun, Optional<py::object> schema);
+		unique_ptr<DuckDBPyRelation> Map(py::function fun, const shared_ptr<DuckDBPyType> &return_type,
+		                                 const Optional<py::object> &batch_size, const Optional<py::object> &cpus,
+		                                 const Optional<py::object> &gpus, const Optional<py::object> &execution_backend,
+		                                 const Optional<py::object> &actor_number, bool side_effects);
+	unique_ptr<DuckDBPyRelation> MapBatches(py::function fun, Optional<py::object> schema,
+	                                        const Optional<py::object> &batch_size,
+	                                        const Optional<py::object> &output_batch_size,
+	                                        const Optional<py::object> &min_task_batch_size,
+	                                        const Optional<py::object> &preserve_compute_batch_boundaries,
+	                                        const Optional<py::object> &cpus, const Optional<py::object> &gpus,
+	                                        const Optional<py::object> &memory_bytes,
+	                                        const Optional<py::object> &execution_backend,
+	                                        const Optional<py::object> &actor_number,
+	                                        const Optional<py::object> &ray_actor_thread_policy,
+	                                        const Optional<py::object> &streaming_breaker,
+	                                        const Optional<py::object> &target_max_batch_bytes,
+	                                        const Optional<py::object> &task_input_max_bytes,
+	                                        const Optional<py::object> &output_target_max_bytes);
+	unique_ptr<DuckDBPyRelation> FlatMap(py::function fun, Optional<py::object> schema,
+	                                     const Optional<py::object> &batch_size,
+	                                     const Optional<py::object> &output_batch_size,
+	                                     const Optional<py::object> &min_task_batch_size,
+	                                     const Optional<py::object> &preserve_compute_batch_boundaries,
+	                                     const Optional<py::object> &cpus,
+	                                     const Optional<py::object> &gpus,
+	                                     const Optional<py::object> &memory_bytes,
+	                                     const Optional<py::object> &execution_backend,
+	                                     const Optional<py::object> &actor_number,
+	                                     const Optional<py::object> &streaming_breaker,
+	                                     const Optional<py::object> &target_max_batch_bytes,
+	                                     const Optional<py::object> &task_input_max_bytes,
+	                                     const Optional<py::object> &output_target_max_bytes);
 
 	unique_ptr<DuckDBPyRelation> Join(DuckDBPyRelation *other, const py::object &condition, const string &type);
 	unique_ptr<DuckDBPyRelation> Cross(DuckDBPyRelation *other);
@@ -230,6 +268,9 @@ public:
 	unique_ptr<DuckDBPyRelation> CreateView(const string &view_name, bool replace = true);
 
 	unique_ptr<DuckDBPyRelation> Query(const string &view_name, const string &sql_query);
+
+	//! Explode a list/array column into individual rows.
+	unique_ptr<DuckDBPyRelation> Explode(const string &column);
 
 	// Update the internal result of the relation
 	DuckDBPyRelation &Execute();
@@ -263,10 +304,12 @@ public:
 	bool ContainsColumnByName(const string &name) const;
 
 	void SetConnectionOwner(py::object owner);
+	py::object GetConnectionOwner() const;
 	unique_ptr<DuckDBPyRelation> DeriveRelation(shared_ptr<Relation> new_rel);
 	unique_ptr<DuckDBPyRelation> DeriveRelation(shared_ptr<DuckDBPyResult> result);
 
 private:
+	bool TryPrintDistributed(const BoxRendererConfig &config);
 	string ToStringInternal(const BoxRendererConfig &config, bool invalidate_cache = false);
 	string GenerateExpressionList(const string &function_name, const string &aggregated_columns,
 	                              const string &groups = "", const string &function_parameter = "",
@@ -290,7 +333,7 @@ private:
 private:
 	//! Prevents GC of the parent DuckDBPyConnection.
 	//! Declared first so it is destroyed last (reverse declaration order).
-	py::object connection_owner;
+	py::object connection_owner = py::none();
 	//! Whether the relation has been executed at least once
 	bool executed;
 	shared_ptr<Relation> rel;

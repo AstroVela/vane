@@ -1,0 +1,34 @@
+name: Feature request
+description: Propose a focused capability or behavior change
+labels:
+  - enhancement
+  - needs triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the problem before proposing an implementation. Larger changes should start as a design discussion.
+
+  - type: textarea
+    attributes:
+      label: Problem
+      description: What workflow is blocked or unnecessarily difficult today?
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Proposed outcome
+      description: Describe the desired user-visible behavior, including compatibility expectations.
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Alternatives and tradeoffs
+      description: What other approaches did you consider?
+
+  - type: textarea
+    attributes:
+      label: Additional context
+      description: Add representative SQL, Python, plans, or benchmark constraints. Do not include confidential data.

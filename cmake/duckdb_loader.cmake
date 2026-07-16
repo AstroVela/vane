@@ -35,7 +35,7 @@ _duckdb_set_default(DUCKDB_SOURCE_PATH
                     "${CMAKE_CURRENT_SOURCE_DIR}/external/duckdb")
 
 # Extension list - commonly used extensions for Python
-_duckdb_set_default(BUILD_EXTENSIONS "core_functions;parquet;icu;json")
+_duckdb_set_default(BUILD_EXTENSIONS "core_functions;parquet;icu;json;httpfs")
 
 # Core build options - disable unnecessary components for Python builds
 _duckdb_set_default(BUILD_SHELL OFF)
@@ -157,8 +157,8 @@ endfunction()
 function(_duckdb_create_interface_target target_name)
   add_library(${target_name} INTERFACE)
 
-  # Include directories to deal with leaking 3rd party headers in duckdb headers
-  # See https://github.com/duckdblabs/duckdb-internal/issues/5084
+  # Include directories to deal with leaking third-party headers in DuckDB
+  # headers.
   target_include_directories(
     ${target_name}
     INTERFACE

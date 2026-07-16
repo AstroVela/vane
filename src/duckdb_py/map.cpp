@@ -9,6 +9,7 @@
 #include "duckdb_python/pytype.hpp"
 #include "duckdb_python/pybind11/dataframe.hpp"
 #include "duckdb_python/pyconnection/pyconnection.hpp"
+#include "duckdb_python/pybind11/gil_wrapper.hpp"
 
 namespace duckdb {
 
@@ -131,7 +132,7 @@ unique_ptr<FunctionData> BindExplicitSchema(unique_ptr<MapFunctionData> function
 // they better not change in the actual execution ^^
 unique_ptr<FunctionData> MapFunction::MapFunctionBind(ClientContext &context, TableFunctionBindInput &input,
                                                       vector<LogicalType> &return_types, vector<string> &names) {
-	py::gil_scoped_acquire acquire;
+	PythonGILWrapper acquire;
 
 	auto data_uptr = make_uniq<MapFunctionData>();
 	auto &data = *data_uptr;
@@ -163,7 +164,7 @@ static string TypeVectorToString(const vector<LogicalType> &types) {
 
 OperatorResultType MapFunction::MapFunctionExec(ExecutionContext &context, TableFunctionInput &data_p, DataChunk &input,
                                                 DataChunk &output) {
-	py::gil_scoped_acquire acquire;
+	PythonGILWrapper acquire;
 
 	if (input.size() == 0) {
 		return OperatorResultType::NEED_MORE_INPUT;

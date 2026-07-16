@@ -1,4 +1,5 @@
 #include "duckdb_python/pybind11/pybind_wrapper.hpp"
+#include "datasource_function.hpp"
 
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/vector.hpp"
@@ -21,8 +22,12 @@
 #include "duckdb_python/pybind11/conversions/python_csv_line_terminator_enum.hpp"
 #include "duckdb/common/enums/statement_type.hpp"
 #include "duckdb/common/adbc/adbc-init.hpp"
+#include "duckdb_python/udf_executor.hpp"
+#include "duckdb_python/vllm_executor.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/execution/distributed/utils/stream.hpp"
+#include "duckdb/execution/distributed/common_types.hpp"
 
 #ifndef DUCKDB_PYTHON_LIB_NAME
 #define DUCKDB_PYTHON_LIB_NAME _duckdb
@@ -31,6 +36,9 @@
 namespace py = pybind11;
 
 namespace duckdb {
+
+py::dict GetUDFExecutorDebugCounters();
+void ResetUDFExecutorDebugCounters();
 
 enum PySQLTokenType : uint8_t {
 	PY_SQL_TOKEN_IDENTIFIER = 0,
@@ -171,6 +179,20 @@ static void InitializeConnectionMethods(py::module_ &m) {
 	    py::arg("exception_handling") = PythonExceptionHandling::FORWARD_ERROR, py::arg("side_effects") = false,
 	    py::arg("connection") = py::none());
 	m.def(
+	    "create_table_function",
+	    [](const string &name, const py::function &udf, const py::object &schema = py::none(),
+	       const shared_ptr<DuckDBPyType> &return_type = nullptr, const Optional<py::object> &batch_size = py::none(),
+	       bool side_effects = false, shared_ptr<DuckDBPyConnection> conn = nullptr) {
+		    if (!conn) {
+			    conn = DuckDBPyConnection::DefaultConnection();
+		    }
+		    return conn->RegisterTableUDF(name, udf, schema, return_type, batch_size, side_effects);
+	    },
+	    "Create a DuckDB table function out of the passing in Python function so it can be used in queries",
+	    py::arg("name"), py::arg("function"), py::arg("schema") = py::none(), py::arg("return_type") = py::none(),
+	    py::kw_only(), py::arg("batch_size") = py::none(), py::arg("side_effects") = false,
+	    py::arg("connection") = py::none());
+	m.def(
 	    "remove_function",
 	    [](const string &name, shared_ptr<DuckDBPyConnection> conn = nullptr) {
 		    if (!conn) {
@@ -229,6 +251,17 @@ static void InitializeConnectionMethods(py::module_ &m) {
 	    },
 	    "Create a list type object of 'type'", py::arg("type").none(false), py::kw_only(),
 	    py::arg("connection") = py::none());
+	m.def(
+	    "tensor_type",
+	    [](const shared_ptr<DuckDBPyType> &type, const py::object &shape,
+	       shared_ptr<DuckDBPyConnection> conn = nullptr) {
+		    if (!conn) {
+			    conn = DuckDBPyConnection::DefaultConnection();
+		    }
+		    return conn->TensorType(type, shape);
+	    },
+	    "Create a fixed-shape tensor type object from 'type' and 'shape'", py::arg("type").none(false),
+	    py::arg("shape").none(false), py::kw_only(), py::arg("connection") = py::none());
 	m.def(
 	    "union_type",
 	    [](const py::object &members, shared_ptr<DuckDBPyConnection> conn = nullptr) {
@@ -1079,6 +1112,9 @@ PYBIND11_MODULE(DUCKDB_PYTHON_LIB_NAME, m) { // NOLINT
 	(void)keep_alive;
 	// END
 
+	// Register global callbacks for datasource_scan (needed for distributed workers)
+	duckdb::RegisterDataSourceGlobalCallbacks();
+
 	py::enum_<duckdb::ExplainType>(m, "ExplainType")
 	    .value("STANDARD", duckdb::ExplainType::EXPLAIN_STANDARD)
 	    .value("ANALYZE", duckdb::ExplainType::EXPLAIN_ANALYZE)
@@ -1086,6 +1122,14 @@ PYBIND11_MODULE(DUCKDB_PYTHON_LIB_NAME, m) { // NOLINT
 
 	RegisterStatementType(m);
 	RegisterExpectedResultType(m);
+
+	// Expose experimental ray C++ bindings as `duckdb.ray_cxx`
+	extern void register_ray_bindings(py::module_ & m);
+	register_ray_bindings(m);
+
+	// Expose vane-runners C++ bindings as `duckdb.vane_runners` and `duckdb.vane_runners_cpp`
+	extern void register_vane_runners(py::module_ & m);
+	register_vane_runners(m);
 
 	py::enum_<duckdb::PythonCSVLineTerminator::Type>(m, "CSVLineTerminator")
 	    .value("LINE_FEED", duckdb::PythonCSVLineTerminator::Type::LINE_FEED)
@@ -1109,6 +1153,18 @@ PYBIND11_MODULE(DUCKDB_PYTHON_LIB_NAME, m) { // NOLINT
 	DuckDBPyRelation::Initialize(m);
 	DuckDBPyConnection::Initialize(m);
 	PythonObject::Initialize();
+	RegisterUDFExecutorFactory();
+	RegisterVLLMExecutorFactory();
+	m.def("_udf_executor_debug_counters", &GetUDFExecutorDebugCounters);
+	m.def("_reset_udf_executor_debug_counters", &ResetUDFExecutorDebugCounters);
+	m.def("_shutdown_udf_executor_dispatcher", &ShutdownUDFExecutorDispatcher);
+	try {
+		py::module_::import("atexit").attr("register")(m.attr("_shutdown_udf_executor_dispatcher"));
+	} catch (const py::error_already_set &) {
+		// Explicit runner/query teardown still cleans active slots. This hook is
+		// the final guard that joins the native dispatcher before Python state is
+		// destroyed.
+	}
 
 	py::options pybind_opts;
 

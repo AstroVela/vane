@@ -1,239 +1,251 @@
-# Release is called by duckdb's InvokeCI -> NotifyExternalRepositories job
 name: Release
+
 on:
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
-      duckdb-python-sha:
-        type: string
-        description: The commit to build against (defaults to latest commit of current ref)
-        required: false
-      duckdb-sha:
-        type: string
-        description: The DuckDB submodule commit or ref to build against
-        required: true
-      stable-version:
-        type: string
-        description: Release a stable version (vX.Y.Z-((rc|post)N))
-        required: false
-      pypi-index:
+      destination:
+        description: Build only, or publish the candidate to TestPyPI
         type: choice
-        description: Which PyPI to use
-        required: true
         options:
-          - test
-          - prod
-      nightly-stale-after-days:
-        type: string
-        description: After how many days should nightlies be considered stale
+          - build-only
+          - testpypi
+        default: build-only
         required: true
-        default: 3
-      store-s3:
-        type: boolean
-        description: Also store test packages in S3 (always true for prod)
-        default: false
 
-defaults:
-  run:
-    shell: bash
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build_sdist:
-    name: Build an sdist and determine versions
-    if: ${{ github.ref != 'refs/heads/main' }}
-    uses: ./.github/workflows/packaging_sdist.yml
-    with:
-      testsuite: all
-      duckdb-python-sha: ${{ inputs.duckdb-python-sha != '' && inputs.duckdb-python-sha || github.sha }}
-      duckdb-sha: ${{ inputs.duckdb-sha }}
-      set-version: ${{ inputs.stable-version }}
-
-  submodule_pr:
-    name: Create or update PR to bump submodule to given SHA
-    needs: build_sdist
-    uses: ./.github/workflows/submodule_auto_pr.yml
-    with:
-      duckdb-python-sha: ${{ inputs.duckdb-python-sha }}
-      duckdb-sha: ${{ inputs.duckdb-sha }}
-    secrets:
-      # reusable workflows and secrets are not great: https://github.com/actions/runner/issues/3206
-      DUCKDBLABS_BOT_TOKEN: ${{ secrets.DUCKDBLABS_BOT_TOKEN }}
-
-  workflow_state:
-    name: Set state for the release workflow
-    needs: build_sdist
-    outputs:
-      pypi_state: ${{ steps.index_check.outputs.pypi_state }}
-      ci_env: ${{ steps.ci_env_check.outputs.ci_env }}
-      s3_url: ${{ steps.s3_check.outputs.s3_url }}
-    runs-on: ubuntu-latest
+  source-package:
+    name: Build source package
+    runs-on: ubuntu-24.04
     steps:
-      - id: index_check
-        name: Check version on PyPI
-        run: |
-          set -ex
-          pypi_hostname=${{ inputs.pypi-index == 'test' && 'test.' || '' }}pypi.org
-          # install duckdb
-          curl https://install.duckdb.org | sh
-          # query pypi
-          result=$(cat <<EOF | ${HOME}/.duckdb/cli/latest/duckdb | xargs
-          ---- Output lines
-          .mode line
-          ---- Query that fetches the given version's age, if the version already exists
-          SELECT
-            today() - (file.value->>'upload_time_iso_8601')::DATE     AS age,
-          FROM read_json('https://${pypi_hostname}/pypi/duckdb/json') AS jd
-          CROSS JOIN json_each(jd.releases)                           AS rel(key, value)
-          CROSS JOIN unnest(FROM_JSON(rel.value, '["JSON"]'))         AS file(value)
-          WHERE rel.key='${{ needs.build_sdist.outputs.package-version }}'
-          LIMIT 1;
-          EOF
-          )
-          if [ -z "$result" ]; then
-            pypi_state=VERSION_NOT_FOUND
-          else
-            pypi_state=VERSION_FOUND
-          fi
-          if [[ -z "${{ inputs.stable-version }}" ]]; then
-            age=${result#age = }
-            if [ "${age}" -ge "${{ inputs.nightly-stale-after-days }}" ]; then
-              echo "::warning title=Stale nightly for ${{ github.ref_name }}::Nightly is ${age} days old (max=${{ inputs.nightly-stale-after-days }})"
-            fi
-          fi
-          echo "pypi_state=${pypi_state}" >> $GITHUB_OUTPUT
-
-      - id: ci_env_check
-        name: Determine CI environment
-        run: |
-          set -eu
-          if [[ test == "${{ inputs.pypi-index }}" ]]; then
-            ci_env=pypi-test
-          elif [[ prod == "${{ inputs.pypi-index }}" ]]; then
-            ci_env=pypi-prod${{ inputs.stable-version == '' && '-nightly' || '' }}
-          else
-            echo "::error::Invalid value for inputs.pypi-index: ${{ inputs.pypi-index }}"
-            exit 1
-          fi
-          echo "ci_env=${ci_env}" >> "$GITHUB_OUTPUT"
-          echo "::notice::Using CI environment ${ci_env}"
-
-      - id: s3_check
-        name: Generate S3 upload URL
-        if: github.repository_owner == 'duckdb'
-        run: |
-          set -eu
-          should_store=${{ (inputs.pypi-index == 'prod' || inputs.store-s3) && '1' || '0' }}
-          if [[ $should_store == 0 ]]; then
-            echo "::notice::S3 upload disabled in inputs, not generating S3 URL"
-            exit 0
-          fi
-          if [[ VERSION_NOT_FOUND != "${{ steps.index_check.outputs.pypi_state }}" ]]; then
-            echo "::warning::S3 upload disabled because package version already uploaded to PyPI"
-            exit 0
-          fi
-          sha=${{ github.sha }}
-          dsha=${{ inputs.duckdb-sha }}
-          version=${{ needs.build_sdist.outputs.package-version }}
-          s3_url="s3://duckdb-staging/python/${version}/${sha:0:10}-duckdb-${dsha:0:10}/"
-          echo "::notice::Generated S3 URL: ${s3_url}"
-          echo "s3_url=${s3_url}" >> $GITHUB_OUTPUT
-
-  build_wheels:
-    name: Build and test releases
-    needs: workflow_state
-    if: ${{ needs.workflow_state.outputs.pypi_state == 'VERSION_NOT_FOUND' }}
-    uses: ./.github/workflows/packaging_wheels.yml
-    with:
-      minimal: false
-      testsuite: all
-      duckdb-python-sha: ${{ inputs.duckdb-python-sha != '' && inputs.duckdb-python-sha || github.sha }}
-      duckdb-sha: ${{ inputs.duckdb-sha }}
-      set-version: ${{ inputs.stable-version }}
-
-  upload_s3:
-    name: Upload Artifacts to S3
-    runs-on: ubuntu-latest
-    needs: [build_sdist, build_wheels, workflow_state]
-    if: ${{ needs.workflow_state.outputs.s3_url }}
-    steps:
-      - name: Fetch artifacts
-        uses: actions/download-artifact@v4
+      - name: Checkout the release commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          pattern: '{sdist,wheel}*'
-          path: artifacts/
-          merge-multiple: true
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
 
-      - name: Upload Artifacts
-        env:
-          AWS_ENDPOINT_URL: ${{ secrets.S3_DUCKDB_STAGING_ENDPOINT }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.S3_DUCKDB_STAGING_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_DUCKDB_STAGING_KEY }}
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
 
+      - name: Require the release tag to match the package version
+        if: github.event_name == 'release'
         run: |
-          aws s3 cp artifacts ${{ needs.workflow_state.outputs.s3_url }} --recursive
+          expected_tag="v$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$GITHUB_REF_NAME" = "$expected_tag"
 
-  publish_pypi:
-    name: Publish Artifacts to PyPI
-    runs-on: ubuntu-latest
-    needs: [workflow_state, build_sdist, build_wheels]
-    environment:
-      name: ${{ needs.workflow_state.outputs.ci_env }}
+      - name: Build and validate the source package
+        run: |
+          python -m pip install --upgrade build pip
+          python -m build --sdist --outdir dist
+          python scripts/check_release_artifacts.py dist/*.tar.gz
+
+      - name: Upload source package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  wheels:
+    name: Build manylinux wheels
+    needs: source-package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Download the exact source package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-sdist
+          path: dist
+
+      - name: Locate source package
+        id: sdist
+        run: |
+          path="$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          test -n "$path"
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Build wheels from the source package
+        uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55 # v4.1.0
+        with:
+          package-dir: ${{ steps.sdist.outputs.path }}
+          output-dir: wheelhouse
+          config-file: "{package}/pyproject.toml"
+
+      - name: Validate wheels
+        run: |
+          test "$(find wheelhouse -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 5
+          python scripts/check_release_artifacts.py wheelhouse/*.whl
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-wheels
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble:
+    name: Validate, attest and sign artifacts
+    needs: wheels
+    runs-on: ubuntu-24.04
     permissions:
-      # this is needed for the OIDC flow that is used with trusted publishing on PyPI
+      attestations: write
+      contents: read
       id-token: write
     steps:
-      - if: ${{ vars.PYPI_HOST == '' }}
+      - name: Checkout release tooling
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Download source package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-sdist
+          path: packages
+
+      - name: Download wheels
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-wheels
+          path: packages
+
+      - name: Validate the complete distribution set
         run: |
-          echo "Error: PYPI_HOST is not set in CI environment '${{ needs.workflow_state.outputs.ci_env }}'"
-          exit 1
+          test "$(find packages -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 1
+          test "$(find packages -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 5
+          python scripts/check_release_artifacts.py packages/*.tar.gz packages/*.whl
 
-      - name: Fetch artifacts
-        uses: actions/download-artifact@v4
+      - name: Generate checksums
+        run: |
+          mkdir -p release-assets
+          (cd packages && sha256sum *.tar.gz *.whl) > release-assets/SHA256SUMS
+
+      - name: Generate a CycloneDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
-          pattern: '{sdist,wheel}*'
-          path: packages/
-          merge-multiple: true
+          path: packages
+          format: cyclonedx-json
+          output-file: release-assets/vane-ai-sbom.cdx.json
+          upload-artifact: false
 
-      - name: Upload artifacts to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Attest distribution provenance
+        uses: actions/attest@c32b4b8b198b65d0bd9d63490e847ff7b53989d4 # v4.0.0
         with:
-          repository-url: 'https://${{ vars.PYPI_HOST }}/legacy/'
-          packages-dir: packages
-          verbose: 'true'
+          subject-path: ${{ github.workspace }}/packages/*
 
-  cleanup_nightlies:
-    name: Remove Nightlies from PyPI
-    needs: [workflow_state, publish_pypi]
-    if: ${{ inputs.stable-version == '' }}
-    uses: ./.github/workflows/cleanup_pypi.yml
-    with:
-      environment: ${{ needs.workflow_state.outputs.ci_env }}
-    secrets:
-      # reusable workflows and secrets are not great: https://github.com/actions/runner/issues/3206
-      PYPI_CLEANUP_OTP: ${{secrets.PYPI_CLEANUP_OTP}}
-      PYPI_CLEANUP_PASSWORD: ${{secrets.PYPI_CLEANUP_PASSWORD}}
+      - name: Sign distributions with Sigstore
+        uses: sigstore/gh-action-sigstore-python@f7ad0af51a5648d09a20d00370f0a91c3bdf8f84 # v3.0.1
+        with:
+          inputs: |
+            packages/*.tar.gz
+            packages/*.whl
 
-  summary:
-    name: Release summary
-    runs-on: ubuntu-latest
-    needs: [build_sdist, workflow_state, build_wheels, upload_s3, publish_pypi, cleanup_nightlies]
-    if: always()
+      - name: Upload clean Python distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-distributions
+          path: |
+            packages/*.tar.gz
+            packages/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload checksums, SBOM and signatures
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-supplemental
+          path: |
+            release-assets/*
+            packages/*.sigstore.json
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    if: github.event_name == 'workflow_dispatch' && inputs.destination == 'testpypi'
+    needs: assemble
+    runs-on: ubuntu-24.04
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/vane-ai
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - run: |
-          sha=${{ github.sha }}
-          dsha=${{ inputs.duckdb-sha }}
-          pversion=${{ needs.build_sdist.outputs.package-version }}
-          long_pversion="${pversion} (${sha:0:10})"
-          pypi_host=${{ inputs.pypi-index == 'test' && 'test.' || '' }}pypi.org
-          pypi_duckdb_url=https://${pypi_host}/project/duckdb/${pversion}/
-          was_released=${{ needs.publish_pypi.result == 'success' && '1' || '0' }}
-          if [[ $was_released == 1 ]]; then
-            echo "## Version ${long_pversion} successfully released" >> $GITHUB_STEP_SUMMARY
-            echo "* Package URL: [${pypi_duckdb_url}](${pypi_duckdb_url})" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "## Version ${long_pversion} was not released" >> $GITHUB_STEP_SUMMARY
-            echo "* Package index state before release: ${{ needs.workflow_state.outputs.pypi_state }}" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "* Package index: ${pypi_host}" >> $GITHUB_STEP_SUMMARY
-          echo "* Vendored DuckDB Version: ${{ needs.build_sdist.outputs.duckdb-version }} (${dsha:0:10})" >> $GITHUB_STEP_SUMMARY
-          echo "* S3 upload status: ${{ needs.upload_s3.result == 'success' && needs.workflow_state.outputs.s3_url || needs.upload_s3.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "* CI Environment: ${{ needs.workflow_state.outputs.ci_env }}" >> $GITHUB_STEP_SUMMARY
+      - name: Download distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-distributions
+          path: dist
+
+      - name: Publish through trusted publishing
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: dist
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    name: Publish to PyPI
+    if: github.event_name == 'release'
+    needs: assemble
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/vane-ai
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-distributions
+          path: dist
+
+      - name: Publish through trusted publishing
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: dist
+
+  publish-github-release:
+    name: Attach release assets
+    if: github.event_name == 'release'
+    needs: assemble
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-distributions
+          path: release-files
+
+      - name: Download supplemental assets
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-supplemental
+          path: release-files
+
+      - name: Attach immutable assets to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" release-files/*

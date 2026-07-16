@@ -1,5 +1,6 @@
 #include "duckdb_python/python_dependency.hpp"
 #include "duckdb/common/helper.hpp"
+#include "duckdb_python/pybind11/gil_wrapper.hpp"
 
 namespace duckdb {
 
@@ -7,7 +8,7 @@ PythonDependencyItem::PythonDependencyItem(unique_ptr<RegisteredObject> &&object
 }
 
 PythonDependencyItem::~PythonDependencyItem() { // NOLINT - cannot throw in exception
-	py::gil_scoped_acquire gil;
+	PythonGILWrapper gil;
 	object.reset();
 }
 

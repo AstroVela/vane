@@ -1,5 +1,9 @@
-from . import spark  # noqa: D104
+from . import (
+    ray,
+    spark,
+)
 
 __all__ = [
+    "ray",
     "spark",
 ]

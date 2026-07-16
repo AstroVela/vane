@@ -2,8 +2,10 @@ cmake_minimum_required(VERSION 3.29)
 
 project(duckdb_py LANGUAGES CXX)
 
-# Always use C++11
-set(CMAKE_CXX_STANDARD 11)
+# Keep the Python extension on C++17 so DuckDB headers with inline/static data
+# members link cleanly in fresh builds. Distributed core still opts into C++20
+# in its own CMakeLists.txt.
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -32,9 +34,73 @@ if(POLICY CMP0003) # No implicit link directories
   cmake_policy(SET CMP0003 NEW)
 endif()
 
+if(POLICY CMP0169) # DuckDB's external extension loader still uses
+                   # FetchContent_Populate.
+  set(CMAKE_POLICY_DEFAULT_CMP0169 OLD)
+endif()
+
 # ────────────────────────────────────────────
 # Dependencies
 # ────────────────────────────────────────────
+# Prefer repo-local vcpkg packages when present. This keeps local PEP 517 builds
+# working after `vcpkg install` without requiring callers to export
+# CMAKE_PREFIX_PATH before running `pip install .`.
+set(_VANE_VCPKG_INSTALLED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed")
+if(EXISTS "${_VANE_VCPKG_INSTALLED_DIR}")
+  set(_VANE_VCPKG_PREFIX_CANDIDATES)
+
+  if(DEFINED VCPKG_TARGET_TRIPLET)
+    list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
+         "${_VANE_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+  endif()
+
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+      list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
+           "${_VANE_VCPKG_INSTALLED_DIR}/x64-linux")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+      list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
+           "${_VANE_VCPKG_INSTALLED_DIR}/arm64-linux")
+    endif()
+  elseif(APPLE)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$")
+      list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
+           "${_VANE_VCPKG_INSTALLED_DIR}/arm64-osx")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+      list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
+           "${_VANE_VCPKG_INSTALLED_DIR}/x64-osx")
+    endif()
+  elseif(WIN32)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
+      list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
+           "${_VANE_VCPKG_INSTALLED_DIR}/arm64-windows")
+    else()
+      list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
+           "${_VANE_VCPKG_INSTALLED_DIR}/x64-windows")
+    endif()
+  endif()
+
+  file(
+    GLOB _VANE_VCPKG_INSTALLED_PREFIXES
+    LIST_DIRECTORIES true
+    "${_VANE_VCPKG_INSTALLED_DIR}/*")
+  list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES ${_VANE_VCPKG_INSTALLED_PREFIXES})
+  list(REMOVE_DUPLICATES _VANE_VCPKG_PREFIX_CANDIDATES)
+
+  foreach(_VANE_VCPKG_PREFIX IN LISTS _VANE_VCPKG_PREFIX_CANDIDATES)
+    if(EXISTS "${_VANE_VCPKG_PREFIX}/share/arrow/ArrowConfig.cmake")
+      list(FIND CMAKE_PREFIX_PATH "${_VANE_VCPKG_PREFIX}" _VANE_PREFIX_INDEX)
+      if(_VANE_PREFIX_INDEX EQUAL -1)
+        list(APPEND CMAKE_PREFIX_PATH "${_VANE_VCPKG_PREFIX}")
+      endif()
+      set(VCPKG_BUILD TRUE)
+      message(
+        STATUS "Vane: using repo-local vcpkg prefix: ${_VANE_VCPKG_PREFIX}")
+      break()
+    endif()
+  endforeach()
+endif()
+
 # PyBind11
 find_package(pybind11 REQUIRED CONFIG)
 
@@ -45,6 +111,17 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 else()
   duckdb_configure_for_release()
 endif()
+
+# When a vcpkg toolchain is used, resolve distributed exchange dependencies
+# through vcpkg packages instead of the legacy external/duckdb/installed layout.
+if(DEFINED CMAKE_TOOLCHAIN_FILE
+   AND CMAKE_TOOLCHAIN_FILE MATCHES "vcpkg[.]cmake$"
+   AND NOT DEFINED DUCKDB_DISTRIBUTED_EXCHANGE_USE_INSTALLED_LIBS)
+  set(DUCKDB_DISTRIBUTED_EXCHANGE_USE_INSTALLED_LIBS
+      OFF
+      CACHE BOOL "Use Arrow/Flight static libs from external/duckdb/installed")
+endif()
+
 duckdb_add_library(duckdb_target)
 
 # Bundle in INTERFACE library
@@ -60,6 +137,10 @@ target_include_directories(
 # ────────────────────────────────────────────
 # Descend into the real DuckDB‑Python sources
 # ────────────────────────────────────────────
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_C_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+
 add_subdirectory(src/duckdb_py)
 
 pybind11_add_module(
@@ -76,7 +157,9 @@ pybind11_add_module(
   $<TARGET_OBJECTS:python_connection>
   $<TARGET_OBJECTS:python_expression>
   $<TARGET_OBJECTS:python_relation>
-  $<TARGET_OBJECTS:python_type>)
+  $<TARGET_OBJECTS:python_type>
+  $<TARGET_OBJECTS:python_ray>
+  $<TARGET_OBJECTS:python_vane_runners>)
 # add _duckdb_dependencies
 target_link_libraries(_duckdb PRIVATE _duckdb_dependencies)
 duckdb_link_extensions(_duckdb)
@@ -104,9 +187,15 @@ if(APPLE)
     _duckdb PRIVATE "LINKER:-exported_symbol,_duckdb_adbc_init"
     "LINKER:-exported_symbol,_PyInit__duckdb")
 elseif(UNIX AND NOT APPLE)
+  # Use a version script to export only the two required symbols. This hides all
+  # internal symbols (including statically-linked OpenSSL from httpfs) from the
+  # dynamic symbol table, preventing SIGSEGV crashes caused by symbol conflicts
+  # with system OpenSSL loaded by Ray/Python/gRPC in the same process.
   target_link_options(
-    _duckdb PRIVATE "LINKER:--export-dynamic-symbol=duckdb_adbc_init"
-    "LINKER:--export-dynamic-symbol=PyInit__duckdb")
+    _duckdb
+    PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/exported_symbols.version"
+  )
 elseif(WIN32)
   target_link_options(_duckdb PRIVATE "/EXPORT:duckdb_adbc_init"
                       "/EXPORT:PyInit__duckdb")

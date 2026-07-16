@@ -77,6 +77,12 @@ class TestType:
         type = duckdb.array_type(BIGINT, 3)
         assert str(type) == "BIGINT[3]"
 
+    def test_tensor_type(self):
+        type = duckdb.tensor_type(FLOAT, (3, 224, 224))
+        assert str(type) == "TENSOR(FLOAT, [3, 224, 224])"
+        assert type.id == "tensor"
+        assert type.children == [("dtype", FLOAT), ("shape", (3, 224, 224))]
+
     def test_struct_type(self):
         type = duckdb.struct_type({"a": BIGINT, "b": BOOLEAN})
         assert str(type) == "STRUCT(a BIGINT, b BOOLEAN)"

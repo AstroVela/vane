@@ -1,4 +1,5 @@
 //===----------------------------------------------------------------------===//
+#include "duckdb_python/pybind11/gil_wrapper.hpp"
 //                         DuckDB
 //
 // duckdb_python/filesystem_object.hpp
@@ -18,7 +19,7 @@ public:
 	    : RegisteredObject(std::move(fs)), filenames(std::move(filenames_p)) {
 	}
 	~FileSystemObject() override {
-		py::gil_scoped_acquire acquire;
+		PythonGILWrapper acquire;
 		// Assert that the 'obj' is a filesystem
 		D_ASSERT(py::isinstance(obj, DuckDBPyConnection::ImportCache()->duckdb.filesystem.ModifiedMemoryFileSystem()));
 		for (auto &file : filenames) {

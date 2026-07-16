@@ -1,6 +1,7 @@
 #include "duckdb_python/arrow/arrow_array_stream.hpp"
 #include "duckdb_python/arrow/polars_filter_pushdown.hpp"
 #include "duckdb_python/arrow/pyarrow_filter_pushdown.hpp"
+#include "duckdb_python/pybind11/gil_wrapper.hpp"
 
 #include "duckdb_python/pyconnection/pyconnection.hpp"
 #include "duckdb_python/pyrelation.hpp"
@@ -61,7 +62,7 @@ py::object PythonTableArrowArrayStreamFactory::ProduceScanner(py::object &arrow_
 
 unique_ptr<ArrowArrayStreamWrapper> PythonTableArrowArrayStreamFactory::Produce(uintptr_t factory_ptr,
                                                                                 ArrowStreamParameters &parameters) {
-	py::gil_scoped_acquire acquire;
+	PythonGILWrapper acquire;
 	auto factory = static_cast<PythonTableArrowArrayStreamFactory *>(reinterpret_cast<void *>(factory_ptr)); // NOLINT
 	D_ASSERT(factory->arrow_object);
 	py::handle arrow_obj_handle(factory->arrow_object);
@@ -235,7 +236,7 @@ void PythonTableArrowArrayStreamFactory::GetSchema(uintptr_t factory_ptr, ArrowS
 		return;
 	}
 
-	py::gil_scoped_acquire acquire;
+	PythonGILWrapper acquire;
 	D_ASSERT(factory->arrow_object);
 	py::handle arrow_obj_handle(factory->arrow_object);
 

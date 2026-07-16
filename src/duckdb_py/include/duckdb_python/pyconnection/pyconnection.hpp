@@ -31,6 +31,8 @@ struct BoundParameterData;
 
 enum class PythonEnvironmentType { NORMAL, INTERACTIVE, JUPYTER };
 
+enum class PythonUDFCatalogType : uint8_t { SCALAR, TABLE };
+
 struct DuckDBPyRelation;
 
 class RegisteredArrow : public RegisteredObject {
@@ -166,9 +168,15 @@ public:
 	ConnectionGuard con;
 	Cursors cursors;
 	std::mutex py_connection_lock;
+	string connection_database = ":memory:";
+	bool connection_read_only = false;
+	py::dict connection_config = py::dict();
 	//! MemoryFileSystem used to temporarily store file-like objects for reading
 	shared_ptr<ModifiedMemoryFileSystem> internal_object_filesystem;
 	case_insensitive_map_t<unique_ptr<ExternalDependency>> registered_functions;
+	case_insensitive_map_t<PythonUDFCatalogType> registered_function_catalog_types;
+	case_insensitive_map_t<py::object> distributed_python_udf_registrations;
+	case_insensitive_map_t<string> applied_distributed_python_udf_digests;
 	case_insensitive_set_t registered_objects;
 
 public:
@@ -218,6 +226,7 @@ public:
 	shared_ptr<DuckDBPyType> StructType(const py::object &fields);
 	shared_ptr<DuckDBPyType> ListType(const shared_ptr<DuckDBPyType> &type);
 	shared_ptr<DuckDBPyType> ArrayType(const shared_ptr<DuckDBPyType> &type, idx_t size);
+	shared_ptr<DuckDBPyType> TensorType(const shared_ptr<DuckDBPyType> &type, const py::object &shape);
 	shared_ptr<DuckDBPyType> UnionType(const py::object &members);
 	shared_ptr<DuckDBPyType> EnumType(const string &name, const shared_ptr<DuckDBPyType> &type,
 	                                  const py::list &values_p);
@@ -231,8 +240,27 @@ public:
 	                  FunctionNullHandling null_handling = FunctionNullHandling::DEFAULT_NULL_HANDLING,
 	                  PythonExceptionHandling exception_handling = PythonExceptionHandling::FORWARD_ERROR,
 	                  bool side_effects = false);
+	shared_ptr<DuckDBPyConnection>
+	CreateVaneFunctionInternal(const string &name, const py::object &callable,
+	                           const py::object &parameters = py::none(),
+	                           const shared_ptr<DuckDBPyType> &return_type = nullptr, bool replace = false);
+	shared_ptr<DuckDBPyConnection>
+	CreateVaneBatchFunctionInternal(const string &name, const py::object &udf, const py::object &input_names,
+	                                const py::object &schema, const py::object &parameters = py::none(),
+	                                const Optional<py::object> &batch_size = py::none(),
+	                                const Optional<py::object> &gpus = py::none(),
+	                                const Optional<py::object> &actor_number = py::none(), bool stateful = false,
+	                                bool row_preserving = true, bool replace = false);
+
+	shared_ptr<DuckDBPyConnection> RegisterTableUDF(const string &name, const py::function &udf,
+	                                                const py::object &schema = py::none(),
+	                                                const shared_ptr<DuckDBPyType> &return_type = nullptr,
+	                                                const Optional<py::object> &batch_size = py::none(),
+	                                                bool side_effects = false);
 
 	shared_ptr<DuckDBPyConnection> UnregisterUDF(const string &name);
+	py::list ExportDistributedPythonUDFRegistrations() const;
+	void ApplyDistributedPythonUDFRegistrations(const py::object &registrations);
 
 	shared_ptr<DuckDBPyConnection> ExecuteMany(const py::object &query, py::object params = py::list());
 
@@ -279,6 +307,7 @@ public:
 	                                                 const py::object &compression = py::none());
 
 	unique_ptr<DuckDBPyRelation> FromArrow(py::object &arrow_object);
+	unique_ptr<DuckDBPyRelation> FromDataSource(py::object &source);
 
 	unordered_set<string> GetTableNames(const string &query, bool qualified);
 
@@ -328,6 +357,8 @@ public:
 	duckdb::pyarrow::RecordBatchReader FetchRecordBatchReader(const idx_t rows_per_batch);
 
 	static shared_ptr<DuckDBPyConnection> Connect(const py::object &database, bool read_only, const py::dict &config);
+	void SetConnectionBootstrapConfig(const string &database, bool read_only, const py::dict &config);
+	py::dict ExportConnectionBootstrapConfig() const;
 
 	static vector<Value> TransformPythonParamList(const py::handle &params);
 	static case_insensitive_map_t<BoundParameterData> TransformPythonParamDict(const py::dict &params);

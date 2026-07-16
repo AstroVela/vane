@@ -1,4 +1,5 @@
 //===----------------------------------------------------------------------===//
+#include "duckdb_python/pybind11/gil_wrapper.hpp"
 //                         DuckDB
 //
 // duckdb_python/arrow/arrow_array_stream.hpp
@@ -76,7 +77,7 @@ public:
 
 	~PythonTableArrowArrayStreamFactory() {
 		if (cached_arrow_table.ptr() != nullptr) {
-			py::gil_scoped_acquire acquire;
+			PythonGILWrapper acquire;
 			cached_arrow_table = py::object();
 		}
 		if (cached_schema.release) {

@@ -1,6 +1,8 @@
+exclude: ^external/duckdb/
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.4.0
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # frozen: v6.0.0
     hooks:
       - id: check-yaml
         args: ["--allow-multiple-documents"]
@@ -12,39 +14,51 @@ repos:
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.13.3
+    rev: 01a675ea018f2fb714478a5ffb83fcea8374bb06 # frozen: v0.15.21
     hooks:
       # Run the linter.
       - id: ruff-check
+        exclude: ^benchmarking/(parquet|tpcds)/
       # Run the formatter.
       - id: ruff-format
+        exclude: ^benchmarking/(parquet|tpcds)/
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v21.1.2    # pick the version of clang-format you want
+    # Root formatter only. external/duckdb uses DuckDB's own clang-format 11 formatter.
+    rev: f4d7745e17a28aad7eed2f4874ca8d1568c11c4c # frozen: v22.1.8
     hooks:
       - id: clang-format
-        files: \.(c|cpp|cc|h|hpp|cxx|hxx)$
+        files: \.(c|cc|cpp|cxx|h|hh|hpp|hxx|ipp)$
 
   - repo: https://github.com/cheshirekow/cmake-format-precommit
-    rev: v0.6.13
+    rev: e2c2116d86a80e72e7146a06e68b7c228afc6319 # frozen: v0.6.13
     hooks:
       - id: cmake-format
 
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 1a4bb160cab6417b3045e1b37b6b72449243e658 # frozen: 0.37.4
+    hooks:
+      - id: check-dependabot
+      - id: check-github-issue-config
+      - id: check-github-issue-forms
+      - id: check-github-workflows
+
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.18.2
+    rev: 41e691678310dfd3833f7ab4e180ddb014310356 # frozen: v2.3.0
     hooks:
       - id: mypy
         entry: mypy
         files: ^(duckdb/|_duckdb-stubs/)
         exclude: ^duckdb/(experimental|query_graph)/
-        additional_dependencies: [ numpy, polars ]
+        # Check the files in the changed range without recursively surfacing
+        # the inherited type debt of every module they import.
+        args: ["--follow-imports=skip", "--allow-subclassing-any", "--no-warn-return-any"]
+        additional_dependencies: [numpy, polars]
 
   - repo: local
     hooks:
-      - id: post-checkout-submodules
-        name: Update submodule post-checkout
-        entry: .githooks/post-checkout
-        language: script
-        stages: [ post-checkout ]
-        pass_filenames: false
-        always_run: true
+      - id: shfmt
+        name: shfmt
+        entry: shfmt -w -ln=bash -i=2 -ci -bn
+        language: system
+        types: [shell]

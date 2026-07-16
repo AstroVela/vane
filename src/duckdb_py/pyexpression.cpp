@@ -12,8 +12,37 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb_python/python_udf_utils.hpp"
+
+#include <thread>
 
 namespace duckdb {
+
+namespace {
+
+static idx_t ExpressionUDFDefaultParallelism() {
+	auto hardware = std::thread::hardware_concurrency();
+	if (hardware == 0) {
+		return idx_t(1);
+	}
+	return static_cast<idx_t>(hardware);
+}
+
+static vector<unique_ptr<ParsedExpression>> CopyExpressionArgs(const py::args &args) {
+	vector<unique_ptr<ParsedExpression>> expressions;
+	expressions.reserve(args.size() + 1);
+	for (auto arg : args) {
+		shared_ptr<DuckDBPyExpression> py_expr;
+		if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(arg, py_expr)) {
+			string actual_type = py::str(py::type::of(arg));
+			throw InvalidInputException("Expected argument of type Expression, received '%s' instead", actual_type);
+		}
+		expressions.push_back(py_expr->GetExpression().Copy());
+	}
+	return expressions;
+}
+
+} // namespace
 
 DuckDBPyExpression::DuckDBPyExpression(unique_ptr<ParsedExpression> expr_p, OrderType order_type,
                                        OrderByNullType null_order)
@@ -496,17 +525,41 @@ shared_ptr<DuckDBPyExpression> DuckDBPyExpression::CaseExpression(const DuckDBPy
 
 shared_ptr<DuckDBPyExpression> DuckDBPyExpression::FunctionExpression(const string &function_name,
                                                                       const py::args &args) {
-	vector<unique_ptr<ParsedExpression>> expressions;
-	for (auto arg : args) {
-		shared_ptr<DuckDBPyExpression> py_expr;
-		if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(arg, py_expr)) {
-			string actual_type = py::str(py::type::of(arg));
-			throw InvalidInputException("Expected argument of type Expression, received '%s' instead", actual_type);
-		}
-		auto expr = py_expr->GetExpression().Copy();
-		expressions.push_back(std::move(expr));
-	}
+	auto expressions = CopyExpressionArgs(args);
 	return InternalFunctionExpression(function_name, std::move(expressions));
+}
+
+shared_ptr<DuckDBPyExpression> DuckDBPyExpression::UDFMapExpression(const py::function &udf, const string &name,
+                                                                   const shared_ptr<DuckDBPyType> &return_type,
+                                                                   const string &execution_backend,
+                                                                   const py::args &args) {
+	if (!return_type) {
+		throw InvalidInputException("return_dtype is required for expression UDF");
+	}
+	auto expressions = CopyExpressionArgs(args);
+	auto payload = BuildExpressionScalarUDFPayload(name, udf, return_type, execution_backend,
+	                                              ExpressionUDFDefaultParallelism(), args.size());
+	expressions.push_back(make_uniq<duckdb::ConstantExpression>(std::move(payload)));
+	return InternalFunctionExpression("udf", std::move(expressions));
+}
+
+shared_ptr<DuckDBPyExpression>
+DuckDBPyExpression::UDFMapBatchesExpression(const py::function &udf, const string &name, const py::object &schema,
+                                            const string &execution_backend, const vector<string> &input_names,
+                                            const Optional<py::object> &batch_size,
+	                                            bool row_preserving,
+                                            const Optional<py::object> &gpus,
+                                            const Optional<py::object> &actor_number, bool stateful,
+                                            const py::args &args) {
+	if (input_names.size() != args.size()) {
+		throw InvalidInputException("input_names count must match batch UDF expression argument count");
+	}
+	auto expressions = CopyExpressionArgs(args);
+	auto payload = BuildExpressionMapBatchesUDFPayload(name, udf, schema, execution_backend,
+	                                                  ExpressionUDFDefaultParallelism(), input_names, batch_size,
+	                                                  row_preserving, gpus, actor_number, stateful);
+	expressions.push_back(make_uniq<duckdb::ConstantExpression>(std::move(payload)));
+	return InternalFunctionExpression("udf", std::move(expressions));
 }
 
 } // namespace duckdb

@@ -13,6 +13,7 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb_python/pyrelation.hpp"
 #include <duckdb/main/settings.hpp>
+#include "duckdb_python/pybind11/gil_wrapper.hpp"
 
 namespace duckdb {
 
@@ -242,7 +243,7 @@ static unique_ptr<TableRef> ReplaceInternal(ClientContext &context, const string
 	D_ASSERT((bool)lookup_result);
 	auto scan_all_frames = result.GetValue<bool>();
 
-	py::gil_scoped_acquire acquire;
+	PythonGILWrapper acquire;
 	py::object current_frame;
 	try {
 		current_frame = py::module::import("inspect").attr("currentframe")();

@@ -23,12 +23,12 @@ public:
 	}
 
 	~PythonObjectContainer() {
-		py::gil_scoped_acquire acquire;
+		PythonGILWrapper acquire;
 		py_obj.clear();
 	}
 
 	void Push(py::object &&obj) {
-		py::gil_scoped_acquire gil;
+		PythonGILWrapper gil;
 		PushInternal(std::move(obj));
 	}
 

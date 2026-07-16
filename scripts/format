@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+set -u
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/format root [--all|--changed|--staged]
+  scripts/format submodule [--all|--changed]
+  scripts/format workspace [--all|--changed]
+  scripts/format -h|--help
+
+No action is run without a subcommand. With a subcommand, the default file set is --changed.
+
+Subcommands:
+  root        Format the root repository only. Does not enter external/duckdb.
+  submodule   Format external/duckdb only, using DuckDB's own formatter.
+  workspace   Format both root and external/duckdb with their own formatters.
+
+Root repository file sets:
+  --all       All root git-tracked files.
+  --changed   Root files changed relative to HEAD. Default.
+  --staged    Root files staged with git add. This is not git stash.
+
+Root formatter hooks:
+  ruff-format, clang-format, cmake-format, shfmt.
+
+Submodule file sets:
+  --all       Full external/duckdb formatter pass.
+  --changed   external/duckdb files changed relative to its HEAD. Default.
+
+Examples:
+  scripts/format root
+  scripts/format root --staged
+  scripts/format root --all
+  scripts/format submodule
+  scripts/format workspace --all
+
+Notes:
+  external/duckdb contains C++, Python, CMake, test, and benchmark files.
+  Its formatter is intentionally separate from the root repository formatter.
+  workspace runs root and external/duckdb independently, then reports failures.
+  root requires pre-commit on PATH.
+  submodule requires black>=24, clang-format 11.0.1, and cmake-format on PATH.
+EOF
+}
+
+die() {
+  echo "$1" >&2
+  echo >&2
+  usage >&2
+  exit 2
+}
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root" || exit 1
+
+if (($# == 0)); then
+  usage
+  exit 0
+fi
+
+case "$1" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  root | submodule | workspace)
+    command_name="$1"
+    shift
+    ;;
+  *)
+    die "Unknown subcommand: $1"
+    ;;
+esac
+
+file_set=""
+
+while (($#)); do
+  case "$1" in
+    --all)
+      [[ -z "$file_set" ]] || die "Choose only one file set: --all, --changed, or --staged."
+      file_set="all"
+      ;;
+    --changed)
+      [[ -z "$file_set" ]] || die "Choose only one file set: --all, --changed, or --staged."
+      file_set="changed"
+      ;;
+    --staged)
+      [[ -z "$file_set" ]] || die "Choose only one file set: --all, --changed, or --staged."
+      file_set="staged"
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "Unknown option: $1"
+      ;;
+  esac
+  shift
+done
+
+if [[ -z "$file_set" ]]; then
+  file_set="changed"
+fi
+
+if [[ "$command_name" != "root" && "$file_set" == "staged" ]]; then
+  die "--staged is only valid with: scripts/format root"
+fi
+
+pre_commit=()
+
+load_pre_commit() {
+  export PRE_COMMIT_HOME="${PRE_COMMIT_HOME:-$repo_root/.cache/pre-commit}"
+
+  if command -v pre-commit >/dev/null 2>&1; then
+    pre_commit=(pre-commit)
+  else
+    echo "pre-commit is required to run root format hooks." >&2
+    echo "Install it in your active environment, for example: python -m pip install pre-commit" >&2
+    return 127
+  fi
+}
+
+root_hooks() {
+  printf '%s\n' ruff-format clang-format cmake-format shfmt
+}
+
+root_changed_files() {
+  git diff --name-only --diff-filter=ACMRT HEAD --
+}
+
+require_submodule_formatters() {
+  local status=0
+  local version
+
+  if ! command -v black >/dev/null 2>&1; then
+    echo "black>=24 is required to format external/duckdb." >&2
+    echo 'Install it in your active environment, for example: python -m pip install "black>=24"' >&2
+    status=127
+  else
+    version="$(black --version 2>/dev/null || true)"
+    if [[ ! "$version" =~ ([0-9]+)\. ]] || ((BASH_REMATCH[1] < 24)); then
+      echo "black>=24 is required to format external/duckdb. Found: ${version:-unknown}" >&2
+      echo 'Install it in your active environment, for example: python -m pip install "black>=24"' >&2
+      status=127
+    fi
+  fi
+
+  if ! command -v clang-format >/dev/null 2>&1; then
+    echo "clang-format 11.0.1 is required to format external/duckdb." >&2
+    echo 'Install it in your active environment, for example: python -m pip install "clang_format==11.0.1"' >&2
+    status=127
+  else
+    version="$(clang-format --version 2>/dev/null || true)"
+    if [[ ! "$version" =~ (^|[^0-9])11\.0\.1([^0-9]|$) ]]; then
+      echo "clang-format 11.0.1 is required to format external/duckdb. Found: ${version:-unknown}" >&2
+      echo 'Install it in your active environment, for example: python -m pip install "clang_format==11.0.1"' >&2
+      status=127
+    fi
+  fi
+
+  if ! command -v cmake-format >/dev/null 2>&1; then
+    echo "cmake-format is required to format external/duckdb." >&2
+    echo "Install it in your active environment, for example: python -m pip install cmake-format" >&2
+    status=127
+  fi
+
+  return "$status"
+}
+
+run_root_format() {
+  local status=0
+  local hook
+  local code
+  local files=()
+
+  load_pre_commit || return $?
+
+  if [[ "$file_set" == "changed" ]]; then
+    while IFS= read -r file; do
+      [[ -n "$file" ]] && files+=("$file")
+    done < <(root_changed_files)
+
+    if ((${#files[@]} == 0)); then
+      echo "No root files changed relative to HEAD."
+      return 0
+    fi
+  fi
+
+  while IFS= read -r hook; do
+    case "$file_set" in
+      all)
+        "${pre_commit[@]}" run "$hook" --all-files --color=always
+        ;;
+      staged)
+        "${pre_commit[@]}" run "$hook" --color=always
+        ;;
+      changed)
+        "${pre_commit[@]}" run "$hook" --files "${files[@]}" --color=always
+        ;;
+    esac
+
+    code=$?
+    if [[ $code -ne 0 ]]; then
+      status=$code
+    fi
+  done < <(root_hooks)
+
+  return "$status"
+}
+
+run_root_format_with_verify() {
+  local first_status
+  local second_status
+
+  run_root_format
+  first_status=$?
+
+  if [[ $first_status -ne 0 ]]; then
+    echo "Re-running root format hooks to verify after automatic edits..."
+    run_root_format
+    second_status=$?
+    if [[ $second_status -ne 0 ]]; then
+      return "$second_status"
+    fi
+  fi
+}
+
+run_submodule_format() {
+  local duckdb_dir="$repo_root/external/duckdb"
+  local revision_arg=HEAD
+
+  if [[ ! -f "$duckdb_dir/scripts/format.py" ]]; then
+    echo "external/duckdb formatter not found. Is the submodule initialized?" >&2
+    return 1
+  fi
+
+  require_submodule_formatters || return $?
+
+  if [[ "$file_set" == "all" ]]; then
+    revision_arg=--all
+  fi
+
+  echo "Formatting external/duckdb with DuckDB's own formatter..."
+  (
+    cd "$duckdb_dir" || exit 1
+    python scripts/format.py "$revision_arg" --fix --noconfirm
+  )
+}
+
+run_workspace_format() {
+  local root_status=0
+  local submodule_status=0
+
+  echo "==> Formatting root repository (--$file_set)"
+  run_root_format_with_verify
+  root_status=$?
+
+  echo "==> Formatting external/duckdb (--$file_set)"
+  run_submodule_format
+  submodule_status=$?
+
+  if [[ $root_status -ne 0 ]]; then
+    echo "Root formatting failed with exit code $root_status." >&2
+  fi
+
+  if [[ $submodule_status -ne 0 ]]; then
+    echo "external/duckdb formatting failed with exit code $submodule_status." >&2
+  fi
+
+  if [[ $root_status -ne 0 ]]; then
+    return "$root_status"
+  fi
+
+  return "$submodule_status"
+}
+
+case "$command_name" in
+  root)
+    run_root_format_with_verify
+    ;;
+  submodule)
+    run_submodule_format
+    ;;
+  workspace)
+    run_workspace_format
+    ;;
+esac

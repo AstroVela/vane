@@ -265,6 +265,25 @@ static void InitializeMetaQueries(py::class_<DuckDBPyRelation> &m) {
 	    .def("explain", &DuckDBPyRelation::Explain, py::arg("type") = "standard");
 }
 
+static void RejectMapBatchesUnsupportedKwargs(const py::kwargs &kwargs) {
+	if (!kwargs || kwargs.empty()) {
+		return;
+	}
+	vector<string> names;
+	names.reserve(kwargs.size());
+	for (auto item : kwargs) {
+		names.push_back(py::cast<string>(py::str(item.first)));
+	}
+	string message = "map_batches() got unsupported keyword argument(s): ";
+	for (idx_t i = 0; i < names.size(); i++) {
+		if (i > 0) {
+			message += ", ";
+		}
+		message += names[i];
+	}
+	throw py::type_error(message);
+}
+
 void DuckDBPyRelation::Initialize(py::handle &m) {
 	auto relation_module = py::class_<DuckDBPyRelation>(m, "DuckDBPyRelation", py::module_local());
 	InitializeReadOnlyProperties(relation_module);
@@ -283,6 +302,63 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 
 	relation_module.def("filter", &DuckDBPyRelation::Filter, "Filter the relation object by the filter in filter_expr",
 	                    py::arg("filter_expr"));
+	relation_module.def(
+	    "map_batches",
+	    [](DuckDBPyRelation &self, py::function fun, Optional<py::object> schema,
+	       const Optional<py::object> &batch_size, const Optional<py::object> &output_batch_size,
+	       const Optional<py::object> &min_task_batch_size,
+	       const Optional<py::object> &preserve_compute_batch_boundaries,
+	       const Optional<py::object> &cpus, const Optional<py::object> &gpus,
+	       const Optional<py::object> &memory_bytes,
+	       const Optional<py::object> &execution_backend, const Optional<py::object> &actor_number,
+	       const Optional<py::object> &ray_actor_thread_policy,
+	       const Optional<py::object> &streaming_breaker, const Optional<py::object> &target_max_batch_bytes,
+	       const Optional<py::object> &task_input_max_bytes,
+	       const Optional<py::object> &output_target_max_bytes, py::kwargs kwargs) {
+		    RejectMapBatchesUnsupportedKwargs(kwargs);
+		    return self.MapBatches(fun, schema, batch_size, output_batch_size, min_task_batch_size,
+		                           preserve_compute_batch_boundaries,
+		                           cpus, gpus, memory_bytes, execution_backend,
+		                           actor_number, ray_actor_thread_policy, streaming_breaker, target_max_batch_bytes,
+		                           task_input_max_bytes, output_target_max_bytes);
+	    },
+	    "Apply a Python function to batches of rows and return the resulting relation", py::arg("function"),
+	    py::arg("schema") = py::none(), py::kw_only(), py::arg("batch_size") = py::none(),
+	    py::arg("output_batch_size") = py::none(), py::arg("min_task_batch_size") = py::none(),
+	    py::arg("preserve_compute_batch_boundaries") = py::none(),
+	    py::arg("cpus") = py::none(), py::arg("gpus") = py::none(), py::arg("memory_bytes") = py::none(),
+	    py::arg("execution_backend") = py::none(), py::arg("actor_number") = py::none(),
+	    py::arg("ray_actor_thread_policy") = py::none(),
+	    py::arg("streaming_breaker") = py::none(), py::arg("target_max_batch_bytes") = py::none(),
+	    py::arg("task_input_max_bytes") = py::none(), py::arg("output_target_max_bytes") = py::none());
+	relation_module.def(
+	    "flat_map",
+	    [](DuckDBPyRelation &self, py::function fun, Optional<py::object> schema,
+	       const Optional<py::object> &batch_size, const Optional<py::object> &output_batch_size,
+	       const Optional<py::object> &min_task_batch_size,
+	       const Optional<py::object> &preserve_compute_batch_boundaries,
+	       const Optional<py::object> &cpus, const Optional<py::object> &gpus,
+	       const Optional<py::object> &memory_bytes,
+	       const Optional<py::object> &execution_backend, const Optional<py::object> &actor_number,
+	       const Optional<py::object> &streaming_breaker, const Optional<py::object> &target_max_batch_bytes,
+	       const Optional<py::object> &task_input_max_bytes,
+	       const Optional<py::object> &output_target_max_bytes, py::kwargs kwargs) {
+		    RejectMapBatchesUnsupportedKwargs(kwargs);
+		    return self.FlatMap(fun, schema, batch_size, output_batch_size, min_task_batch_size,
+		                        preserve_compute_batch_boundaries,
+		                        cpus, gpus, memory_bytes, execution_backend, actor_number,
+		                        streaming_breaker, target_max_batch_bytes,
+		                        task_input_max_bytes,
+		                        output_target_max_bytes);
+	    },
+	    "Apply a Python function per-row that yields multiple output rows (flat_map / one-to-many)",
+	    py::arg("function"), py::arg("schema") = py::none(), py::kw_only(), py::arg("batch_size") = py::none(),
+	    py::arg("output_batch_size") = py::none(), py::arg("min_task_batch_size") = py::none(),
+	    py::arg("preserve_compute_batch_boundaries") = py::none(),
+	    py::arg("cpus") = py::none(), py::arg("gpus") = py::none(), py::arg("memory_bytes") = py::none(),
+	    py::arg("execution_backend") = py::none(), py::arg("actor_number") = py::none(),
+	    py::arg("streaming_breaker") = py::none(), py::arg("target_max_batch_bytes") = py::none(),
+	    py::arg("task_input_max_bytes") = py::none(), py::arg("output_target_max_bytes") = py::none());
 	DefineMethod({"select", "project"}, relation_module, &DuckDBPyRelation::Project,
 	             "Project the relation object by the projection in project_expr", py::kw_only(),
 	             py::arg("groups") = "");
@@ -314,6 +390,11 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	    .def("limit", &DuckDBPyRelation::Limit,
 	         "Only retrieve the first n rows from this relation object, starting at offset", py::arg("n"),
 	         py::arg("offset") = 0)
+	    .def("repartition", &DuckDBPyRelation::Repartition,
+	         "Repartition the relation by optional columns and number of partitions")
+	    .def("local_exchange", &DuckDBPyRelation::LocalExchange,
+	         "Insert a local exchange (pipeline break) for CPU/GPU overlap within a single worker",
+	         py::arg("num_partitions") = py::none())
 	    .def("insert", &DuckDBPyRelation::Insert, "Inserts the given values into the relation", py::arg("values"))
 	    .def("update", &DuckDBPyRelation::Update, "Update the given relation with the provided expressions",
 	         py::arg("set"), py::kw_only(), py::arg("condition") = py::none())
@@ -323,6 +404,11 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	         "Run the given SQL query in sql_query on the view named virtual_table_name that refers to the relation "
 	         "object",
 	         py::arg("virtual_table_name"), py::arg("sql_query"))
+
+	    .def("explode", &DuckDBPyRelation::Explode,
+	         "Unnest/explode a list or array column, producing one row per element. "
+	         "Similar to Spark explode().",
+	         py::arg("column"))
 
 	    // Aren't these also technically consumers?
 	    .def("insert_into", &DuckDBPyRelation::InsertInto,
@@ -337,8 +423,10 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	             py::arg("replace") = true);
 
 	relation_module
-	    .def("map", &DuckDBPyRelation::Map, py::arg("map_function"), py::kw_only(), py::arg("schema") = py::none(),
-	         "Calls the passed function on the relation")
+		    .def("map", &DuckDBPyRelation::Map, py::arg("map_function"), py::kw_only(), py::arg("return_type").none(false),
+		         py::arg("batch_size") = py::none(), py::arg("cpus") = py::none(), py::arg("gpus") = py::none(),
+		         py::arg("execution_backend") = py::none(), py::arg("actor_number") = py::none(),
+		         py::arg("side_effects") = false, "Apply a row-wise scalar Python UDF through the unified UDF executor")
 	    .def("show", &DuckDBPyRelation::Print, "Display a summary of the data", py::kw_only(),
 	         py::arg("max_width") = py::none(), py::arg("max_rows") = py::none(), py::arg("max_col_width") = py::none(),
 	         py::arg("null_value") = py::none(), py::arg("render_mode") = py::none())

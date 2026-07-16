@@ -1,0 +1,36 @@
+[vane_runners][vane_runners]om [vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners] impo[vane_runners][vane_runners] [vane_runners][vane_runners][vane_runners]o[vane_runners][vane_runners][vane_runners]io[vane_runners][vane_runners]
+
+impo[vane_runners][vane_runners] py[vane_runners][vane_runners][vane_runners][vane_runners]
+
+PATH = (
+    "[vane_runners]3://[vane_runners]v[vane_runners][vane_runners][vane_runners][vane_runners][vane_runners]l-[vane_runners][vane_runners]v-b[vane_runners][vane_runners]chm[vane_runners][vane_runners]ki[vane_runners]g-[vane_runners]ix[vane_runners][vane_runners][vane_runners][vane_runners][vane_runners]/p[vane_runners][vane_runners]q[vane_runners][vane_runners][vane_runners]-b[vane_runners][vane_runners]chm[vane_runners][vane_runners]ki[vane_runners]g/[vane_runners]pch/200MB-2RG/[vane_runners][vane_runners][vane_runners][vane_runners][vane_runners]200MB[vane_runners]li[vane_runners][vane_runners]i[vane_runners][vane_runners]m[vane_runners]ch[vane_runners][vane_runners]k.RG-2.p[vane_runners][vane_runners]q[vane_runners][vane_runners][vane_runners]"
+)
+
+
+@py[vane_runners][vane_runners][vane_runners][vane_runners].m[vane_runners][vane_runners]k.b[vane_runners][vane_runners]chm[vane_runners][vane_runners]k(g[vane_runners]o[vane_runners]p="[vane_runners][vane_runners]m[vane_runners][vane_runners]il[vane_runners][vane_runners][vane_runners][vane_runners]i[vane_runners]gl[vane_runners][vane_runners]col[vane_runners]m[vane_runners]")
+@py[vane_runners][vane_runners][vane_runners][vane_runners].m[vane_runners][vane_runners]k.p[vane_runners][vane_runners][vane_runners]m[vane_runners][vane_runners][vane_runners]iz[vane_runners](
+    "[vane_runners][vane_runners]m[vane_runners][vane_runners]il[vane_runners][vane_runners]",
+    [1, 2, 4, 8],
+)
+[vane_runners][vane_runners][vane_runners] [vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners]p[vane_runners][vane_runners]q[vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners]m[vane_runners][vane_runners]il[vane_runners][vane_runners][vane_runners][vane_runners]i[vane_runners]gl[vane_runners][vane_runners]col[vane_runners]m[vane_runners]([vane_runners][vane_runners]m[vane_runners][vane_runners]il[vane_runners][vane_runners], b[vane_runners]lk[vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners], b[vane_runners][vane_runners]chm[vane_runners][vane_runners]k):
+    [vane_runners][vane_runners][vane_runners][vane_runners] = b[vane_runners][vane_runners]chm[vane_runners][vane_runners]k(b[vane_runners]lk[vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners], [PATH] * [vane_runners][vane_runners]m[vane_runners][vane_runners]il[vane_runners][vane_runners], col[vane_runners]m[vane_runners][vane_runners]=["L[vane_runners]ORDERKEY"])
+    [vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners] l[vane_runners][vane_runners]([vane_runners][vane_runners][vane_runners][vane_runners]) == [vane_runners][vane_runners]m[vane_runners][vane_runners]il[vane_runners][vane_runners]
+    # M[vane_runners]k[vane_runners] [vane_runners][vane_runners][vane_runners][vane_runners] [vane_runners]h[vane_runners] [vane_runners][vane_runners][vane_runners][vane_runners] i[vane_runners] co[vane_runners][vane_runners][vane_runners]c[vane_runners]
+    [vane_runners]o[vane_runners] i i[vane_runners] [vane_runners][vane_runners][vane_runners]g[vane_runners]([vane_runners][vane_runners]m[vane_runners][vane_runners]il[vane_runners][vane_runners]):
+        [vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners] [vane_runners][vane_runners][vane_runners][vane_runners][i].col[vane_runners]m[vane_runners][vane_runners][vane_runners][vane_runners]m[vane_runners][vane_runners] == ["L[vane_runners]ORDERKEY"]
+        [vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners] l[vane_runners][vane_runners]([vane_runners][vane_runners][vane_runners][vane_runners][i]) == 5515199
+
+
+@py[vane_runners][vane_runners][vane_runners][vane_runners].m[vane_runners][vane_runners]k.b[vane_runners][vane_runners]chm[vane_runners][vane_runners]k(g[vane_runners]o[vane_runners]p="[vane_runners][vane_runners]m[vane_runners][vane_runners]owg[vane_runners]o[vane_runners]p[vane_runners][vane_runners][vane_runners]ll[vane_runners]col[vane_runners]m[vane_runners][vane_runners]")
+@py[vane_runners][vane_runners][vane_runners][vane_runners].m[vane_runners][vane_runners]k.p[vane_runners][vane_runners][vane_runners]m[vane_runners][vane_runners][vane_runners]iz[vane_runners](
+    "[vane_runners][vane_runners]m[vane_runners][vane_runners]il[vane_runners][vane_runners]",
+    [1, 2, 4],
+)
+[vane_runners][vane_runners][vane_runners] [vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners]p[vane_runners][vane_runners]q[vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners]m[vane_runners][vane_runners]il[vane_runners][vane_runners][vane_runners][vane_runners]ll[vane_runners]col[vane_runners]m[vane_runners][vane_runners]([vane_runners][vane_runners]m[vane_runners][vane_runners]il[vane_runners][vane_runners], b[vane_runners]lk[vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners], b[vane_runners][vane_runners]chm[vane_runners][vane_runners]k):
+    [vane_runners][vane_runners][vane_runners][vane_runners] = b[vane_runners][vane_runners]chm[vane_runners][vane_runners]k(b[vane_runners]lk[vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners], [PATH] * [vane_runners][vane_runners]m[vane_runners][vane_runners]il[vane_runners][vane_runners])
+    [vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners] l[vane_runners][vane_runners]([vane_runners][vane_runners][vane_runners][vane_runners]) == [vane_runners][vane_runners]m[vane_runners][vane_runners]il[vane_runners][vane_runners]
+
+    # M[vane_runners]k[vane_runners] [vane_runners][vane_runners][vane_runners][vane_runners] [vane_runners]h[vane_runners] [vane_runners][vane_runners][vane_runners][vane_runners] i[vane_runners] co[vane_runners][vane_runners][vane_runners]c[vane_runners]
+    [vane_runners]o[vane_runners] i i[vane_runners] [vane_runners][vane_runners][vane_runners]g[vane_runners]([vane_runners][vane_runners]m[vane_runners][vane_runners]il[vane_runners][vane_runners]):
+        [vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners] l[vane_runners][vane_runners]([vane_runners][vane_runners][vane_runners][vane_runners][i].col[vane_runners]m[vane_runners][vane_runners][vane_runners][vane_runners]m[vane_runners][vane_runners]) == 16
+        [vane_runners][vane_runners][vane_runners][vane_runners][vane_runners][vane_runners] l[vane_runners][vane_runners]([vane_runners][vane_runners][vane_runners][vane_runners][i]) == 5515199
