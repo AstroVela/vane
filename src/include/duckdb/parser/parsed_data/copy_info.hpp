@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -14,10 +20,12 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/parser/query_node.hpp"
+#include "duckdb/common/shared_ptr.hpp"
 
 namespace duckdb {
 
 class QueryNode;
+class Relation;
 
 struct CopyInfo : public ParseInfo {
 public:
@@ -50,6 +58,8 @@ public:
 	case_insensitive_map_t<vector<Value>> options;
 	//! The SQL statement used instead of a table when copying data out to a file
 	unique_ptr<QueryNode> select_statement;
+	//! The relation used instead of a table when copying data out to a file (relation API only)
+	shared_ptr<Relation> select_relation;
 
 public:
 	string CopyOptionsToString() const;

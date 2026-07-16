@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 
 namespace duckdb {
@@ -5,11 +11,12 @@ namespace duckdb {
 //-------------------------------------------------------------------------
 // Nested Type Hooks
 //-------------------------------------------------------------------------
-void BinaryDeserializer::OnPropertyBegin(const field_id_t field_id, const char *) {
+void BinaryDeserializer::OnPropertyBegin(const field_id_t field_id, const char *tag) {
 	auto field = NextField();
 	if (field != field_id) {
-		throw SerializationException("Failed to deserialize: field id mismatch, expected: %d, got: %d", field_id,
-		                             field);
+		throw SerializationException(
+		    "Failed to deserialize: field id mismatch, expected: %d, got: %d (tag=%s, nesting=%d)", field_id, field,
+		    tag, nesting_level);
 	}
 }
 

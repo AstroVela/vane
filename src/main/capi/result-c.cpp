@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/capi/capi_internal.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/allocator.hpp"
@@ -382,7 +388,7 @@ bool DeprecatedMaterializeResult(duckdb_result *result) {
 
 } // namespace duckdb
 
-static void DuckdbDestroyColumn(duckdb_column column, idx_t count) {
+static void DuckDBDestroyColumn(duckdb_column column, idx_t count) {
 	if (column.deprecated_data) {
 		if (column.deprecated_type == DUCKDB_TYPE_VARCHAR) {
 			// varchar, delete individual strings
@@ -411,7 +417,7 @@ static void DuckdbDestroyColumn(duckdb_column column, idx_t count) {
 void duckdb_destroy_result(duckdb_result *result) {
 	if (result->deprecated_columns) {
 		for (idx_t i = 0; i < result->deprecated_column_count; i++) {
-			DuckdbDestroyColumn(result->deprecated_columns[i], result->deprecated_row_count);
+			DuckDBDestroyColumn(result->deprecated_columns[i], result->deprecated_row_count);
 		}
 		duckdb_free(result->deprecated_columns);
 	}

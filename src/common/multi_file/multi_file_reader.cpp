@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -55,7 +61,11 @@ MultiFileBindData::~MultiFileBindData() {
 unique_ptr<FunctionData> MultiFileBindData::Copy() const {
 	auto result = make_uniq<MultiFileBindData>();
 	if (bind_data) {
-		result->bind_data = unique_ptr_cast<FunctionData, TableFunctionData>(bind_data->Copy());
+		if (typeid(*bind_data) == typeid(TableFunctionData)) {
+			result->bind_data = make_uniq<TableFunctionData>();
+		} else {
+			result->bind_data = unique_ptr_cast<FunctionData, TableFunctionData>(bind_data->Copy());
+		}
 	}
 	result->file_list = file_list->Copy();
 	result->multi_file_reader = multi_file_reader->Copy();

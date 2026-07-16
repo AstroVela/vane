@@ -1,6 +1,13 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/set/physical_cte.hpp"
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/aggregate_hashtable.hpp"
 #include "duckdb/parallel/event.hpp"
@@ -15,6 +22,12 @@ PhysicalCTE::PhysicalCTE(PhysicalPlan &physical_plan, string ctename, idx_t tabl
       table_index(table_index), ctename(std::move(ctename)) {
 	children.push_back(top);
 	children.push_back(bottom);
+}
+
+PhysicalCTE::PhysicalCTE(PhysicalPlan &physical_plan, string ctename, idx_t table_index, vector<LogicalType> types,
+                         idx_t estimated_cardinality)
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::CTE, std::move(types), estimated_cardinality),
+      table_index(table_index), ctename(std::move(ctename)) {
 }
 
 PhysicalCTE::~PhysicalCTE() {
@@ -108,6 +121,16 @@ InsertionOrderPreservingMap<string> PhysicalCTE::ParamsToString() const {
 	result["Table Index"] = StringUtil::Format("%llu", table_index);
 	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;
+}
+
+void PhysicalCTE::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "ctename", ctename);
+	serializer.WriteProperty(104, "table_index", table_index);
+	vector<LogicalType> working_table_types;
+	if (working_table) {
+		working_table_types = working_table->Types();
+	}
+	serializer.WriteProperty(105, "working_table_types", working_table_types);
 }
 
 } // namespace duckdb

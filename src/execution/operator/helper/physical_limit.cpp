@@ -1,7 +1,14 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/helper/physical_limit.hpp"
 
 #include "duckdb/common/algorithm.hpp"
 #include "duckdb/common/types/batched_data_collection.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_limit.hpp"
 #include "duckdb/main/config.hpp"
@@ -242,6 +249,11 @@ Value PhysicalLimit::GetDelimiter(ExecutionContext &context, DataChunk &input, c
 	input.SetCardinality(input_size);
 	auto limit_value = limit_chunk.GetValue(0, 0);
 	return limit_value;
+}
+
+void PhysicalLimit::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "limit_val", limit_val);
+	serializer.WriteProperty(104, "offset_val", offset_val);
 }
 
 } // namespace duckdb

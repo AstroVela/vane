@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/parser/query_node.hpp"
 
@@ -25,6 +31,7 @@ unique_ptr<CopyInfo> CopyInfo::Copy() const {
 	if (select_statement) {
 		result->select_statement = select_statement->Copy();
 	}
+	result->select_relation = select_relation;
 	return result;
 }
 
@@ -104,6 +111,9 @@ string CopyInfo::ToString() const {
 		if (select_statement) {
 			// COPY (select-node) TO ...
 			result += "(" + select_statement->ToString() + ")";
+		} else if (select_relation) {
+			// relation-based COPY (no SQL representation)
+			result += "(relation)";
 		} else {
 			result += TablePartToString();
 		}

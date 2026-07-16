@@ -1,10 +1,19 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
+#include "duckdb/execution/distributed/common_types.hpp"
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/pipeline.hpp"
+#include <iostream>
 
 namespace duckdb {
 
@@ -45,6 +54,12 @@ public:
 };
 
 unique_ptr<GlobalSourceState> PhysicalColumnDataScan::GetGlobalSourceState(ClientContext &context) const {
+	// DEBUG: Check collection before dereferencing
+
+	if (!collection) {
+		throw InternalException("PhysicalColumnDataScan::GetGlobalSourceState - collection is null");
+	}
+
 	return make_uniq<PhysicalColumnDataGlobalScanState>(*collection);
 }
 
@@ -70,6 +85,10 @@ void PhysicalColumnDataScan::BuildPipelines(Pipeline &current, MetaPipeline &met
 	switch (type) {
 	case PhysicalOperatorType::DELIM_SCAN: {
 		auto entry = state.delim_join_dependencies.find(*this);
+		if (entry == state.delim_join_dependencies.end()) {
+			for (auto &dep : state.delim_join_dependencies) {
+			}
+		}
 		D_ASSERT(entry != state.delim_join_dependencies.end());
 		// this chunk scan introduces a dependency to the current pipeline
 		// namely a dependency on the duplicate elimination pipeline to finish
@@ -129,6 +148,20 @@ InsertionOrderPreservingMap<string> PhysicalColumnDataScan::ParamsToString() con
 	}
 	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;
+}
+
+void PhysicalColumnDataScan::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "cte_index", cte_index);
+	serializer.WriteProperty(104, "delim_index", delim_index);
+	auto serialize_collection = collection.get() != nullptr && type != PhysicalOperatorType::CTE_SCAN &&
+	                            type != PhysicalOperatorType::RECURSIVE_CTE_SCAN &&
+	                            type != PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN;
+	serializer.WriteProperty(105, "has_collection", serialize_collection);
+	if (serialize_collection) {
+		serializer.WriteProperty(106, "collection", collection);
+	}
+	// Persist source_node_id for distributed pset routing (SourceId-based injection)
+	serializer.WritePropertyWithDefault(107, "source_node_id", source_node_id);
 }
 
 } // namespace duckdb

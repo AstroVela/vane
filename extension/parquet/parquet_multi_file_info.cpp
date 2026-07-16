@@ -1,12 +1,52 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "parquet_multi_file_info.hpp"
 #include "duckdb/common/multi_file/multi_file_function.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/hive_partitioning.hpp"
 #include "parquet_crypto.hpp"
 #include "duckdb/function/table_function.hpp"
+#include <algorithm>
+#include <cstdlib>
+#include <iostream>
+#include <unistd.h>
 
 namespace duckdb {
+
+namespace {
+
+static bool ParquetMaxThreadsDebugEnabled() {
+	const char *value = std::getenv("VANE_UDF_WORKER_SLOT_DEBUG");
+	if (!value || !*value) {
+		value = std::getenv("DUCKDB_DISTRIBUTED_DEBUG");
+	}
+	if (!value || !*value) {
+		return false;
+	}
+	string lowered = StringUtil::Lower(value);
+	return lowered != "0" && lowered != "false" && lowered != "no" && lowered != "off";
+}
+
+static const char *FileExpandResultName(FileExpandResult result) {
+	switch (result) {
+	case FileExpandResult::NO_FILES:
+		return "NO_FILES";
+	case FileExpandResult::SINGLE_FILE:
+		return "SINGLE_FILE";
+	case FileExpandResult::MULTIPLE_FILES:
+		return "MULTIPLE_FILES";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+} // namespace
 
 struct ParquetReadBindData : public TableFunctionData {
 	// These come from the initial_reader, but need to be stored in case the initial_reader is removed by a filter
@@ -34,12 +74,21 @@ struct ParquetReadBindData : public TableFunctionData {
 
 struct ParquetReadGlobalState : public GlobalTableFunctionState {
 	explicit ParquetReadGlobalState(optional_ptr<const PhysicalOperator> op_p)
-	    : row_group_index(0), batch_index(0), op(op_p) {
+	    : row_group_index(0), batch_index(0), row_group_pos(0), row_group_ids_initialized(false),
+	      use_row_group_ids(false), op(op_p) {
 	}
 	//! Index of row group within file currently up for scanning
 	idx_t row_group_index;
 	//! Batch index of the next row group to be scanned
 	idx_t batch_index;
+	//! Optional list of row groups to scan (set via file extended info)
+	vector<idx_t> row_group_ids;
+	//! Current position within row_group_ids
+	idx_t row_group_pos;
+	//! Track whether we already parsed extended info for row groups
+	bool row_group_ids_initialized;
+	//! Whether to use row_group_ids during scanning
+	bool use_row_group_ids;
 	//! (Optional) pointer to physical operator performing the scan
 	optional_ptr<const PhysicalOperator> op;
 };
@@ -58,6 +107,68 @@ static void ParseFileRowNumberOption(MultiFileReaderBindData &bind_data, Parquet
 
 		return_types.emplace_back(LogicalType::BIGINT);
 		names.emplace_back("file_row_number");
+	}
+}
+
+static bool TryExtractRowGroupId(const Value &value, idx_t &out) {
+	switch (value.type().id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT: {
+		auto v = value.GetValue<int64_t>();
+		if (v < 0) {
+			return false;
+		}
+		out = static_cast<idx_t>(v);
+		return true;
+	}
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT: {
+		auto v = value.GetValue<uint64_t>();
+		out = static_cast<idx_t>(v);
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
+static void ParseRowGroupIdsFromOpenFile(const OpenFileInfo &file, vector<idx_t> &out) {
+	if (!file.extended_info) {
+		return;
+	}
+	const auto &options = file.extended_info->options;
+	auto list_entry = options.find("row_group_ids");
+	if (list_entry != options.end()) {
+		const auto &val = list_entry->second;
+		if (val.type().id() == LogicalTypeId::LIST) {
+			for (const auto &child : ListValue::GetChildren(val)) {
+				idx_t idx = 0;
+				if (TryExtractRowGroupId(child, idx)) {
+					out.push_back(idx);
+				}
+			}
+		} else {
+			idx_t idx = 0;
+			if (TryExtractRowGroupId(val, idx)) {
+				out.push_back(idx);
+			}
+		}
+	}
+	auto single_entry = options.find("row_group_id");
+	if (single_entry != options.end()) {
+		idx_t idx = 0;
+		if (TryExtractRowGroupId(single_entry->second, idx)) {
+			out.push_back(idx);
+		}
+	}
+
+	if (!out.empty()) {
+		std::sort(out.begin(), out.end());
+		out.erase(std::unique(out.begin(), out.end()), out.end());
 	}
 }
 
@@ -228,6 +339,10 @@ static void ParquetScanSerialize(Serializer &serializer, const optional_ptr<Func
 	if (serializer.ShouldSerialize(3)) {
 		serializer.WriteProperty(104, "table_columns", bind_data.table_columns);
 	}
+	serializer.WritePropertyWithDefault<idx_t>(105, "initial_file_row_groups", parquet_data.initial_file_row_groups,
+	                                           static_cast<idx_t>(0));
+	serializer.WritePropertyWithDefault<idx_t>(106, "initial_file_cardinality", parquet_data.initial_file_cardinality,
+	                                           static_cast<idx_t>(0));
 }
 
 static unique_ptr<FunctionData> ParquetScanDeserialize(Deserializer &deserializer, TableFunction &function) {
@@ -238,22 +353,85 @@ static unique_ptr<FunctionData> ParquetScanDeserialize(Deserializer &deserialize
 	auto serialization = deserializer.ReadProperty<ParquetOptionsSerialization>(103, "parquet_options");
 	auto table_columns =
 	    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(104, "table_columns", vector<string> {});
-
-	vector<Value> file_path;
-	for (auto &path : files) {
-		file_path.emplace_back(path);
-	}
-	FileGlobInput input(FileGlobOptions::FALLBACK_GLOB, "parquet");
+	auto initial_file_row_groups =
+	    deserializer.ReadPropertyWithExplicitDefault<idx_t>(105, "initial_file_row_groups", static_cast<idx_t>(0));
+	auto initial_file_cardinality =
+	    deserializer.ReadPropertyWithExplicitDefault<idx_t>(106, "initial_file_cardinality", static_cast<idx_t>(0));
 
 	auto multi_file_reader = MultiFileReader::Create(function);
-	auto file_list = multi_file_reader->CreateFileList(context, Value::LIST(LogicalType::VARCHAR, file_path), input);
+	if (files.empty()) {
+		throw IOException("%s needs at least one file to read", function.name);
+	}
+	vector<OpenFileInfo> open_files;
+	open_files.reserve(files.size());
+	for (auto &path : files) {
+		open_files.emplace_back(path);
+	}
+	shared_ptr<MultiFileList> file_list(new SimpleMultiFileList(std::move(open_files)));
 	auto parquet_options = make_uniq<ParquetFileReaderOptions>(std::move(serialization.parquet_options));
 	auto interface = make_uniq<ParquetMultiFileInfo>();
-	auto bind_data = MultiFileFunction<ParquetMultiFileInfo>::MultiFileBindInternal(
-	    context, std::move(multi_file_reader), std::move(file_list), types, names,
-	    std::move(serialization.file_options), std::move(parquet_options), std::move(interface));
-	bind_data->Cast<MultiFileBindData>().table_columns = std::move(table_columns);
-	return bind_data;
+	interface->InitializeInterface(context, *multi_file_reader, *file_list);
+
+	// Rebuild bind data from serialized schema without opening any files.
+	auto result = make_uniq<MultiFileBindData>();
+	result->multi_file_reader = std::move(multi_file_reader);
+	result->file_list = std::move(file_list);
+	result->file_options = std::move(serialization.file_options);
+	result->interface = std::move(interface);
+	result->bind_data = result->interface->InitializeBindData(*result, std::move(parquet_options));
+	result->types = std::move(types);
+	result->names = std::move(names);
+	result->table_columns = std::move(table_columns);
+
+	auto &parquet_bind = result->bind_data->Cast<ParquetReadBindData>();
+	parquet_bind.initial_file_row_groups = initial_file_row_groups;
+	parquet_bind.initial_file_cardinality = initial_file_cardinality;
+	auto &options = parquet_bind.GetParquetOptions();
+	if (!options.schema.empty()) {
+		bool match_by_field_id = false;
+		const auto &first_column = options.schema[0];
+		match_by_field_id = first_column.identifier.type().id() == LogicalTypeId::INTEGER;
+		for (const auto &column : options.schema) {
+			auto res = MultiFileColumnDefinition(column.name, column.type);
+			res.identifier = column.identifier;
+			res.default_expression = make_uniq<ConstantExpression>(column.default_value);
+			result->reader_bind.schema.emplace_back(res);
+		}
+		if (options.file_row_number) {
+			MultiFileColumnDefinition res("file_row_number", LogicalType::BIGINT);
+			res.identifier = Value::INTEGER(MultiFileReader::ORDINAL_FIELD_ID);
+			result->reader_bind.schema.emplace_back(res);
+		}
+		result->reader_bind.mapping =
+		    match_by_field_id ? MultiFileColumnMappingMode::BY_FIELD_ID : MultiFileColumnMappingMode::BY_NAME;
+	}
+
+	// Restore filename/hive partition indexes if those options were enabled.
+	if (result->file_options.filename) {
+		auto it = std::find(result->names.begin(), result->names.end(), result->file_options.filename_column);
+		if (it != result->names.end()) {
+			result->reader_bind.filename_idx = optional_idx(it - result->names.begin());
+		}
+	}
+	if (result->file_options.hive_partitioning) {
+		auto partitions = HivePartitioning::Parse(result->file_list->GetFirstFile().path);
+		for (auto &part : partitions) {
+			auto it = std::find_if(result->names.begin(), result->names.end(),
+			                       [&](const string &col_name) { return StringUtil::CIEquals(col_name, part.first); });
+			if (it != result->names.end()) {
+				result->reader_bind.hive_partitioning_indexes.emplace_back(
+				    part.first, NumericCast<idx_t>(it - result->names.begin()));
+			}
+		}
+	}
+
+	result->columns = MultiFileColumnDefinition::ColumnsFromNamesAndTypes(result->names, result->types);
+	virtual_column_map_t virtual_columns;
+	MultiFileReader::GetVirtualColumns(context, result->reader_bind, virtual_columns);
+	result->interface->GetVirtualColumns(context, *result, virtual_columns);
+	result->virtual_columns = std::move(virtual_columns);
+	result->interface->FinalizeBindData(*result);
+	return std::move(result);
 }
 
 static vector<column_t> ParquetGetRowIdColumns(ClientContext &context, optional_ptr<FunctionData> bind_data) {
@@ -460,10 +638,23 @@ optional_idx ParquetMultiFileInfo::MaxThreads(const MultiFileBindData &bind_data
                                               FileExpandResult expand_result) {
 	if (expand_result == FileExpandResult::MULTIPLE_FILES) {
 		// always launch max threads if we are reading multiple files
+		if (ParquetMaxThreadsDebugEnabled()) {
+			std::cerr << "[vane-parquet-max-threads pid=" << getpid()
+			          << "] expand_result=" << FileExpandResultName(expand_result)
+			          << " scheduler_max_threads=" << global_state.max_threads << " returned=unbounded" << std::endl;
+		}
 		return optional_idx();
 	}
 	auto &bind_data = bind_data_p.bind_data->Cast<ParquetReadBindData>();
-	return MaxValue(bind_data.initial_file_row_groups, static_cast<idx_t>(1));
+	auto result = MaxValue(bind_data.initial_file_row_groups, static_cast<idx_t>(1));
+	if (ParquetMaxThreadsDebugEnabled()) {
+		std::cerr << "[vane-parquet-max-threads pid=" << getpid()
+		          << "] expand_result=" << FileExpandResultName(expand_result)
+		          << " scheduler_max_threads=" << global_state.max_threads
+		          << " initial_file_row_groups=" << bind_data.initial_file_row_groups << " returned=" << result
+		          << std::endl;
+	}
+	return result;
 }
 
 void ParquetMultiFileInfo::FinalizeBindData(MultiFileBindData &multi_file_data) {
@@ -553,20 +744,49 @@ bool ParquetReader::TryInitializeScan(ClientContext &context, GlobalTableFunctio
                                       LocalTableFunctionState &lstate_p) {
 	auto &gstate = gstate_p.Cast<ParquetReadGlobalState>();
 	auto &lstate = lstate_p.Cast<ParquetReadLocalState>();
-	if (gstate.row_group_index >= NumRowGroups()) {
-		// scanned all row groups in this file
-		return false;
+	if (!gstate.row_group_ids_initialized) {
+		ParseRowGroupIdsFromOpenFile(file, gstate.row_group_ids);
+		if (!gstate.row_group_ids.empty()) {
+			gstate.use_row_group_ids = true;
+			gstate.row_group_pos = 0;
+		}
+		gstate.row_group_ids_initialized = true;
+	}
+
+	idx_t row_group_idx = 0;
+	if (gstate.use_row_group_ids) {
+		bool found = false;
+		while (gstate.row_group_pos < gstate.row_group_ids.size()) {
+			const auto candidate = gstate.row_group_ids[gstate.row_group_pos++];
+			if (candidate < NumRowGroups()) {
+				row_group_idx = candidate;
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			return false;
+		}
+	} else {
+		if (gstate.row_group_index >= NumRowGroups()) {
+			// scanned all row groups in this file
+			return false;
+		}
+		row_group_idx = gstate.row_group_index++;
 	}
 	// The current reader has rowgroups left to be scanned
-	vector<idx_t> group_indexes {gstate.row_group_index};
+	vector<idx_t> group_indexes {row_group_idx};
 	InitializeScan(context, lstate.scan_state, group_indexes);
-	gstate.row_group_index++;
 	return true;
 }
 
 void ParquetReader::FinishFile(ClientContext &context, GlobalTableFunctionState &gstate_p) {
 	auto &gstate = gstate_p.Cast<ParquetReadGlobalState>();
 	gstate.row_group_index = 0;
+	gstate.row_group_pos = 0;
+	gstate.row_group_ids.clear();
+	gstate.row_group_ids_initialized = false;
+	gstate.use_row_group_ids = false;
 }
 
 AsyncResult ParquetReader::Scan(ClientContext &context, GlobalTableFunctionState &gstate_p,

@@ -1,51 +1,36 @@
-<div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: light)" srcset="logo/DuckDB_Logo-horizontal.svg">
-    <source media="(prefers-color-scheme: dark)" srcset="logo/DuckDB_Logo-horizontal-dark-mode.svg">
-    <img alt="DuckDB logo" src="logo/DuckDB_Logo-horizontal.svg" height="100">
-  </picture>
-</div>
-<br>
+# Vane DuckDB engine fork
 
-<p align="center">
-  <a href="https://github.com/duckdb/duckdb/actions"><img src="https://github.com/duckdb/duckdb/actions/workflows/Main.yml/badge.svg?branch=main" alt="Github Actions Badge"></a>
-  <a href="https://discord.gg/tcvwpjfnZx"><img src="https://shields.io/discord/909674491309850675" alt="discord" /></a>
-  <a href="https://github.com/duckdb/duckdb/releases/"><img src="https://img.shields.io/github/v/release/duckdb/duckdb?color=brightgreen&display_name=tag&logo=duckdb&logoColor=white" alt="Latest Release"></a>
-</p>
+This repository is the native engine fork used by [Vane](https://github.com/AstroVela/vane). It is based on [DuckDB](https://github.com/duckdb/duckdb) and adds Vane-specific distributed planning, execution, exchange, fault-tolerance, and Python integration support.
 
-## DuckDB
+It is not a general-purpose DuckDB distribution. Most users should install and use the parent Vane project rather than build this repository directly.
 
-DuckDB is a high-performance analytical database system. It is designed to be fast, reliable, portable, and easy to use. DuckDB provides a rich SQL dialect with support far beyond basic SQL. DuckDB supports arbitrary and nested correlated subqueries, window functions, collations, complex types (arrays, structs, maps), and [several extensions designed to make SQL easier to use](https://duckdb.org/docs/stable/sql/dialect/friendly_sql.html).
+> [!IMPORTANT]
+> This is an independent fork. It is not affiliated with, endorsed by, or maintained by the DuckDB Foundation. For Vane bugs and support, use the Vane issue tracker rather than DuckDB's community channels.
 
-DuckDB is available as a [standalone CLI application](https://duckdb.org/docs/stable/clients/cli/overview) and has clients for [Python](https://duckdb.org/docs/stable/clients/python/overview), [R](https://duckdb.org/docs/stable/clients/r), [Java](https://duckdb.org/docs/stable/clients/java), [Wasm](https://duckdb.org/docs/stable/clients/wasm/overview), etc., with deep integrations with packages such as [pandas](https://duckdb.org/docs/guides/python/sql_on_pandas) and [dplyr](https://duckdb.org/docs/stable/clients/r#duckplyr-dplyr-api).
+## Relationship to upstream
 
-For more information on using DuckDB, please refer to the [DuckDB documentation](https://duckdb.org/docs/stable/).
+The fork periodically integrates selected upstream DuckDB changes while maintaining Vane's engine extensions. Pull requests that import upstream work must record the upstream commit and preserve its authorship and license notices.
 
-## Installation
+DuckDB and this engine repository are distributed under the MIT license in [LICENSE](LICENSE). Other code below `third_party/` and selected extension directories retains its own license.
 
-If you want to install DuckDB, please see [our installation page](https://duckdb.org/docs/installation/) for instructions.
+## Build
 
-## Data Import
+For an engine-only debug build:
 
-For CSV files and Parquet files, data import is as simple as referencing the file in the FROM clause:
-
-```sql
-SELECT * FROM 'myfile.csv';
-SELECT * FROM 'myfile.parquet';
+```bash
+cmake -S . -B build -G Ninja
+cmake --build build --parallel
 ```
 
-Refer to our [Data Import](https://duckdb.org/docs/stable/data/overview) section for more information.
+Run a named test or the full native test suite:
 
-## SQL Reference
+```bash
+build/test/unittest "test name" -s
+build/test/unittest
+```
 
-The documentation contains a [SQL introduction and reference](https://duckdb.org/docs/stable/sql/introduction).
+The parent Vane package has additional Arrow Flight, gRPC, Python, and packaging prerequisites. See the parent repository's [development guide](https://github.com/AstroVela/vane/blob/main/DEVELOPMENT.md) for the supported build path.
 
-## Development
+## Contributing and security
 
-For development, DuckDB requires [CMake](https://cmake.org), Python 3 and a `C++11` compliant compiler. In the root directory, run `make` to compile the sources. For development, use `make debug` to build a non-optimized debug version. You should run `make unit` and `make allunit` to verify that your version works properly after making changes. To test performance, you can run `BUILD_BENCHMARK=1 BUILD_TPCH=1 make` and then perform several standard benchmarks from the root directory by executing `./build/release/benchmark/benchmark_runner`. The details of benchmarks are in our [Benchmark Guide](benchmark/README.md).
-
-Please also refer to our [Build Guide](https://duckdb.org/docs/stable/dev/building/overview) and [Contribution Guide](CONTRIBUTING.md).
-
-## Support
-
-See the [Support Options](https://duckdblabs.com/support/) page and the dedicated [`endoflife.date`](https://endoflife.date/duckdb) page.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) before participating. Report vulnerabilities through the private process in [SECURITY.md](SECURITY.md).

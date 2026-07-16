@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/physical_plan_generator.hpp"
 
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
@@ -73,10 +79,18 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalOperator &op) {
 		return CreatePlan(op.Cast<LogicalGet>());
 	case LogicalOperatorType::LOGICAL_PROJECTION:
 		return CreatePlan(op.Cast<LogicalProjection>());
+	case LogicalOperatorType::LOGICAL_VLLM_PROJECT:
+		return CreatePlan(op.Cast<LogicalVLLMProject>());
+	case LogicalOperatorType::LOGICAL_UDF_PROJECT:
+		return CreatePlan(op.Cast<LogicalUDFProject>());
 	case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
 		return CreatePlan(op.Cast<LogicalEmptyResult>());
 	case LogicalOperatorType::LOGICAL_FILTER:
 		return CreatePlan(op.Cast<LogicalFilter>());
+	case LogicalOperatorType::LOGICAL_REPARTITION:
+		return CreatePlan(op.Cast<LogicalRepartition>());
+	case LogicalOperatorType::LOGICAL_LOCAL_EXCHANGE:
+		return CreatePlan(op.Cast<LogicalLocalExchange>());
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
 		return CreatePlan(op.Cast<LogicalAggregate>());
 	case LogicalOperatorType::LOGICAL_WINDOW:

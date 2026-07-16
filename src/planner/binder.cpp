@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/planner/binder.hpp"
 
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
@@ -270,6 +276,10 @@ void Binder::AddUsingBindingSet(unique_ptr<UsingColumnSet> set) {
 void Binder::MoveCorrelatedExpressions(Binder &other) {
 	MergeCorrelatedColumns(other.correlated_columns);
 	other.correlated_columns.clear();
+}
+
+void Binder::MoveCorrelatedExpressionsFrom(Binder &other) {
+	MoveCorrelatedExpressions(other);
 }
 
 void Binder::MergeCorrelatedColumns(CorrelatedColumns &other) {

@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT
+#
+# Modified by Vane contributors.
+
 import os
 import json
 import re
@@ -6,7 +12,6 @@ import copy
 from packaging.version import Version
 from functools import reduce
 from pathlib import Path
-
 
 EXT_API_DEFINITION_PATTERN = "src/include/duckdb/main/capi/header_generation/apis/v1/*/*.json"
 

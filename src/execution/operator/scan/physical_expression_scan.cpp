@@ -1,7 +1,14 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/scan/physical_expression_scan.hpp"
 
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 
 namespace duckdb {
 
@@ -73,6 +80,10 @@ bool PhysicalExpressionScan::IsFoldable() const {
 		}
 	}
 	return true;
+}
+
+void PhysicalExpressionScan::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "expressions", expressions);
 }
 
 } // namespace duckdb

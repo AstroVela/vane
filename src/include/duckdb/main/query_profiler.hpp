@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -98,7 +104,8 @@ public:
 
 public:
 	DUCKDB_API void StartOperator(optional_ptr<const PhysicalOperator> phys_op);
-	DUCKDB_API void EndOperator(optional_ptr<DataChunk> chunk);
+	DUCKDB_API void EndOperator(optional_ptr<DataChunk> chunk, optional_ptr<GlobalOperatorState> gstate = nullptr,
+	                            optional_ptr<OperatorState> state = nullptr);
 	DUCKDB_API void FinishSource(GlobalSourceState &gstate, LocalSourceState &lstate);
 
 	//! Adds the timings in the OperatorProfiler (tree) to the QueryProfiler (tree).

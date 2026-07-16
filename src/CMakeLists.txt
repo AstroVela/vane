@@ -1,3 +1,11 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+#
+# SPDX-FileCopyrightText: 2026 Vane contributors
+#
+# SPDX-License-Identifier: MIT
+#
+# Modified by Vane contributors.
+
 add_definitions(-DDUCKDB)
 
 if(${DISABLE_THREADS})
@@ -105,6 +113,11 @@ target_link_libraries(duckdb PUBLIC ${DUCKDB_SYSTEM_LIBS})
 link_extension_libraries(duckdb PRIVATE)
 
 link_threads(duckdb PUBLIC)
+
+if(DUCKDB_DISTRIBUTED_LINK_LIBS)
+  target_link_libraries(duckdb_static PUBLIC ${DUCKDB_DISTRIBUTED_LINK_LIBS})
+  target_link_libraries(duckdb PUBLIC ${DUCKDB_DISTRIBUTED_LINK_LIBS})
+endif()
 
 if(SET_DUCKDB_LIBRARY_VERSION)
   set_target_properties(

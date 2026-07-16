@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -83,10 +89,10 @@ PhysicalType GetTypeId() {
 		} else if (sizeof(uintptr_t) == sizeof(uint64_t)) {
 			return PhysicalType::UINT64;
 		} else {
-			throw InternalException("Unsupported pointer size in GetTypeId");
+			throw InternalException(std::string("Unsupported pointer size in GetTypeId"));
 		}
 	} else {
-		throw InternalException("Unsupported type in GetTypeId");
+		throw InternalException(std::string("Unsupported type in GetTypeId"));
 	}
 }
 

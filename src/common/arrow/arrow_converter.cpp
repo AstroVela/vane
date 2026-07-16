@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/bit.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
@@ -103,6 +109,45 @@ void SetArrowMapFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child,
 	SetArrowStructFormat(root_holder, **child.children, ListType::GetChildType(type), options, context, true);
 }
 
+static string SerializeTensorMetadata(const vector<idx_t> &shape) {
+	string result = "{\"shape\":[";
+	for (idx_t i = 0; i < shape.size(); i++) {
+		result += to_string(shape[i]);
+		if (i + 1 < shape.size()) {
+			result += ",";
+		}
+	}
+	result += "]}";
+	return result;
+}
+
+void SetArrowTensorFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, const LogicalType &type,
+                          ClientProperties &options, ClientContext &context) {
+	D_ASSERT(TensorType::IsTensor(type));
+	auto fixed_size = TensorType::GetFlattenedSize(type);
+	auto &child_type = TensorType::GetChildType(type);
+	auto format = "+w:" + to_string(fixed_size);
+	root_holder.extension_format.push_back(AddName(format));
+	child.format = root_holder.extension_format.back().get();
+
+	ArrowSchemaMetadata schema_metadata;
+	schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME, "arrow.fixed_shape_tensor");
+	schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_METADATA_KEY,
+	                          SerializeTensorMetadata(TensorType::GetShape(type)));
+	root_holder.metadata_info.emplace_back(schema_metadata.SerializeMetadata());
+	child.metadata = root_holder.metadata_info.back().get();
+
+	child.n_children = 1;
+	root_holder.nested_children.emplace_back();
+	root_holder.nested_children.back().resize(1);
+	root_holder.nested_children_ptr.emplace_back();
+	root_holder.nested_children_ptr.back().push_back(&root_holder.nested_children.back()[0]);
+	InitializeChild(root_holder.nested_children.back()[0], root_holder);
+	child.children = &root_holder.nested_children_ptr.back()[0];
+	child.children[0]->name = "item";
+	SetArrowFormat(root_holder, **child.children, child_type, options, context);
+}
+
 bool SetArrowExtension(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, const LogicalType &type,
                        ClientContext &context) {
 	auto &config = DBConfig::GetConfig(context);
@@ -116,6 +161,10 @@ bool SetArrowExtension(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child,
 
 void SetArrowFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, const LogicalType &type,
                     ClientProperties &options, ClientContext &context) {
+	if (TensorType::IsTensor(type)) {
+		SetArrowTensorFormat(root_holder, child, type, options, context);
+		return;
+	}
 	if (type.HasAlias()) {
 		// If it is a json type, we only export it as json if arrow_lossless_conversion = True
 		if (!(type.IsJSONType() && !options.arrow_lossless_conversion)) {
@@ -272,6 +321,7 @@ void SetArrowFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, co
 		break;
 	}
 	case LogicalTypeId::BLOB:
+	case LogicalTypeId::AGGREGATE_STATE:
 		if (options.arrow_output_version >= ArrowFormatVersion::V1_4) {
 			// Views are only introduced in arrow format v1.4
 			child.format = "vz";

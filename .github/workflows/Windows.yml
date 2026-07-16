@@ -163,7 +163,7 @@ jobs:
           duckdb_cli-windows-amd64.zip
 
     - uses: ilammy/msvc-dev-cmd@v1
-    - name: Duckdb.dll export symbols with C++ on Windows
+    - name: DuckDB.dll export symbols with C++ on Windows
       shell: bash
       run: cl -I src/include examples/embedded-c++-windows/cppintegration.cpp -link src/Release/duckdb.lib
 

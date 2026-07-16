@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -91,14 +97,21 @@ public:
 	//! Unblock all tasks (must hold the lock)
 	bool UnblockTasks(const unique_lock<mutex> &guard) {
 		VerifyLock(guard);
-		if (blocked_tasks.empty()) {
+		auto tasks = TakeBlockedTasks(guard);
+		if (tasks.empty()) {
 			return false;
 		}
-		for (auto &entry : blocked_tasks) {
+		for (auto &entry : tasks) {
 			entry.Callback();
 		}
-		blocked_tasks.clear();
 		return true;
+	}
+
+	vector<InterruptState> TakeBlockedTasks(const unique_lock<mutex> &guard) {
+		VerifyLock(guard);
+		vector<InterruptState> result;
+		result.swap(blocked_tasks);
+		return result;
 	}
 
 	SinkResultType BlockSink(const unique_lock<mutex> &guard, const InterruptState &interrupt_state) {

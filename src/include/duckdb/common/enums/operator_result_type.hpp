@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -21,15 +27,15 @@ namespace duckdb {
 //! The operator will be called again with the same input.
 //! FINISHED means the operator has finished the entire pipeline and no more processing is necessary.
 //! The operator will not be called again, and neither will any other operators in this pipeline.
-//! BLOCKED means the operator does not want to be called right now. e.g. because its currently doing async I/O. The
-//! operator has set the interrupt state and the caller is expected to handle it. Note that intermediate operators
-//! should currently not emit this state.
+//! BLOCKED means the operator does not want to be called right now, e.g. because it is doing async I/O. The operator
+//! has set the interrupt state and the caller is expected to handle it.
 enum class OperatorResultType : uint8_t { NEED_MORE_INPUT, HAVE_MORE_OUTPUT, FINISHED, BLOCKED };
 
 //! OperatorFinalizeResultType is used to indicate whether operators have finished flushing their cached results.
 //! FINISHED means the operator has flushed all cached data.
 //! HAVE_MORE_OUTPUT means the operator contains more results.
-enum class OperatorFinalizeResultType : uint8_t { HAVE_MORE_OUTPUT, FINISHED };
+//! BLOCKED means the operator is currently blocked, e.g. by some async I/O.
+enum class OperatorFinalizeResultType : uint8_t { HAVE_MORE_OUTPUT, FINISHED, BLOCKED };
 
 //! OperatorFinalResultType is used for the final call
 enum class OperatorFinalResultType : uint8_t { FINISHED, BLOCKED };

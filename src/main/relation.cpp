@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/relation.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -8,6 +14,8 @@
 #include "duckdb/main/relation/filter_relation.hpp"
 #include "duckdb/main/relation/insert_relation.hpp"
 #include "duckdb/main/relation/limit_relation.hpp"
+#include "duckdb/main/relation/repartition_relation.hpp"
+#include "duckdb/main/relation/local_exchange_relation.hpp"
 #include "duckdb/main/relation/order_relation.hpp"
 #include "duckdb/main/relation/projection_relation.hpp"
 #include "duckdb/main/relation/setop_relation.hpp"
@@ -17,6 +25,7 @@
 #include "duckdb/main/relation/create_view_relation.hpp"
 #include "duckdb/main/relation/write_csv_relation.hpp"
 #include "duckdb/main/relation/write_parquet_relation.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
@@ -100,6 +109,25 @@ shared_ptr<Relation> Relation::Filter(const vector<string> &expressions) {
 
 shared_ptr<Relation> Relation::Limit(int64_t limit, int64_t offset) {
 	return make_shared_ptr<LimitRelation>(shared_from_this(), limit, offset);
+}
+
+shared_ptr<Relation> Relation::Repartition(idx_t num_partitions, vector<unique_ptr<ParsedExpression>> partition_by) {
+	if (num_partitions > 0 && false) {
+		throw InvalidInputException("num_partitions must be greater than zero");
+	}
+	return make_shared_ptr<RepartitionRelation>(shared_from_this(), num_partitions, std::move(partition_by));
+}
+
+shared_ptr<Relation> Relation::Repartition(idx_t num_partitions, const vector<string> &partition_by) {
+	vector<unique_ptr<ParsedExpression>> expressions;
+	if (!partition_by.empty()) {
+		expressions = StringListToExpressionList(*context->GetContext(), partition_by);
+	}
+	return Repartition(num_partitions, std::move(expressions));
+}
+
+shared_ptr<Relation> Relation::LocalExchange(idx_t num_partitions) {
+	return make_shared_ptr<LocalExchangeRelation>(shared_from_this(), num_partitions);
 }
 
 shared_ptr<Relation> Relation::Order(const string &expression) {

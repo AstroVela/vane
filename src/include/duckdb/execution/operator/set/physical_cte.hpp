@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -22,6 +28,8 @@ public:
 public:
 	PhysicalCTE(PhysicalPlan &physical_plan, string ctename, idx_t table_index, vector<LogicalType> types,
 	            PhysicalOperator &top, PhysicalOperator &bottom, idx_t estimated_cardinality);
+	PhysicalCTE(PhysicalPlan &physical_plan, string ctename, idx_t table_index, vector<LogicalType> types,
+	            idx_t estimated_cardinality);
 	~PhysicalCTE() override;
 
 	vector<const_reference<PhysicalOperator>> cte_scans;
@@ -58,6 +66,8 @@ public:
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
 
 	vector<const_reference<PhysicalOperator>> GetSources() const override;
+
+	void SerializeOperatorData(Serializer &serializer) const override;
 };
 
 } // namespace duckdb

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/planner/logical_operator_visitor.hpp"
 
 #include "duckdb/planner/expression/list.hpp"
@@ -185,6 +191,16 @@ void LogicalOperatorVisitor::EnumerateExpressions(LogicalOperator &op,
 		if (limit.offset_val.GetExpression()) {
 			callback(&limit.offset_val.GetExpression());
 		}
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_VLLM_PROJECT: {
+		auto &vllm = op.Cast<LogicalVLLMProject>();
+		callback(&vllm.vllm_expr);
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_UDF_PROJECT: {
+		auto &udf = op.Cast<LogicalUDFProject>();
+		callback(&udf.udf_expr);
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {

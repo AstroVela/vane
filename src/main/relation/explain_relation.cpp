@@ -1,5 +1,12 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/relation/explain_relation.hpp"
 #include "duckdb/parser/statement/explain_statement.hpp"
+#include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -14,9 +21,8 @@ ExplainRelation::ExplainRelation(shared_ptr<Relation> child_p, ExplainType type,
 }
 
 BoundStatement ExplainRelation::Bind(Binder &binder) {
-	auto select = make_uniq<SelectStatement>();
-	select->node = child->GetQueryNode();
-	ExplainStatement explain(std::move(select), type, format);
+	auto relation_stmt = make_uniq<RelationStatement>(child);
+	ExplainStatement explain(std::move(relation_stmt), type, format);
 	return binder.Bind(explain.Cast<SQLStatement>());
 }
 

@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT
+#
+# Modified by Vane contributors.
+
 import amalgamation
 import os
 import re
@@ -19,7 +25,7 @@ def analyze_include_file(fpath, already_included_files, prev_include=""):
         # print(fpath)
         with open_utf8(fpath, 'r') as f:
             text = f.read()
-        (statements, includes) = amalgamation.get_includes(fpath, text)
+        statements, includes = amalgamation.get_includes(fpath, text)
         cached_includes[fpath] = includes
     else:
         includes = cached_includes[fpath]

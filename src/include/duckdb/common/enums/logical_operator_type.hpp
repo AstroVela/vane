@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -25,11 +31,15 @@ enum class LogicalOperatorType : uint8_t {
 	LOGICAL_LIMIT = 6,
 	LOGICAL_ORDER_BY = 7,
 	LOGICAL_TOP_N = 8,
+	LOGICAL_VLLM_PROJECT = 9,
 	LOGICAL_COPY_TO_FILE = 10,
 	LOGICAL_DISTINCT = 11,
 	LOGICAL_SAMPLE = 12,
+	LOGICAL_UDF_PROJECT = 13,
 	LOGICAL_PIVOT = 14,
 	LOGICAL_COPY_DATABASE = 15,
+	LOGICAL_REPARTITION = 17,
+	LOGICAL_LOCAL_EXCHANGE = 18,
 
 	// -----------------------------
 	// Data sources

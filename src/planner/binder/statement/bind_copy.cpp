@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -8,6 +14,7 @@
 #include "duckdb/common/exception/parser_exception.hpp"
 #include "duckdb/function/table/read_csv.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/relation.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
@@ -94,8 +101,13 @@ BoundStatement Binder::BindCopyTo(CopyStatement &stmt, const CopyFunction &funct
 
 	auto &copy_info = *stmt.info;
 	// bind the select statement
-	auto node_copy = copy_info.select_statement->Copy();
-	auto select_node = Bind(*node_copy);
+	BoundStatement select_node;
+	if (copy_info.select_relation) {
+		select_node = copy_info.select_relation->Bind(*this);
+	} else {
+		auto node_copy = copy_info.select_statement->Copy();
+		select_node = Bind(*node_copy);
+	}
 
 	if (!function.copy_to_bind) {
 		throw NotImplementedException("COPY TO is not supported for FORMAT \"%s\"", stmt.info->format);
@@ -504,7 +516,7 @@ BoundStatement Binder::Bind(CopyStatement &stmt, CopyToType copy_to_type) {
 	// bind the copy options
 	BindCopyOptions(*stmt.info);
 
-	if (!stmt.info->is_from && !stmt.info->select_statement) {
+	if (!stmt.info->is_from && !stmt.info->select_statement && !stmt.info->select_relation) {
 		// copy table into file without a query
 		// generate SELECT * FROM table;
 		auto ref = make_uniq<BaseTableRef>();

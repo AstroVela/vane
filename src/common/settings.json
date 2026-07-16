@@ -723,6 +723,34 @@
         "default_value": "50"
     },
     {
+        "name": "local_exchange_buffer_bytes",
+        "description": "Maximum bytes to buffer in local exchange (e.g. 512MB).",
+        "type": "VARCHAR",
+        "scope": "global",
+        "custom_implementation": true
+    },
+    {
+        "name": "local_exchange_default_partitions",
+        "description": "Default number of partitions for local exchange (0 uses min(threads, 32)).",
+        "type": "BIGINT",
+        "scope": "global",
+        "custom_implementation": true
+    },
+    {
+        "name": "local_exchange_max_partitions",
+        "description": "Maximum number of partitions for local exchange (0 uses threads*2).",
+        "type": "BIGINT",
+        "scope": "global",
+        "custom_implementation": true
+    },
+    {
+        "name": "local_exchange_streaming",
+        "description": "Enable streaming local exchange (allow upstream/downstream pipelines to run concurrently).",
+        "type": "BOOLEAN",
+        "scope": "global",
+        "custom_implementation": true
+    },
+    {
         "name": "lock_configuration",
         "description": "Whether or not the configuration can be altered",
         "type": "BOOLEAN",
@@ -903,7 +931,7 @@
         "description": "Whether or not to preserve insertion order. If set to false the system is allowed to re-order any results \"\n\t    \"that do not contain ORDER BY clauses.",
         "type": "BOOLEAN",
         "default_scope": "global",
-        "default_value": "true"
+        "default_value": "false"
     },
     {
         "name": "produce_arrow_string_view",

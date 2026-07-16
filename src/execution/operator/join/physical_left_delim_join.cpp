@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/join/physical_left_delim_join.hpp"
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
@@ -30,6 +36,16 @@ PhysicalLeftDelimJoin::PhysicalLeftDelimJoin(PhysicalPlan &physical_plan, Physic
 		cast_cached_scan.cte_index = delim_idx.GetIndex();
 	}
 	join.children[0] = cached_scan;
+}
+
+PhysicalLeftDelimJoin::PhysicalLeftDelimJoin(PhysicalPlan &physical_plan, DelimJoinDeserializeTag,
+                                             vector<LogicalType> types, PhysicalOperator &original_join,
+                                             PhysicalOperator &distinct,
+                                             const vector<const_reference<PhysicalOperator>> &delim_scans,
+                                             idx_t estimated_cardinality, optional_idx delim_idx)
+    : PhysicalDelimJoin(physical_plan, PhysicalOperatorType::LEFT_DELIM_JOIN, std::move(types), original_join, distinct,
+                        delim_scans, estimated_cardinality, delim_idx) {
+	// Deserialization path: join children are already rewritten in the serialized plan.
 }
 
 //===--------------------------------------------------------------------===//

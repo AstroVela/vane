@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "parquet_extension.hpp"
 
 #include "duckdb.hpp"
@@ -59,13 +65,15 @@
 
 namespace duckdb {
 
+static constexpr idx_t DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES = 128ULL * 1024ULL * 1024ULL;
+
 struct ParquetWriteBindData : public TableFunctionData {
 	vector<LogicalType> sql_types;
 	vector<string> column_names;
 	duckdb_parquet::CompressionCodec::type codec = duckdb_parquet::CompressionCodec::SNAPPY;
 	vector<pair<string, string>> kv_metadata;
 	idx_t row_group_size = DEFAULT_ROW_GROUP_SIZE;
-	idx_t row_group_size_bytes = NumericLimits<idx_t>::Maximum();
+	idx_t row_group_size_bytes = DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES;
 
 	//! Encryption configuration
 	shared_ptr<ParquetEncryptionConfig> encryption_config;
@@ -96,6 +104,28 @@ struct ParquetWriteBindData : public TableFunctionData {
 
 	//! Which geo-parquet version to use when writing
 	GeoParquetVersion geoparquet_version = GeoParquetVersion::V1;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<ParquetWriteBindData>();
+		result->sql_types = sql_types;
+		result->column_names = column_names;
+		result->codec = codec;
+		result->kv_metadata = kv_metadata;
+		result->row_group_size = row_group_size;
+		result->row_group_size_bytes = row_group_size_bytes;
+		result->encryption_config = encryption_config;
+		result->dictionary_size_limit = dictionary_size_limit;
+		result->string_dictionary_page_size_limit = string_dictionary_page_size_limit;
+		result->enable_bloom_filters = enable_bloom_filters;
+		result->bloom_filter_false_positive_ratio = bloom_filter_false_positive_ratio;
+		result->row_groups_per_file = row_groups_per_file;
+		result->field_ids = field_ids.Copy();
+		result->shredding_types = shredding_types.Copy();
+		result->compression_level = compression_level;
+		result->parquet_version = parquet_version;
+		result->geoparquet_version = geoparquet_version;
+		return unique_ptr<FunctionData>(std::move(result));
+	}
 };
 
 void ParquetWriteGlobalState::LogFlushingRowGroup(const ColumnDataCollection &buffer, const string &reason) {

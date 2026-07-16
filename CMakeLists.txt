@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT
+#
+# Modified by Vane contributors.
+
 cmake_minimum_required(VERSION 3.5...3.29)
 
 if(NOT CLANG_TIDY)
@@ -136,6 +142,13 @@ if (DEFINED ENV{DUCKDB_PLATFORM})
           set(MUSL_ENABLED ON)
      endif()
 endif()
+
+# Option to enable the distributed pipeline_node module. This allows temporarily
+# disabling the pipeline_node include/directory compilation for debugging or
+# to reduce build dependencies.
+option(BUILD_DISTRIBUTED_PIPELINE_NODE "Build the distributed pipeline_node module" ON)
+# Option to enable Arrow Flight-based exchange support for distributed execution.
+option(BUILD_DISTRIBUTED_EXCHANGE "Build Arrow Flight exchange support for distributed execution" ON)
 
 if (MUSL_ENABLED)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__MUSL_ENABLED__")
@@ -848,7 +861,6 @@ if(NOT CLANG_TIDY)
   endif()
 endif()
 
-
 if (NOT ${EXTENSION_CONFIG_BUILD})
   # Write the export set for build and install tree
   install(EXPORT "${DUCKDB_EXPORT_SET}" DESTINATION "${INSTALL_CMAKE_DIR}")
@@ -885,5 +897,4 @@ if(EXISTS ${CMAKE_CONFIG_TEMPLATE} AND EXISTS ${CMAKE_CONFIG_VERSION_TEMPLATE})
           "${PROJECT_BINARY_DIR}/DuckDBConfigVersion.cmake"
     DESTINATION "${INSTALL_CMAKE_DIR}")
 endif()
-
 

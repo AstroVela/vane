@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -30,8 +36,25 @@ public:
 	                          const idx_t &ordinality);
 	OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
 	                           GlobalOperatorState &gstate, OperatorState &state) const override;
+	OperatorResultType ExecuteBatch(ExecutionContext &context, ExecutionBatch &input, ExecutionBatch &output,
+	                                GlobalOperatorState &gstate, OperatorState &state) const override;
 	OperatorFinalizeResultType FinalExecute(ExecutionContext &context, DataChunk &chunk, GlobalOperatorState &gstate,
 	                                        OperatorState &state) const override;
+	OperatorFinalizeResultType FinalExecuteBatch(ExecutionContext &context, ExecutionBatch &batch,
+	                                             GlobalOperatorState &gstate, OperatorState &state) const override;
+	void SerializeOperatorData(Serializer &serializer) const override;
+	const TableFunction &GetFunction() const {
+		return function;
+	}
+	const FunctionData *GetBindData() const {
+		return bind_data.get();
+	}
+	const vector<ColumnIndex> &GetColumnIds() const {
+		return column_ids;
+	}
+	const vector<column_t> &GetProjectedInput() const {
+		return projected_input;
+	}
 
 	bool ParallelOperator() const override {
 		return true;
@@ -42,6 +65,8 @@ public:
 	}
 
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
+	InsertionOrderPreservingMap<string> ExtraOperatorParams(GlobalOperatorState &gstate,
+	                                                        OperatorState &state) const override;
 
 	//! Information for WITH ORDINALITY
 	optional_idx ordinality_idx;

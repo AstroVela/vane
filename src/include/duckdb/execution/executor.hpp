@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -10,6 +16,7 @@
 
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/pending_execution_result.hpp"
+#include "duckdb/common/insertion_order_preserving_map.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/pair.hpp"
 #include "duckdb/common/reference_map.hpp"
@@ -34,6 +41,21 @@ struct PipelineEventStack;
 struct ProducerToken;
 struct ScheduleEventData;
 
+struct PipelineProgressSnapshot {
+	idx_t pipeline_index = 0;
+	idx_t input_rows = 0;
+	idx_t input_bytes = 0;
+	idx_t output_rows = 0;
+	idx_t output_bytes = 0;
+	idx_t total_pipeline_tasks = 0;
+	idx_t queued_pipeline_tasks = 0;
+	idx_t running_pipeline_tasks = 0;
+	idx_t completed_pipeline_tasks = 0;
+	vector<string> operators;
+	vector<InsertionOrderPreservingMap<string>> operator_details;
+	vector<idx_t> stage_ids;
+};
+
 class Executor {
 	friend class Pipeline;
 	friend class PipelineTask;
@@ -52,6 +74,9 @@ public:
 	static Executor &Get(ClientContext &context);
 
 	void Initialize(PhysicalOperator &physical_plan);
+	//! Build the exact native pipeline graph without scheduling any events or
+	//! executing operator code. Used to publish immutable progress topology.
+	void InitializeProgressTopology(PhysicalOperator &physical_plan);
 
 	void CancelTasks();
 	PendingExecutionResult ExecuteTask(bool dry_run = false);
@@ -87,6 +112,7 @@ public:
 
 	//! Returns the progress of the pipelines
 	idx_t GetPipelinesProgress(ProgressData &progress);
+	vector<PipelineProgressSnapshot> GetPipelinesProgressSnapshots();
 
 	void CompletePipeline() {
 		completed_pipelines++;
@@ -127,7 +153,7 @@ public:
 private:
 	//! Check if the streaming query result is waiting to be fetched from, must hold the 'executor_lock'
 	bool ResultCollectorIsBlocked();
-	void InitializeInternal(PhysicalOperator &physical_plan);
+	void InitializeInternal(PhysicalOperator &physical_plan, bool schedule_events);
 
 	void ScheduleEvents(const vector<shared_ptr<MetaPipeline>> &meta_pipelines);
 	void ScheduleEventsInternal(ScheduleEventData &event_data);

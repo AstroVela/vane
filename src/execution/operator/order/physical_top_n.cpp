@@ -1,7 +1,14 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/order/physical_top_n.hpp"
 
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/arena_containers/arena_vector.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -628,6 +635,12 @@ InsertionOrderPreservingMap<string> PhysicalTopN::ParamsToString() const {
 	}
 	result["Order By"] = orders_info;
 	return result;
+}
+
+void PhysicalTopN::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "orders", orders);
+	serializer.WriteProperty(104, "limit", limit);
+	serializer.WriteProperty(105, "offset", offset);
 }
 
 } // namespace duckdb

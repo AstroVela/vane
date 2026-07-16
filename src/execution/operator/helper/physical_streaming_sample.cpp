@@ -1,7 +1,14 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/helper/physical_streaming_sample.hpp"
 #include "duckdb/common/random_engine.hpp"
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/common/enum_util.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 
 namespace duckdb {
 
@@ -81,6 +88,10 @@ InsertionOrderPreservingMap<string> PhysicalStreamingSample::ParamsToString() co
 	InsertionOrderPreservingMap<string> result;
 	result["Sample Method"] = EnumUtil::ToString(sample_options->method) + ": " + to_string(100 * percentage) + "%";
 	return result;
+}
+
+void PhysicalStreamingSample::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "sample_options", sample_options);
 }
 
 } // namespace duckdb

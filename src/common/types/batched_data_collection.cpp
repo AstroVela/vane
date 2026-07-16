@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/types/batched_data_collection.hpp"
 
 #include "duckdb/common/optional_ptr.hpp"
@@ -47,6 +53,7 @@ unique_ptr<ColumnDataCollection> BatchedDataCollection::CreateCollection() const
 
 void BatchedDataCollection::Append(DataChunk &input, idx_t batch_index) {
 	D_ASSERT(batch_index != DConstants::INVALID_INDEX);
+
 	optional_ptr<ColumnDataCollection> collection;
 	if (last_collection.collection && last_collection.batch_index == batch_index) {
 		// we are inserting into the same collection as before: use it directly
@@ -61,6 +68,11 @@ void BatchedDataCollection::Append(DataChunk &input, idx_t batch_index) {
 		collection = new_collection.get();
 		data.insert(make_pair(batch_index, std::move(new_collection)));
 	}
+
+	if (!collection) {
+		throw InternalException("BatchedDataCollection::Append - collection is null");
+	}
+
 	collection->Append(last_collection.append_state, input);
 }
 

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -174,6 +180,14 @@ public:
 	        QueryParameters query_parameters = QueryResultOutputType::ALLOW_STREAMING);
 	DUCKDB_API unique_ptr<QueryResult> Execute(const string &query, shared_ptr<PreparedStatementData> &prepared,
 	                                           const PendingQueryParameters &parameters);
+	//! Starts a pending query for a pre-built physical plan without attempting to rebind it.
+	DUCKDB_API unique_ptr<PendingQueryResult>
+	PendingQueryPreparedStatementNoRebind(const string &query, shared_ptr<PreparedStatementData> &prepared,
+	                                      const PendingQueryParameters &parameters);
+	//! Execute a prepared statement without rebind (e.g., pre-built physical plans without unbound statements)
+	DUCKDB_API unique_ptr<QueryResult> ExecutePreparedStatementNoRebind(const string &query,
+	                                                                    shared_ptr<PreparedStatementData> &prepared,
+	                                                                    const PendingQueryParameters &parameters);
 
 	//! Gets current percentage of the query's progress, returns 0 in case the progress bar is disabled.
 	DUCKDB_API QueryProgress GetQueryProgress();

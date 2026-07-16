@@ -1,12 +1,21 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
 
 #include "duckdb/common/allocator.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/common/queue.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/batched_data_collection.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/operator/persistent/batch_memory_manager.hpp"
 #include "duckdb/execution/operator/persistent/batch_task_manager.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/parallel/base_pipeline_event.hpp"
 #include "duckdb/parallel/executor_task.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
@@ -14,6 +23,16 @@
 #include <algorithm>
 
 namespace duckdb {
+
+static void EnsureBatchCopyOutputParentExists(FileSystem &fs, const string &path) {
+	auto parent_dir = StringUtil::GetFilePath(path);
+	if (parent_dir.empty()) {
+		return;
+	}
+	if (!fs.DirectoryExists(parent_dir)) {
+		fs.CreateDirectoriesRecursive(parent_dir);
+	}
+}
 
 struct ActiveFlushGuard {
 	explicit ActiveFlushGuard(atomic<bool> &bool_value_p) : bool_value(bool_value_p) {
@@ -36,6 +55,23 @@ PhysicalBatchCopyToFile::PhysicalBatchCopyToFile(PhysicalPlan &physical_plan, ve
 		throw InternalException("PhysicalFixedBatchCopy created for copy function that does not have "
 		                        "prepare_batch/flush_batch defined");
 	}
+}
+
+void PhysicalBatchCopyToFile::SerializeOperatorData(Serializer &serializer) const {
+	D_ASSERT(!function.name.empty());
+	serializer.WriteProperty(500, "name", function.name);
+	serializer.WritePropertyWithDefault<string>(505, "catalog_name", function.catalog_name, "");
+	serializer.WritePropertyWithDefault<string>(506, "schema_name", function.schema_name, "");
+	const bool has_serialize = function.serialize;
+	serializer.WriteProperty(503, "has_serialize", has_serialize);
+	if (has_serialize) {
+		serializer.WriteObject(504, "function_data",
+		                       [&](Serializer &obj) { function.serialize(obj, *bind_data, function); });
+	}
+	serializer.WriteProperty(200, "file_path", file_path);
+	serializer.WriteProperty(201, "use_tmp_file", use_tmp_file);
+	serializer.WriteProperty(202, "return_type", return_type);
+	serializer.WriteProperty(203, "write_empty_file", write_empty_file);
 }
 
 //===--------------------------------------------------------------------===//
@@ -113,6 +149,8 @@ public:
 			return;
 		}
 		// initialize writing to the file
+		auto &fs = FileSystem::GetFileSystem(context);
+		EnsureBatchCopyOutputParentExists(fs, op.file_path);
 		global_state = op.function.copy_to_initialize_global(context, *op.bind_data, op.file_path);
 		if (op.function.initialize_operator) {
 			op.function.initialize_operator(*global_state, op);
@@ -168,6 +206,7 @@ public:
 	optional_idx batch_index;
 	//! Current task
 	FixedBatchCopyState current_task = FixedBatchCopyState::SINKING_DATA;
+	//! Debug counter for sink calls
 
 	void InitializeCollection(ClientContext &context, const PhysicalOperator &op) {
 		collection = make_uniq<ColumnDataCollection>(context, op.children[0].get().GetTypes());
@@ -412,12 +451,6 @@ void PhysicalBatchCopyToFile::RepartitionBatches(ClientContext &context, GlobalS
                                                  bool final) const {
 	auto &gstate = gstate_p.Cast<FixedBatchCopyGlobalState>();
 	auto &task_manager = gstate.task_manager;
-
-	// repartition batches until the min index is reached
-	lock_guard<mutex> l(gstate.lock);
-	if (gstate.raw_batches.empty()) {
-		return;
-	}
 	if (!final) {
 		if (gstate.any_finished) {
 			// we only repartition in ::NextBatch if all threads are still busy processing batches
@@ -515,17 +548,6 @@ void PhysicalBatchCopyToFile::RepartitionBatches(ClientContext &context, GlobalS
 void PhysicalBatchCopyToFile::FlushBatchData(ClientContext &context, GlobalSinkState &gstate_p) const {
 	auto &gstate = gstate_p.Cast<FixedBatchCopyGlobalState>();
 	auto &memory_manager = gstate.memory_manager;
-
-	// flush batch data to disk (if there are any to flush)
-	// grab the flush lock - we can only call flush_batch with this lock
-	// otherwise the data might end up in the wrong order
-	{
-		lock_guard<mutex> l(gstate.flush_lock);
-		if (gstate.any_flushing) {
-			return;
-		}
-		gstate.any_flushing = true;
-	}
 	ActiveFlushGuard active_flush(gstate.any_flushing);
 	while (true) {
 		unique_ptr<FixedPreparedBatchData> batch_data;

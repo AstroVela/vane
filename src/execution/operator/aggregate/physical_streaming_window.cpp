@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/aggregate/physical_streaming_window.hpp"
 
 #include "duckdb/execution/aggregate_hashtable.hpp"
@@ -5,6 +11,7 @@
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 
 namespace duckdb {
 
@@ -761,6 +768,10 @@ InsertionOrderPreservingMap<string> PhysicalStreamingWindow::ParamsToString() co
 	}
 	result["Projections"] = projections;
 	return result;
+}
+
+void PhysicalStreamingWindow::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "select_list", select_list);
 }
 
 } // namespace duckdb

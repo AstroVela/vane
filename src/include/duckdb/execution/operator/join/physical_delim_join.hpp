@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -13,6 +19,10 @@
 namespace duckdb {
 
 class PhysicalHashAggregate;
+
+struct DelimJoinDeserializeTag {
+	constexpr DelimJoinDeserializeTag() = default;
+};
 
 //! PhysicalDelimJoin represents a join where either the LHS or RHS will be duplicate eliminated and pushed into a
 //! PhysicalColumnDataScan in the other side. Implementations are PhysicalLeftDelimJoin and PhysicalRightDelimJoin
@@ -46,6 +56,9 @@ public:
 	}
 
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
+
+protected:
+	void SerializeOperatorData(Serializer &serializer) const override;
 };
 
 } // namespace duckdb

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/exception.hpp"
@@ -402,6 +408,44 @@ unique_ptr<ArrowType> ArrowType::GetTypeFromSchema(ClientContext &context, Arrow
 	// Let's first figure out if this type is an extension type
 	ArrowSchemaMetadata schema_metadata(schema.metadata);
 	auto &config = DBConfig::GetConfig(context);
+	if (schema_metadata.HasExtension() &&
+	    schema_metadata.GetOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME) == "arrow.fixed_shape_tensor") {
+		if (!(format.size() > 3 && format[0] == '+' && format[1] == 'w' && schema.n_children == 1)) {
+			throw InvalidInputException("arrow.fixed_shape_tensor requires fixed-size list storage");
+		}
+		auto fixed_size = NumericCast<idx_t>(std::stoi(format.substr(format.find(':') + 1)));
+		auto metadata_json = schema_metadata.GetOption(ArrowSchemaMetadata::ARROW_METADATA_KEY);
+		auto tensor_metadata = StringUtil::ParseJSONMap(metadata_json);
+		vector<idx_t> shape;
+		if (tensor_metadata) {
+			try {
+				auto &shape_json = tensor_metadata->GetObject("shape");
+				for (idx_t i = 0;; i++) {
+					auto dim_str = shape_json.GetValue(i);
+					if (dim_str.empty()) {
+						break;
+					}
+					auto dim = std::stoll(dim_str);
+					if (dim <= 0) {
+						throw InvalidInputException("arrow.fixed_shape_tensor shape dimensions must be positive");
+					}
+					shape.push_back(NumericCast<idx_t>(dim));
+				}
+			} catch (const std::exception &ex) {
+				throw InvalidInputException("Failed to parse arrow.fixed_shape_tensor metadata: %s", ex.what());
+			}
+		}
+		if (shape.empty()) {
+			throw InvalidInputException("arrow.fixed_shape_tensor metadata is missing shape");
+		}
+		auto child_type = GetArrowLogicalType(context, *schema.children[0]);
+		auto tensor_type = TensorType::Create(child_type->GetDuckType(), shape);
+		if (TensorType::GetFlattenedSize(tensor_type) != fixed_size) {
+			throw InvalidInputException("arrow.fixed_shape_tensor shape does not match fixed-size storage width");
+		}
+		auto type_info = make_uniq<ArrowArrayInfo>(std::move(child_type), fixed_size);
+		return make_uniq<ArrowType>(tensor_type, std::move(type_info));
+	}
 	auto arrow_type = GetTypeFromFormat(context, schema, format);
 	if (schema_metadata.HasExtension()) {
 		auto extension_info = schema_metadata.GetExtensionInfo(string(format));

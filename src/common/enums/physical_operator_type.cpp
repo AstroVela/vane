@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/enums/physical_operator_type.hpp"
 
 namespace duckdb {
@@ -47,6 +53,8 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "FILTER";
 	case PhysicalOperatorType::PROJECTION:
 		return "PROJECTION";
+	case PhysicalOperatorType::VLLM_PROJECT:
+		return "VLLM_PROJECT";
 	case PhysicalOperatorType::COPY_TO_FILE:
 		return "COPY_TO_FILE";
 	case PhysicalOperatorType::BATCH_COPY_TO_FILE:
@@ -99,6 +107,10 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "EXPLAIN";
 	case PhysicalOperatorType::EXPLAIN_ANALYZE:
 		return "EXPLAIN_ANALYZE";
+	case PhysicalOperatorType::LOCAL_EXCHANGE:
+		return "LOCAL_EXCHANGE";
+	case PhysicalOperatorType::REPARTITION:
+		return "REPARTITION";
 	case PhysicalOperatorType::EXECUTE:
 		return "EXECUTE";
 	case PhysicalOperatorType::VACUUM:
@@ -149,6 +161,8 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "LOAD";
 	case PhysicalOperatorType::INOUT_FUNCTION:
 		return "INOUT_FUNCTION";
+	case PhysicalOperatorType::STREAMING_UDF:
+		return "STREAMING_UDF";
 	case PhysicalOperatorType::CREATE_TYPE:
 		return "CREATE_TYPE";
 	case PhysicalOperatorType::ATTACH:
@@ -167,6 +181,10 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "VERIFY_VECTOR";
 	case PhysicalOperatorType::UPDATE_EXTENSIONS:
 		return "UPDATE_EXTENSIONS";
+	case PhysicalOperatorType::EXCHANGE_SINK:
+		return "EXCHANGE_SINK";
+	case PhysicalOperatorType::EXCHANGE_SOURCE:
+		return "EXCHANGE_SOURCE";
 	case PhysicalOperatorType::INVALID:
 		break;
 	}

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/parallel/pipeline.hpp"
 
 #include "duckdb/common/algorithm.hpp"
@@ -13,6 +19,7 @@
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/main/settings.hpp"
+#include <iostream>
 
 namespace duckdb {
 
@@ -31,6 +38,10 @@ const PipelineExecutor &PipelineTask::GetPipelineExecutor() const {
 }
 
 TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
+	if (!pipeline_task_started) {
+		pipeline.started_pipeline_tasks.fetch_add(1);
+		pipeline_task_started = true;
+	}
 	if (!pipeline_executor) {
 		pipeline_executor = make_uniq<PipelineExecutor>(pipeline.GetClientContext(), pipeline);
 	}
@@ -60,6 +71,9 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 		}
 	}
 
+	D_ASSERT(!pipeline_task_completed);
+	pipeline.completed_pipeline_tasks.fetch_add(1);
+	pipeline_task_completed = true;
 	event->FinishTask();
 	pipeline_executor.reset();
 	return TaskExecutionResult::TASK_FINISHED;
@@ -95,7 +109,49 @@ bool Pipeline::GetProgress(ProgressData &progress) {
 void Pipeline::ScheduleSequentialTask(shared_ptr<Event> &event) {
 	vector<shared_ptr<Task>> tasks;
 	tasks.push_back(make_uniq<PipelineTask>(*this, event));
+	total_pipeline_tasks.store(tasks.size());
 	event->SetTasks(std::move(tasks));
+}
+
+void Pipeline::NotifyMaxThreadsResolved(idx_t max_threads) {
+	max_threads = MaxValue<idx_t>(idx_t(1), max_threads);
+	for (auto &op_ref : operators) {
+		auto &op = op_ref.get();
+		if (op.op_state) {
+			op.op_state->PipelineMaxThreadsResolved(max_threads);
+		}
+	}
+	if (sink && sink->sink_state) {
+		sink->sink_state->PipelineMaxThreadsResolved(max_threads);
+	}
+}
+
+idx_t Pipeline::ResolveMaxThreads() {
+	D_ASSERT(source_state);
+	auto max_threads = source_state->MaxThreads();
+
+	for (auto &op_ref : operators) {
+		auto &op = op_ref.get();
+		if (op.op_state) {
+			max_threads = MinValue<idx_t>(max_threads, op.op_state->MaxThreads(max_threads));
+		}
+	}
+
+	auto &scheduler = TaskScheduler::GetScheduler(executor.context);
+	auto active_threads = NumericCast<idx_t>(scheduler.NumberOfThreads());
+	active_threads = MaxValue<idx_t>(idx_t(1), active_threads);
+	if (max_threads > active_threads) {
+		max_threads = active_threads;
+	}
+	if (sink && sink->sink_state) {
+		max_threads = sink->sink_state->MaxThreads(max_threads);
+	}
+	if (max_threads > active_threads) {
+		max_threads = active_threads;
+	}
+	max_threads = MaxValue<idx_t>(idx_t(1), max_threads);
+	NotifyMaxThreadsResolved(max_threads);
+	return max_threads;
 }
 
 bool Pipeline::ScheduleParallel(shared_ptr<Event> &event) {
@@ -106,14 +162,12 @@ bool Pipeline::ScheduleParallel(shared_ptr<Event> &event) {
 	if (!source->ParallelSource()) {
 		return false;
 	}
-	auto max_threads = source_state->MaxThreads();
 
 	for (auto &op_ref : operators) {
 		auto &op = op_ref.get();
 		if (!op.ParallelOperator()) {
 			return false;
 		}
-		max_threads = MinValue<idx_t>(max_threads, op.op_state->MaxThreads(max_threads));
 	}
 
 	auto partition_info = sink->RequiredPartitionInfo();
@@ -124,17 +178,7 @@ bool Pipeline::ScheduleParallel(shared_ptr<Event> &event) {
 		}
 	}
 
-	auto &scheduler = TaskScheduler::GetScheduler(executor.context);
-	auto active_threads = NumericCast<idx_t>(scheduler.NumberOfThreads());
-	if (max_threads > active_threads) {
-		max_threads = active_threads;
-	}
-	if (sink && sink->sink_state) {
-		max_threads = sink->sink_state->MaxThreads(max_threads);
-	}
-	if (max_threads > active_threads) {
-		max_threads = active_threads;
-	}
+	auto max_threads = ResolveMaxThreads();
 	return LaunchScanTasks(event, max_threads);
 }
 
@@ -171,6 +215,7 @@ void Pipeline::Schedule(shared_ptr<Event> &event) {
 	D_ASSERT(sink);
 	Reset();
 	if (!ScheduleParallel(event)) {
+		NotifyMaxThreadsResolved(1);
 		// could not parallelize this pipeline: push a sequential task instead
 		ScheduleSequentialTask(event);
 	}
@@ -188,6 +233,7 @@ bool Pipeline::LaunchScanTasks(shared_ptr<Event> &event, idx_t max_threads) {
 	for (idx_t i = 0; i < max_threads; i++) {
 		tasks.push_back(make_uniq<PipelineTask>(*this, event));
 	}
+	total_pipeline_tasks.store(tasks.size());
 	event->SetTasks(std::move(tasks));
 	return true;
 }
@@ -218,6 +264,13 @@ void Pipeline::PrepareFinalize() {
 }
 
 void Pipeline::Reset() {
+	input_rows.store(0);
+	input_bytes.store(0);
+	output_rows.store(0);
+	output_bytes.store(0);
+	total_pipeline_tasks.store(1);
+	started_pipeline_tasks.store(0);
+	completed_pipeline_tasks.store(0);
 	ResetSink();
 	for (auto &op_ref : operators) {
 		auto &op = op_ref.get();
@@ -236,7 +289,12 @@ void Pipeline::ResetSource(bool force) {
 	if (source && !source->IsSource()) {
 		throw InternalException("Source of pipeline does not have IsSource set");
 	}
+
 	if (force || !source_state) {
+		if (!source) {
+			throw InternalException("Attempting to reset source on pipeline with null source");
+		}
+
 		source_state = source->GetGlobalSourceState(GetClientContext());
 	}
 }

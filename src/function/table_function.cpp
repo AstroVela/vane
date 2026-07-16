@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/function/table_function.hpp"
 
 namespace duckdb {
@@ -19,13 +25,14 @@ TableFunction::TableFunction(string name, const vector<LogicalType> &arguments, 
                              table_function_init_local_t init_local)
     : SimpleNamedParameterFunction(std::move(name), arguments), bind(bind), bind_replace(nullptr),
       bind_operator(nullptr), init_global(init_global), init_local(init_local), function(function_),
-      in_out_function(nullptr), in_out_function_final(nullptr), statistics(nullptr), statistics_extended(nullptr),
-      dependency(nullptr), cardinality(nullptr), rows_scanned(nullptr), pushdown_complex_filter(nullptr),
-      pushdown_expression(nullptr), to_string(nullptr), dynamic_to_string(nullptr), table_scan_progress(nullptr),
-      get_partition_data(nullptr), get_bind_info(nullptr), type_pushdown(nullptr), get_multi_file_reader(nullptr),
-      supports_pushdown_type(nullptr), supports_pushdown_extract(nullptr), get_partition_info(nullptr),
-      get_partition_stats(nullptr), get_virtual_columns(nullptr), get_row_id_columns(nullptr), set_scan_order(nullptr),
-      serialize(nullptr), deserialize(nullptr), projection_pushdown(false), filter_pushdown(false), filter_prune(false),
+      in_out_function(nullptr), in_out_function_final(nullptr), in_out_function_batch(nullptr),
+      in_out_function_final_batch(nullptr), statistics(nullptr), statistics_extended(nullptr), dependency(nullptr),
+      cardinality(nullptr), rows_scanned(nullptr), pushdown_complex_filter(nullptr), pushdown_expression(nullptr),
+      to_string(nullptr), dynamic_to_string(nullptr), table_scan_progress(nullptr), get_partition_data(nullptr),
+      get_bind_info(nullptr), type_pushdown(nullptr), get_multi_file_reader(nullptr), supports_pushdown_type(nullptr),
+      supports_pushdown_extract(nullptr), get_partition_info(nullptr), get_partition_stats(nullptr),
+      get_virtual_columns(nullptr), get_row_id_columns(nullptr), set_scan_order(nullptr), serialize(nullptr),
+      deserialize(nullptr), projection_pushdown(false), filter_pushdown(false), filter_prune(false),
       sampling_pushdown(false), late_materialization(false) {
 }
 
@@ -34,13 +41,14 @@ TableFunction::TableFunction(string name, const vector<LogicalType> &arguments, 
                              table_function_init_local_t init_local)
     : SimpleNamedParameterFunction(std::move(name), arguments), bind(bind), bind_replace(nullptr),
       bind_operator(nullptr), init_global(init_global), init_local(init_local), function(nullptr),
-      in_out_function(nullptr), in_out_function_final(nullptr), statistics(nullptr), statistics_extended(nullptr),
-      dependency(nullptr), cardinality(nullptr), rows_scanned(nullptr), pushdown_complex_filter(nullptr),
-      pushdown_expression(nullptr), to_string(nullptr), dynamic_to_string(nullptr), table_scan_progress(nullptr),
-      get_partition_data(nullptr), get_bind_info(nullptr), type_pushdown(nullptr), get_multi_file_reader(nullptr),
-      supports_pushdown_type(nullptr), supports_pushdown_extract(nullptr), get_partition_info(nullptr),
-      get_partition_stats(nullptr), get_virtual_columns(nullptr), get_row_id_columns(nullptr), set_scan_order(nullptr),
-      serialize(nullptr), deserialize(nullptr), projection_pushdown(false), filter_pushdown(false), filter_prune(false),
+      in_out_function(nullptr), in_out_function_final(nullptr), in_out_function_batch(nullptr),
+      in_out_function_final_batch(nullptr), statistics(nullptr), statistics_extended(nullptr), dependency(nullptr),
+      cardinality(nullptr), rows_scanned(nullptr), pushdown_complex_filter(nullptr), pushdown_expression(nullptr),
+      to_string(nullptr), dynamic_to_string(nullptr), table_scan_progress(nullptr), get_partition_data(nullptr),
+      get_bind_info(nullptr), type_pushdown(nullptr), get_multi_file_reader(nullptr), supports_pushdown_type(nullptr),
+      supports_pushdown_extract(nullptr), get_partition_info(nullptr), get_partition_stats(nullptr),
+      get_virtual_columns(nullptr), get_row_id_columns(nullptr), set_scan_order(nullptr), serialize(nullptr),
+      deserialize(nullptr), projection_pushdown(false), filter_pushdown(false), filter_prune(false),
       sampling_pushdown(false), late_materialization(false) {
 }
 
@@ -62,7 +70,8 @@ bool TableFunction::operator==(const TableFunction &rhs) const {
 	return name == rhs.name && arguments == rhs.arguments && varargs == rhs.varargs && bind == rhs.bind &&
 	       bind_replace == rhs.bind_replace && bind_operator == rhs.bind_operator && init_global == rhs.init_global &&
 	       init_local == rhs.init_local && function == rhs.function && in_out_function == rhs.in_out_function &&
-	       in_out_function_final == rhs.in_out_function_final && statistics == rhs.statistics &&
+	       in_out_function_final == rhs.in_out_function_final && in_out_function_batch == rhs.in_out_function_batch &&
+	       in_out_function_final_batch == rhs.in_out_function_final_batch && statistics == rhs.statistics &&
 	       dependency == rhs.dependency && cardinality == rhs.cardinality &&
 	       pushdown_complex_filter == rhs.pushdown_complex_filter && pushdown_expression == rhs.pushdown_expression &&
 	       to_string == rhs.to_string && dynamic_to_string == rhs.dynamic_to_string &&

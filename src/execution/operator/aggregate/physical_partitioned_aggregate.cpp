@@ -1,6 +1,13 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/aggregate/physical_partitioned_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/ungrouped_aggregate_state.hpp"
 #include "duckdb/common/types/value_map.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 
 namespace duckdb {
 
@@ -223,6 +230,12 @@ InsertionOrderPreservingMap<string> PhysicalPartitionedAggregate::ParamsToString
 	}
 	result["Aggregates"] = aggregate_info;
 	return result;
+}
+
+void PhysicalPartitionedAggregate::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "groups", groups);
+	serializer.WriteProperty(104, "aggregates", aggregates);
+	serializer.WriteProperty(105, "partitions", partitions);
 }
 
 } // namespace duckdb

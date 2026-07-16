@@ -1,4 +1,12 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
+#include "duckdb/execution/distributed/common_types.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/scalar/generic_common.hpp"
 #include "duckdb/function/scalar/system_functions.hpp"
@@ -8,6 +16,8 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+
+#include <iostream>
 
 namespace duckdb {
 
@@ -269,29 +279,43 @@ void ExportAggregateFinalize(Vector &state, AggregateInputData &aggr_input_data,
 	}
 }
 
+} // namespace
+
 void ExportStateAggregateSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
                                    const AggregateFunction &function) {
-	throw NotImplementedException("FIXME: export state serialize");
+	if (!bind_data_p) {
+		throw SerializationException("Export state aggregate serialize requires bind data for %s", function.name);
+	}
+	auto &bind_data = bind_data_p->Cast<ExportAggregateFunctionBindData>();
+	auto aggregate_expr = bind_data.aggregate->Copy();
+	serializer.WriteProperty(100, "aggregate", aggregate_expr);
 }
 
-unique_ptr<FunctionData> ExportStateAggregateDeserialize(Deserializer &deserializer, AggregateFunction &function) {
-	throw NotImplementedException("FIXME: export state deserialize");
-}
+unique_ptr<FunctionData> ExportStateAggregateDeserialize(Deserializer &deserializer, AggregateFunction &function);
 
 void ExportStateScalarSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
                                 const ScalarFunction &function) {
-	throw NotImplementedException("FIXME: export state serialize");
+	serializer.WriteProperty(100, "arguments", function.arguments);
+	serializer.WriteProperty(101, "return_type", function.return_type);
 }
 
 unique_ptr<FunctionData> ExportStateScalarDeserialize(Deserializer &deserializer, ScalarFunction &function) {
-	throw NotImplementedException("FIXME: export state deserialize");
+	auto arguments = deserializer.ReadProperty<vector<LogicalType>>(100, "arguments");
+	auto return_type = deserializer.ReadProperty<LogicalType>(101, "return_type");
+	function.arguments = arguments;
+	function.SetReturnType(return_type);
+
+	auto &context = deserializer.Get<ClientContext &>();
+	vector<unique_ptr<Expression>> argument_exprs;
+	argument_exprs.reserve(arguments.size());
+	for (auto &arg_type : arguments) {
+		argument_exprs.push_back(make_uniq<BoundConstantExpression>(Value(arg_type)));
+	}
+	return BindAggregateState(context, function, argument_exprs);
 }
 
-} // namespace
-
-unique_ptr<BoundAggregateExpression>
-ExportAggregateFunction::Bind(unique_ptr<BoundAggregateExpression> child_aggregate) {
-	auto &bound_function = child_aggregate->function;
+AggregateFunction MakeExportAggregateFunction(const BoundAggregateExpression &child_aggregate) {
+	auto &bound_function = child_aggregate.function;
 	if (!bound_function.HasStateCombineCallback()) {
 		throw BinderException("Cannot use EXPORT_STATE for non-combinable function %s", bound_function.name);
 	}
@@ -305,15 +329,14 @@ ExportAggregateFunction::Bind(unique_ptr<BoundAggregateExpression> child_aggrega
 	D_ASSERT(bound_function.HasStateSizeCallback());
 	D_ASSERT(bound_function.HasStateFinalizeCallback());
 
-	D_ASSERT(child_aggregate->function.GetReturnType().id() != LogicalTypeId::INVALID);
+	D_ASSERT(child_aggregate.function.GetReturnType().id() != LogicalTypeId::INVALID);
 #ifdef DEBUG
-	for (auto &arg_type : child_aggregate->function.arguments) {
+	for (auto &arg_type : child_aggregate.function.arguments) {
 		D_ASSERT(arg_type.id() != LogicalTypeId::INVALID);
 	}
 #endif
-	auto export_bind_data = make_uniq<ExportAggregateFunctionBindData>(child_aggregate->Copy());
-	aggregate_state_t state_type(child_aggregate->function.name, child_aggregate->function.GetReturnType(),
-	                             child_aggregate->function.arguments);
+	aggregate_state_t state_type(child_aggregate.function.name, child_aggregate.function.GetReturnType(),
+	                             child_aggregate.function.arguments);
 	auto return_type = LogicalType::AGGREGATE_STATE(std::move(state_type));
 
 	auto export_function =
@@ -326,6 +349,23 @@ ExportAggregateFunction::Bind(unique_ptr<BoundAggregateExpression> child_aggrega
 	export_function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	export_function.SetSerializeCallback(ExportStateAggregateSerialize);
 	export_function.SetDeserializeCallback(ExportStateAggregateDeserialize);
+	return export_function;
+}
+
+unique_ptr<FunctionData> ExportStateAggregateDeserialize(Deserializer &deserializer, AggregateFunction &function) {
+	auto aggregate_expr = deserializer.ReadProperty<unique_ptr<Expression>>(100, "aggregate");
+	if (!aggregate_expr || aggregate_expr->GetExpressionType() != ExpressionType::BOUND_AGGREGATE) {
+		throw SerializationException("Invalid export state aggregate payload for %s", function.name);
+	}
+	auto &bound_aggregate = aggregate_expr->Cast<BoundAggregateExpression>();
+	function = MakeExportAggregateFunction(bound_aggregate);
+	return make_uniq<ExportAggregateFunctionBindData>(std::move(aggregate_expr));
+}
+
+unique_ptr<BoundAggregateExpression>
+ExportAggregateFunction::Bind(unique_ptr<BoundAggregateExpression> child_aggregate) {
+	auto export_bind_data = make_uniq<ExportAggregateFunctionBindData>(child_aggregate->Copy());
+	auto export_function = MakeExportAggregateFunction(*child_aggregate);
 
 	return make_uniq<BoundAggregateExpression>(export_function, std::move(child_aggregate->children),
 	                                           std::move(child_aggregate->filter), std::move(export_bind_data),

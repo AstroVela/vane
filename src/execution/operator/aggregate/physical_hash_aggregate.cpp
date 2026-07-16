@@ -1,8 +1,15 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/aggregate_hashtable.hpp"
 #include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
@@ -938,6 +945,11 @@ InsertionOrderPreservingMap<string> PhysicalHashAggregate::ParamsToString() cons
 	result["Aggregates"] = aggregate_info;
 	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;
+}
+
+void PhysicalHashAggregate::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "groups", grouped_aggregate_data.groups);
+	serializer.WriteProperty(104, "aggregates", grouped_aggregate_data.aggregates);
 }
 
 } // namespace duckdb

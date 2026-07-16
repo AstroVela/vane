@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT
+#
+# Modified by Vane contributors.
+
 # this script creates a single header + source file combination out of the DuckDB sources
 import os
 import re
@@ -177,7 +183,7 @@ def find_license(original_file):
     file = original_file
     license = ""
     while True:
-        (file, end) = os.path.split(file)
+        file, end = os.path.split(file)
         if file == "":
             break
         potential_license = os.path.join(file, "LICENSE")
@@ -212,7 +218,7 @@ def write_file(current_file, ignore_excluded=False):
             + "\n\n// LICENSE_CHANGE_END\n"
         )
 
-    (statements, includes) = get_includes(current_file, text)
+    statements, includes = get_includes(current_file, text)
     # find the linenr of the final #include statement we parsed
     if len(statements) > 0:
         index = text.find(statements[-1])
@@ -424,7 +430,7 @@ def gather_file(current_file, source_files, header_files):
     with open_utf8(current_file, 'r') as f:
         text = f.read()
 
-    (statements, includes) = get_includes(current_file, text)
+    statements, includes = get_includes(current_file, text)
     # find the linenr of the final #include statement we parsed
     if len(statements) > 0:
         index = text.find(statements[-1])

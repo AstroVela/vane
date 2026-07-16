@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/enums/relation_type.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -33,6 +39,10 @@ string RelationTypeToString(RelationType type) {
 		return "LIMIT_RELATION";
 	case RelationType::ORDER_RELATION:
 		return "ORDER_RELATION";
+	case RelationType::REPARTITION_RELATION:
+		return "REPARTITION_RELATION";
+	case RelationType::LOCAL_EXCHANGE_RELATION:
+		return "LOCAL_EXCHANGE_RELATION";
 	case RelationType::CREATE_VIEW_RELATION:
 		return "CREATE_VIEW_RELATION";
 	case RelationType::CREATE_TABLE_RELATION:
@@ -61,6 +71,8 @@ string RelationTypeToString(RelationType type) {
 		return "VIEW_RELATION";
 	case RelationType::QUERY_RELATION:
 		return "QUERY_RELATION";
+	case RelationType::UNNEST_RELATION:
+		return "UNNEST_RELATION";
 	case RelationType::EXTENSION_RELATION:
 		return "EXTENSION_RELATION";
 	case RelationType::INVALID_RELATION:

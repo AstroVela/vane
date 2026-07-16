@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -46,6 +52,9 @@ public:
 private:
 	void EvaluateExpressionInternal(ClientContext &context, idx_t expression_idx, optional_ptr<DataChunk> child_chunk,
 	                                DataChunk &result, DataChunk &temp_chunk) const;
+
+protected:
+	void SerializeOperatorData(Serializer &serializer) const override;
 };
 
 } // namespace duckdb

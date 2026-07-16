@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -20,6 +26,8 @@ class PhysicalPivot : public PhysicalOperator {
 public:
 	PhysicalPivot(PhysicalPlan &physical_plan, vector<LogicalType> types, PhysicalOperator &child,
 	              BoundPivotInfo bound_pivot);
+	PhysicalPivot(PhysicalPlan &physical_plan, vector<LogicalType> types, BoundPivotInfo bound_pivot,
+	              idx_t estimated_cardinality);
 
 	BoundPivotInfo bound_pivot;
 	//! The map for pivot value -> column index
@@ -34,6 +42,9 @@ public:
 	bool ParallelOperator() const override {
 		return true;
 	}
+
+protected:
+	void SerializeOperatorData(Serializer &serializer) const override;
 };
 
 } // namespace duckdb

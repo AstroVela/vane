@@ -1,7 +1,14 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/function/function_list.hpp"
 
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/scalar/compressed_materialization_functions.hpp"
+#include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/function/scalar/date_functions.hpp"
 #include "duckdb/function/scalar/generic_functions.hpp"
 #include "duckdb/function/scalar/geometry_functions.hpp"
@@ -197,6 +204,7 @@ static const StaticFunctionDefinition function[] = {
 	DUCKDB_SCALAR_FUNCTION(LikeFun),
 	DUCKDB_SCALAR_FUNCTION(ILikeFun),
 	DUCKDB_SCALAR_FUNCTION(GlobPatternFun),
+	DUCKDB_SCALAR_FUNCTION_SET(UDFFunction),
 	FINAL_FUNCTION
 };
 

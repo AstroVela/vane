@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -32,6 +38,11 @@ public:
 	idx_t cte_index;
 	optional_idx delim_index;
 
+	//! Source node ID for distributed pset routing (analogous to PhysicalTableScan::scan_node_id).
+	//! When set, the distributed translator preserves this ID for the ScanSourceNode,
+	//! enabling key-based worker-side data injection.
+	optional_idx source_node_id;
+
 public:
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
 	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
@@ -50,6 +61,9 @@ public:
 
 public:
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
+
+protected:
+	void SerializeOperatorData(Serializer &serializer) const override;
 };
 
 } // namespace duckdb

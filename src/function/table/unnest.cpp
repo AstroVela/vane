@@ -1,5 +1,13 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/function/table/range.hpp"
 #include "duckdb/common/algorithm.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/execution/operator/projection/physical_unnest.hpp"
@@ -77,9 +85,26 @@ static OperatorResultType UnnestFunction(ExecutionContext &context, TableFunctio
 	return PhysicalUnnest::ExecuteInternal(context, input, output, *lstate.operator_state, state.select_list, false);
 }
 
+static void UnnestSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data, const TableFunction &) {
+	LogicalType input_type = LogicalType::LIST(LogicalType::ANY);
+	if (bind_data) {
+		input_type = bind_data->Cast<UnnestBindData>().input_type;
+	}
+	serializer.WriteProperty(100, "input_type", input_type);
+}
+
+static unique_ptr<FunctionData> UnnestDeserialize(Deserializer &deserializer, TableFunction &) {
+	auto input_type = LogicalType::LIST(LogicalType::ANY);
+	deserializer.ReadPropertyWithExplicitDefault<LogicalType>(100, "input_type", input_type,
+	                                                          LogicalType::LIST(LogicalType::ANY));
+	return make_uniq<UnnestBindData>(std::move(input_type));
+}
+
 void UnnestTableFunction::RegisterFunction(BuiltinFunctions &set) {
 	TableFunction unnest_function("unnest", {LogicalType::ANY}, nullptr, UnnestBind, UnnestInit, UnnestLocalInit);
 	unnest_function.in_out_function = UnnestFunction;
+	unnest_function.serialize = UnnestSerialize;
+	unnest_function.deserialize = UnnestDeserialize;
 	set.AddFunction(unnest_function);
 }
 

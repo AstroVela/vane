@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -105,6 +111,7 @@ enum class PhysicalOperatorType : uint8_t {
 	// -----------------------------
 	EXPLAIN,
 	EXPLAIN_ANALYZE,
+	LOCAL_EXCHANGE,
 	EMPTY_RESULT,
 	EXECUTE,
 	PREPARE,
@@ -124,6 +131,15 @@ enum class PhysicalOperatorType : uint8_t {
 	// Secret
 	// -----------------------------
 	CREATE_SECRET,
+
+	// -----------------------------
+	// Exchange
+	// -----------------------------
+	EXCHANGE_SINK,
+	EXCHANGE_SOURCE,
+	VLLM_PROJECT,
+	REPARTITION,
+	STREAMING_UDF,
 };
 
 string PhysicalOperatorToString(PhysicalOperatorType type);

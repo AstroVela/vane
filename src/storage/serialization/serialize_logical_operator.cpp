@@ -118,6 +118,9 @@ unique_ptr<LogicalOperator> LogicalOperator::Deserialize(Deserializer &deseriali
 	case LogicalOperatorType::LOGICAL_FILTER:
 		result = LogicalFilter::Deserialize(deserializer);
 		break;
+	case LogicalOperatorType::LOGICAL_REPARTITION:
+		result = LogicalRepartition::Deserialize(deserializer);
+		break;
 	case LogicalOperatorType::LOGICAL_GET:
 		result = LogicalGet::Deserialize(deserializer);
 		break;
@@ -150,6 +153,15 @@ unique_ptr<LogicalOperator> LogicalOperator::Deserialize(Deserializer &deseriali
 		break;
 	case LogicalOperatorType::LOGICAL_PROJECTION:
 		result = LogicalProjection::Deserialize(deserializer);
+		break;
+	case LogicalOperatorType::LOGICAL_VLLM_PROJECT:
+		result = LogicalVLLMProject::Deserialize(deserializer);
+		break;
+	case LogicalOperatorType::LOGICAL_UDF_PROJECT:
+		result = LogicalUDFProject::Deserialize(deserializer);
+		break;
+	case LogicalOperatorType::LOGICAL_LOCAL_EXCHANGE:
+		result = LogicalLocalExchange::Deserialize(deserializer);
 		break;
 	case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
 		result = LogicalRecursiveCTE::Deserialize(deserializer);
@@ -185,7 +197,8 @@ unique_ptr<LogicalOperator> LogicalOperator::Deserialize(Deserializer &deseriali
 		result = LogicalWindow::Deserialize(deserializer);
 		break;
 	default:
-		throw SerializationException("Unsupported type for deserialization of LogicalOperator!");
+		throw SerializationException("Unsupported type for deserialization of LogicalOperator: %s (enum=%d)!",
+		                             EnumUtil::ToString(type).c_str(), static_cast<int>(type));
 	}
 	deserializer.Unset<LogicalOperatorType>();
 	result->children = std::move(children);
@@ -531,6 +544,115 @@ unique_ptr<LogicalOperator> LogicalFilter::Deserialize(Deserializer &deserialize
 	return std::move(result);
 }
 
+void LogicalRepartition::Serialize(Serializer &serializer) const {
+	LogicalOperator::Serialize(serializer);
+	auto repartition_type =
+	    repartition_spec ? static_cast<uint8_t>(repartition_spec->type())
+	                     : static_cast<uint8_t>(RepartitionSpec::Type::Random);
+	serializer.WriteProperty<uint8_t>(200, "repartition_type", repartition_type);
+
+	optional_idx num_partitions;
+	vector<unique_ptr<Expression>> partition_by;
+
+	if (!expressions.empty()) {
+		partition_by.reserve(expressions.size());
+		for (auto &expr : expressions) {
+			partition_by.push_back(expr->Copy());
+		}
+	}
+
+	if (repartition_spec) {
+		switch (static_cast<RepartitionSpec::Type>(repartition_type)) {
+		case RepartitionSpec::Type::Hash: {
+			auto *hash_spec = dynamic_cast<HashRepartitionSpec *>(repartition_spec.get());
+			if (!hash_spec) {
+				throw InternalException("Expected HashRepartitionSpec for LOGICAL_REPARTITION");
+			}
+			auto &config = hash_spec->config();
+			if (config->num_partitions) {
+				num_partitions = optional_idx(static_cast<idx_t>(config->num_partitions));
+			}
+			break;
+		}
+		case RepartitionSpec::Type::Random: {
+			auto *random_spec = dynamic_cast<RandomRepartitionSpec *>(repartition_spec.get());
+			if (!random_spec) {
+				throw InternalException("Expected RandomRepartitionSpec for LOGICAL_REPARTITION");
+			}
+			auto &config = random_spec->config();
+			if (config->num_partitions) {
+				num_partitions = optional_idx(static_cast<idx_t>(config->num_partitions));
+			}
+			break;
+		}
+		case RepartitionSpec::Type::IntoPartitions: {
+			auto *into_spec = dynamic_cast<IntoPartitionsRepartitionSpec *>(repartition_spec.get());
+			if (!into_spec) {
+				throw InternalException("Expected IntoPartitionsRepartitionSpec for LOGICAL_REPARTITION");
+			}
+			auto &config = into_spec->config();
+			num_partitions = optional_idx(static_cast<idx_t>(config->num_partitions));
+			break;
+		}
+		case RepartitionSpec::Type::Range:
+			throw NotImplementedException("Range repartition serialization is not supported");
+		}
+	}
+
+	serializer.WritePropertyWithDefault<optional_idx>(201, "num_partitions", num_partitions);
+	serializer.WritePropertyWithDefault<vector<unique_ptr<Expression>>>(202, "partition_by", partition_by);
+}
+
+unique_ptr<LogicalOperator> LogicalRepartition::Deserialize(Deserializer &deserializer) {
+	auto repartition_type_val = deserializer.ReadProperty<uint8_t>(200, "repartition_type");
+	auto num_partitions = deserializer.ReadPropertyWithDefault<optional_idx>(201, "num_partitions");
+	auto partition_by = deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(202, "partition_by");
+
+	size_t num_partitions_val = 0;
+	if (num_partitions.IsValid()) {
+		num_partitions_val = static_cast<size_t>(num_partitions.GetIndex());
+	}
+
+	vector<unique_ptr<Expression>> bound_partition_exprs;
+	if (!partition_by.empty()) {
+		bound_partition_exprs.reserve(partition_by.size());
+		for (auto &expr : partition_by) {
+			bound_partition_exprs.push_back(expr->Copy());
+		}
+	}
+
+	std::shared_ptr<RepartitionSpec> spec;
+	auto repartition_type = static_cast<RepartitionSpec::Type>(repartition_type_val);
+	switch (repartition_type) {
+	case RepartitionSpec::Type::Hash: {
+		vector<ExprRef> expr_refs;
+		expr_refs.reserve(partition_by.size());
+		for (auto &expr : partition_by) {
+			expr_refs.emplace_back(expr.release());
+		}
+		spec = RepartitionSpec::create_hash(num_partitions_val, std::move(expr_refs));
+		break;
+	}
+	case RepartitionSpec::Type::Random:
+		spec = RepartitionSpec::create_random(num_partitions_val);
+		break;
+	case RepartitionSpec::Type::IntoPartitions:
+		if (!num_partitions_val) {
+			throw InternalException("Missing num_partitions for IntoPartitions repartition");
+		}
+		spec = RepartitionSpec::create_into_partitions(num_partitions_val);
+		break;
+	case RepartitionSpec::Type::Range:
+		throw NotImplementedException("Range repartition deserialization is not supported");
+	default:
+		throw InternalException("Unknown repartition type for LOGICAL_REPARTITION");
+	}
+
+	auto result = duckdb::unique_ptr<LogicalRepartition>(new LogicalRepartition(std::move(spec)));
+	result->expressions = std::move(bound_partition_exprs);
+	return std::move(result);
+}
+
 void LogicalInsert::Serialize(Serializer &serializer) const {
 	LogicalOperator::Serialize(serializer);
 	serializer.WritePropertyWithDefault<unique_ptr<CreateInfo>>(200, "table_info", table.GetInfo());
@@ -676,6 +798,47 @@ unique_ptr<LogicalOperator> LogicalProjection::Deserialize(Deserializer &deseria
 	auto table_index = deserializer.ReadPropertyWithDefault<idx_t>(200, "table_index");
 	auto expressions = deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(201, "expressions");
 	auto result = duckdb::unique_ptr<LogicalProjection>(new LogicalProjection(table_index, std::move(expressions)));
+	return std::move(result);
+}
+
+void LogicalVLLMProject::Serialize(Serializer &serializer) const {
+	LogicalOperator::Serialize(serializer);
+	serializer.WritePropertyWithDefault<idx_t>(200, "table_index", table_index);
+	serializer.WritePropertyWithDefault<unique_ptr<Expression>>(201, "vllm_expr", vllm_expr);
+	serializer.WritePropertyWithDefault<string>(202, "output_column_name", output_column_name);
+}
+
+unique_ptr<LogicalOperator> LogicalVLLMProject::Deserialize(Deserializer &deserializer) {
+	auto table_index = deserializer.ReadPropertyWithDefault<idx_t>(200, "table_index");
+	auto vllm_expr = deserializer.ReadPropertyWithDefault<unique_ptr<Expression>>(201, "vllm_expr");
+	auto output_column_name = deserializer.ReadPropertyWithDefault<string>(202, "output_column_name");
+	auto result = duckdb::unique_ptr<LogicalVLLMProject>(new LogicalVLLMProject(table_index, std::move(vllm_expr), std::move(output_column_name)));
+	return std::move(result);
+}
+
+void LogicalUDFProject::Serialize(Serializer &serializer) const {
+	LogicalOperator::Serialize(serializer);
+	serializer.WritePropertyWithDefault<idx_t>(200, "table_index", table_index);
+	serializer.WritePropertyWithDefault<unique_ptr<Expression>>(201, "udf_expr", udf_expr);
+	serializer.WritePropertyWithDefault<string>(202, "output_column_name", output_column_name);
+	serializer.WritePropertyWithDefault<bool>(203, "is_flat_map", is_flat_map);
+	serializer.WritePropertyWithDefault<vector<LogicalType>>(204, "flat_map_output_types", flat_map_output_types);
+	serializer.WritePropertyWithDefault<vector<string>>(205, "flat_map_output_names", flat_map_output_names);
+	serializer.WritePropertyWithDefault<bool>(206, "is_scalar_map", is_scalar_map);
+	serializer.WritePropertyWithDefault<bool>(207, "is_row_preserving_batch", is_row_preserving_batch);
+}
+
+unique_ptr<LogicalOperator> LogicalUDFProject::Deserialize(Deserializer &deserializer) {
+	auto table_index = deserializer.ReadPropertyWithDefault<idx_t>(200, "table_index");
+	auto udf_expr = deserializer.ReadPropertyWithDefault<unique_ptr<Expression>>(201, "udf_expr");
+	auto output_column_name = deserializer.ReadPropertyWithDefault<string>(202, "output_column_name");
+	auto result = duckdb::unique_ptr<LogicalUDFProject>(
+	    new LogicalUDFProject(table_index, std::move(udf_expr), std::move(output_column_name)));
+	result->is_flat_map = deserializer.ReadPropertyWithDefault<bool>(203, "is_flat_map");
+	result->flat_map_output_types = deserializer.ReadPropertyWithDefault<vector<LogicalType>>(204, "flat_map_output_types");
+	result->flat_map_output_names = deserializer.ReadPropertyWithDefault<vector<string>>(205, "flat_map_output_names");
+	result->is_scalar_map = deserializer.ReadPropertyWithDefault<bool>(206, "is_scalar_map");
+	result->is_row_preserving_batch = deserializer.ReadPropertyWithDefault<bool>(207, "is_row_preserving_batch");
 	return std::move(result);
 }
 

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 
 #include "duckdb/execution/operator/helper/physical_batch_collector.hpp"
@@ -39,7 +45,7 @@ PhysicalOperator &PhysicalResultCollector::GetResultCollector(ClientContext &con
 		if (data.output_type == QueryResultOutputType::ALLOW_STREAMING) {
 			return physical_plan.Make<PhysicalBufferedCollector>(data, false);
 		}
-		return physical_plan.Make<PhysicalMaterializedCollector>(data, false);
+		return physical_plan.Make<PhysicalMaterializedCollector>(data, true);
 	}
 
 	// Order-preserving plan, and we can use the batch index: use a batch collector.

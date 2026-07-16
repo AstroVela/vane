@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -112,7 +118,7 @@ public:
 
 	void ReduceUnflushedMemory(idx_t memory_reduction) {
 		if (unflushed_memory_usage < memory_reduction) {
-			throw InternalException("Reducing unflushed memory usage below zero!?");
+			throw InternalException(std::string("Reducing unflushed memory usage below zero!?"));
 		} else {
 			unflushed_memory_usage -= memory_reduction;
 		}

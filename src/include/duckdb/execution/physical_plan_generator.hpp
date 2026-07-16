@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -26,6 +32,10 @@ class PhysicalPlan {
 public:
 	explicit PhysicalPlan(Allocator &allocator) : arena(allocator) {};
 
+	// Note: intentionally avoid adding textual rendering helpers here to keep the
+	// PhysicalPlan header minimal; consumers can render plans using the tree
+	// renderer directly if they have access to the root operator.
+
 	~PhysicalPlan() {
 		// Call the destructor of each physical operator.
 		for (auto &op : ops) {
@@ -47,12 +57,33 @@ public:
 		D_ASSERT(root);
 		return *root;
 	}
+
+	// Const overload for callers with const PhysicalPlan references
+	const PhysicalOperator &Root() const {
+		D_ASSERT(root);
+		return *root;
+	}
+
+	//! Check whether a root operator has been set
+	bool HasRoot() const {
+		return root != nullptr;
+	}
 	void SetRoot(PhysicalOperator &op) {
 		root = op;
 	}
 	//! Get a reference to the arena.
 	ArenaAllocator &ArenaRef() {
 		return arena;
+	}
+
+	// Serialization helpers: serialize/deserialize entire plan tree
+	void Serialize(Serializer &serializer) const;
+	unique_ptr<PhysicalOperator> Deserialize(Deserializer &deserializer);
+
+public:
+	//! Take ownership of a deserialized operator (used during deserialization)
+	void TakeOwnership(unique_ptr<PhysicalOperator> op) {
+		deserialized_ops.push_back(std::move(op));
 	}
 
 private:
@@ -62,6 +93,8 @@ private:
 	vector<reference<PhysicalOperator>> ops;
 	//! The root of the physical plan.
 	optional_ptr<PhysicalOperator> root;
+	//! Storage for operators created during deserialization (not arena-allocated)
+	vector<unique_ptr<PhysicalOperator>> deserialized_ops;
 };
 
 //! The physical plan generator generates a physical execution plan from a logical query plan.
@@ -133,6 +166,10 @@ protected:
 	PhysicalOperator &CreatePlan(LogicalTopN &op);
 	PhysicalOperator &CreatePlan(LogicalPositionalJoin &op);
 	PhysicalOperator &CreatePlan(LogicalProjection &op);
+	PhysicalOperator &CreatePlan(LogicalRepartition &op);
+	PhysicalOperator &CreatePlan(LogicalLocalExchange &op);
+	PhysicalOperator &CreatePlan(LogicalUDFProject &op);
+	PhysicalOperator &CreatePlan(LogicalVLLMProject &op);
 	PhysicalOperator &CreatePlan(LogicalInsert &op);
 	PhysicalOperator &CreatePlan(LogicalCopyToFile &op);
 	PhysicalOperator &CreatePlan(LogicalExplain &op);

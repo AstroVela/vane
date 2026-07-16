@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -124,6 +130,14 @@ public:
 
 	// LIMIT
 	DUCKDB_API shared_ptr<Relation> Limit(int64_t n, int64_t offset = 0);
+
+	// REPARTITION (num_partitions=0 means auto)
+	DUCKDB_API shared_ptr<Relation> Repartition(idx_t num_partitions,
+	                                            vector<unique_ptr<ParsedExpression>> partition_by);
+	DUCKDB_API shared_ptr<Relation> Repartition(idx_t num_partitions, const vector<string> &partition_by);
+
+	// LOCAL_EXCHANGE (num_partitions=0 means auto)
+	DUCKDB_API shared_ptr<Relation> LocalExchange(idx_t num_partitions = 0);
 
 	// ORDER
 	DUCKDB_API shared_ptr<Relation> Order(const string &expression);

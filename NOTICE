@@ -1,0 +1,16 @@
+Vane DuckDB engine fork
+=======================
+
+This repository is derived from DuckDB.
+
+  DuckDB
+  Copyright 2018-2025 Stichting DuckDB Foundation
+  License: MIT
+  https://github.com/duckdb/duckdb
+
+This fork is maintained independently for Vane. It is not affiliated with,
+endorsed by, or maintained by the DuckDB Foundation. DuckDB is a trademark
+of the DuckDB Foundation.
+
+See LICENSE and the license files retained in third_party and extension
+directories for applicable terms.

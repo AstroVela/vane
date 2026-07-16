@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "catch.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/enums/joinref_type.hpp"
@@ -1165,4 +1171,68 @@ TEST_CASE("Test create table with empty name", "[relation_api]") {
 
 	auto values = con.Values("(42)");
 	REQUIRE_THROWS_AS(values->Create(""), ParserException);
+}
+
+TEST_CASE("Test LocalExchange preserved after Limit", "[relation_api][local_exchange]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	// Create a simple table
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE integers(i INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO integers VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)"));
+
+	auto tbl = con.Table("integers");
+
+	// --- Basic LimitRelation::Bind() correctness ---
+	// Limit without LocalExchange: ensure basic functionality works
+	REQUIRE_NOTHROW(result = tbl->Limit(5)->Execute());
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 5);
+
+	// Limit with offset
+	REQUIRE_NOTHROW(result = tbl->Order("i")->Limit(3, 2)->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {3, 4, 5}));
+
+	// --- LocalExchange + Limit: the bug that was fixed ---
+	// LocalExchange followed by Limit should return correct row count
+	REQUIRE_NOTHROW(result = tbl->LocalExchange(4)->Limit(5)->Execute());
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 5);
+
+	// Limit followed by LocalExchange should also work
+	REQUIRE_NOTHROW(result = tbl->Limit(7)->LocalExchange(4)->Execute());
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 7);
+
+	// Double Limit with LocalExchange in between
+	REQUIRE_NOTHROW(result = tbl->Limit(8)->LocalExchange(4)->Limit(3)->Execute());
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 3);
+
+	// LocalExchange + Limit chain
+	REQUIRE_NOTHROW(result = tbl->LocalExchange(4)->Limit(6)->LocalExchange(2)->Limit(2)->Execute());
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 2);
+
+	// Filter + LocalExchange + Limit
+	REQUIRE_NOTHROW(result = tbl->Filter("i > 3")->LocalExchange(4)->Limit(3)->Execute());
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 3);
+
+	// Project + LocalExchange + Limit
+	REQUIRE_NOTHROW(result = tbl->Project("i * 2 AS doubled")->LocalExchange(4)->Limit(4)->Execute());
+	REQUIRE(result->Cast<MaterializedQueryResult>().RowCount() == 4);
+
+	// --- Verify EXPLAIN plan contains LOCAL_EXCHANGE after Limit ---
+	// This is the core regression check: local_exchange must not be silently removed
+	auto explain_result = tbl->LocalExchange(4)->Limit(5)->Explain();
+	REQUIRE_NOTHROW(explain_result);
+	REQUIRE(!explain_result->HasError());
+	string explain_str;
+	while (true) {
+		auto chunk = explain_result->Fetch();
+		if (!chunk || chunk->size() == 0) {
+			break;
+		}
+		for (idx_t r = 0; r < chunk->size(); r++) {
+			explain_str += chunk->GetValue(1, r).ToString();
+		}
+	}
+	// The EXPLAIN output should contain LOCAL_EXCHANGE
+	REQUIRE(explain_str.find("LOCAL_EXCHANGE") != string::npos);
 }

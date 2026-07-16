@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -285,6 +291,12 @@ public:
 	void MergeCorrelatedColumns(CorrelatedColumns &other);
 	//! Add a correlated column to this binder (if it does not exist)
 	void AddCorrelatedColumn(const CorrelatedColumnInfo &info);
+	//! Move correlated columns from another binder into this binder
+	void MoveCorrelatedExpressionsFrom(Binder &other);
+	//! Bind a table function with a pre-bound input plan (used by Relation-based table functions).
+	BoundStatement BindTableFunctionWithInput(TableFunction &table_function, const TableFunctionRef &ref,
+	                                          vector<Value> parameters, named_parameter_map_t named_parameters,
+	                                          BoundStatement &input);
 
 	unique_ptr<LogicalOperator> BindUpdateSet(LogicalOperator &op, unique_ptr<LogicalOperator> root,
 	                                          UpdateSetInfo &set_info, TableCatalogEntry &table,

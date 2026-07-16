@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/planner/logical_operator_deep_copy.hpp"
 
 #include "duckdb/planner/expression/list.hpp"
@@ -100,6 +106,14 @@ void LogicalOperatorDeepCopy::VisitOperator(LogicalOperator &op) {
 		break;
 	case LogicalOperatorType::LOGICAL_UNNEST: {
 		ReplaceTableIndex<LogicalUnnest>(op);
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_VLLM_PROJECT: {
+		ReplaceTableIndex<LogicalVLLMProject>(op);
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_UDF_PROJECT: {
+		ReplaceTableIndex<LogicalUDFProject>(op);
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_PIVOT: {

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/query_profiler.hpp"
 
 #include "duckdb/common/enums/metric_type.hpp"
@@ -365,7 +371,19 @@ void OperatorProfiler::StartOperator(optional_ptr<const PhysicalOperator> phys_o
 	}
 }
 
-void OperatorProfiler::EndOperator(optional_ptr<DataChunk> chunk) {
+static void MergeExtraInfo(InsertionOrderPreservingMap<string> &target, InsertionOrderPreservingMap<string> source) {
+	for (auto &new_info : source) {
+		auto entry = target.find(new_info.first);
+		if (entry != target.end()) {
+			entry->second = std::move(new_info.second);
+		} else {
+			target.insert(std::move(new_info));
+		}
+	}
+}
+
+void OperatorProfiler::EndOperator(optional_ptr<DataChunk> chunk, optional_ptr<GlobalOperatorState> gstate,
+                                   optional_ptr<OperatorState> state) {
 	if (!enabled) {
 		return;
 	}
@@ -385,6 +403,10 @@ void OperatorProfiler::EndOperator(optional_ptr<DataChunk> chunk) {
 		if (ProfilingInfo::Enabled(settings, MetricType::RESULT_SET_SIZE) && chunk) {
 			auto result_set_size = chunk->GetAllocationSize();
 			info.AddMetric(MetricType::RESULT_SET_SIZE, result_set_size);
+		}
+		if (ProfilingInfo::Enabled(settings, MetricType::EXTRA_INFO) && gstate && state) {
+			auto extra_info = active_operator->ExtraOperatorParams(*gstate, *state);
+			MergeExtraInfo(info.extra_info, std::move(extra_info));
 		}
 		if (ProfilingInfo::Enabled(settings, MetricType::SYSTEM_PEAK_BUFFER_MEMORY)) {
 			auto used_memory = BufferManager::GetBufferManager(context).GetBufferPool().GetUsedMemory(false);
@@ -410,16 +432,7 @@ void OperatorProfiler::FinishSource(GlobalSourceState &gstate, LocalSourceState 
 			// we're emitting extra info - get the extra source info
 			auto &info = GetOperatorInfo(*active_operator);
 			auto extra_info = active_operator->ExtraSourceParams(gstate, lstate);
-			for (auto &new_info : extra_info) {
-				auto entry = info.extra_info.find(new_info.first);
-				if (entry != info.extra_info.end()) {
-					// entry exists - override
-					entry->second = std::move(new_info.second);
-				} else {
-					// entry does not exist yet - insert
-					info.extra_info.insert(std::move(new_info));
-				}
-			}
+			MergeExtraInfo(info.extra_info, std::move(extra_info));
 		}
 		if (ProfilingInfo::Enabled(settings, MetricType::OPERATOR_ROWS_SCANNED) &&
 		    active_operator.get()->type == PhysicalOperatorType::TABLE_SCAN) {

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -29,7 +35,8 @@ public:
 	template <class TARGET>
 	TARGET &Cast() {
 		if (type != TARGET::TYPE) {
-			throw InternalException("Failed to cast result modifier to type - result modifier type mismatch");
+			throw InternalException(
+			    std::string("Failed to cast result modifier to type - result modifier type mismatch"));
 		}
 		return reinterpret_cast<TARGET &>(*this);
 	}
@@ -37,7 +44,8 @@ public:
 	template <class TARGET>
 	const TARGET &Cast() const {
 		if (type != TARGET::TYPE) {
-			throw InternalException("Failed to cast result modifier to type - result modifier type mismatch");
+			throw InternalException(
+			    std::string("Failed to cast result modifier to type - result modifier type mismatch"));
 		}
 		return reinterpret_cast<const TARGET &>(*this);
 	}

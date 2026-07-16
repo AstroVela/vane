@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT
+#
+# Modified by Vane contributors.
+
 import argparse
 import glob
 import json
@@ -5,7 +11,6 @@ import os
 import subprocess
 import sys
 from tqdm import tqdm
-
 
 OLD_DB_NAME = "old.duckdb"
 NEW_DB_NAME = "new.duckdb"

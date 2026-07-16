@@ -1,8 +1,17 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "catch.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/execution/operator/exchange/repartition.hpp"
+#include "duckdb/main/relation.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/planner/operator/logical_local_exchange.hpp"
 #include "test_helpers.hpp"
 #include "duckdb/parser/parser.hpp"
 
@@ -11,6 +20,22 @@
 
 using namespace duckdb;
 using namespace std;
+
+static const LogicalLocalExchange *FindLocalExchange(const LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_LOCAL_EXCHANGE) {
+		return &op.Cast<LogicalLocalExchange>();
+	}
+	for (auto &child : op.children) {
+		if (!child) {
+			continue;
+		}
+		auto result = FindLocalExchange(*child);
+		if (result) {
+			return result;
+		}
+	}
+	return nullptr;
+}
 
 static void test_helper(string sql, duckdb::vector<string> fixtures = duckdb::vector<string>()) {
 	DuckDB db;
@@ -140,6 +165,30 @@ TEST_CASE("Test logical_simple with ALTER", "[serialization]") {
 
 TEST_CASE("Test logical_simple with LOAD", "[serialization]") {
 	test_helper("LOAD foo");
+}
+
+TEST_CASE("Test logical_local_exchange preserves explicit partitions across serialization", "[serialization]") {
+	DuckDB db;
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE integers(i INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO integers VALUES (1), (2), (3), (4)"));
+
+	con.context->transaction.BeginTransaction();
+	auto rel = con.Table("integers")->LocalExchange(1)->Limit(2);
+	auto binder = Binder::CreateBinder(*con.context);
+	auto bound = rel->Bind(*binder);
+
+	auto copied_plan = bound.plan->Copy(*con.context);
+	auto local_exchange = FindLocalExchange(*copied_plan);
+	REQUIRE(local_exchange != nullptr);
+	REQUIRE(local_exchange->repartition_spec != nullptr);
+	REQUIRE(local_exchange->repartition_spec->type() == RepartitionSpec::Type::Random);
+
+	auto *random_spec = dynamic_cast<RandomRepartitionSpec *>(local_exchange->repartition_spec.get());
+	REQUIRE(random_spec != nullptr);
+	REQUIRE(random_spec->config()->num_partitions == 1);
+	con.context->transaction.Commit();
 }
 
 // below test cases are oriented towards multi-databases

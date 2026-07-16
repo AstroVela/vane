@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -32,6 +38,8 @@ public:
 
 	Pipeline &pipeline;
 	unique_ptr<PipelineExecutor> pipeline_executor;
+	bool pipeline_task_started = false;
+	bool pipeline_task_completed = false;
 
 	string TaskType() const override {
 		return "PipelineTask";
@@ -72,6 +80,7 @@ public:
 class Pipeline : public enable_shared_from_this<Pipeline> {
 	friend class Executor;
 	friend class PipelineExecutor;
+	friend class PipelineTask;
 	friend class PipelineEvent;
 	friend class PipelineFinishEvent;
 	friend class PipelineBuildState;
@@ -95,6 +104,7 @@ public:
 	void ClearSource();
 	void Schedule(shared_ptr<Event> &event);
 	void PrepareFinalize();
+	idx_t ResolveMaxThreads();
 
 	string ToString() const;
 	void Print() const;
@@ -130,6 +140,16 @@ private:
 	bool ready;
 	//! Whether or not the pipeline has been initialized
 	atomic<bool> initialized;
+	//! Rows and bytes emitted by the source into this pipeline
+	atomic<idx_t> input_rows {0};
+	atomic<idx_t> input_bytes {0};
+	//! Rows and bytes presented to the sink by this pipeline
+	atomic<idx_t> output_rows {0};
+	atomic<idx_t> output_bytes {0};
+	//! Planned, started, and completed DuckDB PipelineTasks for this pipeline
+	atomic<idx_t> total_pipeline_tasks {1};
+	atomic<idx_t> started_pipeline_tasks {0};
+	atomic<idx_t> completed_pipeline_tasks {0};
 	//! The source of this pipeline
 	optional_ptr<PhysicalOperator> source;
 	//! The chain of intermediate operators
@@ -159,6 +179,7 @@ private:
 	void ScheduleSequentialTask(shared_ptr<Event> &event);
 	bool LaunchScanTasks(shared_ptr<Event> &event, idx_t max_threads);
 
+	void NotifyMaxThreadsResolved(idx_t max_threads);
 	bool ScheduleParallel(shared_ptr<Event> &event);
 };
 

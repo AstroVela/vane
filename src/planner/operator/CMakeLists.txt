@@ -1,3 +1,11 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+#
+# SPDX-FileCopyrightText: 2026 Vane contributors
+#
+# SPDX-License-Identifier: MIT
+#
+# Modified by Vane contributors.
+
 add_library_unity(
   duckdb_planner_operator
   OBJECT
@@ -33,6 +41,10 @@ add_library_unity(
   logical_pragma.cpp
   logical_prepare.cpp
   logical_projection.cpp
+  logical_repartition.cpp
+  logical_local_exchange.cpp
+  logical_udf_project.cpp
+  logical_vllm_project.cpp
   logical_recursive_cte.cpp
   logical_materialized_cte.cpp
   logical_sample.cpp

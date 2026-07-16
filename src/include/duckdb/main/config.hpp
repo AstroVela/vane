@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -109,6 +115,17 @@ struct DBConfigOptions {
 	idx_t maximum_swap_space = DConstants::INVALID_INDEX;
 	//! The maximum amount of CPU threads used by the database system. Default: all available.
 	idx_t maximum_threads = DConstants::INVALID_INDEX;
+	//! Default number of partitions for local exchange (0 uses min(threads, 32))
+	idx_t local_exchange_default_partitions = 0;
+	//! Maximum number of partitions for local exchange (0 uses threads*2)
+	idx_t local_exchange_max_partitions = 0;
+	//! Maximum bytes to buffer in local exchange
+	idx_t local_exchange_buffer_bytes = 32ULL * 1024 * 1024;
+	//! Whether local exchange should run in streaming mode (no pipeline dependency)
+	bool local_exchange_streaming = true;
+	//! The number of external threads that work on DuckDB tasks. Default: 1.
+	//! Must be smaller or equal to maximum_threads.
+	idx_t external_threads = 1;
 	//! Whether or not to create and use a temporary directory to store intermediates that do not fit in memory
 	bool use_temporary_directory = true;
 	//! Directory to store temporary structures that do not fit in memory

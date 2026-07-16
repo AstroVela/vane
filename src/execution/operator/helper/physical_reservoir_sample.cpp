@@ -1,5 +1,12 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/helper/physical_reservoir_sample.hpp"
 #include "duckdb/execution/reservoir_sample.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 
 namespace duckdb {
 
@@ -99,6 +106,10 @@ InsertionOrderPreservingMap<string> PhysicalReservoirSample::ParamsToString() co
 	InsertionOrderPreservingMap<string> result;
 	result["Sample Size"] = options->sample_size.ToString() + (options->is_percentage ? "%" : " rows");
 	return result;
+}
+
+void PhysicalReservoirSample::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "sample_options", options);
 }
 
 } // namespace duckdb

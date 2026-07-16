@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/optimizer/optimizer.hpp"
 
 #include "duckdb/execution/column_binding_resolver.hpp"
@@ -36,6 +42,8 @@
 #include "duckdb/optimizer/topn_optimizer.hpp"
 #include "duckdb/optimizer/topn_window_elimination.hpp"
 #include "duckdb/optimizer/unnest_rewriter.hpp"
+#include "duckdb/optimizer/udf_project_rewriter.hpp"
+#include "duckdb/optimizer/vllm_project_rewriter.hpp"
 #include "duckdb/optimizer/late_materialization.hpp"
 #include "duckdb/optimizer/common_subplan_optimizer.hpp"
 #include "duckdb/optimizer/window_self_join.hpp"
@@ -214,6 +222,18 @@ void Optimizer::RunBuiltInOptimizers() {
 	RunOptimizer(OptimizerType::UNNEST_REWRITER, [&]() {
 		UnnestRewriter unnest_rewriter;
 		plan = unnest_rewriter.Optimize(std::move(plan));
+	});
+
+	// splits vllm expressions into a dedicated logical operator
+	RunOptimizer(OptimizerType::VLLM_PROJECT, [&]() {
+		VLLMProjectRewriter vllm_rewriter(binder);
+		plan = vllm_rewriter.Optimize(std::move(plan));
+	});
+
+	// splits udf expressions into a dedicated logical operator
+	RunOptimizer(OptimizerType::UDF_PROJECT, [&]() {
+		UDFProjectRewriter udf_rewriter(binder);
+		plan = udf_rewriter.Optimize(std::move(plan));
 	});
 
 	// removes unused columns

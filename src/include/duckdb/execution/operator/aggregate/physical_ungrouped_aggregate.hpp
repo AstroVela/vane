@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -26,12 +32,13 @@ public:
 public:
 	PhysicalUngroupedAggregate(PhysicalPlan &physical_plan, vector<LogicalType> types,
 	                           vector<unique_ptr<Expression>> expressions, idx_t estimated_cardinality,
-	                           TupleDataValidityType distinct_validity);
+	                           TupleDataValidityType distinct_validity_p);
 
 	//! The aggregates that have to be computed
 	vector<unique_ptr<Expression>> aggregates;
 	unique_ptr<DistinctAggregateData> distinct_data;
 	unique_ptr<DistinctAggregateCollectionInfo> distinct_collection_info;
+	TupleDataValidityType distinct_validity;
 
 public:
 	// Source interface
@@ -53,6 +60,7 @@ public:
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
+	void SerializeOperatorData(Serializer &serializer) const override;
 
 	bool IsSink() const override {
 		return true;

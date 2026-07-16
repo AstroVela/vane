@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -12,7 +18,11 @@
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/scalar/generic_common.hpp"
+
+#include <type_traits>
 
 namespace duckdb {
 
@@ -66,6 +76,7 @@ public:
 		auto original_arguments = deserializer.ReadProperty<vector<LogicalType>>(502, "original_arguments");
 		auto catalog_name = deserializer.ReadPropertyWithDefault<string>(505, "catalog_name");
 		auto schema_name = deserializer.ReadPropertyWithDefault<string>(506, "schema_name");
+		auto has_serialize = deserializer.ReadProperty<bool>(503, "has_serialize");
 		if (catalog_name.empty()) {
 			catalog_name = SYSTEM_CATALOG;
 		}
@@ -83,9 +94,39 @@ public:
 			}
 		}
 
-		auto function = DeserializeFunction<FUNC, CATALOG_ENTRY>(context, catalog_type, catalog_name, schema_name, name,
-		                                                         arguments, original_arguments);
-		auto has_serialize = deserializer.ReadProperty<bool>(503, "has_serialize");
+		bool is_export_state = false;
+		bool is_merge_state = false;
+		if constexpr (std::is_same<FUNC, AggregateFunction>::value) {
+			is_export_state = has_serialize && StringUtil::StartsWith(name, "aggregate_state_export_");
+			is_merge_state = has_serialize && StringUtil::StartsWith(name, "merge_");
+		}
+
+		auto function = [&]() -> FUNC {
+			if constexpr (std::is_same<FUNC, AggregateFunction>::value) {
+				if (is_export_state) {
+					auto placeholder = AggregateFunction(
+					    name, arguments, LogicalType(LogicalTypeId::INVALID), static_cast<aggregate_size_t>(nullptr),
+					    static_cast<aggregate_initialize_t>(nullptr), static_cast<aggregate_update_t>(nullptr),
+					    static_cast<aggregate_combine_t>(nullptr), static_cast<aggregate_finalize_t>(nullptr),
+					    FunctionNullHandling::DEFAULT_NULL_HANDLING);
+					placeholder.serialize = ExportStateAggregateSerialize;
+					placeholder.deserialize = ExportStateAggregateDeserialize;
+					return placeholder;
+				}
+				if (is_merge_state) {
+					auto placeholder = AggregateFunction(
+					    name, arguments, LogicalType(LogicalTypeId::INVALID), static_cast<aggregate_size_t>(nullptr),
+					    static_cast<aggregate_initialize_t>(nullptr), static_cast<aggregate_update_t>(nullptr),
+					    static_cast<aggregate_combine_t>(nullptr), static_cast<aggregate_finalize_t>(nullptr),
+					    FunctionNullHandling::DEFAULT_NULL_HANDLING);
+					placeholder.serialize = distributed::MergeAggregateSerialize;
+					placeholder.deserialize = distributed::MergeAggregateDeserialize;
+					return placeholder;
+				}
+			}
+			return DeserializeFunction<FUNC, CATALOG_ENTRY>(context, catalog_type, catalog_name, schema_name, name,
+			                                                arguments, original_arguments);
+		}();
 		if (has_serialize) {
 			function.arguments = std::move(arguments);
 			function.original_arguments = std::move(original_arguments);

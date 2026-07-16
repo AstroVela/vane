@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/enums/optimizer_type.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -23,6 +29,8 @@ static const DefaultOptimizerType internal_optimizer_types[] = {
     {"join_order", OptimizerType::JOIN_ORDER},
     {"deliminator", OptimizerType::DELIMINATOR},
     {"unnest_rewriter", OptimizerType::UNNEST_REWRITER},
+    {"vllm_project", OptimizerType::VLLM_PROJECT},
+    {"udf_project", OptimizerType::UDF_PROJECT},
     {"unused_columns", OptimizerType::UNUSED_COLUMNS},
     {"statistics_propagation", OptimizerType::STATISTICS_PROPAGATION},
     {"common_subexpressions", OptimizerType::COMMON_SUBEXPRESSIONS},

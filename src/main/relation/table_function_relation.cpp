@@ -1,4 +1,16 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/relation/table_function_relation.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/function/function_binder.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
@@ -6,9 +18,13 @@
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 
 namespace duckdb {
@@ -96,6 +112,73 @@ unique_ptr<TableRef> TableFunctionRelation::GetTableRef() {
 	auto function = make_uniq<FunctionExpression>(name, std::move(children));
 	table_function->function = std::move(function);
 	return std::move(table_function);
+}
+
+BoundStatement TableFunctionRelation::Bind(Binder &binder) {
+	if (!input_relation) {
+		return Relation::Bind(binder);
+	}
+
+	auto qualified_name = QualifiedName::Parse(name);
+	auto catalog = qualified_name.catalog;
+	auto schema = qualified_name.schema;
+	auto function_name = qualified_name.name;
+	Binder::BindSchemaOrCatalog(binder.context, catalog, schema);
+
+	QueryErrorContext error_context;
+	EntryLookupInfo table_function_lookup(CatalogType::TABLE_FUNCTION_ENTRY, function_name, error_context);
+	auto &func_catalog =
+	    *binder.GetCatalogEntry(catalog, schema, table_function_lookup, OnEntryNotFound::THROW_EXCEPTION);
+	if (func_catalog.type == CatalogType::TABLE_MACRO_ENTRY) {
+		// Fall back to SQL binding for macros.
+		return Relation::Bind(binder);
+	}
+	D_ASSERT(func_catalog.type == CatalogType::TABLE_FUNCTION_ENTRY);
+	auto &function_entry = func_catalog.Cast<TableFunctionCatalogEntry>();
+
+	auto child_binder = Binder::CreateBinder(binder.context, &binder);
+	child_binder->SetCanContainNulls(true);
+	auto child_bound = input_relation->Bind(*child_binder);
+	binder.MoveCorrelatedExpressionsFrom(*child_binder);
+
+	vector<LogicalType> arguments;
+	vector<Value> bound_parameters;
+	arguments.reserve(parameters.size() + 1);
+	bound_parameters.reserve(parameters.size() + 1);
+	arguments.emplace_back(LogicalTypeId::TABLE);
+	bound_parameters.emplace_back(); // placeholder for table parameter
+
+	for (auto &parameter : parameters) {
+		arguments.emplace_back(parameter.type());
+		bound_parameters.push_back(parameter);
+	}
+
+	auto bound_named_parameters = named_parameters;
+
+	ErrorData error;
+	FunctionBinder function_binder(binder);
+	auto best_function_idx =
+	    function_binder.BindFunction(function_entry.name, function_entry.functions, arguments, error);
+	if (!best_function_idx.IsValid()) {
+		error.Throw();
+	}
+	auto table_function = function_entry.functions.GetFunctionByOffset(best_function_idx.GetIndex());
+
+	Binder::BindNamedParameters(table_function.named_parameters, bound_named_parameters, error_context,
+	                            table_function.name);
+
+	for (idx_t i = 0; i < arguments.size(); i++) {
+		auto target_type = i < table_function.arguments.size() ? table_function.arguments[i] : table_function.varargs;
+		if (target_type != LogicalType::ANY && target_type != LogicalType::POINTER &&
+		    target_type.id() != LogicalTypeId::LIST && target_type.id() != LogicalTypeId::TABLE) {
+			bound_parameters[i] = bound_parameters[i].CastAs(binder.context, target_type);
+		}
+	}
+
+	TableFunctionRef ref;
+	ref.alias = name;
+	return binder.BindTableFunctionWithInput(table_function, ref, std::move(bound_parameters),
+	                                         std::move(bound_named_parameters), child_bound);
 }
 
 string TableFunctionRelation::GetAlias() {

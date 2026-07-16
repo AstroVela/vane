@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 
 #include "duckdb/common/file_opener.hpp"
@@ -7,12 +13,23 @@
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
 #include "duckdb/main/settings.hpp"
 
 #include <algorithm>
 
 namespace duckdb {
+
+static void EnsureCopyOutputParentExists(FileSystem &fs, const string &path) {
+	auto parent_dir = StringUtil::GetFilePath(path);
+	if (parent_dir.empty()) {
+		return;
+	}
+	if (!fs.DirectoryExists(parent_dir)) {
+		fs.CreateDirectoriesRecursive(parent_dir);
+	}
+}
 
 struct PartitionWriteInfo {
 	unique_ptr<GlobalFunctionData> global_state;
@@ -87,6 +104,8 @@ public:
 		}
 		// initialize writing to the file
 		created_files.push_back(op.file_path);
+		auto &fs = FileSystem::GetFileSystem(context);
+		EnsureCopyOutputParentExists(fs, op.file_path);
 		global_state = op.function.copy_to_initialize_global(context, *op.bind_data, op.file_path);
 		if (op.function.initialize_operator) {
 			op.function.initialize_operator(*global_state, op);
@@ -385,6 +404,7 @@ unique_ptr<GlobalFunctionData> PhysicalCopyToFile::CreateFileState(ClientContext
 	idx_t this_file_offset = g.last_file_offset++;
 	auto &fs = FileSystem::GetFileSystem(context);
 	string output_path(filename_pattern.CreateFilename(fs, file_path, file_extension, this_file_offset));
+	EnsureCopyOutputParentExists(fs, output_path);
 	g.created_files.push_back(output_path);
 	optional_ptr<CopyToFileInfo> written_file_info;
 	if (return_type != CopyFunctionReturnType::CHANGED_ROWS) {
@@ -514,6 +534,36 @@ PhysicalCopyToFile::PhysicalCopyToFile(PhysicalPlan &physical_plan, vector<Logic
                                        unique_ptr<FunctionData> bind_data, idx_t estimated_cardinality)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::COPY_TO_FILE, std::move(types), estimated_cardinality),
       function(std::move(function_p)), bind_data(std::move(bind_data)), parallel(false) {
+}
+
+void PhysicalCopyToFile::SerializeOperatorData(Serializer &serializer) const {
+	D_ASSERT(!function.name.empty());
+	serializer.WriteProperty(500, "name", function.name);
+	serializer.WritePropertyWithDefault<string>(505, "catalog_name", function.catalog_name, "");
+	serializer.WritePropertyWithDefault<string>(506, "schema_name", function.schema_name, "");
+	const bool has_serialize = function.serialize;
+	serializer.WriteProperty(503, "has_serialize", has_serialize);
+	if (has_serialize) {
+		serializer.WriteObject(504, "function_data",
+		                       [&](Serializer &obj) { function.serialize(obj, *bind_data, function); });
+	}
+	serializer.WriteProperty(200, "file_path", file_path);
+	serializer.WriteProperty(201, "use_tmp_file", use_tmp_file);
+	serializer.WriteProperty(202, "filename_pattern", filename_pattern);
+	serializer.WriteProperty(203, "file_extension", file_extension);
+	serializer.WriteProperty(204, "overwrite_mode", overwrite_mode);
+	serializer.WriteProperty(205, "parallel", parallel);
+	serializer.WriteProperty(206, "per_thread_output", per_thread_output);
+	serializer.WriteProperty(207, "file_size_bytes", file_size_bytes);
+	serializer.WriteProperty(208, "rotate", rotate);
+	serializer.WriteProperty(209, "return_type", return_type);
+	serializer.WriteProperty(210, "partition_output", partition_output);
+	serializer.WriteProperty(211, "write_partition_columns", write_partition_columns);
+	serializer.WriteProperty(212, "write_empty_file", write_empty_file);
+	serializer.WriteProperty(213, "hive_file_pattern", hive_file_pattern);
+	serializer.WriteProperty(214, "partition_columns", partition_columns);
+	serializer.WriteProperty(215, "names", names);
+	serializer.WriteProperty(216, "expected_types", expected_types);
 }
 
 void PhysicalCopyToFile::WriteRotateInternal(ExecutionContext &context, GlobalSinkState &global_state,

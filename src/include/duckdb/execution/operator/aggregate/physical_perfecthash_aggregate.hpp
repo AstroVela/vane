@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -25,6 +31,9 @@ public:
 	                             vector<unique_ptr<Expression>> aggregates, vector<unique_ptr<Expression>> groups,
 	                             const vector<unique_ptr<BaseStatistics>> &group_stats, vector<idx_t> required_bits,
 	                             idx_t estimated_cardinality);
+	PhysicalPerfectHashAggregate(PhysicalPlan &physical_plan, ClientContext &context, vector<LogicalType> types,
+	                             vector<unique_ptr<Expression>> aggregates, vector<unique_ptr<Expression>> groups,
+	                             vector<Value> group_minima, vector<idx_t> required_bits, idx_t estimated_cardinality);
 
 	//! The groups
 	vector<unique_ptr<Expression>> groups;
@@ -82,6 +91,12 @@ public:
 	vector<idx_t> required_bits;
 
 	unordered_map<Expression *, size_t> filter_indexes;
+
+protected:
+	void SerializeOperatorData(Serializer &serializer) const override;
+
+private:
+	void Initialize(ClientContext &context);
 };
 
 } // namespace duckdb

@@ -1,6 +1,16 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+#
+# SPDX-FileCopyrightText: 2026 Vane contributors
+#
+# SPDX-License-Identifier: MIT
+#
+# Modified by Vane contributors.
+
 include_directories(../third_party/catch)
 include_directories(../third_party/sqlite/include)
 include_directories(include)
+include_directories(../src)
+include_directories(../src/execution/distributed)
 
 # Allows loading tests from registered extensions
 include_directories("${PROJECT_BINARY_DIR}/codegen/include/")
@@ -25,6 +35,12 @@ if(${ENABLE_UNITTEST_CPP_TESTS})
   add_subdirectory(ossfuzz)
   add_subdirectory(mbedtls)
   add_subdirectory(encryption)
+  add_subdirectory(execution)
+
+  # Ensure unittest target uses the repository C++ standard.
+  if(TARGET unittest)
+    target_compile_features(unittest PRIVATE cxx_std_11)
+  endif()
 endif()
 add_subdirectory(extension)
 add_subdirectory(helpers)
@@ -48,6 +64,7 @@ else()
 endif()
 
 add_executable(unittest unittest.cpp ${ALL_OBJECT_FILES})
+target_compile_features(unittest PRIVATE cxx_std_11)
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   target_compile_options(unittest PRIVATE -Wno-error=maybe-uninitialized)
@@ -56,3 +73,6 @@ endif()
 target_link_libraries(unittest duckdb_static test_helpers)
 
 link_extension_libraries(unittest "")
+
+# Streaming AI inference tests
+add_subdirectory(streaming)

@@ -1,4 +1,11 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/csv_scanner/scanner_boundary.hpp"
+#include "duckdb/execution/distributed/common_types.hpp"
 
 namespace duckdb {
 
@@ -18,18 +25,12 @@ CSVIterator::CSVIterator() : buffer_size(0), is_set(false) {
 
 void CSVBoundary::Print() const {
 #ifndef DUCKDB_DISABLE_PRINT
-	std::cout << "---Boundary: " << boundary_idx << " ---" << '\n';
-	std::cout << "Buffer Index: " << buffer_idx << '\n';
-	std::cout << "Buffer Pos: " << buffer_pos << '\n';
-	std::cout << "End Pos: " << end_pos << '\n';
-	std::cout << "------------" << end_pos << '\n';
 #endif
 }
 
 void CSVIterator::Print() const {
 #ifndef DUCKDB_DISABLE_PRINT
 	boundary.Print();
-	std::cout << "Is set: " << is_set << '\n';
 #endif
 }
 

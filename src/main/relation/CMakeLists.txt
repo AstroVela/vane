@@ -1,3 +1,11 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+#
+# SPDX-FileCopyrightText: 2026 Vane contributors
+#
+# SPDX-License-Identifier: MIT
+#
+# Modified by Vane contributors.
+
 add_library_unity(
   duckdb_main_relation
   OBJECT
@@ -14,6 +22,8 @@ add_library_unity(
   join_relation.cpp
   limit_relation.cpp
   order_relation.cpp
+  repartition_relation.cpp
+  local_exchange_relation.cpp
   update_relation.cpp
   projection_relation.cpp
   query_relation.cpp
@@ -27,7 +37,8 @@ add_library_unity(
   materialized_relation.cpp
   view_relation.cpp
   write_parquet_relation.cpp
-  write_csv_relation.cpp)
+  write_csv_relation.cpp
+  unnest_relation.cpp)
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_main_relation>
     PARENT_SCOPE)

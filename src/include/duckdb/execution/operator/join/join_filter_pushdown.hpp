@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -14,10 +20,12 @@
 
 namespace duckdb {
 class DataChunk;
+class Deserializer;
 class DynamicTableFilterSet;
 class LogicalGet;
 class JoinHashTable;
 class PhysicalComparisonJoin;
+class Serializer;
 struct GlobalUngroupedAggregateState;
 struct LocalUngroupedAggregateState;
 
@@ -75,6 +83,8 @@ public:
 	void Combine(JoinFilterGlobalState &gstate, JoinFilterLocalState &lstate) const;
 	unique_ptr<DataChunk> Finalize(ClientContext &context, optional_ptr<JoinHashTable> ht,
 	                               JoinFilterGlobalState &gstate, const PhysicalComparisonJoin &op) const;
+	void Serialize(Serializer &serializer) const;
+	static unique_ptr<JoinFilterPushdownInfo> Deserialize(Deserializer &deserializer);
 
 	unique_ptr<DataChunk> FinalizeMinMax(JoinFilterGlobalState &gstate) const;
 	unique_ptr<DataChunk> FinalizeFilters(ClientContext &context, optional_ptr<JoinHashTable> ht,

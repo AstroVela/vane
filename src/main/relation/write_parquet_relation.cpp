@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/relation/write_parquet_relation.hpp"
 #include "duckdb/parser/statement/copy_statement.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
@@ -16,7 +22,7 @@ WriteParquetRelation::WriteParquetRelation(shared_ptr<Relation> child_p, string 
 BoundStatement WriteParquetRelation::Bind(Binder &binder) {
 	CopyStatement copy;
 	auto info = make_uniq<CopyInfo>();
-	info->select_statement = child->GetQueryNode();
+	info->select_relation = child;
 	info->is_from = false;
 	info->file_path = parquet_file;
 	info->format = "parquet";

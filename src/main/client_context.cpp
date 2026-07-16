@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/client_context.hpp"
 
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
@@ -816,6 +822,64 @@ unique_ptr<QueryResult> ClientContext::Execute(const string &query, shared_ptr<P
 		return ErrorResult<MaterializedQueryResult>(pending->GetErrorObject());
 	}
 	return pending->ExecuteInternal(*lock);
+}
+
+unique_ptr<PendingQueryResult>
+ClientContext::PendingQueryPreparedStatementNoRebind(const string &query, shared_ptr<PreparedStatementData> &prepared,
+                                                     const PendingQueryParameters &parameters) {
+	auto lock = LockContext();
+	try {
+		InitialCleanup(*lock);
+	} catch (std::exception &ex) {
+		return ErrorResult<PendingQueryResult>(ErrorData(ex), query);
+	}
+
+	auto &profiler = QueryProfiler::Get(*this);
+	profiler.StartQuery(query, false);
+
+	try {
+		BeginQueryInternal(*lock, query);
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		if (Exception::InvalidatesDatabase(error.Type())) {
+			auto &db_instance = DatabaseInstance::GetDatabase(*this);
+			ValidChecker::Invalidate(db_instance, error.RawMessage());
+		}
+		return ErrorResult<PendingQueryResult>(std::move(error), query);
+	}
+
+	bool invalidate_query = true;
+	unique_ptr<PendingQueryResult> pending;
+	try {
+		CheckIfPreparedStatementIsExecutable(*prepared);
+		pending = PendingPreparedStatementInternal(*lock, prepared, parameters);
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		if (!Exception::InvalidatesTransaction(error.Type())) {
+			invalidate_query = false;
+		} else if (Exception::InvalidatesDatabase(error.Type())) {
+			if (!config.query_verification_enabled) {
+				auto &db_instance = DatabaseInstance::GetDatabase(*this);
+				ValidChecker::Invalidate(db_instance, error.RawMessage());
+			}
+		}
+		pending = ErrorResult<PendingQueryResult>(std::move(error), query);
+	}
+
+	if (pending->HasError()) {
+		EndQueryInternal(*lock, false, invalidate_query, pending->GetErrorObject());
+	}
+	return pending;
+}
+
+unique_ptr<QueryResult> ClientContext::ExecutePreparedStatementNoRebind(const string &query,
+                                                                        shared_ptr<PreparedStatementData> &prepared,
+                                                                        const PendingQueryParameters &parameters) {
+	auto pending = PendingQueryPreparedStatementNoRebind(query, prepared, parameters);
+	if (pending->HasError()) {
+		return ErrorResult<MaterializedQueryResult>(pending->GetErrorObject());
+	}
+	return pending->Execute();
 }
 
 unique_ptr<QueryResult> ClientContext::Execute(const string &query, shared_ptr<PreparedStatementData> &prepared,

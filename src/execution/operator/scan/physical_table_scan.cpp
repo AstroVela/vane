@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -8,6 +14,10 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/execution/physical_table_scan_enum.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/execution/dynamic_filter_serialization.hpp"
+#include "duckdb/function/function_serialization.hpp"
 
 #include <utility>
 
@@ -427,6 +437,28 @@ optional_idx PhysicalTableScan::GetRowsScanned(GlobalSourceState &gstate_p, Loca
 		return function.rows_scanned(*gstate.global_state, *state.local_state);
 	}
 	return optional_idx();
+}
+
+void PhysicalTableScan::SerializeOperatorData(Serializer &serializer) const {
+	// TableScan-specific serialization
+	FunctionSerializer::Serialize(serializer, function, bind_data.get());
+	serializer.WriteProperty(200, "returned_types", returned_types);
+	serializer.WriteProperty(201, "column_ids", column_ids);
+	serializer.WriteProperty(202, "projection_ids", projection_ids);
+	serializer.WriteProperty(203, "names", names);
+	serializer.WriteProperty(204, "has_table_filters", table_filters != nullptr);
+	if (table_filters) {
+		serializer.WriteProperty(205, "table_filters", *table_filters);
+	}
+	serializer.WritePropertyWithDefault(206, "extra_info", extra_info, ExtraOperatorInfo {});
+	serializer.WritePropertyWithDefault(207, "parameters", parameters);
+	serializer.WritePropertyWithDefault(208, "virtual_columns", virtual_columns);
+	optional_idx dynamic_filters_id;
+	if (dynamic_filters) {
+		auto &state = serializer.GetSerializationData().GetCustom<DynamicTableFilterSerializationState>();
+		dynamic_filters_id = state.GetId(dynamic_filters);
+	}
+	serializer.WritePropertyWithDefault(209, "dynamic_filters_id", dynamic_filters_id);
 }
 
 } // namespace duckdb

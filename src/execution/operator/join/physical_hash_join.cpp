@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 
 #include "duckdb/common/radix_partitioning.hpp"
@@ -26,6 +32,9 @@
 #include "duckdb/storage/temporary_memory_manager.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/logging/log_manager.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/execution/dynamic_filter_serialization.hpp"
 
 namespace duckdb {
 
@@ -107,6 +116,14 @@ PhysicalHashJoin::PhysicalHashJoin(PhysicalPlan &physical_plan, LogicalOperator 
                                    idx_t estimated_cardinality)
     : PhysicalHashJoin(physical_plan, op, left, right, std::move(cond), join_type, {}, {}, {}, estimated_cardinality,
                        nullptr) {
+}
+
+PhysicalHashJoin::PhysicalHashJoin(PhysicalPlan &physical_plan, LogicalOperator &op, vector<JoinCondition> cond,
+                                   JoinType join_type, vector<LogicalType> delim_types, idx_t estimated_cardinality,
+                                   bool /*skip_child_init*/)
+    : PhysicalComparisonJoin(physical_plan, op, PhysicalOperatorType::HASH_JOIN, std::move(cond), join_type,
+                             estimated_cardinality),
+      delim_types(std::move(delim_types)) {
 }
 
 //===--------------------------------------------------------------------===//
@@ -886,6 +903,55 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::Finalize(ClientContext &context, o
 	return FinalizeFilters(context, ht, op, std::move(final_min_max), false);
 }
 
+void JoinFilterPushdownInfo::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty(100, "join_condition", join_condition);
+	serializer.WriteProperty(101, "min_max_aggregates", min_max_aggregates);
+	serializer.WriteList(102, "probe_info", probe_info.size(), [&](Serializer::List &list, idx_t i) {
+		list.WriteObject([&](Serializer &item_serializer) {
+			vector<ColumnBinding> columns;
+			columns.reserve(probe_info[i].columns.size());
+			for (auto &col : probe_info[i].columns) {
+				columns.push_back(col.probe_column_index);
+			}
+			item_serializer.WriteProperty(1, "columns", columns);
+
+			optional_idx dynamic_filters_id;
+			if (probe_info[i].dynamic_filters) {
+				auto &state = serializer.GetSerializationData().GetCustom<DynamicTableFilterSerializationState>();
+				dynamic_filters_id = state.GetId(probe_info[i].dynamic_filters);
+			}
+			item_serializer.WritePropertyWithDefault(2, "dynamic_filters_id", dynamic_filters_id);
+		});
+	});
+}
+
+unique_ptr<JoinFilterPushdownInfo> JoinFilterPushdownInfo::Deserialize(Deserializer &deserializer) {
+	auto result = make_uniq<JoinFilterPushdownInfo>();
+	result->join_condition = deserializer.ReadPropertyWithDefault<vector<idx_t>>(100, "join_condition");
+	result->min_max_aggregates =
+	    deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(101, "min_max_aggregates");
+
+	deserializer.ReadOptionalList(102, "probe_info", [&](Deserializer::List &list, idx_t /*i*/) {
+		list.ReadObject([&](Deserializer &item_deserializer) {
+			JoinFilterPushdownFilter info;
+			auto columns = item_deserializer.ReadProperty<vector<ColumnBinding>>(1, "columns");
+			info.columns.reserve(columns.size());
+			for (auto &binding : columns) {
+				JoinFilterPushdownColumn col;
+				col.probe_column_index = binding;
+				info.columns.push_back(col);
+			}
+			auto dynamic_filters_id = item_deserializer.ReadPropertyWithDefault<optional_idx>(2, "dynamic_filters_id");
+			if (dynamic_filters_id.IsValid()) {
+				auto &state = deserializer.GetSerializationData().GetCustom<DynamicTableFilterSerializationState>();
+				info.dynamic_filters = state.GetFilters(dynamic_filters_id);
+			}
+			result->probe_info.push_back(std::move(info));
+		});
+	});
+	return result;
+}
+
 SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                             OperatorSinkFinalizeInput &input) const {
 	auto &sink = input.global_state.Cast<HashJoinGlobalSinkState>();
@@ -1090,9 +1156,9 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 		} else {
 			sink.hash_table->Probe(state.scan_structure, state.lhs_join_keys, state.join_key_state, state.probe_state);
 		}
+		state.lhs_output.ReferenceColumns(input, lhs_output_columns.col_idxs);
 	}
 
-	state.lhs_output.ReferenceColumns(input, lhs_output_columns.col_idxs);
 	state.scan_structure.Next(state.lhs_join_keys, state.lhs_output, chunk);
 
 	if (state.scan_structure.PointersExhausted() && chunk.size() == 0) {
@@ -1599,6 +1665,33 @@ InsertionOrderPreservingMap<string> PhysicalHashJoin::ParamsToString() const {
 
 	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;
+}
+
+void PhysicalHashJoin::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "join_type", join_type);
+	serializer.WriteProperty(104, "conditions", conditions);
+	serializer.WriteProperty(105, "condition_types", condition_types);
+	serializer.WriteProperty(106, "payload_col_idxs", payload_columns.col_idxs);
+	serializer.WriteProperty(107, "payload_col_types", payload_columns.col_types);
+	serializer.WriteProperty(108, "lhs_col_idxs", lhs_output_columns.col_idxs);
+	serializer.WriteProperty(109, "lhs_col_types", lhs_output_columns.col_types);
+	serializer.WriteProperty(110, "rhs_col_idxs", rhs_output_columns.col_idxs);
+	serializer.WriteProperty(111, "rhs_col_types", rhs_output_columns.col_types);
+	serializer.WriteProperty(112, "delim_types", delim_types);
+	if (!join_stats.empty()) {
+		serializer.WriteList(113, "join_stats", join_stats.size(), [&](Serializer::List &list, idx_t i) {
+			list.WriteObject([&](Serializer &item_serializer) {
+				auto has_stats = join_stats[i] != nullptr;
+				item_serializer.WriteProperty(0, "has_stats", has_stats);
+				if (!has_stats) {
+					return;
+				}
+				item_serializer.WriteProperty(1, "type", join_stats[i]->GetType());
+				item_serializer.WriteProperty(2, "stats", *join_stats[i]);
+			});
+		});
+	}
+	serializer.WritePropertyWithDefault(114, "filter_pushdown", filter_pushdown);
 }
 
 } // namespace duckdb

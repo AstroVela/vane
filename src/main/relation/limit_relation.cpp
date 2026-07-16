@@ -1,8 +1,16 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/relation/limit_relation.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/common/to_string.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
 
 namespace duckdb {
 
@@ -41,6 +49,25 @@ string LimitRelation::ToString(idx_t depth) {
 	}
 	str += "\n";
 	return str + child->ToString(depth + 1);
+}
+
+BoundStatement LimitRelation::Bind(Binder &binder) {
+	// Bind child directly (NOT through the SQL GetQueryNode() round-trip)
+	// to preserve non-SQL-representable child nodes like LocalExchangeRelation.
+	auto child_bound = child->Bind(binder);
+
+	BoundLimitNode limit_val_bound;
+	BoundLimitNode offset_val_bound;
+	if (limit >= 0) {
+		limit_val_bound = BoundLimitNode::ConstantValue(limit);
+	}
+	if (offset > 0) {
+		offset_val_bound = BoundLimitNode::ConstantValue(offset);
+	}
+	auto limit_node = make_uniq<LogicalLimit>(std::move(limit_val_bound), std::move(offset_val_bound));
+	limit_node->AddChild(std::move(child_bound.plan));
+	child_bound.plan = std::move(limit_node);
+	return child_bound;
 }
 
 } // namespace duckdb

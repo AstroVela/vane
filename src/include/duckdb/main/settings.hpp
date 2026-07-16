@@ -1073,6 +1073,48 @@ struct LateMaterializationMaxRowsSetting {
 	static constexpr idx_t SettingIndex = 63;
 };
 
+struct LocalExchangeBufferBytesSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "local_exchange_buffer_bytes";
+	static constexpr const char *Description = "Maximum bytes to buffer in local exchange (e.g. 512MB).";
+	static constexpr const char *InputType = "VARCHAR";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct LocalExchangeDefaultPartitionsSetting {
+	using RETURN_TYPE = int64_t;
+	static constexpr const char *Name = "local_exchange_default_partitions";
+	static constexpr const char *Description =
+	    "Default number of partitions for local exchange (0 uses min(threads, 32)).";
+	static constexpr const char *InputType = "BIGINT";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct LocalExchangeMaxPartitionsSetting {
+	using RETURN_TYPE = int64_t;
+	static constexpr const char *Name = "local_exchange_max_partitions";
+	static constexpr const char *Description = "Maximum number of partitions for local exchange (0 uses threads*2).";
+	static constexpr const char *InputType = "BIGINT";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct LocalExchangeStreamingSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "local_exchange_streaming";
+	static constexpr const char *Description =
+	    "Enable streaming local exchange (allow upstream/downstream pipelines to run concurrently).";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct LockConfigurationSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "lock_configuration";
@@ -1325,7 +1367,7 @@ struct PreserveInsertionOrderSetting {
 	    "Whether or not to preserve insertion order. If set to false the system is allowed to re-order any results "
 	    "that do not contain ORDER BY clauses.";
 	static constexpr const char *InputType = "BOOLEAN";
-	static constexpr const char *DefaultValue = "true";
+	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
 	static constexpr idx_t SettingIndex = 82;
 };

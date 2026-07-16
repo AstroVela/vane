@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -71,6 +77,20 @@ struct SerializationData {
 	}
 
 	template <typename T>
+	typename std::enable_if<std::is_base_of<CustomData, T>::value, optional_ptr<T>>::type TryGetCustom() const {
+		std::string type = T::GetType();
+		auto iter = customs.find(type);
+		if (iter == customs.end()) {
+			return nullptr;
+		}
+		auto &stack = iter->second;
+		if (stack.empty()) {
+			return nullptr;
+		}
+		return optional_ptr<T>(dynamic_cast<T &>(stack.top().get()));
+	}
+
+	template <typename T>
 	typename std::enable_if<std::is_base_of<CustomData, T>::value, void>::type SetCustom(T &data) {
 		std::string type = T::GetType();
 		auto iter = customs.find(type);
@@ -79,6 +99,20 @@ struct SerializationData {
 		}
 		auto &stack = iter->second;
 		stack.push(data);
+	}
+
+	template <typename T>
+	typename std::enable_if<std::is_base_of<CustomData, T>::value, void>::type UnsetCustom() {
+		std::string type = T::GetType();
+		auto iter = customs.find(type);
+		if (iter == customs.end()) {
+			throw duckdb::InternalException("SerializationData - no stack for %s", type);
+		}
+		auto &stack = iter->second;
+		if (stack.empty()) {
+			throw duckdb::InternalException("SerializationData - unexpected empty stack for %s", type);
+		}
+		stack.pop();
 	}
 };
 

@@ -1,9 +1,16 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -16,6 +23,99 @@
 #include "duckdb/main/settings.hpp"
 
 namespace duckdb {
+
+static optional_ptr<RegisteredUDFFunctionInfo>
+GetRegisteredUDFInfoForNamedArguments(ScalarFunctionCatalogEntry &function_entry) {
+	optional_ptr<RegisteredUDFFunctionInfo> result;
+	for (auto &function : function_entry.functions.functions) {
+		auto info = dynamic_cast<RegisteredUDFFunctionInfo *>(function.function_info.get());
+		if (!info) {
+			continue;
+		}
+		if (result) {
+			throw InternalException("Registered Vane SQL UDF '%s' has multiple metadata-bearing overloads",
+			                        function_entry.name);
+		}
+		result = info;
+	}
+	return result;
+}
+
+static void NormalizeRegisteredUDFNamedArguments(FunctionExpression &function,
+                                                 ScalarFunctionCatalogEntry &function_entry) {
+	bool has_named_argument = false;
+	for (auto &child : function.children) {
+		if (!child->GetAlias().empty()) {
+			has_named_argument = true;
+			break;
+		}
+	}
+	if (!has_named_argument) {
+		return;
+	}
+
+	auto info = GetRegisteredUDFInfoForNamedArguments(function_entry);
+	if (!info) {
+		return;
+	}
+	if (function_entry.functions.functions.size() != 1) {
+		throw InternalException("Registered Vane SQL UDF '%s' must have exactly one overload for named arguments",
+		                        function.function_name);
+	}
+	if (!info->allow_named_arguments) {
+		throw BinderException(function,
+		                      "Vane scalar SQL UDF '%s' does not accept named arguments; named arguments "
+		                      "are not supported without declared input_names",
+		                      function.function_name);
+	}
+
+	vector<unique_ptr<ParsedExpression>> ordered_arguments(info->input_names.size());
+	idx_t positional_index = 0;
+	bool saw_named_argument = false;
+	for (auto &child : function.children) {
+		auto argument_name = child->GetAlias();
+		if (argument_name.empty()) {
+			if (saw_named_argument) {
+				throw BinderException(function, "Unnamed arguments cannot follow named arguments for Vane SQL UDF '%s'",
+				                      function.function_name);
+			}
+			if (positional_index >= ordered_arguments.size()) {
+				throw BinderException(function, "Too many arguments for Vane SQL UDF '%s'", function.function_name);
+			}
+			ordered_arguments[positional_index++] = std::move(child);
+			continue;
+		}
+
+		saw_named_argument = true;
+		idx_t target_index = info->input_names.size();
+		for (idx_t i = 0; i < info->input_names.size(); i++) {
+			if (StringUtil::CIEquals(argument_name, info->input_names[i])) {
+				target_index = i;
+				break;
+			}
+		}
+		if (target_index == info->input_names.size()) {
+			throw BinderException(function, "Unknown named argument '%s' for Vane SQL UDF '%s'", argument_name,
+			                      function.function_name);
+		}
+		if (ordered_arguments[target_index]) {
+			throw BinderException(function,
+			                      "Duplicate named argument '%s' for Vane SQL UDF '%s'; it conflicts with an earlier "
+			                      "positional or named argument",
+			                      argument_name, function.function_name);
+		}
+		child->SetAlias(string());
+		ordered_arguments[target_index] = std::move(child);
+	}
+
+	for (idx_t i = 0; i < ordered_arguments.size(); i++) {
+		if (!ordered_arguments[i]) {
+			throw BinderException(function, "Missing required argument '%s' for Vane SQL UDF '%s'",
+			                      info->input_names[i], function.function_name);
+		}
+	}
+	function.children = std::move(ordered_arguments);
+}
 
 BindResult ExpressionBinder::TryBindLambdaOrJson(FunctionExpression &function, idx_t depth, CatalogEntry &func,
                                                  const LambdaSyntaxType syntax_type) {
@@ -171,6 +271,10 @@ BindResult ExpressionBinder::BindExpression(FunctionExpression &function, idx_t 
 }
 
 BindResult ExpressionBinder::BindFunction(FunctionExpression &function, ScalarFunctionCatalogEntry &func, idx_t depth) {
+	// Vane batch UDFs declare a stable SQL name-to-position contract. Normalize the parsed named arguments before
+	// binding their types so heterogeneous signatures resolve against the intended positions.
+	NormalizeRegisteredUDFNamedArguments(function, func);
+
 	// bind the children of the function expression
 	ErrorData error;
 

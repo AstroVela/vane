@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -89,6 +95,8 @@ private:
 
 	//! Intermediate chunks for the operators
 	vector<unique_ptr<DataChunk>> intermediate_chunks;
+	//! Intermediate execution batches for the operators
+	vector<unique_ptr<ExecutionBatch>> intermediate_batches;
 	//! Intermediate states for the operators
 	vector<unique_ptr<OperatorState>> intermediate_states;
 
@@ -101,6 +109,8 @@ private:
 
 	//! The final chunk used for moving data into the sink
 	DataChunk final_chunk;
+	//! The final execution batch used for moving data into the sink
+	ExecutionBatch final_batch;
 
 	//! The operators that are not yet finished executing and have data remaining
 	//! If the stack of in_process_operators is empty, we fetch from the source instead
@@ -121,6 +131,15 @@ private:
 
 	//! This flag is set when the pipeline gets interrupted by the Sink -> the final_chunk should be re-sink-ed.
 	bool remaining_sink_chunk = false;
+	//! Prevents a blocked sink retry from counting the same output batch twice.
+	bool sink_input_counted = false;
+
+	//! This flag is set when a non-sink operator returns BLOCKED.
+	bool blocked_on_operator = false;
+	//! The operator index to resume from when blocked_on_operator is set.
+	idx_t blocked_operator_idx = 0;
+	//! This flag is set when FinalExecute returns BLOCKED during flushing.
+	bool blocked_on_finalize = false;
 
 	//! This flag is set when the pipeline gets interrupted by NextBatch -> NextBatch should be called again and the
 	//! source_chunk should be sent through the pipeline
@@ -130,33 +149,48 @@ private:
 	idx_t flushing_idx;
 	//! Whether the current flushing_idx should be flushed: this needs to be stored to make flushing code re-entrant
 	bool should_flush_current_idx = true;
+	//! Whether this executor should route source/operator/sink calls through ExecutionBatch callbacks
+	bool use_execution_batches = false;
 
 private:
 	void StartOperator(PhysicalOperator &op);
-	void EndOperator(PhysicalOperator &op, optional_ptr<DataChunk> chunk);
+	void EndOperator(PhysicalOperator &op, optional_ptr<DataChunk> chunk,
+	                 optional_ptr<GlobalOperatorState> gstate = nullptr, optional_ptr<OperatorState> state = nullptr);
 
 	//! Reset the operator index to the first operator
-	void GoToSource(idx_t &current_idx, idx_t initial_idx);
+	void GoToSource(idx_t &current_idx, idx_t initial_idx, bool ignore_in_process);
 	SourceResultType FetchFromSource(DataChunk &result);
+	SourceResultType FetchFromSourceBatch(ExecutionBatch &result);
 
 	void FinishProcessing(int32_t operator_idx = -1);
 	bool IsFinished();
 
 	//! Wrappers for sink/source calls to respective operators
 	SourceResultType GetData(DataChunk &chunk, OperatorSourceInput &input);
+	SourceResultType GetDataBatch(ExecutionBatch &batch, OperatorSourceInput &input);
 	SinkResultType Sink(DataChunk &chunk, OperatorSinkInput &input);
+	SinkResultType SinkBatch(ExecutionBatch &batch, OperatorSinkInput &input);
 
-	OperatorResultType ExecutePushInternal(DataChunk &input, ExecutionBudget &chunk_budget, idx_t initial_idx = 0);
+	OperatorResultType ExecutePushInternal(DataChunk &input, ExecutionBudget &chunk_budget, idx_t initial_idx = 0,
+	                                       bool ignore_in_process = false);
+	OperatorResultType ExecutePushInternalBatch(ExecutionBatch &input, ExecutionBudget &chunk_budget,
+	                                            idx_t initial_idx = 0, bool ignore_in_process = false);
 	//! Pushes a chunk through the pipeline and returns a single result chunk
 	//! Returns whether or not a new input chunk is needed, or whether or not we are finished
-	OperatorResultType Execute(DataChunk &input, DataChunk &result, idx_t initial_index = 0);
+	OperatorResultType Execute(DataChunk &input, DataChunk &result, idx_t initial_index = 0,
+	                           bool ignore_in_process = false);
+	OperatorResultType ExecuteBatch(ExecutionBatch &input, ExecutionBatch &result, idx_t initial_index = 0,
+	                                bool ignore_in_process = false);
+	PipelineExecuteResult ExecuteBatches(idx_t max_chunks);
 
 	//! Notifies the sink that a new batch has started
 	SinkNextBatchType NextBatch(DataChunk &source_chunk, const bool have_more_output);
+	SinkNextBatchType NextBatch(ExecutionBatch &source_batch, const bool have_more_output);
 
 	//! Tries to flush all state from intermediate operators. Will return true if all state is flushed, false in the
 	//! case of a blocked sink.
 	bool TryFlushCachingOperators(ExecutionBudget &chunk_budget);
+	bool TryFlushCachingOperatorsBatch(ExecutionBudget &chunk_budget);
 
 	static bool CanCacheType(const LogicalType &type);
 	void CacheChunk(DataChunk &input, idx_t operator_idx);

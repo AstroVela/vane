@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -24,6 +30,8 @@ public:
 public:
 	PhysicalBatchCopyToFile(PhysicalPlan &physical_plan, vector<LogicalType> types, CopyFunction function,
 	                        unique_ptr<FunctionData> bind_data, idx_t estimated_cardinality);
+
+	void SerializeOperatorData(Serializer &serializer) const override;
 
 	CopyFunction function;
 	unique_ptr<FunctionData> bind_data;

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -20,6 +26,10 @@ public:
 
 public:
 	PhysicalRightDelimJoin(PhysicalPlan &physical_plan, PhysicalPlanGenerator &planner, vector<LogicalType> types,
+	                       PhysicalOperator &original_join, PhysicalOperator &distinct,
+	                       const vector<const_reference<PhysicalOperator>> &delim_scans, idx_t estimated_cardinality,
+	                       optional_idx delim_idx);
+	PhysicalRightDelimJoin(PhysicalPlan &physical_plan, DelimJoinDeserializeTag, vector<LogicalType> types,
 	                       PhysicalOperator &original_join, PhysicalOperator &distinct,
 	                       const vector<const_reference<PhysicalOperator>> &delim_scans, idx_t estimated_cardinality,
 	                       optional_idx delim_idx);

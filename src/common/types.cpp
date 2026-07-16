@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/types.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -386,6 +392,68 @@ static string TypeModifierListToString(const vector<LogicalTypeModifier> &mod_li
 	}
 	result += ")";
 	return result;
+}
+
+static string TensorShapeLabel(const vector<idx_t> &shape) {
+	string result = "[";
+	for (idx_t i = 0; i < shape.size(); i++) {
+		result += to_string(shape[i]);
+		if (i + 1 < shape.size()) {
+			result += ", ";
+		}
+	}
+	result += "]";
+	return result;
+}
+
+static Value TensorShapeValue(const vector<idx_t> &shape) {
+	vector<Value> shape_values;
+	shape_values.reserve(shape.size());
+	for (auto dim : shape) {
+		shape_values.emplace_back(Value::BIGINT(NumericCast<int64_t>(dim)));
+	}
+	return Value::LIST(LogicalType::BIGINT, std::move(shape_values));
+}
+
+static vector<idx_t> ParseTensorShapeValue(const Value &shape_value) {
+	if (shape_value.IsNull() || shape_value.type().id() != LogicalTypeId::LIST) {
+		throw InvalidInputException("TENSOR shape metadata must be a LIST<BIGINT>");
+	}
+	vector<idx_t> shape;
+	auto &children = ListValue::GetChildren(shape_value);
+	shape.reserve(children.size());
+	for (auto &child : children) {
+		auto dim = child.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+		if (dim <= 0) {
+			throw InvalidInputException("TENSOR shape dimensions must be positive, got %lld", (long long)dim);
+		}
+		shape.push_back(NumericCast<idx_t>(dim));
+	}
+	if (shape.empty()) {
+		throw InvalidInputException("TENSOR shape must contain at least one dimension");
+	}
+	return shape;
+}
+
+static idx_t ComputeTensorFlattenedSize(const vector<idx_t> &shape) {
+	if (shape.empty()) {
+		throw InvalidInputException("TENSOR shape must contain at least one dimension");
+	}
+	idx_t flattened_size = 1;
+	for (auto dim : shape) {
+		if (dim == 0) {
+			throw InvalidInputException("TENSOR shape dimensions must be positive");
+		}
+		if (flattened_size > NumericLimits<idx_t>::Maximum() / dim) {
+			throw InvalidInputException("TENSOR shape is too large");
+		}
+		flattened_size *= dim;
+	}
+	if (flattened_size > NumericLimits<uint32_t>::Maximum()) {
+		throw InvalidInputException("TENSOR flattened size %llu exceeds supported uint32_t backing size",
+		                            (unsigned long long)flattened_size);
+	}
+	return flattened_size;
 }
 
 string LogicalType::ToString() const {
@@ -1821,6 +1889,66 @@ LogicalType LogicalType::ARRAY(const LogicalType &child, optional_idx size) {
 		auto info = make_shared_ptr<ArrayTypeInfo>(child, array_size);
 		return LogicalType(LogicalTypeId::ARRAY, std::move(info));
 	}
+}
+
+LogicalType TensorType::Create(const LogicalType &child_type, const vector<idx_t> &shape) {
+	auto flattened_size = ComputeTensorFlattenedSize(shape);
+	auto info = make_shared_ptr<ArrayTypeInfo>(child_type, NumericCast<uint32_t>(flattened_size));
+	LogicalType tensor_type(LogicalTypeId::ARRAY, std::move(info));
+	tensor_type.SetAlias(TYPE_NAME);
+
+	auto extension_info = make_uniq<ExtensionTypeInfo>();
+	LogicalTypeModifier dtype_modifier(Value(child_type.ToString()));
+	dtype_modifier.label = child_type.ToString();
+	extension_info->modifiers.push_back(std::move(dtype_modifier));
+	LogicalTypeModifier shape_modifier(TensorShapeValue(shape));
+	shape_modifier.label = TensorShapeLabel(shape);
+	extension_info->modifiers.push_back(std::move(shape_modifier));
+	extension_info->properties["dtype"] = Value(child_type.ToString());
+	extension_info->properties["shape"] = TensorShapeValue(shape);
+	tensor_type.SetExtensionInfo(std::move(extension_info));
+	return tensor_type;
+}
+
+bool TensorType::IsTensor(const LogicalType &type) {
+	return type.id() == LogicalTypeId::ARRAY && type.HasAlias() && StringUtil::CIEquals(type.GetAlias(), TYPE_NAME);
+}
+
+bool TensorType::IsFixedShapeTensor(const LogicalType &type) {
+	return IsTensor(type);
+}
+
+const LogicalType &TensorType::GetChildType(const LogicalType &type) {
+	if (!IsTensor(type)) {
+		throw InvalidInputException("Type %s is not a TENSOR", type.ToString());
+	}
+	return ArrayType::GetChildType(type);
+}
+
+vector<idx_t> TensorType::GetShape(const LogicalType &type) {
+	if (!IsTensor(type)) {
+		throw InvalidInputException("Type %s is not a TENSOR", type.ToString());
+	}
+	auto extension_info = type.GetExtensionInfo();
+	if (!extension_info) {
+		throw InvalidInputException("TENSOR type %s is missing extension metadata", type.ToString());
+	}
+	auto entry = extension_info->properties.find("shape");
+	if (entry == extension_info->properties.end()) {
+		throw InvalidInputException("TENSOR type %s is missing shape metadata", type.ToString());
+	}
+	return ParseTensorShapeValue(entry->second);
+}
+
+idx_t TensorType::GetFlattenedSize(const LogicalType &type) {
+	if (!IsTensor(type)) {
+		throw InvalidInputException("Type %s is not a TENSOR", type.ToString());
+	}
+	auto flattened_size = ComputeTensorFlattenedSize(GetShape(type));
+	if (flattened_size != ArrayType::GetSize(type)) {
+		throw InvalidInputException("TENSOR type %s has inconsistent shape metadata", type.ToString());
+	}
+	return flattened_size;
 }
 
 //===--------------------------------------------------------------------===//

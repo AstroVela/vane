@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -47,7 +53,9 @@ enum class OptimizerType : uint32_t {
 	TOP_N_WINDOW_ELIMINATION = 30,
 	COMMON_SUBPLAN = 31,
 	JOIN_ELIMINATION = 32,
-	WINDOW_SELF_JOIN = 33
+	WINDOW_SELF_JOIN = 33,
+	UDF_PROJECT = 34,
+	VLLM_PROJECT = 35
 };
 
 string OptimizerTypeToString(OptimizerType type);

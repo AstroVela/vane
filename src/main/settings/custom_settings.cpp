@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 // This file will not be overwritten. To implement a custom function for
@@ -680,7 +686,7 @@ Value DisabledOptimizersSetting::GetSetting(const ClientContext &context) {
 }
 
 //===----------------------------------------------------------------------===//
-// Duckdb Api
+// DuckDB Api
 //===----------------------------------------------------------------------===//
 void DuckDBAPISetting::OnSet(SettingCallbackInfo &info, Value &input) {
 	if (info.db) {
@@ -1627,6 +1633,70 @@ Value ThreadsSetting::GetSetting(const ClientContext &context) {
 
 //===----------------------------------------------------------------------===//
 // Warnings As Errors
+//===----------------------------------------------------------------------===//
+
+//===----------------------------------------------------------------------===//
+// Local Exchange Settings
+//===----------------------------------------------------------------------===//
+void LocalExchangeDefaultPartitionsSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+	auto new_val = input.GetValue<int64_t>();
+	if (new_val < 0) {
+		throw InvalidInputException("local_exchange_default_partitions must be >= 0");
+	}
+	config.options.local_exchange_default_partitions = NumericCast<idx_t>(new_val);
+}
+
+void LocalExchangeDefaultPartitionsSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	config.options.local_exchange_default_partitions = DBConfigOptions().local_exchange_default_partitions;
+}
+
+Value LocalExchangeDefaultPartitionsSetting::GetSetting(const ClientContext &context) {
+	auto &config = DBConfig::GetConfig(context);
+	return Value::BIGINT(NumericCast<int64_t>(config.options.local_exchange_default_partitions));
+}
+
+void LocalExchangeMaxPartitionsSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+	auto new_val = input.GetValue<int64_t>();
+	if (new_val < 0) {
+		throw InvalidInputException("local_exchange_max_partitions must be >= 0");
+	}
+	config.options.local_exchange_max_partitions = NumericCast<idx_t>(new_val);
+}
+
+void LocalExchangeMaxPartitionsSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	config.options.local_exchange_max_partitions = DBConfigOptions().local_exchange_max_partitions;
+}
+
+Value LocalExchangeMaxPartitionsSetting::GetSetting(const ClientContext &context) {
+	auto &config = DBConfig::GetConfig(context);
+	return Value::BIGINT(NumericCast<int64_t>(config.options.local_exchange_max_partitions));
+}
+
+void LocalExchangeBufferBytesSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+	config.options.local_exchange_buffer_bytes = DBConfig::ParseMemoryLimit(input.ToString());
+}
+
+void LocalExchangeBufferBytesSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	config.options.local_exchange_buffer_bytes = DBConfigOptions().local_exchange_buffer_bytes;
+}
+
+Value LocalExchangeBufferBytesSetting::GetSetting(const ClientContext &context) {
+	auto &config = DBConfig::GetConfig(context);
+	return Value(StringUtil::BytesToHumanReadableString(config.options.local_exchange_buffer_bytes));
+}
+
+void LocalExchangeStreamingSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+	config.options.local_exchange_streaming = input.GetValue<bool>();
+}
+
+void LocalExchangeStreamingSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	config.options.local_exchange_streaming = DBConfigOptions().local_exchange_streaming;
+}
+
+Value LocalExchangeStreamingSetting::GetSetting(const ClientContext &context) {
+	auto &config = DBConfig::GetConfig(context);
+	return Value::BOOLEAN(config.options.local_exchange_streaming);
+}
 //===----------------------------------------------------------------------===//
 
 void WarningsAsErrorsSetting::OnSet(SettingCallbackInfo &info, Value &input) {

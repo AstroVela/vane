@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -34,6 +40,9 @@ public:
 	                 idx_t estimated_cardinality, unique_ptr<JoinFilterPushdownInfo> pushdown_info);
 	PhysicalHashJoin(PhysicalPlan &physical_plan, LogicalOperator &op, PhysicalOperator &left, PhysicalOperator &right,
 	                 vector<JoinCondition> cond, JoinType join_type, idx_t estimated_cardinality);
+	// Deserialization-only constructor: does not attach children or compute column mappings.
+	PhysicalHashJoin(PhysicalPlan &physical_plan, LogicalOperator &op, vector<JoinCondition> cond, JoinType join_type,
+	                 vector<LogicalType> delim_types, idx_t estimated_cardinality, bool skip_child_init);
 
 	//! Initialize HT for this operator
 	unique_ptr<JoinHashTable> InitializeHashTable(ClientContext &context) const;
@@ -56,6 +65,7 @@ public:
 
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
+	void SerializeOperatorData(Serializer &serializer) const override;
 
 public:
 	// Operator Interface

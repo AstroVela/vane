@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/executor.hpp"
 
 #include "duckdb/execution/execution_context.hpp"
@@ -6,6 +12,7 @@
 #include "duckdb/execution/operator/set/physical_cte.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/settings.hpp"
@@ -21,8 +28,46 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 
 namespace duckdb {
+
+namespace {
+
+InsertionOrderPreservingMap<string> ProgressOperatorDetails(const PhysicalOperator &op) {
+	if (op.type == PhysicalOperatorType::STREAMING_UDF || op.type == PhysicalOperatorType::INOUT_FUNCTION) {
+		auto params = op.ParamsToString();
+		InsertionOrderPreservingMap<string> details;
+		auto udf_name = params.find("udf_name");
+		if (udf_name != params.end()) {
+			details["udf_name"] = udf_name->second;
+		}
+		for (const auto &entry : params) {
+			if (StringUtil::StartsWith(entry.first, "udf_")) {
+				details[entry.first] = entry.second;
+			}
+		}
+		return details;
+	}
+	return InsertionOrderPreservingMap<string>();
+}
+
+bool PipelineContributesToProgress(Pipeline &pipeline) {
+	auto source = pipeline.GetSource();
+	if (!source) {
+		return true;
+	}
+	switch (source->type) {
+	case PhysicalOperatorType::RESULT_COLLECTOR:
+	case PhysicalOperatorType::COPY_TO_FILE:
+	case PhysicalOperatorType::BATCH_COPY_TO_FILE:
+		return false;
+	default:
+		return true;
+	}
+}
+
+} // namespace
 
 Executor::Executor(ClientContext &context) : context(context), executor_tasks(0), blocked_thread_time(0) {
 }
@@ -165,6 +210,9 @@ void Executor::SchedulePipeline(const shared_ptr<MetaPipeline> &meta_pipeline, S
 
 	for (auto &pipeline : pipelines) {
 		auto source = pipeline->GetSource();
+		if (!source) {
+			continue;
+		}
 		if (source->type == PhysicalOperatorType::TABLE_SCAN) {
 			auto &table_function = source->Cast<PhysicalTableScan>();
 			if (table_function.function.global_initialization == TableFunctionInitialization::INITIALIZE_ON_SCHEDULE) {
@@ -342,6 +390,7 @@ bool Executor::NextExecutor() {
 		return false;
 	}
 	root_pipelines[root_pipeline_idx]->Reset();
+	root_pipelines[root_pipeline_idx]->ResolveMaxThreads();
 	root_executor = make_uniq<PipelineExecutor>(context, *root_pipelines[root_pipeline_idx]);
 	root_pipeline_idx++;
 	return true;
@@ -376,10 +425,15 @@ void Executor::VerifyPipelines() {
 
 void Executor::Initialize(PhysicalOperator &plan) {
 	Reset();
-	InitializeInternal(plan);
+	InitializeInternal(plan, true);
 }
 
-void Executor::InitializeInternal(PhysicalOperator &plan) {
+void Executor::InitializeProgressTopology(PhysicalOperator &plan) {
+	Reset();
+	InitializeInternal(plan, false);
+}
+
+void Executor::InitializeInternal(PhysicalOperator &plan, bool schedule_events) {
 	auto &scheduler = TaskScheduler::GetScheduler(context);
 	{
 		lock_guard<mutex> elock(executor_lock);
@@ -415,27 +469,43 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 		// collect all pipelines from the root pipelines (recursively) for the progress bar and verify them
 		root_pipeline->GetPipelines(pipelines, true);
 
-		// finally, verify and schedule
+		// Finally, verify and optionally schedule. Progress-topology planning
+		// deliberately stops here: it uses the same MetaPipeline builder as
+		// execution, but creates no events and cannot run operator code.
 		VerifyPipelines();
-		ScheduleEvents(to_schedule);
+		if (schedule_events) {
+			ScheduleEvents(to_schedule);
+		}
 	}
 }
 
 void Executor::CancelTasks() {
 	task.reset();
 	{
-		lock_guard<mutex> elock(executor_lock);
-		// mark the query as cancelled so tasks will early-out
-		cancelled = true;
-		// destroy all pipelines, events and states
-		for (auto &rec_cte_ref : recursive_ctes) {
-			auto &rec_cte = rec_cte_ref.get().Cast<PhysicalRecursiveCTE>();
-			rec_cte.recursive_meta_pipeline.reset();
+		vector<shared_ptr<MetaPipeline>> recursive_pipelines_to_destroy;
+		vector<shared_ptr<Pipeline>> pipelines_to_destroy;
+		vector<shared_ptr<Pipeline>> root_pipelines_to_destroy;
+		unordered_map<Task *, shared_ptr<Task>> tasks_to_destroy;
+		vector<shared_ptr<Event>> events_to_destroy;
+		{
+			lock_guard<mutex> elock(executor_lock);
+			// mark the query as cancelled so tasks will early-out
+			cancelled = true;
+			// Detach pipelines, events and blocked tasks while holding executor_lock,
+			// then destroy them after releasing it. Pipeline state destructors can
+			// synchronously wait on external callbacks that reschedule tasks through
+			// this executor.
+			for (auto &rec_cte_ref : recursive_ctes) {
+				auto &rec_cte = rec_cte_ref.get().Cast<PhysicalRecursiveCTE>();
+				if (rec_cte.recursive_meta_pipeline) {
+					recursive_pipelines_to_destroy.push_back(std::move(rec_cte.recursive_meta_pipeline));
+				}
+			}
+			pipelines_to_destroy = std::move(pipelines);
+			root_pipelines_to_destroy = std::move(root_pipelines);
+			tasks_to_destroy = std::move(to_be_rescheduled_tasks);
+			events_to_destroy = std::move(events);
 		}
-		pipelines.clear();
-		root_pipelines.clear();
-		to_be_rescheduled_tasks.clear();
-		events.clear();
 	}
 	// Take all pending tasks and execute them until they cancel
 	while (executor_tasks > 0) {
@@ -665,9 +735,24 @@ vector<LogicalType> Executor::GetTypes() {
 
 void Executor::PushError(ErrorData exception) {
 	// push the exception onto the stack
-	error_manager.PushError(std::move(exception));
-	// interrupt execution of any other pipelines that belong to this executor
-	context.interrupted = true;
+	// Use try-catch to handle the case where error_manager's mutex has been destroyed
+	// This can happen during cleanup when Executor is being destroyed but TaskScheduler
+	// threads are still running and trying to push errors
+	try {
+		error_manager.PushError(std::move(exception));
+		// interrupt execution of any other pipelines that belong to this executor
+		context.interrupted = true;
+	} catch (const std::system_error &e) {
+		// Mutex has been destroyed or is in an invalid state - this can happen during cleanup
+		// Ignore the error to avoid worker crash, as the Executor is being destroyed anyway
+		// The error code "Invalid argument" (EINVAL) typically indicates the mutex is invalid
+		if (e.code().value() == EINVAL) {
+			// Mutex is invalid - Executor is being destroyed, ignore the error
+			return;
+		}
+		// Re-throw other system errors
+		throw;
+	}
 }
 
 bool Executor::HasError() {
@@ -699,14 +784,57 @@ idx_t Executor::GetPipelinesProgress(ProgressData &progress) { // LCOV_EXCL_STAR
 	progress.total = 0;
 	idx_t count_invalid = 0;
 	for (auto &pipeline : pipelines) {
+		if (!PipelineContributesToProgress(*pipeline)) {
+			continue;
+		}
 		ProgressData p;
 		if (!pipeline->GetProgress(p)) {
 			count_invalid++;
 		} else {
+			p.Normalize(1.0);
 			progress.Add(p);
 		}
 	}
 	return count_invalid;
+} // LCOV_EXCL_STOP
+
+vector<PipelineProgressSnapshot> Executor::GetPipelinesProgressSnapshots() { // LCOV_EXCL_START
+	lock_guard<mutex> elock(executor_lock);
+
+	vector<PipelineProgressSnapshot> result;
+	result.reserve(pipelines.size());
+	for (idx_t pipeline_idx = 0; pipeline_idx < pipelines.size(); pipeline_idx++) {
+		auto &pipeline = *pipelines[pipeline_idx];
+		PipelineProgressSnapshot snapshot;
+		snapshot.pipeline_index = pipeline_idx + 1;
+		snapshot.input_rows = pipeline.input_rows.load();
+		snapshot.input_bytes = pipeline.input_bytes.load();
+		snapshot.output_rows = pipeline.output_rows.load();
+		snapshot.output_bytes = pipeline.output_bytes.load();
+		snapshot.total_pipeline_tasks = pipeline.total_pipeline_tasks.load();
+		auto started_pipeline_tasks =
+		    MinValue<idx_t>(pipeline.started_pipeline_tasks.load(), snapshot.total_pipeline_tasks);
+		snapshot.completed_pipeline_tasks =
+		    MinValue<idx_t>(pipeline.completed_pipeline_tasks.load(), started_pipeline_tasks);
+		snapshot.running_pipeline_tasks = started_pipeline_tasks - snapshot.completed_pipeline_tasks;
+		snapshot.queued_pipeline_tasks = snapshot.total_pipeline_tasks - started_pipeline_tasks;
+		for (auto &op_ref : pipeline.GetOperators()) {
+			auto &op = op_ref.get();
+			snapshot.operators.push_back(EnumUtil::ToString(op.type));
+			auto details = ProgressOperatorDetails(op);
+			if (op.IsSink() && op.IsSource()) {
+				if (&op == pipeline.GetSource().get()) {
+					details["pipeline_role"] = "source";
+				}
+				if (&op == pipeline.GetSink().get()) {
+					details["pipeline_role"] = "sink";
+				}
+			}
+			snapshot.operator_details.push_back(std::move(details));
+		}
+		result.push_back(std::move(snapshot));
+	}
+	return result;
 } // LCOV_EXCL_STOP
 
 bool Executor::HasResultCollector() {

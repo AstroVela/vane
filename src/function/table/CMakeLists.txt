@@ -1,3 +1,11 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+#
+# SPDX-FileCopyrightText: 2026 Vane contributors
+#
+# SPDX-License-Identifier: MIT
+#
+# Modified by Vane contributors.
+
 add_subdirectory(system)
 add_subdirectory(version)
 add_subdirectory(arrow)
@@ -6,6 +14,7 @@ add_library_unity(
   OBJECT
   arrow.cpp
   arrow_conversion.cpp
+  datasource_scan.cpp
   checkpoint.cpp
   direct_file_reader.cpp
   glob.cpp

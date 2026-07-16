@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -156,6 +162,10 @@ public:
 			result->table_columns = names;
 		}
 		result->columns = MultiFileColumnDefinition::ColumnsFromNamesAndTypes(result->names, result->types);
+		virtual_column_map_t virtual_columns;
+		MultiFileReader::GetVirtualColumns(context, result->reader_bind, virtual_columns);
+		result->interface->GetVirtualColumns(context, *result, virtual_columns);
+		result->virtual_columns = std::move(virtual_columns);
 		return std::move(result);
 	}
 

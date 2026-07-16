@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "core_functions/function_list.hpp"
 #include "core_functions/aggregate/algebraic_functions.hpp"
 #include "core_functions/aggregate/distributive_functions.hpp"
@@ -18,6 +24,7 @@
 #include "core_functions/scalar/string_functions.hpp"
 #include "core_functions/scalar/struct_functions.hpp"
 #include "core_functions/scalar/union_functions.hpp"
+#include "duckdb/function/scalar/udf_functions.hpp"
 #include "core_functions/scalar/array_functions.hpp"
 #include "core_functions/scalar/debug_functions.hpp"
 
@@ -415,6 +422,7 @@ static const StaticFunctionDefinition core_functions[] = {
 	DUCKDB_SCALAR_FUNCTION_SET(YearWeekFun),
 	DUCKDB_SCALAR_FUNCTION_SET(BitwiseOrFun),
 	DUCKDB_SCALAR_FUNCTION_SET(BitwiseNotFun),
+	DUCKDB_SCALAR_FUNCTION_SET(UDFFunction),
 	FINAL_FUNCTION
 };
 

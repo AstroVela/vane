@@ -316,6 +316,8 @@ void ExtraOperatorInfo::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty<optional_idx>(101, "total_files", total_files);
 	serializer.WriteProperty<optional_idx>(102, "filtered_files", filtered_files);
 	serializer.WritePropertyWithDefault<unique_ptr<SampleOptions>>(103, "sample_options", sample_options);
+	serializer.WriteProperty<optional_idx>(104, "scan_node_id", scan_node_id);
+	serializer.WriteProperty<optional_idx>(105, "scan_group_id", scan_group_id);
 }
 
 ExtraOperatorInfo ExtraOperatorInfo::Deserialize(Deserializer &deserializer) {
@@ -324,6 +326,8 @@ ExtraOperatorInfo ExtraOperatorInfo::Deserialize(Deserializer &deserializer) {
 	deserializer.ReadProperty<optional_idx>(101, "total_files", result.total_files);
 	deserializer.ReadProperty<optional_idx>(102, "filtered_files", result.filtered_files);
 	deserializer.ReadPropertyWithDefault<unique_ptr<SampleOptions>>(103, "sample_options", result.sample_options);
+	deserializer.ReadPropertyWithDefault<optional_idx>(104, "scan_node_id", result.scan_node_id);
+	deserializer.ReadPropertyWithDefault<optional_idx>(105, "scan_group_id", result.scan_group_id);
 	return result;
 }
 

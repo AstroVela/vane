@@ -1,0 +1,29 @@
+name: Build and Test ray_data_scheduler C++ pybind
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    - name: Install build deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-dev python3-venv python3-pip build-essential
+        python3 -m pip install --upgrade pip
+        python3 -m pip install pybind11
+    - name: Build CMake (pybind) & run pytest
+      run: |
+        mkdir -p duckdb/build
+        cd duckdb/build
+        cmake .. -DBUILD_RAY_DATA_SCHEDULER_PYBIND=ON
+        make -j$(nproc) ray_data_scheduler_cpp || make -j$(nproc) build_ray_data_scheduler_pybind
+        cd ../src/ray_data_scheduler
+        PYTHONPATH=$(pwd)/build/lib.linux-x86_64-3.6:$PYTHONPATH python3 -m pytest -q tests/test_pybind_module.py -q -k "test_simple_scheduler_checkpoint_restore or test_process_map_bundle_native" -s

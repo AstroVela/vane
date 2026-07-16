@@ -1,6 +1,13 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/helper/physical_limit_percent.hpp"
 
 #include "duckdb/common/algorithm.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/operator/helper/physical_limit.hpp"
@@ -162,6 +169,11 @@ SourceResultType PhysicalLimitPercent::GetDataInternal(ExecutionContext &context
 	PhysicalLimit::HandleOffset(chunk, current_offset, 0, limit.GetIndex());
 
 	return SourceResultType::HAVE_MORE_OUTPUT;
+}
+
+void PhysicalLimitPercent::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "limit_val", limit_val);
+	serializer.WriteProperty(104, "offset_val", offset_val);
 }
 
 } // namespace duckdb

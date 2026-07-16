@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -10,6 +16,7 @@
 
 #include "duckdb/common/enums/operator_result_type.hpp"
 #include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/execution/external_block.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/function/function.hpp"
@@ -65,6 +72,14 @@ public:
 
 	virtual idx_t MaxThreads() const {
 		return 1;
+	}
+
+	virtual idx_t MaxThreads(idx_t source_max_threads) {
+		auto max_threads = MaxThreads();
+		return max_threads < source_max_threads ? max_threads : source_max_threads;
+	}
+
+	virtual void PipelineMaxThreadsResolved(idx_t max_threads) {
 	}
 
 	template <class TARGET>
@@ -304,6 +319,11 @@ typedef OperatorResultType (*table_in_out_function_t)(ExecutionContext &context,
                                                       DataChunk &input, DataChunk &output);
 typedef OperatorFinalizeResultType (*table_in_out_function_final_t)(ExecutionContext &context, TableFunctionInput &data,
                                                                     DataChunk &output);
+typedef OperatorResultType (*table_in_out_function_batch_t)(ExecutionContext &context, TableFunctionInput &data,
+                                                            ExecutionBatch &input, ExecutionBatch &output);
+typedef OperatorFinalizeResultType (*table_in_out_function_final_batch_t)(ExecutionContext &context,
+                                                                          TableFunctionInput &data,
+                                                                          ExecutionBatch &output);
 typedef OperatorPartitionData (*table_function_get_partition_data_t)(ClientContext &context,
                                                                      TableFunctionGetPartitionInput &input);
 
@@ -424,6 +444,10 @@ public:
 	table_in_out_function_t in_out_function;
 	//! The table in-out final function (if this is an in-out function)
 	table_in_out_function_final_t in_out_function_final;
+	//! Optional ExecutionBatch-aware in-out function
+	table_in_out_function_batch_t in_out_function_batch;
+	//! Optional ExecutionBatch-aware final in-out function
+	table_in_out_function_final_batch_t in_out_function_final_batch;
 	//! (Optional) statistics function
 	//! Returns the statistics of a specified column
 	table_statistics_t statistics;

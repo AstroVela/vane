@@ -1,8 +1,15 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/common/algorithm.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/operator/aggregate/aggregate_object.hpp"
@@ -24,10 +31,10 @@ namespace duckdb {
 PhysicalUngroupedAggregate::PhysicalUngroupedAggregate(PhysicalPlan &physical_plan, vector<LogicalType> types,
                                                        vector<unique_ptr<Expression>> expressions,
                                                        idx_t estimated_cardinality,
-                                                       TupleDataValidityType distinct_validity)
+                                                       TupleDataValidityType distinct_validity_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::UNGROUPED_AGGREGATE, std::move(types),
                        estimated_cardinality),
-      aggregates(std::move(expressions)) {
+      aggregates(std::move(expressions)), distinct_validity(distinct_validity_p) {
 	distinct_collection_info = DistinctAggregateCollectionInfo::Create(aggregates);
 	if (!distinct_collection_info) {
 		return;
@@ -360,8 +367,20 @@ void LocalUngroupedAggregateState::Sink(DataChunk &payload_chunk, idx_t payload_
 	D_ASSERT(payload_idx + payload_cnt <= payload_chunk.data.size());
 	auto start_of_input = payload_cnt == 0 ? nullptr : &payload_chunk.data[payload_idx];
 	AggregateInputData aggr_input_data(state.bind_data[aggr_idx], allocator);
-	aggregate.function.GetStateSimpleUpdateCallback()(start_of_input, aggr_input_data, payload_cnt,
-	                                                  state.aggregate_data[aggr_idx].get(), payload_chunk.size());
+	if (aggregate.function.HasStateSimpleUpdateCallback()) {
+		aggregate.function.GetStateSimpleUpdateCallback()(start_of_input, aggr_input_data, payload_cnt,
+		                                                  state.aggregate_data[aggr_idx].get(), payload_chunk.size());
+	} else {
+		// Fallback: simple_update is not available (e.g. after deserialization).
+		// Use the regular update function with a constant state vector pointing to our single state.
+		D_ASSERT(aggregate.function.HasStateUpdateCallback());
+		Vector state_vector(LogicalType::POINTER);
+		state_vector.SetVectorType(VectorType::CONSTANT_VECTOR);
+		auto state_ptr = ConstantVector::GetData<data_ptr_t>(state_vector);
+		*state_ptr = state.aggregate_data[aggr_idx].get();
+		aggregate.function.GetStateUpdateCallback()(start_of_input, aggr_input_data, payload_cnt, state_vector,
+		                                            payload_chunk.size());
+	}
 }
 
 //===--------------------------------------------------------------------===//
@@ -684,6 +703,11 @@ InsertionOrderPreservingMap<string> PhysicalUngroupedAggregate::ParamsToString()
 	}
 	result["Aggregates"] = aggregate_info;
 	return result;
+}
+
+void PhysicalUngroupedAggregate::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "aggregates", aggregates);
+	serializer.WriteProperty(104, "distinct_validity", distinct_validity);
 }
 
 } // namespace duckdb

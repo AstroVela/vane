@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/config.hpp"
 
 #include "duckdb/common/cgroups.hpp"
@@ -16,6 +22,7 @@
 #endif
 
 #include <cinttypes>
+#include <cctype>
 #include <cstdio>
 
 namespace duckdb {
@@ -153,6 +160,10 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_SETTING(IntegerDivisionSetting),
     DUCKDB_SETTING_CALLBACK(LambdaSyntaxSetting),
     DUCKDB_SETTING(LateMaterializationMaxRowsSetting),
+    DUCKDB_GLOBAL(LocalExchangeBufferBytesSetting),
+    DUCKDB_GLOBAL(LocalExchangeDefaultPartitionsSetting),
+    DUCKDB_GLOBAL(LocalExchangeMaxPartitionsSetting),
+    DUCKDB_GLOBAL(LocalExchangeStreamingSetting),
     DUCKDB_SETTING(LockConfigurationSetting),
     DUCKDB_SETTING_CALLBACK(LogQueryPathSetting),
     DUCKDB_GLOBAL(LoggingLevel),
@@ -202,12 +213,12 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_SETTING(ZstdMinStringLengthSetting),
     FINAL_SETTING};
 
-static const ConfigurationAlias setting_aliases[] = {DUCKDB_SETTING_ALIAS("memory_limit", 96),
+static const ConfigurationAlias setting_aliases[] = {DUCKDB_SETTING_ALIAS("memory_limit", 100),
                                                      DUCKDB_SETTING_ALIAS("null_order", 40),
-                                                     DUCKDB_SETTING_ALIAS("profiling_output", 115),
-                                                     DUCKDB_SETTING_ALIAS("user", 130),
+                                                     DUCKDB_SETTING_ALIAS("profiling_output", 119),
+                                                     DUCKDB_SETTING_ALIAS("user", 134),
                                                      DUCKDB_SETTING_ALIAS("wal_autocheckpoint", 23),
-                                                     DUCKDB_SETTING_ALIAS("worker_threads", 129),
+                                                     DUCKDB_SETTING_ALIAS("worker_threads", 133),
                                                      FINAL_ALIAS};
 
 vector<ConfigurationOption> DBConfig::GetOptions() {
@@ -378,6 +389,128 @@ void DBConfig::ResetGenericOption(idx_t setting_index) {
 	user_settings.ClearSetting(setting_index);
 }
 
+static vector<string> SplitSerializedTypeArguments(const string &input, const string &full_type) {
+	vector<string> result;
+	string current;
+	idx_t parenthesis_depth = 0;
+	idx_t bracket_depth = 0;
+	char quote = '\0';
+
+	for (idx_t i = 0; i < input.size(); i++) {
+		auto ch = input[i];
+		if (quote != '\0') {
+			current += ch;
+			if (ch == quote) {
+				// SQL identifiers and string literals escape their quote by doubling it.
+				if (i + 1 < input.size() && input[i + 1] == quote) {
+					current += input[++i];
+				} else {
+					quote = '\0';
+				}
+			}
+			continue;
+		}
+
+		if (ch == '"' || ch == '\'') {
+			quote = ch;
+			current += ch;
+			continue;
+		}
+		switch (ch) {
+		case '(':
+			parenthesis_depth++;
+			break;
+		case ')':
+			if (parenthesis_depth == 0) {
+				throw InternalException("Ill formatted type: '%s'", full_type);
+			}
+			parenthesis_depth--;
+			break;
+		case '[':
+			bracket_depth++;
+			break;
+		case ']':
+			if (bracket_depth == 0) {
+				throw InternalException("Ill formatted type: '%s'", full_type);
+			}
+			bracket_depth--;
+			break;
+		default:
+			break;
+		}
+
+		if (ch == ',' && parenthesis_depth == 0 && bracket_depth == 0) {
+			StringUtil::Trim(current);
+			if (current.empty()) {
+				throw InternalException("Ill formatted type: '%s'", full_type);
+			}
+			result.push_back(std::move(current));
+			current.clear();
+		} else {
+			current += ch;
+		}
+	}
+
+	if (quote != '\0' || parenthesis_depth != 0 || bracket_depth != 0) {
+		throw InternalException("Ill formatted type: '%s'", full_type);
+	}
+	StringUtil::Trim(current);
+	if (!current.empty()) {
+		result.push_back(std::move(current));
+	} else if (!input.empty()) {
+		throw InternalException("Ill formatted type: '%s'", full_type);
+	}
+	return result;
+}
+
+static pair<string, string> ParseSerializedNamedType(const string &input, const string &full_type) {
+	if (input.empty()) {
+		throw InternalException("Ill formatted type: '%s'", full_type);
+	}
+
+	string name;
+	idx_t type_offset = 0;
+	if (input[0] == '"') {
+		bool closed = false;
+		for (idx_t i = 1; i < input.size(); i++) {
+			auto ch = input[i];
+			if (ch != '"') {
+				name += ch;
+				continue;
+			}
+			if (i + 1 < input.size() && input[i + 1] == '"') {
+				name += '"';
+				i++;
+				continue;
+			}
+			closed = true;
+			type_offset = i + 1;
+			break;
+		}
+		if (!closed) {
+			throw InternalException("Ill formatted type: '%s'", full_type);
+		}
+	} else {
+		while (type_offset < input.size() && !std::isspace(static_cast<unsigned char>(input[type_offset]))) {
+			type_offset++;
+		}
+		name = input.substr(0, type_offset);
+	}
+
+	if (name.empty() || type_offset >= input.size() || !std::isspace(static_cast<unsigned char>(input[type_offset]))) {
+		throw InternalException("Ill formatted type: '%s'", full_type);
+	}
+	while (type_offset < input.size() && std::isspace(static_cast<unsigned char>(input[type_offset]))) {
+		type_offset++;
+	}
+	auto value_type = input.substr(type_offset);
+	StringUtil::Trim(value_type);
+	if (value_type.empty()) {
+		throw InternalException("Ill formatted type: '%s'", full_type);
+	}
+	return make_pair(std::move(name), std::move(value_type));
+}
+
 LogicalType DBConfig::ParseLogicalType(const string &type) {
 	if (StringUtil::EndsWith(type, "[]")) {
 		// list - recurse
@@ -405,10 +538,78 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 		return LogicalType::ARRAY(child_type, array_size);
 	}
 
+	auto upper_type = StringUtil::Upper(type);
+	if (StringUtil::StartsWith(upper_type, "TENSOR(") && StringUtil::EndsWith(upper_type, ")")) {
+		string tensor_args = type.substr(7, type.size() - 8);
+		idx_t split_idx = string::npos;
+		idx_t paren_depth = 0;
+		idx_t bracket_depth = 0;
+		for (idx_t i = 0; i < tensor_args.size(); i++) {
+			auto ch = tensor_args[i];
+			switch (ch) {
+			case '(':
+				paren_depth++;
+				break;
+			case ')':
+				if (paren_depth == 0) {
+					throw InternalException("Ill formatted tensor type: '%s'", type);
+				}
+				paren_depth--;
+				break;
+			case '[':
+				bracket_depth++;
+				break;
+			case ']':
+				if (bracket_depth == 0) {
+					throw InternalException("Ill formatted tensor type: '%s'", type);
+				}
+				bracket_depth--;
+				break;
+			case ',':
+				if (paren_depth == 0 && bracket_depth == 0) {
+					split_idx = i;
+					i = tensor_args.size();
+				}
+				break;
+			default:
+				break;
+			}
+		}
+		if (split_idx == string::npos || paren_depth != 0 || bracket_depth != 0) {
+			throw InternalException("Ill formatted tensor type: '%s'", type);
+		}
+
+		auto child_type_str = tensor_args.substr(0, split_idx);
+		auto shape_str = tensor_args.substr(split_idx + 1);
+		StringUtil::Trim(child_type_str);
+		StringUtil::Trim(shape_str);
+		if (child_type_str.empty() || shape_str.size() < 2 || shape_str.front() != '[' || shape_str.back() != ']') {
+			throw InternalException("Ill formatted tensor type: '%s'", type);
+		}
+
+		vector<idx_t> shape;
+		auto dims_str = shape_str.substr(1, shape_str.size() - 2);
+		for (auto &dim_str : StringUtil::Split(dims_str, ',')) {
+			StringUtil::Trim(dim_str);
+			if (dim_str.empty()) {
+				throw InternalException("Ill formatted tensor type: '%s'", type);
+			}
+			idx_t dim = 0;
+			for (auto ch : dim_str) {
+				if (!StringUtil::CharacterIsDigit(ch)) {
+					throw InternalException("Ill formatted tensor type: '%s'", type);
+				}
+				dim = dim * 10 + static_cast<idx_t>(ch - '0');
+			}
+			shape.push_back(dim);
+		}
+		return TensorType::Create(ParseLogicalType(child_type_str), shape);
+	}
+
 	if (StringUtil::StartsWith(type, "MAP(") && StringUtil::EndsWith(type, ")")) {
 		// map - recurse
 		string map_args = type.substr(4, type.size() - 5);
-		vector<string> map_args_vect = StringUtil::SplitWithParentheses(map_args);
+		vector<string> map_args_vect = SplitSerializedTypeArguments(map_args, type);
 		if (map_args_vect.size() != 2) {
 			throw InternalException("Ill formatted map type: '%s'", type);
 		}
@@ -422,18 +623,13 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 	if (StringUtil::StartsWith(type, "UNION(") && StringUtil::EndsWith(type, ")")) {
 		// union - recurse
 		string union_members_str = type.substr(6, type.size() - 7);
-		vector<string> union_members_vect = StringUtil::SplitWithParentheses(union_members_str);
+		vector<string> union_members_vect = SplitSerializedTypeArguments(union_members_str, type);
 		child_list_t<LogicalType> union_members;
 		for (idx_t member_idx = 0; member_idx < union_members_vect.size(); member_idx++) {
 			StringUtil::Trim(union_members_vect[member_idx]);
-			vector<string> union_member_parts = StringUtil::SplitWithParentheses(union_members_vect[member_idx], ' ');
-			if (union_member_parts.size() != 2) {
-				throw InternalException("Ill formatted union type: %s", type);
-			}
-			StringUtil::Trim(union_member_parts[0]);
-			StringUtil::Trim(union_member_parts[1]);
-			auto value_type = ParseLogicalType(union_member_parts[1]);
-			union_members.emplace_back(make_pair(union_member_parts[0], value_type));
+			auto member = ParseSerializedNamedType(union_members_vect[member_idx], type);
+			auto value_type = ParseLogicalType(member.second);
+			union_members.emplace_back(make_pair(std::move(member.first), std::move(value_type)));
 		}
 		if (union_members.empty() || union_members.size() > UnionType::MAX_UNION_MEMBERS) {
 			throw InternalException("Invalid number of union members: '%s'", type);
@@ -444,18 +640,13 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 	if (StringUtil::StartsWith(type, "STRUCT(") && StringUtil::EndsWith(type, ")")) {
 		// struct - recurse
 		string struct_members_str = type.substr(7, type.size() - 8);
-		vector<string> struct_members_vect = StringUtil::SplitWithParentheses(struct_members_str);
+		vector<string> struct_members_vect = SplitSerializedTypeArguments(struct_members_str, type);
 		child_list_t<LogicalType> struct_members;
 		for (idx_t member_idx = 0; member_idx < struct_members_vect.size(); member_idx++) {
 			StringUtil::Trim(struct_members_vect[member_idx]);
-			vector<string> struct_member_parts = StringUtil::SplitWithParentheses(struct_members_vect[member_idx], ' ');
-			if (struct_member_parts.size() != 2) {
-				throw InternalException("Ill formatted struct type: %s", type);
-			}
-			StringUtil::Trim(struct_member_parts[0]);
-			StringUtil::Trim(struct_member_parts[1]);
-			auto value_type = ParseLogicalType(struct_member_parts[1]);
-			struct_members.emplace_back(make_pair(struct_member_parts[0], value_type));
+			auto member = ParseSerializedNamedType(struct_members_vect[member_idx], type);
+			auto value_type = ParseLogicalType(member.second);
+			struct_members.emplace_back(make_pair(std::move(member.first), std::move(value_type)));
 		}
 		return LogicalType::STRUCT(struct_members);
 	}

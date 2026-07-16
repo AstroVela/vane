@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/function/function.hpp"
 
 #include "duckdb/common/string_util.hpp"
@@ -5,10 +11,12 @@
 #include "duckdb/function/built_in_functions.hpp"
 #include "duckdb/function/scalar/string_functions.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/function/table/datasource_scan.hpp"
 #include "duckdb/parser/parsed_data/pragma_info.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/main/extension_entries.hpp"
+#include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 
 namespace duckdb {
 
@@ -98,6 +106,13 @@ void BuiltinFunctions::Initialize() {
 	RegisterReadFunctions();
 	RegisterTableFunctions();
 	RegisterArrowFunctions();
+
+	// Register datasource_scan for parallel Python DataSource scanning.
+	DataSourceScanFunction::RegisterFunction(*this);
+
+	// Register udf as a built-in table function so plan deserialization
+	// can find it when reconstructing PhysicalTableInOutFunction on remote workers.
+	AddFunction(GetUDFBuiltinTableFunction());
 
 	RegisterPragmaFunctions();
 

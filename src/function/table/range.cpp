@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/function/table/range.hpp"
 #include "duckdb/function/table/summary.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -29,6 +35,9 @@ static void GetParameters(int64_t values[], idx_t value_count, hugeint_t &start,
 }
 
 struct RangeFunctionBindData : public TableFunctionData {
+	RangeFunctionBindData() : cardinality(0) {
+	}
+
 	explicit RangeFunctionBindData(const vector<Value> &inputs, bool generate_series) : cardinality(0) {
 		int64_t values[3];
 		for (idx_t i = 0; i < inputs.size(); i++) {
@@ -53,6 +62,12 @@ struct RangeFunctionBindData : public TableFunctionData {
 	}
 
 	idx_t cardinality;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<RangeFunctionBindData>();
+		result->cardinality = cardinality;
+		return std::move(result);
+	}
 };
 
 template <bool GENERATE_SERIES>
@@ -194,6 +209,9 @@ unique_ptr<NodeStatistics> RangeCardinality(ClientContext &context, const Functi
 // Range (timestamp)
 //===--------------------------------------------------------------------===//
 struct RangeDateTimeBindData : public TableFunctionData {
+	RangeDateTimeBindData() : cardinality(0) {
+	}
+
 	explicit RangeDateTimeBindData(const vector<Value> &inputs) : cardinality(0) {
 		timestamp_t bounds[2];
 		interval_t step;
@@ -221,6 +239,12 @@ struct RangeDateTimeBindData : public TableFunctionData {
 	}
 
 	idx_t cardinality;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<RangeDateTimeBindData>();
+		result->cardinality = cardinality;
+		return std::move(result);
+	}
 };
 
 template <bool GENERATE_SERIES>

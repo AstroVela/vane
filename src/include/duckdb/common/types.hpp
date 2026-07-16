@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -528,6 +534,16 @@ struct ArrayType {
 	DUCKDB_API static constexpr idx_t MAX_ARRAY_SIZE = 100000; // 100k for now
 	//! Recursively replace all ARRAY types to LIST types within the given type
 	DUCKDB_API static LogicalType ConvertToList(const LogicalType &type);
+};
+
+struct TensorType {
+	static constexpr const char *TYPE_NAME = "TENSOR";
+	DUCKDB_API static LogicalType Create(const LogicalType &child_type, const vector<idx_t> &shape);
+	DUCKDB_API static bool IsTensor(const LogicalType &type);
+	DUCKDB_API static bool IsFixedShapeTensor(const LogicalType &type);
+	DUCKDB_API static const LogicalType &GetChildType(const LogicalType &type);
+	DUCKDB_API static vector<idx_t> GetShape(const LogicalType &type);
+	DUCKDB_API static idx_t GetFlattenedSize(const LogicalType &type);
 };
 
 struct AggregateStateType {

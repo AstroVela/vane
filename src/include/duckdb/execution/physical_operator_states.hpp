@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -67,6 +73,9 @@ public:
 	virtual idx_t MaxThreads(idx_t source_max_threads) {
 		return source_max_threads;
 	}
+
+	virtual void PipelineMaxThreadsResolved(idx_t max_threads) {
+	}
 };
 
 class GlobalSinkState : public StateWithBlockableTasks {
@@ -91,6 +100,9 @@ public:
 
 	virtual idx_t MaxThreads(idx_t source_max_threads) {
 		return source_max_threads;
+	}
+
+	virtual void PipelineMaxThreadsResolved(idx_t max_threads) {
 	}
 };
 

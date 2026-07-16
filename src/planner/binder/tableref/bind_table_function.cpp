@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
 #include "duckdb/common/algorithm.hpp"
@@ -351,6 +357,33 @@ BoundStatement Binder::BindTableFunction(TableFunction &function, vector<Value> 
 	D_ASSERT(!ref.alias.empty());
 	return BindTableFunctionInternal(function, ref, std::move(parameters), std::move(named_parameters),
 	                                 std::move(input_table_types), std::move(input_table_names));
+}
+
+BoundStatement Binder::BindTableFunctionWithInput(TableFunction &table_function, const TableFunctionRef &ref,
+                                                  vector<Value> parameters, named_parameter_map_t named_parameters,
+                                                  BoundStatement &input) {
+	auto input_table_types = input.types;
+	auto input_table_names = input.names;
+
+	auto bound = BindTableFunctionInternal(table_function, ref, std::move(parameters), std::move(named_parameters),
+	                                       std::move(input_table_types), std::move(input_table_names));
+	if (input.plan) {
+		auto child_node = std::move(input.plan);
+
+		reference<LogicalOperator> node = *bound.plan;
+		while (!node.get().children.empty()) {
+			D_ASSERT(node.get().children.size() == 1);
+			if (node.get().children.size() != 1) {
+				throw InternalException(
+				    "Binder::BindTableFunctionWithInput: linear path expected, but found node with %d children",
+				    node.get().children.size());
+			}
+			node = *node.get().children[0];
+		}
+		D_ASSERT(node.get().type == LogicalOperatorType::LOGICAL_GET);
+		node.get().children.push_back(std::move(child_node));
+	}
+	return bound;
 }
 
 BoundStatement Binder::Bind(TableFunctionRef &ref) {

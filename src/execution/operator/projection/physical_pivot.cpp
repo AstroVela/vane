@@ -1,24 +1,27 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/projection/physical_pivot.hpp"
 
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 
 namespace duckdb {
 
-PhysicalPivot::PhysicalPivot(PhysicalPlan &physical_plan, vector<LogicalType> types_p, PhysicalOperator &child,
-                             BoundPivotInfo bound_pivot_p)
-    : PhysicalOperator(physical_plan, PhysicalOperatorType::PIVOT, std::move(types_p), child.estimated_cardinality),
-      bound_pivot(std::move(bound_pivot_p)) {
-	children.push_back(child);
-	for (idx_t p = 0; p < bound_pivot.pivot_values.size(); p++) {
-		auto entry = pivot_map.find(bound_pivot.pivot_values[p]);
-		if (entry != pivot_map.end()) {
+static void InitializePivotDataForPhysicalPivot(PhysicalPivot &pivot, PhysicalPlan &physical_plan) {
+	for (idx_t p = 0; p < pivot.bound_pivot.pivot_values.size(); p++) {
+		auto entry = pivot.pivot_map.find(pivot.bound_pivot.pivot_values[p]);
+		if (entry != pivot.pivot_map.end()) {
 			continue;
 		}
-		pivot_map[bound_pivot.pivot_values[p]] = bound_pivot.group_count + p;
+		pivot.pivot_map[pivot.bound_pivot.pivot_values[p]] = pivot.bound_pivot.group_count + p;
 	}
 	// extract the empty aggregate expressions
-	for (auto &aggr_expr : bound_pivot.aggregates) {
+	for (auto &aggr_expr : pivot.bound_pivot.aggregates) {
 		auto &aggr = aggr_expr->Cast<BoundAggregateExpression>();
 		// for each aggregate, initialize an empty aggregate state and finalize it immediately
 		auto state = make_unsafe_uniq_array<data_t>(aggr.function.GetStateSizeCallback()(aggr.function));
@@ -27,8 +30,23 @@ PhysicalPivot::PhysicalPivot(PhysicalPlan &physical_plan, vector<LogicalType> ty
 		Vector result_vector(aggr_expr->return_type);
 		AggregateInputData aggr_input_data(aggr.bind_info.get(), physical_plan.ArenaRef());
 		aggr.function.GetStateFinalizeCallback()(state_vector, aggr_input_data, result_vector, 1, 0);
-		empty_aggregates.push_back(result_vector.GetValue(0));
+		pivot.empty_aggregates.push_back(result_vector.GetValue(0));
 	}
+}
+
+PhysicalPivot::PhysicalPivot(PhysicalPlan &physical_plan, vector<LogicalType> types_p, PhysicalOperator &child,
+                             BoundPivotInfo bound_pivot_p)
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::PIVOT, std::move(types_p), child.estimated_cardinality),
+      bound_pivot(std::move(bound_pivot_p)) {
+	children.push_back(child);
+	InitializePivotDataForPhysicalPivot(*this, physical_plan);
+}
+
+PhysicalPivot::PhysicalPivot(PhysicalPlan &physical_plan, vector<LogicalType> types_p, BoundPivotInfo bound_pivot_p,
+                             idx_t estimated_cardinality)
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::PIVOT, std::move(types_p), estimated_cardinality),
+      bound_pivot(std::move(bound_pivot_p)) {
+	InitializePivotDataForPhysicalPivot(*this, physical_plan);
 }
 
 OperatorResultType PhysicalPivot::Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
@@ -79,6 +97,10 @@ OperatorResultType PhysicalPivot::Execute(ExecutionContext &context, DataChunk &
 	}
 	chunk.SetCardinality(input.size());
 	return OperatorResultType::NEED_MORE_INPUT;
+}
+
+void PhysicalPivot::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "bound_pivot", bound_pivot);
 }
 
 } // namespace duckdb

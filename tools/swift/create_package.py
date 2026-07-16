@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT
+#
+# Modified by Vane contributors.
+
 import os
 import sys
 import shutil
@@ -34,7 +40,7 @@ sys.path.append('scripts')
 import package_build
 
 # fresh build - copy over all of the files
-(source_list, include_list, _) = package_build.build_package(src_dir, extensions, 32, src_dir_name)
+source_list, include_list, _ = package_build.build_package(src_dir, extensions, 32, src_dir_name)
 # standardise paths
 source_list = [os.path.relpath(x, target_dir) if os.path.isabs(x) else x for x in source_list]
 include_list = [os.path.join(src_dir_name, x) for x in include_list]

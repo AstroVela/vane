@@ -1,6 +1,30 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
 
+#include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/common/limits.hpp"
+#include "duckdb/function/function_serialization.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
+
 namespace duckdb {
+
+static void ReferenceOrCast(ExecutionContext &context, Vector &target, Vector &source, idx_t position, idx_t count) {
+	if (target.GetType() == source.GetType()) {
+		ConstantVector::Reference(target, source, position, count);
+		return;
+	}
+	// Cast the selected row into the target type, then mark as constant.
+	Vector tmp(source.GetType());
+	ConstantVector::Reference(tmp, source, position, count);
+	target.SetVectorType(VectorType::FLAT_VECTOR);
+	VectorOperations::Cast(context.client, tmp, target, 1);
+	target.SetVectorType(VectorType::CONSTANT_VECTOR);
+}
 
 class TableInOutLocalState : public OperatorState {
 public:
@@ -24,7 +48,13 @@ public:
 		if (!global_state) {
 			return source_max_threads;
 		}
-		return global_state->MaxThreads();
+		return global_state->MaxThreads(source_max_threads);
+	}
+
+	void PipelineMaxThreadsResolved(idx_t max_threads) override {
+		if (global_state) {
+			global_state->PipelineMaxThreadsResolved(max_threads);
+		}
 	}
 
 	unique_ptr<GlobalTableFunctionState> global_state;
@@ -106,7 +136,7 @@ OperatorResultType PhysicalTableInOutFunction::Execute(ExecutionContext &context
 		state.input_chunk.Reset();
 		// set up the input data to the table in-out function
 		for (idx_t col_idx = 0; col_idx < state.input_chunk.ColumnCount(); col_idx++) {
-			ConstantVector::Reference(state.input_chunk.data[col_idx], input.data[col_idx], state.row_index, 1);
+			ReferenceOrCast(context, state.input_chunk.data[col_idx], input.data[col_idx], state.row_index, 1);
 		}
 		state.input_chunk.SetCardinality(1);
 		state.row_index++;
@@ -120,7 +150,7 @@ OperatorResultType PhysicalTableInOutFunction::Execute(ExecutionContext &context
 	for (idx_t project_idx = 0; project_idx < projected_input.size(); project_idx++) {
 		auto source_idx = projected_input[project_idx];
 		auto target_idx = base_idx + project_idx;
-		ConstantVector::Reference(chunk.data[target_idx], input.data[source_idx], state.row_index - 1, 1);
+		ReferenceOrCast(context, chunk.data[target_idx], input.data[source_idx], state.row_index - 1, 1);
 	}
 	auto result = function.in_out_function(context, data, state.input_chunk, chunk);
 	if (this->ordinality_idx.IsValid()) {
@@ -131,11 +161,26 @@ OperatorResultType PhysicalTableInOutFunction::Execute(ExecutionContext &context
 	if (result == OperatorResultType::FINISHED) {
 		return result;
 	}
+	if (result == OperatorResultType::BLOCKED) {
+		return result;
+	}
 	if (result == OperatorResultType::NEED_MORE_INPUT) {
 		// we finished processing this row: move to the next row
 		state.new_row = true;
 	}
 	return OperatorResultType::HAVE_MORE_OUTPUT;
+}
+
+OperatorResultType PhysicalTableInOutFunction::ExecuteBatch(ExecutionContext &context, ExecutionBatch &input,
+                                                            ExecutionBatch &output, GlobalOperatorState &gstate_p,
+                                                            OperatorState &state_p) const {
+	if (!function.in_out_function_batch || !projected_input.empty() || this->ordinality_idx.IsValid()) {
+		return PhysicalOperator::ExecuteBatch(context, input, output, gstate_p, state_p);
+	}
+	auto &gstate = gstate_p.Cast<TableInOutGlobalState>();
+	auto &state = state_p.Cast<TableInOutLocalState>();
+	TableFunctionInput data(bind_data.get(), state.local_state.get(), gstate.global_state.get());
+	return function.in_out_function_batch(context, data, input, output);
 }
 
 InsertionOrderPreservingMap<string> PhysicalTableInOutFunction::ParamsToString() const {
@@ -153,6 +198,26 @@ InsertionOrderPreservingMap<string> PhysicalTableInOutFunction::ParamsToString()
 	return result;
 }
 
+InsertionOrderPreservingMap<string> PhysicalTableInOutFunction::ExtraOperatorParams(GlobalOperatorState &gstate_p,
+                                                                                    OperatorState &state_p) const {
+	if (!function.dynamic_to_string) {
+		return InsertionOrderPreservingMap<string>();
+	}
+	auto &gstate = gstate_p.Cast<TableInOutGlobalState>();
+	auto &state = state_p.Cast<TableInOutLocalState>();
+	TableFunctionDynamicToStringInput input(function, bind_data.get(),
+	                                        state.local_state ? state.local_state.get() : nullptr,
+	                                        gstate.global_state ? gstate.global_state.get() : nullptr);
+	return function.dynamic_to_string(input);
+}
+
+void PhysicalTableInOutFunction::SerializeOperatorData(Serializer &serializer) const {
+	FunctionSerializer::Serialize(serializer, function, bind_data.get());
+	serializer.WriteProperty(200, "column_ids", column_ids);
+	serializer.WriteProperty(201, "projected_input", projected_input);
+	serializer.WritePropertyWithDefault(202, "ordinality_idx", ordinality_idx);
+}
+
 OperatorFinalizeResultType PhysicalTableInOutFunction::FinalExecute(ExecutionContext &context, DataChunk &chunk,
                                                                     GlobalOperatorState &gstate_p,
                                                                     OperatorState &state_p) const {
@@ -162,7 +227,21 @@ OperatorFinalizeResultType PhysicalTableInOutFunction::FinalExecute(ExecutionCon
 		throw InternalException("FinalExecute not supported for project_input");
 	}
 	TableFunctionInput data(bind_data.get(), state.local_state.get(), gstate.global_state.get());
-	return function.in_out_function_final(context, data, chunk);
+	auto result = function.in_out_function_final(context, data, chunk);
+	return result;
+}
+
+OperatorFinalizeResultType PhysicalTableInOutFunction::FinalExecuteBatch(ExecutionContext &context,
+                                                                         ExecutionBatch &batch,
+                                                                         GlobalOperatorState &gstate_p,
+                                                                         OperatorState &state_p) const {
+	if (!function.in_out_function_final_batch || !projected_input.empty() || this->ordinality_idx.IsValid()) {
+		return PhysicalOperator::FinalExecuteBatch(context, batch, gstate_p, state_p);
+	}
+	auto &gstate = gstate_p.Cast<TableInOutGlobalState>();
+	auto &state = state_p.Cast<TableInOutLocalState>();
+	TableFunctionInput data(bind_data.get(), state.local_state.get(), gstate.global_state.get());
+	return function.in_out_function_final_batch(context, data, batch);
 }
 
 } // namespace duckdb

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/enums/logical_operator_type.hpp"
 
 namespace duckdb {
@@ -44,6 +50,14 @@ string LogicalOperatorToString(LogicalOperatorType type) {
 		return "ORDER_BY";
 	case LogicalOperatorType::LOGICAL_TOP_N:
 		return "TOP_N";
+	case LogicalOperatorType::LOGICAL_VLLM_PROJECT:
+		return "VLLM_PROJECT";
+	case LogicalOperatorType::LOGICAL_UDF_PROJECT:
+		return "UDF_PROJECT";
+	case LogicalOperatorType::LOGICAL_REPARTITION:
+		return "REPARTITION";
+	case LogicalOperatorType::LOGICAL_LOCAL_EXCHANGE:
+		return "LOCAL_EXCHANGE";
 	case LogicalOperatorType::LOGICAL_SAMPLE:
 		return "SAMPLE";
 	case LogicalOperatorType::LOGICAL_COPY_TO_FILE:

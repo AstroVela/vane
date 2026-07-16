@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -49,8 +55,8 @@ struct UnifiedVectorFormat {
 		D_ASSERT(StorageTypeCompatible<T>(physical_type));
 #else
 		if (!StorageTypeCompatible<T>(physical_type)) {
-			throw InternalException("Expected unified vector format of type %s, but found type %s", GetTypeId<T>(),
-			                        physical_type);
+			throw InternalException(StringUtil::Format("Expected unified vector format of type %s, but found type %s",
+			                                           GetTypeId<T>(), physical_type));
 		}
 #endif
 	}
@@ -337,8 +343,8 @@ struct ConstantVector {
 		D_ASSERT(StorageTypeCompatible<T>(vector.GetType().InternalType()));
 #else
 		if (!StorageTypeCompatible<T>(vector.GetType().InternalType())) {
-			throw InternalException("Expected vector of type %s, but found vector of type %s", GetTypeId<T>(),
-			                        vector.GetType().InternalType());
+			throw InternalException(StringUtil::Format("Expected vector of type %s, but found vector of type %s",
+			                                           GetTypeId<T>(), vector.GetType().InternalType()));
 		}
 #endif
 	}
@@ -395,7 +401,7 @@ struct DictionaryVector {
 #else
 		if (vector.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
 			throw InternalException(
-			    "Operation requires a dictionary vector but a non-dictionary vector was encountered");
+			    std::string("Operation requires a dictionary vector but a non-dictionary vector was encountered"));
 		}
 #endif
 	}
@@ -447,7 +453,8 @@ struct FlatVector {
 		D_ASSERT(vector.GetVectorType() == VectorType::FLAT_VECTOR);
 #else
 		if (vector.GetVectorType() != VectorType::FLAT_VECTOR) {
-			throw InternalException("Operation requires a flat vector but a non-flat vector was encountered");
+			throw InternalException(
+			    std::string("Operation requires a flat vector but a non-flat vector was encountered"));
 		}
 #endif
 	}

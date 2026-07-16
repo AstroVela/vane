@@ -1,3 +1,11 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+#
+# SPDX-FileCopyrightText: 2026 Vane contributors
+#
+# SPDX-License-Identifier: MIT
+#
+# Modified by Vane contributors.
+
 add_subdirectory(compressed_materialization)
 add_subdirectory(join_order)
 add_subdirectory(matcher)
@@ -41,6 +49,8 @@ add_library_unity(
   topn_window_elimination.cpp
   unnest_rewriter.cpp
   window_self_join.cpp
+  udf_project_rewriter.cpp
+  vllm_project_rewriter.cpp
   sampling_pushdown.cpp
   sum_rewriter.cpp)
 set(ALL_OBJECT_FILES

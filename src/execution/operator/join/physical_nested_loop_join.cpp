@@ -1,9 +1,16 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/nested_loop_join.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/execution/operator/join/outer_join_marker.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 
 namespace duckdb {
 
@@ -26,6 +33,19 @@ PhysicalNestedLoopJoin::PhysicalNestedLoopJoin(PhysicalPlan &physical_plan, Logi
                                                idx_t estimated_cardinality)
     : PhysicalNestedLoopJoin(physical_plan, op, left, right, std::move(cond), join_type, estimated_cardinality,
                              nullptr) {
+}
+
+PhysicalNestedLoopJoin::PhysicalNestedLoopJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op,
+                                               vector<JoinCondition> cond, JoinType join_type,
+                                               idx_t estimated_cardinality, bool /*skip_child_init*/)
+    : PhysicalComparisonJoin(physical_plan, op, PhysicalOperatorType::NESTED_LOOP_JOIN, std::move(cond), join_type,
+                             estimated_cardinality) {
+}
+
+void PhysicalNestedLoopJoin::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "join_type", join_type);
+	serializer.WriteProperty(104, "conditions", conditions);
+	serializer.WritePropertyWithDefault(105, "predicate", predicate);
 }
 
 bool PhysicalJoin::HasNullValues(DataChunk &chunk) {

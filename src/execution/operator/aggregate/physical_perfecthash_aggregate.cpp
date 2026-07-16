@@ -1,9 +1,16 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
 
 #include "duckdb/execution/perfect_aggregate_hashtable.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 
 namespace duckdb {
 
@@ -24,6 +31,24 @@ PhysicalPerfectHashAggregate::PhysicalPerfectHashAggregate(PhysicalPlan &physica
 		D_ASSERT(NumericStats::HasMin(nstats));
 		group_minima.push_back(NumericStats::Min(nstats));
 	}
+	Initialize(context);
+}
+
+PhysicalPerfectHashAggregate::PhysicalPerfectHashAggregate(PhysicalPlan &physical_plan, ClientContext &context,
+                                                           vector<LogicalType> types_p,
+                                                           vector<unique_ptr<Expression>> aggregates_p,
+                                                           vector<unique_ptr<Expression>> groups_p,
+                                                           vector<Value> group_minima_p, vector<idx_t> required_bits_p,
+                                                           idx_t estimated_cardinality)
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::PERFECT_HASH_GROUP_BY, std::move(types_p),
+                       estimated_cardinality),
+      groups(std::move(groups_p)), aggregates(std::move(aggregates_p)), group_minima(std::move(group_minima_p)),
+      required_bits(std::move(required_bits_p)) {
+	D_ASSERT(group_minima.size() == groups.size());
+	Initialize(context);
+}
+
+void PhysicalPerfectHashAggregate::Initialize(ClientContext &context) {
 	for (auto &expr : groups) {
 		group_types.push_back(expr->return_type);
 	}
@@ -226,6 +251,13 @@ InsertionOrderPreservingMap<string> PhysicalPerfectHashAggregate::ParamsToString
 	}
 	result["Aggregates"] = aggregate_info;
 	return result;
+}
+
+void PhysicalPerfectHashAggregate::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "groups", groups);
+	serializer.WriteProperty(104, "aggregates", aggregates);
+	serializer.WriteProperty(105, "group_minima", group_minima);
+	serializer.WriteProperty(106, "required_bits", required_bits);
 }
 
 } // namespace duckdb

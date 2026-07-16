@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -19,6 +25,7 @@
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/execution_context.hpp"
+#include "duckdb/execution/external_block.hpp"
 #include "duckdb/execution/partition_info.hpp"
 #include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/execution/progress_data.hpp"
@@ -33,6 +40,8 @@ class Pipeline;
 class PipelineBuildState;
 class MetaPipeline;
 class PhysicalPlan;
+class Serializer;
+class Deserializer;
 
 enum class OperatorCachingMode : uint8_t { NONE, PARTITIONED, ORDERED, UNORDERED };
 
@@ -72,6 +81,10 @@ public:
 	virtual InsertionOrderPreservingMap<string> ParamsToString() const {
 		return InsertionOrderPreservingMap<string>();
 	}
+	virtual InsertionOrderPreservingMap<string> ExtraOperatorParams(GlobalOperatorState &gstate,
+	                                                                OperatorState &state) const {
+		return InsertionOrderPreservingMap<string>();
+	}
 	static void SetEstimatedCardinality(InsertionOrderPreservingMap<string> &result, idx_t estimated_cardinality);
 	virtual string ToString(ExplainFormat format = ExplainFormat::DEFAULT) const;
 	void Print() const;
@@ -98,8 +111,12 @@ public:
 	virtual unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) const;
 	virtual OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
 	                                   GlobalOperatorState &gstate, OperatorState &state) const;
+	virtual OperatorResultType ExecuteBatch(ExecutionContext &context, ExecutionBatch &input, ExecutionBatch &output,
+	                                        GlobalOperatorState &gstate, OperatorState &state) const;
 	virtual OperatorFinalizeResultType FinalExecute(ExecutionContext &context, DataChunk &chunk,
 	                                                GlobalOperatorState &gstate, OperatorState &state) const;
+	virtual OperatorFinalizeResultType FinalExecuteBatch(ExecutionContext &context, ExecutionBatch &batch,
+	                                                     GlobalOperatorState &gstate, OperatorState &state) const;
 	virtual OperatorFinalResultType OperatorFinalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	                                                 OperatorFinalizeInput &input) const;
 
@@ -132,6 +149,8 @@ protected:
 
 public:
 	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const;
+	virtual SourceResultType GetDataBatch(ExecutionContext &context, ExecutionBatch &batch,
+	                                      OperatorSourceInput &input) const;
 
 	virtual OperatorPartitionData GetPartitionData(ExecutionContext &context, DataChunk &chunk,
 	                                               GlobalSourceState &gstate, LocalSourceState &lstate,
@@ -178,6 +197,7 @@ public:
 	//! CAN be called in parallel, proper locking is needed when accessing dat
 	//! a inside the GlobalSinkState.
 	virtual SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const;
+	virtual SinkResultType SinkBatch(ExecutionContext &context, ExecutionBatch &batch, OperatorSinkInput &input) const;
 	//! The combine is called when a single thread has completed execution of its part of the pipeline, it is the final
 	//! time that a specific LocalSinkState is accessible. This method can be called in parallel while other Sink() or
 	//! Combine() calls are active on the same GlobalSinkState.
@@ -229,10 +249,27 @@ public:
 	virtual void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline);
 
 public:
+	// Serialization interface
+	//! Serialize this operator and all its children recursively
+	void Serialize(Serializer &serializer) const;
+	//! Deserialize an operator tree from a deserializer
+	static unique_ptr<PhysicalOperator> Deserialize(Deserializer &deserializer, PhysicalPlan &physical_plan);
+
+protected:
+	//! Serialize operator-specific data (virtual, must be implemented by each operator)
+	virtual void SerializeOperatorData(Serializer &serializer) const;
+	//! Deserialize operator-specific data and create the operator
+	//! Common fields (type, types, estimated_cardinality) are already read
+	static unique_ptr<PhysicalOperator> DeserializeOperatorData(Deserializer &deserializer, PhysicalPlan &physical_plan,
+	                                                            PhysicalOperatorType op_type, vector<LogicalType> types,
+	                                                            idx_t estimated_cardinality);
+
+public:
 	template <class TARGET>
 	TARGET &Cast() {
 		if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-			throw InternalException("Failed to cast physical operator to type - physical operator type mismatch");
+			throw InternalException(
+			    std::string("Failed to cast physical operator to type - physical operator type mismatch"));
 		}
 		return reinterpret_cast<TARGET &>(*this);
 	}
@@ -240,7 +277,8 @@ public:
 	template <class TARGET>
 	const TARGET &Cast() const {
 		if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-			throw InternalException("Failed to cast physical operator to type - physical operator type mismatch");
+			throw InternalException(
+			    std::string("Failed to cast physical operator to type - physical operator type mismatch"));
 		}
 		return reinterpret_cast<const TARGET &>(*this);
 	}
