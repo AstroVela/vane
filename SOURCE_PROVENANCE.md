@@ -15,16 +15,18 @@ The repository also contains substantial code derived from projects with compati
 
 New Vane source files use an `Apache-2.0` SPDX identifier. Parent-repository files that combine inherited DuckDB or DuckDB Python client source with Vane modifications use `MIT AND Apache-2.0` and retain both copyright notices. New and modified source in `external/duckdb` remains under that repository's MIT license.
 
-Existing third-party headers are preserved. Unchanged upstream source, vendored dependencies, and generated output are not mechanically relabeled. Run `python3 scripts/check_source_license_headers.py` from the parent checkout to validate the applicable files in both repositories.
+Existing third-party headers are preserved. Unchanged upstream source, vendored dependencies, and generated output are not mechanically relabeled. Run `python3 scripts/check_source_license_headers.py` from the repository root to validate the applicable files.
 
-The DuckDB engine fork is pinned by the `external/duckdb` Git submodule. The
-current engine source baseline is commit
+The DuckDB engine fork is imported under `external/duckdb` as a non-squashed
+Git subtree from `https://github.com/AstroVela/duckdb.git`. The original engine
+history and commit IDs remain reachable from the subtree merge's second parent.
+The current imported engine source baseline is commit
 `398033a962719ac09868f4484ec4f97353bb0325`, described as
 `v1.5.0-1-g398033a962`. Source archives do not contain Git metadata, so the
 same description is passed through `OVERRIDE_GIT_DESCRIBE` in
 `pyproject.toml`. A change to the engine source must update both records in the
-same pull request. Release reviews must also record the exact submodule commit
-and inspect changes since the previously released commit.
+same pull request. Release reviews must also record the exact imported DuckDB
+commit and inspect changes since the previously released baseline.
 
 The statically linked DuckDB HTTPFS extension is fetched separately during the
 native build and pinned to commit

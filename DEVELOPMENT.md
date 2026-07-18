@@ -6,15 +6,12 @@ Vane contains Python, pybind11, and a modified DuckDB C++ engine. A native build
 
 - Linux x86-64 for the currently tested path
 - Python 3.10, 3.11, or 3.12; Python 3.12 is recommended and is the primary development version
-- Git with submodule support
+- Git with `git subtree` support
 - A C++17 compiler, CMake 3.29+, Ninja, and ccache
 - vcpkg at the baseline pinned in `vcpkg.json`
 
-Initialize the engine fork:
-
-```bash
-git submodule update --init --recursive
-```
+The DuckDB engine fork is included directly under `external/duckdb`; a normal
+clone contains all source needed for the build.
 
 Bootstrap native dependencies from the repository root:
 
@@ -89,11 +86,30 @@ scripts/format root --changed
 pre-commit run --from-ref origin/main --to-ref HEAD
 ```
 
-The root formatter deliberately excludes `external/duckdb`. Format submodule changes with:
+The root formatter deliberately excludes `external/duckdb`. Format DuckDB subtree changes with:
 
 ```bash
-scripts/format submodule --changed
+scripts/format duckdb --changed
 ```
+
+## Updating the DuckDB subtree
+
+The engine fork is imported from `AstroVela/duckdb` with its original commit
+history. Pull a reviewed fork revision without squashing:
+
+```bash
+git subtree pull --prefix=external/duckdb \
+  https://github.com/AstroVela/duckdb.git main
+```
+
+Do not pass `--squash`: the subtree merge's second parent must remain the exact
+DuckDB commit. Update `SOURCE_PROVENANCE.md` and `OVERRIDE_GIT_DESCRIBE` in
+`pyproject.toml` whenever the imported baseline changes.
+
+Use `git log --first-parent main` for the Vane-only mainline. To inspect the
+preserved engine history, start at the recorded DuckDB SHA; paths in commits
+before the import use their original layout, such as `src/...` rather than
+`external/duckdb/src/...`.
 
 ## Debugging Ray workers
 

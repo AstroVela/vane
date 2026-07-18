@@ -8,7 +8,7 @@ usage() {
   cat <<'EOF'
 Usage:
   scripts/format root [--all|--changed|--staged]
-  scripts/format submodule [--all|--changed]
+  scripts/format duckdb [--all|--changed]
   scripts/format workspace [--all|--changed]
   scripts/format -h|--help
 
@@ -16,7 +16,7 @@ No action is run without a subcommand. With a subcommand, the default file set i
 
 Subcommands:
   root        Format the root repository only. Does not enter external/duckdb.
-  submodule   Format external/duckdb only, using DuckDB's own formatter.
+  duckdb      Format external/duckdb only, using DuckDB's own formatter.
   workspace   Format both root and external/duckdb with their own formatters.
 
 Root repository file sets:
@@ -27,15 +27,15 @@ Root repository file sets:
 Root formatter hooks:
   ruff-format, clang-format, cmake-format, shfmt.
 
-Submodule file sets:
+DuckDB file sets:
   --all       Full external/duckdb formatter pass.
-  --changed   external/duckdb files changed relative to its HEAD. Default.
+  --changed   external/duckdb files changed relative to the monorepo HEAD. Default.
 
 Examples:
   scripts/format root
   scripts/format root --staged
   scripts/format root --all
-  scripts/format submodule
+  scripts/format duckdb
   scripts/format workspace --all
 
 Notes:
@@ -43,7 +43,7 @@ Notes:
   Its formatter is intentionally separate from the root repository formatter.
   workspace runs root and external/duckdb independently, then reports failures.
   root requires pre-commit on PATH.
-  submodule requires black>=24, clang-format 11.0.1, and cmake-format on PATH.
+  duckdb requires black>=24, clang-format 11.0.1, and cmake-format on PATH.
 EOF
 }
 
@@ -67,7 +67,7 @@ case "$1" in
     usage
     exit 0
     ;;
-  root | submodule | workspace)
+  root | duckdb | workspace)
     command_name="$1"
     shift
     ;;
@@ -130,10 +130,10 @@ root_hooks() {
 }
 
 root_changed_files() {
-  git diff --name-only --diff-filter=ACMRT HEAD --
+  git diff --name-only --diff-filter=ACMRT HEAD -- . ':(exclude)external/duckdb/**'
 }
 
-require_submodule_formatters() {
+require_duckdb_formatters() {
   local status=0
   local version
 
@@ -230,61 +230,77 @@ run_root_format_with_verify() {
   fi
 }
 
-run_submodule_format() {
+run_duckdb_format() {
   local duckdb_dir="$repo_root/external/duckdb"
-  local revision_arg=HEAD
+  local temp_dir
 
   if [[ ! -f "$duckdb_dir/scripts/format.py" ]]; then
-    echo "external/duckdb formatter not found. Is the submodule initialized?" >&2
+    echo "external/duckdb formatter not found. Is the DuckDB source present?" >&2
     return 1
   fi
 
-  require_submodule_formatters || return $?
-
-  if [[ "$file_set" == "all" ]]; then
-    revision_arg=--all
-  fi
+  require_duckdb_formatters || return $?
 
   echo "Formatting external/duckdb with DuckDB's own formatter..."
+
+  if [[ "$file_set" == "all" ]]; then
+    (
+      cd "$duckdb_dir" || exit 1
+      python scripts/format.py --all --fix --noconfirm
+    )
+    return $?
+  fi
+
+  # DuckDB's formatter expects paths relative to its source root. Build a
+  # temporary index at the monorepo HEAD and ask git diff to strip the subtree
+  # prefix so both staged and unstaged DuckDB changes are formatted correctly.
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/vane-duckdb-format.XXXXXX")" || return 1
+  if ! GIT_INDEX_FILE="$temp_dir/index" git read-tree HEAD; then
+    rm -rf "$temp_dir"
+    return 1
+  fi
+
   (
+    trap 'rm -rf "$temp_dir"' EXIT
+    export GIT_INDEX_FILE="$temp_dir/index"
     cd "$duckdb_dir" || exit 1
-    python scripts/format.py "$revision_arg" --fix --noconfirm
+    python scripts/format.py --fix --noconfirm -- "--relative=external/duckdb"
   )
 }
 
 run_workspace_format() {
   local root_status=0
-  local submodule_status=0
+  local duckdb_status=0
 
   echo "==> Formatting root repository (--$file_set)"
   run_root_format_with_verify
   root_status=$?
 
   echo "==> Formatting external/duckdb (--$file_set)"
-  run_submodule_format
-  submodule_status=$?
+  run_duckdb_format
+  duckdb_status=$?
 
   if [[ $root_status -ne 0 ]]; then
     echo "Root formatting failed with exit code $root_status." >&2
   fi
 
-  if [[ $submodule_status -ne 0 ]]; then
-    echo "external/duckdb formatting failed with exit code $submodule_status." >&2
+  if [[ $duckdb_status -ne 0 ]]; then
+    echo "external/duckdb formatting failed with exit code $duckdb_status." >&2
   fi
 
   if [[ $root_status -ne 0 ]]; then
     return "$root_status"
   fi
 
-  return "$submodule_status"
+  return "$duckdb_status"
 }
 
 case "$command_name" in
   root)
     run_root_format_with_verify
     ;;
-  submodule)
-    run_submodule_format
+  duckdb)
+    run_duckdb_format
     ;;
   workspace)
     run_workspace_format
