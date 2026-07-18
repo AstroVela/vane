@@ -78,7 +78,7 @@ Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/qui
 ### More Resources
 
 - [Examples](https://vane.astrovela.ai/docs/data/examples)
-- [Production deployment](https://vane.astrovela.ai/docs/data/contributing/development)
+- [Production deployment](https://vane.astrovela.ai/docs/data/deploy/deployment)
 
 ---
 
