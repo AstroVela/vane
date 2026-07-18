@@ -47,7 +47,10 @@ scripts/format root --changed
 scripts/run_release_tests.sh
 ```
 
-C++ changes require an incremental native build. Changes inside `external/duckdb` must be formatted and tested in that repository and submitted as a separate submodule commit. The parent pull request must explain both commits.
+C++ changes require an incremental native build. Changes inside
+`external/duckdb` must use DuckDB's formatter and relevant engine tests. Keep
+engine changes focused within the subtree, and explain any imported baseline or
+Vane-specific engine changes in the pull request.
 
 ## AI-assisted contributions
 

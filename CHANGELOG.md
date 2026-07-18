@@ -13,6 +13,9 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 
 - Positioned the current project as the Vane Data developer preview.
 - Restricted source distributions to the DuckDB components required by Vane.
+- Imported the official DuckDB baseline as a squashed Git subtree and retained
+  Vane engine customizations as monorepo commits, so normal clones no longer
+  require submodule initialization or carry DuckDB's complete commit history.
 
 ### Security
 

@@ -14,7 +14,7 @@ Vane releases are immutable source and binary artifacts derived from a reviewed 
 
 ## Build and inspect
 
-Build from a clean checkout with submodules initialized. Release automation must:
+Build from a clean checkout. The DuckDB source is part of the checkout. Release automation must:
 
 - build the sdist first;
 - validate it with `scripts/check_release_artifacts.py`;

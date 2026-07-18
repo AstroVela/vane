@@ -205,7 +205,7 @@ include = [
     "adbc_driver_duckdb/**",
     "_duckdb-stubs/*.pyi",
 
-    # -------------- DuckDB submodule includes
+    # -------------- DuckDB subtree includes
     # Core DuckDB source and build system
     "external/duckdb/LICENSE",
     "external/duckdb/src/**",

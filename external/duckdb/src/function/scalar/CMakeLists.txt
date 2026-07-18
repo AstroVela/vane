@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+#
+# SPDX-FileCopyrightText: 2026 Vane contributors
+#
+# SPDX-License-Identifier: MIT
+#
+# Modified by Vane contributors.
+
+add_subdirectory(compressed_materialization)
+add_subdirectory(date)
+add_subdirectory(generic)
+add_subdirectory(list)
+add_subdirectory(map)
+add_subdirectory(operator)
+add_subdirectory(sequence)
+add_subdirectory(string)
+add_subdirectory(struct)
+add_subdirectory(variant)
+add_subdirectory(system)
+add_subdirectory(geometry)
+add_library_unity(
+  duckdb_func_scalar
+  OBJECT
+  compressed_materialization_utils.cpp
+  create_sort_key.cpp
+  strftime_format.cpp
+  nested_functions.cpp
+  pragma_functions.cpp
+  udf.cpp
+  vllm.cpp)
+set(ALL_OBJECT_FILES
+    ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_func_scalar>
+    PARENT_SCOPE)

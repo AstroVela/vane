@@ -1,6 +1,8 @@
 # AI Agent Guidelines
 
-Follow the [Development Guide](https://vane.astrovela.ai/docs/data/contributing/development) for the development workflow.
+Follow [DEVELOPMENT.md](DEVELOPMENT.md) for the development workflow. The
+[published Development Guide](https://vane.astrovela.ai/docs/data/contributing/development)
+should mirror that file.
 
 ## Build
 
@@ -16,11 +18,11 @@ uv pip install . --no-build-isolation
 
 ```bash
 scripts/format root --changed
-scripts/format submodule --changed
+scripts/format duckdb --changed
 scripts/format workspace --changed
 ```
 
-Use `root` for the main repository and `submodule` for `external/duckdb`. Use `workspace` only when both contain changes.
+Use `root` for Vane-owned files and `duckdb` for the `external/duckdb` subtree. Use `workspace` only when both contain changes.
 
 ## Tests
 

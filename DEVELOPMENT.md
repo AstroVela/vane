@@ -6,15 +6,12 @@ Vane contains Python, pybind11, and a modified DuckDB C++ engine. A native build
 
 - Linux x86-64 for the currently tested path
 - Python 3.10, 3.11, or 3.12; Python 3.12 is recommended and is the primary development version
-- Git with submodule support
+- Git with `git subtree` support
 - A C++17 compiler, CMake 3.29+, Ninja, and ccache
 - vcpkg at the baseline pinned in `vcpkg.json`
 
-Initialize the engine fork:
-
-```bash
-git submodule update --init --recursive
-```
+The DuckDB engine fork is included directly under `external/duckdb`; a normal
+clone contains all source needed for the build.
 
 Bootstrap native dependencies from the repository root:
 
@@ -89,11 +86,46 @@ scripts/format root --changed
 pre-commit run --from-ref origin/main --to-ref HEAD
 ```
 
-The root formatter deliberately excludes `external/duckdb`. Format submodule changes with:
+The root formatter deliberately excludes `external/duckdb`. Format DuckDB subtree changes with:
 
 ```bash
-scripts/format submodule --changed
+scripts/format duckdb --changed
 ```
+
+## Updating the DuckDB subtree
+
+The official engine baseline is imported from `duckdb/duckdb` as a squashed
+subtree snapshot. Pull a reviewed upstream revision using the same mode:
+
+```bash
+git subtree pull --prefix=external/duckdb --squash \
+  https://github.com/duckdb/duckdb.git main
+```
+
+The subtree metadata records the exact official DuckDB revision in
+`git-subtree-split`. Vane-specific engine changes live as subsequent commits
+under `external/duckdb`; review and resolve them when updating the official
+baseline. When replaying a change formerly maintained in another repository,
+preserve its author and date and record the original commit and upstream parent
+as commit trailers. Update `SOURCE_PROVENANCE.md` and `OVERRIDE_GIT_DESCRIBE` in
+`pyproject.toml` whenever the imported baseline or resulting engine state
+changes.
+
+The original upstream history remains in `duckdb/duckdb`. Vane's path history
+begins at the squashed snapshot and includes every later Vane engine commit. To
+inspect or export that history with DuckDB-rooted paths, split it to a temporary
+branch:
+
+```bash
+git subtree split --prefix=external/duckdb --ignore-joins -b duckdb-history
+git log --stat duckdb-history
+```
+
+`--ignore-joins` produces a self-contained compact history containing the
+official snapshot and Vane's subsequent commits. To reconnect the split branch
+to DuckDB's complete upstream history instead, fetch `duckdb/duckdb` first and
+omit `--ignore-joins`; Git uses the recorded `git-subtree-split` revision as the
+join point.
 
 ## Debugging Ray workers
 

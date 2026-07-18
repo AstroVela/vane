@@ -1,6 +1,0 @@
-[submodule "external/duckdb"]
-	path = external/duckdb
-	url = https://github.com/AstroVela/duckdb.git
-	branch = main
-[submodule]
-	recurse = true
