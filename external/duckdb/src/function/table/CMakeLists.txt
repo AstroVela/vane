@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+#
+# SPDX-FileCopyrightText: 2026 Vane contributors
+#
+# SPDX-License-Identifier: MIT
+#
+# Modified by Vane contributors.
+
+add_subdirectory(system)
+add_subdirectory(version)
+add_subdirectory(arrow)
+add_library_unity(
+  duckdb_func_table
+  OBJECT
+  arrow.cpp
+  arrow_conversion.cpp
+  datasource_scan.cpp
+  checkpoint.cpp
+  direct_file_reader.cpp
+  glob.cpp
+  query_function.cpp
+  range.cpp
+  repeat.cpp
+  repeat_row.cpp
+  copy_csv.cpp
+  read_csv.cpp
+  read_duckdb.cpp
+  sniff_csv.cpp
+  read_file.cpp
+  system_functions.cpp
+  summary.cpp
+  table_scan.cpp
+  unnest.cpp)
+
+set(ALL_OBJECT_FILES
+    ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_func_table>
+    PARENT_SCOPE)
