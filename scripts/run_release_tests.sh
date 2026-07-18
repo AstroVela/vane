@@ -8,6 +8,8 @@ set -euo pipefail
 # Optional provider, benchmark, compatibility, and external-service suites run
 # separately because they need additional dependencies or infrastructure.
 python -m pytest \
+  --import-mode=importlib \
+  -o pythonpath=tests \
   tests/fast/test_package_metadata.py \
   tests/fast/test_transformers_provider_security.py \
   tests/fast/test_vane_config.py \

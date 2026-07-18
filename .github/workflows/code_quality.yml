@@ -107,6 +107,12 @@ jobs:
           head_ref="$(git rev-parse HEAD)"
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             base_ref="$PR_BASE_SHA"
+            pre-commit run \
+              --show-diff-on-failure \
+              --color=always \
+              --from-ref "$base_ref" \
+              --to-ref "$head_ref"
+            exit
           elif [[ -n "$PUSH_BEFORE_SHA" && ! "$PUSH_BEFORE_SHA" =~ ^0+$ ]] && \
                git cat-file -e "$PUSH_BEFORE_SHA^{commit}" 2>/dev/null; then
             base_ref="$PUSH_BEFORE_SHA"
@@ -117,8 +123,18 @@ jobs:
             exit
           fi
 
+          # A force-push can make before and HEAD sibling commits. Compare the
+          # endpoint trees directly so pre-commit does not expand the range
+          # back to their merge base and lint unrelated files.
+          mapfile -d '' changed_files < <(
+            git diff --name-only --diff-filter=ACMRT -z "$base_ref" "$head_ref" --
+          )
+          if ((${#changed_files[@]} == 0)); then
+            echo "No files changed between $base_ref and $head_ref."
+            exit
+          fi
+
           pre-commit run \
             --show-diff-on-failure \
             --color=always \
-            --from-ref "$base_ref" \
-            --to-ref "$head_ref"
+            --files "${changed_files[@]}"

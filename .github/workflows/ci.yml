@@ -120,6 +120,10 @@ jobs:
         run: python -m pip install --force-reinstall dist/*.whl
 
       - name: Verify the base installation Quickstart outside the checkout
+        env:
+          # Keep this distributed smoke test within a standard 16 GB runner.
+          VANE_FTE_TASK_HEAP_BYTES: "1073741824"
+          VANE_UDF_TASK_HEAP_BYTES: "1073741824"
         run: |
           cd "$RUNNER_TEMP"
           env -u VANE_RUNNER python "$GITHUB_WORKSPACE/scripts/verify_base_install.py"
