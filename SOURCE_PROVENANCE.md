@@ -25,17 +25,36 @@ The current official upstream baseline is commit
 `3a3967aa8190d0a2d1931d4ca4f5d920760030b4`.
 
 Vane's engine customizations are retained as normal commits after that subtree
-snapshot. The initial customization commit reproduces the complete diff from
-the former `AstroVela/duckdb` commit
-`398033a962719ac09868f4484ec4f97353bb0325`, whose sole parent is the official
-baseline above. Its Vane commit message records both original revisions, so the
-custom source, authorship, and provenance remain available even if that fork is
-retired. The resulting engine tree is described as `v1.5.0-2-ge2d3989890`.
-Source archives do not contain Git metadata, so the same description is passed
-through `OVERRIDE_GIT_DESCRIBE` in `pyproject.toml`. A change to the engine
-source must update both records in the same pull request. Release reviews must
-record the imported upstream baseline and inspect subsequent Vane engine
-commits since the previously released state.
+snapshot. The former `AstroVela/duckdb` history maps to Vane as follows:
+
+| Former fork commit | Parent | Corresponding Vane commit |
+| --- | --- | --- |
+| `398033a962719ac09868f4484ec4f97353bb0325` | `3a3967aa8190d0a2d1931d4ca4f5d920760030b4` | `57d4e3c166e307c19b28cb1bb2ea7ebd2283a030` |
+| `e2d398989076fa3c6c3859e77310e5e50608b168` | `398033a962719ac09868f4484ec4f97353bb0325` | `74f8d91976c69d8861262944eb61f4b8a05abd42` |
+
+The former fork is not used for builds or engine identity. It must not be
+deleted until a bundle ending at `e2d398989076fa3c6c3859e77310e5e50608b168`
+has been placed in durable storage and its public location and SHA-256 have
+been recorded here.
+
+At Vane commit `74f8d91976c69d8861262944eb61f4b8a05abd42`, the
+DuckDB-rooted subtree history is described as `v1.5.0-2-g55abe0cb9e`. That
+description is passed through `OVERRIDE_GIT_DESCRIBE` in `pyproject.toml` to
+preserve DuckDB's human-readable version line in source archives without Git
+metadata.
+
+The exact engine identity is content-derived instead. `DUCKDB_SOURCE_ID`
+records the full Git tree object for `external/duckdb`, computed with
+`scripts/sync_duckdb_source_id.py`. The top-level CMake build passes that value
+through its first 10 hexadecimal characters as `GIT_COMMIT_HASH` and DuckDB's
+embedded `SourceID`. The tree object depends on engine paths, modes, and
+contents rather than commit topology, so rebases and squash merges do not
+change the SourceID.
+Ordinary engine changes update only `DUCKDB_SOURCE_ID`; changes to the upstream
+baseline, DuckDB version line, or historical mapping must also update this
+document and `OVERRIDE_GIT_DESCRIBE`. Release reviews must record the full tree
+ID and inspect subsequent Vane engine commits since the previously released
+state.
 
 The statically linked DuckDB HTTPFS extension is fetched separately during the
 native build and pinned to commit

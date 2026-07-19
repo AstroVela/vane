@@ -162,6 +162,63 @@ function(_duckdb_validate_source_path)
   endif()
 endfunction()
 
+function(_duckdb_resolve_source_id)
+  set(_VANE_DUCKDB_SOURCE_ID_FILE "${PROJECT_SOURCE_DIR}/DUCKDB_SOURCE_ID")
+  set(_VANE_DUCKDB_SOURCE_ID_SCRIPT
+      "${PROJECT_SOURCE_DIR}/scripts/sync_duckdb_source_id.py")
+  set(_VANE_DUCKDB_DEFAULT_SOURCE_PATH "${PROJECT_SOURCE_DIR}/external/duckdb")
+
+  if(DEFINED VANE_DUCKDB_SOURCE_ID)
+    set(_VANE_DUCKDB_SOURCE_ID "${VANE_DUCKDB_SOURCE_ID}")
+  elseif(NOT DUCKDB_SOURCE_PATH STREQUAL _VANE_DUCKDB_DEFAULT_SOURCE_PATH)
+    message(FATAL_ERROR "A custom DUCKDB_SOURCE_PATH requires an explicit "
+                        "VANE_DUCKDB_SOURCE_ID.")
+  elseif(EXISTS "${PROJECT_SOURCE_DIR}/.git")
+    if(NOT EXISTS "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}")
+      message(FATAL_ERROR "Missing ${_VANE_DUCKDB_SOURCE_ID_SCRIPT}")
+    endif()
+    find_package(Python REQUIRED COMPONENTS Interpreter)
+    execute_process(
+      COMMAND "${Python_EXECUTABLE}" "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}" --print
+      WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+      RESULT_VARIABLE _VANE_DUCKDB_SOURCE_ID_RESULT
+      OUTPUT_VARIABLE _VANE_DUCKDB_SOURCE_ID
+      ERROR_VARIABLE _VANE_DUCKDB_SOURCE_ID_ERROR
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(_VANE_DUCKDB_SOURCE_ID_RESULT)
+      message(FATAL_ERROR "Unable to compute the DuckDB source tree ID: "
+                          "${_VANE_DUCKDB_SOURCE_ID_ERROR}")
+    endif()
+  elseif(EXISTS "${_VANE_DUCKDB_SOURCE_ID_FILE}")
+    file(READ "${_VANE_DUCKDB_SOURCE_ID_FILE}" _VANE_DUCKDB_SOURCE_ID)
+    string(STRIP "${_VANE_DUCKDB_SOURCE_ID}" _VANE_DUCKDB_SOURCE_ID)
+  else()
+    message(
+      FATAL_ERROR
+        "DUCKDB_SOURCE_ID is unavailable. Provide VANE_DUCKDB_SOURCE_ID or "
+        "build from a source tree containing DUCKDB_SOURCE_ID.")
+  endif()
+
+  string(LENGTH "${_VANE_DUCKDB_SOURCE_ID}" _VANE_DUCKDB_SOURCE_ID_LENGTH)
+  if(NOT _VANE_DUCKDB_SOURCE_ID MATCHES "^[0-9a-f]+$"
+     OR (NOT _VANE_DUCKDB_SOURCE_ID_LENGTH EQUAL 40
+         AND NOT _VANE_DUCKDB_SOURCE_ID_LENGTH EQUAL 64))
+    message(
+      FATAL_ERROR
+        "Invalid DuckDB source tree ID '${_VANE_DUCKDB_SOURCE_ID}'. Expected "
+        "a 40- or 64-character lowercase hexadecimal Git object ID.")
+  endif()
+
+  string(SUBSTRING "${_VANE_DUCKDB_SOURCE_ID}" 0 10
+                   _VANE_DUCKDB_SHORT_SOURCE_ID)
+  set(VANE_DUCKDB_SOURCE_TREE
+      "${_VANE_DUCKDB_SOURCE_ID}"
+      PARENT_SCOPE)
+  set(GIT_COMMIT_HASH
+      "${_VANE_DUCKDB_SHORT_SOURCE_ID}"
+      PARENT_SCOPE)
+endfunction()
+
 function(_duckdb_create_interface_target target_name)
   add_library(${target_name} INTERFACE)
 
@@ -219,6 +276,8 @@ endfunction()
 function(_duckdb_print_summary)
   message(STATUS "DuckDB Configuration:")
   message(STATUS "  Source: ${DUCKDB_SOURCE_PATH}")
+  message(STATUS "  Source tree: ${VANE_DUCKDB_SOURCE_TREE}")
+  message(STATUS "  Source ID: ${GIT_COMMIT_HASH}")
   message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
   message(STATUS "  Native Arch: ${NATIVE_ARCH}")
   message(STATUS "  Unity Build Disabled: ${DISABLE_UNITY}")
@@ -243,6 +302,7 @@ endfunction()
 function(duckdb_add_library target_name)
   _duckdb_validate_source_path()
   _duckdb_validate_jemalloc_config()
+  _duckdb_resolve_source_id()
   _duckdb_print_summary()
 
   # Add DuckDB subdirectory - it will use our variables

@@ -11,6 +11,7 @@ import base64
 import csv
 import hashlib
 import io
+import re
 import stat
 import tarfile
 import zipfile
@@ -28,6 +29,7 @@ PROJECT_METADATA = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text(
 EXPECTED_NAME = str(PROJECT_METADATA["name"])
 EXPECTED_VERSION = str(PROJECT_METADATA["version"])
 MAX_ARTIFACT_BYTES = 100 * 1024 * 1024
+GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 BANNED_PATH_PARTS = (
     "/.git/",
@@ -198,6 +200,7 @@ def _check_wheel_license_files(artifact: WheelArtifact, metadata) -> None:
 def _check_sdist(artifact: SdistArtifact) -> None:
     names = artifact.names()
     required_paths = (
+        "DUCKDB_SOURCE_ID",
         "LICENSE",
         "NOTICE",
         "THIRD_PARTY.md",
@@ -206,10 +209,17 @@ def _check_sdist(artifact: SdistArtifact) -> None:
         "LICENSES/vcpkg-binary-dependencies.txt",
         "external/duckdb/LICENSE",
         "scripts/run_release_tests.sh",
+        "scripts/sync_duckdb_source_id.py",
         "tests/fast/test_package_metadata.py",
     )
     for relative_path in required_paths:
         _require_sdist_path(names, relative_path, artifact.path)
+
+    source_id_name = _require_sdist_path(names, "DUCKDB_SOURCE_ID", artifact.path)
+    source_id = artifact.read(source_id_name).decode("ascii").strip()
+    if GIT_OBJECT_ID.fullmatch(source_id) is None:
+        raise ValueError(f"{artifact.path}: invalid DuckDB source tree ID {source_id!r}")
+
     metadata = _check_metadata(artifact, "/PKG-INFO")
     _check_sdist_license_files(artifact, metadata)
 

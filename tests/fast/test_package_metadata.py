@@ -2,10 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from importlib.metadata import distribution, metadata, requires, version
+from pathlib import Path
 
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
+
+import duckdb
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_base_distribution_installs_expression_runtime_dependencies():
@@ -53,3 +58,11 @@ def test_wheel_or_install_contains_primary_and_third_party_license_files():
     assert any(path.endswith("licenses/duckdb/experimental/spark/LICENSE") for path in files)
     assert any(path.endswith("compression/alp/algorithm/LICENSE") for path in files)
     assert any(path.endswith("compression/alprd/algorithm/LICENSE") for path in files)
+
+
+def test_duckdb_source_id_matches_recorded_source_tree():
+    source_tree_id = (REPOSITORY_ROOT / "DUCKDB_SOURCE_ID").read_text(encoding="ascii").strip()
+    embedded_source_id = duckdb.sql("SELECT source_id FROM pragma_version()").fetchone()[0]
+
+    assert embedded_source_id == source_tree_id[:10]
+    assert duckdb.__git_revision__ == embedded_source_id

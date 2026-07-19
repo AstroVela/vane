@@ -14,6 +14,12 @@ export SKBUILD_CMAKE_BUILD_TYPE=Release
 uv pip install . --no-build-isolation
 ```
 
+After changing `external/duckdb`, synchronize its content-derived SourceID:
+
+```bash
+python scripts/sync_duckdb_source_id.py
+```
+
 ## Formatting
 
 ```bash
