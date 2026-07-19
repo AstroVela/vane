@@ -34,6 +34,7 @@ add_library(
   pyfilesystem.cpp
   pyrelation.cpp
   pyresult.cpp
+  pyresult_source.cpp
   pystatement.cpp
   python_dependency.cpp
   python_import_cache.cpp

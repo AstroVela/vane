@@ -19,6 +19,7 @@
 #include "duckdb/function/pragma/pragma_functions.hpp"
 #include "duckdb/parser/statement/pragma_statement.hpp"
 #include "duckdb/common/box_renderer.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -1100,6 +1101,24 @@ unique_ptr<QueryResult> DuckDBPyRelation::ExecuteInternal(bool stream_result) {
 }
 
 void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
+	if (ResolveRunnerType() == "ray") {
+		this->executed = true;
+		try {
+			auto runner = GetOrCreateRunnerForDB(rel, "ray");
+			auto py_relation = DuckDBPyRelation(rel);
+			py_relation.SetConnectionOwner(connection_owner);
+			auto py_relation_obj = py::cast(std::move(py_relation));
+			auto table_iterator = runner.attr("run_iter_tables")(py_relation_obj, py::int_(1));
+			ForgetRunnerForDB(rel);
+			result = make_uniq<DuckDBPyResult>(MakeDistributedArrowPyResultSource(std::move(table_iterator), names,
+			                                                                      types, rel->context->GetContext()));
+			return;
+		} catch (...) {
+			ForgetRunnerForDB(rel);
+			throw;
+		}
+	}
+
 	auto query_result = ExecuteInternal(stream_result);
 	if (!query_result) {
 		throw InternalException("ExecuteOrThrow - no query available to execute");
@@ -2316,12 +2335,28 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FlatMap(
 string DuckDBPyRelation::ToStringInternal(const BoxRendererConfig &config, bool invalidate_cache) {
 	AssertRelation();
 	if (rendered_result.empty() || invalidate_cache) {
-		BoxRenderer renderer;
+		BoxRenderer renderer(config);
 		auto limit = Limit(config.limit, 0);
-		auto res = limit->ExecuteInternal();
-
 		auto context = rel->context->GetContext();
-		rendered_result = res->ToBox(*context, config);
+		if (ResolveRunnerType() == "ray") {
+			limit->ExecuteOrThrow(true);
+			ColumnDataCollection collection(*context, types);
+			while (true) {
+				unique_ptr<DataChunk> chunk;
+				{
+					py::gil_scoped_release release;
+					chunk = limit->result->FetchChunk();
+				}
+				if (!chunk || chunk->size() == 0) {
+					break;
+				}
+				collection.Append(*chunk);
+			}
+			rendered_result = renderer.ToString(*context, names, collection);
+		} else {
+			auto res = limit->ExecuteInternal();
+			rendered_result = res->ToBox(*context, config);
+		}
 	}
 	return rendered_result;
 }
@@ -2345,55 +2380,7 @@ bool DuckDBPyRelation::TryPrintDistributed(const BoxRendererConfig &config) {
 	if (ResolveRunnerType() != "ray") {
 		return false;
 	}
-
-	auto runner = GetOrCreateRunnerForDB(rel, "ray");
-	auto limited_relation = Limit(static_cast<int64_t>(config.limit), 0);
-	auto limited_relation_obj = py::cast(std::move(limited_relation));
-	py::list tables;
-	try {
-		auto table_iter = runner.attr("run_iter_tables")(limited_relation_obj, py::int_(1));
-		for (auto table : py::reinterpret_borrow<py::iterable>(table_iter)) {
-			tables.append(table);
-		}
-	} catch (...) {
-		ForgetRunnerForDB(rel);
-		throw;
-	}
-	ForgetRunnerForDB(rel);
-
-	unique_ptr<QueryResult> result;
-	if (py::len(tables) == 0) {
-		auto empty_relation = EmptyResult(rel->context->GetContext(), types, names);
-		result = empty_relation->ExecuteInternal();
-	} else {
-		py::object arrow_table = tables[0];
-		if (py::len(tables) > 1) {
-			auto pyarrow = py::module_::import("pyarrow");
-			arrow_table = pyarrow.attr("concat_tables")(tables);
-		}
-
-		// Arrow permits duplicate field names, but DuckDB's Arrow scanner resolves
-		// fields by name. Use unique scan names and restore the relation's names in
-		// the renderer below.
-		py::list scan_names;
-		for (idx_t column_idx = 0; column_idx < names.size(); column_idx++) {
-			scan_names.append(py::str("__vane_show_column_" + std::to_string(column_idx)));
-		}
-		arrow_table = arrow_table.attr("rename_columns")(scan_names);
-
-		auto duckdb_module = py::module_::import("duckdb");
-		auto local_relation_obj = duckdb_module.attr("from_arrow")(arrow_table);
-		auto &local_relation = local_relation_obj.cast<DuckDBPyRelation &>();
-		result = local_relation.ExecuteInternal();
-	}
-
-	if (!result || result->type != QueryResultType::MATERIALIZED_RESULT) {
-		throw InternalException("Distributed show did not produce a materialized result");
-	}
-	auto &materialized = result->Cast<MaterializedQueryResult>();
-	BoxRenderer renderer(config);
-	auto context = rel->context->GetContext();
-	py::print(py::str(renderer.ToString(*context, names, materialized.Collection())));
+	py::print(py::str(ToStringInternal(config, true)));
 	return true;
 }
 
