@@ -239,58 +239,82 @@ def test_timeout():
         signal.signal(signal.SIGALRM, prev_handler)
 
 
-@pytest.fixture
-def ray_local():
+@pytest.fixture(scope="session")
+def _ray_local_cluster():
     try:
         import ray
+        from ray._private.resource_and_label_spec import ResourceAndLabelSpec
+        from ray.cluster_utils import Cluster
     except Exception:
         pytest.skip("ray not installed")
 
-    def current_ray_node():
+    cluster = Cluster()
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=r"Tip: In future versions of Ray")
+            warning_filter = r"ignore:\s*Prefer using device seq_lens directly.*:DeprecationWarning"
+            os.environ["PYTHONWARNINGS"] = warning_filter
+            os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
+            pythonpath = os.environ.get("PYTHONPATH", "")
+            try:
+                import _duckdb as duckdb_ext
+
+                duckdb_pkg_root = os.path.dirname(duckdb.__file__)
+                duckdb_parent = os.path.dirname(duckdb_pkg_root)
+                duckdb_ext_root = os.path.dirname(duckdb_ext.__file__)
+                pythonpath_entries = []
+                if duckdb_ext_root:
+                    pythonpath_entries.append(duckdb_ext_root)
+                if duckdb_parent:
+                    pythonpath_entries.append(duckdb_parent)
+                if pythonpath:
+                    pythonpath_entries.append(pythonpath)
+                pythonpath = os.pathsep.join(dict.fromkeys(pythonpath_entries))
+                if pythonpath:
+                    os.environ["PYTHONPATH"] = pythonpath
+            except Exception:
+                pythonpath = os.environ.get("PYTHONPATH", "")
+            env_vars = {
+                "PYTHONWARNINGS": os.environ.get("PYTHONWARNINGS", ""),
+                "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": os.environ.get("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0"),
+            }
+            if pythonpath:
+                env_vars["PYTHONPATH"] = pythonpath
+            # Keep the Ray control plane alive for the pytest session. Repeatedly
+            # starting a local cluster forks a new gcs_server for every test; in a
+            # long-lived pytest process that can fail with ENOMEM even after the
+            # preceding cluster was shut down. Tests still reconnect as independent
+            # Ray jobs through the function-scoped fixture below.
+            resources = ResourceAndLabelSpec().resolve(is_head=True)
+            cluster.add_node(
+                include_dashboard=False,
+                num_cpus=resources.num_cpus,
+                num_gpus=resources.num_gpus,
+                object_store_memory=int(os.environ.get("VANE_TEST_RAY_OBJECT_STORE_BYTES", str(1024**3))),
+            )
+
+        yield ray, cluster.address, env_vars
+    finally:
         try:
-            from ray._private import worker as ray_worker
+            if ray.is_initialized():
+                ray.shutdown()
+        finally:
+            cluster.shutdown()
 
-            return getattr(ray_worker.global_worker, "node", None)
-        except Exception:
-            return None
 
-    import warnings
+@pytest.fixture
+def ray_local(_ray_local_cluster):
+    ray, cluster_address, env_vars = _ray_local_cluster
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=r"Tip: In future versions of Ray")
-        warning_filter = r"ignore:\s*Prefer using device seq_lens directly.*:DeprecationWarning"
-        os.environ["PYTHONWARNINGS"] = warning_filter
-        os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
-        pythonpath = os.environ.get("PYTHONPATH", "")
-        try:
-            import _duckdb as duckdb_ext
-
-            duckdb_pkg_root = os.path.dirname(duckdb.__file__)
-            duckdb_parent = os.path.dirname(duckdb_pkg_root)
-            duckdb_ext_root = os.path.dirname(duckdb_ext.__file__)
-            pythonpath_entries = []
-            if duckdb_ext_root:
-                pythonpath_entries.append(duckdb_ext_root)
-            if duckdb_parent:
-                pythonpath_entries.append(duckdb_parent)
-            if pythonpath:
-                pythonpath_entries.append(pythonpath)
-            pythonpath = os.pathsep.join(dict.fromkeys(pythonpath_entries))
-            if pythonpath:
-                os.environ["PYTHONPATH"] = pythonpath
-        except Exception:
-            pythonpath = os.environ.get("PYTHONPATH", "")
-        env_vars = {
-            "PYTHONWARNINGS": os.environ.get("PYTHONWARNINGS", ""),
-            "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": os.environ.get("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0"),
-        }
-        if pythonpath:
-            env_vars["PYTHONPATH"] = pythonpath
+        if ray.is_initialized():
+            ray.shutdown()
         ray.init(
+            address=cluster_address,
             ignore_reinit_error=True,
             logging_level="info",
             log_to_driver=True,
-            object_store_memory=int(os.environ.get("VANE_TEST_RAY_OBJECT_STORE_BYTES", str(1024**3))),
             runtime_env={"env_vars": env_vars},
         )
     try:
@@ -302,7 +326,6 @@ def ray_local():
                 vane_mod.teardown_runner()
         except Exception as e:
             print(f"WARNING: Exception during Vane runner teardown: {e}", file=sys.stderr)
-        ray_node = current_ray_node()
         prev_handler = None
         alarm_set = False
         try:
@@ -321,15 +344,6 @@ def ray_local():
         except Exception as e:
             print(f"WARNING: Exception during ray.shutdown(): {e}", file=sys.stderr)
         finally:
-            if ray_node is not None:
-                try:
-                    ray_node.kill_all_processes(
-                        check_alive=False,
-                        allow_graceful=False,
-                        wait=True,
-                    )
-                except Exception as e:
-                    print(f"WARNING: Exception during Ray node cleanup: {e}", file=sys.stderr)
             try:
                 from duckdb.runners.ray import driver as ray_driver
 

@@ -10,6 +10,7 @@ set -euo pipefail
 python -m pytest \
   --import-mode=importlib \
   -o pythonpath=tests \
+  -m "not external_service" \
   tests/fast/test_package_metadata.py \
   tests/fast/test_transformers_provider_security.py \
   tests/fast/test_vane_config.py \

@@ -648,6 +648,7 @@ def _skip_unless_minio_writable(endpoint, access_key, secret_key, region, bucket
         conn.close()
 
 
+@pytest.mark.external_service
 def test_shuffle_cache_duckdb_filesystem_storage_minio_roundtrip():
     endpoint, access_key, secret_key, region, bucket, base_uri = _minio_test_config()
     _skip_unless_minio_writable(endpoint, access_key, secret_key, region, bucket)
@@ -674,6 +675,7 @@ def test_shuffle_cache_duckdb_filesystem_storage_minio_roundtrip():
     assert _s3_glob_paths_fresh(endpoint, access_key, secret_key, region, f"{attempt_prefix}/**") == []
 
 
+@pytest.mark.external_service
 def test_shuffle_cache_duckdb_filesystem_storage_minio_bad_credentials_hard_fail():
     endpoint, access_key, secret_key, region, bucket, _ = _minio_test_config()
     _skip_unless_minio_writable(endpoint, access_key, secret_key, region, bucket)
@@ -988,6 +990,7 @@ def test_object_store_httpfs_real_proxy_slow_body_retries_then_hard_fails():
     assert all("list-type=2" in path and "prefix=prefix%2F" in path for _, path in upstream_requests)
 
 
+@pytest.mark.external_service
 def test_shuffle_cache_duckdb_filesystem_storage_minio_fault_matrix():
     endpoint, access_key, secret_key, region, bucket, base_uri = _minio_test_config()
     _skip_unless_minio_writable(endpoint, access_key, secret_key, region, bucket)
@@ -1011,6 +1014,7 @@ def test_shuffle_cache_duckdb_filesystem_storage_minio_fault_matrix():
     assert result["size_mismatch_cleanup_removed"] >= 1
 
 
+@pytest.mark.external_service
 def test_flight_exchange_minio_selected_attempt_replay_and_loser_cleanup():
     endpoint, access_key, secret_key, region, bucket, base_uri = _minio_test_config()
     _skip_unless_minio_writable(endpoint, access_key, secret_key, region, bucket)

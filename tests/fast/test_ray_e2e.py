@@ -3453,6 +3453,7 @@ def test_ray_join_flight_shuffle_exchange(ray_runner_local_cluster, duckdb_conn,
     )
 
 
+@pytest.mark.external_service
 def test_ray_group_by_flight_shuffle_exchange_minio_durable(
     ray_runner_local_cluster, duckdb_conn, tmp_path, monkeypatch
 ):

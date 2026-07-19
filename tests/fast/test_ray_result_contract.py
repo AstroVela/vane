@@ -2743,6 +2743,7 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
     committed_paths = [entry["final_path"] for entry in committed["files"]]
     assert committed["rows_copied"] == 3
     assert committed_paths
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
     assert sorted(row[0] for row in con.read_parquet(committed_paths).fetchall()) == [1, 2, 3]
     assert not Path(str(dst) + ".duckdb_staging").exists()
     con.close()
@@ -2785,6 +2786,7 @@ def test_run_copy_plan_local_staging_env_preserves_rename_path(tmp_path, monkeyp
     assert result["copy_output_direct_write"] is False
     assert result["copy_output_committed"] is True
     assert dst.exists()
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
     assert sorted(row[0] for row in con.sql(f"select * from read_parquet('{dst}')").fetchall()) == [10, 20]
     assert not Path(str(dst) + ".duckdb_staging").exists()
     con.close()
@@ -2829,6 +2831,7 @@ def test_run_copy_plan_with_fte_preserves_copy_sink_output_for_existing_dir(tmp_
     files = sorted(path for path in dst.rglob("*") if path.is_file())
     assert result["rows_copied"] == 3
     assert files
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
     assert sum(con.sql(f"select count(*) from read_parquet('{path}')").fetchone()[0] for path in files) == 3
     assert not Path(str(dst) + ".duckdb_staging").exists()
     con.close()
@@ -2890,6 +2893,7 @@ def test_run_copy_plan_local_direct_write_committed_reader(tmp_path, monkeypatch
     assert all("_vane_direct_write_" not in path for path in committed_paths)
     assert all(Path(path).parent == dst for path in committed_paths)
     assert all(Path(path).name.startswith(f"{result['copy_output_run_id']}_") for path in committed_paths)
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
     assert sum(con.sql(f"select count(*) from read_parquet('{path}')").fetchone()[0] for path in committed_paths) == 3
 
     loser_file = dst / f"{result['copy_output_run_id']}_w_loser_part.parquet"

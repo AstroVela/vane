@@ -82,7 +82,16 @@ python -m pytest tests/slow
 python -m pytest tests/ai
 ```
 
-Some tests require network access, model weights, GPUs, credentials, or a local MinIO/Ray setup. Tests must skip with a clear reason when an optional environment is absent; they must not silently use a maintainer's local endpoint or credentials.
+Tests that require an externally provisioned service are excluded by default. Run them explicitly when the required
+service and credentials are available:
+
+```bash
+python -m pytest -m external_service tests/fast
+```
+
+Other optional tests may require network access, model weights, GPUs, credentials, or a local Ray setup. Tests must
+skip with a clear reason when an optional environment is absent; they must not silently use a maintainer's local
+endpoint or credentials.
 
 ## Formatting and static checks
 

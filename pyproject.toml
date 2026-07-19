@@ -452,9 +452,12 @@ dev = [ # tooling like uv will install this automatically when syncing the envir
 
 [tool.pytest.ini_options]
 minversion = "7.0"
-addopts = "-ra --verbose"
+addopts = "-ra --verbose -m 'not external_service'"
 testpaths = ["tests"]
 pythonpath = ["tests", "tests/fast"]
+markers = [
+    "external_service: tests that require an externally provisioned service",
+]
 filterwarnings = [
     "error",
     "ignore::UserWarning",
