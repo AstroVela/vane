@@ -28,10 +28,45 @@
 #include "duckdb_python/python_objects.hpp"
 #include "duckdb/execution/vllm_executor.hpp"
 #include "duckdb/common/types/arrow_aux_data.hpp"
+#include "duckdb/parallel/interrupt.hpp"
+
+#include <cmath>
 
 namespace duckdb {
 
 namespace {
+
+static py::object RequiredNormalizedOption(const py::dict &normalized, const char *name) {
+	auto key = py::str(name);
+	if (!normalized.contains(key)) {
+		throw InvalidInputException("normalized vllm options are missing '%s'", name);
+	}
+	return py::reinterpret_borrow<py::object>(normalized[key]);
+}
+
+static idx_t NormalizedNonNegativeInteger(const py::dict &normalized, const char *name) {
+	auto value = RequiredNormalizedOption(normalized, name);
+	if (py::isinstance<py::bool_>(value) || !py::isinstance<py::int_>(value)) {
+		throw InvalidInputException("vllm %s must be a non-boolean integer", name);
+	}
+	auto number = value.cast<int64_t>();
+	if (number < 0) {
+		throw InvalidInputException("vllm %s must be nonnegative", name);
+	}
+	return static_cast<idx_t>(number);
+}
+
+static double NormalizedUnitInterval(const py::dict &normalized, const char *name) {
+	auto value = RequiredNormalizedOption(normalized, name);
+	if (py::isinstance<py::bool_>(value) || (!py::isinstance<py::int_>(value) && !py::isinstance<py::float_>(value))) {
+		throw InvalidInputException("vllm %s must be a non-boolean number", name);
+	}
+	auto number = value.cast<double>();
+	if (!std::isfinite(number) || number < 0.0 || number > 1.0) {
+		throw InvalidInputException("vllm %s must be finite and between 0 and 1", name);
+	}
+	return number;
+}
 
 static py::list ConvertToSingleBatch(vector<LogicalType> &types, vector<string> &names, DataChunk &input,
                                      ClientProperties &options, ClientContext &context) {
@@ -245,25 +280,48 @@ public:
 		}
 	}
 
+	VLLMWakeupRegistrationResult RegisterWakeup(InterruptState &interrupt_state) override {
+		PythonGILWrapper gil;
+		if (!py::hasattr(executor->obj, "register_wakeup_callback")) {
+			return VLLMWakeupRegistrationResult::UNSUPPORTED;
+		}
+		try {
+			auto callback = py::cpp_function([interrupt_state]() { interrupt_state.Callback(); });
+			auto armed = executor->obj.attr("register_wakeup_callback")(std::move(callback));
+			if (!py::isinstance<py::bool_>(armed)) {
+				throw InvalidInputException("vllm register_wakeup_callback must return a bool");
+			}
+			return armed.cast<bool>() ? VLLMWakeupRegistrationResult::ARMED : VLLMWakeupRegistrationResult::READY;
+		} catch (const py::error_already_set &ex) {
+			throw InvalidInputException("vllm register_wakeup_callback failed: %s", ex.what());
+		}
+	}
+
 	void WaitForResult(ClientContext &context) override {
 		PythonGILWrapper gil;
+		if (!executor) {
+			return;
+		}
+		// Shutdown can clear the registered handle after the caller snapshots
+		// the outer VLLMExecutor. Keep the Python executor alive for the full
+		// blocking call, even if another finalizer shuts the bridge down.
+		auto executor_ref = executor->obj;
 		try {
-			executor->obj.attr("wait_for_result")();
+			executor_ref.attr("wait_for_result")();
 		} catch (const py::error_already_set &ex) {
 			throw InvalidInputException("vllm wait_for_result failed: %s", ex.what());
 		}
 	}
 
 	void Shutdown() override {
+		PythonGILWrapper gil;
 		if (!executor) {
 			return;
 		}
-		PythonGILWrapper gil;
 		try {
 			executor->obj.attr("shutdown")();
 			executor.reset();
 		} catch (const py::error_already_set &ex) {
-			executor.reset();
 			throw InvalidInputException("vllm shutdown failed: %s", ex.what());
 		}
 	}
@@ -298,19 +356,31 @@ static unique_ptr<VLLMExecutor> CreatePythonVLLMExecutor(ClientContext &context,
 	}
 	auto normalized = normalized_obj.cast<py::dict>();
 
-	config.do_prefix_routing = normalized["do_prefix_routing"].cast<bool>();
-	config.max_buffer_size = normalized["max_buffer_size"].cast<idx_t>();
-	config.min_bucket_size = normalized["min_bucket_size"].cast<idx_t>();
-	config.prefix_match_threshold = normalized["prefix_match_threshold"].cast<double>();
-	config.load_balance_threshold = normalized["load_balance_threshold"].cast<idx_t>();
-	config.inflight_limit = normalized["inflight_limit"].cast<idx_t>();
+	auto do_prefix_routing = RequiredNormalizedOption(normalized, "do_prefix_routing");
+	if (!py::isinstance<py::bool_>(do_prefix_routing)) {
+		throw InvalidInputException("vllm do_prefix_routing must be a bool");
+	}
+	config.do_prefix_routing = do_prefix_routing.cast<bool>();
+	config.max_buffer_size = NormalizedNonNegativeInteger(normalized, "max_buffer_size");
+	config.min_bucket_size = NormalizedNonNegativeInteger(normalized, "min_bucket_size");
+	config.prefix_match_threshold = NormalizedUnitInterval(normalized, "prefix_match_threshold");
+	config.load_balance_threshold = NormalizedNonNegativeInteger(normalized, "load_balance_threshold");
+	config.inflight_limit = NormalizedNonNegativeInteger(normalized, "inflight_limit");
 
-	auto batch_size_obj = normalized["batch_size"];
+	auto batch_size_obj = RequiredNormalizedOption(normalized, "batch_size");
 	if (batch_size_obj.is_none()) {
 		config.batch_size = optional_idx();
 	} else {
-		config.batch_size = optional_idx(batch_size_obj.cast<idx_t>());
+		if (py::isinstance<py::bool_>(batch_size_obj) || !py::isinstance<py::int_>(batch_size_obj)) {
+			throw InvalidInputException("vllm batch_size must be a non-boolean integer or NULL");
+		}
+		auto batch_size = batch_size_obj.cast<int64_t>();
+		if (batch_size < 1) {
+			throw InvalidInputException("vllm batch_size must be at least 1 or NULL");
+		}
+		config.batch_size = optional_idx(static_cast<idx_t>(batch_size));
 	}
+	config.Validate();
 
 	try {
 		py::object executor_obj = module.attr("build_executor")(py::str(model), normalized_obj);

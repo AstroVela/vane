@@ -10,12 +10,10 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <deque>
 #include <mutex>
 #include <numeric>
 #include <queue>
-#include <thread>
 #include <utility>
 
 namespace duckdb {
@@ -65,6 +63,16 @@ static idx_t CommonPrefixLength(const string &left, const string &right) {
 	return match_len;
 }
 
+static idx_t CompleteUTF8PrefixLength(const string &value, idx_t prefix_len) {
+	if (prefix_len >= value.size()) {
+		return value.size();
+	}
+	while (prefix_len > 0 && (static_cast<unsigned char>(value[prefix_len]) & 0xC0) == 0x80) {
+		prefix_len--;
+	}
+	return prefix_len;
+}
+
 static string ComputeBucketPrefix(const vector<string> &prompts, idx_t start, idx_t end) {
 	if (end <= start) {
 		return string();
@@ -82,14 +90,7 @@ static string ComputeBucketPrefix(const vector<string> &prompts, idx_t start, id
 		}
 	}
 
-	idx_t prefix_len_to_char = 0;
-	for (idx_t i = 0; i < prefix_len; i++) {
-		auto byte = static_cast<unsigned char>(first[i]);
-		if ((byte & 0xC0) != 0x80) {
-			prefix_len_to_char = i;
-		}
-	}
-	return first.substr(0, prefix_len_to_char);
+	return first.substr(0, CompleteUTF8PrefixLength(first, prefix_len));
 }
 
 static unique_ptr<DataChunk> CopyChunk(ClientContext &context, DataChunk &input) {
@@ -168,9 +169,13 @@ struct VLLMGlobalOperatorState : public GlobalOperatorState {
 	std::atomic<int64_t> completed_prompts {0};
 
 	//! Thread coordination for FinalExecute.
-	std::atomic<idx_t> active_threads {0};
+	std::atomic<idx_t> active_threads {1};
 	std::atomic<idx_t> finished_threads {0};
 	std::atomic<bool> global_finished_submitting {false};
+
+	void PipelineMaxThreadsResolved(idx_t max_threads) override {
+		active_threads.store(MaxValue<idx_t>(1, max_threads));
+	}
 
 	int64_t InflightPrompts() const {
 		const auto submitted = submitted_prompts.load();
@@ -202,6 +207,7 @@ struct VLLMGlobalOperatorState : public GlobalOperatorState {
 		if (!exec) {
 			throw InvalidInputException("vllm executor factory did not return an executor");
 		}
+		config.Validate();
 		config_initialized = true;
 		executor = shared_ptr<VLLMExecutor>(std::move(exec));
 	}
@@ -236,11 +242,38 @@ struct VLLMGlobalOperatorState : public GlobalOperatorState {
 		return true;
 	}
 
+	bool WaitForExecutorResult(ClientContext &context) {
+		auto exec = ExecutorRef();
+		if (!exec) {
+			return false;
+		}
+		// This call may block. Keep it outside executor_call_mutex so another
+		// producer can submit the work that eventually wakes this waiter.
+		exec->WaitForResult(context);
+		return true;
+	}
+
+	VLLMWakeupRegistrationResult RegisterWakeup(ExecutionContext &context) {
+		if (!context.interrupt_state) {
+			return VLLMWakeupRegistrationResult::UNSUPPORTED;
+		}
+		// Another finalizer can drain the last result and shut the shared
+		// executor down between this task's readiness check and wakeup
+		// registration. Treat that terminal state as immediately actionable.
+		auto result = VLLMWakeupRegistrationResult::READY;
+		WithExecutorIfPresent([&](VLLMExecutor &exec) { result = exec.RegisterWakeup(*context.interrupt_state); });
+		return result;
+	}
+
 	//! Called by each thread when it finishes submitting. The last thread
 	//! signals the executor that no more prompts will arrive.
 	void ThreadFinishedSubmitting(ClientContext &context) {
 		auto finished = finished_threads.fetch_add(1) + 1;
-		if (finished >= active_threads.load()) {
+		auto expected = active_threads.load();
+		if (finished > expected) {
+			throw InternalException("vllm producer finished more than once");
+		}
+		if (finished == expected) {
 			if (!global_finished_submitting.exchange(true)) {
 				WithExecutorIfPresent([&](VLLMExecutor &exec) { exec.FinishedSubmitting(context); });
 			}
@@ -253,10 +286,14 @@ struct VLLMGlobalOperatorState : public GlobalOperatorState {
 			std::lock_guard<std::mutex> call_lock(executor_call_mutex);
 			{
 				std::lock_guard<std::mutex> lock(executor_mutex);
-				executor_to_shutdown = std::move(executor);
+				executor_to_shutdown = executor;
 			}
 			if (executor_to_shutdown) {
 				executor_to_shutdown->Shutdown();
+				std::lock_guard<std::mutex> lock(executor_mutex);
+				if (executor == executor_to_shutdown) {
+					executor.reset();
+				}
 			}
 		}
 	}
@@ -279,7 +316,6 @@ struct VLLMOperatorState : public OperatorState {
 	idx_t buffer_size = 0;
 	bool finished_submitting = false;
 	std::deque<unique_ptr<DataChunk>> pending_outputs;
-	bool registered = false;
 };
 
 static void TakeReadyResultOnce(ExecutionContext &context, VLLMGlobalOperatorState &gstate, VLLMOperatorState &state,
@@ -292,8 +328,13 @@ static void SubmitPrompts(ExecutionContext &context, VLLMGlobalOperatorState &gs
 	}
 
 	if (!gstate.config.batch_size.IsValid() || prompts.size() <= gstate.config.batch_size.GetIndex()) {
-		gstate.WithExecutor([&](VLLMExecutor &exec) { exec.Submit(prefix, prompts, rows, context.client); });
-		gstate.submitted_prompts.fetch_add(prompts.size());
+		gstate.WithExecutor([&](VLLMExecutor &exec) {
+			exec.Submit(prefix, prompts, rows, context.client);
+			// Publish after Python has installed its reservation and wait state.
+			// executor_call_mutex also prevents a result drain from racing ahead
+			// of this native accounting update.
+			gstate.submitted_prompts.fetch_add(prompts.size());
+		});
 		return;
 	}
 
@@ -308,7 +349,9 @@ static void SubmitPrompts(ExecutionContext &context, VLLMGlobalOperatorState &gs
 				if (gstate.CanSubmitMore()) {
 					break;
 				}
-				gstate.WithExecutor([&](VLLMExecutor &exec) { exec.WaitForResult(context.client); });
+				if (!gstate.WaitForExecutorResult(context.client)) {
+					throw InternalException("vllm executor disappeared during batch backpressure");
+				}
 			}
 		}
 		const idx_t count = MinValue<idx_t>(batch_size, prompts.size() - offset);
@@ -323,9 +366,10 @@ static void SubmitPrompts(ExecutionContext &context, VLLMGlobalOperatorState &gs
 		batch_rows.Slice(rows, sel, count, 0);
 		batch_rows.Flatten();
 
-		gstate.WithExecutor(
-		    [&](VLLMExecutor &exec) { exec.Submit(prefix, std::move(batch_prompts), batch_rows, context.client); });
-		gstate.submitted_prompts.fetch_add(count);
+		gstate.WithExecutor([&](VLLMExecutor &exec) {
+			exec.Submit(prefix, std::move(batch_prompts), batch_rows, context.client);
+			gstate.submitted_prompts.fetch_add(count);
+		});
 	}
 }
 
@@ -423,7 +467,9 @@ static void PopAndSubmitTasks(ExecutionContext &context, VLLMGlobalOperatorState
 			if (gstate.CanSubmitMore()) {
 				break;
 			}
-			gstate.WithExecutor([&](VLLMExecutor &exec) { exec.WaitForResult(context.client); });
+			if (!gstate.WaitForExecutorResult(context.client)) {
+				throw InternalException("vllm executor disappeared during bucket backpressure");
+			}
 		}
 
 		auto bucket = splits.top();
@@ -513,11 +559,6 @@ OperatorResultType PhysicalVLLM::Execute(ExecutionContext &context, DataChunk &i
 	auto &gstate = gstate_p.Cast<VLLMGlobalOperatorState>();
 	auto &state = state_p.Cast<VLLMOperatorState>();
 
-	if (!state.registered) {
-		state.registered = true;
-		gstate.active_threads.fetch_add(1);
-	}
-
 	if (!state.pending_outputs.empty()) {
 		auto output = std::move(state.pending_outputs.front());
 		state.pending_outputs.pop_front();
@@ -538,7 +579,9 @@ OperatorResultType PhysicalVLLM::Execute(ExecutionContext &context, DataChunk &i
 		if (gstate.CanSubmitMore()) {
 			break;
 		}
-		gstate.WithExecutor([&](VLLMExecutor &exec) { exec.WaitForResult(context.client); });
+		if (!gstate.WaitForExecutorResult(context.client)) {
+			throw InternalException("vllm executor disappeared during operator backpressure");
+		}
 	}
 
 	if (gstate.config.do_prefix_routing) {
@@ -579,9 +622,7 @@ OperatorFinalizeResultType PhysicalVLLM::FinalExecute(ExecutionContext &context,
 			PopAndSubmitTasks(context, gstate, state, 0);
 		}
 		state.finished_submitting = true;
-		if (gstate.HasExecutor()) {
-			gstate.ThreadFinishedSubmitting(context.client);
-		}
+		gstate.ThreadFinishedSubmitting(context.client);
 	}
 
 	if (!gstate.HasExecutor()) {
@@ -608,12 +649,18 @@ OperatorFinalizeResultType PhysicalVLLM::FinalExecute(ExecutionContext &context,
 		return OperatorFinalizeResultType::FINISHED;
 	}
 
-	// Event-driven wait — zero CPU, instant wakeup when a result completes.
-	if (!gstate.WithExecutorIfPresent([&](VLLMExecutor &exec) { exec.WaitForResult(context.client); })) {
-		chunk.SetCardinality(0);
-		return OperatorFinalizeResultType::FINISHED;
-	}
+	// Arm before yielding so result, error, cancellation, or a later producer
+	// cannot race between the readiness check above and task suspension.
+	auto wakeup_result = gstate.RegisterWakeup(context);
 	chunk.SetCardinality(0);
+	if (wakeup_result == VLLMWakeupRegistrationResult::ARMED) {
+		return OperatorFinalizeResultType::BLOCKED;
+	}
+	if (wakeup_result == VLLMWakeupRegistrationResult::UNSUPPORTED && gstate.InflightPrompts() > 0) {
+		// Compatibility fallback for legacy executors. Waiting with zero inflight
+		// would deadlock while another producer is still able to submit.
+		gstate.WaitForExecutorResult(context.client);
+	}
 	return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
 }
 

@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import threading
 import time
 from abc import ABC, abstractmethod
 from collections import deque
+from numbers import Integral, Real
 from typing import Any
 
 import pyarrow as pa
@@ -30,8 +32,8 @@ def _positive_float_env(name: str, default: float | None = None) -> float | None
     if not raw:
         return default
     value = float(raw)
-    if value < 0.0:
-        raise ValueError(f"{name} must be non-negative")
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
     return value
 
 
@@ -57,7 +59,12 @@ def _bounded_query_timeout_s(timeout_s: float | None) -> float | None:
 
 def _vllm_engine_init_timeout_s(value: Any | None = None) -> float | None:
     if value is not None:
-        return max(0.0, float(value))
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError("vllm engine_init_timeout_s must be a finite non-negative number")
+        result = float(value)
+        if not math.isfinite(result) or result < 0.0:
+            raise ValueError("vllm engine_init_timeout_s must be a finite non-negative number")
+        return result
     return _positive_float_env("VANE_VLLM_ENGINE_INIT_TIMEOUT_S")
 
 
@@ -806,7 +813,7 @@ class LLMActors:
         engine_args: dict[str, Any],
         generate_args: dict[str, Any],
         on_error: str,
-        gpus_per_actor: int,
+        gpus_per_actor: int | float,
         concurrency: int,
         load_balance_threshold: int,
         name_prefix: str | None = None,
@@ -860,7 +867,7 @@ class LLMActors:
         engine_args: dict[str, Any],
         generate_args: dict[str, Any],
         on_error: str,
-        gpus_per_actor: int,
+        gpus_per_actor: int | float,
         concurrency: int,
         load_balance_threshold: int,
         name_prefix: str,
@@ -956,11 +963,40 @@ _DEFAULTS: dict[str, Any] = {
 }
 
 
+def _integer_option(name: str, value: Any, *, minimum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"vllm {name} must be an integer")
+    result = int(value)
+    if result < minimum:
+        qualifier = "positive" if minimum == 1 else f">= {minimum}"
+        raise ValueError(f"vllm {name} must be {qualifier}")
+    return result
+
+
+def _fractional_gpu_option(value: Any) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError("vllm gpus_per_actor must be a finite positive number")
+    result = float(value)
+    if not math.isfinite(result) or result <= 0:
+        raise ValueError("vllm gpus_per_actor must be a finite positive number")
+    if result >= 1:
+        if not result.is_integer():
+            raise ValueError("vllm gpus_per_actor values >= 1 must be integers")
+        return int(result)
+    return result
+
+
+def _unit_interval_option(name: str, value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"vllm {name} must be a finite number in [0, 1]")
+    result = float(value)
+    if not math.isfinite(result) or not 0.0 <= result <= 1.0:
+        raise ValueError(f"vllm {name} must be a finite number in [0, 1]")
+    return result
+
+
 def normalize_options(options: Any | None) -> dict[str, Any]:
     merged = dict(_DEFAULTS)
-    if options is None:
-        return merged
-
     if isinstance(options, str):
         try:
             parsed = json.loads(options)
@@ -969,25 +1005,30 @@ def normalize_options(options: Any | None) -> dict[str, Any]:
         if not isinstance(parsed, dict):
             raise ValueError("vllm options JSON must decode to a dict")
         options = parsed
-    elif not isinstance(options, dict):
+    elif options is not None and not isinstance(options, dict):
         try:
             options = dict(options)
         except Exception as exc:
             raise TypeError("vllm options must be a dict or JSON string") from exc
 
-    if options.get("ray_address") is not None:
+    if options is not None and options.get("ray_address") is not None:
         raise ValueError("vLLM ray_address has been removed; configure RayRunner instead")
 
-    merged.update(options)
-    merged["concurrency"] = max(1, int(merged["concurrency"]))
-    merged["gpus_per_actor"] = max(0, int(merged["gpus_per_actor"]))
-    merged["do_prefix_routing"] = bool(merged["do_prefix_routing"])
-    merged["max_buffer_size"] = max(0, int(merged["max_buffer_size"]))
-    merged["min_bucket_size"] = max(0, int(merged["min_bucket_size"]))
-    merged["prefix_match_threshold"] = float(merged["prefix_match_threshold"])
-    merged["load_balance_threshold"] = max(0, int(merged["load_balance_threshold"]))
-    merged["batch_size"] = int(merged["batch_size"]) if merged["batch_size"] is not None else None
-    merged["inflight_limit"] = max(0, int(merged["inflight_limit"]))
+    if options is not None:
+        merged.update(options)
+    merged["concurrency"] = _integer_option("concurrency", merged["concurrency"], minimum=1)
+    merged["gpus_per_actor"] = _fractional_gpu_option(merged["gpus_per_actor"])
+    if not isinstance(merged["do_prefix_routing"], bool):
+        raise ValueError("vllm do_prefix_routing must be a boolean")
+    merged["max_buffer_size"] = _integer_option("max_buffer_size", merged["max_buffer_size"], minimum=0)
+    merged["min_bucket_size"] = _integer_option("min_bucket_size", merged["min_bucket_size"], minimum=0)
+    merged["prefix_match_threshold"] = _unit_interval_option("prefix_match_threshold", merged["prefix_match_threshold"])
+    merged["load_balance_threshold"] = _integer_option(
+        "load_balance_threshold", merged["load_balance_threshold"], minimum=0
+    )
+    batch_size = merged["batch_size"]
+    merged["batch_size"] = None if batch_size is None else _integer_option("batch_size", batch_size, minimum=1)
+    merged["inflight_limit"] = _integer_option("inflight_limit", merged["inflight_limit"], minimum=0)
     merged["engine_init_timeout_s"] = _vllm_engine_init_timeout_s(merged.get("engine_init_timeout_s"))
     on_error = merged.get("on_error")
     if on_error is None:
@@ -1056,7 +1097,7 @@ def ensure_named_vllm_pools_for_plan(plan: Any, conn: Any = None) -> tuple[list[
         engine_args = _apply_engine_defaults(dict(opts.get("engine_args") or {}))
         generate_args = dict(opts.get("generate_args") or {})
         on_error = str(opts.get("on_error", "raise"))
-        gpus_per_actor = max(1, int(opts.get("gpus_per_actor", 1)))
+        gpus_per_actor = opts["gpus_per_actor"]
         concurrency = max(1, int(opts.get("concurrency", 1)))
         load_balance_threshold = max(0, int(opts.get("load_balance_threshold", 32)))
         engine_init_timeout_s = _vllm_engine_init_timeout_s(opts.get("engine_init_timeout_s"))
@@ -1111,7 +1152,7 @@ def build_executor(model: str, options: Any | None) -> VLLMExecutor:
             raise RuntimeError("Ray vLLM execution requires an initialized RayRunner runtime")
         if pool_name:
             llm_actors = LLMActors.lookup_named(
-                concurrency=int(opts["concurrency"]),
+                concurrency=opts["concurrency"],
                 name_prefix=pool_name,
             )
         else:
@@ -1120,9 +1161,9 @@ def build_executor(model: str, options: Any | None) -> VLLMExecutor:
                 engine_args=engine_args,
                 generate_args=generate_args,
                 on_error=on_error,
-                gpus_per_actor=int(opts["gpus_per_actor"]),
-                concurrency=int(opts["concurrency"]),
-                load_balance_threshold=int(opts["load_balance_threshold"]),
+                gpus_per_actor=opts["gpus_per_actor"],
+                concurrency=opts["concurrency"],
+                load_balance_threshold=opts["load_balance_threshold"],
                 engine_init_timeout_s=opts["engine_init_timeout_s"],
             )
         return RemoteVLLMExecutor(llm_actors, pool_name=pool_name)
