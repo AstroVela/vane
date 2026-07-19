@@ -15,7 +15,8 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIRECTORY = "external/duckdb"
-SOURCE_ID_FILE = REPOSITORY_ROOT / "DUCKDB_SOURCE_ID"
+SOURCE_ID_PATH = "DUCKDB_SOURCE_ID"
+SOURCE_ID_FILE = REPOSITORY_ROOT / SOURCE_ID_PATH
 GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 
@@ -53,14 +54,57 @@ def source_tree_id() -> str:
     return tree_id
 
 
+def staged_source_tree_id() -> str:
+    """Return the DuckDB tree ID represented by the real Git index."""
+    repository_tree = _git("write-tree")
+    tree_id = _git("rev-parse", f"{repository_tree}:{SOURCE_DIRECTORY}")
+
+    if GIT_OBJECT_ID.fullmatch(tree_id) is None:
+        raise RuntimeError(f"Git returned an invalid DuckDB tree ID: {tree_id!r}")
+    return tree_id
+
+
+def staged_source_id_inputs_changed() -> bool:
+    """Return whether staged engine or SourceID content differs from HEAD."""
+    result = subprocess.run(
+        (
+            "git",
+            "diff",
+            "--cached",
+            "--quiet",
+            "--no-ext-diff",
+            "HEAD",
+            "--",
+            SOURCE_DIRECTORY,
+            SOURCE_ID_PATH,
+        ),
+        cwd=REPOSITORY_ROOT,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        result.check_returncode()
+    return result.returncode == 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="fail instead of rewriting an out-of-date SourceID")
     mode.add_argument("--print", action="store_true", dest="print_only", help="print the current tree ID")
+    mode.add_argument(
+        "--staged-if-changed",
+        action="store_true",
+        help="rewrite from the Git index only when staged engine or SourceID content changed",
+    )
     args = parser.parse_args()
 
-    expected = source_tree_id() + "\n"
+    if args.staged_if_changed:
+        if not staged_source_id_inputs_changed():
+            return 0
+        expected = staged_source_tree_id() + "\n"
+    else:
+        expected = source_tree_id() + "\n"
+
     if args.print_only:
         print(expected, end="")
         return 0
@@ -70,6 +114,10 @@ def main() -> int:
         if actual != expected:
             print(f"{SOURCE_ID_FILE} is missing or out of date")
             return 1
+        print(f"{SOURCE_ID_FILE} is up to date")
+        return 0
+
+    if actual == expected:
         print(f"{SOURCE_ID_FILE} is up to date")
         return 0
 

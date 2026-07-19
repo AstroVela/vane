@@ -14,11 +14,9 @@ export SKBUILD_CMAKE_BUILD_TYPE=Release
 uv pip install . --no-build-isolation
 ```
 
-After changing `external/duckdb`, synchronize its content-derived SourceID:
-
-```bash
-python scripts/sync_duckdb_source_id.py
-```
+DuckDB and workspace formatting automatically synchronize the content-derived
+`DUCKDB_SOURCE_ID`. The pre-commit hook also repairs it from the staged DuckDB
+tree if formatting was skipped; CI rejects an out-of-date value.
 
 ## Formatting
 

@@ -41,6 +41,7 @@ Examples:
 Notes:
   external/duckdb contains C++, Python, CMake, test, and benchmark files.
   Its formatter is intentionally separate from the root repository formatter.
+  Successful duckdb formatting also synchronizes DUCKDB_SOURCE_ID.
   workspace runs root and external/duckdb independently, then reports failures.
   root requires pre-commit on PATH.
   duckdb requires black>=24, clang-format 11.0.1, and cmake-format on PATH.
@@ -232,6 +233,7 @@ run_root_format_with_verify() {
 
 run_duckdb_format() {
   local duckdb_dir="$repo_root/external/duckdb"
+  local format_status
   local temp_dir
 
   if [[ ! -f "$duckdb_dir/scripts/format.py" ]]; then
@@ -248,24 +250,32 @@ run_duckdb_format() {
       cd "$duckdb_dir" || exit 1
       python scripts/format.py --all --fix --noconfirm
     )
-    return $?
+    format_status=$?
+  else
+    # DuckDB's formatter expects paths relative to its source root. Build a
+    # temporary index at the monorepo HEAD and ask git diff to strip the subtree
+    # prefix so both staged and unstaged DuckDB changes are formatted correctly.
+    temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/vane-duckdb-format.XXXXXX")" || return 1
+    if ! GIT_INDEX_FILE="$temp_dir/index" git read-tree HEAD; then
+      rm -rf "$temp_dir"
+      return 1
+    fi
+
+    (
+      trap 'rm -rf "$temp_dir"' EXIT
+      export GIT_INDEX_FILE="$temp_dir/index"
+      cd "$duckdb_dir" || exit 1
+      python scripts/format.py --fix --noconfirm -- "--relative=external/duckdb"
+    )
+    format_status=$?
   fi
 
-  # DuckDB's formatter expects paths relative to its source root. Build a
-  # temporary index at the monorepo HEAD and ask git diff to strip the subtree
-  # prefix so both staged and unstaged DuckDB changes are formatted correctly.
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/vane-duckdb-format.XXXXXX")" || return 1
-  if ! GIT_INDEX_FILE="$temp_dir/index" git read-tree HEAD; then
-    rm -rf "$temp_dir"
-    return 1
+  if [[ $format_status -ne 0 ]]; then
+    return "$format_status"
   fi
 
-  (
-    trap 'rm -rf "$temp_dir"' EXIT
-    export GIT_INDEX_FILE="$temp_dir/index"
-    cd "$duckdb_dir" || exit 1
-    python scripts/format.py --fix --noconfirm -- "--relative=external/duckdb"
-  )
+  echo "Synchronizing DUCKDB_SOURCE_ID..."
+  python "$repo_root/scripts/sync_duckdb_source_id.py"
 }
 
 run_workspace_format() {

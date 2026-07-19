@@ -107,18 +107,23 @@ The subtree metadata records the exact official DuckDB revision in
 under `external/duckdb`; review and resolve them when updating the official
 baseline. When replaying a change formerly maintained in another repository,
 preserve its author and date and record the original commit and upstream parent
-as commit trailers. After any change below `external/duckdb`, synchronize its
-content-derived identity:
+as commit trailers. `scripts/format duckdb` and `scripts/format workspace`
+automatically synchronize the content-derived identity after a successful
+formatter pass. To synchronize or verify it explicitly, run:
 
 ```bash
 python scripts/sync_duckdb_source_id.py
+python scripts/sync_duckdb_source_id.py --check
 ```
 
 The script records the full Git tree object in `DUCKDB_SOURCE_ID`, including
 staged, unstaged, and untracked non-ignored engine files without changing the
-real Git index. CI checks that record before building source packages. Update
-`SOURCE_PROVENANCE.md` and `OVERRIDE_GIT_DESCRIBE` only when the imported
-upstream baseline, DuckDB version line, or historical mapping changes.
+real Git index. If formatting was skipped, pre-commit updates the file from the
+staged DuckDB tree; stage that generated change and retry the commit. CI checks
+the record before building source packages, including commits made with hooks
+disabled. Update `SOURCE_PROVENANCE.md` and `OVERRIDE_GIT_DESCRIBE` only when
+the imported upstream baseline, DuckDB version line, or historical mapping
+changes.
 
 The original upstream history remains in `duckdb/duckdb`. Vane's path history
 begins at the squashed snapshot and includes every later Vane engine commit. To
