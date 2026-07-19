@@ -65,6 +65,9 @@ endif()
 
 add_executable(unittest unittest.cpp ${ALL_OBJECT_FILES})
 target_compile_features(unittest PRIVATE cxx_std_11)
+if(BUILD_DISTRIBUTED_EXCHANGE)
+  target_compile_features(unittest PRIVATE cxx_std_20)
+endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   target_compile_options(unittest PRIVATE -Wno-error=maybe-uninitialized)

@@ -7,7 +7,8 @@
 # This module provides distributed execution capabilities translated from
 # DuckDB's duckdb-distributed framework.
 #
-# Requirements: - C++11 - Thread support
+# Requirements: - C++11 without exchange - C++20 with Arrow Flight exchange -
+# Thread support
 
 # Option to build pipeline_node sources. Turn OFF to skip compiling
 # distributed/pipeline_node.
@@ -78,6 +79,13 @@ endif()
 add_library_unity(duckdb_execution_distributed OBJECT ${DISTRIBUTED_SOURCES})
 
 target_compile_features(duckdb_execution_distributed PRIVATE cxx_std_11)
+
+if(BUILD_DISTRIBUTED_EXCHANGE)
+  # Arrow 24 exports cxx_std_20 through its CMake target. State the requirement
+  # explicitly as well so the legacy preinstalled-library path behaves the same
+  # way as the vcpkg package path.
+  target_compile_features(duckdb_execution_distributed PRIVATE cxx_std_20)
+endif()
 
 # Set include directories
 target_include_directories(

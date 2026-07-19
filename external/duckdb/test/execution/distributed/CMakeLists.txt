@@ -35,5 +35,23 @@ set(ALL_OBJECT_FILES
     PARENT_SCOPE)
 
 target_compile_features(test_execution_distributed PRIVATE cxx_std_11)
-target_include_directories(test_execution_distributed
-                           PRIVATE "${PROJECT_SOURCE_DIR}/installed/include")
+
+if(BUILD_DISTRIBUTED_EXCHANGE)
+  # test_exchange.cpp includes Arrow C++ headers directly. Consume the imported
+  # target when available so its include path and C++20 requirement reach this
+  # object library instead of relying on the final unittest link target.
+  target_compile_features(test_execution_distributed PRIVATE cxx_std_20)
+  if(TARGET Arrow::arrow)
+    target_link_libraries(test_execution_distributed PRIVATE Arrow::arrow)
+  elseif(TARGET Arrow::arrow_shared)
+    target_link_libraries(test_execution_distributed
+                          PRIVATE Arrow::arrow_shared)
+  elseif(TARGET Arrow::arrow_static)
+    target_link_libraries(test_execution_distributed
+                          PRIVATE Arrow::arrow_static)
+  else()
+    target_include_directories(
+      test_execution_distributed
+      PRIVATE "${PROJECT_SOURCE_DIR}/installed/include")
+  endif()
+endif()
