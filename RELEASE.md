@@ -4,9 +4,10 @@ Vane releases are immutable source and binary artifacts derived from a reviewed 
 
 ## Prepare
 
-1. Open a release pull request that sets the PEP 440 version, updates `CHANGELOG.md`, and records the exact `external/duckdb` commit.
-   If the engine source changed, update `OVERRIDE_GIT_DESCRIBE` in
-   `pyproject.toml` and the matching record in `SOURCE_PROVENANCE.md`.
+1. Open a release pull request that sets the PEP 440 version, updates `CHANGELOG.md`, and records the exact `external/duckdb` tree ID from `DUCKDB_SOURCE_ID`.
+   Run `python scripts/sync_duckdb_source_id.py --check`. Update
+   `OVERRIDE_GIT_DESCRIBE` and `SOURCE_PROVENANCE.md` only when the imported
+   upstream baseline, DuckDB version line, or historical mapping changes.
 2. Confirm that every imported dependency has compatible terms and that `SOURCE_PROVENANCE.md`, `THIRD_PARTY.md`, `LICENSE`, and `NOTICE` are current.
 3. Install the pinned vcpkg manifest and run `python scripts/sync_vcpkg_licenses.py --check`.
 4. Run formatting, fast tests, the relevant slow/native tests, and the package-artifact workflow.

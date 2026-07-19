@@ -82,9 +82,15 @@ Some tests require network access, model weights, GPUs, credentials, or a local 
 
 ```bash
 python -m pip install pre-commit
+pre-commit install
 scripts/format root --changed
+python scripts/sync_duckdb_source_id.py --check
 pre-commit run --from-ref origin/main --to-ref HEAD
 ```
+
+Run `pre-commit install` once per clone. The installed commit hook repairs
+`DUCKDB_SOURCE_ID` from the staged DuckDB tree; the explicit check above also
+covers clean range-based runs, where the Git index has no staged changes.
 
 The root formatter deliberately excludes `external/duckdb`. Format DuckDB subtree changes with:
 
@@ -107,8 +113,22 @@ The subtree metadata records the exact official DuckDB revision in
 under `external/duckdb`; review and resolve them when updating the official
 baseline. When replaying a change formerly maintained in another repository,
 preserve its author and date and record the original commit and upstream parent
-as commit trailers. Update `SOURCE_PROVENANCE.md` and `OVERRIDE_GIT_DESCRIBE` in
-`pyproject.toml` whenever the imported baseline or resulting engine state
+as commit trailers. `scripts/format duckdb` and `scripts/format workspace`
+automatically synchronize the content-derived identity after a successful
+formatter pass. To synchronize or verify it explicitly, run:
+
+```bash
+python scripts/sync_duckdb_source_id.py
+python scripts/sync_duckdb_source_id.py --check
+```
+
+The script records the full Git tree object in `DUCKDB_SOURCE_ID`, including
+staged, unstaged, and untracked non-ignored engine files without changing the
+real Git index. If formatting was skipped, pre-commit updates the file from the
+staged DuckDB tree; stage that generated change and retry the commit. CI checks
+the record before building source packages, including commits made with hooks
+disabled. Update `SOURCE_PROVENANCE.md` and `OVERRIDE_GIT_DESCRIBE` only when
+the imported upstream baseline, DuckDB version line, or historical mapping
 changes.
 
 The original upstream history remains in `duckdb/duckdb`. Vane's path history
