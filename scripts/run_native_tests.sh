@@ -53,8 +53,8 @@ fi
 cmake_args+=("-DCMAKE_PREFIX_PATH=$vcpkg_prefix")
 
 override_git_describe="$(
-  sed -n 's/^OVERRIDE_GIT_DESCRIBE = "\([^"]*\)"/\1/p' \
-    "$project_root/pyproject.toml" | head -n 1
+  awk -F'"' '/^OVERRIDE_GIT_DESCRIBE = "/ { print $2; exit }' \
+    "$project_root/pyproject.toml"
 )"
 if [[ -n "$override_git_describe" ]]; then
   cmake_args+=("-DOVERRIDE_GIT_DESCRIBE=$override_git_describe")
