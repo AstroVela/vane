@@ -14,10 +14,14 @@ export SKBUILD_CMAKE_BUILD_TYPE=Release
 uv pip install . --no-build-isolation
 ```
 
-DuckDB and workspace formatting automatically synchronize the content-derived
-`DUCKDB_SOURCE_ID`. The pre-commit hook also repairs it from the staged DuckDB
-tree if formatting was skipped; install that hook once per clone with
-`pre-commit install`. CI rejects an out-of-date value.
+Native builds compute the content-derived DuckDB SourceID without modifying the
+checkout. Direct incremental builds watch the external tree for CMake
+reconfiguration and refresh a generated header in the build directory. The
+engine version object and default in-tree static extension entry points consume
+that header, including after mode-only changes. Git-exported trees derive the
+same Git-compatible identity from their files when no manifest exists. The PEP
+517 backend injects `DUCKDB_SOURCE_ID` into source distributions; do not add
+that generated file to Git.
 
 ## Formatting
 

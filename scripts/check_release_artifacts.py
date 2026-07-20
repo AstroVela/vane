@@ -13,6 +13,8 @@ import hashlib
 import io
 import re
 import stat
+import subprocess
+import sys
 import tarfile
 import zipfile
 from email.parser import BytesParser
@@ -183,6 +185,24 @@ def _check_sdist_license_files(artifact: SdistArtifact, metadata) -> None:
         _require_sdist_path(names, relative_path, artifact.path)
 
 
+def _checkout_duckdb_source_id() -> str | None:
+    """Return the current checkout identity when Git metadata is available."""
+    if not (REPOSITORY_ROOT / ".git").exists():
+        return None
+
+    result = subprocess.run(
+        [sys.executable, "scripts/sync_duckdb_source_id.py", "--print"],
+        cwd=REPOSITORY_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    source_id = result.stdout.strip()
+    if GIT_OBJECT_ID.fullmatch(source_id) is None:
+        raise ValueError(f"current checkout produced an invalid DuckDB source tree ID {source_id!r}")
+    return source_id
+
+
 def _check_wheel_license_files(artifact: WheelArtifact, metadata) -> None:
     metadata_name = _require_suffix(artifact.names(), ".dist-info/METADATA", artifact.path)
     license_root = PurePosixPath(metadata_name).parent / "licenses"
@@ -208,6 +228,7 @@ def _check_sdist(artifact: SdistArtifact) -> None:
         "LICENSES/DuckDB-MIT.txt",
         "LICENSES/vcpkg-binary-dependencies.txt",
         "external/duckdb/LICENSE",
+        "build_backend.py",
         "scripts/run_release_tests.sh",
         "scripts/sync_duckdb_source_id.py",
         "tests/fast/test_package_metadata.py",
@@ -219,6 +240,11 @@ def _check_sdist(artifact: SdistArtifact) -> None:
     source_id = artifact.read(source_id_name).decode("ascii").strip()
     if GIT_OBJECT_ID.fullmatch(source_id) is None:
         raise ValueError(f"{artifact.path}: invalid DuckDB source tree ID {source_id!r}")
+    checkout_source_id = _checkout_duckdb_source_id()
+    if checkout_source_id is not None and source_id != checkout_source_id:
+        raise ValueError(
+            f"{artifact.path}: DuckDB source tree ID {source_id!r} does not match checkout {checkout_source_id!r}"
+        )
 
     metadata = _check_metadata(artifact, "/PKG-INFO")
     _check_sdist_license_files(artifact, metadata)

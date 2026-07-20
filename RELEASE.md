@@ -4,8 +4,8 @@ Vane releases are immutable source and binary artifacts derived from a reviewed 
 
 ## Prepare
 
-1. Open a release pull request that sets the PEP 440 version, updates `CHANGELOG.md`, and records the exact `external/duckdb` tree ID from `DUCKDB_SOURCE_ID`.
-   Run `python scripts/sync_duckdb_source_id.py --check`. Update
+1. Open a release pull request that sets the PEP 440 version, updates `CHANGELOG.md`, and records the exact `external/duckdb` tree ID reported by
+   `python scripts/sync_duckdb_source_id.py --print`. Update
    `OVERRIDE_GIT_DESCRIBE` and `SOURCE_PROVENANCE.md` only when the imported
    upstream baseline, DuckDB version line, or historical mapping changes.
 2. Confirm that every imported dependency has compatible terms and that `SOURCE_PROVENANCE.md`, `THIRD_PARTY.md`, `LICENSE`, and `NOTICE` are current.
@@ -17,7 +17,7 @@ Vane releases are immutable source and binary artifacts derived from a reviewed 
 
 Build from a clean checkout. The DuckDB source is part of the checkout. Release automation must:
 
-- build the sdist first;
+- build the sdist first, letting the PEP 517 backend inject `DUCKDB_SOURCE_ID`;
 - validate it with `scripts/check_release_artifacts.py`;
 - build wheels from that exact sdist in clean manylinux environments;
 - validate wheel metadata, contents, `RECORD`, and license files;

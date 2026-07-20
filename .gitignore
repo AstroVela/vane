@@ -36,6 +36,8 @@ a.out
 *.dll
 
 build
+# Present in source distributions only; ignore accidental local copies.
+/DUCKDB_SOURCE_ID
 .build_debug/*
 .build_release/*
 distribute/*

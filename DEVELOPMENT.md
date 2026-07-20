@@ -99,13 +99,10 @@ endpoint or credentials.
 python -m pip install pre-commit
 pre-commit install
 scripts/format root --changed
-python scripts/sync_duckdb_source_id.py --check
 pre-commit run --from-ref origin/main --to-ref HEAD
 ```
 
-Run `pre-commit install` once per clone. The installed commit hook repairs
-`DUCKDB_SOURCE_ID` from the staged DuckDB tree; the explicit check above also
-covers clean range-based runs, where the Git index has no staged changes.
+Run `pre-commit install` once per clone.
 
 The root formatter deliberately excludes `external/duckdb`. Format DuckDB subtree changes with:
 
@@ -128,23 +125,36 @@ The subtree metadata records the exact official DuckDB revision in
 under `external/duckdb`; review and resolve them when updating the official
 baseline. When replaying a change formerly maintained in another repository,
 preserve its author and date and record the original commit and upstream parent
-as commit trailers. `scripts/format duckdb` and `scripts/format workspace`
-automatically synchronize the content-derived identity after a successful
-formatter pass. To synchronize or verify it explicitly, run:
+as commit trailers. To inspect the content-derived identity without writing the
+checkout, run:
 
 ```bash
-python scripts/sync_duckdb_source_id.py
-python scripts/sync_duckdb_source_id.py --check
+python scripts/sync_duckdb_source_id.py --print
 ```
 
-The script records the full Git tree object in `DUCKDB_SOURCE_ID`, including
+The script computes the full Git tree object for `external/duckdb`, including
 staged, unstaged, and untracked non-ignored engine files without changing the
-real Git index. If formatting was skipped, pre-commit updates the file from the
-staged DuckDB tree; stage that generated change and retry the commit. CI checks
-the record before building source packages, including commits made with hooks
-disabled. Update `SOURCE_PROVENANCE.md` and `OVERRIDE_GIT_DESCRIBE` only when
-the imported upstream baseline, DuckDB version line, or historical mapping
-changes.
+real Git index or object store. When Git metadata and a source-distribution
+manifest are both absent, as in a `git archive` or GitHub source archive, the
+script derives a Git-compatible tree object directly from the materialized
+paths, modes, symlinks, and contents. Git expands the constant
+`.git_archival.txt` template on export so the fallback preserves the
+repository's SHA-1 or SHA-256 object format without a per-change identity file.
+Native configuration registers the external tree as a CMake configuration
+dependency, so Ninja and Makefile builds refresh configure-time metadata after
+timestamp-visible source changes. A lightweight build target also refreshes a
+generated header in the CMake binary directory. DuckDB's version object and the
+entry points of its default in-tree static extensions force-include that header,
+so mode-only changes that leave file timestamps untouched still update every
+runtime SourceID on the first incremental build. The local PEP 517 backend
+injects `DUCKDB_SOURCE_ID` directly into the completed sdist, so read-only source
+trees remain supported.
+The sdist carries that manifest for subsequent builds without Git metadata, and
+artifact validation checks it against the checkout. The manifest is ignored
+build metadata and must not be committed, so parallel engine pull requests do
+not modify a shared generated file. Update `SOURCE_PROVENANCE.md` and
+`OVERRIDE_GIT_DESCRIBE` only when the imported upstream baseline, DuckDB version
+line, or historical mapping changes.
 
 The original upstream history remains in `duckdb/duckdb`. Vane's path history
 begins at the squashed snapshot and includes every later Vane engine commit. To

@@ -1,9 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import subprocess
+import sys
 from importlib.metadata import distribution, metadata, requires, version
 from pathlib import Path
 
+import pytest
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
@@ -11,6 +14,21 @@ from packaging.utils import canonicalize_name
 import duckdb
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _expected_duckdb_source_id(repository_root: Path) -> str:
+    source_id_file = repository_root / "DUCKDB_SOURCE_ID"
+    if not (repository_root / ".git").exists() and source_id_file.is_file():
+        return source_id_file.read_text(encoding="ascii").strip()
+
+    result = subprocess.run(
+        [sys.executable, "scripts/sync_duckdb_source_id.py", "--print"],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
 
 
 def test_base_distribution_installs_expression_runtime_dependencies():
@@ -61,8 +79,33 @@ def test_wheel_or_install_contains_primary_and_third_party_license_files():
 
 
 def test_duckdb_source_id_matches_recorded_source_tree():
-    source_tree_id = (REPOSITORY_ROOT / "DUCKDB_SOURCE_ID").read_text(encoding="ascii").strip()
+    source_tree_id = _expected_duckdb_source_id(REPOSITORY_ROOT)
     embedded_source_id = duckdb.sql("SELECT source_id FROM pragma_version()").fetchone()[0]
 
     assert embedded_source_id == source_tree_id[:10]
     assert duckdb.__git_revision__ == embedded_source_id
+
+
+def test_exported_tree_without_manifest_computes_source_id(tmp_path, monkeypatch):
+    expected = "a" * 40
+
+    def run_source_id(command, **kwargs):
+        assert command == [sys.executable, "scripts/sync_duckdb_source_id.py", "--print"]
+        assert kwargs["cwd"] == tmp_path
+        return subprocess.CompletedProcess(command, 0, stdout=expected + "\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run_source_id)
+
+    assert _expected_duckdb_source_id(tmp_path) == expected
+
+
+def test_sdist_tree_uses_injected_source_id(tmp_path, monkeypatch):
+    expected = "b" * 40
+    (tmp_path / "DUCKDB_SOURCE_ID").write_text(expected + "\n", encoding="ascii")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("an sdist must use its injected SourceID"),
+    )
+
+    assert _expected_duckdb_source_id(tmp_path) == expected

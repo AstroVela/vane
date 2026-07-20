@@ -89,7 +89,8 @@ all = [ # Cloud providers and dataframe/filesystem integrations; local model run
 ######################################################################################################
 
 [build-system]
-build-backend = "scikit_build_core.build"
+build-backend = "build_backend"
+backend-path = ["."]
 requires = [
     "scikit-build-core>=0.11.4",
 	"pybind11[global]>=2.6.0",
@@ -115,7 +116,7 @@ exclude = [
 [tool.scikit-build.cmake.define]
 BUILD_EXTENSIONS = "core_functions;json;parquet;icu;jemalloc;httpfs"
 # Source archives have no Git metadata. This preserves DuckDB's human-readable
-# version line; the exact engine SourceID comes from DUCKDB_SOURCE_ID.
+# version line; source archives receive the exact generated DUCKDB_SOURCE_ID.
 OVERRIDE_GIT_DESCRIBE = "v1.5.0-2-g55abe0cb9e"
 
 # Override: if COVERAGE is set then:
@@ -175,6 +176,7 @@ include = [
     "/DUCKDB_SOURCE_ID",
 
     # Build configuration
+    "/build_backend.py",
     "/pyproject.toml",
     "/CMakeLists.txt",
     "/vcpkg.json",

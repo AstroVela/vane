@@ -1,0 +1,2 @@
+# Git replaces this placeholder in exported archives. Keep it unchanged.
+commit: $Format:%H$
