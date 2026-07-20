@@ -49,6 +49,7 @@ class TestNativeTimeZone:
         assert res[0].tzinfo.zone == "UTC"
 
     def test_native_python_time_timezone(self, duckdb_cursor):
+        duckdb_cursor.execute("SET timezone='UTC';")
         res = duckdb_cursor.execute(f"select TimeRecStart::TIMETZ as tz from '{filename}'").fetchone()
         assert res == (datetime.time(21, 52, 27, tzinfo=datetime.timezone.utc),)
 
