@@ -69,6 +69,43 @@ bool PipelineContributesToProgress(Pipeline &pipeline) {
 
 } // namespace
 
+vector<PipelineProgressSnapshot> Executor::CapturePipelineProgressSnapshots() {
+	vector<PipelineProgressSnapshot> result;
+	result.reserve(pipelines.size());
+	for (idx_t pipeline_idx = 0; pipeline_idx < pipelines.size(); pipeline_idx++) {
+		auto &pipeline = *pipelines[pipeline_idx];
+		PipelineProgressSnapshot snapshot;
+		snapshot.pipeline_index = pipeline_idx + 1;
+		snapshot.input_rows = pipeline.input_rows.load();
+		snapshot.input_bytes = pipeline.input_bytes.load();
+		snapshot.output_rows = pipeline.output_rows.load();
+		snapshot.output_bytes = pipeline.output_bytes.load();
+		snapshot.total_pipeline_tasks = pipeline.total_pipeline_tasks.load();
+		auto started_pipeline_tasks =
+		    MinValue<idx_t>(pipeline.started_pipeline_tasks.load(), snapshot.total_pipeline_tasks);
+		snapshot.completed_pipeline_tasks =
+		    MinValue<idx_t>(pipeline.completed_pipeline_tasks.load(), started_pipeline_tasks);
+		snapshot.running_pipeline_tasks = started_pipeline_tasks - snapshot.completed_pipeline_tasks;
+		snapshot.queued_pipeline_tasks = snapshot.total_pipeline_tasks - started_pipeline_tasks;
+		for (auto &op_ref : pipeline.GetOperators()) {
+			auto &op = op_ref.get();
+			snapshot.operators.push_back(EnumUtil::ToString(op.type));
+			auto details = ProgressOperatorDetails(op);
+			if (op.IsSink() && op.IsSource()) {
+				if (&op == pipeline.GetSource().get()) {
+					details["pipeline_role"] = "source";
+				}
+				if (&op == pipeline.GetSink().get()) {
+					details["pipeline_role"] = "sink";
+				}
+			}
+			snapshot.operator_details.push_back(std::move(details));
+		}
+		result.push_back(std::move(snapshot));
+	}
+	return result;
+}
+
 Executor::Executor(ClientContext &context) : context(context), executor_tasks(0), blocked_thread_time(0) {
 }
 
@@ -681,6 +718,7 @@ PendingExecutionResult Executor::ExecuteTask(bool dry_run) {
 	D_ASSERT(!task);
 
 	lock_guard<mutex> elock(executor_lock);
+	final_pipeline_progress_snapshots = CapturePipelineProgressSnapshots();
 	pipelines.clear();
 	NextExecutor();
 	if (HasError()) { // LCOV_EXCL_START
@@ -703,6 +741,7 @@ void Executor::Reset() {
 	total_pipelines = 0;
 	error_manager.Reset();
 	pipelines.clear();
+	final_pipeline_progress_snapshots.clear();
 	events.clear();
 	to_be_rescheduled_tasks.clear();
 	execution_result = PendingExecutionResult::RESULT_NOT_READY;
@@ -800,41 +839,10 @@ idx_t Executor::GetPipelinesProgress(ProgressData &progress) { // LCOV_EXCL_STAR
 
 vector<PipelineProgressSnapshot> Executor::GetPipelinesProgressSnapshots() { // LCOV_EXCL_START
 	lock_guard<mutex> elock(executor_lock);
-
-	vector<PipelineProgressSnapshot> result;
-	result.reserve(pipelines.size());
-	for (idx_t pipeline_idx = 0; pipeline_idx < pipelines.size(); pipeline_idx++) {
-		auto &pipeline = *pipelines[pipeline_idx];
-		PipelineProgressSnapshot snapshot;
-		snapshot.pipeline_index = pipeline_idx + 1;
-		snapshot.input_rows = pipeline.input_rows.load();
-		snapshot.input_bytes = pipeline.input_bytes.load();
-		snapshot.output_rows = pipeline.output_rows.load();
-		snapshot.output_bytes = pipeline.output_bytes.load();
-		snapshot.total_pipeline_tasks = pipeline.total_pipeline_tasks.load();
-		auto started_pipeline_tasks =
-		    MinValue<idx_t>(pipeline.started_pipeline_tasks.load(), snapshot.total_pipeline_tasks);
-		snapshot.completed_pipeline_tasks =
-		    MinValue<idx_t>(pipeline.completed_pipeline_tasks.load(), started_pipeline_tasks);
-		snapshot.running_pipeline_tasks = started_pipeline_tasks - snapshot.completed_pipeline_tasks;
-		snapshot.queued_pipeline_tasks = snapshot.total_pipeline_tasks - started_pipeline_tasks;
-		for (auto &op_ref : pipeline.GetOperators()) {
-			auto &op = op_ref.get();
-			snapshot.operators.push_back(EnumUtil::ToString(op.type));
-			auto details = ProgressOperatorDetails(op);
-			if (op.IsSink() && op.IsSource()) {
-				if (&op == pipeline.GetSource().get()) {
-					details["pipeline_role"] = "source";
-				}
-				if (&op == pipeline.GetSink().get()) {
-					details["pipeline_role"] = "sink";
-				}
-			}
-			snapshot.operator_details.push_back(std::move(details));
-		}
-		result.push_back(std::move(snapshot));
+	if (pipelines.empty()) {
+		return final_pipeline_progress_snapshots;
 	}
-	return result;
+	return CapturePipelineProgressSnapshots();
 } // LCOV_EXCL_STOP
 
 bool Executor::HasResultCollector() {

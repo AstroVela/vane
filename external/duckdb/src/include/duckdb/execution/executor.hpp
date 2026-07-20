@@ -161,6 +161,7 @@ private:
 	static void VerifyScheduledEvents(const ScheduleEventData &event_data);
 	static void VerifyScheduledEventsInternal(const idx_t i, const vector<reference<Event>> &vertices,
 	                                          vector<bool> &visited, vector<bool> &recursion_stack);
+	vector<PipelineProgressSnapshot> CapturePipelineProgressSnapshots();
 
 	void SchedulePipeline(const shared_ptr<MetaPipeline> &pipeline, ScheduleEventData &event_data);
 
@@ -177,6 +178,8 @@ private:
 	mutex executor_lock;
 	//! All pipelines of the query plan
 	vector<shared_ptr<Pipeline>> pipelines;
+	//! Final progress counters retained after ExecuteTask clears the pipeline graph
+	vector<PipelineProgressSnapshot> final_pipeline_progress_snapshots;
 	//! The root pipelines of the query
 	vector<shared_ptr<Pipeline>> root_pipelines;
 	//! The recursive CTE's in this query plan

@@ -724,6 +724,7 @@ RayTaskResultHandle::RayTaskResultHandle(TaskContext task_context, py::object ha
 
 RayTaskResultHandle::~RayTaskResultHandle() {
 	if (poll_state_) {
+		poll_state_->done_sent.store(true);
 		RayTaskResultPoller::Get().Unregister(poll_state_->id);
 	}
 }
@@ -779,6 +780,13 @@ void RayTaskResultHandle::ReleasePollResult() {
 	}
 	if (!should_release) {
 		return;
+	}
+	if (poll_state_) {
+		// Cleanup is terminal for this handle. Stop the shared poller before
+		// releasing Python payload ownership so a stale poll snapshot cannot
+		// revive the handle after cleanup returns.
+		poll_state_->done_sent.store(true);
+		RayTaskResultPoller::Get().Unregister(poll_state_->id);
 	}
 	try {
 		PythonGILWrapper gil;
