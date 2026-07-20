@@ -20,23 +20,11 @@
 #include <sstream>
 #include <unordered_set>
 
-#if !defined(Py_LIMITED_API)
-extern "C" int _Py_IsFinalizing(void);
-#endif
-
 namespace duckdb {
 
 namespace {
 
 namespace py = pybind11;
-
-static inline int DuckdbPyIsFinalizingForUDFActorResources() {
-#ifdef Py_LIMITED_API
-	return 0;
-#else
-	return _Py_IsFinalizing();
-#endif
-}
 
 static shared_ptr<void> WrapPyObjectForUDFActorHandles(const py::object &obj) {
 	if (obj.is_none()) {
@@ -48,7 +36,7 @@ static shared_ptr<void> WrapPyObjectForUDFActorHandles(const py::object &obj) {
 			return;
 		}
 		auto *boxed_obj = static_cast<py::object *>(ptr);
-		if (!Py_IsInitialized() || DuckdbPyIsFinalizingForUDFActorResources()) {
+		if (!Py_IsInitialized() || PythonIsFinalizing()) {
 			boxed_obj->release();
 			delete boxed_obj;
 			return;
@@ -198,7 +186,7 @@ public:
 		if (resources.empty()) {
 			return;
 		}
-		if (!Py_IsInitialized() || DuckdbPyIsFinalizingForUDFActorResources()) {
+		if (!Py_IsInitialized() || PythonIsFinalizing()) {
 			ReleaseResourcesWithoutPython();
 			return;
 		}
@@ -210,7 +198,7 @@ public:
 		if (resources.empty()) {
 			return;
 		}
-		if (!Py_IsInitialized() || DuckdbPyIsFinalizingForUDFActorResources()) {
+		if (!Py_IsInitialized() || PythonIsFinalizing()) {
 			ReleaseResourcesWithoutPython();
 			return;
 		}

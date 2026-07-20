@@ -1997,7 +1997,7 @@ struct PyPhysicalPlanWrapperRunner {
 								break;
 							}
 							lock.unlock();
-							if (DuckdbPyIsFinalizing()) {
+							if (PythonIsFinalizing()) {
 								break;
 							}
 							emit_native_progress(false);

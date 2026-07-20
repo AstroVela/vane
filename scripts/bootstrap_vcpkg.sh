@@ -17,14 +17,14 @@ for candidate in \
   "$(command -v python3 2>/dev/null || true)" \
   "$(command -v python 2>/dev/null || true)"; do
   if [[ -n "$candidate" && -x "$candidate" ]] \
-    && "$candidate" -c 'import sys; raise SystemExit(not ((3, 10) <= sys.version_info < (3, 13)))'; then
+    && "$candidate" -c 'import sys; raise SystemExit(not ((3, 10) <= sys.version_info < (3, 15)))'; then
     python_cmd="$candidate"
     break
   fi
 done
 
 if [[ -z "$python_cmd" ]]; then
-  echo "Python 3.10, 3.11, or 3.12 is required to bootstrap Vane dependencies." >&2
+  echo "Python 3.10 through 3.14 is required to bootstrap Vane dependencies." >&2
   exit 1
 fi
 

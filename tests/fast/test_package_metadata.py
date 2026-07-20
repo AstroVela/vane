@@ -55,7 +55,7 @@ def test_distribution_declares_alpha_version_and_apache_license_expression():
 
     assert version("vane-ai") == "0.1.0a1"
     assert package_metadata["License-Expression"] == "Apache-2.0"
-    assert SpecifierSet(package_metadata["Requires-Python"]) == SpecifierSet(">=3.10,<3.13")
+    assert SpecifierSet(package_metadata["Requires-Python"]) == SpecifierSet(">=3.10,<3.15")
 
 
 def test_provider_extras_match_provider_import_errors():

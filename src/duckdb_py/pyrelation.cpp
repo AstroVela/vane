@@ -44,10 +44,6 @@
 
 #include <algorithm>
 
-#if !defined(Py_LIMITED_API)
-extern "C" int _Py_IsFinalizing(void);
-#endif
-
 namespace duckdb {
 
 DuckDBPyRelation::DuckDBPyRelation(shared_ptr<Relation> rel_p) : rel(std::move(rel_p)) {
@@ -916,11 +912,9 @@ static bool PyRelationRuntimeUsableForTeardown() {
 	if (!Py_IsInitialized()) {
 		return false;
 	}
-#if !defined(Py_LIMITED_API)
-	if (_Py_IsFinalizing()) {
+	if (PythonIsFinalizing()) {
 		return false;
 	}
-#endif
 	return true;
 }
 

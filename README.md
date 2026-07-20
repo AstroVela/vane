@@ -61,7 +61,7 @@ Vane Data is a high-performance, multimodal-native data engine for AI workloads.
 
 ### Installation
 
-Vane supports Python 3.10, 3.11, and 3.12. Python 3.12 is recommended and is the primary development version.
+Vane supports Python 3.10 through 3.14. Python 3.12 is recommended and is the primary development version.
 
 Install the `vane-ai` package from PyPI:
 

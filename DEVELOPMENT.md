@@ -5,7 +5,7 @@ Vane contains Python, pybind11, and a modified DuckDB C++ engine. A native build
 ## Prerequisites
 
 - Linux x86-64 for the currently tested path
-- Python 3.10, 3.11, or 3.12; Python 3.12 is recommended and is the primary development version
+- Python 3.10 through 3.14; Python 3.12 is recommended and is the primary development version
 - Git with `git subtree` support
 - A C++20 compiler, CMake 3.29+, Ninja, and ccache
 - vcpkg at the baseline pinned in `vcpkg.json`

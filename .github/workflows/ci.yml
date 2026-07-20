@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -45,8 +45,12 @@ jobs:
           python scripts/check_release_artifacts.py dist/*.tar.gz
 
   native-fast-tests:
-    name: Native build and fast tests
+    name: Native build and fast tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
     env:
       VCPKG_ROOT: ${{ github.workspace }}/.cache/vcpkg
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
@@ -78,7 +82,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: pyproject.toml
 
@@ -100,12 +104,13 @@ jobs:
             build \
             "cmake>=3.29" \
             "ninja>=1.10" \
-            "pybind11[global]>=2.6.0" \
+            "pybind11[global]>=3.0.0" \
             "scikit-build-core>=0.11.4" \
             packaging \
             pytest
 
       - name: Build and run native distributed tests
+        if: matrix.python-version == '3.12'
         run: scripts/run_native_tests.sh "[distributed]"
 
       - name: Build release artifacts
@@ -135,6 +140,6 @@ jobs:
       - name: Upload validated artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ci-python-artifacts
+          name: ci-python-artifacts-${{ matrix.python-version }}
           path: dist/*
           if-no-files-found: error

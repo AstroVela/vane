@@ -17,19 +17,13 @@
 
 namespace py = pybind11;
 
-#if !defined(Py_LIMITED_API)
-extern "C" int _Py_IsFinalizing(void);
-#endif
-
 static bool VaneRunnerCanDecRefPython() {
 	if (!Py_IsInitialized()) {
 		return false;
 	}
-#if !defined(Py_LIMITED_API)
-	if (_Py_IsFinalizing()) {
+	if (duckdb::PythonIsFinalizing()) {
 		return false;
 	}
-#endif
 	return true;
 }
 

@@ -651,7 +651,7 @@ static duckdb::shared_ptr<void> WrapPyObjectForUDFActorHandles(const py::object 
 			return;
 		}
 		auto *boxed_obj = static_cast<py::object *>(ptr);
-		if (!Py_IsInitialized() || DuckdbPyIsFinalizing()) {
+		if (!Py_IsInitialized() || PythonIsFinalizing()) {
 			boxed_obj->release();
 			delete boxed_obj;
 			return;

@@ -80,7 +80,7 @@ jobs:
           python -m pip install \
             "cmake>=3.29" \
             "ninja>=1.10" \
-            "pybind11[global]>=2.6.0" \
+            "pybind11[global]>=3.0.0" \
             "scikit-build-core>=0.11.4"
 
       - name: Restore vcpkg binary cache

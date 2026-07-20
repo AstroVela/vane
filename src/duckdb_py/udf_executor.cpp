@@ -55,19 +55,13 @@ namespace duckdb {
 
 namespace {
 
-#if !defined(Py_LIMITED_API)
-extern "C" int _Py_IsFinalizing(void);
-#endif
-
 static bool PythonRuntimeUsableForUDFTeardown() {
 	if (!Py_IsInitialized()) {
 		return false;
 	}
-#if !defined(Py_LIMITED_API)
-	if (_Py_IsFinalizing()) {
+	if (PythonIsFinalizing()) {
 		return false;
 	}
-#endif
 	return true;
 }
 

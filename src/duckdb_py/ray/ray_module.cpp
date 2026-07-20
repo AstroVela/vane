@@ -13,6 +13,7 @@
 #include "duckdb_python/python_objects.hpp"
 #include "duckdb_python/arrow/arrow_array_stream.hpp"
 #include "duckdb_python/arrow/arrow_export_utils.hpp"
+#include "duckdb_python/pybind11/gil_wrapper.hpp"
 
 #include <duckdb/execution/distributed/plan/distributed_physical_plan.hpp>
 #include <duckdb/execution/distributed/plan/plan_config.hpp>
@@ -37,18 +38,6 @@
 #include <duckdb/common/local_file_system.hpp>
 #include <duckdb/common/types/uuid.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
-
-#if !defined(Py_LIMITED_API)
-extern "C" int _Py_IsFinalizing(void);
-#endif
-
-static inline int DuckdbPyIsFinalizing() {
-#ifdef Py_LIMITED_API
-	return 0;
-#else
-	return _Py_IsFinalizing();
-#endif
-}
 
 static inline int DuckdbGetEnvIntMs(const char *name) {
 	const char *val = std::getenv(name);

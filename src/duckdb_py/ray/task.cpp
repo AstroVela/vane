@@ -28,19 +28,13 @@ using namespace duckdb::distributed::python::ray;
 
 namespace {
 
-#if !defined(Py_LIMITED_API)
-extern "C" int _Py_IsFinalizing(void);
-#endif
-
 bool RayTaskPythonRuntimeUsable() {
 	if (!Py_IsInitialized()) {
 		return false;
 	}
-#if !defined(Py_LIMITED_API)
-	if (_Py_IsFinalizing()) {
+	if (duckdb::PythonIsFinalizing()) {
 		return false;
 	}
-#endif
 	return true;
 }
 

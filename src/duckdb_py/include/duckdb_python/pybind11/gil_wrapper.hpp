@@ -8,7 +8,25 @@
 
 #include "duckdb_python/pybind11/pybind_wrapper.hpp"
 
+#if PY_VERSION_HEX < 0x030D0000 && !defined(Py_LIMITED_API)
+extern "C" int _Py_IsFinalizing(void);
+#endif
+
 namespace duckdb {
+
+inline bool PythonIsFinalizing() {
+#if PY_VERSION_HEX >= 0x030D0000
+#if !defined(Py_LIMITED_API) || Py_LIMITED_API + 0 >= 0x030D0000
+	return Py_IsFinalizing();
+#else
+	return false;
+#endif
+#elif !defined(Py_LIMITED_API)
+	return _Py_IsFinalizing();
+#else
+	return false;
+#endif
+}
 
 //! Thread-safe GIL wrapper that keeps a PERSISTENT PyThreadState per thread.
 //!

@@ -25,7 +25,7 @@ license-files = [
     "external/duckdb/extension/jemalloc/jemalloc/LICENSE",
 ]
 keywords = ["Vane", "DuckDB", "Ray", "Distributed", "Database", "SQL", "OLAP"]
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10,<3.15"
 dependencies = [
     "cloudpickle>=3.1.2,<4",
     "numpy",
@@ -48,6 +48,8 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: C++",
 ]
 authors = [{name = "Vane contributors"}]
@@ -93,7 +95,7 @@ build-backend = "build_backend"
 backend-path = ["."]
 requires = [
     "scikit-build-core>=0.11.4",
-	"pybind11[global]>=2.6.0",
+	"pybind11[global]>=3.0.0",
 ]
 
 [tool.scikit-build]
@@ -336,20 +338,20 @@ default-groups = ["dev"]
 # build wheels for.
 # See https://docs.astral.sh/uv/concepts/resolution/#universal-resolution
 environments = [ # no need to resolve packages beyond these platforms with uv...
-    "python_version >= '3.10' and python_version < '3.13' and sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "python_version >= '3.10' and python_version < '3.13' and sys_platform == 'darwin' and platform_machine == 'x86_64'",
-    "python_version >= '3.10' and python_version < '3.13' and sys_platform == 'win32' and platform_machine == 'AMD64'",
-    "python_version >= '3.11' and python_version < '3.13' and sys_platform == 'win32' and platform_machine == 'ARM64'",
-    "python_version >= '3.10' and python_version < '3.13' and sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "python_version >= '3.10' and python_version < '3.13' and sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "python_version >= '3.10' and python_version < '3.15' and sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "python_version >= '3.10' and python_version < '3.15' and sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "python_version >= '3.10' and python_version < '3.15' and sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "python_version >= '3.11' and python_version < '3.15' and sys_platform == 'win32' and platform_machine == 'ARM64'",
+    "python_version >= '3.10' and python_version < '3.15' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "python_version >= '3.10' and python_version < '3.15' and sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 required-environments = [ # ... but do always resolve for all of them
-    "python_version >= '3.10' and python_version < '3.13' and sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "python_version >= '3.10' and python_version < '3.13' and sys_platform == 'darwin' and platform_machine == 'x86_64'",
-    "python_version >= '3.10' and python_version < '3.13' and sys_platform == 'win32' and platform_machine == 'AMD64'",
-    "python_version >= '3.11' and python_version < '3.13' and sys_platform == 'win32' and platform_machine == 'ARM64'",
-    "python_version >= '3.10' and python_version < '3.13' and sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "python_version >= '3.10' and python_version < '3.13' and sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "python_version >= '3.10' and python_version < '3.15' and sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "python_version >= '3.10' and python_version < '3.15' and sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "python_version >= '3.10' and python_version < '3.15' and sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "python_version >= '3.11' and python_version < '3.15' and sys_platform == 'win32' and platform_machine == 'ARM64'",
+    "python_version >= '3.10' and python_version < '3.15' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "python_version >= '3.10' and python_version < '3.15' and sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 
 # We just need pytorch for tests, wihtout GPU acceleration. PyPI doesn't host a cpu-only version for Linux, so we have
@@ -426,7 +428,7 @@ pypi = [ # dependencies used by the pypi cleanup script
 build = [
     "cmake>=3.29.0",
     "ninja>=1.10",
-    "pybind11[global]>=2.6.0",
+    "pybind11[global]>=3.0.0",
     "scikit_build_core>=0.11.4",
     "tomli>=1.1; python_version < '3.11'",
 ]
@@ -578,7 +580,7 @@ indent-style = "space"
 ######################################################################################################
 [tool.cibuildwheel]
 archs = ["x86_64"]
-build = "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64"
+build = "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64 cp314-manylinux_x86_64"
 build-frontend = "build[uv]"
 build-verbosity = 1
 manylinux-x86_64-image = "manylinux_2_28"

@@ -13,19 +13,13 @@ namespace distributed {
 namespace python {
 namespace ray {
 
-#if !defined(Py_LIMITED_API)
-extern "C" int _Py_IsFinalizing(void);
-#endif
-
 static inline bool SafePyObjectCanDecRef() {
 	if (!Py_IsInitialized()) {
 		return false;
 	}
-#if !defined(Py_LIMITED_API)
-	if (_Py_IsFinalizing()) {
+	if (PythonIsFinalizing()) {
 		return false;
 	}
-#endif
 	return true;
 }
 
