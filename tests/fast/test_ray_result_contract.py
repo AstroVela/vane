@@ -2899,7 +2899,7 @@ def test_run_copy_plan_local_direct_write_committed_reader(tmp_path, monkeypatch
     loser_file = dst / f"{result['copy_output_run_id']}_w_loser_part.parquet"
     loser_file.parent.mkdir(parents=True, exist_ok=True)
     con.execute(f"COPY (SELECT 999 AS x) TO '{loser_file}' (FORMAT PARQUET)")
-    all_run_files = [str(path) for path in Path(dst).rglob("*.parquet")]
+    all_run_files = [*committed_paths, str(loser_file)]
     assert con.read_parquet(all_run_files).aggregate("count(*)").fetchone()[0] == 4
 
     from duckdb.runners.ray import read_committed_copy_direct_write_parquet
