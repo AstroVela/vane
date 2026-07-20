@@ -131,9 +131,9 @@ class LocalVLLMExecutor(VLLMExecutor):
 
         self.model = model
         self.engine_args = dict(engine_args)
-        self.llm = None
+        self.llm: Any = None
         self.engine_ready = threading.Event()
-        self.engine_error_message = None
+        self.engine_error_message: str | None = None
         self.engine_init_timeout_s = _vllm_engine_init_timeout_s(engine_init_timeout_s)
 
         sampling_params = generate_args.pop("sampling_params", None)
@@ -160,7 +160,7 @@ class LocalVLLMExecutor(VLLMExecutor):
         self.task_count_lock = threading.Lock()
 
         self.completed_tasks: deque[tuple[str | None, pa.Table]] = deque()
-        self.error_message = None
+        self.error_message: str | None = None
         self.error_lock = threading.Lock()
         self.on_error = on_error
 
@@ -275,7 +275,7 @@ class LocalVLLMExecutor(VLLMExecutor):
             if final_output is None or not final_output.outputs:
                 raise RuntimeError("vllm returned no outputs")
 
-            output_text: str = final_output.outputs[0].text  # type: ignore[assignment]
+            output_text: str = final_output.outputs[0].text
             target_deque.append((output_text, row))
             with self._result_cv:
                 self._result_cv.notify_all()
@@ -454,13 +454,15 @@ class LocalVLLMExecutor(VLLMExecutor):
         source_deque = (
             self._per_executor_deques.get(executor_id, self.completed_tasks) if executor_id else self.completed_tasks
         )
-        if executor_id:
-            done = lambda: (
-                executor_id in self._per_executor_finished
-                and self._per_executor_running_task_count.get(executor_id, 0) == 0
-            )
-        else:
-            done = lambda: self._finished_submitting and self.running_task_count == 0
+
+        def done() -> bool:
+            if executor_id:
+                return (
+                    executor_id in self._per_executor_finished
+                    and self._per_executor_running_task_count.get(executor_id, 0) == 0
+                )
+            return self._finished_submitting and self.running_task_count == 0
+
         with self._result_cv:
             self._result_cv.wait_for(lambda: len(source_deque) > 0 or self.error_message is not None or done())
             return len(source_deque) > 0
@@ -477,13 +479,13 @@ class LocalVLLMExecutor(VLLMExecutor):
         with self._result_cv:
             self._result_cv.notify_all()
         loop = getattr(self, "loop", None)
-        loop_thread = getattr(self, "loop_thread", None)
         if loop is not None and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
 
 
 class RayLocalVLLMExecutor(LocalVLLMExecutor):
-    async def wait_for_result(self, executor_id: str | None = None) -> bool:
+    # Ray actor calls are awaitable, while the in-process executor exposes a blocking method.
+    async def wait_for_result(self, executor_id: str | None = None) -> bool:  # type: ignore[override]
         return await asyncio.to_thread(self._wait_for_result_blocking, executor_id)
 
 
