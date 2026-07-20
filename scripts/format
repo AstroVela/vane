@@ -41,7 +41,6 @@ Examples:
 Notes:
   external/duckdb contains C++, Python, CMake, test, and benchmark files.
   Its formatter is intentionally separate from the root repository formatter.
-  Successful duckdb formatting also refreshes the ignored local DuckDB SourceID manifest.
   workspace runs root and external/duckdb independently, then reports failures.
   root requires pre-commit on PATH.
   duckdb requires black>=24, clang-format 11.0.1, and cmake-format on PATH.
@@ -274,8 +273,7 @@ run_duckdb_format() {
     return "$format_status"
   fi
 
-  echo "Refreshing the local DuckDB SourceID manifest..."
-  python "$repo_root/scripts/sync_duckdb_source_id.py"
+  return 0
 }
 
 run_workspace_format() {

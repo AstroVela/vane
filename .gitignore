@@ -36,7 +36,7 @@ a.out
 *.dll
 
 build
-# Generated locally and injected into source distributions by build_backend.py.
+# Present in source distributions only; ignore accidental local copies.
 /DUCKDB_SOURCE_ID
 .build_debug/*
 .build_release/*

@@ -125,25 +125,26 @@ The subtree metadata records the exact official DuckDB revision in
 under `external/duckdb`; review and resolve them when updating the official
 baseline. When replaying a change formerly maintained in another repository,
 preserve its author and date and record the original commit and upstream parent
-as commit trailers. `scripts/format duckdb` and `scripts/format workspace`
-refresh the ignored local identity manifest after a successful formatter pass.
-To inspect the identity without writing the manifest, or to refresh it
-explicitly, run:
+as commit trailers. To inspect the content-derived identity without writing the
+checkout, run:
 
 ```bash
 python scripts/sync_duckdb_source_id.py --print
-python scripts/sync_duckdb_source_id.py
 ```
 
 The script computes the full Git tree object for `external/duckdb`, including
 staged, unstaged, and untracked non-ignored engine files without changing the
-real Git index. `DUCKDB_SOURCE_ID` is ignored build metadata and must not be
-committed. The local PEP 517 backend generates it before building an sdist, the
-sdist carries it for builds without Git metadata, and artifact validation checks
-it against the checkout. Parallel engine pull requests therefore do not modify
-a shared generated file. Update `SOURCE_PROVENANCE.md` and
-`OVERRIDE_GIT_DESCRIBE` only when the imported upstream baseline, DuckDB version
-line, or historical mapping changes.
+real Git index or object store. Native configuration writes a generated header
+to the CMake binary directory; a lightweight build target refreshes that header
+before direct incremental builds and recompiles DuckDB's version object only
+when the tree ID changes. The local PEP 517 backend injects
+`DUCKDB_SOURCE_ID` directly into the completed sdist, so read-only Git checkouts
+remain supported. The sdist carries that manifest for builds without Git
+metadata, and artifact validation checks it against the checkout. The manifest
+is ignored build metadata and must not be committed, so parallel engine pull
+requests do not modify a shared generated file. Update `SOURCE_PROVENANCE.md`
+and `OVERRIDE_GIT_DESCRIBE` only when the imported upstream baseline, DuckDB
+version line, or historical mapping changes.
 
 The original upstream history remains in `duckdb/duckdb`. Vane's path history
 begins at the squashed snapshot and includes every later Vane engine commit. To

@@ -47,17 +47,19 @@ metadata.
 
 The exact engine identity is content-derived instead. The build computes the
 full Git tree object for `external/duckdb` with
-`scripts/sync_duckdb_source_id.py`. Git checkouts keep `DUCKDB_SOURCE_ID` as an
-ignored local manifest; the PEP 517 backend generates and embeds that manifest
-in source distributions so builds without Git metadata retain the same
-identity. The top-level CMake build passes its first 10 hexadecimal characters
-as `GIT_COMMIT_HASH` and DuckDB's embedded `SourceID`. The tree object depends
-on engine paths, modes, and contents rather than commit topology, so rebases and
-squash merges do not change the SourceID. Ordinary engine changes require no
-tracked identity update. Changes to the upstream baseline, DuckDB version line,
-or historical mapping must update this document and `OVERRIDE_GIT_DESCRIBE`.
-Release reviews must record the full tree ID and inspect subsequent Vane engine
-commits since the previously released state.
+`scripts/sync_duckdb_source_id.py`. Git builds write the short identity only to
+a generated header in the CMake binary directory and refresh it before direct
+incremental builds. The PEP 517 backend injects the full `DUCKDB_SOURCE_ID`
+manifest into source distributions without modifying the checkout, so builds
+without Git metadata retain the same identity. The top-level CMake build also
+passes the configure-time value through `GIT_COMMIT_HASH`; the generated header
+ensures DuckDB's embedded `SourceID` reflects later direct-build changes. The
+tree object depends on engine paths, modes, and contents rather than commit
+topology, so rebases and squash merges do not change the SourceID. Ordinary
+engine changes require no tracked identity update. Changes to the upstream
+baseline, DuckDB version line, or historical mapping must update this document
+and `OVERRIDE_GIT_DESCRIBE`. Release reviews must record the full tree ID and
+inspect subsequent Vane engine commits since the previously released state.
 
 The statically linked DuckDB HTTPFS extension is fetched separately during the
 native build and pinned to commit

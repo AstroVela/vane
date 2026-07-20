@@ -14,10 +14,10 @@ export SKBUILD_CMAKE_BUILD_TYPE=Release
 uv pip install . --no-build-isolation
 ```
 
-DuckDB and workspace formatting refresh the ignored, content-derived
-`DUCKDB_SOURCE_ID` manifest used as a local build stamp. Do not add that file to
-Git. The PEP 517 backend generates and validates it when building source
-distributions.
+Native builds compute the content-derived DuckDB SourceID without modifying the
+checkout. Direct incremental builds refresh a generated header in the build
+directory. The PEP 517 backend injects `DUCKDB_SOURCE_ID` into source
+distributions; do not add that generated file to Git.
 
 ## Formatting
 

@@ -2,21 +2,20 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compute and materialize DuckDB's content-derived SourceID."""
+"""Compute DuckDB's content-derived SourceID and write build outputs."""
 
 from __future__ import annotations
 
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIRECTORY = "external/duckdb"
-SOURCE_ID_PATH = "DUCKDB_SOURCE_ID"
-SOURCE_ID_FILE = REPOSITORY_ROOT / SOURCE_ID_PATH
 GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 
@@ -32,21 +31,60 @@ def _git(*args: str, env: dict[str, str] | None = None) -> str:
     return result.stdout.strip()
 
 
+def _git_path(name: str) -> Path:
+    path = Path(_git("rev-parse", "--git-path", name))
+    return path if path.is_absolute() else REPOSITORY_ROOT / path
+
+
+def _write_tree(environment: dict[str, str], temporary_index: Path) -> str:
+    """Write the worktree through a disposable index, with a safe fallback."""
+    copied_index = False
+    try:
+        shutil.copyfile(_git_path("index"), temporary_index)
+        copied_index = True
+    except OSError:
+        _git("read-tree", "HEAD", env=environment)
+
+    try:
+        _git("add", "-A", "--", SOURCE_DIRECTORY, env=environment)
+        return _git("write-tree", env=environment)
+    except subprocess.CalledProcessError:
+        if not copied_index:
+            raise
+
+    # A split or conflicted real index might not be reusable outside its Git
+    # directory. Starting from HEAD is slower, but remains independent of the
+    # developer's index and resolves conflicts outside the DuckDB subtree.
+    temporary_index.unlink(missing_ok=True)
+    _git("read-tree", "HEAD", env=environment)
+    _git("add", "-A", "--", SOURCE_DIRECTORY, env=environment)
+    return _git("write-tree", env=environment)
+
+
 def source_tree_id() -> str:
     """Return the Git tree ID for the current DuckDB working tree."""
     top_level = Path(_git("rev-parse", "--show-toplevel")).resolve()
     if top_level != REPOSITORY_ROOT:
         raise RuntimeError(f"expected Git root {REPOSITORY_ROOT}, found {top_level}")
 
-    # Use a temporary index so staged, unstaged, and untracked non-ignored
-    # DuckDB files all contribute without changing the developer's real index.
+    # Use temporary index and object stores so staged, unstaged, and untracked
+    # non-ignored DuckDB files all contribute without writing the checkout or
+    # its Git metadata. The real object store remains available read-only.
     with tempfile.TemporaryDirectory(prefix="vane-duckdb-source-id-") as temporary_directory:
-        temporary_index = Path(temporary_directory) / "index"
+        temporary_root = Path(temporary_directory)
+        temporary_index = temporary_root / "index"
+        temporary_objects = temporary_root / "objects"
+        temporary_objects.mkdir()
         environment = os.environ.copy()
         environment["GIT_INDEX_FILE"] = str(temporary_index)
-        _git("read-tree", "HEAD", env=environment)
-        _git("add", "-A", "--", SOURCE_DIRECTORY, env=environment)
-        repository_tree = _git("write-tree", env=environment)
+        environment["GIT_OBJECT_DIRECTORY"] = str(temporary_objects)
+        real_objects = str(_git_path("objects"))
+        existing_alternates = environment.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = (
+            real_objects if existing_alternates is None else real_objects + os.pathsep + existing_alternates
+        )
+        environment["GIT_OPTIONAL_LOCKS"] = "0"
+        repository_tree = _write_tree(environment, temporary_index)
         tree_id = _git("rev-parse", f"{repository_tree}:{SOURCE_DIRECTORY}", env=environment)
 
     if GIT_OBJECT_ID.fullmatch(tree_id) is None:
@@ -54,39 +92,67 @@ def source_tree_id() -> str:
     return tree_id
 
 
-def synchronize_source_id() -> str:
-    """Write the ignored SourceID manifest when needed and return its value."""
-    tree_id = source_tree_id()
-    expected = tree_id + "\n"
-    actual = SOURCE_ID_FILE.read_text(encoding="utf-8") if SOURCE_ID_FILE.exists() else ""
+def validate_source_id(source_id: str) -> str:
+    """Validate and return a full Git object ID."""
+    if GIT_OBJECT_ID.fullmatch(source_id) is None:
+        raise ValueError(f"invalid DuckDB source tree ID: {source_id!r}")
+    return source_id
 
-    if actual != expected:
-        SOURCE_ID_FILE.write_text(expected, encoding="utf-8")
 
-    return tree_id
+def _write_if_changed(path: Path, contents: str) -> None:
+    """Atomically replace a generated file only when its contents changed."""
+    actual = path.read_text(encoding="ascii") if path.exists() else ""
+    if actual == contents:
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii") as temporary_file:
+            temporary_file.write(contents)
+        temporary_path.chmod(0o644)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def write_source_id(path: Path, source_id: str) -> None:
+    """Write a full SourceID manifest to an arbitrary build output path."""
+    _write_if_changed(path, validate_source_id(source_id) + "\n")
+
+
+def write_source_id_header(path: Path, source_id: str) -> None:
+    """Write the generated header used by direct incremental native builds."""
+    short_source_id = validate_source_id(source_id)[:10]
+    contents = f"""// Generated by scripts/sync_duckdb_source_id.py. Do not edit.
+#pragma once
+
+#ifdef DUCKDB_SOURCE_ID
+#undef DUCKDB_SOURCE_ID
+#endif
+#define DUCKDB_SOURCE_ID \"{short_source_id}\"
+"""
+    _write_if_changed(path, contents)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--check", action="store_true", help="fail instead of rewriting an out-of-date SourceID")
-    mode.add_argument("--print", action="store_true", dest="print_only", help="print without writing the manifest")
+    mode.add_argument("--print", action="store_true", dest="print_only", help="print the full tree ID")
+    mode.add_argument("--output", type=Path, help="write the full tree ID to this build output")
+    mode.add_argument("--header", type=Path, help="write a C++ header containing the short SourceID")
+    parser.add_argument("--source-id", help="use this full tree ID instead of computing it from Git")
     args = parser.parse_args()
 
-    if args.print_only:
-        print(source_tree_id())
-        return 0
+    source_id = validate_source_id(args.source_id) if args.source_id is not None else source_tree_id()
 
-    if args.check:
-        expected = source_tree_id() + "\n"
-        actual = SOURCE_ID_FILE.read_text(encoding="utf-8") if SOURCE_ID_FILE.exists() else ""
-        if actual != expected:
-            print(f"{SOURCE_ID_FILE} is missing or out of date")
-            return 1
-        print(f"{SOURCE_ID_FILE} is up to date")
-        return 0
-
-    print(synchronize_source_id())
+    if args.output is not None:
+        write_source_id(args.output, source_id)
+    elif args.header is not None:
+        write_source_id_header(args.header, source_id)
+    else:
+        print(source_id)
     return 0
 
 

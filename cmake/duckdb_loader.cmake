@@ -167,13 +167,7 @@ function(_duckdb_resolve_source_id)
   set(_VANE_DUCKDB_SOURCE_ID_SCRIPT
       "${PROJECT_SOURCE_DIR}/scripts/sync_duckdb_source_id.py")
   set(_VANE_DUCKDB_DEFAULT_SOURCE_PATH "${PROJECT_SOURCE_DIR}/external/duckdb")
-
-  # Git builds keep an ignored local manifest as a CMake reconfiguration stamp.
-  # Source archives carry the same generated file without requiring Git.
-  set_property(
-    DIRECTORY "${PROJECT_SOURCE_DIR}"
-    APPEND
-    PROPERTY CMAKE_CONFIGURE_DEPENDS "${_VANE_DUCKDB_SOURCE_ID_FILE}")
+  set(_VANE_DUCKDB_SOURCE_ID_DYNAMIC FALSE)
 
   if(DEFINED VANE_DUCKDB_SOURCE_ID)
     set(_VANE_DUCKDB_SOURCE_ID "${VANE_DUCKDB_SOURCE_ID}")
@@ -186,7 +180,7 @@ function(_duckdb_resolve_source_id)
     endif()
     find_package(Python REQUIRED COMPONENTS Interpreter)
     execute_process(
-      COMMAND "${Python_EXECUTABLE}" "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}"
+      COMMAND "${Python_EXECUTABLE}" "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}" --print
       WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
       RESULT_VARIABLE _VANE_DUCKDB_SOURCE_ID_RESULT
       OUTPUT_VARIABLE _VANE_DUCKDB_SOURCE_ID
@@ -196,6 +190,7 @@ function(_duckdb_resolve_source_id)
       message(FATAL_ERROR "Unable to compute the DuckDB source tree ID: "
                           "${_VANE_DUCKDB_SOURCE_ID_ERROR}")
     endif()
+    set(_VANE_DUCKDB_SOURCE_ID_DYNAMIC TRUE)
   elseif(EXISTS "${_VANE_DUCKDB_SOURCE_ID_FILE}")
     file(READ "${_VANE_DUCKDB_SOURCE_ID_FILE}" _VANE_DUCKDB_SOURCE_ID)
     string(STRIP "${_VANE_DUCKDB_SOURCE_ID}" _VANE_DUCKDB_SOURCE_ID)
@@ -224,6 +219,74 @@ function(_duckdb_resolve_source_id)
   set(GIT_COMMIT_HASH
       "${_VANE_DUCKDB_SHORT_SOURCE_ID}"
       PARENT_SCOPE)
+  set(VANE_DUCKDB_SOURCE_ID_DYNAMIC
+      "${_VANE_DUCKDB_SOURCE_ID_DYNAMIC}"
+      PARENT_SCOPE)
+endfunction()
+
+function(_duckdb_enable_source_id_refresh)
+  set(_VANE_DUCKDB_SOURCE_ID_SCRIPT
+      "${PROJECT_SOURCE_DIR}/scripts/sync_duckdb_source_id.py")
+  set(_VANE_DUCKDB_SOURCE_ID_HEADER
+      "${PROJECT_BINARY_DIR}/generated/vane_duckdb_source_id.hpp")
+
+  if(NOT EXISTS "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}")
+    message(FATAL_ERROR "Missing ${_VANE_DUCKDB_SOURCE_ID_SCRIPT}")
+  endif()
+  if(NOT TARGET duckdb_func_table_version)
+    message(FATAL_ERROR "DuckDB version target is unavailable")
+  endif()
+
+  find_package(Python REQUIRED COMPONENTS Interpreter)
+  set(_VANE_DUCKDB_SOURCE_ID_ARGUMENTS --header
+                                       "${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+  if(NOT VANE_DUCKDB_SOURCE_ID_DYNAMIC)
+    list(APPEND _VANE_DUCKDB_SOURCE_ID_ARGUMENTS --source-id
+         "${VANE_DUCKDB_SOURCE_TREE}")
+  endif()
+
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}"
+            ${_VANE_DUCKDB_SOURCE_ID_ARGUMENTS}
+    WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+    RESULT_VARIABLE _VANE_DUCKDB_HEADER_RESULT
+    ERROR_VARIABLE _VANE_DUCKDB_HEADER_ERROR)
+  if(_VANE_DUCKDB_HEADER_RESULT)
+    message(FATAL_ERROR "Unable to generate the DuckDB SourceID header: "
+                        "${_VANE_DUCKDB_HEADER_ERROR}")
+  endif()
+
+  if(VANE_DUCKDB_SOURCE_ID_DYNAMIC)
+    # This target intentionally runs on every native build. The script uses a
+    # disposable Git index and rewrites the binary-directory header only when
+    # the DuckDB tree ID changes, so direct incremental builds cannot retain a
+    # SourceID from a previous branch or worktree state.
+    add_custom_target(
+      vane_duckdb_source_id_refresh ALL
+      COMMAND "${Python_EXECUTABLE}" "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}"
+              ${_VANE_DUCKDB_SOURCE_ID_ARGUMENTS}
+      BYPRODUCTS "${_VANE_DUCKDB_SOURCE_ID_HEADER}"
+      WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+      COMMENT "Refreshing DuckDB SourceID"
+      VERBATIM)
+    add_dependencies(duckdb_func_table_version vane_duckdb_source_id_refresh)
+    set_property(
+      DIRECTORY "${PROJECT_SOURCE_DIR}"
+      APPEND
+      PROPERTY CMAKE_CONFIGURE_DEPENDS "${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+  endif()
+
+  set_source_files_properties("${_VANE_DUCKDB_SOURCE_ID_HEADER}"
+                              PROPERTIES GENERATED TRUE HEADER_FILE_ONLY TRUE)
+  target_sources(duckdb_func_table_version
+                 PRIVATE "${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+  if(MSVC)
+    target_compile_options(duckdb_func_table_version
+                           PRIVATE "/FI${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+  else()
+    target_compile_options(duckdb_func_table_version
+                           PRIVATE -include "${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+  endif()
 endfunction()
 
 function(_duckdb_create_interface_target target_name)
@@ -314,6 +377,7 @@ function(duckdb_add_library target_name)
 
   # Add DuckDB subdirectory - it will use our variables
   add_subdirectory("${DUCKDB_SOURCE_PATH}" duckdb EXCLUDE_FROM_ALL)
+  _duckdb_enable_source_id_refresh()
 
   # Create clean interface target
   _duckdb_create_interface_target(${target_name})
