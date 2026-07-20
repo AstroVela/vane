@@ -377,9 +377,9 @@ class TestAllTypes:
             ),
             "interval": np.ma.array(
                 [
-                    np.timedelta64(0),
-                    np.timedelta64(2675722599999999000),
-                    np.timedelta64(42),
+                    np.timedelta64(0, "ns"),
+                    np.timedelta64(2675722599999999000, "ns"),
+                    np.timedelta64(42, "ns"),
                 ],
                 mask=[0, 0, 1],
             ),
@@ -387,7 +387,7 @@ class TestAllTypes:
             # such that the conversion yields "Not a Time"
             "timestamp_ns": np.ma.array(
                 [
-                    np.datetime64("NaT"),
+                    np.datetime64("NaT", "ns"),
                     np.datetime64(9223372036854775806, "ns"),
                     np.datetime64("1990-01-01T00:42"),
                 ],
