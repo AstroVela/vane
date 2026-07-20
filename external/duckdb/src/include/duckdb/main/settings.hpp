@@ -1367,7 +1367,7 @@ struct PreserveInsertionOrderSetting {
 	    "Whether or not to preserve insertion order. If set to false the system is allowed to re-order any results "
 	    "that do not contain ORDER BY clauses.";
 	static constexpr const char *InputType = "BOOLEAN";
-	static constexpr const char *DefaultValue = "false";
+	static constexpr const char *DefaultValue = "true";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
 	static constexpr idx_t SettingIndex = 82;
 };
