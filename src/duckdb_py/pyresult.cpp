@@ -410,6 +410,9 @@ ArrowArrayStream DuckDBPyResult::FetchArrowArrayStream(idx_t rows_per_batch) {
 	if (row_consumption_started || current_chunk) {
 		throw InvalidInputException("Cannot switch a partially consumed row result to an Arrow stream");
 	}
+	if (rows_per_batch == 0) {
+		throw std::runtime_error("Approximate Batch Size of Record Batch MUST be higher than 0");
+	}
 	auto stream = source->TakeArrowStream(rows_per_batch);
 	source.reset();
 	return stream;
@@ -448,10 +451,19 @@ static void ArrowArrayStreamPyCapsuleDestructor(PyObject *object) {
 }
 
 py::object DuckDBPyResult::FetchArrowCapsule(idx_t rows_per_batch) {
-	auto stream_p = FetchArrowArrayStream(rows_per_batch);
-	auto stream = new ArrowArrayStream();
-	*stream = stream_p;
-	return py::capsule(stream, "arrow_array_stream", ArrowArrayStreamPyCapsuleDestructor);
+	auto stream = make_uniq<ArrowArrayStream>();
+	stream->release = nullptr;
+	*stream = FetchArrowArrayStream(rows_per_batch);
+	try {
+		auto capsule = py::capsule(stream.get(), "arrow_array_stream", ArrowArrayStreamPyCapsuleDestructor);
+		stream.release();
+		return capsule;
+	} catch (...) {
+		if (stream->release) {
+			stream->release(stream.get());
+		}
+		throw;
+	}
 }
 
 py::list DuckDBPyResult::GetDescription(const vector<string> &names, const vector<LogicalType> &types) {

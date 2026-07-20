@@ -1102,18 +1102,46 @@ unique_ptr<QueryResult> DuckDBPyRelation::ExecuteInternal(bool stream_result) {
 
 void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
 	if (ResolveRunnerType() == "ray") {
+		auto context = rel->context->GetContext();
+		auto &client_config = ClientConfig::GetConfig(*context);
+		auto result_collector = client_config.get_result_collector;
+		ScopedConfigSetting result_collector_scope(
+		    client_config, [](ClientConfig &config) { config.get_result_collector = nullptr; },
+		    [&result_collector](ClientConfig &config) { config.get_result_collector = std::move(result_collector); });
+
 		this->executed = true;
+		py::object table_iterator;
 		try {
 			auto runner = GetOrCreateRunnerForDB(rel, "ray");
 			auto py_relation = DuckDBPyRelation(rel);
 			py_relation.SetConnectionOwner(connection_owner);
 			auto py_relation_obj = py::cast(std::move(py_relation));
-			auto table_iterator = runner.attr("run_iter_tables")(py_relation_obj, py::int_(1));
+			table_iterator = py::iter(runner.attr("run_iter_tables")(py_relation_obj, py::int_(1)));
+			py::object prefetched_partition;
+			bool has_prefetched_partition = false;
+			bool iterator_exhausted = false;
+			PyObject *next_ptr = PyIter_Next(table_iterator.ptr());
+			if (next_ptr) {
+				prefetched_partition = py::reinterpret_steal<py::object>(next_ptr);
+				has_prefetched_partition = true;
+			} else if (PyErr_Occurred()) {
+				throw py::error_already_set();
+			} else {
+				iterator_exhausted = true;
+			}
 			ForgetRunnerForDB(rel);
-			result = make_uniq<DuckDBPyResult>(MakeDistributedArrowPyResultSource(std::move(table_iterator), names,
-			                                                                      types, rel->context->GetContext()));
+			result = make_uniq<DuckDBPyResult>(MakeDistributedArrowPyResultSource(
+			    std::move(table_iterator), std::move(prefetched_partition), has_prefetched_partition,
+			    iterator_exhausted, names, types, context));
 			return;
 		} catch (...) {
+			if (table_iterator && py::hasattr(table_iterator, "close")) {
+				try {
+					table_iterator.attr("close")();
+				} catch (py::error_already_set &ex) {
+					ex.discard_as_unraisable("closing distributed result iterator after startup failure");
+				}
+			}
 			ForgetRunnerForDB(rel);
 			throw;
 		}
@@ -1252,11 +1280,18 @@ PandasDataFrame DuckDBPyRelation::FetchDFChunk(idx_t vectors_per_chunk, bool dat
 		}
 		ExecuteOrThrow(true);
 	}
-	AssertResultOpen();
+	AssertResult();
 	return result->FetchDFChunk(vectors_per_chunk, date_as_object);
 }
 
+static void ValidateArrowBatchSize(idx_t batch_size) {
+	if (batch_size == 0) {
+		throw std::runtime_error("Approximate Batch Size of Record Batch MUST be higher than 0");
+	}
+}
+
 duckdb::pyarrow::Table DuckDBPyRelation::ToArrowTableInternal(idx_t batch_size, bool to_polars) {
+	ValidateArrowBatchSize(batch_size);
 	if (!result) {
 		if (!rel) {
 			return py::none();
@@ -1343,6 +1378,7 @@ PolarsDataFrame DuckDBPyRelation::ToPolars(idx_t batch_size, bool lazy) {
 }
 
 duckdb::pyarrow::RecordBatchReader DuckDBPyRelation::ToRecordBatch(idx_t batch_size) {
+	ValidateArrowBatchSize(batch_size);
 	if (!result) {
 		if (!rel) {
 			return py::none();

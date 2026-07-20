@@ -31,8 +31,8 @@ def test_relation_show_materializes_through_ray(monkeypatch, capsys):
     monkeypatch.delenv("VANE_RUNNER", raising=False)
     runner = _FakeRayRunner(
         [
-            pa.table({"value": [41]}),
-            pa.table({"value": [42]}),
+            pa.table({"value": pa.array([41], pa.int32())}),
+            pa.table({"value": pa.array([42], pa.int32())}),
         ]
     )
     _install_fake_ray_runner(monkeypatch, runner)
@@ -64,7 +64,7 @@ def test_relation_show_uses_local_execution(monkeypatch, capsys):
 
 def test_relation_show_preserves_duplicate_column_names(monkeypatch, capsys):
     monkeypatch.setenv("VANE_RUNNER", "")
-    table = pa.Table.from_arrays([pa.array([10]), pa.array([20])], names=["a", "a"])
+    table = pa.Table.from_arrays([pa.array([10], pa.int32()), pa.array([20], pa.int32())], names=["a", "a"])
     runner = _FakeRayRunner([table])
     _install_fake_ray_runner(monkeypatch, runner)
 
@@ -83,7 +83,7 @@ def test_relation_show_handles_empty_distributed_result(monkeypatch, capsys):
     _install_fake_ray_runner(monkeypatch, runner)
 
     connection = duckdb.connect()
-    connection.sql("SELECT NULL::VARCHAR AS name WHERE FALSE").show()
+    connection.sql("SELECT NULL::VARCHAR AS name").show()
 
     output = capsys.readouterr().out
     assert "name" in output
