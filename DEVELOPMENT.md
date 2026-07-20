@@ -7,7 +7,7 @@ Vane contains Python, pybind11, and a modified DuckDB C++ engine. A native build
 - Linux x86-64 for the currently tested path
 - Python 3.10, 3.11, or 3.12; Python 3.12 is recommended and is the primary development version
 - Git with `git subtree` support
-- A C++17 compiler, CMake 3.29+, Ninja, and ccache
+- A C++20 compiler, CMake 3.29+, Ninja, and ccache
 - vcpkg at the baseline pinned in `vcpkg.json`
 
 The DuckDB engine fork is included directly under `external/duckdb`; a normal
@@ -42,21 +42,27 @@ Do not use `pip install -e`. An editable install can cause Ray workers to invoke
 
 Python-only changes do not require a native rebuild. Changes below `src/duckdb_py/` or `external/duckdb/src/` do.
 
-## DuckDB engine-only build
+## Native C++ tests
 
-For a fast C++ compile check:
-
-```bash
-cmake -S external/duckdb -B external/duckdb/build -G Ninja
-cmake --build external/duckdb/build --parallel
-```
-
-Run a named engine test or the full unit suite:
+The complete native gate builds DuckDB, distributed exchange, and the test
+runner with the same pinned Arrow and C++20 configuration used by CI. The
+script starts from a fresh CMake configuration (`cmake --fresh`) to avoid
+configuration drift, which triggers a clean rebuild in its build directory:
 
 ```bash
-external/duckdb/build/test/unittest "test name" -s
-external/duckdb/build/test/unittest
+scripts/run_native_tests.sh "[distributed]"
 ```
+
+Run a named engine test or the complete unit suite with the same build:
+
+```bash
+scripts/run_native_tests.sh "test name" -s
+scripts/run_native_tests.sh
+```
+
+The build uses two parallel compile jobs by default to stay within standard CI
+runner memory. Override that limit with `VANE_NATIVE_BUILD_JOBS` when the local
+machine has more capacity.
 
 ## Python tests
 

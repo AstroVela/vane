@@ -106,6 +106,9 @@ jobs:
             packaging \
             pytest
 
+      - name: Build and run native distributed tests
+        run: scripts/run_native_tests.sh "[distributed]"
+
       - name: Build release artifacts
         env:
           SKBUILD_BUILD_DIR: ${{ github.workspace }}/build
