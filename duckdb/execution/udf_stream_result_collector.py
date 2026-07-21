@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import os
 import sys
 import threading
@@ -115,8 +114,8 @@ class AsyncResultCollector:
 
         self._ray = ray_module
         self._shutdown_timeout_s = float(os.environ.get("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S", "5"))
-        if not math.isfinite(self._shutdown_timeout_s) or self._shutdown_timeout_s <= 0:
-            raise ValueError("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S must be finite and positive")
+        if self._shutdown_timeout_s <= 0:
+            raise ValueError("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S must be positive")
         self._cv = threading.Condition()
         self._shutdown = False
         self._started = False

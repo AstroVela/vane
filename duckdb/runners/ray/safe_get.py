@@ -21,8 +21,8 @@ def _positive_float_env(name: str) -> float | None:
     if not raw:
         return None
     value = float(raw)
-    if not math.isfinite(value) or value <= 0.0:
-        raise ValueError(f"{name} must be finite and positive")
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
     return value
 
 

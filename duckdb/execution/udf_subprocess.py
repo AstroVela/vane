@@ -19,7 +19,7 @@ import time
 import weakref
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pyarrow as pa
 
@@ -210,10 +210,10 @@ def _estimate_output_budget_from_rows(row_bytes: int, num_rows: int | None) -> i
 
 
 def _make_local_ref_bundle_worker_payload_with_lease(
-    block_refs,
-    slices,
-    metadata,
-    names,
+    block_refs: Any,
+    slices: Any,
+    metadata: Any,
+    names: Any,
     *,
     submit_id: int | None,
     name: str,
@@ -271,25 +271,25 @@ def _arrow_table_from_ipc_bytes(data: bytes) -> pa.Table:
 
 def _write_ipc_to_shm(shm: shared_memory.SharedMemory, ipc_bytes: bytes) -> int:
     required = _IPC_HEADER.size + len(ipc_bytes)
-    if required > len(shm.buf):
+    buf = cast(Any, shm.buf)
+    if required > len(buf):
         raise BufferError("shared memory segment is too small")
-    _IPC_HEADER.pack_into(shm.buf, 0, len(ipc_bytes))
-    shm.buf[_IPC_HEADER.size : required] = ipc_bytes
+    _IPC_HEADER.pack_into(buf, 0, len(ipc_bytes))
+    buf[_IPC_HEADER.size : required] = ipc_bytes
     return required
 
 
 def _read_ipc_from_shm(shm: shared_memory.SharedMemory, size: int | None = None) -> bytes:
-    if len(shm.buf) < _IPC_HEADER.size:
+    buf = cast(Any, shm.buf)
+    if len(buf) < _IPC_HEADER.size:
         raise BufferError("shared memory segment is too small for IPC header")
-    ipc_size = _IPC_HEADER.unpack_from(shm.buf, 0)[0]
+    ipc_size = _IPC_HEADER.unpack_from(buf, 0)[0]
     required = _IPC_HEADER.size + ipc_size
-    if required > len(shm.buf):
-        raise BufferError(
-            f"shared memory IPC payload exceeds local mapping: required={required} capacity={len(shm.buf)}"
-        )
+    if required > len(buf):
+        raise BufferError(f"shared memory IPC payload exceeds local mapping: required={required} capacity={len(buf)}")
     if size is not None and required > size:
         raise BufferError(f"shared memory IPC payload exceeds response size: required={required} size={size}")
-    return bytes(shm.buf[_IPC_HEADER.size : required])
+    return bytes(buf[_IPC_HEADER.size : required])
 
 
 class _SingleSubprocessExecutor(BaseUDFExecutor):
@@ -642,12 +642,13 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 )
                 raise RuntimeError(self._broken_error)
             data_shm = self._require_data_shm()
-            if result_size > len(data_shm.buf):
+            if result_size > len(cast(Any, data_shm.buf)):
                 name = data_shm.name
                 data_shm.close()
                 self._data_shm = data_shm = _open_existing_shm(name, track=False)
             ipc_result = _read_ipc_from_shm(data_shm, result_size)
             return self._wrap_output(_arrow_table_from_ipc_bytes(ipc_result))
+        raise RuntimeError("UDF subprocess submit result loop exited unexpectedly")
 
     def _submit_ref_bundle_direct(self, payload: dict[str, Any]) -> Any | None:
         if payload.get("estimated_num_rows") == 0:
@@ -674,7 +675,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 self._untrack_input_lease(lease_id)
             raise
 
-    def _submit_ref_bundle(self, block_refs, slices, metadata, names) -> Any | None:
+    def _submit_ref_bundle(self, block_refs: Any, slices: Any, metadata: Any, names: Any) -> Any | None:
         worker_payload, lease_id = _make_local_ref_bundle_worker_payload_with_lease(
             block_refs,
             slices,
@@ -712,7 +713,14 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         self._queue.append((SUBMIT_RESULT_MARKER, int(submit_id), result))
         self._notify_wakeup()
 
-    def submit_ref_bundle_with_id(self, submit_id: int, block_refs, slices, metadata, names) -> None:
+    def submit_ref_bundle_with_id(
+        self,
+        submit_id: int,
+        block_refs: Any,
+        slices: Any,
+        metadata: Any,
+        names: Any,
+    ) -> None:
         self._pending_batches += 1
         try:
             result = self._submit_ref_bundle(block_refs, slices, metadata, names)
@@ -721,7 +729,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         self._queue.append((SUBMIT_RESULT_MARKER, int(submit_id), result))
         self._notify_wakeup()
 
-    def submit_ref_bundle(self, block_refs, slices, metadata, names) -> None:
+    def submit_ref_bundle(self, block_refs: Any, slices: Any, metadata: Any, names: Any) -> None:
         self._pending_batches += 1
         try:
             result = self._submit_ref_bundle(block_refs, slices, metadata, names)
@@ -1067,7 +1075,7 @@ class _GlobalSubprocessTaskRuntime:
         pool: _TaskWorkerPool,
         fn: Callable[[_SingleSubprocessExecutor], Any | None],
         debug_seq: int = 0,
-    ) -> Future:
+    ) -> Future[Any]:
         if self.closed:
             raise RuntimeError("global subprocess task runtime is closed")
         return self.executor.submit(self._run_task, pool, fn, debug_seq)
@@ -1255,7 +1263,7 @@ class LocalSubprocessActorPool:
     def create_admission_authority(self) -> LocalSlotAdmissionAuthority:
         return self.admission_slots.create_authority()
 
-    def first_proc(self):
+    def first_proc(self) -> Any | None:
         if not self._workers:
             return None
         return self._workers[0]._proc
@@ -1264,7 +1272,7 @@ class LocalSubprocessActorPool:
         self,
         fn: Callable[[_SingleSubprocessExecutor], Any | None],
         debug_seq: int = 0,
-    ) -> Future:
+    ) -> Future[Any]:
         with self._lock:
             if self._closed:
                 raise RuntimeError("local subprocess actor pool is closed")
@@ -1498,11 +1506,11 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         self._actor_pool: LocalSubprocessActorPool | None = None
         self._task_runtime: _GlobalSubprocessTaskRuntime | None = None
         self._task_pool: _TaskWorkerPool | None = None
-        self._task_futures: set[Future] = set()
+        self._task_futures: set[Future[Any]] = set()
         self._task_futures_cv = threading.Condition()
         self._task_futures_lock = self._task_futures_cv
         self._task_future_meta: dict[
-            Future,
+            Future[Any],
             tuple[int | None, int, float, AdmissionLease | None],
         ] = {}
         self._debug_submit_count = 0
@@ -1571,7 +1579,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             raise
 
     @property
-    def _proc(self):
+    def _proc(self) -> Any | None:
         if self._actor_pool is not None:
             return self._actor_pool.first_proc()
         if not self._workers:
@@ -1648,7 +1656,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
 
     def _track_task_future(
         self,
-        future: Future,
+        future: Future[Any],
         submit_id: int | None,
         debug_seq: int,
         submit_start: float,
@@ -1662,7 +1670,11 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 submit_start,
                 admission,
             )
-        future.add_done_callback(lambda done, _submit_id=submit_id: self._complete_task_submit(_submit_id, done))
+
+        def complete_task(done: Future[Any], submit_id: int | None = submit_id) -> None:
+            self._complete_task_submit(submit_id, done)
+
+        future.add_done_callback(complete_task)
 
     def _notify_wakeup(self) -> None:
         callback = self._wakeup
@@ -1692,7 +1704,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         for lease_id in lease_ids:
             cancel_local_shm_input_lease(lease_id, name="udf-input-close")
 
-    def _complete_task_submit(self, submit_id: int | None, future: Future) -> None:
+    def _complete_task_submit(self, submit_id: int | None, future: Future[Any]) -> None:
         item: Any | None = None
         debug_meta: tuple[int | None, int, float, AdmissionLease | None] | None = None
         admission: AdmissionLease | None = None
@@ -1833,7 +1845,14 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             admission,
         )
 
-    def submit_ref_bundle_with_id(self, submit_id: int, block_refs, slices, metadata, names) -> None:
+    def submit_ref_bundle_with_id(
+        self,
+        submit_id: int,
+        block_refs: Any,
+        slices: Any,
+        metadata: Any,
+        names: Any,
+    ) -> None:
         worker_payload, lease_id = _make_local_ref_bundle_worker_payload_with_lease(
             block_refs,
             slices,
@@ -1847,14 +1866,18 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             assert lease_id is not None
             self._track_input_lease(lease_id)
 
-            def submit_worker(worker, _payload=worker_payload, _lease_id=lease_id):
+            def submit_worker(
+                worker: _SingleSubprocessExecutor,
+                payload: dict[str, Any] = worker_payload,
+                lease_id: int = lease_id,
+            ) -> Any | None:
                 try:
-                    return worker._submit_ref_bundle_direct(_payload)
+                    return worker._submit_ref_bundle_direct(payload)
                 except BaseException:
-                    cancel_local_shm_input_lease(_lease_id, name=f"udf-input-{int(submit_id)}")
+                    cancel_local_shm_input_lease(lease_id, name=f"udf-input-{int(submit_id)}")
                     raise
                 finally:
-                    self._untrack_input_lease(_lease_id)
+                    self._untrack_input_lease(lease_id)
 
             try:
                 admission = self._take_task_admission()
@@ -1870,7 +1893,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             return
         raise RuntimeError("subprocess UDF ref-bundle input requires local shared-memory descriptors")
 
-    def submit_ref_bundle(self, _block_refs, _slices, _metadata, _names) -> None:
+    def submit_ref_bundle(self, _block_refs: Any, _slices: Any, _metadata: Any, _names: Any) -> None:
         raise RuntimeError(
             "subprocess UDF ref-bundle submission requires submit_ref_bundle_with_id() and a pregranted admission lease"
         )

@@ -284,7 +284,7 @@ def test_ray_get_uses_query_deadline_timeout(monkeypatch):
 
 @pytest.mark.parametrize(
     "raw",
-    ["nan", "inf", "-inf", "0", "-1", "invalid"],
+    ["nan", "inf", "-inf", "-1", "invalid"],
 )
 @pytest.mark.parametrize(
     "env_name",
@@ -294,11 +294,10 @@ def test_ray_get_uses_query_deadline_timeout(monkeypatch):
         "VANE_RAY_ACTOR_INIT_TIMEOUT_S",
         "VANE_UDF_SUBPROCESS_CONTROL_TIMEOUT_S",
         "VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S",
-        "VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S",
     ],
 )
-def test_timeout_env_parsers_reject_non_positive_non_finite_and_invalid(monkeypatch, env_name, raw):
-    from duckdb.execution import udf_ray_actor_pool, udf_stream_result_collector, udf_subprocess
+def test_timeout_env_parsers_reject_non_finite_negative_and_invalid(monkeypatch, env_name, raw):
+    from duckdb.execution import udf_ray_actor_pool, udf_subprocess
     from duckdb.runners.ray import safe_get
 
     for name in (
@@ -307,7 +306,6 @@ def test_timeout_env_parsers_reject_non_positive_non_finite_and_invalid(monkeypa
         "VANE_RAY_ACTOR_INIT_TIMEOUT_S",
         "VANE_UDF_SUBPROCESS_CONTROL_TIMEOUT_S",
         "VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S",
-        "VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(env_name, raw)
@@ -321,8 +319,57 @@ def test_timeout_env_parsers_reject_non_positive_non_finite_and_invalid(monkeypa
             udf_subprocess._subprocess_control_timeout_s()
         elif env_name == "VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S":
             udf_subprocess._subprocess_shutdown_grace_s()
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    [
+        "VANE_RAY_ACTOR_INIT_TIMEOUT_S",
+        "VANE_UDF_SUBPROCESS_CONTROL_TIMEOUT_S",
+        "VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S",
+    ],
+)
+def test_positive_timeout_env_parsers_reject_zero(monkeypatch, env_name):
+    from duckdb.execution import udf_ray_actor_pool, udf_subprocess
+
+    for name in (
+        "VANE_QUERY_DEADLINE_EPOCH_S",
+        "VANE_RAY_OBJECT_GET_TIMEOUT_S",
+        "VANE_RAY_ACTOR_INIT_TIMEOUT_S",
+        "VANE_UDF_SUBPROCESS_CONTROL_TIMEOUT_S",
+        "VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(env_name, "0")
+
+    with pytest.raises(ValueError):
+        if env_name == "VANE_RAY_ACTOR_INIT_TIMEOUT_S":
+            udf_ray_actor_pool._actor_init_timeout_s()
+        elif env_name == "VANE_UDF_SUBPROCESS_CONTROL_TIMEOUT_S":
+            udf_subprocess._subprocess_control_timeout_s()
         else:
-            udf_stream_result_collector.AsyncResultCollector(ray_module=object())
+            udf_subprocess._subprocess_shutdown_grace_s()
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    [
+        "VANE_QUERY_DEADLINE_EPOCH_S",
+        "VANE_RAY_OBJECT_GET_TIMEOUT_S",
+    ],
+)
+def test_ray_safe_get_timeout_envs_preserve_zero(monkeypatch, env_name):
+    from duckdb.runners.ray import safe_get
+
+    monkeypatch.delenv("VANE_QUERY_DEADLINE_EPOCH_S", raising=False)
+    monkeypatch.delenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", raising=False)
+    monkeypatch.setenv(env_name, "0")
+
+    if env_name == "VANE_QUERY_DEADLINE_EPOCH_S":
+        with pytest.raises(safe_get.QueryDeadlineExceeded):
+            safe_get.configured_ray_get_timeout_s()
+    else:
+        assert safe_get.configured_ray_get_timeout_s() == 0.0
 
 
 def test_ray_get_in_async_actor_background_thread_uses_object_ref_future(monkeypatch):

@@ -126,7 +126,7 @@ class UDFActorPoolBase:
         self._confirmed_ready: set[int] = set()
 
     @staticmethod
-    def _actor_class(max_restarts: int, max_task_retries: int):
+    def _actor_class(max_restarts: int, max_task_retries: int) -> Any:
         raise NotImplementedError
 
     @staticmethod
@@ -173,7 +173,7 @@ class UDFActorPoolBase:
         if invalid:
             raise ValueError(f"actor_dispatch_indices contains out-of-range indices: {invalid}")
         instance._confirmed_ready = set(parsed_dispatch_indices)
-        instance._payload = payload
+        instance._payload = payload or {}
         instance._payload_ref = None
         instance._init_refs = []
         instance.actor_node_ids = cls._normalize_actor_node_ids(actor_node_ids, expected_count=len(actors))
