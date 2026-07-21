@@ -1,0 +1,124 @@
+name: Documentation follow-up
+
+on:
+  pull_request_target:
+    types:
+      - closed
+
+permissions:
+  issues: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  create-issue:
+    name: Create documentation issue
+    if: >-
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.body, '- [x] <!-- docs-follow-up -->')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create or find documentation issue
+        id: follow-up
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_REPO_TOKEN }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          SOURCE_PR_NUMBER: ${{ github.event.pull_request.number }}
+          SOURCE_PR_TITLE: ${{ github.event.pull_request.title }}
+          SOURCE_PR_URL: ${{ github.event.pull_request.html_url }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          TARGET_REPOSITORY: AstroVela/vane-website
+        run: |
+          set -euo pipefail
+
+          DOCS_MARKER="<!-- vane-doc-follow-up: ${SOURCE_REPOSITORY}#${SOURCE_PR_NUMBER} -->"
+          DOCS_ACTOR="$(gh api user --jq .login)"
+          export DOCS_ACTOR DOCS_MARKER
+          issue_url="$(
+            gh api --method GET --paginate \
+              "repos/${TARGET_REPOSITORY}/issues" \
+              -f state=all \
+              -f creator="$DOCS_ACTOR" \
+              -f labels=documentation \
+              -f per_page=100 \
+              --jq '
+                .[]
+                | select(
+                    .pull_request == null
+                    and .user.login == env.DOCS_ACTOR
+                    and any(.labels[]?; .name == "documentation")
+                    and ((.body // "") | contains(env.DOCS_MARKER))
+                  )
+                | .html_url
+              ' \
+              | sed -n '1p'
+          )"
+
+          if [[ -z "$issue_url" ]]; then
+            documentation_section="$(
+              printf '%s\n' "$PR_BODY" | awk '
+                /^## Documentation impact[[:space:]]*$/ { capture = 1; next }
+                capture && /^## / { exit }
+                capture { print }
+              '
+            )"
+
+            {
+              printf '%s\n\n' "$DOCS_MARKER"
+              printf 'Follow up on [%s#%s](%s): **%s**.\n\n' \
+                "$SOURCE_REPOSITORY" "$SOURCE_PR_NUMBER" "$SOURCE_PR_URL" \
+                "$SOURCE_PR_TITLE"
+              printf 'Merged commit: `%s`\n\n' "$MERGE_SHA"
+              printf '## Documentation impact from the pull request\n\n'
+              printf '%s\n' "$documentation_section"
+            } >documentation-follow-up.md
+
+            issue_url="$(
+              gh issue create \
+                --repo "$TARGET_REPOSITORY" \
+                --title "[${SOURCE_REPOSITORY}#${SOURCE_PR_NUMBER}] ${SOURCE_PR_TITLE}" \
+                --label documentation \
+                --body-file documentation-follow-up.md
+            )"
+          fi
+
+          printf 'issue_url=%s\n' "$issue_url" >>"$GITHUB_OUTPUT"
+
+      - name: Link issue from source pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_URL: ${{ steps.follow-up.outputs.issue_url }}
+          SOURCE_PR_NUMBER: ${{ github.event.pull_request.number }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          DOCS_COMMENT_MARKER='<!-- vane-doc-follow-up-link -->'
+          export DOCS_COMMENT_MARKER
+          existing_comment="$(
+            gh api --paginate \
+              "repos/${SOURCE_REPOSITORY}/issues/${SOURCE_PR_NUMBER}/comments?per_page=100" \
+              --jq '
+                .[]
+                | select(
+                    .user.login == "github-actions[bot]"
+                    and .performed_via_github_app.slug == "github-actions"
+                    and ((.body // "") | contains(env.DOCS_COMMENT_MARKER))
+                  )
+                | .id
+              ' \
+              | sed -n '1p'
+          )"
+
+          if [[ -z "$existing_comment" ]]; then
+            comment_body="$(
+              printf '%s\nDocumentation follow-up: %s\n' \
+                "$DOCS_COMMENT_MARKER" "$ISSUE_URL"
+            )"
+            gh pr comment "$SOURCE_PR_NUMBER" \
+              --repo "$SOURCE_REPOSITORY" \
+              --body "$comment_body"
+          fi

@@ -10,6 +10,22 @@ body:
         Thanks for reporting a bug. Please do not include secrets, private keys, or confidential datasets.
         Security vulnerabilities should be reported privately using GitHub's security advisory flow.
 
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      description: Select the area that best matches the problem.
+      options:
+        - Python API
+        - DuckDB or SQL execution
+        - Distributed execution or Ray
+        - AI or model integration
+        - Build or installation
+        - Documentation
+        - Other or not sure
+    validations:
+      required: true
+
   - type: textarea
     attributes:
       label: What happened?

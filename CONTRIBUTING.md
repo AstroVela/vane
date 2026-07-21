@@ -12,6 +12,8 @@ Search existing issues and pull requests before starting. If an issue exists, co
 
 ## Pull requests
 
+Title pull requests as `[type](scope) Subject`, for example `[fix](execution) Handle empty batches`. Both `type` and `scope` are required lowercase identifiers; choose names that make the change easy to find.
+
 Keep each pull request focused and explain:
 
 - the user-visible problem and root cause;
@@ -54,7 +56,11 @@ Vane-specific engine changes in the pull request.
 
 ## AI-assisted contributions
 
-AI tools may assist a contribution, but the human contributor remains responsible for every line and claim. Do not submit confidential data to a tool. Review generated changes, verify provenance and license compatibility, run the relevant tests, and disclose material AI-generated code or assets in the pull request when it helps reviewers evaluate risk.
+AI tools may assist a contribution, but the human contributor remains responsible for every line and claim. Authors must understand the core ideas behind AI-assisted changes end to end and be able to justify the design and implementation during review. Explicitly identify unknowns, assumptions, and details that were not independently verified so reviewers can evaluate risks to correctness, concurrency, compatibility, security, and performance.
+
+Do not submit confidential data to a tool. Review generated changes, verify provenance and license compatibility, run the relevant tests, and disclose material AI-generated code or assets in the pull request when it helps reviewers evaluate risk.
+
+Code review validates the change and shares project knowledge. A fully AI-generated contribution that the author cannot explain does not meet those goals. Review capacity is limited, so large submissions that lack the necessary understanding may be split, redirected, or closed. When an implementation cannot be independently validated, prefer opening an issue with a clear problem statement and a minimal reproducible example.
 
 ## Review and merge
 

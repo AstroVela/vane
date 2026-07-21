@@ -1,1 +1,5 @@
 blank_issues_enabled: true
+contact_links:
+  - name: Questions and discussions
+    url: https://github.com/AstroVela/vane/discussions
+    about: Ask usage questions and discuss ideas with the community.

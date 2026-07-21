@@ -1,0 +1,42 @@
+name: Pull request title
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+      - ready_for_review
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate pull request title
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check title format
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          title = os.environ["PR_TITLE"]
+          pattern = r"^\[[a-z][a-z0-9-]*\]\([a-z0-9][a-z0-9._-]*\) \S(?:.*\S)?$"
+          if re.fullmatch(pattern, title):
+              print(f"Valid pull request title: {title}")
+              sys.exit(0)
+
+          print("::error::Invalid pull request title.")
+          print("Expected: [type](scope) Subject")
+          print("Example:  [chore](github) Improve contribution workflows")
+          sys.exit(1)
+          PY

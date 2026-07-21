@@ -9,7 +9,7 @@ updates:
       timezone: Asia/Shanghai
     open-pull-requests-limit: 5
     commit-message:
-      prefix: build
+      prefix: "[chore](deps) "
 
   - package-ecosystem: pip
     directory: /
@@ -20,7 +20,7 @@ updates:
       timezone: Asia/Shanghai
     open-pull-requests-limit: 10
     commit-message:
-      prefix: deps
+      prefix: "[chore](deps) "
 
   - package-ecosystem: pre-commit
     directory: /
@@ -31,4 +31,4 @@ updates:
       timezone: Asia/Shanghai
     open-pull-requests-limit: 5
     commit-message:
-      prefix: build
+      prefix: "[chore](deps) "

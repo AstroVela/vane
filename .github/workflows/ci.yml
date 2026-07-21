@@ -17,8 +17,51 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Classify changes
+    runs-on: ubuntu-24.04
+    outputs:
+      run_full: ${{ steps.ci_scope.outputs.run_full }}
+    steps:
+      - name: Checkout
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine whether full CI is required
+        id: ci_scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            echo "run_full=true" >> "$GITHUB_OUTPUT"
+            exit
+          fi
+
+          if git diff --quiet --no-renames "$PR_BASE_SHA" "$PR_HEAD_SHA" --; then
+            run_full=true
+            echo "No changed files were detected; running full CI."
+          elif git diff --quiet --no-renames "$PR_BASE_SHA" "$PR_HEAD_SHA" -- \
+            . \
+            ':(exclude,glob)**/*.md' \
+            ':(exclude,glob).github/ISSUE_TEMPLATE/**' \
+            ':(exclude,glob).github/PULL_REQUEST_TEMPLATE/**'; then
+            run_full=false
+            echo "Only Markdown or static GitHub templates changed; skipping package and native CI."
+          else
+            run_full=true
+            echo "A product, build, dependency, or automation file changed; running full CI."
+          fi
+          echo "run_full=$run_full" >> "$GITHUB_OUTPUT"
+
   source-package:
     name: Source package (Python ${{ matrix.python-version }})
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -46,6 +89,8 @@ jobs:
 
   native-fast-tests:
     name: Native build and fast tests (Python ${{ matrix.python-version }})
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -143,3 +188,46 @@ jobs:
           name: ci-python-artifacts-${{ matrix.python-version }}
           path: dist/*
           if-no-files-found: error
+
+  # Keep this as the stable branch-protection check; matrix jobs may be skipped.
+  required-ci:
+    name: Required CI
+    if: ${{ always() }}
+    needs:
+      - changes
+      - source-package
+      - native-fast-tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify CI results
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          RUN_FULL: ${{ needs.changes.outputs.run_full }}
+          SOURCE_PACKAGE_RESULT: ${{ needs.source-package.result }}
+          NATIVE_TESTS_RESULT: ${{ needs.native-fast-tests.result }}
+        run: |
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "Change classification did not succeed: $CHANGES_RESULT" >&2
+            exit 1
+          fi
+
+          case "$RUN_FULL" in
+            true)
+              expected_result=success
+              ;;
+            false)
+              expected_result=skipped
+              ;;
+            *)
+              echo "Unexpected full CI decision: $RUN_FULL" >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ "$SOURCE_PACKAGE_RESULT" != "$expected_result" ||
+                "$NATIVE_TESTS_RESULT" != "$expected_result" ]]; then
+            echo "Unexpected CI results: source-package=$SOURCE_PACKAGE_RESULT, native-fast-tests=$NATIVE_TESTS_RESULT" >&2
+            exit 1
+          fi
+
+          echo "Required CI passed with full_ci=$RUN_FULL."
