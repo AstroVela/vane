@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import math
 import os
 import queue
 import socket
@@ -143,8 +144,8 @@ def _positive_float_env(name: str, default: float) -> float:
     if not raw:
         return default
     value = float(raw)
-    if value < 0.0:
-        raise ValueError(f"{name} must be non-negative")
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be finite and positive")
     return value
 
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -20,8 +21,8 @@ def _positive_float_env(name: str) -> float | None:
     if not raw:
         return None
     value = float(raw)
-    if value < 0.0:
-        raise ValueError(f"{name} must be non-negative")
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be finite and positive")
     return value
 
 
