@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import threading
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -93,6 +93,10 @@ def record_token_metrics(
             entry.output_tokens += output_tokens
         if total_tokens is not None:
             entry.total_tokens += total_tokens
+        elif input_tokens is not None or output_tokens is not None:
+            # Providers that don't report a total still get a consistent one,
+            # derived from whatever split counts they did report.
+            entry.total_tokens += (input_tokens or 0) + (output_tokens or 0)
         entry.requests += 1
 
     # Fire optional callback (outside lock)
@@ -114,9 +118,13 @@ def record_token_metrics(
 
 
 def get_token_metrics() -> list[TokenMetricsEntry]:
-    """Return a snapshot of all accumulated token metrics."""
+    """Return a snapshot of all accumulated token metrics.
+
+    Entries are copies: mutating a returned entry does not affect the
+    collector's internal counters or later summaries.
+    """
     with _lock:
-        return list(_counters.values())
+        return [replace(entry) for entry in _counters.values()]
 
 
 def get_token_metrics_summary() -> dict[str, Any]:
@@ -135,23 +143,24 @@ def get_token_metrics_summary() -> dict[str, Any]:
             },
         }
     """
-    with _lock:
-        entries = list(_counters.values())
-
     total_in = total_out = total_tok = total_req = 0
     by_provider: dict[str, dict[str, int]] = defaultdict(
         lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "requests": 0}
     )
-    for e in entries:
-        total_in += e.input_tokens
-        total_out += e.output_tokens
-        total_tok += e.total_tokens
-        total_req += e.requests
-        p = by_provider[e.provider]
-        p["input_tokens"] += e.input_tokens
-        p["output_tokens"] += e.output_tokens
-        p["total_tokens"] += e.total_tokens
-        p["requests"] += e.requests
+    # Read every field while holding the lock so the summary is a consistent
+    # point-in-time snapshot; copying entry references and reading later would
+    # let a concurrent record() tear the numbers.
+    with _lock:
+        for e in _counters.values():
+            total_in += e.input_tokens
+            total_out += e.output_tokens
+            total_tok += e.total_tokens
+            total_req += e.requests
+            p = by_provider[e.provider]
+            p["input_tokens"] += e.input_tokens
+            p["output_tokens"] += e.output_tokens
+            p["total_tokens"] += e.total_tokens
+            p["requests"] += e.requests
 
     return {
         "total_input_tokens": total_in,
