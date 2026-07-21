@@ -168,8 +168,25 @@ def _emit_reader_timing(
     )
 
 
+def _max_concurrent_decodes_from_env() -> int:
+    """Positive decode concurrency from VANE_MAX_CONCURRENT_DECODES.
+
+    Zero would build Semaphore(0) and block every decode forever, and a
+    negative or non-integer value is equally meaningless, so all of those are
+    rejected loudly at configuration load instead.
+    """
+    raw = os.environ.get("VANE_MAX_CONCURRENT_DECODES", "1")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"VANE_MAX_CONCURRENT_DECODES must be a positive integer (>= 1), got {raw!r}") from None
+    if value < 1:
+        raise ValueError(f"VANE_MAX_CONCURRENT_DECODES must be a positive integer (>= 1), got {raw!r}")
+    return value
+
+
 # Limit concurrent video decodes within a single process.
-_MAX_CONCURRENT_DECODES = int(os.environ.get("VANE_MAX_CONCURRENT_DECODES", "1"))
+_MAX_CONCURRENT_DECODES = _max_concurrent_decodes_from_env()
 _decode_semaphore = threading.Semaphore(_MAX_CONCURRENT_DECODES)
 
 # Memory-based backpressure: block NEW decode tasks (not mid-decode!) when
