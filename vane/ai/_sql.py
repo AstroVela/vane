@@ -50,6 +50,14 @@ _FLOAT_OPTION_NAMES = {
 
 
 def _reject_inline_credentials(value: Any, path: str = "options") -> None:
+    """Reject sensitive-keyed options at any nesting depth (defense layer 1).
+
+    SQL options must never carry credentials inline; environment variables are
+    the supported path. Key matching uses the shared sensitive-key table in
+    ``vane.ai._redaction``, which also drives the Python-layer ``Secret``
+    sealing (defense layer 2) — see that module's docstring for the full
+    two-layer design.
+    """
     if isinstance(value, Mapping):
         for key, item in value.items():
             key_text = str(key)

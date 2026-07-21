@@ -3,11 +3,22 @@
 
 """Credential redaction shared by the AI SQL binding and provider layers.
 
-Vane defends provider credentials in two layers: the SQL binding rejects
-inline credential options outright (see ``vane.ai._sql``), while the Python
-descriptor path seals credential values in :class:`Secret` so that repr, str,
-logs, exception messages, and assertion diffs never show the plaintext. Both
-layers share the sensitive-key table and matching logic defined here.
+Vane defends provider credentials in two layers, both driven by the
+sensitive-key table and matching logic defined here.
+
+Layer 1 — the SQL binding rejects inline credentials outright.
+``vane.ai._sql._reject_inline_credentials`` raises on any sensitive-keyed
+option at any nesting depth before a provider is ever constructed;
+environment variables are the supported way to configure credentials for
+the SQL surface.
+
+Layer 2 — the Python descriptor path seals credentials. Provider descriptors
+wrap every sensitive-keyed value in their option mappings in :class:`Secret`
+at construction (:func:`wrap_sensitive_options`), so repr, str, logs,
+exception messages, and assertion diffs show only the fixed placeholder —
+including for pickled copies shipped to workers. The plaintext is restored
+solely at provider execution, immediately before SDK client or engine
+construction, via :func:`unwrap_sensitive_options`.
 
 This module is private; :class:`Secret` is intentionally not exported from
 the public ``vane.ai`` namespace.
