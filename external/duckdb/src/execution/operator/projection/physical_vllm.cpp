@@ -255,7 +255,7 @@ struct VLLMGlobalOperatorState : public GlobalOperatorState {
 
 	VLLMWakeupRegistrationResult RegisterWakeup(ExecutionContext &context) {
 		if (!context.interrupt_state) {
-			return VLLMWakeupRegistrationResult::UNSUPPORTED;
+			throw InternalException("PhysicalVLLM requires an interrupt state for scheduler wakeup registration");
 		}
 		// Another finalizer can drain the last result and shut the shared
 		// executor down between this task's readiness check and wakeup
@@ -655,11 +655,6 @@ OperatorFinalizeResultType PhysicalVLLM::FinalExecute(ExecutionContext &context,
 	chunk.SetCardinality(0);
 	if (wakeup_result == VLLMWakeupRegistrationResult::ARMED) {
 		return OperatorFinalizeResultType::BLOCKED;
-	}
-	if (wakeup_result == VLLMWakeupRegistrationResult::UNSUPPORTED && gstate.InflightPrompts() > 0) {
-		// Compatibility fallback for legacy executors. Waiting with zero inflight
-		// would deadlock while another producer is still able to submit.
-		gstate.WaitForExecutorResult(context.client);
 	}
 	return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
 }
