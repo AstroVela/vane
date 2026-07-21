@@ -964,6 +964,7 @@ class TestAnthropicProvider:
 
     def test_provider_get_prompter_splits_call_client_options(self):
         """Anthropic call-level client options go to provider_options only."""
+        from vane.ai._redaction import Secret
         from vane.ai.providers.anthropic import AnthropicProvider
 
         provider = AnthropicProvider(api_key="ctor-key", base_url="https://ctor.example")
@@ -975,8 +976,9 @@ class TestAnthropicProvider:
             temperature=0,
         )
 
+        # Credentials are sealed on the descriptor (vane#105).
         assert desc.provider_options == {
-            "api_key": "call-key",
+            "api_key": Secret("call-key"),
             "base_url": "https://call.example",
             "timeout": 30,
         }
@@ -1083,6 +1085,7 @@ class TestGoogleProvider:
 
     def test_provider_get_prompter_splits_call_client_options(self):
         """Google prompt call-level client options go to provider_options only."""
+        from vane.ai._redaction import Secret
         from vane.ai.providers.google import GoogleProvider
 
         provider = GoogleProvider(api_key="ctor-key")
@@ -1092,7 +1095,8 @@ class TestGoogleProvider:
             temperature=0,
         )
 
-        assert desc.provider_options == {"api_key": "call-key"}
+        # Credentials are sealed on the descriptor (vane#105).
+        assert desc.provider_options == {"api_key": Secret("call-key")}
         assert "api_key" not in desc.prompt_options
         assert desc.prompt_options["max_api_concurrency"] == 7
         assert desc.prompt_options["temperature"] == 0
@@ -1114,6 +1118,7 @@ class TestGoogleProvider:
 
     def test_provider_get_text_embedder_splits_call_client_options(self):
         """Google embedding call-level client options go to provider_options only."""
+        from vane.ai._redaction import Secret
         from vane.ai.providers.google import GoogleProvider
 
         provider = GoogleProvider(api_key="ctor-key")
@@ -1123,7 +1128,8 @@ class TestGoogleProvider:
             on_error="log",
         )
 
-        assert desc.provider_options == {"api_key": "call-key"}
+        # Credentials are sealed on the descriptor (vane#105).
+        assert desc.provider_options == {"api_key": Secret("call-key")}
         assert "api_key" not in desc.embed_options
         assert desc.embed_options["task_type"] == "RETRIEVAL_QUERY"
         assert desc.embed_options["on_error"] == "log"

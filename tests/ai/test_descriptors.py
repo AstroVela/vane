@@ -101,6 +101,7 @@ class TestTransformersDescriptorPickle:
 
 class TestOpenAIDescriptorPickle:
     def test_text_embedder_descriptor_roundtrip(self):
+        from vane.ai._redaction import Secret
         from vane.ai.providers.openai import OpenAITextEmbedderDescriptor
 
         desc = OpenAITextEmbedderDescriptor(
@@ -116,7 +117,9 @@ class TestOpenAIDescriptorPickle:
 
         assert restored.model_name == "text-embedding-3-small"
         assert restored.dimensions == 512
-        assert restored.provider_options == {"api_key": "test-key"}
+        # Credentials stay sealed on the descriptor (vane#105); the round-trip
+        # preserves the real value, comparable only against another Secret.
+        assert restored.provider_options == {"api_key": Secret("test-key")}
         assert restored.get_provider() == "openai"
         assert restored.is_async() is True
 

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 
+from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider
 from vane.ai.typing import EmbeddingDimensions, UDFOptions
@@ -156,6 +157,10 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
     dimensions: int | None = None
     embed_options: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.provider_options = wrap_sensitive_options(self.provider_options)
+        self.embed_options = wrap_sensitive_options(self.embed_options)
+
     def get_provider(self) -> str:
         return self.provider_name
 
@@ -203,6 +208,10 @@ class GoogleTextEmbedder:
     ):
         from google import genai
 
+        # Restore plaintext credentials sealed by the descriptor; plain dicts
+        # from direct callers pass through unchanged.
+        provider_options = unwrap_sensitive_options(provider_options)
+        options = unwrap_sensitive_options(options)
         api_key = provider_options.get("api_key")
         self._client = genai.Client(api_key=api_key) if api_key else genai.Client()
         self._model = model
@@ -263,6 +272,10 @@ class GooglePrompterDescriptor(PrompterDescriptor):
     return_format: Any | None = None
     prompt_options: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.provider_options = wrap_sensitive_options(self.provider_options)
+        self.prompt_options = wrap_sensitive_options(self.prompt_options)
+
     def get_provider(self) -> str:
         return self.provider_name
 
@@ -310,6 +323,10 @@ class GooglePrompter:
     ):
         from google import genai
 
+        # Restore plaintext credentials sealed by the descriptor; plain dicts
+        # from direct callers pass through unchanged.
+        provider_options = unwrap_sensitive_options(provider_options)
+        options = unwrap_sensitive_options(options)
         api_key = provider_options.get("api_key")
         self._client = genai.Client(api_key=api_key) if api_key else genai.Client()
         self._model = model

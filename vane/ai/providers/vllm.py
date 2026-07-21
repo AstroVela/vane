@@ -45,6 +45,7 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.protocols import PrompterDescriptor
 from vane.ai.provider import Provider
 from vane.ai.typing import UDFOptions
@@ -134,6 +135,9 @@ class VLLMPrompterDescriptor(PrompterDescriptor):
     return_format: Any | None = None
     vllm_options: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.vllm_options = wrap_sensitive_options(self.vllm_options)
+
     def get_provider(self) -> str:
         return self.provider_name
 
@@ -180,7 +184,11 @@ class VLLMPrompter:
         self._model = model
         self._system_message = system_message
         self._return_format = return_format
-        self._options = {k: v for k, v in dict(vllm_options or {}).items() if k not in {"actor_number"}}
+        # Deep-unwrap restores plaintext sealed by the descriptor (including
+        # nested engine_args/generate_args) before the engine sees the options;
+        # plain dicts from direct callers pass through unchanged.
+        options = unwrap_sensitive_options(vllm_options or {})
+        self._options = {k: v for k, v in options.items() if k not in {"actor_number"}}
         self._executor = None
 
         # Pre-compute JSON schema if return_format is set, so the executor

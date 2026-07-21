@@ -9,7 +9,7 @@ This is the "native" counterpart of `run_tpch_duckdb_ray_relapi.py`.
 Key differences vs `run_tpch_duckdb.py`:
   - Uses the Relation API (`con.sql(sql)`) instead of `con.execute(sql)`.
   - Executes via `vane.runners.NativeRunner` by iterating
-    `runner.run_iter_tables(relation)`, which yields MicroPartitions.
+    `runner.run_iter_tables(relation)`, which yields PyArrow tables.
   - Each query runs in a subprocess (spawn) to enforce a hard timeout and to
     isolate hangs/crashes.
 
@@ -101,9 +101,8 @@ def _run_query_native_in_subprocess(
 
         t0 = time.time()
         row_count = 0
-        for mp in runner.run_iter_tables(rel, results_buffer_size):
-            # MicroPartition implements __len__ as number of rows.
-            row_count += len(mp)
+        for table in runner.run_iter_tables(rel, results_buffer_size):
+            row_count += table.num_rows
         elapsed = time.time() - t0
 
         con.close()
