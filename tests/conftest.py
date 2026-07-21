@@ -13,6 +13,7 @@ from importlib import import_module
 from pathlib import Path
 
 import pytest
+from ray_test_profile import ray_test_object_store_bytes
 
 import duckdb
 
@@ -67,7 +68,27 @@ def pytest_addoption(parser):
     parser.addoption("--skiplist", action="append", nargs="+", type=str, help="skip listed tests")
 
 
+_REAL_RAY_FIXTURES = frozenset(
+    {
+        "_ray_local_cluster",
+        "ray_local",
+        "ray_runner",
+        "ray_runner_local_cluster",
+        "ray_subprocess_env",
+    }
+)
+_RAY_CLUSTER_OWNER_FIXTURES = frozenset({"ray_runner_local_cluster"})
+
+
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
+    for item in items:
+        fixture_names = set(item.fixturenames)
+        if fixture_names & _REAL_RAY_FIXTURES:
+            item.add_marker(pytest.mark.real_ray)
+        if fixture_names & _RAY_CLUSTER_OWNER_FIXTURES:
+            item.add_marker(pytest.mark.ray_cluster_owner)
+
     tests_to_skip = config.getoption("--skiplist")
     if not tests_to_skip:
         # --skiplist not given in cli, therefore move on
@@ -295,7 +316,7 @@ def _ray_local_cluster():
                     include_dashboard=False,
                     num_cpus=resources.num_cpus,
                     num_gpus=resources.num_gpus,
-                    object_store_memory=int(os.environ.get("VANE_TEST_RAY_OBJECT_STORE_BYTES", str(1024**3))),
+                    object_store_memory=ray_test_object_store_bytes(),
                 )
 
         yield ray, cluster.address, env_vars
@@ -331,6 +352,12 @@ def ray_local(_ray_local_cluster):
                 vane_mod.teardown_runner()
         except Exception as e:
             print(f"WARNING: Exception during Vane runner teardown: {e}", file=sys.stderr)
+        try:
+            from duckdb.runners.ray import driver as ray_driver
+
+            ray_driver.shutdown_background_event_loop()
+        except Exception:
+            pass
         prev_handler = None
         alarm_set = False
         try:
@@ -349,12 +376,6 @@ def ray_local(_ray_local_cluster):
         except Exception as e:
             print(f"WARNING: Exception during ray.shutdown(): {e}", file=sys.stderr)
         finally:
-            try:
-                from duckdb.runners.ray import driver as ray_driver
-
-                ray_driver.shutdown_background_event_loop()
-            except Exception:
-                pass
             if alarm_set:
                 signal.alarm(0)
                 signal.signal(signal.SIGALRM, prev_handler)

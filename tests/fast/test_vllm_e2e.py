@@ -1,11 +1,14 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-import json
 import importlib
+import json
 import os
 
 import pytest
+from ray_test_profile import ray_test_object_store_bytes
+
+pytestmark = [pytest.mark.real_ray, pytest.mark.ray_cluster_owner]
 
 
 def _explain_text(con, sql):
@@ -38,6 +41,12 @@ def test_vllm_e2e_basic():
 
     if not torch.cuda.is_available():
         pytest.skip("vllm requires CUDA")
+
+    ray.init(
+        address="local",
+        include_dashboard=False,
+        object_store_memory=ray_test_object_store_bytes(),
+    )
 
     import duckdb
 

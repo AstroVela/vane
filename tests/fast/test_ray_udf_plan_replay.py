@@ -389,10 +389,6 @@ def test_ray_runner_replays_map_batches_udf_via_task_plan_pickle(tmp_path, monke
     import pyarrow as pa
 
     monkeypatch.setenv("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
-    # The default graph reserves 640 MiB across the FTE continuation and nested
-    # Ray task. This test's 1 GiB object store must expose more than the default
-    # 50% query fraction to satisfy that strict minimum.
-    monkeypatch.setenv("VANE_QUERY_OBJECT_STORE_FRACTION", "1.0")
 
     con = duckdb.connect()
     parquet_path = tmp_path / "table_udf_pickled_input.parquet"

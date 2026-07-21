@@ -10,10 +10,16 @@ import uuid
 from pathlib import Path
 
 import pytest
+from ray_test_profile import ray_test_object_store_bytes
 
 import duckdb
 
 ray = pytest.importorskip("ray")
+pytestmark = [
+    pytest.mark.real_ray,
+    pytest.mark.ray_cluster_owner,
+    pytest.mark.ray_fault,
+]
 
 _FAULT_RAY_RUNTIME_OWNED = False
 
@@ -327,7 +333,7 @@ def _init_ray_for_fault_test(monkeypatch) -> None:
         ignore_reinit_error=True,
         log_to_driver=True,
         num_cpus=int(os.environ.get("VANE_TEST_RAY_NUM_CPUS", "4")),
-        object_store_memory=int(os.environ.get("VANE_TEST_RAY_OBJECT_STORE_BYTES", str(1024**3))),
+        object_store_memory=ray_test_object_store_bytes(),
         runtime_env={"env_vars": runtime_env_vars},
     )
     _FAULT_RAY_RUNTIME_OWNED = True

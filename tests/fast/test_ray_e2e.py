@@ -15,6 +15,8 @@ try:
 except Exception:
     ray = None
 
+from ray_test_profile import ray_test_object_store_bytes
+
 import duckdb
 from duckdb import runners as _runners
 
@@ -26,9 +28,9 @@ def _vane_shuffle_env(monkeypatch):
     monkeypatch.setenv("VANE_SHUFFLE_ALGORITHM", "flight_shuffle")
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", "/tmp/duckdb_shuffle")
     monkeypatch.setenv("RAY_DEDUP_LOGS", "0")
-    # Local Ray reserves a 1 GiB object store. Keep FTE's production block
-    # target, while sizing UDF windows so multi-actor tests fit the query's
-    # 50% object-store allocation and wide-row batches remain whole.
+    # The default shared test profile reserves a 2 GiB object store. Keep FTE's
+    # production block target, while sizing UDF windows so multi-actor tests
+    # fit the query's 50% allocation and wide-row batches remain whole.
     monkeypatch.setenv("VANE_UDF_TARGET_MAX_BATCH_BYTES", str(16 * 1024**2))
 
 
@@ -368,6 +370,14 @@ def ray_runner(_vane_shuffle_env, request):
 
 
 @pytest.fixture
+def ray_subprocess_env(_ray_local_cluster):
+    _, cluster_address, _ = _ray_local_cluster
+    env = dict(os.environ)
+    env["RAY_ADDRESS"] = cluster_address
+    return env
+
+
+@pytest.fixture
 def ray_runner_local_cluster(_vane_shuffle_env):
     try:
         import ray
@@ -382,6 +392,7 @@ def ray_runner_local_cluster(_vane_shuffle_env):
             logging_level="info",
             log_to_driver=True,
             num_cpus=1,
+            object_store_memory=ray_test_object_store_bytes(),
         )
 
     try:
@@ -1368,7 +1379,7 @@ def test_ray_task_map_batches_ref_passthrough_to_actor_distributed(ray_runner, d
     assert set(rows) == {("11",), ("21",), ("31",), ("41",)}
 
 
-def test_ray_task_large_block_stream_reaches_actor_with_bounded_leases(tmp_path):
+def test_ray_task_large_block_stream_reaches_actor_with_bounded_leases(tmp_path, ray_subprocess_env):
     pytest.importorskip("pyarrow")
     import subprocess
     import sys
@@ -1464,7 +1475,7 @@ def test_ray_task_large_block_stream_reaches_actor_with_bounded_leases(tmp_path)
         assert all(value == payload_len for value in lengths)
         """
     )
-    env = dict(os.environ)
+    env = dict(ray_subprocess_env)
     env["VANE_PROGRESS"] = "0"
     env["RAY_DEDUP_LOGS"] = "0"
     env["VANE_RUNNER"] = "ray"
@@ -1472,7 +1483,7 @@ def test_ray_task_large_block_stream_reaches_actor_with_bounded_leases(tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_ray_lazy_tail_block_submits_without_cross_lease_batching(tmp_path):
+def test_ray_lazy_tail_block_submits_without_cross_lease_batching(tmp_path, ray_subprocess_env):
     pytest.importorskip("pyarrow")
     import subprocess
     import sys
@@ -1547,7 +1558,7 @@ def test_ray_lazy_tail_block_submits_without_cross_lease_batching(tmp_path):
         assert total == row_count
         """
     )
-    env = dict(os.environ)
+    env = dict(ray_subprocess_env)
     env["VANE_PROGRESS"] = "0"
     env["RAY_DEDUP_LOGS"] = "0"
     env["VANE_RUNNER"] = "ray"
@@ -1567,7 +1578,7 @@ def test_ray_lazy_tail_block_submits_without_cross_lease_batching(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_ray_actor_compute_batches_span_upstream_block_boundaries(tmp_path):
+def test_ray_actor_compute_batches_span_upstream_block_boundaries(tmp_path, ray_subprocess_env):
     pytest.importorskip("pyarrow")
     import subprocess
     import sys
@@ -1655,7 +1666,7 @@ def test_ray_actor_compute_batches_span_upstream_block_boundaries(tmp_path):
         assert observed_batch_rows == {{compute_batch_rows}}, observed_batch_rows
         """
     )
-    env = dict(os.environ)
+    env = dict(ray_subprocess_env)
     env["VANE_PROGRESS"] = "0"
     env["RAY_DEDUP_LOGS"] = "0"
     result = subprocess.run(
@@ -1668,7 +1679,7 @@ def test_ray_actor_compute_batches_span_upstream_block_boundaries(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_ray_actor_soft_minimum_task_batch_matches_ray_data_bundling(tmp_path):
+def test_ray_actor_soft_minimum_task_batch_matches_ray_data_bundling(tmp_path, ray_subprocess_env):
     pytest.importorskip("pyarrow")
     import subprocess
     import sys
@@ -1743,7 +1754,7 @@ def test_ray_actor_soft_minimum_task_batch_matches_ray_data_bundling(tmp_path):
         assert counts == expected, (counts, expected)
         """
     )
-    env = dict(os.environ)
+    env = dict(ray_subprocess_env)
     env["VANE_PROGRESS"] = "0"
     env["RAY_DEDUP_LOGS"] = "0"
     env["VANE_RUNNER"] = "ray"
@@ -1757,7 +1768,7 @@ def test_ray_actor_soft_minimum_task_batch_matches_ray_data_bundling(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_ray_actor_lazy_row_backpressure_preserves_non_tail_batch_alignment(tmp_path):
+def test_ray_actor_lazy_row_backpressure_preserves_non_tail_batch_alignment(tmp_path, ray_subprocess_env):
     pytest.importorskip("pyarrow")
     import subprocess
     import sys
@@ -1854,7 +1865,7 @@ def test_ray_actor_lazy_row_backpressure_preserves_non_tail_batch_alignment(tmp_
         assert observed[712] == 712, observed
         """
     )
-    env = dict(os.environ)
+    env = dict(ray_subprocess_env)
     env["VANE_PROGRESS"] = "0"
     env["RAY_DEDUP_LOGS"] = "0"
     result = subprocess.run(
@@ -1867,7 +1878,7 @@ def test_ray_actor_lazy_row_backpressure_preserves_non_tail_batch_alignment(tmp_
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_ray_task_block_stream_does_not_deadlock_when_sink_and_source_blocked(tmp_path):
+def test_ray_task_block_stream_does_not_deadlock_when_sink_and_source_blocked(tmp_path, ray_subprocess_env):
     pytest.importorskip("pyarrow")
     import subprocess
     import sys
@@ -1948,7 +1959,7 @@ def test_ray_task_block_stream_does_not_deadlock_when_sink_and_source_blocked(tm
         assert total == row_count
         """
     )
-    env = dict(os.environ)
+    env = dict(ray_subprocess_env)
     env["VANE_PROGRESS"] = "0"
     env["RAY_DEDUP_LOGS"] = "0"
     env["VANE_RUNNER"] = "ray"
@@ -1956,7 +1967,7 @@ def test_ray_task_block_stream_does_not_deadlock_when_sink_and_source_blocked(tm
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_ray_task_flat_map_ref_stream_preserves_rows_under_actor_backpressure(tmp_path):
+def test_ray_task_flat_map_ref_stream_preserves_rows_under_actor_backpressure(tmp_path, ray_subprocess_env):
     pytest.importorskip("pyarrow")
     import subprocess
     import sys
@@ -2062,14 +2073,14 @@ def test_ray_task_flat_map_ref_stream_preserves_rows_under_actor_backpressure(tm
         assert max_chunk_len == payload_len + 2
         """
     )
-    env = dict(os.environ)
+    env = dict(ray_subprocess_env)
     env["VANE_PROGRESS"] = "0"
     env["RAY_DEDUP_LOGS"] = "0"
     result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_ray_task_flat_map_projected_ref_stream_preserves_column_projection(tmp_path):
+def test_ray_task_flat_map_projected_ref_stream_preserves_column_projection(tmp_path, ray_subprocess_env):
     pytest.importorskip("pyarrow")
     import subprocess
     import sys
@@ -2168,14 +2179,14 @@ def test_ray_task_flat_map_projected_ref_stream_preserves_column_projection(tmp_
         assert chunk_id_sum == row_count * sum(range(expansion))
         """
     )
-    env = dict(os.environ)
+    env = dict(ray_subprocess_env)
     env["VANE_PROGRESS"] = "0"
     env["RAY_DEDUP_LOGS"] = "0"
     result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_ray_task_flat_map_ref_stream_preserves_variable_and_empty_outputs(tmp_path):
+def test_ray_task_flat_map_ref_stream_preserves_variable_and_empty_outputs(tmp_path, ray_subprocess_env):
     pytest.importorskip("pyarrow")
     import subprocess
     import sys
@@ -2291,14 +2302,14 @@ def test_ray_task_flat_map_ref_stream_preserves_variable_and_empty_outputs(tmp_p
         assert max_chunk_id == expected_max_chunk_id
         """
     )
-    env = dict(os.environ)
+    env = dict(ray_subprocess_env)
     env["VANE_PROGRESS"] = "0"
     env["RAY_DEDUP_LOGS"] = "0"
     result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_ray_task_flat_map_ref_stream_preserves_reordered_alias_projection(tmp_path):
+def test_ray_task_flat_map_ref_stream_preserves_reordered_alias_projection(tmp_path, ray_subprocess_env):
     pytest.importorskip("pyarrow")
     import subprocess
     import sys
@@ -2406,14 +2417,14 @@ def test_ray_task_flat_map_ref_stream_preserves_reordered_alias_projection(tmp_p
         assert weight_sum == sum(i * 10 + chunk_id for i in range(row_count) for chunk_id in range(expansion))
         """
     )
-    env = dict(os.environ)
+    env = dict(ray_subprocess_env)
     env["VANE_PROGRESS"] = "0"
     env["RAY_DEDUP_LOGS"] = "0"
     result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_ray_task_flat_map_ref_stream_all_empty_output_finishes(tmp_path):
+def test_ray_task_flat_map_ref_stream_all_empty_output_finishes(tmp_path, ray_subprocess_env):
     pytest.importorskip("pyarrow")
     import subprocess
     import sys
@@ -2493,7 +2504,7 @@ def test_ray_task_flat_map_ref_stream_all_empty_output_finishes(tmp_path):
         assert result.column(0)[0].as_py() == 0
         """
     )
-    env = dict(os.environ)
+    env = dict(ray_subprocess_env)
     env["VANE_PROGRESS"] = "0"
     env["RAY_DEDUP_LOGS"] = "0"
     result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=90)
@@ -3426,7 +3437,7 @@ def test_ray_inout_function(ray_runner, duckdb_conn, parquet_path):
     )
 
 
-def test_ray_join_flight_shuffle_exchange(ray_runner_local_cluster, duckdb_conn, parquet_path, tmp_path, monkeypatch):
+def test_ray_join_flight_shuffle_exchange(ray_runner, duckdb_conn, parquet_path, tmp_path, monkeypatch):
     label = "test_ray_e2e: join flight shuffle exchange"
     shuffle_dir = tmp_path / "duckdb_shuffle"
     monkeypatch.setenv("VANE_SHUFFLE_ALGORITHM", "flight_shuffle")
@@ -3446,7 +3457,7 @@ def test_ray_join_flight_shuffle_exchange(ray_runner_local_cluster, duckdb_conn,
     _log_distributed_plan(df, label)
     _run_query_case(
         duckdb_conn,
-        ray_runner_local_cluster,
+        ray_runner,
         sql,
         label,
         require_all=["HASH_JOIN"],
@@ -3454,9 +3465,7 @@ def test_ray_join_flight_shuffle_exchange(ray_runner_local_cluster, duckdb_conn,
 
 
 @pytest.mark.external_service
-def test_ray_group_by_flight_shuffle_exchange_minio_durable(
-    ray_runner_local_cluster, duckdb_conn, tmp_path, monkeypatch
-):
+def test_ray_group_by_flight_shuffle_exchange_minio_durable(ray_runner, duckdb_conn, tmp_path, monkeypatch):
     label = "test_ray_e2e: group by flight shuffle exchange minio durable"
     endpoint, access_key, secret_key, region, bucket, shuffle_uri = _minio_shuffle_config()
     _skip_unless_minio_writable(endpoint, access_key, secret_key, region, bucket)
@@ -3502,7 +3511,7 @@ def test_ray_group_by_flight_shuffle_exchange_minio_durable(
     )
     _run_query_case(
         duckdb_conn,
-        ray_runner_local_cluster,
+        ray_runner,
         sql,
         label,
         require_any=["GROUP_BY", "AGGREGATE", "HASH_GROUP_BY"],

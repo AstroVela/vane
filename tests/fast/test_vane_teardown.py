@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import pytest
+
 import duckdb
 
 
@@ -8,6 +10,7 @@ def _get_vane_module():
     return getattr(duckdb, "vane_runners_cpp", None)
 
 
+@pytest.mark.usefixtures("ray_local")
 def test_teardown_runner():
     vane_mod = _get_vane_module()
     assert vane_mod is not None, "vane_runners_cpp module not available"

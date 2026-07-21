@@ -45,5 +45,14 @@ scripts/run_release_tests.sh
 To run the complete fast Python test suite:
 
 ```bash
-python -m pytest tests/fast
+scripts/run_fast_tests.sh
 ```
+
+The launcher runs non-Ray tests, shared-cluster Ray tests, and test-owned Ray
+clusters in separate pytest processes. Do not replace it with one long-lived
+`pytest tests/fast` process.
+
+The fast/release Ray shards use a 2 GiB object store by default. Override the
+test-only profile with `VANE_TEST_RAY_OBJECT_STORE_BYTES`; it does not configure
+production clusters. Tests that call `ray.init()` directly must be marked
+`real_ray` and `ray_cluster_owner`.

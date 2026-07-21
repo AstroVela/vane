@@ -231,7 +231,9 @@ def _check_sdist(artifact: SdistArtifact) -> None:
         "build_backend.py",
         "scripts/run_release_tests.sh",
         "scripts/sync_duckdb_source_id.py",
+        "tests/ray_test_profile.py",
         "tests/fast/test_package_metadata.py",
+        "tests/fast/test_ray_test_profile.py",
     )
     for relative_path in required_paths:
         _require_sdist_path(names, relative_path, artifact.path)

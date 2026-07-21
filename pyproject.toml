@@ -194,7 +194,9 @@ include = [
     # Curated base-installation release gate. The larger inherited test tree
     # stays in the repository and is intentionally not part of the PyPI sdist.
     "/tests/conftest.py",
+    "/tests/ray_test_profile.py",
     "/tests/fast/test_package_metadata.py",
+    "/tests/fast/test_ray_test_profile.py",
     "/tests/fast/test_transformers_provider_security.py",
     "/tests/fast/test_vane_config.py",
     "/tests/fast/test_expression_udf_contracts.py",
@@ -461,6 +463,9 @@ testpaths = ["tests"]
 pythonpath = ["tests", "tests/fast"]
 markers = [
     "external_service: tests that require an externally provisioned service",
+    "real_ray: tests that connect to or own a real Ray runtime",
+    "ray_cluster_owner: tests that must own a Ray cluster in an isolated pytest process",
+    "ray_fault: tests that intentionally kill or restart Ray runtime components",
 ]
 filterwarnings = [
     "error",

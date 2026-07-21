@@ -11,25 +11,6 @@ except Exception:
 import duckdb
 
 
-def _init_ray_for_test():
-    ray_init_kwargs = {
-        "address": "local",
-        "ignore_reinit_error": True,
-        "namespace": "duckdb",
-    }
-    import warnings
-
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message=r"Tip: In future versions of Ray, Ray will no longer override accelerator",
-        )
-        try:
-            ray.init(**ray_init_kwargs)
-        except Exception as ex:
-            pytest.skip(f"failed to start local Ray runtime: {ex}")
-
-
 def _collect_rows_from_parts(parts):
     rows = []
     for part in parts:
@@ -38,111 +19,71 @@ def _collect_rows_from_parts(parts):
             pylist = table.to_pylist()
             for row in pylist:
                 if isinstance(row, dict):
-                    rows.append((row.get("a"), row.get("b"), row.get("sum")))
+                    rows.append(tuple(row.values()))
                 else:
                     rows.append(tuple(row))
         elif hasattr(part, "to_pylist"):
             for row in part.to_pylist():
                 if isinstance(row, dict):
-                    rows.append((row.get("a"), row.get("b"), row.get("sum")))
+                    rows.append(tuple(row.values()))
                 else:
                     rows.append(tuple(row))
     return rows
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
 def test_run_simple_plan_on_ray_local():
-    _init_ray_for_test()
-    try:
-        # Force DuckDB to use Ray runner (if available)
-        try:
-            from duckdb import runners as _runners
+    from duckdb import runners as _runners
 
-            _runners.set_runner_ray()
-        except Exception:
-            pytest.skip("duckdb runner API not available in this environment")
+    _runners.set_runner_ray(noop_if_initialized=True)
+    runner = _runners.get_or_create_runner()
+    assert getattr(runner, "name", None) == "ray"
 
-        from duckdb import runners as _runners
-
-        try:
-            runner = _runners.get_or_create_runner()
-        except Exception:
-            pytest.skip("Ray runner not available in this environment")
-        if getattr(runner, "name", None) != "ray":
-            pytest.skip("Ray runner not active")
-
-        relation = duckdb.sql("SELECT a, b, a + b AS sum FROM (VALUES (1, 10), (2, 20), (3, 30)) AS t(a, b)")
-        parts = list(runner.run_iter_tables(relation, results_buffer_size=1))
-        assert len(parts) >= 1
-        rows = sorted(_collect_rows_from_parts(parts))
-        assert rows == [(1, 10, 11), (2, 20, 22), (3, 30, 33)]
-    finally:
-        try:
-            ray.shutdown()
-        except Exception:
-            pass
+    relation = duckdb.sql("SELECT a, b, a + b AS sum FROM (VALUES (1, 10), (2, 20), (3, 30)) AS t(a, b)")
+    parts = list(runner.run_iter_tables(relation, results_buffer_size=1))
+    assert parts
+    rows = sorted(_collect_rows_from_parts(parts))
+    assert rows == [(1, 10, 11), (2, 20, 22), (3, 30, 33)]
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
 def test_run_distributed_plan_end_to_end_on_ray_local(tmp_path):
-    _init_ray_for_test()
+    from duckdb import runners as _runners
+
+    _runners.set_runner_ray(noop_if_initialized=True)
+
+    # Build a small parquet-backed relation with multiple planner partitions.
+    n = 12
+    path = tmp_path / "ray_real_integration_input.parquet"
+    duckdb.sql(
+        f"""
+        COPY (
+            SELECT
+                i::INTEGER AS a,
+                (i * 10)::INTEGER AS b
+            FROM range({n}) AS t(i)
+        ) TO '{path}' (FORMAT PARQUET)
+        """
+    )
+    relation = duckdb.sql(f"SELECT a, b, a + b AS sum FROM read_parquet('{path}')")
+
+    runner = _runners.get_or_create_runner()
+    assert getattr(runner, "name", None) == "ray"
+
+    parts = list(runner.run_iter_tables(relation, results_buffer_size=1))
+    assert parts
+
+    rows = _collect_rows_from_parts(parts)
+    assert len(rows) == n
+
+    expected_rows = {(x, x * 10, x + x * 10) for x in range(n)}
+    assert set(rows) == expected_rows
+
+    # Some Ray setups do not expose named actors through the same namespace.
     try:
-        # Force DuckDB to use Ray runner (if available)
-        try:
-            from duckdb import runners as _runners
-
-            _runners.set_runner_ray()
-        except Exception:
-            pytest.skip("duckdb runner API not available in this environment")
-
-        # Use multiple partitions in the planner.
-
-        # Build a small parquet-backed relation (serializable across Ray workers).
-        n = 12
-        path = tmp_path / "ray_real_integration_input.parquet"
-        duckdb.sql(
-            f"""
-            COPY (
-                SELECT
-                    i::INTEGER AS a,
-                    (i * 10)::INTEGER AS b
-                FROM range({n}) AS t(i)
-            ) TO '{path}' (FORMAT PARQUET)
-            """
-        )
-        relation = duckdb.sql(f"SELECT a, b, a + b AS sum FROM read_parquet('{path}')")
-
-        # Use the runner to stream MicroPartitions through the distributed native execution path.
-        from duckdb import runners as _runners
-
-        try:
-            runner = _runners.get_or_create_runner()
-        except Exception:
-            pytest.skip("Ray runner not available in this environment")
-        if getattr(runner, "name", None) != "ray":
-            pytest.skip("Ray runner not active")
-
-        parts = list(runner.run_iter_tables(relation, results_buffer_size=1))
-        assert len(parts) >= 1
-
-        # Collect and validate data
-        rows = _collect_rows_from_parts(parts)
-        assert len(rows) == n
-
-        expected_rows = {(x, x * 10, x + x * 10) for x in range(n)}
-        # Compare as unordered sets of rows to avoid partition ordering differences
-        assert set(rows) == expected_rows
-
-        # Ensure the Ray query driver actor exists (best-effort — some Ray setups may not expose it the same way)
-        try:
-            actor = ray.get_actor("ray-query-driver-actor", namespace="vane")
-            assert actor is not None
-        except Exception:
-            # Not fatal; continue
-            pass
-
-    finally:
-        try:
-            ray.shutdown()
-        except Exception:
-            pass
+        actor = ray.get_actor("ray-query-driver-actor", namespace="vane")
+        assert actor is not None
+    except Exception:
+        pass

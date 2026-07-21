@@ -77,10 +77,18 @@ The inherited compatibility suites are broader and require the development
 dependency group. Run them when changing the corresponding integration:
 
 ```bash
-python -m pytest tests/fast
+scripts/run_fast_tests.sh
 python -m pytest tests/slow
 python -m pytest tests/ai
 ```
+
+The fast-test launcher runs non-Ray tests, shared-cluster Ray tests, and
+test-owned Ray clusters in separate pytest processes. This keeps the real Ray
+runtime out of the long-lived non-Ray pytest process. Fast and release Ray test
+clusters use a 2 GiB object store by default;
+`VANE_TEST_RAY_OBJECT_STORE_BYTES` overrides this test-only profile and does
+not configure production clusters. Tests that call `ray.init()` directly must
+be marked `real_ray` and `ray_cluster_owner`.
 
 Tests that require an externally provisioned service are excluded by default. Run them explicitly when the required
 service and credentials are available:
