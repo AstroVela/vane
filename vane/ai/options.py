@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, Literal
+
+from vane.ai._redaction import REDACTED_PLACEHOLDER
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -17,8 +19,27 @@ def _set_if_not_none(target: dict[str, Any], key: str, value: object) -> None:
         target[key] = value
 
 
-@dataclass(frozen=True)
-class OpenAIProviderOptions:
+class _RedactedApiKeyRepr:
+    """Mixin rendering ``api_key`` as a fixed placeholder in the dataclass-style repr.
+
+    Dataclasses opting in must be declared with ``repr=False`` so the generated
+    repr does not shadow this one. ``None`` still renders as ``None`` — masking
+    an absent key would be misleading.
+    """
+
+    def __repr__(self) -> str:
+        parts = []
+        for field in fields(self):  # type: ignore[arg-type]
+            value = getattr(self, field.name)
+            if field.name == "api_key" and value is not None:
+                parts.append(f"{field.name}={REDACTED_PLACEHOLDER}")
+            else:
+                parts.append(f"{field.name}={value!r}")
+        return f"{type(self).__qualname__}({', '.join(parts)})"
+
+
+@dataclass(frozen=True, repr=False)
+class OpenAIProviderOptions(_RedactedApiKeyRepr):
     """OpenAI-compatible provider options shared by prompt and embedding calls."""
 
     base_url: str | None = None
@@ -93,8 +114,8 @@ class OpenAIEmbeddingOptions:
         return options
 
 
-@dataclass(frozen=True)
-class AnthropicProviderOptions:
+@dataclass(frozen=True, repr=False)
+class AnthropicProviderOptions(_RedactedApiKeyRepr):
     """Anthropic provider options for client configuration and execution limits."""
 
     api_key: str | None = None
@@ -140,8 +161,8 @@ class AnthropicPromptOptions:
         return options
 
 
-@dataclass(frozen=True)
-class GoogleProviderOptions:
+@dataclass(frozen=True, repr=False)
+class GoogleProviderOptions(_RedactedApiKeyRepr):
     """Google provider options for client configuration and execution limits."""
 
     api_key: str | None = None
