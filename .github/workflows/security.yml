@@ -87,10 +87,8 @@ jobs:
         if: matrix.language == 'c-cpp'
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          path: |
-            .cache/vcpkg
-            .cache/vcpkg-archives
-          key: codeql-vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json') }}
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: codeql-vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-linux-${{ hashFiles('vcpkg.json') }}
 
       - name: Install pinned native dependencies
         if: matrix.language == 'c-cpp'
