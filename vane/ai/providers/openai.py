@@ -20,12 +20,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pyarrow as pa
 
-from vane.ai._redaction import (
-    Secret,
-    normalized_option_key,
-    unwrap_sensitive_options,
-    wrap_sensitive_options,
-)
+from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider
 from vane.ai.typing import EmbeddingDimensions, UDFOptions
@@ -76,17 +71,15 @@ def _chunk_text(text: str, char_size: int) -> list[str]:
 
 # OpenAI-specific keys sealed in addition to the shared sensitive-key table.
 # ``organization`` identifies the paying account and must not leak via repr,
-# but it is not a generic credential, so it stays out of the shared table.
+# but it is not a generic credential, so it stays out of the shared table
+# (which also drives SQL inline-credential rejection). Suffix matching covers
+# nested forms such as an ``OpenAI-Organization`` request header.
 _EXTRA_SENSITIVE_KEYS = frozenset({"organization"})
 
 
 def _wrap_openai_options(options: Mapping[str, Any]) -> dict[str, Any]:
-    """Seal shared sensitive keys plus OpenAI-specific ones (``organization``)."""
-    wrapped = wrap_sensitive_options(options)
-    for key, value in wrapped.items():
-        if normalized_option_key(key) in _EXTRA_SENSITIVE_KEYS and value is not None and not isinstance(value, Secret):
-            wrapped[key] = Secret(value)
-    return wrapped
+    """Seal shared sensitive keys plus OpenAI-specific ones (``organization``) at any depth."""
+    return wrap_sensitive_options(options, extra_keys=_EXTRA_SENSITIVE_KEYS)
 
 
 # ---------------------------------------------------------------------------

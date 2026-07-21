@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public provider options never leak ``api_key`` through repr, str, or assertion diffs.
+"""Public provider options never leak credentials through repr, str, or assertion diffs.
 
-Covers vane#105: the three api_key-bearing options dataclasses (OpenAI,
-Anthropic, Google) render a fixed placeholder instead of the plaintext key,
-while construction, ``.api_key`` reads, equality, and the credential-free
-options dataclasses stay untouched.
+Covers vane#105: the api_key-bearing options dataclasses (OpenAI, Anthropic,
+Google) render a fixed placeholder instead of the plaintext key — OpenAI also
+masks ``organization`` — and the vLLM options render mapping fields
+(``engine_args``/``generate_args``) with nested sensitive keys sealed.
+Construction, field reads, equality, and the credential-free options
+dataclasses stay untouched.
 """
 
 from __future__ import annotations
@@ -38,13 +40,11 @@ API_KEY_OPTIONS_CLASSES = [
 ]
 
 CREDENTIAL_FREE_OPTIONS_CLASSES = [
-    VLLMProviderOptions,
     OpenAIPromptOptions,
     OpenAIEmbeddingOptions,
     AnthropicPromptOptions,
     GooglePromptOptions,
     GoogleEmbeddingOptions,
-    VLLMPromptOptions,
 ]
 
 
@@ -107,9 +107,10 @@ class TestOtherFieldsRenderNormally:
         )
         assert repr(options) == (
             "OpenAIProviderOptions(base_url='https://api.example', "
-            f"api_key={REDACTED_PLACEHOLDER}, organization='org-plain', "
+            f"api_key={REDACTED_PLACEHOLDER}, organization={REDACTED_PLACEHOLDER}, "
             "timeout=30.0, concurrency=4, max_api_concurrency=8)"
         )
+        assert "org-plain" not in repr(options)
 
     def test_anthropic_full_repr(self):
         options = AnthropicProviderOptions(
@@ -151,6 +152,65 @@ class TestCredentialFreeOptionsUntouched:
             "OpenAIPromptOptions(use_chat_completions=None, max_output_tokens=None, "
             "max_tokens=128, temperature=0.5, on_error=None)"
         )
+
+
+class TestOpenAIOrganizationRedaction:
+    def test_organization_masked_when_set(self):
+        options = OpenAIProviderOptions(organization="org-PLAINTEXT-SENTINEL")
+        for rendered in (repr(options), str(options)):
+            assert "org-PLAINTEXT-SENTINEL" not in rendered
+            assert f"organization={REDACTED_PLACEHOLDER}" in rendered
+
+    def test_organization_none_renders_as_none(self):
+        assert "organization=None" in repr(OpenAIProviderOptions())
+
+    def test_organization_read_unchanged(self):
+        options = OpenAIProviderOptions(organization="org-PLAINTEXT-SENTINEL")
+        assert options.organization == "org-PLAINTEXT-SENTINEL"
+        assert options.to_descriptor_options()["organization"] == "org-PLAINTEXT-SENTINEL"
+
+
+HF_TOKEN = "hf_PLAINTEXT-ENGINE-TOKEN-SENTINEL"
+
+
+class TestVLLMMappingFieldRedaction:
+    def test_engine_args_nested_credentials_masked(self):
+        options = VLLMProviderOptions(engine_args={"hf_token": HF_TOKEN, "max_model_len": 512})
+        rendered = repr(options)
+        assert HF_TOKEN not in rendered
+        assert REDACTED_PLACEHOLDER in rendered
+        assert "'max_model_len': 512" in rendered
+
+    def test_generate_args_nested_credentials_masked(self):
+        options = VLLMPromptOptions(generate_args={"api_key": API_KEY, "seed": 7})
+        rendered = repr(options)
+        assert API_KEY not in rendered
+        assert REDACTED_PLACEHOLDER in rendered
+        assert "'seed': 7" in rendered
+
+    def test_mapping_fields_unchanged_for_reads(self):
+        options = VLLMProviderOptions(engine_args={"hf_token": HF_TOKEN})
+        assert options.engine_args == {"hf_token": HF_TOKEN}
+        assert options.to_descriptor_options()["engine_args"] == {"hf_token": HF_TOKEN}
+
+    def test_credential_free_mappings_render_verbatim(self):
+        options = VLLMProviderOptions(engine_args={"max_model_len": 512}, concurrency=2)
+        assert (
+            repr(options)
+            == "VLLMProviderOptions(engine_args={'max_model_len': 512}, concurrency=2, gpus_per_actor=None)"
+        )
+
+    def test_none_mapping_renders_as_none(self):
+        assert "engine_args=None" in repr(VLLMProviderOptions())
+
+    def test_assertion_diff_hides_nested_token(self):
+        left = VLLMProviderOptions(engine_args={"hf_token": HF_TOKEN}, concurrency=1)
+        right = VLLMProviderOptions(engine_args={"hf_token": HF_TOKEN}, concurrency=2)
+        with pytest.raises(AssertionError) as excinfo:
+            assert left == right
+        message = str(excinfo.value)
+        assert HF_TOKEN not in message
+        assert "concurrency" in message
 
 
 @pytest.mark.parametrize("options_cls", API_KEY_OPTIONS_CLASSES)

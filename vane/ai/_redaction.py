@@ -74,10 +74,20 @@ def normalized_option_key(key: Any) -> str:
     return re.sub(r"[^a-z0-9]", "", str(key).casefold())
 
 
-def is_sensitive_option_key(key: Any) -> bool:
-    """Return True when ``key`` names a credential according to the shared key table."""
+def is_sensitive_option_key(key: Any, extra_keys: frozenset[str] = frozenset()) -> bool:
+    """Return True when ``key`` names a credential according to the shared key table.
+
+    ``extra_keys`` extends the table for one call with additional normalized
+    entries, matched with the same exact-or-suffix rule. Callers with
+    provider-specific sensitive names (e.g. OpenAI's ``organization``) pass
+    them here rather than widening the shared table, which also drives SQL
+    inline-credential rejection.
+    """
     normalized = normalized_option_key(key)
-    return any(normalized == sensitive or normalized.endswith(sensitive) for sensitive in SENSITIVE_OPTION_KEYS)
+    return any(
+        normalized == sensitive or normalized.endswith(sensitive)
+        for sensitive in (SENSITIVE_OPTION_KEYS | extra_keys if extra_keys else SENSITIVE_OPTION_KEYS)
+    )
 
 
 class Secret:
@@ -127,27 +137,34 @@ def _seal(value: Any) -> Any:
     return Secret(value)
 
 
-def _wrap_value(value: Any) -> Any:
+def _wrap_value(value: Any, extra_keys: frozenset[str]) -> Any:
     if isinstance(value, Secret):
         return value
     if isinstance(value, Mapping):
-        return {key: _seal(item) if is_sensitive_option_key(key) else _wrap_value(item) for key, item in value.items()}
+        return {
+            key: _seal(item) if is_sensitive_option_key(key, extra_keys) else _wrap_value(item, extra_keys)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
-        return [_wrap_value(item) for item in value]
+        return [_wrap_value(item, extra_keys) for item in value]
     if isinstance(value, tuple):
-        return tuple(_wrap_value(item) for item in value)
+        return tuple(_wrap_value(item, extra_keys) for item in value)
     return value
 
 
-def wrap_sensitive_options(options: Mapping[str, Any]) -> dict[str, Any]:
+def wrap_sensitive_options(options: Mapping[str, Any], extra_keys: frozenset[str] = frozenset()) -> dict[str, Any]:
     """Return a copy of ``options`` with every sensitive-keyed value sealed in a :class:`Secret`.
 
     Matching applies at any nesting depth, including mappings inside lists and
     tuples. A container value under a sensitive key is sealed whole. Values
     that are already ``Secret`` are kept as-is (wrapping is idempotent), and
-    ``None`` values stay ``None``.
+    ``None`` values stay ``None``. ``extra_keys`` extends the key table for
+    this call only (see :func:`is_sensitive_option_key`).
     """
-    return {key: _seal(value) if is_sensitive_option_key(key) else _wrap_value(value) for key, value in options.items()}
+    return {
+        key: _seal(value) if is_sensitive_option_key(key, extra_keys) else _wrap_value(value, extra_keys)
+        for key, value in options.items()
+    }
 
 
 def _unwrap_value(value: Any) -> Any:

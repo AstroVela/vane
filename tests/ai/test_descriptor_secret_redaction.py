@@ -209,6 +209,15 @@ class TestDescriptorReprRedaction:
         assert ORGANIZATION not in repr(descriptor)
         assert ORGANIZATION not in str(descriptor)
 
+    def test_openai_nested_organization_header_is_redacted(self):
+        from vane.ai.providers.openai import OpenAIProvider
+
+        descriptor = OpenAIProvider(api_key=API_KEY).get_prompter(
+            extra_headers={"OpenAI-Organization": ORGANIZATION},
+        )
+        assert ORGANIZATION not in repr(descriptor)
+        assert isinstance(descriptor.prompt_options["extra_headers"]["OpenAI-Organization"], Secret)
+
     def test_credential_kwarg_landing_in_prompt_options_is_redacted(self):
         from vane.ai.providers.openai import OpenAIProvider
 

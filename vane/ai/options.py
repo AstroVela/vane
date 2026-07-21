@@ -5,13 +5,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, ClassVar, Literal
 
-from vane.ai._redaction import REDACTED_PLACEHOLDER
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping
+from vane.ai._redaction import REDACTED_PLACEHOLDER, wrap_sensitive_options
 
 
 def _set_if_not_none(target: dict[str, Any], key: str, value: object) -> None:
@@ -19,28 +17,39 @@ def _set_if_not_none(target: dict[str, Any], key: str, value: object) -> None:
         target[key] = value
 
 
-class _RedactedApiKeyRepr:
-    """Mixin rendering ``api_key`` as a fixed placeholder in the dataclass-style repr.
+class _RedactedOptionsRepr:
+    """Mixin rendering credential-bearing fields redacted in the dataclass-style repr.
 
-    Dataclasses opting in must be declared with ``repr=False`` so the generated
-    repr does not shadow this one. ``None`` still renders as ``None`` — masking
-    an absent key would be misleading.
+    Scalar fields named in ``_REDACTED_FIELDS`` render as a fixed placeholder
+    when set (``None`` still renders as ``None`` — masking an absent key would
+    be misleading). Mapping-valued fields render with sensitive keys sealed at
+    any nesting depth, so nested credentials (e.g. an HF hub token inside
+    ``engine_args``) never reach the repr. Dataclasses opting in must be
+    declared with ``repr=False`` so the generated repr does not shadow this one.
     """
+
+    _REDACTED_FIELDS: ClassVar[frozenset[str]] = frozenset({"api_key"})
 
     def __repr__(self) -> str:
         parts = []
         for field in fields(self):  # type: ignore[arg-type]
             value = getattr(self, field.name)
-            if field.name == "api_key" and value is not None:
+            if field.name in self._REDACTED_FIELDS and value is not None:
                 parts.append(f"{field.name}={REDACTED_PLACEHOLDER}")
+            elif isinstance(value, Mapping):
+                parts.append(f"{field.name}={wrap_sensitive_options(value)!r}")
             else:
                 parts.append(f"{field.name}={value!r}")
         return f"{type(self).__qualname__}({', '.join(parts)})"
 
 
 @dataclass(frozen=True, repr=False)
-class OpenAIProviderOptions(_RedactedApiKeyRepr):
+class OpenAIProviderOptions(_RedactedOptionsRepr):
     """OpenAI-compatible provider options shared by prompt and embedding calls."""
+
+    # ``organization`` identifies the paying account; the OpenAI provider seals
+    # it at the descriptor layer, so the public repr must not leak it either.
+    _REDACTED_FIELDS: ClassVar[frozenset[str]] = frozenset({"api_key", "organization"})
 
     base_url: str | None = None
     api_key: str | None = None
@@ -61,8 +70,8 @@ class OpenAIProviderOptions(_RedactedApiKeyRepr):
         return options
 
 
-@dataclass(frozen=True)
-class VLLMProviderOptions:
+@dataclass(frozen=True, repr=False)
+class VLLMProviderOptions(_RedactedOptionsRepr):
     """vLLM provider options for actor count, GPU allocation, and engine args."""
 
     engine_args: Mapping[str, Any] | None = None
@@ -115,7 +124,7 @@ class OpenAIEmbeddingOptions:
 
 
 @dataclass(frozen=True, repr=False)
-class AnthropicProviderOptions(_RedactedApiKeyRepr):
+class AnthropicProviderOptions(_RedactedOptionsRepr):
     """Anthropic provider options for client configuration and execution limits."""
 
     api_key: str | None = None
@@ -162,7 +171,7 @@ class AnthropicPromptOptions:
 
 
 @dataclass(frozen=True, repr=False)
-class GoogleProviderOptions(_RedactedApiKeyRepr):
+class GoogleProviderOptions(_RedactedOptionsRepr):
     """Google provider options for client configuration and execution limits."""
 
     api_key: str | None = None
@@ -216,8 +225,8 @@ class GoogleEmbeddingOptions:
         return options
 
 
-@dataclass(frozen=True)
-class VLLMPromptOptions:
+@dataclass(frozen=True, repr=False)
+class VLLMPromptOptions(_RedactedOptionsRepr):
     """vLLM prompt generation options."""
 
     generate_args: Mapping[str, Any] | None = None
