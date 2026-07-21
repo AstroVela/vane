@@ -108,7 +108,9 @@ static string PicklePythonUDFCallable(const py::function &udf) {
 		py::dict sanitized_annotations;
 		for (auto item : py::reinterpret_borrow<py::dict>(original_annotations)) {
 			shared_ptr<DuckDBPyType> pytype;
-			if (py::try_cast<shared_ptr<DuckDBPyType>>(item.second, pytype)) {
+			// A None annotation (e.g. `-> None`) casts to a null shared_ptr; keep it verbatim
+			// instead of dereferencing it below.
+			if (py::try_cast<shared_ptr<DuckDBPyType>>(item.second, pytype) && pytype) {
 				sanitized_annotations[item.first] = py::str(pytype->ToString());
 				annotations_rewritten = true;
 			} else {
