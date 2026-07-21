@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -212,8 +213,10 @@ def _positive_float_env(name: str, default: float | None = None) -> float | None
     if not raw:
         return default
     value = float(raw)
-    if value < 0.0:
-        raise ValueError(f"{name} must be non-negative")
+    # NaN compares false against 0.0 and infinity compares true, so both
+    # slipped through a plain sign check (matches the vllm.py reference).
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
     return value
 
 
