@@ -271,7 +271,21 @@ def chunk_text(
 
     Returns:
         List of text chunks. Returns ``[text]`` if text fits in one chunk.
+
+    Raises:
+        ValueError: If ``max_chars`` is not a positive integer or
+            ``overlap_chars`` is not an integer in ``[0, max_chars)``.
     """
+    # bool is an int subclass; reject it along with everything non-integral.
+    if isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < 1:
+        raise ValueError(f"max_chars must be a positive integer, got {max_chars!r}")
+    if isinstance(overlap_chars, bool) or not isinstance(overlap_chars, int):
+        raise ValueError(f"overlap_chars must be an integer, got {overlap_chars!r}")
+    if not 0 <= overlap_chars < max_chars:
+        raise ValueError(
+            f"overlap_chars must satisfy 0 <= overlap_chars < max_chars, "
+            f"got overlap_chars={overlap_chars} max_chars={max_chars}"
+        )
     if len(text) <= max_chars:
         return [text]
 
@@ -294,7 +308,13 @@ def _weighted_average_embeddings(
     """Compute length-weighted average of embeddings."""
     arr = np.array(embeddings, dtype=np.float64)
     w = np.array(weights, dtype=np.float64)
-    w /= w.sum()
+    total = w.sum()
+    if not np.isfinite(total) or total <= 0:
+        # All-zero (or non-finite) weights would divide by zero and poison the
+        # result with NaN; fall back to an unweighted average instead.
+        w = np.full_like(w, 1.0 / len(w))
+    else:
+        w /= total
     averaged = (arr * w[:, np.newaxis]).sum(axis=0)
     norm = np.linalg.norm(averaged)
     if norm > 0:
