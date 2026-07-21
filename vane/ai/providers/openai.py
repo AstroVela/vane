@@ -20,11 +20,19 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pyarrow as pa
 
+from vane.ai._redaction import (
+    Secret,
+    normalized_option_key,
+    unwrap_sensitive_options,
+    wrap_sensitive_options,
+)
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider
 from vane.ai.typing import EmbeddingDimensions, UDFOptions
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from vane.ai.protocols import Prompter, TextEmbedder
     from vane.ai.typing import Embedding, Options
 
@@ -64,6 +72,21 @@ def _get_input_token_limit(model: str) -> int:
 def _chunk_text(text: str, char_size: int) -> list[str]:
     """Split *text* into character-level chunks of at most *char_size*."""
     return [text[i : i + char_size] for i in range(0, len(text), char_size)]
+
+
+# OpenAI-specific keys sealed in addition to the shared sensitive-key table.
+# ``organization`` identifies the paying account and must not leak via repr,
+# but it is not a generic credential, so it stays out of the shared table.
+_EXTRA_SENSITIVE_KEYS = frozenset({"organization"})
+
+
+def _wrap_openai_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    """Seal shared sensitive keys plus OpenAI-specific ones (``organization``)."""
+    wrapped = wrap_sensitive_options(options)
+    for key, value in wrapped.items():
+        if normalized_option_key(key) in _EXTRA_SENSITIVE_KEYS and value is not None and not isinstance(value, Secret):
+            wrapped[key] = Secret(value)
+    return wrapped
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +173,8 @@ class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
             and self.model_name not in _DIMENSION_OVERRIDABLE
         ):
             raise ValueError(f"Model {self.model_name!r} does not support custom dimensions")
+        self.provider_options = _wrap_openai_options(self.provider_options)
+        self.embed_options = _wrap_openai_options(self.embed_options)
 
     def get_provider(self) -> str:
         return self.provider_name
@@ -168,7 +193,7 @@ class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
         # Unknown model with custom base_url — probe the server
         from openai import OpenAI as OpenAIClient
 
-        client = OpenAIClient(**self.provider_options)
+        client = OpenAIClient(**unwrap_sensitive_options(self.provider_options))
         response = client.embeddings.create(
             input="dimension probe",
             model=self.model_name,
@@ -227,6 +252,9 @@ class OpenAITextEmbedder:
 
         if encoding_format not in {"float", "base64"}:
             raise ValueError("encoding_format must be 'float' or 'base64'")
+        # Restore plaintext credentials sealed by the descriptor; plain dicts
+        # from direct callers pass through unchanged.
+        provider_options = unwrap_sensitive_options(provider_options)
         self._model = model
         self._dimensions = dimensions
         self._encoding_format = encoding_format
@@ -339,6 +367,10 @@ class OpenAIPrompterDescriptor(PrompterDescriptor):
     use_chat_completions: bool = True
     prompt_options: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.provider_options = _wrap_openai_options(self.provider_options)
+        self.prompt_options = _wrap_openai_options(self.prompt_options)
+
     def get_provider(self) -> str:
         return self.provider_name
 
@@ -391,6 +423,10 @@ class OpenAIPrompter:
     ):
         from openai import AsyncOpenAI
 
+        # Restore plaintext credentials sealed by the descriptor; plain dicts
+        # from direct callers pass through unchanged.
+        provider_options = unwrap_sensitive_options(provider_options)
+        options = unwrap_sensitive_options(options)
         self._model = model
         self._system_message = system_message
         self._return_format = return_format

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
+from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.protocols import TextClassifierDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider
 from vane.ai.typing import EmbeddingDimensions, UDFOptions
@@ -78,6 +79,9 @@ class TransformersTextEmbedderDescriptor(TextEmbedderDescriptor):
     dimensions: int | None = None
     embed_options: dict[str, Any] = field(default_factory=lambda: {"batch_size": 64})
 
+    def __post_init__(self) -> None:
+        self.embed_options = wrap_sensitive_options(self.embed_options)
+
     def get_provider(self) -> str:
         return "transformers"
 
@@ -100,6 +104,8 @@ class TransformersTextEmbedderDescriptor(TextEmbedderDescriptor):
                 config_options[name] = self.embed_options[name]
         if "cache_folder" in self.embed_options:
             config_options["cache_dir"] = self.embed_options["cache_folder"]
+        # Hub access is an execution boundary: restore the plaintext token.
+        config_options = unwrap_sensitive_options(config_options)
         hidden = AutoConfig.from_pretrained(self.model, **config_options).hidden_size
         return EmbeddingDimensions(size=hidden, dtype=pa.float32())
 
@@ -140,6 +146,9 @@ class TransformersTextEmbedder:
     ):
         from sentence_transformers import SentenceTransformer
 
+        # Restore plaintext credentials sealed by the descriptor; plain dicts
+        # from direct callers pass through unchanged.
+        model_options = unwrap_sensitive_options(model_options)
         trust_remote_code = model_options.pop("trust_remote_code", False) is True
         self.model = SentenceTransformer(
             model_name_or_path,
@@ -169,6 +178,9 @@ class TransformersTextClassifierDescriptor(TextClassifierDescriptor):
 
     model: str
     classify_options: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.classify_options = wrap_sensitive_options(self.classify_options)
 
     def get_provider(self) -> str:
         return "transformers"
@@ -208,6 +220,9 @@ class TransformersTextClassifier:
     def __init__(self, model_name: str, **options: Any):
         from transformers import pipeline
 
+        # Restore plaintext credentials sealed by the descriptor; plain dicts
+        # from direct callers pass through unchanged.
+        options = unwrap_sensitive_options(options)
         options["trust_remote_code"] = options.get("trust_remote_code") is True
         self.pipeline = pipeline(
             "zero-shot-classification",
