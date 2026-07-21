@@ -102,7 +102,7 @@ def _run_query_native_in_subprocess(
         t0 = time.time()
         row_count = 0
         for table in runner.run_iter_tables(rel, results_buffer_size):
-            row_count += len(table)
+            row_count += table.num_rows
         elapsed = time.time() - t0
 
         con.close()
