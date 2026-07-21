@@ -112,7 +112,7 @@ def test_run_distributed_plan_end_to_end_on_ray_local(tmp_path):
         )
         relation = duckdb.sql(f"SELECT a, b, a + b AS sum FROM read_parquet('{path}')")
 
-        # Use the runner to stream MicroPartitions through the distributed native execution path.
+        # Use the runner to stream PyArrow tables through the distributed native execution path.
         from duckdb import runners as _runners
 
         try:

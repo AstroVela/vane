@@ -70,8 +70,7 @@ def run_demo(no_ray_init: bool = False, verbose: bool = False) -> None:
     logger.info("Result: (Preview)")
     collected.show()
 
-    # For additional traceability, print raw partition content using run_iter_tables if you want to see
-    # MicroPartition level results
+    # For additional traceability, print raw partition content using run_iter_tables.
     logger.info("Printing partitions using runner.run_iter_tables for explicit iteration:")
     runner = duckdb.get_or_create_runner()
     builder = df._builder
