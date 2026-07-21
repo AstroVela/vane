@@ -61,6 +61,12 @@ unique_ptr<QueryNode> ProjectionRelation::GetQueryNode() {
 }
 
 BoundStatement ProjectionRelation::Bind(Binder &binder) {
+	// Preserve the input aliases when projecting directly from a join. Binding
+	// the child plan first collapses the join output into a single binding.
+	if (child->type == RelationType::JOIN_RELATION) {
+		return Relation::Bind(binder);
+	}
+
 	auto child_bound = child->Bind(binder);
 
 	auto bindings = child_bound.plan->GetColumnBindings();
