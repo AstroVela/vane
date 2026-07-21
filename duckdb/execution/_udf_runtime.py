@@ -684,7 +684,7 @@ class UDFExecutor:
 
     def _iter_flat_map_output_tables(self, args: pa.Table) -> Iterable[pa.Table]:
         args = self._rename_args(args)
-        output_rows: list[dict] = []
+        output_rows: list[dict[str, Any]] = []
         output_row_bytes = 0
         output_buffer = RuntimeOutputBuffer(self._output_batch_size, self._output_target_max_bytes)
         batches = _iter_table_batches(args, self._batch_size) if not self._prebatched_input else [args]
@@ -698,7 +698,7 @@ class UDFExecutor:
             output_row_bytes = 0
             yield from output_buffer.append(table)
 
-        def append_output_row(row: dict) -> Iterable[pa.Table]:
+        def append_output_row(row: dict[str, Any]) -> Iterable[pa.Table]:
             nonlocal output_row_bytes
             output_rows.append(row)
             output_row_bytes += _estimate_python_row_bytes(row)
@@ -731,7 +731,7 @@ class UDFExecutor:
         if not emitted:
             self._queue.append(_empty_output_table_from_payload(self._payload))
 
-    def _flat_map_rows_to_table(self, rows: list[dict]) -> pa.Table:
+    def _flat_map_rows_to_table(self, rows: list[dict[str, Any]]) -> pa.Table:
         if self._output_names:
             arrays = {name: [row.get(name) for row in rows] for name in self._output_names}
             return pa.table(arrays)
