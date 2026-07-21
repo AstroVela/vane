@@ -4,13 +4,13 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
 
 import pyarrow as pa
 
+from vane.ai._redaction import is_sensitive_option_key
 from vane.ai.functions import (
     _actor_number_or_one,
     _adapt_batch_wrapper_for_backend,
@@ -48,43 +48,12 @@ _FLOAT_OPTION_NAMES = {
     "top_p",
 }
 
-_INLINE_CREDENTIAL_KEYS = {
-    "accesskey",
-    "accesskeyid",
-    "accesstoken",
-    "apikey",
-    "apikeyid",
-    "apitoken",
-    "authorization",
-    "authtoken",
-    "bearertoken",
-    "clientsecret",
-    "clientsecretvalue",
-    "credential",
-    "credentials",
-    "password",
-    "passwd",
-    "privatekey",
-    "secret",
-    "secretkey",
-    "token",
-}
-
-
-def _normalized_option_key(key: Any) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(key).casefold())
-
-
-def _is_inline_credential_key(key: Any) -> bool:
-    normalized = _normalized_option_key(key)
-    return any(normalized == sensitive or normalized.endswith(sensitive) for sensitive in _INLINE_CREDENTIAL_KEYS)
-
 
 def _reject_inline_credentials(value: Any, path: str = "options") -> None:
     if isinstance(value, Mapping):
         for key, item in value.items():
             key_text = str(key)
-            if _is_inline_credential_key(key_text):
+            if is_sensitive_option_key(key_text):
                 raise ValueError(
                     f"AI SQL options cannot include inline credential field {path}.{key_text}; "
                     "configure provider credentials through environment variables"
