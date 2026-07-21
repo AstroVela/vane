@@ -133,27 +133,24 @@ def require():
         # Paths to search for extensions
 
         build = Path(__file__).parent.parent / "build"
-        extension = "extension/*/*.duckdb_extension"
-
         extension_search_patterns = [
-            build / "release" / extension,
-            build / "debug" / extension,
+            (build / "release", "extension/*/*.duckdb_extension"),
+            (build / "debug", "extension/*/*.duckdb_extension"),
         ]
 
         # DUCKDB_PYTHON_TEST_EXTENSION_PATH can be used to add a path for the extension test to search for extensions
         if "DUCKDB_PYTHON_TEST_EXTENSION_PATH" in os.environ:
-            env_extension_path = os.getenv("DUCKDB_PYTHON_TEST_EXTENSION_PATH")
-            env_extension_path = env_extension_path.rstrip("/")
-            extension_search_patterns.append(env_extension_path + "/*/*.duckdb_extension")
-            extension_search_patterns.append(env_extension_path + "/*.duckdb_extension")
+            env_extension_path = Path(os.environ["DUCKDB_PYTHON_TEST_EXTENSION_PATH"])
+            extension_search_patterns.append((env_extension_path, "*/*.duckdb_extension"))
+            extension_search_patterns.append((env_extension_path, "*.duckdb_extension"))
 
         extension_paths_found = []
-        for pattern in extension_search_patterns:
-            extension_paths_found.extend(list(Path(pattern).resolve().glob("*")))
+        for root, pattern in extension_search_patterns:
+            extension_paths_found.extend(root.resolve().glob(pattern))
 
         for path in extension_paths_found:
             print(path)
-            if path.endswith(extension_name + ".duckdb_extension"):
+            if path.name == extension_name + ".duckdb_extension":
                 conn = duckdb.connect(db_name, config={"allow_unsigned_extensions": "true"})
                 conn.execute(f"LOAD '{path}'")
                 return conn
