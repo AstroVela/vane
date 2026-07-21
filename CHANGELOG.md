@@ -20,6 +20,12 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 ### Security
 
 - Documented the trust boundaries around Python UDFs, Ray workers, credentials, native parsers, and remote model code.
+- Redacted AI provider credentials from descriptor and provider-option `repr`,
+  logs, exception formatting, and assertion diffs; plaintext is revealed only at
+  provider execution, and SQL continues to reject inline credentials. Option
+  mappings held by AI descriptors now store sensitive values wrapped in an
+  internal secret type, so code that compared those mappings against plain
+  dictionaries must compare revealed values instead.
 
 ## 0.1.0a1
 

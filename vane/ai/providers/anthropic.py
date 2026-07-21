@@ -18,6 +18,7 @@ import base64
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.protocols import PrompterDescriptor
 from vane.ai.provider import Provider
 from vane.ai.typing import UDFOptions
@@ -93,6 +94,10 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
     return_format: Any | None = None
     prompt_options: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.provider_options = wrap_sensitive_options(self.provider_options)
+        self.prompt_options = wrap_sensitive_options(self.prompt_options)
+
     def get_provider(self) -> str:
         return self.provider_name
 
@@ -141,6 +146,10 @@ class AnthropicPrompter:
     ):
         from anthropic import AsyncAnthropic
 
+        # Restore plaintext credentials sealed by the descriptor; plain dicts
+        # from direct callers pass through unchanged.
+        provider_options = unwrap_sensitive_options(provider_options)
+        options = unwrap_sensitive_options(options)
         self._model = model
         self._system_message = system_message
         self._return_format = return_format
