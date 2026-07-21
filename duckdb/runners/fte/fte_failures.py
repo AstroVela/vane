@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -114,8 +115,29 @@ def _missing_output_stats_failure(attempt_id: FteTaskAttemptId) -> dict[str, Any
     }
 
 
+# Structured error codes that mean a memory failure, matched exactly after
+# _normalized_error_token() (upper-cased, separators folded to underscores).
+_MEMORY_ERROR_CODES = frozenset(
+    {
+        "OOM",
+        "OUT_OF_MEMORY",
+        "MEMORY_LIMIT_EXCEEDED",
+        "EXCEEDED_LOCAL_MEMORY_LIMIT",
+        "EXCEEDED_GLOBAL_MEMORY_LIMIT",
+        "EXCEEDED_MEMORY_LIMIT",
+    }
+)
+
+# Text fallback with word boundaries: "oom" must stand alone so messages
+# containing bloom/room/zoom are not classified as memory failures, while
+# "OOM", "oom-killed", and "out of memory" still are. The text is lower-cased
+# with -/_ folded to spaces before matching.
+_MEMORY_TEXT_PATTERN = re.compile(r"\b(?:oom|out of memory|memory limit|exceeded local memory)\b")
+
+
 def _is_memory_failure(payload: Any) -> bool:
-    text = _failure_text(payload).lower()
-    return any(
-        token in text for token in ("out_of_memory", "out of memory", "oom", "memory limit", "exceeded_local_memory")
-    )
+    code = _normalized_error_token(_failure_field(payload, "error_code", "errorCode", "code"))
+    if code in _MEMORY_ERROR_CODES:
+        return True
+    text = _failure_text(payload).lower().replace("_", " ").replace("-", " ")
+    return _MEMORY_TEXT_PATTERN.search(text) is not None
