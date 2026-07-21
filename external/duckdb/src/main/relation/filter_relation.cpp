@@ -1,9 +1,17 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/relation/filter_relation.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 
 namespace duckdb {
 
@@ -39,6 +47,18 @@ unique_ptr<QueryNode> FilterRelation::GetQueryNode() {
 		result->where_clause = condition->Copy();
 		return std::move(result);
 	}
+}
+
+BoundStatement FilterRelation::Bind(Binder &binder) {
+	if (!CanMapColumnBindings(*child)) {
+		return Relation::Bind(binder);
+	}
+	auto child_bound = child->Bind(binder);
+	auto bound_condition = BindExpressionOnBoundRelation(binder, *child, child_bound, condition->Copy(), "filter");
+	auto filter = make_uniq<LogicalFilter>(std::move(bound_condition));
+	filter->AddChild(std::move(child_bound.plan));
+	child_bound.plan = std::move(filter);
+	return child_bound;
 }
 
 string FilterRelation::GetAlias() {

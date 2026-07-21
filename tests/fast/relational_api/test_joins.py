@@ -105,6 +105,62 @@ class TestRAPIJoins:
         res = rel.fetchall()
         assert res == [(1, 1, 1, 4), (2, 1, 1, 4), (3, 2, 1, 4), (1, 1, 3, 5), (2, 1, 3, 5), (3, 2, 3, 5)]
 
+    def test_cross_join_qualified_non_key_projection(self, con):
+        result = con.table("tbl_a").cross(con.table("tbl_b")).project("tbl_a.b, tbl_b.b")
+
+        assert result.order("1, 2").limit(1).fetchall() == [(1, 4)]
+
+    def test_real_table_join_qualified_non_key_projection(self, con):
+        relation = con.table("tbl_a").join(con.table("tbl_b"), "tbl_a.b = tbl_b.a")
+
+        assert relation.project("tbl_a.a, tbl_b.b").order("1").fetchall() == [(1, 4), (2, 4)]
+
+    def test_order_by_ordinal_preserves_relation_ordering(self, con):
+        relation = con.sql("SELECT * FROM (VALUES (2, 'b'), (1, 'a')) data(id, label)")
+
+        assert relation.order("1").limit(1).fetchone() == (1, "a")
+
+    def test_filter_columns_expression(self, con):
+        relation = con.sql("SELECT * FROM (VALUES (1, 2), (1, -1)) data(a, b)")
+
+        assert relation.filter("COLUMNS(*) > 0").fetchall() == [(1, 2)]
+
+    def test_order_by_subquery_uses_sql_binding(self, con):
+        relation = con.sql("SELECT * FROM (VALUES (2), (1)) data(id)")
+
+        assert relation.order("(SELECT -id)").fetchall() == [(2,), (1,)]
+
+    @pytest.mark.parametrize(
+        ("operation", "expected"),
+        [
+            ("direct", [(2, 1), (2, 1), (3, 1)]),
+            ("filter", [(2, 1)]),
+            ("ordered_limit", [(3, 1)]),
+            ("distinct", [(2, 1), (2, 1), (3, 1)]),
+        ],
+    )
+    def test_qualified_join_bindings_survive_unary_relations(self, con, operation, expected):
+        con.execute("PRAGMA enable_verification")
+        con.execute(
+            "CREATE TEMP TABLE employees AS SELECT * FROM "
+            "(VALUES (1, -1, 'manager'), (2, 1, 'alpha'), (2, 1, 'beta'), (3, 1, 'gamma')) "
+            "data(emp_id, superior_emp_id, variant)"
+        )
+        employees = con.table("employees")
+        left = employees.set_alias("emp1")
+        right = employees.set_alias("emp2")
+        relation = left.join(right, "emp1.superior_emp_id = emp2.emp_id")
+        if operation == "filter":
+            relation = relation.filter("emp1.variant = 'beta'")
+        elif operation == "ordered_limit":
+            relation = relation.order("emp1.emp_id DESC").limit(1)
+        elif operation == "distinct":
+            relation = relation.distinct()
+
+        result = relation.project("emp1.emp_id, emp2.emp_id AS manager_id")
+
+        assert sorted(result.fetchall()) == sorted(expected)
+
     @pytest.mark.parametrize("threads", [1, 4])
     @pytest.mark.parametrize("left_count,right_count", CROSS_JOIN_BOUNDARY_CASES)
     def test_cross_join_vector_boundaries(self, con, threads, left_count, right_count):

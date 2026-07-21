@@ -350,6 +350,44 @@ class TestDataFrameJoin:
             key=lambda x: x.emp_id,
         )
 
+    @pytest.mark.parametrize(
+        ("operation", "expected"),
+        [
+            ("direct", [Row(emp_id=2, manager_id=1), Row(emp_id=2, manager_id=1), Row(emp_id=3, manager_id=1)]),
+            ("filter", [Row(emp_id=2, manager_id=1)]),
+            ("ordered_limit", [Row(emp_id=3, manager_id=1)]),
+            ("distinct", [Row(emp_id=2, manager_id=1), Row(emp_id=2, manager_id=1), Row(emp_id=3, manager_id=1)]),
+        ],
+    )
+    def test_self_join_qualified_bindings_survive_unary_relations(self, spark, operation, expected):
+        employees = spark.createDataFrame(
+            [
+                (1, -1, "manager"),
+                (2, 1, "alpha"),
+                (2, 1, "beta"),
+                (3, 1, "gamma"),
+            ],
+            ["emp_id", "superior_emp_id", "variant"],
+        )
+        relation = employees.alias("emp1").join(
+            employees.alias("emp2"),
+            col("emp1.superior_emp_id") == col("emp2.emp_id"),
+            "inner",
+        )
+        if operation == "filter":
+            relation = relation.filter(col("emp1.variant") == "beta")
+        elif operation == "ordered_limit":
+            relation = relation.orderBy(col("emp1.emp_id").desc()).limit(1)
+        elif operation == "distinct":
+            relation = relation.distinct()
+
+        result = relation.select(
+            col("emp1.emp_id"),
+            col("emp2.emp_id").alias("manager_id"),
+        ).collect()
+
+        assert sorted(result) == sorted(expected)
+
     def test_cross_join(self, spark):
         data1 = [(1, "Carol"), (2, "Alice"), (3, "Dave")]
         data2 = [(4, "A"), (5, "B")]

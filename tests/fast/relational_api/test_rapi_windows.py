@@ -49,6 +49,23 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.parametrize(
+        ("exchange_method", "plan_node"),
+        [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
+    )
+    def test_row_number_preserves_qualified_join_bindings_and_exchange(self, duckdb_cursor, exchange_method, plan_node):
+        left = duckdb_cursor.sql("SELECT * FROM (VALUES (2), (1)) data(value)").set_alias("left_data")
+        right = duckdb_cursor.sql("SELECT 10 AS join_key").set_alias("right_data")
+        joined = left.join(right, "right_data.join_key = 10")
+        exchanged = getattr(joined, exchange_method)(2)
+
+        result = exchanged.row_number("over (order by left_data.value)", "*")
+
+        plan = result.explain()
+        assert plan_node in plan
+        assert "WINDOW" in plan
+        assert sorted(result.fetchall()) == [(1, 10, 1), (2, 10, 2)]
+
     def test_rank(self, table):
         result = table.rank("over ()").execute().fetchall()
         expected = [1] * 8

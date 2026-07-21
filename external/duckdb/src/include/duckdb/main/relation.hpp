@@ -36,8 +36,10 @@ namespace duckdb {
 struct BoundStatement;
 
 class Binder;
+class Expression;
 class LogicalOperator;
 class QueryNode;
+class SelectNode;
 class TableRef;
 
 static string CreateRelationAlias(RelationType type, const string &alias) {
@@ -237,6 +239,15 @@ public:
 
 protected:
 	DUCKDB_API static string RenderWhitespace(idx_t depth);
+	DUCKDB_API static bool CanMapColumnBindings(Relation &relation);
+	DUCKDB_API static shared_ptr<Binder> CreateBinderForBoundRelation(Binder &binder, Relation &relation,
+	                                                                  const BoundStatement &bound_relation);
+	DUCKDB_API static unique_ptr<Expression> BindExpressionOnBoundRelation(Binder &binder, Relation &relation,
+	                                                                       BoundStatement &bound_relation,
+	                                                                       unique_ptr<ParsedExpression> expression,
+	                                                                       const string &operation);
+	DUCKDB_API static BoundStatement BindSelectNodeOnChild(Binder &binder, Relation &child, BoundStatement child_bound,
+	                                                       unique_ptr<SelectNode> select_node);
 
 public:
 	template <class TARGET>
