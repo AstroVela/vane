@@ -21,6 +21,21 @@ All notable user-visible changes are documented here. Vane is currently in alpha
   Vane engine customizations as monorepo commits, so normal clones no longer
   require submodule initialization or carry DuckDB's complete commit history.
 
+### Fixed
+
+- AI execution options now take effect on every surface instead of being
+  silently dropped: explicit `batch_size` and the bare `concurrency` kwarg
+  reach the API prompter/embedder descriptors, API providers no longer require
+  `num_gpus` to use actor fan-out on the relation path, provider-level OpenAI
+  defaults (`batch_size`, `max_api_concurrency`, `on_error`) are routed to the
+  request options, the vLLM `on_error` vocabulary (`ignore`/`null`) is
+  translated at the engine boundary, and `return_format` smuggled inside
+  option dicts or `image_columns` on a text-only batch prompter now raise
+  clear errors. Chunked embedding honours `max_retries`/`on_error`,
+  `on_error="log"` emits a warning log, a failed batch call retries rows
+  individually so only genuinely-bad rows are substituted, and
+  `RetryAfterError` survives pickling across worker boundaries.
+
 ### Security
 
 - Documented the trust boundaries around Python UDFs, Ray workers, credentials, native parsers, and remote model code.
