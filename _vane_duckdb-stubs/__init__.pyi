@@ -42,6 +42,8 @@ _ExpressionLike: typing.TypeAlias = (
     | uuid.UUID
 )
 
+ray_cxx: typing.Any
+
 __all__: lst[str] = [
     "BinderException",
     "CSVLineTerminator",

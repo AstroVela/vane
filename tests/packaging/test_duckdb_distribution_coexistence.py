@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
-import sys
 import tempfile
 import textwrap
 import venv

@@ -27,6 +27,7 @@ import importlib as _importlib
 import sys as _sys
 
 import _vane_duckdb as _native
+
 from vane import _duckdb_api as _duckdb_api
 from vane._duckdb_api import *  # noqa: F403
 from vane._ray_progress_env import configure_ray_progress_logging_defaults as _configure_ray_progress_logging_defaults
