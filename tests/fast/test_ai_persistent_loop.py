@@ -16,6 +16,7 @@ event loop.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import importlib
 import pickle
 import sys
@@ -483,6 +484,75 @@ class TestLoopRecreation:
                 restored._loop_runner.close()
         finally:
             wrapper._loop_runner.close()
+
+    def test_fork_zombie_running_loop_is_skipped_not_closed(self) -> None:
+        """A forked child's inherited loop can claim to be running with no
+        live thread; recreation must skip closing it instead of raising."""
+
+        class RunningZombieLoop:
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            def is_closed(self) -> bool:
+                return False
+
+            def is_running(self) -> bool:
+                return True
+
+            def close(self) -> None:
+                self.close_calls += 1
+                raise RuntimeError("Cannot close a running event loop")
+
+        runner = _PersistentLoopRunner()
+        zombie = RunningZombieLoop()
+        dead_thread = threading.Thread(target=lambda: None, name="vane-ai-batch-loop")
+        dead_thread.start()
+        dead_thread.join(timeout=5.0)
+        assert not dead_thread.is_alive()
+        runner._loop = zombie
+        runner._thread = dead_thread
+        try:
+
+            async def _noop() -> str:
+                return "recovered"
+
+            assert runner.run(_noop()) == "recovered"
+            assert zombie.close_calls == 0
+            assert runner._loop is not zombie
+            assert not runner._loop.is_closed()
+        finally:
+            runner.close()
+
+    def test_close_cancels_inflight_run_instead_of_hanging(self) -> None:
+        """close() racing an active run() must cancel the pending future so
+        the blocked caller raises CancelledError instead of hanging."""
+        runner = _PersistentLoopRunner()
+        started = threading.Event()
+        outcome: list[object] = []
+
+        async def _hang() -> None:
+            started.set()
+            await asyncio.sleep(30)
+
+        def _caller() -> None:
+            try:
+                runner.run(_hang())
+            except BaseException as exc:  # noqa: BLE001 - the assertion target
+                outcome.append(exc)
+            else:
+                outcome.append("returned")
+
+        caller = threading.Thread(target=_caller, daemon=True)
+        caller.start()
+        try:
+            assert started.wait(timeout=5.0)
+            runner.close()
+            caller.join(timeout=5.0)
+            assert not caller.is_alive()
+            assert len(outcome) == 1
+            assert isinstance(outcome[0], (asyncio.CancelledError, concurrent.futures.CancelledError))
+        finally:
+            runner.close()
 
     def test_close_from_the_loop_thread_does_not_raise(self) -> None:
         runner = _PersistentLoopRunner()

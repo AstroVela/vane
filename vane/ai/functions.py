@@ -124,10 +124,18 @@ class _PersistentLoopRunner:
         # child process, so a forked copy transparently gets a new loop.
         if self._loop is None or self._loop.is_closed() or self._thread is None or not self._thread.is_alive():
             stale = self._loop
-            if stale is not None and not stale.is_closed():
+            if stale is not None and not stale.is_closed() and not stale.is_running():
                 # No thread runs the stale loop (dead or lost in a fork), so
-                # close it to release its selector/self-pipe descriptors.
-                stale.close()
+                # close it to release its selector/self-pipe descriptors. A
+                # forked child inherits a loop that still *claims* to be
+                # running (the parent loop thread's state is copied even
+                # though the thread itself is not); closing such a loop
+                # raises, so skip it and accept the fd leak instead. The
+                # try/except is belt and braces for the same race.
+                try:
+                    stale.close()
+                except RuntimeError:
+                    pass
             loop = asyncio.new_event_loop()
             thread = threading.Thread(target=loop.run_forever, name="vane-ai-batch-loop", daemon=True)
             thread.start()
@@ -158,14 +166,40 @@ class _PersistentLoopRunner:
         if loop is None:
             return
         if thread is not None and thread.is_alive():
+
+            def _cancel_and_stop() -> None:
+                tasks = asyncio.all_tasks(loop)
+                for task in tasks:
+                    task.cancel()
+                if not tasks:
+                    loop.stop()
+                    return
+                # Stop only after every task has actually finished
+                # cancelling. run()'s concurrent futures are resolved by
+                # task done-callbacks, and both the cancellation wakeups
+                # and those done-callbacks are deferred one ready-queue
+                # pass each via call_soon -- so stopping in this callback
+                # (or even one call_soon later) exits run_forever before
+                # the futures settle, leaving run() callers hanging
+                # forever. Chaining stop on the gathered tasks guarantees
+                # pending run() calls raise CancelledError first.
+                pending = asyncio.gather(*tasks, return_exceptions=True)
+                pending.add_done_callback(lambda _: loop.stop())
+
             try:
-                loop.call_soon_threadsafe(loop.stop)
+                loop.call_soon_threadsafe(_cancel_and_stop)
             except RuntimeError:
                 pass
             if thread is not threading.current_thread():
                 thread.join(timeout=5.0)
         if not loop.is_closed() and (thread is None or not thread.is_alive()):
-            loop.close()
+            try:
+                loop.close()
+            except RuntimeError:
+                # A forked child inherits a loop that still claims to be
+                # running; closing it raises, so accept the fd leak (same
+                # policy as _ensure_loop_locked).
+                pass
 
     def __reduce__(self) -> tuple[Any, ...]:
         # The loop, thread, and lock are process-local and unpicklable;
