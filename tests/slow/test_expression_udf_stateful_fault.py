@@ -24,12 +24,12 @@ import tempfile
 import time
 import uuid
 
-import duckdb
+import vane
 import pyarrow as pa
 import ray
 import vane
 
-from duckdb.runners.ray.driver import RayQueryDriverClient
+from vane.runners.ray.driver import RayQueryDriverClient
 
 
 CONTROL_NAMESPACE = f"vane-stateful-fault-{uuid.uuid4().hex}"
@@ -117,7 +117,7 @@ try:
         vane.col("value"),
         StatefulCounter()(value=vane.col("value")).alias("state"),
     )
-    logical_plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         output,
         f"stateful-fault-{uuid.uuid4().hex}",
     )

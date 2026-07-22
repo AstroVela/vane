@@ -1,12 +1,18 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 tf = pytest.importorskip("tensorflow")
 
 
 def test_tf():
-    con = duckdb.connect()
+    con = vane.connect()
 
     con.execute("create table t( a integer, b integer)")
     con.execute("insert into t values (1,2), (3,4)")
@@ -26,7 +32,7 @@ def test_tf():
     numeric_types = ["TINYINT", "SMALLINT", "BIGINT", "HUGEINT", "FLOAT", "DOUBLE", "DECIMAL(4,1)", "UTINYINT"]
 
     for supported_type in numeric_types:
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute(f"create table t( a {supported_type} , b {supported_type})")
         con.execute("insert into t values (1,2), (3,4)")
         duck_tf = con.sql("select * from t").tf()

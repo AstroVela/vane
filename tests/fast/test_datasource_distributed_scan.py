@@ -10,9 +10,9 @@ from collections.abc import Iterator
 import pyarrow as pa
 import pytest
 
-import duckdb
-from duckdb import runners as _runners
-from duckdb.datasource import DataSource, DataSourceTask, read_datasource
+import vane
+from vane import runners as _runners
+from vane.datasource import DataSource, DataSourceTask, read_datasource
 
 
 @pytest.fixture(autouse=True)
@@ -24,7 +24,7 @@ def _vane_shuffle_env(monkeypatch):
 
 @pytest.fixture
 def duckdb_conn():
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         yield con
     finally:
@@ -45,7 +45,7 @@ def ray_runner(_vane_shuffle_env, request):
     try:
         yield runner
     finally:
-        vane_mod = getattr(duckdb, "vane_runners_cpp", None)
+        vane_mod = getattr(vane, "vane_runners_cpp", None)
         if vane_mod is not None and hasattr(vane_mod, "teardown_runner"):
             vane_mod.teardown_runner()
 

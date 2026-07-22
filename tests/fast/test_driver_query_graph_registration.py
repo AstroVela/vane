@@ -9,13 +9,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from duckdb.runners.ray.query_execution_graph import (
+from vane.runners.ray.query_execution_graph import (
     ActorPlacement,
     NodeResourceAllocation,
     QueryAllocation,
     ResourceVector,
 )
-from duckdb.runners.ray.query_resource_runtime import (
+from vane.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
     get_query_resource_manager,
 )
@@ -136,7 +136,7 @@ def _clean_query_runtime():
 
 
 def _runner(events, coordinator):
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -241,7 +241,7 @@ def test_driver_rolls_back_graph_and_cluster_allocation_when_actor_initializatio
 
 
 def test_driver_exposes_query_task_and_output_lease_api():
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     required = {
@@ -256,17 +256,17 @@ def test_driver_exposes_query_task_and_output_lease_api():
 
 
 def test_driver_maintenance_refreshes_ray_capacity_usage_and_heartbeat_atomically():
-    from duckdb.runners.ray.cluster_resource_coordinator import (
+    from vane.runners.ray.cluster_resource_coordinator import (
         ClusterQueryResourceCoordinator,
         NodeCapacity,
     )
-    from duckdb.runners.ray.driver import RayQueryDriverActor
-    from duckdb.runners.ray.query_graph_builder import (
+    from vane.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.query_graph_builder import (
         build_query_demand,
         build_query_execution_graph,
     )
-    from duckdb.runners.ray.query_resource_manager import TaskRequest
-    from duckdb.runners.ray.query_resource_runtime import register_query_graph
+    from vane.runners.ray.query_resource_manager import TaskRequest
+    from vane.runners.ray.query_resource_runtime import register_query_graph
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -351,16 +351,16 @@ def test_driver_maintenance_refreshes_ray_capacity_usage_and_heartbeat_atomicall
 
 
 def test_driver_cancels_query_when_fixed_actor_placement_node_is_lost():
-    from duckdb.runners.ray.cluster_resource_coordinator import (
+    from vane.runners.ray.cluster_resource_coordinator import (
         ClusterQueryResourceCoordinator,
         NodeCapacity,
     )
-    from duckdb.runners.ray.driver import RayQueryDriverActor
-    from duckdb.runners.ray.query_graph_builder import (
+    from vane.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.query_graph_builder import (
         build_query_demand,
         build_query_execution_graph,
     )
-    from duckdb.runners.ray.query_resource_runtime import register_query_graph
+    from vane.runners.ray.query_resource_runtime import register_query_graph
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)

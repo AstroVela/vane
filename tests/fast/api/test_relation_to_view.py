@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 
 class TestRelationToView:
@@ -30,10 +36,10 @@ class TestRelationToView:
     def test_registered_relation(self, duckdb_cursor):
         rel = duckdb_cursor.sql("select 'test', 'this is a long string'")
 
-        con = duckdb.connect()
+        con = vane.connect()
         # Register on a different connection is not allowed
         with pytest.raises(
-            duckdb.InvalidInputException,
+            vane.InvalidInputException,
             match="was created by another Connection and can therefore not be used by this Connection",
         ):
             con.register("cross_connection", rel)

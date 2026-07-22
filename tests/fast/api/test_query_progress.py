@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import contextlib
 import platform
 import threading
@@ -5,7 +11,7 @@ import time
 
 import pytest
 
-import duckdb
+import vane
 
 
 class TestQueryProgress:
@@ -14,14 +20,14 @@ class TestQueryProgress:
         reason="threads not allowed on Emscripten",
     )
     def test_query_progress(self, reraise):
-        conn = duckdb.connect()
+        conn = vane.connect()
         conn.sql("set enable_progress_bar_print=false")
         conn.sql("set progress_bar_time=0")
         conn.sql("create table t as (select range as n from range(10000000))")
 
         def thread_target() -> None:
             # run a very slow query which hopefully isn't too memory intensive.
-            with reraise, contextlib.suppress(duckdb.InterruptException):
+            with reraise, contextlib.suppress(vane.InterruptException):
                 conn.execute("select max(sha1(n::varchar)) from t").fetchall()
 
         thread = threading.Thread(target=thread_target)
@@ -57,7 +63,7 @@ class TestQueryProgress:
         thread.join()
 
     def test_query_progress_closed_connection(self):
-        conn = duckdb.connect()
+        conn = vane.connect()
         conn.close()
-        with pytest.raises(duckdb.ConnectionException):
+        with pytest.raises(vane.ConnectionException):
             conn.query_progress()

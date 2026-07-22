@@ -12,7 +12,7 @@ from uuid import UUID
 
 import pytest
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow", "18.0.0")
 
@@ -21,7 +21,7 @@ class TestCanonicalExtensionTypes:
     def test_fixed_shape_tensor_roundtrip(self):
         np = pytest.importorskip("numpy")
 
-        duckdb_cursor = duckdb.connect()
+        duckdb_cursor = vane.connect()
         tensor = np.arange(2 * 3 * 4, dtype=np.float32).reshape(2, 3, 4)
         tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(tensor)
         arrow_table = pa.Table.from_arrays([tensor_array], names=["tensor_col"])
@@ -33,7 +33,7 @@ class TestCanonicalExtensionTypes:
         assert duck_arrow.equals(arrow_table)
 
     def test_uuid(self):
-        duckdb_cursor = duckdb.connect()
+        duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_lossless_conversion = true")
 
         storage_array = pa.array([uuid.uuid4().bytes for _ in range(4)], pa.binary(16))
@@ -46,7 +46,7 @@ class TestCanonicalExtensionTypes:
         assert duck_arrow.equals(arrow_table)
 
     def test_uuid_from_duck(self):
-        duckdb_cursor = duckdb.connect()
+        duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_lossless_conversion = true")
 
         arrow_table = duckdb_cursor.execute("select uuid from test_all_types()").to_arrow_table()
@@ -86,7 +86,7 @@ class TestCanonicalExtensionTypes:
         assert duck_arrow.equals(arrow_table)
 
     def test_uuid_no_def(self):
-        duckdb_cursor = duckdb.connect()
+        duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_lossless_conversion = true")
 
         res_arrow = duckdb_cursor.execute("select uuid from test_all_types()").to_arrow_table()
@@ -98,7 +98,7 @@ class TestCanonicalExtensionTypes:
         ]
 
     def test_uuid_no_def_lossless(self):
-        duckdb_cursor = duckdb.connect()
+        duckdb_cursor = vane.connect()
         res_arrow = duckdb_cursor.execute("select uuid from test_all_types()").to_arrow_table()
         assert res_arrow.to_pylist() == [
             {"uuid": "00000000-0000-0000-0000-000000000000"},
@@ -114,11 +114,11 @@ class TestCanonicalExtensionTypes:
         ]
 
     def test_uuid_no_def_stream(self):
-        duckdb_cursor = duckdb.connect()
+        duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_lossless_conversion = true")
 
         res_arrow = duckdb_cursor.execute("select uuid from test_all_types()").to_arrow_reader()
-        res_duck = duckdb.execute("from res_arrow").fetchall()
+        res_duck = vane.execute("from res_arrow").fetchall()
         assert res_duck == [
             (UUID("00000000-0000-0000-0000-000000000000"),),
             (UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"),),
@@ -130,7 +130,7 @@ class TestCanonicalExtensionTypes:
             print(x.type.__class__)
             return x
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("test", test_function, ["UUID"], "UUID", type="arrow")
 
         rel = con.sql("select ? as x", params=[uuid.UUID("ffffffff-ffff-ffff-ffff-ffffffffffff")])
@@ -160,7 +160,7 @@ class TestCanonicalExtensionTypes:
         assert duckdb_cursor.execute("FROM duck_arrow").fetchall() == [(b"pedro", 29)]
 
     def test_hugeint(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         con.execute("SET arrow_lossless_conversion = true")
 
@@ -189,7 +189,7 @@ class TestCanonicalExtensionTypes:
         assert duckdb_cursor.execute("FROM arrow_table").fetchall() == [(340282366920938463463374607431768211455,)]
 
     def test_bit(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         res_blob = con.execute("SELECT '0101011'::BIT str FROM range(5) tbl(i)").to_arrow_table()
 
@@ -213,7 +213,7 @@ class TestCanonicalExtensionTypes:
         ]
 
     def test_timetz(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         res_time = con.execute("SELECT '02:30:00+04'::TIMETZ str FROM range(1) tbl(i)").to_arrow_table()
 
@@ -227,7 +227,7 @@ class TestCanonicalExtensionTypes:
         ]
 
     def test_bignum(self):
-        con = duckdb.connect()
+        con = vane.connect()
         res_bignum = con.execute(
             "SELECT '179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368'::bignum a FROM range(1) tbl(i)"  # noqa: E501
         ).to_arrow_table()
@@ -241,7 +241,7 @@ class TestCanonicalExtensionTypes:
         ]
 
     def test_nested_types_with_extensions(self):
-        duckdb_cursor = duckdb.connect()
+        duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_lossless_conversion = true")
 
         arrow_table = duckdb_cursor.execute(
@@ -281,7 +281,7 @@ class TestCanonicalExtensionTypes:
         ]
 
     def test_boolean(self):
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET arrow_lossless_conversion = true")
         storage_array = pa.array([-1, 0, 1, 2, None], pa.int8())
         bool8_array = pa.ExtensionArray.from_storage(pa.bool8(), storage_array)
@@ -326,7 +326,7 @@ class TestCanonicalExtensionTypes:
             [pa.array([], pa.binary())],
             schema=schema,
         )
-        with pytest.raises(duckdb.SerializationException, match="Failed to parse JSON string"):
+        with pytest.raises(vane.SerializationException, match="Failed to parse JSON string"):
             tbl = duckdb_cursor.sql("""SELECT geometry as wkt FROM geo_table;""").to_arrow_table()
 
         field = pa.field(

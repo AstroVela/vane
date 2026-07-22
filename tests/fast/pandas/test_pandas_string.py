@@ -1,7 +1,13 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import numpy
 import pandas as pd
 
-import duckdb
+import vane
 
 
 class TestPandasString:
@@ -18,7 +24,7 @@ class TestPandasString:
         if hasattr(pd, "StringDtype"):
             df_in["string"] = pd.Series(strings, dtype=pd.StringDtype())
 
-        df_out = duckdb.query_df(df_in, "data", "SELECT * FROM data").df()
+        df_out = vane.query_df(df_in, "data", "SELECT * FROM data").df()
 
         assert numpy.all(df_out["object"] == strings)
         if hasattr(pd, "StringDtype"):
@@ -29,7 +35,7 @@ class TestPandasString:
         # Create DataFrame with string attribute
         df = pd.DataFrame({"city": ["Amsterdam", "New York", "London"] * N})
         # Copy Dataframe to DuckDB
-        con = duckdb.connect()
+        con = vane.connect()
         con.register("df", df)
         con.execute(
             """

@@ -1,13 +1,19 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pandas as pd
 
-import duckdb
-from duckdb import Value
+import vane
+from vane import Value
 
 NULL = None
 
 
 def check_equal(conn, df, reference_query, data):
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     duckdb_conn.execute(reference_query, parameters=[data])
     res = duckdb_conn.query("SELECT * FROM tbl").fetchall()
     out = conn.sql("SELECT * FROM df").fetchall()

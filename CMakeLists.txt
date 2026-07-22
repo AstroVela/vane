@@ -23,7 +23,7 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # Set the library name
-set(DUCKDB_PYTHON_LIB_NAME "_duckdb")
+set(DUCKDB_PYTHON_LIB_NAME "_vane_duckdb")
 
 # Detect CCache
 include(cmake/compiler_launcher.cmake)
@@ -140,6 +140,14 @@ duckdb_add_library(duckdb_target)
 add_library(_duckdb_dependencies INTERFACE)
 target_link_libraries(_duckdb_dependencies INTERFACE pybind11::pybind11
                                                      duckdb_target)
+# Keep Vane's pybind11 type registry private from the official `_duckdb`
+# extension. The two engines intentionally do not exchange native Python wrapper
+# objects, and sharing a registry would reject duplicate enum and exception
+# registrations when both modules are imported in one process. A private
+# compiler tag changes pybind11's ABI-domain key without opting into a future
+# internals layout.
+target_compile_definitions(_duckdb_dependencies
+                           INTERFACE PYBIND11_COMPILER_TYPE="vane")
 # Also add include directory
 target_include_directories(
   _duckdb_dependencies
@@ -156,7 +164,7 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 add_subdirectory(src/duckdb_py)
 
 pybind11_add_module(
-  _duckdb
+  _vane_duckdb
   $<TARGET_OBJECTS:python_src>
   $<TARGET_OBJECTS:python_arrow>
   $<TARGET_OBJECTS:python_common>
@@ -173,14 +181,14 @@ pybind11_add_module(
   $<TARGET_OBJECTS:python_ray>
   $<TARGET_OBJECTS:python_vane_runners>)
 # add _duckdb_dependencies
-target_link_libraries(_duckdb PRIVATE _duckdb_dependencies)
-duckdb_link_extensions(_duckdb)
+target_link_libraries(_vane_duckdb PRIVATE _duckdb_dependencies)
+duckdb_link_extensions(_vane_duckdb)
 
 # ────────────────────────────────────────────
 # Controlling symbol export
 #
-# We want to export exactly two symbols: - PyInit__duckdb: this allows CPython
-# to load the module - duckdb_adbc_init: the DuckDB ADBC driver
+# We want to export exactly two symbols: - PyInit__vane_duckdb: this allows
+# CPython to load the module - duckdb_adbc_init: the DuckDB ADBC driver
 #
 # The export of symbols on OSX and Linux is controlled by: - Visibility
 # annotations in the code (for this lib we use the PYBIND11_EXPORT macro) -
@@ -189,28 +197,28 @@ duckdb_link_extensions(_duckdb)
 # For Windows, we rely on just the visbility annotations.
 # ────────────────────────────────────────────
 set_target_properties(
-  _duckdb
+  _vane_duckdb
   PROPERTIES CXX_VISIBILITY_PRESET hidden
              C_VISIBILITY_PRESET hidden
              VISIBILITY_INLINES_HIDDEN ON)
 
 if(APPLE)
   target_link_options(
-    _duckdb PRIVATE "LINKER:-exported_symbol,_duckdb_adbc_init"
-    "LINKER:-exported_symbol,_PyInit__duckdb")
+    _vane_duckdb PRIVATE "LINKER:-exported_symbol,_duckdb_adbc_init"
+    "LINKER:-exported_symbol,_PyInit__vane_duckdb")
 elseif(UNIX AND NOT APPLE)
   # Use a version script to export only the two required symbols. This hides all
   # internal symbols (including statically-linked OpenSSL from httpfs) from the
   # dynamic symbol table, preventing SIGSEGV crashes caused by symbol conflicts
   # with system OpenSSL loaded by Ray/Python/gRPC in the same process.
   target_link_options(
-    _duckdb
+    _vane_duckdb
     PRIVATE
     "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/exported_symbols.version"
   )
 elseif(WIN32)
-  target_link_options(_duckdb PRIVATE "/EXPORT:duckdb_adbc_init"
-                      "/EXPORT:PyInit__duckdb")
+  target_link_options(_vane_duckdb PRIVATE "/EXPORT:duckdb_adbc_init"
+                      "/EXPORT:PyInit__vane_duckdb")
 endif()
 
 # ────────────────────────────────────────────
@@ -232,4 +240,4 @@ else()
   set(_DUCKDB_PY_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}")
 endif()
 
-install(TARGETS _duckdb LIBRARY DESTINATION "${_DUCKDB_PY_INSTALL_DIR}")
+install(TARGETS _vane_duckdb LIBRARY DESTINATION "${_DUCKDB_PY_INSTALL_DIR}")

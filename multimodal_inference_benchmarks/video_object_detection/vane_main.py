@@ -19,15 +19,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from vane.datasource import read_datasource
-from vane.datasource.video_reader import VideoFrameSource
-
-import vane
 from video_kernels import (
     crop_bbox_to_png,
     frames_to_torch_tensor,
     yolo_result_to_features,
 )
+
+import vane
+from vane.datasource import read_datasource
+from vane.datasource.video_reader import VideoFrameSource
 
 INPUT_PATH = Path(
     os.environ.get(

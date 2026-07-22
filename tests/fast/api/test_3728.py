@@ -1,10 +1,16 @@
-import duckdb
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
+import vane
 
 
 class Test3728:
     def test_3728_describe_enum(self, duckdb_cursor):
         # Create an in-memory database, but the problem is also present in file-backed DBs
-        cursor = duckdb.connect(":memory:")
+        cursor = vane.connect(":memory:")
 
         # Create an arbitrary enum type
         cursor.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');")

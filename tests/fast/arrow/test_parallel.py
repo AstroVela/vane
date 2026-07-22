@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 from pathlib import Path
 
-import duckdb
+import vane
 
 try:
     import numpy as np
@@ -16,7 +22,7 @@ class TestArrowParallel:
     def test_parallel_run(self, duckdb_cursor):
         if not can_run:
             return
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
         duckdb_conn.execute("PRAGMA threads=4")
         duckdb_conn.execute("PRAGMA verify_parallelism")
         data = pyarrow.array(np.random.randint(800, size=1000000), type=pyarrow.int32())
@@ -29,7 +35,7 @@ class TestArrowParallel:
     def test_parallel_types_and_different_batches(self, duckdb_cursor):
         if not can_run:
             return
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
         duckdb_conn.execute("PRAGMA threads=4")
         duckdb_conn.execute("PRAGMA verify_parallelism")
 
@@ -47,7 +53,7 @@ class TestArrowParallel:
     def test_parallel_fewer_batches_than_threads(self, duckdb_cursor):
         if not can_run:
             return
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
         duckdb_conn.execute("PRAGMA threads=4")
         duckdb_conn.execute("PRAGMA verify_parallelism")
 

@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 import tempfile
 
@@ -5,7 +11,7 @@ import numpy
 import pandas
 import pytest
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 
@@ -20,7 +26,7 @@ def parquet_types_test(type_list):
         add_cast = len(type_pair) > 3 and type_pair[3]
         add_sql_cast = len(type_pair) > 4 and type_pair[4]
         df = pandas.DataFrame.from_dict({"val": numpy.array(value_list, dtype=numpy_type)})
-        duckdb_cursor = duckdb.connect()
+        duckdb_cursor = vane.connect()
         duckdb_cursor.execute(f"CREATE TABLE tmp AS SELECT val::{sql_type} val FROM df")
         duckdb_cursor.execute(f"COPY tmp TO '{temp_name}' (FORMAT PARQUET)")
         read_df = pandas.read_parquet(temp_name)

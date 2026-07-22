@@ -1,10 +1,16 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import warnings
 from contextlib import suppress
 
 import numpy as np
 import pytest
 
-import duckdb
+import vane
 
 
 class TestPandasObjectInteger:
@@ -28,7 +34,7 @@ class TestPandasObjectInteger:
                 "int64": pd.Series(np.ma.masked_array([0, 1, -1], mask=[True, False, False]), dtype="Int64"),
             }
         )
-        df_out = duckdb.query_df(df_in, "data", "SELECT * FROM data").df()
+        df_out = vane.query_df(df_in, "data", "SELECT * FROM data").df()
         warnings.resetwarnings()
         pd.testing.assert_frame_equal(df_expected_res, df_out)
 
@@ -57,7 +63,7 @@ class TestPandasObjectInteger:
                     ),
                 }
             )
-            df_out = duckdb.query_df(df_in, "data", "SELECT * FROM data").df()
+            df_out = vane.query_df(df_in, "data", "SELECT * FROM data").df()
             warnings.resetwarnings()
             pd.testing.assert_frame_equal(df_expected_res, df_out)
 
@@ -81,5 +87,5 @@ class TestPandasObjectInteger:
                 ),
             }
         )
-        df_out = duckdb.query_df(df_in, "data", "SELECT * FROM data").df()
+        df_out = vane.query_df(df_in, "data", "SELECT * FROM data").df()
         pd.testing.assert_frame_equal(df_expected_res, df_out)

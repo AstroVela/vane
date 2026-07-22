@@ -1,8 +1,14 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 from pathlib import Path
 
 import pytest
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 
@@ -12,7 +18,7 @@ def test_10795():
     with pa.memory_map(str(arrow_filename), "r") as source:
         reader = pa.ipc.RecordBatchFileReader(source)
         taxi_fhvhv_arrow = reader.read_all()
-        con = duckdb.connect(database=":memory:")
+        con = vane.connect(database=":memory:")
         con.execute("SET TimeZone='UTC';")
         con.register("taxi_fhvhv", taxi_fhvhv_arrow)
         res = con.execute("""

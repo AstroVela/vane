@@ -3,11 +3,11 @@
 
 import pytest
 
-import duckdb
+import vane
 
 
 def _get_vane_module():
-    return getattr(duckdb, "vane_runners_cpp", None)
+    return getattr(vane, "vane_runners_cpp", None)
 
 
 @pytest.mark.usefixtures("ray_local")

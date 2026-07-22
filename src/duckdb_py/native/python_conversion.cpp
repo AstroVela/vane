@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Modified by Vane contributors.
+
 #include "duckdb_python/python_conversion.hpp"
 #include "duckdb_python/pybind11/pybind_wrapper.hpp"
 
@@ -430,7 +436,7 @@ PythonObjectType GetPythonObjectType(py::handle &ele) {
 		return PythonObjectType::NdArray;
 	} else if (py::isinstance(ele, import_cache.numpy.datetime64())) {
 		return PythonObjectType::NdDatetime;
-	} else if (py::isinstance(ele, import_cache.duckdb.Value())) {
+	} else if (py::isinstance(ele, import_cache.vane.Value())) {
 		return PythonObjectType::Value;
 	} else {
 		return PythonObjectType::Other;

@@ -13,5 +13,5 @@ target_include_directories(
 
 target_link_libraries(python_ray PRIVATE _duckdb_dependencies)
 
-# No installation target; this is built into _duckdb module via
+# No installation target; this is built into the _vane_duckdb module via
 # $<TARGET_OBJECTS:python_ray>

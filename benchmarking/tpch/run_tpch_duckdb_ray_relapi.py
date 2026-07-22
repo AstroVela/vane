@@ -70,12 +70,12 @@ def _clean_output(path: str):
 
 def _read_row_count(path: str) -> int:
     """Read row count from output parquet (handles both single file and directory of shards)."""
-    import duckdb as _duckdb
+    import vane as _vane
 
     if os.path.isdir(path):
         glob = os.path.join(path, "*.parquet")
-        return _duckdb.sql(f"SELECT count(*) FROM read_parquet('{glob}')").fetchone()[0]
-    return _duckdb.sql(f"SELECT count(*) FROM read_parquet('{path}')").fetchone()[0]
+        return _vane.sql(f"SELECT count(*) FROM read_parquet('{glob}')").fetchone()[0]
+    return _vane.sql(f"SELECT count(*) FROM read_parquet('{path}')").fetchone()[0]
 
 
 def _classify_error(exc_str: str) -> str:
@@ -91,7 +91,7 @@ def _classify_error(exc_str: str) -> str:
 def _run_query_distributed_in_subprocess(queue, parquet_folder, qnum, threads, ray_address, output_path, mode="write"):
     """Subprocess target: run a single query via write_parquet or fetchall with VANE_RUNNER=ray.
 
-    Must set env vars BEFORE importing duckdb so the runner dispatch is active.
+    Must set env vars BEFORE importing Vane so the runner dispatch is active.
     """
     try:
         # gRPC workaround: disable fork support and use epoll1 polling
@@ -99,7 +99,7 @@ def _run_query_distributed_in_subprocess(queue, parquet_folder, qnum, threads, r
         os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "0"
         os.environ["GRPC_POLL_STRATEGY"] = "epoll1"
 
-        # Set env vars before importing duckdb
+        # Set env vars before importing Vane
         os.environ["VANE_RUNNER"] = "ray"
 
         # Set Daft shuffle/exchange env vars (use existing env if already set, else defaults)
@@ -109,12 +109,12 @@ def _run_query_distributed_in_subprocess(queue, parquet_folder, qnum, threads, r
 
         import ray
 
-        import duckdb
+        import vane
 
         if not ray.is_initialized():
             ray.init(address=ray_address, ignore_reinit_error=True)
 
-        con = duckdb.connect()
+        con = vane.connect()
         if threads:
             con.execute(f"SET threads={threads}")
 
@@ -129,18 +129,18 @@ def _run_query_distributed_in_subprocess(queue, parquet_folder, qnum, threads, r
         t0 = time.time()
         if mode == "fetch":
             # Explicit distributed execution via runner.run_iter()
-            import duckdb.runners
+            import vane.runners
 
-            runner = duckdb.runners.get_or_create_runner()
+            runner = vane.runners.get_or_create_runner()
             tables = [r.partition() for r in runner.run_iter(con.sql(sql))]
             elapsed = time.time() - t0
             non_empty = [t for t in tables if t.num_rows > 0]
             row_count = sum(t.num_rows for t in non_empty) if non_empty else 0
         else:
             # Distributed write via runner.run_write()
-            import duckdb.runners
+            import vane.runners
 
-            runner = duckdb.runners.get_or_create_runner()
+            runner = vane.runners.get_or_create_runner()
             runner.run_write(con.sql(sql))
             elapsed = time.time() - t0
             try:
@@ -200,9 +200,9 @@ def run_query_distributed_with_timeout(parquet_folder, qnum, threads, timeout, r
 
 def verify_row_counts(parquet_folder, qnum, threads):
     """Run query locally with fetchall to get reference row count."""
-    import duckdb
+    import vane
 
-    con = duckdb.connect()
+    con = vane.connect()
     if threads:
         con.execute(f"SET threads={threads}")
 
@@ -242,9 +242,9 @@ if __name__ == "__main__":
     parser.add_argument("--iterations", default=3, type=int, help="Number of iterations per query (default: 3)")
     args = parser.parse_args()
 
-    import duckdb
+    import vane
 
-    print(f"DuckDB version: {duckdb.__version__}")
+    print(f"DuckDB version: {vane.__version__}")
 
     # Create output directory
     if args.output_dir:
@@ -286,7 +286,7 @@ if __name__ == "__main__":
         questions = list(range(1, 23))
 
     # Show thread count
-    con = duckdb.connect()
+    con = vane.connect()
     if args.threads:
         con.execute(f"SET threads={args.threads}")
     thread_count = con.execute("SELECT current_setting('threads')").fetchone()[0]

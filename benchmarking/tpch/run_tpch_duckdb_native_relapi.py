@@ -58,7 +58,7 @@ def _run_query_native_in_subprocess(
 ) -> None:
     """Subprocess target: run a single query via NativeRunner and return row count.
 
-    Important: set env vars BEFORE importing duckdb so editable-build chatter and
+    Important: set env vars BEFORE importing Vane so editable-build chatter and
     runner selection take effect.
     """
     try:
@@ -77,9 +77,8 @@ def _run_query_native_in_subprocess(
         # by itself; we explicitly call into vane.runners below.
         os.environ["VANE_RUNNER"] = "native"
 
-        import vane.runners
-
         import vane
+        import vane.runners
 
         # Instantiate NativeRunner with optional thread hint.
         # Note: set_runner_native() can only be called once per process.

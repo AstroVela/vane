@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 
@@ -29,6 +35,6 @@ class TestArrowIPCExtension:
             stream = ipc.MessageReader.open_stream(buf_reader)
             # This fails
             with pytest.raises(
-                duckdb.Error, match="The nanoarrow community extension is needed to read the Arrow IPC protocol"
+                vane.Error, match="The nanoarrow community extension is needed to read the Arrow IPC protocol"
             ):
                 duckdb_cursor.from_arrow(stream).fetchall()

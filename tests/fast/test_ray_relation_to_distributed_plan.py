@@ -10,8 +10,8 @@ try:
 except Exception:
     ray = None
 
-import duckdb
-from duckdb import runners as _runners
+import vane
+from vane import runners as _runners
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
@@ -23,27 +23,27 @@ def test_relation_to_distributed_plan():
         pytest.skip("duckdb runner API not available in this environment")
 
     # Use pure SQL relation to avoid pandas_scan serialization limitations.
-    df = duckdb.sql("SELECT * FROM (VALUES (1,4), (2,5), (3,6)) AS t(x, y)")
+    df = vane.sql("SELECT * FROM (VALUES (1,4), (2,5), (3,6)) AS t(x, y)")
 
     # instantiate the Python RayRunner directly (compiled runner wrapper may not expose
     # the Python-only helper method)
-    from duckdb.runners.ray.runner import RayRunner
+    from vane.runners.ray.runner import RayRunner
 
     runner = RayRunner(address=None, max_task_backlog=None)
     assert getattr(runner, "name", None) == "ray"
 
-    # duckdb.sql(...) returns a DuckDB relation
+    # vane.sql(...) returns a DuckDB relation
     relation = df
 
     # Build PyLogicalPlan from relation, then materialize DistributedPhysicalPlan on the driver.
-    ray_cxx = getattr(duckdb, "ray_cxx", None)
+    ray_cxx = getattr(vane, "ray_cxx", None)
     if ray_cxx is None or not hasattr(ray_cxx, "PyLogicalPlan"):
-        pytest.skip("duckdb.ray_cxx.PyLogicalPlan not available in this environment")
+        pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "test-relation-plan")
     assert plan is not None
     assert plan.idx() == "test-relation-plan"
 
-    conn = duckdb.connect()
+    conn = vane.connect()
     distributed_plan = plan.to_physical_plan(conn)
     assert distributed_plan is not None
     assert hasattr(distributed_plan, "num_partitions")
@@ -59,7 +59,7 @@ def test_run_write_parquet_does_not_crash_without_transient_relation_owner(tmp_p
         pytest.skip("duckdb runner API not available in this environment")
 
     output_path = tmp_path / "write_output.parquet"
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.sql("SELECT 1 AS a").write_parquet(str(output_path))
         assert output_path.exists()
@@ -76,16 +76,16 @@ def test_scan_tasks_grouped_by_distributed_worker_slots(monkeypatch, tmp_path):
     except Exception:
         pytest.skip("duckdb runner API not available in this environment")
 
-    ray_cxx = getattr(duckdb, "ray_cxx", None)
+    ray_cxx = getattr(vane, "ray_cxx", None)
     if ray_cxx is None or not hasattr(ray_cxx, "PyLogicalPlan"):
-        pytest.skip("duckdb.ray_cxx.PyLogicalPlan not available in this environment")
+        pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
 
     monkeypatch.setenv("VANE_DISTRIBUTED_NODE_COUNT", "3")
     monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "6")
     monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_BYTES", "1")
 
     source_path = tmp_path / "scan_grouping_input"
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.execute(f"""
             COPY (
@@ -118,9 +118,9 @@ def test_scan_tasks_can_disable_size_grouping(monkeypatch, tmp_path):
     except Exception:
         pytest.skip("duckdb runner API not available in this environment")
 
-    ray_cxx = getattr(duckdb, "ray_cxx", None)
+    ray_cxx = getattr(vane, "ray_cxx", None)
     if ray_cxx is None or not hasattr(ray_cxx, "PyLogicalPlan"):
-        pytest.skip("duckdb.ray_cxx.PyLogicalPlan not available in this environment")
+        pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
 
     monkeypatch.setenv("VANE_DISTRIBUTED_NODE_COUNT", "3")
     monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "6")
@@ -129,7 +129,7 @@ def test_scan_tasks_can_disable_size_grouping(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
 
     source_path = tmp_path / "scan_disable_size_grouping_input"
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.execute(f"""
             COPY (
@@ -162,9 +162,9 @@ def test_scan_task_min_partition_num_can_exceed_worker_slots(monkeypatch, tmp_pa
     except Exception:
         pytest.skip("duckdb runner API not available in this environment")
 
-    ray_cxx = getattr(duckdb, "ray_cxx", None)
+    ray_cxx = getattr(vane, "ray_cxx", None)
     if ray_cxx is None or not hasattr(ray_cxx, "PyLogicalPlan"):
-        pytest.skip("duckdb.ray_cxx.PyLogicalPlan not available in this environment")
+        pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
 
     monkeypatch.setenv("VANE_DISTRIBUTED_NODE_COUNT", "1")
     monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
@@ -172,7 +172,7 @@ def test_scan_task_min_partition_num_can_exceed_worker_slots(monkeypatch, tmp_pa
     monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
 
     source_path = tmp_path / "scan_min_partition_input"
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.execute(f"""
             COPY (
@@ -199,7 +199,7 @@ def test_scan_task_min_partition_num_can_exceed_worker_slots(monkeypatch, tmp_pa
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
 def test_ray_runner_sets_scan_task_backlog_env(monkeypatch):
-    from duckdb.runners.ray import runner as ray_runner_mod
+    from vane.runners.ray import runner as ray_runner_mod
 
     monkeypatch.delenv("VANE_RAY_MAX_TASK_BACKLOG", raising=False)
     monkeypatch.setattr(ray_runner_mod.ray, "is_initialized", lambda: True)

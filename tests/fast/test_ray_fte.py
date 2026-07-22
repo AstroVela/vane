@@ -9,18 +9,18 @@ from pathlib import Path
 
 import pytest
 
-from duckdb.runners.fte.fte_config import FteWorkerAdmissionConfig
-from duckdb.runners.fte.fte_failures import _failure_allows_retry
-from duckdb.runners.ray import fte_fragment_scheduler
-from duckdb.runners.ray.fragment_registry import (
+from vane.runners.fte.fte_config import FteWorkerAdmissionConfig
+from vane.runners.fte.fte_failures import _failure_allows_retry
+from vane.runners.ray import fte_fragment_scheduler
+from vane.runners.ray.fragment_registry import (
     _FTE_FRAGMENT_EXECUTIONS,
     _FTE_REGISTRY_LOCK,
     _FTE_SCHEDULERS,
     _FteFragmentState,
 )
-from duckdb.runners.ray.fragment_worker_assignment import make_fte_assigner
-from duckdb.runners.ray.fragment_worker_results import fte_query_status
-from duckdb.runners.ray.fte import (
+from vane.runners.ray.fragment_worker_assignment import make_fte_assigner
+from vane.runners.ray.fragment_worker_results import fte_query_status
+from vane.runners.ray.fte import (
     ArbitrarySplitAssigner,
     AssignmentResult,
     FteExchangeSourceOutputSelector,
@@ -49,16 +49,16 @@ from duckdb.runners.ray.fte import (
     derive_exchange_sink_instance_for_attempt,
     materialize_task_inputs,
 )
-from duckdb.runners.ray.fte_attempts import RunningAttempt
-from duckdb.runners.ray.fte_events import FteAddSplitsCommand
-from duckdb.runners.ray.query_execution_graph import (
+from vane.runners.ray.fte_attempts import RunningAttempt
+from vane.runners.ray.fte_events import FteAddSplitsCommand
+from vane.runners.ray.query_execution_graph import (
     NodeResourceAllocation,
     QueryAllocation,
     QueryExecutionGraph,
     ResourceVector,
     StageResourceSpec,
 )
-from duckdb.runners.ray.query_resource_runtime import (
+from vane.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
     register_query_graph,
 )
@@ -106,7 +106,7 @@ def test_fte_partition_admission_uses_non_persistent_descriptor_arbitration(monk
         ),
     )
     monkeypatch.setattr(
-        "duckdb.runners.ray.query_resource_runtime.get_query_resource_manager",
+        "vane.runners.ray.query_resource_runtime.get_query_resource_manager",
         lambda _query_id: _Manager(),
     )
 

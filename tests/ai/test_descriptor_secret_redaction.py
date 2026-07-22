@@ -175,15 +175,12 @@ def _install_fake_vllm_engine(monkeypatch, captured):
         captured.append((model, options))
         return SimpleNamespace()
 
-    vllm_module = types.ModuleType("duckdb.execution.vllm")
+    vllm_module = types.ModuleType("vane.execution.vllm")
     vllm_module.build_executor = fake_build_executor
-    execution_module = types.ModuleType("duckdb.execution")
+    execution_module = types.ModuleType("vane.execution")
     execution_module.vllm = vllm_module
-    duckdb_module = types.ModuleType("duckdb")
-    duckdb_module.execution = execution_module
-    monkeypatch.setitem(sys.modules, "duckdb", duckdb_module)
-    monkeypatch.setitem(sys.modules, "duckdb.execution", execution_module)
-    monkeypatch.setitem(sys.modules, "duckdb.execution.vllm", vllm_module)
+    monkeypatch.setitem(sys.modules, "vane.execution", execution_module)
+    monkeypatch.setitem(sys.modules, "vane.execution.vllm", vllm_module)
 
 
 # ---------------------------------------------------------------------------

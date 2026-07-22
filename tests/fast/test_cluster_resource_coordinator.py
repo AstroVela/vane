@@ -5,14 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from duckdb.runners.ray.cluster_resource_coordinator import (
+from vane.runners.ray.cluster_resource_coordinator import (
     ActorResourceBundle,
     ClusterQueryResourceCoordinator,
     NodeCapacity,
     QueryDemand,
     read_ray_node_capacities,
 )
-from duckdb.runners.ray.query_execution_graph import ResourceVector
+from vane.runners.ray.query_execution_graph import ResourceVector
 
 
 def _r(
@@ -422,11 +422,14 @@ def test_refresh_queries_updates_all_usage_and_heartbeats_atomically():
         (_node("n1", cpu=8, heap=800, store=800),),
         heartbeat_timeout_s=10,
     )
-    demand = lambda query_id: _demand(
-        query_id,
-        minimum=_r(cpu=1, heap=100, store=100),
-        desired=_r(cpu=8, heap=800, store=800),
-    )
+
+    def demand(query_id):
+        return _demand(
+            query_id,
+            minimum=_r(cpu=1, heap=100, store=100),
+            desired=_r(cpu=8, heap=800, store=800),
+        )
+
     coordinator.register_query(demand("a"), now=0)
     coordinator.register_query(demand("b"), now=0)
     before = coordinator.snapshot()["queries"]
@@ -454,11 +457,14 @@ def test_refresh_queries_rejects_stale_batch_without_partial_mutation():
         (_node("n1", cpu=8, heap=800, store=800),),
         heartbeat_timeout_s=10,
     )
-    demand = lambda query_id: _demand(
-        query_id,
-        minimum=_r(cpu=1, heap=100),
-        desired=_r(cpu=8, heap=800),
-    )
+
+    def demand(query_id):
+        return _demand(
+            query_id,
+            minimum=_r(cpu=1, heap=100),
+            desired=_r(cpu=8, heap=800),
+        )
+
     coordinator.register_query(demand("a"), now=0)
     coordinator.register_query(demand("b"), now=0)
     before = coordinator.snapshot()["queries"]

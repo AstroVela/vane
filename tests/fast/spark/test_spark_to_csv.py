@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import csv
 import datetime
 import os
@@ -7,7 +13,7 @@ import pytest
 from conftest import getTimeSeriesData
 from spark_namespace import USE_ACTUAL_SPARK
 
-from duckdb import InvalidInputException, read_csv
+from vane import InvalidInputException, read_csv
 
 if USE_ACTUAL_SPARK:
     pytest.skip(
@@ -17,7 +23,7 @@ if USE_ACTUAL_SPARK:
         allow_module_level=True,
     )
 
-pytest.importorskip("duckdb.experimental.spark")
+pytest.importorskip("vane.experimental.spark")
 
 
 @pytest.fixture

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Modified by Vane contributors.
+
 #pragma once
 
 #include "duckdb_python/pyconnection/pyconnection.hpp"
@@ -17,7 +23,7 @@ class type_caster<shared_ptr<DuckDBPyConnection>>
 	using type = DuckDBPyConnection;
 	using holder_caster = copyable_holder_caster<DuckDBPyConnection, shared_ptr<DuckDBPyConnection>>;
 	// This is used to generate documentation on duckdb-web
-	PYBIND11_TYPE_CASTER(shared_ptr<type>, const_name("duckdb.DuckDBPyConnection"));
+	PYBIND11_TYPE_CASTER(shared_ptr<type>, const_name("vane.DuckDBPyConnection"));
 
 	bool load(handle src, bool convert) {
 		if (py::none().is(src)) {

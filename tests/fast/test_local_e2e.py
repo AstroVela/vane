@@ -8,13 +8,13 @@ import sys
 
 import pytest
 
-import duckdb
-from duckdb import runners as _runners
-from duckdb.runners.local import set_runner_local
+import vane
+from vane import runners as _runners
+from vane.runners.local import set_runner_local
 
 
 def _teardown_runner_if_supported():
-    vane_mod = getattr(duckdb, "vane_runners_cpp", None)
+    vane_mod = getattr(vane, "vane_runners_cpp", None)
     if vane_mod is not None and hasattr(vane_mod, "teardown_runner"):
         vane_mod.teardown_runner()
 
@@ -44,14 +44,14 @@ def test_local_runner_write_parquet_e2e(local_runner, tmp_path, monkeypatch):
     src = tmp_path / "local_e2e_input.parquet"
     dst = tmp_path / "local_e2e_output.parquet"
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    setup_conn = duckdb.connect()
+    setup_conn = vane.connect()
     try:
         setup_conn.sql("select i::integer as x, (i % 5)::integer as k from range(100) tbl(i)").write_parquet(str(src))
     finally:
         setup_conn.close()
 
     monkeypatch.setenv("VANE_RUNNER", "local")
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.read_parquet(str(src)).filter("x >= 10 and x < 90").repartition(4).write_parquet(str(dst))
         rows = con.sql(f"select count(*), sum(x), min(k), max(k) from read_parquet('{dst}')").fetchone()
@@ -73,7 +73,7 @@ def test_local_runner_direct_target_per_thread_output_allows_sequential_partitio
         src = tmp_path / "local_direct_input.parquet"
         dst = tmp_path / "local_direct_output"
         monkeypatch.setenv("VANE_RUNNER", "local-fast")
-        setup_conn = duckdb.connect()
+        setup_conn = vane.connect()
         try:
             setup_conn.sql("select i::integer as x, (i % 7)::integer as k from range(4096) tbl(i)").write_parquet(
                 str(src)
@@ -82,7 +82,7 @@ def test_local_runner_direct_target_per_thread_output_allows_sequential_partitio
             setup_conn.close()
 
         monkeypatch.setenv("VANE_RUNNER", "local")
-        con = duckdb.connect()
+        con = vane.connect()
         try:
             con.read_parquet(str(src)).repartition(8).write_parquet(str(dst), per_thread_output=True)
             rows = con.sql(f"select count(*), sum(x), min(k), max(k) from read_parquet('{dst}/*.parquet')").fetchone()
@@ -113,14 +113,14 @@ def test_local_runner_without_ray_import(local_runner, tmp_path, monkeypatch):
     src = tmp_path / "local_no_ray_input.parquet"
     dst = tmp_path / "local_no_ray_output.parquet"
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    setup_conn = duckdb.connect()
+    setup_conn = vane.connect()
     try:
         setup_conn.sql("select i::integer as x from range(10) tbl(i)").write_parquet(str(src))
     finally:
         setup_conn.close()
 
     monkeypatch.setenv("VANE_RUNNER", "local")
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.read_parquet(str(src)).write_parquet(str(dst))
         rows = con.sql(f"select count(*), sum(x) from read_parquet('{dst}')").fetchone()

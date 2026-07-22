@@ -7,7 +7,7 @@ import os
 
 import pytest
 
-from duckdb._ray_progress_env import (
+from vane._ray_progress_env import (
     configure_ray_progress_logging_defaults,
     dynamic_ray_progress_enabled,
     ray_log_to_driver_default,

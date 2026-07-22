@@ -98,7 +98,7 @@ void DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pick
 
 		// Reconstruct Arrow schema from the DataSource
 		auto schema_dict = py::cast<py::dict>(source_obj.attr("schema"));
-		auto ds_module = py::module::import("duckdb.datasource");
+		auto ds_module = py::module::import("vane.datasource");
 		auto arrow_schema = ds_module.attr("_schema_to_arrow")(schema_dict);
 
 		// Create and register a new factory
@@ -162,7 +162,7 @@ void DataSourceStreamFactory::GetSchema(const char *pickled_source, idx_t pickle
 		auto source_obj = cloudpickle.attr("loads")(py::bytes(source_bytes, source_len));
 
 		auto schema_dict = py::cast<py::dict>(source_obj.attr("schema"));
-		auto ds_module = py::module::import("duckdb.datasource");
+		auto ds_module = py::module::import("vane.datasource");
 		auto arrow_schema = ds_module.attr("_schema_to_arrow")(schema_dict);
 		arrow_schema.attr("_export_to_c")(reinterpret_cast<uintptr_t>(out_schema));
 	}
@@ -177,7 +177,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &sour
 
 	// 1. Convert DataSource schema (dict[str, str]) to Arrow schema
 	auto schema_dict = py::cast<py::dict>(source.attr("schema"));
-	auto ds_module = py::module::import("duckdb.datasource");
+	auto ds_module = py::module::import("vane.datasource");
 	auto arrow_schema = ds_module.attr("_schema_to_arrow")(schema_dict);
 
 	// 2. Get tasks and serialize them for worker processes

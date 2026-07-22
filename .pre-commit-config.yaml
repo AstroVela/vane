@@ -48,12 +48,12 @@ repos:
     hooks:
       - id: mypy
         entry: mypy
-        files: ^(duckdb/|_duckdb-stubs/)
-        exclude: ^duckdb/(experimental|query_graph)/
+        files: ^(vane/|_vane_duckdb-stubs/)
+        exclude: ^vane/(experimental|query_graph)/
         # Check the files in the changed range without recursively surfacing
         # the inherited type debt of every module they import.
         args: ["--follow-imports=skip", "--allow-subclassing-any", "--no-warn-return-any"]
-        additional_dependencies: [numpy, polars]
+        additional_dependencies: ["numpy<2.3", polars]
 
   - repo: local
     hooks:

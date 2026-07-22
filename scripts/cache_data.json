@@ -548,34 +548,34 @@
         "name": "LazyFrame",
         "children": []
     },
-    "duckdb": {
+    "vane": {
         "type": "module",
-        "full_path": "duckdb",
-        "name": "duckdb",
+        "full_path": "vane",
+        "name": "vane",
         "children": [
-            "duckdb.filesystem",
-            "duckdb.Value",
-            "duckdb.polars_io"
+            "vane.filesystem",
+            "vane.Value",
+            "vane.polars_io"
         ]
     },
-    "duckdb.filesystem": {
+    "vane.filesystem": {
         "type": "module",
-        "full_path": "duckdb.filesystem",
+        "full_path": "vane.filesystem",
         "name": "filesystem",
         "children": [
-            "duckdb.filesystem.ModifiedMemoryFileSystem"
+            "vane.filesystem.ModifiedMemoryFileSystem"
         ],
         "required": false
     },
-    "duckdb.filesystem.ModifiedMemoryFileSystem": {
+    "vane.filesystem.ModifiedMemoryFileSystem": {
         "type": "attribute",
-        "full_path": "duckdb.filesystem.ModifiedMemoryFileSystem",
+        "full_path": "vane.filesystem.ModifiedMemoryFileSystem",
         "name": "ModifiedMemoryFileSystem",
         "children": []
     },
-    "duckdb.Value": {
+    "vane.Value": {
         "type": "attribute",
-        "full_path": "duckdb.Value",
+        "full_path": "vane.Value",
         "name": "Value",
         "children": []
     },
@@ -711,18 +711,18 @@
         "name": "MessageReader",
         "children": []
     },
-    "duckdb.polars_io": {
+    "vane.polars_io": {
         "type": "module",
-        "full_path": "duckdb.polars_io",
+        "full_path": "vane.polars_io",
         "name": "polars_io",
         "children": [
-            "duckdb.polars_io.duckdb_source"
+            "vane.polars_io.duckdb_source"
         ],
         "required": false
     },
-    "duckdb.polars_io.duckdb_source": {
+    "vane.polars_io.duckdb_source": {
         "type": "attribute",
-        "full_path": "duckdb.polars_io.duckdb_source",
+        "full_path": "vane.polars_io.duckdb_source",
         "name": "duckdb_source",
         "children": [],
         "required": false

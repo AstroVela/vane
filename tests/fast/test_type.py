@@ -8,8 +8,8 @@ import sys
 
 import pytest
 
-import duckdb
-from duckdb.sqltypes import (
+import vane
+from vane.sqltypes import (
     BIGINT,
     BIT,
     BLOB,
@@ -43,7 +43,7 @@ from duckdb.sqltypes import (
 
 class TestType:
     def test_sqltype(self):
-        assert str(duckdb.sqltype("struct(a VARCHAR, b BIGINT)")) == "STRUCT(a VARCHAR, b BIGINT)"
+        assert str(vane.sqltype("struct(a VARCHAR, b BIGINT)")) == "STRUCT(a VARCHAR, b BIGINT)"
         # TODO: add tests with invalid type_str  # noqa: TD002, TD003
 
     def test_primitive_types(self):
@@ -76,80 +76,80 @@ class TestType:
         assert str(INTERVAL) == "INTERVAL"
 
     def test_list_type(self):
-        type = duckdb.list_type(BIGINT)
+        type = vane.list_type(BIGINT)
         assert str(type) == "BIGINT[]"
 
     def test_array_type(self):
-        type = duckdb.array_type(BIGINT, 3)
+        type = vane.array_type(BIGINT, 3)
         assert str(type) == "BIGINT[3]"
 
     def test_tensor_type(self):
-        type = duckdb.tensor_type(FLOAT, (3, 224, 224))
+        type = vane.tensor_type(FLOAT, (3, 224, 224))
         assert str(type) == "TENSOR(FLOAT, [3, 224, 224])"
         assert type.id == "tensor"
         assert type.children == [("dtype", FLOAT), ("shape", (3, 224, 224))]
 
     def test_struct_type(self):
-        type = duckdb.struct_type({"a": BIGINT, "b": BOOLEAN})
+        type = vane.struct_type({"a": BIGINT, "b": BOOLEAN})
         assert str(type) == "STRUCT(a BIGINT, b BOOLEAN)"
 
         # TODO: create an unnamed struct when fields are provided as a list  # noqa: TD002, TD003
-        type = duckdb.struct_type([BIGINT, BOOLEAN])
+        type = vane.struct_type([BIGINT, BOOLEAN])
         assert str(type) == "STRUCT(v1 BIGINT, v2 BOOLEAN)"
 
     def test_incomplete_struct_type(self):
         with pytest.raises(
-            duckdb.InvalidInputException, match="Could not convert empty dictionary to a duckdb STRUCT type"
+            vane.InvalidInputException, match="Could not convert empty dictionary to a duckdb STRUCT type"
         ):
             DuckDBPyType({})
 
     def test_map_type(self):
-        type = duckdb.map_type(duckdb.sqltype("BIGINT"), duckdb.sqltype("DECIMAL(10, 2)"))
+        type = vane.map_type(vane.sqltype("BIGINT"), vane.sqltype("DECIMAL(10, 2)"))
         assert str(type) == "MAP(BIGINT, DECIMAL(10,2))"
 
     def test_decimal_type(self):
-        type = duckdb.decimal_type(5, 3)
+        type = vane.decimal_type(5, 3)
         assert str(type) == "DECIMAL(5,3)"
 
     def test_string_type(self):
-        type = duckdb.string_type()
+        type = vane.string_type()
         assert str(type) == "VARCHAR"
 
     def test_string_type_collation(self):
-        type = duckdb.string_type("NOCASE")
+        type = vane.string_type("NOCASE")
         # collation does not show up in the string representation..
         assert str(type) == "VARCHAR"
 
     def test_union_type(self):
-        type = duckdb.union_type([BIGINT, VARCHAR, TINYINT])
+        type = vane.union_type([BIGINT, VARCHAR, TINYINT])
         assert str(type) == "UNION(v1 BIGINT, v2 VARCHAR, v3 TINYINT)"
 
-        type = duckdb.union_type({"a": BIGINT, "b": VARCHAR, "c": TINYINT})
+        type = vane.union_type({"a": BIGINT, "b": VARCHAR, "c": TINYINT})
         assert str(type) == "UNION(a BIGINT, b VARCHAR, c TINYINT)"
 
     @pytest.mark.skipif(sys.version_info < (3, 9), reason="requires >= python3.9")
     def test_implicit_convert_from_builtin_type(self):
-        type = duckdb.list_type(list[str])
+        type = vane.list_type(list[str])
         assert str(type.child) == "VARCHAR[]"
 
         mapping = {str: "VARCHAR", int: "BIGINT", bytes: "BLOB", bytearray: "BLOB", bool: "BOOLEAN", float: "DOUBLE"}
         for duckdb_type, expected in mapping.items():
-            res = duckdb.list_type(duckdb_type)
+            res = vane.list_type(duckdb_type)
             assert str(res.child) == expected
 
-        res = duckdb.list_type({"a": str, "b": int})
+        res = vane.list_type({"a": str, "b": int})
         assert str(res.child) == "STRUCT(a VARCHAR, b BIGINT)"
 
-        res = duckdb.list_type(dict[str, int])
+        res = vane.list_type(dict[str, int])
         assert str(res.child) == "MAP(VARCHAR, BIGINT)"
 
-        res = duckdb.list_type(list[str])
+        res = vane.list_type(list[str])
         assert str(res.child) == "VARCHAR[]"
 
-        res = duckdb.list_type(list[dict[str, dict[list[str], str]]])
+        res = vane.list_type(list[dict[str, dict[list[str], str]]])
         assert str(res.child) == "MAP(VARCHAR, MAP(VARCHAR[], VARCHAR))[]"
 
-        res = duckdb.list_type(list[str | int])
+        res = vane.list_type(list[str | int])
         assert str(res.child) == "UNION(u1 VARCHAR, u2 BIGINT)[]"
 
     def test_implicit_convert_from_numpy(self, duckdb_cursor):
@@ -195,7 +195,7 @@ class TestType:
             assert type_mapping[dtype_str] == duckdb_type_str
 
     def test_attribute_accessor(self):
-        type = duckdb.row_type([BIGINT, duckdb.list_type(duckdb.map_type(BLOB, BIT))])
+        type = vane.row_type([BIGINT, vane.list_type(vane.map_type(BLOB, BIT))])
         assert not hasattr(type, "a")
         assert hasattr(type, "v1")
 
@@ -211,19 +211,19 @@ class TestType:
         assert str(child_type) == "MAP(BLOB, BIT)"
 
     def test_json_type(self):
-        json_type = duckdb.type("JSON")
+        json_type = vane.type("JSON")
 
-        val = duckdb.Value('{"duck": 42}', json_type)
-        res = duckdb.execute("select typeof($1)", [val]).fetchone()
+        val = vane.Value('{"duck": 42}', json_type)
+        res = vane.execute("select typeof($1)", [val]).fetchone()
         assert res == ("JSON",)
 
     def test_struct_from_dict(self):
-        res = duckdb.list_type({"a": VARCHAR, "b": VARCHAR})
+        res = vane.list_type({"a": VARCHAR, "b": VARCHAR})
         assert res == "STRUCT(a VARCHAR, b VARCHAR)[]"
 
     def test_hash_method(self):
-        type1 = duckdb.list_type({"a": VARCHAR, "b": VARCHAR})
-        type2 = duckdb.list_type({"b": VARCHAR, "a": VARCHAR})
+        type1 = vane.list_type({"a": VARCHAR, "b": VARCHAR})
+        type2 = vane.list_type({"b": VARCHAR, "a": VARCHAR})
         type3 = VARCHAR
 
         type_set = set()

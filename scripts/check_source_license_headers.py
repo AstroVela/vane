@@ -54,6 +54,8 @@ class RepositoryPolicy:
     exclude_nested_third_party: bool
     new_license: str
     modified_license: str
+    non_duckdb_modified_prefixes: tuple[str, ...]
+    duckdb_derived_additions: frozenset[str]
 
 
 POLICIES = {
@@ -62,20 +64,26 @@ POLICIES = {
         path=REPOSITORY_ROOT,
         baseline="60d1d025be5040469662a40d6c0148916a28175a",
         source_names=frozenset(ROOT_SOURCE_NAMES),
-        excluded_prefixes=("external/duckdb/", "third_party/", "vcpkg/", "duckdb/experimental/spark/"),
+        excluded_prefixes=("external/duckdb/", "third_party/", "vcpkg/", "vane/experimental/spark/"),
         exclude_nested_third_party=False,
         new_license="Apache-2.0",
         modified_license="MIT AND Apache-2.0",
+        non_duckdb_modified_prefixes=("vane_adbc_driver_duckdb/",),
+        duckdb_derived_additions=frozenset({"vane/_duckdb_func.py"}),
     ),
     "duckdb": RepositoryPolicy(
         name="duckdb",
         path=REPOSITORY_ROOT / "external" / "duckdb",
-        baseline="3a3967aa8190d0a2d1931d4ca4f5d920760030b4",
+        # Monorepo snapshot that imported upstream DuckDB commit
+        # 3a3967aa8190d0a2d1931d4ca4f5d920760030b4 under external/duckdb.
+        baseline="c143c16b541e6175c5070f41f6bfcfe17b5bcacd",
         source_names=frozenset(SOURCE_NAMES),
         excluded_prefixes=("third_party/", "vcpkg/"),
         exclude_nested_third_party=True,
         new_license="MIT",
         modified_license="MIT",
+        non_duckdb_modified_prefixes=(),
+        duckdb_derived_additions=frozenset(),
     ),
 }
 
@@ -88,10 +96,12 @@ def changed_source_files(policy: RepositoryPolicy) -> list[tuple[str, str]]:
     output = git_output(
         policy.path,
         "diff",
+        "--relative",
         "--name-status",
         "--find-renames",
         policy.baseline,
         "--",
+        ".",
     )
     result: list[tuple[str, str]] = []
     for line in output.splitlines():
@@ -108,7 +118,7 @@ def changed_source_files(policy: RepositoryPolicy) -> list[tuple[str, str]]:
         result.append((status, relative_path))
 
     known_paths = {relative_path for _, relative_path in result}
-    untracked = git_output(policy.path, "ls-files", "--others", "--exclude-standard", "--")
+    untracked = git_output(policy.path, "ls-files", "--others", "--exclude-standard", "--", ".")
     for relative_path in untracked.splitlines():
         path = Path(relative_path)
         if relative_path in known_paths:
@@ -140,11 +150,16 @@ def is_cmake_source(path: Path) -> bool:
     return path.suffix == ".cmake" or path.name == "CMakeLists.txt"
 
 
-def license_header(policy: RepositoryPolicy, status: str, path: Path) -> str:
+def license_header(policy: RepositoryPolicy, status: str, relative_path: str, path: Path) -> str:
     prefix = comment_prefix(path)
-    license_expression = policy.new_license if status == "A" else policy.modified_license
+    inherited_duckdb_source = status == "M"
+    if relative_path.startswith(policy.non_duckdb_modified_prefixes):
+        inherited_duckdb_source = False
+    if relative_path in policy.duckdb_derived_additions:
+        inherited_duckdb_source = True
+    license_expression = policy.modified_license if inherited_duckdb_source else policy.new_license
     metadata: list[str] = []
-    if status == "M":
+    if inherited_duckdb_source:
         metadata.append(f"{prefix} SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation")
     metadata.append(f"{prefix} SPDX-FileCopyrightText: 2026 Vane contributors")
     metadata.append(f"{prefix} SPDX-License-Identifier: {license_expression}")
@@ -153,7 +168,7 @@ def license_header(policy: RepositoryPolicy, status: str, path: Path) -> str:
         lines.pop()
     else:
         lines = metadata
-    if status == "M":
+    if inherited_duckdb_source:
         lines.extend((prefix, f"{prefix} Modified by Vane contributors."))
     return "\n".join(lines) + "\n\n"
 
@@ -198,7 +213,9 @@ def process(policy: RepositoryPolicy, *, fix: bool) -> tuple[int, int, int]:
             existing += 1
             continue
         malformed_cmake_header = is_cmake_source(path) and "SPDX-License-Identifier:" in text[:4096]
-        missing.append((status, relative_path, path, license_header(policy, status, path), malformed_cmake_header))
+        missing.append(
+            (status, relative_path, path, license_header(policy, status, relative_path, path), malformed_cmake_header)
+        )
 
     if fix:
         for _, _, path, header, malformed_cmake_header in missing:

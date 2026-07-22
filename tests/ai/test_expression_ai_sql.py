@@ -14,7 +14,6 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import duckdb
 import vane
 from vane.ai import provider as provider_registry
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
@@ -127,7 +126,7 @@ def mock_ai_provider(monkeypatch):
 
 def _round_trip_ai_plan(relation, *, runner: str = "local-fast"):
     source_types = list(relation.types)
-    logical = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4()))
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4()))
     serialized = pickle.dumps(logical)
     restored = pickle.loads(serialized)
     previous_runner = os.environ.get("VANE_RUNNER")
@@ -144,11 +143,11 @@ def _round_trip_ai_plan(relation, *, runner: str = "local-fast"):
 
 
 def _execute_ai_physical_plan(target, physical):
-    from duckdb.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
+    from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
 
     pools, _ = ensure_local_subprocess_actor_pools_for_plan(physical, conn=target)
     try:
-        result = duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(target.cursor(), physical, None, None)
+        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(target.cursor(), physical, None, None)
         payloads = list(result.partition_payloads)
         return pa.concat_tables(payloads) if len(payloads) > 1 else payloads[0]
     finally:

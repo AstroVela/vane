@@ -10,7 +10,6 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import duckdb
 import vane
 from vane.ai import provider as provider_registry
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
@@ -387,9 +386,9 @@ def test_ai_prompt_vllm_options_map_to_actor_and_gpu_fields(monkeypatch):
 def test_ai_prompt_expression_rejects_gpu_actor_on_local_runner(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     conn = vane.connect()
-    rel = conn.sql("select 1 as id, 'search'::VARCHAR as chunk")
+    conn.sql("select 1 as id, 'search'::VARCHAR as chunk")
 
-    with pytest.raises(duckdb.InvalidInputException, match="GPU resources require a Ray UDF backend"):
+    with pytest.raises(vane.InvalidInputException, match="GPU resources require a Ray UDF backend"):
         vane.ai.prompt(
             vane.col("chunk"),
             provider=MockProvider(),

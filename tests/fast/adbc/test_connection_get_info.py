@@ -1,10 +1,16 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 pytest.importorskip("adbc_driver_manager")
-adbc_driver_duckdb_dbapi = pytest.importorskip("adbc_driver_duckdb.dbapi")
+adbc_driver_duckdb_dbapi = pytest.importorskip("vane_adbc_driver_duckdb.dbapi")
 
 
 class TestADBCConnectionGetInfo:
@@ -26,9 +32,9 @@ class TestADBCConnectionGetInfo:
         expected_result = pa.array(
             [
                 "duckdb",
-                "v" + duckdb.__duckdb_version__,  # don't hardcode this, as it will change every version
+                "v" + vane.__duckdb_version__,  # don't hardcode this, as it will change every version
                 "ADBC DuckDB Driver",
-                "v" + duckdb.__duckdb_version__,  # don't hardcode this, as it will change every version
+                "v" + vane.__duckdb_version__,  # don't hardcode this, as it will change every version
                 "(unknown)",
                 None,
             ],

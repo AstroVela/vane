@@ -98,7 +98,7 @@ static void ThrowScanFailureError(const py::object &entry, const string &name, c
 	}
 	error +=
 	    StringUtil::Format(" not suitable for replacement scans.\nMake sure "
-	                       "that \"%s\" is either a pandas.DataFrame, duckdb.DuckDBPyRelation, pyarrow Table, Dataset, "
+	                       "that \"%s\" is either a pandas.DataFrame, vane.DuckDBPyRelation, pyarrow Table, Dataset, "
 	                       "RecordBatchReader, Scanner, or NumPy ndarrays with supported format",
 	                       name);
 	throw InvalidInputException(error);

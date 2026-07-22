@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pyarrow as pa
 
-import duckdb
+import vane
 from vane.ai.protocols import (
     TextClassifierDescriptor,
     TextEmbedderDescriptor,
@@ -98,7 +98,7 @@ class TestRelationPatch:
 
     def test_embed_text_on_relation(self):
         """rel.embed_text() produces embeddings."""
-        conn = duckdb.connect()
+        conn = vane.connect()
         rel = conn.sql("SELECT 'hello' AS text UNION ALL SELECT 'world' AS text")
 
         result = rel.embed_text("text", provider=MockProvider())
@@ -109,7 +109,7 @@ class TestRelationPatch:
 
     def test_classify_text_on_relation(self):
         """rel.classify_text() produces labels."""
-        conn = duckdb.connect()
+        conn = vane.connect()
         rel = conn.sql("SELECT 'great' AS text UNION ALL SELECT 'bad' AS text")
 
         result = rel.classify_text("text", labels=["positive", "negative"], provider=MockProvider())
@@ -120,20 +120,20 @@ class TestRelationPatch:
 
     def test_methods_exist_on_relation(self):
         """DuckDBPyRelation has the patched methods."""
-        assert hasattr(duckdb.DuckDBPyRelation, "embed_text")
-        assert hasattr(duckdb.DuckDBPyRelation, "classify_text")
-        assert hasattr(duckdb.DuckDBPyRelation, "prompt")
+        assert hasattr(vane.DuckDBPyRelation, "embed_text")
+        assert hasattr(vane.DuckDBPyRelation, "classify_text")
+        assert hasattr(vane.DuckDBPyRelation, "prompt")
 
     def test_patch_is_idempotent(self):
         """Importing the patch module again doesn't break anything."""
         import vane.ai._relation_patch
 
         vane.ai._relation_patch._patch()
-        assert hasattr(duckdb.DuckDBPyRelation, "embed_text")
+        assert hasattr(vane.DuckDBPyRelation, "embed_text")
 
     def test_embed_text_chaining(self):
         """embed_text returns a relation that can be further queried."""
-        conn = duckdb.connect()
+        conn = vane.connect()
         rel = conn.sql("SELECT 'test' AS text")
 
         result = rel.embed_text("text", provider=MockProvider())

@@ -38,7 +38,6 @@ from typing import Any
 
 import pyarrow as pa
 
-import duckdb
 import vane
 from vane.ai import embed_text
 
@@ -112,7 +111,7 @@ def relation_from_dicts(
     if not rows:
         raise RuntimeError("Cannot create a relation from zero rows.")
     columns = list(schema or rows[0])
-    constant = duckdb.ConstantExpression
+    constant = vane.ConstantExpression
     raw = conn.values(
         *(tuple(constant(row[column]) for column in columns) for row in rows),
     )
@@ -577,12 +576,12 @@ def run(args: argparse.Namespace) -> None:
     )
     map_kwargs: dict[str, Any] = {
         "schema": {
-            "id": duckdb.sqltypes.BIGINT,
-            "path": duckdb.sqltypes.VARCHAR,
-            "transcript": duckdb.sqltypes.VARCHAR,
-            "language": duckdb.sqltypes.VARCHAR,
-            "duration_seconds": duckdb.sqltypes.DOUBLE,
-            "segments_json": duckdb.sqltypes.VARCHAR,
+            "id": vane.sqltypes.BIGINT,
+            "path": vane.sqltypes.VARCHAR,
+            "transcript": vane.sqltypes.VARCHAR,
+            "language": vane.sqltypes.VARCHAR,
+            "duration_seconds": vane.sqltypes.DOUBLE,
+            "segments_json": vane.sqltypes.VARCHAR,
         },
         "batch_size": args.batch_size,
     }

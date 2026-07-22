@@ -1,13 +1,19 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 
 import numpy as np
 
-import duckdb
+import vane
 
 
 class TestNumpyDatetime64:
     def test_numpy_datetime64(self, duckdb_cursor):
-        duckdb_con = duckdb.connect()
+        duckdb_con = vane.connect()
 
         duckdb_con.execute("create table tbl(col TIMESTAMP)")
         duckdb_con.execute(
@@ -19,7 +25,7 @@ class TestNumpyDatetime64:
         ).fetchall()
 
     def test_numpy_datetime_big(self):
-        duckdb_con = duckdb.connect()
+        duckdb_con = vane.connect()
 
         duckdb_con.execute("create table test (date DATE)")
         duckdb_con.execute("INSERT INTO TEST VALUES ('2263-02-28')")

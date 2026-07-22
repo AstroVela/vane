@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 from pathlib import Path
 
@@ -6,11 +12,11 @@ import pytest
 
 adbc_driver_manager = pytest.importorskip("adbc_driver_manager")
 adbc_driver_manager_dbapi = pytest.importorskip("adbc_driver_manager.dbapi")
-adbc_driver_duckdb = pytest.importorskip("adbc_driver_duckdb")
+vane_adbc_driver_duckdb = pytest.importorskip("vane_adbc_driver_duckdb")
 pyarrow = pytest.importorskip("pyarrow")
 
 xfail = pytest.mark.xfail
-driver_path = adbc_driver_duckdb.driver_path()
+driver_path = vane_adbc_driver_duckdb.driver_path()
 
 
 @pytest.fixture

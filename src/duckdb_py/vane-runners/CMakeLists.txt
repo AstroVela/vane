@@ -10,5 +10,5 @@ target_include_directories(python_vane_runners
 
 target_link_libraries(python_vane_runners PRIVATE _duckdb_dependencies)
 
-# No installation target; this is built into _duckdb module via
+# No installation target; this is built into the _vane_duckdb module via
 # $<TARGET_OBJECTS:python_vane_runners>

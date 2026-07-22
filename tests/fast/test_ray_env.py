@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import os
 
-from duckdb.runners.ray.runner import (
+from vane.runners.ray.ray_env import collect_vane_env_overrides
+from vane.runners.ray.runner import (
     _configure_scan_task_backlog_env,
 )
-from duckdb.runners.ray.ray_env import collect_vane_env_overrides
 
 
 def test_ray_runner_does_not_inject_udf_stage_count_env(monkeypatch):

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""vLLM provider — wraps the existing ``duckdb.execution.vllm`` engine.
+"""vLLM provider — wraps the existing ``vane.execution.vllm`` engine.
 
 The vLLM executor already manages its own ``AsyncLLMEngine`` event loop,
 request queuing, prefix routing, and Ray actor pool.  This provider wraps
@@ -122,7 +122,7 @@ class VLLMPrompterDescriptor(PrompterDescriptor):
 
     Stores model name and vLLM configuration.  On ``instantiate()`` it
     creates a ``LocalVLLMExecutor`` or ``RemoteVLLMExecutor`` via the
-    existing ``duckdb.execution.vllm.build_executor()`` factory.
+    existing ``vane.execution.vllm.build_executor()`` factory.
 
     When ``return_format`` is set (Pydantic model or JSON schema dict),
     the JSON schema is injected as ``structured_outputs`` in the executor's
@@ -202,7 +202,7 @@ class VLLMPrompter:
 
     def _ensure_executor(self) -> Any:
         if self._executor is None:
-            from duckdb.execution.vllm import build_executor
+            from vane.execution.vllm import build_executor
 
             options = dict(self._options)
             options["use_threading"] = True

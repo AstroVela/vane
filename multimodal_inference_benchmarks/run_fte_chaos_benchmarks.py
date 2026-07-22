@@ -152,14 +152,14 @@ def _materialize_stable_smoke_input(
 ) -> Path:
     if spec.stable_smoke_input_order_by is None:
         raise ValueError("stable smoke input order column is not configured")
-    import duckdb
+    import vane
 
     output_path = suite_root / "smoke_input" / f"{spec.name}_{int(smoke_limit)}.parquet"
     if output_path.exists():
         return output_path
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         source = _quote_sql_string(_normalize_parquet_input(input_path))
         output = _quote_sql_string(str(output_path))
@@ -269,9 +269,9 @@ def _validate_output(output_path: Path) -> OutputSummary:
     parquet_files = sorted(output_path.glob("**/*.parquet"))
     if not parquet_files:
         raise RuntimeError(f"no parquet files written under {output_path}")
-    import duckdb
+    import vane
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         glob = str(output_path / "**" / "*.parquet")
         row_count = con.execute(

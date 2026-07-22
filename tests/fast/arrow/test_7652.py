@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import tempfile
 
 import pytest
@@ -31,8 +37,8 @@ class Test7652:
         assert max(read_list) == max(generated_list)
         assert read_list == generated_list
 
-        # Attempt to perform the same thing with duckdb.
-        print("Retrieving from duckdb")
+        # Attempt to perform the same thing with vane.
+        print("Retrieving from vane")
         duckdb_result = [v[0] for v in duckdb_cursor.sql(f"select * from '{temp_file_name}'").fetchall()]
 
         print("DuckDB result:", duckdb_result)

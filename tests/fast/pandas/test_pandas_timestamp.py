@@ -1,16 +1,22 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 from datetime import datetime
 
 import pandas
 import pytest
 from conftest import pandas_2_or_higher
 
-import duckdb
+import vane
 
 
 @pytest.mark.parametrize("timezone", ["UTC", "CET", "Asia/Kathmandu"])
 @pytest.mark.skipif(not pandas_2_or_higher(), reason="Pandas <2.0.0 does not support timezones in the metadata string")
 def test_run_pandas_with_tz(timezone):
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute(f"SET TimeZone = '{timezone}'")
     df = pandas.DataFrame(
         {

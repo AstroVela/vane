@@ -1,10 +1,16 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 from collections import Counter
 from itertools import product
 
 import pytest
 
-import duckdb
-from duckdb import ColumnExpression
+import vane
+from vane import ColumnExpression
 
 STANDARD_VECTOR_SIZE = 2048
 CROSS_JOIN_BOUNDARY_CASES = (
@@ -24,7 +30,7 @@ CROSS_JOIN_BOUNDARY_CASES = (
 
 @pytest.fixture
 def con():
-    conn = duckdb.connect()
+    conn = vane.connect()
     # Main relation
     conn.execute(
         """

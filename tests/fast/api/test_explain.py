@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 
 class TestExplain:
@@ -15,7 +21,7 @@ class TestExplain:
         res = duckdb_cursor.sql("select 42").explain("STANDARD")
         assert isinstance(res, str)
 
-        res = duckdb_cursor.sql("select 42").explain(duckdb.ExplainType.STANDARD)
+        res = duckdb_cursor.sql("select 42").explain(vane.ExplainType.STANDARD)
         assert isinstance(res, str)
 
         res = duckdb_cursor.sql("select 42").explain(0)
@@ -28,7 +34,7 @@ class TestExplain:
         res = duckdb_cursor.sql("select 42").explain("ANALYZE")
         assert isinstance(res, str)
 
-        res = duckdb_cursor.sql("select 42").explain(duckdb.ExplainType.ANALYZE)
+        res = duckdb_cursor.sql("select 42").explain(vane.ExplainType.ANALYZE)
         assert isinstance(res, str)
 
         res = duckdb_cursor.sql("select 42").explain(1)

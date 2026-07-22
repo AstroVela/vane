@@ -12,16 +12,16 @@ from typing import Any
 
 import pytest
 
-import duckdb
-from duckdb.runners.fte import FteTaskAttemptId, FteTaskId, FteTaskState, TaskResultState
-from duckdb.runners.fte.backends.native import (
+import vane
+from vane.runners.fte import FteTaskAttemptId, FteTaskId, FteTaskState, TaskResultState
+from vane.runners.fte.backends.native import (
     NativeFteWorkerManagerBackend,
     NativeTaskResultHandle,
     NativeWorkerHandle,
 )
-from duckdb.runners.fte.backends.native.backend import _flight_exchange_node_id_from_env
-from duckdb.runners.fte.fte_config import FTE_WORKER_RUNTIME
-from duckdb.runners.progress import build_progress_snapshot
+from vane.runners.fte.backends.native.backend import _flight_exchange_node_id_from_env
+from vane.runners.fte.fte_config import FTE_WORKER_RUNTIME
+from vane.runners.progress import build_progress_snapshot
 
 
 def _task_id(partition_id: int, *, query_id: str = "q") -> dict[str, int | str]:
@@ -77,12 +77,12 @@ def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
     else:
         monkeypatch.delenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", raising=False)
 
-    setup_conn = duckdb.connect()
+    setup_conn = vane.connect()
     src = tmp_path / "native_copy_failure_input.parquet"
     setup_conn.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
     setup_conn.close()
 
-    import duckdb.runners as runners_mod
+    import vane.runners as runners_mod
 
     captured = []
 
@@ -94,13 +94,13 @@ def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
     monkeypatch.setenv("VANE_RUNNER", "local")
     monkeypatch.setattr(runners_mod, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
 
-    con = duckdb.connect()
+    con = vane.connect()
     dst = tmp_path / "native_copy_failure_output.parquet"
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected local write relation to be captured"
 
     query_id = str(uuid.uuid4())
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         captured[0],
         query_id,
     ).to_physical_plan(con)
@@ -115,12 +115,12 @@ def _capture_native_copy_relation(tmp_path, monkeypatch, *, local_staging: bool)
     else:
         monkeypatch.delenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", raising=False)
 
-    setup_conn = duckdb.connect()
+    setup_conn = vane.connect()
     src = tmp_path / "native_copy_isolation_input.parquet"
     setup_conn.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
     setup_conn.close()
 
-    import duckdb.runners as runners_mod
+    import vane.runners as runners_mod
 
     captured = []
 
@@ -132,7 +132,7 @@ def _capture_native_copy_relation(tmp_path, monkeypatch, *, local_staging: bool)
     monkeypatch.setenv("VANE_RUNNER", "local")
     monkeypatch.setattr(runners_mod, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
 
-    con = duckdb.connect()
+    con = vane.connect()
     dst = tmp_path / "native_copy_isolation_output.parquet"
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected local write relation to be captured"
@@ -827,7 +827,7 @@ def test_native_fte_runtime_removes_dynamic_initial_splits_before_execute():
 
 
 def test_native_task_result_handle_normalizes_native_distributed_result_for_cxx():
-    ray_cxx = duckdb.ray_cxx
+    ray_cxx = vane.ray_cxx
 
     def execute_fn(_request):
         return ray_cxx.NativeDistributedTaskResult(
@@ -930,7 +930,7 @@ def test_cxx_python_task_result_handle_polls_native_handle_without_ray_driver():
             },
         )
 
-        result = duckdb.ray_cxx.python_task_result_handle_for_test(handle)
+        result = vane.ray_cxx.python_task_result_handle_for_test(handle)
 
         assert result == {
             "worker_id": _flight_exchange_node_id_from_env(),
@@ -965,7 +965,7 @@ def test_cxx_distributed_runner_accepts_python_backend_without_ray_worker_startu
             self.shutdown_calls += 1
 
     backend = Backend()
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
 
     runner.warm_up()
     stats = runner.fragment_stats()
@@ -1000,7 +1000,7 @@ def test_cxx_distributed_runner_reads_native_backend_fragment_stats():
         )
         assert started.wait(timeout=2.0)
 
-        runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+        runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
         stats = runner.fragment_stats()
 
         assert stats["workers"]["native-worker-0"]["executor_running_task_count"] == 1
@@ -1288,7 +1288,7 @@ def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
             return True
 
         def get_result_sync(self):
-            return duckdb.ray_cxx.RayTaskResult.no_output()
+            return vane.ray_cxx.RayTaskResult.no_output()
 
         def ack(self):
             self.acked = True
@@ -1341,15 +1341,15 @@ def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
         def shutdown(self):
             pass
 
-    con = duckdb.connect()
+    con = vane.connect()
     relation = con.sql("SELECT 1 AS i")
     query_id = f"native-backend-bridge-{uuid.uuid4()}"
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         query_id,
     ).to_physical_plan(con)
     backend = Backend()
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
 
     parts = list(iter(runner.run_plan(plan, con)))
 
@@ -1400,7 +1400,7 @@ def test_cxx_streaming_runner_output_handle_release_lifecycle(
 
         def get_result_sync(self):
             table = pa.table({"i": [1]})
-            return duckdb.ray_cxx.RayTaskResult.success(
+            return vane.ray_cxx.RayTaskResult.success(
                 [table],
                 [],
                 None,
@@ -1454,29 +1454,29 @@ def test_cxx_streaming_runner_output_handle_release_lifecycle(
         def shutdown(self):
             pass
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("SET threads=3")
     relation = con.sql("SELECT 1 AS i")
     query_id = f"streaming-output-release-lifecycle-{uuid.uuid4()}"
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         query_id,
     ).to_physical_plan(con)
     backend = Backend()
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
 
     parts = list(iter(runner.run_plan(plan, con)))
 
     assert parts
     assert all(handle.acked for handle in backend.handles)
     assert all(handle.released is expect_released_after_run for handle in backend.handles)
-    assert duckdb.ray_cxx._lookup_query_connection_snapshot(query_id) is not None
+    assert vane.ray_cxx._lookup_query_connection_snapshot(query_id) is not None
 
     runner.drop_query_fragments(query_id)
 
     assert backend.drop_calls == [query_id]
     assert all(handle.released for handle in backend.handles)
-    assert duckdb.ray_cxx._lookup_query_connection_snapshot(query_id) is None
+    assert vane.ray_cxx._lookup_query_connection_snapshot(query_id) is None
 
 
 def test_cxx_backend_drop_query_failure_is_not_silently_accepted():
@@ -1490,7 +1490,7 @@ def test_cxx_backend_drop_query_failure_is_not_silently_accepted():
 
     query_id = f"backend-drop-failure-{uuid.uuid4()}"
     backend = Backend()
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
 
     with pytest.raises(RuntimeError, match="planned backend drop failure"):
         runner.drop_query_fragments(query_id)
@@ -1554,14 +1554,14 @@ def test_cxx_python_backend_poll_error_retains_result_handle_until_drop():
         def shutdown(self):
             pass
 
-    con = duckdb.connect()
+    con = vane.connect()
     query_id = f"python-backend-poll-error-{uuid.uuid4()}"
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         con.sql("SELECT 1 AS i"),
         query_id,
     ).to_physical_plan(con)
     backend = Backend()
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
 
     with pytest.raises(Exception, match="planned Python backend poll failure"):
         list(runner.run_plan(plan, con))
@@ -1581,24 +1581,24 @@ def test_cxx_run_plan_startup_failure_cleans_query_replay_snapshot():
         def drop_query(self, query_id):
             self.drop_calls.append(str(query_id))
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("SET threads=3")
     query_id = f"stream-startup-cleanup-{uuid.uuid4()}"
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         con.sql("SELECT 1 AS i"),
         query_id,
     ).to_physical_plan(con)
     deferred_plan = pickle.loads(pickle.dumps(plan))
     assert deferred_plan.has_root() is False
-    assert duckdb.ray_cxx._lookup_query_connection_snapshot(query_id) is None
+    assert vane.ray_cxx._lookup_query_connection_snapshot(query_id) is None
 
     backend = Backend()
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
     with pytest.raises(ValueError, match="has no root"):
         runner.run_plan(deferred_plan, con)
 
     assert backend.drop_calls == [query_id]
-    assert duckdb.ray_cxx._lookup_query_connection_snapshot(query_id) is None
+    assert vane.ray_cxx._lookup_query_connection_snapshot(query_id) is None
     con.close()
 
 
@@ -1607,21 +1607,21 @@ def test_cxx_run_plan_startup_and_cleanup_failures_are_aggregated():
         def drop_query(self, _query_id):
             raise RuntimeError("planned stream startup cleanup failure")
 
-    con = duckdb.connect()
+    con = vane.connect()
     query_id = f"stream-startup-cleanup-error-{uuid.uuid4()}"
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         con.sql("SELECT 1 AS i"),
         query_id,
     ).to_physical_plan(con)
     deferred_plan = pickle.loads(pickle.dumps(plan))
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(Backend())
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(Backend())
     with pytest.raises(RuntimeError) as error:
         runner.run_plan(deferred_plan, con)
 
     assert "has no root" in str(error.value)
     assert "planned stream startup cleanup failure" in str(error.value)
-    assert duckdb.ray_cxx._lookup_query_connection_snapshot(query_id) is None
+    assert vane.ray_cxx._lookup_query_connection_snapshot(query_id) is None
     con.close()
 
 
@@ -1643,7 +1643,7 @@ def test_native_cxx_run_copy_plan_failure_cleans_local_staging(tmp_path, monkeyp
 
     backend = NativeFteWorkerManagerBackend(execute_fn=execute_fn)
     try:
-        runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+        runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
         with pytest.raises(ValueError, match="planned native copy failure"):
             runner.run_copy_plan(plan, con)
 
@@ -1661,14 +1661,14 @@ def test_native_cxx_run_copy_plan_failure_cleans_local_staging(tmp_path, monkeyp
 def test_native_cxx_run_copy_plan_surfaces_backend_cleanup_failure(tmp_path, monkeypatch):
     con, _dst, relation = _capture_native_copy_relation(tmp_path, monkeypatch, local_staging=True)
 
-    from duckdb.runners.local.runner import _InProcessFragmentExecutor
+    from vane.runners.local.runner import _InProcessFragmentExecutor
 
     backend = NativeFteWorkerManagerBackend(
         execute_fn=_InProcessFragmentExecutor(),
         max_running_tasks=2,
     )
     query_id = f"copy-cleanup-failure-{uuid.uuid4()}"
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         query_id,
     ).to_physical_plan(con)
@@ -1682,7 +1682,7 @@ def test_native_cxx_run_copy_plan_surfaces_backend_cleanup_failure(tmp_path, mon
 
     backend.drop_query = failing_drop_query
     try:
-        runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+        runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
         with pytest.raises(RuntimeError, match="planned copy backend cleanup failure"):
             runner.run_copy_plan(plan, con)
 
@@ -1695,15 +1695,15 @@ def test_native_cxx_run_copy_plan_surfaces_backend_cleanup_failure(tmp_path, mon
 def test_native_cxx_run_copy_plan_successive_local_staging_runs_use_distinct_paths(tmp_path, monkeypatch):
     con, dst, relation = _capture_native_copy_relation(tmp_path, monkeypatch, local_staging=True)
 
-    from duckdb.runners.local.runner import _InProcessFragmentExecutor
+    from vane.runners.local.runner import _InProcessFragmentExecutor
 
     executor = _InProcessFragmentExecutor()
     backend = NativeFteWorkerManagerBackend(execute_fn=executor, max_running_tasks=2)
     results = []
     try:
-        runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+        runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
         for _ in range(2):
-            plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
                 relation,
                 str(uuid.uuid4()),
             ).to_physical_plan(con)
@@ -1743,7 +1743,7 @@ def test_native_cxx_run_copy_plan_successive_local_staging_runs_use_distinct_pat
 def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
 
-    from duckdb.runners.local import runner as local_runner
+    from vane.runners.local import runner as local_runner
 
     class FakeCursor:
         def __init__(self, conn_id: int) -> None:
@@ -1824,7 +1824,7 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
             return lambda values: values
         raise AssertionError(f"unexpected ray_cxx attr: {name}")
 
-    monkeypatch.setattr(duckdb, "connect", fake_connect)
+    monkeypatch.setattr(vane, "connect", fake_connect)
     monkeypatch.setattr(local_runner, "require_ray_cxx_attr", fake_require)
 
     executor = local_runner._InProcessFragmentExecutor()
@@ -1882,7 +1882,7 @@ def test_native_cxx_run_copy_plan_selected_attempt_ignores_duplicate_copy_output
                     "partition_keys": [None],
                 }
             )
-            return duckdb.ray_cxx.RayTaskResult.success([table], [], None)
+            return vane.ray_cxx.RayTaskResult.success([table], [], None)
 
         def ack(self):
             self.acked = True
@@ -1923,12 +1923,12 @@ def test_native_cxx_run_copy_plan_selected_attempt_ignores_duplicate_copy_output
             selected_file.parent.mkdir(parents=True, exist_ok=True)
             duplicate_file.parent.mkdir(parents=True, exist_ok=True)
 
-            selected_conn = duckdb.connect()
+            selected_conn = vane.connect()
             selected_conn.execute(
                 f"COPY (select 101::integer as x) TO {_sql_string_literal(str(selected_file))} (FORMAT PARQUET)"
             )
             selected_conn.close()
-            duplicate_conn = duckdb.connect()
+            duplicate_conn = vane.connect()
             duplicate_conn.execute(
                 f"COPY (select 999::integer as x) TO {_sql_string_literal(str(duplicate_file))} (FORMAT PARQUET)"
             )
@@ -1982,7 +1982,7 @@ def test_native_cxx_run_copy_plan_selected_attempt_ignores_duplicate_copy_output
 
     backend = Backend()
     try:
-        runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+        runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
         result = runner.run_copy_plan(plan, con)
 
         assert result["copy_selected_file_count"] == 1
@@ -2020,7 +2020,7 @@ def test_native_cxx_run_copy_plan_failure_cleans_direct_write_run(tmp_path, monk
 
     backend = NativeFteWorkerManagerBackend(execute_fn=execute_fn)
     try:
-        runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+        runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
         with pytest.raises(ValueError, match="planned native direct copy failure"):
             runner.run_copy_plan(plan, con)
 
@@ -2058,7 +2058,7 @@ def test_native_cxx_run_copy_plan_cancellation_cleans_local_staging(tmp_path, mo
     outcomes: list[Any] = []
 
     def run_copy_plan():
-        runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+        runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
         try:
             outcomes.append(runner.run_copy_plan(plan, con))
         except BaseException as exc:  # pragma: no cover - asserted below
@@ -2116,7 +2116,7 @@ def test_native_cxx_run_copy_plan_cancellation_cleans_direct_write_run(tmp_path,
     outcomes: list[Any] = []
 
     def run_copy_plan():
-        runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+        runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
         try:
             outcomes.append(runner.run_copy_plan(plan, con))
         except BaseException as exc:  # pragma: no cover - asserted below

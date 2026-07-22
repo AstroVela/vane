@@ -39,7 +39,6 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-import duckdb
 import vane
 from vane.ai import embed_text
 
@@ -123,7 +122,7 @@ def relation_from_rows(
     if not rows:
         raise RuntimeError("Cannot create a relation from zero rows.")
     columns = list(schema)
-    constant = duckdb.ConstantExpression
+    constant = vane.ConstantExpression
     raw = conn.values(
         *(tuple(constant(row[column]) for column in columns) for row in rows),
     )
@@ -500,12 +499,12 @@ def run(args: argparse.Namespace) -> None:
     pages = filtered.map_batches(
         decoder.__call__,
         schema={
-            "record_id": duckdb.sqltypes.VARCHAR,
-            "target_uri": duckdb.sqltypes.VARCHAR,
-            "warc_date": duckdb.sqltypes.VARCHAR,
-            "content_length": duckdb.sqltypes.BIGINT,
-            "language": duckdb.sqltypes.VARCHAR,
-            "text": duckdb.sqltypes.VARCHAR,
+            "record_id": vane.sqltypes.VARCHAR,
+            "target_uri": vane.sqltypes.VARCHAR,
+            "warc_date": vane.sqltypes.VARCHAR,
+            "content_length": vane.sqltypes.BIGINT,
+            "language": vane.sqltypes.VARCHAR,
+            "text": vane.sqltypes.VARCHAR,
         },
         batch_size=args.batch_size,
     ).query(
@@ -528,12 +527,12 @@ def run(args: argparse.Namespace) -> None:
     chunks = pages.map_batches(
         chunker.__call__,
         schema={
-            "record_id": duckdb.sqltypes.VARCHAR,
-            "target_uri": duckdb.sqltypes.VARCHAR,
-            "warc_date": duckdb.sqltypes.VARCHAR,
-            "language": duckdb.sqltypes.VARCHAR,
-            "chunk_id": duckdb.sqltypes.BIGINT,
-            "text": duckdb.sqltypes.VARCHAR,
+            "record_id": vane.sqltypes.VARCHAR,
+            "target_uri": vane.sqltypes.VARCHAR,
+            "warc_date": vane.sqltypes.VARCHAR,
+            "language": vane.sqltypes.VARCHAR,
+            "chunk_id": vane.sqltypes.BIGINT,
+            "text": vane.sqltypes.VARCHAR,
         },
         batch_size=args.batch_size,
     )

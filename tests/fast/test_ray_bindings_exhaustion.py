@@ -6,11 +6,11 @@ import gc
 import pytest
 
 try:
-    from duckdb import ray_cxx
+    from vane import ray_cxx
 except Exception:
-    import _duckdb
+    import _vane_duckdb
 
-    ray_cxx = _duckdb.ray_cxx
+    ray_cxx = _vane_duckdb.ray_cxx
 
 
 def test_run_plan_uninitialized_plan_repeated_fail_fast_no_crash():

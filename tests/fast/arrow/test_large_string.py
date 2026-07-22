@@ -1,4 +1,10 @@
-import duckdb
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
+import vane
 
 try:
     import pyarrow as pa
@@ -17,6 +23,6 @@ class TestArrowLargeString:
         inputs = [pa.array(["foo", "baaaar", "b"], type=pa.large_string())]
         arrow_table = pa.Table.from_arrays(inputs, schema=schema)
 
-        rel = duckdb.from_arrow(arrow_table)
+        rel = vane.from_arrow(arrow_table)
         res = rel.execute().fetchall()
         assert res == [("foo",), ("baaaar",), ("b",)]

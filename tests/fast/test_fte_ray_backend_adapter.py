@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import pytest
 
-from duckdb.runners.fte import TaskResultState
-from duckdb.runners.fte.backends.ray import (
+from vane.runners.fte import TaskResultState
+from vane.runners.fte.backends.ray import (
     RayTaskResultHandleAdapter,
     RayWorkerHandleAdapter,
     RayWorkerManagerBackend,

@@ -8,13 +8,13 @@ import types
 
 import pyarrow as pa
 
-import duckdb
+import vane
 
 
 class _FakeRayRunner:
     def __init__(self, tables: list[pa.Table]) -> None:
         self.tables = tables
-        self.calls: list[tuple[duckdb.DuckDBPyRelation, int | None]] = []
+        self.calls: list[tuple[vane.DuckDBPyRelation, int | None]] = []
 
     def run_iter_tables(self, relation, results_buffer_size=None):
         self.calls.append((relation, results_buffer_size))
@@ -22,9 +22,9 @@ class _FakeRayRunner:
 
 
 def _install_fake_ray_runner(monkeypatch, runner: _FakeRayRunner) -> None:
-    runners = types.ModuleType("duckdb.runners")
+    runners = types.ModuleType("vane.runners")
     runners.set_runner_ray = lambda *_args, **_kwargs: runner
-    monkeypatch.setitem(sys.modules, "duckdb.runners", runners)
+    monkeypatch.setitem(sys.modules, "vane.runners", runners)
 
 
 def test_relation_show_materializes_through_ray(monkeypatch, capsys):
@@ -37,7 +37,7 @@ def test_relation_show_materializes_through_ray(monkeypatch, capsys):
     )
     _install_fake_ray_runner(monkeypatch, runner)
 
-    connection = duckdb.connect()
+    connection = vane.connect()
     relation = connection.sql("SELECT 999 AS value")
 
     relation.show()
@@ -54,7 +54,7 @@ def test_relation_show_materializes_through_ray(monkeypatch, capsys):
 
 def test_relation_show_uses_local_execution(monkeypatch, capsys):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    relation = duckdb.sql("SELECT 7 AS value")
+    relation = vane.sql("SELECT 7 AS value")
 
     relation.show()
 
@@ -68,7 +68,7 @@ def test_relation_show_preserves_duplicate_column_names(monkeypatch, capsys):
     runner = _FakeRayRunner([table])
     _install_fake_ray_runner(monkeypatch, runner)
 
-    connection = duckdb.connect()
+    connection = vane.connect()
     connection.sql("SELECT 1 AS a, 2 AS a").show()
 
     output = capsys.readouterr().out
@@ -82,7 +82,7 @@ def test_relation_show_handles_empty_distributed_result(monkeypatch, capsys):
     runner = _FakeRayRunner([])
     _install_fake_ray_runner(monkeypatch, runner)
 
-    connection = duckdb.connect()
+    connection = vane.connect()
     connection.sql("SELECT NULL::VARCHAR AS name WHERE FALSE").show()
 
     output = capsys.readouterr().out

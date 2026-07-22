@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 
 class TestDuckDBExecute:
@@ -54,7 +60,7 @@ class TestDuckDBExecute:
 
         # Prepared parameter used in a statement that is not the last
         with pytest.raises(
-            duckdb.NotImplementedException, match="Prepared parameters are only supported for the last statement"
+            vane.NotImplementedException, match="Prepared parameters are only supported for the last statement"
         ):
             duckdb_cursor.execute(
                 """

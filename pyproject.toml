@@ -14,7 +14,7 @@ license-files = [
     "LICENSE",
     "NOTICE",
     "LICENSES/*.txt",
-    "duckdb/experimental/spark/LICENSE",
+    "vane/experimental/spark/LICENSE",
     "external/duckdb/LICENSE",
     "external/duckdb/src/include/duckdb/storage/compression/alp/algorithm/LICENSE",
     "external/duckdb/src/include/duckdb/storage/compression/alprd/algorithm/LICENSE",
@@ -106,10 +106,9 @@ ninja.make-fallback = false
 
 [tool.scikit-build.wheel]
 cmake = true
-packages.duckdb = "duckdb"
 packages.vane = "vane"
-packages.adbc_driver_duckdb = "adbc_driver_duckdb"
-packages._duckdb-stubs = "_duckdb-stubs"
+packages.vane_adbc_driver_duckdb = "vane_adbc_driver_duckdb"
+packages._vane_duckdb-stubs = "_vane_duckdb-stubs"
 exclude = [
     # Runtime shuffle data can live under the Python package during local runs.
     "vane/session_*/",
@@ -175,6 +174,7 @@ include = [
     "/MAINTAINERS.md",
     "/RELEASE.md",
     "/ROADMAP.md",
+    "/COMPATIBILITY.md",
     "/DUCKDB_SOURCE_ID",
 
     # Build configuration
@@ -204,14 +204,14 @@ include = [
     "/tests/fast/test_ray_cpp_bindings.py",
     "/tests/fast/test_ray_result_contract.py",
     "/tests/fast/test_fte_production_readiness.py",
+    "/tests/packaging/test_duckdb_distribution_coexistence.py",
     "/multimodal_inference_benchmarks/check_fte_production_readiness.py",
 
     # Source code and stubs
     "src/**",
-    "duckdb/**",
     "vane/**",
-    "adbc_driver_duckdb/**",
-    "_duckdb-stubs/*.pyi",
+    "vane_adbc_driver_duckdb/**",
+    "_vane_duckdb-stubs/*.pyi",
 
     # -------------- DuckDB subtree includes
     # Core DuckDB source and build system
@@ -478,43 +478,81 @@ filterwarnings = [
 ]
 
 [tool.mypy]
-packages = ["duckdb", "_duckdb"]
+packages = ["vane", "_vane_duckdb"]
 strict = true
 warn_unreachable = true
 pretty = true
 python_version = "3.10"
 exclude = [
-    "duckdb/experimental/", # not checking the pyspark API
-    "duckdb/query_graph/",  # old and unmaintained (should probably remove)
+    "vane/experimental/", # not checking the pyspark API
+    "vane/query_graph/",  # old and unmaintained (should probably remove)
     "tests", "scripts",
 ]
 
 [[tool.mypy.overrides]]
-module = "duckdb.experimental.*"
+module = "vane.experimental.*"
 ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = [
+    "_vane_duckdb",
+    "_vane_duckdb.*",
+    "anthropic",
+    "anthropic.*",
+    "cloudpickle",
+    "cloudpickle.*",
+    "decord",
+    "decord.*",
     "fsspec.*",
+    "google",
+    "google.*",
     "pandas",
+    "PIL",
+    "PIL.*",
     "polars",
+    "psutil",
     "pyarrow.*",
     "ray",
     "ray.*",
+    "sentence_transformers",
+    "sentence_transformers.*",
     "torch",
     "tensorflow",
+    "transformers",
+    "transformers.*",
     "vllm",
     "vllm.*",
 ]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "duckdb.filesystem"
+# These modules retain pre-existing strict-mypy debt from the embedded DuckDB
+# and distributed runtime trees. Keep the clean remainder of the newly unified
+# `vane` namespace checked while that debt is paid down incrementally.
+module = [
+    "vane._env",
+    "vane._expression_udf",
+    "vane.ai",
+    "vane.ai.*",
+    "vane.config",
+    "vane.datasource",
+    "vane.datasource.*",
+    "vane.dependencies",
+    "vane.execution",
+    "vane.execution.*",
+    "vane.expressions",
+    "vane.runners",
+    "vane.runners.*",
+]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "vane.filesystem"
 disallow_subclassing_any = false
 
 [tool.coverage.run]
 branch = true
-source = ["duckdb"]
+source = ["vane"]
 
 [tool.ruff]
 line-length = 120
@@ -549,7 +587,7 @@ ban-relative-imports = "all"
 strict = true
 
 [tool.ruff.lint.per-file-ignores]
-"duckdb/experimental/spark/**.py" = [
+"vane/experimental/spark/**.py" = [
     # No need for moduledocstrings for spark
     'D100',
     # Ignore boolean positional args in the Spark API

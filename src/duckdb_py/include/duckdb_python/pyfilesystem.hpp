@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Modified by Vane contributors.
+
 #pragma once
 
 #include "duckdb/common/file_system.hpp"
@@ -17,7 +23,7 @@ public:
 
 public:
 	static bool check_(const py::handle &object) {
-		return py::isinstance(object, py::module::import("duckdb.filesystem").attr("ModifiedMemoryFileSystem"));
+		return py::isinstance(object, py::module::import("vane.filesystem").attr("ModifiedMemoryFileSystem"));
 	}
 };
 

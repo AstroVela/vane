@@ -1,9 +1,15 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 
 import numpy as np
 import pytest
 
-import duckdb
+import vane
 
 pd = pytest.importorskip("pandas", "2.0.0")
 pytest.importorskip("pyarrow")
@@ -15,7 +21,7 @@ class TestPandasArrow:
     def test_pandas_arrow(self, duckdb_cursor):
         pd = pytest.importorskip("pandas")
         df = pd.DataFrame({"a": pd.Series([5, 4, 3])}).convert_dtypes()  # noqa: F841
-        con = duckdb.connect()
+        con = vane.connect()
         res = con.sql("select * from df").fetchall()
         assert res == [(5,), (4,), (3,)]
 
@@ -36,9 +42,9 @@ class TestPandasArrow:
             }
         )
         pyarrow_df = df.convert_dtypes(dtype_backend="pyarrow")  # noqa: F841
-        con = duckdb.connect()
+        con = vane.connect()
         with pytest.raises(
-            duckdb.InvalidInputException, match=r"The dataframe could not be converted to a pyarrow\.lib\.Table"
+            vane.InvalidInputException, match=r"The dataframe could not be converted to a pyarrow\.lib\.Table"
         ):
             res = con.sql("select * from pyarrow_df").fetchall()  # noqa: F841
 
@@ -65,7 +71,7 @@ class TestPandasArrow:
         assert isinstance(df.dtypes["python"], np.dtype("O").__class__)
 
         with pytest.raises(
-            duckdb.InvalidInputException, match=r"The dataframe could not be converted to a pyarrow\.lib\.Table"
+            vane.InvalidInputException, match=r"The dataframe could not be converted to a pyarrow\.lib\.Table"
         ):
             con.sql("select * from df").fetchall()
 
@@ -87,7 +93,7 @@ class TestPandasArrow:
         )
         pyarrow_df = df.convert_dtypes(dtype_backend="pyarrow")  # noqa: F841
 
-        con = duckdb.connect()
+        con = vane.connect()
         res = con.sql("select * from pyarrow_df").fetchall()
         assert res == []
 
@@ -105,7 +111,7 @@ class TestPandasArrow:
         )
         pyarrow_df = df.convert_dtypes(dtype_backend="pyarrow")  # noqa: F841
 
-        con = duckdb.connect()
+        con = vane.connect()
         res = con.sql("select * from pyarrow_df").fetchall()
         assert res == [(None,), (None,), (None,)]
 
@@ -124,7 +130,7 @@ class TestPandasArrow:
             }
         )
         pyarrow_df = df.convert_dtypes(dtype_backend="pyarrow")  # noqa: F841
-        con = duckdb.connect()
+        con = vane.connect()
         res = con.sql("select * from pyarrow_df").fetchone()
         assert res == (
             4.123123,

@@ -37,7 +37,6 @@ import numpy as np
 import pyarrow as pa
 from PIL import Image, ImageDraw, ImageFilter
 
-import duckdb
 import vane
 
 DEFAULT_OUTPUT_DIR = Path("examples/output/querying_images")
@@ -137,13 +136,12 @@ def relation_from_rows(conn: Any, rows: list[dict[str, Any]]) -> Any:
     if not rows:
         raise RuntimeError("Cannot create a relation from zero rows.")
     columns = list(rows[0])
-    constant = duckdb.ConstantExpression
+    constant = vane.ConstantExpression
     raw = conn.values(
         *(tuple(constant(row[column]) for column in columns) for row in rows),
     )
     projections = [
-        f'{quote_ident(source)} AS {quote_ident(column)}'
-        for source, column in zip(raw.columns, columns, strict=True)
+        f"{quote_ident(source)} AS {quote_ident(column)}" for source, column in zip(raw.columns, columns, strict=True)
     ]
     return raw.query("input_rows", f"select {', '.join(projections)} from input_rows")
 
@@ -431,15 +429,15 @@ def run(args: argparse.Namespace) -> None:
     analyzed = rel.map_batches(
         analyzer.__call__,
         schema={
-            "id": duckdb.sqltypes.BIGINT,
-            "path": duckdb.sqltypes.VARCHAR,
-            "size": duckdb.sqltypes.BIGINT,
-            "width": duckdb.sqltypes.BIGINT,
-            "height": duckdb.sqltypes.BIGINT,
-            "red_pixels": duckdb.sqltypes.BIGINT,
-            "red_fraction": duckdb.sqltypes.DOUBLE,
-            "preview_png": duckdb.sqltypes.BLOB,
-            "red_mask_png": duckdb.sqltypes.BLOB,
+            "id": vane.sqltypes.BIGINT,
+            "path": vane.sqltypes.VARCHAR,
+            "size": vane.sqltypes.BIGINT,
+            "width": vane.sqltypes.BIGINT,
+            "height": vane.sqltypes.BIGINT,
+            "red_pixels": vane.sqltypes.BIGINT,
+            "red_fraction": vane.sqltypes.DOUBLE,
+            "preview_png": vane.sqltypes.BLOB,
+            "red_mask_png": vane.sqltypes.BLOB,
         },
         batch_size=args.batch_size,
     )

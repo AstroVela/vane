@@ -32,6 +32,14 @@ EXPECTED_NAME = str(PROJECT_METADATA["name"])
 EXPECTED_VERSION = str(PROJECT_METADATA["version"])
 MAX_ARTIFACT_BYTES = 100 * 1024 * 1024
 GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+PRIVATE_EXTENSION_NAME = re.compile(r"_vane_duckdb(?:[.].+)?[.](?:pyd|so)")
+OFFICIAL_DUCKDB_TOP_LEVEL = frozenset(
+    {
+        "duckdb",
+        "_duckdb-stubs",
+        "adbc_driver_duckdb",
+    }
+)
 
 BANNED_PATH_PARTS = (
     "/.git/",
@@ -221,6 +229,7 @@ def _check_sdist(artifact: SdistArtifact) -> None:
     names = artifact.names()
     required_paths = (
         "DUCKDB_SOURCE_ID",
+        "COMPATIBILITY.md",
         "LICENSE",
         "NOTICE",
         "THIRD_PARTY.md",
@@ -234,6 +243,7 @@ def _check_sdist(artifact: SdistArtifact) -> None:
         "tests/ray_test_profile.py",
         "tests/fast/test_package_metadata.py",
         "tests/fast/test_ray_test_profile.py",
+        "tests/packaging/test_duckdb_distribution_coexistence.py",
     )
     for relative_path in required_paths:
         _require_sdist_path(names, relative_path, artifact.path)
@@ -274,6 +284,26 @@ def _check_wheel_record(artifact: WheelArtifact) -> None:
         raise ValueError(f"{artifact.path}: files missing from RECORD: {sorted(missing)}")
 
 
+def _check_wheel_namespace(artifact: WheelArtifact) -> None:
+    top_level = {PurePosixPath(name).parts[0] for name in artifact.names() if PurePosixPath(name).parts}
+    conflicting = sorted(
+        name
+        for name in top_level
+        if name in OFFICIAL_DUCKDB_TOP_LEVEL or name == "_duckdb" or name.startswith("_duckdb.")
+    )
+    if conflicting:
+        raise ValueError(f"{artifact.path}: wheel claims official DuckDB paths: {conflicting}")
+
+    required = {"vane", "_vane_duckdb-stubs", "vane_adbc_driver_duckdb"}
+    missing = required - top_level
+    if missing:
+        raise ValueError(f"{artifact.path}: wheel is missing private Vane package paths: {sorted(missing)}")
+
+    extensions = sorted(name for name in top_level if PRIVATE_EXTENSION_NAME.fullmatch(name))
+    if len(extensions) != 1:
+        raise ValueError(f"{artifact.path}: expected one private _vane_duckdb extension, found {extensions}")
+
+
 def _check_wheel(artifact: WheelArtifact) -> None:
     names = artifact.names()
     required_suffixes = (
@@ -281,7 +311,7 @@ def _check_wheel(artifact: WheelArtifact) -> None:
         ".dist-info/licenses/NOTICE",
         ".dist-info/licenses/LICENSES/DuckDB-MIT.txt",
         ".dist-info/licenses/LICENSES/vcpkg-binary-dependencies.txt",
-        ".dist-info/licenses/duckdb/experimental/spark/LICENSE",
+        ".dist-info/licenses/vane/experimental/spark/LICENSE",
         ".dist-info/licenses/external/duckdb/LICENSE",
         ".dist-info/licenses/external/duckdb/src/include/duckdb/storage/compression/alp/algorithm/LICENSE",
         ".dist-info/licenses/external/duckdb/src/include/duckdb/storage/compression/alprd/algorithm/LICENSE",
@@ -290,6 +320,7 @@ def _check_wheel(artifact: WheelArtifact) -> None:
         _require_suffix(names, suffix, artifact.path)
     metadata = _check_metadata(artifact, ".dist-info/METADATA")
     _check_wheel_license_files(artifact, metadata)
+    _check_wheel_namespace(artifact)
     _check_wheel_record(artifact)
 
 

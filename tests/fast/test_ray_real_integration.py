@@ -8,7 +8,7 @@ try:
 except Exception:
     ray = None
 
-import duckdb
+import vane
 
 
 def _collect_rows_from_parts(parts):
@@ -34,13 +34,13 @@ def _collect_rows_from_parts(parts):
 @pytest.mark.skipif(ray is None, reason="ray not installed")
 @pytest.mark.usefixtures("ray_local")
 def test_run_simple_plan_on_ray_local():
-    from duckdb import runners as _runners
+    from vane import runners as _runners
 
     _runners.set_runner_ray(noop_if_initialized=True)
     runner = _runners.get_or_create_runner()
     assert getattr(runner, "name", None) == "ray"
 
-    relation = duckdb.sql("SELECT a, b, a + b AS sum FROM (VALUES (1, 10), (2, 20), (3, 30)) AS t(a, b)")
+    relation = vane.sql("SELECT a, b, a + b AS sum FROM (VALUES (1, 10), (2, 20), (3, 30)) AS t(a, b)")
     parts = list(runner.run_iter_tables(relation, results_buffer_size=1))
     assert parts
     rows = sorted(_collect_rows_from_parts(parts))
@@ -50,14 +50,14 @@ def test_run_simple_plan_on_ray_local():
 @pytest.mark.skipif(ray is None, reason="ray not installed")
 @pytest.mark.usefixtures("ray_local")
 def test_run_distributed_plan_end_to_end_on_ray_local(tmp_path):
-    from duckdb import runners as _runners
+    from vane import runners as _runners
 
     _runners.set_runner_ray(noop_if_initialized=True)
 
     # Build a small parquet-backed relation with multiple planner partitions.
     n = 12
     path = tmp_path / "ray_real_integration_input.parquet"
-    duckdb.sql(
+    vane.sql(
         f"""
         COPY (
             SELECT
@@ -67,7 +67,7 @@ def test_run_distributed_plan_end_to_end_on_ray_local(tmp_path):
         ) TO '{path}' (FORMAT PARQUET)
         """
     )
-    relation = duckdb.sql(f"SELECT a, b, a + b AS sum FROM read_parquet('{path}')")
+    relation = vane.sql(f"SELECT a, b, a + b AS sum FROM read_parquet('{path}')")
 
     runner = _runners.get_or_create_runner()
     assert getattr(runner, "name", None) == "ray"

@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 pytest.importorskip("pyarrow")
 
@@ -25,7 +31,7 @@ class TestArrowFetch:
         if not can_run:
             return
 
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
         duckdb_conn.execute("CREATE TABLE test (a  INTEGER)")
 
         check_equal(duckdb_conn)
@@ -34,7 +40,7 @@ class TestArrowFetch:
         if not can_run:
             return
 
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
 
         duckdb_conn.execute("CREATE TABLE test (a  INTEGER)")
         for value in range(10000):
@@ -47,7 +53,7 @@ class TestArrowFetch:
         if not can_run:
             return
 
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
 
         duckdb_conn.execute("CREATE TABLE test (a  INTEGER)")
         duckdb_conn.execute("INSERT INTO  test VALUES(NULL);")
@@ -58,7 +64,7 @@ class TestArrowFetch:
         if not can_run:
             return
 
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
 
         duckdb_conn.execute("CREATE TABLE test (a  INTEGER)")
         duckdb_conn.execute("INSERT INTO  test VALUES(1);")
@@ -69,7 +75,7 @@ class TestArrowFetch:
         if not can_run:
             return
 
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
 
         duckdb_conn.execute("CREATE TABLE test (a  INTEGER)")
         duckdb_conn.execute("PREPARE s1 AS INSERT INTO test VALUES ($1), ($2 / 2)")
@@ -83,7 +89,7 @@ class TestArrowFetch:
         if not can_run:
             return
 
-        duckdb_cursor = duckdb.connect()
+        duckdb_cursor = vane.connect()
         duckdb_cursor.execute("CREATE table t as select range a from range(3000);")
         relation = duckdb_cursor.table("t")
         arrow_tbl = relation.to_arrow_table()

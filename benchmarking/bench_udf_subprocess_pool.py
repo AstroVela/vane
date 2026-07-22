@@ -31,7 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import duckdb  # noqa: E402
+import vane  # noqa: E402
 
 RAY_BACKENDS = ("ray_task",)
 
@@ -103,7 +103,7 @@ def _make_udf_and_schema(workload: str, backend: str, args: argparse.Namespace):
                 def __init__(self) -> None:
                     super().__init__(sleep_ms)
 
-            return SleepActorUDF, {"y": duckdb.sqltypes.BIGINT}
+            return SleepActorUDF, {"y": vane.sqltypes.BIGINT}
 
         sleep_s = float(args.sleep_ms) / 1000.0
 
@@ -111,7 +111,7 @@ def _make_udf_and_schema(workload: str, backend: str, args: argparse.Namespace):
             time.sleep(sleep_s)
             return pa.table({"y": table.column("x")})
 
-        return sleep_udf, {"y": duckdb.sqltypes.BIGINT}
+        return sleep_udf, {"y": vane.sqltypes.BIGINT}
     if workload == "cpu":
         if _uses_actor_backend(backend):
             iterations = args.cpu_iterations
@@ -120,7 +120,7 @@ def _make_udf_and_schema(workload: str, backend: str, args: argparse.Namespace):
                 def __init__(self) -> None:
                     super().__init__(iterations)
 
-            return CpuActorUDF, {"y": duckdb.sqltypes.BIGINT}
+            return CpuActorUDF, {"y": vane.sqltypes.BIGINT}
 
         iterations = int(args.cpu_iterations)
 
@@ -133,11 +133,11 @@ def _make_udf_and_schema(workload: str, backend: str, args: argparse.Namespace):
                 out.append(acc)
             return pa.table({"y": pa.array(out, type=pa.int64())})
 
-        return cpu_udf, {"y": duckdb.sqltypes.BIGINT}
+        return cpu_udf, {"y": vane.sqltypes.BIGINT}
     if workload == "arrow":
         schema = {
-            "x": duckdb.sqltypes.BIGINT,
-            "payload": duckdb.sqltypes.VARCHAR,
+            "x": vane.sqltypes.BIGINT,
+            "payload": vane.sqltypes.VARCHAR,
         }
         if _uses_actor_backend(backend):
             return ArrowIdentityUDF, schema
@@ -149,7 +149,7 @@ def _make_udf_and_schema(workload: str, backend: str, args: argparse.Namespace):
     raise ValueError(f"unknown workload: {workload}")
 
 
-def _make_relation(con: duckdb.DuckDBPyConnection, workload: str, rows: int, payload_bytes: int):
+def _make_relation(con: vane.DuckDBPyConnection, workload: str, rows: int, payload_bytes: int):
     if workload == "arrow":
         return con.sql(
             "select i::BIGINT as x, repeat('x', %d) as payload from range(%d) t(i)" % (int(payload_bytes), int(rows))
@@ -163,7 +163,7 @@ def _run_once(
     actor_number: int | None,
     args: argparse.Namespace,
 ) -> tuple[float, int]:
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         rel = _make_relation(con, workload, args.rows, args.payload_bytes)
         udf, schema = _make_udf_and_schema(workload, backend, args)

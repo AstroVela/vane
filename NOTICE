@@ -13,6 +13,16 @@ Portions of Vane are derived from DuckDB:
   License: MIT
   https://github.com/duckdb/duckdb
 
+The Vane ADBC facade includes software developed by the Apache Arrow ADBC
+project:
+
+  Apache Arrow ADBC
+  Copyright 2022-2026 The Apache Software Foundation
+  https://arrow.apache.org/adbc/
+
+This product includes software developed at
+The Apache Software Foundation (http://www.apache.org/).
+
 Vane is not affiliated with, endorsed by, or maintained by the DuckDB
 Foundation. DuckDB is a trademark of the DuckDB Foundation.
 

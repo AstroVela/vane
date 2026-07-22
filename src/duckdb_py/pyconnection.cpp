@@ -99,7 +99,7 @@ std::string DuckDBPyConnection::formatted_python_version = "";
 namespace {
 
 static string PicklePythonUDFCallable(const py::function &udf) {
-	auto pickle_module = py::module_::import("duckdb.pickle");
+	auto pickle_module = py::module_::import("vane.pickle");
 	auto dumps = pickle_module.attr("dumps");
 	bool annotations_rewritten = false;
 	py::object original_annotations;
@@ -979,7 +979,7 @@ void DuckDBPyConnection::ApplyDistributedPythonUDFRegistrations(const py::object
 		throw InvalidInputException("distributed Python UDF registrations must be iterable");
 	}
 
-	auto pickle_module = py::module_::import("duckdb.pickle");
+	auto pickle_module = py::module_::import("vane.pickle");
 	auto loads = pickle_module.attr("loads");
 
 	for (auto item : py::iterable(registrations_obj)) {
@@ -3086,7 +3086,7 @@ ModifiedMemoryFileSystem &DuckDBPyConnection::GetObjectFileSystem() {
 	if (!internal_object_filesystem) {
 		D_ASSERT(!FileSystemIsRegistered("VANE_INTERNAL_OBJECTSTORE"));
 		auto &import_cache_py = *ImportCache();
-		auto modified_memory_fs = import_cache_py.duckdb.filesystem.ModifiedMemoryFileSystem();
+		auto modified_memory_fs = import_cache_py.vane.filesystem.ModifiedMemoryFileSystem();
 		if (modified_memory_fs.ptr() == nullptr) {
 			throw InvalidInputException(
 			    "This operation could not be completed because required module 'fsspec' is not installed");

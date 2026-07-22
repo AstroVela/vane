@@ -7,11 +7,11 @@ pytest.importorskip("pyarrow")
 
 import pyarrow as pa
 
-import duckdb
+import vane
 
 
 def test_create_function_rejects_removed_process_and_ray_args():
-    con = duckdb.connect()
+    con = vane.connect()
 
     def add_one(value):
         return value + 1
@@ -38,7 +38,7 @@ def test_create_function_rejects_removed_process_and_ray_args():
 
 
 def test_map_batches_rejects_removed_process_and_actor_count_args():
-    con = duckdb.connect()
+    con = vane.connect()
 
     def add_one(table):
         values = table.column(0).to_pylist()
@@ -49,21 +49,21 @@ def test_map_batches_rejects_removed_process_and_actor_count_args():
     with pytest.raises(TypeError):
         rel.map_batches(
             add_one,
-            schema={"out": duckdb.sqltypes.BIGINT},
+            schema={"out": vane.sqltypes.BIGINT},
             use_process=True,
         )
 
     with pytest.raises(TypeError):
         rel.map_batches(
             add_one,
-            schema={"out": duckdb.sqltypes.BIGINT},
+            schema={"out": vane.sqltypes.BIGINT},
             actor_count=1,
         )
 
 
 def test_ray_task_map_batches_local_execution_is_rejected(monkeypatch):
     monkeypatch.setenv("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
-    con = duckdb.connect()
+    con = vane.connect()
 
     def add_ten(table):
         values = table.column(0).to_pylist()
@@ -71,7 +71,7 @@ def test_ray_task_map_batches_local_execution_is_rejected(monkeypatch):
 
     relation = con.sql("select i from range(0, 5) t(i)").map_batches(
         add_ten,
-        schema={"out": duckdb.sqltypes.BIGINT},
+        schema={"out": vane.sqltypes.BIGINT},
         execution_backend="ray_task",
         batch_size=2,
     )
@@ -81,7 +81,7 @@ def test_ray_task_map_batches_local_execution_is_rejected(monkeypatch):
 
 
 def test_flat_map_rejects_removed_actor_count_arg():
-    con = duckdb.connect()
+    con = vane.connect()
 
     def expand(row):
         return [{"out": row["i"]}, {"out": row["i"] + 10}]
@@ -89,6 +89,6 @@ def test_flat_map_rejects_removed_actor_count_arg():
     with pytest.raises(TypeError):
         con.sql("select i from range(0, 2) t(i)").flat_map(
             expand,
-            schema={"out": duckdb.sqltypes.BIGINT},
+            schema={"out": vane.sqltypes.BIGINT},
             actor_count=1,
         )

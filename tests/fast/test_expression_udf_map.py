@@ -12,7 +12,6 @@ import pytest
 
 
 def test_expression_helpers_and_vane_func_are_public():
-    import duckdb
     import vane
 
     assert "func" in vane.__all__
@@ -23,9 +22,9 @@ def test_expression_helpers_and_vane_func_are_public():
     assert callable(vane.func)
     assert callable(vane.func.batch)
 
-    assert isinstance(vane.col("x"), duckdb.Expression)
-    assert isinstance(vane.lit(1), duckdb.Expression)
-    assert isinstance(vane.sql_expr("x + 1"), duckdb.Expression)
+    assert isinstance(vane.col("x"), vane.Expression)
+    assert isinstance(vane.lit(1), vane.Expression)
+    assert isinstance(vane.sql_expr("x + 1"), vane.Expression)
 
     con = vane.connect()
     out = con.sql("select 2::INTEGER as x").select((vane.col("x") + vane.lit(3)).alias("y"))
@@ -204,7 +203,7 @@ def test_vane_function_bound_instance_method_allows_literal_keyword_arguments():
 
 def test_vane_function_bound_instance_method_pickle_round_trip():
     import vane
-    from duckdb.pickle import dumps, loads
+    from vane.pickle import dumps, loads
 
     class Scaler:
         def __init__(self, factor: int) -> None:

@@ -40,7 +40,6 @@ from typing import Any
 import pyarrow as pa
 from pydantic import BaseModel, Field
 
-import duckdb
 import vane
 from vane.ai import prompt
 
@@ -238,7 +237,7 @@ def relation_from_rows(
     if not rows:
         raise RuntimeError("Cannot create a relation from zero rows.")
     columns = list(schema)
-    constant = duckdb.ConstantExpression
+    constant = vane.ConstantExpression
     raw = conn.values(
         *(tuple(constant(row[column]) for column in columns) for row in rows),
     )

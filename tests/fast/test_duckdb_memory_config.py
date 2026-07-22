@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-from duckdb.runners.fte.memory_config import (
+from vane.runners.fte.memory_config import (
     apply_duckdb_memory_limit,
     duckdb_memory_limit_sql,
 )
-from duckdb.runners.local.runner import _InProcessFragmentExecutor
-from duckdb.runners.ray.worker import _configure_ray_worker_conn
+from vane.runners.local.runner import _InProcessFragmentExecutor
+from vane.runners.ray.worker import _configure_ray_worker_conn
 
 
 class _FakeConn:

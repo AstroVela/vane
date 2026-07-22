@@ -1,29 +1,35 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 from decimal import Decimal
 from uuid import UUID
 
 import pytest
 
-import duckdb
+import vane
 
 
 class TestDBApiFetch:
     def test_multiple_fetch_one(self, duckdb_cursor):
-        con = duckdb.connect()
+        con = vane.connect()
         c = con.execute("SELECT 42")
         assert c.fetchone() == (42,)
         assert c.fetchone() is None
         assert c.fetchone() is None
 
     def test_multiple_fetch_all(self, duckdb_cursor):
-        con = duckdb.connect()
+        con = vane.connect()
         c = con.execute("SELECT 42")
         assert c.fetchall() == [(42,)]
         assert c.fetchall() == []
         assert c.fetchall() == []
 
     def test_multiple_fetch_many(self, duckdb_cursor):
-        con = duckdb.connect()
+        con = vane.connect()
         c = con.execute("SELECT 42")
         assert c.fetchmany(1000) == [(42,)]
         assert c.fetchmany(1000) == []
@@ -31,7 +37,7 @@ class TestDBApiFetch:
 
     def test_multiple_fetch_df(self, duckdb_cursor):
         pd = pytest.importorskip("pandas")
-        con = duckdb.connect()
+        con = vane.connect()
         c = con.execute("SELECT 42::BIGINT AS a")
         pd.testing.assert_frame_equal(c.df(), pd.DataFrame.from_dict({"a": [42]}))
         assert c.df() is None
@@ -40,7 +46,7 @@ class TestDBApiFetch:
     def test_multiple_fetch_arrow(self, duckdb_cursor):
         pd = pytest.importorskip("pandas")
         pytest.importorskip("pyarrow")
-        con = duckdb.connect()
+        con = vane.connect()
         c = con.execute("SELECT 42::BIGINT AS a")
         table = c.to_arrow_table()
         df = table.to_pandas()
@@ -49,12 +55,12 @@ class TestDBApiFetch:
         assert c.to_arrow_table() is None
 
     def test_multiple_close(self, duckdb_cursor):
-        con = duckdb.connect()
+        con = vane.connect()
         c = con.execute("SELECT 42")
         c.close()
         c.close()
         c.close()
-        with pytest.raises(duckdb.InvalidInputException, match="No open result set"):
+        with pytest.raises(vane.InvalidInputException, match="No open result set"):
             c.fetchall()
 
     def test_multiple_fetch_all_relation(self, duckdb_cursor):

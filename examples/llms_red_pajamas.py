@@ -30,7 +30,6 @@ from typing import Any
 import numpy as np
 import pyarrow as pa
 
-import duckdb
 import vane
 from vane.ai import embed_text
 
@@ -101,7 +100,7 @@ def relation_from_rows(
     if not rows:
         raise RuntimeError("Cannot create a relation from zero rows.")
     columns = list(schema or rows[0])
-    constant = duckdb.ConstantExpression
+    constant = vane.ConstantExpression
     raw = conn.values(
         *(tuple(constant(row[column]) for column in columns) for row in rows),
     )

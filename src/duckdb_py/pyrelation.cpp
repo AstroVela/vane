@@ -1031,7 +1031,7 @@ static py::object GetOrCreateRunnerForDB(const shared_ptr<Relation> &rel, const 
 	}
 
 	// Create runner outside the lock (Python calls may be slow)
-	auto runners_mod = py::module::import("duckdb.runners");
+	auto runners_mod = py::module::import("vane.runners");
 	py::object runner;
 	if (runner_type == "ray") {
 		// noop_if_initialized=true: reuse existing Ray runner if one was
@@ -1287,7 +1287,7 @@ PolarsDataFrame DuckDBPyRelation::ToPolars(idx_t batch_size, bool lazy) {
 		    pybind11::module_::import("polars").attr("from_arrow")(arrow, py::arg("rechunk") = false));
 	}
 	auto &import_cache = *DuckDBPyConnection::ImportCache();
-	auto lazy_frame_produce = import_cache.duckdb.polars_io.duckdb_source();
+	auto lazy_frame_produce = import_cache.vane.polars_io.duckdb_source();
 	//  We also have to get a polars schema here, for this we can get at empty arrow table
 	// We start by extracting the arrow schema
 	ArrowSchema arrow_schema;
@@ -2371,7 +2371,7 @@ bool DuckDBPyRelation::TryPrintDistributed(const BoxRendererConfig &config) {
 		}
 		arrow_table = arrow_table.attr("rename_columns")(scan_names);
 
-		auto duckdb_module = py::module_::import("duckdb");
+		auto duckdb_module = py::module_::import("vane");
 		auto local_relation_obj = duckdb_module.attr("from_arrow")(arrow_table);
 		auto &local_relation = local_relation_obj.cast<DuckDBPyRelation &>();
 		result = local_relation.ExecuteInternal();

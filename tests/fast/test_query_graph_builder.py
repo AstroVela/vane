@@ -3,9 +3,9 @@
 
 import pytest
 
-from duckdb.runners.ray.cluster_resource_coordinator import ActorResourceBundle
-from duckdb.runners.ray.query_execution_graph import ResourceVector
-from duckdb.runners.ray.query_graph_builder import (
+from vane.runners.ray.cluster_resource_coordinator import ActorResourceBundle
+from vane.runners.ray.query_execution_graph import ResourceVector
+from vane.runners.ray.query_graph_builder import (
     build_query_demand,
     build_query_execution_graph,
     fte_stage_id_for_fragment,

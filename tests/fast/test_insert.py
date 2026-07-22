@@ -1,13 +1,19 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pandas as pd
 
-import duckdb
+import vane
 
 
 class TestInsert:
     def test_insert(self):
         test_df = pd.DataFrame({"i": [1, 2, 3], "j": ["one", "two", "three"]})
         # connect to an in-memory temporary database
-        conn = duckdb.connect()
+        conn = vane.connect()
         # get a cursor
         cursor = conn.cursor()
         conn.execute("CREATE TABLE test (i INTEGER, j STRING)")

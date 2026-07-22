@@ -102,7 +102,7 @@ def _run_relation_benchmark(script_name: str, rel, *, distributed: bool = False)
     print("Running benchmark...")
     start_time = time.perf_counter()
     if distributed:
-        from duckdb.runners import get_or_create_runner
+        from vane.runners import get_or_create_runner
 
         runner = get_or_create_runner()
         tables = list(runner.run_iter_tables(rel))

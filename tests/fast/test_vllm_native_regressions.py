@@ -102,12 +102,12 @@ class _DeferredWakeupExecutor(_RecordingExecutor):
 
 
 def _run_recording_sql(monkeypatch, prompts, options, *, executor=None, threads=1):
-    import duckdb
-    import duckdb.execution.vllm as vllm
+    import vane
+    import vane.execution.vllm as vllm
 
     executor = executor or _RecordingExecutor()
     monkeypatch.setattr(vllm, "build_executor", lambda *_args, **_kwargs: executor)
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.execute(f"PRAGMA threads={threads}")
         con.register(
@@ -158,15 +158,15 @@ def test_native_bucket_prefix_ends_on_a_complete_utf8_character(monkeypatch, pro
 
 
 def test_native_bridge_rejects_zero_batch_size_even_if_python_normalization_is_bypassed(monkeypatch):
-    import duckdb
-    import duckdb.execution.vllm as vllm
+    import vane
+    import vane.execution.vllm as vllm
 
     invalid = vllm.normalize_options({})
     invalid["batch_size"] = 0
     monkeypatch.setattr(vllm, "normalize_options", lambda _options: invalid)
     monkeypatch.setattr(vllm, "build_executor", lambda *_args, **_kwargs: _RecordingExecutor())
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         with pytest.raises(Exception, match="batch_size"):
             con.execute("SELECT vllm('hello', 'recording-model')").fetchall()
@@ -224,8 +224,8 @@ import json
 import threading
 from collections import deque
 
-import duckdb
-import duckdb.execution.vllm as vllm
+import vane
+import vane.execution.vllm as vllm
 
 
 class Fake:
@@ -309,7 +309,7 @@ options = json.dumps(
     },
     separators=(",", ":"),
 )
-con = duckdb.connect()
+con = vane.connect()
 try:
     con.execute("PRAGMA threads=2")
     con.execute(

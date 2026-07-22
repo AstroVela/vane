@@ -713,7 +713,7 @@ public:
 
 		py::object table;
 		try {
-			auto helper = py::module_::import("duckdb.execution.ref_bundle").attr("materialize_ref_bundle");
+			auto helper = py::module_::import("vane.execution.ref_bundle").attr("materialize_ref_bundle");
 			table = helper(std::move(refs), std::move(slices), std::move(metadata), std::move(names));
 		} catch (const py::error_already_set &ex) {
 			throw InvalidInputException("external block materialization failed: %s", ex.what());
@@ -3123,9 +3123,9 @@ private:
 
 		py::object module;
 		try {
-			module = py::module_::import("duckdb.execution.unified_executor");
+			module = py::module_::import("vane.execution.unified_executor");
 		} catch (const py::error_already_set &ex) {
-			throw InvalidInputException("Failed to import duckdb.execution.unified_executor: %s", ex.what());
+			throw InvalidInputException("Failed to import vane.execution.unified_executor: %s", ex.what());
 		}
 		try {
 			py::object options = py::none();
@@ -3156,7 +3156,7 @@ private:
 		}
 		// Caller holds GIL
 		try {
-			auto module = py::module_::import("duckdb.execution.udf_stream_result_collector");
+			auto module = py::module_::import("vane.execution.udf_stream_result_collector");
 			auto collector_obj = module.attr("AsyncResultCollector")();
 			// Wire wakeup callback: when async collector completes an await,
 			// it calls this lambda which signals work_cv so the dispatcher

@@ -1,9 +1,15 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 # ruff: noqa: F841
 from pathlib import Path
 
 import pytest
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 pl = pytest.importorskip("polars")
@@ -37,7 +43,7 @@ def arrow_table_from_rel(rel):
     return rel.to_arrow_table()
 
 
-def arrow_reader_from_rel(rel: duckdb.DuckDBPyRelation):
+def arrow_reader_from_rel(rel: vane.DuckDBPyRelation):
     # Note: this has to executed first, otherwise we'll create a deadlock
     # Because it will try to execute the input at the same time as executing the relation
     # On the same connection (that's the core of the issue)
@@ -69,20 +75,20 @@ def from_arrow():
     return df
 
 
-def create_relation(conn, query: str) -> duckdb.DuckDBPyRelation:
+def create_relation(conn, query: str) -> vane.DuckDBPyRelation:
     df = pd.DataFrame({"a": [1, 2, 3]})
     return conn.sql(query)
 
 
 class TestReplacementScan:
     def test_csv_replacement(self):
-        con = duckdb.connect()
+        con = vane.connect()
         filename = str(Path(__file__).parent / "data" / "integers.csv")
         res = con.execute(f"select count(*) from '{filename}'")
         assert res.fetchone()[0] == 2
 
     def test_parquet_replacement(self):
-        con = duckdb.connect()
+        con = vane.connect()
         filename = str(Path(__file__).parent / "data" / "binary_string.parquet")
         res = con.execute(f"select count(*) from '{filename}'")
         assert res.fetchone()[0] == 3
@@ -104,7 +110,7 @@ class TestReplacementScan:
 
     def test_scan_global(self, duckdb_cursor):
         duckdb_cursor.execute("set python_enable_replacements=false")
-        with pytest.raises(duckdb.CatalogException, match="Table with name global_polars_df does not exist"):
+        with pytest.raises(vane.CatalogException, match="Table with name global_polars_df does not exist"):
             # We set the depth to look for global variables to 0 so it's never found
             duckdb_cursor.sql("select * from global_polars_df")
         duckdb_cursor.execute("set python_enable_replacements=true")
@@ -118,11 +124,11 @@ class TestReplacementScan:
 
         def inner_func(duckdb_cursor) -> None:
             duckdb_cursor.execute("set python_enable_replacements=false")
-            with pytest.raises(duckdb.CatalogException, match="Table with name df does not exist"):
+            with pytest.raises(vane.CatalogException, match="Table with name df does not exist"):
                 # We set the depth to look for local variables to 0 so it's never found
                 duckdb_cursor.sql("select * from df")
             duckdb_cursor.execute("set python_enable_replacements=true")
-            with pytest.raises(duckdb.CatalogException, match="Table with name df does not exist"):
+            with pytest.raises(vane.CatalogException, match="Table with name df does not exist"):
                 # Here it's still not found, because it's not visible to this frame
                 duckdb_cursor.sql("select * from df")
 
@@ -140,7 +146,7 @@ class TestReplacementScan:
 
         def inner_func(duckdb_cursor) -> None:
             duckdb_cursor.execute("set python_enable_replacements=true")
-            with pytest.raises(duckdb.CatalogException, match="Table with name df does not exist"):
+            with pytest.raises(vane.CatalogException, match="Table with name df does not exist"):
                 # We set the depth to look for local variables to 1 so it's still not found because it wasn't defined
                 # in this function
                 duckdb_cursor.sql("select * from df")
@@ -154,35 +160,35 @@ class TestReplacementScan:
         inner_func(duckdb_cursor)
 
     def test_replacement_scan_relapi(self):
-        con = duckdb.connect()
+        con = vane.connect()
         pyrel1 = con.query("from (values (42), (84), (120)) t(i)")
-        assert isinstance(pyrel1, duckdb.DuckDBPyRelation)
+        assert isinstance(pyrel1, vane.DuckDBPyRelation)
         assert pyrel1.fetchall() == [(42,), (84,), (120,)]
 
         pyrel2 = con.query("from pyrel1 limit 2")
-        assert isinstance(pyrel2, duckdb.DuckDBPyRelation)
+        assert isinstance(pyrel2, vane.DuckDBPyRelation)
         assert pyrel2.fetchall() == [(42,), (84,)]
 
         pyrel3 = con.query("select i + 100 from pyrel2")
-        assert type(pyrel3) is duckdb.DuckDBPyRelation
+        assert type(pyrel3) is vane.DuckDBPyRelation
         assert pyrel3.fetchall() == [(142,), (184,)]
 
     def test_replacement_scan_not_found(self):
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("set python_scan_all_frames=true")
-        with pytest.raises(duckdb.CatalogException, match="Table with name non_existant does not exist"):
+        with pytest.raises(vane.CatalogException, match="Table with name non_existant does not exist"):
             con.sql("select * from non_existant").fetchall()
 
     def test_replacement_scan_alias(self):
-        con = duckdb.connect()
+        con = vane.connect()
         pyrel1 = con.query("from (values (1, 2)) t(i, j)")
         pyrel2 = con.query("from (values (1, 10)) t(i, k)")
         pyrel3 = con.query("from pyrel1 join pyrel2 using(i)")
-        assert type(pyrel3) is duckdb.DuckDBPyRelation
+        assert type(pyrel3) is vane.DuckDBPyRelation
         assert pyrel3.fetchall() == [(1, 2, 10)]
 
     def test_replacement_scan_pandas_alias(self):
-        con = duckdb.connect()
+        con = vane.connect()
         df1 = con.query("from (values (1, 2)) t(i, j)").df()
         df2 = con.query("from (values (1, 10)) t(i, k)").df()
         df3 = con.query("from df1 join df2 using(i)")
@@ -213,9 +219,9 @@ class TestReplacementScan:
 
     def test_replacement_scan_fail(self):
         random_object = "I love salmiak rondos"
-        con = duckdb.connect()
+        con = vane.connect()
         with pytest.raises(
-            duckdb.InvalidInputException,
+            vane.InvalidInputException,
             match=r'Python Object "random_object" of type "str" found on line .* not suitable for replacement scans.',
         ):
             con.execute("select count(*) from random_object").fetchone()
@@ -349,7 +355,7 @@ class TestReplacementScan:
 
         # TODO: this should be fixed in the future, likely by unifying the behavior of  # noqa: TD002, TD003
         #  .sql and .execute
-        with pytest.raises(duckdb.CatalogException, match="Table with name df does not exist"):
+        with pytest.raises(vane.CatalogException, match="Table with name df does not exist"):
             rel = duckdb_cursor.sql("select * from v1")
 
     def test_recursive_cte(self, duckdb_cursor):
@@ -454,28 +460,28 @@ class TestReplacementScan:
 
     def test_replacement_disabled(self):
         # Create regular connection, not disabled
-        con = duckdb.connect()
+        con = vane.connect()
         rel = create_relation(con, "select * from df")
         res = rel.fetchall()
         assert res == [(1,), (2,), (3,)]
 
         ## disable external access
         con.execute("set enable_external_access=false")
-        with pytest.raises(duckdb.CatalogException, match="Table with name df does not exist!"):
+        with pytest.raises(vane.CatalogException, match="Table with name df does not exist!"):
             create_relation(con, "select * from df")
         with pytest.raises(
-            duckdb.InvalidInputException,
+            vane.InvalidInputException,
             match="Invalid Input Error: Cannot enable external access while database is running",
         ):
             con.execute("set enable_external_access=true")
 
         # Create connection with external access disabled
-        con = duckdb.connect(config={"enable_external_access": False})
-        with pytest.raises(duckdb.CatalogException, match="Table with name df does not exist!"):
+        con = vane.connect(config={"enable_external_access": False})
+        with pytest.raises(vane.CatalogException, match="Table with name df does not exist!"):
             create_relation(con, "select * from df")
 
         # Create regular connection, disable inbetween creation and execution
-        con = duckdb.connect()
+        con = vane.connect()
         rel = create_relation(con, "select * from df")
 
         con.execute("set enable_external_access=false")
@@ -487,15 +493,15 @@ class TestReplacementScan:
         assert res == [(1,), (2,), (3,)]
 
     def test_replacement_of_cross_connection_relation(self):
-        con1 = duckdb.connect(":memory:")
-        con2 = duckdb.connect(":memory:")
+        con1 = vane.connect(":memory:")
+        con2 = vane.connect(":memory:")
         con1.query("create table integers(i int)")
         con2.query("create table integers(v varchar)")
         con1.query("insert into integers values (42)")
         con2.query("insert into integers values ('xxx')")
         rel1 = con1.query("select * from integers")
         with pytest.raises(
-            duckdb.InvalidInputException,
+            vane.InvalidInputException,
             match=r"The object was created by another Connection and can therefore not be used by this Connection.",
         ):
             con2.query("from rel1")
@@ -503,7 +509,7 @@ class TestReplacementScan:
         del con1
 
         with pytest.raises(
-            duckdb.InvalidInputException,
+            vane.InvalidInputException,
             match=r"The object was created by another Connection and can therefore not be used by this Connection.",
         ):
             con2.query("from rel1")

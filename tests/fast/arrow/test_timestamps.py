@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 
-import duckdb
+import vane
 
 try:
     import pyarrow as pa
@@ -21,7 +27,7 @@ class TestArrowTimestamps:
             pa.array([datetime.datetime.now()], pa.timestamp("s")),
         )
         arrow_table = pa.Table.from_arrays([data[0], data[1], data[2], data[3]], ["a", "b", "c", "d"])
-        rel = duckdb.from_arrow(arrow_table).to_arrow_table()
+        rel = vane.from_arrow(arrow_table).to_arrow_table()
         assert rel["a"] == arrow_table["a"]
         assert rel["b"] == arrow_table["b"]
         assert rel["c"] == arrow_table["c"]
@@ -37,7 +43,7 @@ class TestArrowTimestamps:
             pa.array([None], pa.timestamp("s")),
         )
         arrow_table = pa.Table.from_arrays([data[0], data[1], data[2], data[3]], ["a", "b", "c", "d"])
-        rel = duckdb.from_arrow(arrow_table).to_arrow_table()
+        rel = vane.from_arrow(arrow_table).to_arrow_table()
         assert rel["a"] == arrow_table["a"]
         assert rel["b"] == arrow_table["b"]
         assert rel["c"] == arrow_table["c"]
@@ -52,24 +58,24 @@ class TestArrowTimestamps:
             pa.array([9223372036854775807], pa.timestamp("us")),
         )
         arrow_table = pa.Table.from_arrays([data[0], data[1], data[2]], ["a", "b", "c"])
-        arrow_from_duck = duckdb.from_arrow(arrow_table).to_arrow_table()
+        arrow_from_duck = vane.from_arrow(arrow_table).to_arrow_table()
         assert arrow_from_duck["a"] == arrow_table["a"]
         assert arrow_from_duck["b"] == arrow_table["b"]
         assert arrow_from_duck["c"] == arrow_table["c"]
 
         expected = (datetime.datetime(9999, 12, 31, 23, 59, 59, 999999),)
 
-        duck_rel = duckdb.from_arrow(arrow_table)
+        duck_rel = vane.from_arrow(arrow_table)
         res = duck_rel.project("a::TIMESTAMP_US")
         result = res.fetchone()
         assert result == expected
 
-        duck_rel = duckdb.from_arrow(arrow_table)
+        duck_rel = vane.from_arrow(arrow_table)
         res = duck_rel.project("b::TIMESTAMP_US")
         result = res.fetchone()
         assert result == expected
 
-        duck_rel = duckdb.from_arrow(arrow_table)
+        duck_rel = vane.from_arrow(arrow_table)
         res = duck_rel.project("c::TIMESTAMP_NS")
         result = res.fetchone()
         assert result == expected

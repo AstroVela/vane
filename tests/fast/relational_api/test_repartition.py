@@ -3,7 +3,7 @@
 
 import pytest
 
-import duckdb
+import vane
 
 
 def test_repartition_random(duckdb_cursor):
@@ -26,5 +26,5 @@ def test_repartition_kwargs(duckdb_cursor):
 
 def test_repartition_invalid_partitions(duckdb_cursor):
     rel = duckdb_cursor.query("select i from range(5) t(i)")
-    with pytest.raises(duckdb.InvalidInputException):
+    with pytest.raises(vane.InvalidInputException):
         rel.repartition(0)

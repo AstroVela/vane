@@ -1,0 +1,73 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
+"""DuckDB's SQL types."""
+
+from _vane_duckdb._sqltypes import (
+    BIGINT,
+    BIT,
+    BLOB,
+    BOOLEAN,
+    DATE,
+    DOUBLE,
+    FLOAT,
+    HUGEINT,
+    INTEGER,
+    INTERVAL,
+    SMALLINT,
+    SQLNULL,
+    TIME,
+    TIME_NS,
+    TIME_TZ,
+    TIMESTAMP,
+    TIMESTAMP_MS,
+    TIMESTAMP_NS,
+    TIMESTAMP_S,
+    TIMESTAMP_TZ,
+    TINYINT,
+    UBIGINT,
+    UHUGEINT,
+    UINTEGER,
+    USMALLINT,
+    UTINYINT,
+    UUID,
+    VARCHAR,
+    VARIANT,
+    DuckDBPyType,
+)
+
+__all__ = [
+    "BIGINT",
+    "BIT",
+    "BLOB",
+    "BOOLEAN",
+    "DATE",
+    "DOUBLE",
+    "FLOAT",
+    "HUGEINT",
+    "INTEGER",
+    "INTERVAL",
+    "SMALLINT",
+    "SQLNULL",
+    "TIME",
+    "TIMESTAMP",
+    "TIMESTAMP_MS",
+    "TIMESTAMP_NS",
+    "TIMESTAMP_S",
+    "TIMESTAMP_TZ",
+    "TIME_NS",
+    "TIME_TZ",
+    "TINYINT",
+    "UBIGINT",
+    "UHUGEINT",
+    "UINTEGER",
+    "USMALLINT",
+    "UTINYINT",
+    "UUID",
+    "VARCHAR",
+    "VARIANT",
+    "DuckDBPyType",
+]

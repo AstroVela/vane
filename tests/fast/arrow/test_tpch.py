@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 try:
     import pyarrow
@@ -42,7 +48,7 @@ class TestTPCHArrow:
         tpch_tables = ["part", "partsupp", "supplier", "customer", "lineitem", "orders", "nation", "region"]
         arrow_tables = []
 
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
         duckdb_conn.execute("CALL dbgen(sf=0.01);")
 
         for tpch_table in tpch_tables:
@@ -72,7 +78,7 @@ class TestTPCHArrow:
         tpch_tables = ["part", "partsupp", "supplier", "customer", "lineitem", "orders", "nation", "region"]
         arrow_tables = []
 
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
         duckdb_conn.execute("CALL dbgen(sf=0.1);")
 
         for tpch_table in tpch_tables:
@@ -100,7 +106,7 @@ class TestTPCHArrow:
         tpch_tables = ["part", "partsupp", "supplier", "customer", "lineitem", "orders", "nation", "region"]
         arrow_tables = []
 
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
         duckdb_conn.execute("CALL dbgen(sf=0.01);")
 
         for tpch_table in tpch_tables:

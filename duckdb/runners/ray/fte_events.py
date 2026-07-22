@@ -1,9 +1,0 @@
-# SPDX-FileCopyrightText: 2026 Vane contributors
-# SPDX-License-Identifier: Apache-2.0
-
-from __future__ import annotations
-
-from duckdb.runners.fte import fte_events as _impl
-from duckdb.runners.ray._fte_compat import reexport
-
-reexport(_impl, globals())

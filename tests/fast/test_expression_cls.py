@@ -9,13 +9,12 @@ import pytest
 
 
 def test_vane_cls_public_api():
-    import duckdb
     import vane
 
     assert "cls" in vane.__all__
     assert callable(vane.cls)
     assert callable(vane.cls.batch)
-    assert isinstance(vane.col("x"), duckdb.Expression)
+    assert isinstance(vane.col("x"), vane.Expression)
 
 
 @pytest.mark.parametrize("actor_number", [None, False, True, 0, 1.0, 2])
@@ -58,7 +57,6 @@ def test_vane_cls_rejects_empty_explicit_name_without_defaulting():
 def test_vane_cls_physical_payload_marks_stateful_side_effects(monkeypatch):
     import uuid
 
-    import duckdb
     import vane
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
@@ -71,7 +69,7 @@ def test_vane_cls_physical_payload_marks_stateful_side_effects(monkeypatch):
     con = vane.connect()
     try:
         relation = con.sql("select 1::INTEGER as value").select(Counter()(vane.col("value")).alias("out"))
-        plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             relation,
             str(uuid.uuid4()),
         ).to_physical_plan(con)

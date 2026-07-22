@@ -165,6 +165,10 @@ jobs:
       - name: Validate release artifacts
         run: python scripts/check_release_artifacts.py dist/*.tar.gz dist/*.whl
 
+      - name: Verify coexistence with the official DuckDB wheel
+        if: matrix.python-version == '3.12'
+        run: python tests/packaging/test_duckdb_distribution_coexistence.py dist/*.whl
+
       - name: Install the built wheel
         run: python -m pip install --force-reinstall dist/*.whl
 

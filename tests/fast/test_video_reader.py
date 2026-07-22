@@ -7,8 +7,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from duckdb.datasource import _schema_to_arrow
-from duckdb.datasource.video_reader import (
+from vane.datasource import _schema_to_arrow
+from vane.datasource.video_reader import (
     LimitedVideoFrameTask,
     VideoFrameSource,
     VideoFrameTask,
@@ -63,7 +63,7 @@ def test_video_source_uses_ray_soft_block_row_boundary():
 
 
 def test_video_source_transport_does_not_resplit_ray_soft_block(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
     target_bytes = 128 * 1024**2
@@ -98,7 +98,7 @@ def test_video_source_coalesces_file_tails_within_one_read_task():
 
 
 def test_video_decode_batches_do_not_mutate_emitted_arrow_buffers(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     class FakeFrame:
         def __init__(self, value):
@@ -147,8 +147,8 @@ def test_video_frame_source_schema_declares_typed_frame_not_blob():
 
 
 def test_read_datasource_uses_datasource_udf_relation_hook():
-    import duckdb
-    from duckdb.datasource import DataSource, read_datasource
+    import vane
+    from vane.datasource import DataSource, read_datasource
 
     class HookSource(DataSource):
         @property
@@ -161,17 +161,17 @@ def test_read_datasource_uses_datasource_udf_relation_hook():
         def to_udf_relation(self, con):
             return con.sql("select 42::INTEGER as value")
 
-    con = duckdb.connect()
+    con = vane.connect()
 
     assert read_datasource(HookSource(), con=con).fetchall() == [(42,)]
 
 
 def test_video_frame_source_read_datasource_builds_hidden_udf_plan(monkeypatch):
-    import duckdb
-    from duckdb.datasource import read_datasource
+    import vane
+    from vane.datasource import read_datasource
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
-    con = duckdb.connect()
+    con = vane.connect()
 
     plan = read_datasource(VideoFrameSource(["a.avi"], height=8, width=9), con=con).explain()
     compact_plan = "".join(ch for ch in plan if ch.isalnum() or ch == "_")
@@ -186,7 +186,7 @@ def test_video_frame_source_read_datasource_builds_hidden_udf_plan(monkeypatch):
 
 
 def test_video_source_udf_identity_is_assigned_by_physical_graph(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_VIDEOS_PER_TASK", "1")
@@ -203,7 +203,7 @@ def test_video_source_udf_identity_is_assigned_by_physical_graph(monkeypatch):
 
 
 def test_video_source_udf_cpu_default_accounts_for_resize_pool(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.delenv("VANE_VIDEO_SOURCE_UDF_CPUS", raising=False)
     monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 3)
@@ -212,7 +212,7 @@ def test_video_source_udf_cpu_default_accounts_for_resize_pool(monkeypatch):
 
 
 def test_video_source_udf_cpu_allocation_is_overridable(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_CPUS", "2.5")
     monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 4)
@@ -221,7 +221,7 @@ def test_video_source_udf_cpu_allocation_is_overridable(monkeypatch):
 
 
 def test_video_source_udf_cpu_allocation_must_be_positive(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_CPUS", "0")
 
@@ -230,7 +230,7 @@ def test_video_source_udf_cpu_allocation_must_be_positive(monkeypatch):
 
 
 def test_video_source_udf_memory_is_stage_specific(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_MEMORY_BYTES", "268435456")
@@ -243,7 +243,7 @@ def test_video_source_udf_memory_is_stage_specific(monkeypatch):
 
 
 def test_video_source_udf_memory_must_be_positive(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_MEMORY_BYTES", "0")
@@ -253,7 +253,7 @@ def test_video_source_udf_memory_must_be_positive(monkeypatch):
 
 
 def test_video_frame_source_map_batches_reads_manifest(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     calls = []
     frames = np.arange(2 * 8 * 9 * 3, dtype=np.uint8).reshape(2, 8, 9, 3)
@@ -295,7 +295,7 @@ def test_video_frame_source_map_batches_reads_manifest(monkeypatch):
 
 
 def test_video_frame_source_map_batches_honors_global_frame_limit(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     calls = []
 
@@ -331,7 +331,7 @@ def test_video_frame_source_map_batches_honors_global_frame_limit(monkeypatch):
 
 
 def test_resize_frame_batch_preserves_order_and_uses_configured_threads(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 2)
     frame_a = np.zeros((2, 3, 3), dtype=np.uint8)

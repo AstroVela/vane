@@ -18,7 +18,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import duckdb
+import vane
 from vane.ai.protocols import (
     TextClassifierDescriptor,
     TextEmbedderDescriptor,
@@ -123,7 +123,7 @@ class TestEmbedText:
         """embed_text produces a relation with embedding column."""
         from vane.ai.functions import embed_text
 
-        conn = duckdb.connect()
+        conn = vane.connect()
         rel = conn.sql("SELECT 'hello' AS text UNION ALL SELECT 'world' AS text")
 
         result = embed_text(
@@ -143,7 +143,7 @@ class TestEmbedText:
         """embed_text respects dimensions parameter."""
         from vane.ai.functions import embed_text
 
-        conn = duckdb.connect()
+        conn = vane.connect()
         rel = conn.sql("SELECT 'test' AS text")
 
         result = embed_text(
@@ -160,7 +160,7 @@ class TestEmbedText:
         """embed_text uses custom output column name."""
         from vane.ai.functions import embed_text
 
-        conn = duckdb.connect()
+        conn = vane.connect()
         rel = conn.sql("SELECT 'test' AS text")
 
         result = embed_text(
@@ -177,7 +177,7 @@ class TestEmbedText:
         """embed_text handles NULL values by converting to empty string."""
         from vane.ai.functions import embed_text
 
-        conn = duckdb.connect()
+        conn = vane.connect()
         rel = conn.sql("SELECT NULL::VARCHAR AS text")
 
         result = embed_text(
@@ -197,7 +197,7 @@ class TestClassifyText:
         """classify_text produces a relation with label column."""
         from vane.ai.functions import classify_text
 
-        conn = duckdb.connect()
+        conn = vane.connect()
         rel = conn.sql("SELECT 'great product' AS text UNION ALL SELECT 'terrible' AS text")
 
         result = classify_text(
@@ -216,7 +216,7 @@ class TestClassifyText:
     def test_classify_text_custom_output(self):
         from vane.ai.functions import classify_text
 
-        conn = duckdb.connect()
+        conn = vane.connect()
         rel = conn.sql("SELECT 'test' AS text")
 
         result = classify_text(
@@ -386,7 +386,7 @@ class TestVLLMProvider:
 
     def test_prompter_uses_background_executor_for_sync_actor_calls(self, monkeypatch):
         """The synchronous prompter must not reuse the enclosing Ray actor loop."""
-        import duckdb.execution.vllm as vllm_executor
+        import vane.execution.vllm as vllm_executor
         from vane.ai.providers.vllm import VLLMPrompter
 
         captured = {}
@@ -409,7 +409,7 @@ class TestVLLMProvider:
         import sys
         import types
 
-        import duckdb.execution.vllm as vllm_executor
+        import vane.execution.vllm as vllm_executor
 
         fake_vllm = types.ModuleType("vllm")
 
@@ -1856,7 +1856,7 @@ class TestStructuredOutput:
             captured.update(kwargs)
             return original_get_prompter(self, **kwargs)
 
-        conn = duckdb.connect()
+        conn = vane.connect()
         rel = conn.sql("SELECT 'Hello' AS text")
         with pytest.MonkeyPatch.context() as m:
             m.setattr(OpenAIProvider, "get_prompter", patched_get_prompter)

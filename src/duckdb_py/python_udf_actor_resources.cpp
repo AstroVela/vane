@@ -255,7 +255,7 @@ private:
 
 		try {
 			if (pybind11::len(subprocess_nodes) > 0) {
-				auto subprocess_module = pybind11::module_::import("duckdb.execution.udf_subprocess");
+				auto subprocess_module = pybind11::module_::import("vane.execution.udf_subprocess");
 				auto result = pybind11::reinterpret_borrow<pybind11::tuple>(
 				    subprocess_module.attr("ensure_local_subprocess_actor_pools_for_nodes")(
 				        subprocess_nodes, pybind11::arg("plan_identity") = DirectPlanIdentity(prepared)));

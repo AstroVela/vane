@@ -1,4 +1,10 @@
-import duckdb
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
+import vane
 
 
 class TestRAPIFunctions:
@@ -8,5 +14,5 @@ class TestRAPIFunctions:
         res.show()
 
     def test_rapi_relation_sql_query(self):
-        res = duckdb.table_function("range", [10])
+        res = vane.table_function("range", [10])
         assert res.sql_query() == 'SELECT * FROM "range"(10)'

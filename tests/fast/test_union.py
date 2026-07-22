@@ -1,9 +1,15 @@
-import duckdb
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
+import vane
 
 
 class TestUnion:
     def test_union_by_all(self):
-        connection = duckdb.connect()
+        connection = vane.connect()
 
         connection.execute(
             """

@@ -1,12 +1,18 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 from spark_namespace import USE_ACTUAL_SPARK
 from spark_namespace.sql.types import Row
 
-from duckdb.experimental.spark.exception import (
+from vane.experimental.spark.exception import (
     ContributionsAcceptedError,
 )
 
-_ = pytest.importorskip("duckdb.experimental.spark")
+_ = pytest.importorskip("vane.experimental.spark")
 from spark_namespace.sql import SparkSession
 
 

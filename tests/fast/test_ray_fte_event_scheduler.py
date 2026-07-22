@@ -8,26 +8,26 @@ import time
 
 import pytest
 
-from duckdb.runners.ray.fte import FteTaskAttemptId, FteTaskId
-from duckdb.runners.ray.fte_events import (
+from vane.runners.ray.fte import FteTaskAttemptId, FteTaskId
+from vane.runners.ray.fte_events import (
     MemoryPressureDetected,
-    ResourceAdmissionChanged,
-    WorkerReservationCompleted,
     QueryAbort,
+    ResourceAdmissionChanged,
     RetryDelayExpired,
     SourceInputExhausted,
     SplitEventsSubmitted,
     TaskStatusChanged,
     WorkerFailed,
+    WorkerReservationCompleted,
 )
-from duckdb.runners.ray.fte_scheduler import (
+from vane.runners.ray.fte_scheduler import (
     FteAttemptStatusWatcher,
     FteEventDrivenTaskSource,
     FteEventHandlers,
     FteQueryScheduler,
     FteSchedulerRegistry,
 )
-from duckdb.runners.ray.safe_get import QueryDeadlineExceeded
+from vane.runners.ray.safe_get import QueryDeadlineExceeded
 
 
 def test_event_scheduler_dispatches_events_in_order():

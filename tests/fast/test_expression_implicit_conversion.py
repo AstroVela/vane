@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 """Tests that all types in _ExpressionLike are accepted by the implicit conversion path.
 
 pybind11 registers implicit conversions so that any C++ method taking
@@ -18,8 +24,8 @@ import uuid
 
 import pytest
 
-import duckdb
-from duckdb import (
+import vane
+from vane import (
     CaseExpression,
     CoalesceOperator,
     ColumnExpression,
@@ -39,7 +45,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture
 def rel():
     """A one-row relation with columns of various types."""
-    con = duckdb.connect()
+    con = vane.connect()
     r = con.sql(
         """
         SELECT
@@ -208,7 +214,7 @@ def test_function_expression_with_scalars(rel):
 
 
 def test_sort_with_string():
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("SELECT * FROM (VALUES (2, 'b'), (1, 'a'), (3, 'c')) t(x, y)")
     result = rel.sort("x").fetchall()
     assert result == [(1, "a"), (2, "b"), (3, "c")]
@@ -274,7 +280,7 @@ def test_project_with_scalar(rel):
 
 
 def test_aggregate_with_scalar():
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("SELECT * FROM (VALUES (1), (2), (3)) t(a)")
     # A bare int as an aggregate expression is accepted (non-aggregate, one per row)
     result = rel.aggregate([5]).fetchall()

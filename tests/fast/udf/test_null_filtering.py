@@ -1,11 +1,17 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 import uuid
 from typing import Any, NamedTuple
 
 import pytest
 
-import duckdb
-from duckdb.sqltypes import (
+import vane
+from vane.sqltypes import (
     BIGINT,
     BLOB,
     BOOLEAN,
@@ -137,11 +143,11 @@ def get_types():
             False,
         ),
         Candidate(
-            duckdb.struct_type(["BIGINT[]", "VARCHAR[]"]),
+            vane.struct_type(["BIGINT[]", "VARCHAR[]"]),
             {"v1": [1, 2, 3], "v2": ["a", "non-inlined string", "duckdb"]},
             {"v1": [5, 4, 3, 2, 1], "v2": ["non-inlined-string", "a", "b", "c", "duckdb"]},
         ),
-        Candidate(duckdb.list_type("VARCHAR"), ["the", "duck", "non-inlined string"], ["non-inlined-string", "test"]),
+        Candidate(vane.list_type("VARCHAR"), ["the", "duck", "non-inlined string"], ["non-inlined-string", "test"]),
     ]
 
 
@@ -165,7 +171,7 @@ def construct_query(tuples) -> str:
 def construct_parameters(tuples, dbtype):
     parameters = []
     for row in tuples:
-        parameters.extend([duckdb.Value(x, dbtype) for x in row])
+        parameters.extend([vane.Value(x, dbtype) for x in row])
     return parameters
 
 
@@ -231,7 +237,7 @@ class TestUDFNullFiltering:
         df = pd.DataFrame({"a": table_data})  # noqa: F841
         duckdb_cursor.execute("create table tbl as select * from df")
         duckdb_cursor.create_function("test", returns_null, [str], int, type="native")
-        with pytest.raises(duckdb.InvalidInputException, match="The UDF is not expected to return NULL values"):
+        with pytest.raises(vane.InvalidInputException, match="The UDF is not expected to return NULL values"):
             duckdb_cursor.sql("select test(a::VARCHAR) from tbl").fetchall()
 
     @pytest.mark.parametrize(
@@ -249,5 +255,5 @@ class TestUDFNullFiltering:
         df = pd.DataFrame({"a": table_data})  # noqa: F841
         duckdb_cursor.execute("create table tbl as select * from df")
         duckdb_cursor.create_function("test", returns_null, [str], int, type="arrow")
-        with pytest.raises(duckdb.InvalidInputException, match="The UDF is not expected to return NULL values"):
+        with pytest.raises(vane.InvalidInputException, match="The UDF is not expected to return NULL values"):
             duckdb_cursor.sql("select test(a::VARCHAR) from tbl").fetchall()

@@ -11,6 +11,11 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 
 ### Changed
 
+- Moved the forked DuckDB Python API under `vane`, renamed its native module,
+  stubs, and ADBC package to Vane-owned names, and made installation and
+  uninstallation safe alongside the official `duckdb` distribution.
+- Documented and tested the one-time DuckDB reinstall required when upgrading
+  an environment containing the conflicting `vane-ai 0.1.0a1` wheel.
 - Positioned the current project as the Vane Data developer preview.
 - Defined `DuckDBPyRelation.map` exclusively as a row-wise scalar UDF with a
   required `return_type`; batch transforms use `map_batches` with an explicit
@@ -33,4 +38,4 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 
 ## 0.1.0a1
 
-First planned public alpha release. Not yet published.
+Initial public alpha release.

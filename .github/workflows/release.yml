@@ -92,6 +92,9 @@ jobs:
           test "$(find wheelhouse -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 5
           python scripts/check_release_artifacts.py wheelhouse/*.whl
 
+      - name: Verify coexistence with the official DuckDB wheel
+        run: python tests/packaging/test_duckdb_distribution_coexistence.py wheelhouse/*cp312*.whl
+
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

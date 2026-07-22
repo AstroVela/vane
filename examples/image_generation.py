@@ -35,7 +35,6 @@ from typing import Any
 
 import pyarrow as pa
 
-import duckdb
 import vane
 
 DEFAULT_PARQUET_PATH = "s3://daft-oss-public-data/tutorials/laion-parquet/train-00000-of-00001-6f24a7497df494ae.parquet"
@@ -68,7 +67,7 @@ def relation_from_rows(
     if not rows:
         raise RuntimeError("Cannot create a relation from zero rows.")
     columns = list(schema or rows[0])
-    constant = duckdb.ConstantExpression
+    constant = vane.ConstantExpression
     raw = conn.values(
         *(tuple(constant(row[column]) for column in columns) for row in rows),
     )
@@ -370,11 +369,11 @@ def run(args: argparse.Namespace) -> None:
 
     map_kwargs: dict[str, Any] = {
         "schema": {
-            "id": duckdb.sqltypes.BIGINT,
-            "prompt": duckdb.sqltypes.VARCHAR,
-            "source_url": duckdb.sqltypes.VARCHAR,
-            "aesthetic_score": duckdb.sqltypes.DOUBLE,
-            "generated_image": duckdb.sqltypes.BLOB,
+            "id": vane.sqltypes.BIGINT,
+            "prompt": vane.sqltypes.VARCHAR,
+            "source_url": vane.sqltypes.VARCHAR,
+            "aesthetic_score": vane.sqltypes.DOUBLE,
+            "generated_image": vane.sqltypes.BLOB,
         },
         "batch_size": args.batch_size,
     }

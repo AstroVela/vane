@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 
 @pytest.fixture(autouse=True)
@@ -407,7 +413,7 @@ class TestRAPIWindows:
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
     def test_bitstring_agg(self, table):
-        with pytest.raises(duckdb.BinderException, match="Could not retrieve required statistics"):
+        with pytest.raises(vane.BinderException, match="Could not retrieve required statistics"):
             table.bitstring_agg(
                 "v",
                 window_spec="over (partition by id order by t asc rows between unbounded preceding and current row)",

@@ -69,7 +69,7 @@ def test_configure_normalizes_empty_runner_to_ray(monkeypatch):
 def test_get_or_create_runner_does_not_create_runner_for_local_fast():
     script = """
 import os
-import duckdb.runners as runners
+import vane.runners as runners
 
 os.environ["VANE_RUNNER"] = "local-fast"
 try:
@@ -86,7 +86,7 @@ else:
 def test_get_or_infer_runner_type_defaults_to_ray(configured):
     script = f"""
 import os
-import duckdb.runners as runners
+import vane.runners as runners
 
 configured = {configured!r}
 if configured is None:
@@ -110,7 +110,7 @@ assert runners.get_or_infer_runner_type() == "ray"
 def test_get_or_infer_runner_type_uses_shared_normalization(configured, expected):
     script = f"""
 import os
-import duckdb.runners as runners
+import vane.runners as runners
 
 os.environ["VANE_RUNNER"] = {configured!r}
 assert runners.get_or_infer_runner_type() == {expected!r}
@@ -122,7 +122,7 @@ def test_runner_entry_points_use_shared_invalid_value_error(monkeypatch):
     expected = "Invalid runner type 'invalid-runner'. Please use 'local' or 'ray'."
     script = f"""
 import os
-import duckdb.runners as runners
+import vane.runners as runners
 
 os.environ["VANE_RUNNER"] = "  invalid-runner  "
 try:
@@ -150,7 +150,7 @@ else:
 def test_get_or_create_runner_creates_local_runner():
     script = """
 import os
-import duckdb.runners as runners
+import vane.runners as runners
 
 os.environ["VANE_RUNNER"] = "local"
 runner = runners.get_or_create_runner()
@@ -162,7 +162,7 @@ assert runners.get_or_infer_runner_type() == "local"
 
 def test_ray_noop_does_not_reuse_local_runner():
     script = """
-import duckdb.runners as runners
+import vane.runners as runners
 
 runners.set_runner_local()
 try:

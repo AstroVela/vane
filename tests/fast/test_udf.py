@@ -18,13 +18,13 @@ def _run_udf_width_probe(tmp_path, *, streaming_breaker):
     data_dir = tmp_path / ("streaming_width" if streaming_breaker else "inout_width")
     script = textwrap.dedent(
         f"""
-        import duckdb
+        import vane
         import pyarrow as pa
         from pathlib import Path
 
         data_dir = {str(data_dir)!r}
         Path(data_dir).mkdir(parents=True, exist_ok=True)
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=4")
         for idx in range(4):
             start = idx * 4096
@@ -39,7 +39,7 @@ def _run_udf_width_probe(tmp_path, *, streaming_breaker):
 
         rel = con.sql(f"SELECT * FROM read_parquet('{{data_dir}}/*.parquet')").map_batches(
             ident,
-            schema={{"x": duckdb.sqltypes.INTEGER}},
+            schema={{"x": vane.sqltypes.INTEGER}},
             execution_backend="subprocess_task",
             batch_size=2048,
             streaming_breaker={streaming_breaker!r},
@@ -75,13 +75,13 @@ def _run_udf_actor_width_probe(tmp_path, *, streaming_breaker):
     data_dir = tmp_path / ("streaming_actor_width" if streaming_breaker else "inout_actor_width")
     script = textwrap.dedent(
         f"""
-        import duckdb
+        import vane
         import pyarrow as pa
         from pathlib import Path
 
         data_dir = {str(data_dir)!r}
         Path(data_dir).mkdir(parents=True, exist_ok=True)
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=4")
         for idx in range(4):
             start = idx * 4096
@@ -97,7 +97,7 @@ def _run_udf_actor_width_probe(tmp_path, *, streaming_breaker):
 
         rel = con.sql(f"SELECT * FROM read_parquet('{{data_dir}}/*.parquet')").map_batches(
             Ident,
-            schema={{"x": duckdb.sqltypes.INTEGER}},
+            schema={{"x": vane.sqltypes.INTEGER}},
             execution_backend="subprocess_actor",
             actor_number=2,
             gpus=0.0,
@@ -124,7 +124,7 @@ def _run_subprocess_actor_lazy_compute_batch_probe(tmp_path):
         """
         import json
 
-        import duckdb
+        import vane
         import pyarrow as pa
 
         class Identity:
@@ -141,11 +141,11 @@ def _run_subprocess_actor_lazy_compute_batch_probe(tmp_path):
                     }
                 )
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=1")
         base = con.sql("select i::INTEGER as x from range(4096) t(i)").map_batches(
             Identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="subprocess_actor",
             actor_number=1,
             gpus=0.0,
@@ -153,7 +153,7 @@ def _run_subprocess_actor_lazy_compute_batch_probe(tmp_path):
         )
         rel = base.map_batches(
             AnnotateBatchSize,
-            schema={"x": duckdb.sqltypes.INTEGER, "batch_rows": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER, "batch_rows": vane.sqltypes.INTEGER},
             execution_backend="subprocess_actor",
             actor_number=1,
             gpus=0.0,
@@ -198,7 +198,7 @@ def _run_subprocess_task_direct_compute_batch_probe(tmp_path):
         """
         import json
 
-        import duckdb
+        import vane
         import pyarrow as pa
 
         def annotate_batch_size(table):
@@ -210,11 +210,11 @@ def _run_subprocess_task_direct_compute_batch_probe(tmp_path):
                 }
             )
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=1")
         rel = con.sql("select i::INTEGER as x from range(4096) t(i)").map_batches(
             annotate_batch_size,
-            schema={"x": duckdb.sqltypes.INTEGER, "batch_rows": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER, "batch_rows": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             batch_size=3000,
         )
@@ -247,18 +247,18 @@ def _run_subprocess_task_direct_byte_transport_probe(tmp_path):
         """
         import json
 
-        import duckdb
+        import vane
         import pyarrow as pa
 
         def report_batch_rows(table):
             values = table.column("payload").to_pylist()
             return pa.table({"batch_rows": [table.num_rows for _ in values]})
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=1")
         rel = con.sql("select repeat('x', 2048)::BLOB as payload from range(8) t(i)").map_batches(
             report_batch_rows,
-            schema={"batch_rows": duckdb.sqltypes.BIGINT},
+            schema={"batch_rows": vane.sqltypes.BIGINT},
             execution_backend="subprocess_task",
             batch_size=3000,
             output_batch_size=2048,
@@ -310,18 +310,18 @@ def _run_subprocess_task_direct_work_unit_submit_probe(tmp_path):
         """
         import json
 
-        import duckdb
+        import vane
         import pyarrow as pa
 
         def annotate_batch_size(table):
             rows = table.num_rows
             return pa.table({"batch_rows": [rows for _ in range(rows)]})
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=1")
         rel = con.sql("select i::INTEGER as x from range(5000) t(i)").map_batches(
             annotate_batch_size,
-            schema={"batch_rows": duckdb.sqltypes.INTEGER},
+            schema={"batch_rows": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             batch_size=100,
             target_max_batch_bytes=1 << 30,
@@ -400,7 +400,7 @@ def _run_subprocess_lazy_byte_submit_probe(tmp_path):
         """
         import json
 
-        import duckdb
+        import vane
         import pyarrow as pa
 
         PAYLOAD_BYTES = 2048
@@ -413,13 +413,13 @@ def _run_subprocess_lazy_byte_submit_probe(tmp_path):
             values = table.column("payload").to_pylist()
             return pa.table({"batch_rows": [table.num_rows for _ in values]})
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=1")
         rel = (
             con.sql("select i::INTEGER as x from range(8) t(i)")
             .map_batches(
                 make_payload,
-                schema={"payload": duckdb.sqltypes.BLOB},
+                schema={"payload": vane.sqltypes.BLOB},
                 execution_backend="subprocess_task",
                 batch_size=2048,
                 output_batch_size=2048,
@@ -427,7 +427,7 @@ def _run_subprocess_lazy_byte_submit_probe(tmp_path):
             )
             .map_batches(
                 report_batch_rows,
-                schema={"batch_rows": duckdb.sqltypes.BIGINT},
+                schema={"batch_rows": vane.sqltypes.BIGINT},
                 execution_backend="subprocess_task",
                 batch_size=3000,
                 output_batch_size=2048,
@@ -484,17 +484,17 @@ def _run_subprocess_lazy_byte_submit_probe(tmp_path):
 
 def test_map_batches_ray_streaming_contract_cannot_be_disabled():
     """Ray stages always use the graph-owned direct block stream."""
-    import duckdb
+    import vane
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x")
 
     disabled = rel.map_batches(
         identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="ray_task",
         batch_size=1,
         streaming_breaker=False,
@@ -512,7 +512,7 @@ def test_map_batches_ray_streaming_contract_cannot_be_disabled():
 
     default_streaming = rel.map_batches(
         identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="ray_task",
         batch_size=1,
     )
@@ -525,7 +525,7 @@ def test_map_batches_ray_streaming_contract_cannot_be_disabled():
 def test_map_batches_nested_reserved_field_name_round_trips_at_bind():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     feature_arrow_type = pa.struct(
         [
@@ -546,9 +546,9 @@ def test_map_batches_nested_reserved_field_name_round_trips_at_bind():
         ]
         return pa.table({"features": pa.array(values, type=feature_arrow_type)})
 
-    feature_type = duckdb.sqltype('STRUCT("label" BIGINT, confidence DOUBLE, bbox DOUBLE[])')
+    feature_type = vane.sqltype('STRUCT("label" BIGINT, confidence DOUBLE, bbox DOUBLE[])')
     rel = (
-        duckdb.connect()
+        vane.connect()
         .sql("select i::BIGINT AS x from range(2) t(i)")
         .map_batches(
             make_features,
@@ -559,25 +559,25 @@ def test_map_batches_nested_reserved_field_name_round_trips_at_bind():
     )
 
     assert rel.types[0].children == [
-        ("label", duckdb.sqltypes.BIGINT),
-        ("confidence", duckdb.sqltypes.DOUBLE),
-        ("bbox", duckdb.list_type(duckdb.sqltypes.DOUBLE)),
+        ("label", vane.sqltypes.BIGINT),
+        ("confidence", vane.sqltypes.DOUBLE),
+        ("bbox", vane.list_type(vane.sqltypes.DOUBLE)),
     ]
     assert [row[0]["label"] for row in rel.fetchall()] == [7, 8]
 
 
 def test_scalar_ray_task_uses_mandatory_direct_block_stream_contract():
-    import duckdb
+    import vane
 
     def plus_one(value):
         return value + 1
 
     plan = (
-        duckdb.connect()
+        vane.connect()
         .sql("select 1::INTEGER as a")
         .map(
             plus_one,
-            return_type=duckdb.sqltypes.INTEGER,
+            return_type=vane.sqltypes.INTEGER,
             execution_backend="ray_task",
         )
         .project("a, value")
@@ -592,16 +592,16 @@ def test_scalar_ray_task_uses_mandatory_direct_block_stream_contract():
 
 
 def test_map_batches_streaming_breaker_defaults_on_for_subprocess_actor():
-    import duckdb
+    import vane
 
     class Identity:
         def __call__(self, table):
             return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x").map_batches(
         Identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="subprocess_actor",
         actor_number=1,
         gpus=0.0,
@@ -616,16 +616,16 @@ def test_map_batches_streaming_breaker_defaults_on_for_subprocess_actor():
 
 
 def test_map_batches_subprocess_actor_streaming_breaker_plan_opt_in():
-    import duckdb
+    import vane
 
     class Identity:
         def __call__(self, table):
             return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x").map_batches(
         Identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="subprocess_actor",
         actor_number=1,
         gpus=0.0,
@@ -643,17 +643,17 @@ def test_map_batches_subprocess_actor_streaming_breaker_plan_opt_in():
 def test_map_batches_subprocess_actor_streaming_breaker_fetches_rows():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     class AddOne:
         def __call__(self, table):
             values = table.column("x").to_pylist()
             return pa.table({"y": [value + 1 for value in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(5) t(i)").map_batches(
         AddOne,
-        schema={"y": duckdb.sqltypes.INTEGER},
+        schema={"y": vane.sqltypes.INTEGER},
         execution_backend="subprocess_actor",
         actor_number=1,
         gpus=0.0,
@@ -667,16 +667,16 @@ def test_map_batches_subprocess_actor_streaming_breaker_fetches_rows():
 def test_map_batches_subprocess_streaming_fetch_rows():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def add_one(table):
         values = table.column("x").to_pylist()
         return pa.table({"y": [value + 1 for value in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
         add_one,
-        schema={"y": duckdb.sqltypes.INTEGER},
+        schema={"y": vane.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         batch_size=1,
         streaming_breaker=True,
@@ -687,18 +687,18 @@ def test_map_batches_subprocess_streaming_fetch_rows():
 
 def test_map_batches_subprocess_streaming_drains_after_sink_finalize():
     pytest.importorskip("pyarrow")
-    import duckdb
+    import vane
 
     row_count = 8192
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("SET threads=8")
     rel = con.sql(f"select i::BIGINT as x from range({row_count}) t(i)").map_batches(
         identity,
-        schema={"x": duckdb.sqltypes.BIGINT},
+        schema={"x": vane.sqltypes.BIGINT},
         execution_backend="subprocess_task",
         batch_size=64,
         streaming_breaker=True,
@@ -718,17 +718,17 @@ def test_streaming_breaker_waits_for_tail_events_without_source_finalize_spin():
     script = textwrap.dedent(
         """
         import time
-        import duckdb
+        import vane
 
         def slow_identity(table):
             time.sleep(0.3)
             return table
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=4")
         rel = con.sql("select i::BIGINT as x from range(70) t(i)").map_batches(
             slow_identity,
-            schema={"x": duckdb.sqltypes.BIGINT},
+            schema={"x": vane.sqltypes.BIGINT},
             execution_backend="subprocess_task",
             batch_size=64,
             streaming_breaker=True,
@@ -753,27 +753,27 @@ def test_streaming_breaker_waits_for_tail_events_without_source_finalize_spin():
 
 def test_map_batches_chained_streaming_flushes_partial_pending_before_input_cap():
     pytest.importorskip("pyarrow")
-    import duckdb
+    import vane
 
     row_count = 70
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("SET threads=4")
     rel = (
         con.sql(f"select i::BIGINT as x from range({row_count}) t(i)")
         .map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.BIGINT},
+            schema={"x": vane.sqltypes.BIGINT},
             execution_backend="subprocess_task",
             batch_size=10,
             streaming_breaker=True,
         )
         .map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.BIGINT},
+            schema={"x": vane.sqltypes.BIGINT},
             execution_backend="subprocess_task",
             batch_size=64,
             streaming_breaker=True,
@@ -786,16 +786,16 @@ def test_map_batches_chained_streaming_flushes_partial_pending_before_input_cap(
 def test_map_batches_subprocess_task_native_parallel_plan_and_fetches_rows():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def add_one(table):
         values = table.column("x").to_pylist()
         return pa.table({"y": [value + 1 for value in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
         add_one,
-        schema={"y": duckdb.sqltypes.INTEGER},
+        schema={"y": vane.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         batch_size=1,
         streaming_breaker=True,
@@ -812,17 +812,17 @@ def test_map_batches_subprocess_task_native_parallel_plan_and_fetches_rows():
 def test_map_batches_subprocess_task_default_concurrency_resolves_at_operator_init():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def add_one(table):
         values = table.column("x").to_pylist()
         return pa.table({"y": [value + 1 for value in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("SET threads=4")
     rel = con.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
         add_one,
-        schema={"y": duckdb.sqltypes.INTEGER},
+        schema={"y": vane.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         batch_size=1,
         streaming_breaker=True,
@@ -872,11 +872,11 @@ def test_map_batches_without_batch_size_submits_each_upstream_work_unit(tmp_path
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     input_dir = tmp_path / "map_batches_work_units"
     input_dir.mkdir()
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("SET threads=1")
     for part in range(4):
         start = part * 60
@@ -896,7 +896,7 @@ def test_map_batches_without_batch_size_submits_each_upstream_work_unit(tmp_path
 
     rel = con.read_parquet(str(input_dir / "*.parquet")).map_batches(
         annotate_task_rows,
-        schema={"x": duckdb.sqltypes.INTEGER, "task_rows": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER, "task_rows": vane.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         target_max_batch_bytes=1 << 30,
         streaming_breaker=True,
@@ -914,14 +914,14 @@ def test_map_batches_without_batch_size_submits_each_upstream_work_unit(tmp_path
         con.read_parquet(str(input_dir / "*.parquet"))
         .map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             target_max_batch_bytes=1 << 30,
             streaming_breaker=True,
         )
         .map_batches(
             annotate_task_rows,
-            schema={"x": duckdb.sqltypes.INTEGER, "task_rows": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER, "task_rows": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             target_max_batch_bytes=1 << 30,
             streaming_breaker=True,
@@ -949,17 +949,17 @@ def test_map_batches_materialized_byte_split_preserves_complete_compute_batches(
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def annotate_batch_size(table):
         rows = table.num_rows
         return pa.table({"batch_rows": [rows for _ in range(rows)]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("SET threads=1")
     rel = con.sql("SELECT repeat('x', 4096)::BLOB AS payload FROM range(300) t(i)").map_batches(
         annotate_batch_size,
-        schema={"batch_rows": duckdb.sqltypes.INTEGER},
+        schema={"batch_rows": vane.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         batch_size=100,
         target_max_batch_bytes=512 * 1024,
@@ -990,15 +990,15 @@ def test_map_batches_subprocess_task_direct_submit_follows_upstream_work_units(t
 def test_map_batches_can_request_soft_minimum_task_batch_size():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def identity(table):
         return pa.table({"x": table.column("x")})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(256) t(i)").map_batches(
         identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         batch_size=32,
         min_task_batch_size=32,
@@ -1014,31 +1014,31 @@ def test_map_batches_can_request_soft_minimum_task_batch_size():
 def test_map_batches_minimum_task_batch_size_validates_contract():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def identity(table):
         return pa.table({"x": table.column("x")})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(4) t(i)")
 
-    with pytest.raises(duckdb.InvalidInputException, match="requires batch_size"):
+    with pytest.raises(vane.InvalidInputException, match="requires batch_size"):
         rel.map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             min_task_batch_size=32,
         )
-    with pytest.raises(duckdb.InvalidInputException, match="at least batch_size"):
+    with pytest.raises(vane.InvalidInputException, match="at least batch_size"):
         rel.map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             batch_size=32,
             min_task_batch_size=16,
         )
-    with pytest.raises(duckdb.InvalidInputException, match="streaming_breaker=True"):
+    with pytest.raises(vane.InvalidInputException, match="streaming_breaker=True"):
         rel.map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             batch_size=32,
             min_task_batch_size=32,
             streaming_breaker=False,
@@ -1048,15 +1048,15 @@ def test_map_batches_minimum_task_batch_size_validates_contract():
 def test_map_batches_can_preserve_compute_batch_output_boundaries():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def identity(table):
         return pa.table({"x": table.column("x")})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(5) t(i)").map_batches(
         identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         batch_size=2,
         output_batch_size=3,
@@ -1071,12 +1071,12 @@ def test_map_batches_can_preserve_compute_batch_output_boundaries():
 def test_map_batches_compute_boundary_mode_requires_streaming_breaker():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
-    with pytest.raises(duckdb.InvalidInputException, match="preserve_compute_batch_boundaries"):
-        duckdb.sql("select 1::INTEGER as x").map_batches(
+    with pytest.raises(vane.InvalidInputException, match="preserve_compute_batch_boundaries"):
+        vane.sql("select 1::INTEGER as x").map_batches(
             lambda table: pa.table({"x": table.column("x")}),
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             batch_size=1,
             preserve_compute_batch_boundaries=True,
@@ -1104,7 +1104,7 @@ def test_map_batches_subprocess_actor_uses_actor_pool_size(tmp_path):
 def test_map_batches_subprocess_task_inout_partial_tail_consumed_once(tmp_path, row_count):
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     seen_path = tmp_path / f"seen-{row_count}.txt"
 
@@ -1114,11 +1114,11 @@ def test_map_batches_subprocess_task_inout_partial_tail_consumed_once(tmp_path, 
             handle.write(f"{len(values)}:{min(values)}:{max(values)}\n")
         return pa.table({"x": table.column("x")})
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("SET threads=8")
     rel = con.sql(f"select i::INTEGER as x from range({row_count}) t(i)").map_batches(
         ident,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         batch_size=64,
         streaming_breaker=False,
@@ -1142,13 +1142,13 @@ def test_map_batches_subprocess_task_inout_partial_tail_consumed_once(tmp_path, 
     ],
 )
 def test_map_batches_rejects_removed_admission_params(removed_param):
-    import duckdb
+    import vane
 
-    con = duckdb.connect()
+    con = vane.connect()
     with pytest.raises(TypeError, match=removed_param):
         con.sql("select 1 as x").map_batches(
             lambda table: table,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             **{removed_param: 3},
         )
@@ -1157,16 +1157,16 @@ def test_map_batches_rejects_removed_admission_params(removed_param):
 def test_map_batches_accepts_byte_batching_params():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def add_one(table):
         values = table.column("x").to_pylist()
         return pa.table({"y": [value + 1 for value in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
         add_one,
-        schema={"y": duckdb.sqltypes.INTEGER},
+        schema={"y": vane.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         batch_size=1,
         target_max_batch_bytes=64,
@@ -1183,19 +1183,19 @@ def test_map_batches_accepts_byte_batching_params():
 def test_map_batches_accepts_ray_memory_bytes():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def identity(table):
         return pa.table({"x": table.column("x")})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
         identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="ray_task",
         memory_bytes=536870912,
     )
-    logical = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, "map-batches-memory-bytes")
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, "map-batches-memory-bytes")
     physical = logical.to_physical_plan(con)
     payload = physical.collect_udf_nodes(conn=con)[0]["payload"]
 
@@ -1203,19 +1203,19 @@ def test_map_batches_accepts_ray_memory_bytes():
 
 
 def test_flat_map_accepts_ray_memory_bytes():
-    import duckdb
+    import vane
 
     def duplicate(row):
         return [row, row]
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1::INTEGER as x").flat_map(
         duplicate,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="ray_task",
         memory_bytes=268435456,
     )
-    logical = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, "flat-map-memory-bytes")
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, "flat-map-memory-bytes")
     physical = logical.to_physical_plan(con)
     payload = physical.collect_udf_nodes(conn=con)[0]["payload"]
 
@@ -1223,22 +1223,22 @@ def test_flat_map_accepts_ray_memory_bytes():
 
 
 def test_map_batches_accepts_ray_actor_memory_bytes():
-    import duckdb
+    import vane
 
     class Identity:
         def __call__(self, table):
             return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1::INTEGER as x").map_batches(
         Identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="ray_actor",
         actor_number=1,
         gpus=0.0,
         memory_bytes=1073741824,
     )
-    logical = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, "map-batches-actor-memory-bytes")
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, "map-batches-actor-memory-bytes")
     physical = logical.to_physical_plan(con)
     payload = physical.collect_udf_nodes(conn=con)[0]["payload"]
 
@@ -1246,35 +1246,35 @@ def test_map_batches_accepts_ray_actor_memory_bytes():
 
 
 def test_map_batches_rejects_invalid_or_non_ray_memory_bytes():
-    import duckdb
+    import vane
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     with pytest.raises(Exception, match="memory_bytes"):
         con.sql("select 1 as x").map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="ray_task",
             memory_bytes=0,
         )
     with pytest.raises(Exception, match="Ray UDF backend"):
         con.sql("select 1 as x").map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             memory_bytes=536870912,
         )
 
 
 def test_map_batches_rejects_invalid_byte_batching_params():
-    import duckdb
+    import vane
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     for keyword in (
         "target_max_batch_bytes",
         "task_input_max_bytes",
@@ -1283,7 +1283,7 @@ def test_map_batches_rejects_invalid_byte_batching_params():
         with pytest.raises(Exception, match=keyword):
             con.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
                 identity,
-                schema={"x": duckdb.sqltypes.INTEGER},
+                schema={"x": vane.sqltypes.INTEGER},
                 execution_backend="subprocess_task",
                 batch_size=1,
                 **{keyword: 0},
@@ -1293,17 +1293,17 @@ def test_map_batches_rejects_invalid_byte_batching_params():
 def test_map_batches_reads_target_max_batch_bytes_env(monkeypatch):
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def add_one(table):
         values = table.column("x").to_pylist()
         return pa.table({"y": [value + 1 for value in values]})
 
     monkeypatch.setenv("VANE_UDF_TARGET_MAX_BATCH_BYTES", "77")
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
         add_one,
-        schema={"y": duckdb.sqltypes.INTEGER},
+        schema={"y": vane.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         batch_size=1,
     )
@@ -1315,16 +1315,16 @@ def test_map_batches_reads_target_max_batch_bytes_env(monkeypatch):
 
 
 def test_scalar_map_reads_target_max_batch_bytes_env(monkeypatch):
-    import duckdb
+    import vane
 
     def add_one(value: int) -> int:
         return value + 1
 
     monkeypatch.setenv("VANE_UDF_TARGET_MAX_BATCH_BYTES", "77")
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(4) t(i)").map(
         add_one,
-        return_type=duckdb.sqltypes.INTEGER,
+        return_type=vane.sqltypes.INTEGER,
         execution_backend="ray_task",
     )
     compact_plan = "".join(ch for ch in rel.explain() if ch.isalnum() or ch == "_")
@@ -1337,7 +1337,7 @@ def test_scalar_map_reads_target_max_batch_bytes_env(monkeypatch):
 def test_local_shm_ref_bundle_result_has_block_metadata():
     import pyarrow as pa
 
-    from duckdb.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER, make_local_shm_ref_bundle_result
+    from vane.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER, make_local_shm_ref_bundle_result
 
     result = make_local_shm_ref_bundle_result(pa.table({"x": [1, 2]}))
     marker, refs, metadata, names = result
@@ -1356,33 +1356,33 @@ def test_local_shm_ref_bundle_result_has_block_metadata():
 
 
 def test_map_batches_rejects_invalid_target_max_batch_bytes_env(monkeypatch):
-    import duckdb
+    import vane
 
     def identity(table):
         return table
 
     monkeypatch.setenv("VANE_UDF_TARGET_MAX_BATCH_BYTES", "0")
-    con = duckdb.connect()
+    con = vane.connect()
     with pytest.raises(Exception, match="VANE_UDF_TARGET_MAX_BATCH_BYTES"):
         con.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             batch_size=1,
         )
 
 
 def test_map_batches_worker_slots_keyword_is_not_public_api():
-    import duckdb
+    import vane
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     with pytest.raises(Exception, match=r"map_batches\(\) got unsupported keyword argument\(s\): worker_slots"):
         con.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             batch_size=1,
             worker_slots=3,
@@ -1392,16 +1392,16 @@ def test_map_batches_worker_slots_keyword_is_not_public_api():
 def test_map_batches_accepts_output_batch_size_keyword():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def add_ten(table):
         values = table.column("x").to_pylist()
         return pa.table({"y": [value + 10 for value in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
         add_ten,
-        schema={"y": duckdb.sqltypes.INTEGER},
+        schema={"y": vane.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         batch_size=2,
         output_batch_size=1,
@@ -1413,16 +1413,16 @@ def test_map_batches_accepts_output_batch_size_keyword():
 def test_map_batches_streaming_submit_respects_target_max_batch_bytes():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def report_batch_rows(table):
         values = table.column("payload").to_pylist()
         return pa.table({"batch_rows": [table.num_rows for _ in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select repeat('x', 1024)::BLOB as payload from range(12) t(i)").map_batches(
         report_batch_rows,
-        schema={"batch_rows": duckdb.sqltypes.BIGINT},
+        schema={"batch_rows": vane.sqltypes.BIGINT},
         execution_backend="subprocess_task",
         batch_size=2048,
         output_batch_size=2048,
@@ -1439,10 +1439,10 @@ def test_map_batches_streaming_output_splits_by_actual_bytes_without_row_preserv
     np = pytest.importorskip("numpy")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     tensor_shape = (64, 64)
-    tensor_type = duckdb.tensor_type(duckdb.sqltypes.FLOAT, tensor_shape)
+    tensor_type = vane.tensor_type(vane.sqltypes.FLOAT, tensor_shape)
     seen_path = tmp_path / "downstream_batches.txt"
 
     def make_tensor(table):
@@ -1460,12 +1460,12 @@ def test_map_batches_streaming_output_splits_by_actual_bytes_without_row_preserv
             handle.write(f"{table.num_rows}\n")
         return pa.table({"x": table.column("x")})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = (
         con.sql("select i::BIGINT as x from range(8) t(i)")
         .map_batches(
             make_tensor,
-            schema={"x": duckdb.sqltypes.BIGINT, "embedding": tensor_type},
+            schema={"x": vane.sqltypes.BIGINT, "embedding": tensor_type},
             execution_backend="subprocess_task",
             batch_size=8,
             target_max_batch_bytes=48 * 1024,
@@ -1473,7 +1473,7 @@ def test_map_batches_streaming_output_splits_by_actual_bytes_without_row_preserv
         )
         .map_batches(
             record_downstream_batch,
-            schema={"x": duckdb.sqltypes.BIGINT},
+            schema={"x": vane.sqltypes.BIGINT},
             execution_backend="subprocess_task",
             batch_size=2048,
             target_max_batch_bytes=48 * 1024,
@@ -1491,7 +1491,7 @@ def test_map_batches_streaming_output_splits_by_actual_bytes_without_row_preserv
 def test_map_batches_lazy_ref_submit_respects_target_max_batch_bytes():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def make_payload(table):
         values = table.column("x").to_pylist()
@@ -1501,12 +1501,12 @@ def test_map_batches_lazy_ref_submit_respects_target_max_batch_bytes():
         values = table.column("payload").to_pylist()
         return pa.table({"batch_rows": [table.num_rows for _ in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = (
         con.sql("select i::INTEGER as x from range(12) t(i)")
         .map_batches(
             make_payload,
-            schema={"payload": duckdb.sqltypes.BLOB},
+            schema={"payload": vane.sqltypes.BLOB},
             execution_backend="subprocess_task",
             batch_size=2048,
             output_batch_size=2048,
@@ -1514,7 +1514,7 @@ def test_map_batches_lazy_ref_submit_respects_target_max_batch_bytes():
         )
         .map_batches(
             report_batch_rows,
-            schema={"batch_rows": duckdb.sqltypes.BIGINT},
+            schema={"batch_rows": vane.sqltypes.BIGINT},
             execution_backend="subprocess_task",
             batch_size=2048,
             output_batch_size=2048,
@@ -1531,7 +1531,7 @@ def test_map_batches_lazy_ref_submit_respects_target_max_batch_bytes():
 def test_map_batches_lazy_ref_submit_accepts_all_null_nonempty_batches():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def make_nulls(table):
         return pa.table({"payload": [None for _ in range(table.num_rows)]})
@@ -1539,20 +1539,20 @@ def test_map_batches_lazy_ref_submit_accepts_all_null_nonempty_batches():
     def report_batch_rows(table):
         return pa.table({"batch_rows": [table.num_rows for _ in range(table.num_rows)]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("SET threads=1")
     rel = (
         con.sql("select i::INTEGER as x from range(4) t(i)")
         .map_batches(
             make_nulls,
-            schema={"payload": duckdb.sqltypes.INTEGER},
+            schema={"payload": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             batch_size=2048,
             output_batch_size=2048,
         )
         .map_batches(
             report_batch_rows,
-            schema={"batch_rows": duckdb.sqltypes.INTEGER},
+            schema={"batch_rows": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             batch_size=2048,
             output_batch_size=2048,
@@ -1565,17 +1565,17 @@ def test_map_batches_lazy_ref_submit_accepts_all_null_nonempty_batches():
 def test_map_batches_ray_task_default_concurrency_resolves_at_operator_init():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def add_one(table):
         values = table.column("x").to_pylist()
         return pa.table({"y": [value + 1 for value in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("SET threads=8")
     rel = con.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
         add_one,
-        schema={"y": duckdb.sqltypes.INTEGER},
+        schema={"y": vane.sqltypes.INTEGER},
         execution_backend="ray_task",
         batch_size=1,
     )
@@ -1588,17 +1588,17 @@ def test_map_batches_ray_task_default_concurrency_resolves_at_operator_init():
 def test_map_batches_subprocess_actor_number_plan_and_fetches_rows():
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     class AddOne:
         def __call__(self, table):
             values = table.column("x").to_pylist()
             return pa.table({"y": [value + 1 for value in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
         AddOne,
-        schema={"y": duckdb.sqltypes.INTEGER},
+        schema={"y": vane.sqltypes.INTEGER},
         execution_backend="subprocess_actor",
         actor_number=2,
         gpus=0.0,
@@ -1616,16 +1616,16 @@ def test_map_batches_subprocess_actor_number_plan_and_fetches_rows():
 
 
 def test_map_batches_subprocess_actor_streaming_fetches_rows():
-    import duckdb
+    import vane
 
     class Identity:
         def __call__(self, table):
             return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x").map_batches(
         Identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="subprocess_actor",
         actor_number=2,
         gpus=0.0,
@@ -1636,16 +1636,16 @@ def test_map_batches_subprocess_actor_streaming_fetches_rows():
 
 
 def test_map_batches_subprocess_actor_non_streaming_fetches_rows():
-    import duckdb
+    import vane
 
     class Identity:
         def __call__(self, table):
             return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(3) t(i)").map_batches(
         Identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="subprocess_actor",
         actor_number=1,
         gpus=0.0,
@@ -1658,7 +1658,7 @@ def test_map_batches_subprocess_actor_non_streaming_fetches_rows():
 def test_subprocess_actor_concurrency_does_not_exceed_actor_pool(monkeypatch, tmp_path):
     import json
 
-    import duckdb
+    import vane
 
     state_path = tmp_path / "counter.json"
     monkeypatch.setenv("VANE_TEST_UDF_COUNTER_PATH", str(state_path))
@@ -1696,11 +1696,11 @@ def test_subprocess_actor_concurrency_does_not_exceed_actor_pool(monkeypatch, tm
             finally:
                 update(-1)
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("SET threads=4")
     rel = con.sql("select i::INTEGER as x from range(8) t(i)").map_batches(
         Probe,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="subprocess_actor",
         actor_number=2,
         gpus=0.0,
@@ -1713,36 +1713,36 @@ def test_subprocess_actor_concurrency_does_not_exceed_actor_pool(monkeypatch, tm
 
 
 def test_map_batches_rejects_bare_subprocess_backend():
-    import duckdb
+    import vane
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x")
 
     with pytest.raises(Exception, match="subprocess_task"):
         rel.map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="subprocess",
             batch_size=1,
         )
 
 
 def test_map_batches_rejects_removed_async_options():
-    import duckdb
+    import vane
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x")
 
     with pytest.raises(Exception, match=r"map_batches\(\) got unsupported keyword argument\(s\): async_mode"):
         rel.map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="ray_task",
             batch_size=1,
             async_mode=True,
@@ -1751,7 +1751,7 @@ def test_map_batches_rejects_removed_async_options():
     with pytest.raises(Exception, match=r"map_batches\(\) got unsupported keyword argument\(s\): async_mode"):
         rel.map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="ray_task",
             batch_size=1,
             streaming_breaker=True,
@@ -1760,7 +1760,7 @@ def test_map_batches_rejects_removed_async_options():
 
 
 def test_map_batches_unknown_kwargs_fail_without_rendering_relation():
-    import duckdb
+    import vane
 
     upstream_called = False
 
@@ -1772,19 +1772,19 @@ def test_map_batches_unknown_kwargs_fail_without_rendering_relation():
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.create_function(
         "fail_if_rendered",
         fail_if_rendered,
-        parameters=[duckdb.sqltypes.INTEGER],
-        return_type=duckdb.sqltypes.INTEGER,
+        parameters=[vane.sqltypes.INTEGER],
+        return_type=vane.sqltypes.INTEGER,
     )
     rel = con.sql("select fail_if_rendered(1) as x")
 
     with pytest.raises(Exception, match=r"actor_locality_mode, ray_actor_pool_name"):
         rel.map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="ray_actor",
             actor_number=1,
             gpus=0.0,
@@ -1797,15 +1797,15 @@ def test_map_batches_unknown_kwargs_fail_without_rendering_relation():
 
 def test_map_batches_accepts_explicit_ray_task_backend():
     """execution_backend is the final routing knob for UDFs."""
-    import duckdb
+    import vane
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x").map_batches(
         identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="ray_task",
     )
 
@@ -1814,111 +1814,111 @@ def test_map_batches_accepts_explicit_ray_task_backend():
 
 
 def test_map_batches_rejects_actor_number_for_task_backend():
-    import duckdb
+    import vane
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     with pytest.raises(Exception, match="actor_number is only supported"):
         con.sql("select 1 as x").map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="ray_task",
             actor_number=2,
         )
     with pytest.raises(Exception, match="actor_number is only supported"):
         con.sql("select 1 as x").map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             actor_number=2,
         )
 
 
 def test_map_batches_rejects_removed_concurrency_argument():
-    import duckdb
+    import vane
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     with pytest.raises(Exception, match="unsupported keyword argument.*concurrency"):
         con.sql("select 1 as x").map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             concurrency=2,
         )
 
 
 def test_map_batches_rejects_removed_max_inflight_argument():
-    import duckdb
+    import vane
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     with pytest.raises(Exception, match="unsupported keyword argument.*max_inflight"):
         con.sql("select 1 as x").map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             max_inflight=2,
         )
 
 
 def test_map_batches_actor_backend_requires_actor_number():
-    import duckdb
+    import vane
 
     class Identity:
         def __call__(self, table):
             return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     with pytest.raises(Exception, match="actor_number is required"):
         con.sql("select 1 as x").map_batches(
             Identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="subprocess_actor",
         )
 
 
 def test_map_batches_actor_backend_requires_gpus():
-    import duckdb
+    import vane
 
     class Identity:
         def __call__(self, table):
             return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     with pytest.raises(Exception, match=r"map_batches\(gpus=\.\.\.\) is required"):
         con.sql("select 1 as x").map_batches(
             Identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="subprocess_actor",
             actor_number=1,
         )
     with pytest.raises(Exception, match=r"map_batches\(gpus=\.\.\.\) is required"):
         con.sql("select 1 as x").map_batches(
             Identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="ray_actor",
             actor_number=1,
         )
 
 
 def test_map_batches_accepts_explicit_cpu_resource():
-    import duckdb
+    import vane
 
     class Identity:
         def __call__(self, table):
             return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x").map_batches(
         Identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="ray_actor",
         actor_number=1,
         cpus=0.0,
@@ -1935,16 +1935,16 @@ def test_map_batches_accepts_explicit_cpu_resource():
 
 
 def test_map_batches_accepts_ray_native_actor_thread_policy():
-    import duckdb
+    import vane
 
     class Identity:
         def __call__(self, table):
             return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x").map_batches(
         Identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="ray_actor",
         actor_number=1,
         cpus=0.0,
@@ -1959,17 +1959,17 @@ def test_map_batches_accepts_ray_native_actor_thread_policy():
 
 @pytest.mark.parametrize("policy", ["different", 1])
 def test_map_batches_rejects_invalid_ray_actor_thread_policy(policy):
-    import duckdb
+    import vane
 
     class Identity:
         def __call__(self, table):
             return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     with pytest.raises(Exception, match="ray_actor_thread_policy"):
         con.sql("select 1 as x").map_batches(
             Identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="ray_actor",
             actor_number=1,
             gpus=1.0,
@@ -1978,16 +1978,16 @@ def test_map_batches_rejects_invalid_ray_actor_thread_policy(policy):
 
 
 def test_map_batches_rejects_ray_actor_thread_policy_for_task_backend():
-    import duckdb
+    import vane
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     with pytest.raises(Exception, match="requires execution_backend='ray_actor'"):
         con.sql("select 1 as x").map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="ray_task",
             ray_actor_thread_policy="ray_native",
         )
@@ -1997,16 +1997,16 @@ def test_ray_actor_direct_execution_requires_registered_query_allocation():
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     class Identity:
         def __call__(self, table):
             return pa.table({"x": table.column("x")})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1::INTEGER as x").map_batches(
         Identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         execution_backend="ray_actor",
         actor_number=1,
         cpus=1.0,
@@ -2021,16 +2021,16 @@ def test_ray_actor_direct_execution_requires_registered_query_allocation():
 
 
 def test_map_batches_rejects_non_numeric_gpus():
-    import duckdb
+    import vane
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     with pytest.raises(Exception, match=r"map_batches\(gpus=\.\.\.\) must be a number"):
         con.sql("select 1 as x").map_batches(
             identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
             execution_backend="ray_actor",
             actor_number=1,
             gpus="gpu",
@@ -2040,16 +2040,16 @@ def test_map_batches_rejects_non_numeric_gpus():
 def test_map_batches_explain_analyze_shows_udf_runtime_counters():
     """UDF runtime profile exposes streaming UDF counters."""
     pytest.importorskip("pyarrow")
-    import duckdb
+    import vane
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("PRAGMA enable_profiling")
     rel = con.sql("select i::BIGINT as x from range(4) t(i)").map_batches(
         identity,
-        schema={"x": duckdb.sqltypes.BIGINT},
+        schema={"x": vane.sqltypes.BIGINT},
         batch_size=2,
         execution_backend="subprocess_task",
     )
@@ -2064,16 +2064,16 @@ def test_map_batches_explain_analyze_shows_udf_runtime_counters():
 
 def test_map_batches_explain_analyze_reports_observed_ready_rows():
     pytest.importorskip("pyarrow")
-    import duckdb
+    import vane
 
     def identity(table):
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("PRAGMA enable_profiling")
     rel = con.sql("select i::BIGINT as x from range(4) t(i)").map_batches(
         identity,
-        schema={"x": duckdb.sqltypes.BIGINT},
+        schema={"x": vane.sqltypes.BIGINT},
         batch_size=1,
         execution_backend="subprocess_task",
     )
@@ -2085,7 +2085,7 @@ def test_map_batches_explain_analyze_reports_observed_ready_rows():
 
 def test_map_batches_streaming_compute_uses_user_batch_size(tmp_path):
     pytest.importorskip("pyarrow")
-    import duckdb
+    import vane
 
     seen_path = tmp_path / "seen-batches.txt"
 
@@ -2094,10 +2094,10 @@ def test_map_batches_streaming_compute_uses_user_batch_size(tmp_path):
             handle.write(f"{table.num_rows}\n")
         return table
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select i::BIGINT as x from range(25) t(i)").map_batches(
         identity,
-        schema={"x": duckdb.sqltypes.BIGINT},
+        schema={"x": vane.sqltypes.BIGINT},
         batch_size=10,
         execution_backend="subprocess_task",
     )
@@ -2111,17 +2111,17 @@ def test_map_batches_basic():
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def add_ten(table):
         values = table.column(0).to_pylist()
         return pa.table({"result": [v + 10 for v in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x union all select 2 as x")
     out = rel.map_batches(
         add_ten,
-        schema={"result": duckdb.sqltypes.BIGINT},
+        schema={"result": vane.sqltypes.BIGINT},
         execution_backend="subprocess_task",
     )
     assert sorted(out.fetchall()) == [(11,), (12,)]
@@ -2130,27 +2130,27 @@ def test_map_batches_basic():
 def test_map_batches_direct_arrow_output_conversion():
     """Non-streaming map_batches still accepts direct pyarrow.Table output."""
     pytest.importorskip("pyarrow")
-    import _duckdb
+    import _vane_duckdb
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def add_one(table):
         values = table.column("x").to_pylist()
         return pa.table({"result": [v + 1 for v in values]})
 
-    con = duckdb.connect()
-    _duckdb._reset_udf_executor_debug_counters()
+    con = vane.connect()
+    _vane_duckdb._reset_udf_executor_debug_counters()
     rel = con.sql("select i::BIGINT as x from range(5) t(i)")
     out = rel.map_batches(
         add_one,
-        schema={"result": duckdb.sqltypes.BIGINT},
+        schema={"result": vane.sqltypes.BIGINT},
         batch_size=10,
         streaming_breaker=False,
         execution_backend="subprocess_task",
     )
     assert out.fetchall() == [(1,), (2,), (3,), (4,), (5,)]
-    counters = dict(_duckdb._udf_executor_debug_counters())
+    counters = dict(_vane_duckdb._udf_executor_debug_counters())
     assert counters["udf_direct_arrow_table_conversion_count"] == 1
     assert counters["udf_direct_output_arrow_table_conversion_count"] == 1
     assert counters["udf_python_export_under_client_context_lock_count"] == 0
@@ -2161,7 +2161,7 @@ def test_map_batches_batch_size():
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     seen_sizes = []
 
@@ -2170,11 +2170,11 @@ def test_map_batches_batch_size():
         values = table.column(0).to_pylist()
         return pa.table({"result": [v * 2 for v in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select i from range(10) t(i)")
     out = rel.map_batches(
         track_batch,
-        schema={"result": duckdb.sqltypes.BIGINT},
+        schema={"result": vane.sqltypes.BIGINT},
         batch_size=3,
         execution_backend="subprocess_task",
     )
@@ -2187,7 +2187,7 @@ def test_map_batches_multi_column_output():
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def split(table):
         values = table.column(0).to_pylist()
@@ -2198,11 +2198,11 @@ def test_map_batches_multi_column_output():
             }
         )
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 5 as x")
     out = rel.map_batches(
         split,
-        schema={"doubled": duckdb.sqltypes.BIGINT, "tripled": duckdb.sqltypes.BIGINT},
+        schema={"doubled": vane.sqltypes.BIGINT, "tripled": vane.sqltypes.BIGINT},
         execution_backend="subprocess_task",
     )
     result = out.fetchall()
@@ -2216,7 +2216,7 @@ def test_map_batches_chained_multi_column():
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def stage1(table):
         xs = table.column("x").to_pylist()
@@ -2238,16 +2238,16 @@ def test_map_batches_chained_multi_column():
             }
         )
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 5 as x")
     rel2 = rel.map_batches(
         stage1,
-        schema={"x": duckdb.sqltypes.BIGINT, "doubled": duckdb.sqltypes.BIGINT},
+        schema={"x": vane.sqltypes.BIGINT, "doubled": vane.sqltypes.BIGINT},
         execution_backend="subprocess_task",
     )
     rel3 = rel2.map_batches(
         stage2,
-        schema={"x": duckdb.sqltypes.BIGINT, "doubled": duckdb.sqltypes.BIGINT, "quadrupled": duckdb.sqltypes.BIGINT},
+        schema={"x": vane.sqltypes.BIGINT, "doubled": vane.sqltypes.BIGINT, "quadrupled": vane.sqltypes.BIGINT},
         execution_backend="subprocess_task",
     )
     result = rel3.fetchall()
@@ -2260,7 +2260,7 @@ def test_map_batches_on_error_null():
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def upper_fn(table):
         values = table.column(0).to_pylist()
@@ -2268,13 +2268,13 @@ def test_map_batches_on_error_null():
             raise ValueError("bad input")
         return pa.table({"result": [v.upper() for v in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select * from (values ('ok'), ('bad'), ('ok2')) t(val)")
     # Note: error handling depends on the executor implementation
     # This test verifies the basic map_batches path works
     out = rel.map_batches(
         upper_fn,
-        schema={"result": duckdb.sqltypes.VARCHAR},
+        schema={"result": vane.sqltypes.VARCHAR},
         batch_size=2,
         execution_backend="subprocess_task",
     )
@@ -2294,18 +2294,18 @@ def test_map_batches_ndarray():
     np = pytest.importorskip("numpy")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def embed(table):
         values = np.asarray(table.column(0).to_pylist(), dtype=np.int64)
         result = np.stack([values, values + 1, values + 2], axis=1)
         return pa.table({"embedding": result.tolist()})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x union all select 2 as x")
     out = rel.map_batches(
         embed,
-        schema={"embedding": duckdb.list_type(duckdb.sqltypes.BIGINT)},
+        schema={"embedding": vane.list_type(vane.sqltypes.BIGINT)},
         execution_backend="subprocess_task",
     )
     assert sorted(out.fetchall()) == [([1, 2, 3],), ([2, 3, 4],)]
@@ -2317,11 +2317,11 @@ def test_map_batches_fixed_size_list_through_local_exchange():
     np = pytest.importorskip("numpy")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     embed_size = 4
     embed_arrow_type = pa.list_(pa.float32(), embed_size)
-    embed_sql_type = duckdb.array_type(duckdb.sqltypes.FLOAT, embed_size)
+    embed_sql_type = vane.array_type(vane.sqltypes.FLOAT, embed_size)
 
     def stage1(table):
         xs = table.column("x").to_pylist()
@@ -2360,19 +2360,19 @@ def test_map_batches_fixed_size_list_through_local_exchange():
             }
         )
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select * from (values (1), (2), (3), (4)) t(x)")
     out = (
         rel.map_batches(
             stage1,
-            schema={"x": duckdb.sqltypes.BIGINT, "embedding": embed_sql_type},
+            schema={"x": vane.sqltypes.BIGINT, "embedding": embed_sql_type},
             batch_size=2,
             execution_backend="subprocess_task",
         )
         .local_exchange(1)
         .map_batches(
             stage2,
-            schema={"x": duckdb.sqltypes.BIGINT, "embedding_sum": duckdb.sqltypes.FLOAT},
+            schema={"x": vane.sqltypes.BIGINT, "embedding_sum": vane.sqltypes.FLOAT},
             batch_size=2,
             execution_backend="subprocess_task",
         )
@@ -2387,9 +2387,9 @@ def test_map_batches_tensor_through_local_exchange():
     np = pytest.importorskip("numpy")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
-    tensor_type = duckdb.tensor_type(duckdb.sqltypes.FLOAT, (2, 2))
+    tensor_type = vane.tensor_type(vane.sqltypes.FLOAT, (2, 2))
 
     def stage1(table):
         xs = np.asarray(table.column("x").to_pylist(), dtype=np.float32)
@@ -2414,19 +2414,19 @@ def test_map_batches_tensor_through_local_exchange():
             }
         )
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select * from (values (1), (3), (5), (7)) t(x)")
     out = (
         rel.map_batches(
             stage1,
-            schema={"x": duckdb.sqltypes.BIGINT, "embedding": tensor_type},
+            schema={"x": vane.sqltypes.BIGINT, "embedding": tensor_type},
             batch_size=2,
             execution_backend="subprocess_task",
         )
         .local_exchange(1)
         .map_batches(
             stage2,
-            schema={"x": duckdb.sqltypes.BIGINT, "embedding_sum": duckdb.sqltypes.FLOAT},
+            schema={"x": vane.sqltypes.BIGINT, "embedding_sum": vane.sqltypes.FLOAT},
             batch_size=2,
             execution_backend="subprocess_task",
         )
@@ -2441,10 +2441,10 @@ def test_subprocess_streaming_tensor_uses_batch_sized_chunks_under_low_memory():
     np = pytest.importorskip("numpy")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     tensor_shape = (128, 128)
-    tensor_type = duckdb.tensor_type(duckdb.sqltypes.FLOAT, tensor_shape)
+    tensor_type = vane.tensor_type(vane.sqltypes.FLOAT, tensor_shape)
 
     def make_tensor(table):
         xs = table.column("x").to_pylist()
@@ -2468,7 +2468,7 @@ def test_subprocess_streaming_tensor_uses_batch_sized_chunks_under_low_memory():
             }
         )
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("SET memory_limit='32MB'")
     con.execute("SET threads=4")
 
@@ -2476,14 +2476,14 @@ def test_subprocess_streaming_tensor_uses_batch_sized_chunks_under_low_memory():
         con.sql("select 1::BIGINT as x")
         .map_batches(
             make_tensor,
-            schema={"x": duckdb.sqltypes.BIGINT, "embedding": tensor_type},
+            schema={"x": vane.sqltypes.BIGINT, "embedding": tensor_type},
             execution_backend="subprocess_task",
             batch_size=1,
             streaming_breaker=True,
         )
         .map_batches(
             reduce_tensor,
-            schema={"x": duckdb.sqltypes.BIGINT, "embedding_sum": duckdb.sqltypes.FLOAT},
+            schema={"x": vane.sqltypes.BIGINT, "embedding_sum": vane.sqltypes.FLOAT},
             execution_backend="subprocess_task",
             batch_size=1,
             streaming_breaker=True,
@@ -2498,9 +2498,9 @@ def test_map_batches_tensor_nulls_through_local_exchange():
     pytest.importorskip("numpy")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
-    tensor_type = duckdb.tensor_type(duckdb.sqltypes.FLOAT, (2, 2))
+    tensor_type = vane.tensor_type(vane.sqltypes.FLOAT, (2, 2))
     tensor_arrow_type = pa.fixed_shape_tensor(pa.float32(), (2, 2))
     storage_type = pa.list_(pa.float32(), 4)
 
@@ -2538,19 +2538,19 @@ def test_map_batches_tensor_nulls_through_local_exchange():
             }
         )
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select * from (values (1), (2), (3), (4)) t(x)")
     out = (
         rel.map_batches(
             stage1,
-            schema={"x": duckdb.sqltypes.BIGINT, "embedding": tensor_type},
+            schema={"x": vane.sqltypes.BIGINT, "embedding": tensor_type},
             batch_size=2,
             execution_backend="subprocess_task",
         )
         .local_exchange(1)
         .map_batches(
             stage2,
-            schema={"x": duckdb.sqltypes.BIGINT, "embedding_sum": duckdb.sqltypes.FLOAT},
+            schema={"x": vane.sqltypes.BIGINT, "embedding_sum": vane.sqltypes.FLOAT},
             batch_size=2,
             execution_backend="subprocess_task",
         )
@@ -2562,16 +2562,16 @@ def test_map_batches_tensor_nulls_through_local_exchange():
 def test_flat_map_basic():
     """flat_map produces multiple output rows per input row."""
     pytest.importorskip("pyarrow")
-    import duckdb
+    import vane
 
     def duplicate(row):
         return [row, row]
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x union all select 2 as x")
     out = rel.flat_map(
         duplicate,
-        schema={"x": duckdb.sqltypes.BIGINT},
+        schema={"x": vane.sqltypes.BIGINT},
         execution_backend="subprocess_task",
     )
     rows = out.fetchall()
@@ -2583,7 +2583,7 @@ def test_map_batches_rejects_callable_instance():
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     class Adder:
         def __init__(self):
@@ -2594,10 +2594,10 @@ def test_map_batches_rejects_callable_instance():
             return pa.table({"result": [v + self.offset for v in values]})
 
     adder = Adder()
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x union all select 2 as x")
     with pytest.raises(Exception, match="actor UDF backends require a callable class"):
-        rel.map_batches(adder, schema={"result": duckdb.sqltypes.BIGINT}, execution_backend="subprocess_actor")
+        rel.map_batches(adder, schema={"result": vane.sqltypes.BIGINT}, execution_backend="subprocess_actor")
 
 
 def test_map_batches_callable_class_subprocess_actor_backend():
@@ -2605,7 +2605,7 @@ def test_map_batches_callable_class_subprocess_actor_backend():
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     class Adder:
         def __init__(self):
@@ -2615,11 +2615,11 @@ def test_map_batches_callable_class_subprocess_actor_backend():
             values = table.column("x").to_pylist()
             return pa.table({"result": [v + self.offset for v in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x union all select 2 as x")
     out = rel.map_batches(
         Adder,
-        schema={"result": duckdb.sqltypes.BIGINT},
+        schema={"result": vane.sqltypes.BIGINT},
         execution_backend="subprocess_actor",
         actor_number=1,
         gpus=0.0,
@@ -2628,7 +2628,7 @@ def test_map_batches_callable_class_subprocess_actor_backend():
 
 
 def test_map_batches_default_backend_uses_runner_and_callable_shape(monkeypatch):
-    import duckdb
+    import vane
 
     def identity(table):
         return table
@@ -2638,15 +2638,15 @@ def test_map_batches_default_backend_uses_runner_and_callable_shape(monkeypatch)
             return table
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    con = duckdb.connect()
+    con = vane.connect()
 
-    task_rel = con.sql("select 1 as x").map_batches(identity, schema={"x": duckdb.sqltypes.INTEGER})
+    task_rel = con.sql("select 1 as x").map_batches(identity, schema={"x": vane.sqltypes.INTEGER})
     task_plan = task_rel.explain()
     assert "ray_task" in task_plan
 
     actor_rel = con.sql("select 1 as x").map_batches(
         Identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
+        schema={"x": vane.sqltypes.INTEGER},
         actor_number=1,
         gpus=0.0,
     )
@@ -2660,19 +2660,19 @@ def test_map_batches_callable_class_rejects_task_backend():
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     class Adder:
         def __call__(self, table):
             values = table.column("x").to_pylist()
             return pa.table({"result": [v + 1 for v in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x")
     with pytest.raises(Exception, match="task UDF backends require a function, not a callable class"):
         rel.map_batches(
             Adder,
-            schema={"result": duckdb.sqltypes.BIGINT},
+            schema={"result": vane.sqltypes.BIGINT},
             execution_backend="subprocess_task",
         )
 
@@ -2682,17 +2682,17 @@ def test_map_batches_function_rejects_actor_backend():
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     def add_one(table):
         values = table.column("x").to_pylist()
         return pa.table({"result": [v + 1 for v in values]})
 
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql("select 1 as x")
     with pytest.raises(Exception, match="actor UDF backends require a callable class"):
         rel.map_batches(
             add_one,
-            schema={"result": duckdb.sqltypes.BIGINT},
+            schema={"result": vane.sqltypes.BIGINT},
             execution_backend="subprocess_actor",
         )

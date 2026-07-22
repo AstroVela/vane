@@ -21,7 +21,7 @@ def test_row_preserving_ray_actor_materialized_submit_preserves_passthrough_colu
 import pyarrow as pa
 import ray
 import vane
-from duckdb import runners as _runners
+from vane import runners as _runners
 
 vane.configure(runner="ray")
 
@@ -79,11 +79,11 @@ def test_expected_direct_output_types_preserve_block_stream_actor_chain():
 import tempfile
 from pathlib import Path
 
-import duckdb
+import vane
 import pyarrow as pa
 import ray
 import vane
-from duckdb import runners as _runners
+from vane import runners as _runners
 
 vane.configure(runner="ray")
 
@@ -231,12 +231,12 @@ def test_vane_cls_python_and_sql_actor_paths_preserve_state_on_ray():
 import tempfile
 from pathlib import Path
 
-import duckdb
+import vane
 import pyarrow as pa
 import ray
 import vane
 from collections import Counter
-from duckdb import runners as _runners
+from vane import runners as _runners
 
 vane.configure(runner="ray")
 
@@ -385,12 +385,12 @@ import tempfile
 import uuid
 from pathlib import Path
 
-import duckdb
+import vane
 import numpy as np
 import pyarrow as pa
 import ray
 import vane
-from duckdb import runners as _runners
+from vane import runners as _runners
 from tests.ai.test_expression_ai_sql import MockProvider
 from vane.ai import provider as provider_registry
 
@@ -405,7 +405,7 @@ def collect_table(runner, relation):
 
 
 def assert_actor_pool_size(relation, expected):
-    logical = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4()))
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4()))
     restored = pickle.loads(pickle.dumps(logical))
     target = vane.connect()
     try:
@@ -500,11 +500,11 @@ import tempfile
 import uuid
 from pathlib import Path
 
-import duckdb
+import vane
 import pyarrow as pa
 import ray
 import vane
-from duckdb.runners.ray.driver import RayQueryDriverClient
+from vane.runners.ray.driver import RayQueryDriverClient
 from tests.ai.test_expression_ai_functions import MockProvider
 
 vane.configure(runner="ray")
@@ -555,7 +555,7 @@ try:
             ).alias("embedding"),
         ).order("id")
 
-        logical = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             relation,
             str(uuid.uuid4()),
         )

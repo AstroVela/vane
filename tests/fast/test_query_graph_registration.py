@@ -5,12 +5,12 @@ import uuid
 
 import pytest
 
-import duckdb
-from duckdb.runners.ray.query_graph_builder import build_query_execution_graph
+import vane
+from vane.runners.ray.query_graph_builder import build_query_execution_graph
 
 
 def _physical_plan(relation, con, prefix):
-    return duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    return vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         f"{prefix}-{uuid.uuid4().hex[:8]}",
     ).to_physical_plan(con)
@@ -23,7 +23,7 @@ def _parquet_relation(con, tmp_path):
 
 
 def test_physical_plan_exports_complete_deterministic_execution_stage_metadata(tmp_path):
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         plan = _physical_plan(_parquet_relation(con, tmp_path), con, "graph-plain")
 
@@ -43,7 +43,7 @@ def test_physical_plan_exports_complete_deterministic_execution_stage_metadata(t
 
 
 def test_stage_collection_does_not_treat_generic_inout_as_python_udf(tmp_path):
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         path = tmp_path / "generic_inout.parquet"
         con.execute(f"COPY (SELECT i::BIGINT AS x FROM range(2) tbl(i)) TO '{path}' (FORMAT PARQUET)")
@@ -68,11 +68,11 @@ def test_stage_collection_preannotates_ray_udf_payload_on_original_plan(tmp_path
         def __call__(self, table):
             return pa.table({"y": table.column(0)})
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         relation = _parquet_relation(con, tmp_path).map_batches(
             Identity,
-            schema={"y": duckdb.sqltypes.BIGINT},
+            schema={"y": vane.sqltypes.BIGINT},
             execution_backend="ray_actor",
             actor_number=1,
             gpus=0.0,
@@ -109,18 +109,18 @@ def test_stage_collection_preserves_distinct_stage_identity_for_nested_udfs(tmp_
         def __call__(self, table):
             return pa.table({"second": table.column(0)})
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         relation = (
             _parquet_relation(con, tmp_path)
             .map_batches(
                 first,
-                schema={"first": duckdb.sqltypes.BIGINT},
+                schema={"first": vane.sqltypes.BIGINT},
                 execution_backend="ray_task",
             )
             .map_batches(
                 Second,
-                schema={"second": duckdb.sqltypes.BIGINT},
+                schema={"second": vane.sqltypes.BIGINT},
                 execution_backend="ray_actor",
                 actor_number=1,
                 gpus=0.0,

@@ -16,7 +16,7 @@ from typing import Any
 
 import pyarrow as pa
 
-import duckdb
+import vane
 
 
 class SlowUDF:
@@ -55,7 +55,7 @@ def run_benchmark(
     backend: str,
     actor_number: int | None = None,
 ) -> dict[str, Any]:
-    conn = duckdb.connect()
+    conn = vane.connect()
     try:
         rel = conn.sql(f"SELECT i::VARCHAR AS text FROM range({num_rows}) t(i)")
         udf = _make_udf(backend, latency_ms)

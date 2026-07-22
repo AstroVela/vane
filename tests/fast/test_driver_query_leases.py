@@ -9,14 +9,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from duckdb.runners.ray.query_execution_graph import (
+from vane.runners.ray.query_execution_graph import (
     NodeResourceAllocation,
     QueryAllocation,
     QueryExecutionGraph,
     ResourceVector,
     StageResourceSpec,
 )
-from duckdb.runners.ray.query_resource_runtime import (
+from vane.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
     register_query_graph,
 )
@@ -61,7 +61,7 @@ def _allocation() -> QueryAllocation:
 
 
 def _runner(loop: asyncio.AbstractEventLoop):
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -275,7 +275,7 @@ def test_driver_resource_change_evaluates_only_the_selected_task_waiter():
 
 
 def test_driver_resource_change_event_drives_fte_owner_without_polling(monkeypatch):
-    import duckdb.runners.ray.fte_fragment_scheduler as fte_scheduler
+    import vane.runners.ray.fte_fragment_scheduler as fte_scheduler
 
     calls: list[str] = []
     drained = threading.Event()
@@ -918,7 +918,7 @@ def test_query_teardown_resolves_all_pending_admission_futures():
 
 
 def test_query_teardown_cleans_local_state_when_coordinator_lease_expired():
-    from duckdb.runners.ray.query_resource_runtime import (
+    from vane.runners.ray.query_resource_runtime import (
         get_query_resource_manager,
     )
 
@@ -971,7 +971,7 @@ def test_query_teardown_cleans_local_state_when_coordinator_lease_expired():
 
 
 def test_fragment_drop_waits_for_fte_admission_pump_before_registry_drop(monkeypatch):
-    import duckdb.runners.ray.fte_fragment_scheduler as fte_scheduler
+    import vane.runners.ray.fte_fragment_scheduler as fte_scheduler
 
     class _CoordinatorStub:
         def release_query(self, query_id, generation):
@@ -1047,8 +1047,8 @@ def test_fragment_drop_waits_for_fte_admission_pump_before_registry_drop(monkeyp
 
 
 def test_fragment_drop_keeps_query_resources_when_local_fte_registry_cannot_quiesce(monkeypatch):
-    import duckdb.runners.ray.fte_fragment_scheduler as fte_scheduler
-    from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
+    import vane.runners.ray.fte_fragment_scheduler as fte_scheduler
+    from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
     class _CoordinatorStub:
         def __init__(self):
@@ -1098,9 +1098,9 @@ def test_fragment_drop_keeps_query_resources_when_local_fte_registry_cannot_quie
 
 
 def test_fragment_drop_retains_query_owner_while_remote_teardown_is_incomplete(monkeypatch):
-    import duckdb.runners.ray.fte_fragment_scheduler as fte_scheduler
-    from duckdb.runners.ray.driver import QueryTeardownOwnershipError
-    from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
+    import vane.runners.ray.fte_fragment_scheduler as fte_scheduler
+    from vane.runners.ray.driver import QueryTeardownOwnershipError
+    from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
     class _CoordinatorStub:
         def __init__(self):
@@ -1165,7 +1165,7 @@ def test_fragment_drop_retains_query_owner_while_remote_teardown_is_incomplete(m
 
 
 def test_owner_loop_sync_fence_times_out_and_cancels_late_callback():
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     class _StalledLoop:
         def __init__(self):
@@ -1205,7 +1205,7 @@ def test_owner_loop_sync_fence_times_out_and_cancels_late_callback():
 
 
 def test_owner_loop_sync_fence_poisoned_after_started_callback_timeout():
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     class _RunningLoop:
         def __init__(self):
@@ -1257,8 +1257,8 @@ def test_owner_loop_sync_fence_poisoned_after_started_callback_timeout():
 
 
 def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
-    import duckdb.runners.ray.query_graph_builder as graph_builder
-    from duckdb.runners.ray.query_resource_runtime import (
+    import vane.runners.ray.query_graph_builder as graph_builder
+    from vane.runners.ray.query_resource_runtime import (
         get_query_resource_manager,
     )
 
@@ -1287,7 +1287,7 @@ def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
         lambda _graph, _capacity: "demand",
     )
 
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)

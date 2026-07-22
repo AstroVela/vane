@@ -3,14 +3,14 @@
 
 import pytest
 
-from duckdb.runners.ray.query_execution_graph import (
+from vane.runners.ray.query_execution_graph import (
     NodeResourceAllocation,
     QueryAllocation,
     QueryExecutionGraph,
     ResourceVector,
     StageResourceSpec,
 )
-from duckdb.runners.ray.query_resource_runtime import (
+from vane.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
     get_query_resource_manager,
     query_resource_manager_snapshot,

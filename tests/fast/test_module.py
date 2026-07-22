@@ -1,12 +1,18 @@
-import duckdb
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
+import vane
 
 
 class TestModule:
     def test_paramstyle(self):
-        assert duckdb.paramstyle == "qmark"
+        assert vane.paramstyle == "qmark"
 
     def test_threadsafety(self):
-        assert duckdb.threadsafety == 1
+        assert vane.threadsafety == 1
 
     def test_apilevel(self):
-        assert duckdb.apilevel == "2.0"
+        assert vane.apilevel == "2.0"

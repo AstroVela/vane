@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 try:
     import pyarrow as pa
@@ -24,7 +30,7 @@ class TestArrowInterval:
             pa.array([1], pa.duration("s")),
         )
         arrow_table = pa.Table.from_arrays([data[0], data[1], data[2], data[3]], ["a", "b", "c", "d"])
-        rel = duckdb.from_arrow(arrow_table).to_arrow_table()
+        rel = vane.from_arrow(arrow_table).to_arrow_table()
         assert rel["a"] == expected_arrow["a"]
         assert rel["b"] == expected_arrow["a"]
         assert rel["c"] == expected_arrow["a"]
@@ -41,7 +47,7 @@ class TestArrowInterval:
             pa.array([None], pa.duration("s")),
         )
         arrow_table = pa.Table.from_arrays([data[0], data[1], data[2], data[3]], ["a", "b", "c", "d"])
-        rel = duckdb.from_arrow(arrow_table).to_arrow_table()
+        rel = vane.from_arrow(arrow_table).to_arrow_table()
         assert rel["a"] == expected_arrow["a"]
         assert rel["b"] == expected_arrow["a"]
         assert rel["c"] == expected_arrow["a"]
@@ -55,5 +61,5 @@ class TestArrowInterval:
         data = pa.array([9223372036854775807], pa.duration("s"))
         arrow_table = pa.Table.from_arrays([data], ["a"])
 
-        with pytest.raises(duckdb.ConversionException, match="Could not convert Interval to Microsecond"):
-            duckdb.from_arrow(arrow_table).to_arrow_table()
+        with pytest.raises(vane.ConversionException, match="Could not convert Interval to Microsecond"):
+            vane.from_arrow(arrow_table).to_arrow_table()

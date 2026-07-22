@@ -1,10 +1,16 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import sys
 
 import pytest
 
 pa = pytest.importorskip("pyarrow")
 adbc_driver_manager = pytest.importorskip("adbc_driver_manager")
-adbc_driver_duckdb_dbapi = pytest.importorskip("adbc_driver_duckdb.dbapi")
+adbc_driver_duckdb_dbapi = pytest.importorskip("vane_adbc_driver_duckdb.dbapi")
 
 xfail = pytest.mark.xfail
 

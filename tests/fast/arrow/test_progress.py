@@ -1,8 +1,14 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import os
 
 import pytest
 
-import duckdb
+import vane
 
 pyarrow_parquet = pytest.importorskip("pyarrow.parquet")
 
@@ -15,7 +21,7 @@ class TestProgressBarArrow:
         pyarrow = pytest.importorskip("pyarrow")
 
         data = pyarrow.array(np.arange(10000000), type=pyarrow.int32())
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
         duckdb_conn.execute("PRAGMA progress_bar_time=1")
         duckdb_conn.execute("PRAGMA disable_print_progress_bar")
 
@@ -47,7 +53,7 @@ class TestProgressBarArrow:
         pyarrow = pytest.importorskip("pyarrow")
 
         data = pyarrow.array(np.arange(0), type=pyarrow.int32())
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
         duckdb_conn.execute("PRAGMA progress_bar_time=1")
         duckdb_conn.execute("PRAGMA disable_print_progress_bar")
 

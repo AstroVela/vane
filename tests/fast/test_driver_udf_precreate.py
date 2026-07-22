@@ -33,7 +33,7 @@ class _FakePlan:
 
 
 def test_drop_query_fragments_releases_registered_query_resources():
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -52,8 +52,8 @@ def test_drop_query_fragments_releases_registered_query_resources():
 
 
 def test_drop_resource_query_closes_owned_internal_fte_queries(monkeypatch):
-    import duckdb.runners.ray.fte_fragment_scheduler as fte_scheduler
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    import vane.runners.ray.fte_fragment_scheduler as fte_scheduler
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -79,7 +79,7 @@ def test_drop_resource_query_closes_owned_internal_fte_queries(monkeypatch):
 
 
 def test_precreate_udf_actors_skips_non_actor_backend(monkeypatch):
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
 
@@ -100,9 +100,9 @@ def test_precreate_udf_actors_skips_non_actor_backend(monkeypatch):
             plan.set_udf_actor_handles(handles_map, conn=conn)
         return created, handles_map
 
-    fake_mod = types.ModuleType("duckdb.execution.udf_ray")
+    fake_mod = types.ModuleType("vane.execution.udf_ray")
     fake_mod.prepare_actor_pools_for_plan = _fake_prepare_actor_pools_for_plan
-    monkeypatch.setitem(sys.modules, "duckdb.execution.udf_ray", fake_mod)
+    monkeypatch.setitem(sys.modules, "vane.execution.udf_ray", fake_mod)
 
     runner = SimpleNamespace(_duckdb_conn=object(), _active_udf_actors=[])
 
@@ -133,16 +133,16 @@ def test_precreate_udf_actors_skips_non_actor_backend(monkeypatch):
 
 
 def test_precreate_udf_actors_skips_non_ray_nodes(monkeypatch):
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
 
     def _fake_prepare_actor_pools_for_plan(*_args, **_kwargs):
         return [], {}
 
-    fake_mod = types.ModuleType("duckdb.execution.udf_ray")
+    fake_mod = types.ModuleType("vane.execution.udf_ray")
     fake_mod.prepare_actor_pools_for_plan = _fake_prepare_actor_pools_for_plan
-    monkeypatch.setitem(sys.modules, "duckdb.execution.udf_ray", fake_mod)
+    monkeypatch.setitem(sys.modules, "vane.execution.udf_ray", fake_mod)
 
     runner = SimpleNamespace(_duckdb_conn=object(), _active_udf_actors=[])
 
@@ -170,7 +170,7 @@ def test_precreate_udf_actors_skips_non_ray_nodes(monkeypatch):
 
 
 def test_driver_udf_actor_handle_hook_is_disabled_by_default(monkeypatch):
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     monkeypatch.delenv("VANE_ENABLE_UDF_TEST_HOOKS", raising=False)
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
@@ -181,7 +181,7 @@ def test_driver_udf_actor_handle_hook_is_disabled_by_default(monkeypatch):
 
 
 def test_stateful_actor_loss_error_includes_stable_query_context():
-    from duckdb.execution.udf_ray_actor_state import format_stateful_actor_loss
+    from vane.execution.udf_ray_actor_state import format_stateful_actor_loss
 
     class RayActorError(RuntimeError):
         pass
@@ -205,7 +205,7 @@ def test_stateful_actor_loss_error_includes_stable_query_context():
 
 
 def test_non_stateful_udf_error_is_not_rewritten():
-    from duckdb.execution.udf_ray_actor_state import format_stateful_actor_loss
+    from vane.execution.udf_ray_actor_state import format_stateful_actor_loss
 
     error = RuntimeError("ordinary UDF failure")
 
@@ -213,7 +213,7 @@ def test_non_stateful_udf_error_is_not_rewritten():
 
 
 def test_stateful_actor_loss_during_readiness_keeps_recoverability_context():
-    from duckdb.execution.udf_ray_remote_readiness import RemoteUDFActorReadinessMixin
+    from vane.execution.udf_ray_remote_readiness import RemoteUDFActorReadinessMixin
 
     class RayActorError(RuntimeError):
         pass
@@ -240,8 +240,8 @@ def test_stateful_actor_loss_during_readiness_keeps_recoverability_context():
 
 
 def test_stateful_actor_loss_during_synchronous_submit_keeps_recoverability_context(monkeypatch):
-    import duckdb.execution.udf_ray_remote_submit as remote_submit
-    from duckdb.execution.udf_ray_remote_submit import RemoteUDFSubmitMixin
+    import vane.execution.udf_ray_remote_submit as remote_submit
+    from vane.execution.udf_ray_remote_submit import RemoteUDFSubmitMixin
 
     class RayActorError(RuntimeError):
         pass
@@ -314,7 +314,7 @@ def test_stateful_actor_loss_during_synchronous_submit_keeps_recoverability_cont
 def test_precreate_udf_actors_enable_generic_async_for_distributed_pool(
     monkeypatch,
 ):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     calls = []
 
@@ -382,7 +382,7 @@ def test_precreate_udf_actors_enable_generic_async_for_distributed_pool(
 
 
 def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     calls = []
 
@@ -467,7 +467,7 @@ def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name
 
 
 def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_udf(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     calls = []
 
@@ -566,8 +566,8 @@ def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_
     ids=["stateless", "ai"],
 )
 def test_ensure_actor_pools_for_plan_keeps_default_retry_policy_for_non_stateful_udf(monkeypatch, payload):
-    import duckdb.execution.udf_ray as udf_ray
-    from duckdb.execution.udf_ray_config import MAX_ACTOR_RESTARTS, MAX_ACTOR_TASK_RETRIES
+    import vane.execution.udf_ray as udf_ray
+    from vane.execution.udf_ray_config import MAX_ACTOR_RESTARTS, MAX_ACTOR_TASK_RETRIES
 
     calls = []
 
@@ -616,7 +616,7 @@ def test_ensure_actor_pools_for_plan_keeps_default_retry_policy_for_non_stateful
 
 
 def test_local_subprocess_actor_pool_rejects_multi_actor_stateful_payload():
-    from duckdb.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_nodes
+    from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_nodes
 
     payload = {
         "udf_name": "stateful_counter",
@@ -636,7 +636,7 @@ def test_local_subprocess_actor_pool_rejects_multi_actor_stateful_payload():
 
 
 def test_local_stateful_actor_loss_includes_udf_pid_and_recoverability_context():
-    from duckdb.execution.udf_subprocess import LocalSubprocessActorPool
+    from vane.execution.udf_subprocess import LocalSubprocessActorPool
 
     pool = LocalSubprocessActorPool.__new__(LocalSubprocessActorPool)
     pool.payload = {"udf_name": "local_counter", "stateful": True}
@@ -656,7 +656,7 @@ def test_local_stateful_actor_loss_includes_udf_pid_and_recoverability_context()
 
 
 def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     calls = []
     injected = []
@@ -731,7 +731,7 @@ def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):
 
 
 def test_prepare_actor_pools_publishes_handles_before_waiting_for_init(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     resolved = []
 
@@ -805,7 +805,7 @@ def test_prepare_actor_pools_publishes_handles_before_waiting_for_init(monkeypat
 
 
 def test_udf_actor_pool_shutdown_accepts_query_owned_kill_flag(monkeypatch):
-    import duckdb.execution.udf_ray_actor_pool as actor_pool_mod
+    import vane.execution.udf_ray_actor_pool as actor_pool_mod
 
     killed = []
     fake_ray = types.SimpleNamespace(
@@ -829,7 +829,7 @@ def test_udf_actor_pool_shutdown_accepts_query_owned_kill_flag(monkeypatch):
 
 
 def test_ensure_actor_pools_for_plan_does_not_fail_fast_on_cluster_resource_snapshot(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     calls = []
 
@@ -890,7 +890,7 @@ def test_ensure_actor_pools_for_plan_does_not_fail_fast_on_cluster_resource_snap
 
 
 def test_ensure_actor_pools_for_plan_skips_python_udf_payload(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     calls = []
 
@@ -943,7 +943,7 @@ def test_ensure_actor_pools_for_plan_skips_python_udf_payload(monkeypatch):
 
 
 def test_ensure_actor_pools_for_plan_propagates_collect_errors(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     class _BadPlan:
         def collect_udf_nodes(self, conn=None):
@@ -960,7 +960,7 @@ def test_ensure_actor_pools_for_plan_propagates_collect_errors(monkeypatch):
 
 
 def test_ensure_actor_pools_for_plan_propagates_actor_creation_errors(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     class _FakeRay(types.ModuleType):
         def __init__(self) -> None:
@@ -1017,7 +1017,7 @@ def _build_simple_ray_udf_plan(con):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     class AddOne:
         def __call__(self, table):
@@ -1026,13 +1026,13 @@ def _build_simple_ray_udf_plan(con):
 
     relation = con.sql("SELECT 1 AS x UNION ALL SELECT 2 AS x").map_batches(
         AddOne,
-        schema={"y": duckdb.sqltypes.BIGINT},
+        schema={"y": vane.sqltypes.BIGINT},
         execution_backend="ray_actor",
         actor_number=1,
         gpus=0.0,
         streaming_breaker=False,
     )
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         f"udf-executor-options-{uuid.uuid4().hex[:8]}",
     ).to_physical_plan(con)
@@ -1044,9 +1044,9 @@ def test_physical_plan_structured_executor_options_reach_udf_builder(monkeypatch
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
-    import duckdb.execution.udf as udf_exec
-    from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+    import vane
+    import vane.execution.udf as udf_exec
+    from vane.execution.ref_bundle import make_local_shm_ref_bundle_result
 
     build_calls = []
 
@@ -1116,7 +1116,7 @@ def test_physical_plan_structured_executor_options_reach_udf_builder(monkeypatch
 
     monkeypatch.setattr(udf_exec, "build_executor", _build_executor)
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         plan = _build_simple_ray_udf_plan(con)
         plan.set_udf_actor_handles(
@@ -1129,7 +1129,7 @@ def test_physical_plan_structured_executor_options_reach_udf_builder(monkeypatch
             conn=con,
         )
 
-        result = duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(con.cursor(), plan, None, None)
+        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(con.cursor(), plan, None, None)
         table = _table_from_native_result(result)
     finally:
         con.close()
@@ -1149,10 +1149,10 @@ def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
         import gc
         import uuid
 
-        import duckdb
+        import vane
         import pyarrow as pa
-        import duckdb.execution.udf as udf_exec
-        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+        import vane.execution.udf as udf_exec
+        from vane.execution.ref_bundle import make_local_shm_ref_bundle_result
 
 
         class _FakeExecutor:
@@ -1225,17 +1225,17 @@ def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
 
         udf_exec.build_executor = _build_executor
 
-        con = duckdb.connect()
+        con = vane.connect()
         cursor = con.cursor()
         relation = con.sql("SELECT 1 AS x UNION ALL SELECT 2 AS x").map_batches(
             AddOne,
-            schema={"y": duckdb.sqltypes.BIGINT},
+            schema={"y": vane.sqltypes.BIGINT},
             execution_backend="ray_actor",
             actor_number=1,
             gpus=0.0,
             streaming_breaker=False,
         )
-        plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             relation,
             f"udf-cleanup-gil-{uuid.uuid4().hex[:8]}",
         ).to_physical_plan(con)
@@ -1249,7 +1249,7 @@ def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
             conn=con,
         )
 
-        result = duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(cursor, plan, None, None)
+        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(cursor, plan, None, None)
         payloads = list(result.partition_payloads)
         assert payloads[0].column(0).to_pylist() == [2, 3]
 
@@ -1273,8 +1273,8 @@ def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
 
 def test_physical_plan_rejects_legacy_list_executor_options(monkeypatch):
     pytest.importorskip("pyarrow")
-    import duckdb
-    import duckdb.execution.udf as udf_exec
+    import vane
+    import vane.execution.udf as udf_exec
 
     build_call_count = 0
 
@@ -1285,13 +1285,13 @@ def test_physical_plan_rejects_legacy_list_executor_options(monkeypatch):
 
     monkeypatch.setattr(udf_exec, "build_executor", _unexpected_build_executor)
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         plan = _build_simple_ray_udf_plan(con)
         plan.set_udf_actor_handles({"0": ["bad-handle"]}, conn=con)
 
         with pytest.raises(ValueError, match="udf executor options must be a dict"):
-            duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(con.cursor(), plan, None, None)
+            vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(con.cursor(), plan, None, None)
     finally:
         con.close()
 
@@ -1299,7 +1299,7 @@ def test_physical_plan_rejects_legacy_list_executor_options(monkeypatch):
 
 
 def test_ensure_actor_pools_for_plan_uses_coordinator_actor_nodes(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     class _FakeActorsObj:
         def __init__(self, actors):
@@ -1357,7 +1357,7 @@ def test_ensure_actor_pools_for_plan_uses_coordinator_actor_nodes(monkeypatch):
 
 
 def test_ensure_actor_pools_waits_for_init_refs_before_ready_lookup(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     class _FakeActorsObj:
         def __init__(self, actors, init_refs):

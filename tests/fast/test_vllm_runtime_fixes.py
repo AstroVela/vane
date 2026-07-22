@@ -23,13 +23,13 @@ import pytest
     ],
 )
 def test_vllm_numeric_options_are_strict(options, message):
-    from duckdb.execution.vllm import normalize_options
+    from vane.execution.vllm import normalize_options
 
     with pytest.raises(ValueError, match=message):
         normalize_options(options)
 
 
 def test_vllm_fractional_gpu_option_is_preserved():
-    from duckdb.execution.vllm import normalize_options
+    from vane.execution.vllm import normalize_options
 
     assert normalize_options({"gpus_per_actor": 0.25})["gpus_per_actor"] == pytest.approx(0.25)

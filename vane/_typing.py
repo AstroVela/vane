@@ -16,13 +16,13 @@ Usage::
 
 from __future__ import annotations
 
-from duckdb import (
+from vane import (
     DuckDBPyConnection as Connection,
 )
-from duckdb import (
+from vane import (
     DuckDBPyRelation as Relation,
 )
-from duckdb import (
+from vane import (
     Expression,
     Statement,
 )

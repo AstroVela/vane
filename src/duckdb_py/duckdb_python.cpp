@@ -36,7 +36,7 @@
 #include "duckdb/execution/distributed/common_types.hpp"
 
 #ifndef DUCKDB_PYTHON_LIB_NAME
-#define DUCKDB_PYTHON_LIB_NAME _duckdb
+#define DUCKDB_PYTHON_LIB_NAME _vane_duckdb
 #endif
 
 namespace py = pybind11;
@@ -1098,7 +1098,7 @@ static void RegisterExpectedResultType(py::handle &m) {
 //
 // Right now we export two symbols only:
 // - duckdb_adbc_init: the entrypoint for our ADBC driver
-// - PyInit__duckdb: the entrypoint for the python extension
+// - PyInit__vane_duckdb: the entrypoint for the Python extension
 //
 // All symbols that need exporting must be added to both the list below
 // AND to CMakeLists.txt.
@@ -1129,11 +1129,13 @@ PYBIND11_MODULE(DUCKDB_PYTHON_LIB_NAME, m) { // NOLINT
 	RegisterStatementType(m);
 	RegisterExpectedResultType(m);
 
-	// Expose experimental ray C++ bindings as `duckdb.ray_cxx`
+	// Register experimental Ray C++ bindings on the private native module. The
+	// public `vane` package installs the `vane.ray_cxx` alias after initialization.
 	extern void register_ray_bindings(py::module_ & m);
 	register_ray_bindings(m);
 
-	// Expose vane-runners C++ bindings as `duckdb.vane_runners` and `duckdb.vane_runners_cpp`
+	// Register runner bindings on the private native module. The public `vane`
+	// package installs the runner aliases after initialization.
 	extern void register_vane_runners(py::module_ & m);
 	register_vane_runners(m);
 
@@ -1175,7 +1177,7 @@ PYBIND11_MODULE(DUCKDB_PYTHON_LIB_NAME, m) { // NOLINT
 	py::options pybind_opts;
 
 	m.doc() = "DuckDB is an embeddable SQL OLAP Database Management System";
-	m.attr("__package__") = "duckdb";
+	m.attr("__package__") = "vane";
 	m.attr("__version__") = std::string(DuckDB::LibraryVersion()).substr(1);
 	m.attr("__standard_vector_size__") = DuckDB::StandardVectorSize();
 	m.attr("__git_revision__") = DuckDB::SourceID();

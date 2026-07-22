@@ -69,6 +69,11 @@ Install the `vane-ai` package from PyPI:
 pip install vane-ai
 ```
 
+Vane can be installed alongside the official `duckdb` distribution. Use
+`import vane` for Vane's private engine and `import duckdb` for the official
+package; neither distribution owns or aliases the other's modules. See the
+[compatibility and versioning contract](COMPATIBILITY.md) for details.
+
 For more details, see the [Installation Guide](https://vane.astrovela.ai/docs/data/quickstart/installation).
 
 ### Quick Start

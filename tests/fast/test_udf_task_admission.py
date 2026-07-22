@@ -7,11 +7,11 @@ from concurrent.futures import Future
 
 import pytest
 
-from duckdb.execution.udf_admission import (
+from vane.execution.udf_admission import (
     LocalExecutionSlotPool,
     LocalSlotAdmissionAuthority,
 )
-from duckdb.execution.udf_task_admission import TaskAdmissionController
+from vane.execution.udf_task_admission import TaskAdmissionController
 
 
 class _RemoteMethod:

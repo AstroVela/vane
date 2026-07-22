@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 
 class TestRAPIDescription:
@@ -11,7 +17,7 @@ class TestRAPIDescription:
         types = [x[1] for x in desc]
         assert names == ["a", "b"]
         assert types == ["INTEGER", "BIGINT"]
-        assert all(x == duckdb.NUMBER for x in types)
+        assert all(x == vane.NUMBER for x in types)
 
     def test_rapi_describe(self, duckdb_cursor):
         np = pytest.importorskip("numpy")

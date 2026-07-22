@@ -1,9 +1,15 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 
 import pytest
 from packaging.version import Version
 
-import duckdb
+import vane
 
 # https://pandas.pydata.org/docs/dev/user_guide/copy_on_write.html
 pandas = pytest.importorskip("pandas", "1.5", reason="copy_on_write does not exist in earlier versions")
@@ -36,7 +42,7 @@ class TestCopyOnWrite:
         ],
     )
     def test_copy_on_write(self, col):
-        con = duckdb.connect()
+        con = vane.connect()
         df_in = pandas.DataFrame(  # noqa: F841
             {
                 "numbers": col,

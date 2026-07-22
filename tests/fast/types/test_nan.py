@@ -1,9 +1,15 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 
 import numpy as np
 import pytest
 
-import duckdb
+import vane
 
 pandas = pytest.importorskip("pandas")
 
@@ -22,7 +28,7 @@ class TestPandasNaN:
         df.loc[0, "datetest"] = pandas.NaT
         # now pass the DF through duckdb:
 
-        conn = duckdb.connect(":memory:")
+        conn = vane.connect(":memory:")
         conn.register("testing_null_values", df)
         # scan the DF and fetch the results normally
         results = conn.execute("select * from testing_null_values").fetchall()

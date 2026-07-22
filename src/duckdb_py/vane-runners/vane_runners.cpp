@@ -73,12 +73,12 @@ public:
 		VaneRunnerReleasePyObject(pyobj);
 	}
 
-	// factory: import duckdb.runners.ray_runner and instantiate
+	// factory: import vane.runners.ray_runner and instantiate
 	static std::unique_ptr<RayRunner> try_new(const std::pair<bool, std::string> &address,
 	                                          const std::pair<bool, size_t> &max_task_backlog,
 	                                          const std::pair<bool, bool> &force_client_mode) {
 		duckdb::PythonGILWrapper gil;
-		py::module_ mod = py::module_::import("duckdb.runners.ray.runner");
+		py::module_ mod = py::module_::import("vane.runners.ray.runner");
 		py::object RayRunnerClass = mod.attr("RayRunner");
 		py::object py_address = address.first ? py::cast(address.second) : py::none();
 		py::object py_max_task_backlog = max_task_backlog.first ? py::cast(max_task_backlog.second) : py::none();
@@ -111,7 +111,7 @@ public:
 
 	static std::unique_ptr<LocalRunner> try_new() {
 		duckdb::PythonGILWrapper gil;
-		py::module_ mod = py::module_::import("duckdb.runners.local.runner");
+		py::module_ mod = py::module_::import("vane.runners.local.runner");
 		py::object LocalRunnerClass = mod.attr("LocalRunner");
 		py::object instance = LocalRunnerClass();
 		return std::unique_ptr<LocalRunner>(new LocalRunner(instance));
@@ -120,7 +120,7 @@ public:
 	static std::unique_ptr<LocalRunner> try_new(py::object num_workers, py::object max_running_tasks,
 	                                            py::object execution_mode) {
 		duckdb::PythonGILWrapper gil;
-		py::module_ mod = py::module_::import("duckdb.runners.local.runner");
+		py::module_ mod = py::module_::import("vane.runners.local.runner");
 		py::object LocalRunnerClass = mod.attr("LocalRunner");
 		py::dict kwargs;
 		if (!num_workers.is_none()) {
@@ -410,15 +410,10 @@ void register_vane_runners(py::module_ &m) {
 	} catch (...) {
 	}
 
-	// Also attach the submodule to the higher-level Python package `duckdb` so it is available
-	// as `duckdb.vane_runners` / `duckdb.vane_runners_cpp` from Python code.
-	try {
-		py::module_ duckdb_pkg = py::module_::import("duckdb");
-		duckdb_pkg.attr("vane_runners_cpp") = m;
-		duckdb_pkg.attr("vane_runners") = m;
-	} catch (...) {
-		// swallow: package may not be importable in some contexts during build
-	}
+	// The public `vane` package installs its runner aliases after this native
+	// module has finished initializing. Importing that package from here would
+	// expose a partially initialized extension when `_vane_duckdb` is imported
+	// directly.
 }
 
 } // namespace duckdb

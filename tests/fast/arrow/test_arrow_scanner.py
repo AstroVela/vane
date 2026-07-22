@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 from pathlib import Path
 
-import duckdb
+import vane
 
 try:
     import pyarrow
@@ -19,7 +25,7 @@ class TestArrowScanner:
         if not can_run:
             return
 
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
         duckdb_conn.execute("PRAGMA threads=4")
 
         parquet_filename = str(Path(__file__).parent / "data" / "userdata1.parquet")
@@ -45,7 +51,7 @@ class TestArrowScanner:
         if not can_run:
             return
 
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
         duckdb_conn.execute("PRAGMA threads=4")
 
         parquet_filename = str(Path(__file__).parent / "data" / "userdata1.parquet")
@@ -69,7 +75,7 @@ class TestArrowScanner:
         if not can_run:
             return
 
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
         duckdb_conn.execute("PRAGMA threads=4")
 
         parquet_filename = str(Path(__file__).parent / "data" / "userdata1.parquet")
@@ -110,6 +116,6 @@ class TestArrowScanner:
 
         arrow_scanner = Scanner.from_dataset(arrow_dataset, filter=scanner_filter)
 
-        rel = duckdb.from_arrow(arrow_scanner)
+        rel = vane.from_arrow(arrow_scanner)
 
         assert rel.aggregate("count(*)").execute().fetchone()[0] == 12

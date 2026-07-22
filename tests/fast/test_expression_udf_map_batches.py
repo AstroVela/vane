@@ -228,7 +228,6 @@ def test_vane_function_batch_local_fast_runner_rewrites_streaming_contract(monke
 
     import pyarrow as pa
 
-    import duckdb
     import vane
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
@@ -246,7 +245,7 @@ def test_vane_function_batch_local_fast_runner_rewrites_streaming_contract(monke
     con = vane.connect()
     try:
         relation = con.sql("select i::INTEGER as x from range(3) t(i)").select(expr.alias("y"))
-        plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             relation,
             str(uuid.uuid4()),
         ).to_physical_plan(con)

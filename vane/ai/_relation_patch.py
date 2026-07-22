@@ -4,7 +4,7 @@
 """Monkey-patch AI convenience methods onto DuckDBPyRelation.
 
 This module adds ``.embed_text()``, ``.classify_text()``, and ``.prompt()``
-directly to :class:`duckdb.DuckDBPyRelation` so users can write::
+directly to :class:`vane.DuckDBPyRelation` so users can write::
 
     rel.embed_text("text_col", provider="transformers")
 
@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from duckdb import DuckDBPyRelation
+from vane import DuckDBPyRelation
 
 
 def _embed_text(

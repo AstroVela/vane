@@ -1,7 +1,13 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pandas as pd
 import pytest
 
-import duckdb
+import vane
 
 
 class TestPandasEnum:
@@ -39,7 +45,7 @@ class TestPandasEnum:
         )
         duckdb_cursor.register("df", df)
         with pytest.raises(
-            duckdb.ConversionException,
+            vane.ConversionException,
             match="Type UINT8 with value 0 can't be cast because the value is out of range for the destination "
             "type UINT8",
         ):

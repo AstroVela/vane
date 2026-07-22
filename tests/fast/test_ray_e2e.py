@@ -17,8 +17,8 @@ except Exception:
 
 from ray_test_profile import ray_test_object_store_bytes
 
-import duckdb
-from duckdb import runners as _runners
+import vane
+from vane import runners as _runners
 
 RAY_E2E_ROWS = 1000
 
@@ -59,7 +59,7 @@ def _configure_conn_for_s3(conn, endpoint, access_key, secret_key, region):
 
 def _skip_unless_minio_writable(endpoint, access_key, secret_key, region, bucket):
     probe_path = f"s3://{bucket}/flight-exchange-minio-preflight/{uuid.uuid4()}/probe.parquet"
-    conn = duckdb.connect()
+    conn = vane.connect()
     try:
         _configure_conn_for_s3(conn, endpoint, access_key, secret_key, region)
         conn.execute(f"COPY (SELECT 1 AS value) TO '{probe_path}' (FORMAT PARQUET)")
@@ -97,12 +97,12 @@ def _log_builder_info(df):
 
 
 def _get_distributed_plan_info(df, label):
-    ray_cxx = getattr(duckdb, "ray_cxx", None)
+    ray_cxx = getattr(vane, "ray_cxx", None)
     if ray_cxx is None or not hasattr(ray_cxx, "PyLogicalPlan"):
         return None, None
     try:
         logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(df, f"{label}-plan")
-        conn = duckdb.connect()
+        conn = vane.connect()
         plan = logical_plan.to_physical_plan(conn)
     except Exception:
         return None, None
@@ -298,7 +298,7 @@ def _run_query_case(
 
 @pytest.fixture
 def duckdb_conn():
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         yield con
     finally:
@@ -308,7 +308,7 @@ def duckdb_conn():
 @pytest.fixture
 def parquet_path(tmp_path):
     parquet_path = tmp_path / "ray_e2e.parquet"
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.execute(f"""
             COPY (
@@ -327,7 +327,7 @@ def parquet_path(tmp_path):
 @pytest.fixture
 def partitioned_parquet_path(tmp_path):
     partitioned_path = tmp_path / "ray_e2e_partitioned"
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.execute(f"""
             COPY (
@@ -364,7 +364,7 @@ def ray_runner(_vane_shuffle_env, request):
     finally:
         # Ensure the compiled runner pointer is cleared between tests so we don't
         # reuse a Ray actor from a previous cluster lifecycle.
-        vane_mod = getattr(duckdb, "vane_runners_cpp", None)
+        vane_mod = getattr(vane, "vane_runners_cpp", None)
         if vane_mod is not None and hasattr(vane_mod, "teardown_runner"):
             vane_mod.teardown_runner()
 
@@ -410,7 +410,7 @@ def ray_runner_local_cluster(_vane_shuffle_env):
     try:
         yield runner
     finally:
-        vane_mod = getattr(duckdb, "vane_runners_cpp", None)
+        vane_mod = getattr(vane, "vane_runners_cpp", None)
         if vane_mod is not None and hasattr(vane_mod, "teardown_runner"):
             vane_mod.teardown_runner()
         try:
@@ -537,7 +537,7 @@ def test_ray_udf_distributed(ray_runner, duckdb_conn, tmp_path):
     base = duckdb_conn.sql(f"SELECT * FROM read_parquet('{input_path!s}')")
     df = base.map_batches(
         Upper,
-        schema={"id": duckdb.sqltype("INTEGER"), "val": duckdb.sqltype("VARCHAR"), "out": duckdb.sqltype("VARCHAR")},
+        schema={"id": vane.sqltype("INTEGER"), "val": vane.sqltype("VARCHAR"), "out": vane.sqltype("VARCHAR")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=0.0,
@@ -589,7 +589,7 @@ def test_ray_udf_block_producing_single_stage_distributed(ray_runner, duckdb_con
     base = duckdb_conn.sql(f"SELECT * FROM read_parquet('{input_path!s}')")
     df = base.map_batches(
         Expand,
-        schema={"combined": duckdb.sqltype("INTEGER")},
+        schema={"combined": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=0.0,
@@ -634,7 +634,7 @@ def test_ray_udf_lazy_output_cpu_only_uses_direct_stream_output_distributed(ray_
     base = duckdb_conn.sql(f"SELECT * FROM read_parquet('{input_path!s}')")
     df = base.map_batches(
         Upper,
-        schema={"id": duckdb.sqltype("INTEGER"), "out": duckdb.sqltype("VARCHAR")},
+        schema={"id": vane.sqltype("INTEGER"), "out": vane.sqltype("VARCHAR")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=0.0,
@@ -671,14 +671,14 @@ def test_ray_udf_lazy_output_defaults_to_enabled(duckdb_conn):
     base = duckdb_conn.sql("SELECT * FROM (VALUES ('a'), ('b')) t(val)")
     df = base.map_batches(
         Upper,
-        schema={"out": duckdb.sqltype("VARCHAR")},
+        schema={"out": vane.sqltype("VARCHAR")},
         execution_backend="ray_actor",
         actor_number=1,
         gpus=0.0,
         batch_size=2,
     ).map_batches(
         Suffix,
-        schema={"final": duckdb.sqltype("VARCHAR")},
+        schema={"final": vane.sqltype("VARCHAR")},
         execution_backend="ray_actor",
         actor_number=1,
         gpus=1,
@@ -725,14 +725,14 @@ def test_ray_udf_lazy_output_input_passthrough_distributed(ray_runner, duckdb_co
     base = duckdb_conn.sql(f"SELECT * FROM read_parquet('{input_path!s}')")
     df = base.map_batches(
         Stage1,
-        schema={"score": duckdb.sqltype("INTEGER")},
+        schema={"score": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=0.0,
         batch_size=2,
     ).map_batches(
         Stage2,
-        schema={"combined": duckdb.sqltype("INTEGER")},
+        schema={"combined": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=1,
@@ -789,7 +789,7 @@ def test_ray_udf_lazy_output_projection_limit_passthrough_distributed(ray_runner
     base = duckdb_conn.sql(f"SELECT * FROM read_parquet('{input_path!s}')")
     produced = base.map_batches(
         Stage1,
-        schema={"id": duckdb.sqltype("INTEGER"), "score": duckdb.sqltype("INTEGER")},
+        schema={"id": vane.sqltype("INTEGER"), "score": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=0.0,
@@ -800,7 +800,7 @@ def test_ray_udf_lazy_output_projection_limit_passthrough_distributed(ray_runner
         .limit(3)
         .map_batches(
             Stage2,
-            schema={"combined": duckdb.sqltype("INTEGER")},
+            schema={"combined": vane.sqltype("INTEGER")},
             execution_backend="ray_actor",
             actor_number=2,
             gpus=1,
@@ -859,7 +859,7 @@ def test_ray_udf_lazy_output_local_exchange_passthrough_distributed(ray_runner, 
     base = duckdb_conn.sql(f"SELECT * FROM read_parquet('{input_path!s}')")
     produced = base.map_batches(
         Stage1,
-        schema={"id": duckdb.sqltype("INTEGER"), "score": duckdb.sqltype("INTEGER")},
+        schema={"id": vane.sqltype("INTEGER"), "score": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=0.0,
@@ -867,7 +867,7 @@ def test_ray_udf_lazy_output_local_exchange_passthrough_distributed(ray_runner, 
     )
     df = produced.local_exchange(2).map_batches(
         Stage2,
-        schema={"combined": duckdb.sqltype("INTEGER")},
+        schema={"combined": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=1,
@@ -924,7 +924,7 @@ def test_ray_udf_lazy_output_filter_materialize_distributed(ray_runner, duckdb_c
     base = duckdb_conn.sql(f"SELECT * FROM read_parquet('{input_path!s}')")
     produced = base.map_batches(
         Stage1,
-        schema={"id": duckdb.sqltype("INTEGER"), "score": duckdb.sqltype("INTEGER")},
+        schema={"id": vane.sqltype("INTEGER"), "score": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=0.0,
@@ -932,7 +932,7 @@ def test_ray_udf_lazy_output_filter_materialize_distributed(ray_runner, duckdb_c
     )
     df = produced.filter("score >= 20").map_batches(
         Stage2,
-        schema={"combined": duckdb.sqltype("INTEGER")},
+        schema={"combined": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=0.0,
@@ -976,14 +976,14 @@ def test_ray_udf_lazy_output_budget_plan(duckdb_conn):
     base = duckdb_conn.sql("SELECT * FROM udf_lazy_budget_input")
     df = base.map_batches(
         Stage1,
-        schema={"score": duckdb.sqltype("INTEGER")},
+        schema={"score": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=0.0,
         batch_size=2,
     ).map_batches(
         Stage2,
-        schema={"combined": duckdb.sqltype("INTEGER")},
+        schema={"combined": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=1,
@@ -1031,14 +1031,14 @@ def test_ray_udf_direct_output_lease_lifetime(ray_runner, duckdb_conn, tmp_path)
     base = duckdb_conn.sql(f"SELECT * FROM read_parquet('{input_path!s}')")
     df = base.map_batches(
         Stage1,
-        schema={"score": duckdb.sqltype("INTEGER")},
+        schema={"score": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=0.0,
         batch_size=2,
     ).map_batches(
         Stage2,
-        schema={"combined": duckdb.sqltype("INTEGER")},
+        schema={"combined": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=1,
         gpus=1,
@@ -1084,7 +1084,7 @@ def test_ray_udf_streaming_breaker_distributed(ray_runner, duckdb_conn, tmp_path
     base = duckdb_conn.sql(f"SELECT * FROM read_parquet('{input_path!s}')")
     df = base.map_batches(
         Upper,
-        schema={"id": duckdb.sqltype("INTEGER"), "val": duckdb.sqltype("VARCHAR"), "out": duckdb.sqltype("VARCHAR")},
+        schema={"id": vane.sqltype("INTEGER"), "val": vane.sqltype("VARCHAR"), "out": vane.sqltype("VARCHAR")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=0.0,
@@ -1135,7 +1135,7 @@ def test_ray_udf_streaming_breaker_non_row_preserving(ray_runner, duckdb_conn, t
     base = duckdb_conn.sql(f"SELECT * FROM read_parquet('{input_path!s}')")
     df = base.map_batches(
         Explode,
-        schema={"id": duckdb.sqltype("INTEGER")},
+        schema={"id": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=0.0,
@@ -1178,7 +1178,7 @@ def test_ray_udf_streaming_breaker_backpressure_preserves_rows(ray_runner, duckd
     base = duckdb_conn.sql(f"SELECT * FROM read_parquet('{input_path!s}')")
     df = base.map_batches(
         PlusOne,
-        schema={"id": duckdb.sqltype("INTEGER"), "out": duckdb.sqltype("INTEGER")},
+        schema={"id": vane.sqltype("INTEGER"), "out": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=1,
         gpus=0.0,
@@ -1223,14 +1223,14 @@ def test_ray_udf_lazy_streaming_producer_plan(duckdb_conn):
     base = duckdb_conn.sql("SELECT * FROM lazy_streaming_plan_input")
     df = base.map_batches(
         Stage1,
-        schema={"score": duckdb.sqltype("INTEGER")},
+        schema={"score": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=0.0,
         batch_size=2,
     ).map_batches(
         Stage2,
-        schema={"combined": duckdb.sqltype("INTEGER")},
+        schema={"combined": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=1,
         gpus=1,
@@ -1286,7 +1286,7 @@ def test_ray_udf_lazy_streaming_producer_yields_ref_bundles(ray_runner, duckdb_c
     base = duckdb_conn.sql(f"SELECT * FROM read_parquet('{input_path!s}')")
     df = base.map_batches(
         Stage1,
-        schema={"score": duckdb.sqltype("INTEGER")},
+        schema={"score": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=1,
         gpus=0.0,
@@ -1294,8 +1294,8 @@ def test_ray_udf_lazy_streaming_producer_yields_ref_bundles(ray_runner, duckdb_c
     ).map_batches(
         Stage2,
         schema={
-            "score": duckdb.sqltype("INTEGER"),
-            "seen_rows": duckdb.sqltype("INTEGER"),
+            "score": vane.sqltype("INTEGER"),
+            "seen_rows": vane.sqltype("INTEGER"),
         },
         execution_backend="ray_actor",
         actor_number=1,
@@ -1351,13 +1351,13 @@ def test_ray_task_map_batches_ref_passthrough_to_actor_distributed(ray_runner, d
     base = duckdb_conn.sql(f"SELECT * FROM read_parquet('{input_path!s}')")
     df = base.map_batches(
         stage1,
-        schema={"score": duckdb.sqltype("INTEGER")},
+        schema={"score": vane.sqltype("INTEGER")},
         execution_backend="ray_task",
         batch_size=2,
         streaming_breaker=True,
     ).map_batches(
         Stage2,
-        schema={"combined": duckdb.sqltype("INTEGER")},
+        schema={"combined": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=1,
         cpus=1.0,
@@ -1394,15 +1394,15 @@ def test_ray_task_large_block_stream_reaches_actor_with_bounded_leases(tmp_path,
         import time
         from pathlib import Path
 
-        import duckdb
+        import vane
         import pyarrow as pa
-        from duckdb import runners as _runners
+        from vane import runners as _runners
 
         row_count = 512
         payload_len = 524288
         input_path = Path({str(tmp_path / "large_ref_stream_input.parquet")!r})
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=8")
         con.execute(
             f'''
@@ -1434,8 +1434,8 @@ def test_ray_task_large_block_stream_reaches_actor_with_bounded_leases(tmp_path,
             .map_batches(
                 producer,
                 schema={{
-                    "id": duckdb.sqltypes.INTEGER,
-                    "payload": duckdb.sqltypes.VARCHAR,
+                    "id": vane.sqltypes.INTEGER,
+                    "payload": vane.sqltypes.VARCHAR,
                 }},
                 execution_backend="ray_task",
                 cpus=1.0,
@@ -1447,8 +1447,8 @@ def test_ray_task_large_block_stream_reaches_actor_with_bounded_leases(tmp_path,
             .map_batches(
                 Consumer,
                 schema={{
-                    "id": duckdb.sqltypes.INTEGER,
-                    "payload_len": duckdb.sqltypes.INTEGER,
+                    "id": vane.sqltypes.INTEGER,
+                    "payload_len": vane.sqltypes.INTEGER,
                 }},
                 execution_backend="ray_actor",
                 actor_number=1,
@@ -1497,14 +1497,14 @@ def test_ray_lazy_tail_block_submits_without_cross_lease_batching(tmp_path, ray_
         import os
         from pathlib import Path
 
-        import duckdb
+        import vane
         import pyarrow as pa
-        from duckdb import runners as _runners
+        from vane import runners as _runners
 
         row_count = 1000
         input_path = Path({str(tmp_path / "lazy_tail_lease_input.parquet")!r})
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=8")
         con.execute(
             f'''
@@ -1528,7 +1528,7 @@ def test_ray_lazy_tail_block_submits_without_cross_lease_batching(tmp_path, ray_
             con.read_parquet(str(input_path))
             .map_batches(
                 producer,
-                schema={{"id": duckdb.sqltypes.INTEGER}},
+                schema={{"id": vane.sqltypes.INTEGER}},
                 execution_backend="ray_task",
                 cpus=1.0,
                 gpus=0.0,
@@ -1539,7 +1539,7 @@ def test_ray_lazy_tail_block_submits_without_cross_lease_batching(tmp_path, ray_
             )
             .map_batches(
                 Consumer,
-                schema={{"id": duckdb.sqltypes.INTEGER}},
+                schema={{"id": vane.sqltypes.INTEGER}},
                 execution_backend="ray_actor",
                 actor_number=1,
                 cpus=1.0,
@@ -1591,16 +1591,16 @@ def test_ray_actor_compute_batches_span_upstream_block_boundaries(tmp_path, ray_
         f"""
         from pathlib import Path
 
-        import duckdb
+        import vane
         import pyarrow as pa
-        from duckdb import runners as _runners
+        from vane import runners as _runners
 
         row_count = 300
         compute_batch_rows = 100
         payload_len = 100 * 1024
         input_path = Path({str(tmp_path / "actor_compute_batch_boundaries.parquet")!r})
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute(
             f'''
             COPY (
@@ -1630,7 +1630,7 @@ def test_ray_actor_compute_batches_span_upstream_block_boundaries(tmp_path, ray_
             .repartition(1)
             .map_batches(
                 producer,
-                schema={{"id": duckdb.sqltypes.INTEGER, "payload": duckdb.sqltypes.VARCHAR}},
+                schema={{"id": vane.sqltypes.INTEGER, "payload": vane.sqltypes.VARCHAR}},
                 execution_backend="ray_task",
                 cpus=1.0,
                 gpus=0.0,
@@ -1641,7 +1641,7 @@ def test_ray_actor_compute_batches_span_upstream_block_boundaries(tmp_path, ray_
             )
             .map_batches(
                 Consumer,
-                schema={{"id": duckdb.sqltypes.INTEGER, "compute_batch_rows": duckdb.sqltypes.INTEGER}},
+                schema={{"id": vane.sqltypes.INTEGER, "compute_batch_rows": vane.sqltypes.INTEGER}},
                 execution_backend="ray_actor",
                 actor_number=1,
                 cpus=1.0,
@@ -1693,12 +1693,12 @@ def test_ray_actor_soft_minimum_task_batch_matches_ray_data_bundling(tmp_path, r
         from collections import Counter
         from pathlib import Path
 
-        import duckdb
+        import vane
         import pyarrow as pa
-        from duckdb import runners as _runners
+        from vane import runners as _runners
 
         input_path = Path({str(tmp_path / "soft_min_task_batch.parquet")!r})
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute(
             f'''COPY (SELECT i::INTEGER AS id FROM range(230) t(i))
                 TO '{{input_path!s}}' (FORMAT PARQUET)'''
@@ -1718,7 +1718,7 @@ def test_ray_actor_soft_minimum_task_batch_matches_ray_data_bundling(tmp_path, r
             .repartition(1)
             .map_batches(
                 producer,
-                schema={{"id": duckdb.sqltypes.INTEGER}},
+                schema={{"id": vane.sqltypes.INTEGER}},
                 execution_backend="ray_task",
                 cpus=1.0,
                 gpus=0.0,
@@ -1730,7 +1730,7 @@ def test_ray_actor_soft_minimum_task_batch_matches_ray_data_bundling(tmp_path, r
             )
             .map_batches(
                 Consumer,
-                schema={{"batch_rows": duckdb.sqltypes.INTEGER}},
+                schema={{"batch_rows": vane.sqltypes.INTEGER}},
                 execution_backend="ray_actor",
                 actor_number=1,
                 cpus=1.0,
@@ -1783,16 +1783,16 @@ def test_ray_actor_lazy_row_backpressure_preserves_non_tail_batch_alignment(tmp_
         from collections import Counter
         from pathlib import Path
 
-        import duckdb
+        import vane
         import pyarrow as pa
-        from duckdb import runners as _runners
+        from vane import runners as _runners
 
         row_count = 13_000
         producer_batch_rows = 8_000
         compute_batch_rows = 4_096
         input_path = Path({str(tmp_path / "actor_lazy_row_alignment.parquet")!r})
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=1")
         con.execute(
             f'''
@@ -1824,7 +1824,7 @@ def test_ray_actor_lazy_row_backpressure_preserves_non_tail_batch_alignment(tmp_
             .repartition(1)
             .map_batches(
                 producer,
-                schema={{"id": duckdb.sqltypes.INTEGER}},
+                schema={{"id": vane.sqltypes.INTEGER}},
                 execution_backend="ray_task",
                 cpus=1.0,
                 gpus=0.0,
@@ -1836,8 +1836,8 @@ def test_ray_actor_lazy_row_backpressure_preserves_non_tail_batch_alignment(tmp_
             .map_batches(
                 SlowConsumer,
                 schema={{
-                    "id": duckdb.sqltypes.INTEGER,
-                    "compute_batch_rows": duckdb.sqltypes.INTEGER,
+                    "id": vane.sqltypes.INTEGER,
+                    "compute_batch_rows": vane.sqltypes.INTEGER,
                 }},
                 execution_backend="ray_actor",
                 actor_number=1,
@@ -1893,15 +1893,15 @@ def test_ray_task_block_stream_does_not_deadlock_when_sink_and_source_blocked(tm
         import time
         from pathlib import Path
 
-        import duckdb
+        import vane
         import pyarrow as pa
-        from duckdb import runners as _runners
+        from vane import runners as _runners
 
         row_count = 8192
         payload_len = 65536
         input_path = Path({str(tmp_path / "streaming_deadlock_input.parquet")!r})
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=36")
         con.execute(
             f'''
@@ -1928,7 +1928,7 @@ def test_ray_task_block_stream_does_not_deadlock_when_sink_and_source_blocked(tm
             con.read_parquet(str(input_path))
             .map_batches(
                 slow_producer,
-                schema={{"id": duckdb.sqltypes.INTEGER, "payload": duckdb.sqltypes.VARCHAR}},
+                schema={{"id": vane.sqltypes.INTEGER, "payload": vane.sqltypes.VARCHAR}},
                 execution_backend="ray_task",
                 cpus=1.0,
                 gpus=0.0,
@@ -1937,7 +1937,7 @@ def test_ray_task_block_stream_does_not_deadlock_when_sink_and_source_blocked(tm
             )
             .map_batches(
                 Consumer,
-                schema={{"id": duckdb.sqltypes.INTEGER}},
+                schema={{"id": vane.sqltypes.INTEGER}},
                 execution_backend="ray_actor",
                 actor_number=1,
                 cpus=1.0,
@@ -1980,9 +1980,9 @@ def test_ray_task_flat_map_ref_stream_preserves_rows_under_actor_backpressure(tm
         f"""
         from pathlib import Path
 
-        import duckdb
+        import vane
         import pyarrow as pa
-        from duckdb import runners as _runners
+        from vane import runners as _runners
 
         row_count = 1500
         expansion = 12
@@ -1991,7 +1991,7 @@ def test_ray_task_flat_map_ref_stream_preserves_rows_under_actor_backpressure(tm
         input_dir = Path({str(tmp_path / "ray_task_flat_map_backpressure_input")!r})
         input_dir.mkdir(parents=True, exist_ok=True)
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=8")
         for part in range(part_count):
             lo = part * (row_count // part_count)
@@ -2026,9 +2026,9 @@ def test_ray_task_flat_map_ref_stream_preserves_rows_under_actor_backpressure(tm
             .flat_map(
                 expand,
                 schema={{
-                    "id": duckdb.sqltypes.INTEGER,
-                    "chunk_id": duckdb.sqltypes.INTEGER,
-                    "chunk": duckdb.sqltypes.VARCHAR,
+                    "id": vane.sqltypes.INTEGER,
+                    "chunk_id": vane.sqltypes.INTEGER,
+                    "chunk": vane.sqltypes.VARCHAR,
                 }},
                 execution_backend="ray_task",
                 cpus=1.0,
@@ -2038,9 +2038,9 @@ def test_ray_task_flat_map_ref_stream_preserves_rows_under_actor_backpressure(tm
             .map_batches(
                 Identity,
                 schema={{
-                    "id": duckdb.sqltypes.INTEGER,
-                    "chunk_id": duckdb.sqltypes.INTEGER,
-                    "chunk": duckdb.sqltypes.VARCHAR,
+                    "id": vane.sqltypes.INTEGER,
+                    "chunk_id": vane.sqltypes.INTEGER,
+                    "chunk": vane.sqltypes.VARCHAR,
                 }},
                 execution_backend="ray_actor",
                 actor_number=1,
@@ -2093,16 +2093,16 @@ def test_ray_task_flat_map_projected_ref_stream_preserves_column_projection(tmp_
         f"""
         from pathlib import Path
 
-        import duckdb
+        import vane
         import pyarrow as pa
-        from duckdb import runners as _runners
+        from vane import runners as _runners
 
         row_count = 180
         expansion = 12
         input_dir = Path({str(tmp_path / "ray_task_flat_map_projected_input")!r})
         input_dir.mkdir(parents=True, exist_ok=True)
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=4")
         con.execute(
             f'''
@@ -2135,9 +2135,9 @@ def test_ray_task_flat_map_projected_ref_stream_preserves_column_projection(tmp_
             .flat_map(
                 expand,
                 schema={{
-                    "id": duckdb.sqltypes.INTEGER,
-                    "chunk_id": duckdb.sqltypes.INTEGER,
-                    "chunk": duckdb.sqltypes.VARCHAR,
+                    "id": vane.sqltypes.INTEGER,
+                    "chunk_id": vane.sqltypes.INTEGER,
+                    "chunk": vane.sqltypes.VARCHAR,
                 }},
                 execution_backend="ray_task",
                 cpus=1.0,
@@ -2148,8 +2148,8 @@ def test_ray_task_flat_map_projected_ref_stream_preserves_column_projection(tmp_
             .map_batches(
                 KeepTwo,
                 schema={{
-                    "id": duckdb.sqltypes.INTEGER,
-                    "chunk_id": duckdb.sqltypes.INTEGER,
+                    "id": vane.sqltypes.INTEGER,
+                    "chunk_id": vane.sqltypes.INTEGER,
                 }},
                 execution_backend="ray_actor",
                 actor_number=1,
@@ -2199,15 +2199,15 @@ def test_ray_task_flat_map_ref_stream_preserves_variable_and_empty_outputs(tmp_p
         f"""
         from pathlib import Path
 
-        import duckdb
+        import vane
         import pyarrow as pa
-        from duckdb import runners as _runners
+        from vane import runners as _runners
 
         row_count = 257
         input_dir = Path({str(tmp_path / "ray_task_flat_map_variable_outputs_input")!r})
         input_dir.mkdir(parents=True, exist_ok=True)
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=4")
         con.execute(
             f'''
@@ -2252,10 +2252,10 @@ def test_ray_task_flat_map_ref_stream_preserves_variable_and_empty_outputs(tmp_p
             .flat_map(
                 expand,
                 schema={{
-                    "id": duckdb.sqltypes.INTEGER,
-                    "chunk_id": duckdb.sqltypes.INTEGER,
-                    "ordinal": duckdb.sqltypes.INTEGER,
-                    "chunk": duckdb.sqltypes.VARCHAR,
+                    "id": vane.sqltypes.INTEGER,
+                    "chunk_id": vane.sqltypes.INTEGER,
+                    "ordinal": vane.sqltypes.INTEGER,
+                    "chunk": vane.sqltypes.VARCHAR,
                 }},
                 execution_backend="ray_task",
                 cpus=1.0,
@@ -2266,10 +2266,10 @@ def test_ray_task_flat_map_ref_stream_preserves_variable_and_empty_outputs(tmp_p
             .map_batches(
                 Identity,
                 schema={{
-                    "id": duckdb.sqltypes.INTEGER,
-                    "chunk_id": duckdb.sqltypes.INTEGER,
-                    "ordinal": duckdb.sqltypes.INTEGER,
-                    "chunk": duckdb.sqltypes.VARCHAR,
+                    "id": vane.sqltypes.INTEGER,
+                    "chunk_id": vane.sqltypes.INTEGER,
+                    "ordinal": vane.sqltypes.INTEGER,
+                    "chunk": vane.sqltypes.VARCHAR,
                 }},
                 execution_backend="ray_actor",
                 actor_number=1,
@@ -2322,16 +2322,16 @@ def test_ray_task_flat_map_ref_stream_preserves_reordered_alias_projection(tmp_p
         f"""
         from pathlib import Path
 
-        import duckdb
+        import vane
         import pyarrow as pa
-        from duckdb import runners as _runners
+        from vane import runners as _runners
 
         row_count = 211
         expansion = 13
         input_dir = Path({str(tmp_path / "ray_task_flat_map_reordered_alias_input")!r})
         input_dir.mkdir(parents=True, exist_ok=True)
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=4")
         con.execute(
             f'''
@@ -2369,10 +2369,10 @@ def test_ray_task_flat_map_ref_stream_preserves_reordered_alias_projection(tmp_p
             .flat_map(
                 expand,
                 schema={{
-                    "id": duckdb.sqltypes.INTEGER,
-                    "chunk_id": duckdb.sqltypes.INTEGER,
-                    "chunk": duckdb.sqltypes.VARCHAR,
-                    "weight": duckdb.sqltypes.INTEGER,
+                    "id": vane.sqltypes.INTEGER,
+                    "chunk_id": vane.sqltypes.INTEGER,
+                    "chunk": vane.sqltypes.VARCHAR,
+                    "weight": vane.sqltypes.INTEGER,
                 }},
                 execution_backend="ray_task",
                 cpus=1.0,
@@ -2384,9 +2384,9 @@ def test_ray_task_flat_map_ref_stream_preserves_reordered_alias_projection(tmp_p
             .map_batches(
                 KeepProjected,
                 schema={{
-                    "cid": duckdb.sqltypes.INTEGER,
-                    "source_id": duckdb.sqltypes.INTEGER,
-                    "weight": duckdb.sqltypes.INTEGER,
+                    "cid": vane.sqltypes.INTEGER,
+                    "source_id": vane.sqltypes.INTEGER,
+                    "weight": vane.sqltypes.INTEGER,
                 }},
                 execution_backend="ray_actor",
                 actor_number=1,
@@ -2437,15 +2437,15 @@ def test_ray_task_flat_map_ref_stream_all_empty_output_finishes(tmp_path, ray_su
         f"""
         from pathlib import Path
 
-        import duckdb
+        import vane
         import pyarrow as pa
-        from duckdb import runners as _runners
+        from vane import runners as _runners
 
         row_count = 97
         input_dir = Path({str(tmp_path / "ray_task_flat_map_all_empty_input")!r})
         input_dir.mkdir(parents=True, exist_ok=True)
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET threads=4")
         con.execute(
             f'''
@@ -2469,8 +2469,8 @@ def test_ray_task_flat_map_ref_stream_all_empty_output_finishes(tmp_path, ray_su
             .flat_map(
                 expand,
                 schema={{
-                    "id": duckdb.sqltypes.INTEGER,
-                    "chunk": duckdb.sqltypes.VARCHAR,
+                    "id": vane.sqltypes.INTEGER,
+                    "chunk": vane.sqltypes.VARCHAR,
                 }},
                 execution_backend="ray_task",
                 cpus=1.0,
@@ -2481,8 +2481,8 @@ def test_ray_task_flat_map_ref_stream_all_empty_output_finishes(tmp_path, ray_su
             .map_batches(
                 Identity,
                 schema={{
-                    "id": duckdb.sqltypes.INTEGER,
-                    "chunk": duckdb.sqltypes.VARCHAR,
+                    "id": vane.sqltypes.INTEGER,
+                    "chunk": vane.sqltypes.VARCHAR,
                 }},
                 execution_backend="ray_actor",
                 actor_number=1,
@@ -2556,18 +2556,18 @@ def test_ray_python_udf_task_consumes_and_emits_ref_bundles_distributed(ray_runn
     base = duckdb_conn.sql(f"SELECT * FROM read_parquet('{input_path!s}')")
     produced = base.map_batches(
         Stage1,
-        schema={"id": duckdb.sqltype("INTEGER"), "score": duckdb.sqltype("INTEGER")},
+        schema={"id": vane.sqltype("INTEGER"), "score": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
         gpus=0.0,
         batch_size=2,
     )
-    scalar = produced.map(plus_one, return_type=duckdb.sqltype("INTEGER"), execution_backend="ray_task").project(
+    scalar = produced.map(plus_one, return_type=vane.sqltype("INTEGER"), execution_backend="ray_task").project(
         "id, value as bumped"
     )
     df = scalar.map_batches(
         Stage2,
-        schema={"combined": duckdb.sqltype("INTEGER")},
+        schema={"combined": vane.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=1,
         gpus=1,
@@ -2605,7 +2605,7 @@ def test_ray_python_udf_native(ray_runner, duckdb_conn, parquet_path):
     """
     df = (
         duckdb_conn.sql(base_sql)
-        .map(plus_one, return_type=duckdb.sqltype("INTEGER"), execution_backend="ray_task")
+        .map(plus_one, return_type=vane.sqltype("INTEGER"), execution_backend="ray_task")
         .project("a, value AS out")
     )
     _log_builder_info(df)
@@ -2631,7 +2631,7 @@ def test_ray_python_udf_terminal_failure_propagates(ray_runner, duckdb_conn, par
 
     relation = duckdb_conn.sql(f"SELECT a FROM read_parquet('{parquet_path}') WHERE a < 2").map(
         planned_failure,
-        return_type=duckdb.sqltype("INTEGER"),
+        return_type=vane.sqltype("INTEGER"),
         execution_backend="ray_task",
     )
 
@@ -2659,7 +2659,7 @@ def test_ray_python_udf_map_batches_arrow(ray_runner, duckdb_conn, parquet_path)
     """
     df = duckdb_conn.sql(base_sql).map_batches(
         plus_one_arrow,
-        schema={"a": duckdb.sqltype("INTEGER"), "out": duckdb.sqltype("INTEGER")},
+        schema={"a": vane.sqltype("INTEGER"), "out": vane.sqltype("INTEGER")},
         execution_backend="ray_task",
         batch_size=64,
     )
@@ -2720,7 +2720,7 @@ def test_ray_task_credit_admission_runs_multiple_batches_concurrently(
 
     relation = duckdb_conn.sql(f"SELECT * FROM read_parquet('{input_path!s}')").map_batches(
         overlap_probe,
-        schema={"x": duckdb.sqltype("BIGINT")},
+        schema={"x": vane.sqltype("BIGINT")},
         execution_backend="ray_task",
         cpus=1.0,
         gpus=0.0,
@@ -2758,7 +2758,7 @@ def test_ray_map_batches_udf(ray_runner, duckdb_conn, parquet_path):
     """
     df = duckdb_conn.sql(base_sql).map_batches(
         double_values,
-        schema={"x": duckdb.sqltype("INTEGER")},
+        schema={"x": vane.sqltype("INTEGER")},
         execution_backend="ray_task",
         batch_size=64,
     )
@@ -2793,7 +2793,7 @@ def test_ray_python_stream_table_udf(ray_runner, duckdb_conn, parquet_path):
     """
     df = duckdb_conn.sql(base_sql).map_batches(
         double_values,
-        schema={"x": duckdb.sqltype("INTEGER")},
+        schema={"x": vane.sqltype("INTEGER")},
         execution_backend="ray_task",
         batch_size=64,
     )
@@ -2831,7 +2831,7 @@ def test_ray_python_stream_table_udf_multi_partition_plan(ray_runner, duckdb_con
     )
     df = base.map_batches(
         double_values,
-        schema={"x": duckdb.sqltype("INTEGER")},
+        schema={"x": vane.sqltype("INTEGER")},
         execution_backend="ray_task",
         batch_size=64,
     ).aggregate("x, COUNT(*) AS cnt", "x")
@@ -2871,7 +2871,7 @@ def test_ray_python_udf_multi_partition_plan(ray_runner, duckdb_conn, parquet_pa
         """
     )
     df = (
-        base.map(plus_one, return_type=duckdb.sqltype("INTEGER"), execution_backend="ray_task")
+        base.map(plus_one, return_type=vane.sqltype("INTEGER"), execution_backend="ray_task")
         .project("value AS out")
         .aggregate("out, COUNT(*) AS cnt", "out")
     )
@@ -2907,7 +2907,7 @@ def test_ray_task_map_batches_worker_process(ray_runner, duckdb_conn, tmp_path):
     rel = duckdb_conn.sql(f"SELECT x FROM read_parquet('{input_path!s}')")
     out = rel.map_batches(
         pid_tag_fn,
-        schema={"pid_tag": duckdb.sqltypes.BIGINT},
+        schema={"pid_tag": vane.sqltypes.BIGINT},
         execution_backend="ray_task",
     )
     label = "test_ray_e2e: ray task map_batches worker process"
@@ -2958,10 +2958,10 @@ def test_ray_task_map_batches_worker_parquet_scan_filter_projection(
     out = rel.map_batches(
         add_offset,
         schema={
-            "grp": duckdb.sqltype("INTEGER"),
-            "a": duckdb.sqltype("INTEGER"),
-            "b": duckdb.sqltype("INTEGER"),
-            "b_plus": duckdb.sqltype("INTEGER"),
+            "grp": vane.sqltype("INTEGER"),
+            "a": vane.sqltype("INTEGER"),
+            "b": vane.sqltype("INTEGER"),
+            "b_plus": vane.sqltype("INTEGER"),
         },
         execution_backend="ray_task",
     )

@@ -1,10 +1,16 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 import platform
 
 import pytest
 
-import duckdb
-from duckdb import (
+import vane
+from vane import (
     CaseExpression,
     CoalesceOperator,
     ColumnExpression,
@@ -13,8 +19,8 @@ from duckdb import (
     LambdaExpression,
     StarExpression,
 )
-from duckdb.sqltypes import INTEGER, TIMESTAMP, TINYINT, VARCHAR
-from duckdb.value.constant import IntegerValue, Value
+from vane.sqltypes import INTEGER, TIMESTAMP, TINYINT, VARCHAR
+from vane.value.constant import IntegerValue, Value
 
 pytestmark = pytest.mark.skipif(
     platform.system() == "Emscripten",
@@ -24,7 +30,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def filter_rel():
-    con = duckdb.connect()
+    con = vane.connect()
     rel = con.sql(
         """
         select * from (VALUES
@@ -42,7 +48,7 @@ def filter_rel():
 
 class TestExpression:
     def test_constant_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         val = Value(5, INTEGER)
 
@@ -63,7 +69,7 @@ class TestExpression:
 
     @pytest.mark.skipif(platform.system() == "Windows", reason="There is some weird interaction in Windows CI")
     def test_column_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -79,11 +85,11 @@ class TestExpression:
         assert res == [(1,)]
 
         column = ColumnExpression("d")
-        with pytest.raises(duckdb.BinderException, match='Referenced column "d" not found'):
+        with pytest.raises(vane.BinderException, match='Referenced column "d" not found'):
             rel2 = rel.select(column)
 
     def test_coalesce_operator(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -95,7 +101,7 @@ class TestExpression:
         res = rel2.explain()
         assert "COALESCE" in res
 
-        with pytest.raises(duckdb.ConversionException, match="Could not convert string 'hello' to INT64"):
+        with pytest.raises(vane.ConversionException, match="Could not convert string 'hello' to INT64"):
             rel2.fetchall()
 
         con.execute(
@@ -105,7 +111,7 @@ class TestExpression:
         """
         )
 
-        with pytest.raises(duckdb.InvalidInputException, match="Please provide at least one argument"):
+        with pytest.raises(vane.InvalidInputException, match="Please provide at least one argument"):
             rel.select(CoalesceOperator())
 
         rel4 = rel.select(CoalesceOperator(ConstantExpression(None)))
@@ -187,7 +193,7 @@ class TestExpression:
         assert res == [(None, 1)]
 
     def test_column_expression_explain(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -208,7 +214,7 @@ class TestExpression:
         assert res == [("a", 42, None)]
 
     def test_column_expression_table(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         con.execute(
             """
@@ -227,7 +233,7 @@ class TestExpression:
         assert res == [("a", "b", "c"), ("d", "e", "f"), ("g", "h", "i")]
 
     def test_column_expression_view(self):
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute(
             """
             CREATE TABLE tbl as FROM (
@@ -249,7 +255,7 @@ class TestExpression:
         assert res == [("a", "c"), ("d", "f"), ("g", "i")]
 
     def test_column_expression_replacement_scan(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         pd = pytest.importorskip("pandas")
         df = pd.DataFrame({"a": [42, 43, 0], "b": [True, False, True], "c": [23.123, 623.213, 0.30234]})  # noqa: F841
@@ -259,7 +265,7 @@ class TestExpression:
         assert res == [(42, True), (43, False), (0, True)]
 
     def test_add_operator(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         val = Value(5, INTEGER)
 
@@ -281,7 +287,7 @@ class TestExpression:
         assert res == [(7, 7)]
 
     def test_binary_function_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -296,7 +302,7 @@ class TestExpression:
         assert res == [(4,)]
 
     def test_negate_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -310,7 +316,7 @@ class TestExpression:
         assert res == [(-5,)]
 
     def test_subtract_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -330,7 +336,7 @@ class TestExpression:
         assert res == [(-2,)]
 
     def test_multiply_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -347,7 +353,7 @@ class TestExpression:
         assert res == [(6,)]
 
     def test_division_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -369,7 +375,7 @@ class TestExpression:
         assert res == [(2,)]
 
     def test_modulus_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -386,7 +392,7 @@ class TestExpression:
         assert res == [(1,)]
 
     def test_power_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -403,7 +409,7 @@ class TestExpression:
         assert res == [(25,)]
 
     def test_between_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -430,7 +436,7 @@ class TestExpression:
         assert rel.select(c.between(b, a)).fetchall() == [(True,)]
 
     def test_collate_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
         rel = con.sql(
             """
             select
@@ -460,14 +466,14 @@ class TestExpression:
         # SELECT c1 LIKE 'a' COLLATE NOCASE == True
         assert rel.select(FunctionExpression("~~", col2, lower_a.collate("NOCASE"))).fetchall() == [(True,)]
 
-        with pytest.raises(duckdb.BinderException, match="collations are only supported for type varchar"):
+        with pytest.raises(vane.BinderException, match="collations are only supported for type varchar"):
             rel.select(FunctionExpression("~~", col2, lower_a).collate("NOCASE"))
 
-        with pytest.raises(duckdb.CatalogException, match="Collation with name non-existant does not exist"):
+        with pytest.raises(vane.CatalogException, match="Collation with name non-existant does not exist"):
             rel.select(FunctionExpression("~~", col2, lower_a.collate("non-existant")))
 
     def test_equality_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -487,7 +493,7 @@ class TestExpression:
         assert res == [(False, True)]
 
     def test_lambda_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -514,7 +520,7 @@ class TestExpression:
 
         # 'row' is not a lambda function, so it doesn't accept a lambda expression
         func = FunctionExpression("row", ColumnExpression("a"), LambdaExpression("x", ColumnExpression("x") + 3))
-        with pytest.raises(duckdb.BinderException, match="This scalar function does not support lambdas"):
+        with pytest.raises(vane.BinderException, match="This scalar function does not support lambdas"):
             rel2 = rel.select(func)
 
         # lhs has to be a tuple of strings or a single string
@@ -528,11 +534,11 @@ class TestExpression:
         func = FunctionExpression(
             "list_filter", ColumnExpression("a"), LambdaExpression("x", ColumnExpression("y") != 3)
         )
-        with pytest.raises(duckdb.BinderException, match='Referenced column "y" not found in FROM clause'):
+        with pytest.raises(vane.BinderException, match='Referenced column "y" not found in FROM clause'):
             rel2 = rel.select(func)
 
     def test_inequality_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -552,7 +558,7 @@ class TestExpression:
         assert res == [(True, False)]
 
     def test_comparison_expressions(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -601,7 +607,7 @@ class TestExpression:
         assert res == [(True, False, True)]
 
     def test_expression_alias(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -615,7 +621,7 @@ class TestExpression:
         assert rel2.columns == ["b"]
 
     def test_star_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -636,7 +642,7 @@ class TestExpression:
         assert res == [(2,)]
 
     def test_struct_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -655,7 +661,7 @@ class TestExpression:
         assert res == [({"a": 1, "b": 2},)]
 
     def test_function_expression_udf(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         def my_simple_func(a: int, b: int, c: int) -> int:
             return a + b + c
@@ -679,7 +685,7 @@ class TestExpression:
         assert res == [(6,)]
 
     def test_function_expression_basic(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -696,7 +702,7 @@ class TestExpression:
         assert res == [("tes",), ("his is",), ("di",)]
 
     def test_column_expression_function_coverage(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         con.execute(
             """
@@ -716,7 +722,7 @@ class TestExpression:
         assert res == [("abc",), ("def",), ("ghi",)]
 
     def test_function_expression_aggregate(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -729,12 +735,12 @@ class TestExpression:
         )
         expr = FunctionExpression("first", "text")
         with pytest.raises(
-            duckdb.BinderException, match="Binder Error: Aggregates cannot be present in a Project relation!"
+            vane.BinderException, match="Binder Error: Aggregates cannot be present in a Project relation!"
         ):
             rel.select(expr)
 
     def test_case_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql(
             """
@@ -778,7 +784,7 @@ class TestExpression:
         assert res == [(21,)]
 
     def test_cast_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         rel = con.sql("select '2022/01/21' as a")
         assert rel.types == [VARCHAR]
@@ -791,27 +797,27 @@ class TestExpression:
         assert res == [(datetime.datetime(2022, 1, 21, 0, 0),)]
 
     def test_implicit_constant_conversion(self):
-        con = duckdb.connect()
+        con = vane.connect()
         rel = con.sql("select 42")
         res = rel.select(5).fetchall()
         assert res == [(5,)]
 
     def test_numeric_overflow(self):
-        con = duckdb.connect()
+        con = vane.connect()
         rel = con.sql("select 3000::SHORT salary")
         expr = ColumnExpression("salary") * 100
         rel2 = rel.select(expr)
-        with pytest.raises(duckdb.OutOfRangeException, match="Overflow in multiplication of INT16"):
+        with pytest.raises(vane.OutOfRangeException, match="Overflow in multiplication of INT16"):
             rel2.fetchall()
 
-        val = duckdb.Value(100, TINYINT)
+        val = vane.Value(100, TINYINT)
         expr2 = ColumnExpression("salary") * val
         rel3 = rel.select(expr2)
-        with pytest.raises(duckdb.OutOfRangeException, match="Overflow in multiplication of INT16"):
+        with pytest.raises(vane.OutOfRangeException, match="Overflow in multiplication of INT16"):
             rel3.fetchall()
 
     def test_struct_column_expression(self):
-        con = duckdb.connect()
+        con = vane.connect()
         rel = con.sql("select {'l': 1, 'ee': 33, 't': 7} as leet")
         expr = ColumnExpression("leet.ee")
         rel2 = rel.select(expr)
@@ -868,13 +874,13 @@ class TestExpression:
     def test_empty_in(self, filter_rel):
         expr = ColumnExpression("a")
         with pytest.raises(
-            duckdb.InvalidInputException, match="Incorrect amount of parameters to 'isin', needs at least 1 parameter"
+            vane.InvalidInputException, match="Incorrect amount of parameters to 'isin', needs at least 1 parameter"
         ):
             expr = expr.isin()
 
         expr = ColumnExpression("a")
         with pytest.raises(
-            duckdb.InvalidInputException,
+            vane.InvalidInputException,
             match="Incorrect amount of parameters to 'isnotin', needs at least 1 parameter",
         ):
             expr = expr.isnotin()
@@ -907,7 +913,7 @@ class TestExpression:
         assert res == [(3, "c"), (4, "a")]
 
     def test_null(self):
-        con = duckdb.connect()
+        con = vane.connect()
         rel = con.sql(
             """
             select * from (VALUES
@@ -929,7 +935,7 @@ class TestExpression:
         assert res2 == [(1, "a"), (2, "b"), (4, "c"), (5, "a")]
 
     def test_sort(self):
-        con = duckdb.connect()
+        con = vane.connect()
         rel = con.sql(
             """
             select * from (VALUES
@@ -966,14 +972,14 @@ class TestExpression:
         assert res == [("c",), ("b",), ("a",), ("a",), (None,)]
 
     def test_aggregate(self):
-        con = duckdb.connect()
+        con = vane.connect()
         rel = con.sql("select * from range(1000000) t(a)")
         count = FunctionExpression("count", "a").cast("int")
         assert rel.aggregate([count]).execute().fetchone()[0] == 1000000
         assert rel.aggregate([count]).execute().fetchone()[0] == 1000000
 
     def test_aggregate_error(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         # Not necessarily an error, but even non-aggregates are accepted
         rel = con.sql("select * from values (5) t(a)")
@@ -989,12 +995,12 @@ class TestExpression:
 
         # Providing something that can not be converted into an expression is an error:
         with pytest.raises(
-            duckdb.InvalidInputException, match="Invalid Input Error: Please provide arguments of type Expression!"
+            vane.InvalidInputException, match="Invalid Input Error: Please provide arguments of type Expression!"
         ):
             rel.aggregate([MyClass()]).fetchone()[0]
 
         with pytest.raises(
-            duckdb.InvalidInputException,
+            vane.InvalidInputException,
             match="Please provide either a string or list of Expression objects, not <class 'int'>",
         ):
             rel.aggregate(5).execute().fetchone()

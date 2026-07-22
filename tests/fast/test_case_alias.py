@@ -1,11 +1,17 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pandas as pd
 
-import duckdb
+import vane
 
 
 class TestCaseAlias:
     def test_case_alias(self, duckdb_cursor):
-        con = duckdb.connect(":memory:")
+        con = vane.connect(":memory:")
 
         df = pd.DataFrame([{"COL1": "val1", "CoL2": 1.05}, {"COL1": "val3", "CoL2": 17}])
 

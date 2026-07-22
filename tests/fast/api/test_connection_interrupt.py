@@ -1,10 +1,16 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import platform
 import threading
 import time
 
 import pytest
 
-import duckdb
+import vane
 
 
 class TestConnectionInterrupt:
@@ -13,7 +19,7 @@ class TestConnectionInterrupt:
         reason="threads not allowed on Emscripten",
     )
     def test_connection_interrupt(self):
-        conn = duckdb.connect()
+        conn = vane.connect()
 
         def interrupt() -> None:
             # Wait for query to start running before interrupting
@@ -22,12 +28,12 @@ class TestConnectionInterrupt:
 
         thread = threading.Thread(target=interrupt)
         thread.start()
-        with pytest.raises(duckdb.InterruptException):
+        with pytest.raises(vane.InterruptException):
             conn.execute("select count(*) from range(100000000000)").fetchall()
         thread.join()
 
     def test_interrupt_closed_connection(self):
-        conn = duckdb.connect()
+        conn = vane.connect()
         conn.close()
-        with pytest.raises(duckdb.ConnectionException):
+        with pytest.raises(vane.ConnectionException):
             conn.interrupt()

@@ -3,7 +3,7 @@
 
 import pytest
 
-from duckdb import ray_cxx
+from vane import ray_cxx
 
 
 def test_run_plan_sync_uninitialized_plan_fail_fast():

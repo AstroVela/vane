@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 
 class Test3324:
@@ -27,5 +33,5 @@ class Test3324:
                     column1 = $1"""
         ).fetch_df()
 
-        with pytest.raises(duckdb.BinderException, match="Unexpected prepared parameter"):
+        with pytest.raises(vane.BinderException, match="Unexpected prepared parameter"):
             duckdb_cursor.execute("""execute v1(?)""", ("test1",)).fetch_df()

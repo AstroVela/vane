@@ -18,28 +18,28 @@ import statistics
 import sys
 import time
 
-# Use stable duckdb from /tmp/duckdb_release if available, otherwise system
+# Use stable official DuckDB from /tmp/duckdb_release if available, otherwise system.
 try:
     sys.path.insert(0, "/tmp/duckdb_release")
-    import vane
+    import duckdb
 except ImportError:
     sys.path.pop(0)
-    import vane
+    import duckdb
 
-print(f"DuckDB version: {vane.__duckdb_version__}")
+print(f"DuckDB version: {duckdb.__version__}")
 
 TABLES = ["nation", "region", "supplier", "customer", "part", "partsupp", "orders", "lineitem"]
 QUERY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queries")
 
 
-def setup_views(con: vane.DuckDBPyConnection, parquet_folder: str):
+def setup_views(con: duckdb.DuckDBPyConnection, parquet_folder: str):
     """Create views for each TPC-H table pointing to parquet files."""
     for table in TABLES:
         parquet_path = os.path.join(parquet_folder, table, "*.parquet")
         con.execute(f"CREATE OR REPLACE VIEW {table} AS SELECT * FROM read_parquet('{parquet_path}')")
 
 
-def run_query(con: vane.DuckDBPyConnection, qnum: int) -> tuple[float, int]:
+def run_query(con: duckdb.DuckDBPyConnection, qnum: int) -> tuple[float, int]:
     """Run a single TPC-H query and return (elapsed_seconds, row_count)."""
     query_file = os.path.join(QUERY_DIR, f"{qnum:02d}.sql")
     with open(query_file) as f:
@@ -64,7 +64,7 @@ if __name__ == "__main__":
     else:
         questions = list(range(1, 23))
 
-    con = vane.connect()
+    con = duckdb.connect()
     if args.threads:
         con.execute(f"SET threads={args.threads}")
 

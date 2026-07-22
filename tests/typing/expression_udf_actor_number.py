@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import _duckdb
+import _vane_duckdb
 from typing_extensions import assert_type
 
 
@@ -12,10 +12,10 @@ def batch_identity(table: object) -> object:
 
 
 schema: dict[str, object] = {"result": object()}
-value = _duckdb.ColumnExpression("value")
+value = _vane_duckdb.ColumnExpression("value")
 
 assert_type(
-    _duckdb._VaneUDFMapBatchesExpression(
+    _vane_duckdb._VaneUDFMapBatchesExpression(
         batch_identity,
         "typed_actor_udf",
         schema,
@@ -23,11 +23,11 @@ assert_type(
         ["value"],
         actor_number=1,
     ),
-    _duckdb.Expression,
+    _vane_duckdb.Expression,
 )
 
 assert_type(
-    _duckdb._VaneUDFMapBatchesExpression(
+    _vane_duckdb._VaneUDFMapBatchesExpression(
         batch_identity,
         "typed_actor_udf_with_expression",
         schema,
@@ -41,5 +41,5 @@ assert_type(
         False,
         value,
     ),
-    _duckdb.Expression,
+    _vane_duckdb.Expression,
 )

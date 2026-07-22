@@ -6,9 +6,10 @@ The repository also contains substantial code derived from projects with compati
 
 | Area | Origin | License treatment |
 | --- | --- | --- |
-| `vane/` and Vane-specific distributed execution changes | Vane contributors | Apache-2.0 by default |
+| `vane/` and Vane-specific distributed execution changes | Vane contributors, with portions derived from DuckDB Python | Apache-2.0 for original Vane files; inherited DuckDB portions remain MIT with Vane modifications under Apache-2.0 |
 | `external/duckdb/` | `duckdb/duckdb` plus Vane-maintained engine customizations | DuckDB MIT license plus the licenses retained in its vendored directories |
-| `duckdb/`, `src/duckdb_py/`, `_duckdb-stubs/`, and `adbc_driver_duckdb/` | Derived from DuckDB's Python client and subsequently modified for Vane | Original DuckDB portions remain MIT; Vane contributions are Apache-2.0 |
+| `src/duckdb_py/` and `_vane_duckdb-stubs/` | Derived from DuckDB's Python client and subsequently modified for Vane | Original DuckDB portions remain MIT; Vane contributions are Apache-2.0 |
+| `vane_adbc_driver_duckdb/` | Apache Arrow ADBC DuckDB driver facade carried by DuckDB Python and renamed for Vane's private engine | Existing Apache-2.0 notices and headers are retained; Vane modifications remain Apache-2.0 |
 | Tests and benchmarks derived from DuckDB or other named suites | Their named upstream source | License noted in the source directory or `THIRD_PARTY.md` |
 
 ## File-level license markers

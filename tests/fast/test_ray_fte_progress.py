@@ -7,27 +7,27 @@ import io
 
 import pytest
 
-import duckdb
-import duckdb.runners.progress as shared_progress_mod
-import duckdb.runners.ray.progress as progress_mod
-from duckdb.runners.progress import (
+import vane
+import vane.runners.progress as shared_progress_mod
+import vane.runners.ray.progress as progress_mod
+from vane.runners.progress import (
     LocalProgressSnapshotStore,
     _format_bytes,
     _format_count,
     build_local_progress_snapshot,
     progress_enabled,
 )
-from duckdb.runners.ray.fte import FteTaskExecution
-from duckdb.runners.ray.progress import ProgressRenderer, build_progress_snapshot, format_progress_snapshot
-from duckdb.runners.ray.query_execution_graph import (
+from vane.runners.ray.fte import FteTaskExecution
+from vane.runners.ray.progress import ProgressRenderer, build_progress_snapshot, format_progress_snapshot
+from vane.runners.ray.query_execution_graph import (
     NodeResourceAllocation,
     QueryAllocation,
     QueryExecutionGraph,
     ResourceVector,
     StageResourceSpec,
 )
-from duckdb.runners.ray.query_resource_manager import TaskRequest
-from duckdb.runners.ray.query_resource_runtime import (
+from vane.runners.ray.query_resource_manager import TaskRequest
+from vane.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
     register_query_graph,
 )
@@ -1584,7 +1584,7 @@ def test_progress_snapshot_requires_exact_query_id():
 
 
 def test_progress_task_status_poll_uses_timeout(monkeypatch):
-    import duckdb.runners.ray.worker_handle as worker_handle_mod
+    import vane.runners.ray.worker_handle as worker_handle_mod
 
     class _PendingFuture:
         def result(self, timeout):
@@ -2141,6 +2141,6 @@ def test_exchange_source_task_descriptor_preserves_file_rows_for_progress():
         }
     ]
 
-    raw = duckdb.ray_cxx.make_exchange_source_task_descriptor_for_test(handles, [0], 1, 1)
+    raw = vane.ray_cxx.make_exchange_source_task_descriptor_for_test(handles, [0], 1, 1)
 
-    assert duckdb.ray_cxx.exchange_source_task_source_handles_for_test(raw) == handles
+    assert vane.ray_cxx.exchange_source_task_source_handles_for_test(raw) == handles

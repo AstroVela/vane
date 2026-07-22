@@ -22,9 +22,9 @@ def test_write_parquet_with_unset_runner_dispatches_ray(tmp_path, monkeypatch):
             calls.append(relation)
             return {"ok": True}
 
-    runners = types.ModuleType("duckdb.runners")
+    runners = types.ModuleType("vane.runners")
     runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
-    monkeypatch.setitem(sys.modules, "duckdb.runners", runners)
+    monkeypatch.setitem(sys.modules, "vane.runners", runners)
 
     target = tmp_path / "distributed.parquet"
     vane.connect().sql("select 1 as x").write_parquet(str(target))

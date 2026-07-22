@@ -8,14 +8,14 @@ from pathlib import Path
 
 import pytest
 
-import duckdb
+import vane
 from multimodal_inference_benchmarks import run_fte_chaos_benchmarks as runner
 from multimodal_inference_benchmarks import run_fte_full_matrix as matrix_runner
 
 
 def _write_parquet(path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         escaped = str(path).replace("'", "''")
         con.execute(f"COPY (SELECT 1 AS id, 'ok' AS value) TO '{escaped}' (FORMAT PARQUET)")
@@ -25,7 +25,7 @@ def _write_parquet(path):
 
 def _write_path_parquet(path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         escaped = str(path).replace("'", "''")
         con.execute(
@@ -155,7 +155,7 @@ def test_fte_chaos_runner_materializes_stable_smoke_input(tmp_path):
         "dry_run",
     ]
     stable_input = Path(events[0]["output_path"])
-    rows = duckdb.sql(
+    rows = vane.sql(
         "SELECT path, value FROM read_parquet(?) ORDER BY path",
         params=[str(stable_input)],
     ).fetchall()

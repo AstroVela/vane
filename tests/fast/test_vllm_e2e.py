@@ -48,7 +48,7 @@ def test_vllm_e2e_basic():
         object_store_memory=ray_test_object_store_bytes(),
     )
 
-    import duckdb
+    import vane
 
     timeout_s = int(os.getenv("VLLM_E2E_TIMEOUT", "300"))
     try:
@@ -77,7 +77,7 @@ def test_vllm_e2e_basic():
         },
     }
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.execute("CREATE TABLE prompts(id INTEGER, prompt VARCHAR)")
         con.execute(

@@ -13,13 +13,13 @@ from types import SimpleNamespace
 
 import pytest
 
-import duckdb.execution.udf_stream_result_collector as collector_module
-from duckdb.execution.ray_stream_adapter import RayStreamAdapter, TaskLeaseObjectRefGenerator
-from duckdb.execution.udf_stream_result_collector import (
+import vane.execution.udf_stream_result_collector as collector_module
+from vane.execution.ray_stream_adapter import RayStreamAdapter, TaskLeaseObjectRefGenerator
+from vane.execution.udf_stream_result_collector import (
     AsyncResultCollector,
     _StreamRecord,
 )
-from duckdb.execution.udf_task_admission import TaskAdmission
+from vane.execution.udf_task_admission import TaskAdmission
 
 
 class _Ref:
@@ -765,7 +765,7 @@ def test_generator_terminating_mid_pair_fails_without_fetching_block():
 
 
 def test_explicit_remote_error_pair_preserves_cause_without_output_lease():
-    from duckdb.execution.udf_ray_stream_protocol import make_stream_error_pair
+    from vane.execution.udf_ray_stream_protocol import make_stream_error_pair
 
     fake_ray = _FakeRay()
     driver = _Driver()

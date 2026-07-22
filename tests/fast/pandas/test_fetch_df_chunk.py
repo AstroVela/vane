@@ -1,14 +1,20 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
-VECTOR_SIZE = duckdb.__standard_vector_size__
+VECTOR_SIZE = vane.__standard_vector_size__
 
 
 class TestType:
     def test_fetch_df_chunk(self):
         size = 3000
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute(f"CREATE table t as select range a from range({size});")
         query = con.execute("SELECT a FROM t")
 
@@ -25,7 +31,7 @@ class TestType:
 
     @pytest.mark.parametrize("size", [3000, 10000, 100000, VECTOR_SIZE - 1, VECTOR_SIZE + 1, VECTOR_SIZE])
     def test_monahan(self, size):
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute(f"CREATE table t as select range a from range({size});")
         query = con.execute("SELECT a FROM t")
 
@@ -47,7 +53,7 @@ class TestType:
 
     def test_fetch_df_chunk_parameter(self):
         size = 10000
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute(f"CREATE table t as select range a from range({size});")
         query = con.execute("SELECT a FROM t")
 
@@ -84,7 +90,7 @@ class TestType:
         assert len(cur_chunk) == 0
 
     def test_fetch_df_chunk_negative_parameter(self):
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("CREATE table t as select range a from range(100);")
         query = con.execute("SELECT a FROM t")
 

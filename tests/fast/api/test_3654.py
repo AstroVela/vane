@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pandas as pd
 
-import duckdb
+import vane
 
 try:
     import pyarrow as pa
@@ -17,7 +23,7 @@ class Test3654:
                 "id": [1, 1, 2],
             }
         )
-        con = duckdb.connect()
+        con = vane.connect()
         con.register("df1", df1)
         rel = con.view("df1")
         print(rel.execute().fetchall())
@@ -33,7 +39,7 @@ class Test3654:
             }
         )
         table = pa.Table.from_pandas(df1)
-        con = duckdb.connect()
+        con = vane.connect()
         con.register("df1", table)
         rel = con.view("df1")
         print(rel.execute().fetchall())

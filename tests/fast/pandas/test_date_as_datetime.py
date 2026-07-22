@@ -1,8 +1,14 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 
 import pandas as pd
 
-import duckdb
+import vane
 
 
 def run_checks(df):
@@ -12,7 +18,7 @@ def run_checks(df):
 
 
 def test_date_as_datetime():
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("create table t (d date)")
     con.execute("insert into t values ('1992-07-30'), (NULL)")
 

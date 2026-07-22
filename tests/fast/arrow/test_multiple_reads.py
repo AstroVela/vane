@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 from pathlib import Path
 
-import duckdb
+import vane
 
 try:
     import pyarrow
@@ -18,6 +24,6 @@ class TestArrowReads:
         parquet_filename = str(Path(__file__).parent / "data" / "userdata1.parquet")
         userdata_parquet_table = pyarrow.parquet.read_table(parquet_filename)
         userdata_parquet_table.validate(full=True)
-        rel = duckdb.from_arrow(userdata_parquet_table)
+        rel = vane.from_arrow(userdata_parquet_table)
         assert rel.aggregate("(avg(salary))::INT").execute().fetchone()[0] == 149005
         assert rel.aggregate("(avg(salary))::INT").execute().fetchone()[0] == 149005

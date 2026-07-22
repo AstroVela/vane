@@ -3,15 +3,17 @@
 
 import subprocess
 import sys
+import textwrap
 from importlib.metadata import distribution, metadata, requires, version
 from pathlib import Path
 
+import _vane_duckdb
 import pytest
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 
-import duckdb
+import vane
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
@@ -58,6 +60,33 @@ def test_distribution_declares_alpha_version_and_apache_license_expression():
     assert SpecifierSet(package_metadata["Requires-Python"]) == SpecifierSet(">=3.10,<3.15")
 
 
+def test_public_and_embedded_engine_versions_have_distinct_contracts():
+    assert vane.__version__ == version("vane-ai")
+    assert vane.__vane_version__ == vane.__version__
+    assert vane.__duckdb_version__ == _vane_duckdb.__version__
+    assert vane.version() == f"vane {vane.__version__} (duckdb {vane.__duckdb_version__})"
+
+
+def test_private_extension_first_preserves_public_native_bindings():
+    code = textwrap.dedent(
+        """
+        import importlib
+
+        import _vane_duckdb
+        import vane
+        import vane.runners
+
+        assert vane.ray_cxx is _vane_duckdb.ray_cxx
+        assert vane.vane_runners_cpp is _vane_duckdb
+        assert vane.vane_runners is _vane_duckdb
+        assert importlib.import_module("vane.ray_cxx") is _vane_duckdb.ray_cxx
+        assert importlib.import_module("vane.vane_runners_cpp") is _vane_duckdb
+        assert callable(vane.runners.get_or_infer_runner_type)
+        """
+    )
+    subprocess.run([sys.executable, "-I", "-c", code], check=True)
+
+
 def test_provider_extras_match_provider_import_errors():
     assert _requirements_for_extra("openai") == {"openai"}
     assert _requirements_for_extra("anthropic") == {"anthropic"}
@@ -73,17 +102,27 @@ def test_wheel_or_install_contains_primary_and_third_party_license_files():
     assert any(path.endswith("licenses/NOTICE") for path in files)
     assert any(path.endswith("licenses/LICENSES/DuckDB-MIT.txt") for path in files)
     assert any(path.endswith("licenses/LICENSES/vcpkg-binary-dependencies.txt") for path in files)
-    assert any(path.endswith("licenses/duckdb/experimental/spark/LICENSE") for path in files)
+    assert any(path.endswith("licenses/vane/experimental/spark/LICENSE") for path in files)
     assert any(path.endswith("compression/alp/algorithm/LICENSE") for path in files)
     assert any(path.endswith("compression/alprd/algorithm/LICENSE") for path in files)
 
 
+def test_distribution_owns_only_vane_namespaces():
+    files = {str(path).replace("\\", "/") for path in distribution("vane-ai").files or []}
+    top_level = {path.split("/", 1)[0] for path in files}
+
+    assert {"vane", "_vane_duckdb-stubs", "vane_adbc_driver_duckdb"} <= top_level
+    assert len([name for name in top_level if name.startswith("_vane_duckdb.")]) == 1
+    assert not ({"duckdb", "_duckdb-stubs", "adbc_driver_duckdb"} & top_level)
+    assert not any(name == "_duckdb" or name.startswith("_duckdb.") for name in top_level)
+
+
 def test_duckdb_source_id_matches_recorded_source_tree():
     source_tree_id = _expected_duckdb_source_id(REPOSITORY_ROOT)
-    embedded_source_id = duckdb.sql("SELECT source_id FROM pragma_version()").fetchone()[0]
+    embedded_source_id = vane.sql("SELECT source_id FROM pragma_version()").fetchone()[0]
 
     assert embedded_source_id == source_tree_id[:10]
-    assert duckdb.__git_revision__ == embedded_source_id
+    assert vane.__git_revision__ == embedded_source_id
 
 
 def test_exported_tree_without_manifest_computes_source_id(tmp_path, monkeypatch):

@@ -3,7 +3,7 @@
 
 import pytest
 
-from duckdb.runners.ray.worker_memory import build_ray_node_memory_layout
+from vane.runners.ray.worker_memory import build_ray_node_memory_layout
 
 
 def test_ray_node_memory_layout_has_one_exact_owner_per_byte():

@@ -1,9 +1,15 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import math
 from pathlib import Path
 
 import pytest
 
-import duckdb
+import vane
 
 read_csv = pytest.importorskip("pyarrow.csv").read_csv
 requests = pytest.importorskip("requests")
@@ -232,7 +238,7 @@ def arrow_dataset_register():
 
 @pytest.fixture(scope="module")
 def large_data(arrow_dataset_register):
-    con = duckdb.connect()
+    con = vane.connect()
     arrow_dataset_register(
         "https://github.com/duckdb/duckdb-data/releases/download/v1.0/J1_1e7_NA_0_0.csv.gz",
         "J1_1e7_NA_0_0.csv.gz",
@@ -263,7 +269,7 @@ def large_data(arrow_dataset_register):
 
 @pytest.fixture(scope="module")
 def group_by_data(arrow_dataset_register):
-    con = duckdb.connect()
+    con = vane.connect()
     arrow_dataset_register(
         "https://github.com/duckdb/duckdb-data/releases/download/v1.0/G1_1e7_1e2_5_0.csv.gz",
         "G1_1e7_1e2_5_0.csv.gz",

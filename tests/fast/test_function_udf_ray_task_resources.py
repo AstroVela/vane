@@ -45,8 +45,8 @@ def _fixed_ray_runtime_node(monkeypatch):
 
 
 def test_ray_udf_cpu_and_memory_defaults_are_nonzero(monkeypatch):
-    import duckdb.execution.udf_ray as fur
-    from duckdb.execution.udf_task_admission import ray_udf_task_memory_bytes
+    import vane.execution.udf_ray as fur
+    from vane.execution.udf_task_admission import ray_udf_task_memory_bytes
 
     monkeypatch.delenv("VANE_UDF_TASK_HEAP_BYTES", raising=False)
     monkeypatch.delenv("VANE_UDF_ACTOR_HEAP_BYTES", raising=False)
@@ -58,7 +58,7 @@ def test_ray_udf_cpu_and_memory_defaults_are_nonzero(monkeypatch):
 
 
 def test_ray_task_options_use_exact_logical_resources_and_fixed_pair_window():
-    import duckdb.execution.udf_ray as fur
+    import vane.execution.udf_ray as fur
 
     options = fur._task_remote_options(1.5, 0.25, 3 * _GIB, 2, {"name": "task"})
 
@@ -73,7 +73,7 @@ def test_ray_task_options_use_exact_logical_resources_and_fixed_pair_window():
 
 
 def test_task_payload_accepts_registered_downstream_retention_window_multiple():
-    from duckdb.execution.udf_ray_stream_protocol import task_payload_with_lease
+    from vane.execution.udf_ray_stream_protocol import task_payload_with_lease
 
     payload = _distributed_payload(
         udf_output_target_max_bytes=1024,
@@ -96,7 +96,7 @@ def test_task_payload_accepts_registered_downstream_retention_window_multiple():
 
 @pytest.mark.parametrize("window", [1024, 2500])
 def test_task_payload_rejects_invalid_registered_retention_window(window):
-    from duckdb.execution.udf_ray_stream_protocol import task_payload_with_lease
+    from vane.execution.udf_ray_stream_protocol import task_payload_with_lease
 
     payload = _distributed_payload(udf_output_target_max_bytes=1024)
     lease = {
@@ -116,7 +116,7 @@ def test_task_payload_rejects_invalid_registered_retention_window(window):
 def test_ray_task_remote_keeps_options_available_for_lease_node_affinity():
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-    import duckdb.execution.udf_ray as fur
+    import vane.execution.udf_ray as fur
 
     for builder in (
         fur._build_bundle_stream_remote,
@@ -135,7 +135,7 @@ def test_ray_task_remote_keeps_options_available_for_lease_node_affinity():
 def test_ray_task_executor_requires_runner_owned_ray_runtime(monkeypatch):
     import ray
 
-    import duckdb.execution.udf_ray as fur
+    import vane.execution.udf_ray as fur
 
     monkeypatch.setattr(ray, "is_initialized", lambda: False)
 
@@ -144,7 +144,7 @@ def test_ray_task_executor_requires_runner_owned_ray_runtime(monkeypatch):
 
 
 def test_ray_udf_rejects_unknown_options_without_compatibility_branches():
-    import duckdb.execution.udf as udf
+    import vane.execution.udf as udf
 
     with pytest.raises(ValueError, match="unknown UDF executor options: ray_address"):
         udf.normalize_options({"ray_address": "auto"})
@@ -157,7 +157,7 @@ def test_ray_udf_rejects_unknown_options_without_compatibility_branches():
 
 
 def test_actor_call_uses_fixed_four_raw_objects_for_two_logical_blocks():
-    from duckdb.execution.udf_ray_remote_submit import _with_generator_backpressure
+    from vane.execution.udf_ray_remote_submit import _with_generator_backpressure
 
     class _Method:
         def __init__(self):
@@ -173,7 +173,7 @@ def test_actor_call_uses_fixed_four_raw_objects_for_two_logical_blocks():
 
 
 def test_distributed_payload_requires_registered_query_stage_and_new_protocol():
-    import duckdb.execution.udf_ray as fur
+    import vane.execution.udf_ray as fur
 
     assert fur._ray_payload_requires_block_stream(_distributed_payload()) is True
     for missing in ("query_id", "stage_id", "produce_ray_block_stream"):
@@ -184,8 +184,8 @@ def test_distributed_payload_requires_registered_query_stage_and_new_protocol():
 
 
 def test_task_executor_consumes_pregranted_admission_with_exact_resources(monkeypatch):
-    import duckdb.execution.udf_ray as fur
-    from duckdb.execution.udf_task_admission import ray_udf_task_resource_spec
+    import vane.execution.udf_ray as fur
+    from vane.execution.udf_task_admission import ray_udf_task_resource_spec
 
     captured = {}
 
@@ -224,7 +224,7 @@ def test_task_executor_consumes_pregranted_admission_with_exact_resources(monkey
 
 
 def test_task_submission_starts_immediately_from_pregranted_lease(monkeypatch):
-    import duckdb.execution.udf_ray as fur
+    import vane.execution.udf_ray as fur
 
     submitted = []
     captured = {}
@@ -274,7 +274,7 @@ def test_task_submission_starts_immediately_from_pregranted_lease(monkeypatch):
 
 
 def test_ref_bundle_submission_uses_direct_object_refs_without_registry():
-    from duckdb.execution.udf_ray_remote_ref_bundle import _resolve_ref_bundle_task_refs
+    from vane.execution.udf_ray_remote_ref_bundle import _resolve_ref_bundle_task_refs
 
     refs = [object(), object()]
 
@@ -284,8 +284,8 @@ def test_ref_bundle_submission_uses_direct_object_refs_without_registry():
 
 
 def test_task_stream_producer_yields_direct_block_then_bounded_metadata():
-    import duckdb.execution.udf_ray as fur
-    from duckdb import pickle as duckdb_pickle
+    import vane.execution.udf_ray as fur
+    from vane import pickle as duckdb_pickle
 
     def identity(table):
         return table
@@ -324,8 +324,8 @@ def test_task_stream_producer_yields_direct_block_then_bounded_metadata():
 
 
 def test_materialized_scalar_task_fuses_passthrough_columns_into_block_stream():
-    import duckdb.execution.udf_ray as fur
-    from duckdb import pickle as duckdb_pickle
+    import vane.execution.udf_ray as fur
+    from vane import pickle as duckdb_pickle
 
     def plus_one(value):
         return value + 1
@@ -349,8 +349,8 @@ def test_materialized_scalar_task_fuses_passthrough_columns_into_block_stream():
 
 
 def test_materialized_task_splits_every_block_before_generator_publication():
-    import duckdb.execution.udf_ray as fur
-    from duckdb import pickle as duckdb_pickle
+    import vane.execution.udf_ray as fur
+    from vane import pickle as duckdb_pickle
 
     def plus_one(value):
         return value + 1
@@ -381,8 +381,8 @@ def test_materialized_task_splits_every_block_before_generator_publication():
 
 
 def test_materialized_task_rejects_unsplittable_row_before_first_yield():
-    import duckdb.execution.udf_ray as fur
-    from duckdb import pickle as duckdb_pickle
+    import vane.execution.udf_ray as fur
+    from vane import pickle as duckdb_pickle
 
     def identity(table):
         return table
@@ -403,7 +403,7 @@ def test_materialized_task_rejects_unsplittable_row_before_first_yield():
 
 
 def test_actor_pool_requests_logical_memory_and_initializes_eagerly(monkeypatch):
-    from duckdb.execution.udf_ray_actor_pool import UDFActorPoolBase
+    from vane.execution.udf_ray_actor_pool import UDFActorPoolBase
 
     actor_options = []
     init_calls = []
@@ -485,7 +485,7 @@ def test_actor_pool_requests_logical_memory_and_initializes_eagerly(monkeypatch)
 
 
 def test_actor_pool_thread_env_uses_payload_cpu_allocation(monkeypatch):
-    from duckdb.execution.udf_ray_actor_pool import UDFActorPoolBase
+    from vane.execution.udf_ray_actor_pool import UDFActorPoolBase
 
     actor_options = []
 
@@ -550,7 +550,7 @@ def test_actor_pool_thread_env_uses_payload_cpu_allocation(monkeypatch):
 
 
 def test_actor_pool_default_thread_policy_defers_thread_env_to_ray(monkeypatch):
-    from duckdb.execution.udf_ray_actor_pool import UDFActorPoolBase
+    from vane.execution.udf_ray_actor_pool import UDFActorPoolBase
 
     actor_options = []
 
@@ -609,7 +609,7 @@ def test_actor_pool_default_thread_policy_defers_thread_env_to_ray(monkeypatch):
 
 
 def test_runtime_resource_options_cannot_override_graph_resources():
-    import duckdb.execution.udf_ray as fur
+    import vane.execution.udf_ray as fur
 
     options = fur._task_remote_options(
         1.0,

@@ -1,12 +1,18 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pandas as pd
 import pytest
 
-import duckdb
+import vane
 
 
 class TestAppendDF:
     def test_df_to_table_append(self, duckdb_cursor):
-        conn = duckdb.connect()
+        conn = vane.connect()
         conn.execute("Create table integers (i integer)")
         df_in = pd.DataFrame(
             {
@@ -17,12 +23,12 @@ class TestAppendDF:
         assert conn.execute("select count(*) from integers").fetchone()[0] == 5
 
     def test_append_by_name(self):
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("create table tbl (a integer, b bool, c varchar)")
         df_in = pd.DataFrame({"c": ["duck", "db"], "b": [False, True], "a": [4, 2]})
         # By default we append by position, causing the following exception:
         with pytest.raises(
-            duckdb.ConversionException, match="Conversion Error: Could not convert string 'duck' to INT32"
+            vane.ConversionException, match="Conversion Error: Could not convert string 'duck' to INT32"
         ):
             con.append("tbl", df_in)
 
@@ -32,7 +38,7 @@ class TestAppendDF:
         assert res == [(4, False, "duck"), (2, True, "db")]
 
     def test_append_by_name_quoted(self):
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute(
             """
             create table tbl ("needs to be quoted" integer, other varchar)
@@ -44,11 +50,11 @@ class TestAppendDF:
         assert res == [(1, None), (2, None), (3, None)]
 
     def test_append_by_name_no_exact_match(self):
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("create table tbl (a integer, b bool)")
         df_in = pd.DataFrame({"c": ["a", "b"], "b": [True, False], "a": [42, 1337]})
         # Too many columns raises an error, because the columns cant be found in the targeted table
-        with pytest.raises(duckdb.BinderException, match='Table "tbl" does not have a column with name "c"'):
+        with pytest.raises(vane.BinderException, match='Table "tbl" does not have a column with name "c"'):
             con.append("tbl", df_in, by_name=True)
 
         df_in = pd.DataFrame({"b": [False, False, False]})

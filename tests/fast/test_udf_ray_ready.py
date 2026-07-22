@@ -54,7 +54,7 @@ class _Actor:
 
 
 def _executor(actors, *, dispatch_indices=None, payload=None, node_ids=None):
-    from duckdb.execution.udf_ray import RemoteUDFExecutor, UDFActorPool
+    from vane.execution.udf_ray import RemoteUDFExecutor, UDFActorPool
 
     pool = UDFActorPool._from_handles(
         actors,
@@ -66,8 +66,8 @@ def _executor(actors, *, dispatch_indices=None, payload=None, node_ids=None):
 
 
 def _run_after_lease(executor, monkeypatch, *, actor_index=0):
-    import duckdb.execution.udf_ray_remote_ref_bundle as remote_ref_bundle
-    import duckdb.execution.udf_ray_remote_submit as remote_submit
+    import vane.execution.udf_ray_remote_ref_bundle as remote_ref_bundle
+    import vane.execution.udf_ray_remote_submit as remote_submit
 
     lease = {
         "query_id": executor._payload["query_id"],
@@ -198,7 +198,7 @@ def test_ref_bundle_dispatch_uses_direct_input_refs_and_block_stream(monkeypatch
 
 
 def test_existing_actor_handles_require_explicit_dispatch_eligibility():
-    from duckdb.execution.udf_ray import UDFActorPool
+    from vane.execution.udf_ray import UDFActorPool
 
     actor = _Actor()
     pool = UDFActorPool._from_handles(
@@ -207,15 +207,13 @@ def test_existing_actor_handles_require_explicit_dispatch_eligibility():
         actor_node_ids=["node-a"],
         actor_dispatch_indices=set(),
     )
-    executor = __import__("duckdb.execution.udf_ray", fromlist=["RemoteUDFExecutor"]).RemoteUDFExecutor(
-        pool, _payload()
-    )
+    executor = __import__("vane.execution.udf_ray", fromlist=["RemoteUDFExecutor"]).RemoteUDFExecutor(pool, _payload())
     assert executor._ready_actor_indices == []
     assert executor._actor_init_errors[0] == "ray actor does not expose __ray_ready__ readiness probe"
 
 
 def test_actor_executor_options_reject_missing_or_invalid_coordinator_identity():
-    from duckdb.execution.udf_ray import _build_udf_executor_options
+    from vane.execution.udf_ray import _build_udf_executor_options
 
     actor = _Actor()
     with pytest.raises(ValueError, match="actor node IDs are required"):

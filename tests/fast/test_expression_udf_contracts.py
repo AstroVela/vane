@@ -243,10 +243,9 @@ def test_actor_gpu_reservation_follows_resolved_backend(
     import pyarrow as pa
     import ray
 
-    import duckdb
-    import duckdb.execution.udf_ray as udf_ray
-    import duckdb.execution.udf_subprocess as udf_subprocess
     import vane
+    import vane.execution.udf_ray as udf_ray
+    import vane.execution.udf_subprocess as udf_subprocess
 
     monkeypatch.setenv("VANE_RUNNER", decorator_runner)
 
@@ -273,7 +272,7 @@ def test_actor_gpu_reservation_follows_resolved_backend(
             relation = con.sql("SELECT 1::INTEGER AS value").select(
                 DecoratedBatch()(value=vane.col("value")).alias("result")
             )
-            plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
                 relation,
                 f"gpu-order-{decorator_runner}-{resolved_runner}-{gpus}",
             ).to_physical_plan(con)
@@ -387,9 +386,8 @@ def test_actor_gpu_is_rejected_when_resolved_backend_is_local(monkeypatch):
 def test_stateless_ray_actor_pool_size_and_gpu_options_follow_physical_payload(monkeypatch):
     import ray
 
-    import duckdb
-    import duckdb.execution.udf_ray as udf_ray
     import vane
+    import vane.execution.udf_ray as udf_ray
     from vane._expression_udf import _build_actor_map_batches_expression
 
     class StatelessActor:
@@ -410,7 +408,7 @@ def test_stateless_ray_actor_pool_size_and_gpu_options_follow_physical_payload(m
             actor_number=3,
             gpus=1.25,
         )
-        plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             relation.select(expression.alias("result")),
             "stateless-three-actor-contract",
         ).to_physical_plan(con)

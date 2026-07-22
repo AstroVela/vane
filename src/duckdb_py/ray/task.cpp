@@ -298,7 +298,7 @@ duckdb::distributed::python::ray::MaterializePyPayloadToCollection(const py::obj
 	if (!ray_mod.is_none()) {
 		try {
 			auto object_ref_cls = ray_mod.attr("ObjectRef");
-			auto safe_get = py::module_::import("duckdb.runners.ray.safe_get").attr("resolve_object_refs_blocking");
+			auto safe_get = py::module_::import("vane.runners.ray.safe_get").attr("resolve_object_refs_blocking");
 			for (int depth = 0; depth < 5 && py::isinstance(resolved, object_ref_cls); ++depth) {
 				resolved = safe_get(resolved);
 			}
@@ -567,7 +567,7 @@ private:
 
 				if (!active_indices.empty()) {
 					// Call batch_wait_ready() - single Python call replaces N done() calls
-					auto driver_mod = py::module_::import("duckdb.runners.ray.driver");
+					auto driver_mod = py::module_::import("vane.runners.ray.driver");
 					py::object batch_wait_fn = driver_mod.attr("batch_wait_ready");
 					py::list ready_indices = batch_wait_fn(handles_list);
 
@@ -977,7 +977,7 @@ py::object RayWorkerTask::Plan() const {
 	try {
 
 		// Import the module
-		auto ray_cxx = py::module_::import("_duckdb.ray_cxx");
+		auto ray_cxx = py::module_::import("_vane_duckdb.ray_cxx");
 		auto task_context = task_.context();
 		py::object query_id_obj = py::none();
 		py::object udf_registrations_obj = py::none();

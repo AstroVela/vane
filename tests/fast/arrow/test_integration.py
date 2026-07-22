@@ -1,9 +1,15 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 from pathlib import Path
 
 import pytest
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
@@ -19,7 +25,7 @@ class TestArrowIntegration:
 
         userdata_parquet_table = pq.read_table(parquet_filename)
         userdata_parquet_table.validate(full=True)
-        rel_from_arrow = duckdb.arrow(userdata_parquet_table).project(cols).to_arrow_table()
+        rel_from_arrow = vane.arrow(userdata_parquet_table).project(cols).to_arrow_table()
         rel_from_arrow.validate(full=True)
 
         rel_from_duckdb = duckdb_cursor.from_parquet(parquet_filename).project(cols).to_arrow_table()
@@ -30,7 +36,7 @@ class TestArrowIntegration:
             userdata_parquet_table2 = pa.Table.from_batches(userdata_parquet_table.to_batches(i))
             assert userdata_parquet_table.equals(userdata_parquet_table2, check_metadata=True)
 
-            rel_from_arrow2 = duckdb.arrow(userdata_parquet_table2).project(cols).to_arrow_table()
+            rel_from_arrow2 = vane.arrow(userdata_parquet_table2).project(cols).to_arrow_table()
             rel_from_arrow2.validate(full=True)
 
             assert rel_from_arrow.equals(rel_from_arrow2, check_metadata=True)
@@ -42,7 +48,7 @@ class TestArrowIntegration:
 
         unsigned_parquet_table = pq.read_table(parquet_filename)
         unsigned_parquet_table.validate(full=True)
-        rel_from_arrow = duckdb.arrow(unsigned_parquet_table).project(cols).to_arrow_table()
+        rel_from_arrow = vane.arrow(unsigned_parquet_table).project(cols).to_arrow_table()
         rel_from_arrow.validate(full=True)
 
         rel_from_duckdb = duckdb_cursor.from_parquet(parquet_filename).project(cols).to_arrow_table()
@@ -58,7 +64,7 @@ class TestArrowIntegration:
         arrow_result.combine_chunks()
         arrow_result.validate(full=True)
 
-        round_tripping = duckdb.from_arrow(arrow_result).to_arrow_table()
+        round_tripping = vane.from_arrow(arrow_result).to_arrow_table()
         round_tripping.validate(full=True)
 
         assert round_tripping.equals(arrow_result, check_metadata=True)
@@ -118,7 +124,7 @@ class TestArrowIntegration:
 
         assert duck_arrow_tbl[0].value == expected_value
 
-        # test for select interval from duckdb
+        # test for select interval from vane
         duckdb_cursor.execute("CREATE TABLE test (a INTERVAL)")
         duckdb_cursor.execute("INSERT INTO  test VALUES (INTERVAL 1 YEAR + INTERVAL 1 DAY + INTERVAL 1 SECOND)")
         expected_value = pa.MonthDayNano([12, 1, 1000000000])

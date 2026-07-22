@@ -3,7 +3,7 @@
 
 import pytest
 
-from duckdb.runners.ray.query_execution_graph import (
+from vane.runners.ray.query_execution_graph import (
     ActorPlacement,
     NodeResourceAllocation,
     QueryAllocation,

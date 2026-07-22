@@ -1,10 +1,16 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 from datetime import datetime, time, timezone
 
 import numpy as np
 import pandas as pd
 import pytest
 
-import duckdb
+import vane
 
 _ = pytest.importorskip("pandas", minversion="2.0.0")
 
@@ -14,19 +20,19 @@ class TestDateTimeTime:
         duckdb_time = duckdb_cursor.sql("SELECT make_time(23, 1, 34.234345) AS '0'").df()
         data = [time(hour=23, minute=1, second=34, microsecond=234345)]
         df_in = pd.DataFrame({"0": pd.Series(data=data, dtype="object")})
-        df_out = duckdb.query_df(df_in, "df", "select * from df").df()
+        df_out = vane.query_df(df_in, "df", "select * from df").df()
         pd.testing.assert_frame_equal(df_out, duckdb_time)
 
     def test_time_low(self, duckdb_cursor):
         duckdb_time = duckdb_cursor.sql("SELECT make_time(00, 01, 1.000) AS '0'").df()
         data = [time(hour=0, minute=1, second=1)]
         df_in = pd.DataFrame({"0": pd.Series(data=data, dtype="object")})
-        df_out = duckdb.query_df(df_in, "df", "select * from df").df()
+        df_out = vane.query_df(df_in, "df", "select * from df").df()
         pd.testing.assert_frame_equal(df_out, duckdb_time)
 
     @pytest.mark.parametrize("input", ["2263-02-28", "9999-01-01"])
     def test_pandas_datetime_big(self, input):
-        duckdb_con = duckdb.connect()
+        duckdb_con = vane.connect()
 
         duckdb_con.execute("create table test (date DATE)")
         duckdb_con.execute(f"INSERT INTO TEST VALUES ('{input}')")
@@ -37,7 +43,7 @@ class TestDateTimeTime:
         pd.testing.assert_frame_equal(res, df)
 
     def test_timezone_datetime(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         dt = datetime.now(timezone.utc).replace(microsecond=0)
 

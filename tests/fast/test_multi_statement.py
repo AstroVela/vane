@@ -1,13 +1,19 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import contextlib
 import shutil
 from pathlib import Path
 
-import duckdb
+import vane
 
 
 class TestMultiStatement:
     def test_multi_statement(self, duckdb_cursor):
-        con = duckdb.connect(":memory:")
+        con = vane.connect(":memory:")
 
         # test empty statement
         con.execute("")
@@ -31,7 +37,7 @@ class TestMultiStatement:
         con.execute("INSERT INTO integers2 VALUES (1), (5), (7), (1928)")
         con.execute(f"EXPORT DATABASE '{export_location}'")
         # reset connection
-        con = duckdb.connect(":memory:")
+        con = vane.connect(":memory:")
         con.execute(f"IMPORT DATABASE '{export_location}'")
         integers = [x[0] for x in con.execute("SELECT * FROM integers").fetchall()]
         integers2 = [x[0] for x in con.execute("SELECT * FROM integers2").fetchall()]

@@ -8,7 +8,7 @@ import hashlib
 
 import pytest
 
-import duckdb
+import vane
 
 STREAMING_BACKPRESSURE_ROW_COUNT = 20_000
 STREAMING_DICTIONARY_VALUES = ("alpha", "beta", "gamma", "delta")
@@ -143,7 +143,7 @@ class TestStreamingResult:
         res = duckdb_cursor.sql(
             "SELECT CASE WHEN i < 10000 THEN i ELSE concat('hello', i::VARCHAR)::INT END FROM range(100000) t(i)"
         )
-        with pytest.raises(duckdb.ConversionException):
+        with pytest.raises(vane.ConversionException):
             res.fetchone()
 
     def test_fetch_many(self, duckdb_cursor):
@@ -159,7 +159,7 @@ class TestStreamingResult:
         res = duckdb_cursor.sql(
             "SELECT CASE WHEN i < 10000 THEN i ELSE concat('hello', i::VARCHAR)::INT END FROM range(100000) t(i)"
         )
-        with pytest.raises(duckdb.ConversionException):
+        with pytest.raises(vane.ConversionException):
             res.fetchmany(10)
 
     def test_record_batch_reader(self, duckdb_cursor):
@@ -177,7 +177,7 @@ class TestStreamingResult:
         res = duckdb_cursor.sql(
             "SELECT CASE WHEN i < 10000 THEN i ELSE concat('hello', i::VARCHAR)::INT END FROM range(100000) t(i)"
         )
-        with pytest.raises(duckdb.ConversionException, match="Could not convert string 'hello10000' to INT32"):
+        with pytest.raises(vane.ConversionException, match="Could not convert string 'hello10000' to INT32"):
             reader = res.to_arrow_reader(batch_size=16_384)
 
     def test_9801(self, duckdb_cursor):
