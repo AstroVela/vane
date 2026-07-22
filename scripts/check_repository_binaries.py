@@ -29,6 +29,8 @@ LARGE_FILE_ALLOWLIST: frozenset[str] = frozenset(
 MACHO_MAGICS = {
     b"\xca\xfe\xba\xbe",
     b"\xca\xfe\xba\xbf",
+    b"\xbe\xba\xfe\xca",
+    b"\xbf\xba\xfe\xca",
     b"\xfe\xed\xfa\xce",
     b"\xfe\xed\xfa\xcf",
     b"\xce\xfa\xed\xfe",
@@ -37,7 +39,7 @@ MACHO_MAGICS = {
 
 
 def _normalize(path: str) -> str:
-    return PurePosixPath(path.replace("\\", "/")).as_posix()
+    return PurePosixPath(path).as_posix()
 
 
 def tracked_files(repository_root: Path) -> list[str]:

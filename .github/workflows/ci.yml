@@ -84,9 +84,21 @@ jobs:
       - name: Build and validate source package
         run: |
           python -m pip install --upgrade build pip "tomli>=1.1; python_version < '3.11'"
-          python scripts/check_repository_binaries.py
           python -m build --sdist --outdir dist
           python scripts/check_release_artifacts.py dist/*.tar.gz
+
+  binary-guard:
+    name: Repository binary guard
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check tracked binaries and large files
+        run: python scripts/check_repository_binaries.py
 
   native-fast-tests:
     name: Native build and fast tests (Python ${{ matrix.python-version }})
@@ -194,6 +206,7 @@ jobs:
     if: ${{ always() }}
     needs:
       - changes
+      - binary-guard
       - source-package
       - native-fast-tests
     runs-on: ubuntu-24.04
@@ -201,12 +214,18 @@ jobs:
       - name: Verify CI results
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
+          BINARY_GUARD_RESULT: ${{ needs.binary-guard.result }}
           RUN_FULL: ${{ needs.changes.outputs.run_full }}
           SOURCE_PACKAGE_RESULT: ${{ needs.source-package.result }}
           NATIVE_TESTS_RESULT: ${{ needs.native-fast-tests.result }}
         run: |
           if [[ "$CHANGES_RESULT" != "success" ]]; then
             echo "Change classification did not succeed: $CHANGES_RESULT" >&2
+            exit 1
+          fi
+
+          if [[ "$BINARY_GUARD_RESULT" != "success" ]]; then
+            echo "Repository binary guard did not succeed: $BINARY_GUARD_RESULT" >&2
             exit 1
           fi
 
