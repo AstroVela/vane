@@ -243,3 +243,57 @@ def test_prompt_batch_del_swallows_close_errors():
 
     wrapper._prompter = ExplodingPrompter()
     wrapper.__del__()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Actor adapter forwards close() to the wrapped batch object
+#
+# Actor backends own a _ConfiguredAIBatchActor instance, not the _PromptBatch
+# itself, so _PromptBatch.close() is only reachable if the adapter forwards it.
+# ---------------------------------------------------------------------------
+
+
+def _actor_adapter_wrapping_prompt_batch():
+    functions = _load_real_functions()
+    batch = functions._PromptBatch(object(), "messages", "response", None)
+    prompter = CloseRecordingPrompter()
+    batch._prompter = prompter
+    actor_cls = functions._adapt_batch_wrapper_for_backend(batch, "subprocess_actor")
+    return actor_cls(), batch, prompter
+
+
+def test_actor_adapter_close_delegates_to_wrapped_batch():
+    adapter, batch, prompter = _actor_adapter_wrapping_prompt_batch()
+
+    adapter.close()
+    assert prompter.close_calls == 1
+    assert batch._prompter is None
+
+    adapter.close()  # idempotent through _PromptBatch.close()
+    assert prompter.close_calls == 1
+
+
+def test_actor_adapter_del_delegates_to_wrapped_batch():
+    adapter, batch, prompter = _actor_adapter_wrapping_prompt_batch()
+
+    adapter.__del__()
+    assert prompter.close_calls == 1
+    assert batch._prompter is None
+
+
+def test_actor_adapter_close_tolerates_wrappers_without_close():
+    functions = _load_real_functions()
+    actor_cls = functions._adapt_batch_wrapper_for_backend(lambda table: table, "subprocess_actor")
+    adapter = actor_cls()
+    adapter.close()  # plain-function wrapper: no close attr, must not raise
+
+
+def test_actor_adapter_del_swallows_close_errors():
+    functions = _load_real_functions()
+
+    class ExplodingWrapper:
+        def close(self):
+            raise RuntimeError("teardown boom")
+
+    actor_cls = functions._adapt_batch_wrapper_for_backend(ExplodingWrapper(), "subprocess_actor")
+    actor_cls().__del__()  # must not raise

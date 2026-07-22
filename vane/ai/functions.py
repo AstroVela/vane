@@ -240,6 +240,25 @@ def _adapt_batch_wrapper_for_backend(wrapper: Any, execution_backend: str | None
             def __call__(self, table: pa.Table) -> pa.Table:
                 return self._wrapper(table)
 
+            def close(self) -> None:
+                """Forward teardown to the wrapped batch object.
+
+                Actor backends hold this adapter, not the batch wrapper, so
+                the wrapper's ``close()`` (e.g. ``_PromptBatch`` retiring a
+                vLLM executor) is only reachable through here. Idempotent
+                because the wrapped ``close()`` is.
+                """
+                close = getattr(self._wrapper, "close", None)
+                if close is not None:
+                    close()
+
+            def __del__(self) -> None:
+                try:
+                    self.close()
+                except Exception:
+                    # Interpreter or actor teardown — destructors must not raise.
+                    pass
+
         return _ConfiguredAIBatchActor
 
     if backend in ("", "subprocess_task", "ray_task"):
