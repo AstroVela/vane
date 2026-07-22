@@ -64,6 +64,8 @@ def _get_input_token_limit(model: str) -> int:
     return _MODEL_INPUT_TOKEN_LIMITS.get(model, _DEFAULT_INPUT_TOKEN_LIMIT)
 
 
+# Retained for callers and tests that chunk by raw character count; the
+# embedder itself now uses the token-aware _chunk_text_by_tokens instead.
 def _chunk_text(text: str, char_size: int) -> list[str]:
     """Split *text* into character-level chunks of at most *char_size*."""
     return [text[i : i + char_size] for i in range(0, len(text), char_size)]
@@ -317,19 +319,20 @@ class OpenAITextEmbedder:
         }
         self._client = AsyncOpenAI(**client_opts)
 
-    async def embed_text(self, text: list[str]) -> list[Embedding]:
+    async def embed_text(self, text: list[str]) -> list[Embedding | None]:
         """Embed *text*, returning one float32 embedding per input row.
 
-        Empty rows (``None``, ``""``, or whitespace-only) are never sent to
-        the API — OpenAI rejects empty inputs with an error that fails the
-        whole request. Each such row receives a deterministic zero vector
+        Empty rows are never sent to the API: OpenAI rejects ``""`` inputs
+        with an error that fails the whole request, and ``None`` /
+        whitespace-only rows are normalised to the same deterministic
+        placeholder for consistency. Each such row receives a zero vector
         whose dimension comes from, in order: the configured ``dimensions``,
         the first embedding produced in this call, or the known model
         dimension table. When the dimension is unknowable (every row empty
         and an unrecognised model), those rows are ``None``. Non-empty rows
         are unaffected.
         """
-        results: list[Embedding] = [None] * len(text)
+        results: list[Embedding | None] = [None] * len(text)
         empty_positions: list[int] = []
         batch: list[str] = []
         batch_positions: list[int] = []
@@ -339,7 +342,7 @@ class OpenAITextEmbedder:
             nonlocal batch, batch_positions, batch_tokens
             if not batch:
                 return
-            for position, embedding in zip(batch_positions, await self._embed_batch(batch)):
+            for position, embedding in zip(batch_positions, await self._embed_batch(batch), strict=True):
                 results[position] = embedding
             batch = []
             batch_positions = []
@@ -356,7 +359,10 @@ class OpenAITextEmbedder:
                 # the chunks through token-limited requests, then recombine
                 # via weighted average + L2 normalisation.
                 await flush()
-                chunks = _chunk_text_by_tokens(item, self._input_text_token_limit)
+                # Bound each chunk by BOTH limits so a single chunk always
+                # fits one request, even when input_text_token_limit is
+                # configured above batch_token_limit.
+                chunks = _chunk_text_by_tokens(item, min(self._input_text_token_limit, self._batch_token_limit))
                 chunk_embeddings = await self._embed_chunks(chunks)
                 chunk_lens = np.array(
                     [len(c) for c in chunks],
@@ -384,7 +390,7 @@ class OpenAITextEmbedder:
                     results[position] = np.zeros(dimension, dtype=np.float32)
         return results
 
-    def _placeholder_dimension(self, results: list[Embedding]) -> int | None:
+    def _placeholder_dimension(self, results: list[Embedding | None]) -> int | None:
         """Dimension for empty-row placeholder vectors, ``None`` if unknowable."""
         if self._dimensions is not None:
             return self._dimensions

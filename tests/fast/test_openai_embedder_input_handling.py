@@ -153,6 +153,27 @@ def test_oversized_chunks_respect_batch_token_limit(monkeypatch):
     assert len(result) == 1
 
 
+def test_inverted_limits_still_bound_each_request(monkeypatch):
+    """input_text_token_limit above batch_token_limit must not produce over-limit requests."""
+    server = FakeEmbeddingServer(dim=4)
+    embedder = _make_embedder(
+        monkeypatch,
+        server,
+        model="custom-model",
+        input_text_token_limit=40,
+        batch_token_limit=10,
+    )
+    text = "a" * 150  # 50 estimated tokens: oversized, but chunks must fit the batch limit
+
+    result = asyncio.run(embedder.embed_text([text]))
+
+    assert len(server.requests) >= 2
+    for req in server.requests:
+        assert sum(len(t) for t in req["input"]) // 3 <= 10
+    assert "".join(t for req in server.requests for t in req["input"]) == text
+    assert len(result) == 1
+
+
 def test_oversized_average_is_float32(monkeypatch):
     server = FakeEmbeddingServer(dim=4)
     embedder = _make_embedder(
