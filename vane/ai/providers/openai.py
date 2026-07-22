@@ -69,6 +69,47 @@ def _chunk_text(text: str, char_size: int) -> list[str]:
     return [text[i : i + char_size] for i in range(0, len(text), char_size)]
 
 
+def _estimate_tokens(text: str) -> int:
+    """Conservatively estimate the token count of *text*.
+
+    ASCII characters count at ~3 chars per token; every non-ASCII character
+    counts as a full token (CJK scripts run close to 1 token per character,
+    so a plain ``len(text) // 3`` badly underestimates them). O(len(text))
+    and dependency-free.
+    """
+    ascii_count = len(text.encode("ascii", errors="ignore"))
+    non_ascii_count = len(text) - ascii_count
+    return ascii_count // 3 + non_ascii_count
+
+
+def _chunk_text_by_tokens(text: str, token_limit: int) -> list[str]:
+    """Split *text* into chunks whose estimated token count is <= *token_limit*.
+
+    Uses the same per-character accounting as :func:`_estimate_tokens`, so a
+    chunk is guaranteed to stay within the limit regardless of how ASCII and
+    non-ASCII characters are distributed.
+    """
+    chunks: list[str] = []
+    start = 0
+    ascii_count = 0
+    non_ascii_count = 0
+    for index, char in enumerate(text):
+        if ord(char) < 128:
+            ascii_count += 1
+        else:
+            non_ascii_count += 1
+        if ascii_count // 3 + non_ascii_count > token_limit and index > start:
+            chunks.append(text[start:index])
+            start = index
+            if ord(char) < 128:
+                ascii_count, non_ascii_count = 1, 0
+            else:
+                ascii_count, non_ascii_count = 0, 1
+    if start < len(text):
+        chunks.append(text[start:])
+    return chunks
+
+
 # OpenAI-specific keys sealed in addition to the shared sensitive-key table.
 # ``organization`` identifies the paying account and must not leak via repr,
 # but it is not a generic credential, so it stays out of the shared table
@@ -225,11 +266,20 @@ class OpenAITextEmbedder:
 
     * **batch_token_limit** — max estimated tokens per API request (default 300k).
     * **input_text_token_limit** — max tokens for a single input text.
-      Texts exceeding this are split into character chunks, embedded
-      separately, and recombined via length-weighted averaging + L2
-      normalisation.  The estimation is conservative: ``len(text) // 3``
-      (≈ 1 token per 3 chars), which is O(1) and avoids a tiktoken
-      dependency.
+      Texts exceeding this are split into chunks, embedded separately
+      (through the same token-limited request batching), and recombined via
+      length-weighted averaging + L2 normalisation.
+
+    Token counts are estimated heuristically: ASCII characters at ~3 chars
+    per token, and every non-ASCII character as a full token (CJK scripts
+    run close to 1 token per character). The estimate is O(len(text)) and
+    avoids a tiktoken dependency; it can still undercount rare multi-token
+    characters, but is conservative for common ASCII and CJK text.
+
+    Empty inputs (``None``, ``""``, or whitespace-only) are never sent to
+    the API — OpenAI rejects them with an error for the whole request.
+    Their rows receive deterministic placeholder vectors instead; see
+    :meth:`embed_text`.
     """
 
     def __init__(
@@ -245,6 +295,10 @@ class OpenAITextEmbedder:
 
         if encoding_format not in {"float", "base64"}:
             raise ValueError("encoding_format must be 'float' or 'base64'")
+        if batch_token_limit <= 0:
+            raise ValueError(f"batch_token_limit must be positive, got {batch_token_limit!r}")
+        if input_text_token_limit is not None and input_text_token_limit <= 0:
+            raise ValueError(f"input_text_token_limit must be positive, got {input_text_token_limit!r}")
         # Restore plaintext credentials sealed by the descriptor; plain dicts
         # from direct callers pass through unchanged.
         provider_options = unwrap_sensitive_options(provider_options)
@@ -264,32 +318,46 @@ class OpenAITextEmbedder:
         self._client = AsyncOpenAI(**client_opts)
 
     async def embed_text(self, text: list[str]) -> list[Embedding]:
-        embeddings: list[Embedding] = []
+        """Embed *text*, returning one float32 embedding per input row.
+
+        Empty rows (``None``, ``""``, or whitespace-only) are never sent to
+        the API — OpenAI rejects empty inputs with an error that fails the
+        whole request. Each such row receives a deterministic zero vector
+        whose dimension comes from, in order: the configured ``dimensions``,
+        the first embedding produced in this call, or the known model
+        dimension table. When the dimension is unknowable (every row empty
+        and an unrecognised model), those rows are ``None``. Non-empty rows
+        are unaffected.
+        """
+        results: list[Embedding] = [None] * len(text)
+        empty_positions: list[int] = []
         batch: list[str] = []
+        batch_positions: list[int] = []
         batch_tokens = 0
-        approx_chars_per_token = 3
 
         async def flush() -> None:
-            nonlocal batch, batch_tokens
+            nonlocal batch, batch_positions, batch_tokens
             if not batch:
                 return
-            result = await self._embed_batch(batch)
-            embeddings.extend(result)
+            for position, embedding in zip(batch_positions, await self._embed_batch(batch)):
+                results[position] = embedding
             batch = []
+            batch_positions = []
             batch_tokens = 0
 
-        for item in text:
-            if item is None:
-                item = ""
-            est_tokens = len(item) // approx_chars_per_token
+        for position, item in enumerate(text):
+            if item is None or not item.strip():
+                empty_positions.append(position)
+                continue
+            est_tokens = _estimate_tokens(item)
 
             if est_tokens > self._input_text_token_limit:
-                # Oversized single input — flush pending batch, chunk, embed,
-                # then recombine via weighted average + L2 normalisation.
+                # Oversized single input — flush pending batch, chunk, embed
+                # the chunks through token-limited requests, then recombine
+                # via weighted average + L2 normalisation.
                 await flush()
-                chunk_char_size = self._input_text_token_limit * approx_chars_per_token
-                chunks = _chunk_text(item, chunk_char_size)
-                chunk_embeddings = await self._embed_batch(chunks)
+                chunks = _chunk_text_by_tokens(item, self._input_text_token_limit)
+                chunk_embeddings = await self._embed_chunks(chunks)
                 chunk_lens = np.array(
                     [len(c) for c in chunks],
                     dtype=np.float64,
@@ -298,15 +366,48 @@ class OpenAITextEmbedder:
                 norm = np.linalg.norm(avg)
                 if norm > 0:
                     avg = avg / norm
-                embeddings.append(avg)
+                results[position] = avg.astype(np.float32)
                 continue
 
             if est_tokens + batch_tokens >= self._batch_token_limit:
                 await flush()
             batch.append(item)
+            batch_positions.append(position)
             batch_tokens += est_tokens
 
         await flush()
+
+        if empty_positions:
+            dimension = self._placeholder_dimension(results)
+            if dimension is not None:
+                for position in empty_positions:
+                    results[position] = np.zeros(dimension, dtype=np.float32)
+        return results
+
+    def _placeholder_dimension(self, results: list[Embedding]) -> int | None:
+        """Dimension for empty-row placeholder vectors, ``None`` if unknowable."""
+        if self._dimensions is not None:
+            return self._dimensions
+        for embedding in results:
+            if embedding is not None:
+                return int(np.asarray(embedding).shape[-1])
+        return _MODEL_DIMS.get(self._model)
+
+    async def _embed_chunks(self, chunks: list[str]) -> list[Embedding]:
+        """Embed *chunks* through requests that respect ``batch_token_limit``."""
+        embeddings: list[Embedding] = []
+        batch: list[str] = []
+        batch_tokens = 0
+        for chunk in chunks:
+            est_tokens = _estimate_tokens(chunk)
+            if batch and est_tokens + batch_tokens >= self._batch_token_limit:
+                embeddings.extend(await self._embed_batch(batch))
+                batch = []
+                batch_tokens = 0
+            batch.append(chunk)
+            batch_tokens += est_tokens
+        if batch:
+            embeddings.extend(await self._embed_batch(batch))
         return embeddings
 
     async def _embed_batch(self, texts: list[str]) -> list[Embedding]:
@@ -526,12 +627,19 @@ class OpenAIPrompter:
 
         # Chat Completions API: prompt_tokens / completion_tokens / total_tokens
         # Responses API: input_tokens / output_tokens / total_tokens
+        # Explicit None checks: a legitimate count of 0 must be recorded as 0.
+        input_tokens = getattr(usage, "prompt_tokens", None)
+        if input_tokens is None:
+            input_tokens = getattr(usage, "input_tokens", None)
+        output_tokens = getattr(usage, "completion_tokens", None)
+        if output_tokens is None:
+            output_tokens = getattr(usage, "output_tokens", None)
         record_token_metrics(
             protocol="prompt",
             model=self._model,
             provider="openai",
-            input_tokens=(getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None)),
-            output_tokens=(getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", None)),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             total_tokens=getattr(usage, "total_tokens", None),
         )
 

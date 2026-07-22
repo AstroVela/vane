@@ -21,6 +21,20 @@ All notable user-visible changes are documented here. Vane is currently in alpha
   Vane engine customizations as monorepo commits, so normal clones no longer
   require submodule initialization or carry DuckDB's complete commit history.
 
+### Fixed
+
+- Hardened OpenAI embedder input handling: empty or whitespace-only rows are
+  no longer sent to the API (OpenAI rejects them, failing the whole batch) and
+  instead receive deterministic zero-vector placeholders, or nulls when the
+  embedding dimension is unknowable; token estimation now counts each
+  non-ASCII character as a full token, so CJK text is chunked conservatively
+  instead of being sent oversized; chunks of oversized inputs are embedded
+  through the same token-limited request batching instead of one unbounded
+  request; chunk-averaged embeddings are float32 like normal rows;
+  non-positive `batch_token_limit`/`input_text_token_limit` values are
+  rejected early; and a legitimate token usage of 0 is recorded as 0 instead
+  of null.
+
 ### Security
 
 - Documented the trust boundaries around Python UDFs, Ray workers, credentials, native parsers, and remote model code.
