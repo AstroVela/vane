@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import pyarrow as pa
@@ -23,13 +23,18 @@ import pyarrow as pa
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider
-from vane.ai.typing import EmbeddingDimensions, UDFOptions
+from vane.ai.typing import EmbeddingDimensions, UDFOptions, actor_number_from_options
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from vane.ai.protocols import Prompter, TextEmbedder
     from vane.ai.typing import Embedding, Options
+
+# Keys that configure the OpenAI SDK client itself (as opposed to embed/prompt
+# request options). ``max_retries`` here is the SDK client's internal retry
+# count, not the vane UDF retry option.
+_OPENAI_CLIENT_KEYS = frozenset({"api_key", "base_url", "organization", "timeout", "max_retries"})
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +106,22 @@ class OpenAIProvider(Provider):
     def name(self) -> str:
         return self._name
 
-    _CLIENT_KEYS = {"api_key", "base_url", "organization", "timeout", "max_retries"}
+    _CLIENT_KEYS: ClassVar[frozenset[str]] = _OPENAI_CLIENT_KEYS
+
+    def _split_options(self, options: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Merge provider-level defaults with call options and split them.
+
+        Call-level values override provider-constructor defaults. Client
+        configuration (``_CLIENT_KEYS``) goes to ``provider_options``;
+        everything else flows to the embed/prompt request options, so
+        provider-level defaults such as ``batch_size=``,
+        ``max_api_concurrency=``, or ``on_error=`` take effect instead of
+        being silently dropped.
+        """
+        merged = {**self._options, **options}
+        provider_options = {k: v for k, v in merged.items() if k in self._CLIENT_KEYS}
+        request_options = {k: v for k, v in merged.items() if k not in self._CLIENT_KEYS}
+        return provider_options, request_options
 
     def get_text_embedder(
         self,
@@ -109,16 +129,13 @@ class OpenAIProvider(Provider):
         dimensions: int | None = None,
         **options: Any,
     ) -> TextEmbedderDescriptor:
-        provider_opts = {**self._options}
-        for k in self._CLIENT_KEYS:
-            if k in options:
-                provider_opts[k] = options.pop(k)
+        provider_options, embed_options = self._split_options(options)
         return OpenAITextEmbedderDescriptor(
             provider_name=self._name,
-            provider_options=provider_opts,
-            model_name=model or self.DEFAULT_TEXT_EMBEDDER,
+            provider_options=provider_options,
+            model_name=model or embed_options.pop("model", self.DEFAULT_TEXT_EMBEDDER),
             dimensions=dimensions,
-            embed_options=options,
+            embed_options=embed_options,
         )
 
     def get_prompter(
@@ -129,18 +146,15 @@ class OpenAIProvider(Provider):
         use_chat_completions: bool = True,
         **options: Any,
     ) -> PrompterDescriptor:
-        provider_opts = {**self._options}
-        for k in self._CLIENT_KEYS:
-            if k in options:
-                provider_opts[k] = options.pop(k)
+        provider_options, prompt_options = self._split_options(options)
         return OpenAIPrompterDescriptor(
             provider_name=self._name,
-            provider_options=provider_opts,
-            model_name=model or self.DEFAULT_PROMPTER_MODEL,
+            provider_options=provider_options,
+            model_name=model or prompt_options.pop("model", self.DEFAULT_PROMPTER_MODEL),
             system_message=system_message,
             return_format=return_format,
             use_chat_completions=use_chat_completions,
-            prompt_options=options,
+            prompt_options=prompt_options,
         )
 
 
@@ -183,10 +197,15 @@ class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
             return EmbeddingDimensions(size=self.dimensions, dtype=pa.float32())
         if self.model_name in _MODEL_DIMS:
             return EmbeddingDimensions(size=_MODEL_DIMS[self.model_name], dtype=pa.float32())
-        # Unknown model with custom base_url — probe the server
+        # Unknown model with custom base_url — probe the server. Only client
+        # configuration reaches the probe client; descriptors built by older
+        # code (or direct consumers) may carry extra keys in provider_options.
         from openai import OpenAI as OpenAIClient
 
-        client = OpenAIClient(**unwrap_sensitive_options(self.provider_options))
+        client_opts = {
+            k: v for k, v in unwrap_sensitive_options(self.provider_options).items() if k in _OPENAI_CLIENT_KEYS
+        }
+        client = OpenAIClient(**client_opts)
         response = client.embeddings.create(
             input="dimension probe",
             model=self.model_name,
@@ -200,8 +219,9 @@ class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
             batch_size=self.embed_options.get("batch_size", 64),
             max_retries=0,  # OpenAI client handles retries internally
             on_error=self.embed_options.get("on_error", "raise"),
-            actor_number=self.embed_options.get("actor_number"),
-            num_gpus=self.embed_options.get("num_gpus"),
+            actor_number=actor_number_from_options(self.embed_options),
+            # Pure HTTP provider: no GPU need unless explicitly declared.
+            num_gpus=self.embed_options.get("num_gpus", 0),
         )
 
     def is_async(self) -> bool:
@@ -256,11 +276,7 @@ class OpenAITextEmbedder:
             input_text_token_limit if input_text_token_limit is not None else _get_input_token_limit(model)
         )
         # Filter out non-OpenAI keys before passing to client
-        client_opts = {
-            k: v
-            for k, v in provider_options.items()
-            if k in {"api_key", "base_url", "organization", "timeout", "max_retries"}
-        }
+        client_opts = {k: v for k, v in provider_options.items() if k in _OPENAI_CLIENT_KEYS}
         self._client = AsyncOpenAI(**client_opts)
 
     async def embed_text(self, text: list[str]) -> list[Embedding]:
@@ -375,10 +391,12 @@ class OpenAIPrompterDescriptor(PrompterDescriptor):
 
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(
+            batch_size=self.prompt_options.get("batch_size"),
             max_retries=0,  # OpenAI client handles retries internally
             on_error=self.prompt_options.get("on_error", "raise"),
-            actor_number=self.prompt_options.get("actor_number"),
-            num_gpus=self.prompt_options.get("num_gpus"),
+            actor_number=actor_number_from_options(self.prompt_options),
+            # Pure HTTP provider: no GPU need unless explicitly declared.
+            num_gpus=self.prompt_options.get("num_gpus", 0),
             max_api_concurrency=self.prompt_options.get("max_api_concurrency", 32),
         )
 
@@ -438,11 +456,7 @@ class OpenAIPrompter:
                 "batch_size",
             }
         }
-        client_opts = {
-            k: v
-            for k, v in provider_options.items()
-            if k in {"api_key", "base_url", "organization", "timeout", "max_retries"}
-        }
+        client_opts = {k: v for k, v in provider_options.items() if k in _OPENAI_CLIENT_KEYS}
         self._client = AsyncOpenAI(**client_opts)
 
     # --- Multimodal message processing -----------------------------------

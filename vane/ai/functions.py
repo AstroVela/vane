@@ -518,7 +518,9 @@ class _PromptBatch:
     Supports both plain text and structured output (Pydantic models).
     When ``return_format`` is set, responses are serialized to JSON strings.
     When ``image_columns`` is set, image data from those columns is packed
-    alongside text into multimodal message tuples.
+    alongside text into multimodal message tuples. Prompters exposing only a
+    batch API (``prompt_batch``, e.g. vLLM) are text-only, so combining them
+    with ``image_columns`` raises instead of silently dropping the images.
     """
 
     def __init__(
@@ -576,6 +578,13 @@ class _PromptBatch:
 
         # Use batch API if available (e.g. vLLM's continuous batching)
         if hasattr(self._prompter, "prompt_batch"):
+            if self._image_columns:
+                raise ValueError(
+                    "image_columns is not supported with a batch-only prompter: "
+                    "the prompt_batch API (e.g. vLLM) is text-only, so image "
+                    "columns would be silently dropped. Remove image_columns or "
+                    "use a provider with per-row multimodal prompting."
+                )
             results = _retry_call(
                 self._prompter.prompt_batch,
                 texts,
@@ -921,6 +930,7 @@ def _prompt_expression(
     """
     prov = _resolve_provider(provider, "openai")
     descriptor_options = _merge_options(provider_options, prompt_options)
+    _reject_smuggled_return_format(descriptor_options, "vane.ai.prompt expression API")
     try:
         descriptor = prov.get_prompter(model=model, system_message=system_message, **descriptor_options)
     except NotImplementedError as exc:
@@ -969,6 +979,22 @@ def _reject_relation_only_prompt_kwargs(kwargs: dict[str, Any]) -> None:
             + ", ".join(unsupported)
             + ". Rename the output with .alias(...); use the relation API "
             "prompt(rel, column, ...) for return_format/image_columns/execution_backend."
+        )
+
+
+def _reject_smuggled_return_format(options: dict[str, Any], surface: str) -> None:
+    """Reject ``return_format`` smuggled inside merged option dicts.
+
+    A dict-borne ``return_format`` bypasses the top-level kwarg guard: the
+    prompter would return parsed objects while the batch wrapper skips
+    serialization, surfacing as an opaque ArrowInvalid in the worker. Fail
+    fast with the same message family as the top-level guard instead.
+    """
+    if "return_format" in options:
+        raise TypeError(
+            f"{surface} does not support: return_format (found inside an "
+            "options dict). Use the relation API prompt(rel, column, "
+            "return_format=...) for structured output."
         )
 
 

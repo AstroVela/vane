@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias, TypeVar
 
@@ -22,6 +23,21 @@ Options = dict[str, Any]
 Label = str
 
 T = TypeVar("T")
+
+
+def actor_number_from_options(options: Mapping[str, Any]) -> int | None:
+    """Resolve UDF ``actor_number`` from execution options.
+
+    Accepts ``concurrency`` as the public alias for ``actor_number`` —
+    mirroring the SQL layer and the typed options objects — so the bare
+    Python kwarg is not silently dropped. An explicit ``actor_number`` wins.
+    """
+    value = options.get("actor_number")
+    if value is None:
+        value = options.get("concurrency")
+    if value is None:
+        return None
+    return int(value)
 
 
 class Descriptor(ABC, Generic[T]):

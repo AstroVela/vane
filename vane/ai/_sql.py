@@ -17,6 +17,7 @@ from vane.ai.functions import (
     _EmbedTextBatch,
     _gpus_or_zero,
     _PromptBatch,
+    _reject_smuggled_return_format,
     _resolve_ai_batch_size,
     _resolve_provider,
 )
@@ -148,6 +149,7 @@ def _normalize_sql_options(options: dict[str, Any] | None) -> dict[str, Any]:
 
 def build_ai_prompt_sql_spec(options: dict[str, Any] | None = None) -> dict[str, Any]:
     opts = _normalize_sql_options(options)
+    _reject_smuggled_return_format(opts, "AI SQL prompt options")
     provider = opts.pop("provider", "openai")
     model = opts.pop("model", None)
     system_message = opts.pop("system_message", None)

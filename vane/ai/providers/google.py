@@ -22,7 +22,7 @@ import numpy as np
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider
-from vane.ai.typing import EmbeddingDimensions, UDFOptions
+from vane.ai.typing import EmbeddingDimensions, UDFOptions, actor_number_from_options
 
 if TYPE_CHECKING:
     from vane.ai.protocols import Prompter, TextEmbedder
@@ -178,10 +178,12 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
 
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(
+            batch_size=self.embed_options.get("batch_size"),
             max_retries=self.embed_options.get("max_retries", 3),
             on_error=self.embed_options.get("on_error", "raise"),
-            actor_number=self.embed_options.get("actor_number"),
-            num_gpus=self.embed_options.get("num_gpus"),
+            actor_number=actor_number_from_options(self.embed_options),
+            # Pure HTTP provider: no GPU need unless explicitly declared.
+            num_gpus=self.embed_options.get("num_gpus", 0),
         )
 
     def is_async(self) -> bool:
@@ -287,10 +289,12 @@ class GooglePrompterDescriptor(PrompterDescriptor):
 
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(
+            batch_size=self.prompt_options.get("batch_size"),
             max_retries=self.prompt_options.get("max_retries", 3),
             on_error=self.prompt_options.get("on_error", "raise"),
-            actor_number=self.prompt_options.get("actor_number"),
-            num_gpus=self.prompt_options.get("num_gpus"),
+            actor_number=actor_number_from_options(self.prompt_options),
+            # Pure HTTP provider: no GPU need unless explicitly declared.
+            num_gpus=self.prompt_options.get("num_gpus", 0),
             max_api_concurrency=self.prompt_options.get("max_api_concurrency", 16),
         )
 
