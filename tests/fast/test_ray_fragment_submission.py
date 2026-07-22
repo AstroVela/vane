@@ -73,6 +73,13 @@ class RayWorkerActorHandle(_ProductionRayWorkerActorHandle):
         self.record_fte_task_terminal(attempt_id)
         return result
 
+    def record_fte_task_result_ready_without_drain(self, attempt_id):
+        result = super().record_fte_task_result_ready_without_drain(attempt_id)
+        # Match the immediate-adoption model without re-entering pending drain
+        # while a fragment completion is being applied.
+        self.record_fte_task_terminal(attempt_id, drain=False)
+        return result
+
     def _ensure_fragment_progress_topology(self, query_id, fragment_id, fragment_plan):
         topology = {
             "schema": "pipeline_topology",
@@ -3252,9 +3259,16 @@ def test_fte_pending_drain_is_fair_across_queries(monkeypatch):
     assert query_b_handles == []
     assert [str(task_handle.task_id) for task_handle in handle.pop_fte_result_handles("query-a")] == ["query-a.0.0.0"]
 
-    handle.record_fte_task_terminal(query_a_handles[0].task_id)
+    completion_handles = handle.handle_fte_task_status(
+        {
+            "state": "FINISHED",
+            "task_id": query_a_handles[0].task_id.to_dict(),
+            "version": 1,
+        }
+    )
     first_scheduled = handle.pop_fte_result_handles("query-b")
 
+    assert [str(task_handle.task_id) for task_handle in completion_handles] == ["query-b.0.0.0"]
     assert [str(task_handle.task_id) for task_handle in first_scheduled] == ["query-b.0.0.0"]
     handle.record_fte_task_terminal(first_scheduled[0].task_id)
     second_scheduled = handle.pop_fte_result_handles("query-a")
@@ -3868,6 +3882,7 @@ def test_fte_worker_failure_replays_descriptor_on_new_owner(monkeypatch):
         "SplitEventsSubmitted": 1,
         "WorkerReservationCompleted": 2,
         "WorkerFailed": 1,
+        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -3969,6 +3984,7 @@ def test_fte_worker_failure_retry_waits_for_scheduling_delayer(monkeypatch):
         "WorkerReservationCompleted": 2,
         "WorkerFailed": 1,
         "RetryDelayExpired": 1,
+        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -4025,6 +4041,7 @@ def test_fte_split_append_control_failure_replays_on_replacement(monkeypatch):
         "SplitEventsSubmitted": 2,
         "WorkerReservationCompleted": 2,
         "WorkerFailed": 1,
+        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -4096,6 +4113,7 @@ def test_fte_split_queue_full_replays_descriptor_on_replacement(monkeypatch):
         "SplitEventsSubmitted": 2,
         "WorkerReservationCompleted": 2,
         "WorkerFailed": 1,
+        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -4812,6 +4830,7 @@ def test_fte_exchange_selector_event_updates_running_and_pending_consumers(monke
         "WorkerReservationCompleted": 2,
         "ExchangeSelectorUpdated": 1,
         "TaskStatusChanged": 1,
+        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -6155,6 +6174,7 @@ def test_fte_task_status_event_marks_partition_finished(monkeypatch):
         "SplitEventsSubmitted": 1,
         "WorkerReservationCompleted": 1,
         "TaskStatusChanged": 1,
+        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -6193,6 +6213,7 @@ def test_fte_task_status_event_retries_failed_attempt(monkeypatch):
         "SplitEventsSubmitted": 1,
         "WorkerReservationCompleted": 2,
         "TaskStatusChanged": 1,
+        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -6231,6 +6252,7 @@ def test_fte_task_status_event_oom_is_terminal_for_registered_heap(monkeypatch):
         "SplitEventsSubmitted": 1,
         "WorkerReservationCompleted": 1,
         "TaskStatusChanged": 1,
+        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -6428,6 +6450,7 @@ def test_fte_input_stream_exhausted_control_failure_replays_sealed_descriptor(mo
         "WorkerReservationCompleted": 2,
         "SourceInputExhausted": 1,
         "WorkerFailed": 1,
+        "ResourceAdmissionChanged": 1,
     }
 
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Any
 
+from duckdb.runners.fte import FteTaskAttemptId, FteTaskExecutionClass
 from duckdb.runners.ray.fragment_registry import _FTE_REGISTRY_LOCK
 from duckdb.runners.ray.fragment_worker_pressure import (
     attempt_key,
@@ -13,7 +14,6 @@ from duckdb.runners.ray.fragment_worker_pressure import (
     initial_split_count,
     partition_reservation_key,
 )
-from duckdb.runners.fte import FteTaskAttemptId, FteTaskExecutionClass
 from duckdb.runners.ray.fte_fragment_scheduler import _memory_requirement_bytes
 
 if TYPE_CHECKING:
@@ -21,6 +21,11 @@ if TYPE_CHECKING:
 
 
 class FteWorkerPressureAccountingMixin:
+    if TYPE_CHECKING:
+        # Supplied by the composed Ray worker handle.
+        _fte_pressure: Any
+        _drain_fte_pending_tasks: Any
+
     def finish_fte_task_with_outputs(
         self,
         attempt_id: Any,
@@ -179,6 +184,9 @@ class FteWorkerPressureAccountingMixin:
         """Stop charging worker execution pressure while task output is adopted."""
 
         self._record_fte_task_pressure_complete(attempt_id, drain=True)
+
+    def record_fte_task_result_ready_without_drain(self, attempt_id: Any) -> None:
+        self._record_fte_task_pressure_complete(attempt_id, drain=False)
 
     def record_fte_task_terminal(self, attempt_id: Any, *, drain: bool = True) -> None:
         self._record_fte_task_pressure_complete(attempt_id, drain=drain)

@@ -8,7 +8,7 @@ import hashlib
 import math
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from duckdb.runners.fte import (
@@ -222,10 +222,11 @@ def _normalize_exchange_selector_selected(
     selected: dict[int, dict[str, Any]] = {}
     if not selected_payload:
         return selected
+    items: Iterable[tuple[Any, Any]]
     if isinstance(selected_payload, Mapping):
         items = selected_payload.items()
     elif isinstance(selected_payload, (list, tuple)):
-        normalized_items = []
+        normalized_items: list[tuple[Any, Any]] = []
         for entry in selected_payload:
             if not isinstance(entry, Mapping):
                 raise ValueError("exchange selector selected list entries must be mappings")
@@ -1573,11 +1574,33 @@ def _has_replacement_fte_worker(
     )
 
 
+# FTE lock hierarchy:
+# 1. Scheduler and registry locks protect queues/snapshots only and are released
+#    before fragment state is inspected.
+# 2. A thread may hold one fragment state lock at a time.
+# 3. Global fragment traversal and external admission callbacks run with no
+#    fragment state lock held.
+def _assert_no_fte_fragment_state_lock_held(
+    fragment_execution_items: list[tuple[tuple[str, str], FteFragmentExecution]],
+) -> None:
+    if not __debug__:
+        return
+    held_keys = [
+        key
+        for key, fragment_execution in fragment_execution_items
+        if fragment_execution._state_lock_owned_by_current_thread()
+    ]
+    assert not held_keys, (
+        f"FTE lock hierarchy violation: global fragment traversal while holding a fragment state lock: {held_keys}"
+    )
+
+
 def _ordered_fte_fragment_execution_items_for_pending_drain(
     fragment_execution_items: list[tuple[tuple[str, str], FteFragmentExecution]],
     *,
     execution_class: FteTaskExecutionClass | str | None = None,
 ) -> list[tuple[tuple[str, str], FteFragmentExecution]]:
+    _assert_no_fte_fragment_state_lock_held(fragment_execution_items)
     if not fragment_execution_items:
         return []
     if execution_class is not None:
@@ -1605,6 +1628,7 @@ def _ordered_fte_fragment_execution_items_for_pending_drain(
 def _has_fte_pending_standard_partitions(
     fragment_execution_items: list[tuple[tuple[str, str], FteFragmentExecution]],
 ) -> bool:
+    _assert_no_fte_fragment_state_lock_held(fragment_execution_items)
     return any(
         fragment_execution.has_pending_partitions(FteTaskExecutionClass.STANDARD)
         for _, fragment_execution in fragment_execution_items

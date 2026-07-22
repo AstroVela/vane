@@ -10,7 +10,7 @@ from duckdb.runners.fte import (
     FteWorkerControlFailure,
     FteWorkerReservationUnavailable,
 )
-from duckdb.runners.fte.fte_events import WorkerFailed
+from duckdb.runners.fte.fte_events import ResourceAdmissionChanged, WorkerFailed
 from duckdb.runners.fte.fte_scheduler import FteEventHandlers
 from duckdb.runners.ray.fragment_registry import (
     _FTE_CLOSING_QUERIES,
@@ -34,6 +34,23 @@ if TYPE_CHECKING:
 
 
 class FteWorkerEventHandlingMixin:
+    if TYPE_CHECKING:
+        # Supplied by the other mixins on the composed Ray worker handle.
+        _drain_fte_pending_tasks: Any
+        _execute_fte_fragment_execution_mutation_result: Any
+        _execute_fte_fragment_execution_outbox: Any
+        _handles_for_fte_scheduled_attempts: Any
+        _revoke_fte_speculative_tasks_for_memory_pressure_direct: Any
+        _submit_fte_pending_tasks: Any
+        _task_input_stream_exhausted_direct: Any
+        _try_reserve_fte_partition_for_node_wait: Any
+
+    @staticmethod
+    def _enqueue_fte_global_pending_drain(query_id: str) -> None:
+        scheduler = _FTE_SCHEDULERS.get(str(query_id))
+        if scheduler is not None:
+            scheduler.enqueue(ResourceAdmissionChanged(str(query_id), global_scope=True))
+
     def _handles_for_fte_worker_control_failure(
         self,
         failure: FteWorkerControlFailure,
@@ -86,9 +103,9 @@ class FteWorkerEventHandlingMixin:
             if str(event.query_id) in _FTE_CLOSING_QUERIES:
                 return []
         scheduled_by_stage = mark_fte_worker_failed_for_event(event)
-        if not scheduled_by_stage:
-            return []
-        return self._handles_for_marked_fte_worker_failed(scheduled_by_stage)
+        handles = self._handles_for_marked_fte_worker_failed(scheduled_by_stage) if scheduled_by_stage else []
+        self._enqueue_fte_global_pending_drain(event.query_id)
+        return handles
 
     def _handles_for_worker_reservation_completed_event(self, event: WorkerReservationCompleted) -> list[Any]:
         with _FTE_REGISTRY_LOCK:
@@ -133,12 +150,13 @@ class FteWorkerEventHandlingMixin:
     def _handles_for_task_status_changed_event(self, event: TaskStatusChanged) -> list[Any]:
         raw_state = event.status.get("state")
         state = raw_state if isinstance(raw_state, FteTaskState) else FteTaskState(str(raw_state))
-        if state in {
+        terminal = state in {
             FteTaskState.FINISHED,
             FteTaskState.FAILED,
             FteTaskState.CANCELED,
             FteTaskState.ABORTED,
-        }:
+        }
+        if terminal:
             with _FTE_REGISTRY_LOCK:
                 watcher = _FTE_STATUS_WATCHERS.get(str(event.attempt_id))
             if watcher is not None:
@@ -162,13 +180,18 @@ class FteWorkerEventHandlingMixin:
                 self._execute_fte_fragment_execution_outbox(fragment_execution)
         except FteWorkerControlFailure as exc:
             return self._handles_for_fte_worker_control_failure(exc)
-        if scheduled is None:
-            return []
-        return self._handles_for_fte_scheduled_attempts(
-            query_id,
-            fragment_id,
-            [scheduled],
+        handles = (
+            []
+            if scheduled is None
+            else self._handles_for_fte_scheduled_attempts(
+                query_id,
+                fragment_id,
+                [scheduled],
+            )
         )
+        if terminal:
+            self._enqueue_fte_global_pending_drain(query_id)
+        return handles
 
     def _handles_for_exchange_selector_updated_event(self, event: ExchangeSelectorUpdated) -> list[Any]:
         query_id = str(event.query_id)
@@ -221,7 +244,7 @@ class FteWorkerEventHandlingMixin:
                 fragment_state.exhausted_source_node_ids.add(source_node_id)
         return handles
 
-    def _bind_fte_scheduler_handlers(self, scheduler) -> None:
+    def _bind_fte_scheduler_handlers(self, scheduler: Any) -> None:
         scheduler.set_handlers(
             FteEventHandlers(
                 on_split_events=self._submit_fte_pending_tasks,
@@ -238,7 +261,7 @@ class FteWorkerEventHandlingMixin:
                     query_id_filter=event.query_id,
                 ),
                 on_resource_admission_changed=lambda event: self._drain_fte_pending_tasks(
-                    query_id_filter=event.query_id
+                    query_id_filter=None if event.global_scope else event.query_id
                 ),
                 on_worker_reservation_completed=self._handles_for_worker_reservation_completed_event,
                 on_retry_delay_expired=lambda event: self._drain_fte_pending_tasks(query_id_filter=event.query_id),

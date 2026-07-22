@@ -78,7 +78,10 @@ class MemoryPressureDetected(FteEvent):
 
 @dataclass(frozen=True)
 class ResourceAdmissionChanged(FteEvent):
-    """Wake pending FTE reservations after query resource ownership changes."""
+    """Wake pending FTE reservations after resource or worker capacity changes."""
+
+    # Worker capacity is shared across queries; query-resource changes are not.
+    global_scope: bool = False
 
 
 @dataclass(frozen=True)

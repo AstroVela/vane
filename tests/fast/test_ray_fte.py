@@ -1709,6 +1709,104 @@ def _handle_live_worker_statuses(stage, *, retryable=True):
     return scheduled
 
 
+def test_fte_two_query_fragment_callbacks_do_not_cross_state_locks():
+    callback_barrier = threading.Barrier(2)
+    callback_lock_ownership = {}
+    callback_errors = []
+
+    completion_stage = None
+    admission_stage = None
+
+    class _CompletionWorker(_FakeLiveWorker):
+        def record_fte_task_result_ready(self, _attempt_id):
+            callback_lock_ownership["completion"] = completion_stage._state_lock_owned_by_current_thread()
+            callback_barrier.wait(timeout=5.0)
+            admission_stage.has_pending_partitions()
+
+    completion_worker = _CompletionWorker("worker-completion")
+    completion_stage = _fte_fragment_execution(
+        "query-completion-lock-order",
+        1,
+        fragment_id="query-completion-lock-order:node:scan",
+        worker=completion_worker,
+    )
+    completion_attempt = completion_stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )[0]
+
+    admission_worker = _FakeLiveWorker("worker-admission")
+    admission_stage = _fte_fragment_execution(
+        "query-admission-lock-order",
+        2,
+        fragment_id="query-admission-lock-order:node:exchange",
+        worker=admission_worker,
+        attempt_admission_callback=lambda _partition: False,
+        source_node_ids={"3"},
+        dynamic_exchange_source_node_ids={"3"},
+    )
+    assert (
+        admission_stage.apply_assignment_result(
+            AssignmentResult(
+                partitions_added=[PartitionInfo(0)],
+                partition_updates=[
+                    PartitionUpdate(
+                        0,
+                        "3",
+                        [{"sequence_id": 0, "kind": "exchange_source_task", "data": b"p0"}],
+                        ready_for_scheduling=True,
+                    )
+                ],
+            )
+        )
+        == []
+    )
+
+    def admit_after_global_priority_check(_partition):
+        callback_lock_ownership["admission"] = admission_stage._state_lock_owned_by_current_thread()
+        callback_barrier.wait(timeout=5.0)
+        completion_stage.has_pending_partitions()
+        return False
+
+    admission_stage.attempt_admission_callback = admit_after_global_priority_check
+
+    def run(callback):
+        try:
+            callback()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            callback_errors.append(exc)
+
+    completion_thread = threading.Thread(
+        target=run,
+        args=(lambda: completion_stage.task_finished(completion_attempt.attempt_id),),
+        daemon=True,
+    )
+    admission_thread = threading.Thread(
+        target=run,
+        args=(admission_stage.schedule_next_pending_partition,),
+        daemon=True,
+    )
+    completion_thread.start()
+    admission_thread.start()
+    completion_thread.join(timeout=5.0)
+    admission_thread.join(timeout=5.0)
+
+    assert completion_thread.is_alive() is False
+    assert admission_thread.is_alive() is False
+    assert callback_errors == []
+    assert callback_lock_ownership == {"completion": False, "admission": False}
+
+
+def test_fte_global_pending_scan_rejects_held_fragment_state_lock():
+    stage = _fte_fragment_execution(
+        "query-lock-hierarchy",
+        1,
+        fragment_id="query-lock-hierarchy:node:scan",
+    )
+
+    with stage._state_lock, pytest.raises(AssertionError, match="fragment state lock"):
+        fte_fragment_scheduler._has_fte_pending_standard_partitions([((stage.query_id, stage.fragment_id), stage)])
+
+
 def test_fte_worker_command_executor_requires_split_queue_wait_protocol():
     attempt_id = FteTaskAttemptId(FteTaskId("q", 0, 1), 0)
     command = FteAddSplitsCommand(
