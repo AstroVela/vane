@@ -317,8 +317,10 @@ class VLLMPrompter:
         prompt call instead would permanently finish the executor id in
         Ray-remote mode and break every call after the first (#143).
 
-        Idempotent; also invoked from ``__del__`` when the owning UDF wrapper
-        or actor is torn down.
+        Idempotent. Called explicitly by the owning batch wrapper's
+        teardown (``_PromptBatch.close()``), with ``__del__`` as a
+        GC-timed fallback. A prompt call after ``close()`` rebuilds a
+        fresh executor (and, in local mode, a fresh engine) on demand.
         """
         executor, self._executor = self._executor, None
         if executor is not None:

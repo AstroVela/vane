@@ -542,6 +542,26 @@ class _PromptBatch:
         self._on_error: _OnError = on_error
         self._prompter = None  # lazy: instantiate on first __call__
 
+    def close(self) -> None:
+        """Tear down the cached prompter if it holds releasable resources.
+
+        Prompters with a ``close()`` (e.g. the vLLM prompter, which must
+        retire its executor id on the engine actors) are closed explicitly
+        here rather than relying only on their ``__del__``. Idempotent.
+        """
+        prompter, self._prompter = self._prompter, None
+        if prompter is not None:
+            close = getattr(prompter, "close", None)
+            if close is not None:
+                close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            # Interpreter or actor teardown — destructors must not raise.
+            pass
+
     def _serialize_result(self, result: Any) -> str | None:
         """Convert a prompt result to a string for the output column."""
         if result is None:

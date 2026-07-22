@@ -142,10 +142,10 @@ def test_del_swallows_shutdown_errors():
 
 
 def test_submit_after_close_surfaces_finished_error():
-    """Using a prompter after close() recreates no fake — executor is gone.
+    """close() must drop the executor reference so a fresh one is built next call.
 
-    Guards the invariant that close() drops the cached executor reference
-    rather than leaving a finished executor that would poison later calls.
+    Guards the invariant that close() clears the cache rather than leaving
+    a finished executor behind that would poison later calls.
     """
     prompter, executor = _prompter_with_fake()
     prompter.close()
@@ -160,3 +160,86 @@ def _one_row_table():
     import pyarrow as pa
 
     return pa.table({"_idx": [0]})
+
+
+# ---------------------------------------------------------------------------
+# _PromptBatch delegates teardown to the prompter (explicit close hook)
+# ---------------------------------------------------------------------------
+
+
+def _load_real_functions():
+    """Import the real ``vane.ai.functions``, even under the no-duckdb harness.
+
+    The stub harness registers a placeholder for ``vane.ai.functions``; evict
+    it and stub just the duckdb-importing dependencies so the real module
+    under test can load. On CI (where duckdb imports fine) nothing is stubbed.
+    """
+    import importlib
+    import sys
+    import types
+
+    module = sys.modules.get("vane.ai.functions")
+    if getattr(module, "__file__", None):
+        return module
+    if module is not None:
+        sys.modules.pop("vane.ai.functions")
+        stub_specs = (
+            ("vane._expressions", ("as_expression", "is_expression")),
+            ("vane._expression_udf", ("_build_actor_map_batches_expression",)),
+        )
+        for name, attrs in stub_specs:
+            if name not in sys.modules:
+                stub = types.ModuleType(name)
+                for attr in attrs:
+                    setattr(stub, attr, lambda *a, **k: None)
+                sys.modules[name] = stub
+    return importlib.import_module("vane.ai.functions")
+
+
+class CloseRecordingPrompter:
+    def __init__(self):
+        self.close_calls = 0
+
+    def close(self):
+        self.close_calls += 1
+
+
+def test_prompt_batch_close_closes_prompter_once():
+    functions = _load_real_functions()
+    wrapper = functions._PromptBatch(object(), "messages", "response", None)
+    prompter = CloseRecordingPrompter()
+    wrapper._prompter = prompter
+
+    wrapper.close()
+    assert prompter.close_calls == 1
+    assert wrapper._prompter is None
+
+    wrapper.close()  # idempotent
+    assert prompter.close_calls == 1
+
+
+def test_prompt_batch_close_tolerates_prompters_without_close():
+    functions = _load_real_functions()
+    wrapper = functions._PromptBatch(object(), "messages", "response", None)
+    wrapper._prompter = object()
+    wrapper.close()
+    assert wrapper._prompter is None
+
+
+def test_prompt_batch_close_before_first_use_is_noop():
+    functions = _load_real_functions()
+    wrapper = functions._PromptBatch(object(), "messages", "response", None)
+    wrapper.close()
+    assert wrapper._prompter is None
+
+
+def test_prompt_batch_del_swallows_close_errors():
+    functions = _load_real_functions()
+    wrapper = functions._PromptBatch(object(), "messages", "response", None)
+
+    class ExplodingPrompter:
+        def close(self):
+            raise RuntimeError("teardown boom")
+
+    wrapper._prompter = ExplodingPrompter()
+    wrapper.__del__()  # must not raise
