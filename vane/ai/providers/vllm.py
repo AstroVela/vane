@@ -41,7 +41,9 @@ Under the hood the model's JSON schema is injected into
 
 from __future__ import annotations
 
+import copy
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -70,20 +72,6 @@ def _json_schema_from_return_format(return_format: Any) -> dict[str, Any]:
     raise TypeError(
         f"return_format must be a Pydantic BaseModel class or a JSON schema dict, got {type(return_format).__name__}"
     )
-
-
-def _parse_structured_output(raw_text: str | None, return_format: Any) -> Any:
-    """Parse raw JSON text into a structured object.
-
-    If *return_format* is a Pydantic model class the parsed dict is validated
-    through ``model_validate``.  Otherwise returns a plain ``dict``.
-    """
-    if raw_text is None:
-        return None
-    data = json.loads(raw_text)
-    if hasattr(return_format, "model_validate"):
-        return return_format.model_validate(data)
-    return data
 
 
 class VLLMProvider(Provider):
@@ -118,15 +106,12 @@ class VLLMProvider(Provider):
 
 @dataclass
 class VLLMPrompterDescriptor(PrompterDescriptor):
-    """Serializable factory for a vLLM-backed prompter.
+    """Serializable configuration for native vLLM query planning.
 
-    Stores model name and vLLM configuration.  On ``instantiate()`` it
-    creates a ``LocalVLLMExecutor`` or ``RemoteVLLMExecutor`` via the
-    existing ``duckdb.execution.vllm.build_executor()`` factory.
-
-    When ``return_format`` is set (Pydantic model or JSON schema dict),
-    the JSON schema is injected as ``structured_outputs`` in the executor's
-    ``SamplingParams``.
+    High-level prompt APIs consume this descriptor while binding the native
+    ``vllm()`` expression. The resulting ``PhysicalVLLM`` operator owns one
+    executor for the relation and sends its terminal signal only after every
+    input batch has been submitted.
     """
 
     provider_name: str = "vllm"
@@ -146,6 +131,77 @@ class VLLMPrompterDescriptor(PrompterDescriptor):
 
     def get_options(self) -> Options:
         return dict(self.vllm_options)
+
+    def build_physical_vllm_options(self) -> dict[str, Any]:
+        """Build JSON-ready options for the native ``PhysicalVLLM`` operator.
+
+        The Python UDF path used ``actor_number`` to control the number of
+        outer UDF actors. The native operator owns one executor instead, so
+        that capacity becomes the executor's ``concurrency``. Structured
+        output configuration is copied into vLLM sampling parameters without
+        mutating the descriptor or caller-owned nested dictionaries.
+        """
+        options = copy.deepcopy(self.vllm_options)
+
+        actor_number = options.pop("actor_number", None)
+        if actor_number is not None:
+            options.setdefault("concurrency", actor_number)
+
+        max_retries = options.pop("max_retries", None)
+        if max_retries not in (None, 0):
+            raise ValueError("native vLLM prompting does not support max_retries")
+
+        # PhysicalVLLM invokes the executor through a synchronous C++ bridge.
+        # If that bridge runs inside a generic Ray actor, it still needs a
+        # dedicated event-loop thread rather than Ray's async actor loop.
+        options["use_threading"] = True
+        options["_force_background_thread"] = True
+
+        # The public AI API calls the null-producing policy ``ignore`` while
+        # the native vLLM executor calls the same policy ``null``.
+        if options.get("on_error") == "ignore":
+            options["on_error"] = "null"
+
+        sampling_overrides: dict[str, Any] = {}
+        for name in ("max_tokens", "temperature"):
+            value = options.pop(name, None)
+            if value is not None:
+                sampling_overrides[name] = value
+        if self.return_format is None and not sampling_overrides:
+            return options
+
+        generate_args = options.get("generate_args")
+        if generate_args is None:
+            generate_args = {}
+        elif isinstance(generate_args, Mapping):
+            generate_args = dict(generate_args)
+        else:
+            raise TypeError("vLLM generate_args must be a mapping when sampling parameters are configured")
+        options["generate_args"] = generate_args
+
+        sampling_params = generate_args.get("sampling_params")
+        if sampling_params is None:
+            sampling_params = {}
+        elif isinstance(sampling_params, str):
+            try:
+                sampling_params = json.loads(sampling_params)
+            except json.JSONDecodeError as exc:
+                raise ValueError("vLLM sampling_params JSON could not be parsed") from exc
+            if not isinstance(sampling_params, dict):
+                raise TypeError("vLLM sampling_params JSON must decode to an object")
+        elif isinstance(sampling_params, Mapping):
+            sampling_params = dict(sampling_params)
+        else:
+            raise TypeError("vLLM sampling_params must be a mapping or JSON string")
+        generate_args["sampling_params"] = sampling_params
+
+        for name, value in sampling_overrides.items():
+            sampling_params.setdefault(name, value)
+
+        if self.return_format is not None:
+            schema = copy.deepcopy(_json_schema_from_return_format(self.return_format))
+            sampling_params["structured_outputs"] = {"type": "json", "value": schema}
+        return options
 
     def get_udf_options(self) -> UDFOptions:
         opts = self.vllm_options
@@ -167,12 +223,18 @@ class VLLMPrompterDescriptor(PrompterDescriptor):
 
 
 class VLLMPrompter:
-    """Prompter that uses a vLLM ``LocalVLLMExecutor`` / ``RemoteVLLMExecutor``.
+    """Compatibility object that rejects non-native vLLM execution.
 
-    The executor is created lazily on the first call. Structured output
-    uses ``SamplingParams.structured_outputs`` and the raw JSON output is
-    parsed back into the requested schema/model.
+    A prompter call cannot see relation boundaries, so it cannot know when the
+    shared executor should receive ``finished_submitting()``. All supported
+    vLLM entry points are therefore lowered to ``PhysicalVLLM`` before this
+    object could be invoked.
     """
+
+    _NATIVE_ONLY_ERROR = (
+        "VLLMPrompter cannot execute prompts directly; use vane.ai.prompt(..., provider='vllm') "
+        "or SQL ai_prompt(..., provider := 'vllm') so the query planner can use PhysicalVLLM"
+    )
 
     def __init__(
         self,
@@ -181,117 +243,10 @@ class VLLMPrompter:
         return_format: Any | None = None,
         vllm_options: dict[str, Any] | None = None,
     ):
-        self._model = model
-        self._system_message = system_message
-        self._return_format = return_format
-        # Deep-unwrap restores plaintext sealed by the descriptor (including
-        # nested engine_args/generate_args) before the engine sees the options;
-        # plain dicts from direct callers pass through unchanged.
-        options = unwrap_sensitive_options(vllm_options or {})
-        self._options = {k: v for k, v in options.items() if k not in {"actor_number"}}
-        self._executor = None
-
-        # Pre-compute JSON schema if return_format is set, so the executor
-        # receives the current vLLM structured output config.
-        if self._return_format is not None:
-            schema = _json_schema_from_return_format(self._return_format)
-            gen_args = self._options.setdefault("generate_args", {})
-            sp = gen_args.setdefault("sampling_params", {})
-            if isinstance(sp, dict):
-                sp["structured_outputs"] = {"type": "json", "value": schema}
-
-    def _ensure_executor(self) -> Any:
-        if self._executor is None:
-            from duckdb.execution.vllm import build_executor
-
-            options = dict(self._options)
-            options["use_threading"] = True
-            options["_force_background_thread"] = True
-            self._executor = build_executor(self._model, options)
-        return self._executor
-
-    def _format_prompt(self, text: str) -> str:
-        if self._system_message:
-            return f"{self._system_message}\n\n{text}"
-        return text
-
-    def _maybe_parse(self, raw: str | None) -> Any:
-        """Parse structured output if return_format is set."""
-        if self._return_format is None or raw is None:
-            return raw
-        return _parse_structured_output(raw, self._return_format)
-
-    @staticmethod
-    async def _wait_for_result_async(executor: Any) -> None:
-        import asyncio
-        import inspect
-
-        wait_for_result = executor.wait_for_result
-        if inspect.iscoroutinefunction(wait_for_result):
-            await wait_for_result()
-            return
-        await asyncio.to_thread(wait_for_result)
-
-    @staticmethod
-    def _wait_for_result(executor: Any) -> None:
-        executor.wait_for_result()
+        pass
 
     async def prompt(self, messages: tuple[Any, ...]) -> Any:
-        """Single-row prompt — required by the Prompter protocol.
-
-        For vLLM this is less efficient than batch submission, but
-        allows the wrapper classes in ``functions.py`` to use the
-        standard ``asyncio.gather`` pattern.
-        """
-        text = str(messages[0]) if messages else ""
-        formatted = self._format_prompt(text)
-
-        executor = self._ensure_executor()
-
-        import pyarrow as pa
-
-        dummy_row = pa.table({"_": [""]})
-        executor.submit(None, [formatted], dummy_row)
-        executor.finished_submitting()
-
-        result = executor.take_ready_result()
-        if result is None:
-            await self._wait_for_result_async(executor)
-            result = executor.take_ready_result()
-        if result is None:
-            raise RuntimeError("vllm executor finished without returning a prompt result")
-        output_texts, _row = result
-        return self._maybe_parse(output_texts[0])
+        raise NotImplementedError(self._NATIVE_ONLY_ERROR)
 
     def prompt_batch(self, texts: list[str]) -> list[Any]:
-        """Batch prompt — more efficient for vLLM's continuous batching."""
-        import pyarrow as pa
-
-        executor = self._ensure_executor()
-        prompts = [self._format_prompt(t) for t in texts]
-        rows = pa.table({"_idx": list(range(len(texts)))})
-        executor.submit(None, prompts, rows)
-        executor.finished_submitting()
-
-        results: list[tuple[Any, int]] = []
-        while len(results) < len(texts):
-            result = executor.take_ready_result()
-            if result is None:
-                if executor.all_tasks_finished():
-                    break
-                self._wait_for_result(executor)
-                result = executor.take_ready_result()
-                if result is None:
-                    if executor.all_tasks_finished():
-                        break
-                    raise RuntimeError("vllm executor wait_for_result returned without a ready result")
-            output_texts, row_table = result
-            indices = row_table.column("_idx").to_pylist()
-            for text, idx in zip(output_texts, indices, strict=False):
-                results.append((self._maybe_parse(text), idx))
-
-        if len(results) != len(texts):
-            raise RuntimeError(f"vllm executor returned {len(results)} results for {len(texts)} prompts")
-
-        results.sort(key=lambda x: x[1])
-        return [r[0] for r in results]
+        raise NotImplementedError(self._NATIVE_ONLY_ERROR)

@@ -92,6 +92,43 @@ class _DelayedAsyncVLLMActor:
         return list(self._events)
 
 
+class _FailingSubmitBarrierActor:
+    """Expose whether abort overtakes another in-flight submit acknowledgement."""
+
+    def __init__(self):
+        self._aborted: set[str] = set()
+        self._events: list[tuple[str, str]] = []
+
+    async def submit_async(self, prompts, _rows, executor_id, _reservation_id):
+        if prompts == ["fail"]:
+            await asyncio.sleep(0.05)
+            self._events.append(("submit-failed", executor_id))
+            raise RuntimeError("submit acknowledgement failed")
+        await asyncio.sleep(0.2)
+        self._events.append(("submit-settled", executor_id))
+        return True
+
+    async def finished_executor(self, executor_id):
+        self._events.append(("finish", executor_id))
+        return True
+
+    async def wait_for_result(self, executor_id):
+        while executor_id not in self._aborted:
+            await asyncio.sleep(0.01)
+        return False
+
+    async def abort_executor(self, executor_id, _wait_expected):
+        self._aborted.add(executor_id)
+        self._events.append(("abort", executor_id))
+        return True
+
+    def release_executor(self, _executor_id):
+        return True
+
+    def events(self):
+        return list(self._events)
+
+
 class _ThreadPoolSaturatedWaitActor:
     """Exercise RayLocalVLLMExecutor waits on a real Ray actor event loop."""
 
@@ -178,6 +215,27 @@ def test_remote_executor_waits_for_real_ray_submit_ack_before_finish(ray_runtime
         events = ray_runtime.get(actor.events.remote())
         assert [event[0] for event in events] == ["submit", "finish"]
         assert events[0][1] == events[1][1]
+    finally:
+        executor.shutdown()
+
+
+def test_remote_executor_waits_for_all_real_ray_submit_acks_before_abort(ray_runtime):
+    actor = ray_runtime.remote(max_concurrency=32)(_FailingSubmitBarrierActor).remote()
+    router = ray_runtime.remote(PrefixRouter).remote([actor], 0)
+    owner = _RayActorOwner(ray_runtime, actor, router)
+    executor = RemoteVLLMExecutor(owner)
+
+    try:
+        executor.submit(None, ["fail"], pa.table({"id": [1]}))
+        executor.submit(None, ["settle"], pa.table({"id": [2]}))
+
+        with pytest.raises(RuntimeError, match="submit acknowledgement failed"):
+            executor.finished_submitting()
+
+        events = ray_runtime.get(actor.events.remote())
+        assert [event[0] for event in events] == ["submit-failed", "submit-settled", "abort"]
+        assert len({event[1] for event in events}) == 1
+        assert ray_runtime.get(router.release_executor.remote(executor._executor_id)) == 0
     finally:
         executor.shutdown()
 

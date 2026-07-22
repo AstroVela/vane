@@ -895,7 +895,7 @@ def _new_remote_vllm_error_executor(vllm, monkeypatch, *, release_count=0):
     return vllm.RemoteVLLMExecutor(Owner())
 
 
-def test_vllm_remote_wait_deadline_cancels_outstanding_refs(monkeypatch):
+def test_vllm_remote_wait_deadline_resolves_submits_before_cancelling_wait_refs(monkeypatch):
     import duckdb.execution.vllm as vllm
 
     cancelled = []
@@ -929,7 +929,10 @@ def test_vllm_remote_wait_deadline_cancels_outstanding_refs(monkeypatch):
         def notify_all(self):
             self.notified = True
 
-    submit_ref = object()
+    class SubmitRef:
+        value = None
+
+    submit_ref = SubmitRef()
     wait_ref = object()
     condition = FakeCondition()
     executor = _new_remote_vllm_error_executor(vllm, monkeypatch, release_count=1)
@@ -948,7 +951,7 @@ def test_vllm_remote_wait_deadline_cancels_outstanding_refs(monkeypatch):
         executor.wait_for_result()
 
     assert condition.timeout == pytest.approx(0.125)
-    assert cancelled == [submit_ref, wait_ref]
+    assert cancelled == [wait_ref]
     assert executor._inflight_per_actor == [0]
     assert executor._submit_refs == {}
     assert executor._wait_refs_by_actor == [None]

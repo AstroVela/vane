@@ -115,6 +115,33 @@ def test_vllm_execution_boolean_options_are_strict(name):
     assert normalize_options({name: False})[name] is False
 
 
+def test_native_descriptor_forces_background_loop_inside_ray_actor(monkeypatch):
+    import duckdb.execution.vllm as vllm_executor
+    from vane.ai.providers.vllm import VLLMPrompterDescriptor
+
+    fake_vllm = types.ModuleType("vllm")
+
+    class SamplingParams:
+        pass
+
+    fake_vllm.SamplingParams = SamplingParams
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setattr(vllm_executor.LocalVLLMExecutor, "_detect_ray_actor", staticmethod(lambda: True))
+
+    def fake_run_event_loop(executor):
+        executor.loop = object()
+        executor.loop_ready.set()
+
+    monkeypatch.setattr(vllm_executor.LocalVLLMExecutor, "_run_event_loop", fake_run_event_loop)
+
+    options = VLLMPrompterDescriptor(vllm_options={"use_threading": False}).build_physical_vllm_options()
+    executor = vllm_executor.build_executor("test-model", options)
+
+    assert executor._ray_actor_mode is False
+    assert executor.use_threading is True
+    assert executor.loop_ready.is_set()
+
+
 def test_ray_actor_releases_only_terminal_per_executor_state():
     from duckdb.execution.vllm import RayLocalVLLMExecutor
 
@@ -246,6 +273,79 @@ def test_ray_actor_abort_wait_uses_control_rpc_timeout(monkeypatch):
         asyncio.run(executor.abort_executor("executor", wait_expected=True))
 
     assert sleep_calls == [0.01]
+
+
+def test_ray_actor_abort_installs_tombstone_before_awaiting_engine_abort():
+    from duckdb.execution.vllm import RayLocalVLLMExecutor
+
+    abort_started = asyncio.Event()
+    allow_abort = asyncio.Event()
+
+    class Engine:
+        async def abort(self, _request_id):
+            abort_started.set()
+            await allow_abort.wait()
+
+        async def generate(self, *_args, **_kwargs):
+            yield types.SimpleNamespace(outputs=[types.SimpleNamespace(text="late")])
+
+    executor = RayLocalVLLMExecutor.__new__(RayLocalVLLMExecutor)
+    executor.llm = Engine()
+    executor.on_error = "raise"
+    executor.sampling_params = object()
+    executor.generate_args = {}
+    executor.counter = 0
+    executor.counter_lock = threading.Lock()
+    executor.completed_tasks = deque()
+    executor.error_message = None
+    executor._shutdown_called = False
+    executor._finished_submitting = False
+    executor.running_task_count = 0
+    executor.task_count_lock = threading.Lock()
+    executor._result_cv = threading.Condition(threading.RLock())
+    executor._ray_actor_mode = True
+    executor.engine_error_message = None
+    executor._per_executor_deques = {"executor": deque()}
+    executor._per_executor_running_task_count = {"executor": 0}
+    executor._per_executor_finished = set()
+    executor._per_executor_request_ids = {"executor": {"old-request"}}
+    executor._per_executor_tasks = {"executor": set()}
+    executor._per_executor_errors = {}
+    executor._per_executor_aborted = set()
+    executor._per_executor_waiters = {}
+    executor._per_executor_abort_wait_required = set()
+    executor._per_executor_terminal_wait_observed = set()
+
+    async def run_scenario():
+        abort_task = asyncio.create_task(executor.abort_executor("executor"))
+        await abort_started.wait()
+        tombstone_installed = "executor" in executor._per_executor_aborted
+        late_error = None
+        try:
+            await executor.submit_async(
+                ["late"],
+                pa.table({"id": [1]}),
+                "executor",
+                "late-reservation",
+            )
+        except RuntimeError as exc:
+            late_error = exc
+        finally:
+            allow_abort.set()
+            await abort_task
+            await asyncio.sleep(0)
+        return tombstone_installed, late_error
+
+    tombstone_installed, late_error = asyncio.run(run_scenario())
+
+    assert tombstone_installed is True
+    assert late_error is not None
+    assert "already finished" in str(late_error)
+    assert executor.running_task_count == 0
+    assert "executor" not in executor._per_executor_deques
+    assert "executor" not in executor._per_executor_running_task_count
+    assert "executor" not in executor._per_executor_request_ids
+    assert "executor" not in executor._per_executor_tasks
 
 
 def test_prefix_router_serializes_global_reservations_and_releases_exactly_once():
@@ -661,6 +761,113 @@ def test_remote_executor_acknowledges_submissions_before_finishing_actor(monkeyp
     executor.finished_submitting()
 
     assert events == ["submit-accepted", "executor-finished"]
+
+
+def test_remote_executor_consumes_all_submit_acks_before_aborting(monkeypatch):
+    import duckdb.execution.vllm as vllm
+
+    events = []
+
+    class FailingSubmitRef(_Ref):
+        def __init__(self, name, *, ready):
+            super().__init__(ready=ready)
+            self.name = name
+
+        def resolve(self):
+            events.append(self.name)
+            raise RuntimeError(f"{self.name} failed")
+
+    class SubmitMethod:
+        def __init__(self):
+            self.refs = deque(
+                [
+                    FailingSubmitRef("first-submit-ack", ready=True),
+                    FailingSubmitRef("second-submit-ack", ready=False),
+                ]
+            )
+
+        def remote(self, *_args, **_kwargs):
+            return self.refs.popleft()
+
+    class Actor(_FakeVLLMActor):
+        def __init__(self):
+            super().__init__()
+            self.submit_async = SubmitMethod()
+
+        def _abort(self, executor_id, wait_expected):
+            events.append("abort")
+            return super()._abort(executor_id, wait_expected)
+
+    actor = Actor()
+    router = vllm.PrefixRouter([actor], load_balance_threshold=0)
+
+    class Owner:
+        router_actor = _RemoteProxy(router)
+        llm_actors = [actor]
+
+        @staticmethod
+        def shutdown():
+            return None
+
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref.resolve())
+    executor = vllm.RemoteVLLMExecutor(Owner(), pool_name="pool")
+    executor.submit(None, ["first"], pa.table({"id": [1]}))
+    executor.submit(None, ["second"], pa.table({"id": [2]}))
+
+    with pytest.raises(RuntimeError, match="first-submit-ack failed"):
+        executor.take_ready_result()
+
+    assert events == ["first-submit-ack", "second-submit-ack", "abort"]
+    assert actor.aborted == [executor._executor_id]
+    assert "second-submit-ack failed" in executor._error_message
+    assert executor._submit_refs == {}
+    assert executor._reservations == {}
+    assert router.inflight == [0]
+
+
+def test_remote_executor_terminalizes_after_both_route_ack_attempts_fail(monkeypatch):
+    import duckdb.execution.vllm as vllm
+
+    class LostRouteAckRef(_Ref):
+        def resolve(self):
+            raise RuntimeError("route acknowledgement lost")
+
+    class LostRouteAckMethod:
+        def __init__(self, router):
+            self.router = router
+
+        def remote(self, *args):
+            decision = self.router.route_and_reserve_once(*args)
+            return LostRouteAckRef(decision)
+
+    actor = _FakeVLLMActor()
+    router = vllm.PrefixRouter([actor], load_balance_threshold=0)
+    router_proxy = _RemoteProxy(router)
+    router_proxy.route_and_reserve_once = LostRouteAckMethod(router)
+
+    class Owner:
+        router_actor = router_proxy
+        llm_actors = [actor]
+
+        @staticmethod
+        def shutdown():
+            return None
+
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref.resolve())
+    executor = vllm.RemoteVLLMExecutor(Owner(), pool_name="pool")
+
+    with pytest.raises(RuntimeError, match="route acknowledgement lost"):
+        executor.submit(None, ["prompt"], pa.table({"id": [1]}))
+
+    assert executor._finished is True
+    assert "route acknowledgement lost" in executor._error_message
+    assert actor.aborted == [executor._executor_id]
+    assert executor._executor_id not in router._active_executors
+    assert router.inflight == [0]
+    assert router._reservations == {}
+    assert executor._released_outstanding_inflight is True
+    with pytest.raises(RuntimeError, match="no longer accepts submissions"):
+        executor.submit(None, ["another"], pa.table({"id": [2]}))
 
 
 def test_remote_executor_reports_router_completion_when_actor_finish_ack_fails_once(monkeypatch):

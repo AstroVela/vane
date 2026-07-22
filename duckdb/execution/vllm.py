@@ -441,17 +441,21 @@ class LocalVLLMExecutor(VLLMExecutor):
         if len(prompts) != rows.num_rows:
             raise ValueError("Number of prompts and rows must match")
 
-        # Create per-executor deque on first submit from this executor.
-        if executor_id and executor_id not in self._per_executor_deques:
-            self._per_executor_deques[executor_id] = deque()
-            self._per_executor_request_ids[executor_id] = set()
-            self._per_executor_tasks[executor_id] = set()
-        if executor_id and (
-            executor_id in self._per_executor_finished
-            or executor_id in self._per_executor_aborted
-            or executor_id in self._per_executor_errors
-        ):
-            raise RuntimeError(f"vllm executor {executor_id} is already finished")
+        # Check terminal state before creating any per-executor containers so a
+        # submit that arrives after abort cannot recreate state behind the
+        # tombstone.
+        if executor_id:
+            with self.task_count_lock:
+                if (
+                    executor_id in self._per_executor_finished
+                    or executor_id in self._per_executor_aborted
+                    or executor_id in self._per_executor_errors
+                ):
+                    raise RuntimeError(f"vllm executor {executor_id} is already finished")
+                if executor_id not in self._per_executor_deques:
+                    self._per_executor_deques[executor_id] = deque()
+                    self._per_executor_request_ids[executor_id] = set()
+                    self._per_executor_tasks[executor_id] = set()
 
         if self._ray_actor_mode:
             # Engine is already ready from sync __init__; skip wait.
@@ -478,6 +482,14 @@ class LocalVLLMExecutor(VLLMExecutor):
             # Background-thread mode for non-Ray use.
             if not self.engine_ready.is_set():
                 await self._wait_for_engine_ready_async()
+            if executor_id:
+                with self.task_count_lock:
+                    if (
+                        executor_id in self._per_executor_finished
+                        or executor_id in self._per_executor_aborted
+                        or executor_id in self._per_executor_errors
+                    ):
+                        raise RuntimeError(f"vllm executor {executor_id} is already finished")
             if self.engine_error_message is not None:
                 if self.on_error == "raise":
                     raise RuntimeError(f"vllm engine init failed: {self.engine_error_message}")
@@ -616,8 +628,14 @@ class LocalVLLMExecutor(VLLMExecutor):
 
     async def abort_executor(self, executor_id: str, wait_expected: bool = False) -> None:
         """Abort requests and discard state owned by one remote executor."""
-        request_ids = set(self._per_executor_request_ids.get(executor_id, ()))
-        tasks = set(self._per_executor_tasks.get(executor_id, ()))
+        # Install the terminal tombstone before the first await. Ray async
+        # actors may start another method while this abort is suspended, and a
+        # late submit must be rejected instead of escaping the snapshots below.
+        with self.task_count_lock:
+            self._per_executor_aborted.add(executor_id)
+            self._per_executor_finished.discard(executor_id)
+            request_ids = set(self._per_executor_request_ids.get(executor_id, ()))
+            tasks = set(self._per_executor_tasks.get(executor_id, ()))
         abort = getattr(getattr(self, "llm", None), "abort", None) or getattr(
             getattr(self, "llm", None), "abort_request", None
         )
@@ -656,8 +674,6 @@ class LocalVLLMExecutor(VLLMExecutor):
             self._per_executor_request_ids.pop(executor_id, None)
             self._per_executor_tasks.pop(executor_id, None)
             self._per_executor_errors.pop(executor_id, None)
-            self._per_executor_aborted.add(executor_id)
-            self._per_executor_finished.discard(executor_id)
             if wait_expected:
                 self._per_executor_abort_wait_required.add(executor_id)
                 if self._per_executor_waiters.get(executor_id, 0) == 0:
@@ -1072,11 +1088,9 @@ class RemoteVLLMExecutor(VLLMExecutor):
         try:
             submit_ref.future().add_done_callback(lambda _future, _ref=submit_ref: self._queue_submit_ref_ready(_ref))
         except Exception as exc:
-            self._submit_refs.pop(submit_ref, None)
-            self._rollback_submitted_batch(actor_idx, count, reservation_id)
             self._record_error(TypeError(f"vllm submit ObjectRef does not support completion callbacks: {exc}"))
 
-    def _resolve_submit_ref(self, submit_ref: Any, *, control_rpc: bool = False) -> bool:
+    def _resolve_submit_ref(self, submit_ref: Any, *, control_rpc: bool = False) -> Exception | None:
         with self._result_cv:
             metadata = self._submit_refs.pop(submit_ref, None)
             try:
@@ -1084,7 +1098,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
             except ValueError:
                 pass
         if metadata is None:
-            return True
+            return None
         actor_idx, count, reservation_id = metadata
         resolve = _resolve_vllm_control_ref if control_rpc else resolve_object_refs_blocking
         try:
@@ -1094,9 +1108,17 @@ class RemoteVLLMExecutor(VLLMExecutor):
                 self._rollback_submitted_batch(actor_idx, count, reservation_id)
             except Exception as rollback_error:
                 exc = RuntimeError(f"{exc}; reservation rollback failed: {rollback_error}")
-            self._record_error(exc)
-            return False
-        return True
+            return exc
+        return None
+
+    @staticmethod
+    def _submit_acknowledgement_error(errors: list[Exception]) -> Exception:
+        if len(errors) == 1:
+            return errors[0]
+        return RuntimeError(
+            "vllm remote submit acknowledgements failed: "
+            + "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+        )
 
     def _drain_queued_submit_refs(self) -> None:
         while True:
@@ -1104,19 +1126,23 @@ class RemoteVLLMExecutor(VLLMExecutor):
                 if not self._ready_submit_refs:
                     return
                 submit_ref = self._ready_submit_refs.popleft()
-            if not self._resolve_submit_ref(submit_ref):
+            error = self._resolve_submit_ref(submit_ref)
+            if error is not None:
+                self._record_error(error)
                 return
 
-    def _await_pending_submit_refs(self) -> None:
+    def _await_pending_submit_refs(self) -> list[Exception]:
         """Establish actor-side submission order before sending completion."""
+        errors: list[Exception] = []
         while True:
             with self._result_cv:
                 pending = list(self._submit_refs)
             if not pending:
-                return
+                return errors
             for submit_ref in pending:
-                if not self._resolve_submit_ref(submit_ref, control_rpc=True):
-                    raise RuntimeError(f"vllm remote task failed: {self._error_message}")
+                error = self._resolve_submit_ref(submit_ref, control_rpc=True)
+                if error is not None:
+                    errors.append(error)
 
     def _rollback_submitted_batch(self, actor_idx: int, count: int, reservation_id: str) -> None:
         released = self._rollback_reservation(reservation_id, count)
@@ -1235,6 +1261,13 @@ class RemoteVLLMExecutor(VLLMExecutor):
         with self._lifecycle_lock:
             if self._finished and self._error_message is not None:
                 return
+            # A submit acknowledgement is the causal barrier before actor
+            # terminal RPCs. Consume every outstanding acknowledgement with
+            # its own control-RPC timeout, then perform one logical abort.
+            pending_submit_errors = self._await_pending_submit_refs()
+            if pending_submit_errors:
+                pending_error = self._submit_acknowledgement_error(pending_submit_errors)
+                exc = RuntimeError(f"{exc}; additionally, {pending_error}")
             cleanup_errors: list[Exception] = []
             try:
                 self._abort_actor_state()
@@ -1311,7 +1344,15 @@ class RemoteVLLMExecutor(VLLMExecutor):
                 try:
                     decision = resolve_object_refs_blocking(route_once.remote(*args))
                 except Exception:
-                    decision = resolve_object_refs_blocking(route_once.remote(*args))
+                    try:
+                        decision = resolve_object_refs_blocking(route_once.remote(*args))
+                    except Exception as exc:
+                        # The router may have committed the idempotent
+                        # reservation even though both acknowledgements were
+                        # lost. Terminalize this executor so control-RPC
+                        # reconciliation can release any phantom reservation.
+                        self._record_error(exc)
+                        raise
             else:
                 decision = self._router_call("route_and_reserve", prefix, count, self._executor_id)
             if not isinstance(decision, dict):
@@ -1357,7 +1398,11 @@ class RemoteVLLMExecutor(VLLMExecutor):
             # terminal call can therefore overtake an earlier submit. Resolving
             # every submit acknowledgement is the causal barrier that guarantees
             # each actor has registered all work before it sees finished_executor.
-            self._await_pending_submit_refs()
+            submit_errors = self._await_pending_submit_refs()
+            if submit_errors:
+                submit_error = self._submit_acknowledgement_error(submit_errors)
+                self._record_error(submit_error)
+                raise RuntimeError(f"vllm remote task failed: {self._error_message}")
             errors: list[Exception] = []
             for actor_idx, actor in enumerate(self.llm_actors):
                 if actor_idx in self._finished_actor_indices:
