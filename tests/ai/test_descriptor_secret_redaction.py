@@ -5,8 +5,8 @@
 
 Covers vane#105: descriptors must never expose API keys through repr, str,
 logging, exception rendering, or pickled copies, while ``instantiate()`` (and
-the OpenAI dimension probe / native option materialization) still hands the
-real plaintext to the SDK client or execution boundary.
+the OpenAI dimension probe / native vLLM executor) still hands the real
+plaintext to the SDK client or execution boundary.
 """
 
 from __future__ import annotations
@@ -362,10 +362,13 @@ class TestUnwrapAtExecutionBoundary:
         _google_prompter_descriptor().instantiate()
         assert client.calls == [{"api_key": API_KEY}]
 
-    def test_vllm_native_options_receive_plaintext_nested_args(self):
+    def test_vllm_native_plan_options_keep_nested_args_sealed(self):
         options = _vllm_prompter_descriptor().build_physical_vllm_options()
-        assert options["engine_args"] == {"hf_token": HUB_TOKEN, "max_model_len": 2048}
-        assert options["generate_args"]["api_key"] == API_KEY
+        assert isinstance(options["engine_args"]["hf_token"], Secret)
+        assert options["engine_args"]["hf_token"].reveal() == HUB_TOKEN
+        assert options["engine_args"]["max_model_len"] == 2048
+        assert isinstance(options["generate_args"]["api_key"], Secret)
+        assert options["generate_args"]["api_key"].reveal() == API_KEY
         assert options["generate_args"]["sampling_params"] == {"max_tokens": 64}
         assert options["use_threading"] is True
 
@@ -468,7 +471,8 @@ class TestPickleRoundTrip:
         restored.instantiate()
         assert client.calls == [{"api_key": API_KEY}]
 
-    def test_vllm_pickled_plan_still_builds_native_options_with_plaintext(self):
+    def test_vllm_pickled_plan_still_builds_native_options_with_sealed_secrets(self):
         restored = pickle.loads(pickle.dumps(_vllm_prompter_descriptor()))
         options = restored.build_physical_vllm_options()
-        assert options["engine_args"]["hf_token"] == HUB_TOKEN
+        assert isinstance(options["engine_args"]["hf_token"], Secret)
+        assert options["engine_args"]["hf_token"].reveal() == HUB_TOKEN

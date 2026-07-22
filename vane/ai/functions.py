@@ -61,7 +61,7 @@ from vane.ai.options import (
 )
 from vane.ai.protocols import NativePrompterPlan
 from vane.ai.provider import load_provider
-from vane.ai.providers.vllm import NativeVLLMPromptPlan, _serialize_native_vllm_options
+from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_options_argument
 from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
@@ -832,13 +832,13 @@ def _build_native_vllm_expression(messages: Any, descriptor: NativeVLLMPromptPla
         )
     prompt_expr = duckdb.FunctionExpression("concat", *prompt_arguments)
 
-    options_json = _serialize_native_vllm_options(descriptor.build_physical_vllm_options())
+    options_argument = _build_native_vllm_options_argument(descriptor.build_physical_vllm_options())
 
     return duckdb.FunctionExpression(
         "vllm",
         prompt_expr,
         duckdb.ConstantExpression(descriptor.model_name),
-        duckdb.ConstantExpression(options_json),
+        duckdb.ConstantExpression(options_argument),
     )
 
 

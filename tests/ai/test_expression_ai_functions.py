@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections import deque
 from dataclasses import dataclass
@@ -338,6 +339,22 @@ def test_vllm_native_options_reject_invalid_json_values_early(options, error, me
         descriptor.build_physical_vllm_options()
 
 
+@pytest.mark.parametrize(
+    "reserved_key",
+    [
+        "__vane_vllm_payload_version",
+        "__vane_vllm_public_options_json",
+        "__vane_vllm_secret_payload",
+        "_vane_vllm_secret_payload",
+    ],
+)
+def test_vllm_native_options_reject_reserved_protocol_fields(reserved_key):
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
+    with pytest.raises(ValueError, match="reserved protocol fields"):
+        _build_native_vllm_options_argument({reserved_key: "user-value"})
+
+
 def test_ai_prompt_vllm_rejects_udf_retry_policy():
     with pytest.raises(ValueError, match="native vLLM prompting does not support max_retries"):
         vane.ai.prompt(
@@ -365,6 +382,56 @@ def test_ai_prompt_vllm_expression_plans_native_operator():
     assert "native-model" in plan
     assert "subprocess_actor" not in plan
     assert "ray_actor" not in plan
+
+
+@pytest.mark.parametrize("api_shape", ["relation", "expression"])
+def test_ai_prompt_vllm_keeps_inline_secrets_out_of_public_plan_options(api_shape):
+    sentinel = "hf-NATIVE-PLAN-SECRET-SENTINEL"
+    sampling_sentinel = "sk-NATIVE-SAMPLING-SECRET-SENTINEL"
+    conn = vane.connect()
+    source = conn.sql("select 'search'::VARCHAR as chunk")
+    prompt_kwargs = {
+        "provider": "vllm",
+        "model": "native-model",
+        "provider_options": {
+            "engine_args": {
+                "hf_token": sentinel,
+                "max_model_len": 2048,
+            },
+            "generate_args": {"sampling_params": json.dumps({"api_key": sampling_sentinel, "max_tokens": 8})},
+        },
+    }
+    if api_shape == "relation":
+        relation = vane.ai.prompt(source, "chunk", **prompt_kwargs)
+    else:
+        expression = vane.ai.prompt(vane.col("chunk"), **prompt_kwargs).alias("response")
+        relation = source.select(expression)
+
+    assert sentinel not in relation.explain()
+    assert sampling_sentinel not in relation.explain()
+    physical = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation,
+        f"opaque-secret-{api_shape}",
+    ).to_physical_plan(conn)
+    nodes = physical.collect_vllm_nodes(conn=conn)
+
+    assert len(nodes) == 1
+    envelope = nodes[0]["options"]
+    assert isinstance(envelope, dict)
+    public_options_json = envelope["__vane_vllm_public_options_json"]
+    assert sentinel not in public_options_json
+    assert sampling_sentinel not in public_options_json
+    public_options = json.loads(public_options_json)
+    assert public_options["engine_args"] == {
+        "hf_token": {"__vane_vllm_secret_ref": 0},
+        "max_model_len": 2048,
+    }
+    assert public_options["generate_args"]["sampling_params"] == {
+        "api_key": {"__vane_vllm_secret_ref": 1},
+        "max_tokens": 8,
+    }
+    assert sentinel.encode() in envelope["__vane_vllm_secret_payload"]
+    assert sampling_sentinel.encode() in envelope["__vane_vllm_secret_payload"]
 
 
 def test_ai_prompt_vllm_relation_uses_one_native_lifecycle_and_returns_only_output(monkeypatch):
@@ -426,6 +493,56 @@ def test_ai_prompt_vllm_relation_uses_one_native_lifecycle_and_returns_only_outp
         "Answer briefly.\n\nquestion",
         "Answer briefly.\n\n",
     ]
+
+
+def test_ai_prompt_vllm_relation_restores_opaque_secrets_at_local_executor_creation(monkeypatch):
+    import duckdb.execution.vllm as vllm_executor
+
+    engine_token = "hf-LOCAL-EXECUTOR-SECRET-SENTINEL"
+    generate_key = "sk-LOCAL-EXECUTOR-SECRET-SENTINEL"
+    executor = _RecordingNativeVLLMExecutor()
+    captured = {}
+
+    def create_local_executor(model, engine_args, generate_args, **kwargs):
+        captured.update(
+            model=model,
+            engine_args=engine_args,
+            generate_args=generate_args,
+            kwargs=kwargs,
+        )
+        return executor
+
+    monkeypatch.setattr(vllm_executor, "LocalVLLMExecutor", create_local_executor)
+    conn = vane.connect()
+    source = conn.sql("select 'question'::VARCHAR as question")
+
+    result = vane.ai.prompt(
+        source,
+        "question",
+        provider="vllm",
+        model="native-secret-model",
+        provider_options={
+            "engine_args": {
+                "hf_token": engine_token,
+                "max_model_len": 1024,
+            }
+        },
+        prompt_options={
+            "generate_args": {
+                "api_key": generate_key,
+                "sampling_params": {"max_tokens": 8},
+            }
+        },
+    )
+
+    assert engine_token not in result.explain()
+    assert generate_key not in result.explain()
+    assert result.fetchall() == [("generated:question",)]
+    assert captured["model"] == "native-secret-model"
+    assert captured["engine_args"]["hf_token"] == engine_token
+    assert captured["engine_args"]["max_model_len"] == 1024
+    assert captured["generate_args"]["api_key"] == generate_key
+    assert captured["generate_args"]["sampling_params"] == {"max_tokens": 8}
 
 
 def test_ai_prompt_native_vllm_output_replaces_same_named_input(monkeypatch):

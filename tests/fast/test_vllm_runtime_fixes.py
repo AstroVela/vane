@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import sys
 import threading
 import time
@@ -15,6 +16,25 @@ from decimal import Decimal
 
 import pyarrow as pa
 import pytest
+
+
+def _packed_native_vllm_secret_options():
+    from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_options_argument
+
+    descriptor = NativeVLLMPromptPlan(
+        model_name="secret-model",
+        vllm_options={
+            "engine_args": {
+                "hf_token": "hf_OPAQUE-ENGINE-TOKEN",
+                "max_model_len": 2048,
+            },
+            "generate_args": {
+                "api_key": "sk-OPAQUE-GENERATE-KEY",
+                "sampling_params": {"max_tokens": 16},
+            },
+        },
+    )
+    return _build_native_vllm_options_argument(descriptor.build_physical_vllm_options())
 
 
 def test_vllm_control_rpc_timeout_is_configurable(monkeypatch):
@@ -113,6 +133,111 @@ def test_vllm_execution_boolean_options_are_strict(name):
         normalize_options({name: "false"})
 
     assert normalize_options({name: False})[name] is False
+
+
+def test_vllm_opaque_secrets_restore_only_when_local_executor_is_created(monkeypatch):
+    import duckdb.execution.vllm as vllm
+
+    packed = _packed_native_vllm_secret_options()
+    assert isinstance(packed, dict)
+    public_options = packed["__vane_vllm_public_options_json"]
+    assert "hf_OPAQUE-ENGINE-TOKEN" not in public_options
+    assert "sk-OPAQUE-GENERATE-KEY" not in public_options
+
+    captured = {}
+    executor = object()
+
+    def create_local_executor(model, engine_args, generate_args, **kwargs):
+        captured.update(
+            model=model,
+            engine_args=engine_args,
+            generate_args=generate_args,
+            kwargs=kwargs,
+        )
+        return executor
+
+    monkeypatch.setattr(vllm, "LocalVLLMExecutor", create_local_executor)
+
+    assert vllm.build_executor("secret-model", packed) is executor
+    assert captured["engine_args"]["hf_token"] == "hf_OPAQUE-ENGINE-TOKEN"
+    assert captured["engine_args"]["max_model_len"] == 2048
+    assert captured["generate_args"]["api_key"] == "sk-OPAQUE-GENERATE-KEY"
+    assert captured["generate_args"]["sampling_params"] == {"max_tokens": 16}
+
+
+def test_vllm_opaque_secrets_restore_on_driver_before_named_pool_creation(monkeypatch):
+    import duckdb.execution.vllm as vllm
+
+    packed = _packed_native_vllm_secret_options()
+    assert isinstance(packed, dict)
+    packed.update(
+        use_ray=True,
+        ray_worker_only=True,
+        ray_actor_pool_name="query-scoped-pool",
+    )
+
+    class Plan:
+        def collect_vllm_nodes(self, conn=None):
+            return [
+                {
+                    "model": "secret-model",
+                    "pool_name": "query-scoped-pool",
+                    "options": packed,
+                }
+            ]
+
+    fake_ray = types.ModuleType("ray")
+    fake_ray.is_initialized = lambda: True
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.delenv("VANE_WORKER", raising=False)
+
+    captured = {}
+    actors = object()
+
+    def get_or_create_named(_cls, **kwargs):
+        captured.update(kwargs)
+        return actors
+
+    monkeypatch.setattr(vllm.LLMActors, "get_or_create_named", classmethod(get_or_create_named))
+
+    created, leases = vllm.ensure_named_vllm_pools_for_plan(Plan())
+
+    assert created == [actors]
+    assert leases == {}
+    assert captured["engine_args"]["hf_token"] == "hf_OPAQUE-ENGINE-TOKEN"
+    assert captured["generate_args"]["api_key"] == "sk-OPAQUE-GENERATE-KEY"
+    assert captured["name_prefix"] == "query-scoped-pool"
+
+
+@pytest.mark.parametrize(
+    ("secret_payload", "message"),
+    [
+        (b"not-json", "strict JSON"),
+        (b'{"payload_version":1,"values":[]}', "invalid index"),
+        (b'{"payload_version":1,"values":["secret","unused"]}', "unreferenced"),
+        (
+            b'{"payload_version":1,"payload_version":1,"values":["secret"]}',
+            "strict JSON",
+        ),
+    ],
+)
+def test_vllm_opaque_secret_payload_is_strictly_validated(secret_payload, message):
+    import duckdb.execution.vllm as vllm
+
+    public_options = {
+        "engine_args": {
+            "hf_token": {"__vane_vllm_secret_ref": 0},
+        }
+    }
+    envelope = {
+        "__vane_vllm_payload_version": 1,
+        "__vane_vllm_public_options_json": json.dumps(public_options),
+        "__vane_vllm_secret_payload": secret_payload,
+    }
+
+    normalized = vllm.normalize_options(envelope)
+    with pytest.raises(ValueError, match=message):
+        vllm._restore_native_vllm_secrets(normalized)
 
 
 def test_native_descriptor_forces_background_loop_inside_ray_actor(monkeypatch):
