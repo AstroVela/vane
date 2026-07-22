@@ -6,7 +6,6 @@ from itertools import product
 # SPDX-License-Identifier: MIT AND Apache-2.0
 #
 # Modified by Vane contributors.
-
 import pytest
 
 import duckdb

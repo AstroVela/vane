@@ -182,7 +182,7 @@ def test_binary_relational_operations_fail_before_discarding_exchange(duckdb_cur
 
 @pytest.mark.parametrize("exchange_method", ["repartition", "local_exchange"])
 def test_python_replacement_scan_fails_before_discarding_exchange(duckdb_cursor, exchange_method):
-    relation_with_exchange = getattr(duckdb_cursor.sql("SELECT 1 AS i"), exchange_method)(2)
+    relation_with_exchange = getattr(duckdb_cursor.sql("SELECT 1 AS i"), exchange_method)(2)  # noqa: F841
 
     with pytest.raises(duckdb.NotImplementedException, match="would discard"):
         duckdb_cursor.sql("SELECT * FROM relation_with_exchange")
