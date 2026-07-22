@@ -617,20 +617,72 @@ def test_remote_executor_rejects_actor_result_without_reservation_id(monkeypatch
         executor.shutdown()
 
 
-def test_remote_success_is_not_rejected_when_terminal_actor_cleanup_keeps_failing(monkeypatch):
+def test_remote_success_shutdown_retries_terminal_cleanup_without_warning(monkeypatch):
     import duckdb.execution.vllm as vllm
 
     class Actor(_FakeVLLMActor):
         def __init__(self):
             super().__init__()
-            self.fail_release = True
             self.release_attempts = 0
 
         def _release(self, executor_id):
             self.release_attempts += 1
-            if self.fail_release:
-                raise RuntimeError("persistent release failure")
+            if self.release_attempts == 1:
+                raise RuntimeError("transient release failure")
             return super()._release(executor_id)
+
+    actor = Actor()
+    router = vllm.PrefixRouter([actor], load_balance_threshold=0)
+
+    class Owner:
+        router_actor = _RemoteProxy(router)
+        llm_actors = [actor]
+        shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref.resolve())
+    owner = Owner()
+    executor = vllm.RemoteVLLMExecutor(owner, pool_name="pool")
+    executor_id = executor._executor_id
+    rows = pa.table({"id": [1]})
+    executor.submit(None, ["prompt"], rows)
+    reservation_id = actor.submissions[0][3]
+    actor.publish(["output"], rows, reservation_id)
+
+    assert executor.take_ready_result() == (["output"], rows)
+    executor.finished_submitting()
+    with warnings.catch_warnings(record=True) as first_cleanup_warnings:
+        warnings.simplefilter("always")
+        assert executor.all_tasks_finished() is True
+    assert first_cleanup_warnings == []
+    assert executor._error_message is None
+    assert executor._finished is True
+    assert actor.release_attempts == 1
+
+    with warnings.catch_warnings(record=True) as final_cleanup_warnings:
+        warnings.simplefilter("always")
+        executor.shutdown()
+    assert final_cleanup_warnings == []
+    assert executor._shutdown_complete is True
+    assert executor._error_message is None
+    assert actor.release_attempts == 2
+    assert actor.released == [executor_id]
+    assert owner.shutdown_calls == 1
+
+
+def test_remote_success_warns_after_final_cleanup_attempt_fails(monkeypatch):
+    import duckdb.execution.vllm as vllm
+
+    class Actor(_FakeVLLMActor):
+        def __init__(self):
+            super().__init__()
+            self.release_attempts = 0
+
+        def _release(self, _executor_id):
+            self.release_attempts += 1
+            raise RuntimeError("persistent release failure")
 
     actor = Actor()
     router = vllm.PrefixRouter([actor], load_balance_threshold=0)
@@ -653,26 +705,53 @@ def test_remote_success_is_not_rejected_when_terminal_actor_cleanup_keeps_failin
 
     assert executor.take_ready_result() == (["output"], rows)
     executor.finished_submitting()
-    with pytest.warns(RuntimeWarning, match="persistent release failure"):
-        assert executor.all_tasks_finished() is True
-    assert executor._error_message is None
-    assert executor._finished is True
-    assert any("persistent release failure" in error for error in executor._terminal_cleanup_errors)
-
-    with warnings.catch_warnings(record=True) as repeated_cleanup_warnings:
+    with warnings.catch_warnings(record=True) as first_cleanup_warnings:
         warnings.simplefilter("always")
+        assert executor.all_tasks_finished() is True
+    assert first_cleanup_warnings == []
+    assert actor.release_attempts == 1
+
+    with pytest.warns(
+        RuntimeWarning,
+        match="final shutdown attempt; no background retry will be attempted",
+    ):
         executor.shutdown()
-    assert repeated_cleanup_warnings == []
+
     assert executor._shutdown_complete is False
     assert executor._error_message is None
     assert actor.release_attempts == 2
     assert owner.shutdown_calls == 1
 
-    actor.fail_release = False
+
+def test_remote_cleanup_does_not_retry_terminal_rpcs_after_owned_pool_is_killed(monkeypatch):
+    import duckdb.execution.vllm as vllm
+
+    class Actor(_FakeVLLMActor):
+        @staticmethod
+        def _release(_executor_id):
+            raise RuntimeError("actor release acknowledgement lost")
+
+    actor = Actor()
+    router = vllm.PrefixRouter([actor], load_balance_threshold=0)
+    router_proxy = _RemoteProxy(router)
+    owner = vllm.LLMActors.__new__(vllm.LLMActors)
+    owner.llm_actors = [actor]
+    owner.router_actor = router_proxy
+    owner.owned = True
+    owner._shutdown_complete = False
+    killed = []
+    fake_ray = types.ModuleType("ray")
+    fake_ray.kill = lambda handle, **_kwargs: killed.append(handle)
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref.resolve())
+    executor = vllm.RemoteVLLMExecutor(owner)
+    executor._finished = True
+    executor._finished_submitting_flag = True
+
     executor.shutdown()
+
     assert executor._shutdown_complete is True
-    assert actor.released == [executor._executor_id]
-    assert owner.shutdown_calls == 2
+    assert killed == [actor, router_proxy]
 
 
 def test_remote_executor_rearms_wait_for_already_buffered_actor_result(monkeypatch):
@@ -868,6 +947,86 @@ def test_remote_executor_terminalizes_after_both_route_ack_attempts_fail(monkeyp
     assert executor._released_outstanding_inflight is True
     with pytest.raises(RuntimeError, match="no longer accepts submissions"):
         executor.submit(None, ["another"], pa.table({"id": [2]}))
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"actor_idx": 99},
+        {"operation_id": "wrong-operation"},
+        {"prompt_count": 2},
+        {"reservation_id": 123},
+    ],
+)
+def test_remote_executor_terminalizes_and_reconciles_malformed_route_decision(monkeypatch, override):
+    import duckdb.execution.vllm as vllm
+
+    class MalformedRouteMethod:
+        def __init__(self, router):
+            self.router = router
+
+        def remote(self, *args):
+            decision = self.router.route_and_reserve_once(*args)
+            return _Ref({**decision, **override})
+
+    actor = _FakeVLLMActor()
+    router = vllm.PrefixRouter([actor], load_balance_threshold=0)
+    router_proxy = _RemoteProxy(router)
+    router_proxy.route_and_reserve_once = MalformedRouteMethod(router)
+
+    class Owner:
+        router_actor = router_proxy
+        llm_actors = [actor]
+
+        @staticmethod
+        def shutdown():
+            return None
+
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref.resolve())
+    executor = vllm.RemoteVLLMExecutor(Owner(), pool_name="pool")
+
+    with pytest.raises(RuntimeError, match="invalid reservation"):
+        executor.submit(None, ["prompt"], pa.table({"id": [1]}))
+
+    assert executor._finished is True
+    assert "invalid reservation" in executor._error_message
+    assert actor.aborted == [executor._executor_id]
+    assert executor._executor_id not in router._active_executors
+    assert router.inflight == [0]
+    assert router._reservations == {}
+    assert executor._released_outstanding_inflight is True
+
+
+def test_pending_submit_acknowledgements_each_use_full_control_timeout(monkeypatch):
+    import duckdb.execution.vllm as vllm
+
+    first_ref = object()
+    second_ref = object()
+    executor = vllm.RemoteVLLMExecutor.__new__(vllm.RemoteVLLMExecutor)
+    executor._result_cv = threading.Condition(threading.RLock())
+    executor._submit_refs = {
+        first_ref: (0, 1, "reservation-1"),
+        second_ref: (0, 1, "reservation-2"),
+    }
+    executor._ready_submit_refs = deque()
+    executor._rollback_submitted_batch = lambda *_args, **_kwargs: None
+
+    observed_timeouts = []
+
+    monkeypatch.setattr(vllm, "_vllm_control_rpc_timeout_s", lambda: 5.0)
+
+    def resolve(_ref, *, timeout, honor_query_deadline):
+        assert honor_query_deadline is False
+        observed_timeouts.append(timeout)
+        raise TimeoutError("submit acknowledgement timed out")
+
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", resolve)
+
+    errors = executor._await_pending_submit_refs()
+
+    assert len(errors) == 2
+    assert observed_timeouts == [pytest.approx(5.0), pytest.approx(5.0)]
+    assert executor._submit_refs == {}
 
 
 def test_remote_executor_reports_router_completion_when_actor_finish_ack_fails_once(monkeypatch):

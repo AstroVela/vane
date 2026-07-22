@@ -314,6 +314,30 @@ def test_vllm_descriptor_builds_native_options_without_mutating_inputs():
     assert explicit_concurrency["concurrency"] == 7
 
 
+@pytest.mark.parametrize(
+    ("options", "error", "message"),
+    [
+        (
+            {"engine_args": {"dtype": object()}},
+            TypeError,
+            r"engine_args\.dtype.*JSON-compatible.*object",
+        ),
+        (
+            {"generate_args": {"temperature": float("nan")}},
+            ValueError,
+            r"generate_args\.temperature.*finite",
+        ),
+    ],
+)
+def test_vllm_native_options_reject_invalid_json_values_early(options, error, message):
+    from vane.ai.providers.vllm import VLLMPrompterDescriptor
+
+    descriptor = VLLMPrompterDescriptor(model_name="native-model", vllm_options=options)
+
+    with pytest.raises(error, match=message):
+        descriptor.build_physical_vllm_options()
+
+
 def test_ai_prompt_vllm_rejects_udf_retry_policy():
     with pytest.raises(ValueError, match="native vLLM prompting does not support max_retries"):
         vane.ai.prompt(
@@ -343,7 +367,7 @@ def test_ai_prompt_vllm_expression_plans_native_operator():
     assert "ray_actor" not in plan
 
 
-def test_ai_prompt_vllm_relation_uses_one_native_lifecycle_and_preserves_columns(monkeypatch):
+def test_ai_prompt_vllm_relation_uses_one_native_lifecycle_and_returns_only_output(monkeypatch):
     import duckdb.execution.vllm as vllm_executor
     from vane.ai.providers.vllm import VLLMProvider
 
@@ -357,7 +381,9 @@ def test_ai_prompt_vllm_relation_uses_one_native_lifecycle_and_preserves_columns
 
     monkeypatch.setattr(vllm_executor, "build_executor", build_executor)
     conn = vane.connect()
-    rel = conn.sql("select * from (values (1, 'question'::VARCHAR), (2, NULL::VARCHAR)) source(id, question)")
+    rel = conn.sql(
+        "select * from (values (1, 'question'::VARCHAR), (2, NULL::VARCHAR)) source(id, question) order by id"
+    )
     schema = {
         "type": "object",
         "properties": {"answer": {"type": "string"}},
@@ -379,11 +405,11 @@ def test_ai_prompt_vllm_relation_uses_one_native_lifecycle_and_preserves_columns
         },
     )
 
-    assert result.columns == ["id", "question", "answer"]
+    assert result.columns == ["answer"]
     assert "VLLM_PROJECT" in result.explain()
-    assert result.order("id").fetchall() == [
-        (1, "question", "generated:Answer briefly.\n\nquestion"),
-        (2, None, "generated:Answer briefly.\n\n"),
+    assert result.fetchall() == [
+        ("generated:Answer briefly.\n\nquestion",),
+        ("generated:Answer briefly.\n\n",),
     ]
     assert captured["model"] == "native-model"
     options = captured["options"]
@@ -400,6 +426,46 @@ def test_ai_prompt_vllm_relation_uses_one_native_lifecycle_and_preserves_columns
         "Answer briefly.\n\nquestion",
         "Answer briefly.\n\n",
     ]
+
+
+def test_ai_prompt_native_vllm_output_replaces_same_named_input(monkeypatch):
+    import duckdb.execution.vllm as vllm_executor
+    from vane.ai.providers.vllm import VLLMProvider
+
+    monkeypatch.setattr(
+        vllm_executor,
+        "build_executor",
+        lambda _model, _options: _RecordingNativeVLLMExecutor(),
+    )
+    rel = vane.connect().sql("select 'question'::VARCHAR as question, 'stale'::VARCHAR as answer")
+
+    result = vane.ai.prompt(
+        rel,
+        "question",
+        provider=VLLMProvider(),
+        output_column="answer",
+    )
+
+    assert result.columns == ["answer"]
+    assert result.fetchall() == [("generated:question",)]
+
+
+@pytest.mark.parametrize("execution_backend", ["ray_actor", "subprocess_task", "definitely-invalid"])
+def test_ai_prompt_native_vllm_rejects_explicit_execution_backend(execution_backend):
+    from vane.ai.providers.vllm import VLLMProvider
+
+    rel = vane.connect().sql("select 'question'::VARCHAR as question")
+
+    with pytest.raises(
+        ValueError,
+        match="execution_backend applies only to Python UDF providers; native vLLM routing is derived from the query runner",
+    ):
+        vane.ai.prompt(
+            rel,
+            "question",
+            provider=VLLMProvider(),
+            execution_backend=execution_backend,
+        )
 
 
 def test_ai_prompt_native_vllm_rejects_image_columns():

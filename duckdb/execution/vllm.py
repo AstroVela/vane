@@ -867,9 +867,8 @@ class RemoteVLLMExecutor(VLLMExecutor):
         self._shutdown_called = False
         self._shutdown_complete = False
         self._error_message: str | None = None
-        # Successful queries remain successful when best-effort terminal cleanup
-        # fails. Shutdown retries unfinished cleanup and surfaces persistent errors.
-        self._terminal_cleanup_errors: list[str] = []
+        # Terminal cleanup is attempted at finish and retried once at shutdown.
+        # Persistent failure warns without changing a successful query result.
         self._terminal_cleanup_warning_emitted = False
         # Actor-indexed counters distinguish dispatched prompts, consumed
         # results, and the executor's local mirror of router reservations.
@@ -906,12 +905,19 @@ class RemoteVLLMExecutor(VLLMExecutor):
                     pass
             raise
 
-    def _router_call(self, method_name: str, *args: Any, control_rpc: bool = False) -> Any:
+    def _router_call(
+        self,
+        method_name: str,
+        *args: Any,
+        control_rpc: bool = False,
+    ) -> Any:
         method = getattr(self.router_actor, method_name, None)
         if method is None:
             raise TypeError(f"vllm PrefixRouter does not implement {method_name}")
-        resolve = _resolve_vllm_control_ref if control_rpc else resolve_object_refs_blocking
-        return resolve(method.remote(*args))
+        ref = method.remote(*args)
+        if control_rpc:
+            return _resolve_vllm_control_ref(ref)
+        return resolve_object_refs_blocking(ref)
 
     def _router_release(
         self,
@@ -924,7 +930,12 @@ class RemoteVLLMExecutor(VLLMExecutor):
     ) -> int:
         once_name = f"{method_name}_once"
         method = getattr(self.router_actor, once_name, None)
-        resolve = _resolve_vllm_control_ref if control_rpc else resolve_object_refs_blocking
+
+        def resolve(ref: Any) -> Any:
+            if control_rpc:
+                return _resolve_vllm_control_ref(ref)
+            return resolve_object_refs_blocking(ref)
+
         if method is not None:
             call_args = (*args, operation_id)
             try:
@@ -935,7 +946,11 @@ class RemoteVLLMExecutor(VLLMExecutor):
                 raise RuntimeError(f"vllm PrefixRouter.{once_name} returned an invalid operation result")
             result = result.get("released")
         else:
-            result = self._router_call(method_name, *args, control_rpc=control_rpc)
+            result = self._router_call(
+                method_name,
+                *args,
+                control_rpc=control_rpc,
+            )
         if isinstance(result, bool) or not isinstance(result, int):
             raise RuntimeError(f"vllm PrefixRouter.{method_name} must return an integer release count")
         if (allow_reconcile and result < 0) or (not allow_reconcile and result != expected):
@@ -1073,7 +1088,13 @@ class RemoteVLLMExecutor(VLLMExecutor):
             with self._inflight_lock:
                 self._inflight_per_actor[actor_idx] = max(0, self._inflight_per_actor[actor_idx] - released)
 
-    def _rollback_reservation(self, reservation_id: str, count: int) -> int:
+    def _rollback_reservation(
+        self,
+        reservation_id: str,
+        count: int,
+        *,
+        control_rpc: bool = False,
+    ) -> int:
         with self._reservation_rpc_lock:
             with self._reservation_lock:
                 reservation = self._reservations.get(reservation_id)
@@ -1088,6 +1109,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
                 reservation_id,
                 released,
                 operation_id=f"{self._executor_id}:rollback:{reservation_id}:{remaining_before}:{released}",
+                control_rpc=control_rpc,
             )
             with self._reservation_lock:
                 current = self._reservations.get(reservation_id)
@@ -1116,7 +1138,12 @@ class RemoteVLLMExecutor(VLLMExecutor):
         except Exception as exc:
             self._record_error(TypeError(f"vllm submit ObjectRef does not support completion callbacks: {exc}"))
 
-    def _resolve_submit_ref(self, submit_ref: Any, *, control_rpc: bool = False) -> Exception | None:
+    def _resolve_submit_ref(
+        self,
+        submit_ref: Any,
+        *,
+        control_rpc: bool = False,
+    ) -> Exception | None:
         with self._result_cv:
             metadata = self._submit_refs.pop(submit_ref, None)
             try:
@@ -1126,12 +1153,19 @@ class RemoteVLLMExecutor(VLLMExecutor):
         if metadata is None:
             return None
         actor_idx, count, reservation_id = metadata
-        resolve = _resolve_vllm_control_ref if control_rpc else resolve_object_refs_blocking
         try:
-            resolve(submit_ref)
+            if control_rpc:
+                _resolve_vllm_control_ref(submit_ref)
+            else:
+                resolve_object_refs_blocking(submit_ref)
         except Exception as exc:
             try:
-                self._rollback_submitted_batch(actor_idx, count, reservation_id)
+                self._rollback_submitted_batch(
+                    actor_idx,
+                    count,
+                    reservation_id,
+                    control_rpc=control_rpc,
+                )
             except Exception as rollback_error:
                 exc = RuntimeError(f"{exc}; reservation rollback failed: {rollback_error}")
             return exc
@@ -1166,12 +1200,26 @@ class RemoteVLLMExecutor(VLLMExecutor):
             if not pending:
                 return errors
             for submit_ref in pending:
-                error = self._resolve_submit_ref(submit_ref, control_rpc=True)
+                error = self._resolve_submit_ref(
+                    submit_ref,
+                    control_rpc=True,
+                )
                 if error is not None:
                     errors.append(error)
 
-    def _rollback_submitted_batch(self, actor_idx: int, count: int, reservation_id: str) -> None:
-        released = self._rollback_reservation(reservation_id, count)
+    def _rollback_submitted_batch(
+        self,
+        actor_idx: int,
+        count: int,
+        reservation_id: str,
+        *,
+        control_rpc: bool = False,
+    ) -> None:
+        released = self._rollback_reservation(
+            reservation_id,
+            count,
+            control_rpc=control_rpc,
+        )
         with self._result_cv:
             self._submit_per_actor[actor_idx] = max(0, self._submit_per_actor[actor_idx] - released)
         self._notify_state_change(force=True)
@@ -1248,7 +1296,12 @@ class RemoteVLLMExecutor(VLLMExecutor):
                 errors.append(RuntimeError(f"vllm actor {actor_idx} does not implement release_executor"))
                 continue
             try:
-                if _resolve_vllm_control_ref(method.remote(self._executor_id)) is not True:
+                if (
+                    _resolve_vllm_control_ref(
+                        method.remote(self._executor_id),
+                    )
+                    is not True
+                ):
                     raise RuntimeError("release_executor did not confirm release")
                 self._released_actor_indices.add(actor_idx)
             except Exception as exc:
@@ -1262,19 +1315,14 @@ class RemoteVLLMExecutor(VLLMExecutor):
         _resolve_vllm_control_ref(self.router_actor.report_completion.remote(self._executor_id))
         self._router_completion_reported = True
 
-    def _defer_terminal_cleanup(self, errors: list[str]) -> None:
-        if not errors:
-            return
-        for error in errors:
-            if error not in self._terminal_cleanup_errors:
-                self._terminal_cleanup_errors.append(error)
+    def _warn_incomplete_terminal_cleanup(self, errors: list[Exception]) -> None:
         if self._terminal_cleanup_warning_emitted:
             return
         self._terminal_cleanup_warning_emitted = True
         try:
             warnings.warn(
-                "vllm query completed successfully but terminal cleanup remains incomplete and will be retried: "
-                + "; ".join(errors),
+                "vllm query completed successfully but terminal cleanup remains incomplete after the final "
+                "shutdown attempt; no background retry will be attempted: " + "; ".join(str(error) for error in errors),
                 RuntimeWarning,
                 stacklevel=3,
             )
@@ -1323,16 +1371,17 @@ class RemoteVLLMExecutor(VLLMExecutor):
         with self._lifecycle_lock:
             if self._finished:
                 return
-            cleanup_errors: list[str] = []
+            # This is the first best-effort cleanup attempt. shutdown() makes
+            # the final attempt, so a transient failure here should not warn or
+            # turn an otherwise successful query into a failure.
             try:
                 self._release_outstanding_inflight()
-            except Exception as exc:
-                cleanup_errors.append(f"router reservation release: {exc}")
+            except Exception:
+                pass
             try:
                 self._release_actor_state()
-            except Exception as exc:
-                cleanup_errors.append(f"actor state release: {exc}")
-            self._defer_terminal_cleanup(cleanup_errors)
+            except Exception:
+                pass
             with self._result_cv:
                 self._finished = True
                 self._wait_refs_by_actor = [None] * len(self.llm_actors)
@@ -1364,29 +1413,43 @@ class RemoteVLLMExecutor(VLLMExecutor):
             if count == 0:
                 return
             operation_id = f"{self._executor_id}:route:{uuid.uuid4()}"
-            route_once = getattr(self.router_actor, "route_and_reserve_once", None)
-            if route_once is not None:
-                args = (prefix, count, self._executor_id, operation_id)
-                try:
-                    decision = resolve_object_refs_blocking(route_once.remote(*args))
-                except Exception:
+            try:
+                route_once = getattr(self.router_actor, "route_and_reserve_once", None)
+                if route_once is not None:
+                    args = (prefix, count, self._executor_id, operation_id)
                     try:
                         decision = resolve_object_refs_blocking(route_once.remote(*args))
-                    except Exception as exc:
-                        # The router may have committed the idempotent
-                        # reservation even though both acknowledgements were
-                        # lost. Terminalize this executor so control-RPC
-                        # reconciliation can release any phantom reservation.
-                        self._record_error(exc)
-                        raise
-            else:
-                decision = self._router_call("route_and_reserve", prefix, count, self._executor_id)
-            if not isinstance(decision, dict):
-                raise RuntimeError("vllm PrefixRouter.route_and_reserve must return a dict")
-            actor_idx = int(decision.get("actor_idx", -1))
-            reservation_id = str(decision.get("reservation_id") or "")
-            if actor_idx < 0 or actor_idx >= len(self.llm_actors) or not reservation_id:
-                raise RuntimeError("vllm PrefixRouter returned an invalid reservation")
+                    except Exception:
+                        decision = resolve_object_refs_blocking(route_once.remote(*args))
+                else:
+                    decision = self._router_call("route_and_reserve", prefix, count, self._executor_id)
+                if not isinstance(decision, dict):
+                    raise RuntimeError("vllm PrefixRouter.route_and_reserve must return a dict")
+                actor_idx_value = decision.get("actor_idx")
+                prompt_count_value = decision.get("prompt_count")
+                reservation_id_value = decision.get("reservation_id")
+                valid_operation = route_once is None or decision.get("operation_id") == operation_id
+                if (
+                    isinstance(actor_idx_value, bool)
+                    or not isinstance(actor_idx_value, Integral)
+                    or int(actor_idx_value) < 0
+                    or int(actor_idx_value) >= len(self.llm_actors)
+                    or isinstance(prompt_count_value, bool)
+                    or not isinstance(prompt_count_value, Integral)
+                    or int(prompt_count_value) != count
+                    or not isinstance(reservation_id_value, str)
+                    or not reservation_id_value
+                    or not valid_operation
+                ):
+                    raise RuntimeError("vllm PrefixRouter returned an invalid reservation")
+                actor_idx = int(actor_idx_value)
+                reservation_id = reservation_id_value
+            except Exception as exc:
+                # The router may have committed an idempotent reservation even
+                # when the acknowledgement is lost or malformed. Terminalize
+                # through reconciliation so no phantom reservation survives.
+                self._record_error(exc)
+                raise
             with self._reservation_lock:
                 self._reservations[reservation_id] = {"actor_idx": actor_idx, "remaining": count}
             with self._inflight_lock:
@@ -1544,13 +1607,30 @@ class RemoteVLLMExecutor(VLLMExecutor):
                 self._submit_refs.clear()
                 self._ready_wait_refs.clear()
                 self._ready_submit_refs.clear()
+            owner_terminated_pool = False
             try:
-                self._actors_owner.shutdown()
+                # Test doubles and older embedders may provide the same owner
+                # protocol without being an LLMActors instance.
+                actors_owner: Any = self._actors_owner
+                if isinstance(actors_owner, LLMActors):
+                    actors_owner.shutdown()
+                    owner_terminated_pool = (
+                        actors_owner._shutdown_complete
+                        and not actors_owner.llm_actors
+                        and actors_owner.router_actor is None
+                    )
+                else:
+                    actors_owner.shutdown()
             except Exception as exc:
                 errors.append(exc)
+            if owner_terminated_pool:
+                # Once the query-owned infrastructure is gone, earlier terminal
+                # RPC failures cannot leave actor/router state behind, so they
+                # no longer represent incomplete cleanup.
+                errors.clear()
             self._shutdown_complete = not errors
             if errors and completed_successfully:
-                self._defer_terminal_cleanup([f"shutdown cleanup: {error}" for error in errors])
+                self._warn_incomplete_terminal_cleanup(errors)
             self._notify_state_change(force=True)
             if errors and not completed_successfully:
                 raise RuntimeError("vllm remote shutdown incomplete: " + "; ".join(str(error) for error in errors))
@@ -1963,6 +2043,8 @@ class LLMActors:
         found = (1 if router_actor is not None else 0) + len(llm_actors)
         expected = 1 + concurrency
         if found == expected:
+            # TODO(next PR): validate immutable pool configuration and add
+            # explicit plan-owned leases before broadening named-pool reuse.
             return cls._from_handles(llm_actors, router_actor)
         if found:
             creation_error = RuntimeError(

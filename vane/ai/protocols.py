@@ -11,7 +11,7 @@ conforming to the protocol.
 
 from __future__ import annotations
 
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from vane.ai.typing import Descriptor
@@ -77,3 +77,27 @@ class Prompter(Protocol):
 
 class PrompterDescriptor(Descriptor["Prompter"]):
     """Serializable factory for a :class:`Prompter`."""
+
+
+class NativePrompterPlan(ABC):
+    """Serializable prompt metadata consumed directly by a native planner.
+
+    Unlike :class:`PrompterDescriptor`, a native plan does not instantiate a
+    worker-side Python object. Native-aware callers must recognize the plan
+    and lower it before entering the generic Python UDF execution path.
+    """
+
+    @abstractmethod
+    def get_provider(self) -> str:
+        """Return the provider that produced this plan."""
+        ...
+
+    @abstractmethod
+    def get_model(self) -> str:
+        """Return the native model identifier."""
+        ...
+
+    @abstractmethod
+    def get_options(self) -> dict[str, Any]:
+        """Return the provider-specific native planning options."""
+        ...
