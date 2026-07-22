@@ -77,6 +77,8 @@ def _raise_retry_after_on_google_error(exc: Exception) -> None:
 # ---------------------------------------------------------------------------
 
 _EMBEDDING_DIMS: dict[str, int] = {
+    "gemini-embedding-2": 3072,
+    "gemini-embedding-001": 3072,
     "text-embedding-004": 768,
     "embedding-001": 768,
 }
@@ -90,8 +92,8 @@ _EMBEDDING_DIMS: dict[str, int] = {
 class GoogleProvider(Provider):
     """Provider backed by Google Generative AI (Gemini)."""
 
-    DEFAULT_EMBED_MODEL = "text-embedding-004"
-    DEFAULT_PROMPT_MODEL = "gemini-2.0-flash"
+    DEFAULT_EMBED_MODEL = "gemini-embedding-2"
+    DEFAULT_PROMPT_MODEL = "gemini-3.6-flash"
     _CLIENT_KEYS: ClassVar[frozenset[str]] = frozenset({"api_key"})
 
     def __init__(self, name: str | None = None, **options: Any):
@@ -153,7 +155,7 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
 
     provider_name: str = "google"
     provider_options: dict[str, Any] = field(default_factory=dict)
-    model_name: str = "text-embedding-004"
+    model_name: str = "gemini-embedding-2"
     dimensions: int | None = None
     embed_options: dict[str, Any] = field(default_factory=dict)
 
@@ -267,7 +269,7 @@ class GooglePrompterDescriptor(PrompterDescriptor):
 
     provider_name: str = "google"
     provider_options: dict[str, Any] = field(default_factory=dict)
-    model_name: str = "gemini-2.0-flash"
+    model_name: str = "gemini-3.6-flash"
     system_message: str | None = None
     return_format: Any | None = None
     prompt_options: dict[str, Any] = field(default_factory=dict)

@@ -161,6 +161,40 @@ class TestOpenAIDescriptorPickle:
         assert decoded.tolist() == [1.5, -2.0, 0.25]
 
 
+class TestGoogleProviderDefaults:
+    """Google defaults must be current (non-shut-down) models (vane#141)."""
+
+    def test_default_embed_model_flows_through(self):
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test")
+        desc = provider.get_text_embedder()
+
+        # gemini-embedding-2 replaces text-embedding-004 (shut down 2026-01-14).
+        assert desc.get_model() == "gemini-embedding-2"
+        # Default output dimensionality documented at 3072.
+        assert desc.get_dimensions().size == 3072
+
+    def test_default_prompt_model_flows_through(self):
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test")
+        desc = provider.get_prompter()
+
+        # gemini-3.6-flash replaces gemini-2.0-flash (shut down 2026-06-01).
+        assert desc.get_model() == "gemini-3.6-flash"
+
+    def test_descriptor_dataclass_defaults_match_provider_defaults(self):
+        from vane.ai.providers.google import (
+            GooglePrompterDescriptor,
+            GoogleProvider,
+            GoogleTextEmbedderDescriptor,
+        )
+
+        assert GoogleTextEmbedderDescriptor().get_model() == GoogleProvider.DEFAULT_EMBED_MODEL
+        assert GooglePrompterDescriptor().get_model() == GoogleProvider.DEFAULT_PROMPT_MODEL
+
+
 # ---------------------------------------------------------------------------
 # Descriptor API contracts
 # ---------------------------------------------------------------------------
