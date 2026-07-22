@@ -420,7 +420,7 @@ std::shared_ptr<duckdb::ColumnDataCollection> RayBackedResultPartition::to_colum
 		} catch (const py::error_already_set &ex) {
 			// error_already_set owns Python state, so normalize it while the GIL
 			// is held before publishing a failure to native waiters.
-			throw duckdb::InternalException("Failed to materialize Ray result partition: %s", ex.what());
+			throw duckdb::InvalidInputException("Failed to materialize Ray result partition: %s", ex.what());
 		}
 	} catch (...) {
 		materialize_error = std::current_exception();

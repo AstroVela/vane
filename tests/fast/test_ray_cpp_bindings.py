@@ -74,6 +74,7 @@ def test_ray_backed_result_partition_materialization_is_single_flight(should_fai
         assert result["row_counts"] == [0] * 8
         assert result["same_collection"] is False
         assert all("materialization boom" in error for error in result["errors"])
+        assert {json.loads(error)["exception_type"] for error in result["errors"]} == {"Invalid Input"}
     else:
         assert result["row_counts"] == [3] * 8
         assert result["errors"] == [""] * 8
