@@ -43,6 +43,7 @@ build
 distribute/*
 *.testbin
 *.bin
+external/duckdb/tools/py_repro/repro_async_thread_fixed
 cmake_build
 .cmake_build
 cmake-build-debug
