@@ -44,7 +44,7 @@ def _guess_media_type(data: bytes) -> str:
 class AnthropicProvider(Provider):
     """Provider backed by the Anthropic Messages API."""
 
-    DEFAULT_MODEL = "claude-sonnet-4-20250514"
+    DEFAULT_MODEL = "claude-sonnet-5"
     _CLIENT_KEYS: ClassVar[frozenset[str]] = frozenset({"api_key", "base_url", "timeout", "max_retries"})
 
     def __init__(self, name: str | None = None, **options: Any):
@@ -89,7 +89,7 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
 
     provider_name: str = "anthropic"
     provider_options: dict[str, Any] = field(default_factory=dict)
-    model_name: str = "claude-sonnet-4-20250514"
+    model_name: str = "claude-sonnet-5"
     system_message: str | None = None
     return_format: Any | None = None
     prompt_options: dict[str, Any] = field(default_factory=dict)

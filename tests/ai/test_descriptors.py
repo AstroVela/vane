@@ -161,6 +161,29 @@ class TestOpenAIDescriptorPickle:
         assert decoded.tolist() == [1.5, -2.0, 0.25]
 
 
+class TestAnthropicProviderDefaults:
+    """The Anthropic default must be a current (non-retired) model (vane#167)."""
+
+    def test_default_prompt_model_flows_through(self):
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        provider = AnthropicProvider(api_key="test")
+        desc = provider.get_prompter()
+
+        # claude-sonnet-5 replaces claude-sonnet-4-20250514 (retired 2026-06-15).
+        # It is the current Sonnet generation with no announced retirement
+        # ("Not sooner than June 30, 2027" per Anthropic's deprecations page).
+        assert desc.get_model() == "claude-sonnet-5"
+
+    def test_descriptor_dataclass_default_matches_provider_default(self):
+        from vane.ai.providers.anthropic import (
+            AnthropicPrompterDescriptor,
+            AnthropicProvider,
+        )
+
+        assert AnthropicPrompterDescriptor().get_model() == AnthropicProvider.DEFAULT_MODEL
+
+
 # ---------------------------------------------------------------------------
 # Descriptor API contracts
 # ---------------------------------------------------------------------------
