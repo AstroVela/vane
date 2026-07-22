@@ -229,7 +229,6 @@ def _check_sdist(artifact: SdistArtifact) -> None:
         "LICENSES/vcpkg-binary-dependencies.txt",
         "external/duckdb/LICENSE",
         "build_backend.py",
-        "scripts/check_repository_binaries.py",
         "scripts/run_release_tests.sh",
         "scripts/sync_duckdb_source_id.py",
         "tests/ray_test_profile.py",

@@ -185,7 +185,6 @@ include = [
     "/scripts/bootstrap_manylinux_bison.sh",
     "/scripts/bootstrap_vcpkg.sh",
     "cmake/**",
-    "/scripts/check_repository_binaries.py",
     "/scripts/check_release_artifacts.py",
     "/scripts/run_release_tests.sh",
     "/scripts/sync_duckdb_source_id.py",
