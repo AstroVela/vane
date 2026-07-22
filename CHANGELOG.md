@@ -25,16 +25,19 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 
 - AI execution options now take effect on every surface instead of being
   silently dropped: explicit `batch_size` and the bare `concurrency` kwarg
-  reach the API prompter/embedder descriptors, API providers no longer require
-  `num_gpus` to use actor fan-out on the relation path, provider-level OpenAI
-  defaults (`batch_size`, `max_api_concurrency`, `on_error`) are routed to the
-  request options, the vLLM `on_error` vocabulary (`ignore`/`null`) is
-  translated at the engine boundary, and `return_format` smuggled inside
-  option dicts or `image_columns` on a text-only batch prompter now raise
-  clear errors. Chunked embedding honours `max_retries`/`on_error`,
-  `on_error="log"` emits a warning log, a failed batch call retries rows
-  individually so only genuinely-bad rows are substituted, and
-  `RetryAfterError` survives pickling across worker boundaries.
+  reach the API prompter/embedder descriptors (non-positive values are
+  rejected, matching SQL), API providers no longer require `num_gpus` for
+  actor fan-out on the relation path, and provider-level OpenAI defaults
+  (`batch_size`, `max_api_concurrency`, `on_error`) are routed to the
+  request options.
+- The vLLM `on_error` vocabulary (`ignore`/`null`) is translated at the
+  engine boundary, and `return_format` smuggled inside option dicts or
+  `image_columns` on a text-only batch prompter now raise clear errors.
+- Chunked embedding honours `max_retries`/`on_error`, and `on_error="log"`
+  now emits a warning log for substituted failures.
+- A failed batch call falls back to one attempt per row so only
+  genuinely-bad rows are substituted, and `RetryAfterError` survives
+  pickling across worker boundaries.
 
 ### Security
 

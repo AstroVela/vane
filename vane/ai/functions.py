@@ -126,16 +126,19 @@ class RetryAfterError(Exception):
 _BATCH_CALL_FAILED = object()
 
 
-def _log_substituted_failure(exc: Exception, max_retries: int) -> None:
+def _log_substituted_failure(exc: Exception, max_retries: int, on_error: str) -> None:
     """Log a substituted failure without echoing option mappings or payloads.
 
     Only the exception class and message are logged; provider exceptions carry
-    no plaintext secrets (vane#105).
+    no plaintext secrets (vane#105). The wording stays neutral because the
+    caller's next step differs: batch-level failures fall back to per-row
+    attempts, per-row failures substitute the default.
     """
     cause = exc.__cause__ if isinstance(exc, RetryAfterError) and exc.__cause__ else exc
     logger.warning(
-        "vane.ai call failed after %d attempt(s); substituting default: %s: %s",
+        "vane.ai call failed after %d attempt(s) (on_error=%r): %s: %s",
         1 + max(0, max_retries),
+        on_error,
         type(cause).__name__,
         cause,
     )
@@ -182,7 +185,7 @@ def _retry_call(
             raise last_exc.__cause__
         raise last_exc
     if on_error == "log":
-        _log_substituted_failure(last_exc, max_retries)
+        _log_substituted_failure(last_exc, max_retries, on_error)
     return default
 
 
@@ -214,7 +217,7 @@ async def _retry_call_async(
             raise last_exc.__cause__
         raise last_exc
     if on_error == "log":
-        _log_substituted_failure(last_exc, max_retries)
+        _log_substituted_failure(last_exc, max_retries, on_error)
     return default
 
 
@@ -490,8 +493,10 @@ class _EmbedTextBatch:
     def _embed_rows_individually(self, texts: list[str]) -> list[Any]:
         """Per-row fallback after a failed batch call (``on_error`` != "raise").
 
-        Each row gets its own retry pass; only rows that fail individually
-        receive the zero/None substitution.
+        Each row gets a single attempt — the batch call already exhausted the
+        retry budget — and only rows that fail individually receive the
+        zero/None substitution. A malformed response (wrong row count) is
+        treated as that row's failure.
         """
         embed = self._ensure_embedder().embed_text
         results: list[Any] = []
@@ -499,11 +504,11 @@ class _EmbedTextBatch:
             row = _retry_call(
                 embed,
                 [text],
-                max_retries=self._max_retries,
+                max_retries=0,
                 on_error=self._on_error,
                 default=_BATCH_CALL_FAILED,
             )
-            if row is _BATCH_CALL_FAILED or not row:
+            if row is _BATCH_CALL_FAILED or not isinstance(row, (list, tuple)) or len(row) != 1:
                 results.append(self._substitute_row())
             else:
                 results.append(row[0])
@@ -561,7 +566,12 @@ class _EmbedTextBatch:
         all_chunks: list[str],
         chunk_map: list[list[tuple[int, float]]],
     ) -> list[Any]:
-        """Per-row fallback for the chunked path (``on_error`` != "raise")."""
+        """Per-row fallback for the chunked path (``on_error`` != "raise").
+
+        Each row's chunk group gets a single attempt — the batch call already
+        exhausted the retry budget. A malformed response (wrong chunk count)
+        is treated as that row's failure.
+        """
         embed = self._ensure_embedder().embed_text
         results: list[Any] = []
         for entry in chunk_map:
@@ -569,11 +579,11 @@ class _EmbedTextBatch:
             embs = _retry_call(
                 embed,
                 chunks,
-                max_retries=self._max_retries,
+                max_retries=0,
                 on_error=self._on_error,
                 default=_BATCH_CALL_FAILED,
             )
-            if embs is _BATCH_CALL_FAILED or not embs:
+            if embs is _BATCH_CALL_FAILED or not isinstance(embs, (list, tuple)) or len(embs) != len(chunks):
                 results.append(self._substitute_row())
             elif len(entry) == 1:
                 results.append(embs[0])
@@ -674,19 +684,22 @@ class _PromptBatch:
     def _prompt_rows_individually(self, texts: list[str]) -> list[Any]:
         """Per-row fallback after a failed batch-API call (``on_error`` != "raise").
 
-        Each row gets its own retry pass through ``prompt_batch``; only rows
-        that fail individually are substituted with ``None``.
+        Each row gets a single attempt through ``prompt_batch`` — the batch
+        call already exhausted the retry budget — and only rows that fail
+        individually are substituted with ``None``. A malformed response
+        (wrong row count) is treated as that row's failure.
         """
         results: list[Any] = []
         for text in texts:
             row = _retry_call(
                 self._prompter.prompt_batch,
                 [text],
-                max_retries=self._max_retries,
+                max_retries=0,
                 on_error=self._on_error,
                 default=_BATCH_CALL_FAILED,
             )
-            results.append(None if (row is _BATCH_CALL_FAILED or not row) else row[0])
+            failed = row is _BATCH_CALL_FAILED or not isinstance(row, (list, tuple)) or len(row) != 1
+            results.append(None if failed else row[0])
         return results
 
     def __call__(self, table: pa.Table) -> pa.Table:

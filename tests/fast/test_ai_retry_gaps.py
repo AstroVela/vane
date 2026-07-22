@@ -231,7 +231,52 @@ class TestOnErrorLog:
 # ---------------------------------------------------------------------------
 
 
+class MalformedEmbedder:
+    """Fails multi-row batches; answers single-row calls with a short response."""
+
+    def embed_text(self, texts: list[str]) -> list[np.ndarray]:
+        if len(texts) > 1:
+            raise RuntimeError("provider rejected batch")
+        return []  # malformed: no embedding for the requested row
+
+
 class TestPerRowSubstitution:
+    def test_per_row_fallback_uses_single_attempts(self):
+        """Rows get one attempt each — the batch already exhausted the retry budget."""
+        embedder = FlakyEmbedder()
+        wrapper = _EmbedTextBatch(
+            FakeEmbedderDescriptor(embedder),
+            "text",
+            "embedding",
+            max_retries=2,
+            on_error="ignore",
+        )
+        table = pa.table({"text": ["good one", "BAD row"]})
+
+        values = wrapper(table).column("embedding").to_pylist()
+
+        assert values == [ONES, ZEROS]
+        # Batch pass: 1 + 2 retries = 3 calls; per-row fallback: 1 call per row.
+        batch_calls = [c for c in embedder.calls if len(c) == 2]
+        row_calls = [c for c in embedder.calls if len(c) == 1]
+        assert len(batch_calls) == 3
+        assert len(row_calls) == 2
+
+    def test_malformed_short_response_substitutes_that_row(self):
+        """A wrong-length per-row response counts as that row's failure, not success."""
+        wrapper = _EmbedTextBatch(
+            FakeEmbedderDescriptor(MalformedEmbedder()),
+            "text",
+            "embedding",
+            max_retries=0,
+            on_error="ignore",
+        )
+        table = pa.table({"text": ["row a", "row b"]})
+
+        values = wrapper(table).column("embedding").to_pylist()
+
+        assert values == [ZEROS, ZEROS]
+
     def test_embed_batch_failure_substitutes_only_bad_rows(self):
         embedder = FlakyEmbedder()
         wrapper = _EmbedTextBatch(

@@ -140,6 +140,13 @@ class TestBatchSizePlumbThrough:
 
 
 class TestConcurrencyKwarg:
+    def test_non_positive_concurrency_is_rejected(self):
+        """Python path validates like SQL (_int_or_none): positive integers only."""
+        with pytest.raises(ValueError, match="concurrency must be a positive integer"):
+            OpenAIPrompterDescriptor(prompt_options={"concurrency": 0}).get_udf_options()
+        with pytest.raises(ValueError, match="actor_number must be a positive integer"):
+            OpenAIPrompterDescriptor(prompt_options={"actor_number": -1}).get_udf_options()
+
     def test_api_descriptors_map_concurrency_to_actor_number(self):
         assert OpenAITextEmbedderDescriptor(embed_options={"concurrency": 2}).get_udf_options().actor_number == 2
         assert OpenAIPrompterDescriptor(prompt_options={"concurrency": 3}).get_udf_options().actor_number == 3
