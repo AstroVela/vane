@@ -712,6 +712,18 @@ def test_ai_sql_helper_rejects_vllm_udf_retry_policy():
         build_ai_prompt_sql_spec({"provider": "vllm", "max_retries": Decimal(1)})
 
 
+def test_ai_sql_helper_rejects_non_json_vllm_options_with_path():
+    from vane.ai._sql import build_ai_prompt_sql_spec
+
+    with pytest.raises(TypeError, match=r"engine_args\.dtype.*JSON-compatible.*object"):
+        build_ai_prompt_sql_spec(
+            {
+                "provider": "vllm",
+                "engine_args": {"dtype": object()},
+            }
+        )
+
+
 def test_ai_sql_helper_normalizes_decimal_sql_options(monkeypatch):
     from vane.ai._sql import build_ai_prompt_sql_spec
 

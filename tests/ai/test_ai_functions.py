@@ -328,17 +328,16 @@ class TestVLLMProvider:
         assert descriptor.system_message == "Be concise."
         assert descriptor.vllm_options["engine_args"] == {"max_model_len": 1024}
 
-    def test_direct_prompter_calls_require_native_query_planning(self):
-        import asyncio
+    def test_vllm_prompt_plan_is_not_an_executable_descriptor(self):
+        from vane.ai.protocols import NativePrompterPlan, PrompterDescriptor
+        from vane.ai.providers.vllm import NativeVLLMPromptPlan, VLLMPrompterDescriptor
 
-        from vane.ai.providers.vllm import VLLMPrompterDescriptor
+        plan = VLLMPrompterDescriptor(model_name="test-model")
 
-        prompter = VLLMPrompterDescriptor(model_name="test-model").instantiate()
-
-        with pytest.raises(NotImplementedError, match="PhysicalVLLM"):
-            prompter.prompt_batch(["hello"])
-        with pytest.raises(NotImplementedError, match="PhysicalVLLM"):
-            asyncio.run(prompter.prompt(("hello",)))
+        assert NativeVLLMPromptPlan is VLLMPrompterDescriptor
+        assert isinstance(plan, NativePrompterPlan)
+        assert not isinstance(plan, PrompterDescriptor)
+        assert not hasattr(plan, "instantiate")
 
 
 class TestVLLMStructuredOutput:

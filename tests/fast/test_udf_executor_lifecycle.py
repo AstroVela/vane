@@ -529,7 +529,12 @@ def test_vllm_remote_submit_failure_rolls_back_inflight(monkeypatch):
         report_start = FakeRemoteMethod("router-start")
         report_completion = FakeRemoteMethod("router-complete")
         route_and_reserve = FakeRemoteMethod(
-            {"actor_idx": 0, "reservation_id": "reservation-1", "route_reason": "no_prefix"}
+            {
+                "actor_idx": 0,
+                "prompt_count": 3,
+                "reservation_id": "reservation-1",
+                "route_reason": "no_prefix",
+            }
         )
         complete = FakeRemoteMethod(0)
         rollback = FakeRemoteMethod(3)
@@ -585,7 +590,12 @@ def test_vllm_remote_submit_async_ref_failure_becomes_executor_error(monkeypatch
         report_start = FakeRemoteMethod("router-start")
         report_completion = FakeRemoteMethod("router-complete")
         route_and_reserve = FakeRemoteMethod(
-            {"actor_idx": 0, "reservation_id": "reservation-1", "route_reason": "no_prefix"}
+            {
+                "actor_idx": 0,
+                "prompt_count": 2,
+                "reservation_id": "reservation-1",
+                "route_reason": "no_prefix",
+            }
         )
         complete = FakeRemoteMethod(0)
         rollback = FakeRemoteMethod(2)
@@ -799,7 +809,12 @@ def test_vllm_remote_wait_for_result_drains_ready_actor(monkeypatch):
         report_start = FakeRemoteMethod()
         report_completion = FakeRemoteMethod()
         route_and_reserve = FakeRemoteMethod(
-            {"actor_idx": 0, "reservation_id": "reservation-1", "route_reason": "no_prefix"}
+            {
+                "actor_idx": 0,
+                "prompt_count": 2,
+                "reservation_id": "reservation-1",
+                "route_reason": "no_prefix",
+            }
         )
         complete = FakeRemoteMethod(2)
         rollback = FakeRemoteMethod(0)

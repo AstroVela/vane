@@ -20,6 +20,7 @@ from vane.ai.functions import (
     _resolve_ai_batch_size,
     _resolve_provider,
 )
+from vane.ai.protocols import NativePrompterPlan
 
 
 def _drop_none(options: dict[str, Any]) -> dict[str, Any]:
@@ -162,19 +163,16 @@ def build_ai_prompt_sql_spec(options: dict[str, Any] | None = None) -> dict[str,
     # vLLM already has a native, relation-scoped physical operator. Keep its
     # executor alive across every input batch and let PhysicalVLLM send the
     # single terminal signal when the relation is exhausted.
-    from vane.ai.providers.vllm import VLLMPrompterDescriptor
+    from vane.ai.providers.vllm import NativeVLLMPromptPlan, _serialize_native_vllm_options
 
-    if isinstance(descriptor, VLLMPrompterDescriptor):
+    if isinstance(descriptor, NativeVLLMPromptPlan):
         if max_retries not in (None, 0):
             raise ValueError("native vLLM ai_prompt does not support max_retries")
 
         native_options = descriptor.build_physical_vllm_options()
         if batch_size is not None:
             native_options["batch_size"] = batch_size
-        try:
-            options_json = json.dumps(native_options, ensure_ascii=False, separators=(",", ":"))
-        except (TypeError, ValueError) as exc:
-            raise TypeError("vLLM native options must be JSON-serializable") from exc
+        options_json = _serialize_native_vllm_options(native_options)
 
         return {
             "execution_kind": "native_vllm",
@@ -185,6 +183,8 @@ def build_ai_prompt_sql_spec(options: dict[str, Any] | None = None) -> dict[str,
             "system_message": descriptor.system_message,
             "options_json": options_json,
         }
+    if isinstance(descriptor, NativePrompterPlan):
+        raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
 
     udf_opts = descriptor.get_udf_options()
     resolved_max_retries = udf_opts.max_retries if max_retries is None else max_retries

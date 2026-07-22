@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import threading
+import uuid
 from collections import deque
 
 import pytest
@@ -324,6 +325,27 @@ def test_native_finalizer_blocks_and_resumes_through_a_one_shot_callback(monkeyp
     assert executor.finished_count == 1
     assert not executor.pending
     assert not executor.invalid_wait
+
+
+def test_distributed_collection_preserves_an_explicit_named_pool():
+    import duckdb
+
+    con = duckdb.connect()
+    try:
+        pool_name = "explicit-shared-vllm-pool"
+        options = json.dumps({"use_ray": True, "ray_actor_pool_name": pool_name}, separators=(",", ":"))
+        relation = con.sql(
+            "SELECT vllm(prompt, 'model', '" + options + "') AS generated FROM (VALUES ('hello')) input(prompt)"
+        )
+        plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4())).to_physical_plan(con)
+
+        nodes = plan.collect_vllm_nodes(conn=con)
+
+        assert len(nodes) == 1
+        assert nodes[0]["pool_name"] == pool_name
+        assert json.loads(nodes[0]["options"])["ray_actor_pool_name"] == pool_name
+    finally:
+        con.close()
 
 
 @pytest.mark.parametrize(

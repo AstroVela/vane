@@ -4,9 +4,8 @@
 """vLLM provider — wraps the existing ``duckdb.execution.vllm`` engine.
 
 The vLLM executor already manages its own ``AsyncLLMEngine`` event loop,
-request queuing, prefix routing, and Ray actor pool.  This provider wraps
-that machinery into the Vane AI Provider/Descriptor pattern so users can
-write::
+request queuing, prefix routing, and Ray actor pool. This provider wraps that
+machinery in a planner-only Vane AI provider so users can write::
 
     from vane.ai import prompt
 
@@ -43,14 +42,15 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
-from vane.ai.protocols import PrompterDescriptor
+from vane.ai.options import VLLMJSONValue
+from vane.ai.protocols import NativePrompterPlan
 from vane.ai.provider import Provider
-from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
     from vane.ai.typing import Options
@@ -74,6 +74,37 @@ def _json_schema_from_return_format(return_format: Any) -> dict[str, Any]:
     )
 
 
+def _canonicalize_native_json(value: Any, path: str = "options") -> Any:
+    """Return a strict JSON-compatible copy or fail with an option path."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"vLLM native option {path} must be finite")
+        return value
+    if isinstance(value, Mapping):
+        canonical: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"vLLM native option {path} must use string keys; got {type(key).__name__}")
+            canonical[key] = _canonicalize_native_json(item, f"{path}.{key}")
+        return canonical
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_native_json(item, f"{path}[{index}]") for index, item in enumerate(value)]
+    raise TypeError(f"vLLM native option {path} must be JSON-compatible; got {type(value).__name__}")
+
+
+def _serialize_native_vllm_options(options: Mapping[str, Any]) -> str:
+    """Serialize native options after enforcing the public JSON boundary."""
+    canonical = _canonicalize_native_json(options)
+    return json.dumps(
+        canonical,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
 class VLLMProvider(Provider):
     """Provider backed by a local or remote vLLM engine."""
 
@@ -93,9 +124,9 @@ class VLLMProvider(Provider):
         system_message: str | None = None,
         return_format: Any | None = None,
         **options: Any,
-    ) -> PrompterDescriptor:
+    ) -> NativeVLLMPromptPlan:
         merged = {**self._options, **options}
-        return VLLMPrompterDescriptor(
+        return NativeVLLMPromptPlan(
             provider_name=self._name,
             model_name=model or merged.pop("model", self.DEFAULT_MODEL),
             system_message=system_message,
@@ -105,10 +136,10 @@ class VLLMProvider(Provider):
 
 
 @dataclass
-class VLLMPrompterDescriptor(PrompterDescriptor):
+class NativeVLLMPromptPlan(NativePrompterPlan):
     """Serializable configuration for native vLLM query planning.
 
-    High-level prompt APIs consume this descriptor while binding the native
+    High-level prompt APIs consume this plan while binding the native
     ``vllm()`` expression. The resulting ``PhysicalVLLM`` operator owns one
     executor for the relation and sends its terminal signal only after every
     input batch has been submitted.
@@ -132,7 +163,7 @@ class VLLMPrompterDescriptor(PrompterDescriptor):
     def get_options(self) -> Options:
         return dict(self.vllm_options)
 
-    def build_physical_vllm_options(self) -> dict[str, Any]:
+    def build_physical_vllm_options(self) -> dict[str, VLLMJSONValue]:
         """Build JSON-ready options for the native ``PhysicalVLLM`` operator.
 
         The Python UDF path used ``actor_number`` to control the number of
@@ -141,7 +172,8 @@ class VLLMPrompterDescriptor(PrompterDescriptor):
         output configuration is copied into vLLM sampling parameters without
         mutating the descriptor or caller-owned nested dictionaries.
         """
-        options = copy.deepcopy(self.vllm_options)
+        options = _canonicalize_native_json(unwrap_sensitive_options(self.vllm_options))
+        assert isinstance(options, dict)
 
         actor_number = options.pop("actor_number", None)
         if actor_number is not None:
@@ -201,52 +233,12 @@ class VLLMPrompterDescriptor(PrompterDescriptor):
         if self.return_format is not None:
             schema = copy.deepcopy(_json_schema_from_return_format(self.return_format))
             sampling_params["structured_outputs"] = {"type": "json", "value": schema}
-        return options
-
-    def get_udf_options(self) -> UDFOptions:
-        opts = self.vllm_options
-        return UDFOptions(
-            batch_size=opts.get("batch_size"),
-            num_gpus=opts.get("gpus_per_actor", 1),
-            actor_number=opts.get("actor_number"),
-            max_retries=0,  # vLLM engine handles retries
-            on_error=opts.get("on_error", "raise"),
-        )
-
-    def instantiate(self) -> VLLMPrompter:
-        return VLLMPrompter(
-            model=self.model_name,
-            system_message=self.system_message,
-            return_format=self.return_format,
-            vllm_options=self.vllm_options,
-        )
+        canonical = _canonicalize_native_json(options)
+        assert isinstance(canonical, dict)
+        return canonical
 
 
-class VLLMPrompter:
-    """Compatibility object that rejects non-native vLLM execution.
-
-    A prompter call cannot see relation boundaries, so it cannot know when the
-    shared executor should receive ``finished_submitting()``. All supported
-    vLLM entry points are therefore lowered to ``PhysicalVLLM`` before this
-    object could be invoked.
-    """
-
-    _NATIVE_ONLY_ERROR = (
-        "VLLMPrompter cannot execute prompts directly; use vane.ai.prompt(..., provider='vllm') "
-        "or SQL ai_prompt(..., provider := 'vllm') so the query planner can use PhysicalVLLM"
-    )
-
-    def __init__(
-        self,
-        model: str,
-        system_message: str | None = None,
-        return_format: Any | None = None,
-        vllm_options: dict[str, Any] | None = None,
-    ):
-        pass
-
-    async def prompt(self, messages: tuple[Any, ...]) -> Any:
-        raise NotImplementedError(self._NATIVE_ONLY_ERROR)
-
-    def prompt_batch(self, texts: list[str]) -> list[Any]:
-        raise NotImplementedError(self._NATIVE_ONLY_ERROR)
+# Compatibility import for callers that used the original name. The object is
+# now explicitly planner-only and no longer inherits PrompterDescriptor or
+# exposes an instantiate() method.
+VLLMPrompterDescriptor = NativeVLLMPromptPlan
