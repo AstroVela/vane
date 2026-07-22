@@ -1322,3 +1322,73 @@ TEST_CASE("Test LocalExchange preserved after Limit", "[relation_api][local_exch
 	// The EXPLAIN output should contain LOCAL_EXCHANGE
 	REQUIRE(explain_str.find("LOCAL_EXCHANGE") != string::npos);
 }
+
+TEST_CASE("Empty order is an identity and inherits child serializability", "[relation_api][local_exchange]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	REQUIRE_NO_FAIL(con.Query("PRAGMA enable_verification"));
+	auto values = con.Values("(42)");
+	duckdb::vector<OrderByNode> serializable_orders;
+	auto serializable_order = values->Order(std::move(serializable_orders));
+	REQUIRE(serializable_order->CanSerializeToQueryNode());
+	REQUIRE(serializable_order->CanBindAsInput());
+	REQUIRE_NOTHROW(result = serializable_order->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+
+	auto exchange = con.Values("(42)")->LocalExchange(2);
+	duckdb::vector<OrderByNode> exchange_orders;
+	auto ordered = exchange->Order(std::move(exchange_orders));
+
+	REQUIRE_FALSE(ordered->CanSerializeToQueryNode());
+	REQUIRE(ordered->CanBindAsInput());
+	REQUIRE_NOTHROW(result = ordered->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+	REQUIRE_NOTHROW(result = ordered->Limit(1)->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+}
+
+TEST_CASE("Struct fields preserve relation serialization boundaries", "[relation_api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE nested_left AS SELECT "
+	                          "{'a': {'b': {'c': {'d': 7}}}} AS payload, 1 AS id"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE nested_right AS SELECT 1 AS id"));
+	auto left = con.Table("nested_left")->Alias("l");
+	auto right = con.Table("nested_right")->Alias("r");
+	auto boundary = left->Join(right, "l.id = r.id")->Distinct();
+
+	auto serialized = boundary->Project("payload.a.b.c.d AS value");
+	REQUIRE(serialized->CanSerializeToQueryNode());
+	REQUIRE_NOTHROW(result = serialized->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {7}));
+
+	auto direct_bound = boundary->Project("l.payload.a.b.c.d AS value");
+	REQUIRE_FALSE(direct_bound->CanSerializeToQueryNode());
+	REQUIRE(direct_bound->CanBindAsInput());
+	REQUIRE_NOTHROW(result = direct_bound->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {7}));
+}
+
+TEST_CASE("Virtual columns survive single-source relation boundaries", "[relation_api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE virtual_source(value INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO virtual_source VALUES (10), (20)"));
+	auto boundary = con.Table("virtual_source")->Distinct();
+
+	auto serialized = boundary->Project("virtual_source.value");
+	REQUIRE(serialized->CanSerializeToQueryNode());
+	REQUIRE_NOTHROW(result = serialized->Execute());
+
+	auto direct_bound = boundary->Project("virtual_source.rowid AS row_id")->Order("row_id");
+	REQUIRE_FALSE(direct_bound->CanSerializeToQueryNode());
+	REQUIRE(direct_bound->CanBindAsInput());
+	REQUIRE_NOTHROW(result = direct_bound->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {0, 1}));
+}

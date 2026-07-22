@@ -25,6 +25,7 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 
 namespace duckdb {
@@ -77,6 +78,26 @@ void TableFunctionRelation::InitializeColumns() {
 	TryBindRelation(columns);
 }
 
+void TableFunctionRelation::CaptureVirtualColumnNames(const LogicalOperator &plan) {
+	if (plan.type == LogicalGet::TYPE) {
+		auto &get = plan.Cast<LogicalGet>();
+		auto function_name = QualifiedName::Parse(name).name;
+		if (StringUtil::CIEquals(get.function.name, function_name)) {
+			for (auto &entry : get.virtual_columns) {
+				auto &column_name = entry.second.name;
+				if (!column_name.empty() &&
+				    std::none_of(virtual_column_names.begin(), virtual_column_names.end(),
+				                 [&](const string &existing) { return StringUtil::CIEquals(existing, column_name); })) {
+					virtual_column_names.push_back(column_name);
+				}
+			}
+		}
+	}
+	for (auto &child : plan.children) {
+		CaptureVirtualColumnNames(*child);
+	}
+}
+
 unique_ptr<QueryNode> TableFunctionRelation::GetQueryNode() {
 	auto result = make_uniq<SelectNode>();
 	result->select_list.push_back(make_uniq<StarExpression>());
@@ -116,7 +137,9 @@ unique_ptr<TableRef> TableFunctionRelation::GetTableRef() {
 
 BoundStatement TableFunctionRelation::Bind(Binder &binder) {
 	if (!input_relation) {
-		return Relation::Bind(binder);
+		auto result = Relation::Bind(binder);
+		CaptureVirtualColumnNames(*result.plan);
+		return result;
 	}
 
 	auto qualified_name = QualifiedName::Parse(name);
@@ -131,7 +154,9 @@ BoundStatement TableFunctionRelation::Bind(Binder &binder) {
 	    *binder.GetCatalogEntry(catalog, schema, table_function_lookup, OnEntryNotFound::THROW_EXCEPTION);
 	if (func_catalog.type == CatalogType::TABLE_MACRO_ENTRY) {
 		// Fall back to SQL binding for macros.
-		return Relation::Bind(binder);
+		auto result = Relation::Bind(binder);
+		CaptureVirtualColumnNames(*result.plan);
+		return result;
 	}
 	D_ASSERT(func_catalog.type == CatalogType::TABLE_FUNCTION_ENTRY);
 	auto &function_entry = func_catalog.Cast<TableFunctionCatalogEntry>();
@@ -177,8 +202,20 @@ BoundStatement TableFunctionRelation::Bind(Binder &binder) {
 
 	TableFunctionRef ref;
 	ref.alias = name;
-	return binder.BindTableFunctionWithInput(table_function, ref, std::move(bound_parameters),
-	                                         std::move(bound_named_parameters), child_bound);
+	auto result = binder.BindTableFunctionWithInput(table_function, ref, std::move(bound_parameters),
+	                                                std::move(bound_named_parameters), child_bound);
+	CaptureVirtualColumnNames(*result.plan);
+	return result;
+}
+
+BoundStatement TableFunctionRelation::BindAsInput(Binder &binder) {
+	if (input_relation) {
+		return Bind(binder);
+	}
+	auto table_ref = GetTableRef();
+	auto result = binder.Bind(*table_ref);
+	CaptureVirtualColumnNames(*result.plan);
+	return result;
 }
 
 string TableFunctionRelation::GetAlias() {

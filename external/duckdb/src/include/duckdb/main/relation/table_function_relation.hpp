@@ -48,6 +48,9 @@ public:
 	void AddNamedParameter(const string &name, Value argument);
 	void RemoveNamedParameterIfExists(const string &name);
 	void SetNamedParameters(named_parameter_map_t &&named_parameters);
+	const vector<string> &GetVirtualColumnNames() const {
+		return virtual_column_names;
+	}
 	bool ContainsNonSQLRelation() override {
 		return input_relation && input_relation->ContainsNonSQLRelation();
 	}
@@ -60,8 +63,11 @@ public:
 
 private:
 	void InitializeColumns();
+	void CaptureVirtualColumnNames(const LogicalOperator &plan);
+	BoundStatement BindAsInput(Binder &binder) override;
 
 private:
+	vector<string> virtual_column_names;
 	//! Whether or not to auto initialize the columns on construction
 	bool auto_initialize;
 };

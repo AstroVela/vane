@@ -295,7 +295,7 @@ bool Relation::RequiresDirectRelationBinding(Relation &child) {
 	if (!child.CanSerializeToQueryNode()) {
 		return child.CanBindAsInput();
 	}
-	return ExposesMultiSourceBindings(child);
+	return child.InheritsColumnBindings() || ExposesMultiSourceBindings(child);
 }
 
 bool Relation::ExposesMultiSourceBindings(Relation &child) {
@@ -322,7 +322,16 @@ namespace {
 
 class SerializedExpressionScopeChecker {
 public:
-	explicit SerializedExpressionScopeChecker(string child_alias_p) : child_alias(std::move(child_alias_p)) {
+	explicit SerializedExpressionScopeChecker(Relation &child) : child_alias(child.GetAlias()) {
+		for (auto &column : child.Columns()) {
+			serialized_columns.push_back(column.Name());
+		}
+		auto source = &child;
+		while (source->InheritsColumnBindings()) {
+			source = source->ChildRelation();
+			D_ASSERT(source);
+		}
+		CollectRelationBindings(*source, hidden_bindings);
 	}
 
 	bool Check(const ParsedExpression &expression) {
@@ -331,18 +340,176 @@ public:
 	}
 
 private:
+	struct ScopedBinding {
+		string catalog;
+		string schema;
+		string alias;
+		vector<string> columns;
+	};
+
+	static bool Matches(const string &left, const string &right) {
+		return StringUtil::CIEquals(left, right);
+	}
+
+	static bool HasColumn(const ScopedBinding &binding, const string &column_name) {
+		return std::any_of(binding.columns.begin(), binding.columns.end(),
+		                   [&](const string &column) { return Matches(column, column_name); });
+	}
+
+	static bool HasAlias(const vector<ScopedBinding> &scope, const string &alias) {
+		return std::any_of(scope.begin(), scope.end(),
+		                   [&](const ScopedBinding &binding) { return Matches(binding.alias, alias); });
+	}
+
+	void CollectRelationBindings(Relation &relation, vector<ScopedBinding> &bindings) {
+		switch (relation.type) {
+		case RelationType::JOIN_RELATION: {
+			auto &join = relation.Cast<JoinRelation>();
+			CollectRelationBindings(*join.left, bindings);
+			CollectRelationBindings(*join.right, bindings);
+			return;
+		}
+		case RelationType::CROSS_PRODUCT_RELATION: {
+			auto &cross_product = relation.Cast<CrossProductRelation>();
+			CollectRelationBindings(*cross_product.left, bindings);
+			CollectRelationBindings(*cross_product.right, bindings);
+			return;
+		}
+		default:
+			break;
+		}
+		ScopedBinding binding;
+		binding.alias = relation.GetAlias();
+		for (auto &column : relation.Columns()) {
+			binding.columns.push_back(column.Name());
+		}
+		if (relation.type == RelationType::TABLE_RELATION) {
+			binding.columns.emplace_back("rowid");
+		} else if (relation.type == RelationType::TABLE_FUNCTION_RELATION) {
+			for (auto &column_name : relation.Cast<TableFunctionRelation>().GetVirtualColumnNames()) {
+				binding.columns.push_back(column_name);
+			}
+		}
+		bindings.push_back(std::move(binding));
+	}
+
 	bool QualifierIsVisible(const string &qualifier) const {
 		if (StringUtil::CIEquals(qualifier, child_alias)) {
 			return true;
 		}
 		for (auto scope = query_scopes.rbegin(); scope != query_scopes.rend(); scope++) {
-			for (auto &alias : *scope) {
-				if (StringUtil::CIEquals(qualifier, alias)) {
-					return true;
-				}
+			if (HasAlias(*scope, qualifier)) {
+				return true;
 			}
 		}
 		return false;
+	}
+
+	bool BindingMatchesHiddenReference(const ScopedBinding &binding, const ColumnRefExpression &column_ref) const {
+		auto &names = column_ref.column_names;
+		D_ASSERT(names.size() >= 2);
+		// The binder tries table.column, schema.table.column, and
+		// catalog.schema.table.column before interpreting the leading name as a
+		// struct column. Any remaining names are struct fields.
+		idx_t max_table_position = MinValue<idx_t>(2, names.size() - 2);
+		for (idx_t table_position = 0; table_position <= max_table_position; table_position++) {
+			if (Matches(binding.alias, names[table_position]) && HasColumn(binding, names[table_position + 1])) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool ScopeBindsReference(const vector<ScopedBinding> &scope, const ColumnRefExpression &column_ref) const {
+		auto &names = column_ref.column_names;
+		D_ASSERT(names.size() >= 2);
+		for (auto &binding : scope) {
+			// table.column followed by zero or more struct fields
+			if (Matches(binding.alias, names[0]) && HasColumn(binding, names[1])) {
+				return true;
+			}
+			// catalog.schema.table.column or schema.table.column
+			if (names.size() == 3 && Matches(binding.alias, names[1]) && HasColumn(binding, names[2]) &&
+			    ((!binding.catalog.empty() && Matches(binding.catalog, names[0])) ||
+			     (!binding.schema.empty() && Matches(binding.schema, names[0])))) {
+				return true;
+			}
+			if (names.size() >= 4 && Matches(binding.catalog, names[0]) && Matches(binding.schema, names[1]) &&
+			    Matches(binding.alias, names[2]) && HasColumn(binding, names[3])) {
+				return true;
+			}
+		}
+		// If the leading name is a column in this scope, the binder interprets
+		// the remaining names as struct fields before trying an outer scope.
+		return std::any_of(scope.begin(), scope.end(),
+		                   [&](const ScopedBinding &binding) { return HasColumn(binding, names[0]); });
+	}
+
+	bool ReferencesHiddenBinding(const ColumnRefExpression &column_ref) const {
+		if (!column_ref.IsQualified()) {
+			auto &column_name = column_ref.GetColumnName();
+			bool hidden_column =
+			    std::any_of(hidden_bindings.begin(), hidden_bindings.end(),
+			                [&](const ScopedBinding &binding) { return HasColumn(binding, column_name); });
+			bool serialized_column = std::any_of(serialized_columns.begin(), serialized_columns.end(),
+			                                     [&](const string &column) { return Matches(column, column_name); });
+			if (!hidden_column || serialized_column) {
+				return false;
+			}
+			for (auto scope = query_scopes.rbegin(); scope != query_scopes.rend(); scope++) {
+				if (std::any_of(scope->begin(), scope->end(),
+				                [&](const ScopedBinding &binding) { return HasColumn(binding, column_name); })) {
+					return false;
+				}
+			}
+			return true;
+		}
+		auto &names = column_ref.column_names;
+		if (!child_alias.empty() && Matches(child_alias, names[0]) &&
+		    std::any_of(serialized_columns.begin(), serialized_columns.end(),
+		                [&](const string &column) { return Matches(column, names[1]); })) {
+			// A single-source unary boundary is emitted with the child's alias, so
+			// its materialized output columns remain qualified by that alias. Hidden
+			// virtual columns (e.g., rowid) are intentionally absent here.
+			return false;
+		}
+		bool matches_hidden_binding =
+		    std::any_of(hidden_bindings.begin(), hidden_bindings.end(), [&](const ScopedBinding &binding) {
+			    return BindingMatchesHiddenReference(binding, column_ref);
+		    });
+		if (!matches_hidden_binding) {
+			return false;
+		}
+		for (auto scope = query_scopes.rbegin(); scope != query_scopes.rend(); scope++) {
+			if (ScopeBindsReference(*scope, column_ref)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool HiddenQualifier(const string &qualifier) const {
+		return std::any_of(hidden_bindings.begin(), hidden_bindings.end(),
+		                   [&](const ScopedBinding &binding) { return Matches(binding.alias, qualifier); });
+	}
+
+	void VisitTableRefQuery(QueryNode &node) {
+		// A FROM item's alias belongs to the containing SELECT and is not visible
+		// inside the query that defines that item. Drop only the current SELECT's
+		// scope while descending, retaining any genuinely correlated outer scopes.
+		D_ASSERT(!query_scopes.empty());
+		auto current_scope = std::move(query_scopes.back());
+		query_scopes.pop_back();
+		VisitQueryNode(node);
+		query_scopes.push_back(std::move(current_scope));
+	}
+
+	void VisitTableRefExpression(const ParsedExpression &expression) {
+		D_ASSERT(!query_scopes.empty());
+		auto current_scope = std::move(query_scopes.back());
+		query_scopes.pop_back();
+		VisitExpression(expression);
+		query_scopes.push_back(std::move(current_scope));
 	}
 
 	void VisitExpression(const ParsedExpression &expression) {
@@ -352,7 +519,7 @@ private:
 		switch (expression.GetExpressionClass()) {
 		case ExpressionClass::COLUMN_REF: {
 			auto &column_ref = expression.Cast<ColumnRefExpression>();
-			if (column_ref.IsQualified() && !QualifierIsVisible(column_ref.GetTableName())) {
+			if (ReferencesHiddenBinding(column_ref)) {
 				serializable = false;
 			}
 			return;
@@ -360,9 +527,14 @@ private:
 		case ExpressionClass::STAR: {
 			auto &star = expression.Cast<StarExpression>();
 			auto references_hidden_table = [&](const QualifiedColumnName &column) {
-				return column.IsQualified() && !QualifierIsVisible(column.table);
+				if (!column.IsQualified()) {
+					return false;
+				}
+				ColumnRefExpression column_ref(column.column, column.table);
+				return ReferencesHiddenBinding(column_ref);
 			};
-			if ((!star.relation_name.empty() && !QualifierIsVisible(star.relation_name)) ||
+			if ((!star.relation_name.empty() && HiddenQualifier(star.relation_name) &&
+			     !QualifierIsVisible(star.relation_name)) ||
 			    std::any_of(star.exclude_list.begin(), star.exclude_list.end(), references_hidden_table) ||
 			    std::any_of(star.rename_list.begin(), star.rename_list.end(),
 			                [&](const auto &entry) { return references_hidden_table(entry.first); })) {
@@ -390,30 +562,79 @@ private:
 		                                            [&](const ParsedExpression &child) { VisitExpression(child); });
 	}
 
-	void CollectTableAliases(const TableRef &ref, vector<string> &aliases) {
+	bool CollectQueryOutputColumns(const QueryNode &node, vector<string> &columns) const {
+		switch (node.type) {
+		case QueryNodeType::SELECT_NODE: {
+			auto &select = node.Cast<SelectNode>();
+			for (auto &expression : select.select_list) {
+				if (expression->GetExpressionClass() == ExpressionClass::STAR) {
+					return false;
+				}
+				columns.push_back(expression->GetName());
+			}
+			return true;
+		}
+		case QueryNodeType::SET_OPERATION_NODE: {
+			auto &set_operation = node.Cast<SetOperationNode>();
+			if (set_operation.children.empty()) {
+				return false;
+			}
+			return CollectQueryOutputColumns(*set_operation.children[0], columns);
+		}
+		case QueryNodeType::RECURSIVE_CTE_NODE:
+			return CollectQueryOutputColumns(*node.Cast<RecursiveCTENode>().left, columns);
+		default:
+			return false;
+		}
+	}
+
+	void CollectTableBindings(const TableRef &ref, vector<ScopedBinding> &bindings) {
 		if (!ref.alias.empty()) {
-			aliases.push_back(ref.alias);
+			ScopedBinding binding;
+			binding.alias = ref.alias;
+			if (ref.type == TableReferenceType::SUBQUERY) {
+				CollectQueryOutputColumns(*ref.Cast<SubqueryRef>().subquery->node, binding.columns);
+			}
+			for (idx_t i = 0; i < ref.column_name_alias.size(); i++) {
+				if (i < binding.columns.size()) {
+					binding.columns[i] = ref.column_name_alias[i];
+				} else {
+					binding.columns.push_back(ref.column_name_alias[i]);
+				}
+			}
+			bindings.push_back(std::move(binding));
 			return;
 		}
 		switch (ref.type) {
-		case TableReferenceType::BASE_TABLE:
-			aliases.push_back(ref.Cast<BaseTableRef>().table_name);
+		case TableReferenceType::BASE_TABLE: {
+			auto &base_table = ref.Cast<BaseTableRef>();
+			ScopedBinding binding;
+			binding.catalog = base_table.catalog_name;
+			binding.schema = base_table.schema_name;
+			binding.alias = base_table.table_name;
+			binding.columns = ref.column_name_alias;
+			bindings.push_back(std::move(binding));
 			break;
+		}
 		case TableReferenceType::JOIN: {
 			auto &join = ref.Cast<JoinRef>();
-			CollectTableAliases(*join.left, aliases);
-			CollectTableAliases(*join.right, aliases);
+			CollectTableBindings(*join.left, bindings);
+			CollectTableBindings(*join.right, bindings);
 			break;
 		}
 		case TableReferenceType::TABLE_FUNCTION: {
 			auto &table_function = ref.Cast<TableFunctionRef>();
 			if (table_function.function && table_function.function->GetExpressionClass() == ExpressionClass::FUNCTION) {
-				aliases.push_back(table_function.function->Cast<FunctionExpression>().function_name);
+				ScopedBinding binding;
+				binding.alias = table_function.function->Cast<FunctionExpression>().function_name;
+				binding.columns = ref.column_name_alias;
+				bindings.push_back(std::move(binding));
 			}
 			break;
 		}
 		case TableReferenceType::PIVOT:
-			CollectTableAliases(*ref.Cast<PivotRef>().source, aliases);
+			// PIVOT/UNPIVOT creates a new output binding. Its source aliases are
+			// available to the pivot expressions, but not to the containing SELECT.
 			break;
 		default:
 			break;
@@ -429,7 +650,7 @@ private:
 			auto &expression_list = ref.Cast<ExpressionListRef>();
 			for (auto &row : expression_list.values) {
 				for (auto &expression : row) {
-					VisitExpression(*expression);
+					VisitTableRefExpression(*expression);
 				}
 			}
 			break;
@@ -450,40 +671,40 @@ private:
 			auto &pivot = ref.Cast<PivotRef>();
 			VisitTableRef(*pivot.source);
 			for (auto &aggregate : pivot.aggregates) {
-				VisitExpression(*aggregate);
+				VisitTableRefExpression(*aggregate);
 			}
 			for (auto &column : pivot.pivots) {
 				for (auto &expression : column.pivot_expressions) {
-					VisitExpression(*expression);
+					VisitTableRefExpression(*expression);
 				}
 				for (auto &entry : column.entries) {
 					if (entry.expr) {
-						VisitExpression(*entry.expr);
+						VisitTableRefExpression(*entry.expr);
 					}
 				}
 				if (column.subquery) {
-					VisitQueryNode(*column.subquery);
+					VisitTableRefQuery(*column.subquery);
 				}
 			}
 			break;
 		}
 		case TableReferenceType::SUBQUERY: {
 			auto &subquery = ref.Cast<SubqueryRef>();
-			VisitQueryNode(*subquery.subquery->node);
+			VisitTableRefQuery(*subquery.subquery->node);
 			break;
 		}
 		case TableReferenceType::TABLE_FUNCTION: {
 			auto &table_function = ref.Cast<TableFunctionRef>();
-			VisitExpression(*table_function.function);
+			VisitTableRefExpression(*table_function.function);
 			if (table_function.subquery) {
-				VisitQueryNode(*table_function.subquery->node);
+				VisitTableRefQuery(*table_function.subquery->node);
 			}
 			break;
 		}
 		case TableReferenceType::SHOW_REF: {
 			auto &show = ref.Cast<ShowRef>();
 			if (show.query) {
-				VisitQueryNode(*show.query);
+				VisitTableRefQuery(*show.query);
 			}
 			break;
 		}
@@ -508,11 +729,11 @@ private:
 		switch (node.type) {
 		case QueryNodeType::SELECT_NODE: {
 			auto &select = node.Cast<SelectNode>();
-			vector<string> aliases;
+			vector<ScopedBinding> bindings;
 			if (select.from_table) {
-				CollectTableAliases(*select.from_table, aliases);
+				CollectTableBindings(*select.from_table, bindings);
 			}
-			query_scopes.push_back(std::move(aliases));
+			query_scopes.push_back(std::move(bindings));
 			for (auto &expression : select.select_list) {
 				VisitExpression(*expression);
 			}
@@ -564,7 +785,9 @@ private:
 
 private:
 	string child_alias;
-	vector<vector<string>> query_scopes;
+	vector<string> serialized_columns;
+	vector<ScopedBinding> hidden_bindings;
+	vector<vector<ScopedBinding>> query_scopes;
 	bool serializable = true;
 };
 
@@ -574,26 +797,28 @@ bool Relation::CanSerializeExpressionOnChild(Relation &child, const ParsedExpres
 	if (!child.CanSerializeToQueryNode()) {
 		return false;
 	}
-	if (!ExposesMultiSourceBindings(child) || RequiresSQLMultiSourceBinding(child)) {
+	if (!child.InheritsColumnBindings() || RequiresSQLMultiSourceBinding(child)) {
 		return true;
 	}
 
-	// A semantic boundary above a join is emitted as a subquery. Check every
-	// qualified reference against the aliases that survive that boundary and
-	// against aliases introduced by nested query scopes.
-	return SerializedExpressionScopeChecker(child.GetAlias()).Check(expression);
+	// An inheriting semantic boundary is emitted as a subquery. Check references
+	// against the columns and aliases that survive that boundary, including
+	// aliases introduced by nested query scopes.
+	return SerializedExpressionScopeChecker(child).Check(expression);
 }
 
 unique_ptr<TableRef> Relation::BindRelationInput(Binder &binder, Relation &child) {
 	// BoundRefWrapper lets the normal SELECT binder consume a non-SQL child
 	// without converting its logical plan back into a QueryNode. Keep the
-	// child's full BindContext for binding-preserving relations and joins.
+	// child's full BindContext for binding-preserving relations and native sources.
 	auto child_binder = Binder::CreateBinder(binder.context, binder.shared_from_this());
 	auto child_bound = child.BindAsInput(*child_binder);
 	binder.MoveCorrelatedExpressionsFrom(*child_binder);
 
 	bool multi_source = child.type == RelationType::JOIN_RELATION || child.type == RelationType::CROSS_PRODUCT_RELATION;
-	bool preserves_bindings = child.InheritsColumnBindings() || multi_source;
+	bool native_source =
+	    child.type == RelationType::TABLE_RELATION || child.type == RelationType::TABLE_FUNCTION_RELATION;
+	bool preserves_bindings = child.InheritsColumnBindings() || multi_source || native_source;
 	if (preserves_bindings) {
 		// The bind context is authoritative for the columns that survive an
 		// operator. JoinRef binding retains both inputs in BoundStatement metadata

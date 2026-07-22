@@ -10,7 +10,7 @@
 #include "duckdb/parser/query_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/planner/binder.hpp"
-#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression_binder/relation_binder.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 
 namespace duckdb {
@@ -41,16 +41,15 @@ BoundStatement DistinctRelation::Bind(Binder &binder) {
 BoundStatement DistinctRelation::BindAsInput(Binder &binder) {
 	auto child_ref = BindRelationInput(binder, *child);
 	auto child_bound = binder.Bind(*child_ref);
-	auto bindings = child_bound.plan->GetColumnBindings();
-	if (child_bound.names.size() != child_bound.types.size() || bindings.size() < child_bound.names.size()) {
-		throw InternalException("Distinct relation input metadata does not match its visible column bindings");
-	}
+	vector<unique_ptr<ParsedExpression>> visible_columns;
+	StarExpression star;
+	binder.bind_context.GenerateAllColumnExpressions(star, visible_columns);
+	RelationBinder relation_binder(binder, binder.context, "distinct");
 
 	vector<unique_ptr<Expression>> targets;
-	targets.reserve(child_bound.names.size());
-	for (idx_t i = 0; i < child_bound.names.size(); i++) {
-		unique_ptr<Expression> target =
-		    make_uniq<BoundColumnRefExpression>(child_bound.names[i], child_bound.types[i], bindings[i]);
+	targets.reserve(visible_columns.size());
+	for (auto &column : visible_columns) {
+		auto target = relation_binder.Bind(column);
 		ExpressionBinder::PushCollation(binder.context, target, target->return_type);
 		targets.push_back(std::move(target));
 	}

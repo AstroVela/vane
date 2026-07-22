@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/relation/table_relation.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
@@ -7,6 +13,7 @@
 #include "duckdb/main/relation/update_relation.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 
@@ -32,6 +39,11 @@ unique_ptr<TableRef> TableRelation::GetTableRef() {
 	table_ref->table_name = description->table;
 	table_ref->catalog_name = description->database;
 	return std::move(table_ref);
+}
+
+BoundStatement TableRelation::BindAsInput(Binder &binder) {
+	auto table_ref = GetTableRef();
+	return binder.Bind(*table_ref);
 }
 
 string TableRelation::GetAlias() {

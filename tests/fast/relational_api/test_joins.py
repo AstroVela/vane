@@ -347,6 +347,238 @@ class TestRAPIJoins:
         assert con.sql(sql).fetchall() == expected
 
     @pytest.mark.parametrize("boundary", ["distinct", "limit", "order"])
+    def test_struct_field_after_join_boundary_remains_serializable(self, con, boundary):
+        left = con.sql("SELECT {'a': 7} AS payload, 1 AS id").set_alias("l")
+        right = con.sql("SELECT 1 AS id").set_alias("r")
+        relation = left.join(right, "l.id = r.id")
+        if boundary == "distinct":
+            relation = relation.distinct()
+        elif boundary == "limit":
+            relation = relation.limit(1)
+        else:
+            relation = relation.order("l.id")
+        result = relation.project("payload.a AS value")
+
+        sql = result.sql_query()
+        assert sql
+        assert result.fetchall() == [(7,)]
+        assert con.sql(sql).fetchall() == [(7,)]
+        assert con.sql("SELECT * FROM result").fetchall() == [(7,)]
+
+    def test_lambda_field_after_join_boundary_remains_serializable(self, con):
+        left = con.sql("SELECT [{'a': 7}] AS payloads, 1 AS id").set_alias("l")
+        right = con.sql("SELECT 1 AS id").set_alias("r")
+        result = (
+            left.join(right, "l.id = r.id").distinct().project("list_transform(payloads, item -> item.a) AS values")
+        )
+
+        sql = result.sql_query()
+        assert sql
+        assert result.fetchall() == [([7],)]
+        assert con.sql(sql).fetchall() == [([7],)]
+
+    def test_deep_struct_field_after_join_boundary_remains_serializable(self, con):
+        left = con.sql("SELECT {'a': {'b': {'c': {'d': 7}}}} AS payload, 1 AS id").set_alias("l")
+        right = con.sql("SELECT 1 AS id").set_alias("r")
+        result = left.join(right, "l.id = r.id").distinct().project("payload.a.b.c.d AS value")
+
+        sql = result.sql_query()
+        assert sql
+        assert result.fetchall() == [(7,)]
+        assert con.sql(sql).fetchall() == [(7,)]
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ("(SELECT l.id FROM (VALUES (99)) l(other)) AS value", [(7,)]),
+            ("(SELECT l.payload.a FROM (VALUES (99)) payload(a)) AS value", [(8,)]),
+        ],
+    )
+    def test_nested_alias_without_matching_column_does_not_hide_join_binding(self, con, expression, expected):
+        left = con.sql("SELECT 7 AS id, {'a': 8} AS payload, 1 AS join_key").set_alias("l")
+        right = con.sql("SELECT 1 AS join_key").set_alias("r")
+        result = left.join(right, "l.join_key = r.join_key").distinct().project(expression)
+
+        assert result.fetchall() == expected
+        assert result.sql_query() == ""
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            con.sql("SELECT * FROM result")
+
+    def test_nested_alias_with_matching_column_hides_join_binding(self, con):
+        left = con.sql("SELECT 1 AS id").set_alias("l")
+        right = con.sql("SELECT 1 AS id, 100 AS value").set_alias("r")
+        result = (
+            left.join(right, "l.id = r.id").distinct().project("(SELECT r.value FROM (VALUES (42)) r(value)) AS value")
+        )
+
+        sql = result.sql_query()
+        assert sql
+        assert result.fetchall() == [(42,)]
+        assert con.sql(sql).fetchall() == [(42,)]
+
+    def test_nested_subquery_output_column_hides_join_binding(self, con):
+        left = con.sql("SELECT 1 AS id").set_alias("l")
+        right = con.sql("SELECT 1 AS id, 100 AS right_value").set_alias("r")
+        result = (
+            left.join(right, "l.id = r.id")
+            .distinct()
+            .project("(SELECT r.right_value FROM (SELECT 42 AS right_value) r) AS value")
+        )
+
+        sql = result.sql_query()
+        assert sql
+        assert result.fetchall() == [(42,)]
+        assert con.sql(sql).fetchall() == [(42,)]
+
+    def test_from_subquery_alias_is_not_visible_inside_its_own_query(self, con):
+        left = con.sql("SELECT 7 AS id, 1 AS join_key").set_alias("l")
+        right = con.sql("SELECT 1 AS join_key").set_alias("r")
+        result = (
+            left.join(right, "l.join_key = r.join_key")
+            .distinct()
+            .project("(SELECT id FROM (SELECT l.id) l(id)) AS value")
+        )
+
+        assert result.fetchall() == [(7,)]
+        assert result.sql_query() == ""
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            con.sql("SELECT * FROM result")
+
+    def test_table_function_alias_is_not_visible_inside_its_arguments(self, con):
+        left = con.sql("SELECT 2 AS id, 1 AS join_key").set_alias("l")
+        right = con.sql("SELECT 1 AS join_key").set_alias("r")
+        result = (
+            left.join(right, "l.join_key = r.join_key")
+            .distinct()
+            .project("(SELECT count(*) FROM range(l.id) l(id)) AS value")
+        )
+
+        assert result.fetchall() == [(2,)]
+        assert result.sql_query() == ""
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            con.sql("SELECT * FROM result")
+
+    def test_pivot_source_alias_is_not_visible_after_pivot(self, con):
+        left = con.sql("SELECT 7 AS id, 1 AS join_key").set_alias("l")
+        right = con.sql("SELECT 1 AS join_key").set_alias("r")
+        result = (
+            left.join(right, "l.join_key = r.join_key")
+            .distinct()
+            .project(
+                "(SELECT l.id FROM (VALUES (1, 'a')) l(id, pivot_key) PIVOT (count(*) FOR pivot_key IN ('a'))) AS value"
+            )
+        )
+
+        assert result.fetchall() == [(7,)]
+        assert result.sql_query() == ""
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            con.sql("SELECT * FROM result")
+
+    @pytest.mark.parametrize("expression", ["rowid_source.rowid AS row_id", "rowid AS row_id"])
+    @pytest.mark.parametrize("boundary", ["distinct", "limit", "order"])
+    def test_virtual_rowid_after_join_boundary_is_not_serialized(self, con, boundary, expression):
+        con.execute("CREATE TABLE rowid_source(value INTEGER)")
+        con.execute("INSERT INTO rowid_source VALUES (10), (20)")
+        left = con.table("rowid_source")
+        right = con.sql("SELECT 1 AS join_key").set_alias("r")
+        relation = left.cross(right)
+        if boundary == "distinct":
+            relation = relation.distinct()
+        elif boundary == "limit":
+            relation = relation.limit(2)
+        else:
+            relation = relation.order("rowid_source.value")
+        result = relation.project(expression)
+
+        assert sorted(result.fetchall()) == [(0,), (1,)]
+        assert result.sql_query() == ""
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            con.sql("SELECT * FROM result")
+
+    @pytest.mark.parametrize("expression", ["rowid_source.rowid AS row_id", "rowid AS row_id"])
+    @pytest.mark.parametrize("boundary", ["filter", "distinct", "limit", "order"])
+    def test_virtual_rowid_after_single_source_boundary_is_not_serialized(self, con, boundary, expression):
+        con.execute("CREATE TABLE rowid_source(value INTEGER)")
+        con.execute("INSERT INTO rowid_source VALUES (10), (20)")
+        relation = con.table("rowid_source")
+        if boundary == "filter":
+            relation = relation.filter("value > 0")
+        elif boundary == "distinct":
+            relation = relation.distinct()
+        elif boundary == "limit":
+            relation = relation.limit(2)
+        else:
+            relation = relation.order("rowid_source.value")
+        result = relation.project(expression)
+
+        assert sorted(result.fetchall()) == [(0,), (1,)]
+        assert result.sql_query() == ""
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            con.sql("SELECT * FROM result")
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ("read_parquet.filename AS value", None),
+            ("filename AS value", None),
+            ("read_parquet.file_index AS value", [(0,)]),
+            ("file_index AS value", [(0,)]),
+            ("read_parquet.file_row_number AS value", [(0,)]),
+            ("file_row_number AS value", [(0,)]),
+        ],
+    )
+    def test_table_function_virtual_column_after_join_boundary_is_not_serialized(
+        self, con, tmp_path, expression, expected
+    ):
+        parquet_path = tmp_path / "virtual_columns.parquet"
+        con.execute(f"COPY (SELECT 1 AS id) TO '{parquet_path}' (FORMAT PARQUET)")
+        left = con.table_function("read_parquet", [str(parquet_path)])
+        right = con.sql("SELECT 1 AS join_key").set_alias("r")
+        result = left.cross(right).distinct().project(expression)
+        if expected is None:
+            expected = [(str(parquet_path),)]
+
+        assert result.fetchall() == expected
+        assert result.sql_query() == ""
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            con.sql("SELECT * FROM result")
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ("read_parquet.filename AS value", None),
+            ("filename AS value", None),
+            ("read_parquet.file_index AS value", [(0,)]),
+            ("file_index AS value", [(0,)]),
+            ("read_parquet.file_row_number AS value", [(0,)]),
+            ("file_row_number AS value", [(0,)]),
+        ],
+    )
+    @pytest.mark.parametrize("boundary", ["filter", "distinct", "limit", "order"])
+    def test_table_function_virtual_column_after_single_source_boundary_is_not_serialized(
+        self, con, tmp_path, expression, expected, boundary
+    ):
+        parquet_path = tmp_path / "single_source_virtual_columns.parquet"
+        con.execute(f"COPY (SELECT 1 AS id) TO '{parquet_path}' (FORMAT PARQUET)")
+        relation = con.table_function("read_parquet", [str(parquet_path)])
+        if boundary == "filter":
+            relation = relation.filter("id > 0")
+        elif boundary == "distinct":
+            relation = relation.distinct()
+        elif boundary == "limit":
+            relation = relation.limit(1)
+        else:
+            relation = relation.order("id")
+        result = relation.project(expression)
+        if expected is None:
+            expected = [(str(parquet_path),)]
+
+        assert result.fetchall() == expected
+        assert result.sql_query() == ""
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            con.sql("SELECT * FROM result")
+
+    @pytest.mark.parametrize("boundary", ["distinct", "limit", "order"])
     def test_join_boundary_survives_uncorrelated_subquery(self, con, boundary):
         left = con.sql("SELECT * FROM (VALUES (1), (1), (2)) data(id)").set_alias("l")
         right = con.sql("SELECT * FROM (VALUES (1, 10), (2, 20)) data(id, value)").set_alias("r")
@@ -377,6 +609,25 @@ class TestRAPIJoins:
 
         assert result.fetchall() == [(2,)]
 
+    def test_distinct_using_join_uses_visible_output_columns(self, con):
+        left = con.sql("SELECT 1::INTEGER AS id, 'same' AS left_value").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES ('1', 'same'), ('01', 'same')) data(id, right_value)").set_alias("r")
+        relation = left.join(right, "id").distinct()
+
+        expected = [(1, "same", "same")]
+        assert relation.fetchall() == expected
+        assert relation.limit(10).fetchall() == expected
+        assert relation.aggregate("count(*)").fetchall() == [(1,)]
+
+    def test_distinct_full_outer_using_join_uses_coalesced_key(self, con):
+        left = con.sql("SELECT * FROM (VALUES (1, 'left'), (1, 'left')) data(id, left_value)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (2, 'right'), (2, 'right')) data(id, right_value)").set_alias("r")
+        relation = left.join(right, "id", "outer").distinct()
+
+        expected = [(1, "left", None), (2, None, "right")]
+        assert relation.order("id").limit(10).fetchall() == expected
+        assert relation.aggregate("count(*)").fetchall() == [(2,)]
+
     @pytest.mark.parametrize("join_type", ["semi", "anti"])
     def test_distinct_semi_anti_join_uses_surviving_output(self, con, join_type):
         left = con.sql("SELECT * FROM (VALUES (1, 'one'), (2, 'two'), (2, 'two')) data(id, value)").set_alias("l")
@@ -399,6 +650,24 @@ class TestRAPIJoins:
         else:
             result = ordered.distinct().project("l.id, r.value").order("1")
             assert result.fetchall() == [(1, 10), (2, 20)]
+
+    def test_chained_order_reuses_duplicate_volatile_projection(self, con):
+        left = con.sql("SELECT * FROM range(4) data(id)").set_alias("l")
+        right = con.sql("SELECT 1 AS value").set_alias("r")
+        relation = left.cross(right)
+
+        con.execute("CREATE SEQUENCE direct_order_sequence START 1")
+        relation.order("nextval('direct_order_sequence'), nextval('direct_order_sequence')").fetchall()
+
+        con.execute("CREATE SEQUENCE chained_order_sequence START 1")
+        relation.order("nextval('chained_order_sequence'), nextval('chained_order_sequence')").limit(4).fetchall()
+
+        con.execute("CREATE SEQUENCE distinct_order_sequence START 1")
+        relation.order("nextval('distinct_order_sequence'), nextval('distinct_order_sequence') + 0").limit(4).fetchall()
+
+        assert con.sql("SELECT currval('direct_order_sequence')").fetchone() == (4,)
+        assert con.sql("SELECT currval('chained_order_sequence')").fetchone() == (4,)
+        assert con.sql("SELECT currval('distinct_order_sequence')").fetchone() == (8,)
 
     def test_explicit_alias_restores_serializable_scope_after_join_boundary(self, con):
         left = con.sql("SELECT * FROM (VALUES (1, 10)) data(id, left_value)").set_alias("l")

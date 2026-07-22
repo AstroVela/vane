@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -35,6 +41,9 @@ public:
 	void Update(vector<string> column_names, vector<unique_ptr<ParsedExpression>> &&update,
 	            unique_ptr<ParsedExpression> condition = nullptr) override;
 	void Delete(const string &condition = string()) override;
+
+protected:
+	BoundStatement BindAsInput(Binder &binder) override;
 };
 
 } // namespace duckdb
