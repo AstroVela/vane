@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import platform
 import subprocess
 import sys
 from importlib.metadata import distribution, metadata, requires, version
@@ -124,3 +125,24 @@ def test_sdist_tree_uses_injected_source_id(tmp_path, monkeypatch):
     )
 
     assert _expected_duckdb_source_id(tmp_path) == expected
+
+
+def test_image_extra_installs_pillow():
+    assert _requirements_for_extra("image") == {"pillow"}
+
+
+def test_video_extra_installs_video_dependencies():
+    selected = _requirements_for_extra("video")
+    assert {"pillow", "psutil"} <= selected
+    if sys.platform == "linux" and platform.machine() == "x86_64":
+        assert "decord" in selected
+
+
+def test_base_distribution_keeps_video_dependencies_optional():
+    base_requirements = set()
+    for raw_requirement in requires("vane-ai") or []:
+        requirement = Requirement(raw_requirement)
+        if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
+            base_requirements.add(canonicalize_name(requirement.name))
+
+    assert {"pillow", "psutil", "decord"}.isdisjoint(base_requirements)

@@ -73,6 +73,14 @@ transformers = [
 vllm = [
     "vllm; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
+image = [ # ndarray image inputs for AI providers
+    "pillow>=10",
+]
+video = [ # video data source; decord ships prebuilt wheels for Linux x86-64 only
+    "pillow>=10",
+    "psutil>=5.9",
+    "decord>=0.6; platform_system == 'Linux' and platform_machine == 'x86_64'",
+]
 all = [ # Cloud providers and dataframe/filesystem integrations; local model runtimes stay opt-in.
     "anthropic",
     "google-genai",
@@ -81,6 +89,7 @@ all = [ # Cloud providers and dataframe/filesystem integrations; local model run
     "openai",
     "pandas",  # used for pandas dataframes
     "adbc-driver-manager", # for the adbc driver
+    "pillow>=10", # used for image inputs and video frames
 ]
 
 ######################################################################################################

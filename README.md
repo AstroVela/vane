@@ -69,6 +69,16 @@ Install the `vane-ai` package from PyPI:
 pip install vane-ai
 ```
 
+Optional features are provided as extras:
+
+```bash
+pip install 'vane-ai[openai]'   # OpenAI provider (anthropic / google / transformers / vllm likewise)
+pip install 'vane-ai[image]'    # ndarray image inputs for AI providers (Pillow)
+pip install 'vane-ai[video]'    # video data source (Pillow, psutil, decord)
+```
+
+The `video` extra installs `decord` on Linux x86-64 only, matching the platforms covered by its prebuilt wheels.
+
 For more details, see the [Installation Guide](https://vane.astrovela.ai/docs/data/quickstart/installation).
 
 ### Quick Start

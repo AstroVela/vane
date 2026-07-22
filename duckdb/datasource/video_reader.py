@@ -17,20 +17,33 @@ Usage::
 
 from __future__ import annotations
 
+import importlib
 import os
 import threading
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from itertools import repeat
+from types import ModuleType
 from typing import Any, cast
 
 import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
-from PIL import Image  # type: ignore[import-not-found]
 
 from duckdb.datasource import DataSource, DataSourceTask
+
+
+def _import_video_dependency(module_name: str, package_name: str) -> ModuleType:
+    """Import an optional video dependency, reporting the extra to install on failure."""
+    try:
+        return importlib.import_module(module_name)
+    except ImportError as exc:
+        hint = "Please `pip install 'vane-ai[video]'` to use the video data source."
+        if package_name == "decord":
+            hint += " The video extra installs decord on Linux x86-64 only."
+        raise ImportError(f"The video data source requires the '{package_name}' package. {hint}") from exc
+
 
 # The generic datasource keeps its historical 10 MiB default. The aligned
 # video benchmark explicitly supplies Ray Data's 128 MiB soft block target.
@@ -194,7 +207,7 @@ def _wait_for_memory() -> None:
     IMPORTANT: Only call at task START (before a new video). Never call
     mid-decode or mid-yield — that deadlocks the DuckDB push pipeline.
     """
-    import psutil  # type: ignore[import-untyped]
+    psutil = _import_video_dependency("psutil", "psutil")
 
     def has_capacity(mem: Any) -> bool:
         if _MEM_MIN_AVAILABLE_BYTES > 0 and mem.available >= _MEM_MIN_AVAILABLE_BYTES:
@@ -275,7 +288,7 @@ def _constant_string_array(value: str, count: int) -> pa.Array:
 
 
 def _open_decord_reader(video_path: str) -> Any:
-    from decord import VideoReader  # type: ignore[import-not-found]
+    VideoReader = _import_video_dependency("decord", "decord").VideoReader
 
     if video_path.startswith("s3://"):
         import io as _io
@@ -289,7 +302,8 @@ def _resize_rgb_frame(
     width: int,
     height: int,
 ) -> npt.NDArray[np.uint8]:
-    pil_image = Image.fromarray(frame)
+    pil_image_module = _import_video_dependency("PIL.Image", "pillow")
+    pil_image = pil_image_module.fromarray(frame)
     return np.array(pil_image.resize((width, height)))
 
 
