@@ -47,8 +47,18 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
-from vane.ai.options import VLLMJSONValue
+from duckdb.execution._vllm_options_protocol import (
+    _NATIVE_OPTIONS_PAYLOAD_VERSION,
+    _NATIVE_OPTIONS_PUBLIC_KEY,
+    _NATIVE_OPTIONS_RESERVED_KEYS,
+    _NATIVE_OPTIONS_SECRET_KEY,
+    _NATIVE_OPTIONS_VERSION_KEY,
+    _NATIVE_SECRET_PAYLOAD_VALUES_KEY,
+    _NATIVE_SECRET_PAYLOAD_VERSION_KEY,
+    _NATIVE_SECRET_REF_KEY,
+    _dump_vllm_protocol_json,
+)
+from vane.ai._redaction import Secret, wrap_sensitive_options
 from vane.ai.protocols import NativePrompterPlan
 from vane.ai.provider import Provider
 
@@ -94,15 +104,75 @@ def _canonicalize_native_json(value: Any, path: str = "options") -> Any:
     raise TypeError(f"vLLM native option {path} must be JSON-compatible; got {type(value).__name__}")
 
 
+def _canonicalize_native_plan_json(value: Any, path: str = "options") -> Any:
+    """Validate native options while preserving sealed values for planning."""
+    if isinstance(value, Secret):
+        return Secret(_canonicalize_native_json(value.reveal(), path))
+    if isinstance(value, Mapping):
+        canonical: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"vLLM native option {path} must use string keys; got {type(key).__name__}")
+            canonical[key] = _canonicalize_native_plan_json(item, f"{path}.{key}")
+        return canonical
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_native_plan_json(item, f"{path}[{index}]") for index, item in enumerate(value)]
+    return _canonicalize_native_json(value, path)
+
+
 def _serialize_native_vllm_options(options: Mapping[str, Any]) -> str:
     """Serialize native options after enforcing the public JSON boundary."""
     canonical = _canonicalize_native_json(options)
-    return json.dumps(
-        canonical,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
+    return _dump_vllm_protocol_json(canonical)
+
+
+def _split_native_vllm_secrets(value: Any, secrets: list[Any], path: str = "options") -> Any:
+    if isinstance(value, Secret):
+        secret_index = len(secrets)
+        secrets.append(value.reveal())
+        return {_NATIVE_SECRET_REF_KEY: secret_index}
+    if isinstance(value, Mapping):
+        if _NATIVE_SECRET_REF_KEY in value:
+            raise ValueError(f"vLLM native option {path} uses reserved field {_NATIVE_SECRET_REF_KEY!r}")
+        return {key: _split_native_vllm_secrets(item, secrets, f"{path}.{key}") for key, item in value.items()}
+    if isinstance(value, list):
+        return [_split_native_vllm_secrets(item, secrets, f"{path}[{index}]") for index, item in enumerate(value)]
+    return value
+
+
+def _build_native_vllm_options_argument(options: Mapping[str, Any]) -> str | dict[str, Any]:
+    """Encode sealed native options without exposing them as structured plan fields.
+
+    Plans without credentials retain the legacy JSON representation. Credential-
+    bearing plans use a versioned STRUCT envelope: public options remain JSON,
+    while plaintext values are confined to an opaque BLOB. Opaque here means
+    excluded from structured plan rendering, not encrypted. The runtime decodes
+    the BLOB with strict JSON rather than executable pickle data.
+    """
+    canonical = _canonicalize_native_plan_json(options)
+    assert isinstance(canonical, dict)
+    reserved_protocol_keys = _NATIVE_OPTIONS_RESERVED_KEYS.intersection(canonical)
+    if reserved_protocol_keys:
+        raise ValueError(
+            "vLLM native options use reserved protocol fields: " + ", ".join(sorted(reserved_protocol_keys))
+        )
+    secrets: list[Any] = []
+    public_options = _split_native_vllm_secrets(canonical, secrets)
+    public_options_json = _serialize_native_vllm_options(public_options)
+    if not secrets:
+        return public_options_json
+
+    secret_payload = _dump_vllm_protocol_json(
+        {
+            _NATIVE_SECRET_PAYLOAD_VERSION_KEY: _NATIVE_OPTIONS_PAYLOAD_VERSION,
+            _NATIVE_SECRET_PAYLOAD_VALUES_KEY: secrets,
+        }
+    ).encode("utf-8")
+    return {
+        _NATIVE_OPTIONS_VERSION_KEY: _NATIVE_OPTIONS_PAYLOAD_VERSION,
+        _NATIVE_OPTIONS_PUBLIC_KEY: public_options_json,
+        _NATIVE_OPTIONS_SECRET_KEY: secret_payload,
+    }
 
 
 class VLLMProvider(Provider):
@@ -163,16 +233,17 @@ class NativeVLLMPromptPlan(NativePrompterPlan):
     def get_options(self) -> Options:
         return dict(self.vllm_options)
 
-    def build_physical_vllm_options(self) -> dict[str, VLLMJSONValue]:
-        """Build JSON-ready options for the native ``PhysicalVLLM`` operator.
+    def build_physical_vllm_options(self) -> dict[str, Any]:
+        """Build options for the native ``PhysicalVLLM`` operator.
 
         The Python UDF path used ``actor_number`` to control the number of
         outer UDF actors. The native operator owns one executor instead, so
         that capacity becomes the executor's ``concurrency``. Structured
         output configuration is copied into vLLM sampling parameters without
-        mutating the descriptor or caller-owned nested dictionaries.
+        mutating the descriptor or caller-owned nested dictionaries. Sensitive
+        values stay sealed until the options argument is encoded for the plan.
         """
-        options = _canonicalize_native_json(unwrap_sensitive_options(self.vllm_options))
+        options = _canonicalize_native_plan_json(self.vllm_options)
         assert isinstance(options, dict)
 
         actor_number = options.pop("actor_number", None)
@@ -199,10 +270,12 @@ class NativeVLLMPromptPlan(NativePrompterPlan):
             value = options.pop(name, None)
             if value is not None:
                 sampling_overrides[name] = value
-        if self.return_format is None and not sampling_overrides:
-            return options
 
         generate_args = options.get("generate_args")
+        has_sampling_params = isinstance(generate_args, Mapping) and generate_args.get("sampling_params") is not None
+        if self.return_format is None and not sampling_overrides and not has_sampling_params:
+            return options
+
         if generate_args is None:
             generate_args = {}
         elif isinstance(generate_args, Mapping):
@@ -225,6 +298,7 @@ class NativeVLLMPromptPlan(NativePrompterPlan):
             sampling_params = dict(sampling_params)
         else:
             raise TypeError("vLLM sampling_params must be a mapping or JSON string")
+        sampling_params = wrap_sensitive_options(sampling_params)
         generate_args["sampling_params"] = sampling_params
 
         for name, value in sampling_overrides.items():
@@ -233,7 +307,7 @@ class NativeVLLMPromptPlan(NativePrompterPlan):
         if self.return_format is not None:
             schema = copy.deepcopy(_json_schema_from_return_format(self.return_format))
             sampling_params["structured_outputs"] = {"type": "json", "value": schema}
-        canonical = _canonicalize_native_json(options)
+        canonical = _canonicalize_native_plan_json(options)
         assert isinstance(canonical, dict)
         return canonical
 

@@ -1281,7 +1281,8 @@ def test_vllm_actor_entrypoints_install_explicit_session_environment(monkeypatch
     assert events == ["install", "executor", "install"]
 
 
-def test_vllm_actor_shutdown_retains_failed_handles_for_retry(monkeypatch):
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
+def test_vllm_actor_shutdown_retains_failed_handles_for_retry(monkeypatch, failure_type):
     import duckdb.execution.vllm as vllm
 
     class FakeRay(types.ModuleType):
@@ -1294,7 +1295,7 @@ def test_vllm_actor_shutdown_retains_failed_handles_for_retry(monkeypatch):
             self.attempts.append((actor, no_restart))
             if actor in self.fail_once:
                 self.fail_once.remove(actor)
-                raise RuntimeError("transient kill failure")
+                raise failure_type("transient kill failure")
 
     fake_ray = FakeRay()
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
@@ -1315,6 +1316,33 @@ def test_vllm_actor_shutdown_retains_failed_handles_for_retry(monkeypatch):
         ("llm-1", True),
         ("llm-0", True),
     ]
+
+
+def test_vllm_worker_borrow_does_not_kill_driver_owned_named_pool(monkeypatch):
+    import duckdb.execution.vllm as vllm
+
+    class FakeRay(types.ModuleType):
+        def __init__(self):
+            super().__init__("ray")
+            self.killed = []
+
+        def kill(self, actor, *, no_restart):
+            self.killed.append((actor, no_restart))
+
+    fake_ray = FakeRay()
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    driver_owner = vllm.LLMActors._from_handles(["llm-0"], "router")
+    worker_borrow = vllm.LLMActors._from_handles(["llm-0"], "router", owned=False)
+
+    worker_borrow.shutdown()
+
+    assert fake_ray.killed == []
+    assert worker_borrow.llm_actors == ["llm-0"]
+    assert worker_borrow.router_actor == "router"
+
+    driver_owner.shutdown()
+
+    assert fake_ray.killed == [("router", True), ("llm-0", True)]
 
 
 def test_udf_actor_shutdown_retains_failed_handles_for_retry(monkeypatch):

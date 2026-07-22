@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import threading
-import uuid
 from collections import deque
 
 import pytest
@@ -327,23 +326,34 @@ def test_native_finalizer_blocks_and_resumes_through_a_one_shot_callback(monkeyp
     assert not executor.invalid_wait
 
 
-def test_distributed_collection_preserves_an_explicit_named_pool():
+def test_distributed_collection_keeps_explicit_pool_names_query_scoped():
     import duckdb
 
     con = duckdb.connect()
     try:
-        pool_name = "explicit-shared-vllm-pool"
-        options = json.dumps({"use_ray": True, "ray_actor_pool_name": pool_name}, separators=(",", ":"))
-        relation = con.sql(
-            "SELECT vllm(prompt, 'model', '" + options + "') AS generated FROM (VALUES ('hello')) input(prompt)"
+        explicit_pool_name = "explicit-shared-vllm-pool"
+        options = json.dumps(
+            {"use_ray": True, "ray_actor_pool_name": explicit_pool_name},
+            separators=(",", ":"),
         )
-        plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4())).to_physical_plan(con)
 
-        nodes = plan.collect_vllm_nodes(conn=con)
+        def collect_node(query_id):
+            relation = con.sql(
+                "SELECT vllm(prompt, 'model', '" + options + "') AS generated FROM (VALUES ('hello')) input(prompt)"
+            )
+            plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, query_id).to_physical_plan(con)
+            nodes = plan.collect_vllm_nodes(conn=con)
+            assert len(nodes) == 1
+            return nodes[0]
 
-        assert len(nodes) == 1
-        assert nodes[0]["pool_name"] == pool_name
-        assert json.loads(nodes[0]["options"])["ray_actor_pool_name"] == pool_name
+        first = collect_node("query-a")
+        second = collect_node("query-b")
+
+        assert first["pool_name"] != explicit_pool_name
+        assert second["pool_name"] != explicit_pool_name
+        assert first["pool_name"] != second["pool_name"]
+        assert json.loads(first["options"])["ray_actor_pool_name"] == first["pool_name"]
+        assert json.loads(second["options"])["ray_actor_pool_name"] == second["pool_name"]
     finally:
         con.close()
 

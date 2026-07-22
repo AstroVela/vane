@@ -21,6 +21,16 @@ from typing import Any, Callable, overload
 
 import pyarrow as pa
 
+from duckdb.execution._vllm_options_protocol import (
+    _NATIVE_OPTIONS_NORMALIZED_SECRET_KEY,
+    _NATIVE_OPTIONS_PAYLOAD_VERSION,
+    _NATIVE_SECRET_PAYLOAD_KEYS,
+    _NATIVE_SECRET_PAYLOAD_VALUES_KEY,
+    _NATIVE_SECRET_PAYLOAD_VERSION_KEY,
+    _NATIVE_SECRET_REF_KEY,
+    _load_vllm_protocol_json,
+    _unpack_native_options_envelope,
+)
 from duckdb.runners.ray.ray_env import build_session_runtime_env_vars, install_explicit_session_runtime_env
 from duckdb.runners.ray.safe_get import configured_ray_get_timeout_s, resolve_object_refs_blocking
 
@@ -1964,7 +1974,7 @@ class LLMActors:
                     ray_module.kill(handle, no_restart=True)
                 except TypeError:
                     ray_module.kill(handle)
-            except Exception as exc:
+            except BaseException as exc:
                 errors.append(f"{kind} kill failed: {type(exc).__name__}: {exc}")
                 if kind == "actor":
                     remaining_actors.append(handle)
@@ -2118,6 +2128,61 @@ _DEFAULTS: dict[str, Any] = {
     "engine_init_timeout_s": None,
 }
 
+_ALLOWED_VLLM_OPTIONS = frozenset(_DEFAULTS) | {
+    "_force_background_thread",
+    _NATIVE_OPTIONS_NORMALIZED_SECRET_KEY,
+    "ray_actor_pool_name",
+    "ray_address",
+    "ray_worker_only",
+    "require_ray_worker",
+}
+
+
+def _restore_native_secret_refs(value: Any, secrets: list[Any], used: set[int], path: str) -> Any:
+    if isinstance(value, dict):
+        if _NATIVE_SECRET_REF_KEY in value:
+            if set(value) != {_NATIVE_SECRET_REF_KEY}:
+                raise ValueError(f"vllm native secret reference at {path} has unexpected fields")
+            index = value[_NATIVE_SECRET_REF_KEY]
+            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(secrets):
+                raise ValueError(f"vllm native secret reference at {path} has an invalid index")
+            if index in used:
+                raise ValueError(f"vllm native secret reference at {path} reuses index {index}")
+            used.add(index)
+            return secrets[index]
+        return {key: _restore_native_secret_refs(item, secrets, used, f"{path}.{key}") for key, item in value.items()}
+    if isinstance(value, list):
+        return [
+            _restore_native_secret_refs(item, secrets, used, f"{path}[{index}]") for index, item in enumerate(value)
+        ]
+    return value
+
+
+def _restore_native_vllm_secrets(options: dict[str, Any]) -> dict[str, Any]:
+    public_options = dict(options)
+    secret_payload = public_options.pop(_NATIVE_OPTIONS_NORMALIZED_SECRET_KEY, None)
+    if secret_payload is None:
+        return public_options
+    if not isinstance(secret_payload, bytes):
+        raise TypeError("vllm normalized secret payload must be bytes")
+
+    payload = _load_vllm_protocol_json(secret_payload, "vllm native secret payload")
+    if not isinstance(payload, dict) or set(payload) != _NATIVE_SECRET_PAYLOAD_KEYS:
+        raise ValueError("vllm native secret payload must contain only payload_version and values")
+    version = payload[_NATIVE_SECRET_PAYLOAD_VERSION_KEY]
+    if isinstance(version, bool) or not isinstance(version, int) or version != _NATIVE_OPTIONS_PAYLOAD_VERSION:
+        raise ValueError(f"unsupported vllm native secret payload version: {version!r}")
+    secrets = payload[_NATIVE_SECRET_PAYLOAD_VALUES_KEY]
+    if not isinstance(secrets, list):
+        raise ValueError("vllm native secret payload values must be a list")
+
+    used: set[int] = set()
+    restored = _restore_native_secret_refs(public_options, secrets, used, "options")
+    if used != set(range(len(secrets))):
+        raise ValueError("vllm native secret payload contains unreferenced values")
+    assert isinstance(restored, dict)
+    return restored
+
 
 def _integer_option(name: str, value: Any, *, minimum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral):
@@ -2173,10 +2238,18 @@ def normalize_options(options: Any | None) -> dict[str, Any]:
         except Exception as exc:
             raise TypeError("vllm options must be a dict or JSON string") from exc
 
+    if options is not None:
+        options = _unpack_native_options_envelope(options)
+
     if options is not None and options.get("ray_address") is not None:
         raise ValueError("vLLM ray_address has been removed; configure RayRunner instead")
 
     if options is not None:
+        unknown = sorted(
+            str(name) for name in options if not isinstance(name, str) or name not in _ALLOWED_VLLM_OPTIONS
+        )
+        if unknown:
+            raise ValueError(f"unknown vllm option(s): {', '.join(unknown)}")
         merged.update(options)
     merged["concurrency"] = _integer_option("concurrency", merged["concurrency"], minimum=1)
     merged["gpus_per_actor"] = _fractional_gpu_option(merged["gpus_per_actor"])
@@ -2269,7 +2342,7 @@ def ensure_named_vllm_pools_for_plan(
 
             # Parse options through normalize_options to get clean defaults.
             raw_opts = node.get("options")
-            opts = normalize_options(raw_opts)
+            opts = _restore_native_vllm_secrets(normalize_options(raw_opts))
 
             engine_args = _apply_engine_defaults(dict(opts.get("engine_args") or {}))
             generate_args = dict(opts.get("generate_args") or {})
@@ -2336,10 +2409,7 @@ def _apply_engine_defaults(engine_args: dict[str, Any]) -> dict[str, Any]:
 
 def build_executor(model: str, options: Any | None) -> VLLMExecutor:
     opts = normalize_options(options)
-    engine_args = _apply_engine_defaults(dict(opts["engine_args"]))
-    generate_args = dict(opts["generate_args"])
     pool_name = opts.get("ray_actor_pool_name")
-    on_error = opts.get("on_error", "raise")
     require_ray_worker = opts.get("require_ray_worker", False) or opts.get("ray_worker_only", False)
     if require_ray_worker and not _is_ray_worker():
         raise RuntimeError("vllm executor must be constructed on a Ray worker when require_ray_worker is set")
@@ -2357,11 +2427,14 @@ def build_executor(model: str, options: Any | None) -> VLLMExecutor:
                 name_prefix=pool_name,
             )
         else:
+            opts = _restore_native_vllm_secrets(opts)
+            engine_args = _apply_engine_defaults(dict(opts["engine_args"]))
+            generate_args = dict(opts["generate_args"])
             llm_actors = LLMActors(
                 model=model,
                 engine_args=engine_args,
                 generate_args=generate_args,
-                on_error=on_error,
+                on_error=opts.get("on_error", "raise"),
                 gpus_per_actor=opts["gpus_per_actor"],
                 concurrency=opts["concurrency"],
                 load_balance_threshold=opts["load_balance_threshold"],
@@ -2373,11 +2446,14 @@ def build_executor(model: str, options: Any | None) -> VLLMExecutor:
             llm_actors.shutdown()
             raise
 
+    opts = _restore_native_vllm_secrets(opts)
+    engine_args = _apply_engine_defaults(dict(opts["engine_args"]))
+    generate_args = dict(opts["generate_args"])
     return LocalVLLMExecutor(
         model,
         engine_args,
         generate_args,
-        on_error=on_error,
+        on_error=opts.get("on_error", "raise"),
         use_threading=opts["use_threading"],
         engine_init_timeout_s=opts["engine_init_timeout_s"],
         force_background_thread=opts.get("_force_background_thread", False),
