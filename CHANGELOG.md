@@ -21,6 +21,13 @@ All notable user-visible changes are documented here. Vane is currently in alpha
   Vane engine customizations as monorepo commits, so normal clones no longer
   require submodule initialization or carry DuckDB's complete commit history.
 
+### Fixed
+
+- Updated Google provider defaults from shut-down models to current ones:
+  the embedding default is now `gemini-embedding-2` (3072 dimensions) and
+  the prompt default is `gemini-3.6-flash`; the embedding dimension table
+  gained entries for the current models.
+
 ### Security
 
 - Documented the trust boundaries around Python UDFs, Ray workers, credentials, native parsers, and remote model code.
