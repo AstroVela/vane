@@ -314,5 +314,8 @@ class AnthropicPrompter:
             return None
 
         if response.content:
-            return response.content[0].text
+            return next(
+                (block.text for block in response.content if getattr(block, "type", None) == "text"),
+                None,
+            )
         return None
