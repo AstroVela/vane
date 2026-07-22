@@ -45,6 +45,7 @@ namespace duckdb {
 
 py::dict GetUDFExecutorDebugCounters();
 void ResetUDFExecutorDebugCounters();
+py::dict TestUDFFallbackResultQueue(py::object collector, idx_t slot_id, idx_t queue_capacity, idx_t submit_count);
 
 enum PySQLTokenType : uint8_t {
 	PY_SQL_TOKEN_IDENTIFIER = 0,
@@ -1163,6 +1164,7 @@ PYBIND11_MODULE(DUCKDB_PYTHON_LIB_NAME, m) { // NOLINT
 	RegisterVLLMExecutorFactory();
 	m.def("_udf_executor_debug_counters", &GetUDFExecutorDebugCounters);
 	m.def("_reset_udf_executor_debug_counters", &ResetUDFExecutorDebugCounters);
+	m.def("_test_udf_fallback_result_queue", &TestUDFFallbackResultQueue);
 	m.def("_shutdown_udf_executor_dispatcher", &ShutdownUDFExecutorDispatcher);
 	try {
 		py::module_::import("atexit").attr("register")(m.attr("_shutdown_udf_executor_dispatcher"));

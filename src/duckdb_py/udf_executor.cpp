@@ -147,6 +147,22 @@ static atomic<uint64_t> g_udf_direct_arrow_table_conversion_count {0};
 static atomic<uint64_t> g_udf_direct_output_arrow_table_conversion_count {0};
 static atomic<uint64_t> g_udf_python_export_under_client_context_lock_count {0};
 
+static py::dict MakeUDFDrainCapacity(idx_t rows, bool has_event_capacity, idx_t events, bool has_byte_capacity,
+                                     idx_t bytes, bool has_item_byte_capacity, idx_t item_bytes) {
+	py::dict result;
+	result[py::str("rows")] = py::int_(rows);
+	if (has_event_capacity) {
+		result[py::str("events")] = py::int_(events);
+	}
+	if (has_byte_capacity) {
+		result[py::str("bytes")] = py::int_(bytes);
+	}
+	if (has_item_byte_capacity) {
+		result[py::str("item_bytes")] = py::int_(item_bytes);
+	}
+	return result;
+}
+
 // Global mutex protecting ClientContext access from multiple threads.
 // DuckDB's ClientContext is NOT thread-safe.  With VANE_REPARTITION_COUNT>1,
 // multiple pipeline threads call Submit() (which reads from ClientContext),
@@ -1031,6 +1047,8 @@ struct DispatcherCommand {
 	DispatcherRefSubmitTask ref_submit_task; // only used for SUBMIT_REF_BUNDLE
 };
 
+static constexpr size_t DEFAULT_MAX_RESULT_QUEUE_PER_SLOT = 4;
+
 struct ExecutorSlot {
 	uint64_t id = 0;
 	Value payload;
@@ -1058,6 +1076,7 @@ struct ExecutorSlot {
 	// Result queue: dispatcher pushes, pipeline threads pop
 	mutex result_lock;
 	std::deque<UDFResult> result_queue;
+	size_t result_queue_capacity = DEFAULT_MAX_RESULT_QUEUE_PER_SLOT;
 
 	// Optional push consumer used by queue-driven streaming breaker sources.
 	mutex consumer_lock;
@@ -1126,12 +1145,12 @@ static ClientContext &RequireActiveSlotContext(ExecutorSlot &slot) {
 
 class GlobalPythonDispatcher {
 public:
-	static constexpr size_t MAX_RESULT_QUEUE_PER_SLOT = 4;
-
 	static GlobalPythonDispatcher &Instance() {
 		static GlobalPythonDispatcher instance;
 		return instance;
 	}
+
+	py::dict TestFallbackResultQueue(py::object collector, idx_t slot_id, idx_t queue_capacity, idx_t submit_count);
 
 	// Register a new executor slot.  Returns slot ID and stores the raw
 	// pointer in *out_slot (valid until Unregister).
@@ -1837,8 +1856,10 @@ private:
 
 	struct SlotResultCapacity {
 		idx_t rows = 0;
+		idx_t events = 0;
 		idx_t bytes = 0;
 		idx_t item_bytes = 0;
+		bool has_event_capacity = false;
 		bool has_byte_capacity = false;
 		bool has_item_byte_capacity = false;
 	};
@@ -1862,10 +1883,14 @@ private:
 		}
 		lock_guard<mutex> rg(slot.result_lock);
 		SlotResultCapacity result;
-		if (slot.result_queue.size() >= MAX_RESULT_QUEUE_PER_SLOT) {
+		// The fallback queue stores both data and terminal results. Registered
+		// streaming consumers own their control-event buffering separately.
+		result.has_event_capacity = true;
+		if (slot.result_queue.size() >= slot.result_queue_capacity) {
 			return result;
 		}
-		result.rows = static_cast<idx_t>(MAX_RESULT_QUEUE_PER_SLOT - slot.result_queue.size());
+		result.rows = static_cast<idx_t>(slot.result_queue_capacity - slot.result_queue.size());
+		result.events = result.rows;
 		return result;
 	}
 
@@ -2165,9 +2190,17 @@ private:
 		result.rows = MakeEmptyDataChunk();
 		result.submit_complete = true;
 		result.submit_id = submit_id;
+		bool queued = false;
 		{
 			lock_guard<mutex> rg(slot.result_lock);
-			slot.result_queue.push_back(std::move(result));
+			if (slot.result_queue.size() < slot.result_queue_capacity) {
+				slot.result_queue.push_back(std::move(result));
+				queued = true;
+			}
+		}
+		if (!queued) {
+			SetSlotError(slot, "terminal UDF event exceeded reserved result queue capacity");
+			return;
 		}
 		ReleaseTerminalSubmit(slot, submit_id);
 		MaybeMarkSlotFinished(slot);
@@ -2183,10 +2216,10 @@ private:
 		UDFOutputConsumer queue_consumer;
 		queue_consumer.data_capacity = [&slot]() {
 			lock_guard<mutex> rg(slot.result_lock);
-			if (slot.result_queue.size() >= MAX_RESULT_QUEUE_PER_SLOT) {
+			if (slot.result_queue.size() >= slot.result_queue_capacity) {
 				return idx_t(0);
 			}
-			return static_cast<idx_t>(MAX_RESULT_QUEUE_PER_SLOT - slot.result_queue.size());
+			return static_cast<idx_t>(slot.result_queue_capacity - slot.result_queue.size());
 		};
 		queue_consumer.accept_event = [this, &slot](UDFOutputEvent &&event) {
 			if (event.kind == UDFOutputEventKind::ERROR) {
@@ -2725,14 +2758,9 @@ private:
 					if (capacity.rows > 0) {
 						debug_capacity_positive_slots++;
 					}
-					py::dict capacity_obj;
-					capacity_obj[py::str("rows")] = py::int_(capacity.rows);
-					if (capacity.has_byte_capacity) {
-						capacity_obj[py::str("bytes")] = py::int_(capacity.bytes);
-					}
-					if (capacity.has_item_byte_capacity) {
-						capacity_obj[py::str("item_bytes")] = py::int_(capacity.item_bytes);
-					}
+					auto capacity_obj = MakeUDFDrainCapacity(
+					    capacity.rows, capacity.has_event_capacity, capacity.events, capacity.has_byte_capacity,
+					    capacity.bytes, capacity.has_item_byte_capacity, capacity.item_bytes);
 					capacities[py::int_(slot->id)] = std::move(capacity_obj);
 				}
 
@@ -3199,6 +3227,135 @@ private:
 	std::deque<std::function<void()>> deferred_wakeups;
 	unique_ptr<RegisteredObject> async_collector; // Python AsyncResultCollector
 };
+
+py::dict GlobalPythonDispatcher::TestFallbackResultQueue(py::object collector, idx_t slot_id, idx_t queue_capacity,
+                                                         idx_t submit_count) {
+	if (queue_capacity == 0) {
+		throw InvalidInputException("fallback result queue test capacity must be positive");
+	}
+	if (submit_count > static_cast<idx_t>(std::numeric_limits<int>::max())) {
+		throw InvalidInputException("fallback result queue test submit count is too large");
+	}
+
+	ExecutorSlot slot;
+	slot.id = slot_id;
+	slot.result_queue_capacity = static_cast<size_t>(queue_capacity);
+	slot.inflight_count.store(static_cast<int>(submit_count));
+
+	py::list event_capacities;
+	py::list remaining_event_capacities;
+	py::list queue_sizes;
+	py::list dequeued_events;
+	bool stalled = false;
+	constexpr idx_t MAX_DRAIN_ROUNDS = 16;
+	idx_t drain_round = 0;
+	for (; drain_round < MAX_DRAIN_ROUNDS && slot.inflight_count.load() > 0 && !slot.has_error.load(); drain_round++) {
+		auto capacity = GetSlotResultCapacity(slot);
+		if (capacity.has_event_capacity) {
+			event_capacities.append(py::int_(capacity.events));
+		} else {
+			event_capacities.append(py::none());
+		}
+		py::dict capacities;
+		capacities[py::int_(slot_id)] = MakeUDFDrainCapacity(
+		    capacity.rows, capacity.has_event_capacity, capacity.events, capacity.has_byte_capacity, capacity.bytes,
+		    capacity.has_item_byte_capacity, capacity.item_bytes);
+		auto results = collector.attr("drain_results")(std::move(capacities)).cast<py::list>();
+		if (results.empty()) {
+			stalled = true;
+			break;
+		}
+
+		for (auto &item : results) {
+			auto event = item.cast<py::tuple>();
+			const auto event_size = py::len(event);
+			if (event_size != 4 && event_size != 6) {
+				throw InvalidInputException("fallback result queue test received an invalid event tuple");
+			}
+			if (event[0].cast<idx_t>() != slot_id) {
+				throw InvalidInputException("fallback result queue test received an event for another slot");
+			}
+			auto submit_id = event[1].cast<idx_t>();
+			auto event_kind = event[2].cast<string>();
+			if (event_kind == "data") {
+				UDFResult result;
+				result.outputs = MakeEmptyDataChunk();
+				result.rows = MakeEmptyDataChunk();
+				result.submit_complete = false;
+				result.submit_id = submit_id;
+				if (!TryDeliverResult(slot, std::move(result))) {
+					SetSlotError(slot, "fallback result queue test delivery was rejected");
+				}
+			} else if (event_kind == "complete") {
+				QueueTerminalControlResult(slot, submit_id);
+			} else {
+				throw InvalidInputException("fallback result queue test received unsupported event '%s'", event_kind);
+			}
+
+			size_t queue_size = 0;
+			{
+				lock_guard<mutex> rg(slot.result_lock);
+				queue_size = slot.result_queue.size();
+			}
+			queue_sizes.append(py::int_(queue_size));
+			auto remaining_capacity = GetSlotResultCapacity(slot);
+			if (remaining_capacity.has_event_capacity) {
+				remaining_event_capacities.append(py::int_(remaining_capacity.events));
+			} else {
+				remaining_event_capacities.append(py::none());
+			}
+			if (slot.has_error.load()) {
+				break;
+			}
+		}
+		if (slot.has_error.load()) {
+			break;
+		}
+
+		UDFResult result;
+		bool has_result = false;
+		{
+			lock_guard<mutex> rg(slot.result_lock);
+			if (!slot.result_queue.empty()) {
+				result = std::move(slot.result_queue.front());
+				slot.result_queue.pop_front();
+				has_result = true;
+			}
+		}
+		if (has_result) {
+			dequeued_events.append(
+			    py::make_tuple(py::int_(result.submit_id), py::str(result.submit_complete ? "complete" : "data")));
+		}
+	}
+	if (drain_round == MAX_DRAIN_ROUNDS && slot.inflight_count.load() > 0) {
+		stalled = true;
+	}
+
+	size_t remaining_queue_size = 0;
+	{
+		lock_guard<mutex> rg(slot.result_lock);
+		remaining_queue_size = slot.result_queue.size();
+	}
+	py::object error = py::none();
+	{
+		lock_guard<mutex> eg(slot.error_lock);
+		if (slot.has_error.load()) {
+			error = py::str(slot.error);
+		}
+	}
+
+	py::dict outcome;
+	outcome[py::str("event_capacities")] = std::move(event_capacities);
+	outcome[py::str("remaining_event_capacities")] = std::move(remaining_event_capacities);
+	outcome[py::str("queue_sizes")] = std::move(queue_sizes);
+	outcome[py::str("dequeued_events")] = std::move(dequeued_events);
+	outcome[py::str("terminal_submit_count")] = py::int_(slot.terminal_submit_ids.size());
+	outcome[py::str("inflight_count")] = py::int_(slot.inflight_count.load());
+	outcome[py::str("remaining_queue_size")] = py::int_(remaining_queue_size);
+	outcome[py::str("stalled")] = py::bool_(stalled);
+	outcome[py::str("error")] = std::move(error);
+	return outcome;
+}
 
 struct CollectorOutputLeaseCallbackState {
 	mutex lock;
@@ -3761,6 +3918,15 @@ void ResetUDFExecutorDebugCounters() {
 	g_udf_direct_arrow_table_conversion_count.store(0, std::memory_order_relaxed);
 	g_udf_direct_output_arrow_table_conversion_count.store(0, std::memory_order_relaxed);
 	g_udf_python_export_under_client_context_lock_count.store(0, std::memory_order_relaxed);
+}
+
+py::dict TestUDFFallbackResultQueue(py::object collector, idx_t slot_id, idx_t queue_capacity, idx_t submit_count) {
+	const char *test_hooks = std::getenv("VANE_ENABLE_UDF_TEST_HOOKS");
+	if (!test_hooks || string(test_hooks) != "1") {
+		throw InvalidInputException("UDF test hooks are disabled");
+	}
+	return GlobalPythonDispatcher::Instance().TestFallbackResultQueue(std::move(collector), slot_id, queue_capacity,
+	                                                                  submit_count);
 }
 
 void ShutdownUDFExecutorDispatcher() {

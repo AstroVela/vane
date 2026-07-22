@@ -44,6 +44,7 @@ def _collector_debug_log(event: str, record: _StreamRecord, **fields: Any) -> No
 @dataclass(frozen=True)
 class _DrainCapacity:
     rows: int
+    events: int | None = None
     bytes: int | None = None
     item_bytes: int | None = None
 
@@ -110,7 +111,9 @@ class AsyncResultCollector:
 
     def __init__(self, *, ray_module: Any | None = None) -> None:
         if ray_module is None:
-            import ray as ray_module
+            import ray
+
+            ray_module = ray
 
         self._ray = ray_module
         self._shutdown_timeout_s = float(os.environ.get("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S", "5"))
@@ -178,8 +181,11 @@ class AsyncResultCollector:
             for slot_id, capacity in parsed.items():
                 ready = self._ready_by_slot.get(slot_id)
                 delivered_rows = 0
+                delivered_events = 0
                 delivered_bytes = 0
                 while ready:
+                    if capacity.events is not None and delivered_events >= capacity.events:
+                        break
                     event = ready[0]
                     if event.kind == "data":
                         if delivered_rows >= capacity.rows:
@@ -196,11 +202,13 @@ class AsyncResultCollector:
                         delivered_rows += 1
                         delivered_bytes += event.size_bytes
                     results.append(ready.popleft().as_tuple())
+                    delivered_events += 1
                 if ready is not None and not ready:
                     self._ready_by_slot.pop(slot_id, None)
                 remaining_bytes = None if capacity.bytes is None else max(0, capacity.bytes - delivered_bytes)
                 self._capacity_by_slot[slot_id] = _DrainCapacity(
                     rows=max(0, capacity.rows - delivered_rows),
+                    events=None if capacity.events is None else max(0, capacity.events - delivered_events),
                     bytes=remaining_bytes,
                     item_bytes=capacity.item_bytes,
                 )
@@ -362,10 +370,12 @@ class AsyncResultCollector:
             if not isinstance(raw, dict) or "rows" not in raw:
                 raise ValueError(f"invalid Ray UDF drain capacity for slot {raw_slot!r}")
             rows = max(0, int(raw["rows"]))
+            events_value = raw.get("events")
             bytes_value = raw.get("bytes")
             item_value = raw.get("item_bytes")
             parsed[int(raw_slot)] = _DrainCapacity(
                 rows=rows,
+                events=None if events_value is None else max(0, int(events_value)),
                 bytes=None if bytes_value is None else max(0, int(bytes_value)),
                 item_bytes=None if item_value is None else max(0, int(item_value)),
             )
@@ -378,15 +388,26 @@ class AsyncResultCollector:
         )
         return ready + in_progress
 
+    def _pending_event_count_locked(self, slot_id: int) -> int:
+        ready = len(self._ready_by_slot.get(slot_id, ()))
+        in_progress = sum(
+            1 for record in self._records.values() if record.slot_id == slot_id and record.phase != "block"
+        )
+        return ready + in_progress
+
     def _may_read_block_locked(self, record: _StreamRecord) -> bool:
         capacity = self._capacity_by_slot.get(record.slot_id)
         if capacity is None or capacity.rows <= 0:
+            return False
+        if capacity.events is not None and capacity.events <= 0:
             return False
         if capacity.bytes is not None and capacity.bytes <= 0:
             return False
         if capacity.item_bytes is not None and capacity.item_bytes <= 0:
             return False
-        return self._pending_data_count_locked(record.slot_id) < capacity.rows
+        if self._pending_data_count_locked(record.slot_id) >= capacity.rows:
+            return False
+        return capacity.events is None or self._pending_event_count_locked(record.slot_id) < capacity.events
 
     def _run_event_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -517,11 +538,13 @@ class AsyncResultCollector:
         with self._cv:
             if (
                 self._shutdown
+                or future is None
                 or self._records.get(key) is not record
                 or record.terminal
                 or record.completion_future is not future
             ):
                 return
+        assert future is not None
         try:
             future.result()
             record.producer_completed = True
@@ -548,11 +571,13 @@ class AsyncResultCollector:
         with self._cv:
             if (
                 self._shutdown
+                or future is None
                 or self._records.get(key) is not record
                 or record.terminal
                 or record.wait_future is not future
             ):
                 return
+        assert future is not None
         try:
             value = future.result()
             _collector_debug_log(f"ready_{kind}", record)
