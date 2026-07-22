@@ -24,9 +24,10 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 ### Fixed
 
 - Updated Google provider defaults from shut-down models to current ones:
-  the embedding default is now `gemini-embedding-2` (3072 dimensions) and
-  the prompt default is `gemini-3.6-flash`; the embedding dimension table
-  gained entries for the current models.
+  the embedding default is now `gemini-embedding-001` (stable, 3072 dimensions,
+  one embedding per input row, supports `task_type`) and the prompt default is
+  `gemini-3.6-flash`; the embedding dimension table gained entries for the
+  current models.
 
 ### Security
 

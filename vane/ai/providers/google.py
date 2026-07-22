@@ -90,9 +90,15 @@ _EMBEDDING_DIMS: dict[str, int] = {
 
 
 class GoogleProvider(Provider):
-    """Provider backed by Google Generative AI (Gemini)."""
+    """Provider backed by Google Generative AI (Gemini).
 
-    DEFAULT_EMBED_MODEL = "gemini-embedding-2"
+    Note: Google deprecates the ``temperature``, ``top_p``, and ``top_k`` sampling
+    parameters starting with Gemini 3.6 Flash and all future Gemini releases
+    (currently ignored, later HTTP 400); surfacing this to callers is tracked in
+    vane#145/vane#152.
+    """
+
+    DEFAULT_EMBED_MODEL = "gemini-embedding-001"
     DEFAULT_PROMPT_MODEL = "gemini-3.6-flash"
     _CLIENT_KEYS: ClassVar[frozenset[str]] = frozenset({"api_key"})
 
@@ -155,7 +161,7 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
 
     provider_name: str = "google"
     provider_options: dict[str, Any] = field(default_factory=dict)
-    model_name: str = "gemini-embedding-2"
+    model_name: str = "gemini-embedding-001"
     dimensions: int | None = None
     embed_options: dict[str, Any] = field(default_factory=dict)
 

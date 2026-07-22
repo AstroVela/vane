@@ -170,8 +170,10 @@ class TestGoogleProviderDefaults:
         provider = GoogleProvider(api_key="test")
         desc = provider.get_text_embedder()
 
-        # gemini-embedding-2 replaces text-embedding-004 (shut down 2026-01-14).
-        assert desc.get_model() == "gemini-embedding-2"
+        # gemini-embedding-001 replaces text-embedding-004 (shut down 2026-01-14).
+        # It is stable, embeds each input separately (one vector per row), and
+        # supports task_type, unlike gemini-embedding-2.
+        assert desc.get_model() == "gemini-embedding-001"
         # Default output dimensionality documented at 3072.
         assert desc.get_dimensions().size == 3072
 
