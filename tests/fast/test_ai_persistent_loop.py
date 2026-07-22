@@ -19,6 +19,7 @@ import asyncio
 import importlib
 import pickle
 import sys
+import threading
 import types
 
 import pyarrow as pa
@@ -406,3 +407,106 @@ class TestEmbedTextBatchPersistentLoop:
             assert restored._embedder.loop_ids[0] == id(restored._loop_runner._loop)
         finally:
             restored._loop_runner.close()
+
+
+# ---------------------------------------------------------------------------
+# Loop re-creation: stale loops are closed, cached clients are rebuilt
+# ---------------------------------------------------------------------------
+
+
+class TestLoopRecreation:
+    def test_stale_loop_is_closed_on_recreation(self) -> None:
+        runner = _PersistentLoopRunner()
+        try:
+
+            async def _noop() -> None:
+                return None
+
+            runner.run(_noop())
+            first_loop = runner._loop
+            first_thread = runner._thread
+            # Simulate a fork: the thread is gone but the loop object survives
+            # un-closed (threads never cross fork; the loop's fds do).
+            first_loop.call_soon_threadsafe(first_loop.stop)
+            first_thread.join(timeout=5.0)
+            assert not first_thread.is_alive()
+            assert not first_loop.is_closed()
+
+            runner.run(_noop())
+            assert runner._loop is not first_loop
+            assert first_loop.is_closed()
+        finally:
+            runner.close()
+
+    def test_prompter_is_rebuilt_when_loop_is_recreated(self) -> None:
+        wrapper = _PromptBatch(LoopRecordingDescriptor(), "messages", "response", None)
+        try:
+            wrapper(_messages_table(2))
+            first_prompter = wrapper._prompter
+            first_loop = wrapper._prompter_loop
+            wrapper._loop_runner.close()
+
+            out = wrapper(_messages_table(2))
+            assert out.column("response").to_pylist() == ["echo:m0", "echo:m1"]
+            assert wrapper._prompter is not first_prompter
+            assert wrapper._prompter_loop is not first_loop
+            assert wrapper._prompter.loop_ids[0] == id(wrapper._loop_runner._loop)
+        finally:
+            wrapper._loop_runner.close()
+
+    def test_embedder_is_rebuilt_when_loop_is_recreated(self) -> None:
+        wrapper = _EmbedTextBatch(AsyncEmbedderDescriptor(), "text", "embedding")
+        try:
+            wrapper(pa.table({"text": ["a"]}))
+            first_embedder = wrapper._embedder
+            wrapper._loop_runner.close()
+
+            out = wrapper(pa.table({"text": ["a"]}))
+            assert out.column("embedding").to_pylist() == [[1.0, 0.0]]
+            assert wrapper._embedder is not first_embedder
+            assert wrapper._embedder.loop_ids[0] == id(wrapper._loop_runner._loop)
+        finally:
+            wrapper._loop_runner.close()
+
+    def test_pickle_after_use_clears_cached_client(self) -> None:
+        wrapper = _PromptBatch(LoopRecordingDescriptor(), "messages", "response", None)
+        try:
+            wrapper(_messages_table(1))
+            assert wrapper._prompter is not None
+            restored = pickle.loads(pickle.dumps(wrapper))
+            try:
+                assert restored._prompter is None
+                assert restored._prompter_loop is None
+                out = restored(_messages_table(1))
+                assert out.column("response").to_pylist() == ["echo:m0"]
+            finally:
+                restored._loop_runner.close()
+        finally:
+            wrapper._loop_runner.close()
+
+    def test_close_from_the_loop_thread_does_not_raise(self) -> None:
+        runner = _PersistentLoopRunner()
+        try:
+            loop = runner._ensure_loop()
+            done = threading.Event()
+            errors: list[BaseException] = []
+
+            def _close_from_inside() -> None:
+                try:
+                    runner.close()
+                except BaseException as exc:  # noqa: BLE001 - the assertion target
+                    errors.append(exc)
+                finally:
+                    done.set()
+
+            loop.call_soon_threadsafe(_close_from_inside)
+            assert done.wait(timeout=5.0)
+            assert errors == []
+
+            # The runner recovers with a fresh loop afterwards.
+            async def _noop() -> None:
+                return None
+
+            runner.run(_noop())
+        finally:
+            runner.close()

@@ -117,25 +117,37 @@ class _PersistentLoopRunner:
 
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
         with self._lock:
-            # is_alive() also covers fork: threads do not survive into the
-            # child process, so a forked copy transparently gets a new loop.
-            if self._loop is None or self._loop.is_closed() or self._thread is None or not self._thread.is_alive():
-                loop = asyncio.new_event_loop()
-                thread = threading.Thread(target=loop.run_forever, name="vane-ai-batch-loop", daemon=True)
-                thread.start()
-                self._loop = loop
-                self._thread = thread
-            return self._loop
+            return self._ensure_loop_locked()
+
+    def _ensure_loop_locked(self) -> asyncio.AbstractEventLoop:
+        # is_alive() also covers fork: threads do not survive into the
+        # child process, so a forked copy transparently gets a new loop.
+        if self._loop is None or self._loop.is_closed() or self._thread is None or not self._thread.is_alive():
+            stale = self._loop
+            if stale is not None and not stale.is_closed():
+                # No thread runs the stale loop (dead or lost in a fork), so
+                # close it to release its selector/self-pipe descriptors.
+                stale.close()
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(target=loop.run_forever, name="vane-ai-batch-loop", daemon=True)
+            thread.start()
+            self._loop = loop
+            self._thread = thread
+        return self._loop
 
     def run(self, coro: Any) -> Any:
         """Run *coro* on the persistent loop and return its result."""
-        loop = self._ensure_loop()
-        if threading.current_thread() is self._thread:
-            close = getattr(coro, "close", None)
-            if close is not None:
-                close()
-            raise RuntimeError("_PersistentLoopRunner.run() must not be called from its own event-loop thread")
-        return asyncio.run_coroutine_threadsafe(coro, loop).result()
+        # Submit while holding the lock so a concurrent close() cannot stop
+        # the loop between loop acquisition and submission.
+        with self._lock:
+            loop = self._ensure_loop_locked()
+            if threading.current_thread() is self._thread:
+                close = getattr(coro, "close", None)
+                if close is not None:
+                    close()
+                raise RuntimeError("_PersistentLoopRunner.run() must not be called from its own event-loop thread")
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return future.result()
 
     def close(self) -> None:
         """Stop the loop thread and close the loop. Idempotent."""
@@ -150,7 +162,8 @@ class _PersistentLoopRunner:
                 loop.call_soon_threadsafe(loop.stop)
             except RuntimeError:
                 pass
-            thread.join(timeout=5.0)
+            if thread is not threading.current_thread():
+                thread.join(timeout=5.0)
         if not loop.is_closed() and (thread is None or not thread.is_alive()):
             loop.close()
 
@@ -481,14 +494,27 @@ class _EmbedTextBatch:
         # Arrow type when they already know the dimensions.
         self._arrow_type = arrow_type
         self._embedder = None  # lazy: instantiate on first __call__
+        self._embedder_loop: Any = None  # loop the cached embedder is bound to
         # Persistent loop for async embedders: the cached client must see the
         # same event loop for every batch (pickles as a fresh lazy runner).
         self._loop_runner = _PersistentLoopRunner()
 
     def _ensure_embedder(self) -> Any:
-        if self._embedder is None:
+        # Bind the cached client to the current persistent loop: if the loop
+        # was re-created (fork, close), the old client's pooled connections
+        # are stranded on the dead loop and the client must be rebuilt.
+        loop = self._loop_runner._ensure_loop()
+        if self._embedder is None or self._embedder_loop is not loop:
             self._embedder = self._descriptor.instantiate()
+            self._embedder_loop = loop
         return self._embedder
+
+    def __getstate__(self) -> dict[str, Any]:
+        # The cached client and its loop binding are process-local.
+        state = self.__dict__.copy()
+        state["_embedder"] = None
+        state["_embedder_loop"] = None
+        return state
 
     def _zero_fill(self, count: int) -> list[Any]:
         """Zero embeddings when possible; nulls when the dimension is unknowable."""
@@ -627,9 +653,27 @@ class _PromptBatch:
         self._max_retries = max_retries
         self._on_error: _OnError = on_error
         self._prompter = None  # lazy: instantiate on first __call__
+        self._prompter_loop: Any = None  # loop the cached prompter is bound to
         # Persistent loop: the cached prompter's async SDK client must see the
         # same event loop for every batch (pickles as a fresh lazy runner).
         self._loop_runner = _PersistentLoopRunner()
+
+    def _ensure_prompter(self) -> Any:
+        # Bind the cached client to the current persistent loop: if the loop
+        # was re-created (fork, close), the old client's pooled connections
+        # are stranded on the dead loop and the client must be rebuilt.
+        loop = self._loop_runner._ensure_loop()
+        if self._prompter is None or self._prompter_loop is not loop:
+            self._prompter = self._descriptor.instantiate()
+            self._prompter_loop = loop
+        return self._prompter
+
+    def __getstate__(self) -> dict[str, Any]:
+        # The cached client and its loop binding are process-local.
+        state = self.__dict__.copy()
+        state["_prompter"] = None
+        state["_prompter_loop"] = None
+        return state
 
     def _serialize_result(self, result: Any) -> str | None:
         """Convert a prompt result to a string for the output column."""
@@ -647,8 +691,7 @@ class _PromptBatch:
         return json.dumps(result, default=str)
 
     def __call__(self, table: pa.Table) -> pa.Table:
-        if self._prompter is None:
-            self._prompter = self._descriptor.instantiate()
+        self._ensure_prompter()
         texts = table.column(self._column).to_pylist()
         texts = [t if t is not None else "" for t in texts]
 
