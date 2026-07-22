@@ -169,9 +169,14 @@ class VLLMPrompterDescriptor(PrompterDescriptor):
 class VLLMPrompter:
     """Prompter that uses a vLLM ``LocalVLLMExecutor`` / ``RemoteVLLMExecutor``.
 
-    The executor is created lazily on the first call. Structured output
-    uses ``SamplingParams.structured_outputs`` and the raw JSON output is
-    parsed back into the requested schema/model.
+    The executor is created lazily on the first call and reused for the
+    prompter's lifetime — engines and Ray actor pools are expensive, so they
+    must survive across ``prompt()``/``prompt_batch()`` calls.  Because of
+    that reuse, ``finished_submitting()`` is never called per prompt call;
+    it runs once at teardown via :meth:`close` (see there for details).
+
+    Structured output uses ``SamplingParams.structured_outputs`` and the raw
+    JSON output is parsed back into the requested schema/model.
     """
 
     def __init__(
@@ -252,7 +257,11 @@ class VLLMPrompter:
 
         dummy_row = pa.table({"_": [""]})
         executor.submit(None, [formatted], dummy_row)
-        executor.finished_submitting()
+        # finished_submitting() is deliberately NOT called here: in Ray-remote
+        # mode it permanently retires this executor id on every actor, which
+        # would make any subsequent call fail (#143).  It is deferred to
+        # close().  The result wait below is woken by result arrival, not by
+        # the finished flag.
 
         result = executor.take_ready_result()
         if result is None:
@@ -271,7 +280,9 @@ class VLLMPrompter:
         prompts = [self._format_prompt(t) for t in texts]
         rows = pa.table({"_idx": list(range(len(texts)))})
         executor.submit(None, prompts, rows)
-        executor.finished_submitting()
+        # No finished_submitting() here — deferred to close(); see prompt().
+        # The drain loop below collects exactly len(texts) results, so it
+        # never needs the finished flag to terminate.
 
         results: list[tuple[Any, int]] = []
         while len(results) < len(texts):
@@ -295,3 +306,28 @@ class VLLMPrompter:
 
         results.sort(key=lambda x: x[1])
         return [r[0] for r in results]
+
+    def close(self) -> None:
+        """Tear down the cached executor.
+
+        This is the one place submission is marked finished: ``shutdown()``
+        calls ``finished_submitting()`` for the remote executor (retiring the
+        executor id on every actor and balancing the router's start/completion
+        count) and stops the local executor's engine loop.  Doing this per
+        prompt call instead would permanently finish the executor id in
+        Ray-remote mode and break every call after the first (#143).
+
+        Idempotent; also invoked from ``__del__`` when the owning UDF wrapper
+        or actor is torn down.
+        """
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.shutdown()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            # Interpreter or actor teardown — engine state is going away
+            # anyway, and destructors must not raise.
+            pass
