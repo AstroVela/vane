@@ -105,10 +105,12 @@ def _fold_sampling_param_options(options: dict[str, Any]) -> dict[str, Any]:
 
     Precedence: an entry the user set explicitly in
     ``generate_args["sampling_params"]`` wins over the top-level convenience
-    field of the same name. When ``generate_args`` or ``sampling_params`` is
-    present but not a mapping (e.g. a JSON string or a ``SamplingParams``
-    instance) and a convenience field is set, a ``TypeError`` is raised
-    rather than silently dropping the field.
+    field of the same name — even an entry explicitly set to ``None``. A
+    top-level convenience field set to ``None`` is treated as unset. When
+    ``generate_args`` or ``sampling_params`` is present but not a mapping
+    (e.g. a JSON string or a ``SamplingParams`` instance) and a convenience
+    field is set, a ``TypeError`` is raised rather than silently dropping
+    the field.
 
     Neither ``options`` nor any nested mapping is mutated; when there is
     nothing to fold the input dict is returned unchanged.
@@ -120,28 +122,18 @@ def _fold_sampling_param_options(options: dict[str, Any]) -> dict[str, Any]:
     if not convenience:
         return folded
 
-    generate_args = folded.get("generate_args")
-    if generate_args is None:
-        generate_args = {}
-    elif isinstance(generate_args, Mapping):
-        generate_args = dict(generate_args)
-    else:
+    def copy_mapping(value: Any, label: str) -> dict[str, Any]:
+        if value is None:
+            return {}
+        if isinstance(value, Mapping):
+            return dict(value)
         raise TypeError(
-            f"vllm generate_args must be a mapping to fold top-level options {sorted(convenience)}; "
-            f"got {type(generate_args).__name__}"
+            f"vllm {label} must be a mapping to fold top-level options {sorted(convenience)}; "
+            f"got {type(value).__name__} — pass these values inside generate_args['sampling_params'] instead"
         )
 
-    sampling_params = generate_args.get("sampling_params")
-    if sampling_params is None:
-        sampling_params = {}
-    elif isinstance(sampling_params, Mapping):
-        sampling_params = dict(sampling_params)
-    else:
-        raise TypeError(
-            f"vllm generate_args['sampling_params'] must be a mapping to fold top-level options "
-            f"{sorted(convenience)}; got {type(sampling_params).__name__} — "
-            "pass these values inside sampling_params instead"
-        )
+    generate_args = copy_mapping(folded.get("generate_args"), "generate_args")
+    sampling_params = copy_mapping(generate_args.get("sampling_params"), "generate_args['sampling_params']")
 
     for key, value in convenience.items():
         sampling_params.setdefault(key, value)
@@ -195,9 +187,10 @@ class VLLMPrompterDescriptor(PrompterDescriptor):
     Top-level ``max_tokens`` / ``temperature`` convenience options are folded
     into ``generate_args["sampling_params"]`` at construction — explicit
     ``sampling_params`` entries win on conflict (see
-    :func:`_fold_sampling_param_options`). Folding happens before credential
-    sealing so ``Secret`` wrappers are never compared or copied through the
-    fold.
+    :func:`_fold_sampling_param_options`). Folding runs on the raw options
+    before this descriptor's credential sealing and only touches the
+    non-sensitive sampling keys; already-sealed ``Secret`` values, if a
+    caller passes any, flow through the copies by reference untouched.
     """
 
     provider_name: str = "vllm"

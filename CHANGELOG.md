@@ -21,6 +21,15 @@ All notable user-visible changes are documented here. Vane is currently in alpha
   Vane engine customizations as monorepo commits, so normal clones no longer
   require submodule initialization or carry DuckDB's complete commit history.
 
+### Fixed
+
+- vLLM prompt options `max_tokens` and `temperature` now take effect: they are
+  folded into `generate_args["sampling_params"]` (explicit entries win), where
+  previously they were silently ignored and responses truncated at vLLM's
+  default of 16 tokens. Combining these fields with a non-mapping
+  `generate_args`/`sampling_params` now raises `TypeError` instead of silently
+  dropping them.
+
 ### Security
 
 - Documented the trust boundaries around Python UDFs, Ray workers, credentials, native parsers, and remote model code.
