@@ -11,12 +11,15 @@ import weakref
 from concurrent.futures import Future
 from types import SimpleNamespace
 
+import _duckdb
 import pytest
 
 import duckdb.execution.udf_stream_result_collector as collector_module
 from duckdb.execution.ray_stream_adapter import RayStreamAdapter, TaskLeaseObjectRefGenerator
 from duckdb.execution.udf_stream_result_collector import (
     AsyncResultCollector,
+    _OutputLeaseToken,
+    _ReadyEvent,
     _StreamRecord,
 )
 from duckdb.execution.udf_task_admission import TaskAdmission
@@ -734,6 +737,49 @@ def test_empty_stream_completion_progresses_with_zero_data_capacity():
         collector.shutdown()
 
 
+def test_native_fallback_queue_preserves_interleaved_terminal_and_data_events(monkeypatch):
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    token = _OutputLeaseToken(
+        request_id="interleaved-request",
+        lease_id="interleaved-lease",
+        driver=driver,
+        slot_id=4,
+        submit_id=42,
+        size_bytes=1,
+    )
+    monkeypatch.setenv("VANE_ENABLE_UDF_TEST_HOOKS", "1")
+    with collector._cv:
+        collector._ready_by_slot[4].extend(
+            [
+                _ReadyEvent(4, 41, "complete", None),
+                _ReadyEvent(4, 42, "data", "payload", size_bytes=1, output_token=token),
+                _ReadyEvent(4, 42, "complete", None),
+            ]
+        )
+
+    try:
+        outcome = _duckdb._test_udf_fallback_result_queue(collector, 4, 1, 2)
+
+        assert outcome["event_capacities"] == [1, 1, 1]
+        assert outcome["remaining_event_capacities"] == [0, 0, 0]
+        assert outcome["queue_sizes"] == [1, 1, 1]
+        assert outcome["dequeued_events"] == [
+            (41, "complete"),
+            (42, "data"),
+            (42, "complete"),
+        ]
+        assert outcome["terminal_submit_count"] == 2
+        assert outcome["inflight_count"] == 0
+        assert outcome["remaining_queue_size"] == 0
+        assert outcome["stalled"] is False
+        assert outcome["error"] is None
+        assert collector.slot_has_pending(4) is False
+    finally:
+        collector.shutdown()
+
+
 def test_generator_terminating_mid_pair_fails_without_fetching_block():
     fake_ray = _FakeRay()
     driver = _Driver()
@@ -849,6 +895,7 @@ def test_stream_error_wakes_dispatcher_before_generator_cancellation():
         80,
         _source(fake_ray, driver, request_id="blocking-cancel", submitter=submitter),
     )
+    record = collector._records[(8, 80)]
     try:
         deadline = time.monotonic() + 2.0
         while not driver.mark_query_task_lease_submitted.calls and time.monotonic() < deadline:
@@ -856,17 +903,19 @@ def test_stream_error_wakes_dispatcher_before_generator_cancellation():
         assert driver.mark_query_task_lease_submitted.calls
         wakeup.clear()
 
-        collector.drain_results({8: {"rows": 1, "bytes": 128, "item_bytes": 128}})
+        collector.drain_results({8: {"rows": 1, "events": 1, "bytes": 128, "item_bytes": 128}})
 
         assert fake_ray.cancel_started.wait(timeout=2.0)
         assert wakeup.is_set(), "terminal error was not published before ray.cancel"
         fake_ray.allow_cancel.set()
         events = _drain_until(
             collector,
-            {8: {"rows": 1, "bytes": 128, "item_bytes": 128}},
+            {8: {"rows": 1, "events": 1, "bytes": 128, "item_bytes": 128}},
             predicate=lambda values: any(item[2] == "error" for item in values),
         )
         assert [item[2] for item in events] == ["error"]
+        assert record.terminal is True
+        assert collector.slot_has_pending(8) is False
     finally:
         fake_ray.allow_cancel.set()
         collector.shutdown()
@@ -905,7 +954,7 @@ def test_block_larger_than_declared_item_capacity_fails_instead_of_stalling_queu
         collector.shutdown()
 
 
-def test_slot_cancellation_recursively_cancels_stream_and_releases_output_lease():
+def test_slot_cancellation_terminalizes_once_and_releases_output_lease():
     fake_ray = _FakeRay()
     driver = _Driver()
 
@@ -921,18 +970,26 @@ def test_slot_cancellation_recursively_cancels_stream_and_releases_output_lease(
         60,
         _source(fake_ray, driver, request_id="cancel-active", submitter=submitter),
     )
+    record = collector._records[(6, 60)]
     try:
         events = _drain_until(
             collector,
-            {6: {"rows": 1, "bytes": 128, "item_bytes": 128}},
+            {6: {"rows": 1, "events": 1, "bytes": 128, "item_bytes": 128}},
             predicate=lambda values: any(item[2] == "data" for item in values),
         )
         assert events[0][2] == "data"
         collector.cancel_slot(6)
+        cancel_call_count = len(fake_ray.cancel_calls)
+        release_call_count = len(driver.release_query_output_block_lease.calls)
+        collector.cancel_slot(6)
+
+        assert record.terminal is True
         assert fake_ray.cancel_calls
         assert fake_ray.cancel_calls[-1][1] == {"force": True, "recursive": True}
-        assert len(driver.release_query_output_block_lease.calls) == 1
+        assert cancel_call_count == len(fake_ray.cancel_calls) == 1
+        assert release_call_count == len(driver.release_query_output_block_lease.calls) == 1
         assert collector.slot_has_pending(6) is False
+        assert collector.drain_results({6: {"rows": 1, "events": 1}}) == []
     finally:
         collector.shutdown()
 
