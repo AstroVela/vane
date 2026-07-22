@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -129,6 +130,45 @@ class MockProvider(Provider):
         )
 
 
+class _RecordingNativeVLLMExecutor:
+    """Minimal executor used to exercise the native PhysicalVLLM bridge."""
+
+    def __init__(self) -> None:
+        self.submissions: list[tuple[str | None, tuple[str, ...]]] = []
+        self.ready = deque()
+        self.finished = False
+        self.finished_count = 0
+        self.shutdown_count = 0
+
+    def submit(self, prefix, prompts, rows) -> None:
+        prompt_values = tuple(prompts)
+        self.submissions.append((prefix, prompt_values))
+        self.ready.append(([f"generated:{prompt}" for prompt in prompt_values], rows))
+
+    def take_ready_result(self):
+        try:
+            return self.ready.popleft()
+        except IndexError:
+            return None
+
+    def finished_submitting(self) -> None:
+        self.finished = True
+        self.finished_count += 1
+
+    def all_tasks_finished(self) -> bool:
+        return self.finished and not self.ready
+
+    def wait_for_result(self) -> None:
+        pass
+
+    def register_wakeup_callback(self, _callback) -> bool:
+        return False
+
+    def shutdown(self) -> None:
+        self.finished = True
+        self.shutdown_count += 1
+
+
 def test_ai_embed_is_public_expression_api():
     assert callable(vane.ai.embed)
 
@@ -221,6 +261,160 @@ def test_ai_prompt_keeps_existing_relation_api():
     result = vane.ai.prompt(rel, "chunk", provider=MockProvider())
 
     assert result.fetchall() == [("topic:search",)]
+
+
+def test_vllm_descriptor_builds_native_options_without_mutating_inputs():
+    from vane.ai.providers.vllm import VLLMPrompterDescriptor
+
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    }
+    caller_options = {
+        "actor_number": 4,
+        "on_error": "ignore",
+        "temperature": 0.25,
+        "engine_args": {"max_model_len": 2048},
+        "generate_args": {"sampling_params": '{"max_tokens":32}'},
+    }
+    descriptor = VLLMPrompterDescriptor(
+        model_name="native-model",
+        return_format=schema,
+        vllm_options=caller_options,
+    )
+
+    native_options = descriptor.build_physical_vllm_options()
+
+    assert native_options["concurrency"] == 4
+    assert "actor_number" not in native_options
+    assert native_options["use_threading"] is True
+    assert native_options["_force_background_thread"] is True
+    assert native_options["on_error"] == "null"
+    sampling_params = native_options["generate_args"]["sampling_params"]
+    assert sampling_params["max_tokens"] == 32
+    assert sampling_params["temperature"] == 0.25
+    assert sampling_params["structured_outputs"] == {"type": "json", "value": schema}
+    assert caller_options == {
+        "actor_number": 4,
+        "on_error": "ignore",
+        "temperature": 0.25,
+        "engine_args": {"max_model_len": 2048},
+        "generate_args": {"sampling_params": '{"max_tokens":32}'},
+    }
+
+    sampling_params["max_tokens"] = 1
+    sampling_params["structured_outputs"]["value"]["required"].clear()
+    assert caller_options["generate_args"]["sampling_params"] == '{"max_tokens":32}'
+    assert schema["required"] == ["answer"]
+
+    explicit_concurrency = VLLMPrompterDescriptor(
+        vllm_options={"actor_number": 2, "concurrency": 7}
+    ).build_physical_vllm_options()
+    assert explicit_concurrency["concurrency"] == 7
+
+
+def test_ai_prompt_vllm_rejects_udf_retry_policy():
+    with pytest.raises(ValueError, match="native vLLM prompting does not support max_retries"):
+        vane.ai.prompt(
+            vane.col("chunk"),
+            provider="vllm",
+            prompt_options={"max_retries": 1},
+        )
+
+
+def test_ai_prompt_vllm_expression_plans_native_operator():
+    from vane.ai.providers.vllm import VLLMProvider
+
+    conn = vane.connect()
+    rel = conn.sql("select 'search'::VARCHAR as chunk")
+
+    expr = vane.ai.prompt(
+        vane.col("chunk"),
+        provider=VLLMProvider(),
+        model="native-model",
+        system_message="Answer briefly.",
+    ).alias("answer")
+    plan = rel.select(expr).explain()
+
+    assert "VLLM_PROJECT" in plan
+    assert "native-model" in plan
+    assert "subprocess_actor" not in plan
+    assert "ray_actor" not in plan
+
+
+def test_ai_prompt_vllm_relation_uses_one_native_lifecycle_and_preserves_columns(monkeypatch):
+    import duckdb.execution.vllm as vllm_executor
+    from vane.ai.providers.vllm import VLLMProvider
+
+    executor = _RecordingNativeVLLMExecutor()
+    captured: dict[str, object] = {}
+
+    def build_executor(model, options):
+        captured["model"] = model
+        captured["options"] = options
+        return executor
+
+    monkeypatch.setattr(vllm_executor, "build_executor", build_executor)
+    conn = vane.connect()
+    rel = conn.sql("select * from (values (1, 'question'::VARCHAR), (2, NULL::VARCHAR)) source(id, question)")
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    }
+
+    result = vane.ai.prompt(
+        rel,
+        "question",
+        provider=VLLMProvider(),
+        model="native-model",
+        system_message="Answer briefly.",
+        return_format=schema,
+        output_column="answer",
+        provider_options=vane.ai.VLLMProviderOptions(concurrency=2),
+        prompt_options={
+            "do_prefix_routing": False,
+            "generate_args": {"sampling_params": {"max_tokens": 32}},
+        },
+    )
+
+    assert result.columns == ["id", "question", "answer"]
+    assert "VLLM_PROJECT" in result.explain()
+    assert result.order("id").fetchall() == [
+        (1, "question", "generated:Answer briefly.\n\nquestion"),
+        (2, None, "generated:Answer briefly.\n\n"),
+    ]
+    assert captured["model"] == "native-model"
+    options = captured["options"]
+    assert isinstance(options, dict)
+    assert options["concurrency"] == 2
+    assert "actor_number" not in options
+    assert options["generate_args"]["sampling_params"]["structured_outputs"] == {
+        "type": "json",
+        "value": schema,
+    }
+    assert executor.finished_count == 1
+    assert executor.shutdown_count == 1
+    assert [prompt for _prefix, prompts in executor.submissions for prompt in prompts] == [
+        "Answer briefly.\n\nquestion",
+        "Answer briefly.\n\n",
+    ]
+
+
+def test_ai_prompt_native_vllm_rejects_image_columns():
+    from vane.ai.providers.vllm import VLLMProvider
+
+    conn = vane.connect()
+    rel = conn.sql("select 'question'::VARCHAR as question, 'image'::BLOB as image")
+
+    with pytest.raises(ValueError, match="native vLLM prompting does not support image_columns"):
+        vane.ai.prompt(
+            rel,
+            "question",
+            provider=VLLMProvider(),
+            image_columns=["image"],
+        )
 
 
 def test_ai_prompt_rel_keyword_matches_positional_relation_api():
@@ -390,8 +584,9 @@ def test_ai_prompt_expression_rejects_gpu_actor_on_local_runner(monkeypatch):
     rel = conn.sql("select 1 as id, 'search'::VARCHAR as chunk")
 
     with pytest.raises(duckdb.InvalidInputException, match="GPU resources require a Ray UDF backend"):
-        vane.ai.prompt(
+        expr = vane.ai.prompt(
             vane.col("chunk"),
             provider=MockProvider(),
             provider_options=vane.ai.VLLMProviderOptions(concurrency=1, gpus_per_actor=1),
         ).alias("topic")
+        rel.select(expr)
