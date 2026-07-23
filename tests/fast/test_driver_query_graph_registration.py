@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import duckdb
+from duckdb._ray_cxx import validate_plan_serialization_for_submission
 from duckdb.runners.ray.query_execution_graph import (
     ActorPlacement,
     NodeResourceAllocation,
@@ -32,6 +34,13 @@ class _FakeLogicalPlan:
         assert conn is not None
         self._events.append("physical_plan")
         return self._physical_plan
+
+
+class _ValidatingLogicalPlan(_FakeLogicalPlan):
+    def to_physical_plan(self, conn):
+        physical_plan = super().to_physical_plan(conn)
+        validate_plan_serialization_for_submission(physical_plan)
+        return physical_plan
 
 
 class _FakePhysicalPlan:
@@ -240,47 +249,33 @@ def test_driver_rolls_back_graph_and_cluster_allocation_when_actor_initializatio
     assert "plan_runner" not in events
 
 
-def test_driver_rolls_back_query_registration_when_plan_submission_serialization_fails():
+@pytest.mark.parametrize("entrypoint", ["run_plan", "run_copy_plan"])
+def test_driver_rejects_non_serializable_plan_before_query_registration(entrypoint):
     events = []
     coordinator = _FakeCoordinator(events)
     runner_cls, runner = _runner(events, coordinator)
-    query_id = "query-plan-serialization-failure"
-    physical_plan = _FakePhysicalPlan(query_id, _metadata(query_id), events)
-    serialization_error = RuntimeError("INTENTIONALLY_NON_SERIALIZABLE operator cannot be serialized")
+    query_id = f"query-plan-serialization-failure-{entrypoint}"
+    physical_plan = duckdb.ray_cxx._make_non_serializable_physical_plan_for_test(query_id)
 
-    runner._precreate_udf_actors = lambda *_args: []
+    with pytest.raises(
+        RuntimeError,
+        match=f"distributed physical plan serialization preflight failed for query_id={query_id}",
+    ) as exc_info:
+        coroutine = getattr(runner_cls, entrypoint)(runner, _ValidatingLogicalPlan(physical_plan, events))
+        asyncio.run(coroutine)
 
-    class _FailingPlanRunner:
-        def run_plan(self, _plan, _conn):
-            raise serialization_error
-
-    runner._get_plan_runner = _FailingPlanRunner
-
-    def _drop_fragments_and_release(actual_query_id):
-        events.append("fragment_drop")
-        runner_cls._release_query_resources(
-            runner,
-            actual_query_id,
-            reason="query_fragments_dropped",
-            admission_fenced=True,
-        )
-
-    runner._drop_query_fragments_sync = _drop_fragments_and_release
-
-    with pytest.raises(RuntimeError) as exc_info:
-        asyncio.run(runner_cls.run_plan(runner, _FakeLogicalPlan(physical_plan, events)))
-
-    assert exc_info.value is serialization_error
+    assert isinstance(exc_info.value.__cause__, duckdb.NotImplementedException)
+    assert "INTENTIONALLY_NON_SERIALIZABLE operator cannot be serialized" in str(exc_info.value.__cause__)
     with pytest.raises(KeyError, match="query graph is not registered"):
         get_query_resource_manager(query_id)
-    assert coordinator.released == [(query_id, 7)]
+    assert coordinator.released == []
     assert coordinator.allocations == {}
     assert runner._query_graphs == {}
     assert runner._query_allocations == {}
     assert query_id not in runner.curr_plans
     assert query_id not in runner.curr_streams
     assert query_id not in runner._plan_query_ids
-    assert "fragment_drop" in events
+    assert events == ["physical_plan"]
 
 
 def test_driver_exposes_query_task_and_output_lease_api():

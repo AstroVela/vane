@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 import duckdb
+import duckdb._ray_cxx as ray_cxx_helpers
 
 
 def _make_test_physical_plan(con=None):
@@ -39,6 +40,40 @@ def test_physical_plan_pickle_propagates_non_serializable_operator_error():
         match="INTENTIONALLY_NON_SERIALIZABLE operator cannot be serialized",
     ):
         pickle.dumps(plan)
+
+
+def test_physical_plan_submission_preflight_accepts_serializable_root():
+    plan = _make_test_physical_plan()
+
+    assert plan._validate_serializable_for_submission() is None
+
+
+def test_logical_to_physical_plan_propagates_submission_preflight_cause(monkeypatch):
+    con = duckdb.connect()
+    logical_plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        "query-preflight-wiring",
+    )
+    non_serializable_plan = duckdb.ray_cxx._make_non_serializable_physical_plan_for_test("query-preflight-wiring")
+    validate_submission = ray_cxx_helpers.validate_plan_serialization_for_submission
+
+    def validate_non_serializable_plan(_plan):
+        validate_submission(non_serializable_plan)
+
+    monkeypatch.setattr(
+        ray_cxx_helpers,
+        "validate_plan_serialization_for_submission",
+        validate_non_serializable_plan,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="distributed physical plan serialization preflight failed for query_id=query-preflight-wiring",
+    ) as exc_info:
+        logical_plan.to_physical_plan(con)
+
+    assert isinstance(exc_info.value.__cause__, duckdb.NotImplementedException)
+    assert "INTENTIONALLY_NON_SERIALIZABLE operator cannot be serialized" in str(exc_info.value.__cause__)
 
 
 @pytest.mark.parametrize("query_id", [None, ""], ids=["absent", "empty"])

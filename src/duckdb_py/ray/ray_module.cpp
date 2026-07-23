@@ -439,6 +439,10 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("collect_vllm_nodes", &PyPhysicalPlanWrapper::collect_vllm_nodes, py::arg("conn") = py::none())
 	    .def("set_udf_actor_handles", &PyPhysicalPlanWrapper::set_udf_actor_handles, py::arg("handles_map"),
 	         py::arg("conn") = py::none())
+	    .def(
+	        "_validate_serializable_for_submission",
+	        [](const PyPhysicalPlanWrapper &p) { (void)p.serialize_root_for_clone(); },
+	        "Validate the physical root before distributed query registration.")
 	    .def(py::pickle(
 	        // __getstate__: serialize the plan
 	        [](const PyPhysicalPlanWrapper &p) {
@@ -453,23 +457,9 @@ void register_ray_bindings(py::module_ &mod) {
 			                              p.connection_snapshot_);
 		        }
 
-		        auto physical_plan = p.plan_->physical_plan();
-		        duckdb::MemoryStream stream;
-		        duckdb::SerializationOptions options;
-		        options.serialization_compatibility = duckdb::SerializationCompatibility::Latest();
-		        options.serialize_default_values = true;
-		        duckdb::BinarySerializer serializer(stream, options);
-		        serializer.Begin();
-		        physical_plan->Serialize(serializer);
-		        serializer.End();
-		        auto data_size = stream.GetPosition();
-		        if (data_size == 0) {
-			        throw duckdb::InternalException(
-			            "DistributedPhysicalPlan serialized a non-empty root to an empty payload");
-		        }
-		        auto data_ptr = stream.GetData();
-		        return py::make_tuple(true, py::bytes(reinterpret_cast<const char *>(data_ptr), data_size), p.query_id_,
-		                              p.udf_registrations_, p.udf_actor_handles_, p.connection_snapshot_);
+		        auto serialized_root = p.serialize_root_for_clone();
+		        return py::make_tuple(true, py::bytes(serialized_root), p.query_id_, p.udf_registrations_,
+		                              p.udf_actor_handles_, p.connection_snapshot_);
 	        },
 	        // __setstate__: store deferred bytes for later deserialization
 	        [](py::tuple t) {

@@ -159,8 +159,11 @@ struct PyPhysicalPlanWrapper {
 		serializer.Begin();
 		physical_plan->Serialize(serializer);
 		serializer.End();
-		auto data_ptr = stream.GetData();
 		auto data_size = stream.GetPosition();
+		if (data_size == 0) {
+			throw duckdb::InternalException("DistributedPhysicalPlan serialized a non-empty root to an empty payload");
+		}
+		auto data_ptr = stream.GetData();
 		return string(reinterpret_cast<const char *>(data_ptr), data_size);
 	}
 
@@ -759,6 +762,9 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj) const
 	plan_wrapper.client_context_ = conn_wrapper.con.GetConnection().context;
 	plan_wrapper.udf_registrations_ = udf_registrations_;
 	plan_wrapper.connection_snapshot_ = connection_snapshot_;
+	auto validate_serialization =
+	    py::module_::import("duckdb._ray_cxx").attr("validate_plan_serialization_for_submission");
+	validate_serialization(py::cast(plan_wrapper));
 	RememberQueryUDFRegistrations(plan_wrapper.query_id_, plan_wrapper.udf_registrations_);
 	return plan_wrapper;
 }
