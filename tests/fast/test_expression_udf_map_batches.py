@@ -520,7 +520,7 @@ def test_vane_function_batch_streaming_output_is_sliced_before_grouped_aggregate
         def record_batch_size(table):
             return pa.table({"seen": [table.num_rows] * table.num_rows})
 
-        vane.configure(runner="local-fast")
+        vane.configure(runner="local")
         con = vane.connect()
         relation = con.sql("SELECT i::INTEGER AS x FROM range(5000) t(i)")
         expression = vane.func.batch(
@@ -555,22 +555,35 @@ def test_vane_function_batch_row_preserving_batch_size_is_backend_independent():
 
     import vane
 
-    def record_batch_size(table):
-        return pa.table({"seen": [table.num_rows] * table.num_rows})
+    old_runner = os.environ.get("VANE_RUNNER")
+    con = None
+    try:
+        vane.configure(runner="local")
 
-    vane.configure(runner="local-fast")
-    con = vane.connect()
-    relation = con.sql("SELECT i::INTEGER AS x FROM range(5000) t(i)")
-    expression = vane.func.batch(
-        record_batch_size,
-        inputs={"x": vane.col("x")},
-        schema={"seen": "BIGINT"},
-        batch_size=4096,
-        row_preserving=True,
-    )
+        def record_batch_size(table):
+            return pa.table({"seen": [table.num_rows] * table.num_rows})
 
-    result = relation.select(expression.alias("seen")).aggregate("seen, count(*) AS n").order("seen").fetchall()
-    assert result == [(904, 904), (4096, 4096)]
+        con = vane.connect()
+        relation = con.sql("SELECT i::INTEGER AS x FROM range(5000) t(i)")
+        expression = vane.func.batch(
+            record_batch_size,
+            inputs={"x": vane.col("x")},
+            schema={"seen": "BIGINT"},
+            batch_size=4096,
+            row_preserving=True,
+        )
+
+        result = relation.select(expression.alias("seen")).aggregate("seen, count(*) AS n").order("seen").fetchall()
+        assert result == [(904, 904), (4096, 4096)]
+    finally:
+        try:
+            if con is not None:
+                con.close()
+        finally:
+            if old_runner is None:
+                os.environ.pop("VANE_RUNNER", None)
+            else:
+                os.environ["VANE_RUNNER"] = old_runner
 
 
 def test_vane_function_batch_row_preserving_chain_promotes_ref_bundle_without_gpu():

@@ -47,13 +47,14 @@ assert runners.get_or_infer_runner_type() == "local"
 def test_get_or_create_runner_rejects_native_fte_env_in_subprocess():
     script = """
 import os
+import duckdb
 import duckdb.runners as runners
 
 os.environ["VANE_RUNNER"] = "native-fte"
 try:
     runners.get_or_create_runner()
-except RuntimeError as exc:
-    assert "Please use local-fast, local, or ray" in str(exc)
+except duckdb.InvalidInputException as exc:
+    assert "Please use 'local' or 'ray'" in str(exc)
 else:
     raise AssertionError("native-fte should no longer be a public runner")
 """
