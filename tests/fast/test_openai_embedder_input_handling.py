@@ -174,6 +174,29 @@ def test_inverted_limits_still_bound_each_request(monkeypatch):
     assert len(result) == 1
 
 
+def test_medium_row_between_inverted_limits_is_chunked(monkeypatch):
+    """A row estimated between batch_token_limit and input_text_token_limit must still be chunked."""
+    server = FakeEmbeddingServer(dim=4)
+    embedder = _make_embedder(
+        monkeypatch,
+        server,
+        model="custom-model",
+        input_text_token_limit=40,
+        batch_token_limit=10,
+    )
+    # 20 estimated tokens: below the input limit but above the batch limit,
+    # so sending it whole would exceed the per-request cap.
+    text = "a" * 60
+
+    result = asyncio.run(embedder.embed_text([text]))
+
+    assert len(server.requests) >= 2
+    for req in server.requests:
+        assert sum(len(t) for t in req["input"]) // 3 <= 10
+    assert "".join(t for req in server.requests for t in req["input"]) == text
+    assert len(result) == 1
+
+
 def test_oversized_average_is_float32(monkeypatch):
     server = FakeEmbeddingServer(dim=4)
     embedder = _make_embedder(
