@@ -21,13 +21,6 @@ All notable user-visible changes are documented here. Vane is currently in alpha
   Vane engine customizations as monorepo commits, so normal clones no longer
   require submodule initialization or carry DuckDB's complete commit history.
 
-### Fixed
-
-- Fixed the Anthropic prompter breaking on responses that begin with a
-  thinking block (extended-thinking models): plain-text extraction now
-  returns the first `text` content block instead of assuming `content[0]`
-  is text.
-
 ### Security
 
 - Documented the trust boundaries around Python UDFs, Ray workers, credentials, native parsers, and remote model code.
