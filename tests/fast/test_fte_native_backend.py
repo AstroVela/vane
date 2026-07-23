@@ -1661,6 +1661,8 @@ def test_native_cxx_run_copy_plan_failure_cleans_local_staging(tmp_path, monkeyp
 def test_native_cxx_run_copy_plan_preserves_worker_plan_exception_cause(tmp_path, monkeypatch):
     import _duckdb
 
+    from duckdb._ray_errors import RemoteRayException
+
     con, dst, query_id, plan = _captured_native_copy_plan(tmp_path, monkeypatch, local_staging=True)
     submission_calls = []
     dropped_queries = []
@@ -1698,6 +1700,7 @@ def test_native_cxx_run_copy_plan_preserves_worker_plan_exception_cause(tmp_path
     finally:
         con.close()
 
+    assert isinstance(exc_info.value, RemoteRayException)
     assert isinstance(exc_info.value.__cause__, duckdb.NotImplementedException)
     assert exc_info.value.__cause__.__traceback__ is not None
     assert f"copy plan lookup sentinel for {query_id}" in str(exc_info.value.__cause__)

@@ -20,6 +20,7 @@ import pytest
 
 import duckdb
 import duckdb._ray_cxx as ray_cxx_helpers
+from duckdb._ray_errors import RemoteRayException
 
 
 def _make_test_physical_plan(con=None):
@@ -72,6 +73,7 @@ def test_logical_to_physical_plan_propagates_submission_preflight_cause(monkeypa
     ) as exc_info:
         logical_plan.to_physical_plan(con)
 
+    assert isinstance(exc_info.value, RemoteRayException)
     assert isinstance(exc_info.value.__cause__, duckdb.NotImplementedException)
     assert "INTENTIONALLY_NON_SERIALIZABLE operator cannot be serialized" in str(exc_info.value.__cause__)
 
@@ -172,6 +174,7 @@ def test_worker_submission_preserves_worker_plan_exception_cause(monkeypatch, ma
         runner.drop_query_fragments(query_id)
         con.close()
 
+    assert isinstance(exc_info.value, RemoteRayException)
     assert isinstance(exc_info.value.__cause__, duckdb.NotImplementedException)
     assert exc_info.value.__cause__.__traceback__ is not None
     assert f"plan lookup sentinel for {query_id}" in str(exc_info.value.__cause__)

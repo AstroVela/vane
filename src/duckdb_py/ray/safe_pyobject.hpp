@@ -161,8 +161,12 @@ public:
 			return;
 		}
 		PythonGILWrapper gil;
-		stored.Restore();
-		py::raise_from(PyExc_RuntimeError, message.c_str());
+		auto original = stored.value.get();
+		if (stored.traceback.has_value()) {
+			original.attr("__traceback__") = stored.traceback.get();
+		}
+		auto transported = py::module_::import("duckdb._ray_errors").attr("remote_ray_exception")(message, original);
+		PyErr_SetObject(py::type::of(transported).ptr(), transported.ptr());
 		throw py::error_already_set();
 	}
 

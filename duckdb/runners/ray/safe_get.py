@@ -10,7 +10,8 @@ import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import TYPE_CHECKING, Any
 
-from duckdb.runners.common import QueryDeadlineExceeded
+from duckdb._ray_errors import restore_remote_ray_exception
+from duckdb.runners.common import QueryDeadlineExceeded as QueryDeadlineExceeded
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -146,9 +147,15 @@ def resolve_object_refs_blocking(
         raise ValueError("wait_interval_s must be positive")
 
     _reject_running_event_loop()
-    return _resolve_object_refs(
-        object_refs,
-        timeout,
-        on_wait=on_wait,
-        wait_interval_s=wait_interval_s,
-    )
+    try:
+        return _resolve_object_refs(
+            object_refs,
+            timeout,
+            on_wait=on_wait,
+            wait_interval_s=wait_interval_s,
+        )
+    except BaseException as exc:
+        restored = restore_remote_ray_exception(exc)
+        if restored is not None:
+            raise restored
+        raise

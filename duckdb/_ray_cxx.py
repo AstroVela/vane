@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from duckdb._ray_errors import remote_ray_exception
+
 _DEFAULT_HINT = "Ensure the C++ ray extension is built and importable."
 
 
@@ -29,4 +31,5 @@ def validate_plan_serialization_for_submission(plan: Any) -> None:
         validator()
     except Exception as exc:
         query_id = str(plan.idx())
-        raise RuntimeError(f"distributed physical plan serialization preflight failed for query_id={query_id}") from exc
+        message = f"distributed physical plan serialization preflight failed for query_id={query_id}"
+        raise remote_ray_exception(message, exc) from exc
