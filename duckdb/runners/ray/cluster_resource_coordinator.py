@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import threading
 import time
@@ -239,14 +240,29 @@ class ClusterQueryResourceCoordinator:
         with self._lock:
             if demand.query_id in self._queries:
                 raise ValueError(f"query already registered: {demand.query_id}")
+            previous_queries = self._queries
+            previous_next_sequence = self._next_sequence
+            previous_generation = self._generation
             state = _QueryState(
                 demand=demand,
-                sequence=self._next_sequence,
+                sequence=previous_next_sequence,
                 expires_at=timestamp + self._heartbeat_timeout_s,
             )
-            self._next_sequence += 1
-            self._queries[demand.query_id] = state
-            self._rebalance_locked()
+            staged_queries = copy.deepcopy(previous_queries)
+            staged_queries[demand.query_id] = state
+            try:
+                self._queries = staged_queries
+                self._next_sequence = previous_next_sequence + 1
+                self._rebalance_locked()
+            except BaseException:
+                # Rebalancing updates every query allocation in place. Restore
+                # the exact pre-registration objects and counters after any
+                # failure so no partial allocation, heartbeat, or lease state
+                # can escape.
+                self._queries = previous_queries
+                self._next_sequence = previous_next_sequence
+                self._generation = previous_generation
+                raise
             return state.allocation
 
     def refresh_query(

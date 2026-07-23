@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from duckdb.runners.ray import cluster_resource_coordinator as coordinator_module
 from duckdb.runners.ray.cluster_resource_coordinator import (
     ActorResourceBundle,
     ClusterQueryResourceCoordinator,
@@ -72,6 +73,20 @@ def _demand(
     )
 
 
+def _inject_failure_once(monkeypatch, target, attribute, *, fail_on_call=1):
+    original = getattr(target, attribute)
+    calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == fail_on_call:
+            raise RuntimeError(f"injected {attribute} failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(target, attribute, fail_once)
+
+
 def test_ray_capacity_uses_alive_node_resources_and_object_store_headroom():
     fake_ray = SimpleNamespace(
         nodes=lambda: [
@@ -136,6 +151,96 @@ def test_ray_capacity_never_uses_host_memory_or_cpu_fallback(monkeypatch):
     capacities = read_ray_node_capacities(fake_ray)
 
     assert capacities[0].resources == _r(cpu=2, heap=180, store=200)
+
+
+@pytest.mark.parametrize(
+    ("target_name", "attribute", "fail_on_call"),
+    [
+        pytest.param("module", "_QueryState", 1, id="state-construction"),
+        pytest.param("copy", "deepcopy", 1, id="state-staging"),
+        pytest.param("coordinator", "_rebalance_locked", 1, id="rebalance-entry"),
+        pytest.param("coordinator", "_place_bundle", 1, id="minimum-placement"),
+        pytest.param("module", "ActorPlacement", 1, id="actor-placement"),
+        pytest.param("coordinator", "_weighted_drf_extras", 1, id="fair-share"),
+        pytest.param("coordinator", "_place_divisible", 1, id="divisible-placement"),
+        pytest.param("module", "NodeResourceAllocation", 1, id="allocation-publication"),
+        pytest.param("module", "_positive_difference", 2, id="debt-publication"),
+    ],
+)
+def test_register_query_failure_is_atomic_across_rebalance_phases(
+    monkeypatch,
+    target_name,
+    attribute,
+    fail_on_call,
+):
+    coordinator = ClusterQueryResourceCoordinator(
+        (_node("n1", cpu=8, gpu=1, heap=800, store=800),),
+        heartbeat_timeout_s=10,
+    )
+    coordinator.register_query(
+        _demand(
+            "existing",
+            minimum=_r(cpu=1, heap=100, store=100),
+            desired=_r(cpu=4, heap=400, store=400),
+        ),
+        now=0,
+    )
+    before = coordinator.snapshot()
+    previous_state = coordinator._queries["existing"]
+    previous_next_sequence = coordinator._next_sequence
+
+    targets = {
+        "module": coordinator_module,
+        "copy": coordinator_module.copy,
+        "coordinator": coordinator,
+    }
+    _inject_failure_once(
+        monkeypatch,
+        targets[target_name],
+        attribute,
+        fail_on_call=fail_on_call,
+    )
+
+    actor_bundle = _r(cpu=1, gpu=1, heap=100)
+    with pytest.raises(RuntimeError, match=f"injected {attribute} failure"):
+        coordinator.register_query(
+            _demand(
+                "failed",
+                minimum=actor_bundle,
+                desired=_r(cpu=3, gpu=1, heap=300),
+                actor_bundles=(actor_bundle,),
+            ),
+            now=5,
+        )
+
+    assert coordinator.snapshot() == before
+    assert coordinator._queries["existing"] is previous_state
+    assert coordinator._next_sequence == previous_next_sequence
+
+    coordinator.register_query(
+        _demand(
+            "recovery",
+            minimum=_r(cpu=1, heap=100, store=100),
+            desired=_r(cpu=3, heap=300, store=300),
+        ),
+        now=6,
+    )
+    assert coordinator._queries["recovery"].sequence == previous_next_sequence
+    assert coordinator._next_sequence == previous_next_sequence + 1
+
+    registered = coordinator.snapshot()["queries"]
+    refreshed = coordinator.refresh_queries(
+        observed_usage_by_query={
+            "existing": _r(cpu=1, heap=100, store=100),
+            "recovery": _r(cpu=1, heap=100, store=100),
+        },
+        generations={query_id: query["allocation"]["generation"] for query_id, query in registered.items()},
+        now=7,
+    )
+    assert set(refreshed) == {"existing", "recovery"}
+    assert coordinator.expire_queries(now=16.9) == ()
+    assert coordinator.expire_queries(now=17) == ("existing", "recovery")
+    assert coordinator.snapshot()["queries"] == {}
 
 
 def test_equal_weight_queries_receive_equal_dominant_shares():
@@ -422,11 +527,14 @@ def test_refresh_queries_updates_all_usage_and_heartbeats_atomically():
         (_node("n1", cpu=8, heap=800, store=800),),
         heartbeat_timeout_s=10,
     )
-    demand = lambda query_id: _demand(
-        query_id,
-        minimum=_r(cpu=1, heap=100, store=100),
-        desired=_r(cpu=8, heap=800, store=800),
-    )
+
+    def demand(query_id):
+        return _demand(
+            query_id,
+            minimum=_r(cpu=1, heap=100, store=100),
+            desired=_r(cpu=8, heap=800, store=800),
+        )
+
     coordinator.register_query(demand("a"), now=0)
     coordinator.register_query(demand("b"), now=0)
     before = coordinator.snapshot()["queries"]
@@ -454,11 +562,14 @@ def test_refresh_queries_rejects_stale_batch_without_partial_mutation():
         (_node("n1", cpu=8, heap=800, store=800),),
         heartbeat_timeout_s=10,
     )
-    demand = lambda query_id: _demand(
-        query_id,
-        minimum=_r(cpu=1, heap=100),
-        desired=_r(cpu=8, heap=800),
-    )
+
+    def demand(query_id):
+        return _demand(
+            query_id,
+            minimum=_r(cpu=1, heap=100),
+            desired=_r(cpu=8, heap=800),
+        )
+
     coordinator.register_query(demand("a"), now=0)
     coordinator.register_query(demand("b"), now=0)
     before = coordinator.snapshot()["queries"]
