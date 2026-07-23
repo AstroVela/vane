@@ -456,17 +456,17 @@ string DuckDBPyRelation::ToSQL() {
 		// This relation is just a wrapper around a result set, can't figure out what the SQL was
 		return "";
 	}
-	unique_ptr<QueryNode> query_node;
-	{
-		D_ASSERT(py::gil_check());
-		py::gil_scoped_release release;
-		query_node = rel->TryGetSerializableQueryNode();
-	}
-	if (!query_node) {
-		// Some logical operators and binding scopes have no faithful SQL representation.
-		return "";
-	}
 	try {
+		unique_ptr<QueryNode> query_node;
+		{
+			D_ASSERT(py::gil_check());
+			py::gil_scoped_release release;
+			query_node = rel->TryGetSerializableQueryNode();
+		}
+		if (!query_node) {
+			// Some logical operators and binding scopes have no faithful SQL representation.
+			return "";
+		}
 		return query_node->ToString();
 	} catch (const std::exception &) {
 		return "";
