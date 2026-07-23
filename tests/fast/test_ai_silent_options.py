@@ -147,6 +147,21 @@ class TestConcurrencyKwarg:
         with pytest.raises(ValueError, match="actor_number must be a positive integer"):
             OpenAIPrompterDescriptor(prompt_options={"actor_number": -1}).get_udf_options()
 
+    def test_non_positive_batch_size_is_rejected(self):
+        """Python path validates like SQL (_int_or_none): positive integers only."""
+        with pytest.raises(ValueError, match="batch_size must be a positive integer"):
+            OpenAIPrompterDescriptor(prompt_options={"batch_size": 0}).get_udf_options()
+        with pytest.raises(ValueError, match="batch_size must be a positive integer"):
+            OpenAITextEmbedderDescriptor(embed_options={"batch_size": -8}).get_udf_options()
+
+    def test_explicit_positive_batch_size_still_flows(self):
+        assert OpenAIPrompterDescriptor(prompt_options={"batch_size": 16}).get_udf_options().batch_size == 16
+        assert OpenAITextEmbedderDescriptor(embed_options={"batch_size": 2}).get_udf_options().batch_size == 2
+
+    def test_batch_size_is_int_coerced_and_none_passes_through(self):
+        assert OpenAIPrompterDescriptor(prompt_options={"batch_size": 4.0}).get_udf_options().batch_size == 4
+        assert OpenAIPrompterDescriptor(prompt_options={"batch_size": None}).get_udf_options().batch_size is None
+
     def test_api_descriptors_map_concurrency_to_actor_number(self):
         assert OpenAITextEmbedderDescriptor(embed_options={"concurrency": 2}).get_udf_options().actor_number == 2
         assert OpenAIPrompterDescriptor(prompt_options={"concurrency": 3}).get_udf_options().actor_number == 3
@@ -286,6 +301,88 @@ class TestOpenAISplitOptions:
         assert set(descriptor.provider_options) == {"api_key"}
         assert descriptor.prompt_options["temperature"] == 0.3
         assert "api_key" not in descriptor.prompt_options
+
+    def test_provider_level_prompter_defaults_do_not_break_instantiate(self, monkeypatch):
+        """Descriptor-owned keys are popped from prompt_options and honored.
+
+        Leaving them in prompt_options makes ``instantiate()`` raise
+        ``TypeError: got multiple values for keyword argument`` because the
+        descriptor also passes them as named arguments.
+        """
+        client_calls: list[dict] = []
+
+        class FakeAsyncClient:
+            def __init__(self, **kwargs):
+                client_calls.append(kwargs)
+
+        monkeypatch.setitem(
+            sys.modules,
+            "openai",
+            SimpleNamespace(AsyncOpenAI=FakeAsyncClient, OpenAI=object, OpenAIError=Exception),
+        )
+        provider = OpenAIProvider(
+            api_key="k",
+            model="prov-model",
+            system_message="be brief",
+            return_format=dict,
+            use_chat_completions=False,
+        )
+
+        descriptor = provider.get_prompter()
+
+        assert descriptor.model_name == "prov-model"
+        assert descriptor.system_message == "be brief"
+        assert descriptor.return_format is dict
+        assert descriptor.use_chat_completions is False
+        for key in ("model", "system_message", "return_format", "use_chat_completions"):
+            assert key not in descriptor.prompt_options
+
+        prompter = descriptor.instantiate()  # must not raise TypeError
+        assert prompter._system_message == "be brief"
+        assert prompter._use_chat_completions is False
+        assert client_calls == [{"api_key": "k"}]
+
+    def test_call_level_prompter_arguments_win_over_provider_defaults(self):
+        provider = OpenAIProvider(
+            model="prov-model",
+            system_message="prov",
+            return_format=dict,
+            use_chat_completions=False,
+        )
+
+        descriptor = provider.get_prompter(
+            model="call-model",
+            system_message="call",
+            return_format=str,
+            use_chat_completions=True,
+        )
+
+        assert descriptor.model_name == "call-model"
+        assert descriptor.system_message == "call"
+        assert descriptor.return_format is str
+        assert descriptor.use_chat_completions is True
+        assert "model" not in descriptor.prompt_options
+
+    def test_use_chat_completions_still_defaults_to_true(self):
+        assert OpenAIProvider().get_prompter().use_chat_completions is True
+
+    def test_provider_level_embedder_defaults_are_honored(self):
+        provider = OpenAIProvider(api_key="k", model="text-embedding-3-large", dimensions=256)
+
+        descriptor = provider.get_text_embedder()
+
+        assert descriptor.model_name == "text-embedding-3-large"
+        assert descriptor.dimensions == 256
+        assert "model" not in descriptor.embed_options
+        assert "dimensions" not in descriptor.embed_options
+
+    def test_call_level_embedder_arguments_win_over_provider_defaults(self):
+        provider = OpenAIProvider(model="text-embedding-3-small", dimensions=256)
+
+        descriptor = provider.get_text_embedder(model="text-embedding-3-large", dimensions=512)
+
+        assert descriptor.model_name == "text-embedding-3-large"
+        assert descriptor.dimensions == 512
 
     def test_get_dimensions_probe_receives_only_client_kwargs(self, monkeypatch):
         probe_calls: list[dict] = []

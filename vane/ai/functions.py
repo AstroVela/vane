@@ -691,6 +691,7 @@ class _PromptBatch:
         """
         results: list[Any] = []
         for text in texts:
+            # Remote vLLM per-row resubmission relies on PR #163 deferring finished_submitting() to close().
             row = _retry_call(
                 self._prompter.prompt_batch,
                 [text],

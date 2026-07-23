@@ -55,8 +55,16 @@ def api_worker_options(options: Mapping[str, Any], *, default_batch_size: int | 
     public alias for ``actor_number``. Returns keyword arguments for
     :class:`UDFOptions`.
     """
+    batch_size = options.get("batch_size", default_batch_size)
+    if batch_size is not None:
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            # Mirror the SQL layer's validation (_int_or_none) so both surfaces
+            # reject the same values instead of silently falling back to the
+            # downstream default batch size.
+            raise ValueError("batch_size must be a positive integer")
     return {
-        "batch_size": options.get("batch_size", default_batch_size),
+        "batch_size": batch_size,
         "actor_number": actor_number_from_options(options),
         "num_gpus": options.get("num_gpus", 0),
     }

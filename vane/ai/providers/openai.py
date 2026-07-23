@@ -130,11 +130,17 @@ class OpenAIProvider(Provider):
         **options: Any,
     ) -> TextEmbedderDescriptor:
         provider_options, embed_options = self._split_options(options)
+        # Descriptor-owned keys must not stay in the request options: the
+        # descriptor already carries them as dedicated fields, so leftovers
+        # would be silently ignored (or conflict). Provider-level values act
+        # as defaults; an explicit call-level argument wins.
+        default_model = embed_options.pop("model", None)
+        default_dimensions = embed_options.pop("dimensions", None)
         return OpenAITextEmbedderDescriptor(
             provider_name=self._name,
             provider_options=provider_options,
-            model_name=model or embed_options.pop("model", self.DEFAULT_TEXT_EMBEDDER),
-            dimensions=dimensions,
+            model_name=model or default_model or self.DEFAULT_TEXT_EMBEDDER,
+            dimensions=dimensions if dimensions is not None else default_dimensions,
             embed_options=embed_options,
         )
 
@@ -143,16 +149,27 @@ class OpenAIProvider(Provider):
         model: str | None = None,
         system_message: str | None = None,
         return_format: Any | None = None,
-        use_chat_completions: bool = True,
+        use_chat_completions: bool | None = None,
         **options: Any,
     ) -> PrompterDescriptor:
         provider_options, prompt_options = self._split_options(options)
+        # Descriptor-owned keys must not stay in the request options:
+        # ``instantiate()`` passes them as named arguments alongside
+        # ``**prompt_options``, so leftovers raise ``TypeError: got multiple
+        # values for keyword argument``. Provider-level values act as
+        # defaults; an explicit call-level argument wins.
+        default_model = prompt_options.pop("model", None)
+        default_system_message = prompt_options.pop("system_message", None)
+        default_return_format = prompt_options.pop("return_format", None)
+        default_use_chat_completions = prompt_options.pop("use_chat_completions", None)
+        if use_chat_completions is None:
+            use_chat_completions = default_use_chat_completions if default_use_chat_completions is not None else True
         return OpenAIPrompterDescriptor(
             provider_name=self._name,
             provider_options=provider_options,
-            model_name=model or prompt_options.pop("model", self.DEFAULT_PROMPTER_MODEL),
-            system_message=system_message,
-            return_format=return_format,
+            model_name=model or default_model or self.DEFAULT_PROMPTER_MODEL,
+            system_message=system_message if system_message is not None else default_system_message,
+            return_format=return_format if return_format is not None else default_return_format,
             use_chat_completions=use_chat_completions,
             prompt_options=prompt_options,
         )
