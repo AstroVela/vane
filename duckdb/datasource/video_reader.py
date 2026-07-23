@@ -88,6 +88,19 @@ def _read_optional_positive_int_env(name: str) -> int | None:
     return result
 
 
+def _read_positive_int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        result = int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer >= 1, got {value!r}") from None
+    if result < 1:
+        raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
+    return result
+
+
 _VIDEO_READER_TIMING_LOG = _read_bool_env(
     "VANE_VIDEO_READER_TIMING_LOG",
     _read_bool_env("VIDEO_READER_TIMING_LOG", _read_bool_env("VIDEO_UDF_TIMING_LOG", False)),
@@ -169,7 +182,7 @@ def _emit_reader_timing(
 
 
 # Limit concurrent video decodes within a single process.
-_MAX_CONCURRENT_DECODES = int(os.environ.get("VANE_MAX_CONCURRENT_DECODES", "1"))
+_MAX_CONCURRENT_DECODES = _read_positive_int_env("VANE_MAX_CONCURRENT_DECODES", 1)
 _decode_semaphore = threading.Semaphore(_MAX_CONCURRENT_DECODES)
 
 # Memory-based backpressure: block NEW decode tasks (not mid-decode!) when
