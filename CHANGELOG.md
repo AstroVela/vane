@@ -21,13 +21,6 @@ All notable user-visible changes are documented here. Vane is currently in alpha
   Vane engine customizations as monorepo commits, so normal clones no longer
   require submodule initialization or carry DuckDB's complete commit history.
 
-### Fixed
-
-- Fixed vLLM prompting failing from the second batch on in Ray-remote mode
-  ("vllm executor is already finished"): the executor id is no longer retired
-  after every call; it is retired exactly once at prompter teardown, via an
-  explicit `close()` on the batch wrapper with `__del__` as fallback.
-
 ### Security
 
 - Documented the trust boundaries around Python UDFs, Ray workers, credentials, native parsers, and remote model code.
