@@ -1003,42 +1003,24 @@ py::object RayWorkerTask::Plan() const {
 
 	// Create PyPhysicalPlanWrapper by passing the plan via capsule
 	duckdb::PythonGILWrapper gil;
-	try {
-
-		// Import the module
-		auto ray_cxx = py::module_::import("_duckdb.ray_cxx");
-		auto task_context = task_.context();
-		py::object query_id_obj = py::none();
-		py::object udf_registrations_obj = py::none();
-		py::object udf_actor_handles_obj = py::none();
-		py::object connection_snapshot_obj = py::none();
-		auto query_id_entry = task_context.find("query_id");
-		if (query_id_entry != task_context.end() && !query_id_entry->second.empty()) {
-			query_id_obj = py::str(query_id_entry->second);
-			udf_registrations_obj = ray_cxx.attr("_lookup_query_udf_registrations")(query_id_obj);
-			udf_actor_handles_obj = ray_cxx.attr("_lookup_query_udf_actor_handles")(query_id_obj);
-			connection_snapshot_obj = ray_cxx.attr("_lookup_query_connection_snapshot")(query_id_obj);
-		} else {
-			throw duckdb::InternalException("RayWorkerTask::Plan requires non-empty task context query_id");
-		}
-
-		// Create a capsule containing the shared_ptr
-		auto *plan_copy = new std::shared_ptr<duckdb::PhysicalPlan>(plan_ref);
-		py::capsule plan_capsule(plan_copy,
-		                         [](void *ptr) { delete static_cast<std::shared_ptr<duckdb::PhysicalPlan> *>(ptr); });
-
-		// Call the Python helper to create PyPhysicalPlanWrapper from capsule
-		auto create_fn = ray_cxx.attr("_create_physical_plan_from_capsule");
-
-		auto result = create_fn(plan_capsule, query_id_obj, udf_registrations_obj, udf_actor_handles_obj,
-		                        connection_snapshot_obj);
-
-		return result;
-	} catch (const py::error_already_set &) {
-		throw;
-	} catch (const std::exception &e) {
-		return py::none();
+	auto ray_cxx = py::module_::import("_duckdb.ray_cxx");
+	auto task_context = task_.context();
+	auto query_id_entry = task_context.find("query_id");
+	if (query_id_entry == task_context.end() || query_id_entry->second.empty()) {
+		throw duckdb::InternalException("RayWorkerTask::Plan requires non-empty task context query_id");
 	}
+	py::object query_id_obj = py::str(query_id_entry->second);
+	auto udf_registrations_obj = ray_cxx.attr("_lookup_query_udf_registrations")(query_id_obj);
+	auto udf_actor_handles_obj = ray_cxx.attr("_lookup_query_udf_actor_handles")(query_id_obj);
+	auto connection_snapshot_obj = ray_cxx.attr("_lookup_query_connection_snapshot")(query_id_obj);
+
+	// The capsule owns this shared_ptr copy if any later Python or C++ step
+	// raises, so materialization errors can propagate without leaking it.
+	auto *plan_copy = new std::shared_ptr<duckdb::PhysicalPlan>(plan_ref);
+	py::capsule plan_capsule(plan_copy,
+	                         [](void *ptr) { delete static_cast<std::shared_ptr<duckdb::PhysicalPlan> *>(ptr); });
+	auto create_fn = ray_cxx.attr("_create_physical_plan_from_capsule");
+	return create_fn(plan_capsule, query_id_obj, udf_registrations_obj, udf_actor_handles_obj, connection_snapshot_obj);
 }
 
 py::dict RayWorkerTask::Inputs() const {

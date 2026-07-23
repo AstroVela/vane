@@ -3,6 +3,7 @@
 
 import json
 import os
+import pickle
 import queue
 import socket
 import socketserver
@@ -27,6 +28,34 @@ def _make_test_physical_plan(con=None):
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
+
+
+def test_physical_plan_pickle_propagates_non_serializable_operator_error():
+    plan = duckdb.ray_cxx._make_non_serializable_physical_plan_for_test("query-non-serializable")
+
+    assert plan.has_root() is True
+    with pytest.raises(
+        duckdb.NotImplementedException,
+        match="INTENTIONALLY_NON_SERIALIZABLE operator cannot be serialized",
+    ):
+        pickle.dumps(plan)
+
+
+@pytest.mark.parametrize("query_id", [None, ""], ids=["absent", "empty"])
+def test_worker_task_plan_rejects_missing_query_id(query_id):
+    task = duckdb.ray_cxx._make_worker_task_for_test(True, query_id)
+
+    with pytest.raises(
+        duckdb.InternalException,
+        match="RayWorkerTask::Plan requires non-empty task context query_id",
+    ):
+        task.plan()
+
+
+def test_worker_task_plan_keeps_absent_plan_explicit():
+    task = duckdb.ray_cxx._make_worker_task_for_test()
+
+    assert task.plan() is None
 
 
 @pytest.mark.parametrize("should_fail", [False, True], ids=["success", "failure"])

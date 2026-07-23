@@ -240,6 +240,49 @@ def test_driver_rolls_back_graph_and_cluster_allocation_when_actor_initializatio
     assert "plan_runner" not in events
 
 
+def test_driver_rolls_back_query_registration_when_plan_submission_serialization_fails():
+    events = []
+    coordinator = _FakeCoordinator(events)
+    runner_cls, runner = _runner(events, coordinator)
+    query_id = "query-plan-serialization-failure"
+    physical_plan = _FakePhysicalPlan(query_id, _metadata(query_id), events)
+    serialization_error = RuntimeError("INTENTIONALLY_NON_SERIALIZABLE operator cannot be serialized")
+
+    runner._precreate_udf_actors = lambda *_args: []
+
+    class _FailingPlanRunner:
+        def run_plan(self, _plan, _conn):
+            raise serialization_error
+
+    runner._get_plan_runner = _FailingPlanRunner
+
+    def _drop_fragments_and_release(actual_query_id):
+        events.append("fragment_drop")
+        runner_cls._release_query_resources(
+            runner,
+            actual_query_id,
+            reason="query_fragments_dropped",
+            admission_fenced=True,
+        )
+
+    runner._drop_query_fragments_sync = _drop_fragments_and_release
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(runner_cls.run_plan(runner, _FakeLogicalPlan(physical_plan, events)))
+
+    assert exc_info.value is serialization_error
+    with pytest.raises(KeyError, match="query graph is not registered"):
+        get_query_resource_manager(query_id)
+    assert coordinator.released == [(query_id, 7)]
+    assert coordinator.allocations == {}
+    assert runner._query_graphs == {}
+    assert runner._query_allocations == {}
+    assert query_id not in runner.curr_plans
+    assert query_id not in runner.curr_streams
+    assert query_id not in runner._plan_query_ids
+    assert "fragment_drop" in events
+
+
 def test_driver_exposes_query_task_and_output_lease_api():
     from duckdb.runners.ray.driver import RayQueryDriverActor
 
