@@ -398,7 +398,8 @@ class FteWorkerSubmissionMixin:
                         self._execute_fte_fragment_execution_outbox(fragment_execution)
                 except FteWorkerControlFailure as exc:
                     handles.extend(self._handles_for_fte_worker_control_failure(exc))
-                    continue
+                    should_drain_events = True
+                    break
                 if scheduled is None:
                     if pending_reservation_done_count_after > pending_reservation_done_count_before:
                         made_progress = True
