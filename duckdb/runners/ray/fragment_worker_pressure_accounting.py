@@ -14,7 +14,10 @@ from duckdb.runners.ray.fragment_worker_pressure import (
     initial_split_count,
     partition_reservation_key,
 )
-from duckdb.runners.ray.fte_fragment_scheduler import _memory_requirement_bytes
+from duckdb.runners.ray.fte_fragment_scheduler import (
+    _memory_requirement_bytes,
+    request_fte_pending_task_drain,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -178,7 +181,7 @@ class FteWorkerPressureAccountingMixin:
         except Exception:
             return
         if drain:
-            self._drain_fte_pending_tasks()
+            request_fte_pending_task_drain()
 
     def record_fte_task_result_ready(self, attempt_id: Any) -> None:
         """Stop charging worker execution pressure while task output is adopted."""

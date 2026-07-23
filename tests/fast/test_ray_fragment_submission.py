@@ -2909,7 +2909,7 @@ def test_fte_worker_reservation_completion_is_atomic_with_pending_drain(monkeypa
 
         def drain_pending():
             pending_drain_started.set()
-            return handle._drain_fte_pending_tasks()
+            return worker_handle_mod.request_fte_pending_task_drain()
 
         drain = executor.submit(drain_pending)
         assert pending_drain_started.wait(5.0)
@@ -2955,7 +2955,7 @@ def test_fte_failed_worker_reservation_blocks_concurrent_retry(monkeypatch):
     completion_thread.start()
     assert error_format_entered.wait(1.0)
     try:
-        concurrent_handles = handle._drain_fte_pending_tasks()
+        concurrent_handles = worker_handle_mod.request_fte_pending_task_drain()
         with worker_handle_mod._FTE_REGISTRY_LOCK:
             current_future = worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS.get(pending_key)
             current_generation = worker_handle_mod._FTE_WORKER_RESERVATION_GENERATIONS[pending_key]
@@ -2971,8 +2971,10 @@ def test_fte_failed_worker_reservation_blocks_concurrent_retry(monkeypatch):
     assert current_future is pending_future
     assert current_generation == pending_future.reservation_generation
     assert pending_future.done() is True
+    assert pending_key not in worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS
     assert pending_key not in worker_handle_mod._FTE_PARTITION_OWNERS
     assert pending_key not in worker_handle_mod._FTE_PARTITION_TASK_LEASES
+    assert scheduler.stats().state == "FAILED"
     assert [call[1]["task_id"]["partition_id"] for call in actor.fte_calls if call[0] == "create"] == [0]
 
 
@@ -3651,6 +3653,290 @@ def test_fte_status_refresh_drains_released_capacity_across_queries(monkeypatch)
     query_a_stage = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[("query-a", "query-a:node:8")]
     assert query_a_stage.partitions[0].finished is True
     assert [str(task_handle.task_id) for task_handle in handle.pop_fte_result_handles("query-b")] == ["query-b.0.0.0"]
+
+
+def test_fte_capacity_pump_isolates_failed_query_reservation(monkeypatch):
+    monkeypatch.setattr(
+        fragment_submission_mod,
+        "_split_exchange_source_task_by_partition",
+        lambda value: ([(int(value[-1:]), value)], 2, 2, False),
+    )
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=15, worker_id="worker-0")
+
+    def task(query_id, execution_class="STANDARD"):
+        return _FakeTask(
+            name=f"{query_id}-task-0",
+            context={
+                "query_id": query_id,
+                "node_id": "8",
+                "task_execution_class": execution_class,
+            },
+            inputs={"3": {"kind": "exchange_source_task", "data": b"p0"}},
+            plan={"plan": "exchange-template"},
+        )
+
+    query_a_handle = handle.submit_tasks([task("query-pump-a")])[0]
+    assert handle.submit_tasks([task("query-pump-b")]) == []
+    assert handle.submit_tasks([task("query-pump-c", "SPECULATIVE")]) == []
+    pending_key = ("query-pump-b", "query-pump-b:node:8", 0)
+    pending_future = worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS[pending_key]
+    pending_future.set_exception(RuntimeError("planned query-b reservation failure"))
+
+    handle.record_fte_task_terminal(query_a_handle.task_id)
+
+    query_a_scheduler = worker_handle_mod._FTE_SCHEDULERS.get("query-pump-a")
+    query_b_scheduler = worker_handle_mod._FTE_SCHEDULERS.get("query-pump-b")
+    assert query_a_scheduler is not None
+    assert query_b_scheduler is not None
+    assert query_a_scheduler.stats().state == "RUNNING"
+    assert query_b_scheduler.stats().state == "FAILED"
+    assert "planned query-b reservation failure" in str(query_b_scheduler.stats().failure_reason)
+    assert pending_key not in worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS
+    assert [str(task_handle.task_id) for task_handle in handle.pop_fte_result_handles("query-pump-c")] == [
+        "query-pump-c.0.0.0"
+    ]
+
+
+def test_fte_speculative_admission_isolates_other_query_scan_failure():
+    failed_scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create("query-scan-failure")
+    healthy_scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create("query-scan-healthy")
+
+    class _BrokenFragmentExecution:
+        @staticmethod
+        def _state_lock_owned_by_current_thread():
+            return False
+
+        @staticmethod
+        def has_pending_partitions(*_args):
+            raise RuntimeError("planned admission scan failure")
+
+    class _SpeculativePartition:
+        node_wait_started_at = None
+        execution_class = "SPECULATIVE"
+
+    worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[("query-scan-failure", "fragment-0")] = _BrokenFragmentExecution()
+
+    assert (
+        worker_handle_mod._admit_fte_partition_node_wait(
+            "query-scan-healthy",
+            _SpeculativePartition(),
+        )
+        is False
+    )
+    assert failed_scheduler.stats().state == "FAILED"
+    assert "planned admission scan failure" in str(failed_scheduler.stats().failure_reason)
+    assert healthy_scheduler.stats().state == "RUNNING"
+
+
+def test_fte_resource_waiter_scan_isolates_failed_query():
+    resource_query_id = "query-resource-scan"
+    failed_query_id = "query-resource-scan-failure"
+    healthy_query_id = "query-resource-scan-healthy"
+    failed_scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create(failed_query_id)
+    worker_handle_mod._FTE_SCHEDULERS.get_or_create(healthy_query_id)
+
+    class _FragmentExecution:
+        context = {
+            "resource_query_id": resource_query_id,
+            "resource_stage_id": f"stage:{resource_query_id}:node:8:fte",
+        }
+
+        def __init__(self, error=None):
+            self.error = error
+
+        def has_pending_partitions(self):
+            if self.error is not None:
+                raise self.error
+            return True
+
+    worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[(failed_query_id, "fragment-0")] = _FragmentExecution(
+        RuntimeError("planned resource waiter scan failure")
+    )
+    worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[(healthy_query_id, "fragment-0")] = _FragmentExecution()
+
+    assert worker_handle_mod._fte_execution_queries_waiting_for_resource(resource_query_id) == (healthy_query_id,)
+    assert failed_scheduler.stats().state == "FAILED"
+    assert "planned resource waiter scan failure" in str(failed_scheduler.stats().failure_reason)
+
+
+def test_fte_query_drop_durably_wakes_other_pending_queries(monkeypatch):
+    monkeypatch.setattr(
+        fragment_submission_mod,
+        "_split_exchange_source_task_by_partition",
+        lambda value: ([(int(value[-1:]), value)], 2, 2, False),
+    )
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=15, worker_id="worker-0")
+
+    def task(query_id):
+        return _FakeTask(
+            name=f"{query_id}-task-0",
+            context={"query_id": query_id, "node_id": "8"},
+            inputs={"3": {"kind": "exchange_source_task", "data": b"p0"}},
+            plan={"plan": "exchange-template"},
+        )
+
+    assert len(handle.submit_tasks([task("query-drop-a")])) == 1
+    assert handle.submit_tasks([task("query-drop-b")]) == []
+
+    handle.fte_drop_query("query-drop-a")
+
+    scheduled = handle.pop_fte_result_handles("query-drop-b")
+    assert [str(task_handle.task_id) for task_handle in scheduled] == ["query-drop-b.0.0.0"]
+
+
+def test_fte_capacity_pump_preserves_create_before_followup_worker_commands(monkeypatch):
+    monkeypatch.setattr(
+        fragment_submission_mod,
+        "_split_exchange_source_task_by_partition",
+        lambda value: ([(int(value[-1:]), value)], 2, 2, False),
+    )
+    create_handoff_entered = threading.Event()
+    release_create_handoff = threading.Event()
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=15, worker_id="worker-0")
+    original_execute_commands = handle._execute_fte_fragment_execution_worker_commands
+
+    def block_before_create(fragment_execution, worker_commands):
+        if fragment_execution.query_id == "query-command-order" and any(
+            command.command_type == "FteCreateTaskCommand" for command in worker_commands
+        ):
+            create_handoff_entered.set()
+            assert release_create_handoff.wait(5.0)
+        return original_execute_commands(fragment_execution, worker_commands)
+
+    monkeypatch.setattr(
+        handle,
+        "_execute_fte_fragment_execution_worker_commands",
+        block_before_create,
+    )
+
+    def task(query_id):
+        return _FakeTask(
+            name=f"{query_id}-task-0",
+            context={"query_id": query_id, "node_id": "8"},
+            inputs={"3": {"kind": "exchange_source_task", "data": b"p0"}},
+            plan={"plan": "exchange-template"},
+        )
+
+    blocker = handle.submit_tasks([task("query-command-blocker")])[0]
+    assert handle.submit_tasks([task("query-command-order")]) == []
+    release_errors = []
+
+    def release_capacity():
+        try:
+            handle.record_fte_task_terminal(blocker.task_id)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            release_errors.append(exc)
+
+    release_thread = threading.Thread(target=release_capacity)
+    release_thread.start()
+    assert create_handoff_entered.wait(1.0)
+
+    handle.task_input_stream_exhausted_for_query("query-command-order", ["3"])
+    release_create_handoff.set()
+    release_thread.join(2.0)
+
+    assert release_thread.is_alive() is False
+    assert release_errors == []
+    ordered_calls = [
+        call[0]
+        for call in actor.fte_calls
+        if (call[0] == "create" and call[1]["task_id"]["query_id"] == "query-command-order")
+        or (call[0] == "no_more_splits" and call[1]["query_id"] == "query-command-order")
+    ]
+    assert ordered_calls == ["create", "no_more_splits"]
+
+
+def test_fte_handle_publication_holds_query_lifecycle_through_watcher_registration(monkeypatch):
+    monkeypatch.setattr(
+        fragment_submission_mod,
+        "_split_exchange_source_task_by_partition",
+        lambda value: ([(int(value[-1:]), value)], 2, 2, False),
+    )
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=15, worker_id="worker-0")
+
+    def task(query_id):
+        return _FakeTask(
+            name=f"{query_id}-task-0",
+            context={"query_id": query_id, "node_id": "8"},
+            inputs={"3": {"kind": "exchange_source_task", "data": b"p0"}},
+            plan={"plan": "exchange-template"},
+        )
+
+    blocker = handle.submit_tasks([task("query-publication-blocker")])[0]
+    assert handle.submit_tasks([task("query-publication")]) == []
+    watcher_registration_entered = threading.Event()
+    release_watcher_registration = threading.Event()
+
+    def block_watcher_registration(*_args, **_kwargs):
+        watcher_registration_entered.set()
+        assert release_watcher_registration.wait(5.0)
+
+    monkeypatch.setattr(
+        handle,
+        "_start_fte_attempt_status_watcher",
+        block_watcher_registration,
+    )
+    local_drop_entered = threading.Event()
+    release_local_drop = threading.Event()
+    original_drop_registry = task_control_mod._drop_fte_registry_for_query
+
+    def block_local_registry_drop(query_id):
+        local_drop_entered.set()
+        assert release_local_drop.wait(5.0)
+        return original_drop_registry(query_id)
+
+    monkeypatch.setattr(
+        task_control_mod,
+        "_drop_fte_registry_for_query",
+        block_local_registry_drop,
+    )
+    release_errors = []
+
+    def release_capacity():
+        try:
+            handle.record_fte_task_terminal(blocker.task_id)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            release_errors.append(exc)
+
+    release_thread = threading.Thread(target=release_capacity)
+    release_thread.start()
+    assert watcher_registration_entered.wait(1.0)
+
+    drop_done = threading.Event()
+    drop_results = []
+
+    def drop_query():
+        try:
+            drop_results.append(handle.fte_drop_query("query-publication"))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            drop_results.append(exc)
+        finally:
+            drop_done.set()
+
+    drop_thread = threading.Thread(target=drop_query)
+    drop_thread.start()
+    drop_completed_before_publication = drop_done.wait(0.1)
+    release_watcher_registration.set()
+    release_thread.join(2.0)
+    try:
+        assert local_drop_entered.wait(1.0)
+        with worker_handle_mod._FTE_REGISTRY_LOCK:
+            retained_handles = list(worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY.get("query-publication", []))
+    finally:
+        release_local_drop.set()
+    drop_thread.join(2.0)
+
+    assert drop_completed_before_publication is False
+    assert release_thread.is_alive() is False
+    assert drop_thread.is_alive() is False
+    assert release_errors == []
+    assert [str(result_handle.task_id) for result_handle in retained_handles] == ["query-publication.0.0.0"]
+    assert drop_results == [{"tasks_removed": 1, "tasks_canceled": 0, "fragments_removed": 2}]
+    assert handle.pop_fte_result_handles("query-publication") == []
 
 
 def test_fte_pending_drain_prefers_standard_over_speculative(monkeypatch):
@@ -6314,7 +6600,9 @@ def test_fte_terminal_query_drop_race_still_drains_other_queries(monkeypatch):
     assert completion_thread.is_alive() is False
     assert completion_errors == []
     assert drop_result == {"tasks_removed": 1, "tasks_canceled": 0, "fragments_removed": 2}
-    assert [str(task_handle.task_id) for task_handle in completion_handles] == ["query-b.0.0.0"]
+    # Query B was admitted by the teardown-owned pump, not returned through
+    # the already-closing query A event.
+    assert completion_handles == []
     scheduled_query_b = handle.pop_fte_result_handles("query-b")
     assert [str(task_handle.task_id) for task_handle in scheduled_query_b] == ["query-b.0.0.0"]
 

@@ -78,7 +78,14 @@ class MemoryPressureDetected(FteEvent):
 
 @dataclass(frozen=True)
 class ResourceAdmissionChanged(FteEvent):
-    """Wake pending FTE reservations after query resource ownership changes."""
+    """Wake pending FTE reservations after resource ownership changes.
+
+    Internal pump pulses are deliberately excluded from user-facing event
+    progress counters.
+    """
+
+    execution_class: str | None = None
+    internal: bool = False
 
 
 @dataclass(frozen=True)

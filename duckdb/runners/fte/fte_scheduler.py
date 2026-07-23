@@ -415,16 +415,12 @@ class FteEventDrivenTaskSource:
             self.close()
 
     def close(self) -> None:
-        should_resume = False
         with self._lock:
             if self._closed:
                 return
-            should_resume = self._paused
-        if should_resume:
-            self.resume()
-        with self._lock:
-            if self._closed:
-                return
+            if self._paused:
+                self._paused = False
+                self.resume_count += 1
             self._closed = True
         self.scheduler.unregister_task_source(self.source_id, resume=False)
 
@@ -432,10 +428,8 @@ class FteEventDrivenTaskSource:
 class FteQueryScheduler:
     """Small per-query event loop facade for FTE scheduling.
 
-    The first implementation slice centralizes event ingestion and ordered
-    dispatch while existing submit/status handlers still perform the
-    concrete mutations. Later phases move those mutations behind event handlers
-    owned by this class.
+    Event handlers perform the concrete mutations, but only while this
+    scheduler owns the query's single writer slot.
     """
 
     def __init__(self, query_id: str) -> None:
@@ -457,6 +451,7 @@ class FteQueryScheduler:
         self._retry_delay_generation = 0
         self._retry_delay_timer: threading.Timer | None = None
         self._draining = False
+        self._queued_internal_admission_classes: set[str | None] = set()
         self._failed_worker_ids: set[str] = set()
         self._task_sources: dict[str, FteTaskSourceRegistration] = {}
 
@@ -510,6 +505,10 @@ class FteQueryScheduler:
         with self._lock:
             if self._state != "RUNNING" and not isinstance(event, QueryAbort):
                 return
+            if isinstance(event, ResourceAdmissionChanged) and event.internal:
+                if event.execution_class in self._queued_internal_admission_classes:
+                    return
+                self._queued_internal_admission_classes.add(event.execution_class)
             self._events.append(event)
             callbacks.extend(self._task_source_pause_callbacks_locked())
         self._run_task_source_callbacks(callbacks)
@@ -517,30 +516,42 @@ class FteQueryScheduler:
     def drain(self, handlers: FteEventHandlers | None = None) -> list[Any]:
         outputs: list[Any] = []
         with self._lock:
-            already_draining = self._draining
-            if not already_draining:
-                self._draining = True
-        if already_draining:
-            return outputs
+            if self._draining:
+                return outputs
+            self._draining = True
         try:
             while True:
+                callbacks: list[Callable[[], None]] = []
                 with self._lock:
                     if not self._events:
-                        break
-                    event = self._events.popleft()
-                    event_handlers = handlers or self._handlers
+                        # Publish idle in the same critical section as the
+                        # empty observation.  An enqueue after this point
+                        # either becomes the next drainer or is seen here.
+                        self._draining = False
+                        callbacks.extend(self._task_source_resume_callbacks_locked())
+                        event = None
+                        event_handlers = None
+                    else:
+                        event = self._events.popleft()
+                        if isinstance(event, ResourceAdmissionChanged) and event.internal:
+                            self._queued_internal_admission_classes.discard(event.execution_class)
+                        event_handlers = handlers or self._handlers
+                self._run_task_source_callbacks(callbacks)
+                if event is None:
+                    return outputs
+                assert event_handlers is not None
                 outputs.extend(self._handle_event(event, event_handlers))
-                callbacks: list[Callable[[], None]] = []
+                callbacks = []
                 with self._lock:
                     callbacks.extend(self._task_source_resume_callbacks_locked())
                 self._run_task_source_callbacks(callbacks)
-        finally:
-            callbacks: list[Callable[[], None]] = []
+        except BaseException:
+            callbacks = []
             with self._lock:
                 self._draining = False
                 callbacks.extend(self._task_source_resume_callbacks_locked())
             self._run_task_source_callbacks(callbacks)
-        return outputs
+            raise
 
     def fail(self, reason: Any = None) -> None:
         callbacks: list[Callable[[], None]] = []
@@ -550,6 +561,7 @@ class FteQueryScheduler:
             self._state = "FAILED"
             self._failure_reason = "" if reason is None else str(reason)
             self._events.clear()
+            self._queued_internal_admission_classes.clear()
             if self._retry_delay_timer is not None:
                 self._retry_delay_timer.cancel()
                 self._retry_delay_timer = None
@@ -565,6 +577,7 @@ class FteQueryScheduler:
             self._state = "CLOSED"
             self._failure_reason = None
             self._events.clear()
+            self._queued_internal_admission_classes.clear()
             self._fragment_states.clear()
             self._failed_worker_ids.clear()
             self._task_sources.clear()
@@ -684,11 +697,12 @@ class FteQueryScheduler:
         handlers: FteEventHandlers,
     ) -> list[Any]:
         event_type = event.event_type
-        with self._lock:
-            self._processed_events += 1
-            self._last_event_type = event_type
-            self._last_progress_at = time.monotonic()
-            self._event_counts[event_type] = self._event_counts.get(event_type, 0) + 1
+        if not (isinstance(event, ResourceAdmissionChanged) and event.internal):
+            with self._lock:
+                self._processed_events += 1
+                self._last_event_type = event_type
+                self._last_progress_at = time.monotonic()
+                self._event_counts[event_type] = self._event_counts.get(event_type, 0) + 1
 
         if isinstance(event, SplitEventsSubmitted):
             if handlers.on_split_events is None:
@@ -734,6 +748,7 @@ class FteQueryScheduler:
             with self._lock:
                 self._state = "ABORTED"
                 self._events.clear()
+                self._queued_internal_admission_classes.clear()
             if handlers.on_query_abort is None:
                 return []
             return list(handlers.on_query_abort(event) or [])
@@ -745,6 +760,8 @@ class FteSchedulerRegistry:
         self._lock = threading.RLock()
         self._schedulers: dict[str, FteQueryScheduler] = {}
         self._pending_drain_cursor_query_id: str | None = None
+        self._pending_drain_running = False
+        self._pending_drain_dirty = False
 
     def get_or_create(self, query_id: str) -> FteQueryScheduler:
         query_id = str(query_id or "").strip()
@@ -779,8 +796,39 @@ class FteSchedulerRegistry:
             schedulers = list(self._schedulers.values())
             self._schedulers.clear()
             self._pending_drain_cursor_query_id = None
+            self._pending_drain_dirty = False
         for scheduler in schedulers:
             scheduler.close()
+
+    def run_pending_drain(
+        self,
+        drain_round: Callable[[list[str]], list[Any]],
+    ) -> list[Any]:
+        """Run the global admission pump without entering queries directly.
+
+        Each turn delegates one quantum to every query's own scheduler.
+        Re-entrant capacity notifications only dirty the active pump; the
+        leader observes that bit before atomically publishing itself idle.
+        """
+        outputs: list[Any] = []
+        with self._lock:
+            self._pending_drain_dirty = True
+            if self._pending_drain_running:
+                return outputs
+            self._pending_drain_running = True
+        try:
+            while True:
+                with self._lock:
+                    if not self._pending_drain_dirty:
+                        self._pending_drain_running = False
+                        return outputs
+                    self._pending_drain_dirty = False
+                    query_ids = self.ordered_pending_drain_query_ids(list(self._schedulers))
+                outputs.extend(drain_round(query_ids))
+        except BaseException:
+            with self._lock:
+                self._pending_drain_running = False
+            raise
 
     def record_pending_drain_progress(self, query_id: str) -> None:
         query_id = str(query_id or "").strip()

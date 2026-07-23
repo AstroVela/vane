@@ -8,21 +8,21 @@ import sys
 import time
 from typing import TYPE_CHECKING, Any
 
+from duckdb.runners.fte import fte_status_wait_timeout_s
+from duckdb.runners.fte.fte_events import FteCreateTaskCommand
+from duckdb.runners.fte.fte_scheduler import FteAttemptStatusWatcher
 from duckdb.runners.ray.fragment_registry import (
     _FTE_CLOSING_QUERIES,
     _FTE_REGISTRY_LOCK,
     _FTE_SCHEDULERS,
     _FTE_STATUS_WATCHERS,
 )
-from duckdb.runners.fte import fte_status_wait_timeout_s
-from duckdb.runners.fte.fte_events import FteCreateTaskCommand
 from duckdb.runners.ray.fte_fragment_scheduler import (
+    _store_fte_result_handles,
     begin_fte_registry_operation,
     end_fte_registry_operation,
-    _store_fte_result_handles,
     fte_partition_task_lease_payload,
 )
-from duckdb.runners.fte.fte_scheduler import FteAttemptStatusWatcher
 
 if TYPE_CHECKING:
     from duckdb.runners.fte import FteFragmentExecution, FteTaskAttemptId
@@ -47,6 +47,13 @@ def _fte_command_debug_log(event: str, **fields: Any) -> None:
 
 
 class FteWorkerCommandMixin:
+    if TYPE_CHECKING:
+        # Supplied by the other mixins on the composed Ray worker handle.
+        _bind_fte_scheduler_handlers: Any
+        _fte_partition_owner: Any
+        _fte_task_handle_cls: Any
+        _fte_worker_placement_manager: Any
+
     def _execute_fte_fragment_execution_worker_commands(
         self,
         fragment_execution: FteFragmentExecution,
@@ -136,40 +143,59 @@ class FteWorkerCommandMixin:
         fragment_id: str,
         scheduled_attempts: list[Any],
     ) -> list[Any]:
-        with _FTE_REGISTRY_LOCK:
-            if str(query_id) in _FTE_CLOSING_QUERIES:
-                return []
-        fte_handle_cls = self._fte_task_handle_cls()
-        handles: list[Any] = []
-        watcher_requests: list[tuple[FteTaskAttemptId, Any]] = []
-        for scheduled_attempt in scheduled_attempts:
-            owner = (
-                self._fte_partition_owner(
-                    query_id,
-                    fragment_id,
-                    scheduled_attempt.attempt_id.partition_id,
+        if not scheduled_attempts:
+            return []
+        query_id = str(query_id)
+        if not begin_fte_registry_operation(query_id):
+            return []
+        try:
+            fte_handle_cls = self._fte_task_handle_cls()
+            handles: list[Any] = []
+            watcher_requests: list[tuple[FteTaskAttemptId, Any]] = []
+            for scheduled_attempt in scheduled_attempts:
+                owner = (
+                    self._fte_partition_owner(
+                        query_id,
+                        fragment_id,
+                        scheduled_attempt.attempt_id.partition_id,
+                    )
+                    or self
                 )
-                or self
+                handle = fte_handle_cls(scheduled_attempt.attempt_id, owner)
+                task_context_info = dict(scheduled_attempt.descriptor.task_context_info)
+                if (
+                    "exchange_sink_instance" not in task_context_info
+                    and scheduled_attempt.request.get("exchange_sink_instance") is not None
+                ):
+                    task_context_info["exchange_sink_instance"] = scheduled_attempt.request.get(
+                        "exchange_sink_instance"
+                    )
+                if task_context_info:
+                    handle.task_context_info = task_context_info
+                query_task_lease = scheduled_attempt.request.get("query_task_lease")
+                if not isinstance(query_task_lease, dict):
+                    raise RuntimeError(f"scheduled FTE attempt {scheduled_attempt.attempt_id} has no query task lease")
+                handle.query_task_lease = dict(query_task_lease)
+                handles.append(handle)
+                watcher_requests.append((scheduled_attempt.attempt_id, owner))
+            # Make results visible before a watcher can publish terminal
+            # status; the outer lifecycle token keeps teardown from observing
+            # this publication half-complete.
+            _store_fte_result_handles(
+                query_id,
+                handles,
+                registry_operation_owned=True,
             )
-            handle = fte_handle_cls(scheduled_attempt.attempt_id, owner)
-            task_context_info = dict(scheduled_attempt.descriptor.task_context_info)
-            if (
-                "exchange_sink_instance" not in task_context_info
-                and scheduled_attempt.request.get("exchange_sink_instance") is not None
-            ):
-                task_context_info["exchange_sink_instance"] = scheduled_attempt.request.get("exchange_sink_instance")
-            if task_context_info:
-                handle.task_context_info = task_context_info
-            query_task_lease = scheduled_attempt.request.get("query_task_lease")
-            if not isinstance(query_task_lease, dict):
-                raise RuntimeError(f"scheduled FTE attempt {scheduled_attempt.attempt_id} has no query task lease")
-            handle.query_task_lease = dict(query_task_lease)
-            handles.append(handle)
-            watcher_requests.append((scheduled_attempt.attempt_id, owner))
-        _store_fte_result_handles(query_id, handles)
-        for attempt_id, owner in watcher_requests:
-            self._start_fte_attempt_status_watcher(query_id, attempt_id, owner)
-        return handles
+            for attempt_id, owner in watcher_requests:
+                self._start_fte_attempt_status_watcher(query_id, attempt_id, owner)
+            with _FTE_REGISTRY_LOCK:
+                if query_id in _FTE_CLOSING_QUERIES:
+                    # Successful teardown owns registry removal.  Retain the
+                    # handles if remote teardown fails and must be retried.
+                    return []
+            return handles
+        finally:
+            end_fte_registry_operation(query_id)
 
     def _start_fte_attempt_status_watcher(
         self,

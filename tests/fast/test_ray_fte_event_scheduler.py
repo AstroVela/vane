@@ -5,20 +5,21 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 
 import pytest
 
 from duckdb.runners.ray.fte import FteTaskAttemptId, FteTaskId
 from duckdb.runners.ray.fte_events import (
     MemoryPressureDetected,
-    ResourceAdmissionChanged,
-    WorkerReservationCompleted,
     QueryAbort,
+    ResourceAdmissionChanged,
     RetryDelayExpired,
     SourceInputExhausted,
     SplitEventsSubmitted,
     TaskStatusChanged,
     WorkerFailed,
+    WorkerReservationCompleted,
 )
 from duckdb.runners.ray.fte_scheduler import (
     FteAttemptStatusWatcher,
@@ -151,6 +152,136 @@ def test_event_scheduler_uses_bound_handlers_by_default():
 
     assert scheduler.drain() == ["ok"]
     assert calls == [[7]]
+
+
+def test_event_scheduler_does_not_lose_enqueue_during_idle_handoff():
+    scheduler = FteQueryScheduler("query-idle-handoff")
+    processed = []
+    empty_check_released = threading.Event()
+    concurrent_drain_done = threading.Event()
+    drainer_thread_id = [None]
+
+    class _CoordinatedLock:
+        def __init__(self):
+            self._lock = threading.RLock()
+            self._arm_handoff = False
+            self._block_next_drainer_acquire = False
+
+        def __enter__(self):
+            if threading.get_ident() == drainer_thread_id[0] and self._block_next_drainer_acquire:
+                assert concurrent_drain_done.wait(5.0)
+                self._block_next_drainer_acquire = False
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self._lock.release()
+            if threading.get_ident() == drainer_thread_id[0] and self._arm_handoff:
+                self._arm_handoff = False
+                self._block_next_drainer_acquire = True
+                empty_check_released.set()
+
+    coordinated_lock = _CoordinatedLock()
+
+    class _CoordinatedQueue(deque):
+        def __bool__(self):
+            nonempty = bool(len(self))
+            if not nonempty and threading.get_ident() == drainer_thread_id[0]:
+                coordinated_lock._arm_handoff = True
+            return nonempty
+
+    scheduler._lock = coordinated_lock
+    scheduler._events = _CoordinatedQueue()
+    scheduler.set_handlers(
+        FteEventHandlers(
+            on_split_events=lambda events: processed.extend(event["value"] for event in events) or [],
+        )
+    )
+    scheduler.enqueue(
+        SplitEventsSubmitted.from_events(
+            scheduler.query_id,
+            [{"query_id": scheduler.query_id, "value": 1}],
+        )
+    )
+
+    drain_errors = []
+
+    def drain_initial_event():
+        drainer_thread_id[0] = threading.get_ident()
+        try:
+            scheduler.drain()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            drain_errors.append(exc)
+
+    drain_thread = threading.Thread(target=drain_initial_event)
+    drain_thread.start()
+    assert empty_check_released.wait(1.0)
+
+    scheduler.enqueue(
+        SplitEventsSubmitted.from_events(
+            scheduler.query_id,
+            [{"query_id": scheduler.query_id, "value": 2}],
+        )
+    )
+    scheduler.drain()
+    concurrent_drain_done.set()
+    drain_thread.join(2.0)
+
+    assert drain_thread.is_alive() is False
+    assert drain_errors == []
+    assert processed == [1, 2]
+    assert scheduler.stats().queued_events == 0
+
+
+def test_scheduler_registry_pending_drain_is_single_flight_and_durable():
+    registry = FteSchedulerRegistry()
+    registry.get_or_create("query-a")
+    registry.get_or_create("query-b")
+    calls = []
+    active_depth = 0
+    max_active_depth = 0
+
+    def drain_round(query_ids):
+        nonlocal active_depth, max_active_depth
+        active_depth += 1
+        max_active_depth = max(max_active_depth, active_depth)
+        try:
+            for query_id in query_ids:
+                calls.append(query_id)
+                if calls == ["query-a"]:
+                    assert registry.run_pending_drain(drain_round) == []
+            return []
+        finally:
+            active_depth -= 1
+
+    assert registry.run_pending_drain(drain_round) == []
+    assert calls == ["query-a", "query-b", "query-a", "query-b"]
+    assert max_active_depth == 1
+
+
+def test_event_scheduler_coalesces_pending_internal_admission_pulses():
+    scheduler = FteQueryScheduler("query-admission-pulse")
+    calls = []
+    pulse = ResourceAdmissionChanged(
+        scheduler.query_id,
+        execution_class="STANDARD",
+        internal=True,
+    )
+
+    scheduler.enqueue(pulse)
+    scheduler.enqueue(pulse)
+
+    assert scheduler.stats().queued_events == 1
+    assert (
+        scheduler.drain(
+            FteEventHandlers(
+                on_resource_admission_changed=lambda event: calls.append(event.execution_class) or [],
+            )
+        )
+        == []
+    )
+    assert calls == ["STANDARD"]
+    assert scheduler.stats().processed_events == 0
 
 
 def test_event_scheduler_pauses_and_resumes_registered_task_source():

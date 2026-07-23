@@ -59,6 +59,7 @@ from duckdb.runners.ray.fte_fragment_scheduler import (
     end_fte_registry_operation,
     ensure_fte_fragment_progress_topology,
     fte_registry_query_is_closing,
+    request_fte_pending_task_drain,
     transfer_fte_registry_operations_to_ref,
 )
 from duckdb.runners.ray.fte_scheduler_config import (
@@ -91,6 +92,8 @@ def _registered_fte_task_memory_bytes(
 
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from duckdb.runners.fte import FteSplit
 
 
@@ -122,6 +125,29 @@ def _truthy_context_flag(context: dict[str, Any], key: str) -> bool:
 
 
 class FteWorkerSubmissionMixin:
+    if TYPE_CHECKING:
+        # Supplied by the other mixins on the composed Ray worker handle.
+        _apply_fte_execution_class_transitions: Any
+        _bind_fte_scheduler_handlers: Any
+        _execute_fte_fragment_execution_mutation_result: Any
+        _execute_fte_fragment_execution_outbox: Any
+        _fragment_query_ids: Any
+        _fragment_registration_lock: Any
+        _fragment_registration_refs: Any
+        _fte_fragment_executions: Any
+        _fte_worker_placement_manager: Any
+        _handles_for_fte_scheduled_attempts: Any
+        _handles_for_fte_worker_control_failure: Any
+        _next_fte_fragment_execution_id: Any
+        _next_fte_split_sequence: Any
+        _registered_fragment_ids: Any
+        _release_deferred_fte_execution_partitions: Any
+        _request_fte_worker_reservation_for_partition: Any
+        _try_complete_fte_worker_reservation_future: Any
+        _try_reserve_fte_partition_for_node_wait: Any
+        actor_handle: Any
+        worker_id: Any
+
     def _ensure_fragment_progress_topology(
         self,
         query_id: str,
@@ -217,7 +243,7 @@ class FteWorkerSubmissionMixin:
 
         fragment_registration_result = item.get("fragment_registration_result")
 
-        def select_partition_owner(partition):
+        def select_partition_owner(partition: Any) -> Any:
             try:
                 reservation = self._fte_worker_placement_manager.acquire(
                     query_id=query_id,
@@ -245,14 +271,14 @@ class FteWorkerSubmissionMixin:
                 raise
             return reservation.worker_id, reservation.worker
 
-        def apply_execution_class_transitions(transitions):
+        def apply_execution_class_transitions(transitions: Any) -> None:
             self._apply_fte_execution_class_transitions(query_id, fragment_id, transitions)
 
-        def admit_execution(partition):
+        def admit_execution(partition: Any) -> bool:
             fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get((query_id, fragment_id))
             return _admit_fte_partition_execution_ready(query_id, fragment_execution, partition)
 
-        def admit_attempt(partition):
+        def admit_attempt(partition: Any) -> bool:
             fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get((query_id, fragment_id))
             pending_worker_reservation = pending_fte_worker_reservation_future(
                 query_id,
@@ -270,7 +296,7 @@ class FteWorkerSubmissionMixin:
                 return False
             return _admit_fte_partition_node_wait(query_id, partition, fragment_execution)
 
-        def request_worker_reservation(partition):
+        def request_worker_reservation(partition: Any) -> bool:
             fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get((query_id, fragment_id))
             if fragment_execution is None:
                 return False
@@ -320,18 +346,33 @@ class FteWorkerSubmissionMixin:
         self._fte_fragment_executions[key] = fragment_execution
         return fragment_execution
 
-    def _drain_fte_pending_tasks(self, *, query_id_filter: str | None = None) -> list[Any]:
+    def _drain_fte_pending_tasks(
+        self,
+        *,
+        query_id_filter: str | None = None,
+        max_scheduled_attempts: int | None = None,
+        execution_class_filter: FteTaskExecutionClass | str | None = None,
+    ) -> list[Any]:
+        if query_id_filter is None:
+            return request_fte_pending_task_drain()
         handles: list[Any] = []
-        if query_id_filter is not None:
-            query_id_filter = str(query_id_filter)
-            if fte_registry_query_is_closing(query_id_filter):
-                return []
+        query_id_filter = str(query_id_filter or "").strip()
+        if not query_id_filter:
+            raise ValueError("query_id_filter must be non-empty")
+        if fte_registry_query_is_closing(query_id_filter):
+            return []
+        if max_scheduled_attempts is not None:
+            max_scheduled_attempts = max(1, int(max_scheduled_attempts))
+        if execution_class_filter is not None:
+            execution_class_filter = FteTaskExecutionClass.coerce(execution_class_filter)
+        scheduled_attempt_count = 0
         fragment_execution_items = fte_fragment_execution_items(query_id_filter)
         fragment_execution_items = [
             item for item in fragment_execution_items if not fte_registry_query_is_closing(item[0][0])
         ]
 
         def schedule_execution_class(execution_class: FteTaskExecutionClass) -> tuple[bool, bool]:
+            nonlocal scheduled_attempt_count
             made_progress = False
             should_drain_events = False
             released = self._release_deferred_fte_execution_partitions(
@@ -347,6 +388,8 @@ class FteWorkerSubmissionMixin:
                 fragment_execution_items,
                 execution_class=execution_class,
             ):
+                if max_scheduled_attempts is not None and scheduled_attempt_count >= max_scheduled_attempts:
+                    break
                 try:
                     pending_reservation_done_count_before = fte_pending_worker_reservation_done_count(query_id_filter)
                     scheduled = fragment_execution.schedule_next_pending_partition(execution_class)
@@ -363,6 +406,7 @@ class FteWorkerSubmissionMixin:
                         break
                     continue
                 made_progress = True
+                scheduled_attempt_count += 1
                 handles.extend(
                     self._handles_for_fte_scheduled_attempts(
                         query_id,
@@ -375,27 +419,39 @@ class FteWorkerSubmissionMixin:
         while True:
             made_progress = False
             should_drain_events = False
-            for execution_class in (
-                FteTaskExecutionClass.EAGER_SPECULATIVE,
-                FteTaskExecutionClass.STANDARD,
-            ):
+            execution_classes = (
+                (execution_class_filter,)
+                if execution_class_filter is not None
+                else (
+                    FteTaskExecutionClass.EAGER_SPECULATIVE,
+                    FteTaskExecutionClass.STANDARD,
+                )
+            )
+            for execution_class in execution_classes:
+                if max_scheduled_attempts is not None and scheduled_attempt_count >= max_scheduled_attempts:
+                    break
                 class_progress, class_should_drain = schedule_execution_class(execution_class)
                 made_progress = class_progress or made_progress
                 should_drain_events = class_should_drain or should_drain_events
                 if should_drain_events:
                     break
-            if not should_drain_events and not _has_fte_pending_standard_partitions(fragment_execution_items):
+            if (
+                not should_drain_events
+                and execution_class_filter is None
+                and (max_scheduled_attempts is None or scheduled_attempt_count < max_scheduled_attempts)
+                and not _has_fte_pending_standard_partitions(fragment_execution_items)
+            ):
                 class_progress, class_should_drain = schedule_execution_class(FteTaskExecutionClass.SPECULATIVE)
                 made_progress = class_progress or made_progress
                 should_drain_events = class_should_drain or should_drain_events
             if should_drain_events:
                 break
+            if max_scheduled_attempts is not None and scheduled_attempt_count >= max_scheduled_attempts:
+                break
             if not made_progress:
                 break
-        for query_id in sorted({query_id for (query_id, _), _ in fragment_execution_items}):
-            scheduler = _FTE_SCHEDULERS.get(query_id)
-            if scheduler is not None and not scheduler.is_draining():
-                handles.extend(scheduler.drain())
+        if scheduled_attempt_count:
+            handles.extend(request_fte_pending_task_drain())
         return order_fte_scheduled_handles(handles)
 
     def _submit_fte_pending_tasks_via_scheduler(
@@ -437,7 +493,7 @@ class FteWorkerSubmissionMixin:
                     query_id: str = query_id,
                     query_pending: list[dict[str, Any]] = query_pending,
                     chunk_size: int = chunk_size,
-                ):
+                ) -> Iterator[SplitEventsSubmitted]:
                     for offset in range(0, len(query_pending), chunk_size):
                         yield SplitEventsSubmitted.from_events(
                             query_id,
@@ -790,7 +846,7 @@ class FteWorkerSubmissionMixin:
         )
         return handles
 
-    def submit_tasks(self, tasks: list[RayWorkerTask]) -> list[Any]:
+    def submit_tasks(self, tasks: list[Any]) -> list[Any]:
         started_at = time.monotonic()
         _fte_submission_debug_log("submit_tasks_start", task_count=len(tasks))
         if not tasks:
