@@ -160,6 +160,206 @@ assert runners.get_or_infer_runner_type() == "local"
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
+def test_concurrent_runner_initialization_does_not_deadlock_on_gil():
+    script = r"""
+import faulthandler
+import os
+import sys
+import threading
+
+sys.setswitchinterval(1000.0)
+faulthandler.dump_traceback_later(5.0, repeat=False)
+
+import duckdb
+import duckdb.runners.local.runner as local_runner_module
+
+vane_runners = duckdb.vane_runners_cpp
+vane_runners.teardown_runner()
+os.environ["VANE_RUNNER"] = "local"
+
+barrier = threading.Barrier(2)
+initializer_entered = threading.Event()
+constructor_calls = []
+results = []
+errors = []
+
+
+class BlockingLocalRunner:
+    name = "local"
+
+    def __init__(self, **_kwargs):
+        constructor_calls.append(None)
+        initializer_entered.set()
+        # The first initializer releases the GIL here. The second thread is
+        # already holding the GIL when it returns from the same barrier and
+        # immediately enters the compiled runner binding.
+        barrier.wait(timeout=5.0)
+
+
+local_runner_module.LocalRunner = BlockingLocalRunner
+
+
+def initialize():
+    try:
+        results.append(vane_runners.get_or_create_runner())
+    except BaseException as exc:
+        errors.append(exc)
+
+
+def contend():
+    try:
+        barrier.wait(timeout=5.0)
+        results.append(vane_runners.get_or_create_runner())
+    except BaseException as exc:
+        errors.append(exc)
+
+
+initializer = threading.Thread(target=initialize, daemon=True, name="runner-initializer")
+initializer.start()
+assert initializer_entered.wait(timeout=5.0)
+
+waiter = threading.Thread(target=contend, daemon=True, name="runner-waiter")
+waiter.start()
+
+initializer.join(timeout=5.0)
+waiter.join(timeout=5.0)
+faulthandler.cancel_dump_traceback_later()
+
+assert not initializer.is_alive()
+assert not waiter.is_alive()
+assert errors == []
+assert len(constructor_calls) == 1
+assert len(results) == 2
+assert results[0] is results[1]
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=10)
+
+
+def test_failed_runner_initialization_is_not_published_and_can_retry():
+    script = r"""
+import os
+
+import duckdb
+import duckdb.runners.local.runner as local_runner_module
+
+vane_runners = duckdb.vane_runners_cpp
+vane_runners.teardown_runner()
+os.environ["VANE_RUNNER"] = "local"
+attempts = 0
+
+
+class FlakyLocalRunner:
+    name = "local"
+
+    def __init__(self, **_kwargs):
+        global attempts
+        attempts += 1
+        self.ready = False
+        if attempts == 1:
+            raise RuntimeError("forced runner initialization failure")
+        self.ready = True
+
+
+local_runner_module.LocalRunner = FlakyLocalRunner
+
+try:
+    vane_runners.get_or_create_runner()
+except RuntimeError as exc:
+    assert "forced runner initialization failure" in str(exc)
+else:
+    raise AssertionError("the first runner initialization should fail")
+
+assert vane_runners.get_runner() is None
+
+runner = vane_runners.get_or_create_runner()
+assert attempts == 2
+assert runner.ready is True
+assert vane_runners.get_runner() is runner
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=10)
+
+
+def test_failed_runner_initialization_wakes_waiter_to_retry():
+    script = r"""
+import faulthandler
+import os
+import sys
+import threading
+
+sys.setswitchinterval(1000.0)
+faulthandler.dump_traceback_later(5.0, repeat=False)
+
+import duckdb
+import duckdb.runners.local.runner as local_runner_module
+
+vane_runners = duckdb.vane_runners_cpp
+vane_runners.teardown_runner()
+os.environ["VANE_RUNNER"] = "local"
+
+barrier = threading.Barrier(2)
+initializer_entered = threading.Event()
+attempts = 0
+results = []
+expected_errors = []
+unexpected_errors = []
+
+
+class FailOnceLocalRunner:
+    name = "local"
+
+    def __init__(self, **_kwargs):
+        global attempts
+        attempts += 1
+        if attempts == 1:
+            initializer_entered.set()
+            barrier.wait(timeout=5.0)
+            raise RuntimeError("first attempt failed")
+        self.ready = True
+
+
+local_runner_module.LocalRunner = FailOnceLocalRunner
+
+
+def initialize():
+    try:
+        vane_runners.get_or_create_runner()
+    except RuntimeError as exc:
+        expected_errors.append(str(exc))
+    except BaseException as exc:
+        unexpected_errors.append(exc)
+
+
+def retry():
+    try:
+        barrier.wait(timeout=5.0)
+        results.append(vane_runners.get_or_create_runner())
+    except BaseException as exc:
+        unexpected_errors.append(exc)
+
+
+initializer = threading.Thread(target=initialize, daemon=True, name="failing-initializer")
+initializer.start()
+assert initializer_entered.wait(timeout=5.0)
+
+waiter = threading.Thread(target=retry, daemon=True, name="retrying-waiter")
+waiter.start()
+
+initializer.join(timeout=5.0)
+waiter.join(timeout=5.0)
+faulthandler.cancel_dump_traceback_later()
+
+assert not initializer.is_alive()
+assert not waiter.is_alive()
+assert expected_errors == ["first attempt failed"]
+assert unexpected_errors == []
+assert attempts == 2
+assert len(results) == 1
+assert results[0].ready is True
+assert vane_runners.get_runner() is results[0]
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=10)
+
+
 def test_ray_noop_does_not_reuse_local_runner():
     script = """
 import duckdb.runners as runners
@@ -173,6 +373,34 @@ else:
     raise AssertionError("expected Ray setup to reject existing local runner")
 """
     subprocess.run([sys.executable, "-c", script], check=True)
+
+
+def test_ray_noop_reuses_existing_runner_without_validating_address():
+    script = """
+import duckdb
+import duckdb.runners.ray.runner as ray_runner_module
+
+
+class FakeRayRunner:
+    name = "ray"
+
+    def __init__(self, *_args):
+        pass
+
+    def close(self):
+        pass
+
+
+ray_runner_module.RayRunner = FakeRayRunner
+vane_runners = duckdb.vane_runners_cpp
+vane_runners.teardown_runner()
+
+first = vane_runners.set_runner_ray(None, False, None, False)
+second = vane_runners.set_runner_ray(object(), True, None, False)
+
+assert second is first
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=10)
 
 
 def test_config_registry_contains_stable_public_fields():

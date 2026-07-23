@@ -10,8 +10,10 @@
 
 #include <pybind11/pybind11.h>
 #include <Python.h>
+#include <condition_variable>
 #include <mutex>
 #include <memory>
+#include <thread>
 
 #include <cstdlib>
 
@@ -259,66 +261,133 @@ static RunnerConfig get_runner_config_from_env_or_default() {
 }
 
 // ----------------- Singleton management ----------------- //
+enum class VaneRunnerState { UNINITIALIZED, INITIALIZING, INITIALIZED };
+
 static std::shared_ptr<Runner> VANE_RUNNER_PTR = nullptr;
 static std::mutex VANE_RUNNER_MUTEX;
+static std::condition_variable VANE_RUNNER_CONDITION;
+static VaneRunnerState VANE_RUNNER_STATE = VaneRunnerState::UNINITIALIZED;
+static std::thread::id VANE_RUNNER_INITIALIZER_THREAD;
+
+struct RunnerInitializationResult {
+	std::shared_ptr<Runner> runner;
+	bool created;
+};
+
+// All callers enter from Python with the GIL held. Wait without the GIL so the
+// initializer can return from Python, then unlock the runner mutex before the
+// gil_scoped_release destructor reacquires the GIL.
+static void wait_for_runner_initialization() {
+	py::gil_scoped_release release;
+	std::unique_lock<std::mutex> lock(VANE_RUNNER_MUTEX);
+	VANE_RUNNER_CONDITION.wait(lock, [] { return VANE_RUNNER_STATE != VaneRunnerState::INITIALIZING; });
+	lock.unlock();
+}
+
+template <class FACTORY>
+static RunnerInitializationResult initialize_runner(FACTORY &&factory) {
+	for (;;) {
+		bool should_initialize = false;
+		{
+			std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
+			if (VANE_RUNNER_STATE == VaneRunnerState::INITIALIZED) {
+				return {VANE_RUNNER_PTR, false};
+			}
+			if (VANE_RUNNER_STATE == VaneRunnerState::UNINITIALIZED) {
+				VANE_RUNNER_STATE = VaneRunnerState::INITIALIZING;
+				VANE_RUNNER_INITIALIZER_THREAD = std::this_thread::get_id();
+				should_initialize = true;
+			} else if (VANE_RUNNER_INITIALIZER_THREAD == std::this_thread::get_id()) {
+				throw std::runtime_error("Recursive runner initialization is not supported");
+			}
+		}
+
+		if (should_initialize) {
+			break;
+		}
+		wait_for_runner_initialization();
+	}
+
+	try {
+		auto candidate = factory();
+		{
+			std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
+			VANE_RUNNER_PTR = candidate;
+			VANE_RUNNER_STATE = VaneRunnerState::INITIALIZED;
+			VANE_RUNNER_INITIALIZER_THREAD = std::thread::id();
+		}
+		VANE_RUNNER_CONDITION.notify_all();
+		return {std::move(candidate), true};
+	} catch (...) {
+		{
+			std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
+			VANE_RUNNER_STATE = VaneRunnerState::UNINITIALIZED;
+			VANE_RUNNER_INITIALIZER_THREAD = std::thread::id();
+		}
+		VANE_RUNNER_CONDITION.notify_all();
+		throw;
+	}
+}
 
 // get_or_create_runner will initialize once if not set
 static std::shared_ptr<Runner> get_or_create_runner_cpp() {
-	std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
-	if (VANE_RUNNER_PTR) {
-		return VANE_RUNNER_PTR;
-	}
-	RunnerConfig cfg = get_runner_config_from_env_or_default();
-	std::unique_ptr<Runner> rptr = cfg.create_runner();
-	VANE_RUNNER_PTR = std::shared_ptr<Runner>(std::move(rptr));
-	return VANE_RUNNER_PTR;
+	auto result = initialize_runner([] {
+		RunnerConfig cfg = get_runner_config_from_env_or_default();
+		return std::shared_ptr<Runner>(cfg.create_runner());
+	});
+	return std::move(result.runner);
 }
 
 // Helper to set runner once, following the Rust OnceLock semantics
 static py::object set_runner_ray_py(py::object address_py = py::none(), bool noop_if_initialized = false,
                                     std::pair<bool, size_t> max_task_backlog = std::make_pair(false, size_t(0)),
                                     std::pair<bool, bool> force_client_mode = std::make_pair(false, false)) {
-	std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
-	if (VANE_RUNNER_PTR) {
-		if (noop_if_initialized && VANE_RUNNER_PTR->get_type() == Runner::Type::Ray) {
-			return VANE_RUNNER_PTR->get_pyobj();
+	auto result = initialize_runner([&] {
+		std::pair<bool, std::string> address = std::make_pair(false, std::string());
+		if (!address_py.is_none()) {
+			address = std::make_pair(true, address_py.cast<std::string>());
 		}
+		auto runner = RayRunner::try_new(address, max_task_backlog, force_client_mode);
+		return std::make_shared<Runner>(std::move(runner));
+	});
+	if (!result.created && (!noop_if_initialized || result.runner->get_type() != Runner::Type::Ray)) {
 		throw std::runtime_error("Cannot set runner more than once");
 	}
-	std::pair<bool, std::string> address = std::make_pair(false, std::string());
-	if (!address_py.is_none()) {
-		address = std::make_pair(true, address_py.cast<std::string>());
-	}
-	auto r = RayRunner::try_new(address, max_task_backlog, force_client_mode);
-	VANE_RUNNER_PTR = std::make_shared<Runner>(std::move(r));
-	return VANE_RUNNER_PTR->get_pyobj();
+	return result.runner->get_pyobj();
 }
 
 static py::object set_runner_local_py(py::object num_workers = py::none(), py::object max_running_tasks = py::none(),
                                       py::object execution_mode = py::none()) {
-	std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
-	if (VANE_RUNNER_PTR) {
-		if (VANE_RUNNER_PTR->get_type() == Runner::Type::Local) {
-			return VANE_RUNNER_PTR->get_pyobj();
-		}
+	auto result = initialize_runner([&] {
+		auto runner = LocalRunner::try_new(num_workers, max_running_tasks, execution_mode);
+		return std::make_shared<Runner>(std::move(runner));
+	});
+	if (!result.created && result.runner->get_type() != Runner::Type::Local) {
 		throw std::runtime_error("Cannot set runner more than once");
 	}
-	auto r = LocalRunner::try_new(num_workers, max_running_tasks, execution_mode);
-	VANE_RUNNER_PTR = std::make_shared<Runner>(std::move(r));
-	return VANE_RUNNER_PTR->get_pyobj();
+	return result.runner->get_pyobj();
 }
 
 // Helper to teardown runner explicitly during Python exit
 static void teardown_runner_cpp() {
 	std::shared_ptr<Runner> runner;
-	{
-		std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
-		if (VANE_RUNNER_PTR) {
-			runner = VANE_RUNNER_PTR;
-			VANE_RUNNER_PTR.reset();
-		} else {
-			return;
+	for (;;) {
+		{
+			std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
+			if (VANE_RUNNER_STATE == VaneRunnerState::UNINITIALIZED) {
+				return;
+			}
+			if (VANE_RUNNER_STATE == VaneRunnerState::INITIALIZED) {
+				runner = VANE_RUNNER_PTR;
+				VANE_RUNNER_PTR.reset();
+				VANE_RUNNER_STATE = VaneRunnerState::UNINITIALIZED;
+				break;
+			}
+			if (VANE_RUNNER_INITIALIZER_THREAD == std::this_thread::get_id()) {
+				throw std::runtime_error("Cannot tear down a runner while initializing it");
+			}
 		}
+		wait_for_runner_initialization();
 	}
 	try {
 		duckdb::PythonGILWrapper gil;
@@ -332,10 +401,30 @@ static void teardown_runner_cpp() {
 
 // Get runner Python object or None
 static py::object get_runner_py() {
-	std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
-	if (!VANE_RUNNER_PTR)
-		return py::none();
-	return VANE_RUNNER_PTR->get_pyobj();
+	for (;;) {
+		std::shared_ptr<Runner> runner;
+		bool uninitialized = false;
+		{
+			std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
+			if (VANE_RUNNER_STATE == VaneRunnerState::UNINITIALIZED) {
+				uninitialized = true;
+			}
+			if (VANE_RUNNER_STATE == VaneRunnerState::INITIALIZED) {
+				runner = VANE_RUNNER_PTR;
+			}
+			if (VANE_RUNNER_STATE == VaneRunnerState::INITIALIZING &&
+			    VANE_RUNNER_INITIALIZER_THREAD == std::this_thread::get_id()) {
+				throw std::runtime_error("Cannot get a runner while initializing it");
+			}
+		}
+		if (uninitialized) {
+			return py::none();
+		}
+		if (runner) {
+			return runner->get_pyobj();
+		}
+		wait_for_runner_initialization();
+	}
 }
 
 static py::object get_or_create_runner_py() {
@@ -344,23 +433,27 @@ static py::object get_or_create_runner_py() {
 }
 
 static py::object get_or_infer_runner_type_py() {
-	std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
-	if (VANE_RUNNER_PTR) {
-		if (VANE_RUNNER_PTR->get_type() == Runner::Type::Ray)
-			return py::str(RayRunner::NAME);
-		return py::str(LocalRunner::NAME);
+	for (;;) {
+		std::string runner_type;
+		{
+			std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
+			if (VANE_RUNNER_STATE == VaneRunnerState::INITIALIZED) {
+				runner_type = VANE_RUNNER_PTR->get_type() == Runner::Type::Ray ? RayRunner::NAME : LocalRunner::NAME;
+			} else if (VANE_RUNNER_STATE == VaneRunnerState::UNINITIALIZED) {
+				runner_type = duckdb::ResolveRunnerTypeFromEnvironment();
+			} else if (VANE_RUNNER_INITIALIZER_THREAD == std::this_thread::get_id()) {
+				throw std::runtime_error("Cannot infer runner type while initializing it");
+			}
+		}
+
+		if (!runner_type.empty()) {
+			if (runner_type == "local-fast" || runner_type == LocalRunner::NAME || runner_type == RayRunner::NAME) {
+				return py::str(runner_type);
+			}
+			throw duckdb::InternalException("normalized runner type '%s' has no public runner name", runner_type);
+		}
+		wait_for_runner_initialization();
 	}
-	auto rt = duckdb::ResolveRunnerTypeFromEnvironment();
-	if (rt == "local-fast") {
-		return py::str("local-fast");
-	}
-	if (rt == LocalRunner::NAME) {
-		return py::str(LocalRunner::NAME);
-	}
-	if (rt == RayRunner::NAME) {
-		return py::str(RayRunner::NAME);
-	}
-	throw duckdb::InternalException("normalized runner type '%s' has no public runner name", rt);
 }
 
 // ------------------ Python binding ------------------ //
