@@ -1699,6 +1699,7 @@ def test_native_cxx_run_copy_plan_preserves_worker_plan_exception_cause(tmp_path
         con.close()
 
     assert isinstance(exc_info.value.__cause__, duckdb.NotImplementedException)
+    assert exc_info.value.__cause__.__traceback__ is not None
     assert f"copy plan lookup sentinel for {query_id}" in str(exc_info.value.__cause__)
     assert submission_calls == [1]
     assert dropped_queries == [query_id]
