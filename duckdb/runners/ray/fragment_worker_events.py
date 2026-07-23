@@ -141,6 +141,11 @@ class FteWorkerEventHandlingMixin:
             return self._handles_for_fte_worker_control_failure(exc)
         except FteWorkerReservationUnavailable:
             return self._drain_fte_pending_tasks(query_id_filter=event.query_id)
+        except Exception:
+            with _FTE_REGISTRY_LOCK:
+                if str(event.query_id) in _FTE_CLOSING_QUERIES:
+                    return []
+            raise
         handles = self._handles_for_fte_scheduled_attempts(
             event.query_id,
             str(event.fragment_id),

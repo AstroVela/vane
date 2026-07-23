@@ -2766,6 +2766,48 @@ def test_fte_worker_reservation_completion_after_query_drop_is_ignored(monkeypat
     assert [call[1]["task_id"]["partition_id"] for call in actor.fte_calls if call[0] == "create"] == [0]
 
 
+def test_fte_worker_reservation_completion_racing_query_drop_is_ignored(monkeypatch):
+    from duckdb.runners.ray import fragment_worker_events as worker_events_mod
+
+    query_id = "query-reservation-during-drop"
+    actor, handle, pending_key, pending_future = _submit_strict_worker_reservation_pending_pair(
+        monkeypatch,
+        query_id,
+    )
+    pending_future.set_result(_completed_test_reservation(pending_future, handle))
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get(query_id)
+    assert scheduler is not None
+
+    reservation_removed = threading.Event()
+    allow_completion = threading.Event()
+    original_remove = worker_events_mod.remove_pending_fte_worker_reservation_if_current
+
+    def blocked_remove(key, future):
+        removed = original_remove(key, future)
+        if removed:
+            reservation_removed.set()
+            assert allow_completion.wait(5.0)
+        return removed
+
+    monkeypatch.setattr(
+        worker_events_mod,
+        "remove_pending_fte_worker_reservation_if_current",
+        blocked_remove,
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        completion = executor.submit(scheduler.drain)
+        assert reservation_removed.wait(5.0)
+        try:
+            handle.fte_drop_query(query_id)
+        finally:
+            allow_completion.set()
+        assert completion.result(timeout=5.0) == []
+
+    assert pending_key not in worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS
+    assert (query_id, pending_key[1]) not in worker_handle_mod._FTE_FRAGMENT_EXECUTIONS
+    assert [call[1]["task_id"]["partition_id"] for call in actor.fte_calls if call[0] == "create"] == [0]
+
+
 def test_fte_stale_worker_reservation_generation_does_not_consume_new_future(monkeypatch):
     query_id = "query-reservation-stale-generation"
     actor0, handle, pending_key, old_future = _submit_strict_worker_reservation_pending_pair(
