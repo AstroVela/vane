@@ -35,15 +35,15 @@ public:
 	const vector<ColumnDefinition> &Columns() override;
 	string ToString(idx_t depth) override;
 
-	unique_ptr<TableRef> GetTableRef() override;
 	bool ContainsNonSQLRelation() override {
 		return left->ContainsNonSQLRelation() || right->ContainsNonSQLRelation();
 	}
-	bool CanSerializeToQueryNode() override {
-		return left->CanSerializeToQueryNode() && right->CanSerializeToQueryNode();
+	bool CanSerializeToQueryNodeInternal(Binder &binder) override {
+		return left->CanSerializeToQueryNodeInternal(binder) && right->CanSerializeToQueryNodeInternal(binder);
 	}
 
 protected:
+	unique_ptr<TableRef> GetTableRefInternal() override;
 	BoundStatement BindAsInput(Binder &binder) override;
 };
 

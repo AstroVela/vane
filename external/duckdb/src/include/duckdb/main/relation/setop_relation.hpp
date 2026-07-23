@@ -39,8 +39,8 @@ public:
 	bool ContainsNonSQLRelation() override {
 		return left->ContainsNonSQLRelation() || right->ContainsNonSQLRelation();
 	}
-	bool CanSerializeToQueryNode() override {
-		return left->CanSerializeToQueryNode() && right->CanSerializeToQueryNode();
+	bool CanSerializeToQueryNodeInternal(Binder &binder) override {
+		return left->CanSerializeToQueryNodeInternal(binder) && right->CanSerializeToQueryNodeInternal(binder);
 	}
 };
 

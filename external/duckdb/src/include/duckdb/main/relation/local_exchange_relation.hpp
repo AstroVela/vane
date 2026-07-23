@@ -33,8 +33,8 @@ public:
 	bool ContainsNonSQLRelation() override {
 		return true;
 	}
-	bool CanBindAsInput() override {
-		return child->CanBindAsInput();
+	bool CanBindAsInputInternal(Binder &binder) override {
+		return child->CanBindAsInputInternal(binder);
 	}
 
 protected:

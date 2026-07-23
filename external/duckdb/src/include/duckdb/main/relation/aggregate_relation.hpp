@@ -43,9 +43,9 @@ public:
 	bool ContainsNonSQLRelation() override {
 		return child->ContainsNonSQLRelation();
 	}
-	bool CanSerializeToQueryNode() override;
-	bool CanBindAsInput() override {
-		return child->CanBindAsInput();
+	bool CanSerializeToQueryNodeInternal(Binder &binder) override;
+	bool CanBindAsInputInternal(Binder &binder) override {
+		return child->CanBindAsInputInternal(binder);
 	}
 };
 

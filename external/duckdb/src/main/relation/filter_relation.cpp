@@ -39,14 +39,14 @@ unique_ptr<QueryNode> FilterRelation::GetQueryNode() {
 	} else {
 		auto result = make_uniq<SelectNode>();
 		result->select_list.push_back(make_uniq<StarExpression>());
-		result->from_table = child->GetTableRef();
+		result->from_table = GetTableRefForSerialization(*child);
 		result->where_clause = condition->Copy();
 		return std::move(result);
 	}
 }
 
 BoundStatement FilterRelation::Bind(Binder &binder) {
-	if (!RequiresDirectRelationBinding(*child)) {
+	if (!RequiresDirectRelationBinding(binder, *child)) {
 		return Relation::Bind(binder);
 	}
 	auto select_node = make_uniq<SelectNode>();
@@ -66,8 +66,16 @@ BoundStatement FilterRelation::BindAsInput(Binder &binder) {
 	return child_bound;
 }
 
-bool FilterRelation::CanSerializeToQueryNode() {
-	return CanSerializeExpressionOnChild(*child, *condition);
+bool FilterRelation::CanSerializeToQueryNodeInternal(Binder &binder) {
+	if (!child->CanSerializeToQueryNodeInternal(binder)) {
+		return false;
+	}
+	if (!child->InheritsColumnBindings() || RequiresSQLMultiSourceBinding(*child)) {
+		return true;
+	}
+	auto serialization_binder = Binder::CreateBinder(binder.context);
+	auto serialization_input = BindRelationInput(*serialization_binder, *child);
+	return CanSerializeExpressionOnBoundChild(*serialization_binder, *child, *serialization_input, *condition);
 }
 
 string FilterRelation::GetAlias() {

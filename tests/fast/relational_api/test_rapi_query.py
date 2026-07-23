@@ -32,6 +32,35 @@ def scoped_default(duckdb_cursor):
 
 
 class TestRAPIQuery:
+    def test_sql_query_preserves_result_modifier_boundaries(self, duckdb_cursor):
+        values = duckdb_cursor.sql("SELECT * FROM (VALUES (1), (1), (2)) data(id)").order("id")
+
+        limited_distinct = values.limit(2).distinct()
+        limited_distinct_sql = limited_distinct.sql_query()
+        assert limited_distinct_sql
+        assert limited_distinct.fetchall() == [(1,)]
+        assert duckdb_cursor.sql(limited_distinct_sql).fetchall() == [(1,)]
+        assert duckdb_cursor.sql("SELECT * FROM limited_distinct").fetchall() == [(1,)]
+
+        double_limit = values.limit(2).limit(1)
+        double_limit_sql = double_limit.sql_query()
+        assert double_limit_sql
+        assert double_limit.fetchall() == [(1,)]
+        assert duckdb_cursor.sql(double_limit_sql).fetchall() == [(1,)]
+        assert duckdb_cursor.sql("SELECT * FROM double_limit").fetchall() == [(1,)]
+
+        union_distinct = duckdb_cursor.sql("SELECT 1 AS id").union(duckdb_cursor.sql("SELECT 1 AS id")).distinct()
+        union_distinct_sql = union_distinct.sql_query()
+        assert union_distinct_sql
+        assert union_distinct.fetchall() == [(1,)]
+        assert duckdb_cursor.sql(union_distinct_sql).fetchall() == [(1,)]
+        assert duckdb_cursor.sql("SELECT * FROM union_distinct").fetchall() == [(1,)]
+
+        duplicate_names = duckdb_cursor.sql("SELECT 1 AS x, 2 AS x").limit(1).distinct()
+        duplicate_names_sql = duplicate_names.sql_query()
+        assert duplicate_names.columns == ["x", "x"]
+        assert duckdb_cursor.sql(duplicate_names_sql).columns == ["x", "x"]
+
     @pytest.mark.parametrize(
         ("operation", "expected"),
         [

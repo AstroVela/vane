@@ -23,6 +23,12 @@ LimitRelation::LimitRelation(shared_ptr<Relation> child_p, int64_t limit, int64_
 
 unique_ptr<QueryNode> LimitRelation::GetQueryNode() {
 	auto child_node = child->GetQueryNode();
+	if (std::any_of(child_node->modifiers.begin(), child_node->modifiers.end(), [](const auto &modifier) {
+		    return modifier->type == ResultModifierType::LIMIT_MODIFIER ||
+		           modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER;
+	    })) {
+		child_node = WrapQueryNode(std::move(child_node), child->GetAlias(), child->Columns());
+	}
 	auto limit_node = make_uniq<LimitModifier>();
 	if (limit >= 0) {
 		limit_node->limit = make_uniq<ConstantExpression>(Value::BIGINT(limit));
@@ -53,7 +59,7 @@ string LimitRelation::ToString(idx_t depth) {
 }
 
 BoundStatement LimitRelation::Bind(Binder &binder) {
-	if (!RequiresDirectRelationBinding(*child)) {
+	if (!RequiresDirectRelationBinding(binder, *child)) {
 		return Relation::Bind(binder);
 	}
 	auto select_node = make_uniq<SelectNode>();

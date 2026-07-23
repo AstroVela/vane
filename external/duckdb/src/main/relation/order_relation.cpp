@@ -61,9 +61,16 @@ unique_ptr<QueryNode> OrderRelation::GetQueryNode() {
 		result = child->GetQueryNode();
 	} else {
 		auto select = make_uniq<SelectNode>();
-		select->from_table = child->GetTableRef();
+		select->from_table = GetTableRefForSerialization(*child);
 		select->select_list.push_back(make_uniq<StarExpression>());
 		result = std::move(select);
+	}
+	if (std::any_of(result->modifiers.begin(), result->modifiers.end(), [](const auto &modifier) {
+		    return modifier->type == ResultModifierType::ORDER_MODIFIER ||
+		           modifier->type == ResultModifierType::LIMIT_MODIFIER ||
+		           modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER;
+	    })) {
+		result = WrapQueryNode(std::move(result), child->GetAlias(), child->Columns());
 	}
 	D_ASSERT(result->type == QueryNodeType::SELECT_NODE);
 	auto &select = result->Cast<SelectNode>();
@@ -79,7 +86,7 @@ BoundStatement OrderRelation::Bind(Binder &binder) {
 	if (orders.empty()) {
 		return child->Bind(binder);
 	}
-	if (!RequiresDirectRelationBinding(*child)) {
+	if (!RequiresDirectRelationBinding(binder, *child)) {
 		return Relation::Bind(binder);
 	}
 	auto select_node = make_uniq<SelectNode>();
@@ -150,16 +157,19 @@ BoundStatement OrderRelation::BindAsInput(Binder &binder) {
 	return result;
 }
 
-bool OrderRelation::CanSerializeToQueryNode() {
-	if (!child->CanSerializeToQueryNode()) {
+bool OrderRelation::CanSerializeToQueryNodeInternal(Binder &binder) {
+	if (!child->CanSerializeToQueryNodeInternal(binder)) {
 		return false;
 	}
-	for (auto &order : orders) {
-		if (!CanSerializeExpressionOnChild(*child, *order.expression)) {
-			return false;
-		}
+	if (orders.empty() || !child->InheritsColumnBindings() || RequiresSQLMultiSourceBinding(*child)) {
+		return true;
 	}
-	return true;
+	auto serialization_binder = Binder::CreateBinder(binder.context);
+	auto serialization_input = BindRelationInput(*serialization_binder, *child);
+	return std::all_of(orders.begin(), orders.end(), [&](const auto &order) {
+		return CanSerializeExpressionOnBoundChild(*serialization_binder, *child, *serialization_input,
+		                                          *order.expression);
+	});
 }
 
 string OrderRelation::GetAlias() {

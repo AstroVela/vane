@@ -75,11 +75,11 @@ ValueRelation::ValueRelation(const shared_ptr<RelationContextWrapper> &context,
 unique_ptr<QueryNode> ValueRelation::GetQueryNode() {
 	auto result = make_uniq<SelectNode>();
 	result->select_list.push_back(make_uniq<StarExpression>());
-	result->from_table = GetTableRef();
+	result->from_table = GetTableRefForSerialization(*this);
 	return std::move(result);
 }
 
-unique_ptr<TableRef> ValueRelation::GetTableRef() {
+unique_ptr<TableRef> ValueRelation::GetTableRefInternal() {
 	auto table_ref = make_uniq<ExpressionListRef>();
 	// set the expected types/names
 	if (columns.empty()) {

@@ -26,7 +26,7 @@ CrossProductRelation::CrossProductRelation(shared_ptr<Relation> left_p, shared_p
 unique_ptr<QueryNode> CrossProductRelation::GetQueryNode() {
 	auto result = make_uniq<SelectNode>();
 	result->select_list.push_back(make_uniq<StarExpression>());
-	result->from_table = GetTableRef();
+	result->from_table = GetTableRefForSerialization(*this);
 	return std::move(result);
 }
 
@@ -34,14 +34,14 @@ BoundStatement CrossProductRelation::BindAsInput(Binder &binder) {
 	if (ContainsNonSQLRelation()) {
 		return Relation::Bind(binder);
 	}
-	auto table_ref = GetTableRef();
+	auto table_ref = GetTableRefForSerialization(*this);
 	return binder.Bind(*table_ref);
 }
 
-unique_ptr<TableRef> CrossProductRelation::GetTableRef() {
+unique_ptr<TableRef> CrossProductRelation::GetTableRefInternal() {
 	auto cross_product_ref = make_uniq<JoinRef>(ref_type);
-	cross_product_ref->left = left->GetTableRef();
-	cross_product_ref->right = right->GetTableRef();
+	cross_product_ref->left = GetTableRefForSerialization(*left);
+	cross_product_ref->right = GetTableRefForSerialization(*right);
 	return std::move(cross_product_ref);
 }
 

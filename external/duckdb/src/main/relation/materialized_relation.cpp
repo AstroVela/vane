@@ -30,11 +30,11 @@ MaterializedRelation::MaterializedRelation(const shared_ptr<ClientContext> &cont
 unique_ptr<QueryNode> MaterializedRelation::GetQueryNode() {
 	auto result = make_uniq<SelectNode>();
 	result->select_list.push_back(make_uniq<StarExpression>());
-	result->from_table = GetTableRef();
+	result->from_table = GetTableRefForSerialization(*this);
 	return std::move(result);
 }
 
-unique_ptr<TableRef> MaterializedRelation::GetTableRef() {
+unique_ptr<TableRef> MaterializedRelation::GetTableRefInternal() {
 	auto table_ref = make_uniq<ColumnDataRef>(collection);
 	for (auto &col : columns) {
 		table_ref->expected_names.push_back(col.Name());

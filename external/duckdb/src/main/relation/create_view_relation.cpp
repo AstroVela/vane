@@ -27,13 +27,14 @@ CreateViewRelation::CreateViewRelation(shared_ptr<Relation> child_p, string sche
 }
 
 BoundStatement CreateViewRelation::Bind(Binder &binder) {
-	if (!child->CanSerializeToQueryNode()) {
+	auto query_node = child->TryGetSerializableQueryNode(binder);
+	if (!query_node) {
 		throw NotImplementedException(
 		    "Cannot create a view from a relation that cannot be faithfully represented as a "
 		    "SQL query node; conversion would discard the exchange or lose relation bindings");
 	}
 	auto select = make_uniq<SelectStatement>();
-	select->node = child->GetQueryNode();
+	select->node = std::move(query_node);
 
 	CreateStatement stmt;
 	auto info = make_uniq<CreateViewInfo>();

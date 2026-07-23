@@ -430,6 +430,179 @@ class TestRAPIJoins:
         assert result.fetchall() == [(42,)]
         assert con.sql(sql).fetchall() == [(42,)]
 
+    def test_deduplicated_hidden_column_name_is_not_serialized(self, con):
+        left = con.sql("SELECT 1 AS x, 2 AS x").set_alias("l")
+        right = con.sql("SELECT 1 AS join_key").set_alias("r")
+        boundary = left.cross(right).distinct()
+
+        hidden = boundary.project("l.x_1 AS value")
+        assert hidden.fetchall() == [(2,)]
+        assert hidden.sql_query() == ""
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            con.sql("SELECT * FROM hidden")
+
+        surviving = boundary.project("x_1 AS value")
+        sql = surviving.sql_query()
+        assert sql
+        assert surviving.fetchall() == [(2,)]
+        assert con.sql(sql).fetchall() == [(2,)]
+
+    @pytest.mark.parametrize(
+        ("setup_sql", "expression"),
+        [
+            (
+                "CREATE TABLE local_scope_source AS SELECT 42 AS id",
+                "(SELECT l.id FROM local_scope_source AS l) AS value",
+            ),
+            (
+                "CREATE VIEW local_scope_source AS SELECT 42 AS id",
+                "(SELECT l.id FROM local_scope_source AS l) AS value",
+            ),
+            (
+                "CREATE TABLE local_scope_source AS SELECT 42 AS id",
+                "(SELECT l.id FROM (SELECT * FROM local_scope_source) AS l) AS value",
+            ),
+            (
+                None,
+                "(SELECT l.range FROM range(42, 43) AS l) AS value",
+            ),
+            (
+                "CREATE TABLE local_scope_source AS SELECT 42 AS id",
+                "(WITH local AS (SELECT * FROM local_scope_source) SELECT l.id FROM local AS l) AS value",
+            ),
+        ],
+    )
+    def test_bound_local_scope_hides_join_binding(self, con, setup_sql, expression):
+        if setup_sql:
+            con.execute(setup_sql)
+        left = con.sql("SELECT 7 AS id, 7 AS range, 1 AS join_key").set_alias("l")
+        right = con.sql("SELECT 1 AS join_key").set_alias("r")
+        result = left.join(right, "l.join_key = r.join_key").distinct().project(expression)
+
+        sql = result.sql_query()
+        assert sql
+        assert result.fetchall() == [(42,)]
+        assert con.sql(sql).fetchall() == [(42,)]
+        assert con.sql("SELECT * FROM result").fetchall() == [(42,)]
+
+    def test_relation_serialization_rebinds_after_catalog_change(self, con):
+        con.execute("PRAGMA enable_verification")
+        con.execute("CREATE VIEW local_scope_source AS SELECT 42 AS right_value")
+        left = con.sql("SELECT 1 AS join_key").set_alias("l")
+        right = con.sql("SELECT 1 AS join_key, 100 AS right_value").set_alias("r")
+        result = (
+            left.join(right, "l.join_key = r.join_key")
+            .distinct()
+            .project("(SELECT r.right_value FROM local_scope_source AS r) AS value")
+        )
+
+        sql = result.sql_query()
+        assert sql
+        assert result.fetchall() == [(42,)]
+        assert con.sql(sql).fetchall() == [(42,)]
+        assert con.sql("SELECT * FROM result").fetchall() == [(42,)]
+
+        con.execute("CREATE OR REPLACE VIEW local_scope_source AS SELECT 99 AS other")
+        assert result.fetchall() == [(100,)]
+        assert result.sql_query() == ""
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            con.sql("SELECT * FROM result")
+
+        con.execute("CREATE OR REPLACE VIEW local_scope_source AS SELECT 84 AS right_value")
+        sql = result.sql_query()
+        assert sql
+        assert result.fetchall() == [(84,)]
+        assert con.sql(sql).fetchall() == [(84,)]
+        assert con.sql("SELECT * FROM result").fetchall() == [(84,)]
+
+    @pytest.mark.parametrize("operation", ["project", "filter", "order", "aggregate"])
+    def test_bound_subquery_scope_controls_unary_expression_serialization(self, con, operation):
+        con.execute("CREATE TABLE local_scope_source AS SELECT 42 AS id")
+        left = con.sql("SELECT 7 AS id, 1 AS join_key").set_alias("l")
+        right = con.sql("SELECT 1 AS join_key").set_alias("r")
+        boundary = left.join(right, "l.join_key = r.join_key").distinct()
+
+        if operation == "project":
+            local = boundary.project("(SELECT l.id FROM local_scope_source AS l) AS value")
+            correlated = boundary.project("(SELECT l.id) AS value")
+            expected_local = [(42,)]
+            expected_correlated = [(7,)]
+        elif operation == "filter":
+            local = boundary.filter("(SELECT l.id FROM local_scope_source AS l) = 42")
+            correlated = boundary.filter("(SELECT l.id) = 7")
+            expected_local = expected_correlated = [(7, 1, 1)]
+        elif operation == "order":
+            local = boundary.order("(SELECT l.id FROM local_scope_source AS l)")
+            correlated = boundary.order("(SELECT l.id)")
+            expected_local = expected_correlated = [(7, 1, 1)]
+        else:
+            local = boundary.aggregate("(SELECT l.id FROM local_scope_source AS l) AS value")
+            correlated = boundary.aggregate("(SELECT l.id) AS value")
+            expected_local = [(42,)]
+            expected_correlated = [(7,)]
+
+        sql = local.sql_query()
+        assert sql
+        assert local.fetchall() == expected_local
+        assert con.sql(sql).fetchall() == expected_local
+        assert con.sql("SELECT * FROM local").fetchall() == expected_local
+
+        assert correlated.sql_query() == ""
+        assert correlated.fetchall() == expected_correlated
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            con.sql("SELECT * FROM correlated")
+
+    @pytest.mark.parametrize("operation", ["project", "filter", "order", "aggregate", "window_order"])
+    def test_macro_expansion_cannot_restore_hidden_join_binding(self, con, operation):
+        con.execute("CREATE MACRO relation_field(value) AS value.id")
+        left = con.sql("SELECT * FROM (VALUES (7, 1), (8, 1)) data(id, join_key)").set_alias("l")
+        right = con.sql("SELECT 1 AS join_key").set_alias("r")
+        boundary = left.join(right, "l.join_key = r.join_key").distinct()
+
+        if operation == "project":
+            result = boundary.project("relation_field(l) AS value")
+            assert sorted(result.fetchall()) == [(7,), (8,)]
+        elif operation == "filter":
+            result = boundary.filter("relation_field(l) = 7")
+            assert result.fetchall() == [(7, 1, 1)]
+        elif operation == "order":
+            result = boundary.order("relation_field(l) DESC")
+            assert result.fetchall() == [(8, 1, 1), (7, 1, 1)]
+        elif operation == "aggregate":
+            result = boundary.aggregate("min(relation_field(l)) AS value")
+            assert result.fetchall() == [(7,)]
+        else:
+            result = boundary.order("first_value(relation_field(l)) OVER (ORDER BY id DESC)")
+            assert sorted(result.fetchall()) == [(7, 1, 1), (8, 1, 1)]
+
+        assert result.sql_query() == ""
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            con.sql("SELECT * FROM result")
+
+    def test_macro_expansion_keeps_surviving_struct_column_serializable(self, con):
+        con.execute("CREATE MACRO relation_field(value) AS value.id")
+        left = con.sql("SELECT {'id': 42} AS payload, 1 AS join_key").set_alias("l")
+        right = con.sql("SELECT 1 AS join_key").set_alias("r")
+        result = left.join(right, "l.join_key = r.join_key").distinct().project("relation_field(payload) AS value")
+
+        sql = result.sql_query()
+        assert sql
+        assert result.fetchall() == [(42,)]
+        assert con.sql(sql).fetchall() == [(42,)]
+        assert con.sql("SELECT * FROM result").fetchall() == [(42,)]
+
+    @pytest.mark.parametrize(("join_type", "expected"), [("inner", [(1,)]), ("outer", [(1,), (2,), (3,)])])
+    def test_correlated_surviving_using_column_remains_serializable(self, con, join_type, expected):
+        left = con.sql("SELECT * FROM (VALUES (1), (2)) data(id)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (1), (3)) data(id)").set_alias("r")
+        result = left.join(right, "id", join_type).distinct().project("(SELECT id) AS value")
+
+        sql = result.sql_query()
+        assert sql
+        assert sorted(result.fetchall()) == expected
+        assert sorted(con.sql(sql).fetchall()) == expected
+        assert con.sql("SELECT * FROM result ORDER BY value").fetchall() == expected
+
     def test_from_subquery_alias_is_not_visible_inside_its_own_query(self, con):
         left = con.sql("SELECT 7 AS id, 1 AS join_key").set_alias("l")
         right = con.sql("SELECT 1 AS join_key").set_alias("r")

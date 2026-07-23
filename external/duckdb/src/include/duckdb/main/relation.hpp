@@ -87,7 +87,18 @@ public:
 public:
 	DUCKDB_API virtual const vector<ColumnDefinition> &Columns() = 0;
 	DUCKDB_API virtual unique_ptr<QueryNode> GetQueryNode() = 0;
+	//! Return whether the relation has a faithful QueryNode representation in the
+	//! current binding context. This check is deliberately not cached because
+	//! catalog and setting changes can alter nested-query name resolution.
+	DUCKDB_API bool CanSerializeToQueryNode();
+	//! Return a freshly validated QueryNode, or nullptr if no faithful
+	//! representation exists. The Binder overload is for callers that already
+	//! hold the ClientContext lock and have an active transaction.
+	DUCKDB_API unique_ptr<QueryNode> TryGetSerializableQueryNode();
+	DUCKDB_API unique_ptr<QueryNode> TryGetSerializableQueryNode(Binder &binder);
+	DUCKDB_API bool CanBindAsInput();
 	DUCKDB_API virtual string GetQuery();
+	DUCKDB_API virtual string GetQuery(Binder &binder);
 	DUCKDB_API virtual BoundStatement Bind(Binder &binder);
 	DUCKDB_API virtual string GetAlias();
 
@@ -238,35 +249,43 @@ public:
 		auto child = ChildRelation();
 		return child && child->ContainsNonSQLRelation();
 	}
-	//! Whether GetQueryNode can represent this relation without losing operators or binding scopes.
-	virtual bool CanSerializeToQueryNode() {
+	//! Whether GetQueryNode can represent this relation without losing operators
+	//! or binding scopes in the supplied binding context.
+	virtual bool CanSerializeToQueryNodeInternal(Binder &binder) {
 		if (ContainsNonSQLRelation()) {
 			return false;
 		}
 		auto child = ChildRelation();
-		return !child || child->CanSerializeToQueryNode();
+		return !child || child->CanSerializeToQueryNodeInternal(binder);
 	}
 	//! Whether this relation can be bound directly as another relation's input.
 	//! SQL-serializable relations use the default SQL binding path. Relations
 	//! with a non-SQL binding path override this independently of serialization.
-	virtual bool CanBindAsInput() {
-		return CanSerializeToQueryNode();
+	virtual bool CanBindAsInputInternal(Binder &binder) {
+		return CanSerializeToQueryNodeInternal(binder);
 	}
 	void AddExternalDependency(shared_ptr<ExternalDependency> dependency);
 	DUCKDB_API vector<shared_ptr<ExternalDependency>> GetAllDependencies();
 
 protected:
+	//! Build this relation's table reference after the complete relation tree has
+	//! already been validated for SQL serialization.
+	DUCKDB_API virtual unique_ptr<TableRef> GetTableRefInternal();
+	DUCKDB_API static unique_ptr<TableRef> GetTableRefForSerialization(Relation &relation);
 	//! Bind this relation for use as another relation's input. Binding-preserving
 	//! relations override this to keep their child's BindContext aligned with the plan.
 	virtual BoundStatement BindAsInput(Binder &binder);
 	DUCKDB_API static string RenderWhitespace(idx_t depth);
 	DUCKDB_API static bool ExposesMultiSourceBindings(Relation &child);
-	DUCKDB_API static bool RequiresDirectRelationBinding(Relation &child);
+	DUCKDB_API static bool RequiresDirectRelationBinding(Binder &binder, Relation &child);
 	DUCKDB_API static bool RequiresSQLMultiSourceBinding(Relation &child);
-	DUCKDB_API static bool CanSerializeExpressionOnChild(Relation &child, const ParsedExpression &expression);
+	DUCKDB_API static bool CanSerializeExpressionOnBoundChild(Binder &binder, Relation &child, TableRef &bound_child,
+	                                                          const ParsedExpression &expression);
 	DUCKDB_API static unique_ptr<TableRef> BindRelationInput(Binder &binder, Relation &child);
 	DUCKDB_API static BoundStatement BindSelectNodeOnChild(Binder &binder, Relation &child,
 	                                                       unique_ptr<SelectNode> select_node);
+	DUCKDB_API static unique_ptr<SelectNode> WrapQueryNode(unique_ptr<QueryNode> query_node, const string &alias,
+	                                                       const vector<ColumnDefinition> &columns);
 	DUCKDB_API static unique_ptr<LogicalOperator> PlanRelationFilter(Binder &binder, unique_ptr<Expression> condition,
 	                                                                 unique_ptr<LogicalOperator> child);
 	DUCKDB_API static void ExpandRelationFilter(Binder &binder, unique_ptr<ParsedExpression> &condition);

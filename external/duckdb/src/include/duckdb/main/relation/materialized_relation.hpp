@@ -25,8 +25,10 @@ public:
 	const vector<ColumnDefinition> &Columns() override;
 	string ToString(idx_t depth) override;
 	string GetAlias() override;
-	unique_ptr<TableRef> GetTableRef() override;
 	unique_ptr<QueryNode> GetQueryNode() override;
+
+protected:
+	unique_ptr<TableRef> GetTableRefInternal() override;
 };
 
 } // namespace duckdb

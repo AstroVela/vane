@@ -18,6 +18,7 @@
 #include "duckdb_python/pandas/pandas_scan.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb_python/pyrelation.hpp"
+#include "duckdb/planner/binder.hpp"
 #include <duckdb/main/settings.hpp>
 #include "duckdb_python/pybind11/gil_wrapper.hpp"
 
@@ -143,14 +144,16 @@ unique_ptr<TableRef> PythonReplacementScan::TryReplacementObject(const py::objec
 			    "created by another Connection and can therefore not be used by this Connection.",
 			    name);
 		}
-		if (!pyrel->GetRel().CanSerializeToQueryNode()) {
+		auto binder = Binder::CreateBinder(context);
+		auto query_node = pyrel->GetRel().TryGetSerializableQueryNode(*binder);
+		if (!query_node) {
 			throw NotImplementedException("Cannot use a relation that cannot be faithfully represented as a SQL query "
 			                              "node in a replacement scan; conversion would discard the exchange or lose "
 			                              "relation bindings");
 		}
 		// create a subquery from the underlying relation object
 		auto select = make_uniq<SelectStatement>();
-		select->node = pyrel->GetRel().GetQueryNode();
+		select->node = std::move(query_node);
 		auto subquery = make_uniq<SubqueryRef>(std::move(select));
 		auto dependency = make_uniq<ExternalDependency>();
 		dependency->AddDependency("replacement_cache", PythonDependencyItem::Create(entry));

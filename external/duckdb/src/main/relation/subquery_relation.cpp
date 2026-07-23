@@ -25,7 +25,7 @@ unique_ptr<QueryNode> SubqueryRelation::GetQueryNode() {
 }
 
 BoundStatement SubqueryRelation::Bind(Binder &binder) {
-	if (!RequiresDirectRelationBinding(*child)) {
+	if (!RequiresDirectRelationBinding(binder, *child)) {
 		return Relation::Bind(binder);
 	}
 	// An alias is an explicit binding boundary. Bind the child through the

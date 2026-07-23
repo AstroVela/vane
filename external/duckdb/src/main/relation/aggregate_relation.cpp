@@ -54,7 +54,7 @@ unique_ptr<QueryNode> AggregateRelation::GetQueryNode() {
 	} else {
 		// The child has one source binding: create a new select node around its table reference.
 		auto select = make_uniq<SelectNode>();
-		select->from_table = child->GetTableRef();
+		select->from_table = GetTableRefForSerialization(*child);
 		result = std::move(select);
 	}
 	D_ASSERT(result->type == QueryNodeType::SELECT_NODE);
@@ -74,7 +74,7 @@ unique_ptr<QueryNode> AggregateRelation::GetQueryNode() {
 }
 
 BoundStatement AggregateRelation::Bind(Binder &binder) {
-	if (!RequiresDirectRelationBinding(*child)) {
+	if (!RequiresDirectRelationBinding(binder, *child)) {
 		return Relation::Bind(binder);
 	}
 	auto select_node = make_uniq<SelectNode>();
@@ -90,14 +90,22 @@ BoundStatement AggregateRelation::Bind(Binder &binder) {
 	return BindSelectNodeOnChild(binder, *child, std::move(select_node));
 }
 
-bool AggregateRelation::CanSerializeToQueryNode() {
+bool AggregateRelation::CanSerializeToQueryNodeInternal(Binder &binder) {
+	if (!child->CanSerializeToQueryNodeInternal(binder)) {
+		return false;
+	}
+	if (!child->InheritsColumnBindings() || RequiresSQLMultiSourceBinding(*child)) {
+		return true;
+	}
+	auto serialization_binder = Binder::CreateBinder(binder.context);
+	auto serialization_input = BindRelationInput(*serialization_binder, *child);
 	for (auto &expression : expressions) {
-		if (!CanSerializeExpressionOnChild(*child, *expression)) {
+		if (!CanSerializeExpressionOnBoundChild(*serialization_binder, *child, *serialization_input, *expression)) {
 			return false;
 		}
 	}
 	for (auto &group : groups.group_expressions) {
-		if (!CanSerializeExpressionOnChild(*child, *group)) {
+		if (!CanSerializeExpressionOnBoundChild(*serialization_binder, *child, *serialization_input, *group)) {
 			return false;
 		}
 	}

@@ -43,9 +43,9 @@ public:
 	Relation *ChildRelation() override {
 		return child.get();
 	}
-	bool CanSerializeToQueryNode() override;
-	bool CanBindAsInput() override {
-		return child->CanBindAsInput();
+	bool CanSerializeToQueryNodeInternal(Binder &binder) override;
+	bool CanBindAsInputInternal(Binder &binder) override {
+		return child->CanBindAsInputInternal(binder);
 	}
 
 protected:

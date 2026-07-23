@@ -28,7 +28,8 @@ static string SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::
 	auto client_context = rel->context->GetContext();
 	string serialized_plan;
 	client_context->RunFunctionInTransaction([&]() {
-		auto relation_stmt = make_uniq<duckdb::RelationStatement>(rel);
+		auto statement_binder = duckdb::Binder::CreateBinder(*client_context);
+		auto relation_stmt = make_uniq<duckdb::RelationStatement>(rel, *statement_binder);
 		duckdb::Planner planner(*client_context);
 		planner.CreatePlan(std::move(relation_stmt));
 		auto logical_plan = std::move(planner.plan);

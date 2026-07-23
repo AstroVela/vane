@@ -37,7 +37,7 @@ public:
 	bool IsReadOnly() override {
 		return false;
 	}
-	bool CanSerializeToQueryNode() override {
+	bool CanSerializeToQueryNodeInternal(Binder &) override {
 		return false;
 	}
 };

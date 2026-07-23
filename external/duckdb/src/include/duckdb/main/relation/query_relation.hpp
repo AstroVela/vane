@@ -29,7 +29,7 @@ public:
 	static unique_ptr<SelectStatement> ParseStatement(ClientContext &context, const string &query, const string &error);
 	unique_ptr<QueryNode> GetQueryNode() override;
 	string GetQuery() override;
-	unique_ptr<TableRef> GetTableRef() override;
+	string GetQuery(Binder &binder) override;
 	BoundStatement Bind(Binder &binder) override;
 
 	const vector<ColumnDefinition> &Columns() override;
@@ -37,6 +37,7 @@ public:
 	string GetAlias() override;
 
 private:
+	unique_ptr<TableRef> GetTableRefInternal() override;
 	unique_ptr<SelectStatement> GetSelectStatement();
 };
 

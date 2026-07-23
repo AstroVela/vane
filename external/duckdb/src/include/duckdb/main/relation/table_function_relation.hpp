@@ -39,7 +39,6 @@ public:
 
 public:
 	unique_ptr<QueryNode> GetQueryNode() override;
-	unique_ptr<TableRef> GetTableRef() override;
 	BoundStatement Bind(Binder &binder) override;
 
 	const vector<ColumnDefinition> &Columns() override;
@@ -54,12 +53,15 @@ public:
 	bool ContainsNonSQLRelation() override {
 		return input_relation && input_relation->ContainsNonSQLRelation();
 	}
-	bool CanSerializeToQueryNode() override {
-		return !input_relation || input_relation->CanSerializeToQueryNode();
+	bool CanSerializeToQueryNodeInternal(Binder &binder) override {
+		return !input_relation || input_relation->CanSerializeToQueryNodeInternal(binder);
 	}
-	bool CanBindAsInput() override {
-		return !input_relation || input_relation->CanBindAsInput();
+	bool CanBindAsInputInternal(Binder &binder) override {
+		return !input_relation || input_relation->CanBindAsInputInternal(binder);
 	}
+
+protected:
+	unique_ptr<TableRef> GetTableRefInternal() override;
 
 private:
 	void InitializeColumns();

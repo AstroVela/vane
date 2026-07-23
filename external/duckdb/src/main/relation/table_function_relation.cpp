@@ -101,11 +101,11 @@ void TableFunctionRelation::CaptureVirtualColumnNames(const LogicalOperator &pla
 unique_ptr<QueryNode> TableFunctionRelation::GetQueryNode() {
 	auto result = make_uniq<SelectNode>();
 	result->select_list.push_back(make_uniq<StarExpression>());
-	result->from_table = GetTableRef();
+	result->from_table = GetTableRefForSerialization(*this);
 	return std::move(result);
 }
 
-unique_ptr<TableRef> TableFunctionRelation::GetTableRef() {
+unique_ptr<TableRef> TableFunctionRelation::GetTableRefInternal() {
 	vector<unique_ptr<ParsedExpression>> children;
 	if (input_relation) { // input relation becomes first parameter if present, always
 		auto subquery = make_uniq<SubqueryExpression>();
@@ -212,7 +212,7 @@ BoundStatement TableFunctionRelation::BindAsInput(Binder &binder) {
 	if (input_relation) {
 		return Bind(binder);
 	}
-	auto table_ref = GetTableRef();
+	auto table_ref = GetTableRefForSerialization(*this);
 	auto result = binder.Bind(*table_ref);
 	CaptureVirtualColumnNames(*result.plan);
 	return result;

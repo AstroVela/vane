@@ -38,7 +38,7 @@ unique_ptr<QueryNode> ProjectionRelation::GetQueryNode() {
 	} else {
 		// The child has one source binding: create a new select node around its table reference.
 		auto select = make_uniq<SelectNode>();
-		select->from_table = child->GetTableRef();
+		select->from_table = GetTableRefForSerialization(*child);
 		result = std::move(select);
 	}
 	D_ASSERT(result->type == QueryNodeType::SELECT_NODE);
@@ -52,7 +52,7 @@ unique_ptr<QueryNode> ProjectionRelation::GetQueryNode() {
 }
 
 BoundStatement ProjectionRelation::Bind(Binder &binder) {
-	if (!RequiresDirectRelationBinding(*child)) {
+	if (!RequiresDirectRelationBinding(binder, *child)) {
 		return Relation::Bind(binder);
 	}
 	auto select_node = make_uniq<SelectNode>();
@@ -64,13 +64,18 @@ BoundStatement ProjectionRelation::Bind(Binder &binder) {
 	return BindSelectNodeOnChild(binder, *child, std::move(select_node));
 }
 
-bool ProjectionRelation::CanSerializeToQueryNode() {
-	for (auto &expression : expressions) {
-		if (!CanSerializeExpressionOnChild(*child, *expression)) {
-			return false;
-		}
+bool ProjectionRelation::CanSerializeToQueryNodeInternal(Binder &binder) {
+	if (!child->CanSerializeToQueryNodeInternal(binder)) {
+		return false;
 	}
-	return true;
+	if (!child->InheritsColumnBindings() || RequiresSQLMultiSourceBinding(*child)) {
+		return true;
+	}
+	auto serialization_binder = Binder::CreateBinder(binder.context);
+	auto serialization_input = BindRelationInput(*serialization_binder, *child);
+	return std::all_of(expressions.begin(), expressions.end(), [&](const auto &expression) {
+		return CanSerializeExpressionOnBoundChild(*serialization_binder, *child, *serialization_input, *expression);
+	});
 }
 
 string ProjectionRelation::GetAlias() {

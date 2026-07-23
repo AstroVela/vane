@@ -39,7 +39,8 @@ public:
 	string ToString(idx_t depth) override;
 	string GetAlias() override;
 
-	unique_ptr<TableRef> GetTableRef() override;
+protected:
+	unique_ptr<TableRef> GetTableRefInternal() override;
 };
 
 } // namespace duckdb

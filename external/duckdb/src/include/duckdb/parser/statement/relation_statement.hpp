@@ -19,6 +19,7 @@ public:
 
 public:
 	explicit RelationStatement(shared_ptr<Relation> relation);
+	RelationStatement(shared_ptr<Relation> relation, Binder &binder);
 
 	shared_ptr<Relation> relation;
 

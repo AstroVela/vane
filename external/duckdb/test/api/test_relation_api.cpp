@@ -10,6 +10,7 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/main/relation/explain_relation.hpp"
+#include "duckdb/main/relation/query_relation.hpp"
 #include "duckdb/main/relation/value_relation.hpp"
 #include "iostream"
 #include "test_helpers.hpp"
@@ -1104,9 +1105,11 @@ TEST_CASE("Test Relation Query setting query", "[relation_api]") {
 	DuckDB db;
 	Connection con(db);
 
-	auto query = con.RelationFromQuery("SELECT current_query()");
-	auto result = query->Limit(1)->Execute();
-	REQUIRE(!result->Fetch()->GetValue(0, 0).ToString().empty());
+	const string query_text = "SELECT current_query() /* preserve relation query text */";
+	auto statement = QueryRelation::ParseStatement(*con.context, query_text, "Expected a SELECT statement");
+	auto query = con.RelationFromQuery(std::move(statement), "queryrelation", query_text);
+	auto result = query->Execute();
+	REQUIRE(result->Fetch()->GetValue(0, 0).ToString() == query_text);
 }
 
 TEST_CASE("Construct ValueRelation with RelationContextWrapper and operate on it", "[relation_api][txn][wrapper]") {
@@ -1212,6 +1215,7 @@ TEST_CASE("Relation input binding is independent from SQL serialization", "[rela
 	auto direct_bound = distinct_join->Project("r.value AS x");
 	REQUIRE_FALSE(direct_bound->CanSerializeToQueryNode());
 	REQUIRE(direct_bound->CanBindAsInput());
+	REQUIRE_THROWS_AS(direct_bound->GetTableRef(), NotImplementedException);
 	REQUIRE_NOTHROW(result = direct_bound->Filter("x > 100")->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {200}));
 
@@ -1347,6 +1351,119 @@ TEST_CASE("Empty order is an identity and inherits child serializability", "[rel
 	REQUIRE(CHECK_COLUMN(result, 0, {42}));
 	REQUIRE_NOTHROW(result = ordered->Limit(1)->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+}
+
+TEST_CASE("Bound local query scopes determine relation serialization", "[relation_api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE scope_left(id INTEGER, join_key INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO scope_left VALUES (7, 1)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE scope_right(join_key INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO scope_right VALUES (1)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE local_scope_source(id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO local_scope_source VALUES (42)"));
+
+	auto left = con.Table("scope_left")->Alias("l");
+	auto right = con.Table("scope_right")->Alias("r");
+	auto boundary = left->Join(right, "l.join_key = r.join_key")->Distinct();
+
+	auto correlated = boundary->Project("(SELECT l.id) AS value");
+	REQUIRE_FALSE(correlated->CanSerializeToQueryNode());
+	REQUIRE(correlated->GetQuery().empty());
+	REQUIRE_NOTHROW(result = correlated->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {7}));
+
+	auto local = boundary->Project("(SELECT l.id FROM local_scope_source AS l) AS value");
+	REQUIRE(local->CanSerializeToQueryNode());
+	REQUIRE_FALSE(local->GetQuery().empty());
+	REQUIRE_NOTHROW(result = local->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE MACRO relation_field(value) AS value.id"));
+	auto macro_correlated = boundary->Project("relation_field(l) AS value");
+	REQUIRE_FALSE(macro_correlated->CanSerializeToQueryNode());
+	REQUIRE(macro_correlated->GetQuery().empty());
+	REQUIRE_NOTHROW(result = macro_correlated->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {7}));
+
+	auto using_boundary = left->Join(right, "join_key")->Distinct();
+	auto surviving_output = using_boundary->Project("(SELECT join_key) AS value");
+	REQUIRE(surviving_output->CanSerializeToQueryNode());
+	REQUIRE_FALSE(surviving_output->GetQuery().empty());
+	REQUIRE_NOTHROW(result = surviving_output->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+
+	auto outer_boundary = left->Join(right, "join_key", JoinType::OUTER)->Distinct();
+	auto coalesced_output = outer_boundary->Project("(SELECT join_key) AS value");
+	REQUIRE(coalesced_output->CanSerializeToQueryNode());
+	REQUIRE_FALSE(coalesced_output->GetQuery().empty());
+	REQUIRE_NOTHROW(result = coalesced_output->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+}
+
+TEST_CASE("Relation serialization follows current catalog bindings", "[relation_api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	REQUIRE_NO_FAIL(con.Query("CREATE VIEW local_scope_source AS SELECT 42 AS right_value"));
+	auto left = con.RelationFromQuery("SELECT 1 AS join_key", "l");
+	auto right = con.RelationFromQuery("SELECT 1 AS join_key, 100 AS right_value", "r");
+	auto relation = left->Join(right, "l.join_key = r.join_key")
+	                    ->Distinct()
+	                    ->Project("(SELECT r.right_value FROM local_scope_source AS r) AS value");
+
+	REQUIRE(relation->CanSerializeToQueryNode());
+	REQUIRE_FALSE(relation->GetQuery().empty());
+	REQUIRE_NOTHROW(result = relation->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE OR REPLACE VIEW local_scope_source AS SELECT 99 AS other"));
+	REQUIRE_FALSE(relation->CanSerializeToQueryNode());
+	REQUIRE(relation->GetQuery().empty());
+	REQUIRE_NOTHROW(result = relation->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {100}));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE OR REPLACE VIEW local_scope_source AS SELECT 84 AS right_value"));
+	REQUIRE(relation->CanSerializeToQueryNode());
+	REQUIRE_FALSE(relation->GetQuery().empty());
+	REQUIRE_NOTHROW(result = relation->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {84}));
+}
+
+TEST_CASE("Relation SQL preserves result modifier boundaries", "[relation_api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE modifier_values(id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO modifier_values VALUES (1), (1), (2)"));
+	auto values = con.Table("modifier_values")->Order("id");
+
+	auto limited_distinct = values->Limit(2)->Distinct();
+	REQUIRE_NOTHROW(result = limited_distinct->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+	REQUIRE_FALSE(limited_distinct->GetQuery().empty());
+	REQUIRE_NOTHROW(result = con.Query(limited_distinct->GetQuery()));
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+
+	auto double_limit = values->Limit(2)->Limit(1);
+	REQUIRE_NOTHROW(result = double_limit->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+	REQUIRE_FALSE(double_limit->GetQuery().empty());
+	REQUIRE_NOTHROW(result = con.Query(double_limit->GetQuery()));
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+
+	auto union_left = con.RelationFromQuery("SELECT 1 AS id", "union_left");
+	auto union_right = con.RelationFromQuery("SELECT 1 AS id", "union_right");
+	auto union_distinct = union_left->Union(union_right)->Distinct();
+	REQUIRE_NOTHROW(result = union_distinct->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+	REQUIRE_FALSE(union_distinct->GetQuery().empty());
+	REQUIRE_NOTHROW(result = con.Query(union_distinct->GetQuery()));
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
 }
 
 TEST_CASE("Struct fields preserve relation serialization boundaries", "[relation_api]") {

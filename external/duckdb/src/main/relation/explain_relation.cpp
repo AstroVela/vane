@@ -21,7 +21,7 @@ ExplainRelation::ExplainRelation(shared_ptr<Relation> child_p, ExplainType type,
 }
 
 BoundStatement ExplainRelation::Bind(Binder &binder) {
-	auto relation_stmt = make_uniq<RelationStatement>(child);
+	auto relation_stmt = make_uniq<RelationStatement>(child, binder);
 	ExplainStatement explain(std::move(relation_stmt), type, format);
 	return binder.Bind(explain.Cast<SQLStatement>());
 }

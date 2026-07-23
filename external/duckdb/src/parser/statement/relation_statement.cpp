@@ -8,6 +8,11 @@ RelationStatement::RelationStatement(shared_ptr<Relation> relation_p)
 	query = relation->GetQuery();
 }
 
+RelationStatement::RelationStatement(shared_ptr<Relation> relation_p, Binder &binder)
+    : SQLStatement(StatementType::RELATION_STATEMENT), relation(std::move(relation_p)) {
+	query = relation->GetQuery(binder);
+}
+
 unique_ptr<SQLStatement> RelationStatement::Copy() const {
 	return unique_ptr<RelationStatement>(new RelationStatement(*this));
 }

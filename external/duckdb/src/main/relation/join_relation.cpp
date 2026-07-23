@@ -38,7 +38,7 @@ JoinRelation::JoinRelation(shared_ptr<Relation> left_p, shared_ptr<Relation> rig
 unique_ptr<QueryNode> JoinRelation::GetQueryNode() {
 	auto result = make_uniq<SelectNode>();
 	result->select_list.push_back(make_uniq<StarExpression>());
-	result->from_table = GetTableRef();
+	result->from_table = GetTableRefForSerialization(*this);
 	return std::move(result);
 }
 
@@ -46,14 +46,14 @@ BoundStatement JoinRelation::BindAsInput(Binder &binder) {
 	if (ContainsNonSQLRelation()) {
 		return Relation::Bind(binder);
 	}
-	auto table_ref = GetTableRef();
+	auto table_ref = GetTableRefForSerialization(*this);
 	return binder.Bind(*table_ref);
 }
 
-unique_ptr<TableRef> JoinRelation::GetTableRef() {
+unique_ptr<TableRef> JoinRelation::GetTableRefInternal() {
 	auto join_ref = make_uniq<JoinRef>(join_ref_type);
-	join_ref->left = left->GetTableRef();
-	join_ref->right = right->GetTableRef();
+	join_ref->left = GetTableRefForSerialization(*left);
+	join_ref->right = GetTableRefForSerialization(*right);
 	if (condition) {
 		join_ref->condition = condition->Copy();
 	}

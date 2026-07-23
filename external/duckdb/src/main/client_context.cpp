@@ -1401,18 +1401,29 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContext
 		// run the ToString method of any relation we run, mostly to ensure it doesn't crash
 		relation->ToString();
 		relation->GetAlias();
-		if (relation->IsReadOnly() && relation->CanSerializeToQueryNode()) {
-			// verify read only statements by running a select statement
-			auto select = make_uniq<SelectStatement>();
-			select->node = relation->GetQueryNode();
-			PendingQueryParameters parameters;
-			parameters.query_parameters = query_parameters;
-			parameters.query_parameters.output_type = QueryResultOutputType::FORCE_MATERIALIZED;
-			RunStatementInternal(lock, query, std::move(select), parameters);
+		if (relation->IsReadOnly()) {
+			unique_ptr<QueryNode> query_node;
+			RunFunctionInTransactionInternal(lock, [&]() {
+				auto binder = Binder::CreateBinder(*this);
+				query_node = relation->TryGetSerializableQueryNode(*binder);
+			});
+			if (query_node) {
+				// verify read only statements by running a select statement
+				auto select = make_uniq<SelectStatement>();
+				select->node = std::move(query_node);
+				PendingQueryParameters parameters;
+				parameters.query_parameters = query_parameters;
+				parameters.query_parameters.output_type = QueryResultOutputType::FORCE_MATERIALIZED;
+				RunStatementInternal(lock, query, std::move(select), parameters);
+			}
 		}
 	}
 
-	auto relation_stmt = make_uniq<RelationStatement>(relation);
+	unique_ptr<RelationStatement> relation_stmt;
+	RunFunctionInTransactionInternal(lock, [&]() {
+		auto statement_binder = Binder::CreateBinder(*this);
+		relation_stmt = make_uniq<RelationStatement>(relation, *statement_binder);
+	});
 	PendingQueryParameters parameters;
 	parameters.query_parameters = query_parameters;
 	return PendingQueryInternal(lock, std::move(relation_stmt), parameters);

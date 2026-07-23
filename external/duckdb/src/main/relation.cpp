@@ -28,19 +28,21 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_subquery_expression.hpp"
+#include "duckdb/planner/expression_binder/relation_binder.hpp"
+#include "duckdb/planner/expression_binder/select_binder.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/query_node/bound_select_node.hpp"
 #include "duckdb/parser/tableref/bound_ref_wrapper.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
-#include "duckdb/parser/query_node/recursive_cte_node.hpp"
-#include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
-#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
-#include "duckdb/parser/tableref/list.hpp"
 #include "duckdb/main/relation/join_relation.hpp"
 #include "duckdb/main/relation/value_relation.hpp"
 #include "duckdb/parser/statement/explain_statement.hpp"
@@ -253,14 +255,66 @@ string Relation::GetAlias() {
 }
 
 unique_ptr<TableRef> Relation::GetTableRef() {
-	if (!CanSerializeToQueryNode()) {
-		throw NotImplementedException("Cannot create a table reference for a relation that cannot be faithfully "
-		                              "represented as a SQL query node; conversion would discard the exchange or lose "
-		                              "relation bindings");
-	}
+	unique_ptr<TableRef> result;
+	auto client_context = context->GetContext();
+	client_context->RunFunctionInTransaction([&]() {
+		auto binder = Binder::CreateBinder(*client_context);
+		if (!CanSerializeToQueryNodeInternal(*binder)) {
+			throw NotImplementedException(
+			    "Cannot create a table reference for a relation that cannot be faithfully "
+			    "represented as a SQL query node; conversion would discard the exchange or lose "
+			    "relation bindings");
+		}
+		result = GetTableRefInternal();
+	});
+	return result;
+}
+
+unique_ptr<TableRef> Relation::GetTableRefInternal() {
 	auto select = make_uniq<SelectStatement>();
 	select->node = GetQueryNode();
 	return make_uniq<SubqueryRef>(std::move(select), GetAlias());
+}
+
+unique_ptr<TableRef> Relation::GetTableRefForSerialization(Relation &relation) {
+	return relation.GetTableRefInternal();
+}
+
+bool Relation::CanSerializeToQueryNode() {
+	bool result = false;
+	auto client_context = context->GetContext();
+	client_context->RunFunctionInTransaction([&]() {
+		auto binder = Binder::CreateBinder(*client_context);
+		result = CanSerializeToQueryNodeInternal(*binder);
+	});
+	return result;
+}
+
+unique_ptr<QueryNode> Relation::TryGetSerializableQueryNode() {
+	unique_ptr<QueryNode> result;
+	auto client_context = context->GetContext();
+	client_context->RunFunctionInTransaction([&]() {
+		auto binder = Binder::CreateBinder(*client_context);
+		result = TryGetSerializableQueryNode(*binder);
+	});
+	return result;
+}
+
+unique_ptr<QueryNode> Relation::TryGetSerializableQueryNode(Binder &binder) {
+	if (!CanSerializeToQueryNodeInternal(binder)) {
+		return nullptr;
+	}
+	return GetQueryNode();
+}
+
+bool Relation::CanBindAsInput() {
+	bool result = false;
+	auto client_context = context->GetContext();
+	client_context->RunFunctionInTransaction([&]() {
+		auto binder = Binder::CreateBinder(*client_context);
+		result = CanBindAsInputInternal(*binder);
+	});
+	return result;
 }
 
 unique_ptr<QueryResult> Relation::Execute() {
@@ -277,13 +331,14 @@ unique_ptr<QueryResult> Relation::ExecuteOrThrow() {
 }
 
 BoundStatement Relation::Bind(Binder &binder) {
-	if (!CanSerializeToQueryNode()) {
+	auto query_node = TryGetSerializableQueryNode(binder);
+	if (!query_node) {
 		throw NotImplementedException(
 		    "Cannot bind a relation that cannot be faithfully represented as a SQL query node; "
 		    "conversion would discard the exchange or lose relation bindings");
 	}
 	SelectStatement stmt;
-	stmt.node = GetQueryNode();
+	stmt.node = std::move(query_node);
 	return binder.Bind(stmt.Cast<SQLStatement>());
 }
 
@@ -291,9 +346,9 @@ BoundStatement Relation::BindAsInput(Binder &binder) {
 	return Bind(binder);
 }
 
-bool Relation::RequiresDirectRelationBinding(Relation &child) {
-	if (!child.CanSerializeToQueryNode()) {
-		return child.CanBindAsInput();
+bool Relation::RequiresDirectRelationBinding(Binder &binder, Relation &child) {
+	if (!child.CanSerializeToQueryNodeInternal(binder)) {
+		return child.CanBindAsInputInternal(binder);
 	}
 	return child.InheritsColumnBindings() || ExposesMultiSourceBindings(child);
 }
@@ -322,10 +377,13 @@ namespace {
 
 class SerializedExpressionScopeChecker {
 public:
-	explicit SerializedExpressionScopeChecker(Relation &child) : child_alias(child.GetAlias()) {
+	SerializedExpressionScopeChecker(Binder &binder, Relation &child, BoundRefWrapper &bound_child)
+	    : child_alias(child.GetAlias()), serialization_parent_binder(binder), bound_child_binder(*bound_child.binder) {
 		for (auto &column : child.Columns()) {
 			serialized_columns.push_back(column.Name());
+			serialized_types.push_back(column.Type());
 		}
+		serialized_columns = BindContext::AliasColumnNames(child_alias, serialized_columns, {});
 		auto source = &child;
 		while (source->InheritsColumnBindings()) {
 			source = source->ChildRelation();
@@ -336,16 +394,283 @@ public:
 
 	bool Check(const ParsedExpression &expression) {
 		VisitExpression(expression);
-		return serializable;
+		return serializable && BoundExpressionBindingsMatch(expression);
 	}
 
 private:
+	struct ResolvedCorrelation {
+		ColumnBinding binding;
+		idx_t depth;
+
+		bool operator==(const ResolvedCorrelation &other) const {
+			return binding == other.binding && depth == other.depth;
+		}
+	};
+
 	struct ScopedBinding {
-		string catalog;
-		string schema;
 		string alias;
 		vector<string> columns;
 	};
+
+	static void AddCorrelation(vector<ResolvedCorrelation> &correlations, ColumnBinding binding, idx_t depth) {
+		ResolvedCorrelation correlation {binding, depth};
+		if (std::find(correlations.begin(), correlations.end(), correlation) == correlations.end()) {
+			correlations.push_back(std::move(correlation));
+		}
+	}
+
+	static void CollectColumnBindings(const Expression &expression, vector<ColumnBinding> &bindings) {
+		ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
+		    expression, [&](const BoundColumnRefExpression &column_ref) {
+			    if (std::find(bindings.begin(), bindings.end(), column_ref.binding) == bindings.end()) {
+				    bindings.push_back(column_ref.binding);
+			    }
+		    });
+	}
+
+	static void InitializeSelectNode(Binder &binder, BoundSelectNode &node) {
+		node.projection_index = binder.GenerateTableIndex();
+		node.group_index = binder.GenerateTableIndex();
+		node.aggregate_index = binder.GenerateTableIndex();
+		node.groupings_index = binder.GenerateTableIndex();
+		node.window_index = binder.GenerateTableIndex();
+		node.prune_index = binder.GenerateTableIndex();
+	}
+
+	static bool CollectSyntheticBinding(const BoundColumnRefExpression &column_ref, const BoundSelectNode &node,
+	                                    vector<ResolvedCorrelation> &bindings) {
+		auto &binding = column_ref.binding;
+		if (binding.table_index == node.aggregate_index) {
+			if (binding.column_index >= node.aggregates.size()) {
+				throw InternalException("Aggregate binding is out of range while checking relation serialization");
+			}
+			CollectBoundExpressionBindings(*node.aggregates[binding.column_index], node, bindings);
+			return true;
+		}
+		if (binding.table_index == node.window_index) {
+			if (binding.column_index >= node.windows.size()) {
+				throw InternalException("Window binding is out of range while checking relation serialization");
+			}
+			CollectBoundExpressionBindings(*node.windows[binding.column_index], node, bindings);
+			return true;
+		}
+		if (binding.table_index == node.group_index) {
+			if (binding.column_index >= node.groups.group_expressions.size()) {
+				throw InternalException("Group binding is out of range while checking relation serialization");
+			}
+			CollectBoundExpressionBindings(*node.groups.group_expressions[binding.column_index], node, bindings);
+			return true;
+		}
+		if (binding.table_index == node.groupings_index) {
+			for (auto &group : node.groups.group_expressions) {
+				CollectBoundExpressionBindings(*group, node, bindings);
+			}
+			return true;
+		}
+		for (auto &entry : node.unnests) {
+			auto &unnest = entry.second;
+			if (binding.table_index != unnest.index) {
+				continue;
+			}
+			if (binding.column_index >= unnest.expressions.size()) {
+				throw InternalException("Unnest binding is out of range while checking relation serialization");
+			}
+			CollectBoundExpressionBindings(*unnest.expressions[binding.column_index], node, bindings);
+			return true;
+		}
+		return false;
+	}
+
+	static void CollectBoundExpressionBindings(const Expression &expression, const BoundSelectNode &node,
+	                                           vector<ResolvedCorrelation> &bindings) {
+		if (expression.GetExpressionClass() == ExpressionClass::BOUND_SUBQUERY) {
+			auto &subquery = expression.Cast<BoundSubqueryExpression>();
+			for (auto &correlation : subquery.binder->correlated_columns) {
+				AddCorrelation(bindings, correlation.binding, correlation.depth);
+			}
+		}
+		if (expression.type == ExpressionType::BOUND_COLUMN_REF) {
+			auto &column_ref = expression.Cast<BoundColumnRefExpression>();
+			if (!CollectSyntheticBinding(column_ref, node, bindings)) {
+				AddCorrelation(bindings, column_ref.binding, column_ref.depth);
+			}
+			return;
+		}
+		ExpressionIterator::EnumerateChildren(
+		    expression, [&](const Expression &child) { CollectBoundExpressionBindings(child, node, bindings); });
+	}
+
+	static bool TryBindExpression(Binder &binder, const ParsedExpression &expression,
+	                              vector<ResolvedCorrelation> &bindings, unique_ptr<ParsedExpression> &bound_copy) {
+		bound_copy = expression.Copy();
+		BoundSelectNode node;
+		InitializeSelectNode(binder, node);
+		BoundGroupInformation group_info;
+		try {
+			SelectBinder expression_binder(binder, binder.context, node, group_info);
+			auto bound_expression = expression_binder.Bind(bound_copy);
+			CollectBoundExpressionBindings(*bound_expression, node, bindings);
+			return true;
+		} catch (Exception &ex) {
+			ErrorData error(ex);
+			if (error.Type() != ExceptionType::BINDER) {
+				throw;
+			}
+			return false;
+		}
+	}
+
+	bool NormalizeSerializedBindings(const vector<ResolvedCorrelation> &bindings,
+	                                 vector<ResolvedCorrelation> &normalized) const {
+		for (auto &binding : bindings) {
+			if (binding.binding.table_index != serialized_table_index) {
+				AddCorrelation(normalized, binding.binding, binding.depth);
+				continue;
+			}
+			if (binding.binding.column_index >= serialized_output_origins.size()) {
+				return false;
+			}
+			for (auto &origin : serialized_output_origins[binding.binding.column_index]) {
+				AddCorrelation(normalized, origin, binding.depth);
+			}
+		}
+		return true;
+	}
+
+	static bool BindingsMatch(const vector<ResolvedCorrelation> &left, const vector<ResolvedCorrelation> &right) {
+		if (left.size() != right.size()) {
+			return false;
+		}
+		return std::all_of(left.begin(), left.end(), [&](const auto &binding) {
+			return std::find(right.begin(), right.end(), binding) != right.end();
+		});
+	}
+
+	bool BoundExpressionBindingsMatch(const ParsedExpression &expression) {
+		if (!InitializeSubqueryScopes()) {
+			return false;
+		}
+
+		vector<ResolvedCorrelation> direct_bindings;
+		unique_ptr<ParsedExpression> direct_copy;
+		auto direct_bound = TryBindExpression(bound_child_binder, expression, direct_bindings, direct_copy);
+		vector<ResolvedCorrelation> serialized_bindings;
+		unique_ptr<ParsedExpression> serialized_copy;
+		auto serialized_bound =
+		    TryBindExpression(*serialized_scope_binder, expression, serialized_bindings, serialized_copy);
+
+		if (!direct_bound) {
+			// Binding can expand a macro before rejecting an expression class that is
+			// not valid in a synthetic SELECT. Inspect that expanded tree so hidden
+			// qualifiers introduced by the macro are still detected.
+			VisitExpression(*direct_copy);
+			if (serialized_bound) {
+				return false;
+			}
+			return serializable;
+		}
+		if (!serialized_bound) {
+			return false;
+		}
+
+		vector<ResolvedCorrelation> normalized_bindings;
+		if (!NormalizeSerializedBindings(serialized_bindings, normalized_bindings)) {
+			return false;
+		}
+		return BindingsMatch(direct_bindings, normalized_bindings);
+	}
+
+	bool InitializeSubqueryScopes() {
+		if (serialized_scope_binder) {
+			return serializable;
+		}
+		serialized_scope_binder =
+		    Binder::CreateBinder(serialization_parent_binder.context, &serialization_parent_binder);
+		serialized_table_index = serialized_scope_binder->GenerateTableIndex();
+		serialized_scope_binder->bind_context.AddGenericBinding(serialized_table_index, child_alias, serialized_columns,
+		                                                        serialized_types);
+		ResolveSerializedOutputOrigins();
+		return serializable;
+	}
+
+	void ResolveSerializedOutputOrigins() {
+		vector<unique_ptr<ParsedExpression>> output_columns;
+		StarExpression star;
+		bound_child_binder.bind_context.GenerateAllColumnExpressions(star, output_columns);
+		if (output_columns.size() != serialized_columns.size()) {
+			serializable = false;
+			return;
+		}
+
+		RelationBinder relation_binder(bound_child_binder, bound_child_binder.context, "relation serialization");
+		serialized_output_origins.reserve(output_columns.size());
+		for (auto &column : output_columns) {
+			auto bound_column = relation_binder.Bind(column);
+			vector<ColumnBinding> origins;
+			CollectColumnBindings(*bound_column, origins);
+			if (origins.empty()) {
+				serializable = false;
+				return;
+			}
+			serialized_output_origins.push_back(std::move(origins));
+		}
+	}
+
+	bool TryBindSubquery(const QueryNode &node, Binder &parent, vector<ResolvedCorrelation> &correlations) const {
+		try {
+			auto query = node.Copy();
+			// Correlated lookup walks the active expression binders rather than
+			// Binder parent contexts alone.
+			RelationBinder outer_binder(parent, parent.context, "relation serialization");
+			auto query_binder = Binder::CreateBinder(parent.context, &parent);
+			query_binder->Bind(*query);
+			for (auto &correlation : query_binder->correlated_columns) {
+				AddCorrelation(correlations, correlation.binding, correlation.depth);
+			}
+			return true;
+		} catch (Exception &ex) {
+			ErrorData error(ex);
+			if (error.Type() != ExceptionType::BINDER) {
+				throw;
+			}
+			return false;
+		}
+	}
+
+	bool SubqueryBindingsMatch(const QueryNode &node) {
+		if (!InitializeSubqueryScopes()) {
+			return false;
+		}
+		vector<ResolvedCorrelation> direct_correlations;
+		if (!TryBindSubquery(node, bound_child_binder, direct_correlations)) {
+			return false;
+		}
+		vector<ResolvedCorrelation> serialized_correlations;
+		if (!TryBindSubquery(node, *serialized_scope_binder, serialized_correlations)) {
+			return false;
+		}
+
+		vector<ResolvedCorrelation> normalized_correlations;
+		for (auto &correlation : serialized_correlations) {
+			if (correlation.binding.table_index != serialized_table_index) {
+				AddCorrelation(normalized_correlations, correlation.binding, correlation.depth);
+				continue;
+			}
+			if (correlation.binding.column_index >= serialized_output_origins.size()) {
+				return false;
+			}
+			for (auto &origin : serialized_output_origins[correlation.binding.column_index]) {
+				AddCorrelation(normalized_correlations, origin, correlation.depth);
+			}
+		}
+		if (direct_correlations.size() != normalized_correlations.size()) {
+			return false;
+		}
+		return std::all_of(direct_correlations.begin(), direct_correlations.end(), [&](const auto &correlation) {
+			return std::find(normalized_correlations.begin(), normalized_correlations.end(), correlation) !=
+			       normalized_correlations.end();
+		});
+	}
 
 	static bool Matches(const string &left, const string &right) {
 		return StringUtil::CIEquals(left, right);
@@ -354,11 +679,6 @@ private:
 	static bool HasColumn(const ScopedBinding &binding, const string &column_name) {
 		return std::any_of(binding.columns.begin(), binding.columns.end(),
 		                   [&](const string &column) { return Matches(column, column_name); });
-	}
-
-	static bool HasAlias(const vector<ScopedBinding> &scope, const string &alias) {
-		return std::any_of(scope.begin(), scope.end(),
-		                   [&](const ScopedBinding &binding) { return Matches(binding.alias, alias); });
 	}
 
 	void CollectRelationBindings(Relation &relation, vector<ScopedBinding> &bindings) {
@@ -383,6 +703,7 @@ private:
 		for (auto &column : relation.Columns()) {
 			binding.columns.push_back(column.Name());
 		}
+		binding.columns = BindContext::AliasColumnNames(binding.alias, binding.columns, {});
 		if (relation.type == RelationType::TABLE_RELATION) {
 			binding.columns.emplace_back("rowid");
 		} else if (relation.type == RelationType::TABLE_FUNCTION_RELATION) {
@@ -394,15 +715,7 @@ private:
 	}
 
 	bool QualifierIsVisible(const string &qualifier) const {
-		if (StringUtil::CIEquals(qualifier, child_alias)) {
-			return true;
-		}
-		for (auto scope = query_scopes.rbegin(); scope != query_scopes.rend(); scope++) {
-			if (HasAlias(*scope, qualifier)) {
-				return true;
-			}
-		}
-		return false;
+		return StringUtil::CIEquals(qualifier, child_alias);
 	}
 
 	bool BindingMatchesHiddenReference(const ScopedBinding &binding, const ColumnRefExpression &column_ref) const {
@@ -420,31 +733,6 @@ private:
 		return false;
 	}
 
-	bool ScopeBindsReference(const vector<ScopedBinding> &scope, const ColumnRefExpression &column_ref) const {
-		auto &names = column_ref.column_names;
-		D_ASSERT(names.size() >= 2);
-		for (auto &binding : scope) {
-			// table.column followed by zero or more struct fields
-			if (Matches(binding.alias, names[0]) && HasColumn(binding, names[1])) {
-				return true;
-			}
-			// catalog.schema.table.column or schema.table.column
-			if (names.size() == 3 && Matches(binding.alias, names[1]) && HasColumn(binding, names[2]) &&
-			    ((!binding.catalog.empty() && Matches(binding.catalog, names[0])) ||
-			     (!binding.schema.empty() && Matches(binding.schema, names[0])))) {
-				return true;
-			}
-			if (names.size() >= 4 && Matches(binding.catalog, names[0]) && Matches(binding.schema, names[1]) &&
-			    Matches(binding.alias, names[2]) && HasColumn(binding, names[3])) {
-				return true;
-			}
-		}
-		// If the leading name is a column in this scope, the binder interprets
-		// the remaining names as struct fields before trying an outer scope.
-		return std::any_of(scope.begin(), scope.end(),
-		                   [&](const ScopedBinding &binding) { return HasColumn(binding, names[0]); });
-	}
-
 	bool ReferencesHiddenBinding(const ColumnRefExpression &column_ref) const {
 		if (!column_ref.IsQualified()) {
 			auto &column_name = column_ref.GetColumnName();
@@ -455,12 +743,6 @@ private:
 			                                     [&](const string &column) { return Matches(column, column_name); });
 			if (!hidden_column || serialized_column) {
 				return false;
-			}
-			for (auto scope = query_scopes.rbegin(); scope != query_scopes.rend(); scope++) {
-				if (std::any_of(scope->begin(), scope->end(),
-				                [&](const ScopedBinding &binding) { return HasColumn(binding, column_name); })) {
-					return false;
-				}
 			}
 			return true;
 		}
@@ -480,36 +762,12 @@ private:
 		if (!matches_hidden_binding) {
 			return false;
 		}
-		for (auto scope = query_scopes.rbegin(); scope != query_scopes.rend(); scope++) {
-			if (ScopeBindsReference(*scope, column_ref)) {
-				return false;
-			}
-		}
 		return true;
 	}
 
 	bool HiddenQualifier(const string &qualifier) const {
 		return std::any_of(hidden_bindings.begin(), hidden_bindings.end(),
 		                   [&](const ScopedBinding &binding) { return Matches(binding.alias, qualifier); });
-	}
-
-	void VisitTableRefQuery(QueryNode &node) {
-		// A FROM item's alias belongs to the containing SELECT and is not visible
-		// inside the query that defines that item. Drop only the current SELECT's
-		// scope while descending, retaining any genuinely correlated outer scopes.
-		D_ASSERT(!query_scopes.empty());
-		auto current_scope = std::move(query_scopes.back());
-		query_scopes.pop_back();
-		VisitQueryNode(node);
-		query_scopes.push_back(std::move(current_scope));
-	}
-
-	void VisitTableRefExpression(const ParsedExpression &expression) {
-		D_ASSERT(!query_scopes.empty());
-		auto current_scope = std::move(query_scopes.back());
-		query_scopes.pop_back();
-		VisitExpression(expression);
-		query_scopes.push_back(std::move(current_scope));
 	}
 
 	void VisitExpression(const ParsedExpression &expression) {
@@ -552,7 +810,9 @@ private:
 				serializable = false;
 				return;
 			}
-			VisitQueryNode(*subquery.subquery->node);
+			if (!SubqueryBindingsMatch(*subquery.subquery->node)) {
+				serializable = false;
+			}
 			return;
 		}
 		default:
@@ -562,249 +822,39 @@ private:
 		                                            [&](const ParsedExpression &child) { VisitExpression(child); });
 	}
 
-	bool CollectQueryOutputColumns(const QueryNode &node, vector<string> &columns) const {
-		switch (node.type) {
-		case QueryNodeType::SELECT_NODE: {
-			auto &select = node.Cast<SelectNode>();
-			for (auto &expression : select.select_list) {
-				if (expression->GetExpressionClass() == ExpressionClass::STAR) {
-					return false;
-				}
-				columns.push_back(expression->GetName());
-			}
-			return true;
-		}
-		case QueryNodeType::SET_OPERATION_NODE: {
-			auto &set_operation = node.Cast<SetOperationNode>();
-			if (set_operation.children.empty()) {
-				return false;
-			}
-			return CollectQueryOutputColumns(*set_operation.children[0], columns);
-		}
-		case QueryNodeType::RECURSIVE_CTE_NODE:
-			return CollectQueryOutputColumns(*node.Cast<RecursiveCTENode>().left, columns);
-		default:
-			return false;
-		}
-	}
-
-	void CollectTableBindings(const TableRef &ref, vector<ScopedBinding> &bindings) {
-		if (!ref.alias.empty()) {
-			ScopedBinding binding;
-			binding.alias = ref.alias;
-			if (ref.type == TableReferenceType::SUBQUERY) {
-				CollectQueryOutputColumns(*ref.Cast<SubqueryRef>().subquery->node, binding.columns);
-			}
-			for (idx_t i = 0; i < ref.column_name_alias.size(); i++) {
-				if (i < binding.columns.size()) {
-					binding.columns[i] = ref.column_name_alias[i];
-				} else {
-					binding.columns.push_back(ref.column_name_alias[i]);
-				}
-			}
-			bindings.push_back(std::move(binding));
-			return;
-		}
-		switch (ref.type) {
-		case TableReferenceType::BASE_TABLE: {
-			auto &base_table = ref.Cast<BaseTableRef>();
-			ScopedBinding binding;
-			binding.catalog = base_table.catalog_name;
-			binding.schema = base_table.schema_name;
-			binding.alias = base_table.table_name;
-			binding.columns = ref.column_name_alias;
-			bindings.push_back(std::move(binding));
-			break;
-		}
-		case TableReferenceType::JOIN: {
-			auto &join = ref.Cast<JoinRef>();
-			CollectTableBindings(*join.left, bindings);
-			CollectTableBindings(*join.right, bindings);
-			break;
-		}
-		case TableReferenceType::TABLE_FUNCTION: {
-			auto &table_function = ref.Cast<TableFunctionRef>();
-			if (table_function.function && table_function.function->GetExpressionClass() == ExpressionClass::FUNCTION) {
-				ScopedBinding binding;
-				binding.alias = table_function.function->Cast<FunctionExpression>().function_name;
-				binding.columns = ref.column_name_alias;
-				bindings.push_back(std::move(binding));
-			}
-			break;
-		}
-		case TableReferenceType::PIVOT:
-			// PIVOT/UNPIVOT creates a new output binding. Its source aliases are
-			// available to the pivot expressions, but not to the containing SELECT.
-			break;
-		default:
-			break;
-		}
-	}
-
-	void VisitTableRef(TableRef &ref) {
-		if (!serializable) {
-			return;
-		}
-		switch (ref.type) {
-		case TableReferenceType::EXPRESSION_LIST: {
-			auto &expression_list = ref.Cast<ExpressionListRef>();
-			for (auto &row : expression_list.values) {
-				for (auto &expression : row) {
-					VisitTableRefExpression(*expression);
-				}
-			}
-			break;
-		}
-		case TableReferenceType::JOIN: {
-			auto &join = ref.Cast<JoinRef>();
-			VisitTableRef(*join.left);
-			VisitTableRef(*join.right);
-			if (join.condition) {
-				VisitExpression(*join.condition);
-			}
-			for (auto &expression : join.duplicate_eliminated_columns) {
-				VisitExpression(*expression);
-			}
-			break;
-		}
-		case TableReferenceType::PIVOT: {
-			auto &pivot = ref.Cast<PivotRef>();
-			VisitTableRef(*pivot.source);
-			for (auto &aggregate : pivot.aggregates) {
-				VisitTableRefExpression(*aggregate);
-			}
-			for (auto &column : pivot.pivots) {
-				for (auto &expression : column.pivot_expressions) {
-					VisitTableRefExpression(*expression);
-				}
-				for (auto &entry : column.entries) {
-					if (entry.expr) {
-						VisitTableRefExpression(*entry.expr);
-					}
-				}
-				if (column.subquery) {
-					VisitTableRefQuery(*column.subquery);
-				}
-			}
-			break;
-		}
-		case TableReferenceType::SUBQUERY: {
-			auto &subquery = ref.Cast<SubqueryRef>();
-			VisitTableRefQuery(*subquery.subquery->node);
-			break;
-		}
-		case TableReferenceType::TABLE_FUNCTION: {
-			auto &table_function = ref.Cast<TableFunctionRef>();
-			VisitTableRefExpression(*table_function.function);
-			if (table_function.subquery) {
-				VisitTableRefQuery(*table_function.subquery->node);
-			}
-			break;
-		}
-		case TableReferenceType::SHOW_REF: {
-			auto &show = ref.Cast<ShowRef>();
-			if (show.query) {
-				VisitTableRefQuery(*show.query);
-			}
-			break;
-		}
-		case TableReferenceType::BASE_TABLE:
-		case TableReferenceType::EMPTY_FROM:
-		case TableReferenceType::COLUMN_DATA:
-		case TableReferenceType::DELIM_GET:
-			break;
-		default:
-			serializable = false;
-			break;
-		}
-	}
-
-	void VisitQueryNode(QueryNode &node) {
-		if (!serializable) {
-			return;
-		}
-		for (auto &entry : node.cte_map.map) {
-			VisitQueryNode(*entry.second->query->node);
-		}
-		switch (node.type) {
-		case QueryNodeType::SELECT_NODE: {
-			auto &select = node.Cast<SelectNode>();
-			vector<ScopedBinding> bindings;
-			if (select.from_table) {
-				CollectTableBindings(*select.from_table, bindings);
-			}
-			query_scopes.push_back(std::move(bindings));
-			for (auto &expression : select.select_list) {
-				VisitExpression(*expression);
-			}
-			for (auto &expression : select.groups.group_expressions) {
-				VisitExpression(*expression);
-			}
-			if (select.where_clause) {
-				VisitExpression(*select.where_clause);
-			}
-			if (select.having) {
-				VisitExpression(*select.having);
-			}
-			if (select.qualify) {
-				VisitExpression(*select.qualify);
-			}
-			if (select.from_table) {
-				VisitTableRef(*select.from_table);
-			}
-			ParsedExpressionIterator::EnumerateQueryNodeModifiers(
-			    node, [&](unique_ptr<ParsedExpression> &expression) { VisitExpression(*expression); });
-			query_scopes.pop_back();
-			break;
-		}
-		case QueryNodeType::SET_OPERATION_NODE: {
-			auto &set_operation = node.Cast<SetOperationNode>();
-			for (auto &child : set_operation.children) {
-				VisitQueryNode(*child);
-			}
-			ParsedExpressionIterator::EnumerateQueryNodeModifiers(
-			    node, [&](unique_ptr<ParsedExpression> &expression) { VisitExpression(*expression); });
-			break;
-		}
-		case QueryNodeType::RECURSIVE_CTE_NODE: {
-			auto &recursive_cte = node.Cast<RecursiveCTENode>();
-			VisitQueryNode(*recursive_cte.left);
-			VisitQueryNode(*recursive_cte.right);
-			for (auto &target : recursive_cte.key_targets) {
-				VisitExpression(*target);
-			}
-			ParsedExpressionIterator::EnumerateQueryNodeModifiers(
-			    node, [&](unique_ptr<ParsedExpression> &expression) { VisitExpression(*expression); });
-			break;
-		}
-		default:
-			serializable = false;
-			break;
-		}
-	}
-
 private:
 	string child_alias;
 	vector<string> serialized_columns;
+	vector<LogicalType> serialized_types;
 	vector<ScopedBinding> hidden_bindings;
-	vector<vector<ScopedBinding>> query_scopes;
+	Binder &serialization_parent_binder;
+	Binder &bound_child_binder;
+	shared_ptr<Binder> serialized_scope_binder;
+	idx_t serialized_table_index;
+	vector<vector<ColumnBinding>> serialized_output_origins;
 	bool serializable = true;
 };
 
 } // namespace
 
-bool Relation::CanSerializeExpressionOnChild(Relation &child, const ParsedExpression &expression) {
-	if (!child.CanSerializeToQueryNode()) {
-		return false;
-	}
+bool Relation::CanSerializeExpressionOnBoundChild(Binder &binder, Relation &child, TableRef &bound_child,
+                                                  const ParsedExpression &expression) {
 	if (!child.InheritsColumnBindings() || RequiresSQLMultiSourceBinding(child)) {
 		return true;
 	}
+	if (bound_child.type != TableReferenceType::BOUND_TABLE_REF) {
+		throw InternalException("Expected a bound relation input while checking expression serialization");
+	}
+	auto &bound_ref = bound_child.Cast<BoundRefWrapper>();
+	if (!bound_ref.binder) {
+		throw InternalException("Bound relation input is missing its binder");
+	}
 
 	// An inheriting semantic boundary is emitted as a subquery. Check references
-	// against the columns and aliases that survive that boundary, including
-	// aliases introduced by nested query scopes.
-	return SerializedExpressionScopeChecker(child).Check(expression);
+	// against the columns and aliases that survive that boundary. Nested query
+	// scopes are resolved by the Binder in both the direct and serialized inputs,
+	// then compared by their underlying column bindings.
+	return SerializedExpressionScopeChecker(binder, child, bound_ref).Check(expression);
 }
 
 unique_ptr<TableRef> Relation::BindRelationInput(Binder &binder, Relation &child) {
@@ -843,6 +893,34 @@ BoundStatement Relation::BindSelectNodeOnChild(Binder &binder, Relation &child, 
 	SelectStatement stmt;
 	stmt.node = std::move(select_node);
 	return binder.Bind(stmt.Cast<SQLStatement>());
+}
+
+unique_ptr<SelectNode> Relation::WrapQueryNode(unique_ptr<QueryNode> query_node, const string &alias,
+                                               const vector<ColumnDefinition> &columns) {
+	auto statement = make_uniq<SelectStatement>();
+	statement->node = std::move(query_node);
+	auto result = make_uniq<SelectNode>();
+	result->from_table = make_uniq<SubqueryRef>(std::move(statement), alias);
+	vector<string> output_names;
+	output_names.reserve(columns.size());
+	for (auto &column : columns) {
+		output_names.push_back(column.Name());
+	}
+	auto input_names = BindContext::AliasColumnNames(alias, output_names, {});
+	for (idx_t column_idx = 0; column_idx < output_names.size(); column_idx++) {
+		unique_ptr<ColumnRefExpression> column_ref;
+		if (alias.empty()) {
+			column_ref = make_uniq<ColumnRefExpression>(input_names[column_idx]);
+		} else {
+			column_ref = make_uniq<ColumnRefExpression>(input_names[column_idx], alias);
+		}
+		column_ref->SetAlias(output_names[column_idx]);
+		result->select_list.push_back(std::move(column_ref));
+	}
+	if (result->select_list.empty()) {
+		result->select_list.push_back(make_uniq<StarExpression>());
+	}
+	return result;
 }
 
 unique_ptr<LogicalOperator> Relation::PlanRelationFilter(Binder &binder, unique_ptr<Expression> condition,
@@ -1030,10 +1108,19 @@ string Relation::ToString() {
 
 // LCOV_EXCL_START
 string Relation::GetQuery() {
-	if (!CanSerializeToQueryNode()) {
+	auto query_node = TryGetSerializableQueryNode();
+	if (!query_node) {
 		return string();
 	}
-	return GetQueryNode()->ToString();
+	return query_node->ToString();
+}
+
+string Relation::GetQuery(Binder &binder) {
+	auto query_node = TryGetSerializableQueryNode(binder);
+	if (!query_node) {
+		return string();
+	}
+	return query_node->ToString();
 }
 
 void Relation::Head(idx_t limit) {

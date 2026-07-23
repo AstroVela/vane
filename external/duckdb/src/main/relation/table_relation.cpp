@@ -29,11 +29,11 @@ TableRelation::TableRelation(const shared_ptr<RelationContextWrapper> &context,
 unique_ptr<QueryNode> TableRelation::GetQueryNode() {
 	auto result = make_uniq<SelectNode>();
 	result->select_list.push_back(make_uniq<StarExpression>());
-	result->from_table = GetTableRef();
+	result->from_table = GetTableRefForSerialization(*this);
 	return std::move(result);
 }
 
-unique_ptr<TableRef> TableRelation::GetTableRef() {
+unique_ptr<TableRef> TableRelation::GetTableRefInternal() {
 	auto table_ref = make_uniq<BaseTableRef>();
 	table_ref->schema_name = description->schema;
 	table_ref->table_name = description->table;
@@ -42,7 +42,7 @@ unique_ptr<TableRef> TableRelation::GetTableRef() {
 }
 
 BoundStatement TableRelation::BindAsInput(Binder &binder) {
-	auto table_ref = GetTableRef();
+	auto table_ref = GetTableRefForSerialization(*this);
 	return binder.Bind(*table_ref);
 }
 

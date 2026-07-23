@@ -26,13 +26,14 @@ InsertRelation::InsertRelation(shared_ptr<Relation> child_p, string catalog_name
 }
 
 BoundStatement InsertRelation::Bind(Binder &binder) {
-	if (!child->CanSerializeToQueryNode()) {
+	auto query_node = child->TryGetSerializableQueryNode(binder);
+	if (!query_node) {
 		throw NotImplementedException("Cannot insert from a relation that cannot be faithfully represented as a SQL "
 		                              "query node; conversion would discard the exchange or lose relation bindings");
 	}
 	InsertStatement stmt;
 	auto select = make_uniq<SelectStatement>();
-	select->node = child->GetQueryNode();
+	select->node = std::move(query_node);
 
 	stmt.catalog = catalog_name;
 	stmt.schema = schema_name;

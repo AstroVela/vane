@@ -27,7 +27,7 @@ unique_ptr<QueryNode> UnnestRelation::GetQueryNode() {
 	// Fallback AST path (used by default Relation::Bind if custom Bind not called).
 	// Builds: SELECT * EXCLUDE(col), unnest(col) AS col FROM (child)
 	auto result = make_uniq<SelectNode>();
-	result->from_table = child->GetTableRef();
+	result->from_table = GetTableRefForSerialization(*child);
 
 	auto star = make_uniq<StarExpression>();
 	star->exclude_list.insert(QualifiedColumnName(column_name));

@@ -28,11 +28,11 @@ ViewRelation::ViewRelation(const shared_ptr<ClientContext> &context, unique_ptr<
 unique_ptr<QueryNode> ViewRelation::GetQueryNode() {
 	auto result = make_uniq<SelectNode>();
 	result->select_list.push_back(make_uniq<StarExpression>());
-	result->from_table = GetTableRef();
+	result->from_table = GetTableRefForSerialization(*this);
 	return std::move(result);
 }
 
-unique_ptr<TableRef> ViewRelation::GetTableRef() {
+unique_ptr<TableRef> ViewRelation::GetTableRefInternal() {
 	if (premade_tableref) {
 		return premade_tableref->Copy();
 	}

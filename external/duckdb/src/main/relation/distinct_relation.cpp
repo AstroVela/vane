@@ -24,12 +24,18 @@ DistinctRelation::DistinctRelation(shared_ptr<Relation> child_p)
 
 unique_ptr<QueryNode> DistinctRelation::GetQueryNode() {
 	auto child_node = child->GetQueryNode();
+	bool plain_distinct = child_node->type == QueryNodeType::SELECT_NODE && child_node->modifiers.size() == 1 &&
+	                      child_node->modifiers[0]->type == ResultModifierType::DISTINCT_MODIFIER &&
+	                      child_node->modifiers[0]->Cast<DistinctModifier>().distinct_on_targets.empty();
+	if (child_node->type != QueryNodeType::SELECT_NODE || (!child_node->modifiers.empty() && !plain_distinct)) {
+		child_node = WrapQueryNode(std::move(child_node), child->GetAlias(), child->Columns());
+	}
 	child_node->AddDistinct();
 	return child_node;
 }
 
 BoundStatement DistinctRelation::Bind(Binder &binder) {
-	if (!RequiresDirectRelationBinding(*child)) {
+	if (!RequiresDirectRelationBinding(binder, *child)) {
 		return Relation::Bind(binder);
 	}
 	auto select_node = make_uniq<SelectNode>();

@@ -49,7 +49,8 @@ DistributedPhysicalPlan::from_duckdb_relation(const shared_ptr<duckdb::Relation>
 		// Use RunFunctionInTransaction to ensure proper transaction context
 		client_context->RunFunctionInTransaction([&]() {
 			// Create a RelationStatement from the relation
-			auto relation_stmt = make_uniq<RelationStatement>(relation);
+			auto statement_binder = Binder::CreateBinder(*client_context);
+			auto relation_stmt = make_uniq<RelationStatement>(relation, *statement_binder);
 
 			// Get a Planner instance from the client context
 			Planner planner(*client_context);
