@@ -11,6 +11,7 @@ import pytest
 
 import duckdb
 from duckdb._ray_cxx import validate_plan_serialization_for_submission
+from duckdb._ray_errors import RemoteRayException
 from duckdb.runners.ray.query_execution_graph import (
     ActorPlacement,
     NodeResourceAllocation,
@@ -264,6 +265,7 @@ def test_driver_rejects_non_serializable_plan_before_query_registration(entrypoi
         coroutine = getattr(runner_cls, entrypoint)(runner, _ValidatingLogicalPlan(physical_plan, events))
         asyncio.run(coroutine)
 
+    assert isinstance(exc_info.value, RemoteRayException)
     assert isinstance(exc_info.value.__cause__, duckdb.NotImplementedException)
     assert "INTENTIONALLY_NON_SERIALIZABLE operator cannot be serialized" in str(exc_info.value.__cause__)
     with pytest.raises(KeyError, match="query graph is not registered"):
