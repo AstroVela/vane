@@ -38,6 +38,21 @@ bool RayTaskPythonRuntimeUsable() {
 	return true;
 }
 
+class ScopedGILReleaseIfHeld {
+public:
+	ScopedGILReleaseIfHeld() {
+		if (RayTaskPythonRuntimeUsable() && PyGILState_Check()) {
+			release_ = std::make_unique<py::gil_scoped_release>();
+		}
+	}
+
+	ScopedGILReleaseIfHeld(const ScopedGILReleaseIfHeld &) = delete;
+	ScopedGILReleaseIfHeld &operator=(const ScopedGILReleaseIfHeld &) = delete;
+
+private:
+	std::unique_ptr<py::gil_scoped_release> release_;
+};
+
 py::object GetLoadedRayModuleOrNone() {
 	auto modules = py::module_::import("sys").attr("modules");
 	if (!py::isinstance<py::dict>(modules)) {
@@ -331,17 +346,21 @@ RayBackedResultPartition::RayBackedResultPartition(py::object object_ref, size_t
 RayBackedResultPartition::~RayBackedResultPartition() = default;
 
 duckdb::distributed::DuckDBResult<size_t> RayBackedResultPartition::size_bytes() const {
-	if (size_bytes_ == 0 && materialized_collection_) {
-		return duckdb::distributed::DuckDBResult<size_t>::ok(materialized_collection_->SizeInBytes());
+	if (size_bytes_ != 0) {
+		return duckdb::distributed::DuckDBResult<size_t>::ok(size_bytes_);
 	}
-	return duckdb::distributed::DuckDBResult<size_t>::ok(size_bytes_);
+
+	auto collection = materialized_collection_.load();
+	return duckdb::distributed::DuckDBResult<size_t>::ok(collection ? collection->SizeInBytes() : 0);
 }
 
 duckdb::distributed::DuckDBResult<size_t> RayBackedResultPartition::num_rows() const {
-	if (num_rows_ == 0 && materialized_collection_) {
-		return duckdb::distributed::DuckDBResult<size_t>::ok(materialized_collection_->Count());
+	if (num_rows_ != 0) {
+		return duckdb::distributed::DuckDBResult<size_t>::ok(num_rows_);
 	}
-	return duckdb::distributed::DuckDBResult<size_t>::ok(num_rows_);
+
+	auto collection = materialized_collection_.load();
+	return duckdb::distributed::DuckDBResult<size_t>::ok(collection ? collection->Count() : 0);
 }
 
 py::object RayBackedResultPartition::GetObjectRef() const {
@@ -353,18 +372,28 @@ py::object RayBackedResultPartition::GetLeaseOwner() const {
 }
 
 std::shared_ptr<duckdb::ColumnDataCollection> RayBackedResultPartition::to_column_data() const {
-	if (materialized_collection_) {
-		return materialized_collection_;
-	}
+	// Python callers may enter with the GIL. Release it before call_once waits
+	// so the materializing thread can acquire it.
+	ScopedGILReleaseIfHeld release_gil;
 
-	std::lock_guard<std::mutex> guard(materialize_mutex_);
-	if (materialized_collection_) {
-		return materialized_collection_;
+	std::call_once(materialize_once_, [this] {
+		try {
+			duckdb::PythonGILWrapper gil;
+			try {
+				auto object_ref = object_ref_.get();
+				materialized_collection_.store(MaterializePyPayloadToCollection(object_ref, nullptr));
+			} catch (const py::error_already_set &ex) {
+				throw duckdb::InvalidInputException("Failed to materialize Ray result partition: %s", ex.what());
+			}
+		} catch (...) {
+			materialize_error_ = std::current_exception();
+		}
+	});
+
+	if (materialize_error_) {
+		std::rethrow_exception(materialize_error_);
 	}
-	duckdb::PythonGILWrapper gil;
-	auto object_ref = object_ref_.get();
-	materialized_collection_ = MaterializePyPayloadToCollection(object_ref, nullptr);
-	return materialized_collection_;
+	return materialized_collection_.load();
 }
 
 py::object duckdb::distributed::python::ray::ResultPartitionToPyObject(

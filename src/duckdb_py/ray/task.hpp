@@ -4,6 +4,8 @@
 #pragma once
 
 #include <pybind11/pybind11.h>
+#include <atomic>
+#include <exception>
 #include <memory>
 #include <vector>
 
@@ -148,8 +150,9 @@ private:
 	duckdb::distributed::python::ray::SafePyObject lease_owner_;
 	size_t num_rows_;
 	size_t size_bytes_;
-	mutable std::mutex materialize_mutex_;
-	mutable std::shared_ptr<duckdb::ColumnDataCollection> materialized_collection_;
+	mutable std::once_flag materialize_once_;
+	mutable std::atomic<std::shared_ptr<duckdb::ColumnDataCollection>> materialized_collection_;
+	mutable std::exception_ptr materialize_error_;
 };
 
 std::shared_ptr<duckdb::ColumnDataCollection>

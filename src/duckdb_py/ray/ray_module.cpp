@@ -137,6 +137,17 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def_readonly("num_rows", &NativePartitionMetadata::num_rows)
 	    .def_readonly("size_bytes", &NativePartitionMetadata::size_bytes);
 
+	using RayBackedResultPartition = duckdb::distributed::python::ray::RayBackedResultPartition;
+	py::class_<RayBackedResultPartition, std::shared_ptr<RayBackedResultPartition>>(m,
+	                                                                                "_RayBackedResultPartitionForTest")
+	    .def(py::init([](py::object payload) {
+		    return std::make_shared<RayBackedResultPartition>(std::move(payload), 0, 0, py::none());
+	    }))
+	    .def("materialize", [](const RayBackedResultPartition &partition) {
+		    auto collection = partition.to_column_data();
+		    return collection ? collection->Count() : 0;
+	    });
+
 	py::class_<NativeDistributedTaskResult>(m, "NativeDistributedTaskResult")
 	    .def(py::init<py::iterable, py::iterable, py::object, py::object, std::string, int, py::object, py::object>(),
 	         py::arg("partition_payloads"), py::arg("partition_metadatas"), py::arg("result_schema"), py::arg("stats"),
