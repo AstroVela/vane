@@ -268,9 +268,14 @@ class OpenAITextEmbedder:
 
     * **batch_token_limit** — max estimated tokens per API request (default 300k).
     * **input_text_token_limit** — max tokens for a single input text.
-      Texts exceeding this are split into chunks, embedded separately
-      (through the same token-limited request batching), and recombined via
-      length-weighted averaging + L2 normalisation.
+
+    The effective per-input bound is ``min(input_text_token_limit,
+    batch_token_limit)``, so a single input can never exceed one request's
+    budget even when ``input_text_token_limit`` is configured above
+    ``batch_token_limit``. Texts exceeding the effective bound are split
+    into chunks, embedded separately (through the same token-limited
+    request batching), and recombined via length-weighted averaging + L2
+    normalisation.
 
     Token counts are estimated heuristically: ASCII characters at ~3 chars
     per token, and every non-ASCII character as a full token (CJK scripts
@@ -311,6 +316,11 @@ class OpenAITextEmbedder:
         self._input_text_token_limit = (
             input_text_token_limit if input_text_token_limit is not None else _get_input_token_limit(model)
         )
+        # A single input can never exceed one request's budget, so the
+        # per-input bound is capped by the per-request bound. This also
+        # catches medium rows whose estimate lies between the two limits
+        # when input_text_token_limit is configured above batch_token_limit.
+        self._effective_input_limit = min(self._input_text_token_limit, self._batch_token_limit)
         # Filter out non-OpenAI keys before passing to client
         client_opts = {
             k: v
@@ -354,15 +364,16 @@ class OpenAITextEmbedder:
                 continue
             est_tokens = _estimate_tokens(item)
 
-            if est_tokens > self._input_text_token_limit:
+            if est_tokens > self._effective_input_limit:
                 # Oversized single input — flush pending batch, chunk, embed
                 # the chunks through token-limited requests, then recombine
-                # via weighted average + L2 normalisation.
+                # via weighted average + L2 normalisation. The effective
+                # limit bounds both this threshold and the chunk size, so a
+                # chunk always fits one request even when
+                # input_text_token_limit is configured above
+                # batch_token_limit.
                 await flush()
-                # Bound each chunk by BOTH limits so a single chunk always
-                # fits one request, even when input_text_token_limit is
-                # configured above batch_token_limit.
-                chunks = _chunk_text_by_tokens(item, min(self._input_text_token_limit, self._batch_token_limit))
+                chunks = _chunk_text_by_tokens(item, self._effective_input_limit)
                 chunk_embeddings = await self._embed_chunks(chunks)
                 chunk_lens = np.array(
                     [len(c) for c in chunks],
