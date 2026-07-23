@@ -21,13 +21,6 @@ All notable user-visible changes are documented here. Vane is currently in alpha
   Vane engine customizations as monorepo commits, so normal clones no longer
   require submodule initialization or carry DuckDB's complete commit history.
 
-### Fixed
-
-- Fixed intermittent `Event loop is closed` failures in multi-batch AI queries:
-  batch wrappers now drive their cached async provider clients on a persistent
-  per-wrapper event loop (also enabling HTTP connection reuse across batches),
-  and rebuild the client if the loop is ever re-created.
-
 ### Security
 
 - Documented the trust boundaries around Python UDFs, Ray workers, credentials, native parsers, and remote model code.
