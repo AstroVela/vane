@@ -1928,7 +1928,6 @@ struct PyPhysicalPlanWrapperRunner {
 					return physical_plan.Make<duckdb::PhysicalMaterializedCollector>(data, true);
 				};
 
-				DuckdbGilReleaseMarker gil_marker;
 				py::gil_scoped_release release;
 				auto pending = context.PendingQueryPreparedStatementNoRebind(string("external_plan:") + plan_id,
 				                                                             prepared_data, parameters);
@@ -2234,7 +2233,6 @@ struct PyPhysicalPlanWrapperRunner {
 					native_progress_callback_failed = true;
 				}
 			};
-			DuckdbGilReleaseMarker gil_marker;
 			py::gil_scoped_release release;
 
 			duckdb::PendingExecutionResult exec_result = duckdb::PendingExecutionResult::RESULT_NOT_READY;

@@ -21,14 +21,14 @@ struct ResultPartitionStream {
 			throw py::stop_iteration();
 		}
 
-		// Lock stream while polling
-		lock_guard<mutex> guard(stream_mutex_);
-
-		// Release GIL while we block on C++ stream
-		DuckdbGilReleaseMarker gil_marker;
-		py::gil_scoped_release release;
-		auto opt = stream_->next();
-		PythonGILWrapper acquire;
+		std::pair<bool, duckdb::distributed::ResultPartitionRef> opt;
+		{
+			// Release the GIL before contending on the stream mutex. The mutex
+			// must also be released before Python conversion restores the GIL.
+			py::gil_scoped_release release;
+			lock_guard<mutex> guard(stream_mutex_);
+			opt = stream_->next();
+		}
 		if (!opt.first) {
 			throw py::stop_iteration();
 		}
