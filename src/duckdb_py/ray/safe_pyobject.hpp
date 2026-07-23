@@ -6,6 +6,10 @@
 
 #include <pybind11/pybind11.h>
 
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
 namespace py = pybind11;
 
 namespace duckdb {
@@ -106,6 +110,86 @@ struct SafePyObject {
 	bool has_value() const {
 		return has_value_ && obj_.ptr();
 	}
+};
+
+struct SafePythonException {
+	SafePyObject type;
+	SafePyObject value;
+	SafePyObject traceback;
+
+	SafePythonException() = default;
+	explicit SafePythonException(const py::error_already_set &error)
+	    : type(py::object(error.type())), value(py::object(error.value())), traceback(py::object(error.trace())) {
+	}
+
+	bool has_value() const {
+		return type.has_value() && value.has_value();
+	}
+
+	void Restore() const {
+		if (!has_value()) {
+			return;
+		}
+		auto type_obj = type.get();
+		auto value_obj = value.get();
+		PyObject *traceback_ptr = nullptr;
+		if (traceback.has_value()) {
+			auto traceback_obj = traceback.get();
+			traceback_ptr = traceback_obj.release().ptr();
+		}
+		PyErr_Restore(type_obj.release().ptr(), value_obj.release().ptr(), traceback_ptr);
+	}
+};
+
+// Retains normalized Python exception triples while a background DuckDB task
+// reports its string-only DuckDBError through PlanExecutionStatus.
+class PythonExceptionStore {
+public:
+	void Store(const std::string &query_id, const py::error_already_set &error) {
+		if (query_id.empty()) {
+			return;
+		}
+		PythonGILWrapper gil;
+		SafePythonException stored(error);
+		std::lock_guard<std::mutex> guard(mutex_);
+		errors_.try_emplace(query_id, std::move(stored));
+	}
+
+	void RethrowAsCause(const std::string &query_id, const std::string &message) {
+		auto stored = Take(query_id);
+		if (!stored.has_value()) {
+			return;
+		}
+		PythonGILWrapper gil;
+		stored.Restore();
+		py::raise_from(PyExc_RuntimeError, message.c_str());
+		throw py::error_already_set();
+	}
+
+	void Discard(const std::string &query_id) {
+		(void)Take(query_id);
+	}
+
+private:
+	SafePythonException Take(const std::string &query_id) {
+		SafePythonException stored;
+		if (query_id.empty()) {
+			return stored;
+		}
+		{
+			std::lock_guard<std::mutex> guard(mutex_);
+			auto entry = errors_.find(query_id);
+			if (entry == errors_.end()) {
+				return stored;
+			}
+			stored = std::move(entry->second);
+			errors_.erase(entry);
+		}
+		return stored;
+	}
+
+	std::mutex mutex_;
+	std::unordered_map<std::string, SafePythonException> errors_;
 };
 
 } // namespace ray
