@@ -170,10 +170,12 @@ class TestAnthropicProviderDefaults:
         provider = AnthropicProvider(api_key="test")
         desc = provider.get_prompter()
 
-        # claude-sonnet-5 replaces claude-sonnet-4-20250514 (retired 2026-06-15).
-        # It is the current Sonnet generation with no announced retirement
-        # ("Not sooner than June 30, 2027" per Anthropic's deprecations page).
-        assert desc.get_model() == "claude-sonnet-5"
+        # claude-sonnet-4-6 is Anthropic's named replacement for
+        # claude-sonnet-4-20250514 (retired 2026-06-15) per the deprecations
+        # page, and stays Active with no retirement sooner than 2027-02-17.
+        # Unlike claude-sonnet-5, it accepts temperature/top_p/top_k and runs
+        # without adaptive thinking, matching the current prompter surface.
+        assert desc.get_model() == "claude-sonnet-4-6"
 
     def test_descriptor_dataclass_default_matches_provider_default(self):
         from vane.ai.providers.anthropic import (

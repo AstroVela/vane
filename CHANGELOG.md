@@ -21,12 +21,6 @@ All notable user-visible changes are documented here. Vane is currently in alpha
   Vane engine customizations as monorepo commits, so normal clones no longer
   require submodule initialization or carry DuckDB's complete commit history.
 
-### Fixed
-
-- Updated the Anthropic provider default model from `claude-sonnet-4-20250514`
-  (retired 2026-06-15) to `claude-sonnet-5`, so `prompt(provider="anthropic")`
-  works out of the box when `model` is omitted.
-
 ### Security
 
 - Documented the trust boundaries around Python UDFs, Ray workers, credentials, native parsers, and remote model code.
