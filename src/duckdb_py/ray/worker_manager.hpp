@@ -12,6 +12,7 @@
 #include <vector>
 #include <string>
 
+#include "safe_pyobject.hpp"
 #include "worker.hpp"
 #include "task.hpp"
 #include "duckdb/execution/distributed/utils/channel.hpp"
@@ -42,6 +43,7 @@ public:
 	    const string &query_id, const std::unordered_set<duckdb::distributed::SourceNodeId> &source_node_ids) override;
 
 	void drop_query_fragments(const string &query_id);
+	void rethrow_submission_error(const string &query_id);
 	std::unordered_map<string, std::unordered_map<string, idx_t>> fragment_stats_by_worker() const;
 
 private:
@@ -56,6 +58,7 @@ private:
 
 	mutable mutex mutex_;
 	mutable State state_;
+	PythonExceptionStore submission_errors_;
 
 	static string QueryIdFromTaskEvents(const std::vector<duckdb::distributed::WorkerTask> &tasks);
 	void StoreFteResultHandles(const string &query_id,

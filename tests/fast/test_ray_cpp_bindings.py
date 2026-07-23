@@ -93,6 +93,91 @@ def test_worker_task_plan_keeps_absent_plan_explicit():
     assert task.plan() is None
 
 
+@pytest.mark.parametrize("manager_kind", ["python-backend", "ray-worker-manager"])
+def test_worker_submission_preserves_worker_plan_exception_cause(monkeypatch, manager_kind):
+    import _duckdb
+
+    query_id = f"query-worker-plan-error-{manager_kind}"
+    submission_calls = []
+
+    class SubmissionTarget:
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "worker-1",
+                    "num_cpus": 4.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 4 << 30,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            submission_calls.append(len(tasks))
+            tasks[0].plan()
+            return []
+
+        def drop_query(self, _query_id):
+            return None
+
+        def fte_drop_query(self, _query_id):
+            return {
+                "tasks_removed": 0,
+                "tasks_canceled": 0,
+                "fragments_removed": 0,
+            }
+
+        def shutdown(self):
+            return None
+
+    target = SubmissionTarget()
+    con = duckdb.connect()
+    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+
+    def fail_lookup(actual_query_id):
+        raise duckdb.NotImplementedException(f"plan lookup sentinel for {actual_query_id}")
+
+    monkeypatch.setattr(_duckdb.ray_cxx, "_lookup_query_udf_registrations", fail_lookup)
+    if manager_kind == "python-backend":
+        runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(target)
+    else:
+        import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+        monkeypatch.setattr(
+            ray_worker_handle,
+            "start_ray_workers",
+            lambda _existing_ids: [
+                duckdb.ray_cxx.RayWorkerRuntime(
+                    "worker-1",
+                    target,
+                    4.0,
+                    0.0,
+                    4 << 30,
+                )
+            ],
+        )
+        monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+        runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+
+    stream = runner.run_plan(plan, con)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match=f"distributed worker task submission failed for query_id={query_id}",
+        ) as exc_info:
+            list(stream)
+    finally:
+        runner.drop_query_fragments(query_id)
+        con.close()
+
+    assert isinstance(exc_info.value.__cause__, duckdb.NotImplementedException)
+    assert exc_info.value.__cause__.__traceback__ is not None
+    assert f"plan lookup sentinel for {query_id}" in str(exc_info.value.__cause__)
+    assert submission_calls == [1]
+
+
 @pytest.mark.parametrize("should_fail", [False, True], ids=["success", "failure"])
 def test_ray_backed_result_partition_concurrent_materialization(should_fail):
     script = textwrap.dedent(

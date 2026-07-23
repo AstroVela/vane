@@ -1658,6 +1658,53 @@ def test_native_cxx_run_copy_plan_failure_cleans_local_staging(tmp_path, monkeyp
         con.close()
 
 
+def test_native_cxx_run_copy_plan_preserves_worker_plan_exception_cause(tmp_path, monkeypatch):
+    import _duckdb
+
+    con, dst, query_id, plan = _captured_native_copy_plan(tmp_path, monkeypatch, local_staging=True)
+    submission_calls = []
+    dropped_queries = []
+
+    class Backend:
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-0",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            submission_calls.append(len(tasks))
+            tasks[0].plan()
+            return []
+
+        def drop_query(self, actual_query_id):
+            dropped_queries.append(actual_query_id)
+
+    def fail_lookup(actual_query_id):
+        raise duckdb.NotImplementedException(f"copy plan lookup sentinel for {actual_query_id}")
+
+    monkeypatch.setattr(_duckdb.ray_cxx, "_lookup_query_udf_registrations", fail_lookup)
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(Backend())
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match=f"distributed worker task submission failed for query_id={query_id}",
+        ) as exc_info:
+            runner.run_copy_plan(plan, con)
+    finally:
+        con.close()
+
+    assert isinstance(exc_info.value.__cause__, duckdb.NotImplementedException)
+    assert f"copy plan lookup sentinel for {query_id}" in str(exc_info.value.__cause__)
+    assert submission_calls == [1]
+    assert dropped_queries == [query_id]
+    assert not dst.exists()
+
+
 def test_native_cxx_run_copy_plan_surfaces_backend_cleanup_failure(tmp_path, monkeypatch):
     con, _dst, relation = _capture_native_copy_relation(tmp_path, monkeypatch, local_staging=True)
 
