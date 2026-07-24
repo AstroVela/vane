@@ -3852,6 +3852,7 @@ def test_fte_worker_task_manager_finalization_failure_is_terminal_and_releases_s
         first_execution = manager.tasks[first_task_id]
         original_complete_dynamic_source_splits = first_execution._complete_dynamic_source_splits
         complete_dynamic_source_splits_calls = 0
+        split_queue_status_calls = 0
 
         def track_complete_dynamic_source_splits():
             nonlocal complete_dynamic_source_splits_calls
@@ -3874,17 +3875,13 @@ def test_fte_worker_task_manager_finalization_failure_is_terminal_and_releases_s
 
             monkeypatch.setattr(Path, "stat", fail_output_file_stat)
         elif failure_point == "split_queue_status":
-            original_split_queue_status = first_execution.split_queue_status
-            injected = False
 
-            def fail_split_queue_status_once():
-                nonlocal injected
-                if not injected:
-                    injected = True
-                    raise RuntimeError(failure_message)
-                return original_split_queue_status()
+            def fail_split_queue_status():
+                nonlocal split_queue_status_calls
+                split_queue_status_calls += 1
+                raise RuntimeError(failure_message)
 
-            monkeypatch.setattr(first_execution, "split_queue_status", fail_split_queue_status_once)
+            monkeypatch.setattr(first_execution, "split_queue_status", fail_split_queue_status)
         elif failure_point == "finished_transition":
             original_transition = first_execution._transition
 
@@ -3911,6 +3908,9 @@ def test_fte_worker_task_manager_finalization_failure_is_terminal_and_releases_s
         assert first_terminal["failure"]["message"].startswith(failure_message)
         assert complete_dynamic_source_splits_calls == 1
         assert first_execution.result is None
+        terminal_split_queue_status_calls = split_queue_status_calls
+        if failure_point == "split_queue_status":
+            assert first_terminal["submitted_split_count"] == 0
 
         second_terminal = await asyncio.wait_for(
             _wait_for_terminal_task_status(manager, second_task_id, second_initial),
@@ -3921,6 +3921,9 @@ def test_fte_worker_task_manager_finalization_failure_is_terminal_and_releases_s
 
         assert manager.release_task_result(first_task_id)["state"] == FteTaskState.FAILED.value
         assert manager.release_task_result(first_task_id)["state"] == FteTaskState.FAILED.value
+        if failure_point == "split_queue_status":
+            assert terminal_split_queue_status_calls > 0
+            assert split_queue_status_calls == terminal_split_queue_status_calls
         assert await manager.drop_query("q-finalize") == {"removed": 2, "canceled": 0}
         assert await manager.drop_query("q-finalize") == {"removed": 0, "canceled": 0}
 

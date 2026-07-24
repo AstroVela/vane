@@ -300,6 +300,7 @@ class FteTaskExecution:
             source_id: {split.sequence_id for split in splits} for source_id, splits in self.initial_splits.items()
         }
         self.status = TaskStatus(self.task_id, FteTaskState.PLANNED)
+        self._last_split_queue_status: dict[str, Any] = {}
         self.result: Any = None
         self._result_stored_at: float | None = None
         self._result_release_count = 0
@@ -390,13 +391,24 @@ class FteTaskExecution:
     def status_payload(self) -> dict[str, Any]:
         with self._status_lock:
             status = self.status.to_dict()
-            status.update(self.split_queue_status())
+            if self.status.state in _TERMINAL_STATES:
+                # Finalization may have failed in a native queue accessor.
+                split_queue_status = dict(self._last_split_queue_status)
+            else:
+                split_queue_status = self._refresh_split_queue_status()
+            status.update(split_queue_status)
             status["memory_requirement_bytes"] = self.memory_requirement_bytes
             output_buffer_status = _output_buffer_status(self.output_buffers)
             if output_buffer_status is not None:
                 status["output_buffer_status"] = output_buffer_status
             if self.status.state == FteTaskState.FINISHED:
                 status["result"] = self.result
+        return status
+
+    def _refresh_split_queue_status(self) -> dict[str, Any]:
+        status = self.split_queue_status()
+        with self._status_lock:
+            self._last_split_queue_status = dict(status)
         return status
 
     def split_queue_status(self) -> dict[str, Any]:
@@ -605,7 +617,7 @@ class FteTaskExecution:
             with self._status_lock:
                 self.status.output_stats = self._extract_output_stats(result)
             final_task_stats = self._extract_task_stats(result)
-            final_split_stats = self.split_queue_status()
+            final_split_stats = self._refresh_split_queue_status()
             if final_task_stats or final_split_stats:
                 self._record_task_stats({**final_task_stats, **final_split_stats})
             self._transition(FteTaskState.FINISHED)
@@ -1154,10 +1166,12 @@ class FteWorkerTaskManager:
         self.running_tasks.discard(task_key)
         self._sync_udf_active_fte_fragment_tasks()
         execution = self.tasks.get(task_key)
-        if execution is not None:
-            self._publish_status(execution)
-        self._admission_debug_log("task_done", execution)
-        self._drain_queue()
+        try:
+            if execution is not None:
+                self._publish_status(execution)
+            self._admission_debug_log("task_done", execution)
+        finally:
+            self._drain_queue()
 
     def _sync_udf_active_fte_fragment_tasks(self) -> None:
         if not self.sync_udf_active_fragment_tasks:
