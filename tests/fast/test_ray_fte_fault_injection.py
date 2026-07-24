@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -16,13 +15,14 @@ from ray_test_profile import ray_test_object_store_bytes
 import duckdb
 
 ray = pytest.importorskip("ray")
+Cluster = pytest.importorskip("ray.cluster_utils").Cluster
 pytestmark = [
     pytest.mark.real_ray,
     pytest.mark.ray_cluster_owner,
     pytest.mark.ray_fault,
 ]
 
-_FAULT_RAY_RUNTIME_OWNED = False
+_FAULT_RAY_CLUSTER = None
 
 import duckdb.runners.ray.worker_handle as worker_handle_mod
 from duckdb.runners.ray import worker as worker_mod
@@ -330,7 +330,7 @@ def _register_fault_query(tasks) -> None:
 
 
 def _init_ray_for_fault_test(monkeypatch) -> None:
-    global _FAULT_RAY_RUNTIME_OWNED
+    global _FAULT_RAY_CLUSTER
 
     test_file = Path(__file__).resolve()
     pythonpath_entries = [str(test_file.parent), str(test_file.parents[1])]
@@ -351,7 +351,7 @@ def _init_ray_for_fault_test(monkeypatch) -> None:
     monkeypatch.setenv("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
     monkeypatch.setenv("VANE_FTE_RETRY_INITIAL_DELAY_S", "0")
     if ray.is_initialized():
-        if _FAULT_RAY_RUNTIME_OWNED:
+        if _FAULT_RAY_CLUSTER is not None:
             return
         _shutdown_ray_for_fault_test()
 
@@ -364,47 +364,36 @@ def _init_ray_for_fault_test(monkeypatch) -> None:
         "VANE_FTE_CONTROL_RPC_INITIAL_BACKOFF_S": os.environ.get("VANE_FTE_CONTROL_RPC_INITIAL_BACKOFF_S", "0"),
         "VANE_FTE_SPLIT_QUEUE_SPACE_WAIT_TIMEOUT_S": os.environ.get("VANE_FTE_SPLIT_QUEUE_SPACE_WAIT_TIMEOUT_S", "0.1"),
     }
-    ray.init(
-        address="local",
-        ignore_reinit_error=True,
-        log_to_driver=True,
-        num_cpus=int(os.environ.get("VANE_TEST_RAY_NUM_CPUS", "4")),
-        object_store_memory=ray_test_object_store_bytes(),
-        runtime_env={"env_vars": runtime_env_vars},
-    )
-    _FAULT_RAY_RUNTIME_OWNED = True
+    cluster = Cluster()
+    try:
+        cluster.add_node(
+            include_dashboard=False,
+            num_cpus=int(os.environ.get("VANE_TEST_RAY_NUM_CPUS", "4")),
+            num_gpus=0,
+            object_store_memory=ray_test_object_store_bytes(),
+        )
+        ray.init(
+            address=cluster.address,
+            ignore_reinit_error=True,
+            log_to_driver=True,
+            runtime_env={"env_vars": runtime_env_vars},
+        )
+    except BaseException:
+        cluster.shutdown()
+        raise
+    _FAULT_RAY_CLUSTER = cluster
 
 
 def _shutdown_ray_for_fault_test() -> None:
-    global _FAULT_RAY_RUNTIME_OWNED
+    global _FAULT_RAY_CLUSTER
 
-    ray_processes = ()
+    cluster = _FAULT_RAY_CLUSTER
     try:
-        from ray._private import worker as ray_worker
-
-        ray_node = getattr(ray_worker.global_worker, "node", None)
-        if ray_node is not None:
-            ray_processes = tuple(
-                (process_type, process_info.process)
-                for process_type, process_infos in ray_node.all_processes.items()
-                for process_info in process_infos
-            )
-    except Exception:
-        pass
-
-    ray.shutdown()
-    _FAULT_RAY_RUNTIME_OWNED = False
-    # ray.shutdown() removes the node's process registry even when a process
-    # survives its bounded shutdown wait. Keep our own handles so no Ray reaper
-    # or agent can outlive this owner test and terminate pytest during
-    # session-finalization (before its JUnit report is written).
-    for process_type, process in ray_processes:
-        if process.poll() is None:
-            process.kill()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"Ray {process_type} process did not exit during fault-test cleanup") from exc
+        ray.shutdown()
+    finally:
+        _FAULT_RAY_CLUSTER = None
+        if cluster is not None:
+            cluster.shutdown()
 
 
 @pytest.fixture(scope="module", autouse=True)
