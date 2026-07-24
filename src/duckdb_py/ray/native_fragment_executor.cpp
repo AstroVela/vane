@@ -980,17 +980,6 @@ static py::dict BuildFragmentStatsSummary(
 }
 
 namespace {
-thread_local bool g_duckdb_py_gil_released = false;
-
-struct DuckdbGilReleaseMarker {
-	DuckdbGilReleaseMarker() {
-		g_duckdb_py_gil_released = true;
-	}
-	~DuckdbGilReleaseMarker() {
-		g_duckdb_py_gil_released = false;
-	}
-};
-
 struct CopyOutputInfo {
 	std::string base;        // staging_root_base (empty for direct-write COPY)
 	std::string run_id;      // staging_run_id (UUID)
