@@ -1020,16 +1020,18 @@ struct DispatcherRefSubmitTask {
 	idx_t submit_id = 0;
 	unique_ptr<LazyRefDataChunk> bundle;
 	unique_ptr<DataChunk> rows;
-	ClientProperties options;
 };
 
 struct DispatcherCommand {
 	enum Type { REQUEST_TASK_ADMISSION, SUBMIT, SUBMIT_REF_BUNDLE, FINISHED_SUBMITTING };
 	Type type;
+	uint64_t generation = 0;
 	idx_t retained_input_bytes = 0;          // only used for REQUEST_TASK_ADMISSION
 	DispatcherSubmitTask submit_task;        // only used for SUBMIT
 	DispatcherRefSubmitTask ref_submit_task; // only used for SUBMIT_REF_BUNDLE
 };
+
+enum class ExecutorSlotState : uint8_t { ACTIVE, RETIRING, DETACHED, CLEANED };
 
 struct ExecutorSlot {
 	uint64_t id = 0;
@@ -1037,7 +1039,16 @@ struct ExecutorSlot {
 	shared_ptr<void> actor_handles; // opaque boxed py::object; decode only under GIL
 	vector<LogicalType> expected_output_types;
 	vector<LogicalType> expected_ref_output_types;
-	ClientContext *context = nullptr;
+
+	// Lifecycle and context access are fenced together. Dispatcher work
+	// captures the ACTIVE generation before entering Python. Unregister advances
+	// the generation and clears this weak reference before it can return, while a
+	// dispatcher operation that already acquired a local shared lease may finish
+	// without racing ClientContext destruction.
+	mutex lifecycle_lock;
+	atomic<ExecutorSlotState> state {ExecutorSlotState::ACTIVE};
+	atomic<uint64_t> generation {1};
+	weak_ptr<ClientContext> context;
 
 	// Python executor — created lazily by dispatcher thread (only thread with GIL)
 	unique_ptr<RegisteredObject> py_executor;
@@ -1076,7 +1087,6 @@ struct ExecutorSlot {
 	// State flags
 	atomic<bool> finished_submitting_acked {false};
 	atomic<bool> all_tasks_finished {false};
-	atomic<bool> pending_shutdown {false};
 	atomic<bool> cleanup_cancel_requested {false};
 	atomic<bool> collector_cancel_requested {false};
 
@@ -1111,11 +1121,52 @@ struct ExecutorSlot {
 	bool cleanup_complete {false};
 };
 
-static ClientContext &RequireActiveSlotContext(ExecutorSlot &slot) {
-	if (slot.pending_shutdown.load() || !slot.context) {
+static bool IsSlotActive(const ExecutorSlot &slot) {
+	return slot.state.load() == ExecutorSlotState::ACTIVE;
+}
+
+static bool IsActiveSlotGeneration(const ExecutorSlot &slot, uint64_t generation) {
+	return IsSlotActive(slot) && slot.generation.load() == generation;
+}
+
+static bool IsSlotRetiring(const ExecutorSlot &slot) {
+	auto state = slot.state.load();
+	return state == ExecutorSlotState::RETIRING || state == ExecutorSlotState::DETACHED;
+}
+
+static void BeginSlotRetirement(ExecutorSlot &slot) {
+	lock_guard<mutex> guard(slot.lifecycle_lock);
+	if (slot.state.load() == ExecutorSlotState::ACTIVE) {
+		slot.state.store(ExecutorSlotState::RETIRING);
+		slot.generation.fetch_add(1);
+	}
+	slot.context.reset();
+}
+
+static void DetachRetiringSlot(ExecutorSlot &slot) {
+	lock_guard<mutex> guard(slot.lifecycle_lock);
+	if (slot.state.load() == ExecutorSlotState::RETIRING) {
+		slot.state.store(ExecutorSlotState::DETACHED);
+	}
+	slot.context.reset();
+}
+
+static void MarkSlotCleaned(ExecutorSlot &slot) {
+	lock_guard<mutex> guard(slot.lifecycle_lock);
+	slot.state.store(ExecutorSlotState::CLEANED);
+	slot.context.reset();
+}
+
+static shared_ptr<ClientContext> RequireActiveSlotContext(ExecutorSlot &slot, uint64_t generation) {
+	lock_guard<mutex> guard(slot.lifecycle_lock);
+	if (!IsActiveSlotGeneration(slot, generation)) {
 		throw InvalidInputException("udf executor slot is shutting down");
 	}
-	return *slot.context;
+	auto context = slot.context.lock();
+	if (!context) {
+		throw InvalidInputException("udf executor slot context is unavailable");
+	}
+	return context;
 }
 
 // ─── GlobalPythonDispatcher (singleton) ──────────────────────────────────────
@@ -1133,10 +1184,11 @@ public:
 		return instance;
 	}
 
-	// Register a new executor slot.  Returns slot ID and stores the raw
-	// pointer in *out_slot (valid until Unregister).
+	// Register a new executor slot. Returns the slot ID, raw pointer (valid
+	// until Unregister), and the generation captured by queued commands.
 	uint64_t Register(Value payload, vector<LogicalType> output_types, vector<LogicalType> ref_output_types,
-	                  ClientContext *ctx, shared_ptr<void> actor_handles, ExecutorSlot **out_slot) {
+	                  ClientContext *ctx, shared_ptr<void> actor_handles, ExecutorSlot **out_slot,
+	                  uint64_t *out_generation) {
 		ThrowIfDispatcherError();
 		lock_guard<mutex> g(global_lock);
 		slot_generation++;
@@ -1154,7 +1206,7 @@ public:
 		slot->actor_handles = std::move(actor_handles);
 		slot->expected_output_types = std::move(output_types);
 		slot->expected_ref_output_types = std::move(ref_output_types);
-		slot->context = ctx;
+		slot->context = ctx->shared_from_this();
 		const auto payload_async_mode = GetStructBoolFlag(slot->payload, "async_mode");
 		if (payload_async_mode && GetStructBoolFlag(slot->payload, "streaming_breaker")) {
 			throw InvalidInputException("streaming_breaker=True does not support async_mode=True");
@@ -1163,6 +1215,7 @@ public:
 		auto *raw = slot.get();
 		slots[id] = std::move(slot);
 		*out_slot = raw;
+		*out_generation = raw->generation.load();
 		UDFDebugLog(StringUtil::Format("register slot=%llu total_slots=%llu", static_cast<unsigned long long>(id),
 		                               static_cast<unsigned long long>(slots.size())));
 		StartThreadLocked();
@@ -1179,7 +1232,7 @@ public:
 				return;
 			}
 			slot = it->second;
-			slot->pending_shutdown.store(true);
+			BeginSlotRetirement(*slot);
 			UDFDebugLog(StringUtil::Format(
 			    "unregister_request slot=%llu inflight=%lld slots=%llu", static_cast<unsigned long long>(id),
 			    static_cast<long long>(slot->inflight_count.load()), static_cast<unsigned long long>(slots.size())));
@@ -1188,9 +1241,9 @@ public:
 		work_cv.notify_one();
 		if (g_on_udf_dispatcher_thread) {
 			// The owning ClientContext may be destroyed as soon as this nested
-			// destructor returns. Every subsequent dispatcher phase skips pending
-			// slots, so clear the non-owning pointer immediately on this thread.
-			slot->context = nullptr;
+			// destructor returns. Retire the captured generation and detach the
+			// context before returning to the caller.
+			DetachRetiringSlot(*slot);
 			// The slot map owns the state until CleanupSlot removes it on the next
 			// dispatcher iteration. There is no external destructor to join here.
 			UDFDebugLog(
@@ -1208,12 +1261,12 @@ public:
 				// holding the GIL while waiting would deadlock that cleanup.
 				ScopedGILReleaseIfHeld release_gil;
 				if (!slot->cleanup_cv.wait_for(lk, unregister_timeout, [&slot] { return slot->cleanup_complete; })) {
-					auto msg =
-					    StringUtil::Format("udf unregister cleanup exceeded hard deadline of %llu ms for slot=%llu",
-					                       static_cast<unsigned long long>(unregister_timeout.count()),
-					                       static_cast<unsigned long long>(id));
-					RecordDispatcherError(msg);
+					DetachRetiringSlot(*slot);
 					slot->abort_requested.store(true);
+					UDFDebugLog(StringUtil::Format("unregister_detached_after_timeout slot=%llu deadline_ms=%llu",
+					                               static_cast<unsigned long long>(id),
+					                               static_cast<unsigned long long>(unregister_timeout.count())));
+					NotifyWork();
 					return;
 				}
 			}
@@ -1225,9 +1278,8 @@ public:
 			ScopedGILReleaseIfHeld release_gil;
 			if (!async_shutdown_complete && !async_shutdown_cv.wait_for(shutdown_lk, unregister_timeout,
 			                                                            [this] { return async_shutdown_complete; })) {
-				auto msg = StringUtil::Format("udf async collector shutdown exceeded hard deadline of %llu ms",
-				                              static_cast<unsigned long long>(unregister_timeout.count()));
-				RecordDispatcherError(msg);
+				UDFDebugLog(StringUtil::Format("unregister_async_shutdown_timeout deadline_ms=%llu",
+				                               static_cast<unsigned long long>(unregister_timeout.count())));
 				return;
 			}
 		}
@@ -1270,6 +1322,22 @@ public:
 		// for its final Python-object cleanup before module/static destruction.
 		ScopedGILReleaseIfHeld release_gil;
 		StopThread();
+	}
+
+	void WakeActiveSlotsForTesting() {
+		vector<shared_ptr<ExecutorSlot>> active;
+		{
+			lock_guard<mutex> guard(global_lock);
+			active.reserve(slots.size());
+			for (auto &entry : slots) {
+				active.push_back(entry.second);
+			}
+		}
+		for (auto &slot : active) {
+			if (slot && IsSlotActive(*slot)) {
+				WakeupPipelineThread(*slot);
+			}
+		}
 	}
 
 private:
@@ -1415,7 +1483,7 @@ private:
 					sc->commands = std::move(commands);
 					pending_commands.push_back(std::move(sc));
 				}
-				if (slot->pending_shutdown.load()) {
+				if (IsSlotRetiring(*slot)) {
 					if (had_commands) {
 						continue;
 					}
@@ -1437,8 +1505,8 @@ private:
 			for (auto *slot : active) {
 				if (!slot)
 					continue; // skip cleaned-up slots
-				if (!slot->pending_shutdown.load() && slot->finished_submitting_acked.load() &&
-				    slot->inflight_count.load() == 0 && !slot->all_tasks_finished.load()) {
+				if (IsSlotActive(*slot) && slot->finished_submitting_acked.load() && slot->inflight_count.load() == 0 &&
+				    !slot->all_tasks_finished.load()) {
 					slot->all_tasks_finished.store(true);
 					NotifySlotFinished(*slot);
 					did_work = true;
@@ -1452,7 +1520,7 @@ private:
 				if (!slot) {
 					continue;
 				}
-				if (!slot->pending_shutdown.load() && slot->inflight_count.load() > 0) {
+				if (IsSlotActive(*slot) && slot->inflight_count.load() > 0) {
 					has_async_inflight = true;
 				}
 			}
@@ -1488,7 +1556,7 @@ private:
 					debug_inflight_slots++;
 					debug_inflight_total += static_cast<idx_t>(inflight);
 				}
-				if (slot->pending_shutdown.load()) {
+				if (!IsSlotActive(*slot)) {
 					debug_pending_shutdown_slots++;
 				}
 			}
@@ -1571,42 +1639,53 @@ private:
 					for (auto &cmd : sc->commands) {
 						if (stop.load())
 							break;
-						if (sc->slot->abort_requested.load() || sc->slot->pending_shutdown.load()) {
+						if (sc->slot->abort_requested.load() || !IsSlotActive(*sc->slot) ||
+						    cmd.generation != sc->slot->generation.load()) {
 							did_work = true;
 							continue;
 						}
 						try {
 							switch (cmd.type) {
 							case DispatcherCommand::REQUEST_TASK_ADMISSION:
-								EnsurePythonExecutor_WithGIL(*sc->slot);
+								if (!EnsurePythonExecutor_WithGIL(*sc->slot, cmd.generation)) {
+									break;
+								}
 								DoRequestTaskAdmission_WithGIL(*sc->slot, cmd.retained_input_bytes);
 								did_work = true;
 								break;
 							case DispatcherCommand::SUBMIT:
-								EnsurePythonExecutor_WithGIL(*sc->slot);
-								DoSubmit_WithGIL(*sc->slot, cmd.submit_task);
+								if (!EnsurePythonExecutor_WithGIL(*sc->slot, cmd.generation)) {
+									break;
+								}
+								DoSubmit_WithGIL(*sc->slot, cmd.submit_task, cmd.generation);
 								did_work = true;
 								break;
 							case DispatcherCommand::SUBMIT_REF_BUNDLE:
-								EnsurePythonExecutor_WithGIL(*sc->slot);
-								DoSubmitRefBundle_WithGIL(*sc->slot, cmd.ref_submit_task);
+								if (!EnsurePythonExecutor_WithGIL(*sc->slot, cmd.generation)) {
+									break;
+								}
+								DoSubmitRefBundle_WithGIL(*sc->slot, cmd.ref_submit_task, cmd.generation);
 								did_work = true;
 								break;
 							case DispatcherCommand::FINISHED_SUBMITTING:
-								EnsurePythonExecutor_WithGIL(*sc->slot);
-								DoFinishedSubmitting_WithGIL(*sc->slot);
+								if (!EnsurePythonExecutor_WithGIL(*sc->slot, cmd.generation)) {
+									break;
+								}
+								DoFinishedSubmitting_WithGIL(*sc->slot, cmd.generation);
 								did_work = true;
 								break;
 							}
 						} catch (const std::exception &ex) {
-							SetSlotError(*sc->slot, ex.what());
+							if (IsActiveSlotGeneration(*sc->slot, cmd.generation)) {
+								SetSlotError(*sc->slot, ex.what());
+							}
 						}
 					}
 				}
 
 				if (has_pending_cleanup_cancel) {
 					for (auto *slot : active) {
-						if (!slot || !slot->pending_shutdown.load() || slot->cleanup_cancel_requested.load() ||
+						if (!slot || !IsSlotRetiring(*slot) || slot->cleanup_cancel_requested.load() ||
 						    slot->inflight_count.load() <= 0) {
 							continue;
 						}
@@ -1620,12 +1699,13 @@ private:
 					did_work |= DrainAsyncResults_WithGIL(active);
 				}
 				for (auto *slot : active) {
-					if (!slot || slot->abort_requested.load() || slot->pending_shutdown.load() || !slot->py_executor) {
+					if (!slot || slot->abort_requested.load() || !IsSlotActive(*slot) || !slot->py_executor) {
 						continue;
 					}
-					auto wake_submitter = RefreshTaskAdmission_WithGIL(*slot);
-					wake_submitter |= UpdateSlotUDFStats_WithGIL(*slot);
-					if (wake_submitter) {
+					auto generation = slot->generation.load();
+					auto wake_submitter = RefreshTaskAdmission_WithGIL(*slot, generation);
+					wake_submitter |= UpdateSlotUDFStats_WithGIL(*slot, generation);
+					if (wake_submitter && IsActiveSlotGeneration(*slot, generation)) {
 						WakeupPipelineThread(*slot);
 						did_work = true;
 					}
@@ -1746,7 +1826,7 @@ private:
 	}
 
 	void MarkSlotCleanupComplete(ExecutorSlot &slot) {
-		slot.context = nullptr;
+		MarkSlotCleaned(slot);
 		{
 			lock_guard<mutex> cleanup_guard(slot.cleanup_lock);
 			slot.cleanup_complete = true;
@@ -1765,10 +1845,9 @@ private:
 			slot = it->second;
 		}
 		auto *slot_ptr = slot.get();
-		UDFDebugLog(StringUtil::Format("cleanup_start slot=%llu inflight=%lld pending_shutdown=%s",
-		                               static_cast<unsigned long long>(id),
-		                               static_cast<long long>(slot_ptr->inflight_count.load()),
-		                               slot_ptr->pending_shutdown.load() ? "true" : "false"));
+		UDFDebugLog(StringUtil::Format(
+		    "cleanup_start slot=%llu inflight=%lld retiring=%s", static_cast<unsigned long long>(id),
+		    static_cast<long long>(slot_ptr->inflight_count.load()), IsSlotRetiring(*slot_ptr) ? "true" : "false"));
 		// Cancel any collector-side records for this slot before destroying the
 		// Python executor. Normal cleanup has no records left; timeout cleanup
 		// uses this as the explicit retire path for late generator events.
@@ -1843,7 +1922,10 @@ private:
 		bool has_item_byte_capacity = false;
 	};
 
-	SlotResultCapacity GetSlotResultCapacity(ExecutorSlot &slot) {
+	SlotResultCapacity GetSlotResultCapacity(ExecutorSlot &slot, uint64_t generation) {
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return {};
+		}
 		UDFOutputConsumer output_consumer;
 		if (GetOutputConsumer(slot, output_consumer)) {
 			ScopedGILReleaseIfHeld release_gil;
@@ -1858,6 +1940,9 @@ private:
 			result.item_bytes = output_consumer.data_item_byte_capacity();
 			result.has_byte_capacity = true;
 			result.has_item_byte_capacity = true;
+			if (!IsActiveSlotGeneration(slot, generation)) {
+				return {};
+			}
 			return result;
 		}
 		lock_guard<mutex> rg(slot.result_lock);
@@ -1869,8 +1954,8 @@ private:
 		return result;
 	}
 
-	bool ShouldDrainSyncResults(ExecutorSlot &slot) {
-		return GetSlotResultCapacity(slot).rows > 0;
+	bool ShouldDrainSyncResults(ExecutorSlot &slot, uint64_t generation) {
+		return GetSlotResultCapacity(slot, generation).rows > 0;
 	}
 
 	void DoRequestTaskAdmission_WithGIL(ExecutorSlot &slot, idx_t retained_input_bytes) {
@@ -1883,7 +1968,7 @@ private:
 		slot.py_executor->obj.attr("request_task_admission")(py::int_(retained_input_bytes));
 	}
 
-	bool RefreshTaskAdmission_WithGIL(ExecutorSlot &slot) {
+	bool RefreshTaskAdmission_WithGIL(ExecutorSlot &slot, uint64_t generation) {
 		if (!PayloadUsesTaskAdmission(slot.payload)) {
 			return false;
 		}
@@ -1891,6 +1976,9 @@ private:
 			throw InvalidInputException("distributed Ray UDF executor is missing task_admission_state()");
 		}
 		auto raw_state = slot.py_executor->obj.attr("task_admission_state")();
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return false;
+		}
 		if (!py::isinstance<py::dict>(raw_state)) {
 			throw InvalidInputException("distributed Ray UDF task_admission_state() must return a dict");
 		}
@@ -1905,6 +1993,9 @@ private:
 		idx_t retained_input_bytes = 0;
 		if (ready) {
 			retained_input_bytes = state[py::str("retained_input_bytes")].cast<idx_t>();
+		}
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return false;
 		}
 		lock_guard<mutex> guard(slot.task_admission_lock);
 		if (state_name == "idle" || state_name == "closed") {
@@ -2056,12 +2147,15 @@ private:
 		}
 	}
 
-	bool UpdateSlotUDFStats_WithGIL(ExecutorSlot &slot) {
+	bool UpdateSlotUDFStats_WithGIL(ExecutorSlot &slot, uint64_t generation) {
 		if (!slot.py_executor || !py::hasattr(slot.py_executor->obj, "stats")) {
 			return false;
 		}
 		try {
 			auto raw_stats = slot.py_executor->obj.attr("stats")();
+			if (!IsActiveSlotGeneration(slot, generation)) {
+				return false;
+			}
 			if (!py::isinstance<py::dict>(raw_stats)) {
 				return false;
 			}
@@ -2086,6 +2180,9 @@ private:
 			    ExtractPythonStatsIdx_WithGIL(stats, "udf_output_budget_usage_bytes", output_budget_usage_bytes);
 			if (!has_running && !has_queued && !has_max && !has_output_budget_available &&
 			    !has_output_budget_estimated && !has_output_budget_limit && !has_output_budget_usage) {
+				return false;
+			}
+			if (!IsActiveSlotGeneration(slot, generation)) {
 				return false;
 			}
 			if (has_running) {
@@ -2116,10 +2213,14 @@ private:
 			slot.udf_stats_valid.store(true);
 			return wake_submitter;
 		} catch (const py::error_already_set &ex) {
-			SetSlotError(slot, StringUtil::Format("udf stats update failed: %s", ex.what()));
+			if (IsActiveSlotGeneration(slot, generation)) {
+				SetSlotError(slot, StringUtil::Format("udf stats update failed: %s", ex.what()));
+			}
 			return true;
 		} catch (const std::exception &ex) {
-			SetSlotError(slot, StringUtil::Format("udf stats update failed: %s", ex.what()));
+			if (IsActiveSlotGeneration(slot, generation)) {
+				SetSlotError(slot, StringUtil::Format("udf stats update failed: %s", ex.what()));
+			}
 			return true;
 		}
 	}
@@ -2159,7 +2260,10 @@ private:
 		    static_cast<long long>(inflight_before), static_cast<long long>(slot.inflight_count.load())));
 	}
 
-	void QueueTerminalControlResult(ExecutorSlot &slot, idx_t submit_id) {
+	void QueueTerminalControlResult(ExecutorSlot &slot, idx_t submit_id, uint64_t generation) {
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return;
+		}
 		UDFResult result;
 		result.outputs = MakeEmptyDataChunk();
 		result.rows = MakeEmptyDataChunk();
@@ -2171,7 +2275,9 @@ private:
 		}
 		ReleaseTerminalSubmit(slot, submit_id);
 		MaybeMarkSlotFinished(slot);
-		WakeupPipelineThread(slot);
+		if (IsActiveSlotGeneration(slot, generation)) {
+			WakeupPipelineThread(slot);
+		}
 	}
 
 	UDFOutputConsumer ResolveOutputConsumer(ExecutorSlot &slot) {
@@ -2211,7 +2317,11 @@ private:
 		return queue_consumer;
 	}
 
-	bool DeliverOutputEvent(ExecutorSlot &slot, UDFOutputEvent &&event) {
+	bool DeliverOutputEvent(ExecutorSlot &slot, UDFOutputEvent &&event, uint64_t generation) {
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			ReleaseOutputLeaseCallback(event.release_output_lease);
+			return true;
+		}
 		const auto event_kind = event.kind;
 		const bool submit_complete = event.submit_complete;
 		const auto submit_id_for_log = event.submit_id;
@@ -2256,6 +2366,10 @@ private:
 				ScopedGILReleaseIfHeld release_gil;
 				capacity_available = consumer.data_capacity() > 0;
 			}
+			if (!IsActiveSlotGeneration(slot, generation)) {
+				ReleaseOutputLeaseCallback(event.release_output_lease);
+				return true;
+			}
 			if (!capacity_available) {
 				release_terminal_submit();
 				ReleaseOutputLeaseCallback(event.release_output_lease);
@@ -2276,12 +2390,20 @@ private:
 			ScopedGILReleaseIfHeld release_gil;
 			consumer.accept_event(std::move(event));
 		} catch (const std::exception &ex) {
+			if (!IsActiveSlotGeneration(slot, generation)) {
+				ReleaseOutputLeaseCallback(release_on_consumer_error);
+				return true;
+			}
 			release_terminal_submit();
 			ReleaseOutputLeaseCallback(release_on_consumer_error);
 			SetSlotError(slot, ex.what());
 			return true;
 		}
 
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			ReleaseOutputLeaseCallback(release_on_consumer_error);
+			return true;
+		}
 		release_terminal_submit();
 		if (event_kind == UDFOutputEventKind::ERROR) {
 			SetSlotError(slot, error_for_log.empty() ? "udf async error" : error_for_log);
@@ -2297,7 +2419,7 @@ private:
 		return true;
 	}
 
-	bool TryDeliverResult(ExecutorSlot &slot, UDFResult &&result) {
+	bool TryDeliverResult(ExecutorSlot &slot, UDFResult &&result, uint64_t generation) {
 		UDFOutputEvent event;
 		event.kind = UDFOutputEventKind::DATA;
 		event.submit_id = result.submit_id;
@@ -2307,7 +2429,7 @@ private:
 		event.submit_complete = result.submit_complete;
 		event.handoff_output_lease = std::move(result.handoff_output_lease);
 		event.release_output_lease = std::move(result.release_output_lease);
-		return DeliverOutputEvent(slot, std::move(event));
+		return DeliverOutputEvent(slot, std::move(event), generation);
 	}
 
 	const vector<LogicalType> &ExpectedDirectOutputTypes(ExecutorSlot &slot, idx_t submit_id) {
@@ -2322,10 +2444,16 @@ private:
 		return slot.expected_output_types;
 	}
 
-	bool DrainSyncResults(ExecutorSlot &slot) {
+	bool DrainSyncResults(ExecutorSlot &slot, uint64_t generation) {
 		// Caller holds GIL. Drain at most one queued result per dispatcher
 		// iteration; Python executors wake the dispatcher when new items arrive.
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return false;
+		}
 		auto raw_result = slot.py_executor->obj.attr("take_ready_result")();
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return true;
+		}
 		if (raw_result.is_none()) {
 			return false;
 		}
@@ -2370,8 +2498,11 @@ private:
 			return true;
 		} else {
 			g_udf_direct_output_arrow_table_conversion_count.fetch_add(1, std::memory_order_relaxed);
-			outputs_chunk = ConvertArrowTableToDataChunk(result, RequireActiveSlotContext(slot),
-			                                             ExpectedDirectOutputTypes(slot, submit_id));
+			auto context = RequireActiveSlotContext(slot, generation);
+			outputs_chunk = ConvertArrowTableToDataChunk(result, *context, ExpectedDirectOutputTypes(slot, submit_id));
+		}
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return true;
 		}
 
 		unique_ptr<DataChunk> rows_chunk;
@@ -2404,45 +2535,64 @@ private:
 		class_result.rows = std::move(rows_chunk);
 		class_result.submit_complete = ready_result.submit_complete;
 		class_result.submit_id = submit_id;
-		if (!TryDeliverResult(slot, std::move(class_result))) {
+		if (!TryDeliverResult(slot, std::move(class_result), generation)) {
 			SetSlotError(slot, "udf async result queue: output consumer rejected capacity-aware delivery");
 			return true;
 		}
 		return true;
 	}
 
-	bool DrainSyncSlotSafely(ExecutorSlot &slot) {
+	bool DrainSyncSlotSafely(ExecutorSlot &slot, uint64_t generation) {
 		auto old_error = slot.has_error.load();
 		try {
-			return DrainSyncResults(slot) || slot.has_error.load() != old_error;
+			return DrainSyncResults(slot, generation) || slot.has_error.load() != old_error;
 		} catch (const py::error_already_set &ex) {
-			SetSlotError(slot, StringUtil::Format("udf async collector failed: %s", ex.what()));
+			if (IsActiveSlotGeneration(slot, generation)) {
+				SetSlotError(slot, StringUtil::Format("udf async collector failed: %s", ex.what()));
+			}
 			return true;
 		} catch (const std::exception &ex) {
-			SetSlotError(slot, StringUtil::Format("udf async result drain failed: %s", ex.what()));
+			if (IsActiveSlotGeneration(slot, generation)) {
+				SetSlotError(slot, StringUtil::Format("udf async result drain failed: %s", ex.what()));
+			}
 			return true;
 		}
 	}
 
-	void DoSubmit_WithGIL(ExecutorSlot &slot, DispatcherSubmitTask &task) {
+	void DoSubmit_WithGIL(ExecutorSlot &slot, DispatcherSubmitTask &task, uint64_t generation) {
 		try {
 			// Wrap pre-computed Arrow C data into PyArrow Table (caller holds GIL)
 			if (task.arrow_schemas.size() != task.arrow_arrays.size() || task.arrow_arrays.empty()) {
 				throw InternalException("udf submit task has invalid Arrow batch envelope");
 			}
-			py::list batches;
-			for (idx_t batch_idx = 0; batch_idx < task.arrow_arrays.size(); batch_idx++) {
-				TransformDuckToArrowChunk(task.arrow_schemas[batch_idx]->arrow_schema,
-				                          task.arrow_arrays[batch_idx]->arrow_array, batches);
+			py::object py_args;
+			{
+				// ClientProperties contains a non-owning client_context pointer.
+				// Rebind a pointer-free queued snapshot while holding a local
+				// generation-validated lease for the complete Arrow conversion.
+				auto context = RequireActiveSlotContext(slot, generation);
+				auto options = task.options;
+				options.client_context = context.get();
+				py::list batches;
+				for (idx_t batch_idx = 0; batch_idx < task.arrow_arrays.size(); batch_idx++) {
+					TransformDuckToArrowChunk(task.arrow_schemas[batch_idx]->arrow_schema,
+					                          task.arrow_arrays[batch_idx]->arrow_array, batches);
+				}
+				py_args = pyarrow::ToArrowTable(task.types, task.names, batches, options);
 			}
-			auto py_args = pyarrow::ToArrowTable(task.types, task.names, batches, task.options);
+			if (!IsActiveSlotGeneration(slot, generation)) {
+				return;
+			}
 
 			// submit_with_id() lets Python async executors return out-of-order while
 			// preserving the C++ submit_id -> input rows association.
 			py::object ref = slot.py_executor->obj.attr("submit_with_id")(py::int_(task.submit_id), py_args);
+			if (!IsActiveSlotGeneration(slot, generation)) {
+				return;
+			}
 			ConsumeTaskAdmissionReservation(slot);
 
-			TrackSubmittedPythonRef_WithGIL(slot, task.submit_id, ref, std::move(task.rows));
+			TrackSubmittedPythonRef_WithGIL(slot, task.submit_id, ref, std::move(task.rows), generation);
 		} catch (const py::error_already_set &ex) {
 			throw InvalidInputException("udf submit failed: %s", ex.what());
 		}
@@ -2488,7 +2638,11 @@ private:
 	}
 
 	void TrackSubmittedPythonRef_WithGIL(ExecutorSlot &slot, idx_t submit_id, py::object &ref,
-	                                     unique_ptr<DataChunk> rows, bool require_generator_ref = false) {
+	                                     unique_ptr<DataChunk> rows, uint64_t generation,
+	                                     bool require_generator_ref = false) {
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return;
+		}
 		if (ref.is_none()) {
 			auto inflight_before = slot.inflight_count.load();
 			slot.inflight_count++;
@@ -2507,7 +2661,13 @@ private:
 		if (py::hasattr(slot.py_executor->obj, "error_context")) {
 			error_context = slot.py_executor->obj.attr("error_context")();
 		}
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return;
+		}
 		async_collector->obj.attr("track_generator_ref")(py::int_(slot.id), py::int_(submit_id), ref, error_context);
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return;
+		}
 		auto inflight_before = slot.inflight_count.load();
 		slot.inflight_count++;
 		slot.rows_by_submit_id.emplace(submit_id, std::move(rows));
@@ -2518,7 +2678,7 @@ private:
 		    static_cast<long long>(slot.inflight_count.load())));
 	}
 
-	void DoSubmitRefBundle_WithGIL(ExecutorSlot &slot, DispatcherRefSubmitTask &task) {
+	void DoSubmitRefBundle_WithGIL(ExecutorSlot &slot, DispatcherRefSubmitTask &task, uint64_t generation) {
 		try {
 			if (!task.bundle) {
 				throw InvalidInputException("udf ref bundle submit received null bundle");
@@ -2531,13 +2691,16 @@ private:
 
 			py::object ref = slot.py_executor->obj.attr("submit_ref_bundle_with_id")(py::int_(task.submit_id), refs,
 			                                                                         slices, metadata, names);
+			if (!IsActiveSlotGeneration(slot, generation)) {
+				return;
+			}
 			ConsumeTaskAdmissionReservation(slot);
 			auto inserted = slot.ref_inputs_by_submit_id.emplace(task.submit_id, std::move(task.bundle));
 			if (!inserted.second) {
 				throw InternalException("duplicate retained ref-bundle submit id");
 			}
 
-			TrackSubmittedPythonRef_WithGIL(slot, task.submit_id, ref, std::move(task.rows), true);
+			TrackSubmittedPythonRef_WithGIL(slot, task.submit_id, ref, std::move(task.rows), generation, true);
 		} catch (const py::error_already_set &ex) {
 			throw InvalidInputException("udf ref bundle submit failed: %s", ex.what());
 		}
@@ -2545,24 +2708,28 @@ private:
 
 	bool DrainAsyncResults_WithGIL(vector<ExecutorSlot *> &active) {
 		bool did_work = false;
-		std::unordered_map<uint64_t, ExecutorSlot *> active_by_id;
-		active_by_id.reserve(active.size());
+		std::unordered_map<uint64_t, std::pair<ExecutorSlot *, uint64_t>> slots_by_id;
+		slots_by_id.reserve(active.size());
 		for (auto *slot : active) {
-			if (slot && !slot->pending_shutdown.load()) {
-				active_by_id.emplace(slot->id, slot);
+			if (slot) {
+				slots_by_id.emplace(slot->id, std::make_pair(slot, slot->generation.load()));
 			}
 		}
 		auto fail_active_slots = [&](const string &msg) {
 			for (auto *slot : active) {
-				if (!slot || !slot->py_executor || slot->abort_requested.load() || slot->pending_shutdown.load()) {
+				if (!slot || !slot->py_executor || slot->abort_requested.load() || !IsSlotActive(*slot)) {
 					continue;
 				}
 				SetSlotError(*slot, msg);
 			}
 			did_work = true;
 		};
-		auto handle_output = [&](ExecutorSlot &slot, idx_t submit_id, const py::handle &output) -> bool {
+		auto handle_output = [&](ExecutorSlot &slot, uint64_t generation, idx_t submit_id,
+		                         const py::handle &output) -> bool {
 			auto ready_result = DecodePythonReadyResult(output);
+			if (!IsActiveSlotGeneration(slot, generation)) {
+				return true;
+			}
 			if (ready_result.submit_id > 0) {
 				submit_id = ready_result.submit_id;
 			}
@@ -2614,7 +2781,7 @@ private:
 				empty_result.rows = std::move(rows_chunk);
 				empty_result.submit_complete = ready_result.submit_complete;
 				empty_result.submit_id = submit_id;
-				if (!TryDeliverResult(slot, std::move(empty_result))) {
+				if (!TryDeliverResult(slot, std::move(empty_result), generation)) {
 					SetSlotError(slot, "udf async: output consumer rejected capacity-aware delivery");
 					return false;
 				}
@@ -2636,8 +2803,12 @@ private:
 				return true;
 			} else {
 				g_udf_direct_output_arrow_table_conversion_count.fetch_add(1, std::memory_order_relaxed);
-				outputs_chunk = ConvertArrowTableToDataChunk(output_obj, RequireActiveSlotContext(slot),
-				                                             ExpectedDirectOutputTypes(slot, submit_id));
+				auto context = RequireActiveSlotContext(slot, generation);
+				outputs_chunk =
+				    ConvertArrowTableToDataChunk(output_obj, *context, ExpectedDirectOutputTypes(slot, submit_id));
+			}
+			if (!IsActiveSlotGeneration(slot, generation)) {
+				return true;
 			}
 			unique_ptr<DataChunk> rows_chunk;
 			if (slot.is_table_udf) {
@@ -2672,7 +2843,7 @@ private:
 			result.rows = std::move(rows_chunk);
 			result.submit_complete = ready_result.submit_complete;
 			result.submit_id = submit_id;
-			if (!TryDeliverResult(slot, std::move(result))) {
+			if (!TryDeliverResult(slot, std::move(result), generation)) {
 				SetSlotError(slot, "udf async: output consumer rejected capacity-aware delivery");
 				return false;
 			}
@@ -2690,9 +2861,10 @@ private:
 				auto debug_probe_tick = g_udf_debug_drain_tick.load(std::memory_order_relaxed);
 				bool debug_probe_slots = UDFDebugEnabled() && (debug_probe_tick >= 650 || debug_probe_tick % 200 == 0);
 				for (auto *slot : active) {
-					if (!slot || slot->abort_requested.load() || slot->pending_shutdown.load()) {
+					if (!slot || slot->abort_requested.load() || !IsSlotActive(*slot)) {
 						continue;
 					}
+					auto generation = slot->generation.load();
 					const bool has_inflight = slot->inflight_count.load() > 0;
 					if (!has_inflight) {
 						continue;
@@ -2702,14 +2874,13 @@ private:
 					if (debug_probe_slots) {
 						UDFDebugLog(StringUtil::Format(
 						    "capacity_probe_begin drain_tick=%llu slot=%llu inflight=%lld has_consumer=%s "
-						    "pending_shutdown=%s",
+						    "retiring=%s",
 						    static_cast<unsigned long long>(debug_probe_tick),
 						    static_cast<unsigned long long>(slot->id),
 						    static_cast<long long>(slot->inflight_count.load()),
-						    slot->has_output_consumer ? "true" : "false",
-						    slot->pending_shutdown.load() ? "true" : "false"));
+						    slot->has_output_consumer ? "true" : "false", IsSlotRetiring(*slot) ? "true" : "false"));
 					}
-					auto capacity = GetSlotResultCapacity(*slot);
+					auto capacity = GetSlotResultCapacity(*slot, generation);
 					if (debug_probe_slots) {
 						UDFDebugLog(StringUtil::Format(
 						    "capacity_probe_end drain_tick=%llu slot=%llu rows=%llu bytes=%llu "
@@ -2754,6 +2925,7 @@ private:
 
 				for (auto &item : results) {
 					ExecutorSlot *slot = nullptr;
+					uint64_t slot_generation = 0;
 					try {
 						auto tup = item.cast<py::tuple>();
 						uint64_t slot_id = 0;
@@ -2765,6 +2937,11 @@ private:
 						auto tuple_len = py::len(tup);
 						if (tuple_len == 4 || tuple_len == 6) {
 							slot_id = tup[0].cast<uint64_t>();
+							auto slot_entry = slots_by_id.find(slot_id);
+							if (slot_entry != slots_by_id.end()) {
+								slot = slot_entry->second.first;
+								slot_generation = slot_entry->second.second;
+							}
 							submit_id = tup[1].cast<idx_t>();
 							event_kind = tup[2].cast<string>();
 							payload = py::reinterpret_borrow<py::object>(tup[3]);
@@ -2791,17 +2968,13 @@ private:
 							handoff_output_lease = std::move(callbacks.handoff);
 							release_output_lease = std::move(callbacks.release);
 						}
-						auto slot_entry = active_by_id.find(slot_id);
-						if (slot_entry != active_by_id.end()) {
-							slot = slot_entry->second;
-						}
 						if (!slot) {
 							if (release_output_lease) {
 								release_output_lease();
 							}
 							continue;
 						}
-						if (slot->abort_requested.load() || slot->pending_shutdown.load()) {
+						if (slot->abort_requested.load() || !IsActiveSlotGeneration(*slot, slot_generation)) {
 							if (release_output_lease) {
 								release_output_lease();
 							}
@@ -2858,7 +3031,7 @@ private:
 								event.error = StringUtil::Format(
 								    "udf async collector returned unknown output event '%s'", event_kind);
 							}
-							if (!DeliverOutputEvent(*slot, std::move(event))) {
+							if (!DeliverOutputEvent(*slot, std::move(event), slot_generation)) {
 								SetSlotError(*slot, "udf async: output consumer rejected capacity-aware delivery");
 							}
 							did_work = true;
@@ -2884,15 +3057,22 @@ private:
 								event.submit_id = submit_id;
 								event.submit_complete = true;
 								event.error = DistributedRefBundleContractError(slot->payload, submit_id, payload);
-								DeliverOutputEvent(*slot, std::move(event));
+								DeliverOutputEvent(*slot, std::move(event), slot_generation);
 								did_work = true;
 								continue;
 							} else {
 								g_udf_direct_output_arrow_table_conversion_count.fetch_add(1,
 								                                                           std::memory_order_relaxed);
-								outputs_chunk =
-								    ConvertArrowTableToDataChunk(payload, RequireActiveSlotContext(*slot),
-								                                 ExpectedDirectOutputTypes(*slot, submit_id));
+								auto context = RequireActiveSlotContext(*slot, slot_generation);
+								outputs_chunk = ConvertArrowTableToDataChunk(
+								    payload, *context, ExpectedDirectOutputTypes(*slot, submit_id));
+							}
+							if (!IsActiveSlotGeneration(*slot, slot_generation)) {
+								if (release_output_lease) {
+									release_output_lease();
+								}
+								did_work = true;
+								continue;
 							}
 							unique_ptr<DataChunk> rows_chunk;
 							if (slot->is_table_udf) {
@@ -2928,14 +3108,14 @@ private:
 							result.submit_id = submit_id;
 							result.handoff_output_lease = std::move(handoff_output_lease);
 							result.release_output_lease = std::move(release_output_lease);
-							if (!TryDeliverResult(*slot, std::move(result))) {
+							if (!TryDeliverResult(*slot, std::move(result), slot_generation)) {
 								SetSlotError(*slot, "udf async: output consumer rejected capacity-aware delivery");
 							}
 							did_work = true;
 							continue;
 						}
 						if (event_kind == "complete") {
-							QueueTerminalControlResult(*slot, submit_id);
+							QueueTerminalControlResult(*slot, submit_id, slot_generation);
 							did_work = true;
 							continue;
 						}
@@ -2945,7 +3125,7 @@ private:
 							event.submit_id = submit_id;
 							event.submit_complete = true;
 							event.error = py::str(payload).cast<string>();
-							DeliverOutputEvent(*slot, std::move(event));
+							DeliverOutputEvent(*slot, std::move(event), slot_generation);
 							did_work = true;
 							continue;
 						}
@@ -2954,16 +3134,16 @@ private:
 						                                       event_kind));
 						did_work = true;
 					} catch (const py::error_already_set &ex) {
-						if (slot && !slot->abort_requested.load()) {
+						if (slot && !slot->abort_requested.load() && IsActiveSlotGeneration(*slot, slot_generation)) {
 							SetSlotError(*slot, StringUtil::Format("udf async collector result failed: %s", ex.what()));
-						} else {
+						} else if (!slot) {
 							fail_active_slots(StringUtil::Format("udf async collector failed: %s", ex.what()));
 						}
 						did_work = true;
 					} catch (const std::exception &ex) {
-						if (slot && !slot->abort_requested.load()) {
+						if (slot && !slot->abort_requested.load() && IsActiveSlotGeneration(*slot, slot_generation)) {
 							SetSlotError(*slot, StringUtil::Format("udf async collector result failed: %s", ex.what()));
-						} else {
+						} else if (!slot) {
 							fail_active_slots(StringUtil::Format("udf async result drain failed: %s", ex.what()));
 						}
 						did_work = true;
@@ -2971,14 +3151,15 @@ private:
 				}
 
 				for (auto *slot : active) {
-					if (!slot || slot->abort_requested.load() || slot->pending_shutdown.load() || !slot->py_executor ||
+					if (!slot || slot->abort_requested.load() || !IsSlotActive(*slot) || !slot->py_executor ||
 					    slot->inflight_count.load() <= 0) {
 						continue;
 					}
-					if (!ShouldDrainSyncResults(*slot)) {
+					auto generation = slot->generation.load();
+					if (!ShouldDrainSyncResults(*slot, generation)) {
 						continue;
 					}
-					if (DrainSyncSlotSafely(*slot)) {
+					if (DrainSyncSlotSafely(*slot, generation)) {
 						did_work = true;
 					}
 				}
@@ -2991,14 +3172,15 @@ private:
 
 		if (!async_collector) {
 			for (auto *slot : active) {
-				if (!slot || slot->abort_requested.load() || slot->pending_shutdown.load() || !slot->py_executor ||
+				if (!slot || slot->abort_requested.load() || !IsSlotActive(*slot) || !slot->py_executor ||
 				    slot->inflight_count.load() <= 0) {
 					continue;
 				}
-				if (!ShouldDrainSyncResults(*slot)) {
+				auto generation = slot->generation.load();
+				if (!ShouldDrainSyncResults(*slot, generation)) {
 					continue;
 				}
-				if (DrainSyncSlotSafely(*slot)) {
+				if (DrainSyncSlotSafely(*slot, generation)) {
 					did_work = true;
 				}
 			}
@@ -3007,10 +3189,13 @@ private:
 		return did_work;
 	}
 
-	void DoFinishedSubmitting_WithGIL(ExecutorSlot &slot) {
+	void DoFinishedSubmitting_WithGIL(ExecutorSlot &slot, uint64_t generation) {
 		// Caller holds GIL
 		try {
 			slot.py_executor->obj.attr("finished_submitting")();
+			if (!IsActiveSlotGeneration(slot, generation)) {
+				return;
+			}
 			slot.finished_submitting_acked.store(true);
 			MaybeMarkSlotFinished(slot);
 		} catch (const py::error_already_set &ex) {
@@ -3058,7 +3243,10 @@ private:
 		}
 	}
 
-	void RecordWakeupFailure(ExecutorSlot &slot, const string &msg) {
+	void RecordWakeupFailure(ExecutorSlot &slot, uint64_t generation, const string &msg) {
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return;
+		}
 		bool first_error = false;
 		{
 			lock_guard<mutex> eg(slot.error_lock);
@@ -3071,10 +3259,17 @@ private:
 		if (first_error) {
 			AbortSlotForError(slot);
 		}
-		RecordDispatcherError(msg);
+		lock_guard<mutex> lifecycle_guard(slot.lifecycle_lock);
+		if (IsActiveSlotGeneration(slot, generation)) {
+			RecordDispatcherError(msg);
+		}
 	}
 
 	void WakeupPipelineThread(ExecutorSlot &slot) {
+		auto generation = slot.generation.load();
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return;
+		}
 		// Fire the interrupt callback for operators that returned TASK_BLOCKED.
 		// The callback is one-shot so a stale callback cannot reschedule an
 		// already-running task.
@@ -3090,36 +3285,50 @@ private:
 			}
 			callback = slot.wakeup_callback;
 		}
-		if (should_callback) {
+		if (should_callback && IsActiveSlotGeneration(slot, generation)) {
 			try {
 				interrupt_state.Callback();
 			} catch (const std::exception &ex) {
-				RecordWakeupFailure(slot, StringUtil::Format("udf interrupt callback failed: %s", ex.what()));
+				RecordWakeupFailure(slot, generation,
+				                    StringUtil::Format("udf interrupt callback failed: %s", ex.what()));
 			}
 		}
-		if (callback) {
+		if (callback && IsActiveSlotGeneration(slot, generation)) {
 			try {
 				ScopedGILReleaseIfHeld release_gil;
 				callback();
 			} catch (const std::exception &ex) {
-				RecordWakeupFailure(slot, StringUtil::Format("udf wakeup callback failed: %s", ex.what()));
+				RecordWakeupFailure(slot, generation, StringUtil::Format("udf wakeup callback failed: %s", ex.what()));
 			}
 		}
 	}
 
 	// ── Helpers (caller holds GIL) ───────────────────────────────────────
 
-	void EnsurePythonExecutor_WithGIL(ExecutorSlot &slot) {
+	bool EnsurePythonExecutor_WithGIL(ExecutorSlot &slot, uint64_t generation) {
 		if (slot.py_executor_initialized) {
-			return;
+			return IsActiveSlotGeneration(slot, generation);
+		}
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return false;
 		}
 		ClientProperties cached_options;
 		{
 			py::gil_scoped_release release;
 			ScopedClientContextLock ctx_g;
-			cached_options = RequireActiveSlotContext(slot).GetClientProperties();
+			auto context = RequireActiveSlotContext(slot, generation);
+			cached_options = context->GetClientProperties();
+			// Payload conversion only needs the value properties. Do not carry a
+			// non-owning ClientContext pointer beyond the validated lease.
+			cached_options.client_context = nullptr;
+		}
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return false;
 		}
 		py::object payload_obj = PythonObject::FromValue(slot.payload, slot.payload.type(), cached_options);
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return false;
+		}
 
 		py::object module;
 		try {
@@ -3138,13 +3347,27 @@ private:
 				options = py::reinterpret_borrow<py::dict>(*boxed_options);
 			}
 			py::object executor_obj = module.attr("build_unified_executor")(payload_obj, options);
-			slot.py_executor = make_uniq<RegisteredObject>(std::move(executor_obj));
+			auto executor = make_uniq<RegisteredObject>(std::move(executor_obj));
+			if (!IsActiveSlotGeneration(slot, generation)) {
+				if (py::hasattr(executor->obj, "close")) {
+					executor->obj.attr("close")();
+				}
+				return false;
+			}
 			auto wakeup_fn = py::cpp_function([this]() {
 				wakeup_fired.store(true);
 				work_cv.notify_one();
 			});
-			slot.py_executor->obj.attr("register_wakeup")(wakeup_fn);
+			executor->obj.attr("register_wakeup")(wakeup_fn);
+			if (!IsActiveSlotGeneration(slot, generation)) {
+				if (py::hasattr(executor->obj, "close")) {
+					executor->obj.attr("close")();
+				}
+				return false;
+			}
+			slot.py_executor = std::move(executor);
 			slot.py_executor_initialized = true;
+			return true;
 		} catch (const py::error_already_set &ex) {
 			throw InvalidInputException("Failed to build udf executor: %s", ex.what());
 		}
@@ -3408,16 +3631,13 @@ public:
 			task.submit_id = next_submit_id_++;
 			task.rows = DeepCopyDataChunk(rows);
 			task.bundle = CopyLazyRefDataChunk(bundle);
-			{
-				ScopedClientContextLock ctx_g;
-				task.options = context.GetClientProperties();
-			}
 
 			submit_id = task.submit_id;
 			{
 				lock_guard<mutex> sg(slot_->cmd_lock);
 				DispatcherCommand cmd;
 				cmd.type = DispatcherCommand::SUBMIT_REF_BUNDLE;
+				cmd.generation = slot_generation_;
 				cmd.ref_submit_task = std::move(task);
 				slot_->cmd_queue.push_back(std::move(cmd));
 			}
@@ -3462,6 +3682,7 @@ public:
 			lock_guard<mutex> sg(slot_->cmd_lock);
 			DispatcherCommand cmd;
 			cmd.type = DispatcherCommand::FINISHED_SUBMITTING;
+			cmd.generation = slot_generation_;
 			slot_->cmd_queue.push_back(std::move(cmd));
 		}
 		GlobalPythonDispatcher::Instance().NotifyWork();
@@ -3595,10 +3816,15 @@ private:
 	}
 
 	void EnqueueSubmitTask(DispatcherSubmitTask &&task) {
+		// ClientProperties stores ClientContext as a non-owning pointer. The
+		// dispatcher reacquires a short-lived lease immediately before conversion;
+		// queued work must not retain a pointer that can outlive the connection.
+		task.options.client_context = nullptr;
 		{
 			lock_guard<mutex> sg(slot_->cmd_lock);
 			DispatcherCommand cmd;
 			cmd.type = DispatcherCommand::SUBMIT;
+			cmd.generation = slot_generation_;
 			cmd.submit_task = std::move(task);
 			slot_->cmd_queue.push_back(std::move(cmd));
 		}
@@ -3668,6 +3894,7 @@ private:
 			lock_guard<mutex> command_guard(slot_->cmd_lock);
 			DispatcherCommand command;
 			command.type = DispatcherCommand::REQUEST_TASK_ADMISSION;
+			command.generation = slot_generation_;
 			command.retained_input_bytes = retained_input_bytes;
 			slot_->cmd_queue.push_back(std::move(command));
 			GlobalPythonDispatcher::Instance().NotifyWork();
@@ -3680,7 +3907,7 @@ private:
 			return;
 		}
 		slot_id_ = GlobalPythonDispatcher::Instance().Register(payload_, output_types_, ref_output_types_, &context,
-		                                                       std::move(actor_handles_), &slot_);
+		                                                       std::move(actor_handles_), &slot_, &slot_generation_);
 		registered_ = true;
 		if (wakeup_callback_) {
 			lock_guard<mutex> wg(slot_->wakeup_lock);
@@ -3698,6 +3925,7 @@ private:
 	vector<LogicalType> ref_output_types_;
 	shared_ptr<void> actor_handles_;
 	uint64_t slot_id_ = 0;
+	uint64_t slot_generation_ = 0;
 	ExecutorSlot *slot_ = nullptr; // raw pointer, valid from Register to Unregister
 	bool registered_ = false;
 	mutex submit_lock_;
@@ -3765,6 +3993,14 @@ void ResetUDFExecutorDebugCounters() {
 
 void ShutdownUDFExecutorDispatcher() {
 	GlobalPythonDispatcher::Instance().Shutdown();
+}
+
+void WakeUDFExecutorSlotsForTesting() {
+	const char *test_hooks = std::getenv("VANE_ENABLE_UDF_TEST_HOOKS");
+	if (!test_hooks || string(test_hooks) != "1") {
+		throw InvalidInputException("_wake_udf_executor_slots_for_testing requires VANE_ENABLE_UDF_TEST_HOOKS=1");
+	}
+	GlobalPythonDispatcher::Instance().WakeActiveSlotsForTesting();
 }
 
 void RegisterUDFExecutorFactory() {
