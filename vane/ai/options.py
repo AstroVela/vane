@@ -227,7 +227,14 @@ class GoogleEmbeddingOptions:
 
 @dataclass(frozen=True, repr=False)
 class VLLMPromptOptions(_RedactedOptionsRepr):
-    """vLLM prompt generation options."""
+    """vLLM prompt generation options.
+
+    ``max_tokens`` and ``temperature`` are convenience fields: the vLLM
+    descriptor folds them into ``generate_args["sampling_params"]`` so they
+    reach the engine's ``SamplingParams``. On conflict, an entry set
+    explicitly in ``generate_args["sampling_params"]`` wins over the
+    convenience field of the same name.
+    """
 
     generate_args: Mapping[str, Any] | None = None
     max_tokens: int | None = None

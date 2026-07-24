@@ -42,6 +42,7 @@ Under the hood the model's JSON schema is injected into
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -86,6 +87,61 @@ def _parse_structured_output(raw_text: str | None, return_format: Any) -> Any:
     return data
 
 
+# Convenience prompt options accepted at the top level of the vLLM option
+# mapping. The executor only reads ``generate_args["sampling_params"]``, so
+# the descriptor folds these in before sealing (see
+# ``VLLMPrompterDescriptor.__post_init__``).
+_SAMPLING_PARAM_OPTIONS: tuple[str, ...] = ("max_tokens", "temperature")
+
+
+def _fold_sampling_param_options(options: dict[str, Any]) -> dict[str, Any]:
+    """Return ``options`` with top-level sampling conveniences folded into ``sampling_params``.
+
+    ``vane.ai.prompt`` (via :class:`vane.ai.options.VLLMPromptOptions` or
+    direct keyword arguments) and the SQL binding accept ``max_tokens`` /
+    ``temperature`` as top-level vLLM options, but the executor only reads
+    ``generate_args["sampling_params"]``. Folding makes the convenience
+    fields take effect instead of being silently dropped (vane#142).
+
+    Precedence: an entry the user set explicitly in
+    ``generate_args["sampling_params"]`` wins over the top-level convenience
+    field of the same name — even an entry explicitly set to ``None``. A
+    top-level convenience field set to ``None`` is treated as unset. When
+    ``generate_args`` or ``sampling_params`` is present but not a mapping
+    (e.g. a JSON string or a ``SamplingParams`` instance) and a convenience
+    field is set, a ``TypeError`` is raised rather than silently dropping
+    the field.
+
+    Neither ``options`` nor any nested mapping is mutated; when there is
+    nothing to fold the input dict is returned unchanged.
+    """
+    if not any(key in options for key in _SAMPLING_PARAM_OPTIONS):
+        return options
+    convenience = {key: options[key] for key in _SAMPLING_PARAM_OPTIONS if options.get(key) is not None}
+    folded = {key: value for key, value in options.items() if key not in _SAMPLING_PARAM_OPTIONS}
+    if not convenience:
+        return folded
+
+    def copy_mapping(value: Any, label: str) -> dict[str, Any]:
+        if value is None:
+            return {}
+        if isinstance(value, Mapping):
+            return dict(value)
+        raise TypeError(
+            f"vllm {label} must be a mapping to fold top-level options {sorted(convenience)}; "
+            f"got {type(value).__name__} — pass these values inside generate_args['sampling_params'] instead"
+        )
+
+    generate_args = copy_mapping(folded.get("generate_args"), "generate_args")
+    sampling_params = copy_mapping(generate_args.get("sampling_params"), "generate_args['sampling_params']")
+
+    for key, value in convenience.items():
+        sampling_params.setdefault(key, value)
+    generate_args["sampling_params"] = sampling_params
+    folded["generate_args"] = generate_args
+    return folded
+
+
 class VLLMProvider(Provider):
     """Provider backed by a local or remote vLLM engine."""
 
@@ -127,6 +183,14 @@ class VLLMPrompterDescriptor(PrompterDescriptor):
     When ``return_format`` is set (Pydantic model or JSON schema dict),
     the JSON schema is injected as ``structured_outputs`` in the executor's
     ``SamplingParams``.
+
+    Top-level ``max_tokens`` / ``temperature`` convenience options are folded
+    into ``generate_args["sampling_params"]`` at construction — explicit
+    ``sampling_params`` entries win on conflict (see
+    :func:`_fold_sampling_param_options`). Folding runs on the raw options
+    before this descriptor's credential sealing and only touches the
+    non-sensitive sampling keys; already-sealed ``Secret`` values, if a
+    caller passes any, flow through the copies by reference untouched.
     """
 
     provider_name: str = "vllm"
@@ -136,7 +200,7 @@ class VLLMPrompterDescriptor(PrompterDescriptor):
     vllm_options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.vllm_options = wrap_sensitive_options(self.vllm_options)
+        self.vllm_options = wrap_sensitive_options(_fold_sampling_param_options(self.vllm_options))
 
     def get_provider(self) -> str:
         return self.provider_name
