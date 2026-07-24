@@ -280,31 +280,25 @@ class TestWrapperPickle:
 
 
 class TestVLLMProvider:
-    """Tests for the vLLM provider and descriptor."""
+    """Tests for native vLLM provider planning metadata."""
 
     def test_provider_loads(self):
-        """Vllm provider is registered and loadable."""
         from vane.ai.provider import PROVIDERS
 
         assert "vllm" in PROVIDERS
 
     def test_descriptor_creates(self):
-        """VLLMPrompterDescriptor can be created with default settings."""
         from vane.ai.providers.vllm import VLLMPrompterDescriptor
 
-        desc = VLLMPrompterDescriptor(
-            model_name="Qwen/Qwen3-1.7B",
-        )
-        assert desc.get_provider() == "vllm"
-        assert desc.get_model() == "Qwen/Qwen3-1.7B"
+        descriptor = VLLMPrompterDescriptor(model_name="Qwen/Qwen3-1.7B")
+
+        assert descriptor.get_provider() == "vllm"
+        assert descriptor.get_model() == "Qwen/Qwen3-1.7B"
 
     def test_descriptor_pickle_roundtrip(self):
-        """VLLMPrompterDescriptor survives pickle (required for Ray)."""
-        import pickle
-
         from vane.ai.providers.vllm import VLLMPrompterDescriptor
 
-        desc = VLLMPrompterDescriptor(
+        descriptor = VLLMPrompterDescriptor(
             model_name="meta-llama/Llama-3.1-8B",
             system_message="You are a helpful assistant.",
             vllm_options={
@@ -313,172 +307,44 @@ class TestVLLMProvider:
                 "gpus_per_actor": 1,
             },
         )
-        restored = pickle.loads(pickle.dumps(desc))
-        assert restored.model_name == desc.model_name
-        assert restored.system_message == desc.system_message
-        assert restored.vllm_options == desc.vllm_options
 
-    def test_udf_options_defaults(self):
-        """VLLMPrompterDescriptor produces correct UDFOptions."""
-        from vane.ai.providers.vllm import VLLMPrompterDescriptor
+        restored = pickle.loads(pickle.dumps(descriptor))
 
-        desc = VLLMPrompterDescriptor(
-            model_name="Qwen/Qwen3-1.7B",
-            vllm_options={"gpus_per_actor": 2},
-        )
-        opts = desc.get_udf_options()
-        assert opts.num_gpus == 2
-        assert opts.on_error == "raise"
+        assert restored.model_name == descriptor.model_name
+        assert restored.system_message == descriptor.system_message
+        assert restored.vllm_options == descriptor.vllm_options
 
     def test_provider_get_prompter(self):
-        """VLLMProvider.get_prompter returns a VLLMPrompterDescriptor."""
         from vane.ai.providers.vllm import VLLMPrompterDescriptor, VLLMProvider
 
-        provider = VLLMProvider()
-        desc = provider.get_prompter(
+        descriptor = VLLMProvider().get_prompter(
             model="Qwen/Qwen3-1.7B",
             system_message="Be concise.",
             engine_args={"max_model_len": 1024},
         )
-        assert isinstance(desc, VLLMPrompterDescriptor)
-        assert desc.model_name == "Qwen/Qwen3-1.7B"
-        assert desc.system_message == "Be concise."
-        assert desc.vllm_options["engine_args"] == {"max_model_len": 1024}
 
-    def test_prompt_batch_uses_batch_api(self):
-        """_PromptBatch detects prompt_batch() method on vLLM prompter."""
-        from unittest.mock import MagicMock, patch
+        assert isinstance(descriptor, VLLMPrompterDescriptor)
+        assert descriptor.model_name == "Qwen/Qwen3-1.7B"
+        assert descriptor.system_message == "Be concise."
+        assert descriptor.vllm_options["engine_args"] == {"max_model_len": 1024}
 
-        from vane.ai.providers.vllm import VLLMPrompterDescriptor
+    def test_vllm_prompt_plan_is_not_an_executable_descriptor(self):
+        from vane.ai.protocols import NativePrompterPlan, PrompterDescriptor
+        from vane.ai.providers.vllm import NativeVLLMPromptPlan, VLLMPrompterDescriptor
 
-        desc = VLLMPrompterDescriptor(model_name="test-model")
+        plan = VLLMPrompterDescriptor(model_name="test-model")
 
-        # Mock the instantiate to return a fake prompter with prompt_batch
-        mock_prompter = MagicMock()
-        mock_prompter.prompt_batch.return_value = ["Hello!", "World!"]
-
-        with patch.object(desc, "instantiate", return_value=mock_prompter):
-            from vane.ai.functions import _PromptBatch
-
-            batch = _PromptBatch(desc, "text", "response")
-            table = pa.table({"text": ["hi", "hey"]})
-            result = batch(table)
-
-        mock_prompter.prompt_batch.assert_called_once_with(["hi", "hey"])
-        assert result.column("response").to_pylist() == ["Hello!", "World!"]
-
-    def test_system_message_formatting(self):
-        """VLLMPrompter prepends system message to prompts."""
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        prompter = VLLMPrompter(
-            model="test",
-            system_message="Be brief.",
-        )
-        assert prompter._format_prompt("Hello") == "Be brief.\n\nHello"
-
-    def test_no_system_message(self):
-        """VLLMPrompter passes through prompts when no system_message."""
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        prompter = VLLMPrompter(model="test")
-        assert prompter._format_prompt("Hello") == "Hello"
-
-    def test_prompter_uses_background_executor_for_sync_actor_calls(self, monkeypatch):
-        """The synchronous prompter must not reuse the enclosing Ray actor loop."""
-        import duckdb.execution.vllm as vllm_executor
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        captured = {}
-        sentinel = object()
-
-        def fake_build_executor(model, options):
-            captured.update(model=model, options=options)
-            return sentinel
-
-        monkeypatch.setattr(vllm_executor, "build_executor", fake_build_executor)
-        prompter = VLLMPrompter(model="test", vllm_options={"use_threading": False})
-
-        assert prompter._ensure_executor() is sentinel
-        assert captured["model"] == "test"
-        assert captured["options"]["use_threading"] is True
-        assert captured["options"]["_force_background_thread"] is True
-
-    def test_local_executor_can_force_background_loop_inside_ray_actor(self, monkeypatch):
-        """Sync actor wrappers need a loop thread even when Ray reports actor context."""
-        import sys
-        import types
-
-        import duckdb.execution.vllm as vllm_executor
-
-        fake_vllm = types.ModuleType("vllm")
-
-        class SamplingParams:
-            pass
-
-        fake_vllm.SamplingParams = SamplingParams
-        monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
-        monkeypatch.setattr(vllm_executor.LocalVLLMExecutor, "_detect_ray_actor", staticmethod(lambda: True))
-
-        def fake_run_event_loop(executor):
-            executor.loop = object()
-            executor.loop_ready.set()
-
-        monkeypatch.setattr(vllm_executor.LocalVLLMExecutor, "_run_event_loop", fake_run_event_loop)
-
-        executor = vllm_executor.LocalVLLMExecutor(
-            "test-model",
-            {},
-            {},
-            force_background_thread=True,
-        )
-
-        assert executor._ray_actor_mode is False
-        assert executor.loop_ready.is_set()
-
-    def test_prompt_batch_errors_when_wait_returns_without_result(self):
-        """VLLMPrompter treats an empty wait wakeup as an executor contract error."""
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        class EmptyWakeupExecutor:
-            def __init__(self):
-                self.wait_calls = 0
-
-            def submit(self, _prefix, _prompts, _rows):
-                pass
-
-            def finished_submitting(self):
-                pass
-
-            def take_ready_result(self):
-                return None
-
-            def all_tasks_finished(self):
-                return False
-
-            def wait_for_result(self):
-                self.wait_calls += 1
-
-        prompter = VLLMPrompter(model="test")
-        executor = EmptyWakeupExecutor()
-        prompter._executor = executor
-
-        with pytest.raises(RuntimeError, match="wait_for_result returned without a ready result"):
-            prompter.prompt_batch(["a", "b"])
-        assert executor.wait_calls == 1
-
-
-# ---------------------------------------------------------------------------
-# vLLM Structured Output tests
-# ---------------------------------------------------------------------------
+        assert NativeVLLMPromptPlan is VLLMPrompterDescriptor
+        assert isinstance(plan, NativePrompterPlan)
+        assert not isinstance(plan, PrompterDescriptor)
+        assert not hasattr(plan, "instantiate")
 
 
 class TestVLLMStructuredOutput:
-    """Tests for vLLM provider structured output via guided decoding."""
+    """Tests for native vLLM structured-output configuration."""
 
     def test_json_schema_from_pydantic(self):
-        """_json_schema_from_return_format extracts schema from Pydantic model."""
-        from pydantic import BaseModel
+        BaseModel = pytest.importorskip("pydantic").BaseModel
 
         from vane.ai.providers.vllm import _json_schema_from_return_format
 
@@ -487,80 +353,32 @@ class TestVLLMStructuredOutput:
             age: int
 
         schema = _json_schema_from_return_format(Person)
+
         assert schema["type"] == "object"
-        assert "name" in schema["properties"]
-        assert "age" in schema["properties"]
+        assert {"name", "age"} <= schema["properties"].keys()
 
     def test_json_schema_from_dict(self):
-        """_json_schema_from_return_format passes dicts through."""
         from vane.ai.providers.vllm import _json_schema_from_return_format
 
         schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
+
         assert _json_schema_from_return_format(schema) is schema
 
     def test_json_schema_from_none(self):
-        """_json_schema_from_return_format returns empty dict for None."""
         from vane.ai.providers.vllm import _json_schema_from_return_format
 
         assert _json_schema_from_return_format(None) == {}
 
     def test_json_schema_bad_type(self):
-        """_json_schema_from_return_format raises for unsupported types."""
         from vane.ai.providers.vllm import _json_schema_from_return_format
 
         with pytest.raises(TypeError, match="return_format must be"):
             _json_schema_from_return_format("bad")
 
-    def test_parse_structured_output_pydantic(self):
-        """_parse_structured_output validates JSON into Pydantic model."""
-        from pydantic import BaseModel
-
-        from vane.ai.providers.vllm import _parse_structured_output
-
-        class Person(BaseModel):
-            name: str
-            age: int
-
-        result = _parse_structured_output('{"name": "Alice", "age": 30}', Person)
-        assert isinstance(result, Person)
-        assert result.name == "Alice"
-        assert result.age == 30
-
-    def test_parse_structured_output_dict_schema(self):
-        """_parse_structured_output returns dict when schema is a dict."""
-        from vane.ai.providers.vllm import _parse_structured_output
-
-        schema = {"type": "object"}
-        result = _parse_structured_output('{"x": 1}', schema)
-        assert result == {"x": 1}
-
-    def test_parse_structured_output_none(self):
-        """_parse_structured_output returns None for None input."""
-        from vane.ai.providers.vllm import _parse_structured_output
-
-        assert _parse_structured_output(None, {"type": "object"}) is None
-
-    def test_descriptor_with_return_format(self):
-        """VLLMPrompterDescriptor stores return_format."""
-        from pydantic import BaseModel
-
-        from vane.ai.providers.vllm import VLLMPrompterDescriptor
-
-        class Item(BaseModel):
-            label: str
-
-        desc = VLLMPrompterDescriptor(
-            model_name="test-model",
-            return_format=Item,
-        )
-        assert desc.return_format is Item
-
-    def test_descriptor_pickle_with_return_format(self):
-        """VLLMPrompterDescriptor with return_format survives pickle."""
-        import pickle
-
+    def test_descriptor_with_return_format_survives_pickle(self):
         import cloudpickle
-        from pydantic import BaseModel
+
+        BaseModel = pytest.importorskip("pydantic").BaseModel
 
         from vane.ai.providers.vllm import VLLMPrompterDescriptor
 
@@ -568,126 +386,31 @@ class TestVLLMStructuredOutput:
             value: float
             label: str
 
-        desc = VLLMPrompterDescriptor(
+        descriptor = VLLMPrompterDescriptor(
             model_name="test-model",
             return_format=Score,
         )
-        restored = pickle.loads(cloudpickle.dumps(desc))
-        assert restored.return_format is not None
+
+        restored = pickle.loads(cloudpickle.dumps(descriptor))
+
         assert restored.model_name == "test-model"
-        # Validate the restored return_format still works
-        obj = restored.return_format(value=1.0, label="test")
-        assert obj.value == 1.0
+        assert restored.return_format(value=1.0, label="test").value == 1.0
 
-    def test_provider_get_prompter_with_return_format(self):
-        """VLLMProvider.get_prompter forwards return_format."""
-        from pydantic import BaseModel
-
-        from vane.ai.providers.vllm import VLLMPrompterDescriptor, VLLMProvider
-
-        class Output(BaseModel):
-            text: str
-
-        provider = VLLMProvider()
-        desc = provider.get_prompter(
-            model="test-model",
-            return_format=Output,
-        )
-        assert isinstance(desc, VLLMPrompterDescriptor)
-        assert desc.return_format is Output
-
-    def test_prompter_injects_structured_output(self):
-        """VLLMPrompter injects structured output config into sampling_params."""
-        from pydantic import BaseModel
-
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        class Entity(BaseModel):
-            name: str
-            kind: str
-
-        prompter = VLLMPrompter(
-            model="test-model",
-            return_format=Entity,
-            vllm_options={"generate_args": {"sampling_params": {"max_tokens": 100}}},
-        )
-        sp = prompter._options["generate_args"]["sampling_params"]
-        schema = sp["structured_outputs"]["value"]
-        assert schema["type"] == "object"
-        assert "name" in schema["properties"]
-        assert "guided_json" not in sp
-        assert sp["max_tokens"] == 100
-
-    def test_prompter_injects_structured_output_empty_options(self):
-        """VLLMPrompter creates generate_args/sampling_params if absent."""
-        from pydantic import BaseModel
-
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        class Tag(BaseModel):
-            value: str
-
-        prompter = VLLMPrompter(
-            model="test-model",
-            return_format=Tag,
-        )
-        sp = prompter._options["generate_args"]["sampling_params"]
-        assert "structured_outputs" in sp
-        assert "guided_json" not in sp
-
-    def test_prompter_no_return_format_no_structured_output(self):
-        """VLLMPrompter without return_format does not inject structured output."""
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        prompter = VLLMPrompter(model="test-model")
-        gen_args = prompter._options.get("generate_args", {})
-        sp = gen_args.get("sampling_params", {})
-        if isinstance(sp, dict):
-            assert "guided_json" not in sp
-            assert "structured_outputs" not in sp
-
-    def test_maybe_parse_with_return_format(self):
-        """_maybe_parse parses JSON when return_format is set."""
-        from pydantic import BaseModel
-
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        class Item(BaseModel):
-            x: int
-
-        prompter = VLLMPrompter(model="test", return_format=Item)
-        result = prompter._maybe_parse('{"x": 42}')
-        assert isinstance(result, Item)
-        assert result.x == 42
-
-    def test_maybe_parse_without_return_format(self):
-        """_maybe_parse returns raw text when no return_format."""
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        prompter = VLLMPrompter(model="test")
-        assert prompter._maybe_parse("hello") == "hello"
-
-    def test_maybe_parse_none(self):
-        """_maybe_parse returns None for None input."""
-        from pydantic import BaseModel
-
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        class Item(BaseModel):
-            x: int
-
-        prompter = VLLMPrompter(model="test", return_format=Item)
-        assert prompter._maybe_parse(None) is None
-
-    def test_dict_schema_structured_output(self):
-        """VLLMPrompter accepts raw dict schema for structured output."""
-        from vane.ai.providers.vllm import VLLMPrompter
+    def test_descriptor_injects_schema_into_native_sampling_params(self):
+        from vane.ai.providers.vllm import VLLMPrompterDescriptor
 
         schema = {"type": "object", "properties": {"n": {"type": "number"}}}
-        prompter = VLLMPrompter(model="test", return_format=schema)
-        sp = prompter._options["generate_args"]["sampling_params"]
-        assert sp["structured_outputs"]["value"] == schema
-        assert "guided_json" not in sp
+        descriptor = VLLMPrompterDescriptor(
+            model_name="test-model",
+            return_format=schema,
+            vllm_options={"generate_args": {"sampling_params": {"max_tokens": 100}}},
+        )
+
+        sampling_params = descriptor.build_physical_vllm_options()["generate_args"]["sampling_params"]
+
+        assert sampling_params["max_tokens"] == 100
+        assert sampling_params["structured_outputs"] == {"type": "json", "value": schema}
+        assert "guided_json" not in sampling_params
 
 
 class TestUDFExecutionOptions:

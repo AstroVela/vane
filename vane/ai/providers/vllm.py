@@ -4,9 +4,8 @@
 """vLLM provider — wraps the existing ``duckdb.execution.vllm`` engine.
 
 The vLLM executor already manages its own ``AsyncLLMEngine`` event loop,
-request queuing, prefix routing, and Ray actor pool.  This provider wraps
-that machinery into the Vane AI Provider/Descriptor pattern so users can
-write::
+request queuing, prefix routing, and Ray actor pool. This provider wraps that
+machinery in a planner-only Vane AI provider so users can write::
 
     from vane.ai import prompt
 
@@ -41,14 +40,27 @@ Under the hood the model's JSON schema is injected into
 
 from __future__ import annotations
 
+import copy
 import json
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
-from vane.ai.protocols import PrompterDescriptor
+from duckdb.execution._vllm_options_protocol import (
+    _NATIVE_OPTIONS_PAYLOAD_VERSION,
+    _NATIVE_OPTIONS_PUBLIC_KEY,
+    _NATIVE_OPTIONS_RESERVED_KEYS,
+    _NATIVE_OPTIONS_SECRET_KEY,
+    _NATIVE_OPTIONS_VERSION_KEY,
+    _NATIVE_SECRET_PAYLOAD_VALUES_KEY,
+    _NATIVE_SECRET_PAYLOAD_VERSION_KEY,
+    _NATIVE_SECRET_REF_KEY,
+    _dump_vllm_protocol_json,
+)
+from vane.ai._redaction import Secret, wrap_sensitive_options
+from vane.ai.protocols import NativePrompterPlan
 from vane.ai.provider import Provider
-from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
     from vane.ai.typing import Options
@@ -72,18 +84,95 @@ def _json_schema_from_return_format(return_format: Any) -> dict[str, Any]:
     )
 
 
-def _parse_structured_output(raw_text: str | None, return_format: Any) -> Any:
-    """Parse raw JSON text into a structured object.
+def _canonicalize_native_json(value: Any, path: str = "options") -> Any:
+    """Return a strict JSON-compatible copy or fail with an option path."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"vLLM native option {path} must be finite")
+        return value
+    if isinstance(value, Mapping):
+        canonical: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"vLLM native option {path} must use string keys; got {type(key).__name__}")
+            canonical[key] = _canonicalize_native_json(item, f"{path}.{key}")
+        return canonical
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_native_json(item, f"{path}[{index}]") for index, item in enumerate(value)]
+    raise TypeError(f"vLLM native option {path} must be JSON-compatible; got {type(value).__name__}")
 
-    If *return_format* is a Pydantic model class the parsed dict is validated
-    through ``model_validate``.  Otherwise returns a plain ``dict``.
+
+def _canonicalize_native_plan_json(value: Any, path: str = "options") -> Any:
+    """Validate native options while preserving sealed values for planning."""
+    if isinstance(value, Secret):
+        return Secret(_canonicalize_native_json(value.reveal(), path))
+    if isinstance(value, Mapping):
+        canonical: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"vLLM native option {path} must use string keys; got {type(key).__name__}")
+            canonical[key] = _canonicalize_native_plan_json(item, f"{path}.{key}")
+        return canonical
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_native_plan_json(item, f"{path}[{index}]") for index, item in enumerate(value)]
+    return _canonicalize_native_json(value, path)
+
+
+def _serialize_native_vllm_options(options: Mapping[str, Any]) -> str:
+    """Serialize native options after enforcing the public JSON boundary."""
+    canonical = _canonicalize_native_json(options)
+    return _dump_vllm_protocol_json(canonical)
+
+
+def _split_native_vllm_secrets(value: Any, secrets: list[Any], path: str = "options") -> Any:
+    if isinstance(value, Secret):
+        secret_index = len(secrets)
+        secrets.append(value.reveal())
+        return {_NATIVE_SECRET_REF_KEY: secret_index}
+    if isinstance(value, Mapping):
+        if _NATIVE_SECRET_REF_KEY in value:
+            raise ValueError(f"vLLM native option {path} uses reserved field {_NATIVE_SECRET_REF_KEY!r}")
+        return {key: _split_native_vllm_secrets(item, secrets, f"{path}.{key}") for key, item in value.items()}
+    if isinstance(value, list):
+        return [_split_native_vllm_secrets(item, secrets, f"{path}[{index}]") for index, item in enumerate(value)]
+    return value
+
+
+def _build_native_vllm_options_argument(options: Mapping[str, Any]) -> str | dict[str, Any]:
+    """Encode sealed native options without exposing them as structured plan fields.
+
+    Plans without credentials retain the legacy JSON representation. Credential-
+    bearing plans use a versioned STRUCT envelope: public options remain JSON,
+    while plaintext values are confined to an opaque BLOB. Opaque here means
+    excluded from structured plan rendering, not encrypted. The runtime decodes
+    the BLOB with strict JSON rather than executable pickle data.
     """
-    if raw_text is None:
-        return None
-    data = json.loads(raw_text)
-    if hasattr(return_format, "model_validate"):
-        return return_format.model_validate(data)
-    return data
+    canonical = _canonicalize_native_plan_json(options)
+    assert isinstance(canonical, dict)
+    reserved_protocol_keys = _NATIVE_OPTIONS_RESERVED_KEYS.intersection(canonical)
+    if reserved_protocol_keys:
+        raise ValueError(
+            "vLLM native options use reserved protocol fields: " + ", ".join(sorted(reserved_protocol_keys))
+        )
+    secrets: list[Any] = []
+    public_options = _split_native_vllm_secrets(canonical, secrets)
+    public_options_json = _serialize_native_vllm_options(public_options)
+    if not secrets:
+        return public_options_json
+
+    secret_payload = _dump_vllm_protocol_json(
+        {
+            _NATIVE_SECRET_PAYLOAD_VERSION_KEY: _NATIVE_OPTIONS_PAYLOAD_VERSION,
+            _NATIVE_SECRET_PAYLOAD_VALUES_KEY: secrets,
+        }
+    ).encode("utf-8")
+    return {
+        _NATIVE_OPTIONS_VERSION_KEY: _NATIVE_OPTIONS_PAYLOAD_VERSION,
+        _NATIVE_OPTIONS_PUBLIC_KEY: public_options_json,
+        _NATIVE_OPTIONS_SECRET_KEY: secret_payload,
+    }
 
 
 class VLLMProvider(Provider):
@@ -105,9 +194,9 @@ class VLLMProvider(Provider):
         system_message: str | None = None,
         return_format: Any | None = None,
         **options: Any,
-    ) -> PrompterDescriptor:
+    ) -> NativeVLLMPromptPlan:
         merged = {**self._options, **options}
-        return VLLMPrompterDescriptor(
+        return NativeVLLMPromptPlan(
             provider_name=self._name,
             model_name=model or merged.pop("model", self.DEFAULT_MODEL),
             system_message=system_message,
@@ -117,16 +206,13 @@ class VLLMProvider(Provider):
 
 
 @dataclass
-class VLLMPrompterDescriptor(PrompterDescriptor):
-    """Serializable factory for a vLLM-backed prompter.
+class NativeVLLMPromptPlan(NativePrompterPlan):
+    """Serializable configuration for native vLLM query planning.
 
-    Stores model name and vLLM configuration.  On ``instantiate()`` it
-    creates a ``LocalVLLMExecutor`` or ``RemoteVLLMExecutor`` via the
-    existing ``duckdb.execution.vllm.build_executor()`` factory.
-
-    When ``return_format`` is set (Pydantic model or JSON schema dict),
-    the JSON schema is injected as ``structured_outputs`` in the executor's
-    ``SamplingParams``.
+    High-level prompt APIs consume this plan while binding the native
+    ``vllm()`` expression. The resulting ``PhysicalVLLM`` operator owns one
+    executor for the relation and sends its terminal signal only after every
+    input batch has been submitted.
     """
 
     provider_name: str = "vllm"
@@ -147,151 +233,86 @@ class VLLMPrompterDescriptor(PrompterDescriptor):
     def get_options(self) -> Options:
         return dict(self.vllm_options)
 
-    def get_udf_options(self) -> UDFOptions:
-        opts = self.vllm_options
-        return UDFOptions(
-            batch_size=opts.get("batch_size"),
-            num_gpus=opts.get("gpus_per_actor", 1),
-            actor_number=opts.get("actor_number"),
-            max_retries=0,  # vLLM engine handles retries
-            on_error=opts.get("on_error", "raise"),
-        )
+    def build_physical_vllm_options(self) -> dict[str, Any]:
+        """Build options for the native ``PhysicalVLLM`` operator.
 
-    def instantiate(self) -> VLLMPrompter:
-        return VLLMPrompter(
-            model=self.model_name,
-            system_message=self.system_message,
-            return_format=self.return_format,
-            vllm_options=self.vllm_options,
-        )
-
-
-class VLLMPrompter:
-    """Prompter that uses a vLLM ``LocalVLLMExecutor`` / ``RemoteVLLMExecutor``.
-
-    The executor is created lazily on the first call. Structured output
-    uses ``SamplingParams.structured_outputs`` and the raw JSON output is
-    parsed back into the requested schema/model.
-    """
-
-    def __init__(
-        self,
-        model: str,
-        system_message: str | None = None,
-        return_format: Any | None = None,
-        vllm_options: dict[str, Any] | None = None,
-    ):
-        self._model = model
-        self._system_message = system_message
-        self._return_format = return_format
-        # Deep-unwrap restores plaintext sealed by the descriptor (including
-        # nested engine_args/generate_args) before the engine sees the options;
-        # plain dicts from direct callers pass through unchanged.
-        options = unwrap_sensitive_options(vllm_options or {})
-        self._options = {k: v for k, v in options.items() if k not in {"actor_number"}}
-        self._executor = None
-
-        # Pre-compute JSON schema if return_format is set, so the executor
-        # receives the current vLLM structured output config.
-        if self._return_format is not None:
-            schema = _json_schema_from_return_format(self._return_format)
-            gen_args = self._options.setdefault("generate_args", {})
-            sp = gen_args.setdefault("sampling_params", {})
-            if isinstance(sp, dict):
-                sp["structured_outputs"] = {"type": "json", "value": schema}
-
-    def _ensure_executor(self) -> Any:
-        if self._executor is None:
-            from duckdb.execution.vllm import build_executor
-
-            options = dict(self._options)
-            options["use_threading"] = True
-            options["_force_background_thread"] = True
-            self._executor = build_executor(self._model, options)
-        return self._executor
-
-    def _format_prompt(self, text: str) -> str:
-        if self._system_message:
-            return f"{self._system_message}\n\n{text}"
-        return text
-
-    def _maybe_parse(self, raw: str | None) -> Any:
-        """Parse structured output if return_format is set."""
-        if self._return_format is None or raw is None:
-            return raw
-        return _parse_structured_output(raw, self._return_format)
-
-    @staticmethod
-    async def _wait_for_result_async(executor: Any) -> None:
-        import asyncio
-        import inspect
-
-        wait_for_result = executor.wait_for_result
-        if inspect.iscoroutinefunction(wait_for_result):
-            await wait_for_result()
-            return
-        await asyncio.to_thread(wait_for_result)
-
-    @staticmethod
-    def _wait_for_result(executor: Any) -> None:
-        executor.wait_for_result()
-
-    async def prompt(self, messages: tuple[Any, ...]) -> Any:
-        """Single-row prompt — required by the Prompter protocol.
-
-        For vLLM this is less efficient than batch submission, but
-        allows the wrapper classes in ``functions.py`` to use the
-        standard ``asyncio.gather`` pattern.
+        The Python UDF path used ``actor_number`` to control the number of
+        outer UDF actors. The native operator owns one executor instead, so
+        that capacity becomes the executor's ``concurrency``. Structured
+        output configuration is copied into vLLM sampling parameters without
+        mutating the descriptor or caller-owned nested dictionaries. Sensitive
+        values stay sealed until the options argument is encoded for the plan.
         """
-        text = str(messages[0]) if messages else ""
-        formatted = self._format_prompt(text)
+        options = _canonicalize_native_plan_json(self.vllm_options)
+        assert isinstance(options, dict)
 
-        executor = self._ensure_executor()
+        actor_number = options.pop("actor_number", None)
+        if actor_number is not None:
+            options.setdefault("concurrency", actor_number)
 
-        import pyarrow as pa
+        max_retries = options.pop("max_retries", None)
+        if max_retries not in (None, 0):
+            raise ValueError("native vLLM prompting does not support max_retries")
 
-        dummy_row = pa.table({"_": [""]})
-        executor.submit(None, [formatted], dummy_row)
-        executor.finished_submitting()
+        # PhysicalVLLM invokes the executor through a synchronous C++ bridge.
+        # If that bridge runs inside a generic Ray actor, it still needs a
+        # dedicated event-loop thread rather than Ray's async actor loop.
+        options["use_threading"] = True
+        options["_force_background_thread"] = True
 
-        result = executor.take_ready_result()
-        if result is None:
-            await self._wait_for_result_async(executor)
-            result = executor.take_ready_result()
-        if result is None:
-            raise RuntimeError("vllm executor finished without returning a prompt result")
-        output_texts, _row = result
-        return self._maybe_parse(output_texts[0])
+        # The public AI API calls the null-producing policy ``ignore`` while
+        # the native vLLM executor calls the same policy ``null``.
+        if options.get("on_error") == "ignore":
+            options["on_error"] = "null"
 
-    def prompt_batch(self, texts: list[str]) -> list[Any]:
-        """Batch prompt — more efficient for vLLM's continuous batching."""
-        import pyarrow as pa
+        sampling_overrides: dict[str, Any] = {}
+        for name in ("max_tokens", "temperature"):
+            value = options.pop(name, None)
+            if value is not None:
+                sampling_overrides[name] = value
 
-        executor = self._ensure_executor()
-        prompts = [self._format_prompt(t) for t in texts]
-        rows = pa.table({"_idx": list(range(len(texts)))})
-        executor.submit(None, prompts, rows)
-        executor.finished_submitting()
+        generate_args = options.get("generate_args")
+        has_sampling_params = isinstance(generate_args, Mapping) and generate_args.get("sampling_params") is not None
+        if self.return_format is None and not sampling_overrides and not has_sampling_params:
+            return options
 
-        results: list[tuple[Any, int]] = []
-        while len(results) < len(texts):
-            result = executor.take_ready_result()
-            if result is None:
-                if executor.all_tasks_finished():
-                    break
-                self._wait_for_result(executor)
-                result = executor.take_ready_result()
-                if result is None:
-                    if executor.all_tasks_finished():
-                        break
-                    raise RuntimeError("vllm executor wait_for_result returned without a ready result")
-            output_texts, row_table = result
-            indices = row_table.column("_idx").to_pylist()
-            for text, idx in zip(output_texts, indices, strict=False):
-                results.append((self._maybe_parse(text), idx))
+        if generate_args is None:
+            generate_args = {}
+        elif isinstance(generate_args, Mapping):
+            generate_args = dict(generate_args)
+        else:
+            raise TypeError("vLLM generate_args must be a mapping when sampling parameters are configured")
+        options["generate_args"] = generate_args
 
-        if len(results) != len(texts):
-            raise RuntimeError(f"vllm executor returned {len(results)} results for {len(texts)} prompts")
+        sampling_params = generate_args.get("sampling_params")
+        if sampling_params is None:
+            sampling_params = {}
+        elif isinstance(sampling_params, str):
+            try:
+                sampling_params = json.loads(sampling_params)
+            except json.JSONDecodeError as exc:
+                raise ValueError("vLLM sampling_params JSON could not be parsed") from exc
+            if not isinstance(sampling_params, dict):
+                raise TypeError("vLLM sampling_params JSON must decode to an object")
+        elif isinstance(sampling_params, Mapping):
+            sampling_params = dict(sampling_params)
+        else:
+            raise TypeError("vLLM sampling_params must be a mapping or JSON string")
+        sampling_params = wrap_sensitive_options(sampling_params)
+        generate_args["sampling_params"] = sampling_params
 
-        results.sort(key=lambda x: x[1])
-        return [r[0] for r in results]
+        for name, value in sampling_overrides.items():
+            sampling_params.setdefault(name, value)
+
+        if self.return_format is not None:
+            schema = copy.deepcopy(_json_schema_from_return_format(self.return_format))
+            sampling_params["structured_outputs"] = {"type": "json", "value": schema}
+        canonical = _canonicalize_native_plan_json(options)
+        assert isinstance(canonical, dict)
+        return canonical
+
+
+# Compatibility import for callers that used the original name. The object is
+# now explicitly planner-only and no longer inherits PrompterDescriptor or
+# exposes an instantiate() method.
+VLLMPrompterDescriptor = NativeVLLMPromptPlan

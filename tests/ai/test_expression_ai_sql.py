@@ -7,6 +7,7 @@ import logging
 import os
 import pickle
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -118,6 +119,40 @@ class MockProvider(Provider):
             required_env_name=options.get("required_env_name"),
             fail_after_env_check=bool(options.get("fail_after_env_check", False)),
         )
+
+
+class RecordingNativeVLLMExecutor:
+    def __init__(self) -> None:
+        self.submissions: list[tuple[str | None, tuple[str, ...]]] = []
+        self.ready = deque()
+        self.finished_count = 0
+        self.shutdown_count = 0
+
+    def submit(self, prefix, prompts, rows) -> None:
+        prompt_values = tuple(prompts)
+        self.submissions.append((prefix, prompt_values))
+        self.ready.append(([f"native:{prompt}" for prompt in prompt_values], rows))
+
+    def take_ready_result(self):
+        try:
+            return self.ready.popleft()
+        except IndexError:
+            return None
+
+    def finished_submitting(self) -> None:
+        self.finished_count += 1
+
+    def all_tasks_finished(self) -> bool:
+        return self.finished_count == 1 and not self.ready
+
+    def wait_for_result(self) -> None:
+        raise AssertionError("immediate native vLLM results must not block")
+
+    def register_wakeup_callback(self, callback) -> bool:
+        return False
+
+    def shutdown(self) -> None:
+        self.shutdown_count += 1
 
 
 @pytest.fixture(autouse=True)
@@ -247,6 +282,44 @@ def test_ai_prompt_options_survive_logical_plan_pickle_to_fresh_connection():
     assert udf_node["payload"]["ai_dimensions"] is None
     assert udf_node["payload"]["function_pickle_size_bytes"] > 0
     assert 0 < len(serialized) < 1_000_000
+
+
+def test_ai_prompt_vllm_survives_logical_plan_pickle_as_native_operator(monkeypatch):
+    import duckdb.execution.vllm as vllm_executor
+
+    executor = RecordingNativeVLLMExecutor()
+    builds: list[tuple[str, dict[str, object]]] = []
+
+    def build_executor(model, options):
+        builds.append((model, dict(options)))
+        return executor
+
+    monkeypatch.setattr(vllm_executor, "build_executor", build_executor)
+    source = vane.connect()
+    relation = source.sql("""
+        SELECT ai_prompt(
+            chunk,
+            struct_pack(
+                provider := 'vllm',
+                model := 'round-trip-vllm',
+                batch_size := 1,
+                do_prefix_routing := false
+            )
+        ) AS response
+        FROM (VALUES ('alpha'), ('beta')) AS t(chunk)
+    """)
+
+    _, target, physical, serialized = _round_trip_ai_plan(relation)
+    table = _execute_ai_physical_plan(target, physical)
+
+    assert physical.collect_udf_nodes() == []
+    assert table.column(0).to_pylist() == ["native:alpha", "native:beta"]
+    assert len(builds) == 1
+    assert builds[0][0] == "round-trip-vllm"
+    assert builds[0][1]["batch_size"] == 1
+    assert executor.finished_count == 1
+    assert executor.shutdown_count == 1
+    assert 0 < len(serialized) < 10_000
 
 
 def test_ai_embed_fixed_dimensions_survive_round_trip():
@@ -520,6 +593,79 @@ def test_ai_prompt_sql_explain_uses_ray_actor_backend(monkeypatch):
     assert "actor_number: 1" in text
 
 
+def test_ai_prompt_sql_vllm_explain_uses_native_operator():
+    conn = vane.connect()
+
+    plan = conn.sql("""
+        EXPLAIN SELECT ai_prompt(
+            chunk,
+            struct_pack(
+                provider := 'vllm',
+                model := 'recording-model',
+                concurrency := 2,
+                batch_size := 1
+            )
+        )
+        FROM (VALUES ('alpha')) AS t(chunk)
+    """).fetchall()
+    text = "\n".join(str(row) for row in plan)
+
+    assert "VLLM_PROJECT" in text
+    assert "subprocess_actor" not in text
+    assert "ray_actor" not in text
+
+
+def test_ai_prompt_sql_vllm_reuses_one_native_executor_across_batches(monkeypatch):
+    import duckdb.execution.vllm as vllm_executor
+
+    executor = RecordingNativeVLLMExecutor()
+    builds: list[tuple[str, dict[str, object]]] = []
+
+    def build_executor(model, options):
+        builds.append((model, dict(options)))
+        return executor
+
+    monkeypatch.setattr(vllm_executor, "build_executor", build_executor)
+    conn = vane.connect()
+    conn.execute("PRAGMA threads=1")
+    rows = conn.sql("""
+        SELECT id, ai_prompt(
+            chunk,
+            struct_pack(
+                provider := 'vllm',
+                model := 'recording-model',
+                system_message := 'Answer briefly.',
+                concurrency := 2,
+                batch_size := 1,
+                do_prefix_routing := false,
+                on_error := 'ignore'
+            )
+        ) AS response
+        FROM (VALUES (1, 'alpha'), (2, NULL), (3, 'beta')) AS t(id, chunk)
+        ORDER BY id
+    """).fetchall()
+
+    assert rows == [
+        (1, "native:Answer briefly.\n\nalpha"),
+        (2, "native:Answer briefly.\n\n"),
+        (3, "native:Answer briefly.\n\nbeta"),
+    ]
+    assert len(builds) == 1
+    assert builds[0][0] == "recording-model"
+    assert builds[0][1]["concurrency"] == 2
+    assert builds[0][1]["batch_size"] == 1
+    assert builds[0][1]["on_error"] == "null"
+    assert sorted(prompts for _, prompts in executor.submissions) == sorted(
+        [
+            ("Answer briefly.\n\nalpha",),
+            ("Answer briefly.\n\n",),
+            ("Answer briefly.\n\nbeta",),
+        ]
+    )
+    assert executor.finished_count == 1
+    assert executor.shutdown_count == 1
+
+
 def test_ai_sql_helper_builds_prompt_spec_without_execution():
     from vane.ai._sql import build_ai_prompt_sql_spec
 
@@ -530,6 +676,52 @@ def test_ai_sql_helper_builds_prompt_spec_without_execution():
     assert spec["schema"] == {"response": "VARCHAR"}
     assert spec["actor_number"] == 1
     assert spec["gpus"] == 0
+
+
+def test_ai_sql_helper_builds_native_vllm_spec_without_udf_wrapper():
+    import json
+
+    from vane.ai._sql import build_ai_prompt_sql_spec
+
+    spec = build_ai_prompt_sql_spec(
+        {
+            "provider": "vllm",
+            "model": "recording-model",
+            "system_message": "Answer briefly.",
+            "concurrency": Decimal(3),
+            "batch_size": Decimal(4),
+            "on_error": "ignore",
+        }
+    )
+    native_options = json.loads(spec["options_json"])
+
+    assert spec["execution_kind"] == "native_vllm"
+    assert spec["model"] == "recording-model"
+    assert spec["system_message"] == "Answer briefly."
+    assert "function" not in spec
+    assert native_options["concurrency"] == 3
+    assert native_options["batch_size"] == 4
+    assert native_options["on_error"] == "null"
+    assert "actor_number" not in native_options
+
+
+def test_ai_sql_helper_rejects_vllm_udf_retry_policy():
+    from vane.ai._sql import build_ai_prompt_sql_spec
+
+    with pytest.raises(ValueError, match="native vLLM ai_prompt does not support max_retries"):
+        build_ai_prompt_sql_spec({"provider": "vllm", "max_retries": Decimal(1)})
+
+
+def test_ai_sql_helper_rejects_non_json_vllm_options_with_path():
+    from vane.ai._sql import build_ai_prompt_sql_spec
+
+    with pytest.raises(TypeError, match=r"engine_args\.dtype.*JSON-compatible.*object"):
+        build_ai_prompt_sql_spec(
+            {
+                "provider": "vllm",
+                "engine_args": {"dtype": object()},
+            }
+        )
 
 
 def test_ai_sql_helper_normalizes_decimal_sql_options(monkeypatch):

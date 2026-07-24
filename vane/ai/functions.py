@@ -37,12 +37,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import time
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 import numpy as np
 import pyarrow as pa
 
+import duckdb
 from vane._expression_udf import _build_actor_map_batches_expression
 from vane._expressions import as_expression, is_expression
 from vane.ai.options import (
@@ -57,7 +59,9 @@ from vane.ai.options import (
     VLLMPromptOptions,
     VLLMProviderOptions,
 )
+from vane.ai.protocols import NativePrompterPlan
 from vane.ai.provider import load_provider
+from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_options_argument
 from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
@@ -553,7 +557,6 @@ class _PromptBatch:
             return result.model_dump_json()
         if hasattr(result, "json"):
             return result.json()
-        import json
 
         return json.dumps(result, default=str)
 
@@ -816,6 +819,29 @@ def classify_text(
 # ---------------------------------------------------------------------------
 
 
+def _build_native_vllm_expression(messages: Any, descriptor: NativeVLLMPromptPlan) -> duckdb.Expression:
+    """Build the native row-preserving ``vllm()`` expression."""
+    messages_expr = as_expression(messages)
+    # DuckDB's concat() ignores NULL arguments: concat(NULL, '') returns '',
+    # and concat('system\n\n', NULL, '') returns 'system\n\n'.
+    prompt_arguments = [messages_expr, duckdb.ConstantExpression("")]
+    if descriptor.system_message:
+        prompt_arguments.insert(
+            0,
+            duckdb.ConstantExpression(f"{descriptor.system_message}\n\n"),
+        )
+    prompt_expr = duckdb.FunctionExpression("concat", *prompt_arguments)
+
+    options_argument = _build_native_vllm_options_argument(descriptor.build_physical_vllm_options())
+
+    return duckdb.FunctionExpression(
+        "vllm",
+        prompt_expr,
+        duckdb.ConstantExpression(descriptor.model_name),
+        duckdb.ConstantExpression(options_argument),
+    )
+
+
 def _prompt_relation(
     rel: Any,
     column: str,
@@ -843,10 +869,11 @@ def _prompt_relation(
 ) -> Any:
     """Generate responses for a relation column via ``rel.map_batches()``.
 
-    ``execution_backend`` is optional; when omitted, the relation API infers
-    the task backend from the active runner. Prefer provider environment
-    variables such as ``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``, or
-    ``GOOGLE_API_KEY`` over passing API keys in call options.
+    ``execution_backend`` is optional for Python UDF providers; native vLLM
+    prompting rejects it because execution is owned by the query runner.
+    Prefer provider environment variables such as ``OPENAI_API_KEY``,
+    ``ANTHROPIC_API_KEY``, or ``GOOGLE_API_KEY`` over passing API keys in call
+    options.
     """
     prov = _resolve_provider(provider, "openai")
     prompter_kwargs: dict[str, Any] = {
@@ -863,6 +890,26 @@ def _prompt_relation(
         descriptor = prov.get_prompter(**prompter_kwargs)
     except NotImplementedError as exc:
         raise ValueError(f"Provider {provider!r} is not a prompt provider") from exc
+
+    if isinstance(descriptor, NativeVLLMPromptPlan):
+        if image_columns:
+            raise ValueError("native vLLM prompting does not support image_columns")
+        if execution_backend is not None:
+            raise ValueError(
+                "execution_backend applies only to Python UDF providers; "
+                "native vLLM routing is derived from the query runner"
+            )
+        relation_alias = getattr(rel, "alias", None)
+        column_expr = (
+            duckdb.ColumnExpression(relation_alias, column)
+            if isinstance(relation_alias, str) and relation_alias
+            else duckdb.ColumnExpression(column)
+        )
+        expression = _build_native_vllm_expression(column_expr, descriptor).alias(output_column)
+        return rel.select(expression)
+    if isinstance(descriptor, NativePrompterPlan):
+        raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
+
     udf_opts = descriptor.get_udf_options()
 
     wrapper = _PromptBatch(
@@ -925,6 +972,12 @@ def _prompt_expression(
         descriptor = prov.get_prompter(model=model, system_message=system_message, **descriptor_options)
     except NotImplementedError as exc:
         raise ValueError(f"Provider {provider!r} is not a prompt provider") from exc
+
+    if isinstance(descriptor, NativeVLLMPromptPlan):
+        return _build_native_vllm_expression(messages, descriptor)
+    if isinstance(descriptor, NativePrompterPlan):
+        raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
+
     udf_opts = descriptor.get_udf_options()
 
     wrapper = _PromptBatch(
@@ -995,8 +1048,9 @@ def prompt(
 
     ``prompt(rel, "column", ...)`` and ``prompt(rel=rel, column="column",
     ...)`` preserve the relation API.
-    The relation API accepts ``execution_backend``; when omitted, it infers the
-    task backend from the active runner.
+    The relation API accepts ``execution_backend`` for Python UDF providers;
+    native vLLM prompting rejects explicit values because the query runner owns
+    its execution mode.
     ``prompt(vane.col("column"), ...)`` returns a row-preserving expression.
     The expression API supports ``provider``, ``model``,
     ``provider_options``, ``prompt_options``, and ``system_message``. When

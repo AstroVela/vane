@@ -632,7 +632,9 @@ struct PyPhysicalPlanWrapper {
 				auto &vllm_op = op.Cast<PhysicalVLLM>();
 				idx_t node_id = vllm_counter++;
 
-				// Build pool name using the same sanitization as VLLMProjectNode.
+				// Keep distributed vLLM pools scoped to one query. Cross-query
+				// named-pool reuse requires immutable configuration validation and
+				// explicit lifecycle ownership before it can be enabled safely.
 				auto safe_query = duckdb::distributed::SanitizePoolComponent(query_id);
 				auto pool_name = "duckdb_vllm_" + safe_query + "_" + std::to_string(node_id);
 

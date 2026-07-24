@@ -7,9 +7,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, TypeAlias
 
 from vane.ai._redaction import REDACTED_PLACEHOLDER, wrap_sensitive_options
+
+VLLMJSONPrimitive: TypeAlias = str | int | float | bool | None
+VLLMJSONValue: TypeAlias = VLLMJSONPrimitive | list["VLLMJSONValue"] | dict[str, "VLLMJSONValue"]
 
 
 def _set_if_not_none(target: dict[str, Any], key: str, value: object) -> None:
@@ -72,9 +75,13 @@ class OpenAIProviderOptions(_RedactedOptionsRepr):
 
 @dataclass(frozen=True, repr=False)
 class VLLMProviderOptions(_RedactedOptionsRepr):
-    """vLLM provider options for actor count, GPU allocation, and engine args."""
+    """vLLM provider options for actor count, GPU allocation, and engine args.
 
-    engine_args: Mapping[str, Any] | None = None
+    ``engine_args`` crosses the native operator boundary as JSON. Values must
+    therefore contain only JSON primitives, string-keyed mappings, and lists.
+    """
+
+    engine_args: Mapping[str, VLLMJSONValue] | None = None
     concurrency: int | None = None
     gpus_per_actor: float | None = None
 
@@ -227,9 +234,14 @@ class GoogleEmbeddingOptions:
 
 @dataclass(frozen=True, repr=False)
 class VLLMPromptOptions(_RedactedOptionsRepr):
-    """vLLM prompt generation options."""
+    """vLLM prompt generation options.
 
-    generate_args: Mapping[str, Any] | None = None
+    ``generate_args`` crosses the native operator boundary as JSON. Values
+    must therefore contain only JSON primitives, string-keyed mappings, and
+    lists.
+    """
+
+    generate_args: Mapping[str, VLLMJSONValue] | None = None
     max_tokens: int | None = None
     temperature: float | None = None
     on_error: Literal["raise", "log", "ignore"] | None = None

@@ -626,6 +626,17 @@ def test_vllm_remote_submit_failure_rolls_back_inflight(monkeypatch):
     class FakeRouter:
         report_start = FakeRemoteMethod("router-start")
         report_completion = FakeRemoteMethod("router-complete")
+        route_and_reserve = FakeRemoteMethod(
+            {
+                "actor_idx": 0,
+                "prompt_count": 3,
+                "reservation_id": "reservation-1",
+                "route_reason": "no_prefix",
+            }
+        )
+        complete = FakeRemoteMethod(0)
+        rollback = FakeRemoteMethod(3)
+        release_executor = FakeRemoteMethod(0)
 
     class FakeActor:
         wait_for_result = FakeRemoteMethod("actor-wait")
@@ -638,10 +649,9 @@ def test_vllm_remote_submit_failure_rolls_back_inflight(monkeypatch):
         router_actor = FakeRouter()
         llm_actors = [FakeActor()]
 
-    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref: ref)
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref)
 
     pool_name = "submit-failure-rollback"
-    vllm._shared_inflight.pop(pool_name, None)
     executor = vllm.RemoteVLLMExecutor(FakeLLMActors(), pool_name=pool_name)
 
     rows = pa.table({"x": [1, 2, 3]})
@@ -677,6 +687,17 @@ def test_vllm_remote_submit_async_ref_failure_becomes_executor_error(monkeypatch
     class FakeRouter:
         report_start = FakeRemoteMethod("router-start")
         report_completion = FakeRemoteMethod("router-complete")
+        route_and_reserve = FakeRemoteMethod(
+            {
+                "actor_idx": 0,
+                "prompt_count": 2,
+                "reservation_id": "reservation-1",
+                "route_reason": "no_prefix",
+            }
+        )
+        complete = FakeRemoteMethod(0)
+        rollback = FakeRemoteMethod(2)
+        release_executor = FakeRemoteMethod(0)
 
     class FakeActor:
         wait_for_result = FakeRemoteMethod(False)
@@ -689,7 +710,7 @@ def test_vllm_remote_submit_async_ref_failure_becomes_executor_error(monkeypatch
         router_actor = FakeRouter()
         llm_actors = [FakeActor()]
 
-    def fake_get(ref):
+    def fake_get(ref, **_kwargs):
         if ref.exc is not None:
             raise ref.exc
         return ref.value
@@ -697,7 +718,6 @@ def test_vllm_remote_submit_async_ref_failure_becomes_executor_error(monkeypatch
     monkeypatch.setattr(vllm, "resolve_object_refs_blocking", fake_get)
 
     pool_name = "submit-async-ref-failure"
-    vllm._shared_inflight.pop(pool_name, None)
     executor = vllm.RemoteVLLMExecutor(FakeLLMActors(), pool_name=pool_name)
 
     executor.submit(None, ["a", "b"], pa.table({"x": [1, 2]}))
@@ -739,7 +759,7 @@ def test_vllm_remote_observes_router_lifecycle_refs(monkeypatch):
         router_actor = FakeRouter()
         llm_actors = [FakeActor()]
 
-    def fake_get(ref):
+    def fake_get(ref, **_kwargs):
         observed.append(ref.name)
         return None
 
@@ -771,6 +791,7 @@ def test_vllm_remote_shutdown_reports_completion_once_and_clears_wait_refs(monke
     class FakeRouter:
         report_start = FakeRemoteMethod("router-start")
         report_completion = FakeRemoteMethod("router-complete")
+        release_executor = FakeRemoteMethod("router-release")
 
     class FakeActor:
         wait_for_result = FakeRemoteMethod("actor-wait")
@@ -778,13 +799,21 @@ def test_vllm_remote_shutdown_reports_completion_once_and_clears_wait_refs(monke
         submit_async = FakeRemoteMethod("actor-submit")
         finished_executor = FakeRemoteMethod("actor-finish-executor")
         finished_submitting = FakeRemoteMethod("actor-finish")
+        release_executor = FakeRemoteMethod("actor-release")
 
     class FakeLLMActors:
         router_actor = FakeRouter()
         llm_actors = [FakeActor(), FakeActor()]
 
-    def fake_get(ref):
+        def shutdown(self):
+            observed.append("owner-shutdown")
+
+    def fake_get(ref, **_kwargs):
         observed.append(ref.name)
+        if ref.name == "router-release":
+            return 0
+        if ref.name == "actor-release":
+            return True
         return None
 
     monkeypatch.setattr(vllm, "resolve_object_refs_blocking", fake_get)
@@ -794,7 +823,16 @@ def test_vllm_remote_shutdown_reports_completion_once_and_clears_wait_refs(monke
     executor.shutdown()
     executor.shutdown()
 
-    assert observed == ["router-start", "actor-finish-executor", "actor-finish-executor", "router-complete"]
+    assert observed == [
+        "router-start",
+        "actor-finish-executor",
+        "actor-finish-executor",
+        "router-complete",
+        "router-release",
+        "actor-release",
+        "actor-release",
+        "owner-shutdown",
+    ]
     assert executor._wait_refs_by_actor == [None, None]
 
 
@@ -806,10 +844,17 @@ def test_vllm_actor_wait_for_result_finishes_per_executor_before_global_finish()
     executor.error_message = None
     executor._finished_submitting = False
     executor.running_task_count = 1
+    executor.task_count_lock = threading.Lock()
     executor._result_cv = threading.Condition(threading.Lock())
     executor._per_executor_deques = {"exec-a": deque(), "exec-b": deque()}
     executor._per_executor_running_task_count = {"exec-a": 0, "exec-b": 1}
     executor._per_executor_finished = set()
+    executor._per_executor_errors = {}
+    executor._per_executor_aborted = set()
+    executor._per_executor_waiters = {}
+    executor._per_executor_abort_wait_required = set()
+    executor._per_executor_terminal_wait_observed = set()
+    executor._shutdown_called = False
 
     executor.finished_executor("exec-a")
 
@@ -856,11 +901,22 @@ def test_vllm_remote_wait_for_result_drains_ready_actor(monkeypatch):
 
     class FakeReadyMethod:
         def remote(self, _executor_id):
-            return FakeRef((["out-a", "out-b"], rows))
+            return FakeRef((["out-a", "out-b"], rows, "reservation-1"))
 
     class FakeRouter:
         report_start = FakeRemoteMethod()
         report_completion = FakeRemoteMethod()
+        route_and_reserve = FakeRemoteMethod(
+            {
+                "actor_idx": 0,
+                "prompt_count": 2,
+                "reservation_id": "reservation-1",
+                "route_reason": "no_prefix",
+            }
+        )
+        complete = FakeRemoteMethod(2)
+        rollback = FakeRemoteMethod(0)
+        release_executor = FakeRemoteMethod(0)
 
     class FakeActor:
         wait_for_result = FakeWaitMethod()
@@ -873,10 +929,9 @@ def test_vllm_remote_wait_for_result_drains_ready_actor(monkeypatch):
         router_actor = FakeRouter()
         llm_actors = [FakeActor()]
 
-    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref: ref.value)
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref.value)
 
     pool_name = "wait-ref-drain"
-    vllm._shared_inflight.pop(pool_name, None)
     executor = vllm.RemoteVLLMExecutor(FakeLLMActors(), pool_name=pool_name)
 
     executor.submit(None, ["a", "b"], rows)
@@ -893,7 +948,7 @@ def test_vllm_remote_wait_for_result_drains_ready_actor(monkeypatch):
     assert output_rows is rows
 
 
-def test_vllm_remote_wait_ref_stays_armed_until_callback_records_result():
+def test_vllm_remote_wait_callback_queues_work_without_clearing_the_actor_ref():
     import duckdb.execution.vllm as vllm
 
     class FakeRef:
@@ -905,12 +960,55 @@ def test_vllm_remote_wait_ref_stays_armed_until_callback_records_result():
     executor._shutdown_called = False
     executor._finished = False
     executor._wait_refs_by_actor = [ref]
+    executor._ready_wait_refs = deque()
 
-    assert executor._take_ready_wait_ref(ref) == 0
+    executor._queue_wait_ref_ready(ref)
+
     assert executor._wait_refs_by_actor == [ref]
+    assert list(executor._ready_wait_refs) == [ref]
 
 
-def test_vllm_remote_wait_deadline_cancels_outstanding_refs(monkeypatch):
+def _new_remote_vllm_error_executor(vllm, monkeypatch, *, release_count=0):
+    class Ref:
+        def __init__(self, value=None):
+            self.value = value
+
+        def future(self):
+            return self
+
+        def add_done_callback(self, callback):
+            callback(self)
+
+    class RemoteMethod:
+        def __init__(self, value=None):
+            self.value = value
+
+        def remote(self, *_args, **_kwargs):
+            return Ref(self.value)
+
+    class Router:
+        report_start = RemoteMethod()
+        report_completion = RemoteMethod()
+        release_executor = RemoteMethod(release_count)
+
+    class Actor:
+        wait_for_result = RemoteMethod(False)
+        take_ready_result = RemoteMethod(None)
+        abort_executor = RemoteMethod(None)
+        release_executor = RemoteMethod(True)
+
+    class Owner:
+        router_actor = Router()
+        llm_actors = [Actor()]
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref.value)
+    return vllm.RemoteVLLMExecutor(Owner())
+
+
+def test_vllm_remote_wait_deadline_resolves_submits_before_cancelling_wait_refs(monkeypatch):
     import duckdb.execution.vllm as vllm
 
     cancelled = []
@@ -921,6 +1019,10 @@ def test_vllm_remote_wait_deadline_cancels_outstanding_refs(monkeypatch):
 
         def cancel(self, ref):
             cancelled.append(ref)
+
+        @staticmethod
+        def is_initialized():
+            return True
 
     class FakeCondition:
         def __init__(self):
@@ -940,24 +1042,20 @@ def test_vllm_remote_wait_deadline_cancels_outstanding_refs(monkeypatch):
         def notify_all(self):
             self.notified = True
 
-    submit_ref = object()
+    class SubmitRef:
+        value = None
+
+    submit_ref = SubmitRef()
     wait_ref = object()
     condition = FakeCondition()
-    executor = vllm.RemoteVLLMExecutor.__new__(vllm.RemoteVLLMExecutor)
-    executor.llm_actors = [object()]
+    executor = _new_remote_vllm_error_executor(vllm, monkeypatch, release_count=1)
     executor._result_cv = condition
-    executor._finished = False
-    executor._finished_submitting_flag = False
     executor._submit_per_actor = [1]
     executor._results_per_actor = [0]
     executor._wait_refs_by_actor = [wait_ref]
-    executor._submit_refs = {submit_ref: (0, 1)}
-    executor._error_message = None
-    executor._result_buffer = deque()
-    executor._inflight_lock = threading.Lock()
+    executor._submit_refs = {submit_ref: (0, 1, "reservation-1")}
+    executor._reservations = {"reservation-1": {"actor_idx": 0, "remaining": 1}}
     executor._inflight_per_actor = [1]
-    executor._shutdown_called = False
-    executor._released_outstanding_inflight = False
 
     monkeypatch.setitem(sys.modules, "ray", FakeRay())
     monkeypatch.setattr(vllm, "configured_ray_get_timeout_s", lambda: 0.125)
@@ -966,30 +1064,22 @@ def test_vllm_remote_wait_deadline_cancels_outstanding_refs(monkeypatch):
         executor.wait_for_result()
 
     assert condition.timeout == pytest.approx(0.125)
-    assert cancelled == [submit_ref, wait_ref]
+    assert cancelled == [wait_ref]
     assert executor._inflight_per_actor == [0]
     assert executor._submit_refs == {}
     assert executor._wait_refs_by_actor == [None]
 
 
-def test_vllm_remote_wait_without_pending_ref_before_completion_is_error():
+def test_vllm_remote_wait_without_pending_ref_before_completion_is_error(monkeypatch):
     import duckdb.execution.vllm as vllm
 
-    executor = vllm.RemoteVLLMExecutor.__new__(vllm.RemoteVLLMExecutor)
-    executor.llm_actors = []
-    executor._result_cv = threading.Condition(threading.Lock())
-    executor._finished = False
+    executor = _new_remote_vllm_error_executor(vllm, monkeypatch, release_count=1)
     executor._finished_submitting_flag = True
     executor._submit_per_actor = [1]
     executor._results_per_actor = [0]
     executor._wait_refs_by_actor = [None]
-    executor._submit_refs = {}
-    executor._error_message = None
-    executor._result_buffer = deque()
-    executor._inflight_lock = threading.Lock()
+    executor._reservations = {"reservation-1": {"actor_idx": 0, "remaining": 1}}
     executor._inflight_per_actor = [1]
-    executor._shutdown_called = False
-    executor._released_outstanding_inflight = False
     executor._ensure_remote_wait_refs = lambda: None
 
     with pytest.raises(RuntimeError, match="no pending actor wait refs"):
@@ -1001,48 +1091,11 @@ def test_vllm_remote_wait_without_pending_ref_before_completion_is_error():
 def test_vllm_remote_actor_without_results_after_executor_finish_is_error(monkeypatch):
     import duckdb.execution.vllm as vllm
 
-    class FakeRef:
-        def __init__(self, value):
-            self.value = value
-
-        def future(self):
-            return self
-
-        def add_done_callback(self, callback):
-            callback(self)
-
-    class FakeWaitMethod:
-        def remote(self, _executor_id):
-            return FakeRef(False)
-
-    class FakeReadyMethod:
-        def remote(self, _executor_id):
-            raise AssertionError("take_ready_result should not be called when wait_for_result returns false")
-
-    class FakeActor:
-        wait_for_result = FakeWaitMethod()
-        take_ready_result = FakeReadyMethod()
-
-    def fake_get(ref):
-        return ref.value
-
-    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", fake_get)
-
-    executor = vllm.RemoteVLLMExecutor.__new__(vllm.RemoteVLLMExecutor)
-    executor.llm_actors = [FakeActor()]
-    executor._executor_id = "exec-a"
-    executor._result_cv = threading.Condition(threading.Lock())
-    executor._finished = False
+    executor = _new_remote_vllm_error_executor(vllm, monkeypatch)
     executor._finished_submitting_flag = True
     executor._submit_per_actor = [1]
     executor._results_per_actor = [0]
-    executor._wait_refs_by_actor = [None]
-    executor._submit_refs = {}
-    executor._error_message = None
-    executor._result_buffer = deque()
-    executor._inflight_lock = threading.Lock()
     executor._inflight_per_actor = [0]
-    executor._shutdown_called = False
 
     with pytest.raises(RuntimeError, match="finished without returning all submitted results"):
         executor.wait_for_result()
@@ -1051,48 +1104,15 @@ def test_vllm_remote_actor_without_results_after_executor_finish_is_error(monkey
     assert executor._finished is True
 
 
-def test_vllm_remote_actor_missing_results_rolls_back_shared_inflight(monkeypatch):
+def test_vllm_remote_actor_missing_results_releases_outstanding_reservation(monkeypatch):
     import duckdb.execution.vllm as vllm
 
-    class FakeRef:
-        def __init__(self, value):
-            self.value = value
-
-        def future(self):
-            return self
-
-        def add_done_callback(self, callback):
-            callback(self)
-
-    class FakeWaitMethod:
-        def remote(self, _executor_id):
-            return FakeRef(False)
-
-    class FakeReadyMethod:
-        def remote(self, _executor_id):
-            raise AssertionError("take_ready_result should not be called when wait_for_result returns false")
-
-    class FakeActor:
-        wait_for_result = FakeWaitMethod()
-        take_ready_result = FakeReadyMethod()
-
-    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref: ref.value)
-
-    executor = vllm.RemoteVLLMExecutor.__new__(vllm.RemoteVLLMExecutor)
-    executor.llm_actors = [FakeActor()]
-    executor._executor_id = "exec-a"
-    executor._result_cv = threading.Condition(threading.Lock())
-    executor._finished = False
+    executor = _new_remote_vllm_error_executor(vllm, monkeypatch, release_count=3)
     executor._finished_submitting_flag = True
     executor._submit_per_actor = [3]
     executor._results_per_actor = [0]
-    executor._wait_refs_by_actor = [None]
-    executor._submit_refs = {}
-    executor._error_message = None
-    executor._result_buffer = deque()
-    executor._inflight_lock = threading.Lock()
+    executor._reservations = {"reservation-1": {"actor_idx": 0, "remaining": 3}}
     executor._inflight_per_actor = [3]
-    executor._shutdown_called = False
 
     with pytest.raises(RuntimeError, match="finished without returning all submitted results"):
         executor.wait_for_result()
@@ -1100,37 +1120,19 @@ def test_vllm_remote_actor_missing_results_rolls_back_shared_inflight(monkeypatc
     assert executor._inflight_per_actor == [0]
 
 
-def test_vllm_router_waits_for_actor_finished_refs(monkeypatch):
+def test_vllm_router_completion_never_finishes_shared_actors_globally():
     import duckdb.execution.vllm as vllm
 
-    observed: list[str] = []
-
-    class FakeRef:
-        def __init__(self, name: str):
-            self.name = name
-
-    class FakeFinishedMethod:
-        def __init__(self, name: str):
-            self.name = name
-
-        def remote(self):
-            return FakeRef(self.name)
-
     class FakeActor:
-        def __init__(self, name: str):
-            self.finished_submitting = FakeFinishedMethod(name)
+        @property
+        def finished_submitting(self):
+            raise AssertionError("shared actor-wide completion must not be used")
 
-    def fake_get(ref):
-        observed.append(ref.name)
-        return None
+    router = vllm.PrefixRouter([FakeActor(), FakeActor()], 0)
 
-    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", fake_get)
-
-    router = vllm.PrefixRouter([FakeActor("finish-0"), FakeActor("finish-1")], 0)
-    router.report_start()
-    router.report_completion()
-
-    assert observed == ["finish-0", "finish-1"]
+    assert router.report_start("exec-a") is True
+    assert router.report_completion("exec-a") is True
+    assert router.report_completion("exec-a") is False
 
 
 def test_vllm_named_actor_pool_partial_lookup_fails_without_creation_fallback(monkeypatch):

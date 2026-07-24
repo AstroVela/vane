@@ -4,27 +4,33 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import math
 import os
 import threading
 import time
+import uuid
+import warnings
 from abc import ABC, abstractmethod
-from collections import deque
+from collections import OrderedDict, deque
+from decimal import Decimal
 from numbers import Integral, Real
-from typing import Any
+from typing import Any, Callable, overload
 
 import pyarrow as pa
 
+from duckdb.execution._vllm_options_protocol import (
+    _NATIVE_OPTIONS_NORMALIZED_SECRET_KEY,
+    _NATIVE_OPTIONS_PAYLOAD_VERSION,
+    _NATIVE_SECRET_PAYLOAD_KEYS,
+    _NATIVE_SECRET_PAYLOAD_VALUES_KEY,
+    _NATIVE_SECRET_PAYLOAD_VERSION_KEY,
+    _NATIVE_SECRET_REF_KEY,
+    _load_vllm_protocol_json,
+    _unpack_native_options_envelope,
+)
 from duckdb.runners.ray.safe_get import configured_ray_get_timeout_s, resolve_object_refs_blocking
-
-# ---------------------------------------------------------------------------
-# Shared inflight tracking across all RemoteVLLMExecutors on the same worker.
-# Keyed by pool_name so all executors sharing the same vLLM actor pool see the
-# TRUE global inflight per actor (not per-executor approximation).
-# ---------------------------------------------------------------------------
-_shared_inflight_lock = threading.Lock()
-_shared_inflight: dict[str, list[int]] = {}
 
 
 def _positive_float_env(name: str, default: float | None = None) -> float | None:
@@ -59,7 +65,7 @@ def _bounded_query_timeout_s(timeout_s: float | None) -> float | None:
 
 def _vllm_engine_init_timeout_s(value: Any | None = None) -> float | None:
     if value is not None:
-        if isinstance(value, bool) or not isinstance(value, Real):
+        if isinstance(value, bool) or not isinstance(value, (Real, Decimal)):
             raise ValueError("vllm engine_init_timeout_s must be a finite non-negative number")
         result = float(value)
         if not math.isfinite(result) or result < 0.0:
@@ -68,15 +74,87 @@ def _vllm_engine_init_timeout_s(value: Any | None = None) -> float | None:
     return _positive_float_env("VANE_VLLM_ENGINE_INIT_TIMEOUT_S")
 
 
-def _get_shared_inflight(pool_key: str, num_actors: int) -> list[int]:
-    """Return the shared inflight list for a pool, creating if needed."""
-    with _shared_inflight_lock:
-        if pool_key not in _shared_inflight:
-            _shared_inflight[pool_key] = [0] * num_actors
-        return _shared_inflight[pool_key]
+def _vllm_control_rpc_timeout_s() -> float:
+    default_timeout_s = 30.0
+    raw_value = os.getenv("VANE_VLLM_CONTROL_RPC_TIMEOUT_S")
+    if raw_value is None:
+        return default_timeout_s
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return default_timeout_s
+    if not math.isfinite(value) or value <= 0.0:
+        return default_timeout_s
+    return value
+
+
+def _resolve_vllm_control_ref(object_refs: Any) -> Any:
+    """Resolve terminal/control RPCs with a budget independent of the query."""
+    return resolve_object_refs_blocking(
+        object_refs,
+        timeout=_vllm_control_rpc_timeout_s(),
+        honor_query_deadline=False,
+    )
 
 
 class VLLMExecutor(ABC):
+    """Common execution contract shared by local and Ray-backed vLLM executors.
+
+    Besides the submit/result lifecycle, the base class owns a one-shot wakeup
+    protocol used by DuckDB's native scheduler.  A scheduler callback is armed
+    only while no result or terminal state is ready, then consumed by the next
+    relevant state change so a blocked pipeline task can be scheduled again.
+    """
+
+    def _ensure_wakeup_state(self) -> None:
+        """Lazily initialize callback state for subclasses and test doubles."""
+        if not hasattr(self, "_wakeup_lock"):
+            self._wakeup_lock = threading.Lock()
+        if not hasattr(self, "_wakeup_callbacks"):
+            self._wakeup_callbacks: list[Callable[[], None]] = []
+
+    def _wakeup_ready(self) -> bool:
+        """Return whether the native scheduler should resume without arming."""
+        return False
+
+    def register_wakeup_callback(self, callback: Callable[[], None]) -> bool:
+        """Arm a one-shot native wakeup unless work is already actionable.
+
+        True means the callback is stored and the scheduler may safely block;
+        False means it must immediately recheck results or terminal state.
+        """
+        if not callable(callback):
+            raise TypeError("vllm wakeup callback must be callable")
+        self._ensure_wakeup_state()
+        with self._wakeup_lock:
+            if self._wakeup_ready():
+                return False
+            self._wakeup_callbacks.append(callback)
+            return True
+
+    def _notify_state_change(self, *, force: bool = False) -> None:
+        """Wake condition waiters and consume actionable native callbacks.
+
+        Condition waiters are always notified.  Native callbacks are one-shot
+        and run only when `_wakeup_ready()` is true, unless `force` requests an
+        unconditional scheduler recheck after a state transition.
+        """
+        self._ensure_wakeup_state()
+        callbacks: list[Callable[[], None]] = []
+        with self._wakeup_lock:
+            if force or self._wakeup_ready():
+                callbacks = self._wakeup_callbacks
+                self._wakeup_callbacks = []
+        result_cv = getattr(self, "_result_cv", None)
+        if result_cv is not None:
+            with result_cv:
+                result_cv.notify_all()
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                pass
+
     @abstractmethod
     def submit(self, _prefix: str | None, prompts: list[str], rows: pa.Table) -> None:
         pass
@@ -166,7 +244,8 @@ class LocalVLLMExecutor(VLLMExecutor):
 
         # Condition variable for WaitForResult(): C++ blocks here until a
         # result is available.
-        self._result_cv = threading.Condition(threading.Lock())
+        self._result_cv = threading.Condition(threading.RLock())
+        self._ensure_wakeup_state()
 
         # Dedicated async Ray actors use their actor loop. Synchronous wrappers
         # hosted inside a generic Ray actor need their own background loop.
@@ -186,15 +265,26 @@ class LocalVLLMExecutor(VLLMExecutor):
         self._shutdown_called = False
         # Per-executor result deques: distributed executors submit/read with
         # a unique executor_id so results are never stolen across tasks.
-        self._per_executor_deques: dict[str, deque[tuple[str | None, pa.Table]]] = {}
+        self._per_executor_deques: dict[str, deque[tuple[Any, ...]]] = {}
         self._per_executor_running_task_count: dict[str, int] = {}
         self._per_executor_finished: set[str] = set()
+        self._per_executor_request_ids: dict[str, set[str]] = {}
+        self._per_executor_tasks: dict[str, set[Any]] = {}
+        self._per_executor_errors: dict[str, str] = {}
+        self._per_executor_aborted: set[str] = set()
+        self._per_executor_waiters: dict[str, int] = {}
+        self._per_executor_abort_wait_required: set[str] = set()
+        self._per_executor_terminal_wait_observed: set[str] = set()
+        self._async_waiter_lock = threading.Lock()
+        self._async_waiters: dict[str, list[tuple[Any, asyncio.Event]]] = {}
 
     @staticmethod
     def _detect_ray_actor() -> bool:
         try:
             import ray
 
+            if not ray.is_initialized():
+                return False
             ctx = ray.get_runtime_context()
             return ctx.get_actor_id() is not None
         except Exception:
@@ -251,12 +341,14 @@ class LocalVLLMExecutor(VLLMExecutor):
             self.loop.close()
             asyncio.set_event_loop(None)
 
-    async def _generate(self, prompt: str, row: pa.Table, executor_id: str | None = None) -> None:
-        # Route results to per-executor deque when executor_id is given,
-        # otherwise use the shared completed_tasks deque.
-        target_deque = (
-            self._per_executor_deques.get(executor_id, self.completed_tasks) if executor_id else self.completed_tasks
-        )
+    async def _generate(
+        self,
+        prompt: str,
+        row: pa.Table,
+        executor_id: str | None = None,
+        reservation_id: str | None = None,
+    ) -> None:
+        request_id: str | None = None
         try:
             if not self._ray_actor_mode and not self.engine_ready.is_set():
                 await self._wait_for_engine_ready_async()
@@ -265,52 +357,66 @@ class LocalVLLMExecutor(VLLMExecutor):
             if self.llm is None:
                 raise RuntimeError("vllm engine not initialized")
             with self.counter_lock:
-                request_id = self.counter
+                request_id = str(self.counter)
                 self.counter += 1
+            if executor_id:
+                with self.task_count_lock:
+                    self._per_executor_request_ids.setdefault(executor_id, set()).add(request_id)
 
             final_output = None
-            async for output in self.llm.generate(prompt, self.sampling_params, str(request_id), **self.generate_args):
+            async for output in self.llm.generate(prompt, self.sampling_params, request_id, **self.generate_args):
                 final_output = output
 
             if final_output is None or not final_output.outputs:
                 raise RuntimeError("vllm returned no outputs")
 
             output_text: str = final_output.outputs[0].text
-            target_deque.append((output_text, row))
-            with self._result_cv:
-                self._result_cv.notify_all()
+            if executor_id:
+                self._per_executor_deques.setdefault(executor_id, deque()).append((output_text, row, reservation_id))
+            else:
+                self.completed_tasks.append((output_text, row))
+            self._notify_state_change()
         except Exception as exc:
             if self.on_error == "raise":
-                with self.error_lock:
-                    if self.error_message is None:
-                        self.error_message = f"{type(exc).__name__}: {exc}"
-                with self._result_cv:
-                    self._result_cv.notify_all()
+                error_message = f"{type(exc).__name__}: {exc}"
+                if executor_id:
+                    with self.task_count_lock:
+                        self._per_executor_errors.setdefault(executor_id, error_message)
+                else:
+                    with self.error_lock:
+                        if self.error_message is None:
+                            self.error_message = error_message
+                self._notify_state_change(force=True)
             else:
-                target_deque.append((None, row))
-                with self._result_cv:
-                    self._result_cv.notify_all()
+                if executor_id:
+                    self._per_executor_deques.setdefault(executor_id, deque()).append((None, row, reservation_id))
+                else:
+                    self.completed_tasks.append((None, row))
+                self._notify_state_change()
         finally:
             with self.task_count_lock:
                 self.running_task_count -= 1
                 if executor_id:
+                    if request_id is not None:
+                        self._per_executor_request_ids.get(executor_id, set()).discard(request_id)
                     remaining = self._per_executor_running_task_count.get(executor_id, 0) - 1
                     self._per_executor_running_task_count[executor_id] = max(0, remaining)
-                if (self._finished_submitting and self.running_task_count == 0) or (
-                    executor_id and executor_id in self._per_executor_finished
-                ):
-                    with self._result_cv:
-                        self._result_cv.notify_all()
+            self._notify_state_change()
 
-    def _append_error_rows(self, rows: pa.Table, executor_id: str | None = None) -> None:
+    def _append_error_rows(
+        self,
+        rows: pa.Table,
+        executor_id: str | None = None,
+        reservation_id: str | None = None,
+    ) -> None:
         rows = _ensure_table(rows)
-        target_deque = (
-            self._per_executor_deques.get(executor_id, self.completed_tasks) if executor_id else self.completed_tasks
-        )
         for i in range(rows.num_rows):
-            target_deque.append((None, rows.slice(i, 1)))
-        with self._result_cv:
-            self._result_cv.notify_all()
+            row = rows.slice(i, 1)
+            if executor_id:
+                self._per_executor_deques.setdefault(executor_id, deque()).append((None, row, reservation_id))
+            else:
+                self.completed_tasks.append((None, row))
+        self._notify_state_change()
 
     def submit(self, _prefix: str | None, prompts: list[str], rows: pa.Table) -> None:
         rows = _ensure_table(rows)
@@ -332,24 +438,41 @@ class LocalVLLMExecutor(VLLMExecutor):
         for i, prompt in enumerate(prompts):
             row = rows.slice(i, 1)
             asyncio.run_coroutine_threadsafe(self._generate(prompt, row), self.loop)
+        self._notify_state_change(force=True)
 
-    async def submit_async(self, prompts: list[str], rows: pa.Table, executor_id: str | None = None) -> None:
+    async def submit_async(
+        self,
+        prompts: list[str],
+        rows: pa.Table,
+        executor_id: str | None = None,
+        reservation_id: str | None = None,
+    ) -> None:
         rows = _ensure_table(rows)
         if len(prompts) != rows.num_rows:
             raise ValueError("Number of prompts and rows must match")
 
-        # Create per-executor deque on first submit from this executor.
-        if executor_id and executor_id not in self._per_executor_deques:
-            self._per_executor_deques[executor_id] = deque()
-        if executor_id and executor_id in self._per_executor_finished:
-            raise RuntimeError(f"vllm executor {executor_id} is already finished")
+        # Check terminal state before creating any per-executor containers so a
+        # submit that arrives after abort cannot recreate state behind the
+        # tombstone.
+        if executor_id:
+            with self.task_count_lock:
+                if (
+                    executor_id in self._per_executor_finished
+                    or executor_id in self._per_executor_aborted
+                    or executor_id in self._per_executor_errors
+                ):
+                    raise RuntimeError(f"vllm executor {executor_id} is already finished")
+                if executor_id not in self._per_executor_deques:
+                    self._per_executor_deques[executor_id] = deque()
+                    self._per_executor_request_ids[executor_id] = set()
+                    self._per_executor_tasks[executor_id] = set()
 
         if self._ray_actor_mode:
             # Engine is already ready from sync __init__; skip wait.
             if self.engine_error_message is not None:
                 if self.on_error == "raise":
                     raise RuntimeError(f"vllm engine init failed: {self.engine_error_message}")
-                self._append_error_rows(rows, executor_id)
+                self._append_error_rows(rows, executor_id, reservation_id)
                 return
 
             with self.task_count_lock:
@@ -363,15 +486,24 @@ class LocalVLLMExecutor(VLLMExecutor):
                 row = rows.slice(i, 1)
                 # Run _generate on Ray's actor event loop (same loop as
                 # vLLM engine's async IPC — avoids cross-thread scheduling).
-                asyncio.create_task(self._generate(prompt, row, executor_id))
+                asyncio_task = asyncio.create_task(self._generate(prompt, row, executor_id, reservation_id))
+                self._track_executor_task(executor_id, asyncio_task)
         else:
             # Background-thread mode for non-Ray use.
             if not self.engine_ready.is_set():
                 await self._wait_for_engine_ready_async()
+            if executor_id:
+                with self.task_count_lock:
+                    if (
+                        executor_id in self._per_executor_finished
+                        or executor_id in self._per_executor_aborted
+                        or executor_id in self._per_executor_errors
+                    ):
+                        raise RuntimeError(f"vllm executor {executor_id} is already finished")
             if self.engine_error_message is not None:
                 if self.on_error == "raise":
                     raise RuntimeError(f"vllm engine init failed: {self.engine_error_message}")
-                self._append_error_rows(rows, executor_id)
+                self._append_error_rows(rows, executor_id, reservation_id)
                 return
 
             with self.task_count_lock:
@@ -387,26 +519,54 @@ class LocalVLLMExecutor(VLLMExecutor):
                 # current event loop (Ray's).  asyncio.Event is not thread-safe;
                 # _generate() awaits vLLM's internal Events that are set() by the
                 # output_handler running in self.loop.
-                asyncio.run_coroutine_threadsafe(self._generate(prompt, row, executor_id), self.loop)
+                thread_future = asyncio.run_coroutine_threadsafe(
+                    self._generate(prompt, row, executor_id, reservation_id), self.loop
+                )
+                self._track_executor_task(executor_id, thread_future)
+        self._notify_state_change(force=True)
 
-    def take_ready_result(self, executor_id: str | None = None) -> tuple[list[str | None], pa.Table] | None:
-        if self.error_message is not None and self.on_error == "raise":
-            raise RuntimeError(f"vllm task failed: {self.error_message}")
+    def _track_executor_task(self, executor_id: str | None, task: Any) -> None:
+        """Retain an executor task until its completion callback runs."""
+        if not executor_id:
+            return
+        tasks = self._per_executor_tasks.setdefault(executor_id, set())
+        tasks.add(task)
+
+        def discard(done: Any) -> None:
+            tasks.discard(done)
+
+        task.add_done_callback(discard)
+
+    @overload
+    def take_ready_result(self, executor_id: None = None) -> tuple[list[str | None], pa.Table] | None: ...
+
+    @overload
+    def take_ready_result(self, executor_id: str) -> tuple[list[str | None], pa.Table, str] | None: ...
+
+    def take_ready_result(self, executor_id: str | None = None) -> tuple[Any, ...] | None:
+        if self.on_error == "raise":
+            error_message = self._per_executor_errors.get(executor_id) if executor_id else self.error_message
+            if error_message is not None:
+                raise RuntimeError(f"vllm task failed: {error_message}")
 
         source_deque = (
-            self._per_executor_deques.get(executor_id, self.completed_tasks) if executor_id else self.completed_tasks
+            self._per_executor_deques.setdefault(executor_id, deque()) if executor_id else self.completed_tasks
         )
         try:
-            output, row = source_deque.popleft()
+            item = source_deque.popleft()
         except IndexError:
             return None
-
+        output, row, *extra = item
+        self._notify_state_change()
+        if executor_id:
+            if len(extra) != 1 or not isinstance(extra[0], str) or not extra[0]:
+                raise RuntimeError("vllm per-executor result must include a non-empty reservation_id")
+            return [output], row, extra[0]
         return [output], row
 
     def finished_submitting(self) -> None:
         self._finished_submitting = True
-        with self._result_cv:
-            self._result_cv.notify_all()
+        self._notify_state_change(force=True)
 
     def _engine_ready_wait_timeout_s(self) -> float | None:
         return _bounded_query_timeout_s(self.engine_init_timeout_s)
@@ -443,29 +603,141 @@ class LocalVLLMExecutor(VLLMExecutor):
 
     def finished_executor(self, executor_id: str) -> None:
         self._per_executor_finished.add(executor_id)
-        with self._result_cv:
-            self._result_cv.notify_all()
+        self._notify_state_change(force=True)
+
+    def release_executor(self, executor_id: str) -> bool:
+        """Drop terminal state after an executor drained or aborted."""
+        with self.task_count_lock:
+            if self._per_executor_waiters.get(executor_id, 0) > 0:
+                return False
+            if (
+                executor_id in self._per_executor_abort_wait_required
+                and executor_id not in self._per_executor_terminal_wait_observed
+            ):
+                return False
+            if self._per_executor_deques.get(executor_id):
+                return False
+            if self._per_executor_running_task_count.get(executor_id, 0) > 0:
+                return False
+            if self._per_executor_request_ids.get(executor_id):
+                return False
+            if self._per_executor_tasks.get(executor_id):
+                return False
+            self._per_executor_deques.pop(executor_id, None)
+            self._per_executor_running_task_count.pop(executor_id, None)
+            self._per_executor_request_ids.pop(executor_id, None)
+            self._per_executor_tasks.pop(executor_id, None)
+            self._per_executor_errors.pop(executor_id, None)
+            self._per_executor_aborted.discard(executor_id)
+            self._per_executor_waiters.pop(executor_id, None)
+            self._per_executor_abort_wait_required.discard(executor_id)
+            self._per_executor_terminal_wait_observed.discard(executor_id)
+            self._per_executor_finished.discard(executor_id)
+        self._notify_state_change(force=True)
+        return True
+
+    async def abort_executor(self, executor_id: str, wait_expected: bool = False) -> None:
+        """Abort requests and discard state owned by one remote executor."""
+        # Install the terminal tombstone before the first await. Ray async
+        # actors may start another method while this abort is suspended, and a
+        # late submit must be rejected instead of escaping the snapshots below.
+        with self.task_count_lock:
+            self._per_executor_aborted.add(executor_id)
+            self._per_executor_finished.discard(executor_id)
+            request_ids = set(self._per_executor_request_ids.get(executor_id, ()))
+            tasks = set(self._per_executor_tasks.get(executor_id, ()))
+        abort = getattr(getattr(self, "llm", None), "abort", None) or getattr(
+            getattr(self, "llm", None), "abort_request", None
+        )
+        errors: list[BaseException] = []
+        if abort is not None:
+            for request_id in request_ids:
+                try:
+                    result = abort(request_id)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception as exc:
+                    errors.append(exc)
+        for task in tasks:
+            try:
+                task.cancel()
+            except Exception as exc:
+                errors.append(exc)
+        async_tasks = [task for task in tasks if isinstance(task, asyncio.Future)]
+        if async_tasks:
+            results = await asyncio.gather(*async_tasks, return_exceptions=True)
+            errors.extend(
+                result
+                for result in results
+                if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
+            )
+        if errors:
+            raise RuntimeError(
+                f"vllm executor {executor_id} abort failed: "
+                + "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+            ) from errors[0]
+        with self.task_count_lock:
+            remaining = self._per_executor_running_task_count.pop(executor_id, 0)
+            if remaining:
+                self.running_task_count = max(0, self.running_task_count - remaining)
+            self._per_executor_deques.pop(executor_id, None)
+            self._per_executor_request_ids.pop(executor_id, None)
+            self._per_executor_tasks.pop(executor_id, None)
+            self._per_executor_errors.pop(executor_id, None)
+            if wait_expected:
+                self._per_executor_abort_wait_required.add(executor_id)
+                if self._per_executor_waiters.get(executor_id, 0) == 0:
+                    self._per_executor_terminal_wait_observed.add(executor_id)
+        self._notify_state_change(force=True)
+        if wait_expected:
+            deadline = time.monotonic() + _vllm_control_rpc_timeout_s()
+            while True:
+                with self.task_count_lock:
+                    acknowledged = (
+                        self._per_executor_waiters.get(executor_id, 0) == 0
+                        and executor_id in self._per_executor_terminal_wait_observed
+                    )
+                if acknowledged:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"vllm executor {executor_id} abort waiter did not acknowledge termination")
+                await asyncio.sleep(0.01)
 
     def all_tasks_finished(self) -> bool:
         with self.task_count_lock:
             return self._finished_submitting and self.running_task_count == 0 and len(self.completed_tasks) == 0
 
-    def _wait_for_result_blocking(self, executor_id: str | None = None) -> bool:
-        source_deque = (
-            self._per_executor_deques.get(executor_id, self.completed_tasks) if executor_id else self.completed_tasks
-        )
+    def _wakeup_ready(self) -> bool:
+        if self._shutdown_called or self.error_message is not None:
+            return True
+        if self.completed_tasks or any(bool(results) for results in self._per_executor_deques.values()):
+            return True
+        if self._per_executor_errors or self._per_executor_aborted:
+            return True
+        return self._finished_submitting and self.running_task_count == 0
 
-        def done() -> bool:
-            if executor_id:
-                return (
+    def _wait_for_result_blocking(self, executor_id: str | None = None) -> bool:
+        with self._result_cv:
+            self._result_cv.wait_for(lambda: any(self._wait_for_result_state(executor_id)))
+            return self._wait_for_result_state(executor_id)[0]
+
+    def _wait_for_result_state(self, executor_id: str | None) -> tuple[bool, bool]:
+        source_deque = (
+            self._per_executor_deques.setdefault(executor_id, deque()) if executor_id else self.completed_tasks
+        )
+        has_result = bool(source_deque)
+        if executor_id:
+            terminal = (
+                executor_id in self._per_executor_errors
+                or executor_id in self._per_executor_aborted
+                or (
                     executor_id in self._per_executor_finished
                     and self._per_executor_running_task_count.get(executor_id, 0) == 0
                 )
-            return self._finished_submitting and self.running_task_count == 0
-
-        with self._result_cv:
-            self._result_cv.wait_for(lambda: len(source_deque) > 0 or self.error_message is not None or done())
-            return len(source_deque) > 0
+            )
+        else:
+            terminal = self.error_message is not None or (self._finished_submitting and self.running_task_count == 0)
+        return has_result, terminal
 
     def wait_for_result(self, executor_id: str | None = None) -> bool:
         """Block until at least one result is available or all tasks are done."""
@@ -476,64 +748,246 @@ class LocalVLLMExecutor(VLLMExecutor):
             return
         self._shutdown_called = True
         self._finished_submitting = True
-        with self._result_cv:
-            self._result_cv.notify_all()
+        self._notify_state_change(force=True)
         loop = getattr(self, "loop", None)
         if loop is not None and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
 
 
 class RayLocalVLLMExecutor(LocalVLLMExecutor):
+    def _ensure_async_waiter_state(self) -> None:
+        if not hasattr(self, "_async_waiter_lock"):
+            self._async_waiter_lock = threading.Lock()
+        if not hasattr(self, "_async_waiters"):
+            self._async_waiters: dict[str, list[tuple[Any, asyncio.Event]]] = {}
+
+    def _notify_state_change(self, *, force: bool = False) -> None:
+        super()._notify_state_change(force=force)
+        self._ensure_async_waiter_state()
+        with self._async_waiter_lock:
+            waiters = [waiter for executor_waiters in self._async_waiters.values() for waiter in executor_waiters]
+        for loop, event in waiters:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                # The waiter removes itself during normal loop shutdown.
+                continue
+
     # Ray actor calls are awaitable, while the in-process executor exposes a blocking method.
     async def wait_for_result(self, executor_id: str | None = None) -> bool:  # type: ignore[override]
-        return await asyncio.to_thread(self._wait_for_result_blocking, executor_id)
+        if executor_id is None:
+            return await asyncio.to_thread(self._wait_for_result_blocking, None)
+        self._ensure_async_waiter_state()
+        loop = asyncio.get_running_loop()
+        state_changed = asyncio.Event()
+        waiter = (loop, state_changed)
+        with self._async_waiter_lock:
+            self._async_waiters.setdefault(executor_id, []).append(waiter)
+        with self.task_count_lock:
+            self._per_executor_waiters[executor_id] = self._per_executor_waiters.get(executor_id, 0) + 1
+        try:
+            while True:
+                has_result, terminal = self._wait_for_result_state(executor_id)
+                if has_result or terminal:
+                    return has_result
+                state_changed.clear()
+                has_result, terminal = self._wait_for_result_state(executor_id)
+                if has_result or terminal:
+                    continue
+                await state_changed.wait()
+        finally:
+            with self._async_waiter_lock:
+                executor_waiters = self._async_waiters.get(executor_id, [])
+                try:
+                    executor_waiters.remove(waiter)
+                except ValueError:
+                    pass
+                if not executor_waiters:
+                    self._async_waiters.pop(executor_id, None)
+            with self.task_count_lock:
+                remaining = self._per_executor_waiters.get(executor_id, 0) - 1
+                if remaining > 0:
+                    self._per_executor_waiters[executor_id] = remaining
+                else:
+                    self._per_executor_waiters.pop(executor_id, None)
+                if executor_id in self._per_executor_aborted:
+                    self._per_executor_terminal_wait_observed.add(executor_id)
+            self._notify_state_change(force=True)
 
 
 class RemoteVLLMExecutor(VLLMExecutor):
-    def __init__(self, llm_actors: LLMActors, pool_name: str | None = None):
-        self.router_actor = llm_actors.router_actor
-        resolve_object_refs_blocking(self.router_actor.report_start.remote())
+    # Marks the short interval after reserving an actor's wait slot and before
+    # its Ray ObjectRef is installed. This sentinel is shared by all instances.
+    _WAIT_REF_INSTALLING = object()
 
-        self.llm_actors = llm_actors.llm_actors
-        self._result_cv = threading.Condition(threading.Lock())
+    def __init__(self, llm_actors: LLMActors, pool_name: str | None = None):
+        # Keep the owner, rather than only its handles, so anonymous pools can
+        # release the actors they created while borrowed named pools remain alive.
+        self._actors_owner = llm_actors
+        router_actor = llm_actors.router_actor
+        if router_actor is None:
+            raise ValueError("vllm remote executor requires a PrefixRouter actor")
+        self.router_actor = router_actor
+        self.llm_actors = list(llm_actors.llm_actors)
+        if not self.llm_actors:
+            raise ValueError("vllm remote executor requires at least one actor")
+
+        # The ID is the isolation boundary for router reservations and all
+        # per-executor state stored inside the shared model actors.
+        self._executor_id = str(uuid.uuid4())
+        self._pool_key = pool_name or f"_anon_{id(llm_actors)}"
+        self._result_cv = threading.Condition(threading.RLock())
+        self._ensure_wakeup_state()
+        # Lifecycle operations may acquire the result condition, so callers
+        # must preserve the lifecycle-lock -> result-condition lock order.
+        self._lifecycle_lock = threading.RLock()
+        self._reservation_lock = threading.Lock()
+        # Reservation-mutating router RPCs remain serialized for exact local/
+        # remote accounting, without holding the local state lock over Ray I/O.
+        self._reservation_rpc_lock = threading.Lock()
+        self._inflight_lock = threading.Lock()
         self._finished = False
         self._finished_submitting_flag = False
-        self._submit_per_actor = [0] * len(self.llm_actors)
-        # Shared inflight tracking: all executors for the same pool see the
-        # true global inflight per actor, enabling accurate load-aware routing.
-        self._pool_key = pool_name or f"_anon_{id(llm_actors)}"
-        self._inflight_per_actor = _get_shared_inflight(self._pool_key, len(self.llm_actors))
-        self._inflight_lock = threading.Lock()
-
-        # Unique ID for per-executor result isolation on actors
-        import uuid
-
-        self._executor_id = str(uuid.uuid4())
-
-        self._result_buffer: deque[tuple[list[str | None], pa.Table]] = deque()
-        self._error_message: str | None = None
         self._shutdown_called = False
+        self._shutdown_complete = False
+        self._error_message: str | None = None
+        # Terminal cleanup is attempted at finish and retried once at shutdown.
+        # Persistent failure warns without changing a successful query result.
+        self._terminal_cleanup_warning_emitted = False
+        # Actor-indexed counters distinguish dispatched prompts, consumed
+        # results, and the executor's local mirror of router reservations.
+        self._submit_per_actor = [0] * len(self.llm_actors)
         self._results_per_actor = [0] * len(self.llm_actors)
+        self._inflight_per_actor = [0] * len(self.llm_actors)
+        self._result_buffer: deque[tuple[list[str | None], pa.Table]] = deque()
+        # At most one wait ref is armed per actor. Completion callbacks only
+        # enqueue refs here; the executor thread resolves and re-arms them.
         self._wait_refs_by_actor: list[Any | None] = [None] * len(self.llm_actors)
-        self._submit_refs: dict[Any, tuple[int, int]] = {}
+        self._ready_wait_refs: deque[Any] = deque()
+        # Submit refs form the acknowledgement barrier before terminal RPCs;
+        # their metadata is also sufficient to roll back a failed submission.
+        self._submit_refs: dict[Any, tuple[int, int, str]] = {}
+        self._ready_submit_refs: deque[Any] = deque()
+        # Reservations track the remaining prompt count for exact release.
+        self._reservations: OrderedDict[str, dict[str, int]] = OrderedDict()
+        # Successful terminal RPCs are recorded so shutdown/error retries do
+        # not repeat actor or router transitions that already completed.
         self._released_outstanding_inflight = False
+        self._aborted_actor_indices: set[int] = set()
+        self._released_actor_indices: set[int] = set()
+        self._finished_actor_indices: set[int] = set()
+        self._router_completion_reported = False
+
+        try:
+            resolve_object_refs_blocking(self.router_actor.report_start.remote(self._executor_id))
+        except Exception:
+            cancel_start = getattr(self.router_actor, "cancel_executor_start", None)
+            if cancel_start is not None:
+                try:
+                    _resolve_vllm_control_ref(cancel_start.remote(self._executor_id))
+                except Exception:
+                    pass
+            raise
+
+    def _router_call(
+        self,
+        method_name: str,
+        *args: Any,
+        control_rpc: bool = False,
+    ) -> Any:
+        method = getattr(self.router_actor, method_name, None)
+        if method is None:
+            raise TypeError(f"vllm PrefixRouter does not implement {method_name}")
+        ref = method.remote(*args)
+        if control_rpc:
+            return _resolve_vllm_control_ref(ref)
+        return resolve_object_refs_blocking(ref)
+
+    def _router_release(
+        self,
+        method_name: str,
+        expected: int,
+        *args: Any,
+        operation_id: str,
+        allow_reconcile: bool = False,
+        control_rpc: bool = False,
+    ) -> int:
+        once_name = f"{method_name}_once"
+        method = getattr(self.router_actor, once_name, None)
+
+        def resolve(ref: Any) -> Any:
+            if control_rpc:
+                return _resolve_vllm_control_ref(ref)
+            return resolve_object_refs_blocking(ref)
+
+        if method is not None:
+            call_args = (*args, operation_id)
+            try:
+                result = resolve(method.remote(*call_args))
+            except Exception:
+                result = resolve(method.remote(*call_args))
+            if not isinstance(result, dict) or result.get("operation_id") != operation_id:
+                raise RuntimeError(f"vllm PrefixRouter.{once_name} returned an invalid operation result")
+            result = result.get("released")
+        else:
+            result = self._router_call(
+                method_name,
+                *args,
+                control_rpc=control_rpc,
+            )
+        if isinstance(result, bool) or not isinstance(result, int):
+            raise RuntimeError(f"vllm PrefixRouter.{method_name} must return an integer release count")
+        if (allow_reconcile and result < 0) or (not allow_reconcile and result != expected):
+            raise RuntimeError(f"vllm PrefixRouter.{method_name} released {result} prompts; expected {expected}")
+        return result
 
     def _actor_has_pending_result(self, actor_idx: int) -> bool:
         return self._results_per_actor[actor_idx] < self._submit_per_actor[actor_idx]
 
+    def _queue_wait_ref_ready(self, ready_ref: Any) -> None:
+        with self._result_cv:
+            if self._shutdown_called or self._finished or ready_ref not in self._wait_refs_by_actor:
+                return
+            if ready_ref not in self._ready_wait_refs:
+                self._ready_wait_refs.append(ready_ref)
+        self._notify_state_change(force=True)
+
     def _ensure_wait_ref(self, actor_idx: int) -> None:
-        if self._wait_refs_by_actor[actor_idx] is not None:
-            return
-        if not self._actor_has_pending_result(actor_idx):
-            return
-        actor = self.llm_actors[actor_idx]
-        wait_ref = actor.wait_for_result.remote(self._executor_id)
-        self._wait_refs_by_actor[actor_idx] = wait_ref
+        with self._result_cv:
+            if self._wait_refs_by_actor[actor_idx] is not None or not self._actor_has_pending_result(actor_idx):
+                return
+            self._wait_refs_by_actor[actor_idx] = self._WAIT_REF_INSTALLING
         try:
-            wait_ref.future().add_done_callback(lambda _future, _ref=wait_ref: self._handle_wait_ref_ready(_ref))
+            wait_ref = self.llm_actors[actor_idx].wait_for_result.remote(self._executor_id)
         except Exception as exc:
-            self._wait_refs_by_actor[actor_idx] = None
+            with self._result_cv:
+                self._wait_refs_by_actor[actor_idx] = None
+            self._record_error(exc)
+            return
+        with self._result_cv:
+            if self._shutdown_called or self._finished:
+                install = False
+            else:
+                self._wait_refs_by_actor[actor_idx] = wait_ref
+                install = True
+        if not install:
+            self._cancel_refs([wait_ref])
+            return
+        try:
+            wait_ref.future().add_done_callback(lambda _future, _ref=wait_ref: self._queue_wait_ref_ready(_ref))
+        except Exception as exc:
+            with self._result_cv:
+                if self._wait_refs_by_actor[actor_idx] == wait_ref:
+                    self._wait_refs_by_actor[actor_idx] = None
             self._record_error(TypeError(f"vllm wait ObjectRef does not support completion callbacks: {exc}"))
+
+    def _ensure_remote_wait_refs(self) -> None:
+        for actor_idx in range(len(self.llm_actors)):
+            self._ensure_wait_ref(actor_idx)
+
+    def register_wakeup_callback(self, callback: Callable[[], None]) -> bool:
+        self._ensure_remote_wait_refs()
+        return super().register_wakeup_callback(callback)
 
     def _actor_index_for_wait_ref(self, ready_ref: Any) -> int:
         for actor_idx, ref in enumerate(self._wait_refs_by_actor):
@@ -541,139 +995,249 @@ class RemoteVLLMExecutor(VLLMExecutor):
                 return actor_idx
         raise RuntimeError("vllm remote wait returned an unknown actor ref")
 
-    def _take_ready_wait_ref(self, ready_ref: Any) -> int | None:
-        with self._result_cv:
-            if self._shutdown_called or self._finished:
-                return None
-            actor_idx = self._actor_index_for_wait_ref(ready_ref)
-            return actor_idx
-
-    def _handle_wait_ref_ready(self, ready_ref: Any) -> None:
-        try:
-            actor_idx = self._take_ready_wait_ref(ready_ref)
-            if actor_idx is None:
+    def _drain_queued_wait_refs(self) -> None:
+        while True:
+            with self._result_cv:
+                if not self._ready_wait_refs:
+                    return
+                ready_ref = self._ready_wait_refs.popleft()
+            try:
+                actor_idx = self._actor_index_for_wait_ref(ready_ref)
+                ready = resolve_object_refs_blocking(ready_ref)
+                self._drain_ready_actor(actor_idx, bool(ready), ready_ref)
+            except Exception as exc:
+                self._record_error(exc)
                 return
-            ready = resolve_object_refs_blocking(ready_ref)
-            self._drain_ready_actor(actor_idx, ready, ready_ref)
-        except Exception as exc:
-            self._record_error(exc)
 
     def _drain_ready_actor(self, actor_idx: int, ready: bool, ready_ref: Any) -> None:
-        actor = self.llm_actors[actor_idx]
         if not ready:
-            if self._finished_submitting_flag:
-                if sum(self._results_per_actor) >= sum(self._submit_per_actor):
-                    self._mark_finished()
-                else:
-                    self._record_error(
-                        RuntimeError(
-                            "vllm actor finished without returning all submitted results: "
-                            f"actor_idx={actor_idx} submitted={self._submit_per_actor[actor_idx]} "
-                            f"received={self._results_per_actor[actor_idx]}"
-                        )
-                    )
+            if (
+                self._finished_submitting_flag
+                and self._results_per_actor[actor_idx] >= self._submit_per_actor[actor_idx]
+            ):
+                with self._result_cv:
+                    if self._wait_refs_by_actor[actor_idx] == ready_ref:
+                        self._wait_refs_by_actor[actor_idx] = None
                 return
-            raise RuntimeError("vllm actor wait completed without a result")
-
-        result = resolve_object_refs_blocking(actor.take_ready_result.remote(self._executor_id))
-        if result is None:
-            raise RuntimeError("vllm actor reported readiness but returned no result")
-
-        results_text, _ = result
-        n_results = len(results_text) if results_text else 0
-        with self._inflight_lock:
-            self._inflight_per_actor[actor_idx] -= n_results
-        self._results_per_actor[actor_idx] += n_results
+            raise RuntimeError(
+                "vllm actor finished without returning all submitted results: "
+                f"actor_idx={actor_idx} submitted={self._submit_per_actor[actor_idx]} "
+                f"received={self._results_per_actor[actor_idx]}"
+            )
+        result = resolve_object_refs_blocking(self.llm_actors[actor_idx].take_ready_result.remote(self._executor_id))
+        if not isinstance(result, tuple) or len(result) != 3:
+            raise RuntimeError("vllm actor result must be a 3-item tuple including reservation_id")
+        results_text, rows, reservation_id = result
+        if not isinstance(reservation_id, str) or not reservation_id:
+            raise RuntimeError("vllm actor result must include a non-empty reservation_id")
+        count = len(results_text) if results_text else 0
+        self._complete_reservation(reservation_id, count)
         with self._result_cv:
             if self._wait_refs_by_actor[actor_idx] == ready_ref:
                 self._wait_refs_by_actor[actor_idx] = None
-            self._result_buffer.append(result)
-            self._result_cv.notify_all()
+            self._results_per_actor[actor_idx] += count
+            self._result_buffer.append((results_text, rows))
+        # Actor waits are one-shot. Re-arm immediately after consuming a
+        # result so an already-buffered successor cannot be stranded without
+        # a completion callback while native backpressure is waiting.
+        self._ensure_wait_ref(actor_idx)
+        self._notify_state_change()
 
-    def _ensure_remote_wait_refs(self) -> None:
-        for actor_idx in range(len(self.llm_actors)):
-            self._ensure_wait_ref(actor_idx)
-        if not any(ref is not None for ref in self._wait_refs_by_actor) and self._finished_submitting_flag:
-            if sum(self._results_per_actor) >= sum(self._submit_per_actor):
-                self._mark_finished()
-
-    def _has_pending_wait_ref(self) -> bool:
-        return any(ref is not None for ref in self._wait_refs_by_actor)
-
-    def _rollback_submitted_actor_batch(self, actor_idx: int, prompt_count: int) -> None:
-        with self._inflight_lock:
-            self._inflight_per_actor[actor_idx] = max(0, self._inflight_per_actor[actor_idx] - prompt_count)
-        with self._result_cv:
-            self._submit_per_actor[actor_idx] = max(0, self._submit_per_actor[actor_idx] - prompt_count)
-            self._result_cv.notify_all()
-
-    def _release_outstanding_inflight(self) -> None:
-        with self._inflight_lock:
-            if getattr(self, "_released_outstanding_inflight", False):
-                return
-            for actor_idx in range(len(self._inflight_per_actor)):
-                outstanding = max(0, self._submit_per_actor[actor_idx] - self._results_per_actor[actor_idx])
-                if outstanding:
-                    self._inflight_per_actor[actor_idx] = max(0, self._inflight_per_actor[actor_idx] - outstanding)
-            self._released_outstanding_inflight = True
-
-    def _take_submit_ref(self, ready_ref: Any) -> tuple[int, int] | None:
-        with self._result_cv:
-            if self._shutdown_called or self._finished:
-                return None
-            return self._submit_refs.pop(ready_ref, None)
-
-    def _handle_submit_ref_ready(self, ready_ref: Any) -> None:
-        submit_meta = self._take_submit_ref(ready_ref)
-        if submit_meta is None:
+    def _complete_reservation(self, reservation_id: str | None, count: int) -> None:
+        if reservation_id is None or count <= 0:
             return
-        actor_idx, prompt_count = submit_meta
-        try:
-            resolve_object_refs_blocking(ready_ref)
-        except Exception as exc:
-            self._rollback_submitted_actor_batch(actor_idx, prompt_count)
-            self._record_error(exc)
+        reservation_id = str(reservation_id)
+        with self._reservation_rpc_lock:
+            with self._reservation_lock:
+                reservation = self._reservations.get(reservation_id)
+                if reservation is None:
+                    raise RuntimeError(f"vllm result references unknown reservation {reservation_id}")
+                released = min(count, reservation["remaining"])
+                remaining_before = reservation["remaining"]
+                actor_idx = reservation["actor_idx"]
+            self._router_release(
+                "complete",
+                released,
+                reservation_id,
+                released,
+                operation_id=f"{self._executor_id}:complete:{reservation_id}:{remaining_before}:{released}",
+            )
+            with self._reservation_lock:
+                current = self._reservations.get(reservation_id)
+                if current is not reservation or current["remaining"] != remaining_before:
+                    raise RuntimeError(f"vllm reservation {reservation_id} changed during completion")
+                reservation["remaining"] -= released
+                if reservation["remaining"] == 0:
+                    self._reservations.pop(reservation_id, None)
+            with self._inflight_lock:
+                self._inflight_per_actor[actor_idx] = max(0, self._inflight_per_actor[actor_idx] - released)
 
-    def _track_submit_ref(self, submit_ref: Any, actor_idx: int, prompt_count: int) -> None:
+    def _rollback_reservation(
+        self,
+        reservation_id: str,
+        count: int,
+        *,
+        control_rpc: bool = False,
+    ) -> int:
+        with self._reservation_rpc_lock:
+            with self._reservation_lock:
+                reservation = self._reservations.get(reservation_id)
+                if reservation is None:
+                    return 0
+                released = min(count, reservation["remaining"])
+                remaining_before = reservation["remaining"]
+                actor_idx = reservation["actor_idx"]
+            self._router_release(
+                "rollback",
+                released,
+                reservation_id,
+                released,
+                operation_id=f"{self._executor_id}:rollback:{reservation_id}:{remaining_before}:{released}",
+                control_rpc=control_rpc,
+            )
+            with self._reservation_lock:
+                current = self._reservations.get(reservation_id)
+                if current is not reservation or current["remaining"] != remaining_before:
+                    raise RuntimeError(f"vllm reservation {reservation_id} changed during rollback")
+                reservation["remaining"] -= released
+                if reservation["remaining"] == 0:
+                    self._reservations.pop(reservation_id, None)
+            with self._inflight_lock:
+                self._inflight_per_actor[actor_idx] = max(0, self._inflight_per_actor[actor_idx] - released)
+        return released
+
+    def _queue_submit_ref_ready(self, ready_ref: Any) -> None:
         with self._result_cv:
-            if self._shutdown_called or self._finished:
+            if self._shutdown_called or self._finished or ready_ref not in self._submit_refs:
                 return
-            self._submit_refs[submit_ref] = (actor_idx, prompt_count)
+            if ready_ref not in self._ready_submit_refs:
+                self._ready_submit_refs.append(ready_ref)
+        self._notify_state_change(force=True)
+
+    def _track_submit_ref(self, submit_ref: Any, actor_idx: int, count: int, reservation_id: str) -> None:
+        with self._result_cv:
+            self._submit_refs[submit_ref] = (actor_idx, count, reservation_id)
         try:
-            submit_ref.future().add_done_callback(lambda _future, _ref=submit_ref: self._handle_submit_ref_ready(_ref))
+            submit_ref.future().add_done_callback(lambda _future, _ref=submit_ref: self._queue_submit_ref_ready(_ref))
         except Exception as exc:
-            submit_meta = self._take_submit_ref(submit_ref)
-            if submit_meta is not None:
-                rollback_actor_idx, rollback_prompt_count = submit_meta
-                self._rollback_submitted_actor_batch(rollback_actor_idx, rollback_prompt_count)
             self._record_error(TypeError(f"vllm submit ObjectRef does not support completion callbacks: {exc}"))
 
-    def _record_error(self, exc: Exception) -> None:
-        self._release_outstanding_inflight()
-        self._cancel_remote_refs()
+    def _resolve_submit_ref(
+        self,
+        submit_ref: Any,
+        *,
+        control_rpc: bool = False,
+    ) -> Exception | None:
         with self._result_cv:
-            if self._error_message is None:
-                self._error_message = f"{type(exc).__name__}: {exc}"
-            self._finished = True
-            self._wait_refs_by_actor = [None] * len(self.llm_actors)
-            self._submit_refs.clear()
-            self._result_cv.notify_all()
+            metadata = self._submit_refs.pop(submit_ref, None)
+            try:
+                self._ready_submit_refs.remove(submit_ref)
+            except ValueError:
+                pass
+        if metadata is None:
+            return None
+        actor_idx, count, reservation_id = metadata
+        try:
+            if control_rpc:
+                _resolve_vllm_control_ref(submit_ref)
+            else:
+                resolve_object_refs_blocking(submit_ref)
+        except Exception as exc:
+            try:
+                self._rollback_submitted_batch(
+                    actor_idx,
+                    count,
+                    reservation_id,
+                    control_rpc=control_rpc,
+                )
+            except Exception as rollback_error:
+                exc = RuntimeError(f"{exc}; reservation rollback failed: {rollback_error}")
+            return exc
+        return None
 
-    def _mark_finished(self) -> None:
-        self._release_outstanding_inflight()
+    @staticmethod
+    def _submit_acknowledgement_error(errors: list[Exception]) -> Exception:
+        if len(errors) == 1:
+            return errors[0]
+        return RuntimeError(
+            "vllm remote submit acknowledgements failed: "
+            + "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+        )
+
+    def _drain_queued_submit_refs(self) -> None:
+        while True:
+            with self._result_cv:
+                if not self._ready_submit_refs:
+                    return
+                submit_ref = self._ready_submit_refs.popleft()
+            error = self._resolve_submit_ref(submit_ref)
+            if error is not None:
+                self._record_error(error)
+                return
+
+    def _await_pending_submit_refs(self) -> list[Exception]:
+        """Establish actor-side submission order before sending completion."""
+        errors: list[Exception] = []
+        while True:
+            with self._result_cv:
+                pending = list(self._submit_refs)
+            if not pending:
+                return errors
+            for submit_ref in pending:
+                error = self._resolve_submit_ref(
+                    submit_ref,
+                    control_rpc=True,
+                )
+                if error is not None:
+                    errors.append(error)
+
+    def _rollback_submitted_batch(
+        self,
+        actor_idx: int,
+        count: int,
+        reservation_id: str,
+        *,
+        control_rpc: bool = False,
+    ) -> None:
+        released = self._rollback_reservation(
+            reservation_id,
+            count,
+            control_rpc=control_rpc,
+        )
         with self._result_cv:
-            self._finished = True
-            self._wait_refs_by_actor = [None] * len(self.llm_actors)
-            self._submit_refs.clear()
-            self._result_cv.notify_all()
+            self._submit_per_actor[actor_idx] = max(0, self._submit_per_actor[actor_idx] - released)
+        self._notify_state_change(force=True)
 
-    def _cancel_remote_refs(self) -> None:
-        refs = list(self._submit_refs)
-        refs.extend(ref for ref in self._wait_refs_by_actor if ref is not None)
+    def _release_outstanding_inflight(self) -> None:
+        with self._reservation_rpc_lock:
+            with self._reservation_lock:
+                if self._released_outstanding_inflight:
+                    return
+                expected = sum(reservation["remaining"] for reservation in self._reservations.values())
+            self._router_release(
+                "release_executor",
+                expected,
+                self._executor_id,
+                operation_id=f"{self._executor_id}:release:{expected}",
+                allow_reconcile=True,
+                control_rpc=True,
+            )
+            with self._reservation_lock:
+                self._reservations.clear()
+                self._released_outstanding_inflight = True
+            with self._inflight_lock:
+                self._inflight_per_actor = [0] * len(self.llm_actors)
+
+    def _cancel_refs(self, refs: list[Any]) -> None:
         if not refs:
             return
         try:
             import ray
+        except Exception:
+            return
+        try:
+            if not ray.is_initialized():
+                return
         except Exception:
             return
         for ref in refs:
@@ -682,130 +1246,591 @@ class RemoteVLLMExecutor(VLLMExecutor):
             except Exception:
                 pass
 
-    def submit(self, _prefix: str | None, prompts: list[str], rows: pa.Table) -> None:
-        if self._shutdown_called:
-            raise RuntimeError("vllm remote executor is shut down")
-        prompt_count = len(prompts)
-        # Route to actor with lowest actual inflight (adapts to processing speed)
-        with self._inflight_lock:
-            route_to = min(range(len(self.llm_actors)), key=lambda i: self._inflight_per_actor[i])
-            self._inflight_per_actor[route_to] += prompt_count
+    def _cancel_remote_refs(self) -> None:
+        refs = list(self._submit_refs)
+        refs.extend(ref for ref in self._wait_refs_by_actor if ref is not None and ref is not self._WAIT_REF_INSTALLING)
+        self._cancel_refs(refs)
 
+    def _abort_actor_state(self) -> None:
+        errors: list[Exception] = []
+        for actor_idx, actor in enumerate(self.llm_actors):
+            if actor_idx in self._aborted_actor_indices:
+                continue
+            method = getattr(actor, "abort_executor", None)
+            if method is None:
+                errors.append(RuntimeError(f"vllm actor {actor_idx} does not implement abort_executor"))
+                continue
+            try:
+                wait_ref = self._wait_refs_by_actor[actor_idx]
+                wait_expected = wait_ref is not None and wait_ref is not self._WAIT_REF_INSTALLING
+                _resolve_vllm_control_ref(method.remote(self._executor_id, wait_expected))
+                self._aborted_actor_indices.add(actor_idx)
+            except Exception as exc:
+                errors.append(RuntimeError(f"actor {actor_idx}: {exc}"))
+        if errors:
+            raise RuntimeError("vllm remote abort failed: " + "; ".join(str(error) for error in errors))
+
+    def _release_actor_state(self) -> None:
+        errors: list[Exception] = []
+        for actor_idx, actor in enumerate(self.llm_actors):
+            if actor_idx in self._released_actor_indices:
+                continue
+            method = getattr(actor, "release_executor", None)
+            if method is None:
+                errors.append(RuntimeError(f"vllm actor {actor_idx} does not implement release_executor"))
+                continue
+            try:
+                if (
+                    _resolve_vllm_control_ref(
+                        method.remote(self._executor_id),
+                    )
+                    is not True
+                ):
+                    raise RuntimeError("release_executor did not confirm release")
+                self._released_actor_indices.add(actor_idx)
+            except Exception as exc:
+                errors.append(RuntimeError(f"actor {actor_idx}: {exc}"))
+        if errors:
+            raise RuntimeError("vllm remote actor-state release failed: " + "; ".join(str(error) for error in errors))
+
+    def _report_router_completion(self) -> None:
+        if self._router_completion_reported:
+            return
+        _resolve_vllm_control_ref(self.router_actor.report_completion.remote(self._executor_id))
+        self._router_completion_reported = True
+
+    def _warn_incomplete_terminal_cleanup(self, errors: list[Exception]) -> None:
+        if self._terminal_cleanup_warning_emitted:
+            return
+        self._terminal_cleanup_warning_emitted = True
         try:
-            submit_ref = self.llm_actors[route_to].submit_async.remote(prompts, rows, self._executor_id)
+            warnings.warn(
+                "vllm query completed successfully but terminal cleanup remains incomplete after the final "
+                "shutdown attempt; no background retry will be attempted: " + "; ".join(str(error) for error in errors),
+                RuntimeWarning,
+                stacklevel=3,
+            )
         except Exception:
-            with self._inflight_lock:
-                self._inflight_per_actor[route_to] = max(0, self._inflight_per_actor[route_to] - prompt_count)
-            raise
+            # Warning filters may promote RuntimeWarning to an exception; cleanup
+            # diagnostics must never turn an otherwise successful query into failure.
+            pass
 
-        self._submit_per_actor[route_to] += prompt_count
-        self._track_submit_ref(submit_ref, route_to, prompt_count)
+    def _record_error(self, exc: Exception) -> None:
+        with self._lifecycle_lock:
+            if self._finished and self._error_message is not None:
+                return
+            # A submit acknowledgement is the causal barrier before actor
+            # terminal RPCs. Consume every outstanding acknowledgement with
+            # its own control-RPC timeout, then perform one logical abort.
+            pending_submit_errors = self._await_pending_submit_refs()
+            if pending_submit_errors:
+                pending_error = self._submit_acknowledgement_error(pending_submit_errors)
+                exc = RuntimeError(f"{exc}; additionally, {pending_error}")
+            cleanup_errors: list[Exception] = []
+            try:
+                self._abort_actor_state()
+            except Exception as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            try:
+                self._report_router_completion()
+            except Exception as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            try:
+                self._release_outstanding_inflight()
+            except Exception as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            self._cancel_remote_refs()
+            with self._result_cv:
+                self._error_message = self._error_message or f"{type(exc).__name__}: {exc}"
+                if cleanup_errors:
+                    self._error_message += "; cleanup failed: " + "; ".join(str(error) for error in cleanup_errors)
+                self._finished = True
+                self._wait_refs_by_actor = [None] * len(self.llm_actors)
+                self._submit_refs.clear()
+                self._ready_wait_refs.clear()
+                self._ready_submit_refs.clear()
+            self._notify_state_change(force=True)
+
+    def _mark_finished(self) -> None:
+        with self._lifecycle_lock:
+            if self._finished:
+                return
+            # This is the first best-effort cleanup attempt. shutdown() makes
+            # the final attempt, so a transient failure here should not warn or
+            # turn an otherwise successful query into a failure.
+            try:
+                self._release_outstanding_inflight()
+            except Exception:
+                pass
+            try:
+                self._release_actor_state()
+            except Exception:
+                pass
+            with self._result_cv:
+                self._finished = True
+                self._wait_refs_by_actor = [None] * len(self.llm_actors)
+                self._submit_refs.clear()
+                self._ready_wait_refs.clear()
+                self._ready_submit_refs.clear()
+            self._notify_state_change(force=True)
+
+    def _wakeup_ready(self) -> bool:
+        return bool(
+            self._result_buffer
+            or self._ready_wait_refs
+            or self._ready_submit_refs
+            or self._error_message is not None
+            or self._finished
+            or self._shutdown_called
+        )
+
+    def submit(self, prefix: str | None, prompts: list[str], rows: pa.Table) -> None:
+        with self._lifecycle_lock:
+            if self._shutdown_called or self._finished or self._finished_submitting_flag:
+                raise RuntimeError("vllm remote executor no longer accepts submissions")
+            if self._error_message is not None:
+                raise RuntimeError(f"vllm remote task failed: {self._error_message}")
+            rows = _ensure_table(rows)
+            count = len(prompts)
+            if count != rows.num_rows:
+                raise ValueError("Number of prompts and rows must match")
+            if count == 0:
+                return
+            operation_id = f"{self._executor_id}:route:{uuid.uuid4()}"
+            try:
+                route_once = getattr(self.router_actor, "route_and_reserve_once", None)
+                if route_once is not None:
+                    args = (prefix, count, self._executor_id, operation_id)
+                    try:
+                        decision = resolve_object_refs_blocking(route_once.remote(*args))
+                    except Exception:
+                        decision = resolve_object_refs_blocking(route_once.remote(*args))
+                else:
+                    decision = self._router_call("route_and_reserve", prefix, count, self._executor_id)
+                if not isinstance(decision, dict):
+                    raise RuntimeError("vllm PrefixRouter.route_and_reserve must return a dict")
+                actor_idx_value = decision.get("actor_idx")
+                prompt_count_value = decision.get("prompt_count")
+                reservation_id_value = decision.get("reservation_id")
+                valid_operation = route_once is None or decision.get("operation_id") == operation_id
+                if (
+                    isinstance(actor_idx_value, bool)
+                    or not isinstance(actor_idx_value, Integral)
+                    or int(actor_idx_value) < 0
+                    or int(actor_idx_value) >= len(self.llm_actors)
+                    or isinstance(prompt_count_value, bool)
+                    or not isinstance(prompt_count_value, Integral)
+                    or int(prompt_count_value) != count
+                    or not isinstance(reservation_id_value, str)
+                    or not reservation_id_value
+                    or not valid_operation
+                ):
+                    raise RuntimeError("vllm PrefixRouter returned an invalid reservation")
+                actor_idx = int(actor_idx_value)
+                reservation_id = reservation_id_value
+            except Exception as exc:
+                # The router may have committed an idempotent reservation even
+                # when the acknowledgement is lost or malformed. Terminalize
+                # through reconciliation so no phantom reservation survives.
+                self._record_error(exc)
+                raise
+            with self._reservation_lock:
+                self._reservations[reservation_id] = {"actor_idx": actor_idx, "remaining": count}
+            with self._inflight_lock:
+                self._inflight_per_actor[actor_idx] += count
+            try:
+                submit_ref = self.llm_actors[actor_idx].submit_async.remote(
+                    prompts, rows, self._executor_id, reservation_id
+                )
+            except Exception:
+                self._rollback_reservation(reservation_id, count)
+                raise
+            with self._result_cv:
+                self._submit_per_actor[actor_idx] += count
+            self._track_submit_ref(submit_ref, actor_idx, count, reservation_id)
+            self._ensure_remote_wait_refs()
+            self._notify_state_change(force=True)
 
     def take_ready_result(self) -> tuple[list[str | None], pa.Table] | None:
+        self._drain_queued_submit_refs()
+        self._drain_queued_wait_refs()
         if self._error_message is not None:
             raise RuntimeError(f"vllm remote task failed: {self._error_message}")
         try:
-            return self._result_buffer.popleft()
+            result = self._result_buffer.popleft()
         except IndexError:
             return None
+        self._notify_state_change()
+        return result
 
     def finished_submitting(self) -> None:
-        if self._finished_submitting_flag:
-            return
-        self._finished_submitting_flag = True
-        errors: list[Exception] = []
-        for actor in self.llm_actors:
-            try:
-                resolve_object_refs_blocking(actor.finished_executor.remote(self._executor_id))
-            except Exception as exc:
-                errors.append(exc)
-        try:
-            resolve_object_refs_blocking(self.router_actor.report_completion.remote())
-        except Exception as exc:
-            errors.append(exc)
-        if errors:
-            if len(errors) == 1:
-                raise RuntimeError(f"vllm remote finished_submitting failed: {errors[0]}") from errors[0]
-            message = "; ".join(str(error) for error in errors)
-            raise RuntimeError(f"vllm remote finished_submitting failed: {message}") from errors[0]
+        with self._lifecycle_lock:
+            if self._finished_submitting_flag and self._router_completion_reported:
+                return
+            # Ray async actors do not guarantee actor-call execution order. A
+            # terminal call can therefore overtake an earlier submit. Resolving
+            # every submit acknowledgement is the causal barrier that guarantees
+            # each actor has registered all work before it sees finished_executor.
+            submit_errors = self._await_pending_submit_refs()
+            if submit_errors:
+                submit_error = self._submit_acknowledgement_error(submit_errors)
+                self._record_error(submit_error)
+                raise RuntimeError(f"vllm remote task failed: {self._error_message}")
+            errors: list[Exception] = []
+            for actor_idx, actor in enumerate(self.llm_actors):
+                if actor_idx in self._finished_actor_indices:
+                    continue
+                try:
+                    _resolve_vllm_control_ref(actor.finished_executor.remote(self._executor_id))
+                    self._finished_actor_indices.add(actor_idx)
+                except Exception as exc:
+                    errors.append(RuntimeError(f"actor {actor_idx}: {exc}"))
+            if not self._router_completion_reported:
+                try:
+                    self._report_router_completion()
+                except Exception as exc:
+                    errors.append(RuntimeError(f"router: {exc}"))
+            if errors:
+                raise RuntimeError(
+                    "vllm remote finished_submitting failed: " + "; ".join(str(error) for error in errors)
+                )
+            self._finished_submitting_flag = True
+            self._notify_state_change(force=True)
 
     def all_tasks_finished(self) -> bool:
+        self._drain_queued_submit_refs()
+        self._drain_queued_wait_refs()
         if self._result_buffer:
             return False
         if self._error_message is not None:
             raise RuntimeError(f"vllm remote task failed: {self._error_message}")
         if not self._finished_submitting_flag:
             return False
-        # Per-task completion: received at least as many results as submitted
-        total_submitted = sum(self._submit_per_actor)
-        total_received = sum(self._results_per_actor)
-        if total_submitted == 0:
-            self._mark_finished()
-            return True
-        if total_submitted > 0 and total_received >= total_submitted:
+        if sum(self._results_per_actor) >= sum(self._submit_per_actor):
             self._mark_finished()
             return True
         return False
 
     def wait_for_result(self) -> None:
-        """Block until a result is available in the buffer."""
         if self._error_message is not None:
             raise RuntimeError(f"vllm remote task failed: {self._error_message}")
-        if self._result_buffer or self._finished:
-            return
         try:
-            self._ensure_remote_wait_refs()
-            with self._result_cv:
-                if (
-                    not self._result_buffer
-                    and self._error_message is None
-                    and not self._finished
-                    and not self._has_pending_wait_ref()
-                ):
-                    raise RuntimeError("vllm remote wait has no pending actor wait refs before completion")
-                timeout_s = configured_ray_get_timeout_s()
-                ready = self._result_cv.wait_for(
-                    lambda: bool(self._result_buffer) or self._error_message is not None or self._finished,
-                    timeout=timeout_s,
-                )
-                if not ready:
-                    raise RuntimeError("vllm remote wait exceeded query deadline")
+            while not self._result_buffer and self._error_message is None and not self._finished:
+                self._drain_queued_submit_refs()
+                self._drain_queued_wait_refs()
+                if self._result_buffer or self._error_message is not None or self._finished:
+                    break
+                self._ensure_remote_wait_refs()
+                should_mark_finished = False
+                with self._result_cv:
+                    pending = any(ref is not None for ref in self._wait_refs_by_actor)
+                    if not pending and self._finished_submitting_flag:
+                        if sum(self._results_per_actor) >= sum(self._submit_per_actor):
+                            should_mark_finished = True
+                        else:
+                            raise RuntimeError("vllm remote wait has no pending actor wait refs before completion")
+                    if not should_mark_finished:
+                        ready = self._result_cv.wait_for(
+                            lambda: (
+                                bool(self._result_buffer)
+                                or bool(self._ready_submit_refs)
+                                or bool(self._ready_wait_refs)
+                                or self._error_message is not None
+                                or self._finished
+                            ),
+                            timeout=configured_ray_get_timeout_s(),
+                        )
+                        if not ready:
+                            raise RuntimeError("vllm remote wait exceeded query deadline")
+                if should_mark_finished:
+                    self._mark_finished()
+                    break
         except Exception as exc:
             self._record_error(exc)
         if self._error_message is not None:
             raise RuntimeError(f"vllm remote task failed: {self._error_message}")
 
     def shutdown(self) -> None:
-        if self._shutdown_called:
-            return
-        self._shutdown_called = True
-        completion_error: Exception | None = None
-        try:
-            if not self._finished_submitting_flag:
-                self.finished_submitting()
-        except Exception as exc:
-            completion_error = exc
-        finally:
-            self._mark_finished()
-        if completion_error is not None:
-            raise completion_error
+        with self._lifecycle_lock:
+            if self._shutdown_complete:
+                return
+            completed_successfully = (
+                self._finished
+                and self._error_message is None
+                and self._finished_submitting_flag
+                and sum(self._results_per_actor) >= sum(self._submit_per_actor)
+            )
+            self._shutdown_called = True
+            errors: list[Exception] = []
+            try:
+                if not self._finished_submitting_flag:
+                    self.finished_submitting()
+            except Exception as exc:
+                errors.append(exc)
+            if sum(self._results_per_actor) < sum(self._submit_per_actor):
+                try:
+                    self._abort_actor_state()
+                except Exception as exc:
+                    errors.append(exc)
+            try:
+                self._report_router_completion()
+            except Exception as exc:
+                errors.append(exc)
+            try:
+                self._release_outstanding_inflight()
+            except Exception as exc:
+                errors.append(exc)
+            try:
+                self._release_actor_state()
+            except Exception as exc:
+                errors.append(exc)
+            self._cancel_remote_refs()
+            with self._result_cv:
+                self._finished = True
+                self._wait_refs_by_actor = [None] * len(self.llm_actors)
+                self._submit_refs.clear()
+                self._ready_wait_refs.clear()
+                self._ready_submit_refs.clear()
+            owner_terminated_pool = False
+            try:
+                # Test doubles and older embedders may provide the same owner
+                # protocol without being an LLMActors instance.
+                actors_owner: Any = self._actors_owner
+                if isinstance(actors_owner, LLMActors):
+                    actors_owner.shutdown()
+                    owner_terminated_pool = (
+                        actors_owner._shutdown_complete
+                        and not actors_owner.llm_actors
+                        and actors_owner.router_actor is None
+                    )
+                else:
+                    actors_owner.shutdown()
+            except Exception as exc:
+                errors.append(exc)
+            if owner_terminated_pool:
+                # Once the query-owned infrastructure is gone, earlier terminal
+                # RPC failures cannot leave actor/router state behind, so they
+                # no longer represent incomplete cleanup.
+                errors.clear()
+            self._shutdown_complete = not errors
+            if errors and completed_successfully:
+                self._warn_incomplete_terminal_cleanup(errors)
+            self._notify_state_change(force=True)
+            if errors and not completed_successfully:
+                raise RuntimeError("vllm remote shutdown incomplete: " + "; ".join(str(error) for error in errors))
 
 
 class PrefixRouter:
-    def __init__(self, llm_actors: list[Any], _load_balance_threshold: int, _max_recent_prefixes: int = 8):
+    def __init__(
+        self,
+        llm_actors: list[Any],
+        load_balance_threshold: int,
+        max_recent_prefixes: int = 8,
+    ):
+        if not llm_actors:
+            raise ValueError("vllm PrefixRouter requires at least one actor")
         self.llm_actors = llm_actors
-        self.unfinished_actors = 0
+        self.load_balance_threshold = int(load_balance_threshold)
+        self.max_recent_prefixes = max(1, int(max_recent_prefixes))
+        # This is the authoritative cross-executor reserved-prompt count used
+        # for routing; worker-local mirrors must not influence actor selection.
+        self.inflight = [0] * len(llm_actors)
+        # Prefix affinity is a bounded LRU map so sticky routing cannot retain
+        # an unbounded set of prompt prefixes.
+        self._prefix_affinity: OrderedDict[str, int] = OrderedDict()
+        # Each reservation belongs to one executor and actor, and records the
+        # count still requiring completion or rollback.
+        self._reservations: dict[str, dict[str, Any]] = {}
+        self._active_executors: set[str] = set()
+        # Completed IDs are retained as bounded tombstones, making duplicate
+        # completion idempotent while rejecting accidental ID reuse.
+        self._completed_executors: OrderedDict[str, None] = OrderedDict()
+        # Operation-ID caches replay the original result for retried route and
+        # release RPCs, providing exact-once state mutation over at-least-once calls.
+        self._route_operations: OrderedDict[str, tuple[tuple[Any, ...], dict[str, Any]]] = OrderedDict()
+        self._release_operations: OrderedDict[str, tuple[tuple[Any, ...], int]] = OrderedDict()
+        # All routing, reservation, lifecycle, and idempotency state above is
+        # mutated under one lock so decisions observe one coherent snapshot.
+        self._lock = threading.Lock()
 
-    def report_start(self) -> None:
-        self.unfinished_actors += 1
+    @staticmethod
+    def _trim(mapping: OrderedDict[Any, Any], limit: int) -> None:
+        while len(mapping) > limit:
+            mapping.popitem(last=False)
 
-    def report_completion(self) -> None:
-        if self.unfinished_actors <= 0:
-            raise RuntimeError("vllm router received completion without a matching start")
-        self.unfinished_actors -= 1
-        if self.unfinished_actors == 0:
-            for actor in self.llm_actors:
-                resolve_object_refs_blocking(actor.finished_submitting.remote())
+    def report_start(self, executor_id: str) -> bool:
+        executor_id = str(executor_id)
+        with self._lock:
+            if executor_id in self._active_executors:
+                return False
+            if executor_id in self._completed_executors:
+                raise RuntimeError("vllm router executor was already completed")
+            self._active_executors.add(executor_id)
+            return True
+
+    def cancel_executor_start(self, executor_id: str) -> bool:
+        with self._lock:
+            executor_id = str(executor_id)
+            existed = executor_id in self._active_executors
+            self._active_executors.discard(executor_id)
+            return existed
+
+    def report_completion(self, executor_id: str) -> bool:
+        executor_id = str(executor_id)
+        with self._lock:
+            if executor_id in self._completed_executors:
+                self._completed_executors.move_to_end(executor_id)
+                return False
+            if executor_id not in self._active_executors:
+                raise RuntimeError("vllm router received completion without a matching start")
+            self._active_executors.remove(executor_id)
+            self._completed_executors[executor_id] = None
+            self._trim(self._completed_executors, 4096)
+            return True
+
+    def _route_and_reserve_locked(self, prefix: str | None, prompt_count: Any, executor_id: str) -> dict[str, Any]:
+        executor_id = str(executor_id)
+        if executor_id not in self._active_executors:
+            raise RuntimeError("vllm router executor is not active")
+        if isinstance(prompt_count, bool) or not isinstance(prompt_count, Integral) or prompt_count <= 0:
+            raise ValueError("vllm prompt_count must be a positive integer")
+        prefix = None if prefix is None else str(prefix)
+        min_actor = min(range(len(self.inflight)), key=self.inflight.__getitem__)
+        if prefix is None:
+            actor_idx = min_actor
+            reason = "no_prefix"
+        elif prefix not in self._prefix_affinity:
+            actor_idx = min_actor
+            reason = "initial"
+            self._prefix_affinity[prefix] = actor_idx
+        else:
+            actor_idx = self._prefix_affinity[prefix]
+            if self.inflight[actor_idx] <= self.inflight[min_actor] + self.load_balance_threshold:
+                reason = "sticky"
+            else:
+                actor_idx = min_actor
+                reason = "load_balance"
+                self._prefix_affinity[prefix] = actor_idx
+            self._prefix_affinity.move_to_end(prefix)
+        self._trim(self._prefix_affinity, self.max_recent_prefixes)
+        reservation_id = str(uuid.uuid4())
+        count = int(prompt_count)
+        self.inflight[actor_idx] += count
+        self._reservations[reservation_id] = {
+            "actor_idx": actor_idx,
+            "remaining": count,
+            "executor_id": executor_id,
+        }
+        return {
+            "reservation_id": reservation_id,
+            "actor_idx": actor_idx,
+            "route_reason": reason,
+            "prompt_count": count,
+        }
+
+    def route_and_reserve(self, prefix: str | None, prompt_count: int, executor_id: str) -> dict[str, Any]:
+        with self._lock:
+            return self._route_and_reserve_locked(prefix, prompt_count, executor_id)
+
+    def route_and_reserve_once(
+        self,
+        prefix: str | None,
+        prompt_count: int,
+        executor_id: str,
+        operation_id: str,
+    ) -> dict[str, Any]:
+        token = str(operation_id)
+        if not token:
+            raise ValueError("vllm route operation_id must not be empty")
+        signature = (None if prefix is None else str(prefix), int(prompt_count), str(executor_id))
+        with self._lock:
+            previous = self._route_operations.get(token)
+            if previous is not None:
+                if previous[0] != signature:
+                    raise RuntimeError("vllm route operation_id was reused with different arguments")
+                self._route_operations.move_to_end(token)
+                return {**previous[1], "operation_id": token, "replayed": True}
+            decision = self._route_and_reserve_locked(prefix, prompt_count, executor_id)
+            self._route_operations[token] = (signature, dict(decision))
+            self._trim(self._route_operations, 8192)
+            return {**decision, "operation_id": token, "replayed": False}
+
+    def _release_locked(self, reservation_id: str, count: int | None) -> int:
+        reservation = self._reservations.get(str(reservation_id))
+        if reservation is None:
+            return 0
+        remaining = int(reservation["remaining"])
+        release_count = remaining if count is None else min(remaining, max(0, int(count)))
+        if release_count <= 0:
+            return 0
+        actor_idx = int(reservation["actor_idx"])
+        reservation["remaining"] = remaining - release_count
+        self.inflight[actor_idx] = max(0, self.inflight[actor_idx] - release_count)
+        if reservation["remaining"] == 0:
+            self._reservations.pop(str(reservation_id), None)
+        return release_count
+
+    def complete(self, reservation_id: str, count: int) -> int:
+        with self._lock:
+            return self._release_locked(reservation_id, count)
+
+    def rollback(self, reservation_id: str, count: int | None = None) -> int:
+        with self._lock:
+            return self._release_locked(reservation_id, count)
+
+    def _release_once(
+        self,
+        operation_id: str,
+        signature: tuple[Any, ...],
+        release: Callable[[], int],
+    ) -> dict[str, Any]:
+        token = str(operation_id)
+        if not token:
+            raise ValueError("vllm terminal operation_id must not be empty")
+        previous = self._release_operations.get(token)
+        if previous is not None:
+            if previous[0] != signature:
+                raise RuntimeError("vllm terminal operation_id was reused with different arguments")
+            self._release_operations.move_to_end(token)
+            return {"operation_id": token, "released": previous[1], "replayed": True}
+        released = release()
+        self._release_operations[token] = (signature, released)
+        self._trim(self._release_operations, 8192)
+        return {"operation_id": token, "released": released, "replayed": False}
+
+    def complete_once(self, reservation_id: str, count: int, operation_id: str) -> dict[str, Any]:
+        with self._lock:
+            signature = ("complete", str(reservation_id), int(count))
+            return self._release_once(operation_id, signature, lambda: self._release_locked(reservation_id, count))
+
+    def rollback_once(self, reservation_id: str, count: int, operation_id: str) -> dict[str, Any]:
+        with self._lock:
+            signature = ("rollback", str(reservation_id), int(count))
+            return self._release_once(operation_id, signature, lambda: self._release_locked(reservation_id, count))
+
+    def release_executor(self, executor_id: str) -> int:
+        with self._lock:
+            executor_id = str(executor_id)
+            reservation_ids = [
+                reservation_id
+                for reservation_id, reservation in self._reservations.items()
+                if reservation["executor_id"] == executor_id
+            ]
+            return sum(self._release_locked(reservation_id, None) for reservation_id in reservation_ids)
+
+    def release_executor_once(self, executor_id: str, operation_id: str) -> dict[str, Any]:
+        with self._lock:
+            executor_id = str(executor_id)
+
+            def release() -> int:
+                reservation_ids = [
+                    reservation_id
+                    for reservation_id, reservation in self._reservations.items()
+                    if reservation["executor_id"] == executor_id
+                ]
+                return sum(self._release_locked(reservation_id, None) for reservation_id in reservation_ids)
+
+            return self._release_once(operation_id, ("release_executor", executor_id), release)
 
 
 class LLMActors:
@@ -823,6 +1848,8 @@ class LLMActors:
     ):
         import ray
 
+        self.owned = True
+        self._shutdown_complete = False
         LocalVLLMExecutorActor = ray.remote(num_gpus=gpus_per_actor, max_restarts=4)(RayLocalVLLMExecutor)
         PrefixRouterActor = ray.remote(PrefixRouter)
 
@@ -854,12 +1881,59 @@ class LLMActors:
             ]
             self.router_actor = PrefixRouterActor.remote(self.llm_actors, load_balance_threshold)
 
+    @staticmethod
+    def _kill_handles(
+        ray_module: Any,
+        llm_actors: list[Any],
+        router_actor: Any | None,
+    ) -> tuple[list[Any], Any | None, list[str]]:
+        remaining_actors: list[Any] = []
+        remaining_router = router_actor
+        errors: list[str] = []
+        handles = [("actor", actor) for actor in llm_actors]
+        if router_actor is not None:
+            handles.append(("router", router_actor))
+        for kind, handle in handles:
+            try:
+                try:
+                    ray_module.kill(handle, no_restart=True)
+                except TypeError:
+                    ray_module.kill(handle)
+            except Exception as exc:
+                errors.append(f"{kind} kill failed: {type(exc).__name__}: {exc}")
+                if kind == "actor":
+                    remaining_actors.append(handle)
+                else:
+                    remaining_router = handle
+            else:
+                if kind == "router":
+                    remaining_router = None
+        return remaining_actors, remaining_router, errors
+
     @classmethod
     def _from_handles(cls, llm_actors: list[Any], router_actor: Any) -> LLMActors:
         instance = cls.__new__(cls)
         instance.llm_actors = llm_actors
         instance.router_actor = router_actor
+        instance.owned = False
+        instance._shutdown_complete = False
         return instance
+
+    def shutdown(self) -> None:
+        """Release anonymous actors owned by this executor exactly once."""
+        if self._shutdown_complete:
+            return
+        if not self.owned:
+            self._shutdown_complete = True
+            return
+        import ray
+
+        remaining_actors, remaining_router, errors = self._kill_handles(ray, self.llm_actors, self.router_actor)
+        self.llm_actors = remaining_actors
+        self.router_actor = remaining_router
+        self._shutdown_complete = not remaining_actors and remaining_router is None
+        if errors:
+            raise RuntimeError("vLLM pool shutdown incomplete: " + "; ".join(errors))
 
     @classmethod
     def get_or_create_named(
@@ -897,6 +1971,8 @@ class LLMActors:
         found = (1 if router_actor is not None else 0) + len(llm_actors)
         expected = 1 + concurrency
         if found == expected:
+            # TODO(next PR): validate immutable pool configuration and add
+            # explicit plan-owned leases before broadening named-pool reuse.
             return cls._from_handles(llm_actors, router_actor)
         if found:
             raise RuntimeError(
@@ -943,6 +2019,8 @@ class LLMActors:
             raise RuntimeError(
                 f"Named vLLM actor pool '{name_prefix}' is incomplete; missing actors: {', '.join(missing)}"
             )
+        # TODO(next PR): validate that worker lookup matches the named pool's
+        # immutable model/topology configuration.
         return cls._from_handles(llm_actors, router_actor)
 
 
@@ -965,6 +2043,52 @@ _DEFAULTS: dict[str, Any] = {
 }
 
 
+def _restore_native_secret_refs(value: Any, secrets: list[Any], used: set[int], path: str) -> Any:
+    if isinstance(value, dict):
+        if _NATIVE_SECRET_REF_KEY in value:
+            if set(value) != {_NATIVE_SECRET_REF_KEY}:
+                raise ValueError(f"vllm native secret reference at {path} has unexpected fields")
+            index = value[_NATIVE_SECRET_REF_KEY]
+            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(secrets):
+                raise ValueError(f"vllm native secret reference at {path} has an invalid index")
+            if index in used:
+                raise ValueError(f"vllm native secret reference at {path} reuses index {index}")
+            used.add(index)
+            return secrets[index]
+        return {key: _restore_native_secret_refs(item, secrets, used, f"{path}.{key}") for key, item in value.items()}
+    if isinstance(value, list):
+        return [
+            _restore_native_secret_refs(item, secrets, used, f"{path}[{index}]") for index, item in enumerate(value)
+        ]
+    return value
+
+
+def _restore_native_vllm_secrets(options: dict[str, Any]) -> dict[str, Any]:
+    public_options = dict(options)
+    secret_payload = public_options.pop(_NATIVE_OPTIONS_NORMALIZED_SECRET_KEY, None)
+    if secret_payload is None:
+        return public_options
+    if not isinstance(secret_payload, bytes):
+        raise TypeError("vllm normalized secret payload must be bytes")
+
+    payload = _load_vllm_protocol_json(secret_payload, "vllm native secret payload")
+    if not isinstance(payload, dict) or set(payload) != _NATIVE_SECRET_PAYLOAD_KEYS:
+        raise ValueError("vllm native secret payload must contain only payload_version and values")
+    version = payload[_NATIVE_SECRET_PAYLOAD_VERSION_KEY]
+    if isinstance(version, bool) or not isinstance(version, int) or version != _NATIVE_OPTIONS_PAYLOAD_VERSION:
+        raise ValueError(f"unsupported vllm native secret payload version: {version!r}")
+    secrets = payload[_NATIVE_SECRET_PAYLOAD_VALUES_KEY]
+    if not isinstance(secrets, list):
+        raise ValueError("vllm native secret payload values must be a list")
+
+    used: set[int] = set()
+    restored = _restore_native_secret_refs(public_options, secrets, used, "options")
+    if used != set(range(len(secrets))):
+        raise ValueError("vllm native secret payload contains unreferenced values")
+    assert isinstance(restored, dict)
+    return restored
+
+
 def _integer_option(name: str, value: Any, *, minimum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral):
         raise ValueError(f"vllm {name} must be an integer")
@@ -975,8 +2099,14 @@ def _integer_option(name: str, value: Any, *, minimum: int) -> int:
     return result
 
 
+def _boolean_option(name: str, value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"vllm {name} must be a boolean")
+    return value
+
+
 def _fractional_gpu_option(value: Any) -> int | float:
-    if isinstance(value, bool) or not isinstance(value, Real):
+    if isinstance(value, bool) or not isinstance(value, (Real, Decimal)):
         raise ValueError("vllm gpus_per_actor must be a finite positive number")
     result = float(value)
     if not math.isfinite(result) or result <= 0:
@@ -989,7 +2119,7 @@ def _fractional_gpu_option(value: Any) -> int | float:
 
 
 def _unit_interval_option(name: str, value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
+    if isinstance(value, bool) or not isinstance(value, (Real, Decimal)):
         raise ValueError(f"vllm {name} must be a finite number in [0, 1]")
     result = float(value)
     if not math.isfinite(result) or not 0.0 <= result <= 1.0:
@@ -1013,6 +2143,9 @@ def normalize_options(options: Any | None) -> dict[str, Any]:
         except Exception as exc:
             raise TypeError("vllm options must be a dict or JSON string") from exc
 
+    if options is not None:
+        options = _unpack_native_options_envelope(options)
+
     if options is not None and options.get("ray_address") is not None:
         raise ValueError("vLLM ray_address has been removed; configure RayRunner instead")
 
@@ -1020,8 +2153,16 @@ def normalize_options(options: Any | None) -> dict[str, Any]:
         merged.update(options)
     merged["concurrency"] = _integer_option("concurrency", merged["concurrency"], minimum=1)
     merged["gpus_per_actor"] = _fractional_gpu_option(merged["gpus_per_actor"])
-    if not isinstance(merged["do_prefix_routing"], bool):
-        raise ValueError("vllm do_prefix_routing must be a boolean")
+    for name in (
+        "do_prefix_routing",
+        "use_ray",
+        "use_threading",
+        "require_ray_worker",
+        "ray_worker_only",
+        "_force_background_thread",
+    ):
+        if name in merged:
+            merged[name] = _boolean_option(name, merged[name])
     merged["max_buffer_size"] = _integer_option("max_buffer_size", merged["max_buffer_size"], minimum=0)
     merged["min_bucket_size"] = _integer_option("min_bucket_size", merged["min_bucket_size"], minimum=0)
     merged["prefix_match_threshold"] = _unit_interval_option("prefix_match_threshold", merged["prefix_match_threshold"])
@@ -1088,32 +2229,24 @@ def ensure_named_vllm_pools_for_plan(plan: Any, conn: Any = None) -> tuple[list[
         raise RuntimeError("Ray vLLM actor creation requires an initialized RayRunner runtime")
 
     created: list[LLMActors] = []
+    # TODO(next PR): make precreation transactional and hand plan-owned pool
+    # cleanup to the Driver/Runner teardown chain, including retry ownership.
     for node in vllm_nodes:
         pool_name = str(node["pool_name"])
         model = str(node.get("model", ""))
-
-        # Parse options through normalize_options to get clean defaults.
-        raw_opts = node.get("options")
-        opts = normalize_options(raw_opts)
-
+        opts = _restore_native_vllm_secrets(normalize_options(node.get("options")))
         engine_args = _apply_engine_defaults(dict(opts.get("engine_args") or {}))
         generate_args = dict(opts.get("generate_args") or {})
-        on_error = str(opts.get("on_error", "raise"))
-        gpus_per_actor = opts["gpus_per_actor"]
-        concurrency = max(1, int(opts.get("concurrency", 1)))
-        load_balance_threshold = max(0, int(opts.get("load_balance_threshold", 32)))
-        engine_init_timeout_s = _vllm_engine_init_timeout_s(opts.get("engine_init_timeout_s"))
-
         actors_obj = LLMActors.get_or_create_named(
             model=model,
             engine_args=engine_args,
             generate_args=generate_args,
-            on_error=on_error,
-            gpus_per_actor=gpus_per_actor,
-            concurrency=concurrency,
-            load_balance_threshold=load_balance_threshold,
+            on_error=str(opts["on_error"]),
+            gpus_per_actor=opts["gpus_per_actor"],
+            concurrency=opts["concurrency"],
+            load_balance_threshold=opts["load_balance_threshold"],
             name_prefix=pool_name,
-            engine_init_timeout_s=engine_init_timeout_s,
+            engine_init_timeout_s=opts["engine_init_timeout_s"],
         )
         created.append(actors_obj)
 
@@ -1136,18 +2269,14 @@ def _apply_engine_defaults(engine_args: dict[str, Any]) -> dict[str, Any]:
 
 def build_executor(model: str, options: Any | None) -> VLLMExecutor:
     opts = normalize_options(options)
-    engine_args = _apply_engine_defaults(dict(opts["engine_args"]))
-    generate_args = dict(opts["generate_args"])
     pool_name = opts.get("ray_actor_pool_name")
-    on_error = opts.get("on_error", "raise")
-    require_ray_worker = bool(opts.get("require_ray_worker") or opts.get("ray_worker_only"))
+    require_ray_worker = opts.get("require_ray_worker", False) or opts.get("ray_worker_only", False)
     if require_ray_worker and not _is_ray_worker():
         raise RuntimeError("vllm executor must be constructed on a Ray worker when require_ray_worker is set")
 
     # `use_ray` is the only routing switch. Pool/address metadata only
     # configures Ray-backed execution after it has been explicitly selected.
-    use_ray = bool(opts.get("use_ray"))
-    if use_ray:
+    if opts["use_ray"]:
         import ray
 
         if not ray.is_initialized():
@@ -1158,24 +2287,34 @@ def build_executor(model: str, options: Any | None) -> VLLMExecutor:
                 name_prefix=pool_name,
             )
         else:
+            opts = _restore_native_vllm_secrets(opts)
+            engine_args = _apply_engine_defaults(dict(opts["engine_args"]))
+            generate_args = dict(opts["generate_args"])
             llm_actors = LLMActors(
                 model=model,
                 engine_args=engine_args,
                 generate_args=generate_args,
-                on_error=on_error,
+                on_error=opts.get("on_error", "raise"),
                 gpus_per_actor=opts["gpus_per_actor"],
                 concurrency=opts["concurrency"],
                 load_balance_threshold=opts["load_balance_threshold"],
                 engine_init_timeout_s=opts["engine_init_timeout_s"],
             )
-        return RemoteVLLMExecutor(llm_actors, pool_name=pool_name)
+        try:
+            return RemoteVLLMExecutor(llm_actors, pool_name=pool_name)
+        except Exception:
+            llm_actors.shutdown()
+            raise
 
+    opts = _restore_native_vllm_secrets(opts)
+    engine_args = _apply_engine_defaults(dict(opts["engine_args"]))
+    generate_args = dict(opts["generate_args"])
     return LocalVLLMExecutor(
         model,
         engine_args,
         generate_args,
-        on_error=on_error,
-        use_threading=bool(opts.get("use_threading", True)),
+        on_error=opts.get("on_error", "raise"),
+        use_threading=opts["use_threading"],
         engine_init_timeout_s=opts["engine_init_timeout_s"],
-        force_background_thread=bool(opts.get("_force_background_thread", False)),
+        force_background_thread=opts.get("_force_background_thread", False),
     )

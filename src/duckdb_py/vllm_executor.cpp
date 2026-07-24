@@ -189,6 +189,9 @@ static unique_ptr<DataChunk> ConvertArrowTableToDataChunk(const py::object &tabl
 class VLLMPythonExecutor : public VLLMExecutor {
 public:
 	explicit VLLMPythonExecutor(py::object executor_p) : executor(make_uniq<RegisteredObject>(std::move(executor_p))) {
+		if (!py::hasattr(executor->obj, "register_wakeup_callback")) {
+			throw InvalidInputException("vllm executor must implement register_wakeup_callback");
+		}
 	}
 
 	~VLLMPythonExecutor() override {
@@ -282,9 +285,6 @@ public:
 
 	VLLMWakeupRegistrationResult RegisterWakeup(InterruptState &interrupt_state) override {
 		PythonGILWrapper gil;
-		if (!py::hasattr(executor->obj, "register_wakeup_callback")) {
-			return VLLMWakeupRegistrationResult::UNSUPPORTED;
-		}
 		try {
 			auto callback = py::cpp_function([interrupt_state]() { interrupt_state.Callback(); });
 			auto armed = executor->obj.attr("register_wakeup_callback")(std::move(callback));
