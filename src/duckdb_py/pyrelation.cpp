@@ -294,7 +294,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Repartition(const py::args &args,
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::LocalExchange(const py::object &num_partitions_obj) {
 	AssertRelation();
-	rel->context->GetContext();
+	(void)rel->context->GetContext(); // Throws if the source connection is closed.
 	idx_t num_partitions = 0;
 	if (!num_partitions_obj.is_none()) {
 		num_partitions = num_partitions_obj.cast<idx_t>();
