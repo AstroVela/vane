@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.protocols import PrompterDescriptor
 from vane.ai.provider import Provider
-from vane.ai.typing import UDFOptions
+from vane.ai.typing import UDFOptions, api_worker_options
 
 if TYPE_CHECKING:
     from vane.ai.protocols import Prompter
@@ -111,9 +111,8 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
         return UDFOptions(
             max_retries=0,  # anthropic client handles retries internally
             on_error=self.prompt_options.get("on_error", "raise"),
-            actor_number=self.prompt_options.get("actor_number"),
-            num_gpus=self.prompt_options.get("num_gpus"),
             max_api_concurrency=self.prompt_options.get("max_api_concurrency", 16),
+            **api_worker_options(self.prompt_options),
         )
 
     def instantiate(self) -> Prompter:

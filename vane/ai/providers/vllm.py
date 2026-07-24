@@ -127,6 +127,14 @@ class VLLMPrompterDescriptor(PrompterDescriptor):
     When ``return_format`` is set (Pydantic model or JSON schema dict),
     the JSON schema is injected as ``structured_outputs`` in the executor's
     ``SamplingParams``.
+
+    ``on_error`` vocabulary: vane uses ``{"raise", "log", "ignore"}`` while
+    the vLLM engine uses ``{"raise", "log", "null"}``. Both spellings are
+    accepted in ``vllm_options`` and translated at each boundary:
+    :meth:`get_udf_options` maps the engine's ``"null"`` to ``"ignore"`` (so
+    ``"null"`` never leaks into :class:`UDFOptions`), and
+    :class:`VLLMPrompter` maps vane's ``"ignore"`` to ``"null"`` before the
+    options reach ``build_executor``.
     """
 
     provider_name: str = "vllm"
@@ -149,12 +157,15 @@ class VLLMPrompterDescriptor(PrompterDescriptor):
 
     def get_udf_options(self) -> UDFOptions:
         opts = self.vllm_options
+        on_error = opts.get("on_error", "raise")
+        if on_error == "null":
+            on_error = "ignore"  # engine vocabulary → vane vocabulary
         return UDFOptions(
             batch_size=opts.get("batch_size"),
             num_gpus=opts.get("gpus_per_actor", 1),
             actor_number=opts.get("actor_number"),
             max_retries=0,  # vLLM engine handles retries
-            on_error=opts.get("on_error", "raise"),
+            on_error=on_error,
         )
 
     def instantiate(self) -> VLLMPrompter:
@@ -189,6 +200,9 @@ class VLLMPrompter:
         # plain dicts from direct callers pass through unchanged.
         options = unwrap_sensitive_options(vllm_options or {})
         self._options = {k: v for k, v in options.items() if k not in {"actor_number"}}
+        if self._options.get("on_error") == "ignore":
+            # vane vocabulary → engine vocabulary (the engine rejects "ignore").
+            self._options["on_error"] = "null"
         self._executor = None
 
         # Pre-compute JSON schema if return_format is set, so the executor

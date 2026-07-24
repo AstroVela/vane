@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import time
 from typing import TYPE_CHECKING, Any, Literal, overload
 
@@ -63,6 +64,8 @@ from vane.ai.typing import UDFOptions
 if TYPE_CHECKING:
     from vane import Expression, Relation
     from vane.ai.provider import Provider
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_provider(provider: str | Provider | None, default: str = "transformers") -> Provider:
@@ -109,6 +112,37 @@ class RetryAfterError(Exception):
         self.retry_after = retry_after
         self.__cause__ = original
 
+    def __reduce__(self) -> tuple[Any, tuple[float, Exception | None]]:
+        # The default exception reduction rebuilds from ``args`` (a string),
+        # which turns ``retry_after`` into text and drops ``__cause__`` across
+        # pickle / worker boundaries. Rebuild through ``__init__`` instead.
+        return (RetryAfterError, (self.retry_after, self.__cause__))
+
+
+# Sentinel returned by the retry helpers when a batch call failed and its
+# result was substituted (``on_error`` != "raise"). Distinguishes a real
+# ``None`` result from a substituted failure so wrappers can fall back to
+# per-row attempts.
+_BATCH_CALL_FAILED = object()
+
+
+def _log_substituted_failure(exc: Exception, max_retries: int, on_error: str) -> None:
+    """Log a substituted failure without echoing option mappings or payloads.
+
+    Only the exception class and message are logged; provider exceptions carry
+    no plaintext secrets (vane#105). The wording stays neutral because the
+    caller's next step differs: batch-level failures fall back to per-row
+    attempts, per-row failures substitute the default.
+    """
+    cause = exc.__cause__ if isinstance(exc, RetryAfterError) and exc.__cause__ else exc
+    logger.warning(
+        "vane.ai call failed after %d attempt(s) (on_error=%r): %s: %s",
+        1 + max(0, max_retries),
+        on_error,
+        type(cause).__name__,
+        cause,
+    )
+
 
 def _retry_call(
     fn: Any,
@@ -150,6 +184,8 @@ def _retry_call(
         if isinstance(last_exc, RetryAfterError) and last_exc.__cause__:
             raise last_exc.__cause__
         raise last_exc
+    if on_error == "log":
+        _log_substituted_failure(last_exc, max_retries, on_error)
     return default
 
 
@@ -180,6 +216,8 @@ async def _retry_call_async(
         if isinstance(last_exc, RetryAfterError) and last_exc.__cause__:
             raise last_exc.__cause__
         raise last_exc
+    if on_error == "log":
+        _log_substituted_failure(last_exc, max_retries, on_error)
     return default
 
 
@@ -372,7 +410,14 @@ def _embedding_zero_size(descriptor: Any, arrow_type: Any | None) -> int:
 
 
 class _EmbedTextBatch:
-    """Stateful wrapper — model loaded once per actor via instantiate()."""
+    """Stateful wrapper — model loaded once per actor via instantiate().
+
+    Failure handling: batch embed calls (chunked and non-chunked) go through
+    the retry helpers with the wrapper's ``max_retries``/``on_error``. When a
+    whole-batch call fails with ``on_error`` != "raise", rows are retried
+    individually so only genuinely-bad rows receive the zero/None
+    substitution; the output row count always matches the input.
+    """
 
     def __init__(
         self,
@@ -425,8 +470,11 @@ class _EmbedTextBatch:
                 texts,
                 max_retries=self._max_retries,
                 on_error=self._on_error,
+                default=_BATCH_CALL_FAILED,
             )
-            if result is None:
+            if result is _BATCH_CALL_FAILED:
+                result = self._embed_rows_individually(texts)
+            elif result is None:
                 result = self._zero_fill(len(texts))
 
         if self._normalize:
@@ -439,8 +487,42 @@ class _EmbedTextBatch:
         )
         return pa.table({self._output_column: embeddings})
 
+    def _substitute_row(self) -> Any:
+        return self._zero_fill(1)[0]
+
+    def _embed_rows_individually(self, texts: list[str]) -> list[Any]:
+        """Per-row fallback after a failed batch call (``on_error`` != "raise").
+
+        Each row gets a single attempt — the batch call already exhausted the
+        retry budget — and only rows that fail individually receive the
+        zero/None substitution. A malformed response (wrong row count) is
+        treated as that row's failure.
+        """
+        embed = self._ensure_embedder().embed_text
+        results: list[Any] = []
+        for text in texts:
+            row = _retry_call(
+                embed,
+                [text],
+                max_retries=0,
+                on_error=self._on_error,
+                default=_BATCH_CALL_FAILED,
+            )
+            if row is _BATCH_CALL_FAILED or not isinstance(row, (list, tuple)) or len(row) != 1:
+                results.append(self._substitute_row())
+            else:
+                results.append(row[0])
+        return results
+
     def _embed_with_chunking(self, texts: list[str]) -> list[Any]:
-        """Embed texts with automatic chunking for long inputs."""
+        """Embed texts with automatic chunking for long inputs.
+
+        The chunk batch goes through :func:`_retry_call` with the wrapper's
+        ``max_retries``/``on_error``. When the whole-batch call fails with
+        ``on_error`` != "raise", each text's chunks are retried individually so
+        only genuinely-bad rows get the zero/None substitution; the output row
+        count always matches the input.
+        """
         # Build chunk plan: (original_idx, chunk_text, chunk_weight)
         all_chunks: list[str] = []
         chunk_map: list[list[tuple[int, float]]] = []  # per-original-text
@@ -458,9 +540,15 @@ class _EmbedTextBatch:
             chunk_map.append(entry)
 
         # Embed all chunks in one batch
-        chunk_embeddings = self._ensure_embedder().embed_text(all_chunks)
-        if inspect.isawaitable(chunk_embeddings):
-            chunk_embeddings = _run_async(chunk_embeddings)
+        chunk_embeddings = _retry_call(
+            self._ensure_embedder().embed_text,
+            all_chunks,
+            max_retries=self._max_retries,
+            on_error=self._on_error,
+            default=_BATCH_CALL_FAILED,
+        )
+        if chunk_embeddings is _BATCH_CALL_FAILED:
+            return self._embed_chunk_groups_individually(all_chunks, chunk_map)
 
         # Reassemble: weighted average for multi-chunk texts
         results: list[Any] = []
@@ -471,6 +559,36 @@ class _EmbedTextBatch:
                 embs = [chunk_embeddings[idx] for idx, _ in entry]
                 weights = [w for _, w in entry]
                 results.append(_weighted_average_embeddings(embs, weights))
+        return results
+
+    def _embed_chunk_groups_individually(
+        self,
+        all_chunks: list[str],
+        chunk_map: list[list[tuple[int, float]]],
+    ) -> list[Any]:
+        """Per-row fallback for the chunked path (``on_error`` != "raise").
+
+        Each row's chunk group gets a single attempt — the batch call already
+        exhausted the retry budget. A malformed response (wrong chunk count)
+        is treated as that row's failure.
+        """
+        embed = self._ensure_embedder().embed_text
+        results: list[Any] = []
+        for entry in chunk_map:
+            chunks = [all_chunks[idx] for idx, _ in entry]
+            embs = _retry_call(
+                embed,
+                chunks,
+                max_retries=0,
+                on_error=self._on_error,
+                default=_BATCH_CALL_FAILED,
+            )
+            if embs is _BATCH_CALL_FAILED or not isinstance(embs, (list, tuple)) or len(embs) != len(chunks):
+                results.append(self._substitute_row())
+            elif len(entry) == 1:
+                results.append(embs[0])
+            else:
+                results.append(_weighted_average_embeddings(embs, [w for _, w in entry]))
         return results
 
 
@@ -518,7 +636,13 @@ class _PromptBatch:
     Supports both plain text and structured output (Pydantic models).
     When ``return_format`` is set, responses are serialized to JSON strings.
     When ``image_columns`` is set, image data from those columns is packed
-    alongside text into multimodal message tuples.
+    alongside text into multimodal message tuples. Prompters exposing only a
+    batch API (``prompt_batch``, e.g. vLLM) are text-only, so combining them
+    with ``image_columns`` raises instead of silently dropping the images.
+
+    Failure handling: when a batch-API call fails with ``on_error`` !=
+    "raise", rows are retried individually so only genuinely-bad rows are
+    substituted with ``None``.
     """
 
     def __init__(
@@ -557,6 +681,28 @@ class _PromptBatch:
 
         return json.dumps(result, default=str)
 
+    def _prompt_rows_individually(self, texts: list[str]) -> list[Any]:
+        """Per-row fallback after a failed batch-API call (``on_error`` != "raise").
+
+        Each row gets a single attempt through ``prompt_batch`` — the batch
+        call already exhausted the retry budget — and only rows that fail
+        individually are substituted with ``None``. A malformed response
+        (wrong row count) is treated as that row's failure.
+        """
+        results: list[Any] = []
+        for text in texts:
+            # Remote vLLM per-row resubmission relies on PR #163 deferring finished_submitting() to close().
+            row = _retry_call(
+                self._prompter.prompt_batch,
+                [text],
+                max_retries=0,
+                on_error=self._on_error,
+                default=_BATCH_CALL_FAILED,
+            )
+            failed = row is _BATCH_CALL_FAILED or not isinstance(row, (list, tuple)) or len(row) != 1
+            results.append(None if failed else row[0])
+        return results
+
     def __call__(self, table: pa.Table) -> pa.Table:
         if self._prompter is None:
             self._prompter = self._descriptor.instantiate()
@@ -576,13 +722,23 @@ class _PromptBatch:
 
         # Use batch API if available (e.g. vLLM's continuous batching)
         if hasattr(self._prompter, "prompt_batch"):
+            if self._image_columns:
+                raise ValueError(
+                    "image_columns is not supported with a batch-only prompter: "
+                    "the prompt_batch API (e.g. vLLM) is text-only, so image "
+                    "columns would be silently dropped. Remove image_columns or "
+                    "use a provider with per-row multimodal prompting."
+                )
             results = _retry_call(
                 self._prompter.prompt_batch,
                 texts,
                 max_retries=self._max_retries,
                 on_error=self._on_error,
+                default=_BATCH_CALL_FAILED,
             )
-            if results is None:
+            if results is _BATCH_CALL_FAILED:
+                results = self._prompt_rows_individually(texts)
+            elif results is None:
                 results = [None] * len(texts)
             if self._return_format is not None:
                 results = [self._serialize_result(r) for r in results]
@@ -921,6 +1077,7 @@ def _prompt_expression(
     """
     prov = _resolve_provider(provider, "openai")
     descriptor_options = _merge_options(provider_options, prompt_options)
+    _reject_smuggled_return_format(descriptor_options, "vane.ai.prompt expression API")
     try:
         descriptor = prov.get_prompter(model=model, system_message=system_message, **descriptor_options)
     except NotImplementedError as exc:
@@ -969,6 +1126,22 @@ def _reject_relation_only_prompt_kwargs(kwargs: dict[str, Any]) -> None:
             + ", ".join(unsupported)
             + ". Rename the output with .alias(...); use the relation API "
             "prompt(rel, column, ...) for return_format/image_columns/execution_backend."
+        )
+
+
+def _reject_smuggled_return_format(options: dict[str, Any], surface: str) -> None:
+    """Reject ``return_format`` smuggled inside merged option dicts.
+
+    A dict-borne ``return_format`` bypasses the top-level kwarg guard: the
+    prompter would return parsed objects while the batch wrapper skips
+    serialization, surfacing as an opaque ArrowInvalid in the worker. Fail
+    fast with the same message family as the top-level guard instead.
+    """
+    if "return_format" in options:
+        raise TypeError(
+            f"{surface} does not support: return_format (found inside an "
+            "options dict). Use the relation API prompt(rel, column, "
+            "return_format=...) for structured output."
         )
 
 

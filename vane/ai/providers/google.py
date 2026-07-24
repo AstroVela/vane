@@ -22,7 +22,7 @@ import numpy as np
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider
-from vane.ai.typing import EmbeddingDimensions, UDFOptions
+from vane.ai.typing import EmbeddingDimensions, UDFOptions, api_worker_options
 
 if TYPE_CHECKING:
     from vane.ai.protocols import Prompter, TextEmbedder
@@ -180,8 +180,7 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
         return UDFOptions(
             max_retries=self.embed_options.get("max_retries", 3),
             on_error=self.embed_options.get("on_error", "raise"),
-            actor_number=self.embed_options.get("actor_number"),
-            num_gpus=self.embed_options.get("num_gpus"),
+            **api_worker_options(self.embed_options),
         )
 
     def is_async(self) -> bool:
@@ -289,9 +288,8 @@ class GooglePrompterDescriptor(PrompterDescriptor):
         return UDFOptions(
             max_retries=self.prompt_options.get("max_retries", 3),
             on_error=self.prompt_options.get("on_error", "raise"),
-            actor_number=self.prompt_options.get("actor_number"),
-            num_gpus=self.prompt_options.get("num_gpus"),
             max_api_concurrency=self.prompt_options.get("max_api_concurrency", 16),
+            **api_worker_options(self.prompt_options),
         )
 
     def instantiate(self) -> Prompter:
