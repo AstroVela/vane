@@ -147,6 +147,7 @@ def resolve_object_refs_blocking(
         raise ValueError("wait_interval_s must be positive")
 
     _reject_running_event_loop()
+    restored: BaseException | None = None
     try:
         return _resolve_object_refs(
             object_refs,
@@ -156,6 +157,8 @@ def resolve_object_refs_blocking(
         )
     except BaseException as exc:
         restored = restore_remote_ray_exception(exc)
-        if restored is not None:
-            raise restored
-        raise
+        if restored is None:
+            raise
+    # Raising outside the handler keeps Python from replacing a restored
+    # implicit remote context with the local RayTaskError.
+    raise restored
