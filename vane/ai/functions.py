@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
 import time
 from typing import TYPE_CHECKING, Any, Literal, overload
 
@@ -89,6 +90,130 @@ def _run_async(coro: Any) -> Any:
     return asyncio.run(coro)
 
 
+class _PersistentLoopRunner:
+    """Drive coroutines on a single long-lived event loop owned by this instance.
+
+    AI batch wrappers cache their provider runtime (and its async SDK client)
+    across batches, so every batch must run on the same event loop: driving
+    each batch with a fresh ``asyncio.run()`` strands the cached client's
+    httpx/httpcore connection pool on a closed loop and fails intermittently
+    with ``RuntimeError: Event loop is closed`` from the second batch on.
+
+    The loop runs on a daemon thread that is created lazily on first use,
+    mirroring how wrappers lazily ``instantiate()`` their runtime. Instances
+    pickle as empty shells (the loop and thread are process-local), so an
+    unpickled wrapper on an actor re-creates the loop on first use.
+
+    ``run()`` submits via ``run_coroutine_threadsafe`` and blocks for the
+    result, so it is safe to call from a thread that already runs an event
+    loop (the coroutine executes on this runner's own thread) — preserving
+    the nested-loop safety previously provided by :func:`_run_async`.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+
+    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
+        with self._lock:
+            return self._ensure_loop_locked()
+
+    def _ensure_loop_locked(self) -> asyncio.AbstractEventLoop:
+        # is_alive() also covers fork: threads do not survive into the
+        # child process, so a forked copy transparently gets a new loop.
+        if self._loop is None or self._loop.is_closed() or self._thread is None or not self._thread.is_alive():
+            stale = self._loop
+            if stale is not None and not stale.is_closed() and not stale.is_running():
+                # No thread runs the stale loop (dead or lost in a fork), so
+                # close it to release its selector/self-pipe descriptors. A
+                # forked child inherits a loop that still *claims* to be
+                # running (the parent loop thread's state is copied even
+                # though the thread itself is not); closing such a loop
+                # raises, so skip it and accept the fd leak instead. The
+                # try/except is belt and braces for the same race.
+                try:
+                    stale.close()
+                except RuntimeError:
+                    pass
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(target=loop.run_forever, name="vane-ai-batch-loop", daemon=True)
+            thread.start()
+            self._loop = loop
+            self._thread = thread
+        return self._loop
+
+    def run(self, coro: Any) -> Any:
+        """Run *coro* on the persistent loop and return its result."""
+        # Submit while holding the lock so a concurrent close() cannot stop
+        # the loop between loop acquisition and submission.
+        with self._lock:
+            loop = self._ensure_loop_locked()
+            if threading.current_thread() is self._thread:
+                close = getattr(coro, "close", None)
+                if close is not None:
+                    close()
+                raise RuntimeError("_PersistentLoopRunner.run() must not be called from its own event-loop thread")
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return future.result()
+
+    def close(self) -> None:
+        """Stop the loop thread and close the loop. Idempotent."""
+        with self._lock:
+            loop, thread = self._loop, self._thread
+            self._loop = None
+            self._thread = None
+        if loop is None:
+            return
+        if thread is not None and thread.is_alive():
+
+            def _cancel_and_stop() -> None:
+                tasks = asyncio.all_tasks(loop)
+                for task in tasks:
+                    task.cancel()
+                if not tasks:
+                    loop.stop()
+                    return
+                # Stop only after every task has actually finished
+                # cancelling. run()'s concurrent futures are resolved by
+                # task done-callbacks, and both the cancellation wakeups
+                # and those done-callbacks are deferred one ready-queue
+                # pass each via call_soon -- so stopping in this callback
+                # (or even one call_soon later) exits run_forever before
+                # the futures settle, leaving run() callers hanging
+                # forever. Chaining stop on the gathered tasks guarantees
+                # pending run() calls raise CancelledError first.
+                pending = asyncio.gather(*tasks, return_exceptions=True)
+                pending.add_done_callback(lambda _: loop.stop())
+
+            try:
+                loop.call_soon_threadsafe(_cancel_and_stop)
+            except RuntimeError:
+                pass
+            if thread is not threading.current_thread():
+                thread.join(timeout=5.0)
+        if not loop.is_closed() and (thread is None or not thread.is_alive()):
+            try:
+                loop.close()
+            except RuntimeError:
+                # A forked child inherits a loop that still claims to be
+                # running; closing it raises, so accept the fd leak (same
+                # policy as _ensure_loop_locked).
+                pass
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # The loop, thread, and lock are process-local and unpicklable;
+        # unpickled runners start fresh and lazily create their loop.
+        return (self.__class__, ())
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            # Interpreter shutdown can leave module globals torn down.
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Retry / on_error helpers
 # ---------------------------------------------------------------------------
@@ -116,6 +241,7 @@ def _retry_call(
     max_retries: int = 3,
     on_error: _OnError = "raise",
     default: Any = None,
+    run_async: Any = None,
     **kwargs: Any,
 ) -> Any:
     """Call *fn* with exponential-backoff retry and on_error handling.
@@ -126,13 +252,16 @@ def _retry_call(
         on_error: ``"raise"`` re-raises on final failure; ``"log"`` and
             ``"ignore"`` return *default*.
         default: Value to return when on_error is not ``"raise"``.
+        run_async: Callable used to drive awaitable results (defaults to
+            :func:`_run_async`). Batch wrappers pass their persistent loop
+            runner so cached SDK clients see one loop across batches.
     """
     last_exc: Exception | None = None
     for attempt in range(1 + max(0, max_retries)):
         try:
             result = fn(*args, **kwargs)
             if inspect.isawaitable(result):
-                result = _run_async(result)
+                result = (run_async or _run_async)(result)
             return result
         except Exception as exc:
             last_exc = exc
@@ -399,11 +528,27 @@ class _EmbedTextBatch:
         # Arrow type when they already know the dimensions.
         self._arrow_type = arrow_type
         self._embedder = None  # lazy: instantiate on first __call__
+        self._embedder_loop: Any = None  # loop the cached embedder is bound to
+        # Persistent loop for async embedders: the cached client must see the
+        # same event loop for every batch (pickles as a fresh lazy runner).
+        self._loop_runner = _PersistentLoopRunner()
 
     def _ensure_embedder(self) -> Any:
-        if self._embedder is None:
+        # Bind the cached client to the current persistent loop: if the loop
+        # was re-created (fork, close), the old client's pooled connections
+        # are stranded on the dead loop and the client must be rebuilt.
+        loop = self._loop_runner._ensure_loop()
+        if self._embedder is None or self._embedder_loop is not loop:
             self._embedder = self._descriptor.instantiate()
+            self._embedder_loop = loop
         return self._embedder
+
+    def __getstate__(self) -> dict[str, Any]:
+        # The cached client and its loop binding are process-local.
+        state = self.__dict__.copy()
+        state["_embedder"] = None
+        state["_embedder_loop"] = None
+        return state
 
     def _zero_fill(self, count: int) -> list[Any]:
         """Zero embeddings when possible; nulls when the dimension is unknowable."""
@@ -425,6 +570,7 @@ class _EmbedTextBatch:
                 texts,
                 max_retries=self._max_retries,
                 on_error=self._on_error,
+                run_async=self._loop_runner.run,
             )
             if result is None:
                 result = self._zero_fill(len(texts))
@@ -460,7 +606,7 @@ class _EmbedTextBatch:
         # Embed all chunks in one batch
         chunk_embeddings = self._ensure_embedder().embed_text(all_chunks)
         if inspect.isawaitable(chunk_embeddings):
-            chunk_embeddings = _run_async(chunk_embeddings)
+            chunk_embeddings = self._loop_runner.run(chunk_embeddings)
 
         # Reassemble: weighted average for multi-chunk texts
         results: list[Any] = []
@@ -541,6 +687,27 @@ class _PromptBatch:
         self._max_retries = max_retries
         self._on_error: _OnError = on_error
         self._prompter = None  # lazy: instantiate on first __call__
+        self._prompter_loop: Any = None  # loop the cached prompter is bound to
+        # Persistent loop: the cached prompter's async SDK client must see the
+        # same event loop for every batch (pickles as a fresh lazy runner).
+        self._loop_runner = _PersistentLoopRunner()
+
+    def _ensure_prompter(self) -> Any:
+        # Bind the cached client to the current persistent loop: if the loop
+        # was re-created (fork, close), the old client's pooled connections
+        # are stranded on the dead loop and the client must be rebuilt.
+        loop = self._loop_runner._ensure_loop()
+        if self._prompter is None or self._prompter_loop is not loop:
+            self._prompter = self._descriptor.instantiate()
+            self._prompter_loop = loop
+        return self._prompter
+
+    def __getstate__(self) -> dict[str, Any]:
+        # The cached client and its loop binding are process-local.
+        state = self.__dict__.copy()
+        state["_prompter"] = None
+        state["_prompter_loop"] = None
+        return state
 
     def _serialize_result(self, result: Any) -> str | None:
         """Convert a prompt result to a string for the output column."""
@@ -558,8 +725,7 @@ class _PromptBatch:
         return json.dumps(result, default=str)
 
     def __call__(self, table: pa.Table) -> pa.Table:
-        if self._prompter is None:
-            self._prompter = self._descriptor.instantiate()
+        self._ensure_prompter()
         texts = table.column(self._column).to_pylist()
         texts = [t if t is not None else "" for t in texts]
 
@@ -581,6 +747,7 @@ class _PromptBatch:
                 texts,
                 max_retries=self._max_retries,
                 on_error=self._on_error,
+                run_async=self._loop_runner.run,
             )
             if results is None:
                 results = [None] * len(texts)
@@ -621,7 +788,7 @@ class _PromptBatch:
 
             return await asyncio.gather(*(single(i) for i in range(len(texts))))
 
-        results = _run_async(run_all())
+        results = self._loop_runner.run(run_all())
         return pa.table({self._output_column: results})
 
 
