@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import subprocess
 import sys
 from importlib.metadata import distribution, metadata, requires, version
@@ -39,6 +40,20 @@ def test_base_distribution_installs_expression_runtime_dependencies():
             base_requirements.add(canonicalize_name(requirement.name))
 
     assert {"numpy", "pyarrow"} <= base_requirements
+
+
+def test_artifact_mode_imports_installed_python_packages():
+    if os.environ.get("VANE_FAST_TEST_ARTIFACT_MODE") != "1":
+        pytest.skip("only applies to artifact-backed fast-test jobs")
+
+    import vane
+
+    environment_root = Path(sys.prefix).resolve()
+    for package in (duckdb, vane):
+        package_path = Path(package.__file__).resolve()
+        assert package_path.is_relative_to(environment_root), (
+            f"{package.__name__} was imported from the checkout: {package_path}"
+        )
 
 
 def _requirements_for_extra(extra):

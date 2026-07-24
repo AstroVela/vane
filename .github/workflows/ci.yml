@@ -221,6 +221,7 @@ jobs:
             process_timeout: 900
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      VANE_FAST_TEST_ARTIFACT_MODE: "1"
       VANE_FAST_TEST_EXCLUDE_GPU: "1"
       VANE_FAST_TEST_JUNIT_DIR: ${{ github.workspace }}/test-results
       VANE_FAST_TEST_NON_RAY_SHARD_COUNT: ${{ matrix.shard_count }}
@@ -258,19 +259,27 @@ jobs:
 
       - name: Verify the artifact-installed CPU environment
         run: |
-          python - <<'PY'
+          site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+          PYTHONSAFEPATH=1 PYTHONPATH="$site_packages:$GITHUB_WORKSPACE" python - <<'PY'
           import importlib.metadata
           import pathlib
           import sys
 
           import _duckdb
+          import duckdb
           import torch
+          import vane
 
           distribution = importlib.metadata.distribution("vane-ai")
           extension_path = pathlib.Path(_duckdb.__file__).resolve()
           environment_root = pathlib.Path(sys.prefix).resolve()
           if not extension_path.is_relative_to(environment_root):
               raise RuntimeError(f"_duckdb was not installed from the wheel: {extension_path}")
+          for package in (duckdb, vane):
+              package_path = pathlib.Path(package.__file__).resolve()
+              if not package_path.is_relative_to(environment_root):
+                  raise RuntimeError(f"{package.__name__} was not imported from the wheel: {package_path}")
+              print(f"{package.__name__} package: {package_path}")
           if torch.version.cuda is not None or torch.cuda.is_available():
               raise RuntimeError("fast-test jobs must use the CPU-only PyTorch build")
           print(f"installed {distribution.metadata['Name']} {distribution.version}")
