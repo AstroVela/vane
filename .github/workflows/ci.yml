@@ -92,6 +92,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -178,7 +179,11 @@ jobs:
           env -u VANE_RUNNER python "$GITHUB_WORKSPACE/scripts/verify_base_install.py"
 
       - name: Run the base-installation release tests
-        run: scripts/run_release_tests.sh
+        # This normally takes under a minute. Bound a stuck pytest/Ray teardown
+        # and signal its whole process group so it cannot block the fast-test
+        # jobs that consume the Python 3.12 artifact.
+        timeout-minutes: 12
+        run: timeout --signal=INT --kill-after=30s 600s scripts/run_release_tests.sh
 
       - name: Upload validated artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
