@@ -40,10 +40,7 @@ def ray_log_to_driver_default() -> bool:
 
 
 def configure_ray_progress_logging_defaults() -> None:
-    """Keep Ray background logs from corrupting Vane's dynamic progress UI."""
-    dynamic_progress = dynamic_ray_progress_enabled()
-    if "RAY_LOG_TO_DRIVER" not in os.environ and dynamic_progress:
-        os.environ["RAY_LOG_TO_DRIVER"] = "0"
+    """Compatibility no-op for imports that previously set global Ray defaults.
 
-    if dynamic_progress and not ray_log_to_driver_default():
-        os.environ.setdefault("RAY_BACKEND_LOG_LEVEL", "fatal")
+    ``RayRunner`` passes Vane's preference directly to ``ray.init`` instead.
+    """
