@@ -237,9 +237,8 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Limit(int64_t n, int64_t offset) 
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Repartition(const py::args &args, const py::kwargs &kwargs) {
-	if (!rel) {
-		return nullptr;
-	}
+	AssertRelation();
+	auto context = rel->context->GetContext();
 	std::pair<bool, idx_t> num_partitions = std::make_pair(false, idx_t(0));
 
 	if (kwargs) {
@@ -274,7 +273,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Repartition(const py::args &args,
 		auto arg = args[i];
 		if (py::isinstance<py::str>(arg)) {
 			auto expr_string = string(py::str(arg));
-			auto expressions = Parser::ParseExpressionList(expr_string, rel->context->GetContext()->GetParserOptions());
+			auto expressions = Parser::ParseExpressionList(expr_string, context->GetParserOptions());
 			if (expressions.size() != 1) {
 				throw InvalidInputException("Expected a single expression for repartition");
 			}
@@ -290,16 +289,17 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Repartition(const py::args &args,
 		partition_by.push_back(py_expr->GetExpression().Copy());
 	}
 
-	return make_uniq<DuckDBPyRelation>(
-	    rel->Repartition(num_partitions.first ? num_partitions.second : 0, std::move(partition_by)));
+	return DeriveRelation(rel->Repartition(num_partitions.first ? num_partitions.second : 0, std::move(partition_by)));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::LocalExchange(const py::object &num_partitions_obj) {
+	AssertRelation();
+	rel->context->GetContext();
 	idx_t num_partitions = 0;
 	if (!num_partitions_obj.is_none()) {
 		num_partitions = num_partitions_obj.cast<idx_t>();
 	}
-	return make_uniq<DuckDBPyRelation>(rel->LocalExchange(num_partitions));
+	return DeriveRelation(rel->LocalExchange(num_partitions));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Order(const string &expr) {
