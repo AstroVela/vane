@@ -764,6 +764,49 @@ def test_generator_terminating_mid_pair_fails_without_fetching_block():
         collector.shutdown()
 
 
+def test_failed_completion_retires_without_cancelling_terminal_remote_work():
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    generator = _Generator([], completed=False)
+    adapter = RayStreamAdapter(
+        _source(
+            fake_ray,
+            driver,
+            request_id="failed-completion",
+            submitter=lambda _lease: generator,
+        ),
+        ray_module=fake_ray,
+    )
+    record = _StreamRecord(
+        slot_id=10,
+        submit_id=100,
+        adapter=adapter,
+        sequence=0,
+    )
+    completion_future = Future()
+    completion_future.set_exception(RuntimeError("planned completion failure"))
+    record.completion_future = completion_future
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector._records[(record.slot_id, record.submit_id)] = record
+
+    try:
+        collector._complete_producer_wait(record, completion_future)
+
+        assert collector.drain_results({10: {"rows": 1}}) == [
+            (
+                10,
+                100,
+                "error",
+                "RuntimeError: planned completion failure",
+            )
+        ]
+        assert fake_ray.cancel_calls == []
+        assert len(driver.cancel_query_task_lease_request.calls) == 1
+        assert generator.deleted_streams == [generator.completion_ref]
+    finally:
+        collector.shutdown()
+
+
 def test_explicit_remote_error_pair_preserves_cause_without_output_lease():
     from duckdb.execution.udf_ray_stream_protocol import make_stream_error_pair
 
@@ -784,7 +827,9 @@ def test_explicit_remote_error_pair_preserves_cause_without_output_lease():
         )
         block_ref = _Ref(block, is_block=True)
         holder["block_ref"] = block_ref
-        return _Generator([block_ref, _Ref(metadata)])
+        generator = _Generator([block_ref, _Ref(metadata)])
+        holder["generator"] = generator
+        return generator
 
     collector = AsyncResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
@@ -802,6 +847,9 @@ def test_explicit_remote_error_pair_preserves_cause_without_output_lease():
         assert "RuntimeError: planned remote failure" in events[0][3]
         assert driver.acquire_query_output_block_lease.calls == []
         assert holder["block_ref"].future_result_calls == []
+        assert fake_ray.cancel_calls == []
+        assert len(driver.cancel_query_task_lease_request.calls) == 1
+        assert holder["generator"].deleted_streams == [holder["generator"].completion_ref]
     finally:
         collector.shutdown()
 
@@ -830,6 +878,7 @@ def test_malformed_metadata_fails_only_its_stream_without_output_admission():
         assert "invalid Ray UDF stream metadata" in events[0][3]
         assert driver.acquire_query_output_block_lease.calls == []
         assert len(driver.cancel_query_task_lease_request.calls) == 1
+        assert fake_ray.cancel_calls[-1][1] == {"force": True, "recursive": True}
     finally:
         collector.shutdown()
 

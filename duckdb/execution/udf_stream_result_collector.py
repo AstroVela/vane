@@ -104,6 +104,7 @@ class _StreamRecord:
     wait_kind: str = ""
     wait_future: Any | None = None
     completion_future: Any | None = None
+    terminal_signal_observed: bool = False
 
 
 class AsyncResultCollector:
@@ -536,6 +537,9 @@ class AsyncResultCollector:
                 record.adapter.mark_drained()
             self._maybe_complete_record(record)
         except BaseException as exc:
+            # A failed completion ObjectRef means Ray has already made the task
+            # terminal.  Force-cancelling that task can race its normal reply.
+            record.terminal_signal_observed = True
             with self._cv:
                 shutting_down = self._shutdown
             if not shutting_down:
@@ -584,6 +588,8 @@ class AsyncResultCollector:
             except BaseException as exc:
                 self._fail_record(record, exc)
         except BaseException as exc:
+            if kind == "terminal":
+                record.terminal_signal_observed = True
             with self._cv:
                 shutting_down = self._shutdown
             if not shutting_down:
@@ -613,6 +619,7 @@ class AsyncResultCollector:
         record.metadata_ref = next_ref
 
     def _finish_stream(self, record: _StreamRecord) -> None:
+        record.terminal_signal_observed = True
         if record.phase == "metadata" and record.block_ref is not None:
             raise RuntimeError(
                 "Ray UDF generator terminated after a block without its metadata; "
@@ -628,6 +635,10 @@ class AsyncResultCollector:
         if isinstance(metadata, dict) and metadata.get("event_kind") == "error":
             remote_error = validate_stream_error_metadata(metadata)
             self._validate_task_identity(record, remote_error)
+            # Error pairs are the final two objects emitted by the task.  The
+            # generator is already returning, even if Ray's completion reply
+            # has not reached this worker yet.
+            record.terminal_signal_observed = True
             raise RuntimeError(
                 f"remote Ray UDF failed: {remote_error['exception_type']}: {remote_error['exception_message']}"
             )
@@ -811,7 +822,10 @@ class AsyncResultCollector:
         # slow or the failed generator is being reconstructed.
         self._notify_wakeup()
         self._cancel_record_control(record)
-        record.adapter.cancel()
+        if record.terminal_signal_observed:
+            record.adapter.retire_failed()
+        else:
+            record.adapter.cancel()
         for token in dropped_tokens:
             token.driver.release_query_output_block_lease.remote(
                 token.request_id,

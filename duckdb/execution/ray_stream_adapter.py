@@ -35,9 +35,13 @@ class TaskLeaseObjectRefGenerator:
         ray_module: Any | None = None,
     ) -> None:
         if ray_module is None:
-            import ray as ray_module
+            import ray as imported_ray
+
+            active_ray_module = imported_ray
+        else:
+            active_ray_module = ray_module
         try:
-            validate_ray_stream_contract(ray_module)
+            validate_ray_stream_contract(active_ray_module)
         except BaseException:
             admission.release()
             raise
@@ -46,7 +50,7 @@ class TaskLeaseObjectRefGenerator:
         if not request_id or not str(lease.get("lease_id") or ""):
             admission.release()
             raise ValueError("pregranted Ray UDF task admission is missing identity")
-        self._ray = ray_module
+        self._ray = active_ray_module
         self._driver = admission.driver
         self._request_id = request_id
         self._generator: Any | None = None
@@ -119,6 +123,20 @@ class TaskLeaseObjectRefGenerator:
             submitted=bool(submitted),
         )
 
+    def retire_failed(self) -> None:
+        """Retire a terminally failed task without cancelling completed work."""
+        with self._lock:
+            if self._cancelled:
+                return
+            self._cancelled = True
+            submitted = self._submitted
+            self._released = True
+            self._generator = None
+        self._driver.cancel_query_task_lease_request.remote(
+            self._request_id,
+            submitted=bool(submitted),
+        )
+
     def retire_local_state(self) -> None:
         """Drop client-side task payload ownership after terminal cleanup."""
         with self._lock:
@@ -131,10 +149,14 @@ class RayStreamAdapter:
 
     def __init__(self, source: Any, *, ray_module: Any | None = None) -> None:
         if ray_module is None:
-            import ray as ray_module
+            import ray as imported_ray
 
-        validate_ray_stream_contract(ray_module)
-        self._ray = ray_module
+            active_ray_module = imported_ray
+        else:
+            active_ray_module = ray_module
+
+        validate_ray_stream_contract(active_ray_module)
+        self._ray = active_ray_module
         self._source = source
         self._leased = source if isinstance(source, TaskLeaseObjectRefGenerator) else None
         self._generator = self._leased.generator if self._leased is not None else source
@@ -267,6 +289,30 @@ class RayStreamAdapter:
             leased.retire_local_state()
         elif generator is not None:
             self._ray.cancel(generator, force=True, recursive=True)
+        if generator is not None and completion_ref is not None:
+            self._delete_object_ref_stream(generator, completion_ref)
+
+    def retire_failed(self) -> None:
+        """Retire a terminal failure without racing it with ``ray.cancel``.
+
+        Once Ray has published task completion, or a Vane stream has emitted
+        its terminal error pair, force-cancelling the generator can race the
+        normal task reply in Ray's CoreWorker.  The task lease still follows
+        the failure path, but the already-ending remote work is left alone.
+        """
+        if self._retired:
+            return
+        self._retired = True
+        leased = self._leased
+        generator = self._generator
+        completion_ref = self._completion_ref
+        self._source = None
+        self._leased = None
+        self._generator = None
+        self._completion_ref = None
+        if leased is not None:
+            leased.retire_failed()
+            leased.retire_local_state()
         if generator is not None and completion_ref is not None:
             self._delete_object_ref_stream(generator, completion_ref)
 

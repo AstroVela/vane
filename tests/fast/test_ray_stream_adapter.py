@@ -297,6 +297,27 @@ def test_cancelling_started_stream_cancels_remote_work_and_releases_lease():
     assert driver.cancel_query_task_lease_request.calls[0][1] == {"submitted": True}
 
 
+def test_retiring_terminal_failure_does_not_cancel_already_ending_remote_work():
+    fake_ray = _FakeRay()
+    driver = _driver({"granted": True, "lease": _lease()})
+    generator = _Generator([])
+    source = TaskLeaseObjectRefGenerator(
+        admission=_admission(driver, "request-failed"),
+        submitter=lambda _lease: generator,
+        ray_module=fake_ray,
+    )
+    adapter = RayStreamAdapter(source, ray_module=fake_ray)
+
+    adapter.retire_failed()
+    adapter.retire_failed()
+
+    assert fake_ray.cancel_calls == []
+    assert driver.release_query_task_lease.calls == []
+    assert driver.cancel_query_task_lease_request.calls == [(("request-failed",), {"submitted": True})]
+    assert generator.deleted_streams == [generator.completion]
+    assert generator.worker is None
+
+
 @pytest.mark.parametrize("terminal_action", ["retire", "cancel"])
 def test_terminal_stream_cleanup_disarms_ray_generator_destructor(terminal_action):
     fake_ray = _FakeRay()
