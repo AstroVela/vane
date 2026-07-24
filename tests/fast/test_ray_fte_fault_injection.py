@@ -366,7 +366,11 @@ def _init_ray_for_fault_test(monkeypatch) -> None:
         "VANE_FTE_CONTROL_RPC_INITIAL_BACKOFF_S": os.environ.get("VANE_FTE_CONTROL_RPC_INITIAL_BACKOFF_S", "0"),
         "VANE_FTE_SPLIT_QUEUE_SPACE_WAIT_TIMEOUT_S": os.environ.get("VANE_FTE_SPLIT_QUEUE_SPACE_WAIT_TIMEOUT_S", "0.1"),
     }
-    cluster = Cluster()
+    # The default Cluster lifecycle starts Ray's fate-sharing reaper and
+    # registers a process-exit hook.  These tests own cleanup explicitly; a
+    # reaper that outlives a faulted actor can otherwise terminate pytest
+    # during session finalization, before its JUnit report is written.
+    cluster = Cluster(shutdown_at_exit=False)
     try:
         cluster.add_node(
             include_dashboard=False,
