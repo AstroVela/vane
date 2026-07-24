@@ -6779,6 +6779,11 @@ def test_start_ray_workers_skips_blocking_warmup_inside_ray_worker(monkeypatch):
 
     assert len(runtimes) == 1
     assert option_calls[0]["memory"] == 358
+    assert option_calls[0]["runtime_env"] == {
+        "env_vars": {"RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0"},
+    }
+    assert "num_cpus" not in option_calls[0]
+    assert "num_gpus" not in option_calls[0]
     assert len(remote_calls) == 1
     assert remote_calls[0]["env_overrides"]["VANE_WORKER_ID"] == "10.0.0.1"
     assert remote_calls[0]["env_overrides"]["VANE_WORKER_INDEX"] == "0"
