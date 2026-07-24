@@ -1164,6 +1164,7 @@ PYBIND11_MODULE(DUCKDB_PYTHON_LIB_NAME, m) { // NOLINT
 	m.def("_udf_executor_debug_counters", &GetUDFExecutorDebugCounters);
 	m.def("_reset_udf_executor_debug_counters", &ResetUDFExecutorDebugCounters);
 	m.def("_shutdown_udf_executor_dispatcher", &ShutdownUDFExecutorDispatcher);
+	m.def("_wake_udf_executor_slots_for_testing", &WakeUDFExecutorSlotsForTesting);
 	try {
 		py::module_::import("atexit").attr("register")(m.attr("_shutdown_udf_executor_dispatcher"));
 	} catch (const py::error_already_set &) {
