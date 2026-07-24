@@ -22,6 +22,9 @@ namespace distributed {
 namespace python {
 namespace ray {
 
+string SubmissionErrorOwnerQueryId(const std::vector<duckdb::distributed::WorkerTask> &tasks,
+                                   const string &execution_query_id);
+
 class RayWorkerManager : public duckdb::distributed::WorkerManager {
 public:
 	DuckDBResult<void> submit_fte_task_events(std::vector<duckdb::distributed::WorkerTask> tasks) override;

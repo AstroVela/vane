@@ -825,8 +825,10 @@ public:
 
 	DuckDBResult<void> submit_fte_task_events(std::vector<duckdb::distributed::WorkerTask> tasks) override {
 		string query_id;
+		string submission_error_owner;
 		try {
 			query_id = QueryIdFromTaskEvents(tasks);
+			submission_error_owner = duckdb::distributed::python::ray::SubmissionErrorOwnerQueryId(tasks, query_id);
 			if (!tasks.empty() && query_id.empty()) {
 				return DuckDBResult<void>::err(DuckDBError::value_error("FTE task events require non-empty query_id"));
 			}
@@ -841,7 +843,7 @@ public:
 			StorePythonResultHandles(query_id, std::move(raw_handles));
 			return DuckDBResult<void>::ok();
 		} catch (const py::error_already_set &e) {
-			submission_errors_.Store(query_id, e);
+			submission_errors_.Store(submission_error_owner, e);
 			return DuckDBResult<void>::err(
 			    DuckDBError(string("Python backend submit_fte_task_events failed: ") + e.what()));
 		} catch (const std::exception &e) {

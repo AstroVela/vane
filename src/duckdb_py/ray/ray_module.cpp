@@ -541,6 +541,23 @@ void register_ray_bindings(py::module_ &mod) {
 	    py::arg("has_plan") = false, py::arg("query_id") = py::none(),
 	    "Create a worker task with explicit plan/query-id presence for native tests.");
 
+	m.def(
+	    "_submission_error_owner_query_id_for_test",
+	    [](const string &execution_query_id, py::object resource_query_id_obj) {
+		    std::unordered_map<string, string> context {{"query_id", execution_query_id}};
+		    if (!resource_query_id_obj.is_none()) {
+			    context["resource_query_id"] = resource_query_id_obj.cast<string>();
+		    }
+		    auto config = std::make_shared<duckdb::distributed::DuckDBExecutionConfig>(
+		        duckdb::distributed::DuckDBExecutionConfig::from_env());
+		    std::vector<duckdb::distributed::WorkerTask> tasks;
+		    tasks.emplace_back(duckdb::distributed::TaskContext(), duckdb::distributed::DuckPhysicalPlanRef(),
+		                       std::move(config), std::move(context), "SubmissionErrorOwnerForTest");
+		    return duckdb::distributed::python::ray::SubmissionErrorOwnerQueryId(tasks, execution_query_id);
+	    },
+	    py::arg("execution_query_id"), py::arg("resource_query_id") = py::none(),
+	    "Resolve the query that owns a retained submission exception.");
+
 	py::class_<PyLogicalPlan>(m, "PyLogicalPlan")
 	    .def_static("from_duckdb_relation",
 	                [](py::object relation_obj, py::object query_id_obj) {

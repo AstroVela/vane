@@ -95,6 +95,37 @@ def test_worker_task_plan_keeps_absent_plan_explicit():
     assert task.plan() is None
 
 
+def test_worker_task_plan_rejects_present_plan_without_root():
+    task = duckdb.ray_cxx._make_worker_task_for_test(True, "query-rootless-worker-plan")
+
+    with pytest.raises(
+        duckdb.InternalException,
+        match="RayWorkerTask::Plan received a present physical plan without a root",
+    ):
+        task.plan()
+
+
+@pytest.mark.parametrize(
+    ("execution_query_id", "resource_query_id", "expected"),
+    [
+        ("query-root", None, "query-root"),
+        ("query-root:orderby:sample", "query-root", "query-root"),
+    ],
+)
+def test_submission_error_is_owned_by_outer_resource_query(
+    execution_query_id,
+    resource_query_id,
+    expected,
+):
+    assert (
+        duckdb.ray_cxx._submission_error_owner_query_id_for_test(
+            execution_query_id,
+            resource_query_id,
+        )
+        == expected
+    )
+
+
 @pytest.mark.parametrize("manager_kind", ["python-backend", "ray-worker-manager"])
 def test_worker_submission_preserves_worker_plan_exception_cause(monkeypatch, manager_kind):
     import _duckdb

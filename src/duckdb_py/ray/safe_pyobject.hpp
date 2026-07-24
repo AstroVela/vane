@@ -118,8 +118,11 @@ struct SafePythonException {
 	SafePyObject traceback;
 
 	SafePythonException() = default;
-	explicit SafePythonException(const py::error_already_set &error)
-	    : type(py::object(error.type())), value(py::object(error.value())), traceback(py::object(error.trace())) {
+	explicit SafePythonException(const py::error_already_set &error) {
+		PythonGILWrapper gil;
+		type = SafePyObject(py::object(error.type()));
+		value = SafePyObject(py::object(error.value()));
+		traceback = SafePyObject(py::object(error.trace()));
 	}
 
 	bool has_value() const {
@@ -130,6 +133,7 @@ struct SafePythonException {
 		if (!has_value()) {
 			return;
 		}
+		PythonGILWrapper gil;
 		auto type_obj = type.get();
 		auto value_obj = value.get();
 		PyObject *traceback_ptr = nullptr;

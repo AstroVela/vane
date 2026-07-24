@@ -1009,6 +1009,9 @@ py::object RayWorkerTask::Plan() const {
 	if (query_id_entry == task_context.end() || query_id_entry->second.empty()) {
 		throw duckdb::InternalException("RayWorkerTask::Plan requires non-empty task context query_id");
 	}
+	if (!plan_ref->HasRoot()) {
+		throw duckdb::InternalException("RayWorkerTask::Plan received a present physical plan without a root");
+	}
 	py::object query_id_obj = py::str(query_id_entry->second);
 	auto udf_registrations_obj = ray_cxx.attr("_lookup_query_udf_registrations")(query_id_obj);
 	auto udf_actor_handles_obj = ray_cxx.attr("_lookup_query_udf_actor_handles")(query_id_obj);
