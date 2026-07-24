@@ -170,12 +170,20 @@ std::vector<RayTaskResultHandle> RayWorkerRuntime::WrapFtePythonHandles(const py
 	return handles;
 }
 
-void RayWorkerRuntime::DropQueryFragments(const string &query_id) {
+void RayWorkerRuntime::PrepareDropQuery(const string &query_id) {
 	if (query_id.empty()) {
 		return;
 	}
 	duckdb::PythonGILWrapper gil;
-	ray_worker_handle_.attr("fte_drop_query")(query_id);
+	ray_worker_handle_.attr("fte_prepare_drop_query")(query_id);
+}
+
+void RayWorkerRuntime::CleanupQuery(const string &query_id) {
+	if (query_id.empty()) {
+		return;
+	}
+	duckdb::PythonGILWrapper gil;
+	ray_worker_handle_.attr("fte_cleanup_query")(query_id);
 }
 
 void RayWorkerRuntime::TaskInputStreamExhaustedForQuery(
@@ -229,10 +237,17 @@ std::unordered_map<std::string, duckdb::idx_t> RayWorkerRuntime::FragmentStats()
 	return stats;
 }
 
-void RayWorkerRuntime::Shutdown() {
+void RayWorkerRuntime::PrepareShutdown() {
 	duckdb::PythonGILWrapper gil;
-	try {
-		ray_worker_handle_.attr("shutdown")();
-	} catch (...) {
-	}
+	ray_worker_handle_.attr("prepare_shutdown")();
+}
+
+void RayWorkerRuntime::FinishShutdown() {
+	duckdb::PythonGILWrapper gil;
+	ray_worker_handle_.attr("finish_shutdown")();
+}
+
+void RayWorkerRuntime::AbortShutdown() {
+	duckdb::PythonGILWrapper gil;
+	ray_worker_handle_.attr("abort_shutdown")();
 }

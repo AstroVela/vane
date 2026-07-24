@@ -22,6 +22,60 @@ namespace distributed {
 
 namespace {
 
+bool SetValidationError(std::string *error, const std::string &message) {
+	if (error) {
+		*error = message;
+	}
+	return false;
+}
+
+bool ExtractSinkOutputLocationPrefix(const ExchangeSinkInstanceHandle &handle, std::string &prefix,
+                                     std::string *error) {
+	const auto sink_suffix = std::string("__sink_") + std::to_string(handle.sink_handle.task_partition_id) +
+	                         "__attempt_" + std::to_string(handle.attempt_id);
+	if (handle.output_location.size() < sink_suffix.size() ||
+	    handle.output_location.compare(handle.output_location.size() - sink_suffix.size(), sink_suffix.size(),
+	                                   sink_suffix) != 0) {
+		return SetValidationError(error, "remote exchange sink plan has an invalid sink output location");
+	}
+	prefix = handle.output_location.substr(0, handle.output_location.size() - sink_suffix.size());
+	if (prefix.empty()) {
+		return SetValidationError(error, "remote exchange sink plan is missing its exchange instance id");
+	}
+	return true;
+}
+
+bool ValidateRuntimeSinkHandle(const PhysicalRemoteExchangeSink &sink, const ExchangeSinkInstanceHandle &runtime_handle,
+                               std::string *error) {
+	const auto &plan_handle = sink.SinkHandle();
+	if (plan_handle.query_id.empty()) {
+		return SetValidationError(error, "remote exchange sink plan is missing query ownership");
+	}
+	if (runtime_handle.query_id.empty() || runtime_handle.query_id != plan_handle.query_id) {
+		return SetValidationError(error, "runtime exchange sink query does not match the plan");
+	}
+	if (plan_handle.output_partition_count != sink.NumPartitions()) {
+		return SetValidationError(error, "remote exchange sink plan has an inconsistent output partition count");
+	}
+	if (runtime_handle.output_partition_count == 0 || runtime_handle.output_partition_count != sink.NumPartitions()) {
+		return SetValidationError(error, "runtime exchange sink output partition count does not match the plan");
+	}
+	if (plan_handle.output_location.empty()) {
+		return SetValidationError(error, "remote exchange sink plan is missing its output location");
+	}
+	std::string exchange_instance_prefix;
+	if (!ExtractSinkOutputLocationPrefix(plan_handle, exchange_instance_prefix, error)) {
+		return false;
+	}
+	const auto expected_output_location = exchange_instance_prefix + "__sink_" +
+	                                      std::to_string(runtime_handle.sink_handle.task_partition_id) + "__attempt_" +
+	                                      std::to_string(runtime_handle.attempt_id);
+	if (runtime_handle.output_location != expected_output_location) {
+		return SetValidationError(error, "runtime exchange sink output location does not match the plan");
+	}
+	return true;
+}
+
 bool ApplyExchangeSinkInstanceToOperator(PhysicalOperator &op, const ExchangeSinkInstanceTaskDescriptor &task,
                                          std::string *error, idx_t &applied) {
 	if (op.type == PhysicalOperatorType::EXCHANGE_SINK) {
@@ -33,8 +87,8 @@ bool ApplyExchangeSinkInstanceToOperator(PhysicalOperator &op, const ExchangeSin
 			return false;
 		}
 		auto sink_handle = task.sink_instance;
-		if (sink_handle.output_partition_count == 0) {
-			sink_handle.output_partition_count = sink->NumPartitions();
+		if (!ValidateRuntimeSinkHandle(*sink, sink_handle, error)) {
+			return false;
 		}
 		sink->ApplyRuntimeSinkHandle(std::move(sink_handle));
 		applied++;
@@ -54,6 +108,8 @@ void ExchangeSinkInstanceTaskDescriptor::Serialize(Serializer &serializer) const
 	serializer.WriteProperty(2, "attempt_id", sink_instance.attempt_id);
 	serializer.WriteProperty(3, "output_location", sink_instance.output_location);
 	serializer.WriteProperty(4, "output_partition_count", sink_instance.output_partition_count);
+	serializer.WriteProperty(5, "flight_server_epoch", sink_instance.flight_server_epoch);
+	serializer.WriteProperty(6, "query_id", sink_instance.query_id);
 }
 
 ExchangeSinkInstanceTaskDescriptor ExchangeSinkInstanceTaskDescriptor::Deserialize(Deserializer &deserializer) {
@@ -64,6 +120,8 @@ ExchangeSinkInstanceTaskDescriptor ExchangeSinkInstanceTaskDescriptor::Deseriali
 	    deserializer.ReadPropertyWithExplicitDefault<string>(3, "output_location", "");
 	result.sink_instance.output_partition_count =
 	    deserializer.ReadPropertyWithDefault<idx_t>(4, "output_partition_count");
+	result.sink_instance.flight_server_epoch = deserializer.ReadProperty<string>(5, "flight_server_epoch");
+	result.sink_instance.query_id = deserializer.ReadProperty<string>(6, "query_id");
 	return result;
 }
 

@@ -1165,6 +1165,8 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(114, "range_boundaries", {});
 		auto range_order_modifiers =
 		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(115, "range_order_modifiers", {});
+		sink_handle.flight_server_epoch = deserializer.ReadProperty<string>(116, "flight_server_epoch");
+		sink_handle.query_id = deserializer.ReadProperty<string>(117, "query_id");
 		return make_uniq<PhysicalRemoteExchangeSink>(
 		    physical_plan, std::move(types), estimated_cardinality, std::move(exchange_id), num_partitions,
 		    repartition_type, std::move(partition_by), std::move(sink_handle), std::move(exchange_mgr),
@@ -1187,6 +1189,12 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto source_handle_attempt_ids =
 		    deserializer.ReadPropertyWithDefault<vector<idx_t>>(113, "source_handle_attempt_ids");
 		auto local_dirs = deserializer.ReadPropertyWithDefault<vector<string>>(114, "local_dirs");
+		auto source_handle_flight_server_epochs =
+		    deserializer.ReadProperty<vector<string>>(115, "source_handle_flight_server_epochs");
+		auto source_catalog_handles_explicit = deserializer.ReadProperty<bool>(116, "source_catalog_handles_explicit");
+		if (!source_catalog_handles_explicit) {
+			throw SerializationException("remote exchange source requires explicit catalog handles");
+		}
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.node_id = distributed::ResolveFlightExchangeNodeIdFromEnv();
@@ -1196,48 +1204,26 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		flight_config.local_dirs = std::vector<std::string>(local_dirs.begin(), local_dirs.end());
 		auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
 		std::vector<distributed::ExchangeSourceHandle> source_handles;
-		if (!source_handle_partition_ids.empty() || !source_handle_node_ids.empty() || !source_handle_paths.empty()) {
-			if (source_handle_partition_ids.size() != source_handle_node_ids.size() ||
-			    source_handle_partition_ids.size() != source_handle_paths.size()) {
-				throw SerializationException("remote exchange source handle metadata is inconsistent");
-			}
-			if (!source_handle_flight_ports.empty() &&
-			    source_handle_flight_ports.size() != source_handle_partition_ids.size()) {
-				throw SerializationException("remote exchange source flight port metadata is inconsistent");
-			}
-			if (!source_handle_attempt_ids.empty() &&
-			    source_handle_attempt_ids.size() != source_handle_partition_ids.size()) {
-				throw SerializationException("remote exchange source attempt metadata is inconsistent");
-			}
-			source_handles.reserve(source_handle_partition_ids.size());
-			for (idx_t i = 0; i < source_handle_partition_ids.size(); i++) {
-				distributed::ExchangeSourceHandle sh;
-				sh.partition_id = source_handle_partition_ids[i];
-				sh.attempt_id = source_handle_attempt_ids.empty() ? 0 : source_handle_attempt_ids[i];
-				sh.node_id = source_handle_node_ids[i];
-				sh.flight_port = source_handle_flight_ports.empty() ? 0 : source_handle_flight_ports[i];
-				distributed::ExchangeSourceFile file;
-				file.path = source_handle_paths[i];
-				file.file_size = 0;
-				sh.files.push_back(std::move(file));
-				source_handles.push_back(std::move(sh));
-			}
-		} else if (!runtime_source_node_id.IsValid()) {
-			// Legacy fallback for plans serialized before explicit source handles
-			for (auto partition_idx : partition_indices) {
-				for (idx_t i = 0; i < source_nodes.size(); i++) {
-					distributed::ExchangeSourceHandle sh;
-					sh.partition_id = partition_idx;
-					sh.attempt_id = 0;
-					sh.node_id = source_nodes[i];
-					sh.flight_port = 0;
-					distributed::ExchangeSourceFile file;
-					file.path = exchange_id;
-					file.file_size = 0;
-					sh.files.push_back(std::move(file));
-					source_handles.push_back(std::move(sh));
-				}
-			}
+		if (source_handle_partition_ids.size() != source_handle_node_ids.size() ||
+		    source_handle_partition_ids.size() != source_handle_paths.size() ||
+		    source_handle_partition_ids.size() != source_handle_flight_ports.size() ||
+		    source_handle_partition_ids.size() != source_handle_attempt_ids.size() ||
+		    source_handle_partition_ids.size() != source_handle_flight_server_epochs.size()) {
+			throw SerializationException("remote exchange source handle metadata is inconsistent");
+		}
+		source_handles.reserve(source_handle_partition_ids.size());
+		for (idx_t i = 0; i < source_handle_partition_ids.size(); i++) {
+			distributed::ExchangeSourceHandle sh;
+			sh.partition_id = source_handle_partition_ids[i];
+			sh.attempt_id = source_handle_attempt_ids[i];
+			sh.node_id = source_handle_node_ids[i];
+			sh.flight_port = source_handle_flight_ports[i];
+			sh.flight_server_epoch = source_handle_flight_server_epochs[i];
+			distributed::ExchangeSourceFile file;
+			file.path = source_handle_paths[i];
+			file.file_size = 0;
+			sh.files.push_back(std::move(file));
+			source_handles.push_back(std::move(sh));
 		}
 		return make_uniq<PhysicalRemoteExchangeSource>(physical_plan, std::move(types), estimated_cardinality,
 		                                               std::move(exchange_id), std::move(partition_indices),

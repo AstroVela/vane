@@ -61,7 +61,7 @@ public:
 
 	/// Ensure the output schema metadata is written even when no data was
 	/// produced (0-row exchange).  Called by PhysicalRemoteExchangeSink::Finalize
-	/// after Finish() so that downstream readers can still open the exchange.
+	/// before Finish() so the schema is part of the committed attempt.
 	virtual DuckDBResult<void> EnsureSchema(ClientContext &context, const vector<LogicalType> &types,
 	                                        const vector<string> &names) {
 		return DuckDBResult<void>::ok(); // default no-op

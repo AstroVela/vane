@@ -57,6 +57,12 @@ public:
 		SinkFinished(handle, attempt_id);
 	}
 
+	/// Notify that a concrete sink instance finished, including transport
+	/// incarnation metadata returned by the worker.
+	virtual void SinkFinished(const ExchangeSinkInstanceHandle &instance, const std::string &node_id, int flight_port) {
+		SinkFinished(instance.sink_handle, instance.attempt_id, node_id, flight_port);
+	}
+
 	/// Notify that all required sinks have finished.
 	/// Triggers source handle creation (e.g., listing committed files).
 	virtual void AllRequiredSinksFinished() = 0;

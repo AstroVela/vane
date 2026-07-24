@@ -6,21 +6,22 @@ from __future__ import annotations
 import concurrent.futures
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from duckdb.runners.ray.fragment_worker_control import (
-    enqueue_ordered_fte_control,
-)
+from duckdb.runners.fte import FteTaskAttemptId, validate_fte_status_identity
 from duckdb.runners.ray.fragment_registry import (
     _FTE_CLOSING_QUERIES,
     _FTE_REGISTRY_LOCK,
 )
+from duckdb.runners.ray.fragment_worker_control import (
+    enqueue_ordered_fte_control,
+)
 from duckdb.runners.ray.fte_fragment_scheduler import (
+    _drop_fragment_plan_refs_for_query,
+    _drop_fte_registry_for_query,
     begin_fte_registry_operation,
     begin_fte_registry_teardown_operation,
     close_fte_registry_for_query,
-    _drop_fragment_plan_refs_for_query,
-    _drop_fte_registry_for_query,
     end_fte_registry_operation,
     end_fte_registry_teardown_operation,
     quiesce_fte_registry_for_query,
@@ -37,7 +38,6 @@ from duckdb.runners.ray.safe_get import (
     configured_ray_get_timeout_s,
     resolve_object_refs_blocking,
 )
-from duckdb.runners.fte import FteTaskAttemptId, validate_fte_status_identity
 
 
 class FteControlBarrierPendingError(RuntimeError):
@@ -49,10 +49,23 @@ class FteControlBarrierTerminalError(RuntimeError):
 
 
 class FteWorkerTaskControlMixin:
+    actor_handle: Any
+    _fte_control_lock: Any
+    _fte_control_tails_by_task: dict[str, Any]
+    _fte_control_query_by_task: dict[str, str]
+    _fte_control_operation_by_task: dict[str, str]
+    _fte_drop_incomplete_queries: set[str]
+    _fte_prepare_terminal_errors: dict[str, BaseException]
+    _fragment_drop_incomplete_queries: set[str]
+
+    if TYPE_CHECKING:
+
+        def _drop_fragment_registration_state(self, query_id: str) -> None: ...
+
     def _fte_control_rpc(
         self,
         method_name: str,
-        *args,
+        *args: Any,
         timeout_s: float | None = None,
         cancel_event: Any = None,
     ) -> Any:
@@ -236,7 +249,7 @@ class FteWorkerTaskControlMixin:
                 end_fte_registry_operation(query_id)
             raise
 
-    def _submit_tracked_fte_drop_ref(self, query_id: str) -> Any:
+    def _submit_tracked_fte_drop_ref(self, query_id: str, method_name: str) -> Any:
         begin_fte_registry_teardown_operation(query_id)
         owns_registry_operation = True
         try:
@@ -246,7 +259,8 @@ class FteWorkerTaskControlMixin:
             drop_ref = None
             for attempt in range(attempts):
                 try:
-                    drop_ref = self.actor_handle.fte_drop_query.remote(query_id)
+                    method = getattr(self.actor_handle, method_name)
+                    drop_ref = method.remote(query_id)
                     break
                 except Exception as exc:
                     last_error = exc
@@ -534,6 +548,16 @@ class FteWorkerTaskControlMixin:
                     self._fte_control_query_by_task.pop(task_key, None)
                     self._fte_control_operation_by_task.pop(task_key, None)
 
+        terminal_error: FteControlBarrierTerminalError | None = None
+        if terminal_errors:
+            terminal_error = FteControlBarrierTerminalError(
+                f"FTE control barrier reached terminal failures for {query_key}: " + "; ".join(terminal_errors)
+            )
+            # Terminal entries are removed from the control tail above. Keep
+            # their failure visible across a simultaneous pending operation,
+            # fence retry, or remote-drop retry until final storage cleanup.
+            with self._fte_control_lock:
+                self._fte_prepare_terminal_errors.setdefault(query_key, terminal_error)
         if pending_entries:
             details = ["pending=" + ",".join(task_key for task_key, _, _ in pending_entries)]
             if barrier_resolution_error is not None:
@@ -542,11 +566,8 @@ class FteWorkerTaskControlMixin:
             raise FteControlBarrierPendingError(
                 f"FTE control barrier still has non-terminal operations for {query_key}: " + "; ".join(details)
             )
-        if terminal_errors:
-            details = list(terminal_errors)
-            raise FteControlBarrierTerminalError(
-                f"FTE control barrier reached terminal failures for {query_key}: " + "; ".join(details)
-            )
+        if terminal_error is not None:
+            raise terminal_error
         return statuses
 
     def _has_fte_control_state_for_query(self, query_id: str) -> bool:
@@ -557,7 +578,11 @@ class FteWorkerTaskControlMixin:
     def _has_fte_teardown_state_for_query(self, query_id: str) -> bool:
         query_key = str(query_id or "").strip()
         with self._fte_control_lock:
-            return query_key in self._fte_drop_incomplete_queries or query_key in self._fragment_drop_incomplete_queries
+            return (
+                query_key in self._fte_drop_incomplete_queries
+                or query_key in self._fragment_drop_incomplete_queries
+                or query_key in self._fte_prepare_terminal_errors
+            )
 
     def fte_cancel_task(self, task_id: str | dict[str, Any]) -> dict[str, Any]:
         raw_status = self._enqueue_ordered_fte_control_rpc("fte_cancel_task", task_id)
@@ -565,7 +590,7 @@ class FteWorkerTaskControlMixin:
             raise TypeError("worker actor fte_cancel_task must return a dict")
         return dict(raw_status)
 
-    def fte_drop_query(self, query_id: str) -> dict[str, int]:
+    def fte_prepare_drop_query(self, query_id: str) -> dict[str, int]:
         query_id = (query_id or "").strip()
         if not query_id:
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
@@ -600,18 +625,21 @@ class FteWorkerTaskControlMixin:
             raise FteControlBarrierPendingError(
                 f"FTE query teardown retained pending control ownership for {query_id}: {barrier_pending_error}"
             ) from barrier_pending_error
+        if barrier_error is not None:
+            with self._fte_control_lock:
+                self._fte_prepare_terminal_errors.setdefault(query_id, barrier_error)
         drop_error: BaseException | None = None
         local_error: BaseException | None = None
         result: dict[str, int] = {}
         try:
-            drop_ref = self._submit_tracked_fte_drop_ref(query_id)
+            drop_ref = self._submit_tracked_fte_drop_ref(query_id, "fte_prepare_drop_query")
             raw_result = self._get_fte_control_ref(
-                "fte_drop_query",
+                "fte_prepare_drop_query",
                 drop_ref,
                 honor_query_deadline=False,
             )
             if not isinstance(raw_result, dict):
-                raise TypeError("worker actor fte_drop_query must return a dict")
+                raise TypeError("worker actor fte_prepare_drop_query must return a dict")
             result = {str(key): int(value) for key, value in raw_result.items()}
         except BaseException as exc:
             drop_error = exc
@@ -620,11 +648,9 @@ class FteWorkerTaskControlMixin:
                 self._drop_fragment_registration_state(query_id)
                 _drop_fragment_plan_refs_for_query(query_id)
                 _drop_fte_registry_for_query(query_id)
-                with self._fte_control_lock:
-                    self._fte_drop_incomplete_queries.discard(query_id)
             except BaseException as exc:
                 local_error = exc
-        if barrier_error is not None or drop_error is not None or local_error is not None:
+        if drop_error is not None or local_error is not None:
             details = []
             if barrier_error is not None:
                 details.append(f"barrier={type(barrier_error).__name__}: {barrier_error}")
@@ -636,4 +662,38 @@ class FteWorkerTaskControlMixin:
                 local_error if local_error is not None else (barrier_error if barrier_error is not None else drop_error)
             )
             raise RuntimeError(f"FTE query teardown failed for {query_id}: " + "; ".join(details)) from cause
+        return result
+
+    def fte_cleanup_query(self, query_id: str) -> dict[str, int]:
+        query_id = (query_id or "").strip()
+        if not query_id:
+            return {
+                "flight_shuffle_registry_entries_removed": 0,
+                "flight_shuffle_storage_entries_removed": 0,
+                "flight_shuffle_cleanup_errors": 0,
+            }
+        try:
+            cleanup_ref = self._submit_tracked_fte_drop_ref(query_id, "fte_cleanup_query")
+            raw_result = self._get_fte_control_ref(
+                "fte_cleanup_query",
+                cleanup_ref,
+                honor_query_deadline=False,
+            )
+            if not isinstance(raw_result, dict):
+                raise TypeError("worker actor fte_cleanup_query must return a dict")
+            result = {str(key): int(value) for key, value in raw_result.items()}
+        except BaseException as exc:
+            raise RuntimeError(f"FTE query storage cleanup failed for {query_id}: {exc}") from exc
+        with self._fte_control_lock:
+            self._fte_drop_incomplete_queries.discard(query_id)
+            terminal_error = self._fte_prepare_terminal_errors.pop(query_id, None)
+        if terminal_error is not None:
+            raise RuntimeError(
+                f"FTE query teardown reached a terminal control failure for {query_id}: {terminal_error}"
+            ) from terminal_error
+        return result
+
+    def fte_drop_query(self, query_id: str) -> dict[str, int]:
+        result = self.fte_prepare_drop_query(query_id)
+        result.update(self.fte_cleanup_query(query_id))
         return result

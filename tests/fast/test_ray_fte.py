@@ -3345,9 +3345,10 @@ def test_fte_fragment_execution_retries_base_remote_exchange_sink_instance():
         "task_partition_id": 0,
         "partition_id": 0,
         "attempt_id": 0,
+        "query_id": "q",
         "output_partition_count": 4,
-        "output_location": "q_shuffle_3__sink_0__attempt_0",
-        "attempt_path": "q_shuffle_3__sink_0__attempt_0",
+        "output_location": "55f8c578-9c57-4b9d-bdc2-ef62d1dfc323__sink_0__attempt_0",
+        "attempt_path": "55f8c578-9c57-4b9d-bdc2-ef62d1dfc323__sink_0__attempt_0",
     }
 
     def select_worker(partition):
@@ -3387,6 +3388,7 @@ def test_fte_fragment_execution_retries_base_remote_exchange_sink_instance():
     assert retry.request["exchange_sink_instance"]["output_location"].endswith("__attempt_1")
     assert retry.request["exchange_sink_instance"]["attempt_path"].endswith("__attempt_1")
     assert retry.request["exchange_sink_instance"]["output_partition_count"] == 4
+    assert retry.request["exchange_sink_instance"]["query_id"] == "q"
     assert retry_request["exchange_sink_instance"] == retry.request["exchange_sink_instance"]
 
 

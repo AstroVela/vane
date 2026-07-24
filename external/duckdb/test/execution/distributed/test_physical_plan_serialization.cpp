@@ -31,6 +31,7 @@
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
 #include "duckdb/execution/distributed/exchange/flight_exchange_manager.hpp"
+#include "duckdb/execution/distributed/plan/exchange_sink_instance_task.hpp"
 #include "duckdb/execution/distributed/plan/exchange_source_task.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
@@ -1118,11 +1119,16 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	distributed::ExchangeSinkInstanceHandle sink_handle;
 	sink_handle.sink_handle.task_partition_id = 7;
 	sink_handle.attempt_id = 2;
+	sink_handle.query_id = "query-session-a";
 	sink_handle.output_location = "shuffle_stage__sink_7__attempt_2";
 	sink_handle.output_partition_count = 4;
+	sink_handle.flight_server_epoch = "sink-epoch";
 
 	distributed::FlightExchangeConfig flight_config;
 	flight_config.node_id = "node-1";
+	flight_config.local_dirs = {"/session-a/shuffle-0", "/session-a/shuffle-1"};
+	flight_config.flight_bind_host = "127.0.0.2";
+	flight_config.flight_port = 4242;
 	auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
 
 	vector<unique_ptr<Expression>> partition_by;
@@ -1149,8 +1155,98 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	REQUIRE(sink_ptr->NumPartitions() == 4);
 	REQUIRE(sink_ptr->SinkHandle().sink_handle.task_partition_id == 7);
 	REQUIRE(sink_ptr->SinkHandle().attempt_id == 2);
+	REQUIRE(sink_ptr->SinkHandle().query_id == "query-session-a");
 	REQUIRE(sink_ptr->SinkHandle().output_location == "shuffle_stage__sink_7__attempt_2");
 	REQUIRE(sink_ptr->SinkHandle().output_partition_count == 4);
+	REQUIRE(sink_ptr->SinkHandle().flight_server_epoch == "sink-epoch");
+	auto roundtrip_manager =
+	    std::dynamic_pointer_cast<distributed::FlightExchangeManager>(sink_ptr->GetExchangeManager());
+	const std::vector<std::string> expected_local_dirs = {"/session-a/shuffle-0", "/session-a/shuffle-1"};
+	REQUIRE(roundtrip_manager != nullptr);
+	REQUIRE(roundtrip_manager->config().node_id == "node-1");
+	REQUIRE(roundtrip_manager->config().local_dirs == expected_local_dirs);
+	REQUIRE(roundtrip_manager->config().flight_bind_host == "127.0.0.2");
+	REQUIRE(roundtrip_manager->config().flight_port == 4242);
+}
+
+TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
+          "[serialization][physical_plan][exchange]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+
+	distributed::ExchangeSinkInstanceHandle plan_handle;
+	plan_handle.sink_handle.task_partition_id = 7;
+	plan_handle.attempt_id = 0;
+	plan_handle.query_id = "query-runtime-sink";
+	plan_handle.output_location = "opaque-exchange__sink_7__attempt_0";
+	plan_handle.output_partition_count = 4;
+
+	distributed::FlightExchangeConfig flight_config;
+	flight_config.node_id = "node-1";
+	auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
+	auto &sink_op = plan.Make<PhysicalRemoteExchangeSink>(vector<LogicalType> {LogicalType::INTEGER}, 123,
+	                                                      "diagnostic-stage", 4, RepartitionSpec::Type::Random,
+	                                                      vector<unique_ptr<Expression>> {}, plan_handle, exchange_mgr);
+	auto &sink = sink_op.Cast<PhysicalRemoteExchangeSink>();
+	plan.SetRoot(sink);
+
+	distributed::ExchangeSinkInstanceTaskDescriptor descriptor;
+	descriptor.sink_instance = plan_handle;
+	descriptor.sink_instance.attempt_id = 2;
+	descriptor.sink_instance.output_location = "opaque-exchange__sink_7__attempt_2";
+
+	string error;
+	auto invalid = descriptor;
+	invalid.sink_instance.query_id = "other-query";
+	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
+	REQUIRE(error.find("query") != string::npos);
+	REQUIRE(sink.SinkHandle().attempt_id == 0);
+
+	error.clear();
+	invalid = descriptor;
+	invalid.sink_instance.sink_handle.task_partition_id = 8;
+	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
+	REQUIRE(error.find("output location") != string::npos);
+	REQUIRE(sink.SinkHandle().attempt_id == 0);
+
+	error.clear();
+	invalid = descriptor;
+	invalid.sink_instance.sink_handle.task_partition_id = 8;
+	invalid.sink_instance.output_location = "opaque-exchange__sink_8__attempt_2";
+	REQUIRE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
+	REQUIRE(error.empty());
+	REQUIRE(sink.SinkHandle().sink_handle.task_partition_id == 8);
+	REQUIRE(sink.SinkHandle().output_location == "opaque-exchange__sink_8__attempt_2");
+
+	error.clear();
+	invalid = descriptor;
+	invalid.sink_instance.sink_handle.task_partition_id = 7;
+	invalid.sink_instance.output_location = "opaque-exchange__sink_7__attempt_2";
+	REQUIRE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
+	REQUIRE(error.empty());
+
+	error.clear();
+	invalid = descriptor;
+	invalid.sink_instance.output_partition_count = 0;
+	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
+	REQUIRE(error.find("partition count") != string::npos);
+	REQUIRE(sink.SinkHandle().attempt_id == 2);
+
+	error.clear();
+	invalid = descriptor;
+	invalid.sink_instance.output_location = "other-exchange__sink_7__attempt_2";
+	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
+	REQUIRE(error.find("output location") != string::npos);
+	REQUIRE(sink.SinkHandle().attempt_id == 2);
+
+	error.clear();
+	REQUIRE(distributed::ApplyExchangeSinkInstanceToPlan(plan, descriptor, &error));
+	REQUIRE(error.empty());
+	REQUIRE(sink.SinkHandle().query_id == "query-runtime-sink");
+	REQUIRE(sink.SinkHandle().sink_handle.task_partition_id == 7);
+	REQUIRE(sink.SinkHandle().attempt_id == 2);
+	REQUIRE(sink.SinkHandle().output_location == "opaque-exchange__sink_7__attempt_2");
+	REQUIRE(sink.SinkHandle().output_partition_count == 4);
 }
 
 TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source handles",
@@ -1167,6 +1263,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	handle0.partition_id = 0;
 	handle0.attempt_id = 3;
 	handle0.node_id = "node-1";
+	handle0.flight_server_epoch = "epoch-1";
 	handle0.files.push_back(ExchangeSourceFile("shuffle_stage__sink_0__attempt_0", 0));
 	source_handles.push_back(handle0);
 
@@ -1174,6 +1271,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	handle1.partition_id = 0;
 	handle1.attempt_id = 4;
 	handle1.node_id = "node-2";
+	handle1.flight_server_epoch = "epoch-2";
 	handle1.files.push_back(ExchangeSourceFile("shuffle_stage__sink_1__attempt_0", 0));
 	source_handles.push_back(handle1);
 
@@ -1181,11 +1279,14 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	handle2.partition_id = 1;
 	handle2.attempt_id = 3;
 	handle2.node_id = "node-1";
+	handle2.flight_server_epoch = "epoch-1";
 	handle2.files.push_back(ExchangeSourceFile("shuffle_stage__sink_0__attempt_0", 0));
 	source_handles.push_back(handle2);
 
 	distributed::FlightExchangeConfig flight_config;
 	flight_config.node_id = "node-1";
+	flight_config.flight_location_template = "grpc://{node}:6123";
+	flight_config.flight_timeout_seconds = 7.5;
 	auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
 
 	auto &source = plan.Make<PhysicalRemoteExchangeSource>(types, 456, "shuffle_stage", partition_indices,
@@ -1214,18 +1315,26 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	REQUIRE(source_ptr->SourceHandles()[0].partition_id == 0);
 	REQUIRE(source_ptr->SourceHandles()[0].attempt_id == 3);
 	REQUIRE(source_ptr->SourceHandles()[0].node_id == "node-1");
+	REQUIRE(source_ptr->SourceHandles()[0].flight_server_epoch == "epoch-1");
 	REQUIRE(source_ptr->SourceHandles()[0].files.size() == 1);
 	REQUIRE(source_ptr->SourceHandles()[0].files[0].path == "shuffle_stage__sink_0__attempt_0");
 	REQUIRE(source_ptr->SourceHandles()[1].partition_id == 0);
 	REQUIRE(source_ptr->SourceHandles()[1].attempt_id == 4);
 	REQUIRE(source_ptr->SourceHandles()[1].node_id == "node-2");
+	REQUIRE(source_ptr->SourceHandles()[1].flight_server_epoch == "epoch-2");
 	REQUIRE(source_ptr->SourceHandles()[1].files.size() == 1);
 	REQUIRE(source_ptr->SourceHandles()[1].files[0].path == "shuffle_stage__sink_1__attempt_0");
 	REQUIRE(source_ptr->SourceHandles()[2].partition_id == 1);
 	REQUIRE(source_ptr->SourceHandles()[2].attempt_id == 3);
 	REQUIRE(source_ptr->SourceHandles()[2].node_id == "node-1");
+	REQUIRE(source_ptr->SourceHandles()[2].flight_server_epoch == "epoch-1");
 	REQUIRE(source_ptr->SourceHandles()[2].files.size() == 1);
 	REQUIRE(source_ptr->SourceHandles()[2].files[0].path == "shuffle_stage__sink_0__attempt_0");
+	auto roundtrip_manager =
+	    std::dynamic_pointer_cast<distributed::FlightExchangeManager>(source_ptr->GetExchangeManager());
+	REQUIRE(roundtrip_manager != nullptr);
+	REQUIRE(roundtrip_manager->config().flight_location_template == "grpc://{node}:6123");
+	REQUIRE(roundtrip_manager->config().flight_timeout_seconds == 7.5);
 }
 
 TEST_CASE("PhysicalRemoteExchangeSource serialization preserves runtime source binding node id",
@@ -1268,6 +1377,40 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves runtime source b
 	REQUIRE(source_ptr->RuntimeSourceNodeId().GetIndex() == 42);
 }
 
+TEST_CASE("PhysicalRemoteExchangeSource serialization preserves an explicit empty catalog",
+          "[serialization][physical_plan][exchange]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+
+	distributed::FlightExchangeConfig flight_config;
+	flight_config.node_id = "node-1";
+	auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
+	auto &source_op = plan.Make<PhysicalRemoteExchangeSource>(
+	    vector<LogicalType> {LogicalType::INTEGER}, 0, "empty-exchange", vector<idx_t> {0},
+	    std::vector<distributed::ExchangeSourceHandle> {}, exchange_mgr, vector<string> {}, optional_idx());
+	auto &source = dynamic_cast<PhysicalRemoteExchangeSource &>(source_op);
+
+	MemoryStream stream(allocator);
+	SerializationOptions options;
+	BinarySerializer serializer(stream, options);
+	serializer.Begin();
+	source.Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Begin();
+	auto deserialized_op = PhysicalOperator::Deserialize(deserializer, plan);
+	deserializer.End();
+
+	auto *source_ptr = dynamic_cast<PhysicalRemoteExchangeSource *>(deserialized_op.get());
+	REQUIRE(source_ptr != nullptr);
+	REQUIRE(source_ptr->ExchangeId() == "empty-exchange");
+	REQUIRE(source_ptr->PartitionIndices() == vector<idx_t> {0});
+	REQUIRE(source_ptr->SourceHandles().empty());
+	REQUIRE_FALSE(source_ptr->RuntimeSourceNodeId().IsValid());
+}
+
 TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle attempt ids",
           "[serialization][physical_plan][exchange]") {
 	distributed::ExchangeSourceTaskDescriptor descriptor;
@@ -1280,7 +1423,8 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	handle0.attempt_id = 7;
 	handle0.node_id = "node-1";
 	handle0.flight_port = 5010;
-	handle0.files.push_back(ExchangeSourceFile("shuffle_stage__sink_0__attempt_7", 11));
+	handle0.flight_server_epoch = "epoch-1";
+	handle0.files.push_back(ExchangeSourceFile("shuffle_stage__sink_0__attempt_7", 0, 11));
 	descriptor.source_handles.push_back(handle0);
 
 	distributed::ExchangeSourceHandle handle1;
@@ -1288,7 +1432,8 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	handle1.attempt_id = 2;
 	handle1.node_id = "node-2";
 	handle1.flight_port = 5011;
-	handle1.files.push_back(ExchangeSourceFile("shuffle_stage__sink_1__attempt_2", 17));
+	handle1.flight_server_epoch = "epoch-2";
+	handle1.files.push_back(ExchangeSourceFile("shuffle_stage__sink_1__attempt_2", 0, 17));
 	descriptor.source_handles.push_back(handle1);
 
 	auto roundtrip = distributed::ExchangeSourceTaskDescriptor::DeserializeFromBytes(descriptor.SerializeToBytes());
@@ -1301,6 +1446,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	REQUIRE(roundtrip.source_handles[0].attempt_id == 7);
 	REQUIRE(roundtrip.source_handles[0].node_id == "node-1");
 	REQUIRE(roundtrip.source_handles[0].flight_port == 5010);
+	REQUIRE(roundtrip.source_handles[0].flight_server_epoch == "epoch-1");
 	REQUIRE(roundtrip.source_handles[0].files.size() == 1);
 	REQUIRE(roundtrip.source_handles[0].files[0].path == "shuffle_stage__sink_0__attempt_7");
 	REQUIRE(roundtrip.source_handles[0].files[0].file_size == 11);
@@ -1308,6 +1454,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	REQUIRE(roundtrip.source_handles[1].attempt_id == 2);
 	REQUIRE(roundtrip.source_handles[1].node_id == "node-2");
 	REQUIRE(roundtrip.source_handles[1].flight_port == 5011);
+	REQUIRE(roundtrip.source_handles[1].flight_server_epoch == "epoch-2");
 	REQUIRE(roundtrip.source_handles[1].files.size() == 1);
 	REQUIRE(roundtrip.source_handles[1].files[0].path == "shuffle_stage__sink_1__attempt_2");
 	REQUIRE(roundtrip.source_handles[1].files[0].file_size == 17);
@@ -1337,13 +1484,13 @@ TEST_CASE("ApplyExchangeSourceTasksToPlan patches runtime-bound exchange source"
 	handle0.partition_id = 0;
 	handle0.attempt_id = 5;
 	handle0.node_id = "node-1";
-	handle0.files.push_back(ExchangeSourceFile("shuffle_stage__sink_0__attempt_0", 11));
+	handle0.files.push_back(ExchangeSourceFile("shuffle_stage__sink_0__attempt_0", 0, 11));
 	descriptor.source_handles.push_back(handle0);
 	distributed::ExchangeSourceHandle handle1;
 	handle1.partition_id = 1;
 	handle1.attempt_id = 6;
 	handle1.node_id = "node-2";
-	handle1.files.push_back(ExchangeSourceFile("shuffle_stage__sink_1__attempt_0", 17));
+	handle1.files.push_back(ExchangeSourceFile("shuffle_stage__sink_1__attempt_0", 0, 17));
 	descriptor.source_handles.push_back(handle1);
 
 	std::unordered_map<idx_t, distributed::ExchangeSourceTaskDescriptor> tasks;

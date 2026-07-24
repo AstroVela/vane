@@ -206,6 +206,7 @@ def test_exchange_source_task_descriptor_preserves_attempt_ids():
             "attempt_id": 7,
             "node_id": "node-a",
             "flight_port": 5010,
+            "flight_server_epoch": "epoch-a",
             "files": [{"path": "shuffle__sink_0__attempt_7", "file_size": 11}],
         },
         {
@@ -213,6 +214,7 @@ def test_exchange_source_task_descriptor_preserves_attempt_ids():
             "attempt_id": 2,
             "node_id": "node-b",
             "flight_port": 5011,
+            "flight_server_epoch": "epoch-b",
             "files": [{"path": "shuffle__sink_1__attempt_2", "file_size": 17}],
         },
     ]
@@ -283,10 +285,12 @@ def test_flight_exchange_selected_attempt_runtime_path():
     assert all(h["attempt_id"] == 1 for h in sink0_handles)
     assert all(h["node_id"] == "worker-retry" for h in sink0_handles)
     assert all(h["flight_port"] == 5010 for h in sink0_handles)
+    assert all(h["flight_server_epoch"] == "worker-retry-epoch" for h in sink0_handles)
     assert all("__attempt_1" in h["path"] for h in sink0_handles)
     assert all(h["attempt_id"] == 0 for h in sink1_handles)
     assert all(h["node_id"] == "worker-first" for h in sink1_handles)
     assert all(h["flight_port"] == 5012 for h in sink1_handles)
+    assert all(h["flight_server_epoch"] == "worker-first-epoch" for h in sink1_handles)
 
 
 def test_flight_exchange_materialized_output_attempt_metadata_drives_completion():
@@ -300,11 +304,13 @@ def test_flight_exchange_materialized_output_attempt_metadata_drives_completion(
     assert all(h["attempt_id"] == 1 for h in sink0_handles)
     assert all(h["node_id"] == "worker-retry" for h in sink0_handles)
     assert all(h["flight_port"] == 5010 for h in sink0_handles)
+    assert all(h["flight_server_epoch"] == "worker-retry-epoch" for h in sink0_handles)
     assert all("__attempt_1" in h["path"] for h in sink0_handles)
     assert all("__attempt_0" not in h["path"] for h in sink0_handles)
     assert all(h["attempt_id"] == 0 for h in sink1_handles)
     assert all(h["node_id"] == "worker-first" for h in sink1_handles)
     assert all(h["flight_port"] == 5012 for h in sink1_handles)
+    assert all(h["flight_server_epoch"] == "worker-first-epoch" for h in sink1_handles)
 
 
 def test_ray_task_result_handle_uses_refreshed_worker_id_at_completion():
@@ -373,7 +379,7 @@ def test_flight_exchange_cleans_successful_unselected_attempt(tmp_path):
     assert result["selected_registry_after_cleanup"] is True
     assert result["loser_registry_after_cleanup"] is False
     assert result["selected_manifest_after_close"] is True
-    assert result["selected_registry_after_close"] is False
+    assert result["selected_registry_after_close"] is True
     assert set(result["handle_attempts"]) == {0}
     assert all(path == result["selected_output_location"] for path in result["handle_paths"])
     assert result["selected_output_location"] != result["loser_output_location"]
@@ -382,7 +388,7 @@ def test_flight_exchange_cleans_successful_unselected_attempt(tmp_path):
 def test_shuffle_cache_registry_query_cleanup_removes_attempt_storage(tmp_path):
     result = duckdb.ray_cxx.shuffle_cache_registry_query_cleanup_for_test(str(tmp_path))
 
-    assert result["registry_entries_removed"] == 1
+    assert result["registry_entries_removed"] == 0
     assert result["storage_entries_removed"] > 0
     assert result["cleanup_errors"] == 0
     assert result["cleanup_registry_after_defer"] is False
@@ -1131,21 +1137,14 @@ def test_shuffle_cache_fake_object_no_rename_manifest_commit(tmp_path):
     assert "attempt_id=7\n" in result["manifest"]
 
 
-def test_flight_exchange_source_recovers_from_manifest_after_registry_loss(tmp_path):
-    result = duckdb.ray_cxx.flight_exchange_source_manifest_recovery_for_test(str(tmp_path))
-
-    assert result["values"] == [21, 22, 23, 24]
-    assert result["finished"] is True
-    assert result["registry_present"] is False
+def test_flight_exchange_source_rejects_local_manifest_after_registry_loss(tmp_path):
+    with pytest.raises(Exception, match="not published"):
+        duckdb.ray_cxx.flight_exchange_source_rejects_local_manifest_for_test(str(tmp_path))
 
 
-def test_flight_exchange_source_recovers_remote_writer_from_shared_manifest(tmp_path):
-    result = duckdb.ray_cxx.flight_exchange_source_shared_manifest_recovery_for_test(str(tmp_path))
-
-    assert result["values"] == [71, 72, 73]
-    assert result["finished"] is True
-    assert result["registry_present"] is False
-    assert result["writer_node_id"] != result["reader_node_id"]
+def test_flight_exchange_source_rejects_remote_shared_manifest_without_catalog_publication(tmp_path):
+    with pytest.raises(Exception, match="not published"):
+        duckdb.ray_cxx.flight_exchange_source_rejects_shared_manifest_for_test(str(tmp_path))
 
 
 def _run_python_json(code: str) -> dict:
@@ -1166,29 +1165,33 @@ def _write_shared_manifest_in_subprocess(tmp_path) -> dict:
         import json
         import duckdb
 
-        result = dict(duckdb.ray_cxx.flight_exchange_source_write_shared_manifest_for_test({str(tmp_path)!r}))
+        result = dict(duckdb.ray_cxx.flight_exchange_source_write_unpublished_shared_manifest_for_test({str(tmp_path)!r}))
         print(json.dumps(result), flush=True)
         """
     )
     return _run_python_json(writer_code)
 
 
-def test_flight_exchange_source_recovers_shared_manifest_after_writer_process_exit(tmp_path):
+def test_flight_exchange_source_rejects_shared_manifest_after_writer_process_exit(tmp_path):
     writer_result = _write_shared_manifest_in_subprocess(tmp_path)
     reader_code = textwrap.dedent(
         f"""
         import json
         import duckdb
 
-        result = dict(duckdb.ray_cxx.flight_exchange_source_read_shared_manifest_for_test(
-            {str(tmp_path)!r},
-            {writer_result["output_location"]!r},
-            {writer_result["writer_node_id"]!r},
-            "reader-node",
-            {int(writer_result["partition_id"])},
-            {int(writer_result["attempt_id"])},
-        ))
-        result["values"] = list(result["values"])
+        try:
+            duckdb.ray_cxx.flight_exchange_source_rejects_unpublished_shared_manifest_for_test(
+                {str(tmp_path)!r},
+                {writer_result["output_location"]!r},
+                {writer_result["writer_node_id"]!r},
+                "reader-node",
+                {int(writer_result["partition_id"])},
+                {int(writer_result["attempt_id"])},
+            )
+        except Exception as exc:
+            result = {{"read_error": str(exc)}}
+        else:
+            result = {{"read_error": ""}}
         print(json.dumps(result), flush=True)
         """
     )
@@ -1196,26 +1199,22 @@ def test_flight_exchange_source_recovers_shared_manifest_after_writer_process_ex
 
     assert Path(writer_result["manifest_path"]).exists()
     assert Path(writer_result["committed_path"]).exists()
-    assert reader_result["values"] == [81, 82, 83]
-    assert reader_result["finished"] is True
-    assert reader_result["registry_present"] is False
-    assert reader_result["writer_node_id"] != reader_result["reader_node_id"]
+    assert "not published" in reader_result["read_error"]
 
 
-def test_flight_server_recovers_shared_manifest_after_writer_process_exit(tmp_path):
+def test_flight_server_rejects_unpublished_manifest_after_writer_process_exit(tmp_path):
     writer_result = _write_shared_manifest_in_subprocess(tmp_path)
     reader_code = textwrap.dedent(
         f"""
         import json
         import duckdb
 
-        result = dict(duckdb.ray_cxx.flight_server_read_shared_manifest_for_test(
+        result = dict(duckdb.ray_cxx.flight_server_rejects_unpublished_shared_manifest_for_test(
             {str(tmp_path)!r},
             {writer_result["output_location"]!r},
             {writer_result["writer_node_id"]!r},
             {int(writer_result["partition_id"])},
         ))
-        result["values"] = list(result["values"])
         print(json.dumps(result), flush=True)
         """
     )
@@ -1223,24 +1222,21 @@ def test_flight_server_recovers_shared_manifest_after_writer_process_exit(tmp_pa
 
     assert Path(writer_result["manifest_path"]).exists()
     assert Path(writer_result["committed_path"]).exists()
-    assert reader_result["values"] == [81, 82, 83]
-    assert reader_result["row_count"] == 3
+    assert reader_result["fetch_error"] is True
+    assert "not published" in reader_result["error"]
     assert reader_result["registry_present"] is False
 
 
-def test_remote_exchange_source_local_dirs_survive_serialization_for_manifest_recovery(tmp_path):
-    result = duckdb.ray_cxx.remote_exchange_source_local_dirs_roundtrip_recovery_for_test(str(tmp_path))
-
-    assert result["values"] == [41, 42]
-    assert result["node_id"]
-    assert result["registry_present"] is False
+def test_serialized_remote_exchange_source_does_not_bypass_catalog_with_local_dirs(tmp_path):
+    with pytest.raises(Exception, match="not published"):
+        duckdb.ray_cxx.remote_exchange_source_rejects_local_dirs_manifest_for_test(str(tmp_path))
 
 
-def test_flight_server_recovers_from_manifest_after_registry_loss(tmp_path):
-    result = duckdb.ray_cxx.flight_server_manifest_recovery_for_test(str(tmp_path))
+def test_flight_server_rejects_manifest_after_registry_loss(tmp_path):
+    result = duckdb.ray_cxx.flight_server_rejects_unpublished_manifest_for_test(str(tmp_path))
 
-    assert result["values"] == [31, 32]
-    assert result["row_count"] == 2
+    assert result["fetch_error"] is True
+    assert "not published" in result["error"]
     assert result["registry_present"] is False
 
 
@@ -2025,15 +2021,20 @@ def test_distributed_physical_plan_clone_scan_queue_cancel_does_not_cancel_sibli
 def test_ray_worker_manager_integration(monkeypatch):
     class DummyRayWorkerHandle:
         def __init__(self):
-            self.fte_drop_query_calls = []
+            self.fte_prepare_drop_query_calls = []
+            self.fte_cleanup_query_calls = []
 
-        def fte_drop_query(self, query_id):
-            self.fte_drop_query_calls.append(query_id)
+        def fte_prepare_drop_query(self, query_id):
+            self.fte_prepare_drop_query_calls.append(query_id)
             return {
                 "tasks_removed": 1,
                 "tasks_canceled": 0,
                 "fragments_removed": 1,
             }
+
+        def fte_cleanup_query(self, query_id):
+            self.fte_cleanup_query_calls.append(query_id)
+            return {}
 
         def stats_fragments(self):
             return {
@@ -2079,7 +2080,8 @@ def test_ray_worker_manager_integration(monkeypatch):
     assert stats["totals"]["lookup_hits"] == 3
 
     mgr.drop_query_fragments("query-lifecycle")
-    assert dummy_worker_handle.fte_drop_query_calls == ["query-lifecycle"]
+    assert dummy_worker_handle.fte_prepare_drop_query_calls == ["query-lifecycle"]
+    assert dummy_worker_handle.fte_cleanup_query_calls == ["query-lifecycle"]
 
 
 def test_ray_worker_manager_drop_is_best_effort_across_worker_failures(monkeypatch):
@@ -2090,8 +2092,8 @@ def test_ray_worker_manager_drop_is_best_effort_across_worker_failures(monkeypat
             self.worker_id = worker_id
             self.fail = fail
 
-        def fte_drop_query(self, query_id):
-            calls.append((self.worker_id, query_id))
+        def fte_prepare_drop_query(self, query_id):
+            calls.append(("prepare", self.worker_id, query_id))
             if self.fail:
                 raise RuntimeError(f"{self.worker_id} is dead")
             return {
@@ -2099,6 +2101,10 @@ def test_ray_worker_manager_drop_is_best_effort_across_worker_failures(monkeypat
                 "tasks_canceled": 0,
                 "fragments_removed": 1,
             }
+
+        def fte_cleanup_query(self, query_id):
+            calls.append(("cleanup", self.worker_id, query_id))
+            return {}
 
         def shutdown(self):
             pass
@@ -2132,8 +2138,8 @@ def test_ray_worker_manager_drop_is_best_effort_across_worker_failures(monkeypat
         manager.drop_query_fragments("query-best-effort-drop")
 
     assert sorted(calls) == [
-        ("worker-dead", "query-best-effort-drop"),
-        ("worker-live", "query-best-effort-drop"),
+        ("prepare", "worker-dead", "query-best-effort-drop"),
+        ("prepare", "worker-live", "query-best-effort-drop"),
     ]
 
 
@@ -2174,13 +2180,17 @@ def test_ray_worker_manager_drop_fans_out_after_result_payload_release_failure(m
             self.result_handles = []
             return handles
 
-        def fte_drop_query(self, actual_query_id):
-            drop_calls.append((self.worker_id, actual_query_id))
+        def fte_prepare_drop_query(self, actual_query_id):
+            drop_calls.append(("prepare", self.worker_id, actual_query_id))
             return {
                 "tasks_removed": 0,
                 "tasks_canceled": 0,
                 "fragments_removed": 0,
             }
+
+        def fte_cleanup_query(self, actual_query_id):
+            drop_calls.append(("cleanup", self.worker_id, actual_query_id))
+            return {}
 
         def shutdown(self):
             pass
@@ -2215,9 +2225,321 @@ def test_ray_worker_manager_drop_fans_out_after_result_payload_release_failure(m
     with pytest.raises(Exception, match="result payload release failed"):
         manager.drop_query_fragments(query_id)
 
+    assert [phase for phase, _worker_id, _query_id in drop_calls] == [
+        "prepare",
+        "prepare",
+        "cleanup",
+        "cleanup",
+    ]
     assert sorted(drop_calls) == [
-        ("worker-other", query_id),
-        ("worker-with-result", query_id),
+        ("cleanup", "worker-other", query_id),
+        ("cleanup", "worker-with-result", query_id),
+        ("prepare", "worker-other", query_id),
+        ("prepare", "worker-with-result", query_id),
+    ]
+
+
+def test_ray_worker_manager_shutdown_uses_global_prepare_barrier(monkeypatch):
+    calls: list[tuple[str, str]] = []
+
+    class DummyRayWorkerHandle:
+        def __init__(self, worker_id):
+            self.worker_id = worker_id
+
+        def prepare_shutdown(self):
+            calls.append(("prepare", self.worker_id))
+
+        def finish_shutdown(self):
+            assert len([phase for phase, _ in calls if phase == "prepare"]) == 2
+            calls.append(("finish", self.worker_id))
+
+        def abort_shutdown(self):
+            raise AssertionError("successful shutdown must not force-terminate actors")
+
+    def start_ray_workers(_existing_ids):
+        return [
+            duckdb.ray_cxx.RayWorkerRuntime(
+                "worker-a",
+                DummyRayWorkerHandle("worker-a"),
+                1.0,
+                0.0,
+                1024,
+            ),
+            duckdb.ray_cxx.RayWorkerRuntime(
+                "worker-b",
+                DummyRayWorkerHandle("worker-b"),
+                1.0,
+                0.0,
+                1024,
+            ),
+        ]
+
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(ray_worker_handle, "start_ray_workers", start_ray_workers)
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    manager = duckdb.ray_cxx.RayWorkerManager()
+    assert len(manager.worker_snapshots()) == 2
+
+    manager.shutdown()
+
+    assert [phase for phase, _ in calls] == ["prepare", "prepare", "finish", "finish"]
+    assert sorted(worker_id for phase, worker_id in calls if phase == "prepare") == ["worker-a", "worker-b"]
+    assert sorted(worker_id for phase, worker_id in calls if phase == "finish") == ["worker-a", "worker-b"]
+    manager.shutdown()
+    assert [phase for phase, _ in calls] == ["prepare", "prepare", "finish", "finish"]
+    with pytest.raises(Exception, match="shut down"):
+        manager.worker_snapshots()
+    with pytest.raises(Exception, match="shut down"):
+        manager.try_autoscale([{"CPU": 100, "GPU": 0, "memory": 0}])
+
+
+def test_ray_worker_manager_concurrent_shutdown_waits_for_first_result(monkeypatch):
+    prepare_entered = threading.Event()
+    release_prepare = threading.Event()
+    calls: list[str] = []
+
+    class DummyRayWorkerHandle:
+        def prepare_shutdown(self):
+            calls.append("prepare")
+            prepare_entered.set()
+            assert release_prepare.wait(timeout=5)
+
+        def finish_shutdown(self):
+            calls.append("finish")
+
+        def abort_shutdown(self):
+            raise AssertionError("successful shutdown must not abort")
+
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids: [
+            duckdb.ray_cxx.RayWorkerRuntime(
+                "worker-a",
+                DummyRayWorkerHandle(),
+                1.0,
+                0.0,
+                1024,
+            )
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    manager = duckdb.ray_cxx.RayWorkerManager()
+    assert len(manager.worker_snapshots()) == 1
+
+    outcomes: list[str] = []
+
+    def shutdown():
+        try:
+            manager.shutdown()
+        except BaseException as exc:
+            outcomes.append(f"error:{exc}")
+        else:
+            outcomes.append("ok")
+
+    first = threading.Thread(target=shutdown)
+    second = threading.Thread(target=shutdown)
+    first.start()
+    assert prepare_entered.wait(timeout=5)
+    second.start()
+    time.sleep(0.05)
+    assert outcomes == []
+    assert second.is_alive()
+
+    release_prepare.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+    assert first.is_alive() is False
+    assert second.is_alive() is False
+    assert outcomes == ["ok", "ok"]
+    assert calls == ["prepare", "finish"]
+
+
+def test_ray_worker_manager_shutdown_waits_for_entered_result_collection(monkeypatch):
+    status_entered = threading.Event()
+    release_status = threading.Event()
+    shutdown_finished = threading.Event()
+
+    class DummyRayWorkerHandle:
+        def fte_query_status(self, query_id):
+            status_entered.set()
+            assert release_status.wait(timeout=5)
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": [],
+            }
+
+        def pop_fte_result_handles(self, _query_id):
+            return []
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            raise AssertionError("successful shutdown must not abort")
+
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids: [
+            duckdb.ray_cxx.RayWorkerRuntime(
+                "worker-a",
+                DummyRayWorkerHandle(),
+                1.0,
+                0.0,
+                1024,
+            )
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    manager = duckdb.ray_cxx.RayWorkerManager()
+    assert len(manager.worker_snapshots()) == 1
+
+    wait_outcomes: list[str] = []
+
+    def wait_query():
+        try:
+            manager.wait_fte_query("query-entered-before-shutdown", 5.0)
+        except BaseException as exc:
+            wait_outcomes.append(f"error:{exc}")
+        else:
+            wait_outcomes.append("ok")
+
+    def shutdown():
+        manager.shutdown()
+        shutdown_finished.set()
+
+    waiter = threading.Thread(target=wait_query)
+    closer = threading.Thread(target=shutdown)
+    waiter.start()
+    assert status_entered.wait(timeout=5)
+    closer.start()
+    time.sleep(0.05)
+    assert shutdown_finished.is_set() is False
+
+    release_status.set()
+    waiter.join(timeout=5)
+    closer.join(timeout=5)
+    assert waiter.is_alive() is False
+    assert closer.is_alive() is False
+    assert wait_outcomes == ["ok"]
+    assert shutdown_finished.is_set()
+
+
+def test_ray_worker_manager_shutdown_aborts_all_actors_after_prepare_error(monkeypatch):
+    calls: list[tuple[str, str]] = []
+
+    class DummyRayWorkerHandle:
+        def __init__(self, worker_id, *, fail):
+            self.worker_id = worker_id
+            self.fail = fail
+
+        def prepare_shutdown(self):
+            calls.append(("prepare", self.worker_id))
+            if self.fail:
+                raise RuntimeError(f"{self.worker_id} prepare failed")
+
+        def finish_shutdown(self):
+            raise AssertionError("Flight services must not stop after a failed prepare barrier")
+
+        def abort_shutdown(self):
+            calls.append(("abort", self.worker_id))
+
+    def start_ray_workers(_existing_ids):
+        return [
+            duckdb.ray_cxx.RayWorkerRuntime(
+                "worker-failing",
+                DummyRayWorkerHandle("worker-failing", fail=True),
+                1.0,
+                0.0,
+                1024,
+            ),
+            duckdb.ray_cxx.RayWorkerRuntime(
+                "worker-clean",
+                DummyRayWorkerHandle("worker-clean", fail=False),
+                1.0,
+                0.0,
+                1024,
+            ),
+        ]
+
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(ray_worker_handle, "start_ray_workers", start_ray_workers)
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    manager = duckdb.ray_cxx.RayWorkerManager()
+    assert len(manager.worker_snapshots()) == 2
+
+    with pytest.raises(Exception, match="worker-failing prepare failed"):
+        manager.shutdown()
+
+    assert [phase for phase, _ in calls] == ["prepare", "prepare", "abort", "abort"]
+    assert sorted(worker_id for phase, worker_id in calls if phase == "abort") == [
+        "worker-clean",
+        "worker-failing",
+    ]
+
+
+def test_ray_worker_manager_shutdown_finishes_all_actors_after_finish_error(monkeypatch):
+    calls: list[tuple[str, str]] = []
+
+    class DummyRayWorkerHandle:
+        def __init__(self, worker_id, *, fail):
+            self.worker_id = worker_id
+            self.fail = fail
+
+        def prepare_shutdown(self):
+            calls.append(("prepare", self.worker_id))
+
+        def finish_shutdown(self):
+            calls.append(("finish", self.worker_id))
+            if self.fail:
+                raise RuntimeError(f"{self.worker_id} finish failed")
+
+        def abort_shutdown(self):
+            raise AssertionError("a finish error happens after the prepare barrier")
+
+    def start_ray_workers(_existing_ids):
+        return [
+            duckdb.ray_cxx.RayWorkerRuntime(
+                "worker-failing",
+                DummyRayWorkerHandle("worker-failing", fail=True),
+                1.0,
+                0.0,
+                1024,
+            ),
+            duckdb.ray_cxx.RayWorkerRuntime(
+                "worker-clean",
+                DummyRayWorkerHandle("worker-clean", fail=False),
+                1.0,
+                0.0,
+                1024,
+            ),
+        ]
+
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(ray_worker_handle, "start_ray_workers", start_ray_workers)
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    manager = duckdb.ray_cxx.RayWorkerManager()
+    assert len(manager.worker_snapshots()) == 2
+
+    with pytest.raises(Exception, match="worker-failing finish failed"):
+        manager.shutdown()
+
+    assert [phase for phase, _ in calls] == ["prepare", "prepare", "finish", "finish"]
+    assert sorted(worker_id for phase, worker_id in calls if phase == "finish") == [
+        "worker-clean",
+        "worker-failing",
     ]
 
 

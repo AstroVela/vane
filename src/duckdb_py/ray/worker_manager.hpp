@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
+#include <condition_variable>
 #include <chrono>
 #include <memory>
 
@@ -52,11 +53,39 @@ private:
 		    fte_result_handles_by_query;
 		std::unordered_map<string, std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>>>
 		    retained_fte_result_handles_by_query;
+		idx_t active_operations = 0;
+		bool shutdown_started = false;
+		bool shutdown_finished = false;
+		std::string shutdown_error;
+	};
+
+	class OperationGuard {
+	public:
+		explicit OperationGuard(const RayWorkerManager &manager)
+		    : manager_(manager), active_(manager_.BeginOperation()) {
+		}
+		OperationGuard(const OperationGuard &) = delete;
+		OperationGuard &operator=(const OperationGuard &) = delete;
+		~OperationGuard() {
+			if (active_) {
+				manager_.EndOperation();
+			}
+		}
+		explicit operator bool() const {
+			return active_;
+		}
+
+	private:
+		const RayWorkerManager &manager_;
+		bool active_;
 	};
 
 	mutable mutex mutex_;
+	mutable std::condition_variable shutdown_cv_;
 	mutable State state_;
 
+	bool BeginOperation() const;
+	void EndOperation() const;
 	static string QueryIdFromTaskEvents(const std::vector<duckdb::distributed::WorkerTask> &tasks);
 	void StoreFteResultHandles(const string &query_id,
 	                           std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> handles);

@@ -23,7 +23,7 @@ void RecordRemoteExchangeFinishedSinks(Exchange &exchange, const std::vector<Mat
 			node_id = *worker_id;
 		}
 		const auto &sink_instance = outputs[i].exchange_sink_instance();
-		exchange.SinkFinished(sink_instance.sink_handle, sink_instance.attempt_id, node_id, outputs[i].flight_port());
+		exchange.SinkFinished(sink_instance, node_id, outputs[i].flight_port());
 	}
 }
 
