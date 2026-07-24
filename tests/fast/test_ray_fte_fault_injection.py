@@ -398,7 +398,7 @@ def _shutdown_ray_for_fault_test() -> None:
         ray.shutdown()
     finally:
         _FAULT_RAY_CLUSTER = None
-        if cluster is not None:
+        if cluster is not None and os.environ.get("VANE_TEST_EXTERNAL_RAY_CLUSTER_CLEANUP") != "1":
             cluster.shutdown()
 
 

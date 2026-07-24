@@ -307,6 +307,11 @@ jobs:
             export VANE_UDF_TASK_HEAP_BYTES=1073741824
             export VANE_UDF_ACTOR_HEAP_BYTES=536870912
           fi
+          if [[ "$FAST_TEST_PHASE" == "owner-ray" ]]; then
+            # This runner is dedicated to one shard, so Ray daemon cleanup can
+            # happen outside pytest without risking an unrelated local cluster.
+            export VANE_FAST_TEST_EXTERNAL_RAY_CLEANUP=1
+          fi
           scripts/run_fast_tests.sh "$FAST_TEST_PHASE"
 
       - name: Stop residual Ray processes

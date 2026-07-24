@@ -15,6 +15,8 @@ Environment variables:
       Set to 1 to test installed packages while retaining checkout support modules.
   VANE_FAST_TEST_EXCLUDE_GPU
       Set to 1 to exclude tests marked gpu on CPU-only hosts.
+  VANE_FAST_TEST_EXTERNAL_RAY_CLEANUP
+      Set to 1 on an isolated host to stop Ray between owner-test processes.
   VANE_FAST_TEST_JUNIT_DIR
       Write one or more JUnit XML reports to this directory.
   VANE_FAST_TEST_NON_RAY_SHARD_COUNT
@@ -69,6 +71,16 @@ case "$exclude_gpu" in
   1) gpu_marker=" and not gpu" ;;
   *)
     printf 'VANE_FAST_TEST_EXCLUDE_GPU must be 0 or 1: %s\n' "$exclude_gpu" >&2
+    exit 2
+    ;;
+esac
+
+external_ray_cleanup="${VANE_FAST_TEST_EXTERNAL_RAY_CLEANUP:-0}"
+case "$external_ray_cleanup" in
+  0 | 1) ;;
+  *)
+    printf 'VANE_FAST_TEST_EXTERNAL_RAY_CLEANUP must be 0 or 1: %s\n' \
+      "$external_ray_cleanup" >&2
     exit 2
     ;;
 esac
@@ -133,6 +145,35 @@ run_reported_pytest() {
 run_ray_pytest() {
   VANE_TEST_RAY_OBJECT_STORE_BYTES="${ray_object_store_bytes}" \
     run_reported_pytest "$@"
+}
+
+run_owner_ray_pytest() {
+  if ((external_ray_cleanup)); then
+    VANE_TEST_EXTERNAL_RAY_CLUSTER_CLEANUP=1 run_ray_pytest "$@"
+  else
+    run_ray_pytest "$@"
+  fi
+}
+
+stop_owner_ray_processes() {
+  local cleanup_command=(ray stop --force)
+  local cleanup_output
+  if command -v timeout >/dev/null 2>&1; then
+    cleanup_command=(
+      timeout
+      --signal=TERM
+      --kill-after=10s
+      30s
+      "${cleanup_command[@]}"
+    )
+  fi
+  if cleanup_output="$("${cleanup_command[@]}" 2>&1)"; then
+    return 0
+  else
+    local cleanup_status=$?
+    printf '%s\n' "$cleanup_output" >&2
+    return "$cleanup_status"
+  fi
 }
 
 collect_nodeids() {
@@ -218,11 +259,17 @@ run_owner_ray_tests() {
     owner_index=$((owner_index + 1))
     local report_name
     printf -v report_name 'owner-ray-%02d' "$owner_index"
-    if ! run_ray_pytest \
+    if ! run_owner_ray_pytest \
       "$report_name" \
       -m "$marker" \
       "$nodeid"; then
       owner_status=1
+    fi
+    if ((external_ray_cleanup)); then
+      if ! stop_owner_ray_processes; then
+        printf 'Ray cleanup failed after owner test %s\n' "$nodeid" >&2
+        owner_status=1
+      fi
     fi
   done
   return "$owner_status"
