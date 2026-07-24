@@ -294,10 +294,13 @@ jobs:
           if [[ "$FAST_TEST_PHASE" != "non-ray" ]]; then
             # A public ubuntu-24.04 runner has 16 GiB RAM and no GPU. Keep the
             # Ray test topology below that physical limit while retaining the
-            # 2 GiB object store required by representative FTE plans.
+            # 2 GiB object store required by representative FTE plans. The
+            # tiny UDF fixtures keep multiple actor pools resident, so they do
+            # not need the production profile's 4 GiB heap per actor.
             export VANE_TEST_RAY_OBJECT_STORE_BYTES=2147483648
             export VANE_FTE_TASK_HEAP_BYTES=1073741824
             export VANE_UDF_TASK_HEAP_BYTES=1073741824
+            export VANE_UDF_ACTOR_HEAP_BYTES=536870912
           fi
           scripts/run_fast_tests.sh "$FAST_TEST_PHASE"
 

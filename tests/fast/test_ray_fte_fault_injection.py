@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -377,21 +378,33 @@ def _init_ray_for_fault_test(monkeypatch) -> None:
 def _shutdown_ray_for_fault_test() -> None:
     global _FAULT_RAY_RUNTIME_OWNED
 
+    ray_processes = ()
     try:
         from ray._private import worker as ray_worker
 
         ray_node = getattr(ray_worker.global_worker, "node", None)
+        if ray_node is not None:
+            ray_processes = tuple(
+                (process_type, process_info.process)
+                for process_type, process_infos in ray_node.all_processes.items()
+                for process_info in process_infos
+            )
     except Exception:
-        ray_node = None
+        pass
 
     ray.shutdown()
     _FAULT_RAY_RUNTIME_OWNED = False
-    if ray_node is not None:
-        ray_node.kill_all_processes(
-            check_alive=False,
-            allow_graceful=False,
-            wait=True,
-        )
+    # ray.shutdown() removes the node's process registry even when a process
+    # survives its bounded shutdown wait. Keep our own handles so no Ray reaper
+    # or agent can outlive this owner test and terminate pytest during
+    # session-finalization (before its JUnit report is written).
+    for process_type, process in ray_processes:
+        if process.poll() is None:
+            process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"Ray {process_type} process did not exit during fault-test cleanup") from exc
 
 
 @pytest.fixture(scope="module", autouse=True)

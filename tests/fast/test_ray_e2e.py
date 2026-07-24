@@ -931,6 +931,10 @@ def test_ray_udf_lazy_output_filter_materialize_distributed(ray_runner, duckdb_c
         schema={"id": duckdb.sqltype("INTEGER"), "score": duckdb.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
+        # This test exercises the two-pool materialization boundary, not
+        # CPU saturation. Fractional actors keep both pools plus the parent
+        # FTE slot schedulable on the standard four-core CI runner.
+        cpus=0.5,
         gpus=0.0,
         batch_size=2,
     )
@@ -939,6 +943,7 @@ def test_ray_udf_lazy_output_filter_materialize_distributed(ray_runner, duckdb_c
         schema={"combined": duckdb.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
+        cpus=0.5,
         gpus=0.0,
         batch_size=2,
     )
