@@ -209,8 +209,7 @@ void register_ray_bindings(py::module_ &mod) {
 	                           })
 	    .def_property_readonly("num_cpus", &RayWorkerRuntime::TotalNumCpus)
 	    .def_property_readonly("num_gpus", &RayWorkerRuntime::TotalNumGpus)
-	    .def_property_readonly("total_memory_bytes", &RayWorkerRuntime::TotalMemoryBytes)
-	    .def("shutdown", &RayWorkerRuntime::Shutdown);
+	    .def_property_readonly("total_memory_bytes", &RayWorkerRuntime::TotalMemoryBytes);
 	// Note: submit_task is not exposed - only used internally from C++
 
 	py::class_<duckdb::distributed::FteSplitQueue, std::shared_ptr<duckdb::distributed::FteSplitQueue>>(m,
@@ -292,7 +291,10 @@ void register_ray_bindings(py::module_ &mod) {
 	         })
 	    .def("shutdown",
 	         [](RayWorkerManager &self) {
-		         auto res = self.shutdown();
+		         auto res = [&]() {
+			         py::gil_scoped_release release;
+			         return self.shutdown();
+		         }();
 		         if (res.is_err()) {
 			         throw duckdb::InternalException(res.error().what());
 		         }
@@ -432,6 +434,20 @@ void register_ray_bindings(py::module_ &mod) {
 	    py::arg("query_id"));
 
 	m.def(
+	    "flight_shuffle_query_status",
+	    [](const string &query_id) {
+		    auto status = [&]() {
+			    py::gil_scoped_release release;
+			    return duckdb::distributed::ShuffleCacheRegistry::Instance().QueryStatus(query_id);
+		    }();
+		    py::dict out;
+		    out["cleanup_pending"] = status.cleanup_pending;
+		    out["active_executions"] = status.active_executions;
+		    return out;
+	    },
+	    py::arg("query_id"));
+
+	m.def(
 	    "cleanup_flight_shuffle_for_query",
 	    [](const string &query_id) {
 		    py::dict out;
@@ -441,6 +457,7 @@ void register_ray_bindings(py::module_ &mod) {
 			    out["cleanup_errors"] = 0;
 			    out["cleanup_pending"] = 0;
 			    out["active_executions"] = 0;
+			    out["last_error"] = "";
 			    return out;
 		    }
 		    auto cleanup_result = [&]() {
@@ -452,7 +469,21 @@ void register_ray_bindings(py::module_ &mod) {
 		    out["cleanup_errors"] = cleanup_result.cleanup_errors;
 		    out["cleanup_pending"] = cleanup_result.cleanup_pending;
 		    out["active_executions"] = cleanup_result.active_executions;
+		    out["last_error"] = cleanup_result.last_error;
 		    return out;
+	    },
+	    py::arg("query_id"));
+
+	m.def(
+	    "retire_flight_shuffle_query",
+	    [](const string &query_id) {
+		    auto result = [&]() {
+			    py::gil_scoped_release release;
+			    return duckdb::distributed::ShuffleCacheRegistry::Instance().RetireQuery(query_id);
+		    }();
+		    if (result.is_err()) {
+			    throw std::runtime_error(result.error().what());
+		    }
 	    },
 	    py::arg("query_id"));
 
@@ -771,6 +802,11 @@ void register_ray_bindings(py::module_ &mod) {
 	        py::arg("file_infos"), py::arg("copy_spec"), py::arg("staging_root"), py::arg("conn") = py::none())
 	    .def("drop_query_fragments", &PyPhysicalPlanWrapperRunner::drop_query_fragments, py::arg("query_id"))
 	    .def("warm_up", &PyPhysicalPlanWrapperRunner::warm_up)
+	    .def("shutdown",
+	         [](PyPhysicalPlanWrapperRunner &self) {
+		         py::gil_scoped_release release;
+		         self.shutdown();
+	         })
 	    .def("fragment_stats",
 	         [](PyPhysicalPlanWrapperRunner &self) {
 		         return BuildFragmentStatsSummary(self.fragment_stats_by_worker());
@@ -1565,8 +1601,11 @@ void register_ray_bindings(py::module_ &mod) {
 		    };
 
 		    auto lost_node_id = write_attempt(lost_instance, {101});
+		    lost_instance.flight_server_epoch = FlightExchangeManager::GetLocalFlightServerEpoch();
 		    auto selected_node_id = write_attempt(selected_instance, {201, 202});
-		    exchange->SinkFinished(sink_handle, 1, selected_node_id, 0);
+		    selected_instance.flight_server_epoch = FlightExchangeManager::GetLocalFlightServerEpoch();
+		    const auto flight_port = FlightExchangeManager::GetLocalFlightServerPort();
+		    exchange->SinkFinished(selected_instance, selected_node_id, flight_port);
 		    exchange->AllRequiredSinksFinished();
 		    auto handles = exchange->GetSourceHandles();
 
@@ -1586,7 +1625,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    };
 
 		    auto selected_values_before_late_loser = read_values(handles);
-		    exchange->SinkFinished(sink_handle, 0, lost_node_id, 0);
+		    exchange->SinkFinished(lost_instance, lost_node_id, flight_port);
 		    auto selected_values_after_late_loser = read_values(handles);
 
 		    auto manifest_exists = [&](const ExchangeSinkInstanceHandle &instance, const std::string &node_id) {
@@ -1621,6 +1660,14 @@ void register_ray_bindings(py::module_ &mod) {
 		    out["lost_manifest_exists_after_late_loser"] = manifest_exists(lost_instance, lost_node_id);
 		    out["selected_manifest_exists_after_late_loser"] = manifest_exists(selected_instance, selected_node_id);
 		    exchange->Close();
+		    auto cleanup = ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(exchange_context.query_id);
+		    if (cleanup.cleanup_errors != 0 || cleanup.cleanup_pending != 0) {
+			    throw std::runtime_error("failed to clean selected-attempt dataplane test query");
+		    }
+		    auto retire = ShuffleCacheRegistry::Instance().RetireQuery(exchange_context.query_id);
+		    if (retire.is_err()) {
+			    throw std::runtime_error(retire.error().what());
+		    }
 		    return out;
 	    },
 	    py::arg("local_dir"), "Verify FlightExchangeSource reads only the selected retry attempt data.");
@@ -1686,8 +1733,11 @@ void register_ray_bindings(py::module_ &mod) {
 		    };
 
 		    auto selected_node_id = write_attempt(selected_instance, 101);
-		    exchange->SinkFinished(sink_handle, 0, selected_node_id, 0);
+		    selected_instance.flight_server_epoch = FlightExchangeManager::GetLocalFlightServerEpoch();
+		    const auto flight_port = FlightExchangeManager::GetLocalFlightServerPort();
+		    exchange->SinkFinished(selected_instance, selected_node_id, flight_port);
 		    auto loser_node_id = write_attempt(loser_instance, 202);
+		    loser_instance.flight_server_epoch = FlightExchangeManager::GetLocalFlightServerEpoch();
 
 		    auto make_cache = [&](const std::string &output_location, const std::string &cache_node_id) {
 			    ShuffleCacheConfig cache_config;
@@ -1707,7 +1757,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    auto loser_registry_before =
 		        ShuffleCacheRegistry::Instance().Get(loser_instance.output_location) != nullptr;
 
-		    exchange->SinkFinished(sink_handle, 1, loser_node_id, 0);
+		    exchange->SinkFinished(loser_instance, loser_node_id, flight_port);
 		    exchange->AllRequiredSinksFinished();
 		    auto handles = exchange->GetSourceHandles();
 
@@ -1748,6 +1798,14 @@ void register_ray_bindings(py::module_ &mod) {
 		    out["loser_output_location"] = loser_instance.output_location;
 		    out["handle_paths"] = handle_paths;
 		    out["handle_attempts"] = handle_attempts;
+		    auto cleanup = ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(ctx.query_id);
+		    if (cleanup.cleanup_errors != 0 || cleanup.cleanup_pending != 0) {
+			    throw std::runtime_error("failed to clean unselected-attempt test query");
+		    }
+		    auto retire = ShuffleCacheRegistry::Instance().RetireQuery(ctx.query_id);
+		    if (retire.is_err()) {
+			    throw std::runtime_error(retire.error().what());
+		    }
 		    return out;
 	    },
 	    py::arg("local_dir"), "Exercise cleanup of successful unselected FlightExchange attempts.");
@@ -2514,6 +2572,14 @@ void register_ray_bindings(py::module_ &mod) {
 		    out["selected_values_after_loser_cleanup"] = selected_values_after_cleanup;
 		    out["lost_manifest_after_cleanup_error"] = lost_manifest_after_cleanup_error;
 		    out["selected_cleanup_removed"] = selected_cleanup_res.value();
+		    auto cleanup = ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(exchange_context.query_id);
+		    if (cleanup.cleanup_errors != 0 || cleanup.cleanup_pending != 0) {
+			    throw std::runtime_error("failed to clean MinIO selected-attempt test query");
+		    }
+		    auto retire = ShuffleCacheRegistry::Instance().RetireQuery(exchange_context.query_id);
+		    if (retire.is_err()) {
+			    throw std::runtime_error(retire.error().what());
+		    }
 		    tx_guard.Commit();
 		    return out;
 	    },
@@ -2754,7 +2820,7 @@ void register_ray_bindings(py::module_ &mod) {
 	    py::arg("local_dir"), "Exercise ShuffleCache manifest commit on a fake no-rename object storage backend.");
 
 	m.def(
-	    "flight_exchange_source_manifest_recovery_for_test",
+	    "flight_exchange_source_rejects_local_manifest_for_test",
 	    [](const std::string &local_dir) {
 		    using namespace duckdb;
 		    using namespace duckdb::distributed;
@@ -2766,7 +2832,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    vector<LogicalType> types = {LogicalType::INTEGER};
 		    vector<string> names = {"value"};
 		    const std::string output_location = "flight_exchange_source_manifest_recovery_test__sink_0__attempt_1";
-		    const std::string node_id = "node-a";
+		    const std::string node_id = "127.0.0.1";
+		    const std::string server_epoch = "unpublished-local-manifest-epoch";
 
 		    ShuffleCacheConfig write_config;
 		    write_config.shuffle_stage_id = output_location;
@@ -2796,6 +2863,16 @@ void register_ray_bindings(py::module_ &mod) {
 		    }
 		    ShuffleCacheRegistry::Instance().Remove(output_location);
 
+		    FlightServerConfig server_config;
+		    server_config.bind_host = "127.0.0.1";
+		    server_config.port = 0;
+		    server_config.server_epoch = server_epoch;
+		    FlightServer server(std::move(server_config));
+		    auto start_res = server.Start();
+		    if (start_res.is_err()) {
+			    throw std::runtime_error(start_res.error().what());
+		    }
+
 		    FlightExchangeConfig source_config;
 		    source_config.node_id = node_id;
 		    source_config.local_dirs = {local_dir};
@@ -2806,6 +2883,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    handle.partition_id = 1;
 		    handle.attempt_id = 1;
 		    handle.node_id = node_id;
+		    handle.flight_port = server.port();
+		    handle.flight_server_epoch = server_epoch;
 		    ExchangeSourceFile file;
 		    file.path = output_location;
 		    file.file_size = 0;
@@ -2830,10 +2909,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    return out;
 	    },
 	    py::arg("local_dir"),
-	    "Exercise FlightExchangeSource manifest recovery when ShuffleCacheRegistry has no entry.");
+	    "Verify that FlightExchangeSource rejects a local manifest missing published server identity.");
 
 	m.def(
-	    "flight_exchange_source_shared_manifest_recovery_for_test",
+	    "flight_exchange_source_rejects_shared_manifest_for_test",
 	    [](const std::string &local_dir) {
 		    using namespace duckdb;
 		    using namespace duckdb::distributed;
@@ -2846,8 +2925,9 @@ void register_ray_bindings(py::module_ &mod) {
 		    vector<string> names = {"value"};
 		    const std::string output_location =
 		        "flight_exchange_source_shared_manifest_recovery_test__sink_0__attempt_1";
-		    const std::string writer_node_id = "writer-node";
+		    const std::string writer_node_id = "127.0.0.1";
 		    const std::string reader_node_id = "reader-node";
+		    const std::string server_epoch = "unpublished-shared-manifest-epoch";
 
 		    ShuffleCacheConfig write_config;
 		    write_config.shuffle_stage_id = output_location;
@@ -2876,6 +2956,16 @@ void register_ray_bindings(py::module_ &mod) {
 		    }
 		    ShuffleCacheRegistry::Instance().Remove(output_location);
 
+		    FlightServerConfig server_config;
+		    server_config.bind_host = "127.0.0.1";
+		    server_config.port = 0;
+		    server_config.server_epoch = server_epoch;
+		    FlightServer server(std::move(server_config));
+		    auto start_res = server.Start();
+		    if (start_res.is_err()) {
+			    throw std::runtime_error(start_res.error().what());
+		    }
+
 		    FlightExchangeConfig source_config;
 		    source_config.node_id = reader_node_id;
 		    source_config.local_dirs = {local_dir};
@@ -2886,6 +2976,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    handle.partition_id = 1;
 		    handle.attempt_id = 1;
 		    handle.node_id = writer_node_id;
+		    handle.flight_port = server.port();
+		    handle.flight_server_epoch = server_epoch;
 		    ExchangeSourceFile file;
 		    file.path = output_location;
 		    file.file_size = 0;
@@ -2912,10 +3004,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    return out;
 	    },
 	    py::arg("local_dir"),
-	    "Exercise shared filesystem manifest recovery for a remote writer without using Flight server.");
+	    "Verify that FlightExchangeSource rejects a shared manifest missing published server identity.");
 
 	m.def(
-	    "flight_exchange_source_write_shared_manifest_for_test",
+	    "flight_exchange_source_write_unpublished_shared_manifest_for_test",
 	    [](const std::string &local_dir) {
 		    using namespace duckdb;
 		    using namespace duckdb::distributed;
@@ -2927,7 +3019,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    vector<LogicalType> types = {LogicalType::INTEGER};
 		    vector<string> names = {"value"};
 		    const std::string output_location = "flight_exchange_source_cross_process_manifest_test__sink_0__attempt_1";
-		    const std::string writer_node_id = "writer-node";
+		    const std::string writer_node_id = "127.0.0.1";
 		    const idx_t sink_partition_id = 0;
 		    const idx_t attempt_id = 1;
 		    const idx_t output_partition_id = 1;
@@ -2968,10 +3060,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    out["registry_present"] = ShuffleCacheRegistry::Instance().Get(output_location) != nullptr;
 		    return out;
 	    },
-	    py::arg("local_dir"), "Write a committed shared-manifest exchange attempt for cross-process recovery tests.");
+	    py::arg("local_dir"), "Write a committed but unpublished shared-manifest exchange attempt.");
 
 	m.def(
-	    "flight_exchange_source_read_shared_manifest_for_test",
+	    "flight_exchange_source_rejects_unpublished_shared_manifest_for_test",
 	    [](const std::string &local_dir, const std::string &output_location, const std::string &writer_node_id,
 	       const std::string &reader_node_id, int64_t partition_id, int64_t attempt_id) {
 		    using namespace duckdb;
@@ -2986,6 +3078,16 @@ void register_ray_bindings(py::module_ &mod) {
 		    auto &context = *conn.context;
 
 		    vector<LogicalType> types = {LogicalType::INTEGER};
+		    const std::string server_epoch = "unpublished-cross-process-manifest-epoch";
+		    FlightServerConfig server_config;
+		    server_config.bind_host = "127.0.0.1";
+		    server_config.port = 0;
+		    server_config.server_epoch = server_epoch;
+		    FlightServer server(std::move(server_config));
+		    auto start_res = server.Start();
+		    if (start_res.is_err()) {
+			    throw std::runtime_error(start_res.error().what());
+		    }
 		    FlightExchangeConfig source_config;
 		    source_config.node_id = reader_node_id;
 		    source_config.local_dirs = {local_dir};
@@ -2996,6 +3098,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    handle.partition_id = static_cast<idx_t>(partition_id);
 		    handle.attempt_id = static_cast<idx_t>(attempt_id);
 		    handle.node_id = writer_node_id;
+		    handle.flight_port = server.port();
+		    handle.flight_server_epoch = server_epoch;
 		    ExchangeSourceFile file;
 		    file.path = output_location;
 		    file.file_size = 0;
@@ -3023,10 +3127,10 @@ void register_ray_bindings(py::module_ &mod) {
 	    },
 	    py::arg("local_dir"), py::arg("output_location"), py::arg("writer_node_id"), py::arg("reader_node_id"),
 	    py::arg("partition_id"), py::arg("attempt_id"),
-	    "Read a committed shared-manifest exchange attempt in a fresh process.");
+	    "Verify that a fresh process rejects a committed but unpublished shared-manifest exchange attempt.");
 
 	m.def(
-	    "flight_server_read_shared_manifest_for_test",
+	    "flight_server_rejects_unpublished_shared_manifest_for_test",
 	    [](const std::string &local_dir, const std::string &output_location, const std::string &writer_node_id,
 	       int64_t partition_id) {
 		    using namespace duckdb;
@@ -3076,26 +3180,13 @@ void register_ray_bindings(py::module_ &mod) {
 	    "Verify that an unpublished manifest is not served by a fresh FlightServer process.");
 
 	m.def(
-	    "remote_exchange_source_local_dirs_roundtrip_recovery_for_test",
+	    "remote_exchange_source_rejects_local_dirs_manifest_for_test",
 	    [](const std::string &local_dir) {
 		    using namespace duckdb;
 		    using namespace duckdb::distributed;
 
-		    auto current_node_id = []() -> std::string {
-			    const char *v = std::getenv("RAY_NODE_IP_ADDRESS");
-			    if (v && v[0]) {
-				    return v;
-			    }
-			    v = std::getenv("RAY_NODE_ID");
-			    if (v && v[0]) {
-				    return v;
-			    }
-			    v = std::getenv("HOSTNAME");
-			    if (v && v[0]) {
-				    return v;
-			    }
-			    return "local";
-		    }();
+		    const std::string current_node_id = "127.0.0.1";
+		    const std::string server_epoch = "unpublished-serialized-manifest-epoch";
 
 		    DuckDB db(nullptr);
 		    Connection conn(db);
@@ -3131,6 +3222,16 @@ void register_ray_bindings(py::module_ &mod) {
 		    }
 		    ShuffleCacheRegistry::Instance().Remove(output_location);
 
+		    FlightServerConfig server_config;
+		    server_config.bind_host = "127.0.0.1";
+		    server_config.port = 0;
+		    server_config.server_epoch = server_epoch;
+		    FlightServer server(std::move(server_config));
+		    auto start_res = server.Start();
+		    if (start_res.is_err()) {
+			    throw std::runtime_error(start_res.error().what());
+		    }
+
 		    Allocator allocator;
 		    PhysicalPlan plan(allocator);
 		    vector<idx_t> partition_indices = {1};
@@ -3140,6 +3241,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    handle.partition_id = 1;
 		    handle.attempt_id = 1;
 		    handle.node_id = current_node_id;
+		    handle.flight_port = server.port();
+		    handle.flight_server_epoch = server_epoch;
 		    ExchangeSourceFile file;
 		    file.path = output_location;
 		    file.file_size = 0;
@@ -3203,7 +3306,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    out["registry_present"] = ShuffleCacheRegistry::Instance().Get(output_location) != nullptr;
 		    return out;
 	    },
-	    py::arg("local_dir"), "Exercise EXCHANGE_SOURCE local_dirs serialization through manifest recovery.");
+	    py::arg("local_dir"), "Verify that serialized EXCHANGE_SOURCE cannot bypass catalog identity via local_dirs.");
 
 	m.def(
 	    "flight_server_rejects_unpublished_manifest_for_test",

@@ -1430,6 +1430,13 @@ struct PyPhysicalPlanWrapperRunner {
 		worker_manager_->worker_snapshots();
 	}
 
+	void shutdown() {
+		auto result = worker_manager_->shutdown();
+		if (result.is_err()) {
+			throw std::runtime_error(result.error().what());
+		}
+	}
+
 	std::unordered_map<string, std::unordered_map<string, idx_t>> fragment_stats_by_worker() const {
 		if (ray_worker_manager_) {
 			return ray_worker_manager_->fragment_stats_by_worker();

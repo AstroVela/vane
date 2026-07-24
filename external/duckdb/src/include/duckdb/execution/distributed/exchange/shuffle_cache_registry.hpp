@@ -33,6 +33,17 @@ private:
 		explicit CacheLeaseState(std::shared_ptr<ShuffleCache> cache_p) : cache(std::move(cache_p)) {
 		}
 
+		void AcquireWriter() {
+			std::lock_guard<std::mutex> lock(cleanup_mutex);
+			active_writers++;
+		}
+
+		void ReleaseWriter() {
+			std::lock_guard<std::mutex> lock(cleanup_mutex);
+			D_ASSERT(active_writers > 0);
+			active_writers--;
+		}
+
 		bool TryAcquireReader() {
 			std::lock_guard<std::mutex> lock(cleanup_mutex);
 			if (cleanup_requested || cleanup_complete) {
@@ -55,7 +66,7 @@ private:
 
 		DuckDBResult<idx_t> CleanupIfReady() {
 			std::lock_guard<std::mutex> lock(cleanup_mutex);
-			if (!cleanup_requested || cleanup_complete || active_readers > 0) {
+			if (!cleanup_requested || cleanup_complete || active_writers > 0 || active_readers > 0) {
 				return DuckDBResult<idx_t>::ok(0);
 			}
 			auto result = cache->RemoveAttemptStorage();
@@ -74,9 +85,22 @@ private:
 
 	private:
 		mutable std::mutex cleanup_mutex;
+		idx_t active_writers = 0;
 		idx_t active_readers = 0;
 		bool cleanup_requested = false;
 		bool cleanup_complete = false;
+	};
+
+	struct CacheWriteLease {
+		explicit CacheWriteLease(std::shared_ptr<CacheLeaseState> state_p) : state(std::move(state_p)) {
+			state->AcquireWriter();
+		}
+
+		~CacheWriteLease() {
+			state->ReleaseWriter();
+		}
+
+		std::shared_ptr<CacheLeaseState> state;
 	};
 
 	struct CacheBorrowLease {
@@ -91,11 +115,18 @@ private:
 	};
 
 	struct Entry {
+		Entry(std::string exchange_id_p, std::string query_id_p, std::shared_ptr<CacheLeaseState> state_p,
+		      std::string server_epoch_p, idx_t attempt_id_p, bool published_p)
+		    : exchange_id(std::move(exchange_id_p)), query_id(std::move(query_id_p)), state(std::move(state_p)),
+		      server_epoch(std::move(server_epoch_p)), attempt_id(attempt_id_p), published(published_p) {
+		}
+
 		std::string exchange_id;
 		std::string query_id;
 		std::shared_ptr<CacheLeaseState> state;
 		std::string server_epoch;
 		idx_t attempt_id = 0;
+		bool published = false;
 	};
 
 	struct QueryState {
@@ -112,7 +143,10 @@ public:
 		idx_t cleanup_errors = 0;
 		idx_t cleanup_pending = 0;
 		idx_t active_executions = 0;
+		std::string last_error;
 	};
+
+	using WriteLease = std::shared_ptr<void>;
 
 	static ShuffleCacheRegistry &Instance() {
 		static ShuffleCacheRegistry instance;
@@ -150,10 +184,10 @@ public:
 		return DuckDBResult<void>::ok();
 	}
 
-	/// Fence late publishers and move all currently published attempts to cleanup ownership.
-	DuckDBResult<void> CloseQuery(const std::string &query_id) {
+	/// Fence late publishers and move every tracked attempt to cleanup ownership.
+	DuckDBResult<idx_t> CloseQuery(const std::string &query_id) {
 		if (query_id.empty()) {
-			return DuckDBResult<void>::err(DuckDBError::value_error("query close requires a query id"));
+			return DuckDBResult<idx_t>::err(DuckDBError::value_error("query close requires a query id"));
 		}
 		std::vector<std::shared_ptr<CacheLeaseState>> removed;
 		{
@@ -174,6 +208,62 @@ public:
 				state->RequestCleanup();
 			}
 		}
+		return DuckDBResult<idx_t>::ok(static_cast<idx_t>(removed.size()));
+	}
+
+	/// Track a sink attempt before it can write any storage. The returned lease
+	/// prevents query cleanup from deleting files while the sink is still writing.
+	DuckDBResult<WriteLease> TrackPending(const std::string &exchange_id, std::shared_ptr<ShuffleCache> cache,
+	                                      const std::string &query_id, std::string server_epoch = std::string(),
+	                                      idx_t attempt_id = 0) {
+		if (exchange_id.empty() || query_id.empty() || !cache) {
+			return DuckDBResult<WriteLease>::err(
+			    DuckDBError::value_error("pending shuffle cache requires an exchange id, query id, and cache"));
+		}
+		if (cache->config().shuffle_stage_id != exchange_id) {
+			return DuckDBResult<WriteLease>::err(DuckDBError::value_error(
+			    "pending shuffle cache exchange id does not match its storage descriptor: " + exchange_id));
+		}
+
+		auto state = std::make_shared<CacheLeaseState>(std::move(cache));
+		WriteLease writer_lease = std::make_shared<CacheWriteLease>(state);
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			auto query_it = query_states_.find(query_id);
+			if (query_it != query_states_.end() && query_it->second.closing) {
+				// TrackPending runs before the sink can write. Rejecting here
+				// must not delete this path: an older published incarnation can
+				// still have readers whose leases belong to a different state.
+				return DuckDBResult<WriteLease>::err(
+				    DuckDBError::invalid_state_error("query closed before shuffle sink creation: " + query_id));
+			}
+			if (registry_.find(exchange_id) != registry_.end() ||
+			    std::any_of(deferred_cleanup_.begin(), deferred_cleanup_.end(),
+			                [&](const Entry &entry) { return entry.exchange_id == exchange_id; })) {
+				return DuckDBResult<WriteLease>::err(
+				    DuckDBError::invalid_state_error("conflicting pending shuffle cache for exchange " + exchange_id));
+			}
+			registry_.emplace(exchange_id,
+			                  Entry {exchange_id, query_id, state, std::move(server_epoch), attempt_id, false});
+			return DuckDBResult<WriteLease>::ok(std::move(writer_lease));
+		}
+	}
+
+	/// Make an already-tracked, committed attempt visible to readers.
+	DuckDBResult<void> Publish(const std::string &exchange_id, const std::shared_ptr<ShuffleCache> &cache,
+	                           const std::string &query_id, const std::string &server_epoch, idx_t attempt_id) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		auto query_it = query_states_.find(query_id);
+		if (query_it != query_states_.end() && query_it->second.closing) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::invalid_state_error("query closed before shuffle cache publication: " + query_id));
+		}
+		auto it = registry_.find(exchange_id);
+		if (it == registry_.end() || !DescriptorsMatch(it->second, cache, query_id, server_epoch, attempt_id)) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::invalid_state_error("pending shuffle cache is not owned by this sink: " + exchange_id));
+		}
+		it->second.published = true;
 		return DuckDBResult<void>::ok();
 	}
 
@@ -185,9 +275,14 @@ public:
 			return DuckDBResult<void>::err(
 			    DuckDBError::value_error("shuffle cache registration requires an exchange id, query id, and cache"));
 		}
+		if (cache->config().shuffle_stage_id != exchange_id) {
+			return DuckDBResult<void>::err(DuckDBError::value_error(
+			    "shuffle cache exchange id does not match its storage descriptor: " + exchange_id));
+		}
 
 		auto state = std::make_shared<CacheLeaseState>(std::move(cache));
 		bool query_closing = false;
+		bool owns_cleanup = false;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			auto query_it = query_states_.find(query_id);
@@ -195,19 +290,37 @@ public:
 			if (!query_closing) {
 				auto existing = registry_.find(exchange_id);
 				if (existing != registry_.end()) {
-					if (!DescriptorsMatch(existing->second, state->cache, query_id, server_epoch, attempt_id)) {
+					if (!existing->second.published ||
+					    !DescriptorsMatch(existing->second, state->cache, query_id, server_epoch, attempt_id)) {
 						return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
 						    "conflicting shuffle cache registration for exchange " + exchange_id));
 					}
 					return DuckDBResult<void>::ok();
 				}
-				Entry entry {exchange_id, query_id, std::move(state), std::move(server_epoch), attempt_id};
+				if (std::any_of(deferred_cleanup_.begin(), deferred_cleanup_.end(),
+				                [&](const Entry &entry) { return entry.exchange_id == exchange_id; })) {
+					return DuckDBResult<void>::err(
+					    DuckDBError::invalid_state_error("shuffle cache cleanup still owns exchange " + exchange_id));
+				}
+				Entry entry {exchange_id, query_id, std::move(state), std::move(server_epoch), attempt_id, true};
 				registry_.emplace(exchange_id, std::move(entry));
 				return DuckDBResult<void>::ok();
 			}
-			deferred_cleanup_.push_back(Entry {exchange_id, query_id, state, std::move(server_epoch), attempt_id});
+			const auto storage_already_owned =
+			    registry_.find(exchange_id) != registry_.end() ||
+			    std::any_of(deferred_cleanup_.begin(), deferred_cleanup_.end(),
+			                [&](const Entry &entry) { return entry.exchange_id == exchange_id; });
+			if (!storage_already_owned) {
+				deferred_cleanup_.push_back(
+				    Entry {exchange_id, query_id, state, std::move(server_epoch), attempt_id, true});
+				owns_cleanup = true;
+			}
 		}
 
+		if (!owns_cleanup) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::invalid_state_error("query closed before shuffle cache publication: " + query_id));
+		}
 		state->RequestCleanup();
 		auto cleanup_result = state->CleanupIfReady();
 		RemoveCompletedDeferred();
@@ -222,7 +335,7 @@ public:
 	std::shared_ptr<ShuffleCache> Get(const std::string &exchange_id) const {
 		std::lock_guard<std::mutex> lock(mutex_);
 		auto it = registry_.find(exchange_id);
-		if (it == registry_.end()) {
+		if (it == registry_.end() || !it->second.published) {
 			return nullptr;
 		}
 		return Borrow(it->second.state);
@@ -233,7 +346,7 @@ public:
 	                                                    const std::string &node_id, idx_t attempt_id) const {
 		std::lock_guard<std::mutex> lock(mutex_);
 		auto it = registry_.find(exchange_id);
-		if (it == registry_.end() || !it->second.state || !it->second.state->cache) {
+		if (it == registry_.end() || !it->second.published || !it->second.state || !it->second.state->cache) {
 			return DuckDBResult<std::shared_ptr<ShuffleCache>>::err(
 			    DuckDBError::invalid_state_error("flight exchange attempt is not published: " + exchange_id));
 		}
@@ -292,9 +405,76 @@ public:
 		if (close_result.is_err()) {
 			CleanupResult result;
 			result.cleanup_errors = 1;
+			result.last_error = close_result.error().what();
 			return result;
 		}
-		return CleanupMatching([&](const Entry &entry) { return entry.query_id == query_id; }, &query_id);
+		auto result = CleanupMatching([&](const Entry &entry) { return entry.query_id == query_id; }, &query_id);
+		result.registry_entries_removed += close_result.value();
+		return result;
+	}
+
+	/// Inspect the query fence without starting storage deletion.
+	CleanupResult QueryStatus(const std::string &query_id) const {
+		CleanupResult result;
+		std::lock_guard<std::mutex> lock(mutex_);
+		auto query_it = query_states_.find(query_id);
+		if (query_it != query_states_.end()) {
+			result.active_executions = query_it->second.active_executions;
+		}
+		for (const auto &entry : registry_) {
+			if (entry.second.query_id == query_id) {
+				result.cleanup_pending++;
+			}
+		}
+		for (const auto &entry : deferred_cleanup_) {
+			if (entry.query_id == query_id) {
+				result.cleanup_pending++;
+			}
+		}
+		return result;
+	}
+
+	/// Remove a closed-query tombstone once every scheduled native execution
+	/// and every owned cache attempt has been joined and cleaned.
+	DuckDBResult<void> RetireQuery(const std::string &query_id) {
+		if (query_id.empty()) {
+			return DuckDBResult<void>::err(DuckDBError::value_error("query retirement requires a query id"));
+		}
+		std::lock_guard<std::mutex> lock(mutex_);
+		auto query_it = query_states_.find(query_id);
+		if (query_it == query_states_.end()) {
+			for (const auto &entry : registry_) {
+				if (entry.second.query_id == query_id) {
+					return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
+					    "query cannot retire with registered shuffle attempts: " + query_id));
+				}
+			}
+			for (const auto &entry : deferred_cleanup_) {
+				if (entry.query_id == query_id) {
+					return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
+					    "query cannot retire with pending shuffle cleanup: " + query_id));
+				}
+			}
+			return DuckDBResult<void>::ok();
+		}
+		if (!query_it->second.closing || query_it->second.active_executions != 0) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::invalid_state_error("query cannot retire before native executions drain: " + query_id));
+		}
+		for (const auto &entry : registry_) {
+			if (entry.second.query_id == query_id) {
+				return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
+				    "query cannot retire with registered shuffle attempts: " + query_id));
+			}
+		}
+		for (const auto &entry : deferred_cleanup_) {
+			if (entry.query_id == query_id) {
+				return DuckDBResult<void>::err(
+				    DuckDBError::invalid_state_error("query cannot retire with pending shuffle cleanup: " + query_id));
+			}
+		}
+		query_states_.erase(query_it);
+		return DuckDBResult<void>::ok();
 	}
 
 	/// Test/maintenance helper for exchange-prefix cleanup.
@@ -337,6 +517,7 @@ private:
 	CleanupResult CleanupMatching(MATCH &&matches, const std::string *query_id) {
 		CleanupResult result;
 		std::vector<std::shared_ptr<CacheLeaseState>> candidates;
+		bool query_has_active_executions = false;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			for (auto it = registry_.begin(); it != registry_.end();) {
@@ -358,18 +539,22 @@ private:
 				auto query_it = query_states_.find(*query_id);
 				if (query_it != query_states_.end()) {
 					result.active_executions = query_it->second.active_executions;
+					query_has_active_executions = query_it->second.active_executions > 0;
 				}
 			}
 		}
 
-		for (const auto &state : candidates) {
-			state->RequestCleanup();
-			auto cleanup_result = state->CleanupIfReady();
-			if (cleanup_result.is_err()) {
-				result.cleanup_errors++;
-				continue;
+		if (!query_has_active_executions) {
+			for (const auto &state : candidates) {
+				state->RequestCleanup();
+				auto cleanup_result = state->CleanupIfReady();
+				if (cleanup_result.is_err()) {
+					result.cleanup_errors++;
+					result.last_error = cleanup_result.error().what();
+					continue;
+				}
+				result.storage_entries_removed += cleanup_result.value();
 			}
-			result.storage_entries_removed += cleanup_result.value();
 		}
 
 		{

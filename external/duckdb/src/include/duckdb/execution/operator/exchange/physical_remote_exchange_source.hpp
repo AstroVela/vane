@@ -68,6 +68,9 @@ public:
 	const std::vector<distributed::ExchangeSourceHandle> &SourceHandles() const {
 		return source_handles_;
 	}
+	const std::shared_ptr<distributed::ExchangeManager> &GetExchangeManager() const {
+		return exchange_mgr_;
+	}
 	const vector<std::string> &SourceNodes() const {
 		return source_nodes_;
 	}

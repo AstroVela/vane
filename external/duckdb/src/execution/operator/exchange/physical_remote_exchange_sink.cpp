@@ -252,10 +252,6 @@ SinkResultType PhysicalRemoteExchangeSink::Sink(ExecutionContext &context, DataC
 SinkFinalizeType PhysicalRemoteExchangeSink::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                                       OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<RemoteSinkGlobalState>();
-	auto result = gstate.sink->Finish();
-	if (result.is_err()) {
-		throw IOException(std::string("[RemoteExchangeSink] Finish failed: ") + result.error().what());
-	}
 	// Ensure schema.arrow is written even for 0-row exchanges so downstream
 	// Flight readers can open the exchange without ENOENT errors.
 	vector<string> col_names;
@@ -264,6 +260,25 @@ SinkFinalizeType PhysicalRemoteExchangeSink::Finalize(Pipeline &pipeline, Event 
 		col_names.push_back("col" + std::to_string(i));
 	}
 	auto schema_result = gstate.sink->EnsureSchema(context, types, col_names);
+	if (schema_result.is_err()) {
+		auto message = std::string("[RemoteExchangeSink] EnsureSchema failed: ") + schema_result.error().what();
+		auto abort_result = gstate.sink->Abort();
+		if (abort_result.is_err()) {
+			message += "; Abort failed: ";
+			message += abort_result.error().what();
+		}
+		throw IOException(message);
+	}
+	auto result = gstate.sink->Finish();
+	if (result.is_err()) {
+		auto message = std::string("[RemoteExchangeSink] Finish failed: ") + result.error().what();
+		auto abort_result = gstate.sink->Abort();
+		if (abort_result.is_err()) {
+			message += "; Abort failed: ";
+			message += abort_result.error().what();
+		}
+		throw IOException(message);
+	}
 	return SinkFinalizeType::READY;
 }
 

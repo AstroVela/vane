@@ -11,6 +11,7 @@ import textwrap
 import threading
 import types
 import uuid
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -76,6 +77,128 @@ def test_drop_resource_query_closes_owned_internal_fte_queries(monkeypatch):
         "q-drop-owned_orderby_range",
         "q-drop-owned_orderby_sample",
     ]
+
+
+def test_drop_resource_query_remembers_failed_internal_teardown_after_registry_loss(monkeypatch):
+    import duckdb.runners.ray.fte_fragment_scheduler as fte_scheduler
+    from duckdb.runners.ray.driver import QueryTeardownOwnershipError, RayQueryDriverActor
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    runner = object.__new__(runner_cls)
+    runner._query_pending_execution_teardowns = {}
+    runner._release_query_resources = lambda *_args, **_kwargs: released_queries.append("released")
+
+    resource_query_id = "q-drop-retry"
+    execution_query_id = f"{resource_query_id}_orderby"
+    discovered = [(execution_query_id,), ()]
+    monkeypatch.setattr(
+        fte_scheduler,
+        "fte_execution_query_ids_for_resource",
+        lambda _query_id: discovered.pop(0),
+    )
+    monkeypatch.setattr(fte_scheduler, "fte_query_remote_teardown_blockers", lambda _query_id: ())
+    monkeypatch.setattr(fte_scheduler, "_drop_fte_registry_for_query", lambda _query_id: None)
+
+    calls: list[str] = []
+    failed_once = False
+
+    def drop_query_fragments(query_id):
+        nonlocal failed_once
+        calls.append(query_id)
+        if query_id == execution_query_id and not failed_once:
+            failed_once = True
+            raise RuntimeError("planned nested cleanup failure")
+
+    released_queries: list[str] = []
+    runner._get_plan_runner = lambda: SimpleNamespace(drop_query_fragments=drop_query_fragments)
+
+    with pytest.raises(QueryTeardownOwnershipError, match="pending_execution_queries"):
+        runner._drop_query_fragments_sync(resource_query_id)
+
+    assert runner._query_pending_execution_teardowns == {resource_query_id: {execution_query_id}}
+    assert released_queries == []
+
+    runner._drop_query_fragments_sync(resource_query_id)
+
+    assert calls == [
+        resource_query_id,
+        execution_query_id,
+        resource_query_id,
+        execution_query_id,
+    ]
+    assert runner._query_pending_execution_teardowns == {}
+    assert released_queries == ["released"]
+
+
+def test_driver_actor_shutdown_reaches_plan_runner_once():
+    from duckdb.runners.ray.driver import RayQueryDriverActor
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    runner = object.__new__(runner_cls)
+    events: list[str] = []
+    runner._driver_shutdown_lock = asyncio.Lock()
+    runner._plan_runner_lifecycle_lock = threading.RLock()
+    runner._driver_shutdown_started = False
+    runner._driver_shutdown_complete = False
+    runner.plan_runner = SimpleNamespace(shutdown=lambda: events.append("workers-shutdown"))
+
+    async def stop_maintenance():
+        events.append("maintenance-stopped")
+
+    runner.stop_query_resource_maintenance = stop_maintenance
+
+    async def shutdown_twice():
+        await runner_cls.shutdown(runner)
+        await runner_cls.shutdown(runner)
+
+    asyncio.run(shutdown_twice())
+
+    assert events == ["maintenance-stopped", "workers-shutdown"]
+    assert runner._driver_shutdown_started is True
+    assert runner._driver_shutdown_complete is True
+
+
+def test_driver_client_close_gracefully_shuts_down_before_kill(monkeypatch):
+    from duckdb.runners.ray import driver as driver_module
+
+    events: list[str] = []
+    shutdown_ref = object()
+
+    class ShutdownMethod:
+        @staticmethod
+        def remote():
+            events.append("shutdown-rpc")
+            return shutdown_ref
+
+    actor = SimpleNamespace(shutdown=ShutdownMethod())
+    client = object.__new__(driver_module.RayQueryDriverClient)
+    client.runner = actor
+    client._ray_gcs_address = "gcs-a"
+
+    monkeypatch.setattr(driver_module.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver_module.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
+    )
+
+    def resolve(ref, **kwargs):
+        assert ref is shutdown_ref
+        assert kwargs == {"timeout": 300, "honor_query_deadline": False}
+        events.append("shutdown-complete")
+
+    def kill(target, *, no_restart):
+        assert target is actor
+        assert no_restart is True
+        events.append("kill")
+
+    monkeypatch.setattr(driver_module, "resolve_object_refs_blocking", resolve)
+    monkeypatch.setattr(driver_module.ray, "kill", kill)
+
+    client.close()
+
+    assert client.runner is None
+    assert events == ["shutdown-rpc", "shutdown-complete", "kill"]
 
 
 def test_precreate_udf_actors_skips_non_actor_backend(monkeypatch):

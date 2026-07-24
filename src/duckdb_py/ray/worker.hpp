@@ -59,10 +59,13 @@ public:
 	                                      const std::unordered_set<duckdb::distributed::SourceNodeId> &source_node_ids);
 	QueryStatus FteQueryStatus(const string &query_id);
 	std::vector<RayTaskResultHandle> PopFteResultHandles(const string &query_id);
-	void DropQueryFragments(const string &query_id);
+	void PrepareDropQuery(const string &query_id);
+	void CleanupQuery(const string &query_id);
 	std::unordered_map<string, idx_t> FragmentStats() const;
 
-	void Shutdown();
+	void PrepareShutdown();
+	void FinishShutdown();
+	void AbortShutdown();
 
 	// worker interface
 	const WorkerId &Id() const {

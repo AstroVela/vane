@@ -1035,40 +1035,45 @@ class FteWorkerTaskManager:
         self.max_dropped_task_statuses = 4096
         self._status_cache_lock = threading.RLock()
         self._status_cache: dict[str, dict[str, Any]] = {}
+        self._lifecycle_lock = threading.RLock()
+        self._shutdown = False
         self._admission_debug_log("manager_init")
 
     async def create_task(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        execution = FteTaskExecution(
-            request,
-            self.execute_fn,
-            status_callback=self._publish_status,
-            require_query_task_lease=self.require_query_task_lease,
-            default_task_memory_bytes=self.admission_config.task_memory_bytes,
-        )
-        key = str(execution.task_id)
-        existing = self.tasks.get(key)
-        if existing is not None:
-            return self._publish_status(existing)
-        if execution.memory_requirement_bytes > self.admission_config.memory_budget_bytes:
-            raise RuntimeError(
-                f"FTE task {execution.task_id} heap {execution.memory_requirement_bytes} "
-                "exceeds worker task-heap capacity "
-                f"{self.admission_config.memory_budget_bytes}"
+        with self._lifecycle_lock:
+            if self._shutdown:
+                raise RuntimeError("FTE worker task manager is shut down")
+            execution = FteTaskExecution(
+                request,
+                self.execute_fn,
+                status_callback=self._publish_status,
+                require_query_task_lease=self.require_query_task_lease,
+                default_task_memory_bytes=self.admission_config.task_memory_bytes,
             )
-        if key in self.dropped_task_statuses:
-            self.dropped_task_statuses.pop(key, None)
-            try:
-                self.dropped_task_order.remove(key)
-            except ValueError:
-                pass
-        with self._status_cache_lock:
-            self._status_cache.pop(key, None)
-        self.tasks[key] = execution
-        self.query_tasks.setdefault(execution.task_id.query_id, set()).add(key)
-        self._publish_status(execution)
-        self._admission_debug_log("create_task", execution)
-        self._admit_or_queue(execution)
-        return self._publish_status(execution)
+            key = str(execution.task_id)
+            existing = self.tasks.get(key)
+            if existing is not None:
+                return self._publish_status(existing)
+            if execution.memory_requirement_bytes > self.admission_config.memory_budget_bytes:
+                raise RuntimeError(
+                    f"FTE task {execution.task_id} heap {execution.memory_requirement_bytes} "
+                    "exceeds worker task-heap capacity "
+                    f"{self.admission_config.memory_budget_bytes}"
+                )
+            if key in self.dropped_task_statuses:
+                self.dropped_task_statuses.pop(key, None)
+                try:
+                    self.dropped_task_order.remove(key)
+                except ValueError:
+                    pass
+            with self._status_cache_lock:
+                self._status_cache.pop(key, None)
+            self.tasks[key] = execution
+            self.query_tasks.setdefault(execution.task_id.query_id, set()).add(key)
+            self._publish_status(execution)
+            self._admission_debug_log("create_task", execution)
+            self._admit_or_queue(execution)
+            return self._publish_status(execution)
 
     @staticmethod
     def _key(task_id: Any) -> str:
@@ -1471,3 +1476,35 @@ class FteWorkerTaskManager:
                 f"failed to fully drop FTE query {query_id}; retained failed task ownership: " + details
             ) from errors[0][1]
         return {"removed": removed, "canceled": canceled}
+
+    def shutdown(self) -> dict[str, int]:
+        """Synchronously cancel every task before the actor runtime joins threads."""
+        with self._lifecycle_lock:
+            self._shutdown = True
+            removed = 0
+            canceled = 0
+            errors: list[tuple[str, BaseException]] = []
+            for key, execution in list(self.tasks.items()):
+                try:
+                    if execution.status.state not in _TERMINAL_STATES:
+                        execution.cancel()
+                        canceled += 1
+                    execution.release_result(reason="worker_shutdown")
+                except BaseException as exc:
+                    errors.append((key, exc))
+                    continue
+                self.tasks.pop(key, None)
+                self.running_tasks.discard(key)
+                removed += 1
+            self.query_tasks.clear()
+            self.queued_tasks.clear()
+            try:
+                self._sync_udf_active_fte_fragment_tasks()
+            except BaseException as exc:
+                errors.append(("<sync-admission>", exc))
+            if errors:
+                details = "; ".join(f"task={key}: {type(exc).__name__}: {exc}" for key, exc in errors)
+                raise RuntimeError("failed to cancel all FTE tasks during worker shutdown: " + details) from errors[0][
+                    1
+                ]
+            return {"removed": removed, "canceled": canceled}

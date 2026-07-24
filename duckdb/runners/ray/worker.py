@@ -30,6 +30,7 @@ from duckdb.runners.fte import (
 from duckdb.runners.fte.debug_memory import describe_result_payload, log_debug, process_memory_snapshot
 from duckdb.runners.fte.fte_config import FteWorkerAdmissionConfig
 from duckdb.runners.fte.memory_config import apply_duckdb_memory_limit
+from duckdb.runners.ray.fte_scheduler_config import _fte_control_rpc_timeout_s
 
 
 def _fte_applied_control_status(
@@ -94,7 +95,7 @@ def _chaos_worker_loss_matches(task_id: FteTaskAttemptId) -> bool:
     return not (target_task and target_task != str(task_id))
 
 
-def _cleanup_flight_shuffle_for_query(query_id: str) -> dict[str, int]:
+def _cleanup_flight_shuffle_for_query(query_id: str) -> dict[str, Any]:
     query_id = str(query_id or "").strip()
     if not query_id:
         return {
@@ -103,6 +104,7 @@ def _cleanup_flight_shuffle_for_query(query_id: str) -> dict[str, int]:
             "cleanup_errors": 0,
             "cleanup_pending": 0,
             "active_executions": 0,
+            "last_error": "",
         }
     cleanup_fn = require_ray_cxx_attr(
         "cleanup_flight_shuffle_for_query",
@@ -117,6 +119,7 @@ def _cleanup_flight_shuffle_for_query(query_id: str) -> dict[str, int]:
         "cleanup_errors": int(raw.get("cleanup_errors", 0)),
         "cleanup_pending": int(raw.get("cleanup_pending", 0)),
         "active_executions": int(raw.get("active_executions", 0)),
+        "last_error": str(raw.get("last_error", "")),
     }
 
 
@@ -128,10 +131,57 @@ def _close_flight_shuffle_query(query_id: str) -> None:
     close_fn(str(query_id))
 
 
-async def _drain_flight_shuffle_for_query(query_id: str, *, timeout_s: float = 30.0) -> dict[str, int]:
+def _flight_shuffle_query_status(query_id: str) -> dict[str, int]:
+    status_fn = require_ray_cxx_attr(
+        "flight_shuffle_query_status",
+        hint="Ensure the C++ ray extension is built with Flight shuffle query fencing support.",
+    )
+    raw = status_fn(str(query_id))
+    if not isinstance(raw, dict):
+        raise TypeError("Flight shuffle query status binding must return a dict")
+    return {
+        "cleanup_pending": int(raw.get("cleanup_pending", 0)),
+        "active_executions": int(raw.get("active_executions", 0)),
+    }
+
+
+async def _wait_flight_shuffle_executions_for_query(query_id: str, *, timeout_s: float | None = None) -> None:
+    if timeout_s is None:
+        timeout_s = _fte_control_rpc_timeout_s() * 0.8
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    backoff_s = 0.01
+    while True:
+        status = await asyncio.to_thread(_flight_shuffle_query_status, query_id)
+        if status["active_executions"] == 0:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "timed out waiting for Flight shuffle native executions "
+                f"for {query_id}: active_executions={status['active_executions']}"
+            )
+        await asyncio.sleep(backoff_s)
+        backoff_s = min(backoff_s * 2, 0.5)
+
+
+def _retire_flight_shuffle_query(query_id: str) -> None:
+    retire_fn = require_ray_cxx_attr(
+        "retire_flight_shuffle_query",
+        hint="Ensure the C++ ray extension is built with Flight shuffle query retirement support.",
+    )
+    retire_fn(str(query_id))
+
+
+async def _drain_flight_shuffle_for_query(
+    query_id: str,
+    *,
+    timeout_s: float | None = None,
+) -> dict[str, Any]:
+    if timeout_s is None:
+        timeout_s = _fte_control_rpc_timeout_s() * 0.8
     deadline = time.monotonic() + max(0.0, float(timeout_s))
     total_registry_removed = 0
     total_storage_removed = 0
+    backoff_s = 0.01
     while True:
         cleanup = await asyncio.to_thread(_cleanup_flight_shuffle_for_query, query_id)
         total_registry_removed += cleanup["registry_entries_removed"]
@@ -145,9 +195,11 @@ async def _drain_flight_shuffle_for_query(query_id: str, *, timeout_s: float = 3
                 "timed out draining Flight shuffle query "
                 f"{query_id}: active_executions={cleanup['active_executions']} "
                 f"cleanup_pending={cleanup['cleanup_pending']} "
-                f"cleanup_errors={cleanup['cleanup_errors']}"
+                f"cleanup_errors={cleanup['cleanup_errors']} "
+                f"last_error={cleanup['last_error']!r}"
             )
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(backoff_s)
+        backoff_s = min(backoff_s * 2, 0.5)
 
 
 def _maybe_chaos_kill_worker(task_id: FteTaskAttemptId) -> None:
@@ -498,8 +550,15 @@ class RayWorkerActor:
         # with actor creation instead of blocking the first task.
         self._shared_conn: Any | None = None
         self._shared_conn_lock = threading.Lock()
-        self._shutdown_lock = threading.Lock()
+        self._shutdown_lock = threading.RLock()
+        self._native_execution_condition = threading.Condition()
+        self._native_execution_count = 0
+        self._native_execution_counts_by_query: dict[str, int] = {}
+        self._active_native_cursors: set[Any] = set()
+        self._native_cursor_query_ids: dict[Any, str] = {}
+        self._closing_native_queries: set[str] = set()
         self._shutdown_started = False
+        self._shutdown_prepared = False
         self._shutdown_complete = False
         self._get_shared_conn()  # eagerly initialize
         _ray_worker_memory_log(
@@ -509,8 +568,19 @@ class RayWorkerActor:
             worker_label=_fte_worker_label(),
         )
 
+    def _ensure_worker_runtime_running(self) -> None:
+        shutdown_lock = getattr(self, "_shutdown_lock", None)
+        if shutdown_lock is None:
+            if getattr(self, "_shutdown_started", False):
+                raise RuntimeError("Ray worker runtime is shutting down")
+            return
+        with shutdown_lock:
+            if getattr(self, "_shutdown_started", False):
+                raise RuntimeError("Ray worker runtime is shutting down")
+
     @ray.method(concurrency_group="control")
     def install_env_overrides(self, env_overrides: dict[str, str] | None) -> None:
+        self._ensure_worker_runtime_running()
         self._env_overrides = env_overrides or {}
         _apply_env_overrides(self._env_overrides)
 
@@ -523,6 +593,7 @@ class RayWorkerActor:
         - plan: plan object (PhysicalPlan / DistributedPhysicalPlan wrapper)
         - query_id: query identity for lifecycle cleanup
         """
+        self._ensure_worker_runtime_running()
         registered = 0
         existing = 0
         self._fragment_register_calls += 1
@@ -571,6 +642,7 @@ class RayWorkerActor:
             for entry_index, resolved_plan in zip(pending_ref_indexes, resolved_plans, strict=False):
                 pending_entries[entry_index]["plan"] = resolved_plan
 
+        self._ensure_worker_runtime_running()
         for entry in pending_entries:
             fragment_id = str(entry["fragment_id"])
             plan = entry.get("plan")
@@ -601,6 +673,7 @@ class RayWorkerActor:
 
     @ray.method(concurrency_group="control")
     def drop_query_fragments(self, query_id: str) -> int:
+        self._ensure_worker_runtime_running()
         fragment_ids = self._query_fragments.pop(query_id, set())
         removed = 0
         for fragment_id in fragment_ids:
@@ -623,14 +696,21 @@ class RayWorkerActor:
         }
 
     def _get_fte_task_manager(self) -> FteWorkerTaskManager:
-        if self._fte_task_manager is None:
-            self._fte_task_manager = FteWorkerTaskManager(
-                self._execute_fte_request,
-                admission_config=self._fte_admission_config,
-                require_query_task_lease=True,
-                worker_label=_fte_worker_label(),
-            )
-        return self._fte_task_manager
+        shutdown_lock = getattr(self, "_shutdown_lock", None)
+        if shutdown_lock is None:
+            shutdown_lock = threading.RLock()
+            self._shutdown_lock = shutdown_lock
+        with shutdown_lock:
+            if getattr(self, "_shutdown_started", False):
+                raise RuntimeError("Ray worker runtime is shutting down")
+            if self._fte_task_manager is None:
+                self._fte_task_manager = FteWorkerTaskManager(
+                    self._execute_fte_request,
+                    admission_config=self._fte_admission_config,
+                    require_query_task_lease=True,
+                    worker_label=_fte_worker_label(),
+                )
+            return self._fte_task_manager
 
     async def _execute_fte_request(self, request: dict[str, Any]) -> Any:
         import duckdb
@@ -801,21 +881,49 @@ class RayWorkerActor:
         return _fte_applied_control_status("fte_cancel_task", task_id, status)
 
     @ray.method(concurrency_group="control")
-    async def fte_drop_query(self, query_id: str) -> dict[str, int]:
+    async def fte_prepare_drop_query(self, query_id: str) -> dict[str, int]:
         _close_flight_shuffle_query(query_id)
+        interrupt_errors = self._close_worker_native_query(query_id)
         try:
             fte_result = await self._get_fte_task_manager().drop_query(query_id)
             fragments_removed = self.drop_query_fragments(query_id)
         finally:
-            flight_shuffle_cleanup = await _drain_flight_shuffle_for_query(query_id)
+            drain_results = await asyncio.gather(
+                self._wait_worker_native_executions_for_query(query_id),
+                _wait_flight_shuffle_executions_for_query(query_id),
+                return_exceptions=True,
+            )
+            drain_errors = [result for result in drain_results if isinstance(result, BaseException)]
+            if drain_errors:
+                details = "; ".join(f"{type(error).__name__}: {error}" for error in drain_errors)
+                raise RuntimeError(f"failed to drain native executions for {query_id}: {details}") from drain_errors[0]
+        if interrupt_errors:
+            raise RuntimeError(
+                f"failed to interrupt {len(interrupt_errors)} native execution(s) for {query_id}: "
+                + "; ".join(interrupt_errors)
+            )
         return {
             "tasks_removed": int(fte_result["removed"]),
             "tasks_canceled": int(fte_result["canceled"]),
             "fragments_removed": int(fragments_removed),
+        }
+
+    @ray.method(concurrency_group="control")
+    async def fte_cleanup_query(self, query_id: str) -> dict[str, int]:
+        flight_shuffle_cleanup = await _drain_flight_shuffle_for_query(query_id)
+        _retire_flight_shuffle_query(query_id)
+        self._retire_worker_native_query(query_id)
+        return {
             "flight_shuffle_registry_entries_removed": int(flight_shuffle_cleanup["registry_entries_removed"]),
             "flight_shuffle_storage_entries_removed": int(flight_shuffle_cleanup["storage_entries_removed"]),
             "flight_shuffle_cleanup_errors": int(flight_shuffle_cleanup["cleanup_errors"]),
         }
+
+    @ray.method(concurrency_group="control")
+    async def fte_drop_query(self, query_id: str) -> dict[str, int]:
+        result = await self.fte_prepare_drop_query(query_id)
+        result.update(await self.fte_cleanup_query(query_id))
+        return result
 
     def _get_plan_runner(self) -> Any:
         if self._plan_runner is None:
@@ -885,47 +993,210 @@ class RayWorkerActor:
             self._shared_conn = conn
             return conn
 
-    def _shutdown_worker_runtime(self) -> None:
+    def _begin_worker_native_execution(self, query_id: str) -> None:
+        query_id = str(query_id or "").strip()
+        if not query_id:
+            raise ValueError("native execution admission requires a query_id")
+        with self._native_execution_condition:
+            if self._shutdown_started:
+                raise RuntimeError("Ray worker runtime is shutting down")
+            if query_id in self._closing_native_queries:
+                raise RuntimeError(f"native query is closing: {query_id}")
+            self._native_execution_count += 1
+            self._native_execution_counts_by_query[query_id] = (
+                self._native_execution_counts_by_query.get(query_id, 0) + 1
+            )
+
+    def _end_worker_native_execution(self, query_id: str) -> None:
+        query_id = str(query_id or "").strip()
+        with self._native_execution_condition:
+            if self._native_execution_count <= 0:
+                raise RuntimeError("Ray worker native execution ownership underflow")
+            query_count = self._native_execution_counts_by_query.get(query_id, 0)
+            if query_count <= 0:
+                raise RuntimeError(f"Ray worker native query execution ownership underflow: {query_id}")
+            self._native_execution_count -= 1
+            if query_count == 1:
+                self._native_execution_counts_by_query.pop(query_id, None)
+            else:
+                self._native_execution_counts_by_query[query_id] = query_count - 1
+            self._native_execution_condition.notify_all()
+
+    def _register_native_cursor(self, cursor: Any, query_id: str = "") -> bool:
+        with self._native_execution_condition:
+            self._active_native_cursors.add(cursor)
+            self._native_cursor_query_ids[cursor] = str(query_id)
+            return str(query_id) not in self._closing_native_queries
+
+    def _unregister_native_cursor(self, cursor: Any) -> None:
+        with self._native_execution_condition:
+            self._active_native_cursors.discard(cursor)
+            self._native_cursor_query_ids.pop(cursor, None)
+            self._native_execution_condition.notify_all()
+
+    def _worker_native_query_is_closing(self, query_id: str) -> bool:
+        with self._native_execution_condition:
+            return str(query_id) in self._closing_native_queries
+
+    async def _wait_worker_native_executions_for_query(
+        self,
+        query_id: str,
+        *,
+        timeout_s: float | None = None,
+    ) -> None:
+        query_id = str(query_id or "").strip()
+        if timeout_s is None:
+            timeout_s = _fte_control_rpc_timeout_s() * 0.8
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        backoff_s = 0.01
+        while True:
+            with self._native_execution_condition:
+                active_executions = self._native_execution_counts_by_query.get(query_id, 0)
+            if active_executions == 0:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "timed out waiting for Ray worker native executions "
+                    f"for {query_id}: active_executions={active_executions}"
+                )
+            await asyncio.sleep(backoff_s)
+            backoff_s = min(backoff_s * 2, 0.5)
+
+    def _close_worker_native_query(self, query_id: str) -> list[str]:
+        query_id = str(query_id)
+        with self._native_execution_condition:
+            self._closing_native_queries.add(query_id)
+            cursors = [
+                cursor
+                for cursor, cursor_query_id in self._native_cursor_query_ids.items()
+                if cursor_query_id == query_id
+            ]
+        errors: list[str] = []
+        for cursor in cursors:
+            try:
+                cursor.interrupt()
+            except Exception as exc:
+                errors.append(str(exc))
+        return errors
+
+    def _retire_worker_native_query(self, query_id: str) -> None:
+        with self._native_execution_condition:
+            query_id = str(query_id)
+            active_executions = self._native_execution_counts_by_query.get(query_id, 0)
+            if active_executions:
+                raise RuntimeError(
+                    "cannot retire Ray worker native query with active executions: "
+                    f"{query_id} active_executions={active_executions}"
+                )
+            self._closing_native_queries.discard(query_id)
+
+    def _prepare_worker_runtime_shutdown(self) -> None:
         shutdown_lock = getattr(self, "_shutdown_lock", None)
         if shutdown_lock is None:
-            shutdown_lock = threading.Lock()
+            shutdown_lock = threading.RLock()
             self._shutdown_lock = shutdown_lock
         with shutdown_lock:
-            if getattr(self, "_shutdown_complete", False):
+            if getattr(self, "_shutdown_prepared", False) or getattr(self, "_shutdown_complete", False):
                 return
             errors: list[str] = []
+            native_condition = getattr(self, "_native_execution_condition", None)
+            if native_condition is None:
+                native_condition = threading.Condition()
+                self._native_execution_condition = native_condition
+                self._native_execution_count = 0
+                self._native_execution_counts_by_query = {}
+                self._active_native_cursors = set()
+                self._native_cursor_query_ids = {}
+                self._closing_native_queries = set()
+            with native_condition:
+                self._shutdown_started = True
+            task_manager = getattr(self, "_fte_task_manager", None)
+            if task_manager is not None:
+                try:
+                    task_manager.shutdown()
+                except Exception as exc:
+                    errors.append(f"cancel FTE tasks: {exc}")
             shared_conn_lock = getattr(self, "_shared_conn_lock", None)
             if shared_conn_lock is None:
                 shared_conn_lock = threading.Lock()
                 self._shared_conn_lock = shared_conn_lock
             with shared_conn_lock:
-                self._shutdown_started = True
                 conn = getattr(self, "_shared_conn", None)
-                self._shared_conn = None
             if conn is not None:
                 try:
                     conn.interrupt()
                 except Exception as exc:
                     errors.append(f"interrupt DuckDB connection: {exc}")
+            deadline = time.monotonic() + 25.0
+            cursor_interrupt_errors: set[str] = set()
+            while True:
+                with native_condition:
+                    active_executions = int(getattr(self, "_native_execution_count", 0))
+                    active_cursors = list(getattr(self, "_active_native_cursors", ()))
+                if active_executions == 0:
+                    break
+                for cursor in active_cursors:
+                    try:
+                        cursor.interrupt()
+                    except Exception as exc:
+                        message = f"interrupt active DuckDB cursor: {exc}"
+                        if message not in cursor_interrupt_errors:
+                            cursor_interrupt_errors.add(message)
+                            errors.append(message)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    errors.append(f"timed out waiting for {active_executions} native execution(s) to stop")
+                    break
+                with native_condition:
+                    if self._native_execution_count > 0:
+                        native_condition.wait(timeout=min(0.1, remaining))
+            with native_condition:
+                native_drained = self._native_execution_count == 0
+            if not native_drained:
+                raise RuntimeError("; ".join(errors))
+            with shared_conn_lock:
+                conn = getattr(self, "_shared_conn", None)
+            if conn is not None:
                 try:
                     conn.close()
                 except Exception as exc:
                     errors.append(f"close DuckDB connection: {exc}")
-            try:
-                shutdown_flight = require_ray_cxx_attr(
-                    "shutdown_local_flight_service",
-                    hint="Ensure the C++ ray extension is built with Flight service lifecycle support.",
-                )
-                shutdown_flight()
-            except Exception as exc:
-                errors.append(f"stop process-local Flight service: {exc}")
+                else:
+                    with shared_conn_lock:
+                        if getattr(self, "_shared_conn", None) is conn:
+                            self._shared_conn = None
             if errors:
                 raise RuntimeError("; ".join(errors))
+            self._shutdown_prepared = True
+
+    def _finish_worker_runtime_shutdown(self) -> None:
+        shutdown_lock = getattr(self, "_shutdown_lock", None)
+        if shutdown_lock is None:
+            shutdown_lock = threading.RLock()
+            self._shutdown_lock = shutdown_lock
+        with shutdown_lock:
+            if getattr(self, "_shutdown_complete", False):
+                return
+            if not getattr(self, "_shutdown_prepared", False):
+                raise RuntimeError("Ray worker runtime shutdown was not prepared")
+            shutdown_flight = require_ray_cxx_attr(
+                "shutdown_local_flight_service",
+                hint="Ensure the C++ ray extension is built with Flight service lifecycle support.",
+            )
+            shutdown_flight()
             self._shutdown_complete = True
 
     @ray.method(concurrency_group="control")
-    def shutdown(self) -> None:
-        self._shutdown_worker_runtime()
+    def prepare_shutdown(self) -> None:
+        self._prepare_worker_runtime_shutdown()
+
+    @ray.method(concurrency_group="control")
+    def finish_shutdown(self) -> None:
+        self._finish_worker_runtime_shutdown()
+
+    def _shutdown_worker_runtime(self) -> None:
+        self._prepare_worker_runtime_shutdown()
+        self._finish_worker_runtime_shutdown()
 
     def __del__(self) -> None:
         """Cleanup method called when actor is being destroyed."""
@@ -948,9 +1219,11 @@ class RayWorkerActor:
         dynamic_filter_domains: dict[str, Any] | None = None,
         native_progress_callback: Any | None = None,
         debug_context: dict[str, Any] | None = None,
+        native_query_id: str = "",
     ) -> Any:
         conn = self._get_shared_conn()
         cursor = conn.cursor()
+        query_admitted = self._register_native_cursor(cursor, native_query_id)
         debug_context = dict(debug_context or {})
         start = time.monotonic()
         _ray_worker_memory_log(
@@ -963,6 +1236,8 @@ class RayWorkerActor:
         )
 
         try:
+            if not query_admitted:
+                raise RuntimeError(f"native query is closing: {native_query_id}")
             plan_runner = self._get_plan_runner()
             scan_task_arg = scan_task_map or None
             result = plan_runner.execute_native(
@@ -998,6 +1273,8 @@ class RayWorkerActor:
                 cursor.close()
             except Exception:
                 pass
+            finally:
+                self._unregister_native_cursor(cursor)
 
     @staticmethod
     async def _await_fragment_registration(registration_result: Any | None) -> None:
@@ -1026,21 +1303,33 @@ class RayWorkerActor:
         scan_task_map, exchange_source_task_map = _extract_native_task_maps_from_context(context)
         run_start = time.monotonic()
         _ray_worker_memory_log("run_plan_return_start", **debug_context)
-        query_id = str(query_task_lease.get("query_id") or "").strip()
+        # Native execution, shuffle publication, and actor teardown are owned by
+        # the execution query. The resource query can differ for nested
+        # executions and is only the owner of the admission lease.
+        query_id = str(query_task_lease.get("execution_query_id") or "").strip()
         if not query_id:
-            raise RuntimeError("native task execution requires a query_id")
+            raise RuntimeError("native task execution requires an execution_query_id")
+
+        begin_execution = require_ray_cxx_attr(
+            "begin_flight_shuffle_query_execution",
+            hint="Ensure the C++ ray extension is built with Flight shuffle query fencing support.",
+        )
+        end_execution = require_ray_cxx_attr(
+            "end_flight_shuffle_query_execution",
+            hint="Ensure the C++ ray extension is built with Flight shuffle query fencing support.",
+        )
+
+        self._begin_worker_native_execution(query_id)
+        try:
+            begin_execution(query_id)
+        except BaseException:
+            self._end_worker_native_execution(query_id)
+            raise
 
         def execute_native_task() -> Any:
-            begin_execution = require_ray_cxx_attr(
-                "begin_flight_shuffle_query_execution",
-                hint="Ensure the C++ ray extension is built with Flight shuffle query fencing support.",
-            )
-            end_execution = require_ray_cxx_attr(
-                "end_flight_shuffle_query_execution",
-                hint="Ensure the C++ ray extension is built with Flight shuffle query fencing support.",
-            )
-            begin_execution(query_id)
             try:
+                if self._worker_native_query_is_closing(query_id):
+                    raise RuntimeError(f"native query is closing: {query_id}")
                 return self._execute_native_task(
                     plan,
                     scan_task_map or None,
@@ -1052,11 +1341,23 @@ class RayWorkerActor:
                     dynamic_filter_domains=dynamic_filter_domains,
                     native_progress_callback=native_progress_callback,
                     debug_context=debug_context,
+                    native_query_id=query_id,
                 )
             finally:
-                end_execution(query_id)
+                try:
+                    end_execution(query_id)
+                finally:
+                    self._end_worker_native_execution(query_id)
 
-        result_list = await asyncio.to_thread(execute_native_task)
+        try:
+            native_future = asyncio.get_running_loop().run_in_executor(None, execute_native_task)
+        except BaseException:
+            try:
+                end_execution(query_id)
+            finally:
+                self._end_worker_native_execution(query_id)
+            raise
+        result_list = await asyncio.shield(native_future)
         (
             payloads,
             partition_metadatas,

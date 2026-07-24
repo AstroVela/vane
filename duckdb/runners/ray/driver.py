@@ -903,6 +903,7 @@ class RayQueryDriverActor:
         self._query_task_request_owner_by_identity: dict[tuple[str, str, str], str] = {}
         self._query_output_request_owner_by_identity: dict[tuple[str, str], str] = {}
         self._query_resource_closing_queries: set[str] = set()
+        self._query_pending_execution_teardowns: dict[str, set[str]] = {}
         self._query_task_admission_pumps: set[str] = set()
         self._query_output_admission_pumps: set[str] = set()
         self._query_fte_admission_pumps: dict[str, asyncio.Task[Any]] = {}
@@ -922,6 +923,10 @@ class RayQueryDriverActor:
         self._progress_snapshot_lock = threading.Lock()
         self._progress_snapshot_builds: dict[tuple[str, float | None], asyncio.Task[Any]] = {}
         self._progress_snapshot_cache: dict[tuple[str, float | None], dict[str, Any]] = {}
+        self._plan_runner_lifecycle_lock = threading.RLock()
+        self._driver_shutdown_lock = asyncio.Lock()
+        self._driver_shutdown_started = False
+        self._driver_shutdown_complete = False
         self._driver_duckdb_memory_bytes = duckdb_memory_bytes
         self._env_overrides = env_overrides or {}
         _apply_env_overrides(self._env_overrides)
@@ -975,6 +980,11 @@ class RayQueryDriverActor:
                 f"failed to fence query teardown before fragment drop for {query_id}: {type(exc).__name__}: {exc}"
             ) from exc
         errors: list[BaseException] = []
+        pending_execution_teardowns = getattr(self, "_query_pending_execution_teardowns", None)
+        if pending_execution_teardowns is None:
+            pending_execution_teardowns = {}
+            self._query_pending_execution_teardowns = pending_execution_teardowns
+        remembered_execution_query_ids = set(pending_execution_teardowns.get(str(query_id), ()))
         try:
             plan_runner = self._get_plan_runner()
             from duckdb.runners.ray.fte_fragment_scheduler import (
@@ -987,25 +997,46 @@ class RayQueryDriverActor:
             errors.append(exc)
             execution_query_ids = {str(query_id)}
             plan_runner = None
+        execution_query_ids.update(remembered_execution_query_ids)
+        pending_execution_teardowns.setdefault(str(query_id), set()).update(execution_query_ids)
+        successful_execution_query_ids: set[str] = set()
         if plan_runner is not None:
             for execution_query_id in sorted(execution_query_ids):
                 try:
                     plan_runner.drop_query_fragments(execution_query_id)
                 except BaseException as exc:
                     errors.append(exc)
+                else:
+                    successful_execution_query_ids.add(execution_query_id)
         from duckdb.runners.ray.fte_fragment_scheduler import (
             fte_query_remote_teardown_blockers,
         )
 
-        teardown_blockers = fte_query_remote_teardown_blockers(query_id)
-        if teardown_blockers:
+        teardown_blockers_by_query: dict[str, tuple[str, ...]] = {}
+        for execution_query_id in sorted(execution_query_ids):
+            blockers = fte_query_remote_teardown_blockers(execution_query_id)
+            if blockers:
+                teardown_blockers_by_query[execution_query_id] = blockers
+        pending_for_query = pending_execution_teardowns[str(query_id)]
+        pending_for_query.difference_update(
+            execution_query_id
+            for execution_query_id in successful_execution_query_ids
+            if execution_query_id not in teardown_blockers_by_query
+        )
+        if errors or teardown_blockers_by_query or pending_for_query:
             details = [
                 *(f"{type(error).__name__}: {error}" for error in errors),
-                "owners=" + ", ".join(teardown_blockers),
+                *(
+                    f"owners[{execution_query_id}]=" + ", ".join(blockers)
+                    for execution_query_id, blockers in sorted(teardown_blockers_by_query.items())
+                ),
             ]
+            if pending_for_query:
+                details.append("pending_execution_queries=" + ", ".join(sorted(pending_for_query)))
             raise QueryTeardownOwnershipError(
                 f"distributed query teardown retains remote ownership for {query_id}: " + "; ".join(details)
             ) from (errors[0] if errors else None)
+        pending_execution_teardowns.pop(str(query_id), None)
         try:
             # The remote fan-out is best effort, but local FTE ownership must
             # be fully quiesced before QRM/coordinator release. This second,
@@ -1165,7 +1196,22 @@ class RayQueryDriverActor:
 
     def ping(self) -> bool:
         """Health-check: returns True if the actor is alive."""
+        if self._driver_shutdown_started:
+            raise RuntimeError("Ray query driver is shutting down")
         return True
+
+    async def shutdown(self) -> None:
+        """Stop background maintenance and gracefully drain every worker actor."""
+        async with self._driver_shutdown_lock:
+            if self._driver_shutdown_complete:
+                return
+            with self._plan_runner_lifecycle_lock:
+                self._driver_shutdown_started = True
+                plan_runner = self.plan_runner
+            await self.stop_query_resource_maintenance()
+            if plan_runner is not None:
+                await asyncio.to_thread(plan_runner.shutdown)
+            self._driver_shutdown_complete = True
 
     @staticmethod
     def _sum_node_capacity(node_capacities: tuple[Any, ...]) -> Any:
@@ -2735,14 +2781,17 @@ class RayQueryDriverActor:
             _apply_duckdb_thread_setting(self._duckdb_conn)
 
     def _get_plan_runner(self) -> Any:
-        if self.plan_runner is None:
-            DistributedPhysicalPlanRunner = require_ray_cxx_attr(
-                "DistributedPhysicalPlanRunner",
-                hint="Ensure the C++ ray extension is built and importable in this process.",
-            )
-            self.plan_runner = DistributedPhysicalPlanRunner()
-            self.plan_runner.warm_up()
-        return self.plan_runner
+        with self._plan_runner_lifecycle_lock:
+            if self._driver_shutdown_started:
+                raise RuntimeError("Ray query driver is shutting down")
+            if self.plan_runner is None:
+                DistributedPhysicalPlanRunner = require_ray_cxx_attr(
+                    "DistributedPhysicalPlanRunner",
+                    hint="Ensure the C++ ray extension is built and importable in this process.",
+                )
+                self.plan_runner = DistributedPhysicalPlanRunner()
+                self.plan_runner.warm_up()
+            return self.plan_runner
 
     def _precreate_udf_actors(self, plan: Any, graph: Any, allocation: Any) -> list:
         """Create Ray actors and inject handles without waiting for model init."""
@@ -3352,6 +3401,14 @@ class RayQueryDriverClient:
             and current_gcs_address != self._ray_gcs_address
         ):
             return
+        try:
+            resolve_object_refs_blocking(
+                runner.shutdown.remote(),
+                timeout=300,
+                honor_query_deadline=False,
+            )
+        except Exception:
+            pass
         try:
             ray.kill(runner, no_restart=True)
         except TypeError:

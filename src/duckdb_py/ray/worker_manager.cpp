@@ -33,6 +33,24 @@ static bool IsUnselectedFteHandle(const RayWorkerRuntime::TaskResultHandleType &
 	       finished_status->selected_attempt_task_ids.end();
 }
 
+bool RayWorkerManager::BeginOperation() const {
+	lock_guard<mutex> guard(mutex_);
+	if (state_.shutdown_started) {
+		return false;
+	}
+	state_.active_operations++;
+	return true;
+}
+
+void RayWorkerManager::EndOperation() const {
+	{
+		lock_guard<mutex> guard(mutex_);
+		D_ASSERT(state_.active_operations > 0);
+		state_.active_operations--;
+	}
+	shutdown_cv_.notify_all();
+}
+
 std::string RayWorkerManager::QueryIdFromTaskEvents(const std::vector<duckdb::distributed::WorkerTask> &tasks) {
 	std::string query_id;
 	for (const auto &task : tasks) {
@@ -370,6 +388,10 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 }
 
 DuckDBResult<void> RayWorkerManager::submit_fte_task_events(std::vector<duckdb::distributed::WorkerTask> tasks) {
+	OperationGuard operation(*this);
+	if (!operation) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("Ray worker manager is shut down"));
+	}
 	try {
 		auto query_id = QueryIdFromTaskEvents(tasks);
 		if (!tasks.empty() && query_id.empty()) {
@@ -378,6 +400,9 @@ DuckDBResult<void> RayWorkerManager::submit_fte_task_events(std::vector<duckdb::
 		auto collect_workers = [&]() {
 			std::vector<std::shared_ptr<RayWorkerRuntime>> workers;
 			lock_guard<mutex> guard(mutex_);
+			if (state_.shutdown_started) {
+				throw std::runtime_error("Ray worker manager is shut down");
+			}
 			workers.reserve(state_.ray_workers.size());
 			for (auto &kv : state_.ray_workers) {
 				workers.push_back(kv.second);
@@ -416,10 +441,19 @@ DuckDBResult<void> RayWorkerManager::submit_fte_task_events(std::vector<duckdb::
 }
 
 DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>> RayWorkerManager::worker_snapshots() const {
+	OperationGuard operation(*this);
+	if (!operation) {
+		return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::err(
+		    DuckDBError::invalid_state_error("Ray worker manager is shut down"));
+	}
 	bool should_refresh = false;
 	std::vector<string> existing_ids;
 	{
 		lock_guard<mutex> guard(mutex_);
+		if (state_.shutdown_started) {
+			return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::err(
+			    DuckDBError::invalid_state_error("Ray worker manager is shut down"));
+		}
 		should_refresh = !state_.last_refresh.first ||
 		                 (std::chrono::steady_clock::now() - state_.last_refresh.second) > REFRESH_INTERVAL;
 		if (should_refresh) {
@@ -461,12 +495,27 @@ DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>> RayWorkerManager:
 				new_workers.push_back(std::move(worker));
 			}
 
+			bool reject_new_workers = false;
 			{
 				lock_guard<mutex> guard(mutex_);
-				for (auto &worker : new_workers) {
-					state_.ray_workers.emplace(duckdb::distributed::make_worker_id(*worker->Id()), worker);
+				if (state_.shutdown_started) {
+					reject_new_workers = true;
+				} else {
+					for (auto &worker : new_workers) {
+						state_.ray_workers.emplace(duckdb::distributed::make_worker_id(*worker->Id()), worker);
+					}
+					state_.last_refresh = std::make_pair(true, std::chrono::steady_clock::now());
 				}
-				state_.last_refresh = std::make_pair(true, std::chrono::steady_clock::now());
+			}
+			if (reject_new_workers) {
+				for (auto &worker : new_workers) {
+					try {
+						worker->AbortShutdown();
+					} catch (...) {
+					}
+				}
+				return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::err(
+				    DuckDBError::invalid_state_error("Ray worker manager shut down during worker refresh"));
 			}
 		} catch (const py::error_already_set &e) {
 			return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::err(
@@ -483,6 +532,10 @@ DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>> RayWorkerManager:
 	std::vector<duckdb::distributed::WorkerSnapshot> snapshots;
 	{
 		lock_guard<mutex> guard(mutex_);
+		if (state_.shutdown_started) {
+			return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::err(
+			    DuckDBError::invalid_state_error("Ray worker manager is shut down"));
+		}
 		snapshots.reserve(state_.ray_workers.size());
 		for (auto &kv : state_.ray_workers) {
 			snapshots.emplace_back(kv.first, kv.second->TotalNumCpus(), kv.second->TotalNumGpus(),
@@ -495,14 +548,86 @@ DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>> RayWorkerManager:
 DuckDBResult<void> RayWorkerManager::shutdown() {
 	std::vector<std::shared_ptr<RayWorkerRuntime>> workers;
 	{
-		lock_guard<mutex> guard(mutex_);
+		std::unique_lock<mutex> guard(mutex_);
+		if (state_.shutdown_started) {
+			shutdown_cv_.wait(guard, [&]() { return state_.shutdown_finished; });
+			if (!state_.shutdown_error.empty()) {
+				return DuckDBResult<void>::err(DuckDBError::external_error(state_.shutdown_error));
+			}
+			return DuckDBResult<void>::ok();
+		}
+		state_.shutdown_started = true;
 		workers.reserve(state_.ray_workers.size());
 		for (auto &kv : state_.ray_workers) {
 			workers.push_back(kv.second);
 		}
 	}
+	std::vector<std::string> errors;
+	std::vector<std::string> prepare_errors;
 	for (auto &worker : workers) {
-		worker->Shutdown();
+		const auto worker_id = worker->Id() ? *worker->Id() : std::string("<unknown>");
+		try {
+			worker->PrepareShutdown();
+		} catch (const std::exception &ex) {
+			prepare_errors.push_back(worker_id + ": " + ex.what());
+		} catch (...) {
+			prepare_errors.push_back(worker_id + ": unknown prepare-shutdown error");
+		}
+	}
+	errors.insert(errors.end(), prepare_errors.begin(), prepare_errors.end());
+	// Flight shutdown waits for in-flight RPCs. Stop services only after every
+	// worker has canceled and joined native work, so cross-worker readers cannot
+	// deadlock a server that is being stopped earlier in this loop.
+	if (prepare_errors.empty()) {
+		for (auto &worker : workers) {
+			const auto worker_id = worker->Id() ? *worker->Id() : std::string("<unknown>");
+			try {
+				worker->FinishShutdown();
+			} catch (const std::exception &ex) {
+				errors.push_back(worker_id + ": " + ex.what());
+			} catch (...) {
+				errors.push_back(worker_id + ": unknown finish-shutdown error");
+			}
+		}
+	} else {
+		for (auto &worker : workers) {
+			const auto worker_id = worker->Id() ? *worker->Id() : std::string("<unknown>");
+			try {
+				worker->AbortShutdown();
+			} catch (const std::exception &ex) {
+				errors.push_back(worker_id + " force termination: " + ex.what());
+			} catch (...) {
+				errors.push_back(worker_id + ": unknown force-termination error");
+			}
+		}
+	}
+	decltype(state_.fte_result_handles_by_query) result_handles;
+	decltype(state_.retained_fte_result_handles_by_query) retained_result_handles;
+	{
+		std::unique_lock<mutex> guard(mutex_);
+		shutdown_cv_.wait(guard, [&]() { return state_.active_operations == 0; });
+		state_.ray_workers.clear();
+		result_handles = std::move(state_.fte_result_handles_by_query);
+		retained_result_handles = std::move(state_.retained_fte_result_handles_by_query);
+		state_.last_refresh = {};
+	}
+	result_handles.clear();
+	retained_result_handles.clear();
+	std::string error_message;
+	if (!errors.empty()) {
+		error_message = "Ray worker shutdown failed with " + std::to_string(errors.size()) + " error(s)";
+		for (const auto &error : errors) {
+			error_message += "; " + error;
+		}
+	}
+	{
+		lock_guard<mutex> guard(mutex_);
+		state_.shutdown_error = error_message;
+		state_.shutdown_finished = true;
+	}
+	shutdown_cv_.notify_all();
+	if (!error_message.empty()) {
+		return DuckDBResult<void>::err(DuckDBError::external_error(std::move(error_message)));
 	}
 	return DuckDBResult<void>::ok();
 }
@@ -511,7 +636,12 @@ void RayWorkerManager::drop_query_fragments(const string &query_id) {
 	if (query_id.empty()) {
 		return;
 	}
+	OperationGuard operation(*this);
+	if (!operation) {
+		throw std::runtime_error("Ray worker manager is shut down");
+	}
 	std::vector<std::string> errors;
+	std::vector<std::string> prepare_errors;
 	try {
 		ClearFteResultHandles(query_id);
 	} catch (const std::exception &ex) {
@@ -530,15 +660,30 @@ void RayWorkerManager::drop_query_fragments(const string &query_id) {
 	for (auto &worker : workers) {
 		const auto worker_id = worker->Id() ? *worker->Id() : std::string("<unknown>");
 		try {
-			worker->DropQueryFragments(query_id);
+			worker->PrepareDropQuery(query_id);
 		} catch (const std::exception &ex) {
-			errors.push_back(worker_id + ": " + ex.what());
+			prepare_errors.push_back(worker_id + ": " + ex.what());
 		} catch (...) {
-			errors.push_back(worker_id + ": unknown teardown error");
+			prepare_errors.push_back(worker_id + ": unknown prepare-teardown error");
+		}
+	}
+	errors.insert(errors.end(), prepare_errors.begin(), prepare_errors.end());
+	// Storage deletion is a distributed barrier: no worker may clean its
+	// published attempts until every worker has fenced and drained native work.
+	if (prepare_errors.empty()) {
+		for (auto &worker : workers) {
+			const auto worker_id = worker->Id() ? *worker->Id() : std::string("<unknown>");
+			try {
+				worker->CleanupQuery(query_id);
+			} catch (const std::exception &ex) {
+				errors.push_back(worker_id + ": " + ex.what());
+			} catch (...) {
+				errors.push_back(worker_id + ": unknown storage-cleanup error");
+			}
 		}
 	}
 	if (!errors.empty()) {
-		std::string message = "failed to drop query fragments on " + std::to_string(errors.size()) + " worker(s)";
+		std::string message = "query teardown failed with " + std::to_string(errors.size()) + " error(s)";
 		for (const auto &error : errors) {
 			message += "; " + error;
 		}
@@ -551,6 +696,10 @@ DuckDBResult<void> RayWorkerManager::task_input_stream_exhausted_for_query(
 	if (query_id.empty()) {
 		return DuckDBResult<void>::err(
 		    DuckDBError::value_error("FTE task input exhaustion requires non-empty query_id"));
+	}
+	OperationGuard operation(*this);
+	if (!operation) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("Ray worker manager is shut down"));
 	}
 
 	std::vector<std::shared_ptr<RayWorkerRuntime>> workers;
@@ -616,6 +765,11 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 	if (query_id.empty()) {
 		return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 		    DuckDBError::value_error("query_id must be non-empty"));
+	}
+	OperationGuard operation(*this);
+	if (!operation) {
+		return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+		    DuckDBError::invalid_state_error("Ray worker manager is shut down"));
 	}
 
 	std::vector<duckdb::distributed::MaterializedOutput> outputs;
@@ -694,6 +848,10 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 
 std::unordered_map<std::string, std::unordered_map<std::string, duckdb::idx_t>>
 RayWorkerManager::fragment_stats_by_worker() const {
+	OperationGuard operation(*this);
+	if (!operation) {
+		throw std::runtime_error("Ray worker manager is shut down");
+	}
 	std::vector<std::pair<std::string, std::shared_ptr<RayWorkerRuntime>>> workers;
 	{
 		lock_guard<mutex> guard(mutex_);
@@ -714,6 +872,10 @@ RayWorkerManager::fragment_stats_by_worker() const {
 }
 
 DuckDBResult<void> RayWorkerManager::try_autoscale(const std::vector<TaskResourceRequest> &bundles) {
+	OperationGuard operation(*this);
+	if (!operation) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("Ray worker manager is shut down"));
+	}
 	try {
 		double req_cpus = 0, req_gpus = 0;
 		size_t req_mem = 0;
@@ -727,6 +889,9 @@ DuckDBResult<void> RayWorkerManager::try_autoscale(const std::vector<TaskResourc
 		size_t cluster_mem = 0;
 		{
 			lock_guard<mutex> guard(mutex_);
+			if (state_.shutdown_started) {
+				return DuckDBResult<void>::err(DuckDBError::invalid_state_error("Ray worker manager is shut down"));
+			}
 			for (auto &kv : state_.ray_workers) {
 				cluster_cpus += kv.second->TotalNumCpus();
 				cluster_gpus += kv.second->TotalNumGpus();

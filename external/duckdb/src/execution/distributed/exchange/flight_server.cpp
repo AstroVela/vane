@@ -176,6 +176,7 @@ public:
 
 	arrow::Status Close() override {
 		current_input_.reset();
+		cache_.reset();
 		return arrow::Status::OK();
 	}
 

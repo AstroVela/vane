@@ -48,6 +48,19 @@ int FlightExchangeManager::GetLocalFlightServerPort() {
 	return 0;
 }
 
+std::string FlightExchangeManager::GetLocalFlightServerEpoch() {
+	return std::string();
+}
+
+DuckDBResult<void> FlightExchangeManager::EnsureLocalFlightServerStarted(const FlightExchangeConfig &) {
+	return DuckDBResult<void>::err(
+	    DuckDBError::invalid_state_error("Flight exchange is disabled. Rebuild with BUILD_DISTRIBUTED_EXCHANGE=ON."));
+}
+
+DuckDBResult<void> FlightExchangeManager::ShutdownLocalFlightServer() {
+	return DuckDBResult<void>::ok();
+}
+
 void FlightExchangeManager::Shutdown() {
 }
 

@@ -446,7 +446,10 @@ class FteWorkerLifecycleMixin:
                 self._fte_sequences.pop(key, None)
         self._fte_pressure.drop_query(query_id)
 
-    def shutdown(self) -> None:
+    def _begin_worker_shutdown(self) -> None:
+        if getattr(self, "_worker_shutdown_started", False):
+            return
+        self._worker_shutdown_started = True
         if self.worker_id:
             try:
                 self.mark_fte_worker_failed(
@@ -459,13 +462,29 @@ class FteWorkerLifecycleMixin:
                 current = _FTE_WORKER_HANDLES.get(str(self.worker_id))
                 if current is self:
                     _FTE_WORKER_HANDLES.pop(str(self.worker_id), None)
+
+    def prepare_shutdown(self) -> None:
+        """Fence and drain this worker without stopping its Flight service."""
+        self._begin_worker_shutdown()
+        prepare_method = getattr(self.actor_handle, "prepare_shutdown", None)
+        if prepare_method is None:
+            raise RuntimeError("Ray worker actor does not expose prepare_shutdown")
+        resolve_object_refs_blocking(
+            prepare_method.remote(),
+            timeout=30,
+            honor_query_deadline=False,
+        )
+
+    def finish_shutdown(self) -> None:
+        """Stop the prepared worker service and terminate the Ray actor."""
+        self._begin_worker_shutdown()
         shutdown_error: BaseException | None = None
         try:
-            shutdown_method = getattr(self.actor_handle, "shutdown", None)
-            if shutdown_method is None:
-                raise RuntimeError("Ray worker actor does not expose shutdown")
+            finish_method = getattr(self.actor_handle, "finish_shutdown", None)
+            if finish_method is None:
+                raise RuntimeError("Ray worker actor does not expose finish_shutdown")
             resolve_object_refs_blocking(
-                shutdown_method.remote(),
+                finish_method.remote(),
                 timeout=30,
                 honor_query_deadline=False,
             )
@@ -475,3 +494,8 @@ class FteWorkerLifecycleMixin:
             ray.kill(self.actor_handle)
         if shutdown_error is not None:
             raise RuntimeError(f"Ray worker graceful shutdown failed: {shutdown_error}") from shutdown_error
+
+    def abort_shutdown(self) -> None:
+        """Force-terminate an actor after the distributed prepare barrier fails."""
+        self._begin_worker_shutdown()
+        ray.kill(self.actor_handle)

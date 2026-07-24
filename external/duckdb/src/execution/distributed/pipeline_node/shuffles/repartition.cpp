@@ -40,7 +40,8 @@ vector<std::string> CollectShuffleSourceNodes(const std::vector<ExchangeSourceHa
 
 std::string ExchangeSourceHandleKey(const ExchangeSourceHandle &handle) {
 	std::ostringstream ss;
-	ss << handle.partition_id << '|' << handle.attempt_id << '|' << handle.node_id << '|' << handle.flight_port;
+	ss << handle.partition_id << '|' << handle.attempt_id << '|' << handle.node_id << '|' << handle.flight_port << '|'
+	   << handle.flight_server_epoch;
 	for (const auto &file : handle.files) {
 		ss << '|' << file.path << ':' << file.rows << ':' << file.file_size;
 	}
