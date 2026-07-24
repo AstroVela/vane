@@ -6,21 +6,22 @@ from __future__ import annotations
 import concurrent.futures
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from duckdb.runners.ray.fragment_worker_control import (
-    enqueue_ordered_fte_control,
-)
+from duckdb.runners.fte import FteTaskAttemptId, validate_fte_status_identity
 from duckdb.runners.ray.fragment_registry import (
     _FTE_CLOSING_QUERIES,
     _FTE_REGISTRY_LOCK,
 )
+from duckdb.runners.ray.fragment_worker_control import (
+    enqueue_ordered_fte_control,
+)
 from duckdb.runners.ray.fte_fragment_scheduler import (
+    _drop_fragment_plan_refs_for_query,
+    _drop_fte_registry_for_query,
     begin_fte_registry_operation,
     begin_fte_registry_teardown_operation,
     close_fte_registry_for_query,
-    _drop_fragment_plan_refs_for_query,
-    _drop_fte_registry_for_query,
     end_fte_registry_operation,
     end_fte_registry_teardown_operation,
     quiesce_fte_registry_for_query,
@@ -37,7 +38,6 @@ from duckdb.runners.ray.safe_get import (
     configured_ray_get_timeout_s,
     resolve_object_refs_blocking,
 )
-from duckdb.runners.fte import FteTaskAttemptId, validate_fte_status_identity
 
 
 class FteControlBarrierPendingError(RuntimeError):
@@ -49,10 +49,23 @@ class FteControlBarrierTerminalError(RuntimeError):
 
 
 class FteWorkerTaskControlMixin:
+    actor_handle: Any
+    _fte_control_lock: Any
+    _fte_control_tails_by_task: dict[str, Any]
+    _fte_control_query_by_task: dict[str, str]
+    _fte_control_operation_by_task: dict[str, str]
+    _fte_drop_incomplete_queries: set[str]
+    _fte_prepare_terminal_errors: dict[str, BaseException]
+    _fragment_drop_incomplete_queries: set[str]
+
+    if TYPE_CHECKING:
+
+        def _drop_fragment_registration_state(self, query_id: str) -> None: ...
+
     def _fte_control_rpc(
         self,
         method_name: str,
-        *args,
+        *args: Any,
         timeout_s: float | None = None,
         cancel_event: Any = None,
     ) -> Any:

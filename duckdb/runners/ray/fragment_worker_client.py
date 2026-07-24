@@ -88,7 +88,7 @@ class RayWorkerActorHandle(
             _FTE_WORKER_HANDLES[worker_id] = self
 
     @staticmethod
-    def _fte_task_handle_cls():
+    def _fte_task_handle_cls() -> type[Any]:
         # Lazy import to avoid a module import cycle with driver.py.
         from duckdb.runners.ray.driver import FteWorkerTaskHandle
 

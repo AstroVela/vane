@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import queue
 import subprocess
@@ -11,7 +12,6 @@ import textwrap
 import threading
 import types
 import uuid
-import asyncio
 from types import SimpleNamespace
 
 import pytest

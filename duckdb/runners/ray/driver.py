@@ -9,7 +9,7 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -292,7 +292,7 @@ def _collect_vane_env_overrides() -> dict[str, str]:
     return collect_vane_env_overrides()
 
 
-def _apply_env_overrides(env_overrides: dict[str, str] | None) -> None:
+def _apply_env_overrides(env_overrides: Mapping[str, str | None] | None) -> None:
     if not env_overrides:
         return
     for key, value in env_overrides.items():
@@ -324,7 +324,7 @@ class FteWorkerTaskHandle:
     status_wait_timeout_s: float = 0.0
     task_context_info: dict[str, Any] | None = None
     query_task_lease: dict[str, Any] | None = None
-    _result: RayTaskResult | None = None
+    _result: Any = None
     _error: Exception | None = None
     _future: Any = None
     task: Any = None
@@ -361,6 +361,13 @@ class FteWorkerTaskHandle:
         if self.status_wait_timeout_s <= 0:
             self.status_wait_timeout_s = fte_status_wait_timeout_s()
 
+    def _attempt_id(self) -> FteTaskAttemptId:
+        return FteTaskAttemptId.coerce(self.task_id)
+
+    def _terminal_state_is_set(self) -> bool:
+        """Reload terminal state after another thread or awaited RPC may mutate it."""
+        return self._is_done
+
     def _ensure_started(self) -> None:
         with self._lifecycle_lock:
             if self._is_done or self._result is not None or self._error is not None:
@@ -380,7 +387,7 @@ class FteWorkerTaskHandle:
             min_version = self._last_status_version
         return await asyncio.to_thread(
             self.worker_handle.fte_wait_task_status,
-            self.task_id.to_dict(),
+            self._attempt_id().to_dict(),
             min_version,
             self.status_wait_timeout_s,
         )
@@ -397,7 +404,7 @@ class FteWorkerTaskHandle:
         message = str(exc)
         return "did not complete within" in message or "timed out" in message.lower()
 
-    async def _watch_status(self) -> RayTaskResult:
+    async def _watch_status(self) -> Any:
         while True:
             with self._lifecycle_lock:
                 if self._is_done:
@@ -414,7 +421,7 @@ class FteWorkerTaskHandle:
                 if self._is_soft_status_wait_timeout(exc):
                     continue
                 with self._lifecycle_lock:
-                    if self._is_done:
+                    if self._terminal_state_is_set():
                         continue
                 terminal_error = await self._finalize_status_watch_failure(
                     exc,
@@ -475,7 +482,7 @@ class FteWorkerTaskHandle:
             message += "; cleanup also failed: " + "; ".join(cleanup_errors)
         terminal_error = exc if not cleanup_errors and isinstance(exc, Exception) else RuntimeError(message)
         with self._lifecycle_lock:
-            if self._is_done:
+            if self._terminal_state_is_set():
                 return None
             self._error = terminal_error
             self._result = None
@@ -503,7 +510,7 @@ class FteWorkerTaskHandle:
                 self._is_done = True
             return self._is_done
 
-    def get_result_sync(self) -> RayTaskResult:
+    def get_result_sync(self) -> Any:
         with self._lifecycle_lock:
             if not self.done():
                 raise RuntimeError("FTE task result not ready")
@@ -514,7 +521,7 @@ class FteWorkerTaskHandle:
             self.ack()
             return self._result
 
-    async def get_result(self) -> RayTaskResult:
+    async def get_result(self) -> Any:
         with self._lifecycle_lock:
             self._ensure_started()
             future = self._future
@@ -531,7 +538,7 @@ class FteWorkerTaskHandle:
                 return
             errors: list[str] = []
             try:
-                self.worker_handle.fte_cancel_task(self.task_id.to_dict())
+                self.worker_handle.fte_cancel_task(self._attempt_id().to_dict())
             except Exception as exc:
                 errors.append(f"cancel failed: {exc}")
             try:
@@ -566,14 +573,14 @@ class FteWorkerTaskHandle:
         with self._lifecycle_lock:
             if self._acked:
                 return
-            self.worker_handle.enqueue_fte_ack_task_result(self.task_id.to_dict())
+            self.worker_handle.enqueue_fte_ack_task_result(self._attempt_id().to_dict())
             self._acked = True
 
     def release_result_payload(self) -> None:
         with self._lifecycle_lock:
             if self._released:
                 return
-            self.worker_handle.enqueue_fte_release_task_result(self.task_id.to_dict())
+            self.worker_handle.enqueue_fte_release_task_result(self._attempt_id().to_dict())
             self._released = True
 
     def _apply_status(self, status: dict[str, Any]) -> Exception | None:
@@ -637,7 +644,7 @@ class FteWorkerTaskHandle:
                     self._stats_from_status(status),
                     None,
                     0,
-                    self.task_context_info.get("exchange_sink_instance"),
+                    (self.task_context_info or {}).get("exchange_sink_instance"),
                 )
             self._record_fte_task_terminal()
             try:
@@ -678,7 +685,7 @@ class FteWorkerTaskHandle:
         outputs: list[dict[str, Any]],
     ) -> list[Any]:
         owners = self.worker_handle.finish_fte_task_with_outputs(
-            self.task_id.to_dict(),
+            self._attempt_id().to_dict(),
             dict(self.query_task_lease or {}),
             outputs,
         )
@@ -734,7 +741,7 @@ class FteWorkerTaskHandle:
         self._result = None
         return cleanup_errors
 
-    def _normalize_raw_result(self, raw_result: Any) -> RayTaskResult:
+    def _normalize_raw_result(self, raw_result: Any) -> Any:
         if isinstance(raw_result, RayTaskResult):
             self._finish_task_output_ownership([])
             return raw_result
@@ -802,9 +809,10 @@ class FteWorkerTaskHandle:
         return RayTaskResult.success([], [], None)
 
     def _requires_final_output_stats(self) -> bool:
-        if self.task_context_info.get("exchange_sink_instance") is not None:
+        task_context_info = self.task_context_info or {}
+        if task_context_info.get("exchange_sink_instance") is not None:
             return True
-        return bool(self.task_context_info.get("requires_spooling_output_stats"))
+        return bool(task_context_info.get("requires_spooling_output_stats"))
 
     @staticmethod
     def _output_stats_from_status(status: dict[str, Any]) -> Any:
@@ -843,7 +851,7 @@ class FteWorkerTaskHandle:
         return []
 
 
-def batch_wait_ready(handles: list) -> list[int]:
+def batch_wait_ready(handles: list[Any]) -> list[int]:
     """Batch-check which worker task handle instances are ready.
 
     Called from C++ RayTaskResultPoller under a single GIL acquisition.  Each
@@ -949,7 +957,7 @@ class RayQueryDriverActor:
         # Eagerly create DuckDB connection during __init__ so the ~2s
         # cold-start cost overlaps with actor creation instead of
         # blocking the first query.
-        self._duckdb_conn = None
+        self._duckdb_conn: Any = None
         self._ensure_duckdb_conn()
 
         # Eagerly create PlanRunner + warm up Worker workers so the
@@ -1049,11 +1057,11 @@ class RayQueryDriverActor:
             _drop_fte_registry_for_query(query_id)
         except BaseException as exc:
             self._query_resource_admission_bridge_poisoned = True
-            details = [*errors, exc]
+            quiesce_errors: list[BaseException] = [*errors, exc]
             raise QueryFteRegistryQuiesceError(
                 f"local FTE registry did not quiesce for {query_id}; "
                 "driver admission bridge poisoned: "
-                + "; ".join(f"{type(error).__name__}: {error}" for error in details)
+                + "; ".join(f"{type(error).__name__}: {error}" for error in quiesce_errors)
             ) from exc
         if release_resources:
             try:
@@ -1179,7 +1187,7 @@ class RayQueryDriverActor:
                 return dict(cached)
         return await asyncio.shield(build)
 
-    def _ensure_duckdb_conn(self):
+    def _ensure_duckdb_conn(self) -> Any:
         """Eagerly create the DuckDB connection."""
         if self._duckdb_conn is not None:
             return self._duckdb_conn
@@ -1795,17 +1803,19 @@ class RayQueryDriverActor:
         }
         identity = state["identity"]
         if "block_id" in identity:
-            owner_key = (str(identity["query_id"]), str(identity["block_id"]))
-            owners = self._query_output_request_owner_by_identity
+            output_owner_key = (str(identity["query_id"]), str(identity["block_id"]))
+            output_owners = self._query_output_request_owner_by_identity
+            if output_owners.get(output_owner_key) == str(request_id):
+                output_owners.pop(output_owner_key, None)
         else:
-            owner_key = (
+            task_owner_key = (
                 str(identity["query_id"]),
                 str(identity["task_id"]),
                 str(identity["attempt_id"]),
             )
-            owners = self._query_task_request_owner_by_identity
-        if owners.get(owner_key) == str(request_id):
-            owners.pop(owner_key, None)
+            task_owners = self._query_task_request_owner_by_identity
+            if task_owners.get(task_owner_key) == str(request_id):
+                task_owners.pop(task_owner_key, None)
 
     def _fail_query_admission_requests(self, query_id: str) -> None:
         """Resolve every pending request before its query manager disappears."""
@@ -2793,7 +2803,7 @@ class RayQueryDriverActor:
                 self.plan_runner.warm_up()
             return self.plan_runner
 
-    def _precreate_udf_actors(self, plan: Any, graph: Any, allocation: Any) -> list:
+    def _precreate_udf_actors(self, plan: Any, graph: Any, allocation: Any) -> list[Any]:
         """Create Ray actors and inject handles without waiting for model init."""
         from duckdb.execution.udf_ray import prepare_actor_pools_for_plan
 
@@ -2816,7 +2826,7 @@ class RayQueryDriverActor:
 
         wait_for_actor_pools_ready(actor_pools)
 
-    def _precreate_vllm_actors(self, plan: Any) -> list:
+    def _precreate_vllm_actors(self, plan: Any) -> list[Any]:
         """Pre-create Ray actor pools for vLLM nodes on the driver."""
         from duckdb.execution.vllm import ensure_named_vllm_pools_for_plan
 
@@ -3202,7 +3212,7 @@ class RayQueryDriverActor:
                 # the event loop.
                 stream = self.curr_streams[plan_id]
 
-                def _safe_blocking_next():
+                def _safe_blocking_next() -> Any | None:
                     try:
                         return stream.blocking_next()
                     except StopIteration:
@@ -3294,7 +3304,7 @@ def _maybe_set_distributed_cluster_capacity() -> None:
     if not nodes:
         return
 
-    def _usable(node: dict) -> bool:
+    def _usable(node: dict[str, Any]) -> bool:
         if not node.get("Alive", True):
             return False
         resources = node.get("Resources", {}) or {}
