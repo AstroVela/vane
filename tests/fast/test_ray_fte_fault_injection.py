@@ -350,9 +350,11 @@ def _init_ray_for_fault_test(monkeypatch) -> None:
     monkeypatch.setenv("PYTHONPATH", pythonpath)
     monkeypatch.setenv("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
     monkeypatch.setenv("VANE_FTE_RETRY_INITIAL_DELAY_S", "0")
-    if ray.is_initialized():
-        if _FAULT_RAY_CLUSTER is not None:
+    if _FAULT_RAY_CLUSTER is not None:
+        if ray.is_initialized():
             return
+        _shutdown_ray_for_fault_test()
+    elif ray.is_initialized():
         _shutdown_ray_for_fault_test()
 
     runtime_env_vars = {
@@ -400,7 +402,7 @@ def _shutdown_ray_for_fault_test() -> None:
 def _fault_ray_runtime():
     yield
     _clear_fte_state()
-    if ray.is_initialized():
+    if ray.is_initialized() or _FAULT_RAY_CLUSTER is not None:
         _shutdown_ray_for_fault_test()
 
 
