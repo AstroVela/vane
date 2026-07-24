@@ -23,10 +23,12 @@ import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from itertools import repeat
+from typing import Any, cast
 
 import numpy as np
+import numpy.typing as npt
 import pyarrow as pa
-from PIL import Image
+from PIL import Image  # type: ignore[import-not-found]
 
 from duckdb.datasource import DataSource, DataSourceTask
 
@@ -192,14 +194,14 @@ def _wait_for_memory() -> None:
     IMPORTANT: Only call at task START (before a new video). Never call
     mid-decode or mid-yield — that deadlocks the DuckDB push pipeline.
     """
-    import psutil
+    import psutil  # type: ignore[import-untyped]
 
-    def has_capacity(mem) -> bool:
+    def has_capacity(mem: Any) -> bool:
         if _MEM_MIN_AVAILABLE_BYTES > 0 and mem.available >= _MEM_MIN_AVAILABLE_BYTES:
             return True
         return mem.percent < _MEM_HIGH_WATERMARK
 
-    def has_recovered(mem) -> bool:
+    def has_recovered(mem: Any) -> bool:
         if _MEM_MIN_AVAILABLE_BYTES > 0 and mem.available >= _MEM_MIN_AVAILABLE_BYTES:
             return True
         return mem.percent < _MEM_LOW_WATERMARK
@@ -214,37 +216,48 @@ def _wait_for_memory() -> None:
             return
 
 
+def _s3_filesystem_kwargs() -> dict[str, str | bool]:
+    """Build explicit S3 overrides without bypassing the AWS SDK defaults."""
+    from urllib.parse import urlparse
+
+    kwargs: dict[str, str | bool] = {}
+
+    endpoint_url = _read_optional_text_env(("AWS_ENDPOINT_URL",))
+    if endpoint_url is not None:
+        if "://" in endpoint_url:
+            parsed = urlparse(endpoint_url)
+            endpoint = parsed.netloc or parsed.path
+            if parsed.scheme:
+                kwargs["scheme"] = parsed.scheme
+        else:
+            endpoint = endpoint_url.rstrip("/")
+        kwargs["endpoint_override"] = endpoint
+
+    region = _read_optional_text_env(("AWS_REGION", "AWS_DEFAULT_REGION"))
+    if region is not None:
+        kwargs["region"] = region
+
+    if _read_bool_env("S3FS_ANON", False):
+        kwargs["anonymous"] = True
+
+    return kwargs
+
+
 def _read_s3_bytes(s3_path: str) -> bytes:
     """Read a file from S3 into memory via PyArrow's S3FileSystem."""
     import pyarrow.fs as pa_fs
 
-    ak = os.environ.get("AWS_ACCESS_KEY_ID", "")
-    sk = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-    ep = os.environ.get("AWS_ENDPOINT_URL", "")
-    region = os.environ.get("AWS_REGION", "us-east-1")
-    from urllib.parse import urlparse
-
-    parsed = urlparse(ep)
-    endpoint = parsed.netloc or parsed.path
-    scheme = parsed.scheme or "http"
-    kwargs = {"endpoint_override": endpoint, "region": region, "scheme": scheme}
-    if ak or sk:
-        kwargs["access_key"] = ak
-        kwargs["secret_key"] = sk
-        kwargs["anonymous"] = False
-    else:
-        kwargs["anonymous"] = True
-    fs = pa_fs.S3FileSystem(**kwargs)
+    fs = pa_fs.S3FileSystem(**_s3_filesystem_kwargs())
     obj_path = s3_path[len("s3://") :]
     with fs.open_input_file(obj_path) as f:
         return f.read()
 
 
-def _build_frame_array(frames: np.ndarray) -> pa.ExtensionArray:
-    frames = np.ascontiguousarray(frames, dtype=np.uint8)
-    if frames.ndim != 4 or frames.shape[-1] != 3:
-        raise ValueError(f"expected RGB frame batch with shape (N, H, W, 3), got {frames.shape!r}")
-    return pa.FixedShapeTensorArray.from_numpy_ndarray(frames)
+def _build_frame_array(frames: npt.ArrayLike) -> pa.ExtensionArray:
+    frame_array: npt.NDArray[np.uint8] = np.ascontiguousarray(frames, dtype=np.uint8)
+    if frame_array.ndim != 4 or frame_array.shape[-1] != 3:
+        raise ValueError(f"expected RGB frame batch with shape (N, H, W, 3), got {frame_array.shape!r}")
+    return pa.FixedShapeTensorArray.from_numpy_ndarray(frame_array)
 
 
 def _int64_array(values: list[int]) -> pa.Array:
@@ -254,13 +267,13 @@ def _int64_array(values: list[int]) -> pa.Array:
 
 def _constant_string_array(value: str, count: int) -> pa.Array:
     encoded = value.encode("utf-8")
-    offsets = np.arange(count + 1, dtype=np.int32) * len(encoded)
+    offsets: npt.NDArray[np.int32] = np.arange(count + 1, dtype=np.int32) * len(encoded)
     data = encoded * count
     return pa.Array.from_buffers(pa.string(), count, [None, pa.py_buffer(offsets), pa.py_buffer(data)])
 
 
-def _open_decord_reader(video_path: str):
-    from decord import VideoReader
+def _open_decord_reader(video_path: str) -> Any:
+    from decord import VideoReader  # type: ignore[import-not-found]
 
     if video_path.startswith("s3://"):
         import io as _io
@@ -269,18 +282,22 @@ def _open_decord_reader(video_path: str):
     return VideoReader(video_path)
 
 
-def _resize_rgb_frame(frame: np.ndarray, width: int, height: int) -> np.ndarray:
+def _resize_rgb_frame(
+    frame: npt.NDArray[np.uint8],
+    width: int,
+    height: int,
+) -> npt.NDArray[np.uint8]:
     pil_image = Image.fromarray(frame)
     return np.array(pil_image.resize((width, height)))
 
 
 def _resize_frame_batch(
-    frames: list[np.ndarray],
+    frames: list[npt.NDArray[np.uint8]],
     *,
     width: int,
     height: int,
     executor: ThreadPoolExecutor | None = None,
-) -> list[np.ndarray]:
+) -> list[npt.NDArray[np.uint8]]:
     if not frames:
         return []
     if _VIDEO_RESIZE_THREADS <= 1 or len(frames) == 1:
@@ -308,8 +325,8 @@ def _decode_video_batches(
     vname = os.path.basename(video_path)
     batch_size = _video_source_udf_output_batch_size(height, width, max_partition_bytes)
 
-    resized = np.empty((batch_size, height, width, 3), dtype=np.uint8)
-    raw_frames: list[np.ndarray] = []
+    resized: npt.NDArray[np.uint8] = np.empty((batch_size, height, width, 3), dtype=np.uint8)
+    raw_frames: list[npt.NDArray[np.uint8]] = []
     indices: list[int] = []
     count = 0
     decode_s = 0.0
@@ -377,7 +394,7 @@ def _decode_video_batches(
 
 def _flush_frame_batch(
     vname: str,
-    resized: np.ndarray,
+    resized: npt.NDArray[np.uint8],
     indices: list[int],
     count: int,
 ) -> pa.RecordBatch:
@@ -562,13 +579,13 @@ def _manifest_int_value(values: list[object], index: int, name: str) -> int:
     value = values[index]
     if value is None:
         raise ValueError(f"VideoFrameSource manifest column {name!r} cannot be NULL")
-    return int(value)
+    return int(cast(Any, value))
 
 
 def _manifest_frame_limit(values: list[object]) -> int | None:
     for value in values:
         if value is not None:
-            return max(0, int(value))
+            return max(0, int(cast(Any, value)))
     return None
 
 
@@ -672,7 +689,7 @@ class VideoFrameTask(DataSourceTask):
     def _flush(
         self,
         vname: str,
-        resized: np.ndarray,
+        resized: npt.NDArray[np.uint8],
         indices: list[int],
         count: int,
     ) -> pa.RecordBatch:
@@ -774,7 +791,7 @@ class VideoFrameSource(DataSource):
                 max_partition_bytes=self.max_partition_bytes,
             )
 
-    def to_udf_relation(self, con):
+    def to_udf_relation(self, con: Any) -> Any:
         import duckdb
 
         manifest = con.sql(_video_frame_source_manifest_sql(self))

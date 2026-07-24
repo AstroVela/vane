@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import io
+
 import numpy as np
 import pyarrow as pa
 import pytest
@@ -15,12 +17,187 @@ from duckdb.datasource.video_reader import (
     _coalesce_video_frame_batches,
     _decode_video_batches,
     _flush_frame_batch,
+    _read_s3_bytes,
     _resize_frame_batch,
     _split_video_path_groups,
     _video_frame_source_manifest_sql,
     _video_frame_source_map_batches,
     _video_source_udf_output_batch_size,
 )
+
+_S3_ENV_NAMES = (
+    "S3FS_ANON",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ENDPOINT_URL",
+)
+
+
+@pytest.fixture
+def recording_s3_filesystem(monkeypatch):
+    import pyarrow.fs as pa_fs
+
+    recorded = {}
+
+    class RecordingS3FileSystem:
+        def __init__(self, **kwargs):
+            recorded["kwargs"] = kwargs
+
+        def open_input_file(self, path):
+            recorded["path"] = path
+            return io.BytesIO(b"video-bytes")
+
+    monkeypatch.setattr(pa_fs, "S3FileSystem", RecordingS3FileSystem)
+    return recorded
+
+
+def _clear_s3_environment(monkeypatch):
+    for name in _S3_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_video_s3_reader_uses_default_aws_sdk_chain(monkeypatch, recording_s3_filesystem):
+    _clear_s3_environment(monkeypatch)
+
+    result = _read_s3_bytes("s3://media-bucket/clips/example.mp4")
+
+    assert result == b"video-bytes"
+    assert recording_s3_filesystem == {
+        "kwargs": {},
+        "path": "media-bucket/clips/example.mp4",
+    }
+
+
+@pytest.mark.parametrize(
+    "credential_env",
+    [
+        {"AWS_PROFILE": "media-reader"},
+        {
+            "AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/media-reader",
+            "AWS_ROLE_SESSION_NAME": "vane-video-test",
+            "AWS_WEB_IDENTITY_TOKEN_FILE": "/var/run/secrets/aws/token",
+        },
+    ],
+    ids=["profile", "web-identity-role"],
+)
+def test_video_s3_reader_leaves_profile_and_role_credentials_to_sdk(
+    monkeypatch,
+    recording_s3_filesystem,
+    credential_env,
+):
+    _clear_s3_environment(monkeypatch)
+    for name, value in credential_env.items():
+        monkeypatch.setenv(name, value)
+
+    _read_s3_bytes("s3://media-bucket/example.mp4")
+
+    assert recording_s3_filesystem["kwargs"] == {}
+
+
+def test_video_s3_reader_leaves_static_session_credentials_to_sdk(monkeypatch, recording_s3_filesystem):
+    _clear_s3_environment(monkeypatch)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "temporary-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "temporary-secret-key")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "temporary-session-token")
+
+    _read_s3_bytes("s3://media-bucket/example.mp4")
+
+    assert recording_s3_filesystem["kwargs"] == {}
+
+
+@pytest.mark.parametrize(
+    "partial_credentials",
+    [
+        {"AWS_ACCESS_KEY_ID": "access-key-without-secret"},
+        {"AWS_SECRET_ACCESS_KEY": "secret-key-without-access"},
+    ],
+    ids=["access-key-only", "secret-key-only"],
+)
+def test_video_s3_reader_leaves_partial_static_credentials_to_sdk(
+    monkeypatch,
+    recording_s3_filesystem,
+    partial_credentials,
+):
+    _clear_s3_environment(monkeypatch)
+    for name, value in partial_credentials.items():
+        monkeypatch.setenv(name, value)
+
+    _read_s3_bytes("s3://media-bucket/example.mp4")
+
+    assert recording_s3_filesystem["kwargs"] == {}
+
+
+@pytest.mark.parametrize("region_env", ["AWS_REGION", "AWS_DEFAULT_REGION"])
+def test_video_s3_reader_passes_custom_https_endpoint_and_region(
+    monkeypatch,
+    recording_s3_filesystem,
+    region_env,
+):
+    _clear_s3_environment(monkeypatch)
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://objects.example.test:9443")
+    monkeypatch.setenv(region_env, "eu-west-1")
+
+    _read_s3_bytes("s3://media-bucket/example.mp4")
+
+    assert recording_s3_filesystem["kwargs"] == {
+        "endpoint_override": "objects.example.test:9443",
+        "region": "eu-west-1",
+        "scheme": "https",
+    }
+
+
+@pytest.mark.parametrize(
+    ("endpoint_url", "expected_kwargs"),
+    [
+        ("objects.example.test:9443", {"endpoint_override": "objects.example.test:9443"}),
+        (
+            "http://127.0.0.1:9000",
+            {"endpoint_override": "127.0.0.1:9000", "scheme": "http"},
+        ),
+    ],
+)
+def test_video_s3_reader_uses_pyarrow_secure_default_when_endpoint_has_no_scheme(
+    monkeypatch,
+    recording_s3_filesystem,
+    endpoint_url,
+    expected_kwargs,
+):
+    _clear_s3_environment(monkeypatch)
+    monkeypatch.setenv("AWS_ENDPOINT_URL", endpoint_url)
+
+    _read_s3_bytes("s3://media-bucket/example.mp4")
+
+    assert recording_s3_filesystem["kwargs"] == expected_kwargs
+
+
+def test_video_s3_reader_does_not_enable_anonymous_mode_when_explicitly_disabled(
+    monkeypatch,
+    recording_s3_filesystem,
+):
+    _clear_s3_environment(monkeypatch)
+    monkeypatch.setenv("S3FS_ANON", "false")
+
+    _read_s3_bytes("s3://media-bucket/example.mp4")
+
+    assert recording_s3_filesystem["kwargs"] == {}
+
+
+def test_video_s3_reader_uses_anonymous_mode_only_when_explicit(monkeypatch, recording_s3_filesystem):
+    _clear_s3_environment(monkeypatch)
+    monkeypatch.setenv("S3FS_ANON", "true")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ignored-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "ignored-secret-key")
+
+    _read_s3_bytes("s3://public-media/example.mp4")
+
+    assert recording_s3_filesystem["kwargs"] == {"anonymous": True}
 
 
 def test_video_frame_source_uses_one_ordered_task_for_frame_limit():
