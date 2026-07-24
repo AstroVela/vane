@@ -389,6 +389,7 @@ test = [ # dependencies used for running tests
     "gcovr",
     "gcsfs; sys_platform != 'win32' or platform_machine != 'ARM64'",
     "packaging",
+    "pillow",
     "polars",
     "psutil",
     "py4j",
