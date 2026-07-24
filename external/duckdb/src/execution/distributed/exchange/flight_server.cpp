@@ -13,23 +13,12 @@
 #include <arrow/io/api.h>
 #include <arrow/buffer.h>
 #include <algorithm>
-#include <sstream>
 #include <vector>
 
 namespace duckdb {
 namespace distributed {
 
 namespace {
-
-std::string FlightServerSanitizePathComponent(const std::string &value) {
-	std::string out = value;
-	for (auto &ch : out) {
-		if (ch == '/' || ch == '\\') {
-			ch = '_';
-		}
-	}
-	return out;
-}
 
 DuckDBError FlightServerArrowToError(const arrow::Status &status, const std::string &context) {
 	return DuckDBError::external_error(context + ": " + status.ToString());
@@ -46,32 +35,6 @@ DuckDBResult<arrow::flight::Location> MakeLocation(const FlightServerConfig &con
 		    FlightServerArrowToError(location_res.status(), "create flight location"));
 	}
 	return DuckDBResult<arrow::flight::Location>::ok(std::move(location_res).ValueOrDie());
-}
-
-std::string NodeDirectory(const FlightServerConfig &config, const std::string &shuffle_stage_id,
-                          const std::string &node_id) {
-	auto stage = FlightServerSanitizePathComponent(shuffle_stage_id);
-	auto node = FlightServerSanitizePathComponent(node_id);
-	auto base_dir = config.local_dirs.empty() ? std::string() : config.local_dirs[0];
-	std::ostringstream ss;
-	ss << base_dir << "/shuffle_" << stage << "/node_" << node;
-	return ss.str();
-}
-
-std::string PartitionDirectory(const FlightServerConfig &config, const std::string &shuffle_stage_id,
-                               const std::string &node_id, idx_t partition_idx) {
-	auto stage = FlightServerSanitizePathComponent(shuffle_stage_id);
-	auto node = FlightServerSanitizePathComponent(node_id);
-	auto base_dir =
-	    config.local_dirs.empty() ? std::string() : config.local_dirs[partition_idx % config.local_dirs.size()];
-	std::ostringstream ss;
-	ss << base_dir << "/shuffle_" << stage << "/node_" << node << "/partition_" << partition_idx;
-	return ss.str();
-}
-
-std::string SchemaFilePath(const FlightServerConfig &config, const std::string &shuffle_stage_id,
-                           const std::string &node_id) {
-	return NodeDirectory(config, shuffle_stage_id, node_id) + "/schema.arrow";
 }
 
 /// Lazy-streaming RecordBatchReader that reads batches on-demand from multiple
@@ -151,12 +114,13 @@ private:
 /// FlightData.ipc_message = { metadata: flatbuf bytes, body_buffers: [body bytes] }
 class ZeroCopyIPCStreamFlightDataStream : public arrow::flight::FlightDataStream {
 public:
-	static arrow::Result<std::unique_ptr<ZeroCopyIPCStreamFlightDataStream>> Open(std::vector<std::string> files) {
+	static arrow::Result<std::unique_ptr<ZeroCopyIPCStreamFlightDataStream>> Open(std::vector<std::string> files,
+	                                                                              std::shared_ptr<ShuffleCache> cache) {
 		if (files.empty()) {
 			return arrow::Status::Invalid("no files to stream");
 		}
-		auto stream =
-		    std::unique_ptr<ZeroCopyIPCStreamFlightDataStream>(new ZeroCopyIPCStreamFlightDataStream(std::move(files)));
+		auto stream = std::unique_ptr<ZeroCopyIPCStreamFlightDataStream>(
+		    new ZeroCopyIPCStreamFlightDataStream(std::move(files), std::move(cache)));
 		ARROW_RETURN_NOT_OK(stream->Initialize());
 		return stream;
 	}
@@ -216,7 +180,8 @@ public:
 	}
 
 private:
-	explicit ZeroCopyIPCStreamFlightDataStream(std::vector<std::string> files) : files_(std::move(files)) {
+	ZeroCopyIPCStreamFlightDataStream(std::vector<std::string> files, std::shared_ptr<ShuffleCache> cache)
+	    : files_(std::move(files)), cache_(std::move(cache)) {
 	}
 
 	arrow::Status Initialize() {
@@ -231,6 +196,7 @@ private:
 	}
 
 	std::vector<std::string> files_;
+	std::shared_ptr<ShuffleCache> cache_;
 	std::shared_ptr<arrow::Schema> schema_;
 	std::shared_ptr<arrow::io::ReadableFile> current_input_;
 	size_t current_file_idx_ = 0;
@@ -256,58 +222,47 @@ public:
 			return arrow::Status::Invalid(ticket_res.error().what());
 		}
 		auto ticket = std::move(ticket_res.value());
-
-		std::vector<std::string> files;
-
-		// Priority 1: Look up ShuffleCacheRegistry (aligned with Vane's do_get)
-		auto cache = ShuffleCacheRegistry::Instance().Get(ticket.shuffle_stage_id);
-		bool visible_committed_attempt = cache != nullptr;
-		if (cache) {
-			auto files_res = cache->GetPartitionFiles(ticket.partition_idx);
-			if (!files_res.is_err()) {
-				for (auto &f : files_res.value().files) {
-					files.push_back(f.path);
-				}
-			}
+		if (ticket.server_epoch != config_.server_epoch) {
+			return arrow::Status::Invalid("flight ticket server epoch is stale");
 		}
 
-		// Priority 2: durable manifest recovery (cross-process / registry-loss scenario)
-		if (files.empty() && !config_.local_dirs.empty()) {
-			ShuffleCacheConfig cache_config;
-			cache_config.shuffle_stage_id = ticket.shuffle_stage_id;
-			cache_config.node_id = ticket.node_id;
-			cache_config.num_partitions = std::max<idx_t>(ticket.partition_idx + 1, 1);
-			cache_config.local_dirs = config_.local_dirs;
-			ShuffleCache manifest_cache(std::move(cache_config));
-			if (manifest_cache.HasCommittedManifest()) {
-				visible_committed_attempt = true;
-				auto files_res = manifest_cache.GetPartitionFilesFromManifest(ticket.partition_idx);
-				if (files_res.is_err()) {
-					return arrow::Status::IOError(files_res.error().what());
-				}
-				for (const auto &f : files_res.value().files) {
-					files.push_back(f.path);
-				}
+		auto cache_res = ShuffleCacheRegistry::Instance().Resolve(ticket.exchange_instance_id, ticket.server_epoch,
+		                                                          ticket.node_id, ticket.attempt_id);
+		if (cache_res.is_err()) {
+			return arrow::Status::Invalid(cache_res.error().what());
+		}
+		auto cache = std::move(cache_res.value());
+
+		if (!cache->HasCommittedManifest()) {
+			return arrow::Status::Invalid("flight exchange attempt is not committed: " + ticket.exchange_instance_id);
+		}
+
+		auto files_res = cache->GetPartitionFiles(ticket.partition_idx);
+		if (files_res.is_err()) {
+			return arrow::Status::IOError(files_res.error().what());
+		}
+		if (files_res.value().files.empty()) {
+			files_res = cache->GetPartitionFilesFromManifest(ticket.partition_idx);
+			if (files_res.is_err()) {
+				return arrow::Status::IOError(files_res.error().what());
 			}
+		}
+		std::vector<std::string> files;
+		for (const auto &file : files_res.value().files) {
+			files.push_back(file.path);
 		}
 		std::sort(files.begin(), files.end());
 
-		if (files.empty() && !visible_committed_attempt) {
-			return arrow::Status::Invalid("flight exchange attempt is not committed: " + ticket.shuffle_stage_id);
-		}
 		if (files.empty()) {
 			// Return empty stream with schema only
-			if (config_.local_dirs.empty()) {
-				return arrow::Status::Invalid("flight server local_dirs is empty and no cache found");
-			}
-			auto schema_path = SchemaFilePath(config_, ticket.shuffle_stage_id, ticket.node_id);
-			ARROW_ASSIGN_OR_RAISE(auto schema, ReadSchemaFromFile(schema_path));
+			ARROW_ASSIGN_OR_RAISE(auto schema, ReadSchemaFromFile(cache->SchemaFilePath()));
 			arrow::RecordBatchVector empty;
 			ARROW_ASSIGN_OR_RAISE(auto reader, arrow::RecordBatchReader::Make(empty, schema));
 			*stream = std::unique_ptr<arrow::flight::RecordBatchStream>(new arrow::flight::RecordBatchStream(reader));
 		} else {
 			// True zero-copy: read raw IPC stream bytes directly into FlightPayload
-			ARROW_ASSIGN_OR_RAISE(auto zc_stream, ZeroCopyIPCStreamFlightDataStream::Open(std::move(files)));
+			ARROW_ASSIGN_OR_RAISE(auto zc_stream,
+			                      ZeroCopyIPCStreamFlightDataStream::Open(std::move(files), std::move(cache)));
 			*stream = std::move(zc_stream);
 		}
 		return arrow::Status::OK();
@@ -358,11 +313,7 @@ FlightServer::~FlightServer() {
 		return;
 	}
 	if (impl_ && impl_->server()) {
-		auto status = impl_->server()->Shutdown();
-		if (!status.ok()) {
-			server_thread_.detach();
-			return;
-		}
+		(void)impl_->server()->Shutdown();
 	}
 	server_thread_.join();
 }
@@ -379,8 +330,8 @@ DuckDBResult<void> FlightServer::StartInternal() {
 	if (!impl_) {
 		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("flight server not initialized"));
 	}
-	if (config_.local_dirs.empty()) {
-		return DuckDBResult<void>::err(DuckDBError::value_error("flight server local_dirs is empty"));
+	if (config_.server_epoch.empty()) {
+		return DuckDBResult<void>::err(DuckDBError::value_error("flight server epoch is empty"));
 	}
 	auto start_res = impl_->Start();
 	if (start_res.is_err()) {

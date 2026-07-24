@@ -54,6 +54,7 @@ void ExchangeSinkInstanceTaskDescriptor::Serialize(Serializer &serializer) const
 	serializer.WriteProperty(2, "attempt_id", sink_instance.attempt_id);
 	serializer.WriteProperty(3, "output_location", sink_instance.output_location);
 	serializer.WriteProperty(4, "output_partition_count", sink_instance.output_partition_count);
+	serializer.WriteProperty(5, "flight_server_epoch", sink_instance.flight_server_epoch);
 }
 
 ExchangeSinkInstanceTaskDescriptor ExchangeSinkInstanceTaskDescriptor::Deserialize(Deserializer &deserializer) {
@@ -64,6 +65,7 @@ ExchangeSinkInstanceTaskDescriptor ExchangeSinkInstanceTaskDescriptor::Deseriali
 	    deserializer.ReadPropertyWithExplicitDefault<string>(3, "output_location", "");
 	result.sink_instance.output_partition_count =
 	    deserializer.ReadPropertyWithDefault<idx_t>(4, "output_partition_count");
+	result.sink_instance.flight_server_epoch = deserializer.ReadProperty<string>(5, "flight_server_epoch");
 	return result;
 }
 

@@ -1824,10 +1824,15 @@ struct PyPhysicalPlanWrapperRunner {
 		ApplyTaskLocalCopyOutput(*physical_plan, copy_output_info, &context);
 
 		auto &root_op = physical_plan->Root();
-		py::object task_exchange_sink_instance_obj = py::none();
-		if (exchange_sink_instance_task) {
-			task_exchange_sink_instance_obj = py::bytes(exchange_sink_instance_task->SerializeToBytes());
-		}
+		auto task_exchange_sink_instance_obj = [&]() -> py::object {
+			if (!exchange_sink_instance_task) {
+				return py::none();
+			}
+			auto completed_task = *exchange_sink_instance_task;
+			completed_task.sink_instance.flight_server_epoch =
+			    duckdb::distributed::FlightExchangeManager::GetLocalFlightServerEpoch();
+			return py::bytes(completed_task.SerializeToBytes());
+		};
 
 		py::list results;
 		auto build_result_schema = [&](const duckdb::vector<string> &names,
@@ -1842,7 +1847,7 @@ struct PyPhysicalPlanWrapperRunner {
 			return BuildNativeTaskResult(payloads, metadatas, build_result_schema(names, result_types), py::list(),
 			                             std::move(task_stats), status,
 			                             duckdb::distributed::FlightExchangeManager::GetLocalFlightServerPort(),
-			                             task_exchange_sink_instance_obj);
+			                             task_exchange_sink_instance_obj());
 		};
 		auto build_table_result = [&](const py::object &table, idx_t row_count, const duckdb::vector<string> &names,
 		                              const duckdb::vector<duckdb::LogicalType> &result_types,
@@ -1858,7 +1863,7 @@ struct PyPhysicalPlanWrapperRunner {
 			return BuildNativeTaskResult(payloads, metadatas, build_result_schema(names, result_types), py::list(),
 			                             std::move(task_stats), "ok",
 			                             duckdb::distributed::FlightExchangeManager::GetLocalFlightServerPort(),
-			                             task_exchange_sink_instance_obj);
+			                             task_exchange_sink_instance_obj());
 		};
 		auto build_executed_result = [&](py::object task_stats) -> py::object {
 			duckdb::vector<string> names;

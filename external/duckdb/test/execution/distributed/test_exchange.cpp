@@ -10,6 +10,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/execution/distributed/exchange/flight_ticket.hpp"
+#include "duckdb/execution/distributed/exchange/flight_client.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache_registry.hpp"
 #include "duckdb/execution/distributed/exchange/flight_exchange_manager.hpp"
@@ -297,8 +298,10 @@ private:
 
 TEST_CASE("Exchange: FlightExchangeTicket roundtrip", "[distributed][exchange]") {
 	FlightExchangeTicket ticket;
-	ticket.shuffle_stage_id = "stage_1";
+	ticket.server_epoch = "epoch_1";
+	ticket.exchange_instance_id = "stage_1__instance_a__sink_0__attempt_3";
 	ticket.node_id = "node_2";
+	ticket.attempt_id = 3;
 	ticket.partition_idx = 7;
 
 	auto encoded = ticket.Serialize();
@@ -306,18 +309,26 @@ TEST_CASE("Exchange: FlightExchangeTicket roundtrip", "[distributed][exchange]")
 	REQUIRE(parsed.is_ok());
 
 	auto result = parsed.value();
-	REQUIRE(result.shuffle_stage_id == ticket.shuffle_stage_id);
+	REQUIRE(result.server_epoch == ticket.server_epoch);
+	REQUIRE(result.exchange_instance_id == ticket.exchange_instance_id);
 	REQUIRE(result.node_id == ticket.node_id);
+	REQUIRE(result.attempt_id == ticket.attempt_id);
 	REQUIRE(result.partition_idx == ticket.partition_idx);
 }
 
 TEST_CASE("Exchange: FlightExchangeTicket parse errors", "[distributed][exchange]") {
 	REQUIRE(FlightExchangeTicket::Parse("v1\nstage\nnode").is_err());
-	REQUIRE(FlightExchangeTicket::Parse("v2\nstage\nnode\n1").is_err());
-	REQUIRE(FlightExchangeTicket::Parse("v1\n\nnode\n1").is_err());
-	REQUIRE(FlightExchangeTicket::Parse("v1\nstage\n\n1").is_err());
-	REQUIRE(FlightExchangeTicket::Parse("v1\nstage\nnode\n-1").is_err());
-	REQUIRE(FlightExchangeTicket::Parse("v1\nstage\nnode\nnope").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nstage\nnode\n1").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v2\nepoch\nstage\nnode\n1\n2").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\n\nstage\nnode\n1\n2").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\n\nnode\n1\n2").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\n\n1\n2").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\nnode\n-1\n2").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\nnode\n1\n-2").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\nnode\nnope\n2").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\nnode\n1\nnope").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\nnode\n1x\n2").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\nnode\n1\n2x").is_err());
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -385,6 +396,159 @@ TEST_CASE("Exchange: ShuffleCacheRegistry multiple entries", "[distributed][exch
 	REQUIRE(registry.Get("multi_test_2").get() == cache2.get());
 
 	registry.Remove("multi_test_2");
+}
+
+TEST_CASE("Exchange: ShuffleCacheRegistry validates epoch, attempt, and descriptor identity",
+          "[distributed][exchange]") {
+	auto &registry = ShuffleCacheRegistry::Instance();
+	const std::string exchange_id = "registry_identity_stage";
+
+	ShuffleCacheConfig config;
+	config.shuffle_stage_id = exchange_id;
+	config.node_id = "node-a";
+	config.num_partitions = 2;
+	config.local_dirs = {TestCreatePath("registry_identity_a")};
+	auto cache = std::make_shared<ShuffleCache>(config);
+
+	REQUIRE(registry.Register(exchange_id, cache, "epoch-a", 4).is_ok());
+	REQUIRE(registry.Register(exchange_id, cache, "epoch-a", 4).is_ok());
+	REQUIRE(registry.Resolve(exchange_id, "epoch-a", "node-a", 4).is_ok());
+	REQUIRE(registry.Resolve(exchange_id, "epoch-old", "node-a", 4).is_err());
+	REQUIRE(registry.Resolve(exchange_id, "epoch-a", "node-a", 3).is_err());
+	REQUIRE(registry.Resolve(exchange_id, "epoch-a", "node-b", 4).is_err());
+
+	auto conflicting_config = config;
+	conflicting_config.local_dirs = {TestCreatePath("registry_identity_b")};
+	auto conflicting_cache = std::make_shared<ShuffleCache>(std::move(conflicting_config));
+	REQUIRE(registry.Register(exchange_id, conflicting_cache, "epoch-a", 4).is_err());
+	REQUIRE(registry.Get(exchange_id).get() == cache.get());
+
+	registry.RemoveForDeferredCleanup(exchange_id);
+	REQUIRE(registry.Get(exchange_id) == nullptr);
+	REQUIRE(registry.Resolve(exchange_id, "epoch-a", "node-a", 4).is_err());
+	registry.RemoveAndCleanupByPrefix(exchange_id);
+}
+
+TEST_CASE("Exchange: ShuffleCacheRegistry cleanup waits for active read leases", "[distributed][exchange]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto &context = *conn.context;
+	auto &registry = ShuffleCacheRegistry::Instance();
+	const std::string exchange_id = "registry_lease_stage__sink_0__attempt_0";
+
+	ShuffleCacheConfig config;
+	config.shuffle_stage_id = exchange_id;
+	config.node_id = "node-a";
+	config.num_partitions = 1;
+	config.local_dirs = {TestCreatePath("registry_lease")};
+	auto cache = std::make_shared<ShuffleCache>(std::move(config));
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
+	chunk.SetCardinality(1);
+	chunk.SetValue(0, 0, Value::INTEGER(42));
+	REQUIRE(cache->WriteChunk(context, chunk, 0, {"value"}).is_ok());
+	REQUIRE(cache->FlushAll(context, {"value"}).is_ok());
+	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
+	REQUIRE(cache->HasCommittedManifest());
+
+	REQUIRE(registry.Register(exchange_id, cache, "epoch-a", 0).is_ok());
+	auto lease_result = registry.Resolve(exchange_id, "epoch-a", "node-a", 0);
+	REQUIRE(lease_result.is_ok());
+	auto lease = std::move(lease_result.value());
+	registry.RemoveForDeferredCleanup(exchange_id);
+
+	auto cleanup = registry.RemoveAndCleanupByPrefix("registry_lease_stage");
+	REQUIRE(cleanup.registry_entries_removed == 1);
+	REQUIRE(cleanup.storage_entries_removed == 0);
+	REQUIRE(cleanup.cleanup_errors == 0);
+	REQUIRE(cache->HasCommittedManifest());
+
+	lease.reset();
+	REQUIRE_FALSE(cache->HasCommittedManifest());
+}
+
+TEST_CASE("Exchange: Flight service isolates published attempts and rejects released or stale tickets",
+          "[distributed][exchange]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto &context = *conn.context;
+	auto &registry = ShuffleCacheRegistry::Instance();
+	const std::string prefix = "overlapping-stage";
+	const std::string exchange_a = prefix + "__instance_a__sink_0__attempt_1";
+	const std::string exchange_b = prefix + "__instance_b__sink_0__attempt_1";
+	const std::string epoch = "catalog-isolation-epoch";
+	const std::string node_id = "node-a";
+
+	auto make_committed_cache = [&](const std::string &exchange_id, const std::string &dir, int32_t value) {
+		ShuffleCacheConfig config;
+		config.shuffle_stage_id = exchange_id;
+		config.node_id = node_id;
+		config.num_partitions = 1;
+		config.local_dirs = {dir};
+		auto cache = std::make_shared<ShuffleCache>(std::move(config));
+		DataChunk chunk;
+		chunk.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
+		chunk.SetCardinality(1);
+		chunk.SetValue(0, 0, Value::INTEGER(value));
+		REQUIRE(cache->WriteChunk(context, chunk, 0, {"value"}).is_ok());
+		REQUIRE(cache->FlushAll(context, {"value"}).is_ok());
+		REQUIRE(cache->WriteAttemptManifest(0, 1).is_ok());
+		return cache;
+	};
+
+	auto cache_a = make_committed_cache(exchange_a, TestCreatePath("flight_catalog_isolation_a"), 11);
+	auto cache_b = make_committed_cache(exchange_b, TestCreatePath("flight_catalog_isolation_b"), 22);
+	REQUIRE(registry.Register(exchange_a, cache_a, epoch, 1).is_ok());
+	REQUIRE(registry.Register(exchange_b, cache_b, epoch, 1).is_ok());
+
+	FlightServerConfig server_config;
+	server_config.bind_host = "127.0.0.1";
+	server_config.port = 0;
+	server_config.server_epoch = epoch;
+	FlightServer server(std::move(server_config));
+	REQUIRE(server.Start().is_ok());
+	FlightClientConfig client_config;
+	client_config.location = "grpc://127.0.0.1:" + std::to_string(server.port());
+	FlightClient client(std::move(client_config));
+
+	auto fetch = [&](const std::string &exchange_id, const std::string &ticket_epoch) {
+		FlightExchangeTicket ticket;
+		ticket.server_epoch = ticket_epoch;
+		ticket.exchange_instance_id = exchange_id;
+		ticket.node_id = node_id;
+		ticket.attempt_id = 1;
+		ticket.partition_idx = 0;
+		return client.FetchPartition(context, ticket, {LogicalType::INTEGER});
+	};
+	auto fetched_a = fetch(exchange_a, epoch);
+	auto fetched_b = fetch(exchange_b, epoch);
+	REQUIRE(fetched_a.is_ok());
+	REQUIRE(fetched_b.is_ok());
+	REQUIRE(fetched_a.value()->Count() == 1);
+	REQUIRE(fetched_b.value()->Count() == 1);
+	vector<int32_t> values_a;
+	vector<int32_t> values_b;
+	for (auto &chunk : fetched_a.value()->Chunks()) {
+		for (idx_t row = 0; row < chunk.size(); row++) {
+			values_a.push_back(chunk.GetValue(0, row).GetValue<int32_t>());
+		}
+	}
+	for (auto &chunk : fetched_b.value()->Chunks()) {
+		for (idx_t row = 0; row < chunk.size(); row++) {
+			values_b.push_back(chunk.GetValue(0, row).GetValue<int32_t>());
+		}
+	}
+	REQUIRE(values_a == vector<int32_t> {11});
+	REQUIRE(values_b == vector<int32_t> {22});
+
+	registry.RemoveForDeferredCleanup(exchange_a);
+	REQUIRE(fetch(exchange_a, epoch).is_err());
+	REQUIRE(fetch(exchange_b, epoch).is_ok());
+	REQUIRE(fetch(exchange_b, "stale-epoch").is_err());
+
+	REQUIRE(server.Stop().is_ok());
+	registry.RemoveForDeferredCleanup(exchange_b);
+	registry.RemoveAndCleanupByPrefix(prefix);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -685,6 +849,117 @@ TEST_CASE("Exchange: FlightExchange coordinator lifecycle", "[distributed][excha
 	exchange->Close();
 }
 
+TEST_CASE("Exchange: same logical stage has isolated exchange instances and directories", "[distributed][exchange]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+
+	FlightExchangeConfig config_a;
+	config_a.node_id = "node-a";
+	config_a.local_dirs = {TestCreatePath("exchange_instance_a")};
+	FlightExchangeConfig config_b;
+	config_b.node_id = "node-a";
+	config_b.local_dirs = {TestCreatePath("exchange_instance_b")};
+	FlightExchangeManager manager_a(config_a, conn.context.get());
+	FlightExchangeManager manager_b(config_b, conn.context.get());
+
+	ExchangeContext ctx;
+	ctx.query_id = "same-query";
+	ctx.exchange_id = "same-stage";
+	auto exchange_a = manager_a.CreateExchange(ctx, 1);
+	auto exchange_b = manager_b.CreateExchange(ctx, 1);
+	auto instance_a = exchange_a->InstantiateSink(exchange_a->AddSink(0), 0);
+	auto instance_b = exchange_b->InstantiateSink(exchange_b->AddSink(0), 0);
+	REQUIRE(instance_a.output_location != instance_b.output_location);
+
+	ShuffleCacheConfig cache_config_a;
+	cache_config_a.shuffle_stage_id = instance_a.output_location;
+	cache_config_a.node_id = "node-a";
+	cache_config_a.num_partitions = 1;
+	cache_config_a.local_dirs = config_a.local_dirs;
+	ShuffleCacheConfig cache_config_b;
+	cache_config_b.shuffle_stage_id = instance_b.output_location;
+	cache_config_b.node_id = "node-a";
+	cache_config_b.num_partitions = 1;
+	cache_config_b.local_dirs = config_b.local_dirs;
+	auto cache_a = std::make_shared<ShuffleCache>(std::move(cache_config_a));
+	auto cache_b = std::make_shared<ShuffleCache>(std::move(cache_config_b));
+	auto &registry = ShuffleCacheRegistry::Instance();
+	REQUIRE(registry.Register(instance_a.output_location, cache_a, "epoch-a", 0).is_ok());
+	REQUIRE(registry.Register(instance_b.output_location, cache_b, "epoch-a", 0).is_ok());
+
+	exchange_a->Close();
+	REQUIRE(registry.Get(instance_a.output_location) == nullptr);
+	REQUIRE(registry.Get(instance_b.output_location).get() == cache_b.get());
+
+	exchange_b->Close();
+	registry.RemoveAndCleanupByPrefix(ctx.exchange_id);
+}
+
+TEST_CASE("Exchange: process-local Flight service has immutable network config and explicit shutdown",
+          "[distributed][exchange]") {
+	struct ServiceGuard {
+		~ServiceGuard() {
+			FlightExchangeManager::ShutdownLocalFlightServer();
+		}
+	} guard;
+	REQUIRE(FlightExchangeManager::ShutdownLocalFlightServer().is_ok());
+
+	ExchangeSinkInstanceHandle handle;
+	handle.sink_handle.task_partition_id = 0;
+	handle.attempt_id = 0;
+	handle.output_location = "service_lifecycle__instance_a__sink_0__attempt_0";
+	handle.output_partition_count = 1;
+
+	FlightExchangeConfig config_a;
+	config_a.node_id = "node-a";
+	config_a.flight_bind_host = "127.0.0.1";
+	config_a.flight_port = 0;
+	config_a.local_dirs = {TestCreatePath("flight_service_lifecycle_a")};
+	FlightExchangeManager manager_a(config_a);
+	auto sink_a = manager_a.CreateSink(handle);
+	REQUIRE(sink_a != nullptr);
+	const auto first_port = FlightExchangeManager::GetLocalFlightServerPort();
+	const auto first_epoch = FlightExchangeManager::GetLocalFlightServerEpoch();
+	REQUIRE(first_port > 0);
+	REQUIRE(!first_epoch.empty());
+
+	auto config_b = config_a;
+	config_b.local_dirs = {TestCreatePath("flight_service_lifecycle_b")};
+	config_b.node_id = "node-b";
+	FlightExchangeManager manager_b(config_b);
+	auto sink_b = manager_b.CreateSink(handle);
+	REQUIRE(sink_b != nullptr);
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerPort() == first_port);
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerEpoch() == first_epoch);
+
+	auto conflicting_config = config_b;
+	conflicting_config.flight_port = first_port;
+	FlightExchangeManager conflicting_manager(conflicting_config);
+	REQUIRE_THROWS_WITH(conflicting_manager.CreateSink(handle),
+	                    Catch::Matchers::Contains("refusing conflicting address"));
+
+	manager_a.Shutdown();
+	manager_b.Shutdown();
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerPort() == first_port);
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerEpoch() == first_epoch);
+
+	sink_a.reset();
+	sink_b.reset();
+	REQUIRE(FlightExchangeManager::ShutdownLocalFlightServer().is_ok());
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerPort() == 0);
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerEpoch().empty());
+
+	auto fixed_config = config_a;
+	fixed_config.flight_port = first_port;
+	FlightExchangeManager fixed_manager(fixed_config);
+	auto fixed_sink = fixed_manager.CreateSink(handle);
+	REQUIRE(fixed_sink != nullptr);
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerPort() == first_port);
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerEpoch() != first_epoch);
+	fixed_sink.reset();
+	REQUIRE(FlightExchangeManager::ShutdownLocalFlightServer().is_ok());
+}
+
 TEST_CASE("Exchange: FlightExchange selects first successful sink attempt", "[distributed][exchange]") {
 	DuckDB db(nullptr);
 	Connection conn(db);
@@ -710,9 +985,12 @@ TEST_CASE("Exchange: FlightExchange selects first successful sink attempt", "[di
 	REQUIRE(sink0_attempt1.output_location.find("__sink_0__attempt_1") != std::string::npos);
 	REQUIRE(sink1_attempt0.output_location.find("__sink_1__attempt_0") != std::string::npos);
 
-	exchange->SinkFinished(sink0, 1, "worker-retry", 5010);
-	exchange->SinkFinished(sink0, 0, "worker-late", 5011);
-	exchange->SinkFinished(sink1, 0, "worker-first", 5012);
+	sink0_attempt1.flight_server_epoch = "worker-retry-epoch";
+	exchange->SinkFinished(sink0_attempt1, "worker-retry", 5010);
+	sink0_attempt0.flight_server_epoch = "worker-late-epoch";
+	exchange->SinkFinished(sink0_attempt0, "worker-late", 5011);
+	sink1_attempt0.flight_server_epoch = "worker-first-epoch";
+	exchange->SinkFinished(sink1_attempt0, "worker-first", 5012);
 	exchange->AllRequiredSinksFinished();
 
 	auto source_handles = exchange->GetSourceHandles();
@@ -727,6 +1005,7 @@ TEST_CASE("Exchange: FlightExchange selects first successful sink attempt", "[di
 			REQUIRE(handle.attempt_id == 1);
 			REQUIRE(handle.node_id == "worker-retry");
 			REQUIRE(handle.flight_port == 5010);
+			REQUIRE(handle.flight_server_epoch == "worker-retry-epoch");
 			REQUIRE(handle.files[0].path.find("__attempt_1") != std::string::npos);
 			REQUIRE(handle.files[0].path.find("__attempt_0") == std::string::npos);
 		} else if (handle.files[0].path.find("__sink_1__") != std::string::npos) {
@@ -734,6 +1013,7 @@ TEST_CASE("Exchange: FlightExchange selects first successful sink attempt", "[di
 			REQUIRE(handle.attempt_id == 0);
 			REQUIRE(handle.node_id == "worker-first");
 			REQUIRE(handle.flight_port == 5012);
+			REQUIRE(handle.flight_server_epoch == "worker-first-epoch");
 			REQUIRE(handle.files[0].path.find("__attempt_0") != std::string::npos);
 		} else {
 			FAIL("unexpected source handle path");

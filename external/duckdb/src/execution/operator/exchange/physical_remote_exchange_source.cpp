@@ -310,6 +310,7 @@ void PhysicalRemoteExchangeSource::SerializeOperatorData(Serializer &serializer)
 	vector<string> handle_paths;
 	vector<int> handle_flight_ports;
 	vector<idx_t> handle_attempt_ids;
+	vector<string> handle_flight_server_epochs;
 	vector<string> local_dirs;
 	if (exchange_mgr_) {
 		auto flight_mgr = std::dynamic_pointer_cast<distributed::FlightExchangeManager>(exchange_mgr_);
@@ -323,12 +324,14 @@ void PhysicalRemoteExchangeSource::SerializeOperatorData(Serializer &serializer)
 	handle_paths.reserve(source_handles_.size());
 	handle_flight_ports.reserve(source_handles_.size());
 	handle_attempt_ids.reserve(source_handles_.size());
+	handle_flight_server_epochs.reserve(source_handles_.size());
 	for (const auto &handle : source_handles_) {
 		handle_partition_ids.push_back(handle.partition_id);
 		handle_node_ids.push_back(handle.node_id);
 		handle_paths.push_back(handle.files.empty() ? string() : handle.files[0].path);
 		handle_flight_ports.push_back(handle.flight_port);
 		handle_attempt_ids.push_back(handle.attempt_id);
+		handle_flight_server_epochs.push_back(handle.flight_server_epoch);
 	}
 	serializer.WriteProperty(103, "shuffle_stage_id", exchange_id_);
 	serializer.WriteProperty(104, "partition_indices", partition_indices_);
@@ -344,6 +347,7 @@ void PhysicalRemoteExchangeSource::SerializeOperatorData(Serializer &serializer)
 	serializer.WritePropertyWithDefault(112, "runtime_source_node_id", runtime_source_node_id_, optional_idx());
 	serializer.WriteProperty(113, "source_handle_attempt_ids", handle_attempt_ids);
 	serializer.WriteProperty(114, "local_dirs", local_dirs);
+	serializer.WriteProperty(115, "source_handle_flight_server_epochs", handle_flight_server_epochs);
 }
 
 } // namespace duckdb

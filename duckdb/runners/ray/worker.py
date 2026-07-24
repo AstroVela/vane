@@ -475,6 +475,9 @@ class RayWorkerActor:
         # with actor creation instead of blocking the first task.
         self._shared_conn: Any | None = None
         self._shared_conn_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_started = False
+        self._shutdown_complete = False
         self._get_shared_conn()  # eagerly initialize
         _ray_worker_memory_log(
             "actor_initialized",
@@ -844,11 +847,11 @@ class RayWorkerActor:
         call ``self._get_shared_conn().cursor()`` to obtain a lightweight cursor
         with its own ClientContext.
         """
-        if self._shared_conn is not None:
-            return self._shared_conn
         with self._shared_conn_lock:
+            if self._shutdown_started:
+                raise RuntimeError("Ray worker runtime is shut down")
             if self._shared_conn is not None:
-                return self._shared_conn  # type: ignore[unreachable]
+                return self._shared_conn
             import duckdb
 
             conn = duckdb.connect()
@@ -856,33 +859,46 @@ class RayWorkerActor:
             self._shared_conn = conn
             return conn
 
-    def __del__(self) -> None:
-        """Cleanup method called when actor is being destroyed."""
-        # Use a try-except to safely handle cleanup during Python shutdown
-        try:
-            import sys
-
-            # Check if Python is shutting down
-            if sys.meta_path is None:
-                return  # type: ignore[unreachable]
-
-            conn = getattr(self, "_shared_conn", None)
-            if conn is not None:
+    def _shutdown_worker_runtime(self) -> None:
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            errors: list[str] = []
+            with self._shared_conn_lock:
+                self._shutdown_started = True
+                conn = self._shared_conn
                 self._shared_conn = None
+            if conn is not None:
                 try:
                     conn.interrupt()
-                except Exception:
-                    pass
-                try:
-                    import time
-
-                    time.sleep(0.5)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    errors.append(f"interrupt DuckDB connection: {exc}")
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    errors.append(f"close DuckDB connection: {exc}")
+            try:
+                shutdown_flight = require_ray_cxx_attr(
+                    "shutdown_local_flight_service",
+                    hint="Ensure the C++ ray extension is built with Flight service lifecycle support.",
+                )
+                shutdown_flight()
+            except Exception as exc:
+                errors.append(f"stop process-local Flight service: {exc}")
+            if errors:
+                raise RuntimeError("; ".join(errors))
+            self._shutdown_complete = True
+
+    @ray.method(concurrency_group="control")
+    def shutdown(self) -> None:
+        self._shutdown_worker_runtime()
+
+    def __del__(self) -> None:
+        """Cleanup method called when actor is being destroyed."""
+        try:
+            if sys.meta_path is None:
+                return  # type: ignore[unreachable]
+            self._shutdown_worker_runtime()
         except Exception:
             pass
 

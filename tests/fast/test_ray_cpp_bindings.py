@@ -206,6 +206,7 @@ def test_exchange_source_task_descriptor_preserves_attempt_ids():
             "attempt_id": 7,
             "node_id": "node-a",
             "flight_port": 5010,
+            "flight_server_epoch": "epoch-a",
             "files": [{"path": "shuffle__sink_0__attempt_7", "file_size": 11}],
         },
         {
@@ -213,6 +214,7 @@ def test_exchange_source_task_descriptor_preserves_attempt_ids():
             "attempt_id": 2,
             "node_id": "node-b",
             "flight_port": 5011,
+            "flight_server_epoch": "epoch-b",
             "files": [{"path": "shuffle__sink_1__attempt_2", "file_size": 17}],
         },
     ]
@@ -283,10 +285,12 @@ def test_flight_exchange_selected_attempt_runtime_path():
     assert all(h["attempt_id"] == 1 for h in sink0_handles)
     assert all(h["node_id"] == "worker-retry" for h in sink0_handles)
     assert all(h["flight_port"] == 5010 for h in sink0_handles)
+    assert all(h["flight_server_epoch"] == "worker-retry-epoch" for h in sink0_handles)
     assert all("__attempt_1" in h["path"] for h in sink0_handles)
     assert all(h["attempt_id"] == 0 for h in sink1_handles)
     assert all(h["node_id"] == "worker-first" for h in sink1_handles)
     assert all(h["flight_port"] == 5012 for h in sink1_handles)
+    assert all(h["flight_server_epoch"] == "worker-first-epoch" for h in sink1_handles)
 
 
 def test_flight_exchange_materialized_output_attempt_metadata_drives_completion():
@@ -300,11 +304,13 @@ def test_flight_exchange_materialized_output_attempt_metadata_drives_completion(
     assert all(h["attempt_id"] == 1 for h in sink0_handles)
     assert all(h["node_id"] == "worker-retry" for h in sink0_handles)
     assert all(h["flight_port"] == 5010 for h in sink0_handles)
+    assert all(h["flight_server_epoch"] == "worker-retry-epoch" for h in sink0_handles)
     assert all("__attempt_1" in h["path"] for h in sink0_handles)
     assert all("__attempt_0" not in h["path"] for h in sink0_handles)
     assert all(h["attempt_id"] == 0 for h in sink1_handles)
     assert all(h["node_id"] == "worker-first" for h in sink1_handles)
     assert all(h["flight_port"] == 5012 for h in sink1_handles)
+    assert all(h["flight_server_epoch"] == "worker-first-epoch" for h in sink1_handles)
 
 
 def test_ray_task_result_handle_uses_refreshed_worker_id_at_completion():
@@ -1202,7 +1208,7 @@ def test_flight_exchange_source_recovers_shared_manifest_after_writer_process_ex
     assert reader_result["writer_node_id"] != reader_result["reader_node_id"]
 
 
-def test_flight_server_recovers_shared_manifest_after_writer_process_exit(tmp_path):
+def test_flight_server_rejects_unpublished_manifest_after_writer_process_exit(tmp_path):
     writer_result = _write_shared_manifest_in_subprocess(tmp_path)
     reader_code = textwrap.dedent(
         f"""
@@ -1215,7 +1221,6 @@ def test_flight_server_recovers_shared_manifest_after_writer_process_exit(tmp_pa
             {writer_result["writer_node_id"]!r},
             {int(writer_result["partition_id"])},
         ))
-        result["values"] = list(result["values"])
         print(json.dumps(result), flush=True)
         """
     )
@@ -1223,8 +1228,8 @@ def test_flight_server_recovers_shared_manifest_after_writer_process_exit(tmp_pa
 
     assert Path(writer_result["manifest_path"]).exists()
     assert Path(writer_result["committed_path"]).exists()
-    assert reader_result["values"] == [81, 82, 83]
-    assert reader_result["row_count"] == 3
+    assert reader_result["fetch_error"] is True
+    assert "not published" in reader_result["error"]
     assert reader_result["registry_present"] is False
 
 
@@ -1236,11 +1241,11 @@ def test_remote_exchange_source_local_dirs_survive_serialization_for_manifest_re
     assert result["registry_present"] is False
 
 
-def test_flight_server_recovers_from_manifest_after_registry_loss(tmp_path):
-    result = duckdb.ray_cxx.flight_server_manifest_recovery_for_test(str(tmp_path))
+def test_flight_server_rejects_manifest_after_registry_loss(tmp_path):
+    result = duckdb.ray_cxx.flight_server_rejects_unpublished_manifest_for_test(str(tmp_path))
 
-    assert result["values"] == [31, 32]
-    assert result["row_count"] == 2
+    assert result["fetch_error"] is True
+    assert "not published" in result["error"]
     assert result["registry_present"] is False
 
 

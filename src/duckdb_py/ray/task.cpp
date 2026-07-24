@@ -121,6 +121,9 @@ bool ParseExchangeSinkInstanceObject(py::object obj, duckdb::distributed::Exchan
 	} else if (d.contains("attempt_path")) {
 		out.output_location = py::str(d["attempt_path"]).cast<string>();
 	}
+	if (d.contains("flight_server_epoch")) {
+		out.flight_server_epoch = py::str(d["flight_server_epoch"]).cast<string>();
+	}
 	return true;
 }
 

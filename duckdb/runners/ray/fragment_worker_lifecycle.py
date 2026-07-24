@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
+# mypy: disable-error-code="attr-defined"
 
 from __future__ import annotations
 
@@ -420,7 +421,7 @@ class FteWorkerLifecycleMixin:
                 raise RuntimeError(f"FTE query {query_id} failed: {status}")
             if bool(status.get("finished")):
                 return status
-            if has_deadline and time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"timed out waiting for FTE query {query_id}: {status}")
             time.sleep(0.01)
 
@@ -458,4 +459,19 @@ class FteWorkerLifecycleMixin:
                 current = _FTE_WORKER_HANDLES.get(str(self.worker_id))
                 if current is self:
                     _FTE_WORKER_HANDLES.pop(str(self.worker_id), None)
-        ray.kill(self.actor_handle)
+        shutdown_error: BaseException | None = None
+        try:
+            shutdown_method = getattr(self.actor_handle, "shutdown", None)
+            if shutdown_method is None:
+                raise RuntimeError("Ray worker actor does not expose shutdown")
+            resolve_object_refs_blocking(
+                shutdown_method.remote(),
+                timeout=30,
+                honor_query_deadline=False,
+            )
+        except BaseException as exc:
+            shutdown_error = exc
+        finally:
+            ray.kill(self.actor_handle)
+        if shutdown_error is not None:
+            raise RuntimeError(f"Ray worker graceful shutdown failed: {shutdown_error}") from shutdown_error

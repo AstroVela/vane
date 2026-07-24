@@ -1165,6 +1165,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(114, "range_boundaries", {});
 		auto range_order_modifiers =
 		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(115, "range_order_modifiers", {});
+		sink_handle.flight_server_epoch = deserializer.ReadProperty<string>(116, "flight_server_epoch");
 		return make_uniq<PhysicalRemoteExchangeSink>(
 		    physical_plan, std::move(types), estimated_cardinality, std::move(exchange_id), num_partitions,
 		    repartition_type, std::move(partition_by), std::move(sink_handle), std::move(exchange_mgr),
@@ -1187,6 +1188,8 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto source_handle_attempt_ids =
 		    deserializer.ReadPropertyWithDefault<vector<idx_t>>(113, "source_handle_attempt_ids");
 		auto local_dirs = deserializer.ReadPropertyWithDefault<vector<string>>(114, "local_dirs");
+		auto source_handle_flight_server_epochs =
+		    deserializer.ReadProperty<vector<string>>(115, "source_handle_flight_server_epochs");
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.node_id = distributed::ResolveFlightExchangeNodeIdFromEnv();
@@ -1209,6 +1212,9 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 			    source_handle_attempt_ids.size() != source_handle_partition_ids.size()) {
 				throw SerializationException("remote exchange source attempt metadata is inconsistent");
 			}
+			if (source_handle_flight_server_epochs.size() != source_handle_partition_ids.size()) {
+				throw SerializationException("remote exchange source Flight epoch metadata is inconsistent");
+			}
 			source_handles.reserve(source_handle_partition_ids.size());
 			for (idx_t i = 0; i < source_handle_partition_ids.size(); i++) {
 				distributed::ExchangeSourceHandle sh;
@@ -1216,6 +1222,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 				sh.attempt_id = source_handle_attempt_ids.empty() ? 0 : source_handle_attempt_ids[i];
 				sh.node_id = source_handle_node_ids[i];
 				sh.flight_port = source_handle_flight_ports.empty() ? 0 : source_handle_flight_ports[i];
+				sh.flight_server_epoch = source_handle_flight_server_epochs[i];
 				distributed::ExchangeSourceFile file;
 				file.path = source_handle_paths[i];
 				file.file_size = 0;

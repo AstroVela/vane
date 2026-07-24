@@ -11,8 +11,10 @@ namespace duckdb {
 namespace distributed {
 
 struct FlightExchangeTicket {
-	std::string shuffle_stage_id;
+	std::string server_epoch;
+	std::string exchange_instance_id;
 	std::string node_id;
+	idx_t attempt_id = 0;
 	idx_t partition_idx = 0;
 
 	std::string Serialize() const;

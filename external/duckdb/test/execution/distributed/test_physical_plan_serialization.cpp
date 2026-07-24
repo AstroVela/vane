@@ -1120,6 +1120,7 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	sink_handle.attempt_id = 2;
 	sink_handle.output_location = "shuffle_stage__sink_7__attempt_2";
 	sink_handle.output_partition_count = 4;
+	sink_handle.flight_server_epoch = "sink-epoch";
 
 	distributed::FlightExchangeConfig flight_config;
 	flight_config.node_id = "node-1";
@@ -1151,6 +1152,7 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	REQUIRE(sink_ptr->SinkHandle().attempt_id == 2);
 	REQUIRE(sink_ptr->SinkHandle().output_location == "shuffle_stage__sink_7__attempt_2");
 	REQUIRE(sink_ptr->SinkHandle().output_partition_count == 4);
+	REQUIRE(sink_ptr->SinkHandle().flight_server_epoch == "sink-epoch");
 }
 
 TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source handles",
@@ -1167,6 +1169,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	handle0.partition_id = 0;
 	handle0.attempt_id = 3;
 	handle0.node_id = "node-1";
+	handle0.flight_server_epoch = "epoch-1";
 	handle0.files.push_back(ExchangeSourceFile("shuffle_stage__sink_0__attempt_0", 0));
 	source_handles.push_back(handle0);
 
@@ -1174,6 +1177,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	handle1.partition_id = 0;
 	handle1.attempt_id = 4;
 	handle1.node_id = "node-2";
+	handle1.flight_server_epoch = "epoch-2";
 	handle1.files.push_back(ExchangeSourceFile("shuffle_stage__sink_1__attempt_0", 0));
 	source_handles.push_back(handle1);
 
@@ -1181,6 +1185,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	handle2.partition_id = 1;
 	handle2.attempt_id = 3;
 	handle2.node_id = "node-1";
+	handle2.flight_server_epoch = "epoch-1";
 	handle2.files.push_back(ExchangeSourceFile("shuffle_stage__sink_0__attempt_0", 0));
 	source_handles.push_back(handle2);
 
@@ -1214,16 +1219,19 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	REQUIRE(source_ptr->SourceHandles()[0].partition_id == 0);
 	REQUIRE(source_ptr->SourceHandles()[0].attempt_id == 3);
 	REQUIRE(source_ptr->SourceHandles()[0].node_id == "node-1");
+	REQUIRE(source_ptr->SourceHandles()[0].flight_server_epoch == "epoch-1");
 	REQUIRE(source_ptr->SourceHandles()[0].files.size() == 1);
 	REQUIRE(source_ptr->SourceHandles()[0].files[0].path == "shuffle_stage__sink_0__attempt_0");
 	REQUIRE(source_ptr->SourceHandles()[1].partition_id == 0);
 	REQUIRE(source_ptr->SourceHandles()[1].attempt_id == 4);
 	REQUIRE(source_ptr->SourceHandles()[1].node_id == "node-2");
+	REQUIRE(source_ptr->SourceHandles()[1].flight_server_epoch == "epoch-2");
 	REQUIRE(source_ptr->SourceHandles()[1].files.size() == 1);
 	REQUIRE(source_ptr->SourceHandles()[1].files[0].path == "shuffle_stage__sink_1__attempt_0");
 	REQUIRE(source_ptr->SourceHandles()[2].partition_id == 1);
 	REQUIRE(source_ptr->SourceHandles()[2].attempt_id == 3);
 	REQUIRE(source_ptr->SourceHandles()[2].node_id == "node-1");
+	REQUIRE(source_ptr->SourceHandles()[2].flight_server_epoch == "epoch-1");
 	REQUIRE(source_ptr->SourceHandles()[2].files.size() == 1);
 	REQUIRE(source_ptr->SourceHandles()[2].files[0].path == "shuffle_stage__sink_0__attempt_0");
 }
@@ -1280,7 +1288,8 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	handle0.attempt_id = 7;
 	handle0.node_id = "node-1";
 	handle0.flight_port = 5010;
-	handle0.files.push_back(ExchangeSourceFile("shuffle_stage__sink_0__attempt_7", 11));
+	handle0.flight_server_epoch = "epoch-1";
+	handle0.files.push_back(ExchangeSourceFile("shuffle_stage__sink_0__attempt_7", 0, 11));
 	descriptor.source_handles.push_back(handle0);
 
 	distributed::ExchangeSourceHandle handle1;
@@ -1288,7 +1297,8 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	handle1.attempt_id = 2;
 	handle1.node_id = "node-2";
 	handle1.flight_port = 5011;
-	handle1.files.push_back(ExchangeSourceFile("shuffle_stage__sink_1__attempt_2", 17));
+	handle1.flight_server_epoch = "epoch-2";
+	handle1.files.push_back(ExchangeSourceFile("shuffle_stage__sink_1__attempt_2", 0, 17));
 	descriptor.source_handles.push_back(handle1);
 
 	auto roundtrip = distributed::ExchangeSourceTaskDescriptor::DeserializeFromBytes(descriptor.SerializeToBytes());
@@ -1301,6 +1311,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	REQUIRE(roundtrip.source_handles[0].attempt_id == 7);
 	REQUIRE(roundtrip.source_handles[0].node_id == "node-1");
 	REQUIRE(roundtrip.source_handles[0].flight_port == 5010);
+	REQUIRE(roundtrip.source_handles[0].flight_server_epoch == "epoch-1");
 	REQUIRE(roundtrip.source_handles[0].files.size() == 1);
 	REQUIRE(roundtrip.source_handles[0].files[0].path == "shuffle_stage__sink_0__attempt_7");
 	REQUIRE(roundtrip.source_handles[0].files[0].file_size == 11);
@@ -1308,6 +1319,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	REQUIRE(roundtrip.source_handles[1].attempt_id == 2);
 	REQUIRE(roundtrip.source_handles[1].node_id == "node-2");
 	REQUIRE(roundtrip.source_handles[1].flight_port == 5011);
+	REQUIRE(roundtrip.source_handles[1].flight_server_epoch == "epoch-2");
 	REQUIRE(roundtrip.source_handles[1].files.size() == 1);
 	REQUIRE(roundtrip.source_handles[1].files[0].path == "shuffle_stage__sink_1__attempt_2");
 	REQUIRE(roundtrip.source_handles[1].files[0].file_size == 17);
@@ -1337,13 +1349,13 @@ TEST_CASE("ApplyExchangeSourceTasksToPlan patches runtime-bound exchange source"
 	handle0.partition_id = 0;
 	handle0.attempt_id = 5;
 	handle0.node_id = "node-1";
-	handle0.files.push_back(ExchangeSourceFile("shuffle_stage__sink_0__attempt_0", 11));
+	handle0.files.push_back(ExchangeSourceFile("shuffle_stage__sink_0__attempt_0", 0, 11));
 	descriptor.source_handles.push_back(handle0);
 	distributed::ExchangeSourceHandle handle1;
 	handle1.partition_id = 1;
 	handle1.attempt_id = 6;
 	handle1.node_id = "node-2";
-	handle1.files.push_back(ExchangeSourceFile("shuffle_stage__sink_1__attempt_0", 17));
+	handle1.files.push_back(ExchangeSourceFile("shuffle_stage__sink_1__attempt_0", 0, 17));
 	descriptor.source_handles.push_back(handle1);
 
 	std::unordered_map<idx_t, distributed::ExchangeSourceTaskDescriptor> tasks;

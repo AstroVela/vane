@@ -124,6 +124,15 @@ namespace duckdb {
 void register_ray_bindings(py::module_ &mod) {
 	auto m = mod.def_submodule("ray_cxx");
 	m.doc() = "C++ Ray execution bindings (experimental)";
+	m.def("shutdown_local_flight_service", []() {
+		auto result = []() {
+			py::gil_scoped_release release;
+			return duckdb::distributed::FlightExchangeManager::ShutdownLocalFlightServer();
+		}();
+		if (result.is_err()) {
+			throw std::runtime_error(result.error().what());
+		}
+	});
 
 	py::class_<RayResultPartitionRef>(m, "RayResultPartitionRef")
 	    .def(py::init<py::object, size_t, size_t, py::object>())
@@ -913,6 +922,10 @@ void register_ray_bindings(py::module_ &mod) {
 					        exchange_sink_instance_task.sink_instance.output_location =
 					            py::str(d["attempt_path"]).cast<string>();
 				        }
+				        if (d.contains("flight_server_epoch")) {
+					        exchange_sink_instance_task.sink_instance.flight_server_epoch =
+					            py::str(d["flight_server_epoch"]).cast<string>();
+				        }
 				        has_exchange_sink_instance_task = true;
 			        } else {
 				        throw py::value_error("exchange_sink_instance must be bytes or dict");
@@ -1208,6 +1221,9 @@ void register_ray_bindings(py::module_ &mod) {
 			    if (d.contains("flight_port")) {
 				    handle.flight_port = py::int_(d["flight_port"]).cast<int>();
 			    }
+			    if (d.contains("flight_server_epoch")) {
+				    handle.flight_server_epoch = py::str(d["flight_server_epoch"]).cast<string>();
+			    }
 			    if (d.contains("files")) {
 				    auto files = py::reinterpret_borrow<py::iterable>(d["files"]);
 				    for (auto file_item : files) {
@@ -1246,6 +1262,9 @@ void register_ray_bindings(py::module_ &mod) {
 			    d["attempt_id"] = handle.attempt_id;
 			    d["node_id"] = handle.node_id;
 			    d["flight_port"] = handle.flight_port;
+			    if (!handle.flight_server_epoch.empty()) {
+				    d["flight_server_epoch"] = handle.flight_server_epoch;
+			    }
 			    py::list files;
 			    for (const auto &file : handle.files) {
 				    py::dict fd;
@@ -1278,12 +1297,15 @@ void register_ray_bindings(py::module_ &mod) {
 		    auto exchange = mgr.CreateExchange(ctx, 2);
 		    auto sink0 = exchange->AddSink(0);
 		    auto sink1 = exchange->AddSink(1);
-		    exchange->InstantiateSink(sink0, 0);
-		    exchange->InstantiateSink(sink0, 1);
-		    exchange->InstantiateSink(sink1, 0);
-		    exchange->SinkFinished(sink0, 1, "worker-retry", 5010);
-		    exchange->SinkFinished(sink0, 0, "worker-late", 5011);
-		    exchange->SinkFinished(sink1, 0, "worker-first", 5012);
+		    auto sink0_attempt0 = exchange->InstantiateSink(sink0, 0);
+		    auto sink0_attempt1 = exchange->InstantiateSink(sink0, 1);
+		    auto sink1_attempt0 = exchange->InstantiateSink(sink1, 0);
+		    sink0_attempt1.flight_server_epoch = "worker-retry-epoch";
+		    sink0_attempt0.flight_server_epoch = "worker-late-epoch";
+		    sink1_attempt0.flight_server_epoch = "worker-first-epoch";
+		    exchange->SinkFinished(sink0_attempt1, "worker-retry", 5010);
+		    exchange->SinkFinished(sink0_attempt0, "worker-late", 5011);
+		    exchange->SinkFinished(sink1_attempt0, "worker-first", 5012);
 		    exchange->AllRequiredSinksFinished();
 		    auto handles = exchange->GetSourceHandles();
 		    exchange->Close();
@@ -1295,6 +1317,7 @@ void register_ray_bindings(py::module_ &mod) {
 			    d["attempt_id"] = handle.attempt_id;
 			    d["node_id"] = handle.node_id;
 			    d["flight_port"] = handle.flight_port;
+			    d["flight_server_epoch"] = handle.flight_server_epoch;
 			    d["path"] = handle.files.empty() ? string() : handle.files[0].path;
 			    out.append(d);
 		    }
@@ -1320,6 +1343,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    exchange->InstantiateSink(sink0, 0);
 		    auto sink0_attempt1 = exchange->InstantiateSink(sink0, 1);
 		    auto sink1_attempt0 = exchange->InstantiateSink(sink1, 0);
+		    sink0_attempt1.flight_server_epoch = "worker-retry-epoch";
+		    sink1_attempt0.flight_server_epoch = "worker-first-epoch";
 
 		    std::vector<MaterializedOutput> outputs;
 		    auto retry_output = MaterializedOutput({}, make_worker_id("worker-retry"));
@@ -1344,6 +1369,7 @@ void register_ray_bindings(py::module_ &mod) {
 			    d["attempt_id"] = handle.attempt_id;
 			    d["node_id"] = handle.node_id;
 			    d["flight_port"] = handle.flight_port;
+			    d["flight_server_epoch"] = handle.flight_server_epoch;
 			    d["path"] = handle.files.empty() ? string() : handle.files[0].path;
 			    out.append(d);
 		    }
@@ -2967,7 +2993,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    FlightServerConfig server_config;
 		    server_config.bind_host = "127.0.0.1";
 		    server_config.port = 0;
-		    server_config.local_dirs = {local_dir};
+		    server_config.server_epoch = "shared-manifest-reader-epoch";
 		    FlightServer server(std::move(server_config));
 		    auto start_res = server.Start();
 		    if (start_res.is_err()) {
@@ -2978,34 +3004,25 @@ void register_ray_bindings(py::module_ &mod) {
 		    client_config.location = "grpc://127.0.0.1:" + std::to_string(server.port());
 		    FlightClient client(std::move(client_config));
 		    FlightExchangeTicket ticket;
-		    ticket.shuffle_stage_id = output_location;
+		    ticket.server_epoch = "shared-manifest-reader-epoch";
+		    ticket.exchange_instance_id = output_location;
 		    ticket.node_id = writer_node_id;
+		    ticket.attempt_id = 1;
 		    ticket.partition_idx = static_cast<idx_t>(partition_id);
 		    auto collection_res = client.FetchPartition(context, ticket, types);
 		    auto stop_res = server.Stop();
-		    if (collection_res.is_err()) {
-			    throw std::runtime_error(collection_res.error().what());
-		    }
 		    if (stop_res.is_err()) {
 			    throw std::runtime_error(stop_res.error().what());
 		    }
-		    auto collection = std::move(collection_res.value());
-
-		    py::list values;
-		    for (auto &chunk : collection->Chunks()) {
-			    for (idx_t row = 0; row < chunk.size(); row++) {
-				    values.append(chunk.GetValue(0, row).GetValue<int32_t>());
-			    }
-		    }
 
 		    py::dict out;
-		    out["values"] = values;
-		    out["row_count"] = collection->Count();
+		    out["fetch_error"] = collection_res.is_err();
+		    out["error"] = collection_res.is_err() ? collection_res.error().what() : "";
 		    out["registry_present"] = ShuffleCacheRegistry::Instance().Get(output_location) != nullptr;
 		    return out;
 	    },
 	    py::arg("local_dir"), py::arg("output_location"), py::arg("writer_node_id"), py::arg("partition_id"),
-	    "Serve a committed shared-manifest exchange attempt from a fresh FlightServer process.");
+	    "Verify that an unpublished manifest is not served by a fresh FlightServer process.");
 
 	m.def(
 	    "remote_exchange_source_local_dirs_roundtrip_recovery_for_test",
@@ -3138,7 +3155,7 @@ void register_ray_bindings(py::module_ &mod) {
 	    py::arg("local_dir"), "Exercise EXCHANGE_SOURCE local_dirs serialization through manifest recovery.");
 
 	m.def(
-	    "flight_server_manifest_recovery_for_test",
+	    "flight_server_rejects_unpublished_manifest_for_test",
 	    [](const std::string &local_dir) {
 		    using namespace duckdb;
 		    using namespace duckdb::distributed;
@@ -3181,7 +3198,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    FlightServerConfig server_config;
 		    server_config.bind_host = "127.0.0.1";
 		    server_config.port = 0;
-		    server_config.local_dirs = {local_dir};
+		    server_config.server_epoch = "unpublished-manifest-epoch";
 		    FlightServer server(std::move(server_config));
 		    auto start_res = server.Start();
 		    if (start_res.is_err()) {
@@ -3192,33 +3209,24 @@ void register_ray_bindings(py::module_ &mod) {
 		    client_config.location = "grpc://127.0.0.1:" + std::to_string(server.port());
 		    FlightClient client(std::move(client_config));
 		    FlightExchangeTicket ticket;
-		    ticket.shuffle_stage_id = output_location;
+		    ticket.server_epoch = "unpublished-manifest-epoch";
+		    ticket.exchange_instance_id = output_location;
 		    ticket.node_id = node_id;
+		    ticket.attempt_id = 1;
 		    ticket.partition_idx = 1;
 		    auto collection_res = client.FetchPartition(context, ticket, types);
 		    auto stop_res = server.Stop();
-		    if (collection_res.is_err()) {
-			    throw std::runtime_error(collection_res.error().what());
-		    }
 		    if (stop_res.is_err()) {
 			    throw std::runtime_error(stop_res.error().what());
 		    }
-		    auto collection = std::move(collection_res.value());
-
-		    py::list values;
-		    for (auto &chunk : collection->Chunks()) {
-			    for (idx_t row = 0; row < chunk.size(); row++) {
-				    values.append(chunk.GetValue(0, row).GetValue<int32_t>());
-			    }
-		    }
 
 		    py::dict out;
-		    out["values"] = values;
-		    out["row_count"] = collection->Count();
+		    out["fetch_error"] = collection_res.is_err();
+		    out["error"] = collection_res.is_err() ? collection_res.error().what() : "";
 		    out["registry_present"] = ShuffleCacheRegistry::Instance().Get(output_location) != nullptr;
 		    return out;
 	    },
-	    py::arg("local_dir"), "Exercise FlightServer manifest recovery when ShuffleCacheRegistry has no entry.");
+	    py::arg("local_dir"), "Verify FlightServer rejects a manifest with no published catalog entry.");
 
 	m.def(
 	    "flight_server_uncommitted_attempt_rejected_for_test",
@@ -3240,30 +3248,34 @@ void register_ray_bindings(py::module_ &mod) {
 		    write_config.node_id = node_id;
 		    write_config.num_partitions = 1;
 		    write_config.local_dirs = {local_dir};
-		    ShuffleCache writer(write_config);
+		    auto writer = std::make_shared<ShuffleCache>(write_config);
 
 		    DataChunk input;
 		    input.Initialize(Allocator::DefaultAllocator(), types);
 		    input.SetCardinality(1);
 		    input.SetValue(0, 0, Value::INTEGER(61));
-		    auto write_res = writer.WriteChunk(context, input, 0, names);
+		    auto write_res = writer->WriteChunk(context, input, 0, names);
 		    if (write_res.is_err()) {
 			    throw std::runtime_error(write_res.error().what());
 		    }
-		    auto flush_res = writer.FlushAll(context, names);
+		    auto flush_res = writer->FlushAll(context, names);
 		    if (flush_res.is_err()) {
 			    throw std::runtime_error(flush_res.error().what());
 		    }
-		    auto partial_files_res = writer.GetPartitionFiles(0);
+		    auto partial_files_res = writer->GetPartitionFiles(0);
 		    if (partial_files_res.is_err()) {
 			    throw std::runtime_error(partial_files_res.error().what());
 		    }
-		    ShuffleCacheRegistry::Instance().Remove(output_location);
+		    const std::string server_epoch = "uncommitted-attempt-epoch";
+		    auto register_res = ShuffleCacheRegistry::Instance().Register(output_location, writer, server_epoch, 1);
+		    if (register_res.is_err()) {
+			    throw std::runtime_error(register_res.error().what());
+		    }
 
 		    FlightServerConfig server_config;
 		    server_config.bind_host = "127.0.0.1";
 		    server_config.port = 0;
-		    server_config.local_dirs = {local_dir};
+		    server_config.server_epoch = server_epoch;
 		    FlightServer server(std::move(server_config));
 		    auto start_res = server.Start();
 		    if (start_res.is_err()) {
@@ -3274,18 +3286,21 @@ void register_ray_bindings(py::module_ &mod) {
 		    client_config.location = "grpc://127.0.0.1:" + std::to_string(server.port());
 		    FlightClient client(std::move(client_config));
 		    FlightExchangeTicket ticket;
-		    ticket.shuffle_stage_id = output_location;
+		    ticket.server_epoch = server_epoch;
+		    ticket.exchange_instance_id = output_location;
 		    ticket.node_id = node_id;
+		    ticket.attempt_id = 1;
 		    ticket.partition_idx = 0;
 		    auto collection_res = client.FetchPartition(context, ticket, types);
 		    auto stop_res = server.Stop();
+		    ShuffleCacheRegistry::Instance().Remove(output_location);
 		    if (stop_res.is_err()) {
 			    throw std::runtime_error(stop_res.error().what());
 		    }
 
 		    py::dict out;
 		    out["partial_file_count"] = partial_files_res.value().files.size();
-		    out["committed_manifest"] = writer.HasCommittedManifest();
+		    out["committed_manifest"] = writer->HasCommittedManifest();
 		    out["fetch_error"] = collection_res.is_err();
 		    out["error"] = collection_res.is_err() ? collection_res.error().what() : "";
 		    return out;
