@@ -28,6 +28,8 @@
 #include <iterator>
 #include <utility>
 #include <cstdlib>
+#include <condition_variable>
+#include <thread>
 
 using namespace duckdb;
 using namespace duckdb::distributed;
@@ -126,7 +128,8 @@ void CollectCollectionRows(ColumnDataCollection &collection, vector<int32_t> &ou
 
 class MockObjectShuffleStorage final : public ShuffleStorage {
 public:
-	explicit MockObjectShuffleStorage(std::string root) : root_(std::move(root)), fs_(FileSystem::CreateLocal()) {
+	explicit MockObjectShuffleStorage(std::string root, idx_t remove_failures = 0)
+	    : root_(std::move(root)), fs_(FileSystem::CreateLocal()), remove_failures_remaining_(remove_failures) {
 	}
 
 	bool SupportsObjectPaths() const override {
@@ -193,6 +196,10 @@ public:
 	}
 
 	DuckDBResult<idx_t> RemoveAll(const std::string &path) const override {
+		if (remove_failures_remaining_ > 0) {
+			remove_failures_remaining_--;
+			return DuckDBResult<idx_t>::err(DuckDBError::io_error("injected mock object cleanup failure"));
+		}
 		return RemoveAllRecursive(MapPath(path));
 	}
 
@@ -288,6 +295,7 @@ private:
 
 	std::string root_;
 	unique_ptr<FileSystem> fs_;
+	mutable idx_t remove_failures_remaining_ = 0;
 };
 
 } // namespace
@@ -346,7 +354,7 @@ TEST_CASE("Exchange: ShuffleCacheRegistry register/get/remove", "[distributed][e
 	config.local_dirs = {TestCreatePath("registry_test")};
 
 	auto cache = std::make_shared<ShuffleCache>(std::move(config));
-	registry.Register("registry_test_stage", cache);
+	REQUIRE(registry.Register("registry_test_stage", cache, "registry-test-query").is_ok());
 
 	// Get should return the same cache
 	auto retrieved = registry.Get("registry_test_stage");
@@ -384,8 +392,8 @@ TEST_CASE("Exchange: ShuffleCacheRegistry multiple entries", "[distributed][exch
 	auto cache1 = std::make_shared<ShuffleCache>(std::move(config1));
 	auto cache2 = std::make_shared<ShuffleCache>(std::move(config2));
 
-	registry.Register("multi_test_1", cache1);
-	registry.Register("multi_test_2", cache2);
+	REQUIRE(registry.Register("multi_test_1", cache1, "registry-multi-query").is_ok());
+	REQUIRE(registry.Register("multi_test_2", cache2, "registry-multi-query").is_ok());
 
 	REQUIRE(registry.Get("multi_test_1").get() == cache1.get());
 	REQUIRE(registry.Get("multi_test_2").get() == cache2.get());
@@ -402,6 +410,7 @@ TEST_CASE("Exchange: ShuffleCacheRegistry validates epoch, attempt, and descript
           "[distributed][exchange]") {
 	auto &registry = ShuffleCacheRegistry::Instance();
 	const std::string exchange_id = "registry_identity_stage";
+	const std::string query_id = "registry-identity-query";
 
 	ShuffleCacheConfig config;
 	config.shuffle_stage_id = exchange_id;
@@ -410,8 +419,8 @@ TEST_CASE("Exchange: ShuffleCacheRegistry validates epoch, attempt, and descript
 	config.local_dirs = {TestCreatePath("registry_identity_a")};
 	auto cache = std::make_shared<ShuffleCache>(config);
 
-	REQUIRE(registry.Register(exchange_id, cache, "epoch-a", 4).is_ok());
-	REQUIRE(registry.Register(exchange_id, cache, "epoch-a", 4).is_ok());
+	REQUIRE(registry.Register(exchange_id, cache, query_id, "epoch-a", 4).is_ok());
+	REQUIRE(registry.Register(exchange_id, cache, query_id, "epoch-a", 4).is_ok());
 	REQUIRE(registry.Resolve(exchange_id, "epoch-a", "node-a", 4).is_ok());
 	REQUIRE(registry.Resolve(exchange_id, "epoch-old", "node-a", 4).is_err());
 	REQUIRE(registry.Resolve(exchange_id, "epoch-a", "node-a", 3).is_err());
@@ -420,7 +429,7 @@ TEST_CASE("Exchange: ShuffleCacheRegistry validates epoch, attempt, and descript
 	auto conflicting_config = config;
 	conflicting_config.local_dirs = {TestCreatePath("registry_identity_b")};
 	auto conflicting_cache = std::make_shared<ShuffleCache>(std::move(conflicting_config));
-	REQUIRE(registry.Register(exchange_id, conflicting_cache, "epoch-a", 4).is_err());
+	REQUIRE(registry.Register(exchange_id, conflicting_cache, query_id, "epoch-a", 4).is_err());
 	REQUIRE(registry.Get(exchange_id).get() == cache.get());
 
 	registry.RemoveForDeferredCleanup(exchange_id);
@@ -435,6 +444,7 @@ TEST_CASE("Exchange: ShuffleCacheRegistry cleanup waits for active read leases",
 	auto &context = *conn.context;
 	auto &registry = ShuffleCacheRegistry::Instance();
 	const std::string exchange_id = "registry_lease_stage__sink_0__attempt_0";
+	const std::string query_id = "registry-lease-query";
 
 	ShuffleCacheConfig config;
 	config.shuffle_stage_id = exchange_id;
@@ -451,20 +461,99 @@ TEST_CASE("Exchange: ShuffleCacheRegistry cleanup waits for active read leases",
 	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
 	REQUIRE(cache->HasCommittedManifest());
 
-	REQUIRE(registry.Register(exchange_id, cache, "epoch-a", 0).is_ok());
+	REQUIRE(registry.Register(exchange_id, cache, query_id, "epoch-a", 0).is_ok());
 	auto lease_result = registry.Resolve(exchange_id, "epoch-a", "node-a", 0);
 	REQUIRE(lease_result.is_ok());
 	auto lease = std::move(lease_result.value());
 	registry.RemoveForDeferredCleanup(exchange_id);
 
 	auto cleanup = registry.RemoveAndCleanupByPrefix("registry_lease_stage");
-	REQUIRE(cleanup.registry_entries_removed == 1);
+	REQUIRE(cleanup.registry_entries_removed == 0);
 	REQUIRE(cleanup.storage_entries_removed == 0);
 	REQUIRE(cleanup.cleanup_errors == 0);
+	REQUIRE(cleanup.cleanup_pending == 1);
 	REQUIRE(cache->HasCommittedManifest());
 
 	lease.reset();
+	REQUIRE(cache->HasCommittedManifest());
+	cleanup = registry.RemoveAndCleanupByPrefix("registry_lease_stage");
+	REQUIRE(cleanup.cleanup_pending == 0);
+	REQUIRE(cleanup.cleanup_errors == 0);
+	REQUIRE(cleanup.storage_entries_removed > 0);
 	REQUIRE_FALSE(cache->HasCommittedManifest());
+}
+
+TEST_CASE("Exchange: ShuffleCacheRegistry retains and retries failed cleanup", "[distributed][exchange]") {
+	auto &registry = ShuffleCacheRegistry::Instance();
+	const std::string query_id = "registry-cleanup-retry-query";
+	const std::string exchange_id = "registry_cleanup_retry__sink_0__attempt_0";
+
+	ShuffleCacheConfig config;
+	config.shuffle_stage_id = exchange_id;
+	config.node_id = "node-a";
+	config.num_partitions = 1;
+	config.local_dirs = {"mock://shuffle"};
+	auto storage =
+	    std::make_shared<MockObjectShuffleStorage>(TestCreatePath("registry_cleanup_retry"), /*remove_failures=*/1);
+	auto cache = std::make_shared<ShuffleCache>(std::move(config), std::move(storage));
+
+	REQUIRE(registry.Register(exchange_id, cache, query_id, "epoch-a", 0).is_ok());
+	registry.RemoveForDeferredCleanup(exchange_id);
+
+	auto first_cleanup = registry.RemoveAndCleanupByQuery(query_id);
+	REQUIRE(first_cleanup.cleanup_errors == 1);
+	REQUIRE(first_cleanup.cleanup_pending == 1);
+
+	auto retry_cleanup = registry.RemoveAndCleanupByQuery(query_id);
+	REQUIRE(retry_cleanup.cleanup_errors == 0);
+	REQUIRE(retry_cleanup.cleanup_pending == 0);
+}
+
+TEST_CASE("Exchange: query close fences late cache publication until native execution drains",
+          "[distributed][exchange]") {
+	auto &registry = ShuffleCacheRegistry::Instance();
+	const std::string query_id = "registry-close-race-query";
+	const std::string exchange_id = "registry_close_race__sink_0__attempt_0";
+
+	ShuffleCacheConfig config;
+	config.shuffle_stage_id = exchange_id;
+	config.node_id = "node-a";
+	config.num_partitions = 1;
+	config.local_dirs = {TestCreatePath("registry_close_race")};
+	auto cache = std::make_shared<ShuffleCache>(std::move(config));
+
+	REQUIRE(registry.BeginQueryExecution(query_id).is_ok());
+	REQUIRE(registry.CloseQuery(query_id).is_ok());
+	std::mutex publish_mutex;
+	std::condition_variable publish_ready;
+	bool may_publish = false;
+	bool publication_rejected = false;
+	bool execution_released = false;
+	std::thread publisher([&]() {
+		{
+			std::unique_lock<std::mutex> lock(publish_mutex);
+			publish_ready.wait(lock, [&]() { return may_publish; });
+		}
+		publication_rejected = registry.Register(exchange_id, cache, query_id, "epoch-a", 0).is_err();
+		execution_released = registry.EndQueryExecution(query_id).is_ok();
+	});
+
+	auto while_active = registry.RemoveAndCleanupByQuery(query_id);
+	{
+		std::lock_guard<std::mutex> lock(publish_mutex);
+		may_publish = true;
+	}
+	publish_ready.notify_one();
+	publisher.join();
+
+	REQUIRE(while_active.active_executions == 1);
+	REQUIRE(publication_rejected);
+	REQUIRE(execution_released);
+	auto after_drain = registry.RemoveAndCleanupByQuery(query_id);
+	REQUIRE(after_drain.active_executions == 0);
+	REQUIRE(after_drain.cleanup_pending == 0);
+	REQUIRE(after_drain.cleanup_errors == 0);
+	REQUIRE(registry.Get(exchange_id) == nullptr);
 }
 
 TEST_CASE("Exchange: Flight service isolates published attempts and rejects released or stale tickets",
@@ -478,6 +567,7 @@ TEST_CASE("Exchange: Flight service isolates published attempts and rejects rele
 	const std::string exchange_b = prefix + "__instance_b__sink_0__attempt_1";
 	const std::string epoch = "catalog-isolation-epoch";
 	const std::string node_id = "node-a";
+	const std::string query_id = "catalog-isolation-query";
 
 	auto make_committed_cache = [&](const std::string &exchange_id, const std::string &dir, int32_t value) {
 		ShuffleCacheConfig config;
@@ -498,8 +588,8 @@ TEST_CASE("Exchange: Flight service isolates published attempts and rejects rele
 
 	auto cache_a = make_committed_cache(exchange_a, TestCreatePath("flight_catalog_isolation_a"), 11);
 	auto cache_b = make_committed_cache(exchange_b, TestCreatePath("flight_catalog_isolation_b"), 22);
-	REQUIRE(registry.Register(exchange_a, cache_a, epoch, 1).is_ok());
-	REQUIRE(registry.Register(exchange_b, cache_b, epoch, 1).is_ok());
+	REQUIRE(registry.Register(exchange_a, cache_a, query_id, epoch, 1).is_ok());
+	REQUIRE(registry.Register(exchange_b, cache_b, query_id, epoch, 1).is_ok());
 
 	FlightServerConfig server_config;
 	server_config.bind_host = "127.0.0.1";
@@ -884,8 +974,8 @@ TEST_CASE("Exchange: same logical stage has isolated exchange instances and dire
 	auto cache_a = std::make_shared<ShuffleCache>(std::move(cache_config_a));
 	auto cache_b = std::make_shared<ShuffleCache>(std::move(cache_config_b));
 	auto &registry = ShuffleCacheRegistry::Instance();
-	REQUIRE(registry.Register(instance_a.output_location, cache_a, "epoch-a", 0).is_ok());
-	REQUIRE(registry.Register(instance_b.output_location, cache_b, "epoch-a", 0).is_ok());
+	REQUIRE(registry.Register(instance_a.output_location, cache_a, ctx.query_id, "epoch-a", 0).is_ok());
+	REQUIRE(registry.Register(instance_b.output_location, cache_b, ctx.query_id, "epoch-a", 0).is_ok());
 
 	exchange_a->Close();
 	REQUIRE(registry.Get(instance_a.output_location) == nullptr);
@@ -1046,6 +1136,7 @@ TEST_CASE("Exchange: FlightExchangeSink write and flush", "[distributed][exchang
 	ExchangeSinkInstanceHandle handle;
 	handle.sink_handle.task_partition_id = 0;
 	handle.attempt_id = 0;
+	handle.query_id = "sink-test-query";
 	handle.output_location = "sink_test_stage";
 	handle.output_partition_count = 2;
 
@@ -1155,7 +1246,7 @@ TEST_CASE("Exchange: FlightExchangeSource read from registry", "[distributed][ex
 	REQUIRE(cache->FlushAll(context, cache->BufferedNames()).is_ok());
 
 	// Register the cache
-	ShuffleCacheRegistry::Instance().Register("source_test_stage", cache);
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("source_test_stage", cache, "source-test-query").is_ok());
 
 	// Create source and read partition 0
 	FlightExchangeSource source("source_test_stage", &context);
@@ -1214,7 +1305,7 @@ TEST_CASE("Exchange: FlightExchangeSource multiple partitions", "[distributed][e
 	REQUIRE(cache->WriteChunk(context, chunk2, 2, {"id", "name"}).is_ok());
 
 	REQUIRE(cache->FlushAll(context, cache->BufferedNames()).is_ok());
-	ShuffleCacheRegistry::Instance().Register("source_multi_stage", cache);
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("source_multi_stage", cache, "source-multi-test-query").is_ok());
 
 	// Source reads both partitions
 	FlightExchangeSource source("source_multi_stage", &context);
@@ -1267,7 +1358,7 @@ TEST_CASE("Exchange: FlightExchangeSource switches local cache per handle path",
 	PopulateTwoColumnChunk(chunk0, types, {1, 2}, {"a", "b"});
 	REQUIRE(cache0->WriteChunk(context, chunk0, 0, {"id", "name"}).is_ok());
 	REQUIRE(cache0->FlushAll(context, cache0->BufferedNames()).is_ok());
-	ShuffleCacheRegistry::Instance().Register(stage0, cache0);
+	REQUIRE(ShuffleCacheRegistry::Instance().Register(stage0, cache0, "source-switch-test-query").is_ok());
 
 	ShuffleCacheConfig cache1_config;
 	cache1_config.shuffle_stage_id = stage1;
@@ -1280,7 +1371,7 @@ TEST_CASE("Exchange: FlightExchangeSource switches local cache per handle path",
 	PopulateTwoColumnChunk(chunk1, types, {3, 4}, {"c", "d"});
 	REQUIRE(cache1->WriteChunk(context, chunk1, 0, {"id", "name"}).is_ok());
 	REQUIRE(cache1->FlushAll(context, cache1->BufferedNames()).is_ok());
-	ShuffleCacheRegistry::Instance().Register(stage1, cache1);
+	REQUIRE(ShuffleCacheRegistry::Instance().Register(stage1, cache1, "source-switch-test-query").is_ok());
 
 	FlightExchangeConfig source_config;
 	source_config.node_id = "node_1";
@@ -1356,6 +1447,7 @@ TEST_CASE("Exchange: End-to-end sink to source pipeline", "[distributed][exchang
 	ExchangeSinkInstanceHandle handle;
 	handle.sink_handle.task_partition_id = 0;
 	handle.attempt_id = 0;
+	handle.query_id = "exchange-e2e-query";
 	handle.output_location = exchange_id;
 	handle.output_partition_count = 2;
 
@@ -1443,6 +1535,7 @@ TEST_CASE("Exchange: Multiple sinks to same exchange", "[distributed][exchange]"
 		ExchangeSinkInstanceHandle handle;
 		handle.sink_handle.task_partition_id = 0;
 		handle.attempt_id = 0;
+		handle.query_id = "exchange-multi-sink-query";
 		handle.output_location = exchange_id;
 		handle.output_partition_count = 2;
 
@@ -1458,6 +1551,7 @@ TEST_CASE("Exchange: Multiple sinks to same exchange", "[distributed][exchange]"
 		ExchangeSinkInstanceHandle handle;
 		handle.sink_handle.task_partition_id = 1;
 		handle.attempt_id = 0;
+		handle.query_id = "exchange-multi-sink-query";
 		handle.output_location = exchange_id;
 		handle.output_partition_count = 2;
 

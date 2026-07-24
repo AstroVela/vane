@@ -124,6 +124,9 @@ bool ParseExchangeSinkInstanceObject(py::object obj, duckdb::distributed::Exchan
 	if (d.contains("flight_server_epoch")) {
 		out.flight_server_epoch = py::str(d["flight_server_epoch"]).cast<string>();
 	}
+	if (d.contains("query_id")) {
+		out.query_id = py::str(d["query_id"]).cast<string>();
+	}
 	return true;
 }
 
@@ -1084,6 +1087,10 @@ py::object RayWorkerTask::ExchangeSinkInstance() const {
 	result["partition_id"] = instance.sink_handle.task_partition_id;
 	result["attempt_id"] = instance.attempt_id;
 	result["output_partition_count"] = instance.output_partition_count;
+	result["query_id"] = instance.query_id;
+	if (!instance.flight_server_epoch.empty()) {
+		result["flight_server_epoch"] = instance.flight_server_epoch;
+	}
 	if (!instance.output_location.empty()) {
 		result["output_location"] = instance.output_location;
 		result["attempt_path"] = instance.output_location;

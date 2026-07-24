@@ -991,6 +991,75 @@ def test_normalize_native_task_result_preserves_schema_and_stats():
     assert task_stats == {"processed_input_rows": 3, "processed_input_bytes": 42}
 
 
+def test_run_plan_return_uses_native_completed_sink_descriptor(monkeypatch):
+    from duckdb.runners.ray import worker as worker_module
+
+    events: list[tuple[str, str]] = []
+    original_require = worker_module.require_ray_cxx_attr
+
+    def fake_require(name, hint=None):
+        assert hint
+        if name == "begin_flight_shuffle_query_execution":
+            return lambda query_id: events.append(("begin", query_id))
+        if name == "end_flight_shuffle_query_execution":
+            return lambda query_id: events.append(("end", query_id))
+        return original_require(name, hint=hint)
+
+    completed_descriptor = {
+        "query_id": "query-native-descriptor",
+        "attempt_id": 2,
+        "flight_server_epoch": "worker-epoch",
+    }
+    native_result = duckdb.ray_cxx.NativeDistributedTaskResult(
+        [],
+        [],
+        None,
+        [],
+        "ok",
+        31337,
+        completed_descriptor,
+        {},
+    )
+
+    class DummyWorker:
+        _env_overrides: dict[str, str] = {}
+
+        @staticmethod
+        def _execute_native_task(*args, **kwargs):
+            return native_result
+
+    monkeypatch.setattr(worker_module, "require_ray_cxx_attr", fake_require)
+    actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
+    query_lease = {
+        "lease_id": "lease-native-descriptor",
+        "query_id": "query-native-descriptor",
+        "stage_id": "stage-native-descriptor",
+        "attempt_id": "query-native-descriptor.0.0.0",
+        "target_output_block_bytes": 1,
+        "output_window_bytes": 1,
+    }
+
+    result = asyncio.run(
+        actor_class.run_plan_return(
+            DummyWorker(),
+            object(),
+            None,
+            query_lease,
+            exchange_sink_instance={
+                "query_id": "query-native-descriptor",
+                "attempt_id": 2,
+            },
+        )
+    )
+
+    assert result[4] == 31337
+    assert result[5] == completed_descriptor
+    assert events == [
+        ("begin", "query-native-descriptor"),
+        ("end", "query-native-descriptor"),
+    ]
+
+
 def test_normalize_native_task_result_rejects_legacy_shapes():
     with pytest.raises(TypeError, match="execute_native must return NativeDistributedTaskResult"):
         _normalize_native_task_result(([], [], None))

@@ -41,6 +41,8 @@ struct ExchangeSinkHandle {
 struct ExchangeSinkInstanceHandle {
 	ExchangeSinkHandle sink_handle;
 	idx_t attempt_id = 0;
+	/// Query that owns this concrete attempt.
+	std::string query_id;
 	/// Implementation-specific: output directory (Spooling),
 	/// Flight server address (Flight), etc.
 	std::string output_location;

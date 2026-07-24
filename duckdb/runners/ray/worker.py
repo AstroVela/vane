@@ -101,30 +101,53 @@ def _cleanup_flight_shuffle_for_query(query_id: str) -> dict[str, int]:
             "registry_entries_removed": 0,
             "storage_entries_removed": 0,
             "cleanup_errors": 0,
+            "cleanup_pending": 0,
+            "active_executions": 0,
         }
-    try:
-        cleanup_fn = require_ray_cxx_attr(
-            "cleanup_flight_shuffle_for_query",
-            hint="Ensure the C++ ray extension is built with Flight shuffle cleanup support.",
-        )
-        raw = cleanup_fn(query_id)
-    except Exception:
-        return {
-            "registry_entries_removed": 0,
-            "storage_entries_removed": 0,
-            "cleanup_errors": 1,
-        }
+    cleanup_fn = require_ray_cxx_attr(
+        "cleanup_flight_shuffle_for_query",
+        hint="Ensure the C++ ray extension is built with Flight shuffle cleanup support.",
+    )
+    raw = cleanup_fn(query_id)
     if not isinstance(raw, dict):
-        return {
-            "registry_entries_removed": 0,
-            "storage_entries_removed": 0,
-            "cleanup_errors": 1,
-        }
+        raise TypeError("Flight shuffle cleanup binding must return a dict")
     return {
         "registry_entries_removed": int(raw.get("registry_entries_removed", 0)),
         "storage_entries_removed": int(raw.get("storage_entries_removed", 0)),
         "cleanup_errors": int(raw.get("cleanup_errors", 0)),
+        "cleanup_pending": int(raw.get("cleanup_pending", 0)),
+        "active_executions": int(raw.get("active_executions", 0)),
     }
+
+
+def _close_flight_shuffle_query(query_id: str) -> None:
+    close_fn = require_ray_cxx_attr(
+        "close_flight_shuffle_query",
+        hint="Ensure the C++ ray extension is built with Flight shuffle query fencing support.",
+    )
+    close_fn(str(query_id))
+
+
+async def _drain_flight_shuffle_for_query(query_id: str, *, timeout_s: float = 30.0) -> dict[str, int]:
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    total_registry_removed = 0
+    total_storage_removed = 0
+    while True:
+        cleanup = await asyncio.to_thread(_cleanup_flight_shuffle_for_query, query_id)
+        total_registry_removed += cleanup["registry_entries_removed"]
+        total_storage_removed += cleanup["storage_entries_removed"]
+        if cleanup["active_executions"] == 0 and cleanup["cleanup_pending"] == 0 and cleanup["cleanup_errors"] == 0:
+            cleanup["registry_entries_removed"] = total_registry_removed
+            cleanup["storage_entries_removed"] = total_storage_removed
+            return cleanup
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "timed out draining Flight shuffle query "
+                f"{query_id}: active_executions={cleanup['active_executions']} "
+                f"cleanup_pending={cleanup['cleanup_pending']} "
+                f"cleanup_errors={cleanup['cleanup_errors']}"
+            )
+        await asyncio.sleep(0.01)
 
 
 def _maybe_chaos_kill_worker(task_id: FteTaskAttemptId) -> None:
@@ -779,9 +802,12 @@ class RayWorkerActor:
 
     @ray.method(concurrency_group="control")
     async def fte_drop_query(self, query_id: str) -> dict[str, int]:
-        fte_result = await self._get_fte_task_manager().drop_query(query_id)
-        fragments_removed = self.drop_query_fragments(query_id)
-        flight_shuffle_cleanup = _cleanup_flight_shuffle_for_query(query_id)
+        _close_flight_shuffle_query(query_id)
+        try:
+            fte_result = await self._get_fte_task_manager().drop_query(query_id)
+            fragments_removed = self.drop_query_fragments(query_id)
+        finally:
+            flight_shuffle_cleanup = await _drain_flight_shuffle_for_query(query_id)
         return {
             "tasks_removed": int(fte_result["removed"]),
             "tasks_canceled": int(fte_result["canceled"]),
@@ -860,13 +886,21 @@ class RayWorkerActor:
             return conn
 
     def _shutdown_worker_runtime(self) -> None:
-        with self._shutdown_lock:
-            if self._shutdown_complete:
+        shutdown_lock = getattr(self, "_shutdown_lock", None)
+        if shutdown_lock is None:
+            shutdown_lock = threading.Lock()
+            self._shutdown_lock = shutdown_lock
+        with shutdown_lock:
+            if getattr(self, "_shutdown_complete", False):
                 return
             errors: list[str] = []
-            with self._shared_conn_lock:
+            shared_conn_lock = getattr(self, "_shared_conn_lock", None)
+            if shared_conn_lock is None:
+                shared_conn_lock = threading.Lock()
+                self._shared_conn_lock = shared_conn_lock
+            with shared_conn_lock:
                 self._shutdown_started = True
-                conn = self._shared_conn
+                conn = getattr(self, "_shared_conn", None)
                 self._shared_conn = None
             if conn is not None:
                 try:
@@ -992,19 +1026,37 @@ class RayWorkerActor:
         scan_task_map, exchange_source_task_map = _extract_native_task_maps_from_context(context)
         run_start = time.monotonic()
         _ray_worker_memory_log("run_plan_return_start", **debug_context)
-        result_list = await asyncio.to_thread(
-            self._execute_native_task,
-            plan,
-            scan_task_map or None,
-            copy_output_info=copy_output_info,
-            exchange_source_task_map=exchange_source_task_map or None,
-            exchange_sink_instance=exchange_sink_instance,
-            fte_scan_source_queues=fte_scan_source_queues,
-            fte_exchange_source_queues=fte_exchange_source_queues,
-            dynamic_filter_domains=dynamic_filter_domains,
-            native_progress_callback=native_progress_callback,
-            debug_context=debug_context,
-        )
+        query_id = str(query_task_lease.get("query_id") or "").strip()
+        if not query_id:
+            raise RuntimeError("native task execution requires a query_id")
+
+        def execute_native_task() -> Any:
+            begin_execution = require_ray_cxx_attr(
+                "begin_flight_shuffle_query_execution",
+                hint="Ensure the C++ ray extension is built with Flight shuffle query fencing support.",
+            )
+            end_execution = require_ray_cxx_attr(
+                "end_flight_shuffle_query_execution",
+                hint="Ensure the C++ ray extension is built with Flight shuffle query fencing support.",
+            )
+            begin_execution(query_id)
+            try:
+                return self._execute_native_task(
+                    plan,
+                    scan_task_map or None,
+                    copy_output_info=copy_output_info,
+                    exchange_source_task_map=exchange_source_task_map or None,
+                    exchange_sink_instance=exchange_sink_instance,
+                    fte_scan_source_queues=fte_scan_source_queues,
+                    fte_exchange_source_queues=fte_exchange_source_queues,
+                    dynamic_filter_domains=dynamic_filter_domains,
+                    native_progress_callback=native_progress_callback,
+                    debug_context=debug_context,
+                )
+            finally:
+                end_execution(query_id)
+
+        result_list = await asyncio.to_thread(execute_native_task)
         (
             payloads,
             partition_metadatas,
@@ -1029,7 +1081,7 @@ class RayWorkerActor:
                 )
             ),
         )
-        if exchange_sink_instance is None:
+        if native_exchange_sink_instance is not None:
             exchange_sink_instance = native_exchange_sink_instance
         if len(payloads) != len(partition_metadatas):
             raise RuntimeError(

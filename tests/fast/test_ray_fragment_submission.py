@@ -2003,6 +2003,8 @@ def test_worker_flight_shuffle_cleanup_helper_uses_cxx_binding(monkeypatch):
                 "registry_entries_removed": 2,
                 "storage_entries_removed": 7,
                 "cleanup_errors": 0,
+                "cleanup_pending": 0,
+                "active_executions": 0,
             }
 
         return _cleanup
@@ -2015,8 +2017,94 @@ def test_worker_flight_shuffle_cleanup_helper_uses_cxx_binding(monkeypatch):
         "registry_entries_removed": 2,
         "storage_entries_removed": 7,
         "cleanup_errors": 0,
+        "cleanup_pending": 0,
+        "active_executions": 0,
     }
     assert calls == [("query-drop", "Ensure the C++ ray extension is built with Flight shuffle cleanup support.")]
+
+
+def test_worker_flight_shuffle_cleanup_drain_retries_pending_work(monkeypatch):
+    cleanups = iter(
+        [
+            {
+                "registry_entries_removed": 2,
+                "storage_entries_removed": 0,
+                "cleanup_errors": 1,
+                "cleanup_pending": 1,
+                "active_executions": 1,
+            },
+            {
+                "registry_entries_removed": 0,
+                "storage_entries_removed": 7,
+                "cleanup_errors": 0,
+                "cleanup_pending": 0,
+                "active_executions": 0,
+            },
+        ]
+    )
+    monkeypatch.setattr(worker_mod, "_cleanup_flight_shuffle_for_query", lambda _query_id: next(cleanups))
+
+    result = asyncio.run(worker_mod._drain_flight_shuffle_for_query("query-drop", timeout_s=1))
+
+    assert result == {
+        "registry_entries_removed": 2,
+        "storage_entries_removed": 7,
+        "cleanup_errors": 0,
+        "cleanup_pending": 0,
+        "active_executions": 0,
+    }
+
+
+def test_worker_drop_query_fences_before_cancel_and_drains_afterward(monkeypatch):
+    events: list[str] = []
+
+    class TaskManager:
+        async def drop_query(self, query_id):
+            assert query_id == "query-drop"
+            events.append("cancel")
+            return {"removed": 2, "canceled": 1}
+
+    class DummyWorker:
+        @staticmethod
+        def _get_fte_task_manager():
+            return TaskManager()
+
+        @staticmethod
+        def drop_query_fragments(query_id):
+            assert query_id == "query-drop"
+            events.append("fragments")
+            return 3
+
+    def close(query_id):
+        assert query_id == "query-drop"
+        events.append("close")
+
+    async def drain(query_id):
+        assert query_id == "query-drop"
+        events.append("drain")
+        return {
+            "registry_entries_removed": 4,
+            "storage_entries_removed": 5,
+            "cleanup_errors": 0,
+            "cleanup_pending": 0,
+            "active_executions": 0,
+        }
+
+    monkeypatch.setattr(worker_mod, "_close_flight_shuffle_query", close)
+    monkeypatch.setattr(worker_mod, "_drain_flight_shuffle_for_query", drain)
+    actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+
+    result = asyncio.run(actor_class.fte_drop_query(DummyWorker(), "query-drop"))
+
+    assert events == ["close", "cancel", "fragments", "drain"]
+    assert result == {
+        "tasks_removed": 2,
+        "tasks_canceled": 1,
+        "fragments_removed": 3,
+        "flight_shuffle_registry_entries_removed": 4,
+        "flight_shuffle_storage_entries_removed": 5,
+        "flight_shuffle_cleanup_errors": 0,
+    }
 
 
 def test_fte_control_rpc_retries_transient_failure(monkeypatch):

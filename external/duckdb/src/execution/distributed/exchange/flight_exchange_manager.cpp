@@ -333,6 +333,7 @@ ExchangeSinkInstanceHandle FlightExchange::InstantiateSink(const ExchangeSinkHan
 	ExchangeSinkInstanceHandle instance;
 	instance.sink_handle = handle;
 	instance.attempt_id = attempt_id;
+	instance.query_id = ctx_.query_id;
 	instance.output_location = BuildSinkOutputLocation(exchange_instance_id_, handle, attempt_id);
 	instance.output_partition_count = output_partition_count_;
 	auto &attempt_metadata = sink_attempts_[handle.task_partition_id][attempt_id];
@@ -643,7 +644,7 @@ DuckDBResult<void> FlightExchangeSink::Finish() {
 	}
 	// Register the ShuffleCache in the global registry
 	// so FlightServer / FlightExchangeSource can find it
-	return ShuffleCacheRegistry::Instance().Register(handle_.output_location, shuffle_cache_,
+	return ShuffleCacheRegistry::Instance().Register(handle_.output_location, shuffle_cache_, handle_.query_id,
 	                                                 handle_.flight_server_epoch, handle_.attempt_id);
 }
 

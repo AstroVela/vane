@@ -1166,6 +1166,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto range_order_modifiers =
 		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(115, "range_order_modifiers", {});
 		sink_handle.flight_server_epoch = deserializer.ReadProperty<string>(116, "flight_server_epoch");
+		sink_handle.query_id = deserializer.ReadProperty<string>(117, "query_id");
 		return make_uniq<PhysicalRemoteExchangeSink>(
 		    physical_plan, std::move(types), estimated_cardinality, std::move(exchange_id), num_partitions,
 		    repartition_type, std::move(partition_by), std::move(sink_handle), std::move(exchange_mgr),

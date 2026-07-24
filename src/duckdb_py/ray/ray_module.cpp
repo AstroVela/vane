@@ -393,6 +393,45 @@ void register_ray_bindings(py::module_ &mod) {
 	    [](const string &query_id) { return LookupQueryConnectionSnapshot(query_id); }, py::arg("query_id"));
 
 	m.def(
+	    "begin_flight_shuffle_query_execution",
+	    [](const string &query_id) {
+		    auto result = [&]() {
+			    py::gil_scoped_release release;
+			    return duckdb::distributed::ShuffleCacheRegistry::Instance().BeginQueryExecution(query_id);
+		    }();
+		    if (result.is_err()) {
+			    throw std::runtime_error(result.error().what());
+		    }
+	    },
+	    py::arg("query_id"));
+
+	m.def(
+	    "end_flight_shuffle_query_execution",
+	    [](const string &query_id) {
+		    auto result = [&]() {
+			    py::gil_scoped_release release;
+			    return duckdb::distributed::ShuffleCacheRegistry::Instance().EndQueryExecution(query_id);
+		    }();
+		    if (result.is_err()) {
+			    throw std::runtime_error(result.error().what());
+		    }
+	    },
+	    py::arg("query_id"));
+
+	m.def(
+	    "close_flight_shuffle_query",
+	    [](const string &query_id) {
+		    auto result = [&]() {
+			    py::gil_scoped_release release;
+			    return duckdb::distributed::ShuffleCacheRegistry::Instance().CloseQuery(query_id);
+		    }();
+		    if (result.is_err()) {
+			    throw std::runtime_error(result.error().what());
+		    }
+	    },
+	    py::arg("query_id"));
+
+	m.def(
 	    "cleanup_flight_shuffle_for_query",
 	    [](const string &query_id) {
 		    py::dict out;
@@ -400,13 +439,19 @@ void register_ray_bindings(py::module_ &mod) {
 			    out["registry_entries_removed"] = 0;
 			    out["storage_entries_removed"] = 0;
 			    out["cleanup_errors"] = 0;
+			    out["cleanup_pending"] = 0;
+			    out["active_executions"] = 0;
 			    return out;
 		    }
-		    auto cleanup_result =
-		        duckdb::distributed::ShuffleCacheRegistry::Instance().RemoveAndCleanupByPrefix(query_id + "_");
+		    auto cleanup_result = [&]() {
+			    py::gil_scoped_release release;
+			    return duckdb::distributed::ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(query_id);
+		    }();
 		    out["registry_entries_removed"] = cleanup_result.registry_entries_removed;
 		    out["storage_entries_removed"] = cleanup_result.storage_entries_removed;
 		    out["cleanup_errors"] = cleanup_result.cleanup_errors;
+		    out["cleanup_pending"] = cleanup_result.cleanup_pending;
+		    out["active_executions"] = cleanup_result.active_executions;
 		    return out;
 	    },
 	    py::arg("query_id"));
@@ -925,6 +970,9 @@ void register_ray_bindings(py::module_ &mod) {
 				        if (d.contains("flight_server_epoch")) {
 					        exchange_sink_instance_task.sink_instance.flight_server_epoch =
 					            py::str(d["flight_server_epoch"]).cast<string>();
+				        }
+				        if (d.contains("query_id")) {
+					        exchange_sink_instance_task.sink_instance.query_id = py::str(d["query_id"]).cast<string>();
 				        }
 				        has_exchange_sink_instance_task = true;
 			        } else {
@@ -1744,8 +1792,11 @@ void register_ray_bindings(py::module_ &mod) {
 
 		    auto cleanup_cache = make_cache(cleanup_stage);
 		    auto keep_cache = make_cache(keep_stage);
-		    ShuffleCacheRegistry::Instance().Register(cleanup_stage, cleanup_cache);
-		    ShuffleCacheRegistry::Instance().Register(keep_stage, keep_cache);
+		    auto cleanup_register = ShuffleCacheRegistry::Instance().Register(cleanup_stage, cleanup_cache, query_id);
+		    auto keep_register = ShuffleCacheRegistry::Instance().Register(keep_stage, keep_cache, keep_query_id);
+		    if (cleanup_register.is_err() || keep_register.is_err()) {
+			    throw std::runtime_error("failed to register query cleanup test caches");
+		    }
 		    ShuffleCacheRegistry::Instance().RemoveForDeferredCleanup(cleanup_stage);
 		    auto cleanup_registry_after_defer = ShuffleCacheRegistry::Instance().Get(cleanup_stage) != nullptr;
 
@@ -3267,7 +3318,8 @@ void register_ray_bindings(py::module_ &mod) {
 			    throw std::runtime_error(partial_files_res.error().what());
 		    }
 		    const std::string server_epoch = "uncommitted-attempt-epoch";
-		    auto register_res = ShuffleCacheRegistry::Instance().Register(output_location, writer, server_epoch, 1);
+		    auto register_res = ShuffleCacheRegistry::Instance().Register(
+		        output_location, writer, "flight-server-uncommitted-rejected-query", server_epoch, 1);
 		    if (register_res.is_err()) {
 			    throw std::runtime_error(register_res.error().what());
 		    }

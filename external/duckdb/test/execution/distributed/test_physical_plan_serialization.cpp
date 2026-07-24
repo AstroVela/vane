@@ -1118,12 +1118,16 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	distributed::ExchangeSinkInstanceHandle sink_handle;
 	sink_handle.sink_handle.task_partition_id = 7;
 	sink_handle.attempt_id = 2;
+	sink_handle.query_id = "query-session-a";
 	sink_handle.output_location = "shuffle_stage__sink_7__attempt_2";
 	sink_handle.output_partition_count = 4;
 	sink_handle.flight_server_epoch = "sink-epoch";
 
 	distributed::FlightExchangeConfig flight_config;
 	flight_config.node_id = "node-1";
+	flight_config.local_dirs = {"/session-a/shuffle-0", "/session-a/shuffle-1"};
+	flight_config.flight_bind_host = "127.0.0.2";
+	flight_config.flight_port = 4242;
 	auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
 
 	vector<unique_ptr<Expression>> partition_by;
@@ -1150,9 +1154,18 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	REQUIRE(sink_ptr->NumPartitions() == 4);
 	REQUIRE(sink_ptr->SinkHandle().sink_handle.task_partition_id == 7);
 	REQUIRE(sink_ptr->SinkHandle().attempt_id == 2);
+	REQUIRE(sink_ptr->SinkHandle().query_id == "query-session-a");
 	REQUIRE(sink_ptr->SinkHandle().output_location == "shuffle_stage__sink_7__attempt_2");
 	REQUIRE(sink_ptr->SinkHandle().output_partition_count == 4);
 	REQUIRE(sink_ptr->SinkHandle().flight_server_epoch == "sink-epoch");
+	auto roundtrip_manager =
+	    std::dynamic_pointer_cast<distributed::FlightExchangeManager>(sink_ptr->GetExchangeManager());
+	const std::vector<std::string> expected_local_dirs = {"/session-a/shuffle-0", "/session-a/shuffle-1"};
+	REQUIRE(roundtrip_manager != nullptr);
+	REQUIRE(roundtrip_manager->config().node_id == "node-1");
+	REQUIRE(roundtrip_manager->config().local_dirs == expected_local_dirs);
+	REQUIRE(roundtrip_manager->config().flight_bind_host == "127.0.0.2");
+	REQUIRE(roundtrip_manager->config().flight_port == 4242);
 }
 
 TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source handles",

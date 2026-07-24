@@ -388,7 +388,7 @@ def test_flight_exchange_cleans_successful_unselected_attempt(tmp_path):
 def test_shuffle_cache_registry_query_cleanup_removes_attempt_storage(tmp_path):
     result = duckdb.ray_cxx.shuffle_cache_registry_query_cleanup_for_test(str(tmp_path))
 
-    assert result["registry_entries_removed"] == 1
+    assert result["registry_entries_removed"] == 0
     assert result["storage_entries_removed"] > 0
     assert result["cleanup_errors"] == 0
     assert result["cleanup_registry_after_defer"] is False
