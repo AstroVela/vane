@@ -4,25 +4,35 @@
 from __future__ import annotations
 
 import os
+from typing import Any
+
+import ray
 
 from duckdb._ray_cxx import require_ray_cxx_attr
-from duckdb.runners.ray.fte_scheduler_config import _is_ray_worker_context
+from duckdb.runners.ray.fragment_worker_client import RayWorkerActorHandle
 from duckdb.runners.ray.fte_fragment_scheduler import (
     _collect_vane_env_overrides,
 )
+from duckdb.runners.ray.fte_scheduler_config import _is_ray_worker_context
 from duckdb.runners.ray.safe_get import resolve_object_refs_blocking
 from duckdb.runners.ray.worker import RayWorkerActor
 from duckdb.runners.ray.worker_memory import build_ray_node_memory_layout
 
-import ray
-
-
-from duckdb.runners.ray.fragment_worker_client import RayWorkerActorHandle
-
-RayWorkerRuntime = require_ray_cxx_attr(
+RayWorkerRuntime: Any = require_ray_cxx_attr(
     "RayWorkerRuntime",
     hint="Ensure the C++ ray extension is built and importable in the driver process.",
 )
+
+
+def _persistent_worker_runtime_env() -> dict[str, dict[str, str]]:
+    """Keep the node's accelerator visibility in a zero-GPU Ray actor.
+
+    Ray 2.53 through 2.55 clear accelerator visibility for actors that do not
+    reserve accelerators unless this compatibility switch is disabled. Ray
+    2.56 and later preserve it by default, but accepting the switch keeps the
+    behavior stable across the supported Ray range.
+    """
+    return {"env_vars": {"RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0"}}
 
 
 def start_ray_workers(existing_worker_ids: list[str]) -> list[RayWorkerRuntime]:
@@ -48,10 +58,16 @@ def start_ray_workers(existing_worker_ids: list[str]) -> list[RayWorkerRuntime]:
             # max_concurrency limits how many control/execute RPCs can queue
             # inside the actor. FTE backpressure is handled by task
             # status/split-queue feedback and the shared DuckDB TaskScheduler.
+            #
+            # The persistent actor is a node-local execution container, not a
+            # Ray CPU/GPU lease. Vane admission accounts for native fragments
+            # and Ray-backed UDFs, so reserving the node's full CPU/GPU capacity
+            # here would prevent those child Ray workloads from being scheduled.
             _actor_max_conc = int(os.environ.get("VANE_RAY_ACTOR_MAX_CONCURRENCY", "256"))
             actor = RayWorkerActor.options(  # type: ignore[attr-defined]
                 max_concurrency=_actor_max_conc,
                 memory=(memory_layout.worker_duckdb_memory_bytes + memory_layout.runtime_reserve_bytes),
+                runtime_env=_persistent_worker_runtime_env(),
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node["NodeID"],
                     soft=False,

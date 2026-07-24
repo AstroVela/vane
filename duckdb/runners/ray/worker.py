@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
+# mypy: disable-error-code="untyped-decorator"
 
 from __future__ import annotations
 
@@ -8,7 +9,8 @@ import os
 import sys
 import threading
 import time
-from typing import Any, NamedTuple
+from collections.abc import Mapping
+from typing import Any, NamedTuple, cast
 
 import ray
 
@@ -137,7 +139,7 @@ def _maybe_chaos_kill_worker(task_id: FteTaskAttemptId) -> None:
     os._exit(88)
 
 
-def _normalize_native_task_result(result: Any):
+def _normalize_native_task_result(result: Any) -> tuple[Any, ...]:
     native_type = require_ray_cxx_attr(
         "NativeDistributedTaskResult",
         hint="Ensure the C++ ray extension is built and importable in this process.",
@@ -348,7 +350,7 @@ def _warm_up_python_native_dependencies() -> None:
         pass
 
 
-def _apply_env_overrides(env_overrides: dict[str, str] | None) -> None:
+def _apply_env_overrides(env_overrides: Mapping[str, str | None] | None) -> None:
     if not env_overrides:
         return
     for key, value in env_overrides.items():
@@ -429,8 +431,6 @@ class RayWorkerActor:
         self._task_heap_capacity_bytes = task_heap_capacity_bytes
         _apply_env_overrides(self._env_overrides)
         os.environ["VANE_WORKER"] = "1"
-        if num_gpus > 0:
-            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_gpus))
         try:
             loop = asyncio.get_running_loop()
             set_event_loop(loop)
@@ -473,7 +473,7 @@ class RayWorkerActor:
         # lightweight cursor (new ClientContext) from this connection.
         # Eagerly create during __init__ so the ~2s startup cost overlaps
         # with actor creation instead of blocking the first task.
-        self._shared_conn = None
+        self._shared_conn: Any | None = None
         self._shared_conn_lock = threading.Lock()
         self._get_shared_conn()  # eagerly initialize
         _ray_worker_memory_log(
@@ -676,7 +676,7 @@ class RayWorkerActor:
         status = await self._get_fte_task_manager().create_task(request)
         return _fte_applied_control_status(
             "fte_create_task",
-            request.get("task_id"),
+            cast(str | dict[str, Any], request.get("task_id")),
             status,
         )
 
@@ -832,11 +832,11 @@ class RayWorkerActor:
         self._fragment_lookup_hits += 1
         return fragment_plan
 
-    def _configure_conn(self, conn):
+    def _configure_conn(self, conn: Any) -> None:
         """Apply standard DuckDB settings (S3, threading, etc.) to a connection."""
         _configure_ray_worker_conn(conn, self._duckdb_memory_bytes)
 
-    def _get_shared_conn(self):
+    def _get_shared_conn(self) -> Any:
         """Return the shared DuckDB connection, creating it lazily on first use.
 
         All tasks executed by this actor share the same DatabaseInstance (and
@@ -848,7 +848,7 @@ class RayWorkerActor:
             return self._shared_conn
         with self._shared_conn_lock:
             if self._shared_conn is not None:
-                return self._shared_conn
+                return self._shared_conn  # type: ignore[unreachable]
             import duckdb
 
             conn = duckdb.connect()
@@ -856,7 +856,7 @@ class RayWorkerActor:
             self._shared_conn = conn
             return conn
 
-    def __del__(self):
+    def __del__(self) -> None:
         """Cleanup method called when actor is being destroyed."""
         # Use a try-except to safely handle cleanup during Python shutdown
         try:
@@ -864,7 +864,7 @@ class RayWorkerActor:
 
             # Check if Python is shutting down
             if sys.meta_path is None:
-                return
+                return  # type: ignore[unreachable]
 
             conn = getattr(self, "_shared_conn", None)
             if conn is not None:
@@ -888,7 +888,7 @@ class RayWorkerActor:
 
     def _execute_native_task(
         self,
-        plan,
+        plan: Any,
         scan_task_map: dict[str, str] | None,
         copy_output_info: dict[str, str] | None = None,
         exchange_source_task_map: dict[str, Any] | None = None,
@@ -958,7 +958,7 @@ class RayWorkerActor:
 
     async def run_plan_return(
         self,
-        plan,  # DistributedPhysicalPlan from _duckdb.ray_cxx
+        plan: Any,  # DistributedPhysicalPlan from _duckdb.ray_cxx
         context: dict[str, str] | None,
         query_task_lease: dict[str, Any],
         exchange_sink_instance: dict[str, Any] | bytes | None = None,
