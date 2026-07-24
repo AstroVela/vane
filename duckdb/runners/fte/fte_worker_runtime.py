@@ -14,6 +14,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from duckdb.runners.fte.debug_memory import (
+    debug_flag_enabled,
+    describe_result_payload,
+    log_debug,
+    process_memory_snapshot,
+)
 from duckdb.runners.fte.fte_config import (
     FTE_WORKER_RUNTIME,
     FteWorkerAdmissionConfig,
@@ -30,12 +36,6 @@ from duckdb.runners.fte.fte_descriptor import (
 from duckdb.runners.fte.fte_exchange import collect_spooling_output_stats
 from duckdb.runners.fte.fte_state import _TERMINAL_STATES, FteTaskState
 from duckdb.runners.fte.fte_types import FteSplit, FteTaskAttemptId
-from duckdb.runners.fte.debug_memory import (
-    debug_flag_enabled,
-    describe_result_payload,
-    log_debug,
-    process_memory_snapshot,
-)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -259,7 +259,7 @@ class FteTaskExecution:
         request: Mapping[str, Any],
         execute_fn: Callable[[Mapping[str, Any]], Awaitable[Any]],
         *,
-        status_callback: Callable[["FteTaskExecution"], None] | None = None,
+        status_callback: Callable[["FteTaskExecution"], object] | None = None,
         require_query_task_lease: bool = False,
         default_task_memory_bytes: int | None = None,
     ) -> None:
@@ -300,6 +300,7 @@ class FteTaskExecution:
             source_id: {split.sequence_id for split in splits} for source_id, splits in self.initial_splits.items()
         }
         self.status = TaskStatus(self.task_id, FteTaskState.PLANNED)
+        self._last_split_queue_status: dict[str, Any] = {}
         self.result: Any = None
         self._result_stored_at: float | None = None
         self._result_release_count = 0
@@ -390,13 +391,27 @@ class FteTaskExecution:
     def status_payload(self) -> dict[str, Any]:
         with self._status_lock:
             status = self.status.to_dict()
-            status.update(self.split_queue_status())
+            if self.status.state in _TERMINAL_STATES:
+                try:
+                    split_queue_status = self._refresh_split_queue_status()
+                except Exception:
+                    # Finalization may have failed in a native queue accessor.
+                    split_queue_status = dict(self._last_split_queue_status)
+            else:
+                split_queue_status = self._refresh_split_queue_status()
+            status.update(split_queue_status)
             status["memory_requirement_bytes"] = self.memory_requirement_bytes
             output_buffer_status = _output_buffer_status(self.output_buffers)
             if output_buffer_status is not None:
                 status["output_buffer_status"] = output_buffer_status
             if self.status.state == FteTaskState.FINISHED:
                 status["result"] = self.result
+        return status
+
+    def _refresh_split_queue_status(self) -> dict[str, Any]:
+        status = self.split_queue_status()
+        with self._status_lock:
+            self._last_split_queue_status = dict(status)
         return status
 
     def split_queue_status(self) -> dict[str, Any]:
@@ -580,6 +595,8 @@ class FteTaskExecution:
             self._future.add_done_callback(callback)
 
     async def _run(self) -> None:
+        result_stored = False
+        dynamic_source_splits_completed = False
         try:
             if self.fte_runtime:
                 await self._wait_for_fte_splits_sealed()
@@ -595,23 +612,33 @@ class FteTaskExecution:
             result = await self.execute_fn(self.request)
             with self._status_lock:
                 self.result = result
+                result_stored = True
                 self._result_stored_at = time.time()
+            self._complete_dynamic_source_splits()
+            dynamic_source_splits_completed = True
             self._log_result_lifecycle("result_stored", result=result)
+            with self._status_lock:
+                self.status.output_stats = self._extract_output_stats(result)
+            final_task_stats = self._extract_task_stats(result)
+            final_split_stats = self._refresh_split_queue_status()
+            if final_task_stats or final_split_stats:
+                self._record_task_stats({**final_task_stats, **final_split_stats})
+            self._transition(FteTaskState.FINISHED)
         except asyncio.CancelledError:
             self._transition(FteTaskState.CANCELED)
             raise
         except Exception as exc:
+            if result_stored and not dynamic_source_splits_completed:
+                try:
+                    self._complete_dynamic_source_splits()
+                except Exception:
+                    pass
+            if result_stored:
+                try:
+                    self.release_result(reason="task_failed")
+                except Exception:
+                    pass
             self._transition(FteTaskState.FAILED, failure=_failure_payload(exc))
-        else:
-            result = self.result
-            with self._status_lock:
-                self.status.output_stats = self._extract_output_stats(result)
-            self._complete_dynamic_source_splits()
-            final_task_stats = self._extract_task_stats(result)
-            final_split_stats = self.split_queue_status()
-            if final_task_stats or final_split_stats:
-                self._record_task_stats({**final_task_stats, **final_split_stats})
-            self._transition(FteTaskState.FINISHED)
 
     def _complete_dynamic_source_splits(self) -> None:
         queues = [
@@ -835,23 +862,25 @@ class FteTaskExecution:
 
         if update_request.source_node_ids:
             current = {str(source) for source in (self.request.get("source_node_ids") or [])}
-            merged = current | set(update_request.source_node_ids)
-            if merged != current:
-                self.request["source_node_ids"] = sorted(merged)
+            merged_source_node_ids = current | set(update_request.source_node_ids)
+            if merged_source_node_ids != current:
+                self.request["source_node_ids"] = sorted(merged_source_node_ids)
                 changed = True
         if update_request.dynamic_scan_source_node_ids:
-            merged = self.dynamic_scan_source_ids | set(update_request.dynamic_scan_source_node_ids)
-            if merged != self.dynamic_scan_source_ids:
-                self.dynamic_scan_source_ids = merged
-                self._add_dynamic_source_queues("scan_task", merged)
-                self.request["dynamic_scan_source_node_ids"] = sorted(merged)
+            merged_scan_source_ids = self.dynamic_scan_source_ids | set(update_request.dynamic_scan_source_node_ids)
+            if merged_scan_source_ids != self.dynamic_scan_source_ids:
+                self.dynamic_scan_source_ids = merged_scan_source_ids
+                self._add_dynamic_source_queues("scan_task", merged_scan_source_ids)
+                self.request["dynamic_scan_source_node_ids"] = sorted(merged_scan_source_ids)
                 changed = True
         if update_request.dynamic_exchange_source_node_ids:
-            merged = self.dynamic_exchange_source_ids | set(update_request.dynamic_exchange_source_node_ids)
-            if merged != self.dynamic_exchange_source_ids:
-                self.dynamic_exchange_source_ids = merged
-                self._add_dynamic_source_queues("exchange_source_task", merged)
-                self.request["dynamic_exchange_source_node_ids"] = sorted(merged)
+            merged_exchange_source_ids = self.dynamic_exchange_source_ids | set(
+                update_request.dynamic_exchange_source_node_ids
+            )
+            if merged_exchange_source_ids != self.dynamic_exchange_source_ids:
+                self.dynamic_exchange_source_ids = merged_exchange_source_ids
+                self._add_dynamic_source_queues("exchange_source_task", merged_exchange_source_ids)
+                self.request["dynamic_exchange_source_node_ids"] = sorted(merged_exchange_source_ids)
                 changed = True
 
         for source_id, splits in update_request.initial_splits.items():
@@ -877,11 +906,11 @@ class FteTaskExecution:
                 self.request["output_buffers"] = dict(output_buffers or {})
                 changed = True
         if update_request.dynamic_filter_domains:
-            merged = dict(self.dynamic_filter_domains)
-            merged.update(update_request.dynamic_filter_domains)
-            if merged != self.dynamic_filter_domains:
-                self.dynamic_filter_domains = merged
-                self.request["dynamic_filter_domains"] = dict(merged)
+            merged_dynamic_filter_domains = dict(self.dynamic_filter_domains)
+            merged_dynamic_filter_domains.update(update_request.dynamic_filter_domains)
+            if merged_dynamic_filter_domains != self.dynamic_filter_domains:
+                self.dynamic_filter_domains = merged_dynamic_filter_domains
+                self.request["dynamic_filter_domains"] = dict(merged_dynamic_filter_domains)
                 changed = True
 
         if changed:
@@ -1128,18 +1157,27 @@ class FteWorkerTaskManager:
         self.running_tasks.add(key)
         self._sync_udf_active_fte_fragment_tasks()
         execution.start()
+
+        def task_done(future: asyncio.Task[Any]) -> None:
+            self._task_done(key, future)
+
+        execution.add_done_callback(task_done)
         self._publish_status(execution)
         self._admission_debug_log("start_task", execution, reason=reason)
-        execution.add_done_callback(lambda future, task_key=key: self._task_done(task_key, future))
 
     def _task_done(self, task_key: str, _future: asyncio.Task[Any]) -> None:
         self.running_tasks.discard(task_key)
-        self._sync_udf_active_fte_fragment_tasks()
         execution = self.tasks.get(task_key)
-        if execution is not None:
-            self._publish_status(execution)
-        self._admission_debug_log("task_done", execution)
-        self._drain_queue()
+        try:
+            self._sync_udf_active_fte_fragment_tasks()
+            try:
+                if execution is not None:
+                    self._publish_status(execution)
+            except Exception:
+                pass
+            self._admission_debug_log("task_done", execution)
+        finally:
+            self._drain_queue()
 
     def _sync_udf_active_fte_fragment_tasks(self) -> None:
         if not self.sync_udf_active_fragment_tasks:
@@ -1210,12 +1248,12 @@ class FteWorkerTaskManager:
         key = self._key(task_id)
         execution = self.tasks.get(key)
         if execution is not None:
-            status = self._publish_status(execution)
-            status.pop("result", None)
-            return status
-        status = self._dropped_status(task_id)
-        if status is not None:
-            updated = dict(status)
+            published_status = self._publish_status(execution)
+            published_status.pop("result", None)
+            return published_status
+        dropped_status = self._dropped_status(task_id)
+        if dropped_status is not None:
+            updated = dict(dropped_status)
             updated.pop("result", None)
             return updated
         return self._unknown_status(task_id)
@@ -1225,12 +1263,12 @@ class FteWorkerTaskManager:
         execution = self.tasks.get(key)
         if execution is not None:
             execution.release_result(reason="release_task_result")
-            status = self._publish_status(execution)
-            status.pop("result", None)
-            return status
-        status = self._dropped_status(task_id)
-        if status is not None:
-            updated = dict(status)
+            published_status = self._publish_status(execution)
+            published_status.pop("result", None)
+            return published_status
+        dropped_status = self._dropped_status(task_id)
+        if dropped_status is not None:
+            updated = dict(dropped_status)
             updated.pop("result", None)
             self._store_dropped_status(key, updated)
             return updated
