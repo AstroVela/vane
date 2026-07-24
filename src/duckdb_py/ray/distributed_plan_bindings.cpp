@@ -159,8 +159,11 @@ struct PyPhysicalPlanWrapper {
 		serializer.Begin();
 		physical_plan->Serialize(serializer);
 		serializer.End();
-		auto data_ptr = stream.GetData();
 		auto data_size = stream.GetPosition();
+		if (data_size == 0) {
+			throw duckdb::InternalException("DistributedPhysicalPlan serialized a non-empty root to an empty payload");
+		}
+		auto data_ptr = stream.GetData();
 		return string(reinterpret_cast<const char *>(data_ptr), data_size);
 	}
 
@@ -759,6 +762,9 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj) const
 	plan_wrapper.client_context_ = conn_wrapper.con.GetConnection().context;
 	plan_wrapper.udf_registrations_ = udf_registrations_;
 	plan_wrapper.connection_snapshot_ = connection_snapshot_;
+	auto validate_serialization =
+	    py::module_::import("duckdb._ray_cxx").attr("validate_plan_serialization_for_submission");
+	validate_serialization(py::cast(plan_wrapper));
 	RememberQueryUDFRegistrations(plan_wrapper.query_id_, plan_wrapper.udf_registrations_);
 	return plan_wrapper;
 }
@@ -818,8 +824,11 @@ public:
 	}
 
 	DuckDBResult<void> submit_fte_task_events(std::vector<duckdb::distributed::WorkerTask> tasks) override {
+		string query_id;
+		string submission_error_owner;
 		try {
-			auto query_id = QueryIdFromTaskEvents(tasks);
+			query_id = QueryIdFromTaskEvents(tasks);
+			submission_error_owner = duckdb::distributed::python::ray::SubmissionErrorOwnerQueryId(tasks, query_id);
 			if (!tasks.empty() && query_id.empty()) {
 				return DuckDBResult<void>::err(DuckDBError::value_error("FTE task events require non-empty query_id"));
 			}
@@ -833,6 +842,10 @@ public:
 			py::object raw_handles = backend.attr("submit_tasks")(py_tasks);
 			StorePythonResultHandles(query_id, std::move(raw_handles));
 			return DuckDBResult<void>::ok();
+		} catch (const py::error_already_set &e) {
+			submission_errors_.Store(submission_error_owner, e);
+			return DuckDBResult<void>::err(
+			    DuckDBError(string("Python backend submit_fte_task_events failed: ") + e.what()));
 		} catch (const std::exception &e) {
 			return DuckDBResult<void>::err(
 			    DuckDBError(string("Python backend submit_fte_task_events failed: ") + e.what()));
@@ -955,6 +968,7 @@ public:
 		if (query_id.empty()) {
 			return;
 		}
+		submission_errors_.Discard(query_id);
 		std::exception_ptr result_cleanup_error;
 		try {
 			ClearResultHandles(query_id);
@@ -993,6 +1007,11 @@ public:
 		if (backend_drop_error) {
 			std::rethrow_exception(backend_drop_error);
 		}
+	}
+
+	void rethrow_submission_error(const string &query_id) {
+		submission_errors_.RethrowAsCause(query_id,
+		                                  string("distributed worker task submission failed for query_id=") + query_id);
 	}
 
 	std::unordered_map<string, std::unordered_map<string, idx_t>> fragment_stats_by_worker() const {
@@ -1036,6 +1055,7 @@ public:
 private:
 	mutable mutex mutex_;
 	duckdb::distributed::python::ray::SafePyObject backend_;
+	duckdb::distributed::python::ray::PythonExceptionStore submission_errors_;
 	std::unordered_map<string, std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>>>
 	    result_handles_by_query_;
 	std::unordered_map<string, std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>>>
@@ -1440,6 +1460,14 @@ struct PyPhysicalPlanWrapperRunner {
 		return {};
 	}
 
+	void rethrow_submission_error(const string &query_id) {
+		if (ray_worker_manager_) {
+			ray_worker_manager_->rethrow_submission_error(query_id);
+		} else if (py_backend_worker_manager_) {
+			py_backend_worker_manager_->rethrow_submission_error(query_id);
+		}
+	}
+
 	std::shared_ptr<ResultPartitionStream> run_plan(const PyPhysicalPlanWrapper &plan,
 	                                                duckdb::shared_ptr<duckdb::ClientContext> client_context = nullptr,
 	                                                duckdb::distributed::python::ray::SafePyObject py_conn_keepalive =
@@ -1502,6 +1530,7 @@ struct PyPhysicalPlanWrapperRunner {
 				res = runner->run_plan(plan.plan_);
 			}
 
+			rethrow_submission_error(plan.idx());
 			if (!res.is_ok()) {
 				throw py::value_error(res.error().what());
 			}
@@ -1512,6 +1541,18 @@ struct PyPhysicalPlanWrapperRunner {
 			}
 			auto stream = std::make_shared<duckdb::distributed::PlanResultStream>(std::move(plan_result.stream));
 			auto py_stream = std::make_shared<ResultPartitionStream>(stream);
+			auto query_id = plan.idx();
+			if (ray_worker_manager_) {
+				auto worker_manager = ray_worker_manager_;
+				py_stream->rethrow_pending_error_ = [worker_manager, query_id]() {
+					worker_manager->rethrow_submission_error(query_id);
+				};
+			} else if (py_backend_worker_manager_) {
+				auto worker_manager = py_backend_worker_manager_;
+				py_stream->rethrow_pending_error_ = [worker_manager, query_id]() {
+					worker_manager->rethrow_submission_error(query_id);
+				};
+			}
 			py_stream->keepalive_ = run_state;
 			return py_stream;
 		} catch (const py::error_already_set &ex) {
@@ -1611,6 +1652,7 @@ struct PyPhysicalPlanWrapperRunner {
 				run_plan_ms = elapsed_ms(run_plan_started);
 			}
 
+			rethrow_submission_error(plan.idx());
 			if (!res.is_ok()) {
 				throw py::value_error(res.error().what());
 			}

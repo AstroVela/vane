@@ -33,6 +33,27 @@ static bool IsUnselectedFteHandle(const RayWorkerRuntime::TaskResultHandleType &
 	       finished_status->selected_attempt_task_ids.end();
 }
 
+std::string
+duckdb::distributed::python::ray::SubmissionErrorOwnerQueryId(const std::vector<duckdb::distributed::WorkerTask> &tasks,
+                                                              const std::string &execution_query_id) {
+	std::string resource_query_id;
+	for (const auto &task : tasks) {
+		const auto &context = task.context();
+		auto it = context.find("resource_query_id");
+		if (it == context.end() || it->second.empty()) {
+			continue;
+		}
+		if (resource_query_id.empty()) {
+			resource_query_id = it->second;
+			continue;
+		}
+		if (resource_query_id != it->second) {
+			throw std::runtime_error("FTE submit batch contains multiple resource_query_id values");
+		}
+	}
+	return resource_query_id.empty() ? execution_query_id : resource_query_id;
+}
+
 std::string RayWorkerManager::QueryIdFromTaskEvents(const std::vector<duckdb::distributed::WorkerTask> &tasks) {
 	std::string query_id;
 	for (const auto &task : tasks) {
@@ -370,8 +391,11 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 }
 
 DuckDBResult<void> RayWorkerManager::submit_fte_task_events(std::vector<duckdb::distributed::WorkerTask> tasks) {
+	string query_id;
+	string submission_error_owner;
 	try {
-		auto query_id = QueryIdFromTaskEvents(tasks);
+		query_id = QueryIdFromTaskEvents(tasks);
+		submission_error_owner = SubmissionErrorOwnerQueryId(tasks, query_id);
 		if (!tasks.empty() && query_id.empty()) {
 			return DuckDBResult<void>::err(DuckDBError::value_error("FTE task events require non-empty query_id"));
 		}
@@ -410,9 +434,17 @@ DuckDBResult<void> RayWorkerManager::submit_fte_task_events(std::vector<duckdb::
 			workers[worker_idx]->SubmitFteTaskEvents(worker_tasks);
 		}
 		return DuckDBResult<void>::ok();
+	} catch (const py::error_already_set &e) {
+		submission_errors_.Store(submission_error_owner, e);
+		return DuckDBResult<void>::err(DuckDBError(string("Python error during submit_fte_task_events: ") + e.what()));
 	} catch (const std::exception &e) {
 		return DuckDBResult<void>::err(DuckDBError(string("Python error during submit_fte_task_events: ") + e.what()));
 	}
+}
+
+void RayWorkerManager::rethrow_submission_error(const string &query_id) {
+	submission_errors_.RethrowAsCause(query_id,
+	                                  string("distributed worker task submission failed for query_id=") + query_id);
 }
 
 DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>> RayWorkerManager::worker_snapshots() const {
@@ -511,6 +543,7 @@ void RayWorkerManager::drop_query_fragments(const string &query_id) {
 	if (query_id.empty()) {
 		return;
 	}
+	submission_errors_.Discard(query_id);
 	std::vector<std::string> errors;
 	try {
 		ClearFteResultHandles(query_id);

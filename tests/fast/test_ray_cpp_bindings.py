@@ -3,6 +3,7 @@
 
 import json
 import os
+import pickle
 import queue
 import socket
 import socketserver
@@ -18,6 +19,8 @@ from pathlib import Path
 import pytest
 
 import duckdb
+import duckdb._ray_cxx as ray_cxx_helpers
+from duckdb._ray_errors import RemoteRayException
 
 
 def _make_test_physical_plan(con=None):
@@ -27,6 +30,186 @@ def _make_test_physical_plan(con=None):
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
+
+
+def test_physical_plan_pickle_propagates_non_serializable_operator_error():
+    plan = duckdb.ray_cxx._make_non_serializable_physical_plan_for_test("query-non-serializable")
+
+    assert plan.has_root() is True
+    with pytest.raises(
+        duckdb.NotImplementedException,
+        match="INTENTIONALLY_NON_SERIALIZABLE operator cannot be serialized",
+    ):
+        pickle.dumps(plan)
+
+
+def test_physical_plan_submission_preflight_accepts_serializable_root():
+    plan = _make_test_physical_plan()
+
+    assert plan._validate_serializable_for_submission() is None
+
+
+def test_logical_to_physical_plan_propagates_submission_preflight_cause(monkeypatch):
+    con = duckdb.connect()
+    logical_plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        "query-preflight-wiring",
+    )
+    non_serializable_plan = duckdb.ray_cxx._make_non_serializable_physical_plan_for_test("query-preflight-wiring")
+    validate_submission = ray_cxx_helpers.validate_plan_serialization_for_submission
+
+    def validate_non_serializable_plan(_plan):
+        validate_submission(non_serializable_plan)
+
+    monkeypatch.setattr(
+        ray_cxx_helpers,
+        "validate_plan_serialization_for_submission",
+        validate_non_serializable_plan,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="distributed physical plan serialization preflight failed for query_id=query-preflight-wiring",
+    ) as exc_info:
+        logical_plan.to_physical_plan(con)
+
+    assert isinstance(exc_info.value, RemoteRayException)
+    assert isinstance(exc_info.value.__cause__, duckdb.NotImplementedException)
+    assert "INTENTIONALLY_NON_SERIALIZABLE operator cannot be serialized" in str(exc_info.value.__cause__)
+
+
+@pytest.mark.parametrize("query_id", [None, ""], ids=["absent", "empty"])
+def test_worker_task_plan_rejects_missing_query_id(query_id):
+    task = duckdb.ray_cxx._make_worker_task_for_test(True, query_id)
+
+    with pytest.raises(
+        duckdb.InternalException,
+        match="RayWorkerTask::Plan requires non-empty task context query_id",
+    ):
+        task.plan()
+
+
+def test_worker_task_plan_keeps_absent_plan_explicit():
+    task = duckdb.ray_cxx._make_worker_task_for_test()
+
+    assert task.plan() is None
+
+
+def test_worker_task_plan_rejects_present_plan_without_root():
+    task = duckdb.ray_cxx._make_worker_task_for_test(True, "query-rootless-worker-plan")
+
+    with pytest.raises(
+        duckdb.InternalException,
+        match="RayWorkerTask::Plan received a present physical plan without a root",
+    ):
+        task.plan()
+
+
+@pytest.mark.parametrize(
+    ("execution_query_id", "resource_query_id", "expected"),
+    [
+        ("query-root", None, "query-root"),
+        ("query-root:orderby:sample", "query-root", "query-root"),
+    ],
+)
+def test_submission_error_is_owned_by_outer_resource_query(
+    execution_query_id,
+    resource_query_id,
+    expected,
+):
+    assert (
+        duckdb.ray_cxx._submission_error_owner_query_id_for_test(
+            execution_query_id,
+            resource_query_id,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("manager_kind", ["python-backend", "ray-worker-manager"])
+def test_worker_submission_preserves_worker_plan_exception_cause(monkeypatch, manager_kind):
+    import _duckdb
+
+    query_id = f"query-worker-plan-error-{manager_kind}"
+    submission_calls = []
+
+    class SubmissionTarget:
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "worker-1",
+                    "num_cpus": 4.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 4 << 30,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            submission_calls.append(len(tasks))
+            tasks[0].plan()
+            return []
+
+        def drop_query(self, _query_id):
+            return None
+
+        def fte_drop_query(self, _query_id):
+            return {
+                "tasks_removed": 0,
+                "tasks_canceled": 0,
+                "fragments_removed": 0,
+            }
+
+        def shutdown(self):
+            return None
+
+    target = SubmissionTarget()
+    con = duckdb.connect()
+    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+
+    def fail_lookup(actual_query_id):
+        raise duckdb.NotImplementedException(f"plan lookup sentinel for {actual_query_id}")
+
+    monkeypatch.setattr(_duckdb.ray_cxx, "_lookup_query_udf_registrations", fail_lookup)
+    if manager_kind == "python-backend":
+        runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(target)
+    else:
+        import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+        monkeypatch.setattr(
+            ray_worker_handle,
+            "start_ray_workers",
+            lambda _existing_ids: [
+                duckdb.ray_cxx.RayWorkerRuntime(
+                    "worker-1",
+                    target,
+                    4.0,
+                    0.0,
+                    4 << 30,
+                )
+            ],
+        )
+        monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+        runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+
+    stream = runner.run_plan(plan, con)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match=f"distributed worker task submission failed for query_id={query_id}",
+        ) as exc_info:
+            list(stream)
+    finally:
+        runner.drop_query_fragments(query_id)
+        con.close()
+
+    assert isinstance(exc_info.value, RemoteRayException)
+    assert isinstance(exc_info.value.__cause__, duckdb.NotImplementedException)
+    assert exc_info.value.__cause__.__traceback__ is not None
+    assert f"plan lookup sentinel for {query_id}" in str(exc_info.value.__cause__)
+    assert submission_calls == [1]
 
 
 @pytest.mark.parametrize("should_fail", [False, True], ids=["success", "failure"])

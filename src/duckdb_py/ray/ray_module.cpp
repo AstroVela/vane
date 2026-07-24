@@ -121,6 +121,22 @@ namespace duckdb {
 #include "logical_plan_bindings.cpp"
 #include "distributed_plan_bindings.cpp"
 
+class PhysicalNonSerializableOperatorForTest : public PhysicalOperator {
+public:
+	explicit PhysicalNonSerializableOperatorForTest(PhysicalPlan &physical_plan)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::DUMMY_SCAN, {LogicalType::INTEGER}, 1) {
+	}
+
+	string GetName() const override {
+		return "INTENTIONALLY_NON_SERIALIZABLE";
+	}
+
+protected:
+	void SerializeOperatorData(Serializer &) const override {
+		throw NotImplementedException("INTENTIONALLY_NON_SERIALIZABLE operator cannot be serialized");
+	}
+};
+
 void register_ray_bindings(py::module_ &mod) {
 	auto m = mod.def_submodule("ray_cxx");
 	m.doc() = "C++ Ray execution bindings (experimental)";
@@ -423,10 +439,15 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("collect_vllm_nodes", &PyPhysicalPlanWrapper::collect_vllm_nodes, py::arg("conn") = py::none())
 	    .def("set_udf_actor_handles", &PyPhysicalPlanWrapper::set_udf_actor_handles, py::arg("handles_map"),
 	         py::arg("conn") = py::none())
+	    .def(
+	        "_validate_serializable_for_submission",
+	        [](const PyPhysicalPlanWrapper &p) { (void)p.serialize_root_for_clone(); },
+	        "Validate the physical root before distributed query registration.")
 	    .def(py::pickle(
 	        // __getstate__: serialize the plan
 	        [](const PyPhysicalPlanWrapper &p) {
-		        // If we have deferred serialized bytes, pass them through
+		        // An absent plan is an explicit optional state. A materialized
+		        // or deferred root must always carry a non-empty payload.
 		        if (!p.has_root()) {
 			        if (!p.serialized_root_.empty()) {
 				        return py::make_tuple(true, py::bytes(p.serialized_root_), p.query_id_, p.udf_registrations_,
@@ -436,32 +457,26 @@ void register_ray_bindings(py::module_ &mod) {
 			                              p.connection_snapshot_);
 		        }
 
-		        try {
-			        auto physical_plan = p.plan_->physical_plan();
-			        duckdb::MemoryStream stream;
-			        duckdb::SerializationOptions options;
-			        options.serialization_compatibility = duckdb::SerializationCompatibility::Latest();
-			        options.serialize_default_values = true;
-			        duckdb::BinarySerializer serializer(stream, options);
-			        serializer.Begin();
-			        physical_plan->Serialize(serializer);
-			        serializer.End();
-			        auto data_ptr = stream.GetData();
-			        auto data_size = stream.GetPosition();
-			        return py::make_tuple(true, py::bytes(reinterpret_cast<const char *>(data_ptr), data_size),
-			                              p.query_id_, p.udf_registrations_, p.udf_actor_handles_,
-			                              p.connection_snapshot_);
-		        } catch (const std::exception &ex) {
-			        return py::make_tuple(false, py::bytes(""), p.query_id_, p.udf_registrations_, p.udf_actor_handles_,
-			                              p.connection_snapshot_);
-		        }
+		        auto serialized_root = p.serialize_root_for_clone();
+		        return py::make_tuple(true, py::bytes(serialized_root), p.query_id_, p.udf_registrations_,
+		                              p.udf_actor_handles_, p.connection_snapshot_);
 	        },
 	        // __setstate__: store deferred bytes for later deserialization
 	        [](py::tuple t) {
-		        if (t.size() < 2) {
+		        if (t.size() < 2 || t.size() > 6) {
 			        throw duckdb::InternalException("Invalid state for PyPhysicalPlanWrapper pickle");
 		        }
 		        bool has_data = t[0].cast<bool>();
+		        py::bytes serialized = t[1].cast<py::bytes>();
+		        string data_str = serialized;
+		        if (has_data && data_str.empty()) {
+			        throw duckdb::InternalException(
+			            "Invalid PyPhysicalPlanWrapper pickle: serialized root is marked present but empty");
+		        }
+		        if (!has_data && !data_str.empty()) {
+			        throw duckdb::InternalException(
+			            "Invalid PyPhysicalPlanWrapper pickle: absent root carries serialized data");
+		        }
 		        string query_id;
 		        if (t.size() >= 3) {
 			        query_id = t[2].cast<string>();
@@ -483,14 +498,65 @@ void register_ray_bindings(py::module_ &mod) {
 		        RememberQueryUDFActorHandles(result.query_id_, result.udf_actor_handles_);
 
 		        if (has_data) {
-			        py::bytes serialized = t[1].cast<py::bytes>();
-			        string data_str = serialized;
-			        if (!data_str.empty()) {
-				        result.serialized_root_ = std::move(data_str);
-			        }
+			        result.serialized_root_ = std::move(data_str);
 		        }
 		        return result;
 	        }));
+
+	m.def(
+	    "_make_non_serializable_physical_plan_for_test",
+	    [](const string &query_id) {
+		    if (query_id.empty()) {
+			    throw duckdb::InternalException("test physical plan requires a non-empty query_id");
+		    }
+		    auto physical_plan = std::make_shared<duckdb::PhysicalPlan>(duckdb::Allocator::DefaultAllocator());
+		    auto &root = physical_plan->Make<PhysicalNonSerializableOperatorForTest>();
+		    physical_plan->SetRoot(root);
+		    uint16_t idx = duckdb::distributed::get_query_idx_counter().fetch_add(1);
+		    auto config = std::make_shared<duckdb::distributed::DuckDBExecutionConfig>(
+		        duckdb::distributed::DuckDBExecutionConfig::from_env());
+		    auto distributed_plan = std::make_shared<duckdb::distributed::DistributedPhysicalPlan>(
+		        idx, query_id, std::move(physical_plan), std::move(config));
+		    return PyPhysicalPlanWrapper(std::move(distributed_plan));
+	    },
+	    py::arg("query_id"), "Create an intentionally non-serializable physical plan for native tests.");
+
+	m.def(
+	    "_make_worker_task_for_test",
+	    [](bool has_plan, py::object query_id_obj) {
+		    duckdb::distributed::DuckPhysicalPlanRef physical_plan;
+		    if (has_plan) {
+			    physical_plan = std::make_shared<duckdb::PhysicalPlan>(duckdb::Allocator::DefaultAllocator());
+		    }
+		    auto config = std::make_shared<duckdb::distributed::DuckDBExecutionConfig>(
+		        duckdb::distributed::DuckDBExecutionConfig::from_env());
+		    std::unordered_map<string, string> context;
+		    if (!query_id_obj.is_none()) {
+			    context["query_id"] = query_id_obj.cast<string>();
+		    }
+		    duckdb::distributed::WorkerTask task(duckdb::distributed::TaskContext(), std::move(physical_plan),
+		                                         std::move(config), std::move(context), "WorkerTaskForTest");
+		    return RayWorkerTask(std::move(task));
+	    },
+	    py::arg("has_plan") = false, py::arg("query_id") = py::none(),
+	    "Create a worker task with explicit plan/query-id presence for native tests.");
+
+	m.def(
+	    "_submission_error_owner_query_id_for_test",
+	    [](const string &execution_query_id, py::object resource_query_id_obj) {
+		    std::unordered_map<string, string> context {{"query_id", execution_query_id}};
+		    if (!resource_query_id_obj.is_none()) {
+			    context["resource_query_id"] = resource_query_id_obj.cast<string>();
+		    }
+		    auto config = std::make_shared<duckdb::distributed::DuckDBExecutionConfig>(
+		        duckdb::distributed::DuckDBExecutionConfig::from_env());
+		    std::vector<duckdb::distributed::WorkerTask> tasks;
+		    tasks.emplace_back(duckdb::distributed::TaskContext(), duckdb::distributed::DuckPhysicalPlanRef(),
+		                       std::move(config), std::move(context), "SubmissionErrorOwnerForTest");
+		    return duckdb::distributed::python::ray::SubmissionErrorOwnerQueryId(tasks, execution_query_id);
+	    },
+	    py::arg("execution_query_id"), py::arg("resource_query_id") = py::none(),
+	    "Resolve the query that owns a retained submission exception.");
 
 	py::class_<PyLogicalPlan>(m, "PyLogicalPlan")
 	    .def_static("from_duckdb_relation",
