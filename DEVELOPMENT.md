@@ -90,8 +90,15 @@ clusters use a 2 GiB object store by default;
 not configure production clusters. Tests that call `ray.init()` directly must
 be marked `real_ray` and `ray_cluster_owner`.
 
-Tests that require an externally provisioned service are excluded by default. Run them explicitly when the required
-service and credentials are available:
+CI further splits the non-Ray phase across CPU-only jobs. The jobs install the
+built wheel, use CPU-only PyTorch, cap Ray task heap requests at 1 GiB, and set
+hard pytest-process and job deadlines so the suite fits a standard 4-vCPU,
+16-GiB GitHub-hosted runner. Tests marked `gpu` are excluded there because
+standard runners do not provide CUDA hardware; run the default launcher on a
+GPU host to include them.
+
+Tests that require an externally provisioned service are excluded by default.
+Run them explicitly when the required service and credentials are available:
 
 ```bash
 python -m pytest -m external_service tests/fast

@@ -4,54 +4,220 @@
 
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/run_fast_tests.sh [all|non-ray|shared-ray|owner-ray]
+
+Run the complete fast suite or one process-isolated phase.
+
+Environment variables:
+  VANE_FAST_TEST_EXCLUDE_GPU
+      Set to 1 to exclude tests marked gpu on CPU-only hosts.
+  VANE_FAST_TEST_JUNIT_DIR
+      Write one or more JUnit XML reports to this directory.
+  VANE_FAST_TEST_NON_RAY_SHARD_COUNT
+      Split the non-Ray phase into this many deterministic shards.
+  VANE_FAST_TEST_NON_RAY_SHARD_INDEX
+      Zero-based non-Ray shard index.
+  VANE_FAST_TEST_PROCESS_TIMEOUT_SECONDS
+      Apply a hard deadline to every pytest process (requires GNU timeout).
+EOF
+}
+
+phase="${1:-all}"
+if (($# > 1)); then
+  usage >&2
+  exit 2
+fi
+case "$phase" in
+  all | non-ray | shared-ray | owner-ray) ;;
+  -h | --help)
+    usage
+    exit
+    ;;
+  *)
+    printf 'Unknown fast-test phase: %s\n' "$phase" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$project_root"
+
+exclude_gpu="${VANE_FAST_TEST_EXCLUDE_GPU:-0}"
+case "$exclude_gpu" in
+  0) gpu_marker="" ;;
+  1) gpu_marker=" and not gpu" ;;
+  *)
+    printf 'VANE_FAST_TEST_EXCLUDE_GPU must be 0 or 1: %s\n' "$exclude_gpu" >&2
+    exit 2
+    ;;
+esac
+
+non_ray_shard_count="${VANE_FAST_TEST_NON_RAY_SHARD_COUNT:-1}"
+non_ray_shard_index="${VANE_FAST_TEST_NON_RAY_SHARD_INDEX:-0}"
+if [[ ! "$non_ray_shard_count" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'VANE_FAST_TEST_NON_RAY_SHARD_COUNT must be a positive integer: %s\n' "$non_ray_shard_count" >&2
+  exit 2
+fi
+if [[ ! "$non_ray_shard_index" =~ ^[0-9]+$ ]] || ((non_ray_shard_index >= non_ray_shard_count)); then
+  printf 'VANE_FAST_TEST_NON_RAY_SHARD_INDEX must be in [0, %d): %s\n' \
+    "$non_ray_shard_count" "$non_ray_shard_index" >&2
+  exit 2
+fi
+
+process_timeout_seconds="${VANE_FAST_TEST_PROCESS_TIMEOUT_SECONDS:-0}"
+if [[ ! "$process_timeout_seconds" =~ ^[0-9]+$ ]]; then
+  printf 'VANE_FAST_TEST_PROCESS_TIMEOUT_SECONDS must be a non-negative integer: %s\n' \
+    "$process_timeout_seconds" >&2
+  exit 2
+fi
+if ((process_timeout_seconds > 0)) && ! command -v timeout >/dev/null 2>&1; then
+  printf '%s\n' "VANE_FAST_TEST_PROCESS_TIMEOUT_SECONDS requires the GNU timeout command" >&2
+  exit 2
+fi
+
+junit_dir="${VANE_FAST_TEST_JUNIT_DIR:-}"
+if [[ -n "$junit_dir" ]]; then
+  mkdir -p "$junit_dir"
+  junit_dir="$(cd "$junit_dir" && pwd)"
+fi
+
 ray_object_store_bytes="$(
   PYTHONPATH="tests${PYTHONPATH:+:${PYTHONPATH}}" \
     python -c "from ray_test_profile import ray_test_object_store_bytes; print(ray_test_object_store_bytes())"
 )"
 
+run_pytest() {
+  if ((process_timeout_seconds > 0)); then
+    timeout \
+      --foreground \
+      --signal=INT \
+      --kill-after=30s \
+      "${process_timeout_seconds}s" \
+      python -m pytest "$@"
+  else
+    python -m pytest "$@"
+  fi
+}
+
+run_reported_pytest() {
+  local report_name="$1"
+  shift
+
+  local report_args=()
+  if [[ -n "$junit_dir" ]]; then
+    report_args+=("--junitxml=$junit_dir/$report_name.xml")
+  fi
+  run_pytest "${report_args[@]}" "$@"
+}
+
 run_ray_pytest() {
   VANE_TEST_RAY_OBJECT_STORE_BYTES="${ray_object_store_bytes}" \
-    python -m pytest "$@"
+    run_reported_pytest "$@"
 }
 
-# The pure suite gets a full process lifetime, so its Python/native heap is
-# returned to the OS before any Ray control-plane process is created.
-python -m pytest \
-  -m "not external_service and not real_ray" \
-  tests/fast
-
-# All tests in this shard connect to one session-owned Ray cluster.
-run_ray_pytest \
-  -m "not external_service and real_ray and not ray_cluster_owner" \
-  tests/fast
-
-# A cluster owner may start, stop, or kill its own Ray control plane. Collect
-# the checked markers once, then give every owner a fresh pytest OS process.
-owner_collection="$({
-  python -m pytest \
-    -o addopts= \
-    --collect-only \
-    -q \
-    -m "not external_service and real_ray and ray_cluster_owner" \
-    tests/fast
-} 2>&1)" || {
-  printf '%s\n' "${owner_collection}" >&2
-  exit 1
+collect_nodeids() {
+  local marker="$1"
+  local collection
+  collection="$({
+    PYTEST_ADDOPTS= run_pytest \
+      -o addopts= \
+      --collect-only \
+      -q \
+      -m "$marker" \
+      tests/fast
+  } 2>&1)" || {
+    printf '%s\n' "$collection" >&2
+    return 1
+  }
+  printf '%s\n' "$collection" | sed -n '/^tests\/fast\/.*::/p'
 }
 
-mapfile -t owner_nodeids < <(printf '%s\n' "${owner_collection}" | sed -n '/^tests\/fast\/.*::/p')
-if ((${#owner_nodeids[@]} == 0)); then
-  printf '%s\n' "No real-Ray cluster-owner tests were collected" >&2
-  exit 1
-fi
-
-owner_status=0
-for nodeid in "${owner_nodeids[@]}"; do
-  if ! run_ray_pytest \
-    -m "not external_service and real_ray and ray_cluster_owner" \
-    "${nodeid}"; then
-    owner_status=1
+run_non_ray_tests() {
+  local marker="not external_service and not real_ray${gpu_marker}"
+  if ((non_ray_shard_count == 1)); then
+    run_reported_pytest \
+      "non-ray" \
+      -m "$marker" \
+      tests/fast
+    return
   fi
-done
 
-exit "${owner_status}"
+  local collection
+  collection="$(collect_nodeids "$marker")"
+  if [[ -z "$collection" ]]; then
+    printf '%s\n' "No non-Ray fast tests were collected" >&2
+    return 1
+  fi
+  mapfile -t nodeids <<<"$collection"
+
+  local selected_nodeids=()
+  local position
+  for ((position = non_ray_shard_index; position < ${#nodeids[@]}; position += non_ray_shard_count)); do
+    selected_nodeids+=("${nodeids[position]}")
+  done
+
+  local report_name
+  printf -v report_name \
+    'non-ray-%02d-of-%02d' \
+    "$((non_ray_shard_index + 1))" \
+    "$non_ray_shard_count"
+  run_reported_pytest \
+    "$report_name" \
+    -m "$marker" \
+    "${selected_nodeids[@]}"
+}
+
+run_shared_ray_tests() {
+  run_ray_pytest \
+    "shared-ray" \
+    -m "not external_service and real_ray and not ray_cluster_owner${gpu_marker}" \
+    tests/fast
+}
+
+run_owner_ray_tests() {
+  local marker="not external_service and real_ray and ray_cluster_owner${gpu_marker}"
+  local collection
+  collection="$(collect_nodeids "$marker")"
+  if [[ -z "$collection" ]]; then
+    printf '%s\n' "No real-Ray cluster-owner tests were collected" >&2
+    return 1
+  fi
+  mapfile -t owner_nodeids <<<"$collection"
+
+  local owner_status=0
+  local owner_index=0
+  local nodeid
+  for nodeid in "${owner_nodeids[@]}"; do
+    owner_index=$((owner_index + 1))
+    local report_name
+    printf -v report_name 'owner-ray-%02d' "$owner_index"
+    if ! run_ray_pytest \
+      "$report_name" \
+      -m "$marker" \
+      "$nodeid"; then
+      owner_status=1
+    fi
+  done
+  return "$owner_status"
+}
+
+case "$phase" in
+  all)
+    # Keep the real Ray runtime out of the long-lived non-Ray pytest process.
+    run_non_ray_tests
+    run_shared_ray_tests
+    run_owner_ray_tests
+    ;;
+  non-ray)
+    run_non_ray_tests
+    ;;
+  shared-ray)
+    run_shared_ray_tests
+    ;;
+  owner-ray)
+    run_owner_ray_tests
+    ;;
+esac

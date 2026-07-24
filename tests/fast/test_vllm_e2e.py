@@ -8,7 +8,7 @@ import os
 import pytest
 from ray_test_profile import ray_test_object_store_bytes
 
-pytestmark = [pytest.mark.real_ray, pytest.mark.ray_cluster_owner]
+pytestmark = [pytest.mark.real_ray, pytest.mark.ray_cluster_owner, pytest.mark.gpu]
 
 
 def _explain_text(con, sql):
