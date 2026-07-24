@@ -832,6 +832,43 @@ def test_fte_task_execution_split_seal_wait_rechecks_after_clear():
     asyncio.run(asyncio.wait_for(execution._wait_for_fte_splits_sealed(), timeout=0.1))
 
 
+def test_fte_task_execution_terminal_status_refreshes_split_stats_with_fallback(monkeypatch):
+    async def execute_fn(_request):
+        return None
+
+    execution = FteTaskExecution(
+        {
+            "task_id": "q-terminal-stats.0.0.0",
+        },
+        execute_fn,
+        default_task_memory_bytes=1,
+    )
+    execution._last_split_queue_status = {
+        "completed_split_count": 0,
+        "completed_input_bytes": 0,
+    }
+    execution.status.state = FteTaskState.FAILED
+    refreshed_status = {
+        "completed_split_count": 1,
+        "completed_input_bytes": 128,
+    }
+    monkeypatch.setattr(execution, "split_queue_status", lambda: dict(refreshed_status))
+
+    terminal_status = execution.status_payload()
+
+    assert terminal_status["completed_split_count"] == 1
+    assert terminal_status["completed_input_bytes"] == 128
+    assert execution._last_split_queue_status == refreshed_status
+
+    def fail_split_queue_status():
+        raise RuntimeError("persistent native split status failure")
+
+    monkeypatch.setattr(execution, "split_queue_status", fail_split_queue_status)
+    fallback_status = execution.status_payload()
+    assert fallback_status["completed_split_count"] == 1
+    assert fallback_status["completed_input_bytes"] == 128
+
+
 def test_fte_query_status_uses_fragment_execution_snapshot():
     class _SnapshotOnlyFragmentExecution:
         @property
@@ -3835,8 +3872,11 @@ def test_fte_worker_task_manager_finalization_failure_is_terminal_and_releases_s
 
     async def execute_fn(request):
         task_id = str(FteTaskAttemptId.coerce(request["task_id"]))
-        if task_id == first_task_id and failure_point == "integer_conversion":
-            return ([], [{"num_rows": "not-an-integer", "size_bytes": 1}], None, [])
+        if task_id == first_task_id:
+            queue = request["fte_scan_source_queues"]["7"]
+            assert queue.try_get_next()["state"] == "SPLIT"
+            if failure_point == "integer_conversion":
+                return ([], [{"num_rows": "not-an-integer", "size_bytes": 1}], None, [])
         return {"ok": task_id}
 
     async def run():
@@ -3844,6 +3884,10 @@ def test_fte_worker_task_manager_finalization_failure_is_terminal_and_releases_s
         first_request = {
             "task_id": first_task_id,
             "fragment_id": "q-finalize:node:scan",
+            "dynamic_scan_source_node_ids": ["7"],
+            "initial_splits": {
+                "7": [{"sequence_id": 0, "kind": "scan_task", "data": b"finalization-input"}],
+            },
         }
         if failure_point == "file_stat":
             first_request["exchange_sink_instance"] = {"attempt_path": str(output_dir)}
@@ -3910,7 +3954,10 @@ def test_fte_worker_task_manager_finalization_failure_is_terminal_and_releases_s
         assert first_execution.result is None
         terminal_split_queue_status_calls = split_queue_status_calls
         if failure_point == "split_queue_status":
-            assert first_terminal["submitted_split_count"] == 0
+            assert first_terminal["submitted_split_count"] == 1
+            assert first_terminal["completed_split_count"] == 0
+        else:
+            assert first_terminal["completed_split_count"] == 1
 
         second_terminal = await asyncio.wait_for(
             _wait_for_terminal_task_status(manager, second_task_id, second_initial),
@@ -3923,9 +3970,86 @@ def test_fte_worker_task_manager_finalization_failure_is_terminal_and_releases_s
         assert manager.release_task_result(first_task_id)["state"] == FteTaskState.FAILED.value
         if failure_point == "split_queue_status":
             assert terminal_split_queue_status_calls > 0
-            assert split_queue_status_calls == terminal_split_queue_status_calls
+            assert split_queue_status_calls > terminal_split_queue_status_calls
         assert await manager.drop_query("q-finalize") == {"removed": 2, "canceled": 0}
         assert await manager.drop_query("q-finalize") == {"removed": 0, "canceled": 0}
+
+    asyncio.run(run())
+
+
+def test_fte_worker_task_manager_task_done_drains_after_status_publication_failure(monkeypatch):
+    first_task_id = "q-publish.0.0.0"
+    second_task_id = "q-publish.0.1.0"
+    release_first = asyncio.Event()
+
+    async def execute_fn(request):
+        task_id = str(FteTaskAttemptId.coerce(request["task_id"]))
+        if task_id == first_task_id:
+            await release_first.wait()
+        return {"ok": task_id}
+
+    async def run():
+        manager = _fte_worker_task_manager(execute_fn, max_running_tasks=1)
+        first_initial = await manager.create_task(
+            {
+                "task_id": first_task_id,
+                "fragment_id": "q-publish:node:scan",
+            }
+        )
+        first_execution = manager.tasks[first_task_id]
+        second_initial = await manager.create_task(
+            {
+                "task_id": second_task_id,
+                "fragment_id": "q-publish:node:scan",
+            }
+        )
+        assert second_initial["state"] == FteTaskState.QUEUED.value
+
+        original_task_done = manager._task_done
+        original_publish_status = manager._publish_status
+        inside_task_done = False
+        publication_failures = 0
+
+        def track_task_done(task_key, future):
+            nonlocal inside_task_done
+            inside_task_done = True
+            try:
+                return original_task_done(task_key, future)
+            finally:
+                inside_task_done = False
+
+        def fail_first_done_publication(execution):
+            nonlocal publication_failures
+            if inside_task_done and execution is first_execution:
+                publication_failures += 1
+                raise RuntimeError("planned terminal status publication failure")
+            return original_publish_status(execution)
+
+        monkeypatch.setattr(manager, "_task_done", track_task_done)
+        monkeypatch.setattr(manager, "_publish_status", fail_first_done_publication)
+        loop = asyncio.get_running_loop()
+        loop_errors = []
+        previous_exception_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        try:
+            release_first.set()
+            first_terminal = await asyncio.wait_for(
+                _wait_for_terminal_task_status(manager, first_task_id, first_initial),
+                timeout=2.0,
+            )
+            second_terminal = await asyncio.wait_for(
+                _wait_for_terminal_task_status(manager, second_task_id, second_initial),
+                timeout=2.0,
+            )
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_exception_handler)
+
+        assert first_terminal["state"] == FteTaskState.FINISHED.value
+        assert second_terminal["state"] == FteTaskState.FINISHED.value
+        assert publication_failures == 1
+        assert loop_errors == []
+        assert first_task_id not in manager.running_tasks
 
     asyncio.run(run())
 

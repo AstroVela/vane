@@ -392,8 +392,11 @@ class FteTaskExecution:
         with self._status_lock:
             status = self.status.to_dict()
             if self.status.state in _TERMINAL_STATES:
-                # Finalization may have failed in a native queue accessor.
-                split_queue_status = dict(self._last_split_queue_status)
+                try:
+                    split_queue_status = self._refresh_split_queue_status()
+                except Exception:
+                    # Finalization may have failed in a native queue accessor.
+                    split_queue_status = dict(self._last_split_queue_status)
             else:
                 split_queue_status = self._refresh_split_queue_status()
             status.update(split_queue_status)
@@ -1154,21 +1157,24 @@ class FteWorkerTaskManager:
         self.running_tasks.add(key)
         self._sync_udf_active_fte_fragment_tasks()
         execution.start()
-        self._publish_status(execution)
-        self._admission_debug_log("start_task", execution, reason=reason)
 
         def task_done(future: asyncio.Task[Any]) -> None:
             self._task_done(key, future)
 
         execution.add_done_callback(task_done)
+        self._publish_status(execution)
+        self._admission_debug_log("start_task", execution, reason=reason)
 
     def _task_done(self, task_key: str, _future: asyncio.Task[Any]) -> None:
         self.running_tasks.discard(task_key)
-        self._sync_udf_active_fte_fragment_tasks()
         execution = self.tasks.get(task_key)
         try:
-            if execution is not None:
-                self._publish_status(execution)
+            self._sync_udf_active_fte_fragment_tasks()
+            try:
+                if execution is not None:
+                    self._publish_status(execution)
+            except Exception:
+                pass
             self._admission_debug_log("task_done", execution)
         finally:
             self._drain_queue()
