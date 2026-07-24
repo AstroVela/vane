@@ -7,6 +7,7 @@ import asyncio
 import threading
 import time
 import uuid
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -646,7 +647,7 @@ def test_ray_query_driver_client_copy_refreshes_progress_and_uses_final_snapshot
         def result(self, timeout=None):
             if self.timeouts:
                 self.timeouts -= 1
-                raise TimeoutError
+                raise FutureTimeoutError
             return self.value
 
         def done(self):
