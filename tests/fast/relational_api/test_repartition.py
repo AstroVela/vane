@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
+import weakref
+
 import pytest
 
 import duckdb
@@ -69,6 +72,42 @@ def test_exchange_chain_executes_with_query_verification(duckdb_cursor, exchange
 
     assert relation.fetchall() == [(2,)]
     assert "PROJECTION" in relation.explain()
+
+
+@pytest.mark.parametrize(
+    ("exchange_method", "plan_node"),
+    [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
+)
+def test_exchange_relation_keeps_connection_alive(exchange_method, plan_node):
+    connection = duckdb.connect()
+    connection_ref = weakref.ref(connection)
+    source = connection.sql("SELECT i FROM range(3) data(i)")
+    derived = getattr(source, exchange_method)(2).project("i + 1 AS value")
+
+    del source
+    del connection
+    gc.collect()
+
+    assert connection_ref() is not None
+    assert plan_node in derived.explain()
+    assert sorted(derived.fetchall()) == [(1,), (2,), (3,)]
+
+
+@pytest.mark.parametrize("exchange_method", ["repartition", "local_exchange"])
+def test_exchange_relation_rejects_closed_connection(exchange_method):
+    connection = duckdb.connect()
+    connection_ref = weakref.ref(connection)
+    source = connection.sql("SELECT i FROM range(3) data(i)")
+    derived = getattr(source, exchange_method)(2)
+    connection.close()
+
+    del source
+    del connection
+    gc.collect()
+
+    assert connection_ref() is not None
+    with pytest.raises(duckdb.ConnectionException, match="Connection has already been closed"):
+        derived.fetchall()
 
 
 @pytest.mark.parametrize(

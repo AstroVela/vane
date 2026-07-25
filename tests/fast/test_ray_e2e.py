@@ -1813,6 +1813,9 @@ def test_ray_actor_lazy_row_backpressure_preserves_non_tail_batch_alignment(tmp_
             ) TO '{{input_path!s}}' (FORMAT PARQUET)
             '''
         )
+        # Keep deterministic input generation single-threaded without constraining
+        # the later distributed backpressure pipeline.
+        con.execute("RESET threads")
 
         def producer(table):
             return pa.table({{"id": table.column("id")}})
