@@ -41,7 +41,7 @@ def _import_video_dependency(module_name: str, package_name: str) -> ModuleType:
     except ImportError as exc:
         hint = "Please `pip install 'vane-ai[video]'` to use the video data source."
         if package_name == "decord":
-            hint += " The video extra installs decord on Linux x86-64 only."
+            hint += " The video extra installs decord on Linux x86-64, Vane's currently supported video platform."
         raise ImportError(f"The video data source requires the '{package_name}' package. {hint}") from exc
 
 

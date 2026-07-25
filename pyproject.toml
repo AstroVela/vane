@@ -76,7 +76,7 @@ vllm = [
 image = [ # ndarray image inputs for AI providers
     "pillow>=10",
 ]
-video = [ # video data source; decord ships prebuilt wheels for Linux x86-64 only
+video = [ # video data source; decord is gated to Vane's supported native platform (it lacks modern macOS/ARM wheels)
     "pillow>=10",
     "psutil>=5.9",
     "decord>=0.6; platform_system == 'Linux' and platform_machine == 'x86_64'",
