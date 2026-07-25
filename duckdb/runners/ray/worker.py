@@ -900,16 +900,22 @@ class RayWorkerActor:
             fte_result = await self._get_fte_task_manager().drop_query(query_id)
             fragments_removed = self.drop_query_fragments(query_id)
         finally:
-            drain_results = await asyncio.gather(
+            native_drain_result, flight_drain_result = await asyncio.gather(
                 self._wait_worker_native_executions_for_query(query_id),
                 _wait_flight_shuffle_executions_for_query(query_id),
                 return_exceptions=True,
             )
-            drain_errors = [result for result in drain_results if isinstance(result, BaseException)]
+            drain_errors = [
+                result for result in (native_drain_result, flight_drain_result) if isinstance(result, BaseException)
+            ]
+            if not isinstance(native_drain_result, BaseException):
+                try:
+                    _release_datasource_factories_for_query(query_id)
+                except Exception as error:
+                    drain_errors.append(error)
             if drain_errors:
                 details = "; ".join(f"{type(error).__name__}: {error}" for error in drain_errors)
-                raise RuntimeError(f"failed to drain native executions for {query_id}: {details}") from drain_errors[0]
-            _release_datasource_factories_for_query(query_id)
+                raise RuntimeError(f"failed to prepare query teardown for {query_id}: {details}") from drain_errors[0]
         if interrupt_errors:
             raise RuntimeError(
                 f"failed to interrupt {len(interrupt_errors)} native execution(s) for {query_id}: "

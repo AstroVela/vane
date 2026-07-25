@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import time
 import uuid
+import weakref
 from collections.abc import Iterator
 
 import _duckdb
@@ -146,6 +148,75 @@ class FailingSource(DataSource):
 
     def get_tasks(self) -> Iterator[DataSourceTask]:
         yield FailingTask()
+
+
+class SourceKeepaliveProbe(DataSource):
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    @property
+    def schema(self) -> dict[str, str]:
+        return {"value": "BIGINT"}
+
+    def get_tasks(self) -> Iterator[DataSourceTask]:
+        class SourceKeepaliveTask(DataSourceTask):
+            def __init__(self, path: str) -> None:
+                self.path = path
+
+            def execute(self) -> Iterator[pa.RecordBatch]:
+                with open(self.path, encoding="utf-8") as source_file:
+                    value = int(source_file.read())
+                yield pa.record_batch({"value": pa.array([value], type=pa.int64())})
+
+        yield SourceKeepaliveTask(self.path)
+
+    def __del__(self) -> None:
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass
+
+
+def test_datasource_relation_keeps_source_alive_until_relation_is_released(duckdb_conn, tmp_path):
+    source_path = tmp_path / "source-keepalive.txt"
+    source_path.write_text("42", encoding="utf-8")
+    source = SourceKeepaliveProbe(str(source_path))
+    source_ref = weakref.ref(source)
+
+    relation = read_datasource(source, con=duckdb_conn)
+    del source
+    gc.collect()
+
+    assert source_ref() is not None
+    assert source_path.exists()
+    assert relation.fetchall() == [(42,)]
+
+    del relation
+    gc.collect()
+    assert source_ref() is None
+    assert not source_path.exists()
+
+
+def test_ray_runner_keeps_source_alive_until_distributed_scan_finishes(ray_runner, duckdb_conn, tmp_path):
+    source_path = tmp_path / "distributed-source-keepalive.txt"
+    source_path.write_text("43", encoding="utf-8")
+    source = SourceKeepaliveProbe(str(source_path))
+    source_ref = weakref.ref(source)
+
+    relation = read_datasource(source, con=duckdb_conn, limit=1)
+    del source
+    gc.collect()
+
+    assert source_ref() is not None
+    assert source_path.exists()
+    result = _collect_tables(ray_runner, relation)
+    assert result.num_rows == 1
+    assert result.column(0).to_pylist() == [43]
+
+    del relation
+    gc.collect()
+    assert source_ref() is None
+    assert not source_path.exists()
 
 
 def test_datasource_factory_registry_churn_returns_to_baseline(duckdb_conn):

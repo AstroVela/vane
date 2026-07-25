@@ -89,17 +89,13 @@ static unique_ptr<FunctionData> DataSourceScanBind(ClientContext &context, Table
 		throw InvalidInputException(
 		    "Python datasource runtime is not initialized in this process; missing datasource schema callback");
 	}
-	ArrowSchema arrow_schema;
-	get_schema(pickled_source.c_str(), pickled_source.size(), &arrow_schema);
+	ArrowSchemaWrapper arrow_schema;
+	get_schema(pickled_source.c_str(), pickled_source.size(), &arrow_schema.arrow_schema);
 
 	// Parse Arrow schema into DuckDB types
-	ArrowTableFunction::PopulateArrowTableSchema(context, result->arrow_table, arrow_schema);
+	ArrowTableFunction::PopulateArrowTableSchema(context, result->arrow_table, arrow_schema.arrow_schema);
 	names = result->arrow_table.GetNames();
 	return_types = result->arrow_table.GetTypes();
-
-	if (arrow_schema.release) {
-		arrow_schema.release(&arrow_schema);
-	}
 
 	return std::move(result);
 }
@@ -123,25 +119,13 @@ static unique_ptr<GlobalTableFunctionState> DataSourceScanInitGlobal(ClientConte
 	result->total_tasks = bind_data.pickled_tasks.size();
 	result->next_task_idx = 0;
 
-	// Acquire one process-local factory owner for this execution. Local scan
-	// ownership follows the global state; distributed ownership follows the
-	// logical query and is released only after worker executions are drained.
+	// Resolve ownership callbacks before restoring schema, but do not acquire
+	// until schema restoration has passed every fallible initialization step.
 	auto acquire_source = g_global_acquire_source.load();
 	auto release_source = g_global_release_source.load();
 	if (!bind_data.pickled_source.empty() && (!acquire_source || !release_source)) {
 		throw InvalidInputException(
 		    "Python datasource runtime is not initialized on this Ray worker; missing datasource source callbacks");
-	}
-	if (acquire_source && release_source && !bind_data.pickled_source.empty()) {
-		if (bind_data.query_id.empty()) {
-			result->release_source = release_source;
-			result->pickled_source = bind_data.pickled_source;
-		}
-		acquire_source(bind_data.pickled_source.c_str(), bind_data.pickled_source.size(), bind_data.query_id.c_str(),
-		               bind_data.query_id.size());
-		if (bind_data.query_id.empty()) {
-			result->release_source_on_destroy = true;
-		}
 	}
 
 	// Restore arrow_table on worker nodes (type_info is not picklable).
@@ -151,14 +135,26 @@ static unique_ptr<GlobalTableFunctionState> DataSourceScanInitGlobal(ClientConte
 			throw InvalidInputException(
 			    "Python datasource runtime is not initialized on this Ray worker; missing datasource schema callback");
 		}
-		ArrowSchema arrow_schema;
-		get_schema_cb(bind_data.pickled_source.c_str(), bind_data.pickled_source.size(), &arrow_schema);
+		ArrowSchemaWrapper arrow_schema;
+		get_schema_cb(bind_data.pickled_source.c_str(), bind_data.pickled_source.size(), &arrow_schema.arrow_schema);
 		// Reset to empty so AddColumn's emplace() succeeds
 		const_cast<DataSourceScanBindData &>(bind_data).arrow_table = ArrowTableSchema();
 		ArrowTableFunction::PopulateArrowTableSchema(
-		    context, const_cast<DataSourceScanBindData &>(bind_data).arrow_table, arrow_schema);
-		if (arrow_schema.release) {
-			arrow_schema.release(&arrow_schema);
+		    context, const_cast<DataSourceScanBindData &>(bind_data).arrow_table, arrow_schema.arrow_schema);
+	}
+
+	// Acquire one process-local factory owner for this execution. Local scan
+	// ownership follows the global state; distributed ownership follows the
+	// logical query and is released only after worker executions are drained.
+	if (acquire_source && release_source && !bind_data.pickled_source.empty()) {
+		if (bind_data.query_id.empty()) {
+			result->release_source = release_source;
+			result->pickled_source = bind_data.pickled_source;
+		}
+		acquire_source(bind_data.pickled_source.c_str(), bind_data.pickled_source.size(), bind_data.query_id.c_str(),
+		               bind_data.query_id.size());
+		if (bind_data.query_id.empty()) {
+			result->release_source_on_destroy = true;
 		}
 	}
 

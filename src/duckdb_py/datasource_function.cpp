@@ -8,6 +8,7 @@
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb_python/pybind11/pybind_wrapper.hpp"
 #include "duckdb_python/pyconnection/pyconnection.hpp"
+#include "duckdb_python/python_dependency.hpp"
 
 #include <algorithm>
 #include <condition_variable>
@@ -381,15 +382,22 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &sour
 	// TryBindRelation() which triggers DataSourceScanBind → GetSchema callback,
 	// which needs the GIL to call arrow_schema._export_to_c().
 	auto rel = connection.TableFunction("datasource_scan", std::move(params));
+	auto aliased_rel = rel->Alias(name);
+	auto dependency = make_uniq<ExternalDependency>();
+	dependency->AddDependency("datasource", PythonDependencyItem::Create(source));
+	aliased_rel->AddExternalDependency(std::move(dependency));
 	{
 		std::lock_guard<std::mutex> lock(g_factory_mutex);
 		g_last_created_source_id = source_id;
 	}
 
-	return make_uniq<DuckDBPyRelation>(rel->Alias(name));
+	return make_uniq<DuckDBPyRelation>(std::move(aliased_rel));
 }
 
 void ClearDataSourceFactoryRegistry() {
+	if (!Py_IsInitialized() || PythonIsFinalizing()) {
+		return;
+	}
 	PythonGILWrapper acquire;
 	std::unordered_map<string, shared_ptr<DataSourceFactoryRegistryEntry>> released_entries;
 	{
@@ -401,6 +409,9 @@ void ClearDataSourceFactoryRegistry() {
 }
 
 idx_t ReleaseDataSourceFactoriesForQuery(const string &query_id) {
+	if (!Py_IsInitialized() || PythonIsFinalizing()) {
+		return 0;
+	}
 	if (query_id.empty()) {
 		throw InvalidInputException("Datasource distributed query ID must not be empty");
 	}
