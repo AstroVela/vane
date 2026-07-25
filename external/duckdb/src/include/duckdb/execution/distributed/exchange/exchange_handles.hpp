@@ -41,10 +41,14 @@ struct ExchangeSinkHandle {
 struct ExchangeSinkInstanceHandle {
 	ExchangeSinkHandle sink_handle;
 	idx_t attempt_id = 0;
+	/// Query that owns this concrete attempt.
+	std::string query_id;
 	/// Implementation-specific: output directory (Spooling),
 	/// Flight server address (Flight), etc.
 	std::string output_location;
 	idx_t output_partition_count = 0;
+	/// Process-local Flight service incarnation that published this attempt.
+	std::string flight_server_epoch;
 };
 
 // ─── Source Handles ──────────────────────────────────────
@@ -69,6 +73,7 @@ struct ExchangeSourceHandle {
 	idx_t attempt_id = 0;
 	std::string node_id;
 	int flight_port = 0;
+	std::string flight_server_epoch;
 	std::vector<ExchangeSourceFile> files;
 };
 

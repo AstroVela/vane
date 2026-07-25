@@ -81,12 +81,14 @@ class RayWorkerActorHandle(
         self._fte_control_query_by_task: dict[str, str] = {}
         self._fte_control_operation_by_task: dict[str, str] = {}
         self._fte_drop_incomplete_queries: set[str] = set()
+        self._fte_prepare_terminal_errors: dict[str, BaseException] = {}
         self._fragment_drop_incomplete_queries: set[str] = set()
+        self._worker_shutdown_started = False
         with _FTE_REGISTRY_LOCK:
             _FTE_WORKER_HANDLES[worker_id] = self
 
     @staticmethod
-    def _fte_task_handle_cls():
+    def _fte_task_handle_cls() -> type[Any]:
         # Lazy import to avoid a module import cycle with driver.py.
         from duckdb.runners.ray.driver import FteWorkerTaskHandle
 

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -160,6 +162,8 @@ class _FakeActor:
         self.fte_release_task_result = _FakeRemoteMethod(self._fte_release_task_result)
         self.fte_cancel_task = _FakeRemoteMethod(self._fte_cancel_task)
         self.fte_drop_query = _FakeRemoteMethod(self._fte_drop_query)
+        self.fte_prepare_drop_query = _FakeRemoteMethod(self._fte_drop_query)
+        self.fte_cleanup_query = _FakeRemoteMethod(self._fte_cleanup_query)
 
     def _register_fragments(self, payload):
         self.register_payloads.append(payload)
@@ -239,6 +243,10 @@ class _FakeActor:
     def _fte_drop_query(self, query_id):
         self.fte_calls.append(("drop_query", query_id))
         return {"tasks_removed": 1, "tasks_canceled": 0, "fragments_removed": 2}
+
+    def _fte_cleanup_query(self, query_id):
+        self.fte_calls.append(("cleanup_query", query_id))
+        return {}
 
 
 class _FakeFteTaskHandle:
@@ -838,6 +846,7 @@ def test_fte_worker_actor_handle_wraps_control_rpcs():
         "release",
         "cancel",
         "drop_query",
+        "cleanup_query",
     ]
     assert handle._registered_fragment_ids == {"other:node:b"}
 
@@ -1013,6 +1022,16 @@ def test_fte_control_barrier_rejects_contradictory_status_identities(monkeypatch
 
     with pytest.raises(RuntimeError, match="status identity mismatch"):
         handle.close_and_flush_fte_controls("q-control-identity")
+    assert handle._has_fte_teardown_state_for_query("q-control-identity") is True
+    with pytest.raises(RuntimeError, match="old generation state"):
+        worker_handle_mod.open_fte_registry_for_query("q-control-identity")
+
+    # A real teardown clears the terminal error after remote storage cleanup.
+    # This focused barrier test has no cleanup endpoint, so release its
+    # deliberately retained ownership before reopening the global test state.
+    with handle._fte_control_lock:
+        handle._fte_prepare_terminal_errors.pop("q-control-identity")
+    worker_handle_mod.open_fte_registry_for_query("q-control-identity")
 
 
 def test_worker_control_status_rejects_contradictory_status_identities():
@@ -1168,7 +1187,7 @@ def test_remote_drop_timeout_retains_fence_and_local_generation(monkeypatch):
     query_id = "query-remote-drop-timeout-fence"
     future = _DeferredFuture()
     actor = _FakeActor()
-    actor.fte_drop_query = _DeferredDrop(_DeferredRef(future))
+    actor.fte_prepare_drop_query = _DeferredDrop(_DeferredRef(future))
     handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
     fragment_id = f"{query_id}:node:1"
     with handle._fragment_registration_lock:
@@ -1253,7 +1272,7 @@ def test_pending_teardown_on_one_worker_does_not_block_drop_fanout(monkeypatch):
     pending_future = _DeferredFuture()
     pending_ref = _Ref(pending_future)
     actor1 = _FakeActor()
-    actor1.fte_drop_query = _DropMethod(pending_ref)
+    actor1.fte_prepare_drop_query = _DropMethod(pending_ref)
     actor2 = _FakeActor()
     handle1 = RayWorkerActorHandle(
         actor1,
@@ -1281,7 +1300,7 @@ def test_pending_teardown_on_one_worker_does_not_block_drop_fanout(monkeypatch):
         "tasks_canceled": 0,
         "fragments_removed": 2,
     }
-    assert actor1.fte_drop_query.calls == [query_id]
+    assert actor1.fte_prepare_drop_query.calls == [query_id]
     assert [call for call in actor2.fte_calls if call[0] == "drop_query"] == [("drop_query", query_id)]
 
     pending_future.complete({"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0})
@@ -1383,6 +1402,97 @@ def test_pending_control_barrier_does_not_submit_remote_drop(monkeypatch):
     worker_handle_mod.open_fte_registry_for_query(query_id)
 
 
+def test_terminal_control_failure_survives_simultaneous_pending_control(monkeypatch):
+    class _FailedFuture:
+        def result(self, timeout=None):
+            raise RuntimeError("planned terminal control failure")
+
+    class _PendingFuture:
+        def __init__(self):
+            self.value = None
+
+        def result(self, timeout=None):
+            if self.value is None:
+                raise TimeoutError("planned pending control")
+            return self.value
+
+        def complete(self, value):
+            self.value = value
+
+    class _Ref:
+        def __init__(self, future):
+            self._future = future
+
+        def future(self):
+            return self._future
+
+    class _AckMethod:
+        def __init__(self, failed_ref, pending_ref):
+            self.failed_ref = failed_ref
+            self.pending_ref = pending_ref
+
+        def remote(self, task_id, *_args):
+            if int(task_id["partition_id"]) == 0:
+                return self.failed_ref
+            return self.pending_ref
+
+    query_id = "query-terminal-and-pending-control"
+    failed_task_id = {
+        "query_id": query_id,
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+    }
+    pending_task_id = {
+        "query_id": query_id,
+        "fragment_execution_id": 0,
+        "partition_id": 1,
+        "attempt_id": 0,
+    }
+    pending_future = _PendingFuture()
+    actor = _FakeActor()
+    actor.fte_ack_task_result = _AckMethod(_Ref(_FailedFuture()), _Ref(pending_future))
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    handle.enqueue_fte_ack_task_result(failed_task_id)
+    handle.enqueue_fte_ack_task_result(pending_task_id)
+
+    def resolve(refs, **_kwargs):
+        if isinstance(refs, list):
+            return [ref.future().result() for ref in refs]
+        return refs.future().result()
+
+    monkeypatch.setattr(
+        task_control_mod,
+        "resolve_object_refs_blocking",
+        resolve,
+    )
+
+    with pytest.raises(
+        task_control_mod.FteControlBarrierPendingError,
+        match="retained pending control ownership",
+    ):
+        handle.fte_drop_query(query_id)
+
+    assert [call for call in actor.fte_calls if call[0] == "drop_query"] == []
+    pending_future.complete(
+        {
+            "state": "FINISHED",
+            "task_id": pending_task_id,
+            "_fte_control_operation": "fte_ack_task_result",
+            "_fte_control_applied": True,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="planned terminal control failure"):
+        handle.fte_drop_query(query_id)
+
+    assert [call for call in actor.fte_calls if call[0] == "drop_query"] == [("drop_query", query_id)]
+    assert [call for call in actor.fte_calls if call[0] == "cleanup_query"] == [("cleanup_query", query_id)]
+    assert handle._has_fte_control_state_for_query(query_id) is False
+    assert handle._has_fte_teardown_state_for_query(query_id) is False
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
 def test_terminal_failed_control_allows_drop_and_clears_ownership(monkeypatch):
     class _FailedFuture:
         def result(self, timeout=None):
@@ -1431,6 +1541,78 @@ def test_terminal_failed_control_allows_drop_and_clears_ownership(monkeypatch):
 
     assert original_drop_ref is actor.fte_drop_query
     assert [call for call in actor.fte_calls if call[0] == "drop_query"] == [("drop_query", query_id)]
+    assert handle._has_fte_control_state_for_query(query_id) is False
+    assert handle._has_fte_teardown_state_for_query(query_id) is False
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+def test_terminal_control_failure_survives_retryable_remote_drop_failure(monkeypatch):
+    monkeypatch.setenv("VANE_FTE_CONTROL_RPC_MAX_ATTEMPTS", "1")
+
+    class _FailedFuture:
+        def result(self, timeout=None):
+            raise RuntimeError("planned terminal control failure")
+
+    class _Ref:
+        def future(self):
+            return _FailedFuture()
+
+    class _AckMethod:
+        def remote(self, *_args):
+            return _Ref()
+
+    class _FailOnceActor(_FakeActor):
+        def __init__(self):
+            super().__init__()
+            self.fail_once = True
+
+        def _fte_drop_query(self, query_id):
+            self.fte_calls.append(("drop_query", query_id))
+            if self.fail_once:
+                self.fail_once = False
+                raise RuntimeError("planned remote drop failure")
+            return {
+                "tasks_removed": 1,
+                "tasks_canceled": 0,
+                "fragments_removed": 2,
+            }
+
+    query_id = "query-terminal-control-with-retryable-drop"
+    task_id = {
+        "query_id": query_id,
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+    }
+    actor = _FailOnceActor()
+    actor.fte_ack_task_result = _AckMethod()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    handle.enqueue_fte_ack_task_result(task_id)
+
+    def resolve(refs, **_kwargs):
+        if isinstance(refs, list):
+            raise RuntimeError("planned terminal control failure")
+        return refs.future().result()
+
+    monkeypatch.setattr(
+        task_control_mod,
+        "resolve_object_refs_blocking",
+        resolve,
+    )
+
+    with pytest.raises(RuntimeError, match="planned remote drop failure"):
+        handle.fte_drop_query(query_id)
+
+    assert handle._has_fte_teardown_state_for_query(query_id) is True
+
+    with pytest.raises(RuntimeError, match="planned terminal control failure"):
+        handle.fte_drop_query(query_id)
+
+    assert [call for call in actor.fte_calls if call[0] == "drop_query"] == [
+        ("drop_query", query_id),
+        ("drop_query", query_id),
+    ]
+    assert [call for call in actor.fte_calls if call[0] == "cleanup_query"] == [("cleanup_query", query_id)]
     assert handle._has_fte_control_state_for_query(query_id) is False
     assert handle._has_fte_teardown_state_for_query(query_id) is False
     worker_handle_mod.open_fte_registry_for_query(query_id)
@@ -2003,6 +2185,9 @@ def test_worker_flight_shuffle_cleanup_helper_uses_cxx_binding(monkeypatch):
                 "registry_entries_removed": 2,
                 "storage_entries_removed": 7,
                 "cleanup_errors": 0,
+                "cleanup_pending": 0,
+                "active_executions": 0,
+                "last_error": "",
             }
 
         return _cleanup
@@ -2015,8 +2200,153 @@ def test_worker_flight_shuffle_cleanup_helper_uses_cxx_binding(monkeypatch):
         "registry_entries_removed": 2,
         "storage_entries_removed": 7,
         "cleanup_errors": 0,
+        "cleanup_pending": 0,
+        "active_executions": 0,
+        "last_error": "",
     }
     assert calls == [("query-drop", "Ensure the C++ ray extension is built with Flight shuffle cleanup support.")]
+
+
+def test_worker_flight_shuffle_cleanup_drain_retries_pending_work(monkeypatch):
+    cleanups = iter(
+        [
+            {
+                "registry_entries_removed": 2,
+                "storage_entries_removed": 0,
+                "cleanup_errors": 1,
+                "cleanup_pending": 1,
+                "active_executions": 1,
+            },
+            {
+                "registry_entries_removed": 0,
+                "storage_entries_removed": 7,
+                "cleanup_errors": 0,
+                "cleanup_pending": 0,
+                "active_executions": 0,
+            },
+        ]
+    )
+    monkeypatch.setattr(worker_mod, "_cleanup_flight_shuffle_for_query", lambda _query_id: next(cleanups))
+
+    result = asyncio.run(worker_mod._drain_flight_shuffle_for_query("query-drop", timeout_s=1))
+
+    assert result == {
+        "registry_entries_removed": 2,
+        "storage_entries_removed": 7,
+        "cleanup_errors": 0,
+        "cleanup_pending": 0,
+        "active_executions": 0,
+    }
+
+
+def test_worker_flight_shuffle_cleanup_timeout_reports_storage_error(monkeypatch):
+    monkeypatch.setattr(
+        worker_mod,
+        "_cleanup_flight_shuffle_for_query",
+        lambda _query_id: {
+            "registry_entries_removed": 0,
+            "storage_entries_removed": 0,
+            "cleanup_errors": 1,
+            "cleanup_pending": 1,
+            "active_executions": 0,
+            "last_error": "permission denied",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="last_error='permission denied'"):
+        asyncio.run(worker_mod._drain_flight_shuffle_for_query("query-drop", timeout_s=0))
+
+
+def test_worker_drop_query_uses_separate_execution_and_storage_barriers(monkeypatch):
+    events: list[str] = []
+
+    class TaskManager:
+        async def drop_query(self, query_id):
+            assert query_id == "query-drop"
+            events.append("cancel")
+            return {"removed": 2, "canceled": 1}
+
+    class DummyWorker:
+        @staticmethod
+        def _get_fte_task_manager():
+            return TaskManager()
+
+        @staticmethod
+        def drop_query_fragments(query_id):
+            assert query_id == "query-drop"
+            events.append("fragments")
+            return 3
+
+        @staticmethod
+        def _close_worker_native_query(query_id):
+            assert query_id == "query-drop"
+            events.append("native-close")
+            return []
+
+        @staticmethod
+        async def _wait_worker_native_executions_for_query(query_id):
+            assert query_id == "query-drop"
+            events.append("worker-wait")
+
+        @staticmethod
+        def _retire_worker_native_query(query_id):
+            assert query_id == "query-drop"
+            events.append("native-retire")
+
+    def close(query_id):
+        assert query_id == "query-drop"
+        events.append("close")
+
+    async def wait_for_executions(query_id):
+        assert query_id == "query-drop"
+        events.append("flight-wait")
+
+    async def drain(query_id):
+        assert query_id == "query-drop"
+        events.append("drain")
+        return {
+            "registry_entries_removed": 4,
+            "storage_entries_removed": 5,
+            "cleanup_errors": 0,
+            "cleanup_pending": 0,
+            "active_executions": 0,
+            "last_error": "",
+        }
+
+    def retire(query_id):
+        assert query_id == "query-drop"
+        events.append("retire")
+
+    monkeypatch.setattr(worker_mod, "_close_flight_shuffle_query", close)
+    monkeypatch.setattr(worker_mod, "_wait_flight_shuffle_executions_for_query", wait_for_executions)
+    monkeypatch.setattr(worker_mod, "_drain_flight_shuffle_for_query", drain)
+    monkeypatch.setattr(worker_mod, "_retire_flight_shuffle_query", retire)
+    actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+
+    prepare_result = asyncio.run(actor_class.fte_prepare_drop_query(DummyWorker(), "query-drop"))
+    cleanup_result = asyncio.run(actor_class.fte_cleanup_query(DummyWorker(), "query-drop"))
+    result = dict(prepare_result)
+    result.update(cleanup_result)
+
+    assert events == [
+        "close",
+        "native-close",
+        "cancel",
+        "fragments",
+        "worker-wait",
+        "flight-wait",
+        "drain",
+        "retire",
+        "native-retire",
+    ]
+    assert result == {
+        "tasks_removed": 2,
+        "tasks_canceled": 1,
+        "fragments_removed": 3,
+        "flight_shuffle_registry_entries_removed": 4,
+        "flight_shuffle_storage_entries_removed": 5,
+        "flight_shuffle_cleanup_errors": 0,
+    }
 
 
 def test_fte_control_rpc_retries_transient_failure(monkeypatch):
@@ -7458,12 +7788,25 @@ def test_submit_tasks_extracts_exchange_source_task_inputs(monkeypatch):
 
 
 def test_ray_worker_actor_class_cloudpickle_roundtrip():
-    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    script = """
+import ray
 
-    payload = ray.cloudpickle.dumps(actor_cls)
-    restored = ray.cloudpickle.loads(payload)
+from duckdb.runners.ray import worker as worker_mod
 
-    assert restored.__name__ == actor_cls.__name__
+actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+payload = ray.cloudpickle.dumps(actor_cls)
+restored = ray.cloudpickle.loads(payload)
+assert restored.__name__ == actor_cls.__name__
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_ray_worker_fte_admission_log_uses_worker_id(monkeypatch, capsys):
@@ -7730,6 +8073,10 @@ def test_start_ray_workers_skips_blocking_warmup_inside_ray_worker(monkeypatch):
 def test_execute_native_task_passes_exchange_and_sink_inputs():
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
+    actor._native_execution_condition = threading.Condition()
+    actor._active_native_cursors = set()
+    actor._native_cursor_query_ids = {}
+    actor._closing_native_queries = set()
     calls = []
 
     class _FakeCursor:
@@ -7828,6 +8175,10 @@ def test_execute_native_task_passes_exchange_and_sink_inputs():
 def test_execute_native_task_uses_shared_database_for_fte():
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
+    actor._native_execution_condition = threading.Condition()
+    actor._active_native_cursors = set()
+    actor._native_cursor_query_ids = {}
+    actor._closing_native_queries = set()
     calls = []
     closed = []
 

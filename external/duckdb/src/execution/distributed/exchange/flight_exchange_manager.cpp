@@ -18,6 +18,7 @@
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/function/table/arrow.hpp"
@@ -31,31 +32,27 @@
 #include <algorithm>
 #include <mutex>
 #include <sstream>
-#include <unordered_set>
 
 namespace duckdb {
 namespace distributed {
 
 namespace {
 
-std::mutex &LocalFlightServerMutex() {
-	static std::mutex mutex;
-	return mutex;
-}
+struct LocalFlightServiceState {
+	std::mutex mutex;
+	std::unique_ptr<FlightServer> server;
+	std::string bind_host;
+	int requested_port = 0;
+	int actual_port = 0;
+	std::string server_epoch;
+};
 
-std::unique_ptr<FlightServer> &LocalFlightServerInstance() {
-	static std::unique_ptr<FlightServer> server;
-	return server;
-}
-
-std::string &LocalFlightServerNodeId() {
-	static std::string node_id;
-	return node_id;
-}
-
-int &LocalFlightServerPort() {
-	static int port = 0;
-	return port;
+LocalFlightServiceState &LocalFlightService() {
+	// The service can call into the catalog until its server thread joins.
+	// Construct the catalog first so static teardown destroys the service first.
+	(void)ShuffleCacheRegistry::Instance();
+	static LocalFlightServiceState service;
+	return service;
 }
 
 std::string BuildFlightLocation(const FlightExchangeConfig &config, const std::string &node_id) {
@@ -235,7 +232,7 @@ DuckDBResult<std::unique_ptr<arrow::flight::FlightClient>> ConnectFlightExchange
 	return DuckDBResult<std::unique_ptr<arrow::flight::FlightClient>>::ok(std::move(client_res).ValueOrDie());
 }
 
-DuckDBResult<void> EnsureLocalFlightServerStarted(const FlightExchangeConfig &config) {
+DuckDBResult<void> EnsureLocalFlightServerStartedInternal(const FlightExchangeConfig &config) {
 	if (config.local_dirs.empty()) {
 		return DuckDBResult<void>::ok();
 	}
@@ -243,47 +240,70 @@ DuckDBResult<void> EnsureLocalFlightServerStarted(const FlightExchangeConfig &co
 		return DuckDBResult<void>::ok();
 	}
 
-	auto &server_mutex = LocalFlightServerMutex();
-	auto &server = LocalFlightServerInstance();
-	auto &started_node_id = LocalFlightServerNodeId();
-	auto &started_port = LocalFlightServerPort();
-	std::lock_guard<std::mutex> guard(server_mutex);
-	if (server && started_node_id == config.node_id) {
-		return DuckDBResult<void>::ok();
-	}
-	if (server && started_node_id != config.node_id) {
-		auto stop_res = server->Stop();
-		server.reset();
-		started_port = 0;
-		if (stop_res.is_err()) {
-			return stop_res;
+	auto &service = LocalFlightService();
+	std::lock_guard<std::mutex> guard(service.mutex);
+	if (service.server) {
+		if (service.bind_host != config.flight_bind_host || service.requested_port != config.flight_port) {
+			std::ostringstream message;
+			message << "process-local Flight service already listens on requested address " << service.bind_host << ":"
+			        << service.requested_port << " (actual port " << service.actual_port
+			        << "); refusing conflicting address " << config.flight_bind_host << ":" << config.flight_port;
+			return DuckDBResult<void>::err(DuckDBError::invalid_state_error(message.str()));
 		}
+		return DuckDBResult<void>::ok();
 	}
 
 	FlightServerConfig server_config;
 	server_config.bind_host = config.flight_bind_host;
 	server_config.port = config.flight_port;
-	server_config.local_dirs = config.local_dirs;
-	server = std::unique_ptr<FlightServer>(new FlightServer(std::move(server_config)));
+	server_config.server_epoch = UUID::ToString(UUID::GenerateRandomUUID());
+	auto server = std::unique_ptr<FlightServer>(new FlightServer(server_config));
 	auto start_res = server->Start();
 	if (start_res.is_err()) {
-		server.reset();
 		return start_res;
 	}
-	started_node_id = config.node_id;
-	started_port = server->port();
+	service.bind_host = config.flight_bind_host;
+	service.requested_port = config.flight_port;
+	service.actual_port = server->port();
+	service.server_epoch = std::move(server_config.server_epoch);
+	service.server = std::move(server);
 	return DuckDBResult<void>::ok();
 }
 
 int CurrentLocalFlightServerPort() {
-	auto &server_mutex = LocalFlightServerMutex();
-	std::lock_guard<std::mutex> guard(server_mutex);
-	return LocalFlightServerPort();
+	auto &service = LocalFlightService();
+	std::lock_guard<std::mutex> guard(service.mutex);
+	return service.actual_port;
 }
 
-std::string BuildSinkOutputLocation(const ExchangeContext &ctx, const ExchangeSinkHandle &handle, idx_t attempt_id) {
+std::string CurrentLocalFlightServerEpoch() {
+	auto &service = LocalFlightService();
+	std::lock_guard<std::mutex> guard(service.mutex);
+	return service.server_epoch;
+}
+
+DuckDBResult<void> ShutdownLocalFlightServerInternal() {
+	auto &service = LocalFlightService();
+	std::lock_guard<std::mutex> guard(service.mutex);
+	if (!service.server) {
+		return DuckDBResult<void>::ok();
+	}
+	auto stop_res = service.server->Stop();
+	if (stop_res.is_err()) {
+		return stop_res;
+	}
+	service.server.reset();
+	service.bind_host.clear();
+	service.requested_port = 0;
+	service.actual_port = 0;
+	service.server_epoch.clear();
+	return DuckDBResult<void>::ok();
+}
+
+std::string BuildSinkOutputLocation(const std::string &exchange_instance_id, const ExchangeSinkHandle &handle,
+                                    idx_t attempt_id) {
 	std::ostringstream ss;
-	ss << ctx.exchange_id << "__sink_" << handle.task_partition_id << "__attempt_" << attempt_id;
+	ss << exchange_instance_id << "__sink_" << handle.task_partition_id << "__attempt_" << attempt_id;
 	return ss.str();
 }
 
@@ -293,7 +313,8 @@ std::string BuildSinkOutputLocation(const ExchangeContext &ctx, const ExchangeSi
 
 FlightExchange::FlightExchange(const ExchangeContext &ctx, idx_t output_partition_count,
                                const FlightExchangeConfig &config, ClientContext *context)
-    : ctx_(ctx), output_partition_count_(output_partition_count), config_(config), context_(context) {
+    : ctx_(ctx), output_partition_count_(output_partition_count), config_(config), context_(context),
+      exchange_instance_id_(UUID::ToString(UUID::GenerateRandomUUID())) {
 }
 
 FlightExchange::~FlightExchange() {
@@ -302,16 +323,28 @@ FlightExchange::~FlightExchange() {
 
 ExchangeSinkHandle FlightExchange::AddSink(idx_t task_partition_id) {
 	std::lock_guard<std::mutex> lock(mutex_);
-	all_sinks_.push_back(task_partition_id);
+	if (closed_) {
+		throw InvalidInputException("Flight exchange is closed");
+	}
+	if (std::find(all_sinks_.begin(), all_sinks_.end(), task_partition_id) == all_sinks_.end()) {
+		all_sinks_.push_back(task_partition_id);
+	}
 	return ExchangeSinkHandle {task_partition_id};
 }
 
 ExchangeSinkInstanceHandle FlightExchange::InstantiateSink(const ExchangeSinkHandle &handle, idx_t attempt_id) {
 	std::lock_guard<std::mutex> lock(mutex_);
+	if (closed_) {
+		throw InvalidInputException("Flight exchange is closed");
+	}
+	if (std::find(all_sinks_.begin(), all_sinks_.end(), handle.task_partition_id) == all_sinks_.end()) {
+		throw InvalidInputException("Flight sink partition was not registered");
+	}
 	ExchangeSinkInstanceHandle instance;
 	instance.sink_handle = handle;
 	instance.attempt_id = attempt_id;
-	instance.output_location = BuildSinkOutputLocation(ctx_, handle, attempt_id);
+	instance.query_id = ctx_.query_id;
+	instance.output_location = BuildSinkOutputLocation(exchange_instance_id_, handle, attempt_id);
 	instance.output_partition_count = output_partition_count_;
 	auto &attempt_metadata = sink_attempts_[handle.task_partition_id][attempt_id];
 	attempt_metadata.task_partition_id = handle.task_partition_id;
@@ -326,20 +359,97 @@ void FlightExchange::SinkFinished(const ExchangeSinkHandle &handle, idx_t attemp
 
 void FlightExchange::SinkFinished(const ExchangeSinkHandle &handle, idx_t attempt_id, const std::string &node_id,
                                   int flight_port) {
+	ExchangeSinkInstanceHandle instance;
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (closed_) {
+			throw InvalidInputException("Flight exchange is closed");
+		}
+		auto sink_entry = sink_attempts_.find(handle.task_partition_id);
+		if (sink_entry == sink_attempts_.end()) {
+			throw InvalidInputException("finished Flight sink partition was not instantiated");
+		}
+		auto attempt_entry = sink_entry->second.find(attempt_id);
+		if (attempt_entry == sink_entry->second.end()) {
+			throw InvalidInputException("finished Flight sink attempt was not instantiated");
+		}
+		instance.sink_handle = handle;
+		instance.attempt_id = attempt_id;
+		instance.query_id = ctx_.query_id;
+		instance.output_location = attempt_entry->second.output_location;
+		instance.output_partition_count = output_partition_count_;
+	}
+	SinkFinished(instance, node_id, flight_port);
+}
+
+void FlightExchange::SinkFinished(const ExchangeSinkInstanceHandle &instance, const std::string &node_id,
+                                  int flight_port) {
+	if (instance.query_id != ctx_.query_id) {
+		throw InvalidInputException("finished Flight sink query does not match its exchange");
+	}
+	if (instance.output_partition_count != output_partition_count_) {
+		throw InvalidInputException("finished Flight sink partition count does not match its exchange");
+	}
+	if (flight_port < 0) {
+		throw InvalidInputException("finished Flight sink port must be non-negative");
+	}
+	if (flight_port > 0 && node_id.empty()) {
+		throw InvalidInputException("finished Flight sink is missing its worker node id");
+	}
+	if (flight_port > 0 && instance.flight_server_epoch.empty()) {
+		throw InvalidInputException("finished Flight sink is missing its server epoch");
+	}
 	bool cleanup_unselected = false;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
-		auto &attempt_metadata = sink_attempts_[handle.task_partition_id][attempt_id];
-		attempt_metadata.task_partition_id = handle.task_partition_id;
-		attempt_metadata.attempt_id = attempt_id;
-		if (attempt_metadata.output_location.empty()) {
-			attempt_metadata.output_location = BuildSinkOutputLocation(ctx_, handle, attempt_id);
+		if (closed_) {
+			throw InvalidInputException("Flight exchange is closed");
+		}
+		const auto &handle = instance.sink_handle;
+		const auto attempt_id = instance.attempt_id;
+		if (std::find(all_sinks_.begin(), all_sinks_.end(), handle.task_partition_id) == all_sinks_.end()) {
+			throw InvalidInputException("finished Flight sink partition was not registered");
+		}
+		auto sink_entry = sink_attempts_.find(handle.task_partition_id);
+		if (sink_entry == sink_attempts_.end()) {
+			sink_entry =
+			    sink_attempts_.emplace(handle.task_partition_id, std::unordered_map<idx_t, SinkAttemptMetadata> {})
+			        .first;
+		}
+		auto attempt_entry = sink_entry->second.find(attempt_id);
+		if (attempt_entry == sink_entry->second.end()) {
+			auto expected_output_location = BuildSinkOutputLocation(exchange_instance_id_, handle, attempt_id);
+			if (instance.output_location.empty() || instance.output_location != expected_output_location) {
+				throw InvalidInputException("finished Flight retry output location does not match its exchange");
+			}
+			SinkAttemptMetadata metadata;
+			metadata.task_partition_id = handle.task_partition_id;
+			metadata.attempt_id = attempt_id;
+			metadata.output_location = instance.output_location;
+			attempt_entry = sink_entry->second.emplace(attempt_id, std::move(metadata)).first;
+		}
+		auto &attempt_metadata = attempt_entry->second;
+		if (instance.output_location.empty() || attempt_metadata.output_location != instance.output_location) {
+			throw InvalidInputException("finished Flight sink output location does not match instantiated attempt");
+		}
+		if (!node_id.empty() && !attempt_metadata.node_id.empty() && attempt_metadata.node_id != node_id) {
+			throw InvalidInputException("finished Flight sink node does not match its published attempt");
+		}
+		if (flight_port > 0 && attempt_metadata.flight_port > 0 && attempt_metadata.flight_port != flight_port) {
+			throw InvalidInputException("finished Flight sink port does not match its published attempt");
+		}
+		if (!instance.flight_server_epoch.empty() && !attempt_metadata.flight_server_epoch.empty() &&
+		    attempt_metadata.flight_server_epoch != instance.flight_server_epoch) {
+			throw InvalidInputException("finished Flight sink epoch does not match its published attempt");
 		}
 		if (!node_id.empty()) {
 			attempt_metadata.node_id = node_id;
 		}
 		if (flight_port > 0) {
 			attempt_metadata.flight_port = flight_port;
+		}
+		if (!instance.flight_server_epoch.empty()) {
+			attempt_metadata.flight_server_epoch = instance.flight_server_epoch;
 		}
 
 		auto selected_entry = selected_attempts_.find(handle.task_partition_id);
@@ -358,6 +468,12 @@ void FlightExchange::SinkFinished(const ExchangeSinkHandle &handle, idx_t attemp
 }
 
 void FlightExchange::AllRequiredSinksFinished() {
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (closed_) {
+			throw InvalidInputException("Flight exchange is closed");
+		}
+	}
 	CleanupUnselectedAttempts();
 }
 
@@ -379,6 +495,10 @@ std::vector<FlightExchange::SinkAttemptMetadata> FlightExchange::CollectUnselect
 			if (cleaned_output_locations_.find(attempt_metadata.output_location) != cleaned_output_locations_.end()) {
 				continue;
 			}
+			// Claim cleanup while holding the coordinator lock. Sink completion
+			// and the final barrier may run concurrently, but storage ownership
+			// must be exercised by only one caller at a time.
+			cleaned_output_locations_.insert(attempt_metadata.output_location);
 			attempts.push_back(attempt_metadata);
 		}
 	}
@@ -389,7 +509,11 @@ bool FlightExchange::CleanupAttemptStorage(const SinkAttemptMetadata &attempt_me
 	if (attempt_metadata.output_location.empty()) {
 		return true;
 	}
-	ShuffleCacheRegistry::Instance().Remove(attempt_metadata.output_location);
+	// If the completed attempt belongs to this process, keep its storage under
+	// query-scoped cleanup ownership until teardown observes a successful
+	// deletion. Remote attempts are not present in this process-local catalog,
+	// so the path-based cleanup below remains necessary in either case.
+	ShuffleCacheRegistry::Instance().RemoveForDeferredCleanup(attempt_metadata.output_location);
 	if (config_.local_dirs.empty() || attempt_metadata.node_id.empty()) {
 		return false;
 	}
@@ -414,21 +538,29 @@ void FlightExchange::CleanupUnselectedAttempts() {
 		attempts = CollectUnselectedAttemptsForCleanupLocked();
 	}
 	for (const auto &attempt : attempts) {
-		if (!CleanupAttemptStorage(attempt, "unselected")) {
-			continue;
+		bool cleaned = false;
+		try {
+			cleaned = CleanupAttemptStorage(attempt, "unselected");
+		} catch (...) {
+			std::lock_guard<std::mutex> lock(mutex_);
+			cleaned_output_locations_.erase(attempt.output_location);
+			throw;
 		}
-		std::lock_guard<std::mutex> lock(mutex_);
-		cleaned_output_locations_.insert(attempt.output_location);
+		if (!cleaned) {
+			std::lock_guard<std::mutex> lock(mutex_);
+			cleaned_output_locations_.erase(attempt.output_location);
+		}
 	}
 }
 
 std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 	std::vector<ExchangeSourceHandle> handles;
 	std::vector<std::pair<idx_t, SinkAttemptMetadata>> selected_attempts;
-	bool has_sinks = false;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
-		has_sinks = !all_sinks_.empty();
+		if (closed_) {
+			throw InvalidInputException("Flight exchange is closed");
+		}
 		std::vector<std::pair<idx_t, idx_t>> selected_attempt_ids(selected_attempts_.begin(), selected_attempts_.end());
 		std::sort(selected_attempt_ids.begin(), selected_attempt_ids.end(),
 		          [](const std::pair<idx_t, idx_t> &lhs, const std::pair<idx_t, idx_t> &rhs) {
@@ -446,30 +578,14 @@ std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 				}
 			}
 			if (attempt_metadata.output_location.empty()) {
-				ExchangeSinkHandle sink_handle;
-				sink_handle.task_partition_id = sink_partition_id;
-				attempt_metadata.output_location = BuildSinkOutputLocation(ctx_, sink_handle, attempt_id);
+				throw InvalidInputException("selected Flight sink attempt is missing its catalog identity");
 			}
 			attempt_metadata.task_partition_id = sink_partition_id;
 			attempt_metadata.attempt_id = attempt_id;
 			selected_attempts.emplace_back(sink_partition_id, std::move(attempt_metadata));
 		}
 	}
-	if (selected_attempts.empty() && has_sinks) {
-		return handles;
-	}
 	if (selected_attempts.empty()) {
-		for (idx_t i = 0; i < output_partition_count_; i++) {
-			ExchangeSourceHandle handle;
-			handle.partition_id = i;
-			handle.attempt_id = 0;
-			handle.flight_port = config_.flight_port;
-			ExchangeSourceFile file;
-			file.path = ctx_.exchange_id;
-			file.file_size = 0;
-			handle.files.push_back(std::move(file));
-			handles.push_back(std::move(handle));
-		}
 		return handles;
 	}
 
@@ -506,6 +622,7 @@ std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 			handle.attempt_id = attempt_id;
 			handle.node_id = attempt_metadata.node_id;
 			handle.flight_port = attempt_metadata.flight_port > 0 ? attempt_metadata.flight_port : config_.flight_port;
+			handle.flight_server_epoch = attempt_metadata.flight_server_epoch;
 			handle.files.push_back(build_source_file(attempt_metadata, partition_id));
 			handles.push_back(std::move(handle));
 		}
@@ -523,19 +640,6 @@ void FlightExchange::Close() {
 		return;
 	}
 	closed_ = true;
-	// Clean up the ShuffleCacheRegistry entry
-	ShuffleCacheRegistry::Instance().Remove(ctx_.exchange_id);
-	std::unordered_set<std::string> output_locations;
-	for (const auto &sink_entry : sink_attempts_) {
-		for (const auto &attempt_entry : sink_entry.second) {
-			if (!attempt_entry.second.output_location.empty()) {
-				output_locations.insert(attempt_entry.second.output_location);
-			}
-		}
-	}
-	for (const auto &output_location : output_locations) {
-		ShuffleCacheRegistry::Instance().RemoveForDeferredCleanup(output_location);
-	}
 }
 
 // ─── FlightExchangeSink ─────────────────────────────────
@@ -543,6 +647,12 @@ void FlightExchange::Close() {
 FlightExchangeSink::FlightExchangeSink(std::shared_ptr<ShuffleCache> shuffle_cache,
                                        const ExchangeSinkInstanceHandle &handle, ClientContext *context)
     : shuffle_cache_(std::move(shuffle_cache)), handle_(handle), context_(context) {
+	auto track_result = ShuffleCacheRegistry::Instance().TrackPending(
+	    handle_.output_location, shuffle_cache_, handle_.query_id, handle_.flight_server_epoch, handle_.attempt_id);
+	if (track_result.is_err()) {
+		throw InvalidInputException("Failed to track Flight exchange sink attempt: %s", track_result.error().what());
+	}
+	write_lease_ = std::move(track_result.value());
 }
 
 FlightExchangeSink::~FlightExchangeSink() {
@@ -581,26 +691,43 @@ void FlightExchangeSink::WaitUnblocked() {
 }
 
 DuckDBResult<void> FlightExchangeSink::Finish() {
-	finished_ = true;
+	if (finished_) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("sink already finished"));
+	}
 	if (!context_) {
-		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("sink has no client context"));
+		auto result = DuckDBResult<void>::err(DuckDBError::invalid_state_error("sink has no client context"));
+		Abort();
+		return result;
 	}
 	// Flush all remaining buffered data to disk IPC files
 	auto flush_res = shuffle_cache_->FlushAll(*context_, shuffle_cache_->BufferedNames());
 	if (flush_res.is_err()) {
+		Abort();
 		return flush_res;
 	}
 	auto manifest_res = shuffle_cache_->WriteAttemptManifest(handle_.sink_handle.task_partition_id, handle_.attempt_id);
 	if (manifest_res.is_err()) {
+		Abort();
 		return manifest_res;
 	}
-	// Register the ShuffleCache in the global registry
-	// so FlightServer / FlightExchangeSource can find it
-	ShuffleCacheRegistry::Instance().Register(handle_.output_location, shuffle_cache_);
+	// Publish only after both data and the committed manifest are durable.
+	auto publish_result = ShuffleCacheRegistry::Instance().Publish(
+	    handle_.output_location, shuffle_cache_, handle_.query_id, handle_.flight_server_epoch, handle_.attempt_id);
+	if (publish_result.is_err()) {
+		Abort();
+		return publish_result;
+	}
+	write_lease_.reset();
+	finished_ = true;
 	return DuckDBResult<void>::ok();
 }
 
 DuckDBResult<void> FlightExchangeSink::Abort() {
+	if (finished_) {
+		return DuckDBResult<void>::ok();
+	}
+	ShuffleCacheRegistry::Instance().RemoveForDeferredCleanup(handle_.output_location);
+	write_lease_.reset();
 	finished_ = true;
 	return DuckDBResult<void>::ok();
 }
@@ -611,6 +738,9 @@ size_t FlightExchangeSink::GetMemoryUsage() const {
 
 DuckDBResult<void> FlightExchangeSink::EnsureSchema(ClientContext &context, const vector<LogicalType> &types,
                                                     const vector<string> &names) {
+	if (finished_) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("sink already finished"));
+	}
 	return shuffle_cache_->EnsureSchemaFile(context, types, names);
 }
 
@@ -637,10 +767,6 @@ struct FlightExchangeSource::PartitionStreamState {
 	bool needs_cast = false;
 };
 
-FlightExchangeSource::FlightExchangeSource(const std::string &exchange_id, ClientContext *context)
-    : exchange_id_(exchange_id), context_(context) {
-}
-
 FlightExchangeSource::FlightExchangeSource(const FlightExchangeConfig &config, ClientContext *context)
     : config_(config), context_(context) {
 }
@@ -650,10 +776,6 @@ FlightExchangeSource::~FlightExchangeSource() {
 }
 
 void FlightExchangeSource::AddSourceHandles(std::vector<ExchangeSourceHandle> handles) {
-	// Extract exchange_id from the first handle's file path if not yet set
-	if (exchange_id_.empty() && !handles.empty() && !handles[0].files.empty()) {
-		exchange_id_ = handles[0].files[0].path;
-	}
 	handles_.insert(handles_.end(), std::make_move_iterator(handles.begin()), std::make_move_iterator(handles.end()));
 }
 
@@ -666,8 +788,11 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 
 	auto partition_id = handle.partition_id;
 	auto source_node_id = handle.node_id.empty() ? config_.node_id : handle.node_id;
-	auto output_location =
-	    (!handle.files.empty() && !handle.files[0].path.empty()) ? handle.files[0].path : exchange_id_;
+	if (handle.files.empty() || handle.files[0].path.empty()) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
+		    DuckDBError::invalid_state_error("Flight exchange source handle is missing its catalog identity"));
+	}
+	auto output_location = handle.files[0].path;
 	auto source_flight_port = handle.flight_port > 0 ? handle.flight_port : config_.flight_port;
 
 	auto stream = make_uniq<PartitionStreamState>();
@@ -677,11 +802,10 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 	DuckDBResult<ShufflePartitionFiles> files_res = DuckDBResult<ShufflePartitionFiles>::err(
 	    DuckDBError::invalid_state_error("uninitialized exchange source file result"));
 	std::shared_ptr<ShuffleCache> file_cache;
-	bool committed_manifest_recovery_failed = false;
 	const bool uses_object_storage = FlightExchangeUsesObjectStorage(config_);
-	auto try_manifest_recovery = [&]() -> bool {
+	auto replay_object_manifest = [&]() {
 		if (config_.local_dirs.empty()) {
-			return false;
+			return;
 		}
 		ShuffleCacheConfig cache_config;
 		cache_config.shuffle_stage_id = output_location;
@@ -690,47 +814,47 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 		cache_config.local_dirs = config_.local_dirs;
 		auto manifest_cache = MakeFlightExchangeShuffleCache(cache_config, config_, context_);
 		if (!manifest_cache->HasCommittedManifest()) {
-			if (uses_object_storage) {
-				committed_manifest_recovery_failed = true;
-				files_res = DuckDBResult<ShufflePartitionFiles>::err(DuckDBError::invalid_state_error(
-				    "object-storage shuffle attempt manifest is not committed: " + manifest_cache->ManifestFilePath()));
-				return true;
-			}
-			return false;
+			files_res = DuckDBResult<ShufflePartitionFiles>::err(DuckDBError::invalid_state_error(
+			    "object-storage shuffle attempt manifest is not committed: " + manifest_cache->ManifestFilePath()));
+			return;
 		}
 		auto manifest_res = manifest_cache->GetPartitionFilesFromManifest(partition_id);
 		if (manifest_res.is_ok()) {
 			files_res = std::move(manifest_res);
 			file_cache = std::move(manifest_cache);
 		} else {
-			committed_manifest_recovery_failed = true;
 			files_res = DuckDBResult<ShufflePartitionFiles>::err(manifest_res.error());
 		}
-		return true;
 	};
 
 	// Object storage must be replayed from the durable manifest using this
 	// task's ClientContext/FileOpener, not the sink task's registry cache.
 	if (!uses_object_storage && source_node_id == config_.node_id) {
-		if (!cache_ || cache_key_ != output_location) {
-			cache_ = ShuffleCacheRegistry::Instance().Get(output_location);
-			cache_key_ = output_location;
-		}
-		if (cache_) {
-			files_res = cache_->GetPartitionFiles(partition_id);
-			if (files_res.is_ok() && files_res.value().files.empty() && cache_->HasCommittedManifest()) {
-				auto manifest_res = cache_->GetPartitionFilesFromManifest(partition_id);
+		auto cache_res = ShuffleCacheRegistry::Instance().Resolve(output_location, handle.flight_server_epoch,
+		                                                          source_node_id, handle.attempt_id);
+		if (cache_res.is_ok()) {
+			auto resolved_cache = std::move(cache_res.value());
+			if (!resolved_cache->HasCommittedManifest()) {
+				files_res = DuckDBResult<ShufflePartitionFiles>::err(DuckDBError::invalid_state_error(
+				    "local Flight exchange attempt is not committed: " + output_location));
+			} else {
+				files_res = resolved_cache->GetPartitionFiles(partition_id);
+			}
+			if (files_res.is_ok() && files_res.value().files.empty()) {
+				auto manifest_res = resolved_cache->GetPartitionFilesFromManifest(partition_id);
 				if (manifest_res.is_ok()) {
 					files_res = std::move(manifest_res);
 				}
 			}
 			if (files_res.is_ok()) {
-				file_cache = cache_;
+				file_cache = std::move(resolved_cache);
 			}
+		} else {
+			files_res = DuckDBResult<ShufflePartitionFiles>::err(cache_res.error());
 		}
 	}
-	if (files_res.is_err()) {
-		try_manifest_recovery();
+	if (files_res.is_err() && uses_object_storage) {
+		replay_object_manifest();
 	}
 	if (files_res.is_ok()) {
 		stream->kind = PartitionStreamState::Kind::LOCAL_FILES;
@@ -738,13 +862,15 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 		stream->files = std::move(files_res.value().files);
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::ok(std::move(stream));
 	}
-	if (committed_manifest_recovery_failed || uses_object_storage) {
-		const auto prefix = uses_object_storage
-		                        ? "object-storage FlightExchange source failed to replay committed manifest"
-		                        : "FlightExchange source failed to read selected attempt";
+	if (uses_object_storage) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(DuckDBError::external_error(
-		    std::string(prefix) + " for exchange_id=" + output_location + " source_node_id=" + source_node_id +
-		    " partition=" + std::to_string(partition_id) + ": " + files_res.error().what()));
+		    "object-storage FlightExchange source failed to replay committed manifest for exchange_id=" +
+		    output_location + " source_node_id=" + source_node_id + " partition=" + std::to_string(partition_id) +
+		    ": " + files_res.error().what()));
+	}
+	if (handle.flight_server_epoch.empty()) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
+		    DuckDBError::invalid_state_error("remote Flight exchange source handle is missing its server epoch"));
 	}
 
 	auto location = BuildFlightLocationForPort(config_, source_node_id, source_flight_port);
@@ -756,8 +882,10 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 
 	arrow::flight::Ticket flight_ticket;
 	FlightExchangeTicket ticket;
-	ticket.shuffle_stage_id = output_location;
+	ticket.server_epoch = handle.flight_server_epoch;
+	ticket.exchange_instance_id = output_location;
 	ticket.node_id = source_node_id;
+	ticket.attempt_id = handle.attempt_id;
 	ticket.partition_idx = partition_id;
 	flight_ticket.ticket = ticket.Serialize();
 
@@ -969,8 +1097,10 @@ std::unique_ptr<ExchangeSink> FlightExchangeManager::CreateSink(const ExchangeSi
 	if (server_res.is_err()) {
 		throw std::runtime_error(server_res.error().what());
 	}
+	auto sink_handle = handle;
+	sink_handle.flight_server_epoch = GetLocalFlightServerEpoch();
 	auto shuffle_cache = MakeFlightExchangeShuffleCache(cache_config, config_, context_);
-	return std::unique_ptr<ExchangeSink>(new FlightExchangeSink(shuffle_cache, handle, context_));
+	return std::unique_ptr<ExchangeSink>(new FlightExchangeSink(shuffle_cache, sink_handle, context_));
 }
 
 std::unique_ptr<ExchangeSource> FlightExchangeManager::CreateSource() {
@@ -982,7 +1112,21 @@ int FlightExchangeManager::GetLocalFlightServerPort() {
 	return CurrentLocalFlightServerPort();
 }
 
+std::string FlightExchangeManager::GetLocalFlightServerEpoch() {
+	return CurrentLocalFlightServerEpoch();
+}
+
+DuckDBResult<void> FlightExchangeManager::EnsureLocalFlightServerStarted(const FlightExchangeConfig &config) {
+	return EnsureLocalFlightServerStartedInternal(config);
+}
+
+DuckDBResult<void> FlightExchangeManager::ShutdownLocalFlightServer() {
+	return ShutdownLocalFlightServerInternal();
+}
+
 void FlightExchangeManager::Shutdown() {
+	// Exchange managers are session-scoped users of the process-local service.
+	// The worker runtime owns service shutdown explicitly.
 }
 
 } // namespace distributed

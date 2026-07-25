@@ -195,6 +195,7 @@ public:
 	void SinkFinished(const ExchangeSinkHandle &handle, idx_t attempt_id) override;
 	void SinkFinished(const ExchangeSinkHandle &handle, idx_t attempt_id, const std::string &node_id,
 	                  int flight_port) override;
+	void SinkFinished(const ExchangeSinkInstanceHandle &instance, const std::string &node_id, int flight_port) override;
 	void AllRequiredSinksFinished() override;
 	std::vector<ExchangeSourceHandle> GetSourceHandles() override;
 	idx_t GetNumPartitions() const override;
@@ -208,12 +209,14 @@ private:
 		std::string output_location;
 		std::string node_id;
 		int flight_port = 0;
+		std::string flight_server_epoch;
 	};
 
 	ExchangeContext ctx_;
 	idx_t output_partition_count_;
 	FlightExchangeConfig config_;
 	ClientContext *context_;
+	std::string exchange_instance_id_;
 
 	std::mutex mutex_;
 	std::vector<idx_t> all_sinks_;
@@ -245,6 +248,7 @@ public:
 
 private:
 	std::shared_ptr<ShuffleCache> shuffle_cache_;
+	ShuffleCacheRegistry::WriteLease write_lease_;
 	ExchangeSinkInstanceHandle handle_;
 	ClientContext *context_;
 	bool finished_ = false;
@@ -254,7 +258,6 @@ private:
 
 class FlightExchangeSource : public ExchangeSource {
 public:
-	explicit FlightExchangeSource(const std::string &exchange_id, ClientContext *context);
 	explicit FlightExchangeSource(const FlightExchangeConfig &config, ClientContext *context);
 	~FlightExchangeSource() override;
 
@@ -270,10 +273,7 @@ private:
 	struct PartitionStreamState;
 
 	FlightExchangeConfig config_;
-	std::string exchange_id_;
 	ClientContext *context_;
-	std::shared_ptr<ShuffleCache> cache_;
-	std::string cache_key_;
 	std::vector<ExchangeSourceHandle> handles_;
 	idx_t current_handle_idx_ = 0;
 	bool closed_ = false;
@@ -301,6 +301,9 @@ public:
 	}
 
 	static int GetLocalFlightServerPort();
+	static std::string GetLocalFlightServerEpoch();
+	static DuckDBResult<void> EnsureLocalFlightServerStarted(const FlightExchangeConfig &config);
+	static DuckDBResult<void> ShutdownLocalFlightServer();
 
 	const FlightExchangeConfig &config() const {
 		return config_;

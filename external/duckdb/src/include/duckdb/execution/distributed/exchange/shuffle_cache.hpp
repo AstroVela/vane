@@ -136,6 +136,7 @@ public:
 	DuckDBResult<idx_t> RemoveAttemptStorage() const;
 	std::string ManifestFilePath() const;
 	std::string CommittedMarkerPath() const;
+	std::string SchemaFilePath() const;
 
 private:
 	//! Flush a single partition buffer to an IPC file.
@@ -148,7 +149,6 @@ private:
 	std::string PartitionDirectory(idx_t partition_idx) const;
 	std::string MakePartitionFilePath(idx_t partition_idx);
 	std::string NodeDirectory() const;
-	std::string SchemaFilePath() const;
 
 	ShuffleCacheConfig config_;
 	std::shared_ptr<ShuffleStorage> storage_;

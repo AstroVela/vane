@@ -318,7 +318,7 @@ static DuckDBResult<void> RecordOrderByExchangeSinkOutput(Exchange &exchange, co
 		node_id = *worker_id;
 	}
 	const auto &sink_instance = output.exchange_sink_instance();
-	exchange.SinkFinished(sink_instance.sink_handle, sink_instance.attempt_id, node_id, output.flight_port());
+	exchange.SinkFinished(sink_instance, node_id, output.flight_port());
 	return DuckDBResult<void>::ok();
 }
 

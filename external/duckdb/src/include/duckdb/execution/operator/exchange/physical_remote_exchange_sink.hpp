@@ -66,6 +66,9 @@ public:
 	const distributed::ExchangeSinkInstanceHandle &SinkHandle() const {
 		return sink_handle_;
 	}
+	const std::shared_ptr<distributed::ExchangeManager> &GetExchangeManager() const {
+		return exchange_mgr_;
+	}
 	void ApplyRuntimeSinkHandle(distributed::ExchangeSinkInstanceHandle sink_handle) {
 		sink_handle_ = std::move(sink_handle);
 	}

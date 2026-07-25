@@ -100,6 +100,9 @@ bool ParseExchangeSinkInstanceObject(py::object obj, duckdb::distributed::Exchan
 	}
 	if (py::isinstance<py::dict>(sink_handle_obj)) {
 		auto sink_handle = sink_handle_obj.cast<py::dict>();
+		if (sink_handle.contains("query_id")) {
+			out.query_id = py::str(sink_handle["query_id"]).cast<string>();
+		}
 		if (sink_handle.contains("task_partition_id")) {
 			out.sink_handle.task_partition_id = py::int_(sink_handle["task_partition_id"]).cast<duckdb::idx_t>();
 		} else if (sink_handle.contains("partition_id")) {
@@ -120,6 +123,12 @@ bool ParseExchangeSinkInstanceObject(py::object obj, duckdb::distributed::Exchan
 		out.output_location = py::str(d["output_location"]).cast<string>();
 	} else if (d.contains("attempt_path")) {
 		out.output_location = py::str(d["attempt_path"]).cast<string>();
+	}
+	if (d.contains("flight_server_epoch")) {
+		out.flight_server_epoch = py::str(d["flight_server_epoch"]).cast<string>();
+	}
+	if (d.contains("query_id")) {
+		out.query_id = py::str(d["query_id"]).cast<string>();
 	}
 	return true;
 }
@@ -1081,6 +1090,10 @@ py::object RayWorkerTask::ExchangeSinkInstance() const {
 	result["partition_id"] = instance.sink_handle.task_partition_id;
 	result["attempt_id"] = instance.attempt_id;
 	result["output_partition_count"] = instance.output_partition_count;
+	result["query_id"] = instance.query_id;
+	if (!instance.flight_server_epoch.empty()) {
+		result["flight_server_epoch"] = instance.flight_server_epoch;
+	}
 	if (!instance.output_location.empty()) {
 		result["output_location"] = instance.output_location;
 		result["attempt_path"] = instance.output_location;

@@ -8,7 +8,6 @@
 #include <string>
 #include <memory>
 #include <thread>
-#include <vector>
 
 namespace duckdb {
 namespace distributed {
@@ -16,7 +15,7 @@ namespace distributed {
 struct FlightServerConfig {
 	std::string bind_host;
 	int port = 0;
-	std::vector<std::string> local_dirs;
+	std::string server_epoch;
 };
 
 class FlightServer {

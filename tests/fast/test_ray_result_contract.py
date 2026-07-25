@@ -16,6 +16,7 @@ import pytest
 
 import duckdb
 from duckdb.runners.common import PartitionMetadata
+from duckdb.runners.fte.fte_exchange import ExchangeSinkHandle, ExchangeSinkInstanceHandle
 from duckdb.runners.ray import driver
 from duckdb.runners.ray.partition_metadata import PartitionMetadataAccessor
 from duckdb.runners.ray.safe_get import QueryDeadlineExceeded
@@ -989,6 +990,92 @@ def test_normalize_native_task_result_preserves_schema_and_stats():
     assert flight_port == 24601
     assert exchange_sink_instance == {"attempt_id": 2}
     assert task_stats == {"processed_input_rows": 3, "processed_input_bytes": 42}
+
+
+def test_run_plan_return_uses_native_completed_sink_descriptor(monkeypatch):
+    from duckdb.runners.ray import worker as worker_module
+
+    events: list[tuple[str, str]] = []
+    original_require = worker_module.require_ray_cxx_attr
+
+    def fake_require(name, hint=None):
+        assert hint
+        if name == "begin_flight_shuffle_query_execution":
+            return lambda query_id: events.append(("begin", query_id))
+        if name == "end_flight_shuffle_query_execution":
+            return lambda query_id: events.append(("end", query_id))
+        return original_require(name, hint=hint)
+
+    completed_descriptor = {
+        "query_id": "query-native-descriptor",
+        "attempt_id": 2,
+        "flight_server_epoch": "worker-epoch",
+    }
+    native_result = duckdb.ray_cxx.NativeDistributedTaskResult(
+        [],
+        [],
+        None,
+        [],
+        "ok",
+        31337,
+        completed_descriptor,
+        {},
+    )
+
+    class DummyWorker:
+        _env_overrides: dict[str, str] = {}
+
+        @staticmethod
+        def _begin_worker_native_execution(query_id):
+            events.append(("worker_begin", query_id))
+
+        @staticmethod
+        def _end_worker_native_execution(query_id):
+            events.append(("worker_end", query_id))
+
+        @staticmethod
+        def _worker_native_query_is_closing(_query_id):
+            return False
+
+        @staticmethod
+        def _execute_native_task(*args, **kwargs):
+            events.append(("execute", "query-native-descriptor"))
+            return native_result
+
+    monkeypatch.setattr(worker_module, "require_ray_cxx_attr", fake_require)
+    actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
+    query_lease = {
+        "lease_id": "lease-native-descriptor",
+        "query_id": "resource-query-native-descriptor",
+        "execution_query_id": "query-native-descriptor",
+        "stage_id": "stage-native-descriptor",
+        "attempt_id": "query-native-descriptor.0.0.0",
+        "target_output_block_bytes": 1,
+        "output_window_bytes": 1,
+    }
+
+    result = asyncio.run(
+        actor_class.run_plan_return(
+            DummyWorker(),
+            object(),
+            None,
+            query_lease,
+            exchange_sink_instance={
+                "query_id": "query-native-descriptor",
+                "attempt_id": 2,
+            },
+        )
+    )
+
+    assert result[4] == 31337
+    assert result[5] == completed_descriptor
+    assert events == [
+        ("worker_begin", "query-native-descriptor"),
+        ("begin", "query-native-descriptor"),
+        ("execute", "query-native-descriptor"),
+        ("end", "query-native-descriptor"),
+        ("worker_end", "query-native-descriptor"),
+    ]
 
 
 def test_normalize_native_task_result_rejects_legacy_shapes():
@@ -2452,7 +2539,7 @@ def test_describe_native_progress_materializes_deferred_clone_without_execution(
     assert scan_pipeline["input_rows"] == 10
 
 
-def test_remote_exchange_sink_progress_does_not_add_result_collector(tmp_path, monkeypatch):
+def test_remote_exchange_sink_accepts_nested_query_id_without_result_collector(tmp_path, monkeypatch):
     import duckdb.runners.ray.worker_handle as ray_worker_handle
 
     class _CapturingWorker:
@@ -2466,13 +2553,22 @@ def test_remote_exchange_sink_progress_does_not_add_result_collector(tmp_path, m
         def stats_fragments(self):
             return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
 
-        def fte_drop_query(self, _query_id):
+        def fte_prepare_drop_query(self, _query_id):
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def fte_cleanup_query(self, _query_id):
+            return {}
 
         def task_input_stream_exhausted_for_query(self, _query_id, _source_node_ids):
             return []
 
-        def shutdown(self):
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
             return None
 
     worker = _CapturingWorker()
@@ -2505,12 +2601,25 @@ def test_remote_exchange_sink_progress_does_not_add_result_collector(tmp_path, m
             topology = duckdb.ray_cxx.describe_native_progress(con.cursor(), task_plan)
             operators = [operator for pipeline in topology["pipelines"] for operator in pipeline["operators"]]
             if "EXCHANGE_SINK" in operators:
+                native_sink_instance = task.exchange_sink_instance()
+                sink_instance = ExchangeSinkInstanceHandle(
+                    ExchangeSinkHandle(
+                        native_sink_instance["query_id"],
+                        "nested-query-id-regression",
+                        native_sink_instance["partition_id"],
+                    ),
+                    native_sink_instance["attempt_id"],
+                    native_sink_instance.get("output_location"),
+                ).to_dict()
+                sink_instance["output_partition_count"] = native_sink_instance["output_partition_count"]
+                assert "query_id" not in sink_instance
+                assert sink_instance["sink_handle"]["query_id"] == native_sink_instance["query_id"]
                 sink_topologies.append(topology)
                 sink_results.append(
                     runner.execute_native(
                         con.cursor(),
                         task_plan,
-                        exchange_sink_instance=task.exchange_sink_instance(),
+                        exchange_sink_instance=sink_instance,
                     )
                 )
 
@@ -2986,13 +3095,22 @@ def test_run_copy_plan_propagates_worker_task_failure_before_finalize(tmp_path, 
         def stats_fragments(self):
             return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
 
-        def fte_drop_query(self, _query_id):
+        def fte_prepare_drop_query(self, _query_id):
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def fte_cleanup_query(self, _query_id):
+            return {}
 
         def task_input_stream_exhausted_for_query(self, _query_id, _source_node_ids):
             return []
 
-        def shutdown(self):
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
             return None
 
     import duckdb.runners as runners_mod
@@ -3114,13 +3232,22 @@ def test_run_copy_plan_direct_write_failure_cleans_uncommitted_run(tmp_path, mon
         def stats_fragments(self):
             return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
 
-        def fte_drop_query(self, _query_id):
+        def fte_prepare_drop_query(self, _query_id):
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def fte_cleanup_query(self, _query_id):
+            return {}
 
         def task_input_stream_exhausted_for_query(self, _query_id, _source_node_ids):
             return []
 
-        def shutdown(self):
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
             return None
 
     import duckdb.runners as runners_mod
@@ -3182,10 +3309,19 @@ def test_wait_fte_query_propagates_status_errors(monkeypatch):
         def stats_fragments(self):
             return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
 
-        def fte_drop_query(self, _query_id):
+        def fte_prepare_drop_query(self, _query_id):
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
 
-        def shutdown(self):
+        def fte_cleanup_query(self, _query_id):
+            return {}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
             return None
 
     import duckdb.runners.ray.worker_handle as ray_worker_handle
@@ -3231,10 +3367,19 @@ def test_wait_fte_query_releases_gil_while_waiting(monkeypatch):
         def stats_fragments(self):
             return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
 
-        def fte_drop_query(self, _query_id):
+        def fte_prepare_drop_query(self, _query_id):
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
 
-        def shutdown(self):
+        def fte_cleanup_query(self, _query_id):
+            return {}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
             return None
 
     import duckdb.runners.ray.worker_handle as ray_worker_handle
@@ -3285,7 +3430,13 @@ def test_wait_fte_query_rejects_malformed_query_status(monkeypatch):
         def fte_drop_query(self, _query_id):
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
 
-        def shutdown(self):
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
             return None
 
     import duckdb.runners.ray.worker_handle as ray_worker_handle
@@ -3347,7 +3498,13 @@ def test_wait_fte_query_rejects_result_handles_without_task_id(monkeypatch):
         def fte_drop_query(self, _query_id):
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
 
-        def shutdown(self):
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
             return None
 
     import duckdb.runners.ray.worker_handle as ray_worker_handle
@@ -3410,7 +3567,13 @@ def test_wait_fte_query_rejects_result_handles_without_worker_id(monkeypatch):
         def fte_drop_query(self, _query_id):
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
 
-        def shutdown(self):
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
             return None
 
     import duckdb.runners.ray.worker_handle as ray_worker_handle
@@ -3489,10 +3652,19 @@ def test_wait_fte_query_propagates_selected_attempt_handle_errors(monkeypatch):
         def stats_fragments(self):
             return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
 
-        def fte_drop_query(self, _query_id):
+        def fte_prepare_drop_query(self, _query_id):
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
 
-        def shutdown(self):
+        def fte_cleanup_query(self, _query_id):
+            return {}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
             return None
 
     import duckdb.runners.ray.worker_handle as ray_worker_handle
@@ -3609,7 +3781,13 @@ def test_wait_fte_query_ignores_retry_loser_attempt_errors(monkeypatch):
         def fte_drop_query(self, _query_id):
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
 
-        def shutdown(self):
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
             return None
 
     import duckdb.runners.ray.worker_handle as ray_worker_handle
@@ -3702,10 +3880,19 @@ def test_wait_fte_query_release_failure_preserves_failed_handle_and_releases_res
         def stats_fragments(self):
             return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
 
-        def fte_drop_query(self, _query_id):
+        def fte_prepare_drop_query(self, _query_id):
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
 
-        def shutdown(self):
+        def fte_cleanup_query(self, _query_id):
+            return {}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
             return None
 
     import duckdb.runners.ray.worker_handle as ray_worker_handle
@@ -3833,7 +4020,13 @@ def test_wait_fte_query_does_not_drain_pending_retry_loser_attempt(monkeypatch):
         def fte_drop_query(self, _query_id):
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
 
-        def shutdown(self):
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
             return None
 
     import duckdb.runners.ray.worker_handle as ray_worker_handle
@@ -3928,7 +4121,13 @@ def test_wait_fte_query_clears_cached_handles_after_failed_status(monkeypatch):
         def fte_drop_query(self, _query_id):
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
 
-        def shutdown(self):
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
             return None
 
     import duckdb.runners.ray.worker_handle as ray_worker_handle
@@ -4016,7 +4215,13 @@ def test_wait_fte_query_timeout_preserves_collected_handles(monkeypatch):
         def fte_drop_query(self, _query_id):
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
 
-        def shutdown(self):
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
             return None
 
     import duckdb.runners.ray.worker_handle as ray_worker_handle
@@ -4106,7 +4311,13 @@ def test_wait_fte_query_respects_timeout_after_finished_status_during_drain(monk
         def fte_drop_query(self, _query_id):
             return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
 
-        def shutdown(self):
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
             return None
 
     import duckdb.runners.ray.worker_handle as ray_worker_handle

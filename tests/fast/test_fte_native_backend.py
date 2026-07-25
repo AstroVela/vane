@@ -969,8 +969,10 @@ def test_cxx_distributed_runner_accepts_python_backend_without_ray_worker_startu
 
     runner.warm_up()
     stats = runner.fragment_stats()
+    runner.shutdown()
 
     assert backend.worker_snapshots_calls == 1
+    assert backend.shutdown_calls == 1
     assert stats["workers"] == {}
     assert stats["totals"] == {}
 
