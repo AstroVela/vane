@@ -39,7 +39,6 @@ def test_ray_worker_init_preserves_node_cuda_visibility(monkeypatch, visible_dev
         num_gpus=2,
         duckdb_memory_bytes=128 * 1024**2,
         task_heap_capacity_bytes=128 * 1024**2,
-        env_overrides={},
     )
 
     assert worker_mod.os.environ["CUDA_VISIBLE_DEVICES"] == visible_devices
@@ -51,6 +50,9 @@ def test_ray_worker_init_preserves_node_cuda_visibility(monkeypatch, visible_dev
 def test_zero_gpu_ray_worker_preserves_non_contiguous_node_cuda_visibility(monkeypatch):
     visible_devices = "2,5"
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible_devices)
+    monkeypatch.setenv("AWS_ISSUE75_INHERITED_SECRET", "inherited-aws")
+    monkeypatch.setenv("DUCKDB_ISSUE75_INHERITED_SECRET", "inherited-duckdb")
+    monkeypatch.setenv("VANE_ISSUE75_INHERITED_SECRET", "inherited-vane")
     # Exercise the legacy Ray behavior even when this test runs on Ray 2.56+.
     # The persistent worker's runtime_env must opt back into preservation.
     monkeypatch.setenv("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "1")
@@ -74,21 +76,29 @@ def test_zero_gpu_ray_worker_preserves_non_contiguous_node_cuda_visibility(monke
                 return (
                     worker_mod.os.environ.get("CUDA_VISIBLE_DEVICES"),
                     ray.get_runtime_context().get_accelerator_ids(),
+                    worker_mod.os.environ.get("AWS_ISSUE75_INHERITED_SECRET"),
+                    worker_mod.os.environ.get("DUCKDB_ISSUE75_INHERITED_SECRET"),
+                    worker_mod.os.environ.get("VANE_ISSUE75_INHERITED_SECRET"),
                 )
 
         probe_cls = ray.remote(concurrency_groups={"execute": 128, "control": 512})(CudaVisibilityProbe)
-        actor = probe_cls.options(runtime_env=_persistent_worker_runtime_env()).remote(
+        actor = probe_cls.options(runtime_env=_persistent_worker_runtime_env({})).remote(
             num_cpus=1,
             num_gpus=2,
             duckdb_memory_bytes=128 * 1024**2,
             task_heap_capacity_bytes=128 * 1024**2,
-            env_overrides={},
         )
 
-        observed_devices, assigned_accelerators = ray.get(actor.cuda_visibility.remote(), timeout=60)
+        observed_devices, assigned_accelerators, inherited_aws, inherited_duckdb, inherited_vane = ray.get(
+            actor.cuda_visibility.remote(),
+            timeout=60,
+        )
 
         assert observed_devices == visible_devices
         assert not assigned_accelerators.get("GPU")
+        assert inherited_aws is None
+        assert inherited_duckdb is None
+        assert inherited_vane is None
     finally:
         if actor is not None:
             ray.kill(actor, no_restart=True)

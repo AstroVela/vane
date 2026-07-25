@@ -30,7 +30,11 @@ from duckdb.runners.fte import (
 from duckdb.runners.fte.debug_memory import describe_result_payload, log_debug, process_memory_snapshot
 from duckdb.runners.fte.fte_config import FteWorkerAdmissionConfig
 from duckdb.runners.fte.memory_config import apply_duckdb_memory_limit
+from duckdb.runners.ray.admission_ledger import BoundedReplayMap
 from duckdb.runners.ray.fte_scheduler_config import _fte_control_rpc_timeout_s
+from duckdb.runners.ray.ray_env import scrub_shared_runtime_session_env
+
+_SESSION_CLOSE_REPLAY_CAPACITY = 65_536
 
 
 def _fte_applied_control_status(
@@ -89,6 +93,22 @@ def _clear_datasource_factory_registry() -> None:
     import _duckdb
 
     _duckdb._clear_datasource_factory_registry()
+
+
+def _register_query_python_replay_state(query_id: str, plan: Any) -> bool:
+    register = require_ray_cxx_attr(
+        "_register_query_python_replay_state",
+        hint="Ensure the C++ ray extension is built with query replay lifecycle support.",
+    )
+    return bool(register(str(query_id), plan))
+
+
+def _cleanup_query_python_replay_state(query_id: str) -> None:
+    cleanup = require_ray_cxx_attr(
+        "_cleanup_query_python_replay_state",
+        hint="Ensure the C++ ray extension is built with query replay lifecycle support.",
+    )
+    cleanup(str(query_id))
 
 
 def _chaos_worker_loss_matches(task_id: FteTaskAttemptId) -> bool:
@@ -316,24 +336,22 @@ def _normalize_stats_for_ray(stats_payload: Any) -> list[int]:
     return []
 
 
-def _configure_duckdb_s3(conn: Any) -> None:
-    """Configure S3 settings on a DuckDB connection from AWS environment variables.
+def _configure_duckdb_s3(conn: Any, config: Mapping[str, str]) -> None:
+    """Configure one DuckDB context from explicit session AWS settings.
 
-    Ray actors create bare ``duckdb.connect()`` instances that lack S3 endpoint
-    and credential settings.  The standard ``AWS_*`` env vars *are* propagated
-    to workers, but DuckDB does not automatically map ``AWS_ENDPOINT_URL`` to
-    its ``s3_endpoint`` setting, causing S3 reads to go to the real AWS instead
-    of a local MinIO / compatible store.
+    Shared driver/worker processes must not read session credentials from their
+    process environment. The caller owns the immutable connection-session
+    snapshot.
     """
     from urllib.parse import urlparse
 
-    endpoint_url = os.environ.get("AWS_ENDPOINT_URL", "").strip()
-    access_key = os.environ.get("AWS_ACCESS_KEY_ID", "").strip()
-    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip()
-    session_token = os.environ.get("AWS_SESSION_TOKEN", "").strip()
-    region = (os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "").strip()
+    endpoint_url = str(config.get("AWS_ENDPOINT_URL", "")).strip()
+    access_key = str(config.get("AWS_ACCESS_KEY_ID", "")).strip()
+    secret_key = str(config.get("AWS_SECRET_ACCESS_KEY", "")).strip()
+    session_token = str(config.get("AWS_SESSION_TOKEN", "")).strip()
+    region = str(config.get("AWS_REGION") or config.get("AWS_DEFAULT_REGION") or "").strip()
 
-    if not endpoint_url and not access_key:
+    if not any((endpoint_url, access_key, secret_key, session_token, region)):
         return  # nothing to configure
 
     try:
@@ -344,50 +362,34 @@ def _configure_duckdb_s3(conn: Any) -> None:
     def _q(s: str) -> str:
         return s.replace("'", "''")
 
-    # Use GLOBAL so cursors (which create new ClientContexts) inherit settings.
     if region:
-        conn.execute(f"SET GLOBAL s3_region='{_q(region)}'")
+        conn.execute(f"SET s3_region='{_q(region)}'")
     if access_key:
-        conn.execute(f"SET GLOBAL s3_access_key_id='{_q(access_key)}'")
+        conn.execute(f"SET s3_access_key_id='{_q(access_key)}'")
     if secret_key:
-        conn.execute(f"SET GLOBAL s3_secret_access_key='{_q(secret_key)}'")
+        conn.execute(f"SET s3_secret_access_key='{_q(secret_key)}'")
     if session_token:
-        conn.execute(f"SET GLOBAL s3_session_token='{_q(session_token)}'")
+        conn.execute(f"SET s3_session_token='{_q(session_token)}'")
     if endpoint_url:
-        parsed = urlparse(endpoint_url)
+        parse_target = endpoint_url
+        if "://" not in parse_target and not parse_target.startswith("//"):
+            parse_target = f"//{parse_target}"
+        parsed = urlparse(parse_target)
         endpoint = parsed.netloc or parsed.path
         use_ssl = parsed.scheme == "https"
-        conn.execute(f"SET GLOBAL s3_endpoint='{_q(endpoint)}'")
-        conn.execute(f"SET GLOBAL s3_use_ssl={'true' if use_ssl else 'false'}")
-        conn.execute("SET GLOBAL s3_url_style='path'")
+        conn.execute(f"SET s3_endpoint='{_q(endpoint)}'")
+        conn.execute(f"SET s3_use_ssl={'true' if use_ssl else 'false'}")
+        conn.execute("SET s3_url_style='path'")
 
     # Keep-alive MUST stay enabled: disabling it creates a new TCP connection
     # per S3 request, which exhausts ephemeral ports via TIME_WAIT buildup
     # (55K+ TIME_WAIT sockets observed with keep_alive=false).
-    conn.execute("SET GLOBAL http_keep_alive=true")
+    conn.execute("SET http_keep_alive=true")
     # Increase retries to handle transient connection failures during
     # concurrent S3 access from many DuckDB threads.
-    conn.execute("SET GLOBAL http_retries=10")
-    conn.execute("SET GLOBAL http_retry_wait_ms=100")
-    conn.execute("SET GLOBAL http_retry_backoff=1.5")
-
-    # Create an explicit S3 secret so that credentials are available to the
-    # DuckDB secret manager even when internal code paths use a null FileOpener.
-    if endpoint_url and access_key and secret_key:
-        use_ssl_str = "true" if (urlparse(endpoint_url).scheme == "https") else "false"
-        endpoint_host = urlparse(endpoint_url).netloc or urlparse(endpoint_url).path
-        region_val = region or "us-east-1"
-        conn.execute(f"""
-            CREATE SECRET IF NOT EXISTS __vane_s3 (
-                TYPE S3,
-                KEY_ID '{_q(access_key)}',
-                SECRET '{_q(secret_key)}',
-                ENDPOINT '{_q(endpoint_host)}',
-                REGION '{_q(region_val)}',
-                USE_SSL {use_ssl_str},
-                URL_STYLE 'path'
-            )
-        """)
+    conn.execute("SET http_retries=10")
+    conn.execute("SET http_retry_wait_ms=100")
+    conn.execute("SET http_retry_backoff=1.5")
 
 
 def _configure_ray_worker_conn(conn: Any, duckdb_memory_bytes: int) -> None:
@@ -398,10 +400,6 @@ def _configure_ray_worker_conn(conn: Any, duckdb_memory_bytes: int) -> None:
             conn.execute(f"SET threads={int(duckdb_threads)}")
         except Exception:
             pass
-    try:
-        _configure_duckdb_s3(conn)
-    except Exception:
-        pass
     try:
         conn.execute("SET local_exchange_streaming=true")
     except Exception:
@@ -435,15 +433,6 @@ def _warm_up_python_native_dependencies() -> None:
         __import__("pyarrow.parquet")
     except Exception:
         pass
-
-
-def _apply_env_overrides(env_overrides: Mapping[str, str | None] | None) -> None:
-    if not env_overrides:
-        return
-    for key, value in env_overrides.items():
-        if value is None:
-            continue
-        os.environ[key] = str(value)
 
 
 def _copy_output_info_from_context(context: dict[str, Any] | None) -> dict[str, str] | None:
@@ -502,22 +491,19 @@ class RayWorkerActor:
         num_gpus: int,
         duckdb_memory_bytes: int,
         task_heap_capacity_bytes: int,
-        env_overrides: dict[str, str] | None = None,
     ) -> None:
+        scrub_shared_runtime_session_env()
         duckdb_memory_bytes = int(duckdb_memory_bytes)
         task_heap_capacity_bytes = int(task_heap_capacity_bytes)
         if duckdb_memory_bytes <= 0:
             raise ValueError("Ray worker duckdb_memory_bytes must be positive")
         if task_heap_capacity_bytes <= 0:
             raise ValueError("Ray worker task_heap_capacity_bytes must be positive")
-        self._env_overrides = env_overrides or {}
         self._node_id = str(ray.get_runtime_context().get_node_id() or "").strip()
         if not self._node_id:
             raise RuntimeError("Ray worker runtime context is missing node_id")
         self._duckdb_memory_bytes = duckdb_memory_bytes
         self._task_heap_capacity_bytes = task_heap_capacity_bytes
-        _apply_env_overrides(self._env_overrides)
-        os.environ["VANE_WORKER"] = "1"
         try:
             loop = asyncio.get_running_loop()
             set_event_loop(loop)
@@ -562,6 +548,9 @@ class RayWorkerActor:
         # with actor creation instead of blocking the first task.
         self._shared_conn: Any | None = None
         self._shared_conn_lock = threading.Lock()
+        self._session_connections: dict[str, tuple[dict[str, str], Any]] = {}
+        self._closed_session_ids = BoundedReplayMap[str, bool](capacity=_SESSION_CLOSE_REPLAY_CAPACITY)
+        self._session_connections_lock = threading.RLock()
         self._shutdown_lock = threading.RLock()
         self._native_execution_condition = threading.Condition()
         self._native_execution_count = 0
@@ -591,10 +580,9 @@ class RayWorkerActor:
                 raise RuntimeError("Ray worker runtime is shutting down")
 
     @ray.method(concurrency_group="control")
-    def install_env_overrides(self, env_overrides: dict[str, str] | None) -> None:
+    def ping(self) -> bool:
         self._ensure_worker_runtime_running()
-        self._env_overrides = env_overrides or {}
-        _apply_env_overrides(self._env_overrides)
+        return True
 
     @ray.method(concurrency_group="control")
     async def register_fragments(self, fragments: list[dict[str, Any]]) -> dict[str, int]:
@@ -670,8 +658,9 @@ class RayWorkerActor:
                     )
                 existing += 1
                 continue
-            self._plan_fragments[fragment_id] = plan
             query_id = str(entry.get("query_id", "")).strip()
+            _register_query_python_replay_state(query_id, plan)
+            self._plan_fragments[fragment_id] = plan
             self._fragment_query_ids[fragment_id] = query_id
             self._query_fragments.setdefault(query_id, set()).add(fragment_id)
             registered += 1
@@ -932,6 +921,7 @@ class RayWorkerActor:
         flight_shuffle_cleanup = await _drain_flight_shuffle_for_query(query_id)
         _retire_flight_shuffle_query(query_id)
         self._retire_worker_native_query(query_id)
+        _cleanup_query_python_replay_state(query_id)
         return {
             "flight_shuffle_registry_entries_removed": int(flight_shuffle_cleanup["registry_entries_removed"]),
             "flight_shuffle_storage_entries_removed": int(flight_shuffle_cleanup["storage_entries_removed"]),
@@ -1011,6 +1001,51 @@ class RayWorkerActor:
             self._configure_conn(conn)
             self._shared_conn = conn
             return conn
+
+    def _get_session_conn(self, session_id: str, config: Mapping[str, str]) -> Any:
+        session_key = str(session_id).strip()
+        if not session_key:
+            raise ValueError("Ray worker execution requires a Vane session_id")
+        normalized_config = {str(key): str(value) for key, value in config.items()}
+        with self._session_connections_lock:
+            if self._shutdown_started:
+                raise RuntimeError("Ray worker runtime is shutting down")
+            if session_key in self._closed_session_ids:
+                raise RuntimeError(f"Ray worker Vane session is closed: {session_key}")
+            existing = self._session_connections.get(session_key)
+            if existing is not None:
+                existing_config, connection = existing
+                if existing_config != normalized_config:
+                    raise RuntimeError(f"Ray worker Vane session config changed: {session_key}")
+                return connection
+            connection = self._get_shared_conn().cursor()
+            try:
+                _configure_duckdb_s3(connection, normalized_config)
+            except BaseException as config_error:
+                try:
+                    connection.close()
+                except BaseException as close_error:
+                    raise RuntimeError(
+                        f"Ray worker Vane session {session_key} configuration failed and "
+                        f"its connection could not be closed: {type(close_error).__name__}: {close_error}"
+                    ) from config_error
+                raise
+            self._session_connections[session_key] = (normalized_config, connection)
+            return connection
+
+    @ray.method(concurrency_group="control")
+    def close_session(self, session_id: str) -> None:
+        session_key = str(session_id).strip()
+        if not session_key:
+            raise ValueError("Ray worker close_session requires a Vane session_id")
+        with self._session_connections_lock:
+            self._closed_session_ids[session_key] = True
+            record = self._session_connections.get(session_key)
+            if record is not None:
+                _, connection = record
+                connection.close()
+                if self._session_connections.get(session_key) is record:
+                    self._session_connections.pop(session_key, None)
 
     def _begin_worker_native_execution(self, query_id: str) -> None:
         query_id = str(query_id or "").strip()
@@ -1141,6 +1176,12 @@ class RayWorkerActor:
                 self._shared_conn_lock = shared_conn_lock
             with shared_conn_lock:
                 conn = getattr(self, "_shared_conn", None)
+            session_connections_lock = getattr(self, "_session_connections_lock", None)
+            if session_connections_lock is None:
+                session_connections_lock = threading.RLock()
+                self._session_connections_lock = session_connections_lock
+            with session_connections_lock:
+                session_connections = list(getattr(self, "_session_connections", {}).items())
             if conn is not None:
                 try:
                     conn.interrupt()
@@ -1173,6 +1214,18 @@ class RayWorkerActor:
                 native_drained = self._native_execution_count == 0
             if not native_drained:
                 raise RuntimeError("; ".join(errors))
+            for session_id, record in session_connections:
+                with session_connections_lock:
+                    if getattr(self, "_session_connections", {}).get(session_id) is not record:
+                        continue
+                    _, session_connection = record
+                    try:
+                        session_connection.close()
+                    except Exception as exc:
+                        errors.append(f"close DuckDB session connection {session_id}: {exc}")
+                    else:
+                        if self._session_connections.get(session_id) is record:
+                            self._session_connections.pop(session_id, None)
             with shared_conn_lock:
                 conn = getattr(self, "_shared_conn", None)
             if conn is not None:
@@ -1241,21 +1294,26 @@ class RayWorkerActor:
         debug_context: dict[str, Any] | None = None,
         native_query_id: str = "",
     ) -> Any:
-        conn = self._get_shared_conn()
+        session_id = str(plan.session_id()).strip()
+        session_config = {str(key): str(value) for key, value in dict(plan.session_config()).items()}
+        conn = self._get_session_conn(session_id, session_config)
         cursor = conn.cursor()
-        query_admitted = self._register_native_cursor(cursor, native_query_id)
+        cursor_registered = False
         debug_context = dict(debug_context or {})
         start = time.monotonic()
-        _ray_worker_memory_log(
-            "native_execute_start",
-            **debug_context,
-            scan_task_map_count=len(scan_task_map or {}),
-            exchange_source_task_map_count=len(exchange_source_task_map or {}),
-            has_exchange_sink_instance=exchange_sink_instance is not None,
-            has_dynamic_filter_domains=bool(dynamic_filter_domains),
-        )
 
         try:
+            _configure_duckdb_s3(cursor, session_config)
+            query_admitted = self._register_native_cursor(cursor, native_query_id)
+            cursor_registered = True
+            _ray_worker_memory_log(
+                "native_execute_start",
+                **debug_context,
+                scan_task_map_count=len(scan_task_map or {}),
+                exchange_source_task_map_count=len(exchange_source_task_map or {}),
+                has_exchange_sink_instance=exchange_sink_instance is not None,
+                has_dynamic_filter_domains=bool(dynamic_filter_domains),
+            )
             if not query_admitted:
                 raise RuntimeError(f"native query is closing: {native_query_id}")
             plan_runner = self._get_plan_runner()
@@ -1294,7 +1352,8 @@ class RayWorkerActor:
             except Exception:
                 pass
             finally:
-                self._unregister_native_cursor(cursor)
+                if cursor_registered:
+                    self._unregister_native_cursor(cursor)
 
     @staticmethod
     async def _await_fragment_registration(registration_result: Any | None) -> None:
@@ -1316,7 +1375,6 @@ class RayWorkerActor:
         debug_context: dict[str, Any] | None = None,
     ) -> Any:
         """Run a plan on worker and return a Ray-serializable result tuple."""
-        _apply_env_overrides(self._env_overrides)
         debug_context = dict(debug_context or {})
 
         copy_output_info = _copy_output_info_from_context(context)

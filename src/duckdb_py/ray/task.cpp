@@ -1021,10 +1021,15 @@ py::object RayWorkerTask::Plan() const {
 	if (!plan_ref->HasRoot()) {
 		throw duckdb::InternalException("RayWorkerTask::Plan received a present physical plan without a root");
 	}
+	auto resource_query_id_entry = task_context.find("resource_query_id");
+	if (resource_query_id_entry == task_context.end() || resource_query_id_entry->second.empty()) {
+		throw duckdb::InternalException("RayWorkerTask::Plan requires non-empty task context resource_query_id");
+	}
 	py::object query_id_obj = py::str(query_id_entry->second);
-	auto udf_registrations_obj = ray_cxx.attr("_lookup_query_udf_registrations")(query_id_obj);
-	auto udf_actor_handles_obj = ray_cxx.attr("_lookup_query_udf_actor_handles")(query_id_obj);
-	auto connection_snapshot_obj = ray_cxx.attr("_lookup_query_connection_snapshot")(query_id_obj);
+	py::object resource_query_id_obj = py::str(resource_query_id_entry->second);
+	auto udf_registrations_obj = ray_cxx.attr("_lookup_query_udf_registrations")(resource_query_id_obj);
+	auto udf_actor_handles_obj = ray_cxx.attr("_lookup_query_udf_actor_handles")(resource_query_id_obj);
+	auto connection_snapshot_obj = ray_cxx.attr("_lookup_query_connection_snapshot")(resource_query_id_obj);
 
 	// Keep ownership locally until the capsule is fully constructed. Capsule
 	// construction can allocate and raise before its destructor callback owns
@@ -1034,7 +1039,8 @@ py::object RayWorkerTask::Plan() const {
 	                         [](void *ptr) { delete static_cast<std::shared_ptr<duckdb::PhysicalPlan> *>(ptr); });
 	plan_copy.release();
 	auto create_fn = ray_cxx.attr("_create_physical_plan_from_capsule");
-	return create_fn(plan_capsule, query_id_obj, udf_registrations_obj, udf_actor_handles_obj, connection_snapshot_obj);
+	return create_fn(plan_capsule, query_id_obj, resource_query_id_obj, udf_registrations_obj, udf_actor_handles_obj,
+	                 connection_snapshot_obj);
 }
 
 py::dict RayWorkerTask::Inputs() const {

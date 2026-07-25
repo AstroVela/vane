@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -2322,11 +2323,16 @@ def test_worker_drop_query_uses_separate_execution_and_storage_barriers(monkeypa
         events.append("datasource-release")
         return 2
 
+    def cleanup_replay(query_id):
+        assert query_id == "query-drop"
+        events.append("replay-cleanup")
+
     monkeypatch.setattr(worker_mod, "_close_flight_shuffle_query", close)
     monkeypatch.setattr(worker_mod, "_wait_flight_shuffle_executions_for_query", wait_for_executions)
     monkeypatch.setattr(worker_mod, "_drain_flight_shuffle_for_query", drain)
     monkeypatch.setattr(worker_mod, "_retire_flight_shuffle_query", retire)
     monkeypatch.setattr(worker_mod, "_release_datasource_factories_for_query", release_datasource_factories)
+    monkeypatch.setattr(worker_mod, "_cleanup_query_python_replay_state", cleanup_replay)
     actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
 
     prepare_result = asyncio.run(actor_class.fte_prepare_drop_query(DummyWorker(), "query-drop"))
@@ -2345,6 +2351,7 @@ def test_worker_drop_query_uses_separate_execution_and_storage_barriers(monkeypa
         "drain",
         "retire",
         "native-retire",
+        "replay-cleanup",
     ]
     assert result == {
         "tasks_removed": 2,
@@ -8118,6 +8125,12 @@ def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
         "get",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ray.get must not be used")),
     )
+    replay_registrations = []
+    monkeypatch.setattr(
+        worker_mod,
+        "_register_query_python_replay_state",
+        lambda query_id, plan: replay_registrations.append((query_id, plan)) or True,
+    )
 
     class _Plan:
         def has_root(self):
@@ -8141,6 +8154,7 @@ def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
     assert plan_ref.awaited
     assert actor._plan_fragments["query-1:node:1"] is resolved_plan
     assert actor._query_fragments == {"query-1": {"query-1:node:1"}}
+    assert replay_registrations == [("query-1", resolved_plan)]
 
 
 def test_start_ray_workers_skips_blocking_warmup_inside_ray_worker(monkeypatch):
@@ -8148,13 +8162,13 @@ def test_start_ray_workers_skips_blocking_warmup_inside_ray_worker(monkeypatch):
     option_calls = []
     remote_calls = []
 
-    class _FakeInstalledMethod:
+    class _FakePingMethod:
         def remote(self, *_args, **_kwargs):
             return "warmup-ref"
 
     class _FakeActorHandle:
         def __init__(self):
-            self.install_env_overrides = _FakeInstalledMethod()
+            self.ping = _FakePingMethod()
 
     class _FakeActorFactory:
         def options(self, **kwargs):
@@ -8195,19 +8209,170 @@ def test_start_ray_workers_skips_blocking_warmup_inside_ray_worker(monkeypatch):
     assert len(runtimes) == 1
     assert option_calls[0]["memory"] == 358
     assert option_calls[0]["runtime_env"] == {
-        "env_vars": {"RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0"},
+        "env_vars": {
+            "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
+            "VANE_WORKER": "1",
+            "VANE_WORKER_ID": "10.0.0.1",
+            "VANE_WORKER_INDEX": "0",
+        },
     }
     assert "num_cpus" not in option_calls[0]
     assert "num_gpus" not in option_calls[0]
     assert len(remote_calls) == 1
-    assert remote_calls[0]["env_overrides"]["VANE_WORKER_ID"] == "10.0.0.1"
-    assert remote_calls[0]["env_overrides"]["VANE_WORKER_INDEX"] == "0"
+    assert "env_overrides" not in remote_calls[0]
     assert remote_calls[0]["duckdb_memory_bytes"] == 256
     assert remote_calls[0]["task_heap_capacity_bytes"] == 615
     assert get_calls == []
 
 
-def test_execute_native_task_passes_exchange_and_sink_inputs():
+def test_worker_session_connection_rejects_reopen_after_close(monkeypatch):
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._session_connections = {}
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
+    actor._session_connections_lock = threading.RLock()
+    actor._shutdown_started = False
+    closed = []
+
+    class _SessionConnection:
+        def close(self):
+            closed.append("session")
+
+    class _SharedConnection:
+        def cursor(self):
+            return _SessionConnection()
+
+    actor._get_shared_conn = lambda: _SharedConnection()
+    monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", lambda *_args: None)
+
+    session_connection = actor_cls._get_session_conn(
+        actor,
+        "session-a",
+        {"AWS_ACCESS_KEY_ID": "key-a"},
+    )
+    assert (
+        actor_cls._get_session_conn(
+            actor,
+            "session-a",
+            {"AWS_ACCESS_KEY_ID": "key-a"},
+        )
+        is session_connection
+    )
+
+    actor_cls.close_session(actor, "session-a")
+
+    assert closed == ["session"]
+    with pytest.raises(RuntimeError, match="Vane session is closed"):
+        actor_cls._get_session_conn(
+            actor,
+            "session-a",
+            {"AWS_ACCESS_KEY_ID": "key-a"},
+        )
+
+
+def test_worker_session_configuration_failure_closes_unpublished_connection(monkeypatch):
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._session_connections = {}
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
+    actor._session_connections_lock = threading.RLock()
+    actor._shutdown_started = False
+    closed = []
+
+    class _SessionConnection:
+        def close(self):
+            closed.append("session")
+
+    class _SharedConnection:
+        def cursor(self):
+            return _SessionConnection()
+
+    actor._get_shared_conn = lambda: _SharedConnection()
+    monkeypatch.setattr(
+        worker_mod,
+        "_configure_duckdb_s3",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("planned session configuration failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="planned session configuration failure"):
+        actor_cls._get_session_conn(
+            actor,
+            "session-a",
+            {"AWS_ACCESS_KEY_ID": "key-a"},
+        )
+
+    assert closed == ["session"]
+    assert actor._session_connections == {}
+
+
+def test_worker_session_close_keeps_connection_retryable_after_failure():
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
+    actor._session_connections_lock = threading.RLock()
+    close_calls = []
+
+    class _SessionConnection:
+        def close(self):
+            close_calls.append("close")
+            if len(close_calls) == 1:
+                raise RuntimeError("planned close failure")
+
+    connection = _SessionConnection()
+    record = ({}, connection)
+    actor._session_connections = {"session-a": record}
+
+    with pytest.raises(RuntimeError, match="planned close failure"):
+        actor_cls.close_session(actor, "session-a")
+
+    assert actor._session_connections["session-a"] is record
+    assert "session-a" in actor._closed_session_ids
+
+    actor_cls.close_session(actor, "session-a")
+
+    assert close_calls == ["close", "close"]
+    assert "session-a" not in actor._session_connections
+
+
+def test_execute_native_task_configuration_failure_closes_unregistered_cursor(monkeypatch):
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._native_execution_condition = threading.Condition()
+    actor._active_native_cursors = set()
+    actor._native_cursor_query_ids = {}
+    actor._closing_native_queries = set()
+    closed = []
+
+    class _Cursor:
+        def close(self):
+            closed.append("cursor")
+
+    cursor = _Cursor()
+    actor._get_session_conn = lambda *_args: SimpleNamespace(cursor=lambda: cursor)
+    monkeypatch.setattr(
+        worker_mod,
+        "_configure_duckdb_s3",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("planned query cursor configuration failure")),
+    )
+
+    class _Plan:
+        @staticmethod
+        def session_id():
+            return "session-a"
+
+        @staticmethod
+        def session_config():
+            return {"AWS_ACCESS_KEY_ID": "key-a"}
+
+    with pytest.raises(RuntimeError, match="planned query cursor configuration failure"):
+        actor_cls._execute_native_task(actor, _Plan(), None, native_query_id="query-a")
+
+    assert closed == ["cursor"]
+    assert actor._active_native_cursors == set()
+    assert actor._native_cursor_query_ids == {}
+
+
+def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
     actor._native_execution_condition = threading.Condition()
@@ -8262,14 +8427,30 @@ def test_execute_native_task_passes_exchange_and_sink_inputs():
             )
             return "ok"
 
+    class _FakePlan:
+        def session_id(self):
+            return "session-a"
+
+        def session_config(self):
+            return {"AWS_ACCESS_KEY_ID": "session-a-key"}
+
     shared_conn = _FakeConn()
-    actor._get_shared_conn = lambda: shared_conn
+    actor._get_session_conn = lambda session_id, config: (
+        shared_conn if (session_id, config) == ("session-a", {"AWS_ACCESS_KEY_ID": "session-a-key"}) else None
+    )
     actor._get_plan_runner = lambda: _FakePlanRunner()
+    plan_object = _FakePlan()
+    configured = []
+    monkeypatch.setattr(
+        worker_mod,
+        "_configure_duckdb_s3",
+        lambda cursor, config: configured.append((cursor, dict(config))),
+    )
 
     dynamic_domains = {"df0": {"column": "id", "single_value": 7}}
     result = actor_cls._execute_native_task(
         actor,
-        "fake-plan",
+        plan_object,
         {"1": b"scan"},
         copy_output_info={"base": "", "run_id": "run-native", "remote_base": "/tmp/out"},
         exchange_source_task_map={"9": b"exchange-binding"},
@@ -8279,6 +8460,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs():
     )
 
     assert result == "ok"
+    assert configured == [(shared_conn.cursor_obj, {"AWS_ACCESS_KEY_ID": "session-a-key"})]
     assert len(calls) == 1
     (
         _,
@@ -8293,7 +8475,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs():
         native_progress_callback,
         runtime_context,
     ) = calls[0]
-    assert plan == "fake-plan"
+    assert plan is plan_object
     assert scan_task_arg == {"1": b"scan"}
     assert exchange_source_task_arg == {"9": b"exchange-binding"}
     assert copy_output_info == {"base": "", "run_id": "run-native", "remote_base": "/tmp/out"}
@@ -8309,7 +8491,40 @@ def test_execute_native_task_passes_exchange_and_sink_inputs():
     assert runtime_context == {"query_id": "q1", "fragment_id": "f1", "task_id": "q1.2.3.4"}
 
 
-def test_execute_native_task_uses_shared_database_for_fte():
+def test_configure_duckdb_s3_applies_secret_only_to_connection_context():
+    statements = []
+
+    class _FakeConnection:
+        def execute(self, statement):
+            statements.append(statement)
+
+    worker_mod._configure_duckdb_s3(
+        _FakeConnection(),
+        {"AWS_SECRET_ACCESS_KEY": "secret'value"},
+    )
+
+    assert statements[0] == "LOAD httpfs"
+    assert "SET s3_secret_access_key='secret''value'" in statements
+    assert all("SET GLOBAL" not in statement for statement in statements)
+
+
+def test_configure_duckdb_s3_preserves_scheme_less_endpoint_authority():
+    statements = []
+
+    class _FakeConnection:
+        def execute(self, statement):
+            statements.append(statement)
+
+    worker_mod._configure_duckdb_s3(
+        _FakeConnection(),
+        {"AWS_ENDPOINT_URL": "minio.internal:9000"},
+    )
+
+    assert "SET s3_endpoint='minio.internal:9000'" in statements
+    assert "SET s3_use_ssl=false" in statements
+
+
+def test_execute_native_task_uses_session_database_for_fte():
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
     actor._native_execution_condition = threading.Condition()
@@ -8334,7 +8549,17 @@ def test_execute_native_task_uses_shared_database_for_fte():
             closed.append("conn")
 
     shared_conn = _FakeConn()
-    actor._get_shared_conn = lambda: shared_conn
+
+    class _FakePlan:
+        def session_id(self):
+            return "session-a"
+
+        def session_config(self):
+            return {}
+
+    actor._get_session_conn = lambda session_id, config: (
+        shared_conn if (session_id, config) == ("session-a", {}) else None
+    )
 
     class _FakePlanRunner:
         def execute_native(
@@ -8361,7 +8586,7 @@ def test_execute_native_task_uses_shared_database_for_fte():
     exchange_queues = {"2": object()}
     result = actor_cls._execute_native_task(
         actor,
-        "fake-plan",
+        _FakePlan(),
         None,
         fte_scan_source_queues=scan_queues,
         fte_exchange_source_queues=exchange_queues,

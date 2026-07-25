@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import os
+import threading
 import uuid
+import weakref
 from typing import TYPE_CHECKING, Any
 
 from duckdb._ray_cxx import require_ray_cxx_attr
@@ -13,6 +15,7 @@ from duckdb._vane_session import ensure_vane_session_dir
 
 configure_ray_progress_logging_defaults()
 
+from duckdb.runners.ray.admission_ledger import BoundedReplayMap
 from duckdb.runners.ray.driver import RayQueryDriverClient
 from duckdb.runners.runner import Runner
 
@@ -22,6 +25,31 @@ if TYPE_CHECKING:
     import pyarrow as pa
 
     import duckdb
+
+
+_RAY_RUNNERS: weakref.WeakSet[RayRunner] = weakref.WeakSet()
+_RAY_RUNNERS_LOCK = threading.Lock()
+_SESSION_CLOSE_REPLAY_CAPACITY = 65_536
+
+
+def notify_connection_closed(session_id: str) -> None:
+    """Close one logical Vane session on every live local RayRunner."""
+    session_key = str(session_id).strip()
+    if not session_key:
+        raise ValueError("Vane session_id must not be empty")
+    with _RAY_RUNNERS_LOCK:
+        runners = tuple(_RAY_RUNNERS)
+    errors: list[BaseException] = []
+    for runner in runners:
+        try:
+            runner.close_session(session_key)
+        except BaseException as exc:
+            errors.append(exc)
+    if errors:
+        raise RuntimeError(
+            f"failed to close Vane session {session_key} on {len(errors)} local Ray runner(s): "
+            + "; ".join(f"{type(exc).__name__}: {exc}" for exc in errors)
+        ) from errors[0]
 
 
 def _configure_scan_task_backlog_env(max_task_backlog: int | None) -> None:
@@ -69,15 +97,53 @@ class RayRunner(Runner):
             )
 
         self.query_driver_client: RayQueryDriverClient | None = None
+        self._session_ids: set[str] = set()
+        self._closed_session_ids = BoundedReplayMap[str, bool](capacity=_SESSION_CLOSE_REPLAY_CAPACITY)
+        self._session_lock = threading.RLock()
+        self._closed = False
+        with _RAY_RUNNERS_LOCK:
+            _RAY_RUNNERS.add(self)
 
     def close(self) -> None:
-        if self.query_driver_client is not None:
-            try:
-                self.query_driver_client.close()
-            finally:
-                self.query_driver_client = None
+        with self._session_lock:
+            if self._closed:
+                return
+            client = self.query_driver_client
+            if client is not None:
+                client.close()
+            self.query_driver_client = None
+            self._session_ids.clear()
+            self._closed_session_ids.clear()
+            self._closed = True
+        with _RAY_RUNNERS_LOCK:
+            _RAY_RUNNERS.discard(self)
 
     shutdown = close
+
+    def close_session(self, session_id: str) -> None:
+        session_key = str(session_id).strip()
+        with self._session_lock:
+            self._closed_session_ids[session_key] = True
+            if session_key not in self._session_ids:
+                return
+            client = self.query_driver_client
+            if client is not None:
+                client.close_session(session_key)
+            self._session_ids.remove(session_key)
+
+    def _client_for_session(self, session_id: str) -> RayQueryDriverClient:
+        session_key = str(session_id).strip()
+        with self._session_lock:
+            if self._closed:
+                raise RuntimeError("RayRunner is closed")
+            if session_key in self._closed_session_ids:
+                raise RuntimeError(f"Vane session is closed: {session_key}")
+            client = self.query_driver_client
+            if client is None:
+                client = RayQueryDriverClient()
+                self.query_driver_client = client
+            self._session_ids.add(session_key)
+            return client
 
     def run_iter(
         self, relation: duckdb.DuckDBPyRelation, results_buffer_size: int | None = None
@@ -90,12 +156,12 @@ class RayRunner(Runner):
         )
 
         logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)
+        session_id = str(logical_plan.session_id())
 
-        if self.query_driver_client is None:
-            self.query_driver_client = RayQueryDriverClient()
+        client = self._client_for_session(session_id)
 
         # Send PyLogicalPlan to Driver — Driver will create physical plan
-        yield from self.query_driver_client.stream_plan(
+        yield from client.stream_plan(
             logical_plan,
         )
 
@@ -109,12 +175,12 @@ class RayRunner(Runner):
         query_id = str(uuid.uuid4())
 
         logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)
+        session_id = str(logical_plan.session_id())
 
-        if self.query_driver_client is None:
-            self.query_driver_client = RayQueryDriverClient()
+        client = self._client_for_session(session_id)
 
         # Send PyLogicalPlan to Driver — Driver will create physical plan
-        return self.query_driver_client.run_copy_plan(logical_plan)
+        return client.run_copy_plan(logical_plan)
 
     def run_iter_tables(self, relation: Any, results_buffer_size: int | None = None) -> Iterator[pa.Table]:
         for result in self.run_iter(relation, results_buffer_size=results_buffer_size):

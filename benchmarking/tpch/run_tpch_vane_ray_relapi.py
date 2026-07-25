@@ -169,23 +169,6 @@ def run_query_distributed_with_timeout(parquet_folder, qnum, threads, timeout, r
     if proc.is_alive():
         proc.kill()
         proc.join(timeout=5)
-        # Kill stuck query driver actor so ray.shutdown() won't hang
-        try:
-            import ray as _ray
-
-            for actor_name in ("ray-query-driver-actor",):
-                try:
-                    actor = _ray.get_actor(actor_name, namespace="vane")
-                except Exception:
-                    continue
-                _ray.kill(actor, no_restart=True)
-                print(
-                    f"  [diag] killed stuck actor '{actor_name}' after subprocess timeout",
-                    flush=True,
-                )
-                break
-        except Exception:
-            pass
         return "TIMEOUT", timeout, f"subprocess killed after {timeout}s"
 
     if not queue.empty():

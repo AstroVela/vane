@@ -237,6 +237,14 @@ std::unordered_map<std::string, duckdb::idx_t> RayWorkerRuntime::FragmentStats()
 	return stats;
 }
 
+void RayWorkerRuntime::CloseSession(const string &session_id) {
+	if (session_id.empty()) {
+		throw duckdb::InvalidInputException("Ray worker close session requires a non-empty session_id");
+	}
+	duckdb::PythonGILWrapper gil;
+	ray_worker_handle_.attr("close_session")(session_id);
+}
+
 void RayWorkerRuntime::PrepareShutdown() {
 	duckdb::PythonGILWrapper gil;
 	ray_worker_handle_.attr("prepare_shutdown")();

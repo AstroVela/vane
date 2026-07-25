@@ -95,6 +95,13 @@ static py::dict BuildUDFNode(idx_t node_id, UDFFunctionData &bind_data, ClientCo
 	py::dict meta;
 	meta[py::str("node_id")] = py::int_(node_id);
 	meta[py::str("payload")] = payload_obj;
+	if (bind_data.actor_handles) {
+		auto *boxed_options = static_cast<py::object *>(bind_data.actor_handles.get());
+		if (!py::isinstance<py::dict>(*boxed_options)) {
+			throw InvalidInputException("udf executor options must be a dict");
+		}
+		meta[py::str("executor_options")] = py::reinterpret_borrow<py::dict>(*boxed_options);
+	}
 	if (py::isinstance<py::dict>(payload_obj)) {
 		auto payload_dict = py::reinterpret_borrow<py::dict>(payload_obj);
 		auto get = payload_dict.attr("get");
@@ -234,7 +241,7 @@ private:
 		pybind11::list subprocess_nodes;
 		for (idx_t node_id = 0; node_id < bind_nodes.size(); node_id++) {
 			auto *bind_data = bind_nodes[node_id];
-			if (!bind_data || bind_data->actor_handles) {
+			if (!bind_data) {
 				continue;
 			}
 			string backend;
@@ -243,7 +250,7 @@ private:
 			}
 			if (backend == "subprocess_actor") {
 				subprocess_nodes.append(BuildUDFNode(node_id, *bind_data, context));
-			} else if (backend == "ray_actor") {
+			} else if (backend == "ray_actor" && !bind_data->actor_handles) {
 				throw InvalidInputException("ray_actor UDF execution requires driver-precreated actor handles from a "
 				                            "registered query allocation; "
 				                            "execute the relation through RayRunner");

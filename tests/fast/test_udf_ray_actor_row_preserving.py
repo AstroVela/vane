@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from typing import Any
@@ -76,9 +77,13 @@ def fake_ray(monkeypatch: pytest.MonkeyPatch) -> _FakeRayModule:
     # Load the actor runtime and its runner dependencies against real Ray.
     # The fake only needs to replace Ray while the actor class itself runs.
     import duckdb.execution.udf_ray_actor_runtime  # noqa: F401
+    from duckdb.runners.ray.ray_env import build_session_runtime_env_vars
 
     module = _FakeRayModule()
     monkeypatch.setitem(sys.modules, "ray", module)
+    monkeypatch.setenv("VANE_ISSUE75_INHERITED_SECRET", "inherited-secret")
+    for key, value in build_session_runtime_env_vars({"AWS_ISSUE75_ACTOR_SESSION": "actor-session"}).items():
+        monkeypatch.setenv(key, value)
     return module
 
 
@@ -115,6 +120,13 @@ def test_actor_block_stream_rows_mode_fuses_passthrough(fake_ray):
         "keep": ["a", "b", "c"],
         "y": [2, 3, 4],
     }
+
+
+def test_actor_constructor_installs_only_explicit_session_environment(fake_ray):
+    _make_actor(_rows_payload(_AddOne))
+
+    assert "VANE_ISSUE75_INHERITED_SECRET" not in os.environ
+    assert os.environ["AWS_ISSUE75_ACTOR_SESSION"] == "actor-session"
 
 
 def test_actor_ref_bundle_block_stream_rows_mode_fuses_passthrough(fake_ray):

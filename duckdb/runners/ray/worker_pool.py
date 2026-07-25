@@ -24,7 +24,7 @@ RayWorkerRuntime: Any = require_ray_cxx_attr(
 )
 
 
-def _persistent_worker_runtime_env() -> dict[str, dict[str, str]]:
+def _persistent_worker_runtime_env(env_vars: dict[str, str]) -> dict[str, Any]:
     """Keep the node's accelerator visibility in a zero-GPU Ray actor.
 
     Ray 2.53 through 2.55 clear accelerator visibility for actors that do not
@@ -32,7 +32,10 @@ def _persistent_worker_runtime_env() -> dict[str, dict[str, str]]:
     2.56 and later preserve it by default, but accepting the switch keeps the
     behavior stable across the supported Ray range.
     """
-    return {"env_vars": {"RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0"}}
+    runtime_env_vars = dict(env_vars)
+    runtime_env_vars["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
+    runtime_env_vars["VANE_WORKER"] = "1"
+    return {"env_vars": runtime_env_vars}
 
 
 def start_ray_workers(existing_worker_ids: list[str]) -> list[RayWorkerRuntime]:
@@ -67,7 +70,7 @@ def start_ray_workers(existing_worker_ids: list[str]) -> list[RayWorkerRuntime]:
             actor = RayWorkerActor.options(  # type: ignore[attr-defined]
                 max_concurrency=_actor_max_conc,
                 memory=(memory_layout.worker_duckdb_memory_bytes + memory_layout.runtime_reserve_bytes),
-                runtime_env=_persistent_worker_runtime_env(),
+                runtime_env=_persistent_worker_runtime_env(worker_env),
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node["NodeID"],
                     soft=False,
@@ -77,7 +80,6 @@ def start_ray_workers(existing_worker_ids: list[str]) -> list[RayWorkerRuntime]:
                 num_gpus=int(node["Resources"].get("GPU", 0)),
                 duckdb_memory_bytes=memory_layout.worker_duckdb_memory_bytes,
                 task_heap_capacity_bytes=memory_layout.task_heap_capacity_bytes,
-                env_overrides=worker_env,
             )
             actors.append((node, worker_id, actor))
 
@@ -85,7 +87,7 @@ def start_ray_workers(existing_worker_ids: list[str]) -> list[RayWorkerRuntime]:
     # This absorbs the ~2.5s actor cold-start so the first task dispatch is fast.
     # Matches upstream Vane's start_ray_workers() pattern.
     ACTOR_STARTUP_TIMEOUT = 120
-    warmup_refs = [actor.install_env_overrides.remote(None) for _, _, actor in actors]
+    warmup_refs = [actor.ping.remote() for _, _, actor in actors]
     # Nested distributed execution may call start_ray_workers() from inside a
     # Ray actor. Let actor startup proceed asynchronously there and rely on the
     # first task submission for backpressure.

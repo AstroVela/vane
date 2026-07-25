@@ -154,6 +154,17 @@ private:
 	unique_ptr<DuckDBPyRelation> result;
 };
 
+struct VaneSessionContext {
+	VaneSessionContext(string id_p, py::dict config_p) : id(std::move(id_p)), config(std::move(config_p)) {
+	}
+
+	string id;
+	py::dict config;
+	mutex lock;
+	idx_t connection_count = 1;
+	bool ray_session_opened = false;
+};
+
 struct DuckDBPyConnection : public enable_shared_from_this<DuckDBPyConnection> {
 private:
 	class Cursors {
@@ -177,6 +188,8 @@ public:
 	string connection_database = ":memory:";
 	bool connection_read_only = false;
 	py::dict connection_config = py::dict();
+	shared_ptr<VaneSessionContext> vane_session;
+	bool vane_session_attached = false;
 	//! MemoryFileSystem used to temporarily store file-like objects for reading
 	shared_ptr<ModifiedMemoryFileSystem> internal_object_filesystem;
 	case_insensitive_map_t<unique_ptr<ExternalDependency>> registered_functions;
@@ -363,6 +376,12 @@ public:
 	static shared_ptr<DuckDBPyConnection> Connect(const py::object &database, bool read_only, const py::dict &config);
 	void SetConnectionBootstrapConfig(const string &database, bool read_only, const py::dict &config);
 	py::dict ExportConnectionBootstrapConfig() const;
+	void InitializeVaneSession();
+	void InheritVaneSession(const DuckDBPyConnection &owner);
+	const string &GetVaneSessionId() const;
+	py::dict ExportVaneSessionConfig() const;
+	void MarkVaneRaySessionOpened();
+	void ReleaseVaneSession();
 
 	static vector<Value> TransformPythonParamList(const py::handle &params);
 	static case_insensitive_map_t<BoundParameterData> TransformPythonParamDict(const py::dict &params);

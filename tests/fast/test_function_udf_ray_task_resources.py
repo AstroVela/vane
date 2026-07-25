@@ -117,12 +117,13 @@ def test_ray_task_remote_keeps_options_available_for_lease_node_affinity():
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
     import duckdb.execution.udf_ray as fur
+    from duckdb.runners.ray.ray_env import build_session_runtime_env_vars
 
     for builder in (
         fur._build_bundle_stream_remote,
         fur._build_ref_bundle_stream_remote,
     ):
-        remote_fn = builder(1.0, 0.0, 2 * _GIB, 2, {})
+        remote_fn = builder(1.0, 0.0, 2 * _GIB, 2, {}, build_session_runtime_env_vars({}))
         scheduled = remote_fn.options(
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node_id=_NODE_ID,
@@ -143,9 +144,34 @@ def test_ray_task_executor_requires_runner_owned_ray_runtime(monkeypatch):
         fur._build_ray_task_executor(_distributed_payload(), {})
 
 
+def test_ray_task_executor_requires_explicit_query_driver_handle(monkeypatch):
+    import ray
+
+    import duckdb.execution.udf_ray as fur
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+
+    with pytest.raises(RuntimeError, match="explicit query driver handle"):
+        fur._build_ray_task_executor(
+            _distributed_payload(),
+            {
+                "max_task_retries": None,
+            },
+        )
+
+
 def test_ray_udf_rejects_unknown_options_without_compatibility_branches():
     import duckdb.execution.udf as udf
 
+    query_driver_handle = object()
+    assert (
+        udf.normalize_options(
+            {
+                "query_driver_handle": query_driver_handle,
+            }
+        )["query_driver_handle"]
+        is query_driver_handle
+    )
     with pytest.raises(ValueError, match="unknown UDF executor options: ray_address"):
         udf.normalize_options({"ray_address": "auto"})
     with pytest.raises(TypeError, match="must be a dict"):
@@ -205,6 +231,7 @@ def test_task_executor_consumes_pregranted_admission_with_exact_resources(monkey
         payload,
         run_bundle_stream=object(),
         run_ref_bundle_stream=object(),
+        query_driver_handle=object(),
     )
     admission = SimpleNamespace(
         driver=object(),
@@ -249,6 +276,7 @@ def test_task_submission_starts_immediately_from_pregranted_lease(monkeypatch):
         _distributed_payload(),
         run_bundle_stream=_Remote(),
         run_ref_bundle_stream=_Remote(),
+        query_driver_handle=object(),
     )
     lease = {
         "query_id": "q1",

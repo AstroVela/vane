@@ -10,7 +10,6 @@ from typing import Any
 from duckdb.runners.ray.query_execution_graph import QueryAllocation, QueryExecutionGraph
 from duckdb.runners.ray.query_resource_manager import QueryResourceManager
 
-
 _LOCK = threading.RLock()
 _MANAGERS: dict[str, QueryResourceManager] = {}
 
@@ -64,10 +63,13 @@ def release_query_resource_manager(query_id: str, *, reason: str) -> dict[str, A
     if not query_key:
         return {"released": False, "task_lease_count": 0, "output_lease_count": 0}
     with _LOCK:
-        manager = _MANAGERS.pop(query_key, None)
+        manager = _MANAGERS.get(query_key)
     if manager is None:
         return {"released": False, "task_lease_count": 0, "output_lease_count": 0}
     released = manager.cancel(reason)
+    with _LOCK:
+        if _MANAGERS.get(query_key) is manager:
+            _MANAGERS.pop(query_key, None)
     return {"released": True, **released}
 
 

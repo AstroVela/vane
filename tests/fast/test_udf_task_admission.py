@@ -59,6 +59,11 @@ def _payload():
     }
 
 
+def test_task_admission_requires_explicit_query_driver_handle():
+    with pytest.raises(ValueError, match="query driver handle"):
+        TaskAdmissionController(_payload(), driver=None)
+
+
 def _grant(request):
     return {
         "granted": True,

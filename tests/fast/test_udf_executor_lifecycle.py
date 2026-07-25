@@ -1145,12 +1145,207 @@ def test_vllm_router_waits_for_actor_finished_refs(monkeypatch):
     assert observed == ["finish-0", "finish-1"]
 
 
+def test_vllm_query_owned_actors_receive_explicit_session_environment(monkeypatch):
+    import duckdb.execution.vllm as vllm
+    from duckdb.runners.ray.ray_env import build_session_runtime_env_vars
+
+    creations = []
+
+    class FakeActorFactory:
+        def __init__(self, actor_class, options=None):
+            self.actor_class = actor_class
+            self.actor_options = dict(options or {})
+
+        def options(self, **options):
+            return FakeActorFactory(self.actor_class, options)
+
+        def remote(self, *args, **kwargs):
+            handle = f"{self.actor_class.__name__}-{len(creations)}"
+            creations.append((self.actor_class, self.actor_options, args, kwargs, handle))
+            return handle
+
+    class FakeRay(types.ModuleType):
+        def __init__(self):
+            super().__init__("ray")
+            self.killed = []
+
+        def remote(self, *args, **options):
+            if args:
+                assert len(args) == 1
+                assert not options
+                return FakeActorFactory(args[0])
+            return lambda actor_class: FakeActorFactory(actor_class, options)
+
+        def kill(self, actor, *, no_restart):
+            self.killed.append((actor, no_restart))
+
+    fake_ray = FakeRay()
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    session_config = {
+        "AWS_ACCESS_KEY_ID": "session-key",
+        "DUCKDB_CUSTOM_SESSION": "session-value",
+        "UNMANAGED": "ignored",
+    }
+
+    actors = vllm.LLMActors(
+        model="model",
+        engine_args={},
+        generate_args={},
+        on_error="raise",
+        gpus_per_actor=1,
+        concurrency=2,
+        load_balance_threshold=32,
+        name_prefix="query-pool",
+        session_config=session_config,
+    )
+
+    expected_runtime_env = {"env_vars": build_session_runtime_env_vars(session_config)}
+    assert [creation[1] for creation in creations] == [
+        {"name": "query-pool-llm-0", "runtime_env": expected_runtime_env},
+        {"name": "query-pool-llm-1", "runtime_env": expected_runtime_env},
+        {"name": "query-pool-router", "runtime_env": expected_runtime_env},
+    ]
+    assert creations[0][3]["_install_session_runtime_env"] is True
+    assert creations[1][3]["_install_session_runtime_env"] is True
+    assert creations[2][3]["_install_session_runtime_env"] is True
+
+    actors.shutdown()
+
+    assert fake_ray.killed == [
+        ("PrefixRouter-2", True),
+        ("RayLocalVLLMExecutor-0", True),
+        ("RayLocalVLLMExecutor-1", True),
+    ]
+    assert actors.router_actor is None
+    assert actors.llm_actors == []
+
+
+def test_vllm_actor_entrypoints_install_explicit_session_environment(monkeypatch):
+    import duckdb.execution.vllm as vllm
+
+    events = []
+
+    monkeypatch.setattr(vllm, "install_explicit_session_runtime_env", lambda: events.append("install"))
+    monkeypatch.setattr(vllm.LocalVLLMExecutor, "__init__", lambda *_args, **_kwargs: events.append("executor"))
+
+    vllm.RayLocalVLLMExecutor(
+        "model",
+        {},
+        {},
+        _install_session_runtime_env=True,
+    )
+    vllm.PrefixRouter([], 32, _install_session_runtime_env=True)
+
+    assert events == ["install", "executor", "install"]
+
+
+def test_vllm_actor_shutdown_retains_failed_handles_for_retry(monkeypatch):
+    import duckdb.execution.vllm as vllm
+
+    class FakeRay(types.ModuleType):
+        def __init__(self):
+            super().__init__("ray")
+            self.attempts = []
+            self.fail_once = {"llm-0"}
+
+        def kill(self, actor, *, no_restart):
+            self.attempts.append((actor, no_restart))
+            if actor in self.fail_once:
+                self.fail_once.remove(actor)
+                raise RuntimeError("transient kill failure")
+
+    fake_ray = FakeRay()
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    actors = vllm.LLMActors._from_handles(["llm-0", "llm-1"], "router")
+
+    with pytest.raises(RuntimeError, match="transient kill failure"):
+        actors.shutdown()
+
+    assert actors.router_actor is None
+    assert actors.llm_actors == ["llm-0"]
+
+    actors.shutdown()
+
+    assert actors.llm_actors == []
+    assert fake_ray.attempts == [
+        ("router", True),
+        ("llm-0", True),
+        ("llm-1", True),
+        ("llm-0", True),
+    ]
+
+
+def test_udf_actor_shutdown_retains_failed_handles_for_retry(monkeypatch):
+    from duckdb.execution.udf_ray_actor_pool import UDFActorPoolBase
+
+    class FakeRay(types.ModuleType):
+        def __init__(self):
+            super().__init__("ray")
+            self.attempts = []
+            self.fail_once = {"actor-0"}
+
+        def kill(self, actor, *, no_restart):
+            self.attempts.append((actor, no_restart))
+            if actor in self.fail_once:
+                self.fail_once.remove(actor)
+                raise RuntimeError("transient kill failure")
+
+    fake_ray = FakeRay()
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    actors = UDFActorPoolBase.__new__(UDFActorPoolBase)
+    actors._owns_actors = True
+    actors.actors = ["actor-0", "actor-1"]
+
+    with pytest.raises(RuntimeError, match="transient kill failure"):
+        actors.shutdown()
+
+    assert actors.actors == ["actor-0"]
+
+    actors.shutdown()
+
+    assert actors.actors == []
+    assert fake_ray.attempts == [
+        ("actor-0", True),
+        ("actor-1", True),
+        ("actor-0", True),
+    ]
+
+
+def test_ray_task_session_environment_is_reinstalled_for_reused_worker(monkeypatch):
+    import os
+
+    import duckdb.execution.udf_ray as udf_ray
+    from duckdb.runners.ray.ray_env import build_session_runtime_env_vars
+
+    stale_key = "AWS_ISSUE75_STALE_TASK_SECRET"
+    session_key = "AWS_ISSUE75_CURRENT_TASK_SECRET"
+    monkeypatch.setenv(stale_key, "stale")
+    carrier = build_session_runtime_env_vars({session_key: "current"})
+
+    @udf_ray._with_explicit_session_runtime_env(carrier)
+    def _stream():
+        assert stale_key not in os.environ
+        assert os.environ[session_key] == "current"
+        yield "value"
+        raise AssertionError("closing the generator must not resume its body")
+
+    for _ in range(2):
+        stream = _stream()
+        assert next(stream) == "value"
+        stream.close()
+
+        assert stale_key not in os.environ
+        assert session_key not in os.environ
+        assert all(key not in os.environ for key in carrier)
+
+
 def test_vllm_named_actor_pool_partial_lookup_fails_without_creation_fallback(monkeypatch):
     import duckdb.execution.vllm as vllm
 
     class FakeRay:
         def __init__(self):
             self.lookups: list[str] = []
+            self.killed: list[str] = []
 
         def get_actor(self, name):
             self.lookups.append(name)
@@ -1158,13 +1353,18 @@ def test_vllm_named_actor_pool_partial_lookup_fails_without_creation_fallback(mo
                 return f"actor:{name}"
             raise ValueError(name)
 
+        def kill(self, actor, *, no_restart):
+            assert no_restart is True
+            self.killed.append(actor)
+
     def fail_create(*_args, **_kwargs):
         raise AssertionError("partial named vLLM pool must not fall back to actor creation")
 
-    monkeypatch.setitem(sys.modules, "ray", FakeRay())
+    fake_ray = FakeRay()
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
     monkeypatch.setattr(vllm.LLMActors, "__init__", fail_create)
 
-    with pytest.raises(RuntimeError, match="partially available|incomplete"):
+    with pytest.raises(RuntimeError, match="partially available|incomplete") as exc_info:
         vllm.LLMActors.get_or_create_named(
             model="model",
             engine_args={},
@@ -1175,6 +1375,11 @@ def test_vllm_named_actor_pool_partial_lookup_fails_without_creation_fallback(mo
             load_balance_threshold=32,
             name_prefix="pool",
         )
+
+    owned_pools = exc_info.value.owned_actor_pools
+    assert len(owned_pools) == 1
+    owned_pools[0].shutdown()
+    assert fake_ray.killed == ["actor:pool-router", "actor:pool-llm-0"]
 
 
 def test_vllm_ray_execution_requires_runner_owned_runtime(monkeypatch):
@@ -1391,11 +1596,11 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_injects_with_callback(mon
     injected = []
 
     class FakeLocalActorPool:
-        def __init__(self, payload, pool_size, *, name=None):
+        def __init__(self, payload, pool_size, *, name=None, session_config=None):
             self.payload = payload
             self.pool_size = pool_size
             self.name = name
-            created_args.append((payload, pool_size, name))
+            created_args.append((payload, pool_size, name, session_config))
 
         def shutdown(self, *, kill=False):
             pass
@@ -1409,6 +1614,11 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_injects_with_callback(mon
                 "actor_number": 2,
                 "function_pickle": b"unused",
                 "call_mode": "map_batches",
+            },
+            "executor_options": {
+                "session_config": {
+                    "AWS_ACCESS_KEY_ID": "session-key",
+                },
             },
         },
         {
@@ -1433,7 +1643,13 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_injects_with_callback(mon
     assert len(created) == 1
     assert created_args[0][1] == 2
     assert created_args[0][2] == "local-subprocess-actor-direct-plan-4"
-    assert handles_map == {"4": {"local_actor_pool": created[0]}}
+    assert created_args[0][3] == {"AWS_ACCESS_KEY_ID": "session-key"}
+    assert handles_map == {
+        "4": {
+            "local_actor_pool": created[0],
+            "session_config": {"AWS_ACCESS_KEY_ID": "session-key"},
+        }
+    }
     assert injected == [handles_map]
 
 
@@ -3480,7 +3696,8 @@ def test_local_subprocess_actor_pool_rolls_back_created_workers_on_worker_init_f
 
     created: list[FakeWorker] = []
 
-    def fake_worker(payload, *, worker_env=None):
+    def fake_worker(payload, *, worker_env=None, session_config=None):
+        assert session_config is None
         if len(created) == 1:
             raise RuntimeError("worker init failed")
         worker = FakeWorker(f"w{len(created)}")
@@ -3515,7 +3732,8 @@ def test_local_subprocess_actor_pool_rolls_back_created_workers_on_thread_pool_i
     class FakeWorker:
         _proc = None
 
-        def __init__(self, payload, *, worker_env=None):
+        def __init__(self, payload, *, worker_env=None, session_config=None):
+            assert session_config is None
             self.name = f"w{len(created)}"
             created.append(self.name)
 
@@ -3921,6 +4139,98 @@ def test_subprocess_task_shared_payload_pool_keeps_worker_slots_global(monkeypat
         assert observed_stats["active_workers"] == 1
         assert observed_stats["total_workers"] == 1
         assert len(pids) == 1
+    finally:
+        executor_a.close(kill=True)
+        executor_b.close(kill=True)
+        subprocess_exec._shutdown_global_task_runtime()
+
+
+def test_subprocess_task_pool_identity_includes_session_config():
+    from duckdb.execution.udf_subprocess import _payload_task_key
+
+    payload = {
+        "execution_backend": "subprocess_task",
+        "udf_worker_slots": 1,
+        "function_pickle": b"same-function",
+    }
+
+    first = _payload_task_key(payload, {"AWS_ACCESS_KEY_ID": "session-a"})
+    second = _payload_task_key(payload, {"AWS_ACCESS_KEY_ID": "session-b"})
+    reordered = _payload_task_key(
+        payload,
+        {
+            "VANE_AUTH_HEADER": "auth",
+            "AWS_ACCESS_KEY_ID": "session-a",
+        },
+    )
+    reordered_again = _payload_task_key(
+        payload,
+        {
+            "AWS_ACCESS_KEY_ID": "session-a",
+            "VANE_AUTH_HEADER": "auth",
+        },
+    )
+
+    assert first != second
+    assert reordered == reordered_again
+
+
+def test_subprocess_task_workers_receive_exact_session_environment(monkeypatch):
+    import duckdb.execution.udf_subprocess as subprocess_exec
+
+    subprocess_exec._shutdown_global_task_runtime()
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "inherited-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "inherited-secret")
+    monkeypatch.setenv("VANE_AUTH_HEADER", "inherited-auth")
+
+    def read_session_environment(table):
+        import os
+
+        row_count = table.num_rows
+        return pa.table(
+            {
+                "access_key": [os.environ.get("AWS_ACCESS_KEY_ID", "<missing>")] * row_count,
+                "secret_key": [os.environ.get("AWS_SECRET_ACCESS_KEY", "<missing>")] * row_count,
+                "auth_header": [os.environ.get("VANE_AUTH_HEADER", "<missing>")] * row_count,
+            }
+        )
+
+    payload = _subprocess_map_payload(read_session_environment)
+    executor_a = subprocess_exec.UDFExecutor(
+        payload,
+        options={
+            "session_config": {
+                "AWS_ACCESS_KEY_ID": "session-a",
+                "VANE_AUTH_HEADER": "auth-a",
+            }
+        },
+    )
+    executor_b = subprocess_exec.UDFExecutor(
+        payload,
+        options={
+            "session_config": {
+                "AWS_ACCESS_KEY_ID": "session-b",
+            }
+        },
+    )
+    try:
+        assert executor_a._task_pool is not executor_b._task_pool
+        _submit_with_admission(executor_a, pa.table({"x": [1]}), submit_id=191)
+        _submit_with_admission(executor_b, pa.table({"x": [2]}), submit_id=192)
+
+        result_a = _wait_for_results(executor_a, 1, timeout_s=10.0)[0][2]
+        result_b = _wait_for_results(executor_b, 1, timeout_s=10.0)[0][2]
+
+        assert result_a.to_pydict() == {
+            "access_key": ["session-a"],
+            "secret_key": ["<missing>"],
+            "auth_header": ["auth-a"],
+        }
+        assert result_b.to_pydict() == {
+            "access_key": ["session-b"],
+            "secret_key": ["<missing>"],
+            "auth_header": ["<missing>"],
+        }
     finally:
         executor_a.close(kill=True)
         executor_b.close(kill=True)
@@ -4525,6 +4835,7 @@ def _ray_task_executor(*, stream_result="stream-ref", ref_stream_result="ref-str
         },
         run_stream,
         run_ref_stream,
+        query_driver_handle=object(),
     )
     return executor, run_stream, run_ref_stream
 

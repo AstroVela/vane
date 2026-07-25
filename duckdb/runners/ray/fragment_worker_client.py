@@ -87,6 +87,15 @@ class RayWorkerActorHandle(
         with _FTE_REGISTRY_LOCK:
             _FTE_WORKER_HANDLES[worker_id] = self
 
+    def close_session(self, session_id: str) -> None:
+        from duckdb.runners.ray.safe_get import resolve_object_refs_blocking
+
+        resolve_object_refs_blocking(
+            self.actor_handle.close_session.remote(str(session_id)),
+            timeout=30,
+            honor_query_deadline=False,
+        )
+
     @staticmethod
     def _fte_task_handle_cls() -> type[Any]:
         # Lazy import to avoid a module import cycle with driver.py.

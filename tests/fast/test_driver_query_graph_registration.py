@@ -29,6 +29,19 @@ from duckdb.runners.ray.query_resource_runtime import (
 )
 
 _GIB = 1024**3
+_OWNER_ID = "query-graph-test-owner"
+_SESSION_ID = "query-graph-test-session"
+
+
+class _FakeConnection:
+    def __init__(self):
+        self.closed = False
+
+    def cursor(self):
+        return _FakeConnection()
+
+    def close(self):
+        self.closed = True
 
 
 class _FakeLogicalPlan:
@@ -40,6 +53,15 @@ class _FakeLogicalPlan:
         assert conn is not None
         self._events.append("physical_plan")
         return self._physical_plan
+
+    def idx(self):
+        return self._physical_plan.idx()
+
+    def session_id(self):
+        return _SESSION_ID
+
+    def session_config(self):
+        return {}
 
 
 class _ValidatingLogicalPlan(_FakeLogicalPlan):
@@ -57,6 +79,12 @@ class _FakePhysicalPlan:
 
     def idx(self):
         return self._query_id
+
+    def session_id(self):
+        return _SESSION_ID
+
+    def session_config(self):
+        return {}
 
     def collect_execution_stages(self, conn=None):
         assert conn is not None
@@ -168,12 +196,27 @@ def _clean_query_runtime():
 
 
 def _runner(events, coordinator):
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from duckdb.runners.ray.driver import BoundedReplayMap, RayQueryDriverActor, _DriverSession
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
-    runner._duckdb_conn = object()
-    runner._env_overrides = {}
+    runner._duckdb_conn = _FakeConnection()
+    runner._client_ids = {_OWNER_ID}
+    runner._detaching_client_ids = set()
+    runner._detached_client_results = BoundedReplayMap(capacity=65_536)
+    runner._session_lock = threading.RLock()
+    runner._closed_session_owners = BoundedReplayMap(capacity=65_536)
+    runner._plan_session_ids = {}
+    runner._plan_connections = {}
+    runner._plan_teardown_condition = threading.Condition(runner._session_lock)
+    runner._plan_teardowns_in_progress = set()
+    runner._sessions = {
+        _SESSION_ID: _DriverSession(
+            owner_id=_OWNER_ID,
+            config={},
+            connection=runner._duckdb_conn.cursor(),
+        )
+    }
     runner._query_resource_coordinator = coordinator
     runner._query_resource_lock = threading.RLock()
     runner._query_allocations = {}
@@ -181,6 +224,7 @@ def _runner(events, coordinator):
     runner._active_udf_actors = []
     runner._active_udf_actors_by_plan = {}
     runner._active_vllm_actors = []
+    runner._active_vllm_actors_by_plan = {}
     runner.curr_plans = {}
     runner.curr_streams = {}
     runner._plan_query_ids = {}
@@ -201,7 +245,7 @@ def _runner(events, coordinator):
 
     runner._read_query_node_capacities = _read_node_capacities
     runner._ensure_duckdb_conn = lambda: runner._duckdb_conn
-    runner._precreate_vllm_actors = lambda plan: events.append("vllm_ready") or []
+    runner._precreate_vllm_actors = lambda plan, *, query_connection, session_config: events.append("vllm_ready") or []
     runner._get_plan_runner = lambda: SimpleNamespace(run_plan=lambda plan, conn: "stream")
     return runner_cls, runner
 
@@ -213,16 +257,33 @@ def test_driver_starts_plan_runner_before_opening_actor_readiness_gate():
     query_id = "query-driver-order"
     physical_plan = _FakePhysicalPlan(query_id, _metadata(query_id), events)
 
-    def _precreate(plan, graph, allocation):
+    def _precreate(plan, graph, allocation, *, query_connection, session_config):
+        assert query_connection is not None
+        assert session_config == {}
         assert graph.query_id == query_id
         assert allocation.actor_node_ids_for_stage(f"stage:{query_id}:node:1:udf") == ("node-a",)
         manager = get_query_resource_manager(query_id)
         actor_stage = manager.snapshot()["stages"][f"stage:{query_id}:node:1:udf"]
         assert actor_stage["actor_ready"] is False
         events.append("actors_created")
-        return [SimpleNamespace(shutdown=lambda: None)]
+        pool = SimpleNamespace(shutdown=lambda: None)
+        runner._active_udf_actors.append(pool)
+        runner._active_udf_actors_by_plan[query_id] = [pool]
+        return [pool]
 
     runner._precreate_udf_actors = _precreate
+    vllm_pool = SimpleNamespace(shutdown=lambda: None)
+
+    def _precreate_vllm(plan, *, query_connection, session_config):
+        assert plan is physical_plan
+        assert query_connection is not None
+        assert session_config == {}
+        events.append("vllm_ready")
+        runner._active_vllm_actors.append(vllm_pool)
+        runner._active_vllm_actors_by_plan[query_id] = [vllm_pool]
+        return [vllm_pool]
+
+    runner._precreate_vllm_actors = _precreate_vllm
 
     def _wait_for_ready(_actor_pools):
         manager = get_query_resource_manager(query_id)
@@ -241,7 +302,14 @@ def test_driver_starts_plan_runner_before_opening_actor_readiness_gate():
 
     runner._get_plan_runner = lambda: SimpleNamespace(run_plan=_run_plan)
 
-    asyncio.run(runner_cls.run_plan(runner, _FakeLogicalPlan(physical_plan, events)))
+    asyncio.run(
+        runner_cls.run_plan(
+            runner,
+            _OWNER_ID,
+            _SESSION_ID,
+            _FakeLogicalPlan(physical_plan, events),
+        )
+    )
 
     assert events == [
         "physical_plan",
@@ -256,6 +324,7 @@ def test_driver_starts_plan_runner_before_opening_actor_readiness_gate():
     manager = get_query_resource_manager(query_id)
     assert manager.snapshot()["stages"][f"stage:{query_id}:node:1:udf"]["actor_ready"] is True
     assert runner.curr_streams[query_id] == "stream"
+    assert runner._active_vllm_actors_by_plan[query_id] == [vllm_pool]
 
 
 def test_run_plan_does_not_read_physical_plan_id_after_registration():
@@ -432,14 +501,23 @@ def test_driver_rolls_back_graph_and_cluster_allocation_when_actor_initializatio
     query_id = "query-driver-rollback"
     physical_plan = _FakePhysicalPlan(query_id, _metadata(query_id), events)
 
-    def _fail_precreate(plan, graph, allocation):
+    def _fail_precreate(plan, graph, allocation, *, query_connection, session_config):
+        assert query_connection is not None
+        assert session_config == {}
         events.append("actors_initializing")
         raise RuntimeError("model initialization failed")
 
     runner._precreate_udf_actors = _fail_precreate
 
     with pytest.raises(RuntimeError, match="model initialization failed"):
-        asyncio.run(runner_cls.run_plan(runner, _FakeLogicalPlan(physical_plan, events)))
+        asyncio.run(
+            runner_cls.run_plan(
+                runner,
+                _OWNER_ID,
+                _SESSION_ID,
+                _FakeLogicalPlan(physical_plan, events),
+            )
+        )
 
     with pytest.raises(KeyError, match="query graph is not registered"):
         get_query_resource_manager(query_id)
@@ -774,7 +852,12 @@ def test_driver_rejects_non_serializable_plan_before_query_registration(entrypoi
         RuntimeError,
         match=f"distributed physical plan serialization preflight failed for query_id={query_id}",
     ) as exc_info:
-        coroutine = getattr(runner_cls, entrypoint)(runner, _ValidatingLogicalPlan(physical_plan, events))
+        coroutine = getattr(runner_cls, entrypoint)(
+            runner,
+            _OWNER_ID,
+            _SESSION_ID,
+            _ValidatingLogicalPlan(physical_plan, events),
+        )
         asyncio.run(coroutine)
 
     assert isinstance(exc_info.value, RemoteRayException)

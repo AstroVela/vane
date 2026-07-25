@@ -2706,6 +2706,10 @@ def test_ray_worker_manager_shutdown_aborts_all_actors_after_prepare_error(monke
         "worker-failing",
     ]
 
+    manager.shutdown()
+
+    assert [phase for phase, _ in calls] == ["prepare", "prepare", "abort", "abort"]
+
 
 def test_ray_worker_manager_shutdown_finishes_all_actors_after_finish_error(monkeypatch):
     calls: list[tuple[str, str]] = []
@@ -2759,6 +2763,10 @@ def test_ray_worker_manager_shutdown_finishes_all_actors_after_finish_error(monk
         "worker-clean",
         "worker-failing",
     ]
+
+    manager.shutdown()
+
+    assert [phase for phase, _ in calls] == ["prepare", "prepare", "finish", "finish"]
 
 
 def test_ray_worker_manager_worker_snapshots_fail_fast(monkeypatch):

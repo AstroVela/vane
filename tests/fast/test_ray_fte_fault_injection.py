@@ -594,8 +594,8 @@ def test_real_ray_actor_kill_replays_native_dynamic_scan_on_replacement(monkeypa
     assert len(descriptors) == 1
     descriptor = bytes(descriptors[0])
 
-    actor0 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(1, 0, 1 << 30, 1 << 60, {})
-    actor1 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(1, 0, 1 << 30, 1 << 60, {})
+    actor0 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(1, 0, 1 << 30, 1 << 60)
+    actor1 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(1, 0, 1 << 30, 1 << 60)
     handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-native-a")
     handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-native-b")
 
@@ -692,8 +692,8 @@ def test_real_ray_full_query_worker_loss_uses_retry_output(monkeypatch, tmp_path
     assert len(descriptors) == 1
     descriptor = bytes(descriptors[0])
 
-    actor0 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(1, 0, 1 << 30, 1 << 60, {})
-    actor1 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(1, 0, 1 << 30, 1 << 60, {})
+    actor0 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(1, 0, 1 << 30, 1 << 60)
+    actor1 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(1, 0, 1 << 30, 1 << 60)
     handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-full-a")
     handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-full-b")
 
@@ -802,7 +802,7 @@ def test_real_ray_host_loss_replays_all_owned_full_query_outputs(monkeypatch, tm
     )
     _register_fault_query([task_a, task_b])
 
-    actor0 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(2, 0, 1 << 30, 1 << 60, {})
+    actor0 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(2, 0, 1 << 30, 1 << 60)
     handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-host-a")
 
     try:
@@ -832,7 +832,7 @@ def test_real_ray_host_loss_replays_all_owned_full_query_outputs(monkeypatch, tm
         else:
             raise AssertionError("host-loss native scans did not enter blocked RUNNING state")
 
-        actor1 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(2, 0, 1 << 30, 1 << 60, {})
+        actor1 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(2, 0, 1 << 30, 1 << 60)
         handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-host-b")
         ray.kill(actor0, no_restart=True)
 

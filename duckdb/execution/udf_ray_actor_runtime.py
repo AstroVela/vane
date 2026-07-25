@@ -29,6 +29,7 @@ from duckdb.execution.udf_ray_stream_protocol import (
     validate_task_runtime_node,
 )
 from duckdb.execution.udf_threading import configure_ray_actor_loaded_torch_threads
+from duckdb.runners.ray.ray_env import install_explicit_session_runtime_env
 from duckdb.runners.ray.safe_get import resolve_object_refs_blocking
 
 
@@ -104,6 +105,7 @@ def _actor_class(
     @ray.remote(max_restarts=max_restarts, max_task_retries=max_task_retries, max_concurrency=1)
     class UDFActor:
         def __init__(self) -> None:
+            install_explicit_session_runtime_env()
             # No-arg constructor avoids Ray warning about constructor arguments
             # in the object store with max_restarts>0 (ray#53727).
             # Payload is injected via init_payload() immediately after creation.

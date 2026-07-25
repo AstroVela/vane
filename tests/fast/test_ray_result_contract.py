@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 import uuid
@@ -124,20 +125,74 @@ class _FakeOutputLeaseOwner:
         return True
 
 
+_TEST_RUNTIME_OWNER_ID = "test-runtime-owner"
+_TEST_SESSION_ID = "test-vane-session"
+_TEST_SESSION_CONFIG: dict[str, str] = {}
+
+
 class _FakePhysicalPlanWithoutPlanAttr:
-    def __init__(self, plan_id: str = "fake-plan") -> None:
+    def __init__(
+        self,
+        plan_id: str = "fake-plan",
+        *,
+        session_id: str = _TEST_SESSION_ID,
+        session_config: dict[str, str] | None = None,
+    ) -> None:
         self._plan_id = plan_id
+        self._session_id = session_id
+        self._session_config = dict(_TEST_SESSION_CONFIG if session_config is None else session_config)
 
     def idx(self) -> str:
         return self._plan_id
+
+    def session_id(self) -> str:
+        return self._session_id
+
+    def session_config(self) -> dict[str, str]:
+        return dict(self._session_config)
 
 
 class _FakeLogicalPlan:
     def __init__(self, physical_plan: _FakePhysicalPlanWithoutPlanAttr) -> None:
         self.physical_plan = physical_plan
 
+    def idx(self) -> str:
+        return self.physical_plan.idx()
+
     def to_physical_plan(self, _conn):
         return self.physical_plan
+
+    def session_id(self) -> str:
+        return self.physical_plan.session_id()
+
+    def session_config(self) -> dict[str, str]:
+        return self.physical_plan.session_config()
+
+
+class _FakeConnection:
+    def __init__(self) -> None:
+        self.cursors: list[_FakeConnection] = []
+        self.closed = False
+
+    def cursor(self) -> _FakeConnection:
+        cursor = _FakeConnection()
+        self.cursors.append(cursor)
+        return cursor
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _initialize_test_query_driver_client(client, opened_sessions=None):
+    client._opened_sessions = dict(opened_sessions or {})
+    client._uncertain_sessions = {}
+    client._opening_session_ids = set()
+    client._closing_session_ids = set()
+    client._closed_session_ids = driver.BoundedReplayMap(capacity=65_536)
+    client._session_closes_in_progress = set()
+    client._session_condition = threading.Condition()
+    client._client_closing = False
+    client._client_close_in_progress = False
 
 
 def _make_local_query_driver_actor():
@@ -147,37 +202,106 @@ def _make_local_query_driver_actor():
     runner.curr_plans = {}
     runner._plan_query_ids = {}
     runner._query_terminal_errors = {}
-    runner._env_overrides = {}
-    runner._duckdb_conn = object()
+    runner._duckdb_conn = _FakeConnection()
     runner.plan_runner = None
     runner._active_udf_actors = []
     runner._active_udf_actors_by_plan = {}
     runner._active_vllm_actors = []
+    runner._active_vllm_actors_by_plan = {}
+    runner._plan_runner_lifecycle_lock = threading.RLock()
+    runner._driver_shutdown_started = False
+    runner._client_ids = {_TEST_RUNTIME_OWNER_ID}
+    runner._detaching_client_ids = set()
+    runner._detached_client_results = driver.BoundedReplayMap(capacity=65_536)
+    runner._client_detach_lock = asyncio.Lock()
+    runner._session_lock = threading.RLock()
+    runner._closed_session_owners = driver.BoundedReplayMap(capacity=65_536)
+    runner._plan_session_ids = {}
+    runner._plan_connections = {}
+    runner._plan_teardown_condition = threading.Condition(runner._session_lock)
+    runner._plan_teardowns_in_progress = set()
+    session_connection = runner._duckdb_conn.cursor()
+    runner._sessions = {
+        _TEST_SESSION_ID: driver._DriverSession(
+            owner_id=_TEST_RUNTIME_OWNER_ID,
+            config=dict(_TEST_SESSION_CONFIG),
+            connection=session_connection,
+            s3_config={},
+        )
+    }
+    runner._test_session_connection = session_connection
     return cls, runner
 
 
 def _query_registration_stub(query_id: str):
-    async def _register(_self, _plan, *, expected_plan_id=None):
-        del expected_plan_id
+    async def _register(
+        _self,
+        _plan,
+        *,
+        query_connection,
+        expected_plan_id=None,
+    ):
+        del query_connection, expected_plan_id
         return SimpleNamespace(query_id=query_id, stages=()), object()
 
     return _register
 
 
-def test_driver_env_override_applies_duckdb_execution_width(monkeypatch):
-    cls, runner = _make_local_query_driver_actor()
+def _run_actor_copy_plan(runner, plan):
+    return runner.run_copy_plan(
+        _TEST_RUNTIME_OWNER_ID,
+        _TEST_SESSION_ID,
+        plan,
+    )
+
+
+def _run_actor_stream_plan(runner, plan):
+    return runner.run_plan(
+        _TEST_RUNTIME_OWNER_ID,
+        _TEST_SESSION_ID,
+        plan,
+    )
+
+
+def test_driver_connection_applies_duckdb_execution_width(monkeypatch):
     statements = []
 
     class _Connection:
         def execute(self, statement):
             statements.append(statement)
 
-    runner._duckdb_conn = _Connection()
     monkeypatch.setenv("VANE_DUCKDB_THREADS", "7")
 
-    cls.install_env_overrides(runner, {"VANE_DUCKDB_THREADS": "7"})
+    driver._apply_duckdb_thread_setting(_Connection())
 
     assert statements == ["SET threads=7"]
+
+
+def test_driver_constructor_scrubs_inherited_session_environment(monkeypatch):
+    cls = driver.RayQueryDriverActor.__ray_metadata__.modified_class
+    monkeypatch.setenv("AWS_ISSUE75_INHERITED_SECRET", "inherited-aws")
+    monkeypatch.setenv("DUCKDB_ISSUE75_INHERITED_SECRET", "inherited-duckdb")
+    monkeypatch.setenv("VANE_ISSUE75_INHERITED_SECRET", "inherited-vane")
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(current_actor=object()),
+    )
+    monkeypatch.setattr(driver.asyncio, "get_running_loop", object)
+    monkeypatch.setattr(driver, "set_event_loop", lambda _loop: None)
+    monkeypatch.setattr(driver, "_set_global_event_loop", lambda _loop: None)
+    monkeypatch.setattr(cls, "_create_query_resource_coordinator", lambda _self: object())
+    monkeypatch.setattr(cls, "_ensure_duckdb_conn", lambda _self: object())
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: object())
+    monkeypatch.setattr(cls, "_start_query_resource_maintenance", lambda _self: None)
+
+    cls({}, 1)
+
+    assert "AWS_ISSUE75_INHERITED_SECRET" not in os.environ
+    assert "DUCKDB_ISSUE75_INHERITED_SECRET" not in os.environ
+    assert "VANE_ISSUE75_INHERITED_SECRET" not in os.environ
+    assert os.environ["VANE_RUNNER"] == "ray"
 
 
 def _bind_test_query_resource_owner(
@@ -226,7 +350,16 @@ def _bind_test_query_resource_owner(
     )
     manager.update_stage_state(stage.stage_id, runnable=True)
     runner._plan_query_ids[str(plan_id)] = query_id
+    runner._plan_session_ids[str(plan_id)] = _TEST_SESSION_ID
+    runner._sessions[_TEST_SESSION_ID].plan_ids.add(str(plan_id))
     return manager
+
+
+def _bind_test_plan_session(runner, plan_id: str, *, query_id: str | None = None) -> None:
+    plan_key = str(plan_id)
+    runner._plan_session_ids[plan_key] = _TEST_SESSION_ID
+    runner._plan_query_ids[plan_key] = str(plan_key if query_id is None else query_id)
+    runner._sessions[_TEST_SESSION_ID].plan_ids.add(plan_key)
 
 
 def _fake_task_context_info(task_id):
@@ -261,8 +394,96 @@ def test_ray_progress_snapshot_timeout_returns_none(monkeypatch):
 
     monkeypatch.setattr(driver, "resolve_object_refs_blocking", _fake_get)
 
-    assert driver._ray_progress_snapshot_or_none(_FakeRunner(), "plan-id", 123.0) is None
+    assert (
+        driver._ray_progress_snapshot_or_none(
+            _FakeRunner(),
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            "plan-id",
+            123.0,
+        )
+        is None
+    )
     assert timeouts == [0.1]
+
+
+def test_owned_thread_side_effect_finishes_before_cancellation_is_exposed():
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def _mutate():
+        started.set()
+        assert release.wait(timeout=1.0)
+        finished.set()
+
+    async def _cancel():
+        task = asyncio.create_task(driver._to_thread_with_owned_side_effects(_mutate))
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert started.is_set()
+
+        task.cancel()
+        await asyncio.sleep(0)
+        assert task.done() is False
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_cancel())
+    assert finished.is_set()
+
+
+def test_query_driver_run_plan_cancellation_waits_for_startup_and_tears_down(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr("cancelled-plan"))
+    started = threading.Event()
+    release = threading.Event()
+    events = []
+
+    def _start(_self, session_id, session, plan):
+        assert session_id == _TEST_SESSION_ID
+        assert plan is logical_plan
+        started.set()
+        assert release.wait(timeout=1.0)
+        with runner._session_lock:
+            runner._plan_session_ids["cancelled-plan"] = session_id
+            session.plan_ids.add("cancelled-plan")
+        events.append("started")
+
+    def _cleanup(_self, plan_id):
+        events.append(("cleanup", plan_id))
+        with runner._session_lock:
+            runner._plan_session_ids.pop(plan_id, None)
+            runner._sessions[_TEST_SESSION_ID].plan_ids.discard(plan_id)
+
+    monkeypatch.setattr(cls, "_run_plan_sync", _start)
+    monkeypatch.setattr(cls, "_cleanup_finished_plan", _cleanup)
+
+    async def _cancel():
+        task = asyncio.create_task(_run_actor_stream_plan(runner, logical_plan))
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert started.is_set()
+
+        task.cancel()
+        await asyncio.sleep(0)
+        assert task.done() is False
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_cancel())
+
+    assert events == ["started", ("cleanup", "cancelled-plan")]
+    assert "cancelled-plan" not in runner._plan_session_ids
+    assert "cancelled-plan" not in runner._sessions[_TEST_SESSION_ID].plan_ids
 
 
 def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(monkeypatch):
@@ -277,14 +498,25 @@ def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(mon
             captured["conn"] = conn
             return {"ok": True}
 
-    def _precreate_udf_actors(_self, _plan, _graph, _allocation):
+    def _precreate_udf_actors(
+        _self,
+        _plan,
+        _graph,
+        _allocation,
+        *,
+        query_connection,
+        session_config,
+    ):
+        assert query_connection is runner._test_session_connection.cursors[-1]
+        assert session_config == _TEST_SESSION_CONFIG
+        assert runner._plan_query_ids["copy-plan"] == "copy-plan"
         with pytest.raises(RuntimeError, match="no running event loop"):
             asyncio.get_running_loop()
         captured["actor_init_thread"] = threading.current_thread().name
         return []
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", _precreate_udf_actors)
-    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda _self, _plan: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(
         cls,
@@ -304,13 +536,13 @@ def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(mon
 
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", _final_progress_snapshot)
 
-    outcome = asyncio.run(runner.run_copy_plan(logical_plan))
+    outcome = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
 
     assert isinstance(outcome, driver.CopyPlanOutcome)
     assert outcome.result == {"ok": True}
     assert outcome.final_progress_snapshot == {"query_id": "copy-plan", "state": "FINISHED"}
     assert captured["plan"] is physical_plan
-    assert captured["conn"] is runner._duckdb_conn
+    assert captured["conn"] is runner._test_session_connection.cursors[-1]
     assert captured["actor_init_thread"].startswith("asyncio_")
     assert captured["lifecycle"] == ["snapshot", "teardown"]
 
@@ -326,8 +558,8 @@ def test_query_driver_run_copy_plan_surfaces_terminal_actor_placement_loss(monke
             runner._query_terminal_errors["copy-query-terminal"] = "fixed Ray actor placement was lost"
             return {"ok": True}
 
-    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args: [])
-    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args: [])
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(
         cls,
@@ -343,7 +575,7 @@ def test_query_driver_run_copy_plan_surfaces_terminal_actor_placement_loss(monke
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
     with pytest.raises(RuntimeError, match="fixed Ray actor placement was lost"):
-        asyncio.run(runner.run_copy_plan(logical_plan))
+        asyncio.run(_run_actor_copy_plan(runner, logical_plan))
 
     assert teardown_calls == [
         ("copy-plan-terminal", "copy-query-terminal", True),
@@ -359,8 +591,8 @@ def test_query_driver_copy_progress_contract_failure_still_tears_down(monkeypatc
         def run_copy_plan(self, _plan, _conn):
             return {"ok": True}
 
-    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args: [])
-    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args: [])
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(
         cls,
@@ -380,7 +612,7 @@ def test_query_driver_copy_progress_contract_failure_still_tears_down(monkeypatc
     )
 
     with pytest.raises(RuntimeError, match="invalid progress topology"):
-        asyncio.run(runner.run_copy_plan(logical_plan))
+        asyncio.run(_run_actor_copy_plan(runner, logical_plan))
 
     assert teardown_calls == [
         (
@@ -423,9 +655,9 @@ def test_query_driver_copy_opens_actor_stage_after_topology_and_actor_barriers(m
         events.append("actor-stage-open")
         actor_stage_open.set()
 
-    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args: ["actor-pool"])
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
     monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", wait_for_actors)
-    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(
         cls,
@@ -441,7 +673,7 @@ def test_query_driver_copy_opens_actor_stage_after_topology_and_actor_barriers(m
         wait_for_topology,
     )
 
-    outcome = asyncio.run(runner.run_copy_plan(logical_plan))
+    outcome = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
 
     assert outcome.result == {"ok": True}
     open_index = events.index("actor-stage-open")
@@ -481,9 +713,9 @@ def test_query_driver_copy_accepts_plan_success_before_startup_barriers(monkeypa
     def mark_actor_stages(_self, _graph):
         events.append("actor-stage-open")
 
-    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args: ["actor-pool"])
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
     monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", wait_for_actors)
-    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(
         cls,
@@ -504,7 +736,7 @@ def test_query_driver_copy_accepts_plan_success_before_startup_barriers(monkeypa
         daemon=True,
     )
     release_thread.start()
-    outcome = asyncio.run(runner.run_copy_plan(logical_plan))
+    outcome = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
     release_thread.join(timeout=2.0)
 
     assert outcome.result == {"rows_copied": 0}
@@ -531,9 +763,9 @@ def test_query_driver_copy_plan_failure_interrupts_startup_barriers(monkeypatch)
     def teardown(*_args, **_kwargs):
         teardown_started.set()
 
-    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args: ["actor-pool"])
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
     monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", wait_until_teardown)
-    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(
         cls,
@@ -553,7 +785,7 @@ def test_query_driver_copy_plan_failure_interrupts_startup_barriers(monkeypatch)
     )
 
     with pytest.raises(ValueError, match="native plan startup failed"):
-        asyncio.run(runner.run_copy_plan(logical_plan))
+        asyncio.run(_run_actor_copy_plan(runner, logical_plan))
 
     assert teardown_started.is_set()
     assert marked_ready == []
@@ -595,9 +827,9 @@ def test_query_driver_copy_startup_barrier_failure_tears_down_plan(
     def teardown(*_args, **_kwargs):
         teardown_started.set()
 
-    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args: ["actor-pool"])
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
     monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", wait_for_actors)
-    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(
         cls,
@@ -617,7 +849,7 @@ def test_query_driver_copy_startup_barrier_failure_tears_down_plan(
     )
 
     with pytest.raises(error_type, match=message):
-        asyncio.run(runner.run_copy_plan(logical_plan))
+        asyncio.run(_run_actor_copy_plan(runner, logical_plan))
 
     assert teardown_started.is_set()
     assert marked_ready == []
@@ -670,7 +902,7 @@ def test_ray_query_driver_client_copy_refreshes_progress_and_uses_final_snapshot
     )
 
     class _Runner:
-        install_env_overrides = _RemoteMethod(lambda: _Ref(None))
+        open_session = _RemoteMethod(lambda: _Ref(True))
         run_copy_plan = _RemoteMethod(lambda: _Ref(outcome, timeouts=2))
         progress_snapshot = _RemoteMethod(lambda: _Ref(running_snapshot))
 
@@ -692,8 +924,9 @@ def test_ray_query_driver_client_copy_refreshes_progress_and_uses_final_snapshot
 
     monkeypatch.setattr(driver, "ProgressRenderer", _Renderer)
     monkeypatch.setattr(driver, "progress_enabled", lambda: True)
-    monkeypatch.setattr(driver, "_collect_vane_env_overrides", dict)
     client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client)
     client.runner = _Runner()
 
     result = client.run_copy_plan(_FakePhysicalPlanWithoutPlanAttr("copy-plan"))
@@ -735,14 +968,14 @@ def test_ray_query_driver_client_stream_waits_through_progress_session(monkeypat
     partition_ref = object()
 
     class _Runner:
-        install_env_overrides = _RemoteMethod(None)
+        open_session = _RemoteMethod(True)
         run_plan = _RemoteMethod(None)
         get_next_partition = _RemoteMethod(partition_ref)
 
     class _ProgressSession:
         instances = []
 
-        def __init__(self, runner, plan_id, started_at):
+        def __init__(self, runner, owner_id, session_id, plan_id, started_at):
             self.resolved = []
             self.finish_calls = []
             self.__class__.instances.append(self)
@@ -755,8 +988,9 @@ def test_ray_query_driver_client_stream_waits_through_progress_session(monkeypat
             self.finish_calls.append(kwargs)
 
     monkeypatch.setattr(driver, "_RayProgressSession", _ProgressSession)
-    monkeypatch.setattr(driver, "_collect_vane_env_overrides", dict)
     client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client)
     client.runner = _Runner()
 
     assert list(client.stream_plan(_FakePhysicalPlanWithoutPlanAttr("stream-plan"))) == []
@@ -765,6 +999,135 @@ def test_ray_query_driver_client_stream_waits_through_progress_session(monkeypat
     assert len(progress.resolved) == 1
     assert progress.resolved[0].future().result() is partition_ref
     assert progress.finish_calls == [{"final_state": "FINISHED"}]
+
+
+def test_ray_query_driver_client_stream_start_failure_cancels_and_retries_close(monkeypatch):
+    run_future = object()
+    close_future = object()
+    resolved = []
+    cancelled = []
+
+    class _RemoteMethod:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def remote(self, *args):
+            self.calls.append(args)
+            return self.result
+
+    runner = SimpleNamespace(
+        run_plan=_RemoteMethod(run_future),
+        close_plan=_RemoteMethod(close_future),
+    )
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = runner
+
+    def _resolve(ref, **kwargs):
+        resolved.append((ref, kwargs))
+        if ref is run_future:
+            raise RuntimeError("planned stream startup failure")
+        assert ref is close_future
+        return None
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+    monkeypatch.setattr(driver.ray, "cancel", lambda ref, *, force: cancelled.append((ref, force)))
+
+    plan = _FakePhysicalPlanWithoutPlanAttr("failed-stream-start")
+    with pytest.raises(RuntimeError, match="planned stream startup failure"):
+        list(client.stream_plan(plan))
+
+    assert cancelled == [(run_future, False)]
+    assert runner.close_plan.calls == [
+        (
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            "failed-stream-start",
+        )
+    ]
+    assert resolved == [
+        (run_future, {}),
+        (
+            run_future,
+            {
+                "timeout": 300,
+                "honor_query_deadline": False,
+            },
+        ),
+        (
+            close_future,
+            {
+                "timeout": 30,
+                "honor_query_deadline": False,
+            },
+        ),
+    ]
+
+
+def test_ray_query_driver_client_copy_failure_cancels_and_settles(monkeypatch):
+    copy_future = object()
+    close_future = object()
+    resolved = []
+    cancelled = []
+
+    class _RemoteMethod:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def remote(self, *args):
+            self.calls.append(args)
+            return self.result
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = SimpleNamespace(
+        run_copy_plan=_RemoteMethod(copy_future),
+        close_plan=_RemoteMethod(close_future),
+    )
+
+    def _resolve(ref, **kwargs):
+        resolved.append((ref, kwargs))
+        if ref is copy_future:
+            raise RuntimeError("planned COPY failure")
+        assert ref is close_future
+        return None
+
+    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+    monkeypatch.setattr(driver.ray, "cancel", lambda ref, *, force: cancelled.append((ref, force)))
+
+    with pytest.raises(RuntimeError, match="planned COPY failure"):
+        client.run_copy_plan(_FakePhysicalPlanWithoutPlanAttr("failed-copy"))
+
+    assert cancelled == [(copy_future, False)]
+    assert resolved == [
+        (copy_future, {}),
+        (
+            copy_future,
+            {
+                "timeout": 300,
+                "honor_query_deadline": False,
+            },
+        ),
+        (
+            close_future,
+            {
+                "timeout": 30,
+                "honor_query_deadline": False,
+            },
+        ),
+    ]
+    assert client.runner.close_plan.calls == [
+        (
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            "failed-copy",
+        )
+    ]
 
 
 def test_query_driver_run_plan_passes_distributed_physical_plan_wrapper(monkeypatch):
@@ -780,14 +1143,25 @@ def test_query_driver_run_plan_passes_distributed_physical_plan_wrapper(monkeypa
             captured["conn"] = conn
             return stream
 
-    def _precreate_udf_actors(_self, _plan, _graph, _allocation):
+    def _precreate_udf_actors(
+        _self,
+        _plan,
+        _graph,
+        _allocation,
+        *,
+        query_connection,
+        session_config,
+    ):
+        assert query_connection is runner._test_session_connection.cursors[-1]
+        assert session_config == _TEST_SESSION_CONFIG
+        assert runner._plan_query_ids["stream-plan"] == "stream-plan"
         with pytest.raises(RuntimeError, match="no running event loop"):
             asyncio.get_running_loop()
         captured["startup_thread"] = threading.current_thread().name
         return []
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", _precreate_udf_actors)
-    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda _self, _plan: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(
         cls,
@@ -801,10 +1175,10 @@ def test_query_driver_run_plan_passes_distributed_physical_plan_wrapper(monkeypa
         lambda _self, _query_id, reason, **_kwargs: None,
     )
 
-    asyncio.run(runner.run_plan(logical_plan))
+    asyncio.run(_run_actor_stream_plan(runner, logical_plan))
 
     assert captured["plan"] is physical_plan
-    assert captured["conn"] is runner._duckdb_conn
+    assert captured["conn"] is runner._test_session_connection.cursors[-1]
     assert captured["startup_thread"].startswith("asyncio_")
     assert runner.curr_plans["stream-plan"] is physical_plan
     assert runner.curr_streams["stream-plan"] is stream
@@ -828,8 +1202,8 @@ def test_query_driver_run_plan_start_failure_runs_complete_teardown(monkeypatch)
         calls.append(("fragments", query_id))
         raise RuntimeError("fragment cleanup failed")
 
-    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args: [])
-    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args: [])
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(
         cls,
@@ -841,7 +1215,7 @@ def test_query_driver_run_plan_start_failure_runs_complete_teardown(monkeypatch)
     monkeypatch.setattr(cls, "_drop_query_fragments_sync", _drop_fragments)
 
     with pytest.raises(RuntimeError, match="failed to start and teardown also failed") as exc_info:
-        asyncio.run(runner.run_plan(logical_plan))
+        asyncio.run(_run_actor_stream_plan(runner, logical_plan))
 
     message = str(exc_info.value)
     assert "submission failed" in message
@@ -853,34 +1227,61 @@ def test_query_driver_run_plan_start_failure_runs_complete_teardown(monkeypatch)
     ]
     assert "failed-plan" not in runner.curr_plans
     assert "failed-plan" not in runner.curr_streams
+    assert runner._plan_query_ids["failed-plan"] == "failed-query"
+    assert runner._plan_session_ids["failed-plan"] == _TEST_SESSION_ID
+
+    monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", lambda *_args: None)
+    monkeypatch.setattr(cls, "_drop_query_fragments_sync", lambda *_args: None)
+    cls._cleanup_finished_plan(runner, "failed-plan")
+
     assert "failed-plan" not in runner._plan_query_ids
+    assert "failed-plan" not in runner._plan_session_ids
 
 
 def test_teardown_plan_resources_attempts_every_owned_release(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     plan_id = "teardown-plan"
     calls = []
+    attempts = {
+        "output": 0,
+        "actors": 0,
+        "vllm": 0,
+        "fragments": 0,
+    }
 
     class _OutputOwner:
         def release(self):
             calls.append("output")
-            raise RuntimeError("output release failed")
+            attempts["output"] += 1
+            if attempts["output"] == 1:
+                raise RuntimeError("output release failed")
 
     runner.curr_plans[plan_id] = object()
     runner.curr_streams[plan_id] = _DummyStream([])
-    runner._plan_query_ids[plan_id] = "teardown-query"
+    _bind_test_plan_session(runner, plan_id, query_id="teardown-query")
     runner._leased_result_partition_refs = {plan_id: {"0": (object(), _OutputOwner())}}
     runner._result_partition_ref_counters = {plan_id: 1}
 
     def _cleanup_actors(_self, actual_plan_id):
         calls.append(f"actors:{actual_plan_id}")
-        raise RuntimeError("actor release failed")
+        attempts["actors"] += 1
+        if attempts["actors"] == 1:
+            raise RuntimeError("actor release failed")
+
+    def _cleanup_vllm_actors(_self, actual_plan_id):
+        calls.append(f"vllm:{actual_plan_id}")
+        attempts["vllm"] += 1
+        if attempts["vllm"] == 1:
+            raise RuntimeError("vllm actor release failed")
 
     def _drop_fragments(_self, query_id):
         calls.append(f"fragments:{query_id}")
-        raise RuntimeError("fragment release failed")
+        attempts["fragments"] += 1
+        if attempts["fragments"] == 1:
+            raise RuntimeError("fragment release failed")
 
     monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", _cleanup_actors)
+    monkeypatch.setattr(cls, "_cleanup_vllm_actor_pools", _cleanup_vllm_actors)
     monkeypatch.setattr(cls, "_drop_query_fragments_sync", _drop_fragments)
 
     with pytest.raises(RuntimeError, match="teardown failed") as exc_info:
@@ -893,17 +1294,78 @@ def test_teardown_plan_resources_attempts_every_owned_release(monkeypatch):
 
     assert "output release failed" in str(exc_info.value)
     assert "actor release failed" in str(exc_info.value)
+    assert "vllm actor release failed" in str(exc_info.value)
     assert "fragment release failed" in str(exc_info.value)
     assert calls == [
         "output",
         "actors:teardown-plan",
+        "vllm:teardown-plan",
         "fragments:teardown-query",
     ]
     assert plan_id not in runner.curr_plans
     assert plan_id not in runner.curr_streams
+    assert runner._plan_query_ids[plan_id] == "teardown-query"
+    assert plan_id in runner._plan_session_ids
+    assert list(runner._leased_result_partition_refs[plan_id]) == ["0"]
+    assert runner._result_partition_ref_counters == {plan_id: 1}
+
+    cls._teardown_plan_resources(
+        runner,
+        plan_id,
+        "teardown-query",
+        drop_fragments=True,
+    )
+
+    assert calls == [
+        "output",
+        "actors:teardown-plan",
+        "vllm:teardown-plan",
+        "fragments:teardown-query",
+        "output",
+        "actors:teardown-plan",
+        "vllm:teardown-plan",
+        "fragments:teardown-query",
+    ]
     assert plan_id not in runner._plan_query_ids
+    assert plan_id not in runner._plan_session_ids
     assert runner._leased_result_partition_refs == {}
     assert runner._result_partition_ref_counters == {}
+
+
+@pytest.mark.parametrize(
+    ("cleanup_method", "active_attr", "by_plan_attr"),
+    [
+        ("_cleanup_udf_actor_pools", "_active_udf_actors", "_active_udf_actors_by_plan"),
+        ("_cleanup_vllm_actor_pools", "_active_vllm_actors", "_active_vllm_actors_by_plan"),
+    ],
+)
+def test_query_actor_pool_cleanup_retains_failed_pool_for_retry(cleanup_method, active_attr, by_plan_attr):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "actor-cleanup-retry"
+
+    class _Pool:
+        def __init__(self):
+            self.attempts = 0
+
+        def shutdown(self):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("transient actor cleanup failure")
+
+    pool = _Pool()
+    setattr(runner, active_attr, [pool])
+    setattr(runner, by_plan_attr, {plan_id: [pool]})
+
+    with pytest.raises(RuntimeError, match="transient actor cleanup failure"):
+        getattr(cls, cleanup_method)(runner, plan_id)
+
+    assert getattr(runner, active_attr) == [pool]
+    assert getattr(runner, by_plan_attr) == {plan_id: [pool]}
+
+    getattr(cls, cleanup_method)(runner, plan_id)
+
+    assert getattr(runner, active_attr) == []
+    assert getattr(runner, by_plan_attr) == {}
 
 
 def test_teardown_fence_failure_retains_retryable_query_ownership(monkeypatch):
@@ -937,6 +1399,597 @@ def test_teardown_fence_failure_retains_retryable_query_ownership(monkeypatch):
         assert get_query_resource_manager(query_id) is manager
     finally:
         release_query_resource_manager(query_id, reason="test_complete")
+
+
+def test_concurrent_plan_teardown_runs_owned_cleanup_once(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "concurrent-teardown"
+    query_id = "concurrent-teardown-query"
+    _bind_test_plan_session(runner, plan_id, query_id=query_id)
+    runner.curr_plans[plan_id] = object()
+    runner.curr_streams[plan_id] = _DummyStream([])
+    cleanup_started = threading.Event()
+    cleanup_release = threading.Event()
+    cleanup_calls = []
+    errors = []
+
+    def _drop_fragments(_self, actual_query_id):
+        cleanup_calls.append(actual_query_id)
+        cleanup_started.set()
+        cleanup_release.wait(timeout=1.0)
+
+    monkeypatch.setattr(cls, "_drop_query_fragments_sync", _drop_fragments)
+
+    def _cleanup():
+        try:
+            cls._cleanup_finished_plan(runner, plan_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=_cleanup)
+    second = threading.Thread(target=_cleanup)
+    first.start()
+    assert cleanup_started.wait(timeout=1.0)
+    second.start()
+    cleanup_release.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert cleanup_calls == [query_id]
+    assert plan_id not in runner._plan_session_ids
+
+
+def test_close_session_does_not_deadlock_with_plan_teardown(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "close-during-teardown"
+    query_id = "close-during-teardown-query"
+    _bind_test_plan_session(runner, plan_id, query_id=query_id)
+    runner.curr_plans[plan_id] = object()
+    runner.curr_streams[plan_id] = _DummyStream([])
+    cleanup_started = threading.Event()
+    cleanup_release = threading.Event()
+    close_cleanup_started = threading.Event()
+    cleanup_entries = 0
+    cleanup_entries_lock = threading.Lock()
+    cleanup_calls = []
+    errors = []
+
+    def _drop_fragments(_self, actual_query_id):
+        cleanup_calls.append(actual_query_id)
+        cleanup_started.set()
+        cleanup_release.wait(timeout=1.0)
+
+    original_cleanup_finished_plan = cls._cleanup_finished_plan
+
+    def _tracked_cleanup_finished_plan(self, actual_plan_id):
+        nonlocal cleanup_entries
+        with cleanup_entries_lock:
+            cleanup_entries += 1
+            if cleanup_entries == 2:
+                close_cleanup_started.set()
+        return original_cleanup_finished_plan(self, actual_plan_id)
+
+    async def _run_inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(cls, "_drop_query_fragments_sync", _drop_fragments)
+    monkeypatch.setattr(cls, "_cleanup_finished_plan", _tracked_cleanup_finished_plan)
+    monkeypatch.setattr(asyncio, "to_thread", _run_inline)
+
+    def _cleanup():
+        try:
+            cls._cleanup_finished_plan(runner, plan_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def _close():
+        try:
+            asyncio.run(
+                cls.close_session(
+                    runner,
+                    _TEST_RUNTIME_OWNER_ID,
+                    _TEST_SESSION_ID,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    cleanup_thread = threading.Thread(target=_cleanup, daemon=True)
+    close_thread = threading.Thread(target=_close, daemon=True)
+    cleanup_thread.start()
+    assert cleanup_started.wait(timeout=1.0)
+    close_thread.start()
+    assert close_cleanup_started.wait(timeout=1.0)
+    cleanup_release.set()
+    cleanup_thread.join(timeout=1.0)
+    close_thread.join(timeout=1.0)
+
+    assert not cleanup_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert errors == []
+    assert cleanup_calls == [query_id]
+    assert runner._closed_session_owners.get(_TEST_SESSION_ID) == _TEST_RUNTIME_OWNER_ID
+    assert _TEST_SESSION_ID not in runner._sessions
+
+
+def test_session_close_waits_until_query_connection_is_closed():
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "close-during-query-connection-release"
+    _bind_test_plan_session(runner, plan_id, query_id="")
+    query_close_started = threading.Event()
+    query_close_release = threading.Event()
+    errors = []
+
+    class _BlockingQueryConnection:
+        def close(self):
+            query_close_started.set()
+            assert query_close_release.wait(timeout=1.0)
+
+    runner._plan_connections[plan_id] = _BlockingQueryConnection()
+
+    def _teardown():
+        try:
+            cls._cleanup_finished_plan(runner, plan_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def _close_session():
+        try:
+            asyncio.run(
+                cls.close_session(
+                    runner,
+                    _TEST_RUNTIME_OWNER_ID,
+                    _TEST_SESSION_ID,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    teardown_thread = threading.Thread(target=_teardown, daemon=True)
+    close_thread = threading.Thread(target=_close_session, daemon=True)
+    teardown_thread.start()
+    assert query_close_started.wait(timeout=1.0)
+    close_thread.start()
+    for _ in range(100):
+        with runner._sessions[_TEST_SESSION_ID].condition:
+            if runner._sessions[_TEST_SESSION_ID].closing:
+                break
+        time.sleep(0.001)
+
+    assert close_thread.is_alive()
+    assert runner._test_session_connection.closed is False
+
+    query_close_release.set()
+    teardown_thread.join(timeout=1.0)
+    close_thread.join(timeout=1.0)
+
+    assert not teardown_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert errors == []
+    assert runner._test_session_connection.closed is True
+
+
+def test_close_session_waits_for_active_copy_operation():
+    cls, runner = _make_local_query_driver_actor()
+    session = runner._sessions[_TEST_SESSION_ID]
+    cls._begin_session_copy(session, _TEST_SESSION_ID)
+
+    async def _close_after_copy_finishes():
+        close_task = asyncio.create_task(
+            cls.close_session(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+            )
+        )
+        for _ in range(100):
+            if session.closing:
+                break
+            await asyncio.sleep(0)
+        assert session.closing is True
+        assert close_task.done() is False
+        with pytest.raises(RuntimeError, match="Vane session is closing"):
+            cls._begin_session_copy(session, _TEST_SESSION_ID)
+        cls._end_session_copy(session)
+        await asyncio.wait_for(close_task, timeout=1.0)
+
+    asyncio.run(_close_after_copy_finishes())
+
+    assert session.closed is True
+    assert runner._test_session_connection.closed is True
+    assert _TEST_SESSION_ID not in runner._sessions
+
+
+def test_detach_fences_new_session_work_and_replays_result():
+    cls, runner = _make_local_query_driver_actor()
+    runner._client_ids.add("other-owner")
+    session = runner._sessions[_TEST_SESSION_ID]
+    cls._begin_session_copy(session, _TEST_SESSION_ID)
+
+    async def _detach_after_copy_finishes():
+        detach_task = asyncio.create_task(
+            cls.detach_client(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+            )
+        )
+        for _ in range(100):
+            if _TEST_RUNTIME_OWNER_ID in runner._detaching_client_ids:
+                break
+            await asyncio.sleep(0)
+        assert _TEST_RUNTIME_OWNER_ID in runner._detaching_client_ids
+        with pytest.raises(PermissionError, match="attached client owner"):
+            cls.open_session(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                "late-session",
+                {},
+            )
+        cls._end_session_copy(session)
+        assert await asyncio.wait_for(detach_task, timeout=1.0) is False
+        assert await cls.detach_client(runner, _TEST_RUNTIME_OWNER_ID) is False
+
+    asyncio.run(_detach_after_copy_finishes())
+
+    assert _TEST_RUNTIME_OWNER_ID not in runner._client_ids
+    assert _TEST_SESSION_ID not in runner._sessions
+    assert runner._detached_client_results[_TEST_RUNTIME_OWNER_ID] is False
+
+
+def test_open_session_revalidates_owner_inside_registry_lock(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    runner._sessions = {}
+    runner._client_ids.add("other-owner")
+    normalize_started = threading.Event()
+    normalize_release = threading.Event()
+    open_errors = []
+
+    def _delayed_normalize(config):
+        normalize_started.set()
+        assert normalize_release.wait(timeout=1.0)
+        return dict(config)
+
+    monkeypatch.setattr(driver, "_normalize_session_config", _delayed_normalize)
+
+    def _open():
+        try:
+            cls.open_session(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                "late-session",
+                {},
+            )
+        except BaseException as exc:
+            open_errors.append(exc)
+
+    open_thread = threading.Thread(target=_open)
+    open_thread.start()
+    assert normalize_started.wait(timeout=1.0)
+
+    assert asyncio.run(cls.detach_client(runner, _TEST_RUNTIME_OWNER_ID)) is False
+    normalize_release.set()
+    open_thread.join(timeout=1.0)
+
+    assert not open_thread.is_alive()
+    assert len(open_errors) == 1
+    assert isinstance(open_errors[0], PermissionError)
+    assert "late-session" not in runner._sessions
+
+
+def test_last_owner_detach_retries_runtime_shutdown_failure():
+    cls, runner = _make_local_query_driver_actor()
+    runner._sessions = {}
+    shutdown_calls = []
+
+    async def _shutdown_runtime():
+        shutdown_calls.append("shutdown")
+        if len(shutdown_calls) == 1:
+            raise RuntimeError("planned shutdown failure")
+
+    runner._shutdown_runtime = _shutdown_runtime
+
+    async def _detach_with_retry():
+        with pytest.raises(RuntimeError, match="planned shutdown failure"):
+            await cls.detach_client(runner, _TEST_RUNTIME_OWNER_ID)
+        assert _TEST_RUNTIME_OWNER_ID in runner._client_ids
+        assert _TEST_RUNTIME_OWNER_ID not in runner._detaching_client_ids
+        assert await cls.detach_client(runner, _TEST_RUNTIME_OWNER_ID) is True
+        assert await cls.detach_client(runner, _TEST_RUNTIME_OWNER_ID) is True
+
+    asyncio.run(_detach_with_retry())
+
+    assert shutdown_calls == ["shutdown", "shutdown"]
+    assert _TEST_RUNTIME_OWNER_ID not in runner._client_ids
+    assert runner._detached_client_results[_TEST_RUNTIME_OWNER_ID] is True
+
+
+def test_driver_sessions_keep_config_and_close_lifecycle_independent():
+    cls, runner = _make_local_query_driver_actor()
+    session_b_config = {"AWS_ACCESS_KEY_ID": "session-b-key"}
+
+    assert cls.open_session(
+        runner,
+        _TEST_RUNTIME_OWNER_ID,
+        "session-b",
+        session_b_config,
+    )
+    session_b_config["AWS_ACCESS_KEY_ID"] = "mutated-after-open"
+
+    assert runner._sessions[_TEST_SESSION_ID].config == {}
+    assert runner._sessions["session-b"].config == {"AWS_ACCESS_KEY_ID": "session-b-key"}
+
+    asyncio.run(
+        cls.close_session(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+        )
+    )
+    asyncio.run(
+        cls.close_session(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+        )
+    )
+
+    assert _TEST_SESSION_ID not in runner._sessions
+    assert cls._require_session(runner, _TEST_RUNTIME_OWNER_ID, "session-b").config == {
+        "AWS_ACCESS_KEY_ID": "session-b-key"
+    }
+
+    runner._client_ids.add("other-runtime-owner")
+    with pytest.raises(PermissionError, match="owning runtime client"):
+        cls._require_session(runner, "other-runtime-owner", "session-b")
+
+
+def test_close_unknown_session_tombstones_ambiguous_open():
+    cls, runner = _make_local_query_driver_actor()
+    session_id = "ambiguous-open-session"
+
+    asyncio.run(
+        cls.close_session(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            session_id,
+        )
+    )
+
+    assert runner._closed_session_owners[session_id] == _TEST_RUNTIME_OWNER_ID
+    with pytest.raises(RuntimeError, match="identity was already closed"):
+        cls.open_session(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            session_id,
+            {},
+        )
+
+    runner._client_ids.add("other-runtime-owner")
+    with pytest.raises(PermissionError, match="owning runtime client"):
+        asyncio.run(
+            cls.close_session(
+                runner,
+                "other-runtime-owner",
+                session_id,
+            )
+        )
+
+
+def test_close_plan_cancellation_waits_for_owned_teardown():
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "cancelled-close-plan"
+    _bind_test_plan_session(runner, plan_id, query_id="")
+    cleanup_started = threading.Event()
+    cleanup_release = threading.Event()
+    cleanup_finished = threading.Event()
+
+    def _cleanup(actual_plan_id):
+        assert actual_plan_id == plan_id
+        cleanup_started.set()
+        assert cleanup_release.wait(timeout=1.0)
+        cleanup_finished.set()
+
+    runner._cleanup_finished_plan = _cleanup
+
+    async def _cancel_close():
+        close_task = asyncio.create_task(
+            cls.close_plan(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                plan_id,
+            )
+        )
+        assert await asyncio.to_thread(cleanup_started.wait, 1.0)
+        close_task.cancel()
+        await asyncio.sleep(0.01)
+        assert close_task.done() is False
+        cleanup_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+    asyncio.run(_cancel_close())
+
+    assert cleanup_finished.is_set()
+
+
+@pytest.mark.parametrize(
+    "first_owner",
+    [_TEST_RUNTIME_OWNER_ID, "other-runtime-owner"],
+)
+def test_two_runtime_clients_keep_session_config_and_close_order_independent(first_owner):
+    cls, runner = _make_local_query_driver_actor()
+    other_owner = "other-runtime-owner"
+    runner._sessions = {}
+    runner._client_ids.add(other_owner)
+    sessions = {
+        _TEST_RUNTIME_OWNER_ID: ("session-a", {"AWS_ACCESS_KEY_ID": "session-a-key"}),
+        other_owner: ("session-b", {"AWS_ACCESS_KEY_ID": "session-b-key"}),
+    }
+
+    for owner_id, (session_id, config) in sessions.items():
+        assert cls.open_session(runner, owner_id, session_id, config) is True
+
+    first_session_id, _ = sessions[first_owner]
+    surviving_owner = other_owner if first_owner == _TEST_RUNTIME_OWNER_ID else _TEST_RUNTIME_OWNER_ID
+    surviving_session_id, surviving_config = sessions[surviving_owner]
+
+    assert asyncio.run(cls.detach_client(runner, first_owner)) is False
+
+    assert first_session_id not in runner._sessions
+    surviving_session = cls._require_session(runner, surviving_owner, surviving_session_id)
+    assert surviving_session.config == surviving_config
+    with pytest.raises(PermissionError, match="attached client owner"):
+        cls._require_session(runner, first_owner, surviving_session_id)
+
+    asyncio.run(cls.close_session(runner, surviving_owner, surviving_session_id))
+
+
+@pytest.mark.parametrize("copy_plan", [False, True])
+def test_driver_rejects_active_plan_identity_collision(copy_plan):
+    cls, runner = _make_local_query_driver_actor()
+    session = runner._sessions[_TEST_SESSION_ID]
+    plan_id = "duplicate-plan"
+    runner._plan_session_ids[plan_id] = "other-session"
+
+    class _LogicalPlan:
+        @staticmethod
+        def idx():
+            return plan_id
+
+    existing_cursor_count = len(session.connection.cursors)
+    with pytest.raises(RuntimeError, match="query plan identity is already active"):
+        if copy_plan:
+            asyncio.run(
+                cls._run_copy_plan_for_session(
+                    runner,
+                    _TEST_SESSION_ID,
+                    session,
+                    _LogicalPlan(),
+                )
+            )
+        else:
+            cls._run_plan_sync(
+                runner,
+                _TEST_SESSION_ID,
+                session,
+                _LogicalPlan(),
+            )
+
+    assert len(session.connection.cursors) == existing_cursor_count + 1
+    assert session.connection.cursors[-1].closed is True
+    assert plan_id not in session.plan_ids
+
+
+@pytest.mark.parametrize("copy_plan", [False, True])
+def test_driver_rejects_logical_to_physical_plan_identity_change(copy_plan):
+    cls, runner = _make_local_query_driver_actor()
+    session = runner._sessions[_TEST_SESSION_ID]
+    physical_plan = _FakePhysicalPlanWithoutPlanAttr("physical-plan")
+
+    class _ChangedIdentityLogicalPlan:
+        @staticmethod
+        def idx():
+            return "logical-plan"
+
+        @staticmethod
+        def to_physical_plan(_connection):
+            return physical_plan
+
+    existing_cursor_count = len(session.connection.cursors)
+    with pytest.raises(RuntimeError, match="logical/physical query plan identity changed"):
+        if copy_plan:
+            asyncio.run(
+                cls._run_copy_plan_for_session(
+                    runner,
+                    _TEST_SESSION_ID,
+                    session,
+                    _ChangedIdentityLogicalPlan(),
+                )
+            )
+        else:
+            cls._run_plan_sync(
+                runner,
+                _TEST_SESSION_ID,
+                session,
+                _ChangedIdentityLogicalPlan(),
+            )
+
+    assert len(session.connection.cursors) == existing_cursor_count + 1
+    assert session.connection.cursors[-1].closed is True
+    assert session.plan_ids == set()
+    assert runner._plan_session_ids == {}
+    assert runner._plan_connections == {}
+
+
+@pytest.mark.parametrize("copy_plan", [False, True])
+@pytest.mark.parametrize(
+    ("physical_session_id", "physical_session_config"),
+    [
+        ("other-session", _TEST_SESSION_CONFIG),
+        (_TEST_SESSION_ID, {"AWS_ACCESS_KEY_ID": "other-key"}),
+    ],
+)
+def test_driver_revalidates_physical_plan_session(
+    copy_plan,
+    physical_session_id,
+    physical_session_config,
+):
+    cls, runner = _make_local_query_driver_actor()
+    session = runner._sessions[_TEST_SESSION_ID]
+    physical_plan = _FakePhysicalPlanWithoutPlanAttr(
+        "physical-session-plan",
+        session_id=physical_session_id,
+        session_config=physical_session_config,
+    )
+
+    class _LogicalPlan:
+        @staticmethod
+        def idx():
+            return "physical-session-plan"
+
+        @staticmethod
+        def session_id():
+            return _TEST_SESSION_ID
+
+        @staticmethod
+        def session_config():
+            return dict(_TEST_SESSION_CONFIG)
+
+        @staticmethod
+        def to_physical_plan(_connection):
+            return physical_plan
+
+    existing_cursor_count = len(session.connection.cursors)
+    with pytest.raises(ValueError, match="session mismatch|session config changed"):
+        if copy_plan:
+            asyncio.run(
+                cls.run_copy_plan(
+                    runner,
+                    _TEST_RUNTIME_OWNER_ID,
+                    _TEST_SESSION_ID,
+                    _LogicalPlan(),
+                )
+            )
+        else:
+            asyncio.run(
+                cls.run_plan(
+                    runner,
+                    _TEST_RUNTIME_OWNER_ID,
+                    _TEST_SESSION_ID,
+                    _LogicalPlan(),
+                )
+            )
+
+    assert len(session.connection.cursors) == existing_cursor_count + 1
+    assert session.connection.cursors[-1].closed is True
+    assert session.plan_ids == set()
+    assert session.active_copy_operations == 0
+    assert runner._plan_session_ids == {}
+    assert runner._plan_connections == {}
 
 
 def test_normalize_native_task_result_preserves_schema_and_stats():
@@ -2053,7 +3106,14 @@ def test_get_next_partition_wraps_metadata_aware_fragment(monkeypatch):
         classmethod(lambda _cls, meta: _LocalMetadataAccessor(meta)),
     )
 
-    result = asyncio.run(cls.get_next_partition(runner, plan_id))
+    result = asyncio.run(
+        cls.get_next_partition(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            plan_id,
+        )
+    )
 
     assert result is not None
     assert result.partition_ref() is payload
@@ -2085,9 +3145,15 @@ def test_get_next_partition_leases_and_releases_metadata_aware_fragment(monkeypa
         def __init__(self):
             self.release_result_partition_ref = _FakeRemoteMethod(self._release)
 
-        def _release(self, owner_plan_id, release_token):
-            released.append((owner_plan_id, release_token))
-            return cls.release_result_partition_ref(runner, owner_plan_id, release_token)
+        def _release(self, owner_id, session_id, owner_plan_id, release_token):
+            released.append((owner_id, session_id, owner_plan_id, release_token))
+            return cls.release_result_partition_ref(
+                runner,
+                owner_id,
+                session_id,
+                owner_plan_id,
+                release_token,
+            )
 
     class _LocalMetadataAccessor:
         def __init__(self, metadatas):
@@ -2106,6 +3172,8 @@ def test_get_next_partition_leases_and_releases_metadata_aware_fragment(monkeypa
     result = asyncio.run(
         cls.get_next_partition(
             runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
             plan_id,
             release_owner=_FakeReleaseOwner(),
         )
@@ -2113,7 +3181,7 @@ def test_get_next_partition_leases_and_releases_metadata_aware_fragment(monkeypa
 
     assert result is not None
     assert result.partition() is payload
-    assert released == [(plan_id, "0")]
+    assert released == [(_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id, "0")]
     assert output_owner.released is True
     assert runner._leased_result_partition_refs == {}
 
@@ -2141,12 +3209,20 @@ def test_get_next_partition_releases_by_lease_id_not_object_ref(monkeypatch):
         def __init__(self):
             self.release_result_partition_ref = _FakeRemoteMethod(self._release)
 
-        def _release(self, owner_plan_id, release_token):
+        def _release(self, owner_id, session_id, owner_plan_id, release_token):
+            assert owner_id == _TEST_RUNTIME_OWNER_ID
+            assert session_id == _TEST_SESSION_ID
             assert owner_plan_id == plan_id
             assert release_token is not payload
             assert isinstance(release_token, str)
             released.append(release_token)
-            return cls.release_result_partition_ref(runner, owner_plan_id, release_token)
+            return cls.release_result_partition_ref(
+                runner,
+                owner_id,
+                session_id,
+                owner_plan_id,
+                release_token,
+            )
 
     class _LocalMetadataAccessor:
         def __init__(self, metadatas):
@@ -2165,6 +3241,8 @@ def test_get_next_partition_releases_by_lease_id_not_object_ref(monkeypatch):
     result = asyncio.run(
         cls.get_next_partition(
             runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
             plan_id,
             release_owner=_FakeReleaseOwner(),
         )
@@ -2174,6 +3252,97 @@ def test_get_next_partition_releases_by_lease_id_not_object_ref(monkeypatch):
     assert result.partition() is payload
     assert released == ["0"]
     assert output_owner.released is True
+    assert runner._leased_result_partition_refs == {}
+
+
+def test_late_result_release_is_idempotent_after_plan_and_session_close():
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "late-result-release"
+    _bind_test_plan_session(runner, plan_id, query_id="")
+    runner.curr_plans[plan_id] = object()
+    runner.curr_streams[plan_id] = _DummyStream([])
+    release_calls = []
+
+    class _OutputOwner:
+        def release(self):
+            release_calls.append("release")
+
+    runner._leased_result_partition_refs = {
+        plan_id: {
+            "0": (object(), _OutputOwner()),
+        }
+    }
+    runner._result_partition_ref_counters = {plan_id: 1}
+
+    cls._cleanup_finished_plan(runner, plan_id)
+    cls.release_result_partition_ref(
+        runner,
+        _TEST_RUNTIME_OWNER_ID,
+        _TEST_SESSION_ID,
+        plan_id,
+        "0",
+    )
+    asyncio.run(
+        cls.close_session(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+        )
+    )
+    cls.release_result_partition_ref(
+        runner,
+        _TEST_RUNTIME_OWNER_ID,
+        _TEST_SESSION_ID,
+        plan_id,
+        "0",
+    )
+
+    assert release_calls == ["release"]
+    with pytest.raises(PermissionError, match="owning runtime client"):
+        cls.release_result_partition_ref(
+            runner,
+            "other-runtime-owner",
+            _TEST_SESSION_ID,
+            plan_id,
+            "0",
+        )
+
+
+def test_result_release_failure_retains_lease_for_retry():
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "retry-result-release"
+    _bind_test_plan_session(runner, plan_id, query_id="")
+    attempts = []
+
+    class _OutputOwner:
+        def release(self):
+            attempts.append("release")
+            if len(attempts) == 1:
+                raise RuntimeError("transient release failure")
+
+    record = (object(), _OutputOwner())
+    runner._leased_result_partition_refs = {plan_id: {"0": record}}
+
+    with pytest.raises(RuntimeError, match="transient release failure"):
+        cls.release_result_partition_ref(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            plan_id,
+            "0",
+        )
+
+    assert runner._leased_result_partition_refs[plan_id]["0"] is record
+
+    cls.release_result_partition_ref(
+        runner,
+        _TEST_RUNTIME_OWNER_ID,
+        _TEST_SESSION_ID,
+        plan_id,
+        "0",
+    )
+
+    assert attempts == ["release", "release"]
     assert runner._leased_result_partition_refs == {}
 
 
@@ -2187,7 +3356,14 @@ def test_get_next_partition_rejects_unleased_arrow_payload():
     runner.curr_plans[plan_id] = object()
 
     with pytest.raises(TypeError, match="expected metadata-aware fragment"):
-        asyncio.run(cls.get_next_partition(runner, plan_id))
+        asyncio.run(
+            cls.get_next_partition(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                plan_id,
+            )
+        )
 
 
 def test_get_next_partition_rejects_non_metadata_aware_fragment():
@@ -2198,7 +3374,14 @@ def test_get_next_partition_rejects_non_metadata_aware_fragment():
     runner.curr_plans[plan_id] = object()
 
     with pytest.raises(TypeError, match="expected metadata-aware fragment"):
-        asyncio.run(cls.get_next_partition(runner, plan_id))
+        asyncio.run(
+            cls.get_next_partition(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                plan_id,
+            )
+        )
 
 
 def test_get_next_partition_surfaces_terminal_actor_placement_loss_before_delivery():
@@ -2219,7 +3402,14 @@ def test_get_next_partition_surfaces_terminal_actor_placement_loss_before_delive
     runner._teardown_plan_resources = _teardown
 
     with pytest.raises(RuntimeError, match="fixed Ray actor placement was lost"):
-        asyncio.run(cls.get_next_partition(runner, plan_id))
+        asyncio.run(
+            cls.get_next_partition(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                plan_id,
+            )
+        )
 
     assert teardown_calls == [(plan_id, query_id, True)]
     assert runner.curr_streams[plan_id].items == [undelivered]
@@ -2247,7 +3437,14 @@ def test_get_next_partition_waits_for_teardown_without_blocking_event_loop():
     runner._drop_query_fragments_sync = _slow_drop_query_fragments
 
     async def _consume_to_completion():
-        consume_task = asyncio.create_task(cls.get_next_partition(runner, plan_id))
+        consume_task = asyncio.create_task(
+            cls.get_next_partition(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                plan_id,
+            )
+        )
         assert await asyncio.to_thread(cleanup_started.wait, 1.0)
         assert consume_task.done() is False
 
@@ -2273,6 +3470,8 @@ def test_get_next_partition_waits_for_teardown_without_blocking_event_loop():
 def test_close_plan_runs_blocking_teardown_off_actor_event_loop():
     cls, runner = _make_local_query_driver_actor()
     cleanup_threads = []
+    runner._sessions[_TEST_SESSION_ID].plan_ids.add("plan-close")
+    runner._plan_session_ids["plan-close"] = _TEST_SESSION_ID
 
     def _cleanup(plan_id):
         assert plan_id == "plan-close"
@@ -2283,7 +3482,12 @@ def test_close_plan_runs_blocking_teardown_off_actor_event_loop():
     runner._cleanup_finished_plan = _cleanup
 
     async def _close():
-        await cls.close_plan(runner, "plan-close")
+        await cls.close_plan(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            "plan-close",
+        )
 
     asyncio.run(_close())
 
@@ -2328,6 +3532,7 @@ def test_progress_snapshot_build_runs_off_actor_event_loop(monkeypatch):
     from duckdb.runners.ray import fte_fragment_scheduler
 
     cls, runner = _make_local_query_driver_actor()
+    _bind_test_plan_session(runner, "query-progress")
     build_started = threading.Event()
     build_release = threading.Event()
 
@@ -2362,7 +3567,13 @@ def test_progress_snapshot_build_runs_off_actor_event_loop(monkeypatch):
         watchdog.start()
         try:
             started_at = time.monotonic()
-            progress_call = cls.progress_snapshot(runner, "query-progress", 0.0)
+            progress_call = cls.progress_snapshot(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                "query-progress",
+                0.0,
+            )
             call_elapsed = time.monotonic() - started_at
 
             assert call_elapsed < 0.05
@@ -2384,6 +3595,7 @@ def test_progress_snapshot_build_runs_off_actor_event_loop(monkeypatch):
 
 def test_progress_snapshot_returns_cached_value_while_refresh_runs():
     cls, runner = _make_local_query_driver_actor()
+    _bind_test_plan_session(runner, "query-cache-progress")
     refresh_started = threading.Event()
     refresh_release = threading.Event()
     build_count = 0
@@ -2400,9 +3612,23 @@ def test_progress_snapshot_returns_cached_value_while_refresh_runs():
     runner._build_local_progress_snapshot = _snapshot
 
     async def _read_cached_during_refresh():
-        first = await cls.progress_snapshot(runner, "query-cache-progress", 0.0)
+        first = await cls.progress_snapshot(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            "query-cache-progress",
+            0.0,
+        )
         await asyncio.sleep(0)
-        second_call = asyncio.create_task(cls.progress_snapshot(runner, "query-cache-progress", 0.0))
+        second_call = asyncio.create_task(
+            cls.progress_snapshot(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                "query-cache-progress",
+                0.0,
+            )
+        )
         assert await asyncio.to_thread(refresh_started.wait, 1.0)
         second = await asyncio.wait_for(second_call, timeout=0.1)
         assert runner._progress_snapshot_builds
@@ -2421,6 +3647,7 @@ def test_progress_snapshot_returns_cached_value_while_refresh_runs():
 
 def test_progress_snapshot_state_is_cancelled_and_dropped_with_query():
     cls, runner = _make_local_query_driver_actor()
+    _bind_test_plan_session(runner, "query-drop-progress")
     build_started = threading.Event()
     build_release = threading.Event()
 
@@ -2432,7 +3659,15 @@ def test_progress_snapshot_state_is_cancelled_and_dropped_with_query():
     runner._build_local_progress_snapshot = _slow_snapshot
 
     async def _drop_active_snapshot():
-        progress = asyncio.create_task(cls.progress_snapshot(runner, "query-drop-progress", 0.0))
+        progress = asyncio.create_task(
+            cls.progress_snapshot(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                "query-drop-progress",
+                0.0,
+            )
+        )
         assert await asyncio.to_thread(build_started.wait, 1.0)
         cls._drop_progress_snapshot_state(runner, "query-drop-progress")
         with pytest.raises(asyncio.CancelledError):
@@ -4328,60 +5563,899 @@ def test_wait_fte_query_respects_timeout_after_finished_status_during_drain(monk
         manager.shutdown()
 
 
-def test_ray_query_driver_client_retries_stale_named_actor_with_get_if_exists(monkeypatch):
+def test_worker_manager_close_session_attempts_every_worker_before_retry(monkeypatch):
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    calls = []
+
+    class _SessionWorker:
+        def __init__(self, worker_id, *, fail):
+            self.worker_id = worker_id
+            self.fail = fail
+
+        def close_session(self, session_id):
+            calls.append((self.worker_id, session_id))
+            if self.fail:
+                raise RuntimeError(f"planned close failure on {self.worker_id}")
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    first = _SessionWorker("worker-a", fail=True)
+    second = _SessionWorker("worker-b", fail=False)
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids: [
+            duckdb.ray_cxx.RayWorkerRuntime("worker-a", first, 1.0, 0.0, 1024),
+            duckdb.ray_cxx.RayWorkerRuntime("worker-b", second, 1.0, 0.0, 1024),
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    try:
+        runner.warm_up()
+        with pytest.raises(Exception, match="planned close failure on worker-a"):
+            runner.close_session("session-a")
+
+        assert sorted(calls) == [
+            ("worker-a", "session-a"),
+            ("worker-b", "session-a"),
+        ]
+
+        first.fail = False
+        runner.close_session("session-a")
+
+        assert sorted(calls) == [
+            ("worker-a", "session-a"),
+            ("worker-a", "session-a"),
+            ("worker-b", "session-a"),
+            ("worker-b", "session-a"),
+        ]
+    finally:
+        runner.shutdown()
+
+
+def test_ray_query_driver_clients_attach_to_job_runtime(monkeypatch):
     class _FakeMethod:
         def __init__(self, label):
             self.label = label
+            self.calls = []
 
         def remote(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
             return (self.label, args, kwargs)
 
     class _FakeHandle:
         def __init__(self, name):
             self.name = name
+            self.attach_client = _FakeMethod(("attach", name))
             self.ping = _FakeMethod(("ping", name))
-            self.install_env_overrides = _FakeMethod(("install_env_overrides", name))
 
-    handles = [_FakeHandle("stale"), _FakeHandle("fresh")]
+    handle = _FakeHandle("job-runtime")
     option_calls = []
-    kill_calls = []
+    remote_calls = []
 
     def _fake_options(**kwargs):
         option_calls.append(kwargs)
 
         class _Factory:
-            def remote(self, env_overrides, duckdb_memory_bytes):
-                assert env_overrides == {}
+            def remote(self, runtime_config, duckdb_memory_bytes):
+                assert runtime_config == {"PYTHONPATH": "/vane"}
                 assert duckdb_memory_bytes == 50
-                return handles.pop(0)
+                remote_calls.append((runtime_config, duckdb_memory_bytes, handle))
+                return handle
 
         return _Factory()
 
-    def _fake_ray_get(token, **_kwargs):
-        if token[0] == ("ping", "stale"):
-            raise RuntimeError("stale actor")
-
-    def _fake_ray_kill(handle, no_restart=False):
-        kill_calls.append((handle.name, no_restart))
-
     monkeypatch.setattr(driver, "_maybe_set_distributed_cluster_capacity", lambda: None)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(
+            gcs_address="gcs-a",
+            get_job_id=lambda: "job-a",
+        ),
+    )
     monkeypatch.setattr(
         driver,
         "get_head_node",
         lambda: {"NodeID": "a" * 56, "Resources": {"memory": 1_000}},
     )
-    monkeypatch.setattr(driver, "_collect_vane_env_overrides", dict)
+    monkeypatch.setattr(driver, "_collect_vane_env_overrides", lambda: {"PYTHONPATH": "/vane"})
     monkeypatch.setattr(driver.RayQueryDriverActor, "options", _fake_options)
-    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _fake_ray_get)
-    monkeypatch.setattr(driver.ray, "kill", _fake_ray_kill)
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", lambda *_args, **_kwargs: True)
 
-    runner = driver.RayQueryDriverClient()
+    client_a = driver.RayQueryDriverClient()
+    client_b = driver.RayQueryDriverClient()
 
-    assert runner.runner.name == "fresh"
+    assert client_a.runner is handle
+    assert client_b.runner is handle
+    assert client_a._owner_id != client_b._owner_id
     assert len(option_calls) == 2
-    assert option_calls[0]["name"] == "ray-query-driver-actor"
-    assert option_calls[0]["namespace"] == "vane"
+    assert option_calls[0]["name"] == option_calls[1]["name"]
+    assert option_calls[0]["name"].startswith("vane-query-runtime-")
+    assert all(options["namespace"] == "vane" for options in option_calls)
+    assert all(options["get_if_exists"] is True for options in option_calls)
     assert option_calls[0]["memory"] == 50
-    assert option_calls[0]["get_if_exists"] is True
-    assert option_calls[1]["get_if_exists"] is False
-    assert kill_calls == [("stale", False)]
+    assert option_calls[0]["runtime_env"]["env_vars"] == {"PYTHONPATH": "/vane"}
+    assert option_calls[1]["runtime_env"]["env_vars"] == {"PYTHONPATH": "/vane"}
+    assert remote_calls[0][:2] == ({"PYTHONPATH": "/vane"}, 50)
+    assert remote_calls[1][:2] == ({"PYTHONPATH": "/vane"}, 50)
+    assert handle.attach_client.calls == [
+        ((client_a._owner_id, {"PYTHONPATH": "/vane"}), {}),
+        ((client_b._owner_id, {"PYTHONPATH": "/vane"}), {}),
+    ]
+    assert handle.ping.calls == [
+        ((client_a._owner_id,), {}),
+        ((client_b._owner_id,), {}),
+    ]
+
+
+def test_ray_runner_creates_one_driver_client_for_concurrent_sessions(monkeypatch):
+    from duckdb.runners.ray import runner as runner_module
+
+    created = []
+
+    class _FakeClient:
+        def __init__(self):
+            created.append(self)
+
+    ray_runner = object.__new__(runner_module.RayRunner)
+    ray_runner.query_driver_client = None
+    ray_runner._session_ids = set()
+    ray_runner._closed_session_ids = runner_module.BoundedReplayMap(capacity=65_536)
+    ray_runner._session_lock = threading.RLock()
+    ray_runner._closed = False
+    monkeypatch.setattr(runner_module, "RayQueryDriverClient", _FakeClient)
+
+    clients = []
+
+    def _get_client(session_id):
+        clients.append(ray_runner._client_for_session(session_id))
+
+    first = threading.Thread(target=_get_client, args=("session-a",))
+    second = threading.Thread(target=_get_client, args=("session-b",))
+    first.start()
+    second.start()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert len(created) == 1
+    assert clients == [created[0], created[0]]
+    assert ray_runner._session_ids == {"session-a", "session-b"}
+
+
+def test_ray_runner_close_before_session_registration_is_terminal(monkeypatch):
+    from duckdb.runners.ray import runner as runner_module
+
+    ray_runner = object.__new__(runner_module.RayRunner)
+    ray_runner.query_driver_client = None
+    ray_runner._session_ids = set()
+    ray_runner._closed_session_ids = runner_module.BoundedReplayMap(capacity=65_536)
+    ray_runner._session_lock = threading.RLock()
+    ray_runner._closed = False
+    monkeypatch.setattr(
+        runner_module,
+        "RayQueryDriverClient",
+        lambda: (_ for _ in ()).throw(AssertionError("closed session must not create a client")),
+    )
+
+    ray_runner.close_session("session-a")
+
+    with pytest.raises(RuntimeError, match="Vane session is closed"):
+        ray_runner._client_for_session("session-a")
+    assert set(ray_runner._closed_session_ids) == {"session-a"}
+
+
+def test_ray_runner_close_is_terminal_and_idempotent(monkeypatch):
+    from duckdb.runners.ray import runner as runner_module
+
+    closed_clients = []
+
+    class _FakeClient:
+        def close(self):
+            closed_clients.append(self)
+
+    ray_runner = object.__new__(runner_module.RayRunner)
+    original_client = _FakeClient()
+    ray_runner.query_driver_client = original_client
+    ray_runner._session_ids = {"session-a"}
+    ray_runner._closed_session_ids = runner_module.BoundedReplayMap(capacity=65_536)
+    ray_runner._session_lock = threading.RLock()
+    ray_runner._closed = False
+    with runner_module._RAY_RUNNERS_LOCK:
+        runner_module._RAY_RUNNERS.add(ray_runner)
+    monkeypatch.setattr(runner_module, "RayQueryDriverClient", _FakeClient)
+
+    ray_runner.close()
+    ray_runner.close()
+
+    with runner_module._RAY_RUNNERS_LOCK:
+        assert ray_runner not in runner_module._RAY_RUNNERS
+
+    with pytest.raises(RuntimeError, match="RayRunner is closed"):
+        ray_runner._client_for_session("session-b")
+    assert closed_clients == [original_client]
+    assert ray_runner._session_ids == set()
+    assert ray_runner._closed is True
+
+
+def test_connection_close_notification_attempts_every_live_runner(monkeypatch):
+    from duckdb.runners.ray import runner as runner_module
+
+    calls = []
+
+    class _LiveRunner:
+        def __init__(self, name, *, fail):
+            self.name = name
+            self.fail = fail
+
+        def close_session(self, session_id):
+            calls.append((self.name, session_id))
+            if self.fail:
+                raise RuntimeError(f"planned close failure on {self.name}")
+
+    failing = _LiveRunner("runner-a", fail=True)
+    succeeding = _LiveRunner("runner-b", fail=False)
+    monkeypatch.setattr(runner_module, "_RAY_RUNNERS", {failing, succeeding})
+
+    with pytest.raises(RuntimeError, match="planned close failure on runner-a"):
+        runner_module.notify_connection_closed("session-a")
+
+    assert sorted(calls) == [
+        ("runner-a", "session-a"),
+        ("runner-b", "session-a"),
+    ]
+
+    failing.fail = False
+    runner_module.notify_connection_closed("session-a")
+
+    assert sorted(calls) == [
+        ("runner-a", "session-a"),
+        ("runner-a", "session-a"),
+        ("runner-b", "session-a"),
+        ("runner-b", "session-a"),
+    ]
+
+
+def test_ray_runner_session_start_and_close_are_serialized(monkeypatch):
+    from duckdb.runners.ray import runner as runner_module
+
+    client_init_started = threading.Event()
+    client_init_release = threading.Event()
+    close_started = threading.Event()
+
+    class _FakeClient:
+        def __init__(self):
+            client_init_started.set()
+            assert client_init_release.wait(timeout=1.0)
+
+        def close(self):
+            close_started.set()
+
+    ray_runner = object.__new__(runner_module.RayRunner)
+    ray_runner.query_driver_client = None
+    ray_runner._session_ids = set()
+    ray_runner._closed_session_ids = runner_module.BoundedReplayMap(capacity=65_536)
+    ray_runner._session_lock = threading.RLock()
+    ray_runner._closed = False
+    monkeypatch.setattr(runner_module, "RayQueryDriverClient", _FakeClient)
+
+    session_thread = threading.Thread(
+        target=ray_runner._client_for_session,
+        args=("session-a",),
+        daemon=True,
+    )
+    close_thread = threading.Thread(target=ray_runner.close, daemon=True)
+    session_thread.start()
+    assert client_init_started.wait(timeout=1.0)
+    close_thread.start()
+    try:
+        assert close_started.wait(timeout=0.05) is False
+    finally:
+        client_init_release.set()
+    session_thread.join(timeout=1.0)
+    close_thread.join(timeout=1.0)
+
+    assert not session_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert close_started.is_set()
+    assert ray_runner._closed is True
+
+
+def test_ray_query_driver_client_serializes_first_session_open_with_close(monkeypatch):
+    open_started = threading.Event()
+    open_release = threading.Event()
+    events = []
+
+    class _OpenMethod:
+        @staticmethod
+        def remote(owner_id, session_id, config):
+            events.append(("open", owner_id, session_id, config))
+            open_started.set()
+            assert open_release.wait(timeout=1.0)
+            return "open-ref"
+
+    class _CloseMethod:
+        @staticmethod
+        def remote(owner_id, session_id):
+            events.append(("close", owner_id, session_id))
+            return "close-ref"
+
+    class _Plan:
+        @staticmethod
+        def session_id():
+            return "session-a"
+
+        @staticmethod
+        def session_config():
+            return {"AWS_ACCESS_KEY_ID": "key-a"}
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    _initialize_test_query_driver_client(client)
+    client.runner = SimpleNamespace(
+        open_session=_OpenMethod(),
+        close_session=_CloseMethod(),
+    )
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref)
+    open_errors = []
+    close_errors = []
+
+    def _open():
+        try:
+            client._ensure_session(_Plan())
+        except BaseException as exc:
+            open_errors.append(exc)
+
+    def _close():
+        try:
+            client.close_session("session-a")
+        except BaseException as exc:
+            close_errors.append(exc)
+
+    open_thread = threading.Thread(target=_open)
+    close_thread = threading.Thread(target=_close)
+    open_thread.start()
+    assert open_started.wait(timeout=1.0)
+    close_thread.start()
+    for _ in range(100):
+        with client._session_condition:
+            if "session-a" in client._closing_session_ids:
+                break
+        time.sleep(0.001)
+    open_release.set()
+    open_thread.join(timeout=1.0)
+    close_thread.join(timeout=1.0)
+
+    assert not open_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert len(open_errors) == 1
+    assert "closed while it was opening" in str(open_errors[0])
+    assert close_errors == []
+    assert events == [
+        ("open", "owner-a", "session-a", {"AWS_ACCESS_KEY_ID": "key-a"}),
+        ("close", "owner-a", "session-a"),
+    ]
+    assert client._opened_sessions == {}
+    assert client._opening_session_ids == set()
+    assert client._closing_session_ids == set()
+
+
+def test_ray_query_driver_client_closes_session_after_ambiguous_open_failure(monkeypatch):
+    open_ref = object()
+    close_ref = object()
+    close_calls = []
+
+    class _OpenMethod:
+        @staticmethod
+        def remote(*_args):
+            return open_ref
+
+    class _CloseMethod:
+        @staticmethod
+        def remote(owner_id, session_id):
+            close_calls.append((owner_id, session_id))
+            return close_ref
+
+    class _Plan:
+        @staticmethod
+        def session_id():
+            return "session-a"
+
+        @staticmethod
+        def session_config():
+            return {"AWS_ACCESS_KEY_ID": "key-a"}
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    _initialize_test_query_driver_client(client)
+    client.runner = SimpleNamespace(
+        open_session=_OpenMethod(),
+        close_session=_CloseMethod(),
+    )
+
+    def _resolve(ref, **_kwargs):
+        if ref is open_ref:
+            raise FutureTimeoutError("ambiguous open timeout")
+        assert ref is close_ref
+        return None
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+
+    with pytest.raises(FutureTimeoutError, match="ambiguous open timeout"):
+        client._ensure_session(_Plan())
+
+    assert client._opened_sessions == {}
+    assert client._uncertain_sessions == {
+        "session-a": {
+            "AWS_ACCESS_KEY_ID": "key-a",
+        }
+    }
+
+    client.close_session("session-a")
+
+    assert close_calls == [("owner-a", "session-a")]
+    assert client._uncertain_sessions == {}
+    assert client._closing_session_ids == set()
+
+
+def test_ray_query_driver_client_detach_supersedes_session_close_waiting_on_open(monkeypatch):
+    open_started = threading.Event()
+    open_release = threading.Event()
+    detach_started = threading.Event()
+    detach_release = threading.Event()
+    events = []
+
+    class _OpenMethod:
+        @staticmethod
+        def remote(owner_id, session_id, config):
+            events.append(("open", owner_id, session_id, config))
+            open_started.set()
+            assert open_release.wait(timeout=1.0)
+            return "open-ref"
+
+    class _CloseMethod:
+        @staticmethod
+        def remote(owner_id, session_id):
+            events.append(("close", owner_id, session_id))
+            return "close-ref"
+
+    class _DetachMethod:
+        @staticmethod
+        def remote(owner_id):
+            events.append(("detach", owner_id))
+            detach_started.set()
+            assert detach_release.wait(timeout=1.0)
+            return "detach-ref"
+
+    class _Plan:
+        @staticmethod
+        def session_id():
+            return "session-a"
+
+        @staticmethod
+        def session_config():
+            return {"AWS_ACCESS_KEY_ID": "key-a"}
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
+    _initialize_test_query_driver_client(client)
+    client.runner = SimpleNamespace(
+        open_session=_OpenMethod(),
+        close_session=_CloseMethod(),
+        detach_client=_DetachMethod(),
+    )
+
+    def _resolve(ref, **_kwargs):
+        return False if ref == "detach-ref" else ref
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
+    )
+    errors = []
+
+    def _run(call):
+        try:
+            call()
+        except BaseException as exc:
+            errors.append(exc)
+
+    open_thread = threading.Thread(target=_run, args=(lambda: client._ensure_session(_Plan()),))
+    session_close_thread = threading.Thread(target=_run, args=(lambda: client.close_session("session-a"),))
+    client_close_thread = threading.Thread(target=_run, args=(client.close,))
+    open_thread.start()
+    assert open_started.wait(timeout=1.0)
+    session_close_thread.start()
+    for _ in range(100):
+        with client._session_condition:
+            if "session-a" in client._closing_session_ids:
+                break
+        time.sleep(0.001)
+    client_close_thread.start()
+    open_release.set()
+    assert detach_started.wait(timeout=1.0)
+
+    session_close_thread.join(timeout=1.0)
+    assert not session_close_thread.is_alive()
+    assert not any(event[0] == "close" for event in events)
+
+    detach_release.set()
+    open_thread.join(timeout=1.0)
+    client_close_thread.join(timeout=1.0)
+
+    assert not open_thread.is_alive()
+    assert not client_close_thread.is_alive()
+    assert len(errors) == 1
+    assert "closed while it was opening" in str(errors[0])
+    assert events == [
+        ("open", "owner-a", "session-a", {"AWS_ACCESS_KEY_ID": "key-a"}),
+        ("detach", "owner-a"),
+    ]
+    assert client.runner is None
+    assert client._opened_sessions == {}
+    assert client._closing_session_ids == set()
+
+
+def test_ray_query_driver_client_session_close_failure_stays_fenced_and_retryable(monkeypatch):
+    close_calls = []
+
+    class _CloseMethod:
+        @staticmethod
+        def remote(owner_id, session_id):
+            close_calls.append((owner_id, session_id))
+            return len(close_calls)
+
+    class _Plan:
+        @staticmethod
+        def session_id():
+            return "session-a"
+
+        @staticmethod
+        def session_config():
+            return {}
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    _initialize_test_query_driver_client(client, {"session-a": {}})
+    client.runner = SimpleNamespace(close_session=_CloseMethod())
+
+    def _resolve(ref, **_kwargs):
+        if ref == 1:
+            raise RuntimeError("planned session close failure")
+        return None
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+
+    with pytest.raises(RuntimeError, match="planned session close failure"):
+        client.close_session("session-a")
+
+    assert client._opened_sessions == {"session-a": {}}
+    assert client._closing_session_ids == {"session-a"}
+    with pytest.raises(RuntimeError, match="Vane session is closing"):
+        client._ensure_session(_Plan())
+
+    client.close_session("session-a")
+
+    assert close_calls == [("owner-a", "session-a"), ("owner-a", "session-a")]
+    assert client._opened_sessions == {}
+    assert client._closing_session_ids == set()
+
+
+@pytest.mark.parametrize("failed_ref", ["attach", "ping"])
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
+def test_ray_query_driver_client_detaches_when_initialization_fails(monkeypatch, failed_ref, failure_type):
+    events = []
+
+    class _FakeMethod:
+        def __init__(self, operation):
+            self.operation = operation
+
+        def remote(self, *args):
+            events.append((self.operation, *args))
+            return self.operation
+
+    class _FakeHandle:
+        attach_client = _FakeMethod("attach")
+        ping = _FakeMethod("ping")
+        detach_client = _FakeMethod("detach")
+
+    handle = _FakeHandle()
+
+    class _Factory:
+        @staticmethod
+        def remote(_runtime_config, _duckdb_memory_bytes):
+            return handle
+
+    monkeypatch.setattr(driver, "_maybe_set_distributed_cluster_capacity", lambda: None)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(
+            gcs_address="gcs-a",
+            get_job_id=lambda: "job-a",
+        ),
+    )
+    monkeypatch.setattr(
+        driver,
+        "get_head_node",
+        lambda: {"NodeID": "a" * 56, "Resources": {"memory": 1_000}},
+    )
+    monkeypatch.setattr(driver, "_collect_vane_env_overrides", lambda: {})
+    monkeypatch.setattr(driver.RayQueryDriverActor, "options", lambda **_kwargs: _Factory())
+
+    def resolve(ref, **kwargs):
+        events.append(("resolve", ref, kwargs))
+        if ref == failed_ref:
+            raise failure_type(f"planned {failed_ref} failure")
+        return True
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", resolve)
+    monkeypatch.setattr(
+        driver.ray,
+        "kill",
+        lambda actor, *, no_restart: events.append(("kill", actor, no_restart)),
+    )
+
+    with pytest.raises(failure_type, match=f"planned {failed_ref} failure"):
+        driver.RayQueryDriverClient()
+
+    attach_event = next(event for event in events if event[0] == "attach")
+    detach_event = next(event for event in events if event[0] == "detach")
+    assert attach_event[1] == detach_event[1]
+    if failed_ref == "ping":
+        ping_event = next(event for event in events if event[0] == "ping")
+        assert attach_event[1] == ping_event[1]
+    else:
+        assert all(event[0] != "ping" for event in events)
+    assert ("kill", handle, True) in events
+
+
+@pytest.mark.parametrize("close_order", [(0, 1), (1, 0)])
+def test_ray_query_driver_client_close_keeps_shared_runtime_until_last_owner(monkeypatch, close_order):
+    events = []
+
+    class _FakeMethod:
+        def __init__(self, operation, actor_name):
+            self.operation = operation
+            self.actor_name = actor_name
+
+        def remote(self, owner_id):
+            events.append((self.operation, self.actor_name, owner_id))
+            return (self.operation, self.actor_name)
+
+    class _FakeHandle:
+        def __init__(self, name):
+            self.name = name
+            self.ping = _FakeMethod("ping", name)
+            self.detach_client = _FakeMethod("detach", name)
+
+    shared_handle = _FakeHandle("job-runtime")
+    clients = []
+    for index in range(2):
+        client = object.__new__(driver.RayQueryDriverClient)
+        client._owner_id = f"owner-{index}"
+        client._ray_gcs_address = "gcs-a"
+        _initialize_test_query_driver_client(client)
+        client.runner = shared_handle
+        clients.append(client)
+
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
+    )
+
+    def resolve(ref, **_kwargs):
+        events.append(("resolve", *ref))
+        if ref[0] == "detach":
+            detach_count = sum(event[0] == "detach" for event in events)
+            return detach_count == 2
+        return True
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", resolve)
+    monkeypatch.setattr(
+        driver.ray,
+        "kill",
+        lambda actor, *, no_restart: events.append(("kill", actor.name, no_restart)),
+    )
+
+    first, second = close_order
+    clients[first].close()
+
+    assert clients[first].runner is None
+    assert clients[second].runner is not None
+    ping_ref = clients[second].runner.ping.remote(clients[second]._owner_id)
+    assert resolve(ping_ref) is True
+
+    clients[second].close()
+
+    assert events == [
+        ("detach", "job-runtime", f"owner-{first}"),
+        ("resolve", "detach", "job-runtime"),
+        ("ping", "job-runtime", f"owner-{second}"),
+        ("resolve", "ping", "job-runtime"),
+        ("detach", "job-runtime", f"owner-{second}"),
+        ("resolve", "detach", "job-runtime"),
+        ("kill", "job-runtime", True),
+    ]
+
+
+def test_ray_query_driver_client_close_remains_retryable_after_detach_failure(monkeypatch):
+    class _DetachMethod:
+        @staticmethod
+        def remote(owner_id):
+            assert owner_id == "owner-a"
+            return "detach-ref"
+
+    runner = SimpleNamespace(detach_client=_DetachMethod())
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
+    _initialize_test_query_driver_client(client, {"session-a": {}})
+    client.runner = runner
+
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
+    )
+    monkeypatch.setattr(
+        driver,
+        "resolve_object_refs_blocking",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("planned detach failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="planned detach failure"):
+        client.close()
+
+    assert client.runner is runner
+    assert client._opened_sessions == {"session-a": {}}
+    assert client._client_closing is True
+
+
+def test_ray_query_driver_client_close_remains_retryable_after_kill_failure(monkeypatch):
+    class _DetachMethod:
+        @staticmethod
+        def remote(owner_id):
+            assert owner_id == "owner-a"
+            return "detach-ref"
+
+    runner = SimpleNamespace(detach_client=_DetachMethod())
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
+    _initialize_test_query_driver_client(client, {"session-a": {}})
+    client.runner = runner
+    kill_calls = []
+
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
+    )
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", lambda *_args, **_kwargs: True)
+
+    def _kill(actor, *, no_restart):
+        assert actor is runner
+        assert no_restart is True
+        kill_calls.append(actor)
+        if len(kill_calls) == 1:
+            raise RuntimeError("planned kill failure")
+
+    monkeypatch.setattr(driver.ray, "kill", _kill)
+
+    with pytest.raises(RuntimeError, match="planned kill failure"):
+        client.close()
+
+    assert client.runner is runner
+    assert client._opened_sessions == {"session-a": {}}
+    assert client._client_closing is True
+
+    client.close()
+
+    assert client.runner is None
+    assert client._opened_sessions == {}
+    assert client._client_closing is False
+    assert kill_calls == [runner, runner]
+
+
+def test_ray_query_driver_client_concurrent_close_detaches_once(monkeypatch):
+    detach_calls: list[str] = []
+    kill_calls = []
+    detach_started = threading.Event()
+    allow_detach = threading.Event()
+
+    class _DetachMethod:
+        @staticmethod
+        def remote(owner_id):
+            detach_calls.append(owner_id)
+            return "detach-ref"
+
+    runner = SimpleNamespace(detach_client=_DetachMethod())
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
+    _initialize_test_query_driver_client(client, {"session-a": {}})
+    client.runner = runner
+
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
+    )
+
+    def _resolve(*_args, **_kwargs):
+        detach_started.set()
+        assert allow_detach.wait(timeout=5)
+        return True
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+    monkeypatch.setattr(
+        driver.ray,
+        "kill",
+        lambda actor, *, no_restart: kill_calls.append((actor, no_restart)),
+    )
+
+    errors: list[BaseException] = []
+
+    def _close() -> None:
+        try:
+            client.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=_close)
+    second = threading.Thread(target=_close)
+    first.start()
+    assert detach_started.wait(timeout=5)
+    second.start()
+    allow_detach.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert detach_calls == ["owner-a"]
+    assert kill_calls == [(runner, True)]
+    assert client.runner is None
+
+
+def test_ray_query_driver_client_close_before_open_is_terminal():
+    class _Plan:
+        @staticmethod
+        def session_id():
+            return "session-a"
+
+        @staticmethod
+        def session_config():
+            return {}
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    _initialize_test_query_driver_client(client)
+    client.runner = SimpleNamespace()
+
+    client.close_session("session-a")
+
+    assert set(client._closed_session_ids) == {"session-a"}
+    with pytest.raises(RuntimeError, match="Vane session is closed"):
+        client._ensure_session(_Plan())
