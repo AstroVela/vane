@@ -421,13 +421,16 @@ struct DistributedArrowStreamOwner {
 		} else if (extension_name != "arrow.json") {
 			return false;
 		}
-		return CanNormalizeArrowOffsetWidths(actual_type.attr("storage_type"), expected_type.attr("storage_type"),
-		                                     type_predicates);
+		return CanNormalizeArrowType(actual_type.attr("storage_type"), expected_type.attr("storage_type"),
+		                             type_predicates);
 	}
 
-	static bool CanNormalizeArrowOffsetWidths(const py::object &actual_type, const py::object &expected_type,
-	                                          const py::object &type_predicates) {
+	static bool CanNormalizeArrowType(const py::object &actual_type, const py::object &expected_type,
+	                                  const py::object &type_predicates) {
 		if (py::cast<bool>(actual_type.attr("equals")(expected_type))) {
+			return true;
+		}
+		if (CanNormalizeArrowExtensionStorage(actual_type, expected_type, type_predicates)) {
 			return true;
 		}
 		auto same_family = [&](std::initializer_list<const char *> predicate_names) {
@@ -439,13 +442,13 @@ struct DistributedArrowStreamOwner {
 			return true;
 		}
 		if (same_family({"is_list", "is_large_list", "is_list_view", "is_large_list_view"})) {
-			return CanNormalizeArrowOffsetWidths(actual_type.attr("value_type"), expected_type.attr("value_type"),
-			                                     type_predicates);
+			return CanNormalizeArrowType(actual_type.attr("value_type"), expected_type.attr("value_type"),
+			                             type_predicates);
 		}
 		if (same_family({"is_fixed_size_list"})) {
 			return py::cast<idx_t>(actual_type.attr("list_size")) == py::cast<idx_t>(expected_type.attr("list_size")) &&
-			       CanNormalizeArrowOffsetWidths(actual_type.attr("value_type"), expected_type.attr("value_type"),
-			                                     type_predicates);
+			       CanNormalizeArrowType(actual_type.attr("value_type"), expected_type.attr("value_type"),
+			                             type_predicates);
 		}
 		if (same_family({"is_struct"})) {
 			auto field_count = py::cast<idx_t>(actual_type.attr("num_fields"));
@@ -457,8 +460,7 @@ struct DistributedArrowStreamOwner {
 				auto expected_field = expected_type.attr("field")(field_idx);
 				if (py::cast<string>(actual_field.attr("name")) != py::cast<string>(expected_field.attr("name")) ||
 				    py::cast<bool>(actual_field.attr("nullable")) != py::cast<bool>(expected_field.attr("nullable")) ||
-				    !CanNormalizeArrowOffsetWidths(actual_field.attr("type"), expected_field.attr("type"),
-				                                   type_predicates)) {
+				    !CanNormalizeArrowType(actual_field.attr("type"), expected_field.attr("type"), type_predicates)) {
 					return false;
 				}
 			}
@@ -467,23 +469,118 @@ struct DistributedArrowStreamOwner {
 		if (same_family({"is_map"})) {
 			return py::cast<bool>(actual_type.attr("keys_sorted")) ==
 			           py::cast<bool>(expected_type.attr("keys_sorted")) &&
-			       CanNormalizeArrowOffsetWidths(actual_type.attr("key_type"), expected_type.attr("key_type"),
-			                                     type_predicates) &&
-			       CanNormalizeArrowOffsetWidths(actual_type.attr("item_type"), expected_type.attr("item_type"),
-			                                     type_predicates);
+			       CanNormalizeArrowType(actual_type.attr("key_type"), expected_type.attr("key_type"),
+			                             type_predicates) &&
+			       CanNormalizeArrowType(actual_type.attr("item_type"), expected_type.attr("item_type"),
+			                             type_predicates);
 		}
 		return false;
 	}
 
-	static py::object NormalizeArrowExtensionStorage(const py::object &column, const py::object &expected_type) {
-		auto pyarrow = py::module_::import("pyarrow");
-		auto extension_array = pyarrow.attr("ExtensionArray");
-		auto expected_storage_type = expected_type.attr("storage_type");
+	static py::object NormalizeArrowArray(const py::object &array, const py::object &expected_type,
+	                                      const py::object &pyarrow, const py::object &type_predicates) {
+		auto actual_type = array.attr("type");
+		if (py::cast<bool>(actual_type.attr("equals")(expected_type))) {
+			return array;
+		}
+		if (CanNormalizeArrowExtensionStorage(actual_type, expected_type, type_predicates)) {
+			auto storage = NormalizeArrowArray(array.attr("storage"), expected_type.attr("storage_type"), pyarrow,
+			                                   type_predicates);
+			return pyarrow.attr("ExtensionArray").attr("from_storage")(expected_type, storage);
+		}
+		auto same_family = [&](std::initializer_list<const char *> predicate_names) {
+			return ArrowTypeMatchesAny(type_predicates, actual_type, predicate_names) &&
+			       ArrowTypeMatchesAny(type_predicates, expected_type, predicate_names);
+		};
+		if (same_family({"is_string", "is_large_string", "is_string_view"}) ||
+		    same_family({"is_binary", "is_large_binary", "is_binary_view"})) {
+			return array.attr("cast")(expected_type, py::arg("safe") = true);
+		}
+		if (same_family({"is_list", "is_large_list", "is_list_view", "is_large_list_view"})) {
+			auto values = NormalizeArrowArray(array.attr("flatten")(), expected_type.attr("value_type"), pyarrow,
+			                                  type_predicates);
+			auto large_offsets =
+			    ArrowTypeMatchesAny(type_predicates, expected_type, {"is_large_list", "is_large_list_view"});
+			auto int64_type = pyarrow.attr("int64")();
+			auto offset_type = large_offsets ? int64_type : pyarrow.attr("int32")();
+			auto sizes =
+			    array.attr("value_lengths")().attr("fill_null")(0).attr("cast")(int64_type, py::arg("safe") = true);
+			auto compute = py::module_::import("pyarrow.compute");
+			py::list offset_arrays;
+			offset_arrays.append(pyarrow.attr("array")(py::make_tuple(0), py::arg("type") = int64_type));
+			offset_arrays.append(compute.attr("cumulative_sum")(sizes));
+			auto offsets = pyarrow.attr("concat_arrays")(offset_arrays);
+			if (!large_offsets) {
+				sizes = sizes.attr("cast")(offset_type, py::arg("safe") = true);
+				offsets = offsets.attr("cast")(offset_type, py::arg("safe") = true);
+			}
+			auto mask = array.attr("is_null")();
+			if (ArrowTypeMatchesAny(type_predicates, expected_type, {"is_list"})) {
+				return pyarrow.attr("ListArray")
+				    .attr("from_arrays")(offsets, values, py::arg("type") = expected_type, py::arg("mask") = mask);
+			}
+			if (ArrowTypeMatchesAny(type_predicates, expected_type, {"is_large_list"})) {
+				return pyarrow.attr("LargeListArray")
+				    .attr("from_arrays")(offsets, values, py::arg("type") = expected_type, py::arg("mask") = mask);
+			}
+			auto view_offsets = offsets.attr("slice")(0, py::len(array));
+			if (ArrowTypeMatchesAny(type_predicates, expected_type, {"is_list_view"})) {
+				return pyarrow.attr("ListViewArray")
+				    .attr("from_arrays")(view_offsets, sizes, values, py::arg("type") = expected_type,
+				                         py::arg("mask") = mask);
+			}
+			return pyarrow.attr("LargeListViewArray")
+			    .attr("from_arrays")(view_offsets, sizes, values, py::arg("type") = expected_type,
+			                         py::arg("mask") = mask);
+		}
+		if (same_family({"is_fixed_size_list"})) {
+			auto list_size = py::cast<idx_t>(actual_type.attr("list_size"));
+			auto array_offset = py::cast<idx_t>(array.attr("offset"));
+			auto array_length = NumericCast<idx_t>(py::len(array));
+			auto values = array.attr("values").attr("slice")(array_offset * list_size, array_length * list_size);
+			values = NormalizeArrowArray(values, expected_type.attr("value_type"), pyarrow, type_predicates);
+			return pyarrow.attr("FixedSizeListArray")
+			    .attr("from_arrays")(values, py::arg("type") = expected_type,
+			                         py::arg("mask") = array.attr("is_null")());
+		}
+		if (same_family({"is_struct"})) {
+			py::list fields;
+			auto field_count = py::cast<idx_t>(expected_type.attr("num_fields"));
+			for (idx_t field_idx = 0; field_idx < field_count; field_idx++) {
+				fields.append(NormalizeArrowArray(array.attr("field")(field_idx),
+				                                  expected_type.attr("field")(field_idx).attr("type"), pyarrow,
+				                                  type_predicates));
+			}
+			return pyarrow.attr("StructArray")
+			    .attr("from_arrays")(fields, py::arg("type") = expected_type,
+			                         py::arg("mask") = array.attr("is_null")());
+		}
+		if (same_family({"is_map"})) {
+			auto offsets = array.attr("offsets");
+			auto start = py::cast<idx_t>(offsets.attr("__getitem__")(0).attr("as_py")());
+			auto end = py::cast<idx_t>(offsets.attr("__getitem__")(-1).attr("as_py")());
+			auto entry_count = end - start;
+			auto compute = py::module_::import("pyarrow.compute");
+			auto normalized_offsets =
+			    compute.attr("subtract")(offsets, start).attr("cast")(pyarrow.attr("int32")(), py::arg("safe") = true);
+			auto keys = array.attr("keys").attr("slice")(start, entry_count);
+			keys = NormalizeArrowArray(keys, expected_type.attr("key_type"), pyarrow, type_predicates);
+			auto items = array.attr("items").attr("slice")(start, entry_count);
+			items = NormalizeArrowArray(items, expected_type.attr("item_type"), pyarrow, type_predicates);
+			return pyarrow.attr("MapArray")
+			    .attr("from_arrays")(normalized_offsets, keys, items, py::arg("type") = expected_type,
+			                         py::arg("mask") = array.attr("is_null")());
+		}
+		throw InternalException("Unsupported Arrow normalization from %s to %s", py::cast<string>(py::str(actual_type)),
+		                        py::cast<string>(py::str(expected_type)));
+	}
+
+	static py::object NormalizeArrowColumn(const py::object &column, const py::object &expected_type,
+	                                       const py::object &pyarrow, const py::object &type_predicates) {
 		py::list normalized_chunks;
 		for (auto chunk_handle : column.attr("chunks")) {
 			auto chunk = py::reinterpret_borrow<py::object>(chunk_handle);
-			auto storage = chunk.attr("storage").attr("cast")(expected_storage_type, py::arg("safe") = true);
-			normalized_chunks.append(extension_array.attr("from_storage")(expected_type, storage));
+			normalized_chunks.append(NormalizeArrowArray(chunk, expected_type, pyarrow, type_predicates));
 		}
 		return pyarrow.attr("chunked_array")(normalized_chunks, py::arg("type") = expected_type);
 	}
@@ -509,27 +606,21 @@ struct DistributedArrowStreamOwner {
 			throw;
 		}
 		py::list columns;
-		auto type_predicates = py::module_::import("pyarrow.types");
+		auto pyarrow = py::module_::import("pyarrow");
+		auto type_predicates = pyarrow.attr("types");
 		for (idx_t col_idx = 0; col_idx < types.size(); col_idx++) {
 			auto column = table.attr("column")(col_idx);
 			py::object expected_type = schema.attr("field")(col_idx).attr("type");
 			auto actual_type = column.attr("type");
 			if (!py::cast<bool>(actual_type.attr("equals")(expected_type))) {
-				auto normalize_extension_storage =
-				    CanNormalizeArrowExtensionStorage(actual_type, expected_type, type_predicates);
-				if (!normalize_extension_storage &&
-				    !CanNormalizeArrowOffsetWidths(actual_type, expected_type, type_predicates)) {
+				if (!CanNormalizeArrowType(actual_type, expected_type, type_predicates)) {
 					throw InvalidInputException(
 					    "Distributed result partition %d column %d has Arrow type %s, expected %s for DuckDB type %s",
 					    partition_index, col_idx, py::cast<string>(py::str(actual_type)),
 					    py::cast<string>(py::str(expected_type)), types[col_idx].ToString());
 				}
 				try {
-					if (normalize_extension_storage) {
-						column = NormalizeArrowExtensionStorage(column, expected_type);
-					} else {
-						column = column.attr("cast")(expected_type, py::arg("safe") = true);
-					}
+					column = NormalizeArrowColumn(column, expected_type, pyarrow, type_predicates);
 				} catch (py::error_already_set &ex) {
 					throw InvalidInputException("Distributed result partition %d column %d failed Arrow offset-width "
 					                            "normalization from %s to %s: %s",
@@ -539,7 +630,7 @@ struct DistributedArrowStreamOwner {
 			}
 			columns.append(column);
 		}
-		return py::module_::import("pyarrow").attr("Table").attr("from_arrays")(columns, py::arg("schema") = schema);
+		return pyarrow.attr("Table").attr("from_arrays")(columns, py::arg("schema") = schema);
 	}
 
 	void Fail(string error) {

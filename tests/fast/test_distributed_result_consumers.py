@@ -486,6 +486,55 @@ def test_distributed_result_accepts_lossless_arrow_extension_types(
 
 
 @pytest.mark.parametrize(
+    ("partition_query", "relation_query", "expected"),
+    [
+        (
+            "SELECT ['{\"ray\": true}'::JSON] AS c0",
+            "SELECT ['{\"local\": true}'::JSON] AS value",
+            ['{"ray": true}'],
+        ),
+        ("SELECT ['10101'::BIT] AS c0", "SELECT ['111'::BIT] AS value", ["10101"]),
+        (
+            "SELECT [123456789012345678901234567890::BIGNUM] AS c0",
+            "SELECT [1::BIGNUM] AS value",
+            ["123456789012345678901234567890"],
+        ),
+        (
+            "SELECT {'json_value': '{\"ray\": true}'::JSON} AS c0",
+            "SELECT {'json_value': '{\"local\": true}'::JSON} AS value",
+            {"json_value": '{"ray": true}'},
+        ),
+        (
+            "SELECT ['{\"ray\": true}'::JSON]::JSON[1] AS c0",
+            "SELECT ['{\"local\": true}'::JSON]::JSON[1] AS value",
+            ('{"ray": true}',),
+        ),
+        (
+            "SELECT map(['key'], ['{\"ray\": true}'::JSON]) AS c0",
+            "SELECT map(['key'], ['{\"local\": true}'::JSON]) AS value",
+            {"key": '{"ray": true}'},
+        ),
+    ],
+)
+def test_distributed_result_normalizes_nested_lossless_arrow_extension_storage(
+    monkeypatch, partition_query, relation_query, expected
+):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    producer = duckdb.connect()
+    producer.execute("SET arrow_lossless_conversion = true")
+    producer.execute("SET arrow_large_buffer_size = true")
+    table = producer.sql(partition_query).to_arrow_table()
+
+    runner = _FakeRayRunner([table])
+    _install_fake_ray_runner(monkeypatch, runner)
+    consumer = duckdb.connect()
+    consumer.execute("SET arrow_lossless_conversion = true")
+
+    assert consumer.sql(relation_query).fetchone() == (expected,)
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize(
     "query",
     [
         "SELECT 'red'::ENUM('red', 'blue') AS value",
@@ -526,6 +575,19 @@ def test_distributed_result_rejects_untransportable_types_before_starting_runner
             "SELECT ['local'::VARCHAR] AS value",
             pa.table({"c0": pa.array([["distributed"]], pa.large_list(pa.large_string()))}),
             [(["distributed"],)],
+        ),
+        (
+            "SELECT ['local'::VARCHAR] AS value",
+            pa.table(
+                {
+                    "c0": pa.ListViewArray.from_arrays(
+                        pa.array([0, 1], pa.int32()),
+                        pa.array([2, 3], pa.int32()),
+                        pa.array(["first", "second", "third", "fourth"], pa.large_string()),
+                    )
+                }
+            ),
+            [(["first", "second"],), (["second", "third", "fourth"],)],
         ),
     ],
 )
