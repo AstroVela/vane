@@ -80,7 +80,7 @@ def _ensure_python_datasource_runtime() -> None:
 
 
 def _release_datasource_factories_for_query(query_id: str) -> int:
-    import _duckdb
+    import _duckdb  # type: ignore[import-not-found]
 
     return int(_duckdb._release_datasource_factories_for_query(str(query_id)))
 
