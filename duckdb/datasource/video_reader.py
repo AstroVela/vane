@@ -224,13 +224,12 @@ def _s3_filesystem_kwargs() -> dict[str, str | bool]:
 
     endpoint_url = _read_optional_text_env(("AWS_ENDPOINT_URL",))
     if endpoint_url is not None:
-        if "://" in endpoint_url:
-            parsed = urlparse(endpoint_url)
-            endpoint = parsed.netloc or parsed.path
-            if parsed.scheme:
-                kwargs["scheme"] = parsed.scheme
-        else:
-            endpoint = endpoint_url.rstrip("/")
+        # Treat a scheme-less value as an authority so paths are discarded
+        # consistently from endpoint_override.
+        parsed = urlparse(endpoint_url if "://" in endpoint_url else f"//{endpoint_url}")
+        endpoint = parsed.netloc or parsed.path.rstrip("/")
+        if parsed.scheme:
+            kwargs["scheme"] = parsed.scheme
         kwargs["endpoint_override"] = endpoint
 
     region = _read_optional_text_env(("AWS_REGION", "AWS_DEFAULT_REGION"))

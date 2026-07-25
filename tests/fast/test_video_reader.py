@@ -141,7 +141,7 @@ def test_video_s3_reader_passes_custom_https_endpoint_and_region(
     region_env,
 ):
     _clear_s3_environment(monkeypatch)
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://objects.example.test:9443")
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://objects.example.test:9443/prefix")
     monkeypatch.setenv(region_env, "eu-west-1")
 
     _read_s3_bytes("s3://media-bucket/example.mp4")
@@ -156,14 +156,17 @@ def test_video_s3_reader_passes_custom_https_endpoint_and_region(
 @pytest.mark.parametrize(
     ("endpoint_url", "expected_kwargs"),
     [
-        ("objects.example.test:9443", {"endpoint_override": "objects.example.test:9443"}),
         (
-            "http://127.0.0.1:9000",
+            "objects.example.test:9443/prefix",
+            {"endpoint_override": "objects.example.test:9443"},
+        ),
+        (
+            "http://127.0.0.1:9000/prefix",
             {"endpoint_override": "127.0.0.1:9000", "scheme": "http"},
         ),
     ],
 )
-def test_video_s3_reader_uses_pyarrow_secure_default_when_endpoint_has_no_scheme(
+def test_video_s3_reader_normalizes_endpoint_override(
     monkeypatch,
     recording_s3_filesystem,
     endpoint_url,
