@@ -134,8 +134,8 @@ def test_image_extra_installs_pillow():
 def test_video_extra_installs_video_dependencies():
     selected = _requirements_for_extra("video")
     assert {"pillow", "psutil"} <= selected
-    if platform.system() == "Linux" and platform.machine() == "x86_64":
-        assert "decord" in selected
+    supports_decord = platform.system() == "Linux" and platform.machine() == "x86_64"
+    assert ("decord" in selected) is supports_decord
 
 
 def test_base_distribution_keeps_video_dependencies_optional():
