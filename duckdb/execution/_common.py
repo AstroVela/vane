@@ -18,10 +18,22 @@ if TYPE_CHECKING:
 
 _UDF_CALLABLE_CACHE_LOCK = threading.Lock()
 _UDF_CALLABLE_CACHE: OrderedDict[str, Any] = OrderedDict()
-_UDF_CALLABLE_CACHE_STATS = {
+_UDF_CALLABLE_STATS = {
     "python_udf_callable_cache_hit": 0,
     "python_udf_callable_cache_miss": 0,
     "python_udf_callable_cache_bypass": 0,
+    "python_udf_callable_load_map_native": 0,
+    "python_udf_callable_load_map_arrow": 0,
+    "python_udf_callable_load_map_batches": 0,
+    "python_udf_callable_load_map_batches_rows": 0,
+    "python_udf_callable_load_flat_map": 0,
+}
+_UDF_CALLABLE_LOAD_STATS = {
+    ("map", "native"): "python_udf_callable_load_map_native",
+    ("map", "arrow"): "python_udf_callable_load_map_arrow",
+    ("map_batches", ""): "python_udf_callable_load_map_batches",
+    ("map_batches_rows", ""): "python_udf_callable_load_map_batches_rows",
+    ("flat_map", ""): "python_udf_callable_load_flat_map",
 }
 _TRUTHY_FALSE_VALUES = ("", "0", "false", "no", "off")
 
@@ -30,14 +42,12 @@ _TRUTHY_FALSE_VALUES = ("", "0", "false", "no", "off")
 
 
 def ensure_table(rows: Any) -> pa.Table:
-    """Coerce various Arrow types to pa.Table."""
+    """Coerce a materialized Arrow batch to ``pa.Table``."""
     if isinstance(rows, pa.Table):
         return rows
     if isinstance(rows, pa.RecordBatch):
         return pa.Table.from_batches([rows])
-    if isinstance(rows, pa.RecordBatchReader):
-        return pa.Table.from_batches(list(rows))
-    raise TypeError("rows must be a pyarrow Table, RecordBatch, or RecordBatchReader")
+    raise TypeError("rows must be a pyarrow Table or RecordBatch")
 
 
 def estimate_table_bytes(table: pa.Table) -> int:
@@ -62,7 +72,18 @@ def load_udf_from_payload(payload: dict[str, Any]) -> Any:
     from duckdb import pickle as duckdb_pickle
 
     function_pickle = _payload_pickle_bytes(payload)
+    _record_udf_callable_load(payload)
     return duckdb_pickle.loads(function_pickle)
+
+
+def _record_udf_callable_load(payload: dict[str, Any]) -> None:
+    call_mode = str(payload.get("call_mode") or "")
+    scalar_udf_type = str(payload.get("scalar_udf_type") or "native") if call_mode == "map" else ""
+    stat_name = _UDF_CALLABLE_LOAD_STATS.get((call_mode, scalar_udf_type))
+    if stat_name is None:
+        return
+    with _UDF_CALLABLE_CACHE_LOCK:
+        _UDF_CALLABLE_STATS[stat_name] += 1
 
 
 def _payload_pickle_bytes(payload: dict[str, Any]) -> bytes:
@@ -108,14 +129,14 @@ def clear_udf_callable_cache() -> None:
     """Clear the process-local UDF callable cache."""
     with _UDF_CALLABLE_CACHE_LOCK:
         _UDF_CALLABLE_CACHE.clear()
-        for key in _UDF_CALLABLE_CACHE_STATS:
-            _UDF_CALLABLE_CACHE_STATS[key] = 0
+        for key in _UDF_CALLABLE_STATS:
+            _UDF_CALLABLE_STATS[key] = 0
 
 
 def udf_callable_cache_stats() -> dict[str, int]:
-    """Return process-local callable cache counters."""
+    """Return process-local callable cache and deserialization counters."""
     with _UDF_CALLABLE_CACHE_LOCK:
-        return dict(_UDF_CALLABLE_CACHE_STATS)
+        return dict(_UDF_CALLABLE_STATS)
 
 
 def callable_cache_enabled(payload: dict[str, Any]) -> bool:
@@ -128,13 +149,13 @@ def load_udf_from_payload_cached(payload: dict[str, Any], max_entries: int | Non
     """Deserialize a UDF callable with a process-local LRU cache."""
     if payload.get("side_effects"):
         with _UDF_CALLABLE_CACHE_LOCK:
-            _UDF_CALLABLE_CACHE_STATS["python_udf_callable_cache_bypass"] += 1
+            _UDF_CALLABLE_STATS["python_udf_callable_cache_bypass"] += 1
         return load_udf_from_payload(payload)
     if max_entries is None:
         max_entries = 64
     if max_entries <= 0:
         with _UDF_CALLABLE_CACHE_LOCK:
-            _UDF_CALLABLE_CACHE_STATS["python_udf_callable_cache_bypass"] += 1
+            _UDF_CALLABLE_STATS["python_udf_callable_cache_bypass"] += 1
         return load_udf_from_payload(payload)
 
     key = udf_cache_key(payload)
@@ -142,7 +163,7 @@ def load_udf_from_payload_cached(payload: dict[str, Any], max_entries: int | Non
         if key in _UDF_CALLABLE_CACHE:
             cached = _UDF_CALLABLE_CACHE[key]
             _UDF_CALLABLE_CACHE.move_to_end(key)
-            _UDF_CALLABLE_CACHE_STATS["python_udf_callable_cache_hit"] += 1
+            _UDF_CALLABLE_STATS["python_udf_callable_cache_hit"] += 1
             return cached
 
     udf = load_udf_from_payload(payload)
@@ -150,10 +171,10 @@ def load_udf_from_payload_cached(payload: dict[str, Any], max_entries: int | Non
         if key in _UDF_CALLABLE_CACHE:
             cached = _UDF_CALLABLE_CACHE[key]
             _UDF_CALLABLE_CACHE.move_to_end(key)
-            _UDF_CALLABLE_CACHE_STATS["python_udf_callable_cache_hit"] += 1
+            _UDF_CALLABLE_STATS["python_udf_callable_cache_hit"] += 1
             return cached
         _UDF_CALLABLE_CACHE[key] = udf
-        _UDF_CALLABLE_CACHE_STATS["python_udf_callable_cache_miss"] += 1
+        _UDF_CALLABLE_STATS["python_udf_callable_cache_miss"] += 1
         while len(_UDF_CALLABLE_CACHE) > max_entries:
             _UDF_CALLABLE_CACHE.popitem(last=False)
     return udf

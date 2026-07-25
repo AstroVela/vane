@@ -97,6 +97,17 @@ def _pickle_function(fn):
     return cloudpickle.dumps(fn)
 
 
+def _record_batch_reader_with_pull_counter():
+    pulls = []
+    batch = pa.record_batch({"x": [1]})
+
+    def batches():
+        pulls.append(batch)
+        yield batch
+
+    return pa.RecordBatchReader.from_batches(batch.schema, batches()), pulls
+
+
 def _unsupported_local_map_payload(fn, **extra):
     payload = {
         "function_pickle": _pickle_function(fn),
@@ -1522,6 +1533,51 @@ def test_unified_executor_routes_subprocess_scalar_native():
         assert executor.take_ready_result() is None
     finally:
         executor.close()
+
+
+def test_udf_runtime_rejects_record_batch_reader_input_without_consuming_it():
+    from duckdb.execution._udf_runtime import UDFExecutor
+
+    def identity(table):
+        return table
+
+    reader, pulls = _record_batch_reader_with_pull_counter()
+    executor = UDFExecutor(_subprocess_map_payload(identity))
+
+    with pytest.raises(TypeError, match="rows must be a pyarrow Table or RecordBatch"):
+        executor.submit(reader)
+
+    assert pulls == []
+
+
+@pytest.mark.parametrize(
+    ("call_mode", "scalar_udf_type"),
+    [
+        ("map", "native"),
+        ("map", "arrow"),
+        ("map_batches", None),
+        ("map_batches_rows", None),
+        ("flat_map", None),
+    ],
+)
+def test_udf_runtime_rejects_record_batch_reader_output_without_consuming_it(call_mode, scalar_udf_type):
+    from duckdb.execution._udf_runtime import UDFExecutor
+
+    def identity(value):
+        return value
+
+    if call_mode == "map":
+        payload = _subprocess_scalar_payload(identity, scalar_udf_type=scalar_udf_type)
+    else:
+        payload = _subprocess_map_payload(identity, call_mode=call_mode)
+    executor = UDFExecutor(payload)
+    reader, pulls = _record_batch_reader_with_pull_counter()
+    executor._map_fn = lambda *_args: reader
+
+    with pytest.raises(TypeError, match="RecordBatchReader is not supported"):
+        executor.submit(pa.table({"x": [1]}))
+
+    assert pulls == []
 
 
 def test_udf_runtime_map_batches_stream_output_buffers_compute_subbatches_until_submit_flush():
@@ -4623,8 +4679,69 @@ def test_callable_cache_reuses_deserialized_callable(monkeypatch):
         "python_udf_callable_cache_hit": 1,
         "python_udf_callable_cache_miss": 1,
         "python_udf_callable_cache_bypass": 0,
+        "python_udf_callable_load_map_native": 1,
+        "python_udf_callable_load_map_arrow": 0,
+        "python_udf_callable_load_map_batches": 0,
+        "python_udf_callable_load_map_batches_rows": 0,
+        "python_udf_callable_load_flat_map": 0,
     }
     common.clear_udf_callable_cache()
+
+
+@pytest.mark.parametrize(
+    ("call_mode", "scalar_udf_type", "load_stat"),
+    [
+        ("map", "native", "python_udf_callable_load_map_native"),
+        ("map", "arrow", "python_udf_callable_load_map_arrow"),
+        ("map_batches", None, "python_udf_callable_load_map_batches"),
+        ("map_batches_rows", None, "python_udf_callable_load_map_batches_rows"),
+        ("flat_map", None, "python_udf_callable_load_flat_map"),
+    ],
+)
+def test_runtime_callable_cache_contract_applies_to_every_udf_type(
+    monkeypatch,
+    call_mode,
+    scalar_udf_type,
+    load_stat,
+):
+    import duckdb.execution._common as common
+    from duckdb import pickle as duckdb_pickle
+    from duckdb.execution._udf_runtime import UDFExecutor
+
+    common.clear_udf_callable_cache()
+    calls = []
+
+    def udf(value):
+        return value
+
+    def fake_loads(data):
+        calls.append(data)
+        return udf
+
+    monkeypatch.setattr(duckdb_pickle, "loads", fake_loads)
+    payload = {
+        "function_pickle": f"{call_mode}-{scalar_udf_type}".encode(),
+        "call_mode": call_mode,
+        "execution_backend": "subprocess_task",
+    }
+    if scalar_udf_type is not None:
+        payload["scalar_udf_type"] = scalar_udf_type
+
+    try:
+        UDFExecutor(payload, cache_callable=True, cache_max_entries=8)
+        UDFExecutor(payload, cache_callable=True, cache_max_entries=8)
+
+        stats = common.udf_callable_cache_stats()
+        load_stats = {name: count for name, count in stats.items() if name.startswith("python_udf_callable_load_")}
+
+        assert calls == [payload["function_pickle"]]
+        assert stats["python_udf_callable_cache_hit"] == 1
+        assert stats["python_udf_callable_cache_miss"] == 1
+        assert stats["python_udf_callable_cache_bypass"] == 0
+        assert load_stats[load_stat] == 1
+        assert sum(load_stats.values()) == 1
+    finally:
+        common.clear_udf_callable_cache()
 
 
 def test_local_shm_budget_manager_input_lease_is_diagnostic_only(monkeypatch):

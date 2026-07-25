@@ -118,12 +118,12 @@ _RETURN_NULL = int(PythonExceptionHandling.RETURN_NULL)
 
 
 def _coerce_scalar_array(output: Any, expected_rows: int) -> pa.Array:
+    if isinstance(output, pa.RecordBatchReader):
+        raise TypeError("map UDF output must be materialized; RecordBatchReader is not supported")
     if isinstance(output, pa.Table):
         table = output
     elif isinstance(output, pa.RecordBatch):
         table = pa.Table.from_batches([output])
-    elif isinstance(output, pa.RecordBatchReader):
-        table = pa.Table.from_batches(list(output))
     else:
         table = pa.Table.from_arrays([output], names=["_udf_out"])
 
@@ -242,15 +242,13 @@ def _iter_output_tables(result: Any) -> Iterable[pa.Table]:
     if result is None:
         return
 
+    if isinstance(result, pa.RecordBatchReader):
+        raise TypeError("UDF output must be materialized; RecordBatchReader is not supported")
     if isinstance(result, pa.Table):
         yield result
         return
     if isinstance(result, pa.RecordBatch):
         yield pa.Table.from_batches([result])
-        return
-    if isinstance(result, pa.RecordBatchReader):
-        for rb in result:
-            yield pa.Table.from_batches([rb])
         return
     if isinstance(result, dict):
         yield pa.table(result)
@@ -263,7 +261,7 @@ def _iter_output_tables(result: Any) -> Iterable[pa.Table]:
             yield from _iter_output_tables(item)
         return
 
-    raise TypeError("udf output must be Table/RecordBatch/RecordBatchReader/dict, or an iterable yielding those types")
+    raise TypeError("udf output must be Table/RecordBatch/dict, or an iterable yielding those types")
 
 
 def _iter_table_row_dicts(table: pa.Table) -> Iterable[dict[str, Any]]:
@@ -468,7 +466,11 @@ class UDFExecutor:
         if raw_input_names:
             self._input_names = list(raw_input_names)
 
-        self._map_fn = _load_runtime_callable(payload)
+        self._map_fn = _load_runtime_callable(
+            payload,
+            cache_callable=cache_callable,
+            cache_max_entries=cache_max_entries,
+        )
         self._mode = self._call_mode
         self._is_map_batches = self._call_mode == "map_batches"
         self._is_map_batches_rows = self._call_mode == "map_batches_rows"
@@ -550,7 +552,9 @@ class UDFExecutor:
                     yield table
             return
         except TypeError as exc:
-            raise TypeError(f"map_batches UDF must return pa.Table or Iterator[pa.Table], got {type(result)}") from exc
+            raise TypeError(
+                f"map_batches UDF must return pa.Table or Iterator[pa.Table], got {type(result)}: {exc}"
+            ) from exc
 
     def _coerce_row_preserving_batch_output(self, result: Any, expected_rows: int) -> pa.Table:
         if isinstance(result, pa.Table):
@@ -559,6 +563,10 @@ class UDFExecutor:
             table = pa.Table.from_batches([result])
         elif isinstance(result, dict):
             table = pa.table(result)
+        elif isinstance(result, pa.RecordBatchReader):
+            raise TypeError(
+                "row-preserving map_batches UDF output must be materialized; RecordBatchReader is not supported"
+            )
         elif isinstance(result, Iterable) and not isinstance(result, (str, bytes, bytearray)):
             raise TypeError("row-preserving map_batches UDF must return a single pa.Table, not an iterator")
         else:
@@ -712,6 +720,8 @@ class UDFExecutor:
                 result = self._map_fn(row_dict)
                 if result is None:
                     continue
+                if isinstance(result, pa.RecordBatchReader):
+                    raise TypeError("flat_map UDF output must be row dictionaries; RecordBatchReader is not supported")
                 if isinstance(result, dict):
                     yield from append_output_row(result)
                 else:
@@ -760,6 +770,8 @@ class UDFExecutor:
                     outputs.append(None)
                     continue
                 raise
+            if isinstance(result, pa.RecordBatchReader):
+                raise TypeError("map UDF output must be scalar; RecordBatchReader is not supported")
             if self._default_null_handling() and result is None:
                 raise ValueError(_NULL_HANDLING_ERROR)
             outputs.append(result)
