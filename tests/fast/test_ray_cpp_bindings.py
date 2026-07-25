@@ -153,6 +153,16 @@ def test_worker_submission_preserves_worker_plan_exception_cause(monkeypatch, ma
         def drop_query(self, _query_id):
             return None
 
+        def fte_prepare_drop_query(self, _query_id):
+            return {
+                "tasks_removed": 0,
+                "tasks_canceled": 0,
+                "fragments_removed": 0,
+            }
+
+        def fte_cleanup_query(self, _query_id):
+            return {}
+
         def fte_drop_query(self, _query_id):
             return {
                 "tasks_removed": 0,

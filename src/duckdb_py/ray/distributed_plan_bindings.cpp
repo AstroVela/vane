@@ -847,8 +847,7 @@ public:
 			return DuckDBResult<void>::err(
 			    DuckDBError(string("Python backend submit_fte_task_events failed: ") + e.what()));
 		} catch (const std::exception &e) {
-			return DuckDBResult<void>::err(
-			    DuckDBError(string("Python backend submit_fte_task_events failed: ") + e.what()));
+			return DuckDBResult<void>::err(DuckDBError(string("submit_fte_task_events failed: ") + e.what()));
 		}
 	}
 

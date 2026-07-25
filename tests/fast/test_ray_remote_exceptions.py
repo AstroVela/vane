@@ -125,18 +125,37 @@ def test_remote_ray_exception_type_resolution_failure_is_propagated(monkeypatch)
         transported.restore()
 
 
+def test_remote_ray_exception_defers_local_cause_resolution_until_restore():
+    class LocalSubmissionError(RuntimeError):
+        pass
+
+    transported = ray_errors.remote_ray_exception(
+        "distributed submission failed",
+        LocalSubmissionError("worker-only failure"),
+    )
+
+    round_tripped = pickle.loads(pickle.dumps(transported))
+
+    assert str(round_tripped) == "distributed submission failed"
+    assert round_tripped.__cause__ is None
+    with pytest.raises(TypeError, match="remote exception type is not importable"):
+        round_tripped.restore()
+
+
 def test_remote_ray_exception_rejects_old_payload_schema():
+    transported = RemoteRayException(
+        "remote failure",
+        {
+            "module": "builtins",
+            "qualname": "RuntimeError",
+            "message": "remote failure",
+            "traceback": "",
+            "cause": None,
+        },
+    )
+
     with pytest.raises(KeyError):
-        RemoteRayException(
-            "remote failure",
-            {
-                "module": "builtins",
-                "qualname": "RuntimeError",
-                "message": "remote failure",
-                "traceback": "",
-                "cause": None,
-            },
-        )
+        transported.restore()
 
 
 def test_remote_ray_exception_rejects_cyclic_exception_chain():
@@ -151,9 +170,10 @@ def test_remote_ray_exception_rejects_cyclic_exception_chain():
         "suppress_context": True,
     }
     payload["cause"] = payload
+    transported = RemoteRayException("cycle", payload)
 
     with pytest.raises(ValueError, match="remote exception chain contains a cycle"):
-        RemoteRayException("cycle", payload)
+        transported.restore()
 
 
 def test_safe_get_restores_serialized_ray_exception_chain():

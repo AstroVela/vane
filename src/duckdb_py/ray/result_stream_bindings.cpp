@@ -3,6 +3,7 @@
 
 // Included by ray_module.cpp inside namespace duckdb.
 
+#include <exception>
 #include <functional>
 
 struct ResultPartitionStream {

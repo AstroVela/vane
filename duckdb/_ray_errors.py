@@ -22,22 +22,6 @@ class RemoteRayException(RuntimeError):
         self.message = str(message)
         self.payload = dict(payload)
         super().__init__(self.message, self.payload)
-        chain_seen = {id(payload), id(self.payload)}
-        cause = _restore_optional_remote_exception(
-            self.payload["cause"],
-            depth=1,
-            seen=chain_seen,
-        )
-        context = _restore_optional_remote_exception(
-            self.payload["context"],
-            depth=1,
-            seen=chain_seen,
-        )
-        if cause is not None:
-            self.__cause__ = cause
-        if context is not None:
-            self.__context__ = context
-        self.__suppress_context__ = self.payload["suppress_context"]
 
     @classmethod
     def from_exception(cls, exc: BaseException) -> RemoteRayException:
