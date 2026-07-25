@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from textwrap import dedent
 
 import pytest
 
@@ -31,17 +32,19 @@ def _assert_import_preserves_ray_logging_env(
     env.update(initial_ray_env or {})
 
     ray_import = "import ray" if import_ray_first else ""
-    script = f"""
-import importlib
-import os
+    script = dedent(
+        f"""
+        import importlib
+        import os
 
-ray_logging_env_names = {_RAY_LOGGING_ENV_NAMES!r}
-{ray_import}
-before = {{name: os.environ.get(name) for name in ray_logging_env_names}}
-importlib.import_module({module_name!r})
-after = {{name: os.environ.get(name) for name in ray_logging_env_names}}
-assert after == before, (before, after)
-"""
+        ray_logging_env_names = {_RAY_LOGGING_ENV_NAMES!r}
+        {ray_import}
+        before = {{name: os.environ.get(name) for name in ray_logging_env_names}}
+        importlib.import_module({module_name!r})
+        after = {{name: os.environ.get(name) for name in ray_logging_env_names}}
+        assert after == before, (before, after)
+        """
+    )
     completed = subprocess.run(
         [sys.executable, "-c", script],
         env=env,
