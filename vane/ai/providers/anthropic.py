@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.protocols import PrompterDescriptor
-from vane.ai.provider import Provider
+from vane.ai.provider import Provider, ProviderImportError
 from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
@@ -208,7 +208,10 @@ class AnthropicPrompter:
     def _process_ndarray(self, arr: Any) -> dict[str, Any]:
         import io
 
-        from PIL import Image
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise ProviderImportError("image", function="ndarray image input") from exc
 
         img = Image.fromarray(arr)
         buf = io.BytesIO()

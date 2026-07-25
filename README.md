@@ -69,6 +69,16 @@ Install the `vane-ai` package from PyPI:
 pip install vane-ai
 ```
 
+Optional features are provided as extras:
+
+```bash
+pip install 'vane-ai[openai]'   # OpenAI provider (anthropic / google / transformers / vllm likewise)
+pip install 'vane-ai[image]'    # ndarray image inputs for AI providers (Pillow)
+pip install 'vane-ai[video]'    # video data source (Pillow, psutil, decord)
+```
+
+The `video` extra installs `decord` on Linux x86-64, Vane's currently supported native platform. decord itself publishes no wheels for modern Python on macOS or for any ARM platform; if Vane adds Windows support later, decord's existing `win_amd64` wheel can be enabled explicitly.
+
 For more details, see the [Installation Guide](https://vane.astrovela.ai/docs/data/quickstart/installation).
 
 ### Quick Start

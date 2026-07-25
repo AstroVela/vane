@@ -22,7 +22,7 @@ import pyarrow as pa
 
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
-from vane.ai.provider import Provider
+from vane.ai.provider import Provider, ProviderImportError
 from vane.ai.typing import EmbeddingDimensions, UDFOptions
 
 if TYPE_CHECKING:
@@ -489,7 +489,10 @@ class OpenAIPrompter:
         import base64
         import io
 
-        from PIL import Image
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise ProviderImportError("image", function="ndarray image input") from exc
 
         img = Image.fromarray(arr)
         buf = io.BytesIO()
