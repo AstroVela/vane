@@ -1986,7 +1986,7 @@ DuckDBPyRelation &DuckDBPyRelation::Execute() {
 void DuckDBPyRelation::InsertInto(const string &table) {
 	AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
-	auto insert = rel->InsertRel(parsed_info.schema, parsed_info.name);
+	auto insert = rel->InsertRel(parsed_info.catalog, parsed_info.schema, parsed_info.name);
 	PyExecuteRelation(insert);
 }
 
@@ -2049,7 +2049,7 @@ void DuckDBPyRelation::Insert(const py::object &params) const {
 void DuckDBPyRelation::Create(const string &table) {
 	AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
-	auto create = rel->CreateRel(parsed_info.schema, parsed_info.name, false);
+	auto create = rel->CreateRel(parsed_info.catalog, parsed_info.schema, parsed_info.name, false);
 	PyExecuteRelation(create);
 }
 
