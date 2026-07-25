@@ -226,7 +226,10 @@ def _s3_filesystem_kwargs() -> dict[str, str | bool]:
     if endpoint_url is not None:
         # Treat a scheme-less value as an authority so paths are discarded
         # consistently from endpoint_override.
-        parsed = urlparse(endpoint_url if "://" in endpoint_url else f"//{endpoint_url}")
+        parse_target = endpoint_url
+        if "://" not in parse_target and not parse_target.startswith("//"):
+            parse_target = f"//{parse_target}"
+        parsed = urlparse(parse_target)
         endpoint = parsed.netloc or parsed.path.rstrip("/")
         if parsed.scheme:
             kwargs["scheme"] = parsed.scheme

@@ -161,6 +161,10 @@ def test_video_s3_reader_passes_custom_https_endpoint_and_region(
             {"endpoint_override": "objects.example.test:9443"},
         ),
         (
+            "//objects.example.test:9443/prefix",
+            {"endpoint_override": "objects.example.test:9443"},
+        ),
+        (
             "http://127.0.0.1:9000/prefix",
             {"endpoint_override": "127.0.0.1:9000", "scheme": "http"},
         ),
