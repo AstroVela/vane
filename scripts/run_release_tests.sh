@@ -15,6 +15,7 @@ release_tests=(
   tests/fast/test_expression_udf_contracts.py
   tests/fast/test_local_e2e.py
   tests/fast/test_ray_cpp_bindings.py
+  tests/fast/test_ray_remote_exceptions.py
   tests/fast/test_ray_result_contract.py
   tests/fast/test_fte_production_readiness.py
 )
