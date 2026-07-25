@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import socket
 import struct
 import sys
 import threading
@@ -5227,6 +5228,66 @@ def test_subprocess_ref_bundle_consumer_can_start_when_output_budget_full(monkey
         executor.close(kill=True)
         for ref in refs:
             ref.release()
+
+
+def _timeout_test_executor(subprocess_exec, sock):
+    executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._closed = False
+    executor._broken_error = None
+    executor._sock = sock
+    return executor
+
+
+@pytest.mark.parametrize("initial_timeout", [None, 5.0, 0.0], ids=["blocking", "finite", "nonblocking"])
+@pytest.mark.parametrize("handshake_result", ["ready", "error"])
+def test_recv_expected_restores_socket_timeout_after_handshake(monkeypatch, initial_timeout, handshake_result):
+    import duckdb.execution.udf_subprocess as subprocess_exec
+
+    parent_sock, child_sock = socket.socketpair()
+    parent_sock.settimeout(initial_timeout)
+    executor = _timeout_test_executor(subprocess_exec, parent_sock)
+    msg_type = subprocess_exec._MSG_READY if handshake_result == "ready" else subprocess_exec._MSG_ERROR
+
+    def receive(sock):
+        assert sock.gettimeout() == 2.0
+        return msg_type, b"payload"
+
+    monkeypatch.setattr(subprocess_exec, "_recv_message", receive)
+    try:
+        assert executor._recv_expected(
+            (subprocess_exec._MSG_READY, subprocess_exec._MSG_ERROR),
+            timeout_s=2.0,
+        ) == (msg_type, b"payload")
+        assert parent_sock.gettimeout() == initial_timeout
+    finally:
+        parent_sock.close()
+        child_sock.close()
+
+
+def test_recv_expected_restores_socket_timeout_before_marking_broken(monkeypatch):
+    import duckdb.execution.udf_subprocess as subprocess_exec
+
+    parent_sock, child_sock = socket.socketpair()
+    executor = _timeout_test_executor(subprocess_exec, parent_sock)
+
+    def fail_receive(_sock):
+        raise OSError("connection reset")
+
+    def mark_broken(error: str, *, actor_lost: bool = False) -> None:
+        del actor_lost
+        assert parent_sock.gettimeout() is None
+        executor._broken_error = error
+        parent_sock.close()
+
+    monkeypatch.setattr(subprocess_exec, "_recv_message", fail_receive)
+    executor._mark_broken = mark_broken
+
+    try:
+        with pytest.raises(RuntimeError, match="connection reset"):
+            executor._recv_expected((subprocess_exec._MSG_READY,), timeout_s=2.0)
+    finally:
+        parent_sock.close()
+        child_sock.close()
 
 
 class _FakeControlSocket:
