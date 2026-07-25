@@ -209,6 +209,11 @@ def test_actor_shutdown_joins_native_threads_before_closing_runtime(monkeypatch)
             )
         ),
     )
+    monkeypatch.setattr(
+        worker_module,
+        "_clear_datasource_factory_registry",
+        lambda: events.append("datasource-registry-cleared"),
+    )
 
     actor_class._prepare_worker_runtime_shutdown(actor)
     native_thread.join(timeout=5)
@@ -228,7 +233,7 @@ def test_actor_shutdown_joins_native_threads_before_closing_runtime(monkeypatch)
 
     actor_class._finish_worker_runtime_shutdown(actor)
     assert actor._shutdown_complete is True
-    assert events[-1] == "flight-stopped"
+    assert events[-2:] == ["flight-stopped", "datasource-registry-cleared"]
     with pytest.raises(RuntimeError, match="shutting down"):
         actor_class._begin_worker_native_execution(actor, "query-a")
     with pytest.raises(RuntimeError, match="shutting down"):

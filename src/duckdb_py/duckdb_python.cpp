@@ -1120,6 +1120,9 @@ PYBIND11_MODULE(DUCKDB_PYTHON_LIB_NAME, m) { // NOLINT
 
 	// Register global callbacks for datasource_scan (needed for distributed workers)
 	duckdb::RegisterDataSourceGlobalCallbacks();
+	m.def("_datasource_factory_registry_state_for_test", &duckdb::DataSourceFactoryRegistryStateForTest);
+	m.def("_clear_datasource_factory_registry", &duckdb::ClearDataSourceFactoryRegistry);
+	m.def("_release_datasource_factories_for_query", &duckdb::ReleaseDataSourceFactoriesForQuery, py::arg("query_id"));
 
 	py::enum_<duckdb::ExplainType>(m, "ExplainType")
 	    .value("STANDARD", duckdb::ExplainType::EXPLAIN_STANDARD)

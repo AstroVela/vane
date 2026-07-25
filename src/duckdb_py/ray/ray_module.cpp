@@ -7,6 +7,7 @@
 #include "worker.hpp"
 #include "worker_manager.hpp"
 #include "safe_pyobject.hpp"
+#include "datasource_function.hpp"
 
 #include "duckdb_python/pyrelation.hpp"
 #include "duckdb_python/pyconnection/pyconnection.hpp"
@@ -84,6 +85,7 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/execution/operator/projection/physical_tableinout_function.hpp>
 #include <duckdb/execution/operator/projection/physical_udf_inout.hpp>
 #include <duckdb/function/scalar/udf_functions.hpp>
+#include <duckdb/function/table/datasource_scan.hpp>
 #include <duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp>
 #include <duckdb/execution/operator/helper/physical_result_collector.hpp>
 #include <duckdb/execution/operator/projection/physical_projection.hpp>

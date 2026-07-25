@@ -5,8 +5,13 @@
 #include "duckdb_python/pybind11/gil_wrapper.hpp"
 
 #include "duckdb/common/arrow/arrow.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb_python/pybind11/pybind_wrapper.hpp"
 #include "duckdb_python/pyconnection/pyconnection.hpp"
+
+#include <algorithm>
+#include <condition_variable>
+#include <unordered_set>
 
 namespace py = pybind11;
 
@@ -16,107 +21,151 @@ namespace duckdb {
 static string PyBytesToString(const py::object &obj) {
 	char *buf = nullptr;
 	Py_ssize_t len = 0;
-	PyBytes_AsStringAndSize(obj.ptr(), &buf, &len);
+	if (PyBytes_AsStringAndSize(obj.ptr(), &buf, &len) != 0) {
+		throw py::error_already_set();
+	}
 	return string(buf, static_cast<size_t>(len));
 }
 
-// ── Global registry ────────────────────────────────────────────────
-// Factories must outlive the DuckDB plan execution. We store them in a
-// global map keyed by pointer value. The Python read_datasource() function
-// also holds a reference to prevent GC on the Python side.
-static std::mutex g_factory_mutex;
-static std::unordered_map<uintptr_t, shared_ptr<DataSourceStreamFactory>> g_factory_registry;
+// Every serialized datasource payload starts with a versioned, process-
+// independent source identity. Both source and task blobs carry the same ID.
+static constexpr char DATASOURCE_PAYLOAD_MAGIC[] = {'V', 'D', 'S', '1'};
+static constexpr idx_t DATASOURCE_PAYLOAD_MAGIC_SIZE = sizeof(DATASOURCE_PAYLOAD_MAGIC);
+static constexpr idx_t DATASOURCE_SOURCE_ID_SIZE = BaseUUID::STRING_SIZE;
+static constexpr idx_t DATASOURCE_PAYLOAD_HEADER_SIZE = DATASOURCE_PAYLOAD_MAGIC_SIZE + DATASOURCE_SOURCE_ID_SIZE;
 
-static void RegisterFactory(shared_ptr<DataSourceStreamFactory> factory) {
-	auto key = reinterpret_cast<uintptr_t>(factory.get());
-	std::lock_guard<std::mutex> lock(g_factory_mutex);
-	g_factory_registry[key] = std::move(factory);
+struct ParsedDataSourcePayload {
+	string source_id;
+	const char *payload;
+	idx_t payload_len;
+};
+
+static ParsedDataSourcePayload ParseDataSourcePayload(const char *data, idx_t len, const char *kind) {
+	if (len <= DATASOURCE_PAYLOAD_HEADER_SIZE) {
+		throw InvalidInputException("Serialized datasource %s is too short", kind);
+	}
+	if (memcmp(data, DATASOURCE_PAYLOAD_MAGIC, DATASOURCE_PAYLOAD_MAGIC_SIZE) != 0) {
+		throw InvalidInputException("Serialized datasource %s has an invalid payload header", kind);
+	}
+	string source_id(data + DATASOURCE_PAYLOAD_MAGIC_SIZE, DATASOURCE_SOURCE_ID_SIZE);
+	hugeint_t parsed_uuid;
+	if (!UUID::FromString(source_id, parsed_uuid, true)) {
+		throw InvalidInputException("Serialized datasource %s has an invalid source ID", kind);
+	}
+	return {std::move(source_id), data + DATASOURCE_PAYLOAD_HEADER_SIZE, len - DATASOURCE_PAYLOAD_HEADER_SIZE};
 }
 
-void ClearDataSourceFactoryRegistry() {
-	std::lock_guard<std::mutex> lock(g_factory_mutex);
-	g_factory_registry.clear();
+static string EncodeDataSourcePayload(const string &source_id, const string &payload) {
+	string result;
+	result.reserve(DATASOURCE_PAYLOAD_HEADER_SIZE + payload.size());
+	result.append(DATASOURCE_PAYLOAD_MAGIC, DATASOURCE_PAYLOAD_MAGIC_SIZE);
+	result.append(source_id);
+	result.append(payload);
+	return result;
+}
+
+static py::object LoadArrowSchema(const ParsedDataSourcePayload &source) {
+	auto cloudpickle = py::module::import("cloudpickle");
+	auto source_package = cloudpickle.attr("loads")(py::bytes(source.payload, source.payload_len));
+	if (!py::isinstance<py::tuple>(source_package)) {
+		throw InvalidInputException("Serialized datasource source package must be a tuple");
+	}
+	auto package_tuple = py::reinterpret_borrow<py::tuple>(source_package);
+	if (package_tuple.size() != 2) {
+		throw InvalidInputException(
+		    "Serialized datasource source package must contain source identity bytes and Arrow schema");
+	}
+	if (!py::isinstance<py::bytes>(package_tuple[0])) {
+		throw InvalidInputException("Serialized datasource source identity must be bytes");
+	}
+	return py::reinterpret_borrow<py::object>(package_tuple[1]);
+}
+
+// ── Process-local registry ─────────────────────────────────────────
+// Entries are keyed by the stable source UUID embedded in the distributed
+// plan. Local scans are reference-counted per global state; distributed scans
+// are owned idempotently by their logical query until worker query teardown.
+struct DataSourceFactoryRegistryEntry {
+	explicit DataSourceFactoryRegistryEntry(string source)
+	    : pickled_source(std::move(source)), loading(true), local_owner_count(0) {
+	}
+
+	string pickled_source;
+	shared_ptr<DataSourceStreamFactory> factory;
+	std::condition_variable ready;
+	string load_error;
+	bool loading;
+	idx_t local_owner_count;
+	std::unordered_set<string> query_owners;
+};
+
+static std::mutex g_factory_mutex;
+static std::unordered_map<string, shared_ptr<DataSourceFactoryRegistryEntry>> g_factory_registry;
+static std::atomic<idx_t> g_factory_creation_count {0};
+static string g_last_created_source_id;
+
+static void VerifyMatchingSource(const DataSourceFactoryRegistryEntry &entry, const char *pickled_source,
+                                 idx_t pickled_len, const string &source_id) {
+	if (entry.pickled_source.size() == pickled_len &&
+	    memcmp(entry.pickled_source.data(), pickled_source, pickled_len) == 0) {
+		return;
+	}
+	throw InvalidInputException("Datasource source ID collision for '%s'", source_id);
+}
+
+static void FailFactoryLoad(const string &source_id, const shared_ptr<DataSourceFactoryRegistryEntry> &entry,
+                            const string &error) {
+	{
+		std::lock_guard<std::mutex> lock(g_factory_mutex);
+		entry->load_error = error;
+		entry->loading = false;
+		auto current = g_factory_registry.find(source_id);
+		if (current != g_factory_registry.end() && current->second == entry) {
+			g_factory_registry.erase(current);
+		}
+	}
+	entry->ready.notify_all();
+}
+
+static void AddFactoryOwner(DataSourceFactoryRegistryEntry &entry, const string &query_id) {
+	if (query_id.empty()) {
+		entry.local_owner_count++;
+	} else {
+		entry.query_owners.insert(query_id);
+	}
+}
+
+static idx_t FactoryOwnerCount(const DataSourceFactoryRegistryEntry &entry) {
+	return entry.local_owner_count + entry.query_owners.size();
+}
+
+static bool HasFactoryOwners(const DataSourceFactoryRegistryEntry &entry) {
+	return entry.local_owner_count > 0 || !entry.query_owners.empty();
 }
 
 // ── ProduceStream ──────────────────────────────────────────────────
 // C callback called by datasource_scan GetData/InitLocal from pipeline threads.
-// pickled_task blob layout: [factory_ptr: 8 bytes][pickled task bytes]
-//
-// On a Ray worker the factory_ptr from the driver is invalid. In that case
-// we lazily recreate the factory from the pickled DataSource embedded in
-// pickled_source (stored in the companion global g_pickled_source_for_worker).
-
-// Global pickled_source for worker-side factory recovery.
-// Set by InitGlobal before any GetData call.
-static std::mutex g_worker_source_mutex;
-static string g_worker_pickled_source;
-
-void DataSourceStreamFactory::SetWorkerPickledSource(const char *pickled_source, idx_t pickled_len) {
-	std::lock_guard<std::mutex> lock(g_worker_source_mutex);
-	g_worker_pickled_source.assign(pickled_source, pickled_len);
-}
+// pickled_task blob layout: [magic/version][source UUID][pickled task bytes]
 
 void DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pickled_len, ArrowArrayStream *out_stream) {
-	if (pickled_len < sizeof(uintptr_t)) {
-		throw InternalException("DataSourceStreamFactory::ProduceStream: pickled_task too short");
-	}
-	uintptr_t factory_ptr;
-	memcpy(&factory_ptr, pickled_task, sizeof(uintptr_t));
-
-	DataSourceStreamFactory *factory = nullptr;
-	{
-		std::lock_guard<std::mutex> lock(g_factory_mutex);
-		auto it = g_factory_registry.find(factory_ptr);
-		if (it != g_factory_registry.end()) {
-			factory = it->second.get();
-		}
-	}
-
-	const char *task_bytes = pickled_task + sizeof(uintptr_t);
-	idx_t task_len = pickled_len - sizeof(uintptr_t);
-
+	auto task = ParseDataSourcePayload(pickled_task, pickled_len, "task");
 	PythonGILWrapper acquire;
 
-	// If factory not found (worker process), create one from pickled_source
+	shared_ptr<DataSourceStreamFactory> factory;
+	{
+		std::lock_guard<std::mutex> lock(g_factory_mutex);
+		auto entry = g_factory_registry.find(task.source_id);
+		if (entry != g_factory_registry.end() && !entry->second->loading && HasFactoryOwners(*entry->second)) {
+			factory = entry->second->factory;
+		}
+	}
 	if (!factory) {
-		string pickled_source_copy;
-		{
-			std::lock_guard<std::mutex> lock(g_worker_source_mutex);
-			pickled_source_copy = g_worker_pickled_source;
-		}
-
-		if (pickled_source_copy.size() < sizeof(uintptr_t)) {
-			throw InternalException("ProduceStream: no factory and no worker pickled_source available");
-		}
-
-		// Extract the pickled DataSource (skip the stale factory_ptr prefix)
-		const char *source_bytes = pickled_source_copy.data() + sizeof(uintptr_t);
-		idx_t source_len = pickled_source_copy.size() - sizeof(uintptr_t);
-
-		auto cloudpickle = py::module::import("cloudpickle");
-		auto source_obj = cloudpickle.attr("loads")(py::bytes(source_bytes, source_len));
-
-		// Reconstruct Arrow schema from the DataSource
-		auto schema_dict = py::cast<py::dict>(source_obj.attr("schema"));
-		auto ds_module = py::module::import("duckdb.datasource");
-		auto arrow_schema = ds_module.attr("_schema_to_arrow")(schema_dict);
-
-		// Create and register a new factory
-		auto new_factory = make_shared_ptr<DataSourceStreamFactory>(source_obj, arrow_schema, vector<string> {});
-		uintptr_t new_factory_ptr = reinterpret_cast<uintptr_t>(new_factory.get());
-		RegisterFactory(new_factory);
-		factory = new_factory.get();
-
-		// Update the worker pickled_source with the new factory pointer
-		{
-			std::lock_guard<std::mutex> lock(g_worker_source_mutex);
-			memcpy(&g_worker_pickled_source[0], &new_factory_ptr, sizeof(uintptr_t));
-		}
+		throw InvalidInputException("Datasource source '%s' is not acquired for this query", task.source_id);
 	}
 
 	// 1. Unpickle the task
 	auto cloudpickle = py::module::import("cloudpickle");
-	auto task_obj = cloudpickle.attr("loads")(py::bytes(task_bytes, task_len));
+	auto task_obj = cloudpickle.attr("loads")(py::bytes(task.payload, task.payload_len));
 
 	// 2. Call task.execute() to get a generator of RecordBatches
 	auto generator = task_obj.attr("execute")();
@@ -131,40 +180,144 @@ void DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pick
 
 // ── GetSchema ──────────────────────────────────────────────────────
 // C callback called by datasource_scan Bind to get the Arrow schema.
-// pickled_source blob layout: [factory_ptr: 8 bytes][pickled DataSource bytes]
+// pickled_source blob layout: [magic/version][source UUID][pickled source bytes]
 
 void DataSourceStreamFactory::GetSchema(const char *pickled_source, idx_t pickled_len, ArrowSchema *out_schema) {
-	if (pickled_len < sizeof(uintptr_t)) {
-		throw InternalException("DataSourceStreamFactory::GetSchema: pickled_source too short");
-	}
-	uintptr_t factory_ptr;
-	memcpy(&factory_ptr, pickled_source, sizeof(uintptr_t));
+	auto source = ParseDataSourcePayload(pickled_source, pickled_len, "source");
+	PythonGILWrapper acquire;
 
-	DataSourceStreamFactory *factory = nullptr;
+	shared_ptr<DataSourceFactoryRegistryEntry> entry;
 	{
 		std::lock_guard<std::mutex> lock(g_factory_mutex);
-		auto it = g_factory_registry.find(factory_ptr);
-		if (it != g_factory_registry.end()) {
-			factory = it->second.get();
+		auto current = g_factory_registry.find(source.source_id);
+		if (current != g_factory_registry.end()) {
+			VerifyMatchingSource(*current->second, pickled_source, pickled_len, source.source_id);
+			entry = current->second;
 		}
 	}
 
+	if (entry) {
+		py::gil_scoped_release release;
+		std::unique_lock<std::mutex> lock(g_factory_mutex);
+		entry->ready.wait(lock, [&entry] { return !entry->loading; });
+	}
+
+	shared_ptr<DataSourceStreamFactory> factory;
+	if (entry) {
+		std::lock_guard<std::mutex> lock(g_factory_mutex);
+		if (!entry->load_error.empty()) {
+			throw InvalidInputException("Failed to initialize datasource source '%s': %s", source.source_id,
+			                            entry->load_error);
+		}
+		factory = entry->factory;
+	}
+	auto arrow_schema = factory ? factory->arrow_schema : LoadArrowSchema(source);
+	arrow_schema.attr("_export_to_c")(reinterpret_cast<uintptr_t>(out_schema));
+}
+
+// ── Source ownership ───────────────────────────────────────────────
+
+void DataSourceStreamFactory::AcquireSource(const char *pickled_source, idx_t pickled_len, const char *query_id,
+                                            idx_t query_id_len) {
+	auto source = ParseDataSourcePayload(pickled_source, pickled_len, "source");
+	string query_owner(query_id, query_id_len);
 	PythonGILWrapper acquire;
 
-	if (factory) {
-		factory->arrow_schema.attr("_export_to_c")(reinterpret_cast<uintptr_t>(out_schema));
-	} else {
-		// Worker process: reconstruct schema from pickled DataSource
-		const char *source_bytes = pickled_source + sizeof(uintptr_t);
-		idx_t source_len = pickled_len - sizeof(uintptr_t);
+	shared_ptr<DataSourceFactoryRegistryEntry> entry;
+	bool load_factory = false;
+	{
+		std::lock_guard<std::mutex> lock(g_factory_mutex);
+		auto current = g_factory_registry.find(source.source_id);
+		if (current == g_factory_registry.end()) {
+			entry = make_shared_ptr<DataSourceFactoryRegistryEntry>(string(pickled_source, pickled_len));
+			g_factory_registry.emplace(source.source_id, entry);
+			load_factory = true;
+		} else {
+			entry = current->second;
+			VerifyMatchingSource(*entry, pickled_source, pickled_len, source.source_id);
+			if (!entry->loading) {
+				if (!entry->factory) {
+					throw InternalException("Datasource source '%s' has no registered factory", source.source_id);
+				}
+				AddFactoryOwner(*entry, query_owner);
+				return;
+			}
+		}
+	}
 
-		auto cloudpickle = py::module::import("cloudpickle");
-		auto source_obj = cloudpickle.attr("loads")(py::bytes(source_bytes, source_len));
+	if (!load_factory) {
+		{
+			// Schema deserialization may temporarily release the GIL. Do not
+			// hold it while another query initializes the same logical source.
+			py::gil_scoped_release release;
+			std::unique_lock<std::mutex> lock(g_factory_mutex);
+			entry->ready.wait(lock, [&entry] { return !entry->loading; });
+		}
+		std::lock_guard<std::mutex> lock(g_factory_mutex);
+		if (!entry->load_error.empty()) {
+			throw InvalidInputException("Failed to initialize datasource source '%s': %s", source.source_id,
+			                            entry->load_error);
+		}
+		auto current = g_factory_registry.find(source.source_id);
+		if (current == g_factory_registry.end() || current->second != entry || !entry->factory) {
+			throw InternalException("Datasource source '%s' disappeared during initialization", source.source_id);
+		}
+		AddFactoryOwner(*entry, query_owner);
+		return;
+	}
 
-		auto schema_dict = py::cast<py::dict>(source_obj.attr("schema"));
-		auto ds_module = py::module::import("duckdb.datasource");
-		auto arrow_schema = ds_module.attr("_schema_to_arrow")(schema_dict);
-		arrow_schema.attr("_export_to_c")(reinterpret_cast<uintptr_t>(out_schema));
+	try {
+		auto arrow_schema = LoadArrowSchema(source);
+		auto factory = make_shared_ptr<DataSourceStreamFactory>(std::move(arrow_schema));
+		{
+			std::lock_guard<std::mutex> lock(g_factory_mutex);
+			auto current = g_factory_registry.find(source.source_id);
+			if (current == g_factory_registry.end() || current->second != entry) {
+				throw InternalException("Datasource source '%s' disappeared during initialization", source.source_id);
+			}
+			entry->factory = std::move(factory);
+			AddFactoryOwner(*entry, query_owner);
+			entry->loading = false;
+			g_factory_creation_count.fetch_add(1);
+		}
+		entry->ready.notify_all();
+	} catch (std::exception &ex) {
+		FailFactoryLoad(source.source_id, entry, ex.what());
+		throw;
+	} catch (...) {
+		FailFactoryLoad(source.source_id, entry, "unknown factory initialization error");
+		throw;
+	}
+}
+
+void DataSourceStreamFactory::ReleaseSource(const char *pickled_source, idx_t pickled_len) noexcept {
+	try {
+		auto source = ParseDataSourcePayload(pickled_source, pickled_len, "source");
+		if (!Py_IsInitialized() || PythonIsFinalizing()) {
+			return;
+		}
+		PythonGILWrapper acquire;
+		shared_ptr<DataSourceFactoryRegistryEntry> released_entry;
+		{
+			std::lock_guard<std::mutex> lock(g_factory_mutex);
+			auto current = g_factory_registry.find(source.source_id);
+			if (current == g_factory_registry.end()) {
+				return;
+			}
+			auto &entry = *current->second;
+			VerifyMatchingSource(entry, pickled_source, pickled_len, source.source_id);
+			if (entry.loading || entry.local_owner_count == 0) {
+				return;
+			}
+			entry.local_owner_count--;
+			if (!HasFactoryOwners(entry)) {
+				released_entry = std::move(current->second);
+				g_factory_registry.erase(current);
+			}
+		}
+		// released_entry is destroyed before the GIL wrapper.
+	} catch (...) {
+		// Called from a global-state destructor: release must never throw.
 	}
 }
 
@@ -193,28 +346,27 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &sour
 		throw InvalidInputException("DataSource returned no tasks");
 	}
 
-	// 3. Create and register the factory
-	auto factory = make_shared_ptr<DataSourceStreamFactory>(source, arrow_schema, std::move(pickled_tasks));
-	uintptr_t factory_ptr = reinterpret_cast<uintptr_t>(factory.get());
-	RegisterFactory(factory);
+	// 3. Assign one stable logical source ID. It is serialized with the plan
+	// and is therefore identical in the driver and every worker process.
+	auto source_id = UUID::ToString(UUID::GenerateRandomUUID());
 
-	// 4. Build pickled_tasks list: each blob = [factory_ptr][pickled_task_bytes]
+	// 4. Build pickled_tasks list: each blob = [version][source ID][task]
 	vector<Value> task_values;
-	for (auto &pt : factory->pickled_tasks) {
-		string prefixed;
-		prefixed.resize(sizeof(uintptr_t) + pt.size());
-		memcpy(&prefixed[0], &factory_ptr, sizeof(uintptr_t));
-		memcpy(&prefixed[sizeof(uintptr_t)], pt.data(), pt.size());
+	for (auto &pickled_task : pickled_tasks) {
+		auto prefixed = EncodeDataSourcePayload(source_id, pickled_task);
 		task_values.push_back(Value::BLOB(const_data_ptr_cast(prefixed.data()), prefixed.size()));
 	}
 	auto task_list = Value::LIST(LogicalType::BLOB, std::move(task_values));
 
-	// 5. Build pickled_source: [factory_ptr][pickled DataSource bytes]
-	auto pickled_source_obj = PyBytesToString(cloudpickle.attr("dumps")(source));
-	string pickled_source_prefixed;
-	pickled_source_prefixed.resize(sizeof(uintptr_t) + pickled_source_obj.size());
-	memcpy(&pickled_source_prefixed[0], &factory_ptr, sizeof(uintptr_t));
-	memcpy(&pickled_source_prefixed[sizeof(uintptr_t)], pickled_source_obj.data(), pickled_source_obj.size());
+	// 5. Build pickled_source:
+	// [version][source ID][pickled (pickled DataSource, Arrow schema)].
+	// The source bytes remain part of the collision-checked identity payload,
+	// while workers can load the schema without instantiating the DataSource or
+	// invoking source.schema again.
+	auto pickled_source_identity = cloudpickle.attr("dumps")(source);
+	auto source_package = py::make_tuple(pickled_source_identity, arrow_schema);
+	auto pickled_source_obj = PyBytesToString(cloudpickle.attr("dumps")(source_package));
+	auto pickled_source_prefixed = EncodeDataSourcePayload(source_id, pickled_source_obj);
 
 	// 6. Build datasource_scan(produce_ptr, get_schema_ptr, pickled_source, pickled_tasks)
 	vector<Value> params;
@@ -229,9 +381,100 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &sour
 	// TryBindRelation() which triggers DataSourceScanBind → GetSchema callback,
 	// which needs the GIL to call arrow_schema._export_to_c().
 	auto rel = connection.TableFunction("datasource_scan", std::move(params));
+	{
+		std::lock_guard<std::mutex> lock(g_factory_mutex);
+		g_last_created_source_id = source_id;
+	}
 
-	// Return as DuckDBPyRelation — factory stays alive in g_factory_registry
 	return make_uniq<DuckDBPyRelation>(rel->Alias(name));
+}
+
+void ClearDataSourceFactoryRegistry() {
+	PythonGILWrapper acquire;
+	std::unordered_map<string, shared_ptr<DataSourceFactoryRegistryEntry>> released_entries;
+	{
+		std::lock_guard<std::mutex> lock(g_factory_mutex);
+		released_entries.swap(g_factory_registry);
+		g_last_created_source_id.clear();
+	}
+	// released_entries is destroyed before the GIL wrapper.
+}
+
+idx_t ReleaseDataSourceFactoriesForQuery(const string &query_id) {
+	if (query_id.empty()) {
+		throw InvalidInputException("Datasource distributed query ID must not be empty");
+	}
+	PythonGILWrapper acquire;
+	vector<shared_ptr<DataSourceFactoryRegistryEntry>> released_entries;
+	idx_t released_owners = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_factory_mutex);
+		released_entries.reserve(g_factory_registry.size());
+		for (auto entry = g_factory_registry.begin(); entry != g_factory_registry.end();) {
+			if (entry->second->query_owners.erase(query_id) == 0) {
+				entry++;
+				continue;
+			}
+			released_owners++;
+			if (HasFactoryOwners(*entry->second)) {
+				entry++;
+				continue;
+			}
+			released_entries.push_back(std::move(entry->second));
+			entry = g_factory_registry.erase(entry);
+		}
+	}
+	// released_entries is destroyed before the GIL wrapper.
+	return released_owners;
+}
+
+py::dict DataSourceFactoryRegistryStateForTest() {
+	D_ASSERT(py::gil_check());
+	vector<string> source_ids;
+	std::unordered_set<string> query_id_set;
+	idx_t owner_count = 0;
+	idx_t local_owner_count = 0;
+	idx_t query_owner_count = 0;
+	idx_t factory_count = 0;
+	idx_t registry_size = 0;
+	string last_created_source_id;
+	{
+		std::lock_guard<std::mutex> lock(g_factory_mutex);
+		registry_size = g_factory_registry.size();
+		source_ids.reserve(registry_size);
+		for (auto &item : g_factory_registry) {
+			source_ids.push_back(item.first);
+			owner_count += FactoryOwnerCount(*item.second);
+			local_owner_count += item.second->local_owner_count;
+			query_owner_count += item.second->query_owners.size();
+			query_id_set.insert(item.second->query_owners.begin(), item.second->query_owners.end());
+			factory_count += item.second->factory ? 1 : 0;
+		}
+		last_created_source_id = g_last_created_source_id;
+	}
+	std::sort(source_ids.begin(), source_ids.end());
+
+	py::list py_source_ids;
+	for (auto &source_id : source_ids) {
+		py_source_ids.append(source_id);
+	}
+	vector<string> query_ids(query_id_set.begin(), query_id_set.end());
+	std::sort(query_ids.begin(), query_ids.end());
+	py::list py_query_ids;
+	for (auto &query_id : query_ids) {
+		py_query_ids.append(query_id);
+	}
+	py::dict result;
+	result["registry_size"] = registry_size;
+	result["factory_count"] = factory_count;
+	result["owner_count"] = owner_count;
+	result["local_owner_count"] = local_owner_count;
+	result["query_owner_count"] = query_owner_count;
+	result["factory_creation_count"] = g_factory_creation_count.load();
+	result["source_ids"] = std::move(py_source_ids);
+	result["query_ids"] = std::move(py_query_ids);
+	result["last_created_source_id"] = std::move(last_created_source_id);
+	return result;
 }
 
 // ── RegisterDataSourceGlobalCallbacks ──────────────────────────────
@@ -239,7 +482,8 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &sour
 
 void RegisterDataSourceGlobalCallbacks() {
 	DataSourceScanFunction::SetGlobalProduceStream(&DataSourceStreamFactory::ProduceStream);
-	DataSourceScanFunction::SetGlobalWorkerSourceCallback(&DataSourceStreamFactory::SetWorkerPickledSource);
+	DataSourceScanFunction::SetGlobalAcquireSource(&DataSourceStreamFactory::AcquireSource);
+	DataSourceScanFunction::SetGlobalReleaseSource(&DataSourceStreamFactory::ReleaseSource);
 	DataSourceScanFunction::SetGlobalGetSchema(&DataSourceStreamFactory::GetSchema);
 }
 

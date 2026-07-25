@@ -15,35 +15,35 @@ namespace duckdb {
 //! Lives in the Python binding layer (pybind11 allowed here).
 //! Core datasource_scan.cpp only sees C function pointers.
 struct DataSourceStreamFactory {
-	//! Keep the DataSource Python object alive
-	py::object datasource_obj;
-	//! Pickled task bytes — one per task
-	vector<string> pickled_tasks;
 	//! Arrow schema (PyArrow Schema object, kept alive)
 	py::object arrow_schema;
 
-	DataSourceStreamFactory(py::object datasource, py::object schema, vector<string> tasks)
-	    : datasource_obj(std::move(datasource)), pickled_tasks(std::move(tasks)), arrow_schema(std::move(schema)) {
+	explicit DataSourceStreamFactory(py::object schema) : arrow_schema(std::move(schema)) {
 	}
 
 	//! C callback: unpickle task → task.execute() → RecordBatchReader → _export_to_c
 	//! Called from pipeline threads — each call creates an independent stream.
-	//! The factory pointer is passed indirectly: the pickled_task bytes include a
-	//! prefix with the factory pointer (see ProduceStreamWithFactory).
 	static void ProduceStream(const char *pickled_task, idx_t pickled_len, ArrowArrayStream *out_stream);
 
-	//! C callback: export the cached Arrow schema to ArrowSchema
+	//! C callback: export the serialized or cached Arrow schema to ArrowSchema
 	static void GetSchema(const char *pickled_source, idx_t pickled_len, ArrowSchema *out_schema);
 
-	//! Set the worker-side pickled source for factory recovery (C callback for datasource_set_worker_source_t)
-	static void SetWorkerPickledSource(const char *pickled_source, idx_t pickled_len);
+	//! Acquire/release one query execution owner for the logical source.
+	static void AcquireSource(const char *pickled_source, idx_t pickled_len, const char *query_id, idx_t query_id_len);
+	static void ReleaseSource(const char *pickled_source, idx_t pickled_len) noexcept;
 };
 
 //! Clear all factory references to prevent segfault during Python shutdown.
 //! Must be called before Python interpreter finalizes.
 void ClearDataSourceFactoryRegistry();
 
-//! Register global callbacks (ProduceStream, SetWorkerPickledSource) on DataSourceScanFunction.
+//! Release every source owned by a completed distributed query.
+idx_t ReleaseDataSourceFactoriesForQuery(const string &query_id);
+
+//! Return process-local registry diagnostics used by lifecycle regression tests.
+py::dict DataSourceFactoryRegistryStateForTest();
+
+//! Register global callbacks on DataSourceScanFunction.
 //! Call once from Python module init.
 void RegisterDataSourceGlobalCallbacks();
 

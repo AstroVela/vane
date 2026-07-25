@@ -3,6 +3,27 @@
 
 // Included by ray_module.cpp inside namespace duckdb.
 
+static void AssignDataSourceQueryOwner(duckdb::PhysicalOperator &op, const string &query_id) {
+	if (query_id.empty()) {
+		return;
+	}
+	if (op.type == duckdb::PhysicalOperatorType::TABLE_SCAN) {
+		auto &scan = op.Cast<duckdb::PhysicalTableScan>();
+		auto *bind_data = dynamic_cast<duckdb::DataSourceScanBindData *>(scan.bind_data.get());
+		if (bind_data) {
+			if (!bind_data->query_id.empty() && bind_data->query_id != query_id) {
+				throw duckdb::InvalidInputException(
+				    "Datasource scan query ownership mismatch: existing='%s', requested='%s'", bind_data->query_id,
+				    query_id);
+			}
+			bind_data->query_id = query_id;
+		}
+	}
+	for (auto &child : op.children) {
+		AssignDataSourceQueryOwner(child.get(), query_id);
+	}
+}
+
 struct PyPhysicalPlanWrapper {
 	static constexpr uint64_t INIT_MAGIC = 0x445046504C414E31ULL;
 	uint64_t init_magic_;
@@ -94,6 +115,9 @@ struct PyPhysicalPlanWrapper {
 
 		plan_ =
 		    std::make_shared<duckdb::distributed::DistributedPhysicalPlan>(idx, effective_query_id, physical_plan, cfg);
+		if (physical_plan && physical_plan->HasRoot()) {
+			AssignDataSourceQueryOwner(physical_plan->Root(), effective_query_id);
+		}
 	}
 
 	// Materialize deferred serialized_root_ into the plan's PhysicalPlan.
@@ -134,6 +158,7 @@ struct PyPhysicalPlanWrapper {
 			auto *root_ptr = root_op.get();
 			physical_plan->TakeOwnership(std::move(root_op));
 			physical_plan->SetRoot(*root_ptr);
+			AssignDataSourceQueryOwner(*root_ptr, idx());
 		}
 		// Keep connection alive to ensure allocator validity
 		worker_connection_ = conn_obj;
@@ -207,6 +232,9 @@ struct PyPhysicalPlanWrapper {
 	      query_id_(p ? p->query_id() : string()), plan_(std::move(p)), arrow_schema_(py::none()),
 	      udf_registrations_(py::none()), udf_actor_handles_(py::none()), connection_snapshot_(py::none()),
 	      serialized_root_() {
+		if (plan_ && plan_->physical_plan() && plan_->physical_plan()->HasRoot()) {
+			AssignDataSourceQueryOwner(plan_->physical_plan()->Root(), query_id_);
+		}
 	}
 
 	bool IsInitialized() const {
@@ -1439,6 +1467,13 @@ struct PyPhysicalPlanWrapperRunner {
 		} catch (...) {
 			teardown_error = std::current_exception();
 		}
+		try {
+			ReleaseDataSourceFactoriesForQuery(query_id);
+		} catch (...) {
+			if (!teardown_error) {
+				teardown_error = std::current_exception();
+			}
+		}
 		CleanupQueryPythonReplayState(query_id);
 		if (teardown_error) {
 			std::rethrow_exception(teardown_error);
@@ -1827,6 +1862,7 @@ struct PyPhysicalPlanWrapperRunner {
 		if (!physical_plan || !physical_plan->HasRoot()) {
 			throw py::value_error("Physical plan is missing or has no root operator");
 		}
+		AssignDataSourceQueryOwner(physical_plan->Root(), plan_id);
 
 		if (scan_task_map && !scan_task_map->empty()) {
 			string error;
