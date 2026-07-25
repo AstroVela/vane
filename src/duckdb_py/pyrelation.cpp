@@ -19,6 +19,7 @@
 #include "duckdb/function/pragma/pragma_functions.hpp"
 #include "duckdb/parser/statement/pragma_statement.hpp"
 #include "duckdb/common/box_renderer.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -913,6 +914,53 @@ static string ResolveRunnerType() {
 	return ResolveRunnerTypeFromEnvironment();
 }
 
+static void ValidateDistributedResultType(const LogicalType &type, bool arrow_lossless_conversion) {
+	if (type.id() == LogicalTypeId::ENUM || type.id() == LogicalTypeId::AGGREGATE_STATE ||
+	    type.id() == LogicalTypeId::VARIANT) {
+		throw NotImplementedException(
+		    "Distributed execution cannot preserve result type %s through the Arrow transport", type.ToString());
+	}
+	if (!arrow_lossless_conversion && (type.id() == LogicalTypeId::HUGEINT || type.id() == LogicalTypeId::UHUGEINT ||
+	                                   type.id() == LogicalTypeId::UUID || type.id() == LogicalTypeId::BIT ||
+	                                   type.id() == LogicalTypeId::TIME_TZ || type.IsJSONType())) {
+		throw NotImplementedException(
+		    "Distributed execution cannot preserve result type %s while arrow_lossless_conversion is false",
+		    type.ToString());
+	}
+
+	switch (type.id()) {
+	case LogicalTypeId::LIST:
+		ValidateDistributedResultType(ListType::GetChildType(type), arrow_lossless_conversion);
+		break;
+	case LogicalTypeId::ARRAY:
+		ValidateDistributedResultType(ArrayType::GetChildType(type), arrow_lossless_conversion);
+		break;
+	case LogicalTypeId::MAP:
+		ValidateDistributedResultType(MapType::KeyType(type), arrow_lossless_conversion);
+		ValidateDistributedResultType(MapType::ValueType(type), arrow_lossless_conversion);
+		break;
+	case LogicalTypeId::STRUCT:
+		for (const auto &child : StructType::GetChildTypes(type)) {
+			ValidateDistributedResultType(child.second, arrow_lossless_conversion);
+		}
+		break;
+	case LogicalTypeId::UNION:
+		for (idx_t child_idx = 0; child_idx < UnionType::GetMemberCount(type); child_idx++) {
+			ValidateDistributedResultType(UnionType::GetMemberType(type, child_idx), arrow_lossless_conversion);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static void ValidateDistributedResultTypes(const vector<LogicalType> &types, ClientContext &context) {
+	const auto client_properties = context.GetClientProperties();
+	for (const auto &type : types) {
+		ValidateDistributedResultType(type, client_properties.arrow_lossless_conversion);
+	}
+}
+
 // ── Per-database runner instances ──────────────────────────────────────
 // Each DatabaseInstance gets its own runner (created lazily).
 // Replaces the global VANE_RUNNER_PTR singleton for write dispatch.
@@ -1100,6 +1148,53 @@ unique_ptr<QueryResult> DuckDBPyRelation::ExecuteInternal(bool stream_result) {
 }
 
 void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
+	if (ResolveRunnerType() == "ray") {
+		auto context = rel->context->GetContext();
+		ValidateDistributedResultTypes(types, *context);
+		auto &client_config = ClientConfig::GetConfig(*context);
+		auto result_collector = client_config.get_result_collector;
+		ScopedConfigSetting result_collector_scope(
+		    client_config, [](ClientConfig &config) { config.get_result_collector = nullptr; },
+		    [&result_collector](ClientConfig &config) { config.get_result_collector = std::move(result_collector); });
+
+		this->executed = true;
+		py::object table_iterator;
+		try {
+			auto runner = GetOrCreateRunnerForDB(rel, "ray");
+			auto py_relation = DuckDBPyRelation(rel);
+			py_relation.SetConnectionOwner(connection_owner);
+			auto py_relation_obj = py::cast(std::move(py_relation));
+			table_iterator = py::iter(runner.attr("run_iter_tables")(py_relation_obj, py::int_(1)));
+			py::object prefetched_partition;
+			bool has_prefetched_partition = false;
+			bool iterator_exhausted = false;
+			PyObject *next_ptr = PyIter_Next(table_iterator.ptr());
+			if (next_ptr) {
+				prefetched_partition = py::reinterpret_steal<py::object>(next_ptr);
+				has_prefetched_partition = true;
+			} else if (PyErr_Occurred()) {
+				throw py::error_already_set();
+			} else {
+				iterator_exhausted = true;
+			}
+			ForgetRunnerForDB(rel);
+			result = make_uniq<DuckDBPyResult>(MakeDistributedArrowPyResultSource(
+			    std::move(table_iterator), std::move(prefetched_partition), has_prefetched_partition,
+			    iterator_exhausted, names, types, context));
+			return;
+		} catch (...) {
+			if (table_iterator && py::hasattr(table_iterator, "close")) {
+				try {
+					table_iterator.attr("close")();
+				} catch (py::error_already_set &ex) {
+					ex.discard_as_unraisable("closing distributed result iterator after startup failure");
+				}
+			}
+			ForgetRunnerForDB(rel);
+			throw;
+		}
+	}
+
 	auto query_result = ExecuteInternal(stream_result);
 	if (!query_result) {
 		throw InternalException("ExecuteOrThrow - no query available to execute");
@@ -1233,11 +1328,18 @@ PandasDataFrame DuckDBPyRelation::FetchDFChunk(idx_t vectors_per_chunk, bool dat
 		}
 		ExecuteOrThrow(true);
 	}
-	AssertResultOpen();
+	AssertResult();
 	return result->FetchDFChunk(vectors_per_chunk, date_as_object);
 }
 
+static void ValidateArrowBatchSize(idx_t batch_size) {
+	if (batch_size == 0) {
+		throw std::runtime_error("Approximate Batch Size of Record Batch MUST be higher than 0");
+	}
+}
+
 duckdb::pyarrow::Table DuckDBPyRelation::ToArrowTableInternal(idx_t batch_size, bool to_polars) {
+	ValidateArrowBatchSize(batch_size);
 	if (!result) {
 		if (!rel) {
 			return py::none();
@@ -1324,6 +1426,7 @@ PolarsDataFrame DuckDBPyRelation::ToPolars(idx_t batch_size, bool lazy) {
 }
 
 duckdb::pyarrow::RecordBatchReader DuckDBPyRelation::ToRecordBatch(idx_t batch_size) {
+	ValidateArrowBatchSize(batch_size);
 	if (!result) {
 		if (!rel) {
 			return py::none();
@@ -2316,12 +2419,28 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FlatMap(
 string DuckDBPyRelation::ToStringInternal(const BoxRendererConfig &config, bool invalidate_cache) {
 	AssertRelation();
 	if (rendered_result.empty() || invalidate_cache) {
-		BoxRenderer renderer;
+		BoxRenderer renderer(config);
 		auto limit = Limit(config.limit, 0);
-		auto res = limit->ExecuteInternal();
-
 		auto context = rel->context->GetContext();
-		rendered_result = res->ToBox(*context, config);
+		if (ResolveRunnerType() == "ray") {
+			limit->ExecuteOrThrow(true);
+			ColumnDataCollection collection(*context, types);
+			while (true) {
+				unique_ptr<DataChunk> chunk;
+				{
+					py::gil_scoped_release release;
+					chunk = limit->result->FetchChunk();
+				}
+				if (!chunk || chunk->size() == 0) {
+					break;
+				}
+				collection.Append(*chunk);
+			}
+			rendered_result = renderer.ToString(*context, names, collection);
+		} else {
+			auto res = limit->ExecuteInternal();
+			rendered_result = res->ToBox(*context, config);
+		}
 	}
 	return rendered_result;
 }
@@ -2345,55 +2464,7 @@ bool DuckDBPyRelation::TryPrintDistributed(const BoxRendererConfig &config) {
 	if (ResolveRunnerType() != "ray") {
 		return false;
 	}
-
-	auto runner = GetOrCreateRunnerForDB(rel, "ray");
-	auto limited_relation = Limit(static_cast<int64_t>(config.limit), 0);
-	auto limited_relation_obj = py::cast(std::move(limited_relation));
-	py::list tables;
-	try {
-		auto table_iter = runner.attr("run_iter_tables")(limited_relation_obj, py::int_(1));
-		for (auto table : py::reinterpret_borrow<py::iterable>(table_iter)) {
-			tables.append(table);
-		}
-	} catch (...) {
-		ForgetRunnerForDB(rel);
-		throw;
-	}
-	ForgetRunnerForDB(rel);
-
-	unique_ptr<QueryResult> result;
-	if (py::len(tables) == 0) {
-		auto empty_relation = EmptyResult(rel->context->GetContext(), types, names);
-		result = empty_relation->ExecuteInternal();
-	} else {
-		py::object arrow_table = tables[0];
-		if (py::len(tables) > 1) {
-			auto pyarrow = py::module_::import("pyarrow");
-			arrow_table = pyarrow.attr("concat_tables")(tables);
-		}
-
-		// Arrow permits duplicate field names, but DuckDB's Arrow scanner resolves
-		// fields by name. Use unique scan names and restore the relation's names in
-		// the renderer below.
-		py::list scan_names;
-		for (idx_t column_idx = 0; column_idx < names.size(); column_idx++) {
-			scan_names.append(py::str("__vane_show_column_" + std::to_string(column_idx)));
-		}
-		arrow_table = arrow_table.attr("rename_columns")(scan_names);
-
-		auto duckdb_module = py::module_::import("duckdb");
-		auto local_relation_obj = duckdb_module.attr("from_arrow")(arrow_table);
-		auto &local_relation = local_relation_obj.cast<DuckDBPyRelation &>();
-		result = local_relation.ExecuteInternal();
-	}
-
-	if (!result || result->type != QueryResultType::MATERIALIZED_RESULT) {
-		throw InternalException("Distributed show did not produce a materialized result");
-	}
-	auto &materialized = result->Cast<MaterializedQueryResult>();
-	BoxRenderer renderer(config);
-	auto context = rel->context->GetContext();
-	py::print(py::str(renderer.ToString(*context, names, materialized.Collection())));
+	py::print(py::str(ToStringInternal(config, true)));
 	return true;
 }
 

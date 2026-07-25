@@ -8,18 +8,18 @@
 
 #pragma once
 
+#include "duckdb_python/arrow/arrow_array_stream.hpp"
 #include "duckdb_python/numpy/numpy_result_conversion.hpp"
-#include "duckdb.hpp"
-#include "duckdb/main/chunk_scan_state.hpp"
-#include "duckdb_python/pybind11/pybind_wrapper.hpp"
-#include "duckdb_python/python_objects.hpp"
 #include "duckdb_python/pybind11/dataframe.hpp"
+#include "duckdb_python/pyresult_source.hpp"
+#include "duckdb_python/python_objects.hpp"
 
 namespace duckdb {
 
 struct DuckDBPyResult {
 public:
 	explicit DuckDBPyResult(unique_ptr<QueryResult> result);
+	explicit DuckDBPyResult(unique_ptr<DuckDBPyResultSource> source);
 	~DuckDBPyResult();
 
 public:
@@ -67,19 +67,20 @@ private:
 	PandasDataFrame FrameFromNumpy(bool date_as_object, const py::handle &o);
 
 	void ConvertDateTimeTypes(PandasDataFrame &df, bool date_as_object) const;
-	unique_ptr<DataChunk> FetchNext(QueryResult &result);
-	unique_ptr<DataChunk> FetchNextRaw(QueryResult &result);
+	unique_ptr<DataChunk> FetchNext(bool raw = false);
 	unique_ptr<NumpyResultConversion> InitializeNumpyConversion(bool pandas = false);
+	const DuckDBPyResultMetadata &Metadata() const;
 
 private:
 	idx_t chunk_offset = 0;
 
-	unique_ptr<QueryResult> result;
+	unique_ptr<DuckDBPyResultSource> source;
 	unique_ptr<DataChunk> current_chunk;
 	// Holds the categories of Categorical/ENUM types
 	unordered_map<idx_t, py::list> categories;
 	// Holds the categorical type of Categorical/ENUM types
 	unordered_map<idx_t, py::object> categories_type;
+	bool row_consumption_started = false;
 	bool result_closed = false;
 };
 

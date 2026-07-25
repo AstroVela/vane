@@ -354,7 +354,7 @@ def test_vane_cls_sql_explain_resolves_actor_backend_from_current_runner(monkeyp
             return f"{self.prefix}{text}"
 
     vane.attach_function(Prefixer("p:"), connection=conn, alias="prefixer_sql", parameters=["VARCHAR"])
-    plan = conn.sql("EXPLAIN SELECT prefixer_sql('x'::VARCHAR)").fetchall()
+    plan = conn.execute("EXPLAIN SELECT prefixer_sql('x'::VARCHAR)").fetchall()
     text = "\n".join(str(row) for row in plan)
 
     assert "ray_actor" in text
@@ -382,7 +382,7 @@ def test_vane_cls_batch_sql_explain_resolves_actor_backend_from_current_runner(m
         input_names=["value"],
         parameters=["INTEGER"],
     )
-    plan = conn.sql("EXPLAIN SELECT score_sql(1::INTEGER)").fetchall()
+    plan = conn.execute("EXPLAIN SELECT score_sql(1::INTEGER)").fetchall()
     text = "\n".join(str(row) for row in plan)
 
     assert "ray_actor" in text
