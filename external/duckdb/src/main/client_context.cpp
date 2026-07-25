@@ -587,9 +587,15 @@ ClientContext::PendingPreparedStatementInternal(ClientContextLock &lock,
 
 	// Decide how to get the result collector.
 	get_result_collector_t get_collector = PhysicalResultCollector::GetResultCollector;
-	auto &client_config = ClientConfig::GetConfig(*this);
-	if (!stream_result && client_config.get_result_collector) {
-		get_collector = client_config.get_result_collector;
+	if (!stream_result) {
+		if (parameters.get_result_collector) {
+			get_collector = parameters.get_result_collector;
+		} else {
+			auto &client_config = ClientConfig::GetConfig(*this);
+			if (client_config.get_result_collector) {
+				get_collector = client_config.get_result_collector;
+			}
+		}
 	}
 	statement_data.output_type =
 	    stream_result ? QueryResultOutputType::ALLOW_STREAMING : QueryResultOutputType::FORCE_MATERIALIZED;

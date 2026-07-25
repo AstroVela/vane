@@ -33,6 +33,24 @@ def _make_test_physical_plan(con=None):
     ).to_physical_plan(con)
 
 
+def test_execute_native_keeps_result_collector_query_local():
+    con = duckdb.connect()
+    cursor = con.cursor()
+    local_sql = "SELECT sum(i)::BIGINT FROM range(32) tbl(i)"
+    plan = _make_test_physical_plan(cursor)
+    duckdb.ray_cxx._install_counting_result_collector_for_test(cursor)
+
+    before = duckdb.ray_cxx._execute_materialized_int64_for_test(cursor, local_sql)
+    assert duckdb.ray_cxx._connection_result_collector_calls_for_test(cursor) == 1
+
+    result = duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(cursor, plan)
+
+    assert result.completion_status == "ok"
+    assert duckdb.ray_cxx._connection_result_collector_calls_for_test(cursor) == 1
+    assert duckdb.ray_cxx._execute_materialized_int64_for_test(cursor, local_sql) == before
+    assert duckdb.ray_cxx._connection_result_collector_calls_for_test(cursor) == 2
+
+
 def test_physical_plan_pickle_propagates_non_serializable_operator_error():
     plan = duckdb.ray_cxx._make_non_serializable_physical_plan_for_test("query-non-serializable")
 

@@ -3,9 +3,35 @@
 
 #include <thread>
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/execution/operator/helper/physical_result_collector.hpp"
+#include "duckdb/main/client_config.hpp"
+#include "duckdb/main/client_context_state.hpp"
 
 using namespace duckdb;
 using namespace std;
+
+namespace {
+
+get_result_collector_t CountingResultCollector(idx_t &calls) {
+	return [&calls](ClientContext &context, PreparedStatementData &data) -> PhysicalOperator & {
+		calls++;
+		return PhysicalResultCollector::GetResultCollector(context, data);
+	};
+}
+
+class FailNextQueryEndState : public ClientContextState {
+public:
+	bool fail_next = false;
+
+	void QueryEnd(ClientContext &, optional_ptr<ErrorData>) override {
+		if (fail_next) {
+			fail_next = false;
+			throw InvalidInputException("injected query teardown failure");
+		}
+	}
+};
+
+} // namespace
 
 TEST_CASE("Test Pending Query API", "[api][.]") {
 	DuckDB db;
@@ -111,6 +137,106 @@ TEST_CASE("Test Pending Query API", "[api][.]") {
 		auto pending_query = con.PendingQuery("SELCT 32;");
 		REQUIRE(pending_query->HasError());
 		REQUIRE(duckdb::StringUtil::Contains(pending_query->GetError(), "SYNTAX_ERROR"));
+	}
+}
+
+TEST_CASE("Pending query result collector overrides are query-local", "[api][result-collector]") {
+	idx_t connection_collector_calls = 0;
+	idx_t query_collector_calls = 0;
+	DuckDB db;
+	Connection con(db);
+	auto &client_config = ClientConfig::GetConfig(*con.context);
+	client_config.get_result_collector = CountingResultCollector(connection_collector_calls);
+
+	auto require_local_query = [&](int value, idx_t expected_connection_calls) {
+		auto result = con.Query("SELECT " + to_string(value));
+		REQUIRE(CHECK_COLUMN(result, 0, {value}));
+		REQUIRE(connection_collector_calls == expected_connection_calls);
+	};
+
+	require_local_query(41, 1);
+
+	PendingQueryParameters parameters;
+	parameters.get_result_collector = CountingResultCollector(query_collector_calls);
+
+	SECTION("success") {
+		auto pending_query = con.PendingQuery("SELECT 42", parameters);
+		REQUIRE(!pending_query->HasError());
+		REQUIRE(connection_collector_calls == 1);
+		REQUIRE(query_collector_calls == 1);
+
+		auto result = pending_query->Execute();
+		REQUIRE(CHECK_COLUMN(result, 0, {42}));
+		require_local_query(43, 2);
+		REQUIRE(query_collector_calls == 1);
+	}
+
+	SECTION("planning failure") {
+		auto pending_query = con.PendingQuery("SELECT missing_column", parameters);
+		REQUIRE(pending_query->HasError());
+		REQUIRE(StringUtil::Contains(pending_query->GetError(), "missing_column"));
+		REQUIRE(connection_collector_calls == 1);
+		REQUIRE(query_collector_calls == 0);
+
+		require_local_query(43, 2);
+		REQUIRE(query_collector_calls == 0);
+	}
+
+	SECTION("collector initialization failure") {
+		parameters.get_result_collector = [&query_collector_calls](ClientContext &,
+		                                                           PreparedStatementData &) -> PhysicalOperator & {
+			query_collector_calls++;
+			throw InvalidInputException("injected result collector failure");
+		};
+
+		auto pending_query = con.PendingQuery("SELECT 42", parameters);
+		REQUIRE(pending_query->HasError());
+		REQUIRE(StringUtil::Contains(pending_query->GetError(), "injected result collector failure"));
+		REQUIRE(connection_collector_calls == 1);
+		REQUIRE(query_collector_calls == 1);
+
+		require_local_query(43, 2);
+		REQUIRE(query_collector_calls == 1);
+	}
+
+	SECTION("execution failure") {
+		auto pending_query = con.PendingQuery(
+		    "SELECT concat(SUM(i)::VARCHAR, 'invalid')::INTEGER FROM range(100000) tbl(i)", parameters);
+		REQUIRE(!pending_query->HasError());
+		REQUIRE(connection_collector_calls == 1);
+		REQUIRE(query_collector_calls == 1);
+
+		auto result = pending_query->Execute();
+		REQUIRE(result->HasError());
+		require_local_query(43, 2);
+		REQUIRE(query_collector_calls == 1);
+	}
+
+	SECTION("cancellation") {
+		auto pending_query = con.PendingQuery("SELECT SUM(i) FROM range(1000000000) tbl(i)", parameters);
+		REQUIRE(!pending_query->HasError());
+		REQUIRE(connection_collector_calls == 1);
+		REQUIRE(query_collector_calls == 1);
+
+		con.Interrupt();
+		auto result = pending_query->Execute();
+		REQUIRE(result->HasError());
+		require_local_query(43, 2);
+		REQUIRE(query_collector_calls == 1);
+	}
+
+	SECTION("teardown failure") {
+		auto state = make_shared_ptr<FailNextQueryEndState>();
+		con.context->registered_state->Insert("fail_query_end", state);
+		auto pending_query = con.PendingQuery("SELECT 42", parameters);
+		REQUIRE(!pending_query->HasError());
+		REQUIRE(connection_collector_calls == 1);
+		REQUIRE(query_collector_calls == 1);
+
+		state->fail_next = true;
+		REQUIRE_THROWS_WITH(pending_query->Execute(), Catch::Matchers::Contains("injected query teardown failure"));
+		require_local_query(43, 2);
+		REQUIRE(query_collector_calls == 1);
 	}
 }
 
