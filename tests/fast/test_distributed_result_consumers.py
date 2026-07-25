@@ -30,11 +30,18 @@ class _FakeRayRunner:
             self.closed_iterators += 1
 
 
-def _install_fake_ray_runner(monkeypatch: pytest.MonkeyPatch, runner: object) -> None:
+def _install_fake_ray_runner(monkeypatch: pytest.MonkeyPatch, runner: object) -> list[tuple[object, bool]]:
     monkeypatch.setenv("VANE_RUNNER", "ray")
     runners = types.ModuleType("duckdb.runners")
-    runners.set_runner_ray = lambda *_args, **_kwargs: runner
+    factory_calls: list[tuple[object, bool]] = []
+
+    def set_runner_ray(address=None, noop_if_initialized=False):
+        factory_calls.append((address, noop_if_initialized))
+        return runner
+
+    runners.set_runner_ray = set_runner_ray
     monkeypatch.setitem(sys.modules, "duckdb.runners", runners)
+    return factory_calls
 
 
 def _two_column_relation() -> duckdb.DuckDBPyRelation:
@@ -380,6 +387,94 @@ def test_distributed_result_rejects_safe_but_noncanonical_partition_type(monkeyp
 
     with pytest.raises(duckdb.InvalidInputException, match="has Arrow type int32, expected int64"):
         relation.fetchall()
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT 1::HUGEINT AS value",
+        "SELECT 1::UHUGEINT AS value",
+        "SELECT '00112233-4455-6677-8899-aabbccddeeff'::UUID AS value",
+        "SELECT '10101'::BIT AS value",
+        "SELECT '12:34:56+02:00'::TIMETZ AS value",
+        "SELECT '{\"key\": 1}'::JSON AS value",
+        "SELECT [1::HUGEINT] AS value",
+    ],
+)
+def test_distributed_result_rejects_lossy_types_before_starting_runner(monkeypatch, query):
+    runner = _FakeRayRunner([])
+    factory_calls = _install_fake_ray_runner(monkeypatch, runner)
+
+    with pytest.raises(
+        duckdb.NotImplementedException,
+        match="cannot preserve result type.*arrow_lossless_conversion",
+    ):
+        duckdb.connect().sql(query).fetchall()
+
+    assert factory_calls == []
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    ("partition_query", "relation_query", "expected"),
+    [
+        ("SELECT 1::HUGEINT AS c0", "SELECT 999::HUGEINT AS value", "1"),
+        ("SELECT 1::UHUGEINT AS c0", "SELECT 999::UHUGEINT AS value", "1"),
+        (
+            "SELECT '00112233-4455-6677-8899-aabbccddeeff'::UUID AS c0",
+            "SELECT 'ffffffff-ffff-ffff-ffff-ffffffffffff'::UUID AS value",
+            "00112233-4455-6677-8899-aabbccddeeff",
+        ),
+        ("SELECT '10101'::BIT AS c0", "SELECT '111'::BIT AS value", "10101"),
+        (
+            "SELECT '{\"key\": 1}'::JSON AS c0",
+            "SELECT '{\"local\": true}'::JSON AS value",
+            '{"key": 1}',
+        ),
+        (
+            "SELECT '12:34:56+02:00'::TIMETZ AS c0",
+            "SELECT '01:02:03+01:00'::TIMETZ AS value",
+            "12:34:56+02:00",
+        ),
+    ],
+)
+def test_distributed_result_accepts_lossless_arrow_extension_types(
+    monkeypatch, partition_query, relation_query, expected
+):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    connection = duckdb.connect()
+    connection.execute("SET arrow_lossless_conversion = true")
+    table = connection.sql(partition_query).to_arrow_table()
+
+    runner = _FakeRayRunner([table])
+    _install_fake_ray_runner(monkeypatch, runner)
+
+    assert str(connection.sql(relation_query).fetchone()[0]) == expected
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT 'red'::ENUM('red', 'blue') AS value",
+        "SELECT 42::VARIANT AS value",
+        "SELECT sum(i) EXPORT_STATE AS value FROM range(3) t(i)",
+    ],
+)
+def test_distributed_result_rejects_untransportable_types_before_starting_runner_even_when_lossless(monkeypatch, query):
+    connection = duckdb.connect()
+    connection.execute("SET arrow_lossless_conversion = true")
+    runner = _FakeRayRunner([])
+    factory_calls = _install_fake_ray_runner(monkeypatch, runner)
+
+    with pytest.raises(
+        duckdb.NotImplementedException,
+        match="cannot preserve result type.*Arrow transport",
+    ):
+        connection.sql(query).fetchall()
+
+    assert factory_calls == []
+    assert runner.calls == []
 
 
 @pytest.mark.parametrize(

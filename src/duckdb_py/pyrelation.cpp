@@ -914,6 +914,53 @@ static string ResolveRunnerType() {
 	return ResolveRunnerTypeFromEnvironment();
 }
 
+static void ValidateDistributedResultType(const LogicalType &type, bool arrow_lossless_conversion) {
+	if (type.id() == LogicalTypeId::ENUM || type.id() == LogicalTypeId::AGGREGATE_STATE ||
+	    type.id() == LogicalTypeId::VARIANT) {
+		throw NotImplementedException(
+		    "Distributed execution cannot preserve result type %s through the Arrow transport", type.ToString());
+	}
+	if (!arrow_lossless_conversion && (type.id() == LogicalTypeId::HUGEINT || type.id() == LogicalTypeId::UHUGEINT ||
+	                                   type.id() == LogicalTypeId::UUID || type.id() == LogicalTypeId::BIT ||
+	                                   type.id() == LogicalTypeId::TIME_TZ || type.IsJSONType())) {
+		throw NotImplementedException(
+		    "Distributed execution cannot preserve result type %s while arrow_lossless_conversion is false",
+		    type.ToString());
+	}
+
+	switch (type.id()) {
+	case LogicalTypeId::LIST:
+		ValidateDistributedResultType(ListType::GetChildType(type), arrow_lossless_conversion);
+		break;
+	case LogicalTypeId::ARRAY:
+		ValidateDistributedResultType(ArrayType::GetChildType(type), arrow_lossless_conversion);
+		break;
+	case LogicalTypeId::MAP:
+		ValidateDistributedResultType(MapType::KeyType(type), arrow_lossless_conversion);
+		ValidateDistributedResultType(MapType::ValueType(type), arrow_lossless_conversion);
+		break;
+	case LogicalTypeId::STRUCT:
+		for (const auto &child : StructType::GetChildTypes(type)) {
+			ValidateDistributedResultType(child.second, arrow_lossless_conversion);
+		}
+		break;
+	case LogicalTypeId::UNION:
+		for (idx_t child_idx = 0; child_idx < UnionType::GetMemberCount(type); child_idx++) {
+			ValidateDistributedResultType(UnionType::GetMemberType(type, child_idx), arrow_lossless_conversion);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static void ValidateDistributedResultTypes(const vector<LogicalType> &types, ClientContext &context) {
+	const auto client_properties = context.GetClientProperties();
+	for (const auto &type : types) {
+		ValidateDistributedResultType(type, client_properties.arrow_lossless_conversion);
+	}
+}
+
 // ── Per-database runner instances ──────────────────────────────────────
 // Each DatabaseInstance gets its own runner (created lazily).
 // Replaces the global VANE_RUNNER_PTR singleton for write dispatch.
@@ -1103,6 +1150,7 @@ unique_ptr<QueryResult> DuckDBPyRelation::ExecuteInternal(bool stream_result) {
 void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
 	if (ResolveRunnerType() == "ray") {
 		auto context = rel->context->GetContext();
+		ValidateDistributedResultTypes(types, *context);
 		auto &client_config = ClientConfig::GetConfig(*context);
 		auto result_collector = client_config.get_result_collector;
 		ScopedConfigSetting result_collector_scope(
