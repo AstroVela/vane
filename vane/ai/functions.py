@@ -518,7 +518,8 @@ class _PromptBatch:
     Supports both plain text and structured output (Pydantic models).
     When ``return_format`` is set, responses are serialized to JSON strings.
     When ``image_columns`` is set, image data from those columns is packed
-    alongside text into multimodal message tuples.
+    alongside text into multimodal message tuples. List-valued image cells are
+    expanded in order and NULL image values are skipped.
     """
 
     def __init__(
@@ -570,12 +571,15 @@ class _PromptBatch:
             parts: list[Any] = [texts[idx]]
             for img_col in image_lists:
                 val = img_col[idx]
-                if val is not None:
+                if isinstance(val, list):
+                    parts.extend(item for item in val if item is not None)
+                elif val is not None:
                     parts.append(val)
             return tuple(parts)
 
         # Use batch API if available (e.g. vLLM's continuous batching)
-        if hasattr(self._prompter, "prompt_batch"):
+        has_images = bool(self._image_columns)
+        if not has_images and hasattr(self._prompter, "prompt_batch"):
             results = _retry_call(
                 self._prompter.prompt_batch,
                 texts,
@@ -588,7 +592,6 @@ class _PromptBatch:
                 results = [self._serialize_result(r) for r in results]
             return pa.table({self._output_column: results})
 
-        has_images = bool(self._image_columns)
         max_retries = self._max_retries
         on_error = self._on_error
 

@@ -243,6 +243,8 @@ class VLLMPrompter:
         allows the wrapper classes in ``functions.py`` to use the
         standard ``asyncio.gather`` pattern.
         """
+        if len(messages) != 1 or not isinstance(messages[0], str):
+            raise ValueError("vLLM provider only supports one text prompt; multimodal prompt parts are not supported")
         text = str(messages[0]) if messages else ""
         formatted = self._format_prompt(text)
 

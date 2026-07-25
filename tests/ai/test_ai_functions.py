@@ -367,6 +367,17 @@ class TestVLLMProvider:
         mock_prompter.prompt_batch.assert_called_once_with(["hi", "hey"])
         assert result.column("response").to_pylist() == ["Hello!", "World!"]
 
+    def test_prompter_rejects_multimodal_parts(self):
+        """The native vLLM adapter must not silently discard image parts."""
+        import asyncio
+
+        from vane.ai.providers.vllm import VLLMPrompter
+
+        prompter = VLLMPrompter(model="test")
+
+        with pytest.raises(ValueError, match="multimodal prompt parts are not supported"):
+            asyncio.run(prompter.prompt(("Describe this", b"\x89PNG\r\n\x1a\n")))
+
     def test_system_message_formatting(self):
         """VLLMPrompter prepends system message to prompts."""
         from vane.ai.providers.vllm import VLLMPrompter
@@ -2496,6 +2507,49 @@ class TestMultimodalPromptBatch:
         batch(table)
 
         assert len(captured_messages[0]) == 3  # text + 2 images
+
+    def test_prompt_batch_expands_image_lists_without_using_text_batch_api(self):
+        """BLOB[] values become ordered image parts and skip NULL elements."""
+        from vane.ai.functions import _PromptBatch
+
+        captured_messages = []
+
+        class DualPathPrompter:
+            def prompt_batch(self, texts):
+                raise AssertionError("text-only batch API must not receive image inputs")
+
+            async def prompt(self, msgs):
+                captured_messages.append(msgs)
+                return "ok"
+
+        mock_descriptor = MagicMock()
+        mock_descriptor.instantiate.return_value = DualPathPrompter()
+
+        batch = _PromptBatch(
+            mock_descriptor,
+            "text",
+            "response",
+            image_columns=["images"],
+        )
+        table = pa.table(
+            {
+                "text": ["Compare these", "No images"],
+                "images": pa.array(
+                    [
+                        [b"\x89PNG\r\n\x1a\n", None, b"\xff\xd8\xff"],
+                        None,
+                    ],
+                    type=pa.list_(pa.binary()),
+                ),
+            }
+        )
+        result = batch(table)
+
+        assert captured_messages == [
+            ("Compare these", b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff"),
+            ("No images",),
+        ]
+        assert result.column("response").to_pylist() == ["ok", "ok"]
 
     def test_prompt_batch_no_image_columns_text_only(self):
         """Without image_columns, behavior is identical to original."""

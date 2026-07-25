@@ -60,14 +60,34 @@ static py::object DictGetOrNone(const py::dict &dict, const char *key) {
 	return py::reinterpret_borrow<py::object>(dict[py_key]);
 }
 
-static py::object OptionsToPython(ClientContext &context, vector<unique_ptr<Expression>> &arguments) {
-	if (arguments.size() == 1) {
+static idx_t OptionsArgumentIndex(AISQLKind kind, idx_t argument_count) {
+	if (kind == AISQLKind::EMBED) {
+		if (argument_count == 1) {
+			return argument_count;
+		}
+		if (argument_count == 2) {
+			return 1;
+		}
+		throw BinderException("ai_embed requires one or two arguments");
+	}
+	if (argument_count == 1) {
+		return argument_count;
+	}
+	if (argument_count == 2) {
+		return 1;
+	}
+	if (argument_count == 3) {
+		return 2;
+	}
+	throw BinderException("ai_prompt requires one, two, or three arguments");
+}
+
+static py::object OptionsToPython(ClientContext &context, vector<unique_ptr<Expression>> &arguments,
+                                  idx_t options_index) {
+	if (options_index >= arguments.size()) {
 		return py::none();
 	}
-	if (arguments.size() != 2) {
-		throw BinderException("ai SQL functions require one or two arguments");
-	}
-	auto &options_arg = *arguments[1];
+	auto &options_arg = *arguments[options_index];
 	ThrowIfNotConstant(options_arg, "options");
 	auto options = EvaluateConstant(context, options_arg);
 	if (options.IsNull()) {
@@ -76,14 +96,14 @@ static py::object OptionsToPython(ClientContext &context, vector<unique_ptr<Expr
 	return PythonObject::FromValue(options, options.type(), context.GetClientProperties());
 }
 
-static Value BuildAISQLPayload(ClientContext &context, AISQLKind kind, const py::object &py_options) {
+static Value BuildAISQLPayload(ClientContext &context, AISQLKind kind, const py::object &py_options, bool image_input) {
 	auto sql_module = py::module_::import("vane.ai._sql");
 	auto expression_helpers = py::module_::import("vane._expression_udf");
 	auto normalize_schema = expression_helpers.attr("_normalize_schema");
 
 	auto builder = kind == AISQLKind::PROMPT ? sql_module.attr("build_ai_prompt_sql_spec")
 	                                         : sql_module.attr("build_ai_embed_sql_spec");
-	auto spec = py::cast<py::dict>(builder(py_options));
+	auto spec = py::cast<py::dict>(kind == AISQLKind::PROMPT ? builder(py_options, image_input) : builder(py_options));
 	auto name = py::cast<string>(spec[py::str("name")]);
 	auto udf = py::cast<py::function>(spec[py::str("function")]);
 	auto input_names = ParseInputNames(py::reinterpret_borrow<py::object>(spec[py::str("input_names")]));
@@ -105,23 +125,26 @@ static Value BuildAISQLPayload(ClientContext &context, AISQLKind kind, const py:
 
 static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction &bound_function,
                                           vector<unique_ptr<Expression>> &arguments, AISQLKind kind) {
-	if (arguments.empty() || arguments.size() > 2) {
-		throw BinderException("ai SQL functions require one or two arguments");
-	}
+	auto options_index = OptionsArgumentIndex(kind, arguments.size());
+	auto image_input = kind == AISQLKind::PROMPT && arguments.size() == 3;
 	if (arguments[0]->return_type.id() != LogicalTypeId::VARCHAR) {
 		throw BinderException("ai SQL input argument must be VARCHAR");
+	}
+	if (image_input && arguments[1]->return_type != LogicalType::BLOB &&
+	    arguments[1]->return_type != LogicalType::LIST(LogicalType::BLOB)) {
+		throw BinderException("ai_prompt image argument must be BLOB or BLOB[]");
 	}
 
 	Value payload;
 	{
 		PythonGILWrapper acquire;
-		auto py_options = OptionsToPython(context, arguments);
-		payload = BuildAISQLPayload(context, kind, py_options);
+		auto py_options = OptionsToPython(context, arguments, options_index);
+		payload = BuildAISQLPayload(context, kind, py_options, image_input);
 	}
 	auto return_type = udf_helpers::ResolvePayloadReturnType(payload);
 	bound_function.SetReturnType(return_type);
-	if (arguments.size() == 2) {
-		Function::EraseArgument(bound_function, arguments, 1);
+	if (options_index < arguments.size()) {
+		Function::EraseArgument(bound_function, arguments, options_index);
 	}
 	bound_function.SetExtraFunctionInfo(make_shared_ptr<RegisteredUDFFunctionInfo>(payload));
 	return make_uniq<UDFFunctionData>(std::move(payload), std::move(return_type));
@@ -142,29 +165,44 @@ static void AISQLExecute(DataChunk &, ExpressionState &, Vector &) {
 	    "ai SQL functions can only be used in a projection and must be planned as UDF operators");
 }
 
-static void AddAISQLFunctions(ScalarFunctionSet &set, bind_scalar_function_t bind) {
+static void AddAISQLFunctions(ScalarFunctionSet &set, bind_scalar_function_t bind, bool include_image_inputs) {
 	auto base = ScalarFunction({LogicalType::VARCHAR}, LogicalType::ANY, AISQLExecute, bind, nullptr, nullptr, nullptr,
 	                           LogicalType::INVALID, FunctionStability::VOLATILE);
 	base.SetBindExpressionCallback(LowerRegisteredExpressionUDF);
 	set.AddFunction(std::move(base));
 
 	auto with_options = ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY, AISQLExecute, bind,
-	                                   nullptr, nullptr, nullptr, LogicalType::ANY, FunctionStability::VOLATILE);
+	                                   nullptr, nullptr, nullptr, LogicalType::INVALID, FunctionStability::VOLATILE);
 	with_options.SetBindExpressionCallback(LowerRegisteredExpressionUDF);
 	set.AddFunction(std::move(with_options));
+
+	if (!include_image_inputs) {
+		return;
+	}
+	auto with_image =
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::ANY}, LogicalType::ANY, AISQLExecute,
+	                   bind, nullptr, nullptr, nullptr, LogicalType::INVALID, FunctionStability::VOLATILE);
+	with_image.SetBindExpressionCallback(LowerRegisteredExpressionUDF);
+	set.AddFunction(std::move(with_image));
+
+	auto with_images = ScalarFunction({LogicalType::VARCHAR, LogicalType::LIST(LogicalType::BLOB), LogicalType::ANY},
+	                                  LogicalType::ANY, AISQLExecute, bind, nullptr, nullptr, nullptr,
+	                                  LogicalType::INVALID, FunctionStability::VOLATILE);
+	with_images.SetBindExpressionCallback(LowerRegisteredExpressionUDF);
+	set.AddFunction(std::move(with_images));
 }
 
 } // namespace
 
 ScalarFunctionSet AISQLFunction::GetPromptFunctions() {
 	ScalarFunctionSet set("ai_prompt");
-	AddAISQLFunctions(set, AISQLPromptBind);
+	AddAISQLFunctions(set, AISQLPromptBind, true);
 	return set;
 }
 
 ScalarFunctionSet AISQLFunction::GetEmbedFunctions() {
 	ScalarFunctionSet set("ai_embed");
-	AddAISQLFunctions(set, AISQLEmbedBind);
+	AddAISQLFunctions(set, AISQLEmbedBind, false);
 	return set;
 }
 

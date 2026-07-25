@@ -62,6 +62,12 @@ class MockPrompter:
     def prompt_batch(self, text: list[str]) -> list[str]:
         return [f"{self._prefix}:{item}" for item in text]
 
+    async def prompt(self, messages: tuple[object, ...]) -> str:
+        text = str(messages[0]) if messages else ""
+        images = [part.hex() for part in messages[1:] if isinstance(part, bytes)]
+        image_suffix = f":images={','.join(images)}" if images else ""
+        return f"{self._prefix}:{text}{image_suffix}"
+
 
 @dataclass
 class MockPrompterDescriptor(PrompterDescriptor):
@@ -247,6 +253,32 @@ def test_ai_prompt_options_survive_logical_plan_pickle_to_fresh_connection():
     assert udf_node["payload"]["ai_dimensions"] is None
     assert udf_node["payload"]["function_pickle_size_bytes"] > 0
     assert 0 < len(serialized) < 1_000_000
+
+
+def test_ai_prompt_image_input_survives_plan_round_trip_as_row_data():
+    image_hex = "89504e470d0a1a0a49535355453138524f5744415441"
+    image_bytes = bytes.fromhex(image_hex)
+    source = vane.connect()
+    relation = source.sql(f"""
+        SELECT ai_prompt(
+            prompt,
+            image,
+            struct_pack(provider := 'mock_ai_sql', model := 'round-trip-vision', concurrency := 1)
+        ) AS response
+        FROM (
+            VALUES ('describe', from_hex('{image_hex}'))
+        ) AS t(prompt, image)
+    """)
+
+    _, target, physical, _ = _round_trip_ai_plan(relation)
+    udf_node = physical.collect_udf_nodes()[0]
+    table = _execute_ai_physical_plan(target, physical)
+    payload = udf_node["payload"]
+
+    assert table.column(0).to_pylist() == [f"round-trip-vision:describe:images={image_hex}"]
+    assert payload["input_names"] == ["messages", "images"]
+    assert payload["scalar_arg_count"] == 2
+    assert image_bytes not in payload["function_pickle"]
 
 
 def test_ai_embed_fixed_dimensions_survive_round_trip():
@@ -448,6 +480,58 @@ def test_ai_prompt_sql_with_mock_provider():
     assert rows == [("topic:alpha",), ("topic:beta",)]
 
 
+def test_ai_prompt_sql_with_single_image_blob_and_null_image():
+    conn = vane.connect()
+
+    rows = conn.sql("""
+        SELECT id, ai_prompt(
+            prompt,
+            image,
+            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
+        ) AS response
+        FROM (
+            VALUES
+                (1, 'alpha', from_hex('89504e470d0a1a0a')),
+                (2, 'beta', NULL::BLOB)
+        ) AS t(id, prompt, image)
+        ORDER BY id
+    """).fetchall()
+
+    assert rows == [
+        (1, "vision-model:alpha:images=89504e470d0a1a0a"),
+        (2, "vision-model:beta"),
+    ]
+
+
+def test_ai_prompt_sql_with_image_blob_list():
+    conn = vane.connect()
+
+    rows = conn.sql("""
+        SELECT id, ai_prompt(
+            prompt,
+            images,
+            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
+        ) AS response
+        FROM (
+            VALUES
+                (
+                    1,
+                    'compare',
+                    [from_hex('89504e47'), NULL, from_hex('ffd8ff')]::BLOB[]
+                ),
+                (2, 'empty', []::BLOB[]),
+                (3, 'null', NULL::BLOB[])
+        ) AS t(id, prompt, images)
+        ORDER BY id
+    """).fetchall()
+
+    assert rows == [
+        (1, "vision-model:compare:images=89504e47,ffd8ff"),
+        (2, "vision-model:empty"),
+        (3, "vision-model:null"),
+    ]
+
+
 def test_ai_embed_sql_with_mock_provider_and_dimensions():
     conn = vane.connect()
 
@@ -527,6 +611,21 @@ def test_ai_sql_helper_builds_prompt_spec_without_execution():
 
     assert spec["name"] == "ai_prompt"
     assert spec["input_names"] == ["messages"]
+    assert spec["schema"] == {"response": "VARCHAR"}
+    assert spec["actor_number"] == 1
+    assert spec["gpus"] == 0
+
+
+def test_ai_sql_helper_builds_multimodal_prompt_spec_without_execution():
+    from vane.ai._sql import build_ai_prompt_sql_spec
+
+    spec = build_ai_prompt_sql_spec(
+        {"provider": "mock_ai_sql", "concurrency": 1},
+        image_input=True,
+    )
+
+    assert spec["name"] == "ai_prompt"
+    assert spec["input_names"] == ["messages", "images"]
     assert spec["schema"] == {"response": "VARCHAR"}
     assert spec["actor_number"] == 1
     assert spec["gpus"] == 0
