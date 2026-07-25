@@ -2317,10 +2317,16 @@ def test_worker_drop_query_uses_separate_execution_and_storage_barriers(monkeypa
         assert query_id == "query-drop"
         events.append("retire")
 
+    def release_datasource_factories(query_id):
+        assert query_id == "query-drop"
+        events.append("datasource-release")
+        return 2
+
     monkeypatch.setattr(worker_mod, "_close_flight_shuffle_query", close)
     monkeypatch.setattr(worker_mod, "_wait_flight_shuffle_executions_for_query", wait_for_executions)
     monkeypatch.setattr(worker_mod, "_drain_flight_shuffle_for_query", drain)
     monkeypatch.setattr(worker_mod, "_retire_flight_shuffle_query", retire)
+    monkeypatch.setattr(worker_mod, "_release_datasource_factories_for_query", release_datasource_factories)
     actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
 
     prepare_result = asyncio.run(actor_class.fte_prepare_drop_query(DummyWorker(), "query-drop"))
@@ -2335,6 +2341,7 @@ def test_worker_drop_query_uses_separate_execution_and_storage_barriers(monkeypa
         "fragments",
         "worker-wait",
         "flight-wait",
+        "datasource-release",
         "drain",
         "retire",
         "native-retire",
@@ -2347,6 +2354,136 @@ def test_worker_drop_query_uses_separate_execution_and_storage_barriers(monkeypa
         "flight_shuffle_storage_entries_removed": 5,
         "flight_shuffle_cleanup_errors": 0,
     }
+
+
+def test_worker_drop_query_releases_datasource_after_fragment_cleanup_failure(monkeypatch):
+    events: list[str] = []
+
+    class TaskManager:
+        async def drop_query(self, query_id):
+            assert query_id == "query-drop"
+            events.append("cancel")
+            return {"removed": 2, "canceled": 1}
+
+    class DummyWorker:
+        @staticmethod
+        def _get_fte_task_manager():
+            return TaskManager()
+
+        @staticmethod
+        def drop_query_fragments(query_id):
+            assert query_id == "query-drop"
+            events.append("fragments")
+            raise RuntimeError("fragment cleanup failed")
+
+        @staticmethod
+        def _close_worker_native_query(query_id):
+            assert query_id == "query-drop"
+            events.append("native-close")
+            return []
+
+        @staticmethod
+        async def _wait_worker_native_executions_for_query(query_id):
+            assert query_id == "query-drop"
+            events.append("worker-wait")
+
+    monkeypatch.setattr(worker_mod, "_close_flight_shuffle_query", lambda _query_id: events.append("close"))
+
+    async def wait_for_executions(query_id):
+        assert query_id == "query-drop"
+        events.append("flight-wait")
+
+    monkeypatch.setattr(worker_mod, "_wait_flight_shuffle_executions_for_query", wait_for_executions)
+    monkeypatch.setattr(
+        worker_mod,
+        "_release_datasource_factories_for_query",
+        lambda _query_id: events.append("datasource-release"),
+    )
+    actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+
+    with pytest.raises(RuntimeError, match="fragment cleanup failed"):
+        asyncio.run(actor_class.fte_prepare_drop_query(DummyWorker(), "query-drop"))
+
+    assert events == [
+        "close",
+        "native-close",
+        "cancel",
+        "fragments",
+        "worker-wait",
+        "flight-wait",
+        "datasource-release",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("failed_barrier", "expect_release"),
+    [
+        pytest.param("flight", True, id="flight-failure"),
+        pytest.param("native", False, id="native-failure"),
+    ],
+)
+def test_worker_drop_query_releases_datasource_only_after_native_drain(monkeypatch, failed_barrier, expect_release):
+    events: list[str] = []
+
+    class TaskManager:
+        async def drop_query(self, query_id):
+            assert query_id == "query-drop"
+            events.append("cancel")
+            return {"removed": 2, "canceled": 1}
+
+    class DummyWorker:
+        @staticmethod
+        def _get_fte_task_manager():
+            return TaskManager()
+
+        @staticmethod
+        def drop_query_fragments(query_id):
+            assert query_id == "query-drop"
+            events.append("fragments")
+            return 3
+
+        @staticmethod
+        def _close_worker_native_query(query_id):
+            assert query_id == "query-drop"
+            events.append("native-close")
+            return []
+
+        @staticmethod
+        async def _wait_worker_native_executions_for_query(query_id):
+            assert query_id == "query-drop"
+            events.append("worker-wait")
+            if failed_barrier == "native":
+                raise RuntimeError("native drain failed")
+
+    async def wait_for_flight(query_id):
+        assert query_id == "query-drop"
+        events.append("flight-wait")
+        if failed_barrier == "flight":
+            raise RuntimeError("flight drain failed")
+
+    monkeypatch.setattr(worker_mod, "_close_flight_shuffle_query", lambda _query_id: events.append("close"))
+    monkeypatch.setattr(worker_mod, "_wait_flight_shuffle_executions_for_query", wait_for_flight)
+    monkeypatch.setattr(
+        worker_mod,
+        "_release_datasource_factories_for_query",
+        lambda _query_id: events.append("datasource-release"),
+    )
+    actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+
+    with pytest.raises(RuntimeError, match=f"{failed_barrier} drain failed"):
+        asyncio.run(actor_class.fte_prepare_drop_query(DummyWorker(), "query-drop"))
+
+    expected_events = [
+        "close",
+        "native-close",
+        "cancel",
+        "fragments",
+        "worker-wait",
+        "flight-wait",
+    ]
+    if expect_release:
+        expected_events.append("datasource-release")
+    assert events == expected_events
 
 
 def test_fte_control_rpc_retries_transient_failure(monkeypatch):

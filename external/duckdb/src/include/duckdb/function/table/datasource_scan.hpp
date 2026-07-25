@@ -27,17 +27,24 @@ namespace duckdb {
 //!   4. Export via _export_to_c into the ArrowArrayStream
 typedef void (*datasource_produce_stream_t)(const char *pickled_task, idx_t pickled_len, ArrowArrayStream *out_stream);
 
-//! C callback type: given pickled DataSource bytes, produce the Arrow schema
+//! C callback type: given a serialized logical source package, produce the Arrow schema
 typedef void (*datasource_get_schema_t)(const char *pickled_source, idx_t pickled_len, ArrowSchema *out_schema);
 
-//! C callback type: set the pickled source for worker-side factory recovery
-typedef void (*datasource_set_worker_source_t)(const char *pickled_source, idx_t pickled_len);
+//! C callback types: acquire/release the process-local factory for a logical source.
+//! Acquire must complete before ProduceStream is called. An empty query_id is
+//! released with the scan global state; a non-empty query_id transfers release
+//! ownership to the distributed query teardown path.
+typedef void (*datasource_acquire_source_t)(const char *pickled_source, idx_t pickled_len, const char *query_id,
+                                            idx_t query_id_len);
+typedef void (*datasource_release_source_t)(const char *pickled_source, idx_t pickled_len);
 
 struct DataSourceScanBindData : public TableFunctionData, public ExtensionFileListProvider {
 	//! Pickled DataSourceTask objects, one per task
 	vector<string> pickled_tasks;
-	//! Pickled DataSource object (for schema extraction on deserialize)
+	//! Serialized logical source package (for schema extraction on workers)
 	string pickled_source;
+	//! Distributed query owner. Empty for ordinary connection-local scans.
+	string query_id;
 	//! Callback to produce ArrowArrayStream from a pickled task
 	datasource_produce_stream_t produce_stream;
 	//! Arrow schema metadata
@@ -47,6 +54,7 @@ struct DataSourceScanBindData : public TableFunctionData, public ExtensionFileLi
 		auto result = make_uniq<DataSourceScanBindData>();
 		result->pickled_tasks = pickled_tasks;
 		result->pickled_source = pickled_source;
+		result->query_id = query_id;
 		result->produce_stream = produce_stream;
 		result->arrow_table = arrow_table;
 		return std::move(result);
@@ -60,10 +68,16 @@ struct DataSourceScanBindData : public TableFunctionData, public ExtensionFileLi
 };
 
 struct DataSourceScanGlobalState : public GlobalTableFunctionState {
+	~DataSourceScanGlobalState() override;
+
 	//! Next task index (atomic for thread-safe work-stealing)
 	atomic<idx_t> next_task_idx {0};
 	//! Total tasks
 	idx_t total_tasks = 0;
+	//! Connection-local source ownership acquired for this execution.
+	datasource_release_source_t release_source = nullptr;
+	string pickled_source;
+	bool release_source_on_destroy = false;
 
 	idx_t MaxThreads() const override {
 		return total_tasks;
@@ -86,8 +100,9 @@ struct DataSourceScanFunction {
 	static void SetGlobalProduceStream(datasource_produce_stream_t callback);
 	//! Get the global produce_stream callback (returns nullptr if not set)
 	static datasource_produce_stream_t GetGlobalProduceStream();
-	//! Register a global set_worker_source callback
-	static void SetGlobalWorkerSourceCallback(datasource_set_worker_source_t callback);
+	//! Register global source ownership callbacks.
+	static void SetGlobalAcquireSource(datasource_acquire_source_t callback);
+	static void SetGlobalReleaseSource(datasource_release_source_t callback);
 	//! Register a global get_schema callback for worker schema restoration
 	static void SetGlobalGetSchema(datasource_get_schema_t callback);
 };

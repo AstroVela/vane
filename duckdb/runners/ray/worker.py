@@ -79,6 +79,18 @@ def _ensure_python_datasource_runtime() -> None:
     import duckdb.datasource  # noqa: F401
 
 
+def _release_datasource_factories_for_query(query_id: str) -> int:
+    import _duckdb  # type: ignore[import-not-found]
+
+    return int(_duckdb._release_datasource_factories_for_query(str(query_id)))
+
+
+def _clear_datasource_factory_registry() -> None:
+    import _duckdb
+
+    _duckdb._clear_datasource_factory_registry()
+
+
 def _chaos_worker_loss_matches(task_id: FteTaskAttemptId) -> bool:
     if not _env_flag_enabled("VANE_FTE_CHAOS_KILL_WORKER_ON_RUNNING"):
         return False
@@ -888,15 +900,22 @@ class RayWorkerActor:
             fte_result = await self._get_fte_task_manager().drop_query(query_id)
             fragments_removed = self.drop_query_fragments(query_id)
         finally:
-            drain_results = await asyncio.gather(
+            native_drain_result, flight_drain_result = await asyncio.gather(
                 self._wait_worker_native_executions_for_query(query_id),
                 _wait_flight_shuffle_executions_for_query(query_id),
                 return_exceptions=True,
             )
-            drain_errors = [result for result in drain_results if isinstance(result, BaseException)]
+            drain_errors = [
+                result for result in (native_drain_result, flight_drain_result) if isinstance(result, BaseException)
+            ]
+            if not isinstance(native_drain_result, BaseException):
+                try:
+                    _release_datasource_factories_for_query(query_id)
+                except Exception as error:
+                    drain_errors.append(error)
             if drain_errors:
                 details = "; ".join(f"{type(error).__name__}: {error}" for error in drain_errors)
-                raise RuntimeError(f"failed to drain native executions for {query_id}: {details}") from drain_errors[0]
+                raise RuntimeError(f"failed to prepare query teardown for {query_id}: {details}") from drain_errors[0]
         if interrupt_errors:
             raise RuntimeError(
                 f"failed to interrupt {len(interrupt_errors)} native execution(s) for {query_id}: "
@@ -1184,6 +1203,7 @@ class RayWorkerActor:
                 hint="Ensure the C++ ray extension is built with Flight service lifecycle support.",
             )
             shutdown_flight()
+            _clear_datasource_factory_registry()
             self._shutdown_complete = True
 
     @ray.method(concurrency_group="control")

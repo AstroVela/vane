@@ -20,7 +20,8 @@ static const string DATASOURCE_PREFIX = "datasource://";
 // Global produce_stream callback — set once from Python module init,
 // used to restore the callback on workers after deserialization.
 static std::atomic<datasource_produce_stream_t> g_global_produce_stream {nullptr};
-static std::atomic<datasource_set_worker_source_t> g_global_worker_source_callback {nullptr};
+static std::atomic<datasource_acquire_source_t> g_global_acquire_source {nullptr};
+static std::atomic<datasource_release_source_t> g_global_release_source {nullptr};
 static std::atomic<datasource_get_schema_t> g_global_get_schema {nullptr};
 
 static datasource_produce_stream_t RequireProduceStream(datasource_produce_stream_t callback) {
@@ -88,22 +89,28 @@ static unique_ptr<FunctionData> DataSourceScanBind(ClientContext &context, Table
 		throw InvalidInputException(
 		    "Python datasource runtime is not initialized in this process; missing datasource schema callback");
 	}
-	ArrowSchema arrow_schema;
-	get_schema(pickled_source.c_str(), pickled_source.size(), &arrow_schema);
+	ArrowSchemaWrapper arrow_schema;
+	get_schema(pickled_source.c_str(), pickled_source.size(), &arrow_schema.arrow_schema);
 
 	// Parse Arrow schema into DuckDB types
-	ArrowTableFunction::PopulateArrowTableSchema(context, result->arrow_table, arrow_schema);
+	ArrowTableFunction::PopulateArrowTableSchema(context, result->arrow_table, arrow_schema.arrow_schema);
 	names = result->arrow_table.GetNames();
 	return_types = result->arrow_table.GetTypes();
-
-	if (arrow_schema.release) {
-		arrow_schema.release(&arrow_schema);
-	}
 
 	return std::move(result);
 }
 
 // ── Init Global ────────────────────────────────────────────────────
+
+DataSourceScanGlobalState::~DataSourceScanGlobalState() {
+	if (!release_source_on_destroy || !release_source) {
+		return;
+	}
+	try {
+		release_source(pickled_source.c_str(), pickled_source.size());
+	} catch (...) { // Destructors must not propagate callback failures.
+	}
+}
 
 static unique_ptr<GlobalTableFunctionState> DataSourceScanInitGlobal(ClientContext &context,
                                                                      TableFunctionInitInput &input) {
@@ -112,14 +119,13 @@ static unique_ptr<GlobalTableFunctionState> DataSourceScanInitGlobal(ClientConte
 	result->total_tasks = bind_data.pickled_tasks.size();
 	result->next_task_idx = 0;
 
-	// On a worker, set the pickled_source so ProduceStream can lazily create factories.
-	auto worker_source_cb = g_global_worker_source_callback.load();
-	if (!bind_data.pickled_source.empty() && !worker_source_cb) {
-		throw InvalidInputException("Python datasource runtime is not initialized on this Ray worker; missing "
-		                            "datasource worker source callback");
-	}
-	if (worker_source_cb && !bind_data.pickled_source.empty()) {
-		worker_source_cb(bind_data.pickled_source.c_str(), bind_data.pickled_source.size());
+	// Resolve ownership callbacks before restoring schema, but do not acquire
+	// until schema restoration has passed every fallible initialization step.
+	auto acquire_source = g_global_acquire_source.load();
+	auto release_source = g_global_release_source.load();
+	if (!bind_data.pickled_source.empty() && (!acquire_source || !release_source)) {
+		throw InvalidInputException(
+		    "Python datasource runtime is not initialized on this Ray worker; missing datasource source callbacks");
 	}
 
 	// Restore arrow_table on worker nodes (type_info is not picklable).
@@ -129,14 +135,26 @@ static unique_ptr<GlobalTableFunctionState> DataSourceScanInitGlobal(ClientConte
 			throw InvalidInputException(
 			    "Python datasource runtime is not initialized on this Ray worker; missing datasource schema callback");
 		}
-		ArrowSchema arrow_schema;
-		get_schema_cb(bind_data.pickled_source.c_str(), bind_data.pickled_source.size(), &arrow_schema);
+		ArrowSchemaWrapper arrow_schema;
+		get_schema_cb(bind_data.pickled_source.c_str(), bind_data.pickled_source.size(), &arrow_schema.arrow_schema);
 		// Reset to empty so AddColumn's emplace() succeeds
 		const_cast<DataSourceScanBindData &>(bind_data).arrow_table = ArrowTableSchema();
 		ArrowTableFunction::PopulateArrowTableSchema(
-		    context, const_cast<DataSourceScanBindData &>(bind_data).arrow_table, arrow_schema);
-		if (arrow_schema.release) {
-			arrow_schema.release(&arrow_schema);
+		    context, const_cast<DataSourceScanBindData &>(bind_data).arrow_table, arrow_schema.arrow_schema);
+	}
+
+	// Acquire one process-local factory owner for this execution. Local scan
+	// ownership follows the global state; distributed ownership follows the
+	// logical query and is released only after worker executions are drained.
+	if (acquire_source && release_source && !bind_data.pickled_source.empty()) {
+		if (bind_data.query_id.empty()) {
+			result->release_source = release_source;
+			result->pickled_source = bind_data.pickled_source;
+		}
+		acquire_source(bind_data.pickled_source.c_str(), bind_data.pickled_source.size(), bind_data.query_id.c_str(),
+		               bind_data.query_id.size());
+		if (bind_data.query_id.empty()) {
+			result->release_source_on_destroy = true;
 		}
 	}
 
@@ -235,12 +253,14 @@ static void DataSourceScanSerialize(Serializer &serializer, const optional_ptr<F
 	auto &bind_data = bind_data_p->Cast<DataSourceScanBindData>();
 	serializer.WriteProperty(100, "pickled_tasks", bind_data.pickled_tasks);
 	serializer.WriteProperty(101, "pickled_source", bind_data.pickled_source);
+	serializer.WriteProperty(102, "query_id", bind_data.query_id);
 }
 
 static unique_ptr<FunctionData> DataSourceScanDeserialize(Deserializer &deserializer, TableFunction &function) {
 	auto result = make_uniq<DataSourceScanBindData>();
 	result->pickled_tasks = deserializer.ReadProperty<vector<string>>(100, "pickled_tasks");
 	result->pickled_source = deserializer.ReadProperty<string>(101, "pickled_source");
+	result->query_id = deserializer.ReadProperty<string>(102, "query_id");
 	// Restore produce_stream from global callback (set by Python module on load)
 	result->produce_stream = g_global_produce_stream.load();
 	RequireProduceStream(result->produce_stream);
@@ -273,8 +293,12 @@ datasource_produce_stream_t DataSourceScanFunction::GetGlobalProduceStream() {
 	return g_global_produce_stream.load();
 }
 
-void DataSourceScanFunction::SetGlobalWorkerSourceCallback(datasource_set_worker_source_t callback) {
-	g_global_worker_source_callback.store(callback);
+void DataSourceScanFunction::SetGlobalAcquireSource(datasource_acquire_source_t callback) {
+	g_global_acquire_source.store(callback);
+}
+
+void DataSourceScanFunction::SetGlobalReleaseSource(datasource_release_source_t callback) {
+	g_global_release_source.store(callback);
 }
 
 void DataSourceScanFunction::SetGlobalGetSchema(datasource_get_schema_t callback) {
