@@ -83,7 +83,7 @@ def test_relation_show_handles_empty_distributed_result(monkeypatch, capsys):
     _install_fake_ray_runner(monkeypatch, runner)
 
     connection = duckdb.connect()
-    connection.sql("SELECT NULL::VARCHAR AS name").show()
+    connection.sql("SELECT NULL::VARCHAR AS name WHERE FALSE").show()
 
     output = capsys.readouterr().out
     assert "name" in output

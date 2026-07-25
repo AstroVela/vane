@@ -81,12 +81,12 @@ unique_ptr<DataChunk> DuckDBPyResult::FetchNext(bool raw) {
 	if (!source) {
 		throw InvalidInputException("result closed");
 	}
-	row_consumption_started = true;
-	auto chunk = source->FetchChunk(raw);
-	if (!chunk || chunk->size() == 0) {
+	if (source->IsClosed()) {
 		result_closed = true;
+		return nullptr;
 	}
-	return chunk;
+	row_consumption_started = true;
+	return source->FetchChunk(raw);
 }
 
 Optional<py::tuple> DuckDBPyResult::Fetchone() {

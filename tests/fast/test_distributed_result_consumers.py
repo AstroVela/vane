@@ -55,6 +55,38 @@ def _two_column_tables() -> list[pa.Table]:
     ]
 
 
+def _assert_typed_empty_bulk_result(result, consumer: str) -> None:
+    if consumer == "fetchdf":
+        assert result.empty
+        assert list(result.columns) == ["value"]
+        assert str(result.dtypes["value"]) == "int64"
+    else:
+        assert list(result) == ["value"]
+        assert result["value"].tolist() == []
+        assert str(result["value"].dtype) == "int64"
+
+
+@pytest.mark.parametrize("consumer", ["fetchdf", "fetchnumpy"])
+def test_local_bulk_result_preserves_schema_after_row_cursor_exhaustion(monkeypatch, consumer):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    relation = duckdb.connect().sql("SELECT 1::BIGINT AS value")
+
+    assert relation.fetchmany(2) == [(1,)]
+
+    _assert_typed_empty_bulk_result(getattr(relation, consumer)(), consumer)
+
+
+@pytest.mark.parametrize("consumer", ["fetchdf", "fetchnumpy"])
+def test_distributed_bulk_result_preserves_schema_after_row_cursor_exhaustion(monkeypatch, consumer):
+    runner = _FakeRayRunner([pa.table({"c0": pa.array([1], pa.int64())})])
+    _install_fake_ray_runner(monkeypatch, runner)
+    relation = duckdb.connect().sql("SELECT 999::BIGINT AS value")
+
+    assert relation.fetchmany(2) == [(1,)]
+
+    _assert_typed_empty_bulk_result(getattr(relation, consumer)(), consumer)
+
+
 def test_distributed_row_cursor_is_shared_across_fetch_methods(monkeypatch):
     runner = _FakeRayRunner(_two_column_tables())
     _install_fake_ray_runner(monkeypatch, runner)

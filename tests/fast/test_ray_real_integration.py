@@ -108,6 +108,7 @@ def test_relation_result_consumers_on_ray_local(tmp_path, monkeypatch):
         """
     )
 
+    monkeypatch.setenv("VANE_RUNNER", "ray")
     runners.set_runner_ray(noop_if_initialized=True)
     query = f"SELECT value, label FROM read_parquet('{path}') ORDER BY value"
 
@@ -145,6 +146,7 @@ def test_lossless_relation_result_types_on_ray_local(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     connection = duckdb.connect()
     connection.execute("SET arrow_lossless_conversion = true")
+    monkeypatch.setenv("VANE_RUNNER", "ray")
     runners.set_runner_ray(noop_if_initialized=True)
 
     row = connection.sql("""
@@ -194,6 +196,7 @@ def test_complex_relation_result_consumers_on_ray_local(tmp_path, monkeypatch):
         """
     )
 
+    monkeypatch.setenv("VANE_RUNNER", "ray")
     runners.set_runner_ray(noop_if_initialized=True)
     query = f"""
         SELECT
