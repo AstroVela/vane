@@ -65,6 +65,9 @@ struct PendingQueryParameters {
 	optional_ptr<case_insensitive_map_t<BoundParameterData>> parameters;
 	//! Whether a stream/buffer-managed result should be allowed
 	QueryParameters query_parameters;
+	//! Query-local callback used to create a materialized result collector.
+	//! Takes precedence over the connection-level callback without modifying connection state.
+	get_result_collector_t get_result_collector = nullptr;
 };
 
 //! The ClientContext holds information relevant to the current client session

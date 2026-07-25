@@ -85,6 +85,7 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/execution/operator/projection/physical_udf_inout.hpp>
 #include <duckdb/function/scalar/udf_functions.hpp>
 #include <duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp>
+#include <duckdb/execution/operator/helper/physical_result_collector.hpp>
 #include <duckdb/execution/operator/projection/physical_projection.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/common/arrow/arrow_converter.hpp>
@@ -137,9 +138,54 @@ protected:
 	}
 };
 
+class CountingResultCollectorForTest {
+public:
+	CountingResultCollectorForTest() : calls(make_shared_ptr<std::atomic<idx_t>>(0)) {
+	}
+
+	PhysicalOperator &operator()(ClientContext &context, PreparedStatementData &data) const {
+		calls->fetch_add(1, std::memory_order_relaxed);
+		return PhysicalResultCollector::GetResultCollector(context, data);
+	}
+
+	shared_ptr<std::atomic<idx_t>> calls;
+};
+
 void register_ray_bindings(py::module_ &mod) {
 	auto m = mod.def_submodule("ray_cxx");
 	m.doc() = "C++ Ray execution bindings (experimental)";
+	m.def(
+	    "_install_counting_result_collector_for_test",
+	    [](py::object conn_obj) {
+		    auto &conn_wrapper = ExtractPyConnectionWrapper(std::move(conn_obj));
+		    auto &context = *conn_wrapper.con.GetConnection().context;
+		    ClientConfig::GetConfig(context).get_result_collector = CountingResultCollectorForTest();
+	    },
+	    py::arg("conn"), "Install a connection-level result collector that counts materialized queries.");
+	m.def(
+	    "_connection_result_collector_calls_for_test",
+	    [](py::object conn_obj) {
+		    auto &conn_wrapper = ExtractPyConnectionWrapper(std::move(conn_obj));
+		    auto &context = *conn_wrapper.con.GetConnection().context;
+		    auto &callback = ClientConfig::GetConfig(context).get_result_collector;
+		    auto collector = callback.target<CountingResultCollectorForTest>();
+		    if (!collector) {
+			    throw InternalException("The counting result collector is no longer installed");
+		    }
+		    return collector->calls->load(std::memory_order_relaxed);
+	    },
+	    py::arg("conn"), "Return the number of materialized queries observed by the test collector.");
+	m.def(
+	    "_execute_materialized_int64_for_test",
+	    [](py::object conn_obj, const string &query) {
+		    auto &conn_wrapper = ExtractPyConnectionWrapper(std::move(conn_obj));
+		    auto result = conn_wrapper.con.GetConnection().Query(query);
+		    if (result->HasError()) {
+			    throw InvalidInputException(result->GetError());
+		    }
+		    return result->GetValue<int64_t>(0, 0);
+	    },
+	    py::arg("conn"), py::arg("query"), "Execute a materialized query and return its first BIGINT value.");
 	m.def("shutdown_local_flight_service", []() {
 		auto result = []() {
 			py::gil_scoped_release release;

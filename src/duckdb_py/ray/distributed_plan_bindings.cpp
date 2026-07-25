@@ -1964,6 +1964,13 @@ struct PyPhysicalPlanWrapperRunner {
 			} plan_guard(prepared_data->physical_plan);
 
 			PendingQueryParameters parameters;
+			// Force a parallel result collector for this query only. This enables multi-threaded pipeline
+			// execution for UDF-heavy workloads without changing the connection's collector callback.
+			parameters.get_result_collector = [](duckdb::ClientContext &,
+			                                     duckdb::PreparedStatementData &data) -> duckdb::PhysicalOperator & {
+				auto &physical_plan = *data.physical_plan;
+				return physical_plan.Make<duckdb::PhysicalMaterializedCollector>(data, true);
+			};
 			std::unique_ptr<QueryResult> query_result;
 			vector<PipelineProgressSnapshot> stable_pipeline_snapshots;
 			try {
@@ -1971,15 +1978,6 @@ struct PyPhysicalPlanWrapperRunner {
 				const auto native_progress_env_ms = DuckdbGetEnvIntMs("VANE_NATIVE_PROGRESS_INTERVAL_MS");
 				const auto native_progress_ms =
 				    has_native_progress_callback ? (native_progress_env_ms > 0 ? native_progress_env_ms : 500) : 0;
-				auto &client_config = duckdb::ClientConfig::GetConfig(context);
-				// Force parallel result collector by providing a custom get_result_collector
-				// callback that always creates PhysicalMaterializedCollector(parallel=true).
-				// This enables multi-threaded pipeline execution for UDF-heavy workloads.
-				client_config.get_result_collector =
-				    [](duckdb::ClientContext &, duckdb::PreparedStatementData &data) -> duckdb::PhysicalOperator & {
-					auto &physical_plan = *data.physical_plan;
-					return physical_plan.Make<duckdb::PhysicalMaterializedCollector>(data, true);
-				};
 
 				py::gil_scoped_release release;
 				auto pending = context.PendingQueryPreparedStatementNoRebind(string("external_plan:") + plan_id,
