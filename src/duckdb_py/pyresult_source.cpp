@@ -441,6 +441,13 @@ struct DistributedArrowStreamOwner {
 		    same_family({"is_binary", "is_large_binary", "is_binary_view"})) {
 			return true;
 		}
+		if (same_family({"is_timestamp"})) {
+			auto actual_timezone = actual_type.attr("tz");
+			auto expected_timezone = expected_type.attr("tz");
+			return !py::none().is(actual_timezone) && !py::none().is(expected_timezone) &&
+			       !py::cast<string>(actual_timezone).empty() && !py::cast<string>(expected_timezone).empty() &&
+			       py::cast<string>(actual_type.attr("unit")) == py::cast<string>(expected_type.attr("unit"));
+		}
 		if (same_family({"is_list", "is_large_list", "is_list_view", "is_large_list_view"})) {
 			return CanNormalizeArrowType(actual_type.attr("value_type"), expected_type.attr("value_type"),
 			                             type_predicates);
@@ -451,6 +458,28 @@ struct DistributedArrowStreamOwner {
 			                             type_predicates);
 		}
 		if (same_family({"is_struct"})) {
+			auto field_count = py::cast<idx_t>(actual_type.attr("num_fields"));
+			if (field_count != py::cast<idx_t>(expected_type.attr("num_fields"))) {
+				return false;
+			}
+			for (idx_t field_idx = 0; field_idx < field_count; field_idx++) {
+				auto actual_field = actual_type.attr("field")(field_idx);
+				auto expected_field = expected_type.attr("field")(field_idx);
+				if (py::cast<string>(actual_field.attr("name")) != py::cast<string>(expected_field.attr("name")) ||
+				    py::cast<bool>(actual_field.attr("nullable")) != py::cast<bool>(expected_field.attr("nullable")) ||
+				    !CanNormalizeArrowType(actual_field.attr("type"), expected_field.attr("type"), type_predicates)) {
+					return false;
+				}
+			}
+			return true;
+		}
+		if (same_family({"is_union"})) {
+			if (py::cast<string>(actual_type.attr("mode")) != "sparse" ||
+			    py::cast<string>(expected_type.attr("mode")) != "sparse" ||
+			    py::cast<vector<int64_t>>(actual_type.attr("type_codes")) !=
+			        py::cast<vector<int64_t>>(expected_type.attr("type_codes"))) {
+				return false;
+			}
 			auto field_count = py::cast<idx_t>(actual_type.attr("num_fields"));
 			if (field_count != py::cast<idx_t>(expected_type.attr("num_fields"))) {
 				return false;
@@ -494,6 +523,9 @@ struct DistributedArrowStreamOwner {
 		};
 		if (same_family({"is_string", "is_large_string", "is_string_view"}) ||
 		    same_family({"is_binary", "is_large_binary", "is_binary_view"})) {
+			return array.attr("cast")(expected_type, py::arg("safe") = true);
+		}
+		if (same_family({"is_timestamp"})) {
 			return array.attr("cast")(expected_type, py::arg("safe") = true);
 		}
 		if (same_family({"is_list", "is_large_list", "is_list_view", "is_large_list_view"})) {
@@ -554,6 +586,30 @@ struct DistributedArrowStreamOwner {
 			return pyarrow.attr("StructArray")
 			    .attr("from_arrays")(fields, py::arg("type") = expected_type,
 			                         py::arg("mask") = array.attr("is_null")());
+		}
+		if (same_family({"is_union"})) {
+			py::list children;
+			auto field_count = py::cast<idx_t>(expected_type.attr("num_fields"));
+			for (idx_t field_idx = 0; field_idx < field_count; field_idx++) {
+				children.append(NormalizeArrowArray(array.attr("field")(field_idx),
+				                                    expected_type.attr("field")(field_idx).attr("type"), pyarrow,
+				                                    type_predicates));
+			}
+
+			py::list type_id_buffers;
+			type_id_buffers.append(py::none());
+			type_id_buffers.append(array.attr("buffers")().attr("__getitem__")(1));
+			auto type_ids = pyarrow.attr("Array").attr("from_buffers")(
+			    pyarrow.attr("int8")(), py::len(array), type_id_buffers, py::arg("offset") = array.attr("offset"));
+			py::list type_id_chunks;
+			type_id_chunks.append(type_ids);
+			type_ids = pyarrow.attr("concat_arrays")(type_id_chunks);
+
+			py::list union_buffers;
+			union_buffers.append(py::none());
+			union_buffers.append(type_ids.attr("buffers")().attr("__getitem__")(1));
+			return pyarrow.attr("Array").attr("from_buffers")(expected_type, py::len(array), union_buffers,
+			                                                  py::arg("children") = children);
 		}
 		if (same_family({"is_map"})) {
 			auto offsets = array.attr("offsets");
@@ -622,7 +678,7 @@ struct DistributedArrowStreamOwner {
 				try {
 					column = NormalizeArrowColumn(column, expected_type, pyarrow, type_predicates);
 				} catch (py::error_already_set &ex) {
-					throw InvalidInputException("Distributed result partition %d column %d failed Arrow offset-width "
+					throw InvalidInputException("Distributed result partition %d column %d failed Arrow type "
 					                            "normalization from %s to %s: %s",
 					                            partition_index, col_idx, py::cast<string>(py::str(actual_type)),
 					                            py::cast<string>(py::str(expected_type)), ex.what());

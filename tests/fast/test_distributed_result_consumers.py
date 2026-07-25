@@ -393,10 +393,10 @@ def test_distributed_empty_result_keeps_schema(monkeypatch):
     runner = _FakeRayRunner([])
     _install_fake_ray_runner(monkeypatch, runner)
 
-    row_relation = duckdb.connect().sql("SELECT NULL::VARCHAR AS name")
+    row_relation = duckdb.connect().sql("SELECT NULL::VARCHAR AS name WHERE FALSE")
     assert row_relation.fetchall() == []
 
-    arrow_relation = duckdb.connect().sql("SELECT NULL::VARCHAR AS name")
+    arrow_relation = duckdb.connect().sql("SELECT NULL::VARCHAR AS name WHERE FALSE")
     result = arrow_relation.to_arrow_table()
     assert result.schema.names == ["name"]
     assert result.schema.types == [pa.string()]
@@ -534,6 +534,63 @@ def test_distributed_result_normalizes_nested_lossless_arrow_extension_storage(
     assert len(runner.calls) == 1
 
 
+def test_distributed_result_normalizes_sliced_sparse_union_children(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    producer = duckdb.connect()
+    producer.execute("SET arrow_large_buffer_size = true")
+    table = producer.sql("""
+        SELECT
+            CASE
+                WHEN i % 2 = 0
+                    THEN ('ray-' || i::VARCHAR)::UNION(s VARCHAR, i BIGINT)
+                ELSE i::BIGINT::UNION(s VARCHAR, i BIGINT)
+            END AS c0
+        FROM range(6) AS t(i)
+    """).to_arrow_table()
+    table = table.slice(1, 4)
+
+    runner = _FakeRayRunner([table])
+    _install_fake_ray_runner(monkeypatch, runner)
+
+    relation = duckdb.connect().sql("SELECT NULL::UNION(s VARCHAR, i BIGINT) AS value")
+    assert relation.fetchall() == [(1,), ("ray-2",), (3,), ("ray-4",)]
+    assert len(runner.calls) == 1
+
+
+def test_distributed_result_normalizes_timestamp_timezone_metadata(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    producer = duckdb.connect()
+    producer.execute("SET TimeZone = 'UTC'")
+    table = producer.sql("SELECT TIMESTAMPTZ '2024-01-01 12:00:00+00' AS c0").to_arrow_table()
+    assert table.schema.field(0).type.tz == "UTC"
+
+    runner = _FakeRayRunner([table])
+    _install_fake_ray_runner(monkeypatch, runner)
+    consumer = duckdb.connect()
+    consumer.execute("SET TimeZone = 'America/New_York'")
+
+    value = consumer.sql("SELECT TIMESTAMPTZ '2024-01-01 12:00:00+00' AS value").fetchone()[0]
+    assert value.isoformat() == "2024-01-01T07:00:00-05:00"
+    assert len(runner.calls) == 1
+
+
+def test_distributed_result_does_not_reinterpret_naive_timestamp_as_timestamp_timezone(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    table = duckdb.connect().sql("SELECT TIMESTAMP '2024-01-01 12:00:00' AS c0").to_arrow_table()
+
+    runner = _FakeRayRunner([table])
+    _install_fake_ray_runner(monkeypatch, runner)
+    consumer = duckdb.connect()
+    consumer.execute("SET TimeZone = 'America/New_York'")
+
+    relation = consumer.sql("SELECT TIMESTAMPTZ '2024-01-01 12:00:00+00' AS value")
+    with pytest.raises(
+        duckdb.InvalidInputException,
+        match=r"has Arrow type timestamp\[us\], expected timestamp\[us, tz=America/New_York\]",
+    ):
+        relation.fetchall()
+
+
 @pytest.mark.parametrize(
     "query",
     [
@@ -591,7 +648,7 @@ def test_distributed_result_rejects_untransportable_types_before_starting_runner
         ),
     ],
 )
-def test_distributed_result_normalizes_only_arrow_offset_widths(monkeypatch, query, table, expected):
+def test_distributed_result_normalizes_arrow_offset_widths(monkeypatch, query, table, expected):
     runner = _FakeRayRunner([table])
     _install_fake_ray_runner(monkeypatch, runner)
 

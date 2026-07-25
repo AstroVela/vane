@@ -146,6 +146,7 @@ def test_lossless_relation_result_types_on_ray_local(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     connection = duckdb.connect()
     connection.execute("SET arrow_lossless_conversion = true")
+    connection.execute("SET TimeZone = 'America/New_York'")
     monkeypatch.setenv("VANE_RUNNER", "ray")
     runners.set_runner_ray(noop_if_initialized=True)
 
@@ -156,7 +157,9 @@ def test_lossless_relation_result_types_on_ray_local(monkeypatch):
             '00112233-4455-6677-8899-aabbccddeeff'::UUID AS uuid_value,
             '10101'::BIT AS bit_value,
             '12:34:56+02:00'::TIMETZ AS time_value,
-            '{"key": 1}'::JSON AS json_value
+            TIMESTAMPTZ '2024-01-01 12:00:00+00' AS timestamp_tz_value,
+            '{"key": 1}'::JSON AS json_value,
+            union_value(v := 'distributed'::VARCHAR) AS union_value
     """).fetchone()
 
     assert row is not None
@@ -165,7 +168,9 @@ def test_lossless_relation_result_types_on_ray_local(monkeypatch):
     assert str(row[2]) == "00112233-4455-6677-8899-aabbccddeeff"
     assert row[3] == "10101"
     assert row[4].utcoffset().total_seconds() == 2 * 60 * 60
-    assert row[5] == '{"key": 1}'
+    assert row[5].isoformat() == "2024-01-01T07:00:00-05:00"
+    assert row[6] == '{"key": 1}'
+    assert row[7] == "distributed"
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
