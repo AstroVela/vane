@@ -389,21 +389,24 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
     def _recv_expected(self, expected: tuple[int, ...], *, timeout_s: float | None = None) -> tuple[int, bytes]:
         sock = self._require_socket()
+        timeout_overridden = False
         restore_timeout = None
         if timeout_s is not None and hasattr(sock, "settimeout") and hasattr(sock, "gettimeout"):
             restore_timeout = sock.gettimeout()
             sock.settimeout(max(0.0, float(timeout_s)))
+            timeout_overridden = True
         try:
-            msg_type, payload = _recv_message(sock)
+            try:
+                msg_type, payload = _recv_message(sock)
+            finally:
+                if timeout_overridden:
+                    try:
+                        sock.settimeout(restore_timeout)
+                    except Exception:
+                        pass
         except Exception as exc:
             self._mark_broken(f"UDF subprocess communication failed: {exc}", actor_lost=True)
             raise RuntimeError(self._broken_error) from exc
-        finally:
-            if restore_timeout is not None:
-                try:
-                    sock.settimeout(restore_timeout)
-                except Exception:
-                    pass
         if msg_type not in expected:
             self._mark_broken(f"UDF subprocess sent unexpected message type {msg_type:#x}", actor_lost=True)
             raise RuntimeError(self._broken_error)
