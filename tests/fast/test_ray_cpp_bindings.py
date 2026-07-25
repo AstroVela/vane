@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 import duckdb
+from duckdb.runners.fte.fte_exchange import ExchangeSinkHandle, ExchangeSinkInstanceHandle
 
 
 def _make_test_physical_plan(con=None):
@@ -313,7 +314,7 @@ def test_flight_exchange_materialized_output_attempt_metadata_drives_completion(
     assert all(h["flight_server_epoch"] == "worker-first-epoch" for h in sink1_handles)
 
 
-def test_ray_task_result_handle_uses_refreshed_worker_id_at_completion():
+def test_ray_task_result_handle_uses_refreshed_worker_id_and_nested_sink_query_id():
     class _AdoptingHandle:
         worker_id = "worker-original"
 
@@ -334,12 +335,16 @@ def test_ray_task_result_handle_uses_refreshed_worker_id_at_completion():
             return True
 
         def get_result_sync(self):
+            sink_instance = ExchangeSinkInstanceHandle(
+                ExchangeSinkHandle("query-nested", "exchange-nested", 0),
+                1,
+            )
             return duckdb.ray_cxx.RayTaskResult.success(
                 [],
                 [],
                 None,
                 5010,
-                {"sink_handle": {"partition_id": 0}, "attempt_id": 1},
+                sink_instance.to_dict(),
             )
 
         def release_result_payload(self):
@@ -351,6 +356,8 @@ def test_ray_task_result_handle_uses_refreshed_worker_id_at_completion():
     assert result["worker_id"] == "worker-retry"
     assert result["has_output"] is True
     assert result["flight_port"] == 5010
+    assert result["has_exchange_sink_instance"] is True
+    assert result["exchange_sink_query_id"] == "query-nested"
     assert handle.release_calls == 1
 
 

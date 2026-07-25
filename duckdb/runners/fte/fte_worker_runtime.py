@@ -1189,17 +1189,21 @@ class FteWorkerTaskManager:
             return
 
     def _drain_queue(self) -> None:
-        while self.queued_tasks:
-            key = self.queued_tasks.popleft()
-            execution = self.tasks.get(key)
-            if execution is None or execution.status.state in _TERMINAL_STATES:
-                continue
-            block_reason = self._capacity_block_reason(execution)
-            if block_reason:
-                self.queued_tasks.appendleft(key)
-                self._admission_debug_log("drain_blocked", execution, reason=block_reason)
+        with self._lifecycle_lock:
+            if self._shutdown:
+                self.queued_tasks.clear()
                 return
-            self._start_execution(execution, reason="drain")
+            while self.queued_tasks:
+                key = self.queued_tasks.popleft()
+                execution = self.tasks.get(key)
+                if execution is None or execution.status.state in _TERMINAL_STATES:
+                    continue
+                block_reason = self._capacity_block_reason(execution)
+                if block_reason:
+                    self.queued_tasks.appendleft(key)
+                    self._admission_debug_log("drain_blocked", execution, reason=block_reason)
+                    return
+                self._start_execution(execution, reason="drain")
 
     def _executor_stats(self, task_key: str | None = None) -> dict[str, Any]:
         stats: dict[str, Any] = {
@@ -1481,6 +1485,7 @@ class FteWorkerTaskManager:
         """Synchronously cancel every task before the actor runtime joins threads."""
         with self._lifecycle_lock:
             self._shutdown = True
+            self.queued_tasks.clear()
             removed = 0
             canceled = 0
             errors: list[tuple[str, BaseException]] = []
@@ -1497,7 +1502,6 @@ class FteWorkerTaskManager:
                 self.running_tasks.discard(key)
                 removed += 1
             self.query_tasks.clear()
-            self.queued_tasks.clear()
             try:
                 self._sync_udf_active_fte_fragment_tasks()
             except BaseException as exc:

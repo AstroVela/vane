@@ -100,6 +100,9 @@ bool ParseExchangeSinkInstanceObject(py::object obj, duckdb::distributed::Exchan
 	}
 	if (py::isinstance<py::dict>(sink_handle_obj)) {
 		auto sink_handle = sink_handle_obj.cast<py::dict>();
+		if (sink_handle.contains("query_id")) {
+			out.query_id = py::str(sink_handle["query_id"]).cast<string>();
+		}
 		if (sink_handle.contains("task_partition_id")) {
 			out.sink_handle.task_partition_id = py::int_(sink_handle["task_partition_id"]).cast<duckdb::idx_t>();
 		} else if (sink_handle.contains("partition_id")) {

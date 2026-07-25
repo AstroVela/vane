@@ -342,6 +342,55 @@ def test_fte_task_manager_shutdown_retries_retained_task_cleanup():
     assert execution.release_calls == 2
 
 
+def test_fte_task_manager_shutdown_does_not_admit_queued_task_from_completion_callback():
+    from duckdb.runners.fte import FteTaskState
+    from duckdb.runners.fte.fte_config import FteWorkerAdmissionConfig
+    from duckdb.runners.fte.fte_worker_runtime import FteWorkerTaskManager
+
+    async def execute(_request):
+        raise AssertionError("queued task must not execute during shutdown")
+
+    manager = FteWorkerTaskManager(
+        execute,
+        admission_config=FteWorkerAdmissionConfig(
+            max_running_tasks=1,
+            mode="test",
+            memory_budget_bytes=1,
+        ),
+    )
+    started = []
+
+    class Execution:
+        def __init__(self, state, *, on_release=None):
+            self.status = SimpleNamespace(state=state)
+            self.memory_requirement_bytes = 1
+            self.on_release = on_release
+
+        def cancel(self):
+            self.status.state = FteTaskState.CANCELED
+
+        def release_result(self, *, reason):
+            assert reason == "worker_shutdown"
+            if self.on_release is not None:
+                self.on_release()
+
+    def finish_running_task_during_shutdown():
+        manager.running_tasks.discard("running")
+        manager._drain_queue()
+
+    running = Execution(FteTaskState.RUNNING, on_release=finish_running_task_during_shutdown)
+    queued = Execution(FteTaskState.QUEUED)
+    manager.tasks["running"] = running
+    manager.tasks["queued"] = queued
+    manager.running_tasks.add("running")
+    manager.queued_tasks.append("queued")
+    manager._start_execution = lambda execution, *, reason: started.append((execution, reason))
+
+    assert manager.shutdown() == {"removed": 2, "canceled": 2}
+    assert started == []
+    assert list(manager.queued_tasks) == []
+
+
 def test_actor_task_manager_creation_is_rejected_after_shutdown_starts():
     from duckdb.runners.ray import worker as worker_module
 

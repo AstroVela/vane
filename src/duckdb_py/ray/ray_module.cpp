@@ -973,6 +973,10 @@ void register_ray_bindings(py::module_ &mod) {
 				        }
 				        if (py::isinstance<py::dict>(sink_handle_obj)) {
 					        auto sink_handle = sink_handle_obj.cast<py::dict>();
+					        if (sink_handle.contains("query_id")) {
+						        exchange_sink_instance_task.sink_instance.query_id =
+						            py::str(sink_handle["query_id"]).cast<string>();
+					        }
 					        if (sink_handle.contains("partition_id")) {
 						        exchange_sink_instance_task.sink_instance.sink_handle.task_partition_id =
 						            py::int_(sink_handle["partition_id"]).cast<idx_t>();
@@ -1471,7 +1475,9 @@ void register_ray_bindings(py::module_ &mod) {
 		                                    make_worker_id("worker-original"));
 
 		    std::string worker_id;
+		    std::string exchange_sink_query_id;
 		    bool has_output = false;
+		    bool has_exchange_sink_instance = false;
 		    int flight_port = 0;
 		    {
 			    pybind11::gil_scoped_release release;
@@ -1492,6 +1498,10 @@ void register_ray_bindings(py::module_ &mod) {
 					    worker_id = *output.worker_id();
 				    }
 				    flight_port = output.flight_port();
+				    has_exchange_sink_instance = output.has_exchange_sink_instance();
+				    if (has_exchange_sink_instance) {
+					    exchange_sink_query_id = output.exchange_sink_instance().query_id;
+				    }
 				    task_handle.AckPollResult();
 				    task_handle.ReleasePollResult();
 				    break;
@@ -1504,6 +1514,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    result["worker_id"] = worker_id;
 		    result["has_output"] = has_output;
 		    result["flight_port"] = flight_port;
+		    result["has_exchange_sink_instance"] = has_exchange_sink_instance;
+		    result["exchange_sink_query_id"] = exchange_sink_query_id;
 		    return result;
 	    },
 	    py::arg("handle"),

@@ -16,6 +16,7 @@ import pytest
 
 import duckdb
 from duckdb.runners.common import PartitionMetadata
+from duckdb.runners.fte.fte_exchange import ExchangeSinkHandle, ExchangeSinkInstanceHandle
 from duckdb.runners.ray import driver
 from duckdb.runners.ray.partition_metadata import PartitionMetadataAccessor
 from duckdb.runners.ray.safe_get import QueryDeadlineExceeded
@@ -2538,7 +2539,7 @@ def test_describe_native_progress_materializes_deferred_clone_without_execution(
     assert scan_pipeline["input_rows"] == 10
 
 
-def test_remote_exchange_sink_progress_does_not_add_result_collector(tmp_path, monkeypatch):
+def test_remote_exchange_sink_accepts_nested_query_id_without_result_collector(tmp_path, monkeypatch):
     import duckdb.runners.ray.worker_handle as ray_worker_handle
 
     class _CapturingWorker:
@@ -2600,12 +2601,25 @@ def test_remote_exchange_sink_progress_does_not_add_result_collector(tmp_path, m
             topology = duckdb.ray_cxx.describe_native_progress(con.cursor(), task_plan)
             operators = [operator for pipeline in topology["pipelines"] for operator in pipeline["operators"]]
             if "EXCHANGE_SINK" in operators:
+                native_sink_instance = task.exchange_sink_instance()
+                sink_instance = ExchangeSinkInstanceHandle(
+                    ExchangeSinkHandle(
+                        native_sink_instance["query_id"],
+                        "nested-query-id-regression",
+                        native_sink_instance["partition_id"],
+                    ),
+                    native_sink_instance["attempt_id"],
+                    native_sink_instance.get("output_location"),
+                ).to_dict()
+                sink_instance["output_partition_count"] = native_sink_instance["output_partition_count"]
+                assert "query_id" not in sink_instance
+                assert sink_instance["sink_handle"]["query_id"] == native_sink_instance["query_id"]
                 sink_topologies.append(topology)
                 sink_results.append(
                     runner.execute_native(
                         con.cursor(),
                         task_plan,
-                        exchange_sink_instance=task.exchange_sink_instance(),
+                        exchange_sink_instance=sink_instance,
                     )
                 )
 
