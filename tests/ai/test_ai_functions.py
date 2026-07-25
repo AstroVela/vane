@@ -2508,19 +2508,21 @@ class TestMultimodalPromptBatch:
 
         assert len(captured_messages[0]) == 3  # text + 2 images
 
-    def test_prompt_batch_expands_image_lists_without_using_text_batch_api(self):
-        """BLOB[] values become ordered image parts and skip NULL elements."""
+    def test_prompt_batch_partitions_image_lists_and_preserves_row_order(self):
+        """Only rows with actual images use the multimodal prompt path."""
         from vane.ai.functions import _PromptBatch
 
         captured_messages = []
+        captured_batches = []
 
         class DualPathPrompter:
             def prompt_batch(self, texts):
-                raise AssertionError("text-only batch API must not receive image inputs")
+                captured_batches.append(texts)
+                return [f"batch:{text}" for text in texts]
 
             async def prompt(self, msgs):
                 captured_messages.append(msgs)
-                return "ok"
+                return f"multimodal:{msgs[0]}"
 
         mock_descriptor = MagicMock()
         mock_descriptor.instantiate.return_value = DualPathPrompter()
@@ -2533,11 +2535,12 @@ class TestMultimodalPromptBatch:
         )
         table = pa.table(
             {
-                "text": ["Compare these", "No images"],
+                "text": ["Compare these", "No images", "Empty images"],
                 "images": pa.array(
                     [
                         [b"\x89PNG\r\n\x1a\n", None, b"\xff\xd8\xff"],
                         None,
+                        [],
                     ],
                     type=pa.list_(pa.binary()),
                 ),
@@ -2547,9 +2550,58 @@ class TestMultimodalPromptBatch:
 
         assert captured_messages == [
             ("Compare these", b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff"),
-            ("No images",),
         ]
-        assert result.column("response").to_pylist() == ["ok", "ok"]
+        assert captured_batches == [["No images", "Empty images"]]
+        assert result.column("response").to_pylist() == [
+            "multimodal:Compare these",
+            "batch:No images",
+            "batch:Empty images",
+        ]
+
+    def test_prompt_batch_uses_text_batch_api_when_all_image_parts_are_empty(self):
+        """NULL, empty lists, and NULL list elements remain safely batchable."""
+        from vane.ai.functions import _PromptBatch
+
+        captured_batches = []
+
+        class VLLMLikePrompter:
+            def prompt_batch(self, texts):
+                captured_batches.append(texts)
+                return [f"response:{text}" for text in texts]
+
+            async def prompt(self, _msgs):
+                raise AssertionError("text-only rows must not use the shared single-row executor")
+
+        mock_descriptor = MagicMock()
+        mock_descriptor.instantiate.return_value = VLLMLikePrompter()
+
+        batch = _PromptBatch(
+            mock_descriptor,
+            "text",
+            "response",
+            image_columns=["images"],
+        )
+        table = pa.table(
+            {
+                "text": ["alpha", "beta", "gamma"],
+                "images": pa.array(
+                    [
+                        None,
+                        [],
+                        [None],
+                    ],
+                    type=pa.list_(pa.binary()),
+                ),
+            }
+        )
+        result = batch(table)
+
+        assert captured_batches == [["alpha", "beta", "gamma"]]
+        assert result.column("response").to_pylist() == [
+            "response:alpha",
+            "response:beta",
+            "response:gamma",
+        ]
 
     def test_prompt_batch_no_image_columns_text_only(self):
         """Without image_columns, behavior is identical to original."""

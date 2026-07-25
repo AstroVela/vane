@@ -168,12 +168,14 @@ static void AISQLExecute(DataChunk &, ExpressionState &, Vector &) {
 static void AddAISQLFunctions(ScalarFunctionSet &set, bind_scalar_function_t bind, bool include_image_inputs) {
 	auto base = ScalarFunction({LogicalType::VARCHAR}, LogicalType::ANY, AISQLExecute, bind, nullptr, nullptr, nullptr,
 	                           LogicalType::INVALID, FunctionStability::VOLATILE);
-	base.SetBindExpressionCallback(LowerRegisteredExpressionUDF);
+	base.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	base.SetBindExpressionCallback(LowerRegisteredExpressionUDFPreservingFoldableNulls);
 	set.AddFunction(std::move(base));
 
 	auto with_options = ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY, AISQLExecute, bind,
 	                                   nullptr, nullptr, nullptr, LogicalType::INVALID, FunctionStability::VOLATILE);
-	with_options.SetBindExpressionCallback(LowerRegisteredExpressionUDF);
+	with_options.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	with_options.SetBindExpressionCallback(LowerRegisteredExpressionUDFPreservingFoldableNulls);
 	set.AddFunction(std::move(with_options));
 
 	if (!include_image_inputs) {
@@ -182,13 +184,15 @@ static void AddAISQLFunctions(ScalarFunctionSet &set, bind_scalar_function_t bin
 	auto with_image =
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::ANY}, LogicalType::ANY, AISQLExecute,
 	                   bind, nullptr, nullptr, nullptr, LogicalType::INVALID, FunctionStability::VOLATILE);
-	with_image.SetBindExpressionCallback(LowerRegisteredExpressionUDF);
+	with_image.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	with_image.SetBindExpressionCallback(LowerRegisteredExpressionUDFPreservingFoldableNulls);
 	set.AddFunction(std::move(with_image));
 
 	auto with_images = ScalarFunction({LogicalType::VARCHAR, LogicalType::LIST(LogicalType::BLOB), LogicalType::ANY},
 	                                  LogicalType::ANY, AISQLExecute, bind, nullptr, nullptr, nullptr,
 	                                  LogicalType::INVALID, FunctionStability::VOLATILE);
-	with_images.SetBindExpressionCallback(LowerRegisteredExpressionUDF);
+	with_images.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	with_images.SetBindExpressionCallback(LowerRegisteredExpressionUDFPreservingFoldableNulls);
 	set.AddFunction(std::move(with_images));
 }
 

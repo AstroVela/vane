@@ -480,6 +480,55 @@ def test_ai_prompt_sql_with_mock_provider():
     assert rows == [("topic:alpha",), ("topic:beta",)]
 
 
+@pytest.mark.parametrize("null_image", ["NULL::BLOB", "NULL::BLOB[]"])
+def test_ai_prompt_sql_with_literal_null_image(null_image):
+    conn = vane.connect()
+
+    relation = conn.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            {null_image},
+            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
+        ) AS response
+    """)
+
+    assert [str(dtype) for dtype in relation.types] == ["VARCHAR"]
+    assert relation.fetchall() == [("vision-model:describe",)]
+
+    _, target, physical, _ = _round_trip_ai_plan(relation)
+    table = _execute_ai_physical_plan(target, physical)
+    assert table.column(0).to_pylist() == ["vision-model:describe"]
+
+
+def test_ai_prompt_sql_with_null_options_uses_default_provider(monkeypatch):
+    monkeypatch.setitem(provider_registry.PROVIDERS, "openai", lambda name=None, **options: MockProvider())
+    conn = vane.connect()
+
+    relation = conn.sql("""
+        SELECT ai_prompt(
+            'describe',
+            from_hex('89504e47'),
+            NULL
+        ) AS response
+    """)
+
+    assert [str(dtype) for dtype in relation.types] == ["VARCHAR"]
+    assert relation.fetchall() == [("topic:describe:images=89504e47",)]
+
+
+def test_ai_prompt_literal_null_image_still_validates_provider():
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match="Provider 'does_not_exist' is not supported"):
+        conn.sql("""
+            SELECT ai_prompt(
+                'describe',
+                NULL::BLOB,
+                struct_pack(provider := 'does_not_exist')
+            )
+        """).fetchall()
+
+
 def test_ai_prompt_sql_with_single_image_blob_and_null_image():
     conn = vane.connect()
 
