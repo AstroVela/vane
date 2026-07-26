@@ -304,6 +304,32 @@ struct PyPhysicalPlanWrapper {
 		return field.first && field.second == expected;
 	}
 
+	static string UDFOperatorIdentityOrEmpty(const Value &payload) {
+		static constexpr const char *OPERATOR_ID_FIELD = "_vane_udf_operator_id";
+		if (payload.IsNull() || payload.type().id() != LogicalTypeId::STRUCT) {
+			throw duckdb::InvalidInputException("UDF payload must be a STRUCT");
+		}
+		auto &children = StructValue::GetChildren(payload);
+		auto child_count = StructType::GetChildCount(payload.type());
+		for (idx_t i = 0; i < child_count; i++) {
+			if (StructType::GetChildName(payload.type(), i) != OPERATOR_ID_FIELD) {
+				continue;
+			}
+			if (i >= children.size() || children[i].IsNull() ||
+			    StructType::GetChildType(payload.type(), i).id() != LogicalTypeId::VARCHAR) {
+				throw duckdb::InvalidInputException("UDF payload field %s must be a non-empty VARCHAR",
+				                                    OPERATOR_ID_FIELD);
+			}
+			auto identity = StringValue::Get(children[i]);
+			if (identity.empty()) {
+				throw duckdb::InvalidInputException("UDF payload field %s must be a non-empty VARCHAR",
+				                                    OPERATOR_ID_FIELD);
+			}
+			return identity;
+		}
+		return string();
+	}
+
 	static Value UDFPayloadWithStringField(const Value &payload, const string &name, const string &value) {
 		if (payload.IsNull() || payload.type().id() != LogicalTypeId::STRUCT) {
 			throw duckdb::InvalidInputException("UDF payload must be a STRUCT");
@@ -328,6 +354,57 @@ struct PyPhysicalPlanWrapper {
 		return Value::STRUCT(std::move(new_children));
 	}
 
+	static vector<Value> EnsureStableUDFOperatorIdentities(const vector<UDFFunctionData *> &physical_udfs,
+	                                                       const string &query_id) {
+		static constexpr const char *OPERATOR_ID_FIELD = "_vane_udf_operator_id";
+		auto identity_prefix = "query:" + query_id + ":physical_udf:";
+		std::unordered_set<string> identities;
+		idx_t existing_identity_count = 0;
+		for (auto *bind_data : physical_udfs) {
+			if (!bind_data) {
+				throw duckdb::InternalException("physical UDF collection returned null bind data");
+			}
+			auto identity = UDFOperatorIdentityOrEmpty(bind_data->payload);
+			if (identity.empty()) {
+				continue;
+			}
+			if (identity.compare(0, identity_prefix.size(), identity_prefix) != 0) {
+				throw duckdb::InvalidInputException(
+				    "physical UDF operator identity query ownership mismatch: operator=%s plan=%s", identity, query_id);
+			}
+			existing_identity_count++;
+			if (!identities.insert(identity).second) {
+				throw duckdb::InvalidInputException("duplicate physical UDF operator identity: %s", identity);
+			}
+		}
+		if (existing_identity_count != 0 && existing_identity_count != physical_udfs.size()) {
+			throw duckdb::InvalidInputException(
+			    "physical UDF operator identities are incomplete: identified=%llu total=%llu",
+			    static_cast<unsigned long long>(existing_identity_count),
+			    static_cast<unsigned long long>(physical_udfs.size()));
+		}
+		if (existing_identity_count == physical_udfs.size()) {
+			return {};
+		}
+
+		vector<Value> identified_payloads;
+		identified_payloads.reserve(physical_udfs.size());
+		for (idx_t i = 0; i < physical_udfs.size(); i++) {
+			auto identity = identity_prefix + std::to_string(i);
+			identified_payloads.push_back(
+			    UDFPayloadWithStringField(physical_udfs[i]->payload, OPERATOR_ID_FIELD, identity));
+		}
+		vector<Value> original_payloads;
+		original_payloads.reserve(physical_udfs.size());
+		for (auto *bind_data : physical_udfs) {
+			original_payloads.push_back(std::move(bind_data->payload));
+		}
+		for (idx_t i = 0; i < physical_udfs.size(); i++) {
+			physical_udfs[i]->payload = std::move(identified_payloads[i]);
+		}
+		return original_payloads;
+	}
+
 	py::dict collect_execution_stages(py::object conn_obj) {
 		if (!IsInitialized() || !plan_ || !has_root()) {
 			throw duckdb::InternalException("DistributedPhysicalPlan must have a root before stage collection");
@@ -336,6 +413,39 @@ struct PyPhysicalPlanWrapper {
 		if (query_id.empty()) {
 			throw duckdb::InternalException("DistributedPhysicalPlan stage collection requires a query_id");
 		}
+		if (plan_->query_id() != query_id) {
+			throw duckdb::InvalidInputException("DistributedPhysicalPlan query ownership mismatch: wrapper=%s plan=%s",
+			                                    query_id, plan_->query_id());
+		}
+
+		vector<UDFFunctionData *> physical_udfs;
+		auto physical_plan = plan_->physical_plan();
+		std::function<void(PhysicalOperator &)> collect_physical_udfs = [&](PhysicalOperator &op) -> void {
+			CollectMutableUDFBindData(op, physical_udfs);
+			for (auto &child : op.children) {
+				collect_physical_udfs(child.get());
+			}
+		};
+		collect_physical_udfs(physical_plan->Root());
+		auto unidentified_payloads = EnsureStableUDFOperatorIdentities(physical_udfs, query_id);
+		struct UDFIdentityRollback {
+			const vector<UDFFunctionData *> &bind_data;
+			vector<Value> &payloads;
+			bool active = true;
+
+			~UDFIdentityRollback() {
+				if (!active) {
+					return;
+				}
+				for (idx_t i = 0; i < payloads.size(); i++) {
+					bind_data[i]->payload = std::move(payloads[i]);
+				}
+			}
+
+			void Commit() {
+				active = false;
+			}
+		} identity_rollback {physical_udfs, unidentified_payloads};
 
 		auto pipeline_root = BuildDistributedPipelineNode(plan_, client_context_.get());
 		vector<duckdb::distributed::DistributedPipelineNodeRef> pipeline_nodes;
@@ -352,7 +462,12 @@ struct PyPhysicalPlanWrapper {
 		};
 		collect_pipeline(pipeline_root);
 
-		vector<std::pair<duckdb::distributed::NodeID, const UDFFunctionData *>> pipeline_udfs;
+		struct PipelineUDFBinding {
+			duckdb::distributed::NodeID node_id;
+			const UDFFunctionData *bind_data;
+			duckdb::distributed::DistributedPipelineNodeRef node;
+		};
+		std::unordered_map<string, PipelineUDFBinding> pipeline_udfs;
 		for (auto &node : pipeline_nodes) {
 			const UDFFunctionData *bind_data = nullptr;
 			auto implementation = node->implementation();
@@ -363,52 +478,98 @@ struct PyPhysicalPlanWrapper {
 				bind_data = TryGetUDFBindData(streaming->bind_data());
 			}
 			if (bind_data) {
-				pipeline_udfs.emplace_back(node->node_id(), bind_data);
+				auto identity = UDFOperatorIdentityOrEmpty(bind_data->payload);
+				if (identity.empty()) {
+					throw duckdb::InvalidInputException("pipeline UDF node %llu is missing a stable operator identity",
+					                                    static_cast<unsigned long long>(node->node_id()));
+				}
+				if (!pipeline_udfs.emplace(identity, PipelineUDFBinding {node->node_id(), bind_data, node}).second) {
+					throw duckdb::InvalidInputException("duplicate pipeline UDF operator identity: %s", identity);
+				}
 			}
 		}
 		std::sort(pipeline_nodes.begin(), pipeline_nodes.end(),
 		          [](const auto &left, const auto &right) { return left->node_id() < right->node_id(); });
 
-		vector<UDFFunctionData *> physical_udfs;
-		auto physical_plan = plan_->physical_plan();
-		std::function<void(PhysicalOperator &)> collect_physical_udfs = [&](PhysicalOperator &op) -> void {
-			CollectMutableUDFBindData(op, physical_udfs);
-			for (auto &child : op.children) {
-				collect_physical_udfs(child.get());
-			}
-		};
-		collect_physical_udfs(physical_plan->Root());
 		if (physical_udfs.size() != pipeline_udfs.size()) {
 			throw duckdb::InternalException("physical/pipeline UDF stage count mismatch: physical=%llu pipeline=%llu",
 			                                static_cast<unsigned long long>(physical_udfs.size()),
 			                                static_cast<unsigned long long>(pipeline_udfs.size()));
 		}
 
-		std::unordered_map<duckdb::distributed::NodeID, UDFFunctionData *> udf_by_node;
-		for (idx_t i = 0; i < physical_udfs.size(); i++) {
-			auto node_id = pipeline_udfs[i].first;
-			auto *bind_data = physical_udfs[i];
-			auto pipeline_backend = UDFPayloadStringOrDefault(pipeline_udfs[i].second->payload, "execution_backend");
+		struct PendingUDFStageAnnotation {
+			UDFFunctionData *bind_data;
+			Value payload;
+		};
+		vector<PendingUDFStageAnnotation> pending_annotations;
+		pending_annotations.reserve(physical_udfs.size());
+		std::unordered_map<duckdb::distributed::NodeID, idx_t> udf_by_node;
+		for (auto *bind_data : physical_udfs) {
+			auto identity = UDFOperatorIdentityOrEmpty(bind_data->payload);
+			if (identity.empty()) {
+				throw duckdb::InvalidInputException("physical UDF is missing a stable operator identity");
+			}
+			auto pipeline_entry = pipeline_udfs.find(identity);
+			if (pipeline_entry == pipeline_udfs.end()) {
+				throw duckdb::InvalidInputException("physical UDF operator identity is absent from pipeline DAG: %s",
+				                                    identity);
+			}
+			auto &pipeline_binding = pipeline_entry->second;
+			auto node_id = pipeline_binding.node_id;
+			auto *pipeline_bind_data = pipeline_binding.bind_data;
+			auto pipeline_query_id = pipeline_binding.node->context().query_id();
+			if (pipeline_query_id != query_id) {
+				throw duckdb::InvalidInputException(
+				    "pipeline UDF query ownership mismatch for operator %s at node %llu: pipeline=%s plan=%s", identity,
+				    static_cast<unsigned long long>(node_id), pipeline_query_id, query_id);
+			}
+			auto pipeline_backend = UDFPayloadStringOrDefault(pipeline_bind_data->payload, "execution_backend");
 			auto physical_backend = UDFPayloadStringOrDefault(bind_data->payload, "execution_backend");
 			if (pipeline_backend != physical_backend) {
 				throw duckdb::InternalException(
-				    "physical/pipeline UDF backend mismatch at node %llu: physical=%s pipeline=%s",
-				    static_cast<unsigned long long>(node_id), physical_backend, pipeline_backend);
+				    "physical/pipeline UDF backend mismatch for operator %s at node %llu: physical=%s pipeline=%s",
+				    identity, static_cast<unsigned long long>(node_id), physical_backend, pipeline_backend);
 			}
 			auto stage_id = "stage:" + query_id + ":node:" + std::to_string(node_id) + ":udf";
 			auto existing_query_id = UDFPayloadStringOrDefault(bind_data->payload, "query_id");
 			if (!existing_query_id.empty() && existing_query_id != query_id) {
-				throw duckdb::InvalidInputException("distributed UDF payload query_id mismatch: payload=%s plan=%s",
-				                                    existing_query_id, query_id);
+				throw duckdb::InvalidInputException(
+				    "physical UDF query ownership mismatch for operator %s at node %llu: payload=%s plan=%s", identity,
+				    static_cast<unsigned long long>(node_id), existing_query_id, query_id);
+			}
+			auto pipeline_payload_query_id = UDFPayloadStringOrDefault(pipeline_bind_data->payload, "query_id");
+			if (!pipeline_payload_query_id.empty() && pipeline_payload_query_id != query_id) {
+				throw duckdb::InvalidInputException(
+				    "pipeline UDF payload query ownership mismatch for operator %s at node %llu: payload=%s plan=%s",
+				    identity, static_cast<unsigned long long>(node_id), pipeline_payload_query_id, query_id);
 			}
 			auto existing_stage_id = UDFPayloadStringOrDefault(bind_data->payload, "stage_id");
 			if (!existing_stage_id.empty() && existing_stage_id != stage_id) {
-				throw duckdb::InvalidInputException("distributed UDF payload stage_id mismatch: payload=%s plan=%s",
-				                                    existing_stage_id, stage_id);
+				throw duckdb::InvalidInputException(
+				    "physical UDF stage identity mismatch for operator %s at node %llu: payload=%s expected=%s",
+				    identity, static_cast<unsigned long long>(node_id), existing_stage_id, stage_id);
 			}
-			bind_data->payload = UDFPayloadWithStringField(bind_data->payload, "query_id", query_id);
-			bind_data->payload = UDFPayloadWithStringField(bind_data->payload, "stage_id", stage_id);
-			udf_by_node.emplace(node_id, bind_data);
+			auto pipeline_stage_id = UDFPayloadStringOrDefault(pipeline_bind_data->payload, "stage_id");
+			if (!pipeline_stage_id.empty() && pipeline_stage_id != stage_id) {
+				throw duckdb::InvalidInputException(
+				    "pipeline UDF stage identity mismatch for operator %s at node %llu: payload=%s expected=%s",
+				    identity, static_cast<unsigned long long>(node_id), pipeline_stage_id, stage_id);
+			}
+			if (bind_data->return_type != pipeline_bind_data->return_type ||
+			    bind_data->payload != pipeline_bind_data->payload ||
+			    bind_data->actor_handles != pipeline_bind_data->actor_handles) {
+				throw duckdb::InternalException(
+				    "physical/pipeline UDF descriptor mismatch for operator %s at node %llu", identity,
+				    static_cast<unsigned long long>(node_id));
+			}
+			auto annotated_payload = UDFPayloadWithStringField(bind_data->payload, "query_id", query_id);
+			annotated_payload = UDFPayloadWithStringField(annotated_payload, "stage_id", stage_id);
+			auto annotation_index = pending_annotations.size();
+			pending_annotations.push_back(PendingUDFStageAnnotation {bind_data, std::move(annotated_payload)});
+			if (!udf_by_node.emplace(node_id, annotation_index).second) {
+				throw duckdb::InternalException("duplicate pipeline UDF node identity: %llu",
+				                                static_cast<unsigned long long>(node_id));
+			}
 		}
 
 		duckdb::ClientProperties client_properties;
@@ -436,7 +597,7 @@ struct PyPhysicalPlanWrapper {
 			if (udf_entry == udf_by_node.end()) {
 				metadata[py::str("udf_payload")] = py::none();
 			} else {
-				auto &payload = udf_entry->second->payload;
+				auto &payload = pending_annotations[udf_entry->second].payload;
 				metadata[py::str("udf_payload")] = PythonObject::FromValue(payload, payload.type(), client_properties);
 			}
 			nodes.append(std::move(metadata));
@@ -448,6 +609,10 @@ struct PyPhysicalPlanWrapper {
 		py::list terminals;
 		terminals.append(py::str(std::to_string(pipeline_root->node_id())));
 		result[py::str("terminal_node_ids")] = std::move(terminals);
+		for (auto &pending : pending_annotations) {
+			pending.bind_data->payload = std::move(pending.payload);
+		}
+		identity_rollback.Commit();
 		return result;
 	}
 

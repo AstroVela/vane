@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import pickle
 import uuid
 
 import pytest
@@ -145,5 +146,105 @@ def test_stage_collection_preserves_distinct_stage_identity_for_nested_udfs(tmp_
         for stage_id, node in metadata_by_stage.items():
             assert stage_id.endswith(f":node:{node['node_id']}:udf")
             assert replay_by_stage[stage_id]["payload"]["execution_backend"] == node["udf_payload"]["execution_backend"]
+    finally:
+        con.close()
+
+
+def test_stage_collection_pairs_reordered_branch_udfs_by_stable_identity(monkeypatch, tmp_path):
+    pytest.importorskip("pyarrow")
+    import pyarrow as pa
+
+    def left_udf(table):
+        return pa.table({"id": table.column("id"), "left_value": table.column("left_value")})
+
+    def right_udf(table):
+        return pa.table({"id": table.column("id"), "right_value": table.column("right_value")})
+
+    monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "broadcast_right")
+    left_path = tmp_path / "left.parquet"
+    right_path = tmp_path / "right.parquet"
+    con = duckdb.connect()
+    try:
+        con.execute(
+            f"COPY (SELECT i::BIGINT AS id, (i + 10)::BIGINT AS left_value FROM range(8) tbl(i)) "
+            f"TO '{left_path}' (FORMAT PARQUET)"
+        )
+        con.execute(
+            f"COPY (SELECT i::BIGINT AS id, (i + 20)::BIGINT AS right_value FROM range(8) tbl(i)) "
+            f"TO '{right_path}' (FORMAT PARQUET)"
+        )
+        left = (
+            con.read_parquet(str(left_path))
+            .map_batches(
+                left_udf,
+                schema={"id": duckdb.sqltypes.BIGINT, "left_value": duckdb.sqltypes.BIGINT},
+                execution_backend="ray_task",
+                cpus=1.0,
+                memory_bytes=1 << 30,
+                streaming_breaker=False,
+            )
+            .set_alias("l")
+        )
+        right = (
+            con.read_parquet(str(right_path))
+            .map_batches(
+                right_udf,
+                schema={"id": duckdb.sqltypes.BIGINT, "right_value": duckdb.sqltypes.BIGINT},
+                execution_backend="ray_task",
+                cpus=3.0,
+                memory_bytes=3 << 30,
+                streaming_breaker=False,
+            )
+            .set_alias("r")
+        )
+        relation = left.join(right, "l.id = r.id").project("l.id, l.left_value, r.right_value")
+        plan = _physical_plan(relation, con, "graph-branch-udfs")
+
+        metadata = plan.collect_execution_stages(conn=con)
+        assert metadata == plan.collect_execution_stages(conn=con)
+        assert "Swapped: true" in plan.repr_ascii(False)
+
+        udf_nodes = [node for node in metadata["nodes"] if node["udf_payload"] is not None]
+        by_name = {node["udf_payload"]["udf_name"].rsplit(".", 1)[-1]: node for node in udf_nodes}
+        assert by_name.keys() == {"left_udf", "right_udf"}
+        left_node = by_name["left_udf"]
+        right_node = by_name["right_udf"]
+
+        # Physical translation assigns the left branch first even though the
+        # broadcast pipeline exposes the right branch first.
+        assert int(left_node["node_id"]) < int(right_node["node_id"])
+        assert left_node["udf_payload"]["cpus"] == 1.0
+        assert right_node["udf_payload"]["cpus"] == 3.0
+        assert left_node["udf_payload"]["memory_bytes"] == 1 << 30
+        assert right_node["udf_payload"]["memory_bytes"] == 3 << 30
+        assert left_node["udf_payload"]["stage_id"].endswith(f":node:{left_node['node_id']}:udf")
+        assert right_node["udf_payload"]["stage_id"].endswith(f":node:{right_node['node_id']}:udf")
+        assert left_node["udf_payload"]["_vane_udf_operator_id"] != right_node["udf_payload"]["_vane_udf_operator_id"]
+
+        replay_by_name = {
+            node["payload"]["udf_name"].rsplit(".", 1)[-1]: node for node in plan.collect_udf_nodes(conn=con)
+        }
+        assert replay_by_name["left_udf"]["payload"]["stage_id"] == left_node["udf_payload"]["stage_id"]
+        assert replay_by_name["right_udf"]["payload"]["stage_id"] == right_node["udf_payload"]["stage_id"]
+
+        graph = build_query_execution_graph(metadata, env={})
+        left_stage = graph.stage_by_id(left_node["udf_payload"]["stage_id"])
+        right_stage = graph.stage_by_id(right_node["udf_payload"]["stage_id"])
+        assert left_stage.per_task.cpu == 1.0
+        assert right_stage.per_task.cpu == 3.0
+        assert left_stage.per_task.heap_bytes == 1 << 30
+        assert right_stage.per_task.heap_bytes == 3 << 30
+
+        operator_ids = [
+            left_node["udf_payload"]["_vane_udf_operator_id"],
+            right_node["udf_payload"]["_vane_udf_operator_id"],
+        ]
+        serialized_plan = pickle.dumps(plan)
+        assert all(serialized_plan.count(operator_id.encode()) == 1 for operator_id in operator_ids)
+        corrupted_plan = pickle.loads(
+            serialized_plan.replace(operator_ids[1].encode(), operator_ids[0].encode())
+        ).clone(con)
+        with pytest.raises(duckdb.InvalidInputException, match="duplicate physical UDF operator identity"):
+            corrupted_plan.collect_execution_stages(conn=con)
     finally:
         con.close()
