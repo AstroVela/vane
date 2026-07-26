@@ -34,6 +34,11 @@ static Value EvaluateConstant(ClientContext &context, Expression &arg) {
 	return ExpressionExecutor::EvaluateScalar(context, arg);
 }
 
+static bool IsFoldableNull(ClientContext &context, const Expression &arg) {
+	Value value;
+	return arg.IsFoldable() && ExpressionExecutor::TryEvaluateScalar(context, arg, value) && value.IsNull();
+}
+
 static vector<string> ParseInputNames(const py::object &input_names) {
 	if (!py::isinstance<py::list>(input_names) && !py::isinstance<py::tuple>(input_names)) {
 		throw BinderException("ai SQL helper returned invalid input_names");
@@ -137,6 +142,12 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	    arguments[1]->return_type.id() != LogicalTypeId::SQLNULL) {
 		throw BinderException("ai_prompt image argument must be BLOB or BLOB[]");
 	}
+	if (image_input && IsFoldableNull(context, *arguments[0])) {
+		auto return_type = LogicalType::VARCHAR;
+		bound_function.SetReturnType(return_type);
+		// A NULL payload is a local bind-state marker consumed by the image lowerer.
+		return make_uniq<UDFFunctionData>(Value(LogicalType::SQLNULL), std::move(return_type));
+	}
 
 	Value payload;
 	{
@@ -169,15 +180,12 @@ static void AISQLExecute(DataChunk &, ExpressionState &, Vector &) {
 }
 
 static unique_ptr<Expression> LowerAISQLImageExpressionUDF(FunctionBindExpressionInput &input) {
-	if (!input.children.empty() && input.children[0]->IsFoldable()) {
-		Value prompt;
-		if (ExpressionExecutor::TryEvaluateScalar(input.context, *input.children[0], prompt) && prompt.IsNull()) {
-			if (!input.bind_data) {
-				throw BinderException("registered expression UDF is missing bind payload");
-			}
-			auto &registered_data = input.bind_data->Cast<UDFFunctionData>();
-			return make_uniq<BoundConstantExpression>(Value(registered_data.return_type));
-		}
+	if (!input.bind_data) {
+		throw BinderException("registered expression UDF is missing bind payload");
+	}
+	auto &registered_data = input.bind_data->Cast<UDFFunctionData>();
+	if (registered_data.payload.IsNull()) {
+		return make_uniq<BoundConstantExpression>(Value(registered_data.return_type));
 	}
 	return LowerRegisteredExpressionUDFPreservingFoldableNulls(input);
 }

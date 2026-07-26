@@ -507,7 +507,14 @@ def test_ai_sql_text_signatures_preserve_legacy_null_propagation(monkeypatch, ex
 
 
 @pytest.mark.parametrize("null_prompt", ["NULL", "NULL::VARCHAR"])
-def test_ai_prompt_image_input_propagates_literal_null_prompt(null_prompt):
+def test_ai_prompt_image_input_propagates_literal_null_prompt(monkeypatch, null_prompt):
+    provider_calls = []
+
+    def recording_provider(name=None, **options):
+        provider_calls.append((name, options))
+        return MockProvider()
+
+    monkeypatch.setitem(provider_registry.PROVIDERS, "mock_ai_sql", recording_provider)
     conn = vane.connect()
 
     relation = conn.sql(f"""
@@ -518,13 +525,48 @@ def test_ai_prompt_image_input_propagates_literal_null_prompt(null_prompt):
         ) AS response
     """)
 
+    assert provider_calls == []
     assert [str(dtype) for dtype in relation.types] == ["VARCHAR"]
     assert relation.fetchall() == [(None,)]
+    assert provider_calls == []
 
     _, target, physical, _ = _round_trip_ai_plan(relation)
     assert physical.collect_udf_nodes() == []
     table = _execute_ai_physical_plan(target, physical)
     assert table.column(0).to_pylist() == [None]
+    assert provider_calls == []
+
+
+def test_ai_prompt_literal_null_prompt_skips_invalid_provider():
+    conn = vane.connect()
+
+    relation = conn.sql("""
+        SELECT ai_prompt(
+            NULL,
+            from_hex('89504e47'),
+            struct_pack(provider := 'does_not_exist')
+        ) AS response
+    """)
+
+    assert [str(dtype) for dtype in relation.types] == ["VARCHAR"]
+    assert relation.fetchall() == [(None,)]
+
+
+def test_ai_prompt_literal_null_prompt_skips_nonconstant_options():
+    conn = vane.connect()
+
+    rows = conn.sql("""
+        SELECT ai_prompt(
+            NULL,
+            image,
+            struct_pack(provider := provider_name)
+        ) AS response
+        FROM (
+            VALUES (from_hex('89504e47'), 'does_not_exist')
+        ) AS t(image, provider_name)
+    """).fetchall()
+
+    assert rows == [(None,)]
 
 
 @pytest.mark.parametrize("null_image", ["NULL", "NULL::BLOB", "NULL::BLOB[]"])
