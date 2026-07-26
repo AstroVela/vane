@@ -68,6 +68,46 @@ class CopyPlanOutcome:
     final_progress_snapshot: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class _PreparedQueryResourceRegistration:
+    """Immutable registration input prepared away from the actor owner loop."""
+
+    graph: Any
+    node_capacities: tuple[Any, ...]
+    capacity_snapshot_started_at: float
+
+
+@dataclass(frozen=True)
+class _DeferredQueryAllocationTeardown:
+    """Generation-fenced fragment teardown discovered during a local commit."""
+
+    query_id: str
+    generation: int
+    reason: str
+
+
+class _PlanStartupOwnership:
+    """Hand registered resources to exactly one startup or cancellation path."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._owner = "caller"
+
+    def claim_for_worker(self) -> bool:
+        with self._lock:
+            if self._owner != "caller":
+                return False
+            self._owner = "worker"
+            return True
+
+    def cancel_before_worker_claim(self) -> bool:
+        with self._lock:
+            if self._owner != "caller":
+                return False
+            self._owner = "cancelled"
+            return True
+
+
 def _progress_topology_init_timeout_s() -> float:
     value = float(
         os.environ.get(
@@ -900,6 +940,12 @@ class RayQueryDriverActor:
         self._query_graphs: dict[str, Any] = {}
         self._query_allocations: dict[str, Any] = {}
         self._query_node_capacities: tuple[Any, ...] = ()
+        self._query_allocation_teardowns_pending: dict[
+            str,
+            _DeferredQueryAllocationTeardown,
+        ] = {}
+        self._query_allocation_teardowns_claimed: set[str] = set()
+        self._query_allocation_teardown_futures: set[asyncio.Future[Any]] = set()
         self._query_task_lease_requests: dict[str, dict[str, Any]] = {}
         self._query_output_lease_requests: dict[str, dict[str, Any]] = {}
         self._query_task_lease_request_tombstones = BoundedReplayMap[str, dict[str, Any]](
@@ -1217,6 +1263,10 @@ class RayQueryDriverActor:
                 self._driver_shutdown_started = True
                 plan_runner = self.plan_runner
             await self.stop_query_resource_maintenance()
+            self._ensure_query_allocation_teardown_state()
+            teardown_futures = tuple(self._query_allocation_teardown_futures)
+            if teardown_futures:
+                await asyncio.gather(*teardown_futures, return_exceptions=True)
             if plan_runner is not None:
                 await asyncio.to_thread(plan_runner.shutdown)
             self._driver_shutdown_complete = True
@@ -1262,12 +1312,29 @@ class RayQueryDriverActor:
             heartbeat_timeout_s=heartbeat_timeout,
         )
 
-    def _synchronize_query_allocations(self) -> None:
+    def _ensure_query_allocation_teardown_state(self) -> None:
+        if not hasattr(self, "_query_allocation_teardowns_pending"):
+            self._query_allocation_teardowns_pending = {}
+        if not hasattr(self, "_query_allocation_teardowns_claimed"):
+            self._query_allocation_teardowns_claimed = set()
+        if not hasattr(self, "_query_allocation_teardown_futures"):
+            self._query_allocation_teardown_futures = set()
+
+    def _synchronize_query_allocations(
+        self,
+    ) -> tuple[_DeferredQueryAllocationTeardown, ...]:
+        """Commit local allocation state and return teardown work.
+
+        The caller owns ``_query_resource_lock``. Returned work may perform
+        remote calls and must run only after that lock is released.
+        """
         from duckdb.runners.ray.query_execution_graph import QueryAllocation
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
+        self._ensure_query_allocation_teardown_state()
         snapshot = self._query_resource_coordinator.snapshot()
         coordinator_queries = snapshot["queries"]
+        deferred_teardowns = dict(self._query_allocation_teardowns_pending)
         terminal_errors = getattr(self, "_query_terminal_errors", None)
         if terminal_errors is None:
             terminal_errors = {}
@@ -1301,24 +1368,93 @@ class RayQueryDriverActor:
                     )
                     terminal_errors[query_id] = reason
                     manager.cancel("ray_actor_placement_lost")
-                    try:
-                        self._drop_query_fragments_after_admission_fence_sync(
-                            query_id,
-                            release_resources=False,
-                        )
-                    except BaseException as exc:
-                        terminal_errors[query_id] = (
-                            f"{reason}; fragment cancellation failed: {type(exc).__name__}: {exc}"
-                        )
+                    teardown = _DeferredQueryAllocationTeardown(
+                        query_id=query_id,
+                        generation=allocation.generation,
+                        reason=reason,
+                    )
+                    self._query_allocation_teardowns_pending[query_id] = teardown
+                    deferred_teardowns[query_id] = teardown
+        return tuple(deferred_teardowns[query_id] for query_id in sorted(deferred_teardowns))
 
-    def _refresh_query_capacity(self) -> Any:
-        capacities = self._read_query_node_capacities()
+    def _run_query_allocation_teardowns(
+        self,
+        teardowns: tuple[_DeferredQueryAllocationTeardown, ...],
+    ) -> None:
+        """Run remote fragment teardown after releasing resource-state locks."""
+        self._ensure_query_allocation_teardown_state()
+        for teardown in teardowns:
+            query_id = teardown.query_id
+            with self._query_resource_lock:
+                if self._query_allocation_teardowns_pending.get(query_id) != teardown:
+                    continue
+                if query_id in self._query_allocation_teardowns_claimed:
+                    continue
+                self._query_allocation_teardowns_claimed.add(query_id)
+            succeeded = False
+            try:
+                self._drop_query_fragments_after_admission_fence_sync(
+                    query_id,
+                    release_resources=False,
+                )
+                succeeded = True
+            except BaseException as exc:
+                with self._query_resource_lock:
+                    if (
+                        self._query_allocation_teardowns_pending.get(query_id) == teardown
+                        and query_id in self._query_graphs
+                    ):
+                        self._query_terminal_errors[query_id] = (
+                            f"{teardown.reason}; fragment cancellation failed: {type(exc).__name__}: {exc}"
+                        )
+            finally:
+                with self._query_resource_lock:
+                    self._query_allocation_teardowns_claimed.discard(query_id)
+                    if succeeded and self._query_allocation_teardowns_pending.get(query_id) == teardown:
+                        self._query_allocation_teardowns_pending.pop(query_id, None)
+
+    def _schedule_query_allocation_teardowns(
+        self,
+        teardowns: tuple[_DeferredQueryAllocationTeardown, ...],
+    ) -> None:
+        """Submit teardown work without adding a post-commit cancellation point."""
+        if not teardowns:
+            return
+        self._ensure_query_allocation_teardown_state()
+        future = asyncio.get_running_loop().run_in_executor(
+            None,
+            self._run_query_allocation_teardowns,
+            teardowns,
+        )
+        self._query_allocation_teardown_futures.add(future)
+
+        def _retire(done: asyncio.Future[Any]) -> None:
+            self._query_allocation_teardown_futures.discard(done)
+            if not done.cancelled():
+                done.exception()
+
+        future.add_done_callback(_retire)
+
+    def _apply_query_capacity_snapshot(
+        self,
+        capacities: tuple[Any, ...],
+        *,
+        snapshot_started_at: float,
+    ) -> Any:
+        """Apply a complete GCS snapshot while the caller owns the state lock.
+
+        Request start time orders overlapping reads so a slow older request
+        cannot overwrite a later request that already committed.
+        """
         if not capacities:
             raise RuntimeError("Ray reports no alive nodes with schedulable query resources")
+        last_snapshot_started_at = float(getattr(self, "_query_resource_last_capacity_refresh_at", 0.0))
+        cached_capacities = tuple(getattr(self, "_query_node_capacities", ()))
+        if cached_capacities and float(snapshot_started_at) < last_snapshot_started_at:
+            return self._sum_node_capacity(cached_capacities)
         self._query_resource_coordinator.update_node_capacities(capacities)
         self._query_node_capacities = capacities
-        self._query_resource_last_capacity_refresh_at = time.monotonic()
-        self._synchronize_query_allocations()
+        self._query_resource_last_capacity_refresh_at = float(snapshot_started_at)
         return self._sum_node_capacity(capacities)
 
     @staticmethod
@@ -1353,46 +1489,55 @@ class RayQueryDriverActor:
                 capacities = self._read_query_node_capacities()
             except BaseException as exc:
                 capacity_error = exc
-                capacities = tuple(self._query_node_capacities)
+                capacities = ()
         capacities = tuple(capacities)
-        if not capacities:
-            if capacity_error is not None:
-                raise RuntimeError(
-                    f"failed to refresh Ray capacity and no cached snapshot exists: {capacity_error}"
-                ) from capacity_error
+        if capacity_error is None and not capacities:
             raise RuntimeError("Ray reports no alive nodes with schedulable query resources")
 
-        with self._query_resource_lock:
-            self._query_resource_coordinator.update_node_capacities(
-                capacities,
-                now=timestamp,
-            )
-            self._query_node_capacities = capacities
-            if capacity_error is None:
-                self._query_resource_last_capacity_refresh_at = timestamp
-            self._synchronize_query_allocations()
+        deferred_teardowns: list[_DeferredQueryAllocationTeardown] = []
+        try:
+            with self._query_resource_lock:
+                if capacity_error is None:
+                    self._apply_query_capacity_snapshot(
+                        capacities,
+                        snapshot_started_at=timestamp,
+                    )
+                else:
+                    cached_capacities = tuple(self._query_node_capacities)
+                    if not cached_capacities:
+                        raise RuntimeError(
+                            f"failed to refresh Ray capacity and no cached snapshot exists: {capacity_error}"
+                        ) from capacity_error
+                    self._query_resource_coordinator.update_node_capacities(
+                        cached_capacities,
+                        now=timestamp,
+                    )
+                deferred_teardowns.extend(self._synchronize_query_allocations())
 
-            observed_usage: dict[str, ResourceVector] = {}
-            generations: dict[str, int] = {}
-            for query_id in sorted(self._query_graphs):
-                manager = get_query_resource_manager(query_id)
-                observed_usage[query_id] = ResourceVector.from_dict(manager.snapshot()["usage"])
-                generations[query_id] = self._query_allocations[query_id].generation
-            self._query_resource_coordinator.refresh_queries(
-                observed_usage_by_query=observed_usage,
-                generations=generations,
-                now=timestamp,
-            )
-            expired = self._query_resource_coordinator.expire_queries(now=timestamp)
-            if expired:
-                raise RuntimeError("active query resource heartbeats expired unexpectedly: " + ", ".join(expired))
-            self._synchronize_query_allocations()
-            self._query_resource_last_maintenance_at = timestamp
-            return {
-                "query_count": len(observed_usage),
-                "capacity_cached": capacity_error is not None,
-                "capacity_error": "" if capacity_error is None else str(capacity_error),
-            }
+                observed_usage: dict[str, ResourceVector] = {}
+                generations: dict[str, int] = {}
+                for query_id in sorted(self._query_graphs):
+                    manager = get_query_resource_manager(query_id)
+                    observed_usage[query_id] = ResourceVector.from_dict(manager.snapshot()["usage"])
+                    generations[query_id] = self._query_allocations[query_id].generation
+                self._query_resource_coordinator.refresh_queries(
+                    observed_usage_by_query=observed_usage,
+                    generations=generations,
+                    now=timestamp,
+                )
+                expired = self._query_resource_coordinator.expire_queries(now=timestamp)
+                if expired:
+                    raise RuntimeError("active query resource heartbeats expired unexpectedly: " + ", ".join(expired))
+                deferred_teardowns.extend(self._synchronize_query_allocations())
+                self._query_resource_last_maintenance_at = timestamp
+                result = {
+                    "query_count": len(observed_usage),
+                    "capacity_cached": capacity_error is not None,
+                    "capacity_error": "" if capacity_error is None else str(capacity_error),
+                }
+        finally:
+            self._run_query_allocation_teardowns(tuple(deferred_teardowns))
+        return result
 
     def _start_query_resource_maintenance(self) -> None:
         task = self._query_resource_maintenance_task
@@ -2558,26 +2703,91 @@ class RayQueryDriverActor:
         self._run_query_resource_admission_pumps(query_id)
         return {"cancelled": True, "released": bool(released)}
 
-    def _register_query_resources(self, plan: Any) -> tuple[Any, Any]:
+    def _prepare_query_resource_registration(
+        self,
+        plan: Any,
+        expected_plan_id: str | None = None,
+    ) -> _PreparedQueryResourceRegistration:
         from duckdb.runners.ray.query_graph_builder import (
-            build_query_demand,
             build_query_execution_graph,
-        )
-        from duckdb.runners.ray.query_resource_runtime import (
-            register_query_graph,
-            release_query_resource_manager,
         )
 
         metadata = plan.collect_execution_stages(conn=self._duckdb_conn)
         graph = build_query_execution_graph(metadata)
         plan_id = str(plan.idx())
+        if expected_plan_id is not None and plan_id != expected_plan_id:
+            raise ValueError(
+                f"physical plan query_id changed during registration: "
+                f"prepared={expected_plan_id!r} registration={plan_id!r}"
+            )
         if graph.query_id != plan_id:
             raise ValueError(f"execution graph query_id mismatch: graph={graph.query_id!r} plan={plan_id!r}")
+        capacity_snapshot_started_at = time.monotonic()
+        capacities = self._read_query_node_capacities()
+        if not capacities:
+            raise RuntimeError("Ray reports no alive nodes with schedulable query resources")
+        return _PreparedQueryResourceRegistration(
+            graph=graph,
+            node_capacities=tuple(capacities),
+            capacity_snapshot_started_at=capacity_snapshot_started_at,
+        )
 
+    async def _register_query_resources(
+        self,
+        plan: Any,
+        *,
+        expected_plan_id: str | None = None,
+    ) -> tuple[Any, Any]:
+        """Prepare registration off-loop, then atomically publish local state."""
+        self._ensure_query_resource_admission_state()
+        owner_loop = self._query_resource_admission_loop
+        running_loop = asyncio.get_running_loop()
+        if owner_loop is None:
+            self._query_resource_admission_loop = running_loop
+        elif owner_loop is not running_loop:
+            raise RuntimeError("query resource registration must run on the admission owner loop")
+
+        prepared = await asyncio.to_thread(
+            self._prepare_query_resource_registration,
+            plan,
+            expected_plan_id,
+        )
+        deferred_teardowns: list[_DeferredQueryAllocationTeardown] = []
+        try:
+            result = self._commit_query_resource_registration(
+                prepared,
+                deferred_teardowns=deferred_teardowns,
+            )
+        finally:
+            self._schedule_query_allocation_teardowns(
+                tuple(deferred_teardowns),
+            )
+        return result
+
+    def _commit_query_resource_registration(
+        self,
+        prepared: _PreparedQueryResourceRegistration,
+        *,
+        deferred_teardowns: list[_DeferredQueryAllocationTeardown],
+    ) -> tuple[Any, Any]:
+        from duckdb.runners.ray.query_graph_builder import build_query_demand
+        from duckdb.runners.ray.query_resource_runtime import (
+            register_query_graph,
+            release_query_resource_manager,
+        )
+
+        graph = prepared.graph
         with self._query_resource_lock:
             if graph.query_id in self._query_graphs:
                 raise ValueError(f"query graph is already registered: {graph.query_id}")
-            cluster_capacity = self._refresh_query_capacity()
+            self._ensure_query_allocation_teardown_state()
+            if graph.query_id in self._query_allocation_teardowns_pending:
+                raise RuntimeError(f"query {graph.query_id} still has a pending allocation-loss teardown")
+            cluster_capacity = self._apply_query_capacity_snapshot(
+                prepared.node_capacities,
+                snapshot_started_at=prepared.capacity_snapshot_started_at,
+            )
+            deferred_teardowns.extend(self._synchronize_query_allocations())
             demand = build_query_demand(
                 graph,
                 cluster_capacity,
@@ -2585,7 +2795,7 @@ class RayQueryDriverActor:
             allocation = self._query_resource_coordinator.register_query(demand)
             manager_registered = False
             try:
-                self._synchronize_query_allocations()
+                deferred_teardowns.extend(self._synchronize_query_allocations())
                 manager = register_query_graph(
                     graph,
                     allocation,
@@ -2601,9 +2811,7 @@ class RayQueryDriverActor:
                     )
                 self._query_graphs[graph.query_id] = graph
                 self._query_allocations[graph.query_id] = allocation
-                self._run_on_query_resource_admission_loop_sync(
-                    lambda: self._open_query_resource_admission(graph.query_id)
-                )
+                self._open_query_resource_admission(graph.query_id)
                 return graph, allocation
             except BaseException as registration_error:
                 cleanup_errors: list[BaseException] = []
@@ -2629,7 +2837,7 @@ class RayQueryDriverActor:
                 except BaseException as exc:
                     cleanup_errors.append(exc)
                 try:
-                    self._synchronize_query_allocations()
+                    deferred_teardowns.extend(self._synchronize_query_allocations())
                 except BaseException as exc:
                     cleanup_errors.append(exc)
                 if cleanup_errors:
@@ -2697,33 +2905,37 @@ class RayQueryDriverActor:
                     f"failed to fence query resource release for {query_key}: {type(exc).__name__}: {exc}"
                 ) from exc
         cleanup_errors: list[BaseException] = []
-        with self._query_resource_lock:
-            allocation = self._query_allocations.get(query_key)
-            try:
-                release_query_resource_manager(query_key, reason=reason)
-            except BaseException as exc:
-                cleanup_errors.append(exc)
-            if allocation is not None:
+        deferred_teardowns: tuple[_DeferredQueryAllocationTeardown, ...] = ()
+        try:
+            with self._query_resource_lock:
+                allocation = self._query_allocations.get(query_key)
                 try:
-                    released = self._query_resource_coordinator.release_query(
-                        query_key,
-                        allocation.generation,
-                    )
-                    if not released:
-                        cleanup_errors.append(
-                            RuntimeError(
-                                f"coordinator allocation was already absent for query {query_key} "
-                                f"at generation {allocation.generation}"
-                            )
-                        )
+                    release_query_resource_manager(query_key, reason=reason)
                 except BaseException as exc:
                     cleanup_errors.append(exc)
-            self._query_graphs.pop(query_key, None)
-            self._query_allocations.pop(query_key, None)
-            try:
-                self._synchronize_query_allocations()
-            except BaseException as exc:
-                cleanup_errors.append(exc)
+                if allocation is not None:
+                    try:
+                        released = self._query_resource_coordinator.release_query(
+                            query_key,
+                            allocation.generation,
+                        )
+                        if not released:
+                            cleanup_errors.append(
+                                RuntimeError(
+                                    f"coordinator allocation was already absent for query {query_key} "
+                                    f"at generation {allocation.generation}"
+                                )
+                            )
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+                self._query_graphs.pop(query_key, None)
+                self._query_allocations.pop(query_key, None)
+                try:
+                    deferred_teardowns = self._synchronize_query_allocations()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+        finally:
+            self._run_query_allocation_teardowns(deferred_teardowns)
         if cleanup_errors:
             raise RuntimeError(
                 f"query resource cleanup for {query_key} had "
@@ -2973,13 +3185,65 @@ class RayQueryDriverActor:
     ) -> None:
         """Run a plan without blocking the driver actor's control event loop."""
         _set_global_event_loop(asyncio.get_running_loop())
-        await asyncio.to_thread(self._run_plan_sync, plan)
+        plan, plan_id = await asyncio.to_thread(self._prepare_plan_sync, plan)
+        graph, allocation = await self._register_query_resources(
+            plan,
+            expected_plan_id=plan_id,
+        )
+        startup_ownership = _PlanStartupOwnership()
+        startup = asyncio.create_task(
+            asyncio.to_thread(
+                self._run_plan_sync_with_ownership,
+                plan,
+                plan_id,
+                graph,
+                allocation,
+                startup_ownership,
+            ),
+            name=f"vane-plan-startup:{plan_id}",
+        )
+        try:
+            await asyncio.shield(startup)
+        except asyncio.CancelledError as cancellation_error:
+            if startup_ownership.cancel_before_worker_claim():
+                startup.cancel()
+                await asyncio.gather(startup, return_exceptions=True)
+                try:
+                    await asyncio.to_thread(
+                        self._teardown_plan_resources,
+                        plan_id,
+                        str(graph.query_id),
+                        drop_fragments=False,
+                    )
+                except BaseException as teardown_error:
+                    raise RuntimeError(
+                        f"query plan {plan_id} was cancelled before startup and teardown failed: "
+                        f"{type(teardown_error).__name__}: {teardown_error}"
+                    ) from teardown_error
+            else:
+                try:
+                    await asyncio.shield(startup)
+                except BaseException as startup_error:
+                    raise startup_error from cancellation_error
+                try:
+                    await asyncio.to_thread(
+                        self._teardown_plan_resources,
+                        plan_id,
+                        str(graph.query_id),
+                        drop_fragments=True,
+                    )
+                except BaseException as teardown_error:
+                    raise RuntimeError(
+                        f"query plan {plan_id} was cancelled during startup and teardown failed: "
+                        f"{type(teardown_error).__name__}: {teardown_error}"
+                    ) from teardown_error
+            raise
 
-    def _run_plan_sync(
+    def _prepare_plan_sync(
         self,
         plan: duckdb.ray_cxx.PyLogicalPlan,
-    ) -> None:
-        """Blocking plan startup executed by ``run_plan`` on an owned worker thread."""
+    ) -> tuple[Any, str]:
+        """Prepare a physical plan on an owned worker thread."""
         _apply_env_overrides(self._env_overrides)
 
         if os.environ.get("VANE_WORKER") == "1":
@@ -2990,12 +3254,19 @@ class RayQueryDriverActor:
 
         self._ensure_duckdb_conn()
 
-        plan = plan.to_physical_plan(self._duckdb_conn)
-        graph = None
-        plan_id = str(plan.idx())
+        physical_plan = plan.to_physical_plan(self._duckdb_conn)
+        return physical_plan, str(physical_plan.idx())
+
+    def _run_plan_sync(
+        self,
+        plan: Any,
+        plan_id: str,
+        graph: Any,
+        allocation: Any,
+    ) -> None:
+        """Start an already registered streaming plan on a worker thread."""
         plan_runner_started = False
         try:
-            graph, allocation = self._register_query_resources(plan)
             udf_actors = self._precreate_udf_actors(plan, graph, allocation)
             if udf_actors:
                 self._active_udf_actors_by_plan[plan_id] = list(udf_actors)
@@ -3028,6 +3299,24 @@ class RayQueryDriverActor:
                 ) from start_error
             raise
 
+    def _run_plan_sync_with_ownership(
+        self,
+        plan: Any,
+        plan_id: str,
+        graph: Any,
+        allocation: Any,
+        startup_ownership: _PlanStartupOwnership,
+    ) -> None:
+        """Start only after atomically claiming the registered resources."""
+        if not startup_ownership.claim_for_worker():
+            return
+        self._run_plan_sync(
+            plan,
+            plan_id,
+            graph,
+            allocation,
+        )
+
     async def run_copy_plan(
         self,
         plan: Any,
@@ -3044,7 +3333,10 @@ class RayQueryDriverActor:
         plan_execution: asyncio.Task[Any] | None = None
         startup_tasks: list[asyncio.Task[Any]] = []
         try:
-            graph, allocation = self._register_query_resources(plan)
+            graph, allocation = await self._register_query_resources(
+                plan,
+                expected_plan_id=plan_id,
+            )
             udf_actors = await asyncio.to_thread(
                 self._precreate_udf_actors,
                 plan,

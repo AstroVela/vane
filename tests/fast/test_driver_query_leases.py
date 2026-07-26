@@ -942,7 +942,7 @@ def test_query_teardown_cleans_local_state_when_coordinator_lease_expired():
         runner._query_resource_coordinator = coordinator
         runner._query_graphs = {query_id: graph}
         runner._query_allocations = {query_id: allocation}
-        runner._synchronize_query_allocations = lambda: None
+        runner._synchronize_query_allocations = lambda: ()
 
         with pytest.raises(
             RuntimeError,
@@ -991,7 +991,7 @@ def test_fragment_drop_waits_for_fte_admission_pump_before_registry_drop(monkeyp
         runner._query_resource_coordinator = _CoordinatorStub()
         runner._query_graphs = {query_id: graph}
         runner._query_allocations = {query_id: allocation}
-        runner._synchronize_query_allocations = lambda: None
+        runner._synchronize_query_allocations = lambda: ()
 
         drain_entered = threading.Event()
         release_drain = threading.Event()
@@ -1070,7 +1070,7 @@ def test_fragment_drop_keeps_query_resources_when_local_fte_registry_cannot_quie
         runner._query_resource_coordinator = coordinator
         runner._query_graphs = {query_id: graph}
         runner._query_allocations = {query_id: allocation}
-        runner._synchronize_query_allocations = lambda: None
+        runner._synchronize_query_allocations = lambda: ()
         runner._get_plan_runner = lambda: SimpleNamespace(
             drop_query_fragments=lambda _query_id: None,
         )
@@ -1122,7 +1122,7 @@ def test_fragment_drop_retains_query_owner_while_remote_teardown_is_incomplete(m
         runner._query_resource_coordinator = coordinator
         runner._query_graphs = {query_id: graph}
         runner._query_allocations = {query_id: allocation}
-        runner._synchronize_query_allocations = lambda: None
+        runner._synchronize_query_allocations = lambda: ()
         runner._fence_query_resource_admission_for_teardown = lambda _query_id: None
 
         class _PlanRunner:
@@ -1268,6 +1268,9 @@ def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
     released: list[tuple[str, int]] = []
 
     class _Coordinator:
+        def update_node_capacities(self, _capacities):
+            return None
+
         def register_query(self, demand):
             assert demand == "demand"
             return allocation
@@ -1296,20 +1299,21 @@ def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
     runner._query_graphs = {}
     runner._query_allocations = {}
     runner._query_resource_coordinator = _Coordinator()
-    runner._refresh_query_capacity = lambda: ResourceVector(cpu=1, heap_bytes=101, object_store_bytes=20)
-    runner._synchronize_query_allocations = lambda: None
+    capacity = ResourceVector(cpu=1, heap_bytes=101, object_store_bytes=20)
+    runner._read_query_node_capacities = lambda: (SimpleNamespace(resources=capacity),)
+    runner._synchronize_query_allocations = lambda: ()
 
-    def fail_open(_callback):
+    def fail_open(_query_id):
         raise RuntimeError("injected owner-loop open failure")
 
-    runner._run_on_query_resource_admission_loop_sync = fail_open
+    runner._open_query_resource_admission = fail_open
     plan = SimpleNamespace(
         collect_execution_stages=lambda conn: object(),
         idx=lambda: query_id,
     )
 
     with pytest.raises(RuntimeError, match="injected owner-loop open failure"):
-        runner_cls._register_query_resources(runner, plan)
+        asyncio.run(runner_cls._register_query_resources(runner, plan))
 
     with pytest.raises(KeyError):
         get_query_resource_manager(query_id)

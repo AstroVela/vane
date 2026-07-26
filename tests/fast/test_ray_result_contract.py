@@ -156,6 +156,14 @@ def _make_local_query_driver_actor():
     return cls, runner
 
 
+def _query_registration_stub(query_id: str):
+    async def _register(_self, _plan, *, expected_plan_id=None):
+        del expected_plan_id
+        return SimpleNamespace(query_id=query_id, stages=()), object()
+
+    return _register
+
+
 def test_driver_env_override_applies_duckdb_execution_width(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     statements = []
@@ -281,7 +289,7 @@ def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(mon
     monkeypatch.setattr(
         cls,
         "_register_query_resources",
-        lambda _self, _plan: (SimpleNamespace(query_id="copy-plan", stages=()), object()),
+        _query_registration_stub("copy-plan"),
     )
     monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda _self, _graph: None)
     monkeypatch.setattr(
@@ -324,10 +332,7 @@ def test_query_driver_run_copy_plan_surfaces_terminal_actor_placement_loss(monke
     monkeypatch.setattr(
         cls,
         "_register_query_resources",
-        lambda _self, _plan: (
-            SimpleNamespace(query_id="copy-query-terminal", stages=()),
-            object(),
-        ),
+        _query_registration_stub("copy-query-terminal"),
     )
     monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
 
@@ -360,10 +365,7 @@ def test_query_driver_copy_progress_contract_failure_still_tears_down(monkeypatc
     monkeypatch.setattr(
         cls,
         "_register_query_resources",
-        lambda _self, _plan: (
-            SimpleNamespace(query_id="copy-progress-contract-failure", stages=()),
-            object(),
-        ),
+        _query_registration_stub("copy-progress-contract-failure"),
     )
     monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
     monkeypatch.setattr(
@@ -428,10 +430,7 @@ def test_query_driver_copy_opens_actor_stage_after_topology_and_actor_barriers(m
     monkeypatch.setattr(
         cls,
         "_register_query_resources",
-        lambda _self, _plan: (
-            SimpleNamespace(query_id="copy-startup-order", stages=()),
-            object(),
-        ),
+        _query_registration_stub("copy-startup-order"),
     )
     monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", mark_actor_stages)
     monkeypatch.setattr(cls, "_teardown_plan_resources", lambda *_args, **_kwargs: None)
@@ -489,13 +488,7 @@ def test_query_driver_copy_accepts_plan_success_before_startup_barriers(monkeypa
     monkeypatch.setattr(
         cls,
         "_register_query_resources",
-        lambda _self, _plan: (
-            SimpleNamespace(
-                query_id="copy-plan-before-startup-barriers",
-                stages=(),
-            ),
-            object(),
-        ),
+        _query_registration_stub("copy-plan-before-startup-barriers"),
     )
     monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", mark_actor_stages)
     monkeypatch.setattr(cls, "_teardown_plan_resources", lambda *_args, **_kwargs: None)
@@ -545,10 +538,7 @@ def test_query_driver_copy_plan_failure_interrupts_startup_barriers(monkeypatch)
     monkeypatch.setattr(
         cls,
         "_register_query_resources",
-        lambda _self, _plan: (
-            SimpleNamespace(query_id="copy-plan-startup-failure", stages=()),
-            object(),
-        ),
+        _query_registration_stub("copy-plan-startup-failure"),
     )
     monkeypatch.setattr(
         cls,
@@ -612,13 +602,7 @@ def test_query_driver_copy_startup_barrier_failure_tears_down_plan(
     monkeypatch.setattr(
         cls,
         "_register_query_resources",
-        lambda _self, _plan: (
-            SimpleNamespace(
-                query_id=f"copy-{failing_barrier}-barrier-failure",
-                stages=(),
-            ),
-            object(),
-        ),
+        _query_registration_stub(f"copy-{failing_barrier}-barrier-failure"),
     )
     monkeypatch.setattr(
         cls,
@@ -808,7 +792,7 @@ def test_query_driver_run_plan_passes_distributed_physical_plan_wrapper(monkeypa
     monkeypatch.setattr(
         cls,
         "_register_query_resources",
-        lambda _self, _plan: (SimpleNamespace(query_id="stream-plan", stages=()), object()),
+        _query_registration_stub("stream-plan"),
     )
     monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda _self, _graph: None)
     monkeypatch.setattr(
@@ -850,10 +834,7 @@ def test_query_driver_run_plan_start_failure_runs_complete_teardown(monkeypatch)
     monkeypatch.setattr(
         cls,
         "_register_query_resources",
-        lambda _self, _plan: (
-            SimpleNamespace(query_id="failed-query", stages=()),
-            object(),
-        ),
+        _query_registration_stub("failed-query"),
     )
     monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", _cleanup_udf_actors)
