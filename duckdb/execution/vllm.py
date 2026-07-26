@@ -517,7 +517,10 @@ class RayLocalVLLMExecutor(LocalVLLMExecutor):
 
 class RemoteVLLMExecutor(VLLMExecutor):
     def __init__(self, llm_actors: LLMActors, pool_name: str | None = None):
-        self.router_actor = llm_actors.router_actor
+        router_actor = llm_actors.router_actor
+        if router_actor is None:
+            raise ValueError("RemoteVLLMExecutor requires a router actor")
+        self.router_actor = router_actor
         resolve_object_refs_blocking(self.router_actor.report_start.remote())
 
         self.llm_actors = llm_actors.llm_actors

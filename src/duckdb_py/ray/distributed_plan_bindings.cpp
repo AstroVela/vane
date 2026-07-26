@@ -50,11 +50,11 @@ struct PyPhysicalPlanWrapper {
 		return plan_ && plan_->physical_plan() && plan_->physical_plan()->HasRoot();
 	}
 
-	void ensure_connection_snapshot(py::object conn_obj) const {
+	void ensure_connection_snapshot(py::object conn_obj, bool apply_session_config = true) const {
 		if (connection_snapshot_.is_none()) {
 			return;
 		}
-		ApplyConnectionSnapshot(conn_obj, connection_snapshot_);
+		ApplyConnectionSnapshot(conn_obj, connection_snapshot_, apply_session_config);
 	}
 
 	void apply_udf_actor_handles() {
@@ -126,14 +126,14 @@ struct PyPhysicalPlanWrapper {
 
 	// Materialize deferred serialized_root_ into the plan's PhysicalPlan.
 	// Requires a DuckDB connection for deserialization context.
-	void materialize_deferred_root(py::object conn_obj) {
+	void materialize_deferred_root(py::object conn_obj, bool apply_session_config = true) {
 		if (serialized_root_.empty())
 			return;
 		if (has_root())
 			return; // Already has a root
 
 		ensure_plan_identity();
-		ensure_connection_snapshot(conn_obj);
+		ensure_connection_snapshot(conn_obj, apply_session_config);
 
 		auto &py_conn = ExtractPyConnectionWrapper(conn_obj);
 		auto &db_conn = py_conn.con.GetConnection();
@@ -291,6 +291,10 @@ struct PyPhysicalPlanWrapper {
 
 	py::dict session_config() const {
 		return VaneSessionConfigFromSnapshot(connection_snapshot_);
+	}
+
+	bool has_explicit_s3_credentials() const {
+		return HasExplicitS3CredentialsFromSnapshot(connection_snapshot_);
 	}
 
 	size_t num_partitions() const {
@@ -934,7 +938,7 @@ struct PyPhysicalPlanWrapper {
 	}
 };
 
-PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj) const {
+PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::object effective_session_config) const {
 	if (conn_obj.is_none()) {
 		throw duckdb::InternalException("Connection is required for to_physical_plan");
 	}
@@ -950,7 +954,11 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj) const
 
 	py::object planning_conn = ResolveConnectionForSnapshot(conn_obj, connection_snapshot_);
 	auto &conn_wrapper = ExtractPyConnectionWrapper(planning_conn);
-	ApplyConnectionSnapshot(planning_conn, connection_snapshot_);
+	// Resolved environment/profile credentials are the session baseline. Replay
+	// the source connection last so an explicit SET on that connection keeps
+	// DuckDB's normal explicit-config-over-environment precedence.
+	ApplyEffectiveVaneSessionConfig(conn_wrapper.con.GetConnection(), effective_session_config);
+	ApplyConnectionSnapshot(planning_conn, connection_snapshot_, effective_session_config.is_none());
 	if (!udf_registrations_.is_none()) {
 		conn_wrapper.ApplyDistributedPythonUDFRegistrations(udf_registrations_);
 	}
@@ -1724,7 +1732,7 @@ struct PyPhysicalPlanWrapperRunner {
 	                                                duckdb::distributed::python::ray::SafePyObject py_conn_keepalive =
 	                                                    duckdb::distributed::python::ray::SafePyObject()) {
 		using namespace duckdb::distributed;
-		RegisterQueryPythonReplayState(plan.idx(), plan.udf_registrations_, plan.udf_actor_handles_,
+		RegisterQueryPythonReplayState(plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_,
 		                               plan.connection_snapshot_);
 		auto run_state = std::make_shared<PlanRunState>();
 		run_state->client_context = client_context;
@@ -1827,7 +1835,7 @@ struct PyPhysicalPlanWrapperRunner {
 	                         duckdb::distributed::python::ray::SafePyObject py_conn_keepalive =
 	                             duckdb::distributed::python::ray::SafePyObject()) {
 		using namespace duckdb::distributed;
-		RegisterQueryPythonReplayState(plan.idx(), plan.udf_registrations_, plan.udf_actor_handles_,
+		RegisterQueryPythonReplayState(plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_,
 		                               plan.connection_snapshot_);
 		(void)py_conn_keepalive;
 		auto copy_started = std::chrono::steady_clock::now();

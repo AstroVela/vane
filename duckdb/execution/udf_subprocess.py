@@ -1516,6 +1516,19 @@ def ensure_local_subprocess_actor_pools_for_nodes(
                 raise ValueError("GPU resources require a Ray UDF backend")
             executor_options = dict(node.get("executor_options") or {})
             session_config = _normalize_session_config_option(executor_options)
+            existing_pool = executor_options.get("local_actor_pool")
+            if existing_pool is not None:
+                existing_pool_size = _validate_local_actor_pool_contract(existing_pool)
+                if existing_pool_size != pool_size:
+                    raise ValueError(
+                        "pre-created local_actor_pool size does not match the UDF actor_number: "
+                        f"pool_size={existing_pool_size} actor_number={pool_size}"
+                    )
+                existing_session_config = getattr(existing_pool, "session_config", None)
+                if existing_session_config != session_config:
+                    raise ValueError("pre-created local_actor_pool belongs to a different Vane session")
+                actor_options_map[node_id] = executor_options
+                continue
             pool_name = f"local-subprocess-actor-{identity}-{node_id}"
             pool_kwargs: dict[str, Any] = {"name": pool_name}
             if session_config is not None:
@@ -1625,6 +1638,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 )
             actor_pool_size = _validate_local_actor_pool_contract(actor_pool)
             _validate_stateful_local_actor_contract(payload, actor_pool_size)
+            if getattr(actor_pool, "session_config", None) != session_config:
+                raise ValueError("local_actor_pool belongs to a different Vane session")
             worker_pids = actor_pool.worker_pids()
             self._actor_pool = actor_pool
             self._pool_size = actor_pool_size

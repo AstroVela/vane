@@ -195,6 +195,41 @@ def test_local_plan_snapshot_does_not_open_a_ray_session(monkeypatch):
     assert closed_session_ids == []
 
 
+@pytest.mark.parametrize(
+    ("configured_runner", "environment_runner", "expects_close"),
+    [
+        ("ray", "local", True),
+        ("local", "ray", False),
+    ],
+)
+def test_plan_snapshot_uses_configured_runner_for_session_lifecycle(
+    monkeypatch,
+    configured_runner,
+    environment_runner,
+    expects_close,
+):
+    ray_cxx = _require_ray_cxx()
+    closed_session_ids = []
+    monkeypatch.setenv("VANE_RUNNER", environment_runner)
+    monkeypatch.setattr(
+        duckdb.vane_runners_cpp,
+        "get_or_infer_runner_type",
+        lambda: configured_runner,
+    )
+    monkeypatch.setattr(
+        "duckdb.runners.ray.runner.notify_connection_closed",
+        closed_session_ids.append,
+    )
+
+    connection = duckdb.connect()
+    plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.sql("SELECT 1"), "configured-runner-session")
+    session_id = plan.session_id()
+
+    connection.close()
+
+    assert closed_session_ids == ([session_id] if expects_close else [])
+
+
 def test_deserialized_plan_rejects_missing_session_config():
     ray_cxx = _require_ray_cxx()
     connection = duckdb.connect()
@@ -374,3 +409,204 @@ def test_pickled_physical_plan_replays_bootstrap_and_runtime_connection_snapshot
 
     assert table.column(0).to_pylist() == ["snapshot-test"]
     assert table.column(1).to_pylist() == ["UTC"]
+
+
+def test_effective_session_config_reaches_nondefault_bootstrap_connection(tmp_path):
+    ray_cxx = _require_ray_cxx()
+    database_path = str(tmp_path / "session-bootstrap.duckdb")
+    source_conn = duckdb.connect(database_path)
+    source_conn.execute("LOAD httpfs")
+    source_conn.execute("SET GLOBAL s3_access_key_id='source-placeholder-key'")
+    relation = source_conn.sql("SELECT CAST(current_setting('s3_access_key_id') AS VARCHAR) AS access_key")
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation,
+        "snapshot-effective-session-config",
+    )
+    effective_config = {
+        "AWS_ACCESS_KEY_ID": "resolved-profile-key",
+        "AWS_SECRET_ACCESS_KEY": "resolved-profile-secret",
+    }
+
+    physical_plan = logical_plan.to_physical_plan(
+        duckdb.connect(),
+        effective_session_config=effective_config,
+    )
+    restored_plan = pickle.loads(pickle.dumps(physical_plan))
+    result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+        duckdb.connect().cursor(),
+        restored_plan,
+        effective_session_config=effective_config,
+    )
+
+    assert _table_from_native_result(result).column(0).to_pylist() == ["resolved-profile-key"]
+
+
+def test_explicit_connection_s3_settings_override_effective_session_config():
+    ray_cxx = _require_ray_cxx()
+    source_conn = duckdb.connect()
+    source_conn.execute("LOAD httpfs")
+    source_conn.execute("SET s3_access_key_id='explicit-key'")
+    source_conn.execute("SET s3_secret_access_key='explicit-secret'")
+    source_conn.execute("SET s3_session_token=''")
+    relation = source_conn.sql(
+        "SELECT current_setting('s3_access_key_id') AS access_key, "
+        "current_setting('s3_secret_access_key') AS secret_key, "
+        "current_setting('s3_session_token') AS session_token"
+    )
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation,
+        "snapshot-explicit-s3-precedence",
+    )
+    assert logical_plan.has_explicit_s3_credentials() is True
+    effective_config = {
+        "AWS_ACCESS_KEY_ID": "environment-key",
+        "AWS_SECRET_ACCESS_KEY": "environment-secret",
+        "AWS_SESSION_TOKEN": "environment-token",
+    }
+
+    planning_conn = duckdb.connect()
+    physical_plan = logical_plan.to_physical_plan(
+        planning_conn,
+        effective_session_config=effective_config,
+    )
+    assert physical_plan.has_explicit_s3_credentials() is True
+    assert planning_conn.execute("SELECT current_setting('s3_access_key_id')").fetchone()[0] == "explicit-key"
+
+    restored_plan = pickle.loads(pickle.dumps(physical_plan))
+    worker_cursor = duckdb.connect().cursor()
+    result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+        worker_cursor,
+        restored_plan,
+        effective_session_config=effective_config,
+    )
+
+    table = _table_from_native_result(result)
+    assert table.column(0).to_pylist() == ["explicit-key"]
+    assert table.column(1).to_pylist() == ["explicit-secret"]
+    assert table.column(2).to_pylist() == [""]
+    assert worker_cursor.execute("SELECT current_setting('s3_access_key_id')").fetchone()[0] == "explicit-key"
+    assert worker_cursor.execute("SELECT current_setting('s3_session_token')").fetchone()[0] == ""
+
+
+def test_connection_snapshot_requires_both_explicit_s3_credential_settings():
+    ray_cxx = _require_ray_cxx()
+    source_conn = duckdb.connect()
+    source_conn.execute("LOAD httpfs")
+    source_conn.execute("SET s3_access_key_id='explicit-key'")
+
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT 1"),
+        "snapshot-partial-explicit-s3",
+    )
+
+    with pytest.raises(
+        Exception,
+        match="must set both s3_access_key_id and s3_secret_access_key",
+    ):
+        logical_plan.has_explicit_s3_credentials()
+
+
+@pytest.mark.parametrize(
+    ("access_key", "secret_key"),
+    [
+        ("explicit-key", ""),
+        ("", "explicit-secret"),
+    ],
+)
+def test_connection_snapshot_rejects_explicit_s3_key_pair_with_one_empty_value(
+    access_key,
+    secret_key,
+):
+    ray_cxx = _require_ray_cxx()
+    source_conn = duckdb.connect()
+    source_conn.execute("LOAD httpfs")
+    source_conn.execute(f"SET s3_access_key_id='{access_key}'")
+    source_conn.execute(f"SET s3_secret_access_key='{secret_key}'")
+
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT 1"),
+        "snapshot-empty-partial-explicit-s3",
+    )
+
+    with pytest.raises(
+        Exception,
+        match="must set both s3_access_key_id and s3_secret_access_key",
+    ):
+        logical_plan.has_explicit_s3_credentials()
+
+
+def test_connection_snapshot_rejects_explicit_s3_session_token_without_key_pair():
+    ray_cxx = _require_ray_cxx()
+    source_conn = duckdb.connect()
+    source_conn.execute("LOAD httpfs")
+    source_conn.execute("SET s3_session_token='explicit-token'")
+
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT 1"),
+        "snapshot-partial-explicit-s3-token",
+    )
+
+    with pytest.raises(
+        Exception,
+        match="must set both s3_access_key_id and s3_secret_access_key",
+    ):
+        logical_plan.has_explicit_s3_credentials()
+
+
+def test_connection_snapshot_recognizes_explicit_empty_s3_credentials():
+    ray_cxx = _require_ray_cxx()
+    source_conn = duckdb.connect()
+    source_conn.execute("LOAD httpfs")
+    source_conn.execute("SET s3_access_key_id=''")
+    source_conn.execute("SET s3_secret_access_key=''")
+
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT 1"),
+        "snapshot-empty-explicit-s3",
+    )
+
+    assert logical_plan.has_explicit_s3_credentials() is True
+
+
+def test_effective_session_config_overrides_stale_captured_environment(monkeypatch):
+    ray_cxx = _require_ray_cxx()
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "stale-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "stale-secret")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "stale-token")
+
+    source_conn = duckdb.connect()
+    source_conn.execute("LOAD httpfs")
+    relation = source_conn.sql(
+        "SELECT current_setting('s3_access_key_id') AS access_key, "
+        "current_setting('s3_secret_access_key') AS secret_key, "
+        "current_setting('s3_session_token') AS session_token"
+    )
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation,
+        "snapshot-refreshed-s3-precedence",
+    )
+    effective_config = {
+        "AWS_ACCESS_KEY_ID": "refreshed-key",
+        "AWS_SECRET_ACCESS_KEY": "refreshed-secret",
+        "AWS_SESSION_TOKEN": "refreshed-token",
+    }
+
+    planning_conn = duckdb.connect()
+    physical_plan = logical_plan.to_physical_plan(
+        planning_conn,
+        effective_session_config=effective_config,
+    )
+    assert planning_conn.execute("SELECT current_setting('s3_access_key_id')").fetchone()[0] == "refreshed-key"
+
+    restored_plan = pickle.loads(pickle.dumps(physical_plan))
+    worker_cursor = duckdb.connect().cursor()
+    result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+        worker_cursor,
+        restored_plan,
+        effective_session_config=effective_config,
+    )
+
+    table = _table_from_native_result(result)
+    assert table.column(0).to_pylist() == ["refreshed-key"]
+    assert table.column(1).to_pylist() == ["refreshed-secret"]
+    assert table.column(2).to_pylist() == ["refreshed-token"]

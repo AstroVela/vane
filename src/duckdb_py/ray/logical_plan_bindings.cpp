@@ -20,8 +20,9 @@ struct PyLogicalPlan {
 
 	string session_id() const;
 	py::dict session_config() const;
+	bool has_explicit_s3_credentials() const;
 
-	PyPhysicalPlanWrapper to_physical_plan(py::object conn_obj) const;
+	PyPhysicalPlanWrapper to_physical_plan(py::object conn_obj, py::object effective_session_config) const;
 };
 
 static string SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::Relation> &rel) {
@@ -127,6 +128,50 @@ static py::dict VaneSessionConfigFromSnapshot(const py::object &snapshot_obj) {
 		throw duckdb::InvalidInputException("Connection snapshot Vane session config must be a dict");
 	}
 	return CopyPyDict(session[py::str("config")].cast<py::dict>());
+}
+
+static bool HasExplicitS3CredentialsFromSnapshot(const py::object &snapshot_obj) {
+	if (snapshot_obj.is_none() || !py::isinstance<py::dict>(snapshot_obj)) {
+		throw duckdb::InvalidInputException("Connection snapshot is missing the required Vane session");
+	}
+	auto snapshot = snapshot_obj.cast<py::dict>();
+	if (!snapshot.contains(py::str("settings")) || !py::isinstance<py::list>(snapshot[py::str("settings")])) {
+		return false;
+	}
+	bool has_access_key = false;
+	bool has_secret_key = false;
+	bool has_session_token = false;
+	string access_key;
+	string secret_key;
+	string session_token;
+	for (auto item : snapshot[py::str("settings")].cast<py::list>()) {
+		if (!py::isinstance<py::dict>(item)) {
+			continue;
+		}
+		auto setting = py::reinterpret_borrow<py::dict>(item);
+		if (!setting.contains(py::str("name")) || !setting.contains(py::str("value"))) {
+			continue;
+		}
+		auto name = duckdb::StringUtil::Lower(py::str(setting[py::str("name")]).cast<string>());
+		if (name == "s3_access_key_id") {
+			has_access_key = true;
+			access_key = py::str(setting[py::str("value")]).cast<string>();
+		} else if (name == "s3_secret_access_key") {
+			has_secret_key = true;
+			secret_key = py::str(setting[py::str("value")]).cast<string>();
+		} else if (name == "s3_session_token") {
+			has_session_token = true;
+			session_token = py::str(setting[py::str("value")]).cast<string>();
+		}
+	}
+	const bool has_access_key_value = !access_key.empty();
+	const bool has_secret_key_value = !secret_key.empty();
+	if (has_access_key != has_secret_key || has_access_key_value != has_secret_key_value ||
+	    (has_session_token && !session_token.empty() && !has_access_key_value)) {
+		throw duckdb::InvalidInputException(
+		    "Explicit DuckDB S3 credentials must set both s3_access_key_id and s3_secret_access_key");
+	}
+	return has_access_key;
 }
 
 static bool IsDefaultBootstrapSnapshot(const py::object &bootstrap_obj) {
@@ -249,6 +294,7 @@ struct ConnectionSettingRecord {
 	string name;
 	string value;
 	string input_type;
+	string scope;
 };
 
 static bool ShouldSkipConnectionSettingSnapshot(const string &name, const string &input_type) {
@@ -273,6 +319,15 @@ static bool IsNumericConnectionSettingType(const string &input_type) {
 	    "USMALLINT", "UINTEGER", "UBIGINT", "FLOAT",  "DOUBLE",  "DECIMAL",
 	};
 	return numeric_types.find(duckdb::StringUtil::Upper(input_type)) != numeric_types.end();
+}
+
+static bool IsVaneSessionBaselineConnectionSetting(const string &name) {
+	static const std::unordered_set<string> names {
+	    "http_keep_alive",  "http_retries", "http_retry_backoff", "http_retry_wait_ms",
+	    "s3_access_key_id", "s3_endpoint",  "s3_region",          "s3_secret_access_key",
+	    "s3_session_token", "s3_url_style", "s3_use_ssl",
+	};
+	return names.find(duckdb::StringUtil::Lower(name)) != names.end();
 }
 
 static string QuoteSQLStringLiteral(const string &value) {
@@ -349,8 +404,7 @@ static string VaneSessionConfigValue(const py::dict &config, const char *key) {
 	return py::str(config[py_key]).cast<string>();
 }
 
-static void ApplyVaneSessionConfig(duckdb::Connection &conn, const py::object &snapshot_obj) {
-	auto config = VaneSessionConfigFromSnapshot(snapshot_obj);
+static void ApplyVaneSessionConfigValues(duckdb::Connection &conn, const py::dict &config) {
 	auto endpoint_url = VaneSessionConfigValue(config, "AWS_ENDPOINT_URL");
 	auto access_key = VaneSessionConfigValue(config, "AWS_ACCESS_KEY_ID");
 	auto secret_key = VaneSessionConfigValue(config, "AWS_SECRET_ACCESS_KEY");
@@ -373,7 +427,7 @@ static void ApplyVaneSessionConfig(duckdb::Connection &conn, const py::object &s
 	if (!secret_key.empty()) {
 		ExecuteSnapshotQuery(conn, "SET s3_secret_access_key=" + QuoteSQLStringLiteral(secret_key));
 	}
-	if (!session_token.empty()) {
+	if (!access_key.empty() || !secret_key.empty() || !session_token.empty()) {
 		ExecuteSnapshotQuery(conn, "SET s3_session_token=" + QuoteSQLStringLiteral(session_token));
 	}
 	if (!endpoint_url.empty()) {
@@ -386,6 +440,20 @@ static void ApplyVaneSessionConfig(duckdb::Connection &conn, const py::object &s
 	ExecuteSnapshotQuery(conn, "SET http_retries=10");
 	ExecuteSnapshotQuery(conn, "SET http_retry_wait_ms=100");
 	ExecuteSnapshotQuery(conn, "SET http_retry_backoff=1.5");
+}
+
+static void ApplyVaneSessionConfig(duckdb::Connection &conn, const py::object &snapshot_obj) {
+	ApplyVaneSessionConfigValues(conn, VaneSessionConfigFromSnapshot(snapshot_obj));
+}
+
+static void ApplyEffectiveVaneSessionConfig(duckdb::Connection &conn, const py::object &config_obj) {
+	if (config_obj.is_none()) {
+		return;
+	}
+	if (!py::isinstance<py::dict>(config_obj)) {
+		throw duckdb::InvalidInputException("Effective Vane session config must be a dict");
+	}
+	ApplyVaneSessionConfigValues(conn, config_obj.cast<py::dict>());
 }
 
 static std::vector<string> QueryLoadedExtensionNames(DuckDBPyConnection &conn_wrapper) {
@@ -412,7 +480,7 @@ static std::vector<string> QueryLoadedExtensionNames(DuckDBPyConnection &conn_wr
 
 static std::vector<ConnectionSettingRecord> QueryConnectionSettings(DuckDBPyConnection &conn_wrapper) {
 	std::vector<ConnectionSettingRecord> settings;
-	auto result = ExecuteSnapshotQuery(conn_wrapper.con.GetConnection(), "SELECT name, value, input_type "
+	auto result = ExecuteSnapshotQuery(conn_wrapper.con.GetConnection(), "SELECT name, value, input_type, scope "
 	                                                                     "FROM duckdb_settings() "
 	                                                                     "ORDER BY name");
 	auto &collection = result->Collection();
@@ -422,12 +490,14 @@ static std::vector<ConnectionSettingRecord> QueryConnectionSettings(DuckDBPyConn
 		auto name_val = row.GetValue(0);
 		auto value_val = row.GetValue(1);
 		auto input_type_val = row.GetValue(2);
-		if (name_val.IsNull() || input_type_val.IsNull()) {
+		auto scope_val = row.GetValue(3);
+		if (name_val.IsNull() || input_type_val.IsNull() || scope_val.IsNull()) {
 			continue;
 		}
 		record.name = name_val.ToString();
 		record.value = value_val.IsNull() ? string() : value_val.ToString();
 		record.input_type = input_type_val.ToString();
+		record.scope = scope_val.ToString();
 		settings.push_back(std::move(record));
 	}
 	return settings;
@@ -449,17 +519,14 @@ static void TryLoadSnapshotExtension(DuckDBPyConnection &conn_wrapper, const str
 }
 
 static bool VaneRaySessionLifecycleEnabled() {
-	auto environ = py::module_::import("os").attr("environ");
-	auto runner = py::str(environ.attr("get")(py::str("VANE_RUNNER"), py::str(""))).cast<string>();
+	auto duckdb_module = py::module_::import("duckdb");
+	auto runner = py::str(duckdb_module.attr("vane_runners_cpp").attr("get_or_infer_runner_type")()).cast<string>();
 	duckdb::StringUtil::Trim(runner);
 	runner = duckdb::StringUtil::Lower(runner);
-	return runner.empty() || runner == "ray";
+	return runner == "ray";
 }
 
 static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper) {
-	if (VaneRaySessionLifecycleEnabled()) {
-		conn_wrapper.MarkVaneRaySessionOpened();
-	}
 	auto bootstrap_obj = conn_wrapper.ExportConnectionBootstrapConfig();
 	auto loaded_extensions = QueryLoadedExtensionNames(conn_wrapper);
 	auto source_settings = QueryConnectionSettings(conn_wrapper);
@@ -488,7 +555,10 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper) {
 		}
 		auto lower_name = duckdb::StringUtil::Lower(record.name);
 		auto entry = default_setting_values.find(lower_name);
-		if (entry != default_setting_values.end() && entry->second == record.value) {
+		auto explicitly_local_session_override =
+		    duckdb::StringUtil::Lower(record.scope) == "local" && IsVaneSessionBaselineConnectionSetting(record.name);
+		if (!explicitly_local_session_override && entry != default_setting_values.end() &&
+		    entry->second == record.value) {
 			continue;
 		}
 		py::dict setting_obj;
@@ -509,10 +579,14 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper) {
 	}
 	snapshot_obj[py::str("extensions")] = std::move(extensions_obj);
 	snapshot_obj[py::str("settings")] = std::move(settings_obj);
+	if (VaneRaySessionLifecycleEnabled()) {
+		conn_wrapper.MarkVaneRaySessionOpened();
+	}
 	return snapshot_obj;
 }
 
-static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snapshot_obj) {
+static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snapshot_obj,
+                                    bool apply_session_config = true) {
 	if (snapshot_obj.is_none()) {
 		return;
 	}
@@ -534,7 +608,9 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 			}
 		}
 	}
-	ApplyVaneSessionConfig(conn_wrapper.con.GetConnection(), snapshot_obj);
+	if (apply_session_config) {
+		ApplyVaneSessionConfig(conn_wrapper.con.GetConnection(), snapshot_obj);
+	}
 
 	if (!snapshot.contains(py::str("settings"))) {
 		return;
@@ -576,6 +652,10 @@ string PyLogicalPlan::session_id() const {
 
 py::dict PyLogicalPlan::session_config() const {
 	return VaneSessionConfigFromSnapshot(connection_snapshot_);
+}
+
+bool PyLogicalPlan::has_explicit_s3_credentials() const {
+	return HasExplicitS3CredentialsFromSnapshot(connection_snapshot_);
 }
 
 enum class QueryPythonReplayField : uint8_t {

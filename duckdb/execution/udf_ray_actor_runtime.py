@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import pyarrow as pa
@@ -97,7 +98,7 @@ def _payload_requires_ray_block_stream(payload: dict[str, Any] | None) -> bool:
 def _actor_class(
     max_restarts: int,
     max_task_retries: int,
-):
+) -> Any:
     import ray
 
     # UDFExecutor and user callables are not thread-safe. QRM may pre-admit a
@@ -109,8 +110,8 @@ def _actor_class(
             # No-arg constructor avoids Ray warning about constructor arguments
             # in the object store with max_restarts>0 (ray#53727).
             # Payload is injected via init_payload() immediately after creation.
-            self._payload = None
-            self.executor = None  # lazy init on first streaming submission
+            self._payload: dict[str, Any] | None = None
+            self.executor: RuntimeUDFExecutor | None = None  # lazy init on first streaming submission
 
         def init_payload(self, payload: dict[str, Any]) -> None:
             """Inject payload after construction to avoid Ray object-store GC issues."""
@@ -121,22 +122,26 @@ def _actor_class(
                 runtime_payload = dict(self._payload)
                 runtime_payload["stream_output"] = True
                 runtime_payload["prebatched_input"] = False
-                self.executor = RuntimeUDFExecutor(runtime_payload)
+                executor = RuntimeUDFExecutor(runtime_payload)
+                self.executor = executor
                 configure_ray_actor_loaded_torch_threads(self._payload)
                 if _eager_actor_warm_up_enabled(self._payload):
-                    self.executor.warm_up()
+                    executor.warm_up()
                 _actor_debug_log("executor_init_done", self._payload, path="init_payload")
 
-        def _ensure_executor(self, effective_payload: dict[str, Any]) -> None:
-            if self.executor is not None:
-                return
+        def _ensure_executor(self, effective_payload: dict[str, Any]) -> RuntimeUDFExecutor:
+            executor = self.executor
+            if executor is not None:
+                return executor
             if self._payload is None:
                 self._payload = dict(effective_payload)
             runtime_payload = dict(self._payload)
             runtime_payload["stream_output"] = True
             runtime_payload["prebatched_input"] = False
-            self.executor = RuntimeUDFExecutor(runtime_payload)
+            executor = RuntimeUDFExecutor(runtime_payload)
+            self.executor = executor
             configure_ray_actor_loaded_torch_threads(self._payload)
+            return executor
 
         def _run_row_preserving_batch(
             self,
@@ -148,13 +153,13 @@ def _actor_class(
                 split_row_preserving_input,
             )
 
-            self._ensure_executor(effective_payload)
+            executor = self._ensure_executor(effective_payload)
             args, passthrough = split_row_preserving_input(effective_payload, table)
             if args.num_rows == 0:
                 output = _empty_output_table_from_payload(effective_payload)
                 return fuse_row_preserving_output(effective_payload, passthrough, output)
-            self.executor.submit(args)
-            outputs = self.executor.drain_outputs()
+            executor.submit(args)
+            outputs = executor.drain_outputs()
             if len(outputs) != 1:
                 raise RuntimeError("map_batches_rows actor produced %d outputs, expected exactly 1" % len(outputs))
             return fuse_row_preserving_output(
@@ -167,12 +172,13 @@ def _actor_class(
             self,
             args: pa.Table,
             effective_payload: dict[str, Any],
-        ):
+        ) -> Iterator[Any]:
             _payload_requires_ray_block_stream(effective_payload)
             validate_task_runtime_node(effective_payload)
-            if self.executor is None:
+            executor = self.executor
+            if executor is None:
                 _actor_debug_log("executor_init_start", effective_payload, path="run_block_stream")
-                self._ensure_executor(effective_payload)
+                executor = self._ensure_executor(effective_payload)
                 _actor_debug_log("executor_init_done", effective_payload, path="run_block_stream")
             args = _ensure_table(args)
             _actor_debug_log(
@@ -183,7 +189,7 @@ def _actor_class(
             )
             output_count = 0
 
-            def emit(table: pa.Table):
+            def emit(table: pa.Table) -> Iterator[Any]:
                 nonlocal output_count
                 for block in iter_bounded_stream_blocks(_ensure_table(table), effective_payload):
                     yield block
@@ -195,7 +201,7 @@ def _actor_class(
                     output_count += 1
 
             if str(effective_payload.get("call_mode") or "") == "map":
-                table = execute_scalar_map_layout(effective_payload, args, self.executor)
+                table = execute_scalar_map_layout(effective_payload, args, executor)
                 yield from emit(table)
                 _actor_debug_log(
                     "run_block_stream_submit_done",
@@ -213,7 +219,7 @@ def _actor_class(
                     outputs=1,
                 )
                 return
-            for result in self.executor.iter_submit(args):
+            for result in executor.iter_submit(args):
                 table = _ensure_table(result)
                 _actor_debug_log(
                     "run_block_stream_output",
@@ -237,7 +243,7 @@ def _actor_class(
             self,
             args: pa.Table,
             payload: dict[str, Any] | None = None,
-        ):
+        ) -> Iterator[Any]:
             effective_payload = dict(self._payload or {})
             if payload is not None:
                 effective_payload.update(payload)
@@ -250,12 +256,12 @@ def _actor_class(
 
         def run_ref_bundle_stream(
             self,
-            *blocks,
+            *blocks: Any,
             payload: dict[str, Any] | None = None,
-            slices=None,
-            metadata=None,
-            names=None,
-        ):
+            slices: Any = None,
+            metadata: Any = None,
+            names: Any = None,
+        ) -> Iterator[Any]:
             base_payload = payload or self._payload or {}
             try:
                 _actor_debug_log(

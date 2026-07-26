@@ -284,13 +284,13 @@ def _build_actor_runtime_env(ray_options: dict[str, Any] | None) -> dict[str, An
     return runtime_env
 
 
-def _actor_class(max_restarts: int, max_task_retries: int):
+def _actor_class(max_restarts: int, max_task_retries: int) -> Any:
     return _actor_runtime_class(max_restarts, max_task_retries)
 
 
 class UDFActorPool(_UDFActorPoolBase):
     @staticmethod
-    def _actor_class(max_restarts: int, max_task_retries: int):
+    def _actor_class(max_restarts: int, max_task_retries: int) -> Any:
         return _actor_class(max_restarts, max_task_retries)
 
     @staticmethod
@@ -315,10 +315,10 @@ class UDFActorPool(_UDFActorPoolBase):
 
 
 def _apply_actor_node_options(
-    actors: UDFActorPool,
+    actors: _UDFActorPoolBase,
     *,
     options: dict[str, Any],
-) -> UDFActorPool:
+) -> _UDFActorPoolBase:
     return _apply_actor_node_options_impl(
         actors,
         options=options,
@@ -333,7 +333,7 @@ def ensure_actor_pools_for_plan(
     query_driver_handle: Any,
     session_config: dict[str, str],
     conn: Any = None,
-) -> tuple[list[UDFActorPool], dict[str, Any]]:
+) -> tuple[list[_UDFActorPoolBase], dict[str, Any]]:
     return _ensure_actor_pools_for_plan_impl(
         plan,
         conn=conn,
@@ -358,7 +358,7 @@ def ensure_actor_pools_for_nodes(
     query_driver_handle: Any,
     session_config: dict[str, str],
     set_handles: Any = None,
-) -> tuple[list[UDFActorPool], dict[str, Any]]:
+) -> tuple[list[_UDFActorPoolBase], dict[str, Any]]:
     return _ensure_actor_pools_for_nodes_impl(
         udf_nodes,
         actor_node_ids_by_stage=actor_node_ids_by_stage,
@@ -383,7 +383,7 @@ def prepare_actor_pools_for_plan(
     query_driver_handle: Any,
     session_config: dict[str, str],
     conn: Any = None,
-) -> tuple[list[UDFActorPool], dict[str, Any]]:
+) -> tuple[list[_UDFActorPoolBase], dict[str, Any]]:
     return _prepare_actor_pools_for_plan_impl(
         plan,
         conn=conn,
@@ -401,7 +401,7 @@ def prepare_actor_pools_for_plan(
     )
 
 
-def wait_for_actor_pools_ready(actor_pools: list[UDFActorPool]) -> None:
+def wait_for_actor_pools_ready(actor_pools: list[_UDFActorPoolBase]) -> None:
     _wait_for_actor_pools_ready_impl(actor_pools)
 
 
@@ -416,7 +416,7 @@ class RemoteUDFExecutor(
 ):
     def __init__(
         self,
-        actors: UDFActorPool,
+        actors: _UDFActorPoolBase,
         payload: dict[str, Any],
         *,
         query_driver_handle: Any,
@@ -545,7 +545,7 @@ class RayTaskUDFExecutor(TaskAdmissionExecutorMixin, UDFExecutor):
     def submit(self, _args: pa.Table) -> None:
         raise RuntimeError("RayTaskUDFExecutor.submit() direct submit path has been removed; use submit_with_id()")
 
-    def submit_with_id(self, submit_id: int, args: pa.Table):
+    def submit_with_id(self, submit_id: int, args: pa.Table) -> TaskLeaseObjectRefGenerator:
         seq = _next_ray_task_debug_seq()
         table = _ensure_table(args)
         if _ray_task_should_log(seq):
@@ -568,7 +568,14 @@ class RayTaskUDFExecutor(TaskAdmissionExecutorMixin, UDFExecutor):
             ),
         )
 
-    def submit_ref_bundle_with_id(self, submit_id: int, block_refs, slices, metadata, names):
+    def submit_ref_bundle_with_id(
+        self,
+        submit_id: int,
+        block_refs: Any,
+        slices: Any,
+        metadata: Any,
+        names: Any,
+    ) -> TaskLeaseObjectRefGenerator:
         seq = _next_ray_task_debug_seq()
         if _ray_task_should_log(seq):
             _ray_task_debug_log(
@@ -596,7 +603,13 @@ class RayTaskUDFExecutor(TaskAdmissionExecutorMixin, UDFExecutor):
             ),
         )
 
-    def submit_ref_bundle(self, _block_refs, _slices, _metadata, _names) -> None:
+    def submit_ref_bundle(
+        self,
+        _block_refs: Any,
+        _slices: Any,
+        _metadata: Any,
+        _names: Any,
+    ) -> None:
         raise RuntimeError(
             "RayTaskUDFExecutor.submit_ref_bundle() direct ref-bundle submit path has been removed; "
             "use submit_ref_bundle_with_id()"
@@ -643,7 +656,7 @@ def _streaming_task_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def _iter_materialized_task_outputs(
     payload: dict[str, Any],
     tables: list[pa.Table] | tuple[pa.Table, ...],
-):
+) -> Iterator[Any]:
     """Yield direct block/metadata pairs for materialized Ray task input."""
     validate_task_runtime_node(payload)
     stream_payload = _streaming_task_payload(payload)
@@ -654,7 +667,7 @@ def _iter_materialized_task_outputs(
     configure_loaded_torch_threads()
     output_index = 0
 
-    def emit(output: pa.Table):
+    def emit(output: pa.Table) -> Iterator[tuple[pa.Table, Any]]:
         nonlocal output_index
         for block in iter_bounded_stream_blocks(_ensure_table(output), stream_payload):
             metadata = make_stream_block_metadata(
@@ -741,9 +754,9 @@ def _build_bundle_stream_remote(
         ray_options,
     )
 
-    @ray.remote(**task_options)
+    @ray.remote(**task_options)  # type: ignore[untyped-decorator]
     @_with_explicit_session_runtime_env(session_runtime_env_vars)
-    def run_bundle_stream(payload: dict[str, Any], tables: list[pa.Table]):
+    def run_bundle_stream(payload: dict[str, Any], tables: list[pa.Table]) -> Iterator[Any]:
         seq = _next_ray_task_debug_seq()
         log_task = _ray_task_should_log(seq)
         start = time.perf_counter()
@@ -782,7 +795,13 @@ def _build_bundle_stream_remote(
     return run_bundle_stream
 
 
-def _iter_ref_bundle_task_outputs(payload: dict[str, Any], blocks, slices, metadata, names):
+def _iter_ref_bundle_task_outputs(
+    payload: dict[str, Any],
+    blocks: Any,
+    slices: Any,
+    metadata: Any,
+    names: Any,
+) -> Iterator[Any]:
     validate_task_runtime_node(payload)
     seq = _next_ray_task_debug_seq()
     log_task = _ray_task_should_log(seq)
@@ -819,7 +838,7 @@ def _iter_ref_bundle_task_outputs(payload: dict[str, Any], blocks, slices, metad
         output_count = 0
         output_rows = 0
 
-        def emit_output(output: pa.Table):
+        def emit_output(output: pa.Table) -> Iterator[tuple[pa.Table, Any]]:
             nonlocal output_count, output_rows
             for output_table in iter_bounded_stream_blocks(_ensure_table(output), stream_payload):
                 output_rows += output_table.num_rows
@@ -890,9 +909,15 @@ def _build_ref_bundle_stream_remote(
         ray_options,
     )
 
-    @ray.remote(**task_options)
+    @ray.remote(**task_options)  # type: ignore[untyped-decorator]
     @_with_explicit_session_runtime_env(session_runtime_env_vars)
-    def run_ref_bundle_stream(*blocks, payload: dict[str, Any], slices, metadata, names):
+    def run_ref_bundle_stream(
+        *blocks: Any,
+        payload: dict[str, Any],
+        slices: Any,
+        metadata: Any,
+        names: Any,
+    ) -> Iterator[Any]:
         try:
             yield from _iter_ref_bundle_task_outputs(payload, blocks, slices, metadata, names)
         except Exception as exc:

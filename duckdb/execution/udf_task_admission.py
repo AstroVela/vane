@@ -7,7 +7,7 @@ import os
 import threading
 import uuid
 from collections.abc import Callable
-from typing import Any
+from typing import Any, TypeAlias
 
 from duckdb.execution.udf_admission import (
     AdmissionExecutorMixin,
@@ -55,7 +55,7 @@ def ray_udf_task_resource_spec(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-TaskAdmission = AdmissionLease
+TaskAdmission: TypeAlias = AdmissionLease
 
 
 class TaskAdmissionController:
@@ -82,7 +82,7 @@ class TaskAdmissionController:
         self._error: BaseException | None = None
         self._wakeup: Callable[[], None] | None = None
 
-    def _driver_actor(self):
+    def _driver_actor(self) -> Any:
         return self._driver
 
     def register_wakeup(self, callback: Callable[[], None]) -> None:

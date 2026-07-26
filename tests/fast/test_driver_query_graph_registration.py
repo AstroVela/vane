@@ -49,8 +49,9 @@ class _FakeLogicalPlan:
         self._physical_plan = physical_plan
         self._events = events
 
-    def to_physical_plan(self, conn):
+    def to_physical_plan(self, conn, effective_session_config):
         assert conn is not None
+        assert effective_session_config == {}
         self._events.append("physical_plan")
         return self._physical_plan
 
@@ -63,10 +64,13 @@ class _FakeLogicalPlan:
     def session_config(self):
         return {}
 
+    def has_explicit_s3_credentials(self):
+        return False
+
 
 class _ValidatingLogicalPlan(_FakeLogicalPlan):
-    def to_physical_plan(self, conn):
-        physical_plan = super().to_physical_plan(conn)
+    def to_physical_plan(self, conn, effective_session_config):
+        physical_plan = super().to_physical_plan(conn, effective_session_config)
         validate_plan_serialization_for_submission(physical_plan)
         return physical_plan
 
@@ -215,6 +219,7 @@ def _runner(events, coordinator):
             owner_id=_OWNER_ID,
             config={},
             connection=runner._duckdb_conn.cursor(),
+            s3_config={},
         )
     }
     runner._query_resource_coordinator = coordinator

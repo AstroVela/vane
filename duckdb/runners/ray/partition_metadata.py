@@ -13,7 +13,8 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 
-from duckdb.runners.common import MaterializedResult, PartitionMetadata
+from duckdb.runners.common import MaterializedResult
+from duckdb.runners.common import PartitionMetadata as PartitionMetadata
 from duckdb.runners.ray.safe_get import resolve_object_refs_blocking
 
 if TYPE_CHECKING:

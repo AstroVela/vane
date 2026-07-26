@@ -151,6 +151,9 @@ class _FakePhysicalPlanWithoutPlanAttr:
     def session_config(self) -> dict[str, str]:
         return dict(self._session_config)
 
+    def has_explicit_s3_credentials(self) -> bool:
+        return False
+
 
 class _FakeLogicalPlan:
     def __init__(self, physical_plan: _FakePhysicalPlanWithoutPlanAttr) -> None:
@@ -159,7 +162,7 @@ class _FakeLogicalPlan:
     def idx(self) -> str:
         return self.physical_plan.idx()
 
-    def to_physical_plan(self, _conn):
+    def to_physical_plan(self, _conn, _effective_session_config):
         return self.physical_plan
 
     def session_id(self) -> str:
@@ -168,16 +171,24 @@ class _FakeLogicalPlan:
     def session_config(self) -> dict[str, str]:
         return self.physical_plan.session_config()
 
+    def has_explicit_s3_credentials(self) -> bool:
+        return self.physical_plan.has_explicit_s3_credentials()
+
 
 class _FakeConnection:
     def __init__(self) -> None:
         self.cursors: list[_FakeConnection] = []
+        self.statements: list[str] = []
         self.closed = False
 
     def cursor(self) -> _FakeConnection:
         cursor = _FakeConnection()
         self.cursors.append(cursor)
         return cursor
+
+    def execute(self, statement: str) -> _FakeConnection:
+        self.statements.append(statement)
+        return self
 
     def close(self) -> None:
         self.closed = True
@@ -486,6 +497,69 @@ def test_query_driver_run_plan_cancellation_waits_for_startup_and_tears_down(mon
     assert "cancelled-plan" not in runner._sessions[_TEST_SESSION_ID].plan_ids
 
 
+def test_session_close_does_not_block_actor_loop_during_stream_startup(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    physical_plan = _FakePhysicalPlanWithoutPlanAttr("slow-stream-startup")
+    startup_started = threading.Event()
+    startup_release = threading.Event()
+
+    class _BlockingLogicalPlan(_FakeLogicalPlan):
+        def to_physical_plan(self, _conn, _effective_session_config):
+            startup_started.set()
+            assert startup_release.wait(timeout=1.0)
+            return physical_plan
+
+    class _PlanRunner:
+        @staticmethod
+        def run_plan(_plan, _conn):
+            return _DummyStream([])
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(
+        cls,
+        "_register_query_resources",
+        lambda _self, _plan, *, query_connection: (
+            SimpleNamespace(query_id="slow-stream-startup", stages=()),
+            object(),
+        ),
+    )
+    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+
+    def _cleanup(_self, plan_id):
+        runner.curr_plans.pop(plan_id, None)
+        runner.curr_streams.pop(plan_id, None)
+        cls._release_plan_session_state(runner, plan_id)
+
+    monkeypatch.setattr(cls, "_cleanup_finished_plan", _cleanup)
+
+    async def _close_during_startup():
+        run_task = asyncio.create_task(_run_actor_stream_plan(runner, _BlockingLogicalPlan(physical_plan)))
+        assert await asyncio.to_thread(startup_started.wait, 1.0)
+        close_task = asyncio.create_task(
+            cls.close_session(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+            )
+        )
+        for _ in range(100):
+            if runner._sessions[_TEST_SESSION_ID].closing:
+                break
+            await asyncio.sleep(0)
+        assert runner._sessions[_TEST_SESSION_ID].closing is True
+        await asyncio.wait_for(asyncio.sleep(0), timeout=0.1)
+        assert close_task.done() is False
+        startup_release.set()
+        await asyncio.wait_for(run_task, timeout=1.0)
+        await asyncio.wait_for(close_task, timeout=1.0)
+
+    asyncio.run(_close_during_startup())
+
+    assert _TEST_SESSION_ID not in runner._sessions
+
+
 def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     physical_plan = _FakePhysicalPlanWithoutPlanAttr("copy-plan")
@@ -621,6 +695,65 @@ def test_query_driver_copy_progress_contract_failure_still_tears_down(monkeypatc
             True,
         )
     ]
+
+
+def test_query_driver_copy_progress_cancellation_waits_before_teardown(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-progress-cancellation"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    snapshot_started = threading.Event()
+    snapshot_release = threading.Event()
+    snapshot_finished = threading.Event()
+    teardown_calls = []
+
+    class _PlanRunner:
+        @staticmethod
+        def run_copy_plan(_plan, _conn):
+            return {"ok": True}
+
+    def _build_snapshot(_self, query_id, _started_at):
+        assert query_id == plan_id
+        snapshot_started.set()
+        assert snapshot_release.wait(timeout=1.0)
+        snapshot_finished.set()
+        return {"query_id": query_id}
+
+    def _teardown(_self, actual_plan_id, query_id, *, drop_fragments):
+        assert snapshot_finished.is_set()
+        teardown_calls.append((actual_plan_id, query_id, drop_fragments))
+        cls._release_plan_session_state(runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(
+        cls,
+        "_register_query_resources",
+        lambda _self, _plan, *, query_connection: (
+            SimpleNamespace(query_id=plan_id, stages=()),
+            object(),
+        ),
+    )
+    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_build_local_progress_snapshot", _build_snapshot)
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    async def _cancel_during_snapshot():
+        copy_task = asyncio.create_task(_run_actor_copy_plan(runner, logical_plan))
+        assert await asyncio.to_thread(snapshot_started.wait, 1.0)
+        copy_task.cancel()
+        await asyncio.sleep(0.01)
+        assert copy_task.done() is False
+        assert teardown_calls == []
+        snapshot_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await copy_task
+
+    asyncio.run(_cancel_during_snapshot())
+
+    assert teardown_calls == [(plan_id, plan_id, True)]
+    assert runner._sessions[_TEST_SESSION_ID].active_operations == 0
+    assert plan_id not in runner._plan_session_ids
 
 
 def test_query_driver_copy_opens_actor_stage_after_topology_and_actor_barriers(monkeypatch):
@@ -1001,6 +1134,46 @@ def test_ray_query_driver_client_stream_waits_through_progress_session(monkeypat
     assert progress.finish_calls == [{"final_state": "FINISHED"}]
 
 
+def test_ray_query_driver_client_stream_keeps_captured_runner_during_concurrent_close(monkeypatch):
+    run_ref = object()
+    partition_ref = object()
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+
+    class _RunMethod:
+        @staticmethod
+        def remote(*_args):
+            client.runner = None
+            return run_ref
+
+    class _NextMethod:
+        calls = []
+
+        @classmethod
+        def remote(cls, *args):
+            cls.calls.append(args)
+            return partition_ref
+
+    runner = SimpleNamespace(
+        run_plan=_RunMethod(),
+        get_next_partition=_NextMethod(),
+    )
+    client.runner = runner
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", lambda ref, **_kwargs: None)
+    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
+
+    assert list(client.stream_plan(_FakePhysicalPlanWithoutPlanAttr("stream-plan"))) == []
+    assert _NextMethod.calls == [
+        (
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            "stream-plan",
+            runner,
+        )
+    ]
+
+
 def test_ray_query_driver_client_stream_start_failure_cancels_and_retries_close(monkeypatch):
     run_future = object()
     close_future = object()
@@ -1059,11 +1232,84 @@ def test_ray_query_driver_client_stream_start_failure_cancels_and_retries_close(
         (
             close_future,
             {
-                "timeout": 30,
+                "timeout": 300,
                 "honor_query_deadline": False,
             },
         ),
     ]
+
+
+def test_ray_query_driver_client_stream_start_reports_teardown_failure(monkeypatch):
+    run_future = object()
+    close_future = object()
+
+    class _RemoteMethod:
+        def __init__(self, result):
+            self.result = result
+
+        def remote(self, *_args):
+            return self.result
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = SimpleNamespace(
+        run_plan=_RemoteMethod(run_future),
+        close_plan=_RemoteMethod(close_future),
+    )
+    client._runtime_is_unavailable_or_replaced = lambda: False
+
+    def _resolve(ref, **_kwargs):
+        if ref is run_future:
+            raise RuntimeError("planned stream startup failure")
+        assert ref is close_future
+        raise RuntimeError("planned stream teardown failure")
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+    monkeypatch.setattr(driver.ray, "cancel", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="failed and teardown also failed") as error:
+        list(client.stream_plan(_FakePhysicalPlanWithoutPlanAttr("failed-stream-cleanup")))
+
+    assert "planned stream startup failure" in str(error.value)
+    assert "planned stream teardown failure" in str(error.value)
+
+
+def test_ray_query_driver_client_stream_failure_accepts_concurrent_detach_cleanup(monkeypatch):
+    run_future = object()
+    close_future = object()
+
+    class _RunMethod:
+        @staticmethod
+        def remote(*_args):
+            client.runner = None
+            return run_future
+
+    class _CloseMethod:
+        @staticmethod
+        def remote(*_args):
+            return close_future
+
+    runner = SimpleNamespace(
+        run_plan=_RunMethod(),
+        close_plan=_CloseMethod(),
+    )
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = runner
+
+    def _resolve(ref, **_kwargs):
+        if ref is run_future:
+            raise RuntimeError("planned stream startup failure")
+        assert ref is close_future
+        raise PermissionError("runtime owner was detached")
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+    monkeypatch.setattr(driver.ray, "cancel", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="planned stream startup failure"):
+        list(client.stream_plan(_FakePhysicalPlanWithoutPlanAttr("detached-stream-cleanup")))
 
 
 def test_ray_query_driver_client_copy_failure_cancels_and_settles(monkeypatch):
@@ -1116,7 +1362,7 @@ def test_ray_query_driver_client_copy_failure_cancels_and_settles(monkeypatch):
         (
             close_future,
             {
-                "timeout": 30,
+                "timeout": 300,
                 "honor_query_deadline": False,
             },
         ),
@@ -1575,7 +1821,7 @@ def test_session_close_waits_until_query_connection_is_closed():
 def test_close_session_waits_for_active_copy_operation():
     cls, runner = _make_local_query_driver_actor()
     session = runner._sessions[_TEST_SESSION_ID]
-    cls._begin_session_copy(session, _TEST_SESSION_ID)
+    cls._begin_session_operation(session, _TEST_SESSION_ID)
 
     async def _close_after_copy_finishes():
         close_task = asyncio.create_task(
@@ -1592,8 +1838,8 @@ def test_close_session_waits_for_active_copy_operation():
         assert session.closing is True
         assert close_task.done() is False
         with pytest.raises(RuntimeError, match="Vane session is closing"):
-            cls._begin_session_copy(session, _TEST_SESSION_ID)
-        cls._end_session_copy(session)
+            cls._begin_session_operation(session, _TEST_SESSION_ID)
+        cls._end_session_operation(session)
         await asyncio.wait_for(close_task, timeout=1.0)
 
     asyncio.run(_close_after_copy_finishes())
@@ -1607,7 +1853,7 @@ def test_detach_fences_new_session_work_and_replays_result():
     cls, runner = _make_local_query_driver_actor()
     runner._client_ids.add("other-owner")
     session = runner._sessions[_TEST_SESSION_ID]
-    cls._begin_session_copy(session, _TEST_SESSION_ID)
+    cls._begin_session_operation(session, _TEST_SESSION_ID)
 
     async def _detach_after_copy_finishes():
         detach_task = asyncio.create_task(
@@ -1622,13 +1868,13 @@ def test_detach_fences_new_session_work_and_replays_result():
             await asyncio.sleep(0)
         assert _TEST_RUNTIME_OWNER_ID in runner._detaching_client_ids
         with pytest.raises(PermissionError, match="attached client owner"):
-            cls.open_session(
+            await cls.open_session(
                 runner,
                 _TEST_RUNTIME_OWNER_ID,
                 "late-session",
                 {},
             )
-        cls._end_session_copy(session)
+        cls._end_session_operation(session)
         assert await asyncio.wait_for(detach_task, timeout=1.0) is False
         assert await cls.detach_client(runner, _TEST_RUNTIME_OWNER_ID) is False
 
@@ -1656,11 +1902,13 @@ def test_open_session_revalidates_owner_inside_registry_lock(monkeypatch):
 
     def _open():
         try:
-            cls.open_session(
-                runner,
-                _TEST_RUNTIME_OWNER_ID,
-                "late-session",
-                {},
+            asyncio.run(
+                cls.open_session(
+                    runner,
+                    _TEST_RUNTIME_OWNER_ID,
+                    "late-session",
+                    {},
+                )
             )
         except BaseException as exc:
             open_errors.append(exc)
@@ -1677,6 +1925,31 @@ def test_open_session_revalidates_owner_inside_registry_lock(monkeypatch):
     assert len(open_errors) == 1
     assert isinstance(open_errors[0], PermissionError)
     assert "late-session" not in runner._sessions
+
+
+def test_open_session_defers_credential_resolution_until_plan_preparation(monkeypatch):
+    from duckdb.runners.ray import worker as worker_module
+
+    cls, runner = _make_local_query_driver_actor()
+    runner._sessions = {}
+    monkeypatch.setattr(
+        worker_module,
+        "_effective_duckdb_s3_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("session open must not resolve credentials")),
+    )
+
+    assert (
+        asyncio.run(
+            cls.open_session(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                "deferred-credential-session",
+                {"AWS_PROFILE": "analytics"},
+            )
+        )
+        is True
+    )
+    assert runner._sessions["deferred-credential-session"].s3_config == {}
 
 
 def test_last_owner_detach_retries_runtime_shutdown_failure():
@@ -1708,18 +1981,26 @@ def test_last_owner_detach_retries_runtime_shutdown_failure():
 
 def test_driver_sessions_keep_config_and_close_lifecycle_independent():
     cls, runner = _make_local_query_driver_actor()
-    session_b_config = {"AWS_ACCESS_KEY_ID": "session-b-key"}
+    session_b_config = {
+        "AWS_ACCESS_KEY_ID": "session-b-key",
+        "AWS_SECRET_ACCESS_KEY": "session-b-secret",
+    }
 
-    assert cls.open_session(
-        runner,
-        _TEST_RUNTIME_OWNER_ID,
-        "session-b",
-        session_b_config,
+    assert asyncio.run(
+        cls.open_session(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            "session-b",
+            session_b_config,
+        )
     )
     session_b_config["AWS_ACCESS_KEY_ID"] = "mutated-after-open"
 
     assert runner._sessions[_TEST_SESSION_ID].config == {}
-    assert runner._sessions["session-b"].config == {"AWS_ACCESS_KEY_ID": "session-b-key"}
+    assert runner._sessions["session-b"].config == {
+        "AWS_ACCESS_KEY_ID": "session-b-key",
+        "AWS_SECRET_ACCESS_KEY": "session-b-secret",
+    }
 
     asyncio.run(
         cls.close_session(
@@ -1738,7 +2019,8 @@ def test_driver_sessions_keep_config_and_close_lifecycle_independent():
 
     assert _TEST_SESSION_ID not in runner._sessions
     assert cls._require_session(runner, _TEST_RUNTIME_OWNER_ID, "session-b").config == {
-        "AWS_ACCESS_KEY_ID": "session-b-key"
+        "AWS_ACCESS_KEY_ID": "session-b-key",
+        "AWS_SECRET_ACCESS_KEY": "session-b-secret",
     }
 
     runner._client_ids.add("other-runtime-owner")
@@ -1760,11 +2042,13 @@ def test_close_unknown_session_tombstones_ambiguous_open():
 
     assert runner._closed_session_owners[session_id] == _TEST_RUNTIME_OWNER_ID
     with pytest.raises(RuntimeError, match="identity was already closed"):
-        cls.open_session(
-            runner,
-            _TEST_RUNTIME_OWNER_ID,
-            session_id,
-            {},
+        asyncio.run(
+            cls.open_session(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                session_id,
+                {},
+            )
         )
 
     runner._client_ids.add("other-runtime-owner")
@@ -1816,6 +2100,42 @@ def test_close_plan_cancellation_waits_for_owned_teardown():
     assert cleanup_finished.is_set()
 
 
+def test_close_plan_is_idempotent_after_plan_teardown():
+    cls, runner = _make_local_query_driver_actor()
+    cleanup_calls = []
+    runner._cleanup_finished_plan = lambda plan_id: cleanup_calls.append(plan_id)
+
+    asyncio.run(
+        cls.close_plan(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            "already-closed-plan",
+        )
+    )
+
+    assert cleanup_calls == []
+
+
+def test_close_plan_rejects_plan_from_another_session():
+    cls, runner = _make_local_query_driver_actor()
+    runner._plan_session_ids["other-session-plan"] = "other-session"
+    cleanup_calls = []
+    runner._cleanup_finished_plan = lambda plan_id: cleanup_calls.append(plan_id)
+
+    with pytest.raises(PermissionError, match="does not belong"):
+        asyncio.run(
+            cls.close_plan(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                "other-session-plan",
+            )
+        )
+
+    assert cleanup_calls == []
+
+
 @pytest.mark.parametrize(
     "first_owner",
     [_TEST_RUNTIME_OWNER_ID, "other-runtime-owner"],
@@ -1826,12 +2146,24 @@ def test_two_runtime_clients_keep_session_config_and_close_order_independent(fir
     runner._sessions = {}
     runner._client_ids.add(other_owner)
     sessions = {
-        _TEST_RUNTIME_OWNER_ID: ("session-a", {"AWS_ACCESS_KEY_ID": "session-a-key"}),
-        other_owner: ("session-b", {"AWS_ACCESS_KEY_ID": "session-b-key"}),
+        _TEST_RUNTIME_OWNER_ID: (
+            "session-a",
+            {
+                "AWS_ACCESS_KEY_ID": "session-a-key",
+                "AWS_SECRET_ACCESS_KEY": "session-a-secret",
+            },
+        ),
+        other_owner: (
+            "session-b",
+            {
+                "AWS_ACCESS_KEY_ID": "session-b-key",
+                "AWS_SECRET_ACCESS_KEY": "session-b-secret",
+            },
+        ),
     }
 
     for owner_id, (session_id, config) in sessions.items():
-        assert cls.open_session(runner, owner_id, session_id, config) is True
+        assert asyncio.run(cls.open_session(runner, owner_id, session_id, config)) is True
 
     first_session_id, _ = sessions[first_owner]
     surviving_owner = other_owner if first_owner == _TEST_RUNTIME_OWNER_ID else _TEST_RUNTIME_OWNER_ID
@@ -1885,6 +2217,212 @@ def test_driver_rejects_active_plan_identity_collision(copy_plan):
 
 
 @pytest.mark.parametrize("copy_plan", [False, True])
+def test_driver_applies_session_s3_config_to_query_cursor(copy_plan):
+    cls, runner = _make_local_query_driver_actor()
+    session = runner._sessions[_TEST_SESSION_ID]
+    session.config = {
+        "AWS_ACCESS_KEY_ID": "session-key",
+        "AWS_SECRET_ACCESS_KEY": "session-secret",
+        "AWS_REGION": "us-east-2",
+    }
+    session.s3_config = dict(session.config)
+
+    class _LogicalPlan:
+        @staticmethod
+        def idx():
+            return "s3-config-plan"
+
+        @staticmethod
+        def has_explicit_s3_credentials():
+            return False
+
+        @staticmethod
+        def to_physical_plan(_connection, effective_session_config):
+            assert effective_session_config == session.s3_config
+            raise RuntimeError("planned stop after query cursor configuration")
+
+    with pytest.raises(RuntimeError, match="planned stop after query cursor configuration"):
+        if copy_plan:
+            asyncio.run(
+                cls._run_copy_plan_for_session(
+                    runner,
+                    _TEST_SESSION_ID,
+                    session,
+                    _LogicalPlan(),
+                )
+            )
+        else:
+            cls._run_plan_sync(
+                runner,
+                _TEST_SESSION_ID,
+                session,
+                _LogicalPlan(),
+            )
+
+    query_connection = session.connection.cursors[-1]
+    assert "SET s3_access_key_id='session-key'" in query_connection.statements
+    assert "SET s3_secret_access_key='session-secret'" in query_connection.statements
+    assert "SET s3_region='us-east-2'" in query_connection.statements
+    assert query_connection.closed is True
+
+
+@pytest.mark.parametrize("copy_plan", [False, True])
+def test_driver_explicit_s3_settings_bypass_and_clear_session_credentials(monkeypatch, copy_plan):
+    from duckdb.runners.ray import worker as worker_module
+
+    cls, runner = _make_local_query_driver_actor()
+    session = runner._sessions[_TEST_SESSION_ID]
+    session.config = {
+        "AWS_ACCESS_KEY_ID": "incomplete-environment-key",
+        "AWS_PROFILE": "unavailable-profile",
+    }
+    session.s3_config = {
+        "AWS_ACCESS_KEY_ID": "stale-profile-key",
+        "AWS_SECRET_ACCESS_KEY": "stale-profile-secret",
+        "AWS_SESSION_TOKEN": "stale-profile-token",
+    }
+    monkeypatch.setattr(
+        worker_module,
+        "_resolve_session_aws_credentials",
+        lambda _config: (_ for _ in ()).throw(AssertionError("explicit DuckDB credentials must skip resolution")),
+    )
+
+    class _LogicalPlan:
+        @staticmethod
+        def idx():
+            return "explicit-s3-config-plan"
+
+        @staticmethod
+        def has_explicit_s3_credentials():
+            return True
+
+        @staticmethod
+        def to_physical_plan(_connection, effective_session_config):
+            assert effective_session_config == {}
+            raise RuntimeError("planned stop after explicit S3 baseline reset")
+
+    with pytest.raises(RuntimeError, match="planned stop after explicit S3 baseline reset"):
+        if copy_plan:
+            asyncio.run(
+                cls._run_copy_plan_for_session(
+                    runner,
+                    _TEST_SESSION_ID,
+                    session,
+                    _LogicalPlan(),
+                )
+            )
+        else:
+            cls._run_plan_sync(
+                runner,
+                _TEST_SESSION_ID,
+                session,
+                _LogicalPlan(),
+            )
+
+    query_connection = session.connection.cursors[-1]
+    assert "SET s3_access_key_id=''" in query_connection.statements
+    assert "SET s3_secret_access_key=''" in query_connection.statements
+    assert "SET s3_session_token=''" in query_connection.statements
+    assert query_connection.closed is True
+
+
+def test_copy_session_refresh_does_not_block_actor_loop(monkeypatch):
+    from duckdb.runners.ray import worker as worker_module
+
+    cls, runner = _make_local_query_driver_actor()
+    session = runner._sessions[_TEST_SESSION_ID]
+    refresh_started = threading.Event()
+    refresh_release = threading.Event()
+
+    def _delayed_refresh(config, effective_config, *, use_session_credentials):
+        assert use_session_credentials is True
+        refresh_started.set()
+        assert refresh_release.wait(timeout=1.0)
+        return dict(effective_config)
+
+    class _LogicalPlan:
+        @staticmethod
+        def idx():
+            return "slow-copy-session-refresh"
+
+        @staticmethod
+        def has_explicit_s3_credentials():
+            return False
+
+        @staticmethod
+        def to_physical_plan(_connection, _effective_session_config):
+            raise RuntimeError("planned stop after COPY session refresh")
+
+    monkeypatch.setattr(worker_module, "_refresh_effective_duckdb_s3_config", _delayed_refresh)
+
+    async def _refresh_while_serving_control_requests():
+        copy_task = asyncio.create_task(
+            cls._run_copy_plan_for_session(
+                runner,
+                _TEST_SESSION_ID,
+                session,
+                _LogicalPlan(),
+            )
+        )
+        try:
+            assert await asyncio.to_thread(refresh_started.wait, 1.0)
+            assert cls.ping(runner, _TEST_RUNTIME_OWNER_ID) is True
+        finally:
+            refresh_release.set()
+        with pytest.raises(RuntimeError, match="planned stop after COPY session refresh"):
+            await asyncio.wait_for(copy_task, timeout=1.0)
+
+    asyncio.run(_refresh_while_serving_control_requests())
+
+
+def test_copy_resource_registration_does_not_block_actor_loop(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    session = runner._sessions[_TEST_SESSION_ID]
+    registration_started = threading.Event()
+    registration_release = threading.Event()
+    plan_id = "slow-copy-resource-registration"
+
+    def _delayed_registration(_self, _plan, *, query_connection):
+        assert query_connection is runner._test_session_connection.cursors[-1]
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        registration_started.set()
+        assert registration_release.wait(timeout=1.0)
+        raise RuntimeError("planned stop after COPY resource registration")
+
+    def _teardown(_self, actual_plan_id, _query_id, *, drop_fragments):
+        assert actual_plan_id == plan_id
+        assert drop_fragments is False
+        cls._release_plan_session_state(runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_register_query_resources", _delayed_registration)
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    async def _register_while_serving_control_requests():
+        copy_task = asyncio.create_task(
+            cls._run_copy_plan_for_session(
+                runner,
+                _TEST_SESSION_ID,
+                session,
+                _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id)),
+            )
+        )
+        try:
+            assert await asyncio.to_thread(registration_started.wait, 1.0)
+            assert cls.ping(runner, _TEST_RUNTIME_OWNER_ID) is True
+        finally:
+            registration_release.set()
+        with pytest.raises(RuntimeError, match="planned stop after COPY resource registration"):
+            await asyncio.wait_for(copy_task, timeout=1.0)
+
+    asyncio.run(_register_while_serving_control_requests())
+
+    assert plan_id not in session.plan_ids
+    assert plan_id not in runner._plan_session_ids
+    assert runner._test_session_connection.cursors[-1].closed is True
+
+
+@pytest.mark.parametrize("copy_plan", [False, True])
 def test_driver_rejects_logical_to_physical_plan_identity_change(copy_plan):
     cls, runner = _make_local_query_driver_actor()
     session = runner._sessions[_TEST_SESSION_ID]
@@ -1896,7 +2434,11 @@ def test_driver_rejects_logical_to_physical_plan_identity_change(copy_plan):
             return "logical-plan"
 
         @staticmethod
-        def to_physical_plan(_connection):
+        def has_explicit_s3_credentials():
+            return False
+
+        @staticmethod
+        def to_physical_plan(_connection, _effective_session_config):
             return physical_plan
 
     existing_cursor_count = len(session.connection.cursors)
@@ -1960,7 +2502,11 @@ def test_driver_revalidates_physical_plan_session(
             return dict(_TEST_SESSION_CONFIG)
 
         @staticmethod
-        def to_physical_plan(_connection):
+        def has_explicit_s3_credentials():
+            return False
+
+        @staticmethod
+        def to_physical_plan(_connection, _effective_session_config):
             return physical_plan
 
     existing_cursor_count = len(session.connection.cursors)
@@ -1987,7 +2533,7 @@ def test_driver_revalidates_physical_plan_session(
     assert len(session.connection.cursors) == existing_cursor_count + 1
     assert session.connection.cursors[-1].closed is True
     assert session.plan_ids == set()
-    assert session.active_copy_operations == 0
+    assert session.active_operations == 0
     assert runner._plan_session_ids == {}
     assert runner._plan_connections == {}
 
@@ -3183,6 +3729,42 @@ def test_get_next_partition_leases_and_releases_metadata_aware_fragment(monkeypa
     assert result.partition() is payload
     assert released == [(_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id, "0")]
     assert output_owner.released is True
+    assert runner._leased_result_partition_refs == {}
+
+
+def test_get_next_partition_rejects_result_with_released_output_lease():
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "plan-released-lease"
+    _bind_test_query_resource_owner(runner, plan_id)
+    payload = object()
+    transition_calls = []
+    release_calls = []
+
+    class _ReleasedOutputLeaseOwner:
+        def transition_to(self, state):
+            transition_calls.append(state)
+            return False
+
+        def release(self):
+            release_calls.append("release")
+            return False
+
+    fragment = duckdb.ray_cxx.RayResultPartitionRef(payload, 7, 99, _ReleasedOutputLeaseOwner())
+    runner.curr_streams[plan_id] = _DummyStream([fragment])
+    runner.curr_plans[plan_id] = object()
+
+    with pytest.raises(RuntimeError, match="released before external publication"):
+        asyncio.run(
+            cls.get_next_partition(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                plan_id,
+            )
+        )
+
+    assert transition_calls == ["external_consumer"]
+    assert release_calls == ["release"]
     assert runner._leased_result_partition_refs == {}
 
 
@@ -5693,10 +6275,163 @@ def test_ray_query_driver_clients_attach_to_job_runtime(monkeypatch):
         ((client_a._owner_id, {"PYTHONPATH": "/vane"}), {}),
         ((client_b._owner_id, {"PYTHONPATH": "/vane"}), {}),
     ]
-    assert handle.ping.calls == [
-        ((client_a._owner_id,), {}),
-        ((client_b._owner_id,), {}),
-    ]
+    assert handle.ping.calls == []
+
+
+def test_ray_query_driver_client_retries_named_runtime_that_is_shutting_down(monkeypatch):
+    class _FakeMethod:
+        def __init__(self, label):
+            self.label = label
+            self.calls = []
+
+        def remote(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return self.label
+
+    class _FakeHandle:
+        def __init__(self, name):
+            self.name = name
+            self.attach_client = _FakeMethod(("attach", name))
+            self.ping = _FakeMethod(("ping", name))
+            self.detach_client = _FakeMethod(("detach", name))
+
+    closing_handle = _FakeHandle("closing-runtime")
+    replacement_handle = _FakeHandle("replacement-runtime")
+    handles = iter((closing_handle, replacement_handle))
+    created = []
+
+    class _Factory:
+        @staticmethod
+        def remote(_runtime_config, _duckdb_memory_bytes):
+            handle = next(handles)
+            created.append(handle)
+            return handle
+
+    monkeypatch.setattr(driver, "_maybe_set_distributed_cluster_capacity", lambda: None)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(
+            gcs_address="gcs-a",
+            get_job_id=lambda: "job-a",
+        ),
+    )
+    monkeypatch.setattr(
+        driver,
+        "get_head_node",
+        lambda: {"NodeID": "a" * 56, "Resources": {"memory": 1_000}},
+    )
+    monkeypatch.setattr(driver, "_collect_vane_env_overrides", lambda: {})
+    monkeypatch.setattr(driver.RayQueryDriverActor, "options", lambda **_kwargs: _Factory())
+    monkeypatch.setattr(driver.time, "sleep", lambda _seconds: None)
+
+    def _resolve(ref, **_kwargs):
+        if ref == ("attach", "closing-runtime"):
+            raise driver.RayRuntimeShuttingDownError("Ray query runtime is shutting down")
+        return True
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+
+    client = driver.RayQueryDriverClient()
+
+    assert created == [closing_handle, replacement_handle]
+    assert client.runner is replacement_handle
+    assert len(closing_handle.attach_client.calls) == 1
+    assert len(replacement_handle.attach_client.calls) == 1
+    assert len(replacement_handle.ping.calls) == 0
+
+
+def test_ray_query_driver_client_retires_drained_named_runtime_before_retry(monkeypatch):
+    class _FakeMethod:
+        def __init__(self, label):
+            self.label = label
+            self.calls = []
+
+        def remote(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return self.label
+
+    class _FakeHandle:
+        def __init__(self, name):
+            self.name = name
+            self.attach_client = _FakeMethod(("attach", name))
+            self.runtime_replacement_ready = _FakeMethod(("replacement-ready", name))
+
+    closing_handle = _FakeHandle("closing-runtime")
+    replacement_handle = _FakeHandle("replacement-runtime")
+    active_handle = closing_handle
+    created = []
+    killed = []
+
+    class _Factory:
+        @staticmethod
+        def remote(_runtime_config, _duckdb_memory_bytes):
+            created.append(active_handle)
+            return active_handle
+
+    monkeypatch.setattr(driver, "_maybe_set_distributed_cluster_capacity", lambda: None)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(
+            gcs_address="gcs-a",
+            get_job_id=lambda: "job-a",
+        ),
+    )
+    monkeypatch.setattr(
+        driver,
+        "get_head_node",
+        lambda: {"NodeID": "a" * 56, "Resources": {"memory": 1_000}},
+    )
+    monkeypatch.setattr(driver, "_collect_vane_env_overrides", lambda: {})
+    monkeypatch.setattr(driver.RayQueryDriverActor, "options", lambda **_kwargs: _Factory())
+    monkeypatch.setattr(driver.time, "sleep", lambda _seconds: None)
+
+    def _resolve(ref, **_kwargs):
+        if ref == ("attach", "closing-runtime"):
+            raise driver.RayRuntimeShuttingDownError("Ray query runtime is shutting down")
+        if ref == ("replacement-ready", "closing-runtime"):
+            return True
+        return True
+
+    def _kill(actor, *, no_restart):
+        nonlocal active_handle
+        assert actor is closing_handle
+        assert no_restart is True
+        killed.append(actor)
+        active_handle = replacement_handle
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+    monkeypatch.setattr(driver.ray, "kill", _kill)
+
+    client = driver.RayQueryDriverClient()
+
+    assert created == [closing_handle, replacement_handle]
+    assert killed == [closing_handle]
+    assert client.runner is replacement_handle
+    assert len(closing_handle.runtime_replacement_ready.calls) == 1
+
+
+def test_runtime_replacement_classifier_rejects_permanent_actor_init_failure():
+    assert driver._runtime_actor_is_being_replaced(
+        driver.ray.exceptions.RayActorError(
+            error_msg="actor disappeared before attach",
+        )
+    )
+    assert not driver._runtime_actor_is_being_replaced(
+        driver.ray.exceptions.RayActorError(
+            error_msg="actor constructor failed",
+            actor_init_failed=True,
+        )
+    )
+
+    class _WrappedShutdown(RuntimeError):
+        @staticmethod
+        def as_instanceof_cause():
+            return driver.RayRuntimeShuttingDownError("Ray query runtime is shutting down")
+
+    wrapped_shutdown = _WrappedShutdown()
+    assert driver._runtime_actor_is_being_replaced(wrapped_shutdown)
 
 
 def test_ray_runner_creates_one_driver_client_for_concurrent_sessions(monkeypatch):
@@ -5901,10 +6636,17 @@ def test_ray_query_driver_client_serializes_first_session_open_with_close(monkey
 
     client = object.__new__(driver.RayQueryDriverClient)
     client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
     _initialize_test_query_driver_client(client)
     client.runner = SimpleNamespace(
         open_session=_OpenMethod(),
         close_session=_CloseMethod(),
+    )
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
     )
     monkeypatch.setattr(driver, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref)
     open_errors = []
@@ -5977,10 +6719,17 @@ def test_ray_query_driver_client_closes_session_after_ambiguous_open_failure(mon
 
     client = object.__new__(driver.RayQueryDriverClient)
     client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
     _initialize_test_query_driver_client(client)
     client.runner = SimpleNamespace(
         open_session=_OpenMethod(),
         close_session=_CloseMethod(),
+    )
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
     )
 
     def _resolve(ref, **_kwargs):
@@ -6006,6 +6755,54 @@ def test_ray_query_driver_client_closes_session_after_ambiguous_open_failure(mon
     assert close_calls == [("owner-a", "session-a")]
     assert client._uncertain_sessions == {}
     assert client._closing_session_ids == set()
+
+
+def test_ray_query_driver_client_does_not_close_session_after_rejected_open(monkeypatch):
+    open_ref = object()
+
+    class _OpenMethod:
+        @staticmethod
+        def remote(*_args):
+            return open_ref
+
+    class _CloseMethod:
+        @staticmethod
+        def remote(*_args):
+            raise AssertionError("an unrecorded rejected session must not receive a close RPC")
+
+    class _Plan:
+        @staticmethod
+        def session_id():
+            return "session-a"
+
+        @staticmethod
+        def session_config():
+            return {}
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    _initialize_test_query_driver_client(client)
+    client.runner = SimpleNamespace(
+        open_session=_OpenMethod(),
+        close_session=_CloseMethod(),
+    )
+    monkeypatch.setattr(
+        driver,
+        "resolve_object_refs_blocking",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            driver.VaneSessionOpenRejectedError("Vane session identity collision")
+        ),
+    )
+
+    with pytest.raises(driver.VaneSessionOpenRejectedError, match="identity collision"):
+        client._ensure_session(_Plan())
+
+    assert client._opened_sessions == {}
+    assert client._uncertain_sessions == {}
+
+    client.close_session("session-a")
+
+    assert set(client._closed_session_ids) == {"session-a"}
 
 
 def test_ray_query_driver_client_detach_supersedes_session_close_waiting_on_open(monkeypatch):
@@ -6130,8 +6927,15 @@ def test_ray_query_driver_client_session_close_failure_stays_fenced_and_retryabl
 
     client = object.__new__(driver.RayQueryDriverClient)
     client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
     _initialize_test_query_driver_client(client, {"session-a": {}})
     client.runner = SimpleNamespace(close_session=_CloseMethod())
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
+    )
 
     def _resolve(ref, **_kwargs):
         if ref == 1:
@@ -6155,9 +6959,82 @@ def test_ray_query_driver_client_session_close_failure_stays_fenced_and_retryabl
     assert client._closing_session_ids == set()
 
 
-@pytest.mark.parametrize("failed_ref", ["attach", "ping"])
+@pytest.mark.parametrize(
+    ("ray_initialized", "current_gcs_address"),
+    [
+        (False, "gcs-a"),
+        (True, "gcs-b"),
+    ],
+)
+def test_ray_query_driver_client_session_close_is_terminal_after_runtime_changes(
+    monkeypatch,
+    ray_initialized,
+    current_gcs_address,
+):
+    class _CloseMethod:
+        @staticmethod
+        def remote(_owner_id, _session_id):
+            raise AssertionError("stale Ray runtime must not receive a session-close RPC")
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
+    _initialize_test_query_driver_client(client, {"session-a": {}})
+    client.runner = SimpleNamespace(close_session=_CloseMethod())
+
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: ray_initialized)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address=current_gcs_address),
+    )
+
+    client.close_session("session-a")
+
+    assert client._opened_sessions == {}
+    assert client._uncertain_sessions == {}
+    assert client._closing_session_ids == set()
+    assert client._session_closes_in_progress == set()
+    assert set(client._closed_session_ids) == {"session-a"}
+
+
+def test_ray_query_driver_client_session_close_is_terminal_after_runtime_actor_loss(monkeypatch):
+    class _CloseMethod:
+        @staticmethod
+        def remote(_owner_id, _session_id):
+            return "close-ref"
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
+    _initialize_test_query_driver_client(client, {"session-a": {}})
+    client.runner = SimpleNamespace(close_session=_CloseMethod())
+
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
+    )
+    monkeypatch.setattr(
+        driver,
+        "resolve_object_refs_blocking",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            driver.ray.exceptions.RayActorError(error_msg="runtime actor exited")
+        ),
+    )
+
+    client.close_session("session-a")
+
+    assert client._opened_sessions == {}
+    assert client._uncertain_sessions == {}
+    assert client._closing_session_ids == set()
+    assert client._session_closes_in_progress == set()
+    assert set(client._closed_session_ids) == {"session-a"}
+
+
 @pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
-def test_ray_query_driver_client_detaches_when_initialization_fails(monkeypatch, failed_ref, failure_type):
+def test_ray_query_driver_client_detaches_when_attach_is_ambiguous(monkeypatch, failure_type):
     events = []
 
     class _FakeMethod:
@@ -6199,8 +7076,8 @@ def test_ray_query_driver_client_detaches_when_initialization_fails(monkeypatch,
 
     def resolve(ref, **kwargs):
         events.append(("resolve", ref, kwargs))
-        if ref == failed_ref:
-            raise failure_type(f"planned {failed_ref} failure")
+        if ref == "attach":
+            raise failure_type("planned attach failure")
         return True
 
     monkeypatch.setattr(driver, "resolve_object_refs_blocking", resolve)
@@ -6210,18 +7087,161 @@ def test_ray_query_driver_client_detaches_when_initialization_fails(monkeypatch,
         lambda actor, *, no_restart: events.append(("kill", actor, no_restart)),
     )
 
-    with pytest.raises(failure_type, match=f"planned {failed_ref} failure"):
+    with pytest.raises(failure_type, match="planned attach failure"):
         driver.RayQueryDriverClient()
 
     attach_event = next(event for event in events if event[0] == "attach")
     detach_event = next(event for event in events if event[0] == "detach")
     assert attach_event[1] == detach_event[1]
-    if failed_ref == "ping":
-        ping_event = next(event for event in events if event[0] == "ping")
-        assert attach_event[1] == ping_event[1]
-    else:
-        assert all(event[0] != "ping" for event in events)
+    assert all(event[0] != "ping" for event in events)
     assert ("kill", handle, True) in events
+
+
+def test_ray_query_driver_client_retries_detach_after_ambiguous_attach(monkeypatch):
+    detach_calls = []
+
+    class _DetachMethod:
+        @staticmethod
+        def remote(owner_id):
+            detach_calls.append(owner_id)
+            return "detach-ref"
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
+    runner = SimpleNamespace(detach_client=_DetachMethod())
+    resolve_attempts = 0
+
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
+    )
+    monkeypatch.setattr(driver.time, "sleep", lambda _seconds: None)
+
+    def _resolve(ref, **kwargs):
+        nonlocal resolve_attempts
+        assert ref == "detach-ref"
+        assert kwargs["honor_query_deadline"] is False
+        resolve_attempts += 1
+        if resolve_attempts == 1:
+            raise RuntimeError("transient detach failure")
+        return False
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+
+    client._detach_after_failed_attach(runner, RuntimeError("ambiguous attach"))
+
+    assert detach_calls == ["owner-a", "owner-a"]
+    assert resolve_attempts == 2
+
+
+def test_ray_query_driver_client_reuses_ambiguous_detach_ref_after_timeout(monkeypatch):
+    detach_calls = []
+    resolve_attempts = 0
+
+    class _DetachMethod:
+        @staticmethod
+        def remote(owner_id):
+            detach_calls.append(owner_id)
+            return "detach-ref"
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
+    runner = SimpleNamespace(detach_client=_DetachMethod())
+
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
+    )
+    monkeypatch.setattr(driver.time, "sleep", lambda _seconds: None)
+
+    def _resolve(ref, **kwargs):
+        nonlocal resolve_attempts
+        assert ref == "detach-ref"
+        assert kwargs["honor_query_deadline"] is False
+        resolve_attempts += 1
+        if resolve_attempts == 1:
+            raise FutureTimeoutError("ambiguous detach timeout")
+        return False
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+
+    client._detach_after_failed_attach(runner, RuntimeError("ambiguous attach"))
+
+    assert detach_calls == ["owner-a"]
+    assert resolve_attempts == 2
+
+
+def test_ray_query_driver_client_preserves_attach_error_when_detach_was_not_needed(monkeypatch):
+    class _WrappedPermissionError(RuntimeError):
+        @staticmethod
+        def as_instanceof_cause():
+            return PermissionError("owner was never attached")
+
+    class _DetachMethod:
+        @staticmethod
+        def remote(owner_id):
+            assert owner_id == "owner-a"
+            return "detach-ref"
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
+    runner = SimpleNamespace(detach_client=_DetachMethod())
+
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
+    )
+    monkeypatch.setattr(
+        driver,
+        "resolve_object_refs_blocking",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(_WrappedPermissionError()),
+    )
+
+    client._detach_after_failed_attach(runner, RuntimeError("ambiguous attach"))
+
+
+def test_ray_query_driver_client_reports_unconfirmed_detach_after_ambiguous_attach(monkeypatch):
+    detach_calls = []
+
+    class _DetachMethod:
+        @staticmethod
+        def remote(owner_id):
+            detach_calls.append(owner_id)
+            return "detach-ref"
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
+    runner = SimpleNamespace(detach_client=_DetachMethod())
+    attach_error = RuntimeError("ambiguous attach")
+
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
+    )
+    monkeypatch.setattr(driver.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        driver,
+        "resolve_object_refs_blocking",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("persistent detach failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="owner detach could not be confirmed") as error:
+        client._detach_after_failed_attach(runner, attach_error)
+
+    assert error.value.__cause__ is attach_error
+    assert detach_calls == ["owner-a"] * driver._RUNTIME_ATTACH_CLEANUP_ATTEMPTS
 
 
 @pytest.mark.parametrize("close_order", [(0, 1), (1, 0)])
@@ -6329,6 +7349,40 @@ def test_ray_query_driver_client_close_remains_retryable_after_detach_failure(mo
     assert client._client_closing is True
 
 
+def test_ray_query_driver_client_close_is_terminal_when_ray_stops_during_detach(monkeypatch):
+    class _DetachMethod:
+        @staticmethod
+        def remote(owner_id):
+            assert owner_id == "owner-a"
+            return "detach-ref"
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
+    _initialize_test_query_driver_client(client, {"session-a": {}})
+    client.runner = SimpleNamespace(detach_client=_DetachMethod())
+    initialized = iter((True, False))
+
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: next(initialized))
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
+    )
+    monkeypatch.setattr(
+        driver,
+        "resolve_object_refs_blocking",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("Ray is not initialized")),
+    )
+
+    client.close()
+
+    assert client.runner is None
+    assert client._opened_sessions == {}
+    assert client._client_closing is False
+    assert client._client_close_in_progress is False
+
+
 def test_ray_query_driver_client_close_remains_retryable_after_kill_failure(monkeypatch):
     class _DetachMethod:
         @staticmethod
@@ -6374,6 +7428,41 @@ def test_ray_query_driver_client_close_remains_retryable_after_kill_failure(monk
     assert client._opened_sessions == {}
     assert client._client_closing is False
     assert kill_calls == [runner, runner]
+
+
+def test_ray_query_driver_client_close_is_terminal_after_runtime_actor_loss(monkeypatch):
+    class _DetachMethod:
+        @staticmethod
+        def remote(owner_id):
+            assert owner_id == "owner-a"
+            return "detach-ref"
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
+    _initialize_test_query_driver_client(client, {"session-a": {}})
+    client.runner = SimpleNamespace(detach_client=_DetachMethod())
+
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="gcs-a"),
+    )
+    monkeypatch.setattr(
+        driver,
+        "resolve_object_refs_blocking",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            driver.ray.exceptions.RayActorError(error_msg="runtime actor exited")
+        ),
+    )
+
+    client.close()
+
+    assert client.runner is None
+    assert client._opened_sessions == {}
+    assert client._client_closing is False
+    assert client._client_close_in_progress is False
 
 
 def test_ray_query_driver_client_concurrent_close_detaches_once(monkeypatch):

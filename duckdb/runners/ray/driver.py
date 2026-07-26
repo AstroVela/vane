@@ -45,6 +45,10 @@ _LEASE_REQUEST_REPLAY_CAPACITY = 65_536
 _SESSION_CLOSE_REPLAY_CAPACITY = 65_536
 _CLIENT_DETACH_REPLAY_CAPACITY = 65_536
 _DEFAULT_PROGRESS_TOPOLOGY_INIT_TIMEOUT_S = 60.0
+_RUNTIME_ATTACH_TIMEOUT_S = 300.0
+_RUNTIME_ATTACH_RETRY_INTERVAL_S = 0.05
+_RUNTIME_ATTACH_CLEANUP_ATTEMPTS = 3
+_RUNTIME_ATTACH_CLEANUP_TIMEOUT_S = 300.0
 RAY_QUERY_RUNTIME_ACTOR_NAMESPACE = "vane"
 RAY_QUERY_RUNTIME_ACTOR_NAME_PREFIX = "vane-query-runtime-"
 
@@ -63,6 +67,61 @@ class QueryTeardownOwnershipError(RuntimeError):
 
 class QueryFteRegistryQuiesceError(QueryTeardownOwnershipError):
     """Local FTE threads still own query state; teardown must remain retryable."""
+
+
+class RayRuntimeShuttingDownError(RuntimeError):
+    """The named job runtime cannot accept a new owner while it exits."""
+
+
+class VaneSessionOpenRejectedError(RuntimeError):
+    """A session-open request was rejected before the actor recorded it."""
+
+
+def _runtime_error_candidates(error: BaseException) -> list[BaseException]:
+    candidates: list[BaseException] = [error]
+    candidate_ids = {id(error)}
+    candidate_index = 0
+    while candidate_index < len(candidates) and candidate_index < 16:
+        candidate = candidates[candidate_index]
+        candidate_index += 1
+        converted = getattr(candidate, "as_instanceof_cause", None)
+        if callable(converted):
+            try:
+                converted_cause = converted()
+            except BaseException:
+                converted_cause = None
+            if isinstance(converted_cause, BaseException) and id(converted_cause) not in candidate_ids:
+                candidate_ids.add(id(converted_cause))
+                candidates.append(converted_cause)
+        for attribute in ("cause", "__cause__"):
+            cause = getattr(candidate, attribute, None)
+            if isinstance(cause, BaseException) and id(cause) not in candidate_ids:
+                candidate_ids.add(id(cause))
+                candidates.append(cause)
+    return candidates
+
+
+def _runtime_error_contains(error: BaseException, error_type: type[BaseException]) -> bool:
+    return any(isinstance(candidate, error_type) for candidate in _runtime_error_candidates(error))
+
+
+def _runtime_error_is_wait_timeout(error: BaseException) -> bool:
+    return any(
+        isinstance(candidate, TimeoutError)
+        or type(candidate).__name__ in {"GetTimeoutError", "FutureTimeoutError"}
+        for candidate in _runtime_error_candidates(error)
+    )
+
+
+def _runtime_actor_is_being_replaced(error: BaseException) -> bool:
+    candidates = _runtime_error_candidates(error)
+    if any(isinstance(candidate, RayRuntimeShuttingDownError) for candidate in candidates):
+        return True
+    actor_error_type = getattr(ray.exceptions, "RayActorError", None)
+    return isinstance(actor_error_type, type) and any(
+        isinstance(candidate, actor_error_type) and not bool(getattr(candidate, "actor_init_failed", False))
+        for candidate in candidates
+    )
 
 
 @dataclass(frozen=True)
@@ -1355,7 +1414,7 @@ class RayQueryDriverActor:
         normalized_config = _normalize_session_config(runtime_config)
         with self._session_lock:
             if self._driver_shutdown_started:
-                raise RuntimeError("Ray query runtime is shutting down")
+                raise RayRuntimeShuttingDownError("Ray query runtime is shutting down")
             if owner_key in self._detaching_client_ids or owner_key in self._detached_client_results:
                 raise RuntimeError("Ray query runtime owner identity was already detached")
             if normalized_config != self._runtime_config:
@@ -1415,7 +1474,7 @@ class RayQueryDriverActor:
             session.active_operations -= 1
             session.condition.notify_all()
 
-    def open_session(self, owner_id: str, session_id: str, config: dict[str, str]) -> bool:
+    async def open_session(self, owner_id: str, session_id: str, config: dict[str, str]) -> bool:
         self._require_owner(owner_id)
         owner_key = str(owner_id).strip()
         session_key = str(session_id).strip()
@@ -1426,15 +1485,32 @@ class RayQueryDriverActor:
             if owner_key not in self._client_ids or owner_key in self._detaching_client_ids:
                 raise PermissionError("Ray query runtime operation requires an attached client owner")
             if self._driver_shutdown_started:
-                raise RuntimeError("Ray query runtime is shutting down")
+                raise VaneSessionOpenRejectedError("Ray query runtime is shutting down")
             if session_key in self._closed_session_owners:
-                raise RuntimeError(f"Vane session identity was already closed: {session_key}")
+                raise VaneSessionOpenRejectedError(f"Vane session identity was already closed: {session_key}")
             existing = self._sessions.get(session_key)
             if existing is not None:
                 if existing.owner_id != owner_key or existing.config != normalized_config:
-                    raise RuntimeError(f"Vane session identity collision: {session_key}")
+                    raise VaneSessionOpenRejectedError(f"Vane session identity collision: {session_key}")
                 return False
-            session_connection = self._ensure_duckdb_conn().cursor()
+
+        session_connection = self._ensure_duckdb_conn().cursor()
+        with self._session_lock:
+            if owner_key not in self._client_ids or owner_key in self._detaching_client_ids:
+                session_connection.close()
+                raise PermissionError("Ray query runtime operation requires an attached client owner")
+            if bool(getattr(self, "_driver_shutdown_started")):
+                session_connection.close()
+                raise VaneSessionOpenRejectedError("Ray query runtime is shutting down")
+            if session_key in self._closed_session_owners:
+                session_connection.close()
+                raise VaneSessionOpenRejectedError(f"Vane session identity was already closed: {session_key}")
+            existing = self._sessions.get(session_key)
+            if existing is not None:
+                session_connection.close()
+                if existing.owner_id != owner_key or existing.config != normalized_config:
+                    raise VaneSessionOpenRejectedError(f"Vane session identity collision: {session_key}")
+                return False
             self._sessions[session_key] = _DriverSession(
                 owner_id=owner_key,
                 config=normalized_config,
@@ -1457,6 +1533,11 @@ class RayQueryDriverActor:
         if self._driver_shutdown_started:
             raise RuntimeError("Ray query driver is shutting down")
         return True
+
+    def runtime_replacement_ready(self) -> bool:
+        """Return whether a new client may retire this drained named runtime."""
+        with self._session_lock:
+            return self._driver_shutdown_complete and not self._client_ids
 
     async def _shutdown_runtime(self) -> None:
         """Stop background maintenance and gracefully drain every worker actor."""
@@ -1548,8 +1629,6 @@ class RayQueryDriverActor:
                 with session.condition:
                     while session.active_operations > 0:
                         session.condition.wait()
-                    if session.closed:
-                        return
                     plan_ids = tuple(session.plan_ids)
                 for plan_id in plan_ids:
                     self._cleanup_finished_plan(plan_id)
@@ -3106,7 +3185,7 @@ class RayQueryDriverActor:
                     graph,
                     allocation,
                     reservation_ratio=float(os.environ.get("VANE_QUERY_RESOURCE_RESERVATION_RATIO", "0.5")),
-                    on_change=lambda query_id=graph.query_id: self._signal_query_resource_change(query_id),
+                    on_change=lambda: self._signal_query_resource_change(graph.query_id),
                 )
                 manager_registered = True
                 for stage in graph.stages:
@@ -3619,7 +3698,8 @@ class RayQueryDriverActor:
                     self._leased_result_partition_refs = {}
                 if not hasattr(self, "_result_partition_ref_counters"):
                     self._result_partition_ref_counters = {}
-                output_lease_owner.transition_to("external_consumer")
+                if not output_lease_owner.transition_to("external_consumer"):
+                    raise RuntimeError(f"query result lease was released before external publication: plan={plan_key}")
                 next_id = int(self._result_partition_ref_counters.get(plan_key, 0))
                 self._result_partition_ref_counters[plan_key] = next_id + 1
                 release_token = str(next_id)
@@ -3684,8 +3764,34 @@ class RayQueryDriverActor:
                     self._leased_result_partition_refs.pop(plan_key, None)
 
     async def close_plan(self, owner_id: str, session_id: str, plan_id: str) -> None:
-        self._require_plan_session(owner_id, session_id, plan_id)
-        await _to_thread_with_owned_side_effects(self._cleanup_finished_plan, plan_id)
+        owner_key = str(owner_id).strip()
+        session_key = str(session_id).strip()
+        plan_key = str(plan_id)
+        if not owner_key:
+            raise ValueError("Ray query runtime owner_id must not be empty")
+        if not session_key:
+            raise ValueError("Vane session_id must not be empty")
+        with self._session_lock:
+            session = self._sessions.get(session_key)
+            closed_owner = self._closed_session_owners.get(session_key)
+            plan_session_id = self._plan_session_ids.get(plan_key)
+        if session is None:
+            if closed_owner is None:
+                raise RuntimeError(f"Vane session is not open: {session_key}")
+            if closed_owner != owner_key:
+                raise PermissionError("Vane session operation requires its owning runtime client")
+            return
+        if session.owner_id != owner_key:
+            raise PermissionError("Vane session operation requires its owning runtime client")
+        with session.condition:
+            owns_plan = plan_key in session.plan_ids
+        if plan_session_id is None and not owns_plan:
+            return
+        if plan_session_id is not None and plan_session_id != session_key:
+            raise PermissionError("query plan does not belong to the requested Vane session")
+        if plan_session_id is None or not owns_plan:
+            raise RuntimeError(f"query plan ownership state is inconsistent: {plan_key}")
+        await _to_thread_with_owned_side_effects(self._cleanup_finished_plan, plan_key)
 
     async def run_plan(
         self,
@@ -3835,7 +3941,26 @@ class RayQueryDriverActor:
                 self._plan_connections[plan_id] = query_connection
 
             try:
-                physical_plan = logical_plan.to_physical_plan(query_connection)
+                from duckdb.runners.ray.worker import (
+                    _configure_duckdb_s3,
+                    _refresh_effective_duckdb_s3_config,
+                )
+
+                use_session_credentials = not bool(logical_plan.has_explicit_s3_credentials())
+                refreshed_s3_config = _refresh_effective_duckdb_s3_config(
+                    session.config,
+                    session.s3_config,
+                    use_session_credentials=use_session_credentials,
+                )
+                session.s3_config = _configure_duckdb_s3(
+                    query_connection,
+                    refreshed_s3_config,
+                    use_session_credentials=use_session_credentials,
+                )
+                physical_plan = logical_plan.to_physical_plan(
+                    query_connection,
+                    session.s3_config,
+                )
                 physical_plan_id = str(physical_plan.idx())
                 if physical_plan_id != plan_id:
                     raise RuntimeError(
@@ -3947,35 +4072,18 @@ class RayQueryDriverActor:
     ) -> CopyPlanOutcome:
         logical_plan = plan
         plan_id = str(logical_plan.idx())
-        with session.lock:
-            query_connection = session.connection.cursor()
-            with self._session_lock:
-                if self._sessions.get(str(session_id)) is not session:
-                    query_connection.close()
-                    raise RuntimeError(f"Vane session closed during COPY startup: {session_id}")
-                if plan_id in self._plan_session_ids:
-                    query_connection.close()
-                    raise RuntimeError(f"query plan identity is already active: {plan_id}")
-                session.plan_ids.add(plan_id)
-                self._plan_session_ids[plan_id] = str(session_id)
-                self._plan_connections[plan_id] = query_connection
-            try:
-                plan = logical_plan.to_physical_plan(query_connection)
-                physical_plan_id = str(plan.idx())
-                if physical_plan_id != plan_id:
-                    raise RuntimeError(
-                        f"logical/physical query plan identity changed: logical={plan_id!r} "
-                        f"physical={physical_plan_id!r}"
-                    )
-                self._validate_plan_session(session_id, plan, session)
-            except BaseException:
-                self._release_plan_session_state(plan_id)
-                raise
         graph = None
         plan_runner_started = False
         plan_execution: asyncio.Task[Any] | None = None
         startup_tasks: list[asyncio.Task[Any]] = []
         try:
+            plan, query_connection = await _to_thread_with_owned_side_effects(
+                self._prepare_copy_plan_sync,
+                session_id,
+                session,
+                logical_plan,
+            )
+            self._plan_query_ids[plan_id] = plan_id
             graph, allocation = await self._register_query_resources(
                 plan,
                 query_connection=query_connection,
@@ -4090,7 +4198,7 @@ class RayQueryDriverActor:
                 query_id,
             )
         try:
-            final_progress_snapshot = await asyncio.to_thread(
+            final_progress_snapshot = await _to_thread_with_owned_side_effects(
                 self._build_local_progress_snapshot,
                 query_id,
                 None,
@@ -4122,6 +4230,59 @@ class RayQueryDriverActor:
             result=result,
             final_progress_snapshot=final_progress_snapshot,
         )
+
+    def _prepare_copy_plan_sync(
+        self,
+        session_id: str,
+        session: _DriverSession,
+        logical_plan: Any,
+    ) -> tuple[Any, Any]:
+        """Build a COPY plan on an owned thread without blocking actor control RPCs."""
+        plan_id = str(logical_plan.idx())
+        with session.operation_lock:
+            query_connection = session.connection.cursor()
+            with self._session_lock:
+                if self._sessions.get(str(session_id)) is not session:
+                    query_connection.close()
+                    raise RuntimeError(f"Vane session closed during COPY startup: {session_id}")
+                if plan_id in self._plan_session_ids:
+                    query_connection.close()
+                    raise RuntimeError(f"query plan identity is already active: {plan_id}")
+                session.plan_ids.add(plan_id)
+                self._plan_session_ids[plan_id] = str(session_id)
+                self._plan_connections[plan_id] = query_connection
+            try:
+                from duckdb.runners.ray.worker import (
+                    _configure_duckdb_s3,
+                    _refresh_effective_duckdb_s3_config,
+                )
+
+                use_session_credentials = not bool(logical_plan.has_explicit_s3_credentials())
+                refreshed_s3_config = _refresh_effective_duckdb_s3_config(
+                    session.config,
+                    session.s3_config,
+                    use_session_credentials=use_session_credentials,
+                )
+                session.s3_config = _configure_duckdb_s3(
+                    query_connection,
+                    refreshed_s3_config,
+                    use_session_credentials=use_session_credentials,
+                )
+                plan = logical_plan.to_physical_plan(
+                    query_connection,
+                    session.s3_config,
+                )
+                physical_plan_id = str(plan.idx())
+                if physical_plan_id != plan_id:
+                    raise RuntimeError(
+                        f"logical/physical query plan identity changed: logical={plan_id!r} "
+                        f"physical={physical_plan_id!r}"
+                    )
+                self._validate_plan_session(session_id, plan, session)
+            except BaseException:
+                self._release_plan_session_state(plan_id)
+                raise
+        return plan, query_connection
 
     async def get_next_partition(
         self,
@@ -4345,39 +4506,127 @@ class RayQueryDriverClient:
             # creation time; constructor args are too late for module import.
             "runtime_env": {"env_vars": runtime_config},
         }
-        self.runner = RayQueryDriverActor.options(**runner_options).remote(  # type: ignore[attr-defined]
-            runtime_config,
-            driver_duckdb_memory_bytes,
+        attach_deadline = time.monotonic() + _RUNTIME_ATTACH_TIMEOUT_S
+        while True:
+            runner = RayQueryDriverActor.options(**runner_options).remote(  # type: ignore[attr-defined]
+                runtime_config,
+                driver_duckdb_memory_bytes,
+            )
+            self.runner = runner
+            try:
+                attach_ref = runner.attach_client.remote(self._owner_id, runtime_config)
+                resolve_object_refs_blocking(
+                    attach_ref,
+                    timeout=300,
+                )
+                break
+            except BaseException as error:
+                self.runner = None
+                replacing_runtime = _runtime_actor_is_being_replaced(error)
+                if not replacing_runtime:
+                    self._detach_after_failed_attach(runner, error)
+                    raise
+                try:
+                    replacement_ready = bool(
+                        resolve_object_refs_blocking(
+                            runner.runtime_replacement_ready.remote(),
+                            timeout=300,
+                            honor_query_deadline=False,
+                        )
+                    )
+                    if replacement_ready:
+                        ray.kill(runner, no_restart=True)
+                except BaseException:
+                    pass
+                if time.monotonic() >= attach_deadline:
+                    raise TimeoutError("timed out waiting for the previous Ray query runtime to exit") from error
+                time.sleep(_RUNTIME_ATTACH_RETRY_INTERVAL_S)
+
+    def _runtime_is_unavailable_or_replaced(self) -> bool:
+        if not ray.is_initialized():
+            return True
+        try:
+            current_gcs_address = ray.get_runtime_context().gcs_address
+        except Exception:
+            return False
+        return (
+            self._ray_gcs_address is not None
+            and current_gcs_address is not None
+            and current_gcs_address != self._ray_gcs_address
         )
 
-        try:
-            attach_ref = self.runner.attach_client.remote(self._owner_id, runtime_config)
-            resolve_object_refs_blocking(
-                attach_ref,
-                timeout=300,
-            )
-            resolve_object_refs_blocking(
-                self.runner.ping.remote(self._owner_id),
-                timeout=300,
-            )
-        except BaseException:
-            runner = self.runner
-            self.runner = None
+    def _detach_after_failed_attach(self, runner: Any, attach_error: BaseException) -> None:
+        cleanup_error: BaseException | None = None
+        cleanup_deadline = time.monotonic() + _RUNTIME_ATTACH_CLEANUP_TIMEOUT_S
+        detach_ref: Any | None = None
+        terminal_failures = 0
+        while time.monotonic() < cleanup_deadline:
             try:
+                if detach_ref is None:
+                    detach_ref = runner.detach_client.remote(self._owner_id)
                 last_owner = bool(
                     resolve_object_refs_blocking(
-                        runner.detach_client.remote(self._owner_id),
-                        timeout=300,
+                        detach_ref,
+                        timeout=max(0.0, cleanup_deadline - time.monotonic()),
                         honor_query_deadline=False,
                     )
                 )
-                if last_owner:
+            except BaseException as error:
+                if (
+                    _runtime_error_contains(error, PermissionError)
+                    or _runtime_actor_is_being_replaced(error)
+                    or self._runtime_is_unavailable_or_replaced()
+                ):
+                    return
+                cleanup_error = error
+                if _runtime_error_is_wait_timeout(error):
+                    time.sleep(_RUNTIME_ATTACH_RETRY_INTERVAL_S)
+                    continue
+                terminal_failures += 1
+                if terminal_failures >= _RUNTIME_ATTACH_CLEANUP_ATTEMPTS:
+                    break
+                # The detach method failed and restored owner state. Retry the
+                # idempotent mutation with a new RPC. Ambiguous waits keep
+                # resolving the original ObjectRef instead.
+                detach_ref = None
+                time.sleep(_RUNTIME_ATTACH_RETRY_INTERVAL_S)
+                continue
+            if last_owner:
+                try:
                     ray.kill(runner, no_restart=True)
-            except BaseException:
-                pass
-            raise
+                except BaseException:
+                    # The actor is drained and has no owners. A later attach can
+                    # retire it through runtime_replacement_ready().
+                    pass
+            return
+        assert cleanup_error is not None
+        raise RuntimeError(
+            "Ray query runtime attach failed and owner detach could not be confirmed: "
+            f"attach={type(attach_error).__name__}: {attach_error}; "
+            f"detach={type(cleanup_error).__name__}: {cleanup_error}"
+        ) from attach_error
 
-    def _ensure_session(self, plan: Any) -> tuple[str, dict[str, str]]:
+    def _complete_session_close_locally(self, session_key: str) -> None:
+        with self._session_condition:
+            self._session_closes_in_progress.discard(session_key)
+            self._opened_sessions.pop(session_key, None)
+            self._uncertain_sessions.pop(session_key, None)
+            self._closed_session_ids[session_key] = True
+            self._closing_session_ids.discard(session_key)
+            self._session_condition.notify_all()
+
+    def _complete_client_close_locally(self) -> None:
+        with self._session_condition:
+            self.runner = None
+            self._opened_sessions.clear()
+            self._uncertain_sessions.clear()
+            self._closing_session_ids.clear()
+            self._closed_session_ids.clear()
+            self._client_closing = False
+            self._client_close_in_progress = False
+            self._session_condition.notify_all()
+
+    def _ensure_session(self, plan: Any) -> tuple[str, dict[str, str], Any]:
         session_id = str(plan.session_id()).strip()
         if not session_id:
             raise ValueError("distributed logical plan is missing its Vane session identity")
@@ -4395,7 +4644,7 @@ class RayQueryDriverClient:
                 if existing is not None:
                     if existing != session_config:
                         raise RuntimeError(f"Vane session config changed after open: {session_id}")
-                    return session_id, session_config
+                    return session_id, session_config, runner
                 uncertain = self._uncertain_sessions.get(session_id)
                 if uncertain is not None and uncertain != session_config:
                     raise RuntimeError(f"Vane session config changed after an ambiguous open: {session_id}")
@@ -4408,10 +4657,12 @@ class RayQueryDriverClient:
                 runner.open_session.remote(self._owner_id, session_id, session_config),
                 timeout=300,
             )
-        except BaseException:
+        except BaseException as error:
+            rejected_without_open = _runtime_error_contains(error, VaneSessionOpenRejectedError)
             with self._session_condition:
                 self._opening_session_ids.remove(session_id)
-                self._uncertain_sessions[session_id] = session_config
+                if not rejected_without_open:
+                    self._uncertain_sessions[session_id] = session_config
                 self._session_condition.notify_all()
             raise
         with self._session_condition:
@@ -4422,15 +4673,13 @@ class RayQueryDriverClient:
             self._session_condition.notify_all()
         if closing:
             raise RuntimeError(f"Vane session closed while it was opening: {session_id}")
-        return session_id, session_config
+        return session_id, session_config, runner
 
     def close_session(self, session_id: str) -> None:
         session_key = str(session_id).strip()
         if not session_key:
             return
         with self._session_condition:
-            if self._client_closing:
-                return
             if session_key in self._closed_session_ids:
                 return
             self._closing_session_ids.add(session_key)
@@ -4447,31 +4696,27 @@ class RayQueryDriverClient:
                 return
             runner = getattr(self, "runner", None)
             if runner is None:
-                self._opened_sessions.pop(session_key, None)
-                self._uncertain_sessions.pop(session_key, None)
-                self._closed_session_ids[session_key] = True
-                self._closing_session_ids.discard(session_key)
-                self._session_condition.notify_all()
+                self._complete_session_close_locally(session_key)
                 return
             self._session_closes_in_progress.add(session_key)
+        if self._runtime_is_unavailable_or_replaced():
+            self._complete_session_close_locally(session_key)
+            return
         try:
             resolve_object_refs_blocking(
                 runner.close_session.remote(self._owner_id, session_key),
                 timeout=300,
                 honor_query_deadline=False,
             )
-        except BaseException:
+        except BaseException as error:
+            if self._runtime_is_unavailable_or_replaced() or _runtime_actor_is_being_replaced(error):
+                self._complete_session_close_locally(session_key)
+                return
             with self._session_condition:
                 self._session_closes_in_progress.remove(session_key)
                 self._session_condition.notify_all()
             raise
-        with self._session_condition:
-            self._session_closes_in_progress.remove(session_key)
-            self._opened_sessions.pop(session_key, None)
-            self._uncertain_sessions.pop(session_key, None)
-            self._closed_session_ids[session_key] = True
-            self._closing_session_ids.discard(session_key)
-            self._session_condition.notify_all()
+        self._complete_session_close_locally(session_key)
 
     def close(self) -> None:
         with self._session_condition:
@@ -4484,35 +4729,8 @@ class RayQueryDriverClient:
             self._client_closing = True
             while self._opening_session_ids or self._session_closes_in_progress:
                 self._session_condition.wait()
-        if not ray.is_initialized():
-            with self._session_condition:
-                self.runner = None
-                self._opened_sessions.clear()
-                self._uncertain_sessions.clear()
-                self._closing_session_ids.clear()
-                self._closed_session_ids.clear()
-                self._client_closing = False
-                self._client_close_in_progress = False
-                self._session_condition.notify_all()
-            return
-        try:
-            current_gcs_address = ray.get_runtime_context().gcs_address
-        except Exception:
-            current_gcs_address = None
-        if (
-            self._ray_gcs_address is not None
-            and current_gcs_address is not None
-            and current_gcs_address != self._ray_gcs_address
-        ):
-            with self._session_condition:
-                self.runner = None
-                self._opened_sessions.clear()
-                self._uncertain_sessions.clear()
-                self._closing_session_ids.clear()
-                self._closed_session_ids.clear()
-                self._client_closing = False
-                self._client_close_in_progress = False
-                self._session_condition.notify_all()
+        if self._runtime_is_unavailable_or_replaced():
+            self._complete_client_close_locally()
             return
         try:
             last_owner = bool(
@@ -4524,20 +4742,15 @@ class RayQueryDriverClient:
             )
             if last_owner:
                 ray.kill(runner, no_restart=True)
-        except BaseException:
+        except BaseException as error:
+            if self._runtime_is_unavailable_or_replaced() or _runtime_actor_is_being_replaced(error):
+                self._complete_client_close_locally()
+                return
             with self._session_condition:
                 self._client_close_in_progress = False
                 self._session_condition.notify_all()
             raise
-        with self._session_condition:
-            self.runner = None
-            self._opened_sessions.clear()
-            self._uncertain_sessions.clear()
-            self._closing_session_ids.clear()
-            self._closed_session_ids.clear()
-            self._client_closing = False
-            self._client_close_in_progress = False
-            self._session_condition.notify_all()
+        self._complete_client_close_locally()
 
     shutdown = close
 
@@ -4556,7 +4769,7 @@ class RayQueryDriverClient:
         )
 
     @staticmethod
-    def _cancel_and_settle_remote_call(future: Any) -> None:
+    def _cancel_and_settle_remote_call(future: Any) -> BaseException | None:
         """Wait for an async actor mutation to stop before local ownership moves on."""
         try:
             ray.cancel(future, force=False)
@@ -4568,8 +4781,79 @@ class RayQueryDriverClient:
                 timeout=300,
                 honor_query_deadline=False,
             )
-        except BaseException:
-            pass
+        except BaseException as error:
+            return error
+        return None
+
+    def _client_detach_completed_for_runner(
+        self,
+        runner: Any,
+        error: BaseException,
+    ) -> bool:
+        with self._session_condition:
+            while self._client_close_in_progress:
+                self._session_condition.wait()
+            if getattr(self, "runner", None) is not runner:
+                return True
+            # detach_client removes the owner only after every owned session and
+            # plan was closed. A retryable post-detach actor-kill failure leaves
+            # the local handle in place, so PermissionError is still terminal
+            # for this plan teardown.
+            return self._client_closing and _runtime_error_contains(error, PermissionError)
+
+    def _close_plan_after_stream(
+        self,
+        runner: Any,
+        *,
+        session_id: str,
+        plan_id: str,
+    ) -> None:
+        try:
+            resolve_object_refs_blocking(
+                runner.close_plan.remote(
+                    self._owner_id,
+                    session_id,
+                    plan_id,
+                ),
+                timeout=300,
+                honor_query_deadline=False,
+            )
+        except BaseException as error:
+            if (
+                self._client_detach_completed_for_runner(runner, error)
+                or self._runtime_is_unavailable_or_replaced()
+                or _runtime_actor_is_being_replaced(error)
+            ):
+                return
+            raise
+
+    def _teardown_failed_plan(
+        self,
+        runner: Any,
+        future: Any,
+        *,
+        session_id: str,
+        plan_id: str,
+        operation_error: BaseException,
+    ) -> None:
+        settled_error = self._cancel_and_settle_remote_call(future)
+        try:
+            self._close_plan_after_stream(
+                runner,
+                session_id=session_id,
+                plan_id=plan_id,
+            )
+        except BaseException as teardown_error:
+            settled_detail = (
+                ""
+                if settled_error is None
+                else f"; settled={type(settled_error).__name__}: {settled_error}"
+            )
+            raise RuntimeError(
+                f"Ray query plan {plan_id} failed and teardown also failed: "
+                f"operation={type(operation_error).__name__}: {operation_error}"
+                f"{settled_detail}; teardown={type(teardown_error).__name__}: {teardown_error}"
+            ) from operation_error
 
     def stream_plan(
         self,
@@ -4582,28 +4866,22 @@ class RayQueryDriverClient:
 
         _t_stream_start = _time.time()
 
-        session_id, _ = self._ensure_session(plan)
+        session_id, _, runner = self._ensure_session(plan)
         plan_id = str(plan.idx())
-        run_future = self.runner.run_plan.remote(self._owner_id, session_id, plan)
+        run_future = runner.run_plan.remote(self._owner_id, session_id, plan)
         try:
             resolve_object_refs_blocking(run_future)
-        except BaseException:
-            self._cancel_and_settle_remote_call(run_future)
-            try:
-                resolve_object_refs_blocking(
-                    self.runner.close_plan.remote(
-                        self._owner_id,
-                        session_id,
-                        plan_id,
-                    ),
-                    timeout=30,
-                    honor_query_deadline=False,
-                )
-            except BaseException:
-                pass
+        except BaseException as operation_error:
+            self._teardown_failed_plan(
+                runner,
+                run_future,
+                session_id=session_id,
+                plan_id=plan_id,
+                operation_error=operation_error,
+            )
             raise
         progress = _RayProgressSession(
-            self.runner,
+            runner,
             self._owner_id,
             session_id,
             plan_id,
@@ -4613,11 +4891,11 @@ class RayQueryDriverClient:
         completed = False
         try:
             while True:
-                partition_future = self.runner.get_next_partition.remote(
+                partition_future = runner.get_next_partition.remote(
                     self._owner_id,
                     session_id,
                     plan_id,
-                    self.runner,
+                    runner,
                 )
                 materialized_result = progress.resolve(partition_future)
                 if materialized_result is None:
@@ -4629,14 +4907,10 @@ class RayQueryDriverClient:
         finally:
             try:
                 if not completed:
-                    resolve_object_refs_blocking(
-                        self.runner.close_plan.remote(
-                            self._owner_id,
-                            session_id,
-                            plan_id,
-                        ),
-                        timeout=30,
-                        honor_query_deadline=False,
+                    self._close_plan_after_stream(
+                        runner,
+                        session_id=session_id,
+                        plan_id=plan_id,
                     )
             finally:
                 progress.finish(final_state="FINISHED" if completed else None)
@@ -4651,15 +4925,15 @@ class RayQueryDriverClient:
         _t0 = _time.time()
 
         try:
-            session_id, _ = self._ensure_session(plan)
+            session_id, _, runner = self._ensure_session(plan)
             plan_id = str(plan.idx())
-            future = self.runner.run_copy_plan.remote(
+            future = runner.run_copy_plan.remote(
                 self._owner_id,
                 session_id,
                 plan,
             )
             progress = _RayProgressSession(
-                self.runner,
+                runner,
                 self._owner_id,
                 session_id,
                 plan_id,
@@ -4671,20 +4945,14 @@ class RayQueryDriverClient:
             try:
                 try:
                     outcome = progress.resolve(future)
-                except BaseException:
-                    self._cancel_and_settle_remote_call(future)
-                    try:
-                        resolve_object_refs_blocking(
-                            self.runner.close_plan.remote(
-                                self._owner_id,
-                                session_id,
-                                plan_id,
-                            ),
-                            timeout=30,
-                            honor_query_deadline=False,
-                        )
-                    except BaseException:
-                        pass
+                except BaseException as operation_error:
+                    self._teardown_failed_plan(
+                        runner,
+                        future,
+                        session_id=session_id,
+                        plan_id=plan_id,
+                        operation_error=operation_error,
+                    )
                     raise
                 if not isinstance(outcome, CopyPlanOutcome):
                     raise TypeError(f"Ray COPY returned {type(outcome).__name__}, expected CopyPlanOutcome")

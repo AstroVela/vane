@@ -274,9 +274,17 @@ def _shutdown_owned_actors(ray: Any, actors_obj: Any) -> None:
     if not bool(getattr(actors_obj, "_owns_actors", False)):
         return
     actors = list(getattr(actors_obj, "actors", []))
-    for actor in actors:
-        ray.kill(actor, no_restart=True)
-    actors_obj.actors = []
+    errors: list[str] = []
+    remaining_actors: list[Any] = []
+    for actor_index, actor in enumerate(actors):
+        try:
+            ray.kill(actor, no_restart=True)
+        except BaseException as exc:
+            errors.append(f"actor-{actor_index}: {type(exc).__name__}: {exc}")
+            remaining_actors.append(actor)
+    actors_obj.actors = remaining_actors
+    if errors:
+        raise RuntimeError("failed to shut down UDF actor pool: " + "; ".join(errors))
 
 
 def _resolve_actor_pool_init_refs(ray: Any, actors_obj: Any) -> None:
@@ -297,14 +305,24 @@ def _resolve_actor_pool_init_refs(ray: Any, actors_obj: Any) -> None:
         else:
             resolve_object_refs_blocking(refs, timeout=timeout_s)
     except Exception as exc:
-        _shutdown_owned_actors(ray, actors_obj)
         if _is_timeout_error(exc):
             timeout_desc = "query deadline" if timeout_s is None else f"{timeout_s:.3f}s"
-            raise RuntimeError(
+            readiness_error = RuntimeError(
                 "UDF actor pool initialization timed out "
                 f"after {timeout_desc} while waiting for {len(refs)} actor init refs"
+            )
+        else:
+            readiness_error = RuntimeError(f"UDF actor pool initialization failed: {type(exc).__name__}: {exc}")
+        try:
+            _shutdown_owned_actors(ray, actors_obj)
+        except BaseException as cleanup_error:
+            raise _OwnedUDFActorPoolsError(
+                "UDF actor pool initialization failed and actor cleanup also failed: "
+                f"initialization={readiness_error}; cleanup={type(cleanup_error).__name__}: {cleanup_error}",
+                owned_actor_pools=[actors_obj],
+                creation_error=readiness_error,
             ) from exc
-        raise RuntimeError(f"UDF actor pool initialization failed: {type(exc).__name__}: {exc}") from exc
+        raise readiness_error from exc
     actors_obj._confirmed_ready.update(range(len(actors)))
 
 
@@ -561,16 +579,23 @@ def wait_for_actor_pools_ready(actor_pools: list[UDFActorPoolBase]) -> None:
         for actors_obj in actor_pools:
             _resolve_actor_pool_init_refs(ray, actors_obj)
     except BaseException as readiness_error:
-        cleanup_errors = []
+        cleanup_errors: list[str] = []
+        remaining_owned: list[UDFActorPoolBase] = []
         for actors_obj in reversed(actor_pools):
             try:
                 actors_obj.shutdown()
             except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
+                cleanup_errors.append(f"{type(cleanup_error).__name__}: {cleanup_error}")
+                remaining_owned.append(actors_obj)
         if cleanup_errors:
-            raise RuntimeError(
-                f"UDF actor readiness failed and cleanup also failed: {cleanup_errors[0]}"
+            creation_error = getattr(readiness_error, "creation_error", readiness_error)
+            raise _OwnedUDFActorPoolsError(
+                "UDF actor readiness failed and cleanup also failed: " + "; ".join(cleanup_errors),
+                owned_actor_pools=list(reversed(remaining_owned)),
+                creation_error=creation_error,
             ) from readiness_error
+        if isinstance(readiness_error, _OwnedUDFActorPoolsError):
+            raise readiness_error.creation_error
         raise
 
 

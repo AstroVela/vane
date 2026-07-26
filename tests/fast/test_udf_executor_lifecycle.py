@@ -594,6 +594,46 @@ def test_udf_actor_pool_init_failure_preserves_root_cause():
         actor_pool_mod._resolve_actor_pool_init_refs(FakeRay(), actors_obj)
 
 
+def test_udf_actor_pool_init_cleanup_retains_only_failed_handles_for_retry():
+    import duckdb.execution.udf_ray_actor_pool as actor_pool_mod
+
+    class FakeRay:
+        def __init__(self):
+            self.killed = []
+
+        def kill(self, actor, **kwargs):
+            self.killed.append((actor, kwargs))
+            if actor == "actor-0":
+                raise RuntimeError("planned cleanup failure")
+
+    class FakeRef:
+        def future(self):
+            class _Future:
+                def result(self, timeout=None):
+                    raise TypeError(f"invalid init ObjectRef, timeout={timeout}")
+
+            return _Future()
+
+    fake_ray = FakeRay()
+    actors_obj = types.SimpleNamespace(
+        actors=["actor-0", "actor-1"],
+        _init_refs=[FakeRef(), FakeRef()],
+        _confirmed_ready=set(),
+        _owns_actors=True,
+    )
+
+    with pytest.raises(actor_pool_mod._OwnedUDFActorPoolsError) as exc_info:
+        actor_pool_mod._resolve_actor_pool_init_refs(fake_ray, actors_obj)
+
+    assert "UDF actor pool initialization failed: TypeError" in str(exc_info.value.creation_error)
+    assert exc_info.value.owned_actor_pools == [actors_obj]
+    assert actors_obj.actors == ["actor-0"]
+    assert fake_ray.killed == [
+        ("actor-0", {"no_restart": True}),
+        ("actor-1", {"no_restart": True}),
+    ]
+
+
 def test_local_vllm_submit_fails_fast_when_engine_init_deadline_expires():
     import duckdb.execution.vllm as vllm
 
@@ -1651,6 +1691,152 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_injects_with_callback(mon
         }
     }
     assert injected == [handles_map]
+
+
+def test_ensure_local_subprocess_actor_pools_for_nodes_reuses_injected_pool(monkeypatch):
+    import duckdb.execution.udf_subprocess as subprocess_exec
+
+    session_config = {"AWS_ACCESS_KEY_ID": "session-key"}
+
+    class ExistingPool:
+        pool_size = 2
+
+        def __init__(self):
+            self.session_config = session_config
+
+        def submit(self, *_args, **_kwargs):
+            raise AssertionError("submit should not be called")
+
+        def create_admission_authority(self):
+            raise AssertionError("admission should not be used")
+
+        def stats(self):
+            return {}
+
+        def cancel_output_grants(self):
+            pass
+
+        def first_proc(self):
+            return None
+
+        def worker_pids(self):
+            return ()
+
+    existing_pool = ExistingPool()
+    nodes = [
+        {
+            "node_id": 4,
+            "payload": {
+                "execution_backend": "subprocess_actor",
+                "actor_number": 2,
+                "function_pickle": b"unused",
+                "call_mode": "map_batches",
+            },
+            "executor_options": {
+                "session_config": session_config,
+                "local_actor_pool": existing_pool,
+            },
+        }
+    ]
+    monkeypatch.setattr(
+        subprocess_exec,
+        "LocalSubprocessActorPool",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not create a duplicate pool")),
+    )
+
+    created, handles_map = subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(nodes)
+
+    assert created == []
+    assert handles_map == {
+        "4": {
+            "session_config": session_config,
+            "local_actor_pool": existing_pool,
+        }
+    }
+
+
+def test_ensure_local_subprocess_actor_pools_rejects_implicit_cross_session_reuse():
+    import duckdb.execution.udf_subprocess as subprocess_exec
+
+    class ExistingPool:
+        pool_size = 1
+        session_config = {"AWS_ACCESS_KEY_ID": "session-a-key"}
+
+        def submit(self, *_args, **_kwargs):
+            raise AssertionError("submit should not be called")
+
+        def create_admission_authority(self):
+            raise AssertionError("admission should not be used")
+
+        def stats(self):
+            return {}
+
+        def cancel_output_grants(self):
+            pass
+
+        def first_proc(self):
+            return None
+
+        def worker_pids(self):
+            return ()
+
+    nodes = [
+        {
+            "node_id": 4,
+            "payload": {
+                "execution_backend": "subprocess_actor",
+                "actor_number": 1,
+                "function_pickle": b"unused",
+                "call_mode": "map_batches",
+            },
+            "executor_options": {
+                "local_actor_pool": ExistingPool(),
+            },
+        }
+    ]
+
+    with pytest.raises(ValueError, match="belongs to a different Vane session"):
+        subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(nodes)
+
+
+def test_subprocess_actor_executor_rejects_cross_session_pool_attachment():
+    import duckdb.execution.udf_subprocess as subprocess_exec
+
+    class ExistingPool:
+        pool_size = 1
+        session_config = {"AWS_ACCESS_KEY_ID": "session-a-key"}
+
+        def submit(self, *_args, **_kwargs):
+            raise AssertionError("submit should not be called")
+
+        def create_admission_authority(self):
+            raise AssertionError("admission should not be used")
+
+        def stats(self):
+            return {}
+
+        def cancel_output_grants(self):
+            pass
+
+        def first_proc(self):
+            return None
+
+        def worker_pids(self):
+            return ()
+
+    payload = {
+        "execution_backend": "subprocess_actor",
+        "actor_number": 1,
+        "function_pickle": b"unused",
+        "call_mode": "map_batches",
+    }
+    options = {
+        "local_actor_pool": ExistingPool(),
+        "session_config": {"AWS_ACCESS_KEY_ID": "session-b-key"},
+    }
+
+    with pytest.raises(ValueError, match="belongs to a different Vane session"):
+        subprocess_exec.UDFExecutor(payload, options)
 
 
 def test_ensure_local_subprocess_actor_pools_for_plan_propagates_collection_errors():
