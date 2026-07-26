@@ -428,13 +428,17 @@ try:
         con = vane.connect()
         parquet_path = Path(tmp_dir) / "ai_options.parquet"
         con.execute(
-            f"COPY (SELECT value::VARCHAR AS chunk FROM range(4) t(value)) "
-            f"TO '{parquet_path}' (FORMAT PARQUET)"
+            "COPY ("
+            "SELECT value::VARCHAR AS chunk, "
+            "CASE WHEN value % 2 = 0 THEN from_hex('89504e47') ELSE NULL::BLOB END AS image "
+            "FROM range(4) t(value)"
+            f") TO '{parquet_path}' (FORMAT PARQUET)"
         )
         source = f"read_parquet('{parquet_path}')"
         prompt_relation = con.sql(f'''
             SELECT chunk, ai_prompt(
                 chunk,
+                image,
                 struct_pack(
                     provider := 'mock_ai_sql',
                     model := 'ray-model',
@@ -466,7 +470,13 @@ try:
 
         prompt_rows = sorted(zip(prompt.column(0).to_pylist(), prompt.column(1).to_pylist()))
         embedding_rows = sorted(zip(embedding.column(0).to_pylist(), embedding.column(1).to_pylist()))
-        assert prompt_rows == [(str(value), f"ray-model:{value}") for value in range(4)]
+        assert prompt_rows == [
+            (
+                str(value),
+                f"ray-model:{value}:images=89504e47" if value % 2 == 0 else f"ray-model:{value}",
+            )
+            for value in range(4)
+        ]
         assert [len(vector) for _, vector in embedding_rows] == [5, 5, 5, 5]
         assert all(abs(float(np.linalg.norm(vector)) - 1.0) < 1e-6 for _, vector in embedding_rows)
         print("AI_RAY_OPTIONS provider=mock_ai_sql model=ray-model dimensions=5 concurrency=3")

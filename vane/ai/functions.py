@@ -518,7 +518,8 @@ class _PromptBatch:
     Supports both plain text and structured output (Pydantic models).
     When ``return_format`` is set, responses are serialized to JSON strings.
     When ``image_columns`` is set, image data from those columns is packed
-    alongside text into multimodal message tuples.
+    alongside text into multimodal message tuples. List-valued image cells are
+    expanded in order and NULL or zero-length image values are skipped.
     """
 
     def __init__(
@@ -529,6 +530,7 @@ class _PromptBatch:
         max_api_concurrency: int | None = None,
         return_format: Any | None = None,
         image_columns: list[str] | None = None,
+        propagate_null_prompts: bool = False,
         max_retries: int = 3,
         on_error: _OnError = "raise",
     ) -> None:
@@ -538,6 +540,7 @@ class _PromptBatch:
         self._max_api_concurrency = max_api_concurrency
         self._return_format = return_format
         self._image_columns = image_columns or []
+        self._propagate_null_prompts = propagate_null_prompts
         self._max_retries = max_retries
         self._on_error: _OnError = on_error
         self._prompter = None  # lazy: instantiate on first __call__
@@ -558,37 +561,62 @@ class _PromptBatch:
         return json.dumps(result, default=str)
 
     def __call__(self, table: pa.Table) -> pa.Table:
+        texts = table.column(self._column).to_pylist()
+        active_indices = [idx for idx, text in enumerate(texts) if not (self._propagate_null_prompts and text is None)]
+        results: list[Any] = [None] * len(texts)
+        if self._propagate_null_prompts and not active_indices:
+            return pa.table({self._output_column: pa.array(results, type=pa.string())})
+
         if self._prompter is None:
             self._prompter = self._descriptor.instantiate()
-        texts = table.column(self._column).to_pylist()
         texts = [t if t is not None else "" for t in texts]
 
         # Build per-row message tuples (text + optional image columns)
         image_lists: list[list[Any]] = [table.column(col_name).to_pylist() for col_name in self._image_columns]
 
+        def has_image_data(value: Any) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return len(value) > 0
+            return True
+
         def build_messages(idx: int) -> tuple[Any, ...]:
             parts: list[Any] = [texts[idx]]
             for img_col in image_lists:
                 val = img_col[idx]
-                if val is not None:
+                if isinstance(val, list):
+                    parts.extend(item for item in val if has_image_data(item))
+                elif has_image_data(val):
                     parts.append(val)
             return tuple(parts)
 
-        # Use batch API if available (e.g. vLLM's continuous batching)
-        if hasattr(self._prompter, "prompt_batch"):
-            results = _retry_call(
-                self._prompter.prompt_batch,
-                texts,
+        row_messages = [build_messages(idx) for idx in range(len(texts))]
+
+        # Keep text-only rows on the batch API (e.g. vLLM's continuous
+        # batching), even when other rows in the Arrow batch contain images.
+        prompt_batch = getattr(self._prompter, "prompt_batch", None)
+        if callable(prompt_batch):
+            text_indices = [idx for idx in active_indices if len(row_messages[idx]) == 1]
+            prompt_indices = [idx for idx in active_indices if len(row_messages[idx]) > 1]
+        else:
+            text_indices = []
+            prompt_indices = active_indices
+
+        if text_indices:
+            text_results = _retry_call(
+                prompt_batch,
+                [texts[idx] for idx in text_indices],
                 max_retries=self._max_retries,
                 on_error=self._on_error,
             )
-            if results is None:
-                results = [None] * len(texts)
+            if text_results is None:
+                text_results = [None] * len(text_indices)
             if self._return_format is not None:
-                results = [self._serialize_result(r) for r in results]
-            return pa.table({self._output_column: results})
+                text_results = [self._serialize_result(result) for result in text_results]
+            for idx, result in zip(text_indices, text_results, strict=True):
+                results[idx] = result
 
-        has_images = bool(self._image_columns)
         max_retries = self._max_retries
         on_error = self._on_error
 
@@ -598,30 +626,31 @@ class _PromptBatch:
 
                 async def limited(idx: int) -> str | None:
                     async with sem:
-                        msgs = build_messages(idx) if has_images else (texts[idx],)
                         result = await _retry_call_async(
                             self._prompter.prompt,
-                            msgs,
+                            row_messages[idx],
                             max_retries=max_retries,
                             on_error=on_error,
                         )
                         return self._serialize_result(result) if self._return_format else result
 
-                return await asyncio.gather(*(limited(i) for i in range(len(texts))))
+                return await asyncio.gather(*(limited(idx) for idx in prompt_indices))
 
             async def single(idx: int) -> str | None:
-                msgs = build_messages(idx) if has_images else (texts[idx],)
                 result = await _retry_call_async(
                     self._prompter.prompt,
-                    msgs,
+                    row_messages[idx],
                     max_retries=max_retries,
                     on_error=on_error,
                 )
                 return self._serialize_result(result) if self._return_format else result
 
-            return await asyncio.gather(*(single(i) for i in range(len(texts))))
+            return await asyncio.gather(*(single(idx) for idx in prompt_indices))
 
-        results = _run_async(run_all())
+        if prompt_indices:
+            prompt_results = _run_async(run_all())
+            for idx, result in zip(prompt_indices, prompt_results, strict=True):
+                results[idx] = result
         return pa.table({self._output_column: results})
 
 

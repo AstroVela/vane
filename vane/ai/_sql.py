@@ -146,7 +146,11 @@ def _normalize_sql_options(options: dict[str, Any] | None) -> dict[str, Any]:
     return opts
 
 
-def build_ai_prompt_sql_spec(options: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_ai_prompt_sql_spec(
+    options: dict[str, Any] | None = None,
+    image_input: bool = False,
+) -> dict[str, Any]:
+    """Build the row-preserving SQL prompt UDF specification."""
     opts = _normalize_sql_options(options)
     provider = opts.pop("provider", "openai")
     model = opts.pop("model", None)
@@ -166,6 +170,8 @@ def build_ai_prompt_sql_spec(options: dict[str, Any] | None = None) -> dict[str,
         "messages",
         "response",
         udf_opts.max_api_concurrency,
+        image_columns=["images"] if image_input else None,
+        propagate_null_prompts=image_input,
         max_retries=resolved_max_retries,
         on_error=udf_opts.on_error,
     )
@@ -176,7 +182,7 @@ def build_ai_prompt_sql_spec(options: dict[str, Any] | None = None) -> dict[str,
         "provider": descriptor.get_provider(),
         "model": descriptor.get_model(),
         "return_type": "VARCHAR",
-        "input_names": ["messages"],
+        "input_names": ["messages", "images"] if image_input else ["messages"],
         "schema": {"response": "VARCHAR"},
         "batch_size": batch_size if batch_size is not None else _resolve_ai_batch_size(udf_opts),
         "row_preserving": True,

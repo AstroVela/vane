@@ -279,7 +279,8 @@ static Value PayloadWithAddedOrUpdatedFields(const Value &payload, child_list_t<
 }
 } // namespace
 
-unique_ptr<Expression> LowerRegisteredExpressionUDF(FunctionBindExpressionInput &input) {
+static unique_ptr<Expression> LowerRegisteredExpressionUDFInternal(FunctionBindExpressionInput &input,
+                                                                   bool preserve_foldable_nulls) {
 	if (!input.bind_data) {
 		throw BinderException("registered expression UDF is missing bind payload");
 	}
@@ -296,12 +297,31 @@ unique_ptr<Expression> LowerRegisteredExpressionUDF(FunctionBindExpressionInput 
 	children.push_back(make_uniq<BoundConstantExpression>(registered_data.payload));
 
 	FunctionBinder binder(input.context);
+	if (preserve_foldable_nulls) {
+		// The catalog-based binder replaces a function call with a NULL constant
+		// before invoking UDFBind when any foldable argument is NULL. AI image
+		// arguments use NULL to mean "no image", so bind the sole internal udf
+		// overload directly and let the UDF operator receive that row value.
+		auto functions = UDFFunction::GetFunctions();
+		auto function = functions.GetFunctionByOffset(0);
+		function.name = UDFFunction::Name;
+		return binder.BindScalarFunction(std::move(function), std::move(children));
+	}
+
 	ErrorData error;
 	auto lowered = binder.BindScalarFunction(DEFAULT_SCHEMA, UDFFunction::Name, std::move(children), error);
 	if (!lowered) {
 		error.Throw();
 	}
 	return lowered;
+}
+
+unique_ptr<Expression> LowerRegisteredExpressionUDF(FunctionBindExpressionInput &input) {
+	return LowerRegisteredExpressionUDFInternal(input, false);
+}
+
+unique_ptr<Expression> LowerRegisteredExpressionUDFPreservingFoldableNulls(FunctionBindExpressionInput &input) {
+	return LowerRegisteredExpressionUDFInternal(input, true);
 }
 
 Value BuildPythonUDFPayload(

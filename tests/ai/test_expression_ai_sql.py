@@ -62,6 +62,12 @@ class MockPrompter:
     def prompt_batch(self, text: list[str]) -> list[str]:
         return [f"{self._prefix}:{item}" for item in text]
 
+    async def prompt(self, messages: tuple[object, ...]) -> str:
+        text = str(messages[0]) if messages else ""
+        images = [part.hex() for part in messages[1:] if isinstance(part, bytes)]
+        image_suffix = f":images={','.join(images)}" if images else ""
+        return f"{self._prefix}:{text}{image_suffix}"
+
 
 @dataclass
 class MockPrompterDescriptor(PrompterDescriptor):
@@ -247,6 +253,32 @@ def test_ai_prompt_options_survive_logical_plan_pickle_to_fresh_connection():
     assert udf_node["payload"]["ai_dimensions"] is None
     assert udf_node["payload"]["function_pickle_size_bytes"] > 0
     assert 0 < len(serialized) < 1_000_000
+
+
+def test_ai_prompt_image_input_survives_plan_round_trip_as_row_data():
+    image_hex = "89504e470d0a1a0a49535355453138524f5744415441"
+    image_bytes = bytes.fromhex(image_hex)
+    source = vane.connect()
+    relation = source.sql(f"""
+        SELECT ai_prompt(
+            prompt,
+            image,
+            struct_pack(provider := 'mock_ai_sql', model := 'round-trip-vision', concurrency := 1)
+        ) AS response
+        FROM (
+            VALUES ('describe', from_hex('{image_hex}'))
+        ) AS t(prompt, image)
+    """)
+
+    _, target, physical, _ = _round_trip_ai_plan(relation)
+    udf_node = physical.collect_udf_nodes()[0]
+    table = _execute_ai_physical_plan(target, physical)
+    payload = udf_node["payload"]
+
+    assert table.column(0).to_pylist() == [f"round-trip-vision:describe:images={image_hex}"]
+    assert payload["input_names"] == ["messages", "images"]
+    assert payload["scalar_arg_count"] == 2
+    assert image_bytes not in payload["function_pickle"]
 
 
 def test_ai_embed_fixed_dimensions_survive_round_trip():
@@ -448,6 +480,247 @@ def test_ai_prompt_sql_with_mock_provider():
     assert rows == [("topic:alpha",), ("topic:beta",)]
 
 
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "ai_prompt(NULL, struct_pack(provider := 'mock_ai_sql', concurrency := 1))",
+        "ai_prompt(NULL::VARCHAR, struct_pack(provider := 'mock_ai_sql', concurrency := 1))",
+        "ai_embed(NULL, struct_pack(provider := 'mock_ai_sql', dimensions := 4, concurrency := 1))",
+        "ai_embed(NULL::VARCHAR, struct_pack(provider := 'mock_ai_sql', dimensions := 4, concurrency := 1))",
+        "ai_prompt('alpha', NULL)",
+        "ai_embed('abc', NULL)",
+    ],
+)
+def test_ai_sql_text_signatures_preserve_legacy_null_propagation(monkeypatch, expression):
+    provider_calls = []
+
+    def recording_provider(name=None, **options):
+        provider_calls.append((name, options))
+        return MockProvider()
+
+    monkeypatch.setitem(provider_registry.PROVIDERS, "mock_ai_sql", recording_provider)
+    monkeypatch.setitem(provider_registry.PROVIDERS, "openai", recording_provider)
+    conn = vane.connect()
+
+    assert conn.sql(f"SELECT {expression} AS result").fetchall() == [(None,)]
+    assert provider_calls == []
+
+
+@pytest.mark.parametrize("null_prompt", ["NULL", "NULL::VARCHAR"])
+def test_ai_prompt_image_input_propagates_literal_null_prompt(monkeypatch, null_prompt):
+    provider_calls = []
+
+    def recording_provider(name=None, **options):
+        provider_calls.append((name, options))
+        return MockProvider()
+
+    monkeypatch.setitem(provider_registry.PROVIDERS, "mock_ai_sql", recording_provider)
+    conn = vane.connect()
+
+    relation = conn.sql(f"""
+        SELECT ai_prompt(
+            {null_prompt},
+            from_hex('89504e47'),
+            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
+        ) AS response
+    """)
+
+    assert provider_calls == []
+    assert [str(dtype) for dtype in relation.types] == ["VARCHAR"]
+    assert relation.fetchall() == [(None,)]
+    assert provider_calls == []
+
+    _, target, physical, _ = _round_trip_ai_plan(relation)
+    assert physical.collect_udf_nodes() == []
+    table = _execute_ai_physical_plan(target, physical)
+    assert table.column(0).to_pylist() == [None]
+    assert provider_calls == []
+
+
+def test_ai_prompt_literal_null_prompt_skips_invalid_provider():
+    conn = vane.connect()
+
+    relation = conn.sql("""
+        SELECT ai_prompt(
+            NULL,
+            from_hex('89504e47'),
+            struct_pack(provider := 'does_not_exist')
+        ) AS response
+    """)
+
+    assert [str(dtype) for dtype in relation.types] == ["VARCHAR"]
+    assert relation.fetchall() == [(None,)]
+
+
+def test_ai_prompt_literal_null_prompt_skips_nonconstant_options():
+    conn = vane.connect()
+
+    rows = conn.sql("""
+        SELECT ai_prompt(
+            NULL,
+            image,
+            struct_pack(provider := provider_name)
+        ) AS response
+        FROM (
+            VALUES (from_hex('89504e47'), 'does_not_exist')
+        ) AS t(image, provider_name)
+    """).fetchall()
+
+    assert rows == [(None,)]
+
+
+@pytest.mark.parametrize(
+    "image_expression",
+    [
+        "from_hex('89504e47')",
+        "[from_hex('89504e47')]::BLOB[]",
+    ],
+)
+def test_ai_prompt_image_input_propagates_column_null_prompt(image_expression):
+    conn = vane.connect()
+
+    rows = conn.sql(f"""
+        SELECT id, ai_prompt(
+            prompt,
+            image,
+            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
+        ) AS response
+        FROM (
+            VALUES
+                (1, NULL::VARCHAR, {image_expression}),
+                (2, 'alpha', {image_expression})
+        ) AS t(id, prompt, image)
+        ORDER BY id
+    """).fetchall()
+
+    assert rows == [
+        (1, None),
+        (2, "vision-model:alpha:images=89504e47"),
+    ]
+
+
+@pytest.mark.parametrize("null_image", ["NULL", "NULL::BLOB", "NULL::BLOB[]"])
+def test_ai_prompt_sql_with_literal_null_image(null_image):
+    conn = vane.connect()
+
+    relation = conn.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            {null_image},
+            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
+        ) AS response
+    """)
+
+    assert [str(dtype) for dtype in relation.types] == ["VARCHAR"]
+    assert relation.fetchall() == [("vision-model:describe",)]
+
+    _, target, physical, _ = _round_trip_ai_plan(relation)
+    table = _execute_ai_physical_plan(target, physical)
+    assert table.column(0).to_pylist() == ["vision-model:describe"]
+
+
+def test_ai_prompt_sql_with_null_options_uses_default_provider(monkeypatch):
+    monkeypatch.setitem(provider_registry.PROVIDERS, "openai", lambda name=None, **options: MockProvider())
+    conn = vane.connect()
+
+    relation = conn.sql("""
+        SELECT ai_prompt(
+            'describe',
+            from_hex('89504e47'),
+            NULL
+        ) AS response
+    """)
+
+    assert [str(dtype) for dtype in relation.types] == ["VARCHAR"]
+    assert relation.fetchall() == [("topic:describe:images=89504e47",)]
+
+
+def test_ai_prompt_literal_null_image_still_validates_provider():
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match="Provider 'does_not_exist' is not supported"):
+        conn.sql("""
+            SELECT ai_prompt(
+                'describe',
+                NULL::BLOB,
+                struct_pack(provider := 'does_not_exist')
+            )
+        """).fetchall()
+
+
+def test_ai_prompt_sql_with_single_image_blob_and_null_image():
+    conn = vane.connect()
+
+    rows = conn.sql("""
+        SELECT id, ai_prompt(
+            prompt,
+            image,
+            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
+        ) AS response
+        FROM (
+            VALUES
+                (1, 'alpha', from_hex('89504e470d0a1a0a')),
+                (2, 'beta', NULL::BLOB)
+        ) AS t(id, prompt, image)
+        ORDER BY id
+    """).fetchall()
+
+    assert rows == [
+        (1, "vision-model:alpha:images=89504e470d0a1a0a"),
+        (2, "vision-model:beta"),
+    ]
+
+
+def test_ai_prompt_sql_with_image_blob_list():
+    conn = vane.connect()
+
+    rows = conn.sql("""
+        SELECT id, ai_prompt(
+            prompt,
+            images,
+            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
+        ) AS response
+        FROM (
+            VALUES
+                (
+                    1,
+                    'compare',
+                    [from_hex('89504e47'), NULL, from_hex('ffd8ff')]::BLOB[]
+                ),
+                (2, 'empty', []::BLOB[]),
+                (3, 'null', NULL::BLOB[])
+        ) AS t(id, prompt, images)
+        ORDER BY id
+    """).fetchall()
+
+    assert rows == [
+        (1, "vision-model:compare:images=89504e47,ffd8ff"),
+        (2, "vision-model:empty"),
+        (3, "vision-model:null"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "empty_image",
+    [
+        "''::BLOB",
+        "[''::BLOB]::BLOB[]",
+    ],
+)
+def test_ai_prompt_sql_treats_zero_length_image_as_empty(empty_image):
+    conn = vane.connect()
+
+    rows = conn.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            {empty_image},
+            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
+        ) AS response
+    """).fetchall()
+
+    assert rows == [("vision-model:describe",)]
+
+
 def test_ai_embed_sql_with_mock_provider_and_dimensions():
     conn = vane.connect()
 
@@ -527,6 +800,21 @@ def test_ai_sql_helper_builds_prompt_spec_without_execution():
 
     assert spec["name"] == "ai_prompt"
     assert spec["input_names"] == ["messages"]
+    assert spec["schema"] == {"response": "VARCHAR"}
+    assert spec["actor_number"] == 1
+    assert spec["gpus"] == 0
+
+
+def test_ai_sql_helper_builds_multimodal_prompt_spec_without_execution():
+    from vane.ai._sql import build_ai_prompt_sql_spec
+
+    spec = build_ai_prompt_sql_spec(
+        {"provider": "mock_ai_sql", "concurrency": 1},
+        image_input=True,
+    )
+
+    assert spec["name"] == "ai_prompt"
+    assert spec["input_names"] == ["messages", "images"]
     assert spec["schema"] == {"response": "VARCHAR"}
     assert spec["actor_number"] == 1
     assert spec["gpus"] == 0

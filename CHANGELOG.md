@@ -8,6 +8,10 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 
 - Public governance, contribution, security, release, provenance, and third-party documentation.
 - Release artifact validation and a reproducible native dependency license bundle.
+- Added three-argument SQL `ai_prompt` overloads for per-row `BLOB` and
+  `BLOB[]` image inputs. NULL, zero-length BLOB, and empty BLOB[] inputs fall
+  back to text-only prompting, while the existing text-only signatures remain
+  unchanged.
 
 ### Changed
 
