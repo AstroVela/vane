@@ -846,7 +846,11 @@ struct PyPhysicalPlanWrapper {
 		if (!physical_plan || !physical_plan->HasRoot())
 			return result;
 
-		// Need query_id for pool name construction.
+		// The pool identity must include the connection session. Query IDs are
+		// normally unique, but they are caller-provided at this binding boundary;
+		// allowing the same query ID from another session to attach to an
+		// existing named actor would reuse that actor's session environment.
+		auto session_id = VaneSessionIdFromSnapshot(connection_snapshot_);
 		auto query_id = plan_->query_id();
 		if (query_id.empty()) {
 			query_id = std::to_string(plan_->idx());
@@ -869,8 +873,9 @@ struct PyPhysicalPlanWrapper {
 				idx_t node_id = vllm_counter++;
 
 				// Build pool name using the same sanitization as VLLMProjectNode.
+				auto safe_session = duckdb::distributed::SanitizePoolComponent(session_id);
 				auto safe_query = duckdb::distributed::SanitizePoolComponent(query_id);
-				auto pool_name = "duckdb_vllm_" + safe_query + "_" + std::to_string(node_id);
+				auto pool_name = "duckdb_vllm_" + safe_session + "_" + safe_query + "_" + std::to_string(node_id);
 
 				// Inject pool name into operator options so the translator
 				// propagates it to VLLMProjectNode → produce_tasks.

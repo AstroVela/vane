@@ -106,10 +106,27 @@ def _runtime_error_contains(error: BaseException, error_type: type[BaseException
 
 
 def _runtime_error_is_wait_timeout(error: BaseException) -> bool:
+    candidates = _runtime_error_candidates(error)
+    ray_task_error_type = getattr(ray.exceptions, "RayTaskError", None)
+    if isinstance(ray_task_error_type, type) and any(
+        isinstance(candidate, ray_task_error_type) for candidate in candidates
+    ):
+        # A completed actor RPC can itself raise TimeoutError. That mutation
+        # failed terminally and must be retried with a new ObjectRef rather than
+        # mistaken for an ambiguous local wait on the existing ObjectRef.
+        return False
+    if any(getattr(candidate, "remote_exception_type", None) for candidate in candidates):
+        return False
     return any(
-        isinstance(candidate, TimeoutError)
-        or type(candidate).__name__ in {"GetTimeoutError", "FutureTimeoutError"}
-        for candidate in _runtime_error_candidates(error)
+        isinstance(candidate, TimeoutError) or type(candidate).__name__ in {"GetTimeoutError", "FutureTimeoutError"}
+        for candidate in candidates
+    )
+
+
+def _runtime_actor_is_unavailable(error: BaseException) -> bool:
+    actor_error_type = getattr(ray.exceptions, "RayActorError", None)
+    return isinstance(actor_error_type, type) and any(
+        isinstance(candidate, actor_error_type) for candidate in _runtime_error_candidates(error)
     )
 
 
@@ -203,6 +220,15 @@ def _normalize_session_config(config: Mapping[str, Any]) -> dict[str, str]:
             raise ValueError(f"Vane session config value must not be None: {key}")
         normalized[key] = str(raw_value)
     return normalized
+
+
+def _ray_runtime_job_id(runtime_context: Any) -> str:
+    job_id_obj = runtime_context.get_job_id()
+    job_id_hex = getattr(job_id_obj, "hex", None)
+    job_id = str(job_id_hex() if callable(job_id_hex) else job_id_obj).strip()
+    if not job_id:
+        raise RuntimeError("Ray runtime context returned an empty job identity")
+    return job_id
 
 
 async def _to_thread_with_owned_side_effects(callback: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
@@ -4471,14 +4497,10 @@ class RayQueryDriverClient:
         try:
             runtime_context = ray.get_runtime_context()
             self._ray_gcs_address = runtime_context.gcs_address
-            job_id_obj = runtime_context.get_job_id()
+            self._ray_job_id = _ray_runtime_job_id(runtime_context)
         except Exception:
             self._ray_gcs_address = None
             raise RuntimeError("Ray runtime context is missing the current job identity") from None
-        job_id_hex = getattr(job_id_obj, "hex", None)
-        job_id = str(job_id_hex() if callable(job_id_hex) else job_id_obj).strip()
-        if not job_id:
-            raise RuntimeError("Ray runtime context returned an empty job identity")
         _maybe_set_distributed_cluster_capacity()
         from duckdb.runners.ray.worker_memory import build_ray_node_memory_layout
 
@@ -4497,7 +4519,7 @@ class RayQueryDriverClient:
             soft=False,
         )
         runner_options = {
-            "name": f"{RAY_QUERY_RUNTIME_ACTOR_NAME_PREFIX}{job_id}",
+            "name": f"{RAY_QUERY_RUNTIME_ACTOR_NAME_PREFIX}{self._ray_job_id}",
             "namespace": RAY_QUERY_RUNTIME_ACTOR_NAMESPACE,
             "get_if_exists": True,
             "scheduling_strategy": scheduling,
@@ -4546,16 +4568,28 @@ class RayQueryDriverClient:
         if not ray.is_initialized():
             return True
         try:
-            current_gcs_address = ray.get_runtime_context().gcs_address
+            runtime_context = ray.get_runtime_context()
+            current_gcs_address = runtime_context.gcs_address
         except Exception:
             return False
-        return (
+        if (
             self._ray_gcs_address is not None
             and current_gcs_address is not None
             and current_gcs_address != self._ray_gcs_address
-        )
+        ):
+            return True
+        try:
+            return _ray_runtime_job_id(runtime_context) != self._ray_job_id
+        except Exception:
+            # A context lookup failure is not proof that the old runtime was
+            # replaced; let the actor RPC produce the actionable error.
+            return False
 
     def _detach_after_failed_attach(self, runner: Any, attach_error: BaseException) -> None:
+        # A failed actor process cannot retain an owner, including constructor
+        # failures that must not be classified as a replaceable old runtime.
+        if _runtime_actor_is_unavailable(attach_error):
+            return
         cleanup_error: BaseException | None = None
         cleanup_deadline = time.monotonic() + _RUNTIME_ATTACH_CLEANUP_TIMEOUT_S
         detach_ref: Any | None = None
@@ -4574,7 +4608,7 @@ class RayQueryDriverClient:
             except BaseException as error:
                 if (
                     _runtime_error_contains(error, PermissionError)
-                    or _runtime_actor_is_being_replaced(error)
+                    or _runtime_actor_is_unavailable(error)
                     or self._runtime_is_unavailable_or_replaced()
                 ):
                     return
@@ -4845,9 +4879,7 @@ class RayQueryDriverClient:
             )
         except BaseException as teardown_error:
             settled_detail = (
-                ""
-                if settled_error is None
-                else f"; settled={type(settled_error).__name__}: {settled_error}"
+                "" if settled_error is None else f"; settled={type(settled_error).__name__}: {settled_error}"
             )
             raise RuntimeError(
                 f"Ray query plan {plan_id} failed and teardown also failed: "

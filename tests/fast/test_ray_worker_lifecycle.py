@@ -421,16 +421,15 @@ def test_actor_task_manager_creation_is_rejected_after_shutdown_starts():
 def test_actor_session_connection_creation_is_rejected_after_shutdown_starts():
     from duckdb.runners.ray import worker as worker_module
 
-    class DummyActor:
-        _shutdown_started = True
-        _session_connections_lock = threading.RLock()
-        _session_connections: dict[str, object] = {}
-        _closed_session_ids = worker_module.BoundedReplayMap(capacity=16)
-
     actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    actor._shutdown_started = True
+    actor._session_connections_lock = threading.RLock()
+    actor._session_connections = {}
+    actor._closed_session_ids = worker_module.BoundedReplayMap(capacity=16)
 
     with pytest.raises(RuntimeError, match="shutting down"):
-        actor_class._get_session_conn(DummyActor(), "session-a", {})
+        actor_class._get_session_conn(actor, "session-a", {})
 
 
 def test_actor_shutdown_retries_failed_session_connection_close():

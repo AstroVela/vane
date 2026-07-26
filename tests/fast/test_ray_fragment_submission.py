@@ -9256,7 +9256,9 @@ def test_explicit_duckdb_credentials_skip_profile_resolution_and_discard_cached_
 def test_execute_native_task_uses_session_database_for_fte():
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
+    actor._shutdown_started = False
     actor._session_connections_lock = threading.RLock()
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=16)
     actor._session_s3_configs = {}
     actor._native_execution_condition = threading.Condition()
     actor._active_native_cursors = set()

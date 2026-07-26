@@ -133,13 +133,16 @@ def test_session_runtime_setup_scrubs_inheritance_then_installs_explicit_context
     }
 
     carrier = build_session_runtime_env_vars(config)
-    os.environ.update(carrier)
-    install_explicit_session_runtime_env()
+    try:
+        os.environ.update(carrier)
+        install_explicit_session_runtime_env()
 
-    assert "AWS_SECRET_ACCESS_KEY" not in os.environ
-    assert os.environ["AWS_ACCESS_KEY_ID"] == "session-key"
-    assert os.environ["DUCKDB_ISSUE75_SESSION_SECRET"] == "session-duckdb-secret"
-    assert os.environ["VANE_AUTH_HEADER"] == "session-auth"
-    assert os.environ["VANE_RUNNER"] == "job-runner"
-    assert os.environ["VANE_SESSION_DIR"] == "/tmp/vane-job-session"
-    assert all(key not in os.environ for key in carrier)
+        assert "AWS_SECRET_ACCESS_KEY" not in os.environ
+        assert os.environ["AWS_ACCESS_KEY_ID"] == "session-key"
+        assert os.environ["DUCKDB_ISSUE75_SESSION_SECRET"] == "session-duckdb-secret"
+        assert os.environ["VANE_AUTH_HEADER"] == "session-auth"
+        assert os.environ["VANE_RUNNER"] == "job-runner"
+        assert os.environ["VANE_SESSION_DIR"] == "/tmp/vane-job-session"
+        assert all(key not in os.environ for key in carrier)
+    finally:
+        scrub_shared_runtime_session_env()

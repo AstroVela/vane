@@ -6413,17 +6413,17 @@ def test_ray_query_driver_client_retires_drained_named_runtime_before_retry(monk
 
 
 def test_runtime_replacement_classifier_rejects_permanent_actor_init_failure():
-    assert driver._runtime_actor_is_being_replaced(
-        driver.ray.exceptions.RayActorError(
-            error_msg="actor disappeared before attach",
-        )
+    actor_loss = driver.ray.exceptions.RayActorError(
+        error_msg="actor disappeared before attach",
     )
-    assert not driver._runtime_actor_is_being_replaced(
-        driver.ray.exceptions.RayActorError(
-            error_msg="actor constructor failed",
-            actor_init_failed=True,
-        )
+    actor_init_failure = driver.ray.exceptions.RayActorError(
+        error_msg="actor constructor failed",
+        actor_init_failed=True,
     )
+    assert driver._runtime_actor_is_unavailable(actor_loss)
+    assert driver._runtime_actor_is_unavailable(actor_init_failure)
+    assert driver._runtime_actor_is_being_replaced(actor_loss)
+    assert not driver._runtime_actor_is_being_replaced(actor_init_failure)
 
     class _WrappedShutdown(RuntimeError):
         @staticmethod
@@ -6432,6 +6432,38 @@ def test_runtime_replacement_classifier_rejects_permanent_actor_init_failure():
 
     wrapped_shutdown = _WrappedShutdown()
     assert driver._runtime_actor_is_being_replaced(wrapped_shutdown)
+
+
+def test_runtime_wait_timeout_classifier_rejects_completed_remote_timeout():
+    local_wait_timeout = FutureTimeoutError("ObjectRef is still pending")
+    remote_method_timeout = driver.ray.exceptions.RayTaskError(
+        "detach_client",
+        "remote detach timeout",
+        TimeoutError("remote detach timeout"),
+    )
+    restored_remote_timeout = TimeoutError("transported remote detach timeout")
+    restored_remote_timeout.remote_exception_type = "builtins.TimeoutError"
+
+    assert driver._runtime_error_is_wait_timeout(local_wait_timeout)
+    assert not driver._runtime_error_is_wait_timeout(remote_method_timeout)
+    assert not driver._runtime_error_is_wait_timeout(restored_remote_timeout)
+
+
+def test_failed_attach_cleanup_skips_detach_for_actor_init_failure():
+    class _DetachMethod:
+        @staticmethod
+        def remote(_owner_id):
+            raise AssertionError("a failed actor process cannot retain an attached owner")
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    runner = SimpleNamespace(detach_client=_DetachMethod())
+    attach_error = driver.ray.exceptions.RayActorError(
+        error_msg="actor constructor failed",
+        actor_init_failed=True,
+    )
+
+    client._detach_after_failed_attach(runner, attach_error)
 
 
 def test_ray_runner_creates_one_driver_client_for_concurrent_sessions(monkeypatch):
@@ -6960,16 +6992,18 @@ def test_ray_query_driver_client_session_close_failure_stays_fenced_and_retryabl
 
 
 @pytest.mark.parametrize(
-    ("ray_initialized", "current_gcs_address"),
+    ("ray_initialized", "current_gcs_address", "current_job_id"),
     [
-        (False, "gcs-a"),
-        (True, "gcs-b"),
+        (False, "gcs-a", "job-a"),
+        (True, "gcs-b", "job-a"),
+        (True, "gcs-a", "job-b"),
     ],
 )
 def test_ray_query_driver_client_session_close_is_terminal_after_runtime_changes(
     monkeypatch,
     ray_initialized,
     current_gcs_address,
+    current_job_id,
 ):
     class _CloseMethod:
         @staticmethod
@@ -6979,6 +7013,7 @@ def test_ray_query_driver_client_session_close_is_terminal_after_runtime_changes
     client = object.__new__(driver.RayQueryDriverClient)
     client._owner_id = "owner-a"
     client._ray_gcs_address = "gcs-a"
+    client._ray_job_id = "job-a"
     _initialize_test_query_driver_client(client, {"session-a": {}})
     client.runner = SimpleNamespace(close_session=_CloseMethod())
 
@@ -6986,7 +7021,10 @@ def test_ray_query_driver_client_session_close_is_terminal_after_runtime_changes
     monkeypatch.setattr(
         driver.ray,
         "get_runtime_context",
-        lambda: SimpleNamespace(gcs_address=current_gcs_address),
+        lambda: SimpleNamespace(
+            gcs_address=current_gcs_address,
+            get_job_id=lambda: current_job_id,
+        ),
     )
 
     client.close_session("session-a")

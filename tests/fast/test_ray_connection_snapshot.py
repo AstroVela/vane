@@ -51,6 +51,32 @@ def test_logical_plan_captures_connection_scoped_vane_session(monkeypatch):
     assert restored_plan.session_config() == plan_a.session_config()
 
 
+def test_vllm_named_actor_pool_identity_includes_connection_session():
+    ray_cxx = _require_ray_cxx()
+    connection_a = duckdb.connect()
+    connection_b = duckdb.connect()
+    query_id = "reused-query-id"
+    options = '{"use_ray":true}'
+
+    plan_a = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        connection_a.sql(f"SELECT vllm('hello', 'test-model', '{options}')"),
+        query_id,
+    ).to_physical_plan(connection_a)
+    plan_b = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        connection_b.sql(f"SELECT vllm('hello', 'test-model', '{options}')"),
+        query_id,
+    ).to_physical_plan(connection_b)
+
+    nodes_a = plan_a.collect_vllm_nodes(conn=connection_a)
+    nodes_b = plan_b.collect_vllm_nodes(conn=connection_b)
+
+    assert len(nodes_a) == 1
+    assert len(nodes_b) == 1
+    assert nodes_a[0]["pool_name"] != nodes_b[0]["pool_name"]
+    assert plan_a.session_id() in nodes_a[0]["pool_name"]
+    assert plan_b.session_id() in nodes_b[0]["pool_name"]
+
+
 def test_datasource_relation_retains_connection_scoped_vane_session(monkeypatch):
     from duckdb.datasource import DataSource, DataSourceTask, read_datasource
 
