@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -118,7 +119,8 @@ def _runtime_error_is_wait_timeout(error: BaseException) -> bool:
     if any(getattr(candidate, "remote_exception_type", None) for candidate in candidates):
         return False
     return any(
-        isinstance(candidate, TimeoutError) or type(candidate).__name__ in {"GetTimeoutError", "FutureTimeoutError"}
+        isinstance(candidate, (TimeoutError, FutureTimeoutError))
+        or type(candidate).__name__ in {"GetTimeoutError", "FutureTimeoutError"}
         for candidate in candidates
     )
 

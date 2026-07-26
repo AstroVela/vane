@@ -6455,6 +6455,15 @@ def test_runtime_wait_timeout_classifier_rejects_completed_remote_timeout():
     assert not driver._runtime_error_is_wait_timeout(restored_remote_timeout)
 
 
+def test_runtime_wait_timeout_classifier_accepts_pre311_future_timeout(monkeypatch):
+    class _Pre311FutureTimeoutError(Exception):
+        pass
+
+    monkeypatch.setattr(driver, "FutureTimeoutError", _Pre311FutureTimeoutError)
+
+    assert driver._runtime_error_is_wait_timeout(_Pre311FutureTimeoutError("ObjectRef is still pending"))
+
+
 def test_failed_attach_cleanup_skips_detach_for_actor_init_failure():
     class _DetachMethod:
         @staticmethod
