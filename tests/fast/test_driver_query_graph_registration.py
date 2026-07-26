@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -12,11 +13,14 @@ import pytest
 import duckdb
 from duckdb._ray_cxx import validate_plan_serialization_for_submission
 from duckdb._ray_errors import RemoteRayException
+from duckdb.runners.ray.cluster_resource_coordinator import NodeCapacity
 from duckdb.runners.ray.query_execution_graph import (
     ActorPlacement,
     NodeResourceAllocation,
     QueryAllocation,
+    QueryExecutionGraph,
     ResourceVector,
+    StageResourceSpec,
 )
 from duckdb.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
@@ -59,11 +63,24 @@ class _FakePhysicalPlan:
         return self._metadata
 
 
+class _RegistrationOnlyIdxPhysicalPlan(_FakePhysicalPlan):
+    def __init__(self, query_id, metadata, events):
+        super().__init__(query_id, metadata, events)
+        self.idx_calls = 0
+
+    def idx(self):
+        self.idx_calls += 1
+        if self.idx_calls > 2:
+            raise RuntimeError("physical plan idx was re-entered after registration")
+        return super().idx()
+
+
 class _FakeCoordinator:
     def __init__(self, events):
         self._events = events
         self.released = []
         self.allocations = {}
+        self.capacity_updates = []
 
     def register_query(self, demand):
         self._events.append("coordinator_register")
@@ -88,6 +105,10 @@ class _FakeCoordinator:
         )
         self.allocations[demand.query_id] = allocation
         return allocation
+
+    def update_node_capacities(self, capacities):
+        self.capacity_updates.append(tuple(capacities))
+        return None
 
     def release_query(self, query_id, generation):
         self.released.append((query_id, generation))
@@ -164,12 +185,20 @@ def _runner(events, coordinator):
     runner._plan_query_ids = {}
     runner._leased_result_partition_refs = {}
     runner._result_partition_ref_counters = {}
-    runner._refresh_query_capacity = lambda: ResourceVector(
+    node_resources = ResourceVector(
         cpu=8,
         gpu=1,
         heap_bytes=16 * _GIB,
         object_store_bytes=4 * _GIB,
     )
+
+    def _read_node_capacities():
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        events.append("capacity")
+        return (NodeCapacity("node-a", node_resources),)
+
+    runner._read_query_node_capacities = _read_node_capacities
     runner._ensure_duckdb_conn = lambda: runner._duckdb_conn
     runner._precreate_vllm_actors = lambda plan: events.append("vllm_ready") or []
     runner._get_plan_runner = lambda: SimpleNamespace(run_plan=lambda plan, conn: "stream")
@@ -216,6 +245,7 @@ def test_driver_starts_plan_runner_before_opening_actor_readiness_gate():
     assert events == [
         "physical_plan",
         "collect_graph",
+        "capacity",
         "coordinator_register",
         "actors_created",
         "vllm_ready",
@@ -225,6 +255,30 @@ def test_driver_starts_plan_runner_before_opening_actor_readiness_gate():
     manager = get_query_resource_manager(query_id)
     assert manager.snapshot()["stages"][f"stage:{query_id}:node:1:udf"]["actor_ready"] is True
     assert runner.curr_streams[query_id] == "stream"
+
+
+def test_run_plan_does_not_read_physical_plan_id_after_registration():
+    events: list[str] = []
+    coordinator = _FakeCoordinator(events)
+    runner_cls, runner = _runner(events, coordinator)
+    runner._precreate_udf_actors = lambda *_args: []
+    runner._mark_query_actor_stages_ready = lambda _graph: None
+    query_id = "query-single-use-plan-id"
+    physical_plan = _RegistrationOnlyIdxPhysicalPlan(
+        query_id,
+        _metadata(query_id),
+        events,
+    )
+
+    asyncio.run(
+        runner_cls.run_plan(
+            runner,
+            _FakeLogicalPlan(physical_plan, events),
+        )
+    )
+
+    assert physical_plan.idx_calls == 2
+    assert runner._plan_query_ids[query_id] == query_id
 
 
 def test_driver_rolls_back_graph_and_cluster_allocation_when_actor_initialization_fails():
@@ -248,6 +302,320 @@ def test_driver_rolls_back_graph_and_cluster_allocation_when_actor_initializatio
     assert coordinator.released == [(query_id, 7)]
     assert query_id not in runner.curr_plans
     assert "plan_runner" not in events
+
+
+def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_is_delayed(
+    monkeypatch,
+):
+    from duckdb.runners.ray import driver as driver_module
+    from duckdb.runners.ray.query_resource_runtime import register_query_graph
+
+    events: list[str] = []
+    coordinator = _FakeCoordinator(events)
+    runner_cls, runner = _runner(events, coordinator)
+    runner._query_resource_lock = threading.Lock()
+    runner._read_query_node_capacities = lambda: runner_cls._read_query_node_capacities()
+    runner._precreate_udf_actors = lambda *_args: []
+    runner._precreate_vllm_actors = lambda *_args: []
+    runner._get_plan_runner = lambda: SimpleNamespace(
+        run_copy_plan=lambda _plan, _conn: {"rows_copied": 1},
+    )
+    runner._mark_query_actor_stages_ready = lambda _graph: None
+    runner._build_local_progress_snapshot = lambda query_id, _started_at: {
+        "query_id": query_id,
+        "state": "FINISHED",
+    }
+    runner._teardown_plan_resources = lambda *_args, **_kwargs: None
+    runner._open_query_resource_admission = lambda _query_id: None
+
+    streaming_query_id = "query-streaming-admission"
+    streaming_stage = StageResourceSpec(
+        query_id=streaming_query_id,
+        stage_id=f"stage:{streaming_query_id}:udf",
+        physical_node_id="node:streaming:udf",
+        stage_kind="udf",
+        backend="ray_task",
+        input_stage_ids=(),
+        per_task=ResourceVector(cpu=1, heap_bytes=128),
+        target_output_block_bytes=64,
+        generator_buffer_blocks=1,
+        max_concurrency=None,
+    )
+    streaming_graph = QueryExecutionGraph(
+        query_id=streaming_query_id,
+        plan_digest="sha256:streaming-admission",
+        stages=(streaming_stage,),
+        terminal_stage_ids=(streaming_stage.stage_id,),
+    )
+    streaming_resources = ResourceVector(
+        cpu=2,
+        heap_bytes=4096,
+        object_store_bytes=4096,
+    )
+    streaming_allocation = QueryAllocation(
+        resources=streaming_resources,
+        node_allocations=(
+            NodeResourceAllocation(
+                node_id="node-a",
+                resources=streaming_resources,
+            ),
+        ),
+        actor_placements=(),
+        generation=1,
+    )
+    streaming_manager = register_query_graph(
+        streaming_graph,
+        streaming_allocation,
+    )
+    streaming_manager.update_stage_state(
+        streaming_stage.stage_id,
+        runnable=True,
+        actor_ready=True,
+    )
+    coordinator.allocations[streaming_query_id] = streaming_allocation
+    runner._query_graphs[streaming_query_id] = streaming_graph
+    runner._query_allocations[streaming_query_id] = streaming_allocation
+
+    nodes_started = threading.Event()
+    nodes_release = threading.Event()
+
+    def _delayed_nodes():
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        assert runner._query_resource_lock.acquire(blocking=False)
+        runner._query_resource_lock.release()
+        nodes_started.set()
+        assert nodes_release.wait(timeout=2.0)
+        return [
+            {
+                "Alive": True,
+                "NodeID": "node-a",
+                "Resources": {
+                    "CPU": 32.0,
+                    "GPU": 4.0,
+                    "memory": 64 * _GIB,
+                    "object_store_memory": 32 * _GIB,
+                },
+            }
+        ]
+
+    monkeypatch.setattr(driver_module.ray, "nodes", _delayed_nodes)
+    copy_query_id = "query-copy-delayed-capacity"
+    copy_plan = _FakePhysicalPlan(
+        copy_query_id,
+        _metadata(copy_query_id),
+        events,
+    )
+    lease_request = {
+        "request_id": "request:streaming-during-copy",
+        "query_id": streaming_query_id,
+        "stage_id": streaming_stage.stage_id,
+        "task_id": "task:streaming-during-copy",
+        "attempt_id": "attempt:streaming-during-copy",
+        "node_id": None,
+        "retained_input_bytes": 0,
+        "resources": {
+            "cpu": 1.0,
+            "gpu": 0.0,
+            "heap_bytes": 128,
+            "object_store_bytes": 0,
+        },
+    }
+
+    async def _run_concurrently():
+        copy_task = asyncio.create_task(
+            runner_cls.run_copy_plan(
+                runner,
+                _FakeLogicalPlan(copy_plan, events),
+            )
+        )
+        try:
+            assert await asyncio.to_thread(nodes_started.wait, 1.0)
+            started_at = time.monotonic()
+            lease = await asyncio.wait_for(
+                runner_cls.acquire_query_task_lease(runner, lease_request),
+                timeout=0.25,
+            )
+            assert time.monotonic() - started_at < 0.25
+            assert lease["granted"] is True
+            assert copy_task.done() is False
+            released = await asyncio.wait_for(
+                runner_cls.release_query_task_lease(
+                    runner,
+                    lease_request["request_id"],
+                    lease["lease"]["lease_id"],
+                    lease["lease"]["attempt_id"],
+                ),
+                timeout=0.25,
+            )
+            assert released == {"released": True}
+            nodes_release.set()
+            return await asyncio.wait_for(copy_task, timeout=1.0)
+        finally:
+            nodes_release.set()
+
+    outcome = asyncio.run(_run_concurrently())
+
+    assert outcome.result == {"rows_copied": 1}
+    assert outcome.final_progress_snapshot == {
+        "query_id": copy_query_id,
+        "state": "FINISHED",
+    }
+
+
+def test_registration_does_not_overwrite_a_newer_capacity_snapshot():
+    events: list[str] = []
+    coordinator = _FakeCoordinator(events)
+    runner_cls, runner = _runner(events, coordinator)
+    older = NodeCapacity(
+        "node-old",
+        ResourceVector(
+            cpu=2,
+            heap_bytes=2 * _GIB,
+            object_store_bytes=1 * _GIB,
+        ),
+    )
+    newer = NodeCapacity(
+        "node-new",
+        ResourceVector(
+            cpu=8,
+            heap_bytes=8 * _GIB,
+            object_store_bytes=4 * _GIB,
+        ),
+    )
+    runner._query_node_capacities = (newer,)
+    runner._query_resource_last_capacity_refresh_at = 20.0
+
+    capacity = runner_cls._apply_query_capacity_snapshot(
+        runner,
+        (older,),
+        snapshot_started_at=10.0,
+    )
+
+    assert capacity == newer.resources
+    assert runner._query_node_capacities == (newer,)
+    assert runner._query_resource_last_capacity_refresh_at == 20.0
+    assert coordinator.capacity_updates == []
+
+
+def test_pending_allocation_teardown_fences_query_id_reuse_until_remote_drop_finishes():
+    from duckdb.runners.ray.driver import (
+        _DeferredQueryAllocationTeardown,
+        _PreparedQueryResourceRegistration,
+    )
+    from duckdb.runners.ray.query_graph_builder import build_query_execution_graph
+
+    events: list[str] = []
+    coordinator = _FakeCoordinator(events)
+    runner_cls, runner = _runner(events, coordinator)
+    runner._query_resource_lock = threading.Lock()
+    runner._open_query_resource_admission = lambda _query_id: None
+    query_id = "query-generation-fence"
+    graph = build_query_execution_graph(_metadata(query_id))
+    node = NodeCapacity(
+        "node-a",
+        ResourceVector(
+            cpu=8,
+            gpu=1,
+            heap_bytes=16 * _GIB,
+            object_store_bytes=4 * _GIB,
+        ),
+    )
+    teardown = _DeferredQueryAllocationTeardown(
+        query_id=query_id,
+        generation=3,
+        reason="old generation lost actor placement",
+    )
+    runner._query_allocation_teardowns_pending = {query_id: teardown}
+    runner._query_allocation_teardowns_claimed = set()
+    runner._query_allocation_teardown_futures = set()
+    runner._query_terminal_errors = {}
+    drop_started = threading.Event()
+    allow_drop = threading.Event()
+
+    def _drop_query_fragments(actual_query_id, *, release_resources):
+        assert actual_query_id == query_id
+        assert release_resources is False
+        drop_started.set()
+        assert allow_drop.wait(timeout=2.0)
+
+    runner._drop_query_fragments_after_admission_fence_sync = _drop_query_fragments
+    worker = threading.Thread(
+        target=runner_cls._run_query_allocation_teardowns,
+        args=(runner, (teardown,)),
+    )
+    worker.start()
+    assert drop_started.wait(timeout=1.0)
+
+    prepared = _PreparedQueryResourceRegistration(
+        graph=graph,
+        node_capacities=(node,),
+        capacity_snapshot_started_at=time.monotonic(),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="pending allocation-loss teardown"):
+            runner_cls._commit_query_resource_registration(
+                runner,
+                prepared,
+                deferred_teardowns=[],
+            )
+    finally:
+        allow_drop.set()
+        worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert query_id not in runner._query_allocation_teardowns_pending
+
+    registered_graph, allocation = runner_cls._commit_query_resource_registration(
+        runner,
+        prepared,
+        deferred_teardowns=[],
+    )
+    assert registered_graph is graph
+    assert allocation.generation == 7
+
+
+def test_failed_allocation_teardown_remains_retryable():
+    from duckdb.runners.ray.driver import _DeferredQueryAllocationTeardown
+
+    events: list[str] = []
+    runner_cls, runner = _runner(events, _FakeCoordinator(events))
+    query_id = "query-teardown-retry"
+    teardown = _DeferredQueryAllocationTeardown(
+        query_id=query_id,
+        generation=4,
+        reason="old generation lost actor placement",
+    )
+    runner._query_allocation_teardowns_pending = {query_id: teardown}
+    runner._query_allocation_teardowns_claimed = set()
+    runner._query_allocation_teardown_futures = set()
+    runner._query_graphs = {query_id: object()}
+    runner._query_allocations = {
+        query_id: SimpleNamespace(generation=teardown.generation + 1),
+    }
+    runner._query_terminal_errors = {query_id: teardown.reason}
+    attempts = 0
+
+    def _drop_query_fragments(_query_id, *, release_resources):
+        nonlocal attempts
+        assert release_resources is False
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("transient remote teardown failure")
+
+    runner._drop_query_fragments_after_admission_fence_sync = _drop_query_fragments
+
+    runner_cls._run_query_allocation_teardowns(runner, (teardown,))
+    assert runner._query_allocation_teardowns_pending == {query_id: teardown}
+    assert "transient remote teardown failure" in runner._query_terminal_errors[query_id]
+
+    runner._query_graphs = {}
+    runner._query_allocations = {}
+    retry = runner_cls._synchronize_query_allocations(runner)
+    assert retry == (teardown,)
+    runner_cls._run_query_allocation_teardowns(runner, retry)
+
+    assert attempts == 2
+    assert runner._query_allocation_teardowns_pending == {}
 
 
 @pytest.mark.parametrize("entrypoint", ["run_plan", "run_copy_plan"])
@@ -427,12 +795,18 @@ def test_driver_cancels_query_when_fixed_actor_placement_node_is_lost():
     runner._query_graphs = {query_id: graph}
     runner._query_allocations = {query_id: allocation}
     runner._query_terminal_errors = {}
-    runner._get_plan_runner = lambda: SimpleNamespace(
-        drop_query_fragments=lambda actual_query_id: dropped.append(actual_query_id)
-    )
+    runner._query_resource_lock = threading.Lock()
+
+    def _drop_query_fragments(actual_query_id):
+        assert runner._query_resource_lock.acquire(blocking=False)
+        runner._query_resource_lock.release()
+        dropped.append(actual_query_id)
+
+    runner._get_plan_runner = lambda: SimpleNamespace(drop_query_fragments=_drop_query_fragments)
 
     coordinator.update_node_capacities((NodeCapacity("node-b", node_resources),))
-    runner_cls._synchronize_query_allocations(runner)
+    teardowns = runner_cls._synchronize_query_allocations(runner)
+    runner_cls._run_query_allocation_teardowns(runner, teardowns)
 
     snapshot = manager.snapshot()
     assert snapshot["cancelled"] is True
