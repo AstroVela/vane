@@ -1691,6 +1691,86 @@ void register_ray_bindings(py::module_ &mod) {
 	    "Verify RayTaskResultHandle records the current Python handle worker_id at completion time.");
 
 	m.def(
+	    "_ray_task_result_poller_batch_for_test",
+	    [](py::list handles, int timeout_ms) {
+		    using namespace duckdb::distributed;
+		    using namespace duckdb::distributed::python::ray;
+
+		    if (timeout_ms <= 0) {
+			    throw pybind11::value_error("timeout_ms must be positive");
+		    }
+
+		    struct PollOutcome {
+			    bool terminal = false;
+			    bool is_error = false;
+			    string error;
+			    bool has_output = false;
+			    string worker_id;
+		    };
+
+		    std::vector<std::unique_ptr<RayTaskResultHandle>> task_handles;
+		    task_handles.reserve(handles.size());
+		    for (size_t index = 0; index < handles.size(); ++index) {
+			    auto handle = pybind11::reinterpret_borrow<pybind11::object>(handles[index]);
+			    task_handles.push_back(make_uniq<RayTaskResultHandle>(
+			        TaskContext::from_node_context(0, index + 1, index), std::move(handle),
+			        make_worker_id("worker-original-" + std::to_string(index)),
+			        "poller-test." + std::to_string(index)));
+		    }
+
+		    std::vector<PollOutcome> outcomes(task_handles.size());
+		    {
+			    pybind11::gil_scoped_release release;
+			    size_t remaining = task_handles.size();
+			    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+			    while (remaining > 0 && std::chrono::steady_clock::now() < deadline) {
+				    bool had_progress = false;
+				    for (size_t index = 0; index < task_handles.size(); ++index) {
+					    auto &outcome = outcomes[index];
+					    if (outcome.terminal) {
+						    continue;
+					    }
+					    auto polled = task_handles[index]->poll();
+					    if (!polled.first) {
+						    continue;
+					    }
+					    outcome.terminal = true;
+					    remaining--;
+					    had_progress = true;
+					    if (polled.second.is_err()) {
+						    outcome.is_error = true;
+						    outcome.error = polled.second.error().what();
+					    } else {
+						    auto payload = std::move(polled.second).value();
+						    outcome.has_output = payload.first;
+						    if (payload.second.worker_id()) {
+							    outcome.worker_id = *payload.second.worker_id();
+						    }
+					    }
+					    task_handles[index]->AckPollResult();
+				    }
+				    if (!had_progress && remaining > 0) {
+					    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				    }
+			    }
+		    }
+
+		    pybind11::list result;
+		    for (const auto &outcome : outcomes) {
+			    pybind11::dict item;
+			    item["terminal"] = outcome.terminal;
+			    item["is_error"] = outcome.is_error;
+			    item["error"] = outcome.error;
+			    item["has_output"] = outcome.has_output;
+			    item["worker_id"] = outcome.worker_id;
+			    result.append(std::move(item));
+		    }
+		    return result;
+	    },
+	    py::arg("handles"), py::arg("timeout_ms") = 2000,
+	    "Poll multiple RayTaskResultHandle instances through the shared native poller.");
+
+	m.def(
 	    "python_task_result_handle_for_test",
 	    [](py::object handle) {
 		    using namespace duckdb::distributed;

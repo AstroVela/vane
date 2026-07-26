@@ -17,11 +17,13 @@
 #include <duckdb/common/arrow/arrow_converter.hpp>
 #include <duckdb/common/arrow/arrow.hpp>
 #include <duckdb/common/arrow/arrow_type_extension.hpp>
-#include <thread>
-#include <mutex>
-#include <unordered_map>
 #include <atomic>
 #include <cstdint>
+#include <iostream>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace py = pybind11;
 using namespace duckdb::distributed::python::ray;
@@ -511,6 +513,7 @@ struct RayTaskPollState {
 	duckdb::distributed::python::ray::SafePyObject handle;
 	duckdb::distributed::python::ray::RayTaskResultHandle::WorkerId worker_id;
 	duckdb::distributed::python::ray::RayTaskResultHandle::TaskContext task_context;
+	std::string fte_task_id;
 	std::shared_ptr<duckdb::distributed::UnboundedChannelState<
 	    duckdb::distributed::DuckDBResult<std::pair<bool, duckdb::distributed::MaterializedOutput>>>>
 	    result_state;
@@ -561,6 +564,107 @@ private:
 		thread_ = std::thread([this]() { Run(); });
 	}
 
+	static std::string TaskFailureMessage(const std::shared_ptr<RayTaskPollState> &state, const std::string &operation,
+	                                      const std::string &detail) {
+		std::string message = "Ray task result polling failed operation=" + operation;
+		if (state && !state->fte_task_id.empty()) {
+			message += " task_id=" + state->fte_task_id;
+		} else if (state) {
+			message += " poller_id=" + std::to_string(state->id);
+		}
+		return message + ": " + detail;
+	}
+
+	void ReportBatchFailure(const std::string &operation, const std::string &detail) {
+		auto diagnostic = "operation=" + operation + " error=" + detail;
+		if (diagnostic == last_batch_failure_) {
+			return;
+		}
+		last_batch_failure_ = diagnostic;
+		std::cerr << "[vane-ray-result-poller] " << diagnostic << std::endl;
+	}
+
+	void ClearBatchFailure() {
+		last_batch_failure_.clear();
+	}
+
+	static std::vector<size_t> DecodeReadyIndices(const py::list &ready_indices, size_t active_count) {
+		std::vector<size_t> decoded;
+		decoded.reserve(ready_indices.size());
+		std::unordered_set<size_t> seen;
+		size_t result_position = 0;
+		for (auto raw_index : ready_indices) {
+			auto index_obj = py::reinterpret_borrow<py::object>(raw_index);
+			if (py::isinstance<py::bool_>(index_obj) || !py::isinstance<py::int_>(index_obj)) {
+				throw duckdb::InvalidInputException("batch_wait_ready index at position " +
+				                                    std::to_string(result_position) + " must be an integer");
+			}
+			auto signed_index = index_obj.cast<int64_t>();
+			if (signed_index < 0) {
+				throw duckdb::InvalidInputException("batch_wait_ready index at position " +
+				                                    std::to_string(result_position) + " must be non-negative");
+			}
+			auto index = static_cast<size_t>(signed_index);
+			if (index >= active_count) {
+				throw duckdb::InvalidInputException("batch_wait_ready index " + std::to_string(index) +
+				                                    " is out of range for " + std::to_string(active_count) +
+				                                    " active handles");
+			}
+			if (!seen.insert(index).second) {
+				throw duckdb::InvalidInputException("batch_wait_ready returned duplicate index " +
+				                                    std::to_string(index));
+			}
+			decoded.push_back(index);
+			result_position++;
+		}
+		return decoded;
+	}
+
+	bool PollOneUnderGIL(const std::shared_ptr<RayTaskPollState> &state, const std::string &batch_failure) {
+		if (!state || state->done_sent.load()) {
+			return false;
+		}
+		std::string operation = "read handle";
+		try {
+			if (!state->handle.has_value()) {
+				return SendError(state, operation, "RayTaskResultHandle missing handle");
+			}
+			py::object handle_obj = state->handle.get();
+			operation = "handle.done";
+			if (!handle_obj.attr("done")().cast<bool>()) {
+				return false;
+			}
+			return ProcessDoneUnderGIL(state);
+		} catch (const py::error_already_set &e) {
+			auto detail = std::string(e.what());
+			if (!batch_failure.empty()) {
+				detail += "; batch_fallback_cause=" + batch_failure;
+			}
+			return SendError(state, operation, detail);
+		} catch (const std::exception &e) {
+			auto detail = std::string(e.what());
+			if (!batch_failure.empty()) {
+				detail += "; batch_fallback_cause=" + batch_failure;
+			}
+			return SendError(state, operation, detail);
+		} catch (...) {
+			auto detail = std::string("unknown exception");
+			if (!batch_failure.empty()) {
+				detail += "; batch_fallback_cause=" + batch_failure;
+			}
+			return SendError(state, operation, detail);
+		}
+	}
+
+	bool PollIndividuallyUnderGIL(const std::vector<std::shared_ptr<RayTaskPollState>> &states,
+	                              const std::string &batch_failure) {
+		bool had_progress = false;
+		for (const auto &state : states) {
+			had_progress = PollOneUnderGIL(state, batch_failure) || had_progress;
+		}
+		return had_progress;
+	}
+
 	void Run() {
 		while (!stop_.load()) {
 			if (!RayTaskPythonRuntimeUsable()) {
@@ -576,55 +680,110 @@ private:
 				}
 			}
 			if (snapshot.empty()) {
+				ClearBatchFailure();
 				std::this_thread::sleep_for(std::chrono::milliseconds(5));
 				continue;
 			}
 
 			bool had_progress = false;
-
+			std::string operation = "acquire Python GIL";
 			try {
-				// Single GIL acquisition per polling cycle (was: N times per cycle)
+				// Keep one GIL acquisition per cycle. The batch helper remains
+				// the fast path, while an isolated per-handle path recovers from
+				// helper and result-contract failures.
 				PythonGILWrapper gil;
-
-				// Batch-check which handles are ready using Python helper
-				// This replaces N individual done() calls with one batch call
+				operation = "build handle batch";
 				py::list handles_list;
-				std::vector<size_t> active_indices;
-				for (size_t i = 0; i < snapshot.size(); ++i) {
-					auto &state = snapshot[i];
+				std::vector<std::shared_ptr<RayTaskPollState>> active_states;
+				active_states.reserve(snapshot.size());
+				for (auto &state : snapshot) {
 					if (!state || state->done_sent.load()) {
 						continue;
 					}
 					if (!state->handle.has_value()) {
-						SendError(state, "RayTaskResultHandle missing handle");
+						had_progress =
+						    SendError(state, "read handle", "RayTaskResultHandle missing handle") || had_progress;
 						continue;
 					}
-					handles_list.append(state->handle.get());
-					active_indices.push_back(i);
+					try {
+						handles_list.append(state->handle.get());
+						active_states.push_back(state);
+					} catch (const py::error_already_set &e) {
+						had_progress = SendError(state, "read handle", e.what()) || had_progress;
+					} catch (const std::exception &e) {
+						had_progress = SendError(state, "read handle", e.what()) || had_progress;
+					} catch (...) {
+						had_progress = SendError(state, "read handle", "unknown exception") || had_progress;
+					}
 				}
 
-				if (!active_indices.empty()) {
-					// Call batch_wait_ready() - single Python call replaces N done() calls
-					auto driver_mod = py::module_::import("duckdb.runners.ray.driver");
-					py::object batch_wait_fn = driver_mod.attr("batch_wait_ready");
-					py::list ready_indices = batch_wait_fn(handles_list);
+				if (!active_states.empty()) {
+					std::vector<size_t> ready_positions;
+					bool batch_succeeded = false;
+					std::string batch_failure;
+					try {
+						operation = "import duckdb.runners.ray.driver";
+						auto driver_mod = py::module_::import("duckdb.runners.ray.driver");
+						operation = "resolve batch_wait_ready";
+						py::object batch_wait_fn = driver_mod.attr("batch_wait_ready");
+						operation = "batch_wait_ready";
+						py::object ready_result = batch_wait_fn(handles_list);
+						operation = "decode batch_wait_ready result";
+						if (!py::isinstance<py::list>(ready_result)) {
+							throw duckdb::InvalidInputException("batch_wait_ready result must be a list");
+						}
+						ready_positions =
+						    DecodeReadyIndices(py::reinterpret_borrow<py::list>(ready_result), active_states.size());
+						batch_succeeded = true;
+						ClearBatchFailure();
+					} catch (const py::error_already_set &e) {
+						auto detail = std::string(e.what());
+						batch_failure = operation + ": " + detail;
+						ReportBatchFailure(operation, detail);
+					} catch (const std::exception &e) {
+						auto detail = std::string(e.what());
+						batch_failure = operation + ": " + detail;
+						ReportBatchFailure(operation, detail);
+					} catch (...) {
+						batch_failure = operation + ": unknown exception";
+						ReportBatchFailure(operation, "unknown exception");
+					}
 
-					// Process only the ready (done) handles
-					for (auto py_idx : ready_indices) {
-						size_t ready_pos = py_idx.cast<size_t>();
-						if (ready_pos >= active_indices.size())
-							continue;
-						size_t snap_idx = active_indices[ready_pos];
-						auto &state = snapshot[snap_idx];
-						if (state && !state->done_sent.load()) {
-							ProcessDoneUnderGIL(state);
-							had_progress = true;
+					if (!batch_succeeded) {
+						had_progress = PollIndividuallyUnderGIL(active_states, batch_failure) || had_progress;
+					} else {
+						for (auto ready_position : ready_positions) {
+							auto &state = active_states[ready_position];
+							try {
+								had_progress = ProcessDoneUnderGIL(state) || had_progress;
+							} catch (const py::error_already_set &e) {
+								had_progress = SendError(state, "process ready handle", e.what()) || had_progress;
+							} catch (const std::exception &e) {
+								had_progress = SendError(state, "process ready handle", e.what()) || had_progress;
+							} catch (...) {
+								had_progress =
+								    SendError(state, "process ready handle", "unknown exception") || had_progress;
+							}
 						}
 					}
 				}
-			} catch (const py::error_already_set &) {
-				// Best-effort done notification; continue polling other tasks.
-			} catch (const std::exception &) {
+			} catch (const py::error_already_set &e) {
+				auto detail = std::string(e.what());
+				ReportBatchFailure(operation, detail);
+				for (const auto &state : snapshot) {
+					had_progress = SendError(state, operation, detail) || had_progress;
+				}
+			} catch (const std::exception &e) {
+				auto detail = std::string(e.what());
+				ReportBatchFailure(operation, detail);
+				for (const auto &state : snapshot) {
+					had_progress = SendError(state, operation, detail) || had_progress;
+				}
+			} catch (...) {
+				ReportBatchFailure(operation, "unknown exception");
+				for (const auto &state : snapshot) {
+					had_progress = SendError(state, operation, "unknown exception") || had_progress;
+				}
 			}
 
 			// Clean up done tasks
@@ -648,22 +807,22 @@ private:
 		}
 	}
 
-	void SendError(const std::shared_ptr<RayTaskPollState> &state, const string &msg) {
-		if (state->done_sent.exchange(true)) {
-			return;
+	bool SendError(const std::shared_ptr<RayTaskPollState> &state, const string &operation, const string &detail) {
+		if (!state || state->done_sent.exchange(true)) {
+			return false;
 		}
-		// ALWAYS log task errors to stderr
-		duckdb::distributed::DuckDBError err(msg);
+		duckdb::distributed::DuckDBError err(TaskFailureMessage(state, operation, detail));
 		duckdb::distributed::DuckDBResult<std::pair<bool, duckdb::distributed::MaterializedOutput>> res =
 		    duckdb::distributed::DuckDBResult<std::pair<bool, duckdb::distributed::MaterializedOutput>>::err(err);
 		if (state->result_state) {
 			state->result_state->send(std::move(res));
 		}
+		return true;
 	}
 
-	void SendOutput(const std::shared_ptr<RayTaskPollState> &state, duckdb::distributed::MaterializedOutput output) {
-		if (state->done_sent.exchange(true)) {
-			return;
+	bool SendOutput(const std::shared_ptr<RayTaskPollState> &state, duckdb::distributed::MaterializedOutput output) {
+		if (!state || state->done_sent.exchange(true)) {
+			return false;
 		}
 		// Final task completion is routed through the FTE query result path.
 		if (state->result_state) {
@@ -671,60 +830,72 @@ private:
 			    duckdb::distributed::DuckDBResult<std::pair<bool, duckdb::distributed::MaterializedOutput>>::ok(
 			        std::make_pair(true, std::move(output))));
 		}
+		return true;
 	}
 
-	void SendNoOutput(const std::shared_ptr<RayTaskPollState> &state) {
-		if (state->done_sent.exchange(true)) {
-			return;
+	bool SendNoOutput(const std::shared_ptr<RayTaskPollState> &state) {
+		if (!state || state->done_sent.exchange(true)) {
+			return false;
 		}
 		if (state->result_state) {
 			state->result_state->send(
 			    duckdb::distributed::DuckDBResult<std::pair<bool, duckdb::distributed::MaterializedOutput>>::ok(
 			        std::make_pair(false, duckdb::distributed::MaterializedOutput())));
 		}
+		return true;
 	}
 
-	// ProcessDoneUnderGIL: handles a task that batch_wait_ready() reported as done.
+	// ProcessDoneUnderGIL: handles a task that batch_wait_ready() or the
+	// per-handle fallback confirmed as done.
 	// GIL is already held by the caller.
-	void ProcessDoneUnderGIL(const std::shared_ptr<RayTaskPollState> &state) {
+	bool ProcessDoneUnderGIL(const std::shared_ptr<RayTaskPollState> &state) {
 		if (!state || state->done_sent.load()) {
-			return;
+			return false;
 		}
+		std::string operation = "read handle";
 		try {
 			if (!state->handle.has_value()) {
-				SendError(state, "RayTaskResultHandle missing handle");
-				return;
+				return SendError(state, operation, "RayTaskResultHandle missing handle");
 			}
 			py::object handle_obj = state->handle.get();
 
+			operation = "handle.get_result_sync";
 			py::object result = handle_obj.attr("get_result_sync")();
+			operation = "decode task result";
 			RayTaskResult task_result = result.cast<RayTaskResult>();
 			if (task_result.tag == RayTaskResult::Tag::Success) {
+				operation = "materialize result partitions";
 				std::vector<::duckdb::distributed::ResultPartitionRef> partitions;
 				partitions.reserve(task_result.parts.size());
 				for (auto &part_obj : task_result.parts) {
 					py::object part = part_obj.get();
 					partitions.push_back(BuildResultPartitionFromPyObject(part));
 				}
+				operation = "build materialized output";
 				auto current_worker_id = WorkerIdFromPythonHandle(handle_obj, state->worker_id);
 				std::vector<duckdb::distributed::NodeID> node_ids(state->task_context.node_ids().begin(),
 				                                                  state->task_context.node_ids().end());
 				::duckdb::distributed::MaterializedOutput mat_output(std::move(partitions), current_worker_id,
 				                                                     std::move(node_ids));
 				mat_output.set_flight_port(task_result.flight_port);
+				operation = "apply exchange sink metadata";
 				ApplyExchangeSinkInstanceToMaterializedOutput(mat_output, task_result.ExchangeSinkInstanceObject());
-				SendOutput(state, std::move(mat_output));
+				operation = "publish task output";
+				return SendOutput(state, std::move(mat_output));
 			} else if (task_result.tag == RayTaskResult::Tag::NoOutput) {
-				SendNoOutput(state);
+				operation = "publish no-output result";
+				return SendNoOutput(state);
 			} else if (task_result.tag == RayTaskResult::Tag::WorkerDied) {
-				SendError(state, "worker died");
+				return SendError(state, "task completion", "worker died");
 			} else {
-				SendError(state, "worker unavailable");
+				return SendError(state, "task completion", "worker unavailable");
 			}
 		} catch (const py::error_already_set &e) {
-			SendError(state, e.what());
+			return SendError(state, operation, e.what());
 		} catch (const std::exception &e) {
-			SendError(state, e.what());
+			return SendError(state, operation, e.what());
+		} catch (...) {
+			return SendError(state, operation, "unknown exception");
 		}
 	}
 
@@ -733,6 +904,7 @@ private:
 	std::atomic<bool> stop_ {false};
 	std::atomic<uint64_t> next_id_ {1};
 	std::thread thread_;
+	std::string last_batch_failure_;
 };
 
 } // namespace
@@ -749,6 +921,7 @@ RayTaskResultHandle::RayTaskResultHandle(TaskContext task_context, py::object ha
 	poll_state_->handle = SafePyObject(std::move(handle));
 	poll_state_->worker_id = worker_id;
 	poll_state_->task_context = task_context;
+	poll_state_->fte_task_id = fte_task_id_;
 	poll_state_->result_state = std::make_shared<duckdb::distributed::UnboundedChannelState<
 	    duckdb::distributed::DuckDBResult<std::pair<bool, duckdb::distributed::MaterializedOutput>>>>();
 	RayTaskResultPoller::Get().Register(poll_state_);
