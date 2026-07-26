@@ -18,7 +18,11 @@ struct PyLogicalPlan {
 		return query_id_;
 	}
 
-	PyPhysicalPlanWrapper to_physical_plan(py::object conn_obj) const;
+	string session_id() const;
+	py::dict session_config() const;
+	bool has_explicit_s3_credentials() const;
+
+	PyPhysicalPlanWrapper to_physical_plan(py::object conn_obj, py::object effective_session_config) const;
 };
 
 static string SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::Relation> &rel) {
@@ -90,6 +94,84 @@ static py::object LookupBootstrapSnapshot(const py::object &snapshot_obj) {
 		return py::none();
 	}
 	return bootstrap_obj;
+}
+
+static py::dict LookupVaneSessionSnapshot(const py::object &snapshot_obj) {
+	if (snapshot_obj.is_none() || !py::isinstance<py::dict>(snapshot_obj)) {
+		throw duckdb::InvalidInputException("Connection snapshot is missing the required Vane session");
+	}
+	auto snapshot = snapshot_obj.cast<py::dict>();
+	if (!snapshot.contains(py::str("vane_session")) || !py::isinstance<py::dict>(snapshot[py::str("vane_session")])) {
+		throw duckdb::InvalidInputException("Connection snapshot is missing the required Vane session");
+	}
+	return snapshot[py::str("vane_session")].cast<py::dict>();
+}
+
+static string VaneSessionIdFromSnapshot(const py::object &snapshot_obj) {
+	auto session = LookupVaneSessionSnapshot(snapshot_obj);
+	if (!session.contains(py::str("id")) || session[py::str("id")].is_none()) {
+		throw duckdb::InvalidInputException("Connection snapshot Vane session is missing id");
+	}
+	auto session_id = py::str(session[py::str("id")]).cast<string>();
+	if (session_id.empty()) {
+		throw duckdb::InvalidInputException("Connection snapshot Vane session id must not be empty");
+	}
+	return session_id;
+}
+
+static py::dict VaneSessionConfigFromSnapshot(const py::object &snapshot_obj) {
+	auto session = LookupVaneSessionSnapshot(snapshot_obj);
+	if (!session.contains(py::str("config")) || session[py::str("config")].is_none()) {
+		throw duckdb::InvalidInputException("Connection snapshot Vane session is missing config");
+	}
+	if (!py::isinstance<py::dict>(session[py::str("config")])) {
+		throw duckdb::InvalidInputException("Connection snapshot Vane session config must be a dict");
+	}
+	return CopyPyDict(session[py::str("config")].cast<py::dict>());
+}
+
+static bool HasExplicitS3CredentialsFromSnapshot(const py::object &snapshot_obj) {
+	if (snapshot_obj.is_none() || !py::isinstance<py::dict>(snapshot_obj)) {
+		throw duckdb::InvalidInputException("Connection snapshot is missing the required Vane session");
+	}
+	auto snapshot = snapshot_obj.cast<py::dict>();
+	if (!snapshot.contains(py::str("settings")) || !py::isinstance<py::list>(snapshot[py::str("settings")])) {
+		return false;
+	}
+	bool has_access_key = false;
+	bool has_secret_key = false;
+	bool has_session_token = false;
+	string access_key;
+	string secret_key;
+	string session_token;
+	for (auto item : snapshot[py::str("settings")].cast<py::list>()) {
+		if (!py::isinstance<py::dict>(item)) {
+			continue;
+		}
+		auto setting = py::reinterpret_borrow<py::dict>(item);
+		if (!setting.contains(py::str("name")) || !setting.contains(py::str("value"))) {
+			continue;
+		}
+		auto name = duckdb::StringUtil::Lower(py::str(setting[py::str("name")]).cast<string>());
+		if (name == "s3_access_key_id") {
+			has_access_key = true;
+			access_key = py::str(setting[py::str("value")]).cast<string>();
+		} else if (name == "s3_secret_access_key") {
+			has_secret_key = true;
+			secret_key = py::str(setting[py::str("value")]).cast<string>();
+		} else if (name == "s3_session_token") {
+			has_session_token = true;
+			session_token = py::str(setting[py::str("value")]).cast<string>();
+		}
+	}
+	const bool has_access_key_value = !access_key.empty();
+	const bool has_secret_key_value = !secret_key.empty();
+	if (has_access_key != has_secret_key || has_access_key_value != has_secret_key_value ||
+	    (has_session_token && !session_token.empty() && !has_access_key_value)) {
+		throw duckdb::InvalidInputException(
+		    "Explicit DuckDB S3 credentials must set both s3_access_key_id and s3_secret_access_key");
+	}
+	return has_access_key;
 }
 
 static bool IsDefaultBootstrapSnapshot(const py::object &bootstrap_obj) {
@@ -188,17 +270,31 @@ static py::object ResolveConnectionForSnapshot(py::object conn_obj, const py::ob
 	return CreateConnectionFromBootstrapSnapshot(bootstrap_obj);
 }
 
-static std::mutex g_query_udf_registrations_lock;
-static std::unordered_map<string, duckdb::distributed::python::ray::SafePyObject> g_query_udf_registrations;
-static std::mutex g_query_udf_actor_handles_lock;
-static std::unordered_map<string, duckdb::distributed::python::ray::SafePyObject> g_query_udf_actor_handles;
-static std::mutex g_query_connection_snapshots_lock;
-static std::unordered_map<string, duckdb::distributed::python::ray::SafePyObject> g_query_connection_snapshots;
+struct QueryPythonReplayState {
+	string session_id;
+	duckdb::distributed::python::ray::SafePyObject session_config;
+	duckdb::distributed::python::ray::SafePyObject udf_registrations;
+	duckdb::distributed::python::ray::SafePyObject udf_actor_handles;
+	duckdb::distributed::python::ray::SafePyObject connection_snapshot;
+
+	QueryPythonReplayState(string session_id_p, py::object session_config_p, py::object udf_registrations_p,
+	                       py::object udf_actor_handles_p, py::object connection_snapshot_p)
+	    : session_id(std::move(session_id_p)),
+	      session_config(duckdb::distributed::python::ray::SafePyObject(std::move(session_config_p))),
+	      udf_registrations(duckdb::distributed::python::ray::SafePyObject(std::move(udf_registrations_p))),
+	      udf_actor_handles(duckdb::distributed::python::ray::SafePyObject(std::move(udf_actor_handles_p))),
+	      connection_snapshot(duckdb::distributed::python::ray::SafePyObject(std::move(connection_snapshot_p))) {
+	}
+};
+
+static std::mutex g_query_python_replay_states_lock;
+static std::unordered_map<string, std::unique_ptr<QueryPythonReplayState>> g_query_python_replay_states;
 
 struct ConnectionSettingRecord {
 	string name;
 	string value;
 	string input_type;
+	string scope;
 };
 
 static bool ShouldSkipConnectionSettingSnapshot(const string &name, const string &input_type) {
@@ -223,6 +319,15 @@ static bool IsNumericConnectionSettingType(const string &input_type) {
 	    "USMALLINT", "UINTEGER", "UBIGINT", "FLOAT",  "DOUBLE",  "DECIMAL",
 	};
 	return numeric_types.find(duckdb::StringUtil::Upper(input_type)) != numeric_types.end();
+}
+
+static bool IsVaneSessionBaselineConnectionSetting(const string &name) {
+	static const std::unordered_set<string> names {
+	    "http_keep_alive",  "http_retries", "http_retry_backoff", "http_retry_wait_ms",
+	    "s3_access_key_id", "s3_endpoint",  "s3_region",          "s3_secret_access_key",
+	    "s3_session_token", "s3_url_style", "s3_use_ssl",
+	};
+	return names.find(duckdb::StringUtil::Lower(name)) != names.end();
 }
 
 static string QuoteSQLStringLiteral(const string &value) {
@@ -291,6 +396,66 @@ static void ConfigureConnectionForS3Endpoint(duckdb::Connection &conn, const str
 	                               "URL_STYLE 'path')");
 }
 
+static string VaneSessionConfigValue(const py::dict &config, const char *key) {
+	auto py_key = py::str(key);
+	if (!config.contains(py_key) || config[py_key].is_none()) {
+		return string();
+	}
+	return py::str(config[py_key]).cast<string>();
+}
+
+static void ApplyVaneSessionConfigValues(duckdb::Connection &conn, const py::dict &config) {
+	auto endpoint_url = VaneSessionConfigValue(config, "AWS_ENDPOINT_URL");
+	auto access_key = VaneSessionConfigValue(config, "AWS_ACCESS_KEY_ID");
+	auto secret_key = VaneSessionConfigValue(config, "AWS_SECRET_ACCESS_KEY");
+	auto session_token = VaneSessionConfigValue(config, "AWS_SESSION_TOKEN");
+	auto region = VaneSessionConfigValue(config, "AWS_REGION");
+	if (region.empty()) {
+		region = VaneSessionConfigValue(config, "AWS_DEFAULT_REGION");
+	}
+	if (endpoint_url.empty() && access_key.empty() && secret_key.empty() && session_token.empty() && region.empty()) {
+		return;
+	}
+
+	ExecuteSnapshotQuery(conn, "LOAD httpfs");
+	if (!region.empty()) {
+		ExecuteSnapshotQuery(conn, "SET s3_region=" + QuoteSQLStringLiteral(region));
+	}
+	if (!access_key.empty()) {
+		ExecuteSnapshotQuery(conn, "SET s3_access_key_id=" + QuoteSQLStringLiteral(access_key));
+	}
+	if (!secret_key.empty()) {
+		ExecuteSnapshotQuery(conn, "SET s3_secret_access_key=" + QuoteSQLStringLiteral(secret_key));
+	}
+	if (!access_key.empty() || !secret_key.empty() || !session_token.empty()) {
+		ExecuteSnapshotQuery(conn, "SET s3_session_token=" + QuoteSQLStringLiteral(session_token));
+	}
+	if (!endpoint_url.empty()) {
+		ExecuteSnapshotQuery(conn,
+		                     "SET s3_endpoint=" + QuoteSQLStringLiteral(StripS3EndpointSchemeForDuckDB(endpoint_url)));
+		ExecuteSnapshotQuery(conn, string("SET s3_use_ssl=") + (S3EndpointUsesSSL(endpoint_url) ? "true" : "false"));
+		ExecuteSnapshotQuery(conn, "SET s3_url_style='path'");
+	}
+	ExecuteSnapshotQuery(conn, "SET http_keep_alive=true");
+	ExecuteSnapshotQuery(conn, "SET http_retries=10");
+	ExecuteSnapshotQuery(conn, "SET http_retry_wait_ms=100");
+	ExecuteSnapshotQuery(conn, "SET http_retry_backoff=1.5");
+}
+
+static void ApplyVaneSessionConfig(duckdb::Connection &conn, const py::object &snapshot_obj) {
+	ApplyVaneSessionConfigValues(conn, VaneSessionConfigFromSnapshot(snapshot_obj));
+}
+
+static void ApplyEffectiveVaneSessionConfig(duckdb::Connection &conn, const py::object &config_obj) {
+	if (config_obj.is_none()) {
+		return;
+	}
+	if (!py::isinstance<py::dict>(config_obj)) {
+		throw duckdb::InvalidInputException("Effective Vane session config must be a dict");
+	}
+	ApplyVaneSessionConfigValues(conn, config_obj.cast<py::dict>());
+}
+
 static std::vector<string> QueryLoadedExtensionNames(DuckDBPyConnection &conn_wrapper) {
 	std::vector<string> extensions;
 	auto result =
@@ -315,7 +480,7 @@ static std::vector<string> QueryLoadedExtensionNames(DuckDBPyConnection &conn_wr
 
 static std::vector<ConnectionSettingRecord> QueryConnectionSettings(DuckDBPyConnection &conn_wrapper) {
 	std::vector<ConnectionSettingRecord> settings;
-	auto result = ExecuteSnapshotQuery(conn_wrapper.con.GetConnection(), "SELECT name, value, input_type "
+	auto result = ExecuteSnapshotQuery(conn_wrapper.con.GetConnection(), "SELECT name, value, input_type, scope "
 	                                                                     "FROM duckdb_settings() "
 	                                                                     "ORDER BY name");
 	auto &collection = result->Collection();
@@ -325,12 +490,14 @@ static std::vector<ConnectionSettingRecord> QueryConnectionSettings(DuckDBPyConn
 		auto name_val = row.GetValue(0);
 		auto value_val = row.GetValue(1);
 		auto input_type_val = row.GetValue(2);
-		if (name_val.IsNull() || input_type_val.IsNull()) {
+		auto scope_val = row.GetValue(3);
+		if (name_val.IsNull() || input_type_val.IsNull() || scope_val.IsNull()) {
 			continue;
 		}
 		record.name = name_val.ToString();
 		record.value = value_val.IsNull() ? string() : value_val.ToString();
 		record.input_type = input_type_val.ToString();
+		record.scope = scope_val.ToString();
 		settings.push_back(std::move(record));
 	}
 	return settings;
@@ -349,6 +516,14 @@ static void TryLoadSnapshotExtension(DuckDBPyConnection &conn_wrapper, const str
 	}
 	ExecuteSnapshotQuery(conn, "INSTALL " + extension_name);
 	ExecuteSnapshotQuery(conn, "LOAD " + extension_name);
+}
+
+static bool VaneRaySessionLifecycleEnabled() {
+	auto duckdb_module = py::module_::import("duckdb");
+	auto runner = py::str(duckdb_module.attr("vane_runners_cpp").attr("get_or_infer_runner_type")()).cast<string>();
+	duckdb::StringUtil::Trim(runner);
+	runner = duckdb::StringUtil::Lower(runner);
+	return runner == "ray";
 }
 
 static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper) {
@@ -380,7 +555,10 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper) {
 		}
 		auto lower_name = duckdb::StringUtil::Lower(record.name);
 		auto entry = default_setting_values.find(lower_name);
-		if (entry != default_setting_values.end() && entry->second == record.value) {
+		auto explicitly_local_session_override =
+		    duckdb::StringUtil::Lower(record.scope) == "local" && IsVaneSessionBaselineConnectionSetting(record.name);
+		if (!explicitly_local_session_override && entry != default_setting_values.end() &&
+		    entry->second == record.value) {
 			continue;
 		}
 		py::dict setting_obj;
@@ -391,20 +569,24 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper) {
 	}
 
 	bool has_bootstrap = !IsDefaultBootstrapSnapshot(bootstrap_obj);
-	if (!has_bootstrap && py::len(extensions_obj) == 0 && py::len(settings_obj) == 0) {
-		return py::none();
-	}
-
 	py::dict snapshot_obj;
+	py::dict session_obj;
+	session_obj[py::str("id")] = py::str(conn_wrapper.GetVaneSessionId());
+	session_obj[py::str("config")] = conn_wrapper.ExportVaneSessionConfig();
+	snapshot_obj[py::str("vane_session")] = std::move(session_obj);
 	if (has_bootstrap) {
 		snapshot_obj[py::str("bootstrap")] = NormalizeBootstrapSnapshot(bootstrap_obj);
 	}
 	snapshot_obj[py::str("extensions")] = std::move(extensions_obj);
 	snapshot_obj[py::str("settings")] = std::move(settings_obj);
+	if (VaneRaySessionLifecycleEnabled()) {
+		conn_wrapper.MarkVaneRaySessionOpened();
+	}
 	return snapshot_obj;
 }
 
-static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snapshot_obj) {
+static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snapshot_obj,
+                                    bool apply_session_config = true) {
 	if (snapshot_obj.is_none()) {
 		return;
 	}
@@ -425,6 +607,9 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 				TryLoadSnapshotExtension(conn_wrapper, extension_name, true);
 			}
 		}
+	}
+	if (apply_session_config) {
+		ApplyVaneSessionConfig(conn_wrapper.con.GetConnection(), snapshot_obj);
 	}
 
 	if (!snapshot.contains(py::str("settings"))) {
@@ -461,109 +646,104 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 	}
 }
 
-static void RememberQueryUDFRegistrations(const string &query_id, const py::object &registrations) {
-	if (query_id.empty() || registrations.is_none()) {
-		return;
+string PyLogicalPlan::session_id() const {
+	return VaneSessionIdFromSnapshot(connection_snapshot_);
+}
+
+py::dict PyLogicalPlan::session_config() const {
+	return VaneSessionConfigFromSnapshot(connection_snapshot_);
+}
+
+bool PyLogicalPlan::has_explicit_s3_credentials() const {
+	return HasExplicitS3CredentialsFromSnapshot(connection_snapshot_);
+}
+
+enum class QueryPythonReplayField : uint8_t {
+	UDFRegistrations,
+	UDFActorHandles,
+	ConnectionSnapshot,
+};
+
+static py::object LookupQueryPythonReplayState(const string &query_id, QueryPythonReplayField field) {
+	if (query_id.empty()) {
+		return py::none();
 	}
-	std::lock_guard<std::mutex> guard(g_query_udf_registrations_lock);
-	g_query_udf_registrations[query_id] = duckdb::distributed::python::ray::SafePyObject(registrations);
+	std::lock_guard<std::mutex> guard(g_query_python_replay_states_lock);
+	auto entry = g_query_python_replay_states.find(query_id);
+	if (entry == g_query_python_replay_states.end()) {
+		return py::none();
+	}
+	switch (field) {
+	case QueryPythonReplayField::UDFRegistrations:
+		return entry->second->udf_registrations.get();
+	case QueryPythonReplayField::UDFActorHandles:
+		return entry->second->udf_actor_handles.get();
+	case QueryPythonReplayField::ConnectionSnapshot:
+		return entry->second->connection_snapshot.get();
+	default:
+		throw duckdb::InternalException("Unknown query Python replay field");
+	}
+}
+
+static bool RegisterQueryPythonReplayState(const string &query_id, const py::object &udf_registrations,
+                                           const py::object &udf_actor_handles, const py::object &connection_snapshot) {
+	if (query_id.empty()) {
+		throw duckdb::InternalException("Query Python replay state requires a non-empty query_id");
+	}
+	auto session_id = VaneSessionIdFromSnapshot(connection_snapshot);
+	py::object session_config = VaneSessionConfigFromSnapshot(connection_snapshot);
+	std::lock_guard<std::mutex> guard(g_query_python_replay_states_lock);
+	auto entry = g_query_python_replay_states.find(query_id);
+	if (entry == g_query_python_replay_states.end()) {
+		g_query_python_replay_states.emplace(query_id, std::make_unique<QueryPythonReplayState>(
+		                                                   std::move(session_id), std::move(session_config),
+		                                                   py::reinterpret_borrow<py::object>(udf_registrations),
+		                                                   py::reinterpret_borrow<py::object>(udf_actor_handles),
+		                                                   py::reinterpret_borrow<py::object>(connection_snapshot)));
+		return true;
+	}
+	auto &state = *entry->second;
+	if (state.session_id != session_id || !PythonObjectsEqual(state.session_config.get(), session_config)) {
+		throw duckdb::InvalidInputException("Query " + query_id + " was registered with a different Vane session");
+	}
+	if (!PythonObjectsEqual(state.connection_snapshot.get(), connection_snapshot)) {
+		throw duckdb::InvalidInputException("Query " + query_id +
+		                                    " was registered with a different connection snapshot");
+	}
+	if (!PythonObjectsEqual(state.udf_registrations.get(), udf_registrations)) {
+		throw duckdb::InvalidInputException("Query " + query_id +
+		                                    " was registered with different Python UDF registrations");
+	}
+	if (!PythonObjectsEqual(state.udf_actor_handles.get(), udf_actor_handles)) {
+		throw duckdb::InvalidInputException("Query " + query_id +
+		                                    " was registered with different Python UDF actor handles");
+	}
+	return false;
 }
 
 static py::object LookupQueryUDFRegistrations(const string &query_id) {
-	if (query_id.empty()) {
-		return py::none();
-	}
-	std::lock_guard<std::mutex> guard(g_query_udf_registrations_lock);
-	auto entry = g_query_udf_registrations.find(query_id);
-	if (entry == g_query_udf_registrations.end()) {
-		return py::none();
-	}
-	return entry->second.get();
-}
-
-static void ForgetQueryUDFRegistrations(const string &query_id) {
-	if (query_id.empty()) {
-		return;
-	}
-	std::lock_guard<std::mutex> guard(g_query_udf_registrations_lock);
-	g_query_udf_registrations.erase(query_id);
-}
-
-static void RememberQueryConnectionSnapshot(const string &query_id, const py::object &snapshot) {
-	if (query_id.empty() || snapshot.is_none()) {
-		return;
-	}
-	std::lock_guard<std::mutex> guard(g_query_connection_snapshots_lock);
-	g_query_connection_snapshots[query_id] = duckdb::distributed::python::ray::SafePyObject(snapshot);
+	return LookupQueryPythonReplayState(query_id, QueryPythonReplayField::UDFRegistrations);
 }
 
 static py::object LookupQueryConnectionSnapshot(const string &query_id) {
-	if (query_id.empty()) {
-		return py::none();
-	}
-	std::lock_guard<std::mutex> guard(g_query_connection_snapshots_lock);
-	auto entry = g_query_connection_snapshots.find(query_id);
-	if (entry == g_query_connection_snapshots.end()) {
-		return py::none();
-	}
-	return entry->second.get();
-}
-
-static void ForgetQueryConnectionSnapshot(const string &query_id) {
-	if (query_id.empty()) {
-		return;
-	}
-	std::lock_guard<std::mutex> guard(g_query_connection_snapshots_lock);
-	g_query_connection_snapshots.erase(query_id);
-}
-
-static void RememberQueryUDFActorHandles(const string &query_id, const py::object &handles_map) {
-	if (query_id.empty() || handles_map.is_none()) {
-		return;
-	}
-	std::lock_guard<std::mutex> guard(g_query_udf_actor_handles_lock);
-	g_query_udf_actor_handles[query_id] = duckdb::distributed::python::ray::SafePyObject(handles_map);
+	return LookupQueryPythonReplayState(query_id, QueryPythonReplayField::ConnectionSnapshot);
 }
 
 static py::object LookupQueryUDFActorHandles(const string &query_id) {
-	if (query_id.empty()) {
-		return py::none();
-	}
-	std::lock_guard<std::mutex> guard(g_query_udf_actor_handles_lock);
-	auto entry = g_query_udf_actor_handles.find(query_id);
-	if (entry == g_query_udf_actor_handles.end()) {
-		return py::none();
-	}
-	return entry->second.get();
-}
-
-static void ForgetQueryUDFActorHandles(const string &query_id) {
-	if (query_id.empty()) {
-		return;
-	}
-	std::lock_guard<std::mutex> guard(g_query_udf_actor_handles_lock);
-	g_query_udf_actor_handles.erase(query_id);
+	return LookupQueryPythonReplayState(query_id, QueryPythonReplayField::UDFActorHandles);
 }
 
 static void CleanupQueryPythonReplayState(const string &query_id) {
-	ForgetQueryUDFRegistrations(query_id);
-	ForgetQueryUDFActorHandles(query_id);
-	ForgetQueryConnectionSnapshot(query_id);
+	if (query_id.empty()) {
+		return;
+	}
+	std::lock_guard<std::mutex> guard(g_query_python_replay_states_lock);
+	g_query_python_replay_states.erase(query_id);
 }
 
 static void CleanupAllQueryPythonReplayState() {
-	{
-		std::lock_guard<std::mutex> guard(g_query_udf_registrations_lock);
-		g_query_udf_registrations.clear();
-	}
-	{
-		std::lock_guard<std::mutex> guard(g_query_udf_actor_handles_lock);
-		g_query_udf_actor_handles.clear();
-	}
-	{
-		std::lock_guard<std::mutex> guard(g_query_connection_snapshots_lock);
-		g_query_connection_snapshots.clear();
-	}
+	std::lock_guard<std::mutex> guard(g_query_python_replay_states_lock);
+	g_query_python_replay_states.clear();
 }
 
 static duckdb::unique_ptr<duckdb::LogicalOperator>

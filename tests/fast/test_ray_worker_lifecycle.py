@@ -166,6 +166,11 @@ def test_actor_shutdown_joins_native_threads_before_closing_runtime(monkeypatch)
             assert native_finished.is_set()
             events.append("connection-close")
 
+    class SessionConnection:
+        def close(self):
+            assert native_finished.is_set()
+            events.append("session-connection-close")
+
     class TaskManager:
         def shutdown(self):
             events.append("tasks-canceled")
@@ -173,6 +178,7 @@ def test_actor_shutdown_joins_native_threads_before_closing_runtime(monkeypatch)
     class DummyActor:
         _shutdown_lock = threading.Lock()
         _shared_conn_lock = threading.Lock()
+        _session_connections_lock = threading.RLock()
         _native_execution_condition = threading.Condition()
         _native_execution_count = 1
         _native_execution_counts_by_query = {"query-a": 1}
@@ -181,6 +187,7 @@ def test_actor_shutdown_joins_native_threads_before_closing_runtime(monkeypatch)
         _shutdown_prepared = False
         _shutdown_complete = False
         _shared_conn = Connection()
+        _session_connections = {"session-a": ({}, SessionConnection())}
         _fte_task_manager = TaskManager()
 
     actor = DummyActor()
@@ -228,6 +235,7 @@ def test_actor_shutdown_joins_native_threads_before_closing_runtime(monkeypatch)
         "connection-interrupt",
         "cursor-interrupt",
         "native-finished",
+        "session-connection-close",
         "connection-close",
     ]
 
@@ -408,3 +416,61 @@ def test_actor_task_manager_creation_is_rejected_after_shutdown_starts():
 
     with pytest.raises(RuntimeError, match="shutting down"):
         actor_class._get_fte_task_manager(DummyActor())
+
+
+def test_actor_session_connection_creation_is_rejected_after_shutdown_starts():
+    from duckdb.runners.ray import worker as worker_module
+
+    actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    actor._shutdown_started = True
+    actor._session_connections_lock = threading.RLock()
+    actor._session_connections = {}
+    actor._closed_session_ids = worker_module.BoundedReplayMap(capacity=16)
+
+    with pytest.raises(RuntimeError, match="shutting down"):
+        actor_class._get_session_conn(actor, "session-a", {})
+
+
+def test_actor_shutdown_retries_failed_session_connection_close():
+    from duckdb.runners.ray import worker as worker_module
+
+    class SessionConnection:
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("planned session connection close failure")
+
+    session_connection = SessionConnection()
+
+    class DummyActor:
+        _shutdown_lock = threading.RLock()
+        _shared_conn_lock = threading.Lock()
+        _session_connections_lock = threading.RLock()
+        _native_execution_condition = threading.Condition()
+        _native_execution_count = 0
+        _native_execution_counts_by_query: dict[str, int] = {}
+        _active_native_cursors: set[object] = set()
+        _native_cursor_query_ids: dict[object, str] = {}
+        _closing_native_queries: set[str] = set()
+        _shutdown_started = False
+        _shutdown_prepared = False
+        _shutdown_complete = False
+        _shared_conn = None
+        _session_connections = {"session-a": ({}, session_connection)}
+        _fte_task_manager = None
+
+    actor = DummyActor()
+    actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
+
+    with pytest.raises(RuntimeError, match="planned session connection close failure"):
+        actor_class._prepare_worker_runtime_shutdown(actor)
+
+    assert actor._session_connections == {"session-a": ({}, session_connection)}
+    actor_class._prepare_worker_runtime_shutdown(actor)
+
+    assert actor._session_connections == {}
+    assert actor._shutdown_prepared is True
+    assert session_connection.close_calls == 2

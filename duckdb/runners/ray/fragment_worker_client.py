@@ -87,6 +87,25 @@ class RayWorkerActorHandle(
         with _FTE_REGISTRY_LOCK:
             _FTE_WORKER_HANDLES[worker_id] = self
 
+    def close_session(self, session_id: str) -> None:
+        import ray
+
+        from duckdb.runners.ray.driver import _runtime_error_contains
+        from duckdb.runners.ray.safe_get import resolve_object_refs_blocking
+
+        try:
+            resolve_object_refs_blocking(
+                self.actor_handle.close_session.remote(str(session_id)),
+                timeout=30,
+                honor_query_deadline=False,
+            )
+        except BaseException as error:
+            actor_error_type = getattr(ray.exceptions, "RayActorError", None)
+            if isinstance(actor_error_type, type) and _runtime_error_contains(error, actor_error_type):
+                # A dead worker process cannot retain this session's connection.
+                return
+            raise
+
     @staticmethod
     def _fte_task_handle_cls() -> type[Any]:
         # Lazy import to avoid a module import cycle with driver.py.

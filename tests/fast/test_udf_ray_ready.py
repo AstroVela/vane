@@ -62,7 +62,11 @@ def _executor(actors, *, dispatch_indices=None, payload=None, node_ids=None):
         actor_node_ids=node_ids or ["node-a"] * len(actors),
         actor_dispatch_indices=(set(range(len(actors))) if dispatch_indices is None else dispatch_indices),
     )
-    return RemoteUDFExecutor(pool, payload or _payload())
+    return RemoteUDFExecutor(
+        pool,
+        payload or _payload(),
+        query_driver_handle=object(),
+    )
 
 
 def _run_after_lease(executor, monkeypatch, *, actor_index=0):
@@ -208,10 +212,46 @@ def test_existing_actor_handles_require_explicit_dispatch_eligibility():
         actor_dispatch_indices=set(),
     )
     executor = __import__("duckdb.execution.udf_ray", fromlist=["RemoteUDFExecutor"]).RemoteUDFExecutor(
-        pool, _payload()
+        pool,
+        _payload(),
+        query_driver_handle=object(),
     )
     assert executor._ready_actor_indices == []
     assert executor._actor_init_errors[0] == "ray actor does not expose __ray_ready__ readiness probe"
+
+
+def test_actor_executor_uses_explicit_query_driver_handle():
+    from duckdb.execution.udf_ray import _build_ray_actor_executor
+
+    actor = _Actor()
+    query_driver_handle = object()
+    options = {
+        "actor_handles": [actor],
+        "actor_node_ids": ["node-a"],
+        "actor_dispatch_indices": [0],
+    }
+
+    with pytest.raises(RuntimeError, match="explicit query driver handle"):
+        _build_ray_actor_executor(_payload(), options)
+
+    with pytest.raises(RuntimeError, match="explicit Vane session config"):
+        _build_ray_actor_executor(
+            _payload(),
+            {
+                **options,
+                "query_driver_handle": query_driver_handle,
+            },
+        )
+
+    executor = _build_ray_actor_executor(
+        _payload(),
+        {
+            **options,
+            "query_driver_handle": query_driver_handle,
+            "session_config": {},
+        },
+    )
+    assert executor._task_admission._driver is query_driver_handle
 
 
 def test_actor_executor_options_reject_missing_or_invalid_coordinator_identity():

@@ -127,7 +127,7 @@ def test_worker_task_plan_rejects_present_plan_without_root():
 @pytest.mark.parametrize(
     ("execution_query_id", "resource_query_id", "expected"),
     [
-        ("query-root", None, "query-root"),
+        ("query-root", "query-root", "query-root"),
         ("query-root:orderby:sample", "query-root", "query-root"),
     ],
 )
@@ -143,6 +143,14 @@ def test_submission_error_is_owned_by_outer_resource_query(
         )
         == expected
     )
+
+
+def test_submission_error_rejects_missing_resource_query_owner():
+    with pytest.raises(RuntimeError, match="requires a non-empty resource_query_id"):
+        duckdb.ray_cxx._submission_error_owner_query_id_for_test(
+            "query-root",
+            None,
+        )
 
 
 @pytest.mark.parametrize("manager_kind", ["python-backend", "ray-worker-manager"])
@@ -2706,6 +2714,10 @@ def test_ray_worker_manager_shutdown_aborts_all_actors_after_prepare_error(monke
         "worker-failing",
     ]
 
+    manager.shutdown()
+
+    assert [phase for phase, _ in calls] == ["prepare", "prepare", "abort", "abort"]
+
 
 def test_ray_worker_manager_shutdown_finishes_all_actors_after_finish_error(monkeypatch):
     calls: list[tuple[str, str]] = []
@@ -2759,6 +2771,10 @@ def test_ray_worker_manager_shutdown_finishes_all_actors_after_finish_error(monk
         "worker-clean",
         "worker-failing",
     ]
+
+    manager.shutdown()
+
+    assert [phase for phase, _ in calls] == ["prepare", "prepare", "finish", "finish"]
 
 
 def test_ray_worker_manager_worker_snapshots_fail_fast(monkeypatch):

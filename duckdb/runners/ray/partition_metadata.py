@@ -13,7 +13,8 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 
-from duckdb.runners.common import MaterializedResult, PartitionMetadata
+from duckdb.runners.common import MaterializedResult
+from duckdb.runners.common import PartitionMetadata as PartitionMetadata
 from duckdb.runners.ray.safe_get import resolve_object_refs_blocking
 
 if TYPE_CHECKING:
@@ -29,6 +30,8 @@ class RayMaterializedResult(MaterializedResult):
         metadatas: PartitionMetadataAccessor | None = None,
         metadata_idx: int | None = None,
         release_owner: Any | None = None,
+        release_owner_id: str | None = None,
+        release_session_id: str | None = None,
         release_plan_id: str | None = None,
         release_token: str | None = None,
     ):
@@ -36,6 +39,8 @@ class RayMaterializedResult(MaterializedResult):
         self._metadatas = metadatas
         self._metadata_idx = metadata_idx
         self._release_owner = release_owner
+        self._release_owner_id = release_owner_id
+        self._release_session_id = release_session_id
         self._release_plan_id = release_plan_id
         self._release_token = release_token
         self._released = False
@@ -69,9 +74,13 @@ class RayMaterializedResult(MaterializedResult):
     def close(self) -> None:
         if self._released:
             return
-        self._released = True
         if self._release_owner is None:
+            self._released = True
             return
+        if self._release_owner_id is None:
+            raise TypeError("release_owner_id is required when release_owner is set")
+        if self._release_session_id is None:
+            raise TypeError("release_session_id is required when release_owner is set")
         if self._release_plan_id is None:
             raise TypeError("release_plan_id is required when release_owner is set")
         if self._release_token is None:
@@ -80,7 +89,13 @@ class RayMaterializedResult(MaterializedResult):
         remote = release_method.remote
         if not callable(remote):
             raise TypeError("release_owner.release_result_partition_ref.remote must be callable")
-        remote(self._release_plan_id, self._release_token)
+        remote(
+            self._release_owner_id,
+            self._release_session_id,
+            self._release_plan_id,
+            self._release_token,
+        )
+        self._released = True
 
 
 class PartitionMetadataAccessor:

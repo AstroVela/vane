@@ -391,7 +391,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &sour
 		g_last_created_source_id = source_id;
 	}
 
-	return make_uniq<DuckDBPyRelation>(std::move(aliased_rel));
+	return CreateRelation(std::move(aliased_rel));
 }
 
 void ClearDataSourceFactoryRegistry() {

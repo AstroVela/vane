@@ -295,6 +295,54 @@ def test_datasource_factory_owner_released_when_query_fails(duckdb_conn):
     assert finished["owner_count"] == baseline["owner_count"]
 
 
+def test_datasource_worker_plan_uses_resource_query_owner_when_execution_id_differs(duckdb_conn):
+    source_plan_id = "query-datasource-source-plan"
+    resource_query_id = "query-datasource-resource-owner"
+    execution_query_id = f"{resource_query_id}:stage:retry"
+    relation = read_datasource(RegistryProbeSource([41]), con=duckdb_conn)
+    logical_plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, source_plan_id)
+    source_plan = logical_plan.to_physical_plan(duckdb_conn)
+    assert source_plan.idx() == source_plan_id
+    assert source_plan.resource_query_id() == source_plan_id
+
+    duckdb.ray_cxx._register_query_python_replay_state(resource_query_id, source_plan)
+    worker_connection = duckdb.connect()
+    worker_source_plan = None
+    task = None
+    worker_plan = None
+    result = None
+    try:
+        worker_source_plan = source_plan.clone(worker_connection)
+        task = duckdb.ray_cxx._make_worker_task_from_plan_for_test(
+            worker_source_plan,
+            execution_query_id,
+            resource_query_id,
+        )
+        worker_plan = task.plan()
+        assert worker_plan.idx() == execution_query_id
+        assert worker_plan.resource_query_id() == resource_query_id
+
+        result = duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+            worker_connection,
+            worker_plan,
+        )
+        assert result.completion_status == "ok"
+        assert result.partition_payloads[0].column(0).to_pylist() == [41]
+        assert result.partition_payloads[0].column(2).to_pylist() == [resource_query_id]
+
+        active = _datasource_registry_state()
+        assert active["query_ids"] == [resource_query_id]
+        assert execution_query_id not in active["query_ids"]
+    finally:
+        result = None
+        worker_plan = None
+        task = None
+        worker_source_plan = None
+        worker_connection.close()
+        _duckdb._release_datasource_factories_for_query(resource_query_id)
+        duckdb.ray_cxx._cleanup_query_python_replay_state(resource_query_id)
+
+
 def test_ray_runner_executes_python_datasource_task_on_worker(ray_runner, duckdb_conn):
     driver_pid = os.getpid()
 

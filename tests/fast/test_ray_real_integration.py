@@ -81,12 +81,68 @@ def test_run_distributed_plan_end_to_end_on_ray_local(tmp_path):
     expected_rows = {(x, x * 10, x + x * 10) for x in range(n)}
     assert set(rows) == expected_rows
 
-    # Some Ray setups do not expose named actors through the same namespace.
+    client = runner.query_driver_client
+    assert client is not None
+    assert ray.get(client.runner.ping.remote(client._owner_id)) is True
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_two_connections_share_job_runtime_and_close_independently(monkeypatch, tmp_path):
+    import os
+
+    import pyarrow as pa
+
+    from duckdb import runners as _runners
+    from duckdb.runners.ray.driver import RayQueryDriverClient
+
+    _runners.set_runner_ray(noop_if_initialized=True)
+    runner = _runners.get_or_create_runner()
+
+    session_secret_key = "AWS_ISSUE75_SESSION_SECRET"
+    path = tmp_path / "ray_two_sessions.parquet"
+    duckdb.sql(f"COPY (SELECT i::INTEGER AS value FROM range(8) AS t(i)) TO '{path}' (FORMAT PARQUET)")
+
+    monkeypatch.setenv(session_secret_key, "connection-a")
+    connection_a = duckdb.connect()
+    monkeypatch.setenv(session_secret_key, "connection-b")
+    connection_b = duckdb.connect()
+    monkeypatch.delenv(session_secret_key)
+
+    def read_session_secret(table):
+        secret = os.environ.get(session_secret_key)
+        return pa.table({"secret": [secret] * table.num_rows})
+
+    relation_a = connection_a.sql(f"SELECT * FROM read_parquet('{path}')").map_batches(
+        read_session_secret,
+        schema={"secret": duckdb.sqltypes.VARCHAR},
+        execution_backend="ray_task",
+    )
+    relation_b = connection_b.sql(f"SELECT * FROM read_parquet('{path}')").map_batches(
+        read_session_secret,
+        schema={"secret": duckdb.sqltypes.VARCHAR},
+        execution_backend="ray_task",
+    )
+
+    assert set(_collect_rows_from_parts(runner.run_iter_tables(relation_a))) == {("connection-a",)}
+    assert set(_collect_rows_from_parts(runner.run_iter_tables(relation_b))) == {("connection-b",)}
+
+    runtime_client = runner.query_driver_client
+    assert runtime_client is not None
+    peer_client = RayQueryDriverClient()
     try:
-        actor = ray.get_actor("ray-query-driver-actor", namespace="vane")
-        assert actor is not None
-    except Exception:
-        pass
+        assert runtime_client.runner._actor_id == peer_client.runner._actor_id
+    finally:
+        peer_client.close()
+
+    connection_a.close()
+    relation_b_after_close = connection_b.sql(f"SELECT * FROM read_parquet('{path}')").map_batches(
+        read_session_secret,
+        schema={"secret": duckdb.sqltypes.VARCHAR},
+        execution_backend="ray_task",
+    )
+    assert set(_collect_rows_from_parts(runner.run_iter_tables(relation_b_after_close))) == {("connection-b",)}
+    connection_b.close()
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")

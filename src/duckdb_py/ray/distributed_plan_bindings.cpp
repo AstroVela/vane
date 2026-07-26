@@ -3,24 +3,27 @@
 
 // Included by ray_module.cpp inside namespace duckdb.
 
-static void AssignDataSourceQueryOwner(duckdb::PhysicalOperator &op, const string &query_id) {
-	if (query_id.empty()) {
-		return;
-	}
+static void AssignDataSourceQueryOwner(duckdb::PhysicalOperator &op, const string &query_id,
+                                       bool allow_unacquired_rebind = false) {
 	if (op.type == duckdb::PhysicalOperatorType::TABLE_SCAN) {
 		auto &scan = op.Cast<duckdb::PhysicalTableScan>();
 		auto *bind_data = dynamic_cast<duckdb::DataSourceScanBindData *>(scan.bind_data.get());
 		if (bind_data) {
+			if (query_id.empty()) {
+				throw duckdb::InternalException("Datasource scan requires a non-empty resource query owner");
+			}
 			if (!bind_data->query_id.empty() && bind_data->query_id != query_id) {
-				throw duckdb::InvalidInputException(
-				    "Datasource scan query ownership mismatch: existing='%s', requested='%s'", bind_data->query_id,
-				    query_id);
+				if (!allow_unacquired_rebind) {
+					throw duckdb::InvalidInputException(
+					    "Datasource scan query ownership mismatch: existing='%s', requested='%s'", bind_data->query_id,
+					    query_id);
+				}
 			}
 			bind_data->query_id = query_id;
 		}
 	}
 	for (auto &child : op.children) {
-		AssignDataSourceQueryOwner(child.get(), query_id);
+		AssignDataSourceQueryOwner(child.get(), query_id, allow_unacquired_rebind);
 	}
 }
 
@@ -35,6 +38,7 @@ struct PyPhysicalPlanWrapper {
 	duckdb::shared_ptr<duckdb::ClientContext>
 	    client_context_; // Keep driver-side context alive when built from relation
 	string query_id_;
+	string resource_query_id_;
 	std::shared_ptr<duckdb::distributed::DistributedPhysicalPlan> plan_;
 	py::object arrow_schema_;        // Arrow schema for type information
 	py::object udf_registrations_;   // Connection-local Python UDF registrations captured from the source relation
@@ -46,11 +50,11 @@ struct PyPhysicalPlanWrapper {
 		return plan_ && plan_->physical_plan() && plan_->physical_plan()->HasRoot();
 	}
 
-	void ensure_connection_snapshot(py::object conn_obj) const {
+	void ensure_connection_snapshot(py::object conn_obj, bool apply_session_config = true) const {
 		if (connection_snapshot_.is_none()) {
 			return;
 		}
-		ApplyConnectionSnapshot(conn_obj, connection_snapshot_);
+		ApplyConnectionSnapshot(conn_obj, connection_snapshot_, apply_session_config);
 	}
 
 	void apply_udf_actor_handles() {
@@ -116,20 +120,20 @@ struct PyPhysicalPlanWrapper {
 		plan_ =
 		    std::make_shared<duckdb::distributed::DistributedPhysicalPlan>(idx, effective_query_id, physical_plan, cfg);
 		if (physical_plan && physical_plan->HasRoot()) {
-			AssignDataSourceQueryOwner(physical_plan->Root(), effective_query_id);
+			AssignDataSourceQueryOwner(physical_plan->Root(), resource_query_id_);
 		}
 	}
 
 	// Materialize deferred serialized_root_ into the plan's PhysicalPlan.
 	// Requires a DuckDB connection for deserialization context.
-	void materialize_deferred_root(py::object conn_obj) {
+	void materialize_deferred_root(py::object conn_obj, bool apply_session_config = true) {
 		if (serialized_root_.empty())
 			return;
 		if (has_root())
 			return; // Already has a root
 
 		ensure_plan_identity();
-		ensure_connection_snapshot(conn_obj);
+		ensure_connection_snapshot(conn_obj, apply_session_config);
 
 		auto &py_conn = ExtractPyConnectionWrapper(conn_obj);
 		auto &db_conn = py_conn.con.GetConnection();
@@ -158,7 +162,10 @@ struct PyPhysicalPlanWrapper {
 			auto *root_ptr = root_op.get();
 			physical_plan->TakeOwnership(std::move(root_op));
 			physical_plan->SetRoot(*root_ptr);
-			AssignDataSourceQueryOwner(*root_ptr, idx());
+			// The root was just deserialized and cannot have acquired a process-
+			// local datasource factory yet, so replacing its serialized source
+			// plan owner with the explicit resource query owner is safe.
+			AssignDataSourceQueryOwner(*root_ptr, resource_query_id_, true);
 		}
 		// Keep connection alive to ensure allocator validity
 		worker_connection_ = conn_obj;
@@ -195,13 +202,12 @@ struct PyPhysicalPlanWrapper {
 	PyPhysicalPlanWrapper clone(py::object conn_obj) const {
 		PyPhysicalPlanWrapper result;
 		result.query_id_ = idx();
+		result.resource_query_id_ = resource_query_id_;
 		result.udf_registrations_ = udf_registrations_;
 		result.udf_actor_handles_ = udf_actor_handles_;
 		result.connection_snapshot_ = connection_snapshot_;
 		result.serialized_root_ = serialize_root_for_clone();
 		result.ensure_plan_identity();
-		RememberQueryUDFRegistrations(result.query_id_, result.udf_registrations_);
-		RememberQueryUDFActorHandles(result.query_id_, result.udf_actor_handles_);
 		if (!conn_obj.is_none()) {
 			result.materialize_deferred_root(conn_obj);
 		}
@@ -210,8 +216,8 @@ struct PyPhysicalPlanWrapper {
 
 	PyPhysicalPlanWrapper()
 	    : init_magic_(INIT_MAGIC), worker_connection_(py::none()), client_context_(nullptr), query_id_(),
-	      plan_(nullptr), arrow_schema_(py::none()), udf_registrations_(py::none()), udf_actor_handles_(py::none()),
-	      connection_snapshot_(py::none()), serialized_root_() {
+	      resource_query_id_(), plan_(nullptr), arrow_schema_(py::none()), udf_registrations_(py::none()),
+	      udf_actor_handles_(py::none()), connection_snapshot_(py::none()), serialized_root_() {
 		// Create a minimal placeholder DistributedPhysicalPlan directly (avoid using from_logical_plan_builder).
 		try {
 			uint16_t idx = duckdb::distributed::get_query_idx_counter().fetch_add(1);
@@ -229,11 +235,26 @@ struct PyPhysicalPlanWrapper {
 	}
 	explicit PyPhysicalPlanWrapper(std::shared_ptr<duckdb::distributed::DistributedPhysicalPlan> p)
 	    : init_magic_(INIT_MAGIC), worker_connection_(py::none()), client_context_(nullptr),
-	      query_id_(p ? p->query_id() : string()), plan_(std::move(p)), arrow_schema_(py::none()),
-	      udf_registrations_(py::none()), udf_actor_handles_(py::none()), connection_snapshot_(py::none()),
-	      serialized_root_() {
+	      query_id_(p ? p->query_id() : string()), resource_query_id_(query_id_), plan_(std::move(p)),
+	      arrow_schema_(py::none()), udf_registrations_(py::none()), udf_actor_handles_(py::none()),
+	      connection_snapshot_(py::none()), serialized_root_() {
 		if (plan_ && plan_->physical_plan() && plan_->physical_plan()->HasRoot()) {
-			AssignDataSourceQueryOwner(plan_->physical_plan()->Root(), query_id_);
+			AssignDataSourceQueryOwner(plan_->physical_plan()->Root(), resource_query_id_);
+		}
+	}
+
+	PyPhysicalPlanWrapper(std::shared_ptr<duckdb::distributed::DistributedPhysicalPlan> p, string resource_query_id)
+	    : init_magic_(INIT_MAGIC), worker_connection_(py::none()), client_context_(nullptr),
+	      query_id_(p ? p->query_id() : string()), resource_query_id_(std::move(resource_query_id)),
+	      plan_(std::move(p)), arrow_schema_(py::none()), udf_registrations_(py::none()),
+	      udf_actor_handles_(py::none()), connection_snapshot_(py::none()), serialized_root_() {
+		if (resource_query_id_.empty()) {
+			throw duckdb::InternalException("DistributedPhysicalPlan requires a non-empty resource_query_id");
+		}
+		if (plan_ && plan_->physical_plan() && plan_->physical_plan()->HasRoot()) {
+			// WorkerTask plans are unexecuted copies. Their serialized source
+			// plan ID may differ from the resource query that owns teardown.
+			AssignDataSourceQueryOwner(plan_->physical_plan()->Root(), resource_query_id_, true);
 		}
 	}
 
@@ -255,6 +276,25 @@ struct PyPhysicalPlanWrapper {
 			}
 		}
 		return query_id_;
+	}
+
+	string resource_query_id() const {
+		if (!IsInitialized()) {
+			return string();
+		}
+		return resource_query_id_;
+	}
+
+	string session_id() const {
+		return VaneSessionIdFromSnapshot(connection_snapshot_);
+	}
+
+	py::dict session_config() const {
+		return VaneSessionConfigFromSnapshot(connection_snapshot_);
+	}
+
+	bool has_explicit_s3_credentials() const {
+		return HasExplicitS3CredentialsFromSnapshot(connection_snapshot_);
 	}
 
 	size_t num_partitions() const {
@@ -806,7 +846,11 @@ struct PyPhysicalPlanWrapper {
 		if (!physical_plan || !physical_plan->HasRoot())
 			return result;
 
-		// Need query_id for pool name construction.
+		// The pool identity must include the connection session. Query IDs are
+		// normally unique, but they are caller-provided at this binding boundary;
+		// allowing the same query ID from another session to attach to an
+		// existing named actor would reuse that actor's session environment.
+		auto session_id = VaneSessionIdFromSnapshot(connection_snapshot_);
 		auto query_id = plan_->query_id();
 		if (query_id.empty()) {
 			query_id = std::to_string(plan_->idx());
@@ -829,8 +873,9 @@ struct PyPhysicalPlanWrapper {
 				idx_t node_id = vllm_counter++;
 
 				// Build pool name using the same sanitization as VLLMProjectNode.
+				auto safe_session = duckdb::distributed::SanitizePoolComponent(session_id);
 				auto safe_query = duckdb::distributed::SanitizePoolComponent(query_id);
-				auto pool_name = "duckdb_vllm_" + safe_query + "_" + std::to_string(node_id);
+				auto pool_name = "duckdb_vllm_" + safe_session + "_" + safe_query + "_" + std::to_string(node_id);
 
 				// Inject pool name into operator options so the translator
 				// propagates it to VLLMProjectNode → produce_tasks.
@@ -871,7 +916,6 @@ struct PyPhysicalPlanWrapper {
 
 		if (!handles_map.empty()) {
 			udf_actor_handles_ = handles_map;
-			RememberQueryUDFActorHandles(query_id_, udf_actor_handles_);
 		}
 
 		auto physical_plan = plan_->physical_plan();
@@ -899,7 +943,7 @@ struct PyPhysicalPlanWrapper {
 	}
 };
 
-PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj) const {
+PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::object effective_session_config) const {
 	if (conn_obj.is_none()) {
 		throw duckdb::InternalException("Connection is required for to_physical_plan");
 	}
@@ -915,7 +959,11 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj) const
 
 	py::object planning_conn = ResolveConnectionForSnapshot(conn_obj, connection_snapshot_);
 	auto &conn_wrapper = ExtractPyConnectionWrapper(planning_conn);
-	ApplyConnectionSnapshot(planning_conn, connection_snapshot_);
+	// Resolved environment/profile credentials are the session baseline. Replay
+	// the source connection last so an explicit SET on that connection keeps
+	// DuckDB's normal explicit-config-over-environment precedence.
+	ApplyEffectiveVaneSessionConfig(conn_wrapper.con.GetConnection(), effective_session_config);
+	ApplyConnectionSnapshot(planning_conn, connection_snapshot_, effective_session_config.is_none());
 	if (!udf_registrations_.is_none()) {
 		conn_wrapper.ApplyDistributedPythonUDFRegistrations(udf_registrations_);
 	}
@@ -951,6 +999,7 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj) const
 
 	auto plan_wrapper = PyPhysicalPlanWrapper(distributed_plan);
 	plan_wrapper.query_id_ = query_id_;
+	plan_wrapper.resource_query_id_ = query_id_;
 	plan_wrapper.worker_connection_ = planning_conn;
 	plan_wrapper.client_context_ = conn_wrapper.con.GetConnection().context;
 	plan_wrapper.udf_registrations_ = udf_registrations_;
@@ -958,7 +1007,6 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj) const
 	auto validate_serialization =
 	    py::module_::import("duckdb._ray_cxx").attr("validate_plan_serialization_for_submission");
 	validate_serialization(py::cast(plan_wrapper));
-	RememberQueryUDFRegistrations(plan_wrapper.query_id_, plan_wrapper.udf_registrations_);
 	return plan_wrapper;
 }
 
@@ -1656,6 +1704,16 @@ struct PyPhysicalPlanWrapperRunner {
 		}
 	}
 
+	void close_session(const string &session_id) {
+		if (!ray_worker_manager_) {
+			throw std::runtime_error("Vane session lifecycle requires the Ray worker manager");
+		}
+		auto result = ray_worker_manager_->close_session(session_id);
+		if (result.is_err()) {
+			throw std::runtime_error(result.error().what());
+		}
+	}
+
 	std::unordered_map<string, std::unordered_map<string, idx_t>> fragment_stats_by_worker() const {
 		if (ray_worker_manager_) {
 			return ray_worker_manager_->fragment_stats_by_worker();
@@ -1679,7 +1737,8 @@ struct PyPhysicalPlanWrapperRunner {
 	                                                duckdb::distributed::python::ray::SafePyObject py_conn_keepalive =
 	                                                    duckdb::distributed::python::ray::SafePyObject()) {
 		using namespace duckdb::distributed;
-		RememberQueryConnectionSnapshot(plan.idx(), plan.connection_snapshot_);
+		RegisterQueryPythonReplayState(plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_,
+		                               plan.connection_snapshot_);
 		auto run_state = std::make_shared<PlanRunState>();
 		run_state->client_context = client_context;
 		run_state->py_conn_keepalive = std::move(py_conn_keepalive);
@@ -1781,7 +1840,8 @@ struct PyPhysicalPlanWrapperRunner {
 	                         duckdb::distributed::python::ray::SafePyObject py_conn_keepalive =
 	                             duckdb::distributed::python::ray::SafePyObject()) {
 		using namespace duckdb::distributed;
-		RememberQueryConnectionSnapshot(plan.idx(), plan.connection_snapshot_);
+		RegisterQueryPythonReplayState(plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_,
+		                               plan.connection_snapshot_);
 		(void)py_conn_keepalive;
 		auto copy_started = std::chrono::steady_clock::now();
 		idx_t cleanup_ms = 0;
@@ -1815,7 +1875,6 @@ struct PyPhysicalPlanWrapperRunner {
 			auto cleanup_started = std::chrono::steady_clock::now();
 			try {
 				drop_query_fragments(plan.idx());
-				CleanupQueryPythonReplayState(plan.idx());
 			} catch (...) {
 				cleanup_error = std::current_exception();
 			}
@@ -1996,6 +2055,7 @@ struct PyPhysicalPlanWrapperRunner {
 	// Core implementation of execute_native that works with a raw PhysicalPlan pointer
 	py::object execute_native_impl(
 	    py::object conn_obj, std::shared_ptr<duckdb::PhysicalPlan> physical_plan, const string &plan_id,
+	    const string &resource_query_id,
 	    const std::unordered_map<idx_t, duckdb::distributed::ScanTaskDescriptor> *scan_task_map,
 	    const std::unordered_map<idx_t, duckdb::distributed::ExchangeSourceTaskDescriptor> *exchange_source_task_map =
 	        nullptr,
@@ -2027,7 +2087,7 @@ struct PyPhysicalPlanWrapperRunner {
 		if (!physical_plan || !physical_plan->HasRoot()) {
 			throw py::value_error("Physical plan is missing or has no root operator");
 		}
-		AssignDataSourceQueryOwner(physical_plan->Root(), plan_id);
+		AssignDataSourceQueryOwner(physical_plan->Root(), resource_query_id);
 
 		if (scan_task_map && !scan_task_map->empty()) {
 			string error;
@@ -2537,9 +2597,6 @@ struct PyPhysicalPlanWrapperRunner {
 
 	// Execute physical plan using DuckDB's native Executor (DistributedPhysicalPlan version)
 	py::object execute_native(py::object conn_obj, const PyPhysicalPlanWrapper &plan) {
-		auto cleanup = [&]() {
-			CleanupQueryPythonReplayState(plan.idx());
-		};
 		try {
 			auto &mutable_plan = const_cast<PyPhysicalPlanWrapper &>(plan);
 			py::object exec_conn = ResolveConnectionForSnapshot(conn_obj, plan.connection_snapshot_);
@@ -2551,12 +2608,11 @@ struct PyPhysicalPlanWrapperRunner {
 				throw py::value_error("DistributedPhysicalPlan is missing underlying physical plan");
 			}
 
-			auto result = execute_native_impl(exec_conn, plan.plan_->physical_plan(), plan.idx(), nullptr, nullptr,
-			                                  nullptr, nullptr, nullptr, nullptr, py::none(), py::none());
-			cleanup();
+			auto result =
+			    execute_native_impl(exec_conn, plan.plan_->physical_plan(), plan.idx(), plan.resource_query_id_,
+			                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, py::none(), py::none());
 			return result;
 		} catch (...) {
-			cleanup();
 			throw;
 		}
 	}
@@ -2570,6 +2626,7 @@ static py::dict DescribeNativeProgress(py::object conn_obj, const PyPhysicalPlan
 	py::object exec_conn = ResolveConnectionForSnapshot(conn_obj, plan.connection_snapshot_);
 	PyPhysicalPlanWrapper topology_plan;
 	topology_plan.query_id_ = plan.idx();
+	topology_plan.resource_query_id_ = plan.resource_query_id_;
 	topology_plan.udf_registrations_ = plan.udf_registrations_;
 	topology_plan.udf_actor_handles_ = plan.udf_actor_handles_;
 	topology_plan.connection_snapshot_ = plan.connection_snapshot_;

@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import os
 import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -2322,11 +2324,16 @@ def test_worker_drop_query_uses_separate_execution_and_storage_barriers(monkeypa
         events.append("datasource-release")
         return 2
 
+    def cleanup_replay(query_id):
+        assert query_id == "query-drop"
+        events.append("replay-cleanup")
+
     monkeypatch.setattr(worker_mod, "_close_flight_shuffle_query", close)
     monkeypatch.setattr(worker_mod, "_wait_flight_shuffle_executions_for_query", wait_for_executions)
     monkeypatch.setattr(worker_mod, "_drain_flight_shuffle_for_query", drain)
     monkeypatch.setattr(worker_mod, "_retire_flight_shuffle_query", retire)
     monkeypatch.setattr(worker_mod, "_release_datasource_factories_for_query", release_datasource_factories)
+    monkeypatch.setattr(worker_mod, "_cleanup_query_python_replay_state", cleanup_replay)
     actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
 
     prepare_result = asyncio.run(actor_class.fte_prepare_drop_query(DummyWorker(), "query-drop"))
@@ -2345,6 +2352,7 @@ def test_worker_drop_query_uses_separate_execution_and_storage_barriers(monkeypa
         "drain",
         "retire",
         "native-retire",
+        "replay-cleanup",
     ]
     assert result == {
         "tasks_removed": 2,
@@ -8118,8 +8126,18 @@ def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
         "get",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ray.get must not be used")),
     )
+    replay_registrations = []
+    monkeypatch.setattr(
+        worker_mod,
+        "_register_query_python_replay_state",
+        lambda query_id, plan: replay_registrations.append((query_id, plan)) or True,
+    )
 
     class _Plan:
+        @staticmethod
+        def resource_query_id():
+            return "query-resource"
+
         def has_root(self):
             return True
 
@@ -8141,6 +8159,7 @@ def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
     assert plan_ref.awaited
     assert actor._plan_fragments["query-1:node:1"] is resolved_plan
     assert actor._query_fragments == {"query-1": {"query-1:node:1"}}
+    assert replay_registrations == [("query-resource", resolved_plan)]
 
 
 def test_start_ray_workers_skips_blocking_warmup_inside_ray_worker(monkeypatch):
@@ -8148,13 +8167,13 @@ def test_start_ray_workers_skips_blocking_warmup_inside_ray_worker(monkeypatch):
     option_calls = []
     remote_calls = []
 
-    class _FakeInstalledMethod:
+    class _FakePingMethod:
         def remote(self, *_args, **_kwargs):
             return "warmup-ref"
 
     class _FakeActorHandle:
         def __init__(self):
-            self.install_env_overrides = _FakeInstalledMethod()
+            self.ping = _FakePingMethod()
 
     class _FakeActorFactory:
         def options(self, **kwargs):
@@ -8195,21 +8214,598 @@ def test_start_ray_workers_skips_blocking_warmup_inside_ray_worker(monkeypatch):
     assert len(runtimes) == 1
     assert option_calls[0]["memory"] == 358
     assert option_calls[0]["runtime_env"] == {
-        "env_vars": {"RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0"},
+        "env_vars": {
+            "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
+            "VANE_WORKER": "1",
+            "VANE_WORKER_ID": "10.0.0.1",
+            "VANE_WORKER_INDEX": "0",
+        },
     }
     assert "num_cpus" not in option_calls[0]
     assert "num_gpus" not in option_calls[0]
     assert len(remote_calls) == 1
-    assert remote_calls[0]["env_overrides"]["VANE_WORKER_ID"] == "10.0.0.1"
-    assert remote_calls[0]["env_overrides"]["VANE_WORKER_INDEX"] == "0"
+    assert "env_overrides" not in remote_calls[0]
     assert remote_calls[0]["duckdb_memory_bytes"] == 256
     assert remote_calls[0]["task_heap_capacity_bytes"] == 615
     assert get_calls == []
 
 
-def test_execute_native_task_passes_exchange_and_sink_inputs():
+def test_worker_session_connection_rejects_reopen_after_close(monkeypatch):
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
+    actor._session_connections = {}
+    actor._session_operation_locks = {}
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
+    actor._session_connections_lock = threading.RLock()
+    actor._shutdown_started = False
+    closed = []
+
+    class _SessionConnection:
+        def close(self):
+            closed.append("session")
+
+    class _SharedConnection:
+        def cursor(self):
+            return _SessionConnection()
+
+    actor._get_shared_conn = lambda: _SharedConnection()
+
+    def _configure(_connection, config, *, use_session_credentials):
+        assert use_session_credentials is True
+        return dict(config)
+
+    monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", _configure)
+
+    session_connection = actor_cls._get_session_conn(
+        actor,
+        "session-a",
+        {"AWS_ACCESS_KEY_ID": "key-a"},
+    )
+    assert (
+        actor_cls._get_session_conn(
+            actor,
+            "session-a",
+            {"AWS_ACCESS_KEY_ID": "key-a"},
+        )
+        is session_connection
+    )
+
+    asyncio.run(actor_cls.close_session(actor, "session-a"))
+
+    assert closed == ["session"]
+    with pytest.raises(RuntimeError, match="Vane session is closed"):
+        actor_cls._get_session_conn(
+            actor,
+            "session-a",
+            {"AWS_ACCESS_KEY_ID": "key-a"},
+        )
+    assert actor._session_operation_locks == {}
+
+
+def test_worker_handle_session_close_treats_dead_actor_as_terminal(monkeypatch):
+    close_ref = object()
+    calls = []
+
+    class _CloseMethod:
+        @staticmethod
+        def remote(session_id):
+            calls.append(session_id)
+            return close_ref
+
+    worker_handle = object.__new__(_ProductionRayWorkerActorHandle)
+    worker_handle.actor_handle = SimpleNamespace(close_session=_CloseMethod())
+
+    import duckdb.runners.ray.safe_get as safe_get
+
+    monkeypatch.setattr(
+        safe_get,
+        "resolve_object_refs_blocking",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ray.exceptions.RayActorError(error_msg="worker exited")),
+    )
+
+    worker_handle.close_session("session-a")
+
+    assert calls == ["session-a"]
+
+
+def test_worker_session_connection_open_is_single_flight(monkeypatch):
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._session_connections = {}
+    actor._session_s3_configs = {}
+    actor._session_operation_locks = {}
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
+    actor._session_connections_lock = threading.RLock()
+    actor._shutdown_started = False
+    configure_started = threading.Event()
+    configure_release = threading.Event()
+    created_connections = []
+    results = []
+    errors = []
+
+    class _SessionConnection:
+        def close(self):
+            raise AssertionError("single-flight session connection must not be discarded")
+
+    class _SharedConnection:
+        def cursor(self):
+            connection = _SessionConnection()
+            created_connections.append(connection)
+            return connection
+
+    def _configure(_connection, config, *, use_session_credentials):
+        assert use_session_credentials is True
+        configure_started.set()
+        assert configure_release.wait(timeout=1.0)
+        return dict(config)
+
+    actor._get_shared_conn = lambda: _SharedConnection()
+    monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", _configure)
+
+    def _open():
+        try:
+            results.append(actor_cls._get_session_conn(actor, "session-a", {"AWS_PROFILE": "analytics"}))
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=_open)
+    second = threading.Thread(target=_open)
+    first.start()
+    assert configure_started.wait(timeout=1.0)
+    second.start()
+    time.sleep(0.01)
+    assert len(created_connections) == 1
+    configure_release.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert results == [created_connections[0], created_connections[0]]
+
+
+def test_worker_session_credential_refresh_is_single_flight(monkeypatch):
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    connection = object()
+    actor._session_connections = {"session-a": ({"AWS_PROFILE": "analytics"}, connection)}
+    actor._session_s3_configs = {
+        "session-a": {
+            "AWS_ACCESS_KEY_ID": "old-key",
+            "AWS_SECRET_ACCESS_KEY": "old-secret",
+            worker_mod._AWS_CREDENTIAL_REFRESH_AT_KEY: "0",
+        }
+    }
+    actor._session_operation_locks = {}
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
+    actor._session_connections_lock = threading.RLock()
+    actor._shutdown_started = False
+    resolver_started = threading.Event()
+    resolver_release = threading.Event()
+    resolver_calls = []
+    results = []
+    errors = []
+
+    def _resolve(config):
+        resolver_calls.append(dict(config))
+        resolver_started.set()
+        assert resolver_release.wait(timeout=1.0)
+        return (
+            {
+                "AWS_ACCESS_KEY_ID": "new-key",
+                "AWS_SECRET_ACCESS_KEY": "new-secret",
+            },
+            200.0,
+        )
+
+    monkeypatch.setattr(worker_mod, "_resolve_session_aws_credentials", _resolve)
+    monkeypatch.setattr(worker_mod.time, "time", lambda: 100.0)
+
+    def _refresh():
+        try:
+            results.append(
+                actor_cls._refresh_session_s3_config(
+                    actor,
+                    "session-a",
+                    {"AWS_PROFILE": "analytics"},
+                    connection,
+                    use_session_credentials=True,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=_refresh)
+    second = threading.Thread(target=_refresh)
+    first.start()
+    assert resolver_started.wait(timeout=1.0)
+    second.start()
+    time.sleep(0.01)
+    assert len(resolver_calls) == 1
+    resolver_release.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert len(resolver_calls) == 1
+    assert [result["AWS_ACCESS_KEY_ID"] for result in results] == ["new-key", "new-key"]
+
+
+def test_worker_session_configuration_failure_closes_unpublished_connection(monkeypatch):
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._session_connections = {}
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
+    actor._session_connections_lock = threading.RLock()
+    actor._shutdown_started = False
+    closed = []
+
+    class _SessionConnection:
+        def close(self):
+            closed.append("session")
+
+    class _SharedConnection:
+        def cursor(self):
+            return _SessionConnection()
+
+    actor._get_shared_conn = lambda: _SharedConnection()
+
+    def _fail_configuration(_connection, _config, *, use_session_credentials):
+        assert use_session_credentials is True
+        raise RuntimeError("planned session configuration failure")
+
+    monkeypatch.setattr(
+        worker_mod,
+        "_configure_duckdb_s3",
+        _fail_configuration,
+    )
+
+    with pytest.raises(RuntimeError, match="planned session configuration failure"):
+        actor_cls._get_session_conn(
+            actor,
+            "session-a",
+            {"AWS_ACCESS_KEY_ID": "key-a"},
+        )
+
+    assert closed == ["session"]
+    assert actor._session_connections == {}
+
+
+def test_worker_session_close_wins_race_with_credential_resolution(monkeypatch):
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._session_connections = {}
+    actor._session_s3_configs = {}
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
+    actor._session_connections_lock = threading.RLock()
+    actor._shutdown_started = False
+    resolution_started = threading.Event()
+    resolution_release = threading.Event()
+    closed = []
+    open_errors = []
+
+    class _SessionConnection:
+        def close(self):
+            closed.append("session")
+
+    class _SharedConnection:
+        def cursor(self):
+            return _SessionConnection()
+
+    def _delayed_config(_connection, config, *, use_session_credentials):
+        assert use_session_credentials is True
+        resolution_started.set()
+        assert resolution_release.wait(timeout=1.0)
+        return dict(config)
+
+    actor._get_shared_conn = lambda: _SharedConnection()
+    monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", _delayed_config)
+
+    def _open():
+        try:
+            actor_cls._get_session_conn(actor, "session-a", {"AWS_PROFILE": "analytics"})
+        except BaseException as exc:
+            open_errors.append(exc)
+
+    open_thread = threading.Thread(target=_open)
+    open_thread.start()
+    assert resolution_started.wait(timeout=1.0)
+
+    close_errors = []
+
+    def _close():
+        try:
+            asyncio.run(actor_cls.close_session(actor, "session-a"))
+        except BaseException as exc:
+            close_errors.append(exc)
+
+    close_thread = threading.Thread(target=_close)
+    close_thread.start()
+    for _ in range(100):
+        if "session-a" in actor._closed_session_ids:
+            break
+        time.sleep(0.001)
+    assert close_thread.is_alive()
+    resolution_release.set()
+    open_thread.join(timeout=1.0)
+    close_thread.join(timeout=1.0)
+
+    assert not open_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert close_errors == []
+    assert len(open_errors) == 1
+    assert isinstance(open_errors[0], RuntimeError)
+    assert "Vane session is closed" in str(open_errors[0])
+    assert closed == ["session"]
+    assert actor._session_connections == {}
+    assert actor._session_s3_configs == {}
+
+
+def test_worker_session_close_wins_race_with_credential_refresh(monkeypatch):
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._session_operation_locks = {}
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
+    actor._session_connections_lock = threading.RLock()
+    actor._shutdown_started = False
+    refresh_started = threading.Event()
+    refresh_release = threading.Event()
+    closed = []
+    refresh_errors = []
+    close_errors = []
+
+    class _SessionConnection:
+        def close(self):
+            closed.append("session")
+
+    connection = _SessionConnection()
+    session_config = {"AWS_PROFILE": "analytics"}
+    actor._session_connections = {
+        "session-a": (
+            session_config,
+            connection,
+        ),
+    }
+    actor._session_s3_configs = {
+        "session-a": {
+            "AWS_ACCESS_KEY_ID": "old-key",
+            "AWS_SECRET_ACCESS_KEY": "old-secret",
+        },
+    }
+
+    def _delayed_refresh(_config, _effective, *, use_session_credentials):
+        assert use_session_credentials is True
+        refresh_started.set()
+        assert refresh_release.wait(timeout=1.0)
+        return {
+            "AWS_ACCESS_KEY_ID": "new-key",
+            "AWS_SECRET_ACCESS_KEY": "new-secret",
+        }
+
+    monkeypatch.setattr(
+        worker_mod,
+        "_refresh_effective_duckdb_s3_config",
+        _delayed_refresh,
+    )
+
+    def _refresh():
+        try:
+            actor_cls._refresh_session_s3_config(
+                actor,
+                "session-a",
+                session_config,
+                connection,
+                use_session_credentials=True,
+            )
+        except BaseException as exc:
+            refresh_errors.append(exc)
+
+    refresh_thread = threading.Thread(target=_refresh)
+    refresh_thread.start()
+    assert refresh_started.wait(timeout=1.0)
+
+    def _close():
+        try:
+            asyncio.run(actor_cls.close_session(actor, "session-a"))
+        except BaseException as exc:
+            close_errors.append(exc)
+
+    close_thread = threading.Thread(target=_close)
+    close_thread.start()
+    for _ in range(100):
+        if "session-a" in actor._closed_session_ids:
+            break
+        time.sleep(0.001)
+    assert close_thread.is_alive()
+
+    refresh_release.set()
+    refresh_thread.join(timeout=1.0)
+    close_thread.join(timeout=1.0)
+
+    assert not refresh_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert close_errors == []
+    assert len(refresh_errors) == 1
+    assert "Vane session is closed" in str(refresh_errors[0])
+    assert closed == ["session"]
+    assert actor._session_connections == {}
+    assert actor._session_s3_configs == {}
+    assert actor._session_operation_locks == {}
+
+
+def test_worker_session_close_keeps_connection_retryable_after_failure():
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
+    actor._session_connections_lock = threading.RLock()
+    close_calls = []
+
+    class _SessionConnection:
+        def close(self):
+            close_calls.append("close")
+            if len(close_calls) == 1:
+                raise RuntimeError("planned close failure")
+
+    connection = _SessionConnection()
+    record = ({}, connection)
+    actor._session_connections = {"session-a": record}
+
+    with pytest.raises(RuntimeError, match="planned close failure"):
+        asyncio.run(actor_cls.close_session(actor, "session-a"))
+
+    assert actor._session_connections["session-a"] is record
+    assert "session-a" in actor._closed_session_ids
+
+    asyncio.run(actor_cls.close_session(actor, "session-a"))
+
+    assert close_calls == ["close", "close"]
+    assert "session-a" not in actor._session_connections
+
+
+def test_worker_session_close_does_not_block_actor_event_loop():
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
+    actor._session_connections_lock = threading.RLock()
+    close_started = threading.Event()
+    close_release = threading.Event()
+
+    class _SessionConnection:
+        def close(self):
+            close_started.set()
+            assert close_release.wait(timeout=1.0)
+
+    actor._session_connections = {"session-a": ({}, _SessionConnection())}
+
+    async def _close_without_blocking_loop():
+        close_task = asyncio.create_task(actor_cls.close_session(actor, "session-a"))
+        assert await asyncio.to_thread(close_started.wait, 1.0)
+        await asyncio.wait_for(asyncio.sleep(0), timeout=0.1)
+        assert close_task.done() is False
+        close_release.set()
+        await asyncio.wait_for(close_task, timeout=1.0)
+
+    asyncio.run(_close_without_blocking_loop())
+
+    assert "session-a" not in actor._session_connections
+
+
+def test_worker_session_close_cancellation_waits_for_owned_teardown():
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
+    actor._session_connections_lock = threading.RLock()
+    close_started = threading.Event()
+    close_release = threading.Event()
+
+    class _SessionConnection:
+        def close(self):
+            close_started.set()
+            assert close_release.wait(timeout=1.0)
+
+    actor._session_connections = {"session-a": ({}, _SessionConnection())}
+
+    async def _cancel_close():
+        close_task = asyncio.create_task(actor_cls.close_session(actor, "session-a"))
+        assert await asyncio.to_thread(close_started.wait, 1.0)
+        close_task.cancel()
+        await asyncio.sleep(0.01)
+        assert close_task.done() is False
+        close_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+    asyncio.run(_cancel_close())
+
+    assert "session-a" not in actor._session_connections
+
+
+def test_execute_native_task_configuration_failure_closes_unregistered_cursor(monkeypatch):
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._session_connections_lock = threading.RLock()
+    actor._session_s3_configs = {}
+    actor._session_operation_locks = {}
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
+    actor._shutdown_started = False
+    actor._native_execution_condition = threading.Condition()
+    actor._active_native_cursors = set()
+    actor._native_cursor_query_ids = {}
+    actor._closing_native_queries = set()
+    closed = []
+
+    class _Cursor:
+        def close(self):
+            closed.append("cursor")
+
+    cursor = _Cursor()
+    session_conn = SimpleNamespace(cursor=lambda: cursor)
+    actor._session_connections = {
+        "session-a": (
+            {
+                "AWS_ACCESS_KEY_ID": "key-a",
+                "AWS_SECRET_ACCESS_KEY": "secret-a",
+            },
+            session_conn,
+        ),
+    }
+
+    def _get_session_conn(session_id, config, *, use_session_credentials):
+        assert session_id == "session-a"
+        assert config == {
+            "AWS_ACCESS_KEY_ID": "key-a",
+            "AWS_SECRET_ACCESS_KEY": "secret-a",
+        }
+        assert use_session_credentials is True
+        return session_conn
+
+    actor._get_session_conn = _get_session_conn
+
+    def _fail_configuration(_connection, _config, *, use_session_credentials):
+        assert use_session_credentials is True
+        raise RuntimeError("planned query cursor configuration failure")
+
+    monkeypatch.setattr(
+        worker_mod,
+        "_configure_duckdb_s3",
+        _fail_configuration,
+    )
+
+    class _Plan:
+        @staticmethod
+        def session_id():
+            return "session-a"
+
+        @staticmethod
+        def session_config():
+            return {
+                "AWS_ACCESS_KEY_ID": "key-a",
+                "AWS_SECRET_ACCESS_KEY": "secret-a",
+            }
+
+        @staticmethod
+        def has_explicit_s3_credentials():
+            return False
+
+    with pytest.raises(RuntimeError, match="planned query cursor configuration failure"):
+        actor_cls._execute_native_task(actor, _Plan(), None, native_query_id="query-a")
+
+    assert closed == ["cursor"]
+    assert actor._active_native_cursors == set()
+    assert actor._native_cursor_query_ids == {}
+
+
+def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._session_connections_lock = threading.RLock()
+    actor._session_s3_configs = {}
+    actor._session_operation_locks = {}
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
+    actor._shutdown_started = False
     actor._native_execution_condition = threading.Condition()
     actor._active_native_cursors = set()
     actor._native_cursor_query_ids = {}
@@ -8244,6 +8840,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs():
             dynamic_filter_domains,
             native_progress_callback,
             runtime_context,
+            effective_session_config,
         ):
             calls.append(
                 (
@@ -8258,18 +8855,61 @@ def test_execute_native_task_passes_exchange_and_sink_inputs():
                     dynamic_filter_domains,
                     native_progress_callback,
                     runtime_context,
+                    effective_session_config,
                 )
             )
             return "ok"
 
+    class _FakePlan:
+        def session_id(self):
+            return "session-a"
+
+        def session_config(self):
+            return {
+                "AWS_ACCESS_KEY_ID": "session-a-key",
+                "AWS_SECRET_ACCESS_KEY": "session-a-secret",
+            }
+
+        def has_explicit_s3_credentials(self):
+            return False
+
     shared_conn = _FakeConn()
-    actor._get_shared_conn = lambda: shared_conn
+    actor._session_connections = {
+        "session-a": (
+            {
+                "AWS_ACCESS_KEY_ID": "session-a-key",
+                "AWS_SECRET_ACCESS_KEY": "session-a-secret",
+            },
+            shared_conn,
+        ),
+    }
+
+    def _get_session_conn(session_id, config, *, use_session_credentials):
+        assert (session_id, config) == (
+            "session-a",
+            {
+                "AWS_ACCESS_KEY_ID": "session-a-key",
+                "AWS_SECRET_ACCESS_KEY": "session-a-secret",
+            },
+        )
+        assert use_session_credentials is True
+        return shared_conn
+
+    actor._get_session_conn = _get_session_conn
     actor._get_plan_runner = lambda: _FakePlanRunner()
+    plan_object = _FakePlan()
+    configured = []
+
+    def _configure(cursor, config, *, use_session_credentials):
+        configured.append((cursor, dict(config), use_session_credentials))
+        return dict(config)
+
+    monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", _configure)
 
     dynamic_domains = {"df0": {"column": "id", "single_value": 7}}
     result = actor_cls._execute_native_task(
         actor,
-        "fake-plan",
+        plan_object,
         {"1": b"scan"},
         copy_output_info={"base": "", "run_id": "run-native", "remote_base": "/tmp/out"},
         exchange_source_task_map={"9": b"exchange-binding"},
@@ -8279,6 +8919,16 @@ def test_execute_native_task_passes_exchange_and_sink_inputs():
     )
 
     assert result == "ok"
+    assert configured == [
+        (
+            shared_conn.cursor_obj,
+            {
+                "AWS_ACCESS_KEY_ID": "session-a-key",
+                "AWS_SECRET_ACCESS_KEY": "session-a-secret",
+            },
+            True,
+        )
+    ]
     assert len(calls) == 1
     (
         _,
@@ -8292,8 +8942,9 @@ def test_execute_native_task_passes_exchange_and_sink_inputs():
         dynamic_filter_domains,
         native_progress_callback,
         runtime_context,
+        effective_session_config,
     ) = calls[0]
-    assert plan == "fake-plan"
+    assert plan is plan_object
     assert scan_task_arg == {"1": b"scan"}
     assert exchange_source_task_arg == {"9": b"exchange-binding"}
     assert copy_output_info == {"base": "", "run_id": "run-native", "remote_base": "/tmp/out"}
@@ -8307,11 +8958,308 @@ def test_execute_native_task_passes_exchange_and_sink_inputs():
     assert dynamic_filter_domains == dynamic_domains
     assert native_progress_callback is None
     assert runtime_context == {"query_id": "q1", "fragment_id": "f1", "task_id": "q1.2.3.4"}
+    assert effective_session_config == {
+        "AWS_ACCESS_KEY_ID": "session-a-key",
+        "AWS_SECRET_ACCESS_KEY": "session-a-secret",
+    }
 
 
-def test_execute_native_task_uses_shared_database_for_fte():
+def test_configure_duckdb_s3_applies_static_credentials_only_to_connection_context():
+    statements = []
+
+    class _FakeConnection:
+        def execute(self, statement):
+            statements.append(statement)
+
+    worker_mod._configure_duckdb_s3(
+        _FakeConnection(),
+        {
+            "AWS_ACCESS_KEY_ID": "access-key",
+            "AWS_SECRET_ACCESS_KEY": "secret'value",
+        },
+    )
+
+    assert statements[0] == "LOAD httpfs"
+    assert "SET s3_access_key_id='access-key'" in statements
+    assert "SET s3_secret_access_key='secret''value'" in statements
+    assert "SET s3_session_token=''" in statements
+    assert all("SET GLOBAL" not in statement for statement in statements)
+
+
+def test_configure_duckdb_s3_preserves_scheme_less_endpoint_authority():
+    statements = []
+
+    class _FakeConnection:
+        def execute(self, statement):
+            statements.append(statement)
+
+    worker_mod._configure_duckdb_s3(
+        _FakeConnection(),
+        {"AWS_ENDPOINT_URL": "minio.internal:9000"},
+    )
+
+    assert "SET s3_endpoint='minio.internal:9000'" in statements
+    assert "SET s3_use_ssl=false" in statements
+
+
+@pytest.mark.parametrize(
+    "provider_config",
+    [
+        {"AWS_PROFILE": "analytics"},
+        {
+            "AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/analytics",
+            "AWS_WEB_IDENTITY_TOKEN_FILE": "/var/run/secrets/aws/token",
+        },
+    ],
+)
+def test_configure_duckdb_s3_resolves_session_credential_chain_outside_shared_worker(
+    monkeypatch,
+    provider_config,
+):
+    statements = []
+    resolver_calls = []
+
+    class _FakeConnection:
+        def execute(self, statement):
+            statements.append(statement)
+
+    def _resolve(config):
+        resolver_calls.append(dict(config))
+        return (
+            {
+                "AWS_ACCESS_KEY_ID": "resolved-key",
+                "AWS_SECRET_ACCESS_KEY": "resolved-secret",
+                "AWS_SESSION_TOKEN": "resolved-token",
+                "AWS_REGION": "us-west-2",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(worker_mod, "_resolve_session_aws_credentials", _resolve)
+
+    effective_config = worker_mod._configure_duckdb_s3(
+        _FakeConnection(),
+        provider_config,
+    )
+
+    assert resolver_calls == [provider_config]
+    assert effective_config == {
+        "AWS_ACCESS_KEY_ID": "resolved-key",
+        "AWS_SECRET_ACCESS_KEY": "resolved-secret",
+        "AWS_SESSION_TOKEN": "resolved-token",
+        "AWS_REGION": "us-west-2",
+    }
+    assert "SET s3_access_key_id='resolved-key'" in statements
+    assert "SET s3_secret_access_key='resolved-secret'" in statements
+    assert "SET s3_session_token='resolved-token'" in statements
+    assert "SET s3_region='us-west-2'" in statements
+
+
+@pytest.mark.parametrize(
+    "partial_credentials",
+    [
+        {"AWS_ACCESS_KEY_ID": "partial-key"},
+        {"AWS_SECRET_ACCESS_KEY": "partial-secret"},
+        {"AWS_SESSION_TOKEN": "partial-token"},
+    ],
+)
+def test_session_credentials_reject_incomplete_static_values(monkeypatch, partial_credentials):
+    resolver_calls = []
+    monkeypatch.setattr(
+        worker_mod,
+        "_resolve_session_aws_credentials",
+        lambda config: resolver_calls.append(dict(config)),
+    )
+
+    with pytest.raises(ValueError, match="must provide both"):
+        worker_mod._effective_duckdb_s3_config(partial_credentials)
+
+    assert resolver_calls == []
+
+
+def test_session_credential_resolver_uses_only_explicit_child_environment(monkeypatch):
+    monkeypatch.setenv("AWS_PROFILE", "shared-process-profile")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "shared-process-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "shared-process-secret")
+    calls = []
+
+    def _run(command, **kwargs):
+        calls.append((command, kwargs))
+        assert kwargs["env"]["AWS_PROFILE"] == "connection-profile"
+        assert kwargs["env"]["AWS_WEB_IDENTITY_TOKEN_FILE"] == "/session/token"
+        assert "AWS_ACCESS_KEY_ID" not in kwargs["env"]
+        assert "AWS_SECRET_ACCESS_KEY" not in kwargs["env"]
+        assert kwargs["env"]["VANE_RUNNER"] == "local"
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"credentials":{"AWS_ACCESS_KEY_ID":"resolved-key",'
+                '"AWS_SECRET_ACCESS_KEY":"resolved-secret",'
+                '"AWS_SESSION_TOKEN":"resolved-token"},'
+                '"expiration_epoch_s":1234.5}'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(worker_mod.subprocess, "run", _run)
+
+    credentials, expiration_epoch_s = worker_mod._resolve_session_aws_credentials(
+        {
+            "AWS_PROFILE": "connection-profile",
+            "AWS_WEB_IDENTITY_TOKEN_FILE": "/session/token",
+        }
+    )
+
+    assert credentials == {
+        "AWS_ACCESS_KEY_ID": "resolved-key",
+        "AWS_SECRET_ACCESS_KEY": "resolved-secret",
+        "AWS_SESSION_TOKEN": "resolved-token",
+    }
+    assert expiration_epoch_s == 1234.5
+    assert calls[0][0] == [sys.executable, "-m", "duckdb.runners.ray.aws_credentials"]
+    assert calls[0][1]["capture_output"] is True
+    assert calls[0][1]["check"] is False
+    assert calls[0][1]["text"] is True
+    assert calls[0][1]["timeout"] == 120
+    assert os.environ["AWS_PROFILE"] == "shared-process-profile"
+    assert os.environ["AWS_ACCESS_KEY_ID"] == "shared-process-key"
+    assert os.environ["AWS_SECRET_ACCESS_KEY"] == "shared-process-secret"
+
+
+def test_session_credential_resolver_loads_profile_in_real_child_process(tmp_path):
+    credentials_file = tmp_path / "credentials"
+    credentials_file.write_text(
+        "[analytics]\n"
+        "aws_access_key_id=profile-key\n"
+        "aws_secret_access_key=profile-secret\n"
+        "aws_session_token=profile-token\n",
+        encoding="utf-8",
+    )
+
+    credentials, expiration_epoch_s = worker_mod._resolve_session_aws_credentials(
+        {
+            "AWS_EC2_METADATA_DISABLED": "true",
+            "AWS_PROFILE": "analytics",
+            "AWS_REGION": "us-east-2",
+            "AWS_SHARED_CREDENTIALS_FILE": str(credentials_file),
+        }
+    )
+
+    assert credentials == {
+        "AWS_ACCESS_KEY_ID": "profile-key",
+        "AWS_REGION": "us-east-2",
+        "AWS_SECRET_ACCESS_KEY": "profile-secret",
+        "AWS_SESSION_TOKEN": "profile-token",
+    }
+    assert expiration_epoch_s is None
+
+
+def test_session_credential_chain_refreshes_before_expiration(monkeypatch):
+    now = [100.0]
+    resolver_calls = []
+
+    def _resolve(config):
+        resolver_calls.append(dict(config))
+        suffix = len(resolver_calls)
+        return (
+            {
+                "AWS_ACCESS_KEY_ID": f"key-{suffix}",
+                "AWS_SECRET_ACCESS_KEY": f"secret-{suffix}",
+            },
+            200.0 + suffix * 100.0,
+        )
+
+    monkeypatch.setattr(worker_mod, "_resolve_session_aws_credentials", _resolve)
+    monkeypatch.setattr(worker_mod.time, "time", lambda: now[0])
+
+    config = {"AWS_PROFILE": "analytics"}
+    effective = worker_mod._effective_duckdb_s3_config(config)
+    assert effective["AWS_ACCESS_KEY_ID"] == "key-1"
+
+    now[0] = 259.9
+    assert worker_mod._refresh_effective_duckdb_s3_config(config, effective) == effective
+    assert len(resolver_calls) == 1
+
+    now[0] = 260.0
+    refreshed = worker_mod._refresh_effective_duckdb_s3_config(config, effective)
+    assert refreshed["AWS_ACCESS_KEY_ID"] == "key-2"
+    assert len(resolver_calls) == 2
+
+
+def test_nonexpiring_session_credential_chain_is_resolved_once(monkeypatch):
+    resolver_calls = []
+
+    def _resolve(config):
+        resolver_calls.append(dict(config))
+        return (
+            {
+                "AWS_ACCESS_KEY_ID": "profile-key",
+                "AWS_SECRET_ACCESS_KEY": "profile-secret",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(worker_mod, "_resolve_session_aws_credentials", _resolve)
+    config = {"AWS_PROFILE": "analytics"}
+
+    effective = worker_mod._refresh_effective_duckdb_s3_config(config, {})
+    refreshed = worker_mod._refresh_effective_duckdb_s3_config(config, effective)
+
+    assert refreshed == effective
+    assert resolver_calls == [config]
+
+
+def test_explicit_duckdb_credentials_skip_profile_resolution_and_discard_cached_profile_credentials(monkeypatch):
+    resolver_calls = []
+    monkeypatch.setattr(
+        worker_mod,
+        "_resolve_session_aws_credentials",
+        lambda config: resolver_calls.append(dict(config)),
+    )
+    config = {
+        "AWS_ACCESS_KEY_ID": "incomplete-environment-key",
+        "AWS_PROFILE": "unavailable-profile",
+        "AWS_ENDPOINT_URL": "https://s3.example.test",
+    }
+    cached = {
+        "AWS_ACCESS_KEY_ID": "stale-profile-key",
+        "AWS_SECRET_ACCESS_KEY": "stale-profile-secret",
+        "AWS_SESSION_TOKEN": "stale-profile-token",
+        "AWS_ENDPOINT_URL": "https://s3.example.test",
+        worker_mod._AWS_CREDENTIAL_REFRESH_AT_KEY: "9999999999",
+    }
+    statements = []
+
+    class _FakeConnection:
+        def execute(self, statement):
+            statements.append(statement)
+
+    effective = worker_mod._refresh_effective_duckdb_s3_config(
+        config,
+        cached,
+        use_session_credentials=False,
+    )
+    configured = worker_mod._configure_duckdb_s3(
+        _FakeConnection(),
+        effective,
+        use_session_credentials=False,
+    )
+
+    assert effective == {"AWS_ENDPOINT_URL": "https://s3.example.test"}
+    assert configured == effective
+    assert "SET s3_access_key_id=''" in statements
+    assert "SET s3_secret_access_key=''" in statements
+    assert "SET s3_session_token=''" in statements
+    assert resolver_calls == []
+
+
+def test_execute_native_task_uses_session_database_for_fte():
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
+    actor._shutdown_started = False
+    actor._session_connections_lock = threading.RLock()
+    actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=16)
+    actor._session_s3_configs = {}
     actor._native_execution_condition = threading.Condition()
     actor._active_native_cursors = set()
     actor._native_cursor_query_ids = {}
@@ -8334,7 +9282,21 @@ def test_execute_native_task_uses_shared_database_for_fte():
             closed.append("conn")
 
     shared_conn = _FakeConn()
-    actor._get_shared_conn = lambda: shared_conn
+    actor._session_connections = {"session-a": ({}, shared_conn)}
+
+    class _FakePlan:
+        def session_id(self):
+            return "session-a"
+
+        def session_config(self):
+            return {}
+
+        def has_explicit_s3_credentials(self):
+            return False
+
+    actor._get_session_conn = lambda session_id, config, *, use_session_credentials: (
+        shared_conn if (session_id, config) == ("session-a", {}) else None
+    )
 
     class _FakePlanRunner:
         def execute_native(
@@ -8350,6 +9312,7 @@ def test_execute_native_task_uses_shared_database_for_fte():
             _dynamic_filter_domains,
             _native_progress_callback,
             _runtime_context,
+            _effective_session_config,
         ):
             calls.append((cursor, fte_scan_source_queues, fte_exchange_source_queues))
             return "ok"
@@ -8361,7 +9324,7 @@ def test_execute_native_task_uses_shared_database_for_fte():
     exchange_queues = {"2": object()}
     result = actor_cls._execute_native_task(
         actor,
-        "fake-plan",
+        _FakePlan(),
         None,
         fte_scan_source_queues=scan_queues,
         fte_exchange_source_queues=exchange_queues,

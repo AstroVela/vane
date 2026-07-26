@@ -22,6 +22,9 @@ class _FakePlan:
         self._nodes = nodes
         self.set_calls = []
 
+    def idx(self):
+        return "test-plan"
+
     def collect_udf_nodes(self, conn=None):
         return self._nodes
 
@@ -73,9 +76,9 @@ def test_drop_resource_query_closes_owned_internal_fte_queries(monkeypatch):
     runner._drop_query_fragments_sync("q-drop-owned")
 
     assert dropped_fragments == [
-        "q-drop-owned",
         "q-drop-owned_orderby_range",
         "q-drop-owned_orderby_sample",
+        "q-drop-owned",
     ]
 
 
@@ -115,22 +118,81 @@ def test_drop_resource_query_remembers_failed_internal_teardown_after_registry_l
     with pytest.raises(QueryTeardownOwnershipError, match="pending_execution_queries"):
         runner._drop_query_fragments_sync(resource_query_id)
 
-    assert runner._query_pending_execution_teardowns == {resource_query_id: {execution_query_id}}
+    assert runner._query_pending_execution_teardowns == {
+        resource_query_id: {
+            execution_query_id,
+            resource_query_id,
+        }
+    }
     assert released_queries == []
 
     runner._drop_query_fragments_sync(resource_query_id)
 
     assert calls == [
-        resource_query_id,
+        execution_query_id,
         execution_query_id,
         resource_query_id,
-        execution_query_id,
     ]
     assert runner._query_pending_execution_teardowns == {}
     assert released_queries == ["released"]
 
 
-def test_driver_actor_shutdown_reaches_plan_runner_once():
+def test_drop_resource_query_keeps_outer_owner_until_internal_blockers_clear(monkeypatch):
+    import duckdb.runners.ray.fte_fragment_scheduler as fte_scheduler
+    from duckdb.runners.ray.driver import QueryTeardownOwnershipError, RayQueryDriverActor
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    runner = object.__new__(runner_cls)
+    runner._query_pending_execution_teardowns = {}
+    runner._release_query_resources = lambda *_args, **_kwargs: released_queries.append("released")
+
+    resource_query_id = "q-drop-blocked"
+    execution_query_id = f"{resource_query_id}_stage"
+    monkeypatch.setattr(
+        fte_scheduler,
+        "fte_execution_query_ids_for_resource",
+        lambda _query_id: (execution_query_id,),
+    )
+    monkeypatch.setattr(fte_scheduler, "_drop_fte_registry_for_query", lambda _query_id: None)
+
+    blocked = True
+
+    def teardown_blockers(query_id):
+        if blocked and query_id == execution_query_id:
+            return ("active_execution=1",)
+        return ()
+
+    monkeypatch.setattr(fte_scheduler, "fte_query_remote_teardown_blockers", teardown_blockers)
+
+    calls: list[str] = []
+    released_queries: list[str] = []
+    runner._get_plan_runner = lambda: SimpleNamespace(drop_query_fragments=calls.append)
+
+    with pytest.raises(QueryTeardownOwnershipError, match="active_execution=1"):
+        runner._drop_query_fragments_sync(resource_query_id)
+
+    assert calls == [execution_query_id]
+    assert runner._query_pending_execution_teardowns == {
+        resource_query_id: {
+            execution_query_id,
+            resource_query_id,
+        }
+    }
+    assert released_queries == []
+
+    blocked = False
+    runner._drop_query_fragments_sync(resource_query_id)
+
+    assert calls == [
+        execution_query_id,
+        execution_query_id,
+        resource_query_id,
+    ]
+    assert runner._query_pending_execution_teardowns == {}
+    assert released_queries == ["released"]
+
+
+def test_driver_actor_runtime_shutdown_reaches_plan_runner_once():
     from duckdb.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
@@ -148,8 +210,8 @@ def test_driver_actor_shutdown_reaches_plan_runner_once():
     runner.stop_query_resource_maintenance = stop_maintenance
 
     async def shutdown_twice():
-        await runner_cls.shutdown(runner)
-        await runner_cls.shutdown(runner)
+        await runner_cls._shutdown_runtime(runner)
+        await runner_cls._shutdown_runtime(runner)
 
     asyncio.run(shutdown_twice())
 
@@ -158,22 +220,49 @@ def test_driver_actor_shutdown_reaches_plan_runner_once():
     assert runner._driver_shutdown_complete is True
 
 
-def test_driver_client_close_gracefully_shuts_down_before_kill(monkeypatch):
+def test_driver_actor_rejects_detach_from_non_owner():
+    from duckdb.runners.ray.driver import BoundedReplayMap, RayQueryDriverActor
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    runner = object.__new__(runner_cls)
+    runner._client_ids = {"owner-a"}
+    runner._detaching_client_ids = set()
+    runner._detached_client_results = BoundedReplayMap(capacity=65_536)
+    runner._client_detach_lock = asyncio.Lock()
+    runner._sessions = {}
+    runner._session_lock = threading.RLock()
+
+    with pytest.raises(PermissionError, match="attached client owner"):
+        asyncio.run(runner_cls.detach_client(runner, "owner-b"))
+
+
+def test_driver_client_close_detaches_and_kills_last_job_runtime(monkeypatch):
     from duckdb.runners.ray import driver as driver_module
 
     events: list[str] = []
-    shutdown_ref = object()
+    detach_ref = object()
 
-    class ShutdownMethod:
+    class DetachMethod:
         @staticmethod
-        def remote():
-            events.append("shutdown-rpc")
-            return shutdown_ref
+        def remote(owner_id):
+            assert owner_id == "owner-a"
+            events.append("detach-rpc")
+            return detach_ref
 
-    actor = SimpleNamespace(shutdown=ShutdownMethod())
+    actor = SimpleNamespace(detach_client=DetachMethod())
     client = object.__new__(driver_module.RayQueryDriverClient)
     client.runner = actor
+    client._owner_id = "owner-a"
     client._ray_gcs_address = "gcs-a"
+    client._opened_sessions = {}
+    client._uncertain_sessions = {}
+    client._opening_session_ids = set()
+    client._closing_session_ids = set()
+    client._closed_session_ids = driver_module.BoundedReplayMap(capacity=65_536)
+    client._session_closes_in_progress = set()
+    client._session_condition = threading.Condition()
+    client._client_closing = False
+    client._client_close_in_progress = False
 
     monkeypatch.setattr(driver_module.ray, "is_initialized", lambda: True)
     monkeypatch.setattr(
@@ -183,9 +272,10 @@ def test_driver_client_close_gracefully_shuts_down_before_kill(monkeypatch):
     )
 
     def resolve(ref, **kwargs):
-        assert ref is shutdown_ref
+        assert ref is detach_ref
         assert kwargs == {"timeout": 300, "honor_query_deadline": False}
-        events.append("shutdown-complete")
+        events.append("detach-complete")
+        return True
 
     def kill(target, *, no_restart):
         assert target is actor
@@ -198,10 +288,10 @@ def test_driver_client_close_gracefully_shuts_down_before_kill(monkeypatch):
     client.close()
 
     assert client.runner is None
-    assert events == ["shutdown-rpc", "shutdown-complete", "kill"]
+    assert events == ["detach-rpc", "detach-complete", "kill"]
 
 
-def test_precreate_udf_actors_skips_non_actor_backend(monkeypatch):
+def test_precreate_udf_actors_injects_driver_handle_for_ray_task(monkeypatch):
     from duckdb.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
@@ -210,15 +300,23 @@ def test_precreate_udf_actors_skips_non_actor_backend(monkeypatch):
         plan,
         *,
         actor_node_ids_by_stage,
+        query_driver_handle,
+        session_config,
         conn=None,
     ):
         assert actor_node_ids_by_stage == {}
+        assert query_driver_handle is driver_handle
+        assert session_config == {"AWS_ACCESS_KEY_ID": "session-access-key"}
+        assert conn is query_connection
         created = []
         handles_map = {}
         for node in plan.collect_udf_nodes(conn=conn):
             payload = node.get("payload") or {}
-            if payload.get("execution_backend") != "ray_actor":
-                continue
+            if payload.get("execution_backend") in {"ray_task", "ray_actor"}:
+                handles_map[str(node["node_id"])] = {
+                    "query_driver_handle": query_driver_handle,
+                    "session_config": dict(session_config),
+                }
         if handles_map:
             plan.set_udf_actor_handles(handles_map, conn=conn)
         return created, handles_map
@@ -227,7 +325,12 @@ def test_precreate_udf_actors_skips_non_actor_backend(monkeypatch):
     fake_mod.prepare_actor_pools_for_plan = _fake_prepare_actor_pools_for_plan
     monkeypatch.setitem(sys.modules, "duckdb.execution.udf_ray", fake_mod)
 
-    runner = SimpleNamespace(_duckdb_conn=object(), _active_udf_actors=[])
+    driver_handle = object()
+    runner = SimpleNamespace(
+        _driver_handle=driver_handle,
+        _active_udf_actors=[],
+    )
+    query_connection = object()
 
     plan = _FakePlan(
         [
@@ -249,10 +352,23 @@ def test_precreate_udf_actors_skips_non_actor_backend(monkeypatch):
         plan,
         SimpleNamespace(stages=()),
         SimpleNamespace(actor_node_ids_for_stage=lambda _stage_id: ()),
+        query_connection=query_connection,
+        session_config={"AWS_ACCESS_KEY_ID": "session-access-key"},
     )
 
     assert created == []
-    assert plan.set_calls == []
+    assert plan.set_calls == [
+        {
+            "handles_map": {
+                "7": {
+                    "query_driver_handle": driver_handle,
+                    "session_config": {
+                        "AWS_ACCESS_KEY_ID": "session-access-key",
+                    },
+                }
+            },
+        }
+    ]
 
 
 def test_precreate_udf_actors_skips_non_ray_nodes(monkeypatch):
@@ -267,7 +383,11 @@ def test_precreate_udf_actors_skips_non_ray_nodes(monkeypatch):
     fake_mod.prepare_actor_pools_for_plan = _fake_prepare_actor_pools_for_plan
     monkeypatch.setitem(sys.modules, "duckdb.execution.udf_ray", fake_mod)
 
-    runner = SimpleNamespace(_duckdb_conn=object(), _active_udf_actors=[])
+    runner = SimpleNamespace(
+        _driver_handle=object(),
+        _duckdb_conn=object(),
+        _active_udf_actors=[],
+    )
 
     plan = _FakePlan(
         [
@@ -286,10 +406,85 @@ def test_precreate_udf_actors_skips_non_ray_nodes(monkeypatch):
         plan,
         SimpleNamespace(stages=()),
         SimpleNamespace(actor_node_ids_for_stage=lambda _stage_id: ()),
+        query_connection=object(),
+        session_config={},
     )
 
     assert created == []
     assert plan.set_calls == []
+
+
+@pytest.mark.parametrize(
+    ("module_name", "factory_name", "method_name", "active_attr", "by_plan_attr"),
+    [
+        (
+            "duckdb.execution.udf_ray",
+            "prepare_actor_pools_for_plan",
+            "_precreate_udf_actors",
+            "_active_udf_actors",
+            "_active_udf_actors_by_plan",
+        ),
+        (
+            "duckdb.execution.vllm",
+            "ensure_named_vllm_pools_for_plan",
+            "_precreate_vllm_actors",
+            "_active_vllm_actors",
+            "_active_vllm_actors_by_plan",
+        ),
+    ],
+)
+def test_precreate_retains_partially_created_actor_pool_for_teardown(
+    monkeypatch,
+    module_name,
+    factory_name,
+    method_name,
+    active_attr,
+    by_plan_attr,
+):
+    from duckdb.runners.ray.driver import RayQueryDriverActor
+
+    pool = object()
+    creation_error = RuntimeError("partial actor cleanup failed")
+    creation_error.owned_actor_pools = [pool]
+
+    def _fail(*_args, **_kwargs):
+        raise creation_error
+
+    fake_mod = types.ModuleType(module_name)
+    setattr(fake_mod, factory_name, _fail)
+    monkeypatch.setitem(sys.modules, module_name, fake_mod)
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    runner = SimpleNamespace(
+        _driver_handle=object(),
+        **{
+            active_attr: [],
+            by_plan_attr: {},
+        },
+    )
+    plan = _FakePlan([])
+
+    with pytest.raises(RuntimeError, match="partial actor cleanup failed"):
+        method = getattr(runner_cls, method_name)
+        if method_name == "_precreate_udf_actors":
+            method(
+                runner,
+                plan,
+                SimpleNamespace(stages=()),
+                SimpleNamespace(actor_node_ids_for_stage=lambda _stage_id: ()),
+                query_connection=object(),
+                session_config={},
+            )
+        else:
+            method(
+                runner,
+                plan,
+                query_connection=object(),
+                session_config={},
+            )
+
+    assert getattr(runner, active_attr) == [pool]
+    assert getattr(runner, by_plan_attr) == {"test-plan": [pool]}
 
 
 def test_driver_udf_actor_handle_hook_is_disabled_by_default(monkeypatch):
@@ -300,7 +495,7 @@ def test_driver_udf_actor_handle_hook_is_disabled_by_default(monkeypatch):
     runner = runner_cls.__new__(runner_cls)
 
     with pytest.raises(RuntimeError, match="VANE_ENABLE_UDF_TEST_HOOKS=1"):
-        runner_cls.get_test_udf_actor_handle(runner, "plan-7", "stateful_counter")
+        runner_cls.get_test_udf_actor_handle(runner, "owner-a", "plan-7", "stateful_counter")
 
 
 def test_stateful_actor_loss_error_includes_stable_query_context():
@@ -495,6 +690,8 @@ def test_precreate_udf_actors_enable_generic_async_for_distributed_pool(
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
         actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
+        query_driver_handle=object(),
+        session_config={},
         conn=object(),
     )
 
@@ -560,27 +757,31 @@ def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name
         ]
     )
 
+    query_driver_handle = object()
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
         actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
+        query_driver_handle=query_driver_handle,
+        session_config={},
         conn=object(),
     )
 
     assert len(created) == 1
-    assert calls == [
-        {
-            "payload": {
-                "udf_name": "decode_images",
-                "execution_backend": "ray_actor",
-                "stage_id": "stage:test:actor",
-            },
-            "concurrency": 2,
-            "gpus_per_actor": 0.0,
-            "actor_node_ids": ["node-a", "node-b"],
-            "ray_options": {"num_cpus": 1.0},
-        }
-    ]
+    assert len(calls) == 1
+    assert calls[0]["payload"] == {
+        "udf_name": "decode_images",
+        "execution_backend": "ray_actor",
+        "stage_id": "stage:test:actor",
+    }
+    assert calls[0]["concurrency"] == 2
+    assert calls[0]["gpus_per_actor"] == 0.0
+    assert calls[0]["actor_node_ids"] == ["node-a", "node-b"]
+    assert calls[0]["ray_options"]["num_cpus"] == 1.0
+    from duckdb.runners.ray import ray_env
+
+    assert calls[0]["ray_options"]["runtime_env"]["env_vars"] == ray_env.build_session_runtime_env_vars({})
     assert handles_map["7"]["actor_handles"] == ["actor-0", "actor-1"]
+    assert handles_map["7"]["query_driver_handle"] is query_driver_handle
     assert "ray_actor_pool_name" not in handles_map["7"]
     assert plan.set_calls == [
         {
@@ -646,6 +847,8 @@ def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
         actor_node_ids_by_stage={"stage:test:stateful": ("node-a",)},
+        query_driver_handle=object(),
+        session_config={},
         conn=object(),
     )
 
@@ -731,6 +934,8 @@ def test_ensure_actor_pools_for_plan_keeps_default_retry_policy_for_non_stateful
     created, _ = udf_ray.ensure_actor_pools_for_plan(
         plan,
         actor_node_ids_by_stage={"stage:test:retry-policy": ("node-a",)},
+        query_driver_handle=object(),
+        session_config={},
         conn=object(),
     )
 
@@ -832,24 +1037,70 @@ def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):
     created, handles_map = udf_ray.ensure_actor_pools_for_nodes(
         nodes,
         actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
+        query_driver_handle=object(),
+        session_config={},
         set_handles=inject,
     )
 
     assert len(created) == 1
-    assert calls == [
-        {
-            "payload": {
-                "udf_name": "decode_images",
-                "execution_backend": "ray_actor",
-                "stage_id": "stage:test:actor",
-            },
-            "concurrency": 2,
-            "gpus_per_actor": 0.0,
-            "actor_node_ids": ["node-a", "node-b"],
-            "ray_options": {"num_cpus": 1.0},
-        }
-    ]
+    assert len(calls) == 1
+    assert calls[0]["payload"] == {
+        "udf_name": "decode_images",
+        "execution_backend": "ray_actor",
+        "stage_id": "stage:test:actor",
+    }
+    assert calls[0]["concurrency"] == 2
+    assert calls[0]["gpus_per_actor"] == 0.0
+    assert calls[0]["actor_node_ids"] == ["node-a", "node-b"]
+    assert calls[0]["ray_options"]["num_cpus"] == 1.0
+    from duckdb.runners.ray import ray_env
+
+    assert calls[0]["ray_options"]["runtime_env"]["env_vars"] == ray_env.build_session_runtime_env_vars({})
     assert handles_map["9"]["actor_handles"] == ["actor-0", "actor-1"]
+    assert injected == [handles_map]
+
+
+def test_ray_plan_injects_session_context_for_explicit_subprocess_backends(monkeypatch):
+    import duckdb.execution.udf_ray as udf_ray
+
+    fake_ray = types.ModuleType("ray")
+    fake_ray.is_initialized = lambda: True
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setattr(udf_ray, "_is_vane_worker_process", lambda: False)
+
+    nodes = [
+        {
+            "node_id": 3,
+            "payload": {
+                "execution_backend": "subprocess_task",
+            },
+        },
+        {
+            "node_id": 4,
+            "payload": {
+                "execution_backend": "subprocess_actor",
+            },
+        },
+    ]
+    session_config = {
+        "AWS_ACCESS_KEY_ID": "session-key",
+        "VANE_AUTH_HEADER": "session-auth",
+    }
+    injected = []
+
+    created, handles_map = udf_ray.ensure_actor_pools_for_nodes(
+        nodes,
+        actor_node_ids_by_stage={},
+        query_driver_handle=object(),
+        session_config=session_config,
+        set_handles=injected.append,
+    )
+
+    assert created == []
+    assert handles_map == {
+        "3": {"session_config": session_config},
+        "4": {"session_config": session_config},
+    }
     assert injected == [handles_map]
 
 
@@ -915,6 +1166,8 @@ def test_prepare_actor_pools_publishes_handles_before_waiting_for_init(monkeypat
         actor_node_ids_by_stage={
             "stage:test:deferred-ready": ("node-a", "node-b"),
         },
+        query_driver_handle=object(),
+        session_config={},
     )
 
     assert resolved == []
@@ -949,6 +1202,136 @@ def test_udf_actor_pool_shutdown_accepts_query_owned_kill_flag(monkeypatch):
 
     assert killed == [{"actor": "actor-0", "no_restart": True}]
     assert pool.actors == []
+
+
+def test_udf_actor_pool_constructor_cleans_partial_actor_creation(monkeypatch):
+    import duckdb.execution.udf_ray_actor_pool as actor_pool_mod
+
+    killed = []
+    fake_ray = types.SimpleNamespace(
+        put=lambda payload: ("payload-ref", payload),
+        kill=lambda actor, no_restart=True: killed.append((actor, no_restart)),
+    )
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    class _ActorFactory:
+        calls = 0
+
+        @classmethod
+        def options(cls, **_options):
+            class _BoundActor:
+                @staticmethod
+                def remote():
+                    actor_index = cls.calls
+                    cls.calls += 1
+                    if actor_index == 1:
+                        raise RuntimeError("planned actor creation failure")
+                    return f"actor-{actor_index}"
+
+            return _BoundActor
+
+    class _Pool(actor_pool_mod.UDFActorPoolBase):
+        @staticmethod
+        def _actor_class(_max_restarts, _max_task_retries):
+            return _ActorFactory
+
+        @staticmethod
+        def _resolve_actor_num_cpus(_payload):
+            return 1
+
+        @staticmethod
+        def _resolve_actor_memory_bytes(_payload):
+            return 1
+
+        @staticmethod
+        def _build_actor_runtime_env(_ray_options):
+            return {}
+
+        @staticmethod
+        def _normalize_actor_node_ids(node_ids, *, expected_count):
+            assert len(node_ids) == expected_count
+            return list(node_ids)
+
+    with pytest.raises(RuntimeError, match="planned actor creation failure"):
+        _Pool(
+            payload={},
+            concurrency=2,
+            gpus_per_actor=0,
+            actor_node_ids=["a" * 56, "b" * 56],
+        )
+
+    assert killed == [("actor-0", True)]
+
+
+def test_udf_actor_pool_constructor_exposes_partial_actor_when_cleanup_fails(monkeypatch):
+    import duckdb.execution.udf_ray_actor_pool as actor_pool_mod
+
+    fail_kill = True
+
+    def _kill(_actor, *, no_restart):
+        assert no_restart is True
+        if fail_kill:
+            raise RuntimeError("planned actor cleanup failure")
+
+    fake_ray = types.SimpleNamespace(
+        put=lambda payload: ("payload-ref", payload),
+        kill=_kill,
+    )
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    class _ActorFactory:
+        calls = 0
+
+        @classmethod
+        def options(cls, **_options):
+            class _BoundActor:
+                @staticmethod
+                def remote():
+                    actor_index = cls.calls
+                    cls.calls += 1
+                    if actor_index == 1:
+                        raise RuntimeError("planned actor creation failure")
+                    return f"actor-{actor_index}"
+
+            return _BoundActor
+
+    class _Pool(actor_pool_mod.UDFActorPoolBase):
+        @staticmethod
+        def _actor_class(_max_restarts, _max_task_retries):
+            return _ActorFactory
+
+        @staticmethod
+        def _resolve_actor_num_cpus(_payload):
+            return 1
+
+        @staticmethod
+        def _resolve_actor_memory_bytes(_payload):
+            return 1
+
+        @staticmethod
+        def _build_actor_runtime_env(_ray_options):
+            return {}
+
+        @staticmethod
+        def _normalize_actor_node_ids(node_ids, *, expected_count):
+            assert len(node_ids) == expected_count
+            return list(node_ids)
+
+    with pytest.raises(RuntimeError, match="partial actor cleanup also failed") as exc_info:
+        _Pool(
+            payload={},
+            concurrency=2,
+            gpus_per_actor=0,
+            actor_node_ids=["a" * 56, "b" * 56],
+        )
+
+    owned_pools = exc_info.value.owned_actor_pools
+    assert len(owned_pools) == 1
+    assert owned_pools[0].actors == ["actor-0"]
+
+    fail_kill = False
+    owned_pools[0].shutdown()
+    assert owned_pools[0].actors == []
 
 
 def test_ensure_actor_pools_for_plan_does_not_fail_fast_on_cluster_resource_snapshot(monkeypatch):
@@ -1004,6 +1387,8 @@ def test_ensure_actor_pools_for_plan_does_not_fail_fast_on_cluster_resource_snap
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
         actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
+        query_driver_handle=object(),
+        session_config={},
         conn=object(),
     )
 
@@ -1012,7 +1397,7 @@ def test_ensure_actor_pools_for_plan_does_not_fail_fast_on_cluster_resource_snap
     assert handles_map["7"]["actor_handles"] == ["actor-0", "actor-1"]
 
 
-def test_ensure_actor_pools_for_plan_skips_python_udf_payload(monkeypatch):
+def test_ensure_actor_pools_for_plan_publishes_driver_handle_for_ray_task(monkeypatch):
     import duckdb.execution.udf_ray as udf_ray
 
     calls = []
@@ -1054,14 +1439,23 @@ def test_ensure_actor_pools_for_plan_skips_python_udf_payload(monkeypatch):
         ]
     )
 
+    query_driver_handle = object()
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
         actor_node_ids_by_stage={},
+        query_driver_handle=query_driver_handle,
+        session_config={},
         conn=object(),
     )
 
     assert created == []
-    assert handles_map == {}
+    assert handles_map == {
+        "9": {
+            "query_driver_handle": query_driver_handle,
+            "session_config": {},
+        }
+    }
+    assert plan.set_calls == [{"handles_map": handles_map}]
     assert calls == []
 
 
@@ -1078,6 +1472,8 @@ def test_ensure_actor_pools_for_plan_propagates_collect_errors(monkeypatch):
         udf_ray.ensure_actor_pools_for_plan(
             _BadPlan(),
             actor_node_ids_by_stage={},
+            query_driver_handle=object(),
+            session_config={},
             conn=object(),
         )
 
@@ -1121,6 +1517,8 @@ def test_ensure_actor_pools_for_plan_propagates_actor_creation_errors(monkeypatc
         udf_ray.ensure_actor_pools_for_plan(
             plan,
             actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
+            query_driver_handle=object(),
+            session_config={},
             conn=object(),
         )
     assert plan.set_calls == []
@@ -1242,11 +1640,14 @@ def test_physical_plan_structured_executor_options_reach_udf_builder(monkeypatch
     con = duckdb.connect()
     try:
         plan = _build_simple_ray_udf_plan(con)
+        query_driver_handle = object()
         plan.set_udf_actor_handles(
             {
                 "0": {
                     "actor_handles": ["actor-0"],
                     "actor_node_ids": ["node-a"],
+                    "query_driver_handle": query_driver_handle,
+                    "session_config": {},
                 }
             },
             conn=con,
@@ -1261,6 +1662,8 @@ def test_physical_plan_structured_executor_options_reach_udf_builder(monkeypatch
     assert all(call["payload_execution_backend"] == "ray_actor" for call in build_calls)
     assert build_calls[0]["options"]["actor_handles"] == ["actor-0"]
     assert build_calls[0]["options"]["actor_node_ids"] == ["node-a"]
+    assert build_calls[0]["options"]["query_driver_handle"] is query_driver_handle
+    assert build_calls[0]["options"]["session_config"] == {}
     assert table.column(0).to_pylist() == [2, 3]
 
 
@@ -1367,6 +1770,7 @@ def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
                 "0": {
                     "actor_handles": ["actor-0"],
                     "actor_node_ids": ["node-a"],
+                    "query_driver_handle": object(),
                 }
             },
             conn=con,
@@ -1471,6 +1875,8 @@ def test_ensure_actor_pools_for_plan_uses_coordinator_actor_nodes(monkeypatch):
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
         actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
+        query_driver_handle=object(),
+        session_config={},
     )
 
     assert len(created) == 1
@@ -1548,6 +1954,8 @@ def test_ensure_actor_pools_waits_for_init_refs_before_ready_lookup(monkeypatch)
     _, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
         actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
+        query_driver_handle=object(),
+        session_config={},
     )
 
     assert [ref for ref, _timeout in fake_ray.future_calls] == init_refs

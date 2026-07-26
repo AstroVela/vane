@@ -61,6 +61,7 @@ public:
 	std::vector<RayTaskResultHandle> PopFteResultHandles(const string &query_id);
 	void PrepareDropQuery(const string &query_id);
 	void CleanupQuery(const string &query_id);
+	void CloseSession(const string &session_id);
 	std::unordered_map<string, idx_t> FragmentStats() const;
 
 	void PrepareShutdown();

@@ -23,6 +23,8 @@ _ALLOWED_OPTIONS = frozenset(
         "actor_node_ids",
         "actor_dispatch_indices",
         "local_actor_pool",
+        "query_driver_handle",
+        "session_config",
     }
 )
 

@@ -48,6 +48,7 @@ public:
 
 	void drop_query_fragments(const string &query_id);
 	void rethrow_submission_error(const string &query_id);
+	DuckDBResult<void> close_session(const string &session_id);
 	std::unordered_map<string, std::unordered_map<string, idx_t>> fragment_stats_by_worker() const;
 
 private:
@@ -61,7 +62,6 @@ private:
 		idx_t active_operations = 0;
 		bool shutdown_started = false;
 		bool shutdown_finished = false;
-		std::string shutdown_error;
 	};
 
 	class OperationGuard {

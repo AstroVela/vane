@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+from duckdb.runners.ray.ray_env import build_session_runtime_env_vars
 from duckdb.runners.ray.safe_get import (
     configured_ray_get_timeout_s,
     resolve_object_refs_blocking,
@@ -26,6 +27,21 @@ from duckdb.execution.udf_threading import (
     ray_actor_thread_env,
     ray_actor_thread_policy,
 )
+
+
+class _OwnedUDFActorPoolsError(RuntimeError):
+    """Carry actor pools whose teardown must remain retryable by the driver."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        owned_actor_pools: list[Any],
+        creation_error: BaseException,
+    ) -> None:
+        super().__init__(message)
+        self.owned_actor_pools = list(owned_actor_pools)
+        self.creation_error = creation_error
 
 
 def _with_actor_thread_env(
@@ -120,9 +136,25 @@ class UDFActorPoolBase:
         payload_ref = ray.put(payload)
         self._payload_ref = payload_ref
 
-        self.actors = [Actor.options(**actor_options[idx]).remote() for idx in range(concurrency)]
-
-        self._init_refs = [a.init_payload.remote(payload_ref) for a in self.actors]
+        self.actors: list[Any] = []
+        self._init_refs: list[Any] = []
+        try:
+            for actor_index in range(concurrency):
+                self.actors.append(Actor.options(**actor_options[actor_index]).remote())
+            for actor in self.actors:
+                self._init_refs.append(actor.init_payload.remote(payload_ref))
+        except BaseException as creation_error:
+            try:
+                self.shutdown()
+            except BaseException as cleanup_error:
+                raise _OwnedUDFActorPoolsError(
+                    "UDF actor pool creation failed and partial actor cleanup also failed: "
+                    f"creation={type(creation_error).__name__}: {creation_error}; "
+                    f"cleanup={type(cleanup_error).__name__}: {cleanup_error}",
+                    owned_actor_pools=[self],
+                    creation_error=creation_error,
+                ) from creation_error
+            raise
         self._confirmed_ready: set[int] = set()
 
     @staticmethod
@@ -185,9 +217,17 @@ class UDFActorPoolBase:
 
         import ray
 
-        for actor in self.actors:
-            ray.kill(actor, no_restart=True)
-        self.actors = []
+        errors: list[str] = []
+        remaining_actors: list[Any] = []
+        for actor_index, actor in enumerate(self.actors):
+            try:
+                ray.kill(actor, no_restart=True)
+            except BaseException as exc:
+                errors.append(f"actor-{actor_index}: {type(exc).__name__}: {exc}")
+                remaining_actors.append(actor)
+        self.actors = remaining_actors
+        if errors:
+            raise RuntimeError("failed to shut down UDF actor pool: " + "; ".join(errors))
 
 
 def apply_actor_node_options(
@@ -234,9 +274,17 @@ def _shutdown_owned_actors(ray: Any, actors_obj: Any) -> None:
     if not bool(getattr(actors_obj, "_owns_actors", False)):
         return
     actors = list(getattr(actors_obj, "actors", []))
-    for actor in actors:
-        ray.kill(actor, no_restart=True)
-    actors_obj.actors = []
+    errors: list[str] = []
+    remaining_actors: list[Any] = []
+    for actor_index, actor in enumerate(actors):
+        try:
+            ray.kill(actor, no_restart=True)
+        except BaseException as exc:
+            errors.append(f"actor-{actor_index}: {type(exc).__name__}: {exc}")
+            remaining_actors.append(actor)
+    actors_obj.actors = remaining_actors
+    if errors:
+        raise RuntimeError("failed to shut down UDF actor pool: " + "; ".join(errors))
 
 
 def _resolve_actor_pool_init_refs(ray: Any, actors_obj: Any) -> None:
@@ -257,14 +305,24 @@ def _resolve_actor_pool_init_refs(ray: Any, actors_obj: Any) -> None:
         else:
             resolve_object_refs_blocking(refs, timeout=timeout_s)
     except Exception as exc:
-        _shutdown_owned_actors(ray, actors_obj)
         if _is_timeout_error(exc):
             timeout_desc = "query deadline" if timeout_s is None else f"{timeout_s:.3f}s"
-            raise RuntimeError(
+            readiness_error = RuntimeError(
                 "UDF actor pool initialization timed out "
                 f"after {timeout_desc} while waiting for {len(refs)} actor init refs"
+            )
+        else:
+            readiness_error = RuntimeError(f"UDF actor pool initialization failed: {type(exc).__name__}: {exc}")
+        try:
+            _shutdown_owned_actors(ray, actors_obj)
+        except BaseException as cleanup_error:
+            raise _OwnedUDFActorPoolsError(
+                "UDF actor pool initialization failed and actor cleanup also failed: "
+                f"initialization={readiness_error}; cleanup={type(cleanup_error).__name__}: {cleanup_error}",
+                owned_actor_pools=[actors_obj],
+                creation_error=readiness_error,
             ) from exc
-        raise RuntimeError(f"UDF actor pool initialization failed: {type(exc).__name__}: {exc}") from exc
+        raise readiness_error from exc
     actors_obj._confirmed_ready.update(range(len(actors)))
 
 
@@ -273,6 +331,8 @@ def ensure_actor_pools_for_plan(
     conn: Any = None,
     *,
     actor_node_ids_by_stage: dict[str, tuple[str, ...]],
+    query_driver_handle: Any,
+    session_config: dict[str, str],
     actor_pool_cls: type[UDFActorPoolBase],
     is_vane_worker_process: Callable[[], bool],
     requires_actor_pool_fn: Callable[[dict[str, Any]], bool],
@@ -286,6 +346,8 @@ def ensure_actor_pools_for_plan(
     return ensure_actor_pools_for_nodes(
         udf_nodes,
         actor_node_ids_by_stage=actor_node_ids_by_stage,
+        query_driver_handle=query_driver_handle,
+        session_config=session_config,
         set_handles=lambda actor_handles_map: plan.set_udf_actor_handles(actor_handles_map, conn=conn),
         actor_pool_cls=actor_pool_cls,
         is_vane_worker_process=is_vane_worker_process,
@@ -303,6 +365,8 @@ def prepare_actor_pools_for_plan(
     conn: Any = None,
     *,
     actor_node_ids_by_stage: dict[str, tuple[str, ...]],
+    query_driver_handle: Any,
+    session_config: dict[str, str],
     actor_pool_cls: type[UDFActorPoolBase],
     is_vane_worker_process: Callable[[], bool],
     requires_actor_pool_fn: Callable[[dict[str, Any]], bool],
@@ -323,6 +387,8 @@ def prepare_actor_pools_for_plan(
     return _create_actor_pools_for_nodes(
         udf_nodes,
         actor_node_ids_by_stage=actor_node_ids_by_stage,
+        query_driver_handle=query_driver_handle,
+        session_config=session_config,
         set_handles=lambda actor_handles_map: plan.set_udf_actor_handles(actor_handles_map, conn=conn),
         actor_pool_cls=actor_pool_cls,
         is_vane_worker_process=is_vane_worker_process,
@@ -340,6 +406,8 @@ def ensure_actor_pools_for_nodes(
     udf_nodes: Any,
     *,
     actor_node_ids_by_stage: dict[str, tuple[str, ...]],
+    query_driver_handle: Any,
+    session_config: dict[str, str],
     set_handles: Callable[[dict[str, Any]], None] | None = None,
     actor_pool_cls: type[UDFActorPoolBase],
     is_vane_worker_process: Callable[[], bool],
@@ -353,6 +421,8 @@ def ensure_actor_pools_for_nodes(
     return _create_actor_pools_for_nodes(
         udf_nodes,
         actor_node_ids_by_stage=actor_node_ids_by_stage,
+        query_driver_handle=query_driver_handle,
+        session_config=session_config,
         set_handles=set_handles,
         actor_pool_cls=actor_pool_cls,
         is_vane_worker_process=is_vane_worker_process,
@@ -370,6 +440,8 @@ def _create_actor_pools_for_nodes(
     udf_nodes: Any,
     *,
     actor_node_ids_by_stage: dict[str, tuple[str, ...]],
+    query_driver_handle: Any,
+    session_config: dict[str, str],
     set_handles: Callable[[dict[str, Any]], None] | None,
     actor_pool_cls: type[UDFActorPoolBase],
     is_vane_worker_process: Callable[[], bool],
@@ -386,6 +458,10 @@ def _create_actor_pools_for_nodes(
 
     if not udf_nodes:
         return [], {}
+    if query_driver_handle is None:
+        raise ValueError("Ray UDF executor preparation requires an explicit query driver handle")
+    normalized_session_config = {str(key): str(value) for key, value in session_config.items()}
+    session_runtime_env_vars = build_session_runtime_env_vars(normalized_session_config)
 
     import ray
 
@@ -398,6 +474,17 @@ def _create_actor_pools_for_nodes(
     try:
         for node in udf_nodes:
             raw_payload = node.get("payload") or {}
+            backend = str(raw_payload.get("execution_backend") or "").strip().lower()
+            if backend not in {"ray_task", "ray_actor", "subprocess_task", "subprocess_actor"}:
+                continue
+            node_id = str(node["node_id"])
+            executor_options = {
+                "session_config": normalized_session_config,
+            }
+            actor_handles_map[node_id] = executor_options
+            if backend in {"subprocess_task", "subprocess_actor"}:
+                continue
+            executor_options["query_driver_handle"] = query_driver_handle
             if not requires_actor_pool_fn(raw_payload):
                 continue
             payload = normalize_actor_pool_payload(raw_payload)
@@ -406,7 +493,6 @@ def _create_actor_pools_for_nodes(
             if not requires_actor_pool_fn(payload):
                 continue
 
-            node_id = str(node["node_id"])
             stage_id = str(payload.get("stage_id") or "").strip()
             if not stage_id:
                 raise RuntimeError(f"Ray actor UDF node {node_id} is missing stage_id")
@@ -419,7 +505,12 @@ def _create_actor_pools_for_nodes(
                     f"got {len(assigned_node_ids)}"
                 )
             cpus = resolve_actor_num_cpus(payload)
-            ray_options = {"num_cpus": cpus}
+            ray_options = {
+                "num_cpus": cpus,
+                "runtime_env": {
+                    "env_vars": session_runtime_env_vars,
+                },
+            }
 
             stateful_options: dict[str, int] = {}
             if payload.get("stateful"):
@@ -441,25 +532,37 @@ def _create_actor_pools_for_nodes(
                 _resolve_actor_pool_init_refs(ray, actors_obj)
             actor_node_ids = list(assigned_node_ids)
             actor_dispatch_indices = set(range(len(actors_obj.actors)))
-            actor_handles_map[node_id] = build_udf_executor_options(
-                actor_handles=list(actors_obj.actors),
-                actor_node_ids=actor_node_ids,
-                actor_dispatch_indices=actor_dispatch_indices,
+            executor_options.update(
+                build_udf_executor_options(
+                    actor_handles=list(actors_obj.actors),
+                    actor_node_ids=actor_node_ids,
+                    actor_dispatch_indices=actor_dispatch_indices,
+                )
             )
 
         if actor_handles_map and set_handles is not None:
             set_handles(actor_handles_map)
     except BaseException as execution_error:
-        cleanup_errors = []
+        for actors_obj in getattr(execution_error, "owned_actor_pools", ()):
+            if actors_obj not in created:
+                created.append(actors_obj)
+        cleanup_errors: list[BaseException] = []
+        remaining_owned: list[UDFActorPoolBase] = []
         for actors_obj in reversed(created):
             try:
                 actors_obj.shutdown()
             except BaseException as cleanup_error:
                 cleanup_errors.append(cleanup_error)
+                remaining_owned.append(actors_obj)
         if cleanup_errors:
-            raise RuntimeError(
-                f"UDF actor pool creation failed and cleanup also failed: {cleanup_errors[0]}"
+            creation_error = getattr(execution_error, "creation_error", execution_error)
+            raise _OwnedUDFActorPoolsError(
+                f"UDF actor pool creation failed and cleanup also failed: {cleanup_errors[0]}",
+                owned_actor_pools=list(reversed(remaining_owned)),
+                creation_error=creation_error,
             ) from execution_error
+        if isinstance(execution_error, _OwnedUDFActorPoolsError):
+            raise execution_error.creation_error
         raise
 
     return created, actor_handles_map
@@ -476,16 +579,23 @@ def wait_for_actor_pools_ready(actor_pools: list[UDFActorPoolBase]) -> None:
         for actors_obj in actor_pools:
             _resolve_actor_pool_init_refs(ray, actors_obj)
     except BaseException as readiness_error:
-        cleanup_errors = []
+        cleanup_errors: list[str] = []
+        remaining_owned: list[UDFActorPoolBase] = []
         for actors_obj in reversed(actor_pools):
             try:
                 actors_obj.shutdown()
             except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
+                cleanup_errors.append(f"{type(cleanup_error).__name__}: {cleanup_error}")
+                remaining_owned.append(actors_obj)
         if cleanup_errors:
-            raise RuntimeError(
-                f"UDF actor readiness failed and cleanup also failed: {cleanup_errors[0]}"
+            creation_error = getattr(readiness_error, "creation_error", readiness_error)
+            raise _OwnedUDFActorPoolsError(
+                "UDF actor readiness failed and cleanup also failed: " + "; ".join(cleanup_errors),
+                owned_actor_pools=list(reversed(remaining_owned)),
+                creation_error=creation_error,
             ) from readiness_error
+        if isinstance(readiness_error, _OwnedUDFActorPoolsError):
+            raise readiness_error.creation_error
         raise
 
 

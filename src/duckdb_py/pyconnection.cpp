@@ -548,6 +548,13 @@ static void RegisterVaneScalarFunctionAtomically(
 } // namespace
 
 DuckDBPyConnection::~DuckDBPyConnection() {
+	if (!PythonIsFinalizing()) {
+		try {
+			PythonGILWrapper gil;
+			ReleaseVaneSession();
+		} catch (...) { // NOLINT
+		}
+	}
 	try {
 		py::gil_scoped_release gil;
 		// Release any structures that do not need to hold the GIL here
@@ -2656,13 +2663,16 @@ int DuckDBPyConnection::GetRowcount() {
 void DuckDBPyConnection::Close() {
 	con.SetResult(nullptr);
 	D_ASSERT(py::gil_check());
-	py::gil_scoped_release release;
-	con.SetConnection(nullptr);
-	con.SetDatabase(nullptr);
-	// https://peps.python.org/pep-0249/#Connection.close
-	cursors.ClearCursors();
-	registered_functions.clear();
-	registered_function_catalog_types.clear();
+	{
+		py::gil_scoped_release release;
+		con.SetConnection(nullptr);
+		con.SetDatabase(nullptr);
+		// https://peps.python.org/pep-0249/#Connection.close
+		cursors.ClearCursors();
+		registered_functions.clear();
+		registered_function_catalog_types.clear();
+	}
+	ReleaseVaneSession();
 }
 
 void DuckDBPyConnection::Interrupt() {
@@ -2785,6 +2795,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Cursor() {
 	res->con.SetDatabase(con);
 	res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase()));
 	res->SetConnectionBootstrapConfig(connection_database, connection_read_only, connection_config);
+	res->InheritVaneSession(*this);
 	res->distributed_python_udf_registrations = distributed_python_udf_registrations;
 	res->applied_distributed_python_udf_digests = applied_distributed_python_udf_digests;
 	cursors.AddCursor(res);
@@ -2910,6 +2921,101 @@ py::dict DuckDBPyConnection::ExportConnectionBootstrapConfig() const {
 	result[py::str("read_only")] = py::bool_(connection_read_only);
 	result[py::str("config")] = CopyPyDict(connection_config);
 	return result;
+}
+
+static bool IsVaneSessionEnvironmentKey(const string &name) {
+	return StringUtil::StartsWith(name, "AWS_") || StringUtil::StartsWith(name, "DUCKDB_") ||
+	       StringUtil::StartsWith(name, "S3FS_") || StringUtil::StartsWith(name, "VANE_");
+}
+
+void DuckDBPyConnection::InitializeVaneSession() {
+	auto uuid_module = py::module_::import("uuid");
+	auto session_id = py::str(uuid_module.attr("uuid4")().attr("hex")).cast<string>();
+	if (session_id.empty()) {
+		throw InternalException("Failed to generate Vane connection session identity");
+	}
+
+	py::dict captured;
+	auto environ = py::module_::import("os").attr("environ");
+	auto environ_dict = py::module_::import("builtins").attr("dict")(environ).cast<py::dict>();
+	for (auto item : environ_dict) {
+		auto key = py::str(item.first).cast<string>();
+		if (!IsVaneSessionEnvironmentKey(key)) {
+			continue;
+		}
+		captured[py::str(key)] = py::str(item.second);
+	}
+	vane_session = make_shared_ptr<VaneSessionContext>(std::move(session_id), std::move(captured));
+	vane_session_attached = true;
+}
+
+void DuckDBPyConnection::InheritVaneSession(const DuckDBPyConnection &owner) {
+	if (!owner.vane_session || !owner.vane_session_attached) {
+		throw InternalException("Cannot inherit missing Vane connection session");
+	}
+	vane_session = owner.vane_session;
+	{
+		lock_guard<mutex> guard(vane_session->lock);
+		if (vane_session->connection_count == 0) {
+			throw InternalException("Cannot inherit closed Vane connection session");
+		}
+		vane_session->connection_count++;
+	}
+	vane_session_attached = true;
+}
+
+const string &DuckDBPyConnection::GetVaneSessionId() const {
+	if (!vane_session || vane_session->id.empty()) {
+		throw InternalException("DuckDB connection is missing its Vane session identity");
+	}
+	return vane_session->id;
+}
+
+py::dict DuckDBPyConnection::ExportVaneSessionConfig() const {
+	if (!vane_session) {
+		throw InternalException("DuckDB connection is missing its Vane session configuration");
+	}
+	lock_guard<mutex> guard(vane_session->lock);
+	if (!vane_session_attached || vane_session->connection_count == 0) {
+		throw InternalException("DuckDB connection Vane session is closed");
+	}
+	return CopyPyDict(vane_session->config);
+}
+
+void DuckDBPyConnection::MarkVaneRaySessionOpened() {
+	if (!vane_session) {
+		throw InternalException("DuckDB connection is missing its Vane session identity");
+	}
+	lock_guard<mutex> guard(vane_session->lock);
+	if (!vane_session_attached || vane_session->connection_count == 0) {
+		throw InternalException("DuckDB connection Vane session is closed");
+	}
+	vane_session->ray_session_opened = true;
+}
+
+void DuckDBPyConnection::ReleaseVaneSession() {
+	if (!vane_session_attached) {
+		return;
+	}
+	if (!vane_session) {
+		throw InternalException("DuckDB connection is missing its attached Vane session");
+	}
+	lock_guard<mutex> guard(vane_session->lock);
+	if (vane_session->connection_count == 0) {
+		throw InternalException("DuckDB connection Vane session reference count underflow");
+	}
+	if (vane_session->connection_count > 1) {
+		vane_session->connection_count--;
+		vane_session_attached = false;
+		return;
+	}
+	if (vane_session->ray_session_opened && !vane_session->id.empty() && !PythonIsFinalizing()) {
+		py::module_::import("duckdb.runners.ray.runner").attr("notify_connection_closed")(py::str(vane_session->id));
+		vane_session->ray_session_opened = false;
+	}
+	vane_session->connection_count = 0;
+	vane_session->config = py::dict();
+	vane_session_attached = false;
 }
 
 static bool HasJupyterProgressBarDependencies() {
@@ -3041,6 +3147,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Connect(const py::object &dat
 
 	auto res = FetchOrCreateInstance(database, config);
 	res->SetConnectionBootstrapConfig(database, read_only, config_options);
+	res->InitializeVaneSession();
 	auto &client_context = *res->con.GetConnection().context;
 	SetDefaultConfigArguments(client_context);
 	return res;

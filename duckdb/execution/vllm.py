@@ -11,11 +11,13 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import deque
+from collections.abc import Mapping
 from numbers import Integral, Real
 from typing import Any
 
 import pyarrow as pa
 
+from duckdb.runners.ray.ray_env import build_session_runtime_env_vars, install_explicit_session_runtime_env
 from duckdb.runners.ray.safe_get import configured_ray_get_timeout_s, resolve_object_refs_blocking
 
 # ---------------------------------------------------------------------------
@@ -484,6 +486,30 @@ class LocalVLLMExecutor(VLLMExecutor):
 
 
 class RayLocalVLLMExecutor(LocalVLLMExecutor):
+    def __init__(
+        self,
+        model: str,
+        engine_args: dict[str, Any],
+        generate_args: dict[str, Any],
+        on_error: str = "raise",
+        use_threading: bool = True,
+        engine_init_timeout_s: float | None = None,
+        force_background_thread: bool = False,
+        *,
+        _install_session_runtime_env: bool = False,
+    ):
+        if _install_session_runtime_env:
+            install_explicit_session_runtime_env()
+        super().__init__(
+            model,
+            engine_args,
+            generate_args,
+            on_error=on_error,
+            use_threading=use_threading,
+            engine_init_timeout_s=engine_init_timeout_s,
+            force_background_thread=force_background_thread,
+        )
+
     # Ray actor calls are awaitable, while the in-process executor exposes a blocking method.
     async def wait_for_result(self, executor_id: str | None = None) -> bool:  # type: ignore[override]
         return await asyncio.to_thread(self._wait_for_result_blocking, executor_id)
@@ -491,7 +517,10 @@ class RayLocalVLLMExecutor(LocalVLLMExecutor):
 
 class RemoteVLLMExecutor(VLLMExecutor):
     def __init__(self, llm_actors: LLMActors, pool_name: str | None = None):
-        self.router_actor = llm_actors.router_actor
+        router_actor = llm_actors.router_actor
+        if router_actor is None:
+            raise ValueError("RemoteVLLMExecutor requires a router actor")
+        self.router_actor = router_actor
         resolve_object_refs_blocking(self.router_actor.report_start.remote())
 
         self.llm_actors = llm_actors.llm_actors
@@ -792,7 +821,16 @@ class RemoteVLLMExecutor(VLLMExecutor):
 
 
 class PrefixRouter:
-    def __init__(self, llm_actors: list[Any], _load_balance_threshold: int, _max_recent_prefixes: int = 8):
+    def __init__(
+        self,
+        llm_actors: list[Any],
+        _load_balance_threshold: int,
+        _max_recent_prefixes: int = 8,
+        *,
+        _install_session_runtime_env: bool = False,
+    ):
+        if _install_session_runtime_env:
+            install_explicit_session_runtime_env()
         self.llm_actors = llm_actors
         self.unfinished_actors = 0
 
@@ -808,6 +846,21 @@ class PrefixRouter:
                 resolve_object_refs_blocking(actor.finished_submitting.remote())
 
 
+class _OwnedLLMActorPoolsError(RuntimeError):
+    """Carry vLLM pools whose teardown must remain retryable by the driver."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        owned_actor_pools: list[Any],
+        creation_error: BaseException,
+    ) -> None:
+        super().__init__(message)
+        self.owned_actor_pools = list(owned_actor_pools)
+        self.creation_error = creation_error
+
+
 class LLMActors:
     def __init__(
         self,
@@ -820,39 +873,68 @@ class LLMActors:
         load_balance_threshold: int,
         name_prefix: str | None = None,
         engine_init_timeout_s: float | None = None,
+        session_config: Mapping[str, Any] | None = None,
     ):
         import ray
 
         LocalVLLMExecutorActor = ray.remote(num_gpus=gpus_per_actor, max_restarts=4)(RayLocalVLLMExecutor)
         PrefixRouterActor = ray.remote(PrefixRouter)
+        normalized_session_config = (
+            None if session_config is None else {str(key): str(value) for key, value in session_config.items()}
+        )
+        install_session_env = normalized_session_config is not None
+        actor_runtime_env = (
+            None
+            if normalized_session_config is None
+            else {"env_vars": build_session_runtime_env_vars(normalized_session_config)}
+        )
 
-        if name_prefix:
-            llm_names = [f"{name_prefix}-llm-{i}" for i in range(concurrency)]
-            self.llm_actors = [
-                LocalVLLMExecutorActor.options(name=llm_name).remote(
-                    model,
-                    engine_args,
-                    generate_args,
-                    on_error,
-                    engine_init_timeout_s=engine_init_timeout_s,
+        self.llm_actors: list[Any] = []
+        self.router_actor: Any | None = None
+        try:
+            for actor_index in range(concurrency):
+                actor_options: dict[str, Any] = {}
+                if name_prefix:
+                    actor_options["name"] = f"{name_prefix}-llm-{actor_index}"
+                if actor_runtime_env is not None:
+                    actor_options["runtime_env"] = actor_runtime_env
+                actor_factory = (
+                    LocalVLLMExecutorActor.options(**actor_options) if actor_options else LocalVLLMExecutorActor
                 )
-                for llm_name in llm_names
-            ]
-            self.router_actor = PrefixRouterActor.options(name=f"{name_prefix}-router").remote(
-                self.llm_actors, load_balance_threshold
+                self.llm_actors.append(
+                    actor_factory.remote(
+                        model,
+                        engine_args,
+                        generate_args,
+                        on_error,
+                        engine_init_timeout_s=engine_init_timeout_s,
+                        _install_session_runtime_env=install_session_env,
+                    )
+                )
+
+            router_options: dict[str, Any] = {}
+            if name_prefix:
+                router_options["name"] = f"{name_prefix}-router"
+            if actor_runtime_env is not None:
+                router_options["runtime_env"] = actor_runtime_env
+            router_factory = PrefixRouterActor.options(**router_options) if router_options else PrefixRouterActor
+            self.router_actor = router_factory.remote(
+                self.llm_actors,
+                load_balance_threshold,
+                _install_session_runtime_env=install_session_env,
             )
-        else:
-            self.llm_actors = [
-                LocalVLLMExecutorActor.remote(
-                    model,
-                    engine_args,
-                    generate_args,
-                    on_error,
-                    engine_init_timeout_s=engine_init_timeout_s,
-                )
-                for _ in range(concurrency)
-            ]
-            self.router_actor = PrefixRouterActor.remote(self.llm_actors, load_balance_threshold)
+        except BaseException as creation_error:
+            try:
+                self.shutdown()
+            except BaseException as cleanup_error:
+                raise _OwnedLLMActorPoolsError(
+                    "vLLM actor pool creation failed and partial actor cleanup also failed: "
+                    f"creation={type(creation_error).__name__}: {creation_error}; "
+                    f"cleanup={type(cleanup_error).__name__}: {cleanup_error}",
+                    owned_actor_pools=[self],
+                    creation_error=creation_error,
+                ) from creation_error
+            raise
 
     @classmethod
     def _from_handles(cls, llm_actors: list[Any], router_actor: Any) -> LLMActors:
@@ -860,6 +942,29 @@ class LLMActors:
         instance.llm_actors = llm_actors
         instance.router_actor = router_actor
         return instance
+
+    def shutdown(self) -> None:
+        import ray
+
+        errors: list[str] = []
+        if self.router_actor is not None:
+            try:
+                ray.kill(self.router_actor, no_restart=True)
+            except BaseException as exc:
+                errors.append(f"router: {type(exc).__name__}: {exc}")
+            else:
+                self.router_actor = None
+
+        remaining_llm_actors: list[Any] = []
+        for actor_index, actor in enumerate(self.llm_actors):
+            try:
+                ray.kill(actor, no_restart=True)
+            except BaseException as exc:
+                errors.append(f"llm-{actor_index}: {type(exc).__name__}: {exc}")
+                remaining_llm_actors.append(actor)
+        self.llm_actors = remaining_llm_actors
+        if errors:
+            raise RuntimeError("failed to shut down vLLM actor pool: " + "; ".join(errors))
 
     @classmethod
     def get_or_create_named(
@@ -874,6 +979,7 @@ class LLMActors:
         load_balance_threshold: int,
         name_prefix: str,
         engine_init_timeout_s: float | None = None,
+        session_config: Mapping[str, Any] | None = None,
     ) -> LLMActors:
         import ray
 
@@ -899,11 +1005,16 @@ class LLMActors:
         if found == expected:
             return cls._from_handles(llm_actors, router_actor)
         if found:
-            raise RuntimeError(
+            creation_error = RuntimeError(
                 f"Named vLLM actor pool '{name_prefix}' partially available: "
                 f"found={found} missing={len(missing)} expected={expected} "
                 f"missing_names={', '.join(missing)}"
             )
+            raise _OwnedLLMActorPoolsError(
+                str(creation_error),
+                owned_actor_pools=[cls._from_handles(llm_actors, router_actor)],
+                creation_error=creation_error,
+            ) from creation_error
 
         return cls(
             model=model,
@@ -915,6 +1026,7 @@ class LLMActors:
             load_balance_threshold=load_balance_threshold,
             name_prefix=name_prefix,
             engine_init_timeout_s=engine_init_timeout_s,
+            session_config=session_config,
         )
 
     @classmethod
@@ -1063,7 +1175,12 @@ def _is_ray_worker() -> bool:
         return False
 
 
-def ensure_named_vllm_pools_for_plan(plan: Any, conn: Any = None) -> tuple[list[LLMActors], dict[str, Any]]:
+def ensure_named_vllm_pools_for_plan(
+    plan: Any,
+    conn: Any = None,
+    *,
+    session_config: Mapping[str, Any],
+) -> tuple[list[LLMActors], dict[str, Any]]:
     """Pre-create named Ray actor pools for vLLM nodes in a distributed plan.
 
     Called on the driver before task dispatch so that workers find actors
@@ -1087,35 +1204,62 @@ def ensure_named_vllm_pools_for_plan(plan: Any, conn: Any = None) -> tuple[list[
     if not ray.is_initialized():
         raise RuntimeError("Ray vLLM actor creation requires an initialized RayRunner runtime")
 
+    normalized_session_config = {str(key): str(value) for key, value in session_config.items()}
     created: list[LLMActors] = []
-    for node in vllm_nodes:
-        pool_name = str(node["pool_name"])
-        model = str(node.get("model", ""))
+    try:
+        for node in vllm_nodes:
+            pool_name = str(node["pool_name"])
+            model = str(node.get("model", ""))
 
-        # Parse options through normalize_options to get clean defaults.
-        raw_opts = node.get("options")
-        opts = normalize_options(raw_opts)
+            # Parse options through normalize_options to get clean defaults.
+            raw_opts = node.get("options")
+            opts = normalize_options(raw_opts)
 
-        engine_args = _apply_engine_defaults(dict(opts.get("engine_args") or {}))
-        generate_args = dict(opts.get("generate_args") or {})
-        on_error = str(opts.get("on_error", "raise"))
-        gpus_per_actor = opts["gpus_per_actor"]
-        concurrency = max(1, int(opts.get("concurrency", 1)))
-        load_balance_threshold = max(0, int(opts.get("load_balance_threshold", 32)))
-        engine_init_timeout_s = _vllm_engine_init_timeout_s(opts.get("engine_init_timeout_s"))
+            engine_args = _apply_engine_defaults(dict(opts.get("engine_args") or {}))
+            generate_args = dict(opts.get("generate_args") or {})
+            on_error = str(opts.get("on_error", "raise"))
+            gpus_per_actor = opts["gpus_per_actor"]
+            concurrency = max(1, int(opts.get("concurrency", 1)))
+            load_balance_threshold = max(0, int(opts.get("load_balance_threshold", 32)))
+            engine_init_timeout_s = _vllm_engine_init_timeout_s(opts.get("engine_init_timeout_s"))
 
-        actors_obj = LLMActors.get_or_create_named(
-            model=model,
-            engine_args=engine_args,
-            generate_args=generate_args,
-            on_error=on_error,
-            gpus_per_actor=gpus_per_actor,
-            concurrency=concurrency,
-            load_balance_threshold=load_balance_threshold,
-            name_prefix=pool_name,
-            engine_init_timeout_s=engine_init_timeout_s,
-        )
-        created.append(actors_obj)
+            actors_obj = LLMActors.get_or_create_named(
+                model=model,
+                engine_args=engine_args,
+                generate_args=generate_args,
+                on_error=on_error,
+                gpus_per_actor=gpus_per_actor,
+                concurrency=concurrency,
+                load_balance_threshold=load_balance_threshold,
+                name_prefix=pool_name,
+                engine_init_timeout_s=engine_init_timeout_s,
+                session_config=normalized_session_config,
+            )
+            created.append(actors_obj)
+    except BaseException as execution_error:
+        for actors_obj in getattr(execution_error, "owned_actor_pools", ()):
+            if actors_obj not in created:
+                created.append(actors_obj)
+        cleanup_errors: list[str] = []
+        remaining_owned: list[LLMActors] = []
+        for actors_obj in created:
+            try:
+                actors_obj.shutdown()
+            except BaseException as exc:
+                cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+                remaining_owned.append(actors_obj)
+        if cleanup_errors:
+            creation_error = getattr(execution_error, "creation_error", execution_error)
+            raise _OwnedLLMActorPoolsError(
+                "vLLM plan actor creation failed and prior pool cleanup also failed: "
+                f"creation={type(creation_error).__name__}: {creation_error}; "
+                f"cleanup={'; '.join(cleanup_errors)}",
+                owned_actor_pools=remaining_owned,
+                creation_error=creation_error,
+            ) from execution_error
+        if isinstance(execution_error, _OwnedLLMActorPoolsError):
+            raise execution_error.creation_error
+        raise
 
     return created, {}
 

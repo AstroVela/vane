@@ -18,6 +18,7 @@ import threading
 import time
 import weakref
 from collections import deque
+from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, cast
 
@@ -60,6 +61,7 @@ from duckdb.execution.udf_threading import (
     worker_thread_env as _worker_thread_env,
 )
 from duckdb.execution.unified_executor import UDFExecutor as BaseUDFExecutor
+from duckdb.runners.ray.ray_env import build_explicit_session_process_env
 
 _MSG_READY = 0x01
 _MSG_SUBMIT = 0x02
@@ -295,7 +297,13 @@ def _read_ipc_from_shm(shm: shared_memory.SharedMemory, size: int | None = None)
 class _SingleSubprocessExecutor(BaseUDFExecutor):
     """Run Python UDFs in one long-lived worker subprocess."""
 
-    def __init__(self, payload: dict[str, Any], *, worker_env: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        payload: dict[str, Any],
+        *,
+        worker_env: dict[str, str] | None = None,
+        session_config: Mapping[str, Any] | None = None,
+    ) -> None:
         if payload is None:
             raise ValueError("UDF payload is required")
 
@@ -309,6 +317,9 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         self._wakeup_error: BaseException | None = None
         self._ref_bundle_output = payload_requests_local_ref_bundle_output(payload)
         self._worker_env = dict(worker_env or {})
+        self._session_config = (
+            None if session_config is None else {str(key): str(value) for key, value in session_config.items()}
+        )
         self._active_input_leases: set[int] = set()
         self._active_input_leases_lock = threading.Lock()
         self._active_output_grants: set[int] = set()
@@ -349,7 +360,11 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 str(payload_size),
                 data_shm.name,
             ]
-            env = dict(os.environ)
+            env = (
+                dict(os.environ)
+                if self._session_config is None
+                else build_explicit_session_process_env(self._session_config)
+            )
             env.update(self._worker_env)
             env["PYTHONUNBUFFERED"] = "1"
             proc = subprocess.Popen(
@@ -892,8 +907,26 @@ def _worker_env_for_pool_index(payload: dict[str, Any], worker_idx: int, pool_si
     return env
 
 
-def _payload_task_key(payload: dict[str, Any]) -> str:
-    return hashlib.sha256(duckdb_pickle.dumps(payload)).hexdigest()
+def _normalize_session_config_option(options: Mapping[str, Any]) -> dict[str, str] | None:
+    if "session_config" not in options:
+        return None
+    raw_config = options["session_config"]
+    if not isinstance(raw_config, Mapping):
+        raise TypeError("UDF executor session_config must be a mapping")
+    return {str(key): str(value) for key, value in raw_config.items()}
+
+
+def _payload_task_key(
+    payload: dict[str, Any],
+    session_config: Mapping[str, Any] | None = None,
+) -> str:
+    identity = (
+        payload,
+        None
+        if session_config is None
+        else tuple(sorted((str(key), str(value)) for key, value in session_config.items())),
+    )
+    return hashlib.sha256(duckdb_pickle.dumps(identity)).hexdigest()
 
 
 class _PooledTaskWorker:
@@ -909,10 +942,14 @@ class _TaskWorkerPool:
         key: str,
         payload: dict[str, Any],
         pool_size: int,
+        session_config: Mapping[str, Any] | None = None,
     ) -> None:
         self.runtime = runtime
         self.key = key
         self.payload = dict(payload)
+        self.session_config = (
+            None if session_config is None else {str(key): str(value) for key, value in session_config.items()}
+        )
         self.pool_size = max(1, int(pool_size))
         self.ref_count = 0
         self.closing = False
@@ -971,6 +1008,7 @@ class _TaskWorkerPool:
         worker = _SingleSubprocessExecutor(
             self.payload,
             worker_env=_worker_env_for_pool_index(self.payload, worker_idx, self.pool_size),
+            session_config=self.session_config,
         )
         return _PooledTaskWorker(worker)
 
@@ -1061,14 +1099,20 @@ class _GlobalSubprocessTaskRuntime:
         self.total_workers = 0
         self.closed = False
 
-    def acquire_pool(self, payload: dict[str, Any], pool_size: int) -> _TaskWorkerPool:
-        key = _payload_task_key(payload)
+    def acquire_pool(
+        self,
+        payload: dict[str, Any],
+        pool_size: int,
+        *,
+        session_config: Mapping[str, Any] | None = None,
+    ) -> _TaskWorkerPool:
+        key = _payload_task_key(payload, session_config)
         with self.cond:
             if self.closed:
                 raise RuntimeError("global subprocess task runtime is closed")
             pool = self.pools.get(key)
             if pool is None:
-                pool = _TaskWorkerPool(self, key, payload, pool_size)
+                pool = _TaskWorkerPool(self, key, payload, pool_size, session_config)
                 self.pools[key] = pool
             pool.acquire_ref()
             return pool
@@ -1205,8 +1249,18 @@ atexit.register(_shutdown_global_task_runtime)
 class LocalSubprocessActorPool:
     """Shared subprocess actor pool for one local UDF node."""
 
-    def __init__(self, payload: dict[str, Any], pool_size: int, *, name: str | None = None) -> None:
+    def __init__(
+        self,
+        payload: dict[str, Any],
+        pool_size: int,
+        *,
+        name: str | None = None,
+        session_config: Mapping[str, Any] | None = None,
+    ) -> None:
         self.payload = dict(payload)
+        self.session_config = (
+            None if session_config is None else {str(key): str(value) for key, value in session_config.items()}
+        )
         self.pool_size = max(1, int(pool_size))
         self.name = str(name or "")
         self._closed = False
@@ -1226,6 +1280,7 @@ class LocalSubprocessActorPool:
                     _SingleSubprocessExecutor(
                         self.payload,
                         worker_env=_worker_env_for_pool_index(self.payload, worker_idx, self.pool_size),
+                        session_config=self.session_config,
                     )
                 )
             self._executor = ThreadPoolExecutor(
@@ -1459,12 +1514,29 @@ def ensure_local_subprocess_actor_pools_for_nodes(
             _validate_stateful_local_actor_contract(raw_payload, pool_size)
             if float(raw_payload.get("gpus") or 0.0) > 0.0:
                 raise ValueError("GPU resources require a Ray UDF backend")
+            executor_options = dict(node.get("executor_options") or {})
+            session_config = _normalize_session_config_option(executor_options)
+            existing_pool = executor_options.get("local_actor_pool")
+            if existing_pool is not None:
+                existing_pool_size = _validate_local_actor_pool_contract(existing_pool)
+                if existing_pool_size != pool_size:
+                    raise ValueError(
+                        "pre-created local_actor_pool size does not match the UDF actor_number: "
+                        f"pool_size={existing_pool_size} actor_number={pool_size}"
+                    )
+                existing_session_config = getattr(existing_pool, "session_config", None)
+                if existing_session_config != session_config:
+                    raise ValueError("pre-created local_actor_pool belongs to a different Vane session")
+                actor_options_map[node_id] = executor_options
+                continue
             pool_name = f"local-subprocess-actor-{identity}-{node_id}"
-            pool = LocalSubprocessActorPool(raw_payload, pool_size, name=pool_name)
+            pool_kwargs: dict[str, Any] = {"name": pool_name}
+            if session_config is not None:
+                pool_kwargs["session_config"] = session_config
+            pool = LocalSubprocessActorPool(raw_payload, pool_size, **pool_kwargs)
             created.append(pool)
-            actor_options_map[node_id] = {
-                "local_actor_pool": pool,
-            }
+            executor_options["local_actor_pool"] = pool
+            actor_options_map[node_id] = executor_options
 
         if actor_options_map and set_handles is not None:
             set_handles(actor_options_map)
@@ -1488,6 +1560,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
 
     def __init__(self, payload: dict[str, Any], options: dict[str, Any] | None = None) -> None:
         options = dict(options or {})
+        session_config = _normalize_session_config_option(options)
         self._subprocess_mode = _payload_subprocess_mode(payload)
         self._pool_size = _payload_subprocess_pool_size(payload, self._subprocess_mode)
         if payload.get("stateful"):
@@ -1538,7 +1611,11 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
 
             if self._subprocess_mode == "task":
                 self._task_runtime = _global_task_runtime()
-                self._task_pool = self._task_runtime.acquire_pool(payload, self._pool_size)
+                self._task_pool = self._task_runtime.acquire_pool(
+                    payload,
+                    self._pool_size,
+                    session_config=session_config,
+                )
                 self._initialize_admission(self._task_pool.create_admission_authority())
                 with self._task_runtime.cond:
                     task_pool_ref_count = self._task_pool.ref_count
@@ -1561,6 +1638,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 )
             actor_pool_size = _validate_local_actor_pool_contract(actor_pool)
             _validate_stateful_local_actor_contract(payload, actor_pool_size)
+            if getattr(actor_pool, "session_config", None) != session_config:
+                raise ValueError("local_actor_pool belongs to a different Vane session")
             worker_pids = actor_pool.worker_pids()
             self._actor_pool = actor_pool
             self._pool_size = actor_pool_size

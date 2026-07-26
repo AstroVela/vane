@@ -414,8 +414,8 @@ void register_ray_bindings(py::module_ &mod) {
 	// Wraps a raw PhysicalPlan in a DistributedPhysicalPlan for unified execution.
 	m.def(
 	    "_create_physical_plan_from_capsule",
-	    [](py::capsule capsule, py::object query_id_obj, py::object udf_registrations_obj,
-	       py::object udf_actor_handles_obj, py::object connection_snapshot_obj) {
+	    [](py::capsule capsule, py::object query_id_obj, py::object resource_query_id_obj,
+	       py::object udf_registrations_obj, py::object udf_actor_handles_obj, py::object connection_snapshot_obj) {
 		    auto *plan_ptr = static_cast<std::shared_ptr<duckdb::PhysicalPlan> *>(capsule.get_pointer());
 		    if (!plan_ptr || !*plan_ptr) {
 			    return PyPhysicalPlanWrapper();
@@ -429,21 +429,31 @@ void register_ray_bindings(py::module_ &mod) {
 		    if (query_id.empty()) {
 			    throw duckdb::InternalException("_create_physical_plan_from_capsule requires a non-empty query_id");
 		    }
+		    if (resource_query_id_obj.is_none()) {
+			    throw duckdb::InternalException(
+			        "_create_physical_plan_from_capsule requires a non-empty resource_query_id");
+		    }
+		    auto resource_query_id = resource_query_id_obj.cast<string>();
+		    if (resource_query_id.empty()) {
+			    throw duckdb::InternalException(
+			        "_create_physical_plan_from_capsule requires a non-empty resource_query_id");
+		    }
 		    auto cfg = std::make_shared<duckdb::distributed::DuckDBExecutionConfig>(
 		        duckdb::distributed::DuckDBExecutionConfig::from_env());
 		    auto distributed_plan =
 		        std::make_shared<duckdb::distributed::DistributedPhysicalPlan>(idx, query_id, *plan_ptr, cfg);
-		    auto result = PyPhysicalPlanWrapper(distributed_plan);
+		    auto result = PyPhysicalPlanWrapper(distributed_plan, resource_query_id);
 		    result.query_id_ = query_id;
 		    result.udf_registrations_ = udf_registrations_obj;
 		    result.udf_actor_handles_ = udf_actor_handles_obj;
 		    result.connection_snapshot_ = connection_snapshot_obj;
-		    RememberQueryUDFRegistrations(result.query_id_, result.udf_registrations_);
-		    RememberQueryUDFActorHandles(result.query_id_, result.udf_actor_handles_);
+		    (void)VaneSessionIdFromSnapshot(result.connection_snapshot_);
+		    (void)VaneSessionConfigFromSnapshot(result.connection_snapshot_);
 		    return result;
 	    },
-	    py::arg("capsule"), py::arg("query_id") = py::none(), py::arg("udf_registrations") = py::none(),
-	    py::arg("udf_actor_handles") = py::none(), py::arg("connection_snapshot") = py::none(),
+	    py::arg("capsule"), py::arg("query_id") = py::none(), py::arg("resource_query_id") = py::none(),
+	    py::arg("udf_registrations") = py::none(), py::arg("udf_actor_handles") = py::none(),
+	    py::arg("connection_snapshot") = py::none(),
 	    "Internal helper to create PyPhysicalPlanWrapper from C++ capsule");
 
 	m.def(
@@ -457,6 +467,23 @@ void register_ray_bindings(py::module_ &mod) {
 	m.def(
 	    "_lookup_query_connection_snapshot",
 	    [](const string &query_id) { return LookupQueryConnectionSnapshot(query_id); }, py::arg("query_id"));
+
+	m.def(
+	    "_register_query_python_replay_state",
+	    [](const string &query_id, const PyPhysicalPlanWrapper &plan) {
+		    if (query_id.empty()) {
+			    throw duckdb::InternalException("Query Python replay registration requires a non-empty query_id");
+		    }
+		    // The resource query owns this lifecycle. A retried FTE task can carry a
+		    // physical plan created under a different source plan identifier.
+		    return RegisterQueryPythonReplayState(query_id, plan.udf_registrations_, plan.udf_actor_handles_,
+		                                          plan.connection_snapshot_);
+	    },
+	    py::arg("query_id"), py::arg("plan"));
+
+	m.def(
+	    "_cleanup_query_python_replay_state", [](const string &query_id) { CleanupQueryPythonReplayState(query_id); },
+	    py::arg("query_id"));
 
 	m.def(
 	    "begin_flight_shuffle_query_execution",
@@ -561,6 +588,10 @@ void register_ray_bindings(py::module_ &mod) {
 
 	py::class_<PyPhysicalPlanWrapper>(m, "DistributedPhysicalPlan")
 	    .def("idx", &PyPhysicalPlanWrapper::idx)
+	    .def("resource_query_id", &PyPhysicalPlanWrapper::resource_query_id)
+	    .def("session_id", &PyPhysicalPlanWrapper::session_id)
+	    .def("session_config", &PyPhysicalPlanWrapper::session_config)
+	    .def("has_explicit_s3_credentials", &PyPhysicalPlanWrapper::has_explicit_s3_credentials)
 	    .def("has_root", &PyPhysicalPlanWrapper::has_root)
 	    .def("clone", &PyPhysicalPlanWrapper::clone, py::arg("conn") = py::none())
 	    .def("num_partitions", &PyPhysicalPlanWrapper::num_partitions)
@@ -583,20 +614,20 @@ void register_ray_bindings(py::module_ &mod) {
 		        // or deferred root must always carry a non-empty payload.
 		        if (!p.has_root()) {
 			        if (!p.serialized_root_.empty()) {
-				        return py::make_tuple(true, py::bytes(p.serialized_root_), p.query_id_, p.udf_registrations_,
-				                              p.udf_actor_handles_, p.connection_snapshot_);
+				        return py::make_tuple(true, py::bytes(p.serialized_root_), p.query_id_, p.resource_query_id_,
+				                              p.udf_registrations_, p.udf_actor_handles_, p.connection_snapshot_);
 			        }
-			        return py::make_tuple(false, py::bytes(""), p.query_id_, p.udf_registrations_, p.udf_actor_handles_,
-			                              p.connection_snapshot_);
+			        return py::make_tuple(false, py::bytes(""), p.query_id_, p.resource_query_id_, p.udf_registrations_,
+			                              p.udf_actor_handles_, p.connection_snapshot_);
 		        }
 
 		        auto serialized_root = p.serialize_root_for_clone();
-		        return py::make_tuple(true, py::bytes(serialized_root), p.query_id_, p.udf_registrations_,
-		                              p.udf_actor_handles_, p.connection_snapshot_);
+		        return py::make_tuple(true, py::bytes(serialized_root), p.query_id_, p.resource_query_id_,
+		                              p.udf_registrations_, p.udf_actor_handles_, p.connection_snapshot_);
 	        },
 	        // __setstate__: store deferred bytes for later deserialization
 	        [](py::tuple t) {
-		        if (t.size() < 2 || t.size() > 6) {
+		        if (t.size() != 7) {
 			        throw duckdb::InternalException("Invalid state for PyPhysicalPlanWrapper pickle");
 		        }
 		        bool has_data = t[0].cast<bool>();
@@ -610,25 +641,21 @@ void register_ray_bindings(py::module_ &mod) {
 			        throw duckdb::InternalException(
 			            "Invalid PyPhysicalPlanWrapper pickle: absent root carries serialized data");
 		        }
-		        string query_id;
-		        if (t.size() >= 3) {
-			        query_id = t[2].cast<string>();
-		        }
+		        string query_id = t[2].cast<string>();
 
 		        PyPhysicalPlanWrapper result;
 		        result.query_id_ = std::move(query_id);
-		        if (t.size() >= 4) {
-			        result.udf_registrations_ = t[3];
+		        result.resource_query_id_ = t[3].cast<string>();
+		        if (result.resource_query_id_.empty()) {
+			        throw duckdb::InternalException(
+			            "Invalid PyPhysicalPlanWrapper pickle: resource_query_id must not be empty");
 		        }
-		        if (t.size() >= 5) {
-			        result.udf_actor_handles_ = t[4];
-		        }
-		        if (t.size() >= 6) {
-			        result.connection_snapshot_ = t[5];
-		        }
+		        result.udf_registrations_ = t[4];
+		        result.udf_actor_handles_ = t[5];
+		        result.connection_snapshot_ = t[6];
+		        (void)VaneSessionIdFromSnapshot(result.connection_snapshot_);
+		        (void)VaneSessionConfigFromSnapshot(result.connection_snapshot_);
 		        result.ensure_plan_identity();
-		        RememberQueryUDFRegistrations(result.query_id_, result.udf_registrations_);
-		        RememberQueryUDFActorHandles(result.query_id_, result.udf_actor_handles_);
 
 		        if (has_data) {
 			        result.serialized_root_ = std::move(data_str);
@@ -673,6 +700,29 @@ void register_ray_bindings(py::module_ &mod) {
 	    },
 	    py::arg("has_plan") = false, py::arg("query_id") = py::none(),
 	    "Create a worker task with explicit plan/query-id presence for native tests.");
+
+	m.def(
+	    "_make_worker_task_from_plan_for_test",
+	    [](const PyPhysicalPlanWrapper &plan, const string &execution_query_id, const string &resource_query_id) {
+		    if (!plan.plan_ || !plan.plan_->physical_plan() || !plan.plan_->physical_plan()->HasRoot()) {
+			    throw duckdb::InternalException("test worker task requires a physical plan with a root");
+		    }
+		    if (execution_query_id.empty() || resource_query_id.empty()) {
+			    throw duckdb::InternalException(
+			        "test worker task requires non-empty execution_query_id and resource_query_id");
+		    }
+		    auto config = std::make_shared<duckdb::distributed::DuckDBExecutionConfig>(
+		        duckdb::distributed::DuckDBExecutionConfig::from_env());
+		    std::unordered_map<string, string> context {
+		        {"query_id", execution_query_id},
+		        {"resource_query_id", resource_query_id},
+		    };
+		    duckdb::distributed::WorkerTask task(duckdb::distributed::TaskContext(), plan.plan_->physical_plan(),
+		                                         std::move(config), std::move(context), "WorkerTaskFromPlanForTest");
+		    return RayWorkerTask(std::move(task));
+	    },
+	    py::arg("plan"), py::arg("execution_query_id"), py::arg("resource_query_id"),
+	    "Create a worker task from a physical plan with distinct execution and resource query IDs.");
 
 	m.def(
 	    "_submission_error_owner_query_id_for_test",
@@ -722,7 +772,11 @@ void register_ray_bindings(py::module_ &mod) {
 		                }
 	                })
 	    .def("idx", &PyLogicalPlan::idx)
-	    .def("to_physical_plan", &PyLogicalPlan::to_physical_plan, py::arg("conn") = py::none())
+	    .def("session_id", &PyLogicalPlan::session_id)
+	    .def("session_config", &PyLogicalPlan::session_config)
+	    .def("has_explicit_s3_credentials", &PyLogicalPlan::has_explicit_s3_credentials)
+	    .def("to_physical_plan", &PyLogicalPlan::to_physical_plan, py::arg("conn") = py::none(),
+	         py::arg("effective_session_config") = py::none())
 	    .def(py::pickle(
 	        [](const PyLogicalPlan &p) {
 		        if (p.serialized_logical_plan_.empty()) {
@@ -737,7 +791,7 @@ void register_ray_bindings(py::module_ &mod) {
 		                              p.connection_snapshot_);
 	        },
 	        [](py::tuple t) {
-		        if (t.size() < 2 || t.size() > 4)
+		        if (t.size() != 4)
 			        throw duckdb::InternalException("Invalid state for PyLogicalPlan");
 		        string query_id = py::cast<string>(t[0]);
 		        py::bytes serialized_bytes = py::cast<py::bytes>(t[1]);
@@ -748,12 +802,10 @@ void register_ray_bindings(py::module_ &mod) {
 		        PyLogicalPlan plan;
 		        plan.query_id_ = std::move(query_id);
 		        plan.serialized_logical_plan_ = std::move(serialized_plan);
-		        if (t.size() >= 3) {
-			        plan.udf_registrations_ = t[2];
-		        }
-		        if (t.size() >= 4) {
-			        plan.connection_snapshot_ = t[3];
-		        }
+		        plan.udf_registrations_ = t[2];
+		        plan.connection_snapshot_ = t[3];
+		        (void)VaneSessionIdFromSnapshot(plan.connection_snapshot_);
+		        (void)VaneSessionConfigFromSnapshot(plan.connection_snapshot_);
 		        return plan;
 	        }));
 
@@ -915,6 +967,7 @@ void register_ray_bindings(py::module_ &mod) {
 	        },
 	        py::arg("file_infos"), py::arg("copy_spec"), py::arg("staging_root"), py::arg("conn") = py::none())
 	    .def("drop_query_fragments", &PyPhysicalPlanWrapperRunner::drop_query_fragments, py::arg("query_id"))
+	    .def("close_session", &PyPhysicalPlanWrapperRunner::close_session, py::arg("session_id"))
 	    .def("warm_up", &PyPhysicalPlanWrapperRunner::warm_up)
 	    .def("shutdown",
 	         [](PyPhysicalPlanWrapperRunner &self) {
@@ -932,7 +985,8 @@ void register_ray_bindings(py::module_ &mod) {
 	           py::object exchange_source_task_obj, py::object copy_output_info_obj,
 	           py::object exchange_sink_instance_obj, py::object fte_scan_source_queues_obj,
 	           py::object fte_exchange_source_queues_obj, py::object dynamic_filter_domains_obj,
-	           py::object native_progress_callback_obj, py::object runtime_context_obj) {
+	           py::object native_progress_callback_obj, py::object runtime_context_obj,
+	           py::object effective_session_config_obj) {
 		        string plan_type_name = py::str(py::type::of(plan_obj).attr("__name__")).cast<string>();
 		        std::unordered_map<idx_t, duckdb::distributed::ScanTaskDescriptor> scan_task_map;
 		        bool has_scan_task_map = false;
@@ -1161,12 +1215,14 @@ void register_ray_bindings(py::module_ &mod) {
 			        auto &plan = plan_obj.cast<PyPhysicalPlanWrapper &>();
 			        PyPhysicalPlanWrapper *exec_plan = &plan;
 			        PyPhysicalPlanWrapper deferred_exec_plan;
-			        auto cleanup = [&]() {
-				        CleanupQueryPythonReplayState(exec_plan->idx());
-			        };
 
 			        try {
 				        py::object exec_conn = ResolveConnectionForSnapshot(conn_obj, plan.connection_snapshot_);
+				        // Install refreshed session credentials as a baseline
+				        // before replaying explicit source-connection settings.
+				        ApplyEffectiveVaneSessionConfig(ExtractPyConnectionWrapper(exec_conn).con.GetConnection(),
+				                                        effective_session_config_obj);
+				        const bool apply_snapshot_session_config = effective_session_config_obj.is_none();
 				        // Handle deferred deserialization (from pickle round-trip)
 				        if (!plan.has_root() && !plan.serialized_root_.empty()) {
 					        // Materialize into a temporary wrapper so any physical-plan
@@ -1176,12 +1232,13 @@ void register_ray_bindings(py::module_ &mod) {
 					        // holding an executed plan whose destructor runs after the
 					        // cursor is closed, causing use-after-free crashes.
 					        deferred_exec_plan.query_id_ = plan.query_id_;
+					        deferred_exec_plan.resource_query_id_ = plan.resource_query_id_;
 					        deferred_exec_plan.udf_registrations_ = plan.udf_registrations_;
 					        deferred_exec_plan.udf_actor_handles_ = plan.udf_actor_handles_;
 					        deferred_exec_plan.connection_snapshot_ = plan.connection_snapshot_;
 					        deferred_exec_plan.serialized_root_ = plan.serialized_root_;
 					        deferred_exec_plan.worker_connection_ = exec_conn;
-					        deferred_exec_plan.materialize_deferred_root(exec_conn);
+					        deferred_exec_plan.materialize_deferred_root(exec_conn, apply_snapshot_session_config);
 					        exec_plan = &deferred_exec_plan;
 				        }
 
@@ -1189,17 +1246,15 @@ void register_ray_bindings(py::module_ &mod) {
 					        throw py::value_error("PyPhysicalPlanWrapper has no root after deserialization");
 				        }
 				        exec_plan->worker_connection_ = exec_conn;
-				        exec_plan->ensure_connection_snapshot(exec_conn);
+				        exec_plan->ensure_connection_snapshot(exec_conn, apply_snapshot_session_config);
 				        exec_plan->apply_udf_actor_handles();
 				        auto result = self.execute_native_impl(
-				            exec_conn, exec_plan->plan_->physical_plan(), plan.idx(), scan_task_map_ptr,
-				            exchange_source_task_map_ptr, exchange_sink_instance_task_ptr,
+				            exec_conn, exec_plan->plan_->physical_plan(), plan.idx(), plan.resource_query_id_,
+				            scan_task_map_ptr, exchange_source_task_map_ptr, exchange_sink_instance_task_ptr,
 				            fte_scan_source_queue_map_ptr, fte_exchange_source_queue_map_ptr, copy_output_info_ptr,
 				            dynamic_filter_domains_obj, native_progress_callback_obj, runtime_context_obj);
-				        cleanup();
 				        return result;
 			        } catch (...) {
-				        cleanup();
 				        throw;
 			        }
 		        }
@@ -1213,7 +1268,7 @@ void register_ray_bindings(py::module_ &mod) {
 	        py::arg("exchange_sink_instance") = py::none(), py::arg("fte_scan_source_queues") = py::none(),
 	        py::arg("fte_exchange_source_queues") = py::none(), py::arg("dynamic_filter_domains") = py::none(),
 	        py::arg("native_progress_callback") = py::none(), py::arg("runtime_context") = py::none(),
-	        "Execute physical plan using DuckDB's native Executor");
+	        py::arg("effective_session_config") = py::none(), "Execute physical plan using DuckDB's native Executor");
 
 	// Merge multiple raw-bytes ScanTaskDescriptors into one.
 	// Each descriptor may contain multiple files; the merged result is a single

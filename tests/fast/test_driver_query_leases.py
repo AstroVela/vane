@@ -1313,13 +1313,209 @@ def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="injected owner-loop open failure"):
-        asyncio.run(runner_cls._register_query_resources(runner, plan))
+        asyncio.run(
+            runner_cls._register_query_resources(
+                runner,
+                plan,
+                query_connection=object(),
+            )
+        )
 
     with pytest.raises(KeyError):
         get_query_resource_manager(query_id)
     assert released == [(query_id, allocation.generation)]
     assert runner._query_graphs == {}
     assert runner._query_allocations == {}
+
+
+def test_query_registration_retains_failed_coordinator_release_for_retry(monkeypatch):
+    import duckdb.runners.ray.query_graph_builder as graph_builder
+    from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
+
+    query_id = "query-registration-release-retry"
+    graph = _graph(query_id)
+    allocation = _allocation()
+
+    class _Coordinator:
+        def __init__(self):
+            self.release_calls = 0
+
+        def update_node_capacities(self, _capacities):
+            return None
+
+        def register_query(self, _demand):
+            return allocation
+
+        def release_query(self, released_query_id, generation):
+            assert released_query_id == query_id
+            assert generation == allocation.generation
+            self.release_calls += 1
+            if self.release_calls == 1:
+                raise RuntimeError("planned coordinator release failure")
+            return True
+
+    monkeypatch.setattr(graph_builder, "build_query_execution_graph", lambda _metadata: graph)
+    monkeypatch.setattr(graph_builder, "build_query_demand", lambda _graph, _capacity: "demand")
+
+    from duckdb.runners.ray.driver import RayQueryDriverActor
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    runner = object.__new__(runner_cls)
+    runner._query_resource_lock = threading.RLock()
+    runner._query_graphs = {}
+    runner._query_allocations = {}
+    runner._query_resource_coordinator = _Coordinator()
+    capacity = ResourceVector(cpu=1, heap_bytes=101, object_store_bytes=20)
+    runner._read_query_node_capacities = lambda: (SimpleNamespace(resources=capacity),)
+    runner._synchronize_query_allocations = lambda: ()
+    runner._open_query_resource_admission = lambda _query_id: (_ for _ in ()).throw(
+        RuntimeError("planned registration failure")
+    )
+    runner._fence_query_resource_admission_for_teardown = lambda _query_id: None
+    plan = SimpleNamespace(
+        collect_execution_stages=lambda conn: object(),
+        idx=lambda: query_id,
+    )
+
+    with pytest.raises(RuntimeError, match="planned coordinator release failure"):
+        asyncio.run(
+            runner_cls._register_query_resources(
+                runner,
+                plan,
+                query_connection=object(),
+            )
+        )
+
+    assert runner._query_graphs == {query_id: graph}
+    assert runner._query_allocations == {query_id: allocation}
+    assert get_query_resource_manager(query_id) is not None
+
+    runner_cls._release_query_resources(
+        runner,
+        query_id,
+        reason="registration_cleanup_retry",
+    )
+
+    assert runner._query_resource_coordinator.release_calls == 2
+    assert runner._query_graphs == {}
+    assert runner._query_allocations == {}
+    with pytest.raises(KeyError):
+        get_query_resource_manager(query_id)
+
+
+def test_query_resource_registry_retains_manager_when_cancel_raises():
+    from duckdb.runners.ray import query_resource_runtime as runtime
+
+    query_id = "query-manager-cancel-retry"
+
+    class _Manager:
+        def __init__(self):
+            self.cancel_calls = 0
+
+        def cancel(self, _reason):
+            self.cancel_calls += 1
+            if self.cancel_calls == 1:
+                raise RuntimeError("planned manager cancel failure")
+            return {
+                "task_lease_count": 0,
+                "output_lease_count": 0,
+            }
+
+    manager = _Manager()
+    with runtime._LOCK:
+        runtime._MANAGERS[query_id] = manager
+    try:
+        with pytest.raises(RuntimeError, match="planned manager cancel failure"):
+            runtime.release_query_resource_manager(
+                query_id,
+                reason="first_attempt",
+            )
+
+        with runtime._LOCK:
+            assert runtime._MANAGERS[query_id] is manager
+
+        assert runtime.release_query_resource_manager(
+            query_id,
+            reason="retry",
+        ) == {
+            "released": True,
+            "task_lease_count": 0,
+            "output_lease_count": 0,
+        }
+        with runtime._LOCK:
+            assert query_id not in runtime._MANAGERS
+    finally:
+        with runtime._LOCK:
+            runtime._MANAGERS.pop(query_id, None)
+
+
+def test_query_teardown_retries_manager_after_coordinator_release():
+    from duckdb.runners.ray import query_resource_runtime as runtime
+
+    query_id = "query-manager-teardown-retry"
+    graph = _graph(query_id)
+    allocation = _allocation()
+
+    class _Manager:
+        def __init__(self):
+            self.cancel_calls = 0
+
+        def cancel(self, _reason):
+            self.cancel_calls += 1
+            if self.cancel_calls == 1:
+                raise RuntimeError("planned manager cancel failure")
+            return {
+                "task_lease_count": 0,
+                "output_lease_count": 0,
+            }
+
+    class _Coordinator:
+        def __init__(self):
+            self.release_calls = []
+
+        def release_query(self, released_query_id, generation):
+            self.release_calls.append((released_query_id, generation))
+            return True
+
+        def snapshot(self):
+            return {"queries": {}}
+
+    manager = _Manager()
+    runner_cls, runner = _runner(None)
+    coordinator = _Coordinator()
+    runner._query_resource_lock = threading.RLock()
+    runner._query_resource_coordinator = coordinator
+    runner._query_graphs = {query_id: graph}
+    runner._query_allocations = {query_id: allocation}
+    runner._fence_query_resource_admission_for_teardown = lambda _query_id: None
+    with runtime._LOCK:
+        runtime._MANAGERS[query_id] = manager
+    try:
+        with pytest.raises(RuntimeError, match="planned manager cancel failure"):
+            runner_cls._release_query_resources(
+                runner,
+                query_id,
+                reason="first_attempt",
+            )
+
+        assert coordinator.release_calls == [(query_id, allocation.generation)]
+        assert runner._query_graphs == {}
+        assert runner._query_allocations == {}
+        with runtime._LOCK:
+            assert runtime._MANAGERS[query_id] is manager
+
+        runner_cls._release_query_resources(
+            runner,
+            query_id,
+            reason="retry",
+        )
+
+        assert coordinator.release_calls == [(query_id, allocation.generation)]
+        with runtime._LOCK:
+            assert query_id not in runtime._MANAGERS
+    finally:
+        with runtime._LOCK:
+            runtime._MANAGERS.pop(query_id, None)
 
 
 def test_background_query_teardown_fences_new_admission_before_table_purge():

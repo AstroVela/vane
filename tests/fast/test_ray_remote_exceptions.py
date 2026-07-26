@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import pickle
+import threading
 from typing import Any
 
 import pytest
@@ -296,8 +297,13 @@ def test_ray_driver_client_restores_preflight_stream_and_copy_causes(ray_local, 
         def idx(self) -> str:
             return "remote-error-plan"
 
+        def session_id(self) -> str:
+            return "remote-error-session"
+
+        def session_config(self) -> dict[str, str]:
+            return {}
+
     class Runner:
-        install_env_overrides = SuccessMethod()
         close_plan = SuccessMethod()
         progress_snapshot = SuccessMethod()
 
@@ -311,6 +317,16 @@ def test_ray_driver_client_restores_preflight_stream_and_copy_causes(ray_local, 
 
     for failure_path in ("preflight", "stream", "copy"):
         client = object.__new__(driver.RayQueryDriverClient)
+        client._owner_id = "remote-error-owner"
+        client._opened_sessions = {"remote-error-session": {}}
+        client._uncertain_sessions = {}
+        client._opening_session_ids = set()
+        client._closing_session_ids = set()
+        client._closed_session_ids = driver.BoundedReplayMap(capacity=65_536)
+        client._session_closes_in_progress = set()
+        client._session_condition = threading.Condition()
+        client._client_closing = False
+        client._client_close_in_progress = False
         client.runner = Runner(failure_path)
         with pytest.raises(RuntimeError) as exc_info:
             if failure_path == "copy":

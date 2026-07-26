@@ -7,7 +7,7 @@ import os
 import threading
 import uuid
 from collections.abc import Callable
-from typing import Any
+from typing import Any, TypeAlias
 
 from duckdb.execution.udf_admission import (
     AdmissionExecutorMixin,
@@ -55,18 +55,20 @@ def ray_udf_task_resource_spec(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-TaskAdmission = AdmissionLease
+TaskAdmission: TypeAlias = AdmissionLease
 
 
 class TaskAdmissionController:
     """One-lookahead, non-blocking query task-lease admission."""
 
-    def __init__(self, payload: dict[str, Any], *, driver: Any | None = None) -> None:
+    def __init__(self, payload: dict[str, Any], *, driver: Any) -> None:
         self._payload = dict(payload)
         self._query_id = str(self._payload.get("query_id") or "").strip()
         self._stage_id = str(self._payload.get("stage_id") or "").strip()
         if not self._query_id or not self._stage_id:
             raise ValueError("distributed Ray UDF task admission requires query_id and stage_id")
+        if driver is None:
+            raise ValueError("distributed Ray UDF task admission requires an explicit query driver handle")
         self._resources = ray_udf_task_resource_spec(self._payload)
         self._driver = driver
         self._executor_id = uuid.uuid4().hex
@@ -80,20 +82,7 @@ class TaskAdmissionController:
         self._error: BaseException | None = None
         self._wakeup: Callable[[], None] | None = None
 
-    def _driver_actor(self):
-        if self._driver is not None:
-            return self._driver
-        import ray
-
-        from duckdb.runners.ray.driver import (
-            RAY_QUERY_DRIVER_ACTOR_NAME,
-            RAY_QUERY_DRIVER_ACTOR_NAMESPACE,
-        )
-
-        self._driver = ray.get_actor(
-            RAY_QUERY_DRIVER_ACTOR_NAME,
-            namespace=RAY_QUERY_DRIVER_ACTOR_NAMESPACE,
-        )
+    def _driver_actor(self) -> Any:
         return self._driver
 
     def register_wakeup(self, callback: Callable[[], None]) -> None:
@@ -256,7 +245,7 @@ class TaskAdmissionExecutorMixin(AdmissionExecutorMixin):
         self,
         payload: dict[str, Any],
         *,
-        driver: Any | None = None,
+        driver: Any,
     ) -> None:
         authority = TaskAdmissionController(payload, driver=driver)
         self._task_admission = authority

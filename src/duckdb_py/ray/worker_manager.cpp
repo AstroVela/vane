@@ -54,12 +54,15 @@ void RayWorkerManager::EndOperation() const {
 std::string
 duckdb::distributed::python::ray::SubmissionErrorOwnerQueryId(const std::vector<duckdb::distributed::WorkerTask> &tasks,
                                                               const std::string &execution_query_id) {
+	if (tasks.empty()) {
+		return execution_query_id;
+	}
 	std::string resource_query_id;
 	for (const auto &task : tasks) {
 		const auto &context = task.context();
 		auto it = context.find("resource_query_id");
 		if (it == context.end() || it->second.empty()) {
-			continue;
+			throw std::runtime_error("FTE submit task requires a non-empty resource_query_id");
 		}
 		if (resource_query_id.empty()) {
 			resource_query_id = it->second;
@@ -69,7 +72,7 @@ duckdb::distributed::python::ray::SubmissionErrorOwnerQueryId(const std::vector<
 			throw std::runtime_error("FTE submit batch contains multiple resource_query_id values");
 		}
 	}
-	return resource_query_id.empty() ? execution_query_id : resource_query_id;
+	return resource_query_id;
 }
 
 std::string RayWorkerManager::QueryIdFromTaskEvents(const std::vector<duckdb::distributed::WorkerTask> &tasks) {
@@ -583,9 +586,10 @@ DuckDBResult<void> RayWorkerManager::shutdown() {
 		std::unique_lock<mutex> guard(mutex_);
 		if (state_.shutdown_started) {
 			shutdown_cv_.wait(guard, [&]() { return state_.shutdown_finished; });
-			if (!state_.shutdown_error.empty()) {
-				return DuckDBResult<void>::err(DuckDBError::external_error(state_.shutdown_error));
-			}
+			// The caller that performed shutdown already received the aggregated
+			// error. Every worker was either finished or force-terminated and all
+			// manager-owned state was released, so a retry observes the completed
+			// terminal state instead of replaying an unrecoverable error forever.
 			return DuckDBResult<void>::ok();
 		}
 		state_.shutdown_started = true;
@@ -654,12 +658,49 @@ DuckDBResult<void> RayWorkerManager::shutdown() {
 	}
 	{
 		lock_guard<mutex> guard(mutex_);
-		state_.shutdown_error = error_message;
 		state_.shutdown_finished = true;
 	}
 	shutdown_cv_.notify_all();
 	if (!error_message.empty()) {
 		return DuckDBResult<void>::err(DuckDBError::external_error(std::move(error_message)));
+	}
+	return DuckDBResult<void>::ok();
+}
+
+DuckDBResult<void> RayWorkerManager::close_session(const string &session_id) {
+	if (session_id.empty()) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("Ray worker session_id is empty"));
+	}
+	OperationGuard operation(*this);
+	if (!operation) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("Ray worker manager is shut down"));
+	}
+	std::vector<std::shared_ptr<RayWorkerRuntime>> workers;
+	{
+		lock_guard<mutex> guard(mutex_);
+		workers.reserve(state_.ray_workers.size());
+		for (auto &entry : state_.ray_workers) {
+			workers.push_back(entry.second);
+		}
+	}
+	std::vector<std::string> errors;
+	for (auto &worker : workers) {
+		const auto worker_id = worker->Id() ? *worker->Id() : std::string("<unknown>");
+		try {
+			worker->CloseSession(session_id);
+		} catch (const std::exception &ex) {
+			errors.push_back(worker_id + ": " + ex.what());
+		} catch (...) {
+			errors.push_back(worker_id + ": unknown close-session error");
+		}
+	}
+	if (!errors.empty()) {
+		std::string message =
+		    "Failed to close Ray worker session " + session_id + " with " + std::to_string(errors.size()) + " error(s)";
+		for (const auto &error : errors) {
+			message += "; " + error;
+		}
+		return DuckDBResult<void>::err(DuckDBError::external_error(std::move(message)));
 	}
 	return DuckDBResult<void>::ok();
 }

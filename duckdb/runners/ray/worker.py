@@ -5,11 +5,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import math
 import os
+import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, NamedTuple, cast
 
 import ray
@@ -30,7 +33,54 @@ from duckdb.runners.fte import (
 from duckdb.runners.fte.debug_memory import describe_result_payload, log_debug, process_memory_snapshot
 from duckdb.runners.fte.fte_config import FteWorkerAdmissionConfig
 from duckdb.runners.fte.memory_config import apply_duckdb_memory_limit
+from duckdb.runners.ray.admission_ledger import BoundedReplayMap
 from duckdb.runners.ray.fte_scheduler_config import _fte_control_rpc_timeout_s
+from duckdb.runners.ray.ray_env import build_explicit_session_process_env, scrub_shared_runtime_session_env
+
+_SESSION_CLOSE_REPLAY_CAPACITY = 65_536
+_AWS_CREDENTIAL_RESOLVER_TIMEOUT_S = 120
+_AWS_CREDENTIAL_REFRESH_AT_KEY = "__vane_aws_credential_refresh_at_epoch_s"
+_AWS_CREDENTIAL_PROVIDER_KEYS = (
+    "AWS_CONFIG_FILE",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_PROFILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+)
+_DUCKDB_S3_SESSION_KEYS = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_DEFAULT_REGION",
+    "AWS_ENDPOINT_URL",
+    "AWS_REGION",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+)
+
+
+async def _to_thread_with_owned_side_effects(
+    callback: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Do not expose cancellation until a thread-owned mutation has finished."""
+    thread_task = asyncio.create_task(asyncio.to_thread(callback, *args, **kwargs))
+    cancellation: asyncio.CancelledError | None = None
+    while not thread_task.done():
+        try:
+            await asyncio.shield(thread_task)
+        except asyncio.CancelledError as error:
+            cancellation = error
+    result = thread_task.result()
+    if cancellation is not None:
+        raise cancellation
+    return result
 
 
 def _fte_applied_control_status(
@@ -89,6 +139,32 @@ def _clear_datasource_factory_registry() -> None:
     import _duckdb
 
     _duckdb._clear_datasource_factory_registry()
+
+
+def _register_query_python_replay_state(query_id: str, plan: Any) -> bool:
+    register = require_ray_cxx_attr(
+        "_register_query_python_replay_state",
+        hint="Ensure the C++ ray extension is built with query replay lifecycle support.",
+    )
+    return bool(register(str(query_id), plan))
+
+
+def _plan_resource_query_id(plan: Any) -> str:
+    resource_query_id = getattr(plan, "resource_query_id", None)
+    if not callable(resource_query_id):
+        raise TypeError("distributed physical plan is missing resource_query_id()")
+    query_id = str(resource_query_id()).strip()
+    if not query_id:
+        raise ValueError("distributed physical plan resource_query_id must not be empty")
+    return query_id
+
+
+def _cleanup_query_python_replay_state(query_id: str) -> None:
+    cleanup = require_ray_cxx_attr(
+        "_cleanup_query_python_replay_state",
+        hint="Ensure the C++ ray extension is built with query replay lifecycle support.",
+    )
+    cleanup(str(query_id))
 
 
 def _chaos_worker_loss_matches(task_id: FteTaskAttemptId) -> bool:
@@ -316,25 +392,144 @@ def _normalize_stats_for_ray(stats_payload: Any) -> list[int]:
     return []
 
 
-def _configure_duckdb_s3(conn: Any) -> None:
-    """Configure S3 settings on a DuckDB connection from AWS environment variables.
+def _resolve_session_aws_credentials(config: Mapping[str, str]) -> tuple[dict[str, str], float | None]:
+    """Resolve one session credential chain without mutating shared process state."""
+    environment = build_explicit_session_process_env(config)
+    environment["VANE_RUNNER"] = "local"
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "duckdb.runners.ray.aws_credentials"],
+            check=False,
+            capture_output=True,
+            env=environment,
+            text=True,
+            timeout=_AWS_CREDENTIAL_RESOLVER_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("DuckDB AWS session credential resolver timed out") from exc
+    if completed.returncode != 0:
+        raise RuntimeError(f"DuckDB AWS session credential resolver failed with exit code {completed.returncode}")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("DuckDB AWS session credential resolver returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("DuckDB AWS session credential resolver returned a non-mapping payload")
+    raw_credentials = payload.get("credentials")
+    if not isinstance(raw_credentials, dict):
+        raise RuntimeError("DuckDB AWS session credential resolver returned invalid credentials")
+    credentials = {
+        str(key): str(value)
+        for key, value in raw_credentials.items()
+        if str(key) in _DUCKDB_S3_SESSION_KEYS and value is not None
+    }
+    if not credentials.get("AWS_ACCESS_KEY_ID") or not credentials.get("AWS_SECRET_ACCESS_KEY"):
+        raise RuntimeError("DuckDB AWS session credential resolver returned incomplete credentials")
+    expiration_epoch_s = None
+    raw_expiration = payload.get("expiration_epoch_s")
+    if raw_expiration is not None:
+        try:
+            expiration_epoch_s = float(raw_expiration)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("DuckDB AWS session credential resolver returned an invalid expiration") from exc
+        if not math.isfinite(expiration_epoch_s):
+            raise RuntimeError("DuckDB AWS session credential resolver returned a non-finite expiration")
+    return credentials, expiration_epoch_s
 
-    Ray actors create bare ``duckdb.connect()`` instances that lack S3 endpoint
-    and credential settings.  The standard ``AWS_*`` env vars *are* propagated
-    to workers, but DuckDB does not automatically map ``AWS_ENDPOINT_URL`` to
-    its ``s3_endpoint`` setting, causing S3 reads to go to the real AWS instead
-    of a local MinIO / compatible store.
+
+def _effective_duckdb_s3_config(
+    config: Mapping[str, str],
+    *,
+    use_session_credentials: bool = True,
+) -> dict[str, str]:
+    normalized = {str(key): str(value) for key, value in config.items()}
+    effective = {key: normalized[key] for key in _DUCKDB_S3_SESSION_KEYS if normalized.get(key, "").strip()}
+    if not use_session_credentials:
+        return {
+            key: value
+            for key, value in effective.items()
+            if key not in {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"}
+        }
+    refresh_at = normalized.get(_AWS_CREDENTIAL_REFRESH_AT_KEY, "").strip()
+    if refresh_at:
+        effective[_AWS_CREDENTIAL_REFRESH_AT_KEY] = refresh_at
+    access_key = effective.get("AWS_ACCESS_KEY_ID")
+    secret_key = effective.get("AWS_SECRET_ACCESS_KEY")
+    session_token = effective.get("AWS_SESSION_TOKEN")
+    has_static_credentials = bool(access_key and secret_key)
+    if bool(access_key) != bool(secret_key) or (session_token and not has_static_credentials):
+        raise ValueError("AWS static session credentials must provide both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+    needs_credential_chain = any(normalized.get(key, "").strip() for key in _AWS_CREDENTIAL_PROVIDER_KEYS)
+    if not has_static_credentials and needs_credential_chain:
+        resolved, expiration_epoch_s = _resolve_session_aws_credentials(normalized)
+        resolved.update(effective)
+        effective = resolved
+        if expiration_epoch_s is not None:
+            resolved_at = time.time()
+            refresh_at_epoch_s = resolved_at + max(0.0, expiration_epoch_s - resolved_at) * 0.8
+            effective[_AWS_CREDENTIAL_REFRESH_AT_KEY] = repr(refresh_at_epoch_s)
+    return effective
+
+
+def _refresh_effective_duckdb_s3_config(
+    config: Mapping[str, str],
+    effective_config: Mapping[str, str],
+    *,
+    use_session_credentials: bool = True,
+) -> dict[str, str]:
+    normalized = {str(key): str(value) for key, value in config.items()}
+    if not use_session_credentials:
+        return _effective_duckdb_s3_config(
+            normalized,
+            use_session_credentials=False,
+        )
+    has_static_credentials = bool(
+        normalized.get("AWS_ACCESS_KEY_ID", "").strip() and normalized.get("AWS_SECRET_ACCESS_KEY", "").strip()
+    )
+    needs_credential_chain = any(normalized.get(key, "").strip() for key in _AWS_CREDENTIAL_PROVIDER_KEYS)
+    current = {str(key): str(value) for key, value in effective_config.items()}
+    if has_static_credentials or not needs_credential_chain:
+        return _effective_duckdb_s3_config(normalized)
+    refresh_at = current.get(_AWS_CREDENTIAL_REFRESH_AT_KEY)
+    if refresh_at is None:
+        if current.get("AWS_ACCESS_KEY_ID") and current.get("AWS_SECRET_ACCESS_KEY"):
+            return current
+        return _effective_duckdb_s3_config(normalized)
+    try:
+        refresh_at_epoch_s = float(refresh_at)
+    except ValueError:
+        return _effective_duckdb_s3_config(normalized)
+    if math.isfinite(refresh_at_epoch_s) and time.time() < refresh_at_epoch_s:
+        return current
+    return _effective_duckdb_s3_config(normalized)
+
+
+def _configure_duckdb_s3(
+    conn: Any,
+    config: Mapping[str, str],
+    *,
+    use_session_credentials: bool = True,
+) -> dict[str, str]:
+    """Configure one DuckDB context from explicit session AWS settings.
+
+    Shared driver/worker processes must not read session credentials from their
+    process environment. The caller owns the immutable connection-session
+    snapshot.
     """
     from urllib.parse import urlparse
 
-    endpoint_url = os.environ.get("AWS_ENDPOINT_URL", "").strip()
-    access_key = os.environ.get("AWS_ACCESS_KEY_ID", "").strip()
-    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip()
-    session_token = os.environ.get("AWS_SESSION_TOKEN", "").strip()
-    region = (os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "").strip()
+    effective_config = _effective_duckdb_s3_config(
+        config,
+        use_session_credentials=use_session_credentials,
+    )
+    endpoint_url = str(effective_config.get("AWS_ENDPOINT_URL", "")).strip()
+    access_key = str(effective_config.get("AWS_ACCESS_KEY_ID", "")).strip()
+    secret_key = str(effective_config.get("AWS_SECRET_ACCESS_KEY", "")).strip()
+    session_token = str(effective_config.get("AWS_SESSION_TOKEN", "")).strip()
+    region = str(effective_config.get("AWS_REGION") or effective_config.get("AWS_DEFAULT_REGION") or "").strip()
 
-    if not endpoint_url and not access_key:
-        return  # nothing to configure
+    if use_session_credentials and not any((endpoint_url, access_key, secret_key, session_token, region)):
+        return effective_config
 
     try:
         conn.execute("LOAD httpfs")
@@ -344,50 +539,41 @@ def _configure_duckdb_s3(conn: Any) -> None:
     def _q(s: str) -> str:
         return s.replace("'", "''")
 
-    # Use GLOBAL so cursors (which create new ClientContexts) inherit settings.
     if region:
-        conn.execute(f"SET GLOBAL s3_region='{_q(region)}'")
-    if access_key:
-        conn.execute(f"SET GLOBAL s3_access_key_id='{_q(access_key)}'")
-    if secret_key:
-        conn.execute(f"SET GLOBAL s3_secret_access_key='{_q(secret_key)}'")
-    if session_token:
-        conn.execute(f"SET GLOBAL s3_session_token='{_q(session_token)}'")
+        conn.execute(f"SET s3_region='{_q(region)}'")
+    if use_session_credentials:
+        if access_key:
+            conn.execute(f"SET s3_access_key_id='{_q(access_key)}'")
+        if secret_key:
+            conn.execute(f"SET s3_secret_access_key='{_q(secret_key)}'")
+    else:
+        conn.execute("SET s3_access_key_id=''")
+        conn.execute("SET s3_secret_access_key=''")
+    # Task cursors inherit settings from the long-lived session connection.
+    # Always overwrite the token so a refresh from temporary credentials to
+    # credentials without a token cannot retain the previous value.
+    conn.execute(f"SET s3_session_token='{_q(session_token)}'")
     if endpoint_url:
-        parsed = urlparse(endpoint_url)
+        parse_target = endpoint_url
+        if "://" not in parse_target and not parse_target.startswith("//"):
+            parse_target = f"//{parse_target}"
+        parsed = urlparse(parse_target)
         endpoint = parsed.netloc or parsed.path
         use_ssl = parsed.scheme == "https"
-        conn.execute(f"SET GLOBAL s3_endpoint='{_q(endpoint)}'")
-        conn.execute(f"SET GLOBAL s3_use_ssl={'true' if use_ssl else 'false'}")
-        conn.execute("SET GLOBAL s3_url_style='path'")
+        conn.execute(f"SET s3_endpoint='{_q(endpoint)}'")
+        conn.execute(f"SET s3_use_ssl={'true' if use_ssl else 'false'}")
+        conn.execute("SET s3_url_style='path'")
 
     # Keep-alive MUST stay enabled: disabling it creates a new TCP connection
     # per S3 request, which exhausts ephemeral ports via TIME_WAIT buildup
     # (55K+ TIME_WAIT sockets observed with keep_alive=false).
-    conn.execute("SET GLOBAL http_keep_alive=true")
+    conn.execute("SET http_keep_alive=true")
     # Increase retries to handle transient connection failures during
     # concurrent S3 access from many DuckDB threads.
-    conn.execute("SET GLOBAL http_retries=10")
-    conn.execute("SET GLOBAL http_retry_wait_ms=100")
-    conn.execute("SET GLOBAL http_retry_backoff=1.5")
-
-    # Create an explicit S3 secret so that credentials are available to the
-    # DuckDB secret manager even when internal code paths use a null FileOpener.
-    if endpoint_url and access_key and secret_key:
-        use_ssl_str = "true" if (urlparse(endpoint_url).scheme == "https") else "false"
-        endpoint_host = urlparse(endpoint_url).netloc or urlparse(endpoint_url).path
-        region_val = region or "us-east-1"
-        conn.execute(f"""
-            CREATE SECRET IF NOT EXISTS __vane_s3 (
-                TYPE S3,
-                KEY_ID '{_q(access_key)}',
-                SECRET '{_q(secret_key)}',
-                ENDPOINT '{_q(endpoint_host)}',
-                REGION '{_q(region_val)}',
-                USE_SSL {use_ssl_str},
-                URL_STYLE 'path'
-            )
-        """)
+    conn.execute("SET http_retries=10")
+    conn.execute("SET http_retry_wait_ms=100")
+    conn.execute("SET http_retry_backoff=1.5")
+    return effective_config
 
 
 def _configure_ray_worker_conn(conn: Any, duckdb_memory_bytes: int) -> None:
@@ -398,10 +584,6 @@ def _configure_ray_worker_conn(conn: Any, duckdb_memory_bytes: int) -> None:
             conn.execute(f"SET threads={int(duckdb_threads)}")
         except Exception:
             pass
-    try:
-        _configure_duckdb_s3(conn)
-    except Exception:
-        pass
     try:
         conn.execute("SET local_exchange_streaming=true")
     except Exception:
@@ -435,15 +617,6 @@ def _warm_up_python_native_dependencies() -> None:
         __import__("pyarrow.parquet")
     except Exception:
         pass
-
-
-def _apply_env_overrides(env_overrides: Mapping[str, str | None] | None) -> None:
-    if not env_overrides:
-        return
-    for key, value in env_overrides.items():
-        if value is None:
-            continue
-        os.environ[key] = str(value)
 
 
 def _copy_output_info_from_context(context: dict[str, Any] | None) -> dict[str, str] | None:
@@ -502,22 +675,19 @@ class RayWorkerActor:
         num_gpus: int,
         duckdb_memory_bytes: int,
         task_heap_capacity_bytes: int,
-        env_overrides: dict[str, str] | None = None,
     ) -> None:
+        scrub_shared_runtime_session_env()
         duckdb_memory_bytes = int(duckdb_memory_bytes)
         task_heap_capacity_bytes = int(task_heap_capacity_bytes)
         if duckdb_memory_bytes <= 0:
             raise ValueError("Ray worker duckdb_memory_bytes must be positive")
         if task_heap_capacity_bytes <= 0:
             raise ValueError("Ray worker task_heap_capacity_bytes must be positive")
-        self._env_overrides = env_overrides or {}
         self._node_id = str(ray.get_runtime_context().get_node_id() or "").strip()
         if not self._node_id:
             raise RuntimeError("Ray worker runtime context is missing node_id")
         self._duckdb_memory_bytes = duckdb_memory_bytes
         self._task_heap_capacity_bytes = task_heap_capacity_bytes
-        _apply_env_overrides(self._env_overrides)
-        os.environ["VANE_WORKER"] = "1"
         try:
             loop = asyncio.get_running_loop()
             set_event_loop(loop)
@@ -562,6 +732,11 @@ class RayWorkerActor:
         # with actor creation instead of blocking the first task.
         self._shared_conn: Any | None = None
         self._shared_conn_lock = threading.Lock()
+        self._session_connections: dict[str, tuple[dict[str, str], Any]] = {}
+        self._session_s3_configs: dict[str, dict[str, str]] = {}
+        self._session_operation_locks: dict[str, threading.Lock] = {}
+        self._closed_session_ids = BoundedReplayMap[str, bool](capacity=_SESSION_CLOSE_REPLAY_CAPACITY)
+        self._session_connections_lock = threading.RLock()
         self._shutdown_lock = threading.RLock()
         self._native_execution_condition = threading.Condition()
         self._native_execution_count = 0
@@ -591,10 +766,9 @@ class RayWorkerActor:
                 raise RuntimeError("Ray worker runtime is shutting down")
 
     @ray.method(concurrency_group="control")
-    def install_env_overrides(self, env_overrides: dict[str, str] | None) -> None:
+    def ping(self) -> bool:
         self._ensure_worker_runtime_running()
-        self._env_overrides = env_overrides or {}
-        _apply_env_overrides(self._env_overrides)
+        return True
 
     @ray.method(concurrency_group="control")
     async def register_fragments(self, fragments: list[dict[str, Any]]) -> dict[str, int]:
@@ -670,8 +844,9 @@ class RayWorkerActor:
                     )
                 existing += 1
                 continue
-            self._plan_fragments[fragment_id] = plan
             query_id = str(entry.get("query_id", "")).strip()
+            _register_query_python_replay_state(_plan_resource_query_id(plan), plan)
+            self._plan_fragments[fragment_id] = plan
             self._fragment_query_ids[fragment_id] = query_id
             self._query_fragments.setdefault(query_id, set()).add(fragment_id)
             registered += 1
@@ -932,6 +1107,7 @@ class RayWorkerActor:
         flight_shuffle_cleanup = await _drain_flight_shuffle_for_query(query_id)
         _retire_flight_shuffle_query(query_id)
         self._retire_worker_native_query(query_id)
+        _cleanup_query_python_replay_state(query_id)
         return {
             "flight_shuffle_registry_entries_removed": int(flight_shuffle_cleanup["registry_entries_removed"]),
             "flight_shuffle_storage_entries_removed": int(flight_shuffle_cleanup["storage_entries_removed"]),
@@ -982,6 +1158,7 @@ class RayWorkerActor:
             self._fragment_lookup_misses += 1
             raise ValueError(f"PlanFragment not found in actor registry: {fragment_id}")
 
+        _register_query_python_replay_state(_plan_resource_query_id(fragment_plan), fragment_plan)
         self._plan_fragments[fragment_id] = fragment_plan
         self._fragment_query_ids[fragment_id] = resolved_query_id
         self._query_fragments.setdefault(resolved_query_id, set()).add(fragment_id)
@@ -1011,6 +1188,173 @@ class RayWorkerActor:
             self._configure_conn(conn)
             self._shared_conn = conn
             return conn
+
+    def _get_session_operation_lock(
+        self,
+        session_id: str,
+        *,
+        allow_closed: bool = False,
+    ) -> threading.Lock:
+        with self._session_connections_lock:
+            if not allow_closed:
+                if self._shutdown_started:
+                    raise RuntimeError("Ray worker runtime is shutting down")
+                if session_id in self._closed_session_ids:
+                    raise RuntimeError(f"Ray worker Vane session is closed: {session_id}")
+            operation_locks = getattr(self, "_session_operation_locks", None)
+            if operation_locks is None:
+                operation_locks = {}
+                self._session_operation_locks = operation_locks
+            operation_lock = operation_locks.get(session_id)
+            if operation_lock is None:
+                operation_lock = threading.Lock()
+                operation_locks[session_id] = operation_lock
+            return operation_lock
+
+    def _get_session_conn(
+        self,
+        session_id: str,
+        config: Mapping[str, str],
+        *,
+        use_session_credentials: bool = True,
+    ) -> Any:
+        session_key = str(session_id).strip()
+        if not session_key:
+            raise ValueError("Ray worker execution requires a Vane session_id")
+        normalized_config = {str(key): str(value) for key, value in config.items()}
+        operation_lock = self._get_session_operation_lock(session_key)
+        with operation_lock:
+            return self._get_session_conn_locked(
+                session_key,
+                normalized_config,
+                use_session_credentials=use_session_credentials,
+            )
+
+    def _get_session_conn_locked(
+        self,
+        session_key: str,
+        normalized_config: dict[str, str],
+        *,
+        use_session_credentials: bool,
+    ) -> Any:
+        with self._session_connections_lock:
+            session_s3_configs = getattr(self, "_session_s3_configs", None)
+            if session_s3_configs is None:
+                session_s3_configs = {}
+                self._session_s3_configs = session_s3_configs
+            if self._shutdown_started:
+                raise RuntimeError("Ray worker runtime is shutting down")
+            if session_key in self._closed_session_ids:
+                raise RuntimeError(f"Ray worker Vane session is closed: {session_key}")
+            existing = self._session_connections.get(session_key)
+            if existing is not None:
+                existing_config, connection = existing
+                if existing_config != normalized_config:
+                    raise RuntimeError(f"Ray worker Vane session config changed: {session_key}")
+                return connection
+
+        connection = self._get_shared_conn().cursor()
+        try:
+            effective_s3_config = _configure_duckdb_s3(
+                connection,
+                normalized_config,
+                use_session_credentials=use_session_credentials,
+            )
+        except BaseException as config_error:
+            try:
+                connection.close()
+            except BaseException as close_error:
+                raise RuntimeError(
+                    f"Ray worker Vane session {session_key} configuration failed and "
+                    f"its connection could not be closed: {type(close_error).__name__}: {close_error}"
+                ) from config_error
+            raise
+
+        try:
+            with self._session_connections_lock:
+                if self._shutdown_started:
+                    raise RuntimeError("Ray worker runtime is shutting down")
+                if session_key in self._closed_session_ids:
+                    raise RuntimeError(f"Ray worker Vane session is closed: {session_key}")
+                existing = self._session_connections.get(session_key)
+                if existing is not None:
+                    raise RuntimeError(f"Ray worker Vane session opened outside its operation lock: {session_key}")
+                self._session_connections[session_key] = (normalized_config, connection)
+                session_s3_configs[session_key] = effective_s3_config
+                return connection
+        except BaseException as state_error:
+            try:
+                connection.close()
+            except BaseException as close_error:
+                raise RuntimeError(
+                    f"Ray worker Vane session {session_key} changed while opening and "
+                    f"its connection could not be closed: {type(close_error).__name__}: {close_error}"
+                ) from state_error
+            raise
+
+    def _refresh_session_s3_config(
+        self,
+        session_id: str,
+        session_config: dict[str, str],
+        connection: Any,
+        *,
+        use_session_credentials: bool,
+    ) -> dict[str, str]:
+        operation_lock = self._get_session_operation_lock(session_id)
+        with operation_lock:
+            with self._session_connections_lock:
+                if self._shutdown_started:
+                    raise RuntimeError("Ray worker runtime is shutting down")
+                if session_id in self._closed_session_ids:
+                    raise RuntimeError(f"Ray worker Vane session is closed: {session_id}")
+                record = self._session_connections.get(session_id)
+                if record is None or record[1] is not connection:
+                    raise RuntimeError(f"Ray worker Vane session closed during task startup: {session_id}")
+                effective_s3_config = dict(self._session_s3_configs.get(session_id, session_config))
+            effective_s3_config = _refresh_effective_duckdb_s3_config(
+                session_config,
+                effective_s3_config,
+                use_session_credentials=use_session_credentials,
+            )
+            with self._session_connections_lock:
+                if self._shutdown_started:
+                    raise RuntimeError("Ray worker runtime is shutting down")
+                if session_id in self._closed_session_ids:
+                    raise RuntimeError(f"Ray worker Vane session is closed: {session_id}")
+                record = self._session_connections.get(session_id)
+                if record is None or record[1] is not connection:
+                    raise RuntimeError(f"Ray worker Vane session closed during task startup: {session_id}")
+                self._session_s3_configs[session_id] = effective_s3_config
+            return effective_s3_config
+
+    @ray.method(concurrency_group="control")
+    async def close_session(self, session_id: str) -> None:
+        session_key = str(session_id).strip()
+        if not session_key:
+            raise ValueError("Ray worker close_session requires a Vane session_id")
+
+        def _close() -> None:
+            operation_lock = self._get_session_operation_lock(session_key, allow_closed=True)
+            with self._session_connections_lock:
+                self._closed_session_ids[session_key] = True
+            with operation_lock:
+                with self._session_connections_lock:
+                    record = self._session_connections.get(session_key)
+                if record is None:
+                    with self._session_connections_lock:
+                        operation_locks = getattr(self, "_session_operation_locks", {})
+                        if operation_locks.get(session_key) is operation_lock:
+                            operation_locks.pop(session_key, None)
+                    return
+                _, connection = record
+                connection.close()
+                with self._session_connections_lock:
+                    if self._session_connections.get(session_key) is record:
+                        self._session_connections.pop(session_key, None)
+                        getattr(self, "_session_s3_configs", {}).pop(session_key, None)
+                        getattr(self, "_session_operation_locks", {}).pop(session_key, None)
+
+        await _to_thread_with_owned_side_effects(_close)
 
     def _begin_worker_native_execution(self, query_id: str) -> None:
         query_id = str(query_id or "").strip()
@@ -1141,6 +1485,12 @@ class RayWorkerActor:
                 self._shared_conn_lock = shared_conn_lock
             with shared_conn_lock:
                 conn = getattr(self, "_shared_conn", None)
+            session_connections_lock = getattr(self, "_session_connections_lock", None)
+            if session_connections_lock is None:
+                session_connections_lock = threading.RLock()
+                self._session_connections_lock = session_connections_lock
+            with session_connections_lock:
+                session_connections = list(getattr(self, "_session_connections", {}).items())
             if conn is not None:
                 try:
                     conn.interrupt()
@@ -1173,6 +1523,21 @@ class RayWorkerActor:
                 native_drained = self._native_execution_count == 0
             if not native_drained:
                 raise RuntimeError("; ".join(errors))
+            for session_id, record in session_connections:
+                with session_connections_lock:
+                    if getattr(self, "_session_connections", {}).get(session_id) is not record:
+                        continue
+                    if record is None:
+                        continue
+                    _, session_connection = record
+                    try:
+                        session_connection.close()
+                    except Exception as exc:
+                        errors.append(f"close DuckDB session connection {session_id}: {exc}")
+                    else:
+                        if self._session_connections.get(session_id) is record:
+                            self._session_connections.pop(session_id, None)
+                            getattr(self, "_session_s3_configs", {}).pop(session_id, None)
             with shared_conn_lock:
                 conn = getattr(self, "_shared_conn", None)
             if conn is not None:
@@ -1241,23 +1606,55 @@ class RayWorkerActor:
         debug_context: dict[str, Any] | None = None,
         native_query_id: str = "",
     ) -> Any:
-        conn = self._get_shared_conn()
-        cursor = conn.cursor()
-        query_admitted = self._register_native_cursor(cursor, native_query_id)
+        session_id = str(plan.session_id()).strip()
+        session_config = {str(key): str(value) for key, value in dict(plan.session_config()).items()}
+        has_explicit_s3_credentials = getattr(plan, "has_explicit_s3_credentials", None)
+        if not callable(has_explicit_s3_credentials):
+            raise TypeError("distributed physical plan is missing has_explicit_s3_credentials()")
+        use_session_credentials = not bool(has_explicit_s3_credentials())
+        conn = self._get_session_conn(
+            session_id,
+            session_config,
+            use_session_credentials=use_session_credentials,
+        )
+        effective_s3_config = self._refresh_session_s3_config(
+            session_id,
+            session_config,
+            conn,
+            use_session_credentials=use_session_credentials,
+        )
+        cursor = None
+        cursor_registered = False
         debug_context = dict(debug_context or {})
         start = time.monotonic()
-        _ray_worker_memory_log(
-            "native_execute_start",
-            **debug_context,
-            scan_task_map_count=len(scan_task_map or {}),
-            exchange_source_task_map_count=len(exchange_source_task_map or {}),
-            has_exchange_sink_instance=exchange_sink_instance is not None,
-            has_dynamic_filter_domains=bool(dynamic_filter_domains),
-        )
 
         try:
+            with self._session_connections_lock:
+                if self._shutdown_started:
+                    raise RuntimeError("Ray worker runtime is shutting down")
+                if session_id in self._closed_session_ids:
+                    raise RuntimeError(f"Ray worker Vane session is closed: {session_id}")
+                record = self._session_connections.get(session_id)
+                if record is None or record[1] is not conn:
+                    raise RuntimeError(f"Ray worker Vane session closed during task startup: {session_id}")
+                cursor = conn.cursor()
+                query_admitted = self._register_native_cursor(cursor, native_query_id)
+                cursor_registered = True
             if not query_admitted:
                 raise RuntimeError(f"native query is closing: {native_query_id}")
+            effective_s3_config = _configure_duckdb_s3(
+                cursor,
+                effective_s3_config,
+                use_session_credentials=use_session_credentials,
+            )
+            _ray_worker_memory_log(
+                "native_execute_start",
+                **debug_context,
+                scan_task_map_count=len(scan_task_map or {}),
+                exchange_source_task_map_count=len(exchange_source_task_map or {}),
+                has_exchange_sink_instance=exchange_sink_instance is not None,
+                has_dynamic_filter_domains=bool(dynamic_filter_domains),
+            )
             plan_runner = self._get_plan_runner()
             scan_task_arg = scan_task_map or None
             result = plan_runner.execute_native(
@@ -1272,6 +1669,7 @@ class RayWorkerActor:
                 dynamic_filter_domains or None,
                 native_progress_callback,
                 debug_context or None,
+                effective_s3_config,
             )
             _ray_worker_memory_log(
                 "native_execute_done",
@@ -1290,11 +1688,13 @@ class RayWorkerActor:
             raise
         finally:
             try:
-                cursor.close()
+                if cursor is not None:
+                    cursor.close()
             except Exception:
                 pass
             finally:
-                self._unregister_native_cursor(cursor)
+                if cursor_registered:
+                    self._unregister_native_cursor(cursor)
 
     @staticmethod
     async def _await_fragment_registration(registration_result: Any | None) -> None:
@@ -1316,7 +1716,6 @@ class RayWorkerActor:
         debug_context: dict[str, Any] | None = None,
     ) -> Any:
         """Run a plan on worker and return a Ray-serializable result tuple."""
-        _apply_env_overrides(self._env_overrides)
         debug_context = dict(debug_context or {})
 
         copy_output_info = _copy_output_info_from_context(context)
