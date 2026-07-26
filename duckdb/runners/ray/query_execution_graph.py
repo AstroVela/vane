@@ -78,7 +78,12 @@ class ResourceVector:
         underflow = [name for name, value in values.items() if value < 0]
         if underflow:
             raise ValueError(f"resource subtraction underflow: {', '.join(underflow)}")
-        return ResourceVector(**values)
+        return ResourceVector(
+            cpu=values["cpu"],
+            gpu=values["gpu"],
+            heap_bytes=int(values["heap_bytes"]),
+            object_store_bytes=int(values["object_store_bytes"]),
+        )
 
     def scale(self, factor: float) -> ResourceVector:
         factor = float(factor)
@@ -300,8 +305,7 @@ class StageResourceSpec:
     generator_buffer_blocks: int
     max_concurrency: int | None
     resident_per_actor: ResourceVector = field(default_factory=ResourceVector)
-    actor_min_size: int = 0
-    actor_max_size: int = 0
+    actor_pool_size: int = 0
     actor_prefetch_depth: int = 1
     spill_mode: str = "streaming"
 
@@ -317,8 +321,7 @@ class StageResourceSpec:
         "generator_buffer_blocks",
         "max_concurrency",
         "resident_per_actor",
-        "actor_min_size",
-        "actor_max_size",
+        "actor_pool_size",
         "actor_prefetch_depth",
         "spill_mode",
     )
@@ -344,8 +347,7 @@ class StageResourceSpec:
             "generator_buffer_blocks": int(self.generator_buffer_blocks),
             "max_concurrency": None if self.max_concurrency is None else int(self.max_concurrency),
             "resident_per_actor": self.resident_per_actor.to_dict(),
-            "actor_min_size": int(self.actor_min_size),
-            "actor_max_size": int(self.actor_max_size),
+            "actor_pool_size": int(self.actor_pool_size),
             "actor_prefetch_depth": int(self.actor_prefetch_depth),
             "spill_mode": self.spill_mode,
         }
@@ -367,8 +369,7 @@ class StageResourceSpec:
             generator_buffer_blocks=int(values["generator_buffer_blocks"]),
             max_concurrency=None if max_concurrency is None else int(max_concurrency),
             resident_per_actor=ResourceVector.from_dict(values["resident_per_actor"]),
-            actor_min_size=int(values["actor_min_size"]),
-            actor_max_size=int(values["actor_max_size"]),
+            actor_pool_size=int(values["actor_pool_size"]),
             actor_prefetch_depth=int(values["actor_prefetch_depth"]),
             spill_mode=str(values["spill_mode"]),
         )
@@ -495,14 +496,11 @@ class QueryExecutionGraph:
             if process_resources.heap_bytes <= 0:
                 raise ValueError(f"Ray stage {stage.stage_id} must request non-zero heap_bytes")
 
-        actor_min = int(stage.actor_min_size)
-        actor_max = int(stage.actor_max_size)
+        actor_pool_size = int(stage.actor_pool_size)
         actor_prefetch_depth = int(stage.actor_prefetch_depth)
         if stage.backend == "ray_actor":
-            if actor_min <= 0:
-                raise ValueError(f"ray_actor stage {stage.stage_id} actor_min_size must be > 0")
-            if actor_max < actor_min:
-                raise ValueError(f"ray_actor stage {stage.stage_id} actor_max_size must be >= actor_min_size")
+            if actor_pool_size <= 0:
+                raise ValueError(f"ray_actor stage {stage.stage_id} actor_pool_size must be > 0")
             if actor_prefetch_depth <= 0:
                 raise ValueError(f"ray_actor stage {stage.stage_id} actor_prefetch_depth must be > 0")
             if stage.max_concurrency is not None:
@@ -511,8 +509,8 @@ class QueryExecutionGraph:
                 raise ValueError(
                     f"ray_actor stage {stage.stage_id} invocation resources may only contain object-store bytes"
                 )
-        elif actor_min != 0 or actor_max != 0:
-            raise ValueError(f"actor bounds are only valid for ray_actor stages: {stage.stage_id}")
+        elif actor_pool_size != 0:
+            raise ValueError(f"actor_pool_size is only valid for ray_actor stages: {stage.stage_id}")
         elif actor_prefetch_depth != 1:
             raise ValueError(f"actor_prefetch_depth is only configurable for ray_actor stages: {stage.stage_id}")
         elif not stage.resident_per_actor.is_zero():
@@ -663,18 +661,20 @@ class QueryExecutionGraph:
             ):
                 raise ValueError(f"stage {stage.stage_id} maximum task does not fit any allocated Ray node")
             if stage.backend == "ray_actor":
-                actor_minimum = placement_commitment.scale(stage.actor_min_size)
-                exceeded_actor = actor_minimum.exceeded_dimensions(capacity)
+                actor_pool = placement_commitment.scale(stage.actor_pool_size)
+                exceeded_actor = actor_pool.exceeded_dimensions(capacity)
                 if require_full_minimum and exceeded_actor:
                     raise ValueError(
-                        f"stage {stage.stage_id} actor minimum exceeds query allocation for {', '.join(exceeded_actor)}"
+                        f"stage {stage.stage_id} actor pool exceeds query allocation for {', '.join(exceeded_actor)}"
                     )
                 placements = [
                     placement for placement in allocation.actor_placements if placement.stage_id == stage.stage_id
                 ]
-                if require_full_minimum and len(placements) != stage.actor_min_size:
-                    raise ValueError(f"stage {stage.stage_id} requires exactly {stage.actor_min_size} actor placements")
-                expected_indices = set(range(stage.actor_min_size))
+                if require_full_minimum and len(placements) != stage.actor_pool_size:
+                    raise ValueError(
+                        f"stage {stage.stage_id} requires exactly {stage.actor_pool_size} actor placements"
+                    )
+                expected_indices = set(range(stage.actor_pool_size))
                 placement_indices = {placement.actor_index for placement in placements}
                 if placements and placement_indices != expected_indices:
                     raise ValueError(f"stage {stage.stage_id} actor placement indices must be contiguous from zero")

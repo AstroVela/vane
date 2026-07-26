@@ -115,8 +115,7 @@ def test_builder_counts_each_nested_ray_process_and_never_uses_zero_heap():
     assert gpu_udf.resident_per_actor == ResourceVector(cpu=1, gpu=1, heap_bytes=3 * GIB)
     assert gpu_udf.per_task == ResourceVector(object_store_bytes=128 * MIB)
     assert gpu_udf.max_concurrency is None
-    assert gpu_udf.actor_min_size == 1
-    assert gpu_udf.actor_max_size == 1
+    assert gpu_udf.actor_pool_size == 1
     assert gpu_udf.actor_prefetch_depth == 2
 
 
@@ -238,7 +237,7 @@ def test_plan_digest_is_stable_for_node_order_but_changes_with_resources():
     assert graph_a.plan_digest != graph_c.plan_digest
 
 
-def test_query_demand_reserves_actor_minima_and_downstream_fte_progress_slot():
+def test_query_demand_reserves_fixed_actor_pool_and_downstream_fte_progress_slot():
     graph = build_query_execution_graph(_metadata(), env={})
     cluster = ResourceVector(cpu=64, gpu=4, heap_bytes=64 * GIB, object_store_bytes=64 * GIB)
 
@@ -288,6 +287,24 @@ def test_query_demand_reserves_gpu_ray_task_as_an_indivisible_task_bundle():
     assert demand.desired.gpu == 2
     assert demand.actor_bundles[0].resources.gpu == 1
     assert demand.task_bundles[0].gpu == 1
+
+
+def test_query_demand_reserves_every_fractional_gpu_actor_in_fixed_pool():
+    metadata = _metadata()
+    actor_payload = metadata["nodes"][2]["udf_payload"]
+    actor_payload["actor_pool_size"] = 3
+    actor_payload["gpus"] = 0.25
+    graph = build_query_execution_graph(metadata, env={})
+    cluster = ResourceVector(cpu=64, gpu=4, heap_bytes=64 * GIB, object_store_bytes=64 * GIB)
+
+    demand = build_query_demand(graph, cluster)
+    actor_stage = graph.stage_by_id(udf_stage_id_for_node("query-7", "3"))
+
+    assert actor_stage.actor_pool_size == 3
+    assert [bundle.actor_index for bundle in demand.actor_bundles] == [0, 1, 2]
+    assert all(bundle.resources.gpu == 0.25 for bundle in demand.actor_bundles)
+    assert demand.minimum.gpu == 0.75
+    assert demand.desired.gpu == demand.minimum.gpu
 
 
 def test_fragment_identity_maps_directly_to_pre_registered_fte_stage():

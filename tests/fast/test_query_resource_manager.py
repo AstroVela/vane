@@ -44,8 +44,7 @@ def _stage(
     blocks=2,
     concurrency=100,
     backend="ray_task",
-    actor_min=0,
-    actor_max=0,
+    actor_pool_size=0,
     actor_prefetch_depth=1,
     resident=None,
     stage_kind="udf",
@@ -73,8 +72,7 @@ def _stage(
         generator_buffer_blocks=blocks,
         max_concurrency=concurrency if backend == "ray_worker" else None,
         resident_per_actor=resident_resources,
-        actor_min_size=actor_min,
-        actor_max_size=actor_max,
+        actor_pool_size=actor_pool_size,
         actor_prefetch_depth=actor_prefetch_depth,
         spill_mode="streaming",
     )
@@ -99,7 +97,7 @@ def _manager(
         ActorPlacement(stage_id=stage.stage_id, actor_index=actor_index, node_id="node-a")
         for stage in stages
         if stage.backend == "ray_actor"
-        for actor_index in range(stage.actor_min_size)
+        for actor_index in range(stage.actor_pool_size)
     )
     allocation = _allocation(
         allocation_resources,
@@ -142,8 +140,7 @@ def test_task_admission_requires_runnable_registered_stage_and_ready_actor():
         resources=_r(cpu=1, gpu=1, heap=100),
         backend="ray_actor",
         concurrency=1,
-        actor_min=1,
-        actor_max=1,
+        actor_pool_size=1,
     )
     manager = _manager(actor, resources=_r(cpu=2, gpu=1, heap=500, store=500))
 
@@ -167,8 +164,7 @@ def test_actor_task_leases_own_distinct_concrete_actor_slots():
         resident=_r(cpu=1, gpu=1, heap=100),
         backend="ray_actor",
         concurrency=None,
-        actor_min=2,
-        actor_max=2,
+        actor_pool_size=2,
     )
     manager = _manager(
         actor,
@@ -207,8 +203,7 @@ def test_actor_prefetch_depth_queues_one_call_per_concrete_actor():
         resources=_r(store=40),
         resident=_r(cpu=1, gpu=1, heap=100),
         backend="ray_actor",
-        actor_min=2,
-        actor_max=2,
+        actor_pool_size=2,
         actor_prefetch_depth=2,
     )
     manager = _manager(
@@ -262,8 +257,7 @@ def test_idle_actor_resident_resources_remain_charged_to_query_and_node():
         resident=_r(cpu=1, gpu=1, heap=100),
         backend="ray_actor",
         concurrency=None,
-        actor_min=1,
-        actor_max=1,
+        actor_pool_size=1,
     )
     manager = _manager(
         actor,
@@ -294,8 +288,7 @@ def test_soft_reservation_only_divides_each_dimension_among_stages_that_need_it(
         target=0,
         blocks=0,
         backend="ray_actor",
-        actor_min=1,
-        actor_max=1,
+        actor_pool_size=1,
     )
     manager = _manager(
         *cpu_stages,
@@ -330,8 +323,7 @@ def test_stage_minimum_commitments_are_protected_before_shared_heap_borrowing():
         target=0,
         blocks=0,
         backend="ray_actor",
-        actor_min=1,
-        actor_max=1,
+        actor_pool_size=1,
     )
     manager = _manager(
         *cpu_stages,
@@ -357,8 +349,7 @@ def test_soft_heap_reservation_does_not_exceed_cross_dimension_stage_capacity():
         blocks=0,
         concurrency=None,
         backend="ray_actor",
-        actor_min=1,
-        actor_max=1,
+        actor_pool_size=1,
     )
     cpu_stage = _stage(
         "stage:f:cpu",
@@ -1478,8 +1469,7 @@ def test_parent_fte_placement_preserves_pinned_actor_continuation_node():
         target=0,
         blocks=0,
         backend="ray_actor",
-        actor_min=1,
-        actor_max=1,
+        actor_pool_size=1,
     )
     manager = _manager(
         parent,
@@ -1525,8 +1515,7 @@ def test_ray_task_placement_preserves_combined_fte_and_pinned_actor_reservations
         target=2,
         blocks=1,
         backend="ray_actor",
-        actor_min=1,
-        actor_max=1,
+        actor_pool_size=1,
     )
     manager = _manager(
         producer,
@@ -1614,8 +1603,7 @@ def test_latent_fte_and_actor_reservations_cap_ray_task_fanout():
         target=1,
         blocks=1,
         backend="ray_actor",
-        actor_min=1,
-        actor_max=1,
+        actor_pool_size=1,
     )
     manager = _manager(
         producer,
@@ -1674,8 +1662,7 @@ def test_upstream_fanout_preserves_concurrent_ray_task_and_fte_slots():
         target=0,
         blocks=0,
         backend="ray_actor",
-        actor_min=1,
-        actor_max=1,
+        actor_pool_size=1,
         actor_prefetch_depth=3,
     )
     downstream = _stage(
@@ -1777,8 +1764,7 @@ def test_registered_minimum_supports_parent_task_and_downstream_fte_progress():
         target=1,
         blocks=1,
         backend="ray_actor",
-        actor_min=1,
-        actor_max=1,
+        actor_pool_size=1,
     )
     # actor resident + invocation, one Ray task credit, the invoking FTE task,
     # and one downstream FTE progress slot: this is the registered minimum.
@@ -1858,8 +1844,7 @@ def test_parent_fte_fanout_preserves_shared_fte_slot_across_nested_ray_task():
         target=0,
         blocks=0,
         backend="ray_actor",
-        actor_min=1,
-        actor_max=1,
+        actor_pool_size=1,
     )
     manager = _manager(
         parent,

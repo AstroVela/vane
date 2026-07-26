@@ -50,8 +50,7 @@ def _stage(
     target_output_block_bytes: int = 16 * MIB,
     generator_buffer_blocks: int = 2,
     max_concurrency: int | None = None,
-    actor_min_size: int = 0,
-    actor_max_size: int = 0,
+    actor_pool_size: int = 0,
     actor_prefetch_depth: int = 1,
     spill_mode: str = "streaming",
 ) -> StageResourceSpec:
@@ -78,8 +77,7 @@ def _stage(
         generator_buffer_blocks=generator_buffer_blocks,
         max_concurrency=max_concurrency,
         resident_per_actor=resident,
-        actor_min_size=actor_min_size,
-        actor_max_size=actor_max_size,
+        actor_pool_size=actor_pool_size,
         actor_prefetch_depth=actor_prefetch_depth,
         spill_mode=spill_mode,
     )
@@ -148,8 +146,7 @@ def test_graph_orders_stages_deterministically_and_preserves_one_stage_identity_
         backend="ray_actor",
         per_task=_resources(cpu=1, gpu=1, heap_bytes=1024 * MIB),
         max_concurrency=None,
-        actor_min_size=1,
-        actor_max_size=1,
+        actor_pool_size=1,
     )
     graph = _graph(gpu_udf, scan, cpu_udf, terminals=(gpu_udf.stage_id,))
 
@@ -191,8 +188,7 @@ def test_graph_identifies_downstream_fte_slots_after_non_fte_boundaries():
         inputs=(post_task_fte.stage_id,),
         backend="ray_actor",
         per_task=_resources(gpu=1),
-        actor_min_size=1,
-        actor_max_size=1,
+        actor_pool_size=1,
     )
     post_actor_fte = _stage(
         "stage:fragment-3:post-actor-fte",
@@ -289,8 +285,7 @@ def test_graph_rejects_zero_heap_for_every_ray_python_process(backend):
         "stage:fragment-1:udf",
         backend=backend,
         per_task=_resources(heap_bytes=0),
-        actor_min_size=1 if backend == "ray_actor" else 0,
-        actor_max_size=1 if backend == "ray_actor" else 0,
+        actor_pool_size=1 if backend == "ray_actor" else 0,
     )
 
     with pytest.raises(ValueError, match="non-zero heap_bytes"):
@@ -310,17 +305,15 @@ def test_graph_rejects_ray_stage_without_cpu_or_gpu_scheduling_resources():
 @pytest.mark.parametrize(
     "changes, message",
     [
-        ({"actor_min_size": 0, "actor_max_size": 1}, "actor_min_size"),
-        ({"actor_min_size": 2, "actor_max_size": 1}, "actor_max_size"),
-        ({"actor_min_size": 1, "actor_max_size": 1, "max_concurrency": 1}, "concurrency is owned"),
+        ({"actor_pool_size": 0}, "actor_pool_size"),
+        ({"actor_pool_size": 1, "max_concurrency": 1}, "concurrency is owned"),
     ],
 )
-def test_graph_rejects_invalid_actor_bounds(changes, message):
+def test_graph_rejects_invalid_actor_pool(changes, message):
     params = {
         "backend": "ray_actor",
         "max_concurrency": None,
-        "actor_min_size": 1,
-        "actor_max_size": 1,
+        "actor_pool_size": 1,
         **changes,
     }
     stage = _stage("stage:fragment-1:gpu-udf", **params)
@@ -329,12 +322,11 @@ def test_graph_rejects_invalid_actor_bounds(changes, message):
         _graph(stage, terminals=(stage.stage_id,))
 
 
-def test_graph_rejects_actor_bounds_on_non_actor_stage():
+def test_graph_rejects_actor_pool_on_non_actor_stage():
     stage = _stage(
         "stage:fragment-1:udf",
         backend="ray_task",
-        actor_min_size=1,
-        actor_max_size=1,
+        actor_pool_size=1,
     )
 
     with pytest.raises(ValueError, match="only valid for ray_actor"):
@@ -345,8 +337,7 @@ def test_graph_rejects_invalid_actor_prefetch_depth():
     actor = _stage(
         "stage:fragment-1:gpu-udf",
         backend="ray_actor",
-        actor_min_size=1,
-        actor_max_size=1,
+        actor_pool_size=1,
         actor_prefetch_depth=0,
     )
     with pytest.raises(ValueError, match="actor_prefetch_depth"):
@@ -501,8 +492,7 @@ def test_allocation_rejects_cumulative_actor_placements_on_one_node():
         target_output_block_bytes=10,
         generator_buffer_blocks=2,
         max_concurrency=None,
-        actor_min_size=2,
-        actor_max_size=2,
+        actor_pool_size=2,
     )
     graph = _graph(actor, terminals=(actor.stage_id,))
     per_node = _resources(cpu=1, gpu=1, heap_bytes=100, object_store_bytes=30)
