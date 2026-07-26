@@ -2603,6 +2603,110 @@ class TestMultimodalPromptBatch:
             "response:gamma",
         ]
 
+    def test_prompt_batch_propagates_null_prompts_when_requested(self):
+        """NULL prompts stay local while other rows retain their execution path."""
+        from vane.ai.functions import _PromptBatch
+
+        captured_messages = []
+        captured_batches = []
+
+        class DualPathPrompter:
+            def prompt_batch(self, texts):
+                captured_batches.append(texts)
+                return [f"batch:{text}" for text in texts]
+
+            async def prompt(self, msgs):
+                captured_messages.append(msgs)
+                return f"multimodal:{msgs[0]}"
+
+        mock_descriptor = MagicMock()
+        mock_descriptor.instantiate.return_value = DualPathPrompter()
+
+        batch = _PromptBatch(
+            mock_descriptor,
+            "text",
+            "response",
+            image_columns=["image"],
+            propagate_null_prompts=True,
+        )
+        table = pa.table(
+            {
+                "text": pa.array([None, "Text only", "With image"], type=pa.string()),
+                "image": pa.array([b"ignored", None, b"\x89PNG"], type=pa.binary()),
+            }
+        )
+        result = batch(table)
+
+        assert captured_batches == [["Text only"]]
+        assert captured_messages == [("With image", b"\x89PNG")]
+        assert result.column("response").to_pylist() == [
+            None,
+            "batch:Text only",
+            "multimodal:With image",
+        ]
+
+    def test_prompt_batch_does_not_instantiate_for_only_null_prompts(self):
+        """An all-NULL propagated batch does not initialize a provider."""
+        from vane.ai.functions import _PromptBatch
+
+        mock_descriptor = MagicMock()
+        batch = _PromptBatch(
+            mock_descriptor,
+            "text",
+            "response",
+            image_columns=["image"],
+            propagate_null_prompts=True,
+        )
+        table = pa.table(
+            {
+                "text": pa.array([None], type=pa.string()),
+                "image": pa.array([b"\x89PNG"], type=pa.binary()),
+            }
+        )
+
+        result = batch(table)
+
+        mock_descriptor.instantiate.assert_not_called()
+        assert result.column("response").to_pylist() == [None]
+
+    def test_prompt_batch_treats_zero_length_bytes_as_empty_images(self):
+        """Zero-length BLOBs and BLOB[] elements remain safely batchable."""
+        from vane.ai.functions import _PromptBatch
+
+        captured_batches = []
+
+        class VLLMLikePrompter:
+            def prompt_batch(self, texts):
+                captured_batches.append(texts)
+                return [f"response:{text}" for text in texts]
+
+            async def prompt(self, _msgs):
+                raise AssertionError("empty image values must not use the multimodal path")
+
+        mock_descriptor = MagicMock()
+        mock_descriptor.instantiate.return_value = VLLMLikePrompter()
+
+        batch = _PromptBatch(
+            mock_descriptor,
+            "text",
+            "response",
+            image_columns=["image", "images"],
+        )
+        table = pa.table(
+            {
+                "text": ["empty blob", "empty list item"],
+                "image": pa.array([b"", None], type=pa.binary()),
+                "images": pa.array([None, [b"", None]], type=pa.list_(pa.binary())),
+            }
+        )
+        result = batch(table)
+
+        assert captured_batches == [["empty blob", "empty list item"]]
+        assert result.column("response").to_pylist() == [
+            "response:empty blob",
+            "response:empty list item",
+        ]
+
     def test_prompt_batch_no_image_columns_text_only(self):
         """Without image_columns, behavior is identical to original."""
         from vane.ai.functions import _PromptBatch

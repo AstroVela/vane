@@ -569,6 +569,36 @@ def test_ai_prompt_literal_null_prompt_skips_nonconstant_options():
     assert rows == [(None,)]
 
 
+@pytest.mark.parametrize(
+    "image_expression",
+    [
+        "from_hex('89504e47')",
+        "[from_hex('89504e47')]::BLOB[]",
+    ],
+)
+def test_ai_prompt_image_input_propagates_column_null_prompt(image_expression):
+    conn = vane.connect()
+
+    rows = conn.sql(f"""
+        SELECT id, ai_prompt(
+            prompt,
+            image,
+            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
+        ) AS response
+        FROM (
+            VALUES
+                (1, NULL::VARCHAR, {image_expression}),
+                (2, 'alpha', {image_expression})
+        ) AS t(id, prompt, image)
+        ORDER BY id
+    """).fetchall()
+
+    assert rows == [
+        (1, None),
+        (2, "vision-model:alpha:images=89504e47"),
+    ]
+
+
 @pytest.mark.parametrize("null_image", ["NULL", "NULL::BLOB", "NULL::BLOB[]"])
 def test_ai_prompt_sql_with_literal_null_image(null_image):
     conn = vane.connect()
@@ -668,6 +698,27 @@ def test_ai_prompt_sql_with_image_blob_list():
         (2, "vision-model:empty"),
         (3, "vision-model:null"),
     ]
+
+
+@pytest.mark.parametrize(
+    "empty_image",
+    [
+        "''::BLOB",
+        "[''::BLOB]::BLOB[]",
+    ],
+)
+def test_ai_prompt_sql_treats_zero_length_image_as_empty(empty_image):
+    conn = vane.connect()
+
+    rows = conn.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            {empty_image},
+            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
+        ) AS response
+    """).fetchall()
+
+    assert rows == [("vision-model:describe",)]
 
 
 def test_ai_embed_sql_with_mock_provider_and_dimensions():

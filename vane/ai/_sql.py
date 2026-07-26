@@ -171,6 +171,7 @@ def build_ai_prompt_sql_spec(
         "response",
         udf_opts.max_api_concurrency,
         image_columns=["images"] if image_input else None,
+        propagate_null_prompts=image_input,
         max_retries=resolved_max_retries,
         on_error=udf_opts.on_error,
     )
