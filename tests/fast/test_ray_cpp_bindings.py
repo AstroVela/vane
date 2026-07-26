@@ -2310,6 +2310,351 @@ def test_ray_worker_manager_integration(monkeypatch):
     assert dummy_worker_handle.fte_cleanup_query_calls == ["query-lifecycle"]
 
 
+def test_ray_worker_manager_worker_snapshot_refresh_is_single_flight(monkeypatch):
+    thread_count = 8
+    caller_barrier = threading.Barrier(thread_count)
+    start_condition = threading.Condition()
+    start_calls = []
+    created_handles = []
+
+    class DummyRayWorkerHandle:
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    def start_ray_workers(existing_ids):
+        with start_condition:
+            start_calls.append(tuple(existing_ids))
+            start_condition.notify_all()
+            # The old implementation lets every caller enter this function.
+            # A single-flight implementation times out here with one creator
+            # while the other callers wait for its result.
+            start_condition.wait_for(lambda: len(start_calls) == thread_count, timeout=0.5)
+        handle = DummyRayWorkerHandle()
+        created_handles.append(handle)
+        return [duckdb.ray_cxx.RayWorkerRuntime("worker-shared", handle, 1.0, 0.0, 1024)]
+
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(ray_worker_handle, "start_ray_workers", start_ray_workers)
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    manager = duckdb.ray_cxx.RayWorkerManager()
+    outcomes = []
+    errors = []
+
+    def snapshot():
+        try:
+            caller_barrier.wait(timeout=5)
+            outcomes.append(manager.worker_snapshots())
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=snapshot, daemon=True) for _ in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert [thread for thread in threads if thread.is_alive()] == []
+    assert errors == []
+    assert len(start_calls) == 1
+    assert len(created_handles) == 1
+    assert len(outcomes) == thread_count
+    assert (
+        outcomes
+        == [
+            [
+                {
+                    "worker_id": "worker-shared",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "available_num_cpus": 1.0,
+                    "available_num_gpus": 0.0,
+                    "total_memory_bytes": 1024,
+                    "available_memory_bytes": 1024,
+                }
+            ]
+        ]
+        * thread_count
+    )
+    manager.shutdown()
+
+
+def test_ray_worker_manager_failed_snapshot_refresh_is_shared_and_retryable(monkeypatch):
+    thread_count = 6
+    caller_barrier = threading.Barrier(thread_count)
+    start_condition = threading.Condition()
+    start_calls = []
+
+    class DummyRayWorkerHandle:
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    def start_ray_workers(existing_ids):
+        with start_condition:
+            start_calls.append(tuple(existing_ids))
+            call_number = len(start_calls)
+            start_condition.notify_all()
+            if call_number == 1:
+                start_condition.wait_for(lambda: len(start_calls) == thread_count, timeout=0.5)
+        if call_number == 1:
+            raise RuntimeError("planned shared refresh failure")
+        return [
+            duckdb.ray_cxx.RayWorkerRuntime(
+                "worker-retry",
+                DummyRayWorkerHandle(),
+                1.0,
+                0.0,
+                1024,
+            )
+        ]
+
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(ray_worker_handle, "start_ray_workers", start_ray_workers)
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    manager = duckdb.ray_cxx.RayWorkerManager()
+    errors = []
+
+    def snapshot():
+        try:
+            caller_barrier.wait(timeout=5)
+            manager.worker_snapshots()
+        except BaseException as exc:
+            errors.append(str(exc))
+
+    threads = [threading.Thread(target=snapshot, daemon=True) for _ in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert [thread for thread in threads if thread.is_alive()] == []
+    assert len(start_calls) == 1
+    assert len(errors) == thread_count
+    assert all("planned shared refresh failure" in error for error in errors)
+    assert len(set(errors)) == 1
+
+    snapshots = manager.worker_snapshots()
+    assert [snapshot["worker_id"] for snapshot in snapshots] == ["worker-retry"]
+    assert start_calls == [(), ()]
+    manager.shutdown()
+
+
+def test_ray_worker_manager_rejects_and_cleans_duplicate_refresh_workers(monkeypatch):
+    start_calls = []
+    aborted = []
+
+    class DummyRayWorkerHandle:
+        def __init__(self, label):
+            self.label = label
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            aborted.append(self.label)
+            if self.label == "first":
+                raise RuntimeError("planned first abort failure")
+
+    def start_ray_workers(existing_ids):
+        start_calls.append(tuple(existing_ids))
+        if len(start_calls) == 1:
+            return [
+                duckdb.ray_cxx.RayWorkerRuntime(
+                    "worker-duplicate",
+                    DummyRayWorkerHandle("first"),
+                    1.0,
+                    0.0,
+                    1024,
+                ),
+                duckdb.ray_cxx.RayWorkerRuntime(
+                    "worker-duplicate",
+                    DummyRayWorkerHandle("second"),
+                    1.0,
+                    0.0,
+                    1024,
+                ),
+            ]
+        return [
+            duckdb.ray_cxx.RayWorkerRuntime(
+                "worker-recovered",
+                DummyRayWorkerHandle("recovered"),
+                1.0,
+                0.0,
+                1024,
+            )
+        ]
+
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(ray_worker_handle, "start_ray_workers", start_ray_workers)
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    manager = duckdb.ray_cxx.RayWorkerManager()
+
+    with pytest.raises(Exception, match="duplicate worker id: worker-duplicate") as exc_info:
+        manager.worker_snapshots()
+
+    assert sorted(aborted) == ["first", "second"]
+    assert "worker refresh cleanup failed: worker-duplicate" in str(exc_info.value)
+    assert "planned first abort failure" in str(exc_info.value)
+    snapshots = manager.worker_snapshots()
+    assert [snapshot["worker_id"] for snapshot in snapshots] == ["worker-recovered"]
+    assert start_calls == [(), ()]
+    manager.shutdown()
+
+
+def test_ray_worker_manager_cleans_all_runtimes_after_invalid_refresh_entry(monkeypatch):
+    aborted = []
+
+    class DummyRayWorkerHandle:
+        def __init__(self, label):
+            self.label = label
+
+        def abort_shutdown(self):
+            aborted.append(self.label)
+
+    def start_ray_workers(_existing_ids):
+        return [
+            duckdb.ray_cxx.RayWorkerRuntime(
+                "worker-before-invalid",
+                DummyRayWorkerHandle("before"),
+                1.0,
+                0.0,
+                1024,
+            ),
+            duckdb.ray_cxx.RayWorkerRuntime(
+                "",
+                DummyRayWorkerHandle("empty-id"),
+                1.0,
+                0.0,
+                1024,
+            ),
+            object(),
+            duckdb.ray_cxx.RayWorkerRuntime(
+                "worker-after-invalid",
+                DummyRayWorkerHandle("after"),
+                1.0,
+                0.0,
+                1024,
+            ),
+        ]
+
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(ray_worker_handle, "start_ray_workers", start_ray_workers)
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    manager = duckdb.ray_cxx.RayWorkerManager()
+
+    with pytest.raises(Exception, match="refresh_workers exception"):
+        manager.worker_snapshots()
+
+    assert sorted(aborted) == ["after", "before", "empty-id"]
+    manager.shutdown()
+
+
+def test_ray_worker_manager_snapshot_refresh_shutdown_has_no_deadlock(monkeypatch):
+    caller_barrier = threading.Barrier(2)
+    refresh_entered = threading.Event()
+    release_refresh = threading.Event()
+    start_calls = []
+    aborted = []
+
+    class DummyRayWorkerHandle:
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            aborted.append("worker-racing-shutdown")
+
+    def start_ray_workers(existing_ids):
+        start_calls.append(tuple(existing_ids))
+        refresh_entered.set()
+        assert release_refresh.wait(timeout=10)
+        return [
+            duckdb.ray_cxx.RayWorkerRuntime(
+                "worker-racing-shutdown",
+                DummyRayWorkerHandle(),
+                1.0,
+                0.0,
+                1024,
+            )
+        ]
+
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(ray_worker_handle, "start_ray_workers", start_ray_workers)
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    manager = duckdb.ray_cxx.RayWorkerManager()
+    snapshot_errors = []
+
+    def snapshot():
+        try:
+            caller_barrier.wait(timeout=5)
+            manager.worker_snapshots()
+        except BaseException as exc:
+            snapshot_errors.append(str(exc))
+
+    snapshot_threads = [threading.Thread(target=snapshot, daemon=True) for _ in range(2)]
+    for thread in snapshot_threads:
+        thread.start()
+    assert refresh_entered.wait(timeout=5)
+
+    shutdown_errors = []
+
+    def shutdown():
+        try:
+            manager.shutdown()
+        except BaseException as exc:
+            shutdown_errors.append(str(exc))
+
+    shutdown_thread = threading.Thread(target=shutdown, daemon=True)
+    shutdown_thread.start()
+
+    shutdown_state_error = None
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            manager.try_autoscale([])
+        except BaseException as exc:
+            shutdown_state_error = str(exc)
+            break
+        time.sleep(0.001)
+
+    assert shutdown_thread.is_alive()
+
+    release_refresh.set()
+    for thread in snapshot_threads:
+        thread.join(timeout=10)
+    shutdown_thread.join(timeout=10)
+
+    assert [thread for thread in [*snapshot_threads, shutdown_thread] if thread.is_alive()] == []
+    assert shutdown_state_error is not None
+    assert "shut down" in shutdown_state_error
+    assert shutdown_errors == []
+    assert start_calls == [()]
+    assert len(snapshot_errors) == 2
+    assert all("shut down during worker refresh" in error for error in snapshot_errors)
+    assert aborted == ["worker-racing-shutdown"]
+
+
 def test_ray_worker_manager_drop_is_best_effort_across_worker_failures(monkeypatch):
     calls = []
 

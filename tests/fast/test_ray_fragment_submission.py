@@ -8230,6 +8230,73 @@ def test_start_ray_workers_skips_blocking_warmup_inside_ray_worker(monkeypatch):
     assert get_calls == []
 
 
+@pytest.mark.parametrize(
+    ("warmup_error", "error_match"),
+    [
+        (RuntimeError("planned warmup failure"), "planned warmup failure"),
+        (ray.exceptions.GetTimeoutError("planned warmup timeout"), "Failed to warm up Worker actors within 120s"),
+    ],
+)
+def test_start_ray_workers_cleans_up_actors_after_warmup_failure(monkeypatch, warmup_error, error_match):
+    killed = []
+
+    class _FakePingMethod:
+        def remote(self):
+            return "warmup-ref"
+
+    class _FakeActorHandle:
+        def __init__(self, node_id):
+            self.node_id = node_id
+            self.ping = _FakePingMethod()
+
+    class _FakeActorFactory:
+        def __init__(self):
+            self.node_id = None
+
+        def options(self, **kwargs):
+            self.node_id = kwargs["scheduling_strategy"][1]["node_id"]
+            return self
+
+        def remote(self, **_kwargs):
+            return _FakeActorHandle(self.node_id)
+
+    monkeypatch.setattr(worker_handle_mod, "_is_ray_worker_context", lambda: False)
+    monkeypatch.setattr(worker_handle_mod, "_collect_vane_env_overrides", dict)
+    monkeypatch.setattr(worker_handle_mod, "RayWorkerActor", _FakeActorFactory())
+    monkeypatch.setattr(
+        worker_handle_mod.ray,
+        "nodes",
+        lambda: [
+            {
+                "NodeID": node_id,
+                "NodeManagerAddress": address,
+                "Resources": {"CPU": 4.0, "memory": 1024.0, "GPU": 0.0},
+            }
+            for node_id, address in (("node-a", "10.0.0.1"), ("node-b", "10.0.0.2"))
+        ],
+    )
+    monkeypatch.setattr(
+        worker_handle_mod.ray.util.scheduling_strategies,
+        "NodeAffinitySchedulingStrategy",
+        lambda **kwargs: ("node-affinity", kwargs),
+    )
+    monkeypatch.setattr(
+        worker_handle_mod,
+        "resolve_object_refs_blocking",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(warmup_error),
+    )
+    monkeypatch.setattr(
+        worker_handle_mod.ray,
+        "kill",
+        lambda actor, *, no_restart=True: killed.append((actor.node_id, no_restart)),
+    )
+
+    with pytest.raises(RuntimeError, match=error_match):
+        worker_handle_mod.start_ray_workers(existing_worker_ids=[])
+
+    assert sorted(killed) == [("node-a", True), ("node-b", True)]
+
+
 def test_worker_session_connection_rejects_reopen_after_close(monkeypatch):
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
