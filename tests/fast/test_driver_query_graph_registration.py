@@ -336,7 +336,7 @@ def test_run_plan_does_not_read_physical_plan_id_after_registration():
     events: list[str] = []
     coordinator = _FakeCoordinator(events)
     runner_cls, runner = _runner(events, coordinator)
-    runner._precreate_udf_actors = lambda *_args: []
+    runner._precreate_udf_actors = lambda *_args, **_kwargs: []
     runner._mark_query_actor_stages_ready = lambda _graph: None
     query_id = "query-single-use-plan-id"
     physical_plan = _RegistrationOnlyIdxPhysicalPlan(
@@ -348,6 +348,8 @@ def test_run_plan_does_not_read_physical_plan_id_after_registration():
     asyncio.run(
         runner_cls.run_plan(
             runner,
+            _OWNER_ID,
+            _SESSION_ID,
             _FakeLogicalPlan(physical_plan, events),
         )
     )
@@ -370,7 +372,7 @@ def test_run_plan_cancellation_releases_registration_before_startup_worker_claim
         thread_name_prefix="vane-test-saturated",
     )
 
-    runner._precreate_udf_actors = lambda *_args: startup_entered.set() or []
+    runner._precreate_udf_actors = lambda *_args, **_kwargs: startup_entered.set() or []
     runner._mark_query_actor_stages_ready = lambda _graph: None
 
     async def _exercise() -> None:
@@ -387,12 +389,14 @@ def test_run_plan_cancellation_releases_registration_before_startup_worker_claim
         async def _register_then_saturate(
             plan,
             *,
+            query_connection,
             expected_plan_id=None,
         ):
             nonlocal blocker_future
             registered = await register_query_resources(
                 runner,
                 plan,
+                query_connection=query_connection,
                 expected_plan_id=expected_plan_id,
             )
             blocker_future = loop.run_in_executor(
@@ -408,6 +412,8 @@ def test_run_plan_cancellation_releases_registration_before_startup_worker_claim
         run_plan = asyncio.create_task(
             runner_cls.run_plan(
                 runner,
+                _OWNER_ID,
+                _SESSION_ID,
                 _FakeLogicalPlan(physical_plan, events),
             )
         )
@@ -452,7 +458,7 @@ def test_run_plan_cancellation_after_startup_claim_tears_down_once():
     startup_release = threading.Event()
     fragment_drops: list[str] = []
 
-    def _precreate_udf_actors(*_args):
+    def _precreate_udf_actors(*_args, **_kwargs):
         startup_claimed.set()
         assert startup_release.wait(timeout=2.0)
         return []
@@ -473,6 +479,8 @@ def test_run_plan_cancellation_after_startup_claim_tears_down_once():
         run_plan = asyncio.create_task(
             runner_cls.run_plan(
                 runner,
+                _OWNER_ID,
+                _SESSION_ID,
                 _FakeLogicalPlan(physical_plan, events),
             )
         )
@@ -542,8 +550,8 @@ def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_
     runner_cls, runner = _runner(events, coordinator)
     runner._query_resource_lock = threading.Lock()
     runner._read_query_node_capacities = lambda: runner_cls._read_query_node_capacities()
-    runner._precreate_udf_actors = lambda *_args: []
-    runner._precreate_vllm_actors = lambda *_args: []
+    runner._precreate_udf_actors = lambda *_args, **_kwargs: []
+    runner._precreate_vllm_actors = lambda *_args, **_kwargs: []
     runner._get_plan_runner = lambda: SimpleNamespace(
         run_copy_plan=lambda _plan, _conn: {"rows_copied": 1},
     )
@@ -653,6 +661,8 @@ def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_
         copy_task = asyncio.create_task(
             runner_cls.run_copy_plan(
                 runner,
+                _OWNER_ID,
+                _SESSION_ID,
                 _FakeLogicalPlan(copy_plan, events),
             )
         )

@@ -3123,12 +3123,10 @@ class RayQueryDriverActor:
 
         metadata = plan.collect_execution_stages(conn=query_connection)
         graph = build_query_execution_graph(metadata)
-        plan_id = str(plan.idx())
-        if expected_plan_id is not None and plan_id != expected_plan_id:
-            raise ValueError(
-                f"physical plan query_id changed during registration: "
-                f"prepared={expected_plan_id!r} registration={plan_id!r}"
-            )
+        # The session preparation step already compared the logical and
+        # physical IDs. Reuse that immutable identity after handing the plan to
+        # the registration thread instead of re-entering the physical wrapper.
+        plan_id = str(plan.idx()) if expected_plan_id is None else str(expected_plan_id)
         if graph.query_id != plan_id:
             raise ValueError(f"execution graph query_id mismatch: graph={graph.query_id!r} plan={plan_id!r}")
         capacity_snapshot_started_at = time.monotonic()
@@ -3838,6 +3836,7 @@ class RayQueryDriverActor:
                     session_id,
                     session,
                     plan,
+                    plan_id,
                 )
             except asyncio.CancelledError as cancellation_error:
                 try:
@@ -3944,6 +3943,7 @@ class RayQueryDriverActor:
         session_id: str,
         session: _DriverSession,
         plan: duckdb.ray_cxx.PyLogicalPlan,
+        plan_id: str,
     ) -> tuple[Any, str, Any]:
         """Prepare a physical plan on an owned worker thread."""
         if os.environ.get("VANE_WORKER") == "1":
@@ -3953,7 +3953,6 @@ class RayQueryDriverActor:
             )
         with session.operation_lock:
             logical_plan = plan
-            plan_id = str(logical_plan.idx())
             query_connection = session.connection.cursor()
             with self._session_lock:
                 if self._sessions.get(str(session_id)) is not session:
@@ -4006,7 +4005,7 @@ class RayQueryDriverActor:
         graph: Any,
         allocation: Any,
         query_connection: Any,
-        session_config: Mapping[str, str],
+        session_config: dict[str, str],
     ) -> None:
         """Start an already registered streaming plan on a worker thread."""
         plan_runner_started = False
@@ -4060,7 +4059,7 @@ class RayQueryDriverActor:
         graph: Any,
         allocation: Any,
         query_connection: Any,
-        session_config: Mapping[str, str],
+        session_config: dict[str, str],
         startup_ownership: _PlanStartupOwnership,
     ) -> None:
         """Start only after atomically claiming the registered resources."""
@@ -4108,6 +4107,7 @@ class RayQueryDriverActor:
                 session_id,
                 session,
                 logical_plan,
+                plan_id,
             )
             self._plan_query_ids[plan_id] = plan_id
             graph, allocation = await self._register_query_resources(
@@ -4262,9 +4262,9 @@ class RayQueryDriverActor:
         session_id: str,
         session: _DriverSession,
         logical_plan: Any,
+        plan_id: str,
     ) -> tuple[Any, Any]:
         """Build a COPY plan on an owned thread without blocking actor control RPCs."""
-        plan_id = str(logical_plan.idx())
         with session.operation_lock:
             query_connection = session.connection.cursor()
             with self._session_lock:

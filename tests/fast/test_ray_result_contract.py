@@ -455,24 +455,30 @@ def test_query_driver_run_plan_cancellation_waits_for_startup_and_tears_down(mon
     release = threading.Event()
     events = []
 
-    def _start(_self, session_id, session, plan):
-        assert session_id == _TEST_SESSION_ID
-        assert plan is logical_plan
+    def _start(
+        _self,
+        plan,
+        plan_id,
+        _graph,
+        _allocation,
+        _query_connection,
+        _session_config,
+    ):
+        assert plan is logical_plan.physical_plan
+        assert plan_id == "cancelled-plan"
         started.set()
         assert release.wait(timeout=1.0)
-        with runner._session_lock:
-            runner._plan_session_ids["cancelled-plan"] = session_id
-            session.plan_ids.add("cancelled-plan")
         events.append("started")
 
-    def _cleanup(_self, plan_id):
+    def _cleanup(_self, plan_id, query_id, *, drop_fragments):
+        assert query_id == "cancelled-plan"
+        assert drop_fragments is True
         events.append(("cleanup", plan_id))
-        with runner._session_lock:
-            runner._plan_session_ids.pop(plan_id, None)
-            runner._sessions[_TEST_SESSION_ID].plan_ids.discard(plan_id)
+        cls._release_plan_session_state(runner, plan_id)
 
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub("cancelled-plan"))
     monkeypatch.setattr(cls, "_run_plan_sync", _start)
-    monkeypatch.setattr(cls, "_cleanup_finished_plan", _cleanup)
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _cleanup)
 
     async def _cancel():
         task = asyncio.create_task(_run_actor_stream_plan(runner, logical_plan))
@@ -520,10 +526,7 @@ def test_session_close_does_not_block_actor_loop_during_stream_startup(monkeypat
     monkeypatch.setattr(
         cls,
         "_register_query_resources",
-        lambda _self, _plan, *, query_connection: (
-            SimpleNamespace(query_id="slow-stream-startup", stages=()),
-            object(),
-        ),
+        _query_registration_stub("slow-stream-startup"),
     )
     monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
 
@@ -729,10 +732,7 @@ def test_query_driver_copy_progress_cancellation_waits_before_teardown(monkeypat
     monkeypatch.setattr(
         cls,
         "_register_query_resources",
-        lambda _self, _plan, *, query_connection: (
-            SimpleNamespace(query_id=plan_id, stages=()),
-            object(),
-        ),
+        _query_registration_stub(plan_id),
     )
     monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", _build_snapshot)
@@ -2195,20 +2195,20 @@ def test_driver_rejects_active_plan_identity_collision(copy_plan):
     existing_cursor_count = len(session.connection.cursors)
     with pytest.raises(RuntimeError, match="query plan identity is already active"):
         if copy_plan:
-            asyncio.run(
-                cls._run_copy_plan_for_session(
-                    runner,
-                    _TEST_SESSION_ID,
-                    session,
-                    _LogicalPlan(),
-                )
-            )
-        else:
-            cls._run_plan_sync(
+            cls._prepare_copy_plan_sync(
                 runner,
                 _TEST_SESSION_ID,
                 session,
                 _LogicalPlan(),
+                plan_id,
+            )
+        else:
+            cls._prepare_plan_sync(
+                runner,
+                _TEST_SESSION_ID,
+                session,
+                _LogicalPlan(),
+                plan_id,
             )
 
     assert len(session.connection.cursors) == existing_cursor_count + 1
@@ -2243,20 +2243,20 @@ def test_driver_applies_session_s3_config_to_query_cursor(copy_plan):
 
     with pytest.raises(RuntimeError, match="planned stop after query cursor configuration"):
         if copy_plan:
-            asyncio.run(
-                cls._run_copy_plan_for_session(
-                    runner,
-                    _TEST_SESSION_ID,
-                    session,
-                    _LogicalPlan(),
-                )
-            )
-        else:
-            cls._run_plan_sync(
+            cls._prepare_copy_plan_sync(
                 runner,
                 _TEST_SESSION_ID,
                 session,
                 _LogicalPlan(),
+                "s3-config-plan",
+            )
+        else:
+            cls._prepare_plan_sync(
+                runner,
+                _TEST_SESSION_ID,
+                session,
+                _LogicalPlan(),
+                "s3-config-plan",
             )
 
     query_connection = session.connection.cursors[-1]
@@ -2303,20 +2303,20 @@ def test_driver_explicit_s3_settings_bypass_and_clear_session_credentials(monkey
 
     with pytest.raises(RuntimeError, match="planned stop after explicit S3 baseline reset"):
         if copy_plan:
-            asyncio.run(
-                cls._run_copy_plan_for_session(
-                    runner,
-                    _TEST_SESSION_ID,
-                    session,
-                    _LogicalPlan(),
-                )
-            )
-        else:
-            cls._run_plan_sync(
+            cls._prepare_copy_plan_sync(
                 runner,
                 _TEST_SESSION_ID,
                 session,
                 _LogicalPlan(),
+                "explicit-s3-config-plan",
+            )
+        else:
+            cls._prepare_plan_sync(
+                runner,
+                _TEST_SESSION_ID,
+                session,
+                _LogicalPlan(),
+                "explicit-s3-config-plan",
             )
 
     query_connection = session.connection.cursors[-1]
@@ -2382,8 +2382,14 @@ def test_copy_resource_registration_does_not_block_actor_loop(monkeypatch):
     registration_release = threading.Event()
     plan_id = "slow-copy-resource-registration"
 
-    def _delayed_registration(_self, _plan, *, query_connection):
+    def _delayed_registration(
+        _self,
+        _plan,
+        query_connection,
+        expected_plan_id=None,
+    ):
         assert query_connection is runner._test_session_connection.cursors[-1]
+        assert expected_plan_id == plan_id
         with pytest.raises(RuntimeError, match="no running event loop"):
             asyncio.get_running_loop()
         registration_started.set()
@@ -2395,7 +2401,7 @@ def test_copy_resource_registration_does_not_block_actor_loop(monkeypatch):
         assert drop_fragments is False
         cls._release_plan_session_state(runner, actual_plan_id)
 
-    monkeypatch.setattr(cls, "_register_query_resources", _delayed_registration)
+    monkeypatch.setattr(cls, "_prepare_query_resource_registration", _delayed_registration)
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
     async def _register_while_serving_control_requests():
@@ -2444,20 +2450,20 @@ def test_driver_rejects_logical_to_physical_plan_identity_change(copy_plan):
     existing_cursor_count = len(session.connection.cursors)
     with pytest.raises(RuntimeError, match="logical/physical query plan identity changed"):
         if copy_plan:
-            asyncio.run(
-                cls._run_copy_plan_for_session(
-                    runner,
-                    _TEST_SESSION_ID,
-                    session,
-                    _ChangedIdentityLogicalPlan(),
-                )
-            )
-        else:
-            cls._run_plan_sync(
+            cls._prepare_copy_plan_sync(
                 runner,
                 _TEST_SESSION_ID,
                 session,
                 _ChangedIdentityLogicalPlan(),
+                "logical-plan",
+            )
+        else:
+            cls._prepare_plan_sync(
+                runner,
+                _TEST_SESSION_ID,
+                session,
+                _ChangedIdentityLogicalPlan(),
+                "logical-plan",
             )
 
     assert len(session.connection.cursors) == existing_cursor_count + 1
