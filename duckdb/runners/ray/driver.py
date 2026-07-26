@@ -86,6 +86,28 @@ class _DeferredQueryAllocationTeardown:
     reason: str
 
 
+class _PlanStartupOwnership:
+    """Hand registered resources to exactly one startup or cancellation path."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._owner = "caller"
+
+    def claim_for_worker(self) -> bool:
+        with self._lock:
+            if self._owner != "caller":
+                return False
+            self._owner = "worker"
+            return True
+
+    def cancel_before_worker_claim(self) -> bool:
+        with self._lock:
+            if self._owner != "caller":
+                return False
+            self._owner = "cancelled"
+            return True
+
+
 def _progress_topology_init_timeout_s() -> float:
     value = float(
         os.environ.get(
@@ -3168,13 +3190,54 @@ class RayQueryDriverActor:
             plan,
             expected_plan_id=plan_id,
         )
-        await asyncio.to_thread(
-            self._run_plan_sync,
-            plan,
-            plan_id,
-            graph,
-            allocation,
+        startup_ownership = _PlanStartupOwnership()
+        startup = asyncio.create_task(
+            asyncio.to_thread(
+                self._run_plan_sync_with_ownership,
+                plan,
+                plan_id,
+                graph,
+                allocation,
+                startup_ownership,
+            ),
+            name=f"vane-plan-startup:{plan_id}",
         )
+        try:
+            await asyncio.shield(startup)
+        except asyncio.CancelledError as cancellation_error:
+            if startup_ownership.cancel_before_worker_claim():
+                startup.cancel()
+                await asyncio.gather(startup, return_exceptions=True)
+                try:
+                    await asyncio.to_thread(
+                        self._teardown_plan_resources,
+                        plan_id,
+                        str(graph.query_id),
+                        drop_fragments=False,
+                    )
+                except BaseException as teardown_error:
+                    raise RuntimeError(
+                        f"query plan {plan_id} was cancelled before startup and teardown failed: "
+                        f"{type(teardown_error).__name__}: {teardown_error}"
+                    ) from teardown_error
+            else:
+                try:
+                    await asyncio.shield(startup)
+                except BaseException as startup_error:
+                    raise startup_error from cancellation_error
+                try:
+                    await asyncio.to_thread(
+                        self._teardown_plan_resources,
+                        plan_id,
+                        str(graph.query_id),
+                        drop_fragments=True,
+                    )
+                except BaseException as teardown_error:
+                    raise RuntimeError(
+                        f"query plan {plan_id} was cancelled during startup and teardown failed: "
+                        f"{type(teardown_error).__name__}: {teardown_error}"
+                    ) from teardown_error
+            raise
 
     def _prepare_plan_sync(
         self,
@@ -3235,6 +3298,24 @@ class RayQueryDriverActor:
                     f"teardown={type(teardown_error).__name__}: {teardown_error}"
                 ) from start_error
             raise
+
+    def _run_plan_sync_with_ownership(
+        self,
+        plan: Any,
+        plan_id: str,
+        graph: Any,
+        allocation: Any,
+        startup_ownership: _PlanStartupOwnership,
+    ) -> None:
+        """Start only after atomically claiming the registered resources."""
+        if not startup_ownership.claim_for_worker():
+            return
+        self._run_plan_sync(
+            plan,
+            plan_id,
+            graph,
+            allocation,
+        )
 
     async def run_copy_plan(
         self,

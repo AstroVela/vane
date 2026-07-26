@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -279,6 +280,149 @@ def test_run_plan_does_not_read_physical_plan_id_after_registration():
 
     assert physical_plan.idx_calls == 2
     assert runner._plan_query_ids[query_id] == query_id
+
+
+def test_run_plan_cancellation_releases_registration_before_startup_worker_claim():
+    events: list[str] = []
+    coordinator = _FakeCoordinator(events)
+    runner_cls, runner = _runner(events, coordinator)
+    query_id = "query-cancelled-before-startup"
+    physical_plan = _FakePhysicalPlan(query_id, _metadata(query_id), events)
+    blocker_started = threading.Event()
+    blocker_release = threading.Event()
+    startup_entered = threading.Event()
+    executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="vane-test-saturated",
+    )
+
+    runner._precreate_udf_actors = lambda *_args: startup_entered.set() or []
+    runner._mark_query_actor_stages_ready = lambda _graph: None
+
+    async def _exercise() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(executor)
+        registration_complete = asyncio.Event()
+        blocker_future = None
+        register_query_resources = runner_cls._register_query_resources
+
+        def _occupy_default_executor() -> None:
+            blocker_started.set()
+            assert blocker_release.wait(timeout=2.0)
+
+        async def _register_then_saturate(
+            plan,
+            *,
+            expected_plan_id=None,
+        ):
+            nonlocal blocker_future
+            registered = await register_query_resources(
+                runner,
+                plan,
+                expected_plan_id=expected_plan_id,
+            )
+            blocker_future = loop.run_in_executor(
+                None,
+                _occupy_default_executor,
+            )
+            while not blocker_started.is_set():
+                await asyncio.sleep(0)
+            registration_complete.set()
+            return registered
+
+        runner._register_query_resources = _register_then_saturate
+        run_plan = asyncio.create_task(
+            runner_cls.run_plan(
+                runner,
+                _FakeLogicalPlan(physical_plan, events),
+            )
+        )
+        try:
+            await asyncio.wait_for(
+                registration_complete.wait(),
+                timeout=1.0,
+            )
+            await asyncio.sleep(0)
+            assert startup_entered.is_set() is False
+            run_plan.cancel()
+            await asyncio.sleep(0)
+            blocker_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(run_plan, timeout=1.0)
+            assert blocker_future is not None
+            await blocker_future
+        finally:
+            blocker_release.set()
+
+    try:
+        asyncio.run(_exercise())
+    finally:
+        blocker_release.set()
+        executor.shutdown(wait=True)
+
+    with pytest.raises(KeyError, match="query graph is not registered"):
+        get_query_resource_manager(query_id)
+    assert startup_entered.is_set() is False
+    assert coordinator.released == [(query_id, 7)]
+    assert query_id not in runner._query_graphs
+    assert query_id not in runner._query_allocations
+
+
+def test_run_plan_cancellation_after_startup_claim_tears_down_once():
+    events: list[str] = []
+    coordinator = _FakeCoordinator(events)
+    runner_cls, runner = _runner(events, coordinator)
+    query_id = "query-cancelled-after-startup-claim"
+    physical_plan = _FakePhysicalPlan(query_id, _metadata(query_id), events)
+    startup_claimed = threading.Event()
+    startup_release = threading.Event()
+    fragment_drops: list[str] = []
+
+    def _precreate_udf_actors(*_args):
+        startup_claimed.set()
+        assert startup_release.wait(timeout=2.0)
+        return []
+
+    def _drop_query_fragments(actual_query_id: str) -> None:
+        fragment_drops.append(actual_query_id)
+        runner._release_query_resources(
+            actual_query_id,
+            reason="test_cancelled_during_startup",
+        )
+
+    runner._precreate_udf_actors = _precreate_udf_actors
+    runner._wait_for_udf_actors_ready = lambda _actors: None
+    runner._mark_query_actor_stages_ready = lambda _graph: None
+    runner._drop_query_fragments_sync = _drop_query_fragments
+
+    async def _exercise() -> None:
+        run_plan = asyncio.create_task(
+            runner_cls.run_plan(
+                runner,
+                _FakeLogicalPlan(physical_plan, events),
+            )
+        )
+        try:
+            while not startup_claimed.is_set():
+                await asyncio.sleep(0)
+            run_plan.cancel()
+            startup_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(run_plan, timeout=1.0)
+        finally:
+            startup_release.set()
+
+    asyncio.run(_exercise())
+
+    with pytest.raises(KeyError, match="query graph is not registered"):
+        get_query_resource_manager(query_id)
+    assert fragment_drops == [query_id]
+    assert coordinator.released == [(query_id, 7)]
+    assert query_id not in runner.curr_plans
+    assert query_id not in runner.curr_streams
+    assert query_id not in runner._plan_query_ids
+    assert query_id not in runner._query_graphs
+    assert query_id not in runner._query_allocations
 
 
 def test_driver_rolls_back_graph_and_cluster_allocation_when_actor_initialization_fails():
