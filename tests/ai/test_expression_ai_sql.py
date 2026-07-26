@@ -480,7 +480,54 @@ def test_ai_prompt_sql_with_mock_provider():
     assert rows == [("topic:alpha",), ("topic:beta",)]
 
 
-@pytest.mark.parametrize("null_image", ["NULL::BLOB", "NULL::BLOB[]"])
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "ai_prompt(NULL, struct_pack(provider := 'mock_ai_sql', concurrency := 1))",
+        "ai_prompt(NULL::VARCHAR, struct_pack(provider := 'mock_ai_sql', concurrency := 1))",
+        "ai_embed(NULL, struct_pack(provider := 'mock_ai_sql', dimensions := 4, concurrency := 1))",
+        "ai_embed(NULL::VARCHAR, struct_pack(provider := 'mock_ai_sql', dimensions := 4, concurrency := 1))",
+        "ai_prompt('alpha', NULL)",
+        "ai_embed('abc', NULL)",
+    ],
+)
+def test_ai_sql_text_signatures_preserve_legacy_null_propagation(monkeypatch, expression):
+    provider_calls = []
+
+    def recording_provider(name=None, **options):
+        provider_calls.append((name, options))
+        return MockProvider()
+
+    monkeypatch.setitem(provider_registry.PROVIDERS, "mock_ai_sql", recording_provider)
+    monkeypatch.setitem(provider_registry.PROVIDERS, "openai", recording_provider)
+    conn = vane.connect()
+
+    assert conn.sql(f"SELECT {expression} AS result").fetchall() == [(None,)]
+    assert provider_calls == []
+
+
+@pytest.mark.parametrize("null_prompt", ["NULL", "NULL::VARCHAR"])
+def test_ai_prompt_image_input_propagates_literal_null_prompt(null_prompt):
+    conn = vane.connect()
+
+    relation = conn.sql(f"""
+        SELECT ai_prompt(
+            {null_prompt},
+            from_hex('89504e47'),
+            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
+        ) AS response
+    """)
+
+    assert [str(dtype) for dtype in relation.types] == ["VARCHAR"]
+    assert relation.fetchall() == [(None,)]
+
+    _, target, physical, _ = _round_trip_ai_plan(relation)
+    assert physical.collect_udf_nodes() == []
+    table = _execute_ai_physical_plan(target, physical)
+    assert table.column(0).to_pylist() == [None]
+
+
+@pytest.mark.parametrize("null_image", ["NULL", "NULL::BLOB", "NULL::BLOB[]"])
 def test_ai_prompt_sql_with_literal_null_image(null_image):
     conn = vane.connect()
 

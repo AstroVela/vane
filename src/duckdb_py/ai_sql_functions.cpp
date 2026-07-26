@@ -9,6 +9,7 @@
 #include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb_python/pybind11/gil_wrapper.hpp"
 #include "duckdb_python/python_objects.hpp"
@@ -127,11 +128,13 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
                                           vector<unique_ptr<Expression>> &arguments, AISQLKind kind) {
 	auto options_index = OptionsArgumentIndex(kind, arguments.size());
 	auto image_input = kind == AISQLKind::PROMPT && arguments.size() == 3;
-	if (arguments[0]->return_type.id() != LogicalTypeId::VARCHAR) {
+	auto input_type_id = arguments[0]->return_type.id();
+	if (input_type_id != LogicalTypeId::VARCHAR && !(image_input && input_type_id == LogicalTypeId::SQLNULL)) {
 		throw BinderException("ai SQL input argument must be VARCHAR");
 	}
 	if (image_input && arguments[1]->return_type != LogicalType::BLOB &&
-	    arguments[1]->return_type != LogicalType::LIST(LogicalType::BLOB)) {
+	    arguments[1]->return_type != LogicalType::LIST(LogicalType::BLOB) &&
+	    arguments[1]->return_type.id() != LogicalTypeId::SQLNULL) {
 		throw BinderException("ai_prompt image argument must be BLOB or BLOB[]");
 	}
 
@@ -165,17 +168,29 @@ static void AISQLExecute(DataChunk &, ExpressionState &, Vector &) {
 	    "ai SQL functions can only be used in a projection and must be planned as UDF operators");
 }
 
+static unique_ptr<Expression> LowerAISQLImageExpressionUDF(FunctionBindExpressionInput &input) {
+	if (!input.children.empty() && input.children[0]->IsFoldable()) {
+		Value prompt;
+		if (ExpressionExecutor::TryEvaluateScalar(input.context, *input.children[0], prompt) && prompt.IsNull()) {
+			if (!input.bind_data) {
+				throw BinderException("registered expression UDF is missing bind payload");
+			}
+			auto &registered_data = input.bind_data->Cast<UDFFunctionData>();
+			return make_uniq<BoundConstantExpression>(Value(registered_data.return_type));
+		}
+	}
+	return LowerRegisteredExpressionUDFPreservingFoldableNulls(input);
+}
+
 static void AddAISQLFunctions(ScalarFunctionSet &set, bind_scalar_function_t bind, bool include_image_inputs) {
 	auto base = ScalarFunction({LogicalType::VARCHAR}, LogicalType::ANY, AISQLExecute, bind, nullptr, nullptr, nullptr,
 	                           LogicalType::INVALID, FunctionStability::VOLATILE);
-	base.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	base.SetBindExpressionCallback(LowerRegisteredExpressionUDFPreservingFoldableNulls);
+	base.SetBindExpressionCallback(LowerRegisteredExpressionUDF);
 	set.AddFunction(std::move(base));
 
 	auto with_options = ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY, AISQLExecute, bind,
 	                                   nullptr, nullptr, nullptr, LogicalType::INVALID, FunctionStability::VOLATILE);
-	with_options.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	with_options.SetBindExpressionCallback(LowerRegisteredExpressionUDFPreservingFoldableNulls);
+	with_options.SetBindExpressionCallback(LowerRegisteredExpressionUDF);
 	set.AddFunction(std::move(with_options));
 
 	if (!include_image_inputs) {
@@ -185,14 +200,14 @@ static void AddAISQLFunctions(ScalarFunctionSet &set, bind_scalar_function_t bin
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::ANY}, LogicalType::ANY, AISQLExecute,
 	                   bind, nullptr, nullptr, nullptr, LogicalType::INVALID, FunctionStability::VOLATILE);
 	with_image.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	with_image.SetBindExpressionCallback(LowerRegisteredExpressionUDFPreservingFoldableNulls);
+	with_image.SetBindExpressionCallback(LowerAISQLImageExpressionUDF);
 	set.AddFunction(std::move(with_image));
 
 	auto with_images = ScalarFunction({LogicalType::VARCHAR, LogicalType::LIST(LogicalType::BLOB), LogicalType::ANY},
 	                                  LogicalType::ANY, AISQLExecute, bind, nullptr, nullptr, nullptr,
 	                                  LogicalType::INVALID, FunctionStability::VOLATILE);
 	with_images.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	with_images.SetBindExpressionCallback(LowerRegisteredExpressionUDFPreservingFoldableNulls);
+	with_images.SetBindExpressionCallback(LowerAISQLImageExpressionUDF);
 	set.AddFunction(std::move(with_images));
 }
 
