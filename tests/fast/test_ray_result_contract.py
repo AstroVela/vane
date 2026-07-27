@@ -6573,7 +6573,11 @@ def test_ray_runner_close_is_terminal_and_idempotent(monkeypatch):
 def test_connection_close_notification_attempts_every_live_runner(monkeypatch):
     from duckdb.runners.ray import runner as runner_module
 
+    target_session_id = "session-a"
     calls = []
+
+    def runners_called_for(session_id):
+        return sorted(name for name, called_session_id in calls if called_session_id == session_id)
 
     class _LiveRunner:
         def __init__(self, name, *, fail):
@@ -6582,30 +6586,27 @@ def test_connection_close_notification_attempts_every_live_runner(monkeypatch):
 
         def close_session(self, session_id):
             calls.append((self.name, session_id))
-            if self.fail:
+            if self.fail and session_id == target_session_id:
                 raise RuntimeError(f"planned close failure on {self.name}")
 
     failing = _LiveRunner("runner-a", fail=True)
     succeeding = _LiveRunner("runner-b", fail=False)
     monkeypatch.setattr(runner_module, "_RAY_RUNNERS", {failing, succeeding})
 
-    with pytest.raises(RuntimeError, match="planned close failure on runner-a"):
-        runner_module.notify_connection_closed("session-a")
+    # A connection finalized by another test may notify the process-global
+    # runner registry while this monkeypatch is active.
+    runner_module.notify_connection_closed("unrelated-session")
+    assert runners_called_for("unrelated-session") == ["runner-a", "runner-b"]
 
-    assert sorted(calls) == [
-        ("runner-a", "session-a"),
-        ("runner-b", "session-a"),
-    ]
+    with pytest.raises(RuntimeError, match="planned close failure on runner-a"):
+        runner_module.notify_connection_closed(target_session_id)
+
+    assert runners_called_for(target_session_id) == ["runner-a", "runner-b"]
 
     failing.fail = False
-    runner_module.notify_connection_closed("session-a")
+    runner_module.notify_connection_closed(target_session_id)
 
-    assert sorted(calls) == [
-        ("runner-a", "session-a"),
-        ("runner-a", "session-a"),
-        ("runner-b", "session-a"),
-        ("runner-b", "session-a"),
-    ]
+    assert runners_called_for(target_session_id) == ["runner-a", "runner-a", "runner-b", "runner-b"]
 
 
 def test_ray_runner_session_start_and_close_are_serialized(monkeypatch):
