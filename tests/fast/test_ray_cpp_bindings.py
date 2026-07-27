@@ -580,6 +580,145 @@ def test_ray_task_result_handle_uses_refreshed_worker_id_and_nested_sink_query_i
     assert handle.release_calls == 1
 
 
+class _PollerTestHandle:
+    def __init__(
+        self,
+        name,
+        *,
+        done_error=None,
+        result_error=None,
+        ready_after=1,
+    ):
+        self.worker_id = f"worker-{name}"
+        self.done_error = done_error
+        self.result_error = result_error
+        self.ready_after = ready_after
+        self.done_calls = 0
+
+    def done(self):
+        if self.done_error is not None:
+            raise self.done_error
+        self.done_calls += 1
+        return self.done_calls >= self.ready_after
+
+    def get_result_sync(self):
+        if self.result_error is not None:
+            raise self.result_error
+        return duckdb.ray_cxx.RayTaskResult.success([], [], None, 5010, None)
+
+
+def _poll_with_shared_ray_task_result_poller(*handles):
+    return duckdb.ray_cxx._ray_task_result_poller_batch_for_test(list(handles), timeout_ms=5000)
+
+
+def _assert_successful_poller_outcome(outcome, worker_id):
+    assert outcome == {
+        "terminal": True,
+        "is_error": False,
+        "error": "",
+        "has_output": True,
+        "worker_id": worker_id,
+    }
+
+
+def test_ray_task_result_poller_isolates_handle_done_failure_and_recovers():
+    healthy = _PollerTestHandle("healthy", ready_after=3)
+    outcomes = _poll_with_shared_ray_task_result_poller(
+        _PollerTestHandle("broken", done_error=RuntimeError("injected done failure")),
+        healthy,
+    )
+
+    assert outcomes[0]["terminal"] is True
+    assert outcomes[0]["is_error"] is True
+    assert "operation=handle.done" in outcomes[0]["error"]
+    assert "task_id=poller-test.0" in outcomes[0]["error"]
+    assert "injected done failure" in outcomes[0]["error"]
+    _assert_successful_poller_outcome(outcomes[1], "worker-healthy")
+    assert healthy.done_calls >= 3
+
+    recovery = _poll_with_shared_ray_task_result_poller(_PollerTestHandle("recovery"))
+    _assert_successful_poller_outcome(recovery[0], "worker-recovery")
+
+
+def test_ray_task_result_poller_falls_back_after_batch_helper_failure(monkeypatch, capfd):
+    from duckdb.runners.ray import driver
+
+    def fail_batch_wait(_handles):
+        raise RuntimeError("injected batch helper failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(driver, "batch_wait_ready", fail_batch_wait)
+        outcomes = _poll_with_shared_ray_task_result_poller(
+            _PollerTestHandle("first", ready_after=3),
+            _PollerTestHandle("second", ready_after=4),
+        )
+
+    _assert_successful_poller_outcome(outcomes[0], "worker-first")
+    _assert_successful_poller_outcome(outcomes[1], "worker-second")
+    stderr = capfd.readouterr().err
+    assert "operation=batch_wait_ready" in stderr
+    assert "injected batch helper failure" in stderr
+    assert stderr.count("[vane-ray-result-poller]") == 1
+
+    recovery = _poll_with_shared_ray_task_result_poller(_PollerTestHandle("recovery"))
+    _assert_successful_poller_outcome(recovery[0], "worker-recovery")
+
+
+def test_ray_task_result_poller_falls_back_after_driver_import_failure(monkeypatch, capfd):
+    with monkeypatch.context() as patch:
+        patch.setitem(sys.modules, "duckdb.runners.ray.driver", None)
+        outcomes = _poll_with_shared_ray_task_result_poller(_PollerTestHandle("healthy"))
+
+    _assert_successful_poller_outcome(outcomes[0], "worker-healthy")
+    stderr = capfd.readouterr().err
+    assert "operation=import duckdb.runners.ray.driver" in stderr
+    assert "duckdb.runners.ray.driver" in stderr
+
+    recovery = _poll_with_shared_ray_task_result_poller(_PollerTestHandle("recovery"))
+    _assert_successful_poller_outcome(recovery[0], "worker-recovery")
+
+
+@pytest.mark.parametrize(
+    ("ready_indices", "error_fragment"),
+    [
+        pytest.param(["invalid"], "must be an integer", id="non-integer"),
+        pytest.param([-1], "must be non-negative", id="negative"),
+        pytest.param([1], "out of range", id="out-of-range"),
+        pytest.param([0, 0], "duplicate", id="duplicate"),
+    ],
+)
+def test_ray_task_result_poller_falls_back_after_invalid_ready_indices(
+    monkeypatch,
+    capfd,
+    ready_indices,
+    error_fragment,
+):
+    from duckdb.runners.ray import driver
+
+    with monkeypatch.context() as patch:
+        patch.setattr(driver, "batch_wait_ready", lambda _handles: ready_indices)
+        outcomes = _poll_with_shared_ray_task_result_poller(_PollerTestHandle("healthy"))
+
+    _assert_successful_poller_outcome(outcomes[0], "worker-healthy")
+    stderr = capfd.readouterr().err
+    assert "operation=decode batch_wait_ready result" in stderr
+    assert error_fragment in stderr
+
+
+def test_ray_task_result_poller_isolates_per_handle_completion_failure():
+    outcomes = _poll_with_shared_ray_task_result_poller(
+        _PollerTestHandle("broken", result_error=RuntimeError("injected completion failure")),
+        _PollerTestHandle("healthy"),
+    )
+
+    assert outcomes[0]["terminal"] is True
+    assert outcomes[0]["is_error"] is True
+    assert "operation=handle.get_result_sync" in outcomes[0]["error"]
+    assert "task_id=poller-test.0" in outcomes[0]["error"]
+    assert "injected completion failure" in outcomes[0]["error"]
+    _assert_successful_poller_outcome(outcomes[1], "worker-healthy")
+
+
 def test_flight_exchange_source_reads_only_selected_retry_attempt_data(tmp_path):
     result = duckdb.ray_cxx.flight_exchange_selected_attempt_dataplane_for_test(str(tmp_path))
 
