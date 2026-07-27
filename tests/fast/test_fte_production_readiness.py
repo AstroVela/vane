@@ -1,8 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-import json
-
 from multimodal_inference_benchmarks import check_fte_production_readiness as readiness
 
 
@@ -15,34 +13,12 @@ def _ready_env(shuffle_dir):
     }
 
 
-def _write_full_matrix_manifest(path, suites=readiness.DEFAULT_SUITES, *, full=True):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for suite in suites:
-            handle.write(
-                json.dumps(
-                    {
-                        "event": "comparison_success",
-                        "suite": suite,
-                        "full": full,
-                        "reference": {"row_count": 1, "hash_sum": "1", "hash_xor": "1"},
-                        "chaos": {"row_count": 1, "hash_sum": "1", "hash_xor": "1"},
-                    }
-                )
-                + "\n"
-            )
-
-
 def test_fte_production_readiness_passes_ready_environment(tmp_path):
     shuffle_dir = tmp_path / "shuffle"
     shuffle_dir.mkdir()
-    manifest_path = tmp_path / "manifest.jsonl"
-    _write_full_matrix_manifest(manifest_path)
 
     checks = readiness.evaluate_readiness(
         env=_ready_env(shuffle_dir),
-        manifest_path=manifest_path,
-        require_full_matrix=True,
         min_shuffle_free_bytes=0,
     )
 
@@ -50,48 +26,49 @@ def test_fte_production_readiness_passes_ready_environment(tmp_path):
     assert {check.status for check in checks} == {"PASS"}
 
 
-def test_fte_production_readiness_reports_required_failures():
+def test_fte_production_readiness_warns_for_recommended_settings():
     checks = readiness.evaluate_readiness(
         env={},
-        manifest_path=None,
-        require_full_matrix=True,
-        min_shuffle_free_bytes=0,
-    )
-    failures = {check.name for check in checks if check.status == "FAIL"}
-
-    assert readiness.overall_status(checks) == "FAIL"
-    assert "benchmark.full_matrix" in failures
-
-
-def test_fte_production_readiness_warns_for_optional_manifest_without_requirement(tmp_path):
-    shuffle_dir = tmp_path / "shuffle"
-    shuffle_dir.mkdir()
-
-    checks = readiness.evaluate_readiness(
-        env=_ready_env(shuffle_dir),
-        manifest_path=None,
-        require_full_matrix=False,
         min_shuffle_free_bytes=0,
     )
 
     assert readiness.overall_status(checks) == "WARN"
-    assert [check.status for check in checks if check.name == "benchmark.full_matrix"] == ["WARN"]
+    warnings = {check.name for check in checks if check.status == "WARN"}
+    assert warnings == {
+        "backpressure.vane_fte_split_queue_max_buffered_splits",
+        "backpressure.vane_fte_task_update_max_splits",
+        "backpressure.vane_fte_task_update_max_payload_bytes",
+        "shuffle.path",
+    }
 
 
-def test_fte_production_readiness_rejects_smoke_manifest_when_full_required(tmp_path):
+def test_fte_production_readiness_rejects_invalid_retry_configuration(tmp_path):
     shuffle_dir = tmp_path / "shuffle"
     shuffle_dir.mkdir()
-    manifest_path = tmp_path / "manifest.jsonl"
-    _write_full_matrix_manifest(manifest_path, full=False)
+    env = _ready_env(shuffle_dir)
+    env["VANE_FTE_RETRY_INITIAL_DELAY_S"] = "0"
+    env["VANE_FTE_RETRY_MAX_DELAY_S"] = "invalid"
 
     checks = readiness.evaluate_readiness(
-        env=_ready_env(shuffle_dir),
-        manifest_path=manifest_path,
-        require_full_matrix=True,
+        env=env,
         min_shuffle_free_bytes=0,
     )
 
     assert readiness.overall_status(checks) == "FAIL"
-    assert [check.details["smoke_suites"] for check in checks if check.name == "benchmark.full_matrix"] == [
-        list(readiness.DEFAULT_SUITES)
-    ]
+    failures = {check.name for check in checks if check.status == "FAIL"}
+    assert failures == {
+        "retry.vane_fte_retry_initial_delay_s",
+        "retry.vane_fte_retry_max_delay_s",
+    }
+
+
+def test_fte_production_readiness_rejects_missing_shuffle_parent(tmp_path):
+    checks = readiness.evaluate_readiness(
+        env=_ready_env(tmp_path / "missing" / "shuffle"),
+        min_shuffle_free_bytes=0,
+    )
+
+    assert readiness.overall_status(checks) == "FAIL"
+    failures = [check for check in checks if check.status == "FAIL"]
+    assert [check.name for check in failures] == ["shuffle.path.0"]
+    assert failures[0].message == "shuffle path parent does not exist"
