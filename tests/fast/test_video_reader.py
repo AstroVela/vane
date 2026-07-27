@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import io
+import logging
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
@@ -17,8 +19,9 @@ from duckdb.datasource.video_reader import (
     _coalesce_video_frame_batches,
     _decode_video_batches,
     _flush_frame_batch,
-    _read_s3_bytes,
+    _materialize_video_path,
     _resize_frame_batch,
+    _s3_filesystem,
     _split_video_path_groups,
     _video_frame_source_manifest_sql,
     _video_frame_source_map_batches,
@@ -50,6 +53,9 @@ def recording_s3_filesystem(monkeypatch):
         def __init__(self, **kwargs):
             recorded["kwargs"] = kwargs
 
+        def get_file_info(self, _path):
+            return type("FileInfo", (), {"size": len(b"video-bytes")})()
+
         def open_input_file(self, path):
             recorded["path"] = path
             return io.BytesIO(b"video-bytes")
@@ -63,16 +69,247 @@ def _clear_s3_environment(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
-def test_video_s3_reader_uses_default_aws_sdk_chain(monkeypatch, recording_s3_filesystem):
+def test_video_s3_reader_uses_default_aws_sdk_chain(
+    monkeypatch,
+    recording_s3_filesystem,
+    tmp_path,
+):
     _clear_s3_environment(monkeypatch)
 
-    result = _read_s3_bytes("s3://media-bucket/clips/example.mp4")
+    with _materialize_video_path(
+        "s3://media-bucket/clips/example.mp4",
+        max_remote_video_bytes=1024,
+        remote_temp_dir=str(tmp_path),
+    ) as local_path:
+        result = Path(local_path).read_bytes()
 
     assert result == b"video-bytes"
     assert recording_s3_filesystem == {
         "kwargs": {},
         "path": "media-bucket/clips/example.mp4",
     }
+
+
+def test_remote_video_materialization_reads_bounded_chunks_and_cleans_up(monkeypatch, tmp_path):
+    import pyarrow.fs as pa_fs
+
+    import duckdb.datasource.video_reader as video_reader
+
+    chunk_bytes = video_reader._REMOTE_VIDEO_READ_CHUNK_BYTES
+    object_size = 2 * chunk_bytes + 17
+    read_sizes = []
+
+    class LazyRemoteFile:
+        def __init__(self):
+            self.remaining = object_size
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            assert 0 < size <= chunk_bytes
+            count = min(size, self.remaining)
+            self.remaining -= count
+            return b"x" * count
+
+    class FakeFileInfo:
+        size = object_size
+
+    class FakeS3FileSystem:
+        def __init__(self, **_kwargs):
+            pass
+
+        def get_file_info(self, path):
+            assert path == "media-bucket/clips/example.mp4"
+            return FakeFileInfo()
+
+        def open_input_file(self, path):
+            assert path == "media-bucket/clips/example.mp4"
+            return LazyRemoteFile()
+
+    monkeypatch.setattr(pa_fs, "S3FileSystem", FakeS3FileSystem)
+
+    with video_reader._materialize_video_path(
+        "s3://media-bucket/clips/example.mp4",
+        max_remote_video_bytes=object_size,
+        remote_temp_dir=str(tmp_path),
+    ) as local_path:
+        assert Path(local_path).stat().st_size == object_size
+        assert Path(local_path).parent == tmp_path
+
+    assert read_sizes == [chunk_bytes, chunk_bytes, chunk_bytes, chunk_bytes]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_remote_video_materialization_rejects_oversized_stream_and_cleans_up(monkeypatch, tmp_path):
+    import pyarrow.fs as pa_fs
+
+    import duckdb.datasource.video_reader as video_reader
+
+    limit = 1024
+
+    class GrowingRemoteFile:
+        def __init__(self):
+            self.read_count = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size=-1):
+            assert size == video_reader._REMOTE_VIDEO_READ_CHUNK_BYTES
+            self.read_count += 1
+            return b"x" * limit if self.read_count <= 2 else b""
+
+    class UnknownSizeFileInfo:
+        size = -1
+
+    class FakeS3FileSystem:
+        def __init__(self, **_kwargs):
+            pass
+
+        def get_file_info(self, _path):
+            return UnknownSizeFileInfo()
+
+        def open_input_file(self, _path):
+            return GrowingRemoteFile()
+
+    monkeypatch.setattr(pa_fs, "S3FileSystem", FakeS3FileSystem)
+
+    with pytest.raises(video_reader.RemoteVideoTooLargeError, match="exceeded limit 1024"):
+        with video_reader._materialize_video_path(
+            "s3://media-bucket/clips/example.mp4",
+            max_remote_video_bytes=limit,
+            remote_temp_dir=str(tmp_path),
+        ):
+            pytest.fail("oversized remote video should not be yielded")
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_remote_video_materialization_allows_unknown_size_metadata(monkeypatch, tmp_path):
+    import duckdb.datasource.video_reader as video_reader
+
+    class UnknownSizeFileInfo:
+        size = None
+
+    class FakeS3FileSystem:
+        def get_file_info(self, _path):
+            return UnknownSizeFileInfo()
+
+        def open_input_file(self, _path):
+            return io.BytesIO(b"video-bytes")
+
+    monkeypatch.setattr(video_reader, "_s3_filesystem", FakeS3FileSystem)
+
+    with video_reader._materialize_video_path(
+        "s3://media-bucket/clips/example.mp4",
+        max_remote_video_bytes=1024,
+        remote_temp_dir=str(tmp_path),
+    ) as local_path:
+        assert Path(local_path).read_bytes() == b"video-bytes"
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_video_source_identity_distinguishes_same_basename_sources():
+    import duckdb.datasource.video_reader as video_reader
+
+    path_a, source_id_a = video_reader._video_source_identity("s3://bucket-a/train/clip.mp4")
+    path_b, source_id_b = video_reader._video_source_identity("s3://bucket-b/eval/clip.mp4")
+
+    assert path_a == "s3://bucket-a/train/clip.mp4"
+    assert path_b == "s3://bucket-b/eval/clip.mp4"
+    assert len(source_id_a) == 64
+    assert len(source_id_b) == 64
+    assert source_id_a != source_id_b
+
+
+def test_video_source_identity_preserves_s3_object_key_semantics():
+    import duckdb.datasource.video_reader as video_reader
+
+    path, _ = video_reader._video_source_identity("s3://MEDIA-BUCKET/a//../clip.mp4")
+
+    assert path == "s3://media-bucket/a//../clip.mp4"
+
+
+def test_video_source_identity_resolves_symlink_before_parent_component(tmp_path):
+    import duckdb.datasource.video_reader as video_reader
+
+    decoded_root = tmp_path / "decoded"
+    decoded_dir = decoded_root / "nested"
+    decoded_dir.mkdir(parents=True)
+    decoded_video = decoded_root / "clip.mp4"
+    decoded_video.touch()
+    direct_video = tmp_path / "clip.mp4"
+    direct_video.touch()
+    link = tmp_path / "link"
+    link.symlink_to(decoded_dir, target_is_directory=True)
+
+    canonical_path, source_id = video_reader._video_source_identity(str(link / ".." / "clip.mp4"))
+    direct_path, direct_source_id = video_reader._video_source_identity(str(direct_video))
+
+    assert canonical_path == str(decoded_video.resolve())
+    assert direct_path == str(direct_video.resolve())
+    assert source_id != direct_source_id
+
+
+def test_video_decode_opens_the_resolved_local_source(monkeypatch, tmp_path):
+    import duckdb.datasource.video_reader as video_reader
+
+    decoded_root = tmp_path / "decoded"
+    decoded_dir = decoded_root / "nested"
+    decoded_dir.mkdir(parents=True)
+    decoded_video = decoded_root / "clip.mp4"
+    decoded_video.touch()
+    link = tmp_path / "link"
+    link.symlink_to(decoded_dir, target_is_directory=True)
+    input_path = str(link / ".." / "clip.mp4")
+    opened_paths = []
+
+    def fake_open_decoder(path, **_kwargs):
+        opened_paths.append(path)
+        return []
+
+    monkeypatch.setattr(video_reader, "_open_decord_reader", fake_open_decoder)
+
+    assert (
+        list(
+            _decode_video_batches(
+                input_path,
+                height=2,
+                width=2,
+                max_partition_bytes=1024,
+            )
+        )
+        == []
+    )
+    assert opened_paths == [str(decoded_video.resolve())]
+
+
+def test_video_read_errors_are_pickle_safe():
+    import pickle
+
+    import duckdb.datasource.video_reader as video_reader
+
+    for error_type in (
+        video_reader.VideoReadError,
+        video_reader.RemoteVideoTooLargeError,
+        video_reader.SourceFrameTooLargeError,
+    ):
+        error = error_type("s3://bucket/clip.mp4", "test failure")
+        restored = pickle.loads(pickle.dumps(error))
+
+        assert type(restored) is error_type
+        assert restored.video_path == error.video_path
+        assert restored.message == error.message
+        assert str(restored) == str(error)
 
 
 @pytest.mark.parametrize(
@@ -96,7 +333,7 @@ def test_video_s3_reader_leaves_profile_and_role_credentials_to_sdk(
     for name, value in credential_env.items():
         monkeypatch.setenv(name, value)
 
-    _read_s3_bytes("s3://media-bucket/example.mp4")
+    _s3_filesystem()
 
     assert recording_s3_filesystem["kwargs"] == {}
 
@@ -107,7 +344,7 @@ def test_video_s3_reader_leaves_static_session_credentials_to_sdk(monkeypatch, r
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "temporary-secret-key")
     monkeypatch.setenv("AWS_SESSION_TOKEN", "temporary-session-token")
 
-    _read_s3_bytes("s3://media-bucket/example.mp4")
+    _s3_filesystem()
 
     assert recording_s3_filesystem["kwargs"] == {}
 
@@ -129,7 +366,7 @@ def test_video_s3_reader_leaves_partial_static_credentials_to_sdk(
     for name, value in partial_credentials.items():
         monkeypatch.setenv(name, value)
 
-    _read_s3_bytes("s3://media-bucket/example.mp4")
+    _s3_filesystem()
 
     assert recording_s3_filesystem["kwargs"] == {}
 
@@ -144,7 +381,7 @@ def test_video_s3_reader_passes_custom_https_endpoint_and_region(
     monkeypatch.setenv("AWS_ENDPOINT_URL", "https://objects.example.test:9443/prefix")
     monkeypatch.setenv(region_env, "eu-west-1")
 
-    _read_s3_bytes("s3://media-bucket/example.mp4")
+    _s3_filesystem()
 
     assert recording_s3_filesystem["kwargs"] == {
         "endpoint_override": "objects.example.test:9443",
@@ -179,7 +416,7 @@ def test_video_s3_reader_normalizes_endpoint_override(
     _clear_s3_environment(monkeypatch)
     monkeypatch.setenv("AWS_ENDPOINT_URL", endpoint_url)
 
-    _read_s3_bytes("s3://media-bucket/example.mp4")
+    _s3_filesystem()
 
     assert recording_s3_filesystem["kwargs"] == expected_kwargs
 
@@ -191,7 +428,7 @@ def test_video_s3_reader_does_not_enable_anonymous_mode_when_explicitly_disabled
     _clear_s3_environment(monkeypatch)
     monkeypatch.setenv("S3FS_ANON", "false")
 
-    _read_s3_bytes("s3://media-bucket/example.mp4")
+    _s3_filesystem()
 
     assert recording_s3_filesystem["kwargs"] == {}
 
@@ -202,7 +439,7 @@ def test_video_s3_reader_uses_anonymous_mode_only_when_explicit(monkeypatch, rec
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ignored-access-key")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "ignored-secret-key")
 
-    _read_s3_bytes("s3://public-media/example.mp4")
+    _s3_filesystem()
 
     assert recording_s3_filesystem["kwargs"] == {"anonymous": True}
 
@@ -240,10 +477,104 @@ def test_video_frame_source_manifest_groups_paths_like_ray_read_tasks():
     assert [len(group) for group in _split_video_path_groups(source.paths, 4)] == [3, 3, 3, 2]
     assert sql.count("list_value(") == 4
     assert "video_paths::VARCHAR[]" in sql
+    assert "max_remote_video_bytes::BIGINT" in sql
+    assert "max_source_frame_bytes::BIGINT" in sql
+    assert "max_source_path_bytes::BIGINT" in sql
+    assert "on_error::VARCHAR" in sql
+
+
+@pytest.mark.parametrize("on_error", ["", "ignore", "warn"])
+def test_video_frame_source_rejects_unknown_error_mode(on_error):
+    with pytest.raises(ValueError, match="on_error must be one of: raise, skip"):
+        VideoFrameSource(["a.avi"], on_error=on_error)
+
+
+def test_video_frame_source_rejects_decoder_frame_above_cap():
+    with pytest.raises(
+        ValueError,
+        match="bounded decoder frame size 384 exceeds max_source_frame_bytes 383",
+    ):
+        VideoFrameSource(
+            ["a.avi"],
+            height=4,
+            width=4,
+            max_source_frame_bytes=383,
+        )
 
 
 def test_video_source_uses_ray_soft_block_row_boundary():
-    assert _video_source_udf_output_batch_size(640, 640, 128 * 1024**2) == 110
+    assert _video_source_udf_output_batch_size(640, 640, 128 * 1024**2) == 109
+
+
+def test_video_source_batch_size_accounts_for_provenance_columns():
+    import duckdb.datasource.video_reader as video_reader
+
+    target_bytes = 1024
+    max_source_path_bytes = 100
+    batch_size = _video_source_udf_output_batch_size(
+        1,
+        1,
+        target_bytes,
+        max_source_path_bytes=max_source_path_bytes,
+    )
+
+    assert batch_size == 6
+    assert (
+        video_reader._video_output_batch_bytes(
+            batch_size - 1,
+            height=1,
+            width=1,
+            max_source_path_bytes=max_source_path_bytes,
+        )
+        <= target_bytes
+    )
+    assert (
+        video_reader._video_output_batch_bytes(
+            batch_size,
+            height=1,
+            width=1,
+            max_source_path_bytes=max_source_path_bytes,
+        )
+        > target_bytes
+    )
+    below_target = _flush_frame_batch(
+        "s" * video_reader._SOURCE_ID_BYTES,
+        "p" * max_source_path_bytes,
+        np.zeros((batch_size - 1, 1, 1, 3), dtype=np.uint8),
+        np.arange(batch_size - 1, dtype=np.int64),
+        batch_size - 1,
+    )
+    crossing_target = _flush_frame_batch(
+        "s" * video_reader._SOURCE_ID_BYTES,
+        "p" * max_source_path_bytes,
+        np.zeros((batch_size, 1, 1, 3), dtype=np.uint8),
+        np.arange(batch_size, dtype=np.int64),
+        batch_size,
+    )
+    assert below_target.nbytes <= target_bytes
+    assert crossing_target.nbytes > target_bytes
+
+
+def test_video_source_batch_size_respects_arrow_string_offset_limit():
+    import duckdb.datasource.video_reader as video_reader
+
+    max_source_path_bytes = 1024
+    expected_limit = video_reader._ARROW_STRING_DATA_MAX_BYTES // max_source_path_bytes
+
+    assert (
+        _video_source_udf_output_batch_size(
+            1,
+            1,
+            10**15,
+            max_source_path_bytes=max_source_path_bytes,
+        )
+        == expected_limit
+    )
+    with pytest.raises(ValueError, match="exceeding Arrow's .* UTF-8 offset limit"):
+        video_reader._constant_string_array(
+            "x" * max_source_path_bytes,
+            expected_limit + 1,
+        )
 
 
 def test_video_source_transport_does_not_resplit_ray_soft_block(monkeypatch):
@@ -257,7 +588,7 @@ def test_video_source_transport_does_not_resplit_ray_soft_block(monkeypatch):
         max_partition_bytes=target_bytes,
     )
 
-    assert kwargs["output_batch_size"] == 110
+    assert kwargs["output_batch_size"] == 109
     assert kwargs["output_target_max_bytes"] == 2 * target_bytes
     assert kwargs["preserve_compute_batch_boundaries"] is True
 
@@ -289,23 +620,283 @@ def test_video_decode_batches_do_not_mutate_emitted_arrow_buffers(monkeypatch):
             self._value = value
 
         def asnumpy(self):
-            return np.full((2, 2, 3), self._value, dtype=np.uint8)
+            return np.full((2, 32, 3), self._value, dtype=np.uint8)
 
-    monkeypatch.setattr(video_reader, "_open_decord_reader", lambda _path: [FakeFrame(i) for i in range(5)])
+    monkeypatch.setattr(
+        video_reader,
+        "_open_decord_reader",
+        lambda _path, **_kwargs: [FakeFrame(i) for i in range(5)],
+    )
     monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 1)
+    source_path, _ = video_reader._video_source_identity("clip.avi")
+    max_partition_bytes = video_reader._video_output_batch_bytes(
+        1,
+        height=2,
+        width=2,
+        max_source_path_bytes=len(source_path.encode("utf-8")),
+    )
 
     batches = list(
         _decode_video_batches(
             "clip.avi",
             height=2,
             width=2,
-            # One 12-byte frame reaches the soft target, so each batch has 2 rows.
-            max_partition_bytes=12,
+            # One complete output row reaches the soft target, so the crossing
+            # row makes each full batch contain two rows.
+            max_partition_bytes=max_partition_bytes,
         )
     )
 
     values = [batch.column("frame").to_numpy_ndarray()[:, 0, 0, 0].tolist() for batch in batches]
     assert values == [[0, 1], [2, 3], [4]]
+    expected_path, expected_source_id = video_reader._video_source_identity("clip.avi")
+    assert batches[0].column("video_path").to_pylist() == [expected_path, expected_path]
+    assert batches[0].column("source_id").to_pylist() == [expected_source_id, expected_source_id]
+
+
+def test_video_decoder_uses_one_thread_for_bounded_native_buffering(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    calls = []
+
+    class FakeVideoReader:
+        def __init__(self, path, *, width, height, num_threads):
+            calls.append((path, width, height, num_threads))
+
+    class FakeDecordModule:
+        VideoReader = FakeVideoReader
+
+    monkeypatch.setattr(video_reader, "_import_video_dependency", lambda *_args: FakeDecordModule)
+
+    reader = video_reader._open_decord_reader("clip.avi", width=320, height=180)
+
+    assert isinstance(reader, FakeVideoReader)
+    assert calls == [("clip.avi", 320, 180, 1)]
+
+
+def test_video_decode_aligns_narrow_decord_output_before_exact_resize(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    class FakeFrame:
+        shape = (2, 32, 3)
+
+        def asnumpy(self):
+            return np.zeros(self.shape, dtype=np.uint8)
+
+    calls = []
+
+    def fake_open_decoder(path, **kwargs):
+        calls.append((path, kwargs))
+        return [FakeFrame()]
+
+    monkeypatch.setattr(video_reader, "_open_decord_reader", fake_open_decoder)
+
+    batches = list(
+        _decode_video_batches(
+            "clip.avi",
+            height=2,
+            width=2,
+            max_partition_bytes=1024,
+            max_source_frame_bytes=2 * 32 * 3,
+        )
+    )
+
+    source_path, _ = video_reader._video_source_identity("clip.avi")
+    assert calls == [(source_path, {"width": 32, "height": 2})]
+    assert batches[0].column("frame").type.shape == [2, 2, 3]
+
+
+def test_video_decode_does_not_advance_reader_past_frame_limit(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    class FakeFrame:
+        shape = (2, 32, 3)
+
+        def asnumpy(self):
+            return np.zeros(self.shape, dtype=np.uint8)
+
+    class BoundaryReader:
+        def __init__(self):
+            self.next_calls = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.next_calls += 1
+            if self.next_calls == 1:
+                return FakeFrame()
+            pytest.fail("decoder advanced beyond max_frames")
+
+    reader = BoundaryReader()
+    monkeypatch.setattr(video_reader, "_open_decord_reader", lambda _path, **_kwargs: reader)
+
+    batches = list(
+        video_reader._decode_video_batches(
+            "clip.avi",
+            height=2,
+            width=2,
+            max_partition_bytes=1024,
+            max_frames=1,
+        )
+    )
+
+    assert sum(batch.num_rows for batch in batches) == 1
+    assert reader.next_calls == 1
+
+
+def test_remote_video_decode_uses_temporary_path_and_preserves_remote_identity(
+    monkeypatch,
+    recording_s3_filesystem,
+    tmp_path,
+):
+    import duckdb.datasource.video_reader as video_reader
+
+    class FakeFrame:
+        def asnumpy(self):
+            return np.zeros((2, 32, 3), dtype=np.uint8)
+
+    decoder_paths = []
+
+    def fake_open_decoder(path, **kwargs):
+        assert kwargs == {"width": 32, "height": 2}
+        decoder_path = Path(path)
+        assert decoder_path.is_file()
+        decoder_paths.append(decoder_path)
+        return [FakeFrame()]
+
+    monkeypatch.setattr(video_reader, "_open_decord_reader", fake_open_decoder)
+
+    batches = list(
+        _decode_video_batches(
+            "s3://media-bucket/clips/example.mp4",
+            height=2,
+            width=2,
+            max_partition_bytes=1024,
+            max_remote_video_bytes=1024,
+            remote_temp_dir=str(tmp_path),
+        )
+    )
+
+    source_path, source_id = video_reader._video_source_identity("s3://media-bucket/clips/example.mp4")
+    assert len(decoder_paths) == 1
+    assert not decoder_paths[0].exists()
+    assert batches[0].column("video_path").to_pylist() == [source_path]
+    assert batches[0].column("source_id").to_pylist() == [source_id]
+    assert recording_s3_filesystem["path"] == "media-bucket/clips/example.mp4"
+
+
+def test_remote_video_decode_cleans_temporary_path_when_consumer_stops_early(
+    monkeypatch,
+    recording_s3_filesystem,
+    tmp_path,
+):
+    import duckdb.datasource.video_reader as video_reader
+
+    class FakeFrame:
+        def asnumpy(self):
+            return np.zeros((2, 32, 3), dtype=np.uint8)
+
+    decoder_paths = []
+
+    def fake_open_decoder(path, **kwargs):
+        assert kwargs == {"width": 32, "height": 2}
+        decoder_paths.append(Path(path))
+        return [FakeFrame(), FakeFrame(), FakeFrame()]
+
+    monkeypatch.setattr(video_reader, "_open_decord_reader", fake_open_decoder)
+    source_path, _ = video_reader._video_source_identity("s3://media-bucket/clips/example.mp4")
+    max_partition_bytes = video_reader._video_output_batch_bytes(
+        1,
+        height=2,
+        width=2,
+        max_source_path_bytes=len(source_path.encode("utf-8")),
+    )
+    batches = _decode_video_batches(
+        "s3://media-bucket/clips/example.mp4",
+        height=2,
+        width=2,
+        max_partition_bytes=max_partition_bytes,
+        max_remote_video_bytes=1024,
+        remote_temp_dir=str(tmp_path),
+    )
+
+    first = next(batches)
+    assert first.num_rows == 2
+    assert decoder_paths[0].is_file()
+
+    batches.close()
+
+    assert not decoder_paths[0].exists()
+
+
+def test_video_decode_keeps_raw_resize_window_bounded(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    class FakeFrame:
+        def __init__(self, value):
+            self._value = value
+
+        def asnumpy(self):
+            return np.full((4, 32, 3), self._value, dtype=np.uint8)
+
+    resize_window_sizes = []
+
+    def fake_resize(frames, *, width, height, executor=None):
+        del executor
+        resize_window_sizes.append(len(frames))
+        return [np.full((height, width, 3), frame[0, 0, 0], dtype=np.uint8) for frame in frames]
+
+    monkeypatch.setattr(
+        video_reader,
+        "_open_decord_reader",
+        lambda _path, **_kwargs: [FakeFrame(i) for i in range(10)],
+    )
+    monkeypatch.setattr(video_reader, "_resize_frame_batch", fake_resize)
+    monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 3)
+    source_path, _ = video_reader._video_source_identity("clip.avi")
+    max_partition_bytes = video_reader._video_output_batch_bytes(
+        8,
+        height=2,
+        width=2,
+        max_source_path_bytes=len(source_path.encode("utf-8")),
+    )
+
+    batches = list(
+        _decode_video_batches(
+            "clip.avi",
+            height=2,
+            width=2,
+            max_partition_bytes=max_partition_bytes,
+        )
+    )
+
+    assert [batch.num_rows for batch in batches] == [9, 1]
+    assert resize_window_sizes
+    assert max(resize_window_sizes) <= 3
+
+
+def test_video_decode_rejects_frame_bound_before_opening_decoder(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    def fail_open(*_args, **_kwargs):
+        pytest.fail("decoder must not open when its requested frame exceeds the cap")
+
+    monkeypatch.setattr(video_reader, "_open_decord_reader", fail_open)
+
+    with pytest.raises(
+        video_reader.SourceFrameTooLargeError,
+        match="bounded decoder frame size 384 exceeds limit 383",
+    ):
+        list(
+            _decode_video_batches(
+                "clip.avi",
+                height=4,
+                width=4,
+                max_partition_bytes=1024,
+                max_source_frame_bytes=383,
+            )
+        )
 
 
 def test_datasource_schema_supports_fixed_shape_tensor_entries():
@@ -324,6 +915,7 @@ def test_video_frame_source_schema_declares_typed_frame_not_blob():
     source = VideoFrameSource(["a.avi"], height=4, width=5)
 
     assert source.schema == {
+        "source_id": "VARCHAR",
         "video_path": "VARCHAR",
         "frame_index": "BIGINT",
         "frame": {"kind": "tensor", "dtype": "UINT8", "shape": [4, 5, 3]},
@@ -419,11 +1011,85 @@ def test_video_source_udf_memory_is_stage_specific(monkeypatch):
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_MEMORY_BYTES", "268435456")
     monkeypatch.setenv("VANE_UDF_TASK_HEAP_BYTES", "1073741824")
+    monkeypatch.delenv("VANE_VIDEO_SOURCE_UDF_OUTPUT_BATCH_SIZE", raising=False)
 
-    assert video_reader._video_source_udf_kwargs()["memory_bytes"] == 268435456
+    expected_peak = video_reader._video_source_peak_memory_bytes(
+        height=640,
+        width=480,
+        max_partition_bytes=10 * 1024**2,
+        max_source_frame_bytes=128 * 1024**2,
+    )
+    assert video_reader._video_source_udf_kwargs()["memory_bytes"] == expected_peak
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "subprocess_task")
     assert "memory_bytes" not in video_reader._video_source_udf_kwargs()
+
+
+def test_video_source_udf_memory_covers_large_output_partition(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
+    monkeypatch.delenv("VANE_VIDEO_SOURCE_UDF_MEMORY_BYTES", raising=False)
+    monkeypatch.delenv("VANE_VIDEO_SOURCE_UDF_OUTPUT_BATCH_SIZE", raising=False)
+    max_partition_bytes = 128 * 1024**2
+    expected_peak = video_reader._video_source_peak_memory_bytes(
+        height=640,
+        width=640,
+        max_partition_bytes=max_partition_bytes,
+        max_source_frame_bytes=128 * 1024**2,
+    )
+
+    kwargs = video_reader._video_source_udf_kwargs(
+        height=640,
+        width=640,
+        max_partition_bytes=max_partition_bytes,
+    )
+
+    assert expected_peak > 512 * 1024**2
+    assert kwargs["memory_bytes"] == expected_peak
+
+
+def test_video_source_peak_memory_accounts_for_provenance_and_decord_copy_overlap(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 2)
+    height = 2
+    width = 3
+    frame_bytes = height * width * 3
+    max_partition_bytes = 500
+    max_source_frame_bytes = 1000
+    max_source_path_bytes = 10
+    decode_batch_size = video_reader._video_source_udf_output_batch_size(
+        height,
+        width,
+        max_partition_bytes,
+        max_source_path_bytes=max_source_path_bytes,
+    )
+    transport_batch_size = 7
+
+    peak_bytes = video_reader._video_source_peak_memory_bytes(
+        height=height,
+        width=width,
+        max_partition_bytes=max_partition_bytes,
+        max_source_frame_bytes=max_source_frame_bytes,
+        max_source_path_bytes=max_source_path_bytes,
+        output_batch_size=transport_batch_size,
+    )
+    output_bytes = video_reader._video_output_batch_bytes(
+        transport_batch_size,
+        height=height,
+        width=width,
+        max_source_path_bytes=max_source_path_bytes,
+    )
+
+    assert decode_batch_size == 5
+    assert peak_bytes == (
+        video_reader._REMOTE_VIDEO_READ_CHUNK_BYTES
+        + video_reader._VIDEO_DECODER_MEMORY_HEADROOM_BYTES
+        + 2 * output_bytes
+        + 2 * (max_source_frame_bytes + frame_bytes)
+        + max_source_frame_bytes
+    )
 
 
 def test_video_source_udf_memory_must_be_positive(monkeypatch):
@@ -442,7 +1108,7 @@ def test_video_frame_source_map_batches_reads_manifest(monkeypatch):
     calls = []
     frames = np.arange(2 * 8 * 9 * 3, dtype=np.uint8).reshape(2, 8, 9, 3)
 
-    def fake_decode(video_path, *, height, width, max_partition_bytes, max_frames=None):
+    def fake_decode(video_path, *, height, width, max_partition_bytes, max_frames=None, **_kwargs):
         calls.append((video_path, height, width, max_partition_bytes, max_frames))
         yield pa.record_batch(
             {
@@ -461,6 +1127,14 @@ def test_video_frame_source_map_batches_reads_manifest(monkeypatch):
             "width": [9, 9],
             "max_partition_bytes": [1024, 1024],
             "frame_limit": pa.array([None, None], type=pa.int64()),
+            "max_remote_video_bytes": [4096, 4096],
+            "max_source_frame_bytes": [2048, 2048],
+            "max_source_path_bytes": [
+                video_reader._video_source_path_bytes("a.avi"),
+                video_reader._video_source_path_bytes("b.avi"),
+            ],
+            "on_error": ["raise", "raise"],
+            "remote_temp_dir": pa.array([None, None], type=pa.string()),
         }
     )
 
@@ -483,7 +1157,7 @@ def test_video_frame_source_map_batches_honors_global_frame_limit(monkeypatch):
 
     calls = []
 
-    def fake_decode(video_path, *, height, width, max_partition_bytes, max_frames=None):
+    def fake_decode(video_path, *, height, width, max_partition_bytes, max_frames=None, **_kwargs):
         calls.append((video_path, max_frames))
         row_count = min(2, max_frames if max_frames is not None else 2)
         if row_count > 0:
@@ -505,6 +1179,16 @@ def test_video_frame_source_map_batches_honors_global_frame_limit(monkeypatch):
             "width": [9],
             "max_partition_bytes": [1024],
             "frame_limit": pa.array([3], type=pa.int64()),
+            "max_remote_video_bytes": [4096],
+            "max_source_frame_bytes": [2048],
+            "max_source_path_bytes": [
+                max(
+                    video_reader._video_source_path_bytes("a.avi"),
+                    video_reader._video_source_path_bytes("b.avi"),
+                )
+            ],
+            "on_error": ["raise"],
+            "remote_temp_dir": pa.array([None], type=pa.string()),
         }
     )
 
@@ -512,6 +1196,108 @@ def test_video_frame_source_map_batches_honors_global_frame_limit(monkeypatch):
 
     assert calls == [("a.avi", 3), ("b.avi", 1)]
     assert sum(table.num_rows for table in tables) == 3
+
+
+def test_video_frame_source_map_batches_skips_bad_file_and_continues(
+    monkeypatch,
+    caplog,
+):
+    import duckdb.datasource.video_reader as video_reader
+
+    frames = np.zeros((2, 2, 2, 3), dtype=np.uint8)
+
+    class FakeDecordError(Exception):
+        pass
+
+    class FakeDecordLimitReachedError(Exception):
+        pass
+
+    class FakeDecordBase:
+        DECORDError = FakeDecordError
+        DECORDLimitReachedError = FakeDecordLimitReachedError
+
+    real_import_module = video_reader.importlib.import_module
+
+    def fake_import_module(module_name, *args, **kwargs):
+        if module_name == "decord._ffi.base":
+            return FakeDecordBase
+        return real_import_module(module_name, *args, **kwargs)
+
+    def fake_decode(video_path, **_kwargs):
+        source_path, source_id = video_reader._video_source_identity(video_path)
+        row_count = 1 if video_path == "bad.avi" else 2
+        yield pa.record_batch(
+            {
+                "source_id": [source_id] * row_count,
+                "video_path": [source_path] * row_count,
+                "frame_index": list(range(row_count)),
+                "frame": pa.FixedShapeTensorArray.from_numpy_ndarray(frames[:row_count]),
+            }
+        )
+        if video_path == "bad.avi":
+            raise FakeDecordError("corrupt video")
+
+    monkeypatch.setattr(video_reader.importlib, "import_module", fake_import_module)
+    assert video_reader._is_decord_error(FakeDecordError("corrupt"))
+    assert video_reader._is_decord_error(FakeDecordLimitReachedError("recovery limit"))
+    monkeypatch.setattr(video_reader, "_wait_for_memory", lambda: None)
+    monkeypatch.setattr(video_reader, "_decode_video_batches", fake_decode)
+    manifest = pa.table(
+        {
+            "video_paths": pa.array([["bad.avi", "good.avi"]], type=pa.list_(pa.string())),
+            "height": [2],
+            "width": [2],
+            "max_partition_bytes": [1024],
+            "frame_limit": pa.array([None], type=pa.int64()),
+            "max_remote_video_bytes": [4096],
+            "max_source_frame_bytes": [2048],
+            "max_source_path_bytes": [
+                max(
+                    video_reader._video_source_path_bytes("bad.avi"),
+                    video_reader._video_source_path_bytes("good.avi"),
+                )
+            ],
+            "on_error": ["skip"],
+            "remote_temp_dir": pa.array([None], type=pa.string()),
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger=video_reader.__name__):
+        tables = list(_video_frame_source_map_batches(manifest))
+
+    bad_path, _ = video_reader._video_source_identity("bad.avi")
+    good_path, _ = video_reader._video_source_identity("good.avi")
+    assert [table.column("video_path").to_pylist() for table in tables] == [[bad_path, good_path, good_path]]
+    assert f"Skipping unreadable video source={bad_path!r}" in caplog.text
+
+
+def test_video_read_error_mode_raise_wraps_file_failure(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    def fake_decode(_video_path, **_kwargs):
+        raise OSError("corrupt video")
+        yield
+
+    monkeypatch.setattr(video_reader, "_decode_video_batches", fake_decode)
+
+    with pytest.raises(video_reader.VideoReadError, match="corrupt video") as raised:
+        list(
+            video_reader._decode_video_with_policy(
+                "bad.avi",
+                height=2,
+                width=2,
+                max_partition_bytes=1024,
+                max_frames=None,
+                max_remote_video_bytes=4096,
+                max_source_frame_bytes=2048,
+                remote_temp_dir=None,
+                on_error="raise",
+            )
+        )
+
+    assert isinstance(raised.value.__cause__, OSError)
+    expected_path, _ = video_reader._video_source_identity("bad.avi")
+    assert raised.value.video_path == expected_path
 
 
 def test_resize_frame_batch_preserves_order_and_uses_configured_threads(monkeypatch):
@@ -533,10 +1319,30 @@ def test_resize_frame_batch_preserves_order_and_uses_configured_threads(monkeypa
 def test_flush_frame_batch_uses_fixed_shape_tensor_for_frames():
     resized = np.arange(2 * 2 * 3 * 3, dtype=np.uint8).reshape(2, 2, 3, 3)
 
-    batch = _flush_frame_batch("clip.avi", resized, [5, 6], 2)
+    batch = _flush_frame_batch("source-1", "clips/clip.avi", resized, [5, 6], 2)
     frame = batch.column("frame")
 
-    assert batch.column("video_path").to_pylist() == ["clip.avi", "clip.avi"]
+    assert batch.column("source_id").to_pylist() == ["source-1", "source-1"]
+    assert batch.column("video_path").to_pylist() == ["clips/clip.avi", "clips/clip.avi"]
     assert batch.column("frame_index").to_pylist() == [5, 6]
     assert frame.type == pa.fixed_shape_tensor(pa.uint8(), (2, 3, 3))
     np.testing.assert_array_equal(frame.to_numpy_ndarray(), resized)
+
+
+def test_flush_frame_batch_compacts_partial_output_buffer():
+    import gc
+    import weakref
+
+    resized = np.zeros((100, 2, 3, 3), dtype=np.uint8)
+    full_buffer_ref = weakref.ref(resized)
+    indices = np.arange(100, dtype=np.int64)
+    full_indices_ref = weakref.ref(indices)
+
+    batch = _flush_frame_batch("source-1", "clips/clip.avi", resized, indices, 1)
+    del resized
+    del indices
+    gc.collect()
+
+    assert batch.num_rows == 1
+    assert full_buffer_ref() is None
+    assert full_indices_ref() is None
