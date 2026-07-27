@@ -34,18 +34,22 @@ def test_write_parquet_with_unset_runner_dispatches_ray(tmp_path, monkeypatch):
     assert not target.exists()
 
 
-def test_write_failure_invalidates_cached_and_native_runner(tmp_path, monkeypatch):
+def test_write_failure_releases_cache_and_preserves_configured_native_runner(tmp_path, monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     import duckdb
+    import duckdb.runners as runners_module
     import duckdb.runners.ray.runner as ray_runner_module
     import vane
 
     created_runners = []
+    set_runner_calls = 0
 
     class FailingRayRunner:
-        def __init__(self, *_args):
+        def __init__(self, *args):
             self.runner_number = len(created_runners) + 1
             self.calls = 0
+            self.close_calls = 0
+            self.init_args = args
             created_runners.append(self)
 
         def run_write(self, relation):
@@ -53,21 +57,38 @@ def test_write_failure_invalidates_cached_and_native_runner(tmp_path, monkeypatc
             raise RuntimeError(f"injected write failure from runner {self.runner_number}")
 
         def close(self):
-            pass
+            self.close_calls += 1
 
     vane_runners = duckdb.vane_runners_cpp
     vane_runners.teardown_runner()
     monkeypatch.setattr(ray_runner_module, "RayRunner", FailingRayRunner)
+    configured_runner = runners_module.set_runner_ray(
+        "ray://configured",
+        max_task_backlog=17,
+        force_client_mode=True,
+    )
+    real_set_runner_ray = runners_module.set_runner_ray
+
+    def tracking_set_runner_ray(*args, **kwargs):
+        nonlocal set_runner_calls
+        set_runner_calls += 1
+        return real_set_runner_ray(*args, **kwargs)
+
+    monkeypatch.setattr(runners_module, "set_runner_ray", tracking_set_runner_ray)
 
     connection = vane.connect()
     try:
-        for runner_number in (1, 2):
-            target = tmp_path / f"failed-{runner_number}.parquet"
-            with pytest.raises(RuntimeError, match=f"injected write failure from runner {runner_number}"):
-                connection.sql(f"select {runner_number} as x").write_parquet(str(target))
+        for attempt in (1, 2):
+            target = tmp_path / f"failed-{attempt}.parquet"
+            with pytest.raises(RuntimeError, match="injected write failure from runner 1"):
+                connection.sql(f"select {attempt} as x").write_parquet(str(target))
 
-        assert [runner.calls for runner in created_runners] == [1, 1]
-        assert vane_runners.get_runner() is None
+        assert set_runner_calls == 2
+        assert len(created_runners) == 1
+        assert created_runners[0].calls == 2
+        assert created_runners[0].close_calls == 0
+        assert created_runners[0].init_args == ("ray://configured", 17, True)
+        assert vane_runners.get_runner() is configured_runner
     finally:
         vane_runners.teardown_runner()
 
@@ -109,7 +130,7 @@ except RuntimeError as exc:
 else:
     raise AssertionError("expected the injected write failure")
 
-assert duckdb.vane_runners_cpp.get_runner() is None
+assert isinstance(duckdb.vane_runners_cpp.get_runner(), ClosingFailingRayRunner)
 """
     subprocess.run([sys.executable, "-c", script, str(target)], check=True, timeout=20)
 

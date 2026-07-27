@@ -3,7 +3,6 @@
 
 // C++ translation of src/duckdb_py/duckdb-runners (Rust -> C++)
 #include "duckdb_python/pybind11/gil_wrapper.hpp"
-#include "duckdb_python/vane_runners.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
 // This file mirrors the structure and public behavior of the original
 // Rust implementation (`runners.rs` + `python.rs` + parts of `lib.rs`) using
@@ -30,29 +29,25 @@ static bool VaneRunnerCanDecRefPython() {
 	return true;
 }
 
-static void VaneRunnerReleasePyObject(py::object &obj) noexcept {
-	try {
-		if (!obj.ptr()) {
-			return;
-		}
-		if (!VaneRunnerCanDecRefPython()) {
-			obj.release();
-			return;
-		}
-		duckdb::PythonGILWrapper gil;
-		PyObject *ptr = obj.release().ptr();
-		Py_DECREF(ptr);
-	} catch (...) {
-		obj.release();
+static void VaneRunnerReleasePyObject(py::object &obj) {
+	if (!obj.ptr()) {
+		return;
 	}
+	if (!VaneRunnerCanDecRefPython()) {
+		obj.release();
+		return;
+	}
+	duckdb::PythonGILWrapper gil;
+	PyObject *ptr = obj.release().ptr();
+	Py_DECREF(ptr);
 }
 
-static void VaneRunnerClosePyObject(py::object &obj) noexcept {
+static void VaneRunnerClosePyObject(py::object &obj) {
+	if (!obj.ptr() || !VaneRunnerCanDecRefPython()) {
+		return;
+	}
+	duckdb::PythonGILWrapper gil;
 	try {
-		if (!obj.ptr() || !VaneRunnerCanDecRefPython()) {
-			return;
-		}
-		duckdb::PythonGILWrapper gil;
 		if (py::hasattr(obj, "close")) {
 			obj.attr("close")();
 		}
@@ -102,10 +97,6 @@ public:
 		return pyobj;
 	}
 
-	bool wraps(PyObject *expected) const noexcept {
-		return pyobj.ptr() == expected;
-	}
-
 private:
 	py::object pyobj;
 };
@@ -151,10 +142,6 @@ public:
 		return pyobj;
 	}
 
-	bool wraps(PyObject *expected) const noexcept {
-		return pyobj.ptr() == expected;
-	}
-
 private:
 	py::object pyobj;
 };
@@ -189,13 +176,6 @@ public:
 			return ray->to_pyobj();
 		}
 		return local->to_pyobj();
-	}
-
-	bool wraps(PyObject *expected) const noexcept {
-		if (type == Type::Ray) {
-			return ray->wraps(expected);
-		}
-		return local->wraps(expected);
 	}
 
 private:
@@ -288,29 +268,6 @@ static std::mutex VANE_RUNNER_MUTEX;
 static std::condition_variable VANE_RUNNER_CONDITION;
 static VaneRunnerState VANE_RUNNER_STATE = VaneRunnerState::UNINITIALIZED;
 static std::thread::id VANE_RUNNER_INITIALIZER_THREAD;
-
-void duckdb::InvalidateVaneRunnerIfCurrent(PyObject *expected_runner) noexcept {
-	try {
-		std::shared_ptr<Runner> invalidated_runner;
-		{
-			std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
-			if (!expected_runner || VANE_RUNNER_STATE != VaneRunnerState::INITIALIZED || !VANE_RUNNER_PTR ||
-			    !VANE_RUNNER_PTR->wraps(expected_runner)) {
-				return;
-			}
-			invalidated_runner = std::move(VANE_RUNNER_PTR);
-			VANE_RUNNER_STATE = VaneRunnerState::UNINITIALIZED;
-			VANE_RUNNER_INITIALIZER_THREAD = std::thread::id();
-		}
-		VANE_RUNNER_CONDITION.notify_all();
-
-		duckdb::PythonGILWrapper gil;
-		auto runner_obj = invalidated_runner->get_pyobj();
-		VaneRunnerClosePyObject(runner_obj);
-	} catch (...) {
-		// Failure cleanup must preserve the original runner/write exception.
-	}
-}
 
 struct RunnerInitializationResult {
 	std::shared_ptr<Runner> runner;

@@ -34,7 +34,6 @@
 #include "duckdb_python/arrow/arrow_export_utils.hpp"
 #include "duckdb_python/python_udf_utils.hpp"
 #include "duckdb_python/python_udf_actor_resources.hpp"
-#include "duckdb_python/vane_runners.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -1152,12 +1151,7 @@ static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py:
 	auto py_write_rel = DuckDBPyRelation(write_rel);
 	py_write_rel.SetConnectionOwner(connection_owner);
 	auto py_write_rel_obj = py::cast(std::move(py_write_rel));
-	try {
-		runner_for_db.runner.attr("run_write")(py_write_rel_obj);
-	} catch (...) {
-		InvalidateVaneRunnerIfCurrent(runner_for_db.runner.ptr());
-		throw;
-	}
+	runner_for_db.runner.attr("run_write")(py_write_rel_obj);
 	return true;
 }
 
