@@ -1227,8 +1227,13 @@ class TestAnthropicStructuredOutput:
         tool_block.type = "tool_use"
         tool_block.input = {"name": "Alice", "age": 30}
 
+        mock_usage = MagicMock()
+        mock_usage.input_tokens = 12
+        mock_usage.output_tokens = 7
+
         mock_response = MagicMock()
         mock_response.content = [tool_block]
+        mock_response.usage = mock_usage
 
         async def mock_create(**kwargs):
             assert "tools" in kwargs
@@ -1252,9 +1257,16 @@ class TestAnthropicStructuredOutput:
         )
 
         text_block = MagicMock()
+        text_block.type = "text"
         text_block.text = "Hello world"
+
+        mock_usage = MagicMock()
+        mock_usage.input_tokens = 8
+        mock_usage.output_tokens = 3
+
         mock_response = MagicMock()
         mock_response.content = [text_block]
+        mock_response.usage = mock_usage
 
         async def mock_create(**kwargs):
             assert "tools" not in kwargs
@@ -1356,9 +1368,16 @@ class TestAnthropicMultimodal:
 
         captured_messages = []
         text_block = MagicMock()
+        text_block.type = "text"
         text_block.text = "I see an image"
+
+        mock_usage = MagicMock()
+        mock_usage.input_tokens = 25
+        mock_usage.output_tokens = 6
+
         mock_response = MagicMock()
         mock_response.content = [text_block]
+        mock_response.usage = mock_usage
 
         async def mock_create(**kwargs):
             captured_messages.append(kwargs["messages"])
@@ -1389,9 +1408,16 @@ class TestAnthropicMultimodal:
 
         captured_messages = []
         text_block = MagicMock()
+        text_block.type = "text"
         text_block.text = "ok"
+
+        mock_usage = MagicMock()
+        mock_usage.input_tokens = 15
+        mock_usage.output_tokens = 2
+
         mock_response = MagicMock()
         mock_response.content = [text_block]
+        mock_response.usage = mock_usage
 
         async def mock_create(**kwargs):
             captured_messages.append(kwargs["messages"])
