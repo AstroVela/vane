@@ -212,7 +212,10 @@ jobs:
 
   publish-testpypi:
     name: Publish to TestPyPI
-    if: github.event_name == 'workflow_dispatch' && inputs.destination == 'testpypi'
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.destination == 'testpypi' &&
+      github.ref == 'refs/heads/main'
     needs: assemble
     runs-on: ubuntu-24.04
     environment:

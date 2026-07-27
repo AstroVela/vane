@@ -67,6 +67,13 @@ def _rejected_by(callback: Callable[[], object]) -> ValueError:
     pytest.fail("contaminated artifact was accepted", pytrace=False)
 
 
+def _assert_no_recoverable_value(sentinel: bytes, *surfaces: str) -> None:
+    recoverable_values = (sentinel, base64.b64encode(sentinel))
+    encoded_surfaces = tuple(surface.encode("utf-8", errors="replace") for surface in surfaces)
+    if any(value in surface for value in recoverable_values for surface in encoded_surfaces):
+        pytest.fail("output exposed a recoverable matched value", pytrace=False)
+
+
 def _assert_metadata_only_error(
     error: ValueError,
     *,
@@ -87,8 +94,7 @@ def _assert_metadata_only_error(
         captured.out,
         captured.err,
     )
-    if any(sentinel in surface.encode("utf-8", errors="replace") for surface in surfaces):
-        pytest.fail("content error exposed the matched value", pytrace=False)
+    _assert_no_recoverable_value(sentinel, *surfaces)
 
 
 @pytest.fixture
@@ -109,7 +115,7 @@ def test_literal_rule_repr_does_not_expose_value():
     sentinel = _runtime_sentinel()
     rule = check_release_artifacts.LiteralContentRule("runtime-sensitive-content", sentinel)
 
-    assert sentinel not in repr(rule).encode("utf-8")
+    _assert_no_recoverable_value(sentinel, repr(rule))
 
 
 @pytest.mark.parametrize(
@@ -173,8 +179,7 @@ def test_cli_loads_private_manifest_without_exposing_match(
     )
     assert check_release_artifacts.main() == 0
     captured = capsys.readouterr()
-    if sentinel in (captured.out + captured.err).encode("utf-8", errors="replace"):
-        pytest.fail("CLI output exposed the matched value", pytrace=False)
+    _assert_no_recoverable_value(sentinel, captured.out, captured.err)
 
 
 @pytest.mark.parametrize("suffix", [".tar.gz", ".whl"], ids=["sdist", "wheel"])
@@ -203,7 +208,7 @@ def test_standalone_cli_reads_private_manifest_from_stdin(tmp_path, suffix):
     output = (result.stdout + result.stderr).encode("utf-8", errors="replace")
     assert rule_id.encode("ascii") in output
     assert member_name.encode("ascii") in output
-    assert sentinel not in output
+    _assert_no_recoverable_value(sentinel, result.stdout, result.stderr)
 
 
 @pytest.mark.parametrize("suffix", [".tar.gz", ".whl"], ids=["sdist", "wheel"])
