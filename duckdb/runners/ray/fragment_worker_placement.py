@@ -44,6 +44,7 @@ class FteWorkerPlacementMixin:
         # Supplied by the other mixins on the composed Ray worker handle.
         _bind_fte_scheduler_handlers: Any
         _fte_worker_placement_manager: Any
+        _handles_for_worker_reservation_completed_event: Any
         worker_id: Any
 
     def _select_fte_worker(
@@ -95,6 +96,26 @@ class FteWorkerPlacementMixin:
                 future.reservation_generation,
                 worker_id,
                 error=error,
+            )
+        )
+
+    def _handle_fte_worker_reservation_callback_error(
+        self,
+        future: FteWorkerReservationFuture,
+        error: BaseException,
+    ) -> None:
+        callback_failure = RuntimeError(f"FTE worker reservation completion callback failed: {error}")
+        callback_failure.__cause__ = error
+        # Dispatch itself may be what failed, so enter the generation-fenced
+        # completion handler directly instead of trying to enqueue another event.
+        self._handles_for_worker_reservation_completed_event(
+            WorkerReservationCompleted(
+                future.query_id,
+                future.fragment_execution_id,
+                future.fragment_id,
+                future.partition_id,
+                future.reservation_generation,
+                error=callback_failure,
             )
         )
 
@@ -250,6 +271,7 @@ class FteWorkerPlacementMixin:
                     node_requirements=placement.node_requirements,
                     node_requirements_wait_started_at=placement.node_requirements_wait_started_at,
                     on_done=self._enqueue_fte_worker_reservation_completion,
+                    on_done_error=self._handle_fte_worker_reservation_callback_error,
                 )
             except BaseException:
                 release_fte_partition_submission(*key)
