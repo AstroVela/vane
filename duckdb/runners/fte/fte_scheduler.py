@@ -6,6 +6,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +36,19 @@ if TYPE_CHECKING:
     from duckdb.runners.fte.fte_events import FteEvent, FteWorkerCommand
 
 
+class FteSplitSubmissionCancelled(InterruptedError):
+    """Split backpressure wait stopped because the owning query is closing."""
+
+
+class FteSplitQueueTerminal(RuntimeError):
+    """The target task became terminal while split submission was backpressured."""
+
+    def __init__(self, attempt_id: Any, status: Mapping[str, Any]) -> None:
+        self.attempt_id = attempt_id
+        self.status = dict(status)
+        super().__init__(f"split queue task {attempt_id} became terminal with state {self.status.get('state')}")
+
+
 class FteWorkerCommandExecutor:
     """Execute typed commands through the worker's single ordered control lane."""
 
@@ -62,26 +76,106 @@ class FteWorkerCommandExecutor:
             raise RuntimeError(f"FTE worker handle must provide {method_name}")
         return method
 
-    def wait_split_queue_has_space(self, command: FteAddSplitsCommand) -> None:
-        worker = command.worker
-        space = self._required_worker_method(worker, "fte_wait_split_queue_has_space")(
-            command.attempt_id.to_dict(),
-            command.source_node_id,
-            None,
-            None,
-        )
-        if not bool(space.get("has_space", True)):
-            raise RuntimeError(f"split queue for task {command.attempt_id} source {command.source_node_id} stayed full")
+    @staticmethod
+    def _cancel_requested(cancel_event: Any) -> bool:
+        return cancel_event is not None and bool(cancel_event.is_set())
 
-    def add_splits(self, command: FteAddSplitsCommand) -> Any:
+    @classmethod
+    def _raise_if_split_submission_cancelled(
+        cls,
+        command: FteAddSplitsCommand,
+        cancel_event: Any,
+    ) -> None:
+        if cls._cancel_requested(cancel_event):
+            raise FteSplitSubmissionCancelled(
+                f"split submission canceled for task {command.attempt_id} source {command.source_node_id}"
+            )
+
+    def wait_split_queue_has_space(
+        self,
+        command: FteAddSplitsCommand,
+        *,
+        cancel_event: Any = None,
+    ) -> None:
+        worker = command.worker
+        wait_interruptibly = getattr(worker, "fte_wait_split_queue_has_space_interruptible", None)
+        wait_for_space = self._required_worker_method(worker, "fte_wait_split_queue_has_space")
+        while True:
+            self._raise_if_split_submission_cancelled(command, cancel_event)
+            try:
+                if cancel_event is not None and callable(wait_interruptibly):
+                    space = wait_interruptibly(
+                        command.attempt_id.to_dict(),
+                        command.source_node_id,
+                        None,
+                        None,
+                        cancel_event,
+                    )
+                else:
+                    space = wait_for_space(
+                        command.attempt_id.to_dict(),
+                        command.source_node_id,
+                        None,
+                        None,
+                    )
+            except QueryDeadlineExceeded:
+                raise
+            except Exception as exc:
+                if self._cancel_requested(cancel_event):
+                    raise FteSplitSubmissionCancelled(
+                        f"split submission canceled for task {command.attempt_id} source {command.source_node_id}"
+                    ) from exc
+                raise
+            self._raise_if_split_submission_cancelled(command, cancel_event)
+            if not isinstance(space, Mapping):
+                raise TypeError("fte_wait_split_queue_has_space must return a mapping")
+            has_space = space.get("has_space")
+            if not isinstance(has_space, bool):
+                raise TypeError("fte_wait_split_queue_has_space must return a boolean has_space")
+            status = space.get("status")
+            if not isinstance(status, Mapping):
+                raise TypeError("fte_wait_split_queue_has_space must return a task status mapping")
+            validate_fte_status_identity(status, command.attempt_id)
+            raw_state = status.get("state")
+            try:
+                state = raw_state if isinstance(raw_state, FteTaskState) else FteTaskState(str(raw_state))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"unknown FTE task state while waiting for split queue space: {raw_state!r}") from exc
+            if state in {
+                FteTaskState.FINISHED,
+                FteTaskState.FAILED,
+                FteTaskState.CANCELED,
+                FteTaskState.ABORTED,
+            }:
+                raise FteSplitQueueTerminal(
+                    command.attempt_id,
+                    status,
+                )
+            if has_space:
+                return
+
+    def add_splits(
+        self,
+        command: FteAddSplitsCommand,
+        *,
+        cancel_event: Any = None,
+    ) -> Any:
         self._record(command)
         worker = command.worker
         split_payloads = [dict(split) for split in command.splits]
         task_id = command.attempt_id.to_dict()
-        return self._required_worker_method(worker, "enqueue_fte_add_splits")(
+        enqueue = self._required_worker_method(worker, "enqueue_fte_add_splits")
+        if cancel_event is None:
+            return enqueue(
+                task_id,
+                command.source_node_id,
+                split_payloads,
+            )
+        return enqueue(
             task_id,
             command.source_node_id,
             split_payloads,
+            cancel_event=cancel_event,
         )
 
     def no_more_splits(self, command: FteNoMoreSplitsCommand) -> Any:
@@ -100,12 +194,25 @@ class FteWorkerCommandExecutor:
         update = dict(command.update)
         return self._required_worker_method(worker, "enqueue_fte_update_task")(task_id, update)
 
-    def execute(self, command: Any) -> Any:
+    def execute(self, command: Any, *, cancel_event: Any = None) -> Any:
         if isinstance(command, FteCreateTaskCommand):
             return self.create_task(command)
         if isinstance(command, FteAddSplitsCommand):
-            self.wait_split_queue_has_space(command)
-            return self.add_splits(command)
+            if cancel_event is None:
+                self.wait_split_queue_has_space(command)
+                return self.add_splits(command)
+            self.wait_split_queue_has_space(command, cancel_event=cancel_event)
+            self._raise_if_split_submission_cancelled(command, cancel_event)
+            try:
+                return self.add_splits(command, cancel_event=cancel_event)
+            except Exception as exc:
+                # Query close can win after capacity becomes available, either
+                # before or while the ordered add-splits control is running.
+                if self._cancel_requested(cancel_event):
+                    raise FteSplitSubmissionCancelled(
+                        f"split submission canceled for task {command.attempt_id} source {command.source_node_id}"
+                    ) from exc
+                raise
         if isinstance(command, FteNoMoreSplitsCommand):
             return self.no_more_splits(command)
         if isinstance(command, FteTaskUpdateCommand):

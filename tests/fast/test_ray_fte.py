@@ -10,8 +10,13 @@ from pathlib import Path
 
 import pytest
 
+from duckdb.runners.common import QueryDeadlineExceeded
 from duckdb.runners.fte.fte_config import FteWorkerAdmissionConfig
 from duckdb.runners.fte.fte_failures import _failure_allows_retry
+from duckdb.runners.fte.fte_scheduler import (
+    FteSplitQueueTerminal,
+    FteSplitSubmissionCancelled,
+)
 from duckdb.runners.ray import fte_fragment_scheduler
 from duckdb.runners.ray.fragment_registry import (
     _FTE_FRAGMENT_EXECUTIONS,
@@ -1714,12 +1719,19 @@ class _FakeLiveWorker:
 
     def fte_wait_split_queue_has_space(
         self,
-        _task_id,
+        task_id,
         _source_node_id=None,
         _max_buffered_splits=None,
         _timeout_s=None,
     ):
-        return {"has_space": True, "buffered_splits": 0}
+        return {
+            "has_space": True,
+            "buffered_splits": 0,
+            "status": self.statuses.get(
+                self._key(task_id),
+                {"state": FteTaskState.RUNNING.value, "task_id": task_id},
+            ),
+        }
 
     def fte_cancel_task(self, task_id):
         self.calls.append(("cancel", task_id))
@@ -2006,8 +2018,11 @@ def test_fte_worker_command_executor_requires_split_queue_wait_protocol():
 
 def test_fte_worker_command_executor_requires_single_ordered_enqueue_protocol():
     class _Worker:
-        def fte_wait_split_queue_has_space(self, *_args):
-            return {"has_space": True}
+        def fte_wait_split_queue_has_space(self, task_id, *_args):
+            return {
+                "has_space": True,
+                "status": {"state": FteTaskState.RUNNING.value, "task_id": task_id},
+            }
 
         def fte_add_splits(self, _task_id, _source_node_id, _splits):
             raise AssertionError("ordered control must use enqueue_fte_add_splits")
@@ -2024,6 +2039,204 @@ def test_fte_worker_command_executor_requires_single_ordered_enqueue_protocol():
     )
 
     with pytest.raises(RuntimeError, match="enqueue_fte_add_splits"):
+        FteWorkerCommandExecutor().execute(command)
+
+
+def test_fte_worker_command_executor_waits_for_slow_split_consumer():
+    wait_started = threading.Event()
+    queue_recovered = threading.Event()
+
+    class _Worker:
+        def __init__(self):
+            self.added = []
+
+        def fte_wait_split_queue_has_space(self, task_id, *_args):
+            wait_started.set()
+            assert queue_recovered.wait(timeout=1.0)
+            return {
+                "has_space": True,
+                "status": {"state": FteTaskState.RUNNING.value, "task_id": task_id},
+            }
+
+        def enqueue_fte_add_splits(self, task_id, source_node_id, splits):
+            self.added.append((task_id, source_node_id, splits))
+            return {"state": FteTaskState.RUNNING.value, "task_id": task_id}
+
+    worker = _Worker()
+    attempt_id = FteTaskAttemptId(FteTaskId("q-slow-consumer", 0, 1), 0)
+    command = FteAddSplitsCommand(
+        query_id=attempt_id.query_id,
+        fragment_id="q-slow-consumer:node:scan",
+        worker_id="worker-a",
+        worker=worker,
+        attempt_id=attempt_id,
+        source_node_id="7",
+        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        submitted = executor.submit(FteWorkerCommandExecutor().execute, command)
+        assert wait_started.wait(timeout=1.0)
+        assert submitted.done() is False
+        queue_recovered.set()
+        submitted.result(timeout=1.0)
+
+    assert len(worker.added) == 1
+
+
+def test_fte_worker_command_executor_split_wait_is_cancellable():
+    cancel_event = threading.Event()
+
+    class _Worker:
+        def fte_wait_split_queue_has_space(self, *_args):
+            raise AssertionError("interruptible split wait must be used")
+
+        def fte_wait_split_queue_has_space_interruptible(
+            self,
+            _task_id,
+            _source_node_id,
+            _max_buffered_splits,
+            _timeout_s,
+            stop_event,
+        ):
+            stop_event.set()
+            raise InterruptedError("query closed")
+
+    attempt_id = FteTaskAttemptId(FteTaskId("q-cancel-splits", 0, 1), 0)
+    command = FteAddSplitsCommand(
+        query_id=attempt_id.query_id,
+        fragment_id="q-cancel-splits:node:scan",
+        worker_id="worker-a",
+        worker=_Worker(),
+        attempt_id=attempt_id,
+        source_node_id="7",
+        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+    )
+
+    with pytest.raises(FteSplitSubmissionCancelled, match="split submission canceled"):
+        FteWorkerCommandExecutor().execute(command, cancel_event=cancel_event)
+
+
+def test_fte_worker_command_executor_close_wins_capacity_to_enqueue_race():
+    cancel_event = threading.Event()
+
+    class _Worker:
+        def fte_wait_split_queue_has_space(self, task_id, *_args):
+            return {
+                "has_space": True,
+                "status": {"state": FteTaskState.RUNNING.value, "task_id": task_id},
+            }
+
+        def enqueue_fte_add_splits(self, *_args, cancel_event=None):
+            assert cancel_event is not None
+            cancel_event.set()
+            raise RuntimeError("query control admission closed")
+
+    attempt_id = FteTaskAttemptId(FteTaskId("q-close-enqueue-race", 0, 1), 0)
+    command = FteAddSplitsCommand(
+        query_id=attempt_id.query_id,
+        fragment_id="q-close-enqueue-race:node:scan",
+        worker_id="worker-a",
+        worker=_Worker(),
+        attempt_id=attempt_id,
+        source_node_id="7",
+        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+    )
+
+    with pytest.raises(FteSplitSubmissionCancelled, match="split submission canceled"):
+        FteWorkerCommandExecutor().execute(command, cancel_event=cancel_event)
+
+
+def test_fte_worker_command_executor_cancels_ordered_add_after_capacity():
+    cancel_event = threading.Event()
+    add_started = threading.Event()
+
+    class _Worker:
+        def fte_wait_split_queue_has_space(self, task_id, *_args):
+            return {
+                "has_space": True,
+                "status": {"state": FteTaskState.RUNNING.value, "task_id": task_id},
+            }
+
+        def enqueue_fte_add_splits(
+            self,
+            _task_id,
+            _source_node_id,
+            _splits,
+            *,
+            cancel_event,
+        ):
+            add_started.set()
+            assert cancel_event.wait(timeout=1.0)
+            raise InterruptedError("query closed during ordered add")
+
+    attempt_id = FteTaskAttemptId(FteTaskId("q-close-blocked-add", 0, 1), 0)
+    command = FteAddSplitsCommand(
+        query_id=attempt_id.query_id,
+        fragment_id="q-close-blocked-add:node:scan",
+        worker_id="worker-a",
+        worker=_Worker(),
+        attempt_id=attempt_id,
+        source_node_id="7",
+        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        submitted = executor.submit(
+            FteWorkerCommandExecutor().execute,
+            command,
+            cancel_event=cancel_event,
+        )
+        assert add_started.wait(timeout=1.0)
+        cancel_event.set()
+        with pytest.raises(FteSplitSubmissionCancelled, match="split submission canceled"):
+            submitted.result(timeout=1.0)
+
+
+def test_fte_worker_command_executor_preserves_query_deadline():
+    class _Worker:
+        def fte_wait_split_queue_has_space(self, *_args):
+            raise AssertionError("interruptible split wait must be used")
+
+        def fte_wait_split_queue_has_space_interruptible(self, *_args):
+            raise QueryDeadlineExceeded("query deadline expired while waiting for split capacity")
+
+    attempt_id = FteTaskAttemptId(FteTaskId("q-deadline-splits", 0, 1), 0)
+    command = FteAddSplitsCommand(
+        query_id=attempt_id.query_id,
+        fragment_id="q-deadline-splits:node:scan",
+        worker_id="worker-a",
+        worker=_Worker(),
+        attempt_id=attempt_id,
+        source_node_id="7",
+        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+    )
+
+    with pytest.raises(QueryDeadlineExceeded, match="query deadline expired"):
+        FteWorkerCommandExecutor().execute(command, cancel_event=threading.Event())
+
+
+def test_fte_worker_command_executor_reports_terminal_task_during_split_wait():
+    class _Worker:
+        def fte_wait_split_queue_has_space(self, task_id, *_args):
+            return {
+                "has_space": False,
+                "terminal": True,
+                "status": {"state": FteTaskState.FAILED.value, "task_id": task_id},
+            }
+
+    attempt_id = FteTaskAttemptId(FteTaskId("q-terminal-splits", 0, 1), 0)
+    command = FteAddSplitsCommand(
+        query_id=attempt_id.query_id,
+        fragment_id="q-terminal-splits:node:scan",
+        worker_id="worker-a",
+        worker=_Worker(),
+        attempt_id=attempt_id,
+        source_node_id="7",
+        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+    )
+
+    with pytest.raises(FteSplitQueueTerminal, match="became terminal with state FAILED"):
         FteWorkerCommandExecutor().execute(command)
 
 
@@ -2484,8 +2697,12 @@ def test_fte_fragment_execution_appends_descriptor_before_add_splits_command_fai
     assert [split.data for split in descriptor.initial_splits["7"]] == [b"a", b"b"]
 
 
-def test_fte_fragment_execution_appends_descriptor_before_split_queue_full_failure():
-    class _FullSplitQueueWorker(_FakeLiveWorker):
+def test_fte_fragment_execution_backpressures_until_split_queue_recovers():
+    class _RecoveringSplitQueueWorker(_FakeLiveWorker):
+        def __init__(self):
+            super().__init__()
+            self.wait_count = 0
+
         def fte_wait_split_queue_has_space(
             self,
             task_id,
@@ -2502,9 +2719,14 @@ def test_fte_fragment_execution_appends_descriptor_before_split_queue_full_failu
                     timeout_s,
                 )
             )
-            return {"has_space": False, "buffered_splits": 1024}
+            self.wait_count += 1
+            return {
+                "has_space": self.wait_count >= 2,
+                "buffered_splits": 0 if self.wait_count >= 2 else 1024,
+                "status": self.statuses[self._key(task_id)],
+            }
 
-    worker = _FullSplitQueueWorker()
+    worker = _RecoveringSplitQueueWorker()
     stage = _fte_fragment_execution(
         "q",
         37,
@@ -2541,10 +2763,14 @@ def test_fte_fragment_execution_appends_descriptor_before_split_queue_full_failu
         )
     )
 
-    with pytest.raises(FteWorkerControlFailure, match="fte_add_splits"):
-        _execute_stage_commands(stage, update_result)
+    _execute_stage_commands(stage, update_result)
 
-    assert [call[0] for call in worker.calls] == ["create", "wait_space"]
+    assert [call[0] for call in worker.calls] == [
+        "create",
+        "wait_space",
+        "wait_space",
+        "add",
+    ]
     descriptor = stage.descriptor_storage.require(FteTaskId("q", 37, 0))
     assert [split.data for split in descriptor.initial_splits["7"]] == [b"a", b"b"]
 
@@ -4752,16 +4978,29 @@ def test_fte_worker_task_manager_fte_runtime_uses_dynamic_scan_source_queue():
     asyncio.run(run())
 
 
-def test_fte_worker_task_manager_fte_dynamic_scan_with_explicit_source_waits_until_sealed():
-    executed = asyncio.Event()
-    captured = {}
-
-    async def execute_fn(request):
-        captured["request"] = request
-        executed.set()
-        return {"ok": True}
-
+def test_fte_worker_task_manager_dynamic_source_consumes_before_no_more_splits():
     async def run():
+        execution_started = asyncio.Event()
+        allow_consumer = asyncio.Event()
+        captured = {}
+        consumed = []
+
+        async def execute_fn(request):
+            captured["request"] = request
+            execution_started.set()
+            await allow_consumer.wait()
+            queue = request["fte_scan_source_queues"]["7"]
+            while True:
+                item = queue.try_get_next()
+                if item["state"] == "BLOCKED":
+                    await asyncio.sleep(0.001)
+                    continue
+                if item["state"] == "SPLIT":
+                    consumed.append(item["data"])
+                    continue
+                assert item == {"state": "FINISHED"}
+                return {"ok": True}
+
         manager = _fte_worker_task_manager(execute_fn)
         task_id = {"query_id": "q", "fragment_execution_id": 0, "partition_id": 12, "attempt_id": 0}
         await manager.create_task(
@@ -4771,47 +5010,49 @@ def test_fte_worker_task_manager_fte_dynamic_scan_with_explicit_source_waits_unt
                 "worker_runtime": "fte",
                 "source_node_ids": ["7"],
                 "dynamic_scan_source_node_ids": ["7"],
-                "initial_splits": {
-                    "7": [
-                        {
-                            "sequence_id": 0,
-                            "kind": "scan_task",
-                            "data": b"initial-scan",
-                        }
-                    ],
-                },
+                "split_queue_max_buffered_splits": 1,
             }
         )
-        await asyncio.sleep(0)
-        assert executed.is_set() is False
+        await asyncio.wait_for(execution_started.wait(), timeout=1.0)
 
         await manager.add_splits(
             task_id,
             "7",
-            [{"sequence_id": 1, "kind": "scan_task", "data": b"late-scan"}],
+            [{"sequence_id": 0, "kind": "scan_task", "data": b"first"}],
         )
-        await asyncio.sleep(0)
-        assert executed.is_set() is False
+        full = await manager.wait_split_queue_has_space(
+            task_id,
+            source_node_id="7",
+            max_buffered_splits=1,
+            timeout_s=0.01,
+        )
+        assert full["has_space"] is False
+        assert full["buffered_splits"] == 1
 
-        await manager.no_more_splits(task_id, "7")
-        await asyncio.wait_for(executed.wait(), timeout=1)
-        status = await manager.wait_task_status(task_id, 0, timeout_s=1.0)
+        wait_for_space = asyncio.create_task(
+            manager.wait_split_queue_has_space(
+                task_id,
+                source_node_id="7",
+                max_buffered_splits=1,
+                timeout_s=1.0,
+            )
+        )
+        await asyncio.sleep(0.02)
+        assert wait_for_space.done() is False
+
+        allow_consumer.set()
+        space = await asyncio.wait_for(wait_for_space, timeout=1.0)
+        assert space["has_space"] is True
+        await manager.add_splits(
+            task_id,
+            "7",
+            [{"sequence_id": 1, "kind": "scan_task", "data": b"second"}],
+        )
+        sealed = await manager.no_more_splits(task_id, "7")
+        status = await manager.wait_task_status(task_id, sealed["version"], timeout_s=1.0)
         assert status["state"] == FteTaskState.FINISHED.value
-
-        request = captured["request"]
-        assert request["initial_splits"] == {}
-        queue = request["fte_scan_source_queues"]["7"]
-        assert queue.try_get_next() == {
-            "state": "SPLIT",
-            "kind": "scan_task",
-            "data": b"initial-scan",
-        }
-        assert queue.try_get_next() == {
-            "state": "SPLIT",
-            "kind": "scan_task",
-            "data": b"late-scan",
-        }
-        assert queue.try_get_next() == {"state": "FINISHED"}
+        assert consumed == [b"first", b"second"]
+        assert captured["request"]["initial_splits"] == {}
 
     asyncio.run(run())
 
@@ -4859,14 +5100,20 @@ def test_fte_worker_task_manager_wait_split_queue_has_space_tracks_buffered_spli
         assert full["status"]["queued_split_weight"] == 1
         assert full["status"]["split_queue_has_space"] is False
 
-        assert queue.try_get_next()["state"] == "SPLIT"
+        async def consume_after_delay():
+            await asyncio.sleep(0.02)
+            assert queue.try_get_next()["state"] == "SPLIT"
+
+        consumer = asyncio.create_task(consume_after_delay())
         space = await manager.wait_split_queue_has_space(
             task_id,
             source_node_id="7",
             max_buffered_splits=1,
-            timeout_s=0.1,
+            timeout_s=0.5,
         )
+        await asyncio.wait_for(consumer, timeout=1.0)
         assert space["has_space"] is True
+        assert space["terminal"] is False
         assert space["buffered_splits"] == 0
         assert space["buffered_bytes"] == 0
 

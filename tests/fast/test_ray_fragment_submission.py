@@ -7,7 +7,8 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from types import SimpleNamespace
 
 import pytest
@@ -39,6 +40,7 @@ from duckdb.runners.ray.fte import (
 from duckdb.runners.ray.fte_events import (
     FteAddSplitsCommand,
     FteCreateTaskCommand,
+    FteNoMoreSplitsCommand,
     TaskStatusChanged,
     WorkerReservationCompleted,
 )
@@ -233,7 +235,11 @@ class _FakeActor:
         timeout_s=None,
     ):
         self.fte_calls.append(("wait_split_queue", task_id, source_node_id, max_buffered_splits, timeout_s))
-        return {"has_space": True, "buffered_splits": 0}
+        return {
+            "has_space": True,
+            "buffered_splits": 0,
+            "status": {"state": FteTaskState.RUNNING.value, "task_id": task_id},
+        }
 
     def _fte_get_task_info(self, task_id):
         self.fte_calls.append(("get_info", task_id))
@@ -875,6 +881,348 @@ def test_fte_status_wait_preserves_query_deadline_failure(monkeypatch):
 
     with pytest.raises(QueryDeadlineExceeded, match="query deadline expired"):
         handle.fte_wait_task_status(task_id, 3, 0.01)
+
+
+def test_fte_split_backpressure_remote_error_is_canceled_by_query_close():
+    query_id = "query-split-wait-close"
+    wait_started = threading.Event()
+    add_called = threading.Event()
+
+    class _BackpressuredWorker:
+        def fte_wait_split_queue_has_space(self, *_args):
+            raise AssertionError("query-owned split wait must be interruptible")
+
+        def fte_wait_split_queue_has_space_interruptible(
+            self,
+            _task_id,
+            _source_node_id,
+            _max_buffered_splits,
+            _timeout_s,
+            stop_event,
+        ):
+            wait_started.set()
+            deadline = time.monotonic() + 1.0
+            while not stop_event.is_set():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("query close did not cancel split wait")
+                time.sleep(0.01)
+            raise RuntimeError("remote split wait raced query close")
+
+        def enqueue_fte_add_splits(self, *_args):
+            add_called.set()
+            raise AssertionError("canceled split submission must not reach the worker")
+
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-split-wait-close",
+    )
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=f"{query_id}:node:7",
+        task_memory_bytes=1,
+    )
+    attempt_id = FteTaskAttemptId.coerce(
+        {
+            "query_id": query_id,
+            "fragment_execution_id": 0,
+            "partition_id": 0,
+            "attempt_id": 0,
+        }
+    )
+    command = FteAddSplitsCommand(
+        query_id=query_id,
+        fragment_id=stage.fragment_id,
+        worker_id="worker-split-wait-close",
+        worker=_BackpressuredWorker(),
+        attempt_id=attempt_id,
+        source_node_id="7",
+        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+    )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            execution = executor.submit(
+                handle._execute_fte_fragment_execution_worker_commands,
+                stage,
+                [command],
+            )
+            assert wait_started.wait(timeout=1.0)
+            worker_handle_mod.close_fte_registry_for_query(query_id)
+            execution.result(timeout=1.0)
+
+        assert add_called.is_set() is False
+        assert query_id not in worker_handle_mod._FTE_ACTIVE_OPERATIONS_BY_QUERY
+    finally:
+        fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
+
+
+def test_fte_split_backpressure_preserves_query_deadline():
+    query_id = "query-split-wait-deadline"
+
+    class _DeadlineWorker:
+        def fte_wait_split_queue_has_space(self, *_args):
+            raise AssertionError("query-owned split wait must be interruptible")
+
+        def fte_wait_split_queue_has_space_interruptible(self, *_args):
+            raise QueryDeadlineExceeded("query deadline expired while waiting for split capacity")
+
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-split-wait-deadline",
+    )
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=f"{query_id}:node:7",
+        task_memory_bytes=1,
+    )
+    attempt_id = FteTaskAttemptId.coerce(
+        {
+            "query_id": query_id,
+            "fragment_execution_id": 0,
+            "partition_id": 0,
+            "attempt_id": 0,
+        }
+    )
+    command = FteAddSplitsCommand(
+        query_id=query_id,
+        fragment_id=stage.fragment_id,
+        worker_id="worker-split-wait-deadline",
+        worker=_DeadlineWorker(),
+        attempt_id=attempt_id,
+        source_node_id="7",
+        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+    )
+
+    try:
+        with pytest.raises(QueryDeadlineExceeded, match="query deadline expired"):
+            handle._execute_fte_fragment_execution_worker_commands(stage, [command])
+        assert query_id not in worker_handle_mod._FTE_ACTIVE_OPERATIONS_BY_QUERY
+        assert handle._fte_healthy is True
+    finally:
+        fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
+
+
+def test_fte_split_backpressure_terminal_status_uses_task_status_path(monkeypatch):
+    query_id = "query-split-wait-terminal"
+    attempt_id = FteTaskAttemptId.coerce(
+        {
+            "query_id": query_id,
+            "fragment_execution_id": 0,
+            "partition_id": 0,
+            "attempt_id": 0,
+        }
+    )
+    terminal_status = {
+        "state": FteTaskState.FAILED.value,
+        "task_id": attempt_id.to_dict(),
+        "failure": {"type": "ValueError", "message": "planned task failure"},
+    }
+
+    class _TerminalWorker:
+        def fte_wait_split_queue_has_space(self, *_args):
+            raise AssertionError("query-owned split wait must be interruptible")
+
+        def fte_wait_split_queue_has_space_interruptible(self, *_args):
+            return {
+                "has_space": False,
+                "terminal": True,
+                "status": terminal_status,
+            }
+
+        def enqueue_fte_add_splits(self, *_args, **_kwargs):
+            raise AssertionError("terminal task must not accept more splits")
+
+        def enqueue_fte_no_more_splits(self, *_args, **_kwargs):
+            raise AssertionError("terminal task must skip trailing controls")
+
+    worker = _TerminalWorker()
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-split-wait-terminal",
+    )
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=f"{query_id}:node:7",
+        task_memory_bytes=1,
+    )
+    add_command = FteAddSplitsCommand(
+        query_id=query_id,
+        fragment_id=stage.fragment_id,
+        worker_id=handle.worker_id,
+        worker=worker,
+        attempt_id=attempt_id,
+        source_node_id="7",
+        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+    )
+    no_more_command = FteNoMoreSplitsCommand(
+        query_id=query_id,
+        fragment_id=stage.fragment_id,
+        worker_id=handle.worker_id,
+        worker=worker,
+        attempt_id=attempt_id,
+        source_node_id="7",
+    )
+    captured_events = []
+    monkeypatch.setattr(
+        handle,
+        "_handles_for_task_status_changed_event",
+        lambda event: captured_events.append(event) or [],
+    )
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+    try:
+        handle._execute_fte_fragment_execution_worker_commands(
+            stage,
+            [add_command, no_more_command],
+        )
+        scheduler = worker_commands_mod._FTE_SCHEDULERS.get(query_id)
+        assert scheduler is not None
+        scheduler.drain()
+
+        assert len(captured_events) == 1
+        assert captured_events[0].status == terminal_status
+        assert handle._fte_healthy is True
+        stats = scheduler.stats()
+        assert stats.event_counts.get("TaskStatusChanged", 0) == 1
+        assert stats.event_counts.get("WorkerFailed", 0) == 0
+    finally:
+        fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
+
+
+def test_interruptible_fte_control_ref_preserves_completed_query_deadline():
+    completed = Future()
+    completed.set_exception(QueryDeadlineExceeded("remote query deadline"))
+    ref = SimpleNamespace(future=lambda: completed)
+
+    with pytest.raises(QueryDeadlineExceeded, match="remote query deadline"):
+        task_control_mod.FteWorkerTaskControlMixin._get_fte_control_ref(
+            "fte_wait_split_queue_has_space",
+            ref,
+            timeout_s=0.1,
+            cancel_event=threading.Event(),
+        )
+
+
+def test_interruptible_fte_control_ref_reloads_result_completed_at_timeout_boundary():
+    class _RacingFuture:
+        def __init__(self):
+            self.result_calls = []
+
+        def result(self, timeout=None):
+            self.result_calls.append(timeout)
+            if len(self.result_calls) == 1:
+                raise FutureTimeoutError
+            return "completed"
+
+        def done(self):
+            return True
+
+    future = _RacingFuture()
+    ref = SimpleNamespace(future=lambda: future)
+
+    assert (
+        task_control_mod.FteWorkerTaskControlMixin._get_fte_control_ref(
+            "fte_wait_split_queue_has_space",
+            ref,
+            timeout_s=0.1,
+            cancel_event=threading.Event(),
+        )
+        == "completed"
+    )
+    assert future.result_calls == [0.05, None]
+
+
+def test_fte_control_ref_preserves_query_deadline_when_wait_expires(monkeypatch):
+    pending = Future()
+    ref = SimpleNamespace(future=lambda: pending)
+    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", str(time.time() + 0.05))
+
+    try:
+        with pytest.raises(QueryDeadlineExceeded, match="query deadline expired"):
+            task_control_mod.FteWorkerTaskControlMixin._get_fte_control_ref(
+                "fte_add_splits",
+                ref,
+                timeout_s=30.0,
+            )
+    finally:
+        pending.cancel()
+
+
+def test_ordered_add_ref_is_canceled_and_unowned_after_query_close(monkeypatch):
+    query_id = "query-cancel-ordered-add"
+    task_id = {
+        "query_id": query_id,
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+    }
+    add_started = threading.Event()
+    pending = Future()
+
+    class _DeferredRef:
+        def future(self):
+            return pending
+
+    ref = _DeferredRef()
+
+    class _DeferredAdd:
+        def remote(self, *_args):
+            add_started.set()
+            return ref
+
+    actor = _FakeActor()
+    actor.fte_add_splits = _DeferredAdd()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    canceled_refs = []
+    barrier_snapshot_started = threading.Event()
+    cancellation_applied = threading.Event()
+    resolve_object_refs_blocking = task_control_mod.resolve_object_refs_blocking
+
+    def cancel_ref(object_ref, *, force=False):
+        assert force is False
+        canceled_refs.append(object_ref)
+        pending.cancel()
+        cancellation_applied.set()
+
+    def resolve_after_cancellation(*args, **kwargs):
+        barrier_snapshot_started.set()
+        assert cancellation_applied.wait(timeout=1.0)
+        return resolve_object_refs_blocking(*args, **kwargs)
+
+    monkeypatch.setattr(ray, "cancel", cancel_ref)
+    monkeypatch.setattr(task_control_mod, "resolve_object_refs_blocking", resolve_after_cancellation)
+    query_closing = worker_commands_mod._FteQueryClosingEvent(query_id)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            submitted = executor.submit(
+                handle.enqueue_fte_add_splits,
+                task_id,
+                "7",
+                [{"sequence_id": 1}],
+                cancel_event=query_closing,
+            )
+            assert add_started.wait(timeout=1.0)
+            assert worker_handle_mod._FTE_ACTIVE_OPERATIONS_BY_QUERY[query_id] == 1
+            flushed = executor.submit(handle.close_and_flush_fte_controls, query_id)
+            assert barrier_snapshot_started.wait(timeout=1.0)
+            with pytest.raises(InterruptedError, match="interrupted by cancellation"):
+                submitted.result(timeout=1.0)
+            assert flushed.result(timeout=1.0) == []
+
+        assert canceled_refs == [ref]
+        assert str(FteTaskAttemptId.coerce(task_id)) not in handle._fte_control_tails_by_task
+        assert query_id not in worker_handle_mod._FTE_ACTIVE_OPERATIONS_BY_QUERY
+    finally:
+        if not pending.done():
+            pending.cancel()
+        fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
 
 
 def test_fte_worker_actor_handle_chains_async_control_updates_by_task():
@@ -1784,6 +2132,62 @@ def test_control_future_completed_during_zero_timeout_probe_is_reloaded(monkeypa
     assert future.calls == 2
     assert handle._has_fte_control_state_for_query(query_id) is False
     worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+def test_control_barrier_ignores_terminal_error_from_detached_ref(monkeypatch):
+    query_id = "query-control-detached-terminal-error"
+    task_id = {
+        "query_id": query_id,
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+    }
+    raw_status = {
+        "state": "FINISHED",
+        "task_id": task_id,
+        "_fte_control_operation": "fte_ack_task_result",
+        "_fte_control_applied": True,
+    }
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    ref = handle.enqueue_fte_ack_task_result(task_id)
+    validation_failed = threading.Event()
+    current_ref_confirmed = threading.Event()
+    allow_error_recording = threading.Event()
+    original_is_current = handle._is_current_ordered_fte_control_ref
+
+    def resolve(refs, **_kwargs):
+        assert refs == [ref]
+        return [raw_status]
+
+    def fail_validation(_status, _expected_task):
+        validation_failed.set()
+        raise RuntimeError("canceled detached ref")
+
+    def gate_after_current_ref_check(task_key, candidate_ref):
+        is_current = original_is_current(task_key, candidate_ref)
+        if validation_failed.is_set() and is_current and not current_ref_confirmed.is_set():
+            current_ref_confirmed.set()
+            assert allow_error_recording.wait(timeout=1.0)
+        return is_current
+
+    monkeypatch.setattr(task_control_mod, "resolve_object_refs_blocking", resolve)
+    monkeypatch.setattr(task_control_mod, "validate_fte_status_identity", fail_validation)
+    monkeypatch.setattr(handle, "_is_current_ordered_fte_control_ref", gate_after_current_ref_check)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            closed = executor.submit(handle.close_and_flush_fte_controls, query_id)
+            assert current_ref_confirmed.wait(timeout=1.0)
+            handle._discard_ordered_fte_control_ref(task_id, ref)
+            allow_error_recording.set()
+            assert closed.result(timeout=1.0) == []
+
+        assert handle._has_fte_control_state_for_query(query_id) is False
+        assert query_id not in handle._fte_prepare_terminal_errors
+    finally:
+        allow_error_recording.set()
+        worker_handle_mod.open_fte_registry_for_query(query_id)
 
 
 def test_fte_control_close_fences_concurrent_late_admission(monkeypatch):
@@ -2859,7 +3263,7 @@ def test_fte_split_ack_before_create_ack_is_merged_into_running_pressure(monkeyp
     release_create_ack = threading.Event()
     scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create(query_id)
 
-    def execute(command):
+    def execute(command, **_kwargs):
         if isinstance(command, FteCreateTaskCommand):
             create_rpc_completed.set()
             assert release_create_ack.wait(2.0)
@@ -3027,10 +3431,39 @@ def test_fte_add_splits_ack_after_task_finish_does_not_revive_pressure():
     class _BlockingFuture:
         def __init__(self, value):
             self.value = value
+            self._lock = threading.Lock()
+            self._callbacks = []
+            self._done = False
 
         def result(self, timeout=None):
-            assert release_rpc.wait(timeout)
+            with self._lock:
+                if self._done:
+                    return self.value
+            if not release_rpc.wait(timeout):
+                raise FutureTimeoutError
+            with self._lock:
+                if self._done:
+                    return self.value
+                self._done = True
+                callbacks = list(self._callbacks)
+                self._callbacks.clear()
+            for callback in callbacks:
+                callback(self)
             return self.value
+
+        def add_done_callback(self, callback):
+            with self._lock:
+                if self._done:
+                    invoke_now = True
+                else:
+                    self._callbacks.append(callback)
+                    invoke_now = False
+            if invoke_now:
+                callback(self)
+
+        def done(self):
+            with self._lock:
+                return self._done
 
     class _BlockingObjectRef:
         def __init__(self, value):
@@ -6410,14 +6843,18 @@ def test_fte_control_failure_preempts_queued_work_across_queries(monkeypatch):
     assert all(owner is replacement for owner in query_owners.values())
 
 
-def test_fte_split_queue_full_replays_descriptor_on_replacement(monkeypatch):
+def test_fte_split_queue_full_recovers_without_replacing_worker(monkeypatch):
     monkeypatch.setattr(
         RayWorkerActorHandle,
         "_fte_task_handle_cls",
         staticmethod(lambda: _FakeFteTaskHandle),
     )
 
-    class _FullSplitQueueActor(_FakeActor):
+    class _RecoveringSplitQueueActor(_FakeActor):
+        def __init__(self):
+            super().__init__()
+            self.space_checks = 0
+
         def _fte_wait_split_queue_has_space(
             self,
             task_id,
@@ -6434,12 +6871,17 @@ def test_fte_split_queue_full_replays_descriptor_on_replacement(monkeypatch):
                     timeout_s,
                 )
             )
-            return {"has_space": False, "buffered_splits": 1024}
+            self.space_checks += 1
+            return {
+                "has_space": self.space_checks >= 2,
+                "buffered_splits": 0 if self.space_checks >= 2 else 1024,
+                "status": {"state": FteTaskState.RUNNING.value, "task_id": task_id},
+            }
 
-    actor0 = _FullSplitQueueActor()
+    actor0 = _RecoveringSplitQueueActor()
     actor1 = _FakeActor()
     handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-0")
-    handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-1")
+    _handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-1")
     first_task = _FakeTask(
         name="scan-task-0",
         context={"query_id": "query-fte-queue-full", "node_id": "7"},
@@ -6458,27 +6900,21 @@ def test_fte_split_queue_full_replays_descriptor_on_replacement(monkeypatch):
 
     assert len(first) == 1
     assert first[0].worker_handle is handle0
-    assert len(retries) == 1
-    assert retries[0].worker_handle is handle1
+    assert retries == []
     assert [call[0] for call in actor0.fte_calls] == [
         "create",
         "wait_split_queue",
+        "wait_split_queue",
+        "add_splits",
     ]
-    retry_creates = [call for call in actor1.fte_calls if call[0] == "create"]
-    assert len(retry_creates) == 1
-    retry_request = retry_creates[0][1]
-    assert retry_request["task_id"]["attempt_id"] == 1
-    assert [split["data"] for split in retry_request["initial_splits"]["7"]] == [b"a", b"b"]
-    assert "worker-0" not in worker_handle_mod._FTE_WORKER_HANDLES
+    assert [call for call in actor1.fte_calls if call[0] == "create"] == []
+    assert handle0._fte_healthy is True
+    assert "worker-0" in worker_handle_mod._FTE_WORKER_HANDLES
     assert (
-        worker_handle_mod._FTE_PARTITION_OWNERS[("query-fte-queue-full", "query-fte-queue-full:node:7", 0)] is handle1
+        worker_handle_mod._FTE_PARTITION_OWNERS[("query-fte-queue-full", "query-fte-queue-full:node:7", 0)] is handle0
     )
     stats = handle0.fte_registry_stats()["event_schedulers"]["query-fte-queue-full"]
-    assert stats["event_counts"] == {
-        "SplitEventsSubmitted": 2,
-        "WorkerReservationCompleted": 2,
-        "WorkerFailed": 1,
-    }
+    assert stats["event_counts"].get("WorkerFailed", 0) == 0
 
 
 def test_fte_worker_failure_replays_all_owned_stage_partitions(monkeypatch):

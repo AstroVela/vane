@@ -6,13 +6,15 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
+import math
 import os
 import sys
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -168,55 +170,206 @@ def _native_pending_status_fields(
 
 
 class _BackgroundEventLoop:
-    def __init__(self, thread_name: str) -> None:
+    _NEW = "NEW"
+    _STARTING = "STARTING"
+    _RUNNING = "RUNNING"
+    _STOPPING = "STOPPING"
+    _CLOSED = "CLOSED"
+    _FAILED = "FAILED"
+
+    def __init__(
+        self,
+        thread_name: str,
+        *,
+        start_timeout_s: float = 5.0,
+        operation_timeout_s: float = 30.0,
+    ) -> None:
         self._thread_name = thread_name
+        self._start_timeout_s = float(start_timeout_s)
+        self._operation_timeout_s = float(operation_timeout_s)
+        if not math.isfinite(self._start_timeout_s) or self._start_timeout_s <= 0:
+            raise ValueError("native FTE event-loop start timeout must be finite and positive")
+        if not math.isfinite(self._operation_timeout_s) or self._operation_timeout_s <= 0:
+            raise ValueError("native FTE event-loop operation timeout must be finite and positive")
+        self._condition = threading.Condition(threading.RLock())
+        self._state = self._NEW
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
-        self._ready = threading.Event()
-        self._closed = False
+        self._failure: BaseException | None = None
+        self._pending_futures: set[Future[Any]] = set()
 
-    def start(self) -> None:
-        if self._loop is not None:
-            return
+    @staticmethod
+    def _close_awaitable(awaitable: Awaitable[Any]) -> None:
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
 
-        def run() -> None:
+    def _raise_unavailable_locked(self) -> None:
+        failure = self._failure
+        if failure is not None:
+            raise RuntimeError("native FTE event loop failed") from failure
+        if self._state == self._STOPPING:
+            raise RuntimeError("native FTE event loop is stopping")
+        raise RuntimeError("native FTE event loop is closed")
+
+    def _thread_main(self) -> None:
+        loop: asyncio.AbstractEventLoop | None = None
+        failure: BaseException | None = None
+        should_run = False
+        try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            self._loop = loop
-            self._ready.set()
-            loop.run_forever()
-            pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
-            for task in pending:
-                task.cancel()
-            if pending:
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            loop.close()
+            with self._condition:
+                if self._state == self._STARTING:
+                    self._loop = loop
+                    self._state = self._RUNNING
+                    should_run = True
+                self._condition.notify_all()
 
-        self._thread = threading.Thread(target=run, name=self._thread_name, daemon=True)
-        self._thread.start()
-        if not self._ready.wait(timeout=5.0):
-            raise RuntimeError("failed to start native FTE event loop")
+            if should_run:
+                loop.run_forever()
+                with self._condition:
+                    if self._state == self._RUNNING:
+                        failure = RuntimeError("native FTE event loop stopped unexpectedly")
+                        self._failure = failure
+                    self._state = self._STOPPING
+                    pending_futures = tuple(self._pending_futures)
+                    self._condition.notify_all()
+                for future in pending_futures:
+                    future.cancel()
+        except BaseException as exc:
+            failure = exc
+            with self._condition:
+                self._failure = exc
+                self._state = self._STOPPING
+                pending_futures = tuple(self._pending_futures)
+                self._condition.notify_all()
+            for future in pending_futures:
+                future.cancel()
+        finally:
+            if loop is not None:
+                try:
+                    pending_tasks = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                    for task in pending_tasks:
+                        task.cancel()
+                    if pending_tasks:
+                        loop.run_until_complete(asyncio.gather(*pending_tasks, return_exceptions=True))
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+                try:
+                    loop.close()
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+                asyncio.set_event_loop(None)
+            with self._condition:
+                self._loop = None
+                self._pending_futures.clear()
+                if failure is not None:
+                    self._failure = failure
+                self._state = self._FAILED if self._failure is not None else self._CLOSED
+                self._condition.notify_all()
 
-    def submit(self, coro: Awaitable[Any]) -> Future:
-        if self._closed:
-            raise RuntimeError("native FTE event loop is closed")
-        self.start()
-        assert self._loop is not None
-        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+    def start(self) -> None:
+        deadline = time.monotonic() + self._start_timeout_s
+        with self._condition:
+            if self._state == self._NEW:
+                self._state = self._STARTING
+                thread = threading.Thread(
+                    target=self._thread_main,
+                    name=self._thread_name,
+                    daemon=True,
+                )
+                self._thread = thread
+                try:
+                    thread.start()
+                except BaseException as exc:
+                    self._failure = exc
+                    self._state = self._FAILED
+                    self._condition.notify_all()
+                    raise RuntimeError("failed to start native FTE event loop") from exc
+            while self._state == self._STARTING:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failure = TimeoutError("native FTE event-loop startup timed out")
+                    self._failure = failure
+                    self._state = self._STOPPING
+                    self._condition.notify_all()
+                    raise RuntimeError("failed to start native FTE event loop") from failure
+                self._condition.wait(remaining)
+            if self._state == self._RUNNING:
+                return
+            self._raise_unavailable_locked()
 
-    def run(self, coro: Awaitable[Any], timeout_s: float | None = None) -> Any:
-        return self.submit(coro).result(timeout=timeout_s)
+    def _discard_future(self, future: Future[Any]) -> None:
+        with self._condition:
+            self._pending_futures.discard(future)
+
+    def submit(self, coro: Coroutine[Any, Any, Any]) -> Future[Any]:
+        try:
+            self.start()
+            with self._condition:
+                if self._state != self._RUNNING or self._loop is None:
+                    self._raise_unavailable_locked()
+                loop = self._loop
+                assert loop is not None
+                future: Future[Any] = asyncio.run_coroutine_threadsafe(coro, loop)
+                self._pending_futures.add(future)
+                future.add_done_callback(self._discard_future)
+                return future
+        except BaseException:
+            self._close_awaitable(coro)
+            raise
+
+    def run(self, coro: Coroutine[Any, Any, Any], timeout_s: float | None = None) -> Any:
+        timeout_s = self._operation_timeout_s if timeout_s is None else float(timeout_s)
+        if not math.isfinite(timeout_s) or timeout_s < 0:
+            self._close_awaitable(coro)
+            raise ValueError("native FTE event-loop operation timeout must be finite and non-negative")
+        future = self.submit(coro)
+        try:
+            return future.result(timeout=timeout_s)
+        except FutureTimeoutError as exc:
+            if future.done():
+                return future.result()
+            future.cancel()
+            raise TimeoutError(f"native FTE event-loop operation timed out after {timeout_s:.3f}s") from exc
 
     def shutdown(self, timeout_s: float = 5.0) -> None:
-        if self._closed:
+        timeout_s = float(timeout_s)
+        if not math.isfinite(timeout_s) or timeout_s < 0:
+            raise ValueError("native FTE event-loop shutdown timeout must be finite and non-negative")
+        with self._condition:
+            if self._state == self._CLOSED:
+                return
+            if self._state == self._NEW:
+                self._state = self._CLOSED
+                self._condition.notify_all()
+                return
+            if self._state == self._FAILED:
+                self._state = self._CLOSED
+                self._condition.notify_all()
+            elif self._state in {self._STARTING, self._RUNNING}:
+                self._state = self._STOPPING
+                loop = self._loop
+                if loop is not None:
+                    try:
+                        loop.call_soon_threadsafe(loop.stop)
+                    except BaseException as exc:
+                        self._failure = exc
+                self._condition.notify_all()
+            thread = self._thread
+        if thread is None or thread is threading.current_thread():
             return
-        self._closed = True
-        loop = self._loop
-        if loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(loop.stop)
-        thread = self._thread
-        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+        if thread.is_alive():
             thread.join(timeout=timeout_s)
+        if thread.is_alive():
+            raise RuntimeError(f"native FTE event loop did not stop within {timeout_s:.3f}s")
+        with self._condition:
+            if self._state in {self._STOPPING, self._FAILED}:
+                self._state = self._CLOSED
+                self._condition.notify_all()
 
 
 def _as_status(method_name: str, value: Any) -> dict[str, Any]:
@@ -381,9 +534,7 @@ def _normalize_result_for_cxx(value: Any) -> Any:
     partition_refs = []
     for index, payload in enumerate(payloads or []):
         if index < len(metadatas or []):
-            num_rows, size_bytes = _metadata_rows_bytes(metadatas[index])
-        else:
-            num_rows, size_bytes = 0, 0
+            _metadata_rows_bytes(metadatas[index])
         if isinstance(payload, RayResultPartitionRef):
             partition_refs.append(payload)
         else:
@@ -654,16 +805,18 @@ class _NativeFteProgressRegistry:
             fragment_executions: dict[str, dict[str, Any]] = {}
             for fragment_id, registered in fragments.items():
                 partitions: dict[str, dict[str, Any]] = {}
-                for partition_id, partition in registered.partitions.items():
+                for partition_id, registered_partition in registered.partitions.items():
                     metrics_key = (query_id, fragment_id, partition_id)
                     metrics = partition_metrics.get(metrics_key)
                     if metrics is not None:
-                        partition.last_metrics = dict(metrics)
-                    metrics = dict(partition.last_metrics or self._placeholder_partition_metrics(partition))
+                        registered_partition.last_metrics = dict(metrics)
+                    metrics = dict(
+                        registered_partition.last_metrics or self._placeholder_partition_metrics(registered_partition)
+                    )
                     self._merge_fragment_progress_topology_locked(registered, metrics)
                     partitions[partition_id] = metrics
                     if str(metrics.get("state") or "").upper() == "FINISHED":
-                        selected_attempt_ids.add(str(partition.task_id))
+                        selected_attempt_ids.add(str(registered_partition.task_id))
 
                 partition_count = len(partitions)
                 running_count = sum(int(partition.get("running_count") or 0) for partition in partitions.values())
@@ -953,7 +1106,7 @@ class NativeWorkerHandle:
         source_node_id: str,
         splits: Sequence[Mapping[str, Any]],
     ) -> dict[str, Any]:
-        split_payloads = [dict(split) for split in splits]
+        split_payloads: list[Mapping[str, Any]] = [dict(split) for split in splits]
         return _as_status(
             "fte_add_splits",
             self._loop.run(self._manager.add_splits(task_id, str(source_node_id), split_payloads)),
@@ -994,9 +1147,13 @@ class NativeWorkerHandle:
         min_version: int | None = None,
         timeout_s: float | None = None,
     ) -> dict[str, Any]:
+        loop_timeout_s = None if timeout_s is None else max(5.0, float(timeout_s) + 5.0)
         return _as_status(
             "fte_wait_task_status",
-            self._loop.run(self._manager.wait_task_status(task_id, min_version, timeout_s)),
+            self._loop.run(
+                self._manager.wait_task_status(task_id, min_version, timeout_s),
+                timeout_s=loop_timeout_s,
+            ),
         )
 
     def fte_wait_split_queue_has_space(
@@ -1006,6 +1163,7 @@ class NativeWorkerHandle:
         max_buffered_splits: int | None = None,
         timeout_s: float | None = None,
     ) -> dict[str, Any]:
+        loop_timeout_s = None if timeout_s is None else max(5.0, float(timeout_s) + 5.0)
         return _as_status(
             "fte_wait_split_queue_has_space",
             self._loop.run(
@@ -1014,7 +1172,8 @@ class NativeWorkerHandle:
                     source_node_id,
                     max_buffered_splits,
                     timeout_s,
-                )
+                ),
+                timeout_s=loop_timeout_s,
             ),
         )
 
@@ -1096,6 +1255,7 @@ class NativeFteWorkerManagerBackend:
         self._dropped_queries: dict[str, dict[str, Any]] = {}
         self._progress_registry = _NativeFteProgressRegistry()
         self._closed = False
+        self._closing = False
         self._debug_sampler_stop = threading.Event()
         self._debug_sampler_thread: threading.Thread | None = None
         if _native_submit_debug_enabled():
@@ -1135,6 +1295,8 @@ class NativeFteWorkerManagerBackend:
     def submit_tasks(self, tasks: Sequence[Any]) -> Sequence[NativeTaskResultHandle]:
         if self._closed:
             raise RuntimeError("native FTE worker manager is shut down")
+        if self._closing:
+            raise RuntimeError("native FTE worker manager is shutting down")
         submit_started_at = time.monotonic()
         batch_size = len(tasks)
         submitted_count = 0
@@ -1435,11 +1597,8 @@ class NativeFteWorkerManagerBackend:
                     **({"task_stats": progress_stats} if progress_stats else {}),
                 }
             )
-        output_stats = (
-            dict(status.get("spooling_output_stats"))
-            if isinstance(status.get("spooling_output_stats"), Mapping)
-            else status.get("spooling_output_stats")
-        )
+        raw_output_stats = status.get("spooling_output_stats")
+        output_stats = dict(raw_output_stats) if isinstance(raw_output_stats, Mapping) else raw_output_stats
         selected_output_stats: Any = None
         if finished:
             selected_output_stats = progress_stats or output_stats
@@ -1595,10 +1754,19 @@ class NativeFteWorkerManagerBackend:
     def shutdown(self) -> None:
         if self._closed:
             return
-        self._closed = True
+        self._closing = True
         self._stop_debug_sampler()
+        worker_errors: list[str] = []
         for worker in self._workers:
-            worker.shutdown()
+            worker_id = str(getattr(worker, "worker_id", "") or "<unknown>")
+            try:
+                worker.shutdown()
+            except BaseException as exc:
+                worker_errors.append(f"{worker_id}: {type(exc).__name__}: {exc}")
+        if worker_errors:
+            raise RuntimeError("native FTE worker manager shutdown failed: " + "; ".join(worker_errors))
+        self._closed = True
+        self._closing = False
 
     def _start_debug_sampler(self) -> None:
         if self._debug_sampler_thread is not None:

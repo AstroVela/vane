@@ -3,23 +3,29 @@
 
 from __future__ import annotations
 
+import asyncio
 import pickle
 import threading
 import time
 import uuid
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 import duckdb
+import duckdb.runners.fte.backends.native.backend as native_backend_mod
 from duckdb.runners.fte import FteTaskAttemptId, FteTaskId, FteTaskState, TaskResultState
 from duckdb.runners.fte.backends.native import (
     NativeFteWorkerManagerBackend,
     NativeTaskResultHandle,
     NativeWorkerHandle,
 )
-from duckdb.runners.fte.backends.native.backend import _flight_exchange_node_id_from_env
+from duckdb.runners.fte.backends.native.backend import (
+    _BackgroundEventLoop,
+    _flight_exchange_node_id_from_env,
+)
 from duckdb.runners.fte.fte_config import FTE_WORKER_RUNTIME
 from duckdb.runners.progress import build_progress_snapshot
 
@@ -68,6 +74,210 @@ class _FakeNativeWorkerTask:
 
     def exchange_sink_instance(self):
         return self._exchange_sink_instance
+
+
+def test_native_background_event_loop_concurrent_first_submit_starts_once(monkeypatch):
+    background = _BackgroundEventLoop("native-fte-concurrent-start")
+    original_thread_main = background._thread_main
+    thread_main_started = threading.Event()
+    release_thread_main = threading.Event()
+    call_count = 0
+    call_count_lock = threading.Lock()
+
+    def gated_thread_main():
+        nonlocal call_count
+        with call_count_lock:
+            call_count += 1
+        thread_main_started.set()
+        assert release_thread_main.wait(timeout=1.0)
+        original_thread_main()
+
+    monkeypatch.setattr(background, "_thread_main", gated_thread_main)
+    submit_barrier = threading.Barrier(8)
+
+    def submit(index):
+        submit_barrier.wait(timeout=1.0)
+        future = background.submit(asyncio.sleep(0, result=index))
+        return future.result(timeout=1.0)
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            submitted = [executor.submit(submit, index) for index in range(8)]
+            assert thread_main_started.wait(timeout=1.0)
+            release_thread_main.set()
+            assert sorted(future.result(timeout=2.0) for future in submitted) == list(range(8))
+    finally:
+        release_thread_main.set()
+        background.shutdown(timeout_s=1.0)
+
+    assert call_count == 1
+
+
+def test_native_background_event_loop_submit_during_shutdown_is_rejected(monkeypatch):
+    background = _BackgroundEventLoop("native-fte-submit-during-shutdown")
+    background.start()
+    event_loop = background._loop
+    assert event_loop is not None
+    original_call_soon_threadsafe = event_loop.call_soon_threadsafe
+    stop_scheduling_started = threading.Event()
+    allow_stop_scheduling = threading.Event()
+
+    def gated_call_soon_threadsafe(callback, *args, **kwargs):
+        if callback == event_loop.stop:
+            stop_scheduling_started.set()
+            assert allow_stop_scheduling.wait(timeout=1.0)
+        return original_call_soon_threadsafe(callback, *args, **kwargs)
+
+    monkeypatch.setattr(event_loop, "call_soon_threadsafe", gated_call_soon_threadsafe)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        shutdown = executor.submit(background.shutdown, 1.0)
+        assert stop_scheduling_started.wait(timeout=1.0)
+        submitted = executor.submit(background.submit, asyncio.sleep(0, result="late"))
+        allow_stop_scheduling.set()
+        shutdown.result(timeout=2.0)
+        with pytest.raises(RuntimeError, match="stopping|closed"):
+            submitted.result(timeout=2.0)
+
+
+def test_native_background_event_loop_shutdown_stops_published_loop_before_run(monkeypatch):
+    original_new_event_loop = asyncio.new_event_loop
+    run_forever_entered = threading.Event()
+    allow_run_forever = threading.Event()
+    stop_scheduled = threading.Event()
+
+    def gated_new_event_loop():
+        event_loop = original_new_event_loop()
+        original_run_forever = event_loop.run_forever
+        original_call_soon_threadsafe = event_loop.call_soon_threadsafe
+
+        def gated_run_forever():
+            run_forever_entered.set()
+            assert allow_run_forever.wait(timeout=1.0)
+            original_run_forever()
+
+        def tracked_call_soon_threadsafe(callback, *args, **kwargs):
+            if callback == event_loop.stop:
+                stop_scheduled.set()
+            return original_call_soon_threadsafe(callback, *args, **kwargs)
+
+        monkeypatch.setattr(event_loop, "run_forever", gated_run_forever)
+        monkeypatch.setattr(event_loop, "call_soon_threadsafe", tracked_call_soon_threadsafe)
+        return event_loop
+
+    monkeypatch.setattr(asyncio, "new_event_loop", gated_new_event_loop)
+    background = _BackgroundEventLoop("native-fte-stop-before-run")
+    try:
+        background.start()
+        assert run_forever_entered.wait(timeout=1.0)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            shutdown = executor.submit(background.shutdown, 1.0)
+            assert stop_scheduled.wait(timeout=1.0)
+            allow_run_forever.set()
+            shutdown.result(timeout=2.0)
+    finally:
+        allow_run_forever.set()
+        background.shutdown(timeout_s=1.0)
+
+
+def test_native_background_event_loop_shutdown_completes_pending_future():
+    background = _BackgroundEventLoop("native-fte-cancel-pending")
+
+    async def wait_forever():
+        await asyncio.Event().wait()
+
+    future = background.submit(wait_forever())
+    background.shutdown(timeout_s=1.0)
+
+    with pytest.raises(CancelledError):
+        future.result(timeout=1.0)
+
+
+def test_native_background_event_loop_operation_timeout_cancels_coroutine():
+    background = _BackgroundEventLoop(
+        "native-fte-operation-timeout",
+        operation_timeout_s=0.05,
+    )
+    coroutine_finished = threading.Event()
+
+    async def wait_forever():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            coroutine_finished.set()
+
+    try:
+        with pytest.raises(TimeoutError, match="operation timed out"):
+            background.run(wait_forever())
+        assert coroutine_finished.wait(timeout=1.0)
+    finally:
+        background.shutdown(timeout_s=1.0)
+
+
+def test_native_background_event_loop_reloads_result_completed_at_timeout_boundary(monkeypatch):
+    class _RacingFuture:
+        def __init__(self):
+            self.result_calls = []
+
+        def result(self, timeout=None):
+            self.result_calls.append(timeout)
+            if len(self.result_calls) == 1:
+                raise native_backend_mod.FutureTimeoutError
+            return "completed"
+
+        def done(self):
+            return True
+
+    async def unused():
+        return None
+
+    future = _RacingFuture()
+    background = _BackgroundEventLoop("native-fte-timeout-boundary")
+
+    def submit(coroutine):
+        coroutine.close()
+        return future
+
+    monkeypatch.setattr(background, "submit", submit)
+
+    assert background.run(unused(), timeout_s=0.25) == "completed"
+    assert future.result_calls == [0.25, None]
+
+
+def test_native_background_event_loop_catches_pre311_future_timeout(monkeypatch):
+    class _Pre311FutureTimeout(Exception):
+        pass
+
+    class _PendingFuture:
+        def __init__(self):
+            self.cancelled = False
+
+        def result(self, timeout=None):
+            assert timeout == 0.25
+            raise _Pre311FutureTimeout
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+
+    async def unused():
+        return None
+
+    pending = _PendingFuture()
+    background = _BackgroundEventLoop("native-fte-pre311-future-timeout")
+
+    def submit(coroutine):
+        coroutine.close()
+        return pending
+
+    monkeypatch.setattr(native_backend_mod, "FutureTimeoutError", _Pre311FutureTimeout)
+    monkeypatch.setattr(background, "submit", submit)
+
+    with pytest.raises(TimeoutError, match="operation timed out"):
+        background.run(unused(), timeout_s=0.25)
+    assert pending.cancelled is True
 
 
 def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
@@ -655,6 +865,41 @@ def test_native_worker_manager_backend_submit_wait_drop_and_shutdown():
         backend.submit_tasks([])
 
 
+def test_native_worker_manager_shutdown_attempts_all_workers_and_is_retryable():
+    shutdown_calls = []
+
+    class _Worker:
+        def __init__(self, worker_id, *, fail_once=False):
+            self.worker_id = worker_id
+            self.fail_once = fail_once
+
+        def shutdown(self):
+            shutdown_calls.append(self.worker_id)
+            if self.fail_once:
+                self.fail_once = False
+                raise RuntimeError(f"{self.worker_id} loop did not stop")
+
+    backend = NativeFteWorkerManagerBackend(
+        workers=[
+            _Worker("first", fail_once=True),
+            _Worker("second"),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="first.*loop did not stop"):
+        backend.shutdown()
+
+    assert shutdown_calls == ["first", "second"]
+    assert backend._closed is False
+    with pytest.raises(RuntimeError, match="shutting down"):
+        backend.submit_tasks([])
+
+    backend.shutdown()
+
+    assert shutdown_calls == ["first", "second", "first", "second"]
+    assert backend._closed is True
+
+
 def test_native_worker_manager_exposes_ray_compatible_query_status_and_handles():
     release = threading.Event()
 
@@ -783,7 +1028,7 @@ def test_native_worker_task_request_converts_inputs_to_dynamic_splits():
     assert [split["data"]["partition_indices"] for split in exchange_splits] == [[0], [1]]
 
 
-def test_native_fte_runtime_removes_dynamic_initial_splits_before_execute():
+def test_native_fte_runtime_starts_dynamic_source_and_removes_initial_splits_before_execute():
     executed = threading.Event()
     captured: list[dict[str, Any]] = []
 
@@ -809,14 +1054,10 @@ def test_native_fte_runtime_removes_dynamic_initial_splits_before_execute():
             ]
         )
 
-        time.sleep(0.02)
-        assert executed.is_set() is False
-
-        backend.task_input_stream_exhausted("query-dynamic-scan", ["7"])
+        assert executed.wait(timeout=1.0)
         outputs = backend.wait_query("query-dynamic-scan", 2.0)
 
         assert outputs == [{"ok": True}]
-        assert executed.is_set() is True
         assert captured[0]["initial_splits"] == {}
         assert captured[0]["dynamic_scan_source_node_ids"] == ["7"]
         assert "fte_scan_source_queues" in captured[0]

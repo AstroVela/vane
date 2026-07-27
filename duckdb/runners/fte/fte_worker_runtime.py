@@ -559,10 +559,12 @@ class FteTaskExecution:
         while True:
             buffered = self._source_buffered_splits(source_node_id)
             buffered_bytes = self._source_buffered_bytes(source_node_id)
-            has_space = buffered < max_buffered_splits or self.status.state in _TERMINAL_STATES
-            if has_space:
+            has_space = buffered < max_buffered_splits
+            terminal = self.status.state in _TERMINAL_STATES
+            if has_space or terminal:
                 return {
-                    "has_space": True,
+                    "has_space": has_space,
+                    "terminal": terminal,
                     "buffered_splits": buffered,
                     "buffered_bytes": buffered_bytes,
                     "max_buffered_splits": max_buffered_splits,
@@ -572,6 +574,7 @@ class FteTaskExecution:
             if remaining <= 0:
                 return {
                     "has_space": False,
+                    "terminal": False,
                     "buffered_splits": buffered,
                     "buffered_bytes": buffered_bytes,
                     "max_buffered_splits": max_buffered_splits,
@@ -729,8 +732,8 @@ class FteTaskExecution:
         required_sources = {str(source) for source in explicit_sources}
         if not required_sources:
             required_sources = set(self.initial_splits) | set(self.seen_sequences)
-            required_sources.difference_update(self.dynamic_scan_source_ids)
-            required_sources.difference_update(self.dynamic_exchange_source_ids)
+        required_sources.difference_update(self.dynamic_scan_source_ids)
+        required_sources.difference_update(self.dynamic_exchange_source_ids)
         if not required_sources:
             return True
         return required_sources.issubset(self.no_more_split_sources)
