@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import socket
 import struct
@@ -48,10 +49,15 @@ _MSG_OUTPUT_GRANT_REQUEST = 0x0C
 _MSG_OUTPUT_GRANT_GRANTED = 0x0D
 _MSG_OUTPUT_GRANT_CANCELLED = 0x0E
 _MSG_OUTPUT_GRANT_RELEASE = 0x0F
+_MSG_TASK_CANCELLED = 0x10
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
 _DEFAULT_SHM_SIZE = 1 << 20
+
+
+class _TaskCancelledError(RuntimeError):
+    """The parent cancelled this task without invalidating the worker."""
 
 
 def _debug_enabled() -> bool:
@@ -269,7 +275,7 @@ def _request_output_grant(
     msg_type, payload_data = _recv_message(sock)
     if msg_type == _MSG_OUTPUT_GRANT_CANCELLED:
         error = payload_data.decode("utf-8", errors="replace") or "local_shm output grant cancelled"
-        raise RuntimeError(error)
+        raise _TaskCancelledError(error)
     if msg_type != _MSG_OUTPUT_GRANT_GRANTED:
         raise RuntimeError(f"unexpected output grant response: {msg_type:#x}")
     response = duckdb_pickle.loads(payload_data)
@@ -468,7 +474,23 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
         while not close_requested:
             msg_type, payload_data = _recv_message(sock)
             if msg_type == _MSG_CLOSE:
-                _send_message(sock, _MSG_ACK)
+                cleanup_error: BaseException | None = None
+                try:
+                    if executor is not None:
+                        executor.close()
+                except BaseException as exc:
+                    cleanup_error = exc
+                finally:
+                    executor = None
+                    gc.collect()
+                if cleanup_error is None:
+                    _send_message(sock, _MSG_ACK)
+                else:
+                    _send_message(
+                        sock,
+                        _MSG_ERROR,
+                        _format_exception(cleanup_error).encode("utf-8", errors="replace"),
+                    )
                 close_requested = True
                 continue
             if msg_type == _MSG_FINISHED:
@@ -553,6 +575,8 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                         result_msg_type=result_msg_type,
                     )
                 _send_message(sock, result_msg_type, result_payload)
+            except _TaskCancelledError as exc:
+                _send_message(sock, _MSG_TASK_CANCELLED, str(exc).encode("utf-8", errors="replace"))
             except Exception as exc:
                 _send_message(sock, _MSG_ERROR, _format_exception(exc).encode("utf-8", errors="replace"))
     except Exception as exc:
@@ -561,6 +585,13 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
         except Exception:
             pass
     finally:
+        if executor is not None:
+            try:
+                executor.close()
+            except Exception:
+                pass
+            executor = None
+            gc.collect()
         try:
             payload_shm.close()
         except Exception:

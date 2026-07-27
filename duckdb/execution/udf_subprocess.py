@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import weakref
 from collections import deque
 from collections.abc import Mapping
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
 from duckdb import pickle as duckdb_pickle
 from duckdb.execution._common import ensure_table as _ensure_table
 from duckdb.execution.ref_bundle import (
+    REF_BUNDLE_RESULT_MARKER,
     SUBMIT_RESULT_MARKER,
     _create_shm,
     _open_existing_shm,
@@ -48,6 +50,7 @@ from duckdb.execution.ref_bundle import (
     payload_requests_local_ref_bundle_output,
     register_local_shm_ref_budget_wakeup,
     release_local_shm_output_grant,
+    release_local_shm_ref_bundle_descriptor,
     request_local_shm_output_grant,
     wake_local_shm_ref_budget_waiters,
 )
@@ -56,6 +59,10 @@ from duckdb.execution.udf_admission import (
     AdmissionLease,
     LocalExecutionSlotPool,
     LocalSlotAdmissionAuthority,
+)
+from duckdb.execution.udf_lifecycle import (
+    ExecutionCancellationScope,
+    ExecutionCancelledError,
 )
 from duckdb.execution.udf_threading import (
     worker_thread_env as _worker_thread_env,
@@ -78,6 +85,7 @@ _MSG_OUTPUT_GRANT_REQUEST = 0x0C
 _MSG_OUTPUT_GRANT_GRANTED = 0x0D
 _MSG_OUTPUT_GRANT_CANCELLED = 0x0E
 _MSG_OUTPUT_GRANT_RELEASE = 0x0F
+_MSG_TASK_CANCELLED = 0x10
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
@@ -320,11 +328,14 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         self._session_config = (
             None if session_config is None else {str(key): str(value) for key, value in session_config.items()}
         )
-        self._active_input_leases: set[int] = set()
+        self._execution_scope_lock = threading.Lock()
+        self._active_execution_scope: ExecutionCancellationScope | None = None
+        self._worker_lifetime_scope = ExecutionCancellationScope(f"subprocess-worker:{id(self)}", 1)
+        self._close_lock = threading.Lock()
+        self._active_input_leases: dict[int, ExecutionCancellationScope] = {}
         self._active_input_leases_lock = threading.Lock()
-        self._active_output_grants: set[int] = set()
+        self._active_output_grants: dict[int, ExecutionCancellationScope] = {}
         self._active_output_grants_lock = threading.Lock()
-        self._output_grant_cancel_event = threading.Event()
 
         self._payload_shm: shared_memory.SharedMemory | None = None
         self._data_shm: shared_memory.SharedMemory | None = None
@@ -441,32 +452,82 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             raise RuntimeError("UDF subprocess data shared memory is not available")
         return self._data_shm
 
-    def _track_input_lease(self, lease_id: int) -> None:
+    def _current_execution_scope(self) -> ExecutionCancellationScope:
+        lock = getattr(self, "_execution_scope_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._execution_scope_lock = lock
+        with lock:
+            scope = getattr(self, "_active_execution_scope", None)
+            if scope is not None:
+                return scope
+            lifetime_scope = getattr(self, "_worker_lifetime_scope", None)
+            if lifetime_scope is None:
+                lifetime_scope = ExecutionCancellationScope(f"subprocess-worker:{id(self)}", 1)
+                self._worker_lifetime_scope = lifetime_scope
+            return lifetime_scope
+
+    def _run_in_execution_scope(
+        self,
+        scope: ExecutionCancellationScope,
+        fn: Callable[[_SingleSubprocessExecutor], Any | None],
+    ) -> Any | None:
+        with self._execution_scope_lock:
+            if self._active_execution_scope is not None:
+                raise RuntimeError("UDF subprocess worker already has an active execution scope")
+            self._active_execution_scope = scope
+        unregister = scope.register_cancel_wakeup(lambda: self._cancel_scope_resources(scope, cancel_scope=False))
+        try:
+            scope.raise_if_cancelled("UDF subprocess task")
+            return fn(self)
+        finally:
+            unregister()
+            self._cancel_scope_resources(scope, cancel_scope=False)
+            with self._execution_scope_lock:
+                if self._active_execution_scope is scope:
+                    self._active_execution_scope = None
+
+    def _track_input_lease(
+        self,
+        lease_id: int,
+        scope: ExecutionCancellationScope | None = None,
+    ) -> None:
+        owner_scope = scope or self._current_execution_scope()
         with self._active_input_leases_lock:
-            self._active_input_leases.add(int(lease_id))
+            self._active_input_leases[int(lease_id)] = owner_scope
 
     def _untrack_input_lease(self, lease_id: int) -> None:
         with self._active_input_leases_lock:
-            self._active_input_leases.discard(int(lease_id))
+            self._active_input_leases.pop(int(lease_id), None)
 
-    def _cancel_active_input_leases(self) -> None:
+    def _cancel_active_input_leases(self, scope: ExecutionCancellationScope | None = None) -> None:
         with self._active_input_leases_lock:
-            lease_ids = list(self._active_input_leases)
-            self._active_input_leases.clear()
+            lease_ids = [
+                lease_id
+                for lease_id, owner_scope in self._active_input_leases.items()
+                if scope is None or owner_scope is scope
+            ]
+            for lease_id in lease_ids:
+                self._active_input_leases.pop(lease_id, None)
         for lease_id in lease_ids:
             cancel_local_shm_input_lease(lease_id, name="udf-input-close")
 
-    def _track_output_grant(self, grant_id: int) -> None:
+    def _track_output_grant(
+        self,
+        grant_id: int,
+        scope: ExecutionCancellationScope | None = None,
+    ) -> None:
         if int(grant_id) <= 0:
             return
+        owner_scope = scope or self._current_execution_scope()
         with self._active_output_grants_lock:
-            self._active_output_grants.add(int(grant_id))
+            self._active_output_grants[int(grant_id)] = owner_scope
 
     def _untrack_output_grant(self, grant_id: int) -> None:
         if int(grant_id) <= 0:
             return
         with self._active_output_grants_lock:
-            self._active_output_grants.discard(int(grant_id))
+            self._active_output_grants.pop(int(grant_id), None)
 
     def _release_output_grant(self, grant_id: int, *, name: str) -> None:
         if int(grant_id) <= 0:
@@ -476,12 +537,36 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         finally:
             self._untrack_output_grant(int(grant_id))
 
-    def _release_active_output_grants(self, *, name: str = "udf-output-close") -> None:
+    def _release_active_output_grants(
+        self,
+        *,
+        name: str = "udf-output-close",
+        scope: ExecutionCancellationScope | None = None,
+    ) -> None:
         with self._active_output_grants_lock:
-            grant_ids = list(self._active_output_grants)
-            self._active_output_grants.clear()
+            grant_ids = [
+                grant_id
+                for grant_id, owner_scope in self._active_output_grants.items()
+                if scope is None or owner_scope is scope
+            ]
+            for grant_id in grant_ids:
+                self._active_output_grants.pop(grant_id, None)
         for grant_id in grant_ids:
             release_local_shm_output_grant(grant_id, name=name)
+
+    def _cancel_scope_resources(
+        self,
+        scope: ExecutionCancellationScope,
+        *,
+        cancel_scope: bool = True,
+    ) -> None:
+        if cancel_scope:
+            scope.cancel("subprocess execution cancelled")
+        try:
+            self._cancel_active_input_leases(scope)
+            self._release_active_output_grants(name="udf-output-cancel", scope=scope)
+        finally:
+            wake_local_shm_ref_budget_waiters()
 
     def _mark_broken(self, error: str, *, actor_lost: bool = False) -> None:
         self._actor_lost = self._actor_lost or actor_lost
@@ -529,9 +614,15 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         if args.num_rows == 0:
             return None
 
-        _marker, refs, metadata, names = make_local_shm_ref_bundle_result(args)
+        scope = self._current_execution_scope()
+        scope.raise_if_cancelled("UDF subprocess input allocation")
+        _marker, refs, metadata, names = make_local_shm_ref_bundle_result(
+            args,
+            cancel_event=scope,
+        )
         lease_id = None
         try:
+            scope.raise_if_cancelled("UDF subprocess input allocation")
             worker_payload, lease_id = _make_local_ref_bundle_worker_payload_with_lease(
                 refs,
                 None,
@@ -577,22 +668,27 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             priority = str(event.get("priority") or "consumer")
             input_lease_id_raw = event.get("input_lease_id")
             input_lease_id = int(input_lease_id_raw) if input_lease_id_raw is not None else None
+            scope = self._current_execution_scope()
+            grant_id = 0
             try:
                 grant_id = request_local_shm_output_grant(
                     size,
                     name=f"udf-output-{request_id}",
                     priority=priority,
                     input_lease_id=input_lease_id,
-                    cancel_event=self._output_grant_cancel_event,
+                    cancel_event=scope,
                 )
+                self._track_output_grant(grant_id, scope)
+                scope.raise_if_cancelled("UDF subprocess output grant")
             except BaseException as exc:
+                if grant_id > 0:
+                    self._release_output_grant(grant_id, name=f"udf-output-{request_id}-cancelled")
                 _send_message(
                     self._require_socket(),
                     _MSG_OUTPUT_GRANT_CANCELLED,
                     str(exc).encode("utf-8", errors="replace"),
                 )
                 return True
-            self._track_output_grant(grant_id)
             response = {"request_id": request_id, "grant_id": int(grant_id)}
             try:
                 _send_message(self._require_socket(), _MSG_OUTPUT_GRANT_GRANTED, duckdb_pickle.dumps(response))
@@ -623,33 +719,72 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     _MSG_INPUT_CONSUME_FAILED,
                     _MSG_OUTPUT_GRANT_REQUEST,
                     _MSG_OUTPUT_GRANT_RELEASE,
+                    _MSG_TASK_CANCELLED,
                 )
             )
-            if self._handle_submit_control_message(msg_type, payload):
-                msg_type = None
-                continue
+            try:
+                if self._handle_submit_control_message(msg_type, payload):
+                    msg_type = None
+                    continue
+            except BaseException as exc:
+                self._mark_broken(
+                    f"UDF subprocess control-message handling failed: {exc}",
+                    actor_lost=True,
+                )
+                raise RuntimeError(self._broken_error) from exc
             if msg_type == _MSG_ERROR:
                 error = payload.decode("utf-8", errors="replace")
                 self._mark_broken(error)
                 raise RuntimeError(error)
+            if msg_type == _MSG_TASK_CANCELLED:
+                error = payload.decode("utf-8", errors="replace") or "UDF subprocess task cancelled"
+                scope = self._current_execution_scope()
+                if scope.is_set():
+                    raise ExecutionCancelledError(f"UDF subprocess task cancelled: {scope.cancel_reason or error}")
+                self._mark_broken(f"UDF subprocess unexpectedly cancelled a task: {error}")
+                raise RuntimeError(self._broken_error)
             if msg_type == _MSG_REF_BUNDLE_RESULT:
                 descriptor = duckdb_pickle.loads(payload)
                 grant_id_raw = descriptor.get("grant_id") if isinstance(descriptor, dict) else None
                 grant_id = int(grant_id_raw) if grant_id_raw is not None else None
+                scope = self._current_execution_scope()
+                if scope.is_set():
+                    try:
+                        release_local_shm_ref_bundle_descriptor(descriptor)
+                    finally:
+                        if grant_id is not None:
+                            self._release_output_grant(grant_id, name="udf-output-cancelled-result")
+                    raise ExecutionCancelledError(
+                        f"UDF subprocess task cancelled: {scope.cancel_reason or 'cancelled'}"
+                    )
                 try:
-                    result = make_local_shm_ref_bundle_result_from_descriptor(descriptor, block_on_budget=False)
+                    result = make_local_shm_ref_bundle_result_from_descriptor(
+                        descriptor,
+                        block_on_budget=False,
+                        cancel_event=scope,
+                    )
                 except BaseException:
-                    if grant_id is not None:
-                        self._release_output_grant(grant_id, name="udf-output-descriptor-wrap-failed")
+                    try:
+                        release_local_shm_ref_bundle_descriptor(descriptor)
+                    finally:
+                        if grant_id is not None:
+                            self._release_output_grant(grant_id, name="udf-output-descriptor-wrap-failed")
                     raise
                 if grant_id is not None:
                     self._untrack_output_grant(grant_id)
+                try:
+                    scope.raise_if_cancelled("UDF subprocess result")
+                except BaseException:
+                    _release_local_ref_bundle_result(result)
+                    raise
                 return result
             if len(payload) != 8:
                 self._mark_broken("UDF subprocess returned malformed OK response", actor_lost=True)
                 raise RuntimeError(self._broken_error)
 
             result_size = struct.unpack("<Q", payload)[0]
+            scope = self._current_execution_scope()
+            scope.raise_if_cancelled("UDF subprocess task")
             if result_size == 0:
                 return None
             if self._ref_bundle_output:
@@ -674,8 +809,14 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         sock = self._require_socket()
         lease_id_raw = payload.get("input_lease_id")
         lease_id = int(lease_id_raw) if lease_id_raw is not None else None
+        scope = self._current_execution_scope()
+        scope.raise_if_cancelled("UDF subprocess submit")
         if lease_id is not None:
-            self._track_input_lease(lease_id)
+            self._track_input_lease(lease_id, scope)
+            if scope.is_set():
+                cancel_local_shm_input_lease(lease_id, name="udf-input")
+                self._untrack_input_lease(lease_id)
+                scope.raise_if_cancelled("UDF subprocess submit")
         try:
             payload_bytes = duckdb_pickle.dumps(payload)
             _send_message(sock, _MSG_SUBMIT_REF_BUNDLE, payload_bytes)
@@ -804,12 +945,25 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
     def register_wakeup(self, callback: Callable[[], None]) -> None:
         self._wakeup = callback
 
+    def is_reusable(self) -> bool:
+        if self._closed or self._broken_error is not None:
+            return False
+        proc = self._proc
+        return proc is not None and proc.poll() is None
+
     def cancel_output_grants(self) -> None:
-        self._output_grant_cancel_event.set()
-        self._release_active_output_grants(name="udf-output-cancel")
-        wake_local_shm_ref_budget_waiters()
+        scope = self._current_execution_scope()
+        self._cancel_scope_resources(scope)
 
     def close(self, kill: bool = False) -> None:
+        close_lock = getattr(self, "_close_lock", None)
+        if close_lock is None:
+            close_lock = threading.Lock()
+            self._close_lock = close_lock
+        with close_lock:
+            self._close_locked(kill=kill)
+
+    def _close_locked(self, *, kill: bool) -> None:
         if self._closed:
             return
         self._closed = True
@@ -818,20 +972,38 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
         proc = self._proc
         sock = self._sock
-        self._proc = None
-        self._sock = None
         shutdown_error: BaseException | None = None
+        graceful_error: BaseException | None = None
 
-        if sock is not None:
+        if proc is not None and proc.poll() is None and sock is not None and not kill:
+            deadline = time.monotonic() + _subprocess_shutdown_grace_s()
             try:
-                if proc is not None and proc.poll() is None and not kill:
-                    _send_message(sock, _MSG_CLOSE)
-            except Exception:
-                pass
-            try:
-                sock.close()
-            except Exception:
-                pass
+                _send_message(sock, _MSG_CLOSE)
+                remaining = max(0.0, deadline - time.monotonic())
+                if hasattr(sock, "settimeout"):
+                    sock.settimeout(remaining)
+                msg_type, payload = _recv_message(sock)
+                if msg_type == _MSG_ERROR:
+                    graceful_error = RuntimeError(
+                        "UDF subprocess graceful shutdown failed: " + payload.decode("utf-8", errors="replace")
+                    )
+                elif msg_type != _MSG_ACK:
+                    graceful_error = RuntimeError(
+                        f"UDF subprocess graceful shutdown returned unexpected message type {msg_type:#x}"
+                    )
+            except (socket.timeout, EOFError, OSError) as exc:
+                _subprocess_debug_log(f"worker graceful shutdown timed out or disconnected: {exc}")
+            except BaseException as exc:
+                graceful_error = exc
+            if proc.poll() is None:
+                remaining = max(0.0, deadline - time.monotonic())
+                try:
+                    proc.wait(timeout=remaining)
+                except (subprocess.TimeoutExpired, TimeoutError) as exc:
+                    _subprocess_debug_log(f"worker graceful shutdown did not exit before deadline: {exc}")
+                except BaseException as exc:
+                    if graceful_error is None:
+                        graceful_error = exc
 
         if proc is not None and proc.poll() is None:
             try:
@@ -844,6 +1016,14 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 if shutdown_error is None:
                     shutdown_error = exc
 
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        self._proc = None
+        self._sock = None
         self._close_payload_shm()
         data_shm = self._data_shm
         self._data_shm = None
@@ -861,6 +1041,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             finalizer.detach()
         if shutdown_error is not None:
             raise RuntimeError(f"UDF subprocess did not terminate cleanly: {shutdown_error}") from shutdown_error
+        if graceful_error is not None:
+            raise RuntimeError(str(graceful_error)) from graceful_error
 
     def __del__(self) -> None:
         try:
@@ -929,10 +1111,35 @@ def _payload_task_key(
     return hashlib.sha256(duckdb_pickle.dumps(identity)).hexdigest()
 
 
+def _worker_is_reusable(worker: Any) -> bool:
+    check = getattr(worker, "is_reusable", None)
+    if callable(check):
+        return bool(check())
+    if getattr(worker, "_closed", False) or getattr(worker, "_broken_error", None) is not None:
+        return False
+    proc = getattr(worker, "_proc", None)
+    poll = getattr(proc, "poll", None)
+    return proc is None or not callable(poll) or poll() is None
+
+
+def _release_local_ref_bundle_result(value: Any) -> None:
+    if isinstance(value, tuple) and len(value) >= 3 and value[0] == SUBMIT_RESULT_MARKER:
+        value = value[2]
+    if not (isinstance(value, tuple) and len(value) >= 2 and value[0] == REF_BUNDLE_RESULT_MARKER):
+        return
+    for ref in list(value[1] or []):
+        try:
+            ref.release()
+        except Exception:
+            pass
+
+
 class _PooledTaskWorker:
     def __init__(self, worker: _SingleSubprocessExecutor) -> None:
         self.worker = worker
         self.last_used = time.monotonic()
+        self.active_scope: ExecutionCancellationScope | None = None
+        self.abort_requested = False
 
 
 class _TaskWorkerPool:
@@ -1004,6 +1211,10 @@ class _TaskWorkerPool:
         for worker in workers:
             worker.cancel_output_grants()
 
+    def _wake_waiters(self) -> None:
+        with self.runtime.cond:
+            self.runtime.cond.notify_all()
+
     def _spawn_worker(self, worker_idx: int) -> _PooledTaskWorker:
         worker = _SingleSubprocessExecutor(
             self.payload,
@@ -1012,56 +1223,72 @@ class _TaskWorkerPool:
         )
         return _PooledTaskWorker(worker)
 
-    def acquire_worker(self) -> _PooledTaskWorker:
+    def acquire_worker(self, scope: ExecutionCancellationScope) -> _PooledTaskWorker:
         wrapper: _PooledTaskWorker | None = None
         spawn_idx: int | None = None
-        while wrapper is None and spawn_idx is None:
-            evicted: _SingleSubprocessExecutor | None = None
+        unregister = scope.register_cancel_wakeup(self._wake_waiters)
+        try:
+            while wrapper is None and spawn_idx is None:
+                evicted: _SingleSubprocessExecutor | None = None
+                with self.runtime.cond:
+                    scope.raise_if_cancelled("subprocess task worker acquisition")
+                    if self.closing or self.runtime.closed:
+                        raise RuntimeError("subprocess task worker pool is closed")
+                    while self.idle:
+                        candidate = self.idle.pop()
+                        if _worker_is_reusable(candidate.worker):
+                            candidate.active_scope = scope
+                            self.active += 1
+                            self._active_wrappers.add(candidate)
+                            return candidate
+                        self.total = max(0, self.total - 1)
+                        self.runtime.total_workers = max(0, self.runtime.total_workers - 1)
+                        evicted = candidate.worker
+                        self.runtime.cond.notify_all()
+                        break
+                    if evicted is not None:
+                        pass
+                    elif self.total < self.pool_size and self.runtime.total_workers < self.runtime.max_workers:
+                        spawn_idx = self.next_worker_idx
+                        self.next_worker_idx += 1
+                        self.total += 1
+                        self.active += 1
+                        self.runtime.total_workers += 1
+                        break
+                    else:
+                        evicted = self.runtime._take_idle_worker_locked()
+                        if evicted is None:
+                            self.runtime.cond.wait()
+                            continue
+                if evicted is not None:
+                    evicted.close(kill=False)
+
+            try:
+                assert spawn_idx is not None
+                wrapper = self._spawn_worker(spawn_idx)
+            except Exception:
+                with self.runtime.cond:
+                    self.total = max(0, self.total - 1)
+                    self.active = max(0, self.active - 1)
+                    self.runtime.total_workers = max(0, self.runtime.total_workers - 1)
+                    self.runtime.cond.notify_all()
+                raise
+            close_kill = False
             with self.runtime.cond:
-                if self.closing:
-                    raise RuntimeError("subprocess task worker pool is closed")
-                if self.idle:
-                    wrapper = self.idle.pop()
-                    self.active += 1
+                if self.closing or self.runtime.closed:
+                    self.total = max(0, self.total - 1)
+                    self.active = max(0, self.active - 1)
+                    self.runtime.total_workers = max(0, self.runtime.total_workers - 1)
+                    close_kill = self.kill_on_release
+                    self.runtime.cond.notify_all()
+                else:
+                    wrapper.active_scope = scope
                     self._active_wrappers.add(wrapper)
                     return wrapper
-                if self.total < self.pool_size and self.runtime.total_workers < self.runtime.max_workers:
-                    spawn_idx = self.next_worker_idx
-                    self.next_worker_idx += 1
-                    self.total += 1
-                    self.active += 1
-                    self.runtime.total_workers += 1
-                    break
-                evicted = self.runtime._take_idle_worker_locked()
-                if evicted is None:
-                    self.runtime.cond.wait()
-                    continue
-            if evicted is not None:
-                evicted.close(kill=False)
-
-        try:
-            assert spawn_idx is not None
-            wrapper = self._spawn_worker(spawn_idx)
-        except Exception:
-            with self.runtime.cond:
-                self.total = max(0, self.total - 1)
-                self.active = max(0, self.active - 1)
-                self.runtime.total_workers = max(0, self.runtime.total_workers - 1)
-                self.runtime.cond.notify_all()
-            raise
-        close_kill = False
-        with self.runtime.cond:
-            if self.closing or self.runtime.closed:
-                self.total = max(0, self.total - 1)
-                self.active = max(0, self.active - 1)
-                self.runtime.total_workers = max(0, self.runtime.total_workers - 1)
-                close_kill = self.kill_on_release
-                self.runtime.cond.notify_all()
-            else:
-                self._active_wrappers.add(wrapper)
-                return wrapper
-        wrapper.worker.close(kill=close_kill)
-        raise RuntimeError("subprocess task worker pool is closed")
+            wrapper.worker.close(kill=close_kill)
+            raise RuntimeError("subprocess task worker pool is closed")
+        finally:
+            unregister()
 
     def release_worker(self, wrapper: _PooledTaskWorker, *, reusable: bool = True) -> None:
         to_close: _SingleSubprocessExecutor | None = None
@@ -1069,22 +1296,29 @@ class _TaskWorkerPool:
         with self.runtime.cond:
             self._active_wrappers.discard(wrapper)
             self.active = max(0, self.active - 1)
-            if (
-                self.closing
-                or not reusable
-                or getattr(wrapper.worker, "_closed", False)
-                or getattr(wrapper.worker, "_broken_error", None) is not None
-            ):
+            wrapper.active_scope = None
+            if self.closing or wrapper.abort_requested or not reusable or not _worker_is_reusable(wrapper.worker):
                 self.total = max(0, self.total - 1)
                 self.runtime.total_workers = max(0, self.runtime.total_workers - 1)
                 to_close = wrapper.worker
-                kill_close = self.kill_on_release or not reusable
+                kill_close = self.kill_on_release or wrapper.abort_requested or not reusable
             else:
                 wrapper.last_used = time.monotonic()
                 self.idle.append(wrapper)
             self.runtime.cond.notify_all()
         if to_close is not None:
             to_close.close(kill=kill_close)
+
+    def abort_scopes(self, scopes: set[ExecutionCancellationScope]) -> None:
+        workers: list[_SingleSubprocessExecutor] = []
+        with self.runtime.cond:
+            for wrapper in self._active_wrappers:
+                if wrapper.active_scope in scopes:
+                    wrapper.abort_requested = True
+                    workers.append(wrapper.worker)
+            self.runtime.cond.notify_all()
+        for worker in workers:
+            worker.close(kill=True)
 
 
 class _GlobalSubprocessTaskRuntime:
@@ -1121,21 +1355,23 @@ class _GlobalSubprocessTaskRuntime:
         self,
         pool: _TaskWorkerPool,
         fn: Callable[[_SingleSubprocessExecutor], Any | None],
+        scope: ExecutionCancellationScope,
         debug_seq: int = 0,
     ) -> Future[Any]:
         if self.closed:
             raise RuntimeError("global subprocess task runtime is closed")
-        return self.executor.submit(self._run_task, pool, fn, debug_seq)
+        return self.executor.submit(self._run_task, pool, fn, scope, debug_seq)
 
     def _run_task(
         self,
         pool: _TaskWorkerPool,
         fn: Callable[[_SingleSubprocessExecutor], Any | None],
+        scope: ExecutionCancellationScope,
         debug_seq: int = 0,
     ) -> Any | None:
         acquire_start = time.perf_counter()
         wrapper: _PooledTaskWorker | None = None
-        wrapper = pool.acquire_worker()
+        wrapper = pool.acquire_worker(scope)
         acquire_s = time.perf_counter() - acquire_start
         assert wrapper is not None
         if _should_debug_submit(debug_seq):
@@ -1150,13 +1386,13 @@ class _GlobalSubprocessTaskRuntime:
         reusable = True
         run_start = time.perf_counter()
         try:
-            return fn(wrapper.worker)
+            scope.raise_if_cancelled("subprocess task")
+            return wrapper.worker._run_in_execution_scope(scope, fn)
         except BaseException:
-            reusable = getattr(wrapper.worker, "_broken_error", None) is None and not getattr(
-                wrapper.worker, "_closed", False
-            )
+            reusable = _worker_is_reusable(wrapper.worker)
             raise
         finally:
+            scope.finish()
             if _should_debug_submit(debug_seq):
                 _subprocess_debug_log(
                     "task_worker_finished "
@@ -1264,14 +1500,20 @@ class LocalSubprocessActorPool:
         self.pool_size = max(1, int(pool_size))
         self.name = str(name or "")
         self._closed = False
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._cond = threading.Condition(self._lock)
         self._active = 0
+        self._terminal_error: BaseException | None = None
+        self._active_scopes: dict[int, ExecutionCancellationScope] = {}
+        self._worker_generations = [0 for _ in range(self.pool_size)]
+        self._replacing_workers: set[int] = set()
+        self._aborting_workers: set[tuple[int, int]] = set()
         pool_identity = self.name or str(id(self))
         self.admission_slots = LocalExecutionSlotPool(
             max_slots=self.pool_size,
             execution_slot_prefix=f"subprocess_actor:{pool_identity}",
         )
-        self._idle_workers: queue.Queue[int] = queue.Queue()
+        self._idle_workers: deque[tuple[int, int]] = deque()
         self._workers: list[_SingleSubprocessExecutor] = []
         self._executor: ThreadPoolExecutor | None = None
         try:
@@ -1310,56 +1552,163 @@ class LocalSubprocessActorPool:
                 ) from init_error
             raise
         for worker_idx in range(self.pool_size):
-            self._idle_workers.put(worker_idx)
+            self._idle_workers.append((worker_idx, 0))
         _subprocess_debug_log(
             f"local_actor_pool_created name={self.name!r} pool_size={self.pool_size} worker_pids={self.worker_pids()}"
         )
 
     def worker_pids(self) -> list[int | None]:
-        return [getattr(worker._proc, "pid", None) for worker in self._workers]
+        with self._lock:
+            return [getattr(worker._proc, "pid", None) for worker in self._workers]
 
     def create_admission_authority(self) -> LocalSlotAdmissionAuthority:
         return self.admission_slots.create_authority()
 
     def first_proc(self) -> Any | None:
-        if not self._workers:
-            return None
-        return self._workers[0]._proc
+        with self._lock:
+            if not self._workers:
+                return None
+            return self._workers[0]._proc
+
+    def _wake_waiters(self) -> None:
+        with self._cond:
+            self._cond.notify_all()
+
+    def _raise_if_unavailable_locked(self) -> None:
+        if self._closed:
+            raise RuntimeError("local subprocess actor pool is closed")
+        if self._terminal_error is not None:
+            raise RuntimeError(f"local subprocess actor pool failed: {self._terminal_error}") from self._terminal_error
+
+    def _spawn_worker(self, worker_idx: int) -> _SingleSubprocessExecutor:
+        return _SingleSubprocessExecutor(
+            self.payload,
+            worker_env=_worker_env_for_pool_index(self.payload, worker_idx, self.pool_size),
+            session_config=self.session_config,
+        )
+
+    def _set_terminal_error(self, error: BaseException) -> None:
+        should_close_admission = False
+        with self._cond:
+            if self._terminal_error is None:
+                self._terminal_error = error
+                should_close_admission = True
+            self._cond.notify_all()
+        if should_close_admission:
+            self.admission_slots.close()
+
+    def _replace_worker(
+        self,
+        worker_idx: int,
+        worker_generation: int,
+        failed_worker: _SingleSubprocessExecutor,
+    ) -> None:
+        try:
+            failed_worker.close(kill=True)
+        except Exception:
+            pass
+        try:
+            replacement = self._spawn_worker(worker_idx)
+        except BaseException as exc:
+            with self._cond:
+                self._replacing_workers.discard(worker_idx)
+                self._cond.notify_all()
+            self._set_terminal_error(RuntimeError(f"failed to replace local subprocess actor {worker_idx}: {exc}"))
+            return
+
+        close_replacement = False
+        with self._cond:
+            self._replacing_workers.discard(worker_idx)
+            if (
+                self._closed
+                or worker_idx >= len(self._workers)
+                or self._worker_generations[worker_idx] != worker_generation
+                or self._workers[worker_idx] is not failed_worker
+            ):
+                close_replacement = True
+            else:
+                next_generation = worker_generation + 1
+                self._workers[worker_idx] = replacement
+                self._worker_generations[worker_idx] = next_generation
+                self._idle_workers.append((worker_idx, next_generation))
+            self._cond.notify_all()
+        if close_replacement:
+            replacement.close(kill=True)
+
+    def _acquire_worker(
+        self,
+        scope: ExecutionCancellationScope,
+    ) -> tuple[int, int, _SingleSubprocessExecutor]:
+        unregister = scope.register_cancel_wakeup(self._wake_waiters)
+        try:
+            while True:
+                replacement: tuple[int, int, _SingleSubprocessExecutor] | None = None
+                with self._cond:
+                    scope.raise_if_cancelled("local subprocess actor acquisition")
+                    self._raise_if_unavailable_locked()
+                    while self._idle_workers:
+                        worker_idx, worker_generation = self._idle_workers.popleft()
+                        if worker_idx >= len(self._workers):
+                            continue
+                        if self._worker_generations[worker_idx] != worker_generation:
+                            continue
+                        worker = self._workers[worker_idx]
+                        if _worker_is_reusable(worker):
+                            self._active += 1
+                            self._active_scopes[worker_idx] = scope
+                            return worker_idx, worker_generation, worker
+                        if worker_idx not in self._replacing_workers:
+                            self._replacing_workers.add(worker_idx)
+                            replacement = (worker_idx, worker_generation, worker)
+                        break
+                    if replacement is None:
+                        self._cond.wait()
+                        continue
+                self._replace_worker(*replacement)
+        finally:
+            unregister()
 
     def submit(
         self,
         fn: Callable[[_SingleSubprocessExecutor], Any | None],
+        scope: ExecutionCancellationScope,
         debug_seq: int = 0,
     ) -> Future[Any]:
         with self._lock:
-            if self._closed:
-                raise RuntimeError("local subprocess actor pool is closed")
+            self._raise_if_unavailable_locked()
             executor = self._executor
         if executor is None:
             raise RuntimeError("local subprocess actor pool is closed")
-        return executor.submit(self._run, fn, debug_seq)
+        return executor.submit(self._run, fn, scope, debug_seq)
 
     def _run(
         self,
         fn: Callable[[_SingleSubprocessExecutor], Any | None],
+        scope: ExecutionCancellationScope,
         debug_seq: int = 0,
     ) -> Any | None:
-        worker_idx = self._idle_workers.get()
-        with self._lock:
-            self._active += 1
-            active = self._active
-        worker = self._workers[worker_idx]
-        worker_pid = getattr(worker._proc, "pid", None)
+        worker_idx: int | None = None
+        worker_generation = 0
+        worker: _SingleSubprocessExecutor | None = None
+        worker_pid = None
+        reusable = False
+        replace_worker = False
+        terminal_error: BaseException | None = None
         try:
+            worker_idx, worker_generation, worker = self._acquire_worker(scope)
+            with self._lock:
+                active = self._active
+            worker_pid = getattr(worker._proc, "pid", None)
             if _should_debug_submit(debug_seq):
                 _subprocess_debug_log(
                     "local_actor_pool_worker_acquired "
                     f"name={self.name!r} seq={debug_seq} worker_idx={worker_idx} active={active} "
-                    f"pool_size={self.pool_size} worker_pid={getattr(self._workers[worker_idx]._proc, 'pid', None)}"
+                    f"pool_size={self.pool_size} worker_pid={worker_pid}"
                 )
-            return fn(worker)
+            scope.raise_if_cancelled("local subprocess actor task")
+            return worker._run_in_execution_scope(scope, fn)
         except BaseException as exc:
-            if self.payload.get("stateful") and worker._actor_lost:
+            if self.payload.get("stateful") and worker is not None and getattr(worker, "_actor_lost", False):
                 udf_name = str(self.payload.get("udf_name") or "udf")
                 actor_id = "unknown" if worker_pid is None else str(worker_pid)
                 raise RuntimeError(
@@ -1368,44 +1717,114 @@ class LocalSubprocessActorPool:
                 ) from exc
             raise
         finally:
-            with self._lock:
-                self._active = max(0, self._active - 1)
-                active_after = self._active
-            self._idle_workers.put(worker_idx)
+            scope.finish()
+            active_after = 0
+            if worker_idx is not None and worker is not None:
+                reusable = _worker_is_reusable(worker)
+                with self._cond:
+                    worker_identity = (worker_idx, worker_generation)
+                    abort_requested = worker_identity in self._aborting_workers
+                    self._aborting_workers.discard(worker_identity)
+                    self._active = max(0, self._active - 1)
+                    self._active_scopes.pop(worker_idx, None)
+                    active_after = self._active
+                    if not self._closed and reusable and not abort_requested:
+                        self._idle_workers.append((worker_idx, worker_generation))
+                    elif not self._closed and self.payload.get("stateful"):
+                        udf_name = str(self.payload.get("udf_name") or "udf")
+                        actor_id = "unknown" if worker_pid is None else str(worker_pid)
+                        terminal_error = RuntimeError(
+                            f"stateful UDF {udf_name!r} lost local actor pid {actor_id}; "
+                            "state was not recoverable; side effects may already have occurred"
+                        )
+                    elif not self._closed and worker_idx not in self._replacing_workers:
+                        self._replacing_workers.add(worker_idx)
+                        replace_worker = True
+                    self._cond.notify_all()
+                if terminal_error is not None:
+                    self._set_terminal_error(terminal_error)
+                elif replace_worker:
+                    self._replace_worker(worker_idx, worker_generation, worker)
             if _should_debug_submit(debug_seq):
                 _subprocess_debug_log(
                     "local_actor_pool_worker_finished "
-                    f"name={self.name!r} seq={debug_seq} worker_idx={worker_idx} active={active_after}"
+                    f"name={self.name!r} seq={debug_seq} worker_idx={worker_idx} "
+                    f"active={active_after} reusable={reusable}"
                 )
 
     def stats(self) -> dict[str, int]:
         with self._lock:
             active = self._active
+            idle = len(self._idle_workers)
         return {
             "pool_size": self.pool_size,
             "active_workers": active,
-            "idle_workers": max(0, self.pool_size - active),
+            "idle_workers": idle,
         }
 
     def cancel_output_grants(self) -> None:
-        for worker in list(self._workers):
+        with self._lock:
+            workers = list(self._workers)
+        for worker in workers:
             worker.cancel_output_grants()
 
+    def abort_scopes(self, scopes: set[ExecutionCancellationScope]) -> None:
+        workers: list[_SingleSubprocessExecutor] = []
+        with self._cond:
+            for worker_idx, scope in self._active_scopes.items():
+                if scope not in scopes or worker_idx >= len(self._workers):
+                    continue
+                worker_generation = self._worker_generations[worker_idx]
+                self._aborting_workers.add((worker_idx, worker_generation))
+                workers.append(self._workers[worker_idx])
+            self._cond.notify_all()
+        for worker in workers:
+            worker.close(kill=True)
+
     def shutdown(self, *, kill: bool = False) -> None:
-        with self._lock:
+        with self._cond:
             if self._closed:
                 return
             self._closed = True
+            active_scopes = list(self._active_scopes.values())
+            self._cond.notify_all()
         self.admission_slots.close()
-        self.cancel_output_grants()
+        for scope in active_scopes:
+            scope.cancel("local subprocess actor pool closed")
+
+        close_kill = bool(kill)
+        if not close_kill:
+            deadline = time.monotonic() + _subprocess_shutdown_grace_s()
+            with self._cond:
+                while self._active > 0:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        close_kill = True
+                        break
+                    self._cond.wait(timeout=remaining)
+        if close_kill:
+            self.abort_scopes(set(active_scopes))
+
         executor = self._executor
         self._executor = None
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
-        for worker in list(self._workers):
-            worker.close(kill=kill)
-        self._workers = []
-        _subprocess_debug_log(f"local_actor_pool_shutdown name={self.name!r} kill={kill}")
+        with self._lock:
+            workers = list(self._workers)
+        cleanup_errors: list[BaseException] = []
+        for worker in workers:
+            try:
+                worker.close(kill=close_kill)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        with self._cond:
+            self._workers = []
+            self._idle_workers.clear()
+            self._cond.notify_all()
+        _subprocess_debug_log(f"local_actor_pool_shutdown name={self.name!r} kill={close_kill}")
+        if cleanup_errors:
+            details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
+            raise RuntimeError(f"local subprocess actor pool shutdown failed: {details}") from cleanup_errors[0]
 
     def __del__(self) -> None:
         try:
@@ -1451,13 +1870,14 @@ def _validate_stateful_local_actor_contract(payload: dict[str, Any], pool_size: 
 
 _LOCAL_ACTOR_POOL_CONTRACT_ERROR = (
     "local_actor_pool must expose submit(), create_admission_authority(), pool_size, stats(), "
-    "cancel_output_grants(), first_proc(), and worker_pids()"
+    "cancel_output_grants(), abort_scopes(), first_proc(), and worker_pids()"
 )
 _LOCAL_ACTOR_POOL_REQUIRED_METHODS = (
     "submit",
     "create_admission_authority",
     "stats",
     "cancel_output_grants",
+    "abort_scopes",
     "first_proc",
     "worker_pids",
 )
@@ -1587,8 +2007,13 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         self._task_futures_lock = self._task_futures_cv
         self._task_future_meta: dict[
             Future[Any],
-            tuple[int | None, int, float, AdmissionLease | None],
+            tuple[int | None, int, float, AdmissionLease | None, ExecutionCancellationScope],
         ] = {}
+        self._execution_owner_id = uuid.uuid4().hex
+        self._execution_scope_generation = 0
+        self._execution_scopes: set[ExecutionCancellationScope] = set()
+        self._execution_scopes_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
         self._debug_submit_count = 0
         self._queue: deque[Any] = deque()
         self._result_admissions: deque[AdmissionLease | None] = deque()
@@ -1743,6 +2168,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         debug_seq: int,
         submit_start: float,
         admission: AdmissionLease | None,
+        scope: ExecutionCancellationScope,
     ) -> None:
         with self._task_futures_lock:
             self._task_futures.add(future)
@@ -1751,12 +2177,40 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 debug_seq,
                 submit_start,
                 admission,
+                scope,
             )
 
         def complete_task(done: Future[Any], submit_id: int | None = submit_id) -> None:
             self._complete_task_submit(submit_id, done)
 
         future.add_done_callback(complete_task)
+
+    def _new_execution_scope(self) -> ExecutionCancellationScope:
+        with self._execution_scopes_lock:
+            if self._closed:
+                raise RuntimeError("UDF subprocess executor is closed")
+            self._execution_scope_generation += 1
+            scope = ExecutionCancellationScope(
+                self._execution_owner_id,
+                self._execution_scope_generation,
+            )
+            self._execution_scopes.add(scope)
+            return scope
+
+    def _retire_execution_scope(self, scope: ExecutionCancellationScope) -> None:
+        scope.finish()
+        with self._execution_scopes_lock:
+            self._execution_scopes.discard(scope)
+
+    def _cancel_execution_scopes(self, reason: str) -> set[ExecutionCancellationScope]:
+        lock = getattr(self, "_execution_scopes_lock", None)
+        if lock is None:
+            return set()
+        with lock:
+            scopes = set(self._execution_scopes)
+        for scope in scopes:
+            scope.cancel(reason)
+        return scopes
 
     def _notify_wakeup(self) -> None:
         callback = self._wakeup
@@ -1788,19 +2242,32 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
 
     def _complete_task_submit(self, submit_id: int | None, future: Future[Any]) -> None:
         item: Any | None = None
-        debug_meta: tuple[int | None, int, float, AdmissionLease | None] | None = None
+        result: Any | None = None
+        debug_meta: (
+            tuple[
+                int | None,
+                int,
+                float,
+                AdmissionLease | None,
+                ExecutionCancellationScope,
+            ]
+            | None
+        ) = None
         admission: AdmissionLease | None = None
+        scope: ExecutionCancellationScope | None = None
         try:
             result = future.result()
             self._record_output_budget_result(result)
             item = self._submit_result_item(submit_id, result)
         except BaseException as exc:
+            _release_local_ref_bundle_result(result)
+            result = None
             item = (SUBMIT_RESULT_MARKER, int(submit_id), exc) if submit_id is not None else exc
         finally:
             with self._task_futures_lock:
                 debug_meta = self._task_future_meta.get(future)
             if debug_meta is not None:
-                debug_submit_id, debug_seq, submit_start, admission = debug_meta
+                debug_submit_id, debug_seq, submit_start, admission, scope = debug_meta
                 if _should_debug_submit(debug_seq):
                     _subprocess_debug_log(
                         "task_submit_completed "
@@ -1810,6 +2277,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             if item is not None:
                 with self._queue_lock:
                     if self._closed:
+                        _release_local_ref_bundle_result(result)
                         if admission is not None:
                             admission.release()
                     else:
@@ -1819,11 +2287,13 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 admission.release()
             with self._pending_lock:
                 self._pending_batches = max(0, self._pending_batches - 1)
-            self._notify_wakeup()
             with self._task_futures_cv:
                 self._task_futures.discard(future)
                 self._task_future_meta.pop(future, None)
                 self._task_futures_cv.notify_all()
+            if scope is not None:
+                self._retire_execution_scope(scope)
+            self._notify_wakeup()
 
     def _submit_async(
         self,
@@ -1831,83 +2301,103 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         fn: Callable[[_SingleSubprocessExecutor], Any | None],
         admission: AdmissionLease | None = None,
     ) -> None:
-        if self._closed:
+        lifecycle_lock = getattr(self, "_lifecycle_lock", None)
+        if lifecycle_lock is None:
+            lifecycle_lock = threading.RLock()
+            self._lifecycle_lock = lifecycle_lock
+        with lifecycle_lock:
+            if self._closed:
+                if admission is not None:
+                    admission.release()
+                raise RuntimeError("UDF subprocess executor is closed")
+            self._debug_submit_count += 1
+            debug_seq = self._debug_submit_count
+            submit_start = time.perf_counter()
+            try:
+                scope = self._new_execution_scope()
+            except BaseException:
+                if admission is not None:
+                    admission.release()
+                raise
+
+            if self._actor_pool is not None:
+                actor_pool = self._actor_pool
+                with self._pending_lock:
+                    self._pending_batches += 1
+                    pending = self._pending_batches
+                try:
+                    if _should_debug_submit(debug_seq):
+                        pool_stats = actor_pool.stats()
+                        _subprocess_debug_log(
+                            "local_actor_pool_submit_scheduled "
+                            f"name={getattr(actor_pool, 'name', '')!r} seq={debug_seq} "
+                            f"submit_id={submit_id} pending={pending} pool_size={actor_pool.pool_size} "
+                            f"pool_active={pool_stats.get('active_workers', 0)} "
+                            f"pool_idle={pool_stats.get('idle_workers', 0)}"
+                        )
+                    future = actor_pool.submit(fn, scope, debug_seq)
+                    self._track_task_future(
+                        future,
+                        submit_id,
+                        debug_seq,
+                        submit_start,
+                        admission,
+                        scope,
+                    )
+                except BaseException:
+                    with self._pending_lock:
+                        self._pending_batches = max(0, self._pending_batches - 1)
+                    if admission is not None:
+                        admission.release()
+                    self._retire_execution_scope(scope)
+                    raise
+                return
+
+            if self._task_pool is not None:
+                runtime = self._task_runtime
+                task_pool = self._task_pool
+                if runtime is None:
+                    if admission is not None:
+                        admission.release()
+                    self._retire_execution_scope(scope)
+                    raise RuntimeError("global subprocess task runtime is not available")
+                with self._pending_lock:
+                    self._pending_batches += 1
+                    pending = self._pending_batches
+                try:
+                    if _should_debug_submit(debug_seq):
+                        with runtime.cond:
+                            _subprocess_debug_log(
+                                "task_submit_scheduled "
+                                f"seq={debug_seq} submit_id={submit_id} pending={pending} "
+                                f"pool_size={task_pool.pool_size} "
+                                f"pool_total={task_pool.total} pool_active={task_pool.active} "
+                                f"pool_idle={len(task_pool.idle)} "
+                                f"runtime_total_workers={runtime.total_workers} "
+                                f"runtime_max_workers={runtime.max_workers}"
+                            )
+                    future = runtime.submit(task_pool, fn, scope, debug_seq)
+                    self._track_task_future(
+                        future,
+                        submit_id,
+                        debug_seq,
+                        submit_start,
+                        admission,
+                        scope,
+                    )
+                except BaseException:
+                    with self._pending_lock:
+                        self._pending_batches = max(0, self._pending_batches - 1)
+                    if admission is not None:
+                        admission.release()
+                    self._retire_execution_scope(scope)
+                    raise
+                return
+
             if admission is not None:
                 admission.release()
-            raise RuntimeError("UDF subprocess executor is closed")
-        self._debug_submit_count += 1
-        debug_seq = self._debug_submit_count
-        submit_start = time.perf_counter()
-
-        if self._actor_pool is not None:
-            actor_pool = self._actor_pool
-            with self._pending_lock:
-                self._pending_batches += 1
-                pending = self._pending_batches
-            if _should_debug_submit(debug_seq):
-                pool_stats = actor_pool.stats()
-                _subprocess_debug_log(
-                    "local_actor_pool_submit_scheduled "
-                    f"name={getattr(actor_pool, 'name', '')!r} seq={debug_seq} submit_id={submit_id} "
-                    f"pending={pending} pool_size={actor_pool.pool_size} "
-                    f"pool_active={pool_stats.get('active_workers', 0)} "
-                    f"pool_idle={pool_stats.get('idle_workers', 0)}"
-                )
-            try:
-                future = actor_pool.submit(fn, debug_seq)
-                self._track_task_future(
-                    future,
-                    submit_id,
-                    debug_seq,
-                    submit_start,
-                    admission,
-                )
-            except Exception:
-                with self._pending_lock:
-                    self._pending_batches = max(0, self._pending_batches - 1)
-                if admission is not None:
-                    admission.release()
-                raise
-            return
-
-        if self._task_pool is not None:
-            runtime = self._task_runtime
-            task_pool = self._task_pool
-            if runtime is None:
-                raise RuntimeError("global subprocess task runtime is not available")
-            with self._pending_lock:
-                self._pending_batches += 1
-                pending = self._pending_batches
-            if _should_debug_submit(debug_seq):
-                with runtime.cond:
-                    _subprocess_debug_log(
-                        "task_submit_scheduled "
-                        f"seq={debug_seq} submit_id={submit_id} pending={pending} "
-                        f"pool_size={task_pool.pool_size} "
-                        f"pool_total={task_pool.total} pool_active={task_pool.active} "
-                        f"pool_idle={len(task_pool.idle)} runtime_total_workers={runtime.total_workers} "
-                        f"runtime_max_workers={runtime.max_workers}"
-                    )
-            try:
-                future = runtime.submit(task_pool, fn, debug_seq)
-                self._track_task_future(
-                    future,
-                    submit_id,
-                    debug_seq,
-                    submit_start,
-                    admission,
-                )
-            except Exception:
-                with self._pending_lock:
-                    self._pending_batches = max(0, self._pending_batches - 1)
-                if admission is not None:
-                    admission.release()
-                raise
-            return
-
-        if admission is not None:
-            admission.release()
-        raise RuntimeError("subprocess executor is not initialized with an actor or task worker owner")
+            self._retire_execution_scope(scope)
+            raise RuntimeError("subprocess executor is not initialized with an actor or task worker owner")
 
     def submit(self, args: pa.Table) -> None:
         table = _ensure_table(args)
@@ -2036,20 +2526,11 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 future.cancel()
             self._task_futures_cv.notify_all()
 
-    def _cancel_worker_output_grants(self) -> None:
-        actor_pool = self._actor_pool
-        if actor_pool is not None:
-            actor_pool.cancel_output_grants()
-        task_pool = self._task_pool
-        if task_pool is not None:
-            task_pool.cancel_output_grants()
-        for worker in list(self._workers):
-            worker.cancel_output_grants()
-
-    def _cancel_local_shm_waits(self) -> None:
+    def _cancel_local_shm_waits(self) -> set[ExecutionCancellationScope]:
+        scopes = self._cancel_execution_scopes("UDF executor closed")
         self._cancel_active_input_leases()
-        self._cancel_worker_output_grants()
         wake_local_shm_ref_budget_waiters()
+        return scopes
 
     def _wait_for_pending_futures(self, timeout_s: float | None = None) -> bool:
         deadline = None if timeout_s is None else time.monotonic() + max(0.0, float(timeout_s))
@@ -2065,20 +2546,33 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             return True
 
     def close(self, kill: bool = False) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        lifecycle_lock = getattr(self, "_lifecycle_lock", None)
+        if lifecycle_lock is None:
+            lifecycle_lock = threading.RLock()
+            self._lifecycle_lock = lifecycle_lock
+        with lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
         authority = getattr(self, "_admission_authority", None)
         if authority is not None:
             authority.close()
         queue_lock = getattr(self, "_queue_lock", None)
+        result_queue = getattr(self, "_queue", None)
         result_admissions = getattr(self, "_result_admissions", None)
-        if queue_lock is not None and result_admissions is not None:
+        if queue_lock is not None:
             with queue_lock:
-                admissions = list(result_admissions)
-                result_admissions.clear()
+                queued_results = list(result_queue or ())
+                if result_queue is not None:
+                    result_queue.clear()
+                admissions = list(result_admissions or ())
+                if result_admissions is not None:
+                    result_admissions.clear()
         else:
+            queued_results = []
             admissions = []
+        for result in queued_results:
+            _release_local_ref_bundle_result(result)
         for admission in admissions:
             if admission is not None:
                 admission.release()
@@ -2086,15 +2580,28 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         self._budget_wakeup_unregister = None
         if budget_wakeup_unregister is not None:
             budget_wakeup_unregister()
-        self._cancel_local_shm_waits()
+        cancelled_scopes = self._cancel_local_shm_waits()
         close_kill = bool(kill)
         if close_kill:
+            actor_pool = self._actor_pool
+            if actor_pool is not None:
+                actor_pool.abort_scopes(cancelled_scopes)
+            task_pool = self._task_pool
+            if task_pool is not None:
+                task_pool.abort_scopes(cancelled_scopes)
             self._cancel_pending_futures()
         else:
             if not self._wait_for_pending_futures(_subprocess_shutdown_grace_s()):
                 close_kill = True
+                actor_pool = self._actor_pool
+                if actor_pool is not None:
+                    actor_pool.abort_scopes(cancelled_scopes)
+                task_pool = self._task_pool
+                if task_pool is not None:
+                    task_pool.abort_scopes(cancelled_scopes)
                 self._cancel_pending_futures()
-                self._cancel_local_shm_waits()
+                self._cancel_active_input_leases()
+                wake_local_shm_ref_budget_waiters()
         actor_pool = self._actor_pool
         if actor_pool is not None:
             self._actor_pool = None

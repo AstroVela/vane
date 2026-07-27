@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from itertools import count
 from multiprocessing import resource_tracker as _resource_tracker
 from multiprocessing import shared_memory
-from typing import Any
+from typing import Any, Protocol
 
 import pyarrow as pa
 
@@ -46,6 +46,10 @@ _local_shm_budget_reserved_bytes = 0
 _local_shm_budget_pending_output_bytes = 0
 _local_shm_refs_created = 0
 _local_shm_refs_released = 0
+
+
+class _CancellationFlag(Protocol):
+    def is_set(self) -> bool: ...
 
 
 @dataclass
@@ -320,11 +324,24 @@ class LocalShmBudgetManager:
             soft_limit = max(soft_limit, min(limit, requested))
             return usage + requested <= soft_limit
 
-    def acquire_allocation(self, size: int, *, name: str = "", block: bool = True) -> int:
+    def acquire_allocation(
+        self,
+        size: int,
+        *,
+        name: str = "",
+        block: bool = True,
+        cancel_event: _CancellationFlag | None = None,
+    ) -> int:
         requested = max(0, int(size))
         if requested <= 0:
             return 0
         with self._cond:
+
+            def _raise_if_cancelled_locked() -> None:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError(f"local_shm allocation cancelled: {name or '-'}")
+
+            _raise_if_cancelled_locked()
             limit = self._limit_locked()
             if limit <= 0:
                 return 0
@@ -339,9 +356,11 @@ class LocalShmBudgetManager:
                     limit_bytes=limit,
                 )
                 self._cond.wait()
+                _raise_if_cancelled_locked()
                 limit = self._limit_locked()
                 if limit <= 0:
                     return 0
+            _raise_if_cancelled_locked()
             if not block and self._usage_locked() > 0 and self._usage_locked() + requested > limit:
                 _shm_debug_log(
                     "budget_overcommit",
@@ -572,7 +591,7 @@ class LocalShmBudgetManager:
         size: int,
         *,
         name: str = "",
-        cancel_event: threading.Event | None = None,
+        cancel_event: _CancellationFlag | None = None,
     ) -> int:
         requested = max(0, int(size))
         if requested <= 0:
@@ -639,7 +658,7 @@ class LocalShmBudgetManager:
         name: str = "",
         priority: str = "producer",
         input_lease_id: int | None = None,
-        cancel_event: threading.Event | None = None,
+        cancel_event: _CancellationFlag | None = None,
     ) -> int:
         requested = max(0, int(size))
         if requested <= 0:
@@ -805,7 +824,7 @@ def request_local_shm_output_grant(
     name: str = "",
     priority: str = "producer",
     input_lease_id: int | None = None,
-    cancel_event: threading.Event | None = None,
+    cancel_event: _CancellationFlag | None = None,
 ) -> int:
     return _LOCAL_SHM_BUDGET_MANAGER.request_output_grant(
         size,
@@ -852,11 +871,22 @@ def can_admit_local_shm_ref_output_submit(size: int, *, projected_output_bytes: 
     )
 
 
-def _acquire_local_shm_ref_budget(size: int, *, name: str = "", block: bool = True) -> int:
+def _acquire_local_shm_ref_budget(
+    size: int,
+    *,
+    name: str = "",
+    block: bool = True,
+    cancel_event: _CancellationFlag | None = None,
+) -> int:
     requested = max(0, int(size))
     if requested <= 0:
         return 0
-    return _LOCAL_SHM_BUDGET_MANAGER.acquire_allocation(requested, name=name, block=block)
+    return _LOCAL_SHM_BUDGET_MANAGER.acquire_allocation(
+        requested,
+        name=name,
+        block=block,
+        cancel_event=cancel_event,
+    )
 
 
 def wake_local_shm_ref_budget_waiters() -> None:
@@ -867,7 +897,7 @@ def claim_local_shm_ref_output_budget(
     size: int,
     *,
     name: str = "",
-    cancel_event: threading.Event | None = None,
+    cancel_event: _CancellationFlag | None = None,
 ) -> int:
     requested = max(0, int(size))
     if requested <= 0:
@@ -1059,6 +1089,7 @@ class LocalShmBlockRef:
         shm: shared_memory.SharedMemory | None = None,
         budget_bytes: int | None = None,
         track: bool = False,
+        cancel_event: _CancellationFlag | None = None,
     ) -> None:
         self.name = str(name)
         self.size = int(size)
@@ -1069,7 +1100,14 @@ class LocalShmBlockRef:
         if not self.owner:
             self._budget_bytes = 0
         elif budget_bytes is None:
-            self._budget_bytes = _acquire_local_shm_ref_budget(self.size, name=self.name)
+            if cancel_event is None:
+                self._budget_bytes = _acquire_local_shm_ref_budget(self.size, name=self.name)
+            else:
+                self._budget_bytes = _acquire_local_shm_ref_budget(
+                    self.size,
+                    name=self.name,
+                    cancel_event=cancel_event,
+                )
         else:
             self._budget_bytes = max(0, int(budget_bytes))
         self._finalizer = weakref.finalize(
@@ -1170,11 +1208,22 @@ def _cleanup_local_shm_ref(
         raise cleanup_error
 
 
-def make_local_shm_ref_bundle_result(table: pa.Table):
+def make_local_shm_ref_bundle_result(
+    table: pa.Table,
+    *,
+    cancel_event: _CancellationFlag | None = None,
+):
     table = _ensure_table(table)
     ipc_bytes = _arrow_table_to_ipc_bytes(table)
     required = _IPC_HEADER_SIZE + len(ipc_bytes)
-    budget_bytes = _acquire_local_shm_ref_budget(required, name="local-shm-result")
+    if cancel_event is None:
+        budget_bytes = _acquire_local_shm_ref_budget(required, name="local-shm-result")
+    else:
+        budget_bytes = _acquire_local_shm_ref_budget(
+            required,
+            name="local-shm-result",
+            cancel_event=cancel_event,
+        )
     shm = None
     try:
         shm = _create_shm(required, track=False)
@@ -1302,6 +1351,7 @@ def make_local_shm_ref_bundle_result_from_descriptor(
     descriptor: dict[str, Any],
     *,
     block_on_budget: bool = True,
+    cancel_event: _CancellationFlag | None = None,
 ):
     refs_in = list(descriptor.get("block_refs") or [])
     metadata_in = list(descriptor.get("metadata") or [{} for _ in refs_in])
@@ -1338,12 +1388,18 @@ def make_local_shm_ref_bundle_result_from_descriptor(
                             size - budget_bytes,
                             name=name,
                             block=block_on_budget,
+                            cancel_event=cancel_event,
                         )
                     except Exception:
                         _release_local_shm_ref_budget(budget_bytes, name=name)
                         raise
             else:
-                budget_bytes = _acquire_local_shm_ref_budget(size, name=name, block=block_on_budget)
+                budget_bytes = _acquire_local_shm_ref_budget(
+                    size,
+                    name=name,
+                    block=block_on_budget,
+                    cancel_event=cancel_event,
+                )
             shm = None
             try:
                 shm = _open_existing_shm(name, track=False)

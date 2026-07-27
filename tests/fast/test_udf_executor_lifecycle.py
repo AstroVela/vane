@@ -1470,6 +1470,9 @@ def test_unified_executor_passes_local_subprocess_actor_pool_option():
         def cancel_output_grants(self):
             return None
 
+        def abort_scopes(self, _scopes):
+            return None
+
     pool = FakeLocalActorPool()
     executor = build_unified_executor(
         _subprocess_map_payload(
@@ -1716,6 +1719,9 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_reuses_injected_pool(monk
         def cancel_output_grants(self):
             pass
 
+        def abort_scopes(self, _scopes):
+            pass
+
         def first_proc(self):
             return None
 
@@ -1774,6 +1780,9 @@ def test_ensure_local_subprocess_actor_pools_rejects_implicit_cross_session_reus
         def cancel_output_grants(self):
             pass
 
+        def abort_scopes(self, _scopes):
+            pass
+
         def first_proc(self):
             return None
 
@@ -1816,6 +1825,9 @@ def test_subprocess_actor_executor_rejects_cross_session_pool_attachment():
             return {}
 
         def cancel_output_grants(self):
+            pass
+
+        def abort_scopes(self, _scopes):
             pass
 
         def first_proc(self):
@@ -2204,6 +2216,38 @@ def test_udf_runtime_map_batches_finished_submitting_flushes_compute_tail():
     assert output.column("x").to_pylist() == list(range(2048))
     assert set(output.column("batch_rows").to_pylist()) == {2048}
     assert executor.take_ready_result() is None
+
+
+def test_udf_runtime_close_flushes_compute_tail_before_releasing_callable():
+    from duckdb.execution._udf_runtime import UDFExecutor
+
+    def report_compute_batch(table):
+        values = table.column("x").to_pylist()
+        return pa.table(
+            {
+                "x": values,
+                "batch_rows": [table.num_rows for _ in values],
+            }
+        )
+
+    executor = UDFExecutor(
+        _subprocess_map_payload(
+            report_compute_batch,
+            batch_size=3000,
+            stream_output=True,
+        )
+    )
+    executor.submit(pa.table({"x": list(range(2048))}))
+    assert executor.take_ready_result() is None
+
+    executor.close()
+    executor.close()
+    output = executor.take_ready_result()
+
+    assert output is not None
+    assert output.column("x").to_pylist() == list(range(2048))
+    assert set(output.column("batch_rows").to_pylist()) == {2048}
+    assert executor._map_fn is None
 
 
 def test_udf_runtime_actor_backend_does_not_buffer_input_across_submits():
@@ -2677,18 +2721,31 @@ def test_subprocess_error_propagates_and_closes_worker():
     import duckdb.execution.udf_subprocess as subprocess_exec
 
     class Fail:
-        def __call__(self, _table):
-            raise ValueError("bad edge udf")
+        def __call__(self, table):
+            values = table.column("x").to_pylist()
+            if values == [1]:
+                raise ValueError("bad edge udf")
+            return pa.table({"y": values})
 
     payload = _subprocess_map_payload(Fail, execution_backend="subprocess_actor", actor_number=1)
     executor, pool = _make_subprocess_actor_executor(subprocess_exec, payload)
     try:
+        original_proc = executor._proc
+        assert original_proc is not None
+        original_pid = original_proc.pid
         _submit_with_admission(executor, pa.table({"x": [1]}))
         result = _wait_for_results(executor, 1, timeout_s=10.0)[0]
         assert isinstance(result, RuntimeError)
         assert "bad edge udf" in str(result)
-        proc = executor._proc
-        assert proc is None or proc.poll() is not None
+        assert original_proc.poll() is not None
+        replacement_proc = executor._proc
+        assert replacement_proc is not None
+        assert replacement_proc.poll() is None
+        assert replacement_proc.pid != original_pid
+
+        _submit_with_admission(executor, pa.table({"x": [2]}))
+        replacement_result = _wait_for_results(executor, 1, timeout_s=10.0)[0]
+        assert replacement_result.to_pydict() == {"y": [2]}
     finally:
         executor.close(kill=True)
         pool.shutdown(kill=True)
@@ -3334,6 +3391,67 @@ def test_subprocess_ref_bundle_mode_rejects_direct_ipc(monkeypatch):
         executor.close(kill=True)
 
 
+def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkeypatch):
+    import duckdb.execution.udf_subprocess as subprocess_exec
+    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+
+    descriptor = {
+        "block_refs": [
+            {
+                "provider": "local_shm",
+                "shm_name": "failed-result-shm",
+                "ipc_size_bytes": 128,
+            }
+        ],
+        "metadata": [{}],
+        "names": ["x"],
+        "grant_id": 77,
+    }
+    scope = ExecutionCancellationScope("test-executor", 1)
+    executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._closed = False
+    executor._broken_error = None
+    executor._execution_scope_lock = threading.Lock()
+    executor._active_execution_scope = scope
+    executor._worker_lifetime_scope = ExecutionCancellationScope("test-worker", 1)
+    executor._active_output_grants = {77: scope}
+    executor._active_output_grants_lock = threading.Lock()
+    executor._recv_expected = lambda _expected: (
+        subprocess_exec._MSG_REF_BUNDLE_RESULT,
+        subprocess_exec.duckdb_pickle.dumps(descriptor),
+    )
+
+    released = []
+
+    def fail_descriptor_wrap(*_args, **_kwargs):
+        raise RuntimeError("descriptor wrap failed")
+
+    monkeypatch.setattr(
+        subprocess_exec,
+        "make_local_shm_ref_bundle_result_from_descriptor",
+        fail_descriptor_wrap,
+    )
+    monkeypatch.setattr(
+        subprocess_exec,
+        "release_local_shm_ref_bundle_descriptor",
+        lambda value: released.append(("descriptor", value)),
+    )
+    monkeypatch.setattr(
+        subprocess_exec,
+        "release_local_shm_output_grant",
+        lambda grant_id, *, name="": released.append(("grant", grant_id, name)),
+    )
+
+    with pytest.raises(RuntimeError, match="descriptor wrap failed"):
+        executor._recv_submit_result()
+
+    assert released == [
+        ("descriptor", descriptor),
+        ("grant", 77, "udf-output-descriptor-wrap-failed"),
+    ]
+    assert not executor._active_output_grants
+
+
 def test_subprocess_ref_bundle_contract_requires_output_mode():
     import duckdb.execution.udf_subprocess as subprocess_exec
 
@@ -3730,8 +3848,9 @@ def test_subprocess_ref_bundle_blob_output_schema_has_initial_budget_estimate():
         executor.close(kill=True)
 
 
-def test_subprocess_output_grant_request_uses_executor_cancel_event(monkeypatch):
+def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch):
     import duckdb.execution.udf_subprocess as subprocess_exec
+    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
 
     parent_sock, child_sock = subprocess_exec.socket.socketpair()
     executor = subprocess_exec._SingleSubprocessExecutor.__new__(subprocess_exec._SingleSubprocessExecutor)
@@ -3739,9 +3858,12 @@ def test_subprocess_output_grant_request_uses_executor_cancel_event(monkeypatch)
     executor._broken_error = None
     executor._sock = parent_sock
     executor._wakeup = None
-    executor._active_output_grants = set()
+    executor._active_output_grants = {}
     executor._active_output_grants_lock = threading.Lock()
-    executor._output_grant_cancel_event = threading.Event()
+    executor._execution_scope_lock = threading.Lock()
+    scope = ExecutionCancellationScope("executor-a", 9)
+    executor._active_execution_scope = scope
+    executor._worker_lifetime_scope = ExecutionCancellationScope("worker", 1)
 
     captured: dict[str, object] = {}
 
@@ -3775,7 +3897,7 @@ def test_subprocess_output_grant_request_uses_executor_cancel_event(monkeypatch)
             "name": "udf-output-9",
             "priority": "consumer",
             "input_lease_id": 123,
-            "cancel_event": executor._output_grant_cancel_event,
+            "cancel_event": scope,
         }
     finally:
         parent_sock.close()
@@ -3784,6 +3906,7 @@ def test_subprocess_output_grant_request_uses_executor_cancel_event(monkeypatch)
 
 def test_single_subprocess_close_without_kill_cancels_output_grant_wait(monkeypatch):
     import duckdb.execution.udf_subprocess as subprocess_exec
+    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
 
     events: list[object] = []
     executor = subprocess_exec._SingleSubprocessExecutor.__new__(subprocess_exec._SingleSubprocessExecutor)
@@ -3793,11 +3916,14 @@ def test_single_subprocess_close_without_kill_cancels_output_grant_wait(monkeypa
     executor._payload_shm = None
     executor._data_shm = None
     executor._finalizer = None
-    executor._active_input_leases = {42}
+    scope = ExecutionCancellationScope("worker", 1)
+    executor._execution_scope_lock = threading.Lock()
+    executor._active_execution_scope = None
+    executor._worker_lifetime_scope = scope
+    executor._active_input_leases = {42: scope}
     executor._active_input_leases_lock = threading.Lock()
-    executor._active_output_grants = set()
+    executor._active_output_grants = {}
     executor._active_output_grants_lock = threading.Lock()
-    executor._output_grant_cancel_event = threading.Event()
 
     monkeypatch.setattr(
         subprocess_exec,
@@ -3812,14 +3938,14 @@ def test_single_subprocess_close_without_kill_cancels_output_grant_wait(monkeypa
 
     executor.close(kill=False)
 
-    assert executor._output_grant_cancel_event.is_set()
+    assert scope.is_set()
     assert events == [
-        "wake-budget",
         ("cancel-lease", 42, "udf-input-close"),
+        "wake-budget",
     ]
 
 
-def test_local_subprocess_actor_pool_shutdown_cancels_worker_grants_before_executor_wait():
+def test_local_subprocess_actor_pool_shutdown_fences_admission_before_executor_wait():
     import duckdb.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
@@ -3828,15 +3954,12 @@ def test_local_subprocess_actor_pool_shutdown_cancels_worker_grants_before_execu
         def __init__(self, name: str):
             self.name = name
 
-        def cancel_output_grants(self) -> None:
-            events.append(f"cancel:{self.name}")
-
         def close(self, *, kill: bool = False) -> None:
             events.append(f"close:{self.name}:{kill}")
 
     class FakeExecutor:
         def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
-            assert events[:3] == ["admission-close", "cancel:w0", "cancel:w1"]
+            assert events == ["admission-close"]
             events.append(f"shutdown:{wait}:{cancel_futures}")
 
     class FakeAdmissionSlots:
@@ -3846,7 +3969,11 @@ def test_local_subprocess_actor_pool_shutdown_cancels_worker_grants_before_execu
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
     pool.name = "pool"
     pool._closed = False
-    pool._lock = threading.Lock()
+    pool._lock = threading.RLock()
+    pool._cond = threading.Condition(pool._lock)
+    pool._active = 0
+    pool._active_scopes = {}
+    pool._idle_workers = deque([(0, 0), (1, 0)])
     pool._workers = [FakeWorker("w0"), FakeWorker("w1")]
     pool._executor = FakeExecutor()
     pool.admission_slots = FakeAdmissionSlots()
@@ -3855,13 +3982,146 @@ def test_local_subprocess_actor_pool_shutdown_cancels_worker_grants_before_execu
 
     assert events == [
         "admission-close",
-        "cancel:w0",
-        "cancel:w1",
         "shutdown:False:True",
         "close:w0:False",
         "close:w1:False",
     ]
     assert pool._workers == []
+
+
+def test_local_subprocess_actor_abort_fences_generation_from_idle_reuse():
+    import duckdb.execution.udf_subprocess as subprocess_exec
+    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+
+    task_started = threading.Event()
+    finish_task = threading.Event()
+    close_started = threading.Event()
+    allow_close = threading.Event()
+
+    class FakeWorker:
+        def __init__(self):
+            self._closed = False
+            self._proc = types.SimpleNamespace(pid=4242)
+
+        def is_reusable(self):
+            return not self._closed
+
+        def _run_in_execution_scope(self, _scope, fn):
+            return fn(self)
+
+        def close(self, *, kill=False):
+            assert kill
+            close_started.set()
+            assert allow_close.wait(timeout=5.0)
+            self._closed = True
+
+    class FakeAdmissionSlots:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    worker = FakeWorker()
+    scope = ExecutionCancellationScope("executor-a", 1)
+    pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool.payload = {"stateful": True, "udf_name": "stateful_abort_race"}
+    pool.pool_size = 1
+    pool.name = "abort-reuse-race"
+    pool._closed = False
+    pool._lock = threading.RLock()
+    pool._cond = threading.Condition(pool._lock)
+    pool._active = 0
+    pool._terminal_error = None
+    pool._active_scopes = {}
+    pool._worker_generations = [0]
+    pool._replacing_workers = set()
+    pool._aborting_workers = set()
+    pool._idle_workers = deque([(0, 0)])
+    pool._workers = [worker]
+    pool.admission_slots = FakeAdmissionSlots()
+
+    def run_task(_worker):
+        task_started.set()
+        assert finish_task.wait(timeout=5.0)
+
+    run_thread = threading.Thread(target=lambda: pool._run(run_task, scope), daemon=True)
+    run_thread.start()
+    assert task_started.wait(timeout=5.0)
+
+    abort_thread = threading.Thread(target=lambda: pool.abort_scopes({scope}), daemon=True)
+    abort_thread.start()
+    assert close_started.wait(timeout=5.0)
+    finish_task.set()
+    with pool._cond:
+        assert pool._cond.wait_for(lambda: pool._active == 0, timeout=5.0)
+        assert not pool._idle_workers
+        assert pool._terminal_error is not None
+
+    allow_close.set()
+    run_thread.join(timeout=5.0)
+    abort_thread.join(timeout=5.0)
+    assert not run_thread.is_alive()
+    assert not abort_thread.is_alive()
+    assert pool.admission_slots.closed
+    pool._closed = True
+
+
+def test_stateful_actor_preserves_structured_udf_error_before_terminal_failure():
+    import duckdb.execution.udf_subprocess as subprocess_exec
+    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+
+    class FailedWorker:
+        def __init__(self):
+            self._actor_lost = False
+            self._proc = types.SimpleNamespace(pid=4242)
+            self.failed = False
+
+        def is_reusable(self):
+            return not self.failed
+
+        def _run_in_execution_scope(self, _scope, fn):
+            return fn(self)
+
+    class FakeAdmissionSlots:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    worker = FailedWorker()
+    pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool.payload = {"stateful": True, "udf_name": "stateful_structured_error"}
+    pool.pool_size = 1
+    pool.name = "stateful-structured-error"
+    pool._closed = False
+    pool._lock = threading.RLock()
+    pool._cond = threading.Condition(pool._lock)
+    pool._active = 0
+    pool._terminal_error = None
+    pool._active_scopes = {}
+    pool._worker_generations = [0]
+    pool._replacing_workers = set()
+    pool._aborting_workers = set()
+    pool._idle_workers = deque([(0, 0)])
+    pool._workers = [worker]
+    pool.admission_slots = FakeAdmissionSlots()
+
+    def fail_with_structured_udf_error(_worker):
+        worker.failed = True
+        raise ValueError("TIMESTAMP is timezone-naive")
+
+    with pytest.raises(ValueError, match="TIMESTAMP is timezone-naive"):
+        pool._run(
+            fail_with_structured_udf_error,
+            ExecutionCancellationScope("test-executor", 1),
+        )
+
+    assert pool._terminal_error is not None
+    assert "state was not recoverable" in str(pool._terminal_error)
+    assert pool.admission_slots.closed
+    pool._closed = True
 
 
 def test_local_subprocess_actor_pool_rolls_back_created_workers_on_worker_init_failure(monkeypatch):
@@ -4070,6 +4330,10 @@ def test_subprocess_submit_without_worker_owner_fails_fast():
     executor._task_futures_cv = threading.Condition()
     executor._task_futures_lock = executor._task_futures_cv
     executor._task_future_meta = {}
+    executor._execution_owner_id = "unowned-executor"
+    executor._execution_scope_generation = 0
+    executor._execution_scopes = set()
+    executor._execution_scopes_lock = threading.Lock()
 
     with pytest.raises(RuntimeError, match="not initialized with an actor or task worker owner"):
         executor._submit_async(411, lambda _worker: None)
@@ -4185,6 +4449,7 @@ def test_subprocess_task_runtime_keeps_cpu_count_worker_cap(monkeypatch):
 
 def test_subprocess_task_pool_kill_closes_active_worker(monkeypatch):
     import duckdb.execution.udf_subprocess as subprocess_exec
+    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
 
     runtime = subprocess_exec._GlobalSubprocessTaskRuntime()
 
@@ -4207,7 +4472,7 @@ def test_subprocess_task_pool_kill_closes_active_worker(monkeypatch):
     )
     try:
         pool.acquire_ref()
-        wrapper = pool.acquire_worker()
+        wrapper = pool.acquire_worker(ExecutionCancellationScope("test-executor", 1))
 
         pool.release_ref(kill=True)
 
@@ -4217,8 +4482,72 @@ def test_subprocess_task_pool_kill_closes_active_worker(monkeypatch):
         runtime.close(kill=True)
 
 
+def test_subprocess_task_pool_abort_fences_worker_from_idle_reuse(monkeypatch):
+    import duckdb.execution.udf_subprocess as subprocess_exec
+    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime()
+    close_started = threading.Event()
+    allow_close = threading.Event()
+
+    class FakeWorker:
+        def __init__(self):
+            self._closed = False
+            self._broken_error = None
+
+        def is_reusable(self):
+            return not self._closed
+
+        def close(self, kill=False):
+            assert kill
+            close_started.set()
+            assert allow_close.wait(timeout=5.0)
+            self._closed = True
+
+    fake_worker = FakeWorker()
+    pool = subprocess_exec._TaskWorkerPool(
+        runtime,
+        "abort-reuse-race",
+        {"execution_backend": "subprocess_task"},
+        1,
+    )
+    monkeypatch.setattr(
+        pool,
+        "_spawn_worker",
+        lambda _worker_idx: subprocess_exec._PooledTaskWorker(fake_worker),
+    )
+    scope = ExecutionCancellationScope("executor-a", 1)
+    try:
+        pool.acquire_ref()
+        wrapper = pool.acquire_worker(scope)
+        abort_thread = threading.Thread(target=lambda: pool.abort_scopes({scope}), daemon=True)
+        abort_thread.start()
+        assert close_started.wait(timeout=5.0)
+
+        release_thread = threading.Thread(
+            target=lambda: pool.release_worker(wrapper, reusable=True),
+            daemon=True,
+        )
+        release_thread.start()
+        with runtime.cond:
+            assert runtime.cond.wait_for(lambda: pool.active == 0, timeout=5.0)
+            assert wrapper not in pool.idle
+
+        allow_close.set()
+        release_thread.join(timeout=5.0)
+        abort_thread.join(timeout=5.0)
+        assert not release_thread.is_alive()
+        assert not abort_thread.is_alive()
+        assert pool.total == 0
+    finally:
+        allow_close.set()
+        pool.release_ref(kill=True)
+        runtime.close(kill=True)
+
+
 def test_subprocess_task_pool_kill_closes_worker_spawned_during_close(monkeypatch):
     import duckdb.execution.udf_subprocess as subprocess_exec
+    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
 
     runtime = subprocess_exec._GlobalSubprocessTaskRuntime()
     spawn_started = threading.Event()
@@ -4249,7 +4578,7 @@ def test_subprocess_task_pool_kill_closes_worker_spawned_during_close(monkeypatc
 
     def acquire_worker():
         try:
-            acquired.append(pool.acquire_worker())
+            acquired.append(pool.acquire_worker(ExecutionCancellationScope("test-executor", 1)))
         except BaseException as exc:
             errors.append(exc)
 
@@ -5807,6 +6136,48 @@ class _FakeControlSocket:
         self.closed = True
 
 
+class _FakeShutdownProcess:
+    def __init__(self, *, exits_on_wait: bool, honor_wait_timeout: bool = False) -> None:
+        self.exits_on_wait = exits_on_wait
+        self.honor_wait_timeout = honor_wait_timeout
+        self.running = True
+        self.wait_timeouts: list[float | None] = []
+        self.kill_calls = 0
+
+    def poll(self):
+        return None if self.running else 0
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        if self.exits_on_wait or not self.running:
+            self.running = False
+            return 0
+        if self.honor_wait_timeout and timeout is not None:
+            time.sleep(timeout)
+        raise TimeoutError("process did not exit")
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self.running = False
+
+
+class _GracefulShutdownSocket(_FakeControlSocket):
+    def __init__(self, recv_payload: bytes = b"", *, time_out_on_recv: bool = False) -> None:
+        super().__init__(recv_payload)
+        self.time_out_on_recv = time_out_on_recv
+        self.timeout: float | None = None
+
+    def settimeout(self, timeout: float | None) -> None:
+        self.timeout = timeout
+
+    def recv(self, size: int) -> bytes:
+        if self.time_out_on_recv:
+            if self.timeout is not None:
+                time.sleep(self.timeout)
+            raise socket.timeout("graceful shutdown timed out")
+        return super().recv(size)
+
+
 def _decode_control_messages(data: bytes, header) -> list[tuple[int, bytes]]:
     messages = []
     offset = 0
@@ -5817,6 +6188,102 @@ def _decode_control_messages(data: bytes, header) -> list[tuple[int, bytes]]:
         offset += payload_len
         messages.append((msg_type, payload))
     return messages
+
+
+def _bare_shutdown_executor(subprocess_exec, sock, proc):
+    executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._closed = False
+    executor._broken_error = None
+    executor._execution_scope_lock = threading.Lock()
+    executor._active_execution_scope = None
+    executor._worker_lifetime_scope = subprocess_exec.ExecutionCancellationScope("shutdown-worker", 1)
+    executor._close_lock = threading.Lock()
+    executor._active_input_leases = {}
+    executor._active_input_leases_lock = threading.Lock()
+    executor._active_output_grants = {}
+    executor._active_output_grants_lock = threading.Lock()
+    executor._payload_shm = None
+    executor._data_shm = None
+    executor._sock = sock
+    executor._proc = proc
+    return executor
+
+
+def test_single_subprocess_graceful_close_waits_for_ack_and_exit_without_kill():
+    import duckdb.execution.udf_subprocess as subprocess_exec
+
+    ack = subprocess_exec._HEADER.pack(subprocess_exec._MSG_ACK, 0)
+    sock = _GracefulShutdownSocket(ack)
+    proc = _FakeShutdownProcess(exits_on_wait=True)
+    executor = _bare_shutdown_executor(subprocess_exec, sock, proc)
+
+    executor.close(kill=False)
+
+    messages = _decode_control_messages(bytes(sock.sent), subprocess_exec._HEADER)
+    assert messages == [(subprocess_exec._MSG_CLOSE, b"")]
+    assert proc.kill_calls == 0
+    assert len(proc.wait_timeouts) == 1
+    assert proc.wait_timeouts[0] is not None
+    assert proc.wait_timeouts[0] > 0.0
+    assert sock.closed
+
+
+def test_single_subprocess_graceful_close_reports_cleanup_error_after_exit():
+    import duckdb.execution.udf_subprocess as subprocess_exec
+
+    payload = b"cleanup failed"
+    response = subprocess_exec._HEADER.pack(subprocess_exec._MSG_ERROR, len(payload)) + payload
+    sock = _GracefulShutdownSocket(response)
+    proc = _FakeShutdownProcess(exits_on_wait=True)
+    executor = _bare_shutdown_executor(subprocess_exec, sock, proc)
+
+    with pytest.raises(RuntimeError, match="graceful shutdown failed.*cleanup failed"):
+        executor.close(kill=False)
+
+    assert proc.kill_calls == 0
+    assert len(proc.wait_timeouts) == 1
+    assert sock.closed
+
+
+def test_single_subprocess_graceful_close_honors_timeout_before_kill(monkeypatch):
+    import duckdb.execution.udf_subprocess as subprocess_exec
+
+    monkeypatch.setenv("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", "0.02")
+    sock = _GracefulShutdownSocket(time_out_on_recv=True)
+    proc = _FakeShutdownProcess(exits_on_wait=False)
+    executor = _bare_shutdown_executor(subprocess_exec, sock, proc)
+
+    started = time.monotonic()
+    executor.close(kill=False)
+    elapsed = time.monotonic() - started
+
+    messages = _decode_control_messages(bytes(sock.sent), subprocess_exec._HEADER)
+    assert messages == [(subprocess_exec._MSG_CLOSE, b"")]
+    assert sock.timeout is not None
+    assert 0.0 < sock.timeout <= 0.02
+    assert elapsed >= sock.timeout
+    assert proc.kill_calls == 1
+    assert sock.closed
+
+
+def test_single_subprocess_graceful_close_waits_after_control_disconnect(monkeypatch):
+    import duckdb.execution.udf_subprocess as subprocess_exec
+
+    monkeypatch.setenv("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", "0.02")
+    sock = _GracefulShutdownSocket()
+    proc = _FakeShutdownProcess(exits_on_wait=False, honor_wait_timeout=True)
+    executor = _bare_shutdown_executor(subprocess_exec, sock, proc)
+
+    started = time.monotonic()
+    executor.close(kill=False)
+    elapsed = time.monotonic() - started
+
+    assert elapsed >= 0.015
+    assert proc.kill_calls == 1
+    assert proc.wait_timeouts
+    assert proc.wait_timeouts[0] is not None
+    assert 0.0 < proc.wait_timeouts[0] <= 0.02
+    assert sock.closed
 
 
 def test_single_subprocess_close_releases_active_output_grants(monkeypatch):
@@ -5837,11 +6304,14 @@ def test_single_subprocess_close_releases_active_output_grants(monkeypatch):
     executor._wakeup_error = None
     executor._ref_bundle_output = True
     executor._worker_env = {}
-    executor._active_input_leases = set()
+    executor._execution_scope_lock = threading.Lock()
+    executor._active_execution_scope = None
+    executor._worker_lifetime_scope = subprocess_exec.ExecutionCancellationScope("test-worker", 1)
+    executor._close_lock = threading.Lock()
+    executor._active_input_leases = {}
     executor._active_input_leases_lock = threading.Lock()
-    executor._active_output_grants = set()
+    executor._active_output_grants = {}
     executor._active_output_grants_lock = threading.Lock()
-    executor._output_grant_cancel_event = threading.Event()
     executor._payload_shm = None
     executor._data_shm = None
     executor._sock = _FakeControlSocket()
@@ -6008,7 +6478,7 @@ def test_subprocess_worker_row_preserving_ref_bundle_requires_scalar_arg_count(p
         worker.split_row_preserving_input(payload, pa.table({"arg": [1], "passthrough": [2]}))
 
 
-def test_subprocess_executor_close_escalates_when_pending_futures_do_not_finish(monkeypatch):
+def test_subprocess_executor_close_escalates_scoped_pending_work(monkeypatch):
     import duckdb.execution.udf_subprocess as subprocess_exec
 
     class FakeWorker:
@@ -6036,6 +6506,9 @@ def test_subprocess_executor_close_escalates_when_pending_futures_do_not_finish(
     executor._task_futures_cv = threading.Condition()
     executor._task_futures = {Future()}
     executor._task_future_meta = {}
+    executor._execution_scopes_lock = threading.Lock()
+    scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
+    executor._execution_scopes = {scope}
     executor._active_input_leases = set()
     executor._active_input_leases_lock = threading.Lock()
     executor._actor_pool = None
@@ -6049,9 +6522,177 @@ def test_subprocess_executor_close_escalates_when_pending_futures_do_not_finish(
     thread.start()
 
     assert done.wait(timeout=1.0)
-    assert executor._workers[0].cancelled
+    assert scope.is_set()
+    assert not executor._workers[0].cancelled
     assert executor._workers[0].closed == [True]
     assert thread_pool.shutdown_calls == [{"wait": False, "cancel_futures": True}]
+
+
+def test_subprocess_executor_close_fences_submit_before_cancelling_scopes(monkeypatch):
+    import duckdb.execution.udf_subprocess as subprocess_exec
+
+    submit_started = threading.Event()
+    release_submit = threading.Event()
+    submitted_future = Future()
+
+    class FakeActorPool:
+        name = "submit-close-race"
+        pool_size = 1
+
+        def __init__(self):
+            self.aborted = []
+
+        def stats(self):
+            return {"active_workers": 0, "idle_workers": 1}
+
+        def submit(self, _fn, _scope, _debug_seq):
+            submit_started.set()
+            assert release_submit.wait(timeout=5.0)
+            return submitted_future
+
+        def abort_scopes(self, scopes):
+            self.aborted.append(set(scopes))
+
+    monkeypatch.setenv("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", "0.01")
+    actor_pool = FakeActorPool()
+    executor = object.__new__(subprocess_exec.UDFExecutor)
+    executor._closed = False
+    executor._lifecycle_lock = threading.RLock()
+    executor._execution_owner_id = "test-executor"
+    executor._execution_scope_generation = 0
+    executor._execution_scopes = set()
+    executor._execution_scopes_lock = threading.Lock()
+    executor._debug_submit_count = 0
+    executor._actor_pool = actor_pool
+    executor._task_pool = None
+    executor._task_runtime = None
+    executor._executor = None
+    executor._workers = []
+    executor._task_futures_cv = threading.Condition()
+    executor._task_futures_lock = executor._task_futures_cv
+    executor._task_futures = set()
+    executor._task_future_meta = {}
+    executor._pending_lock = threading.Lock()
+    executor._pending_batches = 0
+    executor._queue_lock = threading.Lock()
+    executor._queue = deque()
+    executor._result_admissions = deque()
+    executor._active_input_leases = set()
+    executor._active_input_leases_lock = threading.Lock()
+    executor._budget_wakeup_unregister = None
+    executor._admission_authority = None
+    executor._wakeup = None
+    executor._wakeup_error = None
+    executor._ref_bundle_output = False
+
+    submit_errors = []
+
+    def submit():
+        try:
+            executor._submit_async(None, lambda _worker: None)
+        except BaseException as exc:
+            submit_errors.append(exc)
+
+    submit_thread = threading.Thread(target=submit, daemon=True)
+    close_thread = threading.Thread(target=executor.close, daemon=True)
+    submit_thread.start()
+    assert submit_started.wait(timeout=5.0)
+    close_thread.start()
+
+    assert not executor._closed
+    release_submit.set()
+    submit_thread.join(timeout=5.0)
+    close_thread.join(timeout=5.0)
+
+    assert not submit_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert not submit_errors
+    assert submitted_future.cancelled()
+    assert not executor._task_futures
+    assert actor_pool.aborted and len(actor_pool.aborted[0]) == 1
+
+
+def test_subprocess_executor_releases_ref_bundle_result_completed_after_close():
+    import duckdb.execution.udf_subprocess as subprocess_exec
+    from duckdb.execution import ref_bundle
+
+    result = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2]}))
+    refs = list(result[1])
+    future = Future()
+    future.set_result(result)
+    scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
+
+    executor = object.__new__(subprocess_exec.UDFExecutor)
+    executor._closed = True
+    executor._ref_bundle_output = False
+    executor._queue = deque()
+    executor._result_admissions = deque()
+    executor._queue_lock = threading.Lock()
+    executor._pending_batches = 1
+    executor._pending_lock = threading.Lock()
+    executor._task_futures_cv = threading.Condition()
+    executor._task_futures_lock = executor._task_futures_cv
+    executor._task_futures = {future}
+    executor._task_future_meta = {future: (None, 1, time.perf_counter(), None, scope)}
+    executor._execution_scopes_lock = threading.Lock()
+    executor._execution_scopes = {scope}
+    executor._wakeup = None
+    executor._wakeup_error = None
+
+    executor._complete_task_submit(None, future)
+
+    assert not executor._queue
+    assert executor._pending_batches == 0
+    assert not executor._task_futures
+    assert not executor._execution_scopes
+    assert scope.finished
+    assert all(ref._closed for ref in refs)
+
+
+def test_subprocess_executor_close_releases_queued_ref_bundle_results():
+    import duckdb.execution.udf_subprocess as subprocess_exec
+    from duckdb.execution import ref_bundle
+
+    class FakeAdmission:
+        def __init__(self):
+            self.released = False
+
+        def release(self):
+            self.released = True
+
+    class FakeAuthority:
+        def close(self):
+            return None
+
+    result = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2]}))
+    refs = list(result[1])
+    admission = FakeAdmission()
+
+    executor = object.__new__(subprocess_exec.UDFExecutor)
+    executor._closed = False
+    executor._lifecycle_lock = threading.RLock()
+    executor._admission_authority = FakeAuthority()
+    executor._queue = deque([(ref_bundle.SUBMIT_RESULT_MARKER, 41, result)])
+    executor._result_admissions = deque([admission])
+    executor._queue_lock = threading.Lock()
+    executor._budget_wakeup_unregister = None
+    executor._execution_scopes_lock = threading.Lock()
+    executor._execution_scopes = set()
+    executor._active_input_leases = set()
+    executor._active_input_leases_lock = threading.Lock()
+    executor._task_futures_cv = threading.Condition()
+    executor._task_futures = set()
+    executor._actor_pool = None
+    executor._task_pool = None
+    executor._executor = None
+    executor._workers = []
+
+    executor.close(kill=True)
+
+    assert not executor._queue
+    assert not executor._result_admissions
+    assert admission.released
+    assert all(ref._closed for ref in refs)
 
 
 def test_ray_actor_init_has_default_timeout(monkeypatch):
@@ -6132,3 +6773,250 @@ def test_subprocess_stats_expose_local_shm_budget_keys():
             assert isinstance(stats[key], int)
     finally:
         executor.close(kill=True)
+
+
+def test_local_shm_allocation_wait_is_cancelled_by_execution_scope(monkeypatch):
+    import duckdb.execution.ref_bundle as ref_bundle
+    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+
+    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100)
+    manager.acquire_allocation(90, name="existing")
+    wait_started = threading.Event()
+    done = threading.Event()
+    errors: list[BaseException] = []
+    original_log = ref_bundle._shm_debug_log
+
+    def record_wait(event, **fields):
+        if event == "budget_wait":
+            wait_started.set()
+        original_log(event, **fields)
+
+    monkeypatch.setattr(ref_bundle, "_shm_debug_log", record_wait)
+    scope = ExecutionCancellationScope("executor-a", 1)
+    unregister = scope.register_cancel_wakeup(manager.wake_waiters)
+
+    def allocate():
+        try:
+            manager.acquire_allocation(
+                20,
+                name="cancelled-allocation",
+                cancel_event=scope,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=allocate, daemon=True)
+    try:
+        thread.start()
+        assert wait_started.wait(timeout=5.0)
+
+        assert scope.cancel("executor closed")
+        assert done.wait(timeout=5.0)
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+        assert "allocation cancelled" in str(errors[0])
+        assert manager.snapshot()["allocated_bytes"] == 90
+    finally:
+        unregister()
+        manager.release_allocation(90, name="existing")
+        thread.join(timeout=5.0)
+
+
+def test_subprocess_task_shared_pool_close_is_scoped_to_own_executor(monkeypatch):
+    import duckdb.execution.udf_subprocess as subprocess_exec
+    from duckdb.execution import ref_bundle
+
+    subprocess_exec._shutdown_global_task_runtime()
+    grant_started = threading.Event()
+    release_grant = threading.Event()
+    captured_cancel_events = []
+    original_request = subprocess_exec.request_local_shm_output_grant
+
+    def gated_request(
+        size,
+        *,
+        name="",
+        priority="producer",
+        input_lease_id=None,
+        cancel_event=None,
+    ):
+        captured_cancel_events.append(cancel_event)
+        if len(captured_cancel_events) == 1:
+            grant_started.set()
+            while not release_grant.wait(timeout=0.01):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("output grant cancelled")
+        return original_request(
+            size,
+            name=name,
+            priority=priority,
+            input_lease_id=input_lease_id,
+            cancel_event=cancel_event,
+        )
+
+    monkeypatch.setattr(subprocess_exec, "request_local_shm_output_grant", gated_request)
+
+    def add_one(table):
+        return pa.table({"y": [value + 1 for value in table.column("x").to_pylist()]})
+
+    payload = _subprocess_map_payload(
+        add_one,
+        execution_backend="subprocess_task",
+        udf_worker_slots=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    executor_a = subprocess_exec.UDFExecutor(payload)
+    executor_b = subprocess_exec.UDFExecutor(payload)
+    results = []
+    try:
+        assert executor_a._task_pool is executor_b._task_pool
+        _submit_with_admission(executor_b, pa.table({"x": [1]}), submit_id=901)
+        assert grant_started.wait(timeout=10.0)
+        assert captured_cancel_events and not captured_cancel_events[0].is_set()
+
+        executor_a.close(kill=False)
+
+        assert not captured_cancel_events[0].is_set()
+        release_grant.set()
+        results.extend(_wait_for_results(executor_b, 1, timeout_s=10.0))
+        assert len(results) == 1
+        assert results[0][0:2] == (ref_bundle.SUBMIT_RESULT_MARKER, 901)
+        assert results[0][2][0] == ref_bundle.REF_BUNDLE_RESULT_MARKER
+
+        _submit_with_admission(executor_b, pa.table({"x": [2]}), submit_id=902)
+        results.extend(_wait_for_results(executor_b, 1, timeout_s=10.0))
+        assert len(results) == 2
+        assert results[1][0:2] == (ref_bundle.SUBMIT_RESULT_MARKER, 902)
+        assert results[1][2][0] == ref_bundle.REF_BUNDLE_RESULT_MARKER
+    finally:
+        release_grant.set()
+        if not executor_a._closed:
+            executor_a.close(kill=True)
+        executor_b.close(kill=True)
+        subprocess_exec._shutdown_global_task_runtime()
+        for result in results:
+            value = result[2]
+            if isinstance(value, tuple) and value and value[0] == ref_bundle.REF_BUNDLE_RESULT_MARKER:
+                for ref in value[1]:
+                    ref.release()
+
+
+def test_subprocess_actor_shared_pool_close_is_scoped_to_own_executor(monkeypatch):
+    import duckdb.execution.udf_subprocess as subprocess_exec
+    from duckdb.execution import ref_bundle
+
+    grant_started = threading.Event()
+    release_grant = threading.Event()
+    captured_cancel_events = []
+    original_request = subprocess_exec.request_local_shm_output_grant
+
+    def gated_request(
+        size,
+        *,
+        name="",
+        priority="producer",
+        input_lease_id=None,
+        cancel_event=None,
+    ):
+        captured_cancel_events.append(cancel_event)
+        if len(captured_cancel_events) == 1:
+            grant_started.set()
+            while not release_grant.wait(timeout=0.01):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("output grant cancelled")
+        return original_request(
+            size,
+            name=name,
+            priority=priority,
+            input_lease_id=input_lease_id,
+            cancel_event=cancel_event,
+        )
+
+    monkeypatch.setattr(subprocess_exec, "request_local_shm_output_grant", gated_request)
+
+    class AddOne:
+        def __call__(self, table):
+            return pa.table({"y": [value + 1 for value in table.column("x").to_pylist()]})
+
+    payload = _subprocess_map_payload(
+        AddOne,
+        execution_backend="subprocess_actor",
+        actor_number=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    pool = subprocess_exec.LocalSubprocessActorPool(payload, 1, name="shared-scope-test")
+    executor_a = subprocess_exec.UDFExecutor(payload, options={"local_actor_pool": pool})
+    executor_b = subprocess_exec.UDFExecutor(payload, options={"local_actor_pool": pool})
+    results = []
+    try:
+        assert executor_a._actor_pool is pool
+        assert executor_b._actor_pool is pool
+        _submit_with_admission(executor_b, pa.table({"x": [1]}), submit_id=911)
+        assert grant_started.wait(timeout=10.0)
+        assert captured_cancel_events and not captured_cancel_events[0].is_set()
+
+        executor_a.close(kill=False)
+
+        assert not captured_cancel_events[0].is_set()
+        release_grant.set()
+        results.extend(_wait_for_results(executor_b, 1, timeout_s=10.0))
+        assert results[0][0:2] == (ref_bundle.SUBMIT_RESULT_MARKER, 911)
+        assert results[0][2][0] == ref_bundle.REF_BUNDLE_RESULT_MARKER
+
+        _submit_with_admission(executor_b, pa.table({"x": [2]}), submit_id=912)
+        results.extend(_wait_for_results(executor_b, 1, timeout_s=10.0))
+        assert results[1][0:2] == (ref_bundle.SUBMIT_RESULT_MARKER, 912)
+        assert results[1][2][0] == ref_bundle.REF_BUNDLE_RESULT_MARKER
+    finally:
+        release_grant.set()
+        if not executor_a._closed:
+            executor_a.close(kill=True)
+        executor_b.close(kill=True)
+        pool.shutdown(kill=True)
+        for result in results:
+            value = result[2]
+            if isinstance(value, tuple) and value and value[0] == ref_bundle.REF_BUNDLE_RESULT_MARKER:
+                for ref in value[1]:
+                    ref.release()
+
+
+def test_subprocess_stateful_actor_destructor_finishes_before_graceful_close_ack(monkeypatch, tmp_path):
+    import duckdb.execution.udf_subprocess as subprocess_exec
+
+    marker_path = tmp_path / "stateful-cleanup.txt"
+    monkeypatch.setenv("VANE_TEST_STATEFUL_CLEANUP_MARKER", str(marker_path))
+
+    class StatefulCleanup:
+        def __call__(self, table):
+            return table
+
+        def __del__(self):
+            import os
+            import time
+            from pathlib import Path
+
+            time.sleep(0.05)
+            Path(os.environ["VANE_TEST_STATEFUL_CLEANUP_MARKER"]).write_text("cleaned")
+
+    pool = subprocess_exec.LocalSubprocessActorPool(
+        _subprocess_map_payload(
+            StatefulCleanup,
+            execution_backend="subprocess_actor",
+            actor_number=1,
+            stateful=True,
+            udf_name="stateful_cleanup",
+        ),
+        1,
+        name="stateful-cleanup-test",
+    )
+    try:
+        pool.shutdown(kill=False)
+    finally:
+        if not pool._closed:
+            pool.shutdown(kill=True)
+
+    assert marker_path.read_text() == "cleaned"
