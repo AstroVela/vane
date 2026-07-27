@@ -85,6 +85,18 @@ For more details, see the [Installation Guide](https://vane.astrovela.ai/docs/da
 
 Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/quickstart) to build and run your first Vane pipeline.
 
+### Execution Policy
+
+Vane uses the Ray runner by default. If no runner is configured, executing a lazy relation through consumers such as
+display, result fetching, or file writes selects Ray and may lazily initialize it. An experimental local runner can be
+selected explicitly before creating connections:
+
+```python
+import vane
+
+vane.configure(runner="local")
+```
+
 ### More Resources
 
 - [Examples](https://vane.astrovela.ai/docs/data/examples)
