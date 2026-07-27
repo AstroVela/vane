@@ -6,8 +6,11 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from duckdb.runners.fte.dynamic_inputs import strip_fte_dynamic_context
 from duckdb.runners.fte.fte_attempts import (
     ExecutionClassTransition,
     FinishedAttempt,
@@ -56,7 +59,7 @@ from duckdb.runners.fte.fte_update_batch import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from duckdb.runners.fte.fte_events import FteWorkerCommand
     from duckdb.runners.fte.fte_exchange import ExchangeSinkHandle, FteExchangeTracker
@@ -81,6 +84,16 @@ class FteWorkerControlFailure(RuntimeError):
             f"FTE worker {self.worker_id or '<unknown>'} failed during "
             f"{self.method_name} for {self.attempt_id}: {cause}"
         )
+
+
+@dataclass(frozen=True)
+class FtePartitionPlacementSnapshot:
+    partition: FteTaskPartition
+    generation: int
+    memory_requirement_bytes: int | None
+    execution_class: FteTaskExecutionClass
+    node_requirements: NodeRequirements | None
+    node_requirements_wait_started_at: float | None
 
 
 class FteWorkerReservationUnavailable(RuntimeError):
@@ -146,6 +159,10 @@ class FteTaskPartition:
         self.execution_ready_deferred = False
         self.node_wait_started_at: float | None = None
         self.no_matching_node_started_at: float | None = None
+        self._placement_generation = 0
+
+    def _invalidate_placement(self) -> None:
+        self._placement_generation += 1
 
     @property
     def state(self) -> FtePartitionState:
@@ -184,6 +201,7 @@ class FteTaskPartition:
         if self.running_attempts:
             raise RuntimeError(f"partition {self.task_id} already has a running attempt")
 
+        self._invalidate_placement()
         attempt_number = self.next_attempt_number()
         attempt_id = FteTaskAttemptId(self.task_id, attempt_number)
         request = self.descriptor.to_create_task_request(
@@ -214,6 +232,12 @@ class FteTaskPartition:
     def mark_waiting_for_node(self) -> None:
         if self.node_wait_started_at is None:
             self.node_wait_started_at = time.time()
+            self._invalidate_placement()
+
+    def clear_waiting_for_node(self) -> None:
+        if self.node_wait_started_at is not None:
+            self.node_wait_started_at = None
+            self._invalidate_placement()
 
     def mark_no_matching_node(self) -> float:
         if self.no_matching_node_started_at is None:
@@ -224,14 +248,20 @@ class FteTaskPartition:
         self.no_matching_node_started_at = None
 
     def mark_ready_for_execution(self) -> None:
+        if self.ready_for_scheduling and not self.execution_ready_deferred:
+            return
         self.ready_for_scheduling = True
         self.execution_ready_deferred = False
+        self._invalidate_placement()
 
     def defer_ready_for_execution(self) -> None:
         if self.finished or self.failed or self.running_attempts:
             return
+        if not self.ready_for_scheduling and self.execution_ready_deferred:
+            return
         self.ready_for_scheduling = False
         self.execution_ready_deferred = True
+        self._invalidate_placement()
 
     def seal(self) -> FteTaskExecutionClass | None:
         if self.finished or self.failed:
@@ -256,6 +286,7 @@ class FteTaskPartition:
                 f"from {self.execution_class.value} to {new_class.value}"
             )
         self.execution_class = new_class
+        self._invalidate_placement()
         return True
 
     def mark_attempt_finished(
@@ -268,6 +299,7 @@ class FteTaskPartition:
         running = self.running_attempts.pop(attempt.attempt_id, None)
         if running is None:
             return False
+        self._invalidate_placement()
         task_stats = self.running_task_stats.pop(attempt.attempt_id, None)
         self.finished = True
         self.failed = False
@@ -303,6 +335,7 @@ class FteTaskPartition:
         running = self.running_attempts.pop(attempt.attempt_id, None)
         if running is None:
             return None
+        self._invalidate_placement()
         self.running_task_stats.pop(attempt.attempt_id, None)
 
         self.failure_observed = True
@@ -339,6 +372,7 @@ class FteTaskPartition:
         running = self.running_attempts.pop(attempt.attempt_id, None)
         if running is None:
             return None
+        self._invalidate_placement()
 
         self.failure_observed = True
         self.failures.append(error)
@@ -420,6 +454,7 @@ class FteFragmentExecution:
         execution_class_transition_callback: Callable[[list[ExecutionClassTransition]], None] | None = None,
         execution_admission_callback: Callable[[FteTaskPartition], bool] | None = None,
         attempt_admission_callback: Callable[[FteTaskPartition], bool] | None = None,
+        attempt_admission_abandon_callback: Callable[[FteTaskPartition], None] | None = None,
         worker_reservation_callback: Callable[[FteTaskPartition], bool] | None = None,
         descriptor_storage: TaskDescriptorStorage | None = None,
         max_attempts: int = 4,
@@ -449,6 +484,7 @@ class FteFragmentExecution:
         self.execution_class_transition_callback = execution_class_transition_callback
         self.execution_admission_callback = execution_admission_callback
         self.attempt_admission_callback = attempt_admission_callback
+        self.attempt_admission_abandon_callback = attempt_admission_abandon_callback
         self.worker_reservation_callback = worker_reservation_callback
         self.descriptor_storage = descriptor_storage if descriptor_storage is not None else TaskDescriptorStorage()
         self.max_attempts = int(max_attempts)
@@ -491,11 +527,22 @@ class FteFragmentExecution:
         partition_id: int,
         node_requirements: NodeRequirements | None = None,
     ) -> FteTaskPartition:
+        with self._state_lock:
+            return self._add_partition_locked(partition_id, node_requirements)
+
+    def _add_partition_locked(
+        self,
+        partition_id: int,
+        node_requirements: NodeRequirements | None = None,
+    ) -> FteTaskPartition:
+        if not self._state_lock_owned_by_current_thread():
+            raise RuntimeError("FTE partition mutation requires the fragment state lock")
         partition_id = _check_non_negative("partition_id", partition_id)
         existing = self.partitions.get(partition_id)
         if existing is not None:
             if existing.node_requirements is None and node_requirements is not None:
                 existing.node_requirements = node_requirements
+                existing._invalidate_placement()
             return existing
         task_id = FteTaskId(self.query_id, self.fragment_execution_id, partition_id)
         sink_handle = self.exchange.add_sink(partition_id) if self.exchange is not None else None
@@ -525,6 +572,185 @@ class FteFragmentExecution:
         self.descriptor_storage.put(task_id, descriptor)
         return partition
 
+    def merge_submission_metadata(
+        self,
+        *,
+        task_context_info: Mapping[str, Any] | None,
+        exchange_sink_instance: Any,
+        dynamic_scan_sources: set[str],
+        dynamic_exchange_sources: set[str],
+    ) -> None:
+        dynamic_scan_sources = {str(source) for source in dynamic_scan_sources}
+        dynamic_exchange_sources = {str(source) for source in dynamic_exchange_sources}
+        submitted_task_context_info = dict(task_context_info or {})
+        with self._state_lock:
+            if not self.task_context_info and submitted_task_context_info:
+                self.task_context_info = dict(submitted_task_context_info)
+            if exchange_sink_instance is not None:
+                self.task_context_info["exchange_sink_instance"] = exchange_sink_instance
+            self.source_node_ids.update(dynamic_scan_sources)
+            self.source_node_ids.update(dynamic_exchange_sources)
+            self.dynamic_scan_source_node_ids.update(dynamic_scan_sources)
+            self.dynamic_exchange_source_node_ids.update(dynamic_exchange_sources)
+            self.context = strip_fte_dynamic_context(
+                self.context,
+                self.dynamic_scan_source_node_ids,
+                self.dynamic_exchange_source_node_ids,
+            )
+            for partition in self.partitions.values():
+                descriptor = partition.descriptor
+                descriptor.source_node_ids.update(dynamic_scan_sources)
+                descriptor.source_node_ids.update(dynamic_exchange_sources)
+                descriptor.dynamic_scan_source_node_ids.update(dynamic_scan_sources)
+                descriptor.dynamic_exchange_source_node_ids.update(dynamic_exchange_sources)
+                descriptor.context = strip_fte_dynamic_context(
+                    descriptor.context,
+                    descriptor.dynamic_scan_source_node_ids,
+                    descriptor.dynamic_exchange_source_node_ids,
+                )
+                if not descriptor.task_context_info and submitted_task_context_info:
+                    descriptor.task_context_info = dict(submitted_task_context_info)
+                if descriptor.exchange_sink_instance is None and exchange_sink_instance is not None:
+                    descriptor.exchange_sink_instance = exchange_sink_instance
+
+    def get_partition(self, partition_id: int) -> FteTaskPartition | None:
+        with self._state_lock:
+            return self.partitions.get(int(partition_id))
+
+    def partition_scheduling_requirements(
+        self,
+        partition_id: int,
+    ) -> tuple[int | None, FteTaskExecutionClass, NodeRequirements | None] | None:
+        with self._state_lock:
+            partition = self.partitions.get(int(partition_id))
+            if partition is None:
+                return None
+            return (
+                partition.memory_requirement_bytes,
+                FteTaskExecutionClass.coerce(partition.execution_class),
+                partition.node_requirements,
+            )
+
+    def partition_attempt_is_running(
+        self,
+        partition_id: int,
+        attempt_id: FteTaskAttemptId | str | Mapping[str, Any],
+    ) -> bool:
+        attempt = FteTaskAttemptId.coerce(attempt_id)
+        with self._state_lock:
+            partition = self.partitions.get(int(partition_id))
+            return bool(
+                partition is not None
+                and any(running.attempt_id == attempt for running in partition.running_attempts.values())
+            )
+
+    def _placement_snapshot_locked(
+        self,
+        partition_id: int,
+        *,
+        expected_partition: FteTaskPartition | None = None,
+        expected_generation: int | None = None,
+    ) -> FtePartitionPlacementSnapshot | None:
+        if not self._state_lock_owned_by_current_thread():
+            raise RuntimeError("FTE placement snapshot requires the fragment state lock")
+        partition = self.partitions.get(int(partition_id))
+        if partition is None or (expected_partition is not None and partition is not expected_partition):
+            return None
+        if expected_generation is not None and partition._placement_generation != int(expected_generation):
+            return None
+        if partition.running_attempts or partition.finished or partition.failed:
+            return None
+        return FtePartitionPlacementSnapshot(
+            partition=partition,
+            generation=partition._placement_generation,
+            memory_requirement_bytes=partition.memory_requirement_bytes,
+            execution_class=partition.execution_class,
+            node_requirements=partition.node_requirements,
+            node_requirements_wait_started_at=partition.node_wait_started_at,
+        )
+
+    @contextmanager
+    def partition_placement(
+        self,
+        partition_id: int,
+        *,
+        expected_partition: FteTaskPartition | None = None,
+    ) -> Iterator[FtePartitionPlacementSnapshot | None]:
+        with self._attempt_scheduling_lock:
+            with self._state_lock:
+                snapshot = self._placement_snapshot_locked(
+                    partition_id,
+                    expected_partition=expected_partition,
+                )
+            yield snapshot
+
+    def mark_partition_waiting_for_node(
+        self,
+        snapshot: FtePartitionPlacementSnapshot,
+    ) -> FtePartitionPlacementSnapshot | None:
+        with self._state_lock:
+            current = self._placement_snapshot_locked(
+                snapshot.partition.task_id.partition_id,
+                expected_partition=snapshot.partition,
+                expected_generation=snapshot.generation,
+            )
+            if current is None:
+                return None
+            current.partition.mark_waiting_for_node()
+            return self._placement_snapshot_locked(
+                current.partition.task_id.partition_id,
+                expected_partition=current.partition,
+            )
+
+    def commit_partition_placement(self, snapshot: FtePartitionPlacementSnapshot) -> bool:
+        with self._state_lock:
+            return (
+                self._placement_snapshot_locked(
+                    snapshot.partition.task_id.partition_id,
+                    expected_partition=snapshot.partition,
+                    expected_generation=snapshot.generation,
+                )
+                is not None
+            )
+
+    def record_partition_placement_unavailable(
+        self,
+        snapshot: FtePartitionPlacementSnapshot,
+        *,
+        has_matching_node: bool,
+    ) -> tuple[bool, float]:
+        with self._state_lock:
+            current = self._placement_snapshot_locked(
+                snapshot.partition.task_id.partition_id,
+                expected_partition=snapshot.partition,
+                expected_generation=snapshot.generation,
+            )
+            if current is None:
+                return False, 0.0
+            if has_matching_node:
+                current.partition.reset_no_matching_node()
+                return True, 0.0
+            return True, current.partition.mark_no_matching_node()
+
+    def defer_partition_after_placement_rejection(
+        self,
+        snapshot: FtePartitionPlacementSnapshot,
+        *,
+        defer_execution: bool,
+    ) -> bool:
+        with self._state_lock:
+            current = self._placement_snapshot_locked(
+                snapshot.partition.task_id.partition_id,
+                expected_partition=snapshot.partition,
+                expected_generation=snapshot.generation,
+            )
+            if current is None:
+                return False
+            current.partition.clear_waiting_for_node()
+            if defer_execution:
+                current.partition.defer_ready_for_execution()
+            return True
+
     def _base_sink_instance_for_partition(self) -> Any:
         if self.exchange is not None:
             return None
@@ -532,6 +758,10 @@ class FteFragmentExecution:
 
     def _state_lock_owned_by_current_thread(self) -> bool:
         is_owned = getattr(self._state_lock, "_is_owned", None)
+        return bool(is_owned()) if callable(is_owned) else False
+
+    def _attempt_scheduling_lock_owned_by_current_thread(self) -> bool:
+        is_owned = getattr(self._attempt_scheduling_lock, "_is_owned", None)
         return bool(is_owned()) if callable(is_owned) else False
 
     def apply_assignment_result(self, result: AssignmentResult) -> FragmentExecutionMutationResult:
@@ -543,7 +773,7 @@ class FteFragmentExecution:
             try:
                 with self._state_lock:
                     for info in result.partitions_added:
-                        self.add_partition(info.partition_id, info.node_requirements)
+                        self._add_partition_locked(info.partition_id, info.node_requirements)
                 for update in self._coalesce_partition_updates(result.partition_updates):
                     attempt = self.update_partition(update)
                     if attempt is not None:
@@ -677,11 +907,34 @@ class FteFragmentExecution:
 
             with self._state_lock:
                 current = self.partitions.get(int(partition_id))
-                if current is not partition or not self._partition_ready_to_schedule(partition):
-                    return None
-                if not self._partition_matches_execution_class(partition, execution_class):
-                    return None
-                return self._create_attempt_after_admission(partition)
+                placement_is_current = (
+                    current is partition
+                    and self._partition_ready_to_schedule(partition)
+                    and self._partition_matches_execution_class(partition, execution_class)
+                )
+                if not placement_is_current:
+                    reservation_callback = None
+                else:
+                    reservation_callback = self.worker_reservation_callback
+            if not placement_is_current:
+                if self.attempt_admission_abandon_callback is not None:
+                    self.attempt_admission_abandon_callback(partition)
+                return None
+            if reservation_callback is None:
+                with self._state_lock:
+                    current = self.partitions.get(int(partition_id))
+                    placement_is_current = not (
+                        current is not partition
+                        or not self._partition_ready_to_schedule(partition)
+                        or not self._partition_matches_execution_class(partition, execution_class)
+                    )
+                    if placement_is_current:
+                        return self._create_attempt_after_admission(partition)
+                if self.attempt_admission_abandon_callback is not None:
+                    self.attempt_admission_abandon_callback(partition)
+                return None
+            reservation_callback(partition)
+            return None
 
     @staticmethod
     def _transition_from_partition(partition: FteTaskPartition) -> ExecutionClassTransition:
@@ -1236,6 +1489,17 @@ class FteFragmentExecution:
             }
 
     def start_attempt_with_worker(self, partition: FteTaskPartition) -> ScheduledAttempt:
+        with self._attempt_scheduling_lock:
+            with self._state_lock:
+                return self._start_attempt_with_worker_locked(partition)
+
+    def _start_attempt_with_worker_locked(self, partition: FteTaskPartition) -> ScheduledAttempt:
+        if not self._attempt_scheduling_lock_owned_by_current_thread():
+            raise RuntimeError("FTE attempt mutation requires the attempt scheduling lock")
+        if not self._state_lock_owned_by_current_thread():
+            raise RuntimeError("FTE attempt mutation requires the fragment state lock")
+        if self.partitions.get(partition.task_id.partition_id) is not partition:
+            raise ValueError(f"partition {partition.task_id} does not belong to this fragment execution")
         worker_id, worker = self._select_worker(partition)
         sink_instance = None
         if self.exchange is not None:
@@ -1282,10 +1546,10 @@ class FteFragmentExecution:
             command.worker.record_fte_task_started(command.attempt_id, command.request)
             return
         if isinstance(command, FteAddSplitsCommand):
-            command.worker.record_fte_splits_added(command.attempt_id, len(command.splits))
-            command.worker.record_fte_split_bytes_added(
+            command.worker.record_fte_splits_added(
                 command.attempt_id,
-                sum(_estimated_payload_bytes(split) for split in command.splits),
+                len(command.splits),
+                split_bytes=sum(_estimated_payload_bytes(split) for split in command.splits),
             )
 
     def worker_control_failure_for_command(

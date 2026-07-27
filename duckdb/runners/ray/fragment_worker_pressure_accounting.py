@@ -130,8 +130,9 @@ class FteWorkerPressureAccountingMixin:
             self._fte_pressure.last_seen_at = time.time()
             return True
 
-    def record_fte_task_started(self, attempt_id: Any, request: Mapping[str, Any]) -> None:
-        key = attempt_key(attempt_id)
+    def record_fte_task_started(self, attempt_id: Any, request: Mapping[str, Any]) -> bool:
+        attempt = FteTaskAttemptId.coerce(attempt_id)
+        key = str(attempt)
         memory_requirement = request.get("memory_requirement_bytes")
         task_class = FteTaskExecutionClass.coerce(request.get("execution_class"))
         try:
@@ -139,15 +140,22 @@ class FteWorkerPressureAccountingMixin:
         except (TypeError, ValueError):
             memory_requirement_bytes = 0
         with _FTE_REGISTRY_LOCK:
+            if self._fte_pressure.attempt_is_terminal(attempt) or key in self._fte_pressure.running_attempts:
+                return False
             self._fte_pressure.running_attempts.add(key)
             self._fte_pressure.execution_class_by_attempt[key] = task_class.value
-            self._fte_pressure.split_counts_by_attempt[key] = initial_split_count(request)
-            self._fte_pressure.split_bytes_by_attempt[key] = initial_split_bytes(request)
+            self._fte_pressure.split_counts_by_attempt[key] = initial_split_count(
+                request
+            ) + self._fte_pressure.pending_split_counts_by_attempt.pop(key, 0)
+            self._fte_pressure.split_bytes_by_attempt[key] = initial_split_bytes(
+                request
+            ) + self._fte_pressure.pending_split_bytes_by_attempt.pop(key, 0)
             if memory_requirement_bytes > 0:
                 self._fte_pressure.memory_bytes_by_attempt[key] = memory_requirement_bytes
             else:
                 self._fte_pressure.memory_bytes_by_attempt.pop(key, None)
             self._fte_pressure.last_seen_at = time.time()
+            return True
 
     def record_fte_task_started_from_reservation(
         self,
@@ -156,47 +164,76 @@ class FteWorkerPressureAccountingMixin:
         partition_id: int,
         attempt_id: Any,
         request: Mapping[str, Any],
-    ) -> None:
+    ) -> bool:
         """Move reservation pressure to running without exposing free capacity."""
 
         reservation_key = partition_reservation_key(query_id, fragment_id, partition_id)
         with _FTE_REGISTRY_LOCK:
+            if not self.record_fte_task_started(attempt_id, request):
+                return False
             self._fte_pressure.reserved_partitions.discard(reservation_key)
             self._fte_pressure.memory_bytes_by_reservation.pop(reservation_key, None)
             self._fte_pressure.execution_class_by_reservation.pop(reservation_key, None)
-            self.record_fte_task_started(attempt_id, request)
+            return True
 
-    def record_fte_splits_added(self, attempt_id: Any, split_count: int) -> None:
-        key = attempt_key(attempt_id)
+    def record_fte_splits_added(
+        self,
+        attempt_id: Any,
+        split_count: int,
+        *,
+        split_bytes: int | None = None,
+    ) -> bool:
+        attempt = FteTaskAttemptId.coerce(attempt_id)
+        key = str(attempt)
+        added_split_count = max(0, int(split_count))
+        added_split_bytes = None if split_bytes is None else max(0, int(split_bytes))
         with _FTE_REGISTRY_LOCK:
-            self._fte_pressure.running_attempts.add(key)
-            self._fte_pressure.split_counts_by_attempt[key] = self._fte_pressure.split_counts_by_attempt.get(
-                key, 0
-            ) + max(0, int(split_count))
+            if self._fte_pressure.attempt_is_terminal(attempt):
+                return False
+            if key not in self._fte_pressure.running_attempts:
+                self._fte_pressure.pending_split_counts_by_attempt[key] = (
+                    self._fte_pressure.pending_split_counts_by_attempt.get(key, 0) + added_split_count
+                )
+                if added_split_bytes is not None:
+                    self._fte_pressure.pending_split_bytes_by_attempt[key] = (
+                        self._fte_pressure.pending_split_bytes_by_attempt.get(key, 0) + added_split_bytes
+                    )
+                self._fte_pressure.last_seen_at = time.time()
+                return True
+            self._fte_pressure.split_counts_by_attempt[key] = (
+                self._fte_pressure.split_counts_by_attempt.get(key, 0) + added_split_count
+            )
+            if added_split_bytes is not None:
+                self._fte_pressure.split_bytes_by_attempt[key] = (
+                    self._fte_pressure.split_bytes_by_attempt.get(key, 0) + added_split_bytes
+                )
             self._fte_pressure.last_seen_at = time.time()
+            return True
 
-    def record_fte_split_bytes_added(self, attempt_id: Any, split_bytes: int) -> None:
+    def record_fte_split_bytes_added(self, attempt_id: Any, split_bytes: int) -> bool:
         key = attempt_key(attempt_id)
         with _FTE_REGISTRY_LOCK:
-            self._fte_pressure.running_attempts.add(key)
+            if key not in self._fte_pressure.running_attempts:
+                return False
             self._fte_pressure.split_bytes_by_attempt[key] = self._fte_pressure.split_bytes_by_attempt.get(
                 key, 0
             ) + max(0, int(split_bytes))
             self._fte_pressure.last_seen_at = time.time()
+            return True
 
     def _record_fte_task_pressure_complete(self, attempt_id: Any, *, drain: bool) -> None:
-        key = attempt_key(attempt_id)
+        attempt = FteTaskAttemptId.coerce(attempt_id)
+        key = str(attempt)
         with _FTE_REGISTRY_LOCK:
+            self._fte_pressure.record_terminal_attempt(attempt)
             self._fte_pressure.running_attempts.discard(key)
             self._fte_pressure.split_counts_by_attempt.pop(key, None)
             self._fte_pressure.split_bytes_by_attempt.pop(key, None)
+            self._fte_pressure.pending_split_counts_by_attempt.pop(key, None)
+            self._fte_pressure.pending_split_bytes_by_attempt.pop(key, None)
             self._fte_pressure.memory_bytes_by_attempt.pop(key, None)
             self._fte_pressure.execution_class_by_attempt.pop(key, None)
             self._fte_pressure.last_seen_at = time.time()
-        try:
-            FteTaskAttemptId.coerce(attempt_id)
-        except Exception:
-            return
         if drain:
             request_fte_pending_task_drain()
 

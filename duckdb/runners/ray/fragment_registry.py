@@ -6,11 +6,12 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from duckdb.runners.fte import (
     FteTaskAttemptId,
     FteTaskExecutionClass,
+    FteTaskId,
 )
 from duckdb.runners.fte.fte_scheduler import FteSchedulerRegistry
 
@@ -21,6 +22,9 @@ if TYPE_CHECKING:
     from duckdb.runners.fte.fte_scheduler import FteAttemptStatusWatcher
     from duckdb.runners.ray.fragment_worker_client import RayWorkerActorHandle
     from duckdb.runners.ray.fte_fragment_scheduler import FteWorkerReservationFuture
+
+
+_PressureKey = TypeVar("_PressureKey")
 
 
 @dataclass(frozen=True)
@@ -115,14 +119,31 @@ class _FteSchedulingDelayer:
 class _FteWorkerPressure:
     def __init__(self) -> None:
         self.running_attempts: set[str] = set()
+        # Compact every task's terminal attempts into one monotonic watermark.
+        # This keeps late ACK rejection exact without retaining one tombstone
+        # for every retry for the lifetime of the query.
+        self.terminal_attempt_id_by_task: dict[str, int] = {}
         self.reserved_partitions: set[tuple[str, str, int]] = set()
         self.split_counts_by_attempt: dict[str, int] = {}
         self.split_bytes_by_attempt: dict[str, int] = {}
+        self.pending_split_counts_by_attempt: dict[str, int] = {}
+        self.pending_split_bytes_by_attempt: dict[str, int] = {}
         self.memory_bytes_by_attempt: dict[str, int] = {}
         self.memory_bytes_by_reservation: dict[tuple[str, str, int], int] = {}
         self.execution_class_by_attempt: dict[str, str] = {}
         self.execution_class_by_reservation: dict[tuple[str, str, int], str] = {}
         self.last_seen_at = time.time()
+
+    def attempt_is_terminal(self, attempt_id: FteTaskAttemptId) -> bool:
+        terminal_attempt_id = self.terminal_attempt_id_by_task.get(str(attempt_id.task_id))
+        return terminal_attempt_id is not None and int(attempt_id.attempt_id) <= terminal_attempt_id
+
+    def record_terminal_attempt(self, attempt_id: FteTaskAttemptId) -> None:
+        task_key = str(attempt_id.task_id)
+        self.terminal_attempt_id_by_task[task_key] = max(
+            int(attempt_id.attempt_id),
+            self.terminal_attempt_id_by_task.get(task_key, -1),
+        )
 
     def score(self) -> int:
         return (
@@ -137,8 +158,8 @@ class _FteWorkerPressure:
 
     @staticmethod
     def _memory_bytes_for_class(
-        memory_by_key: dict[str, int],
-        execution_class_by_key: dict[str, str],
+        memory_by_key: dict[_PressureKey, int],
+        execution_class_by_key: dict[_PressureKey, str],
         execution_class: FteTaskExecutionClass,
     ) -> int:
         return sum(
@@ -183,6 +204,7 @@ class _FteWorkerPressure:
         )
         return {
             "running_attempt_count": len(self.running_attempts),
+            "terminal_attempt_count": len(self.terminal_attempt_id_by_task),
             "reserved_partition_count": len(self.reserved_partitions),
             "assigned_split_count": sum(self.split_counts_by_attempt.values()),
             "assigned_split_bytes": sum(self.split_bytes_by_attempt.values()),
@@ -212,35 +234,51 @@ class _FteWorkerPressure:
         def owned_attempt(attempt: str) -> bool:
             return FteTaskAttemptId.parse(attempt).query_id == query_id
 
-        self.running_attempts = {attempt for attempt in self.running_attempts if not owned_attempt(attempt)}
-        self.reserved_partitions = {
-            reservation for reservation in self.reserved_partitions if reservation[0] != query_id
-        }
-        self.split_counts_by_attempt = {
-            attempt: count for attempt, count in self.split_counts_by_attempt.items() if not owned_attempt(attempt)
-        }
-        self.split_bytes_by_attempt = {
-            attempt: count for attempt, count in self.split_bytes_by_attempt.items() if not owned_attempt(attempt)
-        }
-        self.memory_bytes_by_attempt = {
-            attempt: count for attempt, count in self.memory_bytes_by_attempt.items() if not owned_attempt(attempt)
-        }
-        self.memory_bytes_by_reservation = {
-            reservation: count
-            for reservation, count in self.memory_bytes_by_reservation.items()
-            if reservation[0] != query_id
-        }
-        self.execution_class_by_attempt = {
-            attempt: execution_class
-            for attempt, execution_class in self.execution_class_by_attempt.items()
-            if not owned_attempt(attempt)
-        }
-        self.execution_class_by_reservation = {
-            reservation: execution_class
-            for reservation, execution_class in self.execution_class_by_reservation.items()
-            if reservation[0] != query_id
-        }
-        self.last_seen_at = time.time()
+        with _FTE_REGISTRY_LOCK:
+            self.running_attempts = {attempt for attempt in self.running_attempts if not owned_attempt(attempt)}
+            self.terminal_attempt_id_by_task = {
+                task: attempt_id
+                for task, attempt_id in self.terminal_attempt_id_by_task.items()
+                if FteTaskId.parse(task).query_id != query_id
+            }
+            self.reserved_partitions = {
+                reservation for reservation in self.reserved_partitions if reservation[0] != query_id
+            }
+            self.split_counts_by_attempt = {
+                attempt: count for attempt, count in self.split_counts_by_attempt.items() if not owned_attempt(attempt)
+            }
+            self.split_bytes_by_attempt = {
+                attempt: count for attempt, count in self.split_bytes_by_attempt.items() if not owned_attempt(attempt)
+            }
+            self.pending_split_counts_by_attempt = {
+                attempt: count
+                for attempt, count in self.pending_split_counts_by_attempt.items()
+                if not owned_attempt(attempt)
+            }
+            self.pending_split_bytes_by_attempt = {
+                attempt: count
+                for attempt, count in self.pending_split_bytes_by_attempt.items()
+                if not owned_attempt(attempt)
+            }
+            self.memory_bytes_by_attempt = {
+                attempt: count for attempt, count in self.memory_bytes_by_attempt.items() if not owned_attempt(attempt)
+            }
+            self.memory_bytes_by_reservation = {
+                reservation: count
+                for reservation, count in self.memory_bytes_by_reservation.items()
+                if reservation[0] != query_id
+            }
+            self.execution_class_by_attempt = {
+                attempt: execution_class
+                for attempt, execution_class in self.execution_class_by_attempt.items()
+                if not owned_attempt(attempt)
+            }
+            self.execution_class_by_reservation = {
+                reservation: execution_class
+                for reservation, execution_class in self.execution_class_by_reservation.items()
+                if reservation[0] != query_id
+            }
+            self.last_seen_at = time.time()
 
 
 @dataclass

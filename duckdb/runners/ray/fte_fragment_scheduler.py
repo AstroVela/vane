@@ -809,18 +809,18 @@ def _drop_fte_registry_for_query(query_id: str) -> None:
         _FTE_FRAGMENT_PROGRESS_TOPOLOGY_BUILDS.difference_update(
             {key for key in _FTE_FRAGMENT_PROGRESS_TOPOLOGY_BUILDS if key[0] == query_id}
         )
-        for key in list(_FTE_WORKER_RESERVATION_GENERATIONS):
-            if key[0] == query_id:
-                _FTE_WORKER_RESERVATION_GENERATIONS.pop(key, None)
-        for key in list(_FTE_PENDING_WORKER_RESERVATIONS):
-            if key[0] == query_id:
-                future = _FTE_PENDING_WORKER_RESERVATIONS.pop(key, None)
+        for reservation_key in list(_FTE_WORKER_RESERVATION_GENERATIONS):
+            if reservation_key[0] == query_id:
+                _FTE_WORKER_RESERVATION_GENERATIONS.pop(reservation_key, None)
+        for reservation_key in list(_FTE_PENDING_WORKER_RESERVATIONS):
+            if reservation_key[0] == query_id:
+                future = _FTE_PENDING_WORKER_RESERVATIONS.pop(reservation_key, None)
                 if future is not None:
                     pending_worker_reservation_futures.append(future)
         _FTE_RESULT_HANDLES_BY_QUERY.pop(query_id, None)
-        for key in list(_FTE_SEQUENCES):
-            if key[0] == query_id:
-                _FTE_SEQUENCES.pop(key, None)
+        for sequence_key in list(_FTE_SEQUENCES):
+            if sequence_key[0] == query_id:
+                _FTE_SEQUENCES.pop(sequence_key, None)
         for key in list(_FTE_FRAGMENT_STATES):
             if key[0] == query_id:
                 _FTE_FRAGMENT_STATES.pop(key, None)
@@ -1156,13 +1156,13 @@ def _write_sink_has_input(fragment_execution: Any) -> tuple[bool, bool]:
 
 
 def _sync_write_sink_stage_for_fragment(fragment_execution: Any) -> str | None:
-    if not _is_write_sink_fragment(fragment_execution):
-        return None
-
     from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
-    resource_query_id, stage_id = resource_identity_from_context(fragment_execution.context)
-    has_input, all_terminal = _write_sink_has_input(fragment_execution)
+    with fragment_execution._state_lock:
+        if not _is_write_sink_fragment(fragment_execution):
+            return None
+        resource_query_id, stage_id = resource_identity_from_context(fragment_execution.context)
+        has_input, all_terminal = _write_sink_has_input(fragment_execution)
     get_query_resource_manager(resource_query_id).update_stage_state(
         stage_id,
         runnable=has_input,
@@ -1545,39 +1545,6 @@ def _fte_worker_selection_key(
     )
 
 
-def _fte_partition_memory_requirement_bytes(owner_key: tuple[str, str, int]) -> int | None:
-    fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get((owner_key[0], owner_key[1]))
-    if fragment_execution is None:
-        return None
-    partition = fragment_execution.partitions.get(owner_key[2])
-    if partition is None:
-        return None
-    memory_requirement = partition.memory_requirement_bytes
-    if memory_requirement is None:
-        return None
-    return _memory_requirement_bytes(memory_requirement)
-
-
-def _fte_partition_execution_class(owner_key: tuple[str, str, int]) -> FteTaskExecutionClass:
-    fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get((owner_key[0], owner_key[1]))
-    if fragment_execution is None:
-        return FteTaskExecutionClass.STANDARD
-    partition = fragment_execution.partitions.get(owner_key[2])
-    if partition is None:
-        return FteTaskExecutionClass.STANDARD
-    return FteTaskExecutionClass.coerce(partition.execution_class)
-
-
-def _fte_partition_node_requirements(owner_key: tuple[str, str, int]) -> NodeRequirements | None:
-    fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get((owner_key[0], owner_key[1]))
-    if fragment_execution is None:
-        return None
-    partition = fragment_execution.partitions.get(owner_key[2])
-    if partition is None:
-        return None
-    return partition.node_requirements
-
-
 def _select_replacement_fte_worker(
     exclude_worker_id: str | set[str],
     *,
@@ -1591,11 +1558,12 @@ def _select_replacement_fte_worker(
         if isinstance(exclude_worker_id, str)
         else {str(worker_id) for worker_id in exclude_worker_id}
     )
-    candidates = [
-        handle
-        for worker_id, handle in sorted(_FTE_WORKER_HANDLES.items())
-        if str(worker_id) not in exclude_worker_ids and handle is not None and handle._fte_healthy
-    ]
+    with _FTE_REGISTRY_LOCK:
+        candidates = [
+            handle
+            for worker_id, handle in sorted(_FTE_WORKER_HANDLES.items())
+            if str(worker_id) not in exclude_worker_ids and handle is not None and handle._fte_healthy
+        ]
     if not candidates:
         return None
     candidates = _filter_workers_for_node_requirements(
@@ -1638,11 +1606,12 @@ def _has_replacement_fte_worker(
         if isinstance(exclude_worker_id, str)
         else {str(worker_id) for worker_id in exclude_worker_id}
     )
-    candidates = [
-        handle
-        for worker_id, handle in _FTE_WORKER_HANDLES.items()
-        if str(worker_id) not in exclude_worker_ids and handle is not None and handle._fte_healthy
-    ]
+    with _FTE_REGISTRY_LOCK:
+        candidates = [
+            handle
+            for worker_id, handle in _FTE_WORKER_HANDLES.items()
+            if str(worker_id) not in exclude_worker_ids and handle is not None and handle._fte_healthy
+        ]
     return bool(
         _filter_workers_for_node_requirements(
             candidates,
@@ -2143,30 +2112,48 @@ class FteWorkerPlacementManager:
         fragment_id: str,
         partition_id: int,
         terminal: bool | None = None,
+        expected_owner: RayWorkerActorHandle | None = None,
     ) -> RayWorkerActorHandle | None:
         query_id = str(query_id)
         fragment_id = str(fragment_id)
         partition_id = int(partition_id)
+        owner_key = (query_id, fragment_id, partition_id)
+        fragment_execution = None
+        waiter_identity = None
         with _FTE_REGISTRY_LOCK:
-            owner = _FTE_PARTITION_OWNERS.pop((query_id, fragment_id, partition_id), None)
-            lease_record = _FTE_PARTITION_TASK_LEASES.pop((query_id, fragment_id, partition_id), None)
+            current_owner = _FTE_PARTITION_OWNERS.get(owner_key)
+            if expected_owner is not None and current_owner is not expected_owner:
+                return None
+            owner = _FTE_PARTITION_OWNERS.pop(owner_key, None)
+            lease_record = _FTE_PARTITION_TASK_LEASES.pop(owner_key, None)
+            waiter_identity = _FTE_PARTITION_TASK_WAITERS.pop(owner_key, None)
+            for stage_key, partition_key in list(_FTE_STAGE_SUBMISSION_PROBES.items()):
+                if partition_key == owner_key:
+                    _FTE_STAGE_SUBMISSION_PROBES.pop(stage_key, None)
+            for stage_key, blocked in list(_FTE_STAGE_SUBMISSION_BLOCKS.items()):
+                if blocked[2] == owner_key:
+                    _FTE_STAGE_SUBMISSION_BLOCKS.pop(stage_key, None)
             if terminal is None and lease_record is not None:
-                _, task_lease = lease_record
                 fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get((query_id, fragment_id))
-                partition = None if fragment_execution is None else fragment_execution.partitions.get(partition_id)
-                terminal = bool(
-                    partition is not None
-                    and any(
-                        str(running.attempt_id) == task_lease.attempt_id
-                        for running in partition.running_attempts.values()
-                    )
+        if terminal is None and lease_record is not None:
+            _, task_lease = lease_record
+            terminal = bool(
+                fragment_execution is not None
+                and fragment_execution.partition_attempt_is_running(
+                    partition_id,
+                    task_lease.attempt_id,
                 )
-        release_fte_partition_task_waiter((query_id, fragment_id, partition_id))
-        release_fte_partition_submission(
-            query_id,
-            fragment_id,
-            partition_id,
-        )
+            )
+        if waiter_identity is not None:
+            from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
+
+            try:
+                get_query_resource_manager(waiter_identity[0]).remove_task_waiter(
+                    waiter_identity[1],
+                    waiter_identity[2],
+                )
+            except KeyError:
+                pass
         try:
             if owner is not None:
                 owner.release_fte_partition_reservation(query_id, fragment_id, partition_id)
@@ -2259,6 +2246,13 @@ def _mark_fte_worker_failed(
     handles_to_kill: list[RayWorkerActorHandle] = []
     pending_worker_reservation_futures_to_cancel: list[FteWorkerReservationFuture] = []
     retryable_by_owner_key: dict[tuple[str, str, int], bool] = {}
+    failed_owner_items: list[
+        tuple[
+            tuple[str, str, int],
+            RayWorkerActorHandle,
+            FteFragmentExecution | None,
+        ]
+    ] = []
     with _FTE_REGISTRY_LOCK:
         for failed_worker_id in sorted(failed_worker_ids):
             failed_handle = _FTE_WORKER_HANDLES.pop(failed_worker_id, None)
@@ -2271,46 +2265,56 @@ def _mark_fte_worker_failed(
                 continue
             if str(owner.worker_id) not in failed_worker_ids:
                 continue
-            memory_requirement_bytes = _fte_partition_memory_requirement_bytes(owner_key)
-            execution_class = _fte_partition_execution_class(owner_key)
-            node_requirements = _fte_partition_node_requirements(owner_key)
-            wait_started_at = time.time()
-            replacement = _select_replacement_fte_worker(
-                failed_worker_ids,
-                memory_requirement_bytes=memory_requirement_bytes,
-                execution_class=execution_class,
-                node_requirements=node_requirements,
-                node_requirements_wait_started_at=wait_started_at,
+            failed_owner_items.append(
+                (
+                    owner_key,
+                    owner,
+                    _FTE_FRAGMENT_EXECUTIONS.get((owner_key[0], owner_key[1])),
+                )
             )
-            if replacement is None:
-                future = _FTE_PENDING_WORKER_RESERVATIONS.pop(owner_key, None)
-                if future is not None:
-                    pending_worker_reservation_futures_to_cancel.append(future)
-                FteWorkerPlacementManager.release_owner(
-                    query_id=owner_key[0],
-                    fragment_id=owner_key[1],
-                    partition_id=owner_key[2],
-                )
-                retryable_by_owner_key[owner_key] = _has_replacement_fte_worker(
-                    failed_worker_ids,
-                    node_requirements=node_requirements,
-                    node_requirements_wait_started_at=wait_started_at,
-                )
-            else:
-                retryable_by_owner_key[owner_key] = True
-                future = _FTE_PENDING_WORKER_RESERVATIONS.pop(owner_key, None)
-                if future is not None:
-                    pending_worker_reservation_futures_to_cancel.append(future)
-                FteWorkerPlacementManager.release_owner(
-                    query_id=owner_key[0],
-                    fragment_id=owner_key[1],
-                    partition_id=owner_key[2],
-                )
+            future = _FTE_PENDING_WORKER_RESERVATIONS.pop(owner_key, None)
+            if future is not None:
+                pending_worker_reservation_futures_to_cancel.append(future)
         fragment_execution_items = [
             item
             for item in _FTE_FRAGMENT_EXECUTIONS.items()
             if query_id_filter is None or item[0][0] == query_id_filter
         ]
+
+    for owner_key, owner, fragment_execution in failed_owner_items:
+        scheduling_requirements = None
+        if fragment_execution is not None:
+            with _FTE_REGISTRY_LOCK:
+                fragment_is_current = _FTE_FRAGMENT_EXECUTIONS.get((owner_key[0], owner_key[1])) is fragment_execution
+            if fragment_is_current:
+                scheduling_requirements = fragment_execution.partition_scheduling_requirements(
+                    owner_key[2],
+                )
+        if scheduling_requirements is None:
+            memory_requirement_bytes = None
+            execution_class = FteTaskExecutionClass.STANDARD
+            node_requirements = None
+        else:
+            memory_requirement_bytes, execution_class, node_requirements = scheduling_requirements
+        wait_started_at = time.time()
+        replacement = _select_replacement_fte_worker(
+            failed_worker_ids,
+            memory_requirement_bytes=memory_requirement_bytes,
+            execution_class=execution_class,
+            node_requirements=node_requirements,
+            node_requirements_wait_started_at=wait_started_at,
+        )
+        retryable_by_owner_key[owner_key] = replacement is not None or _has_replacement_fte_worker(
+            failed_worker_ids,
+            node_requirements=node_requirements,
+            node_requirements_wait_started_at=wait_started_at,
+        )
+        FteWorkerPlacementManager.release_owner(
+            query_id=owner_key[0],
+            fragment_id=owner_key[1],
+            partition_id=owner_key[2],
+            expected_owner=owner,
+        )
 
     for handle in handles_to_kill:
         try:

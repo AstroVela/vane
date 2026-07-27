@@ -33,6 +33,7 @@ from duckdb.runners.ray.fragment_registry import (
     _FTE_REGISTRY_LOCK,
     _FTE_SCHEDULERS,
 )
+from duckdb.runners.ray.fragment_submission_window import release_fte_partition_submission
 from duckdb.runners.ray.fragment_worker_context import (
     fragment_id_for_task,
     resource_identity_from_context,
@@ -194,44 +195,29 @@ class FteWorkerSubmissionMixin:
         query_id = str(item["query_id"])
         fragment_id = str(item["fragment_id"])
         key = (query_id, fragment_id)
+
+        def merge_existing(existing: FteFragmentExecution) -> FteFragmentExecution:
+            existing.merge_submission_metadata(
+                task_context_info=item.get("task_context_info"),
+                exchange_sink_instance=item.get("exchange_sink_instance"),
+                dynamic_scan_sources=dynamic_scan_sources,
+                dynamic_exchange_sources=dynamic_exchange_sources,
+            )
+            with _FTE_REGISTRY_LOCK:
+                if fte_registry_query_is_closing(query_id) or _FTE_FRAGMENT_EXECUTIONS.get(key) is not existing:
+                    raise RuntimeError(
+                        f"FTE fragment registry changed while merging metadata: {query_id}/{fragment_id}"
+                    )
+                self._fte_fragment_executions[key] = existing
+            return existing
+
         with _FTE_REGISTRY_LOCK:
             if fte_registry_query_is_closing(query_id):
                 raise RuntimeError(f"FTE query registry is closing: {query_id}")
             _FTE_SCHEDULERS.get_or_create(query_id)
             existing = _FTE_FRAGMENT_EXECUTIONS.get(key)
-            if existing is not None:
-                if not existing.task_context_info and item.get("task_context_info"):
-                    existing.task_context_info = dict(item["task_context_info"])
-                if item.get("exchange_sink_instance") is not None:
-                    existing.task_context_info["exchange_sink_instance"] = item.get("exchange_sink_instance")
-                existing.source_node_ids.update(dynamic_scan_sources)
-                existing.source_node_ids.update(dynamic_exchange_sources)
-                existing.dynamic_scan_source_node_ids.update(dynamic_scan_sources)
-                existing.dynamic_exchange_source_node_ids.update(dynamic_exchange_sources)
-                existing.context = _strip_fte_dynamic_context(
-                    existing.context,
-                    existing.dynamic_scan_source_node_ids,
-                    existing.dynamic_exchange_source_node_ids,
-                )
-                for partition in existing.partitions.values():
-                    partition.descriptor.source_node_ids.update(dynamic_scan_sources)
-                    partition.descriptor.source_node_ids.update(dynamic_exchange_sources)
-                    partition.descriptor.dynamic_scan_source_node_ids.update(dynamic_scan_sources)
-                    partition.descriptor.dynamic_exchange_source_node_ids.update(dynamic_exchange_sources)
-                    partition.descriptor.context = _strip_fte_dynamic_context(
-                        partition.descriptor.context,
-                        partition.descriptor.dynamic_scan_source_node_ids,
-                        partition.descriptor.dynamic_exchange_source_node_ids,
-                    )
-                    if not partition.descriptor.task_context_info and item.get("task_context_info"):
-                        partition.descriptor.task_context_info = dict(item["task_context_info"])
-                    if (
-                        partition.descriptor.exchange_sink_instance is None
-                        and item.get("exchange_sink_instance") is not None
-                    ):
-                        partition.descriptor.exchange_sink_instance = item.get("exchange_sink_instance")
-                self._fte_fragment_executions[key] = existing
-                return existing
+        if existing is not None:
+            return merge_existing(existing)
 
         fragment_execution_context = _strip_fte_dynamic_context(
             item.get("context"),
@@ -299,6 +285,11 @@ class FteWorkerSubmissionMixin:
         def request_worker_reservation(partition: Any) -> bool:
             fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get((query_id, fragment_id))
             if fragment_execution is None:
+                release_fte_partition_submission(
+                    query_id,
+                    fragment_id,
+                    partition.task_id.partition_id,
+                )
                 return False
             return self._request_fte_worker_reservation_for_partition(
                 query_id,
@@ -315,6 +306,11 @@ class FteWorkerSubmissionMixin:
             execution_class_transition_callback=apply_execution_class_transitions,
             execution_admission_callback=admit_execution,
             attempt_admission_callback=admit_attempt,
+            attempt_admission_abandon_callback=lambda partition: release_fte_partition_submission(
+                query_id,
+                fragment_id,
+                partition.task_id.partition_id,
+            ),
             worker_reservation_callback=request_worker_reservation,
             context=fragment_execution_context,
             fragment_plan=item.get("fragment_plan"),
@@ -340,9 +336,12 @@ class FteWorkerSubmissionMixin:
                 raise RuntimeError(f"FTE query registry is closing: {query_id}")
             existing = _FTE_FRAGMENT_EXECUTIONS.get(key)
             if existing is not None:
-                self._fte_fragment_executions[key] = existing
-                return existing
-            _FTE_FRAGMENT_EXECUTIONS[key] = fragment_execution
+                registered = existing
+            else:
+                _FTE_FRAGMENT_EXECUTIONS[key] = fragment_execution
+                registered = fragment_execution
+        if registered is not fragment_execution:
+            return merge_existing(registered)
         self._fte_fragment_executions[key] = fragment_execution
         return fragment_execution
 

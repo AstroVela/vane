@@ -25,7 +25,7 @@ def pending_fte_worker_reservation_partition(future: Any) -> tuple[Any | None, A
         fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get((future.query_id, future.fragment_id))
     if fragment_execution is None:
         return None, None
-    return fragment_execution, fragment_execution.partitions.get(future.partition_id)
+    return fragment_execution, fragment_execution.get_partition(future.partition_id)
 
 
 def pending_fte_worker_reservation_future(
@@ -43,12 +43,13 @@ def cancel_fte_worker_reservation_future(
     *,
     allow_next_submission: bool = True,
 ) -> None:
+    key = future.key
     with _FTE_REGISTRY_LOCK:
-        if _FTE_PENDING_WORKER_RESERVATIONS.get(future.key) is future:
-            _FTE_PENDING_WORKER_RESERVATIONS.pop(future.key, None)
-    release_fte_partition_task_waiter(future.key)
+        if _FTE_PENDING_WORKER_RESERVATIONS.get(key) is future:
+            _FTE_PENDING_WORKER_RESERVATIONS.pop(key, None)
+    release_fte_partition_task_waiter(key)
     release_fte_partition_submission(
-        *future.key,
+        *key,
         allow_next=allow_next_submission,
     )
     future.cancel()
