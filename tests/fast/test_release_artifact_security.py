@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import io
 import secrets
 import string
@@ -93,6 +94,29 @@ def test_default_configuration_has_production_content_rules():
     )
 
 
+def test_credential_rule_uses_memory_hard_fingerprint(monkeypatch):
+    sentinel = _runtime_sentinel()
+    rule_id = "runtime-sensitive-content"
+    calls: list[tuple[str, bytes]] = []
+
+    def memory_hard_fingerprint(candidate_rule_id: str, value: bytes) -> bytes:
+        calls.append((candidate_rule_id, value))
+        return hashlib.sha256(b"test-kdf\0" + candidate_rule_id.encode() + b"\0" + value).digest()
+
+    monkeypatch.setattr(
+        check_release_artifacts,
+        "_memory_hard_fingerprint",
+        memory_hard_fingerprint,
+    )
+
+    rule = check_release_artifacts.CredentialFingerprintRule.from_value(rule_id, sentinel)
+    assert calls == [(rule_id, sentinel)]
+
+    calls.clear()
+    assert rule.matches(b"prefix-" + sentinel + b"-suffix")
+    assert calls == [(rule_id, sentinel)]
+
+
 @pytest.mark.parametrize(
     ("rule_type", "sentinel_factory"),
     [
@@ -113,6 +137,47 @@ def test_rule_strategies_match_runtime_values(rule_type, sentinel_factory):
         pytest.fail("runtime rule did not detect its generated value", pytrace=False)
     if rule.matches(b"clean artifact content"):
         pytest.fail("runtime rule rejected clean content", pytrace=False)
+
+
+def test_path_rule_prefilters_candidate_rich_clean_content(monkeypatch):
+    sentinel = _runtime_path()
+    rule = check_release_artifacts.PosixPathFingerprintRule.from_value(
+        "runtime-sensitive-content",
+        sentinel,
+    )
+    sentinel_tag = hashlib.sha256(sentinel).digest()[: check_release_artifacts.CANDIDATE_TAG_BYTES]
+    candidates: list[bytes] = []
+    for index in range(1 << 16):
+        candidate = f"/{index:04x}/{index ^ 0xFFFF:04x}/".encode()
+        candidate_tag = hashlib.sha256(candidate).digest()[: check_release_artifacts.CANDIDATE_TAG_BYTES]
+        if candidate != sentinel and candidate_tag != sentinel_tag:
+            candidates.append(candidate)
+        if len(candidates) == 4096:
+            break
+    assert len(candidates) == 4096
+
+    kdf_candidates: list[bytes] = []
+
+    def memory_hard_fingerprint(_rule_id: str, value: bytes) -> bytes:
+        kdf_candidates.append(value)
+        return bytes(check_release_artifacts.FINGERPRINT_BYTES)
+
+    monkeypatch.setattr(
+        check_release_artifacts,
+        "_memory_hard_fingerprint",
+        memory_hard_fingerprint,
+    )
+
+    assert not rule.matches(b"\n".join(candidates))
+    assert kdf_candidates == []
+
+    monkeypatch.setattr(
+        check_release_artifacts,
+        "_candidate_tag",
+        lambda _value: rule.candidate_tag,
+    )
+    assert not rule.matches(candidates[0])
+    assert kdf_candidates == [candidates[0]]
 
 
 @pytest.mark.parametrize(

@@ -71,8 +71,9 @@ class ContentRule(Protocol):
 
 
 # Exact local matching is deterministic; scrypt raises the offline guessing cost
-# for low-entropy IP and path rules but does not replace rotation or history review.
+# for low-entropy rules but does not replace rotation or history review.
 FINGERPRINT_BYTES = hashlib.sha256().digest_size
+CANDIDATE_TAG_BYTES = 2
 SCRYPT_N = 1 << 14
 SCRYPT_R = 8
 SCRYPT_P = 1
@@ -157,10 +158,16 @@ def _memory_hard_fingerprint(rule_id: str, value: bytes) -> bytes:
     )
 
 
+def _candidate_tag(value: bytes) -> bytes:
+    """Return a short scan prefilter; scrypt remains the authoritative check."""
+    return hashlib.sha256(value).digest()[:CANDIDATE_TAG_BYTES]
+
+
 @dataclass(frozen=True)
 class _FingerprintRule:
     rule_id: str
     fingerprint: bytes
+    candidate_tag: bytes
     length: int
 
     def __post_init__(self) -> None:
@@ -170,21 +177,36 @@ class _FingerprintRule:
             raise ValueError("content rule length must be positive")
         if len(self.fingerprint) != FINGERPRINT_BYTES:
             raise ValueError(f"content rule fingerprint must be {FINGERPRINT_BYTES} bytes")
+        if len(self.candidate_tag) != CANDIDATE_TAG_BYTES:
+            raise ValueError(f"content rule candidate tag must be {CANDIDATE_TAG_BYTES} bytes")
+
+    def _matches_candidate(self, value: bytes) -> bool:
+        if not hmac.compare_digest(_candidate_tag(value), self.candidate_tag):
+            return False
+        return hmac.compare_digest(
+            _memory_hard_fingerprint(self.rule_id, value),
+            self.fingerprint,
+        )
 
 
 @dataclass(frozen=True)
 class CredentialFingerprintRule(_FingerprintRule):
-    """Match printable credential-shaped windows by SHA-256 fingerprint."""
+    """Match printable credential-shaped windows by memory-hard fingerprint."""
 
     @classmethod
     def from_value(cls, rule_id: str, value: bytes) -> CredentialFingerprintRule:
         if not _is_credential_shaped(value):
             raise ValueError("credential fingerprint rule requires a credential-shaped value")
-        return cls(rule_id=rule_id, fingerprint=hashlib.sha256(value).digest(), length=len(value))
+        return cls(
+            rule_id=rule_id,
+            fingerprint=_memory_hard_fingerprint(rule_id, value),
+            candidate_tag=_candidate_tag(value),
+            length=len(value),
+        )
 
     def matches(self, data: bytes) -> bool:
         for candidate in _credential_candidate_pattern(self.length).finditer(data):
-            if hmac.compare_digest(hashlib.sha256(candidate.group(1)).digest(), self.fingerprint):
+            if self._matches_candidate(candidate.group(1)):
                 return True
         return False
 
@@ -200,16 +222,14 @@ class IPv4FingerprintRule(_FingerprintRule):
         return cls(
             rule_id=rule_id,
             fingerprint=_memory_hard_fingerprint(rule_id, value),
+            candidate_tag=_candidate_tag(value),
             length=len(value),
         )
 
     def matches(self, data: bytes) -> bool:
         for match in _ipv4_candidate_pattern(self.length).finditer(data):
             candidate = match.group(1)
-            if _is_ipv4(candidate) and hmac.compare_digest(
-                _memory_hard_fingerprint(self.rule_id, candidate),
-                self.fingerprint,
-            ):
+            if _is_ipv4(candidate) and self._matches_candidate(candidate):
                 return True
         return False
 
@@ -227,6 +247,7 @@ class PosixPathFingerprintRule(_FingerprintRule):
         return cls(
             rule_id=rule_id,
             fingerprint=_memory_hard_fingerprint(rule_id, value),
+            candidate_tag=_candidate_tag(value),
             length=len(value),
             part_lengths=part_lengths,
             trailing_slash=trailing_slash,
@@ -243,10 +264,7 @@ class PosixPathFingerprintRule(_FingerprintRule):
     def matches(self, data: bytes) -> bool:
         pattern = _posix_path_candidate_pattern(self.part_lengths, self.trailing_slash)
         for match in pattern.finditer(data):
-            if hmac.compare_digest(
-                _memory_hard_fingerprint(self.rule_id, match.group(1)),
-                self.fingerprint,
-            ):
+            if self._matches_candidate(match.group(1)):
                 return True
         return False
 
@@ -261,11 +279,13 @@ CONTENT_RULES: tuple[ContentRule, ...] = (
     IPv4FingerprintRule(
         rule_id="release-internal-ip",
         fingerprint=bytes.fromhex("ea0958373ff59a2b35ce264fda1b50cf0f9fed173878bbff134729f6338c9edd"),
+        candidate_tag=bytes.fromhex("7628"),
         length=12,
     ),
     CredentialFingerprintRule(
         rule_id="release-credential",
-        fingerprint=bytes.fromhex("805bd951772627f3d1a607084df1727c6caad60447c5d73febf7be2d2fe17fd8"),
+        fingerprint=bytes.fromhex("e950be9f297db2c9f6d3a4878256321972b47bcb0540fbb6b66610b339c35fbe"),
+        candidate_tag=bytes.fromhex("805b"),
         length=14,
     ),
 )
@@ -273,6 +293,7 @@ TEXT_CONTENT_RULES: tuple[ContentRule, ...] = (
     PosixPathFingerprintRule(
         rule_id="release-local-path",
         fingerprint=bytes.fromhex("ba09f8cff6db233c4dd270f695d4c75dc9afd939826d017c3ffe27aaaa11be5f"),
+        candidate_tag=bytes.fromhex("146b"),
         length=11,
         part_lengths=(4, 4),
         trailing_slash=True,
