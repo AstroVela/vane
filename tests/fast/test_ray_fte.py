@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -492,6 +493,35 @@ def test_fte_write_sink_updates_registered_stage_state_instead_of_registering_an
         assert manager.snapshot()["stages"][stage_id]["runnable"] is True
         assert fragment_id == f"{query_id}:node:sink"
     finally:
+        _cleanup_fte_query(query_id)
+
+
+def test_fte_write_sink_stage_snapshot_owns_fragment_state_lock():
+    query_id = "q-write-sink-stage-lock"
+    clear_query_resource_managers()
+    _manager, _stage_id = _register_fte_query(query_id, "sink", partitions=1, task_slots=1)
+    stage, _fragment_id = _install_fte_fragment(
+        query_id,
+        "sink",
+        partitions=1,
+        context={
+            "node_id": "sink",
+            "copy_output_base": "",
+            "copy_output_run_id": "run-write-lock",
+            "copy_output_remote_base": "/tmp/out-lock.parquet",
+        },
+    )
+
+    class _LockCheckingPartitions(dict):
+        def values(self):
+            assert stage._state_lock_owned_by_current_thread()
+            return super().values()
+
+    stage.partitions = _LockCheckingPartitions(stage.partitions)
+    try:
+        fte_fragment_scheduler._sync_write_sink_stage_for_fragment(stage)
+    finally:
+        stage.partitions = dict(stage.partitions)
         _cleanup_fte_query(query_id)
 
 
@@ -1712,10 +1742,7 @@ class _FakeLiveWorker:
     def record_fte_task_started(self, _attempt_id, _request):
         return None
 
-    def record_fte_splits_added(self, _attempt_id, _split_count):
-        return None
-
-    def record_fte_split_bytes_added(self, _attempt_id, _split_bytes):
+    def record_fte_splits_added(self, _attempt_id, _split_count, *, split_bytes=None):
         return None
 
     def record_fte_task_terminal(self, _attempt_id):
@@ -1803,6 +1830,64 @@ def test_fte_worker_command_outbox_pop_owns_attempt_scheduling_lock():
     assert acquired_during_copy is False
     assert popped == ["first"]
     assert stage._worker_command_outbox == []
+
+
+def test_fte_add_partition_owns_state_lock_and_is_idempotent_under_concurrency():
+    class _LockCheckingExchange:
+        def __init__(self):
+            self.stage = None
+            self.created_sink_count = 0
+
+        def add_sink(self, partition_id):
+            assert self.stage is not None
+            assert self.stage._state_lock_owned_by_current_thread()
+            assert partition_id == 0
+            self.created_sink_count += 1
+            return object()
+
+    exchange = _LockCheckingExchange()
+    stage = FteFragmentExecution(
+        "query-concurrent-add",
+        0,
+        fragment_id="query-concurrent-add:node:1",
+        exchange=exchange,
+        task_memory_bytes=1,
+    )
+    exchange.stage = stage
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        partitions = list(executor.map(stage.add_partition, [0] * 8))
+
+    assert len({id(partition) for partition in partitions}) == 1
+    assert stage.partitions == {0: partitions[0]}
+    assert exchange.created_sink_count == 1
+
+
+def test_fte_start_attempt_with_worker_owns_mutation_locks():
+    worker = _FakeLiveWorker("worker-lock-contract")
+    lock_ownership = {}
+    stage = None
+
+    def select_worker(_partition):
+        assert stage is not None
+        lock_ownership["scheduling"] = stage._attempt_scheduling_lock_owned_by_current_thread()
+        lock_ownership["state"] = stage._state_lock_owned_by_current_thread()
+        return worker
+
+    stage = FteFragmentExecution(
+        "query-start-lock-contract",
+        0,
+        fragment_id="query-start-lock-contract:node:1",
+        worker_selector=select_worker,
+        task_memory_bytes=1,
+    )
+    partition = stage.add_partition(0)
+
+    scheduled = stage.start_attempt_with_worker(partition)
+
+    assert lock_ownership == {"scheduling": True, "state": True}
+    assert scheduled.worker_id == worker.worker_id
+    assert partition.running_attempt is not None
 
 
 def test_fte_two_query_fragment_callbacks_do_not_cross_state_locks():
@@ -1940,6 +2025,40 @@ def test_fte_worker_command_executor_requires_single_ordered_enqueue_protocol():
 
     with pytest.raises(RuntimeError, match="enqueue_fte_add_splits"):
         FteWorkerCommandExecutor().execute(command)
+
+
+def test_fte_add_splits_command_success_accounts_count_and_bytes_atomically():
+    class _Worker:
+        def __init__(self):
+            self.calls = []
+
+        def record_fte_splits_added(self, attempt_id, split_count, *, split_bytes=None):
+            self.calls.append((str(FteTaskAttemptId.coerce(attempt_id)), split_count, split_bytes))
+
+        def record_fte_split_bytes_added(self, *_args, **_kwargs):
+            raise AssertionError("split bytes must be accounted with the split batch")
+
+    worker = _Worker()
+    attempt_id = FteTaskAttemptId(FteTaskId("q", 0, 1), 0)
+    command = FteAddSplitsCommand(
+        query_id="q",
+        fragment_id="q:node:scan",
+        worker_id="worker-a",
+        worker=worker,
+        attempt_id=attempt_id,
+        source_node_id="7",
+        splits=(
+            {"sequence_id": 1, "kind": "scan_task", "size_bytes": 7},
+            {"sequence_id": 2, "kind": "scan_task", "size_bytes": 11},
+        ),
+    )
+    stage = _fte_fragment_execution("q", 0, fragment_id="q:node:scan")
+
+    stage.handle_worker_command_success(command)
+
+    assert len(worker.calls) == 1
+    assert worker.calls[0][:2] == (str(attempt_id), 2)
+    assert worker.calls[0][2] > 0
 
 
 def test_fte_fragment_execution_requires_fragment_registration_protocol():

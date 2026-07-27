@@ -5,7 +5,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from duckdb.runners.ray.fragment_registry import _FTE_WORKER_HANDLES
+from duckdb.runners.ray.fragment_registry import (
+    _FTE_REGISTRY_LOCK,
+    _FTE_WORKER_HANDLES,
+)
 from duckdb.runners.ray.fte_fragment_scheduler import (
     _filter_workers_for_node_requirements,
     _fte_worker_has_memory_capacity,
@@ -25,16 +28,18 @@ def available_fte_workers(
     exclude: set[str] | None = None,
 ) -> list[Any]:
     exclude = exclude or set()
-    workers = [
-        handle
-        for worker_id, handle in sorted(_FTE_WORKER_HANDLES.items())
-        if handle is not None and str(worker_id) not in exclude and handle._fte_healthy
-    ]
-    if (
-        current_worker not in workers
-        and (not current_worker_id or str(current_worker_id) not in exclude)
-        and current_worker._fte_healthy
-    ):
+    with _FTE_REGISTRY_LOCK:
+        workers = [
+            handle
+            for worker_id, handle in sorted(_FTE_WORKER_HANDLES.items())
+            if handle is not None and str(worker_id) not in exclude and handle._fte_healthy
+        ]
+        include_current_worker = (
+            current_worker not in workers
+            and (not current_worker_id or str(current_worker_id) not in exclude)
+            and current_worker._fte_healthy
+        )
+    if include_current_worker:
         workers.append(current_worker)
     return workers
 

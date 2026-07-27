@@ -14,8 +14,12 @@ import duckdb
 
 ray = pytest.importorskip("ray")
 
+import duckdb.runners.ray.fragment_worker_commands as worker_commands_mod
+import duckdb.runners.ray.fragment_worker_placement as worker_placement_mod
+import duckdb.runners.ray.fragment_worker_selection as worker_selection_mod
 import duckdb.runners.ray.fragment_worker_submission as fragment_submission_mod
 import duckdb.runners.ray.fragment_worker_task_control as task_control_mod
+import duckdb.runners.ray.fte_fragment_scheduler as fte_fragment_scheduler_mod
 import duckdb.runners.ray.worker as worker_mod
 import duckdb.runners.ray.worker_handle as worker_handle_mod
 from duckdb.runners.common import QueryDeadlineExceeded
@@ -30,7 +34,12 @@ from duckdb.runners.ray.fte import (
     NodeRequirements,
     PartitionInfo,
 )
-from duckdb.runners.ray.fte_events import TaskStatusChanged, WorkerReservationCompleted
+from duckdb.runners.ray.fte_events import (
+    FteAddSplitsCommand,
+    FteCreateTaskCommand,
+    TaskStatusChanged,
+    WorkerReservationCompleted,
+)
 from duckdb.runners.ray.query_execution_graph import (
     NodeResourceAllocation,
     QueryAllocation,
@@ -2055,6 +2064,15 @@ def test_fte_drop_query_clears_fte_registry_and_worker_pressure(monkeypatch):
             )
         ]
     )
+    handle0.record_fte_task_terminal(
+        {
+            "query_id": "query-drop",
+            "fragment_execution_id": 99,
+            "partition_id": 0,
+            "attempt_id": 0,
+        },
+        drain=False,
+    )
 
     before = handle0.fte_registry_stats()
     assert before["fragment_execution_count"] == 2
@@ -2070,6 +2088,7 @@ def test_fte_drop_query_clears_fte_registry_and_worker_pressure(monkeypatch):
         "FteCreateTaskCommand": 1,
     }
     assert sum(worker["running_attempt_count"] for worker in before["workers"].values()) == 2
+    assert sum(worker["terminal_attempt_count"] for worker in before["workers"].values()) == 1
 
     assert handle0.fte_drop_query("query-drop") == {
         "tasks_removed": 1,
@@ -2088,6 +2107,7 @@ def test_fte_drop_query_clears_fte_registry_and_worker_pressure(monkeypatch):
         "FteCreateTaskCommand": 1,
     }
     assert sum(worker["running_attempt_count"] for worker in after["workers"].values()) == 1
+    assert sum(worker["terminal_attempt_count"] for worker in after["workers"].values()) == 0
     assert all(
         "query-drop" not in attempt
         for worker in (handle0, handle1)
@@ -2739,6 +2759,883 @@ def test_fte_owner_selection_uses_worker_split_pressure(monkeypatch):
     assert handle0.fte_pressure_stats()["assigned_split_bytes"] == len(b"p0")
     assert handle1.fte_pressure_stats()["assigned_split_bytes"] == len(b"p1")
     assert handle0.fte_registry_stats()["partition_owner_count"] == 2
+
+
+def test_fte_terminal_pressure_rejects_late_attempt_updates():
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-terminal-pressure",
+    )
+    attempt = {
+        "query_id": "query-terminal-pressure",
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+    }
+    request = {
+        "execution_class": "standard",
+        "initial_splits": {},
+        "memory_requirement_bytes": 64,
+    }
+
+    assert handle.record_fte_task_started(attempt, request) is True
+    assert handle.record_fte_splits_added(attempt, 1, split_bytes=16) is True
+    handle.record_fte_task_terminal(attempt, drain=False)
+
+    assert handle.record_fte_task_started(attempt, request) is False
+    assert handle.record_fte_splits_added(attempt, 1, split_bytes=128) is False
+    assert handle.record_fte_split_bytes_added(attempt, 256) is False
+    stats = handle.fte_pressure_stats()
+    assert stats["running_attempt_count"] == 0
+    assert stats["assigned_split_count"] == 0
+    assert stats["assigned_split_bytes"] == 0
+    assert stats["assigned_memory_bytes"] == 0
+    assert stats["score"] == 0
+
+
+def test_fte_split_ack_before_create_ack_is_merged_into_running_pressure(monkeypatch):
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-create-add-ack-order",
+    )
+    query_id = "query-create-add-ack-order"
+    fragment_id = f"{query_id}:node:7"
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=fragment_id,
+        task_memory_bytes=64,
+    )
+    partition = stage.add_partition(0)
+    scheduled = partition.start_attempt(
+        worker_id=handle.worker_id,
+        remote_handle=handle,
+    )
+    request = {
+        **scheduled.request,
+        "initial_splits": {
+            "7": ({"sequence_id": 0, "kind": "scan_task", "data": b"base"},),
+        },
+    }
+    handle.reserve_fte_partition(
+        query_id,
+        fragment_id,
+        0,
+        memory_requirement_bytes=64,
+        execution_class="standard",
+    )
+    create_command = FteCreateTaskCommand(
+        query_id=query_id,
+        fragment_id=fragment_id,
+        worker_id=handle.worker_id,
+        worker=handle,
+        attempt_id=scheduled.attempt_id,
+        partition_id=0,
+        request=request,
+    )
+    add_command = FteAddSplitsCommand(
+        query_id=query_id,
+        fragment_id=fragment_id,
+        worker_id=handle.worker_id,
+        worker=handle,
+        attempt_id=scheduled.attempt_id,
+        source_node_id="7",
+        splits=(
+            {"sequence_id": 1, "kind": "scan_task", "data": b"a"},
+            {"sequence_id": 2, "kind": "scan_task", "data": b"bc"},
+        ),
+    )
+    create_rpc_completed = threading.Event()
+    release_create_ack = threading.Event()
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create(query_id)
+
+    def execute(command):
+        if isinstance(command, FteCreateTaskCommand):
+            create_rpc_completed.set()
+            assert release_create_ack.wait(2.0)
+        else:
+            assert create_rpc_completed.wait(2.0)
+
+    monkeypatch.setattr(scheduler.worker_command_executor, "execute", execute)
+    monkeypatch.setattr(
+        worker_commands_mod,
+        "fte_partition_task_lease_payload",
+        lambda *_args, **_kwargs: {},
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        create_ack = executor.submit(
+            handle._execute_fte_fragment_execution_worker_commands,
+            stage,
+            [create_command],
+        )
+        assert create_rpc_completed.wait(2.0)
+        add_ack = executor.submit(
+            handle._execute_fte_fragment_execution_worker_commands,
+            stage,
+            [add_command],
+        )
+        add_ack.result(timeout=2.0)
+
+        attempt_key = str(scheduled.attempt_id)
+        assert handle._fte_pressure.pending_split_counts_by_attempt == {attempt_key: 2}
+        pending_split_bytes = handle._fte_pressure.pending_split_bytes_by_attempt[attempt_key]
+        assert pending_split_bytes > 0
+        assert handle.fte_pressure_stats()["running_attempt_count"] == 0
+
+        release_create_ack.set()
+        create_ack.result(timeout=2.0)
+
+    stats = handle.fte_pressure_stats()
+    assert stats["running_attempt_count"] == 1
+    assert stats["reserved_partition_count"] == 0
+    assert stats["assigned_split_count"] == 3
+    assert stats["assigned_split_bytes"] == 4 + pending_split_bytes
+    assert stats["assigned_memory_bytes"] == 64
+    assert handle._fte_pressure.pending_split_counts_by_attempt == {}
+    assert handle._fte_pressure.pending_split_bytes_by_attempt == {}
+
+
+def test_fte_terminal_pressure_compacts_retry_tombstones_by_task():
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-terminal-pressure-compaction",
+    )
+    task = {
+        "query_id": "query-terminal-pressure-compaction",
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+    }
+    request = {
+        "execution_class": "standard",
+        "initial_splits": {},
+        "memory_requirement_bytes": 64,
+    }
+
+    for attempt_id in range(10_000):
+        handle.record_fte_task_terminal(
+            {**task, "attempt_id": attempt_id},
+            drain=False,
+        )
+
+    task_key = "query-terminal-pressure-compaction.0.0"
+    assert handle._fte_pressure.terminal_attempt_id_by_task == {task_key: 9_999}
+    assert handle.fte_pressure_stats()["terminal_attempt_count"] == 1
+    assert handle.record_fte_task_started({**task, "attempt_id": 9_999}, request) is False
+    assert handle.record_fte_splits_added({**task, "attempt_id": 9_999}, 1) is False
+    assert handle.record_fte_task_started({**task, "attempt_id": 10_000}, request) is True
+
+
+def test_fte_late_ack_for_terminal_attempt_does_not_touch_retry_pressure():
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-retry-pressure",
+    )
+    old_attempt = {
+        "query_id": "query-retry-pressure",
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+    }
+    retry_attempt = {
+        **old_attempt,
+        "attempt_id": 1,
+    }
+    request = {
+        "execution_class": "standard",
+        "initial_splits": {},
+        "memory_requirement_bytes": 64,
+    }
+
+    assert handle.record_fte_task_started(old_attempt, request) is True
+    handle.record_fte_task_terminal(old_attempt, drain=False)
+    assert handle.record_fte_task_started(retry_attempt, request) is True
+    assert handle.record_fte_splits_added(retry_attempt, 2, split_bytes=32) is True
+
+    assert handle.record_fte_splits_added(old_attempt, 10, split_bytes=1024) is False
+    stats = handle.fte_pressure_stats()
+    assert stats["running_attempt_count"] == 1
+    assert stats["assigned_split_count"] == 2
+    assert stats["assigned_split_bytes"] == 32
+    assert stats["assigned_memory_bytes"] == 64
+
+
+def test_fte_late_create_ack_does_not_clear_retry_reservation():
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-retry-reservation",
+    )
+    query_id = "query-retry-reservation"
+    fragment_id = f"{query_id}:node:7"
+    old_attempt = {
+        "query_id": query_id,
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+    }
+    request = {
+        "execution_class": "standard",
+        "initial_splits": {},
+        "memory_requirement_bytes": 128,
+    }
+
+    assert handle.record_fte_task_started(old_attempt, request) is True
+    handle.record_fte_task_terminal(old_attempt, drain=False)
+    handle.reserve_fte_partition(
+        query_id,
+        fragment_id,
+        0,
+        memory_requirement_bytes=128,
+        execution_class="standard",
+    )
+
+    assert (
+        handle.record_fte_task_started_from_reservation(
+            query_id,
+            fragment_id,
+            0,
+            old_attempt,
+            request,
+        )
+        is False
+    )
+    stats = handle.fte_pressure_stats()
+    assert stats["running_attempt_count"] == 0
+    assert stats["terminal_attempt_count"] == 1
+    assert stats["reserved_partition_count"] == 1
+    assert stats["reserved_memory_bytes"] == 128
+    assert stats["score"] == 1024
+
+
+def test_fte_add_splits_ack_after_task_finish_does_not_revive_pressure():
+    rpc_started = threading.Event()
+    release_rpc = threading.Event()
+
+    class _BlockingFuture:
+        def __init__(self, value):
+            self.value = value
+
+        def result(self, timeout=None):
+            assert release_rpc.wait(timeout)
+            return self.value
+
+    class _BlockingObjectRef:
+        def __init__(self, value):
+            self._future = _BlockingFuture(value)
+
+        def future(self):
+            return self._future
+
+    class _BlockingAddSplits:
+        def remote(self, task_id, source_node_id, splits, dependency=None):
+            rpc_started.set()
+            return _BlockingObjectRef(
+                _FakeActor._control_status(
+                    "fte_add_splits",
+                    task_id,
+                    version=2,
+                )
+            )
+
+    query_id = "query-late-add-splits-ack"
+    fragment_id = f"{query_id}:node:7"
+    actor = _FakeActor()
+    actor.fte_add_splits = _BlockingAddSplits()
+    handle = RayWorkerActorHandle(
+        actor,
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-late-add-splits-ack",
+    )
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=fragment_id,
+        task_memory_bytes=64,
+    )
+
+    finished_partition = stage.add_partition(0)
+    finished_attempt = finished_partition.start_attempt(
+        worker_id=handle.worker_id,
+        remote_handle=handle,
+    )
+    assert handle.record_fte_task_started(finished_attempt.attempt_id, finished_attempt.request) is True
+
+    retry_partition = stage.add_partition(1)
+    failed_attempt = retry_partition.start_attempt(
+        worker_id=handle.worker_id,
+        remote_handle=handle,
+    )
+    assert handle.record_fte_task_started(failed_attempt.attempt_id, failed_attempt.request) is True
+    assert stage.task_failed(failed_attempt.attempt_id, "retry", schedule_retry=False) is None
+    retry_attempt = retry_partition.start_attempt(
+        worker_id=handle.worker_id,
+        remote_handle=handle,
+    )
+    assert retry_attempt.attempt_id.attempt_id == 1
+    assert handle.record_fte_task_started(retry_attempt.attempt_id, retry_attempt.request) is True
+    assert handle.record_fte_splits_added(retry_attempt.attempt_id, 2, split_bytes=32) is True
+
+    command = FteAddSplitsCommand(
+        query_id=query_id,
+        fragment_id=fragment_id,
+        worker_id=handle.worker_id,
+        worker=handle,
+        attempt_id=finished_attempt.attempt_id,
+        source_node_id="7",
+        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"late"},),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        command_execution = executor.submit(
+            handle._execute_fte_fragment_execution_worker_commands,
+            stage,
+            [command],
+        )
+        try:
+            assert rpc_started.wait(2.0)
+            assert stage.task_finished(finished_attempt.attempt_id) is True
+
+            before_ack = handle.fte_pressure_stats()
+            assert before_ack["running_attempt_count"] == 1
+            assert before_ack["terminal_attempt_count"] == 2
+            assert before_ack["assigned_split_count"] == 2
+            assert before_ack["assigned_split_bytes"] == 32
+            assert before_ack["assigned_memory_bytes"] == 64
+        finally:
+            release_rpc.set()
+        command_execution.result(timeout=2.0)
+
+    after_ack = handle.fte_pressure_stats()
+    assert after_ack["running_attempt_count"] == 1
+    assert after_ack["terminal_attempt_count"] == 2
+    assert after_ack["assigned_split_count"] == 2
+    assert after_ack["assigned_split_bytes"] == 32
+    assert after_ack["assigned_memory_bytes"] == 64
+    assert handle._fte_pressure.running_attempts == {str(retry_attempt.attempt_id)}
+
+
+def test_fte_pressure_drop_query_serializes_with_other_query_start():
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-drop-pressure-race",
+    )
+    query_a_attempt = {
+        "query_id": "query-drop-pressure-a",
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+    }
+    query_b_attempt = {
+        "query_id": "query-drop-pressure-b",
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+    }
+    request = {
+        "execution_class": "standard",
+        "initial_splits": {},
+        "memory_requirement_bytes": 64,
+    }
+    assert handle.record_fte_task_started(query_a_attempt, request) is True
+
+    drop_iteration_started = threading.Event()
+    query_b_start_entered = threading.Event()
+
+    class _BlockingAttemptSet(set):
+        def __iter__(self):
+            snapshot = tuple(set.__iter__(self))
+            drop_iteration_started.set()
+            assert query_b_start_entered.wait(2.0)
+            return iter(snapshot)
+
+    handle._fte_pressure.running_attempts = _BlockingAttemptSet(handle._fte_pressure.running_attempts)
+
+    def start_query_b():
+        query_b_start_entered.set()
+        return handle.record_fte_task_started(query_b_attempt, request)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        dropped = executor.submit(handle._fte_pressure.drop_query, "query-drop-pressure-a")
+        assert drop_iteration_started.wait(2.0)
+        started = executor.submit(start_query_b)
+        dropped.result(timeout=2.0)
+        assert started.result(timeout=2.0) is True
+
+    stats = handle.fte_pressure_stats()
+    assert stats["running_attempt_count"] == 1
+    assert stats["assigned_memory_bytes"] == 64
+    assert handle._fte_pressure.running_attempts == {str(FteTaskAttemptId.coerce(query_b_attempt))}
+
+
+def test_fte_existing_fragment_metadata_merge_serializes_with_partition_add(monkeypatch):
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-metadata-merge",
+    )
+    query_id = "query-metadata-merge"
+    fragment_id = f"{query_id}:node:7"
+    key = (query_id, fragment_id)
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=fragment_id,
+        context={"scan_task_nodes": "7,8"},
+        task_memory_bytes=64,
+    )
+    first = stage.add_partition(0)
+    merge_iteration_started = threading.Event()
+    add_entered = threading.Event()
+
+    class _LockCheckingPartitions(dict):
+        def values(self):
+            assert stage._state_lock_owned_by_current_thread()
+            is_registry_lock_owned = getattr(fragment_submission_mod._FTE_REGISTRY_LOCK, "_is_owned", None)
+            assert callable(is_registry_lock_owned) and not is_registry_lock_owned()
+            merge_iteration_started.set()
+            assert add_entered.wait(2.0)
+            return super().values()
+
+    stage.partitions = _LockCheckingPartitions(stage.partitions)
+    monkeypatch.setitem(fragment_submission_mod._FTE_FRAGMENT_EXECUTIONS, key, stage)
+
+    def merge_metadata():
+        return handle._get_or_create_fte_fragment_execution(
+            {
+                "query_id": query_id,
+                "fragment_id": fragment_id,
+                "task_context_info": {"metadata": "merged"},
+                "exchange_sink_instance": {"sink": "merged"},
+            },
+            dynamic_scan_sources={"7"},
+            dynamic_exchange_sources={"8"},
+        )
+
+    def add_partition():
+        add_entered.set()
+        return stage.add_partition(1)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        merged = executor.submit(merge_metadata)
+        assert merge_iteration_started.wait(2.0)
+        added = executor.submit(add_partition)
+        assert merged.result(timeout=2.0) is stage
+        second = added.result(timeout=2.0)
+
+    assert first.descriptor.source_node_ids == {"7", "8"}
+    assert second.descriptor.source_node_ids == {"7", "8"}
+    assert second.descriptor.task_context_info == {
+        "metadata": "merged",
+        "exchange_sink_instance": {"sink": "merged"},
+    }
+    assert second.descriptor.exchange_sink_instance == {"sink": "merged"}
+
+
+def test_available_fte_workers_snapshots_registry_before_concurrent_removal(monkeypatch):
+    iteration_started = threading.Event()
+    removal_started = threading.Event()
+
+    class _Worker:
+        _fte_healthy = True
+
+        def __init__(self, worker_id):
+            self.worker_id = worker_id
+
+    class _LockCheckingRegistry(dict):
+        def items(self):
+            is_owned = getattr(worker_selection_mod._FTE_REGISTRY_LOCK, "_is_owned", None)
+            assert callable(is_owned) and is_owned()
+            iteration_started.set()
+            assert removal_started.wait(2.0)
+            return super().items()
+
+    worker_a = _Worker("worker-a")
+    worker_b = _Worker("worker-b")
+    registry = _LockCheckingRegistry({"worker-a": worker_a, "worker-b": worker_b})
+    monkeypatch.setattr(worker_selection_mod, "_FTE_WORKER_HANDLES", registry)
+
+    def remove_worker():
+        removal_started.set()
+        with worker_selection_mod._FTE_REGISTRY_LOCK:
+            registry.pop("worker-b")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        snapshot = executor.submit(
+            worker_selection_mod.available_fte_workers,
+            worker_a,
+            worker_a.worker_id,
+        )
+        assert iteration_started.wait(2.0)
+        removal = executor.submit(remove_worker)
+        workers = snapshot.result(timeout=2.0)
+        removal.result(timeout=2.0)
+
+    assert workers == [worker_a, worker_b]
+    assert registry == {"worker-a": worker_a}
+
+
+def test_fte_node_wait_placement_rechecks_terminal_partition_after_admission(monkeypatch):
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-placement-terminal",
+    )
+    query_id = "query-placement-terminal"
+    fragment_id = f"{query_id}:node:7"
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=fragment_id,
+        context={
+            "resource_query_id": query_id,
+            "resource_stage_id": f"stage:{query_id}:node:7:fte",
+        },
+        task_memory_bytes=64,
+    )
+    partition = stage.add_partition(0)
+    next_partition = stage.add_partition(1)
+    _register_test_query_graph(query_id, [fragment_id])
+    monkeypatch.setitem(
+        worker_handle_mod._FTE_FRAGMENT_EXECUTIONS,
+        (query_id, fragment_id),
+        stage,
+    )
+    admission_started = threading.Event()
+    terminal_committed = threading.Event()
+    reservation_calls = []
+
+    class _PlacementManager:
+        def acquire(self, **kwargs):
+            reservation_calls.append(kwargs)
+            return object()
+
+    handle._fte_worker_placement_manager = _PlacementManager()
+
+    real_admit = worker_placement_mod._admit_fte_partition_node_wait
+
+    def admit(*args, **kwargs):
+        admitted = real_admit(*args, **kwargs)
+        assert admitted is True
+        admission_started.set()
+        assert terminal_committed.wait(2.0)
+        return admitted
+
+    monkeypatch.setattr(worker_placement_mod, "_admit_fte_partition_node_wait", admit)
+
+    def finish_partition():
+        assert admission_started.wait(2.0)
+        with stage._state_lock:
+            partition.finished = True
+            partition._invalidate_placement()
+        terminal_committed.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        placement = executor.submit(
+            handle._try_reserve_fte_partition_for_node_wait,
+            query_id,
+            fragment_id,
+            partition,
+            fragment_execution=stage,
+        )
+        finished = executor.submit(finish_partition)
+        placement.result(timeout=2.0)
+        finished.result(timeout=2.0)
+
+    assert partition.finished is True
+    assert partition.node_wait_started_at is None
+    assert reservation_calls == []
+    assert fte_fragment_scheduler_mod.fte_submission_window_snapshot()["probes"] == {}
+    assert (
+        fte_fragment_scheduler_mod.admit_fte_partition_submission(
+            query_id,
+            fragment_id,
+            next_partition.task_id.partition_id,
+        )
+        is True
+    )
+    assert (
+        fte_fragment_scheduler_mod.release_fte_partition_submission(
+            query_id,
+            fragment_id,
+            next_partition.task_id.partition_id,
+        )
+        is True
+    )
+
+
+def test_fte_ready_attempt_releases_admission_when_partition_finishes_before_handoff(monkeypatch):
+    query_id = "query-ready-attempt-terminal"
+    fragment_id = f"{query_id}:node:7"
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=fragment_id,
+        context={
+            "resource_query_id": query_id,
+            "resource_stage_id": f"stage:{query_id}:node:7:fte",
+        },
+        task_memory_bytes=64,
+    )
+    partition = stage.add_partition(0)
+    next_partition = stage.add_partition(1)
+    with stage._state_lock:
+        partition.mark_ready_for_execution()
+    _register_test_query_graph(query_id, [fragment_id])
+    monkeypatch.setitem(
+        worker_handle_mod._FTE_FRAGMENT_EXECUTIONS,
+        (query_id, fragment_id),
+        stage,
+    )
+    admission_started = threading.Event()
+    terminal_committed = threading.Event()
+    reservation_calls = []
+
+    def admit(candidate):
+        admitted = fte_fragment_scheduler_mod._admit_fte_partition_node_wait(
+            query_id,
+            candidate,
+            stage,
+        )
+        assert admitted is True
+        admission_started.set()
+        assert terminal_committed.wait(2.0)
+        return admitted
+
+    stage.attempt_admission_callback = admit
+    stage.attempt_admission_abandon_callback = lambda candidate: (
+        fte_fragment_scheduler_mod.release_fte_partition_submission(
+            query_id,
+            fragment_id,
+            candidate.task_id.partition_id,
+        )
+    )
+    stage.worker_reservation_callback = lambda candidate: reservation_calls.append(candidate) or True
+
+    def finish_partition():
+        assert admission_started.wait(2.0)
+        with stage._state_lock:
+            partition.finished = True
+            partition._invalidate_placement()
+        terminal_committed.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        scheduled = executor.submit(stage.schedule_next_pending_partition)
+        finished = executor.submit(finish_partition)
+        assert scheduled.result(timeout=2.0) is None
+        finished.result(timeout=2.0)
+
+    assert reservation_calls == []
+    assert fte_fragment_scheduler_mod.fte_submission_window_snapshot()["probes"] == {}
+    assert (
+        fte_fragment_scheduler_mod.admit_fte_partition_submission(
+            query_id,
+            fragment_id,
+            next_partition.task_id.partition_id,
+        )
+        is True
+    )
+    assert (
+        fte_fragment_scheduler_mod.release_fte_partition_submission(
+            query_id,
+            fragment_id,
+            next_partition.task_id.partition_id,
+        )
+        is True
+    )
+
+
+def test_fte_async_reservation_releases_admission_for_terminal_partition(monkeypatch):
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-async-reservation-terminal",
+    )
+    query_id = "query-async-reservation-terminal"
+    fragment_id = f"{query_id}:node:7"
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=fragment_id,
+        context={
+            "resource_query_id": query_id,
+            "resource_stage_id": f"stage:{query_id}:node:7:fte",
+        },
+        task_memory_bytes=64,
+    )
+    partition = stage.add_partition(0)
+    _register_test_query_graph(query_id, [fragment_id])
+    monkeypatch.setitem(
+        worker_handle_mod._FTE_FRAGMENT_EXECUTIONS,
+        (query_id, fragment_id),
+        stage,
+    )
+    assert (
+        fte_fragment_scheduler_mod.admit_fte_partition_submission(
+            query_id,
+            fragment_id,
+            partition.task_id.partition_id,
+        )
+        is True
+    )
+    with stage._state_lock:
+        partition.finished = True
+        partition._invalidate_placement()
+
+    assert (
+        handle._request_fte_worker_reservation_for_partition(
+            query_id,
+            fragment_id,
+            stage,
+            partition,
+        )
+        is False
+    )
+    assert fte_fragment_scheduler_mod.fte_submission_window_snapshot()["probes"] == {}
+
+
+def test_fte_node_wait_placement_releases_reservation_when_partition_finishes_before_commit(monkeypatch):
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-placement-rollback",
+    )
+    query_id = "query-placement-rollback"
+    fragment_id = f"{query_id}:node:7"
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=fragment_id,
+        task_memory_bytes=64,
+    )
+    partition = stage.add_partition(0)
+    reservation_started = threading.Event()
+    terminal_committed = threading.Event()
+    releases = []
+
+    class _PlacementManager:
+        def acquire(self, **_kwargs):
+            reservation_started.set()
+            assert terminal_committed.wait(2.0)
+            return object()
+
+    handle._fte_worker_placement_manager = _PlacementManager()
+    monkeypatch.setattr(worker_placement_mod, "_admit_fte_partition_node_wait", lambda *_args: True)
+    monkeypatch.setattr(
+        worker_placement_mod.FteWorkerPlacementManager,
+        "release_owner",
+        lambda **kwargs: releases.append(kwargs),
+    )
+
+    def finish_partition():
+        assert reservation_started.wait(2.0)
+        with stage._state_lock:
+            partition.finished = True
+            partition._invalidate_placement()
+        terminal_committed.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        placement = executor.submit(
+            handle._try_reserve_fte_partition_for_node_wait,
+            query_id,
+            fragment_id,
+            partition,
+            fragment_execution=stage,
+        )
+        finished = executor.submit(finish_partition)
+        placement.result(timeout=2.0)
+        finished.result(timeout=2.0)
+
+    assert partition.finished is True
+    assert len(releases) == 1
+    assert releases[0] == {
+        "query_id": query_id,
+        "fragment_id": fragment_id,
+        "partition_id": 0,
+        "terminal": False,
+    }
+
+
+def test_fte_async_placement_releases_reservation_when_partition_finishes_before_commit(monkeypatch):
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-async-placement-rollback",
+    )
+    query_id = "query-async-placement-rollback"
+    fragment_id = f"{query_id}:node:7"
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=fragment_id,
+        context={
+            "resource_query_id": query_id,
+            "resource_stage_id": f"stage:{query_id}:node:7:fte",
+        },
+        task_memory_bytes=64,
+    )
+    partition = stage.add_partition(0)
+    monkeypatch.setitem(
+        fragment_submission_mod._FTE_FRAGMENT_EXECUTIONS,
+        (query_id, fragment_id),
+        stage,
+    )
+    future, created = handle._fte_worker_placement_manager.request_async(
+        query_id=query_id,
+        fragment_execution_id=stage.fragment_execution_id,
+        fragment_id=fragment_id,
+        partition_id=0,
+        memory_requirement_bytes=64,
+        execution_class=partition.execution_class,
+    )
+    assert created is True
+    reservation_started = threading.Event()
+    terminal_committed = threading.Event()
+    releases = []
+
+    def acquire(**_kwargs):
+        reservation_started.set()
+        assert terminal_committed.wait(2.0)
+        return object()
+
+    monkeypatch.setattr(handle._fte_worker_placement_manager, "acquire", acquire)
+    monkeypatch.setattr(
+        worker_placement_mod.FteWorkerPlacementManager,
+        "release_owner",
+        lambda **kwargs: releases.append(kwargs),
+    )
+
+    def finish_partition():
+        assert reservation_started.wait(2.0)
+        with stage._state_lock:
+            partition.finished = True
+            partition._invalidate_placement()
+        terminal_committed.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        placement = executor.submit(
+            handle._try_complete_fte_worker_reservation_future,
+            future,
+            partition=partition,
+        )
+        finished = executor.submit(finish_partition)
+        assert placement.result(timeout=2.0) is False
+        finished.result(timeout=2.0)
+
+    assert future.cancelled() is True
+    assert releases == [
+        {
+            "query_id": query_id,
+            "fragment_id": fragment_id,
+            "partition_id": 0,
+            "terminal": False,
+        }
+    ]
 
 
 def test_fte_registry_stats_reports_query_stage_partition_metrics(monkeypatch):
@@ -5034,6 +5931,92 @@ def test_fte_worker_failure_retry_preserves_registered_heap(monkeypatch):
     assert high_memory.fte_pressure_stats()["assigned_memory_bytes"] == 0
 
 
+def test_fte_worker_failure_does_not_invert_attempt_start_lock_order(monkeypatch):
+    failure_holds_registry = threading.Event()
+    start_holds_state = threading.Event()
+    failure_reads_state_without_registry = threading.Event()
+    query_id = "query-worker-failure-start-race"
+    fragment_id = f"{query_id}:node:7"
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="failed-start-race",
+    )
+    replacement = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="replacement-start-race",
+    )
+    stage = None
+
+    def select_replacement(_partition):
+        assert stage is not None
+        assert stage._state_lock_owned_by_current_thread()
+        start_holds_state.set()
+        assert failure_holds_registry.wait(2.0)
+        with fte_fragment_scheduler_mod._FTE_REGISTRY_LOCK:
+            fte_fragment_scheduler_mod._FTE_PARTITION_OWNERS[owner_key] = replacement
+            return replacement.worker_id, replacement
+
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=fragment_id,
+        worker_selector=select_replacement,
+        task_memory_bytes=64,
+    )
+    partition = stage.add_partition(0)
+    owner_key = (query_id, fragment_id, 0)
+
+    class _BlockingOwnerRegistry(dict):
+        def items(self):
+            is_owned = getattr(fte_fragment_scheduler_mod._FTE_REGISTRY_LOCK, "_is_owned", None)
+            assert callable(is_owned) and is_owned()
+            failure_holds_registry.set()
+            assert start_holds_state.wait(2.0)
+            return super().items()
+
+    monkeypatch.setattr(
+        fte_fragment_scheduler_mod,
+        "_FTE_PARTITION_OWNERS",
+        _BlockingOwnerRegistry({owner_key: failed}),
+    )
+    monkeypatch.setitem(
+        fte_fragment_scheduler_mod._FTE_FRAGMENT_EXECUTIONS,
+        (query_id, fragment_id),
+        stage,
+    )
+    original_requirements = stage.partition_scheduling_requirements
+
+    def observed_requirements(partition_id):
+        is_owned = getattr(fte_fragment_scheduler_mod._FTE_REGISTRY_LOCK, "_is_owned", None)
+        assert callable(is_owned) and not is_owned()
+        failure_reads_state_without_registry.set()
+        return original_requirements(partition_id)
+
+    monkeypatch.setattr(stage, "partition_scheduling_requirements", observed_requirements)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        failure = executor.submit(
+            fte_fragment_scheduler_mod._mark_fte_worker_failed,
+            failed.worker_id,
+            "worker lost during attempt start",
+            query_id_filter=query_id,
+            failed_worker_ids_override={failed.worker_id},
+        )
+        assert failure_holds_registry.wait(2.0)
+        attempt = executor.submit(stage.start_attempt_with_worker, partition)
+
+        scheduled = attempt.result(timeout=2.0)
+        assert failure.result(timeout=2.0) == []
+
+    assert failure_reads_state_without_registry.is_set()
+    assert scheduled.worker_id == replacement.worker_id
+    assert partition.running_attempt is not None
+    assert partition.running_attempt.remote_handle is replacement
+    assert fte_fragment_scheduler_mod._FTE_PARTITION_OWNERS[owner_key] is replacement
+
+
 def test_fte_worker_failure_replays_descriptor_on_new_owner(monkeypatch):
     monkeypatch.setattr(
         RayWorkerActorHandle,
@@ -6988,14 +7971,18 @@ def test_worker_pressure_drop_uses_exact_query_identity():
     parent_reservation = partition_reservation_key("q", "q:node:1", 0)
     child_reservation = partition_reservation_key("q|child", "q|child:node:1", 0)
     pressure.running_attempts.update({parent_attempt, child_attempt})
+    pressure.terminal_attempt_id_by_task.update({"q.0.0": 0, "q.child.0.0": 0})
     pressure.split_counts_by_attempt.update({parent_attempt: 1, child_attempt: 2})
+    pressure.pending_split_counts_by_attempt.update({parent_attempt: 3, child_attempt: 4})
     pressure.reserved_partitions.update({parent_reservation, child_reservation})
     pressure.memory_bytes_by_reservation.update({parent_reservation: 10, child_reservation: 20})
 
     pressure.drop_query("q")
 
     assert pressure.running_attempts == {child_attempt}
+    assert pressure.terminal_attempt_id_by_task == {"q.child.0.0": 0}
     assert pressure.split_counts_by_attempt == {child_attempt: 2}
+    assert pressure.pending_split_counts_by_attempt == {child_attempt: 4}
     assert pressure.reserved_partitions == {child_reservation}
     assert pressure.memory_bytes_by_reservation == {child_reservation: 20}
 
