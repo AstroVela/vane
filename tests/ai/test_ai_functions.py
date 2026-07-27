@@ -726,8 +726,18 @@ class TestUDFExecutionOptions:
         assert OpenAITextEmbedderDescriptor(embed_options={"num_gpus": 1}).get_udf_options().num_gpus == 1
         assert OpenAIPrompterDescriptor(prompt_options={"num_gpus": 2}).get_udf_options().num_gpus == 2
         assert AnthropicPrompterDescriptor(prompt_options={"num_gpus": 3}).get_udf_options().num_gpus == 3
-        assert GoogleTextEmbedderDescriptor(embed_options={"num_gpus": 4}).get_udf_options().num_gpus == 4
-        assert GooglePrompterDescriptor(prompt_options={"num_gpus": 5}).get_udf_options().num_gpus == 5
+        assert (
+            GoogleTextEmbedderDescriptor(model_name="gemini-embedding-001", embed_options={"num_gpus": 4})
+            .get_udf_options()
+            .num_gpus
+            == 4
+        )
+        assert (
+            GooglePrompterDescriptor(model_name="gemini-3.6-flash", prompt_options={"num_gpus": 5})
+            .get_udf_options()
+            .num_gpus
+            == 5
+        )
 
     def test_prompt_relation_defaults_keep_task_fanout_and_batch_size_one(self, monkeypatch):
         import vane
@@ -1014,23 +1024,23 @@ class TestGoogleProvider:
         assert "google" in PROVIDERS
 
     def test_embedder_descriptor_creates(self):
-        """GoogleTextEmbedderDescriptor can be created."""
+        """GoogleTextEmbedderDescriptor derives dims for a known model."""
         from vane.ai.providers.google import GoogleTextEmbedderDescriptor
 
         desc = GoogleTextEmbedderDescriptor(
-            model_name="text-embedding-004",
+            model_name="gemini-embedding-001",
         )
         assert desc.get_provider() == "google"
-        assert desc.get_model() == "text-embedding-004"
+        assert desc.get_model() == "gemini-embedding-001"
         dims = desc.get_dimensions()
-        assert dims.size == 768
+        assert dims.size == 3072
 
     def test_embedder_descriptor_custom_dims(self):
         """GoogleTextEmbedderDescriptor supports custom dimensions."""
         from vane.ai.providers.google import GoogleTextEmbedderDescriptor
 
         desc = GoogleTextEmbedderDescriptor(
-            model_name="text-embedding-004",
+            model_name="gemini-embedding-001",
             dimensions=256,
         )
         dims = desc.get_dimensions()
@@ -1042,7 +1052,7 @@ class TestGoogleProvider:
 
         desc = GoogleTextEmbedderDescriptor(
             provider_options={"api_key": "test"},
-            model_name="text-embedding-004",
+            model_name="gemini-embedding-001",
             dimensions=256,
         )
         restored = pickle.loads(pickle.dumps(desc))
@@ -1054,11 +1064,11 @@ class TestGoogleProvider:
         from vane.ai.providers.google import GooglePrompterDescriptor
 
         desc = GooglePrompterDescriptor(
-            model_name="gemini-2.0-flash",
+            model_name="gemini-3.6-flash",
             system_message="Be helpful.",
         )
         assert desc.get_provider() == "google"
-        assert desc.get_model() == "gemini-2.0-flash"
+        assert desc.get_model() == "gemini-3.6-flash"
 
     def test_prompter_descriptor_pickle(self):
         """GooglePrompterDescriptor survives pickle."""
@@ -1066,7 +1076,7 @@ class TestGoogleProvider:
 
         desc = GooglePrompterDescriptor(
             provider_options={"api_key": "test"},
-            model_name="gemini-2.0-flash",
+            model_name="gemini-2.5-pro",
             system_message="Be concise.",
             prompt_options={"temperature": 0.5},
         )
@@ -1078,9 +1088,21 @@ class TestGoogleProvider:
         """Google prompter descriptor produces correct UDFOptions."""
         from vane.ai.providers.google import GooglePrompterDescriptor
 
-        desc = GooglePrompterDescriptor()
+        desc = GooglePrompterDescriptor(model_name="gemini-3.6-flash")
         opts = desc.get_udf_options()
         assert opts.max_api_concurrency == 16
+
+    def test_descriptor_model_name_required(self):
+        """Descriptors cannot be constructed without an explicit model."""
+        from vane.ai.providers.google import (
+            GooglePrompterDescriptor,
+            GoogleTextEmbedderDescriptor,
+        )
+
+        with pytest.raises(TypeError):
+            GooglePrompterDescriptor()
+        with pytest.raises(TypeError):
+            GoogleTextEmbedderDescriptor()
 
     def test_provider_get_prompter(self):
         """GoogleProvider.get_prompter returns descriptor."""
@@ -1088,11 +1110,171 @@ class TestGoogleProvider:
 
         provider = GoogleProvider(api_key="test")
         desc = provider.get_prompter(
-            model="gemini-2.0-flash",
+            model="gemini-3.6-flash",
             system_message="Summarize.",
         )
         assert isinstance(desc, GooglePrompterDescriptor)
-        assert desc.model_name == "gemini-2.0-flash"
+        assert desc.model_name == "gemini-3.6-flash"
+
+    def test_get_prompter_missing_model_raises(self):
+        """No call-site model and no provider config fails fast."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test")
+        with pytest.raises(ValueError) as excinfo:
+            provider.get_prompter()
+        message = str(excinfo.value)
+        assert "No prompt model configured" in message
+        assert "model=" in message
+        assert "GoogleProvider(prompt_model=...)" in message
+
+    def test_get_prompter_provider_config_flow_through(self):
+        """Provider-level prompt_model is used when the call omits model."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test", prompt_model="gemini-3.6-flash")
+        desc = provider.get_prompter()
+        assert desc.model_name == "gemini-3.6-flash"
+
+    def test_get_prompter_call_model_beats_provider_config(self):
+        """Call-site model overrides the provider-level prompt_model."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test", prompt_model="gemini-2.5-pro")
+        desc = provider.get_prompter(model="gemini-3.6-flash")
+        assert desc.model_name == "gemini-3.6-flash"
+
+    def test_get_text_embedder_missing_model_raises(self):
+        """No call-site model and no provider config fails fast."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test")
+        with pytest.raises(ValueError) as excinfo:
+            provider.get_text_embedder()
+        message = str(excinfo.value)
+        assert "No embedding model configured" in message
+        assert "model=" in message
+        assert "GoogleProvider(embedding_model=...)" in message
+
+    def test_get_text_embedder_provider_config_flow_through(self):
+        """Provider-level embedding_model is used when the call omits model."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test", embedding_model="gemini-embedding-001")
+        desc = provider.get_text_embedder()
+        assert desc.model_name == "gemini-embedding-001"
+        assert desc.get_dimensions().size == 3072
+
+    def test_get_text_embedder_call_model_beats_provider_config(self):
+        """Call-site model overrides the provider-level embedding_model."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test", embedding_model="gemini-embedding-2")
+        desc = provider.get_text_embedder(model="gemini-embedding-001")
+        assert desc.model_name == "gemini-embedding-001"
+
+    def test_get_text_embedder_provider_dimensions_flow_through(self):
+        """Provider-level embedding_dimensions covers models without metadata."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(
+            api_key="test",
+            embedding_model="custom-tuned-embedder",
+            embedding_dimensions=1024,
+        )
+        desc = provider.get_text_embedder()
+        assert desc.get_dimensions().size == 1024
+
+    def test_get_text_embedder_call_dimensions_beat_provider_config(self):
+        """Call-site dimensions override the provider-level configuration."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test", embedding_dimensions=1024)
+        desc = provider.get_text_embedder(model="gemini-embedding-001", dimensions=256)
+        assert desc.get_dimensions().size == 256
+
+    def test_provider_ctor_typo_raises_type_error(self):
+        """A mistyped constructor kwarg cannot leak into request options."""
+        from vane.ai.providers.google import GoogleProvider
+
+        with pytest.raises(TypeError):
+            GoogleProvider(promt_model="gemini-3.6-flash")
+
+    @pytest.mark.parametrize("model", ["gemini-3.6-flash", "gemini-3.5-flash-lite"])
+    @pytest.mark.parametrize("option", ["temperature", "top_p", "top_k"])
+    def test_unsupported_sampling_option_rejected(self, model, option):
+        """Deprecated sampling params are rejected before dispatch."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test")
+        with pytest.raises(ValueError) as excinfo:
+            provider.get_prompter(model=model, **{option: 0.5})
+        message = str(excinfo.value)
+        assert option in message
+        assert model in message
+
+    def test_unsupported_option_rejected_on_direct_descriptor_construction(self):
+        """Validation also covers direct descriptor construction."""
+        from vane.ai.providers.google import GooglePrompterDescriptor
+
+        with pytest.raises(ValueError, match="does not support options"):
+            GooglePrompterDescriptor(
+                model_name="gemini-3.6-flash",
+                prompt_options={"temperature": 0.2},
+            )
+
+    def test_sampling_options_pass_for_untabled_model(self):
+        """Models without a capability-table entry accept sampling params."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test")
+        desc = provider.get_prompter(
+            model="gemini-2.5-pro",
+            temperature=0.2,
+            top_p=0.9,
+            top_k=40,
+        )
+        assert desc.prompt_options["temperature"] == 0.2
+        assert desc.prompt_options["top_p"] == 0.9
+        assert desc.prompt_options["top_k"] == 40
+
+    def test_embedder_unknown_model_without_dimensions_raises(self):
+        """Unknown embedding model without explicit dimensions fails fast."""
+        from vane.ai.providers.google import GoogleProvider, GoogleTextEmbedderDescriptor
+
+        provider = GoogleProvider(api_key="test")
+        with pytest.raises(ValueError) as excinfo:
+            provider.get_text_embedder(model="custom-tuned-embedder")
+        message = str(excinfo.value)
+        assert "Cannot derive embedding dimensions" in message
+        assert "dimensions=" in message
+        assert "GoogleProvider(embedding_dimensions=...)" in message
+
+        with pytest.raises(ValueError, match="Cannot derive embedding dimensions"):
+            GoogleTextEmbedderDescriptor(model_name="custom-tuned-embedder")
+
+    def test_embedder_unknown_model_with_explicit_dimensions_flows(self):
+        """Explicit dimensions make an unknown model usable."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test")
+        desc = provider.get_text_embedder(model="custom-tuned-embedder", dimensions=512)
+        assert desc.get_dimensions().size == 512
+
+    def test_embedder_zero_dimensions_rejected(self):
+        """dimensions=0 is rejected instead of silently treated as unset."""
+        from vane.ai.providers.google import GoogleTextEmbedderDescriptor
+
+        with pytest.raises(ValueError, match="positive integer"):
+            GoogleTextEmbedderDescriptor(model_name="custom-tuned-embedder", dimensions=0)
+
+    @pytest.mark.parametrize("dimensions", [64, 4096])
+    def test_embedder_dimensions_outside_documented_range_rejected(self, dimensions):
+        """Dimensions conflicting with trusted model metadata fail fast."""
+        from vane.ai.providers.google import GoogleTextEmbedderDescriptor
+
+        with pytest.raises(ValueError, match="output dimensionality"):
+            GoogleTextEmbedderDescriptor(model_name="gemini-embedding-001", dimensions=dimensions)
 
     def test_provider_get_prompter_splits_call_client_options(self):
         """Google prompt call-level client options go to provider_options only."""
@@ -1101,6 +1283,7 @@ class TestGoogleProvider:
 
         provider = GoogleProvider(api_key="ctor-key")
         desc = provider.get_prompter(
+            model="gemini-2.5-pro",
             api_key="call-key",
             max_api_concurrency=7,
             temperature=0,
@@ -1121,7 +1304,7 @@ class TestGoogleProvider:
 
         provider = GoogleProvider(api_key="test")
         desc = provider.get_text_embedder(
-            model="text-embedding-004",
+            model="gemini-embedding-001",
             dimensions=256,
         )
         assert isinstance(desc, GoogleTextEmbedderDescriptor)
@@ -1134,6 +1317,7 @@ class TestGoogleProvider:
 
         provider = GoogleProvider(api_key="ctor-key")
         desc = provider.get_text_embedder(
+            model="gemini-embedding-001",
             api_key="call-key",
             task_type="RETRIEVAL_QUERY",
             on_error="log",
@@ -1452,19 +1636,19 @@ class TestGoogleStructuredOutput:
     def test_descriptor_has_return_format(self):
         from vane.ai.providers.google import GooglePrompterDescriptor
 
-        desc = GooglePrompterDescriptor(return_format=dict)
+        desc = GooglePrompterDescriptor(model_name="gemini-3.6-flash", return_format=dict)
         assert desc.return_format is dict
 
     def test_descriptor_default_no_return_format(self):
         from vane.ai.providers.google import GooglePrompterDescriptor
 
-        desc = GooglePrompterDescriptor()
+        desc = GooglePrompterDescriptor(model_name="gemini-3.6-flash")
         assert desc.return_format is None
 
     def test_descriptor_pickle_with_return_format(self):
         from vane.ai.providers.google import GooglePrompterDescriptor
 
-        desc = GooglePrompterDescriptor(return_format=dict)
+        desc = GooglePrompterDescriptor(model_name="gemini-3.6-flash", return_format=dict)
         restored = pickle.loads(pickle.dumps(desc))
         assert restored.return_format is dict
 
@@ -1472,7 +1656,7 @@ class TestGoogleStructuredOutput:
         from vane.ai.providers.google import GoogleProvider
 
         prov = GoogleProvider(api_key="test")
-        desc = prov.get_prompter(return_format=dict)
+        desc = prov.get_prompter(model="gemini-3.6-flash", return_format=dict)
         assert desc.return_format is dict
 
 

@@ -7,6 +7,12 @@ Supports text embedding via ``embed_content`` and prompting via
 ``generate_content`` with multimodal input (text + images) and
 structured output via ``response_schema``.
 
+Vane does not choose Google models: every prompt or embedding call must
+name a model, either per call (``model=...``) or through explicit
+provider configuration (``GoogleProvider(prompt_model=...,
+embedding_model=...)``). Missing configuration raises :class:`ValueError`
+at expression-build time.
+
 Requires::
 
     pip install 'vane-ai[google]'
@@ -25,6 +31,8 @@ from vane.ai.provider import Provider, ProviderImportError
 from vane.ai.typing import EmbeddingDimensions, UDFOptions
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from vane.ai.protocols import Prompter, TextEmbedder
     from vane.ai.typing import Embedding, Options
 
@@ -76,10 +84,71 @@ def _raise_retry_after_on_google_error(exc: Exception) -> None:
 # Model metadata
 # ---------------------------------------------------------------------------
 
+# Default output dimensionality per known embedding model, from the Gemini
+# embeddings guide (https://ai.google.dev/gemini-api/docs/embeddings). Only
+# models with trusted metadata belong here; any other model requires the
+# caller to supply ``dimensions`` explicitly.
 _EMBEDDING_DIMS: dict[str, int] = {
-    "text-embedding-004": 768,
-    "embedding-001": 768,
+    "gemini-embedding-001": 3072,
+    "gemini-embedding-2": 3072,
 }
+
+# Documented ``output_dimensionality`` bounds per known embedding model.
+_EMBEDDING_DIM_RANGE: dict[str, tuple[int, int]] = {
+    "gemini-embedding-001": (128, 3072),
+    "gemini-embedding-2": (128, 3072),
+}
+
+# Request options rejected per model before dispatch. Gemini 3.6 Flash and
+# 3.5 Flash-Lite deprecate the classic sampling parameters: the API ignores
+# them today and returns HTTP 400 in future model generations
+# (https://ai.google.dev/gemini-api/docs/latest-model).
+_MODEL_UNSUPPORTED_OPTIONS: dict[str, frozenset[str]] = {
+    "gemini-3.6-flash": frozenset({"temperature", "top_p", "top_k"}),
+    "gemini-3.5-flash-lite": frozenset({"temperature", "top_p", "top_k"}),
+}
+
+
+def _validate_prompt_options(model_name: str, options: Mapping[str, Any]) -> None:
+    """Reject request options the selected model is documented not to support.
+
+    Raises:
+        ValueError: If ``options`` contains keys listed for ``model_name``
+            in :data:`_MODEL_UNSUPPORTED_OPTIONS`.
+    """
+    unsupported = _MODEL_UNSUPPORTED_OPTIONS.get(model_name, frozenset())
+    offending = sorted(unsupported.intersection(options))
+    if offending:
+        raise ValueError(
+            f"Google model {model_name!r} does not support options {offending}: "
+            "the Gemini API ignores these sampling parameters and rejects them "
+            "in future model generations. Remove them from the request."
+        )
+
+
+def _validate_embedding_dimensions(model_name: str, dimensions: int | None) -> None:
+    """Validate the embedding-dimensions configuration for ``model_name``.
+
+    Raises:
+        ValueError: If ``dimensions`` is omitted for a model without trusted
+            metadata in :data:`_EMBEDDING_DIMS`, is not a positive integer,
+            or falls outside the documented range for a known model.
+    """
+    if dimensions is None:
+        if model_name not in _EMBEDDING_DIMS:
+            raise ValueError(
+                f"Cannot derive embedding dimensions for Google model {model_name!r}. "
+                "Pass dimensions=... or configure GoogleProvider(embedding_dimensions=...)."
+            )
+        return
+    if dimensions < 1:
+        raise ValueError(f"Embedding dimensions must be a positive integer, got {dimensions!r}.")
+    bounds = _EMBEDDING_DIM_RANGE.get(model_name)
+    if bounds is not None and not bounds[0] <= dimensions <= bounds[1]:
+        raise ValueError(
+            f"Google model {model_name!r} supports output dimensionality "
+            f"between {bounds[0]} and {bounds[1]}, got {dimensions}."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -88,15 +157,46 @@ _EMBEDDING_DIMS: dict[str, int] = {
 
 
 class GoogleProvider(Provider):
-    """Provider backed by Google Generative AI (Gemini)."""
+    """Provider backed by Google Generative AI (Gemini).
 
-    DEFAULT_EMBED_MODEL = "text-embedding-004"
-    DEFAULT_PROMPT_MODEL = "gemini-2.0-flash"
+    The provider ships no default model IDs: a model must be supplied per
+    call (``model=...``) or through the named constructor parameters below.
+    Call-site arguments always win over constructor configuration.
+
+    Args:
+        name: Optional display-name override (default ``"google"``).
+        api_key: Google API key. Prefer the ``GOOGLE_API_KEY`` environment
+            variable over passing keys in code.
+        prompt_model: Model used by ``get_prompter`` when the call does not
+            pass ``model=...``.
+        embedding_model: Model used by ``get_text_embedder`` when the call
+            does not pass ``model=...``.
+        embedding_dimensions: Embedding output dimensionality used when the
+            call does not pass ``dimensions=...``. Required (here or per
+            call) for embedding models without trusted dimension metadata.
+
+    All parameters are named; a mistyped keyword raises :class:`TypeError`
+    instead of silently leaking into API request options.
+    """
+
     _CLIENT_KEYS: ClassVar[frozenset[str]] = frozenset({"api_key"})
 
-    def __init__(self, name: str | None = None, **options: Any):
+    def __init__(
+        self,
+        name: str | None = None,
+        *,
+        api_key: str | None = None,
+        prompt_model: str | None = None,
+        embedding_model: str | None = None,
+        embedding_dimensions: int | None = None,
+    ):
         self._name = name or "google"
-        self._options: dict[str, Any] = options
+        self._prompt_model = prompt_model
+        self._embedding_model = embedding_model
+        self._embedding_dimensions = embedding_dimensions
+        self._options: dict[str, Any] = {}
+        if api_key is not None:
+            self._options["api_key"] = api_key
 
     @property
     def name(self) -> str:
@@ -114,12 +214,27 @@ class GoogleProvider(Provider):
         dimensions: int | None = None,
         **options: Any,
     ) -> TextEmbedderDescriptor:
+        """Build an embedder descriptor for an explicitly selected model.
+
+        Raises:
+            ValueError: If neither ``model=...`` nor the provider's
+                ``embedding_model`` is configured, or if dimensions cannot
+                be resolved for the selected model.
+        """
         provider_options, embed_options = self._split_options(options)
-        model_name = model or self.DEFAULT_EMBED_MODEL
+        options_model = embed_options.pop("model", None)
+        model_name = model or options_model or self._embedding_model
+        if model_name is None:
+            raise ValueError(
+                "No embedding model configured for the Google provider. "
+                "Pass model=... or configure GoogleProvider(embedding_model=...)."
+            )
+        if dimensions is None:
+            dimensions = self._embedding_dimensions
         return GoogleTextEmbedderDescriptor(
+            model_name=model_name,
             provider_name=self._name,
             provider_options=provider_options,
-            model_name=model_name,
             dimensions=dimensions,
             embed_options=embed_options,
         )
@@ -131,11 +246,25 @@ class GoogleProvider(Provider):
         return_format: Any | None = None,
         **options: Any,
     ) -> PrompterDescriptor:
+        """Build a prompter descriptor for an explicitly selected model.
+
+        Raises:
+            ValueError: If neither ``model=...`` nor the provider's
+                ``prompt_model`` is configured, or if the selected model
+                does not support one of the requested options.
+        """
         provider_options, prompt_options = self._split_options(options)
+        options_model = prompt_options.pop("model", None)
+        model_name = model or options_model or self._prompt_model
+        if model_name is None:
+            raise ValueError(
+                "No prompt model configured for the Google provider. "
+                "Pass model=... or configure GoogleProvider(prompt_model=...)."
+            )
         return GooglePrompterDescriptor(
+            model_name=model_name,
             provider_name=self._name,
             provider_options=provider_options,
-            model_name=model or prompt_options.pop("model", self.DEFAULT_PROMPT_MODEL),
             system_message=system_message,
             return_format=return_format,
             prompt_options=prompt_options,
@@ -149,15 +278,21 @@ class GoogleProvider(Provider):
 
 @dataclass
 class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
-    """Serializable factory for a Google Generative AI text embedder."""
+    """Serializable factory for a Google Generative AI text embedder.
 
+    ``model_name`` is required. ``dimensions`` is required unless the model
+    has trusted metadata in :data:`_EMBEDDING_DIMS`; both are validated at
+    construction time, before anything ships to workers.
+    """
+
+    model_name: str
     provider_name: str = "google"
     provider_options: dict[str, Any] = field(default_factory=dict)
-    model_name: str = "text-embedding-004"
     dimensions: int | None = None
     embed_options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _validate_embedding_dimensions(self.model_name, self.dimensions)
         self.provider_options = wrap_sensitive_options(self.provider_options)
         self.embed_options = wrap_sensitive_options(self.embed_options)
 
@@ -171,10 +306,9 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
         return dict(self.embed_options)
 
     def get_dimensions(self) -> EmbeddingDimensions:
-        if self.dimensions:
+        if self.dimensions is not None:
             return EmbeddingDimensions(size=self.dimensions)
-        size = _EMBEDDING_DIMS.get(self.model_name, 768)
-        return EmbeddingDimensions(size=size)
+        return EmbeddingDimensions(size=_EMBEDDING_DIMS[self.model_name])
 
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(
@@ -263,16 +397,20 @@ class GooglePrompterDescriptor(PrompterDescriptor):
 
     Supports structured output via ``response_schema`` and multimodal
     input (text + images via ``Part.from_bytes``).
+
+    ``model_name`` is required, and the model/option combination is
+    validated at construction time, before anything ships to workers.
     """
 
+    model_name: str
     provider_name: str = "google"
     provider_options: dict[str, Any] = field(default_factory=dict)
-    model_name: str = "gemini-2.0-flash"
     system_message: str | None = None
     return_format: Any | None = None
     prompt_options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _validate_prompt_options(self.model_name, self.prompt_options)
         self.provider_options = wrap_sensitive_options(self.provider_options)
         self.prompt_options = wrap_sensitive_options(self.prompt_options)
 
