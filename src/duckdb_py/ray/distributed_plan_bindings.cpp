@@ -2098,8 +2098,17 @@ struct PyPhysicalPlanWrapperRunner {
 
 		if (fte_scan_source_queue_map && !fte_scan_source_queue_map->empty()) {
 			string error;
-			if (!duckdb::distributed::ApplyFteScanSourceQueuesToPlan(*physical_plan, *fte_scan_source_queue_map,
-			                                                         &error)) {
+			bool applied;
+			{
+				// ExtensionFileListProvider scans materialize the dynamic file list
+				// here and can wait until no_more_splits. The control thread that
+				// seals the queue must be able to acquire the GIL while that wait is
+				// in progress.
+				py::gil_scoped_release release;
+				applied = duckdb::distributed::ApplyFteScanSourceQueuesToPlan(*physical_plan,
+				                                                              *fte_scan_source_queue_map, &error);
+			}
+			if (!applied) {
 				throw py::value_error("Failed to apply FTE scan source queues to plan: " + error);
 			}
 		}

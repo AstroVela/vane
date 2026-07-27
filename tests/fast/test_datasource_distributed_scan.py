@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import gc
 import os
+import subprocess
+import sys
+import textwrap
 import time
 import uuid
 import weakref
@@ -341,6 +344,114 @@ def test_datasource_worker_plan_uses_resource_query_owner_when_execution_id_diff
         worker_connection.close()
         _duckdb._release_datasource_factories_for_query(resource_query_id)
         duckdb.ray_cxx._cleanup_query_python_replay_state(resource_query_id)
+
+
+def test_datasource_fte_scan_wait_releases_gil_for_queue_seal():
+    # Isolate the expected pre-fix deadlock so the parent pytest process can
+    # enforce a hard timeout and report both thread stacks.
+    code = textwrap.dedent(
+        """
+        from __future__ import annotations
+
+        import faulthandler
+        import sys
+        import threading
+        import uuid
+        from collections.abc import Iterator
+
+        import pyarrow as pa
+
+        import duckdb
+        import _duckdb
+        from duckdb.datasource import DataSource, DataSourceTask, read_datasource
+
+
+        class SingleTask(DataSourceTask):
+            def execute(self) -> Iterator[pa.RecordBatch]:
+                yield pa.record_batch({"value": pa.array([41], type=pa.int64())})
+
+
+        class SingleSource(DataSource):
+            @property
+            def schema(self) -> dict[str, str]:
+                return {"value": "BIGINT"}
+
+            def get_tasks(self) -> Iterator[DataSourceTask]:
+                yield SingleTask()
+
+
+        faulthandler.dump_traceback_later(5.0, repeat=False)
+        # After the executor thread starts, only an explicit native GIL release
+        # should let this thread resume and seal the queue.
+        sys.setswitchinterval(1000.0)
+
+        query_id = f"query-datasource-fte-gil-{uuid.uuid4().hex[:8]}"
+        source_connection = duckdb.connect()
+        relation = read_datasource(SingleSource(), con=source_connection)
+        source_plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            relation,
+            query_id,
+        ).to_physical_plan(source_connection)
+        scan_task_descriptors = source_plan.scan_task_descriptor_map()
+        assert len(scan_task_descriptors) == 1
+        node_id, descriptors = next(iter(scan_task_descriptors.items()))
+        assert len(descriptors) == 1
+
+        duckdb.ray_cxx._register_query_python_replay_state(query_id, source_plan)
+        worker_connection = duckdb.connect()
+        worker_plan = source_plan.clone(worker_connection)
+        split_queue = duckdb.ray_cxx.FteSplitQueue()
+        split_queue.add_scan_split(bytes(descriptors[0]))
+        started = threading.Event()
+        results = []
+        errors = []
+
+
+        def execute_native() -> None:
+            started.set()
+            try:
+                results.append(
+                    duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+                        worker_connection,
+                        worker_plan,
+                        fte_scan_source_queues={str(node_id): split_queue},
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+
+        thread = threading.Thread(target=execute_native, daemon=True)
+        thread.start()
+        assert started.wait(timeout=2.0)
+        split_queue.no_more_splits()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+        assert errors == []
+        assert len(results) == 1
+        assert results[0].completion_status == "ok"
+        assert results[0].partition_payloads[0].column(0).to_pylist() == [41]
+        assert split_queue.consumed_splits() == 1
+
+        faulthandler.cancel_dump_traceback_later()
+        results.clear()
+        worker_plan = None
+        worker_connection.close()
+        _duckdb._release_datasource_factories_for_query(query_id)
+        duckdb.ray_cxx._cleanup_query_python_replay_state(query_id)
+        source_connection.close()
+        print("ok", flush=True)
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=os.getcwd(),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "ok" in proc.stdout
 
 
 def test_ray_runner_executes_python_datasource_task_on_worker(ray_runner, duckdb_conn):
