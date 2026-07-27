@@ -20,6 +20,23 @@ using duckdb::distributed::WorkerSnapshot;
 
 static constexpr auto REFRESH_INTERVAL = std::chrono::seconds(5);
 
+static std::vector<std::string> AbortWorkers(const std::vector<std::shared_ptr<RayWorkerRuntime>> &workers) {
+	std::vector<std::string> errors;
+	for (auto &worker : workers) {
+		const auto worker_id = worker && worker->Id() ? *worker->Id() : std::string("<unknown>");
+		try {
+			if (worker) {
+				worker->AbortShutdown();
+			}
+		} catch (const std::exception &ex) {
+			errors.push_back(worker_id + ": " + ex.what());
+		} catch (...) {
+			errors.push_back(worker_id + ": unknown abort error");
+		}
+	}
+	return errors;
+}
+
 static bool IsUnselectedFteHandle(const RayWorkerRuntime::TaskResultHandleType &handle,
                                   const RayWorkerRuntime::QueryStatus *finished_status) {
 	if (!finished_status || finished_status->selected_attempt_task_ids.empty()) {
@@ -476,12 +493,24 @@ void RayWorkerManager::rethrow_submission_error(const string &query_id) {
 }
 
 DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>> RayWorkerManager::worker_snapshots() const {
+	// State locks and refresh waits must never retain the GIL. The creator
+	// reacquires it only around Python/Ray startup and actor cleanup.
+	if (PyGILState_Check()) {
+		py::gil_scoped_release release;
+		return WorkerSnapshotsWithoutGIL();
+	}
+	return WorkerSnapshotsWithoutGIL();
+}
+
+RayWorkerManager::WorkerSnapshotResult RayWorkerManager::WorkerSnapshotsWithoutGIL() const {
 	OperationGuard operation(*this);
 	if (!operation) {
 		return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::err(
 		    DuckDBError::invalid_state_error("Ray worker manager is shut down"));
 	}
-	bool should_refresh = false;
+	std::promise<WorkerSnapshotResult> refresh_completion;
+	std::shared_ptr<WorkerRefreshFlight> refresh;
+	bool refresh_creator = false;
 	std::vector<string> existing_ids;
 	{
 		lock_guard<mutex> guard(mutex_);
@@ -489,19 +518,49 @@ DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>> RayWorkerManager:
 			return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::err(
 			    DuckDBError::invalid_state_error("Ray worker manager is shut down"));
 		}
-		should_refresh = !state_.last_refresh.first ||
-		                 (std::chrono::steady_clock::now() - state_.last_refresh.second) > REFRESH_INTERVAL;
-		if (should_refresh) {
+		const bool should_refresh = !state_.last_refresh.first ||
+		                            (std::chrono::steady_clock::now() - state_.last_refresh.second) > REFRESH_INTERVAL;
+		if (!should_refresh) {
+			std::vector<duckdb::distributed::WorkerSnapshot> snapshots;
+			snapshots.reserve(state_.ray_workers.size());
+			for (auto &kv : state_.ray_workers) {
+				snapshots.emplace_back(kv.first, kv.second->TotalNumCpus(), kv.second->TotalNumGpus(),
+				                       kv.second->TotalMemoryBytes());
+			}
+			return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::ok(std::move(snapshots));
+		}
+		if (state_.worker_refresh) {
+			refresh = state_.worker_refresh;
+		} else {
 			existing_ids.reserve(state_.ray_workers.size());
 			for (auto &kv : state_.ray_workers) {
 				if (kv.first) {
 					existing_ids.push_back(*kv.first);
 				}
 			}
+			auto result = refresh_completion.get_future().share();
+			refresh = std::make_shared<WorkerRefreshFlight>(std::move(result));
+			state_.worker_refresh = refresh;
+			refresh_creator = true;
 		}
 	}
 
-	if (should_refresh) {
+	if (!refresh_creator) {
+		try {
+			return refresh->result.get();
+		} catch (const std::exception &ex) {
+			return WorkerSnapshotResult::err(
+			    DuckDBError::internal_error(string("worker refresh synchronization failed: ") + ex.what()));
+		} catch (...) {
+			return WorkerSnapshotResult::err(
+			    DuckDBError::internal_error("worker refresh synchronization failed: unknown exception"));
+		}
+	}
+
+	WorkerSnapshotResult refresh_result;
+	std::vector<std::shared_ptr<RayWorkerRuntime>> new_workers;
+	bool worker_creation_succeeded = false;
+	{
 		duckdb::PythonGILWrapper gil;
 		try {
 			py::module_ worker_pool_obj = py::module_::import("duckdb.runners.ray.worker_pool");
@@ -511,73 +570,134 @@ DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>> RayWorkerManager:
 			try {
 				workers_iter = py_workers_obj.cast<py::iterable>();
 			} catch (const py::cast_error &e) {
-				return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::err(DuckDBError::external_error(
-				    string("start_ray_workers must return an iterable of RayWorkerRuntime: ") + e.what()));
+				throw std::runtime_error(string("start_ray_workers must return an iterable of RayWorkerRuntime: ") +
+				                         e.what());
 			}
 
-			std::vector<std::shared_ptr<RayWorkerRuntime>> new_workers;
+			string worker_validation_error;
 			for (auto item : workers_iter) {
-				auto worker = item.cast<std::shared_ptr<RayWorkerRuntime>>();
+				std::shared_ptr<RayWorkerRuntime> worker;
+				try {
+					worker = item.cast<std::shared_ptr<RayWorkerRuntime>>();
+				} catch (const py::cast_error &e) {
+					if (worker_validation_error.empty()) {
+						worker_validation_error = e.what();
+					}
+					continue;
+				}
 				if (!worker) {
-					return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::err(
-					    DuckDBError::invalid_state_error("start_ray_workers returned null RayWorkerRuntime"));
+					if (worker_validation_error.empty()) {
+						worker_validation_error = "start_ray_workers returned null RayWorkerRuntime";
+					}
+					continue;
 				}
 				auto worker_id = worker->Id();
-				if (!worker_id) {
-					return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::err(
-					    DuckDBError::invalid_state_error("start_ray_workers returned worker without id"));
-				}
 				new_workers.push_back(std::move(worker));
+				if (!worker_id || worker_id->empty()) {
+					if (worker_validation_error.empty()) {
+						worker_validation_error = "start_ray_workers returned worker without id";
+					}
+					continue;
+				}
+			}
+			if (!worker_validation_error.empty()) {
+				throw std::runtime_error(std::move(worker_validation_error));
+			}
+			worker_creation_succeeded = true;
+		} catch (const py::error_already_set &e) {
+			refresh_result = WorkerSnapshotResult::err(
+			    DuckDBError::external_error(string("refresh_workers python error: ") + e.what()));
+		} catch (const std::exception &e) {
+			refresh_result = WorkerSnapshotResult::err(
+			    DuckDBError::external_error(string("refresh_workers exception: ") + e.what()));
+		} catch (...) {
+			refresh_result =
+			    WorkerSnapshotResult::err(DuckDBError::external_error("refresh_workers unknown exception"));
+		}
+	}
+
+	if (worker_creation_succeeded) {
+		try {
+			std::unordered_set<string> worker_ids;
+			std::vector<std::pair<WorkerId, std::shared_ptr<RayWorkerRuntime>>> new_entries;
+			new_entries.reserve(new_workers.size());
+			for (auto &worker : new_workers) {
+				const auto &worker_id = *worker->Id();
+				if (!worker_ids.insert(worker_id).second) {
+					throw std::runtime_error("start_ray_workers returned duplicate worker id: " + worker_id);
+				}
+				new_entries.emplace_back(duckdb::distributed::make_worker_id(worker_id), worker);
 			}
 
-			bool reject_new_workers = false;
 			{
 				lock_guard<mutex> guard(mutex_);
 				if (state_.shutdown_started) {
-					reject_new_workers = true;
+					refresh_result = WorkerSnapshotResult::err(
+					    DuckDBError::invalid_state_error("Ray worker manager shut down during worker refresh"));
 				} else {
-					for (auto &worker : new_workers) {
-						state_.ray_workers.emplace(duckdb::distributed::make_worker_id(*worker->Id()), worker);
+					auto updated_workers = state_.ray_workers;
+					for (auto &entry : new_entries) {
+						if (updated_workers.find(entry.first) != updated_workers.end()) {
+							throw std::runtime_error("start_ray_workers returned existing worker id: " + *entry.first);
+						}
+						auto inserted = updated_workers.emplace(entry.first, entry.second);
+						if (!inserted.second) {
+							throw std::runtime_error("failed to stage worker id: " + *entry.first);
+						}
 					}
+
+					std::vector<duckdb::distributed::WorkerSnapshot> snapshots;
+					snapshots.reserve(updated_workers.size());
+					for (auto &kv : updated_workers) {
+						snapshots.emplace_back(kv.first, kv.second->TotalNumCpus(), kv.second->TotalNumGpus(),
+						                       kv.second->TotalMemoryBytes());
+					}
+					state_.ray_workers.swap(updated_workers);
 					state_.last_refresh = std::make_pair(true, std::chrono::steady_clock::now());
+					refresh_result = WorkerSnapshotResult::ok(std::move(snapshots));
 				}
 			}
-			if (reject_new_workers) {
-				for (auto &worker : new_workers) {
-					try {
-						worker->AbortShutdown();
-					} catch (...) {
-					}
-				}
-				return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::err(
-				    DuckDBError::invalid_state_error("Ray worker manager shut down during worker refresh"));
-			}
-		} catch (const py::error_already_set &e) {
-			return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::err(
-			    DuckDBError::external_error(string("refresh_workers python error: ") + e.what()));
-		} catch (const std::exception &e) {
-			return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::err(
-			    DuckDBError::external_error(string("refresh_workers exception: ") + e.what()));
+		} catch (const std::exception &ex) {
+			refresh_result = WorkerSnapshotResult::err(
+			    DuckDBError::external_error(string("refresh_workers commit failed: ") + ex.what()));
 		} catch (...) {
-			return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::err(
-			    DuckDBError::external_error("refresh_workers unknown exception"));
+			refresh_result = WorkerSnapshotResult::err(
+			    DuckDBError::external_error("refresh_workers commit failed: unknown exception"));
 		}
 	}
 
-	std::vector<duckdb::distributed::WorkerSnapshot> snapshots;
-	{
-		lock_guard<mutex> guard(mutex_);
-		if (state_.shutdown_started) {
-			return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::err(
-			    DuckDBError::invalid_state_error("Ray worker manager is shut down"));
-		}
-		snapshots.reserve(state_.ray_workers.size());
-		for (auto &kv : state_.ray_workers) {
-			snapshots.emplace_back(kv.first, kv.second->TotalNumCpus(), kv.second->TotalNumGpus(),
-			                       kv.second->TotalMemoryBytes());
+	if (refresh_result.is_err() && !new_workers.empty()) {
+		try {
+			auto cleanup_errors = AbortWorkers(new_workers);
+			if (!cleanup_errors.empty()) {
+				string message = refresh_result.error().what();
+				for (auto &error : cleanup_errors) {
+					message += "; worker refresh cleanup failed: " + error;
+				}
+				refresh_result = WorkerSnapshotResult::err(DuckDBError::external_error(std::move(message)));
+			}
+		} catch (const std::exception &ex) {
+			refresh_result = WorkerSnapshotResult::err(DuckDBError::external_error(
+			    string(refresh_result.error().what()) + "; worker refresh cleanup failed: " + ex.what()));
+		} catch (...) {
+			refresh_result = WorkerSnapshotResult::err(DuckDBError::external_error(
+			    string(refresh_result.error().what()) + "; worker refresh cleanup failed: unknown exception"));
 		}
 	}
-	return DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>::ok(std::move(snapshots));
+
+	try {
+		refresh_completion.set_value(refresh_result);
+	} catch (...) {
+		// The creator owns the only promise. Its destructor makes the shared
+		// future ready with broken_promise if publication unexpectedly fails.
+	}
+	{
+		lock_guard<mutex> guard(mutex_);
+		if (state_.worker_refresh == refresh) {
+			state_.worker_refresh.reset();
+		}
+	}
+	return refresh_result;
 }
 
 DuckDBResult<void> RayWorkerManager::shutdown() {

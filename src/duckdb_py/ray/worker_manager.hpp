@@ -8,6 +8,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <future>
 #include <memory>
 
 #include <vector>
@@ -52,9 +53,19 @@ public:
 	std::unordered_map<string, std::unordered_map<string, idx_t>> fragment_stats_by_worker() const;
 
 private:
+	using WorkerSnapshotResult = DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>>;
+
+	struct WorkerRefreshFlight {
+		explicit WorkerRefreshFlight(std::shared_future<WorkerSnapshotResult> result_p) : result(std::move(result_p)) {
+		}
+
+		std::shared_future<WorkerSnapshotResult> result;
+	};
+
 	struct State {
 		std::unordered_map<WorkerId, std::shared_ptr<RayWorkerRuntime>, WorkerIdHash, WorkerIdEqual> ray_workers;
 		std::pair<bool, std::chrono::steady_clock::time_point> last_refresh;
+		std::shared_ptr<WorkerRefreshFlight> worker_refresh;
 		std::unordered_map<string, std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>>>
 		    fte_result_handles_by_query;
 		std::unordered_map<string, std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>>>
@@ -92,6 +103,7 @@ private:
 
 	bool BeginOperation() const;
 	void EndOperation() const;
+	WorkerSnapshotResult WorkerSnapshotsWithoutGIL() const;
 	static string QueryIdFromTaskEvents(const std::vector<duckdb::distributed::WorkerTask> &tasks);
 	void StoreFteResultHandles(const string &query_id,
 	                           std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> handles);
