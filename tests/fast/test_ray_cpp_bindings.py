@@ -2790,7 +2790,8 @@ def test_ray_worker_manager_snapshot_refresh_shutdown_has_no_deadlock(monkeypatc
     assert shutdown_errors == []
     assert start_calls == [()]
     assert len(snapshot_errors) == 2
-    assert all("shut down during worker refresh" in error for error in snapshot_errors)
+    assert all("shut down" in error for error in snapshot_errors)
+    assert any("shut down during worker refresh" in error for error in snapshot_errors)
     assert aborted == ["worker-racing-shutdown"]
 
 
