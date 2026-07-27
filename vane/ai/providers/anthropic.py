@@ -11,6 +11,22 @@ Vane does not ship a default Anthropic model: the model must be supplied
 per call (``model=...``) or configured on the provider
 (``AnthropicProvider(prompt_model=...)``); the per-call model wins.
 
+Prompt options follow a strict contract enforced at descriptor
+construction, before any request is dispatched:
+
+- Every known Messages API request option is forwarded to the API
+  (``thinking``, ``metadata``, ``tool_choice``, ``service_tier``, ...).
+- Unknown option keys raise :class:`ValueError` instead of being
+  silently dropped.
+- Option/model combinations the API is documented to reject (for
+  example sampling parameters on Claude Sonnet 5) raise
+  :class:`ValueError` before dispatch.
+- ``max_tokens`` has no library default: it must be supplied per call
+  (``max_tokens=...``) or configured on the provider
+  (``AnthropicProvider(max_tokens=...)``); the per-call value wins.
+- A truncated response (``stop_reason == "max_tokens"``) raises instead
+  of silently returning partial text or ``None``.
+
 Requires::
 
     pip install 'vane-ai[anthropic]'
@@ -28,8 +44,93 @@ from vane.ai.provider import Provider, ProviderImportError
 from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from vane.ai.protocols import Prompter
     from vane.ai.typing import Options
+
+
+# Messages API request options Vane forwards verbatim. Verified against the
+# ``anthropic`` SDK (v0.117.0) ``Messages.create`` signature. Keys Vane owns
+# are deliberately absent: ``model``, ``messages``, ``system``, ``tools``, and
+# ``stream`` are managed by the prompter, and client configuration
+# (``api_key``, ``base_url``, ``timeout``, ``max_retries``) travels through
+# provider options.
+_KNOWN_PROMPT_OPTIONS: frozenset[str] = frozenset(
+    {
+        "cache_control",
+        "container",
+        "extra_body",
+        "extra_headers",
+        "extra_query",
+        "inference_geo",
+        "max_tokens",
+        "metadata",
+        "output_config",
+        "service_tier",
+        "stop_sequences",
+        "temperature",
+        "thinking",
+        "tool_choice",
+        "top_k",
+        "top_p",
+        "user_profile_id",
+    }
+)
+
+# Vane execution options that ride in ``prompt_options`` but are consumed by
+# the UDF machinery and never forwarded to the Messages API.
+_VANE_EXECUTION_OPTIONS: frozenset[str] = frozenset(
+    {
+        "actor_number",
+        "batch_size",
+        "concurrency",
+        "max_api_concurrency",
+        "num_gpus",
+        "on_error",
+    }
+)
+
+# Request options the API is documented to reject per model family. A model
+# matches an entry by family prefix: the exact id or ``<family>-<suffix>``
+# (dated snapshots and successors within the family). Documented sources:
+# https://platform.claude.com/docs/en/about-claude/models/whats-new-sonnet-5
+# (Claude Sonnet 5 returns a 400 error for non-default ``temperature``,
+# ``top_p``, or ``top_k``) and
+# https://platform.claude.com/docs/en/about-claude/models/migration-guide
+# (the same constraint on Claude Opus 4.7 and later Opus models).
+_MODEL_UNSUPPORTED_OPTIONS: dict[str, frozenset[str]] = {
+    "claude-opus-4-7": frozenset({"temperature", "top_k", "top_p"}),
+    "claude-opus-4-8": frozenset({"temperature", "top_k", "top_p"}),
+    "claude-opus-5": frozenset({"temperature", "top_k", "top_p"}),
+    "claude-sonnet-5": frozenset({"temperature", "top_k", "top_p"}),
+}
+
+
+def _validate_prompt_options(model_name: str, options: Mapping[str, Any]) -> None:
+    """Reject unknown or model-unsupported prompt options before dispatch.
+
+    Raises:
+        ValueError: If ``options`` contains keys that are neither known
+            Messages API request options nor Vane execution options, or
+            contains request options the selected model is documented to
+            reject.
+    """
+    unknown = sorted(key for key in options if key not in _KNOWN_PROMPT_OPTIONS and key not in _VANE_EXECUTION_OPTIONS)
+    if unknown:
+        raise ValueError(
+            f"Unknown Anthropic prompt option(s) {unknown} for model {model_name!r}. "
+            f"Supported Messages API request options: {sorted(_KNOWN_PROMPT_OPTIONS)}."
+        )
+    for family, unsupported in _MODEL_UNSUPPORTED_OPTIONS.items():
+        if model_name == family or model_name.startswith(f"{family}-"):
+            rejected = sorted(key for key in options if key in unsupported)
+            if rejected:
+                raise ValueError(
+                    f"Anthropic model {model_name!r} does not support option(s) {rejected}: "
+                    "the API rejects non-default sampling parameters for this model "
+                    "family. Remove the option(s) or select a model that supports them."
+                )
 
 
 def _guess_media_type(data: bytes) -> str:
@@ -51,6 +152,8 @@ class AnthropicProvider(Provider):
     Vane does not choose an Anthropic model for you. Configure an
     application-owned model via ``prompt_model=...`` here, or pass
     ``model=...`` on each call; the per-call model takes precedence.
+    The same applies to ``max_tokens``: configure it here or pass it per
+    call; the per-call value wins.
 
     Args:
         name: Optional display-name override (default ``"anthropic"``).
@@ -62,6 +165,8 @@ class AnthropicProvider(Provider):
             client.
         prompt_model: Model used by ``get_prompter`` when the call does not
             pass ``model=...``.
+        max_tokens: Response token cap used by ``get_prompter`` when the
+            call does not pass ``max_tokens``.
 
     All parameters are named; a mistyped keyword raises :class:`TypeError`
     instead of silently leaking into API request options.
@@ -78,9 +183,11 @@ class AnthropicProvider(Provider):
         timeout: Any = None,
         max_retries: int | None = None,
         prompt_model: str | None = None,
+        max_tokens: int | None = None,
     ):
         self._name = name or "anthropic"
         self._prompt_model = prompt_model
+        self._max_tokens = max_tokens
         client_options = {
             "api_key": api_key,
             "base_url": base_url,
@@ -110,11 +217,14 @@ class AnthropicProvider(Provider):
 
         The model resolves as: call-site ``model`` > provider
         ``prompt_model`` configuration; the selected value must be a
-        non-empty string.
+        non-empty string. ``max_tokens`` resolves as: call-site option >
+        provider ``max_tokens`` configuration.
 
         Raises:
-            ValueError: If no model is configured through either path, or
-                the selected model is not a non-empty string.
+            ValueError: If no model or no ``max_tokens`` is configured
+                through either path, if the selected model is not a
+                non-empty string, or if ``options`` contains unknown keys
+                or options the selected model does not support.
         """
         provider_options, prompt_options = self._split_options(options)
         model_name = model if model is not None else self._prompt_model
@@ -128,6 +238,8 @@ class AnthropicProvider(Provider):
                 f"Anthropic prompt model must be a non-empty string, got {model_name!r}. "
                 "Pass model=... or configure AnthropicProvider(prompt_model=...)."
             )
+        if "max_tokens" not in prompt_options and self._max_tokens is not None:
+            prompt_options["max_tokens"] = self._max_tokens
         return AnthropicPrompterDescriptor(
             provider_name=self._name,
             provider_options=provider_options,
@@ -143,8 +255,12 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
     """Serializable factory for an Anthropic Messages API prompter.
 
     ``model_name`` is required — Vane does not ship a default Anthropic
-    model. Supports structured output via Anthropic's ``tool_use``
-    mechanism and multimodal input (text + images).
+    model — and ``prompt_options`` must carry ``max_tokens``: there is no
+    library default. Construction validates the option contract: unknown
+    option keys and options the selected model is documented to reject
+    raise :class:`ValueError` before anything is dispatched. Supports
+    structured output via Anthropic's ``tool_use`` mechanism and
+    multimodal input (text + images).
     """
 
     model_name: str
@@ -157,6 +273,12 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
     def __post_init__(self) -> None:
         self.provider_options = wrap_sensitive_options(self.provider_options)
         self.prompt_options = wrap_sensitive_options(self.prompt_options)
+        _validate_prompt_options(self.model_name, self.prompt_options)
+        if "max_tokens" not in self.prompt_options:
+            raise ValueError(
+                "No max_tokens configured for the Anthropic provider. "
+                "Pass max_tokens=... or configure AnthropicProvider(max_tokens=...)."
+            )
 
     def get_provider(self) -> str:
         return self.provider_name
@@ -213,24 +335,10 @@ class AnthropicPrompter:
         self._model = model
         self._system_message = system_message
         self._return_format = return_format
-        self._options = {
-            k: v
-            for k, v in options.items()
-            if k
-            not in {
-                "api_key",
-                "base_url",
-                "timeout",
-                "max_retries",
-                "on_error",
-                "actor_number",
-                "num_gpus",
-                "concurrency",
-                "max_api_concurrency",
-                "model",
-                "batch_size",
-            }
-        }
+        # Forward only known Messages API request options; Vane execution
+        # options (and anything else) never reach the API. The descriptor
+        # rejects unknown keys before the prompter is ever built.
+        self._options = {k: v for k, v in options.items() if k in _KNOWN_PROMPT_OPTIONS}
         client_opts = {
             k: v for k, v in provider_options.items() if k in {"api_key", "base_url", "timeout", "max_retries"}
         }
@@ -331,20 +439,18 @@ class AnthropicPrompter:
 
         _flush_content()
 
+        # Forward every known request option; there is no implicit
+        # max_tokens default (the descriptor enforces its presence).
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": chat_messages,
-            "max_tokens": self._options.get("max_tokens", 1024),
+            **self._options,
         }
         if self._system_message:
             kwargs["system"] = self._system_message
 
-        # Forward extra options
-        for k in ("temperature", "top_p", "top_k", "stop_sequences"):
-            if k in self._options:
-                kwargs[k] = self._options[k]
-
-        # Structured output: use tool_use with forced tool choice
+        # Structured output: use tool_use with forced tool choice. This
+        # overrides any caller-supplied tool_choice for the extraction turn.
         if self._return_format is not None:
             tool_def = self._build_tool_schema()
             kwargs["tools"] = [tool_def]
@@ -363,6 +469,16 @@ class AnthropicPrompter:
                 provider="anthropic",
                 input_tokens=getattr(usage, "input_tokens", None),
                 output_tokens=getattr(usage, "output_tokens", None),
+            )
+
+        # Truncation is an error, never a silent partial answer. The raise
+        # routes through the UDF on_error policy like any other failure.
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            raise ValueError(
+                f"Anthropic response from model {self._model!r} was truncated at "
+                f"max_tokens={self._options.get('max_tokens')} (stop_reason='max_tokens'). "
+                "Raise max_tokens on the call or via AnthropicProvider(max_tokens=...) "
+                "to fit the full response."
             )
 
         if self._return_format is not None:
