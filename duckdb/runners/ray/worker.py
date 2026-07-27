@@ -167,22 +167,6 @@ def _cleanup_query_python_replay_state(query_id: str) -> None:
     cleanup(str(query_id))
 
 
-def _chaos_worker_loss_matches(task_id: FteTaskAttemptId) -> bool:
-    if not _env_flag_enabled("VANE_FTE_CHAOS_KILL_WORKER_ON_RUNNING"):
-        return False
-    target_worker_index = os.getenv("VANE_FTE_CHAOS_KILL_WORKER_INDEX", "").strip()
-    if target_worker_index:
-        worker_index = os.getenv("VANE_WORKER_INDEX", "").strip()
-        target_worker_indices = {index.strip() for index in target_worker_index.split(",") if index.strip()}
-        if worker_index not in target_worker_indices:
-            return False
-    target_attempt = os.getenv("VANE_FTE_CHAOS_KILL_ATTEMPT_ID", "0").strip()
-    if target_attempt and int(target_attempt) != int(task_id.attempt_id):
-        return False
-    target_task = os.getenv("VANE_FTE_CHAOS_KILL_TASK_ID", "").strip()
-    return not (target_task and target_task != str(task_id))
-
-
 def _cleanup_flight_shuffle_for_query(query_id: str) -> dict[str, Any]:
     query_id = str(query_id or "").strip()
     if not query_id:
@@ -288,18 +272,6 @@ async def _drain_flight_shuffle_for_query(
             )
         await asyncio.sleep(backoff_s)
         backoff_s = min(backoff_s * 2, 0.5)
-
-
-def _maybe_chaos_kill_worker(task_id: FteTaskAttemptId) -> None:
-    if not _chaos_worker_loss_matches(task_id):
-        return
-    delay_s = float(os.getenv("VANE_FTE_CHAOS_KILL_DELAY_S", "0") or "0")
-    if delay_s > 0:
-        import time
-
-        time.sleep(delay_s)
-    sys.stderr.flush()
-    os._exit(88)
 
 
 def _normalize_native_task_result(result: Any) -> tuple[Any, ...]:
@@ -921,7 +893,6 @@ class RayWorkerActor:
         )
 
         task_id = FteTaskAttemptId.coerce(request.get("task_id"))
-        _maybe_chaos_kill_worker(task_id)
         query_id = str(request.get("query_id") or task_id.query_id or "").strip() or None
         fragment_id = str(request.get("fragment_id", "")).strip()
         if not fragment_id:
