@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from itertools import count
 from multiprocessing import resource_tracker as _resource_tracker
@@ -41,7 +42,7 @@ _shm_debug_lock = threading.Lock()
 _shm_debug_seq = 0
 _local_shm_budget_cond = threading.Condition()
 _local_shm_budget_wakeup_lock = threading.Lock()
-_local_shm_budget_wakeup_callbacks: set[Any] = set()
+_local_shm_budget_wakeup_callbacks: set[Callable[[], None]] = set()
 _local_shm_budget_reserved_bytes = 0
 _local_shm_budget_pending_output_bytes = 0
 _local_shm_refs_created = 0
@@ -179,7 +180,7 @@ def _local_shm_ref_budget_limit_bytes() -> int:
         raise ValueError(f"VANE_LOCAL_SHM_REF_BUDGET_BYTES is not a valid byte size: {raw!r}") from exc
 
 
-def _make_local_shm_ref_budget_limit_factory():
+def _make_local_shm_ref_budget_limit_factory() -> Callable[[], int]:
     auto_limit_bytes: int | None = None
     auto_limit_lock = threading.Lock()
 
@@ -225,7 +226,7 @@ def _notify_local_shm_budget_wakeup_callbacks() -> None:
     raise RuntimeError(f"local_shm budget wakeup callbacks failed: {message}") from errors[0]
 
 
-def register_local_shm_ref_budget_wakeup(callback: Any):
+def register_local_shm_ref_budget_wakeup(callback: Callable[[], None]) -> Callable[[], None]:
     with _local_shm_budget_wakeup_lock:
         _local_shm_budget_wakeup_callbacks.add(callback)
 
@@ -237,7 +238,7 @@ def register_local_shm_ref_budget_wakeup(callback: Any):
 
 
 class LocalShmBudgetManager:
-    def __init__(self, *, limit_factory: Any | None = None) -> None:
+    def __init__(self, *, limit_factory: Callable[[], int] | None = None) -> None:
         self._cond = threading.Condition()
         self._limit_factory = limit_factory or _make_local_shm_ref_budget_limit_factory()
         self._allocated_bytes = 0
@@ -931,37 +932,47 @@ def _arrow_table_from_ipc_bytes(data: bytes) -> pa.Table:
     return reader.read_all()
 
 
+def _require_shm_buffer(shm: shared_memory.SharedMemory) -> memoryview[int]:
+    buffer = shm.buf
+    if buffer is None:
+        raise RuntimeError(f"shared memory segment {shm.name!r} is closed")
+    return buffer
+
+
 def _write_ipc_to_shm(shm: shared_memory.SharedMemory, ipc_bytes: bytes) -> int:
+    buffer = _require_shm_buffer(shm)
     required = _IPC_HEADER_SIZE + len(ipc_bytes)
-    if required > len(shm.buf):
+    if required > len(buffer):
         raise BufferError("shared memory segment is too small for Arrow IPC payload")
-    shm.buf[:_IPC_HEADER_SIZE] = len(ipc_bytes).to_bytes(_IPC_HEADER_SIZE, "little")
-    shm.buf[_IPC_HEADER_SIZE:required] = ipc_bytes
+    buffer[:_IPC_HEADER_SIZE] = len(ipc_bytes).to_bytes(_IPC_HEADER_SIZE, "little")
+    buffer[_IPC_HEADER_SIZE:required] = ipc_bytes
     return required
 
 
 def _read_ipc_from_shm(shm: shared_memory.SharedMemory, size: int | None = None) -> bytes:
-    if len(shm.buf) < _IPC_HEADER_SIZE:
+    buffer = _require_shm_buffer(shm)
+    if len(buffer) < _IPC_HEADER_SIZE:
         raise BufferError("shared memory segment is too small for Arrow IPC header")
-    ipc_size = int.from_bytes(shm.buf[:_IPC_HEADER_SIZE], "little")
+    ipc_size = int.from_bytes(buffer[:_IPC_HEADER_SIZE], "little")
     required = _IPC_HEADER_SIZE + ipc_size
-    if required > len(shm.buf):
+    if required > len(buffer):
         raise BufferError(
-            f"shared memory IPC payload exceeds local mapping: required={required} capacity={len(shm.buf)}"
+            f"shared memory IPC payload exceeds local mapping: required={required} capacity={len(buffer)}"
         )
     if size is not None and required > size:
         raise BufferError(f"shared memory IPC payload exceeds descriptor size: required={required} size={size}")
-    return bytes(shm.buf[_IPC_HEADER_SIZE:required])
+    return bytes(buffer[_IPC_HEADER_SIZE:required])
 
 
 def _ipc_payload_bounds(shm: shared_memory.SharedMemory, size: int | None = None) -> tuple[int, int]:
-    if len(shm.buf) < _IPC_HEADER_SIZE:
+    buffer = _require_shm_buffer(shm)
+    if len(buffer) < _IPC_HEADER_SIZE:
         raise BufferError("shared memory segment is too small for Arrow IPC header")
-    ipc_size = int.from_bytes(shm.buf[:_IPC_HEADER_SIZE], "little")
+    ipc_size = int.from_bytes(buffer[:_IPC_HEADER_SIZE], "little")
     required = _IPC_HEADER_SIZE + ipc_size
-    if required > len(shm.buf):
+    if required > len(buffer):
         raise BufferError(
-            f"shared memory IPC payload exceeds local mapping: required={required} capacity={len(shm.buf)}"
+            f"shared memory IPC payload exceeds local mapping: required={required} capacity={len(buffer)}"
         )
     if size is not None and required > size:
         raise BufferError(f"shared memory IPC payload exceeds descriptor size: required={required} size={size}")
@@ -1024,7 +1035,7 @@ def _arrow_table_from_local_shm_zero_copy(name: str, size: int) -> pa.Table:
     owner: _LocalShmBufferOwner | None = None
     try:
         start, end = _ipc_payload_bounds(shm, size)
-        address = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf, start))
+        address = ctypes.addressof(ctypes.c_char.from_buffer(_require_shm_buffer(shm), start))
         owner = _LocalShmBufferOwner(shm)
         buffer = pa.foreign_buffer(address, end - start, base=owner)
         table = pa.ipc.open_stream(pa.BufferReader(buffer)).read_all()
@@ -1051,11 +1062,19 @@ def _unlink_shared_memory_name(name: str) -> None:
         shm.close()
 
 
-def _untrack_shm(shm: shared_memory.SharedMemory) -> shared_memory.SharedMemory:
-    name = shm._name
-    if not name:
-        shm.close()
+def _posix_shm_name(shm: shared_memory.SharedMemory) -> str:
+    name = getattr(shm, "_name", None)
+    if not isinstance(name, str) or not name:
         raise RuntimeError("shared memory handle is missing its POSIX name")
+    return name
+
+
+def _untrack_shm(shm: shared_memory.SharedMemory) -> shared_memory.SharedMemory:
+    try:
+        name = _posix_shm_name(shm)
+    except Exception:
+        shm.close()
+        raise
     _resource_tracker.unregister(name, "shared_memory")
     return shm
 
@@ -1074,7 +1093,10 @@ def _unlink_shm(shm: shared_memory.SharedMemory, *, track: bool) -> None:
     if track:
         shm.unlink()
         return
-    shared_memory._posixshmem.shm_unlink(shm._name)
+    posix_shmem = getattr(shared_memory, "_posixshmem", None)
+    if posix_shmem is None:
+        raise RuntimeError("multiprocessing.shared_memory has no POSIX unlink implementation")
+    posix_shmem.shm_unlink(_posix_shm_name(shm))
 
 
 class LocalShmBlockRef:
@@ -1212,7 +1234,7 @@ def make_local_shm_ref_bundle_result(
     table: pa.Table,
     *,
     cancel_event: _CancellationFlag | None = None,
-):
+) -> tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]]:
     table = _ensure_table(table)
     ipc_bytes = _arrow_table_to_ipc_bytes(table)
     required = _IPC_HEADER_SIZE + len(ipc_bytes)
@@ -1280,7 +1302,7 @@ def make_local_shm_ref_bundle_descriptor(table: pa.Table, *, grant_id: int | Non
             "ipc_size_bytes": int(required),
             "shm_name": shm.name,
         }
-        descriptor = {
+        descriptor: dict[str, Any] = {
             "block_refs": [
                 {
                     "provider": LOCAL_SHM_PROVIDER,
@@ -1352,7 +1374,7 @@ def make_local_shm_ref_bundle_result_from_descriptor(
     *,
     block_on_budget: bool = True,
     cancel_event: _CancellationFlag | None = None,
-):
+) -> tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]]:
     refs_in = list(descriptor.get("block_refs") or [])
     metadata_in = list(descriptor.get("metadata") or [{} for _ in refs_in])
     if len(refs_in) != len(metadata_in):

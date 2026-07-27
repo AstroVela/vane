@@ -23,6 +23,7 @@ from duckdb.execution._common import callable_cache_enabled as _callable_cache_e
 from duckdb.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
 from duckdb.execution.ref_bundle import (
     _open_existing_shm,
+    _require_shm_buffer,
     make_local_shm_ref_bundle_descriptor,
     materialize_ref_bundle,
     payload_requests_local_ref_bundle_output,
@@ -166,13 +167,6 @@ def _recv_message(sock: socket.socket) -> tuple[int, bytes]:
     return msg_type, payload
 
 
-def _require_shm_buffer(shm: shared_memory.SharedMemory) -> memoryview[int]:
-    buffer = shm.buf
-    if buffer is None:
-        raise RuntimeError("shared memory mapping is closed")
-    return buffer
-
-
 def _read_ipc_from_shm(shm: shared_memory.SharedMemory, size: int | None = None) -> bytes:
     buffer = _require_shm_buffer(shm)
     ipc_size = _IPC_HEADER.unpack_from(buffer, 0)[0]
@@ -197,10 +191,10 @@ def _write_ipc_to_shm(shm: shared_memory.SharedMemory, ipc_bytes: bytes) -> int:
 
 
 def _resize_shm(shm: shared_memory.SharedMemory, required: int) -> shared_memory.SharedMemory:
-    buffer = _require_shm_buffer(shm)
-    if required <= len(buffer):
+    capacity = len(_require_shm_buffer(shm))
+    if required <= capacity:
         return shm
-    new_size = max(required, len(buffer) * 2, _DEFAULT_SHM_SIZE)
+    new_size = max(required, capacity * 2, _DEFAULT_SHM_SIZE)
     name = shm.name
     path = f"/dev/shm/{name}"
     fd = os.open(path, os.O_RDWR)
@@ -231,7 +225,11 @@ def _format_exception(exc: BaseException) -> str:
         return repr(exc)
 
 
-def _send_input_consumed(sock: socket.socket, ref_bundle: dict[str, Any], input_table: pa.Table) -> None:
+def _send_input_consumed(
+    sock: socket.socket,
+    ref_bundle: dict[str, Any],
+    input_table: pa.Table,
+) -> None:
     lease_id = ref_bundle.get("input_lease_id")
     if lease_id is None:
         return
@@ -244,7 +242,11 @@ def _send_input_consumed(sock: socket.socket, ref_bundle: dict[str, Any], input_
     _send_message(sock, _MSG_INPUT_CONSUMED, duckdb_pickle.dumps(payload))
 
 
-def _send_input_consume_failed(sock: socket.socket, ref_bundle: dict[str, Any], exc: BaseException) -> None:
+def _send_input_consume_failed(
+    sock: socket.socket,
+    ref_bundle: dict[str, Any],
+    exc: BaseException,
+) -> None:
     lease_id = ref_bundle.get("input_lease_id")
     if lease_id is None:
         return
@@ -510,7 +512,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                 input_lease_id = None
                 if msg_type == _MSG_SUBMIT:
                     input_size = struct.unpack("<Q", payload_data)[0]
-                    if input_size > len(data_shm.buf):
+                    if input_size > len(_require_shm_buffer(data_shm)):
                         name = data_shm.name
                         data_shm.close()
                         data_shm = _open_existing_shm(name, track=False)
