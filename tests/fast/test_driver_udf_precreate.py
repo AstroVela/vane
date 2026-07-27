@@ -1551,7 +1551,6 @@ def _build_simple_ray_udf_plan(con):
         execution_backend="ray_actor",
         actor_number=1,
         gpus=0.0,
-        streaming_breaker=False,
     )
     plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
@@ -1664,7 +1663,7 @@ def test_physical_plan_structured_executor_options_reach_udf_builder(monkeypatch
     assert build_calls[0]["options"]["actor_node_ids"] == ["node-a"]
     assert build_calls[0]["options"]["query_driver_handle"] is query_driver_handle
     assert build_calls[0]["options"]["session_config"] == {}
-    assert table.column(0).to_pylist() == [2, 3]
+    assert sorted(table.column(0).to_pylist()) == [2, 3]
 
 
 def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
@@ -1759,7 +1758,6 @@ def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
             execution_backend="ray_actor",
             actor_number=1,
             gpus=0.0,
-            streaming_breaker=False,
         )
         plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             relation,
@@ -1778,7 +1776,12 @@ def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
 
         result = duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(cursor, plan, None, None)
         payloads = list(result.partition_payloads)
-        assert payloads[0].column(0).to_pylist() == [2, 3]
+        values = [
+            value
+            for payload in payloads
+            for value in payload.column(0).to_pylist()
+        ]
+        assert sorted(values) == [2, 3], values
 
         cursor.close()
         con.close()

@@ -104,13 +104,19 @@ private:
 	mutable std::mutex streaming_state_lock;
 };
 
-// Create a TableFunction with INOUT callbacks for udf execution.
-// Used by the planner to create PhysicalTableInOutFunction.
+// Create the serializable TableFunction descriptor used by
+// PhysicalStreamingUDF. Its pull callbacks reject execution.
 TableFunction MakeUDFTableFunction(Value payload, const vector<LogicalType> &return_types,
                                    const vector<string> &return_names);
 
-// Create a named, registered TableFunction with INOUT callbacks.
-// Used by conn.create_function() to register a named UDF in the catalog.
+// Identify UDF-backed table functions that must be planned as
+// PhysicalStreamingUDF instead of a pull-based table-in/table-out operator.
+bool IsUDFTableFunction(const TableFunction &function);
+
+// Normalize and validate the mandatory output-consumer payload contract.
+Value RequireUDFStreamingOutput(Value payload);
+
+// Create the equivalent named descriptor used by conn.create_function().
 TableFunction MakeUDFRegisteredTableFunction(string name, Value payload, vector<LogicalType> output_types,
                                              vector<string> output_names);
 

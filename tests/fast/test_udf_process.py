@@ -29,6 +29,7 @@ def test_unregister_timeout_detaches_stale_dispatcher_work():
         import duckdb
         import duckdb.execution.udf as udf_exec
         import pyarrow as pa
+        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
 
         dispatcher_blocked = threading.Event()
         release_dispatcher = threading.Event()
@@ -66,7 +67,7 @@ def test_unregister_timeout_detaches_stale_dispatcher_work():
                 self._output = (
                     "__vane_submit_result__",
                     int(submit_id),
-                    pa.table({"y": [value + 1 for value in values]}),
+                    make_local_shm_ref_bundle_result(pa.table({"y": [value + 1 for value in values]})),
                 )
                 if self._wakeup is not None:
                     self._wakeup()
@@ -110,7 +111,6 @@ def test_unregister_timeout_detaches_stale_dispatcher_work():
                 add_one,
                 schema={"y": duckdb.sqltypes.BIGINT},
                 execution_backend="subprocess_task",
-                streaming_breaker=False,
             )
 
 
@@ -193,6 +193,7 @@ def test_unregister_timeout_keeps_context_alive_during_input_conversion():
         import duckdb
         import duckdb.execution.udf as udf_exec
         import pyarrow as pa
+        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
 
         conversion_blocked = threading.Event()
         release_conversion = threading.Event()
@@ -248,7 +249,7 @@ def test_unregister_timeout_keeps_context_alive_during_input_conversion():
                 self._output = (
                     "__vane_submit_result__",
                     int(submit_id),
-                    pa.table({"y": [value + 1 for value in values]}),
+                    make_local_shm_ref_bundle_result(pa.table({"y": [value + 1 for value in values]})),
                 )
                 if self._wakeup is not None:
                     self._wakeup()
@@ -288,7 +289,6 @@ def test_unregister_timeout_keeps_context_alive_during_input_conversion():
                 add_one,
                 schema={"y": output_type},
                 execution_backend="subprocess_task",
-                streaming_breaker=False,
             )
 
 

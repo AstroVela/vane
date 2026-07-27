@@ -2163,9 +2163,8 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MapBatches(
     const Optional<py::object> &preserve_compute_batch_boundaries, const Optional<py::object> &cpus,
     const Optional<py::object> &gpus, const Optional<py::object> &memory_bytes,
     const Optional<py::object> &execution_backend, const Optional<py::object> &actor_number,
-    const Optional<py::object> &ray_actor_thread_policy, const Optional<py::object> &streaming_breaker,
-    const Optional<py::object> &target_max_batch_bytes, const Optional<py::object> &task_input_max_bytes,
-    const Optional<py::object> &output_target_max_bytes) {
+    const Optional<py::object> &ray_actor_thread_policy, const Optional<py::object> &target_max_batch_bytes,
+    const Optional<py::object> &task_input_max_bytes, const Optional<py::object> &output_target_max_bytes) {
 	AssertRelation();
 	if (schema.is_none() || !py::isinstance<py::dict>(schema)) {
 		throw InvalidInputException("map_batches requires a schema dict");
@@ -2188,15 +2187,6 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MapBatches(
 	                                     min_task_batch_size, preserve_compute_batch_boundaries, actor_number,
 	                                     target_max_batch_bytes, task_input_max_bytes, output_target_max_bytes,
 	                                     /*side_effects=*/false);
-	const bool streaming_breaker_requested = streaming_breaker.is_none() || py::cast<bool>(streaming_breaker);
-	if (!min_task_batch_size.is_none() && !streaming_breaker_requested) {
-		throw InvalidInputException("min_task_batch_size requires streaming_breaker=True");
-	}
-	if (!preserve_compute_batch_boundaries.is_none() && py::cast<bool>(preserve_compute_batch_boundaries) &&
-	    !streaming_breaker_requested) {
-		throw InvalidInputException("preserve_compute_batch_boundaries requires streaming_breaker=True");
-	}
-
 	// Add input_names to payload for column renaming in Python executors
 	auto &existing_children = StructValue::GetChildren(payload);
 	auto &existing_type = payload.type();
@@ -2214,16 +2204,13 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MapBatches(
 	}
 	new_children.emplace_back("input_names", Value::LIST(LogicalType::VARCHAR, std::move(input_name_values)));
 	new_children.emplace_back("row_preserving", Value::BOOLEAN(false));
-	if (streaming_breaker_requested) {
-		new_children.emplace_back("streaming_breaker", Value::BOOLEAN(true));
-		if (uses_subprocess_backend) {
-			new_children.emplace_back("produce_ref_bundle_output", Value::BOOLEAN(true));
-			new_children.emplace_back("streaming_output_mode", Value("local_shm_ref_bundle"));
-		} else {
-			new_children.emplace_back("produce_ray_block_stream", Value::BOOLEAN(true));
-		}
-		new_children.emplace_back("prebatched_input", Value::BOOLEAN(false));
+	if (uses_subprocess_backend) {
+		new_children.emplace_back("produce_ref_bundle_output", Value::BOOLEAN(true));
+		new_children.emplace_back("streaming_output_mode", Value("local_shm_ref_bundle"));
+	} else {
+		new_children.emplace_back("produce_ray_block_stream", Value::BOOLEAN(true));
 	}
+	new_children.emplace_back("prebatched_input", Value::BOOLEAN(false));
 	payload = Value::STRUCT(std::move(new_children));
 
 	// Build udf(col1, col2, ..., payload) expression
@@ -2296,8 +2283,8 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FlatMap(
     const Optional<py::object> &preserve_compute_batch_boundaries, const Optional<py::object> &cpus,
     const Optional<py::object> &gpus, const Optional<py::object> &memory_bytes,
     const Optional<py::object> &execution_backend, const Optional<py::object> &actor_number,
-    const Optional<py::object> &streaming_breaker, const Optional<py::object> &target_max_batch_bytes,
-    const Optional<py::object> &task_input_max_bytes, const Optional<py::object> &output_target_max_bytes) {
+    const Optional<py::object> &target_max_batch_bytes, const Optional<py::object> &task_input_max_bytes,
+    const Optional<py::object> &output_target_max_bytes) {
 	AssertRelation();
 	if (schema.is_none() || !py::isinstance<py::dict>(schema)) {
 		throw InvalidInputException("flat_map requires a schema dict");
@@ -2319,15 +2306,6 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FlatMap(
 	                                     target_max_batch_bytes, task_input_max_bytes, output_target_max_bytes,
 	                                     /*side_effects=*/false,
 	                                     /*flat_map=*/true);
-	const bool streaming_breaker_requested = streaming_breaker.is_none() || py::cast<bool>(streaming_breaker);
-	if (!min_task_batch_size.is_none() && !streaming_breaker_requested) {
-		throw InvalidInputException("min_task_batch_size requires streaming_breaker=True");
-	}
-	if (!preserve_compute_batch_boundaries.is_none() && py::cast<bool>(preserve_compute_batch_boundaries) &&
-	    !streaming_breaker_requested) {
-		throw InvalidInputException("preserve_compute_batch_boundaries requires streaming_breaker=True");
-	}
-
 	// Add input_names to payload for column renaming in Python executors
 	{
 		auto &existing_children = StructValue::GetChildren(payload);
@@ -2342,16 +2320,13 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FlatMap(
 		}
 		new_children.emplace_back("input_names", Value::LIST(LogicalType::VARCHAR, std::move(input_name_values)));
 		new_children.emplace_back("row_preserving", Value::BOOLEAN(false));
-		if (streaming_breaker_requested) {
-			new_children.emplace_back("streaming_breaker", Value::BOOLEAN(true));
-			if (uses_subprocess_backend) {
-				new_children.emplace_back("produce_ref_bundle_output", Value::BOOLEAN(true));
-				new_children.emplace_back("streaming_output_mode", Value("local_shm_ref_bundle"));
-			} else {
-				new_children.emplace_back("produce_ray_block_stream", Value::BOOLEAN(true));
-			}
-			new_children.emplace_back("prebatched_input", Value::BOOLEAN(false));
+		if (uses_subprocess_backend) {
+			new_children.emplace_back("produce_ref_bundle_output", Value::BOOLEAN(true));
+			new_children.emplace_back("streaming_output_mode", Value("local_shm_ref_bundle"));
+		} else {
+			new_children.emplace_back("produce_ray_block_stream", Value::BOOLEAN(true));
 		}
+		new_children.emplace_back("prebatched_input", Value::BOOLEAN(false));
 		payload = Value::STRUCT(std::move(new_children));
 	}
 

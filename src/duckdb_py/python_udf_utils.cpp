@@ -576,7 +576,6 @@ Value BuildExpressionMapBatchesUDFPayload(const string &name, const py::function
 	}
 	if (row_preserving) {
 		fields.emplace_back("call_mode", Value("map_batches_rows"));
-		fields.emplace_back("streaming_breaker", Value::BOOLEAN(true));
 		fields.emplace_back("produce_ray_block_stream", Value::BOOLEAN(ray_backend));
 		fields.emplace_back("produce_ref_bundle_output", Value::BOOLEAN(!ray_backend));
 		fields.emplace_back("stream_output", Value::BOOLEAN(true));
@@ -584,7 +583,6 @@ Value BuildExpressionMapBatchesUDFPayload(const string &name, const py::function
 			fields.emplace_back("streaming_output_mode", Value("local_shm_ref_bundle"));
 		}
 	} else {
-		fields.emplace_back("streaming_breaker", Value::BOOLEAN(true));
 		fields.emplace_back("produce_ray_block_stream", Value::BOOLEAN(ray_backend));
 		fields.emplace_back("produce_ref_bundle_output", Value::BOOLEAN(!ray_backend));
 		if (!ray_backend) {

@@ -399,7 +399,6 @@ def test_execute_native_subprocess_udf_reports_admission_task_stats(tmp_path):
             schema={"x": duckdb.sqltype("INTEGER")},
             execution_backend="subprocess_task",
             batch_size=1,
-            streaming_breaker=True,
         )
         plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             relation,

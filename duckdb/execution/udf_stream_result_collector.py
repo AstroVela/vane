@@ -380,7 +380,10 @@ class AsyncResultCollector:
     def _pending_data_count_locked(self, slot_id: int) -> int:
         ready = sum(1 for event in self._ready_by_slot.get(slot_id, ()) if event.kind == "data")
         in_progress = sum(
-            1 for record in self._records.values() if record.slot_id == slot_id and record.phase != "block"
+            1
+            for record in self._records.values()
+            if record.slot_id == slot_id
+            and (record.phase != "block" or (record.wait_kind == "data" and record.wait_future is not None))
         )
         return ready + in_progress
 

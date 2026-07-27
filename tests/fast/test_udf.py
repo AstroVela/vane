@@ -9,13 +9,13 @@ These tests verify that Python UDFs work through the Relation methods.
 import pytest
 
 
-def _run_udf_width_probe(tmp_path, *, streaming_breaker):
+def _run_udf_width_probe(tmp_path):
     import os
     import subprocess
     import sys
     import textwrap
 
-    data_dir = tmp_path / ("streaming_width" if streaming_breaker else "inout_width")
+    data_dir = tmp_path / "streaming_width"
     script = textwrap.dedent(
         f"""
         import duckdb
@@ -42,7 +42,6 @@ def _run_udf_width_probe(tmp_path, *, streaming_breaker):
             schema={{"x": duckdb.sqltypes.INTEGER}},
             execution_backend="subprocess_task",
             batch_size=2048,
-            streaming_breaker={streaming_breaker!r},
         )
         print(rel.aggregate("count(*)").fetchall())
         """
@@ -66,13 +65,13 @@ def _run_udf_width_probe(tmp_path, *, streaming_breaker):
     return result.stdout + result.stderr
 
 
-def _run_udf_actor_width_probe(tmp_path, *, streaming_breaker):
+def _run_udf_actor_width_probe(tmp_path):
     import os
     import subprocess
     import sys
     import textwrap
 
-    data_dir = tmp_path / ("streaming_actor_width" if streaming_breaker else "inout_actor_width")
+    data_dir = tmp_path / "streaming_actor_width"
     script = textwrap.dedent(
         f"""
         import duckdb
@@ -102,7 +101,6 @@ def _run_udf_actor_width_probe(tmp_path, *, streaming_breaker):
             actor_number=2,
             gpus=0.0,
             batch_size=2048,
-            streaming_breaker={streaming_breaker!r},
         )
         print(rel.aggregate("count(*)").fetchall())
         """
@@ -482,7 +480,7 @@ def _run_subprocess_lazy_byte_submit_probe(tmp_path):
     raise AssertionError(summarize_log(log))
 
 
-def test_map_batches_ray_streaming_contract_cannot_be_disabled():
+def test_map_batches_requires_strict_streaming_contract():
     """Ray stages always use the graph-owned direct block stream."""
     import duckdb
 
@@ -492,34 +490,33 @@ def test_map_batches_ray_streaming_contract_cannot_be_disabled():
     con = duckdb.connect()
     rel = con.sql("select 1 as x")
 
-    disabled = rel.map_batches(
-        identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
-        execution_backend="ray_task",
-        batch_size=1,
-        streaming_breaker=False,
-    )
-    disabled_plan = disabled.explain()
-    assert "INOUT_FUNCTION" in disabled_plan
-    assert "call_mode" in disabled_plan
-    assert "map_batches" in disabled_plan
-    assert "execution_backend" in disabled_plan
-    assert "ray_task" in disabled_plan
-    assert "lazy_ref_boundary" in disabled_plan
-    assert "strict_ref_aware" in disabled_plan
-    assert "ray_block_stream_output" in disabled_plan
-    assert "direct_block_metadata_pair" in disabled_plan
+    with pytest.raises(TypeError, match="streaming_breaker"):
+        rel.map_batches(
+            identity,
+            schema={"x": duckdb.sqltypes.INTEGER},
+            execution_backend="ray_task",
+            batch_size=1,
+            **{"streaming_breaker": False},
+        )
+    with pytest.raises(TypeError, match="streaming_breaker"):
+        rel.flat_map(
+            identity,
+            schema={"x": duckdb.sqltypes.INTEGER},
+            execution_backend="ray_task",
+            **{"streaming_breaker": False},
+        )
 
-    default_streaming = rel.map_batches(
+    streaming = rel.map_batches(
         identity,
         schema={"x": duckdb.sqltypes.INTEGER},
         execution_backend="ray_task",
         batch_size=1,
     )
-    default_plan = default_streaming.explain()
-    assert "STREAMING_UDF" in default_plan
-    assert "ray_block_stream_output" in default_plan
-    assert "direct_block_metadata_pair" in default_plan
+    plan = streaming.explain()
+    assert "STREAMING_UDF" in plan
+    assert "INOUT_FUNCTION" not in plan
+    assert "ray_block_stream_output" in plan
+    assert "direct_block_metadata_pair" in plan
 
 
 def test_map_batches_nested_reserved_field_name_round_trips_at_bind():
@@ -584,14 +581,60 @@ def test_scalar_ray_task_uses_mandatory_direct_block_stream_contract():
         .explain()
     )
 
-    assert "INOUT_FUNCTION" in plan
+    assert "STREAMING_UDF" in plan
+    assert "INOUT_FUNCTION" not in plan
     assert "lazy_ref_boundary" in plan
     assert "strict_ref_aware" in plan
     assert "ray_block_stream_output" in plan
     assert "direct_block_metadata_pair" in plan
 
 
-def test_map_batches_streaming_breaker_defaults_on_for_subprocess_actor():
+def test_scalar_subprocess_task_consumer_preserves_input_rows():
+    import duckdb
+
+    def plus_one(value):
+        return value + 1
+
+    rows = (
+        duckdb.connect()
+        .sql("select i::INTEGER as a from range(4) t(i)")
+        .map(
+            plus_one,
+            return_type=duckdb.sqltypes.INTEGER,
+            execution_backend="subprocess_task",
+        )
+        .project("a, value")
+        .fetchall()
+    )
+
+    assert rows == [(0, 1), (1, 2), (2, 3), (3, 4)]
+
+
+def test_scalar_subprocess_actor_consumer_preserves_input_rows():
+    import duckdb
+
+    class PlusOne:
+        def __call__(self, value):
+            return value + 1
+
+    rows = (
+        duckdb.connect()
+        .sql("select i::INTEGER as a from range(4) t(i)")
+        .map(
+            PlusOne,
+            return_type=duckdb.sqltypes.INTEGER,
+            execution_backend="subprocess_actor",
+            actor_number=1,
+            gpus=0.0,
+        )
+        .project("a, value")
+        .fetchall()
+    )
+
+    assert rows == [(0, 1), (1, 2), (2, 3), (3, 4)]
+
+
+def test_map_batches_uses_strict_consumer_for_subprocess_actor():
     import duckdb
 
     class Identity:
@@ -615,32 +658,7 @@ def test_map_batches_streaming_breaker_defaults_on_for_subprocess_actor():
     assert "local_shm_ref_bundle" in plan
 
 
-def test_map_batches_subprocess_actor_streaming_breaker_plan_opt_in():
-    import duckdb
-
-    class Identity:
-        def __call__(self, table):
-            return table
-
-    con = duckdb.connect()
-    rel = con.sql("select 1 as x").map_batches(
-        Identity,
-        schema={"x": duckdb.sqltypes.INTEGER},
-        execution_backend="subprocess_actor",
-        actor_number=1,
-        gpus=0.0,
-        batch_size=1,
-        streaming_breaker=True,
-    )
-
-    plan = rel.explain()
-    assert "STREAMING_UDF" in plan
-    assert "execution_backend" in plan
-    assert "subprocess_actor" in plan
-    assert "local_shm_ref_bundle" in plan
-
-
-def test_map_batches_subprocess_actor_streaming_breaker_fetches_rows():
+def test_map_batches_subprocess_actor_consumer_fetches_rows():
     import pyarrow as pa
 
     import duckdb
@@ -658,7 +676,6 @@ def test_map_batches_subprocess_actor_streaming_breaker_fetches_rows():
         actor_number=1,
         gpus=0.0,
         batch_size=2,
-        streaming_breaker=True,
     )
 
     assert sorted(rel.fetchall()) == [(1,), (2,), (3,), (4,), (5,)]
@@ -679,7 +696,6 @@ def test_map_batches_subprocess_streaming_fetch_rows():
         schema={"y": duckdb.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         batch_size=1,
-        streaming_breaker=True,
     )
 
     assert sorted(rel.fetchall()) == [(1,), (2,), (3,), (4,)]
@@ -701,13 +717,12 @@ def test_map_batches_subprocess_streaming_drains_after_sink_finalize():
         schema={"x": duckdb.sqltypes.BIGINT},
         execution_backend="subprocess_task",
         batch_size=64,
-        streaming_breaker=True,
     )
 
     assert rel.aggregate("count(*)").fetchone() == (row_count,)
 
 
-def test_streaming_breaker_waits_for_tail_events_without_source_finalize_spin():
+def test_streaming_udf_waits_for_tail_events_without_source_finalize_spin():
     pytest.importorskip("pyarrow")
     import os
     import re
@@ -731,7 +746,6 @@ def test_streaming_breaker_waits_for_tail_events_without_source_finalize_spin():
             schema={"x": duckdb.sqltypes.BIGINT},
             execution_backend="subprocess_task",
             batch_size=64,
-            streaming_breaker=True,
         )
         assert rel.aggregate("count(*)").fetchone() == (70,)
         """
@@ -769,14 +783,12 @@ def test_map_batches_chained_streaming_flushes_partial_pending_before_input_cap(
             schema={"x": duckdb.sqltypes.BIGINT},
             execution_backend="subprocess_task",
             batch_size=10,
-            streaming_breaker=True,
         )
         .map_batches(
             identity,
             schema={"x": duckdb.sqltypes.BIGINT},
             execution_backend="subprocess_task",
             batch_size=64,
-            streaming_breaker=True,
         )
     )
 
@@ -798,7 +810,6 @@ def test_map_batches_subprocess_task_native_parallel_plan_and_fetches_rows():
         schema={"y": duckdb.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         batch_size=1,
-        streaming_breaker=True,
     )
 
     plan = rel.explain()
@@ -825,7 +836,6 @@ def test_map_batches_subprocess_task_default_concurrency_resolves_at_operator_in
         schema={"y": duckdb.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         batch_size=1,
-        streaming_breaker=True,
     )
 
     plan = rel.explain()
@@ -837,18 +847,10 @@ def test_map_batches_subprocess_task_default_concurrency_resolves_at_operator_in
 
 
 def test_map_batches_subprocess_task_streaming_width_resolves_from_pipeline(tmp_path):
-    log = _run_udf_width_probe(tmp_path, streaming_breaker=True)
+    log = _run_udf_width_probe(tmp_path)
     assert "streaming_ctor_unresolved udf_name=ident initial_config_width=1" in log
     assert "streaming_ctor_initial_resolve" not in log
     assert "streaming_resolve_commit udf_name=ident width=4 operator_width_resolved=true" in log
-    assert "payload_udf_worker_slots=4" in log
-    assert "executor_init mode=task backend='subprocess_task' pool_size=4" in log
-
-
-def test_map_batches_subprocess_task_inout_width_resolves_before_local_init(tmp_path):
-    log = _run_udf_width_probe(tmp_path, streaming_breaker=False)
-    assert "pipeline_max_threads_resolved udf_name=ident max_threads=4" in log
-    assert "resolve_runtime_commit udf_name=ident reason=pipeline_resolved width=4" in log
     assert "payload_udf_worker_slots=4" in log
     assert "executor_init mode=task backend='subprocess_task' pool_size=4" in log
 
@@ -899,7 +901,6 @@ def test_map_batches_without_batch_size_submits_each_upstream_work_unit(tmp_path
         schema={"x": duckdb.sqltypes.INTEGER, "task_rows": duckdb.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         target_max_batch_bytes=1 << 30,
-        streaming_breaker=True,
     )
     counts = {}
     for _x, task_rows in rel.fetchall():
@@ -917,14 +918,12 @@ def test_map_batches_without_batch_size_submits_each_upstream_work_unit(tmp_path
             schema={"x": duckdb.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             target_max_batch_bytes=1 << 30,
-            streaming_breaker=True,
         )
         .map_batches(
             annotate_task_rows,
             schema={"x": duckdb.sqltypes.INTEGER, "task_rows": duckdb.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             target_max_batch_bytes=1 << 30,
-            streaming_breaker=True,
         )
     )
     chained_counts = {}
@@ -963,7 +962,6 @@ def test_map_batches_materialized_byte_split_preserves_complete_compute_batches(
         execution_backend="subprocess_task",
         batch_size=100,
         target_max_batch_bytes=512 * 1024,
-        streaming_breaker=True,
     )
     counts = {}
     for (batch_rows,) in rel.fetchall():
@@ -1004,7 +1002,6 @@ def test_map_batches_can_request_soft_minimum_task_batch_size():
         min_task_batch_size=32,
         target_max_batch_bytes=1 << 30,
         task_input_max_bytes=1 << 30,
-        streaming_breaker=True,
     )
 
     compact_plan = "".join(ch for ch in rel.explain() if ch.isalnum() or ch == "_")
@@ -1035,14 +1032,6 @@ def test_map_batches_minimum_task_batch_size_validates_contract():
             batch_size=32,
             min_task_batch_size=16,
         )
-    with pytest.raises(duckdb.InvalidInputException, match="streaming_breaker=True"):
-        rel.map_batches(
-            identity,
-            schema={"x": duckdb.sqltypes.INTEGER},
-            batch_size=32,
-            min_task_batch_size=32,
-            streaming_breaker=False,
-        )
 
 
 def test_map_batches_can_preserve_compute_batch_output_boundaries():
@@ -1061,27 +1050,10 @@ def test_map_batches_can_preserve_compute_batch_output_boundaries():
         batch_size=2,
         output_batch_size=3,
         preserve_compute_batch_boundaries=True,
-        streaming_breaker=True,
     )
 
     compact_plan = "".join(ch for ch in rel.explain() if ch.isalnum() or ch == "_")
     assert "preserve_compute_batch_boundariestrue" in compact_plan
-
-
-def test_map_batches_compute_boundary_mode_requires_streaming_breaker():
-    import pyarrow as pa
-
-    import duckdb
-
-    with pytest.raises(duckdb.InvalidInputException, match="preserve_compute_batch_boundaries"):
-        duckdb.sql("select 1::INTEGER as x").map_batches(
-            lambda table: pa.table({"x": table.column("x")}),
-            schema={"x": duckdb.sqltypes.INTEGER},
-            execution_backend="subprocess_task",
-            batch_size=1,
-            preserve_compute_batch_boundaries=True,
-            streaming_breaker=False,
-        )
 
 
 @pytest.mark.timeout(60)
@@ -1094,14 +1066,14 @@ def test_map_batches_lazy_ref_submit_uses_byte_threshold_before_user_batch_size(
 
 
 def test_map_batches_subprocess_actor_uses_actor_pool_size(tmp_path):
-    log = _run_udf_actor_width_probe(tmp_path, streaming_breaker=True)
+    log = _run_udf_actor_width_probe(tmp_path)
     assert "streaming_resolve_commit udf_name=Ident width=4 operator_width_resolved=true" in log
     assert "payload_udf_worker_slots=2" in log
 
 
 @pytest.mark.timeout(30)
 @pytest.mark.parametrize("row_count", [2049, 6145])
-def test_map_batches_subprocess_task_inout_partial_tail_consumed_once(tmp_path, row_count):
+def test_map_batches_subprocess_task_partial_tail_consumed_once(tmp_path, row_count):
     import pyarrow as pa
 
     import duckdb
@@ -1121,7 +1093,6 @@ def test_map_batches_subprocess_task_inout_partial_tail_consumed_once(tmp_path, 
         schema={"x": duckdb.sqltypes.INTEGER},
         execution_backend="subprocess_task",
         batch_size=64,
-        streaming_breaker=False,
     )
 
     assert rel.aggregate("count(*)").fetchone() == (row_count,)
@@ -1469,7 +1440,6 @@ def test_map_batches_streaming_output_splits_by_actual_bytes_without_row_preserv
             execution_backend="subprocess_task",
             batch_size=8,
             target_max_batch_bytes=48 * 1024,
-            streaming_breaker=True,
         )
         .map_batches(
             record_downstream_batch,
@@ -1477,7 +1447,6 @@ def test_map_batches_streaming_output_splits_by_actual_bytes_without_row_preserv
             execution_backend="subprocess_task",
             batch_size=2048,
             target_max_batch_bytes=48 * 1024,
-            streaming_breaker=True,
         )
     )
 
@@ -1630,12 +1599,11 @@ def test_map_batches_subprocess_actor_streaming_fetches_rows():
         actor_number=2,
         gpus=0.0,
         batch_size=1,
-        streaming_breaker=True,
     )
     assert sorted(rel.fetchall()) == [(1,)]
 
 
-def test_map_batches_subprocess_actor_non_streaming_fetches_rows():
+def test_map_batches_subprocess_actor_fetches_rows():
     import duckdb
 
     class Identity:
@@ -1650,7 +1618,6 @@ def test_map_batches_subprocess_actor_non_streaming_fetches_rows():
         actor_number=1,
         gpus=0.0,
         batch_size=1,
-        streaming_breaker=False,
     )
     assert sorted(rel.fetchall()) == [(0,), (1,), (2,)]
 
@@ -1754,7 +1721,6 @@ def test_map_batches_rejects_removed_async_options():
             schema={"x": duckdb.sqltypes.INTEGER},
             execution_backend="ray_task",
             batch_size=1,
-            streaming_breaker=True,
             async_mode=True,
         )
 
@@ -2127,8 +2093,8 @@ def test_map_batches_basic():
     assert sorted(out.fetchall()) == [(11,), (12,)]
 
 
-def test_map_batches_direct_arrow_output_conversion():
-    """Non-streaming map_batches still accepts direct pyarrow.Table output."""
+def test_map_batches_routes_arrow_output_through_ref_bundle():
+    """Strict consumer delivery converts worker Arrow output to a ref bundle."""
     pytest.importorskip("pyarrow")
     import _duckdb
     import pyarrow as pa
@@ -2146,13 +2112,12 @@ def test_map_batches_direct_arrow_output_conversion():
         add_one,
         schema={"result": duckdb.sqltypes.BIGINT},
         batch_size=10,
-        streaming_breaker=False,
         execution_backend="subprocess_task",
     )
     assert out.fetchall() == [(1,), (2,), (3,), (4,), (5,)]
     counters = dict(_duckdb._udf_executor_debug_counters())
-    assert counters["udf_direct_arrow_table_conversion_count"] == 1
-    assert counters["udf_direct_output_arrow_table_conversion_count"] == 1
+    assert counters["udf_distributed_ref_bundle_data_events"] >= 1
+    assert counters["udf_direct_output_arrow_table_conversion_count"] == 0
     assert counters["udf_python_export_under_client_context_lock_count"] == 0
 
 
@@ -2479,14 +2444,12 @@ def test_subprocess_streaming_tensor_uses_batch_sized_chunks_under_low_memory():
             schema={"x": duckdb.sqltypes.BIGINT, "embedding": tensor_type},
             execution_backend="subprocess_task",
             batch_size=1,
-            streaming_breaker=True,
         )
         .map_batches(
             reduce_tensor,
             schema={"x": duckdb.sqltypes.BIGINT, "embedding_sum": duckdb.sqltypes.FLOAT},
             execution_backend="subprocess_task",
             batch_size=1,
-            streaming_breaker=True,
         )
     )
     assert out.fetchall() == [(1, 16384.0)]

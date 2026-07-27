@@ -968,7 +968,6 @@ def _video_source_udf_kwargs(
         # evaluated, just like Ray Data finalizes a block builder per read
         # task.
         "preserve_compute_batch_boundaries": True,
-        "streaming_breaker": True,
         "cpus": _video_source_udf_cpus(),
     }
     if execution_backend == "ray_task":

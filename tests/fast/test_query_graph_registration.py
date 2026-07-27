@@ -77,7 +77,6 @@ def test_stage_collection_preannotates_ray_udf_payload_on_original_plan(tmp_path
             execution_backend="ray_actor",
             actor_number=1,
             gpus=0.0,
-            streaming_breaker=False,
         )
         plan = _physical_plan(relation, con, "graph-udf")
 
@@ -125,7 +124,6 @@ def test_stage_collection_preserves_distinct_stage_identity_for_nested_udfs(tmp_
                 execution_backend="ray_actor",
                 actor_number=1,
                 gpus=0.0,
-                streaming_breaker=False,
             )
         )
         plan = _physical_plan(relation, con, "graph-nested-udf")
@@ -181,7 +179,6 @@ def test_stage_collection_pairs_reordered_branch_udfs_by_stable_identity(monkeyp
                 execution_backend="ray_task",
                 cpus=1.0,
                 memory_bytes=1 << 30,
-                streaming_breaker=False,
             )
             .set_alias("l")
         )
@@ -193,7 +190,6 @@ def test_stage_collection_pairs_reordered_branch_udfs_by_stable_identity(monkeyp
                 execution_backend="ray_task",
                 cpus=3.0,
                 memory_bytes=3 << 30,
-                streaming_breaker=False,
             )
             .set_alias("r")
         )

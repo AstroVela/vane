@@ -821,9 +821,8 @@ static void ValidateDistributedRefBundlePayload(const Value &payload) {
 	if (!GetStructBoolFlag(payload, "produce_ref_bundle_output")) {
 		throw InvalidInputException(
 		    "distributed UDF ref-bundle output contract requires produce_ref_bundle_output=true; udf_name=%s "
-		    "execution_backend=%s streaming_breaker=%s stream_output=%s",
+		    "execution_backend=%s stream_output=%s",
 		    GetStructStringOrDefault(payload, "udf_name", "<unknown>"), backend.second,
-		    GetStructBoolFlag(payload, "streaming_breaker") ? "true" : "false",
 		    GetStructBoolFlag(payload, "stream_output") ? "true" : "false");
 	}
 	auto mode = GetStructStringField(payload, "streaming_output_mode");
@@ -1066,11 +1065,7 @@ struct ExecutorSlot {
 	bool task_admission_reserved = false;
 	idx_t task_admission_retained_input_bytes = 0;
 
-	// Result queue: dispatcher pushes, pipeline threads pop
-	mutex result_lock;
-	std::deque<UDFResult> result_queue;
-
-	// Optional push consumer used by queue-driven streaming breaker sources.
+	// Required push consumer owned by the streaming UDF source.
 	mutex consumer_lock;
 	bool has_output_consumer = false;
 	UDFOutputConsumer output_consumer;
@@ -1173,12 +1168,11 @@ static shared_ptr<ClientContext> RequireActiveSlotContext(ExecutorSlot &slot, ui
 //
 // All Python/GIL interactions for UDF executors are routed through a
 // single background thread owned by this singleton.  Pipeline threads never
-// acquire the GIL — they push commands and pop results via per-slot queues.
+// acquire the GIL — they push commands while the dispatcher delivers results
+// through the required output consumer.
 
 class GlobalPythonDispatcher {
 public:
-	static constexpr size_t MAX_RESULT_QUEUE_PER_SLOT = 4;
-
 	static GlobalPythonDispatcher &Instance() {
 		static GlobalPythonDispatcher instance;
 		return instance;
@@ -1187,8 +1181,8 @@ public:
 	// Register a new executor slot. Returns the slot ID, raw pointer (valid
 	// until Unregister), and the generation captured by queued commands.
 	uint64_t Register(Value payload, vector<LogicalType> output_types, vector<LogicalType> ref_output_types,
-	                  ClientContext *ctx, shared_ptr<void> actor_handles, ExecutorSlot **out_slot,
-	                  uint64_t *out_generation) {
+	                  ClientContext *ctx, shared_ptr<void> actor_handles, UDFOutputConsumer output_consumer,
+	                  ExecutorSlot **out_slot, uint64_t *out_generation) {
 		ThrowIfDispatcherError();
 		lock_guard<mutex> g(global_lock);
 		slot_generation++;
@@ -1207,10 +1201,11 @@ public:
 		slot->expected_output_types = std::move(output_types);
 		slot->expected_ref_output_types = std::move(ref_output_types);
 		slot->context = ctx->shared_from_this();
-		const auto payload_async_mode = GetStructBoolFlag(slot->payload, "async_mode");
-		if (payload_async_mode && GetStructBoolFlag(slot->payload, "streaming_breaker")) {
-			throw InvalidInputException("streaming_breaker=True does not support async_mode=True");
+		if (GetStructBoolFlag(slot->payload, "async_mode")) {
+			throw InvalidInputException("async_mode=True is not supported by the strict UDF output-consumer contract");
 		}
+		slot->output_consumer = std::move(output_consumer);
+		slot->has_output_consumer = true;
 		slot->is_table_udf = ClassifyUDFMode(slot->payload) == UDFMode::RESULT_ONLY_BATCH;
 		auto *raw = slot.get();
 		slots[id] = std::move(slot);
@@ -1338,6 +1333,11 @@ public:
 				WakeupPipelineThread(*slot);
 			}
 		}
+		// Strict streaming operators defer task callbacks onto the dispatcher
+		// after their executor wakeup callback runs. The test hook must also
+		// flush that second hop so it can wake teardown while the dispatcher is
+		// deliberately blocked inside a Python conversion callback.
+		DrainDeferredWakeups();
 	}
 
 private:
@@ -1871,16 +1871,9 @@ private:
 			}
 			slot_ptr->actor_handles.reset();
 		}
-		{
-			std::deque<UDFResult> retired_results;
-			{
-				lock_guard<mutex> rg(slot_ptr->result_lock);
-				retired_results.swap(slot_ptr->result_queue);
-			}
-			slot_ptr->rows_by_submit_id.clear();
-			slot_ptr->ref_inputs_by_submit_id.clear();
-			slot_ptr->inflight_count.store(0);
-		}
+		slot_ptr->rows_by_submit_id.clear();
+		slot_ptr->ref_inputs_by_submit_id.clear();
+		slot_ptr->inflight_count.store(0);
 		{
 			lock_guard<mutex> g(global_lock);
 			auto it = slots.find(id);
@@ -1927,30 +1920,24 @@ private:
 			return {};
 		}
 		UDFOutputConsumer output_consumer;
-		if (GetOutputConsumer(slot, output_consumer)) {
-			ScopedGILReleaseIfHeld release_gil;
-			if (!output_consumer.data_capacity || !output_consumer.data_byte_capacity ||
-			    !output_consumer.data_item_byte_capacity) {
-				throw InvalidInputException(
-				    "registered udf output consumer requires event, byte, and item-byte capacity callbacks");
-			}
-			SlotResultCapacity result;
-			result.rows = output_consumer.data_capacity();
-			result.bytes = output_consumer.data_byte_capacity();
-			result.item_bytes = output_consumer.data_item_byte_capacity();
-			result.has_byte_capacity = true;
-			result.has_item_byte_capacity = true;
-			if (!IsActiveSlotGeneration(slot, generation)) {
-				return {};
-			}
-			return result;
+		if (!GetOutputConsumer(slot, output_consumer)) {
+			throw InternalException("UDF execution started without its required output consumer");
 		}
-		lock_guard<mutex> rg(slot.result_lock);
+		ScopedGILReleaseIfHeld release_gil;
+		if (!output_consumer.data_capacity || !output_consumer.data_byte_capacity ||
+		    !output_consumer.data_item_byte_capacity) {
+			throw InvalidInputException(
+			    "registered udf output consumer requires event, byte, and item-byte capacity callbacks");
+		}
 		SlotResultCapacity result;
-		if (slot.result_queue.size() >= MAX_RESULT_QUEUE_PER_SLOT) {
-			return result;
+		result.rows = output_consumer.data_capacity();
+		result.bytes = output_consumer.data_byte_capacity();
+		result.item_bytes = output_consumer.data_item_byte_capacity();
+		result.has_byte_capacity = true;
+		result.has_item_byte_capacity = true;
+		if (!IsActiveSlotGeneration(slot, generation)) {
+			return {};
 		}
-		result.rows = static_cast<idx_t>(MAX_RESULT_QUEUE_PER_SLOT - slot.result_queue.size());
 		return result;
 	}
 
@@ -2077,10 +2064,6 @@ private:
 				SetSlotError(slot, StringUtil::Format("udf executor close failed: %s", ex.what()));
 			}
 		}
-		{
-			lock_guard<mutex> rg(slot.result_lock);
-			slot.result_queue.clear();
-		}
 		slot.rows_by_submit_id.clear();
 		slot.ref_inputs_by_submit_id.clear();
 		slot.inflight_count.store(0);
@@ -2093,10 +2076,6 @@ private:
 		slot.inflight_count.store(0);
 		slot.finished_submitting_acked.store(true);
 		slot.all_tasks_finished.store(true);
-		{
-			lock_guard<mutex> rg(slot.result_lock);
-			slot.result_queue.clear();
-		}
 		slot.rows_by_submit_id.clear();
 		slot.ref_inputs_by_submit_id.clear();
 		if (first_abort && PythonRuntimeUsableForUDFTeardown()) {
@@ -2225,18 +2204,6 @@ private:
 		}
 	}
 
-	static UDFResult OutputEventToResult(UDFOutputEvent &&event) {
-		UDFResult result;
-		result.outputs = std::move(event.outputs);
-		result.ref_outputs = std::move(event.ref_outputs);
-		result.rows = std::move(event.rows);
-		result.submit_complete = event.submit_complete;
-		result.submit_id = event.submit_id;
-		result.handoff_output_lease = std::move(event.handoff_output_lease);
-		result.release_output_lease = std::move(event.release_output_lease);
-		return result;
-	}
-
 	void ReleaseTerminalSubmit(ExecutorSlot &slot, idx_t submit_id) {
 		auto inflight_before = slot.inflight_count.load();
 		if (submit_id > 0 && !slot.terminal_submit_ids.insert(submit_id).second) {
@@ -2260,63 +2227,6 @@ private:
 		    static_cast<long long>(inflight_before), static_cast<long long>(slot.inflight_count.load())));
 	}
 
-	void QueueTerminalControlResult(ExecutorSlot &slot, idx_t submit_id, uint64_t generation) {
-		if (!IsActiveSlotGeneration(slot, generation)) {
-			return;
-		}
-		UDFResult result;
-		result.outputs = MakeEmptyDataChunk();
-		result.rows = MakeEmptyDataChunk();
-		result.submit_complete = true;
-		result.submit_id = submit_id;
-		{
-			lock_guard<mutex> rg(slot.result_lock);
-			slot.result_queue.push_back(std::move(result));
-		}
-		ReleaseTerminalSubmit(slot, submit_id);
-		MaybeMarkSlotFinished(slot);
-		if (IsActiveSlotGeneration(slot, generation)) {
-			WakeupPipelineThread(slot);
-		}
-	}
-
-	UDFOutputConsumer ResolveOutputConsumer(ExecutorSlot &slot) {
-		UDFOutputConsumer output_consumer;
-		if (GetOutputConsumer(slot, output_consumer)) {
-			return output_consumer;
-		}
-
-		UDFOutputConsumer queue_consumer;
-		queue_consumer.data_capacity = [&slot]() {
-			lock_guard<mutex> rg(slot.result_lock);
-			if (slot.result_queue.size() >= MAX_RESULT_QUEUE_PER_SLOT) {
-				return idx_t(0);
-			}
-			return static_cast<idx_t>(MAX_RESULT_QUEUE_PER_SLOT - slot.result_queue.size());
-		};
-		queue_consumer.accept_event = [this, &slot](UDFOutputEvent &&event) {
-			if (event.kind == UDFOutputEventKind::ERROR) {
-				throw InvalidInputException("%s", event.error);
-			}
-			if (event.kind != UDFOutputEventKind::DATA) {
-				return;
-			}
-			auto result = OutputEventToResult(std::move(event));
-			{
-				lock_guard<mutex> rg(slot.result_lock);
-				slot.result_queue.push_back(std::move(result));
-			}
-			WakeupPipelineThread(slot);
-		};
-		queue_consumer.accept_error = [this, &slot](const string &msg) {
-			SetSlotError(slot, msg);
-		};
-		queue_consumer.notify_finished = [this, &slot]() {
-			NotifySlotFinished(slot);
-		};
-		return queue_consumer;
-	}
-
 	bool DeliverOutputEvent(ExecutorSlot &slot, UDFOutputEvent &&event, uint64_t generation) {
 		if (!IsActiveSlotGeneration(slot, generation)) {
 			ReleaseOutputLeaseCallback(event.release_output_lease);
@@ -2336,15 +2246,12 @@ private:
 			released_terminal_submit = true;
 			ReleaseTerminalSubmit(slot, submit_id_for_log);
 		};
-		UDFOutputConsumer registered_consumer;
-		const bool has_registered_output_consumer = GetOutputConsumer(slot, registered_consumer);
-		if (UDFDebugEnabled() &&
-		    (event_kind != UDFOutputEventKind::DATA || terminal_submit_event || has_registered_output_consumer)) {
+		if (UDFDebugEnabled() && (event_kind != UDFOutputEventKind::DATA || terminal_submit_event)) {
 			UDFDebugLog(StringUtil::Format(
-			    "deliver_event slot=%llu submit=%llu kind=%s submit_complete=%s registered_consumer=%s inflight=%lld",
+			    "deliver_event slot=%llu submit=%llu kind=%s submit_complete=%s inflight=%lld",
 			    static_cast<unsigned long long>(slot.id), static_cast<unsigned long long>(submit_id_for_log),
 			    UDFOutputEventKindName(event_kind), submit_complete ? "true" : "false",
-			    has_registered_output_consumer ? "true" : "false", static_cast<long long>(slot.inflight_count.load())));
+			    static_cast<long long>(slot.inflight_count.load())));
 		}
 
 		if (event_kind == UDFOutputEventKind::FINISHED) {
@@ -2352,7 +2259,13 @@ private:
 			return true;
 		}
 
-		auto consumer = has_registered_output_consumer ? registered_consumer : ResolveOutputConsumer(slot);
+		UDFOutputConsumer consumer;
+		if (!GetOutputConsumer(slot, consumer)) {
+			release_terminal_submit();
+			ReleaseOutputLeaseCallback(event.release_output_lease);
+			SetSlotError(slot, "UDF execution started without its required output consumer");
+			return true;
+		}
 		if (!consumer.accept_event) {
 			release_terminal_submit();
 			ReleaseOutputLeaseCallback(event.release_output_lease);
@@ -2360,33 +2273,13 @@ private:
 			return true;
 		}
 
-		if (event_kind == UDFOutputEventKind::DATA && !has_registered_output_consumer) {
-			bool capacity_available = true;
-			if (consumer.data_capacity) {
-				ScopedGILReleaseIfHeld release_gil;
-				capacity_available = consumer.data_capacity() > 0;
-			}
-			if (!IsActiveSlotGeneration(slot, generation)) {
-				ReleaseOutputLeaseCallback(event.release_output_lease);
-				return true;
-			}
-			if (!capacity_available) {
-				release_terminal_submit();
-				ReleaseOutputLeaseCallback(event.release_output_lease);
-				SetSlotError(slot, "udf output consumer capacity contract was violated");
-				return false;
-			}
-		}
-
 		auto release_on_consumer_error = event.release_output_lease;
 		try {
-			// Registered streaming consumers can wake the downstream source
+			// Streaming consumers can wake the downstream source
 			// synchronously from accept_event(). Release submit capacity first
 			// so the awakened source does not immediately block on stale
 			// inflight accounting.
-			if (has_registered_output_consumer) {
-				release_terminal_submit();
-			}
+			release_terminal_submit();
 			ScopedGILReleaseIfHeld release_gil;
 			consumer.accept_event(std::move(event));
 		} catch (const std::exception &ex) {
@@ -2406,30 +2299,14 @@ private:
 		}
 		release_terminal_submit();
 		if (event_kind == UDFOutputEventKind::ERROR) {
-			SetSlotError(slot, error_for_log.empty() ? "udf async error" : error_for_log);
+			// The ERROR event has already been accepted by the consumer.
+			// Record/abort the dispatcher slot without sending the same
+			// control error through accept_error a second time.
+			SetSlotError(slot, error_for_log.empty() ? "udf async error" : error_for_log, false);
 			return true;
 		}
 		MaybeMarkSlotFinished(slot);
-		if (!has_registered_output_consumer) {
-			WakeupPipelineThread(slot);
-		}
-		if (event_kind != UDFOutputEventKind::DATA) {
-			return true;
-		}
 		return true;
-	}
-
-	bool TryDeliverResult(ExecutorSlot &slot, UDFResult &&result, uint64_t generation) {
-		UDFOutputEvent event;
-		event.kind = UDFOutputEventKind::DATA;
-		event.submit_id = result.submit_id;
-		event.outputs = std::move(result.outputs);
-		event.ref_outputs = std::move(result.ref_outputs);
-		event.rows = std::move(result.rows);
-		event.submit_complete = result.submit_complete;
-		event.handoff_output_lease = std::move(result.handoff_output_lease);
-		event.release_output_lease = std::move(result.release_output_lease);
-		return DeliverOutputEvent(slot, std::move(event), generation);
 	}
 
 	const vector<LogicalType> &ExpectedDirectOutputTypes(ExecutorSlot &slot, idx_t submit_id) {
@@ -2529,13 +2406,14 @@ private:
 			slot.rows_by_submit_id.erase(row_entry);
 		}
 
-		UDFResult class_result;
-		class_result.outputs = std::move(outputs_chunk);
-		class_result.ref_outputs = std::move(ref_outputs);
-		class_result.rows = std::move(rows_chunk);
-		class_result.submit_complete = ready_result.submit_complete;
-		class_result.submit_id = submit_id;
-		if (!TryDeliverResult(slot, std::move(class_result), generation)) {
+		UDFOutputEvent event;
+		event.kind = UDFOutputEventKind::DATA;
+		event.outputs = std::move(outputs_chunk);
+		event.ref_outputs = std::move(ref_outputs);
+		event.rows = std::move(rows_chunk);
+		event.submit_complete = ready_result.submit_complete;
+		event.submit_id = submit_id;
+		if (!DeliverOutputEvent(slot, std::move(event), generation)) {
 			SetSlotError(slot, "udf async result queue: output consumer rejected capacity-aware delivery");
 			return true;
 		}
@@ -2776,12 +2654,13 @@ private:
 					slot.rows_by_submit_id.erase(row_entry);
 				}
 				auto empty_outputs = MakeEmptyDataChunk();
-				UDFResult empty_result;
-				empty_result.outputs = std::move(empty_outputs);
-				empty_result.rows = std::move(rows_chunk);
-				empty_result.submit_complete = ready_result.submit_complete;
-				empty_result.submit_id = submit_id;
-				if (!TryDeliverResult(slot, std::move(empty_result), generation)) {
+				UDFOutputEvent event;
+				event.kind = UDFOutputEventKind::DATA;
+				event.outputs = std::move(empty_outputs);
+				event.rows = std::move(rows_chunk);
+				event.submit_complete = ready_result.submit_complete;
+				event.submit_id = submit_id;
+				if (!DeliverOutputEvent(slot, std::move(event), generation)) {
 					SetSlotError(slot, "udf async: output consumer rejected capacity-aware delivery");
 					return false;
 				}
@@ -2837,13 +2716,14 @@ private:
 				slot.rows_by_submit_id.erase(row_entry);
 			}
 
-			UDFResult result;
-			result.outputs = std::move(outputs_chunk);
-			result.ref_outputs = std::move(ref_outputs);
-			result.rows = std::move(rows_chunk);
-			result.submit_complete = ready_result.submit_complete;
-			result.submit_id = submit_id;
-			if (!TryDeliverResult(slot, std::move(result), generation)) {
+			UDFOutputEvent event;
+			event.kind = UDFOutputEventKind::DATA;
+			event.outputs = std::move(outputs_chunk);
+			event.ref_outputs = std::move(ref_outputs);
+			event.rows = std::move(rows_chunk);
+			event.submit_complete = ready_result.submit_complete;
+			event.submit_id = submit_id;
+			if (!DeliverOutputEvent(slot, std::move(event), generation)) {
 				SetSlotError(slot, "udf async: output consumer rejected capacity-aware delivery");
 				return false;
 			}
@@ -2982,157 +2862,56 @@ private:
 							continue;
 						}
 
-						UDFOutputConsumer output_consumer;
-						if (GetOutputConsumer(*slot, output_consumer)) {
-							UDFOutputEvent event;
-							event.submit_id = submit_id;
-							event.submit_complete = false;
-							if (event_kind == "data") {
-								event.kind = UDFOutputEventKind::DATA;
-								try {
-									if (!IsPythonRefBundleResult(payload)) {
-										g_udf_distributed_direct_table_rejected_events.fetch_add(
-										    1, std::memory_order_relaxed);
-										event.kind = UDFOutputEventKind::ERROR;
-										event.submit_complete = true;
-										event.error =
-										    DistributedRefBundleContractError(slot->payload, submit_id, payload);
-										if (release_output_lease) {
-											release_output_lease();
-											release_output_lease = nullptr;
-										}
-									} else {
-										g_udf_distributed_ref_bundle_data_events.fetch_add(1,
-										                                                   std::memory_order_relaxed);
-										event.ref_outputs =
-										    ConvertPythonRefBundleResult(payload, slot->expected_ref_output_types);
-										event.handoff_output_lease = std::move(handoff_output_lease);
-										event.release_output_lease = std::move(release_output_lease);
-									}
-								} catch (const std::exception &ex) {
+						UDFOutputEvent event;
+						event.submit_id = submit_id;
+						event.submit_complete = false;
+						if (event_kind == "data") {
+							event.kind = UDFOutputEventKind::DATA;
+							try {
+								if (!IsPythonRefBundleResult(payload)) {
+									g_udf_distributed_direct_table_rejected_events.fetch_add(1,
+									                                                         std::memory_order_relaxed);
+									event.kind = UDFOutputEventKind::ERROR;
+									event.submit_complete = true;
+									event.error = DistributedRefBundleContractError(slot->payload, submit_id, payload);
 									if (release_output_lease) {
 										release_output_lease();
 										release_output_lease = nullptr;
 									}
-									event.kind = UDFOutputEventKind::ERROR;
-									event.submit_complete = true;
-									event.error = ex.what();
-								}
-							} else if (event_kind == "complete") {
-								event.kind = UDFOutputEventKind::COMPLETE;
-								event.submit_complete = true;
-							} else if (event_kind == "error") {
-								event.kind = UDFOutputEventKind::ERROR;
-								event.submit_complete = true;
-								event.error = py::str(payload).cast<string>();
-							} else {
-								event.kind = UDFOutputEventKind::ERROR;
-								event.submit_complete = true;
-								event.error = StringUtil::Format(
-								    "udf async collector returned unknown output event '%s'", event_kind);
-							}
-							if (!DeliverOutputEvent(*slot, std::move(event), slot_generation)) {
-								SetSlotError(*slot, "udf async: output consumer rejected capacity-aware delivery");
-							}
-							did_work = true;
-							continue;
-						}
-
-						if (event_kind == "data") {
-							unique_ptr<DataChunk> outputs_chunk;
-							unique_ptr<LazyRefDataChunk> ref_outputs;
-							if (IsPythonRefBundleResult(payload)) {
-								if (RequiresDistributedRefBundleOutput(slot->payload)) {
+								} else {
 									g_udf_distributed_ref_bundle_data_events.fetch_add(1, std::memory_order_relaxed);
+									event.ref_outputs =
+									    ConvertPythonRefBundleResult(payload, slot->expected_ref_output_types);
+									event.handoff_output_lease = std::move(handoff_output_lease);
+									event.release_output_lease = std::move(release_output_lease);
 								}
-								ref_outputs = ConvertPythonRefBundleResult(payload, slot->expected_ref_output_types);
-							} else if (RequiresDistributedRefBundleOutput(slot->payload)) {
-								g_udf_distributed_direct_table_rejected_events.fetch_add(1, std::memory_order_relaxed);
+							} catch (const std::exception &ex) {
 								if (release_output_lease) {
 									release_output_lease();
 									release_output_lease = nullptr;
 								}
-								UDFOutputEvent event;
 								event.kind = UDFOutputEventKind::ERROR;
-								event.submit_id = submit_id;
 								event.submit_complete = true;
-								event.error = DistributedRefBundleContractError(slot->payload, submit_id, payload);
-								DeliverOutputEvent(*slot, std::move(event), slot_generation);
-								did_work = true;
-								continue;
-							} else {
-								g_udf_direct_output_arrow_table_conversion_count.fetch_add(1,
-								                                                           std::memory_order_relaxed);
-								auto context = RequireActiveSlotContext(*slot, slot_generation);
-								outputs_chunk = ConvertArrowTableToDataChunk(
-								    payload, *context, ExpectedDirectOutputTypes(*slot, submit_id));
+								event.error = ex.what();
 							}
-							if (!IsActiveSlotGeneration(*slot, slot_generation)) {
-								if (release_output_lease) {
-									release_output_lease();
-								}
-								did_work = true;
-								continue;
-							}
-							unique_ptr<DataChunk> rows_chunk;
-							if (slot->is_table_udf) {
-								rows_chunk = MakeEmptyDataChunk();
-							} else {
-								auto row_entry = slot->rows_by_submit_id.find(submit_id);
-								if (row_entry == slot->rows_by_submit_id.end()) {
-									if (release_output_lease) {
-										release_output_lease();
-										release_output_lease = nullptr;
-									}
-									SetSlotError(*slot, "udf async: submit_id rows missing (submit/result mismatch)");
-									did_work = true;
-									continue;
-								}
-								if (!row_entry->second) {
-									if (release_output_lease) {
-										release_output_lease();
-										release_output_lease = nullptr;
-									}
-									SetSlotError(*slot, "udf async: non-table generator produced multiple data events");
-									did_work = true;
-									continue;
-								}
-								rows_chunk = std::move(row_entry->second);
-							}
-
-							UDFResult result;
-							result.outputs = std::move(outputs_chunk);
-							result.ref_outputs = std::move(ref_outputs);
-							result.rows = std::move(rows_chunk);
-							result.submit_complete = false;
-							result.submit_id = submit_id;
-							result.handoff_output_lease = std::move(handoff_output_lease);
-							result.release_output_lease = std::move(release_output_lease);
-							if (!TryDeliverResult(*slot, std::move(result), slot_generation)) {
-								SetSlotError(*slot, "udf async: output consumer rejected capacity-aware delivery");
-							}
-							did_work = true;
-							continue;
-						}
-						if (event_kind == "complete") {
-							QueueTerminalControlResult(*slot, submit_id, slot_generation);
-							did_work = true;
-							continue;
-						}
-						if (event_kind == "error") {
-							UDFOutputEvent event;
+						} else if (event_kind == "complete") {
+							event.kind = UDFOutputEventKind::COMPLETE;
+							event.submit_complete = true;
+						} else if (event_kind == "error") {
 							event.kind = UDFOutputEventKind::ERROR;
-							event.submit_id = submit_id;
 							event.submit_complete = true;
 							event.error = py::str(payload).cast<string>();
-							DeliverOutputEvent(*slot, std::move(event), slot_generation);
-							did_work = true;
-							continue;
+						} else {
+							event.kind = UDFOutputEventKind::ERROR;
+							event.submit_complete = true;
+							event.error = StringUtil::Format("udf async collector returned unknown output event '%s'",
+							                                 event_kind);
 						}
-
-						SetSlotError(*slot, StringUtil::Format("udf async collector returned unknown output event '%s'",
-						                                       event_kind));
+						if (!DeliverOutputEvent(*slot, std::move(event), slot_generation)) {
+							SetSlotError(*slot, "udf async: output consumer rejected capacity-aware delivery");
+						}
 						did_work = true;
+						continue;
 					} catch (const py::error_already_set &ex) {
 						if (slot && !slot->abort_requested.load() && IsActiveSlotGeneration(*slot, slot_generation)) {
 							SetSlotError(*slot, StringUtil::Format("udf async collector result failed: %s", ex.what()));
@@ -3203,7 +2982,7 @@ private:
 		}
 	}
 
-	void SetSlotError(ExecutorSlot &slot, const string &msg) {
+	void SetSlotError(ExecutorSlot &slot, const string &msg, bool notify_output_consumer = true) {
 		bool should_notify = false;
 		{
 			lock_guard<mutex> eg(slot.error_lock);
@@ -3218,6 +2997,9 @@ private:
 			return;
 		}
 		WakeupPipelineThread(slot);
+		if (!notify_output_consumer) {
+			return;
+		}
 		UDFOutputConsumer output_consumer;
 		if (GetOutputConsumer(slot, output_consumer) && output_consumer.accept_error) {
 			try {
@@ -3479,7 +3261,7 @@ MakeCollectorOutputLeaseCallbacks(const py::object &collector, const string &req
 //
 // Thin UDFExecutor wrapper.  Pipeline threads interact with this class.
 // It NEVER acquires the GIL — all Python work is delegated to the global
-// dispatcher thread via per-slot command/result queues.
+// dispatcher thread via per-slot commands and the required output consumer.
 
 class DispatchedUDFPythonExecutor : public UDFExecutor {
 public:
@@ -3646,33 +3428,6 @@ public:
 		}
 	}
 
-	std::pair<bool, UDFResult> TakeReadyResult(ClientContext &) override {
-		if (!registered_) {
-			return std::make_pair(false, UDFResult());
-		}
-
-		// Check errors first
-		{
-			lock_guard<mutex> eg(slot_->error_lock);
-			if (slot_->has_error.load()) {
-				auto msg = slot_->error;
-				throw InvalidInputException("udf async error: %s", msg);
-			}
-		}
-
-		// Try to pop a result (no GIL — just result_lock)
-		{
-			lock_guard<mutex> rg(slot_->result_lock);
-			if (!slot_->result_queue.empty()) {
-				auto result = std::move(slot_->result_queue.front());
-				slot_->result_queue.pop_front();
-				GlobalPythonDispatcher::Instance().NotifyWork();
-				return std::make_pair(true, std::move(result));
-			}
-		}
-		return std::make_pair(false, UDFResult());
-	}
-
 	void FinishedSubmitting(ClientContext &) override {
 		if (!registered_) {
 			return;
@@ -3700,22 +3455,19 @@ public:
 		return true;
 	}
 
-	bool SupportsOutputConsumer() override {
-		return true;
-	}
-
 	void RegisterOutputConsumer(UDFOutputConsumer consumer) override {
+		if (registered_) {
+			throw InternalException("UDF output consumer must be registered before the first submission");
+		}
+		if (has_output_consumer_) {
+			throw InternalException("UDF output consumer was registered more than once");
+		}
+		if (!consumer.data_capacity || !consumer.data_byte_capacity || !consumer.data_item_byte_capacity ||
+		    !consumer.accept_event || !consumer.accept_error || !consumer.notify_finished) {
+			throw InvalidInputException("UDF output consumer is missing a required callback");
+		}
 		output_consumer_ = std::move(consumer);
 		has_output_consumer_ = true;
-		if (!registered_ || !slot_) {
-			return;
-		}
-		{
-			lock_guard<mutex> cg(slot_->consumer_lock);
-			slot_->output_consumer = output_consumer_;
-			slot_->has_output_consumer = true;
-		}
-		GlobalPythonDispatcher::Instance().NotifyWork();
 	}
 
 	void NotifyOutputConsumerSpaceAvailable() override {
@@ -3848,12 +3600,6 @@ private:
 				return true;
 			}
 		}
-		{
-			lock_guard<mutex> rg(slot_->result_lock);
-			if (!slot_->result_queue.empty()) {
-				return true;
-			}
-		}
 		if (slot_->all_tasks_finished.load()) {
 			return true;
 		}
@@ -3906,17 +3652,16 @@ private:
 		if (registered_) {
 			return;
 		}
+		if (!has_output_consumer_) {
+			throw InternalException("UDF execution requires an output consumer before the first submission");
+		}
 		slot_id_ = GlobalPythonDispatcher::Instance().Register(payload_, output_types_, ref_output_types_, &context,
-		                                                       std::move(actor_handles_), &slot_, &slot_generation_);
+		                                                       std::move(actor_handles_), std::move(output_consumer_),
+		                                                       &slot_, &slot_generation_);
 		registered_ = true;
 		if (wakeup_callback_) {
 			lock_guard<mutex> wg(slot_->wakeup_lock);
 			slot_->wakeup_callback = wakeup_callback_;
-		}
-		if (has_output_consumer_) {
-			lock_guard<mutex> cg(slot_->consumer_lock);
-			slot_->output_consumer = output_consumer_;
-			slot_->has_output_consumer = true;
 		}
 	}
 
