@@ -34,6 +34,7 @@
 #include "duckdb_python/arrow/arrow_export_utils.hpp"
 #include "duckdb_python/python_udf_utils.hpp"
 #include "duckdb_python/python_udf_actor_resources.hpp"
+#include "duckdb_python/vane_runners.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -1021,24 +1022,29 @@ struct SafeRelationPyObject {
 		return *this;
 	}
 
-	~SafeRelationPyObject() {
+	~SafeRelationPyObject() noexcept {
 		Reset();
 	}
 
-	void Reset() {
-		if (!obj.ptr()) {
+	void Reset() noexcept {
+		try {
+			if (!obj.ptr()) {
+				has_value = false;
+				return;
+			}
+			if (!PyRelationRuntimeUsableForTeardown()) {
+				obj.release();
+				has_value = false;
+				return;
+			}
+			PythonGILWrapper gil;
+			auto *ptr = obj.release().ptr();
+			Py_DECREF(ptr);
 			has_value = false;
-			return;
-		}
-		if (!PyRelationRuntimeUsableForTeardown()) {
+		} catch (...) {
 			obj.release();
 			has_value = false;
-			return;
 		}
-		PythonGILWrapper gil;
-		auto *ptr = obj.release().ptr();
-		Py_DECREF(ptr);
-		has_value = false;
 	}
 
 	py::object Get() const {
@@ -1059,32 +1065,40 @@ static DatabaseInstance *GetRelationDatabasePtr(const shared_ptr<Relation> &rel)
 	return context->db.get();
 }
 
-static void ForgetRunnerForDB(const shared_ptr<Relation> &rel) {
-	auto *db_ptr = GetRelationDatabasePtr(rel);
+static void ForgetRunnerForDB(DatabaseInstance *db_ptr) noexcept {
 	if (!db_ptr) {
 		return;
 	}
-	std::lock_guard<std::mutex> guard(per_db_runner_mutex);
-	per_db_runners.erase(db_ptr);
+	try {
+		std::lock_guard<std::mutex> guard(per_db_runner_mutex);
+		per_db_runners.erase(db_ptr);
+	} catch (...) {
+		// Cleanup must not mask a runner exception or terminate unwinding.
+	}
 }
 
 class PerDBRunnerCleanupGuard {
 public:
-	explicit PerDBRunnerCleanupGuard(shared_ptr<Relation> rel_p) : rel(std::move(rel_p)) {
+	explicit PerDBRunnerCleanupGuard(DatabaseInstance *db_ptr_p) noexcept : db_ptr(db_ptr_p) {
 	}
 
-	~PerDBRunnerCleanupGuard() {
-		ForgetRunnerForDB(rel);
+	~PerDBRunnerCleanupGuard() noexcept {
+		ForgetRunnerForDB(db_ptr);
 	}
 
 	PerDBRunnerCleanupGuard(const PerDBRunnerCleanupGuard &) = delete;
 	PerDBRunnerCleanupGuard &operator=(const PerDBRunnerCleanupGuard &) = delete;
 
 private:
-	shared_ptr<Relation> rel;
+	DatabaseInstance *db_ptr;
 };
 
-static py::object GetOrCreateRunnerForDB(const shared_ptr<Relation> &rel, const string &runner_type) {
+struct RunnerForDatabase {
+	DatabaseInstance *db_ptr;
+	py::object runner;
+};
+
+static RunnerForDatabase GetOrCreateRunnerForDB(const shared_ptr<Relation> &rel, const string &runner_type) {
 	if (!rel || !rel->context) {
 		throw InternalException("Cannot resolve runner: relation has no context");
 	}
@@ -1099,7 +1113,7 @@ static py::object GetOrCreateRunnerForDB(const shared_ptr<Relation> &rel, const 
 		if (it != per_db_runners.end()) {
 			auto runner = it->second.Get();
 			if (!runner.is_none()) {
-				return runner;
+				return {db_ptr, std::move(runner)};
 			}
 		}
 	}
@@ -1123,7 +1137,7 @@ static py::object GetOrCreateRunnerForDB(const shared_ptr<Relation> &rel, const 
 		std::lock_guard<std::mutex> guard(per_db_runner_mutex);
 		per_db_runners[db_ptr] = SafeRelationPyObject(runner);
 	}
-	return runner;
+	return {db_ptr, std::move(runner)};
 }
 
 // Try to dispatch a write relation to the Python runner.
@@ -1133,12 +1147,17 @@ static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py:
 	if (runner_type == "local-fast") {
 		return false;
 	}
-	auto runner = GetOrCreateRunnerForDB(write_rel, runner_type);
-	PerDBRunnerCleanupGuard cleanup_guard(write_rel);
+	auto runner_for_db = GetOrCreateRunnerForDB(write_rel, runner_type);
+	PerDBRunnerCleanupGuard cleanup_guard(runner_for_db.db_ptr);
 	auto py_write_rel = DuckDBPyRelation(write_rel);
 	py_write_rel.SetConnectionOwner(connection_owner);
 	auto py_write_rel_obj = py::cast(std::move(py_write_rel));
-	runner.attr("run_write")(py_write_rel_obj);
+	try {
+		runner_for_db.runner.attr("run_write")(py_write_rel_obj);
+	} catch (...) {
+		InvalidateVaneRunnerIfCurrent(runner_for_db.runner.ptr());
+		throw;
+	}
 	return true;
 }
 
@@ -1172,11 +1191,12 @@ void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
 		this->executed = true;
 		py::object table_iterator;
 		try {
-			auto runner = GetOrCreateRunnerForDB(rel, "ray");
+			auto runner_for_db = GetOrCreateRunnerForDB(rel, "ray");
+			PerDBRunnerCleanupGuard cleanup_guard(runner_for_db.db_ptr);
 			auto py_relation = DuckDBPyRelation(rel);
 			py_relation.SetConnectionOwner(connection_owner);
 			auto py_relation_obj = py::cast(std::move(py_relation));
-			table_iterator = py::iter(runner.attr("run_iter_tables")(py_relation_obj, py::int_(1)));
+			table_iterator = py::iter(runner_for_db.runner.attr("run_iter_tables")(py_relation_obj, py::int_(1)));
 			py::object prefetched_partition;
 			bool has_prefetched_partition = false;
 			bool iterator_exhausted = false;
@@ -1189,7 +1209,6 @@ void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
 			} else {
 				iterator_exhausted = true;
 			}
-			ForgetRunnerForDB(rel);
 			result = make_uniq<DuckDBPyResult>(MakeDistributedArrowPyResultSource(
 			    std::move(table_iterator), std::move(prefetched_partition), has_prefetched_partition,
 			    iterator_exhausted, names, types, context));
@@ -1202,7 +1221,6 @@ void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
 					ex.discard_as_unraisable("closing distributed result iterator after startup failure");
 				}
 			}
-			ForgetRunnerForDB(rel);
 			throw;
 		}
 	}

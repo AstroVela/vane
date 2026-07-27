@@ -27,8 +27,9 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 
 ### Fixed
 
-- Released per-database runner cache entries after relation write failures so a
-  failed runner is not reused by a later write.
+- Released per-database runner cache entries and invalidated the matching
+  process runner after relation write failures so a failed runner is not reused
+  by a later write.
 
 ### Security
 
