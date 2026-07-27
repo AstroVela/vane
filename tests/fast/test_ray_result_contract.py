@@ -6570,6 +6570,34 @@ def test_ray_runner_close_is_terminal_and_idempotent(monkeypatch):
     assert ray_runner._closed is True
 
 
+def test_connection_close_notification_reenters_runner_registry_lock(monkeypatch):
+    from duckdb.runners.ray import runner as runner_module
+
+    target_session_id = "reentrant-session"
+    calls = []
+
+    class _LiveRunner:
+        def close_session(self, session_id):
+            calls.append(session_id)
+
+    monkeypatch.setattr(runner_module, "_RAY_RUNNERS", {_LiveRunner()})
+    registry_lock = runner_module._RAY_RUNNERS_LOCK
+
+    registry_lock.acquire()
+    try:
+        reacquired = registry_lock.acquire(blocking=False)
+        assert reacquired, "connection finalizers must be able to re-enter the runner registry lock"
+        if reacquired:
+            registry_lock.release()
+    finally:
+        registry_lock.release()
+
+    with registry_lock:
+        runner_module.notify_connection_closed(target_session_id)
+
+    assert calls.count(target_session_id) == 1
+
+
 def test_connection_close_notification_attempts_every_live_runner(monkeypatch):
     from duckdb.runners.ray import runner as runner_module
 

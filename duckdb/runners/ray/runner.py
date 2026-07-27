@@ -28,7 +28,9 @@ if TYPE_CHECKING:
 
 
 _RAY_RUNNERS: weakref.WeakSet[RayRunner] = weakref.WeakSet()
-_RAY_RUNNERS_LOCK = threading.Lock()
+# WeakSet operations may allocate and synchronously run DuckDB connection
+# finalizers, which re-enter notify_connection_closed() on the same thread.
+_RAY_RUNNERS_LOCK = threading.RLock()
 _SESSION_CLOSE_REPLAY_CAPACITY = 65_536
 
 
