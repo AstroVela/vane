@@ -10,14 +10,18 @@ import argparse
 import base64
 import csv
 import hashlib
+import hmac
 import io
+import ipaddress
 import re
 import stat
 import subprocess
 import sys
 import tarfile
 import zipfile
+from dataclasses import dataclass
 from email.parser import BytesParser
+from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
@@ -48,11 +52,6 @@ BANNED_PATH_SUFFIXES = (
     ".log",
     "/ray_data_main_old.py",
 )
-BANNED_CONTENT = (
-    b"192.168." + b"1.28",
-    b"StrongPass" + b"123!",
-)
-BANNED_TEXT_CONTENT = (b"/home/" + b"kaka/",)
 
 
 class Artifact(Protocol):
@@ -63,6 +62,222 @@ class Artifact(Protocol):
     def names(self) -> list[str]: ...
 
     def read(self, name: str) -> bytes: ...
+
+
+class ContentRule(Protocol):
+    rule_id: str
+
+    def matches(self, data: bytes) -> bool: ...
+
+
+# Exact local matching is deterministic; scrypt raises the offline guessing cost
+# for low-entropy IP and path rules but does not replace rotation or history review.
+FINGERPRINT_BYTES = hashlib.sha256().digest_size
+SCRYPT_N = 1 << 14
+SCRYPT_R = 8
+SCRYPT_P = 1
+SCRYPT_MAX_MEMORY = 32 * 1024 * 1024
+SCRYPT_SALT_PREFIX = b"vane-release-content-rule-v1\0"
+
+
+@cache
+def _credential_candidate_pattern(length: int) -> re.Pattern[bytes]:
+    prefix = f"[!-~]{{0,{length - 1}}}"
+    lookaheads = "".join(
+        (
+            f"(?={prefix}[a-z])",
+            f"(?={prefix}[A-Z])",
+            f"(?={prefix}[0-9])",
+            f"(?={prefix}[^A-Za-z0-9])",
+        )
+    )
+    window = f"[!-~]{{{length}}}"
+    return re.compile(f"(?={lookaheads}({window}))".encode("ascii"))
+
+
+@cache
+def _ipv4_candidate_pattern(length: int) -> re.Pattern[bytes]:
+    return re.compile(f"(?=([0-9.]{{{length}}}))".encode("ascii"))
+
+
+@cache
+def _posix_path_candidate_pattern(
+    part_lengths: tuple[int, ...],
+    trailing_slash: bool,
+) -> re.Pattern[bytes]:
+    part_patterns = [f"[\\x20-\\x2e\\x30-\\x7e]{{{length}}}" for length in part_lengths]
+    candidate = "/" + "/".join(part_patterns)
+    if trailing_slash:
+        candidate += "/"
+    return re.compile(f"(?=({candidate}))".encode("ascii"))
+
+
+def _is_credential_shaped(value: bytes) -> bool:
+    return (
+        bool(value)
+        and all(0x21 <= byte <= 0x7E for byte in value)
+        and any(0x61 <= byte <= 0x7A for byte in value)
+        and any(0x41 <= byte <= 0x5A for byte in value)
+        and any(0x30 <= byte <= 0x39 for byte in value)
+        and any(not (0x61 <= byte <= 0x7A or 0x41 <= byte <= 0x5A or 0x30 <= byte <= 0x39) for byte in value)
+    )
+
+
+def _is_ipv4(value: bytes) -> bool:
+    try:
+        ipaddress.IPv4Address(value.decode("ascii"))
+    except (UnicodeDecodeError, ipaddress.AddressValueError):
+        return False
+    return True
+
+
+def _posix_path_shape(value: bytes) -> tuple[tuple[int, ...], bool]:
+    if not value.startswith(b"/") or value == b"/":
+        raise ValueError("POSIX path fingerprint rule requires an absolute path")
+    if any(byte < 0x20 or byte > 0x7E for byte in value):
+        raise ValueError("POSIX path fingerprint rule requires printable ASCII")
+
+    trailing_slash = value.endswith(b"/")
+    body = value[1:-1] if trailing_slash else value[1:]
+    parts = body.split(b"/")
+    if not parts or any(not part for part in parts):
+        raise ValueError("POSIX path fingerprint rule requires non-empty path parts")
+    return tuple(len(part) for part in parts), trailing_slash
+
+
+def _memory_hard_fingerprint(rule_id: str, value: bytes) -> bytes:
+    return hashlib.scrypt(
+        value,
+        salt=SCRYPT_SALT_PREFIX + rule_id.encode("utf-8"),
+        n=SCRYPT_N,
+        r=SCRYPT_R,
+        p=SCRYPT_P,
+        maxmem=SCRYPT_MAX_MEMORY,
+        dklen=FINGERPRINT_BYTES,
+    )
+
+
+@dataclass(frozen=True)
+class _FingerprintRule:
+    rule_id: str
+    fingerprint: bytes
+    length: int
+
+    def __post_init__(self) -> None:
+        if not self.rule_id:
+            raise ValueError("content rule ID must not be empty")
+        if self.length <= 0:
+            raise ValueError("content rule length must be positive")
+        if len(self.fingerprint) != FINGERPRINT_BYTES:
+            raise ValueError(f"content rule fingerprint must be {FINGERPRINT_BYTES} bytes")
+
+
+@dataclass(frozen=True)
+class CredentialFingerprintRule(_FingerprintRule):
+    """Match printable credential-shaped windows by SHA-256 fingerprint."""
+
+    @classmethod
+    def from_value(cls, rule_id: str, value: bytes) -> CredentialFingerprintRule:
+        if not _is_credential_shaped(value):
+            raise ValueError("credential fingerprint rule requires a credential-shaped value")
+        return cls(rule_id=rule_id, fingerprint=hashlib.sha256(value).digest(), length=len(value))
+
+    def matches(self, data: bytes) -> bool:
+        for candidate in _credential_candidate_pattern(self.length).finditer(data):
+            if hmac.compare_digest(hashlib.sha256(candidate.group(1)).digest(), self.fingerprint):
+                return True
+        return False
+
+
+@dataclass(frozen=True)
+class IPv4FingerprintRule(_FingerprintRule):
+    """Match IPv4 candidates using a memory-hard fingerprint."""
+
+    @classmethod
+    def from_value(cls, rule_id: str, value: bytes) -> IPv4FingerprintRule:
+        if not _is_ipv4(value):
+            raise ValueError("IPv4 fingerprint rule requires an IPv4 address")
+        return cls(
+            rule_id=rule_id,
+            fingerprint=_memory_hard_fingerprint(rule_id, value),
+            length=len(value),
+        )
+
+    def matches(self, data: bytes) -> bool:
+        for match in _ipv4_candidate_pattern(self.length).finditer(data):
+            candidate = match.group(1)
+            if _is_ipv4(candidate) and hmac.compare_digest(
+                _memory_hard_fingerprint(self.rule_id, candidate),
+                self.fingerprint,
+            ):
+                return True
+        return False
+
+
+@dataclass(frozen=True)
+class PosixPathFingerprintRule(_FingerprintRule):
+    """Match printable absolute POSIX paths using a memory-hard fingerprint."""
+
+    part_lengths: tuple[int, ...]
+    trailing_slash: bool
+
+    @classmethod
+    def from_value(cls, rule_id: str, value: bytes) -> PosixPathFingerprintRule:
+        part_lengths, trailing_slash = _posix_path_shape(value)
+        return cls(
+            rule_id=rule_id,
+            fingerprint=_memory_hard_fingerprint(rule_id, value),
+            length=len(value),
+            part_lengths=part_lengths,
+            trailing_slash=trailing_slash,
+        )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not self.part_lengths or any(length <= 0 for length in self.part_lengths):
+            raise ValueError("POSIX path fingerprint rule requires positive part lengths")
+        expected_length = sum(self.part_lengths) + len(self.part_lengths) + self.trailing_slash
+        if self.length != expected_length:
+            raise ValueError("POSIX path fingerprint rule length does not match its path shape")
+
+    def matches(self, data: bytes) -> bool:
+        pattern = _posix_path_candidate_pattern(self.part_lengths, self.trailing_slash)
+        for match in pattern.finditer(data):
+            if hmac.compare_digest(
+                _memory_hard_fingerprint(self.rule_id, match.group(1)),
+                self.fingerprint,
+            ):
+                return True
+        return False
+
+
+@dataclass(frozen=True)
+class ContentMatch:
+    rule_id: str
+    member_name: str
+
+
+CONTENT_RULES: tuple[ContentRule, ...] = (
+    IPv4FingerprintRule(
+        rule_id="release-internal-ip",
+        fingerprint=bytes.fromhex("ea0958373ff59a2b35ce264fda1b50cf0f9fed173878bbff134729f6338c9edd"),
+        length=12,
+    ),
+    CredentialFingerprintRule(
+        rule_id="release-credential",
+        fingerprint=bytes.fromhex("805bd951772627f3d1a607084df1727c6caad60447c5d73febf7be2d2fe17fd8"),
+        length=14,
+    ),
+)
+TEXT_CONTENT_RULES: tuple[ContentRule, ...] = (
+    PosixPathFingerprintRule(
+        rule_id="release-local-path",
+        fingerprint=bytes.fromhex("ba09f8cff6db233c4dd270f695d4c75dc9afd939826d017c3ffe27aaaa11be5f"),
+        length=11,
+        part_lengths=(4, 4),
+        trailing_slash=True,
+    ),
+)
 
 
 class WheelArtifact:
@@ -151,16 +366,34 @@ def _check_paths(artifact: Artifact) -> None:
             raise ValueError(f"{artifact.path}: stale release path {name}")
 
 
-def _check_internal_content(artifact: Artifact) -> None:
+def _detect_internal_content(
+    artifact: Artifact,
+    content_rules: tuple[ContentRule, ...],
+    text_content_rules: tuple[ContentRule, ...],
+) -> ContentMatch | None:
     for name in artifact.names():
         data = artifact.read(name)
-        markers = BANNED_CONTENT
-        if b"\0" not in data[:8192]:
-            markers += BANNED_TEXT_CONTENT
-        for marker in markers:
-            if marker in data:
-                value = marker.decode("utf-8", errors="replace")
-                raise ValueError(f"{artifact.path}: internal value {value!r} found in {name}")
+        for rule in content_rules:
+            if rule.matches(data):
+                return ContentMatch(rule_id=rule.rule_id, member_name=name)
+        if b"\0" in data[:8192]:
+            continue
+        for rule in text_content_rules:
+            if rule.matches(data):
+                return ContentMatch(rule_id=rule.rule_id, member_name=name)
+    return None
+
+
+def _check_internal_content(
+    artifact: Artifact,
+    content_rules: tuple[ContentRule, ...],
+    text_content_rules: tuple[ContentRule, ...],
+) -> None:
+    match = _detect_internal_content(artifact, content_rules, text_content_rules)
+    if match is not None:
+        raise ValueError(
+            f"{artifact.path}: content rule {match.rule_id!r} matched archive member {match.member_name!r}"
+        )
 
 
 def _metadata(artifact: Artifact, suffix: str):
@@ -293,8 +526,17 @@ def _check_wheel(artifact: WheelArtifact) -> None:
     _check_wheel_record(artifact)
 
 
-def check_artifact(path: Path) -> None:
+def check_artifact(
+    path: Path,
+    *,
+    content_rules: tuple[ContentRule, ...] | None = None,
+    text_content_rules: tuple[ContentRule, ...] | None = None,
+) -> None:
     """Validate one sdist or wheel."""
+    if content_rules is None:
+        content_rules = CONTENT_RULES
+    if text_content_rules is None:
+        text_content_rules = TEXT_CONTENT_RULES
     if path.stat().st_size > MAX_ARTIFACT_BYTES:
         raise ValueError(f"{path}: artifact exceeds the project's 100 MiB publication limit")
 
@@ -309,7 +551,7 @@ def check_artifact(path: Path) -> None:
 
     try:
         _check_paths(artifact)
-        _check_internal_content(artifact)
+        _check_internal_content(artifact, content_rules, text_content_rules)
         specific_check(artifact)
     finally:
         artifact.close()
