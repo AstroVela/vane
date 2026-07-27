@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -9,11 +10,12 @@ from duckdb.runners.ray import cluster_resource_coordinator as coordinator_modul
 from duckdb.runners.ray.cluster_resource_coordinator import (
     ActorResourceBundle,
     ClusterQueryResourceCoordinator,
+    ElasticGpuDemandError,
     NodeCapacity,
     QueryDemand,
     read_ray_node_capacities,
 )
-from duckdb.runners.ray.query_execution_graph import ResourceVector
+from duckdb.runners.ray.query_execution_graph import ActorPlacement, ResourceVector
 
 
 def _r(
@@ -320,6 +322,82 @@ def test_query_desired_resources_are_downward_caps_not_capacity_overrides():
     assert allocation.resources == _r(cpu=3, heap=300, store=400)
 
 
+def test_query_demand_rejects_elastic_gpu_headroom_before_registration():
+    minimum = _r(cpu=1, gpu=1, heap=100)
+
+    with pytest.raises(
+        ElasticGpuDemandError,
+        match=r"GPU resources cannot be elastic: minimum=1, desired=4",
+    ) as raised:
+        _demand(
+            "elastic-gpu",
+            minimum=minimum,
+            desired=_r(cpu=4, gpu=4, heap=400),
+            actor_bundles=(minimum,),
+        )
+
+    assert raised.value.to_dict() == {
+        "code": "ELASTIC_GPU_UNSUPPORTED",
+        "query_id": "elastic-gpu",
+        "resource": "gpu",
+        "minimum": 1.0,
+        "desired": 4.0,
+    }
+    restored = pickle.loads(pickle.dumps(raised.value))
+    assert isinstance(restored, ElasticGpuDemandError)
+    assert str(restored) == str(raised.value)
+    assert restored.to_dict() == raised.value.to_dict()
+
+
+def test_fixed_gpu_bundle_receives_only_divisible_cpu_and_memory_headroom():
+    coordinator = ClusterQueryResourceCoordinator(
+        (_node("gpu-node", cpu=4, gpu=1, heap=400, store=400),),
+    )
+    fixed_gpu_bundle = _r(cpu=1, gpu=1, heap=100)
+    desired = _r(cpu=4, gpu=1, heap=400, store=400)
+
+    allocation = coordinator.register_query(
+        _demand(
+            "fixed-gpu",
+            minimum=fixed_gpu_bundle,
+            desired=desired,
+            actor_bundles=(fixed_gpu_bundle,),
+        ),
+        now=0,
+    )
+
+    assert allocation.resources == desired
+    assert allocation.actor_placements == (ActorPlacement(stage_id="stage:actor", actor_index=0, node_id="gpu-node"),)
+
+
+def test_fractional_gpu_actor_bundles_are_placed_whole_on_heterogeneous_nodes():
+    coordinator = ClusterQueryResourceCoordinator(
+        (
+            _node("half-gpu", cpu=2, gpu=0.5, heap=200),
+            _node("quarter-gpu", cpu=1, gpu=0.25, heap=100),
+        )
+    )
+    bundle = _r(cpu=1, gpu=0.25, heap=100)
+    fixed_pool = bundle.scale(3)
+
+    allocation = coordinator.register_query(
+        _demand(
+            "fractional-gpu",
+            minimum=fixed_pool,
+            desired=fixed_pool,
+            actor_bundles=(bundle, bundle, bundle),
+        ),
+        now=0,
+    )
+
+    assert allocation.resources == fixed_pool
+    assert allocation.actor_placements == (
+        ActorPlacement(stage_id="stage:actor", actor_index=0, node_id="quarter-gpu"),
+        ActorPlacement(stage_id="stage:actor", actor_index=1, node_id="half-gpu"),
+        ActorPlacement(stage_id="stage:actor", actor_index=2, node_id="half-gpu"),
+    )
+
+
 def test_indivisible_gpu_actor_bundle_must_fit_one_node_not_cluster_aggregate():
     coordinator = ClusterQueryResourceCoordinator(
         (
@@ -392,7 +470,7 @@ def test_actor_bundle_resources_must_be_part_of_query_minimum():
         )
 
 
-def test_gpu_actor_minima_use_priority_then_fifo_without_partial_bundle_grants():
+def test_gpu_actor_pools_use_priority_then_fifo_without_partial_bundle_grants():
     coordinator = ClusterQueryResourceCoordinator(
         (
             _node("n1", cpu=4, gpu=1, heap=1_000, store=1_000),
@@ -415,7 +493,7 @@ def test_gpu_actor_minima_use_priority_then_fifo_without_partial_bundle_grants()
     assert sum(snapshot[query_id]["allocation"]["resources"]["gpu"] for query_id in snapshot) == 2
 
 
-def test_running_gpu_actor_minimum_is_not_preempted_by_later_high_priority_query():
+def test_running_gpu_actor_pool_is_not_preempted_by_later_high_priority_query():
     coordinator = ClusterQueryResourceCoordinator((_node("n1", cpu=4, gpu=1, heap=1_000, store=1_000),))
     bundle = _r(cpu=1, gpu=1, heap=100)
     low = coordinator.register_query(

@@ -232,8 +232,7 @@ def _udf_stage(
             )
         )
         max_concurrency = None
-        actor_min = actor_size
-        actor_max = actor_size
+        actor_pool_size = actor_size
         resident_per_actor = ResourceVector(
             cpu=cpu,
             gpu=gpu,
@@ -242,8 +241,7 @@ def _udf_stage(
         invocation_resources = ResourceVector(object_store_bytes=input_window)
     else:
         max_concurrency = None
-        actor_min = 0
-        actor_max = 0
+        actor_pool_size = 0
         actor_prefetch_depth = 1
         resident_per_actor = ResourceVector()
         invocation_resources = ResourceVector(
@@ -264,8 +262,7 @@ def _udf_stage(
         generator_buffer_blocks=retention_blocks,
         max_concurrency=max_concurrency,
         resident_per_actor=resident_per_actor,
-        actor_min_size=actor_min,
-        actor_max_size=actor_max,
+        actor_pool_size=actor_pool_size,
         actor_prefetch_depth=actor_prefetch_depth,
         spill_mode="streaming",
     )
@@ -438,20 +435,18 @@ def build_query_demand(
     fte_tasks: list[ResourceVector] = []
     ray_tasks: list[ResourceVector] = []
     downstream_fte_tasks: list[ResourceVector] = []
-    desired_gpu = 0.0
     stage_by_id = {stage.stage_id: stage for stage in graph.stages}
     for stage in graph.stages:
         commitment = _task_commitment(stage)
         if stage.backend == "ray_actor":
-            actor_bundle = stage.resident_per_actor + commitment
-            desired_gpu += stage.resident_per_actor.gpu * stage.actor_max_size
+            actor_commitment = stage.resident_per_actor + commitment
             actor_bundles.extend(
                 ActorResourceBundle(
                     stage_id=stage.stage_id,
                     actor_index=actor_index,
-                    resources=actor_bundle,
+                    resources=actor_commitment,
                 )
-                for actor_index in range(stage.actor_min_size)
+                for actor_index in range(stage.actor_pool_size)
             )
         elif stage.backend == "ray_task":
             ray_tasks.append(commitment)
@@ -469,8 +464,8 @@ def build_query_demand(
         if stage_id in downstream_fte_stage_ids
     )
     minimum = ResourceVector()
-    for bundle in actor_bundles:
-        minimum = minimum + bundle.resources
+    for required_actor in actor_bundles:
+        minimum = minimum + required_actor.resources
     task_bundles = tuple(
         bundle
         # Reserve the nested Ray process before its parent FTE bundle.  The
@@ -488,14 +483,13 @@ def build_query_demand(
         )
         if not bundle.is_zero()
     )
-    for bundle in task_bundles:
-        minimum = minimum + bundle
+    for task_bundle in task_bundles:
+        minimum = minimum + task_bundle
     desired = ResourceVector(
         cpu=cluster_capacity.cpu,
-        # GPU task commitments are indivisible task bundles just like their
-        # CPU/heap commitments. Keep enough GPU allocation for the minimum
-        # runnable task set in addition to any fixed actor residency.
-        gpu=min(cluster_capacity.gpu, max(desired_gpu, minimum.gpu)),
+        # GPU commitments remain fixed indivisible bundles. Only CPU and
+        # memory headroom participate in elastic DRF allocation.
+        gpu=minimum.gpu,
         heap_bytes=cluster_capacity.heap_bytes,
         object_store_bytes=cluster_capacity.object_store_bytes,
     )

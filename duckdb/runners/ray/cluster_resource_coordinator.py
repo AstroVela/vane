@@ -22,6 +22,36 @@ from duckdb.runners.ray.worker_memory import build_ray_node_memory_layout
 _EPSILON = 1e-9
 
 
+class ElasticGpuDemandError(ValueError):
+    code = "ELASTIC_GPU_UNSUPPORTED"
+
+    def __init__(
+        self,
+        query_id: str,
+        minimum_gpu: float,
+        desired_gpu: float,
+    ) -> None:
+        self.query_id = str(query_id)
+        self.minimum_gpu = float(minimum_gpu)
+        self.desired_gpu = float(desired_gpu)
+        super().__init__(self.query_id, self.minimum_gpu, self.desired_gpu)
+
+    def __str__(self) -> str:
+        return (
+            f"query {self.query_id} GPU resources cannot be elastic: "
+            f"minimum={self.minimum_gpu:g}, desired={self.desired_gpu:g}"
+        )
+
+    def to_dict(self) -> dict[str, str | float]:
+        return {
+            "code": self.code,
+            "query_id": self.query_id,
+            "resource": "gpu",
+            "minimum": self.minimum_gpu,
+            "desired": self.desired_gpu,
+        }
+
+
 def _sum_resources(resources: Sequence[ResourceVector]) -> ResourceVector:
     total = ResourceVector()
     for item in resources:
@@ -100,6 +130,12 @@ class QueryDemand:
         if not self.minimum.fits_within(self.desired):
             exceeded = self.minimum.exceeded_dimensions(self.desired)
             raise ValueError(f"minimum query demand exceeds desired demand for {', '.join(exceeded)}")
+        if not math.isclose(self.minimum.gpu, self.desired.gpu, rel_tol=0.0, abs_tol=_EPSILON):
+            raise ElasticGpuDemandError(
+                query_id=query_id,
+                minimum_gpu=self.minimum.gpu,
+                desired_gpu=self.desired.gpu,
+            )
         weight = float(self.weight)
         if not math.isfinite(weight) or weight <= 0:
             raise ValueError("weight must be finite and > 0")
@@ -445,30 +481,32 @@ class ClusterQueryResourceCoordinator:
             if query_id not in pinned_query_ids:
                 actor_ok = True
                 new_actor_placements: list[ActorPlacement] = []
-                for bundle in state.demand.actor_bundles:
-                    node_id = self._place_bundle(bundle.resources, trial_remaining)
+                for actor_bundle in state.demand.actor_bundles:
+                    node_id = self._place_bundle(actor_bundle.resources, trial_remaining)
                     if node_id is None:
                         actor_ok = False
                         break
                     new_actor_placements.append(
                         ActorPlacement(
-                            stage_id=bundle.stage_id,
-                            actor_index=bundle.actor_index,
+                            stage_id=actor_bundle.stage_id,
+                            actor_index=actor_bundle.actor_index,
                             node_id=node_id,
                         )
                     )
-                    trial_allocations[node_id] = trial_allocations.get(node_id, ResourceVector()) + bundle.resources
+                    trial_allocations[node_id] = (
+                        trial_allocations.get(node_id, ResourceVector()) + actor_bundle.resources
+                    )
                 if not actor_ok:
                     continue
                 actor_placements_by_query[query_id] = tuple(new_actor_placements)
 
             task_ok = True
-            for bundle in state.demand.task_bundles:
-                node_id = self._place_bundle(bundle, trial_remaining)
+            for task_bundle in state.demand.task_bundles:
+                node_id = self._place_bundle(task_bundle, trial_remaining)
                 if node_id is None:
                     task_ok = False
                     break
-                trial_allocations[node_id] = trial_allocations.get(node_id, ResourceVector()) + bundle
+                trial_allocations[node_id] = trial_allocations.get(node_id, ResourceVector()) + task_bundle
             if not task_ok:
                 continue
 
@@ -480,8 +518,8 @@ class ClusterQueryResourceCoordinator:
         extra_capacity = _sum_resources(list(remaining.values()))
         extras = self._weighted_drf_extras(admitted, extra_capacity, total_capacity)
 
-        # Place the aggregate DRF result onto concrete nodes. Each dimension is
-        # divisible; indivisible actor bundles were already placed above.
+        # Place the aggregate DRF result onto concrete nodes. GPU demand is
+        # fixed in the bundles above; only CPU and memory extras are divisible.
         for state in admitted:
             query_id = state.demand.query_id
             extra = extras.get(query_id, ResourceVector())
@@ -546,7 +584,7 @@ class ClusterQueryResourceCoordinator:
         remaining: dict[str, ResourceVector],
     ) -> dict[str, ResourceVector] | None:
         if request.gpu > _EPSILON:
-            return None
+            raise AssertionError("divisible placement received fixed GPU resources")
         trial_remaining = dict(remaining)
         allocations = {node_id: ResourceVector() for node_id in remaining}
         for field_name in ("cpu", "heap_bytes", "object_store_bytes"):
@@ -700,6 +738,7 @@ class ClusterQueryResourceCoordinator:
 __all__ = [
     "ActorResourceBundle",
     "ClusterQueryResourceCoordinator",
+    "ElasticGpuDemandError",
     "NodeCapacity",
     "QueryDemand",
     "read_ray_node_capacities",

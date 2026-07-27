@@ -836,10 +836,10 @@ class QueryResourceManager:
             evaluations = self._evaluate_waiting_tasks_locked()
             owned_fatal = [item for item in evaluations if item.fatal and item.key in candidate_keys]
             if owned_fatal:
-                selected = min(owned_fatal, key=lambda item: item.rank)
-                return selected.request, TaskGrant(
+                fatal_selected = min(owned_fatal, key=lambda item: item.rank)
+                return fatal_selected.request, TaskGrant(
                     False,
-                    blocked_reason=selected.reason or "fatal_task_admission",
+                    blocked_reason=fatal_selected.reason or "fatal_task_admission",
                     fatal=True,
                 )
             selected = self._select_waiting_task_evaluation_locked(evaluations)
@@ -1619,7 +1619,7 @@ class QueryResourceManager:
         """Cap a soft share by tasks that can coexist under every hard dimension."""
         concurrency = self._stage_concurrency_cap(spec)
         if spec.backend == "ray_actor":
-            concurrency = spec.actor_min_size
+            concurrency = spec.actor_pool_size
         hard_bound = math.inf if concurrency is None else int(concurrency)
         commitment = self._task_commitment(spec)
         for resource_field in _RESOURCE_FIELDS:
@@ -1759,7 +1759,7 @@ class QueryResourceManager:
 
     def _preferred_liveness_stage_locked(self) -> str | None:
         if self._waiting_task_inputs:
-            candidates: list[str] = []
+            waiting_candidates: list[str] = []
             for stage_id in self.graph.reverse_topological_stage_ids():
                 for request, _ in self._waiting_task_inputs.values():
                     if str(request.stage_id) != stage_id:
@@ -1769,18 +1769,18 @@ class QueryResourceManager:
                         hypothetical=True,
                     )
                     if not fatal and reason in _SOFT_TASK_BLOCK_REASONS:
-                        candidates.append(stage_id)
+                        waiting_candidates.append(stage_id)
                         break
-            if not candidates:
+            if not waiting_candidates:
                 return None
             starving = [
                 stage_id
-                for stage_id in candidates
+                for stage_id in waiting_candidates
                 if self._stages[stage_id].queued_input_bytes > 0
                 and self._active_task_count_for_stage_locked(stage_id) == 0
             ]
-            return (starving or candidates)[0]
-        candidates: list[str] = []
+            return (starving or waiting_candidates)[0]
+        runnable_candidates: list[str] = []
         for stage_id in self.graph.reverse_topological_stage_ids():
             stage = self._stages[stage_id]
             if not stage.runnable or stage.completed:
@@ -1798,15 +1798,15 @@ class QueryResourceManager:
                 hypothetical=True,
             )
             if not fatal and reason in _SOFT_TASK_BLOCK_REASONS:
-                candidates.append(stage_id)
-        if not candidates:
+                runnable_candidates.append(stage_id)
+        if not runnable_candidates:
             return None
         starving = [
             stage_id
-            for stage_id in candidates
+            for stage_id in runnable_candidates
             if self._stages[stage_id].queued_input_bytes > 0 and self._active_task_count_for_stage_locked(stage_id) == 0
         ]
-        return (starving or candidates)[0]
+        return (starving or runnable_candidates)[0]
 
     def _grant_task_locked(
         self,
@@ -1854,7 +1854,7 @@ class QueryResourceManager:
             else:
                 self._queued_actor_slot_leases.setdefault(actor_slot, deque()).append(lease.lease_id)
         if plan.new_credit is not None:
-            credit = _ContinuationCredit(
+            new_credit = _ContinuationCredit(
                 credit_id=uuid.uuid4().hex,
                 parent_task_lease_id=lease.lease_id,
                 parent_stage_id=lease.stage_id,
@@ -1864,20 +1864,20 @@ class QueryResourceManager:
                 resources=plan.new_credit.resources,
                 allocation_generation=self.allocation.generation,
             )
-            self._continuation_credits[credit.credit_id] = credit
-            self._continuation_credit_by_parent[lease.lease_id] = credit.credit_id
+            self._continuation_credits[new_credit.credit_id] = new_credit
+            self._continuation_credit_by_parent[lease.lease_id] = new_credit.credit_id
         elif plan.borrowed_credit_id is not None:
-            credit = self._continuation_credits.get(plan.borrowed_credit_id)
+            borrowed_credit = self._continuation_credits.get(plan.borrowed_credit_id)
             if (
-                credit is None
-                or not credit.parent_active
-                or credit.borrowed_by_task_lease_id is not None
-                or lease.stage_id not in credit.eligible_stage_ids
-                or credit.node_id != lease.node_id
+                borrowed_credit is None
+                or not borrowed_credit.parent_active
+                or borrowed_credit.borrowed_by_task_lease_id is not None
+                or lease.stage_id not in borrowed_credit.eligible_stage_ids
+                or borrowed_credit.node_id != lease.node_id
             ):
                 raise RuntimeError("continuation credit changed during atomic task admission")
-            credit.borrowed_by_task_lease_id = lease.lease_id
-            self._continuation_credit_by_borrower[lease.lease_id] = credit.credit_id
+            borrowed_credit.borrowed_by_task_lease_id = lease.lease_id
+            self._continuation_credit_by_borrower[lease.lease_id] = borrowed_credit.credit_id
         self._waiting_task_inputs.pop((lease.task_id, lease.attempt_id), None)
         self._recompute_stage_queued_input_locked(lease.stage_id)
         self._started_stage_ids.add(lease.stage_id)
@@ -2483,8 +2483,6 @@ class QueryResourceManager:
         outputs_by_idle_credit: dict[str, int] = {}
         for output in self._output_leases.values():
             if node_id is not None and output.node_id != node_id:
-                continue
-            if stage_id is not None and output.producer_stage_id != stage_id:
                 continue
             credit_id = output.continuation_credit_id
             credit = self._continuation_credits.get(credit_id or "")
