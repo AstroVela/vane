@@ -1447,6 +1447,366 @@ class TestGoogleEmbeddingRowPreservation:
             asyncio.run(embedder.embed_text(["first row", "second row"]))
 
 
+class TestGoogleEmbeddingBatching:
+    """Tests for Google embedding request chunking under the API batch cap."""
+
+    def _recording_embedder(self, model, dimensions=None, options=None):
+        """Build a GoogleTextEmbedder around a recording embed_content mock.
+
+        The fake response derives each embedding value from the input text
+        (``"txt-<n>"`` embeds to ``[float(n)]``), so result order can be
+        asserted independently of request order.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.providers.google import GoogleTextEmbedder
+
+        calls: list[dict] = []
+
+        async def fake_embed_content(**kwargs):
+            calls.append(kwargs)
+            response = MagicMock()
+            response.embeddings = []
+            for item in kwargs["contents"]:
+                embedding = MagicMock()
+                embedding.values = [float(item.parts[0].text.rsplit("-", 1)[1])]
+                response.embeddings.append(embedding)
+            return response
+
+        embedder = GoogleTextEmbedder.__new__(GoogleTextEmbedder)
+        embedder._client = MagicMock()
+        embedder._client.aio.models.embed_content = AsyncMock(side_effect=fake_embed_content)
+        embedder._model = model
+        embedder._dimensions = dimensions
+        embedder._options = dict(options or {})
+        return embedder, calls
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_oversized_batch_chunked_under_cap(self):
+        """250 inputs become 3 requests of <=100, concatenated in order."""
+        import asyncio
+
+        embedder, calls = self._recording_embedder("gemini-embedding-001")
+        texts = [f"txt-{i}" for i in range(250)]
+
+        result = asyncio.run(embedder.embed_text(texts))
+
+        assert [len(call["contents"]) for call in calls] == [100, 100, 50]
+        assert all(call["model"] == "gemini-embedding-001" for call in calls)
+        # Chunks cover the inputs in order without overlap.
+        sent = [item.parts[0].text for call in calls for item in call["contents"]]
+        assert sent == texts
+        # One embedding per input row, in input order.
+        assert len(result) == len(texts)
+        assert [e[0] for e in result] == [float(i) for i in range(250)]
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    @pytest.mark.parametrize("count", [1, 100])
+    def test_batch_at_or_under_cap_is_single_request(self, count):
+        """Batches within the cap go out as one request."""
+        import asyncio
+
+        embedder, calls = self._recording_embedder("gemini-embedding-001")
+        texts = [f"txt-{i}" for i in range(count)]
+
+        result = asyncio.run(embedder.embed_text(texts))
+
+        assert len(calls) == 1
+        assert len(calls[0]["contents"]) == count
+        assert len(result) == count
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_empty_batch_makes_no_requests(self):
+        import asyncio
+
+        embedder, calls = self._recording_embedder("gemini-embedding-001")
+
+        result = asyncio.run(embedder.embed_text([]))
+
+        assert calls == []
+        assert result == []
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_aggregating_model_batches_via_separate_contents(self):
+        """gemini-embedding-2 aggregates multiple direct string inputs, so
+        each input travels as its own Content and full-size chunks stay
+        row-preserving without falling back to one request per input."""
+        import asyncio
+
+        embedder, calls = self._recording_embedder("gemini-embedding-2")
+        texts = ["txt-0", "txt-1", "txt-2"]
+
+        result = asyncio.run(embedder.embed_text(texts))
+
+        assert len(calls) == 1
+        assert [item.parts[0].text for item in calls[0]["contents"]] == texts
+        assert len(result) == len(texts)
+        assert [e[0] for e in result] == [0.0, 1.0, 2.0]
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_result_count_mismatch_raises(self):
+        """A model that does not embed inputs individually is rejected."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.providers.google import GoogleTextEmbedder
+
+        async def aggregate_embed_content(**kwargs):
+            response = MagicMock()
+            embedding = MagicMock()
+            embedding.values = [1.0]
+            response.embeddings = [embedding]  # one embedding for N inputs
+            return response
+
+        embedder = GoogleTextEmbedder.__new__(GoogleTextEmbedder)
+        embedder._client = MagicMock()
+        embedder._client.aio.models.embed_content = AsyncMock(side_effect=aggregate_embed_content)
+        embedder._model = "custom-aggregating-embedder"
+        embedder._dimensions = None
+        embedder._options = {}
+
+        with pytest.raises(ValueError, match="returned 1 embeddings for 3 inputs"):
+            asyncio.run(embedder.embed_text(["a", "b", "c"]))
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_config_forwarded_to_every_chunk(self):
+        """Dimensions and request options reach each chunked request."""
+        import asyncio
+
+        embedder, calls = self._recording_embedder(
+            "gemini-embedding-001",
+            dimensions=256,
+            options={"task_type": "RETRIEVAL_QUERY"},
+        )
+        texts = [f"txt-{i}" for i in range(150)]
+
+        asyncio.run(embedder.embed_text(texts))
+
+        assert len(calls) == 2
+        for call in calls:
+            assert call["config"]["output_dimensionality"] == 256
+            assert call["config"]["task_type"] == "RETRIEVAL_QUERY"
+
+    def test_udf_batch_size_defaults_to_request_cap(self):
+        """The descriptor's UDF batch size defaults to the per-request cap."""
+        from vane.ai.providers.google import GoogleTextEmbedderDescriptor
+
+        desc = GoogleTextEmbedderDescriptor(model_name="gemini-embedding-001")
+        assert desc.get_udf_options().batch_size == 100
+
+    def test_udf_batch_size_cap_applies_to_aggregating_model(self):
+        """Per-Content encoding keeps gemini-embedding-2 row-preserving at
+        full chunk size, so it gets the same default cap as other models."""
+        from vane.ai.providers.google import GoogleTextEmbedderDescriptor
+
+        desc = GoogleTextEmbedderDescriptor(model_name="gemini-embedding-2")
+        assert desc.get_udf_options().batch_size == 100
+
+    def test_udf_batch_size_explicit_override(self):
+        from vane.ai.providers.google import GoogleTextEmbedderDescriptor
+
+        desc = GoogleTextEmbedderDescriptor(
+            model_name="gemini-embedding-001",
+            embed_options={"batch_size": 25},
+        )
+        assert desc.get_udf_options().batch_size == 25
+
+
+class TestGoogleConversationStructure:
+    """Recording-client structural tests for Google role handling.
+
+    Asserts the exact ``Content`` / ``system_instruction`` structures the
+    prompter sends to ``generate_content``.
+    """
+
+    def _recording_prompter(self, system_message=None):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from vane.ai.providers.google import GooglePrompter
+
+        with patch("google.genai.Client"):
+            prompter = GooglePrompter(
+                provider_options={"api_key": "test"},
+                model="gemini-2.5-pro",
+                system_message=system_message,
+            )
+
+        calls: list[dict] = []
+        response = MagicMock()
+        response.text = "ok"
+        response.usage_metadata = None
+
+        async def fake_generate_content(**kwargs):
+            calls.append(kwargs)
+            return response
+
+        client = MagicMock()
+        client.aio.models.generate_content = AsyncMock(side_effect=fake_generate_content)
+        prompter._client = client
+        return prompter, calls
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_system_plus_user_string(self):
+        """Descriptor system_message routes through system_instruction."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter(system_message="Be helpful.")
+
+        result = asyncio.run(prompter.prompt(("hello",)))
+
+        assert result == "ok"
+        assert len(calls) == 1
+        assert calls[0]["model"] == "gemini-2.5-pro"
+        contents = calls[0]["contents"]
+        assert len(contents) == 1
+        assert contents[0].role == "user"
+        assert [part.text for part in contents[0].parts] == ["hello"]
+        assert calls[0]["config"].system_instruction == "Be helpful."
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_plain_string_prompt_regression(self):
+        """A plain-string prompt stays a single user turn with no config."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+
+        asyncio.run(prompter.prompt(("hello",)))
+
+        contents = calls[0]["contents"]
+        assert [content.role for content in contents] == ["user"]
+        assert [part.text for part in contents[0].parts] == ["hello"]
+        assert calls[0]["config"] is None
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_alternating_turns_preserved_in_order(self):
+        """Role-tagged dicts become ordered user/model Content turns."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+
+        asyncio.run(
+            prompter.prompt(
+                (
+                    {"role": "user", "content": "q1"},
+                    {"role": "assistant", "content": "a1"},
+                    {"role": "user", "content": "q2"},
+                )
+            )
+        )
+
+        contents = calls[0]["contents"]
+        assert [content.role for content in contents] == ["user", "model", "user"]
+        assert [content.parts[0].text for content in contents] == ["q1", "a1", "q2"]
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_system_messages_combined_in_declaration_order(self):
+        """system dicts merge with the descriptor system_message, in order,
+        and never appear as conversation turns."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter(system_message="A.")
+
+        asyncio.run(
+            prompter.prompt(
+                (
+                    {"role": "system", "content": "B."},
+                    {"role": "user", "content": "hi"},
+                )
+            )
+        )
+
+        assert calls[0]["config"].system_instruction == "A.\n\nB."
+        contents = calls[0]["contents"]
+        assert [content.role for content in contents] == ["user"]
+        assert contents[0].parts[0].text == "hi"
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    @pytest.mark.parametrize("role", ["tool", "function", "assistantt"])
+    def test_unsupported_role_raises(self, role):
+        """Unknown roles fail fast instead of degrading into user text."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+
+        with pytest.raises(ValueError, match=f"Unsupported message role '{role}'"):
+            asyncio.run(prompter.prompt(({"role": role, "content": "x"},)))
+        assert calls == []
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_mixed_text_image_parts_preserved_in_order(self):
+        """Structured part lists convert per-part, in order."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 10
+
+        asyncio.run(prompter.prompt(({"role": "user", "content": ["look", png]},)))
+
+        contents = calls[0]["contents"]
+        assert len(contents) == 1
+        assert contents[0].role == "user"
+        parts = contents[0].parts
+        assert len(parts) == 2
+        assert parts[0].text == "look"
+        assert parts[1].inline_data.mime_type == "image/png"
+        assert parts[1].inline_data.data == png
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_untagged_parts_group_into_user_turns_between_role_dicts(self):
+        """Loose parts flush into user turns around role-tagged messages."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+
+        asyncio.run(
+            prompter.prompt(
+                (
+                    "intro",
+                    {"role": "assistant", "content": "a"},
+                    "next",
+                )
+            )
+        )
+
+        contents = calls[0]["contents"]
+        assert [content.role for content in contents] == ["user", "model", "user"]
+        assert [content.parts[0].text for content in contents] == ["intro", "a", "next"]
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_dict_text_content_part_converts_without_repr(self):
+        """OpenAI-style text part dicts become real text parts."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+
+        asyncio.run(prompter.prompt(({"role": "user", "content": [{"type": "text", "text": "hi"}]},)))
+
+        parts = calls[0]["contents"][0].parts
+        assert [part.text for part in parts] == ["hi"]
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_unsupported_dict_content_part_raises(self):
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+
+        with pytest.raises(ValueError, match="Unsupported dict content part"):
+            asyncio.run(
+                prompter.prompt(({"role": "user", "content": [{"type": "image_url", "image_url": {"url": "u"}}]},))
+            )
+        assert calls == []
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_non_string_system_content_raises(self):
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+
+        with pytest.raises(ValueError, match="system messages must be plain text"):
+            asyncio.run(prompter.prompt(({"role": "system", "content": ["a", "b"]},)))
+        assert calls == []
+
+
 # ---------------------------------------------------------------------------
 # Anthropic Structured Output + Multimodal tests
 # ---------------------------------------------------------------------------

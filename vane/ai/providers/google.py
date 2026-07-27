@@ -99,6 +99,23 @@ _EMBEDDING_DIM_RANGE: dict[str, tuple[int, int]] = {
     "gemini-embedding-2": (128, 3072),
 }
 
+# Per-request input cap for Gemini embedding requests. The embeddings guide
+# does not publish a batch-size number, but the ``batchEmbedContents``
+# endpoint (which multi-input ``embed_content`` calls use) rejects larger
+# batches with "BatchEmbedContentsRequest.requests: at most 100 requests can
+# be in one batch", so 100 is the server-enforced limit.
+_EMBED_BATCH_LIMIT = 100
+
+# Conversation roles supported by the Gemini API, mapped from the
+# OpenAI/Anthropic-style role names used in Vane message dicts to the wire
+# role names Gemini expects. ``system`` is handled separately via
+# ``GenerateContentConfig.system_instruction``; anything else is rejected.
+_CONVERSATION_ROLES: dict[str, str] = {
+    "user": "user",
+    "assistant": "model",
+}
+
+
 # Request options rejected per model before dispatch. Gemini 3.6 Flash and
 # 3.5 Flash-Lite deprecate the classic sampling parameters: the API ignores
 # them today and returns HTTP 400 in future model generations
@@ -304,6 +321,10 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
     ``model_name`` is required. ``dimensions`` is required unless the model
     has trusted metadata in :data:`_EMBEDDING_DIMS`; both are validated at
     construction time, before anything ships to workers.
+
+    The default UDF ``batch_size`` matches the per-request input cap
+    (:data:`_EMBED_BATCH_LIMIT`); the embedder additionally chunks
+    oversized batches as defense in depth.
     """
 
     model_name: str
@@ -333,6 +354,7 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
 
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(
+            batch_size=self.embed_options.get("batch_size", _EMBED_BATCH_LIMIT),
             max_retries=self.embed_options.get("max_retries", 3),
             on_error=self.embed_options.get("on_error", "raise"),
             actor_number=self.embed_options.get("actor_number"),
@@ -389,34 +411,44 @@ class GoogleTextEmbedder:
         }
 
     async def embed_text(self, text: list[str]) -> list[Embedding]:
+        """Embed *text*, chunking into per-request batches under the API cap.
+
+        Each input is sent as its own ``types.Content``, so aggregating
+        models such as ``gemini-embedding-2`` still return one embedding
+        per input. Requests are capped at :data:`_EMBED_BATCH_LIMIT` inputs
+        and results are concatenated in input order, so an oversized arrow
+        batch can never produce a single oversized API call. The result
+        always contains exactly one embedding per input.
+        """
         from google.genai import types
 
-        # Embedding models such as gemini-embedding-2 aggregate multiple
-        # direct string inputs into a single embedding; one Content per input
-        # keeps the call row-preserving.
-        kwargs: dict[str, Any] = {
-            "model": self._model,
-            "contents": [types.Content(parts=[types.Part.from_text(text=t)]) for t in text],
-        }
         config = dict(self._options)
         if self._dimensions is not None:
             config["output_dimensionality"] = self._dimensions
-        if config:
-            kwargs["config"] = config
 
-        try:
-            result = await self._client.aio.models.embed_content(**kwargs)
-        except Exception as exc:
-            _raise_retry_after_on_google_error(exc)
-            raise
-        embeddings = result.embeddings or []
-        if len(embeddings) != len(text):
-            raise ValueError(
-                f"Google embed_content returned {len(embeddings)} embeddings for "
-                f"{len(text)} inputs with model {self._model!r}; embedding calls "
-                "must return exactly one embedding per input row."
-            )
-        return [np.array(e.values, dtype=np.float32) for e in embeddings]
+        embeddings: list[Embedding] = []
+        for start in range(0, len(text), _EMBED_BATCH_LIMIT):
+            chunk = text[start : start + _EMBED_BATCH_LIMIT]
+            kwargs: dict[str, Any] = {
+                "model": self._model,
+                "contents": [types.Content(parts=[types.Part.from_text(text=t)]) for t in chunk],
+            }
+            if config:
+                kwargs["config"] = config
+            try:
+                result = await self._client.aio.models.embed_content(**kwargs)
+            except Exception as exc:
+                _raise_retry_after_on_google_error(exc)
+                raise
+            chunk_embeddings = result.embeddings or []
+            if len(chunk_embeddings) != len(chunk):
+                raise ValueError(
+                    f"Google embed_content returned {len(chunk_embeddings)} embeddings for "
+                    f"{len(chunk)} inputs with model {self._model!r}; embedding calls "
+                    "must return exactly one embedding per input row."
+                )
+            embeddings.extend(np.array(e.values, dtype=np.float32) for e in chunk_embeddings)
+        return embeddings
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +512,9 @@ class GooglePrompter:
 
     Features:
     - Multimodal: str, bytes (images), numpy arrays → Gemini content parts
+    - Conversations: role-tagged dicts become ordered ``Content`` turns
+      (``user`` → ``user``, ``assistant`` → ``model``); ``system`` messages
+      route through ``system_instruction``; other roles are rejected.
     - Structured Output: ``return_format`` (Pydantic BaseModel) uses
       ``response_mime_type="application/json"`` + ``response_schema``.
     """
@@ -532,8 +567,13 @@ class GooglePrompter:
             media_type = _guess_media_type(msg)
             return types.Part.from_bytes(data=msg, mime_type=media_type)
         if isinstance(msg, dict):
-            # Dict content part — convert to text representation
-            return types.Part.from_text(text=str(msg.get("content", msg)))
+            # Structured content part. Only explicit text parts convert;
+            # anything else raises instead of degrading into a ``str()`` repr.
+            if isinstance(msg.get("text"), str):
+                return types.Part.from_text(text=msg["text"])
+            if isinstance(msg.get("content"), str):
+                return types.Part.from_text(text=msg["content"])
+            raise ValueError(f"Unsupported dict content part for the Google provider: {msg!r}")
         # numpy array
         type_name = type(msg).__name__
         mod = getattr(type(msg), "__module__", "")
@@ -556,6 +596,12 @@ class GooglePrompter:
         img.save(buf, "PNG")
         return types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png")
 
+    def _content_parts(self, content: Any) -> list[Any]:
+        """Convert a role-tagged message's ``content`` into ordered Gemini parts."""
+        if isinstance(content, (list, tuple)):
+            return [self._process_message(part) for part in content]
+        return [self._process_message(content)]
+
     # --- API call --------------------------------------------------------
 
     async def prompt(self, messages: tuple[Any, ...]) -> Any:
@@ -563,24 +609,60 @@ class GooglePrompter:
 
         Supports multimodal content (str, bytes, numpy arrays) and
         structured output via ``response_schema``.
+
+        Role-tagged dicts (``{"role": ..., "content": ...}``) become genuine
+        ordered conversation turns: ``user`` maps to a ``user`` turn,
+        ``assistant`` to a ``model`` turn, and ``system`` messages are routed
+        through ``GenerateContentConfig.system_instruction`` (combined with
+        the descriptor's ``system_message`` in declaration order). Any other
+        role raises :class:`ValueError`. Untagged parts between role-tagged
+        messages are grouped into user turns, preserving order.
         """
         from google.genai import types
 
-        # Build content parts
-        parts: list[Any] = []
+        contents: list[Any] = []
+        system_texts: list[str] = []
+        if self._system_message:
+            system_texts.append(self._system_message)
+
+        # Untagged parts accumulate into a single user turn until a
+        # role-tagged message closes it.
+        pending_parts: list[Any] = []
+
+        def _flush_pending() -> None:
+            if pending_parts:
+                contents.append(types.Content(role="user", parts=list(pending_parts)))
+                pending_parts.clear()
+
         for msg in messages:
             if isinstance(msg, dict) and "role" in msg:
-                # Complete message — extract text content
-                parts.append(types.Part.from_text(text=str(msg.get("content", ""))))
+                role = msg["role"]
+                content = msg.get("content", "")
+                if role == "system":
+                    if not isinstance(content, str):
+                        raise ValueError(
+                            f"Google system messages must be plain text, got content of type {type(content).__name__}."
+                        )
+                    system_texts.append(content)
+                    continue
+                mapped_role = _CONVERSATION_ROLES.get(role)
+                if mapped_role is None:
+                    supported = sorted((*_CONVERSATION_ROLES, "system"))
+                    raise ValueError(
+                        f"Unsupported message role {role!r} for the Google provider. Supported roles: {supported}."
+                    )
+                _flush_pending()
+                contents.append(types.Content(role=mapped_role, parts=self._content_parts(content)))
             else:
-                parts.append(self._process_message(msg))
+                pending_parts.append(self._process_message(msg))
 
-        contents = [types.Content(role="user", parts=parts)]
+        _flush_pending()
 
         # Build config
         config_kwargs: dict[str, Any] = {}
-        if self._system_message:
-            config_kwargs["system_instruction"] = self._system_message
+        system_instruction = "\n\n".join(text for text in system_texts if text)
+        if system_instruction:
+            config_kwargs["system_instruction"] = system_instruction
         for k in ("temperature", "top_p", "top_k", "max_output_tokens"):
             if k in self._options:
                 config_kwargs[k] = self._options[k]
