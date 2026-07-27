@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for flat_map UDF (one-to-many row expansion via INOUT_FUNCTION)."""
+"""Tests for flat_map UDF through the strict streaming consumer path."""
 
 import duckdb
 
@@ -149,7 +149,7 @@ def test_flat_map_passthrough_columns():
     assert parts == ["a", "b", "c"]
 
 
-def test_flat_map_streaming_breaker_subprocess_task():
+def test_flat_map_strict_consumer_subprocess_task():
     """Streaming flat_map should support one-to-many table output."""
     con = duckdb.connect()
 
@@ -165,7 +165,6 @@ def test_flat_map_streaming_breaker_subprocess_task():
             execution_backend="subprocess_task",
             batch_size=1,
             output_batch_size=1,
-            streaming_breaker=True,
         )
         .fetchall()
     )

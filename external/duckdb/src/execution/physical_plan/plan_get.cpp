@@ -2,11 +2,15 @@
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
+#include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/function/scalar/nested_functions.hpp"
+#include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -71,6 +75,97 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalGet &op) {
 			                                      child.get().estimated_cardinality);
 			proj.children.push_back(child);
 			child = proj;
+		}
+
+		if (IsUDFTableFunction(op.function)) {
+			if (!op.bind_data) {
+				throw InternalException("registered UDF table function is missing bind data");
+			}
+			if (!op.projected_input.empty()) {
+				throw NotImplementedException(
+				    "registered UDF table functions do not support projected input columns under the required "
+				    "streaming output contract");
+			}
+			if (op.ordinality_idx.IsValid()) {
+				throw NotImplementedException(
+				    "registered UDF table functions do not support WITH ORDINALITY under the required streaming "
+				    "output contract");
+			}
+
+			auto &udf_bind = op.bind_data->Cast<UDFFunctionData>();
+			udf_bind.payload = RequireUDFStreamingOutput(std::move(udf_bind.payload));
+			auto udf_function = MakeUDFTableFunction(udf_bind.payload, op.returned_types, op.names);
+			auto udf_return_type = udf_bind.return_type;
+			const bool multi_column_output = op.returned_types.size() > 1;
+
+			vector<ColumnIndex> all_column_ids;
+			all_column_ids.emplace_back(0);
+			vector<LogicalType> streaming_types {udf_return_type};
+			auto &streaming_udf =
+			    Make<PhysicalStreamingUDF>(std::move(streaming_types), std::move(udf_function), std::move(op.bind_data),
+			                               std::move(all_column_ids), op.estimated_cardinality, vector<column_t>());
+			streaming_udf.children.push_back(child);
+
+			vector<idx_t> selected_columns;
+			if (op.projection_ids.empty()) {
+				selected_columns.reserve(column_ids.size());
+				for (auto &column_id : column_ids) {
+					if (column_id.IsVirtualColumn()) {
+						throw NotImplementedException(
+						    "registered UDF table functions do not support virtual output columns");
+					}
+					selected_columns.push_back(column_id.GetPrimaryIndex());
+				}
+			} else {
+				selected_columns.reserve(op.projection_ids.size());
+				for (auto projection_id : op.projection_ids) {
+					if (projection_id >= column_ids.size()) {
+						throw InternalException("registered UDF projection index is out of range");
+					}
+					auto &column_id = column_ids[projection_id];
+					if (column_id.IsVirtualColumn()) {
+						throw NotImplementedException(
+						    "registered UDF table functions do not support virtual output columns");
+					}
+					selected_columns.push_back(column_id.GetPrimaryIndex());
+				}
+			}
+
+			const bool identity_projection =
+			    !multi_column_output && selected_columns.size() == 1 && selected_columns[0] == 0;
+			if (identity_projection) {
+				return streaming_udf;
+			}
+			if (selected_columns.size() != op.types.size()) {
+				throw InternalException("registered UDF output projection type count mismatch");
+			}
+
+			vector<unique_ptr<Expression>> output_expressions;
+			output_expressions.reserve(selected_columns.size());
+			for (auto column_idx : selected_columns) {
+				if (column_idx >= op.returned_types.size()) {
+					throw InternalException("registered UDF output column index is out of range");
+				}
+				if (!multi_column_output) {
+					output_expressions.push_back(make_uniq<BoundReferenceExpression>(op.returned_types[column_idx], 0));
+					continue;
+				}
+
+				vector<unique_ptr<Expression>> extract_arguments;
+				extract_arguments.push_back(make_uniq<BoundReferenceExpression>(udf_return_type, 0));
+				extract_arguments.push_back(make_uniq<BoundConstantExpression>(Value(op.names[column_idx])));
+				auto extract_function = GetKeyExtractFunction();
+				auto extract_bind = extract_function.GetBindCallback()(context, extract_function, extract_arguments);
+				auto extract_type = extract_function.GetReturnType();
+				auto extract = make_uniq<BoundFunctionExpression>(
+				    extract_type, std::move(extract_function), std::move(extract_arguments), std::move(extract_bind));
+				extract->SetAlias(op.names[column_idx]);
+				output_expressions.push_back(std::move(extract));
+			}
+			auto &output_projection =
+			    Make<PhysicalProjection>(op.types, std::move(output_expressions), op.estimated_cardinality);
+			output_projection.children.push_back(streaming_udf);
+			return output_projection;
 		}
 
 		auto &table_in_out =

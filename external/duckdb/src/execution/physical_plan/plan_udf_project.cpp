@@ -10,7 +10,6 @@
 
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
-#include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/common/exception.hpp"
@@ -281,7 +280,7 @@ static Value PayloadWithResolvedExpressionBackend(const Value &payload) {
 		throw InvalidInputException("GPU resources require VANE_RUNNER=ray");
 	}
 	const bool uses_actor_backend = PayloadUsesActorBackend(payload);
-	const bool local_ref_bundle_output = runner_type != "ray" && PayloadBoolField(payload, "streaming_breaker");
+	const bool local_ref_bundle_output = runner_type != "ray";
 	child_list_t<Value> fields;
 	fields.emplace_back("execution_backend",
 	                    Value(ExpressionUDFExecutionBackendForRunner(runner_type, uses_actor_backend)));
@@ -292,9 +291,7 @@ static Value PayloadWithResolvedExpressionBackend(const Value &payload) {
 		}
 		fields.emplace_back("actor_pool_size", Value::BIGINT(static_cast<int64_t>(actor_number.second)));
 	}
-	if (PayloadHasField(payload, "streaming_output_mode") || local_ref_bundle_output) {
-		fields.emplace_back("streaming_output_mode", Value(StreamingOutputModeForRunner(runner_type)));
-	}
+	fields.emplace_back("streaming_output_mode", Value(StreamingOutputModeForRunner(runner_type)));
 	auto result = PayloadWithStringFields(payload, std::move(fields));
 	if (runner_type == "ray") {
 		result = PayloadWithBoolField(result, "produce_ray_block_stream", true);
@@ -359,11 +356,7 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalUDFProject &op) {
 	if (PayloadBoolField(bind_data.payload, "expression_udf")) {
 		bind_data.payload = PayloadWithResolvedExpressionBackend(bind_data.payload);
 	}
-	if (PayloadStringEquals(bind_data.payload, "execution_backend", "ray_task") ||
-	    PayloadStringEquals(bind_data.payload, "execution_backend", "ray_actor")) {
-		bind_data.payload = PayloadWithBoolField(bind_data.payload, "produce_ray_block_stream", true);
-		bind_data.payload = PayloadWithBoolField(bind_data.payload, "produce_ref_bundle_output", false);
-	}
+	bind_data.payload = RequireUDFStreamingOutput(std::move(bind_data.payload));
 
 	auto &plan = CreatePlan(*op.children[0]);
 	if (op.is_scalar_map || op.is_row_preserving_batch) {
@@ -372,7 +365,8 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalUDFProject &op) {
 		    AddUDFLayoutPayload(bind_data.payload, bound.children.size(), child_types, bind_data.return_type);
 	}
 
-	// Build the TableFunction with INOUT callbacks.
+	// Build the serializable TableFunction descriptor consumed by
+	// PhysicalStreamingUDF.
 	// Always output 1 column with the original return type (STRUCT for multi-column,
 	// scalar for single).  This must match BoundStatement.types set at bind time.
 	vector<LogicalType> return_types;
@@ -394,8 +388,7 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalUDFProject &op) {
 	}
 	auto table_function = MakeUDFTableFunction(bind_data.payload, return_types, return_names);
 
-	// Create bind data for the INOUT function
-	auto inout_bind_data = std::move(bound.bind_info);
+	auto udf_bind_data = std::move(bound.bind_info);
 
 	// Single output column
 	vector<ColumnIndex> column_ids;
@@ -403,19 +396,11 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalUDFProject &op) {
 	auto &input_plan = MaybeWrapRowPreservingLayoutProjection(*this, plan, bound.children, bind_data.payload,
 	                                                          op.estimated_cardinality);
 
-	if (PayloadBoolField(bind_data.payload, "streaming_breaker")) {
-		auto &streaming_op =
-		    Make<PhysicalStreamingUDF>(op.types, std::move(table_function), std::move(inout_bind_data),
-		                               std::move(column_ids), op.estimated_cardinality, vector<column_t>());
-		streaming_op.children.push_back(input_plan);
-		return streaming_op;
-	}
-
-	auto &inout_op =
-	    Make<PhysicalTableInOutFunction>(op.types, std::move(table_function), std::move(inout_bind_data),
-	                                     std::move(column_ids), op.estimated_cardinality, vector<column_t>());
-	inout_op.children.push_back(input_plan);
-	return inout_op;
+	auto &streaming_op =
+	    Make<PhysicalStreamingUDF>(op.types, std::move(table_function), std::move(udf_bind_data), std::move(column_ids),
+	                               op.estimated_cardinality, vector<column_t>());
+	streaming_op.children.push_back(input_plan);
+	return streaming_op;
 }
 
 } // namespace duckdb

@@ -116,7 +116,7 @@ def test_local_progress_snapshot_uses_common_progress_shape():
             "pipelines": [
                 {
                     "pipeline_id": 2,
-                    "operators": ["TABLE_SCAN", "INOUT_FUNCTION"],
+                    "operators": ["TABLE_SCAN", "STREAMING_UDF"],
                     "operator_details": [{}, {"pipeline_role": "sink", "udf_name": "udf"}],
                     "input_rows": 50,
                     "input_bytes": 1024,
@@ -129,7 +129,7 @@ def test_local_progress_snapshot_uses_common_progress_shape():
                 },
                 {
                     "pipeline_id": 1,
-                    "operators": ["INOUT_FUNCTION", "COPY_TO_FILE"],
+                    "operators": ["STREAMING_UDF", "COPY_TO_FILE"],
                     "operator_details": [{"pipeline_role": "source", "udf_name": "udf"}, {}],
                     "input_rows": 50,
                     "input_bytes": 1024,
@@ -278,12 +278,12 @@ def test_progress_snapshot_uses_native_pipeline_driver_lifecycle():
                         "progress_topology": _topology(
                             (
                                 2,
-                                ["TABLE_SCAN", "INOUT_FUNCTION"],
+                                ["TABLE_SCAN", "STREAMING_UDF"],
                                 [{}, {"pipeline_role": "sink", "udf_name": "udf"}],
                             ),
                             (
                                 1,
-                                ["INOUT_FUNCTION", "COPY_TO_FILE"],
+                                ["STREAMING_UDF", "COPY_TO_FILE"],
                                 [{"pipeline_role": "source", "udf_name": "udf"}, {}],
                             ),
                         ),
@@ -300,7 +300,7 @@ def test_progress_snapshot_uses_native_pipeline_driver_lifecycle():
                                             "pipelines": [
                                                 {
                                                     "pipeline_id": 2,
-                                                    "operators": ["TABLE_SCAN", "INOUT_FUNCTION"],
+                                                    "operators": ["TABLE_SCAN", "STREAMING_UDF"],
                                                     "operator_details": [
                                                         {},
                                                         {"pipeline_role": "sink", "udf_name": "udf"},
@@ -316,7 +316,7 @@ def test_progress_snapshot_uses_native_pipeline_driver_lifecycle():
                                                 },
                                                 {
                                                     "pipeline_id": 1,
-                                                    "operators": ["INOUT_FUNCTION", "COPY_TO_FILE"],
+                                                    "operators": ["STREAMING_UDF", "COPY_TO_FILE"],
                                                     "operator_details": [
                                                         {"pipeline_role": "source", "udf_name": "udf"},
                                                         {},
@@ -1371,7 +1371,7 @@ def test_progress_consumes_structured_native_repartition_pipelines():
                             ),
                             (
                                 2,
-                                ["REPARTITION", "INOUT_FUNCTION"],
+                                ["REPARTITION", "STREAMING_UDF"],
                                 [
                                     {"pipeline_role": "source"},
                                     {
@@ -1382,7 +1382,7 @@ def test_progress_consumes_structured_native_repartition_pipelines():
                             ),
                             (
                                 1,
-                                ["INOUT_FUNCTION", "COPY_TO_FILE"],
+                                ["STREAMING_UDF", "COPY_TO_FILE"],
                                 [
                                     {
                                         "udf_name": "_decode_and_transform",
@@ -1418,7 +1418,7 @@ def test_progress_consumes_structured_native_repartition_pipelines():
                                         },
                                         {
                                             "pipeline_id": 2,
-                                            "operators": ["REPARTITION", "INOUT_FUNCTION"],
+                                            "operators": ["REPARTITION", "STREAMING_UDF"],
                                             "operator_details": [
                                                 {"pipeline_role": "source"},
                                                 {
@@ -1433,7 +1433,7 @@ def test_progress_consumes_structured_native_repartition_pipelines():
                                         },
                                         {
                                             "pipeline_id": 1,
-                                            "operators": ["INOUT_FUNCTION", "COPY_TO_FILE"],
+                                            "operators": ["STREAMING_UDF", "COPY_TO_FILE"],
                                             "operator_details": [
                                                 {
                                                     "udf_name": "_decode_and_transform",

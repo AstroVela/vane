@@ -72,7 +72,6 @@ class BenchResult:
     rows: int
     batch_size: int
     batches: int
-    streaming_breaker: bool
     repeat: int
     wall_s_mean: float
     wall_s_min: float
@@ -174,8 +173,6 @@ def _run_once(
         }
         if _backend_supports_actor_number(backend) and actor_number is not None:
             kwargs["actor_number"] = int(actor_number)
-        if args.streaming_breaker:
-            kwargs["streaming_breaker"] = True
         if backend.startswith("ray_") and args.ray_cpus is not None:
             kwargs["cpus"] = float(args.ray_cpus)
         start = time.perf_counter()
@@ -206,7 +203,6 @@ def _run_case(
             rows=args.rows,
             batch_size=args.batch_size,
             batches=batches,
-            streaming_breaker=bool(args.streaming_breaker),
             repeat=args.repeat,
             wall_s_mean=mean_s,
             wall_s_min=min(timings),
@@ -222,7 +218,6 @@ def _run_case(
             rows=args.rows,
             batch_size=args.batch_size,
             batches=batches,
-            streaming_breaker=bool(args.streaming_breaker),
             repeat=args.repeat,
             wall_s_mean=0.0,
             wall_s_min=0.0,
@@ -300,7 +295,6 @@ def main() -> None:
     parser.add_argument("--sleep-ms", type=float, default=50.0)
     parser.add_argument("--cpu-iterations", type=int, default=20000)
     parser.add_argument("--payload-bytes", type=int, default=4096)
-    parser.add_argument("--streaming-breaker", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ray-address", default="")
     parser.add_argument("--ray-num-cpus", type=int, default=8)
     parser.add_argument("--ray-cpus", type=float, default=0.0)

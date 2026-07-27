@@ -97,4 +97,32 @@ class TestMap:
         )
         result = duckdb_cursor.sql("select * from map_batches_test((select i from range(3) tbl(i)))")
 
+        plan = result.explain()
+        assert "STREAMING_UDF" in plan
+        assert "INOUT_FUNCTION" not in plan
+        assert result.fetchall() == [(0,), (3,), (6,)]
+
+    def test_create_table_function_map_batches_projects_output(self, duckdb_cursor):
+        def calculate_values(table):
+            import pyarrow as pa
+
+            values = table.column(0).to_pylist()
+            return pa.table(
+                {
+                    "doubled": [value * 2 for value in values],
+                    "tripled": [value * 3 for value in values],
+                }
+            )
+
+        duckdb_cursor.create_table_function(
+            "map_batches_projection_test",
+            calculate_values,
+            schema={
+                "doubled": duckdb.sqltypes.INTEGER,
+                "tripled": duckdb.sqltypes.INTEGER,
+            },
+        )
+        result = duckdb_cursor.sql("select tripled from map_batches_projection_test((select i from range(3) tbl(i)))")
+
+        assert "STREAMING_UDF" in result.explain()
         assert result.fetchall() == [(0,), (3,), (6,)]

@@ -19,13 +19,11 @@
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/execution/udf_executor.hpp"
-#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/external_block.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/function/function_serialization.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
-#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 
@@ -44,42 +42,6 @@
 #include <unistd.h>
 
 namespace duckdb {
-
-struct UDFPendingOutput {
-	ExecutionBatch batch;
-	unique_ptr<DataChunk> rows;
-	bool raw_udf_output = false;
-	std::function<void()> release_output_lease;
-};
-
-struct UDFOutputLeaseOwnership {
-	explicit UDFOutputLeaseOwnership(std::function<void()> release_output_lease_p)
-	    : release_output_lease(std::move(release_output_lease_p)) {
-	}
-
-	~UDFOutputLeaseOwnership() {
-		if (!release_output_lease) {
-			return;
-		}
-		try {
-			auto release = std::move(release_output_lease);
-			release();
-		} catch (...) {
-		}
-	}
-
-	std::function<void()> release_output_lease;
-};
-
-struct LazyInputReplayToken {
-	bool valid = false;
-	const LazyRefDataChunk *ptr = nullptr;
-	idx_t cardinality = 0;
-	idx_t block_count = 0;
-	vector<const void *> object_ref_ptrs;
-	vector<idx_t> start_offsets;
-	vector<idx_t> end_offsets;
-};
 
 namespace {
 
@@ -139,29 +101,6 @@ static void UDFWorkerSlotDebugLog(const string &message) {
 }
 
 static atomic<uint64_t> g_streaming_udf_debug_tick {0};
-
-static LazyInputReplayToken MakeLazyInputReplayToken(const LazyRefDataChunk &bundle) {
-	LazyInputReplayToken token;
-	token.valid = true;
-	token.ptr = &bundle;
-	token.cardinality = bundle.cardinality;
-	token.block_count = bundle.blocks.size();
-	token.object_ref_ptrs.reserve(bundle.blocks.size());
-	token.start_offsets.reserve(bundle.blocks.size());
-	token.end_offsets.reserve(bundle.blocks.size());
-	for (auto &block : bundle.blocks) {
-		token.object_ref_ptrs.push_back(block.object_ref.get());
-		token.start_offsets.push_back(block.StartOffset());
-		token.end_offsets.push_back(block.EndOffset());
-	}
-	return token;
-}
-
-static bool LazyInputReplayTokenMatches(const LazyInputReplayToken &left, const LazyInputReplayToken &right) {
-	return left.valid && right.valid && left.ptr == right.ptr && left.cardinality == right.cardinality &&
-	       left.block_count == right.block_count && left.object_ref_ptrs == right.object_ref_ptrs &&
-	       left.start_offsets == right.start_offsets && left.end_offsets == right.end_offsets;
-}
 
 const Value *GetStructChild(const Value &payload, const string &name) {
 	if (payload.IsNull() || payload.type().id() != LogicalTypeId::STRUCT) {
@@ -433,16 +372,8 @@ static bool IsRowPreservingPythonUDFLayoutPayload(const Value &payload);
 } // namespace
 
 struct UDFOperatorState : public OperatorState {
-	UDFOperatorState(ClientContext &context, const vector<unique_ptr<Expression>> &arg_exprs_p, Value payload_p,
-	                 shared_ptr<void> actor_handles_p = nullptr)
-	    : arg_executor(context), payload(std::move(payload_p)), actor_handles(std::move(actor_handles_p)) {
-		for (auto &expr : arg_exprs_p) {
-			arg_executor.AddExpression(*expr);
-		}
-		arg_types.reserve(arg_exprs_p.size());
-		for (auto &expr : arg_exprs_p) {
-			arg_types.push_back(expr->return_type);
-		}
+	UDFOperatorState(Value payload_p, shared_ptr<void> actor_handles_p = nullptr)
+	    : payload(std::move(payload_p)), actor_handles(std::move(actor_handles_p)) {
 		// is_flat_map = "result-only table UDF mode": no passthrough rows, output = UDF result only.
 		// row-preserving batch UDFs also carry output_schema, so classify by call_mode instead.
 		is_flat_map = ClassifyUDFMode(payload) == UDFMode::RESULT_ONLY_BATCH;
@@ -466,27 +397,13 @@ struct UDFOperatorState : public OperatorState {
 		}
 	}
 
-	ExpressionExecutor arg_executor;
-	vector<LogicalType> arg_types;
 	UDFConfig config;
 	Value payload;
 	shared_ptr<void> actor_handles;
 	unique_ptr<UDFExecutor> executor;
 	bool finished_submitting = false;
-	std::deque<unique_ptr<DataChunk>> pending_inputs;
-	std::deque<UDFPendingOutput> pending_outputs;
 	idx_t submitted_batches = 0;
 	idx_t completed_batches = 0;
-	bool logged_execute_enter = false;
-	idx_t execute_calls = 0;
-	idx_t final_calls = 0;
-	idx_t blocked_returns = 0;
-	idx_t soft_yield_returns = 0;
-	idx_t need_more_returns = 0;
-	idx_t have_more_returns = 0;
-	idx_t total_output_rows = 0;
-	bool input_consumed = false;
-	LazyInputReplayToken consumed_lazy_input;
 	bool is_flat_map = false;
 	vector<string> output_names;
 	vector<LogicalType> output_types_declared;
@@ -519,19 +436,11 @@ static void ReleaseUDFOutputLease(std::function<void()> &callback) {
 }
 
 static void EnsureExecutor(ExecutionContext &context, UDFOperatorState &state);
-static bool TakeReadyResultOnce(ExecutionContext &context, UDFOperatorState &state);
-static unique_ptr<DataChunk> BuildOutputChunk(DataChunk &rows, DataChunk &outputs, bool is_flat_map,
-                                              const vector<string> &output_names = {},
-                                              const vector<LogicalType> &output_types_declared = {});
 static void PreserveFlatMapLazyOutputShape(UDFOperatorState &state, LazyRefDataChunk &bundle);
 static void PreserveScalarMapLazyOutputShape(UDFOperatorState &state, LazyRefDataChunk &bundle);
-static bool PopPendingOutputBatch(ExecutionContext &context, UDFOperatorState &state, ExecutionBatch &output);
-static UDFWakeupRegistrationResult RegisterAsyncWakeup(ExecutionContext &context, UDFOperatorState &state);
 
 struct UDFGlobalState;
 
-static void PushMaterializedOutputBatchPieces(std::deque<UDFPendingOutput> &queue, unique_ptr<DataChunk> output_chunk,
-                                              std::function<void()> release_output_lease = nullptr);
 static idx_t EstimateStreamingVarlenBytes(const Vector &vec, const idx_t count) {
 	if (count == 0) {
 		return 0;
@@ -573,291 +482,6 @@ static OperatorResultType UDFInOutExecuteBatch(ExecutionContext &context, TableF
 static OperatorFinalizeResultType UDFInOutFinalBatch(ExecutionContext &context, TableFunctionInput &data,
                                                      ExecutionBatch &output);
 
-static idx_t LogicalInflightBatches(const UDFOperatorState &state) {
-	if (state.submitted_batches <= state.completed_batches) {
-		return 0;
-	}
-	return state.submitted_batches - state.completed_batches;
-}
-
-static UDFWakeupRegistrationResult RegisterBackpressureWakeup(ExecutionContext &context, UDFOperatorState &state) {
-	if (!state.executor) {
-		return UDFWakeupRegistrationResult::UNSUPPORTED;
-	}
-	return RegisterAsyncWakeup(context, state);
-}
-
-static bool CanUseAsyncWakeup(ExecutionContext &context, UDFOperatorState &state) {
-	if (!context.interrupt_state) {
-		return false;
-	}
-	if (!state.executor || !state.executor->SupportsAsyncWakeup()) {
-		return false;
-	}
-	return true;
-}
-
-[[noreturn]] static void ThrowNonRefAwareUDFBoundary(const UDFOperatorState &state, const char *reason,
-                                                     const char *detail = nullptr) {
-	if (detail) {
-		throw InvalidInputException("udf lazy/ref-bundle execution reached non-ref-aware boundary '%s' (%s). "
-		                            "Implicit materialization inside UDF is disabled; planner must connect this edge "
-		                            "through a ref-aware UDF path or insert an explicit materialize boundary.",
-		                            reason ? reason : "unknown", detail);
-	}
-	throw InvalidInputException("udf lazy/ref-bundle execution reached non-ref-aware boundary '%s'. "
-	                            "Implicit materialization inside UDF is disabled; planner must connect this edge "
-	                            "through a ref-aware UDF path or insert an explicit materialize boundary. "
-	                            "is_flat_map=%s executor_supports_ref_bundle_input=%s",
-	                            reason ? reason : "unknown", state.is_flat_map ? "true" : "false",
-	                            (state.executor && state.executor->SupportsRefBundleInput()) ? "true" : "false");
-}
-
-static UDFPendingOutput MakeMaterializedPendingOutput(unique_ptr<DataChunk> chunk) {
-	UDFPendingOutput pending;
-	pending.batch.kind = ExecutionBatchKind::MATERIALIZED_CHUNK;
-	if (chunk) {
-		pending.batch.rows = chunk->size();
-		pending.batch.estimated_bytes = chunk->GetAllocationSize();
-	}
-	pending.batch.materialized = std::move(chunk);
-	return pending;
-}
-
-static unique_ptr<DataChunk> TakeMaterializedPendingUDFOutput(ExecutionContext &context, UDFOperatorState &state,
-                                                              UDFPendingOutput &pending) {
-	if (pending.batch.kind == ExecutionBatchKind::MATERIALIZED_CHUNK) {
-		if (!pending.batch.materialized) {
-			throw InternalException("udf pending materialized output is null");
-		}
-		return std::move(pending.batch.materialized);
-	}
-	if (pending.batch.kind != ExecutionBatchKind::LAZY_DATA_CHUNK) {
-		throw InternalException("udf pending output has unsupported ExecutionBatch kind");
-	}
-	if (!pending.batch.lazy) {
-		throw InternalException("udf pending lazy output is null");
-	}
-	ThrowNonRefAwareUDFBoundary(state, "non_ref_aware_inout_queue");
-}
-
-static bool PopPendingOutput(ExecutionContext &context, UDFOperatorState &state, DataChunk &output) {
-	while (!state.pending_outputs.empty()) {
-		auto pending = std::move(state.pending_outputs.front());
-		state.pending_outputs.pop_front();
-		auto output_chunk = TakeMaterializedPendingUDFOutput(context, state, pending);
-		if (!output_chunk) {
-			continue;
-		}
-		if (output_chunk->size() > STANDARD_VECTOR_SIZE) {
-			std::deque<UDFPendingOutput> pieces;
-			PushMaterializedOutputBatchPieces(pieces, std::move(output_chunk), std::move(pending.release_output_lease));
-			if (pieces.empty()) {
-				continue;
-			}
-			auto first = std::move(pieces.front());
-			pieces.pop_front();
-			while (!pieces.empty()) {
-				state.pending_outputs.push_front(std::move(pieces.back()));
-				pieces.pop_back();
-			}
-			output_chunk = std::move(first.batch.materialized);
-		}
-		state.total_output_rows += output_chunk->size();
-		output.Move(*output_chunk);
-		ReleaseUDFOutputLease(pending.release_output_lease);
-		return true;
-	}
-	return false;
-}
-
-static void StoreMaterializedExecutionBatchOutput(ExecutionBatch &batch, unique_ptr<DataChunk> chunk) {
-	batch = ExecutionBatch();
-	batch.kind = ExecutionBatchKind::MATERIALIZED_CHUNK;
-	if (chunk) {
-		batch.rows = chunk->size();
-		batch.estimated_bytes = chunk->GetAllocationSize();
-	}
-	batch.materialized = std::move(chunk);
-}
-
-static void StoreLazyExecutionBatchOutput(ExecutionBatch &batch, unique_ptr<LazyRefDataChunk> lazy) {
-	batch = ExecutionBatch();
-	batch.kind = ExecutionBatchKind::LAZY_DATA_CHUNK;
-	if (lazy) {
-		lazy->RecomputeCardinality();
-		batch.rows = lazy->cardinality;
-		batch.estimated_bytes = lazy->EstimatedBytes();
-	}
-	batch.lazy = std::move(lazy);
-}
-
-static bool PopPendingOutputBatch(ExecutionContext &context, UDFOperatorState &state, ExecutionBatch &output) {
-	while (!state.pending_outputs.empty()) {
-		auto pending = std::move(state.pending_outputs.front());
-		state.pending_outputs.pop_front();
-		if (pending.batch.kind == ExecutionBatchKind::MATERIALIZED_CHUNK) {
-			auto output_chunk = TakeMaterializedPendingUDFOutput(context, state, pending);
-			if (!output_chunk) {
-				continue;
-			}
-			if (output_chunk->size() > STANDARD_VECTOR_SIZE) {
-				std::deque<UDFPendingOutput> pieces;
-				PushMaterializedOutputBatchPieces(pieces, std::move(output_chunk),
-				                                  std::move(pending.release_output_lease));
-				if (pieces.empty()) {
-					continue;
-				}
-				auto first = std::move(pieces.front());
-				pieces.pop_front();
-				while (!pieces.empty()) {
-					state.pending_outputs.push_front(std::move(pieces.back()));
-					pieces.pop_back();
-				}
-				output = std::move(first.batch);
-			} else {
-				StoreMaterializedExecutionBatchOutput(output, std::move(output_chunk));
-				ReleaseUDFOutputLease(pending.release_output_lease);
-			}
-			state.total_output_rows += output.rows;
-			return true;
-		}
-		if (pending.batch.kind != ExecutionBatchKind::LAZY_DATA_CHUNK) {
-			throw InternalException("udf pending output has unsupported ExecutionBatch kind");
-		}
-		if (!pending.batch.lazy || pending.batch.lazy->Empty()) {
-			continue;
-		}
-		auto total_rows = pending.batch.lazy->cardinality;
-		if (total_rows > STANDARD_VECTOR_SIZE) {
-			auto first = SliceLazyDataChunk(*pending.batch.lazy, 0, STANDARD_VECTOR_SIZE);
-			auto rest =
-			    SliceLazyDataChunk(*pending.batch.lazy, STANDARD_VECTOR_SIZE, total_rows - STANDARD_VECTOR_SIZE);
-			StoreLazyExecutionBatchOutput(output, std::move(first));
-			StoreLazyExecutionBatchOutput(pending.batch, std::move(rest));
-			state.pending_outputs.push_front(std::move(pending));
-		} else {
-			output = std::move(pending.batch);
-			ReleaseUDFOutputLease(pending.release_output_lease);
-		}
-		state.total_output_rows += output.rows;
-		return true;
-	}
-	return false;
-}
-
-static void BufferPendingInput(UDFOperatorState &state, DataChunk &input) {
-	if (input.size() == 0) {
-		return;
-	}
-	auto buffered = make_uniq<DataChunk>();
-	buffered->Initialize(Allocator::DefaultAllocator(), input.GetTypes(), input.size());
-	input.Copy(*buffered, 0);
-	state.pending_inputs.push_back(std::move(buffered));
-}
-
-static void BufferDeferredPipelineInput(UDFOperatorState &state, DataChunk &input, bool using_buffered_input) {
-	if (!using_buffered_input || input.size() == 0) {
-		return;
-	}
-	BufferPendingInput(state, input);
-}
-
-static OperatorResultType ReturnExecuteOutputForCurrentInput(UDFOperatorState &state) {
-	if (state.input_consumed && state.pending_outputs.empty() && LogicalInflightBatches(state) == 0) {
-		state.input_consumed = false;
-		state.need_more_returns++;
-		return OperatorResultType::NEED_MORE_INPUT;
-	}
-	state.have_more_returns++;
-	return OperatorResultType::HAVE_MORE_OUTPUT;
-}
-
-static bool BufferExecuteInputBeforeOutput(UDFOperatorState &state, DataChunk &input) {
-	if (!state.input_consumed && input.size() > 0) {
-		BufferPendingInput(state, input);
-		state.need_more_returns++;
-		return true;
-	}
-	return false;
-}
-
-static bool BufferExecuteBatchInputBeforeOutput(UDFOperatorState &state, ExecutionBatch &input) {
-	if (!state.input_consumed && input.kind == ExecutionBatchKind::MATERIALIZED_CHUNK && input.materialized &&
-	    input.materialized->size() > 0) {
-		BufferPendingInput(state, *input.materialized);
-		state.need_more_returns++;
-		return true;
-	}
-	return false;
-}
-
-static UDFWakeupRegistrationResult RegisterAsyncWakeup(ExecutionContext &context, UDFOperatorState &state) {
-	if (!CanUseAsyncWakeup(context, state)) {
-		return UDFWakeupRegistrationResult::UNSUPPORTED;
-	}
-	return state.executor->RegisterWakeup(*context.interrupt_state);
-}
-
-static unique_ptr<DataChunk> BuildOutputChunk(DataChunk &rows, DataChunk &outputs, bool is_flat_map,
-                                              const vector<string> &output_names,
-                                              const vector<LogicalType> &output_types_declared) {
-	if (is_flat_map) {
-		// flat_map/map_batches mode: output is UDF result only, no passthrough rows.
-		if (outputs.ColumnCount() <= 1) {
-			// Single column — pass through as-is
-			auto output_ptr = make_uniq<DataChunk>();
-			output_ptr->Move(outputs);
-			return output_ptr;
-		}
-		// Multi-column: wrap into a single STRUCT column to match the plan's
-		// expected output type (STRUCT(col1 T1, col2 T2, ...)).
-		// Use declared output types when available to avoid type mismatches
-		// (e.g., pyarrow returns int64 but schema declares int32).
-		auto row_count = outputs.size();
-		child_list_t<LogicalType> struct_children;
-		for (idx_t i = 0; i < outputs.ColumnCount(); i++) {
-			auto name = i < output_names.size() ? output_names[i] : StringUtil::Format("c%d", i);
-			auto type = i < output_types_declared.size() ? output_types_declared[i] : outputs.data[i].GetType();
-			struct_children.push_back(make_pair(name, type));
-		}
-		auto struct_type = LogicalType::STRUCT(std::move(struct_children));
-
-		auto output_ptr = make_uniq<DataChunk>();
-		vector<LogicalType> output_types;
-		output_types.push_back(struct_type);
-		output_ptr->Initialize(Allocator::DefaultAllocator(), output_types, row_count);
-
-		// Set up STRUCT vector: cast children to declared types if needed
-		auto &struct_vector = output_ptr->data[0];
-		auto &struct_entries = StructVector::GetEntries(struct_vector);
-		for (idx_t i = 0; i < outputs.ColumnCount(); i++) {
-			auto declared_type =
-			    i < output_types_declared.size() ? output_types_declared[i] : outputs.data[i].GetType();
-			if (outputs.data[i].GetType() == declared_type) {
-				struct_entries[i]->Reference(outputs.data[i]);
-			} else {
-				// Cast to declared type (e.g., BIGINT -> INTEGER)
-				VectorOperations::DefaultCast(outputs.data[i], *struct_entries[i], row_count);
-			}
-		}
-		output_ptr->SetCardinality(row_count);
-		return output_ptr;
-	}
-	if (rows.size() != outputs.size()) {
-		throw InvalidInputException("udf output count (%d) does not match input rows (%d)", outputs.size(),
-		                            rows.size());
-	}
-
-	DataChunk output;
-	output.Move(rows);
-	output.Fuse(outputs);
-
-	auto output_ptr = make_uniq<DataChunk>();
-	output_ptr->Move(output);
-	return output_ptr;
-}
-
 static LogicalType BuildFlatMapStructOutputType(const vector<string> &output_names,
                                                 const vector<LogicalType> &output_types) {
 	child_list_t<LogicalType> struct_children;
@@ -868,39 +492,6 @@ static LogicalType BuildFlatMapStructOutputType(const vector<string> &output_nam
 	return LogicalType::STRUCT(std::move(struct_children));
 }
 
-static vector<LogicalType> GetUDFBatchOutputTypes(const UDFOperatorState &state,
-                                                  optional_ptr<const FunctionData> bind_data) {
-	vector<LogicalType> output_types;
-	if (bind_data) {
-		if (IsRowPreservingPythonUDFLayoutPayload(state.payload) && !state.output_types_declared.empty()) {
-			return state.output_types_declared;
-		}
-		output_types.push_back(bind_data->Cast<UDFFunctionData>().return_type);
-		return output_types;
-	}
-	if (!state.is_flat_map) {
-		return output_types;
-	}
-	if (state.output_types_declared.size() <= 1) {
-		output_types = state.output_types_declared;
-		return output_types;
-	}
-	output_types.push_back(BuildFlatMapStructOutputType(state.output_names, state.output_types_declared));
-	return output_types;
-}
-
-static unique_ptr<DataChunk> MakeEmptyUDFBatchOutput(ClientContext &context, const UDFOperatorState &state,
-                                                     optional_ptr<const FunctionData> bind_data = nullptr) {
-	auto chunk = make_uniq<DataChunk>();
-	auto output_types = GetUDFBatchOutputTypes(state, bind_data);
-	// Empty batches can still flow through downstream expressions such as
-	// struct_extract. Initialize the vectors so nested types have auxiliary
-	// child storage even when cardinality is zero.
-	chunk->Initialize(context, output_types, 0);
-	chunk->SetCardinality(0);
-	return chunk;
-}
-
 static idx_t UDFExecutionBatchSize(const ExecutionBatch &batch) {
 	if (batch.kind == ExecutionBatchKind::MATERIALIZED_CHUNK) {
 		return batch.materialized ? batch.materialized->size() : batch.rows;
@@ -909,38 +500,6 @@ static idx_t UDFExecutionBatchSize(const ExecutionBatch &batch) {
 		return batch.lazy ? batch.lazy->cardinality : batch.rows;
 	}
 	return batch.rows;
-}
-
-static unique_ptr<DataChunk> MakeEmptyUDFInputChunk(ClientContext &context, const vector<LogicalType> &types) {
-	auto chunk = make_uniq<DataChunk>();
-	chunk->InitializeEmpty(types);
-	chunk->SetCardinality(0);
-	return chunk;
-}
-
-static unique_ptr<DataChunk> ReferenceMaterializedUDFInputBatch(ExecutionContext &context, UDFOperatorState &state,
-                                                                ExecutionBatch &input, const char *reason) {
-	if (input.kind == ExecutionBatchKind::MATERIALIZED_CHUNK) {
-		if (!input.materialized) {
-			return MakeEmptyUDFInputChunk(context.client, state.arg_types);
-		}
-		auto chunk = make_uniq<DataChunk>();
-		chunk->InitializeEmpty(input.materialized->GetTypes());
-		chunk->Reference(*input.materialized);
-		return chunk;
-	}
-	if (input.kind == ExecutionBatchKind::LAZY_DATA_CHUNK) {
-		if (!input.lazy) {
-			return MakeEmptyUDFInputChunk(context.client, state.arg_types);
-		}
-		ThrowNonRefAwareUDFBoundary(state, reason ? reason : "udf_lazy_input_boundary");
-	}
-	throw InternalException("udf input has unsupported ExecutionBatch kind");
-}
-
-static void StoreEmptyUDFBatchOutput(ExecutionContext &context, UDFOperatorState &state,
-                                     optional_ptr<const FunctionData> bind_data, ExecutionBatch &output) {
-	StoreMaterializedExecutionBatchOutput(output, MakeEmptyUDFBatchOutput(context.client, state, bind_data));
 }
 
 static void PreserveFlatMapLazyOutputShape(UDFOperatorState &state, LazyRefDataChunk &bundle) {
@@ -1040,14 +599,6 @@ static bool UsesCompleteRowPreservingBlockLayout(const Value &payload) {
 	return (ray_block_stream.first && ray_block_stream.second) || (local_ref_bundle.first && local_ref_bundle.second);
 }
 
-static idx_t GetRowPreservingUDFArgCount(const Value &payload) {
-	auto arg_count = GetStructIntField(payload, "scalar_arg_count");
-	if (!arg_count.first) {
-		throw InvalidInputException("row-preserving udf payload is missing scalar_arg_count");
-	}
-	return arg_count.second;
-}
-
 static void EnsureExecutor(ExecutionContext &context, UDFOperatorState &state) {
 	if (state.executor) {
 		return;
@@ -1061,147 +612,6 @@ static void EnsureExecutor(ExecutionContext &context, UDFOperatorState &state) {
 	if (!state.executor) {
 		throw InternalException("UDF executor factory returned NULL");
 	}
-}
-
-static void CompleteMaterializedSubmitResult(UDFOperatorState &state, const UDFResult &result) {
-	if (!result.submit_complete) {
-		return;
-	}
-	state.completed_batches++;
-}
-
-static bool TakeReadyResultOnce(ExecutionContext &context, UDFOperatorState &state) {
-	if (!state.executor) {
-		return false;
-	}
-	auto result = state.executor->TakeReadyResult(context.client);
-	if (!result.first) {
-		return false;
-	}
-	CompleteMaterializedSubmitResult(state, result.second);
-	if (result.second.ref_outputs) {
-		if (state.is_flat_map) {
-			PreserveFlatMapLazyOutputShape(state, *result.second.ref_outputs);
-		} else {
-			PreserveScalarMapLazyOutputShape(state, *result.second.ref_outputs);
-		}
-		result.second.ref_outputs->RecomputeCardinality();
-		if (result.second.handoff_output_lease) {
-			auto handoff = std::move(result.second.handoff_output_lease);
-			try {
-				handoff();
-			} catch (...) {
-				ReleaseUDFOutputLease(result.second.release_output_lease);
-				throw;
-			}
-		}
-		if (result.second.release_output_lease) {
-			auto token = make_shared_ptr<UDFOutputLeaseOwnership>(std::move(result.second.release_output_lease));
-			for (auto &block : result.second.ref_outputs->blocks) {
-				block.ownership_tokens.push_back(token);
-			}
-		}
-		UDFPendingOutput pending;
-		StoreLazyExecutionBatchOutput(pending.batch, std::move(result.second.ref_outputs));
-		state.pending_outputs.push_back(std::move(pending));
-		return true;
-	}
-	if (!result.second.rows || !result.second.outputs) {
-		throw InvalidInputException("UDF executor returned a malformed result without rows or output payload");
-	}
-	auto output_chunk = BuildOutputChunk(*result.second.rows, *result.second.outputs, state.is_flat_map,
-	                                     state.output_names, state.output_types_declared);
-	PushMaterializedOutputBatchPieces(state.pending_outputs, std::move(output_chunk),
-	                                  std::move(result.second.release_output_lease));
-	return true;
-}
-
-// Drain one ready result from the executor without waiting.
-static bool DrainReadyResult(ExecutionContext &context, UDFOperatorState &state) {
-	if (!state.executor) {
-		return false;
-	}
-	return TakeReadyResultOnce(context, state);
-}
-
-template <class OUTPUT, class POP_OUTPUT>
-static bool DrainReadyResultsUntilLogicalDone(ExecutionContext &context, UDFOperatorState &state, POP_OUTPUT pop_output,
-                                              OUTPUT &output) {
-	while (state.submitted_batches != state.completed_batches || LogicalInflightBatches(state) != 0) {
-		if (!DrainReadyResult(context, state)) {
-			return false;
-		}
-		if (pop_output(context, state, output)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static void ReferenceColumnRange(ClientContext &context, DataChunk &input, idx_t column_offset, idx_t column_count,
-                                 DataChunk &output) {
-	if (column_offset + column_count > input.ColumnCount()) {
-		throw InternalException("udf column range exceeds input column count");
-	}
-	vector<LogicalType> types;
-	types.reserve(column_count);
-	for (idx_t i = 0; i < column_count; i++) {
-		types.push_back(input.data[column_offset + i].GetType());
-	}
-	output.InitializeEmpty(types);
-	output.SetCardinality(input.size());
-	for (idx_t i = 0; i < column_count; i++) {
-		output.data[i].Reference(input.data[column_offset + i]);
-	}
-}
-
-static bool TrySubmitArgsRaw(ExecutionContext &context, UDFOperatorState &state, DataChunk &input, idx_t &submit_id) {
-	if (!state.executor) {
-		throw InternalException("UDF executor is not initialized");
-	}
-	input.Flatten();
-	bool submitted = false;
-	if (state.is_flat_map) {
-		DataChunk empty_rows;
-		empty_rows.SetCardinality(0);
-		submitted = state.executor->TrySubmitWithRetainedBytes(input, empty_rows, context.client,
-		                                                       EstimateStreamingChunkBytes(input), submit_id);
-	} else if (IsRowPreservingPythonUDFLayoutPayload(state.payload)) {
-		auto arg_count = GetRowPreservingUDFArgCount(state.payload);
-		if (arg_count > input.ColumnCount()) {
-			throw InvalidInputException("scalar_arg_count %llu exceeds input column count %llu",
-			                            static_cast<unsigned long long>(arg_count),
-			                            static_cast<unsigned long long>(input.ColumnCount()));
-		}
-		if (UsesCompleteRowPreservingBlockLayout(state.payload)) {
-			// A streamed block is the complete downstream batch. Send the scalar
-			// argument prefix and passthrough suffix together so materialized
-			// and lazy-ref inputs produce the same immutable output schema.
-			DataChunk empty_rows;
-			empty_rows.SetCardinality(0);
-			submitted = state.executor->TrySubmitWithRetainedBytes(input, empty_rows, context.client,
-			                                                       EstimateStreamingChunkBytes(input), submit_id);
-		} else {
-			DataChunk args;
-			DataChunk rows;
-			ReferenceColumnRange(context.client, input, 0, arg_count, args);
-			ReferenceColumnRange(context.client, input, arg_count, input.ColumnCount() - arg_count, rows);
-			submitted = state.executor->TrySubmitWithRetainedBytes(args, rows, context.client,
-			                                                       EstimateStreamingChunkBytes(args), submit_id);
-		}
-	} else {
-		submitted = state.executor->TrySubmitWithRetainedBytes(input, input, context.client,
-		                                                       EstimateStreamingChunkBytes(input), submit_id);
-	}
-	if (!submitted) {
-		submit_id = 0;
-		return false;
-	}
-	if (submit_id == 0) {
-		throw InternalException("streaming UDF submit returned invalid submit_id 0");
-	}
-	state.submitted_batches++;
-	return true;
 }
 
 static bool TrySubmitMaterializedEnvelopeRaw(ExecutionContext &context, UDFOperatorState &state,
@@ -1260,12 +670,13 @@ static bool TrySubmitRefBundleRaw(ExecutionContext &context, UDFOperatorState &s
 	return true;
 }
 
-// ─── UDFLocalState: wraps UDFOperatorState for INOUT path ─────────
+// TableFunction-local state is retained for descriptor serialization and
+// dynamic diagnostics. Execution itself is owned by PhysicalStreamingUDF.
 struct UDFLocalState : public LocalTableFunctionState {
 	UDFOperatorState inner;
 
-	UDFLocalState(ClientContext &context, Value payload_p, shared_ptr<void> actor_handles_p = nullptr)
-	    : inner(context, {}, std::move(payload_p), std::move(actor_handles_p)) {
+	UDFLocalState(Value payload_p, shared_ptr<void> actor_handles_p = nullptr)
+	    : inner(std::move(payload_p), std::move(actor_handles_p)) {
 	}
 };
 
@@ -1324,330 +735,33 @@ public:
 	mutex resolve_lock;
 };
 
-static void PushMaterializedOutputBatchPieces(std::deque<UDFPendingOutput> &queue, unique_ptr<DataChunk> output_chunk,
-                                              std::function<void()> release_output_lease) {
-	if (!output_chunk || output_chunk->size() == 0) {
-		ReleaseUDFOutputLease(release_output_lease);
-		return;
-	}
-	if (output_chunk->size() <= STANDARD_VECTOR_SIZE) {
-		auto pending = MakeMaterializedPendingOutput(std::move(output_chunk));
-		pending.release_output_lease = std::move(release_output_lease);
-		queue.push_back(std::move(pending));
-		return;
-	}
-	output_chunk->Flatten();
-	auto types = output_chunk->GetTypes();
-	idx_t total = output_chunk->size();
-	idx_t offset = 0;
-	while (offset < total) {
-		idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, total - offset);
-		auto piece = make_uniq<DataChunk>();
-		piece->Initialize(Allocator::DefaultAllocator(), types, count);
-		for (idx_t col = 0; col < output_chunk->ColumnCount(); col++) {
-			VectorOperations::Copy(output_chunk->data[col], piece->data[col], offset + count, offset, 0);
-		}
-		piece->SetCardinality(count);
-		auto pending = MakeMaterializedPendingOutput(std::move(piece));
-		if (offset + count >= total) {
-			pending.release_output_lease = std::move(release_output_lease);
-		}
-		queue.push_back(std::move(pending));
-		offset += count;
-	}
+[[noreturn]] static void ThrowPullBasedUDFPlanRemoved() {
+	throw InvalidInputException("pull-based UDF plans are unsupported; replan the query with the required "
+	                            "PhysicalStreamingUDF output consumer");
 }
 
-// ─── INOUT Execute callback ─────────────────────────────────────────────────
-static OperatorResultType UDFInOutExecute(ExecutionContext &context, TableFunctionInput &data, DataChunk &input,
-                                          DataChunk &output) {
-	auto &local_state = data.local_state->Cast<UDFLocalState>();
-	auto &state = local_state.inner;
-	state.execute_calls++;
-	bool using_buffered_input = false;
-	DataChunk *current_input = &input;
-	if (!state.pending_inputs.empty()) {
-		current_input = state.pending_inputs.front().get();
-		using_buffered_input = true;
-	}
-
-	// 1. Return pending output if available
-	if (!state.pending_outputs.empty() && BufferExecuteInputBeforeOutput(state, input)) {
-		output.SetCardinality(0);
-		return OperatorResultType::NEED_MORE_INPUT;
-	}
-	if (PopPendingOutput(context, state, output)) {
-		return ReturnExecuteOutputForCurrentInput(state);
-	}
-
-	// 2. Drain one ready result, if the executor already has one queued.
-	if (state.executor) {
-		DrainReadyResult(context, state);
-		if (!state.pending_outputs.empty() && BufferExecuteInputBeforeOutput(state, input)) {
-			output.SetCardinality(0);
-			return OperatorResultType::NEED_MORE_INPUT;
-		}
-		if (PopPendingOutput(context, state, output)) {
-			return ReturnExecuteOutputForCurrentInput(state);
-		}
-	}
-
-	// 3. Submit new input. TrySubmit is the task-admission boundary: it returns
-	// false until the executor owns a query task lease for this input.
-	if (current_input->size() > 0 && !state.input_consumed) {
-		EnsureExecutor(context, state);
-		idx_t submit_id = 0;
-		if (!TrySubmitArgsRaw(context, state, *current_input, submit_id)) {
-			output.SetCardinality(0);
-			auto wakeup_result = RegisterBackpressureWakeup(context, state);
-			if (wakeup_result == UDFWakeupRegistrationResult::ARMED) {
-				return OperatorResultType::BLOCKED;
-			}
-			return OperatorResultType::HAVE_MORE_OUTPUT;
-		}
-		BufferDeferredPipelineInput(state, input, using_buffered_input);
-		if (using_buffered_input) {
-			state.pending_inputs.pop_front();
-		}
-		state.input_consumed = true;
-	}
-
-	// 4. Always request more input and let the downstream ready-result/finalize path
-	// drain async results. Avoid returning BLOCKED here; the in/out pipeline
-	// resume path is not preserving the consumed-input state correctly.
-	if (state.input_consumed) {
-		output.SetCardinality(0);
-		state.input_consumed = false;
-		state.need_more_returns++;
-		return OperatorResultType::NEED_MORE_INPUT;
-	}
-
-	output.SetCardinality(0);
-	state.need_more_returns++;
-	return OperatorResultType::NEED_MORE_INPUT;
+// These callbacks remain attached to the serializable UDF TableFunction
+// descriptor, but a valid physical plan always executes PhysicalStreamingUDF.
+// Calling one means an unsupported pull-based plan reached execution.
+static OperatorResultType UDFInOutExecute(ExecutionContext &, TableFunctionInput &, DataChunk &, DataChunk &) {
+	ThrowPullBasedUDFPlanRemoved();
 }
 
-static OperatorResultType UDFInOutExecuteBatch(ExecutionContext &context, TableFunctionInput &data,
-                                               ExecutionBatch &input, ExecutionBatch &output) {
-	auto &local_state = data.local_state->Cast<UDFLocalState>();
-	auto &state = local_state.inner;
-
-	state.execute_calls++;
-	bool using_buffered_input = false;
-	unique_ptr<DataChunk> materialized_input;
-	DataChunk *current_input = nullptr;
-	LazyRefDataChunk *current_lazy_input = nullptr;
-	if (!state.pending_inputs.empty()) {
-		current_input = state.pending_inputs.front().get();
-		using_buffered_input = true;
-	} else if (input.kind == ExecutionBatchKind::LAZY_DATA_CHUNK && input.lazy && UDFExecutionBatchSize(input) > 0) {
-		current_lazy_input = input.lazy.get();
-		current_lazy_input->RecomputeCardinality();
-	} else {
-		materialized_input = ReferenceMaterializedUDFInputBatch(context, state, input, "udf_batch_input_barrier");
-		current_input = materialized_input.get();
-	}
-	const auto current_rows =
-	    current_lazy_input ? current_lazy_input->cardinality : (current_input ? current_input->size() : idx_t(0));
-	LazyInputReplayToken current_lazy_token;
-	bool current_lazy_already_consumed = false;
-	if (current_lazy_input) {
-		current_lazy_token = MakeLazyInputReplayToken(*current_lazy_input);
-		current_lazy_already_consumed = LazyInputReplayTokenMatches(state.consumed_lazy_input, current_lazy_token);
-	}
-	const auto submit_rows = current_lazy_already_consumed ? idx_t(0) : current_rows;
-
-	if (!state.pending_outputs.empty() && BufferExecuteBatchInputBeforeOutput(state, input)) {
-		StoreEmptyUDFBatchOutput(context, state, data.bind_data, output);
-		return OperatorResultType::NEED_MORE_INPUT;
-	}
-	if (PopPendingOutputBatch(context, state, output)) {
-		return ReturnExecuteOutputForCurrentInput(state);
-	}
-
-	if (state.executor) {
-		DrainReadyResult(context, state);
-		if (!state.pending_outputs.empty() && BufferExecuteBatchInputBeforeOutput(state, input)) {
-			StoreEmptyUDFBatchOutput(context, state, data.bind_data, output);
-			return OperatorResultType::NEED_MORE_INPUT;
-		}
-		if (PopPendingOutputBatch(context, state, output)) {
-			return ReturnExecuteOutputForCurrentInput(state);
-		}
-	}
-
-	if (submit_rows > 0 && !state.input_consumed) {
-		EnsureExecutor(context, state);
-		auto can_submit_ref_bundle = current_lazy_input && state.executor->SupportsRefBundleInput() &&
-		                             (state.is_flat_map || IsRowPreservingPythonUDFLayoutPayload(state.payload));
-		bool submitted = false;
-		idx_t submit_id = 0;
-		if (can_submit_ref_bundle) {
-			submitted = TrySubmitRefBundleRaw(context, state, *current_lazy_input, submit_id);
-			if (submitted) {
-				state.consumed_lazy_input = std::move(current_lazy_token);
-			}
-		} else {
-			if (!current_input) {
-				materialized_input =
-				    ReferenceMaterializedUDFInputBatch(context, state, input, "udf_lazy_input_barrier");
-				current_input = materialized_input.get();
-			}
-			submitted = TrySubmitArgsRaw(context, state, *current_input, submit_id);
-		}
-		if (!submitted) {
-			StoreEmptyUDFBatchOutput(context, state, data.bind_data, output);
-			auto wakeup_result = RegisterBackpressureWakeup(context, state);
-			if (wakeup_result == UDFWakeupRegistrationResult::ARMED) {
-				return OperatorResultType::BLOCKED;
-			}
-			return OperatorResultType::HAVE_MORE_OUTPUT;
-		}
-
-		if (using_buffered_input) {
-			auto deferred_input =
-			    ReferenceMaterializedUDFInputBatch(context, state, input, "udf_deferred_lazy_input_barrier");
-			BufferPendingInput(state, *deferred_input);
-			state.pending_inputs.pop_front();
-		}
-		state.input_consumed = true;
-	}
-
-	if (state.input_consumed) {
-		StoreEmptyUDFBatchOutput(context, state, data.bind_data, output);
-		state.input_consumed = false;
-		state.need_more_returns++;
-		return OperatorResultType::NEED_MORE_INPUT;
-	}
-
-	StoreEmptyUDFBatchOutput(context, state, data.bind_data, output);
-	state.need_more_returns++;
-	return OperatorResultType::NEED_MORE_INPUT;
+static OperatorResultType UDFInOutExecuteBatch(ExecutionContext &, TableFunctionInput &, ExecutionBatch &,
+                                               ExecutionBatch &) {
+	ThrowPullBasedUDFPlanRemoved();
 }
 
-// ─── INOUT FinalExecute callback ────────────────────────────────────────────
-template <class OUTPUT, class POP_OUTPUT, class STORE_EMPTY_OUTPUT>
-static OperatorFinalizeResultType UDFInOutFinalCommon(ExecutionContext &context, TableFunctionInput &data,
-                                                      OUTPUT &output, POP_OUTPUT pop_output,
-                                                      STORE_EMPTY_OUTPUT store_empty_output) {
-	auto &local_state = data.local_state->Cast<UDFLocalState>();
-	auto &state = local_state.inner;
-	state.final_calls++;
-
-	if (pop_output(context, state, output)) {
-		return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
-	}
-
-	if (!state.pending_inputs.empty()) {
-		EnsureExecutor(context, state);
-		while (!state.pending_inputs.empty()) {
-			DrainReadyResult(context, state);
-			if (pop_output(context, state, output)) {
-				return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
-			}
-			auto pending_input = std::move(state.pending_inputs.front());
-			state.pending_inputs.pop_front();
-			idx_t submit_id = 0;
-			if (!TrySubmitArgsRaw(context, state, *pending_input, submit_id)) {
-				state.pending_inputs.push_front(std::move(pending_input));
-				auto wakeup_result = RegisterBackpressureWakeup(context, state);
-				if (wakeup_result == UDFWakeupRegistrationResult::READY) {
-					continue;
-				}
-				store_empty_output(context, state, data.bind_data, output);
-				if (wakeup_result == UDFWakeupRegistrationResult::ARMED) {
-					return OperatorFinalizeResultType::BLOCKED;
-				}
-				return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
-			}
-		}
-	}
-
-	if (!state.executor) {
-		store_empty_output(context, state, data.bind_data, output);
-		return OperatorFinalizeResultType::FINISHED;
-	}
-
-	if (!state.finished_submitting) {
-		state.finished_submitting = true;
-		state.executor->FinishedSubmitting(context.client);
-	}
-
-	DrainReadyResult(context, state);
-	if (pop_output(context, state, output)) {
-		return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
-	}
-
-	bool all_done = state.executor->AllTasksFinished(context.client);
-	const auto logical_done = state.submitted_batches == state.completed_batches && LogicalInflightBatches(state) == 0;
-	if (all_done && !logical_done) {
-		if (DrainReadyResultsUntilLogicalDone(context, state, pop_output, output)) {
-			return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
-		}
-	}
-	const auto logical_done_after_drain =
-	    state.submitted_batches == state.completed_batches && LogicalInflightBatches(state) == 0;
-	if (all_done && logical_done_after_drain) {
-		DrainReadyResult(context, state);
-		if (pop_output(context, state, output)) {
-			return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
-		}
-		store_empty_output(context, state, data.bind_data, output);
-		return OperatorFinalizeResultType::FINISHED;
-	}
-	if (all_done && !logical_done_after_drain) {
-		throw InvalidInputException("UDF executor finished before completing all submitted batches");
-	}
-
-	auto wakeup_result = RegisterAsyncWakeup(context, state);
-	if (wakeup_result == UDFWakeupRegistrationResult::ARMED) {
-		store_empty_output(context, state, data.bind_data, output);
-		return OperatorFinalizeResultType::BLOCKED;
-	}
-	if (wakeup_result == UDFWakeupRegistrationResult::UNSUPPORTED) {
-		store_empty_output(context, state, data.bind_data, output);
-		return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
-	}
-	DrainReadyResult(context, state);
-	if (pop_output(context, state, output)) {
-		return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
-	}
-	store_empty_output(context, state, data.bind_data, output);
-	all_done = state.executor->AllTasksFinished(context.client);
-	if (all_done && state.submitted_batches == state.completed_batches && LogicalInflightBatches(state) == 0) {
-		return OperatorFinalizeResultType::FINISHED;
-	}
-	if (all_done) {
-		throw InvalidInputException("UDF executor finished before completing all submitted batches");
-	}
-	return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
+static OperatorFinalizeResultType UDFInOutFinal(ExecutionContext &, TableFunctionInput &, DataChunk &) {
+	ThrowPullBasedUDFPlanRemoved();
 }
 
-static OperatorFinalizeResultType UDFInOutFinal(ExecutionContext &context, TableFunctionInput &data,
-                                                DataChunk &output) {
-	auto pop_output = [](ExecutionContext &context, UDFOperatorState &state, DataChunk &output) {
-		return PopPendingOutput(context, state, output);
-	};
-	auto store_empty_output = [](ExecutionContext &, UDFOperatorState &, optional_ptr<const FunctionData>,
-	                             DataChunk &output) {
-		output.SetCardinality(0);
-	};
-	return UDFInOutFinalCommon(context, data, output, pop_output, store_empty_output);
+static OperatorFinalizeResultType UDFInOutFinalBatch(ExecutionContext &, TableFunctionInput &, ExecutionBatch &) {
+	ThrowPullBasedUDFPlanRemoved();
 }
 
-static OperatorFinalizeResultType UDFInOutFinalBatch(ExecutionContext &context, TableFunctionInput &data,
-                                                     ExecutionBatch &output) {
-	auto pop_output = [](ExecutionContext &context, UDFOperatorState &state, ExecutionBatch &output) {
-		return PopPendingOutputBatch(context, state, output);
-	};
-	auto store_empty_output = [](ExecutionContext &context, UDFOperatorState &state,
-	                             optional_ptr<const FunctionData> bind_data, ExecutionBatch &output) {
-		StoreEmptyUDFBatchOutput(context, state, bind_data, output);
-	};
-	return UDFInOutFinalCommon(context, data, output, pop_output, store_empty_output);
-}
-
-// ─── INOUT InitLocal callback ───────────────────────────────────────────────
-static unique_ptr<LocalTableFunctionState> UDFInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+// ─── TableFunction descriptor state callbacks ───────────────────────────────
+static unique_ptr<LocalTableFunctionState> UDFInitLocal(ExecutionContext &, TableFunctionInitInput &input,
                                                         GlobalTableFunctionState *global_state) {
 	auto &bind_data = input.bind_data->Cast<UDFFunctionData>();
 	auto payload = bind_data.payload;
@@ -1655,7 +769,7 @@ static unique_ptr<LocalTableFunctionState> UDFInitLocal(ExecutionContext &contex
 		auto &udf_global_state = global_state->Cast<UDFGlobalState>();
 		payload = udf_global_state.ResolvedPayload();
 	}
-	auto local_state = make_uniq<UDFLocalState>(context.client, std::move(payload), bind_data.actor_handles);
+	auto local_state = make_uniq<UDFLocalState>(std::move(payload), bind_data.actor_handles);
 	return std::move(local_state);
 }
 
@@ -1732,6 +846,7 @@ static InsertionOrderPreservingMap<string> UDFTableFunctionToString(TableFunctio
 		return result;
 	}
 	auto &bind_data = input.bind_data->Cast<UDFFunctionData>();
+	result["output_delivery"] = "consumer_required";
 	auto udf_name = GetStructStringField(bind_data.payload, "udf_name");
 	if (udf_name.first && !udf_name.second.empty()) {
 		result["udf_name"] = udf_name.second;
@@ -1762,7 +877,9 @@ static InsertionOrderPreservingMap<string> UDFTableFunctionToString(TableFunctio
 		result["lazy_ref_boundary"] = "strict_ref_aware";
 	}
 	if (produce_ref_bundle.first && produce_ref_bundle.second) {
-		result["ref_bundle_output"] = "invalid_non_streaming";
+		auto output_mode = GetStructStringField(bind_data.payload, "streaming_output_mode");
+		result["ref_bundle_output"] =
+		    output_mode.first && !output_mode.second.empty() ? output_mode.second : "local_shm_ref_bundle";
 	}
 	if (produce_ray_block_stream.first && produce_ray_block_stream.second) {
 		result["ray_block_stream_output"] = "direct_block_metadata_pair";
@@ -2136,13 +1253,9 @@ static idx_t StreamingOutputEventCapacity(const StreamingUDFState &state);
 
 static StreamingUDFConfig ResolveStreamingUDFConfig(const Value &payload, idx_t task_operator_width) {
 	StreamingUDFConfig config;
-	auto streaming_breaker = GetStructBoolField(payload, "streaming_breaker");
-	if (!streaming_breaker.first || !streaming_breaker.second) {
-		throw InvalidInputException("streaming UDF requires payload.streaming_breaker=true");
-	}
 	auto async_mode = GetStructBoolField(payload, "async_mode");
 	if (async_mode.first && async_mode.second) {
-		throw InvalidInputException("streaming_breaker=True does not support async_mode=True");
+		throw InvalidInputException("strict streaming UDF execution does not support async_mode=True");
 	}
 	auto execution_backend = GetStructStringField(payload, "execution_backend");
 	const bool supports_streaming_backend =
@@ -2153,10 +1266,9 @@ static StreamingUDFConfig ResolveStreamingUDFConfig(const Value &payload, idx_t 
 		throw InvalidInputException(
 		    "streaming UDF requires execution_backend=ray_actor, ray_task, subprocess_task or subprocess_actor");
 	}
-	if (!HasStructField(payload, "output_schema")) {
-		throw InvalidInputException("streaming UDF requires map_batches/flat_map output_schema");
+	if (ClassifyUDFMode(payload) != UDFMode::SCALAR_MAP && !HasStructField(payload, "output_schema")) {
+		throw InvalidInputException("non-scalar streaming UDF execution requires payload.output_schema");
 	}
-
 	auto batch_size = GetStructIntField(payload, "batch_size");
 	if (batch_size.first && batch_size.second > 0) {
 		config.compute_batch_rows = batch_size.second;
@@ -2361,8 +1473,7 @@ static void EnsureStreamingExecutor(ExecutionContext &context, StreamingUDFState
 		throw InternalException("streaming UDF executor requested before pipeline max threads were resolved");
 	}
 	if (!state.op) {
-		vector<unique_ptr<Expression>> empty_args;
-		state.op = make_uniq<UDFOperatorState>(context.client, empty_args, state.payload, state.actor_handles);
+		state.op = make_uniq<UDFOperatorState>(state.payload, state.actor_handles);
 		EnsureExecutor(context, *state.op);
 	}
 	if (!state.wakeup_registered && state.op->executor && state.op->executor->SupportsAsyncWakeup()) {
@@ -2380,9 +1491,6 @@ static void EnsureStreamingExecutor(ExecutionContext &context, StreamingUDFState
 		state.wakeup_registered = true;
 	}
 	if (!state.output_consumer_registered && state.op->executor) {
-		if (!state.op->executor->SupportsOutputConsumer()) {
-			throw InvalidInputException("streaming UDF requires an executor that supports output consumers");
-		}
 		auto weak_state = state.self;
 		UDFOutputConsumer consumer;
 		consumer.data_capacity = [weak_state]() {
@@ -3010,6 +2118,8 @@ static bool EnqueueStreamingDataEventLocked(StreamingUDFState &state, UDFOutputE
 
 	if (state.op->is_flat_map) {
 		PreserveFlatMapLazyOutputShape(*state.op, *event.ref_outputs);
+	} else {
+		PreserveScalarMapLazyOutputShape(*state.op, *event.ref_outputs);
 	}
 	event.ref_outputs->RecomputeCardinality();
 	const auto lazy_rows = event.ref_outputs->cardinality;
@@ -3999,7 +3109,7 @@ SourceResultType PhysicalStreamingUDF::GetDataBatch(ExecutionContext &context, E
 InsertionOrderPreservingMap<string> PhysicalStreamingUDF::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
 	result["Name"] = function.name.empty() ? "udf" : function.name;
-	result["streaming_breaker"] = "true";
+	result["output_delivery"] = "consumer_required";
 	if (bind_data) {
 		auto &udf_bind = bind_data->Cast<UDFFunctionData>();
 		auto udf_name = GetStructStringField(udf_bind.payload, "udf_name");
@@ -4026,12 +3136,16 @@ InsertionOrderPreservingMap<string> PhysicalStreamingUDF::ParamsToString() const
 			}
 		}
 		auto produce_ref_bundle = GetStructBoolField(udf_bind.payload, "produce_ref_bundle_output");
+		auto produce_ray_block_stream = GetStructBoolField(udf_bind.payload, "produce_ray_block_stream");
+		if ((produce_ref_bundle.first && produce_ref_bundle.second) ||
+		    (produce_ray_block_stream.first && produce_ray_block_stream.second)) {
+			result["lazy_ref_boundary"] = "strict_ref_aware";
+		}
 		if (produce_ref_bundle.first && produce_ref_bundle.second) {
 			auto output_mode = GetStructStringField(udf_bind.payload, "streaming_output_mode");
 			result["ref_bundle_output"] =
 			    output_mode.first && !output_mode.second.empty() ? output_mode.second : "local_shm_ref_bundle";
 		}
-		auto produce_ray_block_stream = GetStructBoolField(udf_bind.payload, "produce_ray_block_stream");
 		if (produce_ray_block_stream.first && produce_ray_block_stream.second) {
 			result["ray_block_stream_output"] = "direct_block_metadata_pair";
 		}
@@ -4172,7 +3286,42 @@ static unique_ptr<FunctionData> UDFTableFunctionDeserialize(Deserializer &deseri
 	return make_uniq<UDFFunctionData>(std::move(payload), std::move(return_type));
 }
 
-// ─── Public: create a TableFunction with INOUT callbacks ────────────────────
+//! Stores payload in function_info so the bind function can create UDFFunctionData.
+struct UDFTableInfo : public TableFunctionInfo {
+	explicit UDFTableInfo(Value payload_p, vector<LogicalType> output_types_p, vector<string> output_names_p)
+	    : payload(std::move(payload_p)), output_types(std::move(output_types_p)),
+	      output_names(std::move(output_names_p)) {
+	}
+
+	Value payload;
+	vector<LogicalType> output_types;
+	vector<string> output_names;
+};
+
+bool IsUDFTableFunction(const TableFunction &function) {
+	return (function.function_info && dynamic_cast<UDFTableInfo *>(function.function_info.get()) != nullptr) ||
+	       function.GetSerializeCallback() == UDFTableFunctionSerialize;
+}
+
+Value RequireUDFStreamingOutput(Value payload) {
+	auto backend = GetStructStringField(payload, "execution_backend");
+	if (!backend.first || (backend.second != "ray_task" && backend.second != "ray_actor" &&
+	                       backend.second != "subprocess_task" && backend.second != "subprocess_actor")) {
+		throw InvalidInputException("unsupported udf execution_backend '%s' for strict streaming output",
+		                            backend.first ? backend.second : "<missing>");
+	}
+
+	const bool ray_backend = backend.second == "ray_task" || backend.second == "ray_actor";
+	child_list_t<Value> replacements;
+	replacements.emplace_back("streaming_output_mode",
+	                          Value(ray_backend ? "ray_block_stream" : "local_shm_ref_bundle"));
+	replacements.emplace_back("produce_ray_block_stream", Value::BOOLEAN(ray_backend));
+	replacements.emplace_back("produce_ref_bundle_output", Value::BOOLEAN(!ray_backend));
+	replacements.emplace_back("prebatched_input", Value::BOOLEAN(false));
+	return ReplaceStructFields(payload, std::move(replacements));
+}
+
+// ─── Public: create the serializable UDF TableFunction descriptor ───────────
 TableFunction MakeUDFTableFunction(Value payload, const vector<LogicalType> &return_types,
                                    const vector<string> &return_names) {
 	// Create bind data
@@ -4204,18 +3353,6 @@ TableFunction MakeUDFTableFunction(Value payload, const vector<LogicalType> &ret
 }
 
 // ─── Registered version: includes bind function for conn.create_function() ──
-
-//! Stores payload in function_info so the bind function can create UDFFunctionData.
-struct UDFTableInfo : public TableFunctionInfo {
-	explicit UDFTableInfo(Value payload_p, vector<LogicalType> output_types_p, vector<string> output_names_p)
-	    : payload(std::move(payload_p)), output_types(std::move(output_types_p)),
-	      output_names(std::move(output_names_p)) {
-	}
-
-	Value payload;
-	vector<LogicalType> output_types;
-	vector<string> output_names;
-};
 
 static unique_ptr<FunctionData> UDFRegisteredBind(ClientContext &context, TableFunctionBindInput &input,
                                                   vector<LogicalType> &return_types, vector<string> &return_names) {
@@ -4256,7 +3393,7 @@ TableFunction MakeUDFRegisteredTableFunction(string name, Value payload, vector<
 
 TableFunction GetUDFBuiltinTableFunction() {
 	// Minimal table function registered in the catalog at init time.
-	// The INOUT callbacks are the same as the dynamically-created version.
+	// Its pull callbacks deliberately reject execution.
 	// This entry exists solely so BinaryDeserializer can look up "udf" as
 	// a TableFunction when reconstructing serialized plans on remote workers.
 	TableFunction tf("udf", {}, nullptr);

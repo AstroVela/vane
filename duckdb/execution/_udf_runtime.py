@@ -506,6 +506,7 @@ class UDFExecutor:
         cache_callable: bool,
         cache_max_entries: int | None,
     ) -> None:
+        self._payload = payload
         self._mode = "map"
         self._is_map_batches = False
         self._is_map_batches_rows = False

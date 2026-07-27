@@ -2184,7 +2184,6 @@ def test_execute_native_streaming_udf_emits_determinate_live_progress(tmp_path, 
         schema={"x": duckdb.sqltypes.BIGINT},
         execution_backend="subprocess_task",
         batch_size=2048,
-        streaming_breaker=True,
     )
     plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,

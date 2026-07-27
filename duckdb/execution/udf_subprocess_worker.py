@@ -10,7 +10,7 @@ import socket
 import struct
 import sys
 from traceback import TracebackException
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
@@ -113,7 +113,7 @@ def _should_log_submit(submit_count: int) -> bool:
     return every > 0 and submit_count % every == 0
 
 
-def _worker_thread_log(event: str, payload: dict | None = None, **fields: object) -> None:
+def _worker_thread_log(event: str, payload: dict[str, Any] | None = None, **fields: object) -> None:
     if not _debug_enabled():
         return
     backend = str((payload or {}).get("execution_backend") or "-")
@@ -160,31 +160,41 @@ def _recv_message(sock: socket.socket) -> tuple[int, bytes]:
     return msg_type, payload
 
 
+def _require_shm_buffer(shm: shared_memory.SharedMemory) -> memoryview[int]:
+    buffer = shm.buf
+    if buffer is None:
+        raise RuntimeError("shared memory mapping is closed")
+    return buffer
+
+
 def _read_ipc_from_shm(shm: shared_memory.SharedMemory, size: int | None = None) -> bytes:
-    ipc_size = _IPC_HEADER.unpack_from(shm.buf, 0)[0]
+    buffer = _require_shm_buffer(shm)
+    ipc_size = _IPC_HEADER.unpack_from(buffer, 0)[0]
     required = _IPC_HEADER.size + ipc_size
-    if required > len(shm.buf):
+    if required > len(buffer):
         raise BufferError(
-            f"shared memory IPC payload exceeds local mapping: required={required} capacity={len(shm.buf)}"
+            f"shared memory IPC payload exceeds local mapping: required={required} capacity={len(buffer)}"
         )
     if size is not None and required > size:
         raise BufferError(f"shared memory IPC payload exceeds message size: required={required} size={size}")
-    return bytes(shm.buf[_IPC_HEADER.size : required])
+    return bytes(buffer[_IPC_HEADER.size : required])
 
 
 def _write_ipc_to_shm(shm: shared_memory.SharedMemory, ipc_bytes: bytes) -> int:
+    buffer = _require_shm_buffer(shm)
     required = _IPC_HEADER.size + len(ipc_bytes)
-    if required > len(shm.buf):
+    if required > len(buffer):
         raise BufferError("shared memory segment is too small")
-    _IPC_HEADER.pack_into(shm.buf, 0, len(ipc_bytes))
-    shm.buf[_IPC_HEADER.size : required] = ipc_bytes
+    _IPC_HEADER.pack_into(buffer, 0, len(ipc_bytes))
+    buffer[_IPC_HEADER.size : required] = ipc_bytes
     return required
 
 
 def _resize_shm(shm: shared_memory.SharedMemory, required: int) -> shared_memory.SharedMemory:
-    if required <= len(shm.buf):
+    buffer = _require_shm_buffer(shm)
+    if required <= len(buffer):
         return shm
-    new_size = max(required, len(shm.buf) * 2, _DEFAULT_SHM_SIZE)
+    new_size = max(required, len(buffer) * 2, _DEFAULT_SHM_SIZE)
     name = shm.name
     path = f"/dev/shm/{name}"
     fd = os.open(path, os.O_RDWR)
@@ -215,7 +225,7 @@ def _format_exception(exc: BaseException) -> str:
         return repr(exc)
 
 
-def _send_input_consumed(sock: socket.socket, ref_bundle: dict, input_table: pa.Table) -> None:
+def _send_input_consumed(sock: socket.socket, ref_bundle: dict[str, Any], input_table: pa.Table) -> None:
     lease_id = ref_bundle.get("input_lease_id")
     if lease_id is None:
         return
@@ -228,7 +238,7 @@ def _send_input_consumed(sock: socket.socket, ref_bundle: dict, input_table: pa.
     _send_message(sock, _MSG_INPUT_CONSUMED, duckdb_pickle.dumps(payload))
 
 
-def _send_input_consume_failed(sock: socket.socket, ref_bundle: dict, exc: BaseException) -> None:
+def _send_input_consume_failed(sock: socket.socket, ref_bundle: dict[str, Any], exc: BaseException) -> None:
     lease_id = ref_bundle.get("input_lease_id")
     if lease_id is None:
         return
@@ -272,7 +282,7 @@ def _release_output_grant(sock: socket.socket, grant_id: int) -> None:
     _send_message(sock, _MSG_OUTPUT_GRANT_RELEASE, duckdb_pickle.dumps({"grant_id": int(grant_id)}))
 
 
-def _payload_subprocess_mode(payload: dict) -> str:
+def _payload_subprocess_mode(payload: dict[str, Any]) -> str:
     backend = str(payload.get("execution_backend") or "").strip().lower()
     if backend == "subprocess_task":
         return "task"
@@ -302,11 +312,11 @@ def _make_local_shm_ref_bundle_descriptor_for_tables(
     tables: list[pa.Table],
     *,
     grant_id: int | None = None,
-) -> dict:
+) -> dict[str, Any]:
     if not tables:
         raise RuntimeError("UDF returned no result")
 
-    descriptor = {
+    descriptor: dict[str, Any] = {
         "block_refs": [],
         "metadata": [],
         "names": list(tables[0].schema.names),
@@ -348,7 +358,10 @@ def _execute_submit(
     if input_table.num_rows == 0:
         return data_shm, _MSG_OK, struct.pack("<Q", 0)
     payload = getattr(executor, "_payload", {}) or {}
-    row_preserving = str(payload.get("call_mode") or "") == "map_batches_rows"
+    call_mode = str(payload.get("call_mode") or "")
+    row_preserving = call_mode == "map_batches_rows" or (
+        call_mode == "map" and payload.get("scalar_arg_count") is not None
+    )
     passthrough_table = None
     if row_preserving:
         input_table, passthrough_table = split_row_preserving_input(payload, input_table)
@@ -359,7 +372,7 @@ def _execute_submit(
     if row_preserving:
         if len(output_tables) != 1:
             raise RuntimeError(
-                "map_batches_rows subprocess produced %d outputs, expected exactly 1" % len(output_tables)
+                "%s subprocess produced %d outputs, expected exactly 1" % (call_mode, len(output_tables))
             )
         output_tables = [fuse_row_preserving_output(payload, passthrough_table, output_tables[0])]
     if produce_ref_bundle_output:
@@ -395,7 +408,7 @@ def _execute_submit(
 
 
 def _execute_task_submit(
-    payload: dict,
+    payload: dict[str, Any],
     input_table: pa.Table,
     data_shm: shared_memory.SharedMemory,
     produce_ref_bundle_output: bool,

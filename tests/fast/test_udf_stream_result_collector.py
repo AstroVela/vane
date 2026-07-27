@@ -17,6 +17,8 @@ import duckdb.execution.udf_stream_result_collector as collector_module
 from duckdb.execution.ray_stream_adapter import RayStreamAdapter, TaskLeaseObjectRefGenerator
 from duckdb.execution.udf_stream_result_collector import (
     AsyncResultCollector,
+    _OutputLeaseToken,
+    _ReadyEvent,
     _StreamRecord,
 )
 from duckdb.execution.udf_task_admission import TaskAdmission
@@ -335,6 +337,86 @@ def test_zero_capacity_does_not_consume_block_or_metadata_objects():
         time.sleep(0.05)
         assert holder["generator"].read_count == 0
         assert driver.acquire_query_output_block_lease.calls == []
+    finally:
+        collector.shutdown()
+
+
+def test_scheduled_block_read_reserves_data_capacity_across_streams():
+    fake_ray = _FakeRay()
+    driver = _Driver()
+
+    def submitter(lease):
+        return _Generator(
+            [
+                _Ref(f"block-{lease['lease_id']}", ready=False, is_block=True),
+                _Ref(_metadata(lease)),
+            ],
+            completed=False,
+        )
+
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector.track_generator_ref(
+        1,
+        10,
+        _source(fake_ray, driver, request_id="reserved-read-1", submitter=submitter),
+    )
+    collector.track_generator_ref(
+        1,
+        11,
+        _source(fake_ray, driver, request_id="reserved-read-2", submitter=submitter),
+    )
+    capacity = {1: {"rows": 1, "bytes": 128, "item_bytes": 128}}
+    try:
+        assert collector.drain_results(capacity) == []
+        with collector._cv:
+            scheduled = [
+                record.submit_id
+                for record in collector._records.values()
+                if record.wait_kind == "data" and record.wait_future is not None
+            ]
+        assert scheduled == [10]
+
+        # A dispatcher capacity refresh must not grant the same downstream
+        # credit to the second stream while the first read remains in flight.
+        assert collector.drain_results(capacity) == []
+        with collector._cv:
+            scheduled = [
+                record.submit_id
+                for record in collector._records.values()
+                if record.wait_kind == "data" and record.wait_future is not None
+            ]
+        assert scheduled == [10]
+    finally:
+        collector.cancel_slot(1)
+        collector.shutdown()
+
+
+def test_data_capacity_does_not_count_interleaved_control_events():
+    fake_ray = _FakeRay()
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    token = _OutputLeaseToken(
+        request_id="strict-consumer-request",
+        lease_id="strict-consumer-lease",
+        driver=object(),
+        slot_id=1,
+        submit_id=11,
+        size_bytes=64,
+    )
+    with collector._cv:
+        collector._ready_by_slot[1].extend(
+            [
+                _ReadyEvent(1, 10, "complete", None),
+                _ReadyEvent(1, 11, "data", "payload", size_bytes=64, output_token=token),
+                _ReadyEvent(1, 11, "complete", None),
+                _ReadyEvent(1, 12, "error", "boom"),
+            ]
+        )
+
+    try:
+        events = collector.drain_results({1: {"rows": 1, "bytes": 64, "item_bytes": 64}})
+
+        assert [event[2] for event in events] == ["complete", "data", "complete", "error"]
+        assert collector.drain_results({1: {"rows": 0, "bytes": 0, "item_bytes": 0}}) == []
     finally:
         collector.shutdown()
 

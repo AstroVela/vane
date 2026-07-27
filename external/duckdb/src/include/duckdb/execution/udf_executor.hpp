@@ -33,16 +33,6 @@ using RefBlockDescriptor = ExternalBlockDescriptor;
 using LazyRefDataChunk = LazyDataChunk;
 using RefBundleBundler = LazyDataChunkBundler;
 
-struct UDFResult {
-	unique_ptr<DataChunk> outputs;
-	unique_ptr<LazyRefDataChunk> ref_outputs;
-	unique_ptr<DataChunk> rows;
-	bool submit_complete = true;
-	idx_t submit_id = 0;
-	std::function<void()> handoff_output_lease;
-	std::function<void()> release_output_lease;
-};
-
 enum class UDFOutputEventKind { DATA, COMPLETE, ERROR, FINISHED };
 
 struct UDFOutputEvent {
@@ -60,6 +50,8 @@ struct UDFOutputEvent {
 };
 
 struct UDFOutputConsumer {
+	// Capacity applies only to DATA. COMPLETE, ERROR, and FINISHED are control
+	// events and must remain deliverable without consuming a DATA reservation.
 	std::function<idx_t()> data_capacity;
 	std::function<idx_t()> data_byte_capacity;
 	std::function<idx_t()> data_item_byte_capacity;
@@ -89,14 +81,13 @@ public:
 	                                idx_t &submit_id) = 0;
 	virtual bool TrySubmitRefBundleWithRetainedBytes(LazyRefDataChunk &bundle, DataChunk &rows, ClientContext &context,
 	                                                 idx_t retained_input_bytes, idx_t &submit_id) = 0;
-	virtual std::pair<bool, UDFResult> TakeReadyResult(ClientContext &context) = 0;
 	virtual void FinishedSubmitting(ClientContext &context) = 0;
 	virtual bool AllTasksFinished(ClientContext &context) = 0;
 	virtual bool SupportsAsyncWakeup() = 0;
 	virtual UDFWakeupRegistrationResult RegisterWakeup(InterruptState &interrupt_state) = 0;
 	virtual void RegisterWakeupCallback(std::function<void()> callback) = 0;
 	virtual void EnqueueDeferredWakeup(std::function<void()> callback) = 0;
-	virtual bool SupportsOutputConsumer() = 0;
+	// Register exactly once, before the first submission.
 	virtual void RegisterOutputConsumer(UDFOutputConsumer consumer) = 0;
 	virtual void NotifyOutputConsumerSpaceAvailable() = 0;
 	virtual idx_t DebugSlotId() = 0;

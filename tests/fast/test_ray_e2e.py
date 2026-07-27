@@ -1062,14 +1062,14 @@ def test_ray_udf_direct_output_lease_lifetime(ray_runner, duckdb_conn, tmp_path)
     assert set(rows) == {("11",), ("21",), ("31",), ("41",)}
 
 
-def test_ray_udf_streaming_breaker_distributed(ray_runner, duckdb_conn, tmp_path):
+def test_ray_udf_strict_consumer_distributed(ray_runner, duckdb_conn, tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
     if ray is None:
         pytest.skip("ray not installed")
 
-    label = "test_ray_e2e: udf streaming breaker distributed"
+    label = "test_ray_e2e: udf strict consumer distributed"
 
     class Upper:
         def __call__(self, table):
@@ -1099,7 +1099,6 @@ def test_ray_udf_streaming_breaker_distributed(ray_runner, duckdb_conn, tmp_path
         actor_number=2,
         gpus=0.0,
         batch_size=2,
-        streaming_breaker=True,
     )
     assert "STREAMING_UDF" in df.explain()
 
@@ -1116,14 +1115,14 @@ def test_ray_udf_streaming_breaker_distributed(ray_runner, duckdb_conn, tmp_path
     }
 
 
-def test_ray_udf_streaming_breaker_non_row_preserving(ray_runner, duckdb_conn, tmp_path):
+def test_ray_udf_strict_consumer_non_row_preserving(ray_runner, duckdb_conn, tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
     if ray is None:
         pytest.skip("ray not installed")
 
-    label = "test_ray_e2e: udf streaming breaker non row preserving"
+    label = "test_ray_e2e: udf strict consumer non row preserving"
 
     class Explode:
         def __call__(self, table):
@@ -1150,7 +1149,6 @@ def test_ray_udf_streaming_breaker_non_row_preserving(ray_runner, duckdb_conn, t
         actor_number=2,
         gpus=0.0,
         batch_size=2,
-        streaming_breaker=True,
     )
     assert "STREAMING_UDF" in df.explain()
 
@@ -1162,13 +1160,13 @@ def test_ray_udf_streaming_breaker_non_row_preserving(ray_runner, duckdb_conn, t
     assert set(rows) == {("1",), ("2",), ("3",), ("11",), ("12",), ("13",)}
 
 
-def test_ray_udf_streaming_breaker_backpressure_preserves_rows(ray_runner, duckdb_conn, tmp_path, monkeypatch):
+def test_ray_udf_strict_consumer_backpressure_preserves_rows(ray_runner, duckdb_conn, tmp_path, monkeypatch):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
     if ray is None:
         pytest.skip("ray not installed")
-    label = "test_ray_e2e: udf streaming breaker backpressure preserves rows"
+    label = "test_ray_e2e: udf strict consumer backpressure preserves rows"
     row_count = 5000
 
     class PlusOne:
@@ -1193,7 +1191,6 @@ def test_ray_udf_streaming_breaker_backpressure_preserves_rows(ray_runner, duckd
         actor_number=1,
         gpus=0.0,
         batch_size=64,
-        streaming_breaker=True,
     )
     assert "STREAMING_UDF" in df.explain()
 
@@ -1365,7 +1362,6 @@ def test_ray_task_map_batches_ref_passthrough_to_actor_distributed(ray_runner, d
         schema={"score": duckdb.sqltype("INTEGER")},
         execution_backend="ray_task",
         batch_size=2,
-        streaming_breaker=True,
     ).map_batches(
         Stage2,
         schema={"combined": duckdb.sqltype("INTEGER")},
@@ -1453,7 +1449,6 @@ def test_ray_task_large_block_stream_reaches_actor_with_bounded_leases(tmp_path,
                 gpus=0.0,
                 batch_size=2048,
                 target_max_batch_bytes=128 * 1024 * 1024,
-                streaming_breaker=True,
             )
             .map_batches(
                 Consumer,
@@ -1466,7 +1461,6 @@ def test_ray_task_large_block_stream_reaches_actor_with_bounded_leases(tmp_path,
                 cpus=1.0,
                 gpus=0.0,
                 batch_size=32,
-                streaming_breaker=True,
             )
         )
 
@@ -1546,7 +1540,6 @@ def test_ray_lazy_tail_block_submits_without_cross_lease_batching(tmp_path, ray_
                 batch_size=1000,
                 task_input_max_bytes=1024,
                 output_target_max_bytes=1024,
-                streaming_breaker=True,
             )
             .map_batches(
                 Consumer,
@@ -1558,7 +1551,6 @@ def test_ray_lazy_tail_block_submits_without_cross_lease_batching(tmp_path, ray_
                 batch_size=1000,
                 task_input_max_bytes=64 * 1024,
                 output_target_max_bytes=64 * 1024,
-                streaming_breaker=True,
             )
         )
 
@@ -1648,7 +1640,6 @@ def test_ray_actor_compute_batches_span_upstream_block_boundaries(tmp_path, ray_
                 batch_size=compute_batch_rows,
                 task_input_max_bytes=16 * 1024 * 1024,
                 output_target_max_bytes=8 * 1024 * 1024,
-                streaming_breaker=True,
             )
             .map_batches(
                 Consumer,
@@ -1660,7 +1651,6 @@ def test_ray_actor_compute_batches_span_upstream_block_boundaries(tmp_path, ray_
                 batch_size=compute_batch_rows,
                 task_input_max_bytes=12 * 1024 * 1024,
                 output_target_max_bytes=1024 * 1024,
-                streaming_breaker=True,
             )
         )
 
@@ -1737,7 +1727,6 @@ def test_ray_actor_soft_minimum_task_batch_matches_ray_data_bundling(tmp_path, r
                 output_batch_size=110,
                 preserve_compute_batch_boundaries=True,
                 output_target_max_bytes=1024 * 1024,
-                streaming_breaker=True,
             )
             .map_batches(
                 Consumer,
@@ -1750,7 +1739,6 @@ def test_ray_actor_soft_minimum_task_batch_matches_ray_data_bundling(tmp_path, r
                 min_task_batch_size=32,
                 task_input_max_bytes=1024 * 1024,
                 output_target_max_bytes=1024 * 1024,
-                streaming_breaker=True,
             )
         )
 
@@ -1845,7 +1833,6 @@ def test_ray_actor_lazy_row_backpressure_preserves_non_tail_batch_alignment(tmp_
                 batch_size=producer_batch_rows,
                 task_input_max_bytes=64 * 1024 * 1024,
                 output_target_max_bytes=64 * 1024 * 1024,
-                streaming_breaker=True,
             )
             .map_batches(
                 SlowConsumer,
@@ -1860,7 +1847,6 @@ def test_ray_actor_lazy_row_backpressure_preserves_non_tail_batch_alignment(tmp_
                 batch_size=compute_batch_rows,
                 task_input_max_bytes=64 * 1024 * 1024,
                 output_target_max_bytes=64 * 1024 * 1024,
-                streaming_breaker=True,
             )
         )
 
@@ -1947,7 +1933,6 @@ def test_ray_task_block_stream_does_not_deadlock_when_sink_and_source_blocked(tm
                 cpus=1.0,
                 gpus=0.0,
                 batch_size=2048,
-                streaming_breaker=True,
             )
             .map_batches(
                 Consumer,
@@ -1957,7 +1942,6 @@ def test_ray_task_block_stream_does_not_deadlock_when_sink_and_source_blocked(tm
                 cpus=1.0,
                 gpus=0.0,
                 batch_size=32,
-                streaming_breaker=True,
             )
         )
 
@@ -2047,7 +2031,6 @@ def test_ray_task_flat_map_ref_stream_preserves_rows_under_actor_backpressure(tm
                 execution_backend="ray_task",
                 cpus=1.0,
                 gpus=0.0,
-                streaming_breaker=True,
             )
             .map_batches(
                 Identity,
@@ -2061,7 +2044,6 @@ def test_ray_task_flat_map_ref_stream_preserves_rows_under_actor_backpressure(tm
                 cpus=1.0,
                 gpus=0.0,
                 batch_size=10,
-                streaming_breaker=True,
             )
         )
 
@@ -2156,7 +2138,6 @@ def test_ray_task_flat_map_projected_ref_stream_preserves_column_projection(tmp_
                 execution_backend="ray_task",
                 cpus=1.0,
                 gpus=0.0,
-                streaming_breaker=True,
             )
             .project("id, chunk_id")
             .map_batches(
@@ -2170,7 +2151,6 @@ def test_ray_task_flat_map_projected_ref_stream_preserves_column_projection(tmp_
                 cpus=1.0,
                 gpus=0.0,
                 batch_size=10,
-                streaming_breaker=True,
             )
         )
 
@@ -2275,7 +2255,6 @@ def test_ray_task_flat_map_ref_stream_preserves_variable_and_empty_outputs(tmp_p
                 cpus=1.0,
                 gpus=0.0,
                 output_batch_size=17,
-                streaming_breaker=True,
             )
             .map_batches(
                 Identity,
@@ -2290,7 +2269,6 @@ def test_ray_task_flat_map_ref_stream_preserves_variable_and_empty_outputs(tmp_p
                 cpus=1.0,
                 gpus=0.0,
                 batch_size=7,
-                streaming_breaker=True,
             )
         )
 
@@ -2392,7 +2370,6 @@ def test_ray_task_flat_map_ref_stream_preserves_reordered_alias_projection(tmp_p
                 cpus=1.0,
                 gpus=0.0,
                 output_batch_size=31,
-                streaming_breaker=True,
             )
             .project("chunk_id AS cid, id AS source_id, weight")
             .map_batches(
@@ -2407,7 +2384,6 @@ def test_ray_task_flat_map_ref_stream_preserves_reordered_alias_projection(tmp_p
                 cpus=1.0,
                 gpus=0.0,
                 batch_size=9,
-                streaming_breaker=True,
             )
         )
 
@@ -2490,7 +2466,6 @@ def test_ray_task_flat_map_ref_stream_all_empty_output_finishes(tmp_path, ray_su
                 cpus=1.0,
                 gpus=0.0,
                 output_batch_size=5,
-                streaming_breaker=True,
             )
             .map_batches(
                 Identity,
@@ -2503,7 +2478,6 @@ def test_ray_task_flat_map_ref_stream_all_empty_output_finishes(tmp_path, ray_su
                 cpus=1.0,
                 gpus=0.0,
                 batch_size=3,
-                streaming_breaker=True,
             )
         )
 
@@ -2590,7 +2564,8 @@ def test_ray_python_udf_task_consumes_and_emits_ref_bundles_distributed(ray_runn
     )
 
     plan = df.explain()
-    assert "INOUT_FUNCTION" in plan
+    assert "STREAMING_UDF" in plan
+    assert "INOUT_FUNCTION" not in plan
     assert "ray_task" in plan
     assert "strict_ref_aware" in plan
     assert "scalar_arg_count" in plan
@@ -2742,7 +2717,6 @@ def test_ray_task_credit_admission_runs_multiple_batches_concurrently(
         batch_size=2048,
         task_input_max_bytes=1024 * 1024,
         output_target_max_bytes=1024 * 1024,
-        streaming_breaker=True,
     )
 
     parts = _run_iter_tables(ray_runner, relation, "credit-first ray task admission", timeout_s=30.0)

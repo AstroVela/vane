@@ -227,17 +227,16 @@ public:
 	           const Optional<py::object> &preserve_compute_batch_boundaries, const Optional<py::object> &cpus,
 	           const Optional<py::object> &gpus, const Optional<py::object> &memory_bytes,
 	           const Optional<py::object> &execution_backend, const Optional<py::object> &actor_number,
-	           const Optional<py::object> &ray_actor_thread_policy, const Optional<py::object> &streaming_breaker,
-	           const Optional<py::object> &target_max_batch_bytes, const Optional<py::object> &task_input_max_bytes,
-	           const Optional<py::object> &output_target_max_bytes);
+	           const Optional<py::object> &ray_actor_thread_policy, const Optional<py::object> &target_max_batch_bytes,
+	           const Optional<py::object> &task_input_max_bytes, const Optional<py::object> &output_target_max_bytes);
 	unique_ptr<DuckDBPyRelation>
 	FlatMap(py::function fun, Optional<py::object> schema, const Optional<py::object> &batch_size,
 	        const Optional<py::object> &output_batch_size, const Optional<py::object> &min_task_batch_size,
 	        const Optional<py::object> &preserve_compute_batch_boundaries, const Optional<py::object> &cpus,
 	        const Optional<py::object> &gpus, const Optional<py::object> &memory_bytes,
 	        const Optional<py::object> &execution_backend, const Optional<py::object> &actor_number,
-	        const Optional<py::object> &streaming_breaker, const Optional<py::object> &target_max_batch_bytes,
-	        const Optional<py::object> &task_input_max_bytes, const Optional<py::object> &output_target_max_bytes);
+	        const Optional<py::object> &target_max_batch_bytes, const Optional<py::object> &task_input_max_bytes,
+	        const Optional<py::object> &output_target_max_bytes);
 
 	unique_ptr<DuckDBPyRelation> Join(DuckDBPyRelation *other, const py::object &condition, const string &type);
 	unique_ptr<DuckDBPyRelation> Cross(DuckDBPyRelation *other);
