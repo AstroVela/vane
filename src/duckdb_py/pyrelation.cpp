@@ -1068,6 +1068,22 @@ static void ForgetRunnerForDB(const shared_ptr<Relation> &rel) {
 	per_db_runners.erase(db_ptr);
 }
 
+class PerDBRunnerCleanupGuard {
+public:
+	explicit PerDBRunnerCleanupGuard(shared_ptr<Relation> rel_p) : rel(std::move(rel_p)) {
+	}
+
+	~PerDBRunnerCleanupGuard() {
+		ForgetRunnerForDB(rel);
+	}
+
+	PerDBRunnerCleanupGuard(const PerDBRunnerCleanupGuard &) = delete;
+	PerDBRunnerCleanupGuard &operator=(const PerDBRunnerCleanupGuard &) = delete;
+
+private:
+	shared_ptr<Relation> rel;
+};
+
 static py::object GetOrCreateRunnerForDB(const shared_ptr<Relation> &rel, const string &runner_type) {
 	if (!rel || !rel->context) {
 		throw InternalException("Cannot resolve runner: relation has no context");
@@ -1117,17 +1133,13 @@ static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py:
 	if (runner_type == "local-fast") {
 		return false;
 	}
-	try {
-		auto runner = GetOrCreateRunnerForDB(write_rel, runner_type);
-		auto py_write_rel = DuckDBPyRelation(write_rel);
-		py_write_rel.SetConnectionOwner(connection_owner);
-		auto py_write_rel_obj = py::cast(std::move(py_write_rel));
-		runner.attr("run_write")(py_write_rel_obj);
-		ForgetRunnerForDB(write_rel);
-		return true;
-	} catch (py::error_already_set &) {
-		throw;
-	}
+	auto runner = GetOrCreateRunnerForDB(write_rel, runner_type);
+	PerDBRunnerCleanupGuard cleanup_guard(write_rel);
+	auto py_write_rel = DuckDBPyRelation(write_rel);
+	py_write_rel.SetConnectionOwner(connection_owner);
+	auto py_write_rel_obj = py::cast(std::move(py_write_rel));
+	runner.attr("run_write")(py_write_rel_obj);
+	return true;
 }
 
 static unique_ptr<QueryResult> PyExecuteRelation(const shared_ptr<Relation> &rel, bool stream_result = false) {

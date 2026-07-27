@@ -25,6 +25,11 @@ All notable user-visible changes are documented here. Vane is currently in alpha
   Vane engine customizations as monorepo commits, so normal clones no longer
   require submodule initialization or carry DuckDB's complete commit history.
 
+### Fixed
+
+- Released per-database runner cache entries after relation write failures so a
+  failed runner is not reused by a later write.
+
 ### Security
 
 - Documented the trust boundaries around Python UDFs, Ray workers, credentials, native parsers, and remote model code.
