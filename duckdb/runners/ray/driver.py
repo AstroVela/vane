@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Callable, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass, field
@@ -50,6 +51,8 @@ _RUNTIME_ATTACH_TIMEOUT_S = 300.0
 _RUNTIME_ATTACH_RETRY_INTERVAL_S = 0.05
 _RUNTIME_ATTACH_CLEANUP_ATTEMPTS = 3
 _RUNTIME_ATTACH_CLEANUP_TIMEOUT_S = 300.0
+_DEFAULT_CLIENT_LEASE_TIMEOUT_S = 60.0
+_DEFAULT_CLIENT_HEARTBEAT_INTERVAL_S = 10.0
 RAY_QUERY_RUNTIME_ACTOR_NAMESPACE = "vane"
 RAY_QUERY_RUNTIME_ACTOR_NAME_PREFIX = "vane-query-runtime-"
 
@@ -76,6 +79,63 @@ class RayRuntimeShuttingDownError(RuntimeError):
 
 class VaneSessionOpenRejectedError(RuntimeError):
     """A session-open request was rejected before the actor recorded it."""
+
+
+class QueryExecutionCleanupError(RuntimeError):
+    """A primary query failure accompanied by one or more cleanup failures."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        primary_error: BaseException | None = None,
+        cleanup_errors: tuple[BaseException, ...] = (),
+    ) -> None:
+        super().__init__(str(message))
+        self.primary_error = primary_error
+        self.cleanup_errors = tuple(cleanup_errors)
+
+    @classmethod
+    def from_errors(
+        cls,
+        context: str,
+        primary_error: BaseException,
+        cleanup_errors: list[BaseException] | tuple[BaseException, ...],
+    ) -> QueryExecutionCleanupError:
+        cleanup = tuple(cleanup_errors)
+        if not cleanup:
+            raise ValueError("QueryExecutionCleanupError requires at least one cleanup error")
+        message = f"{context}: primary={type(primary_error).__name__}: {primary_error}; cleanup=" + "; ".join(
+            f"{type(error).__name__}: {error}" for error in cleanup
+        )
+        return cls(
+            message,
+            primary_error=primary_error,
+            cleanup_errors=cleanup,
+        )
+
+
+def _client_owner_lease_settings() -> tuple[float, float]:
+    lease_timeout = float(
+        os.environ.get(
+            "VANE_RAY_CLIENT_LEASE_TIMEOUT_S",
+            str(_DEFAULT_CLIENT_LEASE_TIMEOUT_S),
+        )
+    )
+    heartbeat_interval = float(
+        os.environ.get(
+            "VANE_RAY_CLIENT_HEARTBEAT_INTERVAL_S",
+            str(_DEFAULT_CLIENT_HEARTBEAT_INTERVAL_S),
+        )
+    )
+    if not math.isfinite(lease_timeout) or lease_timeout <= 0:
+        raise ValueError("VANE_RAY_CLIENT_LEASE_TIMEOUT_S must be finite and > 0")
+    if not math.isfinite(heartbeat_interval) or heartbeat_interval <= 0 or heartbeat_interval > lease_timeout / 3.0:
+        raise ValueError(
+            "VANE_RAY_CLIENT_HEARTBEAT_INTERVAL_S must be finite, > 0, and no greater than one third of "
+            "VANE_RAY_CLIENT_LEASE_TIMEOUT_S"
+        )
+    return lease_timeout, heartbeat_interval
 
 
 def _runtime_error_candidates(error: BaseException) -> list[BaseException]:
@@ -204,10 +264,27 @@ class _DriverSession:
     close_in_progress: bool = False
     closed: bool = False
     active_operations: int = 0
+    active_operation_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     condition: threading.Condition = field(init=False)
 
     def __post_init__(self) -> None:
         self.condition = threading.Condition(self.lock)
+
+
+@dataclass
+class _ClientOwnerLease:
+    lease_token: str
+    expires_at: float
+    state: str = "active"
+    cleanup_attempts: int = 0
+    next_cleanup_at: float = 0.0
+    last_cleanup_error: str = ""
+
+
+@dataclass
+class _AdmissionLoopFence:
+    completed: threading.Event = field(default_factory=threading.Event)
+    error: BaseException | None = None
 
 
 def _normalize_session_config(config: Mapping[str, Any]) -> dict[str, str]:
@@ -1074,10 +1151,20 @@ class RayQueryDriverActor:
         if duckdb_memory_bytes <= 0:
             raise ValueError("Ray driver duckdb_memory_bytes must be positive")
         self._runtime_config = _normalize_session_config(runtime_config)
+        (
+            self._client_lease_timeout_s,
+            self._client_heartbeat_interval_s,
+        ) = _client_owner_lease_settings()
         self._client_ids: set[str] = set()
+        self._client_leases: dict[str, _ClientOwnerLease] = {}
         self._detaching_client_ids: set[str] = set()
         self._detached_client_results = BoundedReplayMap[str, bool](capacity=_CLIENT_DETACH_REPLAY_CAPACITY)
-        self._client_detach_lock = asyncio.Lock()
+        self._client_detach_locks: dict[str, asyncio.Lock] = {}
+        self._expired_client_cleanup_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._client_lease_maintenance_task: asyncio.Task[Any] | None = None
+        self._client_lease_maintenance_stop: asyncio.Event | None = None
+        self._client_lease_maintenance_error = ""
+        self._client_lease_maintenance_failures = 0
         self._sessions: dict[str, _DriverSession] = {}
         self._closed_session_owners = BoundedReplayMap[str, str](capacity=_SESSION_CLOSE_REPLAY_CAPACITY)
         self._session_lock = threading.RLock()
@@ -1130,7 +1217,8 @@ class RayQueryDriverActor:
         self._query_resource_admission_dirty_queries: set[str] = set()
         self._query_resource_admission_signal_scheduled = False
         self._query_resource_admission_loop: asyncio.AbstractEventLoop | None = None
-        self._query_resource_admission_bridge_poisoned = False
+        self._query_resource_admission_fence_lock = threading.Lock()
+        self._query_resource_admission_uncertain_fences: dict[str, _AdmissionLoopFence] = {}
         self._query_resource_maintenance_task: asyncio.Task[Any] | None = None
         self._query_resource_maintenance_stop: asyncio.Event | None = None
         self._query_resource_maintenance_error = ""
@@ -1170,6 +1258,7 @@ class RayQueryDriverActor:
         # Eagerly create PlanRunner + warm up Worker workers so the
         # ~2.8s cold-start cost overlaps with GPU model loading.
         self._get_plan_runner()
+        self._start_client_lease_maintenance()
         self._start_query_resource_maintenance()
 
     def _drop_query_fragments_sync(self, query_id: str) -> None:
@@ -1279,11 +1368,10 @@ class RayQueryDriverActor:
 
             _drop_fte_registry_for_query(query_id)
         except BaseException as exc:
-            self._query_resource_admission_bridge_poisoned = True
             quiesce_errors: list[BaseException] = [*errors, exc]
             raise QueryFteRegistryQuiesceError(
                 f"local FTE registry did not quiesce for {query_id}; "
-                "driver admission bridge poisoned: "
+                "query remains fenced for retry: "
                 + "; ".join(f"{type(error).__name__}: {error}" for error in quiesce_errors)
             ) from exc
         if release_resources:
@@ -1429,25 +1517,106 @@ class RayQueryDriverActor:
         apply_duckdb_memory_limit(self._duckdb_conn, self._driver_duckdb_memory_bytes)
         return self._duckdb_conn
 
+    def _ensure_client_lease_state(self) -> None:
+        if not hasattr(self, "_client_lease_timeout_s"):
+            self._client_lease_timeout_s = _DEFAULT_CLIENT_LEASE_TIMEOUT_S
+        if not hasattr(self, "_client_heartbeat_interval_s"):
+            self._client_heartbeat_interval_s = _DEFAULT_CLIENT_HEARTBEAT_INTERVAL_S
+        if not hasattr(self, "_client_leases"):
+            self._client_leases = {}
+        if not hasattr(self, "_client_detach_locks"):
+            self._client_detach_locks = {}
+        if not hasattr(self, "_expired_client_cleanup_tasks"):
+            self._expired_client_cleanup_tasks = {}
+        # Local test shells historically populated only ``_client_ids``.
+        # Treat those owners as non-expiring unless a test installs a lease.
+        for owner_key in self._client_ids:
+            self._client_leases.setdefault(
+                owner_key,
+                _ClientOwnerLease(
+                    lease_token="",
+                    expires_at=math.inf,
+                ),
+            )
+
+    def _owner_is_active_locked(self, owner_key: str, *, now: float | None = None) -> bool:
+        self._ensure_client_lease_state()
+        lease = self._client_leases.get(owner_key)
+        if owner_key not in self._client_ids or lease is None:
+            return False
+        timestamp = time.monotonic() if now is None else float(now)
+        if lease.state in {"active", "detaching"} and timestamp >= lease.expires_at:
+            lease.state = "expired"
+            lease.next_cleanup_at = timestamp
+            self._detaching_client_ids.add(owner_key)
+        return lease.state == "active" and owner_key not in self._detaching_client_ids
+
     def _require_owner(self, owner_id: str) -> None:
         owner_key = str(owner_id).strip()
         with self._session_lock:
-            if owner_key not in self._client_ids or owner_key in self._detaching_client_ids:
+            if not self._owner_is_active_locked(owner_key):
                 raise PermissionError("Ray query runtime operation requires an attached client owner")
 
-    def attach_client(self, owner_id: str, runtime_config: dict[str, str]) -> bool:
+    def attach_client(
+        self,
+        owner_id: str,
+        runtime_config: dict[str, str],
+        lease_token: str,
+    ) -> bool:
         owner_key = str(owner_id).strip()
         if not owner_key:
             raise ValueError("Ray query runtime owner_id must not be empty")
+        token_key = str(lease_token).strip()
+        if not token_key:
+            raise ValueError("Ray query runtime lease_token must not be empty")
         normalized_config = _normalize_session_config(runtime_config)
         with self._session_lock:
+            self._ensure_client_lease_state()
             if self._driver_shutdown_started:
                 raise RayRuntimeShuttingDownError("Ray query runtime is shutting down")
             if owner_key in self._detaching_client_ids or owner_key in self._detached_client_results:
                 raise RuntimeError("Ray query runtime owner identity was already detached")
             if normalized_config != self._runtime_config:
                 raise RuntimeError("Ray query runtime configuration differs from the existing job runtime")
+            existing = self._client_leases.get(owner_key)
+            if existing is not None and existing.lease_token != token_key:
+                raise RuntimeError("Ray query runtime owner identity has a different lease generation")
+            expires_at = time.monotonic() + float(self._client_lease_timeout_s)
+            if existing is None:
+                self._client_leases[owner_key] = _ClientOwnerLease(
+                    lease_token=token_key,
+                    expires_at=expires_at,
+                )
+            else:
+                if existing.state != "active":
+                    raise RuntimeError("Ray query runtime owner lease is no longer active")
+                existing.expires_at = expires_at
             self._client_ids.add(owner_key)
+        return True
+
+    def heartbeat_client(self, owner_id: str, lease_token: str) -> bool:
+        """Renew exactly one live client generation without resurrecting it."""
+        owner_key = str(owner_id).strip()
+        token_key = str(lease_token).strip()
+        with self._session_lock:
+            self._ensure_client_lease_state()
+            lease = self._client_leases.get(owner_key)
+            if (
+                owner_key not in self._client_ids
+                or lease is None
+                or lease.lease_token != token_key
+                or lease.state == "expired"
+            ):
+                raise PermissionError("Ray query runtime client lease is no longer active")
+            timestamp = time.monotonic()
+            if lease.state in {"active", "detaching"} and timestamp >= lease.expires_at:
+                lease.state = "expired"
+                lease.next_cleanup_at = timestamp
+                self._detaching_client_ids.add(owner_key)
+                raise PermissionError("Ray query runtime client lease expired")
+            if lease.state not in {"active", "detaching"}:
+                raise PermissionError("Ray query runtime client lease is no longer active")
+            lease.expires_at = timestamp + float(self._client_lease_timeout_s)
         return True
 
     def _require_session(
@@ -1487,19 +1656,31 @@ class RayQueryDriverActor:
 
     @staticmethod
     def _begin_session_operation(session: _DriverSession, session_id: str) -> None:
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
         with session.condition:
             if session.closed:
                 raise RuntimeError(f"Vane session is closed: {session_id}")
             if session.closing:
                 raise RuntimeError(f"Vane session is closing: {session_id}")
             session.active_operations += 1
+            if current_task is not None:
+                session.active_operation_tasks.add(current_task)
 
     @staticmethod
     def _end_session_operation(session: _DriverSession) -> None:
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
         with session.condition:
             if session.active_operations <= 0:
                 raise RuntimeError("Vane session operation accounting underflow")
             session.active_operations -= 1
+            if current_task is not None:
+                session.active_operation_tasks.discard(current_task)
             session.condition.notify_all()
 
     async def open_session(self, owner_id: str, session_id: str, config: dict[str, str]) -> bool:
@@ -1510,7 +1691,7 @@ class RayQueryDriverActor:
             raise ValueError("Vane session_id must not be empty")
         normalized_config = _normalize_session_config(config)
         with self._session_lock:
-            if owner_key not in self._client_ids or owner_key in self._detaching_client_ids:
+            if not self._owner_is_active_locked(owner_key):
                 raise PermissionError("Ray query runtime operation requires an attached client owner")
             if self._driver_shutdown_started:
                 raise VaneSessionOpenRejectedError("Ray query runtime is shutting down")
@@ -1524,7 +1705,7 @@ class RayQueryDriverActor:
 
         session_connection = self._ensure_duckdb_conn().cursor()
         with self._session_lock:
-            if owner_key not in self._client_ids or owner_key in self._detaching_client_ids:
+            if not self._owner_is_active_locked(owner_key):
                 session_connection.close()
                 raise PermissionError("Ray query runtime operation requires an attached client owner")
             if bool(getattr(self, "_driver_shutdown_started")):
@@ -1567,6 +1748,28 @@ class RayQueryDriverActor:
         with self._session_lock:
             return self._driver_shutdown_complete and not self._client_ids
 
+    def runtime_lifecycle_snapshot(self, owner_id: str) -> dict[str, Any]:
+        """Return aggregate lifecycle state to an attached diagnostic caller."""
+        self._require_owner(owner_id)
+        with self._session_lock:
+            self._ensure_client_lease_state()
+            lease_states: dict[str, int] = {}
+            cleanup_errors = 0
+            for lease in self._client_leases.values():
+                lease_states[lease.state] = lease_states.get(lease.state, 0) + 1
+                cleanup_errors += bool(lease.last_cleanup_error)
+            return {
+                "client_count": len(self._client_ids),
+                "session_count": len(self._sessions),
+                "plan_count": len(self._plan_session_ids),
+                "lease_states": lease_states,
+                "cleanup_errors": cleanup_errors,
+                "lease_maintenance": {
+                    "failures": int(getattr(self, "_client_lease_maintenance_failures", 0)),
+                    "error": str(getattr(self, "_client_lease_maintenance_error", "")),
+                },
+            }
+
     async def _shutdown_runtime(self) -> None:
         """Stop background maintenance and gracefully drain every worker actor."""
         async with self._driver_shutdown_lock:
@@ -1575,6 +1778,7 @@ class RayQueryDriverActor:
             with self._plan_runner_lifecycle_lock:
                 self._driver_shutdown_started = True
                 plan_runner = self.plan_runner
+            await self.stop_client_lease_maintenance()
             await self.stop_query_resource_maintenance()
             self._ensure_query_allocation_teardown_state()
             teardown_futures = tuple(self._query_allocation_teardown_futures)
@@ -1584,39 +1788,196 @@ class RayQueryDriverActor:
                 await _to_thread_with_owned_side_effects(plan_runner.shutdown)
             self._driver_shutdown_complete = True
 
+    def _client_detach_lock_for(self, owner_key: str) -> asyncio.Lock:
+        self._ensure_client_lease_state()
+        lock = self._client_detach_locks.get(owner_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._client_detach_locks[owner_key] = lock
+        return lock
+
+    def _mark_expired_client_leases(
+        self,
+        *,
+        now: float | None = None,
+    ) -> tuple[str, ...]:
+        timestamp = time.monotonic() if now is None else float(now)
+        expired_sessions: list[_DriverSession] = []
+        with self._session_lock:
+            self._ensure_client_lease_state()
+            for owner_key in sorted(self._client_ids):
+                lease = self._client_leases[owner_key]
+                if lease.state in {"active", "detaching"} and timestamp >= lease.expires_at:
+                    lease.state = "expired"
+                    lease.next_cleanup_at = timestamp
+                    self._detaching_client_ids.add(owner_key)
+                    expired_sessions.extend(
+                        session for session in self._sessions.values() if session.owner_id == owner_key
+                    )
+            due = tuple(
+                owner_key
+                for owner_key in sorted(self._client_ids)
+                if self._client_leases[owner_key].state == "expired"
+                and self._client_leases[owner_key].next_cleanup_at <= timestamp
+                and owner_key not in self._expired_client_cleanup_tasks
+            )
+        for session in expired_sessions:
+            with session.condition:
+                session.closing = True
+        return due
+
+    def _schedule_expired_client_reclamations(self) -> None:
+        for owner_key in self._mark_expired_client_leases():
+            with self._session_lock:
+                sessions = tuple(session for session in self._sessions.values() if session.owner_id == owner_key)
+            for session in sessions:
+                with session.condition:
+                    active_operation_tasks = tuple(session.active_operation_tasks)
+                for active_operation in active_operation_tasks:
+                    active_operation.cancel()
+            task = asyncio.create_task(
+                self._detach_client_owner(owner_key, expired=True),
+                name=f"vane-expired-client-cleanup:{owner_key}",
+            )
+            self._expired_client_cleanup_tasks[owner_key] = task
+
+            def _complete(
+                completed: asyncio.Task[Any],
+                *,
+                expected_owner: str = owner_key,
+            ) -> None:
+                if self._expired_client_cleanup_tasks.get(expected_owner) is completed:
+                    self._expired_client_cleanup_tasks.pop(expected_owner, None)
+                try:
+                    completed.result()
+                except BaseException:
+                    pass
+                with self._session_lock:
+                    owner_detached = expected_owner not in self._client_ids
+                lock = self._client_detach_locks.get(expected_owner)
+                if owner_detached and lock is not None and not lock.locked():
+                    self._client_detach_locks.pop(expected_owner, None)
+
+            task.add_done_callback(_complete)
+
+    def _start_client_lease_maintenance(self) -> None:
+        task = getattr(self, "_client_lease_maintenance_task", None)
+        if task is not None and not task.done():
+            return
+        loop = asyncio.get_running_loop()
+        self._client_lease_maintenance_stop = asyncio.Event()
+        self._client_lease_maintenance_task = loop.create_task(
+            self._client_lease_maintenance_loop(),
+            name="vane-client-lease-maintenance",
+        )
+
+    async def _client_lease_maintenance_loop(self) -> None:
+        stop = self._client_lease_maintenance_stop
+        if stop is None:
+            raise RuntimeError("client lease maintenance stop event is not initialized")
+        interval = min(1.0, float(self._client_heartbeat_interval_s))
+        while not stop.is_set():
+            try:
+                self._schedule_expired_client_reclamations()
+                self._client_lease_maintenance_error = ""
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                self._client_lease_maintenance_failures += 1
+                self._client_lease_maintenance_error = f"{type(error).__name__}: {error}"
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except TimeoutError:
+                continue
+
+    async def stop_client_lease_maintenance(self) -> None:
+        stop = getattr(self, "_client_lease_maintenance_stop", None)
+        task = getattr(self, "_client_lease_maintenance_task", None)
+        if stop is not None:
+            stop.set()
+        if task is not None and task is not asyncio.current_task():
+            await task
+        self._client_lease_maintenance_task = None
+
     async def detach_client(self, owner_id: str) -> bool:
         owner_key = str(owner_id).strip()
         if not owner_key:
             raise ValueError("Ray query runtime owner_id must not be empty")
-        async with self._client_detach_lock:
+        result = await self._detach_client_owner(owner_key, expired=False)
+        lock = self._client_detach_locks.get(owner_key)
+        if lock is not None and not lock.locked():
+            self._client_detach_locks.pop(owner_key, None)
+        return result
+
+    async def _detach_client_owner(self, owner_key: str, *, expired: bool) -> bool:
+        async with self._client_detach_lock_for(owner_key):
             with self._session_lock:
                 detached_result = self._detached_client_results.get(owner_key)
                 if detached_result is not None:
                     return detached_result
                 if owner_key not in self._client_ids:
                     raise PermissionError("Ray query runtime operation requires an attached client owner")
+                lease = self._client_leases[owner_key]
+                expired_cleanup = expired or lease.state == "expired"
+                if expired and lease.state != "expired":
+                    return False
+                if not expired_cleanup:
+                    lease.state = "detaching"
                 self._detaching_client_ids.add(owner_key)
                 session_ids = [
                     session_id for session_id, session in self._sessions.items() if session.owner_id == owner_key
                 ]
             try:
                 for session_id in session_ids:
-                    await self._close_session_for_owner(owner_key, session_id)
+                    await self._close_session_for_owner(
+                        owner_key,
+                        session_id,
+                        cancel_active=expired_cleanup,
+                    )
                 with self._session_lock:
-                    self._client_ids.remove(owner_key)
-                    last_owner = not self._client_ids
+                    last_owner = len(self._client_ids) == 1
                     if last_owner:
                         with self._plan_runner_lifecycle_lock:
                             self._driver_shutdown_started = True
+                    else:
+                        self._client_ids.remove(owner_key)
                 if last_owner:
                     await self._shutdown_runtime()
-            except BaseException:
+                    with self._session_lock:
+                        self._client_ids.remove(owner_key)
+            except BaseException as error:
                 with self._session_lock:
-                    self._client_ids.add(owner_key)
-                    self._detaching_client_ids.discard(owner_key)
+                    lease = self._client_leases[owner_key]
+                    expired_cleanup = expired_cleanup or lease.state == "expired"
+                    if expired_cleanup:
+                        lease.state = "expired"
+                        lease.cleanup_attempts += 1
+                        retry_base = max(
+                            0.05,
+                            min(5.0, float(self._client_heartbeat_interval_s)),
+                        )
+                        retry_delay = min(
+                            30.0,
+                            retry_base * (2 ** min(lease.cleanup_attempts - 1, 5)),
+                        )
+                        lease.next_cleanup_at = time.monotonic() + retry_delay
+                        lease.last_cleanup_error = f"{type(error).__name__}: {error}"
+                    else:
+                        lease.state = "active"
+                        lease.expires_at = time.monotonic() + float(self._client_lease_timeout_s)
+                        lease.cleanup_attempts = 0
+                        lease.next_cleanup_at = 0.0
+                        lease.last_cleanup_error = ""
+                        self._detaching_client_ids.discard(owner_key)
+                if self._driver_shutdown_started and not self._driver_shutdown_complete:
+                    # Shutdown stops maintenance before draining the native
+                    # runner. If that drain fails, lease expiry still needs a
+                    # live reaper so an abandoned retry cannot become immortal.
+                    self._start_client_lease_maintenance()
                 raise
             with self._session_lock:
                 self._detaching_client_ids.discard(owner_key)
+                self._client_leases.pop(owner_key, None)
                 self._detached_client_results[owner_key] = last_owner
             return last_owner
 
@@ -1625,7 +1986,13 @@ class RayQueryDriverActor:
         owner_key = str(owner_id).strip()
         await self._close_session_for_owner(owner_key, session_id)
 
-    async def _close_session_for_owner(self, owner_key: str, session_id: str) -> None:
+    async def _close_session_for_owner(
+        self,
+        owner_key: str,
+        session_id: str,
+        *,
+        cancel_active: bool = False,
+    ) -> None:
         session_key = str(session_id).strip()
         if not session_key:
             raise ValueError("Vane session_id must not be empty")
@@ -1645,6 +2012,10 @@ class RayQueryDriverActor:
             if session.closed:
                 return
             session.closing = True
+            active_operation_tasks = tuple(session.active_operation_tasks)
+        if cancel_active:
+            for task in active_operation_tasks:
+                task.cancel()
 
         def _close() -> None:
             with session.condition:
@@ -2033,19 +2404,39 @@ class RayQueryDriverActor:
                 self._query_resource_admission_loop = asyncio.get_running_loop()
             except RuntimeError:
                 self._query_resource_admission_loop = None
-        if not hasattr(self, "_query_resource_admission_bridge_poisoned"):
-            self._query_resource_admission_bridge_poisoned = False
+        if not hasattr(self, "_query_resource_admission_fence_lock"):
+            self._query_resource_admission_fence_lock = threading.Lock()
+        if not hasattr(self, "_query_resource_admission_uncertain_fences"):
+            self._query_resource_admission_uncertain_fences = {}
+
+    def _settle_query_resource_admission_fence(self, query_id: str) -> None:
+        query_key = str(query_id or "").strip()
+        if not query_key:
+            raise ValueError("query admission owner-loop fence requires a query_id")
+        with self._query_resource_admission_fence_lock:
+            fence = self._query_resource_admission_uncertain_fences.get(query_key)
+            if fence is None:
+                return
+            if not fence.completed.is_set():
+                raise QueryTeardownOwnershipError(f"query admission owner-loop fence is still settling for {query_key}")
+            self._query_resource_admission_uncertain_fences.pop(query_key, None)
+        if fence.error is not None:
+            raise QueryTeardownOwnershipError(
+                f"late query admission owner-loop mutation failed for {query_key}: "
+                f"{type(fence.error).__name__}: {fence.error}"
+            ) from fence.error
 
     def _run_on_query_resource_admission_loop_sync(
         self,
         callback: Callable[[], None],
         *,
+        query_id: str,
         timeout_s: float = 30.0,
     ) -> None:
-        """Run one admission-state mutation on its owner loop with a fence."""
+        """Run one query-scoped admission mutation on its owner loop."""
         self._ensure_query_resource_admission_state()
-        if self._query_resource_admission_bridge_poisoned:
-            raise RuntimeError("query admission owner-loop fence is poisoned; restart the driver actor")
+        query_key = str(query_id or "").strip()
+        self._settle_query_resource_admission_fence(query_key)
         loop = self._query_resource_admission_loop
         try:
             running_loop = asyncio.get_running_loop()
@@ -2057,8 +2448,7 @@ class RayQueryDriverActor:
         if loop is None or loop.is_closed() or not loop.is_running():
             raise RuntimeError("query admission owner loop is not running")
 
-        completed = threading.Event()
-        error: list[BaseException] = []
+        fence = _AdmissionLoopFence()
         invocation_lock = threading.Lock()
         invocation_state = "queued"
 
@@ -2066,36 +2456,40 @@ class RayQueryDriverActor:
             nonlocal invocation_state
             with invocation_lock:
                 if invocation_state == "cancelled":
-                    completed.set()
+                    fence.completed.set()
                     return
                 invocation_state = "started"
             try:
                 callback()
             except BaseException as exc:
-                error.append(exc)
+                fence.error = exc
             finally:
                 with invocation_lock:
                     invocation_state = "finished"
-                completed.set()
+                fence.completed.set()
 
         loop.call_soon_threadsafe(invoke)
-        if not completed.wait(max(0.001, float(timeout_s))):
+        if not fence.completed.wait(max(0.001, float(timeout_s))):
             with invocation_lock:
                 if invocation_state == "queued":
                     invocation_state = "cancelled"
-                    timeout_message = "timed out waiting for query admission owner-loop fence"
+                    timeout_message = f"timed out waiting for query admission owner-loop fence for {query_key}"
                 elif invocation_state == "finished":
                     timeout_message = ""
                 else:
-                    # A started callback cannot be revoked safely. Poison the
-                    # bridge so teardown/rollback cannot continue into a new
-                    # query generation while a late mutation is possible.
-                    self._query_resource_admission_bridge_poisoned = True
-                    timeout_message = "query admission owner-loop callback started but did not finish; bridge poisoned"
+                    # A started callback cannot be revoked safely. Fence only
+                    # this query generation until the callback settles; other
+                    # queries keep using the shared actor.
+                    with self._query_resource_admission_fence_lock:
+                        self._query_resource_admission_uncertain_fences[query_key] = fence
+                    timeout_message = (
+                        f"query admission owner-loop callback started but did not finish for {query_key}; "
+                        "query generation remains fenced"
+                    )
             if timeout_message:
-                raise RuntimeError(timeout_message)
-        if error:
-            raise error[0]
+                raise QueryTeardownOwnershipError(timeout_message)
+        if fence.error is not None:
+            raise fence.error
 
     def _close_query_resource_admission(self, query_id: str) -> None:
         """Fence new requests and resolve all old requests on the owner loop."""
@@ -2149,6 +2543,7 @@ class RayQueryDriverActor:
 
         self._ensure_query_resource_admission_state()
         query_key = str(query_id)
+        self._settle_query_resource_admission_fence(query_key)
         old_state_exists = any(
             state.get("identity", {}).get("query_id") == query_key
             for table in (
@@ -3289,13 +3684,17 @@ class RayQueryDriverActor:
             self._purge_completed_query_fte_admission_pump(query_key)
             quiesce_fte_registry_for_query(query_key)
             return
-        self._run_on_query_resource_admission_loop_sync(lambda: self._close_query_resource_admission(query_key))
+        self._run_on_query_resource_admission_loop_sync(
+            lambda: self._close_query_resource_admission(query_key),
+            query_id=query_key,
+        )
         # A resource-change callback may already be draining the FTE scheduler
         # in a worker thread. Keep every fragment registry alive until that
         # drain exits; the close fence prevents another drain from starting.
         self._wait_for_query_fte_admission_pump(query_key)
         self._run_on_query_resource_admission_loop_sync(
-            lambda: self._purge_completed_query_fte_admission_pump(query_key)
+            lambda: self._purge_completed_query_fte_admission_pump(query_key),
+            query_id=query_key,
         )
         quiesce_fte_registry_for_query(query_key)
 
@@ -3691,6 +4090,7 @@ class RayQueryDriverActor:
         reason = str(getattr(self, "_query_terminal_errors", {}).get(str(query_id), ""))
         if not reason:
             return
+        primary_error = RuntimeError(reason)
         try:
             self._teardown_plan_resources(
                 plan_id,
@@ -3698,10 +4098,13 @@ class RayQueryDriverActor:
                 drop_fragments=True,
             )
         except BaseException as teardown_error:
-            raise RuntimeError(
-                f"{reason}; deterministic teardown failed: {type(teardown_error).__name__}: {teardown_error}"
-            ) from teardown_error
-        raise RuntimeError(reason)
+            aggregate_error = QueryExecutionCleanupError.from_errors(
+                f"terminal query {query_id} failed and deterministic teardown also failed",
+                primary_error,
+                [teardown_error],
+            )
+            raise aggregate_error from primary_error
+        raise primary_error
 
     def _lease_result_partition_ref(
         self,
@@ -3851,10 +4254,12 @@ class RayQueryDriverActor:
                 except asyncio.CancelledError:
                     pass
                 except BaseException as teardown_error:
-                    raise RuntimeError(
-                        f"query plan {plan_id} was cancelled during preparation and teardown failed: "
-                        f"{type(teardown_error).__name__}: {teardown_error}"
-                    ) from teardown_error
+                    aggregate_error = QueryExecutionCleanupError.from_errors(
+                        f"query plan {plan_id} was cancelled during preparation and teardown failed",
+                        cancellation_error,
+                        [teardown_error],
+                    )
+                    raise aggregate_error from cancellation_error
                 raise cancellation_error
 
             self._plan_query_ids[plan_id] = plan_id
@@ -3875,11 +4280,12 @@ class RayQueryDriverActor:
                 except asyncio.CancelledError:
                     pass
                 except BaseException as teardown_error:
-                    raise RuntimeError(
-                        f"query plan {plan_id} registration failed and teardown also failed: "
-                        f"registration={type(registration_error).__name__}: {registration_error}; "
-                        f"teardown={type(teardown_error).__name__}: {teardown_error}"
-                    ) from registration_error
+                    aggregate_error = QueryExecutionCleanupError.from_errors(
+                        f"query plan {plan_id} registration failed and teardown also failed",
+                        registration_error,
+                        [teardown_error],
+                    )
+                    raise aggregate_error from registration_error
                 raise
             self._plan_query_ids[plan_id] = str(graph.query_id)
 
@@ -3913,10 +4319,12 @@ class RayQueryDriverActor:
                     except asyncio.CancelledError:
                         pass
                     except BaseException as teardown_error:
-                        raise RuntimeError(
-                            f"query plan {plan_id} was cancelled before startup and teardown failed: "
-                            f"{type(teardown_error).__name__}: {teardown_error}"
-                        ) from teardown_error
+                        aggregate_error = QueryExecutionCleanupError.from_errors(
+                            f"query plan {plan_id} was cancelled before startup and teardown failed",
+                            cancellation_error,
+                            [teardown_error],
+                        )
+                        raise aggregate_error from cancellation_error
                 else:
                     try:
                         await asyncio.shield(startup)
@@ -3932,10 +4340,12 @@ class RayQueryDriverActor:
                     except asyncio.CancelledError:
                         pass
                     except BaseException as teardown_error:
-                        raise RuntimeError(
-                            f"query plan {plan_id} was cancelled during startup and teardown failed: "
-                            f"{type(teardown_error).__name__}: {teardown_error}"
-                        ) from teardown_error
+                        aggregate_error = QueryExecutionCleanupError.from_errors(
+                            f"query plan {plan_id} was cancelled during startup and teardown failed",
+                            cancellation_error,
+                            [teardown_error],
+                        )
+                        raise aggregate_error from cancellation_error
                 raise
         finally:
             self._end_session_operation(session)
@@ -4047,11 +4457,12 @@ class RayQueryDriverActor:
                     drop_fragments=plan_runner_started,
                 )
             except BaseException as teardown_error:
-                raise RuntimeError(
-                    f"query plan {plan_id} failed to start and teardown also failed: "
-                    f"start={type(start_error).__name__}: {start_error}; "
-                    f"teardown={type(teardown_error).__name__}: {teardown_error}"
-                ) from start_error
+                aggregate_error = QueryExecutionCleanupError.from_errors(
+                    f"query plan {plan_id} failed to start and teardown also failed",
+                    start_error,
+                    [teardown_error],
+                )
+                raise aggregate_error from start_error
             raise
 
     def _run_plan_sync_with_ownership(
@@ -4211,11 +4622,12 @@ class RayQueryDriverActor:
             if startup_tasks:
                 await asyncio.gather(*startup_tasks, return_exceptions=True)
             if teardown_error is not None:
-                raise RuntimeError(
-                    f"COPY query plan {plan_id} failed and teardown also failed: "
-                    f"execution={type(execution_error).__name__}: {execution_error}; "
-                    f"teardown={type(teardown_error).__name__}: {teardown_error}"
-                ) from execution_error
+                aggregate_error = QueryExecutionCleanupError.from_errors(
+                    f"COPY query plan {plan_id} failed and teardown also failed",
+                    execution_error,
+                    [teardown_error],
+                )
+                raise aggregate_error from execution_error
             raise
         query_id = str(graph.query_id)
         _log_copy_result_debug(query_id, result)
@@ -4242,11 +4654,12 @@ class RayQueryDriverActor:
             except asyncio.CancelledError:
                 raise progress_error
             except BaseException as teardown_error:
-                raise RuntimeError(
-                    f"COPY query plan {plan_id} progress finalization failed and teardown also failed: "
-                    f"progress={type(progress_error).__name__}: {progress_error}; "
-                    f"teardown={type(teardown_error).__name__}: {teardown_error}"
-                ) from progress_error
+                aggregate_error = QueryExecutionCleanupError.from_errors(
+                    f"COPY query plan {plan_id} progress finalization failed and teardown also failed",
+                    progress_error,
+                    [teardown_error],
+                )
+                raise aggregate_error from progress_error
             raise
         await _to_thread_with_owned_side_effects(
             self._teardown_plan_resources,
@@ -4319,13 +4732,33 @@ class RayQueryDriverActor:
         plan_id: str,
         release_owner: Any | None = None,
     ) -> RayMaterializedResult | None:
+        session = self._require_plan_session(owner_id, session_id, plan_id)
+        self._begin_session_operation(session, session_id)
+        try:
+            return await self._get_next_partition_for_session(
+                session,
+                owner_id,
+                session_id,
+                plan_id,
+                release_owner,
+            )
+        finally:
+            self._end_session_operation(session)
+
+    async def _get_next_partition_for_session(
+        self,
+        session: _DriverSession,
+        owner_id: str,
+        session_id: str,
+        plan_id: str,
+        release_owner: Any | None,
+    ) -> RayMaterializedResult | None:
         from duckdb.runners.ray.partition_metadata import (
             PartitionMetadata,
             PartitionMetadataAccessor,
             RayMaterializedResult,
         )
 
-        session = self._require_plan_session(owner_id, session_id, plan_id)
         if plan_id not in self.curr_streams:
             raise ValueError(f"Plan {plan_id} not found in DriverPlanRunner")
 
@@ -4487,6 +4920,21 @@ class RayQueryDriverClient:
 
     def __init__(self) -> None:
         self._owner_id = uuid.uuid4().hex
+        self._lease_token = uuid.uuid4().hex
+        (
+            self._client_lease_timeout_s,
+            self._client_heartbeat_interval_s,
+        ) = _client_owner_lease_settings()
+        self._client_heartbeat_rpc_timeout_s = max(
+            0.001,
+            min(
+                self._client_heartbeat_interval_s,
+                self._client_lease_timeout_s / 3.0,
+            ),
+        )
+        self._client_heartbeat_stop = threading.Event()
+        self._client_heartbeat_thread: threading.Thread | None = None
+        self._client_heartbeat_error = ""
         self._opened_sessions: dict[str, dict[str, str]] = {}
         self._uncertain_sessions: dict[str, dict[str, str]] = {}
         self._opening_session_ids: set[str] = set()
@@ -4538,7 +4986,11 @@ class RayQueryDriverClient:
             )
             self.runner = runner
             try:
-                attach_ref = runner.attach_client.remote(self._owner_id, runtime_config)
+                attach_ref = runner.attach_client.remote(
+                    self._owner_id,
+                    runtime_config,
+                    self._lease_token,
+                )
                 resolve_object_refs_blocking(
                     attach_ref,
                     timeout=300,
@@ -4565,6 +5017,91 @@ class RayQueryDriverClient:
                 if time.monotonic() >= attach_deadline:
                     raise TimeoutError("timed out waiting for the previous Ray query runtime to exit") from error
                 time.sleep(_RUNTIME_ATTACH_RETRY_INTERVAL_S)
+        self._start_client_heartbeat()
+
+    @staticmethod
+    def _client_heartbeat_worker(
+        client_ref: weakref.ReferenceType[RayQueryDriverClient],
+        stop: threading.Event,
+        interval_s: float,
+        rpc_timeout_s: float,
+    ) -> None:
+        retry_interval_s = min(
+            1.0,
+            max(0.001, interval_s / 4.0),
+        )
+        next_interval_s = interval_s
+        while not stop.wait(next_interval_s):
+            client = client_ref()
+            if client is None:
+                return
+            with client._session_condition:
+                runner = getattr(client, "runner", None)
+                owner_id = client._owner_id
+                lease_token = client._lease_token
+            if runner is None:
+                return
+            terminal = False
+            try:
+                heartbeat_ref = runner.heartbeat_client.remote(
+                    owner_id,
+                    lease_token,
+                )
+                resolve_object_refs_blocking(
+                    heartbeat_ref,
+                    timeout=rpc_timeout_s,
+                    honor_query_deadline=False,
+                )
+            except BaseException as error:
+                terminal = (
+                    _runtime_error_contains(error, PermissionError)
+                    or _runtime_actor_is_unavailable(error)
+                    or client._runtime_is_unavailable_or_replaced()
+                )
+                with client._session_condition:
+                    client._client_heartbeat_error = f"{type(error).__name__}: {error}"
+                next_interval_s = retry_interval_s
+            else:
+                with client._session_condition:
+                    client._client_heartbeat_error = ""
+                next_interval_s = interval_s
+            del client
+            if terminal:
+                return
+
+    def _start_client_heartbeat(self) -> None:
+        thread = self._client_heartbeat_thread
+        if thread is not None and thread.is_alive():
+            return
+        stop = self._client_heartbeat_stop
+        client_ref = weakref.ref(self)
+        thread = threading.Thread(
+            target=type(self)._client_heartbeat_worker,
+            args=(
+                client_ref,
+                stop,
+                float(self._client_heartbeat_interval_s),
+                float(self._client_heartbeat_rpc_timeout_s),
+            ),
+            name=f"vane-ray-client-heartbeat:{self._owner_id}",
+            daemon=True,
+        )
+        self._client_heartbeat_thread = thread
+        thread.start()
+
+    def _stop_client_heartbeat(self) -> None:
+        stop = getattr(self, "_client_heartbeat_stop", None)
+        if stop is not None:
+            stop.set()
+        thread = getattr(self, "_client_heartbeat_thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        self._client_heartbeat_thread = None
+
+    def __del__(self) -> None:
+        stop = getattr(self, "_client_heartbeat_stop", None)
+        if stop is not None:
+            stop.set()
 
     def _runtime_is_unavailable_or_replaced(self) -> bool:
         if not ray.is_initialized():
@@ -4661,6 +5198,7 @@ class RayQueryDriverClient:
             self._client_closing = False
             self._client_close_in_progress = False
             self._session_condition.notify_all()
+        self._stop_client_heartbeat()
 
     def _ensure_session(self, plan: Any) -> tuple[str, dict[str, str], Any]:
         session_id = str(plan.session_id()).strip()
@@ -4759,12 +5297,17 @@ class RayQueryDriverClient:
             while self._client_close_in_progress:
                 self._session_condition.wait()
             runner = getattr(self, "runner", None)
-            if runner is None:
-                return
-            self._client_close_in_progress = True
-            self._client_closing = True
-            while self._opening_session_ids or self._session_closes_in_progress:
-                self._session_condition.wait()
+            if runner is not None:
+                self._client_close_in_progress = True
+                self._client_closing = True
+                while self._opening_session_ids or self._session_closes_in_progress:
+                    self._session_condition.wait()
+        if runner is None:
+            self._stop_client_heartbeat()
+            return
+        # Closing is terminal intent. Stop renewal before detach so a hung
+        # cleanup is eventually escalated to the actor-side expiry reaper.
+        self._stop_client_heartbeat()
         if self._runtime_is_unavailable_or_replaced():
             self._complete_client_close_locally()
             return
@@ -4779,7 +5322,11 @@ class RayQueryDriverClient:
             if last_owner:
                 ray.kill(runner, no_restart=True)
         except BaseException as error:
-            if self._runtime_is_unavailable_or_replaced() or _runtime_actor_is_being_replaced(error):
+            if (
+                _runtime_error_contains(error, PermissionError)
+                or self._runtime_is_unavailable_or_replaced()
+                or _runtime_actor_is_being_replaced(error)
+            ):
                 self._complete_client_close_locally()
                 return
             with self._session_condition:
@@ -4880,14 +5427,16 @@ class RayQueryDriverClient:
                 plan_id=plan_id,
             )
         except BaseException as teardown_error:
-            settled_detail = (
-                "" if settled_error is None else f"; settled={type(settled_error).__name__}: {settled_error}"
+            cleanup_errors = [
+                *(() if settled_error is None else (settled_error,)),
+                teardown_error,
+            ]
+            aggregate_error = QueryExecutionCleanupError.from_errors(
+                f"Ray query plan {plan_id} failed and teardown also failed",
+                operation_error,
+                cleanup_errors,
             )
-            raise RuntimeError(
-                f"Ray query plan {plan_id} failed and teardown also failed: "
-                f"operation={type(operation_error).__name__}: {operation_error}"
-                f"{settled_detail}; teardown={type(teardown_error).__name__}: {teardown_error}"
-            ) from operation_error
+            raise aggregate_error from operation_error
 
     def stream_plan(
         self,
@@ -4938,7 +5487,8 @@ class RayQueryDriverClient:
                 if not isinstance(materialized_result, RayMaterializedResult):
                     continue
                 yield materialized_result
-        finally:
+        except BaseException as operation_error:
+            cleanup_errors: list[BaseException] = []
             try:
                 if not completed:
                     self._close_plan_after_stream(
@@ -4946,8 +5496,22 @@ class RayQueryDriverClient:
                         session_id=session_id,
                         plan_id=plan_id,
                     )
-            finally:
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            try:
                 progress.finish(final_state="FINISHED" if completed else None)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                aggregate_error = QueryExecutionCleanupError.from_errors(
+                    f"Ray query plan {plan_id} failed and cleanup also failed",
+                    operation_error,
+                    cleanup_errors,
+                )
+                raise aggregate_error from operation_error
+            raise
+        else:
+            progress.finish(final_state="FINISHED" if completed else None)
 
     def run_copy_plan(
         self,
@@ -4999,6 +5563,19 @@ class RayQueryDriverClient:
                 )
             return outcome.result
         except Exception as e:
+            cleanup_failure = next(
+                (
+                    candidate
+                    for candidate in _runtime_error_candidates(e)
+                    if isinstance(candidate, QueryExecutionCleanupError)
+                ),
+                None,
+            )
+            if cleanup_failure is not None:
+                primary_error = getattr(cleanup_failure, "primary_error", None)
+                if isinstance(primary_error, BaseException):
+                    raise cleanup_failure from primary_error
+                raise cleanup_failure
             safe_message = _safe_remote_error_message(e)
             if hasattr(e, "traceback_str") or hasattr(e, "cause"):
                 raise RuntimeError(safe_message) from None

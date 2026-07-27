@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import time
+
 import pytest
 
 try:
@@ -143,6 +145,118 @@ def test_two_connections_share_job_runtime_and_close_independently(monkeypatch, 
     )
     assert set(_collect_rows_from_parts(runner.run_iter_tables(relation_b_after_close))) == {("connection-b",)}
     connection_b.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_crashed_runtime_client_is_reclaimed_while_peer_survives(monkeypatch):
+    from duckdb.runners.ray.driver import (
+        RayQueryDriverClient,
+        _collect_vane_env_overrides,
+    )
+
+    lease_env = {
+        "VANE_RAY_CLIENT_LEASE_TIMEOUT_S": "1.0",
+        "VANE_RAY_CLIENT_HEARTBEAT_INTERVAL_S": "0.2",
+    }
+    for key, value in lease_env.items():
+        monkeypatch.setenv(key, value)
+
+    peer = RayQueryDriverClient()
+    runtime_config = _collect_vane_env_overrides()
+
+    @ray.remote
+    class _CrashOwner:
+        def __init__(self, runner, config):
+            import threading
+            import uuid
+
+            self.runner = runner
+            self.owner_id = uuid.uuid4().hex
+            self.lease_token = uuid.uuid4().hex
+            ray.get(
+                self.runner.attach_client.remote(
+                    self.owner_id,
+                    config,
+                    self.lease_token,
+                )
+            )
+            self.stop = threading.Event()
+
+            def _heartbeat():
+                while not self.stop.wait(0.2):
+                    ray.get(
+                        self.runner.heartbeat_client.remote(
+                            self.owner_id,
+                            self.lease_token,
+                        )
+                    )
+
+            self.heartbeat_thread = threading.Thread(
+                target=_heartbeat,
+                daemon=True,
+            )
+            self.heartbeat_thread.start()
+
+        def open_session(self, session_id):
+            ray.get(
+                self.runner.open_session.remote(
+                    self.owner_id,
+                    session_id,
+                    {},
+                )
+            )
+            ray.get(
+                self.runner.heartbeat_client.remote(
+                    self.owner_id,
+                    self.lease_token,
+                )
+            )
+            return {
+                "owner_id": self.owner_id,
+                "actor_id": str(self.runner._actor_id),
+            }
+
+    crashed_session_id = "crashed-runtime-client-session"
+    crash_owner = _CrashOwner.remote(peer.runner, runtime_config)
+    try:
+        crashed = ray.get(crash_owner.open_session.remote(crashed_session_id))
+        assert crashed["actor_id"] == str(peer.runner._actor_id)
+        before = ray.get(peer.runner.runtime_lifecycle_snapshot.remote(peer._owner_id))
+        assert before["client_count"] == 2
+        assert before["session_count"] == 1
+
+        ray.kill(crash_owner, no_restart=True)
+
+        deadline = time.monotonic() + 10.0
+        snapshot = before
+        while time.monotonic() < deadline:
+            snapshot = ray.get(peer.runner.runtime_lifecycle_snapshot.remote(peer._owner_id))
+            if snapshot["client_count"] == 1 and snapshot["session_count"] == 0:
+                break
+            time.sleep(0.1)
+
+        assert snapshot["client_count"] == 1
+        assert snapshot["session_count"] == 0
+        assert snapshot["plan_count"] == 0
+        assert snapshot["cleanup_errors"] == 0
+
+        survivor_session_id = "surviving-runtime-client-session"
+        assert ray.get(
+            peer.runner.open_session.remote(
+                peer._owner_id,
+                survivor_session_id,
+                {},
+            )
+        )
+        ray.get(
+            peer.runner.close_session.remote(
+                peer._owner_id,
+                survivor_session_id,
+            )
+        )
+    finally:
+        peer.close()
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
