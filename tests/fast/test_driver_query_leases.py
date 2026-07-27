@@ -1822,6 +1822,20 @@ def test_new_query_generation_reopens_admission_after_old_state_is_purged():
 
         runner_cls._close_query_resource_admission(runner, query_id)
         assert query_id in runner._query_resource_closing_queries
+        late_cancel = await runner_cls.cancel_query_output_block_lease_request(
+            runner,
+            {
+                "request_id": "request:late-old-generation-output",
+                "query_id": query_id,
+                "producer_stage_id": graph.stages[0].stage_id,
+                "task_lease_id": "lease:retired-old-generation-task",
+                "attempt_id": "attempt:retired-old-generation-task",
+                "block_id": "block:late-old-generation-output",
+                "size_bytes": 10,
+            },
+        )
+        assert late_cancel == {"cancelled": True, "released": False}
+        assert len(runner._query_output_lease_request_tombstones) == 0
         clear_query_resource_managers()
 
         manager = register_query_graph(graph, _allocation())

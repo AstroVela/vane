@@ -3470,6 +3470,8 @@ class RayQueryDriverActor:
 
         request_id, request, identity = self._parse_output_block_lease_request(payload)
         self._ensure_query_resource_admission_state()
+        if str(request.query_id) in self._query_resource_closing_queries:
+            return {"cancelled": True, "released": False}
         request_key = request_id
         tombstone = self._query_output_lease_request_tombstones.get(request_key)
         if tombstone is not None and tombstone["identity"] != identity:
