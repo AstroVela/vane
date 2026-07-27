@@ -12,7 +12,7 @@ from duckdb.datasource import video_reader
 def test_missing_decord_error_names_video_extra(monkeypatch):
     monkeypatch.setitem(sys.modules, "decord", None)
     with pytest.raises(ImportError, match=r"vane-ai\[video\]") as exc_info:
-        video_reader._open_decord_reader("nonexistent.mp4")
+        video_reader._open_decord_reader("nonexistent.mp4", width=32, height=32)
     assert "decord" in str(exc_info.value)
     assert "Linux x86-64" in str(exc_info.value)
 
