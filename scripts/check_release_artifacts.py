@@ -8,15 +8,18 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import csv
 import hashlib
 import io
+import json
 import re
 import stat
 import subprocess
 import sys
 import tarfile
 import zipfile
+from dataclasses import dataclass, field
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 from typing import Protocol
@@ -32,6 +35,7 @@ EXPECTED_NAME = str(PROJECT_METADATA["name"])
 EXPECTED_VERSION = str(PROJECT_METADATA["version"])
 MAX_ARTIFACT_BYTES = 100 * 1024 * 1024
 GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+CONTENT_RULE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 BANNED_PATH_PARTS = (
     "/.git/",
@@ -48,11 +52,6 @@ BANNED_PATH_SUFFIXES = (
     ".log",
     "/ray_data_main_old.py",
 )
-BANNED_CONTENT = (
-    b"192.168." + b"1.28",
-    b"StrongPass" + b"123!",
-)
-BANNED_TEXT_CONTENT = (b"/home/" + b"kaka/",)
 
 
 class Artifact(Protocol):
@@ -63,6 +62,27 @@ class Artifact(Protocol):
     def names(self) -> list[str]: ...
 
     def read(self, name: str) -> bytes: ...
+
+
+class ContentRule(Protocol):
+    rule_id: str
+
+    def matches(self, data: bytes) -> bool: ...
+
+
+@dataclass(frozen=True)
+class ContentMatch:
+    rule_id: str
+    member_name: str
+
+
+@dataclass(frozen=True)
+class LiteralContentRule:
+    rule_id: str
+    value: bytes = field(repr=False)
+
+    def matches(self, data: bytes) -> bool:
+        return self.value in data
 
 
 class WheelArtifact:
@@ -151,16 +171,106 @@ def _check_paths(artifact: Artifact) -> None:
             raise ValueError(f"{artifact.path}: stale release path {name}")
 
 
-def _check_internal_content(artifact: Artifact) -> None:
+def _detect_internal_content(
+    artifact: Artifact,
+    content_rules: tuple[ContentRule, ...],
+    text_content_rules: tuple[ContentRule, ...],
+) -> ContentMatch | None:
     for name in artifact.names():
         data = artifact.read(name)
-        markers = BANNED_CONTENT
-        if b"\0" not in data[:8192]:
-            markers += BANNED_TEXT_CONTENT
-        for marker in markers:
-            if marker in data:
-                value = marker.decode("utf-8", errors="replace")
-                raise ValueError(f"{artifact.path}: internal value {value!r} found in {name}")
+        for rule in content_rules:
+            if rule.matches(data):
+                return ContentMatch(rule_id=rule.rule_id, member_name=name)
+        if b"\0" in data[:8192]:
+            continue
+        for rule in text_content_rules:
+            if rule.matches(data):
+                return ContentMatch(rule_id=rule.rule_id, member_name=name)
+    return None
+
+
+def _check_internal_content(
+    artifact: Artifact,
+    content_rules: tuple[ContentRule, ...],
+    text_content_rules: tuple[ContentRule, ...],
+) -> None:
+    match = _detect_internal_content(artifact, content_rules, text_content_rules)
+    if match is not None:
+        raise ValueError(
+            f"{artifact.path}: content rule {match.rule_id!r} matched archive member {match.member_name!r}"
+        )
+
+
+def _parse_content_rule_manifest(
+    raw_manifest: str,
+    *,
+    source: str,
+) -> tuple[tuple[ContentRule, ...], tuple[ContentRule, ...]]:
+    try:
+        manifest = json.loads(raw_manifest)
+    except json.JSONDecodeError:
+        raise ValueError(f"{source}: invalid content rule manifest JSON") from None
+
+    if not isinstance(manifest, dict) or set(manifest) != {"version", "rules"}:
+        raise ValueError(f"{source}: invalid content rule manifest structure")
+    if manifest["version"] != 1:
+        raise ValueError(f"{source}: unsupported content rule manifest version")
+
+    entries = manifest["rules"]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"{source}: content rule manifest must contain at least one rule")
+
+    content_rules: list[ContentRule] = []
+    text_content_rules: list[ContentRule] = []
+    rule_ids: set[str] = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or set(entry) != {"id", "scope", "value_base64"}:
+            raise ValueError(f"{source}: invalid content rule at index {index}")
+
+        rule_id = entry["id"]
+        if not isinstance(rule_id, str) or CONTENT_RULE_ID.fullmatch(rule_id) is None:
+            raise ValueError(f"{source}: invalid content rule id at index {index}")
+        if rule_id in rule_ids:
+            raise ValueError(f"{source}: duplicate content rule id {rule_id!r}")
+        rule_ids.add(rule_id)
+
+        scope = entry["scope"]
+        if not isinstance(scope, str) or scope not in {"all", "text"}:
+            raise ValueError(f"{source}: invalid content rule scope at index {index}")
+
+        encoded_value = entry["value_base64"]
+        if not isinstance(encoded_value, str):
+            raise ValueError(f"{source}: invalid content rule value at index {index}")
+        try:
+            value = base64.b64decode(encoded_value, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError(f"{source}: invalid content rule value at index {index}") from None
+        if not value:
+            raise ValueError(f"{source}: empty content rule value at index {index}")
+
+        rule = LiteralContentRule(rule_id=rule_id, value=value)
+        if scope == "text":
+            text_content_rules.append(rule)
+        else:
+            content_rules.append(rule)
+
+    return tuple(content_rules), tuple(text_content_rules)
+
+
+def _load_content_rule_manifest(
+    source: str,
+) -> tuple[tuple[ContentRule, ...], tuple[ContentRule, ...]]:
+    if source == "-":
+        raw_manifest = sys.stdin.read()
+        source_name = "stdin"
+    else:
+        path = Path(source)
+        try:
+            raw_manifest = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            raise ValueError(f"{path}: could not read content rule manifest") from None
+        source_name = str(path)
+    return _parse_content_rule_manifest(raw_manifest, source=source_name)
 
 
 def _metadata(artifact: Artifact, suffix: str):
@@ -293,7 +403,12 @@ def _check_wheel(artifact: WheelArtifact) -> None:
     _check_wheel_record(artifact)
 
 
-def check_artifact(path: Path) -> None:
+def check_artifact(
+    path: Path,
+    *,
+    content_rules: tuple[ContentRule, ...] = (),
+    text_content_rules: tuple[ContentRule, ...] = (),
+) -> None:
     """Validate one sdist or wheel."""
     if path.stat().st_size > MAX_ARTIFACT_BYTES:
         raise ValueError(f"{path}: artifact exceeds the project's 100 MiB publication limit")
@@ -309,7 +424,7 @@ def check_artifact(path: Path) -> None:
 
     try:
         _check_paths(artifact)
-        _check_internal_content(artifact)
+        _check_internal_content(artifact, content_rules, text_content_rules)
         specific_check(artifact)
     finally:
         artifact.close()
@@ -317,11 +432,25 @@ def check_artifact(path: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--content-rules-manifest",
+        metavar="PATH",
+        help="load private exact-content rules from PATH, or from standard input with '-'",
+    )
     parser.add_argument("artifacts", nargs="+", type=Path)
     args = parser.parse_args()
 
+    content_rules: tuple[ContentRule, ...] = ()
+    text_content_rules: tuple[ContentRule, ...] = ()
+    if args.content_rules_manifest is not None:
+        content_rules, text_content_rules = _load_content_rule_manifest(args.content_rules_manifest)
+
     for artifact in args.artifacts:
-        check_artifact(artifact)
+        check_artifact(
+            artifact,
+            content_rules=content_rules,
+            text_content_rules=text_content_rules,
+        )
         print(f"validated {artifact}")
     return 0
 
