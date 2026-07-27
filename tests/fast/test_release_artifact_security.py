@@ -1,15 +1,17 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
 import io
+import json
 import secrets
 import string
+import subprocess
 import sys
 import tarfile
 import traceback
 import zipfile
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -28,13 +30,19 @@ def _runtime_path() -> bytes:
     return f"/{segment()}/{segment()}/".encode("ascii")
 
 
-@dataclass(frozen=True)
-class _RuntimeContentRule:
-    rule_id: str
-    value: bytes
-
-    def matches(self, data: bytes) -> bool:
-        return self.value in data
+def _content_rule_manifest(rule_id: str, value: bytes, *, text_only: bool) -> str:
+    return json.dumps(
+        {
+            "version": 1,
+            "rules": [
+                {
+                    "id": rule_id,
+                    "scope": "text" if text_only else "all",
+                    "value_base64": base64.b64encode(value).decode("ascii"),
+                }
+            ],
+        }
+    )
 
 
 def _write_archive(path: Path, member_name: str, data: bytes) -> None:
@@ -89,9 +97,19 @@ def content_check_only(monkeypatch):
     monkeypatch.setattr(check_release_artifacts, "_check_wheel", lambda _artifact: None)
 
 
-def test_default_configuration_has_no_public_exact_rules():
-    assert check_release_artifacts.CONTENT_RULES == ()
-    assert check_release_artifacts.TEXT_CONTENT_RULES == ()
+def test_private_manifest_rejects_empty_rule_set():
+    with pytest.raises(ValueError, match="at least one rule"):
+        check_release_artifacts._parse_content_rule_manifest(
+            '{"version": 1, "rules": []}',
+            source="runtime manifest",
+        )
+
+
+def test_literal_rule_repr_does_not_expose_value():
+    sentinel = _runtime_sentinel()
+    rule = check_release_artifacts.LiteralContentRule("runtime-sensitive-content", sentinel)
+
+    assert sentinel not in repr(rule).encode("utf-8")
 
 
 @pytest.mark.parametrize(
@@ -102,7 +120,7 @@ def test_default_configuration_has_no_public_exact_rules():
     ],
 )
 @pytest.mark.parametrize("suffix", [".tar.gz", ".whl"], ids=["sdist", "wheel"])
-def test_cli_uses_runtime_rule_source_without_exposing_match(
+def test_cli_loads_private_manifest_without_exposing_match(
     tmp_path,
     suffix,
     sentinel_factory,
@@ -114,14 +132,25 @@ def test_cli_uses_runtime_rule_source_without_exposing_match(
     sentinel = sentinel_factory()
     rule_id = "runtime-sensitive-content"
     member_name = "project/security-probe.txt"
-    rule = _RuntimeContentRule(rule_id, sentinel)
     contaminated = tmp_path / f"contaminated{suffix}"
     clean = tmp_path / f"clean{suffix}"
+    manifest = tmp_path / "content-rules.json"
     _write_archive(contaminated, member_name, b"prefix-" + sentinel + b"-suffix")
     _write_archive(clean, member_name, b"clean artifact content")
-    monkeypatch.setattr(check_release_artifacts, "CONTENT_RULES", () if text_only else (rule,))
-    monkeypatch.setattr(check_release_artifacts, "TEXT_CONTENT_RULES", (rule,) if text_only else ())
-    monkeypatch.setattr(sys, "argv", ["check_release_artifacts.py", str(contaminated)])
+    manifest.write_text(
+        _content_rule_manifest(rule_id, sentinel, text_only=text_only),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "check_release_artifacts.py",
+            "--content-rules-manifest",
+            str(manifest),
+            str(contaminated),
+        ],
+    )
 
     error = _rejected_by(check_release_artifacts.main)
 
@@ -132,11 +161,49 @@ def test_cli_uses_runtime_rule_source_without_exposing_match(
         member_name=member_name,
         capsys=capsys,
     )
-    monkeypatch.setattr(sys, "argv", ["check_release_artifacts.py", str(clean)])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "check_release_artifacts.py",
+            "--content-rules-manifest",
+            str(manifest),
+            str(clean),
+        ],
+    )
     assert check_release_artifacts.main() == 0
     captured = capsys.readouterr()
     if sentinel in (captured.out + captured.err).encode("utf-8", errors="replace"):
         pytest.fail("CLI output exposed the matched value", pytrace=False)
+
+
+@pytest.mark.parametrize("suffix", [".tar.gz", ".whl"], ids=["sdist", "wheel"])
+def test_standalone_cli_reads_private_manifest_from_stdin(tmp_path, suffix):
+    sentinel = _runtime_sentinel()
+    rule_id = "runtime-sensitive-content"
+    member_name = "project/security-probe.txt"
+    contaminated = tmp_path / f"contaminated{suffix}"
+    _write_archive(contaminated, member_name, b"prefix-" + sentinel + b"-suffix")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(check_release_artifacts.__file__).resolve()),
+            "--content-rules-manifest",
+            "-",
+            str(contaminated),
+        ],
+        input=_content_rule_manifest(rule_id, sentinel, text_only=False),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    output = (result.stdout + result.stderr).encode("utf-8", errors="replace")
+    assert rule_id.encode("ascii") in output
+    assert member_name.encode("ascii") in output
+    assert sentinel not in output
 
 
 @pytest.mark.parametrize("suffix", [".tar.gz", ".whl"], ids=["sdist", "wheel"])
@@ -149,7 +216,7 @@ def test_runtime_binary_rule_checks_members_with_nul_bytes(
     sentinel = _runtime_sentinel()
     rule_id = "runtime-binary-content"
     member_name = "project/security-probe.bin"
-    rule = _RuntimeContentRule(rule_id, sentinel)
+    rule = check_release_artifacts.LiteralContentRule(rule_id, sentinel)
     artifact = tmp_path / f"binary{suffix}"
     _write_archive(artifact, member_name, b"\0" + sentinel)
 
@@ -180,7 +247,7 @@ def test_runtime_text_rule_preserves_binary_member_filter(
     sentinel = _runtime_path()
     rule_id = "runtime-text-content"
     member_name = "project/security-probe.bin"
-    rule = _RuntimeContentRule(rule_id, sentinel)
+    rule = check_release_artifacts.LiteralContentRule(rule_id, sentinel)
     text_artifact = tmp_path / f"text{suffix}"
     binary_artifact = tmp_path / f"binary{suffix}"
     _write_archive(text_artifact, member_name, sentinel)

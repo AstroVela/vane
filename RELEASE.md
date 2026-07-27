@@ -24,6 +24,14 @@ Build from a clean checkout. The DuckDB source is part of the checkout. Release 
 - install each wheel in a fresh environment and run the Quickstart smoke test;
 - produce SHA-256 checksums, a software bill of materials, build provenance, and Sigstore signatures.
 
+Trusted `main` and release validations also load exact forbidden-content rules
+from the `RELEASE_ARTIFACT_CONTENT_RULES` GitHub secret. The secret is a JSON
+manifest with `version` set to `1`; each entry in `rules` contains a public
+`id`, a `scope` of `all` or `text`, and the exact value in `value_base64`.
+Pull-request jobs intentionally do not receive this manifest. Configure the
+secret before merging or publishing; trusted validation fails when it is
+missing.
+
 Manually inspect the archive file list. TPC-H, TPC-DS, TPC-E tools, local paths, credentials, caches, logs, model weights, and build directories must not be present.
 
 ## Stage and publish
