@@ -4363,6 +4363,108 @@ def test_fte_worker_reservation_completion_is_atomic_with_pending_drain(monkeypa
     assert [call[1]["task_id"]["partition_id"] for call in actor.fte_calls if call[0] == "create"] == [0, 1]
 
 
+@pytest.mark.parametrize("failure_point", ["bind", "enqueue"])
+def test_fte_worker_reservation_callback_failure_fails_query_and_releases_resources(
+    monkeypatch,
+    failure_point,
+):
+    query_id = f"query-reservation-callback-{failure_point}"
+    actor, handle, pending_key, pending_future = _submit_strict_worker_reservation_pending_pair(
+        monkeypatch,
+        query_id,
+    )
+    running = handle.pop_fte_result_handles(query_id)
+    assert len(running) == 1
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get(query_id)
+    assert scheduler is not None
+    failure = RuntimeError(f"planned reservation callback {failure_point} failure")
+
+    if failure_point == "bind":
+
+        def fail_completion_bind(_scheduler):
+            raise failure
+
+        monkeypatch.setattr(handle, "_bind_fte_scheduler_handlers", fail_completion_bind)
+    else:
+        original_enqueue = scheduler.enqueue
+
+        def fail_completion_enqueue(event, *, priority=False):
+            if isinstance(event, WorkerReservationCompleted):
+                raise failure
+            return original_enqueue(event, priority=priority)
+
+        monkeypatch.setattr(scheduler, "enqueue", fail_completion_enqueue)
+
+    handle.record_fte_task_terminal(running[0].task_id)
+
+    fragment_execution = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[(query_id, pending_key[1])]
+    stats = scheduler.stats()
+    assert pending_future.done() is True
+    assert pending_key not in worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS
+    assert pending_key not in worker_handle_mod._FTE_PARTITION_OWNERS
+    assert pending_key not in worker_handle_mod._FTE_PARTITION_TASK_LEASES
+    assert fragment_execution.partitions[pending_key[2]].running_attempt is None
+    assert stats.state == "FAILED"
+    assert stats.queued_events == 0
+    assert stats.failure_reason == (
+        f"FTE worker reservation failed: FTE worker reservation completion callback failed: {failure}"
+    )
+    assert [call[1]["task_id"]["partition_id"] for call in actor.fte_calls if call[0] == "create"] == [0]
+
+
+def test_fte_worker_reservation_callback_failure_ignores_replacement_generation(monkeypatch):
+    query_id = "query-reservation-callback-stale"
+    actor, handle, pending_key, old_future = _submit_strict_worker_reservation_pending_pair(
+        monkeypatch,
+        query_id,
+    )
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+
+    def fail_completion_bind(_scheduler):
+        callback_entered.set()
+        assert release_callback.wait(5.0)
+        raise RuntimeError("planned stale reservation callback failure")
+
+    monkeypatch.setattr(handle, "_bind_fte_scheduler_handlers", fail_completion_bind)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        completion = executor.submit(
+            old_future.set_result,
+            _completed_test_reservation(old_future, handle),
+        )
+        assert callback_entered.wait(5.0)
+        try:
+            with worker_handle_mod._FTE_REGISTRY_LOCK:
+                removed_future = worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS.pop(pending_key)
+                fragment_execution = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[(query_id, pending_key[1])]
+            partition = fragment_execution.partitions[pending_key[2]]
+            new_future, created = handle._fte_worker_placement_manager.request_async(
+                query_id=query_id,
+                fragment_execution_id=fragment_execution.fragment_execution_id,
+                fragment_id=pending_key[1],
+                partition_id=pending_key[2],
+                memory_requirement_bytes=partition.memory_requirement_bytes,
+                execution_class=partition.execution_class,
+                node_requirements=partition.node_requirements,
+                node_requirements_wait_started_at=partition.node_wait_started_at,
+                on_done=handle._enqueue_fte_worker_reservation_completion,
+                on_done_error=handle._handle_fte_worker_reservation_callback_error,
+            )
+        finally:
+            release_callback.set()
+        assert completion.result(timeout=5.0) is True
+
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get(query_id)
+    assert scheduler is not None
+    assert removed_future is old_future
+    assert created is True
+    assert new_future.reservation_generation == old_future.reservation_generation + 1
+    assert worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS[pending_key] is new_future
+    assert scheduler.stats().state == "RUNNING"
+    assert scheduler.stats().queued_events == 0
+    assert [call[1]["task_id"]["partition_id"] for call in actor.fte_calls if call[0] == "create"] == [0]
+
+
 def test_fte_failed_worker_reservation_blocks_concurrent_retry(monkeypatch):
     query_id = "query-reservation-failure-race"
     actor, handle, pending_key, pending_future = _submit_strict_worker_reservation_pending_pair(

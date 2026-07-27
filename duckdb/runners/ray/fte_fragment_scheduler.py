@@ -8,7 +8,7 @@ import hashlib
 import math
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from duckdb.runners.fte import (
@@ -42,8 +42,6 @@ from duckdb.runners.ray.fte_scheduler_config import (
 from duckdb.runners.ray.ray_env import collect_vane_env_overrides
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from duckdb.runners.fte import FteFragmentExecution, NodeRequirements
     from duckdb.runners.ray.fragment_worker_client import RayWorkerActorHandle
 
@@ -1764,6 +1762,17 @@ class FteWorkerReservation:
         self.attempt_id = str(attempt_id)
 
 
+_FteWorkerReservationDoneCallback = Callable[["FteWorkerReservationFuture"], None]
+_FteWorkerReservationCallbackErrorHandler = Callable[
+    ["FteWorkerReservationFuture", BaseException],
+    None,
+]
+_FteWorkerReservationCallback = tuple[
+    _FteWorkerReservationDoneCallback,
+    _FteWorkerReservationCallbackErrorHandler | None,
+]
+
+
 class FteWorkerReservationFuture:
     def __init__(
         self,
@@ -1794,7 +1803,7 @@ class FteWorkerReservationFuture:
         self._cancelled = False
         self._result: FteWorkerReservation | None = None
         self._exception: BaseException | None = None
-        self._callbacks: list[Callable[[FteWorkerReservationFuture], None]] = []
+        self._callbacks: list[_FteWorkerReservationCallback] = []
 
     def done(self) -> bool:
         with self._lock:
@@ -1824,15 +1833,21 @@ class FteWorkerReservationFuture:
         with self._lock:
             self.blocked_reason = str(blocked_reason or "")
 
-    def add_done_callback(self, callback: Callable[[FteWorkerReservationFuture], None]) -> None:
+    def add_done_callback(
+        self,
+        callback: _FteWorkerReservationDoneCallback,
+        *,
+        on_error: _FteWorkerReservationCallbackErrorHandler | None = None,
+    ) -> None:
+        registered_callback = (callback, on_error)
         run_now = False
         with self._lock:
             if self._done:
                 run_now = True
             else:
-                self._callbacks.append(callback)
+                self._callbacks.append(registered_callback)
         if run_now:
-            self._run_callback(callback)
+            self._run_callback(*registered_callback)
 
     def set_result(self, reservation: FteWorkerReservation) -> bool:
         callbacks = self._complete(result=reservation)
@@ -1855,7 +1870,7 @@ class FteWorkerReservationFuture:
         result: FteWorkerReservation | None = None,
         exception: BaseException | None = None,
         cancelled: bool = False,
-    ) -> list[Callable[[FteWorkerReservationFuture], None]]:
+    ) -> list[_FteWorkerReservationCallback]:
         with self._lock:
             if self._done:
                 return []
@@ -1867,15 +1882,24 @@ class FteWorkerReservationFuture:
             self._callbacks.clear()
         return callbacks
 
-    def _run_callbacks(self, callbacks: list[Callable[[FteWorkerReservationFuture], None]]) -> None:
-        for callback in callbacks:
-            self._run_callback(callback)
+    def _run_callbacks(
+        self,
+        callbacks: list[_FteWorkerReservationCallback],
+    ) -> None:
+        for callback, on_error in callbacks:
+            self._run_callback(callback, on_error)
 
-    def _run_callback(self, callback: Callable[[FteWorkerReservationFuture], None]) -> None:
+    def _run_callback(
+        self,
+        callback: _FteWorkerReservationDoneCallback,
+        on_error: _FteWorkerReservationCallbackErrorHandler | None,
+    ) -> None:
         try:
             callback(self)
-        except Exception:
-            pass
+        except Exception as exc:
+            if on_error is None:
+                raise
+            on_error(self, exc)
 
 
 def _fte_partition_owner(query_id: str, fragment_id: str, partition_id: int) -> Any | None:
@@ -1898,7 +1922,8 @@ class FteWorkerPlacementManager:
         execution_class: FteTaskExecutionClass | str | None = None,
         node_requirements: NodeRequirements | Mapping[str, Any] | None = None,
         node_requirements_wait_started_at: float | None = None,
-        on_done: Callable[[FteWorkerReservationFuture], None] | None = None,
+        on_done: _FteWorkerReservationDoneCallback | None = None,
+        on_done_error: _FteWorkerReservationCallbackErrorHandler | None = None,
     ) -> tuple[FteWorkerReservationFuture, bool]:
         query_id = str(query_id)
         fragment_id = str(fragment_id)
@@ -1925,7 +1950,7 @@ class FteWorkerPlacementManager:
             )
             _FTE_PENDING_WORKER_RESERVATIONS[key] = future
         if on_done is not None:
-            future.add_done_callback(on_done)
+            future.add_done_callback(on_done, on_error=on_done_error)
         return future, True
 
     def acquire(
