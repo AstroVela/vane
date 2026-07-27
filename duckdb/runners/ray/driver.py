@@ -3047,6 +3047,29 @@ class RayQueryDriverActor:
         values["request_id"] = request_id
         return values
 
+    def _parse_output_block_lease_request(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[str, Any, dict[str, Any]]:
+        from duckdb.runners.ray.query_resource_manager import OutputBlockRequest
+
+        values = self._strict_lease_request(
+            payload,
+            fields={
+                "request_id",
+                "query_id",
+                "producer_stage_id",
+                "task_lease_id",
+                "attempt_id",
+                "block_id",
+                "size_bytes",
+            },
+            kind="output block",
+        )
+        request_id = values.pop("request_id")
+        request = OutputBlockRequest(**values)
+        return request_id, request, asdict(request)
+
     async def acquire_query_task_lease(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Resolve one task lease through the query's serialized admission pump."""
         from duckdb.runners.ray.query_resource_manager import TaskGrant, TaskRequest
@@ -3286,25 +3309,10 @@ class RayQueryDriverActor:
 
     async def acquire_query_output_block_lease(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Resolve one produced block through the query's admission pump."""
-        from duckdb.runners.ray.query_resource_manager import OutputBlockGrant, OutputBlockRequest
+        from duckdb.runners.ray.query_resource_manager import OutputBlockGrant
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
-        values = self._strict_lease_request(
-            payload,
-            fields={
-                "request_id",
-                "query_id",
-                "producer_stage_id",
-                "task_lease_id",
-                "attempt_id",
-                "block_id",
-                "size_bytes",
-            },
-            kind="output block",
-        )
-        request_id = values.pop("request_id")
-        request = OutputBlockRequest(**values)
-        identity = asdict(request)
+        request_id, request, identity = self._parse_output_block_lease_request(payload)
         self._ensure_query_resource_admission_state()
         if str(request.query_id) in self._query_resource_closing_queries:
             return self._grant_payload(
@@ -3456,17 +3464,23 @@ class RayQueryDriverActor:
         self._run_query_resource_admission_pumps(lease["query_id"])
         return {"released": bool(released)}
 
-    async def cancel_query_output_block_lease_request(self, request_id: str) -> dict[str, Any]:
+    async def cancel_query_output_block_lease_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         from duckdb.runners.ray.query_resource_manager import OutputBlockGrant
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
+        request_id, request, identity = self._parse_output_block_lease_request(payload)
         self._ensure_query_resource_admission_state()
-        request_key = str(request_id)
+        if str(request.query_id) in self._query_resource_closing_queries:
+            return {"cancelled": True, "released": False}
+        request_key = request_id
+        tombstone = self._query_output_lease_request_tombstones.get(request_key)
+        if tombstone is not None and tombstone["identity"] != identity:
+            raise ValueError(f"output lease request_id reused with different identity: {request_key}")
+        if tombstone is not None:
+            return {"cancelled": True, "released": False}
         state = self._query_output_lease_requests.get(request_key)
-        if state is None:
-            if request_key in self._query_output_lease_request_tombstones:
-                return {"cancelled": True, "released": False}
-            return {"cancelled": False, "released": False}
+        if state is not None and state["identity"] != identity:
+            raise ValueError(f"output lease request_id reused with different identity: {request_key}")
         denial = self._grant_payload(
             OutputBlockGrant(
                 False,
@@ -3474,6 +3488,29 @@ class RayQueryDriverActor:
                 fatal=True,
             )
         )
+        if state is None:
+            resource_identity = (
+                str(identity["query_id"]),
+                str(identity["block_id"]),
+            )
+            conflicting_owner = self._query_output_request_owner_by_identity.get(resource_identity)
+            if conflicting_owner is not None:
+                raise ValueError(
+                    "output block is already owned by request_id "
+                    f"{conflicting_owner}: query_id={request.query_id} "
+                    f"block_id={request.block_id}"
+                )
+            try:
+                get_query_resource_manager(request.query_id).mark_output_block_terminal(request.block_id)
+            except KeyError:
+                pass
+            self._query_output_lease_request_tombstones[request_key] = {
+                "identity": identity,
+                "status": "cancelled",
+                "result": denial,
+            }
+            self._run_query_resource_admission_pumps(request.query_id)
+            return {"cancelled": True, "released": False}
         lease = state.get("lease")
         released = False
         if lease is not None:

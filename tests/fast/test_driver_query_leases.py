@@ -441,7 +441,7 @@ def test_driver_pending_output_waiter_is_live_and_cancel_cleanup_is_complete():
 
         assert await runner_cls.cancel_query_output_block_lease_request(
             runner,
-            output_request["request_id"],
+            output_request,
         ) == {"cancelled": True, "released": False}
         denial = await asyncio.wait_for(pending, timeout=1)
         assert denial["blocked_reason"] == "output_lease_request_cancelled"
@@ -458,6 +458,124 @@ def test_driver_pending_output_waiter_is_live_and_cancel_cleanup_is_complete():
             task["lease"]["lease_id"],
             task["lease"]["attempt_id"],
         )
+
+    asyncio.run(scenario())
+
+
+def test_driver_output_cancel_before_acquire_is_durable_and_restores_budget():
+    async def scenario():
+        query_id = "query-output-pre-cancel"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_graph(
+            graph,
+            _allocation(),
+            on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
+        )
+        stage_id = graph.stages[0].stage_id
+        manager.update_stage_state(stage_id, runnable=True)
+        task_request = _task_request(query_id, "request:task", "task:pre-cancel-output")
+        task = await runner_cls.acquire_query_task_lease(runner, task_request)
+        output_request = {
+            "request_id": "request:pre-cancel-output",
+            "query_id": query_id,
+            "producer_stage_id": stage_id,
+            "task_lease_id": task["lease"]["lease_id"],
+            "attempt_id": task["lease"]["attempt_id"],
+            "block_id": "block:pre-cancel-output",
+            "size_bytes": 10,
+        }
+        baseline = manager.snapshot()
+
+        assert await runner_cls.cancel_query_output_block_lease_request(
+            runner,
+            output_request,
+        ) == {"cancelled": True, "released": False}
+        denial = await runner_cls.acquire_query_output_block_lease(
+            runner,
+            output_request,
+        )
+
+        assert denial["granted"] is False
+        assert denial["fatal"] is True
+        assert denial["blocked_reason"] == "output_lease_request_cancelled"
+        snapshot = manager.snapshot()
+        assert snapshot["output_leases"] == baseline["output_leases"]
+        assert (
+            snapshot["stages"][stage_id]["pending_output_count"] == baseline["stages"][stage_id]["pending_output_count"]
+        )
+        assert (
+            snapshot["stages"][stage_id]["queued_output_bytes"] == baseline["stages"][stage_id]["queued_output_bytes"]
+        )
+
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            task["lease"]["lease_id"],
+            task["lease"]["attempt_id"],
+        ) == {"released": True}
+
+    asyncio.run(scenario())
+
+
+def test_driver_output_cancel_after_grant_releases_late_lease_and_restores_budget():
+    async def scenario():
+        query_id = "query-output-late-grant-cancel"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_graph(
+            graph,
+            _allocation(),
+            on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
+        )
+        stage_id = graph.stages[0].stage_id
+        manager.update_stage_state(stage_id, runnable=True)
+        task_request = _task_request(query_id, "request:task", "task:late-grant-output")
+        task = await runner_cls.acquire_query_task_lease(runner, task_request)
+        output_request = {
+            "request_id": "request:late-grant-output",
+            "query_id": query_id,
+            "producer_stage_id": stage_id,
+            "task_lease_id": task["lease"]["lease_id"],
+            "attempt_id": task["lease"]["attempt_id"],
+            "block_id": "block:late-grant-output",
+            "size_bytes": 10,
+        }
+        baseline = manager.snapshot()
+
+        grant = await runner_cls.acquire_query_output_block_lease(
+            runner,
+            output_request,
+        )
+        assert grant["granted"] is True
+        assert manager.snapshot()["output_leases"]
+
+        assert await runner_cls.cancel_query_output_block_lease_request(
+            runner,
+            output_request,
+        ) == {"cancelled": True, "released": True}
+
+        snapshot = manager.snapshot()
+        assert snapshot["output_leases"] == baseline["output_leases"]
+        assert (
+            snapshot["stages"][stage_id]["pending_output_count"] == baseline["stages"][stage_id]["pending_output_count"]
+        )
+        assert (
+            snapshot["stages"][stage_id]["queued_output_bytes"] == baseline["stages"][stage_id]["queued_output_bytes"]
+        )
+        replay = await runner_cls.acquire_query_output_block_lease(
+            runner,
+            output_request,
+        )
+        assert replay["granted"] is False
+        assert replay["blocked_reason"] == "output_lease_request_cancelled"
+
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            task["lease"]["lease_id"],
+            task["lease"]["attempt_id"],
+        ) == {"released": True}
 
     asyncio.run(scenario())
 
@@ -541,7 +659,7 @@ def test_driver_output_pump_evaluates_each_waiter_once_per_state_transition():
                 continue
             assert await runner_cls.cancel_query_output_block_lease_request(
                 runner,
-                request["request_id"],
+                request,
             ) == {"cancelled": True, "released": False}
         results = await asyncio.gather(*output_tasks)
         for request, result in zip(output_requests, results):
@@ -675,7 +793,7 @@ def test_output_block_rejects_a_second_request_id_instead_of_orphaning_future():
 
         assert await runner_cls.cancel_query_output_block_lease_request(
             runner,
-            first_request["request_id"],
+            first_request,
         ) == {"cancelled": True, "released": False}
         denial = await first_waiter
         assert denial["blocked_reason"] == "output_lease_request_cancelled"
@@ -1704,6 +1822,20 @@ def test_new_query_generation_reopens_admission_after_old_state_is_purged():
 
         runner_cls._close_query_resource_admission(runner, query_id)
         assert query_id in runner._query_resource_closing_queries
+        late_cancel = await runner_cls.cancel_query_output_block_lease_request(
+            runner,
+            {
+                "request_id": "request:late-old-generation-output",
+                "query_id": query_id,
+                "producer_stage_id": graph.stages[0].stage_id,
+                "task_lease_id": "lease:retired-old-generation-task",
+                "attempt_id": "attempt:retired-old-generation-task",
+                "block_id": "block:late-old-generation-output",
+                "size_bytes": 10,
+            },
+        )
+        assert late_cancel == {"cancelled": True, "released": False}
+        assert len(runner._query_output_lease_request_tombstones) == 0
         clear_query_resource_managers()
 
         manager = register_query_graph(graph, _allocation())
