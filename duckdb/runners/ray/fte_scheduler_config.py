@@ -125,15 +125,3 @@ def _fte_retry_delay_scale_factor() -> float:
         return max(1.0, float(raw))
     except (TypeError, ValueError):
         return 2.0
-
-
-def _chaos_host_loss_worker_indices() -> set[str]:
-    if os.getenv("VANE_FTE_CHAOS_FAIL_HOST_ON_WORKER_LOSS", "").strip().lower() in (
-        "",
-        "0",
-        "false",
-        "no",
-        "off",
-    ):
-        return set()
-    return {index.strip() for index in os.getenv("VANE_FTE_CHAOS_KILL_WORKER_INDEX", "").split(",") if index.strip()}

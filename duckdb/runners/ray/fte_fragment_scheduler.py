@@ -32,7 +32,6 @@ from duckdb.runners.ray.fragment_worker_waiters import (
     release_fte_query_task_waiters,
 )
 from duckdb.runners.ray.fte_scheduler_config import (
-    _chaos_host_loss_worker_indices,
     _fte_control_rpc_timeout_s,
     _fte_exhausted_node_wait_period_s,
     _fte_retry_delay_scale_factor,
@@ -2239,9 +2238,7 @@ def _mark_fte_worker_failed(
     if query_id_filter is not None:
         query_id_filter = str(query_id_filter)
     failed_worker_ids = (
-        {str(item) for item in failed_worker_ids_override}
-        if failed_worker_ids_override is not None
-        else _expanded_fte_failed_worker_ids(worker_id)
+        {str(item) for item in failed_worker_ids_override} if failed_worker_ids_override is not None else {worker_id}
     )
     handles_to_kill: list[RayWorkerActorHandle] = []
     pending_worker_reservation_futures_to_cancel: list[FteWorkerReservationFuture] = []
@@ -2353,22 +2350,6 @@ def _mark_fte_worker_failed(
             if scheduled:
                 scheduled_by_stage.append((query_id, fragment_id, scheduled, []))
     return scheduled_by_stage
-
-
-def _expanded_fte_failed_worker_ids(worker_id: str) -> set[str]:
-    worker_id = str(worker_id or "")
-    if not worker_id:
-        return set()
-    host_id, worker_index = _worker_id_host_and_index(worker_id)
-    failed_worker_ids = {worker_id}
-    chaos_host_indices = _chaos_host_loss_worker_indices()
-    if chaos_host_indices and (not worker_index or worker_index in chaos_host_indices):
-        with _FTE_REGISTRY_LOCK:
-            for candidate_worker_id in _FTE_WORKER_HANDLES:
-                candidate_host_id, candidate_index = _worker_id_host_and_index(candidate_worker_id)
-                if candidate_host_id == host_id and candidate_index in chaos_host_indices:
-                    failed_worker_ids.add(str(candidate_worker_id))
-    return failed_worker_ids
 
 
 def _collect_vane_env_overrides() -> dict[str, str]:

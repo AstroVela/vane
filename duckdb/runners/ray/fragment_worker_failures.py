@@ -12,7 +12,6 @@ from duckdb.runners.ray.fragment_registry import (
     _FTE_WORKER_HANDLES,
 )
 from duckdb.runners.ray.fte_fragment_scheduler import (
-    _expanded_fte_failed_worker_ids,
     _fte_retry_remaining_delay_s,
     _mark_fte_worker_failed,
 )
@@ -21,7 +20,8 @@ from duckdb.runners.ray.fte_fragment_scheduler import (
 def quarantine_fte_worker(worker_id: str) -> frozenset[str]:
     """Make a failed worker ineligible before per-query reconciliation."""
 
-    failed_worker_ids = frozenset(_expanded_fte_failed_worker_ids(worker_id))
+    worker_id = str(worker_id or "")
+    failed_worker_ids = frozenset({worker_id}) if worker_id else frozenset()
     with _FTE_REGISTRY_LOCK:
         for failed_worker_id in failed_worker_ids:
             handle = _FTE_WORKER_HANDLES.get(failed_worker_id)
