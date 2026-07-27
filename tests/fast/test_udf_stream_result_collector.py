@@ -191,6 +191,20 @@ class _RemoteMethod:
         return _Ref(self.fn(*args, **kwargs))
 
 
+class _BlockingRemoteMethod(_RemoteMethod):
+    def __init__(self, fn):
+        super().__init__(fn)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def remote(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        self.started.set()
+        if not self.release.wait(timeout=2.0):
+            raise TimeoutError("timed out waiting to release blocked remote call")
+        return _Ref(self.fn(*args, **kwargs))
+
+
 class _Driver:
     def __init__(self):
         self.next_task = 0
@@ -438,6 +452,48 @@ def test_metadata_transition_is_atomic_with_concurrent_capacity_refresh(
         assert [item[2] for item in events] == ["data", "complete"]
     finally:
         allow_transition.set()
+        collector.shutdown()
+
+
+def test_slot_cancel_fences_output_lease_acquire_before_ref_publication():
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    acquire = _BlockingRemoteMethod(driver._acquire_output)
+    driver.acquire_query_output_block_lease = acquire
+
+    def submitter(lease):
+        return _Generator(
+            [_Ref("block", is_block=True), _Ref(_metadata(lease))],
+            completed=False,
+        )
+
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector.track_generator_ref(
+        2,
+        24,
+        _source(
+            fake_ray,
+            driver,
+            request_id="cancel-during-output-acquire",
+            submitter=submitter,
+        ),
+    )
+    try:
+        collector.drain_results({2: {"rows": 1, "bytes": 128, "item_bytes": 128}})
+        assert acquire.started.wait(timeout=2.0)
+
+        collector.cancel_slot(2)
+        acquire.release.set()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not driver.cancel_query_output_block_lease_request.calls:
+            time.sleep(0.005)
+
+        assert len(driver.cancel_query_output_block_lease_request.calls) == 1
+        assert driver.cancel_query_output_block_lease_request.calls[0] == acquire.calls[0]
+        assert collector.slot_has_pending(2) is False
+    finally:
+        acquire.release.set()
         collector.shutdown()
 
 

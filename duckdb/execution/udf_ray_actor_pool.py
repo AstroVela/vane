@@ -512,12 +512,12 @@ def _create_actor_pools_for_nodes(
                 },
             }
 
-            stateful_options: dict[str, int] = {}
+            fault_tolerance_options: dict[str, int] = {}
+            if payload.get("side_effects"):
+                fault_tolerance_options["max_task_retries"] = 0
             if payload.get("stateful"):
-                stateful_options = {
-                    "max_restarts": 0,
-                    "max_task_retries": 0,
-                }
+                fault_tolerance_options["max_restarts"] = 0
+                fault_tolerance_options["max_task_retries"] = 0
 
             actors_obj = actor_pool_cls(
                 payload=payload,
@@ -525,7 +525,7 @@ def _create_actor_pools_for_nodes(
                 gpus_per_actor=gpus,
                 actor_node_ids=list(assigned_node_ids),
                 ray_options=ray_options,
-                **stateful_options,
+                **fault_tolerance_options,
             )
             created.append(actors_obj)
             if wait_for_ready:

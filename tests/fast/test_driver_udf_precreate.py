@@ -872,6 +872,64 @@ def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_
     ]
 
 
+def test_ensure_actor_pools_for_plan_disables_retries_for_side_effecting_udf(monkeypatch):
+    import duckdb.execution.udf_ray as udf_ray
+    from duckdb.execution.udf_ray_config import MAX_ACTOR_RESTARTS
+
+    calls = []
+
+    class _FakeUDFActorPool:
+        def __init__(
+            self,
+            *,
+            payload,
+            concurrency,
+            gpus_per_actor,
+            actor_node_ids,
+            ray_options=None,
+            max_restarts=MAX_ACTOR_RESTARTS,
+            max_task_retries=None,
+        ):
+            calls.append((max_restarts, max_task_retries))
+            self.actors = ["side-effecting-actor"]
+            self._init_refs = []
+            self._confirmed_ready = set()
+
+    fake_ray = types.ModuleType("ray")
+    fake_ray.is_initialized = lambda: True
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setattr(udf_ray, "_is_vane_worker_process", lambda: False)
+    monkeypatch.setattr(udf_ray, "UDFActorPool", _FakeUDFActorPool)
+
+    plan = _FakePlan(
+        [
+            {
+                "node_id": 8,
+                "actor_pool_size": 1,
+                "gpus": 0.0,
+                "payload": {
+                    "udf_name": "external_counter",
+                    "execution_backend": "ray_actor",
+                    "stateful": False,
+                    "side_effects": True,
+                    "stage_id": "stage:test:side-effects",
+                },
+            }
+        ]
+    )
+
+    created, _ = udf_ray.ensure_actor_pools_for_plan(
+        plan,
+        actor_node_ids_by_stage={"stage:test:side-effects": ("node-a",)},
+        query_driver_handle=object(),
+        session_config={},
+        conn=object(),
+    )
+
+    assert len(created) == 1
+    assert calls == [(MAX_ACTOR_RESTARTS, 0)]
+
+
 @pytest.mark.parametrize(
     "payload",
     [

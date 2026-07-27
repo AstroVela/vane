@@ -97,7 +97,9 @@ class _StreamRecord:
     metadata: dict[str, Any] | None = None
     block_item_capacity_bytes: int | None = None
     output_request_id: str = ""
+    output_request: dict[str, Any] | None = None
     output_lease_ref: Any | None = None
+    output_cancel_sent: bool = False
     producer_completed: bool = False
     terminal: bool = False
     error_context: dict[str, Any] | None = None
@@ -659,23 +661,36 @@ class AsyncResultCollector:
         if driver is None:
             raise RuntimeError("Ray UDF stream has no query resource driver")
         request_id = f"output-request:{validated['block_id']}"
-        record.metadata = validated
-        record.output_request_id = request_id
-        record.output_lease_ref = driver.acquire_query_output_block_lease.remote(
-            {
-                "request_id": request_id,
-                "query_id": validated["query_id"],
-                "producer_stage_id": validated["producer_stage_id"],
-                "task_lease_id": validated["task_lease_id"],
-                "attempt_id": validated["attempt_id"],
-                "block_id": validated["block_id"],
-                "size_bytes": validated["size_bytes"],
-            }
-        )
+        request = {
+            "request_id": request_id,
+            "query_id": validated["query_id"],
+            "producer_stage_id": validated["producer_stage_id"],
+            "task_lease_id": validated["task_lease_id"],
+            "attempt_id": validated["attempt_id"],
+            "block_id": validated["block_id"],
+            "size_bytes": validated["size_bytes"],
+        }
         # Metadata is already consumed at this point.  Keep output admission as
         # its own state so producer completion cannot mistake a drained stream
         # for a block whose metadata never arrived.
-        record.phase = "output_lease"
+        key = (record.slot_id, record.submit_id)
+        with self._cv:
+            if self._shutdown or self._records.get(key) is not record or record.terminal:
+                return
+            record.metadata = validated
+            record.output_request_id = request_id
+            record.output_request = request
+            record.output_cancel_sent = False
+            record.phase = "output_lease"
+
+        output_lease_ref = driver.acquire_query_output_block_lease.remote(request)
+        with self._cv:
+            stale = self._shutdown or self._records.get(key) is not record or record.terminal
+            if not stale:
+                record.output_lease_ref = output_lease_ref
+        if stale:
+            self._cancel_record_control(record)
+            return
         _collector_debug_log("output_lease_requested", record)
 
     @staticmethod
@@ -750,7 +765,9 @@ class AsyncResultCollector:
                 record.metadata = None
                 record.block_item_capacity_bytes = None
                 record.output_request_id = ""
+                record.output_request = None
                 record.output_lease_ref = None
+                record.output_cancel_sent = False
                 self._cv.notify_all()
         if stale:
             driver.release_query_output_block_lease.remote(
@@ -781,11 +798,13 @@ class AsyncResultCollector:
         self._notify_wakeup()
 
     def _cancel_record_control(self, record: _StreamRecord) -> None:
-        if record.output_lease_ref is None or not record.output_request_id:
-            return
-        driver = record.adapter.driver
-        if driver is not None:
-            driver.cancel_query_output_block_lease_request.remote(record.output_request_id)
+        with self._cv:
+            request = record.output_request
+            driver = record.adapter.driver
+            if request is None or driver is None or record.output_cancel_sent:
+                return
+            record.output_cancel_sent = True
+        driver.cancel_query_output_block_lease_request.remote(request)
 
     def _fail_record(self, record: _StreamRecord, exc: BaseException) -> None:
         exc = format_stateful_actor_loss(record.error_context, exc)
