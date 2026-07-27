@@ -8,6 +8,7 @@ import os
 import threading
 import time
 import uuid
+import weakref
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from pathlib import Path
@@ -195,6 +196,13 @@ class _FakeConnection:
 
 
 def _initialize_test_query_driver_client(client, opened_sessions=None):
+    client._lease_token = "test-client-lease-token"
+    client._client_lease_timeout_s = 60.0
+    client._client_heartbeat_interval_s = 10.0
+    client._client_heartbeat_rpc_timeout_s = 10.0
+    client._client_heartbeat_stop = threading.Event()
+    client._client_heartbeat_thread = None
+    client._client_heartbeat_error = ""
     client._opened_sessions = dict(opened_sessions or {})
     client._uncertain_sessions = {}
     client._opening_session_ids = set()
@@ -221,10 +229,24 @@ def _make_local_query_driver_actor():
     runner._active_vllm_actors_by_plan = {}
     runner._plan_runner_lifecycle_lock = threading.RLock()
     runner._driver_shutdown_started = False
+    runner._driver_shutdown_complete = False
     runner._client_ids = {_TEST_RUNTIME_OWNER_ID}
+    runner._client_lease_timeout_s = 60.0
+    runner._client_heartbeat_interval_s = 10.0
+    runner._client_leases = {
+        _TEST_RUNTIME_OWNER_ID: driver._ClientOwnerLease(
+            lease_token="test-owner-lease-token",
+            expires_at=float("inf"),
+        )
+    }
     runner._detaching_client_ids = set()
     runner._detached_client_results = driver.BoundedReplayMap(capacity=65_536)
-    runner._client_detach_lock = asyncio.Lock()
+    runner._client_detach_locks = {}
+    runner._expired_client_cleanup_tasks = {}
+    runner._client_lease_maintenance_task = None
+    runner._client_lease_maintenance_stop = None
+    runner._client_lease_maintenance_error = ""
+    runner._client_lease_maintenance_failures = 0
     runner._session_lock = threading.RLock()
     runner._closed_session_owners = driver.BoundedReplayMap(capacity=65_536)
     runner._plan_session_ids = {}
@@ -288,6 +310,40 @@ def test_driver_connection_applies_duckdb_execution_width(monkeypatch):
     assert statements == ["SET threads=7"]
 
 
+@pytest.mark.parametrize(
+    ("lease_timeout", "heartbeat_interval", "message"),
+    [
+        ("0", "0.1", "LEASE_TIMEOUT"),
+        ("nan", "0.1", "LEASE_TIMEOUT"),
+        ("3", "0", "HEARTBEAT_INTERVAL"),
+        ("3", "1.1", "one third"),
+    ],
+)
+def test_client_owner_lease_settings_reject_unsafe_values(
+    monkeypatch,
+    lease_timeout,
+    heartbeat_interval,
+    message,
+):
+    monkeypatch.setenv("VANE_RAY_CLIENT_LEASE_TIMEOUT_S", lease_timeout)
+    monkeypatch.setenv(
+        "VANE_RAY_CLIENT_HEARTBEAT_INTERVAL_S",
+        heartbeat_interval,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        driver._client_owner_lease_settings()
+
+
+def test_client_owner_lease_settings_accept_one_third_heartbeat_interval(
+    monkeypatch,
+):
+    monkeypatch.setenv("VANE_RAY_CLIENT_LEASE_TIMEOUT_S", "30")
+    monkeypatch.setenv("VANE_RAY_CLIENT_HEARTBEAT_INTERVAL_S", "10")
+
+    assert driver._client_owner_lease_settings() == (30.0, 10.0)
+
+
 def test_driver_constructor_scrubs_inherited_session_environment(monkeypatch):
     cls = driver.RayQueryDriverActor.__ray_metadata__.modified_class
     monkeypatch.setenv("AWS_ISSUE75_INHERITED_SECRET", "inherited-aws")
@@ -305,6 +361,7 @@ def test_driver_constructor_scrubs_inherited_session_environment(monkeypatch):
     monkeypatch.setattr(cls, "_create_query_resource_coordinator", lambda _self: object())
     monkeypatch.setattr(cls, "_ensure_duckdb_conn", lambda _self: object())
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: object())
+    monkeypatch.setattr(cls, "_start_client_lease_maintenance", lambda _self: None)
     monkeypatch.setattr(cls, "_start_query_resource_maintenance", lambda _self: None)
 
     cls({}, 1)
@@ -1275,6 +1332,60 @@ def test_ray_query_driver_client_stream_start_reports_teardown_failure(monkeypat
     assert "planned stream teardown failure" in str(error.value)
 
 
+def test_ray_query_driver_client_stream_preserves_primary_and_cleanup_failures(monkeypatch):
+    run_future = object()
+    partition_future = object()
+    close_future = object()
+    primary_error = ValueError("planned mid-stream query failure")
+    cleanup_error = RuntimeError("planned mid-stream cleanup failure")
+
+    class _RemoteMethod:
+        def __init__(self, result):
+            self.result = result
+
+        def remote(self, *_args):
+            return self.result
+
+    class _ProgressSession:
+        def __init__(self, *_args):
+            self.finished = False
+
+        def resolve(self, ref):
+            assert ref is partition_future
+            raise primary_error
+
+        def finish(self, **_kwargs):
+            self.finished = True
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = SimpleNamespace(
+        run_plan=_RemoteMethod(run_future),
+        get_next_partition=_RemoteMethod(partition_future),
+        close_plan=_RemoteMethod(close_future),
+    )
+    client._runtime_is_unavailable_or_replaced = lambda: False
+
+    def _resolve(ref, **_kwargs):
+        if ref is run_future:
+            return None
+        assert ref is close_future
+        raise cleanup_error
+
+    monkeypatch.setattr(driver, "_RayProgressSession", _ProgressSession)
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+
+    with pytest.raises(driver.QueryExecutionCleanupError) as error:
+        list(client.stream_plan(_FakePhysicalPlanWithoutPlanAttr("mid-stream-cleanup")))
+
+    assert error.value.primary_error is primary_error
+    assert error.value.cleanup_errors == (cleanup_error,)
+    assert error.value.__cause__ is primary_error
+    assert "planned mid-stream query failure" in str(error.value)
+    assert "planned mid-stream cleanup failure" in str(error.value)
+
+
 def test_ray_query_driver_client_stream_failure_accepts_concurrent_detach_cleanup(monkeypatch):
     run_future = object()
     close_future = object()
@@ -1885,6 +1996,218 @@ def test_detach_fences_new_session_work_and_replays_result():
     assert runner._detached_client_results[_TEST_RUNTIME_OWNER_ID] is False
 
 
+def test_client_owner_lease_heartbeat_renews_and_cannot_resurrect_expired_generation():
+    cls, runner = _make_local_query_driver_actor()
+    lease = runner._client_leases[_TEST_RUNTIME_OWNER_ID]
+    lease.lease_token = "owner-generation-a"
+    lease.expires_at = time.monotonic() + 1.0
+    original_expiry = lease.expires_at
+
+    assert cls.heartbeat_client(
+        runner,
+        _TEST_RUNTIME_OWNER_ID,
+        "owner-generation-a",
+    )
+    assert lease.expires_at > original_expiry
+
+    lease.expires_at = 10.0
+    assert cls._mark_expired_client_leases(runner, now=9.0) == ()
+    assert cls._mark_expired_client_leases(runner, now=10.0) == (_TEST_RUNTIME_OWNER_ID,)
+    assert lease.state == "expired"
+
+    with pytest.raises(PermissionError, match="lease is no longer active"):
+        cls.heartbeat_client(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            "owner-generation-a",
+        )
+    with pytest.raises(PermissionError, match="lease is no longer active"):
+        cls.heartbeat_client(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            "owner-generation-b",
+        )
+    assert lease.state == "expired"
+
+
+def test_expired_client_reclamation_retains_ownership_until_retry_succeeds():
+    cls, runner = _make_local_query_driver_actor()
+    other_owner = "surviving-owner"
+    runner._client_ids.add(other_owner)
+    cls._ensure_client_lease_state(runner)
+    plan_id = "expired-owner-plan"
+    _bind_test_plan_session(runner, plan_id, query_id="expired-owner-query")
+    runner.curr_plans[plan_id] = object()
+    runner.curr_streams[plan_id] = _DummyStream([])
+    lease = runner._client_leases[_TEST_RUNTIME_OWNER_ID]
+    lease.lease_token = "expired-owner-generation"
+    lease.expires_at = 5.0
+    cleanup_attempts = []
+
+    def _cleanup(actual_plan_id):
+        cleanup_attempts.append(actual_plan_id)
+        if len(cleanup_attempts) == 1:
+            raise RuntimeError("planned expired-owner teardown failure")
+        runner.curr_plans.pop(actual_plan_id, None)
+        runner.curr_streams.pop(actual_plan_id, None)
+        runner._plan_query_ids.pop(actual_plan_id, None)
+        runner._plan_session_ids.pop(actual_plan_id, None)
+        runner._sessions[_TEST_SESSION_ID].plan_ids.discard(actual_plan_id)
+
+    runner._cleanup_finished_plan = _cleanup
+
+    async def _reclaim_with_retry():
+        assert cls._mark_expired_client_leases(runner, now=5.0) == (_TEST_RUNTIME_OWNER_ID,)
+        with pytest.raises(
+            RuntimeError,
+            match="planned expired-owner teardown failure",
+        ):
+            await cls._detach_client_owner(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                expired=True,
+            )
+
+        assert _TEST_RUNTIME_OWNER_ID in runner._client_ids
+        assert _TEST_RUNTIME_OWNER_ID in runner._detaching_client_ids
+        assert runner._plan_session_ids[plan_id] == _TEST_SESSION_ID
+        assert runner._client_leases[_TEST_RUNTIME_OWNER_ID].state == "expired"
+        assert "planned expired-owner teardown failure" in (
+            runner._client_leases[_TEST_RUNTIME_OWNER_ID].last_cleanup_error
+        )
+
+        assert await cls.open_session(
+            runner,
+            other_owner,
+            "survivor-during-expired-cleanup-retry",
+            {},
+        )
+        await cls.close_session(
+            runner,
+            other_owner,
+            "survivor-during-expired-cleanup-retry",
+        )
+
+        assert (
+            await cls._detach_client_owner(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                expired=True,
+            )
+            is False
+        )
+
+    asyncio.run(_reclaim_with_retry())
+
+    assert cleanup_attempts == [plan_id, plan_id]
+    assert _TEST_RUNTIME_OWNER_ID not in runner._client_ids
+    assert other_owner in runner._client_ids
+    assert _TEST_SESSION_ID not in runner._sessions
+    assert plan_id not in runner._plan_session_ids
+    assert runner._detached_client_results[_TEST_RUNTIME_OWNER_ID] is False
+
+
+def test_expired_client_reclamation_cancels_owned_active_operation():
+    cls, runner = _make_local_query_driver_actor()
+    runner._sessions[_TEST_SESSION_ID].plan_ids.clear()
+    runner._client_ids.add("surviving-owner")
+    cls._ensure_client_lease_state(runner)
+    lease = runner._client_leases[_TEST_RUNTIME_OWNER_ID]
+    lease.expires_at = 1.0
+
+    async def _reclaim_active_operation():
+        operation_started = asyncio.Event()
+
+        async def _operation():
+            session = runner._sessions[_TEST_SESSION_ID]
+            cls._begin_session_operation(session, _TEST_SESSION_ID)
+            operation_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cls._end_session_operation(session)
+
+        operation = asyncio.create_task(_operation())
+        await operation_started.wait()
+        assert cls._mark_expired_client_leases(runner, now=1.0) == (_TEST_RUNTIME_OWNER_ID,)
+        assert (
+            await cls._detach_client_owner(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                expired=True,
+            )
+            is False
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+
+    asyncio.run(_reclaim_active_operation())
+
+    assert _TEST_RUNTIME_OWNER_ID not in runner._client_ids
+    assert "surviving-owner" in runner._client_ids
+    assert _TEST_SESSION_ID not in runner._sessions
+
+
+def test_expired_client_reclamation_cancels_blocked_partition_read():
+    from duckdb.runners.ray.query_resource_runtime import (
+        release_query_resource_manager,
+    )
+
+    cls, runner = _make_local_query_driver_actor()
+    runner._client_ids.add("surviving-owner")
+    cls._ensure_client_lease_state(runner)
+    plan_id = "expired-owner-blocked-read"
+    query_id = "expired-owner-blocked-query"
+    manager = _bind_test_query_resource_owner(
+        runner,
+        plan_id,
+        query_id=query_id,
+    )
+    read_started = threading.Event()
+    release_read = threading.Event()
+
+    class _BlockingStream:
+        @staticmethod
+        def blocking_next():
+            read_started.set()
+            release_read.wait(timeout=2.0)
+            raise StopIteration
+
+    runner.curr_plans[plan_id] = object()
+    runner.curr_streams[plan_id] = _BlockingStream()
+    runner._drop_query_fragments_sync = lambda _query_id: release_read.set()
+    lease = runner._client_leases[_TEST_RUNTIME_OWNER_ID]
+    lease.expires_at = time.monotonic() + 60.0
+
+    async def _reclaim_blocked_read():
+        partition_read = asyncio.create_task(
+            cls.get_next_partition(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                plan_id,
+            )
+        )
+        assert await asyncio.to_thread(read_started.wait, 1.0)
+        lease.expires_at = 1.0
+        cls._mark_expired_client_leases(runner, now=1.0)
+        cls._schedule_expired_client_reclamations(runner)
+        cleanup_task = runner._expired_client_cleanup_tasks[_TEST_RUNTIME_OWNER_ID]
+        with pytest.raises(asyncio.CancelledError):
+            await partition_read
+        assert await asyncio.wait_for(cleanup_task, timeout=1.0) is False
+
+    try:
+        asyncio.run(_reclaim_blocked_read())
+        assert manager.snapshot()["external_consumer_waiting"] is False
+        assert _TEST_RUNTIME_OWNER_ID not in runner._client_ids
+        assert _TEST_SESSION_ID not in runner._sessions
+        assert plan_id not in runner._plan_session_ids
+    finally:
+        release_read.set()
+        release_query_resource_manager(query_id, reason="test_complete")
+
+
 def test_open_session_revalidates_owner_inside_registry_lock(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     runner._sessions = {}
@@ -1956,6 +2279,8 @@ def test_last_owner_detach_retries_runtime_shutdown_failure():
     cls, runner = _make_local_query_driver_actor()
     runner._sessions = {}
     shutdown_calls = []
+    maintenance_restarts = []
+    runner._start_client_lease_maintenance = lambda: maintenance_restarts.append("restart")
 
     async def _shutdown_runtime():
         shutdown_calls.append("shutdown")
@@ -1975,6 +2300,7 @@ def test_last_owner_detach_retries_runtime_shutdown_failure():
     asyncio.run(_detach_with_retry())
 
     assert shutdown_calls == ["shutdown", "shutdown"]
+    assert maintenance_restarts == ["restart"]
     assert _TEST_RUNTIME_OWNER_ID not in runner._client_ids
     assert runner._detached_client_results[_TEST_RUNTIME_OWNER_ID] is True
 
@@ -4004,6 +4330,23 @@ def test_get_next_partition_surfaces_terminal_actor_placement_loss_before_delive
     from duckdb.runners.ray.query_resource_runtime import release_query_resource_manager
 
     release_query_resource_manager(query_id, reason="test_complete")
+
+
+def test_terminal_query_failure_preserves_primary_when_teardown_also_fails():
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "terminal-cleanup-plan"
+    query_id = "terminal-cleanup-query"
+    runner._query_terminal_errors[query_id] = "fixed actor placement was lost"
+    cleanup_error = RuntimeError("planned terminal teardown failure")
+    runner._teardown_plan_resources = lambda *_args, **_kwargs: (_ for _ in ()).throw(cleanup_error)
+
+    with pytest.raises(driver.QueryExecutionCleanupError) as error:
+        cls._finish_terminal_query(runner, plan_id, query_id)
+
+    assert isinstance(error.value.primary_error, RuntimeError)
+    assert str(error.value.primary_error) == "fixed actor placement was lost"
+    assert error.value.cleanup_errors == (cleanup_error,)
+    assert error.value.__cause__ is error.value.primary_error
 
 
 def test_get_next_partition_waits_for_teardown_without_blocking_event_loop():
@@ -6278,10 +6621,74 @@ def test_ray_query_driver_clients_attach_to_job_runtime(monkeypatch):
     assert remote_calls[0][:2] == ({"PYTHONPATH": "/vane"}, 50)
     assert remote_calls[1][:2] == ({"PYTHONPATH": "/vane"}, 50)
     assert handle.attach_client.calls == [
-        ((client_a._owner_id, {"PYTHONPATH": "/vane"}), {}),
-        ((client_b._owner_id, {"PYTHONPATH": "/vane"}), {}),
+        (
+            (
+                client_a._owner_id,
+                {"PYTHONPATH": "/vane"},
+                client_a._lease_token,
+            ),
+            {},
+        ),
+        (
+            (
+                client_b._owner_id,
+                {"PYTHONPATH": "/vane"},
+                client_b._lease_token,
+            ),
+            {},
+        ),
     ]
     assert handle.ping.calls == []
+
+
+def test_ray_query_driver_client_heartbeat_retries_transient_failure_early(
+    monkeypatch,
+):
+    heartbeat_calls = []
+
+    class _HeartbeatMethod:
+        @staticmethod
+        def remote(owner_id, lease_token):
+            heartbeat_calls.append((owner_id, lease_token))
+            return f"heartbeat-{len(heartbeat_calls)}"
+
+    class _Stop:
+        def __init__(self):
+            self.waits = []
+
+        def wait(self, timeout):
+            self.waits.append(timeout)
+            return len(self.waits) == 3
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    _initialize_test_query_driver_client(client)
+    client.runner = SimpleNamespace(heartbeat_client=_HeartbeatMethod())
+    client._runtime_is_unavailable_or_replaced = lambda: False
+    stop = _Stop()
+    resolve_calls = []
+
+    def _resolve(ref, **kwargs):
+        resolve_calls.append((ref, kwargs))
+        if len(resolve_calls) == 1:
+            raise TimeoutError("transient heartbeat wait timeout")
+        return True
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+
+    driver.RayQueryDriverClient._client_heartbeat_worker(
+        weakref.ref(client),
+        stop,
+        4.0,
+        4.0,
+    )
+
+    assert stop.waits == [4.0, 1.0, 4.0]
+    assert heartbeat_calls == [
+        ("owner-a", "test-client-lease-token"),
+        ("owner-a", "test-client-lease-token"),
+    ]
+    assert client._client_heartbeat_error == ""
 
 
 def test_ray_query_driver_client_retries_named_runtime_that_is_shutting_down(monkeypatch):
@@ -7429,6 +7836,47 @@ def test_ray_query_driver_client_close_remains_retryable_after_detach_failure(mo
     assert client.runner is runner
     assert client._opened_sessions == {"session-a": {}}
     assert client._client_closing is True
+    assert client._client_heartbeat_stop.is_set()
+
+
+def test_ray_query_driver_client_close_accepts_expiry_reaper_takeover(
+    monkeypatch,
+):
+    class _DetachMethod:
+        @staticmethod
+        def remote(owner_id):
+            assert owner_id == "owner-a"
+            return "detach-ref"
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = "owner-a"
+    client._ray_gcs_address = "gcs-a"
+    _initialize_test_query_driver_client(client, {"session-a": {}})
+    client.runner = SimpleNamespace(detach_client=_DetachMethod())
+
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        driver.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(
+            gcs_address="gcs-a",
+            get_job_id=lambda: "job-a",
+        ),
+    )
+    monkeypatch.setattr(
+        driver,
+        "resolve_object_refs_blocking",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError("expired owner cleanup is already in progress")
+        ),
+    )
+
+    client.close()
+
+    assert client.runner is None
+    assert client._opened_sessions == {}
+    assert client._client_closing is False
+    assert client._client_heartbeat_stop.is_set()
 
 
 def test_ray_query_driver_client_close_is_terminal_when_ray_stops_during_detach(monkeypatch):

@@ -1092,7 +1092,14 @@ def test_fragment_drop_keeps_query_resources_when_local_fte_registry_cannot_quie
         assert runner._query_graphs == {query_id: graph}
         assert runner._query_allocations == {query_id: allocation}
         assert coordinator.released == []
-        assert runner._query_resource_admission_bridge_poisoned is True
+        assert query_id in runner._query_resource_closing_queries
+        healthy_query_mutations = []
+        runner_cls._run_on_query_resource_admission_loop_sync(
+            runner,
+            lambda: healthy_query_mutations.append("query-b"),
+            query_id="query-b",
+        )
+        assert healthy_query_mutations == ["query-b"]
 
     asyncio.run(scenario())
 
@@ -1195,6 +1202,7 @@ def test_owner_loop_sync_fence_times_out_and_cancels_late_callback():
         runner_cls._run_on_query_resource_admission_loop_sync(
             runner,
             lambda: mutations.append("late"),
+            query_id="query-stalled-fence",
             timeout_s=0.01,
         )
 
@@ -1204,12 +1212,15 @@ def test_owner_loop_sync_fence_times_out_and_cancels_late_callback():
     assert mutations == []
 
 
-def test_owner_loop_sync_fence_poisoned_after_started_callback_timeout():
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+def test_owner_loop_sync_fence_timeout_isolated_to_query_until_callback_settles():
+    from duckdb.runners.ray.driver import (
+        QueryTeardownOwnershipError,
+        RayQueryDriverActor,
+    )
 
     class _RunningLoop:
         def __init__(self):
-            self.thread = None
+            self.threads = []
 
         @staticmethod
         def is_closed():
@@ -1220,8 +1231,9 @@ def test_owner_loop_sync_fence_poisoned_after_started_callback_timeout():
             return True
 
         def call_soon_threadsafe(self, callback):
-            self.thread = threading.Thread(target=callback)
-            self.thread.start()
+            thread = threading.Thread(target=callback)
+            self.threads.append(thread)
+            thread.start()
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -1236,24 +1248,46 @@ def test_owner_loop_sync_fence_poisoned_after_started_callback_timeout():
         release_callback.wait(timeout=1)
         mutations.append("late")
 
-    with pytest.raises(RuntimeError, match="callback started but did not finish; bridge poisoned"):
+    with pytest.raises(
+        QueryTeardownOwnershipError,
+        match="query generation remains fenced",
+    ):
         runner_cls._run_on_query_resource_admission_loop_sync(
             runner,
             blocked_callback,
+            query_id="query-a",
             timeout_s=0.01,
         )
     assert callback_started.is_set()
-    assert runner._query_resource_admission_bridge_poisoned is True
-
-    release_callback.set()
-    loop.thread.join(timeout=1)
-    assert mutations == ["late"]
-    with pytest.raises(RuntimeError, match="fence is poisoned"):
+    with pytest.raises(
+        QueryTeardownOwnershipError,
+        match="still settling for query-a",
+    ):
         runner_cls._run_on_query_resource_admission_loop_sync(
             runner,
             lambda: None,
+            query_id="query-a",
             timeout_s=0.01,
         )
+
+    runner_cls._run_on_query_resource_admission_loop_sync(
+        runner,
+        lambda: mutations.append("query-b"),
+        query_id="query-b",
+        timeout_s=0.1,
+    )
+
+    release_callback.set()
+    for thread in loop.threads:
+        thread.join(timeout=1)
+    assert mutations == ["query-b", "late"]
+    runner_cls._run_on_query_resource_admission_loop_sync(
+        runner,
+        lambda: mutations.append("query-a-retry"),
+        query_id="query-a",
+        timeout_s=0.1,
+    )
+    assert mutations == ["query-b", "late", "query-a-retry"]
 
 
 def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
