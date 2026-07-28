@@ -59,7 +59,7 @@ def ray_runner(_vane_shuffle_env, request):
 
 def _collect_tables(runner, relation, timeout_s: float = 60.0) -> pa.Table:
     start = time.time()
-    parts = list(runner.run_iter_tables(relation, results_buffer_size=1))
+    parts = list(runner.run_iter_tables(relation))
     elapsed = time.time() - start
     assert elapsed < timeout_s
     assert parts

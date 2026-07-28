@@ -84,11 +84,9 @@ class RayRunner(Runner):
         self,
         address: str | None,
         max_task_backlog: int | None,
-        force_client_mode: bool = False,
     ) -> None:
         self.ray_address = address
         self.max_task_backlog = max_task_backlog
-        self.force_client_mode = force_client_mode
         ensure_vane_session_dir()
         _configure_scan_task_backlog_env(max_task_backlog)
 
@@ -147,9 +145,7 @@ class RayRunner(Runner):
             self._session_ids.add(session_key)
             return client
 
-    def run_iter(
-        self, relation: duckdb.DuckDBPyRelation, results_buffer_size: int | None = None
-    ) -> Iterator[RayMaterializedResult]:
+    def run_iter(self, relation: duckdb.DuckDBPyRelation) -> Iterator[RayMaterializedResult]:
         query_id = str(uuid.uuid4())
 
         PyLogicalPlan = require_ray_cxx_attr(
@@ -184,6 +180,6 @@ class RayRunner(Runner):
         # Send PyLogicalPlan to Driver — Driver will create physical plan
         return client.run_copy_plan(logical_plan)
 
-    def run_iter_tables(self, relation: Any, results_buffer_size: int | None = None) -> Iterator[pa.Table]:
-        for result in self.run_iter(relation, results_buffer_size=results_buffer_size):
+    def run_iter_tables(self, relation: Any) -> Iterator[pa.Table]:
+        for result in self.run_iter(relation):
             yield result.partition()

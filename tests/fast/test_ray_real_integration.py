@@ -43,7 +43,7 @@ def test_run_simple_plan_on_ray_local():
     assert getattr(runner, "name", None) == "ray"
 
     relation = duckdb.sql("SELECT a, b, a + b AS sum FROM (VALUES (1, 10), (2, 20), (3, 30)) AS t(a, b)")
-    parts = list(runner.run_iter_tables(relation, results_buffer_size=1))
+    parts = list(runner.run_iter_tables(relation))
     assert parts
     rows = sorted(_collect_rows_from_parts(parts))
     assert rows == [(1, 10, 11), (2, 20, 22), (3, 30, 33)]
@@ -74,7 +74,7 @@ def test_run_distributed_plan_end_to_end_on_ray_local(tmp_path):
     runner = _runners.get_or_create_runner()
     assert getattr(runner, "name", None) == "ray"
 
-    parts = list(runner.run_iter_tables(relation, results_buffer_size=1))
+    parts = list(runner.run_iter_tables(relation))
     assert parts
 
     rows = _collect_rows_from_parts(parts)
