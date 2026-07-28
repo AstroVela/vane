@@ -108,18 +108,24 @@ class AnthropicProvider(Provider):
     ) -> PrompterDescriptor:
         """Build a prompter descriptor for an explicitly selected model.
 
-        The model resolves as: call-site ``model`` (including a ``model``
-        key in ``options``) > provider ``prompt_model`` configuration.
+        The model resolves as: call-site ``model`` > provider
+        ``prompt_model`` configuration; the selected value must be a
+        non-empty string.
 
         Raises:
-            ValueError: If no model is configured through either path.
+            ValueError: If no model is configured through either path, or
+                the selected model is not a non-empty string.
         """
         provider_options, prompt_options = self._split_options(options)
-        option_model = prompt_options.pop("model", None)
-        model_name = model or option_model or self._prompt_model
+        model_name = model if model is not None else self._prompt_model
         if model_name is None:
             raise ValueError(
                 "No prompt model configured for the Anthropic provider. "
+                "Pass model=... or configure AnthropicProvider(prompt_model=...)."
+            )
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError(
+                f"Anthropic prompt model must be a non-empty string, got {model_name!r}. "
                 "Pass model=... or configure AnthropicProvider(prompt_model=...)."
             )
         return AnthropicPrompterDescriptor(

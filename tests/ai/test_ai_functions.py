@@ -1051,14 +1051,22 @@ class TestAnthropicProvider:
         desc = provider.get_prompter(model="claude-call-model")
         assert desc.model_name == "claude-call-model"
 
-    def test_options_model_key_overrides_provider_prompt_model(self):
-        """A model key in call options beats provider-level prompt_model."""
+    @pytest.mark.parametrize("model", ["", "   "])
+    def test_blank_call_model_rejected(self, model):
+        """A blank call-site model is an error, not a provider-config fallback."""
         from vane.ai.providers.anthropic import AnthropicProvider
 
         provider = AnthropicProvider(api_key="test-key", prompt_model="claude-config-model")
-        desc = provider.get_prompter(**{"model": "claude-options-model"})
-        assert desc.model_name == "claude-options-model"
-        assert "model" not in desc.prompt_options
+        with pytest.raises(ValueError, match="non-empty string"):
+            provider.get_prompter(model=model)
+
+    def test_blank_provider_prompt_model_rejected(self):
+        """A blank provider-level prompt_model fails at expression-build time."""
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        provider = AnthropicProvider(api_key="test-key", prompt_model="")
+        with pytest.raises(ValueError, match="non-empty string"):
+            provider.get_prompter()
 
     def test_ctor_prompt_model_is_keyword_only(self):
         """prompt_model must be passed by name; positional use is a TypeError."""
