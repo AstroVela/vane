@@ -279,6 +279,20 @@ def test_ray_driver_client_restores_preflight_stream_and_copy_causes(ray_local, 
     def succeed(value: Any = None) -> Any:
         return value
 
+    @ray.remote
+    def recover_failure_with_chain(label: str, operation_id: str) -> Any:
+        import duckdb as remote_duckdb
+        from duckdb._ray_errors import remote_ray_exception as build_remote_ray_exception
+        from duckdb.runners.ray.driver import CopyPlanRecovery
+
+        try:
+            raise remote_duckdb.NotImplementedException(f"{label} original")
+        except remote_duckdb.NotImplementedException as cause:
+            return CopyPlanRecovery(
+                operation_id=operation_id,
+                error=build_remote_ray_exception(f"{label} outer", cause),
+            )
+
     class SuccessMethod:
         def __init__(self, value: Any = None) -> None:
             self.value = value
@@ -292,6 +306,13 @@ def test_ray_driver_client_restores_preflight_stream_and_copy_causes(ray_local, 
 
         def remote(self, *_args, **_kwargs):
             return fail_with_chain.remote(self.label)
+
+    class RecoveryFailureMethod:
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        def remote(self, *_args):
+            return recover_failure_with_chain.remote(self.label, str(_args[-1]))
 
     class Plan:
         def idx(self) -> str:
@@ -311,6 +332,7 @@ def test_ray_driver_client_restores_preflight_stream_and_copy_causes(ray_local, 
             self.run_plan = FailureMethod("preflight") if failure_path == "preflight" else SuccessMethod()
             self.get_next_partition = FailureMethod("stream") if failure_path == "stream" else SuccessMethod(None)
             self.run_copy_plan = FailureMethod("copy") if failure_path == "copy" else SuccessMethod()
+            self.recover_copy_plan = RecoveryFailureMethod("copy") if failure_path == "copy" else SuccessMethod()
 
     monkeypatch.setattr(driver, "_collect_vane_env_overrides", dict)
     monkeypatch.setattr(driver, "progress_enabled", lambda: False)
