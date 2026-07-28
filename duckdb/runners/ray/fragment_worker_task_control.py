@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from duckdb.runners.fte import FteTaskAttemptId, validate_fte_status_identity
@@ -94,34 +94,59 @@ class FteWorkerTaskControlMixin:
         raise last_error
 
     @staticmethod
+    def _cancel_fte_control_ref(
+        ref: Any,
+        on_cancel: Callable[[], None] | None,
+    ) -> None:
+        if on_cancel is not None:
+            on_cancel()
+        try:
+            import ray
+
+            ray.cancel(ref, force=False)
+        except Exception:
+            pass
+
+    @staticmethod
     def _get_fte_control_ref(
         method_name: str,
         ref: Any,
         timeout_s: float | None = None,
         cancel_event: Any = None,
         honor_query_deadline: bool = True,
+        on_cancel: Callable[[], None] | None = None,
     ) -> Any:
         resolved_timeout_s = _fte_control_rpc_timeout_s() if timeout_s is None else max(0.0, float(timeout_s))
         if cancel_event is not None:
-            resolved_timeout_s = configured_ray_get_timeout_s(resolved_timeout_s)
+            try:
+                resolved_timeout_s = configured_ray_get_timeout_s(resolved_timeout_s)
+            except QueryDeadlineExceeded:
+                FteWorkerTaskControlMixin._cancel_fte_control_ref(ref, on_cancel)
+                raise
             deadline = None if resolved_timeout_s is None else time.monotonic() + resolved_timeout_s
             future = ref.future()
             while True:
                 if cancel_event.is_set():
-                    try:
-                        import ray
-
-                        ray.cancel(ref, force=False)
-                    except Exception:
-                        pass
-                    raise InterruptedError(f"{method_name} interrupted by watcher shutdown")
+                    FteWorkerTaskControlMixin._cancel_fte_control_ref(ref, on_cancel)
+                    raise InterruptedError(f"{method_name} interrupted by cancellation")
+                # Preserve a query-wide deadline as a query failure rather than
+                # misclassifying it as an individual control RPC timeout.
+                try:
+                    configured_ray_get_timeout_s(None)
+                except QueryDeadlineExceeded:
+                    FteWorkerTaskControlMixin._cancel_fte_control_ref(ref, on_cancel)
+                    raise
                 remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
                 if remaining is not None and remaining <= 0.0:
+                    FteWorkerTaskControlMixin._cancel_fte_control_ref(ref, on_cancel)
                     raise TimeoutError(f"{method_name} did not complete within {resolved_timeout_s:.3f}s")
                 wait_slice = 0.05 if remaining is None else min(0.05, remaining)
                 try:
                     return future.result(timeout=wait_slice)
                 except concurrent.futures.TimeoutError:
+                    done = getattr(future, "done", None)
+                    if callable(done) and done():
+                        return future.result()
                     continue
         try:
             if honor_query_deadline:
@@ -137,6 +162,8 @@ class FteWorkerTaskControlMixin:
         except QueryDeadlineExceeded:
             raise
         except TimeoutError as exc:
+            if honor_query_deadline:
+                configured_ray_get_timeout_s(None)
             raise TimeoutError(f"{method_name} did not complete within {resolved_timeout_s:.3f}s") from exc
 
     def _enqueue_ordered_fte_control_rpc(
@@ -145,9 +172,60 @@ class FteWorkerTaskControlMixin:
         task_id: str | dict[str, Any],
         *args: Any,
         timeout_s: float | None = None,
+        cancel_event: Any = None,
     ) -> Any:
-        ref = self._enqueue_ordered_fte_control_ref(method_name, task_id, *args)
-        return self._get_fte_control_ref(method_name, ref, timeout_s=timeout_s)
+        tracked_query_id: str | None = None
+        owns_registry_operation = False
+        if cancel_event is not None:
+            tracked_query_id = FteTaskAttemptId.coerce(task_id).task_id.query_id
+            if not begin_fte_registry_operation(tracked_query_id):
+                raise RuntimeError(f"FTE query registry is closing: {tracked_query_id}")
+            owns_registry_operation = True
+        try:
+            ref = self._enqueue_ordered_fte_control_ref(method_name, task_id, *args)
+            if owns_registry_operation:
+                assert tracked_query_id is not None
+                transfer_fte_registry_operations_to_ref([tracked_query_id], ref)
+                owns_registry_operation = False
+            on_cancel = None
+            if cancel_event is not None:
+
+                def discard_ref() -> None:
+                    self._discard_ordered_fte_control_ref(task_id, ref)
+
+                on_cancel = discard_ref
+            return self._get_fte_control_ref(
+                method_name,
+                ref,
+                timeout_s=timeout_s,
+                cancel_event=cancel_event,
+                on_cancel=on_cancel,
+            )
+        finally:
+            if owns_registry_operation:
+                assert tracked_query_id is not None
+                end_fte_registry_operation(tracked_query_id)
+
+    def _discard_ordered_fte_control_ref(
+        self,
+        task_id: str | dict[str, Any],
+        ref: Any,
+    ) -> None:
+        task_key = str(FteTaskAttemptId.coerce(task_id))
+        with self._fte_control_lock:
+            if self._fte_control_tails_by_task.get(task_key) is not ref:
+                return
+            self._fte_control_tails_by_task.pop(task_key, None)
+            self._fte_control_query_by_task.pop(task_key, None)
+            self._fte_control_operation_by_task.pop(task_key, None)
+
+    def _is_current_ordered_fte_control_ref(
+        self,
+        task_key: str,
+        ref: Any,
+    ) -> bool:
+        with self._fte_control_lock:
+            return self._fte_control_tails_by_task.get(task_key) is ref
 
     def _enqueue_ordered_fte_control_ref(
         self,
@@ -298,8 +376,16 @@ class FteWorkerTaskControlMixin:
         task_id: str | dict[str, Any],
         source_node_id: str,
         splits: list[dict[str, Any]],
+        *,
+        cancel_event: Any = None,
     ) -> dict[str, Any]:
-        raw_status = self._enqueue_ordered_fte_control_rpc("fte_add_splits", task_id, source_node_id, splits)
+        raw_status = self._enqueue_ordered_fte_control_rpc(
+            "fte_add_splits",
+            task_id,
+            source_node_id,
+            splits,
+            cancel_event=cancel_event,
+        )
         if not isinstance(raw_status, dict):
             raise TypeError("worker actor fte_add_splits must return a dict")
         return dict(raw_status)
@@ -427,6 +513,31 @@ class FteWorkerTaskControlMixin:
             raise TypeError("worker actor fte_wait_split_queue_has_space must return a dict")
         return dict(raw_status)
 
+    def fte_wait_split_queue_has_space_interruptible(
+        self,
+        task_id: str | dict[str, Any],
+        source_node_id: str | None,
+        max_buffered_splits: int | None,
+        timeout_s: float | None,
+        stop_event: Any,
+    ) -> dict[str, Any]:
+        server_timeout_s = None if timeout_s is None else max(0.0, float(timeout_s))
+        client_timeout_s = None
+        if server_timeout_s is not None:
+            client_timeout_s = max(30.0, server_timeout_s + 5.0)
+        raw_status = self._fte_control_rpc(
+            "fte_wait_split_queue_has_space",
+            task_id,
+            source_node_id,
+            max_buffered_splits,
+            server_timeout_s,
+            timeout_s=client_timeout_s,
+            cancel_event=stop_event,
+        )
+        if not isinstance(raw_status, dict):
+            raise TypeError("worker actor fte_wait_split_queue_has_space must return a dict")
+        return dict(raw_status)
+
     def fte_get_task_info(self, task_id: str | dict[str, Any]) -> dict[str, Any]:
         raw_info = self._fte_control_rpc("fte_get_task_info", task_id)
         if not isinstance(raw_info, dict):
@@ -471,56 +582,80 @@ class FteWorkerTaskControlMixin:
         except BaseException as exc:
             barrier_resolution_error = exc
 
-        statuses: list[dict[str, Any]] = []
+        status_entries: list[tuple[str, Any, dict[str, Any]]] = []
         terminal_entries: list[tuple[str, Any, str]] = []
         pending_entries: list[tuple[str, Any, str]] = []
-        terminal_errors: list[str] = []
+        terminal_error_entries: list[tuple[str, Any, str]] = []
 
         if raw_statuses is None:
             resolved_entries: list[tuple[tuple[str, Any, str], Any]] = []
             for entry in pending:
                 task_key, ref, _ = entry
+                if not self._is_current_ordered_fte_control_ref(task_key, ref):
+                    continue
                 future_method = getattr(ref, "future", None)
                 if not callable(future_method):
-                    terminal_entries.append(entry)
-                    terminal_errors.append(f"task={task_key}: control ref has no future()")
+                    if self._is_current_ordered_fte_control_ref(task_key, ref):
+                        terminal_entries.append(entry)
+                        terminal_error_entries.append((task_key, ref, f"task={task_key}: control ref has no future()"))
                     continue
                 try:
                     future = future_method()
                 except BaseException as exc:
-                    terminal_entries.append(entry)
-                    terminal_errors.append(f"task={task_key}: {type(exc).__name__}: {exc}")
+                    if self._is_current_ordered_fte_control_ref(task_key, ref):
+                        terminal_entries.append(entry)
+                        terminal_error_entries.append((task_key, ref, f"task={task_key}: {type(exc).__name__}: {exc}"))
                     continue
                 try:
                     raw_status = future.result(timeout=0)
                 except concurrent.futures.TimeoutError:
+                    if not self._is_current_ordered_fte_control_ref(task_key, ref):
+                        continue
                     done_value = getattr(future, "done", None)
                     try:
                         is_done = bool(done_value() if callable(done_value) else done_value)
                     except BaseException:
                         is_done = False
                     if is_done:
-                        terminal_entries.append(entry)
                         try:
                             raw_status = future.result()
                         except BaseException as terminal_exc:
-                            terminal_errors.append(f"task={task_key}: {type(terminal_exc).__name__}: {terminal_exc}")
+                            if self._is_current_ordered_fte_control_ref(task_key, ref):
+                                terminal_entries.append(entry)
+                                terminal_error_entries.append(
+                                    (
+                                        task_key,
+                                        ref,
+                                        f"task={task_key}: {type(terminal_exc).__name__}: {terminal_exc}",
+                                    )
+                                )
                         else:
-                            resolved_entries.append((entry, raw_status))
-                    else:
+                            if self._is_current_ordered_fte_control_ref(task_key, ref):
+                                terminal_entries.append(entry)
+                                resolved_entries.append((entry, raw_status))
+                    elif self._is_current_ordered_fte_control_ref(task_key, ref):
                         pending_entries.append(entry)
                     continue
                 except BaseException as exc:
-                    terminal_entries.append(entry)
-                    terminal_errors.append(f"task={task_key}: {type(exc).__name__}: {exc}")
+                    if self._is_current_ordered_fte_control_ref(task_key, ref):
+                        terminal_entries.append(entry)
+                        terminal_error_entries.append((task_key, ref, f"task={task_key}: {type(exc).__name__}: {exc}"))
                     continue
-                terminal_entries.append(entry)
-                resolved_entries.append((entry, raw_status))
+                if self._is_current_ordered_fte_control_ref(task_key, ref):
+                    terminal_entries.append(entry)
+                    resolved_entries.append((entry, raw_status))
         else:
-            terminal_entries = list(pending)
-            resolved_entries = list(zip(pending, raw_statuses, strict=True))
+            resolved_entries = [
+                (entry, raw_status)
+                for entry, raw_status in zip(pending, raw_statuses, strict=True)
+                if self._is_current_ordered_fte_control_ref(entry[0], entry[1])
+            ]
+            terminal_entries = [entry for entry, _ in resolved_entries]
 
-        for (task_key, _, expected_operation), raw_status in resolved_entries:
+        for entry, raw_status in resolved_entries:
+            task_key, ref, expected_operation = entry
+            if not self._is_current_ordered_fte_control_ref(task_key, ref):
+                continue
             try:
                 if not isinstance(raw_status, Mapping):
                     raise TypeError("FTE result-control barrier status must be a mapping")
@@ -537,26 +672,42 @@ class FteWorkerTaskControlMixin:
                         f"FTE control barrier operation was not applied: task={task_key} operation={expected_operation}"
                     )
             except BaseException as exc:
-                terminal_errors.append(f"task={task_key}: {type(exc).__name__}: {exc}")
+                if self._is_current_ordered_fte_control_ref(task_key, ref):
+                    terminal_error_entries.append((task_key, ref, f"task={task_key}: {type(exc).__name__}: {exc}"))
                 continue
-            statuses.append(status)
+            if self._is_current_ordered_fte_control_ref(task_key, ref):
+                status_entries.append((task_key, ref, status))
 
+        terminal_error: FteControlBarrierTerminalError | None = None
         with self._fte_control_lock:
+            pending_entries = [
+                entry for entry in pending_entries if self._fte_control_tails_by_task.get(entry[0]) is entry[1]
+            ]
+            terminal_entries = [
+                entry for entry in terminal_entries if self._fte_control_tails_by_task.get(entry[0]) is entry[1]
+            ]
+            terminal_errors = [
+                message
+                for task_key, ref, message in terminal_error_entries
+                if self._fte_control_tails_by_task.get(task_key) is ref
+            ]
+            statuses = [
+                status
+                for task_key, ref, status in status_entries
+                if self._fte_control_tails_by_task.get(task_key) is ref
+            ]
             for task_key, ref, _ in terminal_entries:
                 if self._fte_control_tails_by_task.get(task_key) is ref:
                     self._fte_control_tails_by_task.pop(task_key, None)
                     self._fte_control_query_by_task.pop(task_key, None)
                     self._fte_control_operation_by_task.pop(task_key, None)
-
-        terminal_error: FteControlBarrierTerminalError | None = None
-        if terminal_errors:
-            terminal_error = FteControlBarrierTerminalError(
-                f"FTE control barrier reached terminal failures for {query_key}: " + "; ".join(terminal_errors)
-            )
-            # Terminal entries are removed from the control tail above. Keep
-            # their failure visible across a simultaneous pending operation,
-            # fence retry, or remote-drop retry until final storage cleanup.
-            with self._fte_control_lock:
+            if terminal_errors:
+                terminal_error = FteControlBarrierTerminalError(
+                    f"FTE control barrier reached terminal failures for {query_key}: " + "; ".join(terminal_errors)
+                )
+                # Terminal entries are removed from the control tail above. Keep
+                # their failure visible across a simultaneous pending operation,
+                # fence retry, or remote-drop retry until final storage cleanup.
                 self._fte_prepare_terminal_errors.setdefault(query_key, terminal_error)
         if pending_entries:
             details = ["pending=" + ",".join(task_key for task_key, _, _ in pending_entries)]

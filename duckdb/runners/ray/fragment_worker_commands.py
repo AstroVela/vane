@@ -8,9 +8,14 @@ import sys
 import time
 from typing import TYPE_CHECKING, Any
 
+from duckdb.runners.common import QueryDeadlineExceeded
 from duckdb.runners.fte import fte_status_wait_timeout_s
-from duckdb.runners.fte.fte_events import FteCreateTaskCommand
-from duckdb.runners.fte.fte_scheduler import FteAttemptStatusWatcher
+from duckdb.runners.fte.fte_events import FteCreateTaskCommand, TaskStatusChanged
+from duckdb.runners.fte.fte_scheduler import (
+    FteAttemptStatusWatcher,
+    FteSplitQueueTerminal,
+    FteSplitSubmissionCancelled,
+)
 from duckdb.runners.ray.fragment_registry import (
     _FTE_CLOSING_QUERIES,
     _FTE_REGISTRY_LOCK,
@@ -46,6 +51,17 @@ def _fte_command_debug_log(event: str, **fields: Any) -> None:
     print("[vane-fte-command] " + " ".join(parts), file=sys.stderr, flush=True)
 
 
+class _FteQueryClosingEvent:
+    """Event-compatible view of one query's registry close state."""
+
+    def __init__(self, query_id: str) -> None:
+        self._query_id = str(query_id)
+
+    def is_set(self) -> bool:
+        with _FTE_REGISTRY_LOCK:
+            return self._query_id in _FTE_CLOSING_QUERIES
+
+
 class FteWorkerCommandMixin:
     if TYPE_CHECKING:
         # Supplied by the other mixins on the composed Ray worker handle.
@@ -58,16 +74,20 @@ class FteWorkerCommandMixin:
         fragment_execution: FteFragmentExecution,
         worker_commands: list[Any] | tuple[Any, ...],
     ) -> None:
+        terminal_attempts: set[str] = set()
         for command_index, command in enumerate(worker_commands):
             query_id = str(command.query_id)
+            attempt_id = getattr(command, "attempt_id", None)
+            if attempt_id is not None and str(attempt_id) in terminal_attempts:
+                continue
             if not begin_fte_registry_operation(query_id):
                 return
             try:
                 scheduler = _FTE_SCHEDULERS.get_or_create(query_id)
                 self._bind_fte_scheduler_handlers(scheduler)
+                query_closing = _FteQueryClosingEvent(query_id)
                 started_at = time.monotonic()
                 command_type = getattr(command, "command_type", type(command).__name__)
-                attempt_id = getattr(command, "attempt_id", None)
                 _fte_command_debug_log(
                     "execute_command_start",
                     command_index=command_index,
@@ -86,8 +106,32 @@ class FteWorkerCommandMixin:
                             command.partition_id,
                             command.attempt_id,
                         )
-                    scheduler.worker_command_executor.execute(command)
+                    scheduler.worker_command_executor.execute(
+                        command,
+                        cancel_event=query_closing,
+                    )
+                except FteSplitSubmissionCancelled:
+                    if query_closing.is_set():
+                        return
+                    raise
+                except FteSplitQueueTerminal as exc:
+                    if query_closing.is_set():
+                        return
+                    terminal_attempts.add(str(exc.attempt_id))
+                    scheduler.enqueue(
+                        TaskStatusChanged.from_status(
+                            query_id,
+                            exc.attempt_id,
+                            exc.status,
+                        ),
+                        priority=True,
+                    )
+                    continue
+                except QueryDeadlineExceeded:
+                    raise
                 except Exception as exc:
+                    if query_closing.is_set():
+                        return
                     _fte_command_debug_log(
                         "execute_command_error",
                         command_index=command_index,
