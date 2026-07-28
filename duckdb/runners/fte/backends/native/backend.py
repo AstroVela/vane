@@ -258,6 +258,16 @@ class _BackgroundEventLoop:
                     if failure is None:
                         failure = exc
                 try:
+                    # asyncio task cancellation does not stop work that has
+                    # already entered a synchronous native call through
+                    # asyncio.to_thread(). Join that owned executor before the
+                    # loop is considered closed so callers have a real native
+                    # execution barrier.
+                    loop.run_until_complete(loop.shutdown_default_executor())
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+                try:
                     loop.close()
                 except BaseException as exc:
                     if failure is None:
@@ -336,10 +346,8 @@ class _BackgroundEventLoop:
             future.cancel()
             raise TimeoutError(f"native FTE event-loop operation timed out after {timeout_s:.3f}s") from exc
 
-    def shutdown(self, timeout_s: float = 5.0) -> None:
-        timeout_s = float(timeout_s)
-        if not math.isfinite(timeout_s) or timeout_s < 0:
-            raise ValueError("native FTE event-loop shutdown timeout must be finite and non-negative")
+    def request_shutdown(self) -> None:
+        """Fence new work and ask the loop thread to begin teardown."""
         with self._condition:
             if self._state == self._CLOSED:
                 return
@@ -359,6 +367,13 @@ class _BackgroundEventLoop:
                     except BaseException as exc:
                         self._failure = exc
                 self._condition.notify_all()
+
+    def shutdown(self, timeout_s: float = 5.0) -> None:
+        timeout_s = float(timeout_s)
+        if not math.isfinite(timeout_s) or timeout_s < 0:
+            raise ValueError("native FTE event-loop shutdown timeout must be finite and non-negative")
+        self.request_shutdown()
+        with self._condition:
             thread = self._thread
         if thread is None or thread is threading.current_thread():
             return
@@ -1213,6 +1228,10 @@ class NativeWorkerHandle:
         if self._owns_loop:
             self._loop.shutdown()
 
+    def request_shutdown(self) -> None:
+        if self._owns_loop:
+            self._loop.request_shutdown()
+
 
 class NativeFteWorkerManagerBackend:
     def __init__(
@@ -1751,12 +1770,32 @@ class NativeFteWorkerManagerBackend:
         if worker_errors:
             raise RuntimeError(f"native FTE query teardown failed for {query_id}: " + "; ".join(worker_errors))
 
-    def shutdown(self) -> None:
+    def request_shutdown(self) -> None:
         if self._closed:
             return
         self._closing = True
         self._stop_debug_sampler()
         worker_errors: list[str] = []
+        for worker in self._workers:
+            request_shutdown = getattr(worker, "request_shutdown", None)
+            if not callable(request_shutdown):
+                continue
+            worker_id = str(getattr(worker, "worker_id", "") or "<unknown>")
+            try:
+                request_shutdown()
+            except BaseException as exc:
+                worker_errors.append(f"{worker_id}: {type(exc).__name__}: {exc}")
+        if worker_errors:
+            raise RuntimeError("native FTE worker manager shutdown request failed: " + "; ".join(worker_errors))
+
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        worker_errors: list[str] = []
+        try:
+            self.request_shutdown()
+        except BaseException as exc:
+            worker_errors.append(f"request: {type(exc).__name__}: {exc}")
         for worker in self._workers:
             worker_id = str(getattr(worker, "worker_id", "") or "<unknown>")
             try:

@@ -163,3 +163,140 @@ def test_local_runner_collects_udf_actor_shutdown_errors_after_attempting_every_
     assert "second cleanup failed" in str(graceful_errors[0])
     assert len(forced_errors) == 1
     assert "second cleanup failed" in str(forced_errors[0])
+
+
+def test_local_runner_teardown_releases_actor_pools_after_execution_resources():
+    from duckdb.runners.local.runner import _shutdown_local_write_resources
+
+    events = []
+
+    class FakeBackend:
+        def request_shutdown(self):
+            events.append("backend-request")
+
+        def shutdown(self):
+            events.append("backend-join")
+
+    class FakeFragmentExecutor:
+        def request_shutdown(self):
+            events.append("fragments-request")
+
+        def close(self):
+            events.append("fragments-close")
+
+    class FakeConn:
+        def close(self):
+            events.append("connection")
+
+    class FakePool:
+        def __init__(self, name):
+            self.name = name
+
+        def shutdown(self, *, kill):
+            events.append(f"pool:{self.name}:{kill}")
+
+    errors = _shutdown_local_write_resources(
+        FakeBackend(),
+        FakeFragmentExecutor(),
+        FakeConn(),
+        [FakePool("first"), FakePool("second")],
+        kill_actor_pools=True,
+    )
+
+    assert errors == []
+    assert events == [
+        "backend-request",
+        "fragments-request",
+        "backend-join",
+        "fragments-close",
+        "pool:second:True",
+        "pool:first:True",
+        "connection",
+    ]
+
+
+def test_local_runner_teardown_keeps_dependencies_when_backend_does_not_stop():
+    from duckdb.runners.local.runner import _shutdown_local_write_resources
+
+    events = []
+
+    class FakeBackend:
+        def request_shutdown(self):
+            events.append("backend-request")
+
+        def shutdown(self):
+            events.append("backend-join")
+            raise RuntimeError("backend join timed out")
+
+    class FakeFragmentExecutor:
+        def request_shutdown(self):
+            events.append("fragments-request")
+
+        def close(self):
+            raise AssertionError("fragment resources must remain alive")
+
+    class UnexpectedConn:
+        def close(self):
+            raise AssertionError("driver connection must remain alive")
+
+    class UnexpectedPool:
+        def shutdown(self, *, kill):
+            raise AssertionError("actor pool must remain alive")
+
+    errors = _shutdown_local_write_resources(
+        FakeBackend(),
+        FakeFragmentExecutor(),
+        UnexpectedConn(),
+        [UnexpectedPool()],
+        kill_actor_pools=True,
+    )
+
+    assert events == ["backend-request", "fragments-request", "backend-join"]
+    assert len(errors) == 1
+    assert "backend join timed out" in str(errors[0])
+
+
+def test_local_runner_teardown_keeps_dependencies_when_fragment_close_fails():
+    from duckdb.runners.local.runner import _shutdown_local_write_resources
+
+    events = []
+
+    class FakeBackend:
+        def request_shutdown(self):
+            events.append("backend-request")
+
+        def shutdown(self):
+            events.append("backend-join")
+
+    class FakeFragmentExecutor:
+        def request_shutdown(self):
+            events.append("fragments-request")
+
+        def close(self):
+            events.append("fragments-close")
+            raise RuntimeError("fragment close failed")
+
+    class UnexpectedConn:
+        def close(self):
+            raise AssertionError("driver connection must remain alive")
+
+    class UnexpectedPool:
+        def shutdown(self, *, kill):
+            raise AssertionError("actor pool must remain alive")
+
+    errors = _shutdown_local_write_resources(
+        FakeBackend(),
+        FakeFragmentExecutor(),
+        UnexpectedConn(),
+        [UnexpectedPool()],
+        kill_actor_pools=False,
+    )
+
+    assert len(errors) == 1
+    assert "fragment close failed" in str(errors[0])
+    assert events == [
+        "backend-request",
+        "fragments-request",
+        "backend-join",
+        "fragments-close",
+    ]

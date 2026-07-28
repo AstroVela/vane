@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import threading
@@ -102,6 +103,46 @@ def _shutdown_udf_actor_pools(actor_pools: list[Any], *, kill: bool) -> list[Bas
     return errors
 
 
+def _shutdown_local_write_resources(
+    backend: Any,
+    fragment_executor: Any,
+    conn: Any,
+    actor_pools: list[Any],
+    *,
+    kill_actor_pools: bool,
+) -> list[BaseException]:
+    """Stop execution before releasing any resource a fragment may still use."""
+    errors: list[BaseException] = []
+    try:
+        backend.request_shutdown()
+    except BaseException as exc:
+        errors.append(exc)
+
+    try:
+        fragment_executor.request_shutdown()
+    except BaseException as exc:
+        errors.append(exc)
+
+    try:
+        backend.shutdown()
+    except BaseException as exc:
+        errors.append(exc)
+        return errors
+
+    try:
+        fragment_executor.close()
+    except BaseException as exc:
+        errors.append(exc)
+        return errors
+
+    errors.extend(_shutdown_udf_actor_pools(actor_pools, kill=kill_actor_pools))
+    try:
+        conn.close()
+    except BaseException as exc:
+        errors.append(exc)
+    return errors
+
+
 def _native_task_maps_from_context(context: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any]]:
     scan_task_map: dict[str, Any] = {}
     exchange_source_task_map: dict[str, Any] = {}
@@ -118,23 +159,110 @@ def _native_task_maps_from_context(context: dict[str, Any] | None) -> tuple[dict
 
 
 class _InProcessFragmentExecutor:
-    def __init__(self) -> None:
+    def __init__(self, *, close_timeout_s: float = 30.0) -> None:
+        close_timeout_s = float(close_timeout_s)
+        if not math.isfinite(close_timeout_s) or close_timeout_s <= 0:
+            raise ValueError("local fragment executor close timeout must be finite and positive")
+        self._close_timeout_s = close_timeout_s
         self._local = threading.local()
-        self._resources_lock = threading.Lock()
+        self._resources_lock = threading.RLock()
+        self._resources_condition = threading.Condition(self._resources_lock)
         self._plan_clone_lock = threading.Lock()
         self._connections: list[Any] = []
         self._plan_runners: list[Any] = []
+        self._retained_resources: list[Any] = []
+        self._active_cursors: set[Any] = set()
+        self._in_flight = 0
+        self._closing = False
+        self._closed = False
 
-    def close(self) -> None:
-        with self._resources_lock:
+    def retain_resources(self, *resources: Any) -> None:
+        with self._resources_condition:
+            if self._closing or self._closed:
+                raise RuntimeError("local fragment executor is closing")
+            self._retained_resources.extend(resource for resource in resources if resource is not None)
+
+    def _begin_execution(self) -> None:
+        with self._resources_condition:
+            if self._closing or self._closed:
+                raise RuntimeError("local fragment executor is closing")
+            self._in_flight += 1
+
+    def _end_execution(self) -> None:
+        with self._resources_condition:
+            if self._in_flight <= 0:
+                raise RuntimeError("local fragment executor execution ownership underflow")
+            self._in_flight -= 1
+            self._resources_condition.notify_all()
+
+    def _register_cursor(self, cursor: Any) -> bool:
+        with self._resources_condition:
+            self._active_cursors.add(cursor)
+            return not self._closing
+
+    def _unregister_cursor(self, cursor: Any) -> None:
+        with self._resources_condition:
+            self._active_cursors.discard(cursor)
+            self._resources_condition.notify_all()
+
+    def request_shutdown(self) -> None:
+        """Fence new fragment calls and interrupt cursors currently in native execution."""
+        with self._resources_condition:
+            if self._closed:
+                return
+            self._closing = True
+            active_cursors = list(self._active_cursors)
+
+        interrupt_errors: list[BaseException] = []
+        for cursor in active_cursors:
+            try:
+                cursor.interrupt()
+            except BaseException as exc:
+                interrupt_errors.append(exc)
+        if interrupt_errors:
+            details = "; ".join(f"{type(error).__name__}: {error}" for error in interrupt_errors)
+            raise RuntimeError(f"failed to interrupt local fragment execution during close: {details}") from (
+                interrupt_errors[0]
+            )
+
+    def close(self, *, timeout_s: float | None = None) -> None:
+        timeout_s = self._close_timeout_s if timeout_s is None else float(timeout_s)
+        if not math.isfinite(timeout_s) or timeout_s < 0:
+            raise ValueError("local fragment executor close timeout must be finite and non-negative")
+        deadline = time.monotonic() + timeout_s
+        request_error: BaseException | None = None
+        with self._resources_condition:
+            if self._closed:
+                return
+            shutdown_requested = self._closing
+        if not shutdown_requested:
+            try:
+                self.request_shutdown()
+            except BaseException as exc:
+                request_error = exc
+        with self._resources_condition:
+            while self._in_flight > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        f"local fragment executor did not drain before close: active_executions={self._in_flight}"
+                    )
+                self._resources_condition.wait(timeout=remaining)
             connections = list(self._connections)
             self._connections.clear()
             self._plan_runners.clear()
+            retained_resources = self._retained_resources
+            self._retained_resources = []
+            self._active_cursors.clear()
+            self._closed = True
         for conn in connections:
             try:
                 conn.close()
             except Exception:
                 pass
+        retained_resources.clear()
+        if request_error is not None:
+            raise request_error
 
     @staticmethod
     def _configure_conn(conn: Any) -> None:
@@ -174,22 +302,33 @@ class _InProcessFragmentExecutor:
         return plan_runner
 
     def __call__(self, request: Mapping[str, Any]) -> Any:
-        request_payload = dict(request)
-        context = NativeFteWorkerManagerBackend.materialize_task_context(
-            request_payload,
-            merge_scan_task_descriptors=require_ray_cxx_attr("merge_scan_task_descriptors"),
-        )
-        scan_task_map, exchange_source_task_map = _native_task_maps_from_context(context)
-        plan = request_payload.get("fragment_plan")
-        if plan is None:
-            raise RuntimeError("local fragment execution requires fragment_plan")
-
-        conn = self._get_conn()
-        if hasattr(plan, "clone"):
-            with self._plan_clone_lock:
-                plan = plan.clone(conn)
-        cursor = conn.cursor()
+        self._begin_execution()
+        cursor = None
+        cursor_registered = False
         try:
+            request_payload = dict(request)
+            context = NativeFteWorkerManagerBackend.materialize_task_context(
+                request_payload,
+                merge_scan_task_descriptors=require_ray_cxx_attr("merge_scan_task_descriptors"),
+            )
+            scan_task_map, exchange_source_task_map = _native_task_maps_from_context(context)
+            plan = request_payload.get("fragment_plan")
+            if plan is None:
+                raise RuntimeError("local fragment execution requires fragment_plan")
+
+            conn = self._get_conn()
+            if hasattr(plan, "clone"):
+                with self._plan_clone_lock:
+                    plan = plan.clone(conn)
+            cursor = conn.cursor()
+            accepting_work = self._register_cursor(cursor)
+            cursor_registered = True
+            if not accepting_work:
+                try:
+                    cursor.interrupt()
+                except Exception:
+                    pass
+                raise RuntimeError("local fragment executor is closing")
             return self._get_plan_runner().execute_native(
                 cursor,
                 plan,
@@ -204,9 +343,16 @@ class _InProcessFragmentExecutor:
             )
         finally:
             try:
-                cursor.close()
+                if cursor is not None:
+                    cursor.close()
             except Exception:
                 pass
+            finally:
+                try:
+                    if cursor_registered:
+                        self._unregister_cursor(cursor)
+                finally:
+                    self._end_execution()
 
 
 class LocalRunner(Runner):
@@ -269,6 +415,11 @@ class LocalRunner(Runner):
             from duckdb.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
 
             udf_actor_pools, _ = ensure_local_subprocess_actor_pools_for_plan(physical_plan, conn=conn)
+            # If a bounded backend shutdown ever times out, an in-flight native
+            # call still owns this executor. Keep its driver and actor
+            # dependencies reachable until the explicit fragment drain
+            # succeeds instead of letting local-variable teardown destroy them.
+            fragment_executor.retain_resources(conn, *udf_actor_pools)
             plan_runner = DistributedPhysicalPlanRunner(backend)
 
             started_at = time.time()
@@ -304,20 +455,13 @@ class LocalRunner(Runner):
                 write_executor.shutdown(wait=True)
         finally:
             primary_error_active = sys.exc_info()[0] is not None
-            actor_cleanup_errors = _shutdown_udf_actor_pools(
+            cleanup_errors = _shutdown_local_write_resources(
+                backend,
+                fragment_executor,
+                conn,
                 udf_actor_pools,
-                kill=not write_succeeded,
+                kill_actor_pools=not write_succeeded,
             )
-            try:
-                backend.shutdown()
-            finally:
-                fragment_executor.close()
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            if write_succeeded and not primary_error_active and actor_cleanup_errors:
-                details = "; ".join(f"{type(error).__name__}: {error}" for error in actor_cleanup_errors)
-                raise RuntimeError(
-                    f"failed to gracefully shut down {len(actor_cleanup_errors)} local UDF actor pool(s): {details}"
-                ) from actor_cleanup_errors[0]
+            if write_succeeded and not primary_error_active and cleanup_errors:
+                details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
+                raise RuntimeError(f"failed to shut down local write resources: {details}") from cleanup_errors[0]

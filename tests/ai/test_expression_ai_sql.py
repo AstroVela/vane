@@ -6,9 +6,12 @@ from __future__ import annotations
 import logging
 import os
 import pickle
+import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
@@ -478,6 +481,65 @@ def test_ai_prompt_sql_with_mock_provider():
     """).fetchall()
 
     assert rows == [("topic:alpha",), ("topic:beta",)]
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        pytest.param(
+            """
+            ai_prompt(
+                'describe',
+                struct_pack(provider := 'mock_ai_sql', model := 'text-model', concurrency := 1)
+            )
+            """,
+            "text-model:describe",
+            id="prompt",
+        ),
+        pytest.param(
+            """
+            ai_embed(
+                'abc',
+                struct_pack(provider := 'mock_ai_sql', dimensions := 4, concurrency := 1)
+            )
+            """,
+            [3.0, 3.0, 3.0, 3.0],
+            id="embed",
+        ),
+    ],
+)
+def test_ai_sql_full_local_copy_in_subprocess(tmp_path, expression, expected):
+    repo_root = Path(__file__).resolve().parents[2]
+    output = tmp_path / "ai-local-copy.parquet"
+    script = f"""
+import vane
+from vane.ai import provider as provider_registry
+from duckdb.runners.fte.backends.native.backend import _NativeFteProgressRegistry
+from tests.ai.test_expression_ai_sql import MockProvider
+
+# Keep this teardown regression focused on #214. Live UDF counters currently
+# trigger the independent progress-topology failure tracked by #239.
+_NativeFteProgressRegistry._topology_from_task_stats = staticmethod(lambda _task_stats: None)
+provider_registry.PROVIDERS["mock_ai_sql"] = lambda name=None, **options: MockProvider()
+vane.configure(runner="local")
+conn = vane.connect()
+conn.sql({f"SELECT {expression} AS result"!r}).write_parquet({str(output)!r})
+row = conn.read_parquet({str(output)!r}).fetchone()
+assert row == ({expected!r},), row
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo_root)
+    env["PYTHONFAULTHANDLER"] = "1"
+    env["VANE_PROGRESS"] = "0"
+
+    subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        cwd=repo_root,
+        env=env,
+        timeout=60,
+    )
+    assert output.exists()
 
 
 @pytest.mark.parametrize(
