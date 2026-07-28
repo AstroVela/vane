@@ -45,7 +45,7 @@ try:
         UpperActor()(vane.col("text")).alias("upper_text"),
     )
 
-    parts = list(runner.run_iter_tables(result, results_buffer_size=1))
+    parts = list(runner.run_iter_tables(result))
     table = pa.concat_tables(parts).rename_columns(list(result.columns))
     rows = sorted(table.to_pylist(), key=lambda row: row["id"])
     assert rows == [
@@ -89,7 +89,7 @@ vane.configure(runner="ray")
 
 
 def collect_table(runner, relation):
-    parts = list(runner.run_iter_tables(relation, results_buffer_size=1))
+    parts = list(runner.run_iter_tables(relation))
     tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
     return pa.concat_tables(tables)
 
@@ -269,7 +269,7 @@ class StatefulBatchCounter:
 
 
 def collect_table(runner, relation):
-    parts = list(runner.run_iter_tables(relation, results_buffer_size=1))
+    parts = list(runner.run_iter_tables(relation))
     tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
     return pa.concat_tables(tables)
 
@@ -399,7 +399,7 @@ vane.configure(runner="ray")
 
 
 def collect_table(runner, relation):
-    parts = list(runner.run_iter_tables(relation, results_buffer_size=1))
+    parts = list(runner.run_iter_tables(relation))
     tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
     return pa.concat_tables(tables)
 

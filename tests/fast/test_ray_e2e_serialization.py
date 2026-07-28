@@ -93,7 +93,7 @@ def test_streaming_metadata_and_rows_full_execution(tmp_path):
 
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
-    parts = list(runner.run_iter_tables(relation, results_buffer_size=1))
+    parts = list(runner.run_iter_tables(relation))
     tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
     result = pa.concat_tables(tables)
 

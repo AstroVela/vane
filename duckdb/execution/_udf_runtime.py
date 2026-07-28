@@ -443,6 +443,7 @@ class UDFExecutor:
             raise ValueError("UDF payload is required")
         self._queue: deque[pa.Table] = deque()
         self._finished_submitting = False
+        self._closed = False
         self._call_mode = str(payload.get("call_mode") or "")
         if self._call_mode not in ("map_batches", "map_batches_rows", "flat_map", "map"):
             raise ValueError("UDF payload.call_mode must be one of: map_batches, map_batches_rows, flat_map, map")
@@ -874,6 +875,16 @@ class UDFExecutor:
         if self._is_map_batches:
             self._execute_map_batches_compute_batches(self._flush_map_batches_compute_batches())
         self._finished_submitting = True
+
+    def close(self) -> None:
+        """Flush buffered work and deterministically release the loaded callable."""
+        if self._closed:
+            return
+        try:
+            self.finished_submitting()
+        finally:
+            self._closed = True
+            self._map_fn = None
 
     def all_tasks_finished(self) -> bool:
         return self._finished_submitting and not self._queue

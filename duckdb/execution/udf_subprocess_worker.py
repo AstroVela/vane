@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import socket
 import struct
@@ -22,6 +23,7 @@ from duckdb.execution._common import callable_cache_enabled as _callable_cache_e
 from duckdb.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
 from duckdb.execution.ref_bundle import (
     _open_existing_shm,
+    _require_shm_buffer,
     make_local_shm_ref_bundle_descriptor,
     materialize_ref_bundle,
     payload_requests_local_ref_bundle_output,
@@ -48,10 +50,15 @@ _MSG_OUTPUT_GRANT_REQUEST = 0x0C
 _MSG_OUTPUT_GRANT_GRANTED = 0x0D
 _MSG_OUTPUT_GRANT_CANCELLED = 0x0E
 _MSG_OUTPUT_GRANT_RELEASE = 0x0F
+_MSG_TASK_CANCELLED = 0x10
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
 _DEFAULT_SHM_SIZE = 1 << 20
+
+
+class _TaskCancelledError(RuntimeError):
+    """The parent cancelled this task without invalidating the worker."""
 
 
 def _debug_enabled() -> bool:
@@ -160,13 +167,6 @@ def _recv_message(sock: socket.socket) -> tuple[int, bytes]:
     return msg_type, payload
 
 
-def _require_shm_buffer(shm: shared_memory.SharedMemory) -> memoryview[int]:
-    buffer = shm.buf
-    if buffer is None:
-        raise RuntimeError("shared memory mapping is closed")
-    return buffer
-
-
 def _read_ipc_from_shm(shm: shared_memory.SharedMemory, size: int | None = None) -> bytes:
     buffer = _require_shm_buffer(shm)
     ipc_size = _IPC_HEADER.unpack_from(buffer, 0)[0]
@@ -191,10 +191,10 @@ def _write_ipc_to_shm(shm: shared_memory.SharedMemory, ipc_bytes: bytes) -> int:
 
 
 def _resize_shm(shm: shared_memory.SharedMemory, required: int) -> shared_memory.SharedMemory:
-    buffer = _require_shm_buffer(shm)
-    if required <= len(buffer):
+    capacity = len(_require_shm_buffer(shm))
+    if required <= capacity:
         return shm
-    new_size = max(required, len(buffer) * 2, _DEFAULT_SHM_SIZE)
+    new_size = max(required, capacity * 2, _DEFAULT_SHM_SIZE)
     name = shm.name
     path = f"/dev/shm/{name}"
     fd = os.open(path, os.O_RDWR)
@@ -225,7 +225,11 @@ def _format_exception(exc: BaseException) -> str:
         return repr(exc)
 
 
-def _send_input_consumed(sock: socket.socket, ref_bundle: dict[str, Any], input_table: pa.Table) -> None:
+def _send_input_consumed(
+    sock: socket.socket,
+    ref_bundle: dict[str, Any],
+    input_table: pa.Table,
+) -> None:
     lease_id = ref_bundle.get("input_lease_id")
     if lease_id is None:
         return
@@ -238,7 +242,11 @@ def _send_input_consumed(sock: socket.socket, ref_bundle: dict[str, Any], input_
     _send_message(sock, _MSG_INPUT_CONSUMED, duckdb_pickle.dumps(payload))
 
 
-def _send_input_consume_failed(sock: socket.socket, ref_bundle: dict[str, Any], exc: BaseException) -> None:
+def _send_input_consume_failed(
+    sock: socket.socket,
+    ref_bundle: dict[str, Any],
+    exc: BaseException,
+) -> None:
     lease_id = ref_bundle.get("input_lease_id")
     if lease_id is None:
         return
@@ -269,7 +277,7 @@ def _request_output_grant(
     msg_type, payload_data = _recv_message(sock)
     if msg_type == _MSG_OUTPUT_GRANT_CANCELLED:
         error = payload_data.decode("utf-8", errors="replace") or "local_shm output grant cancelled"
-        raise RuntimeError(error)
+        raise _TaskCancelledError(error)
     if msg_type != _MSG_OUTPUT_GRANT_GRANTED:
         raise RuntimeError(f"unexpected output grant response: {msg_type:#x}")
     response = duckdb_pickle.loads(payload_data)
@@ -468,7 +476,23 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
         while not close_requested:
             msg_type, payload_data = _recv_message(sock)
             if msg_type == _MSG_CLOSE:
-                _send_message(sock, _MSG_ACK)
+                cleanup_error: BaseException | None = None
+                try:
+                    if executor is not None:
+                        executor.close()
+                except BaseException as exc:
+                    cleanup_error = exc
+                finally:
+                    executor = None
+                    gc.collect()
+                if cleanup_error is None:
+                    _send_message(sock, _MSG_ACK)
+                else:
+                    _send_message(
+                        sock,
+                        _MSG_ERROR,
+                        _format_exception(cleanup_error).encode("utf-8", errors="replace"),
+                    )
                 close_requested = True
                 continue
             if msg_type == _MSG_FINISHED:
@@ -488,7 +512,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                 input_lease_id = None
                 if msg_type == _MSG_SUBMIT:
                     input_size = struct.unpack("<Q", payload_data)[0]
-                    if input_size > len(data_shm.buf):
+                    if input_size > len(_require_shm_buffer(data_shm)):
                         name = data_shm.name
                         data_shm.close()
                         data_shm = _open_existing_shm(name, track=False)
@@ -553,6 +577,8 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                         result_msg_type=result_msg_type,
                     )
                 _send_message(sock, result_msg_type, result_payload)
+            except _TaskCancelledError as exc:
+                _send_message(sock, _MSG_TASK_CANCELLED, str(exc).encode("utf-8", errors="replace"))
             except Exception as exc:
                 _send_message(sock, _MSG_ERROR, _format_exception(exc).encode("utf-8", errors="replace"))
     except Exception as exc:
@@ -561,6 +587,13 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
         except Exception:
             pass
     finally:
+        if executor is not None:
+            try:
+                executor.close()
+            except Exception:
+                pass
+            executor = None
+            gc.collect()
         try:
             payload_shm.close()
         except Exception:

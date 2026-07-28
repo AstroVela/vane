@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 import uuid
@@ -89,6 +90,16 @@ def _copy_output_info_from_context(context: dict[str, Any] | None) -> dict[str, 
         "run_id": str(run_id or ""),
         "remote_base": str(remote_base or ""),
     }
+
+
+def _shutdown_udf_actor_pools(actor_pools: list[Any], *, kill: bool) -> list[BaseException]:
+    errors: list[BaseException] = []
+    for pool in reversed(actor_pools):
+        try:
+            pool.shutdown(kill=kill)
+        except BaseException as exc:
+            errors.append(exc)
+    return errors
 
 
 def _native_task_maps_from_context(context: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -215,10 +226,10 @@ class LocalRunner(Runner):
         os.environ["VANE_LOCAL_FTE_WORKERS"] = str(self.num_workers)
         os.environ["VANE_LOCAL_FTE_EXECUTION_MODE"] = self.execution_mode
 
-    def run_iter(self, relation: Any, results_buffer_size: int | None = None) -> Iterator[Any]:
+    def run_iter(self, relation: Any) -> Iterator[Any]:
         raise NotImplementedError("local FTE run_iter is not implemented yet")
 
-    def run_iter_tables(self, relation: Any, results_buffer_size: int | None = None) -> Iterator[pa.Table]:
+    def run_iter_tables(self, relation: Any) -> Iterator[pa.Table]:
         raise NotImplementedError("local FTE run_iter_tables is not implemented yet")
 
     @staticmethod
@@ -250,8 +261,9 @@ class LocalRunner(Runner):
             num_workers=self.num_workers,
             max_running_tasks=self.max_running_tasks,
         )
-        udf_actor_pools = []
+        udf_actor_pools: list[Any] = []
         renderer = None
+        write_succeeded = False
         try:
             physical_plan = logical_plan.to_physical_plan(conn)
             from duckdb.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
@@ -267,7 +279,6 @@ class LocalRunner(Runner):
                 return plan_runner.run_copy_plan(physical_plan, conn)
 
             write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vane-local-fte-write")
-            write_succeeded = False
             try:
                 future = write_executor.submit(execute_write)
                 if renderer is None:
@@ -292,11 +303,11 @@ class LocalRunner(Runner):
                     renderer.finish(final_state="FINISHED" if write_succeeded else None)
                 write_executor.shutdown(wait=True)
         finally:
-            for pool in reversed(udf_actor_pools):
-                try:
-                    pool.shutdown(kill=True)
-                except Exception:
-                    pass
+            primary_error_active = sys.exc_info()[0] is not None
+            actor_cleanup_errors = _shutdown_udf_actor_pools(
+                udf_actor_pools,
+                kill=not write_succeeded,
+            )
             try:
                 backend.shutdown()
             finally:
@@ -305,3 +316,8 @@ class LocalRunner(Runner):
                     conn.close()
                 except Exception:
                     pass
+            if write_succeeded and not primary_error_active and actor_cleanup_errors:
+                details = "; ".join(f"{type(error).__name__}: {error}" for error in actor_cleanup_errors)
+                raise RuntimeError(
+                    f"failed to gracefully shut down {len(actor_cleanup_errors)} local UDF actor pool(s): {details}"
+                ) from actor_cleanup_errors[0]

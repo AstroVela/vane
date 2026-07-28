@@ -930,7 +930,7 @@ class FteTaskExecution:
     def no_more_splits(self, source_node_id: str) -> TaskStatus:
         with self._status_lock:
             if self.status.state in _TERMINAL_STATES:
-                raise RuntimeError(f"cannot update terminal task {self.task_id}")
+                return self.status
             source_node_id = str(source_node_id)
             changed = source_node_id not in self.no_more_split_sources
             if changed:

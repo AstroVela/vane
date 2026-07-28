@@ -132,3 +132,34 @@ rows = conn.sql(f"select count(*), sum(x) from read_parquet('{dst}')").fetchone(
 assert rows == (20, 190)
 """
     subprocess.run([sys.executable, "-c", script], check=True)
+
+
+def test_local_runner_collects_udf_actor_shutdown_errors_after_attempting_every_pool():
+    from duckdb.runners.local.runner import _shutdown_udf_actor_pools
+
+    calls = []
+
+    class FakePool:
+        def __init__(self, name, *, fail=False):
+            self.name = name
+            self.fail = fail
+
+        def shutdown(self, *, kill):
+            calls.append((self.name, kill))
+            if self.fail:
+                raise RuntimeError(f"{self.name} cleanup failed")
+
+    pools = [FakePool("first"), FakePool("second", fail=True)]
+    graceful_errors = _shutdown_udf_actor_pools(pools, kill=False)
+    forced_errors = _shutdown_udf_actor_pools(pools, kill=True)
+
+    assert calls == [
+        ("second", False),
+        ("first", False),
+        ("second", True),
+        ("first", True),
+    ]
+    assert len(graceful_errors) == 1
+    assert "second cleanup failed" in str(graceful_errors[0])
+    assert len(forced_errors) == 1
+    assert "second cleanup failed" in str(forced_errors[0])

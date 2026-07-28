@@ -17,13 +17,11 @@ import duckdb
 class _FakeRayRunner:
     def __init__(self, tables: list[pa.Table]) -> None:
         self.tables = tables
-        self.calls: list[tuple[duckdb.DuckDBPyRelation, int | None]] = []
+        self.calls: list[duckdb.DuckDBPyRelation] = []
         self.closed_iterators = 0
 
-    def run_iter_tables(
-        self, relation: duckdb.DuckDBPyRelation, results_buffer_size: int | None = None
-    ) -> Iterator[pa.Table]:
-        self.calls.append((relation, results_buffer_size))
+    def run_iter_tables(self, relation: duckdb.DuckDBPyRelation) -> Iterator[pa.Table]:
+        self.calls.append(relation)
         try:
             yield from self.tables
         finally:
@@ -97,7 +95,6 @@ def test_distributed_row_cursor_is_shared_across_fetch_methods(monkeypatch):
     assert relation.fetchall() == [(3, "three")]
 
     assert len(runner.calls) == 1
-    assert runner.calls[0][1] == 1
     assert runner.closed_iterators == 1
 
 
@@ -137,7 +134,7 @@ def test_distributed_execute_reports_runner_start_error(monkeypatch):
         def __init__(self) -> None:
             self.calls = 0
 
-        def run_iter_tables(self, _relation, results_buffer_size=None):
+        def run_iter_tables(self, _relation):
             self.calls += 1
             raise RuntimeError("runner failed before first partition")
             yield  # pragma: no cover
@@ -157,8 +154,7 @@ def test_distributed_result_reports_midstream_runner_error(monkeypatch):
         def __init__(self) -> None:
             self.closed_iterators = 0
 
-        def run_iter_tables(self, _relation, results_buffer_size=None):
-            del results_buffer_size
+        def run_iter_tables(self, _relation):
             try:
                 yield pa.table({"c0": pa.array([1], pa.int64())})
                 raise RuntimeError("runner failed after first partition")
@@ -681,7 +677,7 @@ def test_distributed_runner_error_does_not_fall_back_to_local(monkeypatch):
         def __init__(self) -> None:
             self.calls = 0
 
-        def run_iter_tables(self, _relation, results_buffer_size=None):
+        def run_iter_tables(self, _relation):
             self.calls += 1
             raise NotImplementedError("unsupported distributed plan")
             yield  # pragma: no cover
@@ -760,4 +756,4 @@ def test_distributed_repr_uses_common_result_source(monkeypatch):
     assert "42" in output
     assert "999" not in output
     assert len(runner.calls) == 1
-    assert "LIMIT 10000" in runner.calls[0][0].sql_query().upper()
+    assert "LIMIT 10000" in runner.calls[0].sql_query().upper()

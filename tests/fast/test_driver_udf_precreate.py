@@ -5,13 +5,13 @@ from __future__ import annotations
 
 import asyncio
 import os
-import queue
 import subprocess
 import sys
 import textwrap
 import threading
 import types
 import uuid
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -1022,23 +1022,45 @@ def test_local_subprocess_actor_pool_rejects_multi_actor_stateful_payload():
 
 
 def test_local_stateful_actor_loss_includes_udf_pid_and_recoverability_context():
+    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
     from duckdb.execution.udf_subprocess import LocalSubprocessActorPool
+
+    class LostWorker:
+        def __init__(self):
+            self._proc = SimpleNamespace(pid=4242)
+            self._actor_lost = False
+            self.lost = False
+
+        def is_reusable(self):
+            return not self.lost
+
+        def _run_in_execution_scope(self, scope, fn):
+            return fn(self)
 
     pool = LocalSubprocessActorPool.__new__(LocalSubprocessActorPool)
     pool.payload = {"udf_name": "local_counter", "stateful": True}
     pool.pool_size = 1
     pool.name = "local-counter-pool"
-    pool._lock = threading.Lock()
+    pool._closed = False
+    pool._lock = threading.RLock()
+    pool._cond = threading.Condition(pool._lock)
     pool._active = 0
-    pool._idle_workers = queue.Queue()
-    pool._idle_workers.put(0)
-    pool._workers = [SimpleNamespace(_proc=SimpleNamespace(pid=4242), _actor_lost=True)]
+    pool._terminal_error = None
+    pool._active_scopes = {}
+    pool._worker_generations = [0]
+    pool._replacing_workers = set()
+    pool._aborting_workers = set()
+    pool._idle_workers = deque([(0, 0)])
+    pool._workers = [LostWorker()]
+    pool.admission_slots = SimpleNamespace(close=lambda: None)
 
-    def fail_after_actor_loss(_worker):
+    def fail_after_actor_loss(worker):
+        worker.lost = True
+        worker._actor_lost = True
         raise RuntimeError("UDF subprocess communication failed")
 
     with pytest.raises(RuntimeError, match="local_counter.*pid 4242.*state was not recoverable"):
-        pool._run(fail_after_actor_loss)
+        pool._run(fail_after_actor_loss, ExecutionCancellationScope("test-executor", 1))
 
 
 def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):

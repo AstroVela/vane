@@ -1190,7 +1190,7 @@ void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
 			auto py_relation = DuckDBPyRelation(rel);
 			py_relation.SetConnectionOwner(connection_owner);
 			auto py_relation_obj = py::cast(std::move(py_relation));
-			table_iterator = py::iter(runner_for_db.runner.attr("run_iter_tables")(py_relation_obj, py::int_(1)));
+			table_iterator = py::iter(runner_for_db.runner.attr("run_iter_tables")(py_relation_obj));
 			py::object prefetched_partition;
 			bool has_prefetched_partition = false;
 			bool iterator_exhausted = false;

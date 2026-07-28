@@ -74,7 +74,7 @@ def run_demo(no_ray_init: bool = False, verbose: bool = False) -> None:
     logger.info("Printing partitions using runner.run_iter_tables for explicit iteration:")
     runner = duckdb.get_or_create_runner()
     builder = df._builder
-    for table in runner.run_iter_tables(builder, results_buffer_size=1):
+    for table in runner.run_iter_tables(builder):
         try:
             print(table.to_pandas())
         except Exception:
