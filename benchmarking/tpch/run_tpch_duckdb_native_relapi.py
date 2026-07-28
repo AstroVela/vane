@@ -53,7 +53,6 @@ def _run_query_native_in_subprocess(
     parquet_folder: str,
     qnum: int,
     threads: int | None,
-    results_buffer_size: int | None,
     child_verbose: bool,
 ) -> None:
     """Subprocess target: run a single query via NativeRunner and return row count.
@@ -101,7 +100,7 @@ def _run_query_native_in_subprocess(
 
         t0 = time.time()
         row_count = 0
-        for table in runner.run_iter_tables(rel, results_buffer_size):
+        for table in runner.run_iter_tables(rel):
             row_count += table.num_rows
         elapsed = time.time() - t0
 
@@ -115,7 +114,6 @@ def run_query_native_with_timeout(
     parquet_folder: str,
     qnum: int,
     threads: int | None,
-    results_buffer_size: int | None,
     timeout: int,
     child_verbose: bool,
 ) -> tuple[str, float, int | str]:
@@ -123,7 +121,7 @@ def run_query_native_with_timeout(
     queue: multiprocessing.Queue = multiprocessing.Queue()
     proc = multiprocessing.Process(
         target=_run_query_native_in_subprocess,
-        args=(queue, parquet_folder, qnum, threads, results_buffer_size, child_verbose),
+        args=(queue, parquet_folder, qnum, threads, child_verbose),
     )
     proc.start()
     proc.join(timeout=timeout)
@@ -174,12 +172,6 @@ if __name__ == "__main__":
     parser.add_argument("--threads", default=None, type=int, help="Number of DuckDB threads (default: all cores)")
     parser.add_argument(
         "--timeout", default=300, type=int, help="Per-query subprocess timeout in seconds (default: 300)"
-    )
-    parser.add_argument(
-        "--results-buffer-size",
-        default=None,
-        type=int,
-        help="Optional results buffer size passed to runner.run_iter_tables() (default: None)",
     )
     parser.add_argument(
         "--child-verbose",
@@ -235,7 +227,6 @@ if __name__ == "__main__":
                 args.parquet_folder,
                 qnum,
                 args.threads,
-                args.results_buffer_size,
                 args.timeout,
                 args.child_verbose,
             )

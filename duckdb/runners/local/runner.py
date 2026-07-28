@@ -226,10 +226,10 @@ class LocalRunner(Runner):
         os.environ["VANE_LOCAL_FTE_WORKERS"] = str(self.num_workers)
         os.environ["VANE_LOCAL_FTE_EXECUTION_MODE"] = self.execution_mode
 
-    def run_iter(self, relation: Any, results_buffer_size: int | None = None) -> Iterator[Any]:
+    def run_iter(self, relation: Any) -> Iterator[Any]:
         raise NotImplementedError("local FTE run_iter is not implemented yet")
 
-    def run_iter_tables(self, relation: Any, results_buffer_size: int | None = None) -> Iterator[pa.Table]:
+    def run_iter_tables(self, relation: Any) -> Iterator[pa.Table]:
         raise NotImplementedError("local FTE run_iter_tables is not implemented yet")
 
     @staticmethod

@@ -260,10 +260,10 @@ def _assert_results_match(con, sql, parts, label, *, ordered=False):
         assert sorted(actual_rows) == sorted(expected_rows), f"{label}: result rows do not match expected values"
 
 
-def _run_iter_tables(runner, builder, label, timeout_s=25.0, results_buffer_size=1):
+def _run_iter_tables(runner, builder, label, timeout_s=25.0):
     start = time.time()
     try:
-        parts = list(runner.run_iter_tables(builder, results_buffer_size=results_buffer_size))
+        parts = list(runner.run_iter_tables(builder))
         elapsed = time.time() - start
         _log_partitions(parts)
     except Exception:
@@ -1465,7 +1465,7 @@ def test_ray_task_large_block_stream_reaches_actor_with_bounded_leases(tmp_path,
         )
 
         start = time.time()
-        parts = list(runner.run_iter_tables(rel, results_buffer_size=1))
+        parts = list(runner.run_iter_tables(rel))
         elapsed = time.time() - start
         ids = []
         lengths = []
@@ -1555,7 +1555,7 @@ def test_ray_lazy_tail_block_submits_without_cross_lease_batching(tmp_path, ray_
         )
 
         total = 0
-        for part in runner.run_iter_tables(rel, results_buffer_size=1):
+        for part in runner.run_iter_tables(rel):
             table = part.to_arrow() if hasattr(part, "to_arrow") else part
             total += table.num_rows
         assert total == row_count
@@ -1658,7 +1658,7 @@ def test_ray_actor_compute_batches_span_upstream_block_boundaries(tmp_path, ray_
         runner = _runners.get_or_create_runner()
         total = 0
         observed_batch_rows = set()
-        for part in runner.run_iter_tables(rel, results_buffer_size=1):
+        for part in runner.run_iter_tables(rel):
             table = part.to_arrow() if hasattr(part, "to_arrow") else part
             total += table.num_rows
             observed_batch_rows.update(table.column(1).to_pylist())
@@ -1745,7 +1745,7 @@ def test_ray_actor_soft_minimum_task_batch_matches_ray_data_bundling(tmp_path, r
         _runners.set_runner_ray(noop_if_initialized=True)
         runner = _runners.get_or_create_runner()
         counts = Counter()
-        for part in runner.run_iter_tables(rel, results_buffer_size=1):
+        for part in runner.run_iter_tables(rel):
             table = part.to_arrow() if hasattr(part, "to_arrow") else part
             counts.update(table.column(0).to_pylist())
 
@@ -1854,7 +1854,7 @@ def test_ray_actor_lazy_row_backpressure_preserves_non_tail_batch_alignment(tmp_
         runner = _runners.get_or_create_runner()
         total = 0
         observed = Counter()
-        for part in runner.run_iter_tables(rel, results_buffer_size=1):
+        for part in runner.run_iter_tables(rel):
             table = part.to_arrow() if hasattr(part, "to_arrow") else part
             total += table.num_rows
             observed.update(table.column(1).to_pylist())
@@ -1946,7 +1946,7 @@ def test_ray_task_block_stream_does_not_deadlock_when_sink_and_source_blocked(tm
         )
 
         start = time.time()
-        parts = list(runner.run_iter_tables(rel, results_buffer_size=1))
+        parts = list(runner.run_iter_tables(rel))
         elapsed = time.time() - start
         total = 0
         for part in parts:
@@ -2053,7 +2053,7 @@ def test_ray_task_flat_map_ref_stream_preserves_rows_under_actor_backpressure(tm
         ids = set()
         chunk_id_sum = 0
         max_chunk_len = 0
-        for part in runner.run_iter_tables(rel, results_buffer_size=1):
+        for part in runner.run_iter_tables(rel):
             table = part.to_arrow() if hasattr(part, "to_arrow") else part
             count += table.num_rows
             ids.update(table.column(0).to_pylist())
@@ -2159,7 +2159,7 @@ def test_ray_task_flat_map_projected_ref_stream_preserves_column_projection(tmp_
         )
         _runners.set_runner_ray(noop_if_initialized=True)
         runner = _runners.get_or_create_runner()
-        parts = list(runner.run_iter_tables(aggregate, results_buffer_size=1))
+        parts = list(runner.run_iter_tables(aggregate))
         result = pa.concat_tables(
             [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
         )
@@ -2278,7 +2278,7 @@ def test_ray_task_flat_map_ref_stream_preserves_variable_and_empty_outputs(tmp_p
         )
         _runners.set_runner_ray(noop_if_initialized=True)
         runner = _runners.get_or_create_runner()
-        parts = list(runner.run_iter_tables(aggregate, results_buffer_size=1))
+        parts = list(runner.run_iter_tables(aggregate))
         result = pa.concat_tables(
             [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
         )
@@ -2392,7 +2392,7 @@ def test_ray_task_flat_map_ref_stream_preserves_reordered_alias_projection(tmp_p
         )
         _runners.set_runner_ray(noop_if_initialized=True)
         runner = _runners.get_or_create_runner()
-        parts = list(runner.run_iter_tables(aggregate, results_buffer_size=1))
+        parts = list(runner.run_iter_tables(aggregate))
         result = pa.concat_tables(
             [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
         )
@@ -2484,7 +2484,7 @@ def test_ray_task_flat_map_ref_stream_all_empty_output_finishes(tmp_path, ray_su
         aggregate = rel.aggregate("count(*) AS c")
         _runners.set_runner_ray(noop_if_initialized=True)
         runner = _runners.get_or_create_runner()
-        parts = list(runner.run_iter_tables(aggregate, results_buffer_size=1))
+        parts = list(runner.run_iter_tables(aggregate))
         result = pa.concat_tables(
             [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
         )
@@ -2626,7 +2626,7 @@ def test_ray_python_udf_terminal_failure_propagates(ray_runner, duckdb_conn, par
     )
 
     with pytest.raises(Exception, match="planned scalar failure|FTE query .* failed"):
-        list(ray_runner.run_iter_tables(relation, results_buffer_size=1))
+        list(ray_runner.run_iter_tables(relation))
 
 
 def test_ray_python_udf_map_batches_arrow(ray_runner, duckdb_conn, parquet_path):

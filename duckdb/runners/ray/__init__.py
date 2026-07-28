@@ -32,7 +32,6 @@ def set_runner_ray(
     address: str | None = None,
     noop_if_initialized: bool = False,
     max_task_backlog: int | None = None,
-    force_client_mode: bool = False,
 ) -> Runner:
     """Configure DuckDB to use the Ray distributed computing framework."""
     import duckdb as _duckdb_pkg
@@ -42,5 +41,4 @@ def set_runner_ray(
         address,
         noop_if_initialized,
         max_task_backlog,
-        force_client_mode,
     )

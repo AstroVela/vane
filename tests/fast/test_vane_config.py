@@ -375,6 +375,31 @@ else:
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
+def test_set_runner_ray_rejects_removed_force_client_mode():
+    from duckdb import runners
+
+    with pytest.raises(TypeError, match="force_client_mode"):
+        runners.set_runner_ray(force_client_mode=True)
+
+
+@pytest.mark.parametrize("method_name", ["run_iter", "run_iter_tables"])
+def test_ray_runner_rejects_removed_results_buffer_size(method_name):
+    from duckdb.runners.ray.runner import RayRunner
+
+    runner = object.__new__(RayRunner)
+    method = getattr(runner, method_name)
+
+    with pytest.raises(TypeError, match="results_buffer_size"):
+        method(object(), results_buffer_size=1)
+
+
+def test_native_set_runner_ray_rejects_removed_fourth_argument():
+    import duckdb
+
+    with pytest.raises(TypeError):
+        duckdb.vane_runners_cpp.set_runner_ray(None, False, None, False)
+
+
 def test_ray_noop_reuses_existing_runner_without_validating_address():
     script = """
 import duckdb
@@ -395,8 +420,8 @@ ray_runner_module.RayRunner = FakeRayRunner
 vane_runners = duckdb.vane_runners_cpp
 vane_runners.teardown_runner()
 
-first = vane_runners.set_runner_ray(None, False, None, False)
-second = vane_runners.set_runner_ray(object(), True, None, False)
+first = vane_runners.set_runner_ray(None, False, None)
+second = vane_runners.set_runner_ray(object(), True, None)
 
 assert second is first
 """

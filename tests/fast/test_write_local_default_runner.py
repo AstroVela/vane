@@ -65,7 +65,6 @@ def test_write_failure_releases_cache_and_preserves_configured_native_runner(tmp
     configured_runner = runners_module.set_runner_ray(
         "ray://configured",
         max_task_backlog=17,
-        force_client_mode=True,
     )
     real_set_runner_ray = runners_module.set_runner_ray
 
@@ -87,7 +86,7 @@ def test_write_failure_releases_cache_and_preserves_configured_native_runner(tmp
         assert len(created_runners) == 1
         assert created_runners[0].calls == 2
         assert created_runners[0].close_calls == 0
-        assert created_runners[0].init_args == ("ray://configured", 17, True)
+        assert created_runners[0].init_args == ("ray://configured", 17)
         assert vane_runners.get_runner() is configured_runner
     finally:
         vane_runners.teardown_runner()

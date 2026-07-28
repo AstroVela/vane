@@ -14,10 +14,10 @@ import duckdb
 class _FakeRayRunner:
     def __init__(self, tables: list[pa.Table]) -> None:
         self.tables = tables
-        self.calls: list[tuple[duckdb.DuckDBPyRelation, int | None]] = []
+        self.calls: list[duckdb.DuckDBPyRelation] = []
 
-    def run_iter_tables(self, relation, results_buffer_size=None):
-        self.calls.append((relation, results_buffer_size))
+    def run_iter_tables(self, relation):
+        self.calls.append(relation)
         yield from self.tables
 
 
@@ -47,9 +47,8 @@ def test_relation_show_materializes_through_ray(monkeypatch, capsys):
     assert "42" in output
     assert "999" not in output
     assert len(runner.calls) == 1
-    limited_relation, results_buffer_size = runner.calls[0]
+    limited_relation = runner.calls[0]
     assert "LIMIT 10000" in limited_relation.sql_query().upper()
-    assert results_buffer_size == 1
 
 
 def test_relation_show_uses_local_execution(monkeypatch, capsys):

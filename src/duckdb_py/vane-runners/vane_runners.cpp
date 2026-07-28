@@ -77,19 +77,13 @@ public:
 
 	// factory: import duckdb.runners.ray_runner and instantiate
 	static std::unique_ptr<RayRunner> try_new(const std::pair<bool, std::string> &address,
-	                                          const std::pair<bool, size_t> &max_task_backlog,
-	                                          const std::pair<bool, bool> &force_client_mode) {
+	                                          const std::pair<bool, size_t> &max_task_backlog) {
 		duckdb::PythonGILWrapper gil;
 		py::module_ mod = py::module_::import("duckdb.runners.ray.runner");
 		py::object RayRunnerClass = mod.attr("RayRunner");
 		py::object py_address = address.first ? py::cast(address.second) : py::none();
 		py::object py_max_task_backlog = max_task_backlog.first ? py::cast(max_task_backlog.second) : py::none();
-		py::object instance;
-		if (force_client_mode.first) {
-			instance = RayRunnerClass(py_address, py_max_task_backlog, force_client_mode.second);
-		} else {
-			instance = RayRunnerClass(py_address, py_max_task_backlog);
-		}
+		py::object instance = RayRunnerClass(py_address, py_max_task_backlog);
 		return std::unique_ptr<RayRunner>(new RayRunner(instance));
 	}
 
@@ -162,11 +156,10 @@ public:
 
 	// call run_iter_tables on the underlying Python runner object
 	// lp_builder is expected to be a Python LogicalPlanBuilder-compatible object
-	py::iterator run_iter_tables(py::object py_builder, const std::pair<bool, size_t> &results_buffer_size) const {
+	py::iterator run_iter_tables(py::object py_builder) const {
 		duckdb::PythonGILWrapper gil;
 		py::object runner_obj = get_pyobj();
-		py::object py_buf_size = results_buffer_size.first ? py::cast(results_buffer_size.second) : py::none();
-		py::object result = runner_obj.attr("run_iter_tables")(py_builder, py_buf_size);
+		py::object result = runner_obj.attr("run_iter_tables")(py_builder);
 		return py::iterator(result);
 	}
 
@@ -190,20 +183,17 @@ struct RunnerConfig {
 	// Ray config
 	std::pair<bool, std::string> address;
 	std::pair<bool, size_t> max_task_backlog;
-	std::pair<bool, bool> force_client_mode;
 
 	RunnerConfig()
 	    : which(Which::Local), address(std::make_pair(false, std::string())),
-	      max_task_backlog(std::make_pair(false, size_t(0))), force_client_mode(std::make_pair(false, false)) {
+	      max_task_backlog(std::make_pair(false, size_t(0))) {
 	}
 
-	static RunnerConfig RayCfg(std::pair<bool, std::string> addr, std::pair<bool, size_t> backlog,
-	                           std::pair<bool, bool> force) {
+	static RunnerConfig RayCfg(std::pair<bool, std::string> addr, std::pair<bool, size_t> backlog) {
 		RunnerConfig rc;
 		rc.which = Which::Ray;
 		rc.address = std::move(addr);
 		rc.max_task_backlog = backlog;
-		rc.force_client_mode = force;
 		return rc;
 	}
 	static RunnerConfig LocalCfg() {
@@ -216,7 +206,7 @@ struct RunnerConfig {
 		if (which == Which::Local) {
 			return std::unique_ptr<Runner>(new Runner(LocalRunner::try_new()));
 		}
-		return std::unique_ptr<Runner>(new Runner(RayRunner::try_new(address, max_task_backlog, force_client_mode)));
+		return std::unique_ptr<Runner>(new Runner(RayRunner::try_new(address, max_task_backlog)));
 	}
 };
 
@@ -243,7 +233,7 @@ static RunnerConfig get_ray_runner_config_from_env() {
 		address = std::make_pair(true, std::string(addr));
 
 	auto max_task_backlog = parse_usize_env_var(VANE_RAY_MAX_TASK_BACKLOG);
-	return RunnerConfig::RayCfg(address, max_task_backlog, std::make_pair(false, false));
+	return RunnerConfig::RayCfg(address, max_task_backlog);
 }
 
 static RunnerConfig get_runner_config_from_env_or_default() {
@@ -340,14 +330,13 @@ static std::shared_ptr<Runner> get_or_create_runner_cpp() {
 
 // Helper to set runner once, following the Rust OnceLock semantics
 static py::object set_runner_ray_py(py::object address_py = py::none(), bool noop_if_initialized = false,
-                                    std::pair<bool, size_t> max_task_backlog = std::make_pair(false, size_t(0)),
-                                    std::pair<bool, bool> force_client_mode = std::make_pair(false, false)) {
+                                    std::pair<bool, size_t> max_task_backlog = std::make_pair(false, size_t(0))) {
 	auto result = initialize_runner([&] {
 		std::pair<bool, std::string> address = std::make_pair(false, std::string());
 		if (!address_py.is_none()) {
 			address = std::make_pair(true, address_py.cast<std::string>());
 		}
-		auto runner = RayRunner::try_new(address, max_task_backlog, force_client_mode);
+		auto runner = RayRunner::try_new(address, max_task_backlog);
 		return std::make_shared<Runner>(std::move(runner));
 	});
 	if (!result.created && (!noop_if_initialized || result.runner->get_type() != Runner::Type::Ray)) {
@@ -474,16 +463,14 @@ void register_vane_runners(py::module_ &m) {
 
 	m.def(
 	    "set_runner_ray",
-	    [](py::object address, bool noop_if_initialized, py::object max_task_backlog_py,
-	       bool force_client_mode) -> py::object {
+	    [](py::object address, bool noop_if_initialized, py::object max_task_backlog_py) -> py::object {
 		    std::pair<bool, size_t> max_task_backlog = std::make_pair(false, size_t(0));
 		    if (!max_task_backlog_py.is_none())
 			    max_task_backlog = std::make_pair(true, max_task_backlog_py.cast<size_t>());
-		    return set_runner_ray_py(address, noop_if_initialized, max_task_backlog,
-		                             std::make_pair(true, force_client_mode));
+		    return set_runner_ray_py(address, noop_if_initialized, max_task_backlog);
 	    },
 	    py::arg("address") = py::none(), py::arg("noop_if_initialized") = false,
-	    py::arg("max_task_backlog") = py::none(), py::arg("force_client_mode") = false);
+	    py::arg("max_task_backlog") = py::none());
 
 	m.def(
 	    "set_runner_local",
