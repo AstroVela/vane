@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import io
 import logging
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -442,6 +445,43 @@ def test_video_s3_reader_uses_anonymous_mode_only_when_explicit(monkeypatch, rec
     _s3_filesystem()
 
     assert recording_s3_filesystem["kwargs"] == {"anonymous": True}
+
+
+@pytest.mark.parametrize(("configured", "expected"), [(None, 1), ("1", 1), ("4", 4)])
+def test_max_concurrent_decodes_accepts_positive_integers(configured, expected):
+    env = os.environ.copy()
+    if configured is None:
+        env.pop("VANE_MAX_CONCURRENT_DECODES", None)
+    else:
+        env["VANE_MAX_CONCURRENT_DECODES"] = configured
+    script = f"""
+import duckdb.datasource.video_reader as video_reader
+
+assert video_reader._MAX_CONCURRENT_DECODES == {expected}
+for _ in range({expected}):
+    assert video_reader._decode_semaphore.acquire(blocking=False)
+assert not video_reader._decode_semaphore.acquire(blocking=False)
+"""
+
+    subprocess.run([sys.executable, "-c", script], check=True, env=env, timeout=10)
+
+
+@pytest.mark.parametrize("configured", ["0", "-1", "invalid", "", "   "])
+def test_max_concurrent_decodes_rejects_invalid_values(configured):
+    env = os.environ.copy()
+    env["VANE_MAX_CONCURRENT_DECODES"] = configured
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import duckdb.datasource.video_reader"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+    assert result.returncode != 0
+    assert "VANE_MAX_CONCURRENT_DECODES must be an integer >= 1" in result.stderr
 
 
 def test_video_frame_source_uses_one_ordered_task_for_frame_limit():
