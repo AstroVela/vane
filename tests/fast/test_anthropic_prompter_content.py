@@ -4,8 +4,8 @@
 """AnthropicPrompter plain-text extraction across response content blocks.
 
 Extended-thinking models return a leading ``thinking`` block (which has
-``.thinking`` and no ``.text``), so ``prompt`` must return the first
-``text`` block rather than assuming ``content[0]`` is text.
+``.thinking`` and no ``.text``), so ``prompt`` must concatenate the
+``text`` blocks rather than assuming ``content[0]`` is text.
 """
 
 import asyncio
@@ -57,6 +57,15 @@ def test_prompt_returns_text_when_first_block_is_text(monkeypatch):
     prompter = _make_prompter(monkeypatch, [_text_block("plain reply")])
 
     assert asyncio.run(prompter.prompt(("hello",))) == "plain reply"
+
+
+def test_prompt_concatenates_multiple_text_blocks(monkeypatch):
+    prompter = _make_prompter(
+        monkeypatch,
+        [_thinking_block(), _text_block("a"), _text_block("b")],
+    )
+
+    assert asyncio.run(prompter.prompt(("hello",))) == "ab"
 
 
 def test_prompt_returns_none_for_thinking_only_content(monkeypatch):
