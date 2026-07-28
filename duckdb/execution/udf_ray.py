@@ -690,6 +690,7 @@ def _iter_materialized_task_outputs(
                 yield block
                 yield metadata
         executor.finished_submitting()
+        executor.close()
         return
 
     if str(stream_payload.get("call_mode") or "") == "map_batches_rows":
@@ -704,6 +705,7 @@ def _iter_materialized_task_outputs(
                 yield block
                 yield metadata
         executor.finished_submitting()
+        executor.close()
         return
 
     for raw_table in tables:
@@ -716,6 +718,7 @@ def _iter_materialized_task_outputs(
         for block, metadata in emit(output):
             yield block
             yield metadata
+    executor.close()
 
 
 def _execute_row_preserving_batch_layout(
@@ -859,6 +862,7 @@ def _iter_ref_bundle_task_outputs(
             for block, output_metadata in emit_output(output):
                 yield block
                 yield output_metadata
+        executor.close()
         if log_task:
             _ray_task_debug_log(
                 "worker_ref_bundle_finished",
@@ -875,6 +879,7 @@ def _iter_ref_bundle_task_outputs(
         configure_loaded_torch_threads()
         fused = _execute_row_preserving_batch_layout(payload, table, executor)
         executor.finished_submitting()
+        executor.close()
         for output_index, block in enumerate(iter_bounded_stream_blocks(fused, payload)):
             yield block
             yield make_stream_block_metadata(block, payload, output_index=output_index)
@@ -886,6 +891,7 @@ def _iter_ref_bundle_task_outputs(
     executor = RuntimeUDFExecutor(payload, cache_callable=_callable_cache_enabled(payload))
     configure_loaded_torch_threads()
     fused = _execute_scalar_map_layout(payload, table, executor)
+    executor.close()
     for output_index, block in enumerate(iter_bounded_stream_blocks(fused, payload)):
         yield block
         yield make_stream_block_metadata(block, payload, output_index=output_index)

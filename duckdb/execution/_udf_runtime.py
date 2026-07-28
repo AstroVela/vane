@@ -18,6 +18,7 @@ from typing import Any
 import pyarrow as pa
 
 from duckdb import PythonExceptionHandling
+from duckdb.execution._async_runtime import AsyncRuntime
 from duckdb.execution._common import (
     ensure_table as _ensure_table,
 )
@@ -444,6 +445,7 @@ class UDFExecutor:
         self._queue: deque[pa.Table] = deque()
         self._finished_submitting = False
         self._closed = False
+        self._async_runtime: AsyncRuntime | None = None
         self._call_mode = str(payload.get("call_mode") or "")
         if self._call_mode not in ("map_batches", "map_batches_rows", "flat_map", "map"):
             raise ValueError("UDF payload.call_mode must be one of: map_batches, map_batches_rows, flat_map, map")
@@ -472,6 +474,7 @@ class UDFExecutor:
             cache_callable=cache_callable,
             cache_max_entries=cache_max_entries,
         )
+        self._bind_async_runtime()
         self._mode = self._call_mode
         self._is_map_batches = self._call_mode == "map_batches"
         self._is_map_batches_rows = self._call_mode == "map_batches_rows"
@@ -527,6 +530,19 @@ class UDFExecutor:
             cache_callable=cache_callable,
             cache_max_entries=cache_max_entries,
         )
+        self._bind_async_runtime()
+
+    def _bind_async_runtime(self) -> None:
+        """Hand an executor-owned async runtime to callables that ask for one.
+
+        Callables that drive async work (AI batch wrappers) declare a
+        ``bind_async_runtime(run_async)`` hook instead of creating loops
+        themselves; the executor owns the loop and closes it in ``close()``.
+        """
+        bind = getattr(self._map_fn, "bind_async_runtime", None)
+        if callable(bind):
+            self._async_runtime = AsyncRuntime()
+            bind(self._async_runtime.run)
 
     def warm_up(self) -> None:
         """Run an optional UDF-level warmup hook after deserialization."""
@@ -877,14 +893,28 @@ class UDFExecutor:
         self._finished_submitting = True
 
     def close(self) -> None:
-        """Flush buffered work and deterministically release the loaded callable."""
+        """Flush buffered work and deterministically release the loaded callable.
+
+        Callables that were bound an async runtime additionally get their
+        ``close()`` hook invoked (provider clients close on the owned loop)
+        before the loop itself is shut down.
+        """
         if self._closed:
             return
         try:
             self.finished_submitting()
         finally:
             self._closed = True
-            self._map_fn = None
+            map_fn, self._map_fn = self._map_fn, None
+            runtime, self._async_runtime = self._async_runtime, None
+            try:
+                if runtime is not None:
+                    close_fn = getattr(map_fn, "close", None)
+                    if callable(close_fn):
+                        close_fn()
+            finally:
+                if runtime is not None:
+                    runtime.close()
 
     def all_tasks_finished(self) -> bool:
         return self._finished_submitting and not self._queue

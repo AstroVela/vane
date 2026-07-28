@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass
 
@@ -194,7 +195,12 @@ def test_embed_zero_fill_fallback_survives_dimension_probe_failure():
             return UDFOptions(max_retries=0, on_error="ignore")
 
     wrapper = _EmbedTextBatch(FailingDescriptor(), "text", "embedding", max_retries=0, on_error="ignore")
-    out = wrapper(pa.table({"text": ["a", "b"]}))
+    loop = asyncio.new_event_loop()
+    wrapper.bind_async_runtime(loop.run_until_complete)
+    try:
+        out = wrapper(pa.table({"text": ["a", "b"]}))
+    finally:
+        loop.close()
 
     assert out.num_rows == 2
     assert out.column("embedding").to_pylist() == [None, None]
@@ -386,8 +392,7 @@ def test_ai_prompt_vllm_options_map_to_actor_and_gpu_fields(monkeypatch):
 
 def test_ai_prompt_expression_rejects_gpu_actor_on_local_runner(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    conn = vane.connect()
-    rel = conn.sql("select 1 as id, 'search'::VARCHAR as chunk")
+    vane.connect()
 
     with pytest.raises(duckdb.InvalidInputException, match="GPU resources require a Ray UDF backend"):
         vane.ai.prompt(

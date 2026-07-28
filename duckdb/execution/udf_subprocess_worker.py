@@ -449,6 +449,7 @@ def _execute_task_submit(
         )
     finally:
         executor.finished_submitting()
+        executor.close()
 
 
 def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm_name: str) -> None:
