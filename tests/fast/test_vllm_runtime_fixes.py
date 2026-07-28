@@ -296,8 +296,8 @@ def test_ray_actor_releases_only_terminal_per_executor_state():
     executor._per_executor_errors = {}
     executor._per_executor_aborted = set()
     executor._per_executor_waiters = {}
-    executor._per_executor_abort_wait_required = set()
-    executor._per_executor_terminal_wait_observed = set()
+    executor._per_executor_wait_tokens_observed = {}
+    executor._per_executor_abort_wait_tokens = {}
 
     assert executor.release_executor("executor") is False
     assert executor.take_ready_result("executor") == ([None], rows, "reservation")
@@ -332,8 +332,8 @@ def test_ray_actor_abort_waiter_does_not_depend_on_default_thread_pool_capacity(
     executor._per_executor_errors = {}
     executor._per_executor_aborted = set()
     executor._per_executor_waiters = {}
-    executor._per_executor_abort_wait_required = set()
-    executor._per_executor_terminal_wait_observed = set()
+    executor._per_executor_wait_tokens_observed = {}
+    executor._per_executor_abort_wait_tokens = {}
 
     async def run_scenario():
         loop = asyncio.get_running_loop()
@@ -352,11 +352,12 @@ def test_ray_actor_abort_waiter_does_not_depend_on_default_thread_pool_capacity(
             while not pool_occupied.is_set():
                 await asyncio.sleep(0)
 
-            waiter = asyncio.create_task(executor.wait_for_result("executor"))
+            wait_token = "registered-wait"
+            waiter = asyncio.create_task(executor.wait_for_result("executor", wait_token))
             while executor._per_executor_waiters.get("executor", 0) == 0:
                 await asyncio.sleep(0)
 
-            await asyncio.wait_for(executor.abort_executor("executor", wait_expected=True), timeout=2.0)
+            await asyncio.wait_for(executor.abort_executor("executor", wait_token), timeout=2.0)
             assert await asyncio.wait_for(waiter, timeout=2.0) is False
         finally:
             release_pool.set()
@@ -366,6 +367,51 @@ def test_ray_actor_abort_waiter_does_not_depend_on_default_thread_pool_capacity(
             await blocker
 
     asyncio.run(run_scenario())
+
+
+def test_ray_actor_abort_waits_for_late_wait_token_before_releasing_state():
+    from duckdb.execution.vllm import RayLocalVLLMExecutor
+
+    executor = RayLocalVLLMExecutor.__new__(RayLocalVLLMExecutor)
+    executor.llm = None
+    executor.completed_tasks = deque()
+    executor.error_message = None
+    executor._shutdown_called = False
+    executor._finished_submitting = False
+    executor.running_task_count = 0
+    executor.task_count_lock = threading.Lock()
+    executor._result_cv = threading.Condition(threading.RLock())
+    executor._per_executor_deques = {"executor": deque()}
+    executor._per_executor_running_task_count = {"executor": 0}
+    executor._per_executor_finished = set()
+    executor._per_executor_request_ids = {"executor": set()}
+    executor._per_executor_tasks = {"executor": set()}
+    executor._per_executor_errors = {}
+    executor._per_executor_aborted = set()
+    executor._per_executor_waiters = {}
+    executor._per_executor_wait_tokens_observed = {}
+    executor._per_executor_abort_wait_tokens = {}
+
+    async def run_scenario():
+        wait_token = "late-wait"
+        abort_task = asyncio.create_task(executor.abort_executor("executor", wait_token))
+        await asyncio.sleep(0)
+
+        assert abort_task.done() is False
+        assert executor.release_executor("executor") is False
+
+        waiter = asyncio.create_task(executor.wait_for_result("executor", wait_token))
+        assert await asyncio.wait_for(waiter, timeout=2.0) is False
+        await asyncio.wait_for(abort_task, timeout=2.0)
+
+        assert executor.release_executor("executor") is True
+
+    asyncio.run(run_scenario())
+
+    assert "executor" not in executor._per_executor_deques
+    assert "executor" not in executor._per_executor_waiters
+    assert "executor" not in executor._per_executor_wait_tokens_observed
+    assert "executor" not in executor._per_executor_abort_wait_tokens
 
 
 def test_ray_actor_abort_wait_uses_control_rpc_timeout(monkeypatch):
@@ -387,9 +433,9 @@ def test_ray_actor_abort_wait_uses_control_rpc_timeout(monkeypatch):
     executor._per_executor_tasks = {"executor": set()}
     executor._per_executor_errors = {}
     executor._per_executor_aborted = set()
-    executor._per_executor_waiters = {"executor": 1}
-    executor._per_executor_abort_wait_required = set()
-    executor._per_executor_terminal_wait_observed = set()
+    executor._per_executor_waiters = {}
+    executor._per_executor_wait_tokens_observed = {}
+    executor._per_executor_abort_wait_tokens = {}
 
     clock = iter((100.0, 106.0, 111.0))
     sleep_calls = []
@@ -401,8 +447,8 @@ def test_ray_actor_abort_wait_uses_control_rpc_timeout(monkeypatch):
     monkeypatch.setattr(vllm, "time", types.SimpleNamespace(monotonic=lambda: next(clock)))
     monkeypatch.setattr(vllm.asyncio, "sleep", fake_sleep)
 
-    with pytest.raises(RuntimeError, match="abort waiter did not acknowledge termination"):
-        asyncio.run(executor.abort_executor("executor", wait_expected=True))
+    with pytest.raises(RuntimeError, match="abort waiter timeout-wait did not acknowledge termination"):
+        asyncio.run(executor.abort_executor("executor", "timeout-wait"))
 
     assert sleep_calls == [0.01]
 
@@ -445,8 +491,8 @@ def test_ray_actor_abort_installs_tombstone_before_awaiting_engine_abort():
     executor._per_executor_errors = {}
     executor._per_executor_aborted = set()
     executor._per_executor_waiters = {}
-    executor._per_executor_abort_wait_required = set()
-    executor._per_executor_terminal_wait_observed = set()
+    executor._per_executor_wait_tokens_observed = {}
+    executor._per_executor_abort_wait_tokens = {}
 
     async def run_scenario():
         abort_task = asyncio.create_task(executor.abort_executor("executor"))
@@ -565,8 +611,10 @@ class _FakeVLLMActor:
         self.submissions = []
         self.results = deque()
         self.wait_refs = deque()
+        self.wait_tokens = []
         self.released = []
         self.aborted = []
+        self.abort_wait_tokens = []
         self.finished = []
         self.submit_async = _RemoteMethod(self._submit)
         self.wait_for_result = _RemoteMethod(self._wait, raw_ref=True)
@@ -578,7 +626,8 @@ class _FakeVLLMActor:
     def _submit(self, prompts, rows, executor_id, reservation_id):
         self.submissions.append((list(prompts), rows, executor_id, reservation_id))
 
-    def _wait(self, _executor_id):
+    def _wait(self, executor_id, wait_token):
+        self.wait_tokens.append((executor_id, wait_token))
         ref = _Ref(ready=False)
         self.wait_refs.append(ref)
         return ref
@@ -593,8 +642,9 @@ class _FakeVLLMActor:
         self.released.append(executor_id)
         return True
 
-    def _abort(self, executor_id, _wait_expected):
+    def _abort(self, executor_id, wait_token):
         self.aborted.append(executor_id)
+        self.abort_wait_tokens.append((executor_id, wait_token))
 
     def publish(self, outputs, rows, reservation_id):
         self.results.append((outputs, rows, reservation_id))
@@ -890,10 +940,10 @@ def test_remote_executor_rearms_wait_for_already_buffered_actor_result(monkeypat
     import duckdb.execution.vllm as vllm
 
     class ReadyAwareActor(_FakeVLLMActor):
-        def _wait(self, executor_id):
+        def _wait(self, executor_id, wait_token):
             if self.results:
                 return _Ref(True)
-            return super()._wait(executor_id)
+            return super()._wait(executor_id, wait_token)
 
     actor = ReadyAwareActor()
     router = vllm.PrefixRouter([actor], load_balance_threshold=0)
@@ -1005,9 +1055,9 @@ def test_remote_executor_consumes_all_submit_acks_before_aborting(monkeypatch):
             super().__init__()
             self.submit_async = SubmitMethod()
 
-        def _abort(self, executor_id, wait_expected):
+        def _abort(self, executor_id, wait_token):
             events.append("abort")
-            return super()._abort(executor_id, wait_expected)
+            return super()._abort(executor_id, wait_token)
 
     actor = Actor()
     router = vllm.PrefixRouter([actor], load_balance_threshold=0)
@@ -1228,6 +1278,8 @@ def test_remote_shutdown_ignores_expired_query_deadline_for_control_rpcs(monkeyp
     assert router.inflight == [0]
     assert actor.finished == [executor_id]
     assert actor.aborted == [executor_id]
+    assert actor.abort_wait_tokens == actor.wait_tokens
+    assert actor.abort_wait_tokens[0][1]
     assert actor.released == [executor_id]
     assert owner.shutdown_calls == 1
 

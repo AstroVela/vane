@@ -904,8 +904,8 @@ def test_vllm_actor_wait_for_result_finishes_per_executor_before_global_finish()
     executor._per_executor_errors = {}
     executor._per_executor_aborted = set()
     executor._per_executor_waiters = {}
-    executor._per_executor_abort_wait_required = set()
-    executor._per_executor_terminal_wait_observed = set()
+    executor._per_executor_wait_tokens_observed = {}
+    executor._per_executor_abort_wait_tokens = {}
     executor._shutdown_called = False
 
     executor.finished_executor("exec-a")
@@ -946,7 +946,7 @@ def test_vllm_remote_wait_for_result_drains_ready_actor(monkeypatch):
             return FakeRef(self.value)
 
     class FakeWaitMethod:
-        def remote(self, _executor_id):
+        def remote(self, _executor_id, _wait_token):
             nonlocal wait_ref
             wait_ref = FakeRef(True, kind="wait")
             return wait_ref
@@ -1461,6 +1461,107 @@ def test_vllm_ray_execution_requires_runner_owned_runtime(monkeypatch):
 
     with pytest.raises(RuntimeError, match="initialized RayRunner runtime"):
         vllm.build_executor("model", {"use_ray": True})
+
+
+def test_vllm_remote_construction_base_exception_rolls_back_start_and_pool(monkeypatch):
+    import duckdb.execution.vllm as vllm
+
+    events = []
+
+    class Ref:
+        def __init__(self, name):
+            self.name = name
+
+    class RemoteMethod:
+        def __init__(self, name):
+            self.name = name
+
+        def remote(self, *_args):
+            events.append(self.name)
+            return Ref(self.name)
+
+    class Router:
+        report_start = RemoteMethod("report-start")
+        cancel_executor_start = RemoteMethod("cancel-start")
+
+    class Owner:
+        router_actor = Router()
+        llm_actors = [object()]
+
+        def shutdown(self):
+            events.append("owner-shutdown")
+
+    fake_ray = types.ModuleType("ray")
+    fake_ray.is_initialized = lambda: True
+    owner = Owner()
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setattr(vllm, "LLMActors", lambda **_kwargs: owner)
+
+    def resolve(ref, **_kwargs):
+        if ref.name == "report-start":
+            raise KeyboardInterrupt("construction interrupted")
+        return None
+
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", resolve)
+
+    with pytest.raises(KeyboardInterrupt, match="construction interrupted"):
+        vllm.build_executor("model", {"use_ray": True})
+
+    assert events == ["report-start", "cancel-start", "owner-shutdown"]
+
+
+def test_vllm_remote_construction_cleanup_failures_preserve_base_exception(monkeypatch):
+    import duckdb.execution.vllm as vllm
+
+    events = []
+    primary_error = KeyboardInterrupt("construction interrupted")
+
+    class Ref:
+        def __init__(self, name):
+            self.name = name
+
+    class RemoteMethod:
+        def __init__(self, name):
+            self.name = name
+
+        def remote(self, *_args):
+            events.append(self.name)
+            return Ref(self.name)
+
+    class Router:
+        report_start = RemoteMethod("report-start")
+        cancel_executor_start = RemoteMethod("cancel-start")
+
+    class Owner:
+        router_actor = Router()
+        llm_actors = [object()]
+
+        def shutdown(self):
+            events.append("owner-shutdown")
+            raise RuntimeError("pool cleanup failed")
+
+    fake_ray = types.ModuleType("ray")
+    fake_ray.is_initialized = lambda: True
+    owner = Owner()
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setattr(vllm, "LLMActors", lambda **_kwargs: owner)
+
+    def resolve(ref, **_kwargs):
+        if ref.name == "report-start":
+            raise primary_error
+        raise RuntimeError("start rollback failed")
+
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", resolve)
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+        vllm.build_executor("model", {"use_ray": True})
+
+    assert exc_info.value is primary_error
+    assert events == ["report-start", "cancel-start", "owner-shutdown"]
+    assert getattr(primary_error, "_vane_cleanup_failures") == [
+        "vllm router start rollback failed: RuntimeError: start rollback failed",
+        "vllm actor pool construction rollback failed: RuntimeError: pool cleanup failed",
+    ]
 
 
 def test_unified_executor_passes_local_subprocess_actor_pool_option():

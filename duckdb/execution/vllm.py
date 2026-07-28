@@ -99,6 +99,39 @@ def _resolve_vllm_control_ref(object_refs: Any) -> Any:
     )
 
 
+def _attach_vllm_cleanup_failure(
+    primary_error: BaseException,
+    operation: str,
+    cleanup_error: BaseException,
+) -> None:
+    """Expose secondary cleanup evidence without replacing the primary error."""
+    try:
+        detail = f"{operation} failed: {type(cleanup_error).__name__}: {cleanup_error}"
+    except BaseException:
+        detail = f"{operation} failed with an unprintable {type(cleanup_error).__name__}"
+    try:
+        cleanup_failures = getattr(primary_error, "_vane_cleanup_failures", None)
+        if cleanup_failures is None:
+            cleanup_failures = []
+            setattr(primary_error, "_vane_cleanup_failures", cleanup_failures)
+        cleanup_failures.append(detail)
+    except BaseException:
+        pass
+
+    add_note = getattr(primary_error, "add_note", None)
+    if callable(add_note):
+        try:
+            add_note(detail)
+            return
+        except BaseException:
+            pass
+    try:
+        warnings.warn(detail, RuntimeWarning, stacklevel=3)
+    except BaseException:
+        # Warning filters must not replace the primary construction failure.
+        pass
+
+
 class VLLMExecutor(ABC):
     """Common execution contract shared by local and Ray-backed vLLM executors.
 
@@ -275,8 +308,11 @@ class LocalVLLMExecutor(VLLMExecutor):
         self._per_executor_errors: dict[str, str] = {}
         self._per_executor_aborted: set[str] = set()
         self._per_executor_waiters: dict[str, int] = {}
-        self._per_executor_abort_wait_required: set[str] = set()
-        self._per_executor_terminal_wait_observed: set[str] = set()
+        # A Ray async actor may execute abort/release before an earlier wait RPC
+        # starts. Tokens distinguish that not-yet-started wait from a previously
+        # completed wait for the same executor.
+        self._per_executor_wait_tokens_observed: dict[str, str] = {}
+        self._per_executor_abort_wait_tokens: dict[str, str] = {}
         self._async_waiter_lock = threading.Lock()
         self._async_waiters: dict[str, list[tuple[Any, asyncio.Event]]] = {}
 
@@ -612,9 +648,10 @@ class LocalVLLMExecutor(VLLMExecutor):
         with self.task_count_lock:
             if self._per_executor_waiters.get(executor_id, 0) > 0:
                 return False
+            expected_wait_token = self._per_executor_abort_wait_tokens.get(executor_id)
             if (
-                executor_id in self._per_executor_abort_wait_required
-                and executor_id not in self._per_executor_terminal_wait_observed
+                expected_wait_token is not None
+                and self._per_executor_wait_tokens_observed.get(executor_id) != expected_wait_token
             ):
                 return False
             if self._per_executor_deques.get(executor_id):
@@ -632,20 +669,24 @@ class LocalVLLMExecutor(VLLMExecutor):
             self._per_executor_errors.pop(executor_id, None)
             self._per_executor_aborted.discard(executor_id)
             self._per_executor_waiters.pop(executor_id, None)
-            self._per_executor_abort_wait_required.discard(executor_id)
-            self._per_executor_terminal_wait_observed.discard(executor_id)
+            self._per_executor_wait_tokens_observed.pop(executor_id, None)
+            self._per_executor_abort_wait_tokens.pop(executor_id, None)
             self._per_executor_finished.discard(executor_id)
         self._notify_state_change(force=True)
         return True
 
-    async def abort_executor(self, executor_id: str, wait_expected: bool = False) -> None:
+    async def abort_executor(self, executor_id: str, wait_token: str | None = None) -> None:
         """Abort requests and discard state owned by one remote executor."""
+        if wait_token is not None and (not isinstance(wait_token, str) or not wait_token):
+            raise ValueError("vllm abort wait_token must be a non-empty string")
         # Install the terminal tombstone before the first await. Ray async
         # actors may start another method while this abort is suspended, and a
         # late submit must be rejected instead of escaping the snapshots below.
         with self.task_count_lock:
             self._per_executor_aborted.add(executor_id)
             self._per_executor_finished.discard(executor_id)
+            if wait_token is not None:
+                self._per_executor_abort_wait_tokens[executor_id] = wait_token
             request_ids = set(self._per_executor_request_ids.get(executor_id, ()))
             tasks = set(self._per_executor_tasks.get(executor_id, ()))
         abort = getattr(getattr(self, "llm", None), "abort", None) or getattr(
@@ -686,23 +727,21 @@ class LocalVLLMExecutor(VLLMExecutor):
             self._per_executor_request_ids.pop(executor_id, None)
             self._per_executor_tasks.pop(executor_id, None)
             self._per_executor_errors.pop(executor_id, None)
-            if wait_expected:
-                self._per_executor_abort_wait_required.add(executor_id)
-                if self._per_executor_waiters.get(executor_id, 0) == 0:
-                    self._per_executor_terminal_wait_observed.add(executor_id)
         self._notify_state_change(force=True)
-        if wait_expected:
+        if wait_token is not None:
             deadline = time.monotonic() + _vllm_control_rpc_timeout_s()
             while True:
                 with self.task_count_lock:
                     acknowledged = (
                         self._per_executor_waiters.get(executor_id, 0) == 0
-                        and executor_id in self._per_executor_terminal_wait_observed
+                        and self._per_executor_wait_tokens_observed.get(executor_id) == wait_token
                     )
                 if acknowledged:
                     break
                 if time.monotonic() >= deadline:
-                    raise RuntimeError(f"vllm executor {executor_id} abort waiter did not acknowledge termination")
+                    raise RuntimeError(
+                        f"vllm executor {executor_id} abort waiter {wait_token} did not acknowledge termination"
+                    )
                 await asyncio.sleep(0.01)
 
     def all_tasks_finished(self) -> bool:
@@ -800,9 +839,17 @@ class RayLocalVLLMExecutor(LocalVLLMExecutor):
                 continue
 
     # Ray actor calls are awaitable, while the in-process executor exposes a blocking method.
-    async def wait_for_result(self, executor_id: str | None = None) -> bool:  # type: ignore[override]
+    async def wait_for_result(  # type: ignore[override]
+        self,
+        executor_id: str | None = None,
+        wait_token: str | None = None,
+    ) -> bool:
         if executor_id is None:
+            if wait_token is not None:
+                raise ValueError("vllm global wait does not accept a wait_token")
             return await asyncio.to_thread(self._wait_for_result_blocking, None)
+        if wait_token is not None and (not isinstance(wait_token, str) or not wait_token):
+            raise ValueError("vllm wait_token must be a non-empty string")
         self._ensure_async_waiter_state()
         loop = asyncio.get_running_loop()
         state_changed = asyncio.Event()
@@ -836,8 +883,8 @@ class RayLocalVLLMExecutor(LocalVLLMExecutor):
                     self._per_executor_waiters[executor_id] = remaining
                 else:
                     self._per_executor_waiters.pop(executor_id, None)
-                if executor_id in self._per_executor_aborted:
-                    self._per_executor_terminal_wait_observed.add(executor_id)
+                if wait_token is not None:
+                    self._per_executor_wait_tokens_observed[executor_id] = wait_token
             self._notify_state_change(force=True)
 
 
@@ -889,6 +936,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
         # At most one wait ref is armed per actor. Completion callbacks only
         # enqueue refs here; the executor thread resolves and re-arms them.
         self._wait_refs_by_actor: list[Any | None] = [None] * len(self.llm_actors)
+        self._wait_tokens_by_actor: list[str | None] = [None] * len(self.llm_actors)
         self._ready_wait_refs: deque[Any] = deque()
         # Submit refs form the acknowledgement barrier before terminal RPCs;
         # their metadata is also sufficient to roll back a failed submission.
@@ -906,13 +954,17 @@ class RemoteVLLMExecutor(VLLMExecutor):
 
         try:
             resolve_object_refs_blocking(self.router_actor.report_start.remote(self._executor_id))
-        except Exception:
-            cancel_start = getattr(self.router_actor, "cancel_executor_start", None)
-            if cancel_start is not None:
-                try:
+        except BaseException as start_error:
+            try:
+                cancel_start = getattr(self.router_actor, "cancel_executor_start", None)
+                if cancel_start is not None:
                     _resolve_vllm_control_ref(cancel_start.remote(self._executor_id))
-                except Exception:
-                    pass
+            except BaseException as cleanup_error:
+                _attach_vllm_cleanup_failure(
+                    start_error,
+                    "vllm router start rollback",
+                    cleanup_error,
+                )
             raise
 
     def _router_call(
@@ -979,33 +1031,38 @@ class RemoteVLLMExecutor(VLLMExecutor):
         self._notify_state_change(force=True)
 
     def _ensure_wait_ref(self, actor_idx: int) -> None:
-        with self._result_cv:
-            if self._wait_refs_by_actor[actor_idx] is not None or not self._actor_has_pending_result(actor_idx):
-                return
-            self._wait_refs_by_actor[actor_idx] = self._WAIT_REF_INSTALLING
-        try:
-            wait_ref = self.llm_actors[actor_idx].wait_for_result.remote(self._executor_id)
-        except Exception as exc:
+        # Serialize wait submission with terminal lifecycle calls. Once abort
+        # receives a token, the corresponding wait RPC is guaranteed to have
+        # been submitted and can run while abort awaits its acknowledgement.
+        with self._lifecycle_lock:
             with self._result_cv:
-                self._wait_refs_by_actor[actor_idx] = None
-            self._record_error(exc)
-            return
-        with self._result_cv:
-            if self._shutdown_called or self._finished:
-                install = False
-            else:
-                self._wait_refs_by_actor[actor_idx] = wait_ref
-                install = True
-        if not install:
-            self._cancel_refs([wait_ref])
-            return
-        try:
-            wait_ref.future().add_done_callback(lambda _future, _ref=wait_ref: self._queue_wait_ref_ready(_ref))
-        except Exception as exc:
-            with self._result_cv:
-                if self._wait_refs_by_actor[actor_idx] == wait_ref:
+                if (
+                    self._shutdown_called
+                    or self._finished
+                    or self._wait_refs_by_actor[actor_idx] is not None
+                    or not self._actor_has_pending_result(actor_idx)
+                ):
+                    return
+                wait_token = f"{self._executor_id}:wait:{uuid.uuid4()}"
+                self._wait_refs_by_actor[actor_idx] = self._WAIT_REF_INSTALLING
+                self._wait_tokens_by_actor[actor_idx] = wait_token
+            try:
+                wait_ref = self.llm_actors[actor_idx].wait_for_result.remote(self._executor_id, wait_token)
+            except Exception as exc:
+                with self._result_cv:
                     self._wait_refs_by_actor[actor_idx] = None
-            self._record_error(TypeError(f"vllm wait ObjectRef does not support completion callbacks: {exc}"))
+                    self._wait_tokens_by_actor[actor_idx] = None
+                self._record_error(exc)
+                return
+            with self._result_cv:
+                self._wait_refs_by_actor[actor_idx] = wait_ref
+            try:
+                wait_ref.future().add_done_callback(lambda _future, _ref=wait_ref: self._queue_wait_ref_ready(_ref))
+            except Exception as exc:
+                with self._result_cv:
+                    if self._wait_refs_by_actor[actor_idx] == wait_ref:
+                        self._wait_refs_by_actor[actor_idx] = None
+                self._record_error(TypeError(f"vllm wait ObjectRef does not support completion callbacks: {exc}"))
 
     def _ensure_remote_wait_refs(self) -> None:
         for actor_idx in range(len(self.llm_actors)):
@@ -1044,6 +1101,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
                 with self._result_cv:
                     if self._wait_refs_by_actor[actor_idx] == ready_ref:
                         self._wait_refs_by_actor[actor_idx] = None
+                        self._wait_tokens_by_actor[actor_idx] = None
                 return
             raise RuntimeError(
                 "vllm actor finished without returning all submitted results: "
@@ -1061,6 +1119,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
         with self._result_cv:
             if self._wait_refs_by_actor[actor_idx] == ready_ref:
                 self._wait_refs_by_actor[actor_idx] = None
+                self._wait_tokens_by_actor[actor_idx] = None
             self._results_per_actor[actor_idx] += count
             self._result_buffer.append((results_text, rows))
         # Actor waits are one-shot. Re-arm immediately after consuming a
@@ -1287,9 +1346,8 @@ class RemoteVLLMExecutor(VLLMExecutor):
                 errors.append(RuntimeError(f"vllm actor {actor_idx} does not implement abort_executor"))
                 continue
             try:
-                wait_ref = self._wait_refs_by_actor[actor_idx]
-                wait_expected = wait_ref is not None and wait_ref is not self._WAIT_REF_INSTALLING
-                _resolve_vllm_control_ref(method.remote(self._executor_id, wait_expected))
+                wait_token = self._wait_tokens_by_actor[actor_idx]
+                _resolve_vllm_control_ref(method.remote(self._executor_id, wait_token))
                 self._aborted_actor_indices.add(actor_idx)
             except Exception as exc:
                 errors.append(RuntimeError(f"actor {actor_idx}: {exc}"))
@@ -1372,6 +1430,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
                     self._error_message += "; cleanup failed: " + "; ".join(str(error) for error in cleanup_errors)
                 self._finished = True
                 self._wait_refs_by_actor = [None] * len(self.llm_actors)
+                self._wait_tokens_by_actor = [None] * len(self.llm_actors)
                 self._submit_refs.clear()
                 self._ready_wait_refs.clear()
                 self._ready_submit_refs.clear()
@@ -1395,6 +1454,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
             with self._result_cv:
                 self._finished = True
                 self._wait_refs_by_actor = [None] * len(self.llm_actors)
+                self._wait_tokens_by_actor = [None] * len(self.llm_actors)
                 self._submit_refs.clear()
                 self._ready_wait_refs.clear()
                 self._ready_submit_refs.clear()
@@ -1614,6 +1674,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
             with self._result_cv:
                 self._finished = True
                 self._wait_refs_by_actor = [None] * len(self.llm_actors)
+                self._wait_tokens_by_actor = [None] * len(self.llm_actors)
                 self._submit_refs.clear()
                 self._ready_wait_refs.clear()
                 self._ready_submit_refs.clear()
@@ -2442,8 +2503,15 @@ def build_executor(model: str, options: Any | None) -> VLLMExecutor:
             )
         try:
             return RemoteVLLMExecutor(llm_actors, pool_name=pool_name)
-        except Exception:
-            llm_actors.shutdown()
+        except BaseException as construction_error:
+            try:
+                llm_actors.shutdown()
+            except BaseException as cleanup_error:
+                _attach_vllm_cleanup_failure(
+                    construction_error,
+                    "vllm actor pool construction rollback",
+                    cleanup_error,
+                )
             raise
 
     opts = _restore_native_vllm_secrets(opts)

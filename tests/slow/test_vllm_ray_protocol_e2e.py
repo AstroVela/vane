@@ -77,12 +77,12 @@ class _DelayedAsyncVLLMActor:
         self._events.append(("finish", executor_id))
         return True
 
-    async def wait_for_result(self, executor_id):
+    async def wait_for_result(self, executor_id, _wait_token):
         while executor_id not in self._finished:
             await asyncio.sleep(0.01)
         return False
 
-    def abort_executor(self, _executor_id, _wait_expected):
+    def abort_executor(self, _executor_id, _wait_token):
         return True
 
     def release_executor(self, _executor_id):
@@ -112,12 +112,12 @@ class _FailingSubmitBarrierActor:
         self._events.append(("finish", executor_id))
         return True
 
-    async def wait_for_result(self, executor_id):
+    async def wait_for_result(self, executor_id, _wait_token):
         while executor_id not in self._aborted:
             await asyncio.sleep(0.01)
         return False
 
-    async def abort_executor(self, executor_id, _wait_expected):
+    async def abort_executor(self, executor_id, _wait_token):
         self._aborted.add(executor_id)
         self._events.append(("abort", executor_id))
         return True
@@ -150,9 +150,10 @@ class _ThreadPoolSaturatedWaitActor:
         executor._per_executor_errors = {}
         executor._per_executor_aborted = set()
         executor._per_executor_waiters = {}
-        executor._per_executor_abort_wait_required = set()
-        executor._per_executor_terminal_wait_observed = set()
+        executor._per_executor_wait_tokens_observed = {}
+        executor._per_executor_abort_wait_tokens = {}
         self.executor = executor
+        self.wait_token = "real-ray-wait"
         self.pool_started = threading.Event()
         self.release_pool = threading.Event()
 
@@ -171,13 +172,13 @@ class _ThreadPoolSaturatedWaitActor:
         return self.pool_started.is_set()
 
     async def wait_for_result(self):
-        return await self.executor.wait_for_result("executor")
+        return await self.executor.wait_for_result("executor", self.wait_token)
 
     async def waiter_count(self):
         return self.executor._per_executor_waiters.get("executor", 0)
 
     async def abort_executor(self):
-        await self.executor.abort_executor("executor", wait_expected=True)
+        await self.executor.abort_executor("executor", self.wait_token)
         return True
 
     async def release_default_pool(self):
