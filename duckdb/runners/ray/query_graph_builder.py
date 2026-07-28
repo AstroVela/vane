@@ -404,12 +404,17 @@ def build_query_execution_graph(
     )
 
 
-def _task_commitment(stage: StageResourceSpec) -> ResourceVector:
+def _hard_task_commitment(stage: StageResourceSpec) -> ResourceVector:
+    """Return resources that must be placed before a task can run.
+
+    Retained inputs and generator output windows are spillable pipeline data.
+    They are controlled dynamically by QRM against the query's object-store
+    budget instead of being reserved for every possible task at registration.
+    """
     return ResourceVector(
         cpu=stage.per_task.cpu,
         gpu=stage.per_task.gpu,
         heap_bytes=stage.per_task.heap_bytes,
-        object_store_bytes=stage.per_task.object_store_bytes + stage.output_window_bytes,
     )
 
 
@@ -437,14 +442,13 @@ def build_query_demand(
     downstream_fte_tasks: list[ResourceVector] = []
     stage_by_id = {stage.stage_id: stage for stage in graph.stages}
     for stage in graph.stages:
-        commitment = _task_commitment(stage)
+        commitment = _hard_task_commitment(stage)
         if stage.backend == "ray_actor":
-            actor_commitment = stage.resident_per_actor + commitment
             actor_bundles.extend(
                 ActorResourceBundle(
                     stage_id=stage.stage_id,
                     actor_index=actor_index,
-                    resources=actor_commitment,
+                    resources=stage.resident_per_actor,
                 )
                 for actor_index in range(stage.actor_pool_size)
             )
@@ -459,7 +463,7 @@ def build_query_demand(
         for downstream_stage_id in (graph.downstream_fte_stage_ids_requiring_separate_slot(stage.stage_id))
     }
     downstream_fte_tasks.extend(
-        _task_commitment(stage_by_id[stage_id])
+        _hard_task_commitment(stage_by_id[stage_id])
         for stage_id in graph.topological_stage_ids()
         if stage_id in downstream_fte_stage_ids
     )

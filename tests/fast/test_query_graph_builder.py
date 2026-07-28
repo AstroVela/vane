@@ -237,7 +237,7 @@ def test_plan_digest_is_stable_for_node_order_but_changes_with_resources():
     assert graph_a.plan_digest != graph_c.plan_digest
 
 
-def test_query_demand_reserves_fixed_actor_pool_and_downstream_fte_progress_slot():
+def test_query_demand_reserves_hard_actor_pool_and_downstream_fte_progress_slot():
     graph = build_query_execution_graph(_metadata(), env={})
     cluster = ResourceVector(cpu=64, gpu=4, heap_bytes=64 * GIB, object_store_bytes=64 * GIB)
 
@@ -258,21 +258,38 @@ def test_query_demand_reserves_fixed_actor_pool_and_downstream_fte_progress_slot
                 cpu=1,
                 gpu=1,
                 heap_bytes=3 * GIB,
-                object_store_bytes=192 * MIB,
             ),
         ),
     )
     assert demand.task_bundles == (
-        ResourceVector(cpu=1, heap_bytes=1536 * MIB, object_store_bytes=256 * MIB),
-        ResourceVector(cpu=1, heap_bytes=2 * GIB, object_store_bytes=256 * MIB),
-        ResourceVector(cpu=1, heap_bytes=2 * GIB, object_store_bytes=256 * MIB),
+        ResourceVector(cpu=1, heap_bytes=1536 * MIB),
+        ResourceVector(cpu=1, heap_bytes=2 * GIB),
+        ResourceVector(cpu=1, heap_bytes=2 * GIB),
     )
     assert demand.minimum == ResourceVector(
         cpu=4,
         gpu=1,
         heap_bytes=3 * GIB + 4 * GIB + 1536 * MIB,
-        object_store_bytes=(192 + 256 + 256 + 256) * MIB,
     )
+
+
+def test_query_demand_treats_pipeline_windows_as_soft_budget_regression_issue_38():
+    metadata = _metadata()
+    metadata["nodes"][2]["udf_payload"]["actor_pool_size"] = 2
+    graph = build_query_execution_graph(metadata, env={})
+    cluster = ResourceVector(
+        cpu=64,
+        gpu=4,
+        heap_bytes=64 * GIB,
+        object_store_bytes=512 * MIB,
+    )
+
+    demand = build_query_demand(graph, cluster)
+
+    assert demand.minimum.object_store_bytes == 0
+    assert demand.desired.object_store_bytes == 512 * MIB
+    assert all(bundle.resources.object_store_bytes == 0 for bundle in demand.actor_bundles)
+    assert all(bundle.object_store_bytes == 0 for bundle in demand.task_bundles)
 
 
 def test_query_demand_reserves_gpu_ray_task_as_an_indivisible_task_bundle():

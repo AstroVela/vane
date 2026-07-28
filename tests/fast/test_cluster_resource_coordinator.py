@@ -166,7 +166,7 @@ def test_ray_capacity_never_uses_host_memory_or_cpu_fallback(monkeypatch):
         pytest.param("coordinator", "_weighted_drf_extras", 1, id="fair-share"),
         pytest.param("coordinator", "_place_divisible", 1, id="divisible-placement"),
         pytest.param("module", "NodeResourceAllocation", 1, id="allocation-publication"),
-        pytest.param("module", "_positive_difference", 2, id="debt-publication"),
+        pytest.param("module", "_hard_positive_difference", 2, id="debt-publication"),
     ],
 )
 def test_register_query_failure_is_atomic_across_rebalance_phases(
@@ -555,8 +555,36 @@ def test_capacity_shrink_preserves_observed_usage_as_debt_and_stops_new_admissio
 
     assert query["allocation"]["resources"] == _r(cpu=2, heap=200, store=200).to_dict()
     assert query["observed_usage"] == _r(cpu=3, heap=300, store=300).to_dict()
-    assert query["allocation_debt"] == _r(cpu=1, heap=100, store=100).to_dict()
+    assert query["allocation_debt"] == _r(cpu=1, heap=100).to_dict()
+    assert query["soft_object_store_debt_bytes"] == 100
     assert query["can_admit_new_tasks"] is False
+
+
+def test_object_store_overage_is_soft_debt_and_does_not_close_query_admission():
+    coordinator = ClusterQueryResourceCoordinator(
+        (_node("n1", cpu=4, heap=400, store=400),),
+    )
+    allocation = coordinator.register_query(
+        _demand(
+            "q",
+            minimum=_r(cpu=1, heap=100),
+            desired=_r(cpu=4, heap=400, store=400),
+        ),
+        now=0,
+    )
+
+    coordinator.refresh_query(
+        "q",
+        observed_usage=_r(cpu=1, heap=100, store=450),
+        generation=allocation.generation,
+        now=1,
+    )
+    query = coordinator.snapshot()["queries"]["q"]
+
+    assert query["state"] == "RUNNING"
+    assert query["allocation_debt"] == _r().to_dict()
+    assert query["soft_object_store_debt_bytes"] == 50
+    assert query["can_admit_new_tasks"] is True
 
 
 def test_stale_generation_cannot_refresh_or_release_newer_query_lease():

@@ -74,6 +74,15 @@ def _positive_difference(left: ResourceVector, right: ResourceVector) -> Resourc
     )
 
 
+def _hard_positive_difference(left: ResourceVector, right: ResourceVector) -> ResourceVector:
+    """Return allocation debt for resources that cannot be relieved by spill."""
+    return ResourceVector(
+        cpu=max(0.0, left.cpu - right.cpu),
+        gpu=max(0.0, left.gpu - right.gpu),
+        heap_bytes=max(0, left.heap_bytes - right.heap_bytes),
+    )
+
+
 @dataclass(frozen=True)
 class NodeCapacity:
     node_id: str
@@ -115,6 +124,14 @@ class ActorResourceBundle:
 
 @dataclass(frozen=True)
 class QueryDemand:
+    """Hard placement minimum plus elastic resource targets.
+
+    CPU, GPU, and heap in ``minimum`` are placement requirements. The
+    object-store components are soft flow-control budgets; spillable task
+    input/output windows must not be copied into ``minimum`` or the placement
+    bundles.
+    """
+
     query_id: str
     minimum: ResourceVector
     desired: ResourceVector
@@ -556,10 +573,10 @@ class ClusterQueryResourceCoordinator:
             )
             state.node_allocations = node_allocations_by_query[query_id]
             state.actor_placements = actor_placements_by_query[query_id]
-            state.allocation_debt = _positive_difference(state.observed_usage, resources)
+            state.allocation_debt = _hard_positive_difference(state.observed_usage, resources)
             if not state.allocation_debt.is_zero() and state.state != "ACTOR_PLACEMENT_LOST":
                 state.state = "ALLOCATION_DEBT"
-                state.rejection_reason = "live query leases exceed the current allocation"
+                state.rejection_reason = "live query hard-resource leases exceed the current allocation"
 
     @staticmethod
     def _place_bundle(bundle: ResourceVector, remaining: dict[str, ResourceVector]) -> str | None:
@@ -723,6 +740,10 @@ class ClusterQueryResourceCoordinator:
                         "allocation": state.allocation.to_dict(),
                         "observed_usage": state.observed_usage.to_dict(),
                         "allocation_debt": state.allocation_debt.to_dict(),
+                        "soft_object_store_debt_bytes": max(
+                            0,
+                            state.observed_usage.object_store_bytes - state.allocation.resources.object_store_bytes,
+                        ),
                         "can_admit_new_tasks": state.state == "RUNNING" and state.allocation_debt.is_zero(),
                         "rejection_reason": state.rejection_reason,
                         "node_allocations": {

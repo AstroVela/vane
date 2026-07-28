@@ -1042,8 +1042,8 @@ def test_handed_off_child_output_recycles_credit_without_unaccounting_physical_b
     )
     assert second_output.granted
     with_both_outputs = manager.snapshot()
-    # Recycling compute ownership never recycles bytes: the two physical
-    # blocks consume two windows under the query/node hard cap.
+    # Recycling compute ownership never recycles bytes: both physical blocks
+    # remain charged to the query and node flow-control budgets.
     assert with_both_outputs["usage"] == _r(cpu=2, heap=10, store=20).to_dict()
     assert (
         with_both_outputs["output_leases"][second_output.lease.lease_id]["continuation_credit_id"]
@@ -1109,30 +1109,19 @@ def test_cross_stage_credit_reuse_checks_historical_outputs_before_grant():
         attempt_id=first_grant.lease.attempt_id,
     )
     assert manager.transition_output_block(first_output.lease.lease_id, "downstream_input")
-    assert manager.snapshot()["usage"]["object_store_bytes"] == 20
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 15
 
     second_request = _task(second_child.stage_id, 0, retained=10)
     manager.note_task_waiting(second_request)
-    denied = manager.try_acquire_queued_task(second_request)
-
-    assert not denied.granted
-    assert denied.blocked_reason == "hard_object_store_bytes"
-    snapshot = manager.snapshot()
-    assert snapshot["usage"]["object_store_bytes"] == 20
-    assert snapshot["node_usage"]["node-a"]["object_store_bytes"] == 20
-
-    manager.update_allocation(
-        _allocation(_r(cpu=10, heap=10, store=25), generation=2),
-        admission_open=True,
-    )
     granted = manager.try_acquire_queued_task(second_request)
-    assert granted.granted
+    assert granted.granted and granted.liveness
     admitted = manager.snapshot()
     assert admitted["usage"]["object_store_bytes"] == 25
     assert admitted["node_usage"]["node-a"]["object_store_bytes"] == 25
+    assert admitted["soft_object_store_debt_bytes"] == 5
 
 
-def test_continuation_borrow_selects_feasible_idle_credit_with_smallest_live_output_delta():
+def test_continuation_borrow_reuses_idle_credit_with_smallest_live_output_delta():
     parent = _stage(
         "stage:f:parent-fte",
         resources=_r(cpu=1, heap=2),
@@ -1195,7 +1184,7 @@ def test_continuation_borrow_selects_feasible_idle_credit_with_smallest_live_out
         if credit["borrowed_by_task_lease_id"] == second_child.lease.lease_id
     }
     assert len(borrowed_credit_ids) == 1
-    assert borrowed_credit_ids != {historical_credit_id}
+    assert borrowed_credit_ids == {historical_credit_id}
 
 
 def test_cross_stage_idle_credit_output_excess_is_attributed_exactly_once():
@@ -1228,6 +1217,7 @@ def test_cross_stage_idle_credit_output_excess_is_attributed_exactly_once():
         resources=_r(cpu=10, heap=10, store=30),
     )
     manager.update_stage_state(parent.stage_id, runnable=True, actor_ready=True)
+    manager.set_external_consumer_waiting(True)
     parent_grant = manager.try_acquire_task(_task(parent.stage_id, 0))
     assert parent_grant.granted
 
@@ -1247,6 +1237,7 @@ def test_cross_stage_idle_credit_output_excess_is_attributed_exactly_once():
             )
         )
         assert output.granted
+        assert output.liveness is (index == 1)
         assert manager.transition_output_block(output.lease.lease_id, "stage_queue")
         assert manager.transition_output_block(output.lease.lease_id, "downstream_input")
         assert manager.release_task_lease(
@@ -1261,9 +1252,9 @@ def test_cross_stage_idle_credit_output_excess_is_attributed_exactly_once():
         for stage_id, stage_snapshot in snapshot["stages"].items()
     }
     assert sum(stage_store_usage.values()) == 30
-    reservation_stage_id = next(iter(snapshot["continuation_credits"].values()))["reservation_stage_id"]
-    assert stage_store_usage[reservation_stage_id] >= 20
-    assert sum(stage_store_usage.values()) - 20 == 10
+    assert stage_store_usage[parent.stage_id] == 0
+    assert stage_store_usage[first_child.stage_id] == 15
+    assert stage_store_usage[second_child.stage_id] == 15
 
 
 def test_continuation_stage_usage_matches_query_usage_for_active_and_idle_borrower():
@@ -1491,7 +1482,7 @@ def test_parent_fte_placement_preserves_pinned_actor_continuation_node():
     assert automatic_request.lease.node_id == "node-b"
 
 
-def test_ray_task_placement_preserves_combined_fte_and_pinned_actor_reservations():
+def test_ray_task_placement_keeps_actor_invocation_bytes_out_of_hard_reservations():
     producer = _stage(
         "stage:f:placed-ray-task-producer",
         resources=_r(cpu=1, heap=1),
@@ -1529,12 +1520,11 @@ def test_ray_task_placement_preserves_combined_fte_and_pinned_actor_reservations
     )
     manager.update_stage_state(producer.stage_id, runnable=True, actor_ready=True)
 
-    assert manager.task_eligible_node_ids(producer.stage_id) == ("node-b",)
+    assert manager.task_eligible_node_ids(producer.stage_id) == ("node-a", "node-b")
     pinned = manager.try_acquire_task(_task(producer.stage_id, "pinned", node_id="node-a"))
     automatic = manager.try_acquire_task(_task(producer.stage_id, "automatic"))
 
-    assert not pinned.granted
-    assert pinned.blocked_reason == "continuation_node_capacity"
+    assert pinned.granted
     assert automatic.granted
     assert automatic.lease.node_id == "node-b"
 
@@ -1615,8 +1605,8 @@ def test_latent_fte_and_actor_reservations_cap_ray_task_fanout():
     # them before their first input makes them runnable.
     manager.update_stage_state(producer.stage_id, runnable=True, actor_ready=True)
 
-    producer_grants = [manager.try_acquire_task(_task(producer.stage_id, partition)) for partition in range(8)]
-    blocked_producer = manager.try_acquire_task(_task(producer.stage_id, 8))
+    producer_grants = [manager.try_acquire_task(_task(producer.stage_id, partition)) for partition in range(9)]
+    blocked_producer = manager.try_acquire_task(_task(producer.stage_id, 9))
 
     assert all(grant.granted for grant in producer_grants)
     assert not blocked_producer.granted
@@ -1624,9 +1614,8 @@ def test_latent_fte_and_actor_reservations_cap_ray_task_fanout():
     reservations = manager.snapshot()["admission"]["downstream_reservations"][producer.stage_id]
     assert [reservation["reservation_id"] for reservation in reservations] == [
         f"fte:{producer.stage_id}",
-        f"actor:{gpu_actor.stage_id}",
     ]
-    assert sum(reservation["resources"]["object_store_bytes"] for reservation in reservations) == 2
+    assert sum(reservation["resources"]["object_store_bytes"] for reservation in reservations) == 0
 
     manager.update_stage_state(consumer.stage_id, runnable=True, actor_ready=True)
     consumer_grant = manager.try_acquire_task(_task(consumer.stage_id, 0))
@@ -1634,15 +1623,15 @@ def test_latent_fte_and_actor_reservations_cap_ray_task_fanout():
     actor_grant = manager.try_acquire_task(_task(gpu_actor.stage_id, 0, retained=0))
 
     assert consumer_grant.granted
-    assert actor_grant.granted
+    assert actor_grant.granted and actor_grant.liveness
     assert actor_grant.lease.actor_index == 0
     assert (
         manager.snapshot()["usage"]
         == _r(
-            cpu=9,
+            cpu=10,
             gpu=1,
-            heap=38,
-            store=10,
+            heap=40,
+            store=11,
         ).to_dict()
     )
 
@@ -1889,7 +1878,7 @@ def test_parent_fte_fanout_preserves_shared_fte_slot_across_nested_ray_task():
     assert final_snapshot["usage"]["heap_bytes"] == 47
 
 
-def test_hard_heap_and_object_store_limits_are_never_bypassed_by_liveness():
+def test_hard_heap_limit_is_never_bypassed_by_object_store_liveness():
     stage = _stage("stage:f:decode", resources=_r(cpu=1, heap=100), target=25, blocks=2)
     manager = _manager(stage, resources=_r(cpu=10, heap=250, store=100))
     _ready(manager, stage.stage_id, consumer_waiting=True)
@@ -1908,6 +1897,55 @@ def test_hard_heap_and_object_store_limits_are_never_bypassed_by_liveness():
     assert snapshot["liveness"]["active_task_lease_id"] is None
 
 
+def test_soft_budget_does_not_start_extra_same_stage_work_while_task_is_active():
+    stage = _stage("stage:f:decode", resources=_r(cpu=1, heap=100), target=30, blocks=2)
+    manager = _manager(stage, resources=_r(cpu=10, heap=1_000, store=100))
+    _ready(manager, stage.stage_id, consumer_waiting=True)
+
+    first = manager.try_acquire_task(_task(stage.stage_id, 0))
+    second = manager.try_acquire_task(_task(stage.stage_id, 1))
+
+    assert first.granted
+    assert not second.granted
+    assert second.blocked_reason == "liveness_not_needed"
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 60
+
+
+def test_soft_budget_does_not_start_extra_borrower_while_same_stage_task_is_active():
+    parent = _stage(
+        "stage:f:parent",
+        resources=_r(cpu=1, heap=2),
+        target=0,
+        blocks=0,
+        backend="ray_worker",
+        stage_kind="fte",
+    )
+    child = _stage(
+        "stage:f:child",
+        inputs=(parent.stage_id,),
+        resources=_r(cpu=1, heap=8, store=81),
+    )
+    manager = _manager(
+        parent,
+        child,
+        resources=_r(cpu=4, heap=20, store=150),
+    )
+    _ready(manager, parent.stage_id, child.stage_id)
+
+    first_parent = manager.try_acquire_task(_task(parent.stage_id, 0))
+    first = manager.try_acquire_task(_task(child.stage_id, 0, retained=81))
+    second_parent = manager.try_acquire_task(_task(parent.stage_id, 1))
+    second = manager.try_acquire_task(_task(child.stage_id, 1, retained=81))
+
+    assert first_parent.granted
+    assert first.granted
+    assert not first.liveness
+    assert second_parent.granted
+    assert not second.granted
+    assert second.blocked_reason == "liveness_not_needed"
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 101
+
+
 def test_retained_input_uses_exact_dynamic_credit_above_nominal_target():
     stage = _stage("stage:f:decode", resources=_r(cpu=1, heap=100, store=30))
     manager = _manager(stage, resources=_r(cpu=10, heap=1_000, store=1_000))
@@ -1920,16 +1958,322 @@ def test_retained_input_uses_exact_dynamic_credit_above_nominal_target():
     assert manager.snapshot()["usage"]["object_store_bytes"] == 51
 
 
-def test_retained_input_larger_than_query_allocation_is_fatal():
-    stage = _stage("stage:f:decode", resources=_r(cpu=1, heap=100, store=30))
+def test_retained_input_larger_than_soft_budget_uses_one_liveness_task():
+    stage = _stage("stage:f:decode", resources=_r(cpu=1, heap=100, store=81))
     manager = _manager(stage, resources=_r(cpu=10, heap=1_000, store=100))
     _ready(manager, stage.stage_id)
 
-    denied = manager.try_acquire_task(_task(stage.stage_id, 0, retained=81))
+    request = _task(stage.stage_id, 0, retained=81)
+    manager.note_task_waiting(request)
+    granted = manager.try_acquire_queued_task(request)
 
+    assert granted.granted
+    assert granted.liveness
+    assert manager.snapshot()["soft_object_store_debt_bytes"] == 1
+
+
+@pytest.mark.parametrize("acquire_mode", ["queued", "next_queued"])
+def test_liveness_parent_lends_escape_to_one_continuation_path_until_handoff(acquire_mode):
+    parent = _stage(
+        "stage:f:parent",
+        resources=_r(cpu=1, heap=2),
+        target=60,
+        blocks=2,
+        backend="ray_worker",
+        stage_kind="fte",
+    )
+    child = _stage(
+        "stage:f:child",
+        inputs=(parent.stage_id,),
+        resources=_r(cpu=1, heap=8),
+        target=10,
+        blocks=2,
+    )
+    manager = _manager(
+        parent,
+        child,
+        resources=_r(cpu=4, heap=20, store=100),
+    )
+    manager.update_stage_state(parent.stage_id, runnable=True, actor_ready=True)
+
+    parent_grant = manager.try_acquire_task(_task(parent.stage_id, 0))
+    child_request = _task(child.stage_id, 0)
+    manager.note_task_waiting(child_request)
+    if acquire_mode == "queued":
+        child_grant = manager.try_acquire_queued_task(child_request)
+    else:
+        selected, child_grant = manager.try_acquire_next_queued_task(
+            {(child_request.task_id, child_request.attempt_id)}
+        )
+        assert selected == child_request
+        assert child_grant is not None
+
+    assert parent_grant.granted and parent_grant.liveness
+    assert child_grant.granted and child_grant.liveness
+    assert manager.snapshot()["liveness"]["active_task_lease_id"] == parent_grant.lease.lease_id
+
+    output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            child.stage_id,
+            child_grant.lease.lease_id,
+            child_grant.lease.attempt_id,
+            "continuation-output",
+            10,
+        )
+    )
+    assert output.granted and not output.liveness
+    assert manager.transition_output_block(output.lease.lease_id, "stage_queue")
+    assert manager.release_task_lease(
+        parent_grant.lease.lease_id,
+        attempt_id=parent_grant.lease.attempt_id,
+    )
+    assert manager.release_task_lease(
+        child_grant.lease.lease_id,
+        attempt_id=child_grant.lease.attempt_id,
+    )
+
+    producer_owned = manager.snapshot()
+    assert producer_owned["liveness"]["active_task_lease_id"] == parent_grant.lease.lease_id
+    blocked = manager.try_acquire_task(_task(parent.stage_id, 1))
+    assert not blocked.granted
+    assert blocked.blocked_reason == "liveness_task_active"
+
+    assert manager.transition_output_block(output.lease.lease_id, "downstream_input")
+    handed_off = manager.snapshot()
+    assert handed_off["liveness"]["active_task_lease_id"] is None
+    assert handed_off["continuation_credits"] == {}
+    assert handed_off["usage"]["object_store_bytes"] == 10
+
+
+def test_liveness_parent_allows_one_direct_actor_continuation_without_sibling_fanout():
+    parent = _stage(
+        "stage:f:parent",
+        resources=_r(cpu=1, heap=2),
+        target=60,
+        blocks=2,
+        backend="ray_worker",
+        stage_kind="fte",
+    )
+    first_actor = _stage(
+        "stage:f:actor-a",
+        inputs=(parent.stage_id,),
+        resources=_r(store=20),
+        target=10,
+        blocks=2,
+        backend="ray_actor",
+        actor_pool_size=1,
+        resident=_r(cpu=1, heap=8),
+    )
+    sibling_actor = _stage(
+        "stage:f:actor-b",
+        inputs=(parent.stage_id,),
+        resources=_r(store=20),
+        target=10,
+        blocks=2,
+        backend="ray_actor",
+        actor_pool_size=1,
+        resident=_r(cpu=1, heap=8),
+    )
+    sibling_task = _stage(
+        "stage:f:zz-task-b",
+        inputs=(sibling_actor.stage_id,),
+        resources=_r(cpu=1, heap=8, store=20),
+        target=10,
+        blocks=2,
+    )
+    path_target = _stage(
+        "stage:f:aa-path",
+        inputs=(first_actor.stage_id,),
+        resources=_r(cpu=1, heap=10, store=20),
+        target=10,
+        blocks=2,
+        backend="ray_worker",
+        stage_kind="fte",
+    )
+    manager = _manager(
+        parent,
+        first_actor,
+        sibling_actor,
+        sibling_task,
+        path_target,
+        resources=_r(cpu=8, heap=60, store=100),
+        terminals=(
+            path_target.stage_id,
+            sibling_task.stage_id,
+        ),
+    )
+    manager.update_stage_state(parent.stage_id, runnable=True, actor_ready=True)
+    parent_grant = manager.try_acquire_task(_task(parent.stage_id, 0))
+    manager.update_stage_state(first_actor.stage_id, runnable=True, actor_ready=True)
+    manager.update_stage_state(sibling_actor.stage_id, runnable=True, actor_ready=True)
+
+    first_request = _task(first_actor.stage_id, 0)
+    manager.note_task_waiting(first_request)
+    selected, first_grant = manager.try_acquire_next_queued_task({(first_request.task_id, first_request.attempt_id)})
+
+    assert selected == first_request
+    assert first_grant is not None
+    assert parent_grant.granted and parent_grant.liveness
+    assert first_grant.granted and first_grant.liveness
+    sibling_request = _task(sibling_actor.stage_id, 0)
+    manager.note_task_waiting(sibling_request)
+    sibling_grant = manager.try_acquire_queued_task(sibling_request)
+    assert not sibling_grant.granted
+    assert sibling_grant.blocked_reason == "liveness_task_active"
+    assert manager.remove_task_waiter(
+        sibling_request.task_id,
+        sibling_request.attempt_id,
+    )
+    sibling_task_request = _task(sibling_task.stage_id, 0)
+    manager.note_task_waiting(sibling_task_request)
+    sibling_task_grant = manager.try_acquire_queued_task(sibling_task_request)
+    assert not sibling_task_grant.granted
+    assert sibling_task_grant.blocked_reason == "liveness_task_active"
+    path_request = _task(path_target.stage_id, 0)
+    manager.note_task_waiting(path_request)
+    selected, path_grant = manager.try_acquire_next_queued_task(
+        {
+            (sibling_task_request.task_id, sibling_task_request.attempt_id),
+            (path_request.task_id, path_request.attempt_id),
+        }
+    )
+    assert selected == path_request
+    assert path_grant is not None
+    assert path_grant.granted and path_grant.liveness
+    assert manager.release_task_lease(
+        path_grant.lease.lease_id,
+        attempt_id=path_grant.lease.attempt_id,
+    )
+    assert manager.remove_task_waiter(
+        sibling_task_request.task_id,
+        sibling_task_request.attempt_id,
+    )
+
+    output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            first_actor.stage_id,
+            first_grant.lease.lease_id,
+            first_grant.lease.attempt_id,
+            "actor-continuation-output",
+            10,
+        )
+    )
+    assert output.granted and not output.liveness
+    assert manager.transition_output_block(output.lease.lease_id, "stage_queue")
+    assert manager.release_task_lease(
+        parent_grant.lease.lease_id,
+        attempt_id=parent_grant.lease.attempt_id,
+    )
+    assert manager.release_task_lease(
+        first_grant.lease.lease_id,
+        attempt_id=first_grant.lease.attempt_id,
+    )
+    assert manager.snapshot()["liveness"]["active_task_lease_id"] == parent_grant.lease.lease_id
+
+    assert manager.transition_output_block(output.lease.lease_id, "downstream_input")
+    assert manager.snapshot()["liveness"]["active_task_lease_id"] is None
+
+
+def test_liveness_actor_path_can_start_soft_blocked_downstream_fte():
+    parent = _stage(
+        "stage:f:parent",
+        resources=_r(cpu=1, heap=2),
+        target=0,
+        blocks=0,
+        backend="ray_worker",
+        stage_kind="fte",
+    )
+    actor = _stage(
+        "stage:f:actor",
+        inputs=(parent.stage_id,),
+        resources=_r(store=81),
+        target=10,
+        blocks=2,
+        backend="ray_actor",
+        actor_pool_size=1,
+        resident=_r(cpu=1, heap=8),
+    )
+    downstream = _stage(
+        "stage:f:downstream",
+        inputs=(actor.stage_id,),
+        resources=_r(cpu=1, heap=10, store=10),
+        target=20,
+        blocks=2,
+        backend="ray_worker",
+        stage_kind="fte",
+    )
+    manager = _manager(
+        parent,
+        actor,
+        downstream,
+        resources=_r(cpu=4, heap=30, store=100),
+    )
+    manager.update_stage_state(parent.stage_id, runnable=True, actor_ready=True)
+    parent_grant = manager.try_acquire_task(_task(parent.stage_id, 0))
+    manager.update_stage_state(actor.stage_id, runnable=True, actor_ready=True)
+    actor_request = _task(actor.stage_id, 0)
+    manager.note_task_waiting(actor_request)
+    selected, actor_grant = manager.try_acquire_next_queued_task({(actor_request.task_id, actor_request.attempt_id)})
+
+    assert selected == actor_request
+    assert actor_grant is not None
+    assert parent_grant.granted and not parent_grant.liveness
+    assert actor_grant.granted and actor_grant.liveness
+    downstream_grant = manager.try_acquire_task_descriptor(_task(downstream.stage_id, 0))
+    assert downstream_grant.granted and downstream_grant.liveness
+    assert manager.snapshot()["liveness"]["active_task_lease_id"] == actor_grant.lease.lease_id
+
+    assert manager.release_task_lease(
+        downstream_grant.lease.lease_id,
+        attempt_id=downstream_grant.lease.attempt_id,
+    )
+    assert manager.release_task_lease(
+        actor_grant.lease.lease_id,
+        attempt_id=actor_grant.lease.attempt_id,
+    )
+    assert manager.snapshot()["liveness"]["active_task_lease_id"] is None
+
+
+def test_liveness_task_credit_returns_after_outputs_leave_the_producer_queue():
+    stage = _stage("stage:f:decode", resources=_r(cpu=1, heap=100, store=81))
+    manager = _manager(stage, resources=_r(cpu=10, heap=1_000, store=100))
+    _ready(manager, stage.stage_id)
+
+    first_request = _task(stage.stage_id, 0, retained=81)
+    manager.note_task_waiting(first_request)
+    first = manager.try_acquire_queued_task(first_request)
+    outputs = manager.finish_task_with_outputs(
+        first.lease.lease_id,
+        attempt_id=first.lease.attempt_id,
+        outputs=(
+            OutputBlockRequest(
+                query_id="q",
+                producer_stage_id=stage.stage_id,
+                task_lease_id=first.lease.lease_id,
+                attempt_id=first.lease.attempt_id,
+                block_id="first-output",
+                size_bytes=10,
+            ),
+        ),
+    )
+
+    producer_owned = manager.snapshot()
+    assert producer_owned["liveness"]["active_task_lease_id"] == first.lease.lease_id
+    assert producer_owned["usage"]["object_store_bytes"] == 10
+    second_request = _task(stage.stage_id, 1, retained=81)
+    manager.note_task_waiting(second_request)
+    denied = manager.try_acquire_queued_task(second_request)
     assert not denied.granted
-    assert denied.fatal
-    assert denied.blocked_reason == "task_exceeds_query_allocation"
+    assert denied.blocked_reason == "liveness_task_active"
+
+    assert manager.transition_output_block(outputs[0].lease_id, "downstream_input")
+    handed_off = manager.snapshot()
+    assert handed_off["liveness"]["active_task_lease_id"] is None
+    assert handed_off["usage"]["object_store_bytes"] == 10
+    second = manager.try_acquire_queued_task(second_request)
+    assert second.granted and second.liveness
 
 
 def test_liveness_is_not_granted_while_another_runnable_stage_has_normal_capacity():
@@ -2134,20 +2478,65 @@ def test_output_transition_rejects_skips_and_attempt_mismatch():
         manager.transition_output_block(block.lease.lease_id, "external_consumer")
 
 
-def test_oversized_output_block_is_fatal_and_never_gets_liveness():
+def test_oversized_output_block_uses_one_bounded_liveness_grant():
     stage = _stage("stage:f:decode", target=50, blocks=2)
     manager = _manager(stage, resources=_r(cpu=10, heap=1_000, store=100))
     _ready(manager, stage.stage_id, consumer_waiting=True)
     task = manager.try_acquire_task(_task(stage.stage_id, 0))
 
-    denied = manager.try_acquire_output_block(
+    granted = manager.try_acquire_output_block(
         OutputBlockRequest("q", stage.stage_id, task.lease.lease_id, "0", "huge", 101)
     )
 
-    assert not denied.granted
-    assert denied.fatal
-    assert denied.blocked_reason == "output_block_exceeds_query_limit"
-    assert denied.liveness is False
+    assert granted.granted
+    assert granted.liveness
+    second = manager.try_acquire_output_block(
+        OutputBlockRequest("q", stage.stage_id, task.lease.lease_id, "0", "second", 1)
+    )
+    assert not second.granted
+    assert second.blocked_reason == "liveness_output_active"
+    assert manager.transition_output_block(granted.lease.lease_id, "stage_queue")
+    assert manager.transition_output_block(granted.lease.lease_id, "downstream_input")
+    next_block = manager.try_acquire_output_block(
+        OutputBlockRequest("q", stage.stage_id, task.lease.lease_id, "0", "second-after-handoff", 1)
+    )
+    assert next_block.granted
+    assert next_block.liveness
+    assert manager.snapshot()["soft_object_store_debt_bytes"] == 2
+
+
+def test_object_store_debt_does_not_block_debt_neutral_downstream_compute():
+    producer = _stage("stage:f:producer", resources=_r(cpu=1, heap=100), target=50, blocks=2)
+    consumer = _stage(
+        "stage:f:consumer",
+        inputs=(producer.stage_id,),
+        resources=_r(cpu=1, heap=100),
+        target=0,
+        blocks=0,
+    )
+    manager = _manager(
+        producer,
+        consumer,
+        resources=_r(cpu=10, heap=1_000, store=100),
+    )
+    _ready(manager, producer.stage_id, consumer.stage_id, consumer_waiting=True)
+    producer_task = manager.try_acquire_task(_task(producer.stage_id, 0))
+    oversized = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            producer.stage_id,
+            producer_task.lease.lease_id,
+            "0",
+            "oversized",
+            101,
+        )
+    )
+
+    assert oversized.granted and oversized.liveness
+    assert manager.snapshot()["soft_object_store_debt_bytes"] == 1
+    downstream = manager.try_acquire_task(_task(consumer.stage_id, 0, retained=0))
+    assert downstream.granted
+    assert not downstream.liveness
 
 
 def test_allocation_shrink_creates_debt_without_revoking_existing_leases():
@@ -2191,9 +2580,11 @@ def test_pending_allocation_preserves_live_node_debt_and_stops_new_admission():
     assert blocked.blocked_reason == "allocation_pending"
     assert blocked.fatal is False
     assert snapshot["allocation_admission_open"] is False
-    assert snapshot["allocation_debt"] == expected_usage
+    assert snapshot["allocation_debt"] == _r(cpu=1, heap=100).to_dict()
+    assert snapshot["soft_object_store_debt_bytes"] == 20
     assert snapshot["node_usage"]["node-a"] == expected_usage
-    assert snapshot["node_allocation_debt"]["node-a"] == expected_usage
+    assert snapshot["node_allocation_debt"]["node-a"] == _r(cpu=1, heap=100).to_dict()
+    assert snapshot["node_soft_object_store_debt_bytes"]["node-a"] == 20
 
     assert manager.release_task_lease(
         active.lease.lease_id,
@@ -2274,11 +2665,7 @@ def test_task_and_materialized_output_ownership_stay_on_one_ray_node():
     assert output.node_id == first.lease.node_id
     assert manager.snapshot()["node_usage"][output.node_id]["object_store_bytes"] == 10
 
-    blocked = manager.try_acquire_task(_task(stage.stage_id, 3, node_id=output.node_id))
-    assert not blocked.granted
-    assert blocked.blocked_reason == "node_capacity"
-
-    assert manager.release_output_block(output.lease_id)
-    granted = manager.try_acquire_task(_task(stage.stage_id, 3, attempt="1", node_id=output.node_id))
+    granted = manager.try_acquire_task(_task(stage.stage_id, 3, node_id=output.node_id))
     assert granted.granted
     assert granted.lease.node_id == output.node_id
+    assert manager.snapshot()["node_soft_object_store_debt_bytes"][output.node_id] == 10

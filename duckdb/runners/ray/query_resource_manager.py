@@ -20,6 +20,7 @@ from duckdb.runners.ray.query_execution_graph import (
 )
 
 _SOFT_TASK_BLOCK_REASONS = {
+    "query_soft_object_store_bytes",
     "stage_soft_cpu",
     "stage_soft_gpu",
     "stage_soft_heap_bytes",
@@ -27,6 +28,7 @@ _SOFT_TASK_BLOCK_REASONS = {
     "stage_soft_limit",
 }
 _SOFT_OUTPUT_BLOCK_REASONS = {
+    "query_soft_object_store_bytes",
     "stage_soft_object_store_bytes",
     "stage_soft_limit",
 }
@@ -58,6 +60,19 @@ def _positive_difference(left: ResourceVector, right: ResourceVector) -> Resourc
         heap_bytes=max(0, left.heap_bytes - right.heap_bytes),
         object_store_bytes=max(0, left.object_store_bytes - right.object_store_bytes),
     )
+
+
+def _hard_resources(resources: ResourceVector) -> ResourceVector:
+    """Drop the spillable object-store flow-control dimension."""
+    return ResourceVector(
+        cpu=resources.cpu,
+        gpu=resources.gpu,
+        heap_bytes=resources.heap_bytes,
+    )
+
+
+def _hard_positive_difference(left: ResourceVector, right: ResourceVector) -> ResourceVector:
+    return _positive_difference(_hard_resources(left), _hard_resources(right))
 
 
 def _component_max(resources: tuple[ResourceVector, ...]) -> ResourceVector:
@@ -358,6 +373,7 @@ class QueryResourceManager:
         self._output_lease_by_block: dict[str, str] = {}
         self._terminal_output_blocks = BoundedSet[str](capacity=_TERMINAL_IDENTITY_REPLAY_CAPACITY)
         self._active_liveness_task_lease_id: str | None = None
+        self._active_liveness_path_task_lease_ids: set[str] = set()
         self._active_liveness_output_lease_id: str | None = None
         self._task_liveness_grants_total = 0
         self._output_liveness_grants_total = 0
@@ -599,12 +615,7 @@ class QueryResourceManager:
             stage = self._stages.get(str(stage_id))
             if stage is None:
                 raise KeyError(f"stage is not registered: {stage_id}")
-            commitment = ResourceVector(
-                cpu=stage.spec.per_task.cpu,
-                gpu=stage.spec.per_task.gpu,
-                heap_bytes=stage.spec.per_task.heap_bytes,
-                object_store_bytes=(stage.spec.per_task.object_store_bytes + stage.spec.output_window_bytes),
-            )
+            commitment = self._task_commitment(stage.spec)
             allowed_actor_nodes = (
                 set(self.allocation.actor_node_ids_for_stage(stage.spec.stage_id))
                 if stage.spec.backend == "ray_actor"
@@ -630,8 +641,9 @@ class QueryResourceManager:
             base_remaining: dict[str, ResourceVector] = {}
             for node_id, capacity in allocation_by_node.items():
                 resident = self._actor_resident_usage_locked(node_id=node_id)
-                if resident.fits_within(capacity):
-                    base_remaining[node_id] = capacity - resident
+                hard_capacity = _hard_resources(capacity)
+                if resident.fits_within(hard_capacity):
+                    base_remaining[node_id] = hard_capacity - resident
 
             def preserves_registered_minimum(task_node_id: str) -> bool:
                 task_capacity = base_remaining.get(task_node_id)
@@ -676,7 +688,10 @@ class QueryResourceManager:
             if fatal or blocked_reason not in _SOFT_TASK_BLOCK_REASONS:
                 return TaskGrant(False, blocked_reason=blocked_reason, fatal=fatal)
 
-            liveness_block = self._task_liveness_block_reason_locked(request)
+            liveness_block = self._task_liveness_block_reason_locked(
+                request,
+                plan,
+            )
             if liveness_block is not None:
                 return TaskGrant(False, blocked_reason=liveness_block)
             return self._grant_task_locked(
@@ -859,12 +874,18 @@ class QueryResourceManager:
                     liveness=False,
                 )
             request = selected.request
-            if self._active_liveness_task_lease_id is not None:
+            if self._active_liveness_task_lease_id is not None and not self._continues_active_liveness_path_locked(
+                str(request.stage_id),
+                selected.plan,
+            ):
                 return request, TaskGrant(
                     False,
                     blocked_reason="liveness_task_active",
                 )
-            if self._task_leases and not self._external_consumer_waiting:
+            if not self._active_tasks_allow_liveness_locked(
+                str(request.stage_id),
+                selected.plan,
+            ):
                 return request, TaskGrant(
                     False,
                     blocked_reason="liveness_not_needed",
@@ -937,11 +958,12 @@ class QueryResourceManager:
         resources = _resource_with_object_store(stage.spec.per_task, retained)
         output_window = stage.spec.output_window_bytes
         commitment = _resource_with_object_store(resources, retained + output_window)
-        if commitment.exceeded_dimensions(self.allocation.resources):
+        hard_commitment = _hard_resources(commitment)
+        if hard_commitment.exceeded_dimensions(_hard_resources(self.allocation.resources)):
             return "task_exceeds_query_allocation", True, empty_plan
 
         query_usage = self._query_usage_locked()
-        debt = _positive_difference(query_usage, self.allocation.resources)
+        debt = _hard_positive_difference(query_usage, self.allocation.resources)
         if not debt.is_zero():
             return "allocation_debt", False, empty_plan
 
@@ -975,13 +997,18 @@ class QueryResourceManager:
                 idle_output_excess,
             )
 
-        exceeded = (query_usage + admission_commitment).exceeded_dimensions(self.allocation.resources)
-        if exceeded:
-            reason = "continuation_capacity" if credit_template is not None else f"hard_{exceeded[0]}"
+        usage_after = query_usage + admission_commitment
+        hard_exceeded = _hard_resources(usage_after).exceeded_dimensions(_hard_resources(self.allocation.resources))
+        if hard_exceeded:
+            reason = "continuation_capacity" if credit_template is not None else f"hard_{hard_exceeded[0]}"
             return reason, False, empty_plan
+        query_soft_blocked = (
+            admission_commitment.object_store_bytes > 0
+            and usage_after.object_store_bytes > self.allocation.resources.object_store_bytes
+        )
         downstream_reservations = self._downstream_reservations_locked(stage.spec)
         if downstream_reservations:
-            remaining = self.allocation.resources - (query_usage + admission_commitment)
+            remaining = _hard_resources(self.allocation.resources) - _hard_resources(query_usage + admission_commitment)
             reservation_total = self._downstream_reservation_total(downstream_reservations)
             if not reservation_total.fits_within(remaining):
                 return "continuation_capacity", False, empty_plan
@@ -991,7 +1018,7 @@ class QueryResourceManager:
             eligible_stage_ids, reservation_stage_id, credit_resources = credit_template
             node_id, credit_node_id, node_blocked_reason, node_fatal = self._select_task_and_credit_nodes_locked(
                 request.node_id,
-                commitment,
+                hard_commitment,
                 credit_resources,
                 downstream_reservations=downstream_reservations,
             )
@@ -1010,7 +1037,7 @@ class QueryResourceManager:
             )
             node_id, node_blocked_reason, node_fatal = self._select_task_node_locked(
                 request.node_id,
-                admission_commitment,
+                _hard_resources(admission_commitment),
                 allowed_node_ids=allowed_node_ids,
                 downstream_reservations=downstream_reservations,
             )
@@ -1044,6 +1071,8 @@ class QueryResourceManager:
             for downstream_id in self._direct_downstream_stage_ids[stage.spec.stage_id]
         ):
             return "stage_soft_limit", False, plan
+        if query_soft_blocked:
+            return "query_soft_object_store_bytes", False, plan
         if borrowed_credit is None:
             soft_reason = self._stage_soft_block_reason_locked(stage.spec.stage_id, commitment)
             if soft_reason is not None:
@@ -1058,7 +1087,9 @@ class QueryResourceManager:
         allowed_node_ids: set[str] | None,
         downstream_reservations: tuple[_DownstreamReservation, ...] = (),
     ) -> tuple[str, str | None, bool]:
-        allocation_by_node = {item.node_id: item.resources for item in self.allocation.node_allocations}
+        allocation_by_node = {
+            item.node_id: _hard_resources(item.resources) for item in self.allocation.node_allocations
+        }
         requested = "" if requested_node_id is None else str(requested_node_id).strip()
         if requested and requested not in allocation_by_node:
             return "", "node_not_allocated", True
@@ -1077,7 +1108,7 @@ class QueryResourceManager:
         debt_detected = False
         for node_id in static_candidates:
             capacity = allocation_by_node[node_id]
-            usage = self._node_usage_locked(node_id)
+            usage = _hard_resources(self._node_usage_locked(node_id))
             if not usage.fits_within(capacity):
                 debt_detected = True
                 continue
@@ -1123,7 +1154,9 @@ class QueryResourceManager:
         downstream_reservations: tuple[_DownstreamReservation, ...],
     ) -> tuple[str, str, str | None, bool]:
         """Place one parent task and its continuation ownership atomically."""
-        allocation_by_node = {item.node_id: item.resources for item in self.allocation.node_allocations}
+        allocation_by_node = {
+            item.node_id: _hard_resources(item.resources) for item in self.allocation.node_allocations
+        }
         requested = "" if requested_node_id is None else str(requested_node_id).strip()
         if requested and requested not in allocation_by_node:
             return "", "", "node_not_allocated", True
@@ -1152,7 +1185,7 @@ class QueryResourceManager:
                 remaining_by_node: dict[str, ResourceVector] = {}
                 feasible = True
                 for node_id, capacity in allocation_by_node.items():
-                    usage = self._node_usage_locked(node_id)
+                    usage = _hard_resources(self._node_usage_locked(node_id))
                     if not usage.fits_within(capacity):
                         if node_id in proposed:
                             debt_detected = True
@@ -1199,7 +1232,7 @@ class QueryResourceManager:
     ) -> bool:
         remaining_by_node: dict[str, ResourceVector] = {}
         for node_id, capacity in allocation_by_node.items():
-            usage = self._node_usage_locked(node_id)
+            usage = _hard_resources(self._node_usage_locked(node_id))
             if node_id == parent_node_id:
                 usage = usage + parent_commitment
             if usage.fits_within(capacity):
@@ -1277,9 +1310,11 @@ class QueryResourceManager:
 
     @staticmethod
     def _task_commitment(spec: StageResourceSpec) -> ResourceVector:
-        return _resource_with_object_store(
-            spec.per_task,
-            spec.per_task.object_store_bytes + spec.output_window_bytes,
+        """Return non-spillable process resources for one runnable task."""
+        return ResourceVector(
+            cpu=spec.per_task.cpu,
+            gpu=spec.per_task.gpu,
+            heap_bytes=spec.per_task.heap_bytes,
         )
 
     def _continuation_credit_template_locked(
@@ -1325,7 +1360,9 @@ class QueryResourceManager:
             return None
         requested = "" if requested_node_id is None else str(requested_node_id).strip()
         commitment = self._task_commitment(stage)
-        allocation_by_node = {item.node_id: item.resources for item in self.allocation.node_allocations}
+        allocation_by_node = {
+            item.node_id: _hard_resources(item.resources) for item in self.allocation.node_allocations
+        }
         candidates = [
             credit
             for credit in self._continuation_credits.values()
@@ -1352,13 +1389,24 @@ class QueryResourceManager:
                 prospective_task_usage,
                 idle_output_excess,
             )
-            query_exceeded = (query_usage + incremental).exceeded_dimensions(self.allocation.resources)
-            node_usage = self._node_usage_locked(credit.node_id)
-            node_exceeded = (node_usage + incremental).exceeded_dimensions(allocation_by_node[credit.node_id])
+            query_exceeded = _hard_resources(query_usage + incremental).exceeded_dimensions(
+                _hard_resources(self.allocation.resources)
+            )
+            node_usage = _hard_resources(self._node_usage_locked(credit.node_id))
+            node_exceeded = _hard_resources(node_usage + incremental).exceeded_dimensions(
+                allocation_by_node[credit.node_id]
+            )
+            soft_debt = max(
+                0,
+                query_usage.object_store_bytes
+                + incremental.object_store_bytes
+                - self.allocation.resources.object_store_bytes,
+            )
             feasible = not query_exceeded and not node_exceeded
             return (
                 0 if feasible else 1,
                 len(query_exceeded) + len(node_exceeded),
+                soft_debt,
                 incremental.dominant_share(self.allocation.resources),
                 incremental.gpu,
                 incremental.cpu,
@@ -1384,13 +1432,13 @@ class QueryResourceManager:
         actor boundary additionally needs one slot for every inactive
         downstream Ray-task continuation: the actor input producer, actor call,
         and downstream consumer can all remain live while generator output is
-        drained, so the transferable component-max credit alone is not enough.
-        Actor process resources are resident, but each downstream actor stage
-        also needs an invocation input/output window on one of its pinned nodes.
+        drained, so the transferable component-max process credit alone is not
+        enough. Actor process resources are already resident; invocation
+        input/output bytes use the query's dynamic object-store budget.
 
         Reservations include latent stages: waiting for a stage to become
         runnable is too late because an upstream producer may already have
-        consumed the last heap or object-store slot by then.
+        consumed the last non-spillable process slot by then.
         """
         reachable = tuple(
             self._stages[stage_id]
@@ -1637,11 +1685,70 @@ class QueryResourceManager:
         per_task_amount = self._stage_dimension_commitment(spec, field_name)
         return per_task_amount * max(0, int(hard_bound))
 
-    def _task_liveness_block_reason_locked(self, request: TaskRequest) -> str | None:
-        if self._active_liveness_task_lease_id is not None:
+    def _active_tasks_allow_liveness_locked(
+        self,
+        stage_id: str,
+        plan: _TaskAdmissionPlan,
+    ) -> bool:
+        """Allow one escape only when it can drain an active upstream path."""
+        if not self._task_leases:
+            return True
+        stage_key = str(stage_id)
+        if self._active_task_count_for_stage_locked(stage_key) > 0:
+            return False
+        if plan.borrowed_credit_id is not None:
+            return True
+        return any(stage_key in self._reachable_stage_ids[lease.stage_id] for lease in self._task_leases.values())
+
+    def _continues_active_liveness_path_locked(
+        self,
+        stage_id: str,
+        plan: _TaskAdmissionPlan,
+    ) -> bool:
+        """Return whether a soft-blocked task continues the one escape path."""
+        active_lease_id = self._active_liveness_task_lease_id
+        if active_lease_id is None:
+            return False
+        stage_key = str(stage_id)
+        stage = self._stages.get(stage_key)
+        if stage is None:
+            return False
+        active_path_leases = tuple(
+            lease
+            for lease_id, lease in self._task_leases.items()
+            if lease_id in self._active_liveness_path_task_lease_ids
+        )
+        frontier = tuple(
+            lease
+            for lease in active_path_leases
+            if not any(
+                other.lease_id != lease.lease_id and other.stage_id in self._reachable_stage_ids[lease.stage_id]
+                for other in active_path_leases
+            )
+        )
+        continues_from_frontier = any(stage_key in self._reachable_stage_ids[lease.stage_id] for lease in frontier)
+        credit_id = plan.borrowed_credit_id
+        if credit_id is not None:
+            credit = self._continuation_credits.get(credit_id)
+            return (
+                continues_from_frontier
+                and credit is not None
+                and credit.parent_active
+                and credit.parent_task_lease_id in self._active_liveness_path_task_lease_ids
+                and credit.borrowed_by_task_lease_id is None
+            )
+        return continues_from_frontier
+
+    def _task_liveness_block_reason_locked(
+        self,
+        request: TaskRequest,
+        plan: _TaskAdmissionPlan,
+    ) -> str | None:
+        if self._active_liveness_task_lease_id is not None and not self._continues_active_liveness_path_locked(
+            str(request.stage_id),
+            plan,
+        ):
             return "liveness_task_active"
-        if self._task_leases and not self._external_consumer_waiting:
-            return "liveness_not_needed"
         if self._has_normal_task_candidate_locked():
             return "normal_candidate_available"
         preferred = self._preferred_liveness_stage_locked()
@@ -1649,6 +1756,11 @@ class QueryResourceManager:
             return "no_liveness_candidate"
         if preferred != str(request.stage_id):
             return "liveness_candidate_not_selected"
+        if not self._active_tasks_allow_liveness_locked(
+            str(request.stage_id),
+            plan,
+        ):
+            return "liveness_not_needed"
         return None
 
     def _has_normal_task_candidate_locked(self) -> bool:
@@ -1724,6 +1836,21 @@ class QueryResourceManager:
         soft = [item for item in evaluations if not item.fatal and item.reason in _SOFT_TASK_BLOCK_REASONS]
         if not soft:
             return None
+        if self._active_liveness_task_lease_id is not None:
+            path_candidates = [
+                item
+                for item in soft
+                if self._continues_active_liveness_path_locked(
+                    str(item.request.stage_id),
+                    item.plan,
+                )
+                and self._active_tasks_allow_liveness_locked(
+                    str(item.request.stage_id),
+                    item.plan,
+                )
+            ]
+            if path_candidates:
+                soft = path_candidates
         soft_stage_ids = {str(item.request.stage_id) for item in soft}
         ordered_stage_ids = [stage_id for stage_id in self._reverse_topological_stage_ids if stage_id in soft_stage_ids]
         starving_stage_ids = [
@@ -1741,12 +1868,21 @@ class QueryResourceManager:
         self,
         evaluations: tuple[_QueuedTaskEvaluation, ...],
     ) -> str | None:
-        if self._active_liveness_task_lease_id is not None:
-            return "liveness_task_active"
-        if self._task_leases and not self._external_consumer_waiting:
-            return "liveness_not_needed"
         if any(not item.fatal and item.reason is None for item in evaluations):
             return "normal_candidate_available"
+        selected = self._select_waiting_task_evaluation_locked(evaluations)
+        if selected is None:
+            return "no_liveness_candidate"
+        if self._active_liveness_task_lease_id is not None and not self._continues_active_liveness_path_locked(
+            str(selected.request.stage_id),
+            selected.plan,
+        ):
+            return "liveness_task_active"
+        if not self._active_tasks_allow_liveness_locked(
+            str(selected.request.stage_id),
+            selected.plan,
+        ):
+            return "liveness_not_needed"
         return None
 
     def _preferred_waiting_task_locked(self) -> tuple[TaskRequest | None, str]:
@@ -1764,11 +1900,21 @@ class QueryResourceManager:
                 for request, _ in self._waiting_task_inputs.values():
                     if str(request.stage_id) != stage_id:
                         continue
-                    reason, fatal, _ = self._normal_task_block_reason_locked(
+                    reason, fatal, plan = self._normal_task_block_reason_locked(
                         request,
                         hypothetical=True,
                     )
-                    if not fatal and reason in _SOFT_TASK_BLOCK_REASONS:
+                    path_allowed = self._active_liveness_task_lease_id is None or (
+                        self._continues_active_liveness_path_locked(
+                            stage_id,
+                            plan,
+                        )
+                        and self._active_tasks_allow_liveness_locked(
+                            stage_id,
+                            plan,
+                        )
+                    )
+                    if not fatal and reason in _SOFT_TASK_BLOCK_REASONS and path_allowed:
                         waiting_candidates.append(stage_id)
                         break
             if not waiting_candidates:
@@ -1793,11 +1939,21 @@ class QueryResourceManager:
                 node_id=None,
                 retained_input_bytes=stage.spec.per_task.object_store_bytes,
             )
-            reason, fatal, _ = self._normal_task_block_reason_locked(
+            reason, fatal, plan = self._normal_task_block_reason_locked(
                 request,
                 hypothetical=True,
             )
-            if not fatal and reason in _SOFT_TASK_BLOCK_REASONS:
+            path_allowed = self._active_liveness_task_lease_id is None or (
+                self._continues_active_liveness_path_locked(
+                    stage_id,
+                    plan,
+                )
+                and self._active_tasks_allow_liveness_locked(
+                    stage_id,
+                    plan,
+                )
+            )
+            if not fatal and reason in _SOFT_TASK_BLOCK_REASONS and path_allowed:
                 runnable_candidates.append(stage_id)
         if not runnable_candidates:
             return None
@@ -1819,6 +1975,14 @@ class QueryResourceManager:
             raise RuntimeError("cannot grant a query task lease without a concrete Ray node")
         if plan.new_credit is not None and plan.borrowed_credit_id is not None:
             raise RuntimeError("task admission cannot create and borrow a continuation credit")
+        continues_active_liveness = liveness and self._continues_active_liveness_path_locked(
+            str(request.stage_id),
+            plan,
+        )
+        if liveness and self._active_liveness_task_lease_id is not None and not continues_active_liveness:
+            raise RuntimeError("task liveness path changed during atomic admission")
+        if liveness and self._active_liveness_task_lease_id is None and self._active_liveness_path_task_lease_ids:
+            raise RuntimeError("task liveness path has no active root")
         stage = self._stages[str(request.stage_id)].spec
         actor_index = plan.actor_index
         lease_id = uuid.uuid4().hex
@@ -1882,7 +2046,9 @@ class QueryResourceManager:
         self._recompute_stage_queued_input_locked(lease.stage_id)
         self._started_stage_ids.add(lease.stage_id)
         if liveness:
-            self._active_liveness_task_lease_id = lease.lease_id
+            if self._active_liveness_task_lease_id is None:
+                self._active_liveness_task_lease_id = lease.lease_id
+            self._active_liveness_path_task_lease_ids.add(lease.lease_id)
             self._task_liveness_grants_total += 1
         self._publish_change_locked()
         return TaskGrant(True, lease=lease, liveness=liveness)
@@ -2041,8 +2207,7 @@ class QueryResourceManager:
             self._on_task_lease_removed_locked(task)
             self._active_attempt_leases.pop((task.task_id, task.attempt_id), None)
             self._terminal_attempts.add((task.task_id, task.attempt_id))
-            if self._active_liveness_task_lease_id == task.lease_id:
-                self._active_liveness_task_lease_id = None
+            self._maybe_clear_task_liveness_locked(task.lease_id)
             self._publish_change_locked()
             return output_leases
 
@@ -2057,14 +2222,29 @@ class QueryResourceManager:
             self._active_attempt_leases.pop((lease.task_id, lease.attempt_id), None)
             if terminal:
                 self._terminal_attempts.add((lease.task_id, lease.attempt_id))
-            if self._active_liveness_task_lease_id == lease_key:
-                self._active_liveness_task_lease_id = None
+            self._maybe_clear_task_liveness_locked(lease_key)
             self._publish_change_locked()
             return True
 
+    def _maybe_clear_task_liveness_locked(self, task_lease_id: str) -> None:
+        """Return one escape after its continuation path leaves the producer."""
+        task_key = str(task_lease_id)
+        if task_key not in self._active_liveness_path_task_lease_ids:
+            return
+        if task_key in self._task_leases:
+            return
+        if any(
+            output.task_lease_id == task_key and output.state in {"generator_pending", "stage_queue"}
+            for output in self._output_leases.values()
+        ):
+            return
+        self._active_liveness_path_task_lease_ids.remove(task_key)
+        if not self._active_liveness_path_task_lease_ids:
+            self._active_liveness_task_lease_id = None
+
     def try_acquire_output_block(self, request: OutputBlockRequest) -> OutputBlockGrant:
         with self._lock:
-            blocked_reason, fatal, delta = self._normal_output_block_reason_locked(request)
+            blocked_reason, fatal, _ = self._normal_output_block_reason_locked(request)
             if blocked_reason is None:
                 return self._grant_output_block_locked(request, liveness=False)
             if fatal or blocked_reason not in _SOFT_OUTPUT_BLOCK_REASONS:
@@ -2078,10 +2258,6 @@ class QueryResourceManager:
             preferred = self._preferred_output_liveness_stage_locked(request)
             if preferred != str(request.producer_stage_id):
                 return OutputBlockGrant(False, blocked_reason="liveness_output_candidate_not_selected")
-            if delta > 0:
-                usage_after = self._query_usage_locked() + ResourceVector(object_store_bytes=delta)
-                if not usage_after.fits_within(self.allocation.resources):
-                    return OutputBlockGrant(False, blocked_reason="hard_object_store_bytes")
             return self._grant_output_block_locked(request, liveness=True)
 
     def try_acquire_next_queued_output_block(
@@ -2175,25 +2351,20 @@ class QueryResourceManager:
         size = int(request.size_bytes)
         if size <= 0:
             return "invalid_output_block_size", True, 0
-        object_limit = self.allocation.resources.object_store_bytes
-        if size > object_limit:
-            return "output_block_exceeds_query_limit", True, 0
 
         live = self._live_output_bytes_for_task_locked(task.lease_id)
         before = max(task.output_window_bytes, live)
         after = max(task.output_window_bytes, live + size)
         delta = after - before
+        object_limit = self.allocation.resources.object_store_bytes
+        usage_after = self._query_usage_locked() + ResourceVector(object_store_bytes=delta)
+        if delta > 0 and usage_after.object_store_bytes > object_limit:
+            return "query_soft_object_store_bytes", False, delta
         if delta > 0:
-            usage_after = self._query_usage_locked() + ResourceVector(object_store_bytes=delta)
-            if not usage_after.fits_within(self.allocation.resources):
-                return "hard_object_store_bytes", False, delta
             try:
-                node_capacity = self.allocation.resources_for_node(task.node_id)
+                self.allocation.resources_for_node(task.node_id)
             except KeyError:
                 return "node_not_allocated", True, delta
-            node_usage_after = self._node_usage_locked(task.node_id) + ResourceVector(object_store_bytes=delta)
-            if not node_usage_after.fits_within(node_capacity):
-                return "node_capacity", False, delta
             soft = self._stage_soft_block_reason_locked(
                 stage.spec.stage_id,
                 ResourceVector(object_store_bytes=delta),
@@ -2334,13 +2505,13 @@ class QueryResourceManager:
                 raise ValueError(f"invalid output lease transition: {lease.state} -> {target}")
             self._output_leases[lease_key] = OutputBlockLease(**{**asdict(lease), "state": target})
             if target == "downstream_input" and self._active_liveness_output_lease_id == lease_key:
-                # The object remains physically leased and fully charged, but
-                # it no longer occupies the producer-side liveness escape.
-                # This is the ownership boundary that permits another block
-                # to complete a downstream compute batch without weakening
-                # query/node object-store hard limits.
+                # A liveness escape limits producer-side progress to one full
+                # block at a time. The handed-off object stays charged, while
+                # returning the token lets a partial downstream batch request
+                # its next block.
                 self._active_liveness_output_lease_id = None
             if target == "downstream_input":
+                self._maybe_clear_task_liveness_locked(lease.task_lease_id)
                 self._maybe_return_continuation_credit_locked(lease.task_lease_id)
             self._recompute_stage_queued_output_locked(lease.producer_stage_id)
             self._publish_change_locked()
@@ -2356,6 +2527,7 @@ class QueryResourceManager:
             self._terminal_output_blocks.add(lease.block_id)
             if self._active_liveness_output_lease_id == lease_key:
                 self._active_liveness_output_lease_id = None
+            self._maybe_clear_task_liveness_locked(lease.task_lease_id)
             self._maybe_return_continuation_credit_locked(lease.task_lease_id)
             self._recompute_stage_queued_output_locked(lease.producer_stage_id)
             self._publish_change_locked()
@@ -2385,6 +2557,7 @@ class QueryResourceManager:
             for stage_id in self._stages:
                 self._recompute_stage_queued_output_locked(stage_id)
             self._active_liveness_task_lease_id = None
+            self._active_liveness_path_task_lease_ids.clear()
             self._active_liveness_output_lease_id = None
             self._allocation_admission_open = False
             self._cancelled = True
@@ -2635,15 +2808,33 @@ class QueryResourceManager:
                 "graph": self.graph.to_dict(),
                 "allocation": self.allocation.to_dict(),
                 "usage": usage.to_dict(),
-                "allocation_debt": _positive_difference(usage, self.allocation.resources).to_dict(),
+                "allocation_debt": _hard_positive_difference(
+                    usage,
+                    self.allocation.resources,
+                ).to_dict(),
+                "soft_object_store_debt_bytes": max(
+                    0,
+                    usage.object_store_bytes - self.allocation.resources.object_store_bytes,
+                ),
                 "allocation_admission_open": self._allocation_admission_open,
                 "admission_epoch": int(self._admission_epoch),
                 "node_usage": {node_id: resources.to_dict() for node_id, resources in node_usage.items()},
                 "node_allocation_debt": {
-                    node_id: _positive_difference(
+                    node_id: _hard_positive_difference(
                         resources,
                         allocation_by_node.get(node_id, ResourceVector()),
                     ).to_dict()
+                    for node_id, resources in node_usage.items()
+                },
+                "node_soft_object_store_debt_bytes": {
+                    node_id: max(
+                        0,
+                        resources.object_store_bytes
+                        - allocation_by_node.get(
+                            node_id,
+                            ResourceVector(),
+                        ).object_store_bytes,
+                    )
                     for node_id, resources in node_usage.items()
                 },
                 "reservation_ratio": self.reservation_ratio,

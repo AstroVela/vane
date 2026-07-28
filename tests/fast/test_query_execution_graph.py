@@ -386,7 +386,7 @@ def test_legacy_intermediate_resource_dimension_is_rejected():
         ResourceVector.from_dict(payload)
 
 
-def test_allocation_validation_includes_task_heap_retained_input_and_output_window():
+def test_allocation_validation_keeps_heap_hard_and_object_windows_soft():
     stage = _stage(
         "stage:fragment-1:decode",
         per_task=_resources(cpu=1, heap_bytes=300, object_store_bytes=50),
@@ -411,14 +411,14 @@ def test_allocation_validation_includes_task_heap_retained_input_and_output_wind
             _resources(
                 cpu=4,
                 heap_bytes=300,
-                object_store_bytes=250,
+                object_store_bytes=1,
             ),
             generation=7,
         )
     )
 
 
-def test_allocation_rejects_one_output_window_larger_than_hard_object_store_limit():
+def test_allocation_accepts_one_output_window_larger_than_soft_object_store_budget():
     stage = _stage(
         "stage:fragment-1:decode",
         target_output_block_bytes=101,
@@ -430,8 +430,7 @@ def test_allocation_rejects_one_output_window_larger_than_hard_object_store_limi
         generation=1,
     )
 
-    with pytest.raises(ValueError, match="output window"):
-        graph.validate_allocation(allocation)
+    graph.validate_allocation(allocation)
 
 
 def test_allocation_rejects_aggregate_resources_that_do_not_form_a_runnable_node():

@@ -4463,9 +4463,9 @@ class RayQueryDriverActor:
     ) -> dict[str, Any]:
         """Transfer a live output from the producer queue to downstream input.
 
-        This returns only the producer-side liveness credit.  The output lease
-        itself remains active, so its bytes continue to count against query,
-        stage, and node object-store limits until the final descriptor owner
+        This returns producer-side liveness credit. The output lease itself
+        remains active, so its bytes continue to count against the query and
+        stage soft object-store budgets until the final descriptor owner
         releases it.
         """
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager

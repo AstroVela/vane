@@ -28,8 +28,11 @@ class ResourceVector:
     """Resources owned by a query, stage, task, or output window.
 
     CPU and GPU are Ray logical resources and may be fractional. Byte resources
-    are exact integer ownership quantities. A vector is never allowed to carry
-    negative capacity; subtraction that would underflow is a control-plane bug.
+    use integer accounting units. Query allocations treat CPU, GPU, and heap as
+    hard ownership while object-store bytes are a flow-control budget: live
+    ObjectRefs may temporarily exceed it under the bounded liveness policy and
+    Ray Core may spill them. A vector is never allowed to carry negative
+    capacity; subtraction that would underflow is a control-plane bug.
     """
 
     cpu: float = 0.0
@@ -140,7 +143,7 @@ class ResourceVector:
 
 @dataclass(frozen=True)
 class NodeResourceAllocation:
-    """One query's hard resource ownership on one concrete Ray node."""
+    """One query's hard process ownership and soft object budget on one node."""
 
     node_id: str
     resources: ResourceVector
@@ -216,6 +219,15 @@ def _resource_vectors_equivalent(left: ResourceVector, right: ResourceVector) ->
         and math.isclose(left.gpu, right.gpu, rel_tol=0.0, abs_tol=1e-9)
         and left.heap_bytes == right.heap_bytes
         and left.object_store_bytes == right.object_store_bytes
+    )
+
+
+def _hard_resources(resources: ResourceVector) -> ResourceVector:
+    """Return the non-spillable portion of a query resource vector."""
+    return ResourceVector(
+        cpu=resources.cpu,
+        gpu=resources.gpu,
+        heap_bytes=resources.heap_bytes,
     )
 
 
@@ -620,33 +632,12 @@ class QueryExecutionGraph:
         *,
         require_full_minimum: bool = True,
     ) -> None:
-        capacity = allocation.resources
+        hard_capacity = _hard_resources(allocation.resources)
         for stage in self.stages:
-            task_commitment = ResourceVector(
-                cpu=stage.per_task.cpu,
-                gpu=stage.per_task.gpu,
-                heap_bytes=stage.per_task.heap_bytes,
-                object_store_bytes=(stage.per_task.object_store_bytes + stage.output_window_bytes),
-            )
+            task_commitment = _hard_resources(stage.per_task)
             actor_resident = stage.resident_per_actor if stage.backend == "ray_actor" else ResourceVector()
             placement_commitment = actor_resident + task_commitment
-            output_window = stage.output_window_bytes
-            if require_full_minimum and capacity.object_store_bytes > 0 and output_window > capacity.object_store_bytes:
-                raise ValueError(
-                    f"stage {stage.stage_id} output window {output_window} exceeds query object-store allocation "
-                    f"{capacity.object_store_bytes}"
-                )
-            total_object_store = stage.per_task.object_store_bytes + output_window
-            if (
-                require_full_minimum
-                and capacity.object_store_bytes > 0
-                and total_object_store > capacity.object_store_bytes
-            ):
-                raise ValueError(
-                    f"stage {stage.stage_id} retained input plus output window {total_object_store} exceeds "
-                    f"query object-store allocation {capacity.object_store_bytes}"
-                )
-            exceeded = placement_commitment.exceeded_dimensions(capacity)
+            exceeded = placement_commitment.exceeded_dimensions(hard_capacity)
             if require_full_minimum and exceeded:
                 raise ValueError(
                     f"stage {stage.stage_id} maximum task exceeds query allocation for {', '.join(exceeded)}"
@@ -655,14 +646,14 @@ class QueryExecutionGraph:
                 require_full_minimum
                 and not task_commitment.is_zero()
                 and not any(
-                    placement_commitment.fits_within(node_allocation.resources)
+                    placement_commitment.fits_within(_hard_resources(node_allocation.resources))
                     for node_allocation in allocation.node_allocations
                 )
             ):
                 raise ValueError(f"stage {stage.stage_id} maximum task does not fit any allocated Ray node")
             if stage.backend == "ray_actor":
-                actor_pool = placement_commitment.scale(stage.actor_pool_size)
-                exceeded_actor = actor_pool.exceeded_dimensions(capacity)
+                actor_pool = actor_resident.scale(stage.actor_pool_size)
+                exceeded_actor = actor_pool.exceeded_dimensions(hard_capacity)
                 if require_full_minimum and exceeded_actor:
                     raise ValueError(
                         f"stage {stage.stage_id} actor pool exceeds query allocation for {', '.join(exceeded_actor)}"
@@ -679,7 +670,9 @@ class QueryExecutionGraph:
                 if placements and placement_indices != expected_indices:
                     raise ValueError(f"stage {stage.stage_id} actor placement indices must be contiguous from zero")
                 for placement in placements:
-                    if not placement_commitment.fits_within(allocation.resources_for_node(placement.node_id)):
+                    if not placement_commitment.fits_within(
+                        _hard_resources(allocation.resources_for_node(placement.node_id))
+                    ):
                         raise ValueError(
                             f"stage {stage.stage_id} actor {placement.actor_index} does not fit "
                             f"allocated Ray node {placement.node_id}"
@@ -695,19 +688,15 @@ class QueryExecutionGraph:
             actor_commitment_by_node: dict[str, ResourceVector] = {}
             for placement in allocation.actor_placements:
                 stage = self.stage_by_id(placement.stage_id)
-                invocation = ResourceVector(
-                    object_store_bytes=(stage.per_task.object_store_bytes + stage.output_window_bytes)
-                )
                 actor_commitment_by_node[placement.node_id] = (
                     actor_commitment_by_node.get(
                         placement.node_id,
                         ResourceVector(),
                     )
                     + stage.resident_per_actor
-                    + invocation
                 )
             for node_id, commitment in actor_commitment_by_node.items():
-                if not commitment.fits_within(allocation.resources_for_node(node_id)):
+                if not commitment.fits_within(_hard_resources(allocation.resources_for_node(node_id))):
                     raise ValueError(f"cumulative actor placements do not fit allocated Ray node {node_id}")
 
     def normalized_digest(self) -> str:
