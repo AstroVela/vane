@@ -334,8 +334,8 @@ DuckDBResult<void> FlightServer::StartInternal() {
 	if (!config_.allow_insecure_flight) {
 		return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
 		    "Plaintext Flight transport is disabled by default. Set VANE_ALLOW_INSECURE_FLIGHT=1 or call "
-		    "vane.configure(allow_insecure_flight=True) before creating Ray workers to enable it in a trusted "
-		    "development environment."));
+		    "vane.configure(allow_insecure_flight=True) on the driver before submitting the distributed query to "
+		    "enable it in a trusted development environment."));
 	}
 	if (config_.server_epoch.empty()) {
 		return DuckDBResult<void>::err(DuckDBError::value_error("flight server epoch is empty"));

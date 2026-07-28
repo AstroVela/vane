@@ -105,10 +105,10 @@ Plaintext Arrow Flight is disabled by default. Same-process local-disk shuffle a
 import vane
 
 vane.configure(allow_insecure_flight=True)
-# Create Ray workers only after applying this setting.
+# Submit the distributed query after applying this setting.
 ```
 
-Alternatively, set `VANE_ALLOW_INSECURE_FLIGHT=1` before creating Ray workers. Existing workers are not dynamically reconfigured, and `DUCKDB_FLIGHT_PORT` alone does not enable transport. The opt-in keeps the current plaintext `grpc://` listener on `0.0.0.0`; it does not provide TLS, authentication, or authorization. See [SECURITY.md](SECURITY.md) for the trust boundary.
+Alternatively, set `VANE_ALLOW_INSECURE_FLIGHT=1` on the driver before submitting the distributed query. The opt-in is serialized with the exchange plan, so existing Ray workers do not need to be recreated. `DUCKDB_FLIGHT_PORT` alone does not enable transport. The opt-in keeps the current plaintext `grpc://` listener on `0.0.0.0`; it does not provide TLS, authentication, or authorization. See [SECURITY.md](SECURITY.md) for the trust boundary.
 
 ### More Resources
 

@@ -882,8 +882,8 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 	if (!config_.allow_insecure_flight) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(DuckDBError::invalid_state_error(
 		    "Remote local-disk shuffle requires insecure plaintext Flight transport, which is disabled by default. "
-		    "Set VANE_ALLOW_INSECURE_FLIGHT=1 or call vane.configure(allow_insecure_flight=True) before creating Ray "
-		    "workers, and use it only in a trusted development environment."));
+		    "Set VANE_ALLOW_INSECURE_FLIGHT=1 or call vane.configure(allow_insecure_flight=True) on the driver before "
+		    "submitting the distributed query, and use it only in a trusted development environment."));
 	}
 	if (handle.flight_server_epoch.empty()) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(

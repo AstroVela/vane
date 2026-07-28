@@ -188,7 +188,8 @@ class EnvRegistry:
         bool,
         False,
         "Allow plaintext Arrow Flight transport for cross-worker local-disk shuffle. "
-        "Use only in trusted development environments and configure it before creating Ray workers.",
+        "Use only in trusted development environments and configure it on the driver before submitting the "
+        "distributed query.",
     )
 
     # -- Fault-tolerant execution ------------------------------------------

@@ -32,7 +32,7 @@ Several Vane features intentionally execute code. Treat these boundaries explici
 
 Vane disables its plaintext Arrow Flight listener and remote client path by default. Same-process local-disk shuffle continues through the in-process registry, and object-storage shuffle continues through committed manifests without opening a listener. A cross-worker local-disk shuffle fails before creating a network client.
 
-For a trusted development network only, opt in before creating any Ray workers:
+For a trusted development network only, opt in on the driver before submitting the distributed query:
 
 ```python
 import vane
@@ -40,7 +40,7 @@ import vane
 vane.configure(allow_insecure_flight=True)
 ```
 
-The equivalent environment setting is `VANE_ALLOW_INSECURE_FLIGHT=1`. Existing Ray workers are not dynamically reconfigured, and setting `DUCKDB_FLIGHT_PORT` alone does not authorize network transport. The opt-in retains the current `0.0.0.0` plaintext `grpc://` behavior; it is not a substitute for TLS, authentication, authorization, or network isolation.
+The equivalent environment setting is `VANE_ALLOW_INSECURE_FLIGHT=1`. The opt-in is serialized with the exchange plan, so existing Ray workers do not need to be recreated. Setting `DUCKDB_FLIGHT_PORT` alone does not authorize network transport. The opt-in retains the current `0.0.0.0` plaintext `grpc://` behavior; it is not a substitute for TLS, authentication, authorization, or network isolation.
 
 ## Secure deployment baseline
 
