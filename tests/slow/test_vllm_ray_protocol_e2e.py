@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = [pytest.mark.real_ray, pytest.mark.ray_cluster_owner]
+
 ray = pytest.importorskip("ray")
 pa = pytest.importorskip("pyarrow")
 
