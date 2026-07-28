@@ -7686,6 +7686,7 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
     class FakeRuntimeExecutor:
         def __init__(self, _payload, *, cache_callable=False):
             self.finished = False
+            self.closed = False
             self.input_rows = 0
             created.append(self)
 
@@ -7694,6 +7695,9 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
 
         def finished_submitting(self):
             self.finished = True
+
+        def close(self):
+            self.closed = True
 
         def drain_outputs(self):
             if not self.finished:
@@ -7731,6 +7735,7 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
     assert descriptor["metadata"] == [{"rows": [3], "num_rows": 1, "ipc_size_bytes": 1}]
     assert descriptor["names"] == ["rows"]
     assert created and created[0].finished
+    assert created[0].closed
 
 
 @pytest.mark.parametrize(
