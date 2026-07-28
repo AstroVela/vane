@@ -701,7 +701,9 @@ def embed_text(
         rel: A DuckDB relation containing the source data.
         column: Name of the text column to embed.
         provider: Provider name or instance (default: ``"transformers"``).
-        model: Model identifier (provider-specific default if ``None``).
+        model: Model identifier. Providers without a library default (e.g.
+            ``"google"``) require an explicit model here or on the provider
+            instance and raise :class:`ValueError` otherwise.
         dimensions: Output embedding dimensions (model default if ``None``).
         output_column: Name of the output column (default: ``"embedding"``).
         max_chunk_chars: If set, texts longer than this are split into
