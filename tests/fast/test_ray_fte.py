@@ -904,6 +904,55 @@ def test_fte_task_execution_terminal_status_refreshes_split_stats_with_fallback(
     assert fallback_status["completed_input_bytes"] == 128
 
 
+@pytest.mark.parametrize(
+    "terminal_state",
+    [
+        FteTaskState.FINISHED,
+        FteTaskState.FAILED,
+        FteTaskState.CANCELED,
+        FteTaskState.ABORTED,
+    ],
+)
+def test_fte_task_execution_late_no_more_splits_is_terminal_noop(terminal_state):
+    async def execute_fn(_request):
+        return None
+
+    execution = FteTaskExecution(
+        {
+            "task_id": "q-late-no-more-splits.0.0.0",
+            "no_more_splits": ["already-sealed"],
+        },
+        execute_fn,
+        default_task_memory_bytes=1,
+    )
+    failure = None
+    if terminal_state == FteTaskState.FAILED:
+        failure = {
+            "type": "RuntimeError",
+            "message": "existing failure",
+            "traceback": "existing traceback",
+        }
+    execution._transition(terminal_state, failure=failure)
+    state_before = execution.status.state
+    version_before = execution.status.version
+    failure_before = None if execution.status.failure is None else dict(execution.status.failure)
+    updated_at_before = execution.status.updated_at
+    sealed_sources_before = set(execution.no_more_split_sources)
+
+    status = execution.no_more_splits("late-source")
+
+    assert status is execution.status
+    assert status.state == state_before
+    assert status.version == version_before
+    assert status.failure == failure_before
+    assert status.updated_at == updated_at_before
+    assert execution.no_more_split_sources == sealed_sources_before
+    with pytest.raises(RuntimeError, match="cannot add splits to terminal task"):
+        execution.add_splits("late-source", [])
+    with pytest.raises(RuntimeError, match="cannot update terminal task"):
+        execution.update_task({})
+
+
 def test_fte_query_status_uses_fragment_execution_snapshot():
     class _SnapshotOnlyFragmentExecution:
         @property
@@ -4332,6 +4381,8 @@ def test_fte_worker_task_manager_unknown_status_is_non_throwing():
         assert status["task_id_string"] == "q.9.3.0"
         with pytest.raises(KeyError, match="unknown FTE task attempt"):
             await manager.add_splits(task_id, "7", [])
+        with pytest.raises(KeyError, match="unknown FTE task attempt"):
+            await manager.no_more_splits(task_id, "7")
 
     asyncio.run(run())
 
