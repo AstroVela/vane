@@ -1276,6 +1276,66 @@ class TestGoogleProvider:
         with pytest.raises(ValueError, match="output dimensionality"):
             GoogleTextEmbedderDescriptor(model_name="gemini-embedding-001", dimensions=dimensions)
 
+    @pytest.mark.parametrize("dimensions", [256.5, True, "256"])
+    def test_embedder_non_integer_dimensions_rejected(self, dimensions):
+        """Non-integer dimensions raise the promised configuration error."""
+        from vane.ai.providers.google import GoogleTextEmbedderDescriptor
+
+        with pytest.raises(ValueError, match="positive integer"):
+            GoogleTextEmbedderDescriptor(model_name="custom-tuned-embedder", dimensions=dimensions)
+
+    @pytest.mark.parametrize("model", ["gemini-3.6-flash", "models/gemini-3.6-flash"])
+    def test_unsupported_option_rejected_for_both_model_name_forms(self, model):
+        """The models/ resource form cannot bypass the capability table."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test")
+        with pytest.raises(ValueError, match="does not support options"):
+            provider.get_prompter(model=model, temperature=0.2)
+
+    @pytest.mark.parametrize("model", ["gemini-embedding-001", "models/gemini-embedding-001"])
+    def test_embedder_trusted_dimensions_for_both_model_name_forms(self, model):
+        """The models/ resource form still hits the trusted dimensions table."""
+        from vane.ai.providers.google import GoogleProvider
+
+        desc = GoogleProvider(api_key="test").get_text_embedder(model=model)
+        assert desc.model_name == model
+        assert desc.get_dimensions().size == 3072
+
+    @pytest.mark.parametrize("model", ["", "   "])
+    def test_get_prompter_blank_call_model_rejected(self, model):
+        """A blank call-site model is an error, not a provider-config fallback."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test", prompt_model="gemini-2.5-pro")
+        with pytest.raises(ValueError, match="non-empty string"):
+            provider.get_prompter(model=model)
+
+    def test_get_prompter_blank_provider_model_rejected(self):
+        """A blank provider-level prompt_model fails at expression-build time."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test", prompt_model="")
+        with pytest.raises(ValueError, match="non-empty string"):
+            provider.get_prompter()
+
+    @pytest.mark.parametrize("model", ["", "   "])
+    def test_get_text_embedder_blank_call_model_rejected(self, model):
+        """A blank call-site model is an error, not a provider-config fallback."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test", embedding_model="gemini-embedding-001")
+        with pytest.raises(ValueError, match="non-empty string"):
+            provider.get_text_embedder(model=model)
+
+    def test_get_text_embedder_blank_provider_model_rejected(self):
+        """A blank provider-level embedding_model fails at expression-build time."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test", embedding_model="")
+        with pytest.raises(ValueError, match="non-empty string"):
+            provider.get_text_embedder()
+
     def test_provider_get_prompter_splits_call_client_options(self):
         """Google prompt call-level client options go to provider_options only."""
         from vane.ai._redaction import Secret
@@ -1328,6 +1388,63 @@ class TestGoogleProvider:
         assert "api_key" not in desc.embed_options
         assert desc.embed_options["task_type"] == "RETRIEVAL_QUERY"
         assert desc.embed_options["on_error"] == "log"
+
+
+class TestGoogleEmbeddingRowPreservation:
+    """embed_text must return exactly one embedding per input row.
+
+    gemini-embedding-2 aggregates multiple direct string inputs into a
+    single embedding, so each input is sent as its own ``types.Content``
+    and the result count is verified against the input count.
+    """
+
+    def _make_embedder(self, embeddings):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+
+        from vane.ai.providers.google import GoogleTextEmbedder
+
+        with patch("google.genai.Client"):
+            embedder = GoogleTextEmbedder(
+                provider_options={"api_key": "test"},
+                model="gemini-embedding-2",
+            )
+        embed_content = AsyncMock(return_value=SimpleNamespace(embeddings=embeddings))
+        embedder._client.aio.models.embed_content = embed_content
+        return embedder, embed_content
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_two_inputs_yield_two_vectors_via_separate_contents(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        from google.genai import types
+
+        embedder, embed_content = self._make_embedder(
+            [
+                SimpleNamespace(values=[0.1, 0.2]),
+                SimpleNamespace(values=[0.3, 0.4]),
+            ]
+        )
+
+        result = asyncio.run(embedder.embed_text(["first row", "second row"]))
+
+        assert len(result) == 2
+        contents = embed_content.call_args.kwargs["contents"]
+        assert len(contents) == 2
+        assert all(isinstance(c, types.Content) for c in contents)
+        assert contents[0].parts[0].text == "first row"
+        assert contents[1].parts[0].text == "second row"
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_embedding_count_mismatch_raises(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        embedder, _ = self._make_embedder([SimpleNamespace(values=[0.1, 0.2])])
+
+        with pytest.raises(ValueError, match="one embedding per input row"):
+            asyncio.run(embedder.embed_text(["first row", "second row"]))
 
 
 # ---------------------------------------------------------------------------

@@ -109,6 +109,16 @@ _MODEL_UNSUPPORTED_OPTIONS: dict[str, frozenset[str]] = {
 }
 
 
+def _canonical_model_id(model_name: str) -> str:
+    """Strip the Gemini API ``models/`` resource prefix for local lookups.
+
+    The Google Gen AI SDK accepts both ``gemini-3.6-flash`` and
+    ``models/gemini-3.6-flash``; local metadata and capability tables key on
+    the bare ID, while the caller-provided value is sent to the SDK verbatim.
+    """
+    return model_name.removeprefix("models/")
+
+
 def _validate_prompt_options(model_name: str, options: Mapping[str, Any]) -> None:
     """Reject request options the selected model is documented not to support.
 
@@ -116,7 +126,7 @@ def _validate_prompt_options(model_name: str, options: Mapping[str, Any]) -> Non
         ValueError: If ``options`` contains keys listed for ``model_name``
             in :data:`_MODEL_UNSUPPORTED_OPTIONS`.
     """
-    unsupported = _MODEL_UNSUPPORTED_OPTIONS.get(model_name, frozenset())
+    unsupported = _MODEL_UNSUPPORTED_OPTIONS.get(_canonical_model_id(model_name), frozenset())
     offending = sorted(unsupported.intersection(options))
     if offending:
         raise ValueError(
@@ -134,16 +144,19 @@ def _validate_embedding_dimensions(model_name: str, dimensions: int | None) -> N
             metadata in :data:`_EMBEDDING_DIMS`, is not a positive integer,
             or falls outside the documented range for a known model.
     """
+    canonical = _canonical_model_id(model_name)
     if dimensions is None:
-        if model_name not in _EMBEDDING_DIMS:
+        if canonical not in _EMBEDDING_DIMS:
             raise ValueError(
                 f"Cannot derive embedding dimensions for Google model {model_name!r}. "
                 "Pass dimensions=... or configure GoogleProvider(embedding_dimensions=...)."
             )
         return
+    if isinstance(dimensions, bool) or not isinstance(dimensions, int):
+        raise ValueError(f"Embedding dimensions must be a positive integer, got {dimensions!r}.")
     if dimensions < 1:
         raise ValueError(f"Embedding dimensions must be a positive integer, got {dimensions!r}.")
-    bounds = _EMBEDDING_DIM_RANGE.get(model_name)
+    bounds = _EMBEDDING_DIM_RANGE.get(canonical)
     if bounds is not None and not bounds[0] <= dimensions <= bounds[1]:
         raise ValueError(
             f"Google model {model_name!r} supports output dimensionality "
@@ -222,11 +235,15 @@ class GoogleProvider(Provider):
                 be resolved for the selected model.
         """
         provider_options, embed_options = self._split_options(options)
-        options_model = embed_options.pop("model", None)
-        model_name = model or options_model or self._embedding_model
+        model_name = model if model is not None else self._embedding_model
         if model_name is None:
             raise ValueError(
                 "No embedding model configured for the Google provider. "
+                "Pass model=... or configure GoogleProvider(embedding_model=...)."
+            )
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError(
+                f"Google embedding model must be a non-empty string, got {model_name!r}. "
                 "Pass model=... or configure GoogleProvider(embedding_model=...)."
             )
         if dimensions is None:
@@ -254,11 +271,15 @@ class GoogleProvider(Provider):
                 does not support one of the requested options.
         """
         provider_options, prompt_options = self._split_options(options)
-        options_model = prompt_options.pop("model", None)
-        model_name = model or options_model or self._prompt_model
+        model_name = model if model is not None else self._prompt_model
         if model_name is None:
             raise ValueError(
                 "No prompt model configured for the Google provider. "
+                "Pass model=... or configure GoogleProvider(prompt_model=...)."
+            )
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError(
+                f"Google prompt model must be a non-empty string, got {model_name!r}. "
                 "Pass model=... or configure GoogleProvider(prompt_model=...)."
             )
         return GooglePrompterDescriptor(
@@ -308,7 +329,7 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
     def get_dimensions(self) -> EmbeddingDimensions:
         if self.dimensions is not None:
             return EmbeddingDimensions(size=self.dimensions)
-        return EmbeddingDimensions(size=_EMBEDDING_DIMS[self.model_name])
+        return EmbeddingDimensions(size=_EMBEDDING_DIMS[_canonical_model_id(self.model_name)])
 
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(
@@ -368,9 +389,14 @@ class GoogleTextEmbedder:
         }
 
     async def embed_text(self, text: list[str]) -> list[Embedding]:
+        from google.genai import types
+
+        # Embedding models such as gemini-embedding-2 aggregate multiple
+        # direct string inputs into a single embedding; one Content per input
+        # keeps the call row-preserving.
         kwargs: dict[str, Any] = {
             "model": self._model,
-            "contents": text,
+            "contents": [types.Content(parts=[types.Part.from_text(text=t)]) for t in text],
         }
         config = dict(self._options)
         if self._dimensions is not None:
@@ -383,7 +409,14 @@ class GoogleTextEmbedder:
         except Exception as exc:
             _raise_retry_after_on_google_error(exc)
             raise
-        return [np.array(e.values, dtype=np.float32) for e in result.embeddings]
+        embeddings = result.embeddings or []
+        if len(embeddings) != len(text):
+            raise ValueError(
+                f"Google embed_content returned {len(embeddings)} embeddings for "
+                f"{len(text)} inputs with model {self._model!r}; embedding calls "
+                "must return exactly one embedding per input row."
+            )
+        return [np.array(e.values, dtype=np.float32) for e in embeddings]
 
 
 # ---------------------------------------------------------------------------
