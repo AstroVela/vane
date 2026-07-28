@@ -96,10 +96,22 @@ def test_source_tree_id_clears_suppression_in_temporary_index(tmp_path, monkeypa
     source.mkdir(parents=True)
     tracked_file = source / "source.cpp"
     tracked_file.write_text("original\n", encoding="ascii")
+    fixed_timestamp_ns = tracked_file.stat().st_mtime_ns - 5_000_000_000
+    os.utime(tracked_file, ns=(fixed_timestamp_ns, fixed_timestamp_ns))
     _git(tmp_path, "init", "--quiet")
+    _git(tmp_path, "config", "core.trustctime", "false")
     _git(tmp_path, "add", "external/duckdb/source.cpp")
+    original_timestamps = tracked_file.stat()
     _git(tmp_path, "update-index", suppression_flag, "external/duckdb/source.cpp")
+    os.utime(
+        tmp_path / ".git" / "index",
+        ns=(original_timestamps.st_mtime_ns, original_timestamps.st_mtime_ns),
+    )
     tracked_file.write_text("modified\n", encoding="ascii")
+    os.utime(
+        tracked_file,
+        ns=(original_timestamps.st_atime_ns, original_timestamps.st_mtime_ns),
+    )
     monkeypatch.setattr(sync_duckdb_source_id, "REPOSITORY_ROOT", tmp_path)
 
     expected = sync_duckdb_source_id.filesystem_tree_id(source, object_format="sha1")

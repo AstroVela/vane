@@ -17,6 +17,7 @@ import duckdb
 
 ray = pytest.importorskip("ray")
 
+import duckdb.runners.fte.fte_execution as fte_execution_mod
 import duckdb.runners.ray.fragment_worker_commands as worker_commands_mod
 import duckdb.runners.ray.fragment_worker_placement as worker_placement_mod
 import duckdb.runners.ray.fragment_worker_selection as worker_selection_mod
@@ -4468,6 +4469,7 @@ def test_fte_no_matching_node_waits_before_fail(monkeypatch):
 
 def test_fte_no_matching_node_period_expiry_fails_query(monkeypatch):
     monkeypatch.setenv("VANE_FTE_ALLOWED_NO_MATCHING_NODE_PERIOD_S", "0")
+    monkeypatch.setattr(fte_execution_mod.time, "time", lambda: 42.0)
     actor = _FakeActor()
     handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60, worker_id="aaa#0")
     stage = handle._get_or_create_fte_fragment_execution(
