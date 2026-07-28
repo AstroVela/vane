@@ -51,7 +51,7 @@ namespace {
 
 struct ParsedFlightHost {
 	std::string host;
-	bool is_unspecified = false;
+	bool is_wildcard = false;
 };
 
 int ParseFlightIpLiteral(int family, const std::string &host, void *address) {
@@ -82,15 +82,26 @@ DuckDBResult<ParsedFlightHost> ParseFlightHost(std::string host) {
 	}
 
 	std::array<unsigned char, 16> address {};
+	const auto is_zero = [](unsigned char byte) {
+		return byte == 0;
+	};
 	if (ParseFlightIpLiteral(AF_INET, host, address.data()) == 1) {
-		const bool is_unspecified =
-		    std::all_of(address.begin(), address.begin() + 4, [](unsigned char byte) { return byte == 0; });
+		const bool is_unspecified = std::all_of(address.begin(), address.begin() + 4, is_zero);
 		return DuckDBResult<ParsedFlightHost>::ok({std::move(host), is_unspecified});
 	}
 	if (ParseFlightIpLiteral(AF_INET6, host, address.data()) == 1) {
-		const bool is_unspecified =
-		    std::all_of(address.begin(), address.end(), [](unsigned char byte) { return byte == 0; });
-		return DuckDBResult<ParsedFlightHost>::ok({std::move(host), is_unspecified});
+		const bool is_unspecified = std::all_of(address.begin(), address.end(), is_zero);
+		const bool is_ipv4_mapped_unspecified = std::all_of(address.begin(), address.begin() + 10, is_zero) &&
+		                                        address[10] == 0xff && address[11] == 0xff &&
+		                                        std::all_of(address.begin() + 12, address.end(), is_zero);
+		return DuckDBResult<ParsedFlightHost>::ok({std::move(host), is_unspecified || is_ipv4_mapped_unspecified});
+	}
+	const bool is_numeric_ipv4_like = std::all_of(host.begin(), host.end(), [](char character) {
+		return (character >= '0' && character <= '9') || character == '.';
+	});
+	if (is_numeric_ipv4_like) {
+		return DuckDBResult<ParsedFlightHost>::err(
+		    DuckDBError::value_error("Flight host is not a canonical IPv4 literal: " + host));
 	}
 	if (starts_with_bracket || host.find(':') != std::string::npos) {
 		return DuckDBResult<ParsedFlightHost>::err(
@@ -288,7 +299,7 @@ DuckDBResult<void> EnsureLocalFlightServerStartedInternal(const FlightServiceCon
 	if (advertise_host.empty()) {
 		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("Flight advertise host is empty"));
 	}
-	if (parsed_advertise_host.is_unspecified || advertise_host == "*") {
+	if (parsed_advertise_host.is_wildcard || advertise_host == "*") {
 		return DuckDBResult<void>::err(
 		    DuckDBError::invalid_state_error("Flight advertise host must not be a wildcard address"));
 	}
@@ -405,7 +416,7 @@ FlightServiceConfig ResolveFlightServiceConfigFromEnv() {
 	if (config.advertise_host.empty()) {
 		throw InvalidInputException("VANE_FLIGHT_ADVERTISE_HOST must not be empty");
 	}
-	if (parsed_advertise_host.is_unspecified || config.advertise_host == "*") {
+	if (parsed_advertise_host.is_wildcard || config.advertise_host == "*") {
 		throw InvalidInputException("VANE_FLIGHT_ADVERTISE_HOST must be a routable host, not a wildcard address");
 	}
 
@@ -523,20 +534,20 @@ void FlightExchange::SinkFinished(const ExchangeSinkInstanceHandle &instance, co
 		if (node_id.empty()) {
 			throw InvalidInputException("finished Flight sink is missing its worker identity");
 		}
-		bool flight_host_is_unspecified = false;
+		bool flight_host_is_wildcard = false;
 		if (!flight_host.empty()) {
 			auto flight_host_res = ParseFlightHost(flight_host);
 			if (flight_host_res.is_err()) {
 				throw InvalidInputException("finished Flight sink has an invalid advertised host: %s",
 				                            flight_host_res.error().what());
 			}
-			flight_host_is_unspecified = flight_host_res.value().is_unspecified;
+			flight_host_is_wildcard = flight_host_res.value().is_wildcard;
 			flight_host = std::move(flight_host_res.value().host);
 		}
 		if (flight_host.empty() || flight_port == 0 || instance.flight_server_epoch.empty()) {
 			throw InvalidInputException("finished Flight sink endpoint requires host, port, and server epoch");
 		}
-		if (flight_host_is_unspecified || flight_host == "*") {
+		if (flight_host_is_wildcard || flight_host == "*") {
 			throw InvalidInputException("finished Flight sink cannot advertise a wildcard host");
 		}
 	}
@@ -1034,13 +1045,13 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 		    std::string("remote Flight exchange source handle has an invalid advertised host: ") +
 		    source_flight_host_res.error().what()));
 	}
-	const bool source_flight_host_is_unspecified = source_flight_host_res.value().is_unspecified;
+	const bool source_flight_host_is_wildcard = source_flight_host_res.value().is_wildcard;
 	source_flight_host = std::move(source_flight_host_res.value().host);
 	if (source_flight_host.empty()) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
 		    DuckDBError::invalid_state_error("remote Flight exchange source handle is missing its advertised host"));
 	}
-	if (source_flight_host_is_unspecified || source_flight_host == "*") {
+	if (source_flight_host_is_wildcard || source_flight_host == "*") {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
 		    DuckDBError::invalid_state_error("remote Flight exchange source handle advertises a wildcard host"));
 	}

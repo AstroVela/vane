@@ -40,7 +40,11 @@ from duckdb.runners.fte import (
 )
 from duckdb.runners.progress import ProgressRenderer, progress_enabled
 from duckdb.runners.ray.admission_ledger import BoundedReplayMap
-from duckdb.runners.ray.ray_env import collect_vane_env_overrides, scrub_shared_runtime_session_env
+from duckdb.runners.ray.ray_env import (
+    collect_vane_env_overrides,
+    reject_node_local_ray_runtime_env,
+    scrub_shared_runtime_session_env,
+)
 from duckdb.runners.ray.safe_get import QueryDeadlineExceeded, resolve_object_refs_blocking
 from duckdb.runners.ray.worker import WorkerTaskMetadata
 
@@ -5500,6 +5504,7 @@ class RayQueryDriverClient:
         except Exception:
             self._ray_gcs_address = None
             raise RuntimeError("Ray runtime context is missing the current job identity") from None
+        reject_node_local_ray_runtime_env(runtime_context)
         _maybe_set_distributed_cluster_capacity()
         from duckdb.runners.ray.worker_memory import build_ray_node_memory_layout
 

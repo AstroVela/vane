@@ -9567,7 +9567,7 @@ def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
     assert replay_registrations == [("query-resource", resolved_plan)]
 
 
-def test_start_ray_workers_skips_blocking_warmup_inside_ray_worker(monkeypatch):
+def test_start_ray_workers_keeps_flight_host_worker_local_and_skips_nested_warmup(monkeypatch):
     get_calls = []
     option_calls = []
     remote_calls = []
@@ -9590,7 +9590,11 @@ def test_start_ray_workers_skips_blocking_warmup_inside_ray_worker(monkeypatch):
             return _FakeActorHandle()
 
     monkeypatch.setattr(worker_handle_mod, "_is_ray_worker_context", lambda: True)
-    monkeypatch.setattr(worker_handle_mod, "_collect_vane_env_overrides", dict)
+    monkeypatch.setattr(
+        worker_handle_mod,
+        "_collect_vane_env_overrides",
+        lambda: {"VANE_FLIGHT_ADVERTISE_HOST": "flight.example.internal"},
+    )
     monkeypatch.setattr(worker_handle_mod, "RayWorkerActor", _FakeActorFactory())
     monkeypatch.setattr(
         worker_handle_mod.ray,
@@ -9600,7 +9604,12 @@ def test_start_ray_workers_skips_blocking_warmup_inside_ray_worker(monkeypatch):
                 "NodeID": "node-a",
                 "NodeManagerAddress": "10.0.0.1",
                 "Resources": {"CPU": 4.0, "memory": 1024.0, "GPU": 0.0},
-            }
+            },
+            {
+                "NodeID": "node-b",
+                "NodeManagerAddress": "10.0.0.2",
+                "Resources": {"CPU": 4.0, "memory": 1024.0, "GPU": 0.0},
+            },
         ],
     )
     monkeypatch.setattr(
@@ -9616,23 +9625,23 @@ def test_start_ray_workers_skips_blocking_warmup_inside_ray_worker(monkeypatch):
 
     runtimes = worker_handle_mod.start_ray_workers(existing_worker_ids=[])
 
-    assert len(runtimes) == 1
-    assert option_calls[0]["memory"] == 358
-    assert option_calls[0]["runtime_env"] == {
-        "env_vars": {
-            "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
-            "VANE_FLIGHT_ADVERTISE_HOST": "10.0.0.1",
-            "VANE_WORKER": "1",
-            "VANE_WORKER_ID": "10.0.0.1",
-            "VANE_WORKER_INDEX": "0",
-        },
-    }
-    assert "num_cpus" not in option_calls[0]
-    assert "num_gpus" not in option_calls[0]
-    assert len(remote_calls) == 1
-    assert "env_overrides" not in remote_calls[0]
-    assert remote_calls[0]["duckdb_memory_bytes"] == 256
-    assert remote_calls[0]["task_heap_capacity_bytes"] == 615
+    assert len(runtimes) == 2
+    for index, address in enumerate(("10.0.0.1", "10.0.0.2")):
+        assert option_calls[index]["memory"] == 358
+        assert option_calls[index]["runtime_env"] == {
+            "env_vars": {
+                "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
+                "VANE_WORKER": "1",
+                "VANE_WORKER_ID": address,
+                "VANE_WORKER_INDEX": "0",
+            },
+        }
+        assert "num_cpus" not in option_calls[index]
+        assert "num_gpus" not in option_calls[index]
+        assert "env_overrides" not in remote_calls[index]
+        assert remote_calls[index]["duckdb_memory_bytes"] == 256
+        assert remote_calls[index]["task_heap_capacity_bytes"] == 615
+        assert remote_calls[index]["flight_advertise_host_fallback"] == address
     assert get_calls == []
 
 

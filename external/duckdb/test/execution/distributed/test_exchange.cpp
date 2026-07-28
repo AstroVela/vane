@@ -1161,11 +1161,21 @@ TEST_CASE("Exchange: Flight service normalizes IPv6 hosts before building Arrow 
 	REQUIRE(config.bind_host == "::1");
 }
 
-TEST_CASE("Exchange: Flight service rejects unspecified advertised IP addresses", "[distributed][exchange][security]") {
-	for (const auto &configured_host : {"0.0.0.0", "::", "[::]", "[::0]", "0:0:0:0:0:0:0:0", "[0:0:0:0:0:0:0:0]"}) {
+TEST_CASE("Exchange: Flight service rejects wildcard advertised IP addresses", "[distributed][exchange][security]") {
+	for (const auto &configured_host : {"0.0.0.0", "::", "[::]", "[::0]", "0:0:0:0:0:0:0:0", "[0:0:0:0:0:0:0:0]",
+	                                    "::ffff:0.0.0.0", "[::ffff:0:0]", "0:0:0:0:0:ffff:0:0"}) {
 		INFO("configured host: " << configured_host);
 		ScopedEnvVar advertise_host("VANE_FLIGHT_ADVERTISE_HOST", configured_host);
 		REQUIRE_THROWS_WITH(ResolveFlightServiceConfigFromEnv(), Catch::Matchers::Contains("must be a routable host"));
+	}
+}
+
+TEST_CASE("Exchange: Flight service rejects non-canonical numeric IPv4 hosts", "[distributed][exchange][security]") {
+	for (const auto &configured_host : {"00.00.00.00", "000.000.000.000", "0.0.0.00"}) {
+		INFO("configured host: " << configured_host);
+		ScopedEnvVar advertise_host("VANE_FLIGHT_ADVERTISE_HOST", configured_host);
+		REQUIRE_THROWS_WITH(ResolveFlightServiceConfigFromEnv(),
+		                    Catch::Matchers::Contains("not a canonical IPv4 literal"));
 	}
 }
 
@@ -1183,7 +1193,7 @@ TEST_CASE("Exchange: remote local-disk source rejects a wildcard advertised host
 	handle.partition_id = 0;
 	handle.attempt_id = 1;
 	handle.node_id = "writer-worker";
-	handle.flight_host = "[::0]";
+	handle.flight_host = "[::ffff:0.0.0.0]";
 	handle.flight_port = 1;
 	handle.flight_server_epoch = "remote-epoch";
 	handle.files.push_back(ExchangeSourceFile("remote-disabled-attempt", 0));
@@ -1192,6 +1202,34 @@ TEST_CASE("Exchange: remote local-disk source rejects a wildcard advertised host
 	DataChunk output;
 	output.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
 	REQUIRE_THROWS_WITH(source.ReadChunk(output), Catch::Matchers::Contains("advertises a wildcard host"));
+}
+
+TEST_CASE("Exchange: remote local-disk source rejects non-canonical numeric IPv4 advertised hosts",
+          "[distributed][exchange][security]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	FlightExchangeConfig config;
+	config.node_id = "reader-node";
+	config.local_dirs = {TestCreatePath("exchange_remote_noncanonical_ipv4")};
+	config.expected_types = {LogicalType::INTEGER};
+
+	for (const auto &configured_host : {"00.00.00.00", "000.000.000.000", "0.0.0.00"}) {
+		INFO("configured host: " << configured_host);
+		FlightExchangeSource source(config, conn.context.get());
+		ExchangeSourceHandle handle;
+		handle.partition_id = 0;
+		handle.attempt_id = 1;
+		handle.node_id = "writer-worker";
+		handle.flight_host = configured_host;
+		handle.flight_port = 1;
+		handle.flight_server_epoch = "remote-epoch";
+		handle.files.push_back(ExchangeSourceFile("remote-disabled-attempt", 0));
+		source.AddSourceHandles({handle});
+
+		DataChunk output;
+		output.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
+		REQUIRE_THROWS_WITH(source.ReadChunk(output), Catch::Matchers::Contains("not a canonical IPv4 literal"));
+	}
 }
 
 TEST_CASE("Exchange: FlightExchange coordinator lifecycle", "[distributed][exchange]") {

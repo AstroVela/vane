@@ -25,14 +25,17 @@ RayWorkerRuntime: Any = require_ray_cxx_attr(
 
 
 def _persistent_worker_runtime_env(env_vars: dict[str, str]) -> dict[str, Any]:
-    """Keep the node's accelerator visibility in a zero-GPU Ray actor.
+    """Build the persistent actor environment without node-local overrides.
 
     Ray 2.53 through 2.55 clear accelerator visibility for actors that do not
     reserve accelerators unless this compatibility switch is disabled. Ray
     2.56 and later preserve it by default, but accepting the switch keeps the
-    behavior stable across the supported Ray range.
+    behavior stable across the supported Ray range. The Flight advertised host
+    is resolved inside the target worker so this runtime environment cannot
+    overwrite a node-local value.
     """
     runtime_env_vars = dict(env_vars)
+    runtime_env_vars.pop("VANE_FLIGHT_ADVERTISE_HOST", None)
     runtime_env_vars["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
     runtime_env_vars["VANE_WORKER"] = "1"
     return {"env_vars": runtime_env_vars}
@@ -84,8 +87,6 @@ def start_ray_workers(existing_worker_ids: list[str]) -> list[RayWorkerRuntime]:
                     continue
                 worker_env = dict(env_overrides)
                 worker_env["VANE_WORKER_ID"] = worker_id
-                if node_manager_address:
-                    worker_env.setdefault("VANE_FLIGHT_ADVERTISE_HOST", node_manager_address)
                 worker_env["VANE_WORKER_INDEX"] = "0"
                 memory_layout = build_ray_node_memory_layout(int(node["Resources"]["memory"]))
                 # max_concurrency limits how many control/execute RPCs can queue
@@ -97,7 +98,7 @@ def start_ray_workers(existing_worker_ids: list[str]) -> list[RayWorkerRuntime]:
                 # and Ray-backed UDFs, so reserving the node's full CPU/GPU capacity
                 # here would prevent those child Ray workloads from being scheduled.
                 _actor_max_conc = int(os.environ.get("VANE_RAY_ACTOR_MAX_CONCURRENCY", "256"))
-                actor = RayWorkerActor.options(
+                actor = RayWorkerActor.options(  # type: ignore[attr-defined]
                     max_concurrency=_actor_max_conc,
                     memory=(memory_layout.worker_duckdb_memory_bytes + memory_layout.runtime_reserve_bytes),
                     runtime_env=_persistent_worker_runtime_env(worker_env),
@@ -110,6 +111,7 @@ def start_ray_workers(existing_worker_ids: list[str]) -> list[RayWorkerRuntime]:
                     num_gpus=int(node["Resources"].get("GPU", 0)),
                     duckdb_memory_bytes=memory_layout.worker_duckdb_memory_bytes,
                     task_heap_capacity_bytes=memory_layout.task_heap_capacity_bytes,
+                    flight_advertise_host_fallback=node_manager_address,
                 )
                 actors.append((node, worker_id, actor))
 

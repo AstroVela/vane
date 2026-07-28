@@ -103,7 +103,7 @@ Vane follows [Ray's trusted-cluster model](https://docs.ray.io/en/latest/ray-sec
 
 A worker lazily starts one process-owned plaintext `grpc://` Flight service when a local-disk exchange sink first needs it. The service provides no TLS, client authentication, query-level authorization, or tenant isolation. Keep its port reachable only inside the controlled Ray cluster network; workloads that do not trust one another require separate isolated Ray clusters.
 
-Workers advertise their Ray private address by default. `VANE_FLIGHT_BIND_HOST` may select a different local bind address, including `0.0.0.0` in a container with appropriate network policy, while `VANE_FLIGHT_ADVERTISE_HOST` must always be a routable non-wildcard address. `DUCKDB_FLIGHT_PORT` selects a fixed worker-local port; the default `0` lets the operating system allocate one. See [SECURITY.md](SECURITY.md) for the complete trust boundary.
+Workers advertise their Ray private address by default. `VANE_FLIGHT_BIND_HOST` may select a different local bind address, including `0.0.0.0` in a container with appropriate network policy, while `VANE_FLIGHT_ADVERTISE_HOST` must always be a routable non-wildcard address. The advertised-host override is worker-local: set it in each worker node's environment rather than on the driver or in a Ray Job/actor runtime environment. `DUCKDB_FLIGHT_PORT` selects a fixed worker-local port; the default `0` lets the operating system allocate one. See [SECURITY.md](SECURITY.md) for the complete trust boundary.
 
 ### More Resources
 

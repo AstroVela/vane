@@ -36,7 +36,7 @@ Each worker process owns at most one lazily started Flight service. A Flight tic
 
 Vane does not provide confidentiality between users or jobs in one Ray cluster, protection from a malicious worker, or per-query authorization for this transport. Deploy mutually untrusted workloads in separate Ray clusters and separate networks.
 
-The worker's Ray private address is used for binding and advertisement by default. Operators may set `VANE_FLIGHT_BIND_HOST=0.0.0.0` when container networking requires a wildcard listener, but `VANE_FLIGHT_ADVERTISE_HOST` must be a routable non-wildcard address. Firewall, Security Group, or NetworkPolicy rules must restrict the configured or dynamically allocated `DUCKDB_FLIGHT_PORT` to the same Ray cluster. Do not expose it through a public Service, Ingress, LoadBalancer, or NodePort.
+The worker's Ray private address is used for binding and advertisement by default. Operators may set `VANE_FLIGHT_BIND_HOST=0.0.0.0` when container networking requires a wildcard listener, but `VANE_FLIGHT_ADVERTISE_HOST` must be a routable non-wildcard address. The advertised-host override belongs to the worker node's environment and is not copied from the driver to every worker. Vane rejects this override in a Ray Job or actor runtime environment because Ray inherits those values across nodes. Firewall, Security Group, or NetworkPolicy rules must restrict the configured or dynamically allocated `DUCKDB_FLIGHT_PORT` to the same Ray cluster. Do not expose it through a public Service, Ingress, LoadBalancer, or NodePort.
 
 ## Secure deployment baseline
 
