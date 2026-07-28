@@ -791,13 +791,16 @@ class AsyncResultCollector:
         record.adapter.mark_drained()
         key = (record.slot_id, record.submit_id)
         with self._cv:
-            if self._records.pop(key, None) is not record:
+            if self._records.get(key) is not record:
                 return
             record.terminal = True
+        record.adapter.retire()
+        with self._cv:
+            if self._records.pop(key, None) is not record:
+                return
             self._ready_by_slot[record.slot_id].append(_ReadyEvent(record.slot_id, record.submit_id, "complete", None))
             self._cv.notify_all()
         _collector_debug_log("retired", record)
-        record.adapter.retire()
         self._notify_wakeup()
 
     def _cancel_record_control(self, record: _StreamRecord) -> None:
