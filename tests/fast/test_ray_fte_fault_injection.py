@@ -27,7 +27,10 @@ _FAULT_RAY_CLUSTER = None
 import duckdb.runners.ray.worker_handle as worker_handle_mod
 from duckdb.runners.ray import driver as ray_driver
 from duckdb.runners.ray import worker as worker_mod
-from duckdb.runners.ray.fte_fragment_scheduler import ensure_fte_fragment_progress_topology
+from duckdb.runners.ray.fte_fragment_scheduler import (
+    _stop_fte_status_watchers,
+    ensure_fte_fragment_progress_topology,
+)
 from duckdb.runners.ray.query_execution_graph import (
     NodeResourceAllocation,
     QueryAllocation,
@@ -261,6 +264,7 @@ class _NativeDynamicScanTask:
 
 
 def _clear_fte_state() -> None:
+    _stop_fte_status_watchers()
     clear_query_resource_managers()
     worker_handle_mod._FTE_FRAGMENT_EXECUTION_IDS.clear()
     worker_handle_mod._FTE_QUERY_NEXT_FRAGMENT_EXECUTION_ID.clear()
