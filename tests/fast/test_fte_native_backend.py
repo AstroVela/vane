@@ -1952,7 +1952,7 @@ def test_native_cxx_run_copy_plan_preserves_worker_plan_exception_cause(tmp_path
     assert not dst.exists()
 
 
-def test_native_cxx_run_copy_plan_surfaces_backend_cleanup_failure(tmp_path, monkeypatch):
+def test_native_cxx_committed_copy_returns_backend_cleanup_warning(tmp_path, monkeypatch):
     con, _dst, relation = _capture_native_copy_relation(tmp_path, monkeypatch, local_staging=True)
 
     from duckdb.runners.local.runner import _InProcessFragmentExecutor
@@ -1977,10 +1977,14 @@ def test_native_cxx_run_copy_plan_surfaces_backend_cleanup_failure(tmp_path, mon
     backend.drop_query = failing_drop_query
     try:
         runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
-        with pytest.raises(RuntimeError, match="planned copy backend cleanup failure"):
-            runner.run_copy_plan(plan, con)
+        result = runner.run_copy_plan(plan, con)
 
         assert drop_calls == [query_id]
+        assert result["copy_output_committed"] is True
+        assert result["copy_runner_cleanup_pending"] is True
+        assert any(
+            "planned copy backend cleanup failure" in warning for warning in result["copy_runner_cleanup_warnings"]
+        )
     finally:
         backend.shutdown()
         con.close()
@@ -2016,6 +2020,8 @@ def test_native_cxx_run_copy_plan_successive_local_staging_runs_use_distinct_pat
             assert result["copy_finalize_ms"] >= 0
             assert result["copy_cleanup_ms"] >= 0
             assert result["copy_runner_cleanup_ms"] >= 0
+            assert result["copy_runner_cleanup_pending"] is False
+            assert result["copy_runner_cleanup_warnings"] == []
             assert result["copy_selected_file_count"] == len(result["files"])
             assert result["copy_duplicate_file_count"] == 0
         assert first_path != second_path

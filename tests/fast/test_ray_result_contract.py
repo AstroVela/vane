@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pickle
 import threading
 import time
 import uuid
@@ -294,6 +295,15 @@ def _run_actor_stream_plan(runner, plan):
         _TEST_SESSION_ID,
         plan,
     )
+
+
+def _committed_copy_result(**values):
+    result = {
+        "rows_copied": 1,
+        "copy_output_committed": True,
+    }
+    result.update(values)
+    return result
 
 
 def test_driver_connection_applies_duckdb_execution_width(monkeypatch):
@@ -630,7 +640,7 @@ def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(mon
         def run_copy_plan(self, plan, conn):
             captured["plan"] = plan
             captured["conn"] = conn
-            return {"ok": True}
+            return _committed_copy_result(ok=True)
 
     def _precreate_udf_actors(
         _self,
@@ -673,7 +683,10 @@ def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(mon
     outcome = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
 
     assert isinstance(outcome, driver.CopyPlanOutcome)
-    assert outcome.result == {"ok": True}
+    assert outcome.result["ok"] is True
+    assert outcome.result["copy_operation_id"] == "copy-plan"
+    assert outcome.result["copy_write_state"] == "committed"
+    assert outcome.result["copy_cleanup_state"] == "complete"
     assert outcome.final_progress_snapshot == {"query_id": "copy-plan", "state": "FINISHED"}
     assert captured["plan"] is physical_plan
     assert captured["conn"] is runner._test_session_connection.cursors[-1]
@@ -681,7 +694,7 @@ def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(mon
     assert captured["lifecycle"] == ["snapshot", "teardown"]
 
 
-def test_query_driver_run_copy_plan_surfaces_terminal_actor_placement_loss(monkeypatch):
+def test_query_driver_committed_copy_preserves_terminal_actor_placement_warning(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     physical_plan = _FakePhysicalPlanWithoutPlanAttr("copy-plan-terminal")
     logical_plan = _FakeLogicalPlan(physical_plan)
@@ -690,7 +703,7 @@ def test_query_driver_run_copy_plan_surfaces_terminal_actor_placement_loss(monke
     class _PlanRunner:
         def run_copy_plan(self, _plan, _conn):
             runner._query_terminal_errors["copy-query-terminal"] = "fixed Ray actor placement was lost"
-            return {"ok": True}
+            return _committed_copy_result(ok=True)
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -708,22 +721,24 @@ def test_query_driver_run_copy_plan_surfaces_terminal_actor_placement_loss(monke
 
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
-    with pytest.raises(RuntimeError, match="fixed Ray actor placement was lost"):
-        asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+    outcome = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
 
     assert teardown_calls == [
         ("copy-plan-terminal", "copy-query-terminal", True),
     ]
+    assert outcome.write_state == "committed"
+    assert outcome.cleanup_state == "complete"
+    assert any("fixed Ray actor placement was lost" in warning for warning in outcome.cleanup_warnings)
 
 
-def test_query_driver_copy_progress_contract_failure_still_tears_down(monkeypatch):
+def test_query_driver_copy_progress_failure_returns_committed_warning(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr("copy-progress-contract-failure"))
     teardown_calls = []
 
     class _PlanRunner:
         def run_copy_plan(self, _plan, _conn):
-            return {"ok": True}
+            return _committed_copy_result()
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -745,8 +760,7 @@ def test_query_driver_copy_progress_contract_failure_still_tears_down(monkeypatc
         lambda _self, plan_id, query_id, *, drop_fragments: teardown_calls.append((plan_id, query_id, drop_fragments)),
     )
 
-    with pytest.raises(RuntimeError, match="invalid progress topology"):
-        asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+    outcome = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
 
     assert teardown_calls == [
         (
@@ -755,6 +769,434 @@ def test_query_driver_copy_progress_contract_failure_still_tears_down(monkeypatc
             True,
         )
     ]
+    assert outcome.operation_id == "copy-progress-contract-failure"
+    assert outcome.write_state == "committed"
+    assert outcome.cleanup_state == "complete"
+    assert outcome.final_progress_snapshot is None
+    assert len(outcome.cleanup_warnings) == 1
+    assert "progress finalization failed: RuntimeError: invalid progress topology" in outcome.cleanup_warnings[0]
+
+
+def test_query_driver_failure_immediately_after_commit_replays_success(monkeypatch):
+    import duckdb.runners.ray.fte_fragment_scheduler as scheduler_mod
+
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-failure-immediately-after-commit"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    plan_finished = threading.Event()
+    plan_calls = 0
+    teardown_calls = []
+
+    class _PlanRunner:
+        def run_copy_plan(self, _plan, _conn):
+            nonlocal plan_calls
+            plan_calls += 1
+            plan_finished.set()
+            return _committed_copy_result(rows_copied=5)
+
+    def _fail_after_commit(_self, _actors):
+        assert plan_finished.wait(timeout=2.0)
+        raise RuntimeError("injected immediately-after-commit failure")
+
+    def _teardown(_self, actual_plan_id, query_id, *, drop_fragments):
+        teardown_calls.append((actual_plan_id, query_id, drop_fragments))
+        cls._release_plan_session_state(runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
+    monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", _fail_after_commit)
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+    monkeypatch.setattr(
+        scheduler_mod,
+        "wait_for_fte_query_progress_topology",
+        lambda *_args, **_kwargs: plan_finished.wait(timeout=2.0),
+    )
+
+    first = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+    replayed = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+
+    assert first == replayed
+    assert first.write_state == "committed"
+    assert first.cleanup_state == "complete"
+    assert first.final_progress_snapshot is None
+    assert any("injected immediately-after-commit failure" in warning for warning in first.cleanup_warnings), (
+        first.cleanup_warnings
+    )
+    assert plan_calls == 1
+    assert teardown_calls == [(plan_id, plan_id, True)]
+
+
+def test_query_driver_postcommit_startup_drain_cancellation_replays_success(monkeypatch):
+    import duckdb.runners.ray.fte_fragment_scheduler as scheduler_mod
+
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-postcommit-startup-drain-cancellation"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    plan_finished = threading.Event()
+    topology_started = threading.Event()
+    topology_release = threading.Event()
+    teardown_finished = threading.Event()
+    startup_drain_started = threading.Event()
+    plan_calls = 0
+    original_gather = asyncio.gather
+
+    class _PlanRunner:
+        @staticmethod
+        def run_copy_plan(_plan, _conn):
+            nonlocal plan_calls
+            plan_calls += 1
+            plan_finished.set()
+            return _committed_copy_result(rows_copied=19)
+
+    def _fail_actor_barrier(_self, _actors):
+        assert plan_finished.wait(timeout=2.0)
+        raise RuntimeError("actor barrier failed after commit")
+
+    def _wait_for_topology(*_args, **_kwargs):
+        topology_started.set()
+        assert topology_release.wait(timeout=2.0)
+
+    def _teardown(_self, actual_plan_id, _query_id, *, drop_fragments):
+        assert actual_plan_id == plan_id
+        assert drop_fragments is True
+        cls._release_plan_session_state(runner, actual_plan_id)
+        teardown_finished.set()
+
+    def _tracked_gather(*args, **kwargs):
+        startup_drain_started.set()
+        return original_gather(*args, **kwargs)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
+    monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", _fail_actor_barrier)
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+    monkeypatch.setattr(driver.asyncio, "gather", _tracked_gather)
+    monkeypatch.setattr(
+        scheduler_mod,
+        "wait_for_fte_query_progress_topology",
+        _wait_for_topology,
+    )
+
+    async def _cancel_during_startup_drain():
+        copy_task = asyncio.create_task(_run_actor_copy_plan(runner, logical_plan))
+        assert await asyncio.to_thread(topology_started.wait, 1.0)
+        assert await asyncio.to_thread(teardown_finished.wait, 1.0)
+        assert await asyncio.to_thread(startup_drain_started.wait, 1.0)
+        operation_task = runner._copy_operations_inflight[plan_id].task
+        operation_task.cancel()
+        await asyncio.sleep(0)
+        topology_release.set()
+        outcome = await asyncio.wait_for(copy_task, timeout=1.0)
+        replayed = await _run_actor_copy_plan(runner, logical_plan)
+        return outcome, replayed
+
+    outcome, replayed = asyncio.run(_cancel_during_startup_drain())
+
+    assert outcome == replayed
+    assert outcome.write_state == "committed"
+    assert outcome.result["rows_copied"] == 19
+    assert any("actor barrier failed after commit" in warning for warning in outcome.cleanup_warnings)
+    assert plan_calls == 1
+
+
+def test_query_driver_concurrent_copy_retries_share_one_write(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-concurrent-singleflight"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    plan_started = threading.Event()
+    plan_release = threading.Event()
+    plan_calls = 0
+    teardown_calls = 0
+
+    class _PlanRunner:
+        @staticmethod
+        def run_copy_plan(_plan, _conn):
+            nonlocal plan_calls
+            plan_calls += 1
+            plan_started.set()
+            assert plan_release.wait(timeout=2.0)
+            return _committed_copy_result(rows_copied=17)
+
+    def _teardown(_self, actual_plan_id, _query_id, *, drop_fragments):
+        nonlocal teardown_calls
+        teardown_calls += 1
+        assert actual_plan_id == plan_id
+        assert drop_fragments is True
+        cls._release_plan_session_state(runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    async def _run_concurrent_retries():
+        first_task = asyncio.create_task(_run_actor_copy_plan(runner, logical_plan))
+        assert await asyncio.to_thread(plan_started.wait, 1.0)
+        second_task = asyncio.create_task(_run_actor_copy_plan(runner, logical_plan))
+        await asyncio.sleep(0.01)
+        assert plan_calls == 1
+        plan_release.set()
+        return await asyncio.gather(first_task, second_task)
+
+    first, second = asyncio.run(_run_concurrent_retries())
+
+    assert first == second
+    assert first.result["rows_copied"] == 17
+    assert first.write_state == "committed"
+    assert plan_calls == 1
+    assert teardown_calls == 1
+
+
+def test_query_driver_copy_result_logging_failure_replays_committed_success(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-committed-result-logging-failure"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    plan_calls = 0
+    teardown_calls = []
+
+    class _PlanRunner:
+        def run_copy_plan(self, _plan, _conn):
+            nonlocal plan_calls
+            plan_calls += 1
+            return _committed_copy_result(rows_copied=5)
+
+    def _teardown(_self, actual_plan_id, query_id, *, drop_fragments):
+        teardown_calls.append((actual_plan_id, query_id, drop_fragments))
+        cls._release_plan_session_state(runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+    monkeypatch.setattr(
+        driver,
+        "_log_copy_result_debug",
+        lambda *_args: (_ for _ in ()).throw(OSError("stderr unavailable")),
+    )
+
+    first = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+    replayed = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+
+    assert first == replayed
+    assert first.write_state == "committed"
+    assert first.cleanup_state == "complete"
+    assert any("stderr unavailable" in warning for warning in first.cleanup_warnings)
+    assert plan_calls == 1
+    assert teardown_calls == [(plan_id, plan_id, True)]
+
+
+def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-committed-cleanup-retry"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    plan_calls = 0
+    teardown_calls = 0
+
+    class _PlanRunner:
+        def run_copy_plan(self, _plan, _conn):
+            nonlocal plan_calls
+            plan_calls += 1
+            return _committed_copy_result(rows_copied=7)
+
+    def _teardown(_self, actual_plan_id, query_id, *, drop_fragments):
+        nonlocal teardown_calls
+        teardown_calls += 1
+        assert (actual_plan_id, query_id, drop_fragments) == (plan_id, plan_id, True)
+        if teardown_calls == 1:
+            raise RuntimeError("planned post-commit teardown failure")
+        cls._release_plan_session_state(runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    first = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+    recovered = asyncio.run(
+        cls.recover_copy_plan(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            plan_id,
+        )
+    )
+    cleaned = asyncio.run(
+        cls.retry_copy_cleanup(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            plan_id,
+        )
+    )
+    replayed = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+
+    assert first.cleanup_state == "pending"
+    assert "planned post-commit teardown failure" in first.cleanup_warnings[0]
+    assert recovered.outcome == first
+    assert recovered.error is None
+    assert cleaned.cleanup_state == "complete"
+    assert replayed == cleaned
+    assert plan_calls == 1
+    assert teardown_calls == 2
+
+
+def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-failed-before-commit"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    plan_calls = 0
+
+    class _PlanRunner:
+        def run_copy_plan(self, _plan, _conn):
+            nonlocal plan_calls
+            plan_calls += 1
+            raise ValueError("planned failure before commit")
+
+    def _teardown(_self, actual_plan_id, _query_id, *, drop_fragments):
+        assert actual_plan_id == plan_id
+        assert drop_fragments is True
+        cls._release_plan_session_state(runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    for operation in (
+        lambda: _run_actor_copy_plan(runner, logical_plan),
+        lambda: _run_actor_copy_plan(runner, logical_plan),
+    ):
+        with pytest.raises(ValueError, match="planned failure before commit"):
+            asyncio.run(operation())
+
+    recovered = asyncio.run(
+        cls.recover_copy_plan(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            plan_id,
+        )
+    )
+
+    assert recovered.outcome is None
+    assert isinstance(recovered.error, ValueError)
+    assert str(recovered.error) == "planned failure before commit"
+    assert plan_calls == 1
+
+
+def test_query_driver_evicted_copy_outcome_refuses_reexecution(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    first_plan_id = "copy-evicted-terminal-first"
+    second_plan_id = "copy-evicted-terminal-second"
+    logical_plans = {
+        plan_id: _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+        for plan_id in (first_plan_id, second_plan_id)
+    }
+    plan_calls = {first_plan_id: 0, second_plan_id: 0}
+
+    class _PlanRunner:
+        @staticmethod
+        def run_copy_plan(plan, _conn):
+            plan_id = str(plan.idx())
+            plan_calls[plan_id] += 1
+            return _committed_copy_result(rows_copied=plan_calls[plan_id])
+
+    async def _register(
+        _self,
+        plan,
+        *,
+        query_connection,
+        expected_plan_id=None,
+    ):
+        del query_connection
+        plan_id = str(plan.idx())
+        assert expected_plan_id == plan_id
+        return SimpleNamespace(query_id=plan_id, stages=()), object()
+
+    def _teardown(_self, plan_id, query_id, *, drop_fragments):
+        assert query_id == plan_id
+        assert drop_fragments is True
+        cls._release_plan_session_state(runner, plan_id)
+
+    runner._copy_operation_terminal = driver.BoundedReplayMap(capacity=1)
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _register)
+    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    first = asyncio.run(_run_actor_copy_plan(runner, logical_plans[first_plan_id]))
+    second = asyncio.run(_run_actor_copy_plan(runner, logical_plans[second_plan_id]))
+
+    assert first.operation_id == first_plan_id
+    assert second.operation_id == second_plan_id
+    assert runner._copy_operation_terminal.get(first_plan_id) is None
+    with pytest.raises(driver.CopyOutcomeUnknownError, match=first_plan_id):
+        asyncio.run(_run_actor_copy_plan(runner, logical_plans[first_plan_id]))
+    with pytest.raises(driver.CopyOutcomeUnknownError, match=first_plan_id):
+        asyncio.run(
+            cls.recover_copy_plan(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                first_plan_id,
+            )
+        )
+    assert asyncio.run(_run_actor_copy_plan(runner, logical_plans[second_plan_id])) == second
+    assert plan_calls == {
+        first_plan_id: 1,
+        second_plan_id: 1,
+    }
+
+
+def test_query_driver_unknown_copy_recovery_never_submits_a_write():
+    cls, runner = _make_local_query_driver_actor()
+
+    with pytest.raises(driver.CopyOutcomeUnknownError, match="unknown-copy-operation") as error:
+        asyncio.run(
+            cls.recover_copy_plan(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                "unknown-copy-operation",
+            )
+        )
+
+    assert error.value.operation_id == "unknown-copy-operation"
+
+
+def test_copy_outcome_unknown_error_preserves_operation_id_across_serialization():
+    error = driver.CopyOutcomeUnknownError("unknown-copy-operation")
+
+    restored = pickle.loads(pickle.dumps(error))
+
+    assert type(restored) is driver.CopyOutcomeUnknownError
+    assert restored.operation_id == error.operation_id
+    assert str(restored) == str(error)
+
+
+def test_copy_outcome_unknown_error_is_exported_from_ray_runner_package():
+    from duckdb.runners.ray import CopyOutcomeUnknownError
+
+    assert CopyOutcomeUnknownError is driver.CopyOutcomeUnknownError
 
 
 def test_query_driver_copy_progress_cancellation_waits_before_teardown(monkeypatch):
@@ -769,7 +1211,7 @@ def test_query_driver_copy_progress_cancellation_waits_before_teardown(monkeypat
     class _PlanRunner:
         @staticmethod
         def run_copy_plan(_plan, _conn):
-            return {"ok": True}
+            return _committed_copy_result(ok=True)
 
     def _build_snapshot(_self, query_id, _started_at):
         assert query_id == plan_id
@@ -813,6 +1255,114 @@ def test_query_driver_copy_progress_cancellation_waits_before_teardown(monkeypat
     assert plan_id not in runner._plan_session_ids
 
 
+def test_query_driver_copy_operation_cancellation_waits_for_native_commit(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-native-commit-during-cancellation"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    native_started = threading.Event()
+    native_release = threading.Event()
+    native_finished = threading.Event()
+    teardown_started = threading.Event()
+    plan_calls = 0
+
+    class _PlanRunner:
+        @staticmethod
+        def run_copy_plan(_plan, _conn):
+            nonlocal plan_calls
+            plan_calls += 1
+            native_started.set()
+            assert native_release.wait(timeout=2.0)
+            native_finished.set()
+            return _committed_copy_result(rows_copied=11)
+
+    def _teardown(_self, actual_plan_id, query_id, *, drop_fragments):
+        assert (actual_plan_id, query_id, drop_fragments) == (plan_id, plan_id, True)
+        teardown_started.set()
+        cls._release_plan_session_state(runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    async def _cancel_while_native_write_is_running():
+        copy_task = asyncio.create_task(_run_actor_copy_plan(runner, logical_plan))
+        assert await asyncio.to_thread(native_started.wait, 1.0)
+        operation_task = runner._copy_operations_inflight[plan_id].task
+        operation_task.cancel()
+        assert await asyncio.to_thread(teardown_started.wait, 1.0)
+        assert native_finished.is_set() is False
+        native_release.set()
+        outcome = await asyncio.wait_for(copy_task, timeout=1.0)
+        recovered = await cls.recover_copy_plan(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            plan_id,
+        )
+        return outcome, recovered
+
+    outcome, recovered = asyncio.run(_cancel_while_native_write_is_running())
+
+    assert outcome.write_state == "committed"
+    assert outcome.result["rows_copied"] == 11
+    assert recovered.outcome == outcome
+    assert plan_calls == 1
+    assert teardown_started.is_set()
+
+
+def test_query_driver_copy_teardown_cancellation_reports_cleanup_complete(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-teardown-cancellation"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    teardown_started = threading.Event()
+    teardown_release = threading.Event()
+    teardown_finished = threading.Event()
+
+    class _PlanRunner:
+        @staticmethod
+        def run_copy_plan(_plan, _conn):
+            return _committed_copy_result(rows_copied=13)
+
+    def _teardown(_self, actual_plan_id, query_id, *, drop_fragments):
+        assert (actual_plan_id, query_id, drop_fragments) == (plan_id, plan_id, True)
+        teardown_started.set()
+        assert teardown_release.wait(timeout=2.0)
+        cls._release_plan_session_state(runner, actual_plan_id)
+        teardown_finished.set()
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    async def _cancel_during_teardown():
+        copy_task = asyncio.create_task(_run_actor_copy_plan(runner, logical_plan))
+        assert await asyncio.to_thread(teardown_started.wait, 1.0)
+        operation_task = runner._copy_operations_inflight[plan_id].task
+        operation_task.cancel()
+        await asyncio.sleep(0.01)
+        assert copy_task.done() is False
+        teardown_release.set()
+        outcome = await asyncio.wait_for(copy_task, timeout=1.0)
+        replayed = await _run_actor_copy_plan(runner, logical_plan)
+        return outcome, replayed
+
+    outcome, replayed = asyncio.run(_cancel_during_teardown())
+
+    assert teardown_finished.is_set()
+    assert outcome == replayed
+    assert outcome.write_state == "committed"
+    assert outcome.cleanup_state == "complete"
+    assert not any("CancelledError" in warning for warning in outcome.cleanup_warnings)
+
+
 def test_query_driver_copy_opens_actor_stage_after_topology_and_actor_barriers(monkeypatch):
     import duckdb.runners.ray.fte_fragment_scheduler as scheduler_mod
 
@@ -829,7 +1379,7 @@ def test_query_driver_copy_opens_actor_stage_after_topology_and_actor_barriers(m
             plan_started.set()
             assert actor_stage_open.wait(timeout=2.0)
             events.append("plan-finished")
-            return {"ok": True}
+            return _committed_copy_result(ok=True)
 
     def wait_for_topology(query_id, *, timeout_s):
         assert query_id == "copy-startup-order"
@@ -865,7 +1415,8 @@ def test_query_driver_copy_opens_actor_stage_after_topology_and_actor_barriers(m
 
     outcome = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
 
-    assert outcome.result == {"ok": True}
+    assert outcome.result["ok"] is True
+    assert outcome.write_state == "committed"
     open_index = events.index("actor-stage-open")
     assert events.index("topology-ready") < open_index
     assert events.index("actors-ready") < open_index
@@ -885,7 +1436,7 @@ def test_query_driver_copy_accepts_plan_success_before_startup_barriers(monkeypa
         def run_copy_plan(self, _plan, _conn):
             events.append("plan-finished")
             plan_finished.set()
-            return {"rows_copied": 0}
+            return _committed_copy_result(rows_copied=0)
 
     def wait_for_topology(query_id, *, timeout_s):
         assert query_id == "copy-plan-before-startup-barriers"
@@ -929,7 +1480,8 @@ def test_query_driver_copy_accepts_plan_success_before_startup_barriers(monkeypa
     outcome = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
     release_thread.join(timeout=2.0)
 
-    assert outcome.result == {"rows_copied": 0}
+    assert outcome.result["rows_copied"] == 0
+    assert outcome.write_state == "committed"
     open_index = events.index("actor-stage-open")
     assert events.index("plan-finished") < events.index("topology-ready") < open_index
     assert events.index("plan-finished") < events.index("actors-ready") < open_index
@@ -1089,6 +1641,7 @@ def test_ray_query_driver_client_copy_refreshes_progress_and_uses_final_snapshot
     outcome = driver.CopyPlanOutcome(
         result={"rows_copied": 7},
         final_progress_snapshot=final_snapshot,
+        operation_id="copy-plan",
     )
 
     class _Runner:
@@ -1131,6 +1684,191 @@ def test_ray_query_driver_client_copy_refreshes_progress_and_uses_final_snapshot
             "final_snapshot": final_snapshot,
         }
     ]
+
+
+def test_ray_query_driver_client_recovers_ambiguous_copy_without_resubmission(monkeypatch):
+    submit_ref = object()
+    recovery_ref = object()
+
+    class _RemoteMethod:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def remote(self, *args):
+            self.calls.append(args)
+            return self.result
+
+    outcome = driver.CopyPlanOutcome(
+        operation_id="copy-ambiguous-response",
+        write_state="committed",
+        cleanup_state="complete",
+        result=_committed_copy_result(rows_copied=11),
+        final_progress_snapshot={"state": "FINISHED"},
+    )
+    runner = SimpleNamespace(
+        run_copy_plan=_RemoteMethod(submit_ref),
+        recover_copy_plan=_RemoteMethod(recovery_ref),
+    )
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = runner
+    resolutions = []
+
+    def _resolve(ref, **kwargs):
+        resolutions.append((ref, kwargs))
+        if ref is submit_ref:
+            raise FutureTimeoutError("COPY response wait timed out")
+        assert ref is recovery_ref
+        return driver.CopyPlanRecovery(
+            operation_id=outcome.operation_id,
+            outcome=outcome,
+        )
+
+    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+    monkeypatch.setattr(
+        driver.ray,
+        "cancel",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ambiguous COPY recovery must not cancel the committed operation")
+        ),
+    )
+
+    plan = _FakePhysicalPlanWithoutPlanAttr("copy-ambiguous-response")
+    result = client.run_copy_plan(plan)
+
+    assert result["rows_copied"] == 11
+    assert runner.run_copy_plan.calls == [
+        (
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            plan,
+        )
+    ]
+    assert runner.recover_copy_plan.calls == [
+        (
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            outcome.operation_id,
+        )
+    ]
+    assert resolutions == [
+        (submit_ref, {}),
+        (
+            recovery_ref,
+            {
+                "honor_query_deadline": False,
+            },
+        ),
+    ]
+
+
+def test_ray_query_driver_client_recovers_invalid_copy_response_without_resubmission(monkeypatch):
+    submit_ref = object()
+    recovery_ref = object()
+
+    class _RemoteMethod:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def remote(self, *args):
+            self.calls.append(args)
+            return self.result
+
+    invalid_outcome = driver.CopyPlanOutcome(
+        operation_id="wrong-operation",
+        result=_committed_copy_result(rows_copied=11),
+        final_progress_snapshot={"state": "FINISHED"},
+    )
+    recovered_outcome = driver.CopyPlanOutcome(
+        operation_id="copy-invalid-response",
+        result=_committed_copy_result(rows_copied=11),
+        final_progress_snapshot={"state": "FINISHED"},
+    )
+    runner = SimpleNamespace(
+        run_copy_plan=_RemoteMethod(submit_ref),
+        recover_copy_plan=_RemoteMethod(recovery_ref),
+    )
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = runner
+
+    def _resolve(ref, **_kwargs):
+        if ref is submit_ref:
+            return invalid_outcome
+        assert ref is recovery_ref
+        return driver.CopyPlanRecovery(
+            operation_id=recovered_outcome.operation_id,
+            outcome=recovered_outcome,
+        )
+
+    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+
+    plan = _FakePhysicalPlanWithoutPlanAttr("copy-invalid-response")
+    result = client.run_copy_plan(plan)
+
+    assert result["rows_copied"] == 11
+    assert runner.run_copy_plan.calls == [
+        (
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            plan,
+        )
+    ]
+    assert runner.recover_copy_plan.calls == [
+        (
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            "copy-invalid-response",
+        )
+    ]
+
+
+def test_ray_query_driver_client_maps_invalid_recovery_outcome_to_unknown(monkeypatch):
+    submit_ref = object()
+    recovery_ref = object()
+
+    class _RemoteMethod:
+        def __init__(self, result):
+            self.result = result
+
+        def remote(self, *_args):
+            return self.result
+
+    mismatched_outcome = driver.CopyPlanOutcome(
+        operation_id="wrong-operation",
+        result=_committed_copy_result(),
+        final_progress_snapshot=None,
+    )
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = SimpleNamespace(
+        run_copy_plan=_RemoteMethod(submit_ref),
+        recover_copy_plan=_RemoteMethod(recovery_ref),
+    )
+
+    def _resolve(ref, **_kwargs):
+        if ref is submit_ref:
+            raise FutureTimeoutError("COPY response wait timed out")
+        assert ref is recovery_ref
+        return driver.CopyPlanRecovery(
+            operation_id="copy-invalid-recovery",
+            outcome=mismatched_outcome,
+        )
+
+    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+
+    with pytest.raises(driver.CopyOutcomeUnknownError) as error:
+        client.run_copy_plan(_FakePhysicalPlanWithoutPlanAttr("copy-invalid-recovery"))
+
+    assert error.value.operation_id == "copy-invalid-recovery"
 
 
 def test_ray_query_driver_client_stream_waits_through_progress_session(monkeypatch):
@@ -1423,9 +2161,9 @@ def test_ray_query_driver_client_stream_failure_accepts_concurrent_detach_cleanu
         list(client.stream_plan(_FakePhysicalPlanWithoutPlanAttr("detached-stream-cleanup")))
 
 
-def test_ray_query_driver_client_copy_failure_cancels_and_settles(monkeypatch):
+def test_ray_query_driver_client_copy_failure_recovers_without_cancel_or_close(monkeypatch):
     copy_future = object()
-    close_future = object()
+    recovery_future = object()
     resolved = []
     cancelled = []
 
@@ -1443,46 +2181,186 @@ def test_ray_query_driver_client_copy_failure_cancels_and_settles(monkeypatch):
     _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
     client.runner = SimpleNamespace(
         run_copy_plan=_RemoteMethod(copy_future),
-        close_plan=_RemoteMethod(close_future),
+        recover_copy_plan=_RemoteMethod(recovery_future),
     )
 
     def _resolve(ref, **kwargs):
         resolved.append((ref, kwargs))
         if ref is copy_future:
             raise RuntimeError("planned COPY failure")
-        assert ref is close_future
-        return None
+        assert ref is recovery_future
+        return driver.CopyPlanRecovery(
+            operation_id="failed-copy",
+            error=RuntimeError("planned COPY failure"),
+        )
 
     monkeypatch.setattr(driver, "progress_enabled", lambda: False)
     monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
     monkeypatch.setattr(driver.ray, "cancel", lambda ref, *, force: cancelled.append((ref, force)))
+    monkeypatch.setattr(driver.ray, "is_initialized", lambda: True)
 
     with pytest.raises(RuntimeError, match="planned COPY failure"):
         client.run_copy_plan(_FakePhysicalPlanWithoutPlanAttr("failed-copy"))
 
-    assert cancelled == [(copy_future, False)]
+    assert cancelled == []
     assert resolved == [
         (copy_future, {}),
         (
-            copy_future,
+            recovery_future,
             {
-                "timeout": 300,
-                "honor_query_deadline": False,
-            },
-        ),
-        (
-            close_future,
-            {
-                "timeout": 300,
                 "honor_query_deadline": False,
             },
         ),
     ]
-    assert client.runner.close_plan.calls == [
+    assert client.runner.recover_copy_plan.calls == [
         (
             _TEST_RUNTIME_OWNER_ID,
             _TEST_SESSION_ID,
             "failed-copy",
+        )
+    ]
+
+
+def test_ray_query_driver_client_maps_recovery_rpc_creation_failure_to_unknown(monkeypatch):
+    copy_future = object()
+
+    class _RemoteMethod:
+        def __init__(self, result=None, *, error=None):
+            self.result = result
+            self.error = error
+            self.calls = []
+
+        def remote(self, *args):
+            self.calls.append(args)
+            if self.error is not None:
+                raise self.error
+            return self.result
+
+    run_copy_plan = _RemoteMethod(copy_future)
+    recover_copy_plan = _RemoteMethod(error=RuntimeError("recovery RPC could not be created"))
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = SimpleNamespace(
+        run_copy_plan=run_copy_plan,
+        recover_copy_plan=recover_copy_plan,
+    )
+    monkeypatch.setattr(client, "_runtime_is_unavailable_or_replaced", lambda: False)
+
+    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
+    monkeypatch.setattr(
+        driver,
+        "resolve_object_refs_blocking",
+        lambda ref, **_kwargs: (_ for _ in ()).throw(FutureTimeoutError("COPY response wait timed out")),
+    )
+
+    with pytest.raises(driver.CopyOutcomeUnknownError) as error:
+        client.run_copy_plan(_FakePhysicalPlanWithoutPlanAttr("copy-recovery-creation-failed"))
+
+    assert error.value.operation_id == "copy-recovery-creation-failed"
+    assert len(run_copy_plan.calls) == 1
+    assert recover_copy_plan.calls == [
+        (
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            "copy-recovery-creation-failed",
+        )
+    ]
+
+
+def test_ray_query_driver_client_maps_recovery_resolution_failure_to_unknown(monkeypatch):
+    copy_future = object()
+    recovery_future = object()
+
+    class _RemoteMethod:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def remote(self, *args):
+            self.calls.append(args)
+            return self.result
+
+    run_copy_plan = _RemoteMethod(copy_future)
+    recover_copy_plan = _RemoteMethod(recovery_future)
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = SimpleNamespace(
+        run_copy_plan=run_copy_plan,
+        recover_copy_plan=recover_copy_plan,
+    )
+    monkeypatch.setattr(client, "_runtime_is_unavailable_or_replaced", lambda: False)
+
+    def _resolve(ref, **_kwargs):
+        if ref is copy_future:
+            raise FutureTimeoutError("COPY response wait timed out")
+        assert ref is recovery_future
+        raise PermissionError("runtime owner expired during COPY recovery")
+
+    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+
+    with pytest.raises(driver.CopyOutcomeUnknownError) as error:
+        client.run_copy_plan(_FakePhysicalPlanWithoutPlanAttr("copy-recovery-resolution-failed"))
+
+    assert error.value.operation_id == "copy-recovery-resolution-failed"
+    assert len(run_copy_plan.calls) == 1
+    assert recover_copy_plan.calls == [
+        (
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            "copy-recovery-resolution-failed",
+        )
+    ]
+
+
+def test_ray_query_driver_client_retries_pending_copy_cleanup_by_operation_id(monkeypatch):
+    cleanup_ref = object()
+    operation_id = "copy-cleanup-client-retry"
+
+    class _RemoteMethod:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def remote(self, *args):
+            self.calls.append(args)
+            return self.result
+
+    retry_copy_cleanup = _RemoteMethod(cleanup_ref)
+    outcome = driver.CopyPlanOutcome(
+        operation_id=operation_id,
+        result=_committed_copy_result(
+            copy_operation_id=operation_id,
+            copy_write_state="committed",
+            copy_cleanup_state="complete",
+            copy_cleanup_warnings=[],
+        ),
+        final_progress_snapshot={"state": "FINISHED"},
+    )
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = SimpleNamespace(retry_copy_cleanup=retry_copy_cleanup)
+
+    monkeypatch.setattr(
+        driver,
+        "resolve_object_refs_blocking",
+        lambda ref, **kwargs: (
+            outcome
+            if ref is cleanup_ref and kwargs == {"honor_query_deadline": False}
+            else (_ for _ in ()).throw(AssertionError("unexpected cleanup resolution"))
+        ),
+    )
+
+    result = client.retry_copy_cleanup(operation_id)
+
+    assert result["copy_cleanup_state"] == "complete"
+    assert retry_copy_cleanup.calls == [
+        (
+            _TEST_RUNTIME_OWNER_ID,
+            operation_id,
         )
     ]
 
@@ -4999,6 +5877,8 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
     assert result["copy_output_run_id"]
     assert result["copy_output_direct_write"] is True
     assert result["copy_output_committed"] is True
+    assert result["copy_runner_cleanup_pending"] is False
+    assert result["copy_runner_cleanup_warnings"] == []
     assert Path(result["copy_output_commit_dir"]).is_dir()
     assert Path(result["copy_output_lifecycle_path"]).is_file()
     assert Path(result["copy_output_manifest_path"]).is_file()
@@ -6988,6 +7868,33 @@ def test_ray_runner_close_is_terminal_and_idempotent(monkeypatch):
     assert closed_clients == [original_client]
     assert ray_runner._session_ids == set()
     assert ray_runner._closed is True
+
+
+def test_ray_runner_retries_pending_copy_cleanup_by_operation_id():
+    from duckdb.runners.ray import runner as runner_module
+
+    calls = []
+    expected = {
+        "copy_operation_id": "copy-cleanup-runner-retry",
+        "copy_cleanup_state": "complete",
+    }
+
+    class _FakeClient:
+        def retry_copy_cleanup(self, operation_id):
+            calls.append(operation_id)
+            return expected
+
+    ray_runner = object.__new__(runner_module.RayRunner)
+    ray_runner.query_driver_client = _FakeClient()
+    ray_runner._session_ids = set()
+    ray_runner._closed_session_ids = runner_module.BoundedReplayMap(capacity=65_536)
+    ray_runner._session_lock = threading.RLock()
+    ray_runner._closed = False
+
+    result = ray_runner.retry_copy_cleanup("copy-cleanup-runner-retry")
+
+    assert result is expected
+    assert calls == ["copy-cleanup-runner-retry"]
 
 
 def test_connection_close_notification_reenters_runner_registry_lock(monkeypatch):

@@ -180,6 +180,16 @@ class RayRunner(Runner):
         # Send PyLogicalPlan to Driver — Driver will create physical plan
         return client.run_copy_plan(logical_plan)
 
+    def retry_copy_cleanup(self, operation_id: str) -> dict[str, Any]:
+        """Retry cleanup for a committed write without executing the write again."""
+        with self._session_lock:
+            if self._closed:
+                raise RuntimeError("RayRunner is closed")
+            client = self.query_driver_client
+            if client is None:
+                raise RuntimeError("RayRunner has no active query runtime client")
+        return client.retry_copy_cleanup(operation_id)
+
     def run_iter_tables(self, relation: Any) -> Iterator[pa.Table]:
         for result in self.run_iter(relation):
             yield result.partition()

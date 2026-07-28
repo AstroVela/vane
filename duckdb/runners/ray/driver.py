@@ -13,10 +13,11 @@ import uuid
 import weakref
 from collections.abc import Callable, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any
+from dataclasses import asdict, dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Literal
 
 from duckdb._ray_cxx import require_ray_cxx_attr
+from duckdb._ray_errors import restore_remote_ray_exception
 from duckdb._ray_progress_env import configure_ray_progress_logging_defaults
 
 RayResultPartitionRef = require_ray_cxx_attr(
@@ -46,6 +47,7 @@ from duckdb.runners.ray.worker import WorkerTaskMetadata
 _LEASE_REQUEST_REPLAY_CAPACITY = 65_536
 _SESSION_CLOSE_REPLAY_CAPACITY = 65_536
 _CLIENT_DETACH_REPLAY_CAPACITY = 65_536
+_COPY_OPERATION_REPLAY_CAPACITY = 1_024
 _DEFAULT_PROGRESS_TOPOLOGY_INIT_TIMEOUT_S = 60.0
 _RUNTIME_ATTACH_TIMEOUT_S = 300.0
 _RUNTIME_ATTACH_RETRY_INTERVAL_S = 0.05
@@ -113,6 +115,20 @@ class QueryExecutionCleanupError(RuntimeError):
             primary_error=primary_error,
             cleanup_errors=cleanup,
         )
+
+
+class CopyOutcomeUnknownError(RuntimeError):
+    """The actor cannot prove whether a COPY operation committed."""
+
+    def __init__(self, operation_id: str) -> None:
+        self.operation_id = str(operation_id)
+        super().__init__(
+            f"COPY outcome is unknown for operation {self.operation_id}; "
+            "refusing to resubmit a potentially committed write"
+        )
+
+    def __reduce__(self) -> tuple[type[CopyOutcomeUnknownError], tuple[str]]:
+        return CopyOutcomeUnknownError, (self.operation_id,)
 
 
 def _client_owner_lease_settings() -> tuple[float, float]:
@@ -208,7 +224,35 @@ class CopyPlanOutcome:
     """Internal actor-to-client COPY result captured before query teardown."""
 
     result: dict[str, Any]
-    final_progress_snapshot: dict[str, Any]
+    final_progress_snapshot: dict[str, Any] | None
+    operation_id: str = ""
+    write_state: Literal["committed"] = "committed"
+    cleanup_state: Literal["complete", "pending"] = "complete"
+    cleanup_warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CopyPlanRecovery:
+    """Read-only reconciliation response for one submitted COPY operation."""
+
+    operation_id: str
+    outcome: CopyPlanOutcome | None = None
+    error: BaseException | None = None
+
+
+@dataclass(frozen=True)
+class _CopyOperationInFlight:
+    owner_id: str
+    session_id: str
+    task: asyncio.Task[CopyPlanOutcome]
+
+
+@dataclass(frozen=True)
+class _CopyOperationTerminal:
+    owner_id: str
+    session_id: str
+    outcome: CopyPlanOutcome | None = None
+    error: BaseException | None = None
 
 
 @dataclass(frozen=True)
@@ -1172,6 +1216,15 @@ class RayQueryDriverActor:
         self._plan_connections: dict[str, Any] = {}
         self._plan_teardown_condition = threading.Condition(self._session_lock)
         self._plan_teardowns_in_progress: set[str] = set()
+        self._copy_operations_inflight: dict[str, _CopyOperationInFlight] = {}
+        self._copy_operation_terminal = BoundedReplayMap[str, _CopyOperationTerminal](
+            capacity=_COPY_OPERATION_REPLAY_CAPACITY
+        )
+        # Outcome payloads are bounded, but an admitted identity must remain
+        # known for the owner's lifetime. Evicting a payload may make recovery
+        # impossible; it must never authorize the same write to run again.
+        self._copy_operation_identities: dict[str, tuple[str, str]] = {}
+        self._copy_cleanup_tasks: dict[str, asyncio.Task[CopyPlanOutcome]] = {}
         self._driver_handle = ray.get_runtime_context().current_actor
         # Avoid referencing C++ types at import time; store opaque plan objects and
         # lazily instantiate the plan runner when first required.
@@ -1945,6 +1998,7 @@ class RayQueryDriverActor:
                     await self._shutdown_runtime()
                     with self._session_lock:
                         self._client_ids.remove(owner_key)
+                self._discard_copy_operation_state_for_owner(owner_key)
             except BaseException as error:
                 with self._session_lock:
                     lease = self._client_leases[owner_key]
@@ -4524,20 +4578,418 @@ class RayQueryDriverActor:
             session_config,
         )
 
+    def _ensure_copy_operation_state(self) -> None:
+        if not isinstance(getattr(self, "_copy_operations_inflight", None), dict):
+            self._copy_operations_inflight = {}
+        if not isinstance(getattr(self, "_copy_operation_terminal", None), BoundedReplayMap):
+            self._copy_operation_terminal = BoundedReplayMap(capacity=_COPY_OPERATION_REPLAY_CAPACITY)
+        if not isinstance(getattr(self, "_copy_operation_identities", None), dict):
+            self._copy_operation_identities = {}
+        if not isinstance(getattr(self, "_copy_cleanup_tasks", None), dict):
+            self._copy_cleanup_tasks = {}
+
+    def _discard_copy_operation_state_for_owner(self, owner_id: str) -> None:
+        self._ensure_copy_operation_state()
+        operation_ids = {
+            operation_id
+            for operation_id, (record_owner_id, _) in self._copy_operation_identities.items()
+            if record_owner_id == owner_id
+        }
+        for operation_id in operation_ids:
+            self._copy_operation_identities.pop(operation_id, None)
+        self._copy_operation_terminal.discard_where(
+            lambda operation_id, record: operation_id in operation_ids and record.owner_id == owner_id
+        )
+
+    @staticmethod
+    def _copy_operation_id(plan: Any) -> str:
+        operation_id = str(plan.idx()).strip()
+        if not operation_id:
+            raise ValueError("COPY operation identity must not be empty")
+        return operation_id
+
+    @staticmethod
+    def _validate_copy_operation_identity(
+        record: _CopyOperationInFlight | _CopyOperationTerminal,
+        *,
+        owner_id: str,
+        session_id: str | None,
+        operation_id: str,
+    ) -> None:
+        if record.owner_id != owner_id or (session_id is not None and record.session_id != session_id):
+            raise PermissionError(
+                f"COPY operation {operation_id} does not belong to the requested runtime owner and session"
+            )
+
+    @staticmethod
+    def _validate_copy_identity_tombstone(
+        identity: tuple[str, str],
+        *,
+        owner_id: str,
+        session_id: str | None,
+        operation_id: str,
+    ) -> None:
+        record_owner_id, record_session_id = identity
+        if record_owner_id != owner_id or (session_id is not None and record_session_id != session_id):
+            raise PermissionError(
+                f"COPY operation {operation_id} does not belong to the requested runtime owner and session"
+            )
+
+    @staticmethod
+    def _copy_terminal_result(record: _CopyOperationTerminal) -> CopyPlanOutcome:
+        if record.error is not None:
+            raise record.error
+        if record.outcome is None:
+            raise RuntimeError("COPY terminal replay record has no result")
+        return record.outcome
+
+    @staticmethod
+    def _copy_terminal_recovery(
+        operation_id: str,
+        record: _CopyOperationTerminal,
+    ) -> CopyPlanRecovery:
+        if (record.outcome is None) == (record.error is None):
+            raise RuntimeError("COPY terminal replay record must contain exactly one result")
+        return CopyPlanRecovery(
+            operation_id=operation_id,
+            outcome=record.outcome,
+            error=record.error,
+        )
+
+    @staticmethod
+    async def _await_copy_operation(task: asyncio.Task[CopyPlanOutcome]) -> CopyPlanOutcome:
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                # The write owns its operation identity until a terminal
+                # outcome is recorded. Do not let cancellation of one waiter
+                # cancel the write or interrupt observation of its outcome.
+                cancellation = error
+            except BaseException:
+                break
+        if cancellation is not None:
+            try:
+                task.result()
+            except BaseException:
+                pass
+            raise cancellation
+        return task.result()
+
+    @staticmethod
+    async def _drain_copy_startup_tasks(tasks: list[asyncio.Task[Any]]) -> None:
+        if not tasks:
+            return
+        drain = asyncio.gather(*tasks, return_exceptions=True)
+        while not drain.done():
+            try:
+                await asyncio.shield(drain)
+            except asyncio.CancelledError:
+                # Once native COPY may have committed, cancellation cannot
+                # interrupt observation of the remaining startup tasks.
+                continue
+        drain.result()
+
+    @staticmethod
+    def _copy_cleanup_warning(stage: str, error: BaseException) -> str:
+        try:
+            message = str(error)
+        except BaseException:
+            message = "<error message unavailable>"
+        return f"{stage} failed: {type(error).__name__}: {message}"
+
+    @staticmethod
+    def _copy_native_cleanup_warnings(result: Mapping[str, Any]) -> tuple[str, ...]:
+        raw_warnings = result.get("copy_runner_cleanup_warnings", ())
+        if isinstance(raw_warnings, str):
+            return (raw_warnings,) if raw_warnings else ()
+        if not isinstance(raw_warnings, (list, tuple)):
+            return ()
+        return tuple(str(warning) for warning in raw_warnings if str(warning))
+
+    @staticmethod
+    def _committed_copy_outcome(
+        operation_id: str,
+        result: Mapping[str, Any],
+        final_progress_snapshot: dict[str, Any] | None,
+        *,
+        cleanup_state: Literal["complete", "pending"],
+        cleanup_warnings: tuple[str, ...],
+    ) -> CopyPlanOutcome:
+        public_result = dict(result)
+        public_result["copy_operation_id"] = operation_id
+        public_result["copy_write_state"] = "committed"
+        public_result["copy_cleanup_state"] = cleanup_state
+        public_result["copy_cleanup_warnings"] = list(cleanup_warnings)
+        return CopyPlanOutcome(
+            result=public_result,
+            final_progress_snapshot=final_progress_snapshot,
+            operation_id=operation_id,
+            write_state="committed",
+            cleanup_state=cleanup_state,
+            cleanup_warnings=cleanup_warnings,
+        )
+
+    async def _execute_copy_operation(
+        self,
+        owner_id: str,
+        session_id: str,
+        session: _DriverSession,
+        plan: Any,
+        operation_id: str,
+    ) -> CopyPlanOutcome:
+        try:
+            self._begin_session_operation(session, session_id)
+            try:
+                outcome = await self._run_copy_plan_for_session(
+                    session_id,
+                    session,
+                    plan,
+                )
+            finally:
+                self._end_session_operation(session)
+        except BaseException as error:
+            self._copy_operation_terminal[operation_id] = _CopyOperationTerminal(
+                owner_id=owner_id,
+                session_id=session_id,
+                error=error,
+            )
+            raise
+        else:
+            self._copy_operation_terminal[operation_id] = _CopyOperationTerminal(
+                owner_id=owner_id,
+                session_id=session_id,
+                outcome=outcome,
+            )
+            return outcome
+        finally:
+            current = self._copy_operations_inflight.get(operation_id)
+            if current is not None and current.task is asyncio.current_task():
+                self._copy_operations_inflight.pop(operation_id, None)
+
     async def run_copy_plan(
         self,
         owner_id: str,
         session_id: str,
         plan: Any,
     ) -> CopyPlanOutcome:
-        """Run COPY and capture its final progress state before teardown."""
+        """Run one idempotently identified COPY and replay its terminal outcome."""
+        self._ensure_copy_operation_state()
+        owner_key = str(owner_id).strip()
+        session_key = str(session_id).strip()
+        operation_id = self._copy_operation_id(plan)
         session = self._require_session(owner_id, session_id)
         self._validate_plan_session(session_id, plan, session)
-        self._begin_session_operation(session, session_id)
+        terminal = self._copy_operation_terminal.get(operation_id)
+        if terminal is not None:
+            self._validate_copy_operation_identity(
+                terminal,
+                owner_id=owner_key,
+                session_id=session_key,
+                operation_id=operation_id,
+            )
+            self._copy_operation_identities.setdefault(
+                operation_id,
+                (terminal.owner_id, terminal.session_id),
+            )
+            return self._copy_terminal_result(terminal)
+        in_flight = self._copy_operations_inflight.get(operation_id)
+        if in_flight is not None:
+            self._validate_copy_operation_identity(
+                in_flight,
+                owner_id=owner_key,
+                session_id=session_key,
+                operation_id=operation_id,
+            )
+            self._copy_operation_identities.setdefault(
+                operation_id,
+                (in_flight.owner_id, in_flight.session_id),
+            )
+            return await self._await_copy_operation(in_flight.task)
+        identity = self._copy_operation_identities.get(operation_id)
+        if identity is not None:
+            self._validate_copy_identity_tombstone(
+                identity,
+                owner_id=owner_key,
+                session_id=session_key,
+                operation_id=operation_id,
+            )
+            raise CopyOutcomeUnknownError(operation_id)
+        self._copy_operation_identities[operation_id] = (
+            owner_key,
+            session_key,
+        )
+        task = asyncio.create_task(
+            self._execute_copy_operation(
+                owner_key,
+                session_key,
+                session,
+                plan,
+                operation_id,
+            ),
+            name=f"vane-copy-operation:{operation_id}",
+        )
+        self._copy_operations_inflight[operation_id] = _CopyOperationInFlight(
+            owner_id=owner_key,
+            session_id=session_key,
+            task=task,
+        )
+        return await self._await_copy_operation(task)
+
+    async def _recover_copy_operation(
+        self,
+        owner_id: str,
+        operation_id: str,
+        *,
+        session_id: str | None,
+    ) -> CopyPlanRecovery:
+        self._ensure_copy_operation_state()
+        owner_key = str(owner_id).strip()
+        session_key = None if session_id is None else str(session_id).strip()
+        operation_key = str(operation_id).strip()
+        self._require_owner(owner_key)
+        if session_id is not None and not session_key:
+            raise ValueError("Vane session_id must not be empty")
+        if not operation_key:
+            raise ValueError("COPY operation identity must not be empty")
+        terminal = self._copy_operation_terminal.get(operation_key)
+        if terminal is not None:
+            self._validate_copy_operation_identity(
+                terminal,
+                owner_id=owner_key,
+                session_id=session_key,
+                operation_id=operation_key,
+            )
+            return self._copy_terminal_recovery(operation_key, terminal)
+        in_flight = self._copy_operations_inflight.get(operation_key)
+        if in_flight is not None:
+            self._validate_copy_operation_identity(
+                in_flight,
+                owner_id=owner_key,
+                session_id=session_key,
+                operation_id=operation_key,
+            )
+            try:
+                outcome = await self._await_copy_operation(in_flight.task)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as operation_error:
+                terminal = self._copy_operation_terminal.get(operation_key)
+                if terminal is not None:
+                    self._validate_copy_operation_identity(
+                        terminal,
+                        owner_id=owner_key,
+                        session_id=session_key,
+                        operation_id=operation_key,
+                    )
+                    return self._copy_terminal_recovery(operation_key, terminal)
+                return CopyPlanRecovery(
+                    operation_id=operation_key,
+                    error=operation_error,
+                )
+            return CopyPlanRecovery(
+                operation_id=operation_key,
+                outcome=outcome,
+            )
+        identity = self._copy_operation_identities.get(operation_key)
+        if identity is not None:
+            self._validate_copy_identity_tombstone(
+                identity,
+                owner_id=owner_key,
+                session_id=session_key,
+                operation_id=operation_key,
+            )
+        raise CopyOutcomeUnknownError(operation_key)
+
+    async def recover_copy_plan(
+        self,
+        owner_id: str,
+        session_id: str,
+        operation_id: str,
+    ) -> CopyPlanRecovery:
+        """Read or await an existing COPY outcome without submitting a write."""
+        return await self._recover_copy_operation(
+            owner_id,
+            operation_id,
+            session_id=session_id,
+        )
+
+    async def _retry_copy_cleanup_for_operation(
+        self,
+        operation_id: str,
+        terminal: _CopyOperationTerminal,
+        outcome: CopyPlanOutcome,
+    ) -> CopyPlanOutcome:
+        cleanup_warnings = outcome.cleanup_warnings
+        cleanup_state: Literal["complete", "pending"] = "complete"
         try:
-            return await self._run_copy_plan_for_session(session_id, session, plan)
-        finally:
-            self._end_session_operation(session)
+            await _to_thread_with_owned_side_effects(
+                self._cleanup_finished_plan,
+                operation_id,
+            )
+        except asyncio.CancelledError:
+            # The owned cleanup call completed before waiter cancellation was
+            # exposed, so there is no cleanup work left to retry.
+            pass
+        except BaseException as cleanup_error:
+            cleanup_state = "pending"
+            cleanup_warnings += (self._copy_cleanup_warning("COPY cleanup retry", cleanup_error),)
+        updated = self._committed_copy_outcome(
+            operation_id,
+            outcome.result,
+            outcome.final_progress_snapshot,
+            cleanup_state=cleanup_state,
+            cleanup_warnings=cleanup_warnings,
+        )
+        current = self._copy_operation_terminal.get(operation_id)
+        if current is terminal:
+            self._copy_operation_terminal[operation_id] = replace(
+                terminal,
+                outcome=updated,
+            )
+        return updated
+
+    async def retry_copy_cleanup(
+        self,
+        owner_id: str,
+        operation_id: str,
+    ) -> CopyPlanOutcome:
+        """Retry only post-commit cleanup for an existing COPY operation."""
+        recovery = await self._recover_copy_operation(
+            owner_id,
+            operation_id,
+            session_id=None,
+        )
+        if recovery.error is not None:
+            raise recovery.error
+        outcome = recovery.outcome
+        if outcome is None:
+            raise CopyOutcomeUnknownError(str(operation_id).strip())
+        if outcome.cleanup_state == "complete":
+            return outcome
+        operation_key = str(operation_id).strip()
+        terminal = self._copy_operation_terminal.get(operation_key)
+        if terminal is None or terminal.outcome is None:
+            raise CopyOutcomeUnknownError(operation_key)
+        cleanup_task = self._copy_cleanup_tasks.get(operation_key)
+        if cleanup_task is None:
+            cleanup_task = asyncio.create_task(
+                self._retry_copy_cleanup_for_operation(
+                    operation_key,
+                    terminal,
+                    outcome,
+                ),
+                name=f"vane-copy-cleanup:{operation_key}",
+            )
+            self._copy_cleanup_tasks[operation_key] = cleanup_task
+
+            def discard_completed_cleanup(completed: asyncio.Task[CopyPlanOutcome]) -> None:
+                if self._copy_cleanup_tasks.get(operation_key) is completed:
+                    self._copy_cleanup_tasks.pop(operation_key, None)
+
+            cleanup_task.add_done_callback(discard_completed_cleanup)
+        return await self._await_copy_operation(cleanup_task)
 
     async def _run_copy_plan_for_session(
         self,
@@ -4624,7 +5076,7 @@ class RayQueryDriverActor:
                         # before a slow actor has initialized, so keep waiting
                         # for the startup barriers instead of rewriting that
                         # success as an execution error.
-                        await plan_execution
+                        await self._await_copy_operation(plan_execution)
                         plan_execution_observed = True
                     for task in done:
                         if task is plan_execution:
@@ -4632,7 +5084,16 @@ class RayQueryDriverActor:
                         await task
                         pending_startup.discard(task)
             self._mark_query_actor_stages_ready(graph)
-            result = await plan_execution
+            # Cancellation must reach the exception path promptly so teardown
+            # can interrupt a still-running native write, but it must not
+            # cancel the asyncio wrapper around that thread. The exception path
+            # waits for the wrapper's terminal result and checks the commit
+            # marker before classifying the operation.
+            result = await asyncio.shield(plan_execution)
+            if not isinstance(result, Mapping):
+                raise TypeError(f"native COPY returned {type(result).__name__}, expected a mapping")
+            if result.get("copy_output_committed") is not True:
+                raise RuntimeError(f"native COPY plan {plan_id} returned without a committed output marker")
         except BaseException as execution_error:
             query_id = self._plan_query_ids.get(plan_id, "")
             teardown_error: BaseException | None = None
@@ -4651,13 +5112,52 @@ class RayQueryDriverActor:
             # Teardown interrupts the native runner. Always retrieve its
             # terminal result so a concurrent failure cannot escape as an
             # unobserved asyncio task exception.
+            committed_result: Mapping[str, Any] | None = None
             if plan_execution is not None:
                 try:
-                    await plan_execution
+                    await self._await_copy_operation(plan_execution)
                 except BaseException:
                     pass
-            if startup_tasks:
-                await asyncio.gather(*startup_tasks, return_exceptions=True)
+                try:
+                    observed_result = plan_execution.result()
+                except BaseException:
+                    pass
+                else:
+                    if isinstance(observed_result, Mapping) and observed_result.get("copy_output_committed") is True:
+                        committed_result = observed_result
+            await self._drain_copy_startup_tasks(startup_tasks)
+            if committed_result is not None:
+                cleanup_warnings = self._copy_native_cleanup_warnings(committed_result) + (
+                    self._copy_cleanup_warning(
+                        "COPY post-commit execution finalization",
+                        execution_error,
+                    ),
+                )
+                cleanup_state: Literal["complete", "pending"] = "complete"
+                if teardown_error is not None:
+                    cleanup_state = "pending"
+                    cleanup_warnings += (
+                        self._copy_cleanup_warning(
+                            "COPY post-commit teardown",
+                            teardown_error,
+                        ),
+                    )
+                try:
+                    _log_copy_result_debug(str(query_id or plan_id), committed_result)
+                except BaseException as logging_error:
+                    cleanup_warnings += (
+                        self._copy_cleanup_warning(
+                            "COPY result logging",
+                            logging_error,
+                        ),
+                    )
+                return self._committed_copy_outcome(
+                    plan_id,
+                    committed_result,
+                    None,
+                    cleanup_state=cleanup_state,
+                    cleanup_warnings=cleanup_warnings,
+                )
             if teardown_error is not None:
                 aggregate_error = QueryExecutionCleanupError.from_errors(
                     f"COPY query plan {plan_id} failed and teardown also failed",
@@ -4667,13 +5167,19 @@ class RayQueryDriverActor:
                 raise aggregate_error from execution_error
             raise
         query_id = str(graph.query_id)
-        _log_copy_result_debug(query_id, result)
-        if query_id in getattr(self, "_query_terminal_errors", {}):
-            await _to_thread_with_owned_side_effects(
-                self._finish_terminal_query,
-                plan_id,
-                query_id,
+        cleanup_warnings = self._copy_native_cleanup_warnings(result)
+        try:
+            _log_copy_result_debug(query_id, result)
+        except BaseException as logging_error:
+            cleanup_warnings += (
+                self._copy_cleanup_warning(
+                    "COPY result logging",
+                    logging_error,
+                ),
             )
+        terminal_reason = str(getattr(self, "_query_terminal_errors", {}).get(query_id, ""))
+        if terminal_reason:
+            cleanup_warnings += (f"COPY post-commit terminal query state: {terminal_reason}",)
         try:
             final_progress_snapshot = await _to_thread_with_owned_side_effects(
                 self._build_local_progress_snapshot,
@@ -4681,32 +5187,38 @@ class RayQueryDriverActor:
                 None,
             )
         except BaseException as progress_error:
-            try:
-                await _to_thread_with_owned_side_effects(
-                    self._teardown_plan_resources,
-                    plan_id,
-                    query_id,
-                    drop_fragments=True,
-                )
-            except asyncio.CancelledError:
-                raise progress_error
-            except BaseException as teardown_error:
-                aggregate_error = QueryExecutionCleanupError.from_errors(
-                    f"COPY query plan {plan_id} progress finalization failed and teardown also failed",
+            final_progress_snapshot = None
+            cleanup_warnings += (
+                self._copy_cleanup_warning(
+                    "COPY progress finalization",
                     progress_error,
-                    [teardown_error],
-                )
-                raise aggregate_error from progress_error
-            raise
-        await _to_thread_with_owned_side_effects(
-            self._teardown_plan_resources,
+                ),
+            )
+        final_cleanup_state: Literal["complete", "pending"] = "complete"
+        try:
+            await _to_thread_with_owned_side_effects(
+                self._teardown_plan_resources,
+                plan_id,
+                query_id,
+                drop_fragments=True,
+            )
+        except asyncio.CancelledError:
+            # The owned teardown completed before cancellation was exposed.
+            pass
+        except BaseException as teardown_error:
+            final_cleanup_state = "pending"
+            cleanup_warnings += (
+                self._copy_cleanup_warning(
+                    "COPY post-commit teardown",
+                    teardown_error,
+                ),
+            )
+        return self._committed_copy_outcome(
             plan_id,
-            query_id,
-            drop_fragments=True,
-        )
-        return CopyPlanOutcome(
-            result=result,
-            final_progress_snapshot=final_progress_snapshot,
+            result,
+            final_progress_snapshot,
+            cleanup_state=final_cleanup_state,
+            cleanup_warnings=cleanup_warnings,
         )
 
     def _prepare_copy_plan_sync(
@@ -5148,14 +5660,18 @@ class RayQueryDriverClient:
             current_gcs_address = runtime_context.gcs_address
         except Exception:
             return False
+        expected_gcs_address = getattr(self, "_ray_gcs_address", None)
         if (
-            self._ray_gcs_address is not None
+            expected_gcs_address is not None
             and current_gcs_address is not None
-            and current_gcs_address != self._ray_gcs_address
+            and current_gcs_address != expected_gcs_address
         ):
             return True
+        expected_job_id = getattr(self, "_ray_job_id", None)
+        if expected_job_id is None:
+            return False
         try:
-            return _ray_runtime_job_id(runtime_context) != self._ray_job_id
+            return _ray_runtime_job_id(runtime_context) != expected_job_id
         except Exception:
             # A context lookup failure is not proof that the old runtime was
             # replaced; let the actor RPC produce the actionable error.
@@ -5475,6 +5991,110 @@ class RayQueryDriverClient:
             )
             raise aggregate_error from operation_error
 
+    def _recover_copy_plan(
+        self,
+        runner: Any,
+        *,
+        session_id: str,
+        operation_id: str,
+        operation_error: BaseException,
+    ) -> CopyPlanOutcome:
+        """Resolve an ambiguous COPY response without ever resubmitting it."""
+        try:
+            recovery_future = runner.recover_copy_plan.remote(
+                self._owner_id,
+                session_id,
+                operation_id,
+            )
+        except BaseException:
+            raise CopyOutcomeUnknownError(operation_id) from operation_error
+        while True:
+            try:
+                recovery = resolve_object_refs_blocking(
+                    recovery_future,
+                    honor_query_deadline=False,
+                )
+            except BaseException as recovery_error:
+                if _runtime_error_is_wait_timeout(recovery_error):
+                    # Rewait on the same read-only ObjectRef. A new RPC is not
+                    # needed and the write operation must never be resubmitted.
+                    continue
+                unknown_error = next(
+                    (
+                        candidate
+                        for candidate in _runtime_error_candidates(recovery_error)
+                        if isinstance(candidate, CopyOutcomeUnknownError)
+                    ),
+                    None,
+                )
+                if unknown_error is not None:
+                    raise unknown_error
+                raise CopyOutcomeUnknownError(operation_id) from operation_error
+            break
+        if not isinstance(recovery, CopyPlanRecovery):
+            raise CopyOutcomeUnknownError(operation_id) from operation_error
+        if recovery.operation_id != operation_id:
+            raise CopyOutcomeUnknownError(operation_id) from operation_error
+        if (recovery.outcome is None) == (recovery.error is None):
+            raise CopyOutcomeUnknownError(operation_id) from operation_error
+        if recovery.error is not None:
+            if not isinstance(recovery.error, BaseException):
+                raise CopyOutcomeUnknownError(operation_id) from operation_error
+            restored_error = restore_remote_ray_exception(recovery.error)
+            raise recovery.error if restored_error is None else restored_error
+        try:
+            return self._validate_copy_outcome(
+                recovery.outcome,
+                operation_id,
+            )
+        except BaseException:
+            raise CopyOutcomeUnknownError(operation_id) from operation_error
+
+    @staticmethod
+    def _validate_copy_outcome(
+        outcome: Any,
+        operation_id: str,
+    ) -> CopyPlanOutcome:
+        if not isinstance(outcome, CopyPlanOutcome):
+            raise TypeError(f"Ray COPY returned {type(outcome).__name__}, expected CopyPlanOutcome")
+        if outcome.operation_id != operation_id:
+            raise RuntimeError(
+                f"Ray COPY outcome identity mismatch: expected={operation_id} actual={outcome.operation_id}"
+            )
+        if outcome.write_state != "committed":
+            raise RuntimeError(
+                f"Ray COPY operation {operation_id} returned non-committed write state: {outcome.write_state}"
+            )
+        if outcome.cleanup_state not in {"complete", "pending"}:
+            raise RuntimeError(
+                f"Ray COPY operation {operation_id} returned invalid cleanup state: {outcome.cleanup_state}"
+            )
+        if not isinstance(outcome.result, dict):
+            raise TypeError(f"Ray COPY operation {operation_id} returned a non-dict result")
+        return outcome
+
+    def retry_copy_cleanup(self, operation_id: str) -> dict[str, Any]:
+        """Retry post-commit cleanup using the operation id returned by run_copy_plan()."""
+        operation_key = str(operation_id).strip()
+        if not operation_key:
+            raise ValueError("COPY operation identity must not be empty")
+        with self._session_condition:
+            runner = getattr(self, "runner", None)
+            if runner is None or self._client_closing:
+                raise RuntimeError("Ray query runtime client is closed")
+        outcome = resolve_object_refs_blocking(
+            runner.retry_copy_cleanup.remote(
+                self._owner_id,
+                operation_key,
+            ),
+            honor_query_deadline=False,
+        )
+        validated = self._validate_copy_outcome(
+            outcome,
+            operation_key,
+        )
+        return validated.result
+
     def stream_plan(
         self,
         plan: Any,
@@ -5581,16 +6201,25 @@ class RayQueryDriverClient:
                 try:
                     outcome = progress.resolve(future)
                 except BaseException as operation_error:
-                    self._teardown_failed_plan(
+                    outcome = self._recover_copy_plan(
                         runner,
-                        future,
                         session_id=session_id,
-                        plan_id=plan_id,
+                        operation_id=plan_id,
                         operation_error=operation_error,
                     )
-                    raise
-                if not isinstance(outcome, CopyPlanOutcome):
-                    raise TypeError(f"Ray COPY returned {type(outcome).__name__}, expected CopyPlanOutcome")
+                else:
+                    try:
+                        outcome = self._validate_copy_outcome(
+                            outcome,
+                            plan_id,
+                        )
+                    except BaseException as response_error:
+                        outcome = self._recover_copy_plan(
+                            runner,
+                            session_id=session_id,
+                            operation_id=plan_id,
+                            operation_error=response_error,
+                        )
                 final_progress_snapshot = outcome.final_progress_snapshot
                 completed = True
             finally:
@@ -5600,6 +6229,16 @@ class RayQueryDriverClient:
                 )
             return outcome.result
         except Exception as e:
+            unknown_outcome = next(
+                (
+                    candidate
+                    for candidate in _runtime_error_candidates(e)
+                    if isinstance(candidate, CopyOutcomeUnknownError)
+                ),
+                None,
+            )
+            if unknown_outcome is not None:
+                raise unknown_outcome
             cleanup_failure = next(
                 (
                     candidate

@@ -74,7 +74,7 @@ def _google_embedder_descriptor():
 
     return GoogleTextEmbedderDescriptor(
         provider_options={"api_key": API_KEY},
-        model_name="text-embedding-004",
+        model_name="gemini-embedding-001",
         embed_options={"task_type": "RETRIEVAL_QUERY", "auth_token": API_KEY},
     )
 
@@ -84,7 +84,7 @@ def _google_prompter_descriptor():
 
     return GooglePrompterDescriptor(
         provider_options={"api_key": API_KEY},
-        model_name="gemini-2.0-flash",
+        model_name="gemini-2.5-pro",
         prompt_options={"temperature": 0.1, "auth_token": API_KEY},
     )
 
@@ -229,7 +229,9 @@ class TestDescriptorReprRedaction:
     def test_credential_kwarg_landing_in_embed_options_is_redacted(self):
         from vane.ai.providers.google import GoogleProvider
 
-        descriptor = GoogleProvider(api_key=API_KEY).get_text_embedder(auth_token=API_KEY, task_type="RETRIEVAL_QUERY")
+        descriptor = GoogleProvider(api_key=API_KEY).get_text_embedder(
+            model="gemini-embedding-001", auth_token=API_KEY, task_type="RETRIEVAL_QUERY"
+        )
         assert API_KEY not in repr(descriptor)
         assert isinstance(descriptor.embed_options["auth_token"], Secret)
         assert descriptor.embed_options["task_type"] == "RETRIEVAL_QUERY"

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import gc
 import threading
 import time
 import weakref
@@ -641,10 +640,20 @@ def test_inflight_block_keeps_item_capacity_from_read_admission():
         collector.shutdown()
 
 
-def test_terminal_stream_is_retired_without_waiting_for_collector_shutdown():
+def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
     fake_ray = _FakeRay()
     driver = _Driver()
     generator_holder = {}
+    retire_started = threading.Event()
+    allow_retire = threading.Event()
+    original_retire = RayStreamAdapter.retire
+
+    def blocking_retire(adapter):
+        retire_started.set()
+        allow_retire.wait()
+        original_retire(adapter)
+
+    monkeypatch.setattr(RayStreamAdapter, "retire", blocking_retire)
 
     def make_source():
         def submitter(lease):
@@ -669,27 +678,43 @@ def test_terminal_stream_is_retired_without_waiting_for_collector_shutdown():
     collector = AsyncResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(2, 22, source)
     del source
+    capacity = {2: {"rows": 1, "bytes": 128, "item_bytes": 128}}
     try:
-        events = _drain_until(
-            collector,
-            {2: {"rows": 1, "bytes": 128, "item_bytes": 128}},
-            predicate=lambda values: any(item[2] == "complete" for item in values),
-        )
+        events = []
+        deadline = time.monotonic() + 2.0
+        while not retire_started.is_set() and time.monotonic() < deadline:
+            events.extend(collector.drain_results(capacity))
+            time.sleep(0.005)
+        assert retire_started.is_set()
+        events.extend(collector.drain_results(capacity))
+
+        # Completion is the observable retirement boundary. Keep the record
+        # pending, and do not publish completion, until local stream cleanup
+        # has dropped the source and deleted the Ray ObjectRef stream.
+        assert [item[2] for item in events] == ["data"]
+        assert collector._records
+        assert source_ref() is not None
+        generator = generator_holder["generator"]
+        assert generator.deleted_streams == []
+
         data = next(item for item in events if item[2] == "data")
         assert collector.release_output_block_lease(data[4], data[5]) is True
         del data
         del events
 
-        deadline = time.monotonic() + 1.0
-        while source_ref() is not None and time.monotonic() < deadline:
-            gc.collect()
-            time.sleep(0.005)
+        allow_retire.set()
+        events = _drain_until(
+            collector,
+            capacity,
+            predicate=lambda values: any(item[2] == "complete" for item in values),
+        )
 
+        assert [item[2] for item in events] == ["complete"]
         assert collector._records == {}
         assert source_ref() is None
-        generator = generator_holder["generator"]
         assert generator.deleted_streams == [generator.completion_ref]
     finally:
+        allow_retire.set()
         collector.shutdown()
 
 
