@@ -25,6 +25,7 @@ pytestmark = [
 _FAULT_RAY_CLUSTER = None
 
 import duckdb.runners.ray.worker_handle as worker_handle_mod
+from duckdb.runners.ray import driver as ray_driver
 from duckdb.runners.ray import worker as worker_mod
 from duckdb.runners.ray.fte_fragment_scheduler import ensure_fte_fragment_progress_topology
 from duckdb.runners.ray.query_execution_graph import (
@@ -395,7 +396,12 @@ def _shutdown_ray_for_fault_test() -> None:
 
     cluster = _FAULT_RAY_CLUSTER
     try:
-        ray.shutdown()
+        try:
+            # Result-handle watchers await Ray ObjectRefs on this loop. Stop
+            # them before ray.shutdown() destroys the driver's core worker.
+            ray_driver.shutdown_background_event_loop()
+        finally:
+            ray.shutdown()
     finally:
         _FAULT_RAY_CLUSTER = None
         if cluster is not None and os.environ.get("VANE_TEST_EXTERNAL_RAY_CLUSTER_CLEANUP") != "1":

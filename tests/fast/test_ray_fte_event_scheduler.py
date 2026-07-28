@@ -848,6 +848,47 @@ def test_attempt_status_watcher_treats_query_deadline_as_hard_failure():
     assert calls == [("worker-query-deadline", "query deadline expired before Ray ObjectRef get")]
 
 
+def test_attempt_status_watcher_reports_failure_with_unprintable_message():
+    class _UnprintableError(RuntimeError):
+        def __getattribute__(self, name):
+            if name == "__class__":
+                raise RuntimeError("exception class is unreadable")
+            return super().__getattribute__(name)
+
+        def __str__(self):
+            raise RuntimeError("exception message is unreadable")
+
+    error = _UnprintableError()
+
+    class _Worker:
+        worker_id = "worker-unprintable-failure"
+
+        def fte_wait_task_status(self, task_id, min_version, timeout_s):
+            raise error
+
+    scheduler = FteSchedulerRegistry().get_or_create("query-watch-unprintable-failure")
+    calls = []
+    scheduler.set_handlers(
+        FteEventHandlers(
+            on_worker_failed=lambda event: calls.append((event.worker_id, event.error)) or [],
+        )
+    )
+    attempt_id = FteTaskAttemptId(FteTaskId("query-watch-unprintable-failure", 0, 1), 0)
+    watcher = FteAttemptStatusWatcher(
+        scheduler=scheduler,
+        attempt_id=attempt_id,
+        worker=_Worker(),
+        wait_timeout_s=0,
+        poll_interval_s=0.001,
+    )
+
+    assert watcher.start() is True
+    watcher.join(1.0)
+
+    assert watcher.is_alive() is False
+    assert calls == [("worker-unprintable-failure", error)]
+
+
 def test_attempt_status_watcher_join_observes_real_thread_lifecycle():
     entered = threading.Event()
 

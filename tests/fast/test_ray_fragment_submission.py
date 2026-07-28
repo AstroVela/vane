@@ -1019,7 +1019,11 @@ def test_fte_split_backpressure_terminal_status_uses_task_status_path(monkeypatc
     terminal_status = {
         "state": FteTaskState.FAILED.value,
         "task_id": attempt_id.to_dict(),
-        "failure": {"type": "ValueError", "message": "planned task failure"},
+        "failure": {
+            "error_code": "GENERIC_INTERNAL_ERROR",
+            "type": "ValueError",
+            "message": "planned task failure",
+        },
     }
 
     class _TerminalWorker:
@@ -3512,7 +3516,17 @@ def test_fte_add_splits_ack_after_task_finish_does_not_revive_pressure():
         remote_handle=handle,
     )
     assert handle.record_fte_task_started(failed_attempt.attempt_id, failed_attempt.request) is True
-    assert stage.task_failed(failed_attempt.attempt_id, "retry", schedule_retry=False) is None
+    assert (
+        stage.task_failed(
+            failed_attempt.attempt_id,
+            {
+                "error_code": "GENERIC_INTERNAL_ERROR",
+                "message": "retry",
+            },
+            schedule_retry=False,
+        )
+        is None
+    )
     retry_attempt = retry_partition.start_attempt(
         worker_id=handle.worker_id,
         remote_handle=handle,
@@ -5506,7 +5520,16 @@ def test_fte_worker_capacity_registers_every_ready_partition_with_credit_authori
     ("terminal_state", "terminal_extra", "next_query_a_attempt"),
     [
         ("FINISHED", {}, "query-a.0.1.0"),
-        ("FAILED", {"failure": {"message": "retry me"}}, "query-a.0.0.1"),
+        (
+            "FAILED",
+            {
+                "failure": {
+                    "error_code": "GENERIC_INTERNAL_ERROR",
+                    "message": "retry me",
+                }
+            },
+            "query-a.0.0.1",
+        ),
     ],
 )
 def test_fte_pending_drain_is_fair_across_queries(
@@ -6461,7 +6484,7 @@ def test_fte_worker_failure_retry_preserves_registered_heap(monkeypatch):
         memory_requirement_bytes=5,
     )
 
-    retries = low_memory.mark_fte_worker_failed("worker-0", "worker lost")
+    retries = low_memory.mark_fte_worker_failed("worker-0", RuntimeError("worker lost"))
 
     assert len(first) == 1
     assert len(retries) == 1
@@ -6543,7 +6566,10 @@ def test_fte_worker_failure_does_not_invert_attempt_start_lock_order(monkeypatch
         failure = executor.submit(
             fte_fragment_scheduler_mod._mark_fte_worker_failed,
             failed.worker_id,
-            "worker lost during attempt start",
+            {
+                "error_code": "WORKER_LOST",
+                "message": "worker lost during attempt start",
+            },
             query_id_filter=query_id,
             failed_worker_ids_override={failed.worker_id},
         )
@@ -6578,7 +6604,7 @@ def test_fte_worker_failure_replays_descriptor_on_new_owner(monkeypatch):
     )
 
     first = handle0.submit_tasks([task])
-    retries = handle1.mark_fte_worker_failed("worker-0", "actor died")
+    retries = handle1.mark_fte_worker_failed("worker-0", RuntimeError("actor died"))
 
     assert len(first) == 1
     assert len(retries) == 1
@@ -6638,7 +6664,7 @@ def test_fte_worker_failure_keeps_retryability_partition_local():
     worker_handle_mod._FTE_PARTITION_OWNERS[(query_id, fragment_id, 0)] = failed
     worker_handle_mod._FTE_PARTITION_OWNERS[(query_id, fragment_id, 1)] = failed
 
-    handles = replacement.mark_fte_worker_failed("failed#0", "actor died")
+    handles = replacement.mark_fte_worker_failed("failed#0", RuntimeError("actor died"))
 
     assert stage.partitions[0].failed is False
     assert stage.partitions[1].failed is True
@@ -6675,7 +6701,7 @@ def test_fte_worker_failure_retry_waits_for_scheduling_delayer(monkeypatch):
         "query-fte-retry-delay.0.0.0"
     ]
 
-    retries = handle1.mark_fte_worker_failed("worker-0", "actor died")
+    retries = handle1.mark_fte_worker_failed("worker-0", RuntimeError("actor died"))
 
     assert retries == []
     assert [call for call in actor1.fte_calls if call[0] == "create"] == []
@@ -6966,7 +6992,7 @@ def test_fte_worker_failure_replays_all_owned_stage_partitions(monkeypatch):
     actor1 = _FakeActor()
     handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-1")
 
-    retries = handle1.mark_fte_worker_failed("worker-0", "host lost")
+    retries = handle1.mark_fte_worker_failed("worker-0", RuntimeError("host lost"))
 
     assert len(first_handles) == 2
     assert len(retries) == 2
@@ -7033,7 +7059,7 @@ def test_fte_worker_failure_without_replacement_fails_stage_without_retry(monkey
     )
 
     first = handle.submit_tasks([task])
-    retries = handle.mark_fte_worker_failed("worker-alone", "host lost")
+    retries = handle.mark_fte_worker_failed("worker-alone", RuntimeError("host lost"))
 
     assert len(first) == 1
     assert retries == []
@@ -8492,7 +8518,10 @@ def test_fte_registry_close_waits_for_terminal_handler_and_suppresses_retry(monk
             return {
                 "state": "FAILED",
                 "task_id": task_id,
-                "failure": {"message": "retryable"},
+                "failure": {
+                    "error_code": "GENERIC_INTERNAL_ERROR",
+                    "message": "retryable",
+                },
                 "version": 1,
             }
 
@@ -8993,7 +9022,10 @@ def test_fte_task_status_event_retries_failed_attempt(monkeypatch):
         {
             "state": "FAILED",
             "task_id": first.task_id.to_dict(),
-            "failure": {"message": "retry me"},
+            "failure": {
+                "error_code": "GENERIC_INTERNAL_ERROR",
+                "message": "retry me",
+            },
             "version": 1,
         }
     )
@@ -9121,7 +9153,11 @@ def test_fte_wait_query_raises_on_failed_partition(monkeypatch):
         {
             "state": "FAILED",
             "task_id": running.task_id.to_dict(),
-            "failure": {"message": "not retryable", "retryable": False},
+            "failure": {
+                "error_code": "GENERIC_INTERNAL_ERROR",
+                "message": "not retryable",
+                "retryable": False,
+            },
             "version": 1,
         }
     )

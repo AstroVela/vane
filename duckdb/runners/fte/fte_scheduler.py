@@ -27,6 +27,7 @@ from duckdb.runners.fte.fte_events import (
     WorkerFailed,
     WorkerReservationCompleted,
 )
+from duckdb.runners.fte.fte_failures import _safe_failure_message
 from duckdb.runners.fte.fte_state import FteTaskState
 from duckdb.runners.fte.fte_types import validate_fte_status_identity
 
@@ -307,14 +308,14 @@ class FteAttemptStatusWatcher:
 
     @staticmethod
     def _is_soft_status_wait_timeout(exc: BaseException) -> bool:
-        if isinstance(exc, QueryDeadlineExceeded) or "query deadline expired" in str(exc).lower():
+        message = _safe_failure_message(exc)
+        if issubclass(type(exc), QueryDeadlineExceeded) or "query deadline expired" in message.lower():
             return False
-        if isinstance(exc, TimeoutError):
+        if issubclass(type(exc), TimeoutError):
             return True
-        name = exc.__class__.__name__
+        name = type(exc).__name__
         if name in {"TimeoutError", "GetTimeoutError"}:
             return True
-        message = str(exc)
         return "did not complete within" in message or "timed out" in message.lower()
 
     def _run(self) -> None:
