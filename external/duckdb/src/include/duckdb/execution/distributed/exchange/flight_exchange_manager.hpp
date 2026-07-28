@@ -16,9 +16,7 @@
 #include "duckdb/execution/distributed/exchange/flight_server.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache_registry.hpp"
-#include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
-#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 
 #include <string>
@@ -185,40 +183,7 @@ inline FlightExchangeConfig ResolveFlightExchangeConfigFromEnv() {
 	return config;
 }
 
-inline bool FlightServiceAdvertiseHostIsWildcard(std::string host) {
-	StringUtil::Trim(host);
-	host = StringUtil::Lower(host);
-	return host == "0.0.0.0" || host == "::" || host == "[::]" || host == "*";
-}
-
-inline FlightServiceConfig ResolveFlightServiceConfigFromEnv() {
-	FlightServiceConfig config;
-	config.advertise_host = ResolveFlightExchangeEnvString("VANE_FLIGHT_ADVERTISE_HOST");
-	if (config.advertise_host.empty()) {
-		config.advertise_host = ResolveFlightExchangeEnvString("RAY_NODE_IP_ADDRESS");
-	}
-	if (config.advertise_host.empty()) {
-		config.advertise_host = "127.0.0.1";
-	}
-	StringUtil::Trim(config.advertise_host);
-	if (config.advertise_host.empty()) {
-		throw InvalidInputException("VANE_FLIGHT_ADVERTISE_HOST must not be empty");
-	}
-	if (FlightServiceAdvertiseHostIsWildcard(config.advertise_host)) {
-		throw InvalidInputException("VANE_FLIGHT_ADVERTISE_HOST must be a routable host, not a wildcard address");
-	}
-
-	config.bind_host = ResolveFlightExchangeEnvString("VANE_FLIGHT_BIND_HOST");
-	if (config.bind_host.empty()) {
-		config.bind_host = config.advertise_host;
-	}
-	StringUtil::Trim(config.bind_host);
-	if (config.bind_host.empty()) {
-		config.bind_host = config.advertise_host;
-	}
-	config.port = ResolveFlightExchangeEnvInt("DUCKDB_FLIGHT_PORT", 0);
-	return config;
-}
+FlightServiceConfig ResolveFlightServiceConfigFromEnv();
 
 // ─── FlightExchange (coordinator) ────────────────────────
 

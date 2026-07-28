@@ -17,6 +17,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 
+#include "arrow/flight/api.h"
 #include "arrow/io/api.h"
 
 #include <string>
@@ -1138,9 +1139,34 @@ TEST_CASE("Exchange: local-disk sink starts and publishes the cluster-internal F
 	REQUIRE(FlightExchangeManager::ShutdownLocalFlightServer().is_ok());
 }
 
-TEST_CASE("Exchange: Flight service rejects wildcard advertised hosts", "[distributed][exchange][security]") {
-	ScopedEnvVar advertise_host("VANE_FLIGHT_ADVERTISE_HOST", "0.0.0.0");
-	REQUIRE_THROWS_WITH(ResolveFlightServiceConfigFromEnv(), Catch::Matchers::Contains("must be a routable host"));
+TEST_CASE("Exchange: Flight service normalizes IPv6 hosts before building Arrow URIs",
+          "[distributed][exchange][security]") {
+	ScopedEnvVar bind_host("VANE_FLIGHT_BIND_HOST", "");
+	for (const auto &configured_host : {"::1", "[::1]"}) {
+		INFO("configured host: " << configured_host);
+		ScopedEnvVar advertise_host("VANE_FLIGHT_ADVERTISE_HOST", configured_host);
+		auto config = ResolveFlightServiceConfigFromEnv();
+		REQUIRE(config.advertise_host == "::1");
+		REQUIRE(config.bind_host == "::1");
+
+		auto location = BuildFlightLocation(config.bind_host, 1234);
+		REQUIRE(location == "grpc+tcp://[::1]:1234");
+		REQUIRE(arrow::flight::Location::Parse(location).ok());
+	}
+
+	ScopedEnvVar advertise_host("VANE_FLIGHT_ADVERTISE_HOST", "");
+	ScopedEnvVar ray_node_ip("RAY_NODE_IP_ADDRESS", "::1");
+	auto config = ResolveFlightServiceConfigFromEnv();
+	REQUIRE(config.advertise_host == "::1");
+	REQUIRE(config.bind_host == "::1");
+}
+
+TEST_CASE("Exchange: Flight service rejects unspecified advertised IP addresses", "[distributed][exchange][security]") {
+	for (const auto &configured_host : {"0.0.0.0", "::", "[::]", "[::0]", "0:0:0:0:0:0:0:0", "[0:0:0:0:0:0:0:0]"}) {
+		INFO("configured host: " << configured_host);
+		ScopedEnvVar advertise_host("VANE_FLIGHT_ADVERTISE_HOST", configured_host);
+		REQUIRE_THROWS_WITH(ResolveFlightServiceConfigFromEnv(), Catch::Matchers::Contains("must be a routable host"));
+	}
 }
 
 TEST_CASE("Exchange: remote local-disk source rejects a wildcard advertised host before connecting",
@@ -1157,7 +1183,7 @@ TEST_CASE("Exchange: remote local-disk source rejects a wildcard advertised host
 	handle.partition_id = 0;
 	handle.attempt_id = 1;
 	handle.node_id = "writer-worker";
-	handle.flight_host = "0.0.0.0";
+	handle.flight_host = "[::0]";
 	handle.flight_port = 1;
 	handle.flight_server_epoch = "remote-epoch";
 	handle.files.push_back(ExchangeSourceFile("remote-disabled-attempt", 0));
@@ -1341,7 +1367,7 @@ TEST_CASE("Exchange: FlightExchange accepts validated dynamically derived retry 
 	auto suffix = retry.output_location.rfind("__attempt_0");
 	REQUIRE(suffix != std::string::npos);
 	retry.output_location.replace(suffix, std::string("__attempt_0").size(), "__attempt_2");
-	retry.flight_host = "retry.internal";
+	retry.flight_host = "[::1]";
 	retry.flight_server_epoch = "retry-epoch";
 	exchange->SinkFinished(retry, "worker-retry", 5010);
 
@@ -1349,7 +1375,7 @@ TEST_CASE("Exchange: FlightExchange accepts validated dynamically derived retry 
 	REQUIRE(handles.size() == 1);
 	REQUIRE(handles[0].attempt_id == 2);
 	REQUIRE(handles[0].node_id == "worker-retry");
-	REQUIRE(handles[0].flight_host == "retry.internal");
+	REQUIRE(handles[0].flight_host == "::1");
 	REQUIRE(handles[0].flight_port == 5010);
 	REQUIRE(handles[0].flight_server_epoch == "retry-epoch");
 	REQUIRE(handles[0].files.size() == 1);
