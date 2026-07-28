@@ -933,7 +933,7 @@ def test_ai_prompt_sql_vllm_reuses_one_native_executor_across_batches(monkeypatc
 
     assert rows == [
         (1, "native:Answer briefly.\n\nalpha"),
-        (2, "native:Answer briefly.\n\n"),
+        (2, None),
         (3, "native:Answer briefly.\n\nbeta"),
     ]
     assert len(builds) == 1
@@ -944,7 +944,6 @@ def test_ai_prompt_sql_vllm_reuses_one_native_executor_across_batches(monkeypatc
     assert sorted(prompts for _, prompts in executor.submissions) == sorted(
         [
             ("Answer briefly.\n\nalpha",),
-            ("Answer briefly.\n\n",),
             ("Answer briefly.\n\nbeta",),
         ]
     )

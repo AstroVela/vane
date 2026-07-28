@@ -181,16 +181,15 @@ static unique_ptr<Expression> BindScalarFunction(ClientContext &context, const s
 
 static unique_ptr<Expression> BuildNativeVLLMPromptArgument(ClientContext &context, unique_ptr<Expression> prompt,
                                                             const Value &system_message) {
-	vector<unique_ptr<Expression>> concat_arguments;
-	if (!system_message.IsNull() && !StringValue::Get(system_message).empty()) {
-		auto prefix = StringValue::Get(system_message) + "\n\n";
-		concat_arguments.push_back(make_uniq<BoundConstantExpression>(Value(std::move(prefix))));
+	if (system_message.IsNull() || StringValue::Get(system_message).empty()) {
+		return prompt;
 	}
+
+	vector<unique_ptr<Expression>> concat_arguments;
+	auto prefix = StringValue::Get(system_message) + "\n\n";
+	concat_arguments.push_back(make_uniq<BoundConstantExpression>(Value(std::move(prefix))));
 	concat_arguments.push_back(std::move(prompt));
-	// concat ignores NULL arguments. The empty suffix preserves non-NULL text
-	// while matching the previous Python batch wrapper's NULL-to-empty policy.
-	concat_arguments.push_back(make_uniq<BoundConstantExpression>(Value("")));
-	return BindScalarFunction(context, "concat", std::move(concat_arguments));
+	return BindScalarFunction(context, "||", std::move(concat_arguments));
 }
 
 static unique_ptr<Expression> LowerNativeVLLMPrompt(FunctionBindExpressionInput &input) {

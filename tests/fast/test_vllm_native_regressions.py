@@ -126,6 +126,61 @@ def _run_recording_sql(monkeypatch, prompts, options, *, executor=None, threads=
         con.close()
 
 
+@pytest.mark.parametrize("do_prefix_routing", [False, True])
+def test_native_vllm_propagates_null_prompts_without_submitting_them(monkeypatch, do_prefix_routing):
+    executor, rows = _run_recording_sql(
+        monkeypatch,
+        ["alpha", None, "beta"],
+        {
+            "do_prefix_routing": do_prefix_routing,
+            "max_buffer_size": 0,
+            "min_bucket_size": 1,
+            "batch_size": None,
+            "inflight_limit": 0,
+        },
+    )
+
+    assert {row[0]: row[2] for row in rows} == {
+        0: "generated:alpha",
+        1: None,
+        2: "generated:beta",
+    }
+    assert sorted(prompt for _, prompts in executor.submissions for prompt in prompts) == ["alpha", "beta"]
+
+
+def test_native_vllm_all_null_prompts_do_not_build_an_executor(monkeypatch):
+    import duckdb
+    import duckdb.execution.vllm as vllm
+
+    builds = 0
+
+    def build_executor(*_args, **_kwargs):
+        nonlocal builds
+        builds += 1
+        return _RecordingExecutor()
+
+    monkeypatch.setattr(vllm, "build_executor", build_executor)
+    con = duckdb.connect()
+    try:
+        con.register(
+            "vllm_input",
+            pa.table(
+                {
+                    "id": pa.array([0, 1], type=pa.int64()),
+                    "prompt": pa.array([None, None], type=pa.string()),
+                }
+            ),
+        )
+        rows = con.execute(
+            "SELECT id, vllm(prompt, 'recording-model') AS generated FROM vllm_input ORDER BY id"
+        ).fetchall()
+    finally:
+        con.close()
+
+    assert rows == [(0, None), (1, None)]
+    assert builds == 0
+
+
 @pytest.mark.parametrize(
     ("prompts", "expected_prefix"),
     [

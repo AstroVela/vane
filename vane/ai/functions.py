@@ -851,21 +851,19 @@ def classify_text(
 def _build_native_vllm_expression(messages: Any, descriptor: NativeVLLMPromptPlan) -> duckdb.Expression:
     """Build the native row-preserving ``vllm()`` expression."""
     messages_expr = as_expression(messages)
-    # DuckDB's concat() ignores NULL arguments: concat(NULL, '') returns '',
-    # and concat('system\n\n', NULL, '') returns 'system\n\n'.
-    prompt_arguments = [messages_expr, duckdb.ConstantExpression("")]
     if descriptor.system_message:
-        prompt_arguments.insert(
-            0,
+        # Unlike concat(), the || operator propagates NULL inputs.
+        messages_expr = duckdb.FunctionExpression(
+            "||",
             duckdb.ConstantExpression(f"{descriptor.system_message}\n\n"),
+            messages_expr,
         )
-    prompt_expr = duckdb.FunctionExpression("concat", *prompt_arguments)
 
     options_argument = _build_native_vllm_options_argument(descriptor.build_physical_vllm_options())
 
     return duckdb.FunctionExpression(
         "vllm",
-        prompt_expr,
+        messages_expr,
         duckdb.ConstantExpression(descriptor.model_name),
         duckdb.ConstantExpression(options_argument),
     )

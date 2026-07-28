@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -474,10 +474,12 @@ def test_ai_prompt_vllm_relation_uses_one_native_lifecycle_and_returns_only_outp
 
     assert result.columns == ["answer"]
     assert "VLLM_PROJECT" in result.explain()
-    assert result.fetchall() == [
-        ("generated:Answer briefly.\n\nquestion",),
-        ("generated:Answer briefly.\n\n",),
-    ]
+    assert Counter(result.fetchall()) == Counter(
+        [
+            ("generated:Answer briefly.\n\nquestion",),
+            (None,),
+        ]
+    )
     assert captured["model"] == "native-model"
     options = captured["options"]
     assert isinstance(options, dict)
@@ -491,7 +493,6 @@ def test_ai_prompt_vllm_relation_uses_one_native_lifecycle_and_returns_only_outp
     assert executor.shutdown_count == 1
     assert [prompt for _prefix, prompts in executor.submissions for prompt in prompts] == [
         "Answer briefly.\n\nquestion",
-        "Answer briefly.\n\n",
     ]
 
 
