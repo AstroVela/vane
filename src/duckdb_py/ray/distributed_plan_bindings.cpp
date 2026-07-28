@@ -1917,12 +1917,23 @@ struct PyPhysicalPlanWrapperRunner {
 				run_plan_ms = elapsed_ms(run_plan_started);
 			}
 
-			rethrow_submission_error(plan.idx());
 			if (!res.is_ok()) {
+				rethrow_submission_error(plan.idx());
 				throw py::value_error(res.error().what());
 			}
 
 			auto result = std::move(res).value();
+			if (!result.output_committed) {
+				rethrow_submission_error(plan.idx());
+				throw py::value_error("distributed COPY completed without a committed output marker");
+			}
+			std::vector<string> post_commit_warnings;
+			try {
+				rethrow_submission_error(plan.idx());
+			} catch (...) {
+				post_commit_warnings.push_back("native COPY post-commit submission state failed: " +
+				                               exception_message(std::current_exception()));
+			}
 			py::list files;
 			for (auto &info : result.files) {
 				py::dict entry;
@@ -1948,12 +1959,18 @@ struct PyPhysicalPlanWrapperRunner {
 			AppendDistributedCopyResultMetadata(out, result);
 			body_succeeded = true;
 			cleanup();
-			if (cleanup_error) {
-				std::rethrow_exception(cleanup_error);
-			}
 			out["copy_total_ms"] = py::int_(elapsed_ms(copy_started));
 			out["copy_run_plan_ms"] = py::int_(run_plan_ms);
 			out["copy_runner_cleanup_ms"] = py::int_(cleanup_ms);
+			out["copy_runner_cleanup_pending"] = py::bool_(cleanup_error != nullptr);
+			py::list cleanup_warnings;
+			for (const auto &warning : post_commit_warnings) {
+				cleanup_warnings.append(warning);
+			}
+			if (cleanup_error) {
+				cleanup_warnings.append("native COPY runner cleanup failed: " + exception_message(cleanup_error));
+			}
+			out["copy_runner_cleanup_warnings"] = cleanup_warnings;
 			out["copy_selected_file_count"] = py::int_(result.files.size());
 			out["copy_duplicate_file_count"] = py::int_(0);
 			return out;

@@ -553,7 +553,10 @@ def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_
     runner._precreate_udf_actors = lambda *_args, **_kwargs: []
     runner._precreate_vllm_actors = lambda *_args, **_kwargs: []
     runner._get_plan_runner = lambda: SimpleNamespace(
-        run_copy_plan=lambda _plan, _conn: {"rows_copied": 1},
+        run_copy_plan=lambda _plan, _conn: {
+            "rows_copied": 1,
+            "copy_output_committed": True,
+        },
     )
     runner._mark_query_actor_stages_ready = lambda _graph: None
     runner._build_local_progress_snapshot = lambda query_id, _started_at: {
@@ -693,7 +696,14 @@ def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_
 
     outcome = asyncio.run(_run_concurrently())
 
-    assert outcome.result == {"rows_copied": 1}
+    assert outcome.result == {
+        "rows_copied": 1,
+        "copy_output_committed": True,
+        "copy_operation_id": copy_query_id,
+        "copy_write_state": "committed",
+        "copy_cleanup_state": "complete",
+        "copy_cleanup_warnings": [],
+    }
     assert outcome.final_progress_snapshot == {
         "query_id": copy_query_id,
         "state": "FINISHED",
