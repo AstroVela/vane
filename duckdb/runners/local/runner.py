@@ -110,8 +110,13 @@ def _shutdown_local_write_resources(
     actor_pools: list[Any],
     *,
     kill_actor_pools: bool,
+    timeout_s: float,
 ) -> list[BaseException]:
     """Stop execution before releasing any resource a fragment may still use."""
+    timeout_s = float(timeout_s)
+    if not math.isfinite(timeout_s) or timeout_s < 0:
+        raise ValueError("local write resource shutdown timeout must be finite and non-negative")
+    deadline = time.monotonic() + timeout_s
     errors: list[BaseException] = []
     try:
         backend.request_shutdown()
@@ -124,13 +129,13 @@ def _shutdown_local_write_resources(
         errors.append(exc)
 
     try:
-        backend.shutdown()
+        backend.shutdown(timeout_s=max(0.0, deadline - time.monotonic()))
     except BaseException as exc:
         errors.append(exc)
         return errors
 
     try:
-        fragment_executor.close()
+        fragment_executor.close(timeout_s=max(0.0, deadline - time.monotonic()))
     except BaseException as exc:
         errors.append(exc)
         return errors
@@ -176,6 +181,10 @@ class _InProcessFragmentExecutor:
         self._closing = False
         self._closed = False
 
+    @property
+    def close_timeout_s(self) -> float:
+        return self._close_timeout_s
+
     def retain_resources(self, *resources: Any) -> None:
         with self._resources_condition:
             if self._closing or self._closed:
@@ -218,7 +227,9 @@ class _InProcessFragmentExecutor:
             try:
                 cursor.interrupt()
             except BaseException as exc:
-                interrupt_errors.append(exc)
+                with self._resources_condition:
+                    if cursor in self._active_cursors:
+                        interrupt_errors.append(exc)
         if interrupt_errors:
             details = "; ".join(f"{type(error).__name__}: {error}" for error in interrupt_errors)
             raise RuntimeError(f"failed to interrupt local fragment execution during close: {details}") from (
@@ -343,14 +354,14 @@ class _InProcessFragmentExecutor:
             )
         finally:
             try:
-                if cursor is not None:
-                    cursor.close()
-            except Exception:
-                pass
+                if cursor_registered:
+                    self._unregister_cursor(cursor)
             finally:
                 try:
-                    if cursor_registered:
-                        self._unregister_cursor(cursor)
+                    if cursor is not None:
+                        cursor.close()
+                except Exception:
+                    pass
                 finally:
                     self._end_execution()
 
@@ -461,6 +472,7 @@ class LocalRunner(Runner):
                 conn,
                 udf_actor_pools,
                 kill_actor_pools=not write_succeeded,
+                timeout_s=fragment_executor.close_timeout_s,
             )
             if write_succeeded and not primary_error_active and cleanup_errors:
                 details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)

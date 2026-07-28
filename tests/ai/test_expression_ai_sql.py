@@ -511,6 +511,7 @@ def test_ai_prompt_sql_with_mock_provider():
 def test_ai_sql_full_local_copy_in_subprocess(tmp_path, expression, expected):
     repo_root = Path(__file__).resolve().parents[2]
     output = tmp_path / "ai-local-copy.parquet"
+    expected_row = (expected,)
     script = f"""
 import vane
 from vane.ai import provider as provider_registry
@@ -525,10 +526,10 @@ vane.configure(runner="local")
 conn = vane.connect()
 conn.sql({f"SELECT {expression} AS result"!r}).write_parquet({str(output)!r})
 row = conn.read_parquet({str(output)!r}).fetchone()
-assert row == ({expected!r},), row
+assert row == {expected_row!r}, row
 """
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(repo_root)
+    env["PYTHONPATH"] = os.pathsep.join(entry for entry in (str(repo_root), env.get("PYTHONPATH")) if entry)
     env["PYTHONFAULTHANDLER"] = "1"
     env["VANE_PROGRESS"] = "0"
 

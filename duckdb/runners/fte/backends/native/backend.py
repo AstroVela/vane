@@ -1224,9 +1224,9 @@ class NativeWorkerHandle:
         stats["memory"] = self._total_memory_bytes
         return stats
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout_s: float = 5.0) -> None:
         if self._owns_loop:
-            self._loop.shutdown()
+            self._loop.shutdown(timeout_s=timeout_s)
 
     def request_shutdown(self) -> None:
         if self._owns_loop:
@@ -1788,9 +1788,15 @@ class NativeFteWorkerManagerBackend:
         if worker_errors:
             raise RuntimeError("native FTE worker manager shutdown request failed: " + "; ".join(worker_errors))
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout_s: float | None = None) -> None:
         if self._closed:
             return
+        deadline: float | None = None
+        if timeout_s is not None:
+            timeout_s = float(timeout_s)
+            if not math.isfinite(timeout_s) or timeout_s < 0:
+                raise ValueError("native FTE worker manager shutdown timeout must be finite and non-negative")
+            deadline = time.monotonic() + timeout_s
         worker_errors: list[str] = []
         try:
             self.request_shutdown()
@@ -1799,7 +1805,10 @@ class NativeFteWorkerManagerBackend:
         for worker in self._workers:
             worker_id = str(getattr(worker, "worker_id", "") or "<unknown>")
             try:
-                worker.shutdown()
+                if deadline is None:
+                    worker.shutdown()
+                else:
+                    worker.shutdown(timeout_s=max(0.0, deadline - time.monotonic()))
             except BaseException as exc:
                 worker_errors.append(f"{worker_id}: {type(exc).__name__}: {exc}")
         if worker_errors:

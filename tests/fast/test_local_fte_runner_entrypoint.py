@@ -169,19 +169,23 @@ def test_local_runner_teardown_releases_actor_pools_after_execution_resources():
     from duckdb.runners.local.runner import _shutdown_local_write_resources
 
     events = []
+    backend_timeouts = []
+    fragment_timeouts = []
 
     class FakeBackend:
         def request_shutdown(self):
             events.append("backend-request")
 
-        def shutdown(self):
+        def shutdown(self, *, timeout_s):
+            backend_timeouts.append(timeout_s)
             events.append("backend-join")
 
     class FakeFragmentExecutor:
         def request_shutdown(self):
             events.append("fragments-request")
 
-        def close(self):
+        def close(self, *, timeout_s):
+            fragment_timeouts.append(timeout_s)
             events.append("fragments-close")
 
     class FakeConn:
@@ -201,9 +205,11 @@ def test_local_runner_teardown_releases_actor_pools_after_execution_resources():
         FakeConn(),
         [FakePool("first"), FakePool("second")],
         kill_actor_pools=True,
+        timeout_s=7.0,
     )
 
     assert errors == []
+    assert 0 < fragment_timeouts[0] <= backend_timeouts[0] <= 7.0
     assert events == [
         "backend-request",
         "fragments-request",
@@ -224,7 +230,7 @@ def test_local_runner_teardown_keeps_dependencies_when_backend_does_not_stop():
         def request_shutdown(self):
             events.append("backend-request")
 
-        def shutdown(self):
+        def shutdown(self, *, timeout_s):
             events.append("backend-join")
             raise RuntimeError("backend join timed out")
 
@@ -249,6 +255,7 @@ def test_local_runner_teardown_keeps_dependencies_when_backend_does_not_stop():
         UnexpectedConn(),
         [UnexpectedPool()],
         kill_actor_pools=True,
+        timeout_s=7.0,
     )
 
     assert events == ["backend-request", "fragments-request", "backend-join"]
@@ -265,14 +272,14 @@ def test_local_runner_teardown_keeps_dependencies_when_fragment_close_fails():
         def request_shutdown(self):
             events.append("backend-request")
 
-        def shutdown(self):
+        def shutdown(self, *, timeout_s):
             events.append("backend-join")
 
     class FakeFragmentExecutor:
         def request_shutdown(self):
             events.append("fragments-request")
 
-        def close(self):
+        def close(self, *, timeout_s):
             events.append("fragments-close")
             raise RuntimeError("fragment close failed")
 
@@ -290,6 +297,7 @@ def test_local_runner_teardown_keeps_dependencies_when_fragment_close_fails():
         UnexpectedConn(),
         [UnexpectedPool()],
         kill_actor_pools=False,
+        timeout_s=7.0,
     )
 
     assert len(errors) == 1
