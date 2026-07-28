@@ -2163,6 +2163,9 @@ struct PyPhysicalPlanWrapperRunner {
 		auto task_flight_port = [&]() {
 			return task_flight_manager ? task_flight_manager->GetPublishedFlightServerPort() : 0;
 		};
+		auto task_flight_host = [&]() {
+			return task_flight_manager ? task_flight_manager->GetPublishedFlightServerHost() : string();
+		};
 		auto task_flight_server_epoch = [&]() {
 			return task_flight_manager ? task_flight_manager->GetPublishedFlightServerEpoch() : string();
 		};
@@ -2171,6 +2174,7 @@ struct PyPhysicalPlanWrapperRunner {
 				return py::none();
 			}
 			auto completed_task = *exchange_sink_instance_task;
+			completed_task.sink_instance.flight_host = task_flight_host();
 			completed_task.sink_instance.flight_server_epoch = task_flight_server_epoch();
 			return py::bytes(completed_task.SerializeToBytes());
 		};

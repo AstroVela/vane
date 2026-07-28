@@ -1180,6 +1180,10 @@ void register_ray_bindings(py::module_ &mod) {
 					        exchange_sink_instance_task.sink_instance.flight_server_epoch =
 					            py::str(d["flight_server_epoch"]).cast<string>();
 				        }
+				        if (d.contains("flight_host")) {
+					        exchange_sink_instance_task.sink_instance.flight_host =
+					            py::str(d["flight_host"]).cast<string>();
+				        }
 				        if (d.contains("query_id")) {
 					        exchange_sink_instance_task.sink_instance.query_id = py::str(d["query_id"]).cast<string>();
 				        }
@@ -1476,6 +1480,9 @@ void register_ray_bindings(py::module_ &mod) {
 			    if (d.contains("node_id")) {
 				    handle.node_id = py::str(d["node_id"]).cast<string>();
 			    }
+			    if (d.contains("flight_host")) {
+				    handle.flight_host = py::str(d["flight_host"]).cast<string>();
+			    }
 			    if (d.contains("flight_port")) {
 				    handle.flight_port = py::int_(d["flight_port"]).cast<int>();
 			    }
@@ -1519,6 +1526,9 @@ void register_ray_bindings(py::module_ &mod) {
 			    d["partition_id"] = handle.partition_id;
 			    d["attempt_id"] = handle.attempt_id;
 			    d["node_id"] = handle.node_id;
+			    if (!handle.flight_host.empty()) {
+				    d["flight_host"] = handle.flight_host;
+			    }
 			    d["flight_port"] = handle.flight_port;
 			    if (!handle.flight_server_epoch.empty()) {
 				    d["flight_server_epoch"] = handle.flight_server_epoch;
@@ -1546,9 +1556,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    using namespace duckdb::distributed;
 		    FlightExchangeConfig config;
 		    config.node_id = "coordinator";
-		    config.flight_port = 7777;
 		    config.local_dirs = {"."};
-		    config.allow_insecure_flight = true;
 		    FlightExchangeManager mgr(config, nullptr);
 
 		    ExchangeContext ctx;
@@ -1560,6 +1568,9 @@ void register_ray_bindings(py::module_ &mod) {
 		    auto sink0_attempt0 = exchange->InstantiateSink(sink0, 0);
 		    auto sink0_attempt1 = exchange->InstantiateSink(sink0, 1);
 		    auto sink1_attempt0 = exchange->InstantiateSink(sink1, 0);
+		    sink0_attempt1.flight_host = "flight-retry.internal";
+		    sink0_attempt0.flight_host = "flight-late.internal";
+		    sink1_attempt0.flight_host = "flight-first.internal";
 		    sink0_attempt1.flight_server_epoch = "worker-retry-epoch";
 		    sink0_attempt0.flight_server_epoch = "worker-late-epoch";
 		    sink1_attempt0.flight_server_epoch = "worker-first-epoch";
@@ -1576,6 +1587,7 @@ void register_ray_bindings(py::module_ &mod) {
 			    d["partition_id"] = handle.partition_id;
 			    d["attempt_id"] = handle.attempt_id;
 			    d["node_id"] = handle.node_id;
+			    d["flight_host"] = handle.flight_host;
 			    d["flight_port"] = handle.flight_port;
 			    d["flight_server_epoch"] = handle.flight_server_epoch;
 			    d["path"] = handle.files.empty() ? string() : handle.files[0].path;
@@ -1591,9 +1603,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    using namespace duckdb::distributed;
 		    FlightExchangeConfig config;
 		    config.node_id = "coordinator";
-		    config.flight_port = 7777;
 		    config.local_dirs = {"."};
-		    config.allow_insecure_flight = true;
 		    FlightExchangeManager mgr(config, nullptr);
 
 		    ExchangeContext ctx;
@@ -1605,6 +1615,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    exchange->InstantiateSink(sink0, 0);
 		    auto sink0_attempt1 = exchange->InstantiateSink(sink0, 1);
 		    auto sink1_attempt0 = exchange->InstantiateSink(sink1, 0);
+		    sink0_attempt1.flight_host = "flight-retry.internal";
+		    sink1_attempt0.flight_host = "flight-first.internal";
 		    sink0_attempt1.flight_server_epoch = "worker-retry-epoch";
 		    sink1_attempt0.flight_server_epoch = "worker-first-epoch";
 
@@ -1630,6 +1642,7 @@ void register_ray_bindings(py::module_ &mod) {
 			    d["partition_id"] = handle.partition_id;
 			    d["attempt_id"] = handle.attempt_id;
 			    d["node_id"] = handle.node_id;
+			    d["flight_host"] = handle.flight_host;
 			    d["flight_port"] = handle.flight_port;
 			    d["flight_server_epoch"] = handle.flight_server_epoch;
 			    d["path"] = handle.files.empty() ? string() : handle.files[0].path;
@@ -1836,7 +1849,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    config.node_id = "node-a";
 		    config.local_dirs = {local_dir};
 		    config.expected_types = types;
-		    config.allow_insecure_flight = true;
 		    FlightExchangeManager mgr(config, &context);
 
 		    ExchangeContext exchange_context;
@@ -1868,8 +1880,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    };
 
 		    auto lost_node_id = write_attempt(lost_instance, {101});
+		    lost_instance.flight_host = FlightExchangeManager::GetLocalFlightServerHost();
 		    lost_instance.flight_server_epoch = FlightExchangeManager::GetLocalFlightServerEpoch();
 		    auto selected_node_id = write_attempt(selected_instance, {201, 202});
+		    selected_instance.flight_host = FlightExchangeManager::GetLocalFlightServerHost();
 		    selected_instance.flight_server_epoch = FlightExchangeManager::GetLocalFlightServerEpoch();
 		    const auto flight_port = FlightExchangeManager::GetLocalFlightServerPort();
 		    exchange->SinkFinished(selected_instance, selected_node_id, flight_port);
@@ -1972,7 +1986,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    FlightExchangeConfig config;
 		    config.node_id = node_id;
 		    config.local_dirs = {local_dir};
-		    config.allow_insecure_flight = true;
 		    FlightExchangeManager mgr(config, &context);
 
 		    ExchangeContext ctx;
@@ -2001,10 +2014,12 @@ void register_ray_bindings(py::module_ &mod) {
 		    };
 
 		    auto selected_node_id = write_attempt(selected_instance, 101);
+		    selected_instance.flight_host = FlightExchangeManager::GetLocalFlightServerHost();
 		    selected_instance.flight_server_epoch = FlightExchangeManager::GetLocalFlightServerEpoch();
 		    const auto flight_port = FlightExchangeManager::GetLocalFlightServerPort();
 		    exchange->SinkFinished(selected_instance, selected_node_id, flight_port);
 		    auto loser_node_id = write_attempt(loser_instance, 202);
+		    loser_instance.flight_host = FlightExchangeManager::GetLocalFlightServerHost();
 		    loser_instance.flight_server_epoch = FlightExchangeManager::GetLocalFlightServerEpoch();
 
 		    auto make_cache = [&](const std::string &output_location, const std::string &cache_node_id) {
@@ -3135,7 +3150,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    server_config.bind_host = "127.0.0.1";
 		    server_config.port = 0;
 		    server_config.server_epoch = server_epoch;
-		    server_config.allow_insecure_flight = true;
 		    FlightServer server(std::move(server_config));
 		    auto start_res = server.Start();
 		    if (start_res.is_err()) {
@@ -3146,13 +3160,13 @@ void register_ray_bindings(py::module_ &mod) {
 		    source_config.node_id = node_id;
 		    source_config.local_dirs = {local_dir};
 		    source_config.expected_types = types;
-		    source_config.allow_insecure_flight = true;
 		    FlightExchangeSource source(source_config, &context);
 
 		    ExchangeSourceHandle handle;
 		    handle.partition_id = 1;
 		    handle.attempt_id = 1;
 		    handle.node_id = node_id;
+		    handle.flight_host = "127.0.0.1";
 		    handle.flight_port = server.port();
 		    handle.flight_server_epoch = server_epoch;
 		    ExchangeSourceFile file;
@@ -3230,7 +3244,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    server_config.bind_host = "127.0.0.1";
 		    server_config.port = 0;
 		    server_config.server_epoch = server_epoch;
-		    server_config.allow_insecure_flight = true;
 		    FlightServer server(std::move(server_config));
 		    auto start_res = server.Start();
 		    if (start_res.is_err()) {
@@ -3241,13 +3254,13 @@ void register_ray_bindings(py::module_ &mod) {
 		    source_config.node_id = reader_node_id;
 		    source_config.local_dirs = {local_dir};
 		    source_config.expected_types = types;
-		    source_config.allow_insecure_flight = true;
 		    FlightExchangeSource source(source_config, &context);
 
 		    ExchangeSourceHandle handle;
 		    handle.partition_id = 1;
 		    handle.attempt_id = 1;
 		    handle.node_id = writer_node_id;
+		    handle.flight_host = "127.0.0.1";
 		    handle.flight_port = server.port();
 		    handle.flight_server_epoch = server_epoch;
 		    ExchangeSourceFile file;
@@ -3355,7 +3368,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    server_config.bind_host = "127.0.0.1";
 		    server_config.port = 0;
 		    server_config.server_epoch = server_epoch;
-		    server_config.allow_insecure_flight = true;
 		    FlightServer server(std::move(server_config));
 		    auto start_res = server.Start();
 		    if (start_res.is_err()) {
@@ -3365,13 +3377,13 @@ void register_ray_bindings(py::module_ &mod) {
 		    source_config.node_id = reader_node_id;
 		    source_config.local_dirs = {local_dir};
 		    source_config.expected_types = types;
-		    source_config.allow_insecure_flight = true;
 		    FlightExchangeSource source(source_config, &context);
 
 		    ExchangeSourceHandle handle;
 		    handle.partition_id = static_cast<idx_t>(partition_id);
 		    handle.attempt_id = static_cast<idx_t>(attempt_id);
 		    handle.node_id = writer_node_id;
+		    handle.flight_host = "127.0.0.1";
 		    handle.flight_port = server.port();
 		    handle.flight_server_epoch = server_epoch;
 		    ExchangeSourceFile file;
@@ -3423,7 +3435,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    server_config.bind_host = "127.0.0.1";
 		    server_config.port = 0;
 		    server_config.server_epoch = "shared-manifest-reader-epoch";
-		    server_config.allow_insecure_flight = true;
 		    FlightServer server(std::move(server_config));
 		    auto start_res = server.Start();
 		    if (start_res.is_err()) {
@@ -3501,7 +3512,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    server_config.bind_host = "127.0.0.1";
 		    server_config.port = 0;
 		    server_config.server_epoch = server_epoch;
-		    server_config.allow_insecure_flight = true;
 		    FlightServer server(std::move(server_config));
 		    auto start_res = server.Start();
 		    if (start_res.is_err()) {
@@ -3517,6 +3527,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    handle.partition_id = 1;
 		    handle.attempt_id = 1;
 		    handle.node_id = current_node_id;
+		    handle.flight_host = "127.0.0.1";
 		    handle.flight_port = server.port();
 		    handle.flight_server_epoch = server_epoch;
 		    ExchangeSourceFile file;
@@ -3528,7 +3539,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    FlightExchangeConfig flight_config;
 		    flight_config.node_id = current_node_id;
 		    flight_config.local_dirs = {local_dir};
-		    flight_config.allow_insecure_flight = true;
 		    auto exchange_mgr = std::make_shared<FlightExchangeManager>(std::move(flight_config));
 
 		    auto &source =
@@ -3630,7 +3640,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    server_config.bind_host = "127.0.0.1";
 		    server_config.port = 0;
 		    server_config.server_epoch = "unpublished-manifest-epoch";
-		    server_config.allow_insecure_flight = true;
 		    FlightServer server(std::move(server_config));
 		    auto start_res = server.Start();
 		    if (start_res.is_err()) {
@@ -3709,7 +3718,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    server_config.bind_host = "127.0.0.1";
 		    server_config.port = 0;
 		    server_config.server_epoch = server_epoch;
-		    server_config.allow_insecure_flight = true;
 		    FlightServer server(std::move(server_config));
 		    auto start_res = server.Start();
 		    if (start_res.is_err()) {

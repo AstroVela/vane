@@ -99,16 +99,11 @@ vane.configure(runner="local")
 
 ### Distributed Flight Transport
 
-Plaintext Arrow Flight is disabled by default. Same-process local-disk shuffle and object-storage shuffle do not require a listener. Cross-worker local-disk shuffle is available only as an explicit escape hatch for trusted development environments:
+Vane follows [Ray's trusted-cluster model](https://docs.ray.io/en/latest/ray-security/index.html): the driver, workers, submitted code, and east-west network belong to one trusted computing boundary. Same-process local-disk shuffle reads directly from the process-local registry, and object-storage shuffle reads committed manifests. Only cross-worker local-disk shuffle uses Arrow Flight.
 
-```python
-import vane
+A worker lazily starts one process-owned plaintext `grpc://` Flight service when a local-disk exchange sink first needs it. The service provides no TLS, client authentication, query-level authorization, or tenant isolation. Keep its port reachable only inside the controlled Ray cluster network; workloads that do not trust one another require separate isolated Ray clusters.
 
-vane.configure(allow_insecure_flight=True)
-# Submit the distributed query after applying this setting.
-```
-
-Alternatively, set `VANE_ALLOW_INSECURE_FLIGHT=1` on the driver before submitting the distributed query. The opt-in is serialized with the exchange plan, so existing Ray workers do not need to be recreated. `DUCKDB_FLIGHT_PORT` alone does not enable transport. The opt-in keeps the current plaintext `grpc://` listener on `0.0.0.0`; it does not provide TLS, authentication, or authorization. See [SECURITY.md](SECURITY.md) for the trust boundary.
+Workers advertise their Ray private address by default. `VANE_FLIGHT_BIND_HOST` may select a different local bind address, including `0.0.0.0` in a container with appropriate network policy, while `VANE_FLIGHT_ADVERTISE_HOST` must always be a routable non-wildcard address. `DUCKDB_FLIGHT_PORT` selects a fixed worker-local port; the default `0` lets the operating system allocate one. See [SECURITY.md](SECURITY.md) for the complete trust boundary.
 
 ### More Resources
 

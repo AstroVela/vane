@@ -105,26 +105,6 @@ class _RunnerVar(_Var[str]):
         super().__set__(obj, normalized)
 
 
-class _StrictBoolVar(_Var[bool]):
-    """Security-sensitive boolean that rejects ambiguous values."""
-
-    def _parse(self, raw: str) -> bool:
-        normalized = raw.strip().lower()
-        if normalized in ("1", "true"):
-            return True
-        if normalized in ("0", "false"):
-            return False
-        raise ValueError(f"{self.env_name} must be '0', '1', 'false', or 'true'")
-
-    def __set__(self, obj: Any, value: bool) -> None:
-        if value is None:
-            super().__set__(obj, value)
-            return
-        if type(value) is not bool:
-            raise ValueError("allow_insecure_flight must be a bool")
-        os.environ[self.env_name] = "1" if value else "0"
-
-
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -179,17 +159,6 @@ class EnvRegistry:
         str,
         "",
         "SQL to execute on each Ray worker at startup.",
-    )
-
-    # -- Distributed exchange -----------------------------------------------
-
-    allow_insecure_flight: bool = _StrictBoolVar(
-        "VANE_ALLOW_INSECURE_FLIGHT",
-        bool,
-        False,
-        "Allow plaintext Arrow Flight transport for cross-worker local-disk shuffle. "
-        "Use only in trusted development environments and configure it on the driver before submitting the "
-        "distributed query.",
     )
 
     # -- Fault-tolerant execution ------------------------------------------

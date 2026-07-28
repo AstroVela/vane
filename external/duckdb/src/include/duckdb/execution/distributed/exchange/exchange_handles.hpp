@@ -47,6 +47,8 @@ struct ExchangeSinkInstanceHandle {
 	/// Flight server address (Flight), etc.
 	std::string output_location;
 	idx_t output_partition_count = 0;
+	/// Cluster-internal host advertised by the worker that published this attempt.
+	std::string flight_host;
 	/// Process-local Flight service incarnation that published this attempt.
 	std::string flight_server_epoch;
 };
@@ -72,6 +74,7 @@ struct ExchangeSourceHandle {
 	idx_t partition_id = 0;
 	idx_t attempt_id = 0;
 	std::string node_id;
+	std::string flight_host;
 	int flight_port = 0;
 	std::string flight_server_epoch;
 	std::vector<ExchangeSourceFile> files;

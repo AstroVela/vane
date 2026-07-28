@@ -43,14 +43,16 @@ class ClientContext;
 namespace distributed {
 
 struct FlightExchangeConfig {
-	std::string flight_bind_host = "0.0.0.0";
-	int flight_port = 0;
-	bool allow_insecure_flight = false;
 	std::vector<std::string> local_dirs; // shuffle directories for IPC files
 	std::string node_id;
-	std::string flight_location_template;
 	double flight_timeout_seconds = 0.0;
 	std::vector<LogicalType> expected_types;
+};
+
+struct FlightServiceConfig {
+	std::string bind_host;
+	std::string advertise_host;
+	int port = 0;
 };
 
 inline std::string ResolveFlightExchangeEnvString(const char *name) {
@@ -68,22 +70,6 @@ inline int ResolveFlightExchangeEnvInt(const char *name, int fallback) {
 	} catch (...) {
 		return fallback;
 	}
-}
-
-inline bool ResolveAllowInsecureFlightFromEnv() {
-	auto value = ResolveFlightExchangeEnvString("VANE_ALLOW_INSECURE_FLIGHT");
-	if (value.empty()) {
-		return false;
-	}
-	StringUtil::Trim(value);
-	value = StringUtil::Lower(value);
-	if (value == "1" || value == "true") {
-		return true;
-	}
-	if (value == "0" || value == "false") {
-		return false;
-	}
-	throw InvalidInputException("VANE_ALLOW_INSECURE_FLIGHT must be '0', '1', 'false', or 'true'");
 }
 
 inline std::string FlightExchangeJoinPath(const std::string &base, const std::string &child) {
@@ -194,11 +180,43 @@ inline std::string ResolveFlightExchangeNodeIdFromEnv() {
 
 inline FlightExchangeConfig ResolveFlightExchangeConfigFromEnv() {
 	FlightExchangeConfig config;
-	config.allow_insecure_flight = ResolveAllowInsecureFlightFromEnv();
 	config.node_id = ResolveFlightExchangeNodeIdFromEnv();
 	config.local_dirs = ResolveFlightExchangeLocalDirsFromEnv();
-	config.flight_bind_host = "0.0.0.0";
-	config.flight_port = ResolveFlightExchangeEnvInt("DUCKDB_FLIGHT_PORT", 0);
+	return config;
+}
+
+inline bool FlightServiceAdvertiseHostIsWildcard(std::string host) {
+	StringUtil::Trim(host);
+	host = StringUtil::Lower(host);
+	return host == "0.0.0.0" || host == "::" || host == "[::]" || host == "*";
+}
+
+inline FlightServiceConfig ResolveFlightServiceConfigFromEnv() {
+	FlightServiceConfig config;
+	config.advertise_host = ResolveFlightExchangeEnvString("VANE_FLIGHT_ADVERTISE_HOST");
+	if (config.advertise_host.empty()) {
+		config.advertise_host = ResolveFlightExchangeEnvString("RAY_NODE_IP_ADDRESS");
+	}
+	if (config.advertise_host.empty()) {
+		config.advertise_host = "127.0.0.1";
+	}
+	StringUtil::Trim(config.advertise_host);
+	if (config.advertise_host.empty()) {
+		throw InvalidInputException("VANE_FLIGHT_ADVERTISE_HOST must not be empty");
+	}
+	if (FlightServiceAdvertiseHostIsWildcard(config.advertise_host)) {
+		throw InvalidInputException("VANE_FLIGHT_ADVERTISE_HOST must be a routable host, not a wildcard address");
+	}
+
+	config.bind_host = ResolveFlightExchangeEnvString("VANE_FLIGHT_BIND_HOST");
+	if (config.bind_host.empty()) {
+		config.bind_host = config.advertise_host;
+	}
+	StringUtil::Trim(config.bind_host);
+	if (config.bind_host.empty()) {
+		config.bind_host = config.advertise_host;
+	}
+	config.port = ResolveFlightExchangeEnvInt("DUCKDB_FLIGHT_PORT", 0);
 	return config;
 }
 
@@ -228,6 +246,7 @@ private:
 		idx_t attempt_id = 0;
 		std::string output_location;
 		std::string node_id;
+		std::string flight_host;
 		int flight_port = 0;
 		std::string flight_server_epoch;
 	};
@@ -320,11 +339,13 @@ public:
 		RefreshRuntimeNodeId();
 	}
 
+	static std::string GetLocalFlightServerHost();
 	static int GetLocalFlightServerPort();
 	static std::string GetLocalFlightServerEpoch();
+	std::string GetPublishedFlightServerHost() const;
 	int GetPublishedFlightServerPort() const;
 	std::string GetPublishedFlightServerEpoch() const;
-	static DuckDBResult<void> EnsureLocalFlightServerStarted(const FlightExchangeConfig &config);
+	static DuckDBResult<void> EnsureLocalFlightServerStarted(const FlightServiceConfig &config);
 	static DuckDBResult<void> ShutdownLocalFlightServer();
 
 	const FlightExchangeConfig &config() const {

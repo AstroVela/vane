@@ -69,7 +69,8 @@ def start_ray_workers(existing_worker_ids: list[str]) -> list[RayWorkerRuntime]:
     worker_handles = []
     try:
         for node in ray.nodes():
-            base_worker_id = str(node.get("NodeManagerAddress") or node.get("NodeID") or "")
+            node_manager_address = str(node.get("NodeManagerAddress") or "").strip()
+            base_worker_id = node_manager_address or str(node.get("NodeID") or "")
             if (
                 "Resources" in node
                 and "CPU" in node["Resources"]
@@ -83,6 +84,8 @@ def start_ray_workers(existing_worker_ids: list[str]) -> list[RayWorkerRuntime]:
                     continue
                 worker_env = dict(env_overrides)
                 worker_env["VANE_WORKER_ID"] = worker_id
+                if node_manager_address:
+                    worker_env.setdefault("VANE_FLIGHT_ADVERTISE_HOST", node_manager_address)
                 worker_env["VANE_WORKER_INDEX"] = "0"
                 memory_layout = build_ray_node_memory_layout(int(node["Resources"]["memory"]))
                 # max_concurrency limits how many control/execute RPCs can queue

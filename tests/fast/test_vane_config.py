@@ -36,58 +36,6 @@ def test_configure_accepts_local_runner(monkeypatch):
     assert os.environ["VANE_RUNNER"] == "local"
 
 
-def test_insecure_flight_defaults_disabled_even_with_flight_port(monkeypatch):
-    monkeypatch.delenv("VANE_ALLOW_INSECURE_FLIGHT", raising=False)
-    monkeypatch.setenv("DUCKDB_FLIGHT_PORT", "4242")
-
-    assert current_config().allow_insecure_flight is False
-
-
-def test_configure_insecure_flight_requires_explicit_boolean(monkeypatch):
-    monkeypatch.delenv("VANE_ALLOW_INSECURE_FLIGHT", raising=False)
-
-    enabled = configure(allow_insecure_flight=True)
-    assert enabled.allow_insecure_flight is True
-    assert os.environ["VANE_ALLOW_INSECURE_FLIGHT"] == "1"
-    assert current_config().allow_insecure_flight is True
-
-    disabled = configure(allow_insecure_flight=False)
-    assert disabled.allow_insecure_flight is False
-    assert os.environ["VANE_ALLOW_INSECURE_FLIGHT"] == "0"
-    assert current_config().allow_insecure_flight is False
-
-
-@pytest.mark.parametrize(
-    ("configured", "expected"),
-    [("1", True), ("true", True), (" TRUE ", True), ("0", False), ("false", False), (" FALSE ", False)],
-)
-def test_insecure_flight_environment_uses_strict_boolean_values(monkeypatch, configured, expected):
-    monkeypatch.setenv("VANE_ALLOW_INSECURE_FLIGHT", configured)
-
-    assert current_config().allow_insecure_flight is expected
-
-
-@pytest.mark.parametrize("configured", ["yes", "on", "2", "enabled", " "])
-def test_invalid_insecure_flight_environment_fails_closed(monkeypatch, configured):
-    monkeypatch.setenv("VANE_ALLOW_INSECURE_FLIGHT", configured)
-
-    with pytest.raises(
-        ValueError,
-        match="VANE_ALLOW_INSECURE_FLIGHT must be '0', '1', 'false', or 'true'",
-    ):
-        current_config()
-
-
-@pytest.mark.parametrize("configured", ["true", 1, None])
-def test_configure_rejects_ambiguous_insecure_flight_values(monkeypatch, configured):
-    monkeypatch.delenv("VANE_ALLOW_INSECURE_FLIGHT", raising=False)
-
-    with pytest.raises(ValueError, match="allow_insecure_flight must be a bool"):
-        configure(allow_insecure_flight=configured)
-
-    assert "VANE_ALLOW_INSECURE_FLIGHT" not in os.environ
-
-
 def test_public_configuration_rejects_internal_direct_runner(monkeypatch):
     monkeypatch.delenv("VANE_RUNNER", raising=False)
 
@@ -484,7 +432,6 @@ def test_config_registry_contains_stable_public_fields():
     fields = set(current_config().__dict__)
 
     assert "runner" in fields
-    assert "allow_insecure_flight" in fields
     assert "ray_scan_task_open_cost_bytes" in fields
     assert "udf_parallel" in fields
 

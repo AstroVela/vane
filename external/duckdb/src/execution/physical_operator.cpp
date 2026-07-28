@@ -1143,8 +1143,10 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto repartition_type_raw = deserializer.ReadProperty<uint8_t>(106, "repartition_type");
 		auto partition_by = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(107, "partition_by");
 		auto local_dirs = deserializer.ReadProperty<vector<string>>(108, "local_dirs");
-		auto bind_host = deserializer.ReadProperty<string>(109, "flight_bind_host");
-		auto port = deserializer.ReadProperty<int>(110, "flight_port");
+		// Consume node-local service fields emitted by older plans, but never
+		// use driver-provided listener configuration on a worker.
+		(void)deserializer.ReadPropertyWithExplicitDefault<string>(109, "flight_bind_host", "");
+		(void)deserializer.ReadPropertyWithExplicitDefault<int>(110, "flight_port", 0);
 		auto repartition_type = static_cast<RepartitionSpec::Type>(repartition_type_raw);
 		// Create sink handle for this exchange
 		distributed::ExchangeSinkInstanceHandle sink_handle;
@@ -1160,15 +1162,11 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(115, "range_order_modifiers", {});
 		sink_handle.flight_server_epoch = deserializer.ReadProperty<string>(116, "flight_server_epoch");
 		sink_handle.query_id = deserializer.ReadProperty<string>(117, "query_id");
-		auto allow_insecure_flight =
-		    deserializer.ReadPropertyWithExplicitDefault<bool>(118, "allow_insecure_flight", false);
+		(void)deserializer.ReadPropertyWithExplicitDefault<bool>(118, "allow_insecure_flight", false);
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
-		flight_config.flight_bind_host = bind_host;
-		flight_config.flight_port = port;
 		flight_config.local_dirs = std::vector<std::string>(local_dirs.begin(), local_dirs.end());
 		flight_config.node_id = node_id;
-		flight_config.allow_insecure_flight = allow_insecure_flight;
 		auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
 		return make_uniq<PhysicalRemoteExchangeSink>(
 		    physical_plan, std::move(types), estimated_cardinality, std::move(exchange_id), num_partitions,
@@ -1179,7 +1177,9 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto exchange_id = deserializer.ReadProperty<string>(103, "shuffle_stage_id");
 		auto partition_indices = deserializer.ReadProperty<vector<idx_t>>(104, "partition_indices");
 		auto source_nodes = deserializer.ReadProperty<vector<string>>(105, "source_nodes");
-		auto location_template = deserializer.ReadProperty<string>(106, "flight_location_template");
+		// Older plans carried a driver-derived location template. Endpoint
+		// selection now comes exclusively from the producing worker.
+		(void)deserializer.ReadPropertyWithExplicitDefault<string>(106, "flight_location_template", "");
 		auto timeout_seconds = deserializer.ReadProperty<double>(107, "flight_timeout_seconds");
 		auto source_handle_partition_ids =
 		    deserializer.ReadPropertyWithDefault<vector<idx_t>>(108, "source_handle_partition_ids");
@@ -1198,23 +1198,28 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		if (!source_catalog_handles_explicit) {
 			throw SerializationException("remote exchange source requires explicit catalog handles");
 		}
-		auto allow_insecure_flight =
-		    deserializer.ReadPropertyWithExplicitDefault<bool>(117, "allow_insecure_flight", false);
+		(void)deserializer.ReadPropertyWithExplicitDefault<bool>(117, "allow_insecure_flight", false);
+		auto source_handle_flight_hosts =
+		    deserializer.ReadPropertyWithDefault<vector<string>>(118, "source_handle_flight_hosts");
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.node_id = distributed::ResolveFlightExchangeNodeIdFromEnv();
-		flight_config.flight_location_template = location_template;
 		flight_config.flight_timeout_seconds = timeout_seconds;
 		flight_config.expected_types = types;
 		flight_config.local_dirs = std::vector<std::string>(local_dirs.begin(), local_dirs.end());
-		flight_config.allow_insecure_flight = allow_insecure_flight;
 		auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
 		std::vector<distributed::ExchangeSourceHandle> source_handles;
+		if (source_handle_flight_hosts.empty()) {
+			// Compatibility for source handles serialized before advertised
+			// hosts were separated from worker identity.
+			source_handle_flight_hosts = source_handle_node_ids;
+		}
 		if (source_handle_partition_ids.size() != source_handle_node_ids.size() ||
 		    source_handle_partition_ids.size() != source_handle_paths.size() ||
 		    source_handle_partition_ids.size() != source_handle_flight_ports.size() ||
 		    source_handle_partition_ids.size() != source_handle_attempt_ids.size() ||
-		    source_handle_partition_ids.size() != source_handle_flight_server_epochs.size()) {
+		    source_handle_partition_ids.size() != source_handle_flight_server_epochs.size() ||
+		    source_handle_partition_ids.size() != source_handle_flight_hosts.size()) {
 			throw SerializationException("remote exchange source handle metadata is inconsistent");
 		}
 		source_handles.reserve(source_handle_partition_ids.size());
@@ -1223,6 +1228,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 			sh.partition_id = source_handle_partition_ids[i];
 			sh.attempt_id = source_handle_attempt_ids[i];
 			sh.node_id = source_handle_node_ids[i];
+			sh.flight_host = source_handle_flight_hosts[i];
 			sh.flight_port = source_handle_flight_ports[i];
 			sh.flight_server_epoch = source_handle_flight_server_epochs[i];
 			distributed::ExchangeSourceFile file;

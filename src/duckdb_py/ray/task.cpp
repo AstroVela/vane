@@ -129,6 +129,9 @@ bool ParseExchangeSinkInstanceObject(py::object obj, duckdb::distributed::Exchan
 	if (d.contains("flight_server_epoch")) {
 		out.flight_server_epoch = py::str(d["flight_server_epoch"]).cast<string>();
 	}
+	if (d.contains("flight_host")) {
+		out.flight_host = py::str(d["flight_host"]).cast<string>();
+	}
 	if (d.contains("query_id")) {
 		out.query_id = py::str(d["query_id"]).cast<string>();
 	}
@@ -1259,6 +1262,9 @@ py::object RayWorkerTask::ExchangeSinkInstance() const {
 	result["query_id"] = instance.query_id;
 	if (!instance.flight_server_epoch.empty()) {
 		result["flight_server_epoch"] = instance.flight_server_epoch;
+	}
+	if (!instance.flight_host.empty()) {
+		result["flight_host"] = instance.flight_host;
 	}
 	if (!instance.output_location.empty()) {
 		result["output_location"] = instance.output_location;
