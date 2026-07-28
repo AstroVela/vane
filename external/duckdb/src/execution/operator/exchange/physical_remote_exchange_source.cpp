@@ -350,6 +350,7 @@ void PhysicalRemoteExchangeSource::SerializeOperatorData(Serializer &serializer)
 	serializer.WriteProperty(114, "local_dirs", local_dirs);
 	serializer.WriteProperty(115, "source_handle_flight_server_epochs", handle_flight_server_epochs);
 	serializer.WriteProperty(116, "source_catalog_handles_explicit", true);
+	serializer.WritePropertyWithDefault(117, "allow_insecure_flight", flight_config.allow_insecure_flight, false);
 }
 
 } // namespace duckdb

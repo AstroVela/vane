@@ -32,6 +32,9 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 
 ### Security
 
+- Disabled plaintext Arrow Flight transport by default. Cross-worker local-disk
+  shuffle now requires the explicit `allow_insecure_flight` development opt-in,
+  while same-process and object-storage shuffle remain network-free by default.
 - Documented the trust boundaries around Python UDFs, Ray workers, credentials, native parsers, and remote model code.
 - Redacted AI provider credentials from descriptor and provider-option `repr`,
   logs, exception formatting, and assertion diffs; plaintext is revealed only at

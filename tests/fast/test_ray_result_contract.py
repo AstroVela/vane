@@ -4686,8 +4686,26 @@ def test_describe_native_progress_materializes_deferred_clone_without_execution(
     assert scan_pipeline["input_rows"] == 10
 
 
-def test_remote_exchange_sink_accepts_nested_query_id_without_result_collector(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("allow_insecure_flight", "publishes_flight_endpoint"),
+    [(None, False), ("1", True)],
+    ids=["secure-default", "explicit-insecure-opt-in"],
+)
+def test_remote_exchange_sink_accepts_nested_query_id_without_result_collector(
+    tmp_path,
+    monkeypatch,
+    request,
+    allow_insecure_flight,
+    publishes_flight_endpoint,
+):
     import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    duckdb.ray_cxx.shutdown_local_flight_service()
+    request.addfinalizer(duckdb.ray_cxx.shutdown_local_flight_service)
+    if allow_insecure_flight is None:
+        monkeypatch.delenv("VANE_ALLOW_INSECURE_FLIGHT", raising=False)
+    else:
+        monkeypatch.setenv("VANE_ALLOW_INSECURE_FLIGHT", allow_insecure_flight)
 
     class _CapturingWorker:
         def __init__(self):
@@ -4772,6 +4790,10 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_result_collector(t
 
     assert sink_topologies
     assert len(sink_results) == len(sink_topologies)
+    if publishes_flight_endpoint:
+        assert all(result.flight_port > 0 for result in sink_results)
+    else:
+        assert all(result.flight_port == 0 for result in sink_results)
     assert all(
         "RESULT_COLLECTOR" not in pipeline["operators"]
         for topology in sink_topologies

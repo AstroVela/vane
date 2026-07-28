@@ -16,7 +16,9 @@
 #include "duckdb/execution/distributed/exchange/flight_server.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache_registry.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 
 #include <string>
@@ -43,6 +45,7 @@ namespace distributed {
 struct FlightExchangeConfig {
 	std::string flight_bind_host = "0.0.0.0";
 	int flight_port = 0;
+	bool allow_insecure_flight = false;
 	std::vector<std::string> local_dirs; // shuffle directories for IPC files
 	std::string node_id;
 	std::string flight_location_template;
@@ -65,6 +68,22 @@ inline int ResolveFlightExchangeEnvInt(const char *name, int fallback) {
 	} catch (...) {
 		return fallback;
 	}
+}
+
+inline bool ResolveAllowInsecureFlightFromEnv() {
+	auto value = ResolveFlightExchangeEnvString("VANE_ALLOW_INSECURE_FLIGHT");
+	if (value.empty()) {
+		return false;
+	}
+	StringUtil::Trim(value);
+	value = StringUtil::Lower(value);
+	if (value == "1" || value == "true") {
+		return true;
+	}
+	if (value == "0" || value == "false") {
+		return false;
+	}
+	throw InvalidInputException("VANE_ALLOW_INSECURE_FLIGHT must be '0', '1', 'false', or 'true'");
 }
 
 inline std::string FlightExchangeJoinPath(const std::string &base, const std::string &child) {
@@ -175,6 +194,7 @@ inline std::string ResolveFlightExchangeNodeIdFromEnv() {
 
 inline FlightExchangeConfig ResolveFlightExchangeConfigFromEnv() {
 	FlightExchangeConfig config;
+	config.allow_insecure_flight = ResolveAllowInsecureFlightFromEnv();
 	config.node_id = ResolveFlightExchangeNodeIdFromEnv();
 	config.local_dirs = ResolveFlightExchangeLocalDirsFromEnv();
 	config.flight_bind_host = "0.0.0.0";
@@ -302,6 +322,8 @@ public:
 
 	static int GetLocalFlightServerPort();
 	static std::string GetLocalFlightServerEpoch();
+	int GetPublishedFlightServerPort() const;
+	std::string GetPublishedFlightServerEpoch() const;
 	static DuckDBResult<void> EnsureLocalFlightServerStarted(const FlightExchangeConfig &config);
 	static DuckDBResult<void> ShutdownLocalFlightServer();
 

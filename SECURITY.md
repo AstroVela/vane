@@ -22,10 +22,25 @@ Several Vane features intentionally execute code. Treat these boundaries explici
 
 - Python UDFs and Cloudpickle payloads can execute arbitrary Python in the driver or Ray workers. Never deserialize or run a callable from an untrusted source.
 - A Ray cluster is part of the trusted computing base. Use Ray authentication, network isolation, least-privilege identities, and compatible package versions on every node.
+- Cross-worker local-disk shuffle uses plaintext Arrow Flight when explicitly enabled. It provides neither transport encryption nor client authentication.
 - Model repositories can contain executable custom code. Keep remote-code loading disabled unless a trusted model specifically requires it, and pin reviewed model revisions.
 - API keys and cloud credentials may be propagated to workers. Prefer short-lived, scoped credentials and secret managers; never place secrets in SQL text, logs, source files, or benchmark output.
 - Image, video, audio, document, Parquet, Arrow, and compressed inputs reach native parsers. Process hostile inputs in isolated workers with resource limits.
 - SQL can consume unbounded CPU, memory, storage, network, or model tokens. Multi-tenant deployments need admission control, quotas, and cancellation outside Vane's current defaults.
+
+## Plaintext Flight transport
+
+Vane disables its plaintext Arrow Flight listener and remote client path by default. Same-process local-disk shuffle continues through the in-process registry, and object-storage shuffle continues through committed manifests without opening a listener. A cross-worker local-disk shuffle fails before creating a network client.
+
+For a trusted development network only, opt in before creating any Ray workers:
+
+```python
+import vane
+
+vane.configure(allow_insecure_flight=True)
+```
+
+The equivalent environment setting is `VANE_ALLOW_INSECURE_FLIGHT=1`. Existing Ray workers are not dynamically reconfigured, and setting `DUCKDB_FLIGHT_PORT` alone does not authorize network transport. The opt-in retains the current `0.0.0.0` plaintext `grpc://` behavior; it is not a substitute for TLS, authentication, authorization, or network isolation.
 
 ## Secure deployment baseline
 

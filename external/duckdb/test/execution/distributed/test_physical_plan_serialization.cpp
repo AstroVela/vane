@@ -53,6 +53,7 @@
 
 #include <memory>
 #include <iostream>
+#include <cstdlib>
 
 using namespace duckdb;
 
@@ -127,6 +128,105 @@ TableFunction MakeTestInOutFunction() {
 	func.serialize = TestInOutSerialize;
 	func.deserialize = TestInOutDeserialize;
 	return func;
+}
+
+void SetSerializationTestEnv(const string &name, const string &value) {
+#if defined(_WIN32)
+	_putenv_s(name.c_str(), value.c_str());
+#else
+	setenv(name.c_str(), value.c_str(), 1);
+#endif
+}
+
+void UnsetSerializationTestEnv(const string &name) {
+#if defined(_WIN32)
+	_putenv_s(name.c_str(), "");
+#else
+	unsetenv(name.c_str());
+#endif
+}
+
+class ScopedSerializationTestEnv {
+public:
+	ScopedSerializationTestEnv(string name, string value) : name_(std::move(name)) {
+		const auto *existing = std::getenv(name_.c_str());
+		if (existing) {
+			had_value_ = true;
+			old_value_ = existing;
+		}
+		SetSerializationTestEnv(name_, value);
+	}
+
+	~ScopedSerializationTestEnv() {
+		if (had_value_) {
+			SetSerializationTestEnv(name_, old_value_);
+		} else {
+			UnsetSerializationTestEnv(name_);
+		}
+	}
+
+private:
+	string name_;
+	string old_value_;
+	bool had_value_ = false;
+};
+
+void SerializeLegacyRemoteExchangeSink(Serializer &serializer) {
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	vector<unique_ptr<Expression>> partition_by;
+	vector<string> local_dirs = {"/legacy/local"};
+	vector<string> range_boundaries;
+	vector<string> range_order_modifiers;
+	serializer.WriteProperty(100, "type", PhysicalOperatorType::EXCHANGE_SINK);
+	serializer.WriteProperty(101, "types", types);
+	serializer.WriteProperty<idx_t>(102, "estimated_cardinality", 0);
+	serializer.WriteProperty(103, "shuffle_stage_id", string("legacy-sink"));
+	serializer.WriteProperty(104, "node_id", string("legacy-node"));
+	serializer.WriteProperty<idx_t>(105, "num_partitions", 1);
+	serializer.WriteProperty<uint8_t>(106, "repartition_type", static_cast<uint8_t>(RepartitionSpec::Type::Random));
+	serializer.WriteProperty(107, "partition_by", partition_by);
+	serializer.WriteProperty(108, "local_dirs", local_dirs);
+	serializer.WriteProperty(109, "flight_bind_host", string("0.0.0.0"));
+	serializer.WriteProperty<int>(110, "flight_port", 31337);
+	serializer.WriteProperty<idx_t>(111, "sink_task_partition_id", 0);
+	serializer.WriteProperty<idx_t>(112, "sink_attempt_id", 0);
+	serializer.WriteProperty(113, "sink_output_location", string("legacy-sink-attempt"));
+	serializer.WriteProperty(114, "range_boundaries", range_boundaries);
+	serializer.WriteProperty(115, "range_order_modifiers", range_order_modifiers);
+	serializer.WriteProperty(116, "flight_server_epoch", string());
+	serializer.WriteProperty(117, "query_id", string("legacy-query"));
+	serializer.WriteList(198, "children", 0, [](Serializer::List &, idx_t) {});
+}
+
+void SerializeLegacyRemoteExchangeSource(Serializer &serializer) {
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	vector<idx_t> partition_indices;
+	vector<string> source_nodes;
+	vector<idx_t> handle_partition_ids;
+	vector<string> handle_node_ids;
+	vector<string> handle_paths;
+	vector<int> handle_flight_ports;
+	vector<idx_t> handle_attempt_ids;
+	vector<string> local_dirs = {"/legacy/local"};
+	vector<string> handle_server_epochs;
+	serializer.WriteProperty(100, "type", PhysicalOperatorType::EXCHANGE_SOURCE);
+	serializer.WriteProperty(101, "types", types);
+	serializer.WriteProperty<idx_t>(102, "estimated_cardinality", 0);
+	serializer.WriteProperty(103, "shuffle_stage_id", string("legacy-source"));
+	serializer.WriteProperty(104, "partition_indices", partition_indices);
+	serializer.WriteProperty(105, "source_nodes", source_nodes);
+	serializer.WriteProperty(106, "flight_location_template", string("grpc://{node}:31337"));
+	serializer.WriteProperty<double>(107, "flight_timeout_seconds", 0);
+	serializer.WriteProperty(108, "source_handle_partition_ids", handle_partition_ids);
+	serializer.WriteProperty(109, "source_handle_node_ids", handle_node_ids);
+	serializer.WriteProperty(110, "source_handle_paths", handle_paths);
+	serializer.WriteProperty(111, "source_handle_flight_ports", handle_flight_ports);
+	serializer.WritePropertyWithDefault(112, "runtime_source_node_id", optional_idx(), optional_idx());
+	serializer.WriteProperty(113, "source_handle_attempt_ids", handle_attempt_ids);
+	serializer.WriteProperty(114, "local_dirs", local_dirs);
+	serializer.WriteProperty(115, "source_handle_flight_server_epochs", handle_server_epochs);
+	serializer.WriteProperty(116, "source_catalog_handles_explicit", true);
+	serializer.WriteList(198, "children", 0, [](Serializer::List &, idx_t) {});
 }
 
 } // namespace
@@ -1129,6 +1229,7 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	flight_config.local_dirs = {"/session-a/shuffle-0", "/session-a/shuffle-1"};
 	flight_config.flight_bind_host = "127.0.0.2";
 	flight_config.flight_port = 4242;
+	flight_config.allow_insecure_flight = true;
 	auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
 
 	vector<unique_ptr<Expression>> partition_by;
@@ -1167,6 +1268,7 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	REQUIRE(roundtrip_manager->config().local_dirs == expected_local_dirs);
 	REQUIRE(roundtrip_manager->config().flight_bind_host == "127.0.0.2");
 	REQUIRE(roundtrip_manager->config().flight_port == 4242);
+	REQUIRE(roundtrip_manager->config().allow_insecure_flight);
 }
 
 TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
@@ -1287,6 +1389,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	flight_config.node_id = "node-1";
 	flight_config.flight_location_template = "grpc://{node}:6123";
 	flight_config.flight_timeout_seconds = 7.5;
+	flight_config.allow_insecure_flight = true;
 	auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
 
 	auto &source = plan.Make<PhysicalRemoteExchangeSource>(types, 456, "shuffle_stage", partition_indices,
@@ -1335,6 +1438,56 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	REQUIRE(roundtrip_manager != nullptr);
 	REQUIRE(roundtrip_manager->config().flight_location_template == "grpc://{node}:6123");
 	REQUIRE(roundtrip_manager->config().flight_timeout_seconds == 7.5);
+	REQUIRE(roundtrip_manager->config().allow_insecure_flight);
+}
+
+TEST_CASE("Legacy remote exchange payloads default insecure Flight to disabled",
+          "[serialization][physical_plan][exchange][security]") {
+	ScopedSerializationTestEnv worker_opt_in("VANE_ALLOW_INSECURE_FLIGHT", "1");
+
+	{
+		Allocator allocator;
+		PhysicalPlan plan(allocator);
+		MemoryStream stream(allocator);
+		SerializationOptions options;
+		BinarySerializer serializer(stream, options);
+		serializer.Begin();
+		SerializeLegacyRemoteExchangeSink(serializer);
+		serializer.End();
+
+		stream.Rewind();
+		BinaryDeserializer deserializer(stream);
+		deserializer.Begin();
+		auto deserialized_op = PhysicalOperator::Deserialize(deserializer, plan);
+		deserializer.End();
+		auto *sink = dynamic_cast<PhysicalRemoteExchangeSink *>(deserialized_op.get());
+		REQUIRE(sink != nullptr);
+		auto manager = std::dynamic_pointer_cast<distributed::FlightExchangeManager>(sink->GetExchangeManager());
+		REQUIRE(manager != nullptr);
+		REQUIRE_FALSE(manager->config().allow_insecure_flight);
+	}
+
+	{
+		Allocator allocator;
+		PhysicalPlan plan(allocator);
+		MemoryStream stream(allocator);
+		SerializationOptions options;
+		BinarySerializer serializer(stream, options);
+		serializer.Begin();
+		SerializeLegacyRemoteExchangeSource(serializer);
+		serializer.End();
+
+		stream.Rewind();
+		BinaryDeserializer deserializer(stream);
+		deserializer.Begin();
+		auto deserialized_op = PhysicalOperator::Deserialize(deserializer, plan);
+		deserializer.End();
+		auto *source = dynamic_cast<PhysicalRemoteExchangeSource *>(deserialized_op.get());
+		REQUIRE(source != nullptr);
+		auto manager = std::dynamic_pointer_cast<distributed::FlightExchangeManager>(source->GetExchangeManager());
+		REQUIRE(manager != nullptr);
+		REQUIRE_FALSE(manager->config().allow_insecure_flight);
+	}
 }
 
 TEST_CASE("PhysicalRemoteExchangeSource serialization preserves runtime source binding node id",
@@ -1375,6 +1528,10 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves runtime source b
 	REQUIRE(source_ptr->SourceHandles().empty());
 	REQUIRE(source_ptr->RuntimeSourceNodeId().IsValid());
 	REQUIRE(source_ptr->RuntimeSourceNodeId().GetIndex() == 42);
+	auto roundtrip_manager =
+	    std::dynamic_pointer_cast<distributed::FlightExchangeManager>(source_ptr->GetExchangeManager());
+	REQUIRE(roundtrip_manager != nullptr);
+	REQUIRE_FALSE(roundtrip_manager->config().allow_insecure_flight);
 }
 
 TEST_CASE("PhysicalRemoteExchangeSource serialization preserves an explicit empty catalog",

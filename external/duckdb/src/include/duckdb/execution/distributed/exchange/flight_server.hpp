@@ -16,6 +16,7 @@ struct FlightServerConfig {
 	std::string bind_host;
 	int port = 0;
 	std::string server_epoch;
+	bool allow_insecure_flight = false;
 };
 
 class FlightServer {

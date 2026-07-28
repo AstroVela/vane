@@ -776,6 +776,7 @@ TEST_CASE("Exchange: Flight service isolates published attempts and rejects rele
 	server_config.bind_host = "127.0.0.1";
 	server_config.port = 0;
 	server_config.server_epoch = epoch;
+	server_config.allow_insecure_flight = true;
 	FlightServer server(std::move(server_config));
 	REQUIRE(server.Start().is_ok());
 	FlightClientConfig client_config;
@@ -820,6 +821,20 @@ TEST_CASE("Exchange: Flight service isolates published attempts and rejects rele
 	REQUIRE(server.Stop().is_ok());
 	registry.RemoveForDeferredCleanup(exchange_b);
 	registry.RemoveAndCleanupByPrefix(prefix);
+}
+
+TEST_CASE("Exchange: Flight server refuses plaintext transport without explicit opt-in",
+          "[distributed][exchange][security]") {
+	FlightServerConfig server_config;
+	server_config.bind_host = "127.0.0.1";
+	server_config.port = 0;
+	server_config.server_epoch = "disabled-flight-server-epoch";
+	FlightServer server(std::move(server_config));
+
+	auto start_result = server.Start();
+	REQUIRE(start_result.is_err());
+	REQUIRE_THAT(start_result.error().what(), Catch::Matchers::Contains("disabled by default"));
+	REQUIRE(server.port() == 0);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1074,10 +1089,99 @@ TEST_CASE("Exchange: ShuffleCache write to multiple partitions", "[distributed][
 // FlightExchangeManager
 // ═══════════════════════════════════════════════════════════
 
+TEST_CASE("Exchange: local-disk sink stays process-local unless insecure Flight is explicitly enabled",
+          "[distributed][exchange][security]") {
+	REQUIRE(FlightExchangeManager::ShutdownLocalFlightServer().is_ok());
+	ScopedEnvVar allow_insecure_flight("VANE_ALLOW_INSECURE_FLIGHT", "");
+	ScopedEnvVar configured_port("DUCKDB_FLIGHT_PORT", "4242");
+	ScopedEnvVar worker_id("VANE_WORKER_ID", "process-local-node");
+	auto config = ResolveFlightExchangeConfigFromEnv();
+	config.local_dirs = {TestCreatePath("exchange_process_local_default")};
+
+	REQUIRE_FALSE(config.allow_insecure_flight);
+	REQUIRE(config.flight_port == 4242);
+
+	DuckDB db(nullptr);
+	Connection conn(db);
+	FlightExchangeManager manager(config, conn.context.get());
+	ExchangeContext exchange_context;
+	exchange_context.query_id = "process-local-default-query";
+	exchange_context.exchange_id = "process-local-default-stage";
+	auto exchange = manager.CreateExchange(exchange_context, 1);
+	auto instance = exchange->InstantiateSink(exchange->AddSink(0), 0);
+	auto sink = manager.CreateSink(instance);
+	REQUIRE(sink != nullptr);
+	REQUIRE(manager.GetPublishedFlightServerPort() == 0);
+	REQUIRE(manager.GetPublishedFlightServerEpoch().empty());
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerPort() == 0);
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerEpoch().empty());
+
+	REQUIRE(sink->EnsureSchema(*conn.context, {LogicalType::INTEGER}, {"value"}).is_ok());
+	DataChunk input;
+	input.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
+	input.SetCardinality(1);
+	input.SetValue(0, 0, Value::INTEGER(57));
+	REQUIRE(sink->AddChunk(0, input).is_ok());
+	REQUIRE(sink->Finish().is_ok());
+	exchange->SinkFinished(instance, config.node_id, manager.GetPublishedFlightServerPort());
+	auto handles = exchange->GetSourceHandles();
+	REQUIRE(handles.size() == 1);
+	REQUIRE(handles[0].flight_port == 0);
+	REQUIRE(handles[0].flight_server_epoch.empty());
+
+	auto source = manager.CreateSource();
+	source->AddSourceHandles(handles);
+	DataChunk output;
+	output.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
+	REQUIRE(source->ReadChunk(output));
+	REQUIRE(output.size() == 1);
+	REQUIRE(output.GetValue(0, 0) == Value::INTEGER(57));
+	REQUIRE_FALSE(source->ReadChunk(output));
+	source->Close();
+	sink.reset();
+	exchange->Close();
+	auto cleanup = ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(exchange_context.query_id);
+	REQUIRE(cleanup.cleanup_errors == 0);
+	REQUIRE(cleanup.cleanup_pending == 0);
+	REQUIRE(ShuffleCacheRegistry::Instance().RetireQuery(exchange_context.query_id).is_ok());
+}
+
+TEST_CASE("Exchange: invalid insecure Flight environment value fails closed", "[distributed][exchange][security]") {
+	ScopedEnvVar allow_insecure_flight("VANE_ALLOW_INSECURE_FLIGHT", "enabled");
+	REQUIRE_THROWS_WITH(ResolveFlightExchangeConfigFromEnv(),
+	                    Catch::Matchers::Contains("VANE_ALLOW_INSECURE_FLIGHT must be"));
+}
+
+TEST_CASE("Exchange: remote local-disk source fails before connecting when insecure Flight is disabled",
+          "[distributed][exchange][security]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	FlightExchangeConfig config;
+	config.node_id = "reader-node";
+	config.local_dirs = {TestCreatePath("exchange_remote_disabled")};
+	config.expected_types = {LogicalType::INTEGER};
+	FlightExchangeSource source(config, conn.context.get());
+
+	ExchangeSourceHandle handle;
+	handle.partition_id = 0;
+	handle.attempt_id = 1;
+	handle.node_id = "unreachable.invalid";
+	handle.flight_port = 1;
+	handle.flight_server_epoch = "remote-epoch";
+	handle.files.push_back(ExchangeSourceFile("remote-disabled-attempt", 0));
+	source.AddSourceHandles({handle});
+
+	DataChunk output;
+	output.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
+	REQUIRE_THROWS_WITH(source.ReadChunk(output),
+	                    Catch::Matchers::Contains("vane.configure(allow_insecure_flight=True)"));
+}
+
 TEST_CASE("Exchange: FlightExchange coordinator lifecycle", "[distributed][exchange]") {
 	FlightExchangeConfig config;
 	config.node_id = "node_1";
 	config.local_dirs = {TestCreatePath("exchange_coordinator")};
+	config.allow_insecure_flight = true;
 
 	DuckDB db(nullptr);
 	Connection conn(db);
@@ -1234,6 +1338,7 @@ TEST_CASE("Exchange: FlightExchange accepts validated dynamically derived retry 
 	FlightExchangeConfig config;
 	config.node_id = "coordinator";
 	config.local_dirs = {TestCreatePath("exchange_dynamic_retry")};
+	config.allow_insecure_flight = true;
 	FlightExchangeManager manager(config, conn.context.get());
 	ExchangeContext ctx;
 	ctx.query_id = "dynamic-retry-query";
@@ -1278,6 +1383,8 @@ TEST_CASE("Exchange: process-local Flight service has immutable network config a
 	} guard;
 	REQUIRE(FlightExchangeManager::ShutdownLocalFlightServer().is_ok());
 
+	DuckDB db(nullptr);
+	Connection conn(db);
 	ExchangeSinkInstanceHandle handle;
 	handle.sink_handle.task_partition_id = 0;
 	handle.attempt_id = 0;
@@ -1293,13 +1400,57 @@ TEST_CASE("Exchange: process-local Flight service has immutable network config a
 	config_a.flight_bind_host = "127.0.0.1";
 	config_a.flight_port = 0;
 	config_a.local_dirs = {TestCreatePath("flight_service_lifecycle_a")};
-	FlightExchangeManager manager_a(config_a);
+	config_a.allow_insecure_flight = true;
+	FlightExchangeManager manager_a(config_a, conn.context.get());
 	auto sink_a = manager_a.CreateSink(handle);
 	REQUIRE(sink_a != nullptr);
 	const auto first_port = FlightExchangeManager::GetLocalFlightServerPort();
 	const auto first_epoch = FlightExchangeManager::GetLocalFlightServerEpoch();
 	REQUIRE(first_port > 0);
 	REQUIRE(!first_epoch.empty());
+	REQUIRE(manager_a.GetPublishedFlightServerPort() == first_port);
+	REQUIRE(manager_a.GetPublishedFlightServerEpoch() == first_epoch);
+
+	auto disabled_handle = handle;
+	disabled_handle.query_id = "service-disabled-query";
+	disabled_handle.output_location = "service_lifecycle__disabled__sink_0__attempt_0";
+	auto disabled_config = config_a;
+	disabled_config.allow_insecure_flight = false;
+	disabled_config.flight_bind_host = "0.0.0.0";
+	disabled_config.flight_port = first_port + 1;
+	disabled_config.local_dirs = {TestCreatePath("flight_service_lifecycle_disabled")};
+	FlightExchangeManager disabled_manager(disabled_config, conn.context.get());
+	auto disabled_sink = disabled_manager.CreateSink(disabled_handle);
+	REQUIRE(disabled_sink != nullptr);
+	REQUIRE(disabled_manager.GetPublishedFlightServerPort() == 0);
+	REQUIRE(disabled_manager.GetPublishedFlightServerEpoch().empty());
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerPort() == first_port);
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerEpoch() == first_epoch);
+	REQUIRE(disabled_sink->EnsureSchema(*conn.context, {LogicalType::INTEGER}, {"value"}).is_ok());
+	DataChunk disabled_chunk;
+	disabled_chunk.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
+	disabled_chunk.SetCardinality(1);
+	disabled_chunk.SetValue(0, 0, Value::INTEGER(57));
+	REQUIRE(disabled_sink->AddChunk(0, disabled_chunk).is_ok());
+	REQUIRE(disabled_sink->Finish().is_ok());
+
+	FlightClientConfig client_config;
+	client_config.location = "grpc://127.0.0.1:" + std::to_string(first_port);
+	FlightClient client(std::move(client_config));
+	FlightExchangeTicket disabled_ticket;
+	disabled_ticket.server_epoch = first_epoch;
+	disabled_ticket.exchange_instance_id = disabled_handle.output_location;
+	disabled_ticket.node_id = disabled_config.node_id;
+	disabled_ticket.attempt_id = disabled_handle.attempt_id;
+	disabled_ticket.partition_idx = 0;
+	auto disabled_fetch = client.FetchPartition(*conn.context, disabled_ticket, {LogicalType::INTEGER});
+	REQUIRE(disabled_fetch.is_err());
+	REQUIRE_THAT(disabled_fetch.error().what(), Catch::Matchers::Contains("server epoch is stale"));
+	disabled_sink.reset();
+	auto disabled_cleanup = ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(disabled_handle.query_id);
+	REQUIRE(disabled_cleanup.cleanup_errors == 0);
+	REQUIRE(disabled_cleanup.cleanup_pending == 0);
+	REQUIRE(ShuffleCacheRegistry::Instance().RetireQuery(disabled_handle.query_id).is_ok());
 
 	auto config_b = config_a;
 	config_b.local_dirs = {TestCreatePath("flight_service_lifecycle_b")};
@@ -1354,6 +1505,7 @@ TEST_CASE("Exchange: FlightExchange selects first successful sink attempt", "[di
 	config.node_id = "coordinator";
 	config.flight_port = 7777;
 	config.local_dirs = {TestCreatePath("exchange_selected_attempt")};
+	config.allow_insecure_flight = true;
 	FlightExchangeManager mgr(config, conn.context.get());
 
 	ExchangeContext ctx;
@@ -1829,6 +1981,7 @@ TEST_CASE("Exchange: FlightExchangeSource revalidates local handle attempt ident
 	FlightExchangeConfig source_config;
 	source_config.node_id = "node-local";
 	source_config.expected_types = {LogicalType::INTEGER};
+	source_config.allow_insecure_flight = true;
 	FlightExchangeSource source(source_config, &context);
 	source.AddSourceHandles({valid, invalid});
 

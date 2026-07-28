@@ -96,6 +96,10 @@ bool FlightExchangeUsesObjectStorage(const FlightExchangeConfig &config) {
 	return false;
 }
 
+bool FlightExchangePublishesInsecureEndpoint(const FlightExchangeConfig &config) {
+	return config.allow_insecure_flight && !config.local_dirs.empty() && !FlightExchangeUsesObjectStorage(config);
+}
+
 std::shared_ptr<ShuffleCache> MakeFlightExchangeShuffleCache(const ShuffleCacheConfig &cache_config,
                                                              const FlightExchangeConfig &exchange_config,
                                                              ClientContext *context) {
@@ -233,10 +237,7 @@ DuckDBResult<std::unique_ptr<arrow::flight::FlightClient>> ConnectFlightExchange
 }
 
 DuckDBResult<void> EnsureLocalFlightServerStartedInternal(const FlightExchangeConfig &config) {
-	if (config.local_dirs.empty()) {
-		return DuckDBResult<void>::ok();
-	}
-	if (FlightExchangeUsesObjectStorage(config)) {
+	if (!FlightExchangePublishesInsecureEndpoint(config)) {
 		return DuckDBResult<void>::ok();
 	}
 
@@ -257,6 +258,7 @@ DuckDBResult<void> EnsureLocalFlightServerStartedInternal(const FlightExchangeCo
 	server_config.bind_host = config.flight_bind_host;
 	server_config.port = config.flight_port;
 	server_config.server_epoch = UUID::ToString(UUID::GenerateRandomUUID());
+	server_config.allow_insecure_flight = config.allow_insecure_flight;
 	auto server = std::unique_ptr<FlightServer>(new FlightServer(server_config));
 	auto start_res = server->Start();
 	if (start_res.is_err()) {
@@ -392,6 +394,11 @@ void FlightExchange::SinkFinished(const ExchangeSinkInstanceHandle &instance, co
 	}
 	if (flight_port < 0) {
 		throw InvalidInputException("finished Flight sink port must be non-negative");
+	}
+	if (!FlightExchangePublishesInsecureEndpoint(config_) &&
+	    (flight_port > 0 || !instance.flight_server_epoch.empty())) {
+		throw InvalidInputException(
+		    "Flight sink cannot publish a plaintext endpoint unless this plan explicitly enables insecure Flight");
 	}
 	if (flight_port > 0 && node_id.empty()) {
 		throw InvalidInputException("finished Flight sink is missing its worker node id");
@@ -621,8 +628,11 @@ std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 			handle.partition_id = partition_id;
 			handle.attempt_id = attempt_id;
 			handle.node_id = attempt_metadata.node_id;
-			handle.flight_port = attempt_metadata.flight_port > 0 ? attempt_metadata.flight_port : config_.flight_port;
-			handle.flight_server_epoch = attempt_metadata.flight_server_epoch;
+			if (FlightExchangePublishesInsecureEndpoint(config_)) {
+				handle.flight_port =
+				    attempt_metadata.flight_port > 0 ? attempt_metadata.flight_port : config_.flight_port;
+				handle.flight_server_epoch = attempt_metadata.flight_server_epoch;
+			}
 			handle.files.push_back(build_source_file(attempt_metadata, partition_id));
 			handles.push_back(std::move(handle));
 		}
@@ -830,7 +840,8 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 	// Object storage must be replayed from the durable manifest using this
 	// task's ClientContext/FileOpener, not the sink task's registry cache.
 	if (!uses_object_storage && source_node_id == config_.node_id) {
-		auto cache_res = ShuffleCacheRegistry::Instance().Resolve(output_location, handle.flight_server_epoch,
+		auto expected_server_epoch = config_.allow_insecure_flight ? handle.flight_server_epoch : std::string();
+		auto cache_res = ShuffleCacheRegistry::Instance().Resolve(output_location, expected_server_epoch,
 		                                                          source_node_id, handle.attempt_id);
 		if (cache_res.is_ok()) {
 			auto resolved_cache = std::move(cache_res.value());
@@ -867,6 +878,12 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 		    "object-storage FlightExchange source failed to replay committed manifest for exchange_id=" +
 		    output_location + " source_node_id=" + source_node_id + " partition=" + std::to_string(partition_id) +
 		    ": " + files_res.error().what()));
+	}
+	if (!config_.allow_insecure_flight) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(DuckDBError::invalid_state_error(
+		    "Remote local-disk shuffle requires insecure plaintext Flight transport, which is disabled by default. "
+		    "Set VANE_ALLOW_INSECURE_FLIGHT=1 or call vane.configure(allow_insecure_flight=True) before creating Ray "
+		    "workers, and use it only in a trusted development environment."));
 	}
 	if (handle.flight_server_epoch.empty()) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
@@ -1098,7 +1115,7 @@ std::unique_ptr<ExchangeSink> FlightExchangeManager::CreateSink(const ExchangeSi
 		throw std::runtime_error(server_res.error().what());
 	}
 	auto sink_handle = handle;
-	sink_handle.flight_server_epoch = GetLocalFlightServerEpoch();
+	sink_handle.flight_server_epoch = GetPublishedFlightServerEpoch();
 	auto shuffle_cache = MakeFlightExchangeShuffleCache(cache_config, config_, context_);
 	return std::unique_ptr<ExchangeSink>(new FlightExchangeSink(shuffle_cache, sink_handle, context_));
 }
@@ -1113,6 +1130,20 @@ int FlightExchangeManager::GetLocalFlightServerPort() {
 }
 
 std::string FlightExchangeManager::GetLocalFlightServerEpoch() {
+	return CurrentLocalFlightServerEpoch();
+}
+
+int FlightExchangeManager::GetPublishedFlightServerPort() const {
+	if (!FlightExchangePublishesInsecureEndpoint(config_)) {
+		return 0;
+	}
+	return CurrentLocalFlightServerPort();
+}
+
+std::string FlightExchangeManager::GetPublishedFlightServerEpoch() const {
+	if (!FlightExchangePublishesInsecureEndpoint(config_)) {
+		return std::string();
+	}
 	return CurrentLocalFlightServerEpoch();
 }
 

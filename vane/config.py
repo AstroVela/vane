@@ -79,6 +79,8 @@ def configure(**kw: Any) -> VaneConfig:
         if runner not in _PUBLIC_RUNNER_VALUES:
             raise ValueError(_PUBLIC_RUNNER_ERROR)
         kw["runner"] = runner
+    if "allow_insecure_flight" in kw and type(kw["allow_insecure_flight"]) is not bool:
+        raise ValueError("allow_insecure_flight must be a bool")
     cfg = VaneConfig(**kw)  # type: ignore[call-arg]
     # Apply only the explicitly passed keys (not defaults)
     env.set(**kw)

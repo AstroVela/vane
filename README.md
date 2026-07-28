@@ -97,6 +97,19 @@ import vane
 vane.configure(runner="local")
 ```
 
+### Distributed Flight Transport
+
+Plaintext Arrow Flight is disabled by default. Same-process local-disk shuffle and object-storage shuffle do not require a listener. Cross-worker local-disk shuffle is available only as an explicit escape hatch for trusted development environments:
+
+```python
+import vane
+
+vane.configure(allow_insecure_flight=True)
+# Create Ray workers only after applying this setting.
+```
+
+Alternatively, set `VANE_ALLOW_INSECURE_FLIGHT=1` before creating Ray workers. Existing workers are not dynamically reconfigured, and `DUCKDB_FLIGHT_PORT` alone does not enable transport. The opt-in keeps the current plaintext `grpc://` listener on `0.0.0.0`; it does not provide TLS, authentication, or authorization. See [SECURITY.md](SECURITY.md) for the trust boundary.
+
 ### More Resources
 
 - [Examples](https://vane.astrovela.ai/docs/data/examples)
