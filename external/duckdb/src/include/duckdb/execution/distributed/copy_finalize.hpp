@@ -38,6 +38,25 @@ inline idx_t DistributedCopyElapsedMillis(std::chrono::steady_clock::time_point 
 	return static_cast<idx_t>(value > max_value ? max_value : value);
 }
 
+inline bool DistributedCopyExceptionIsNotFound(const std::exception &ex) {
+	ErrorData error(ex);
+	const auto &extra_info = error.ExtraInfo();
+	auto http_status = extra_info.find("status_code");
+	if (http_status != extra_info.end() && http_status->second == "404") {
+		return true;
+	}
+	auto error_number = extra_info.find("errno");
+	if (error_number != extra_info.end() && error_number->second == std::to_string(ENOENT)) {
+		return true;
+	}
+
+	// pybind11 exposes fsspec FileNotFoundError only through the formatted
+	// exception text, without DuckDB errno/status metadata.
+	const std::string message = ex.what();
+	return StringUtil::StartsWith(message, "FileNotFoundError:") ||
+	       StringUtil::Contains(message, "\nFileNotFoundError:");
+}
+
 inline std::string ResolveDistributedCopyListedPath(FileSystem &fs, const std::string &directory,
                                                     const std::string &listed_path) {
 	if (listed_path.empty() || listed_path.find("://") != std::string::npos) {
@@ -56,6 +75,7 @@ inline std::string ResolveDistributedCopyListedPath(FileSystem &fs, const std::s
 		auto directory_suffix = directory.substr(protocol_end);
 		const bool preserve_root_separator = StringUtil::StartsWith(directory_suffix, separator);
 		trim_leading_separators(directory_suffix);
+		StringUtil::RTrim(directory_suffix, separator);
 
 		auto listed_suffix = listed_path;
 		const bool listed_path_is_rooted = StringUtil::StartsWith(listed_suffix, separator);
@@ -82,14 +102,22 @@ inline std::string ResolveDistributedCopyListedPath(FileSystem &fs, const std::s
 }
 
 inline void ListDistributedCopyFilesRecursive(FileSystem &fs, const std::string &dir, std::vector<std::string> &out) {
-	fs.ListFiles(dir, [&](const std::string &path, bool is_dir) {
-		auto full_path = ResolveDistributedCopyListedPath(fs, dir, path);
-		if (is_dir) {
-			ListDistributedCopyFilesRecursive(fs, full_path, out);
-		} else {
-			out.push_back(full_path);
+	bool saw_entry = false;
+	try {
+		fs.ListFiles(dir, [&](const std::string &path, bool is_dir) {
+			saw_entry = true;
+			auto full_path = ResolveDistributedCopyListedPath(fs, dir, path);
+			if (is_dir) {
+				ListDistributedCopyFilesRecursive(fs, full_path, out);
+			} else {
+				out.push_back(full_path);
+			}
+		});
+	} catch (const std::exception &ex) {
+		if (saw_entry || !DistributedCopyExceptionIsNotFound(ex)) {
+			throw;
 		}
-	});
+	}
 }
 
 inline void SortAndDeduplicateDistributedCopyPaths(std::vector<std::string> &paths) {
@@ -197,14 +225,7 @@ inline DuckDBResult<bool> CheckDistributedCopyFileExists(FileSystem &fs, const s
 			    DuckDBError::io_error("remote distributed COPY object check returned no file handle: " + path));
 		}
 	} catch (const std::exception &ex) {
-		ErrorData error(ex);
-		const auto &extra_info = error.ExtraInfo();
-		auto http_status = extra_info.find("status_code");
-		if (http_status != extra_info.end() && http_status->second == "404") {
-			return DuckDBResult<bool>::ok(false);
-		}
-		auto error_number = extra_info.find("errno");
-		if (error_number != extra_info.end() && error_number->second == std::to_string(ENOENT)) {
+		if (DistributedCopyExceptionIsNotFound(ex)) {
 			return DuckDBResult<bool>::ok(false);
 		}
 		return DuckDBResult<bool>::err(DuckDBError::io_error(
@@ -251,8 +272,14 @@ inline DuckDBResult<std::string> CanonicalDistributedCopyBasePath(FileSystem &fs
 			auto authority_end = canonical_base_path.find(separator, separator.size() * 2);
 			if (authority_end != std::string::npos) {
 				auto share_end = canonical_base_path.find(separator, authority_end + separator.size());
-				root_length =
-				    share_end == std::string::npos ? canonical_base_path.size() : share_end + separator.size();
+				auto share_start = authority_end + separator.size();
+				if (share_end == std::string::npos && share_start < canonical_base_path.size()) {
+					canonical_base_path += separator;
+					root_length = canonical_base_path.size();
+				} else {
+					root_length =
+					    share_end == std::string::npos ? canonical_base_path.size() : share_end + separator.size();
+				}
 			}
 		} else if (StringUtil::StartsWith(canonical_base_path, separator)) {
 			root_length = separator.size();
@@ -897,10 +924,12 @@ inline bool DistributedCopyPathIsInDirectory(const std::string &path, const std:
 	if (path.empty() || directory.empty()) {
 		return false;
 	}
-	auto normalized_directory = directory;
-	StringUtil::RTrim(normalized_directory, separator);
-	if (normalized_directory.empty()) {
-		return false;
+	auto normalized_directory = NormalizeCopyDirectWriteRoot(directory, separator);
+	if (separator.empty()) {
+		return path == normalized_directory;
+	}
+	if (StringUtil::EndsWith(normalized_directory, separator)) {
+		return StringUtil::StartsWith(path, normalized_directory);
 	}
 	return path == normalized_directory || StringUtil::StartsWith(path, normalized_directory + separator);
 }

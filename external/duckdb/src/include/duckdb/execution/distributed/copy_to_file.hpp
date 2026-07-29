@@ -125,31 +125,56 @@ inline bool CopySpecNeedsDirectory(const DistributedCopySpec &spec) {
 	return spec.partition_output || spec.per_thread_output || spec.rotate;
 }
 
-inline std::string BuildCopyDirectWriteRunDirectory(const std::string &base_path, const std::string &run_id,
-                                                    const std::string &separator = "/") {
+inline std::string NormalizeCopyDirectWriteRoot(const std::string &base_path, const std::string &separator) {
+	if (base_path.empty()) {
+		return ".";
+	}
+	if (separator.empty()) {
+		return base_path;
+	}
+
 	auto root = base_path;
 	StringUtil::RTrim(root, separator);
 	if (root.empty()) {
-		root = ".";
+		return separator;
 	}
+
+	auto protocol = base_path.find("://");
+	if (protocol != std::string::npos) {
+		auto authority_end = base_path.find(separator, protocol + 3);
+		if (authority_end != std::string::npos && root.size() <= authority_end) {
+			return base_path.substr(0, authority_end + separator.size());
+		}
+	}
+	return root;
+}
+
+inline std::string BuildCopyPathUnderRoot(const std::string &root, const std::string &name,
+                                          const std::string &separator) {
+	if (separator.empty() || StringUtil::EndsWith(root, separator)) {
+		return root + name;
+	}
+	return root + separator + name;
+}
+
+inline std::string BuildCopyDirectWriteRunDirectory(const std::string &base_path, const std::string &run_id,
+                                                    const std::string &separator = "/") {
+	auto root = NormalizeCopyDirectWriteRoot(base_path, separator);
 	if (run_id.empty()) {
 		return root;
 	}
-	return root + separator + DISTRIBUTED_COPY_DIRECT_WRITE_RUN_PREFIX + run_id;
+	return BuildCopyPathUnderRoot(root, DISTRIBUTED_COPY_DIRECT_WRITE_RUN_PREFIX + run_id, separator);
 }
 
 inline std::string BuildCopyDirectWriteTaskDirectory(const std::string &base_path, const std::string &run_id,
                                                      const std::string &worker_dir_name,
                                                      const std::string &separator = "/") {
 	if (run_id.empty()) {
-		auto root = base_path;
-		StringUtil::RTrim(root, separator);
-		if (root.empty()) {
-			root = ".";
-		}
-		return root + separator + worker_dir_name;
+		auto root = NormalizeCopyDirectWriteRoot(base_path, separator);
+		return BuildCopyPathUnderRoot(root, worker_dir_name, separator);
 	}
-	return BuildCopyDirectWriteRunDirectory(base_path, run_id, separator) + separator + worker_dir_name;
+	auto run_directory = BuildCopyDirectWriteRunDirectory(base_path, run_id, separator);
+	return BuildCopyPathUnderRoot(run_directory, worker_dir_name, separator);
 }
 
 inline std::string BuildCopyDirectTargetFileName(const std::string &run_id, const std::string &worker_dir_name,
@@ -160,12 +185,8 @@ inline std::string BuildCopyDirectTargetFileName(const std::string &run_id, cons
 inline std::string BuildCopyDirectTargetFilePath(const std::string &base_path, const std::string &run_id,
                                                  const std::string &worker_dir_name, const std::string &file_name,
                                                  const std::string &separator = "/") {
-	auto root = base_path;
-	StringUtil::RTrim(root, separator);
-	if (root.empty()) {
-		root = ".";
-	}
-	return root + separator + BuildCopyDirectTargetFileName(run_id, worker_dir_name, file_name);
+	auto root = NormalizeCopyDirectWriteRoot(base_path, separator);
+	return BuildCopyPathUnderRoot(root, BuildCopyDirectTargetFileName(run_id, worker_dir_name, file_name), separator);
 }
 
 inline std::string BuildCopyDirectTargetFilenamePattern(const std::string &run_id, const std::string &worker_dir_name) {

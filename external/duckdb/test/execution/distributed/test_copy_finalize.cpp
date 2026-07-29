@@ -76,6 +76,43 @@ private:
 	std::unordered_map<string, idx_t> list_calls;
 };
 
+class MissingPrefixFileOnlyRecursiveListFileSystem : public FileOnlyRecursiveListFileSystem {
+public:
+	explicit MissingPrefixFileOnlyRecursiveListFileSystem(string missing_prefix)
+	    : missing_prefix(std::move(missing_prefix)) {
+	}
+
+	bool ListFiles(const string &directory, const std::function<void(const string &, bool)> &callback,
+	               FileOpener *opener = nullptr) override {
+		if (directory == missing_prefix) {
+			throw IOException({{"errno", std::to_string(ENOENT)}}, "injected missing prefix");
+		}
+		return FileOnlyRecursiveListFileSystem::ListFiles(directory, callback, opener);
+	}
+
+private:
+	string missing_prefix;
+};
+
+class ErrnoListFileSystem : public LocalFileSystem {
+public:
+	explicit ErrnoListFileSystem(int error_number, bool emit_entry = false)
+	    : error_number(error_number), emit_entry(emit_entry) {
+	}
+
+	bool ListFiles(const string &, const std::function<void(const string &, bool)> &callback,
+	               FileOpener * = nullptr) override {
+		if (emit_entry) {
+			callback("partial", false);
+		}
+		throw IOException({{"errno", std::to_string(error_number)}}, "injected list failure");
+	}
+
+private:
+	int error_number;
+	bool emit_entry;
+};
+
 class MarkerCheckFailureFileSystem : public FileOnlyRecursiveListFileSystem {
 public:
 	explicit MarkerCheckFailureFileSystem(string marker_path) : marker_path(std::move(marker_path)) {
@@ -114,6 +151,18 @@ public:
 
 private:
 	string marker_path;
+};
+
+class WindowsPathFileSystem : public LocalFileSystem {
+public:
+	string PathSeparator(const string &) override {
+		return "\\";
+	}
+
+	bool IsPathAbsolute(const string &path) override {
+		return StringUtil::StartsWith(path, "\\\\") ||
+		       (path.size() >= 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/'));
+	}
 };
 
 class RemoteMarkerStatusFileSystem : public LocalFileSystem {
@@ -212,6 +261,13 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	REQUIRE(root_res.value() == root);
 	auto root_paths = BuildDistributedCopyFinalizeCommitPaths(fs, root_res.value(), "run-root");
 	REQUIRE(root_paths.commit_dir == root + ".duckdb_commit" + root + "run-root");
+	auto root_run_dir = BuildCopyDirectWriteRunDirectory(root, "run-root", root);
+	REQUIRE(root_run_dir == root + "_vane_direct_write_run-root");
+	REQUIRE(BuildCopyDirectWriteTaskDirectory(root, "run-root", "w_0", root) == root_run_dir + root + "w_0");
+	auto root_direct_target = BuildCopyDirectTargetFilePath(root, "run-root", "w_0", "part.parquet");
+	REQUIRE(root_direct_target == root + "run-root_w_0_part.parquet");
+	REQUIRE(DistributedCopyPathIsInDirectory(root_direct_target, root, root));
+	REQUIRE(DistributedCopyDirectWriteFinalPathBelongsToRun(fs, root, "run-root", root_direct_target));
 
 	auto authority_root_res = CanonicalDistributedCopyBasePath(fs, "s3://bucket///");
 	REQUIRE(authority_root_res.is_ok());
@@ -222,12 +278,34 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	auto authority_paths =
 	    BuildDistributedCopyFinalizeCommitPaths(fs, authority_root_res.value(), "run-authority-root");
 	REQUIRE(authority_paths.commit_dir == "s3://bucket/.duckdb_commit/run-authority-root");
+	REQUIRE(BuildCopyDirectWriteRunDirectory(authority_root_res.value(), "run-authority-root") ==
+	        "s3://bucket/_vane_direct_write_run-authority-root");
+	auto authority_direct_target =
+	    BuildCopyDirectTargetFilePath(authority_root_res.value(), "run-authority-root", "w_0", "part.parquet");
+	REQUIRE(DistributedCopyDirectWriteFinalPathBelongsToRun(fs, authority_root_res.value(), "run-authority-root",
+	                                                        authority_direct_target));
 	auto authority_prefix_res = CanonicalDistributedCopyBasePath(fs, "s3://bucket/prefix///");
 	REQUIRE(authority_prefix_res.is_ok());
 	REQUIRE(authority_prefix_res.value() == "s3://bucket/prefix");
 	auto empty_authority_root_res = CanonicalDistributedCopyBasePath(fs, "file:////");
 	REQUIRE(empty_authority_root_res.is_ok());
 	REQUIRE(empty_authority_root_res.value() == "file:///");
+	REQUIRE(BuildCopyDirectWriteRunDirectory(empty_authority_root_res.value(), "run-file-root") ==
+	        "file:///_vane_direct_write_run-file-root");
+	auto file_root_direct_target =
+	    BuildCopyDirectTargetFilePath(empty_authority_root_res.value(), "run-file-root", "w_0", "part.parquet");
+	REQUIRE(DistributedCopyDirectWriteFinalPathBelongsToRun(fs, empty_authority_root_res.value(), "run-file-root",
+	                                                        file_root_direct_target));
+
+	WindowsPathFileSystem windows_fs;
+	auto unc_root_res = CanonicalDistributedCopyBasePath(windows_fs, R"(\\server\share)");
+	REQUIRE(unc_root_res.is_ok());
+	REQUIRE(unc_root_res.value() == R"(\\server\share\)");
+	auto unc_paths = BuildDistributedCopyFinalizeCommitPaths(windows_fs, unc_root_res.value(), "run-unc-root");
+	REQUIRE(unc_paths.commit_dir == R"(\\server\share\.duckdb_commit\run-unc-root)");
+	auto unc_prefix_res = CanonicalDistributedCopyBasePath(windows_fs, R"(\\server\share\prefix\\)");
+	REQUIRE(unc_prefix_res.is_ok());
+	REQUIRE(unc_prefix_res.value() == R"(\\server\share\prefix)");
 
 	spec.file_path = root_temporary_output_path;
 	spec.use_tmp_file = true;
@@ -314,6 +392,10 @@ TEST_CASE("Distributed COPY resolves relative and qualified list paths",
 	        qualified_path);
 	REQUIRE(ResolveDistributedCopyListedPath(fs, directory, "bucket/out.duckdb_commit/run/lifecycle.txt") ==
 	        qualified_path);
+	const string authority_root = "memory://bucket/";
+	REQUIRE(ResolveDistributedCopyListedPath(fs, authority_root, "bucket/key") == "memory://bucket/key");
+	REQUIRE(ResolveDistributedCopyListedPath(fs, authority_root, "/bucket/key") == "memory://bucket/key");
+	REQUIRE(ResolveDistributedCopyListedPath(fs, "memory:///", "key") == "memory:///key");
 
 	auto local_directory = TestCreatePath("copy_finalize_qualified_list_path");
 	auto local_path = fs.JoinPath(local_directory, "lifecycle.txt");
@@ -337,6 +419,26 @@ TEST_CASE("Distributed COPY removes directory trees from qualified file-only lis
 
 	REQUIRE_FALSE(local_fs.FileExists(first_file));
 	REQUIRE_FALSE(local_fs.FileExists(nested_file));
+}
+
+TEST_CASE("Distributed COPY treats only not-found list failures as empty",
+          "[distributed][copy][lifecycle][object-storage]") {
+	ErrnoListFileSystem missing_fs(ENOENT);
+	auto missing_res = ListDistributedCopyFilesUnderPrefix(missing_fs, "/missing");
+	REQUIRE(missing_res.is_ok());
+	REQUIRE(missing_res.value().empty());
+
+	std::runtime_error python_missing("FileNotFoundError: /missing");
+	REQUIRE(DistributedCopyExceptionIsNotFound(python_missing));
+
+	ErrnoListFileSystem partial_missing_fs(ENOENT, true);
+	auto partial_missing_res = ListDistributedCopyFilesUnderPrefix(partial_missing_fs, "/partial");
+	REQUIRE(partial_missing_res.is_err());
+
+	ErrnoListFileSystem denied_fs(EACCES);
+	auto denied_res = ListDistributedCopyFilesUnderPrefix(denied_fs, "/denied");
+	REQUIRE(denied_res.is_err());
+	REQUIRE(StringUtil::Contains(denied_res.error().what(), "injected list failure"));
 }
 
 TEST_CASE("Distributed COPY strict marker checks use the portable local missing-file contract",
@@ -472,6 +574,29 @@ TEST_CASE("Expired direct-write cleanup accepts qualified file-only listings",
 
 	FileOnlyRecursiveListFileSystem qualified_fs(true);
 	auto cleanup_res = CleanupExpiredDistributedCopyDirectWriteRuns(qualified_fs, base_path, 1, 10);
+	REQUIRE(cleanup_res.is_ok());
+	REQUIRE(cleanup_res.value().scanned_runs == 1);
+	REQUIRE(cleanup_res.value().cleaned_runs == 1);
+	REQUIRE(cleanup_res.value().errors == 0);
+	REQUIRE_FALSE(local_fs.FileExists(data_file));
+	auto paths = BuildDistributedCopyFinalizeCommitPaths(local_fs, base_path, run_id);
+	REQUIRE_FALSE(local_fs.FileExists(paths.lifecycle_path));
+}
+
+TEST_CASE("Expired direct-target cleanup accepts a missing legacy run prefix",
+          "[distributed][copy][lifecycle][object-storage]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_missing_legacy_run_prefix");
+	auto &local_fs = test_dir.fs;
+	auto base_path = local_fs.JoinPath(test_dir.path, "out");
+	const string run_id = "run-direct-target";
+
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, run_id, 1).is_ok());
+	auto data_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_failed", "part.parquet");
+	WriteTestFile(local_fs, data_file, "stale");
+	auto missing_run_prefix = BuildCopyDirectWriteRunDirectory(base_path, run_id, local_fs.PathSeparator(base_path));
+
+	MissingPrefixFileOnlyRecursiveListFileSystem object_fs(missing_run_prefix);
+	auto cleanup_res = CleanupExpiredDistributedCopyDirectWriteRuns(object_fs, base_path, 1, 10);
 	REQUIRE(cleanup_res.is_ok());
 	REQUIRE(cleanup_res.value().scanned_runs == 1);
 	REQUIRE(cleanup_res.value().cleaned_runs == 1);
