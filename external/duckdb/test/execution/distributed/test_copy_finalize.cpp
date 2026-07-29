@@ -196,6 +196,17 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	auto literal_res = CanonicalDistributedCopyBasePath(fs, spec);
 	REQUIRE(literal_res.is_ok());
 	REQUIRE(literal_res.value() == fs.JoinPath(parent, "tmp_copy-output"));
+
+	auto root = fs.PathSeparator(std::string());
+	auto root_output_path = root + "copy-output";
+	auto root_temporary_output_path = root + "tmp_copy-output";
+	spec.file_path = root_temporary_output_path;
+	spec.use_tmp_file = true;
+	auto root_temporary_res = CanonicalDistributedCopyBasePath(fs, spec);
+	REQUIRE(root_temporary_res.is_ok());
+	REQUIRE(root_temporary_res.value() == root_output_path);
+	REQUIRE(DistributedCopyTemporaryBasePath(fs, root_output_path) == root_temporary_output_path);
+	REQUIRE(DistributedCopyWorkerBaseMatchesCanonical(fs, root_output_path, root_temporary_output_path));
 }
 
 TEST_CASE("Distributed COPY temporary direct output preserves the canonical target",

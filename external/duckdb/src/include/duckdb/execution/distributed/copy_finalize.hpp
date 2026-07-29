@@ -191,6 +191,18 @@ inline DuckDBResult<std::string> CanonicalDistributedCopyBasePath(FileSystem &fs
 	return DuckDBResult<std::string>::ok(std::move(canonical_base_path));
 }
 
+inline std::string DistributedCopyPathInDirectory(FileSystem &fs, const std::string &directory,
+                                                  const std::string &base_name) {
+	if (directory.empty()) {
+		return base_name;
+	}
+	auto separator = fs.PathSeparator(directory);
+	if (StringUtil::EndsWith(directory, separator)) {
+		return directory + base_name;
+	}
+	return fs.JoinPath(directory, base_name);
+}
+
 inline DuckDBResult<std::string> CanonicalDistributedCopyBasePath(FileSystem &fs, const DistributedCopySpec &spec) {
 	auto canonical_res = CanonicalDistributedCopyBasePath(fs, spec.file_path);
 	if (canonical_res.is_err()) {
@@ -210,7 +222,7 @@ inline DuckDBResult<std::string> CanonicalDistributedCopyBasePath(FileSystem &fs
 		    DuckDBError::value_error("distributed COPY requires non-empty canonical base_path"));
 	}
 	auto directory = StringUtil::GetFilePath(canonical_base_path);
-	canonical_base_path = directory.empty() ? base_name : fs.JoinPath(directory, base_name);
+	canonical_base_path = DistributedCopyPathInDirectory(fs, directory, base_name);
 	return DuckDBResult<std::string>::ok(std::move(canonical_base_path));
 }
 
@@ -218,7 +230,7 @@ inline std::string DistributedCopyTemporaryBasePath(FileSystem &fs, const std::s
 	auto base_name = StringUtil::GetFileName(canonical_base_path);
 	auto directory = StringUtil::GetFilePath(canonical_base_path);
 	auto temporary_name = "tmp_" + base_name;
-	return directory.empty() ? temporary_name : fs.JoinPath(directory, temporary_name);
+	return DistributedCopyPathInDirectory(fs, directory, temporary_name);
 }
 
 inline bool DistributedCopyWorkerBaseMatchesCanonical(FileSystem &fs, const std::string &canonical_base_path,
