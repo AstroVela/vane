@@ -14,6 +14,9 @@ namespace {
 
 class FileOnlyRecursiveListFileSystem : public LocalFileSystem {
 public:
+	explicit FileOnlyRecursiveListFileSystem(bool qualified_paths_p = false) : qualified_paths(qualified_paths_p) {
+	}
+
 	bool DirectoryExists(const string &, optional_ptr<FileOpener> = nullptr) override {
 		return false;
 	}
@@ -37,19 +40,23 @@ private:
 				found = ListObjectKeys(root, full_path, callback) || found;
 				return;
 			}
-			auto relative_path = full_path.substr(root.size());
-			auto separator = backing_fs.PathSeparator(relative_path);
-			if (StringUtil::StartsWith(relative_path, separator)) {
-				relative_path = relative_path.substr(separator.size());
+			auto callback_path = full_path;
+			if (!qualified_paths) {
+				callback_path = full_path.substr(root.size());
+				auto separator = backing_fs.PathSeparator(callback_path);
+				if (StringUtil::StartsWith(callback_path, separator)) {
+					callback_path = callback_path.substr(separator.size());
+				}
 			}
-			callback(relative_path, false);
-			callback(relative_path, false);
+			callback(callback_path, false);
+			callback(callback_path, false);
 			found = true;
 		});
 		return found;
 	}
 
 	LocalFileSystem backing_fs;
+	bool qualified_paths;
 };
 
 class CountingFileOnlyRecursiveListFileSystem : public FileOnlyRecursiveListFileSystem {
@@ -273,6 +280,26 @@ TEST_CASE("Distributed COPY temporary direct output preserves the canonical targ
 	REQUIRE(ReadDistributedCopyTextFile(fs, output_path).value() == "old");
 }
 
+TEST_CASE("Distributed COPY resolves relative and qualified list paths",
+          "[distributed][copy][lifecycle][object-storage][path]") {
+	LocalFileSystem fs;
+	const string directory = "memory://bucket/out.duckdb_commit";
+	const string qualified_path = directory + "/run/lifecycle.txt";
+
+	REQUIRE(ResolveDistributedCopyListedPath(fs, directory, "run/lifecycle.txt") == qualified_path);
+	REQUIRE(ResolveDistributedCopyListedPath(fs, directory, qualified_path) == qualified_path);
+	REQUIRE(ResolveDistributedCopyListedPath(fs, directory, "/bucket/out.duckdb_commit/run/lifecycle.txt") ==
+	        qualified_path);
+	REQUIRE(ResolveDistributedCopyListedPath(fs, directory, "bucket/out.duckdb_commit/run/lifecycle.txt") ==
+	        qualified_path);
+
+	auto local_directory = TestCreatePath("copy_finalize_qualified_list_path");
+	auto local_path = fs.JoinPath(local_directory, "lifecycle.txt");
+	REQUIRE(ResolveDistributedCopyListedPath(fs, local_directory, local_path) == local_path);
+	auto root = fs.PathSeparator(std::string());
+	REQUIRE(ResolveDistributedCopyListedPath(fs, root, "lifecycle.txt") == root + "lifecycle.txt");
+}
+
 TEST_CASE("Distributed COPY strict marker checks use the portable local missing-file contract",
           "[distributed][copy][lifecycle][path]") {
 	auto marker_path = TestCreatePath("copy_finalize_missing_local_marker");
@@ -391,6 +418,28 @@ TEST_CASE("Direct-write cleanup fails closed when committed marker status is unk
 	REQUIRE(StringUtil::Contains(cleanup.error_messages[0], "injected marker check failure"));
 	REQUIRE(local_fs.FileExists(data_file));
 	REQUIRE(local_fs.FileExists(paths.lifecycle_path));
+}
+
+TEST_CASE("Expired direct-write cleanup accepts qualified file-only listings",
+          "[distributed][copy][lifecycle][object-storage]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_qualified_file_listing");
+	auto &local_fs = test_dir.fs;
+	auto base_path = local_fs.JoinPath(test_dir.path, "out");
+	const string run_id = "run-qualified";
+
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, run_id, 1).is_ok());
+	auto data_file = local_fs.JoinPath(base_path, run_id + "_w_failed_part.parquet");
+	WriteTestFile(local_fs, data_file, "stale");
+
+	FileOnlyRecursiveListFileSystem qualified_fs(true);
+	auto cleanup_res = CleanupExpiredDistributedCopyDirectWriteRuns(qualified_fs, base_path, 1, 10);
+	REQUIRE(cleanup_res.is_ok());
+	REQUIRE(cleanup_res.value().scanned_runs == 1);
+	REQUIRE(cleanup_res.value().cleaned_runs == 1);
+	REQUIRE(cleanup_res.value().errors == 0);
+	REQUIRE_FALSE(local_fs.FileExists(data_file));
+	auto paths = BuildDistributedCopyFinalizeCommitPaths(local_fs, base_path, run_id);
+	REQUIRE_FALSE(local_fs.FileExists(paths.lifecycle_path));
 }
 
 TEST_CASE("Direct-write cleanup keeps lifecycle registration until metadata cleanup finishes",

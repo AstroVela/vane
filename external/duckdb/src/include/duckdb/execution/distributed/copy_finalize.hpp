@@ -38,9 +38,52 @@ inline idx_t DistributedCopyElapsedMillis(std::chrono::steady_clock::time_point 
 	return static_cast<idx_t>(value > max_value ? max_value : value);
 }
 
+inline std::string ResolveDistributedCopyListedPath(FileSystem &fs, const std::string &directory,
+                                                    const std::string &listed_path) {
+	if (listed_path.empty() || listed_path.find("://") != std::string::npos) {
+		return listed_path;
+	}
+
+	auto directory_protocol = directory.find("://");
+	auto separator = directory_protocol == std::string::npos ? fs.PathSeparator(directory) : std::string("/");
+	if (directory_protocol != std::string::npos) {
+		auto trim_leading_separators = [&](std::string &path) {
+			while (!separator.empty() && StringUtil::StartsWith(path, separator)) {
+				path.erase(0, separator.size());
+			}
+		};
+		auto protocol_end = directory_protocol + 3;
+		auto directory_suffix = directory.substr(protocol_end);
+		const bool preserve_root_separator = StringUtil::StartsWith(directory_suffix, separator);
+		trim_leading_separators(directory_suffix);
+
+		auto listed_suffix = listed_path;
+		const bool listed_path_is_rooted = StringUtil::StartsWith(listed_suffix, separator);
+		trim_leading_separators(listed_suffix);
+		if (listed_path_is_rooted || listed_suffix == directory_suffix ||
+		    StringUtil::StartsWith(listed_suffix, directory_suffix + separator)) {
+			return directory.substr(0, protocol_end) + (preserve_root_separator ? separator : std::string()) +
+			       listed_suffix;
+		}
+	}
+
+	if (fs.IsPathAbsolute(listed_path)) {
+		return listed_path;
+	}
+	auto normalized_directory = directory;
+	StringUtil::RTrim(normalized_directory, separator);
+	if (listed_path == normalized_directory || StringUtil::StartsWith(listed_path, normalized_directory + separator)) {
+		return listed_path;
+	}
+	if (StringUtil::EndsWith(directory, separator)) {
+		return directory + listed_path;
+	}
+	return fs.JoinPath(directory, listed_path);
+}
+
 inline void ListDistributedCopyFilesRecursive(FileSystem &fs, const std::string &dir, std::vector<std::string> &out) {
 	fs.ListFiles(dir, [&](const std::string &path, bool is_dir) {
-		auto full_path = fs.JoinPath(dir, path);
+		auto full_path = ResolveDistributedCopyListedPath(fs, dir, path);
 		if (is_dir) {
 			ListDistributedCopyFilesRecursive(fs, full_path, out);
 		} else {
