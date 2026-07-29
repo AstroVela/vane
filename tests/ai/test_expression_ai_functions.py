@@ -7,6 +7,7 @@ import json
 import math
 from collections import Counter, deque
 from dataclasses import dataclass
+from datetime import date
 
 import numpy as np
 import pyarrow as pa
@@ -134,7 +135,8 @@ class MockProvider(Provider):
 class _RecordingNativeVLLMExecutor:
     """Minimal executor used to exercise the native PhysicalVLLM bridge."""
 
-    def __init__(self) -> None:
+    def __init__(self, responses: dict[str, str] | None = None) -> None:
+        self.responses = responses
         self.submissions: list[tuple[str | None, tuple[str, ...]]] = []
         self.ready = deque()
         self.finished = False
@@ -144,7 +146,12 @@ class _RecordingNativeVLLMExecutor:
     def submit(self, prefix, prompts, rows) -> None:
         prompt_values = tuple(prompts)
         self.submissions.append((prefix, prompt_values))
-        self.ready.append(([f"generated:{prompt}" for prompt in prompt_values], rows))
+        output_values = (
+            [f"generated:{prompt}" for prompt in prompt_values]
+            if self.responses is None
+            else [self.responses[prompt] for prompt in prompt_values]
+        )
+        self.ready.append((output_values, rows))
 
     def take_ready_result(self):
         try:
@@ -474,6 +481,7 @@ def test_ai_prompt_vllm_relation_uses_one_native_lifecycle_and_returns_only_outp
 
     assert result.columns == ["answer"]
     assert "VLLM_PROJECT" in result.explain()
+    assert "STREAMING_UDF" not in result.explain()
     assert Counter(result.fetchall()) == Counter(
         [
             ("generated:Answer briefly.\n\nquestion",),
@@ -494,6 +502,117 @@ def test_ai_prompt_vllm_relation_uses_one_native_lifecycle_and_returns_only_outp
     assert [prompt for _prefix, prompts in executor.submissions for prompt in prompts] == [
         "Answer briefly.\n\nquestion",
     ]
+
+
+def test_ai_prompt_vllm_relation_validates_pydantic_output_and_preserves_nulls(monkeypatch):
+    pydantic = pytest.importorskip("pydantic")
+    import duckdb.execution.vllm as vllm_executor
+
+    class Answer(pydantic.BaseModel):
+        answer: str
+        validated: bool = True
+
+        @pydantic.field_validator("answer")
+        @classmethod
+        def answer_must_be_approved(cls, value: str) -> str:
+            if value != "approved":
+                raise ValueError("answer must be approved")
+            return value
+
+    executor = _RecordingNativeVLLMExecutor(
+        {
+            "valid": '{"answer":"approved"}',
+            "invalid": '{"answer":"rejected"}',
+        }
+    )
+    monkeypatch.setattr(vllm_executor, "build_executor", lambda _model, _options: executor)
+    conn = vane.connect()
+    source = conn.sql(
+        "select * from (values (1, 'valid'::VARCHAR), (2, 'invalid'::VARCHAR), "
+        "(3, NULL::VARCHAR)) source(id, question) order by id"
+    )
+
+    result = vane.ai.prompt(
+        source,
+        "question",
+        provider="vllm",
+        return_format=Answer,
+        prompt_options={"on_error": "ignore"},
+    )
+
+    plan = result.explain()
+    assert "VLLM_PROJECT" in plan
+    assert "STREAMING_UDF" in plan
+    assert Counter(result.fetchall()) == Counter(
+        [
+            ('{"answer":"approved","validated":true}',),
+            (None,),
+            (None,),
+        ]
+    )
+    assert executor.finished_count == 1
+    assert executor.shutdown_count == 1
+    assert Counter(prompt for _prefix, prompts in executor.submissions for prompt in prompts) == Counter(
+        ["valid", "invalid"]
+    )
+
+
+def test_ai_prompt_vllm_relation_uses_pydantic_json_validation(monkeypatch):
+    pydantic = pytest.importorskip("pydantic")
+    import duckdb.execution.vllm as vllm_executor
+
+    class Answer(pydantic.BaseModel):
+        model_config = pydantic.ConfigDict(strict=True)
+
+        due: date
+
+    executor = _RecordingNativeVLLMExecutor({"valid": '{"due":"2026-01-02"}'})
+    monkeypatch.setattr(vllm_executor, "build_executor", lambda _model, _options: executor)
+    conn = vane.connect()
+    source = conn.sql("select 'valid'::VARCHAR as question")
+
+    result = vane.ai.prompt(
+        source,
+        "question",
+        provider="vllm",
+        return_format=Answer,
+    )
+
+    assert result.fetchall() == [('{"due":"2026-01-02"}',)]
+    assert executor.finished_count == 1
+    assert executor.shutdown_count == 1
+
+
+def test_ai_prompt_vllm_relation_rejects_pydantic_validation_failure(monkeypatch):
+    pydantic = pytest.importorskip("pydantic")
+    import duckdb.execution.vllm as vllm_executor
+
+    class Answer(pydantic.BaseModel):
+        answer: str
+
+        @pydantic.field_validator("answer")
+        @classmethod
+        def answer_must_be_approved(cls, value: str) -> str:
+            if value != "approved":
+                raise ValueError("answer must be approved")
+            return value
+
+    executor = _RecordingNativeVLLMExecutor({"invalid": '{"answer":"rejected"}'})
+    monkeypatch.setattr(vllm_executor, "build_executor", lambda _model, _options: executor)
+    conn = vane.connect()
+    source = conn.sql("select 'invalid'::VARCHAR as question")
+    result = vane.ai.prompt(
+        source,
+        "question",
+        provider="vllm",
+        return_format=Answer,
+    )
+
+    with pytest.raises(Exception, match="answer must be approved"):
+        result.fetchall()
+
+    assert executor.finished_count == 1
+    assert executor.shutdown_count == 1
 
 
 def test_ai_prompt_vllm_relation_restores_opaque_secrets_at_local_executor_creation(monkeypatch):
