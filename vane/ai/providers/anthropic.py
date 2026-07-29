@@ -377,5 +377,6 @@ class AnthropicPrompter:
             return None
 
         if response.content:
-            return response.content[0].text
+            text_blocks = [block.text for block in response.content if getattr(block, "type", None) == "text"]
+            return "".join(text_blocks) if text_blocks else None
         return None
