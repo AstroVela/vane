@@ -306,6 +306,18 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	auto unc_prefix_res = CanonicalDistributedCopyBasePath(windows_fs, R"(\\server\share\prefix\\)");
 	REQUIRE(unc_prefix_res.is_ok());
 	REQUIRE(unc_prefix_res.value() == R"(\\server\share\prefix)");
+	auto drive_root_res = CanonicalDistributedCopyBasePath(windows_fs, R"(C:\\)");
+	REQUIRE(drive_root_res.is_ok());
+	REQUIRE(drive_root_res.value() == R"(C:\)");
+	REQUIRE(NormalizeCopyDirectWriteRoot(drive_root_res.value(), R"(\)") == R"(C:\)");
+	REQUIRE(BuildCopyDirectWriteRunDirectory(drive_root_res.value(), "", R"(\)") == R"(C:\)");
+	REQUIRE(BuildCopyDirectWriteRunDirectory(drive_root_res.value(), "run-drive-root", R"(\)") ==
+	        R"(C:\_vane_direct_write_run-drive-root)");
+	REQUIRE_FALSE(DistributedCopyPathIsInDirectory(R"(C:)", drive_root_res.value(), R"(\)"));
+	REQUIRE(DistributedCopyPathIsInDirectory(R"(C:\run-drive-root_w_0_part.parquet)", drive_root_res.value(), R"(\)"));
+	auto forward_slash_drive_root_res = CanonicalDistributedCopyBasePath(windows_fs, "C:////");
+	REQUIRE(forward_slash_drive_root_res.is_ok());
+	REQUIRE(forward_slash_drive_root_res.value() == R"(C:\)");
 
 	spec.file_path = root_temporary_output_path;
 	spec.use_tmp_file = true;
@@ -635,4 +647,19 @@ TEST_CASE("Direct-write cleanup keeps lifecycle registration until metadata clea
 	REQUIRE(retry_cleanup.value().errors == 0);
 	REQUIRE_FALSE(local_fs.FileExists(paths.manifest_path));
 	REQUIRE_FALSE(local_fs.FileExists(paths.lifecycle_path));
+}
+
+TEST_CASE("Direct-write cleanup requires lifecycle registration", "[distributed][copy][lifecycle]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_requires_lifecycle");
+	auto &fs = test_dir.fs;
+	auto base_path = fs.JoinPath(test_dir.path, "out");
+	const string run_id = "run-unregistered";
+	auto data_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_failed", "part.parquet");
+	WriteTestFile(fs, data_file, "must survive");
+
+	auto cleanup_res = CleanupDistributedCopyUncommittedDirectWriteRun(fs, base_path, run_id);
+
+	REQUIRE(cleanup_res.is_err());
+	REQUIRE(StringUtil::Contains(cleanup_res.error().what(), "requires lifecycle registration"));
+	REQUIRE(fs.FileExists(data_file));
 }

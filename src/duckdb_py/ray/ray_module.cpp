@@ -1391,7 +1391,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    return out;
 	    },
 	    py::arg("base_path"), py::arg("run_id"),
-	    "Best-effort cleanup for an uncommitted direct-write distributed COPY run.");
+	    "Cleanup a lifecycle-registered uncommitted direct-write distributed COPY run.");
 
 	m.def(
 	    "register_copy_direct_write_run_lifecycle",
@@ -4454,6 +4454,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    write_file(stale_file, stale_body);
 
 		    auto stale_commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, final_root, stale_run_id);
+		    auto stale_lifecycle_res = WriteDistributedCopyDirectWriteLifecycle(fs, final_root, stale_run_id);
+		    if (stale_lifecycle_res.is_err()) {
+			    throw std::runtime_error(stale_lifecycle_res.error().what());
+		    }
 		    std::vector<DistributedCopyFileInfo> stale_files;
 		    stale_files.push_back(make_file_info(stale_file, 1, stale_body.size()));
 		    auto stale_manifest_res = WriteDistributedCopyFinalizeManifest(fs, stale_commit_paths, final_root,
@@ -4468,6 +4472,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    write_file(committed_file, committed_body);
 
 		    auto committed_paths = BuildDistributedCopyFinalizeCommitPaths(fs, final_root, committed_run_id);
+		    auto committed_lifecycle_res = WriteDistributedCopyDirectWriteLifecycle(fs, final_root, committed_run_id);
+		    if (committed_lifecycle_res.is_err()) {
+			    throw std::runtime_error(committed_lifecycle_res.error().what());
+		    }
 		    std::vector<DistributedCopyFileInfo> committed_files;
 		    committed_files.push_back(make_file_info(committed_file, 1, committed_body.size()));
 		    auto committed_manifest_res = WriteDistributedCopyFinalizeManifest(

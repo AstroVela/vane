@@ -253,6 +253,12 @@ inline DuckDBResult<std::string> CanonicalDistributedCopyBasePath(FileSystem &fs
 
 	auto canonical_base_path = base_path;
 	auto protocol = canonical_base_path.find("://");
+	if (protocol == 1 && fs.PathSeparator(canonical_base_path) == "\\" && fs.IsPathAbsolute(canonical_base_path)) {
+		protocol = std::string::npos;
+	}
+	if (protocol == std::string::npos) {
+		canonical_base_path = fs.ConvertSeparators(canonical_base_path);
+	}
 	auto separator = protocol == std::string::npos ? fs.PathSeparator(canonical_base_path) : std::string("/");
 	if (separator.empty()) {
 		return DuckDBResult<std::string>::ok(std::move(canonical_base_path));
@@ -1334,18 +1340,19 @@ CleanupDistributedCopyUncommittedDirectWriteRun(FileSystem &fs, const std::strin
 		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::ok(std::move(result));
 	}
 
-	auto worker_base_path = canonical_base_path;
 	auto lifecycle_exists_res = CheckDistributedCopyFileExists(fs, commit_paths.lifecycle_path);
 	if (lifecycle_exists_res.is_err()) {
 		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(lifecycle_exists_res.error());
 	}
-	if (lifecycle_exists_res.value()) {
-		auto lifecycle_res = ReadDistributedCopyDirectWriteLifecycle(fs, commit_paths, canonical_base_path, run_id);
-		if (lifecycle_res.is_err()) {
-			return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(lifecycle_res.error());
-		}
-		worker_base_path = std::move(lifecycle_res).value().worker_base_path;
+	if (!lifecycle_exists_res.value()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(DuckDBError::io_error(
+		    "direct-write cleanup requires lifecycle registration: " + commit_paths.lifecycle_path));
 	}
+	auto lifecycle_res = ReadDistributedCopyDirectWriteLifecycle(fs, commit_paths, canonical_base_path, run_id);
+	if (lifecycle_res.is_err()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(lifecycle_res.error());
+	}
+	auto worker_base_path = std::move(lifecycle_res).value().worker_base_path;
 	return CleanupDistributedCopyUncommittedDirectWriteRunWithWorkerBase(fs, canonical_base_path, worker_base_path,
 	                                                                     run_id);
 }

@@ -1830,12 +1830,15 @@ def test_distributed_copy_direct_write_uncommitted_stale_cleanup(tmp_path):
 def test_cleanup_uncommitted_copy_direct_write_run_public_api(tmp_path):
     base = tmp_path / "copy_direct_public_cleanup"
     stale_run_id = "run-public-stale"
+    stale_registration = duckdb.ray_cxx.register_copy_direct_write_run_lifecycle(
+        str(base),
+        stale_run_id,
+    )
     stale_run_dir = base / f"_vane_direct_write_{stale_run_id}" / "w_failed"
     stale_file = stale_run_dir / "part.parquet"
     stale_file.parent.mkdir(parents=True)
     stale_file.write_bytes(b"stale")
-    stale_commit_dir = Path(str(base) + ".duckdb_commit") / stale_run_id
-    stale_commit_dir.mkdir(parents=True)
+    stale_commit_dir = Path(stale_registration["copy_output_commit_dir"])
     (stale_commit_dir / "manifest.txt").write_text("partial\n")
 
     stale = duckdb.ray_cxx.cleanup_uncommitted_copy_direct_write_run(str(base), stale_run_id)
@@ -1849,12 +1852,15 @@ def test_cleanup_uncommitted_copy_direct_write_run_public_api(tmp_path):
     assert not stale_commit_dir.exists()
 
     committed_run_id = "run-public-committed"
+    committed_registration = duckdb.ray_cxx.register_copy_direct_write_run_lifecycle(
+        str(base),
+        committed_run_id,
+    )
     committed_run_dir = base / f"_vane_direct_write_{committed_run_id}" / "w_selected"
     committed_file = committed_run_dir / "part.parquet"
     committed_file.parent.mkdir(parents=True)
     committed_file.write_bytes(b"committed")
-    committed_commit_dir = Path(str(base) + ".duckdb_commit") / committed_run_id
-    committed_commit_dir.mkdir(parents=True)
+    committed_commit_dir = Path(committed_registration["copy_output_commit_dir"])
     (committed_commit_dir / "manifest.txt").write_text("committed manifest\n")
     (committed_commit_dir / "committed").write_text("committed\n")
 

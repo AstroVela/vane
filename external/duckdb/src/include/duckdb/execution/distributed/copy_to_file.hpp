@@ -138,6 +138,9 @@ inline std::string NormalizeCopyDirectWriteRoot(const std::string &base_path, co
 	if (root.empty()) {
 		return separator;
 	}
+	if (separator == "\\" && root.size() == 2 && root[1] == ':' && base_path.size() > root.size()) {
+		return root + separator;
+	}
 
 	auto protocol = base_path.find("://");
 	if (protocol != std::string::npos) {
