@@ -236,6 +236,13 @@ class GoogleEmbeddingOptions:
 class VLLMPromptOptions(_RedactedOptionsRepr):
     """vLLM prompt generation options.
 
+    ``max_tokens`` and ``temperature`` are convenience fields: the vLLM
+    plan folds them into ``generate_args["sampling_params"]`` when it
+    builds the native operator options, so they reach the engine's
+    ``SamplingParams``. On conflict, an entry set explicitly in
+    ``generate_args["sampling_params"]`` wins over the convenience field
+    of the same name.
+
     ``generate_args`` crosses the native operator boundary as JSON. Values
     must therefore contain only JSON primitives, string-keyed mappings, and
     lists.
