@@ -24,6 +24,9 @@ public:
 	bool is_sink() const override {
 		return true;
 	}
+	bool is_blocking_materializing() const override {
+		return true;
+	}
 	NodeID node_id() const override {
 		return ctx_.node_id();
 	}

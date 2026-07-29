@@ -50,6 +50,8 @@ public:
 	    duckdb::distributed::MaterializedOutputCallback on_output) override;
 	DuckDBResult<void> task_input_stream_exhausted_for_query(
 	    const string &query_id, const std::unordered_set<duckdb::distributed::SourceNodeId> &source_node_ids) override;
+	DuckDBResult<void> blocking_materialization_completed(const string &query_id,
+	                                                      duckdb::distributed::NodeID node_id) override;
 
 	void drop_query_fragments(const string &query_id);
 	void rethrow_submission_error(const string &query_id);

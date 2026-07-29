@@ -48,6 +48,7 @@ def _stage(
     actor_prefetch_depth=1,
     resident=None,
     stage_kind="udf",
+    spill_mode="streaming",
 ):
     requested = resources or _r(cpu=1, heap=10)
     if backend == "ray_actor":
@@ -74,7 +75,7 @@ def _stage(
         resident_per_actor=resident_resources,
         actor_pool_size=actor_pool_size,
         actor_prefetch_depth=actor_prefetch_depth,
-        spill_mode="streaming",
+        spill_mode=spill_mode,
     )
 
 
@@ -155,6 +156,253 @@ def test_task_admission_requires_runnable_registered_stage_and_ready_actor():
     assert granted.granted
     assert granted.lease.resources == actor.per_task
     assert granted.lease.output_window_bytes == 20
+
+
+def test_only_first_pending_materializing_phase_and_its_upstream_receive_reservations_without_gating():
+    source = _stage(
+        "stage:f:phase-source",
+        resources=_r(cpu=1, heap=10),
+        target=1,
+        blocks=1,
+        backend="ray_worker",
+        stage_kind="fte",
+    )
+    first_barrier = _stage(
+        "stage:f:phase-first-barrier",
+        inputs=(source.stage_id,),
+        resources=_r(cpu=1, heap=10),
+        target=1,
+        blocks=1,
+        backend="ray_worker",
+        stage_kind="fte",
+        spill_mode="barrier",
+    )
+    between = _stage(
+        "stage:f:phase-between",
+        inputs=(first_barrier.stage_id,),
+        resources=_r(cpu=1, heap=10),
+        target=1,
+        blocks=1,
+        backend="ray_worker",
+        stage_kind="fte",
+    )
+    second_barrier = _stage(
+        "stage:f:phase-second-barrier",
+        inputs=(between.stage_id,),
+        resources=_r(cpu=1, heap=10),
+        target=1,
+        blocks=1,
+        backend="ray_worker",
+        stage_kind="fte",
+        spill_mode="barrier",
+    )
+    terminal = _stage(
+        "stage:f:phase-terminal",
+        inputs=(second_barrier.stage_id,),
+        resources=_r(cpu=1, heap=10),
+        target=1,
+        blocks=1,
+        backend="ray_worker",
+        stage_kind="fte",
+    )
+    manager = _manager(
+        source,
+        first_barrier,
+        between,
+        second_barrier,
+        terminal,
+        resources=_r(cpu=5, heap=100, store=100),
+    )
+    _ready(
+        manager,
+        source.stage_id,
+        first_barrier.stage_id,
+        between.stage_id,
+        second_barrier.stage_id,
+        terminal.stage_id,
+    )
+    for stage in (source, first_barrier, between, second_barrier, terminal):
+        manager.note_task_waiting(_task(stage.stage_id, "waiting"))
+
+    first_snapshot = manager.snapshot()
+    unreserved_between = manager.try_acquire_task(_task(between.stage_id, 0))
+
+    assert first_snapshot["materializing_phase"] == {
+        "barrier_stage_id": first_barrier.stage_id,
+        "stage_ids": [source.stage_id, first_barrier.stage_id],
+        "object_store_backpressure_disabled": True,
+        "object_store_unlimited_stage_ids": [
+            source.stage_id,
+            first_barrier.stage_id,
+        ],
+    }
+    assert first_snapshot["admission"]["reservation_stage_ids"]["cpu"] == [
+        source.stage_id,
+        first_barrier.stage_id,
+    ]
+    assert unreserved_between.granted
+    assert unreserved_between.liveness is False
+    assert between.stage_id not in first_snapshot["admission"]["reservation_stage_ids"]["cpu"]
+    assert manager.release_task_lease(unreserved_between.lease.lease_id, attempt_id="0")
+
+    with pytest.raises(ValueError, match="not a blocking materializer"):
+        manager.mark_materializing_stage_completed(source.stage_id)
+    assert manager.mark_materializing_stage_completed(first_barrier.stage_id)
+    assert not manager.mark_materializing_stage_completed(first_barrier.stage_id)
+    second_snapshot = manager.snapshot()
+
+    assert second_snapshot["materializing_phase"]["barrier_stage_id"] == second_barrier.stage_id
+    assert second_snapshot["materializing_phase"]["stage_ids"] == [
+        source.stage_id,
+        first_barrier.stage_id,
+        between.stage_id,
+        second_barrier.stage_id,
+    ]
+    assert second_snapshot["stages"][source.stage_id]["completed"] is False
+    assert second_snapshot["stages"][first_barrier.stage_id]["completed"] is False
+    assert second_snapshot["stages"][first_barrier.stage_id]["materialization_completed"] is True
+    assert second_snapshot["stages"][source.stage_id]["phase_eligible"] is True
+    assert second_snapshot["stages"][first_barrier.stage_id]["phase_eligible"] is True
+    assert second_snapshot["stages"][between.stage_id]["phase_eligible"] is True
+    assert second_snapshot["stages"][terminal.stage_id]["phase_eligible"] is False
+    assert manager.try_acquire_task(_task(between.stage_id, 1)).granted
+    assert manager.try_acquire_task(_task(first_barrier.stage_id, 1)).granted
+
+
+def test_blocking_materialization_disables_only_corresponding_object_store_soft_limits():
+    early = _stage(
+        "stage:f:spill-early",
+        resources=_r(cpu=1, heap=10),
+        target=10,
+        blocks=1,
+    )
+    producer = _stage(
+        "stage:f:spill-producer",
+        inputs=(early.stage_id,),
+        resources=_r(cpu=1, heap=10),
+        target=10,
+        blocks=1,
+    )
+    barrier = _stage(
+        "stage:f:spill-barrier",
+        inputs=(producer.stage_id,),
+        resources=_r(cpu=1, heap=10),
+        target=10,
+        blocks=1,
+        spill_mode="barrier",
+    )
+    terminal = _stage(
+        "stage:f:spill-terminal",
+        inputs=(barrier.stage_id,),
+        resources=_r(cpu=1, heap=10),
+        target=10,
+        blocks=1,
+    )
+    manager = _manager(
+        early,
+        producer,
+        barrier,
+        terminal,
+        resources=_r(cpu=4, heap=100, store=10),
+    )
+    _ready(manager, early.stage_id, producer.stage_id, barrier.stage_id, terminal.stage_id)
+
+    producer_task = manager.try_acquire_task(_task(producer.stage_id, 0, retained=0))
+    barrier_task = manager.try_acquire_task(_task(barrier.stage_id, 0, retained=0))
+    manager.note_task_waiting(_task(early.stage_id, "waiting", retained=0))
+    early_normal_reason = manager._normal_task_block_reason_locked(_task(early.stage_id, 0, retained=0))[0]
+    early_task = manager.try_acquire_task(_task(early.stage_id, 0, retained=0))
+    output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            query_id="q",
+            producer_stage_id=producer.stage_id,
+            task_lease_id=producer_task.lease.lease_id,
+            attempt_id="0",
+            block_id="materialized-input",
+            size_bytes=25,
+        )
+    )
+    snapshot = manager.snapshot()
+
+    assert producer_task.granted and producer_task.liveness is False
+    assert barrier_task.granted and barrier_task.liveness is False
+    assert early_normal_reason == "query_soft_object_store_bytes"
+    assert not early_task.granted
+    assert early_task.blocked_reason == "liveness_not_needed"
+    assert output.granted and output.liveness is False
+    assert snapshot["usage"]["object_store_bytes"] > snapshot["allocation"]["resources"]["object_store_bytes"]
+    assert snapshot["materializing_phase"]["object_store_unlimited_stage_ids"] == [
+        producer.stage_id,
+        barrier.stage_id,
+    ]
+    assert snapshot["admission"]["reservation_stage_ids"]["object_store_bytes"] == [
+        early.stage_id,
+    ]
+
+
+def test_nested_materializers_activate_spill_exemptions_on_real_demand():
+    inner_input = _stage("stage:f:nested-inner-input", resources=_r(cpu=1, heap=10))
+    receiver = _stage("stage:f:nested-receiver", resources=_r(cpu=1, heap=10))
+    inner_barrier = _stage(
+        "stage:f:nested-inner-barrier",
+        inputs=(inner_input.stage_id, receiver.stage_id),
+        resources=_r(cpu=1, heap=10),
+        spill_mode="barrier",
+    )
+    middle_input = _stage("stage:f:nested-middle-input", resources=_r(cpu=1, heap=10))
+    middle_barrier = _stage(
+        "stage:f:nested-middle-barrier",
+        inputs=(middle_input.stage_id, inner_barrier.stage_id),
+        resources=_r(cpu=1, heap=10),
+        spill_mode="barrier",
+    )
+    outer_input = _stage("stage:f:nested-outer-input", resources=_r(cpu=1, heap=10))
+    outer_barrier = _stage(
+        "stage:f:nested-outer-barrier",
+        inputs=(outer_input.stage_id, middle_barrier.stage_id),
+        resources=_r(cpu=1, heap=10),
+        spill_mode="barrier",
+    )
+    manager = _manager(
+        inner_input,
+        receiver,
+        inner_barrier,
+        middle_input,
+        middle_barrier,
+        outer_input,
+        outer_barrier,
+        resources=_r(cpu=7, heap=100, store=10),
+    )
+    _ready(
+        manager,
+        inner_input.stage_id,
+        receiver.stage_id,
+        inner_barrier.stage_id,
+        middle_input.stage_id,
+        middle_barrier.stage_id,
+        outer_input.stage_id,
+        outer_barrier.stage_id,
+    )
+
+    initial = manager.snapshot()
+    outer_task = manager.try_acquire_task(_task(outer_input.stage_id, 0, retained=0))
+    after_outer_demand = manager.snapshot()
+    middle_task = manager.try_acquire_task(_task(middle_input.stage_id, 0, retained=0))
+    after_middle_demand = manager.snapshot()
+
+    assert initial["materializing_phase"]["barrier_stage_id"] == inner_barrier.stage_id
+    assert initial["materializing_phase"]["object_store_unlimited_stage_ids"] == [
+        inner_input.stage_id,
+        receiver.stage_id,
+        inner_barrier.stage_id,
+    ]
+    assert outer_task.granted and outer_task.liveness is False
+    assert outer_input.stage_id not in initial["admission"]["reservation_stage_ids"]["object_store_bytes"]
+    assert after_outer_demand["stages"][outer_input.stage_id]["object_store_backpressure_disabled"] is True
+    assert after_outer_demand["stages"][middle_input.stage_id]["object_store_backpressure_disabled"] is False
+    assert middle_task.granted and middle_task.liveness is False
+    assert after_middle_demand["stages"][middle_input.stage_id]["object_store_backpressure_disabled"] is True
+    assert after_middle_demand["materializing_phase"]["barrier_stage_id"] == inner_barrier.stage_id
 
 
 def test_actor_task_leases_own_distinct_concrete_actor_slots():

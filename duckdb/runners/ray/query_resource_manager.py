@@ -325,6 +325,15 @@ class QueryResourceManager:
         self._reverse_topological_rank = {
             stage_id: index for index, stage_id in enumerate(self._reverse_topological_stage_ids)
         }
+        self._upstream_stage_ids: dict[str, tuple[str, ...]] = {}
+        for stage_id in self._topological_stage_ids:
+            upstream: set[str] = set()
+            for input_stage_id in self._stages[stage_id].spec.input_stage_ids:
+                upstream.add(input_stage_id)
+                upstream.update(self._upstream_stage_ids[input_stage_id])
+            self._upstream_stage_ids[stage_id] = tuple(
+                candidate for candidate in self._topological_stage_ids if candidate in upstream
+            )
         self._reachable_stage_ids: dict[str, tuple[str, ...]] = {}
         self._reachable_udf_stage_ids: dict[str, tuple[str, ...]] = {}
         self._downstream_fte_stage_ids_requiring_separate_slot = {
@@ -377,6 +386,7 @@ class QueryResourceManager:
         self._active_liveness_output_lease_id: str | None = None
         self._task_liveness_grants_total = 0
         self._output_liveness_grants_total = 0
+        self._completed_materializing_stage_ids: set[str] = set()
         self._external_consumer_waiting = False
         self._cancelled = False
         self._cancel_reason = ""
@@ -578,6 +588,21 @@ class QueryResourceManager:
                 return
             stage.actor_ready = ready
             self._publish_change_locked()
+
+    def mark_materializing_stage_completed(self, stage_id: str) -> bool:
+        """Advance a blocking phase without terminalizing its output stage."""
+        stage_key = str(stage_id)
+        with self._lock:
+            stage = self._stages.get(stage_key)
+            if stage is None:
+                raise KeyError(f"stage is not registered: {stage_key}")
+            if stage.spec.spill_mode != "barrier":
+                raise ValueError(f"stage is not a blocking materializer: {stage_key}")
+            if self._materializing_stage_completed_locked(stage_key):
+                return False
+            self._completed_materializing_stage_ids.add(stage_key)
+            self._publish_change_locked()
+            return True
 
     def update_allocation(
         self,
@@ -1002,8 +1027,12 @@ class QueryResourceManager:
         if hard_exceeded:
             reason = "continuation_capacity" if credit_template is not None else f"hard_{hard_exceeded[0]}"
             return reason, False, empty_plan
+        object_store_unlimited = stage.spec.stage_id in self._materializing_object_store_unlimited_stage_ids_locked(
+            requested_stage_id=stage.spec.stage_id,
+        )
         query_soft_blocked = (
-            admission_commitment.object_store_bytes > 0
+            not object_store_unlimited
+            and admission_commitment.object_store_bytes > 0
             and usage_after.object_store_bytes > self.allocation.resources.object_store_bytes
         )
         downstream_reservations = self._downstream_reservations_locked(stage.spec)
@@ -1074,7 +1103,11 @@ class QueryResourceManager:
         if query_soft_blocked:
             return "query_soft_object_store_bytes", False, plan
         if borrowed_credit is None:
-            soft_reason = self._stage_soft_block_reason_locked(stage.spec.stage_id, commitment)
+            soft_reason = self._stage_soft_block_reason_locked(
+                stage.spec.stage_id,
+                commitment,
+                ignore_object_store=object_store_unlimited,
+            )
             if soft_reason is not None:
                 return soft_reason, False, plan
         return None, False, plan
@@ -1317,16 +1350,83 @@ class QueryResourceManager:
             heap_bytes=spec.per_task.heap_bytes,
         )
 
+    def _current_materializing_stage_id_locked(self) -> str | None:
+        """Return the first unfinished blocking stage in source-to-sink order."""
+        return next(
+            (
+                stage_id
+                for stage_id in self._topological_stage_ids
+                if self._stages[stage_id].spec.spill_mode == "barrier"
+                and not self._materializing_stage_completed_locked(stage_id)
+            ),
+            None,
+        )
+
+    def _materializing_stage_completed_locked(self, stage_id: str) -> bool:
+        return self._stages[stage_id].completed or stage_id in self._completed_materializing_stage_ids
+
+    def _materializing_phase_stage_ids_locked(self) -> tuple[str, ...]:
+        """Return unfinished stages eligible in the current materialization phase."""
+        barrier_stage_id = self._current_materializing_stage_id_locked()
+        if barrier_stage_id is None:
+            return tuple(stage_id for stage_id in self._topological_stage_ids if not self._stages[stage_id].completed)
+        phase = set(self._upstream_stage_ids[barrier_stage_id])
+        phase.add(barrier_stage_id)
+        return tuple(
+            stage_id
+            for stage_id in self._topological_stage_ids
+            if stage_id in phase and not self._stages[stage_id].completed
+        )
+
+    def _materializing_object_store_unlimited_stage_ids_locked(
+        self,
+        *,
+        requested_stage_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Return stages whose data must be collectable beyond the soft budget.
+
+        Vane accounts a block to its producer even after the block becomes a
+        downstream input. Therefore the blocking stage and its direct input
+        producers share the spill exemption. DuckDB may concurrently start
+        nested materializers (notably chained broadcast joins), so a blocking
+        boundary becomes active when its own stage or one of its direct inputs
+        is requested or has started. The first unfinished boundary is always
+        active. Earlier streaming producers keep their normal soft budgets and
+        bounded liveness escape.
+        """
+        first_barrier_stage_id = self._current_materializing_stage_id_locked()
+        if first_barrier_stage_id is None:
+            return ()
+        requested = None if requested_stage_id is None else str(requested_stage_id)
+        unlimited: set[str] = set()
+        for barrier_stage_id in self._topological_stage_ids:
+            barrier = self._stages[barrier_stage_id]
+            if barrier.spec.spill_mode != "barrier" or self._materializing_stage_completed_locked(barrier_stage_id):
+                continue
+            boundary = set(barrier.spec.input_stage_ids)
+            boundary.add(barrier_stage_id)
+            active = (
+                barrier_stage_id == first_barrier_stage_id
+                or requested in boundary
+                or bool(boundary & self._started_stage_ids)
+            )
+            if active:
+                unlimited.update(boundary)
+        return tuple(stage_id for stage_id in self._topological_stage_ids if stage_id in unlimited)
+
     def _continuation_credit_template_locked(
         self,
         parent: StageResourceSpec,
     ) -> tuple[tuple[str, ...], str, ResourceVector] | None:
         if parent.backend != "ray_worker":
             return None
+        phase_stage_ids = set(self._materializing_phase_stage_ids_locked())
         eligible_specs = tuple(
             self._stages[stage_id].spec
             for stage_id in self._reachable_udf_stage_ids[parent.stage_id]
-            if self._stages[stage_id].spec.backend == "ray_task" and not self._stages[stage_id].completed
+            if stage_id in phase_stage_ids
+            and self._stages[stage_id].spec.backend == "ray_task"
+            and not self._stages[stage_id].completed
         )
         if not eligible_specs:
             return None
@@ -1440,10 +1540,11 @@ class QueryResourceManager:
         runnable is too late because an upstream producer may already have
         consumed the last non-spillable process slot by then.
         """
+        phase_stage_ids = set(self._materializing_phase_stage_ids_locked())
         reachable = tuple(
             self._stages[stage_id]
             for stage_id in self._reachable_stage_ids[parent.stage_id]
-            if not self._stages[stage_id].completed
+            if stage_id in phase_stage_ids and not self._stages[stage_id].completed
         )
         reservations: list[_DownstreamReservation] = []
         allocation_node_ids = tuple(sorted(allocation.node_id for allocation in self.allocation.node_allocations))
@@ -1451,7 +1552,9 @@ class QueryResourceManager:
         inactive_fte = tuple(
             self._stages[stage_id].spec
             for stage_id in self._downstream_fte_stage_ids_requiring_separate_slot[parent.stage_id]
-            if not self._stages[stage_id].completed and self._active_task_count_for_stage_locked(stage_id) == 0
+            if stage_id in phase_stage_ids
+            and not self._stages[stage_id].completed
+            and self._active_task_count_for_stage_locked(stage_id) == 0
         )
         if inactive_fte:
             resources = _component_max(tuple(self._task_commitment(stage) for stage in inactive_fte))
@@ -1537,9 +1640,24 @@ class QueryResourceManager:
         *,
         requested_stage_id: str | None,
     ) -> tuple[str, ...]:
+        phase_stage_ids = set(self._materializing_phase_stage_ids_locked())
+        object_store_unlimited_stage_ids = (
+            set(
+                self._materializing_object_store_unlimited_stage_ids_locked(
+                    requested_stage_id=requested_stage_id,
+                )
+            )
+            if field_name == "object_store_bytes"
+            else set()
+        )
         stage_ids: list[str] = []
         for stage_id, stage in self._stages.items():
-            if not stage.runnable or stage.completed:
+            if (
+                stage_id not in phase_stage_ids
+                or stage_id in object_store_unlimited_stage_ids
+                or not stage.runnable
+                or stage.completed
+            ):
                 continue
             task_demand = (
                 (requested_stage_id is not None and stage_id == requested_stage_id)
@@ -1564,6 +1682,12 @@ class QueryResourceManager:
         live_stage_ids: tuple[str, ...],
     ) -> tuple[str, ...]:
         live = set(live_stage_ids)
+        phase_stage_ids = set(self._materializing_phase_stage_ids_locked())
+        object_store_unlimited_stage_ids = (
+            set(self._materializing_object_store_unlimited_stage_ids_locked())
+            if field_name == "object_store_bytes"
+            else set()
+        )
         continuation_ids: set[str] = set()
         for source_stage_id in live_stage_ids:
             if self._stages[source_stage_id].spec.backend != "ray_worker":
@@ -1572,6 +1696,8 @@ class QueryResourceManager:
                 stage = self._stages[stage_id]
                 if (
                     stage_id not in live
+                    and stage_id in phase_stage_ids
+                    and stage_id not in object_store_unlimited_stage_ids
                     and not stage.completed
                     and self._stage_dimension_commitment(stage.spec, field_name) > 0
                 ):
@@ -1599,11 +1725,28 @@ class QueryResourceManager:
         selected = set(live_stage_ids) | set(continuation_stage_ids)
         return tuple(stage_id for stage_id in self._topological_stage_ids if stage_id in selected)
 
-    def _stage_soft_block_reason_locked(self, stage_id: str, request: ResourceVector) -> str | None:
+    def _stage_soft_block_reason_locked(
+        self,
+        stage_id: str,
+        request: ResourceVector,
+        *,
+        ignore_object_store: bool = False,
+    ) -> str | None:
+        # Materialization phases define which stages receive a designated
+        # reservation; they are not an execution gate.  DuckDB can demand a
+        # downstream stage while an earlier blocking phase is still pending
+        # (nested broadcast joins do this from concurrent materializers).
+        # Match Ray Data's allocator semantics: an out-of-phase stage has no
+        # per-stage budget, while query/node hard limits and the query's
+        # object-store soft limit still apply.
+        if stage_id not in self._materializing_phase_stage_ids_locked():
+            return None
         usage_by_stage = {key: self._stage_usage_locked(key) for key in self._stages}
         current = usage_by_stage[stage_id]
         limits = self.allocation.resources
         for field_name in _RESOURCE_FIELDS:
+            if ignore_object_store and field_name == "object_store_bytes":
+                continue
             amount = getattr(request, field_name)
             if amount <= 0:
                 continue
@@ -2358,7 +2501,8 @@ class QueryResourceManager:
         delta = after - before
         object_limit = self.allocation.resources.object_store_bytes
         usage_after = self._query_usage_locked() + ResourceVector(object_store_bytes=delta)
-        if delta > 0 and usage_after.object_store_bytes > object_limit:
+        object_store_unlimited = stage.spec.stage_id in self._materializing_object_store_unlimited_stage_ids_locked()
+        if not object_store_unlimited and delta > 0 and usage_after.object_store_bytes > object_limit:
             return "query_soft_object_store_bytes", False, delta
         if delta > 0:
             try:
@@ -2368,6 +2512,7 @@ class QueryResourceManager:
             soft = self._stage_soft_block_reason_locked(
                 stage.spec.stage_id,
                 ResourceVector(object_store_bytes=delta),
+                ignore_object_store=object_store_unlimited,
             )
             if soft is not None:
                 return soft, False, delta
@@ -2783,6 +2928,11 @@ class QueryResourceManager:
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             usage = self._query_usage_locked()
+            materializing_stage_id = self._current_materializing_stage_id_locked()
+            materializing_phase_stage_ids = self._materializing_phase_stage_ids_locked()
+            materializing_object_store_unlimited_stage_ids = (
+                self._materializing_object_store_unlimited_stage_ids_locked()
+            )
             preferred_task, grant_class = self._preferred_waiting_task_locked()
             allocation_by_node = {item.node_id: item.resources for item in self.allocation.node_allocations}
             reservation_source_stage_ids = {lease.stage_id for lease in self._task_leases.values()} | {
@@ -2838,6 +2988,12 @@ class QueryResourceManager:
                     for node_id, resources in node_usage.items()
                 },
                 "reservation_ratio": self.reservation_ratio,
+                "materializing_phase": {
+                    "barrier_stage_id": materializing_stage_id,
+                    "stage_ids": list(materializing_phase_stage_ids),
+                    "object_store_backpressure_disabled": bool(materializing_object_store_unlimited_stage_ids),
+                    "object_store_unlimited_stage_ids": list(materializing_object_store_unlimited_stage_ids),
+                },
                 "cancelled": self._cancelled,
                 "cancel_reason": self._cancel_reason,
                 "external_consumer_waiting": self._external_consumer_waiting,
@@ -2918,6 +3074,11 @@ class QueryResourceManager:
                         "queued_output_bytes": stage.queued_output_bytes,
                         "pending_output_count": stage.pending_output_count,
                         "completed": stage.completed,
+                        "materialization_completed": (self._materializing_stage_completed_locked(stage_id)),
+                        "phase_eligible": stage_id in materializing_phase_stage_ids,
+                        "object_store_backpressure_disabled": (
+                            stage_id in materializing_object_store_unlimited_stage_ids
+                        ),
                         "usage": self._stage_usage_locked(stage_id).to_dict(),
                         "active_task_count": self._active_task_count_for_stage_locked(stage_id),
                     }

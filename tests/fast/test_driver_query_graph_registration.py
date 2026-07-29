@@ -166,6 +166,7 @@ def _metadata(query_id: str) -> dict:
                 "node_name": "ScanSource",
                 "input_node_ids": [],
                 "is_sink": False,
+                "is_blocking_materializing": False,
                 "num_partitions": 4,
                 "udf_payload": None,
             },
@@ -174,6 +175,7 @@ def _metadata(query_id: str) -> dict:
                 "node_name": "StreamingUDF",
                 "input_node_ids": ["0"],
                 "is_sink": False,
+                "is_blocking_materializing": False,
                 "num_partitions": 4,
                 "udf_payload": {
                     "query_id": query_id,

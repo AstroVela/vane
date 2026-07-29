@@ -549,6 +549,13 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 
 		auto finish_profile_start = std::chrono::steady_clock::now();
 		exchange->AllRequiredSinksFinished();
+		auto phase_res = fte_task_submitter->blocking_materialization_completed(self_shared->context().query_id(),
+		                                                                        self_shared->node_id());
+		if (phase_res.is_err()) {
+			result_tx_ptr->close();
+			exchange->Close();
+			return DuckDBResult<void>::err(phase_res.error());
+		}
 		auto send_res = send_new_source_handles("final");
 		if (send_res.is_err()) {
 			result_tx_ptr->close();

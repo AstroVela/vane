@@ -40,6 +40,14 @@ static vector<BoundOrderByNode> CopyOrderBys(const vector<BoundOrderByNode> &ord
 	return copies;
 }
 
+bool OrderByNode::is_blocking_materializing() const {
+	return ChildHasMultiplePartitions(child_);
+}
+
+bool TopNNode::is_blocking_materializing() const {
+	return ChildHasMultiplePartitions(child_);
+}
+
 static void FixOrderByReferenceTypes(Expression &expr, const vector<LogicalType> &input_types) {
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
 		auto &ref = expr.Cast<BoundReferenceExpression>();
@@ -810,6 +818,14 @@ SubmittableTaskStream<WorkerTask> OrderByNode::produce_tasks(PlanExecutionContex
 			DebugOrderByOutputs("range-output", range_mat_res.outputs);
 			DebugOrderByHandles("range-handles", range_handles);
 			auto range_estimated_cardinality = EstimateRowsFromHandles(range_handles, staging_estimated_cardinality);
+			auto phase_res = fte_task_submitter->blocking_materialization_completed(self_shared->context().query_id(),
+			                                                                        self_shared->node_id());
+			if (phase_res.is_err()) {
+				result_tx_ptr->close();
+				range_exchange->Close();
+				staging_exchange->Close();
+				return DuckDBResult<void>::err(phase_res.error());
+			}
 
 			auto final_tasks =
 			    BuildExchangeSourceTasks(self_shared->context(), self_shared->config(), *task_id_counter, exchange_mgr,

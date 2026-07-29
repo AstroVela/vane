@@ -58,6 +58,7 @@ public:
 	void SubmitFteTaskEvents(const std::vector<WorkerTask> &tasks);
 	void TaskInputStreamExhaustedForQuery(const string &query_id,
 	                                      const std::unordered_set<duckdb::distributed::SourceNodeId> &source_node_ids);
+	void BlockingMaterializationCompleted(const string &query_id, duckdb::distributed::NodeID node_id);
 	QueryStatus
 	FteQueryStatus(const string &query_id,
 	               const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>

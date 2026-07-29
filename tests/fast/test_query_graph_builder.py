@@ -27,6 +27,7 @@ def _metadata():
                 "node_name": "ScanSource",
                 "input_node_ids": [],
                 "is_sink": False,
+                "is_blocking_materializing": False,
                 "num_partitions": 36,
                 "udf_payload": None,
             },
@@ -35,6 +36,7 @@ def _metadata():
                 "node_name": "StreamingUDF",
                 "input_node_ids": ["1"],
                 "is_sink": False,
+                "is_blocking_materializing": False,
                 "num_partitions": 36,
                 "udf_payload": {
                     "execution_backend": "ray_task",
@@ -51,6 +53,7 @@ def _metadata():
                 "node_name": "StreamingUDF",
                 "input_node_ids": ["2"],
                 "is_sink": False,
+                "is_blocking_materializing": False,
                 "num_partitions": 1,
                 "udf_payload": {
                     "execution_backend": "ray_actor",
@@ -68,6 +71,7 @@ def _metadata():
                 "node_name": "CopyFinish",
                 "input_node_ids": ["3"],
                 "is_sink": True,
+                "is_blocking_materializing": True,
                 "num_partitions": 1,
                 "udf_payload": None,
             },
@@ -91,6 +95,18 @@ def test_builder_registers_complete_pipeline_and_nested_udf_stages_before_execut
         fte_stage_id_for_node("query-7", "4"),
     )
     assert graph.terminal_stage_ids == (fte_stage_id_for_node("query-7", "4"),)
+    assert graph.stage_by_id(fte_stage_id_for_node("query-7", "4")).spill_mode == "barrier"
+
+
+def test_builder_uses_native_materialization_metadata_instead_of_sink_shape():
+    metadata = _metadata()
+    metadata["nodes"][1]["is_blocking_materializing"] = True
+    metadata["nodes"][3]["is_blocking_materializing"] = False
+
+    graph = build_query_execution_graph(metadata, env={})
+
+    assert graph.stage_by_id(fte_stage_id_for_node("query-7", "2")).spill_mode == "barrier"
+    assert graph.stage_by_id(fte_stage_id_for_node("query-7", "4")).spill_mode == "streaming"
 
 
 def test_builder_counts_each_nested_ray_process_and_never_uses_zero_heap():

@@ -134,6 +134,14 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 		return DuckDBResult<void>::err(DuckDBError::internal_error(ex.what()));
 	}
 
+	auto phase_res =
+	    fte_task_submitter->blocking_materialization_completed(node->context().query_id(), node->node_id());
+	if (phase_res.is_err()) {
+		result_tx->close();
+		exchange->Close();
+		return DuckDBResult<void>::err(phase_res.error());
+	}
+
 	auto source_handles = exchange->GetSourceHandles();
 	auto source_nodes = CollectCoordinatorSourceNodes(source_handles);
 	auto estimated_cardinality = EstimateRowsFromHandles(source_handles);

@@ -306,6 +306,29 @@ def test_weighted_dominant_fairness_gives_double_share_to_weight_two_query():
     assert two.object_store_bytes / one.object_store_bytes == pytest.approx(2.0, rel=0.03)
 
 
+def test_object_store_budget_remains_fair_when_hard_minima_exhaust_cpu():
+    coordinator = ClusterQueryResourceCoordinator(
+        (_node("n1", cpu=2, heap=200, store=1_000),),
+        heartbeat_timeout_s=30,
+    )
+    for query_id in ("a", "b"):
+        coordinator.register_query(
+            _demand(
+                query_id,
+                minimum=_r(cpu=1, heap=100),
+                desired=_r(cpu=1, heap=100, store=1_000),
+            ),
+            now=0,
+        )
+
+    queries = coordinator.snapshot()["queries"]
+    allocation_a = ResourceVector.from_dict(queries["a"]["allocation"]["resources"])
+    allocation_b = ResourceVector.from_dict(queries["b"]["allocation"]["resources"])
+
+    assert allocation_a == _r(cpu=1, heap=100, store=500)
+    assert allocation_b == _r(cpu=1, heap=100, store=500)
+
+
 def test_query_desired_resources_are_downward_caps_not_capacity_overrides():
     coordinator = ClusterQueryResourceCoordinator(
         (_node("n1", cpu=32, gpu=4, heap=32_000, store=32_000),),

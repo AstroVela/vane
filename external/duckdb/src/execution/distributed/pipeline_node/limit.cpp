@@ -33,6 +33,18 @@ BoundLimitNode CopyBoundLimitNode(const BoundLimitNode &node) {
 	return BoundLimitNode();
 }
 
+bool LimitNode::is_blocking_materializing() const {
+	return ChildHasMultiplePartitions(child_);
+}
+
+bool StreamingLimitNode::is_blocking_materializing() const {
+	return ChildHasMultiplePartitions(child_);
+}
+
+bool LimitPercentNode::is_blocking_materializing() const {
+	return ChildHasMultiplePartitions(child_);
+}
+
 namespace {
 using PlanBuilder = MaterializedPlanBuilder;
 using PerTaskBuilderFactory = PerTaskMaterializedPlanBuilderFactory;

@@ -646,14 +646,33 @@ class ClusterQueryResourceCoordinator:
         extra_capacity: ResourceVector,
         total_capacity: ResourceVector,
     ) -> dict[str, ResourceVector]:
-        if not admitted or extra_capacity.is_zero():
+        if not admitted:
             return {}
 
+        # Object-store bytes are a soft flow-control budget. Allocate them
+        # independently so saturation in a hard DRF dimension (for example,
+        # all CPU consumed by query minima) cannot give one admitted query the
+        # entire store tail while another receives zero.
+        hard_extra_capacity = ResourceVector(
+            cpu=extra_capacity.cpu,
+            gpu=extra_capacity.gpu,
+            heap_bytes=extra_capacity.heap_bytes,
+        )
+        hard_total_capacity = ResourceVector(
+            cpu=total_capacity.cpu,
+            gpu=total_capacity.gpu,
+            heap_bytes=total_capacity.heap_bytes,
+        )
         headroom: dict[str, ResourceVector] = {
-            state.demand.query_id: state.demand.desired - state.demand.minimum for state in admitted
+            state.demand.query_id: ResourceVector(
+                cpu=(state.demand.desired - state.demand.minimum).cpu,
+                gpu=(state.demand.desired - state.demand.minimum).gpu,
+                heap_bytes=(state.demand.desired - state.demand.minimum).heap_bytes,
+            )
+            for state in admitted
         }
         dominant: dict[str, float] = {
-            query_id: vector.dominant_share(total_capacity) for query_id, vector in headroom.items()
+            query_id: vector.dominant_share(hard_total_capacity) for query_id, vector in headroom.items()
         }
         states_by_id = {state.demand.query_id: state for state in admitted}
         finite_limits = [
@@ -661,8 +680,6 @@ class ClusterQueryResourceCoordinator:
             for query_id in headroom
             if dominant[query_id] > 0 and math.isfinite(dominant[query_id])
         ]
-        if not finite_limits:
-            return {}
 
         def allocation_at(level: float) -> dict[str, ResourceVector]:
             result: dict[str, ResourceVector] = {}
@@ -678,34 +695,48 @@ class ClusterQueryResourceCoordinator:
 
         def feasible(level: float) -> bool:
             total = _sum_resources(list(allocation_at(level).values()))
-            return total.fits_within(extra_capacity)
+            return total.fits_within(hard_extra_capacity)
 
-        low = 0.0
-        high = max(finite_limits)
-        if feasible(high):
-            low = high
+        if finite_limits:
+            low = 0.0
+            high = max(finite_limits)
+            if feasible(high):
+                low = high
+            else:
+                for _ in range(80):
+                    middle = (low + high) / 2.0
+                    if feasible(middle):
+                        low = middle
+                    else:
+                        high = middle
+            allocated = allocation_at(low)
         else:
-            for _ in range(80):
-                middle = (low + high) / 2.0
-                if feasible(middle):
-                    low = middle
-                else:
-                    high = middle
-        allocated = allocation_at(low)
+            allocated = {state.demand.query_id: ResourceVector() for state in admitted}
 
         # Byte flooring can leave a small tail. Assign it deterministically to
         # the currently lowest weighted dominant share without exceeding demand.
         used = _sum_resources(list(allocated.values()))
-        remaining = _positive_difference(extra_capacity, used)
-        for field_name in ("heap_bytes", "object_store_bytes"):
+        remaining = _positive_difference(hard_extra_capacity, used)
+        for field_name in ("heap_bytes",):
             tail = int(getattr(remaining, field_name))
             if tail <= 0:
                 continue
+
+            def weighted_hard_share(state: _QueryState) -> float:
+                query_id = state.demand.query_id
+                minimum = state.demand.minimum
+                extra = allocated[query_id]
+                current = ResourceVector(
+                    cpu=minimum.cpu + extra.cpu,
+                    gpu=minimum.gpu + extra.gpu,
+                    heap_bytes=minimum.heap_bytes + extra.heap_bytes,
+                )
+                return current.dominant_share(hard_total_capacity) / state.demand.weight
+
             candidates = sorted(
                 admitted,
                 key=lambda state: (
-                    (state.demand.minimum + allocated[state.demand.query_id]).dominant_share(total_capacity)
-                    / state.demand.weight,
+                    weighted_hard_share(state),
                     -state.demand.priority,
                     state.sequence,
                 ),
@@ -724,6 +755,96 @@ class ClusterQueryResourceCoordinator:
                 tail -= amount
                 if tail == 0:
                     break
+
+        object_store_extras = ClusterQueryResourceCoordinator._weighted_object_store_extras(
+            admitted,
+            int(extra_capacity.object_store_bytes),
+        )
+        for state in admitted:
+            query_id = state.demand.query_id
+            allocated[query_id] = _replace_resource(
+                allocated[query_id],
+                "object_store_bytes",
+                object_store_extras.get(query_id, 0),
+            )
+        return allocated
+
+    @staticmethod
+    def _weighted_object_store_extras(
+        admitted: Sequence[_QueryState],
+        extra_capacity_bytes: int,
+    ) -> dict[str, int]:
+        """Weighted max-min allocation for the spillable query budget."""
+        capacity = max(0, int(extra_capacity_bytes))
+        if not admitted or capacity <= 0:
+            return {}
+
+        minimum = {state.demand.query_id: int(state.demand.minimum.object_store_bytes) for state in admitted}
+        desired = {state.demand.query_id: int(state.demand.desired.object_store_bytes) for state in admitted}
+        limits = [
+            desired[state.demand.query_id] / state.demand.weight
+            for state in admitted
+            if desired[state.demand.query_id] > minimum[state.demand.query_id]
+        ]
+        if not limits:
+            return {}
+
+        def allocation_at(level: float) -> dict[str, int]:
+            result: dict[str, int] = {}
+            for state in admitted:
+                query_id = state.demand.query_id
+                target = min(
+                    desired[query_id],
+                    max(
+                        minimum[query_id],
+                        level * state.demand.weight,
+                    ),
+                )
+                result[query_id] = min(
+                    desired[query_id] - minimum[query_id],
+                    max(0, math.floor(target - minimum[query_id])),
+                )
+            return result
+
+        def feasible(level: float) -> bool:
+            return sum(allocation_at(level).values()) <= capacity
+
+        low = 0.0
+        high = max(limits)
+        if feasible(high):
+            low = high
+        else:
+            for _ in range(80):
+                middle = (low + high) / 2.0
+                if feasible(middle):
+                    low = middle
+                else:
+                    high = middle
+        allocated = allocation_at(low)
+
+        # Flooring leaves at most a small integer tail. Hand out individual
+        # bytes at the lowest weighted final budget to preserve fairness and a
+        # deterministic priority/arrival-order tie break.
+        tail = capacity - sum(allocated.values())
+        while tail > 0:
+            candidates = [
+                state
+                for state in admitted
+                if allocated[state.demand.query_id] < desired[state.demand.query_id] - minimum[state.demand.query_id]
+            ]
+            if not candidates:
+                break
+            selected = min(
+                candidates,
+                key=lambda state: (
+                    (minimum[state.demand.query_id] + allocated[state.demand.query_id]) / state.demand.weight,
+                    -state.demand.priority,
+                    state.sequence,
+                    state.demand.query_id,
+                ),
+            )
+            allocated[selected.demand.query_id] += 1
+            tail -= 1
         return allocated
 
     def snapshot(self) -> dict[str, Any]:

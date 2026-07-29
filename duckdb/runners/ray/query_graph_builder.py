@@ -33,6 +33,7 @@ _NODE_FIELDS = (
     "node_name",
     "input_node_ids",
     "is_sink",
+    "is_blocking_materializing",
     "num_partitions",
     "udf_payload",
 )
@@ -144,6 +145,7 @@ def _normalize_metadata(metadata: Mapping[str, Any]) -> tuple[str, dict[str, dic
         node["input_node_ids"] = tuple(str(item).strip() for item in node["input_node_ids"])
         node["num_partitions"] = _positive_int(node["num_partitions"], "num_partitions")
         node["is_sink"] = bool(node["is_sink"])
+        node["is_blocking_materializing"] = bool(node["is_blocking_materializing"])
         if node["udf_payload"] is not None and not isinstance(node["udf_payload"], Mapping):
             raise TypeError(f"execution stage node {node_id} udf_payload must be a mapping or None")
         node["udf_payload"] = None if node["udf_payload"] is None else dict(node["udf_payload"])
@@ -353,6 +355,7 @@ def build_query_execution_graph(
         fte_stage_id = fte_stage_id_for_node(query_id, node_id)
         input_stage_ids = tuple(output_stage_by_node[parent] for parent in node["input_node_ids"])
         is_sink = bool(node["is_sink"])
+        is_blocking_materializing = bool(node["is_blocking_materializing"])
         remote_udf_driver = node_id in remote_udf_driver_node_ids
         stages.append(
             StageResourceSpec(
@@ -376,7 +379,7 @@ def build_query_execution_graph(
                 target_output_block_bytes=0 if is_sink else fte_target,
                 generator_buffer_blocks=0 if is_sink else _GENERATOR_BUFFER_BLOCKS,
                 max_concurrency=int(node["num_partitions"]),
-                spill_mode="barrier" if is_sink else "streaming",
+                spill_mode="barrier" if is_blocking_materializing else "streaming",
             )
         )
         udf_stage = _udf_stage(

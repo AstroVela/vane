@@ -6295,6 +6295,7 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
     class _CapturingWorker:
         def __init__(self):
             self.tasks = []
+            self.blocking_materialization_completions = []
 
         def submit_tasks(self, tasks):
             self.tasks.extend(tasks)
@@ -6322,6 +6323,10 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
 
         def task_input_stream_exhausted_for_query(self, _query_id, _source_node_ids):
             return []
+
+        def blocking_materialization_completed(self, query_id, node_id):
+            self.blocking_materialization_completions.append((query_id, node_id))
+            return True
 
         def prepare_shutdown(self):
             return None
@@ -6388,6 +6393,8 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
 
     assert sink_topologies
     assert len(sink_results) == len(sink_topologies)
+    assert len(worker.blocking_materialization_completions) == 1
+    assert worker.blocking_materialization_completions[0][0] == plan.idx()
     assert all(result.flight_port > 0 for result in sink_results)
     assert all(result.completion_status == "executed" for result in sink_results)
     ordinary_result = runner.execute_native(con.cursor(), _make_test_physical_plan(con), None, None)

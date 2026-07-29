@@ -39,6 +39,25 @@ def test_physical_plan_exports_complete_deterministic_execution_stage_metadata(t
         assert graph.query_id == plan.idx()
         assert all(node["node_id"] for node in first["nodes"])
         assert all(node["num_partitions"] >= 1 for node in first["nodes"])
+        assert all(isinstance(node["is_blocking_materializing"], bool) for node in first["nodes"])
+    finally:
+        con.close()
+
+
+def test_stage_collection_marks_blocking_distributed_materializers(tmp_path):
+    con = duckdb.connect()
+    try:
+        relation = _parquet_relation(con, tmp_path).repartition(2).order("x")
+        plan = _physical_plan(relation, con, "graph-materializing")
+
+        metadata = plan.collect_execution_stages(conn=con)
+        materializing_names = {node["node_name"] for node in metadata["nodes"] if node["is_blocking_materializing"]}
+        graph = build_query_execution_graph(metadata, env={})
+
+        assert {"Repartition", "OrderBy"} <= materializing_names
+        assert {stage.physical_node_id for stage in graph.stages if stage.spill_mode == "barrier"} == {
+            f"node:{node['node_id']}:fte" for node in metadata["nodes"] if node["is_blocking_materializing"]
+        }
     finally:
         con.close()
 
