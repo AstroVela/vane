@@ -73,7 +73,9 @@ def _write_tree(environment: dict[str, str], temporary_index: Path) -> str:
     """Write the worktree through a disposable index, with a safe fallback."""
     copied_index = False
     try:
-        shutil.copyfile(_git_path("index"), temporary_index)
+        # Preserve the index timestamp so Git can still detect racily clean
+        # entries after the copy.
+        shutil.copy2(_git_path("index"), temporary_index)
         copied_index = True
     except OSError:
         _git("read-tree", "HEAD", env=environment)

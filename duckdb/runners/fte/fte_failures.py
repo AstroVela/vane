@@ -12,24 +12,114 @@ if TYPE_CHECKING:
     from duckdb.runners.fte.fte_types import FteTaskAttemptId
 
 
-def _failure_text(payload: Any) -> str:
-    if payload is None:
-        return ""
-    if isinstance(payload, Mapping):
-        parts: list[str] = []
-        for key in ("error_code", "errorCode", "code", "type", "message", "error", "exception"):
-            value = payload.get(key)
-            if value is not None:
-                parts.append(str(value))
-        failure = payload.get("failure")
-        if failure is not None and failure is not payload:
-            parts.append(_failure_text(failure))
-        return " ".join(part for part in parts if part)
-    return str(payload)
+_MEMORY_FAILURE_CODES = frozenset(
+    {
+        "EXCEEDED_LOCAL_MEMORY_LIMIT",
+        "OUT_OF_MEMORY",
+    }
+)
 
 
 def _normalized_error_token(value: Any) -> str:
     return str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
+
+
+def _safe_failure_message(message: Any) -> str:
+    if message is None:
+        return ""
+    try:
+        return str(message)
+    except BaseException:
+        return f"<unprintable {type(message).__name__}>"
+
+
+def _failure_payload(
+    error_code: str,
+    message: Any,
+    *,
+    error_type: str = "INTERNAL_ERROR",
+) -> dict[str, Any]:
+    if not isinstance(error_code, str):
+        raise TypeError("FTE failure error_code must be a string")
+    code = _normalized_error_token(error_code)
+    if not code:
+        raise ValueError("FTE failure error_code must be non-empty")
+    return {
+        "error_type": _normalized_error_token(error_type),
+        "error_code": code,
+        "message": _safe_failure_message(message),
+    }
+
+
+def _normalize_failure_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise TypeError("FTE failure payload must be a mapping")
+    if "error_code" not in payload:
+        raise ValueError("FTE failure payload requires error_code")
+    raw_code = payload["error_code"]
+    if not isinstance(raw_code, str):
+        raise TypeError("FTE failure payload error_code must be a string")
+    code = _normalized_error_token(raw_code)
+    if not code:
+        raise ValueError("FTE failure payload requires error_code")
+    normalized = dict(payload)
+    normalized["error_code"] = code
+    if "error_type" in normalized:
+        normalized["error_type"] = _normalized_error_token(normalized["error_type"])
+    return normalized
+
+
+_UNREADABLE_EXCEPTION_ATTRIBUTE = object()
+
+
+def _read_exception_attribute(error: BaseException, attribute: str) -> Any:
+    try:
+        return getattr(error, attribute, None)
+    except BaseException:
+        return _UNREADABLE_EXCEPTION_ATTRIBUTE
+
+
+def _failure_exception_matches(
+    error: Any,
+    exception_types: tuple[type[BaseException], ...],
+) -> bool:
+    if not issubclass(type(error), BaseException):
+        return False
+    candidates = [error]
+    candidate_ids = {id(error)}
+    candidate_index = 0
+    while candidate_index < len(candidates) and candidate_index < 16:
+        candidate = candidates[candidate_index]
+        candidate_index += 1
+        if issubclass(type(candidate), exception_types):
+            return True
+        converted = _read_exception_attribute(candidate, "as_instanceof_cause")
+        if callable(converted):
+            try:
+                converted_cause = converted()
+            except BaseException:
+                converted_cause = None
+            if issubclass(type(converted_cause), BaseException) and id(converted_cause) not in candidate_ids:
+                candidate_ids.add(id(converted_cause))
+                candidates.append(converted_cause)
+        chained_causes = [
+            cause
+            for cause in (
+                _read_exception_attribute(candidate, "cause"),
+                _read_exception_attribute(candidate, "__cause__"),
+            )
+            if issubclass(type(cause), BaseException)
+        ]
+        suppress_context = _read_exception_attribute(candidate, "__suppress_context__")
+        if not chained_causes and suppress_context is False:
+            context = _read_exception_attribute(candidate, "__context__")
+            if issubclass(type(context), BaseException):
+                chained_causes.append(context)
+        for cause in chained_causes:
+            if issubclass(type(cause), BaseException) and id(cause) not in candidate_ids:
+                candidate_ids.add(id(cause))
+                candidates.append(cause)
+    return False
 
 
 def _failure_field(payload: Any, *keys: str) -> Any:
@@ -107,15 +197,11 @@ def _failure_allows_retry(payload: Any, *, default: bool = True) -> bool:
 
 
 def _missing_output_stats_failure(attempt_id: FteTaskAttemptId) -> dict[str, Any]:
-    return {
-        "error_type": "INTERNAL_ERROR",
-        "error_code": "MISSING_SPOOLING_OUTPUT_STATS",
-        "message": (f"Treating FINISHED task {attempt_id} as FAILED because spooling output stats are missing"),
-    }
+    return _failure_payload(
+        "MISSING_SPOOLING_OUTPUT_STATS",
+        f"Treating FINISHED task {attempt_id} as FAILED because spooling output stats are missing",
+    )
 
 
 def _is_memory_failure(payload: Any) -> bool:
-    text = _failure_text(payload).lower()
-    return any(
-        token in text for token in ("out_of_memory", "out of memory", "oom", "memory limit", "exceeded_local_memory")
-    )
+    return _normalize_failure_payload(payload)["error_code"] in _MEMORY_FAILURE_CODES

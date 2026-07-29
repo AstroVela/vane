@@ -739,6 +739,7 @@ def test_native_task_result_handle_rejects_mismatched_status_identity():
     assert poll.error is not None
     assert "status identity mismatch" in str(poll.error)
     assert callback_events[-1][0]["state"] == FteTaskState.FAILED.value
+    assert callback_events[-1][0]["failure"]["error_code"] == "NATIVE_BACKEND_ERROR"
     assert callback_events[-1][1] is poll.error
 
     with pytest.raises(RuntimeError, match="status identity mismatch"):
@@ -748,6 +749,25 @@ def test_native_task_result_handle_rejects_mismatched_status_identity():
     with pytest.raises(RuntimeError, match="status identity mismatch"):
         handle.info_snapshot()
     assert callback_events[-1][1] is not None
+
+
+def test_native_task_result_handle_validates_enum_terminal_failure_payload():
+    task = _task_id(0, query_id="query-native-enum-terminal")
+
+    class _EnumTerminalWorker:
+        worker_id = "native-worker-enum-terminal"
+
+        def fte_get_task_status_cached(self, _task_id):
+            return {
+                "state": FteTaskState.FAILED,
+                "task_id": task,
+                "failure": {"message": "out of memory"},
+            }
+
+    handle = NativeTaskResultHandle(_EnumTerminalWorker(), task)
+
+    with pytest.raises(ValueError, match="requires error_code"):
+        handle.status_snapshot()
 
 
 def test_native_backend_rejects_mismatched_create_task_identity():

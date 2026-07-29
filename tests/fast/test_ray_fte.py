@@ -12,7 +12,7 @@ import pytest
 
 from duckdb.runners.common import QueryDeadlineExceeded
 from duckdb.runners.fte.fte_config import FteWorkerAdmissionConfig
-from duckdb.runners.fte.fte_failures import _failure_allows_retry
+from duckdb.runners.fte.fte_failures import _failure_allows_retry, _failure_payload
 from duckdb.runners.fte.fte_scheduler import (
     FteSplitQueueTerminal,
     FteSplitSubmissionCancelled,
@@ -882,7 +882,10 @@ def test_fte_task_execution_terminal_status_refreshes_split_stats_with_fallback(
         "completed_split_count": 0,
         "completed_input_bytes": 0,
     }
-    execution.status.state = FteTaskState.FAILED
+    execution._transition(
+        FteTaskState.FAILED,
+        failure=_failure_payload("GENERIC_INTERNAL_ERROR", "task failed"),
+    )
     refreshed_status = {
         "completed_split_count": 1,
         "completed_input_bytes": 128,
@@ -925,13 +928,16 @@ def test_fte_task_execution_late_no_more_splits_is_terminal_noop(terminal_state)
         execute_fn,
         default_task_memory_bytes=1,
     )
-    failure = None
-    if terminal_state == FteTaskState.FAILED:
-        failure = {
-            "type": "RuntimeError",
-            "message": "existing failure",
-            "traceback": "existing traceback",
-        }
+    failure_codes = {
+        FteTaskState.FAILED: "GENERIC_INTERNAL_ERROR",
+        FteTaskState.CANCELED: "TASK_CANCELED",
+        FteTaskState.ABORTED: "TASK_ABORTED",
+    }
+    failure = (
+        None
+        if terminal_state == FteTaskState.FINISHED
+        else _failure_payload(failure_codes[terminal_state], "existing failure")
+    )
     execution._transition(terminal_state, failure=failure)
     state_before = execution.status.state
     version_before = execution.status.version
@@ -1684,7 +1690,13 @@ def test_two_stage_query_dag_worker_loss_uses_selected_attempt_for_final_result(
     lost_path = exchange.record_output_file(scheduled0.sink_instance, 0, "lost", b"999\n")
     exchange.finish_attempt(scheduled0.sink_instance)
 
-    retries = upstream.mark_worker_failed("worker-a", "host lost before status was observed")
+    retries = upstream.mark_worker_failed(
+        "worker-a",
+        {
+            "error_code": "WORKER_LOST",
+            "message": "host lost before status was observed",
+        },
+    )
     assert len(retries) == 1
     retry = retries[0]
     selected_path = exchange.record_output_file(retry.sink_instance, 0, "selected", b"10\n20\n")
@@ -1728,6 +1740,49 @@ def test_two_stage_query_dag_worker_loss_uses_selected_attempt_for_final_result(
     assert exchange.cleanup_unselected_attempts() == 1
     assert not Path(scheduled0.sink_instance.attempt_path).exists()
     assert Path(retry.sink_instance.attempt_path).exists()
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (
+            fte_fragment_scheduler.ray.exceptions.OutOfMemoryError("ray node exhausted memory"),
+            "OUT_OF_MEMORY",
+        ),
+        (RuntimeError("bloom filter construction failed"), "WORKER_LOST"),
+        (RuntimeError("out of memory"), "WORKER_LOST"),
+    ],
+)
+def test_fte_worker_failure_payload_uses_structured_exception_type(error, expected_code):
+    failure = fte_fragment_scheduler._worker_failure_payload("worker-a", error)
+
+    assert failure["error_code"] == expected_code
+
+
+def test_fte_worker_failure_payload_reads_structured_exception_chain():
+    error = RuntimeError("worker RPC failed")
+    error.__cause__ = fte_fragment_scheduler.ray.exceptions.OutOfMemoryError("ray node exhausted memory")
+
+    failure = fte_fragment_scheduler._worker_failure_payload("worker-a", error)
+
+    assert failure["error_code"] == "OUT_OF_MEMORY"
+
+
+def test_fte_worker_failure_payload_preserves_normalized_structured_code():
+    failure = fte_fragment_scheduler._worker_failure_payload(
+        "worker-a",
+        {
+            "error_code": "out-of-memory",
+            "message": "Ray node exhausted memory",
+        },
+    )
+
+    assert failure["error_code"] == "OUT_OF_MEMORY"
+
+
+def test_fte_worker_failure_payload_rejects_unstructured_text():
+    with pytest.raises(TypeError, match="exception or structured failure payload"):
+        fte_fragment_scheduler._worker_failure_payload("worker-a", "out of memory")
 
 
 class _FakeLiveWorker:
@@ -1784,7 +1839,14 @@ class _FakeLiveWorker:
 
     def fte_cancel_task(self, task_id):
         self.calls.append(("cancel", task_id))
-        return {"state": "CANCELED", "task_id": task_id}
+        return {
+            "state": "CANCELED",
+            "task_id": task_id,
+            "failure": {
+                "error_code": "TASK_CANCELED",
+                "message": "task canceled",
+            },
+        }
 
     def set_fte_task_execution_class(self, task_id, execution_class):
         self.calls.append(
@@ -2271,7 +2333,14 @@ def test_fte_worker_command_executor_reports_terminal_task_during_split_wait():
             return {
                 "has_space": False,
                 "terminal": True,
-                "status": {"state": FteTaskState.FAILED.value, "task_id": task_id},
+                "status": {
+                    "state": FteTaskState.FAILED.value,
+                    "task_id": task_id,
+                    "failure": {
+                        "error_code": "GENERIC_INTERNAL_ERROR",
+                        "message": "task failed",
+                    },
+                },
             }
 
     attempt_id = FteTaskAttemptId(FteTaskId("q-terminal-splits", 0, 1), 0)
@@ -2746,6 +2815,32 @@ def test_fte_fragment_execution_appends_descriptor_before_add_splits_command_fai
     assert [split.data for split in descriptor.initial_splits["7"]] == [b"a", b"b"]
 
 
+def test_fte_worker_control_failure_preserves_unprintable_cause():
+    class _UnprintableError(RuntimeError):
+        def __str__(self):
+            raise RuntimeError("exception message is unreadable")
+
+    cause = _UnprintableError()
+    attempt_id = FteTaskAttemptId(FteTaskId("q-unprintable-control", 0, 0), 0)
+
+    failure = FteWorkerControlFailure(
+        worker_id="worker-unprintable-control",
+        attempt_id=attempt_id,
+        method_name="fte_add_splits",
+        cause=cause,
+    )
+
+    assert failure.cause is cause
+    assert str(failure).endswith("<unprintable _UnprintableError>")
+    assert (
+        fte_fragment_scheduler._worker_failure_payload(
+            failure.worker_id,
+            failure,
+        )["error_code"]
+        == "WORKER_LOST"
+    )
+
+
 def test_fte_fragment_execution_backpressures_until_split_queue_recovers():
     class _RecoveringSplitQueueWorker(_FakeLiveWorker):
         def __init__(self):
@@ -2860,6 +2955,13 @@ def test_fte_fragment_execution_revoke_unsealed_speculative_waits_for_seal():
     assert worker.calls[-1] == ("cancel", scheduled[0].attempt_id.to_dict())
     assert stage.schedule_next_pending_partition() is None
     assert stage.partitions[0].ready_for_scheduling is False
+    assert stage.partitions[0].failures == [
+        {
+            "error_type": "INTERNAL_ERROR",
+            "error_code": "SPECULATIVE_ATTEMPT_REVOKED",
+            "message": "memory pressure",
+        }
+    ]
 
     scheduled_after_seal = stage.seal_partition(0)
 
@@ -3249,7 +3351,13 @@ def test_fte_fragment_execution_retry_replays_accumulated_descriptor():
         )
     )
     _execute_stage_commands(stage, initial)
-    retry = stage.task_failed(FteTaskAttemptId(FteTaskId("q", 4, 0), 0), "lost")
+    retry = stage.task_failed(
+        FteTaskAttemptId(FteTaskId("q", 4, 0), 0),
+        {
+            "error_code": "GENERIC_INTERNAL_ERROR",
+            "message": "bloom filter construction failed",
+        },
+    )
     _execute_stage_commands(stage)
 
     assert retry is not None
@@ -3261,6 +3369,36 @@ def test_fte_fragment_execution_retry_replays_accumulated_descriptor():
     assert retry_request["initial_splits"]["7"][0]["data"] == b"a"
     assert retry_request["no_more_splits"] == ["7"]
     assert stage.partitions[0].remaining_attempts == 1
+
+
+def test_fte_fragment_execution_rejects_terminal_status_without_error_code():
+    worker = _FakeLiveWorker()
+    stage = _fte_fragment_execution(
+        "q-failure-code",
+        4,
+        fragment_id="q-failure-code:node:scan",
+        worker=worker,
+        max_attempts=2,
+    )
+    scheduled = stage.seal_partition(0)
+
+    assert scheduled is not None
+    with pytest.raises(ValueError, match="requires error_code"):
+        stage.handle_task_status(
+            {
+                "state": FteTaskState.FAILED.value,
+                "task_id": scheduled.attempt_id.to_dict(),
+                "failure": {"message": "out of memory"},
+                "task_stats": {"completed_split_count": 1},
+            }
+        )
+
+    partition = stage.partitions[0]
+    assert partition.failed is False
+    assert partition.failures == []
+    assert partition.running_task_stats == {}
+    assert partition.running_attempt is not None
+    assert partition.running_attempt.attempt_id == scheduled.attempt_id
 
 
 def test_fte_fragment_execution_oom_is_terminal_for_fixed_heap():
@@ -3501,7 +3639,14 @@ def test_fte_fragment_execution_handle_failed_status_retries_with_replayed_descr
     )
     scheduled0 = scheduled_result[0]
     _execute_stage_commands(stage, scheduled_result)
-    worker.set_status(scheduled0.attempt_id.to_dict(), "FAILED", failure={"message": "lost"})
+    worker.set_status(
+        scheduled0.attempt_id.to_dict(),
+        "FAILED",
+        failure={
+            "error_code": "GENERIC_INTERNAL_ERROR",
+            "message": "lost",
+        },
+    )
 
     retries = _handle_live_worker_statuses(stage)
     _execute_stage_commands(stage)
@@ -3565,6 +3710,7 @@ def test_fte_fragment_execution_handle_fatal_status_fails_without_retry():
         "FAILED",
         failure={
             "error_type": "INTERNAL_ERROR",
+            "error_code": "COORDINATOR_FAILURE",
             "fatal": True,
             "message": "coordinator cannot recover",
         },
@@ -3595,7 +3741,10 @@ def test_fte_fragment_execution_handle_canceled_status_fails_without_retry_by_de
     worker.set_status(
         scheduled.attempt_id.to_dict(),
         "CANCELED",
-        failure={"message": "query canceled"},
+        failure={
+            "error_code": "TASK_CANCELED",
+            "message": "query canceled",
+        },
     )
 
     retries = _handle_live_worker_statuses(stage)
@@ -3650,7 +3799,14 @@ def test_fte_fragment_execution_handle_failed_status_marks_stage_failed_when_att
     scheduled = stage.apply_assignment_result(
         AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
     )[0]
-    worker.set_status(scheduled.attempt_id.to_dict(), "FAILED", failure={"message": "fatal"})
+    worker.set_status(
+        scheduled.attempt_id.to_dict(),
+        "FAILED",
+        failure={
+            "error_code": "GENERIC_INTERNAL_ERROR",
+            "message": "fatal",
+        },
+    )
 
     retries = _handle_live_worker_statuses(stage)
 
@@ -3698,7 +3854,13 @@ def test_fte_fragment_execution_worker_lost_uses_retry_attempt_as_durable_output
     lost_path = exchange.record_output_file(scheduled0.sink_instance, 0, "lost", b"lost")
     exchange.finish_attempt(scheduled0.sink_instance)
 
-    retries = stage.mark_worker_failed("worker-a", "actor died before status was observed")
+    retries = stage.mark_worker_failed(
+        "worker-a",
+        {
+            "error_code": "WORKER_LOST",
+            "message": "actor died before status was observed",
+        },
+    )
     _execute_stage_commands(stage)
 
     assert len(retries) == 1
@@ -3762,7 +3924,13 @@ def test_fte_fragment_execution_retries_base_remote_exchange_sink_instance():
     )
     scheduled0 = scheduled_result[0]
     _execute_stage_commands(stage, scheduled_result)
-    retry = stage.task_failed(scheduled0.attempt_id, "lost worker")
+    retry = stage.task_failed(
+        scheduled0.attempt_id,
+        {
+            "error_code": "WORKER_LOST",
+            "message": "lost worker",
+        },
+    )
     _execute_stage_commands(stage)
 
     assert retry is not None
@@ -3836,7 +4004,10 @@ def test_fte_fragment_execution_handle_task_status_accepts_task_id_string():
         {
             "task_id_string": str(scheduled.attempt_id),
             "state": FteTaskState.CANCELED,
-            "failure": {"message": "canceled"},
+            "failure": {
+                "error_code": "TASK_CANCELED",
+                "message": "canceled",
+            },
         },
         retryable=False,
     )
@@ -4488,6 +4659,7 @@ def test_fte_worker_task_manager_finalization_failure_is_terminal_and_releases_s
             timeout=2.0,
         )
         assert first_terminal["state"] == FteTaskState.FAILED.value
+        assert first_terminal["failure"]["error_code"] == "GENERIC_INTERNAL_ERROR"
         assert first_terminal["failure"]["message"].startswith(failure_message)
         assert complete_dynamic_source_splits_calls == 1
         assert first_execution.result is None

@@ -24,6 +24,7 @@ from duckdb.runners.fte.dynamic_inputs import (
     strip_fte_dynamic_context,
 )
 from duckdb.runners.fte.fte_config import FTE_WORKER_RUNTIME, FteWorkerAdmissionConfig
+from duckdb.runners.fte.fte_failures import _failure_payload, _normalize_failure_payload
 from duckdb.runners.fte.fte_state import FteTaskState
 from duckdb.runners.fte.fte_types import (
     FteTaskAttemptId,
@@ -599,11 +600,14 @@ class NativeTaskResultHandle:
         except Exception:
             pass
 
-    def _failure_status(self) -> dict[str, Any]:
+    def _failure_status(self, error: BaseException) -> dict[str, Any]:
+        failure = _failure_payload("NATIVE_BACKEND_ERROR", error)
+        failure["type"] = type(error).__name__
         return {
             "state": FteTaskState.FAILED.value,
             "task_id": self._task_id.to_dict(),
             "task_id_string": str(self._task_id),
+            "failure": failure,
         }
 
     def _validated_status(self, status: Any, *, operation: str) -> dict[str, Any]:
@@ -611,6 +615,14 @@ class NativeTaskResultHandle:
             raise TypeError(f"{operation} must return a status mapping")
         result = dict(status)
         validate_fte_status_identity(result, self._task_id)
+        raw_state = result.get("state")
+        state = raw_state.value if isinstance(raw_state, FteTaskState) else str(raw_state or "").upper()
+        if state in {
+            FteTaskState.FAILED.value,
+            FteTaskState.CANCELED.value,
+            FteTaskState.ABORTED.value,
+        }:
+            result["failure"] = _normalize_failure_payload(result.get("failure"))
         return result
 
     def status_snapshot(self) -> dict[str, Any]:
@@ -620,7 +632,7 @@ class NativeTaskResultHandle:
                 operation="fte_get_task_status_cached",
             )
         except BaseException as exc:
-            self._record_status(self._failure_status(), exc)
+            self._record_status(self._failure_status(exc), exc)
             raise
         self._record_status(status)
         return status
@@ -637,7 +649,7 @@ class NativeTaskResultHandle:
             )
             info["status"] = status
         except BaseException as exc:
-            self._record_status(self._failure_status(), exc)
+            self._record_status(self._failure_status(exc), exc)
             raise
         self._record_status(status)
         return info
@@ -649,11 +661,12 @@ class NativeTaskResultHandle:
                 operation="fte_get_task_status_cached",
             )
         except BaseException as exc:
-            self._record_status(self._failure_status(), exc)
+            self._record_status(self._failure_status(exc), exc)
             return TaskResultPoll(TaskResultState.ERROR, error=exc)
 
         self._record_status(status)
-        state = str(status.get("state") or "").upper()
+        raw_state = status.get("state")
+        state = raw_state.value if isinstance(raw_state, FteTaskState) else str(raw_state or "").upper()
         if state not in _TERMINAL_STATE_VALUES:
             return TaskResultPoll(TaskResultState.NOT_READY)
         if state == FteTaskState.FINISHED.value:
@@ -661,11 +674,11 @@ class NativeTaskResultHandle:
             if result is None:
                 return TaskResultPoll(TaskResultState.NO_OUTPUT)
             return TaskResultPoll(TaskResultState.MATERIALIZED_OUTPUT, output=result)
-        failure = status.get("failure")
-        message = failure.get("message") if isinstance(failure, Mapping) else None
+        failure = _normalize_failure_payload(status.get("failure"))
+        message = failure.get("message")
         return TaskResultPoll(
             TaskResultState.ERROR,
-            error=RuntimeError(message or f"native FTE task {self._task_id} ended with {state}"),
+            error=RuntimeError(message or f"native FTE task {self._task_id} ended with {failure['error_code']}"),
         )
 
     def done(self) -> bool:
@@ -1586,7 +1599,8 @@ class NativeFteWorkerManagerBackend:
         progress_stats = cls._progress_stats_from_status(status)
         failure = status.get("failure")
         if error is not None:
-            failure = {"type": type(error).__name__, "message": str(error)}
+            failure = _failure_payload("NATIVE_BACKEND_ERROR", error)
+            failure["type"] = type(error).__name__
         running_attempts = []
         if running:
             running_attempts.append(
@@ -1674,7 +1688,12 @@ class NativeFteWorkerManagerBackend:
             try:
                 status = handle.status_snapshot()
             except BaseException as exc:
-                status = {"state": FteTaskState.FAILED.value}
+                failure = _failure_payload("NATIVE_BACKEND_ERROR", exc)
+                failure["type"] = type(exc).__name__
+                status = {
+                    "state": FteTaskState.FAILED.value,
+                    "failure": failure,
+                }
                 status_error = exc
             partition = self._partition_metrics_from_handle(handle, status, error=status_error)
             partition_metrics[(query_id, handle.fragment_id, str(handle.task_id.partition_id))] = partition

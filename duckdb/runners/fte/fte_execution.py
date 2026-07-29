@@ -37,8 +37,11 @@ from duckdb.runners.fte.fte_exchange import (
 )
 from duckdb.runners.fte.fte_failures import (
     _failure_allows_retry,
+    _failure_payload,
     _is_memory_failure,
     _missing_output_stats_failure,
+    _normalize_failure_payload,
+    _safe_failure_message,
 )
 from duckdb.runners.fte.fte_split_assigner import (
     PartitionUpdate,
@@ -82,7 +85,7 @@ class FteWorkerControlFailure(RuntimeError):
         self.cause = cause
         super().__init__(
             f"FTE worker {self.worker_id or '<unknown>'} failed during "
-            f"{self.method_name} for {self.attempt_id}: {cause}"
+            f"{self.method_name} for {self.attempt_id}: {_safe_failure_message(cause)}"
         )
 
 
@@ -154,7 +157,7 @@ class FteTaskPartition:
         self.selected_attempt: int | None = None
         self.finished_attempts: dict[int, FinishedAttempt] = {}
         self.selected_output_stats: Any = None
-        self.failures: list[Any] = []
+        self.failures: list[dict[str, Any]] = []
         self.ready_for_scheduling = bool(self.sealed)
         self.execution_ready_deferred = False
         self.node_wait_started_at: float | None = None
@@ -324,7 +327,7 @@ class FteTaskPartition:
     def mark_attempt_failed(
         self,
         attempt_id: FteTaskAttemptId | str | Mapping[str, Any],
-        error: Any = None,
+        error: dict[str, Any],
         *,
         retryable: bool = True,
     ) -> ReadyTask | None:
@@ -363,7 +366,7 @@ class FteTaskPartition:
     def revoke_attempt(
         self,
         attempt_id: FteTaskAttemptId | str | Mapping[str, Any],
-        error: Any = None,
+        error: dict[str, Any],
     ) -> RevokedAttempt | None:
         attempt = FteTaskAttemptId.coerce(attempt_id)
         self._validate_attempt_task(attempt)
@@ -1256,21 +1259,22 @@ class FteFragmentExecution:
     def task_failed(
         self,
         attempt_id: FteTaskAttemptId | str | Mapping[str, Any],
-        error: Any = None,
+        error: Mapping[str, Any],
         *,
         retryable: bool = True,
         schedule_retry: bool = True,
     ) -> ScheduledAttempt | None:
         attempt = FteTaskAttemptId.coerce(attempt_id)
+        failure = _normalize_failure_payload(error)
         should_schedule = False
         with self._state_lock:
             partition = self.partitions[attempt.partition_id]
             running = partition.running_attempts.get(attempt.attempt_id)
-            failure_retryable = retryable and _failure_allows_retry(error)
+            failure_retryable = retryable and _failure_allows_retry(failure)
             if self.exchange is not None and partition.sink_handle is not None:
                 self.exchange.sink_aborted(partition.sink_handle, attempt.attempt_id)
-            ready = partition.mark_attempt_failed(attempt, error, retryable=failure_retryable)
-            if ready is not None and _is_memory_failure(error):
+            ready = partition.mark_attempt_failed(attempt, failure, retryable=failure_retryable)
+            if ready is not None and _is_memory_failure(failure):
                 partition.failed = True
                 partition.ready_for_scheduling = False
                 partition.execution_ready_deferred = False
@@ -1305,6 +1309,10 @@ class FteFragmentExecution:
         limit = None if max_count is None else max(0, int(max_count))
         if limit == 0:
             return revoked
+        failure = _failure_payload(
+            "SPECULATIVE_ATTEMPT_REVOKED",
+            reason or "speculative task revoked",
+        )
         try:
             with self._state_lock:
                 reached_limit = False
@@ -1330,7 +1338,7 @@ class FteFragmentExecution:
                             self.exchange.sink_aborted(partition.sink_handle, running.attempt_id.attempt_id)
                         revoked_attempt = partition.revoke_attempt(
                             running.attempt_id,
-                            reason or "speculative task revoked",
+                            failure,
                         )
                         if revoked_attempt is None:
                             continue
@@ -1350,7 +1358,7 @@ class FteFragmentExecution:
     def mark_worker_failed(
         self,
         worker_id: str,
-        error: Any = None,
+        error: Mapping[str, Any],
         *,
         retryable: bool = True,
         retryable_by_partition_id: Mapping[int, bool] | None = None,
@@ -1437,6 +1445,9 @@ class FteFragmentExecution:
             return None
         attempt_id = self._attempt_id_from_status(status)
         state = self._task_state_from_status(status)
+        terminal_failure = None
+        if state in (FteTaskState.FAILED, FteTaskState.CANCELED, FteTaskState.ABORTED):
+            terminal_failure = _normalize_failure_payload(status.get("failure"))
         task_stats = _task_status_progress_stats(status)
         raw_task_stats = status.get("task_stats")
         if isinstance(raw_task_stats, Mapping):
@@ -1458,11 +1469,11 @@ class FteFragmentExecution:
                 )
             self.task_finished(attempt_id, output_stats)
             return None
-        if state in (FteTaskState.FAILED, FteTaskState.CANCELED, FteTaskState.ABORTED):
+        if terminal_failure is not None:
             status_retryable = retryable and state == FteTaskState.FAILED
             return self.task_failed(
                 attempt_id,
-                status.get("failure") or dict(status),
+                terminal_failure,
                 retryable=status_retryable,
                 schedule_retry=schedule_retry,
             )

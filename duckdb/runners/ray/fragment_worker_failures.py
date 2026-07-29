@@ -14,6 +14,7 @@ from duckdb.runners.ray.fragment_registry import (
 from duckdb.runners.ray.fte_fragment_scheduler import (
     _fte_retry_remaining_delay_s,
     _mark_fte_worker_failed,
+    _worker_failure_payload,
 )
 
 
@@ -31,6 +32,7 @@ def quarantine_fte_worker(worker_id: str) -> frozenset[str]:
 
 
 def mark_fte_worker_failed_for_event(event: Any) -> list[tuple[str, str, list[Any], list[Any]]]:
+    failure = _worker_failure_payload(event.worker_id, event.error)
     with _FTE_REGISTRY_LOCK:
         if str(event.query_id) in _FTE_CLOSING_QUERIES:
             return []
@@ -47,7 +49,7 @@ def mark_fte_worker_failed_for_event(event: Any) -> list[tuple[str, str, list[An
         return []
     scheduled_by_stage = _mark_fte_worker_failed(
         event.worker_id,
-        event.error,
+        failure,
         query_id_filter=event.query_id,
         failed_worker_ids_override=new_failed_worker_ids,
     )

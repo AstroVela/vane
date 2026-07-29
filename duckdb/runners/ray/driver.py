@@ -38,6 +38,7 @@ from duckdb.runners.fte import (
     fte_status_wait_timeout_s,
     validate_fte_status_identity,
 )
+from duckdb.runners.fte.fte_failures import _normalize_failure_payload, _safe_failure_message
 from duckdb.runners.progress import ProgressRenderer, progress_enabled
 from duckdb.runners.ray.admission_ledger import BoundedReplayMap
 from duckdb.runners.ray.ray_env import collect_vane_env_overrides, scrub_shared_runtime_session_env
@@ -707,14 +708,14 @@ class FteWorkerTaskHandle:
 
     @staticmethod
     def _is_soft_status_wait_timeout(exc: BaseException) -> bool:
-        if isinstance(exc, QueryDeadlineExceeded) or "query deadline expired" in str(exc).lower():
+        message = _safe_failure_message(exc)
+        if issubclass(type(exc), QueryDeadlineExceeded) or "query deadline expired" in message.lower():
             return False
-        if isinstance(exc, TimeoutError):
+        if issubclass(type(exc), TimeoutError):
             return True
-        name = exc.__class__.__name__
+        name = type(exc).__name__
         if name in {"TimeoutError", "GetTimeoutError"}:
             return True
-        message = str(exc)
         return "did not complete within" in message or "timed out" in message.lower()
 
     async def _watch_status(self) -> Any:
@@ -763,10 +764,12 @@ class FteWorkerTaskHandle:
             if self._worker_failure_publish_started:
                 return
             self._worker_failure_publish_started = True
+        contextual_error = RuntimeError(f"{failure_kind} for {self.task_id}: {_safe_failure_message(exc)}")
+        contextual_error.__cause__ = exc
         await asyncio.to_thread(
             self.worker_handle.mark_fte_worker_failed,
             self.worker_id,
-            f"{failure_kind} for {self.task_id}: {exc}",
+            contextual_error,
         )
 
     async def _finalize_status_watch_failure(
@@ -785,12 +788,12 @@ class FteWorkerTaskHandle:
                 failure_kind=failure_kind,
             )
         except Exception as cleanup_exc:
-            cleanup_errors.append(f"worker failure publication failed: {cleanup_exc}")
+            cleanup_errors.append(f"worker failure publication failed: {_safe_failure_message(cleanup_exc)}")
         try:
             await asyncio.to_thread(self._record_fte_task_terminal)
         except Exception as cleanup_exc:
-            cleanup_errors.append(f"terminal record failed: {cleanup_exc}")
-        message = str(exc)
+            cleanup_errors.append(f"terminal record failed: {_safe_failure_message(cleanup_exc)}")
+        message = _safe_failure_message(exc)
         if cleanup_errors:
             message += "; cleanup also failed: " + "; ".join(cleanup_errors)
         terminal_error = exc if not cleanup_errors and isinstance(exc, Exception) else RuntimeError(message)
@@ -977,11 +980,8 @@ class FteWorkerTaskHandle:
             # FteAttemptStatusWatcher is the sole scheduler/status writer for
             # every terminal state.  The result handle only converts the
             # observed transport terminal into its local consumer result.
-            failure = status.get("failure") or {}
-            if isinstance(failure, dict):
-                message = failure.get("message") or failure.get("type") or state.value
-            else:
-                message = str(failure)
+            failure = _normalize_failure_payload(status.get("failure"))
+            message = failure.get("message") or failure["error_code"]
             self._error = RuntimeError(f"FTE task {self.task_id} {state.value}: {message}")
             self._record_fte_task_terminal()
             self._is_done = True

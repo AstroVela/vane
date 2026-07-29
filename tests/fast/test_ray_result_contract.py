@@ -3901,7 +3901,13 @@ def test_fte_output_publication_is_bounded_by_block_target_and_task_window():
 
 class _RequiredFteWorkerCallbacks:
     def fte_cancel_task(self, _task_id):
-        return {"state": "CANCELED"}
+        return {
+            "state": "CANCELED",
+            "failure": {
+                "error_code": "TASK_CANCELED",
+                "message": "task canceled",
+            },
+        }
 
     def mark_fte_worker_failed(self, _worker_id, _error):
         return []
@@ -3953,7 +3959,14 @@ class _FakeFteStatusWorker(_RequiredFteWorkerCallbacks):
 
     def fte_cancel_task(self, task_id):
         self.calls.append(("cancel", task_id))
-        self.status = {"state": "CANCELED", "task_id": task_id}
+        self.status = {
+            "state": "CANCELED",
+            "task_id": task_id,
+            "failure": {
+                "error_code": "TASK_CANCELED",
+                "message": "task canceled",
+            },
+        }
         return dict(self.status)
 
     def fte_ack_task_result(self, task_id):
@@ -4482,7 +4495,10 @@ def test_fte_worker_task_handle_does_not_publish_failed_status_event():
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
     worker.status = {
         "state": "FAILED",
-        "failure": {"message": "remote failed"},
+        "failure": {
+            "error_code": "GENERIC_INTERNAL_ERROR",
+            "message": "remote failed",
+        },
     }
     handle = driver.FteWorkerTaskHandle(task_id, worker)
 
@@ -4501,7 +4517,10 @@ def test_fte_worker_task_handle_does_not_adopt_retry_from_data_plane():
             return {
                 "state": "FAILED",
                 "task_id": task_id,
-                "failure": {"message": "retryable"},
+                "failure": {
+                    "error_code": "GENERIC_INTERNAL_ERROR",
+                    "message": "retryable",
+                },
                 "version": 1,
             }
 
@@ -4552,7 +4571,88 @@ def test_fte_worker_task_handle_malformed_status_fails_worker_and_records_termin
     assert handle.done() is True
     assert len(worker.worker_failures) == 1
     assert worker.worker_failures[0][0] == "worker-malformed-status"
-    assert "status protocol failed" in worker.worker_failures[0][1]
+    assert "status protocol failed" in str(worker.worker_failures[0][1])
+    assert worker.terminal_attempts == ["q.1.2.0"]
+
+
+def test_fte_worker_task_handle_preserves_ray_oom_type_when_publishing_worker_failure():
+    class _OomStatusWorker(_RequiredFteWorkerCallbacks):
+        worker_id = "worker-oom-status"
+
+        def __init__(self, error):
+            self.error = error
+            self.worker_failures = []
+            self.terminal_attempts = []
+
+        def fte_wait_task_status(self, _task_id, _min_version, _timeout_s):
+            raise self.error
+
+        def mark_fte_worker_failed(self, worker_id, error):
+            self.worker_failures.append((worker_id, error))
+            return []
+
+        def record_fte_task_terminal(self, task_id):
+            self.terminal_attempts.append(str(driver.FteTaskAttemptId.coerce(task_id)))
+
+    oom_error = driver.ray.exceptions.OutOfMemoryError("Ray killed the worker for memory pressure")
+    worker = _OomStatusWorker(oom_error)
+    handle = driver.FteWorkerTaskHandle(
+        {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
+        worker,
+    )
+
+    with pytest.raises(driver.ray.exceptions.OutOfMemoryError, match="memory pressure"):
+        asyncio.run(handle.get_result())
+
+    assert len(worker.worker_failures) == 1
+    worker_id, published_error = worker.worker_failures[0]
+    assert worker_id == "worker-oom-status"
+    assert "status wait failed" in str(published_error)
+    assert published_error.__cause__ is oom_error
+    from duckdb.runners.ray.fte_fragment_scheduler import _worker_failure_payload
+
+    assert _worker_failure_payload(worker_id, published_error)["error_code"] == "OUT_OF_MEMORY"
+    assert worker.terminal_attempts == ["q.1.2.0"]
+
+
+def test_fte_worker_task_handle_publishes_failure_with_unprintable_message():
+    class _UnprintableError(RuntimeError):
+        def __str__(self):
+            raise RuntimeError("exception message is unreadable")
+
+    class _StatusWorker(_RequiredFteWorkerCallbacks):
+        worker_id = "worker-unprintable-status"
+
+        def __init__(self, error):
+            self.error = error
+            self.worker_failures = []
+            self.terminal_attempts = []
+
+        def fte_wait_task_status(self, _task_id, _min_version, _timeout_s):
+            raise self.error
+
+        def mark_fte_worker_failed(self, worker_id, error):
+            self.worker_failures.append((worker_id, error))
+            return []
+
+        def record_fte_task_terminal(self, task_id):
+            self.terminal_attempts.append(str(driver.FteTaskAttemptId.coerce(task_id)))
+
+    failure = _UnprintableError()
+    worker = _StatusWorker(failure)
+    handle = driver.FteWorkerTaskHandle(
+        {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
+        worker,
+    )
+
+    with pytest.raises(_UnprintableError):
+        asyncio.run(handle.get_result())
+
+    assert len(worker.worker_failures) == 1
+    worker_id, published_error = worker.worker_failures[0]
+    assert worker_id == "worker-unprintable-status"
+    assert str(published_error).endswith("<unprintable _UnprintableError>")
+    assert published_error.__cause__ is failure
     assert worker.terminal_attempts == ["q.1.2.0"]
 
 
@@ -4820,7 +4920,13 @@ def test_fte_worker_task_handle_failed_status_raises_result_error():
     worker = _FakeFteStatusWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
     handle = driver.FteWorkerTaskHandle(task_id, worker)
-    worker.status = {"state": "FAILED", "failure": {"message": "boom"}}
+    worker.status = {
+        "state": "FAILED",
+        "failure": {
+            "error_code": "GENERIC_INTERNAL_ERROR",
+            "message": "boom",
+        },
+    }
 
     assert _wait_batch_ready(handle) == [0]
     with pytest.raises(RuntimeError, match="boom"):

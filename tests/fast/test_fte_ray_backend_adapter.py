@@ -41,7 +41,13 @@ class _FakeWorkerHandle:
 
     def fte_cancel_task(self, task_id):
         self.calls.append(("fte_cancel_task", (task_id,)))
-        return {"state": "CANCELED"}
+        return {
+            "state": "CANCELED",
+            "failure": {
+                "error_code": "TASK_CANCELED",
+                "message": "task canceled",
+            },
+        }
 
     def optional_method(self):
         return "delegated"
@@ -60,7 +66,13 @@ def test_ray_worker_handle_adapter_delegates_worker_protocol_methods():
     assert adapter.fte_no_more_splits("task.0", "source-a") == {"state": "UPDATED"}
     assert adapter.fte_update_task("task.0", {"x": 1})["update"] == {"x": 1}
     assert adapter.fte_wait_task_status("task.0", 3, 0.5) == {"state": "RUNNING", "version": 3}
-    assert adapter.fte_cancel_task("task.0") == {"state": "CANCELED"}
+    assert adapter.fte_cancel_task("task.0") == {
+        "state": "CANCELED",
+        "failure": {
+            "error_code": "TASK_CANCELED",
+            "message": "task canceled",
+        },
+    }
     assert adapter.optional_method() == "delegated"
 
     assert fake.calls == [
