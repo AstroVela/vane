@@ -94,6 +94,7 @@ struct ExtensionInstallOptions {
 class ExtensionHelper {
 public:
 	static void LoadAllExtensions(DuckDB &db);
+	static bool IsExtensionLinked(const string &extension);
 	static vector<string> LoadedExtensionTestPaths();
 	static ExtensionLoadResult LoadExtension(DuckDB &db, const std::string &extension);
 

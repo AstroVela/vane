@@ -505,8 +505,11 @@ def _configure_duckdb_s3(
 
     try:
         conn.execute("LOAD httpfs")
-    except Exception:
-        conn.execute("INSTALL httpfs; LOAD httpfs")
+    except Exception as exc:
+        raise RuntimeError(
+            "Ray S3 configuration requires the statically linked httpfs extension; "
+            "runtime extension installation is disabled"
+        ) from exc
 
     def _q(s: str) -> str:
         return s.replace("'", "''")

@@ -8,6 +8,10 @@ void ExtensionHelper::LoadAllExtensions(DuckDB &db) {
 	// nop
 }
 
+bool ExtensionHelper::IsExtensionLinked(const string &) {
+	return false;
+}
+
 vector<string> ExtensionHelper::LoadedExtensionTestPaths() {
 	return {};
 }

@@ -8,6 +8,8 @@ struct PyPhysicalPlanWrapper;
 struct PyLogicalPlan {
 	string query_id_;
 	string serialized_logical_plan_;
+	// Driver-local source connection; intentionally omitted from pickle state.
+	py::object source_connection_ = py::none();
 	duckdb::shared_ptr<duckdb::Relation> relation_;
 	py::object udf_registrations_ = py::none();
 	py::object connection_snapshot_ = py::none();
@@ -79,6 +81,26 @@ static py::dict CopyPyDict(const py::dict &source) {
 		result[item.first] = item.second;
 	}
 	return result;
+}
+
+static bool IsExtensionSecuritySetting(const string &lower_name) {
+	return lower_name == "allow_unsigned_extensions" || lower_name == "autoinstall_known_extensions" ||
+	       lower_name == "autoload_known_extensions";
+}
+
+static py::dict SanitizeBootstrapConfig(const py::dict &config) {
+	py::dict sanitized;
+	// Preserve absent options so file-backed connections keep DuckDB's
+	// configuration identity; Vane's build defaults all three settings to OFF.
+	for (auto item : config) {
+		auto name = duckdb::StringUtil::Lower(py::str(item.first).cast<string>());
+		if (IsExtensionSecuritySetting(name)) {
+			sanitized[py::str(name)] = py::str("false");
+			continue;
+		}
+		sanitized[item.first] = item.second;
+	}
+	return sanitized;
 }
 
 static py::object LookupBootstrapSnapshot(const py::object &snapshot_obj) {
@@ -225,16 +247,29 @@ static bool PythonObjectsEqual(const py::handle &lhs, const py::handle &rhs) {
 	return compare_result == 1;
 }
 
+static string BootstrapDatabasePath(const py::object &bootstrap_obj) {
+	if (bootstrap_obj.is_none() || !py::isinstance<py::dict>(bootstrap_obj)) {
+		return ":memory:";
+	}
+	auto bootstrap = bootstrap_obj.cast<py::dict>();
+	if (!bootstrap.contains(py::str("database")) || bootstrap[py::str("database")].is_none()) {
+		return ":memory:";
+	}
+	return py::str(bootstrap[py::str("database")]).cast<string>();
+}
+
+static bool BootstrapUsesInMemoryDatabase(const py::object &bootstrap_obj) {
+	auto database = BootstrapDatabasePath(bootstrap_obj);
+	return duckdb::DBConfig::IsInMemoryDatabase(database.c_str());
+}
+
 static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootstrap_obj) {
 	if (IsDefaultBootstrapSnapshot(bootstrap_obj)) {
 		return py::cast(DuckDBPyConnection::Connect(py::str(":memory:"), false, py::dict()));
 	}
 
 	auto bootstrap = bootstrap_obj.cast<py::dict>();
-	py::object database_obj = py::str(":memory:");
-	if (bootstrap.contains(py::str("database")) && !bootstrap[py::str("database")].is_none()) {
-		database_obj = py::str(bootstrap[py::str("database")]);
-	}
+	auto database = BootstrapDatabasePath(bootstrap_obj);
 
 	bool read_only = false;
 	if (bootstrap.contains(py::str("read_only")) && !bootstrap[py::str("read_only")].is_none()) {
@@ -246,7 +281,21 @@ static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootst
 	    py::isinstance<py::dict>(bootstrap[py::str("config")])) {
 		config = CopyPyDict(bootstrap[py::str("config")].cast<py::dict>());
 	}
-	return py::cast(DuckDBPyConnection::Connect(database_obj, read_only, config));
+	auto connection = DuckDBPyConnection::Connect(py::str(database), read_only, SanitizeBootstrapConfig(config));
+	// Keep the source bootstrap identity for connection matching even though
+	// worker extension security settings are forced off.
+	connection->SetConnectionBootstrapConfig(database, read_only, config);
+	return py::cast(std::move(connection));
+}
+
+static py::object CreateSnapshotBaselineConnection(DuckDBPyConnection &source_conn, const py::object &bootstrap_obj) {
+	if (BootstrapUsesInMemoryDatabase(bootstrap_obj)) {
+		return CreateConnectionFromBootstrapSnapshot(bootstrap_obj);
+	}
+	// A fresh cursor preserves the existing file-database baseline: database-
+	// global settings remain defaults while connection-local overrides differ.
+	// It also avoids reopening a live file with sanitized bootstrap settings.
+	return py::cast(source_conn.Cursor());
 }
 
 static bool ConnectionMatchesBootstrapSnapshot(py::object conn_obj, const py::object &snapshot_obj) {
@@ -259,6 +308,20 @@ static bool ConnectionMatchesBootstrapSnapshot(py::object conn_obj, const py::ob
 	return PythonObjectsEqual(actual_bootstrap, normalized_required);
 }
 
+static bool ConnectionsShareDatabaseInstance(const py::object &lhs_obj, const py::object &rhs_obj) {
+	if (lhs_obj.is_none() || rhs_obj.is_none()) {
+		return false;
+	}
+	auto &lhs_wrapper = ExtractPyConnectionWrapper(lhs_obj);
+	auto &rhs_wrapper = ExtractPyConnectionWrapper(rhs_obj);
+	if (lhs_wrapper.con.ConnectionIsClosed() || rhs_wrapper.con.ConnectionIsClosed()) {
+		return false;
+	}
+	auto &lhs = lhs_wrapper.con.GetConnection();
+	auto &rhs = rhs_wrapper.con.GetConnection();
+	return &duckdb::DatabaseInstance::GetDatabase(*lhs.context) == &duckdb::DatabaseInstance::GetDatabase(*rhs.context);
+}
+
 static py::object ResolveConnectionForSnapshot(py::object conn_obj, const py::object &snapshot_obj) {
 	auto bootstrap_obj = LookupBootstrapSnapshot(snapshot_obj);
 	if (bootstrap_obj.is_none() || IsDefaultBootstrapSnapshot(bootstrap_obj)) {
@@ -268,6 +331,23 @@ static py::object ResolveConnectionForSnapshot(py::object conn_obj, const py::ob
 		return conn_obj;
 	}
 	return CreateConnectionFromBootstrapSnapshot(bootstrap_obj);
+}
+
+static py::object ResolvePlanningConnectionForSnapshot(py::object conn_obj, const py::object &source_conn_obj,
+                                                       const py::object &snapshot_obj) {
+	auto bootstrap_obj = LookupBootstrapSnapshot(snapshot_obj);
+	if (bootstrap_obj.is_none() || IsDefaultBootstrapSnapshot(bootstrap_obj) ||
+	    ConnectionMatchesBootstrapSnapshot(conn_obj, snapshot_obj)) {
+		return conn_obj;
+	}
+	if (!BootstrapUsesInMemoryDatabase(bootstrap_obj) && !source_conn_obj.is_none() &&
+	    ConnectionMatchesBootstrapSnapshot(source_conn_obj, snapshot_obj)) {
+		// The source DatabaseInstance may still be alive. Reopening its file with
+		// the sanitized worker configuration violates DuckDB's instance cache;
+		// a cursor shares that instance without running database initialization.
+		return py::cast(ExtractPyConnectionWrapper(source_conn_obj).Cursor());
+	}
+	return ResolveConnectionForSnapshot(conn_obj, snapshot_obj);
 }
 
 struct QueryPythonReplayState {
@@ -297,10 +377,19 @@ struct ConnectionSettingRecord {
 	string scope;
 };
 
+static void EnforceExtensionSecuritySettings(duckdb::Connection &conn) {
+	// Snapshot replay can run with a query-local result collector installed, so
+	// update the configuration without executing SET statements.
+	auto &config = duckdb::DBConfig::GetConfig(*conn.context);
+	config.SetOptionByName("allow_unsigned_extensions", duckdb::Value::BOOLEAN(false));
+	config.SetOptionByName("autoinstall_known_extensions", duckdb::Value::BOOLEAN(false));
+	config.SetOptionByName("autoload_known_extensions", duckdb::Value::BOOLEAN(false));
+}
+
 static bool ShouldSkipConnectionSettingSnapshot(const string &name, const string &input_type) {
 	auto lower_name = duckdb::StringUtil::Lower(name);
 	auto upper_input_type = duckdb::StringUtil::Upper(input_type);
-	if (lower_name == "duckdb_api") {
+	if (lower_name == "duckdb_api" || IsExtensionSecuritySetting(lower_name)) {
 		return true;
 	}
 	if (upper_input_type.find('[') != string::npos) {
@@ -456,7 +545,7 @@ static void ApplyEffectiveVaneSessionConfig(duckdb::Connection &conn, const py::
 	ApplyVaneSessionConfigValues(conn, config_obj.cast<py::dict>());
 }
 
-static std::vector<string> QueryLoadedExtensionNames(DuckDBPyConnection &conn_wrapper) {
+static std::vector<string> QueryLoadedNonStaticExtensionNames(DuckDBPyConnection &conn_wrapper) {
 	std::vector<string> extensions;
 	auto result =
 	    ExecuteSnapshotQuery(conn_wrapper.con.GetConnection(), "SELECT extension_name "
@@ -503,19 +592,18 @@ static std::vector<ConnectionSettingRecord> QueryConnectionSettings(DuckDBPyConn
 	return settings;
 }
 
-static void TryLoadSnapshotExtension(DuckDBPyConnection &conn_wrapper, const string &extension_name,
-                                     bool allow_install) {
-	auto &conn = conn_wrapper.con.GetConnection();
-	try {
-		ExecuteSnapshotQuery(conn, "LOAD " + extension_name);
-		return;
-	} catch (...) {
-	}
-	if (!allow_install) {
+static void RejectNonStaticRayExtensions(const std::vector<string> &extension_names) {
+	if (extension_names.empty()) {
 		return;
 	}
-	ExecuteSnapshotQuery(conn, "INSTALL " + extension_name);
-	ExecuteSnapshotQuery(conn, "LOAD " + extension_name);
+	auto joined_names = extension_names.front();
+	for (idx_t index = 1; index < extension_names.size(); index++) {
+		joined_names += ", " + extension_names[index];
+	}
+	throw duckdb::InvalidInputException("Ray distributed execution supports only statically linked extensions; "
+	                                    "non-static extensions are not supported: "
+	                                    "%s",
+	                                    joined_names);
 }
 
 static bool VaneRaySessionLifecycleEnabled() {
@@ -528,24 +616,17 @@ static bool VaneRaySessionLifecycleEnabled() {
 
 static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper) {
 	auto bootstrap_obj = conn_wrapper.ExportConnectionBootstrapConfig();
-	auto loaded_extensions = QueryLoadedExtensionNames(conn_wrapper);
+	auto non_static_extensions = QueryLoadedNonStaticExtensionNames(conn_wrapper);
+	RejectNonStaticRayExtensions(non_static_extensions);
 	auto source_settings = QueryConnectionSettings(conn_wrapper);
 
-	auto default_conn_obj = CreateConnectionFromBootstrapSnapshot(bootstrap_obj);
+	auto default_conn_obj = CreateSnapshotBaselineConnection(conn_wrapper, bootstrap_obj);
 	auto &default_conn = ExtractPyConnectionWrapper(default_conn_obj);
-	for (const auto &extension_name : loaded_extensions) {
-		TryLoadSnapshotExtension(default_conn, extension_name, false);
-	}
 	auto default_settings = QueryConnectionSettings(default_conn);
 	std::unordered_map<string, string> default_setting_values;
 	default_setting_values.reserve(default_settings.size());
 	for (const auto &record : default_settings) {
 		default_setting_values[duckdb::StringUtil::Lower(record.name)] = record.value;
-	}
-
-	py::list extensions_obj;
-	for (const auto &extension_name : loaded_extensions) {
-		extensions_obj.append(py::str(extension_name));
 	}
 
 	py::list settings_obj;
@@ -577,7 +658,9 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper) {
 	if (has_bootstrap) {
 		snapshot_obj[py::str("bootstrap")] = NormalizeBootstrapSnapshot(bootstrap_obj);
 	}
-	snapshot_obj[py::str("extensions")] = std::move(extensions_obj);
+	// Keep the field for snapshot compatibility; capture rejects any non-static
+	// extension before reaching this point.
+	snapshot_obj[py::str("extensions")] = py::list();
 	snapshot_obj[py::str("settings")] = std::move(settings_obj);
 	if (VaneRaySessionLifecycleEnabled()) {
 		conn_wrapper.MarkVaneRaySessionOpened();
@@ -586,7 +669,7 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper) {
 }
 
 static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snapshot_obj,
-                                    bool apply_session_config = true) {
+                                    bool apply_session_config = true, bool enforce_extension_security = true) {
 	if (snapshot_obj.is_none()) {
 		return;
 	}
@@ -594,22 +677,31 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 		throw duckdb::InvalidInputException("Connection snapshot must be a dict");
 	}
 
-	auto &conn_wrapper = ExtractPyConnectionWrapper(conn_obj);
 	auto snapshot = snapshot_obj.cast<py::dict>();
+	std::vector<string> extension_names;
 	if (snapshot.contains(py::str("extensions"))) {
 		auto extensions_obj = snapshot[py::str("extensions")];
 		if (!extensions_obj.is_none() && py::isinstance<py::list>(extensions_obj)) {
 			for (auto item : extensions_obj.cast<py::list>()) {
 				auto extension_name = py::str(item).cast<string>();
-				if (extension_name.empty()) {
-					continue;
+				if (!extension_name.empty()) {
+					extension_names.push_back(std::move(extension_name));
 				}
-				TryLoadSnapshotExtension(conn_wrapper, extension_name, true);
 			}
 		}
 	}
+	RejectNonStaticRayExtensions(extension_names);
+
+	auto &conn_wrapper = ExtractPyConnectionWrapper(conn_obj);
+	auto &conn = conn_wrapper.con.GetConnection();
+	if (enforce_extension_security) {
+		// Distributed snapshot replay never inherits settings that permit
+		// runtime downloads or unsigned extension binaries.
+		EnforceExtensionSecuritySettings(conn);
+	}
+
 	if (apply_session_config) {
-		ApplyVaneSessionConfig(conn_wrapper.con.GetConnection(), snapshot_obj);
+		ApplyVaneSessionConfig(conn, snapshot_obj);
 	}
 
 	if (!snapshot.contains(py::str("settings"))) {
@@ -633,7 +725,7 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 		auto input_type = setting_obj.contains(py::str("input_type"))
 		                      ? py::str(setting_obj[py::str("input_type")]).cast<string>()
 		                      : string("VARCHAR");
-		if (setting_name.empty()) {
+		if (setting_name.empty() || IsExtensionSecuritySetting(duckdb::StringUtil::Lower(setting_name))) {
 			continue;
 		}
 		string sql_value;
@@ -642,7 +734,7 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 		} else {
 			sql_value = QuoteSQLStringLiteral(setting_value);
 		}
-		ExecuteSnapshotQuery(conn_wrapper.con.GetConnection(), "SET " + setting_name + " = " + sql_value);
+		ExecuteSnapshotQuery(conn, "SET " + setting_name + " = " + sql_value);
 	}
 }
 

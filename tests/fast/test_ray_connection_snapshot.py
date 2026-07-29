@@ -412,6 +412,192 @@ def test_pickled_physical_plan_replays_connection_snapshot_on_execute_native():
     assert worker_cursor.execute("SELECT current_setting('TimeZone')").fetchone()[0] == "UTC"
 
 
+def test_snapshot_replay_rejects_non_static_extensions_without_installing(tmp_path):
+    ray_cxx = _require_ray_cxx()
+
+    source_conn = duckdb.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT 1"),
+        "snapshot-missing-extension",
+    )
+    physical_plan = logical_plan.to_physical_plan(duckdb.connect())
+    state = list(physical_plan.__getstate__())
+    snapshot = dict(state[6])
+    snapshot["extensions"] = ["sqlite_scanner"]
+    state[6] = snapshot
+
+    replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    replay_plan.__setstate__(tuple(state))
+
+    extension_directory = tmp_path / "extensions"
+    worker_connection = duckdb.connect(
+        config={
+            "autoinstall_known_extensions": "false",
+            "autoload_known_extensions": "false",
+            "extension_directory": str(extension_directory),
+        }
+    )
+    worker_connection.execute("SET custom_extension_repository = 'http://127.0.0.1:9'")
+
+    with pytest.raises(Exception) as exc_info:
+        ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+            worker_connection.cursor(),
+            replay_plan,
+        )
+
+    message = str(exc_info.value)
+    assert "supports only statically linked extensions" in message
+    assert "sqlite_scanner" in message
+    assert "Failed to download extension" not in message
+    assert not extension_directory.exists()
+
+
+def test_snapshot_bootstrap_is_sanitized_before_connect(tmp_path):
+    ray_cxx = _require_ray_cxx()
+
+    source_conn = duckdb.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT 1"),
+        "snapshot-bootstrap-extension-security",
+    )
+    physical_plan = logical_plan.to_physical_plan(duckdb.connect())
+    state = list(physical_plan.__getstate__())
+    snapshot = dict(state[6])
+    extension_directory = tmp_path / "bootstrap-extensions"
+    snapshot["bootstrap"] = {
+        "database": ":memory:",
+        "read_only": False,
+        "config": {
+            "allow_unsigned_extensions": "true",
+            "autoinstall_known_extensions": "true",
+            "autoload_known_extensions": "true",
+            "custom_extension_repository": "http://127.0.0.1:9",
+            "extension_directory": str(extension_directory),
+            "sqlite_all_varchar": "true",
+        },
+    }
+    snapshot["extensions"] = ["sqlite_scanner"]
+    state[6] = snapshot
+
+    replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    replay_plan.__setstate__(tuple(state))
+
+    with pytest.raises(Exception) as exc_info:
+        ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+            duckdb.connect().cursor(),
+            replay_plan,
+        )
+
+    assert not extension_directory.exists()
+    message = str(exc_info.value)
+    assert "sqlite_all_varchar" in message
+    assert "sqlite_scanner" in message
+    assert "not statically linked" in message
+
+
+def test_snapshot_bootstrap_applies_static_extension_settings_after_connect(tmp_path):
+    ray_cxx = _require_ray_cxx()
+
+    source_conn = duckdb.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql(
+            """
+            SELECT
+                CAST(current_setting('http_timeout') AS BIGINT) AS timeout,
+                CAST(current_setting('allow_unsigned_extensions') AS BOOLEAN) AS allow_unsigned,
+                CAST(current_setting('autoinstall_known_extensions') AS BOOLEAN) AS autoinstall,
+                CAST(current_setting('autoload_known_extensions') AS BOOLEAN) AS autoload
+            """
+        ),
+        "snapshot-bootstrap-static-extension-setting",
+    )
+    state = list(logical_plan.__getstate__())
+    snapshot = dict(state[3])
+    extension_directory = tmp_path / "bootstrap-extensions"
+    snapshot["bootstrap"] = {
+        "database": ":memory:",
+        "read_only": False,
+        "config": {
+            "allow_unsigned_extensions": "true",
+            "autoinstall_known_extensions": "true",
+            "autoload_known_extensions": "true",
+            "custom_extension_repository": "http://127.0.0.1:9",
+            "extension_directory": str(extension_directory),
+            "http_timeout": "41",
+        },
+    }
+    snapshot["settings"] = [
+        setting for setting in snapshot.get("settings", []) if setting.get("name", "").lower() != "http_timeout"
+    ]
+    state[3] = snapshot
+
+    replay_logical_plan = ray_cxx.PyLogicalPlan.__new__(ray_cxx.PyLogicalPlan)
+    replay_logical_plan.__setstate__(tuple(state))
+    physical_plan = replay_logical_plan.to_physical_plan(duckdb.connect())
+    restored_plan = pickle.loads(pickle.dumps(physical_plan))
+    result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+        duckdb.connect().cursor(),
+        restored_plan,
+    )
+
+    table = _table_from_native_result(result)
+    assert [table.column(index).to_pylist() for index in range(4)] == [
+        [41],
+        [False],
+        [False],
+        [False],
+    ]
+    assert not extension_directory.exists()
+
+
+def test_snapshot_replay_keeps_extension_security_settings_disabled():
+    ray_cxx = _require_ray_cxx()
+    snapshot_setting_names = (
+        "autoinstall_known_extensions",
+        "autoload_known_extensions",
+    )
+    setting_names = (
+        "allow_unsigned_extensions",
+        *snapshot_setting_names,
+    )
+    settings_query = f"""
+        SELECT name, value
+        FROM duckdb_settings()
+        WHERE name IN ({", ".join(repr(name) for name in setting_names)})
+        ORDER BY name
+    """
+
+    source_connection = duckdb.connect()
+    for name in snapshot_setting_names:
+        source_connection.execute(f"SET {name} = true")
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_connection.sql("SELECT 1"),
+        "snapshot-extension-security-settings",
+    )
+    physical_plan = logical_plan.to_physical_plan(duckdb.connect())
+    state = list(physical_plan.__getstate__())
+    snapshot = dict(state[6])
+    captured_setting_names = {setting["name"].lower() for setting in snapshot["settings"]}
+    assert captured_setting_names.isdisjoint(setting_names)
+    snapshot["settings"] = [
+        *snapshot["settings"],
+        *({"name": name, "value": "true", "input_type": "BOOLEAN"} for name in setting_names),
+    ]
+    state[6] = snapshot
+    replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    replay_plan.__setstate__(tuple(state))
+
+    worker_connection = duckdb.connect(config={name: "true" for name in setting_names})
+    assert dict(worker_connection.execute(settings_query).fetchall()) == {name: "true" for name in setting_names}
+
+    ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+        worker_connection.cursor(),
+        replay_plan,
+    )
+
+    assert dict(worker_connection.execute(settings_query).fetchall()) == {name: "false" for name in setting_names}
+
+
 def test_pickled_physical_plan_replays_bootstrap_and_runtime_connection_snapshot():
     ray_cxx = _require_ray_cxx()
 
@@ -437,20 +623,106 @@ def test_pickled_physical_plan_replays_bootstrap_and_runtime_connection_snapshot
     assert table.column(1).to_pylist() == ["UTC"]
 
 
+def test_logical_plan_capture_planning_and_execution_preserve_file_database_security_config(tmp_path):
+    ray_cxx = _require_ray_cxx()
+    database_path = str(tmp_path / "capture-bootstrap.duckdb")
+    setting_names = (
+        "allow_unsigned_extensions",
+        "autoinstall_known_extensions",
+        "autoload_known_extensions",
+    )
+    settings_query = f"""
+        SELECT name, value
+        FROM duckdb_settings()
+        WHERE name IN ({", ".join(repr(name) for name in setting_names)})
+        ORDER BY name
+    """
+    source_conn = duckdb.connect(
+        database_path,
+        config={name: "true" for name in setting_names},
+    )
+    source_settings = dict(source_conn.execute(settings_query).fetchall())
+
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT 1 AS value"),
+        "file-security-setting",
+    )
+
+    assert logical_plan.idx() == "file-security-setting"
+    assert source_settings == {name: "true" for name in setting_names}
+
+    physical_plan = logical_plan.to_physical_plan(duckdb.connect())
+
+    assert physical_plan.idx() == "file-security-setting"
+    restored_plan = pickle.loads(pickle.dumps(physical_plan))
+    assert dict(source_conn.execute(settings_query).fetchall()) == source_settings
+    source_conn.close()
+    del logical_plan
+    del physical_plan
+    gc.collect()
+
+    worker_conn = duckdb.connect(config={name: "true" for name in setting_names})
+    assert dict(worker_conn.execute(settings_query).fetchall()) == {name: "true" for name in setting_names}
+
+    restored_result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+        worker_conn.cursor(),
+        restored_plan,
+    )
+
+    assert _table_from_native_result(restored_result).column(0).to_pylist() == [1]
+
+
+def test_file_database_table_scan_reopens_bootstrap_on_worker(tmp_path):
+    ray_cxx = _require_ray_cxx()
+    database_path = str(tmp_path / "table-scan-bootstrap.duckdb")
+    source_conn = duckdb.connect(database_path)
+    source_conn.execute("CREATE TABLE numbers AS SELECT i AS value FROM range(10) data(i)")
+
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT sum(value) AS total FROM numbers"),
+        "snapshot-file-table-scan",
+    )
+    physical_plan = logical_plan.to_physical_plan(duckdb.connect())
+    restored_plan = pickle.loads(pickle.dumps(physical_plan))
+
+    result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+        duckdb.connect().cursor(),
+        restored_plan,
+    )
+
+    assert _table_from_native_result(result).column(0).to_pylist() == [45]
+
+
 def test_effective_session_config_reaches_nondefault_bootstrap_connection(tmp_path):
     ray_cxx = _require_ray_cxx()
     database_path = str(tmp_path / "session-bootstrap.duckdb")
     source_conn = duckdb.connect(database_path)
     source_conn.execute("LOAD httpfs")
-    source_conn.execute("SET GLOBAL s3_access_key_id='source-placeholder-key'")
-    relation = source_conn.sql("SELECT CAST(current_setting('s3_access_key_id') AS VARCHAR) AS access_key")
+    source_conn.execute("SET GLOBAL s3_access_key_id='database-key'")
+    source_conn.execute("SET GLOBAL s3_secret_access_key='database-secret'")
+    source_conn.execute("SET GLOBAL s3_session_token='database-token'")
+    relation = source_conn.sql(
+        "SELECT current_setting('s3_access_key_id') AS access_key, "
+        "current_setting('s3_secret_access_key') AS secret_key, "
+        "current_setting('s3_session_token') AS session_token"
+    )
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         "snapshot-effective-session-config",
     )
+    assert logical_plan.has_explicit_s3_credentials() is False
+    snapshot_setting_names = {setting["name"].lower() for setting in logical_plan.__getstate__()[3]["settings"]}
+    assert snapshot_setting_names.isdisjoint(
+        {
+            "s3_access_key_id",
+            "s3_secret_access_key",
+            "s3_session_token",
+        }
+    )
     effective_config = {
         "AWS_ACCESS_KEY_ID": "resolved-profile-key",
         "AWS_SECRET_ACCESS_KEY": "resolved-profile-secret",
+        "AWS_SESSION_TOKEN": "resolved-profile-token",
     }
 
     physical_plan = logical_plan.to_physical_plan(
@@ -464,7 +736,33 @@ def test_effective_session_config_reaches_nondefault_bootstrap_connection(tmp_pa
         effective_session_config=effective_config,
     )
 
-    assert _table_from_native_result(result).column(0).to_pylist() == ["resolved-profile-key"]
+    table = _table_from_native_result(result)
+    assert [table.column(index).to_pylist() for index in range(3)] == [
+        ["resolved-profile-key"],
+        ["resolved-profile-secret"],
+        ["resolved-profile-token"],
+    ]
+
+
+def test_file_database_snapshot_baseline_ignores_database_target_settings(tmp_path):
+    ray_cxx = _require_ray_cxx()
+    database_path = str(tmp_path / "read-only-bootstrap.duckdb")
+    duckdb.connect(database_path).close()
+    source_conn = duckdb.connect(database_path, config={"access_mode": "READ_ONLY"})
+
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT 1 AS value"),
+        "snapshot-file-target-settings",
+    )
+    snapshot_setting_names = {setting["name"].lower() for setting in logical_plan.__getstate__()[3]["settings"]}
+
+    assert snapshot_setting_names.isdisjoint({"access_mode", "temp_directory"})
+    physical_plan = logical_plan.to_physical_plan(duckdb.connect())
+    result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+        duckdb.connect().cursor(),
+        physical_plan,
+    )
+    assert _table_from_native_result(result).column(0).to_pylist() == [1]
 
 
 def test_explicit_connection_s3_settings_override_effective_session_config():

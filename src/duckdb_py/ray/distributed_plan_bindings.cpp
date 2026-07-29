@@ -976,13 +976,15 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 		throw duckdb::InternalException("Logical plan is empty and no relation is available");
 	}
 
-	py::object planning_conn = ResolveConnectionForSnapshot(conn_obj, connection_snapshot_);
+	py::object planning_conn = ResolvePlanningConnectionForSnapshot(conn_obj, source_connection_, connection_snapshot_);
 	auto &conn_wrapper = ExtractPyConnectionWrapper(planning_conn);
 	// Resolved environment/profile credentials are the session baseline. Replay
 	// the source connection last so an explicit SET on that connection keeps
 	// DuckDB's normal explicit-config-over-environment precedence.
 	ApplyEffectiveVaneSessionConfig(conn_wrapper.con.GetConnection(), effective_session_config);
-	ApplyConnectionSnapshot(planning_conn, connection_snapshot_, effective_session_config.is_none());
+	const bool shares_source_database = ConnectionsShareDatabaseInstance(planning_conn, source_connection_);
+	ApplyConnectionSnapshot(planning_conn, connection_snapshot_, effective_session_config.is_none(),
+	                        !shares_source_database);
 	if (!udf_registrations_.is_none()) {
 		conn_wrapper.ApplyDistributedPythonUDFRegistrations(udf_registrations_);
 	}

@@ -10506,6 +10506,27 @@ def test_configure_duckdb_s3_applies_static_credentials_only_to_connection_conte
     assert all("SET GLOBAL" not in statement for statement in statements)
 
 
+def test_configure_duckdb_s3_does_not_install_httpfs_when_load_fails():
+    statements = []
+
+    class _FakeConnection:
+        def execute(self, statement):
+            statements.append(statement)
+            raise RuntimeError("httpfs is unavailable")
+
+    with pytest.raises(RuntimeError, match="runtime extension installation is disabled") as exc_info:
+        worker_mod._configure_duckdb_s3(
+            _FakeConnection(),
+            {
+                "AWS_ACCESS_KEY_ID": "access-key",
+                "AWS_SECRET_ACCESS_KEY": "secret-key",
+            },
+        )
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert statements == ["LOAD httpfs"]
+
+
 def test_configure_duckdb_s3_preserves_scheme_less_endpoint_authority():
     statements = []
 

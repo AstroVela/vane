@@ -1,5 +1,6 @@
 #include "duckdb/main/extension/generated_extension_loader.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "duckdb/common/string_util.hpp"
 
 namespace duckdb {
 
@@ -13,6 +14,15 @@ vector<string> LinkedExtensions(){
     vector<string> VEC = {${EXT_NAME_VECTOR_INITIALIZER}
     };
     return VEC;
+}
+
+bool ExtensionHelper::IsExtensionLinked(const string &extension) {
+    for (auto &ext_name : LinkedExtensions()) {
+        if (StringUtil::CIEquals(ext_name, extension)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void ExtensionHelper::LoadAllExtensions(DuckDB &db) {
