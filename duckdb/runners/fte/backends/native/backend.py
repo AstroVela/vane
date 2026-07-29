@@ -747,6 +747,7 @@ class _NativeFteRegisteredFragment:
     dynamic_exchange_source_node_ids: set[str] = field(default_factory=set)
     partitions: dict[str, _NativeFteRegisteredPartition] = field(default_factory=dict)
     progress_topology: dict[str, Any] | None = None
+    progress_topology_unavailable: bool = False
 
 
 class _NativeFteProgressRegistry:
@@ -1014,15 +1015,60 @@ class _NativeFteProgressRegistry:
         for raw_pipeline in raw_pipelines:
             if not isinstance(raw_pipeline, Mapping):
                 raise TypeError("native progress pipeline entries must be mappings")
+            raw_operator_details = raw_pipeline["operator_details"]
+            if type(raw_operator_details) is not list:
+                raise TypeError("native progress operator_details must be a list")
+            operator_details: list[dict[str, Any]] = []
+            for raw_details in raw_operator_details:
+                if not isinstance(raw_details, Mapping):
+                    raise TypeError("native progress operator details must be mappings")
+                # Live native stats include counters in operator_details. Those
+                # values evolve during execution and are not topology. Keep
+                # only the fields consumed as stable display identity.
+                operator_details.append(
+                    {key: raw_details[key] for key in ("udf_name", "pipeline_role") if key in raw_details}
+                )
             pipelines.append(
                 {
                     "pipeline_id": raw_pipeline["pipeline_id"],
                     "operators": raw_pipeline["operators"],
-                    "operator_details": raw_pipeline["operator_details"],
+                    "operator_details": operator_details,
                     "stage_ids": raw_pipeline["stage_ids"],
                 }
             )
         return validate_pipeline_topology({"schema": "pipeline_topology", "pipelines": pipelines})
+
+    @staticmethod
+    def _merge_progress_topologies(
+        current: Mapping[str, Any],
+        incoming: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        merged = copy.deepcopy(dict(current))
+        pipelines = merged["pipelines"]
+        pipelines_by_id = {pipeline["pipeline_id"]: pipeline for pipeline in pipelines}
+        for incoming_pipeline in incoming["pipelines"]:
+            pipeline_id = incoming_pipeline["pipeline_id"]
+            current_pipeline = pipelines_by_id.get(pipeline_id)
+            if current_pipeline is None:
+                copied = copy.deepcopy(incoming_pipeline)
+                pipelines.append(copied)
+                pipelines_by_id[pipeline_id] = copied
+                continue
+            if (
+                current_pipeline["operators"] != incoming_pipeline["operators"]
+                or current_pipeline["stage_ids"] != incoming_pipeline["stage_ids"]
+            ):
+                return None
+            for current_details, incoming_details in zip(
+                current_pipeline["operator_details"],
+                incoming_pipeline["operator_details"],
+                strict=True,
+            ):
+                for key, value in incoming_details.items():
+                    if key in current_details and current_details[key] != value:
+                        return None
+                    current_details.setdefault(key, copy.deepcopy(value))
+        return validate_pipeline_topology(merged)
 
     @classmethod
     def _merge_fragment_progress_topology_locked(
@@ -1030,16 +1076,28 @@ class _NativeFteProgressRegistry:
         fragment: _NativeFteRegisteredFragment,
         metrics: Mapping[str, Any],
     ) -> None:
-        for task_stats in cls._task_stats_from_partition_metrics(metrics):
-            topology = cls._topology_from_task_stats(task_stats)
-            if topology is None:
-                continue
-            if fragment.progress_topology is None:
-                fragment.progress_topology = topology
-            elif fragment.progress_topology != topology:
-                raise RuntimeError(
-                    f"native fragment progress topology changed after publication: {fragment.fragment_id}"
-                )
+        if fragment.progress_topology_unavailable:
+            return
+        try:
+            for task_stats in cls._task_stats_from_partition_metrics(metrics):
+                topology = cls._topology_from_task_stats(task_stats)
+                if topology is None:
+                    continue
+                if fragment.progress_topology is None:
+                    fragment.progress_topology = topology
+                    continue
+                merged = cls._merge_progress_topologies(fragment.progress_topology, topology)
+                if merged is None:
+                    fragment.progress_topology = None
+                    fragment.progress_topology_unavailable = True
+                    return
+                fragment.progress_topology = merged
+        except Exception:
+            # Progress is observational. Malformed or genuinely conflicting
+            # snapshots must not break fte_query_status, which is also the
+            # native completion-detection path.
+            fragment.progress_topology = None
+            fragment.progress_topology_unavailable = True
 
     @staticmethod
     def _placeholder_partition_metrics(partition: _NativeFteRegisteredPartition) -> dict[str, Any]:

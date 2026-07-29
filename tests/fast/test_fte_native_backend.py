@@ -25,6 +25,8 @@ from duckdb.runners.fte.backends.native import (
 from duckdb.runners.fte.backends.native.backend import (
     _BackgroundEventLoop,
     _flight_exchange_node_id_from_env,
+    _NativeFteProgressRegistry,
+    _NativeFteRegisteredFragment,
 )
 from duckdb.runners.fte.fte_config import FTE_WORKER_RUNTIME
 from duckdb.runners.progress import build_progress_snapshot
@@ -1442,6 +1444,222 @@ def test_native_backend_query_status_builds_local_progress_snapshot():
         release.set()
         backend.drop_query("query-progress")
         backend.shutdown()
+
+
+def test_native_progress_topology_ignores_live_counters_and_merges_stable_identity():
+    fragment = _NativeFteRegisteredFragment(
+        query_id="query-progress-topology",
+        fragment_id="query-progress-topology:scan",
+        fragment_execution_id=0,
+    )
+
+    def metrics(counter: str, *, include_udf_name: bool, include_copy_pipeline: bool):
+        udf_details = {
+            "pipeline_role": "source",
+            "udf_completed_input_rows": counter,
+        }
+        if include_udf_name:
+            udf_details["udf_name"] = "ai_prompt"
+        pipelines = [
+            {
+                "pipeline_id": 1,
+                "operators": ["STREAMING_UDF"],
+                "operator_details": [udf_details],
+                "stage_ids": [],
+            }
+        ]
+        if include_copy_pipeline:
+            pipelines.append(
+                {
+                    "pipeline_id": 2,
+                    "operators": ["COPY_TO_FILE"],
+                    "operator_details": [{}],
+                    "stage_ids": [],
+                }
+            )
+        return {"running_attempts": [{"task_stats": {"pipelines": pipelines}}]}
+
+    initial_metrics = metrics("0", include_udf_name=False, include_copy_pipeline=False)
+    updated_metrics = metrics("1", include_udf_name=True, include_copy_pipeline=True)
+    _NativeFteProgressRegistry._merge_fragment_progress_topology_locked(fragment, initial_metrics)
+    _NativeFteProgressRegistry._merge_fragment_progress_topology_locked(fragment, updated_metrics)
+
+    assert fragment.progress_topology_unavailable is False
+    assert (
+        updated_metrics["running_attempts"][0]["task_stats"]["pipelines"][0]["operator_details"][0][
+            "udf_completed_input_rows"
+        ]
+        == "1"
+    )
+    assert fragment.progress_topology == {
+        "schema": "pipeline_topology",
+        "pipelines": [
+            {
+                "pipeline_id": 1,
+                "operators": ["STREAMING_UDF"],
+                "operator_details": [{"pipeline_role": "source", "udf_name": "ai_prompt"}],
+                "stage_ids": [],
+            },
+            {
+                "pipeline_id": 2,
+                "operators": ["COPY_TO_FILE"],
+                "operator_details": [{}],
+                "stage_ids": [],
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "bad_metrics",
+    [
+        pytest.param(
+            {
+                "running_attempts": [
+                    {
+                        "task_stats": {
+                            "pipelines": [
+                                {
+                                    "pipeline_id": 1,
+                                    "operators": ["STREAMING_UDF"],
+                                    "operator_details": [{}],
+                                    "stage_ids": [],
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            id="conflicting-operators",
+        ),
+        pytest.param({"running_attempts": "not-a-sequence"}, id="malformed-attempts"),
+    ],
+)
+def test_native_progress_topology_unavailable_does_not_break_query_status(bad_metrics):
+    query_id = "query-progress-unavailable"
+    fragment_id = f"{query_id}:scan"
+    registry = _NativeFteProgressRegistry()
+    registry.register_requests(
+        [
+            {
+                "task_id": _task_id(0, query_id=query_id),
+                "fragment_id": fragment_id,
+            }
+        ]
+    )
+    initial_metrics = {
+        "running_attempts": [
+            {
+                "task_stats": {
+                    "pipelines": [
+                        {
+                            "pipeline_id": 1,
+                            "operators": ["TABLE_SCAN"],
+                            "operator_details": [{}],
+                            "stage_ids": [],
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+    registry.record_partition_metrics(query_id, fragment_id, "0", initial_metrics)
+    registry.record_partition_metrics(query_id, fragment_id, "0", bad_metrics)
+    registry.record_partition_metrics(query_id, fragment_id, "0", initial_metrics)
+
+    status = registry.query_status(query_id)
+    assert status["fragment_executions"][fragment_id]["progress_topology"] == {
+        "schema": "pipeline_topology",
+        "pipelines": [],
+    }
+    snapshot = build_progress_snapshot({"queries": {query_id: status}}, query_id)
+    assert snapshot["fragments"][0]["pipelines"] == []
+
+
+def test_native_progress_snapshot_normalizes_stable_identity_across_attempts():
+    query_id = "query-progress-stable-identity"
+    fragment_id = f"{query_id}:scan"
+    registry = _NativeFteProgressRegistry()
+    registry.register_requests(
+        [
+            {
+                "task_id": _task_id(0, query_id=query_id),
+                "fragment_id": fragment_id,
+            }
+        ]
+    )
+
+    def task_stats(operator_details, input_rows):
+        return {
+            "pipelines": [
+                {
+                    "pipeline_id": 1,
+                    "operators": ["STREAMING_UDF"],
+                    "operator_details": [operator_details],
+                    "stage_ids": [],
+                    "input_rows": input_rows,
+                    "total_pipeline_tasks": 1,
+                    "running_pipeline_tasks": 1,
+                }
+            ]
+        }
+
+    registry.record_partition_metrics(
+        query_id,
+        fragment_id,
+        "0",
+        {
+            "state": "RUNNING",
+            "running_attempts": [
+                {
+                    "task_stats": task_stats(
+                        {
+                            "pipeline_role": "source",
+                            "udf_completed_input_rows": "1",
+                        },
+                        1,
+                    )
+                },
+                {
+                    "task_stats": task_stats(
+                        {
+                            "pipeline_role": "source",
+                            "udf_name": "ai_prompt",
+                            "udf_completed_input_rows": "2",
+                        },
+                        2,
+                    )
+                },
+            ],
+        },
+    )
+
+    status = registry.query_status(query_id)
+    snapshot = build_progress_snapshot({"queries": {query_id: status}}, query_id)
+    first_attempt_details = status["fragment_executions"][fragment_id]["partitions"]["0"]["running_attempts"][0][
+        "task_stats"
+    ]["pipelines"][0]["operator_details"][0]
+    assert first_attempt_details == {
+        "pipeline_role": "source",
+        "udf_completed_input_rows": "1",
+    }
+    assert snapshot["fragments"][0]["pipelines"] == [
+        {
+            "id": "1.1",
+            "display_id": "1.1",
+            "name": "ai_prompt(source)",
+            "state": "R",
+            "processed_rows": 3,
+            "processed_bytes": 0,
+            "output_rows": 0,
+            "output_bytes": 0,
+            "queued_pipeline_tasks": 0,
+            "running_pipeline_tasks": 2,
+            "completed_pipeline_tasks": 0,
+            "total_pipeline_tasks": 2,
+        }
+    ]
 
 
 def test_native_backend_progress_query_status_uses_cached_task_stats(monkeypatch):

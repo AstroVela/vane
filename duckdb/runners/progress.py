@@ -22,7 +22,7 @@ def progress_enabled(runner_type: str | None = None) -> bool:
     value = os.getenv("VANE_PROGRESS", "auto").strip().lower()
     if value in _FALSE_VALUES:
         return False
-    runner = (runner_type or os.getenv("VANE_RUNNER", "")).strip().lower() or "ray"
+    runner = (runner_type or os.getenv("VANE_RUNNER") or "").strip().lower() or "ray"
     return runner in {"local", "ray"} or value not in ("", "auto")
 
 
@@ -329,7 +329,15 @@ def _pipeline_stats_with_progress_topology(
 ) -> list[dict[str, Any]]:
     """Keep native topology stable while overlaying matching live counters."""
     topology = validate_pipeline_topology(progress_topology, allow_empty=True)
-    topology_by_id = {pipeline["pipeline_id"]: pipeline for pipeline in topology["pipelines"]}
+    topology_pipelines = topology["pipelines"]
+    if not topology_pipelines:
+        # An empty topology means pipeline-level progress is unavailable. Keep
+        # the surrounding live stats usable for fragment/query totals without
+        # trying to align pipeline entries against a topology that was
+        # deliberately discarded.
+        return [{**dict(stats), "pipelines": []} for stats in live_stats_items]
+
+    topology_by_id = {pipeline["pipeline_id"]: pipeline for pipeline in topology_pipelines}
     zero_pipelines = [
         {
             **copy.deepcopy(pipeline),
@@ -342,7 +350,7 @@ def _pipeline_stats_with_progress_topology(
             "running_pipeline_tasks": 0,
             "completed_pipeline_tasks": 0,
         }
-        for pipeline in topology["pipelines"]
+        for pipeline in topology_pipelines
     ]
     aligned_stats: list[dict[str, Any]] = [{"pipelines": zero_pipelines}]
     for stats in live_stats_items:
@@ -360,7 +368,18 @@ def _pipeline_stats_with_progress_topology(
             operators = pipeline.get("operators")
             if operators != planned["operators"]:
                 raise RuntimeError(f"live progress pipeline {pipeline_id} operators do not match topology")
-            aligned_pipelines.append(pipeline)
+            aligned_pipeline = dict(pipeline)
+            live_operator_details = pipeline.get("operator_details")
+            aligned_operator_details: list[dict[str, Any]] = []
+            for index, planned_details in enumerate(planned["operator_details"]):
+                # Stable identity comes from the topology. Fill it into a
+                # detached live entry so partial attempts render consistently,
+                # while retaining live-only counters and the original stats.
+                details = copy.deepcopy(_operator_detail_at(live_operator_details, index))
+                details.update(copy.deepcopy(planned_details))
+                aligned_operator_details.append(details)
+            aligned_pipeline["operator_details"] = aligned_operator_details
+            aligned_pipelines.append(aligned_pipeline)
         aligned["pipelines"] = aligned_pipelines
         aligned_stats.append(aligned)
     return aligned_stats
@@ -414,6 +433,7 @@ def build_progress_snapshot(
     requested_query_id = str(query_id)
     queries = registry_stats.get("queries") or {}
     query = queries.get(requested_query_id) or {}
+    query_payload: dict[str, Any]
     if isinstance(query, dict):
         query_payload = {"query_id": str(query.get("query_id") or requested_query_id)}
         for key in ("failed", "finished"):
