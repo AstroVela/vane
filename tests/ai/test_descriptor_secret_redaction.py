@@ -61,10 +61,13 @@ def _openai_prompter_descriptor():
 def _anthropic_prompter_descriptor():
     from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 
+    # The strict option contract (vane#146) rejects unknown prompt-option
+    # keys and requires max_tokens, so the sensitive value rides in the
+    # known ``extra_headers`` request option.
     return AnthropicPrompterDescriptor(
         provider_options={"api_key": API_KEY, "base_url": "https://api.example"},
         model_name="claude-sonnet-4-20250514",
-        prompt_options={"temperature": 0.2, "auth_token": API_KEY},
+        prompt_options={"temperature": 0.2, "max_tokens": 64, "extra_headers": {"auth_token": API_KEY}},
     )
 
 

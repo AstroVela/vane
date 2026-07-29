@@ -438,7 +438,9 @@ class TestUDFExecutionOptions:
         assert OpenAITextEmbedderDescriptor(embed_options={"num_gpus": 1}).get_udf_options().num_gpus == 1
         assert OpenAIPrompterDescriptor(prompt_options={"num_gpus": 2}).get_udf_options().num_gpus == 2
         assert (
-            AnthropicPrompterDescriptor(model_name="claude-test-model", prompt_options={"num_gpus": 3})
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model", prompt_options={"max_tokens": 64, "num_gpus": 3}
+            )
             .get_udf_options()
             .num_gpus
             == 3
@@ -656,6 +658,7 @@ class TestAnthropicProvider:
         desc = AnthropicPrompterDescriptor(
             model_name="claude-sonnet-4-20250514",
             system_message="Be concise.",
+            prompt_options={"max_tokens": 64},
         )
         assert desc.get_provider() == "anthropic"
         assert desc.get_model() == "claude-sonnet-4-20250514"
@@ -668,7 +671,7 @@ class TestAnthropicProvider:
             provider_options={"api_key": "test-key"},
             model_name="claude-sonnet-4-20250514",
             system_message="You are helpful.",
-            prompt_options={"temperature": 0.7},
+            prompt_options={"max_tokens": 64, "temperature": 0.7},
         )
         restored = pickle.loads(pickle.dumps(desc))
         assert restored.model_name == desc.model_name
@@ -679,7 +682,7 @@ class TestAnthropicProvider:
         """Anthropic descriptor produces correct UDFOptions."""
         from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 
-        desc = AnthropicPrompterDescriptor(model_name="claude-test-model")
+        desc = AnthropicPrompterDescriptor(model_name="claude-test-model", prompt_options={"max_tokens": 64})
         opts = desc.get_udf_options()
         assert opts.max_api_concurrency == 16
 
@@ -694,6 +697,7 @@ class TestAnthropicProvider:
         desc = provider.get_prompter(
             model="claude-sonnet-4-20250514",
             system_message="Be brief.",
+            max_tokens=64,
             temperature=0.5,
         )
         assert isinstance(desc, AnthropicPrompterDescriptor)
@@ -711,6 +715,7 @@ class TestAnthropicProvider:
             api_key="call-key",
             base_url="https://call.example",
             timeout=30,
+            max_tokens=64,
             max_api_concurrency=6,
             temperature=0,
         )
@@ -748,7 +753,7 @@ class TestAnthropicProvider:
         """Provider-level prompt_model configures the descriptor model."""
         from vane.ai.providers.anthropic import AnthropicProvider
 
-        provider = AnthropicProvider(api_key="test-key", prompt_model="claude-config-model")
+        provider = AnthropicProvider(api_key="test-key", prompt_model="claude-config-model", max_tokens=64)
         desc = provider.get_prompter()
         assert desc.model_name == "claude-config-model"
         # prompt_model is provider-level config, never a request option.
@@ -759,7 +764,7 @@ class TestAnthropicProvider:
         """Call-site model beats provider-level prompt_model."""
         from vane.ai.providers.anthropic import AnthropicProvider
 
-        provider = AnthropicProvider(api_key="test-key", prompt_model="claude-config-model")
+        provider = AnthropicProvider(api_key="test-key", prompt_model="claude-config-model", max_tokens=64)
         desc = provider.get_prompter(model="claude-call-model")
         assert desc.model_name == "claude-call-model"
 
@@ -768,7 +773,7 @@ class TestAnthropicProvider:
         """A blank call-site model is an error, not a provider-config fallback."""
         from vane.ai.providers.anthropic import AnthropicProvider
 
-        provider = AnthropicProvider(api_key="test-key", prompt_model="claude-config-model")
+        provider = AnthropicProvider(api_key="test-key", prompt_model="claude-config-model", max_tokens=64)
         with pytest.raises(ValueError, match="non-empty string"):
             provider.get_prompter(model=model)
 
@@ -776,7 +781,7 @@ class TestAnthropicProvider:
         """A blank provider-level prompt_model fails at expression-build time."""
         from vane.ai.providers.anthropic import AnthropicProvider
 
-        provider = AnthropicProvider(api_key="test-key", prompt_model="")
+        provider = AnthropicProvider(api_key="test-key", prompt_model="", max_tokens=64)
         with pytest.raises(ValueError, match="non-empty string"):
             provider.get_prompter()
 
@@ -793,6 +798,524 @@ class TestAnthropicProvider:
 
         with pytest.raises(TypeError):
             AnthropicProvider(api_key="test-key", promt_model="claude-config-model")
+
+
+class TestAnthropicStrictOptions:
+    """Tests for the strict Anthropic option contract (vane#146)."""
+
+    def _provider(self, **kwargs):
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        return AnthropicProvider(api_key="test-key", prompt_model="claude-test-model", **kwargs)
+
+    # --- unknown options are rejected pre-dispatch ------------------------
+
+    def test_unknown_option_rejected(self):
+        """A typo'd request option raises before dispatch, naming the key."""
+        with pytest.raises(ValueError, match="thinkng") as excinfo:
+            self._provider(max_tokens=64).get_prompter(thinkng={"type": "adaptive"})
+        message = str(excinfo.value)
+        assert "claude-test-model" in message
+        assert "thinking" in message  # the supported list points at the fix
+
+    def test_unknown_option_rejected_on_direct_descriptor_construction(self):
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="metdata"):
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model",
+                prompt_options={"max_tokens": 64, "metdata": {"user_id": "u"}},
+            )
+
+    def test_ctor_typo_is_rejected_by_the_named_ctor(self):
+        """The ctor has no **options channel; a misspelled kwarg is a TypeError."""
+        with pytest.raises(TypeError):
+            self._provider(max_tokens=64, promt_model="claude-other-model")
+
+    # --- known options forward to the API ---------------------------------
+
+    @pytest.mark.skipif(not _has_module("anthropic"), reason="anthropic not installed")
+    def test_known_options_forward_to_messages_create(self):
+        """thinking/metadata/tool_choice/service_tier reach the recorded call."""
+        import asyncio
+
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        desc = AnthropicPrompterDescriptor(
+            model_name="claude-test-model",
+            provider_options={"api_key": "test-key"},
+            prompt_options={
+                "max_tokens": 64,
+                "thinking": {"type": "adaptive"},
+                "metadata": {"user_id": "user-1"},
+                "tool_choice": {"type": "auto"},
+                "service_tier": "auto",
+                "max_api_concurrency": 4,
+                "on_error": "raise",
+            },
+        )
+        prompter = desc.instantiate()
+
+        captured: dict = {}
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = "ok"
+        mock_response = MagicMock()
+        mock_response.content = [text_block]
+        mock_response.stop_reason = "end_turn"
+
+        async def mock_create(**kwargs):
+            captured.update(kwargs)
+            return mock_response
+
+        prompter._client.messages.create = mock_create
+        assert asyncio.run(prompter.prompt(("Hi",))) == "ok"
+
+        assert captured["max_tokens"] == 64
+        assert captured["thinking"] == {"type": "adaptive"}
+        assert captured["metadata"] == {"user_id": "user-1"}
+        assert captured["tool_choice"] == {"type": "auto"}
+        assert captured["service_tier"] == "auto"
+        # Vane execution options never reach the API.
+        assert "max_api_concurrency" not in captured
+        assert "on_error" not in captured
+
+    # --- per-model unsupported combinations -------------------------------
+
+    def test_sonnet5_sampling_option_rejected(self):
+        """Sonnet 5 documents rejecting non-default sampling parameters."""
+        with pytest.raises(ValueError, match="temperature") as excinfo:
+            self._provider(max_tokens=64).get_prompter(model="claude-sonnet-5", temperature=0.2)
+        assert "claude-sonnet-5" in str(excinfo.value)
+
+    def test_sonnet5_snapshot_id_matches_family_prefix(self):
+        with pytest.raises(ValueError, match="top_p"):
+            self._provider(max_tokens=64).get_prompter(model="claude-sonnet-5-20260601", top_p=0.9)
+
+    def test_sonnet46_sampling_option_passes(self):
+        """The same option is fine on a model without the restriction."""
+        desc = self._provider(max_tokens=64).get_prompter(model="claude-sonnet-4-6", temperature=0.2)
+        assert desc.prompt_options["temperature"] == 0.2
+
+    @pytest.mark.parametrize("default", [1, 1.0])
+    def test_sonnet5_default_temperature_passes(self, default):
+        """The documented default temperature (1.0) is accepted by the API."""
+        desc = self._provider(max_tokens=64).get_prompter(model="claude-sonnet-5", temperature=default)
+        assert desc.prompt_options["temperature"] == default
+
+    def test_sonnet5_boolean_temperature_rejected(self):
+        """True == 1 in Python, but a bool is not the documented default."""
+        with pytest.raises(ValueError, match="temperature"):
+            self._provider(max_tokens=64).get_prompter(model="claude-sonnet-5", temperature=True)
+
+    def test_sonnet5_default_like_top_p_still_rejected(self):
+        """top_p has no documented default, so any explicit value is non-default."""
+        with pytest.raises(ValueError, match="top_p"):
+            self._provider(max_tokens=64).get_prompter(model="claude-sonnet-5", top_p=1.0)
+
+    @pytest.mark.parametrize("model", ["claude-fable-5", "claude-mythos-5", "claude-mythos-preview"])
+    def test_fable_mythos_sampling_option_rejected(self, model):
+        """The Fable/Mythos families document the same non-default rejection."""
+        with pytest.raises(ValueError, match="temperature") as excinfo:
+            self._provider(max_tokens=64).get_prompter(model=model, temperature=0.2)
+        assert model in str(excinfo.value)
+
+    def test_fable_default_temperature_passes(self):
+        """The documented default temperature is accepted on Fable too."""
+        desc = self._provider(max_tokens=64).get_prompter(model="claude-fable-5", temperature=1.0)
+        assert desc.prompt_options["temperature"] == 1.0
+
+    def test_fable_top_p_rejected(self):
+        with pytest.raises(ValueError, match="top_p"):
+            self._provider(max_tokens=64).get_prompter(model="claude-fable-5", top_p=1.0)
+
+    # --- per-model thinking.type restrictions -----------------------------
+
+    @pytest.mark.parametrize(
+        "model",
+        ["claude-sonnet-5", "claude-opus-4-7", "claude-fable-5", "claude-sonnet-5-20260601"],
+    )
+    def test_manual_thinking_rejected_on_adaptive_only_models(self, model):
+        """The removed manual form fails pre-dispatch on adaptive-only families."""
+        with pytest.raises(ValueError, match="thinking.type") as excinfo:
+            self._provider(max_tokens=64).get_prompter(model=model, thinking={"type": "enabled", "budget_tokens": 1024})
+        assert model in str(excinfo.value)
+
+    @pytest.mark.parametrize("model", ["claude-fable-5", "claude-mythos-5", "claude-mythos-preview"])
+    def test_disabled_thinking_rejected_on_always_on_models(self, model):
+        """Thinking cannot be turned off where it is always on."""
+        with pytest.raises(ValueError, match="disabled"):
+            self._provider(max_tokens=64).get_prompter(model=model, thinking={"type": "disabled"})
+
+    @pytest.mark.parametrize("model", ["claude-mythos-preview", "claude-opus-4-6"])
+    def test_manual_thinking_passes_where_still_supported(self, model):
+        """Mythos Preview and the 4.6 models still accept the manual form."""
+        desc = self._provider(max_tokens=64).get_prompter(
+            model=model, thinking={"type": "enabled", "budget_tokens": 1024}
+        )
+        assert desc.prompt_options["thinking"]["type"] == "enabled"
+
+    @pytest.mark.parametrize("model", ["claude-haiku-4-5", "claude-opus-4-5", "claude-sonnet-4-5"])
+    def test_adaptive_thinking_rejected_on_extended_only_models(self, model):
+        """Extended-thinking-only models reject the adaptive form."""
+        with pytest.raises(ValueError, match="adaptive"):
+            self._provider(max_tokens=64).get_prompter(model=model, thinking={"type": "adaptive"})
+
+    def test_adaptive_thinking_passes_on_adaptive_models(self):
+        desc = self._provider(max_tokens=64).get_prompter(model="claude-sonnet-5", thinking={"type": "adaptive"})
+        assert desc.prompt_options["thinking"] == {"type": "adaptive"}
+
+    # --- extra_body cannot bypass the option contract ---------------------
+
+    @pytest.mark.parametrize(
+        "smuggled",
+        [
+            {"thinking": {"type": "enabled", "budget_tokens": 1024}},
+            {"temperature": 0.2},
+            {"max_tokens": 5},
+            {"model": "claude-other-model"},
+            {"stream": True},
+        ],
+    )
+    def test_extra_body_with_validated_field_rejected(self, smuggled):
+        """Vane-owned and known request fields cannot ride in extra_body."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="extra_body") as excinfo:
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model",
+                prompt_options={"max_tokens": 64, "extra_body": smuggled},
+            )
+        assert next(iter(smuggled)) in str(excinfo.value)
+
+    def test_extra_body_non_mapping_rejected(self):
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="extra_body"):
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model",
+                prompt_options={"max_tokens": 64, "extra_body": ["thinking"]},
+            )
+
+    def test_extra_body_with_unmodeled_field_passes(self):
+        """extra_body keeps its purpose: fields the SDK does not model."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        desc = AnthropicPrompterDescriptor(
+            model_name="claude-test-model",
+            prompt_options={"max_tokens": 64, "extra_body": {"future_api_field": {"enabled": True}}},
+        )
+        assert desc.prompt_options["extra_body"] == {"future_api_field": {"enabled": True}}
+
+    # --- explicit max_tokens chain ----------------------------------------
+
+    def test_get_prompter_without_max_tokens_raises(self):
+        """Missing max_tokens fails fast, naming both fix paths."""
+        with pytest.raises(ValueError, match="No max_tokens configured") as excinfo:
+            self._provider().get_prompter()
+        message = str(excinfo.value)
+        assert "max_tokens=" in message
+        assert "AnthropicProvider(max_tokens=" in message
+
+    def test_descriptor_requires_max_tokens(self):
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="No max_tokens configured"):
+            AnthropicPrompterDescriptor(model_name="claude-test-model")
+
+    def test_call_max_tokens_flows_through(self):
+        desc = self._provider().get_prompter(max_tokens=256)
+        assert desc.prompt_options["max_tokens"] == 256
+
+    def test_provider_max_tokens_flows_through(self):
+        desc = self._provider(max_tokens=128).get_prompter()
+        assert desc.prompt_options["max_tokens"] == 128
+
+    def test_call_max_tokens_overrides_provider_config(self):
+        desc = self._provider(max_tokens=128).get_prompter(max_tokens=512)
+        assert desc.prompt_options["max_tokens"] == 512
+
+    def test_none_max_tokens_falls_back_to_provider_config(self):
+        """An explicit max_tokens=None is unconfigured, not a configured value."""
+        desc = self._provider(max_tokens=128).get_prompter(max_tokens=None)
+        assert desc.prompt_options["max_tokens"] == 128
+
+    def test_none_max_tokens_without_config_raises(self):
+        with pytest.raises(ValueError, match="No max_tokens configured"):
+            self._provider().get_prompter(max_tokens=None)
+
+    def test_none_max_tokens_rejected_on_direct_descriptor_construction(self):
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="No max_tokens configured"):
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model",
+                prompt_options={"max_tokens": None},
+            )
+
+    @pytest.mark.parametrize("bad", ["64", 64.0, False, -1])
+    def test_non_integer_max_tokens_rejected(self, bad):
+        """max_tokens must be a non-negative int; False must not satisfy == 0."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="non-negative integer"):
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model",
+                prompt_options={"max_tokens": bad},
+            )
+
+    def test_ctor_max_tokens_is_keyword_only(self):
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        with pytest.raises(TypeError):
+            AnthropicProvider("anthropic", "claude-config-model", 64)
+
+    # --- truncation surfaces as an error ----------------------------------
+
+    @pytest.mark.skipif(not _has_module("anthropic"), reason="anthropic not installed")
+    def test_truncated_text_response_raises(self):
+        import asyncio
+
+        from vane.ai.providers.anthropic import AnthropicPrompter
+
+        prompter = AnthropicPrompter(
+            provider_options={"api_key": "test-key"},
+            model="claude-test-model",
+            max_tokens=64,
+        )
+
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = "partial answ"
+        mock_response = MagicMock()
+        mock_response.content = [text_block]
+        mock_response.stop_reason = "max_tokens"
+
+        async def mock_create(**kwargs):
+            return mock_response
+
+        prompter._client.messages.create = mock_create
+        with pytest.raises(ValueError, match="truncated") as excinfo:
+            asyncio.run(prompter.prompt(("Hi",)))
+        message = str(excinfo.value)
+        assert "claude-test-model" in message
+        assert "max_tokens=64" in message
+
+    @pytest.mark.skipif(not _has_module("anthropic"), reason="anthropic not installed")
+    def test_truncated_structured_response_raises_instead_of_none(self):
+        import asyncio
+
+        from vane.ai.providers.anthropic import AnthropicPrompter
+
+        prompter = AnthropicPrompter(
+            provider_options={"api_key": "test-key"},
+            model="claude-test-model",
+            max_tokens=64,
+            return_format=dict,
+        )
+
+        # Truncation cut the turn before a complete tool_use block emerged.
+        mock_response = MagicMock()
+        mock_response.content = []
+        mock_response.stop_reason = "max_tokens"
+
+        async def mock_create(**kwargs):
+            return mock_response
+
+        prompter._client.messages.create = mock_create
+        with pytest.raises(ValueError, match="truncated"):
+            asyncio.run(prompter.prompt(("Extract data",)))
+
+    # --- documented-invalid option combinations ---------------------------
+
+    def test_return_format_with_caller_tool_choice_rejected(self):
+        """A caller tool_choice would be overridden by extract_data — reject it."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="tool_choice"):
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model",
+                return_format=dict,
+                prompt_options={"max_tokens": 64, "tool_choice": {"type": "none"}},
+            )
+
+    def test_return_format_with_manual_thinking_rejected(self):
+        """Forced tool use plus manual extended thinking is API-rejected."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="manual extended thinking"):
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model",
+                return_format=dict,
+                prompt_options={"max_tokens": 64, "thinking": {"type": "enabled", "budget_tokens": 1024}},
+            )
+
+    def test_return_format_with_adaptive_thinking_passes(self):
+        """Adaptive thinking supports forced tool use and stays allowed."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        desc = AnthropicPrompterDescriptor(
+            model_name="claude-test-model",
+            return_format=dict,
+            prompt_options={"max_tokens": 64, "thinking": {"type": "adaptive"}},
+        )
+        assert desc.return_format is dict
+
+    # --- forced tool choice needs tool definitions ------------------------
+
+    @pytest.mark.parametrize(
+        "tool_choice",
+        [{"type": "any"}, {"type": "tool", "name": "extract_data"}],
+    )
+    def test_forced_tool_choice_without_return_format_rejected(self, tool_choice):
+        """Vane sends no tools without return_format, so forced tool use cannot be satisfied."""
+        with pytest.raises(ValueError, match="tool_choice"):
+            self._provider(max_tokens=64).get_prompter(tool_choice=tool_choice)
+
+    @pytest.mark.parametrize("tool_choice", [{"type": "auto"}, {"type": "none"}])
+    def test_no_tools_safe_tool_choice_passes(self, tool_choice):
+        """auto/none remain valid without tool definitions."""
+        desc = self._provider(max_tokens=64).get_prompter(tool_choice=tool_choice)
+        assert desc.prompt_options["tool_choice"] == tool_choice
+
+    # --- execution options flow into UDFOptions ---------------------------
+
+    def test_concurrency_and_batch_size_flow_into_udf_options(self):
+        """The raw-dict path carries concurrency/batch_size instead of dropping them."""
+        desc = self._provider(max_tokens=64).get_prompter(concurrency=3, batch_size=7)
+        udf_options = desc.get_udf_options()
+        assert udf_options.actor_number == 3
+        assert udf_options.batch_size == 7
+
+    def test_actor_number_and_matching_concurrency_pass(self):
+        """Equal values for the alias pair are not a conflict."""
+        desc = self._provider(max_tokens=64).get_prompter(actor_number=3, concurrency=3)
+        assert desc.get_udf_options().actor_number == 3
+
+    def test_conflicting_actor_number_and_concurrency_rejected(self):
+        """concurrency aliases actor_number; disagreeing values raise."""
+        with pytest.raises(ValueError, match="alias"):
+            self._provider(max_tokens=64).get_prompter(actor_number=2, concurrency=3)
+
+    @pytest.mark.skipif(not _has_module("anthropic"), reason="anthropic not installed")
+    def test_structured_output_dispatch_kwargs(self):
+        """The dispatched call carries the forced extract_data tool choice."""
+        import asyncio
+
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        desc = AnthropicPrompterDescriptor(
+            model_name="claude-test-model",
+            provider_options={"api_key": "test-key"},
+            return_format=dict,
+            prompt_options={"max_tokens": 64},
+        )
+        prompter = desc.instantiate()
+
+        captured: dict = {}
+        tool_block = MagicMock()
+        tool_block.type = "tool_use"
+        tool_block.input = {"answer": 42}
+        mock_response = MagicMock()
+        mock_response.content = [tool_block]
+        mock_response.stop_reason = "end_turn"
+
+        async def mock_create(**kwargs):
+            captured.update(kwargs)
+            return mock_response
+
+        prompter._client.messages.create = mock_create
+        assert asyncio.run(prompter.prompt(("Extract",))) == {"answer": 42}
+
+        assert captured["tool_choice"] == {"type": "tool", "name": "extract_data"}
+        assert captured["tools"][0]["name"] == "extract_data"
+        assert captured["max_tokens"] == 64
+
+    # --- max_tokens=0 cache prewarming ------------------------------------
+
+    @pytest.mark.skipif(not _has_module("anthropic"), reason="anthropic not installed")
+    def test_zero_max_tokens_prewarm_returns_none(self):
+        """A max_tokens=0 response with stop_reason=max_tokens is prewarming, not truncation."""
+        import asyncio
+
+        from vane.ai.providers.anthropic import AnthropicPrompter
+
+        prompter = AnthropicPrompter(
+            provider_options={"api_key": "test-key"},
+            model="claude-test-model",
+            max_tokens=0,
+        )
+
+        mock_response = MagicMock()
+        mock_response.content = []
+        mock_response.stop_reason = "max_tokens"
+
+        async def mock_create(**kwargs):
+            return mock_response
+
+        prompter._client.messages.create = mock_create
+        assert asyncio.run(prompter.prompt(("cached prefix",))) is None
+
+    def test_zero_max_tokens_descriptor_constructs(self):
+        """Plain max_tokens=0 (cache prewarming) passes descriptor validation."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        desc = AnthropicPrompterDescriptor(
+            model_name="claude-test-model",
+            prompt_options={"max_tokens": 0, "cache_control": {"type": "ephemeral"}},
+        )
+        assert desc.prompt_options["max_tokens"] == 0
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"max_tokens": 0, "thinking": {"type": "enabled", "budget_tokens": 1024}},
+            {"max_tokens": 0, "tool_choice": {"type": "any"}},
+            {"max_tokens": 0, "tool_choice": {"type": "tool", "name": "extract_data"}},
+            {"max_tokens": 0, "output_config": {"format": "json"}},
+        ],
+    )
+    def test_zero_max_tokens_rejects_output_implying_options(self, options):
+        """Options that imply output are rejected with max_tokens=0 pre-dispatch."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="cache-prewarming"):
+            AnthropicPrompterDescriptor(model_name="claude-test-model", prompt_options=options)
+
+    def test_zero_max_tokens_rejects_return_format(self):
+        """Structured output implies output and cannot ride a prewarming request."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="cache-prewarming"):
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model",
+                return_format=dict,
+                prompt_options={"max_tokens": 0},
+            )
+
+    @pytest.mark.skipif(not _has_module("anthropic"), reason="anthropic not installed")
+    def test_positive_max_tokens_truncation_still_raises(self):
+        """The prewarming carve-out does not weaken truncation detection."""
+        import asyncio
+
+        from vane.ai.providers.anthropic import AnthropicPrompter
+
+        prompter = AnthropicPrompter(
+            provider_options={"api_key": "test-key"},
+            model="claude-test-model",
+            max_tokens=1,
+        )
+
+        mock_response = MagicMock()
+        mock_response.content = []
+        mock_response.stop_reason = "max_tokens"
+
+        async def mock_create(**kwargs):
+            return mock_response
+
+        prompter._client.messages.create = mock_create
+        with pytest.raises(ValueError, match="truncated"):
+            asyncio.run(prompter.prompt(("Hi",)))
 
 
 # ---------------------------------------------------------------------------
@@ -1604,19 +2127,23 @@ class TestAnthropicStructuredOutput:
     def test_descriptor_has_return_format(self):
         from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 
-        desc = AnthropicPrompterDescriptor(model_name="claude-test-model", return_format=dict)
+        desc = AnthropicPrompterDescriptor(
+            model_name="claude-test-model", return_format=dict, prompt_options={"max_tokens": 64}
+        )
         assert desc.return_format is dict
 
     def test_descriptor_default_no_return_format(self):
         from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 
-        desc = AnthropicPrompterDescriptor(model_name="claude-test-model")
+        desc = AnthropicPrompterDescriptor(model_name="claude-test-model", prompt_options={"max_tokens": 64})
         assert desc.return_format is None
 
     def test_descriptor_pickle_with_return_format(self):
         from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 
-        desc = AnthropicPrompterDescriptor(model_name="claude-test-model", return_format=dict)
+        desc = AnthropicPrompterDescriptor(
+            model_name="claude-test-model", return_format=dict, prompt_options={"max_tokens": 64}
+        )
         restored = pickle.loads(pickle.dumps(desc))
         assert restored.return_format is dict
 
@@ -1624,7 +2151,7 @@ class TestAnthropicStructuredOutput:
         from vane.ai.providers.anthropic import AnthropicProvider
 
         prov = AnthropicProvider(api_key="test")
-        desc = prov.get_prompter(model="claude-test-model", return_format=dict)
+        desc = prov.get_prompter(model="claude-test-model", max_tokens=64, return_format=dict)
         assert desc.return_format is dict
 
     @pytest.mark.skipif(not _has_module("anthropic"), reason="anthropic not installed")
