@@ -1275,6 +1275,158 @@ class TestAnthropicStrictOptions:
         with pytest.raises(ValueError, match="truncated"):
             asyncio.run(prompter.prompt(("Extract data",)))
 
+    # --- documented-invalid option combinations ---------------------------
+
+    def test_return_format_with_caller_tool_choice_rejected(self):
+        """A caller tool_choice would be overridden by extract_data — reject it."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="tool_choice"):
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model",
+                return_format=dict,
+                prompt_options={"max_tokens": 64, "tool_choice": {"type": "none"}},
+            )
+
+    def test_return_format_with_manual_thinking_rejected(self):
+        """Forced tool use plus manual extended thinking is API-rejected."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="manual extended thinking"):
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model",
+                return_format=dict,
+                prompt_options={"max_tokens": 64, "thinking": {"type": "enabled", "budget_tokens": 1024}},
+            )
+
+    def test_return_format_with_adaptive_thinking_passes(self):
+        """Adaptive thinking supports forced tool use and stays allowed."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        desc = AnthropicPrompterDescriptor(
+            model_name="claude-test-model",
+            return_format=dict,
+            prompt_options={"max_tokens": 64, "thinking": {"type": "adaptive"}},
+        )
+        assert desc.return_format is dict
+
+    def test_structured_output_dispatch_kwargs(self):
+        """The dispatched call carries the forced extract_data tool choice."""
+        import asyncio
+
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        desc = AnthropicPrompterDescriptor(
+            model_name="claude-test-model",
+            provider_options={"api_key": "test-key"},
+            return_format=dict,
+            prompt_options={"max_tokens": 64},
+        )
+        prompter = desc.instantiate()
+
+        captured: dict = {}
+        tool_block = MagicMock()
+        tool_block.type = "tool_use"
+        tool_block.input = {"answer": 42}
+        mock_response = MagicMock()
+        mock_response.content = [tool_block]
+        mock_response.stop_reason = "end_turn"
+
+        async def mock_create(**kwargs):
+            captured.update(kwargs)
+            return mock_response
+
+        prompter._client.messages.create = mock_create
+        assert asyncio.run(prompter.prompt(("Extract",))) == {"answer": 42}
+
+        assert captured["tool_choice"] == {"type": "tool", "name": "extract_data"}
+        assert captured["tools"][0]["name"] == "extract_data"
+        assert captured["max_tokens"] == 64
+
+    # --- max_tokens=0 cache prewarming ------------------------------------
+
+    def test_zero_max_tokens_prewarm_returns_none(self):
+        """A max_tokens=0 response with stop_reason=max_tokens is prewarming, not truncation."""
+        import asyncio
+
+        from vane.ai.providers.anthropic import AnthropicPrompter
+
+        prompter = AnthropicPrompter(
+            provider_options={"api_key": "test-key"},
+            model="claude-test-model",
+            max_tokens=0,
+        )
+
+        mock_response = MagicMock()
+        mock_response.content = []
+        mock_response.stop_reason = "max_tokens"
+
+        async def mock_create(**kwargs):
+            return mock_response
+
+        prompter._client.messages.create = mock_create
+        assert asyncio.run(prompter.prompt(("cached prefix",))) is None
+
+    def test_zero_max_tokens_descriptor_constructs(self):
+        """Plain max_tokens=0 (cache prewarming) passes descriptor validation."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        desc = AnthropicPrompterDescriptor(
+            model_name="claude-test-model",
+            prompt_options={"max_tokens": 0, "cache_control": {"type": "ephemeral"}},
+        )
+        assert desc.prompt_options["max_tokens"] == 0
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"max_tokens": 0, "thinking": {"type": "enabled", "budget_tokens": 1024}},
+            {"max_tokens": 0, "tool_choice": {"type": "any"}},
+            {"max_tokens": 0, "tool_choice": {"type": "tool", "name": "extract_data"}},
+            {"max_tokens": 0, "output_config": {"format": "json"}},
+        ],
+    )
+    def test_zero_max_tokens_rejects_output_implying_options(self, options):
+        """Options that imply output are rejected with max_tokens=0 pre-dispatch."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="cache-prewarming"):
+            AnthropicPrompterDescriptor(model_name="claude-test-model", prompt_options=options)
+
+    def test_zero_max_tokens_rejects_return_format(self):
+        """Structured output implies output and cannot ride a prewarming request."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="cache-prewarming"):
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model",
+                return_format=dict,
+                prompt_options={"max_tokens": 0},
+            )
+
+    def test_positive_max_tokens_truncation_still_raises(self):
+        """The prewarming carve-out does not weaken truncation detection."""
+        import asyncio
+
+        from vane.ai.providers.anthropic import AnthropicPrompter
+
+        prompter = AnthropicPrompter(
+            provider_options={"api_key": "test-key"},
+            model="claude-test-model",
+            max_tokens=1,
+        )
+
+        mock_response = MagicMock()
+        mock_response.content = []
+        mock_response.stop_reason = "max_tokens"
+
+        async def mock_create(**kwargs):
+            return mock_response
+
+        prompter._client.messages.create = mock_create
+        with pytest.raises(ValueError, match="truncated"):
+            asyncio.run(prompter.prompt(("Hi",)))
+
 
 # ---------------------------------------------------------------------------
 # Google Provider tests

@@ -25,7 +25,15 @@ construction, before any request is dispatched:
   (``max_tokens=...``) or configured on the provider
   (``AnthropicProvider(max_tokens=...)``); the per-call value wins.
 - A truncated response (``stop_reason == "max_tokens"``) raises instead
-  of silently returning partial text or ``None``.
+  of silently returning partial text or ``None``. The one documented
+  exception is ``max_tokens=0`` cache prewarming, whose successful
+  response intentionally has empty content and that stop reason; it
+  returns ``None``.
+- Option combinations the API is documented to reject — structured
+  output with a caller-supplied ``tool_choice`` or manual extended
+  thinking, and ``max_tokens=0`` with anything that implies output —
+  raise :class:`ValueError` at construction instead of being silently
+  overridden.
 
 Requires::
 
@@ -35,6 +43,7 @@ Requires::
 from __future__ import annotations
 
 import base64
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -44,8 +53,6 @@ from vane.ai.provider import Provider, ProviderImportError
 from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     from vane.ai.protocols import Prompter
     from vane.ai.typing import Options
 
@@ -131,6 +138,59 @@ def _validate_prompt_options(model_name: str, options: Mapping[str, Any]) -> Non
                     "the API rejects non-default sampling parameters for this model "
                     "family. Remove the option(s) or select a model that supports them."
                 )
+
+
+def _is_manual_thinking(thinking: Any) -> bool:
+    """True for manual extended thinking (``thinking.type == "enabled"``)."""
+    return isinstance(thinking, Mapping) and thinking.get("type") == "enabled"
+
+
+def _validate_option_combinations(return_format: Any | None, options: Mapping[str, Any]) -> None:
+    """Reject option combinations the API is documented to refuse.
+
+    Structured output dispatches a forced ``extract_data`` tool choice, so a
+    caller-supplied ``tool_choice`` would be silently replaced, and manual
+    extended thinking (``thinking.type == "enabled"``) only supports
+    auto/none tool choices
+    (https://platform.claude.com/docs/en/about-claude/models/extended-thinking-models#thinking-with-tool-use).
+    ``max_tokens=0`` is a cache-prewarming request whose response has no
+    content, so options that imply output are rejected up front
+    (https://platform.claude.com/docs/en/build-with-claude/prompt-caching#pre-warming-the-cache).
+
+    Raises:
+        ValueError: On any of the documented-invalid combinations above.
+    """
+    if return_format is not None:
+        if "tool_choice" in options:
+            raise ValueError(
+                "return_format dispatches a forced extract_data tool choice, which "
+                f"would override the caller-supplied tool_choice {options['tool_choice']!r}. "
+                "Remove tool_choice from the options or drop return_format."
+            )
+        if _is_manual_thinking(options.get("thinking")):
+            raise ValueError(
+                "return_format dispatches a forced tool choice, which the Anthropic "
+                'API rejects together with manual extended thinking (thinking={"type": '
+                '"enabled", ...}). Use adaptive thinking or drop return_format.'
+            )
+    if options.get("max_tokens") == 0:
+        offending = []
+        if return_format is not None:
+            offending.append("return_format")
+        if _is_manual_thinking(options.get("thinking")):
+            offending.append('thinking={"type": "enabled"}')
+        tool_choice = options.get("tool_choice")
+        if isinstance(tool_choice, Mapping) and tool_choice.get("type") in ("tool", "any"):
+            offending.append(f"tool_choice={tool_choice!r}")
+        output_config = options.get("output_config")
+        if isinstance(output_config, Mapping) and "format" in output_config:
+            offending.append("output_config.format")
+        if offending:
+            raise ValueError(
+                "max_tokens=0 is a cache-prewarming request whose successful response "
+                f"has no content; the API rejects it combined with {', '.join(offending)}. "
+                "Remove those options or use a positive max_tokens."
+            )
 
 
 def _guess_media_type(data: bytes) -> str:
@@ -279,6 +339,7 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
                 "No max_tokens configured for the Anthropic provider. "
                 "Pass max_tokens=... or configure AnthropicProvider(max_tokens=...)."
             )
+        _validate_option_combinations(self.return_format, self.prompt_options)
 
     def get_provider(self) -> str:
         return self.provider_name
@@ -449,8 +510,9 @@ class AnthropicPrompter:
         if self._system_message:
             kwargs["system"] = self._system_message
 
-        # Structured output: use tool_use with forced tool choice. This
-        # overrides any caller-supplied tool_choice for the extraction turn.
+        # Structured output: use tool_use with forced tool choice. The
+        # descriptor rejects caller-supplied tool_choice and manual thinking
+        # alongside return_format, so nothing is silently replaced here.
         if self._return_format is not None:
             tool_def = self._build_tool_schema()
             kwargs["tools"] = [tool_def]
@@ -472,8 +534,12 @@ class AnthropicPrompter:
             )
 
         # Truncation is an error, never a silent partial answer. The raise
-        # routes through the UDF on_error policy like any other failure.
+        # routes through the UDF on_error policy like any other failure. The
+        # exception is max_tokens=0: a documented cache-prewarming request
+        # whose successful response has empty content and this stop reason.
         if getattr(response, "stop_reason", None) == "max_tokens":
+            if self._options.get("max_tokens") == 0:
+                return None
             raise ValueError(
                 f"Anthropic response from model {self._model!r} was truncated at "
                 f"max_tokens={self._options.get('max_tokens')} (stop_reason='max_tokens'). "
