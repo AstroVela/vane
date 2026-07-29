@@ -36,6 +36,7 @@ from duckdb.runners.fte.fte_descriptor import (
 )
 from duckdb.runners.fte.fte_exchange import collect_spooling_output_stats
 from duckdb.runners.fte.fte_failures import (
+    FteTaskTerminalControlError,
     _failure_exception_matches,
     _failure_payload,
     _normalize_failure_payload,
@@ -801,7 +802,11 @@ class FteTaskExecution:
     def add_splits(self, source_node_id: str, splits: list[Mapping[str, Any]]) -> TaskStatus:
         with self._status_lock:
             if self.status.state in _TERMINAL_STATES:
-                raise RuntimeError(f"cannot add splits to terminal task {self.task_id}")
+                raise FteTaskTerminalControlError(
+                    operation="add_splits",
+                    task_id=self.task_id,
+                    status=self.status_payload(),
+                )
             source_node_id = str(source_node_id)
             if source_node_id in self.no_more_split_sources:
                 raise RuntimeError(f"source {source_node_id} is already marked no_more_splits")

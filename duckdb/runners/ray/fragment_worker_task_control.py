@@ -8,7 +8,9 @@ import time
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
-from duckdb.runners.fte import FteTaskAttemptId, validate_fte_status_identity
+from duckdb.runners.fte import FteTaskAttemptId, FteTaskState, validate_fte_status_identity
+from duckdb.runners.fte.fte_scheduler import FteSplitQueueTerminal
+from duckdb.runners.fte.fte_state import _TERMINAL_STATES
 from duckdb.runners.ray.fragment_registry import (
     _FTE_CLOSING_QUERIES,
     _FTE_REGISTRY_LOCK,
@@ -61,6 +63,36 @@ class FteWorkerTaskControlMixin:
     if TYPE_CHECKING:
 
         def _drop_fragment_registration_state(self, query_id: str) -> None: ...
+
+    @staticmethod
+    def _validated_fte_add_splits_status(
+        task_id: str | dict[str, Any],
+        raw_status: Any,
+    ) -> dict[str, Any]:
+        if not isinstance(raw_status, dict):
+            raise TypeError("worker actor fte_add_splits must return a dict")
+        status = dict(raw_status)
+        if status.get("_fte_control_applied") is not False:
+            return status
+        attempt_id = FteTaskAttemptId.coerce(task_id)
+        validate_fte_status_identity(status, attempt_id)
+        if status.get("_fte_control_operation") != "fte_add_splits":
+            raise RuntimeError(
+                "FTE add-splits control operation mismatch: "
+                f"task={attempt_id} actual={status.get('_fte_control_operation')!r}"
+            )
+        raw_state = status.get("state")
+        try:
+            state = raw_state if isinstance(raw_state, FteTaskState) else FteTaskState(str(raw_state))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"unknown FTE task state in rejected add-splits control: {raw_state!r}") from exc
+        if state not in _TERMINAL_STATES:
+            raise RuntimeError(
+                f"FTE add-splits control was not applied to non-terminal task {attempt_id}: {state.value}"
+            )
+        status.pop("_fte_control_operation", None)
+        status.pop("_fte_control_applied", None)
+        raise FteSplitQueueTerminal(attempt_id, status)
 
     def _fte_control_rpc(
         self,
@@ -367,9 +399,7 @@ class FteWorkerTaskControlMixin:
         splits: list[dict[str, Any]],
     ) -> dict[str, Any]:
         raw_status = self._enqueue_ordered_fte_control_rpc("fte_add_splits", task_id, source_node_id, splits)
-        if not isinstance(raw_status, dict):
-            raise TypeError("worker actor fte_add_splits must return a dict")
-        return dict(raw_status)
+        return self._validated_fte_add_splits_status(task_id, raw_status)
 
     def enqueue_fte_add_splits(
         self,
@@ -386,9 +416,7 @@ class FteWorkerTaskControlMixin:
             splits,
             cancel_event=cancel_event,
         )
-        if not isinstance(raw_status, dict):
-            raise TypeError("worker actor fte_add_splits must return a dict")
-        return dict(raw_status)
+        return self._validated_fte_add_splits_status(task_id, raw_status)
 
     def fte_no_more_splits(
         self,

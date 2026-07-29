@@ -20,6 +20,23 @@ _MEMORY_FAILURE_CODES = frozenset(
 )
 
 
+class FteTaskTerminalControlError(RuntimeError):
+    """A mutable control reached a known task after it became terminal."""
+
+    def __init__(
+        self,
+        *,
+        operation: str,
+        task_id: FteTaskAttemptId,
+        status: Mapping[str, Any],
+    ) -> None:
+        self.operation = str(operation)
+        self.task_id = task_id
+        self.status = dict(status)
+        operation_text = self.operation.replace("_", " ")
+        super().__init__(f"cannot {operation_text} to terminal task {task_id}")
+
+
 def _normalized_error_token(value: Any) -> str:
     return str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
 

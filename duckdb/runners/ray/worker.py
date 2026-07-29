@@ -32,6 +32,7 @@ from duckdb.runners.fte import (
 )
 from duckdb.runners.fte.debug_memory import describe_result_payload, log_debug, process_memory_snapshot
 from duckdb.runners.fte.fte_config import FteWorkerAdmissionConfig
+from duckdb.runners.fte.fte_failures import FteTaskTerminalControlError
 from duckdb.runners.fte.memory_config import apply_duckdb_memory_limit
 from duckdb.runners.ray.admission_ledger import BoundedReplayMap
 from duckdb.runners.ray.fte_scheduler_config import _fte_control_rpc_timeout_s
@@ -87,6 +88,8 @@ def _fte_applied_control_status(
     operation: str,
     task_id: str | dict[str, Any],
     status: dict[str, Any],
+    *,
+    applied: bool | None = None,
 ) -> dict[str, Any]:
     result = dict(status)
     expected = FteTaskAttemptId.coerce(task_id)
@@ -97,7 +100,9 @@ def _fte_applied_control_status(
             f"FTE control {operation} returned a mismatched task identity for {expected}: {exc}"
         ) from exc
     result["_fte_control_operation"] = str(operation)
-    result["_fte_control_applied"] = str(result.get("state") or "").upper() != "UNKNOWN"
+    result["_fte_control_applied"] = (
+        str(result.get("state") or "").upper() != "UNKNOWN" if applied is None else bool(applied)
+    )
     return result
 
 
@@ -956,7 +961,17 @@ class RayWorkerActor:
         splits: list[dict[str, Any]],
         _fte_control_dependency: Any = None,
     ) -> dict[str, Any]:
-        status = await self._get_fte_task_manager().add_splits(task_id, source_node_id, splits)
+        try:
+            status = await self._get_fte_task_manager().add_splits(task_id, source_node_id, splits)
+        except FteTaskTerminalControlError as exc:
+            if exc.operation != "add_splits":
+                raise
+            return _fte_applied_control_status(
+                "fte_add_splits",
+                task_id,
+                exc.status,
+                applied=False,
+            )
         return _fte_applied_control_status("fte_add_splits", task_id, status)
 
     @ray.method(concurrency_group="control")
