@@ -64,7 +64,7 @@ Changelog = "https://github.com/AstroVela/vane/releases"
 
 [project.optional-dependencies]
 openai = ["openai"]
-anthropic = ["anthropic"]
+anthropic = ["anthropic>=0.117.0"] # floor matches the Messages.create option surface validated in vane/ai/providers/anthropic.py
 google = ["google-genai"]
 transformers = [
     "sentence-transformers",
@@ -83,7 +83,7 @@ video = [ # video data source; decord is gated to Vane's supported native platfo
     "decord>=0.6; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
 all = [ # Cloud providers and dataframe/filesystem integrations; local model runtimes stay opt-in.
-    "anthropic",
+    "anthropic>=0.117.0",
     "google-genai",
     "ipython", # used in query_graph
     "fsspec",  # used in filesystem support

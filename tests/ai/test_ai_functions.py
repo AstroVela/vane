@@ -1185,6 +1185,64 @@ class TestAnthropicStrictOptions:
         desc = self._provider(max_tokens=64).get_prompter(model="claude-sonnet-4-6", temperature=0.2)
         assert desc.prompt_options["temperature"] == 0.2
 
+    @pytest.mark.parametrize("default", [1, 1.0])
+    def test_sonnet5_default_temperature_passes(self, default):
+        """The documented default temperature (1.0) is accepted by the API."""
+        desc = self._provider(max_tokens=64).get_prompter(model="claude-sonnet-5", temperature=default)
+        assert desc.prompt_options["temperature"] == default
+
+    def test_sonnet5_boolean_temperature_rejected(self):
+        """True == 1 in Python, but a bool is not the documented default."""
+        with pytest.raises(ValueError, match="temperature"):
+            self._provider(max_tokens=64).get_prompter(model="claude-sonnet-5", temperature=True)
+
+    def test_sonnet5_default_like_top_p_still_rejected(self):
+        """top_p has no documented default, so any explicit value is non-default."""
+        with pytest.raises(ValueError, match="top_p"):
+            self._provider(max_tokens=64).get_prompter(model="claude-sonnet-5", top_p=1.0)
+
+    # --- extra_body cannot bypass the option contract ---------------------
+
+    @pytest.mark.parametrize(
+        "smuggled",
+        [
+            {"thinking": {"type": "enabled", "budget_tokens": 1024}},
+            {"temperature": 0.2},
+            {"max_tokens": 5},
+            {"model": "claude-other-model"},
+            {"stream": True},
+        ],
+    )
+    def test_extra_body_with_validated_field_rejected(self, smuggled):
+        """Vane-owned and known request fields cannot ride in extra_body."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="extra_body") as excinfo:
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model",
+                prompt_options={"max_tokens": 64, "extra_body": smuggled},
+            )
+        assert next(iter(smuggled)) in str(excinfo.value)
+
+    def test_extra_body_non_mapping_rejected(self):
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="extra_body"):
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model",
+                prompt_options={"max_tokens": 64, "extra_body": ["thinking"]},
+            )
+
+    def test_extra_body_with_unmodeled_field_passes(self):
+        """extra_body keeps its purpose: fields the SDK does not model."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        desc = AnthropicPrompterDescriptor(
+            model_name="claude-test-model",
+            prompt_options={"max_tokens": 64, "extra_body": {"future_api_field": {"enabled": True}}},
+        )
+        assert desc.prompt_options["extra_body"] == {"future_api_field": {"enabled": True}}
+
     # --- explicit max_tokens chain ----------------------------------------
 
     def test_get_prompter_without_max_tokens_raises(self):
@@ -1212,6 +1270,35 @@ class TestAnthropicStrictOptions:
     def test_call_max_tokens_overrides_provider_config(self):
         desc = self._provider(max_tokens=128).get_prompter(max_tokens=512)
         assert desc.prompt_options["max_tokens"] == 512
+
+    def test_none_max_tokens_falls_back_to_provider_config(self):
+        """An explicit max_tokens=None is unconfigured, not a configured value."""
+        desc = self._provider(max_tokens=128).get_prompter(max_tokens=None)
+        assert desc.prompt_options["max_tokens"] == 128
+
+    def test_none_max_tokens_without_config_raises(self):
+        with pytest.raises(ValueError, match="No max_tokens configured"):
+            self._provider().get_prompter(max_tokens=None)
+
+    def test_none_max_tokens_rejected_on_direct_descriptor_construction(self):
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="No max_tokens configured"):
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model",
+                prompt_options={"max_tokens": None},
+            )
+
+    @pytest.mark.parametrize("bad", ["64", 64.0, False, -1])
+    def test_non_integer_max_tokens_rejected(self, bad):
+        """max_tokens must be a non-negative int; False must not satisfy == 0."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(ValueError, match="non-negative integer"):
+            AnthropicPrompterDescriptor(
+                model_name="claude-test-model",
+                prompt_options={"max_tokens": bad},
+            )
 
     def test_ctor_max_tokens_is_keyword_only(self):
         from vane.ai.providers.anthropic import AnthropicProvider
@@ -1310,6 +1397,7 @@ class TestAnthropicStrictOptions:
         )
         assert desc.return_format is dict
 
+    @pytest.mark.skipif(not _has_module("anthropic"), reason="anthropic not installed")
     def test_structured_output_dispatch_kwargs(self):
         """The dispatched call carries the forced extract_data tool choice."""
         import asyncio
@@ -1345,6 +1433,7 @@ class TestAnthropicStrictOptions:
 
     # --- max_tokens=0 cache prewarming ------------------------------------
 
+    @pytest.mark.skipif(not _has_module("anthropic"), reason="anthropic not installed")
     def test_zero_max_tokens_prewarm_returns_none(self):
         """A max_tokens=0 response with stop_reason=max_tokens is prewarming, not truncation."""
         import asyncio
@@ -1404,6 +1493,7 @@ class TestAnthropicStrictOptions:
                 prompt_options={"max_tokens": 0},
             )
 
+    @pytest.mark.skipif(not _has_module("anthropic"), reason="anthropic not installed")
     def test_positive_max_tokens_truncation_still_raises(self):
         """The prewarming carve-out does not weaken truncation detection."""
         import asyncio

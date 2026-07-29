@@ -19,11 +19,17 @@ construction, before any request is dispatched:
 - Unknown option keys raise :class:`ValueError` instead of being
   silently dropped.
 - Option/model combinations the API is documented to reject (for
-  example sampling parameters on Claude Sonnet 5) raise
+  example non-default sampling parameters on Claude Sonnet 5; the
+  documented default ``temperature=1`` still passes) raise
   :class:`ValueError` before dispatch.
+- ``extra_body`` is reserved for request fields the SDK does not model:
+  Vane-owned fields and known request options inside it raise
+  :class:`ValueError` instead of bypassing the validated contract.
 - ``max_tokens`` has no library default: it must be supplied per call
   (``max_tokens=...``) or configured on the provider
-  (``AnthropicProvider(max_tokens=...)``); the per-call value wins.
+  (``AnthropicProvider(max_tokens=...)``); the per-call value wins. An
+  explicit ``None`` is treated as unconfigured, and the resolved value
+  must be a non-negative integer.
 - A truncated response (``stop_reason == "max_tokens"``) raises instead
   of silently returning partial text or ``None``. The one documented
   exception is ``max_tokens=0`` cache prewarming, whose successful
@@ -85,6 +91,10 @@ _KNOWN_PROMPT_OPTIONS: frozenset[str] = frozenset(
     }
 )
 
+# Request fields Vane owns end-to-end. They are set by the prompter and may
+# not be smuggled past pre-dispatch validation through ``extra_body``.
+_VANE_OWNED_REQUEST_FIELDS: frozenset[str] = frozenset({"messages", "model", "stream", "system", "tools"})
+
 # Vane execution options that ride in ``prompt_options`` but are consumed by
 # the UDF machinery and never forwarded to the Messages API.
 _VANE_EXECUTION_OPTIONS: frozenset[str] = frozenset(
@@ -98,14 +108,19 @@ _VANE_EXECUTION_OPTIONS: frozenset[str] = frozenset(
     }
 )
 
-# Request options the API is documented to reject per model family. A model
-# matches an entry by family prefix: the exact id or ``<family>-<suffix>``
-# (dated snapshots and successors within the family). Documented sources:
+# Request options the API rejects per model family when set to a non-default
+# value. A model matches an entry by family prefix: the exact id or
+# ``<family>-<suffix>`` (dated snapshots and successors within the family).
+# ``temperature`` has a documented default of 1.0 (Messages API reference,
+# https://platform.claude.com/docs/en/api/messages), so passing exactly that
+# value is accepted; ``top_p`` and ``top_k`` have no documented default, so
+# any explicit value is non-default and rejected. Documented sources:
 # https://platform.claude.com/docs/en/about-claude/models/whats-new-sonnet-5
 # (Claude Sonnet 5 returns a 400 error for non-default ``temperature``,
 # ``top_p``, or ``top_k``) and
 # https://platform.claude.com/docs/en/about-claude/models/migration-guide
-# (the same constraint on Claude Opus 4.7 and later Opus models).
+# ("Setting temperature, top_p, or top_k to a non-default value returns a
+# 400 error" on Claude Opus 4.7 and later Opus models).
 _MODEL_UNSUPPORTED_OPTIONS: dict[str, frozenset[str]] = {
     "claude-opus-4-7": frozenset({"temperature", "top_k", "top_p"}),
     "claude-opus-4-8": frozenset({"temperature", "top_k", "top_p"}),
@@ -114,14 +129,21 @@ _MODEL_UNSUPPORTED_OPTIONS: dict[str, frozenset[str]] = {
 }
 
 
+def _is_default_temperature(value: Any) -> bool:
+    """True when ``value`` is the documented API default ``temperature`` (1.0)."""
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and value == 1
+
+
 def _validate_prompt_options(model_name: str, options: Mapping[str, Any]) -> None:
-    """Reject unknown or model-unsupported prompt options before dispatch.
+    """Reject unknown, contract-bypassing, or model-unsupported prompt options.
 
     Raises:
         ValueError: If ``options`` contains keys that are neither known
-            Messages API request options nor Vane execution options, or
-            contains request options the selected model is documented to
-            reject.
+            Messages API request options nor Vane execution options; if
+            ``extra_body`` is not a mapping or carries Vane-owned or
+            otherwise-validated request fields; or if a sampling option
+            carries a non-default value on a model family the API is
+            documented to reject it for.
     """
     unknown = sorted(key for key in options if key not in _KNOWN_PROMPT_OPTIONS and key not in _VANE_EXECUTION_OPTIONS)
     if unknown:
@@ -129,14 +151,38 @@ def _validate_prompt_options(model_name: str, options: Mapping[str, Any]) -> Non
             f"Unknown Anthropic prompt option(s) {unknown} for model {model_name!r}. "
             f"Supported Messages API request options: {sorted(_KNOWN_PROMPT_OPTIONS)}."
         )
+    extra_body = options.get("extra_body")
+    if extra_body is not None:
+        if not isinstance(extra_body, Mapping):
+            raise ValueError(
+                f"Anthropic option extra_body must be a mapping of additional JSON "
+                f"request body fields, got {type(extra_body).__name__}."
+            )
+        bypassing = sorted(
+            key for key in extra_body if key in _VANE_OWNED_REQUEST_FIELDS or key in _KNOWN_PROMPT_OPTIONS
+        )
+        if bypassing:
+            raise ValueError(
+                f"extra_body must not carry field(s) {bypassing} for model {model_name!r}: "
+                "Vane-owned request fields and known Messages API request options are "
+                "validated before dispatch and cannot bypass that contract through "
+                "extra_body. Pass request options at the top level instead."
+            )
     for family, unsupported in _MODEL_UNSUPPORTED_OPTIONS.items():
         if model_name == family or model_name.startswith(f"{family}-"):
-            rejected = sorted(key for key in options if key in unsupported)
+            rejected = sorted(
+                key
+                for key, value in options.items()
+                if key in unsupported and not (key == "temperature" and _is_default_temperature(value))
+            )
             if rejected:
                 raise ValueError(
                     f"Anthropic model {model_name!r} does not support option(s) {rejected}: "
-                    "the API rejects non-default sampling parameters for this model "
-                    "family. Remove the option(s) or select a model that supports them."
+                    "the API returns a 400 error for non-default sampling parameters on "
+                    "this model family (temperature is accepted only at its documented "
+                    "default of 1; top_p and top_k have no documented default, so any "
+                    "explicit value is non-default). Omit the option(s) or select a "
+                    "model that supports them."
                 )
 
 
@@ -278,7 +324,8 @@ class AnthropicProvider(Provider):
         The model resolves as: call-site ``model`` > provider
         ``prompt_model`` configuration; the selected value must be a
         non-empty string. ``max_tokens`` resolves as: call-site option >
-        provider ``max_tokens`` configuration.
+        provider ``max_tokens`` configuration; an explicit
+        ``max_tokens=None`` is treated as unconfigured.
 
         Raises:
             ValueError: If no model or no ``max_tokens`` is configured
@@ -298,7 +345,7 @@ class AnthropicProvider(Provider):
                 f"Anthropic prompt model must be a non-empty string, got {model_name!r}. "
                 "Pass model=... or configure AnthropicProvider(prompt_model=...)."
             )
-        if "max_tokens" not in prompt_options and self._max_tokens is not None:
+        if prompt_options.get("max_tokens") is None and self._max_tokens is not None:
             prompt_options["max_tokens"] = self._max_tokens
         return AnthropicPrompterDescriptor(
             provider_name=self._name,
@@ -334,9 +381,15 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
         self.provider_options = wrap_sensitive_options(self.provider_options)
         self.prompt_options = wrap_sensitive_options(self.prompt_options)
         _validate_prompt_options(self.model_name, self.prompt_options)
-        if "max_tokens" not in self.prompt_options:
+        max_tokens = self.prompt_options.get("max_tokens")
+        if max_tokens is None:
             raise ValueError(
                 "No max_tokens configured for the Anthropic provider. "
+                "Pass max_tokens=... or configure AnthropicProvider(max_tokens=...)."
+            )
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 0:
+            raise ValueError(
+                f"Anthropic max_tokens must be a non-negative integer, got {max_tokens!r}. "
                 "Pass max_tokens=... or configure AnthropicProvider(max_tokens=...)."
             )
         _validate_option_combinations(self.return_format, self.prompt_options)
