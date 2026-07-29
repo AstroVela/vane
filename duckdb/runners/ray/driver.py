@@ -54,6 +54,7 @@ _SESSION_CLOSE_REPLAY_CAPACITY = 65_536
 _CLIENT_DETACH_REPLAY_CAPACITY = 65_536
 _COPY_OPERATION_REPLAY_CAPACITY = 1_024
 _DEFAULT_PROGRESS_TOPOLOGY_INIT_TIMEOUT_S = 60.0
+_DEFAULT_COPY_RECONCILIATION_TIMEOUT_S = 30.0
 _RUNTIME_ATTACH_TIMEOUT_S = 300.0
 _RUNTIME_ATTACH_RETRY_INTERVAL_S = 0.05
 _RUNTIME_ATTACH_CLEANUP_ATTEMPTS = 3
@@ -157,6 +158,18 @@ def _client_owner_lease_settings() -> tuple[float, float]:
             "VANE_RAY_CLIENT_LEASE_TIMEOUT_S"
         )
     return lease_timeout, heartbeat_interval
+
+
+def _copy_reconciliation_timeout_s() -> float:
+    value = float(
+        os.environ.get(
+            "VANE_RAY_COPY_RECONCILIATION_TIMEOUT_S",
+            str(_DEFAULT_COPY_RECONCILIATION_TIMEOUT_S),
+        )
+    )
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("VANE_RAY_COPY_RECONCILIATION_TIMEOUT_S must be finite and > 0")
+    return value
 
 
 def _runtime_error_candidates(error: BaseException) -> list[BaseException]:
@@ -4847,6 +4860,7 @@ class RayQueryDriverActor:
         operation_id: str,
         *,
         session_id: str | None,
+        wait_timeout_s: float | None = None,
     ) -> CopyPlanRecovery:
         self._ensure_copy_operation_state()
         owner_key = str(owner_id).strip()
@@ -4874,8 +4888,29 @@ class RayQueryDriverActor:
                 session_id=session_key,
                 operation_id=operation_key,
             )
+            if wait_timeout_s is not None:
+                # asyncio.wait leaves a pending task running. Reconciliation
+                # timing out must never cancel a COPY that may still commit.
+                done, _ = await asyncio.wait(
+                    {in_flight.task},
+                    timeout=wait_timeout_s,
+                )
+                if not done:
+                    terminal = self._copy_operation_terminal.get(operation_key)
+                    if terminal is not None:
+                        self._validate_copy_operation_identity(
+                            terminal,
+                            owner_id=owner_key,
+                            session_id=session_key,
+                            operation_id=operation_key,
+                        )
+                        return self._copy_terminal_recovery(operation_key, terminal)
+                    raise CopyOutcomeUnknownError(operation_key)
             try:
-                outcome = await self._await_copy_operation(in_flight.task)
+                if wait_timeout_s is None:
+                    outcome = await self._await_copy_operation(in_flight.task)
+                else:
+                    outcome = in_flight.task.result()
             except asyncio.CancelledError:
                 raise
             except BaseException as operation_error:
@@ -4912,11 +4947,12 @@ class RayQueryDriverActor:
         session_id: str,
         operation_id: str,
     ) -> CopyPlanRecovery:
-        """Read or await an existing COPY outcome without submitting a write."""
+        """Read or briefly await an existing COPY outcome without submitting a write."""
         return await self._recover_copy_operation(
             owner_id,
             operation_id,
             session_id=session_id,
+            wait_timeout_s=_copy_reconciliation_timeout_s(),
         )
 
     async def _retry_copy_cleanup_for_operation(
@@ -6003,8 +6039,9 @@ class RayQueryDriverClient:
         session_id: str,
         operation_id: str,
         operation_error: BaseException,
+        reconciliation_timeout_s: float,
     ) -> CopyPlanOutcome:
-        """Resolve an ambiguous COPY response without ever resubmitting it."""
+        """Resolve an ambiguous COPY response with one bounded read-only wait."""
         try:
             recovery_future = runner.recover_copy_plan.remote(
                 self._owner_id,
@@ -6013,29 +6050,25 @@ class RayQueryDriverClient:
             )
         except BaseException:
             raise CopyOutcomeUnknownError(operation_id) from operation_error
-        while True:
-            try:
-                recovery = resolve_object_refs_blocking(
-                    recovery_future,
-                    honor_query_deadline=False,
-                )
-            except BaseException as recovery_error:
-                if _runtime_error_is_wait_timeout(recovery_error):
-                    # Rewait on the same read-only ObjectRef. A new RPC is not
-                    # needed and the write operation must never be resubmitted.
-                    continue
-                unknown_error = next(
-                    (
-                        candidate
-                        for candidate in _runtime_error_candidates(recovery_error)
-                        if isinstance(candidate, CopyOutcomeUnknownError)
-                    ),
-                    None,
-                )
-                if unknown_error is not None:
-                    raise unknown_error
-                raise CopyOutcomeUnknownError(operation_id) from operation_error
-            break
+        try:
+            recovery = resolve_object_refs_blocking(
+                recovery_future,
+                timeout=reconciliation_timeout_s,
+                honor_query_deadline=False,
+                honor_object_get_timeout=False,
+            )
+        except BaseException as recovery_error:
+            unknown_error = next(
+                (
+                    candidate
+                    for candidate in _runtime_error_candidates(recovery_error)
+                    if isinstance(candidate, CopyOutcomeUnknownError)
+                ),
+                None,
+            )
+            if unknown_error is not None:
+                raise unknown_error
+            raise CopyOutcomeUnknownError(operation_id) from operation_error
         if not isinstance(recovery, CopyPlanRecovery):
             raise CopyOutcomeUnknownError(operation_id) from operation_error
         if recovery.operation_id != operation_id:
@@ -6183,6 +6216,7 @@ class RayQueryDriverClient:
         import time as _time
 
         _t0 = _time.time()
+        reconciliation_timeout_s = _copy_reconciliation_timeout_s()
 
         try:
             session_id, _, runner = self._ensure_session(plan)
@@ -6211,6 +6245,7 @@ class RayQueryDriverClient:
                         session_id=session_id,
                         operation_id=plan_id,
                         operation_error=operation_error,
+                        reconciliation_timeout_s=reconciliation_timeout_s,
                     )
                 else:
                     try:
@@ -6224,6 +6259,7 @@ class RayQueryDriverClient:
                             session_id=session_id,
                             operation_id=plan_id,
                             operation_error=response_error,
+                            reconciliation_timeout_s=reconciliation_timeout_s,
                         )
                 final_progress_snapshot = outcome.final_progress_snapshot
                 completed = True

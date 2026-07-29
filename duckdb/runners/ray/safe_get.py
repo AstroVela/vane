@@ -31,6 +31,7 @@ def configured_ray_get_timeout_s(
     timeout: float | None = None,
     *,
     honor_query_deadline: bool = True,
+    honor_object_get_timeout: bool = True,
 ) -> float | None:
     resolved_timeout = max(0.0, float(timeout)) if timeout is not None else None
     deadline = _positive_float_env("VANE_QUERY_DEADLINE_EPOCH_S") if honor_query_deadline else None
@@ -39,7 +40,7 @@ def configured_ray_get_timeout_s(
         if remaining <= 0.0:
             raise QueryDeadlineExceeded("query deadline expired before Ray ObjectRef get")
         resolved_timeout = remaining if resolved_timeout is None else min(resolved_timeout, remaining)
-    configured = _positive_float_env("VANE_RAY_OBJECT_GET_TIMEOUT_S")
+    configured = _positive_float_env("VANE_RAY_OBJECT_GET_TIMEOUT_S") if honor_object_get_timeout else None
     if configured is not None:
         resolved_timeout = configured if resolved_timeout is None else min(resolved_timeout, configured)
     return resolved_timeout
@@ -128,6 +129,7 @@ def resolve_object_refs_blocking(
     *,
     timeout: float | None = None,
     honor_query_deadline: bool = True,
+    honor_object_get_timeout: bool = True,
     on_wait: Callable[[], None] | None = None,
     wait_interval_s: float = 0.5,
 ) -> Any:
@@ -137,10 +139,13 @@ def resolve_object_refs_blocking(
     call site; native pollers and other worker-owned threads wait through the
     ObjectRef concurrent-future bridge. When ``on_wait`` is provided, one total
     timeout is divided into bounded waits and the callback runs between them.
+    Callers with a dedicated hard timeout may opt out of the process-wide
+    ObjectRef timeout without disabling that explicit bound.
     """
     timeout = configured_ray_get_timeout_s(
         timeout,
         honor_query_deadline=honor_query_deadline,
+        honor_object_get_timeout=honor_object_get_timeout,
     )
     wait_interval_s = float(wait_interval_s)
     if on_wait is not None and wait_interval_s <= 0:
