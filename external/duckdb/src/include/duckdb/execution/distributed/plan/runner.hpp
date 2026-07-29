@@ -45,26 +45,6 @@
 namespace duckdb {
 namespace distributed {
 
-inline std::pair<bool, idx_t> DirectWriteLifecycleCleanupMinAgeMsFromEnv() {
-	const char *env = std::getenv("VANE_DISTRIBUTED_COPY_DIRECT_WRITE_CLEANUP_MIN_AGE_MS");
-	if (!env || !*env) {
-		return std::make_pair(true, static_cast<idx_t>(24ULL * 60ULL * 60ULL * 1000ULL));
-	}
-
-	auto lower = StringUtil::Lower(std::string(env));
-	if (lower == "0" || lower == "false" || lower == "no" || lower == "off" || lower == "disabled") {
-		return std::make_pair(false, idx_t(0));
-	}
-
-	errno = 0;
-	char *end = nullptr;
-	auto value = std::strtoull(env, &end, 10);
-	if (errno != 0 || end == env || *end != '\0') {
-		return std::make_pair(true, static_cast<idx_t>(24ULL * 60ULL * 60ULL * 1000ULL));
-	}
-	return std::make_pair(true, static_cast<idx_t>(value));
-}
-
 inline size_t FteEventBurstLimit() {
 	const char *env = std::getenv("VANE_FTE_EVENT_BURST_LIMIT");
 	if (!env || !*env) {
@@ -593,13 +573,9 @@ public:
 		find_sink(pipeline_node);
 
 		if (sink_node && sink_node->staging_root_base().empty()) {
+			// Persist lifecycle metadata for explicit operator-managed cleanup. Starting a COPY must not age out
+			// other runs: elapsed time alone does not establish that another run is abandoned.
 			auto &fs = FileSystem::GetFileSystem(*client_context_);
-			auto cleanup_policy = DirectWriteLifecycleCleanupMinAgeMsFromEnv();
-			if (cleanup_policy.first) {
-				(void)CleanupExpiredDistributedCopyDirectWriteRuns(fs, sink_node->spec().file_path,
-				                                                   cleanup_policy.second);
-			}
-
 			auto lifecycle_res =
 			    WriteDistributedCopyDirectWriteLifecycle(fs, sink_node->spec().file_path, sink_node->staging_run_id());
 			if (lifecycle_res.is_err()) {

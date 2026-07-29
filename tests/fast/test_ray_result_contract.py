@@ -6187,6 +6187,69 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
 
 
 @pytest.mark.usefixtures("ray_local")
+def test_run_copy_plan_leaves_stale_direct_write_cleanup_to_explicit_api(tmp_path, monkeypatch):
+    captured = []
+    monkeypatch.delenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", raising=False)
+
+    class _DummyRunner:
+        def run_write(self, relation):
+            captured.append(relation)
+            return {"ok": True}
+
+    import duckdb.runners as runners_mod
+    from duckdb.runners.ray import cleanup_copy_direct_write_lifecycle_once
+
+    monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
+
+    con = duckdb.connect()
+    src = tmp_path / "copy_explicit_cleanup_input.parquet"
+    dst = tmp_path / "copy_explicit_cleanup_output"
+    dst.mkdir()
+    con.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
+    assert captured, "expected write relation to be captured"
+
+    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        captured[0],
+        str(uuid.uuid4()),
+    ).to_physical_plan(con)
+
+    stale_run_id = "run-explicit-cleanup"
+    stale_lifecycle = duckdb.ray_cxx.register_copy_direct_write_run_lifecycle(
+        str(dst),
+        stale_run_id,
+        created_epoch_ms=1,
+    )
+    stale_file = dst / f"_vane_direct_write_{stale_run_id}" / "w_failed" / "part.parquet"
+    stale_file.parent.mkdir(parents=True)
+    stale_file.write_bytes(b"stale")
+
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    with _registered_low_level_plan(plan, con):
+        result = runner.run_copy_plan(plan, con)
+
+    assert result["copy_output_committed"] is True
+    assert stale_file.is_file()
+    assert Path(stale_lifecycle["copy_output_lifecycle_path"]).is_file()
+
+    cleanup = cleanup_copy_direct_write_lifecycle_once(
+        str(dst),
+        min_age_ms=1,
+    )
+
+    assert cleanup["scanned_runs"] == 2
+    assert cleanup["cleaned_runs"] == 1
+    assert cleanup["committed_runs"] == 1
+    assert cleanup["cleaned_run_ids"] == [{"base_path": str(dst), "run_id": stale_run_id}]
+    assert not stale_file.exists()
+    assert not Path(stale_lifecycle["copy_output_commit_dir"]).exists()
+    assert Path(result["copy_output_committed_marker_path"]).is_file()
+    con.close()
+
+
+@pytest.mark.usefixtures("ray_local")
 def test_run_copy_plan_local_staging_env_preserves_rename_path(tmp_path, monkeypatch):
     captured = []
     monkeypatch.setenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", "1")
