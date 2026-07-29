@@ -392,6 +392,40 @@ def test_ray_safe_get_timeout_envs_preserve_zero(monkeypatch, env_name):
         assert safe_get.configured_ray_get_timeout_s() == 0.0
 
 
+def test_ray_get_explicit_timeout_can_ignore_global_wait_limits(monkeypatch):
+    from duckdb.runners.ray import safe_get
+
+    class FakeFuture:
+        def __init__(self):
+            self.calls = []
+
+        def result(self, timeout=None):
+            self.calls.append(timeout)
+            return "resolved"
+
+    class FakeRef:
+        def __init__(self, future):
+            self._future = future
+
+        def future(self):
+            return self._future
+
+    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", "0")
+    monkeypatch.setenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", "0")
+    future = FakeFuture()
+
+    assert (
+        safe_get.resolve_object_refs_blocking(
+            FakeRef(future),
+            timeout=2.5,
+            honor_query_deadline=False,
+            honor_object_get_timeout=False,
+        )
+        == "resolved"
+    )
+    assert future.calls == [2.5]
+
+
 def test_ray_get_in_async_actor_background_thread_uses_object_ref_future(monkeypatch):
     from duckdb.runners.ray import safe_get
 
