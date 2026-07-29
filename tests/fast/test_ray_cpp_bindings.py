@@ -504,11 +504,13 @@ def test_flight_exchange_selected_attempt_runtime_path():
     assert {h["partition_id"] for h in sink0_handles} == {0, 1}
     assert all(h["attempt_id"] == 1 for h in sink0_handles)
     assert all(h["node_id"] == "worker-retry" for h in sink0_handles)
+    assert all(h["flight_host"] == "flight-retry.internal" for h in sink0_handles)
     assert all(h["flight_port"] == 5010 for h in sink0_handles)
     assert all(h["flight_server_epoch"] == "worker-retry-epoch" for h in sink0_handles)
     assert all("__attempt_1" in h["path"] for h in sink0_handles)
     assert all(h["attempt_id"] == 0 for h in sink1_handles)
     assert all(h["node_id"] == "worker-first" for h in sink1_handles)
+    assert all(h["flight_host"] == "flight-first.internal" for h in sink1_handles)
     assert all(h["flight_port"] == 5012 for h in sink1_handles)
     assert all(h["flight_server_epoch"] == "worker-first-epoch" for h in sink1_handles)
 
@@ -523,12 +525,14 @@ def test_flight_exchange_materialized_output_attempt_metadata_drives_completion(
     assert len(sink1_handles) == 2
     assert all(h["attempt_id"] == 1 for h in sink0_handles)
     assert all(h["node_id"] == "worker-retry" for h in sink0_handles)
+    assert all(h["flight_host"] == "flight-retry.internal" for h in sink0_handles)
     assert all(h["flight_port"] == 5010 for h in sink0_handles)
     assert all(h["flight_server_epoch"] == "worker-retry-epoch" for h in sink0_handles)
     assert all("__attempt_1" in h["path"] for h in sink0_handles)
     assert all("__attempt_0" not in h["path"] for h in sink0_handles)
     assert all(h["attempt_id"] == 0 for h in sink1_handles)
     assert all(h["node_id"] == "worker-first" for h in sink1_handles)
+    assert all(h["flight_host"] == "flight-first.internal" for h in sink1_handles)
     assert all(h["flight_port"] == 5012 for h in sink1_handles)
     assert all(h["flight_server_epoch"] == "worker-first-epoch" for h in sink1_handles)
 

@@ -5670,8 +5670,17 @@ def test_describe_native_progress_materializes_deferred_clone_without_execution(
     assert scan_pipeline["input_rows"] == 10
 
 
-def test_remote_exchange_sink_accepts_nested_query_id_without_result_collector(tmp_path, monkeypatch):
+def test_remote_exchange_sink_accepts_nested_query_id_without_result_collector(
+    tmp_path,
+    monkeypatch,
+    request,
+):
     import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    duckdb.ray_cxx.shutdown_local_flight_service()
+    request.addfinalizer(duckdb.ray_cxx.shutdown_local_flight_service)
+    monkeypatch.setenv("VANE_FLIGHT_BIND_HOST", "127.0.0.1")
+    monkeypatch.setenv("VANE_FLIGHT_ADVERTISE_HOST", "127.0.0.1")
 
     class _CapturingWorker:
         def __init__(self):
@@ -5756,6 +5765,10 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_result_collector(t
 
     assert sink_topologies
     assert len(sink_results) == len(sink_topologies)
+    assert all(result.flight_port > 0 for result in sink_results)
+    ordinary_result = runner.execute_native(con.cursor(), _make_test_physical_plan(con), None, None)
+    assert ordinary_result.flight_port == 0
+    assert ordinary_result.exchange_sink_instance is None
     assert all(
         "RESULT_COLLECTOR" not in pipeline["operators"]
         for topology in sink_topologies

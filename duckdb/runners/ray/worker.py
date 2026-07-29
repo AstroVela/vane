@@ -647,8 +647,12 @@ class RayWorkerActor:
         num_gpus: int,
         duckdb_memory_bytes: int,
         task_heap_capacity_bytes: int,
+        flight_advertise_host_fallback: str = "",
     ) -> None:
         scrub_shared_runtime_session_env()
+        flight_advertise_host_fallback = str(flight_advertise_host_fallback or "").strip()
+        if flight_advertise_host_fallback and not os.environ.get("VANE_FLIGHT_ADVERTISE_HOST", "").strip():
+            os.environ["VANE_FLIGHT_ADVERTISE_HOST"] = flight_advertise_host_fallback
         duckdb_memory_bytes = int(duckdb_memory_bytes)
         task_heap_capacity_bytes = int(task_heap_capacity_bytes)
         if duckdb_memory_bytes <= 0:

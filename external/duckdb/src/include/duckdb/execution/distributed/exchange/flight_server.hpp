@@ -18,6 +18,9 @@ struct FlightServerConfig {
 	std::string server_epoch;
 };
 
+//! Build a Flight TCP URI, adding URI brackets around an IPv6 host.
+std::string BuildFlightLocation(const std::string &host, int port);
+
 class FlightServer {
 public:
 	explicit FlightServer(FlightServerConfig config);

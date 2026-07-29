@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: MIT
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#endif
+
 /**
  * @file flight_exchange_manager.cpp
  * @brief Concrete FlightExchange implementation — disk-first + Arrow Flight.
@@ -16,6 +23,8 @@
 #include "duckdb/execution/distributed/exchange/flight_ticket.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/uuid.hpp"
@@ -30,6 +39,8 @@
 #include <arrow/ipc/api.h>
 
 #include <algorithm>
+#include <array>
+#include <iostream>
 #include <mutex>
 #include <sstream>
 
@@ -38,10 +49,72 @@ namespace distributed {
 
 namespace {
 
+struct ParsedFlightHost {
+	std::string host;
+	bool is_wildcard = false;
+};
+
+int ParseFlightIpLiteral(int family, const std::string &host, void *address) {
+#if defined(_WIN32)
+	return InetPtonA(family, host.c_str(), address);
+#else
+	return inet_pton(family, host.c_str(), address);
+#endif
+}
+
+DuckDBResult<ParsedFlightHost> ParseFlightHost(std::string host) {
+	StringUtil::Trim(host);
+	if (host.empty()) {
+		return DuckDBResult<ParsedFlightHost>::ok({std::move(host), false});
+	}
+
+	const bool starts_with_bracket = host.front() == '[';
+	const bool ends_with_bracket = host.back() == ']';
+	if (starts_with_bracket != ends_with_bracket) {
+		return DuckDBResult<ParsedFlightHost>::err(
+		    DuckDBError::value_error("Flight host has mismatched brackets: " + host));
+	}
+	if (starts_with_bracket) {
+		host = host.substr(1, host.size() - 2);
+		if (host.empty()) {
+			return DuckDBResult<ParsedFlightHost>::err(DuckDBError::value_error("Flight host must not be empty"));
+		}
+	}
+
+	std::array<unsigned char, 16> address {};
+	const auto is_zero = [](unsigned char byte) {
+		return byte == 0;
+	};
+	if (ParseFlightIpLiteral(AF_INET, host, address.data()) == 1) {
+		const bool is_unspecified = std::all_of(address.begin(), address.begin() + 4, is_zero);
+		return DuckDBResult<ParsedFlightHost>::ok({std::move(host), is_unspecified});
+	}
+	if (ParseFlightIpLiteral(AF_INET6, host, address.data()) == 1) {
+		const bool is_unspecified = std::all_of(address.begin(), address.end(), is_zero);
+		const bool is_ipv4_mapped_unspecified = std::all_of(address.begin(), address.begin() + 10, is_zero) &&
+		                                        address[10] == 0xff && address[11] == 0xff &&
+		                                        std::all_of(address.begin() + 12, address.end(), is_zero);
+		return DuckDBResult<ParsedFlightHost>::ok({std::move(host), is_unspecified || is_ipv4_mapped_unspecified});
+	}
+	const bool is_numeric_ipv4_like = std::all_of(host.begin(), host.end(), [](char character) {
+		return (character >= '0' && character <= '9') || character == '.';
+	});
+	if (is_numeric_ipv4_like) {
+		return DuckDBResult<ParsedFlightHost>::err(
+		    DuckDBError::value_error("Flight host is not a canonical IPv4 literal: " + host));
+	}
+	if (starts_with_bracket || host.find(':') != std::string::npos) {
+		return DuckDBResult<ParsedFlightHost>::err(
+		    DuckDBError::value_error("Flight host is not a valid IP literal: " + host));
+	}
+	return DuckDBResult<ParsedFlightHost>::ok({std::move(host), false});
+}
+
 struct LocalFlightServiceState {
 	std::mutex mutex;
 	std::unique_ptr<FlightServer> server;
 	std::string bind_host;
+	std::string advertise_host;
 	int requested_port = 0;
 	int actual_port = 0;
 	std::string server_epoch;
@@ -53,27 +126,6 @@ LocalFlightServiceState &LocalFlightService() {
 	(void)ShuffleCacheRegistry::Instance();
 	static LocalFlightServiceState service;
 	return service;
-}
-
-std::string BuildFlightLocation(const FlightExchangeConfig &config, const std::string &node_id) {
-	auto location = config.flight_location_template;
-	if (location.empty()) {
-		location = "grpc://{node}:" + std::to_string(config.flight_port);
-	}
-	auto pos = location.find("{node}");
-	if (pos != std::string::npos) {
-		location.replace(pos, std::string("{node}").size(), node_id);
-	}
-	return location;
-}
-
-std::string BuildFlightLocationForPort(const FlightExchangeConfig &config, const std::string &node_id, int port) {
-	auto effective_config = config;
-	if (port > 0) {
-		effective_config.flight_port = port;
-		effective_config.flight_location_template.clear();
-	}
-	return BuildFlightLocation(effective_config, node_id);
 }
 
 bool FlightExchangeLooksLikeObjectPath(const std::string &path) {
@@ -94,6 +146,10 @@ bool FlightExchangeUsesObjectStorage(const FlightExchangeConfig &config) {
 		}
 	}
 	return false;
+}
+
+bool FlightExchangeUsesNetworkTransport(const FlightExchangeConfig &config) {
+	return !config.local_dirs.empty() && !FlightExchangeUsesObjectStorage(config);
 }
 
 std::shared_ptr<ShuffleCache> MakeFlightExchangeShuffleCache(const ShuffleCacheConfig &cache_config,
@@ -232,42 +288,73 @@ DuckDBResult<std::unique_ptr<arrow::flight::FlightClient>> ConnectFlightExchange
 	return DuckDBResult<std::unique_ptr<arrow::flight::FlightClient>>::ok(std::move(client_res).ValueOrDie());
 }
 
-DuckDBResult<void> EnsureLocalFlightServerStartedInternal(const FlightExchangeConfig &config) {
-	if (config.local_dirs.empty()) {
-		return DuckDBResult<void>::ok();
+DuckDBResult<void> EnsureLocalFlightServerStartedInternal(const FlightServiceConfig &config) {
+	auto advertise_host_res = ParseFlightHost(config.advertise_host);
+	if (advertise_host_res.is_err()) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error(std::string("invalid Flight advertise host: ") +
+		                                                                advertise_host_res.error().what()));
 	}
-	if (FlightExchangeUsesObjectStorage(config)) {
-		return DuckDBResult<void>::ok();
+	auto parsed_advertise_host = std::move(advertise_host_res.value());
+	auto advertise_host = std::move(parsed_advertise_host.host);
+	if (advertise_host.empty()) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("Flight advertise host is empty"));
+	}
+	if (parsed_advertise_host.is_wildcard || advertise_host == "*") {
+		return DuckDBResult<void>::err(
+		    DuckDBError::invalid_state_error("Flight advertise host must not be a wildcard address"));
+	}
+	auto bind_host_res = ParseFlightHost(config.bind_host);
+	if (bind_host_res.is_err()) {
+		return DuckDBResult<void>::err(
+		    DuckDBError::invalid_state_error(std::string("invalid Flight bind host: ") + bind_host_res.error().what()));
+	}
+	auto bind_host = std::move(bind_host_res.value().host);
+	if (bind_host.empty()) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("Flight bind host is empty"));
 	}
 
 	auto &service = LocalFlightService();
 	std::lock_guard<std::mutex> guard(service.mutex);
 	if (service.server) {
-		if (service.bind_host != config.flight_bind_host || service.requested_port != config.flight_port) {
+		if (service.bind_host != bind_host || service.advertise_host != advertise_host ||
+		    service.requested_port != config.port) {
 			std::ostringstream message;
 			message << "process-local Flight service already listens on requested address " << service.bind_host << ":"
-			        << service.requested_port << " (actual port " << service.actual_port
-			        << "); refusing conflicting address " << config.flight_bind_host << ":" << config.flight_port;
+			        << service.requested_port << " (actual port " << service.actual_port << ", advertised as "
+			        << service.advertise_host << "); refusing conflicting address " << bind_host << ":" << config.port
+			        << " advertised as " << advertise_host;
 			return DuckDBResult<void>::err(DuckDBError::invalid_state_error(message.str()));
 		}
 		return DuckDBResult<void>::ok();
 	}
 
 	FlightServerConfig server_config;
-	server_config.bind_host = config.flight_bind_host;
-	server_config.port = config.flight_port;
+	server_config.bind_host = bind_host;
+	server_config.port = config.port;
 	server_config.server_epoch = UUID::ToString(UUID::GenerateRandomUUID());
 	auto server = std::unique_ptr<FlightServer>(new FlightServer(server_config));
 	auto start_res = server->Start();
 	if (start_res.is_err()) {
 		return start_res;
 	}
-	service.bind_host = config.flight_bind_host;
-	service.requested_port = config.flight_port;
+	service.bind_host = std::move(bind_host);
+	service.advertise_host = std::move(advertise_host);
+	service.requested_port = config.port;
 	service.actual_port = server->port();
 	service.server_epoch = std::move(server_config.server_epoch);
 	service.server = std::move(server);
+	std::cerr << "Started plaintext cluster-internal Flight shuffle service at "
+	          << BuildFlightLocation(service.advertise_host, service.actual_port)
+	          << ". This endpoint provides no TLS or client authentication and must remain inside the trusted Ray "
+	             "cluster network."
+	          << std::endl;
 	return DuckDBResult<void>::ok();
+}
+
+std::string CurrentLocalFlightServerHost() {
+	auto &service = LocalFlightService();
+	std::lock_guard<std::mutex> guard(service.mutex);
+	return service.advertise_host;
 }
 
 int CurrentLocalFlightServerPort() {
@@ -294,6 +381,7 @@ DuckDBResult<void> ShutdownLocalFlightServerInternal() {
 	}
 	service.server.reset();
 	service.bind_host.clear();
+	service.advertise_host.clear();
 	service.requested_port = 0;
 	service.actual_port = 0;
 	service.server_epoch.clear();
@@ -308,6 +396,45 @@ std::string BuildSinkOutputLocation(const std::string &exchange_instance_id, con
 }
 
 } // namespace
+
+FlightServiceConfig ResolveFlightServiceConfigFromEnv() {
+	FlightServiceConfig config;
+	config.advertise_host = ResolveFlightExchangeEnvString("VANE_FLIGHT_ADVERTISE_HOST");
+	if (config.advertise_host.empty()) {
+		config.advertise_host = ResolveFlightExchangeEnvString("RAY_NODE_IP_ADDRESS");
+	}
+	if (config.advertise_host.empty()) {
+		config.advertise_host = "127.0.0.1";
+	}
+
+	auto advertise_host_res = ParseFlightHost(config.advertise_host);
+	if (advertise_host_res.is_err()) {
+		throw InvalidInputException("invalid VANE_FLIGHT_ADVERTISE_HOST: %s", advertise_host_res.error().what());
+	}
+	auto parsed_advertise_host = std::move(advertise_host_res.value());
+	config.advertise_host = std::move(parsed_advertise_host.host);
+	if (config.advertise_host.empty()) {
+		throw InvalidInputException("VANE_FLIGHT_ADVERTISE_HOST must not be empty");
+	}
+	if (parsed_advertise_host.is_wildcard || config.advertise_host == "*") {
+		throw InvalidInputException("VANE_FLIGHT_ADVERTISE_HOST must be a routable host, not a wildcard address");
+	}
+
+	config.bind_host = ResolveFlightExchangeEnvString("VANE_FLIGHT_BIND_HOST");
+	if (config.bind_host.empty()) {
+		config.bind_host = config.advertise_host;
+	}
+	auto bind_host_res = ParseFlightHost(config.bind_host);
+	if (bind_host_res.is_err()) {
+		throw InvalidInputException("invalid VANE_FLIGHT_BIND_HOST: %s", bind_host_res.error().what());
+	}
+	config.bind_host = std::move(bind_host_res.value().host);
+	if (config.bind_host.empty()) {
+		config.bind_host = config.advertise_host;
+	}
+	config.port = ResolveFlightExchangeEnvInt("DUCKDB_FLIGHT_PORT", 0);
+	return config;
+}
 
 // ─── FlightExchange ──────────────────────────────────────
 
@@ -393,11 +520,36 @@ void FlightExchange::SinkFinished(const ExchangeSinkInstanceHandle &instance, co
 	if (flight_port < 0) {
 		throw InvalidInputException("finished Flight sink port must be non-negative");
 	}
-	if (flight_port > 0 && node_id.empty()) {
-		throw InvalidInputException("finished Flight sink is missing its worker node id");
+	auto flight_host = instance.flight_host;
+	if (flight_host.empty() && flight_port > 0) {
+		// Compatibility for worker results produced before flight_host was
+		// carried separately from worker identity.
+		flight_host = node_id;
 	}
-	if (flight_port > 0 && instance.flight_server_epoch.empty()) {
-		throw InvalidInputException("finished Flight sink is missing its server epoch");
+	const bool has_flight_endpoint = !flight_host.empty() || flight_port > 0 || !instance.flight_server_epoch.empty();
+	if (!FlightExchangeUsesNetworkTransport(config_) && has_flight_endpoint) {
+		throw InvalidInputException("non-local-disk Flight sink cannot publish a Flight endpoint");
+	}
+	if (has_flight_endpoint) {
+		if (node_id.empty()) {
+			throw InvalidInputException("finished Flight sink is missing its worker identity");
+		}
+		bool flight_host_is_wildcard = false;
+		if (!flight_host.empty()) {
+			auto flight_host_res = ParseFlightHost(flight_host);
+			if (flight_host_res.is_err()) {
+				throw InvalidInputException("finished Flight sink has an invalid advertised host: %s",
+				                            flight_host_res.error().what());
+			}
+			flight_host_is_wildcard = flight_host_res.value().is_wildcard;
+			flight_host = std::move(flight_host_res.value().host);
+		}
+		if (flight_host.empty() || flight_port == 0 || instance.flight_server_epoch.empty()) {
+			throw InvalidInputException("finished Flight sink endpoint requires host, port, and server epoch");
+		}
+		if (flight_host_is_wildcard || flight_host == "*") {
+			throw InvalidInputException("finished Flight sink cannot advertise a wildcard host");
+		}
 	}
 	bool cleanup_unselected = false;
 	{
@@ -435,6 +587,10 @@ void FlightExchange::SinkFinished(const ExchangeSinkInstanceHandle &instance, co
 		if (!node_id.empty() && !attempt_metadata.node_id.empty() && attempt_metadata.node_id != node_id) {
 			throw InvalidInputException("finished Flight sink node does not match its published attempt");
 		}
+		if (!flight_host.empty() && !attempt_metadata.flight_host.empty() &&
+		    attempt_metadata.flight_host != flight_host) {
+			throw InvalidInputException("finished Flight sink host does not match its published attempt");
+		}
 		if (flight_port > 0 && attempt_metadata.flight_port > 0 && attempt_metadata.flight_port != flight_port) {
 			throw InvalidInputException("finished Flight sink port does not match its published attempt");
 		}
@@ -444,6 +600,9 @@ void FlightExchange::SinkFinished(const ExchangeSinkInstanceHandle &instance, co
 		}
 		if (!node_id.empty()) {
 			attempt_metadata.node_id = node_id;
+		}
+		if (!flight_host.empty()) {
+			attempt_metadata.flight_host = flight_host;
 		}
 		if (flight_port > 0) {
 			attempt_metadata.flight_port = flight_port;
@@ -621,8 +780,11 @@ std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 			handle.partition_id = partition_id;
 			handle.attempt_id = attempt_id;
 			handle.node_id = attempt_metadata.node_id;
-			handle.flight_port = attempt_metadata.flight_port > 0 ? attempt_metadata.flight_port : config_.flight_port;
-			handle.flight_server_epoch = attempt_metadata.flight_server_epoch;
+			if (FlightExchangeUsesNetworkTransport(config_)) {
+				handle.flight_host = attempt_metadata.flight_host;
+				handle.flight_port = attempt_metadata.flight_port;
+				handle.flight_server_epoch = attempt_metadata.flight_server_epoch;
+			}
 			handle.files.push_back(build_source_file(attempt_metadata, partition_id));
 			handles.push_back(std::move(handle));
 		}
@@ -793,7 +955,8 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 		    DuckDBError::invalid_state_error("Flight exchange source handle is missing its catalog identity"));
 	}
 	auto output_location = handle.files[0].path;
-	auto source_flight_port = handle.flight_port > 0 ? handle.flight_port : config_.flight_port;
+	auto source_flight_host = handle.flight_host.empty() ? source_node_id : handle.flight_host;
+	auto source_flight_port = handle.flight_port;
 
 	auto stream = make_uniq<PartitionStreamState>();
 	stream->expected_types.insert(stream->expected_types.end(), config_.expected_types.begin(),
@@ -803,6 +966,7 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 	    DuckDBError::invalid_state_error("uninitialized exchange source file result"));
 	std::shared_ptr<ShuffleCache> file_cache;
 	const bool uses_object_storage = FlightExchangeUsesObjectStorage(config_);
+	const bool uses_process_local_registry = !uses_object_storage && source_node_id == config_.node_id;
 	auto replay_object_manifest = [&]() {
 		if (config_.local_dirs.empty()) {
 			return;
@@ -829,7 +993,7 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 
 	// Object storage must be replayed from the durable manifest using this
 	// task's ClientContext/FileOpener, not the sink task's registry cache.
-	if (!uses_object_storage && source_node_id == config_.node_id) {
+	if (uses_process_local_registry) {
 		auto cache_res = ShuffleCacheRegistry::Instance().Resolve(output_location, handle.flight_server_epoch,
 		                                                          source_node_id, handle.attempt_id);
 		if (cache_res.is_ok()) {
@@ -862,6 +1026,9 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 		stream->files = std::move(files_res.value().files);
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::ok(std::move(stream));
 	}
+	if (uses_process_local_registry) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(files_res.error());
+	}
 	if (uses_object_storage) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(DuckDBError::external_error(
 		    "object-storage FlightExchange source failed to replay committed manifest for exchange_id=" +
@@ -872,8 +1039,28 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
 		    DuckDBError::invalid_state_error("remote Flight exchange source handle is missing its server epoch"));
 	}
+	auto source_flight_host_res = ParseFlightHost(source_flight_host);
+	if (source_flight_host_res.is_err()) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(DuckDBError::invalid_state_error(
+		    std::string("remote Flight exchange source handle has an invalid advertised host: ") +
+		    source_flight_host_res.error().what()));
+	}
+	const bool source_flight_host_is_wildcard = source_flight_host_res.value().is_wildcard;
+	source_flight_host = std::move(source_flight_host_res.value().host);
+	if (source_flight_host.empty()) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
+		    DuckDBError::invalid_state_error("remote Flight exchange source handle is missing its advertised host"));
+	}
+	if (source_flight_host_is_wildcard || source_flight_host == "*") {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
+		    DuckDBError::invalid_state_error("remote Flight exchange source handle advertises a wildcard host"));
+	}
+	if (source_flight_port <= 0) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
+		    DuckDBError::invalid_state_error("remote Flight exchange source handle is missing its port"));
+	}
 
-	auto location = BuildFlightLocationForPort(config_, source_node_id, source_flight_port);
+	auto location = BuildFlightLocation(source_flight_host, source_flight_port);
 	auto client_res = ConnectFlightExchangeClient(location);
 	if (client_res.is_err()) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(client_res.error());
@@ -1093,12 +1280,14 @@ std::unique_ptr<ExchangeSink> FlightExchangeManager::CreateSink(const ExchangeSi
 	cache_config.num_partitions = handle.output_partition_count;
 	cache_config.local_dirs = config_.local_dirs;
 
-	auto server_res = EnsureLocalFlightServerStarted(config_);
-	if (server_res.is_err()) {
-		throw std::runtime_error(server_res.error().what());
+	if (FlightExchangeUsesNetworkTransport(config_)) {
+		auto server_res = EnsureLocalFlightServerStarted(ResolveFlightServiceConfigFromEnv());
+		if (server_res.is_err()) {
+			throw std::runtime_error(server_res.error().what());
+		}
 	}
 	auto sink_handle = handle;
-	sink_handle.flight_server_epoch = GetLocalFlightServerEpoch();
+	sink_handle.flight_server_epoch = GetPublishedFlightServerEpoch();
 	auto shuffle_cache = MakeFlightExchangeShuffleCache(cache_config, config_, context_);
 	return std::unique_ptr<ExchangeSink>(new FlightExchangeSink(shuffle_cache, sink_handle, context_));
 }
@@ -1106,6 +1295,10 @@ std::unique_ptr<ExchangeSink> FlightExchangeManager::CreateSink(const ExchangeSi
 std::unique_ptr<ExchangeSource> FlightExchangeManager::CreateSource() {
 	RefreshRuntimeNodeId();
 	return std::unique_ptr<ExchangeSource>(new FlightExchangeSource(config_, context_));
+}
+
+std::string FlightExchangeManager::GetLocalFlightServerHost() {
+	return CurrentLocalFlightServerHost();
 }
 
 int FlightExchangeManager::GetLocalFlightServerPort() {
@@ -1116,7 +1309,28 @@ std::string FlightExchangeManager::GetLocalFlightServerEpoch() {
 	return CurrentLocalFlightServerEpoch();
 }
 
-DuckDBResult<void> FlightExchangeManager::EnsureLocalFlightServerStarted(const FlightExchangeConfig &config) {
+std::string FlightExchangeManager::GetPublishedFlightServerHost() const {
+	if (!FlightExchangeUsesNetworkTransport(config_)) {
+		return std::string();
+	}
+	return CurrentLocalFlightServerHost();
+}
+
+int FlightExchangeManager::GetPublishedFlightServerPort() const {
+	if (!FlightExchangeUsesNetworkTransport(config_)) {
+		return 0;
+	}
+	return CurrentLocalFlightServerPort();
+}
+
+std::string FlightExchangeManager::GetPublishedFlightServerEpoch() const {
+	if (!FlightExchangeUsesNetworkTransport(config_)) {
+		return std::string();
+	}
+	return CurrentLocalFlightServerEpoch();
+}
+
+DuckDBResult<void> FlightExchangeManager::EnsureLocalFlightServerStarted(const FlightServiceConfig &config) {
 	return EnsureLocalFlightServerStartedInternal(config);
 }
 

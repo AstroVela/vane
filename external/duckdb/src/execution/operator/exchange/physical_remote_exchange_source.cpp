@@ -307,6 +307,7 @@ InsertionOrderPreservingMap<string> PhysicalRemoteExchangeSource::ParamsToString
 void PhysicalRemoteExchangeSource::SerializeOperatorData(Serializer &serializer) const {
 	vector<idx_t> handle_partition_ids;
 	vector<string> handle_node_ids;
+	vector<string> handle_flight_hosts;
 	vector<string> handle_paths;
 	vector<int> handle_flight_ports;
 	vector<idx_t> handle_attempt_ids;
@@ -318,12 +319,9 @@ void PhysicalRemoteExchangeSource::SerializeOperatorData(Serializer &serializer)
 	}
 	const auto &flight_config = flight_mgr->config();
 	local_dirs.insert(local_dirs.end(), flight_config.local_dirs.begin(), flight_config.local_dirs.end());
-	auto flight_location_template = flight_config.flight_location_template;
-	if (flight_location_template.empty()) {
-		flight_location_template = "grpc://{node}:" + std::to_string(flight_config.flight_port);
-	}
 	handle_partition_ids.reserve(source_handles_.size());
 	handle_node_ids.reserve(source_handles_.size());
+	handle_flight_hosts.reserve(source_handles_.size());
 	handle_paths.reserve(source_handles_.size());
 	handle_flight_ports.reserve(source_handles_.size());
 	handle_attempt_ids.reserve(source_handles_.size());
@@ -331,6 +329,7 @@ void PhysicalRemoteExchangeSource::SerializeOperatorData(Serializer &serializer)
 	for (const auto &handle : source_handles_) {
 		handle_partition_ids.push_back(handle.partition_id);
 		handle_node_ids.push_back(handle.node_id);
+		handle_flight_hosts.push_back(handle.flight_host);
 		handle_paths.push_back(handle.files.empty() ? string() : handle.files[0].path);
 		handle_flight_ports.push_back(handle.flight_port);
 		handle_attempt_ids.push_back(handle.attempt_id);
@@ -339,7 +338,6 @@ void PhysicalRemoteExchangeSource::SerializeOperatorData(Serializer &serializer)
 	serializer.WriteProperty(103, "shuffle_stage_id", exchange_id_);
 	serializer.WriteProperty(104, "partition_indices", partition_indices_);
 	serializer.WriteProperty(105, "source_nodes", source_nodes_);
-	serializer.WriteProperty(106, "flight_location_template", flight_location_template);
 	serializer.WriteProperty(107, "flight_timeout_seconds", flight_config.flight_timeout_seconds);
 	serializer.WriteProperty(108, "source_handle_partition_ids", handle_partition_ids);
 	serializer.WriteProperty(109, "source_handle_node_ids", handle_node_ids);
@@ -350,6 +348,7 @@ void PhysicalRemoteExchangeSource::SerializeOperatorData(Serializer &serializer)
 	serializer.WriteProperty(114, "local_dirs", local_dirs);
 	serializer.WriteProperty(115, "source_handle_flight_server_epochs", handle_flight_server_epochs);
 	serializer.WriteProperty(116, "source_catalog_handles_explicit", true);
+	serializer.WriteProperty(118, "source_handle_flight_hosts", handle_flight_hosts);
 }
 
 } // namespace duckdb

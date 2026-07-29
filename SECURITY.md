@@ -21,15 +21,27 @@ Include the affected commit or version, impact, prerequisites, a minimal reprodu
 Several Vane features intentionally execute code. Treat these boundaries explicitly:
 
 - Python UDFs and Cloudpickle payloads can execute arbitrary Python in the driver or Ray workers. Never deserialize or run a callable from an untrusted source.
-- A Ray cluster is part of the trusted computing base. Use Ray authentication, network isolation, least-privilege identities, and compatible package versions on every node.
+- A Ray cluster is one trusted computing boundary: the driver, every worker, submitted Python/UDF/native code, the east-west network, and administrators can affect one another. Follow [Ray's security guidance](https://docs.ray.io/en/latest/ray-security/index.html), including network isolation, least-privilege identities, and compatible package versions on every node.
+- Cross-worker local-disk shuffle uses plaintext Arrow Flight. It provides neither transport encryption nor client authentication.
 - Model repositories can contain executable custom code. Keep remote-code loading disabled unless a trusted model specifically requires it, and pin reviewed model revisions.
 - API keys and cloud credentials may be propagated to workers. Prefer short-lived, scoped credentials and secret managers; never place secrets in SQL text, logs, source files, or benchmark output.
 - Image, video, audio, document, Parquet, Arrow, and compressed inputs reach native parsers. Process hostile inputs in isolated workers with resource limits.
 - SQL can consume unbounded CPU, memory, storage, network, or model tokens. Multi-tenant deployments need admission control, quotas, and cancellation outside Vane's current defaults.
 
+## Plaintext Flight transport
+
+Vane supports plaintext Arrow Flight inside a controlled, isolated Ray cluster. Same-process local-disk reads use the process-local registry, object-storage reads use committed manifests, and only cross-worker local-disk reads use Flight. Object-storage failures do not fall back to a producer's local Flight endpoint.
+
+Each worker process owns at most one lazily started Flight service. A Flight ticket identifies a live published exchange attempt and partition; it is not an authentication or authorization credential. The service validates the ticket format, service epoch, producer identity, selected attempt, committed manifest, partition, query lifecycle, and reader lease.
+
+Vane does not provide confidentiality between users or jobs in one Ray cluster, protection from a malicious worker, or per-query authorization for this transport. Deploy mutually untrusted workloads in separate Ray clusters and separate networks.
+
+The worker's Ray private address is used for binding and advertisement by default. Operators may set `VANE_FLIGHT_BIND_HOST=0.0.0.0` when container networking requires a wildcard listener, but `VANE_FLIGHT_ADVERTISE_HOST` must be a routable non-wildcard address. The advertised-host override belongs to the worker node's environment and is not copied from the driver to every worker. Vane rejects this override in a Ray Job or actor runtime environment because Ray inherits those values across nodes. Firewall, Security Group, or NetworkPolicy rules must restrict the configured or dynamically allocated `DUCKDB_FLIGHT_PORT` to the same Ray cluster. Do not expose it through a public Service, Ingress, LoadBalancer, or NodePort.
+
 ## Secure deployment baseline
 
 - Run the driver and workers as unprivileged users in isolated networks.
+- Keep Ray and Vane Flight ports reachable only from the same trusted cluster.
 - Restrict worker egress and filesystem access to what a pipeline needs.
 - Pin Vane, Ray, model, container, and native dependency versions.
 - Keep credentials outside source and rotate any credential exposed in output.

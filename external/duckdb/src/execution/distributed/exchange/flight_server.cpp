@@ -12,11 +12,16 @@
 #include <arrow/ipc/dictionary.h>
 #include <arrow/io/api.h>
 #include <arrow/buffer.h>
+#include <arrow/util/uri.h>
 #include <algorithm>
 #include <vector>
 
 namespace duckdb {
 namespace distributed {
+
+std::string BuildFlightLocation(const std::string &host, int port) {
+	return "grpc+tcp://" + arrow::util::UriEncodeHost(host) + ":" + std::to_string(port);
+}
 
 namespace {
 
@@ -29,7 +34,7 @@ DuckDBResult<arrow::flight::Location> MakeLocation(const FlightServerConfig &con
 		return DuckDBResult<arrow::flight::Location>::err(
 		    DuckDBError::value_error("invalid flight server bind address"));
 	}
-	auto location_res = arrow::flight::Location::ForGrpcTcp(config.bind_host, config.port);
+	auto location_res = arrow::flight::Location::Parse(BuildFlightLocation(config.bind_host, config.port));
 	if (!location_res.ok()) {
 		return DuckDBResult<arrow::flight::Location>::err(
 		    FlightServerArrowToError(location_res.status(), "create flight location"));

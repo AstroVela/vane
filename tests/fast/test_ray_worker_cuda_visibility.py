@@ -19,6 +19,40 @@ class _RuntimeContext:
 
 
 @pytest.mark.parametrize(
+    ("node_local_host", "expected_host"),
+    [
+        (None, "10.0.0.1"),
+        ("flight.node.internal", "flight.node.internal"),
+    ],
+)
+def test_ray_worker_init_uses_node_address_only_as_flight_host_fallback(
+    monkeypatch,
+    node_local_host,
+    expected_host,
+):
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    if node_local_host is None:
+        monkeypatch.delenv("VANE_FLIGHT_ADVERTISE_HOST", raising=False)
+    else:
+        monkeypatch.setenv("VANE_FLIGHT_ADVERTISE_HOST", node_local_host)
+    monkeypatch.setattr(worker_mod.ray, "get_runtime_context", _RuntimeContext)
+    monkeypatch.setattr(worker_mod, "_warm_up_python_native_dependencies", lambda: None)
+    monkeypatch.setattr(worker_mod, "_ensure_python_datasource_runtime", lambda: None)
+    monkeypatch.setattr(actor_cls, "_get_shared_conn", lambda _self: None)
+
+    actor = actor_cls(
+        num_cpus=2,
+        num_gpus=0,
+        duckdb_memory_bytes=128 * 1024**2,
+        task_heap_capacity_bytes=128 * 1024**2,
+        flight_advertise_host_fallback="10.0.0.1",
+    )
+
+    assert worker_mod.os.environ["VANE_FLIGHT_ADVERTISE_HOST"] == expected_host
+    actor_cls.__del__(actor)
+
+
+@pytest.mark.parametrize(
     "visible_devices",
     [
         "2,5",

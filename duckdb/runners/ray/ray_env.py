@@ -17,6 +17,8 @@ _JOB_DUCKDB_ENV_KEYS = (
     "DUCKDB_SHUFFLE_DIRS",
 )
 
+_NODE_LOCAL_RUNTIME_ENV_KEYS = frozenset({"VANE_FLIGHT_ADVERTISE_HOST"})
+
 _SENSITIVE_ENV_MARKERS = (
     "ACCESS_KEY",
     "API_KEY",
@@ -38,6 +40,24 @@ _SESSION_ENV_PREFIXES = (
 )
 
 _SESSION_ENV_PAYLOAD_KEY = "VANE_INTERNAL_SESSION_ENV_PAYLOAD"
+
+
+def reject_node_local_ray_runtime_env(runtime_context: Any) -> None:
+    """Reject node-local settings inherited through a Ray runtime environment."""
+    runtime_env = getattr(runtime_context, "runtime_env", None)
+    if not isinstance(runtime_env, Mapping):
+        return
+    env_vars = runtime_env.get("env_vars")
+    if not isinstance(env_vars, Mapping):
+        return
+
+    inherited_keys = sorted(key for key in _NODE_LOCAL_RUNTIME_ENV_KEYS if key in env_vars)
+    if inherited_keys:
+        keys = ", ".join(inherited_keys)
+        raise RuntimeError(
+            f"{keys} is node-local and must not be set in a Ray Job or actor runtime_env; "
+            "configure it in each Ray worker node's environment instead"
+        )
 
 
 def _is_session_environment_key(key: str) -> bool:
@@ -113,13 +133,15 @@ def collect_vane_env_overrides() -> dict[str, str]:
 
     Connection/session credentials are carried in the logical-plan session
     snapshot and must never be installed in a shared runtime process.
+    Node-local service addresses remain in each worker's process environment
+    rather than inheriting through Ray runtime environments.
     """
     ensure_vane_session_dir()
 
     overrides = {
         key: value
         for key, value in os.environ.items()
-        if key.startswith("VANE_") and not _is_session_environment_key(key)
+        if key.startswith("VANE_") and key not in _NODE_LOCAL_RUNTIME_ENV_KEYS and not _is_session_environment_key(key)
     }
     for key in ("PYTHONPATH", "PYTHONWARNINGS"):
         value = os.environ.get(key)

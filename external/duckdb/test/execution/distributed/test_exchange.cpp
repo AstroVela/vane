@@ -17,6 +17,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 
+#include "arrow/flight/api.h"
 #include "arrow/io/api.h"
 
 #include <string>
@@ -1074,6 +1075,163 @@ TEST_CASE("Exchange: ShuffleCache write to multiple partitions", "[distributed][
 // FlightExchangeManager
 // ═══════════════════════════════════════════════════════════
 
+TEST_CASE("Exchange: local-disk sink starts and publishes the cluster-internal Flight service",
+          "[distributed][exchange]") {
+	REQUIRE(FlightExchangeManager::ShutdownLocalFlightServer().is_ok());
+	ScopedEnvVar bind_host("VANE_FLIGHT_BIND_HOST", "127.0.0.1");
+	ScopedEnvVar advertise_host("VANE_FLIGHT_ADVERTISE_HOST", "127.0.0.1");
+	ScopedEnvVar configured_port("DUCKDB_FLIGHT_PORT", "0");
+	ScopedEnvVar worker_id("VANE_WORKER_ID", "process-local-node");
+	auto config = ResolveFlightExchangeConfigFromEnv();
+	config.local_dirs = {TestCreatePath("exchange_process_local_default")};
+	auto service_config = ResolveFlightServiceConfigFromEnv();
+	REQUIRE(service_config.bind_host == "127.0.0.1");
+	REQUIRE(service_config.advertise_host == "127.0.0.1");
+	REQUIRE(service_config.port == 0);
+
+	DuckDB db(nullptr);
+	Connection conn(db);
+	FlightExchangeManager manager(config, conn.context.get());
+	ExchangeContext exchange_context;
+	exchange_context.query_id = "process-local-default-query";
+	exchange_context.exchange_id = "process-local-default-stage";
+	auto exchange = manager.CreateExchange(exchange_context, 1);
+	auto instance = exchange->InstantiateSink(exchange->AddSink(0), 0);
+	auto sink = manager.CreateSink(instance);
+	REQUIRE(sink != nullptr);
+	REQUIRE(manager.GetPublishedFlightServerHost() == "127.0.0.1");
+	REQUIRE(manager.GetPublishedFlightServerPort() > 0);
+	REQUIRE_FALSE(manager.GetPublishedFlightServerEpoch().empty());
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerHost() == "127.0.0.1");
+
+	REQUIRE(sink->EnsureSchema(*conn.context, {LogicalType::INTEGER}, {"value"}).is_ok());
+	DataChunk input;
+	input.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
+	input.SetCardinality(1);
+	input.SetValue(0, 0, Value::INTEGER(57));
+	REQUIRE(sink->AddChunk(0, input).is_ok());
+	REQUIRE(sink->Finish().is_ok());
+	instance.flight_host = manager.GetPublishedFlightServerHost();
+	instance.flight_server_epoch = manager.GetPublishedFlightServerEpoch();
+	exchange->SinkFinished(instance, config.node_id, manager.GetPublishedFlightServerPort());
+	auto handles = exchange->GetSourceHandles();
+	REQUIRE(handles.size() == 1);
+	REQUIRE(handles[0].node_id == "process-local-node");
+	REQUIRE(handles[0].flight_host == "127.0.0.1");
+	REQUIRE(handles[0].flight_port == manager.GetPublishedFlightServerPort());
+	REQUIRE(handles[0].flight_server_epoch == manager.GetPublishedFlightServerEpoch());
+
+	auto source = manager.CreateSource();
+	source->AddSourceHandles(handles);
+	DataChunk output;
+	output.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
+	REQUIRE(source->ReadChunk(output));
+	REQUIRE(output.size() == 1);
+	REQUIRE(output.GetValue(0, 0) == Value::INTEGER(57));
+	REQUIRE_FALSE(source->ReadChunk(output));
+	source->Close();
+	sink.reset();
+	exchange->Close();
+	auto cleanup = ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(exchange_context.query_id);
+	REQUIRE(cleanup.cleanup_errors == 0);
+	REQUIRE(cleanup.cleanup_pending == 0);
+	REQUIRE(ShuffleCacheRegistry::Instance().RetireQuery(exchange_context.query_id).is_ok());
+	REQUIRE(FlightExchangeManager::ShutdownLocalFlightServer().is_ok());
+}
+
+TEST_CASE("Exchange: Flight service normalizes IPv6 hosts before building Arrow URIs",
+          "[distributed][exchange][security]") {
+	ScopedEnvVar bind_host("VANE_FLIGHT_BIND_HOST", "");
+	for (const auto &configured_host : {"::1", "[::1]"}) {
+		INFO("configured host: " << configured_host);
+		ScopedEnvVar advertise_host("VANE_FLIGHT_ADVERTISE_HOST", configured_host);
+		auto config = ResolveFlightServiceConfigFromEnv();
+		REQUIRE(config.advertise_host == "::1");
+		REQUIRE(config.bind_host == "::1");
+
+		auto location = BuildFlightLocation(config.bind_host, 1234);
+		REQUIRE(location == "grpc+tcp://[::1]:1234");
+		REQUIRE(arrow::flight::Location::Parse(location).ok());
+	}
+
+	ScopedEnvVar advertise_host("VANE_FLIGHT_ADVERTISE_HOST", "");
+	ScopedEnvVar ray_node_ip("RAY_NODE_IP_ADDRESS", "::1");
+	auto config = ResolveFlightServiceConfigFromEnv();
+	REQUIRE(config.advertise_host == "::1");
+	REQUIRE(config.bind_host == "::1");
+}
+
+TEST_CASE("Exchange: Flight service rejects wildcard advertised IP addresses", "[distributed][exchange][security]") {
+	for (const auto &configured_host : {"0.0.0.0", "::", "[::]", "[::0]", "0:0:0:0:0:0:0:0", "[0:0:0:0:0:0:0:0]",
+	                                    "::ffff:0.0.0.0", "[::ffff:0:0]", "0:0:0:0:0:ffff:0:0"}) {
+		INFO("configured host: " << configured_host);
+		ScopedEnvVar advertise_host("VANE_FLIGHT_ADVERTISE_HOST", configured_host);
+		REQUIRE_THROWS_WITH(ResolveFlightServiceConfigFromEnv(), Catch::Matchers::Contains("must be a routable host"));
+	}
+}
+
+TEST_CASE("Exchange: Flight service rejects non-canonical numeric IPv4 hosts", "[distributed][exchange][security]") {
+	for (const auto &configured_host : {"00.00.00.00", "000.000.000.000", "0.0.0.00"}) {
+		INFO("configured host: " << configured_host);
+		ScopedEnvVar advertise_host("VANE_FLIGHT_ADVERTISE_HOST", configured_host);
+		REQUIRE_THROWS_WITH(ResolveFlightServiceConfigFromEnv(),
+		                    Catch::Matchers::Contains("not a canonical IPv4 literal"));
+	}
+}
+
+TEST_CASE("Exchange: remote local-disk source rejects a wildcard advertised host before connecting",
+          "[distributed][exchange][security]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	FlightExchangeConfig config;
+	config.node_id = "reader-node";
+	config.local_dirs = {TestCreatePath("exchange_remote_disabled")};
+	config.expected_types = {LogicalType::INTEGER};
+	FlightExchangeSource source(config, conn.context.get());
+
+	ExchangeSourceHandle handle;
+	handle.partition_id = 0;
+	handle.attempt_id = 1;
+	handle.node_id = "writer-worker";
+	handle.flight_host = "[::ffff:0.0.0.0]";
+	handle.flight_port = 1;
+	handle.flight_server_epoch = "remote-epoch";
+	handle.files.push_back(ExchangeSourceFile("remote-disabled-attempt", 0));
+	source.AddSourceHandles({handle});
+
+	DataChunk output;
+	output.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
+	REQUIRE_THROWS_WITH(source.ReadChunk(output), Catch::Matchers::Contains("advertises a wildcard host"));
+}
+
+TEST_CASE("Exchange: remote local-disk source rejects non-canonical numeric IPv4 advertised hosts",
+          "[distributed][exchange][security]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	FlightExchangeConfig config;
+	config.node_id = "reader-node";
+	config.local_dirs = {TestCreatePath("exchange_remote_noncanonical_ipv4")};
+	config.expected_types = {LogicalType::INTEGER};
+
+	for (const auto &configured_host : {"00.00.00.00", "000.000.000.000", "0.0.0.00"}) {
+		INFO("configured host: " << configured_host);
+		FlightExchangeSource source(config, conn.context.get());
+		ExchangeSourceHandle handle;
+		handle.partition_id = 0;
+		handle.attempt_id = 1;
+		handle.node_id = "writer-worker";
+		handle.flight_host = configured_host;
+		handle.flight_port = 1;
+		handle.flight_server_epoch = "remote-epoch";
+		handle.files.push_back(ExchangeSourceFile("remote-disabled-attempt", 0));
+		source.AddSourceHandles({handle});
+
+		DataChunk output;
+		output.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
+		REQUIRE_THROWS_WITH(source.ReadChunk(output), Catch::Matchers::Contains("not a canonical IPv4 literal"));
+	}
+}
+
 TEST_CASE("Exchange: FlightExchange coordinator lifecycle", "[distributed][exchange]") {
 	FlightExchangeConfig config;
 	config.node_id = "node_1";
@@ -1247,6 +1405,7 @@ TEST_CASE("Exchange: FlightExchange accepts validated dynamically derived retry 
 	auto suffix = retry.output_location.rfind("__attempt_0");
 	REQUIRE(suffix != std::string::npos);
 	retry.output_location.replace(suffix, std::string("__attempt_0").size(), "__attempt_2");
+	retry.flight_host = "[::1]";
 	retry.flight_server_epoch = "retry-epoch";
 	exchange->SinkFinished(retry, "worker-retry", 5010);
 
@@ -1254,6 +1413,7 @@ TEST_CASE("Exchange: FlightExchange accepts validated dynamically derived retry 
 	REQUIRE(handles.size() == 1);
 	REQUIRE(handles[0].attempt_id == 2);
 	REQUIRE(handles[0].node_id == "worker-retry");
+	REQUIRE(handles[0].flight_host == "::1");
 	REQUIRE(handles[0].flight_port == 5010);
 	REQUIRE(handles[0].flight_server_epoch == "retry-epoch");
 	REQUIRE(handles[0].files.size() == 1);
@@ -1262,6 +1422,7 @@ TEST_CASE("Exchange: FlightExchange accepts validated dynamically derived retry 
 	auto forged_retry = initial;
 	forged_retry.attempt_id = 3;
 	forged_retry.output_location = "forged-output";
+	forged_retry.flight_host = "retry.internal";
 	forged_retry.flight_server_epoch = "retry-epoch";
 	REQUIRE_THROWS_WITH(exchange->SinkFinished(forged_retry, "worker-retry", 5010),
 	                    Catch::Matchers::Contains("retry output location does not match"));
@@ -1278,71 +1439,59 @@ TEST_CASE("Exchange: process-local Flight service has immutable network config a
 	} guard;
 	REQUIRE(FlightExchangeManager::ShutdownLocalFlightServer().is_ok());
 
-	ExchangeSinkInstanceHandle handle;
-	handle.sink_handle.task_partition_id = 0;
-	handle.attempt_id = 0;
-	handle.query_id = "service-lifecycle-query";
-	handle.output_location = "service_lifecycle__instance_a__sink_0__attempt_0";
-	handle.output_partition_count = 1;
-	auto handle_b = handle;
-	handle_b.sink_handle.task_partition_id = 1;
-	handle_b.output_location = "service_lifecycle__instance_a__sink_1__attempt_0";
-
-	FlightExchangeConfig config_a;
-	config_a.node_id = "node-a";
-	config_a.flight_bind_host = "127.0.0.1";
-	config_a.flight_port = 0;
-	config_a.local_dirs = {TestCreatePath("flight_service_lifecycle_a")};
-	FlightExchangeManager manager_a(config_a);
-	auto sink_a = manager_a.CreateSink(handle);
-	REQUIRE(sink_a != nullptr);
+	FlightServiceConfig service_config;
+	service_config.bind_host = "127.0.0.1";
+	service_config.advertise_host = "127.0.0.1";
+	service_config.port = 0;
+	REQUIRE(FlightExchangeManager::EnsureLocalFlightServerStarted(service_config).is_ok());
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerHost() == "127.0.0.1");
 	const auto first_port = FlightExchangeManager::GetLocalFlightServerPort();
 	const auto first_epoch = FlightExchangeManager::GetLocalFlightServerEpoch();
 	REQUIRE(first_port > 0);
 	REQUIRE(!first_epoch.empty());
 
-	auto config_b = config_a;
-	config_b.local_dirs = {TestCreatePath("flight_service_lifecycle_b")};
-	config_b.node_id = "node-b";
-	FlightExchangeManager manager_b(config_b);
-	auto sink_b = manager_b.CreateSink(handle_b);
-	REQUIRE(sink_b != nullptr);
+	FlightExchangeConfig config_a;
+	config_a.node_id = "node-a";
+	config_a.local_dirs = {TestCreatePath("flight_service_lifecycle_a")};
+	FlightExchangeManager manager_a(config_a);
+	REQUIRE(manager_a.GetPublishedFlightServerHost() == "127.0.0.1");
+	REQUIRE(manager_a.GetPublishedFlightServerPort() == first_port);
+	REQUIRE(manager_a.GetPublishedFlightServerEpoch() == first_epoch);
+
+	auto object_storage_config = config_a;
+	object_storage_config.local_dirs = {"s3://bucket/shuffle"};
+	FlightExchangeManager object_storage_manager(object_storage_config);
+	REQUIRE(object_storage_manager.GetPublishedFlightServerHost().empty());
+	REQUIRE(object_storage_manager.GetPublishedFlightServerPort() == 0);
+	REQUIRE(object_storage_manager.GetPublishedFlightServerEpoch().empty());
 	REQUIRE(FlightExchangeManager::GetLocalFlightServerPort() == first_port);
 	REQUIRE(FlightExchangeManager::GetLocalFlightServerEpoch() == first_epoch);
 
-	auto conflicting_config = config_b;
-	conflicting_config.flight_port = first_port;
-	FlightExchangeManager conflicting_manager(conflicting_config);
-	REQUIRE_THROWS_WITH(conflicting_manager.CreateSink(handle),
-	                    Catch::Matchers::Contains("refusing conflicting address"));
+	REQUIRE(FlightExchangeManager::EnsureLocalFlightServerStarted(service_config).is_ok());
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerPort() == first_port);
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerEpoch() == first_epoch);
+
+	auto conflicting_config = service_config;
+	conflicting_config.advertise_host = "flight-worker.internal";
+	auto conflicting_start = FlightExchangeManager::EnsureLocalFlightServerStarted(conflicting_config);
+	REQUIRE(conflicting_start.is_err());
+	REQUIRE_THAT(conflicting_start.error().what(), Catch::Matchers::Contains("refusing conflicting address"));
 
 	manager_a.Shutdown();
-	manager_b.Shutdown();
+	object_storage_manager.Shutdown();
 	REQUIRE(FlightExchangeManager::GetLocalFlightServerPort() == first_port);
 	REQUIRE(FlightExchangeManager::GetLocalFlightServerEpoch() == first_epoch);
 
-	sink_a.reset();
-	sink_b.reset();
-	auto cleanup = ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(handle.query_id);
-	REQUIRE(cleanup.cleanup_errors == 0);
-	REQUIRE(cleanup.cleanup_pending == 0);
-	REQUIRE(ShuffleCacheRegistry::Instance().RetireQuery(handle.query_id).is_ok());
 	REQUIRE(FlightExchangeManager::ShutdownLocalFlightServer().is_ok());
+	REQUIRE(FlightExchangeManager::GetLocalFlightServerHost().empty());
 	REQUIRE(FlightExchangeManager::GetLocalFlightServerPort() == 0);
 	REQUIRE(FlightExchangeManager::GetLocalFlightServerEpoch().empty());
 
-	auto fixed_config = config_a;
-	fixed_config.flight_port = first_port;
-	FlightExchangeManager fixed_manager(fixed_config);
-	auto fixed_sink = fixed_manager.CreateSink(handle);
-	REQUIRE(fixed_sink != nullptr);
+	auto fixed_config = service_config;
+	fixed_config.port = first_port;
+	REQUIRE(FlightExchangeManager::EnsureLocalFlightServerStarted(fixed_config).is_ok());
 	REQUIRE(FlightExchangeManager::GetLocalFlightServerPort() == first_port);
 	REQUIRE(FlightExchangeManager::GetLocalFlightServerEpoch() != first_epoch);
-	fixed_sink.reset();
-	cleanup = ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(handle.query_id);
-	REQUIRE(cleanup.cleanup_errors == 0);
-	REQUIRE(cleanup.cleanup_pending == 0);
-	REQUIRE(ShuffleCacheRegistry::Instance().RetireQuery(handle.query_id).is_ok());
 	REQUIRE(FlightExchangeManager::ShutdownLocalFlightServer().is_ok());
 }
 
@@ -1352,7 +1501,6 @@ TEST_CASE("Exchange: FlightExchange selects first successful sink attempt", "[di
 
 	FlightExchangeConfig config;
 	config.node_id = "coordinator";
-	config.flight_port = 7777;
 	config.local_dirs = {TestCreatePath("exchange_selected_attempt")};
 	FlightExchangeManager mgr(config, conn.context.get());
 
@@ -1371,10 +1519,13 @@ TEST_CASE("Exchange: FlightExchange selects first successful sink attempt", "[di
 	REQUIRE(sink0_attempt1.output_location.find("__sink_0__attempt_1") != std::string::npos);
 	REQUIRE(sink1_attempt0.output_location.find("__sink_1__attempt_0") != std::string::npos);
 
+	sink0_attempt1.flight_host = "flight-retry.internal";
 	sink0_attempt1.flight_server_epoch = "worker-retry-epoch";
 	exchange->SinkFinished(sink0_attempt1, "worker-retry", 5010);
+	sink0_attempt0.flight_host = "flight-late.internal";
 	sink0_attempt0.flight_server_epoch = "worker-late-epoch";
 	exchange->SinkFinished(sink0_attempt0, "worker-late", 5011);
+	sink1_attempt0.flight_host = "flight-first.internal";
 	sink1_attempt0.flight_server_epoch = "worker-first-epoch";
 	exchange->SinkFinished(sink1_attempt0, "worker-first", 5012);
 	exchange->AllRequiredSinksFinished();
@@ -1390,6 +1541,7 @@ TEST_CASE("Exchange: FlightExchange selects first successful sink attempt", "[di
 			sink0_handles++;
 			REQUIRE(handle.attempt_id == 1);
 			REQUIRE(handle.node_id == "worker-retry");
+			REQUIRE(handle.flight_host == "flight-retry.internal");
 			REQUIRE(handle.flight_port == 5010);
 			REQUIRE(handle.flight_server_epoch == "worker-retry-epoch");
 			REQUIRE(handle.files[0].path.find("__attempt_1") != std::string::npos);
@@ -1398,6 +1550,7 @@ TEST_CASE("Exchange: FlightExchange selects first successful sink attempt", "[di
 			sink1_handles++;
 			REQUIRE(handle.attempt_id == 0);
 			REQUIRE(handle.node_id == "worker-first");
+			REQUIRE(handle.flight_host == "flight-first.internal");
 			REQUIRE(handle.flight_port == 5012);
 			REQUIRE(handle.flight_server_epoch == "worker-first-epoch");
 			REQUIRE(handle.files[0].path.find("__attempt_0") != std::string::npos);
@@ -1837,7 +1990,8 @@ TEST_CASE("Exchange: FlightExchangeSource revalidates local handle attempt ident
 	REQUIRE(source.ReadChunk(output));
 	REQUIRE(output.size() == 1);
 	REQUIRE(output.GetValue(0, 0).GetValue<int32_t>() == 42);
-	REQUIRE_THROWS_WITH(source.ReadChunk(output), Catch::Matchers::Contains("missing its server epoch"));
+	REQUIRE_THROWS_WITH(source.ReadChunk(output),
+	                    Catch::Matchers::Contains("attempt id does not match the published attempt"));
 
 	source.Close();
 	ShuffleCacheRegistry::Instance().Remove(exchange_id);
