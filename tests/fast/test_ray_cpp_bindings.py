@@ -1744,6 +1744,20 @@ def test_distributed_copy_sink_mode_local_staging_env_preserves_staging(monkeypa
     assert result["uses_visible_direct_target"] is False
 
 
+def test_distributed_copy_sink_mode_tmp_file_preserves_node_local_direct_write(monkeypatch, tmp_path):
+    monkeypatch.setenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", "1")
+
+    result = duckdb.ray_cxx.distributed_copy_sink_mode_for_test(
+        str(tmp_path / "tmp_out"),
+        use_tmp_file=True,
+    )
+
+    assert result["construct_error"] is False, result["error"]
+    assert result["staging_root_base"] == ""
+    assert result["uses_direct_write"] is True
+    assert result["uses_visible_direct_target"] is True
+
+
 def test_distributed_copy_sink_mode_remote_rejects_local_staging_env(monkeypatch):
     monkeypatch.setenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", "1")
 

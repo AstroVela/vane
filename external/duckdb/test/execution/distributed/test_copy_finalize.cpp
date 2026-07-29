@@ -52,6 +52,23 @@ private:
 	LocalFileSystem backing_fs;
 };
 
+class CountingFileOnlyRecursiveListFileSystem : public FileOnlyRecursiveListFileSystem {
+public:
+	bool ListFiles(const string &directory, const std::function<void(const string &, bool)> &callback,
+	               FileOpener *opener = nullptr) override {
+		list_calls[directory]++;
+		return FileOnlyRecursiveListFileSystem::ListFiles(directory, callback, opener);
+	}
+
+	idx_t ListCallCount(const string &directory) const {
+		auto entry = list_calls.find(directory);
+		return entry == list_calls.end() ? 0 : entry->second;
+	}
+
+private:
+	std::unordered_map<string, idx_t> list_calls;
+};
+
 class MarkerCheckFailureFileSystem : public FileOnlyRecursiveListFileSystem {
 public:
 	explicit MarkerCheckFailureFileSystem(string marker_path) : marker_path(std::move(marker_path)) {
@@ -181,6 +198,70 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	REQUIRE(literal_res.value() == fs.JoinPath(parent, "tmp_copy-output"));
 }
 
+TEST_CASE("Distributed COPY temporary direct output preserves the canonical target",
+          "[distributed][copy][lifecycle][path]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_temporary_replacement");
+	auto &fs = test_dir.fs;
+	auto output_path = fs.JoinPath(test_dir.path, "copy-output");
+	auto temporary_output_path = fs.JoinPath(test_dir.path, "tmp_copy-output");
+	const string run_id = "run-tmp";
+	auto worker_file = BuildCopyDirectTargetFilePath(temporary_output_path, run_id, "w_0", "part.parquet");
+	const string replacement_contents = "replacement";
+
+	WriteTestFile(fs, output_path, "old");
+	WriteTestFile(fs, worker_file, replacement_contents);
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(fs, output_path, run_id, 1, temporary_output_path).is_ok());
+
+	DuckDB db(nullptr);
+	Connection connection(db);
+	DistributedCopySpec spec;
+	spec.file_path = temporary_output_path;
+	spec.use_tmp_file = true;
+	spec.file_extension = "parquet";
+
+	auto make_files = [&]() {
+		vector<DistributedCopyFileInfo> files;
+		DistributedCopyFileInfo file;
+		file.staging_path = worker_file;
+		file.row_count = 2;
+		file.file_size_bytes = replacement_contents.size();
+		files.push_back(std::move(file));
+		return files;
+	};
+
+	auto first_res = FinalizeCopyFiles(spec, "", make_files(), *connection.context, run_id);
+	REQUIRE(first_res.is_ok());
+	auto first = std::move(first_res).value();
+	REQUIRE(first.output_base_path == output_path);
+	REQUIRE(first.output_direct_write);
+	REQUIRE(first.output_committed);
+	REQUIRE(first.rows_copied == 2);
+	REQUIRE(first.files.size() == 1);
+	REQUIRE(first.files[0].final_path == worker_file);
+	REQUIRE(fs.FileExists(output_path));
+	REQUIRE(ReadDistributedCopyTextFile(fs, output_path).value() == "old");
+	REQUIRE(ReadDistributedCopyTextFile(fs, first.files[0].final_path).value() == replacement_contents);
+	REQUIRE_FALSE(fs.DirectoryExists(temporary_output_path + ".duckdb_commit"));
+
+	auto committed_res = ReadCommittedDistributedCopyDirectWriteResult(fs, output_path, run_id);
+	REQUIRE(committed_res.is_ok());
+	REQUIRE(committed_res.value().rows_copied == 2);
+	REQUIRE(committed_res.value().files[0].final_path == worker_file);
+
+	const string stale_run_id = "run-tmp-stale";
+	auto stale_worker_file =
+	    BuildCopyDirectTargetFilePath(temporary_output_path, stale_run_id, "w_failed", "part.parquet");
+	WriteTestFile(fs, stale_worker_file, "stale");
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(fs, output_path, stale_run_id, 1, temporary_output_path).is_ok());
+	auto cleanup_res = CleanupDistributedCopyUncommittedDirectWriteRun(fs, output_path, stale_run_id);
+	REQUIRE(cleanup_res.is_ok());
+	REQUIRE_FALSE(cleanup_res.value().skipped_committed);
+	REQUIRE_FALSE(fs.FileExists(stale_worker_file));
+	REQUIRE(fs.FileExists(worker_file));
+	REQUIRE(fs.FileExists(output_path));
+	REQUIRE(ReadDistributedCopyTextFile(fs, output_path).value() == "old");
+}
+
 TEST_CASE("Distributed COPY strict marker checks use the portable local missing-file contract",
           "[distributed][copy][lifecycle][path]") {
 	auto marker_path = TestCreatePath("copy_finalize_missing_local_marker");
@@ -217,6 +298,7 @@ TEST_CASE("Expired direct-write cleanup discovers file-only object listings",
 	auto base_path = local_fs.JoinPath(test_dir.path, "out");
 
 	const string stale_run_id = "run-stale";
+	const string second_stale_run_id = "run-stale-two";
 	const string active_run_id = "run-active";
 	const string committed_run_id = "run-committed";
 
@@ -228,6 +310,10 @@ TEST_CASE("Expired direct-write cleanup discovers file-only object listings",
 	WriteTestFile(local_fs, stale_direct_target_file, "stale direct target");
 	auto stale_paths = BuildDistributedCopyFinalizeCommitPaths(local_fs, base_path, stale_run_id);
 	WriteTestFile(local_fs, stale_paths.manifest_path, "partial");
+
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, second_stale_run_id, 2).is_ok());
+	auto second_stale_direct_target_file = local_fs.JoinPath(base_path, second_stale_run_id + "_w_failed_part.parquet");
+	WriteTestFile(local_fs, second_stale_direct_target_file, "second stale direct target");
 
 	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, active_run_id, 95).is_ok());
 	auto active_file =
@@ -246,20 +332,22 @@ TEST_CASE("Expired direct-write cleanup discovers file-only object listings",
 	auto unregistered_path = local_fs.JoinPath(base_path + ".duckdb_commit", "run-without-lifecycle", "manifest.txt");
 	WriteTestFile(local_fs, unregistered_path, "not registered");
 
-	FileOnlyRecursiveListFileSystem object_fs;
+	CountingFileOnlyRecursiveListFileSystem object_fs;
 	auto cleanup_res = CleanupExpiredDistributedCopyDirectWriteRuns(object_fs, base_path, 10, 100);
 	REQUIRE(cleanup_res.is_ok());
 	auto cleanup = std::move(cleanup_res).value();
 
-	REQUIRE(cleanup.scanned_runs == 3);
-	REQUIRE(cleanup.cleaned_runs == 1);
+	REQUIRE(cleanup.scanned_runs == 4);
+	REQUIRE(cleanup.cleaned_runs == 2);
 	REQUIRE(cleanup.committed_runs == 1);
 	REQUIRE(cleanup.active_runs == 1);
 	REQUIRE(cleanup.skipped_unregistered_runs == 0);
 	REQUIRE(cleanup.errors == 0);
-	REQUIRE(cleanup.cleaned_run_ids == vector<string> {stale_run_id});
+	REQUIRE(cleanup.cleaned_run_ids == vector<string> {stale_run_id, second_stale_run_id});
+	REQUIRE(object_fs.ListCallCount(base_path) == 1);
 	REQUIRE_FALSE(local_fs.FileExists(stale_file));
 	REQUIRE_FALSE(local_fs.FileExists(stale_direct_target_file));
+	REQUIRE_FALSE(local_fs.FileExists(second_stale_direct_target_file));
 	REQUIRE_FALSE(local_fs.FileExists(stale_paths.lifecycle_path));
 	REQUIRE_FALSE(local_fs.FileExists(stale_paths.manifest_path));
 	REQUIRE(local_fs.FileExists(active_file));

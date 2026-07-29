@@ -4076,6 +4076,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    };
 
 		    auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, final_root, run_id);
+		    auto lifecycle_res = WriteDistributedCopyDirectWriteLifecycle(fs, final_root, run_id);
+		    if (lifecycle_res.is_err()) {
+			    throw std::runtime_error(lifecycle_res.error().what());
+		    }
 		    auto first_res = FinalizeCopyFiles(spec, "", make_files(), context, run_id);
 		    auto replay_loser_dir = BuildCopyDirectWriteTaskDirectory(final_root, run_id, "w_replay_loser");
 		    auto replay_loser_file = replay_loser_dir + "/part.parquet";
@@ -4175,6 +4179,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    };
 
 		    auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, final_root, run_id);
+		    auto lifecycle_res = WriteDistributedCopyDirectWriteLifecycle(fs, final_root, run_id);
+		    if (lifecycle_res.is_err()) {
+			    throw std::runtime_error(lifecycle_res.error().what());
+		    }
 		    auto first_res = FinalizeCopyFiles(spec, "", make_files(), context, run_id);
 		    write_file(replay_loser_file, "replay_loser");
 		    auto second_res = FinalizeCopyFiles(spec, "", make_files(), context, run_id);
@@ -4223,7 +4231,7 @@ void register_ray_bindings(py::module_ &mod) {
 
 	m.def(
 	    "distributed_copy_sink_mode_for_test",
-	    [](const std::string &output_path) {
+	    [](const std::string &output_path, bool use_tmp_file) {
 		    using namespace duckdb;
 		    using namespace duckdb::distributed;
 
@@ -4232,6 +4240,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.file_path = output_path;
 		    spec.file_extension = "parquet";
 		    spec.per_thread_output = true;
+		    spec.use_tmp_file = use_tmp_file;
 		    try {
 			    auto sink = std::make_shared<CopySinkNode>(1, PipelineNodeRef(), std::move(spec));
 			    out["construct_error"] = false;
@@ -4250,7 +4259,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    }
 		    return out;
 	    },
-	    py::arg("output_path"), "Return distributed COPY sink mode for an output path.");
+	    py::arg("output_path"), py::arg("use_tmp_file") = false,
+	    "Return distributed COPY sink mode for an output path.");
 
 	m.def(
 	    "distributed_copy_direct_write_local_invisible_file_commit_for_test",
@@ -4281,6 +4291,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    files.push_back(std::move(info));
 
 		    auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, final_root, run_id);
+		    auto lifecycle_res = WriteDistributedCopyDirectWriteLifecycle(fs, final_root, run_id);
+		    if (lifecycle_res.is_err()) {
+			    throw std::runtime_error(lifecycle_res.error().what());
+		    }
 		    auto finalize_res = FinalizeCopyFiles(spec, "", std::move(files), context, run_id);
 
 		    py::dict out;
@@ -4342,6 +4356,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    selected_files.push_back(std::move(selected_info));
 
 		    auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, final_root, run_id);
+		    auto lifecycle_res = WriteDistributedCopyDirectWriteLifecycle(fs, final_root, run_id);
+		    if (lifecycle_res.is_err()) {
+			    throw std::runtime_error(lifecycle_res.error().what());
+		    }
 		    auto manifest_res =
 		        WriteDistributedCopyFinalizeManifest(fs, commit_paths, final_root, "direct:" + run_id, selected_files);
 		    if (manifest_res.is_err()) {
