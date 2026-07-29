@@ -13,9 +13,12 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/hive_partitioning.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/main/client_context.hpp"
 
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <limits>
 #include <sstream>
@@ -45,19 +48,18 @@ inline void ListDistributedCopyFilesRecursive(FileSystem &fs, const std::string 
 	});
 }
 
+inline void SortAndDeduplicateDistributedCopyPaths(std::vector<std::string> &paths) {
+	std::sort(paths.begin(), paths.end());
+	paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
+}
+
 inline void RemoveDistributedCopyDirectoryTree(FileSystem &fs, const std::string &dir) {
 	if (dir.empty()) {
 		return;
 	}
-	try {
-		if (!fs.DirectoryExists(dir)) {
-			return;
-		}
-	} catch (...) {
-		return;
-	}
 
 	std::vector<std::string> child_dirs;
+	std::vector<std::string> child_files;
 	try {
 		fs.ListFiles(dir, [&](const std::string &path, bool is_dir) {
 			auto full_path = fs.JoinPath(dir, path);
@@ -65,14 +67,20 @@ inline void RemoveDistributedCopyDirectoryTree(FileSystem &fs, const std::string
 				child_dirs.push_back(full_path);
 				return;
 			}
-			try {
-				fs.RemoveFile(full_path);
-			} catch (...) {
-			}
+			child_files.push_back(full_path);
 		});
 	} catch (...) {
 	}
 
+	SortAndDeduplicateDistributedCopyPaths(child_files);
+	for (const auto &child_file : child_files) {
+		try {
+			fs.RemoveFile(child_file);
+		} catch (...) {
+		}
+	}
+
+	SortAndDeduplicateDistributedCopyPaths(child_dirs);
 	for (auto &child_dir : child_dirs) {
 		RemoveDistributedCopyDirectoryTree(fs, child_dir);
 	}
@@ -126,6 +134,41 @@ inline bool DistributedCopyFileExistsNoThrow(FileSystem &fs, const std::string &
 	}
 }
 
+inline DuckDBResult<bool> CheckDistributedCopyFileExists(FileSystem &fs, const std::string &path) {
+	if (path.empty()) {
+		return DuckDBResult<bool>::ok(false);
+	}
+	const bool is_remote = FileSystem::IsRemoteFile(path);
+	try {
+		auto flags = FileFlags::FILE_FLAGS_READ;
+		if (!is_remote) {
+			flags |= FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS;
+		}
+		auto handle = fs.OpenFile(path, flags);
+		if (!handle) {
+			if (!is_remote) {
+				return DuckDBResult<bool>::ok(false);
+			}
+			return DuckDBResult<bool>::err(
+			    DuckDBError::io_error("remote distributed COPY object check returned no file handle: " + path));
+		}
+	} catch (const std::exception &ex) {
+		ErrorData error(ex);
+		const auto &extra_info = error.ExtraInfo();
+		auto http_status = extra_info.find("status_code");
+		if (http_status != extra_info.end() && http_status->second == "404") {
+			return DuckDBResult<bool>::ok(false);
+		}
+		auto error_number = extra_info.find("errno");
+		if (error_number != extra_info.end() && error_number->second == std::to_string(ENOENT)) {
+			return DuckDBResult<bool>::ok(false);
+		}
+		return DuckDBResult<bool>::err(DuckDBError::io_error(
+		    StringUtil::Format("failed to check distributed COPY object \"%s\": %s", path, ex.what())));
+	}
+	return DuckDBResult<bool>::ok(true);
+}
+
 inline bool DistributedCopyDirectoryExistsNoThrow(FileSystem &fs, const std::string &path) {
 	if (path.empty()) {
 		return false;
@@ -135,6 +178,39 @@ inline bool DistributedCopyDirectoryExistsNoThrow(FileSystem &fs, const std::str
 	} catch (...) {
 		return false;
 	}
+}
+
+inline DuckDBResult<std::string> CanonicalDistributedCopyBasePath(FileSystem &fs, const std::string &base_path) {
+	auto canonical_base_path = base_path;
+	StringUtil::RTrim(canonical_base_path, fs.PathSeparator(canonical_base_path));
+	if (canonical_base_path.empty()) {
+		return DuckDBResult<std::string>::err(
+		    DuckDBError::value_error("distributed COPY requires non-empty base_path"));
+	}
+	return DuckDBResult<std::string>::ok(std::move(canonical_base_path));
+}
+
+inline DuckDBResult<std::string> CanonicalDistributedCopyBasePath(FileSystem &fs, const DistributedCopySpec &spec) {
+	auto canonical_res = CanonicalDistributedCopyBasePath(fs, spec.file_path);
+	if (canonical_res.is_err()) {
+		return canonical_res;
+	}
+	auto canonical_base_path = std::move(canonical_res).value();
+	if (!spec.use_tmp_file) {
+		return DuckDBResult<std::string>::ok(std::move(canonical_base_path));
+	}
+
+	auto base_name = StringUtil::GetFileName(canonical_base_path);
+	if (StringUtil::StartsWith(base_name, "tmp_")) {
+		base_name = base_name.substr(4);
+	}
+	if (base_name.empty()) {
+		return DuckDBResult<std::string>::err(
+		    DuckDBError::value_error("distributed COPY requires non-empty canonical base_path"));
+	}
+	auto directory = StringUtil::GetFilePath(canonical_base_path);
+	canonical_base_path = directory.empty() ? base_name : fs.JoinPath(directory, base_name);
+	return DuckDBResult<std::string>::ok(std::move(canonical_base_path));
 }
 
 inline DuckDBResult<idx_t> ParseDistributedCopyFinalizeIdx(const std::string &value, const std::string &field) {
@@ -334,14 +410,16 @@ inline idx_t DistributedCopyCurrentEpochMillis() {
 inline DuckDBResult<void> WriteDistributedCopyDirectWriteLifecycle(FileSystem &fs, const std::string &base_path,
                                                                    const std::string &run_id,
                                                                    idx_t created_epoch_ms = 0) {
-	if (base_path.empty()) {
-		return DuckDBResult<void>::err(DuckDBError::value_error("direct-write lifecycle requires non-empty base_path"));
+	auto canonical_res = CanonicalDistributedCopyBasePath(fs, base_path);
+	if (canonical_res.is_err()) {
+		return DuckDBResult<void>::err(canonical_res.error());
 	}
 	if (run_id.empty()) {
 		return DuckDBResult<void>::err(DuckDBError::value_error("direct-write lifecycle requires non-empty run_id"));
 	}
+	auto canonical_base_path = std::move(canonical_res).value();
 
-	auto paths = BuildDistributedCopyFinalizeCommitPaths(fs, base_path, run_id);
+	auto paths = BuildDistributedCopyFinalizeCommitPaths(fs, canonical_base_path, run_id);
 	if (DistributedCopyFileExistsNoThrow(fs, paths.committed_marker_path)) {
 		return DuckDBResult<void>::ok();
 	}
@@ -356,11 +434,12 @@ inline DuckDBResult<void> WriteDistributedCopyDirectWriteLifecycle(FileSystem &f
 		    StringUtil::Format("failed to create direct-write lifecycle dir \"%s\": %s", paths.commit_dir, ex.what())));
 	}
 
-	auto direct_write_run_dir = BuildCopyDirectWriteRunDirectory(base_path, run_id, fs.PathSeparator(base_path));
+	auto direct_write_run_dir =
+	    BuildCopyDirectWriteRunDirectory(canonical_base_path, run_id, fs.PathSeparator(canonical_base_path));
 	std::ostringstream lifecycle;
 	lifecycle << "version=1\n";
 	lifecycle << "mode=direct_write\n";
-	lifecycle << "base_path=" << base_path << "\n";
+	lifecycle << "base_path=" << canonical_base_path << "\n";
 	lifecycle << "run_id=" << run_id << "\n";
 	lifecycle << "created_epoch_ms=" << created_epoch_ms << "\n";
 	lifecycle << "direct_write_run_dir=" << direct_write_run_dir << "\n";
@@ -703,27 +782,26 @@ inline bool DistributedCopyDirectWriteFinalPathBelongsToRun(FileSystem &fs, cons
 
 inline DuckDBResult<DistributedCopyResult>
 ReadCommittedDistributedCopyDirectWriteResult(FileSystem &fs, const std::string &base_path, const std::string &run_id) {
-	if (base_path.empty()) {
-		return DuckDBResult<DistributedCopyResult>::err(
-		    DuckDBError::value_error("direct-write committed reader requires non-empty base_path"));
+	auto canonical_res = CanonicalDistributedCopyBasePath(fs, base_path);
+	if (canonical_res.is_err()) {
+		return DuckDBResult<DistributedCopyResult>::err(canonical_res.error());
 	}
 	if (run_id.empty()) {
 		return DuckDBResult<DistributedCopyResult>::err(
 		    DuckDBError::value_error("direct-write committed reader requires non-empty run_id"));
 	}
 
-	auto normalized_base_path = base_path;
-	StringUtil::RTrim(normalized_base_path, fs.PathSeparator(normalized_base_path));
-	auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, normalized_base_path, run_id);
+	auto canonical_base_path = std::move(canonical_res).value();
+	auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, canonical_base_path, run_id);
 	auto manifest_root = "direct:" + run_id;
-	auto read_res = ReadDistributedCopyFinalizeManifest(fs, commit_paths, normalized_base_path, manifest_root, true);
+	auto read_res = ReadDistributedCopyFinalizeManifest(fs, commit_paths, canonical_base_path, manifest_root, true);
 	if (read_res.is_err()) {
 		return DuckDBResult<DistributedCopyResult>::err(read_res.error());
 	}
 
 	auto result = std::move(read_res).value();
 	for (const auto &info : result.files) {
-		if (!DistributedCopyDirectWriteFinalPathBelongsToRun(fs, normalized_base_path, run_id, info.final_path)) {
+		if (!DistributedCopyDirectWriteFinalPathBelongsToRun(fs, canonical_base_path, run_id, info.final_path)) {
 			return DuckDBResult<DistributedCopyResult>::err(DuckDBError::invalid_state_error(StringUtil::Format(
 			    "distributed COPY direct-write committed manifest file is outside run output: \"%s\"",
 			    info.final_path)));
@@ -779,16 +857,6 @@ CleanupDistributedCopyDirectWriteUnselectedFiles(FileSystem &fs, const std::stri
 		return;
 	}
 
-	try {
-		if (!fs.DirectoryExists(direct_write_run_dir)) {
-			return;
-		}
-	} catch (const std::exception &ex) {
-		return;
-	} catch (...) {
-		return;
-	}
-
 	std::unordered_set<std::string> selected_paths;
 	for (const auto &info : selected_files) {
 		if (!info.final_path.empty()) {
@@ -838,14 +906,6 @@ CleanupDistributedCopyDirectTargetUnselectedFiles(FileSystem &fs, const std::str
 	}
 
 	for (const auto &dir : scan_dirs) {
-		try {
-			if (!fs.DirectoryExists(dir)) {
-				continue;
-			}
-		} catch (...) {
-			continue;
-		}
-
 		std::vector<std::string> all_files;
 		try {
 			ListDistributedCopyFilesRecursive(fs, dir, all_files);
@@ -897,6 +957,107 @@ inline bool DistributedCopyUsesDirectTargetLayout(FileSystem &fs, const std::str
 	return false;
 }
 
+struct DistributedCopyPrefixCleanupResult {
+	bool existed = false;
+	bool removed = false;
+};
+
+inline DuckDBResult<std::vector<std::string>> ListDistributedCopyFilesUnderPrefix(FileSystem &fs,
+                                                                                  const std::string &prefix) {
+	std::vector<std::string> files;
+	try {
+		ListDistributedCopyFilesRecursive(fs, prefix, files);
+	} catch (const std::exception &ex) {
+		return DuckDBResult<std::vector<std::string>>::err(DuckDBError::io_error(
+		    StringUtil::Format("failed to list distributed COPY prefix \"%s\": %s", prefix, ex.what())));
+	}
+	SortAndDeduplicateDistributedCopyPaths(files);
+	return DuckDBResult<std::vector<std::string>>::ok(std::move(files));
+}
+
+inline DuckDBResult<void> RemoveDistributedCopyFiles(FileSystem &fs, const std::vector<std::string> &files) {
+	for (const auto &file : files) {
+		try {
+			fs.RemoveFile(file);
+		} catch (const std::exception &ex) {
+			return DuckDBResult<void>::err(DuckDBError::io_error(
+			    StringUtil::Format("failed to remove distributed COPY object \"%s\": %s", file, ex.what())));
+		}
+	}
+	return DuckDBResult<void>::ok();
+}
+
+inline DuckDBResult<DistributedCopyPrefixCleanupResult>
+CleanupDistributedCopyPrefix(FileSystem &fs, const std::string &prefix,
+                             const std::string &remove_last = std::string()) {
+	auto files_res = ListDistributedCopyFilesUnderPrefix(fs, prefix);
+	if (files_res.is_err()) {
+		return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(files_res.error());
+	}
+	auto files = std::move(files_res).value();
+	if (!remove_last.empty()) {
+		auto remove_last_it = std::find(files.begin(), files.end(), remove_last);
+		if (remove_last_it != files.end()) {
+			files.erase(remove_last_it);
+			files.push_back(remove_last);
+		}
+	}
+
+	DistributedCopyPrefixCleanupResult result;
+	result.existed = !files.empty() || DistributedCopyDirectoryExistsNoThrow(fs, prefix);
+	auto remove_res = RemoveDistributedCopyFiles(fs, files);
+	if (remove_res.is_err()) {
+		return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(remove_res.error());
+	}
+
+	try {
+		fs.RemoveDirectory(prefix);
+	} catch (...) {
+	}
+
+	auto remaining_res = ListDistributedCopyFilesUnderPrefix(fs, prefix);
+	if (remaining_res.is_err()) {
+		return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(remaining_res.error());
+	}
+	if (!remaining_res.value().empty() || DistributedCopyDirectoryExistsNoThrow(fs, prefix)) {
+		return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(
+		    DuckDBError::io_error("distributed COPY prefix still exists after cleanup: " + prefix));
+	}
+	result.removed = result.existed;
+	return DuckDBResult<DistributedCopyPrefixCleanupResult>::ok(std::move(result));
+}
+
+inline DuckDBResult<void> CleanupDistributedCopyDirectTargetFilesForRun(FileSystem &fs, const std::string &base_path,
+                                                                        const std::string &run_id) {
+	auto files_res = ListDistributedCopyFilesUnderPrefix(fs, base_path);
+	if (files_res.is_err()) {
+		return DuckDBResult<void>::err(files_res.error());
+	}
+
+	std::vector<std::string> run_files;
+	for (const auto &file : files_res.value()) {
+		if (CopyDirectTargetFileNameMatchesRun(StringUtil::GetFileName(file), run_id)) {
+			run_files.push_back(file);
+		}
+	}
+	auto remove_res = RemoveDistributedCopyFiles(fs, run_files);
+	if (remove_res.is_err()) {
+		return remove_res;
+	}
+
+	auto remaining_res = ListDistributedCopyFilesUnderPrefix(fs, base_path);
+	if (remaining_res.is_err()) {
+		return DuckDBResult<void>::err(remaining_res.error());
+	}
+	for (const auto &file : remaining_res.value()) {
+		if (CopyDirectTargetFileNameMatchesRun(StringUtil::GetFileName(file), run_id)) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::io_error("distributed COPY direct-target object still exists after cleanup: " + file));
+		}
+	}
+	return DuckDBResult<void>::ok();
+}
+
 struct DistributedCopyDirectWriteRunCleanupResult {
 	bool skipped_committed = false;
 	bool data_run_dir_existed = false;
@@ -908,43 +1069,48 @@ struct DistributedCopyDirectWriteRunCleanupResult {
 inline DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>
 CleanupDistributedCopyUncommittedDirectWriteRun(FileSystem &fs, const std::string &base_path,
                                                 const std::string &run_id) {
-	if (base_path.empty()) {
-		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(
-		    DuckDBError::value_error("direct-write cleanup requires non-empty base_path"));
+	auto canonical_res = CanonicalDistributedCopyBasePath(fs, base_path);
+	if (canonical_res.is_err()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(canonical_res.error());
 	}
 	if (run_id.empty()) {
 		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(
 		    DuckDBError::value_error("direct-write cleanup requires non-empty run_id"));
 	}
+	auto canonical_base_path = std::move(canonical_res).value();
 
 	DistributedCopyDirectWriteRunCleanupResult result;
-	auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, base_path, run_id);
-	if (DistributedCopyFileExistsNoThrow(fs, commit_paths.committed_marker_path)) {
+	auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, canonical_base_path, run_id);
+	auto committed_res = CheckDistributedCopyFileExists(fs, commit_paths.committed_marker_path);
+	if (committed_res.is_err()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(committed_res.error());
+	}
+	if (committed_res.value()) {
 		result.skipped_committed = true;
 		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::ok(std::move(result));
 	}
 
-	auto direct_write_run_dir = BuildCopyDirectWriteRunDirectory(base_path, run_id, fs.PathSeparator(base_path));
-	result.data_run_dir_existed = DistributedCopyDirectoryExistsNoThrow(fs, direct_write_run_dir);
-	if (result.data_run_dir_existed) {
-		RemoveDistributedCopyDirectoryTree(fs, direct_write_run_dir);
-		if (DistributedCopyDirectoryExistsNoThrow(fs, direct_write_run_dir)) {
-			return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(
-			    DuckDBError::io_error("failed to cleanup direct-write run dir: " + direct_write_run_dir));
-		}
-		result.data_run_dir_removed = true;
+	auto direct_write_run_dir =
+	    BuildCopyDirectWriteRunDirectory(canonical_base_path, run_id, fs.PathSeparator(canonical_base_path));
+	auto data_cleanup_res = CleanupDistributedCopyPrefix(fs, direct_write_run_dir);
+	if (data_cleanup_res.is_err()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(data_cleanup_res.error());
+	}
+	result.data_run_dir_existed = data_cleanup_res.value().existed;
+	result.data_run_dir_removed = data_cleanup_res.value().removed;
+
+	auto direct_target_cleanup_res = CleanupDistributedCopyDirectTargetFilesForRun(fs, canonical_base_path, run_id);
+	if (direct_target_cleanup_res.is_err()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(direct_target_cleanup_res.error());
 	}
 
-	CleanupDistributedCopyDirectTargetUnselectedFiles(fs, base_path, run_id, {});
-
-	result.commit_dir_existed = DistributedCopyDirectoryExistsNoThrow(fs, commit_paths.commit_dir);
-	if (result.commit_dir_existed) {
-		RemoveDistributedCopyDirectoryTree(fs, commit_paths.commit_dir);
-		if (DistributedCopyDirectoryExistsNoThrow(fs, commit_paths.commit_dir)) {
-			return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(
-			    DuckDBError::io_error("failed to cleanup direct-write commit dir: " + commit_paths.commit_dir));
-		}
-		result.commit_dir_removed = true;
+	auto commit_cleanup_res = CleanupDistributedCopyPrefix(fs, commit_paths.commit_dir, commit_paths.lifecycle_path);
+	if (commit_cleanup_res.is_err()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(commit_cleanup_res.error());
+	}
+	result.commit_dir_existed = commit_cleanup_res.value().existed;
+	result.commit_dir_removed = commit_cleanup_res.value().removed;
+	if (result.commit_dir_removed) {
 		RemoveDistributedCopyDirectoryIfEmpty(fs, StringUtil::GetFilePath(commit_paths.commit_dir));
 	}
 
@@ -965,53 +1131,52 @@ struct DistributedCopyDirectWriteCleanupScanResult {
 inline DuckDBResult<DistributedCopyDirectWriteCleanupScanResult>
 CleanupExpiredDistributedCopyDirectWriteRuns(FileSystem &fs, const std::string &base_path, idx_t min_age_ms,
                                              idx_t now_epoch_ms = 0) {
-	if (base_path.empty()) {
-		return DuckDBResult<DistributedCopyDirectWriteCleanupScanResult>::err(
-		    DuckDBError::value_error("direct-write cleanup scan requires non-empty base_path"));
+	auto canonical_res = CanonicalDistributedCopyBasePath(fs, base_path);
+	if (canonical_res.is_err()) {
+		return DuckDBResult<DistributedCopyDirectWriteCleanupScanResult>::err(canonical_res.error());
 	}
 	if (now_epoch_ms == 0) {
 		now_epoch_ms = DistributedCopyCurrentEpochMillis();
 	}
+	auto canonical_base_path = std::move(canonical_res).value();
 
 	DistributedCopyDirectWriteCleanupScanResult result;
-	auto commit_root = base_path + ".duckdb_commit";
-	if (!DistributedCopyDirectoryExistsNoThrow(fs, commit_root)) {
-		return DuckDBResult<DistributedCopyDirectWriteCleanupScanResult>::ok(std::move(result));
-	}
+	auto commit_root = canonical_base_path + ".duckdb_commit";
 
 	std::vector<std::string> run_ids;
-	try {
-		fs.ListFiles(commit_root, [&](const std::string &path, bool is_dir) {
-			if (!is_dir) {
-				return;
-			}
-			auto run_id = StringUtil::GetFileName(path);
-			if (run_id.empty()) {
-				run_id = path;
-				StringUtil::RTrim(run_id, fs.PathSeparator(run_id));
-				run_id = StringUtil::GetFileName(run_id);
-			}
-			if (!run_id.empty()) {
-				run_ids.push_back(run_id);
-			}
-		});
-	} catch (const std::exception &ex) {
-		return DuckDBResult<DistributedCopyDirectWriteCleanupScanResult>::err(DuckDBError::io_error(
-		    StringUtil::Format("failed to list direct-write commit root \"%s\": %s", commit_root, ex.what())));
+	auto files_res = ListDistributedCopyFilesUnderPrefix(fs, commit_root);
+	if (files_res.is_err()) {
+		return DuckDBResult<DistributedCopyDirectWriteCleanupScanResult>::err(files_res.error());
 	}
+	for (const auto &path : files_res.value()) {
+		if (StringUtil::GetFileName(path) != DISTRIBUTED_COPY_DIRECT_WRITE_LIFECYCLE_FILE) {
+			continue;
+		}
+		auto run_id = StringUtil::GetFileName(StringUtil::GetFilePath(path));
+		if (run_id.empty()) {
+			continue;
+		}
+		auto expected_paths = BuildDistributedCopyFinalizeCommitPaths(fs, canonical_base_path, run_id);
+		if (path == expected_paths.lifecycle_path) {
+			run_ids.push_back(std::move(run_id));
+		}
+	}
+	SortAndDeduplicateDistributedCopyPaths(run_ids);
 
 	for (const auto &run_id : run_ids) {
 		result.scanned_runs++;
-		auto paths = BuildDistributedCopyFinalizeCommitPaths(fs, base_path, run_id);
-		if (DistributedCopyFileExistsNoThrow(fs, paths.committed_marker_path)) {
+		auto paths = BuildDistributedCopyFinalizeCommitPaths(fs, canonical_base_path, run_id);
+		auto committed_res = CheckDistributedCopyFileExists(fs, paths.committed_marker_path);
+		if (committed_res.is_err()) {
+			result.errors++;
+			result.error_messages.push_back(committed_res.error().what());
+			continue;
+		}
+		if (committed_res.value()) {
 			result.committed_runs++;
 			continue;
 		}
-		if (!DistributedCopyFileExistsNoThrow(fs, paths.lifecycle_path)) {
-			result.skipped_unregistered_runs++;
-			continue;
-		}
-		auto lifecycle_res = ReadDistributedCopyDirectWriteLifecycle(fs, paths, base_path, run_id);
+		auto lifecycle_res = ReadDistributedCopyDirectWriteLifecycle(fs, paths, canonical_base_path, run_id);
 		if (lifecycle_res.is_err()) {
 			result.errors++;
 			result.error_messages.push_back(lifecycle_res.error().what());
@@ -1023,7 +1188,7 @@ CleanupExpiredDistributedCopyDirectWriteRuns(FileSystem &fs, const std::string &
 			continue;
 		}
 
-		auto cleanup_res = CleanupDistributedCopyUncommittedDirectWriteRun(fs, base_path, run_id);
+		auto cleanup_res = CleanupDistributedCopyUncommittedDirectWriteRun(fs, canonical_base_path, run_id);
 		if (cleanup_res.is_err()) {
 			result.errors++;
 			result.error_messages.push_back(cleanup_res.error().what());
@@ -1102,16 +1267,11 @@ inline DuckDBResult<DistributedCopyResult> FinalizeCopyFiles(const DistributedCo
 	result.files = std::move(files);
 	auto &fs = FileSystem::GetFileSystem(context);
 
-	std::string base_path = spec.file_path;
-	StringUtil::RTrim(base_path, fs.PathSeparator(base_path));
-	if (spec.use_tmp_file) {
-		auto base = StringUtil::GetFileName(base_path);
-		auto dir = StringUtil::GetFilePath(base_path);
-		if (base.rfind("tmp_", 0) == 0) {
-			base = base.substr(4);
-		}
-		base_path = dir.empty() ? base : fs.JoinPath(dir, base);
+	auto canonical_res = CanonicalDistributedCopyBasePath(fs, spec);
+	if (canonical_res.is_err()) {
+		return DuckDBResult<DistributedCopyResult>::err(canonical_res.error());
 	}
+	auto base_path = std::move(canonical_res).value();
 
 	const bool output_is_dir = spec.partition_output || spec.per_thread_output || spec.rotate;
 

@@ -118,6 +118,9 @@ def cleanup_copy_direct_write_lifecycle_once(
     direct-write COPY results. It delegates correctness decisions to the C++
     manifest/marker aware scanner: committed runs are skipped, active runs are
     kept, and only lifecycle-registered stale uncommitted runs are removed.
+
+    The caller must ensure that no COPY is running for any supplied base path.
+    Elapsed time does not prove that an uncommitted run is abandoned.
     """
     import duckdb
 
@@ -150,7 +153,11 @@ def run_copy_direct_write_lifecycle_cleanup_loop(
     sleep_fn: Callable[[float], None] | None = None,
     on_iteration: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Run direct-write lifecycle cleanup periodically until stopped."""
+    """Run direct-write lifecycle cleanup periodically until stopped.
+
+    The caller must keep every supplied base path free of concurrent COPY
+    operations for the lifetime of the loop.
+    """
     if max_iterations is not None and max_iterations <= 0:
         raise ValueError("max_iterations must be positive when provided")
     if interval_seconds < 0:
@@ -214,7 +221,10 @@ def _install_signal_handlers(stop_event: threading.Event) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Cleanup stale uncommitted Vane direct-write COPY runs.",
+        description=(
+            "Cleanup stale uncommitted Vane direct-write COPY runs. "
+            "Run only while COPY is quiesced for every supplied base path."
+        ),
     )
     parser.add_argument(
         "--base-path",

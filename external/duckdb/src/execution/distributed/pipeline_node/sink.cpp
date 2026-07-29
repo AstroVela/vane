@@ -81,9 +81,15 @@ SubmittableTaskStream<WorkerTask> CopySinkNode::produce_tasks(PlanExecutionConte
 	if (!client_context) {
 		throw InvalidInputException("CopySinkNode requires ClientContext for plan cloning");
 	}
+	auto &fs = FileSystem::GetFileSystem(*client_context);
+	auto canonical_res = CanonicalDistributedCopyBasePath(fs, spec_);
+	if (canonical_res.is_err()) {
+		throw InvalidInputException(canonical_res.error().what());
+	}
+	auto remote_base = std::move(canonical_res).value();
 
 	return input_stream.map_tasks([self, node_id_val, node_ctx, staging_root_base, staging_run_id, client_context,
-	                               fragment_plan_cache,
+	                               remote_base, fragment_plan_cache,
 	                               fragment_plan_cache_lock](SubmittableTask<WorkerTask> task) mutable {
 		auto *old_task = task.task();
 		if (!old_task) {
@@ -126,7 +132,7 @@ SubmittableTaskStream<WorkerTask> CopySinkNode::produce_tasks(PlanExecutionConte
 		auto merged_ctx = MergeTaskContext(old_task->context(), node_ctx);
 		merged_ctx["copy_output_base"] = staging_root_base;
 		merged_ctx["copy_output_run_id"] = staging_run_id;
-		merged_ctx["copy_output_remote_base"] = self->spec_.file_path;
+		merged_ctx["copy_output_remote_base"] = remote_base;
 		WorkerTask new_task(ctx, fragment_plan, old_task->config(), std::move(merged_ctx));
 		new_task.mutable_inputs() = old_task->inputs();
 		return SubmittableTask<WorkerTask>(std::move(new_task));

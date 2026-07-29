@@ -1917,6 +1917,37 @@ def test_cleanup_expired_copy_direct_write_runs_public_api(tmp_path):
     assert Path(committed["copy_output_lifecycle_path"]).exists()
 
 
+def test_copy_direct_write_lifecycle_uses_trimmed_base_path(tmp_path):
+    base = tmp_path / "copy_direct_trimmed_lifecycle"
+    base.mkdir()
+    raw_base = str(base) + os.sep
+    run_id = "run-trailing-separator"
+
+    registered = duckdb.ray_cxx.register_copy_direct_write_run_lifecycle(
+        raw_base,
+        run_id,
+        created_epoch_ms=1,
+    )
+    selected_file = base / f"{run_id}_w_selected_part.parquet"
+    selected_file.write_bytes(b"committed")
+    canonical_commit_dir = Path(str(base) + ".duckdb_commit") / run_id
+    canonical_commit_dir.mkdir(parents=True, exist_ok=True)
+    (canonical_commit_dir / "committed").write_text("committed\n")
+
+    cleanup = duckdb.ray_cxx.cleanup_expired_copy_direct_write_runs(
+        raw_base,
+        min_age_ms=1,
+        now_epoch_ms=10,
+    )
+
+    assert registered["copy_output_base_path"] == str(base)
+    assert Path(registered["copy_output_lifecycle_path"]).parent == canonical_commit_dir
+    assert cleanup["scanned_runs"] == 1
+    assert cleanup["cleaned_runs"] == 0
+    assert cleanup["committed_runs"] == 1
+    assert selected_file.exists()
+
+
 def test_copy_direct_write_lifecycle_cleanup_once_public_api(tmp_path):
     from duckdb.runners.ray import cleanup_copy_direct_write_lifecycle_once
 

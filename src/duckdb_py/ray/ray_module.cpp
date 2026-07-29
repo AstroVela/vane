@@ -1404,13 +1404,19 @@ void register_ray_bindings(py::module_ &mod) {
 		    auto &context = *conn.context;
 		    auto &fs = FileSystem::GetFileSystem(context);
 
-		    auto register_res = WriteDistributedCopyDirectWriteLifecycle(fs, base_path, run_id, created_epoch_ms);
+		    auto canonical_res = CanonicalDistributedCopyBasePath(fs, base_path);
+		    if (canonical_res.is_err()) {
+			    throw py::value_error(canonical_res.error().what());
+		    }
+		    auto canonical_base_path = std::move(canonical_res).value();
+		    auto register_res =
+		        WriteDistributedCopyDirectWriteLifecycle(fs, canonical_base_path, run_id, created_epoch_ms);
 		    if (register_res.is_err()) {
 			    throw py::value_error(register_res.error().what());
 		    }
-		    auto paths = BuildDistributedCopyFinalizeCommitPaths(fs, base_path, run_id);
+		    auto paths = BuildDistributedCopyFinalizeCommitPaths(fs, canonical_base_path, run_id);
 		    py::dict out;
-		    out["copy_output_base_path"] = base_path;
+		    out["copy_output_base_path"] = canonical_base_path;
 		    out["copy_output_run_id"] = run_id;
 		    out["copy_output_commit_dir"] = paths.commit_dir;
 		    out["copy_output_lifecycle_path"] = paths.lifecycle_path;

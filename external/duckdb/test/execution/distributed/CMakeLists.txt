@@ -7,6 +7,7 @@ set(TEST_EXECUTION_DISTRIBUTED_SOURCES
     test_udf_per_thread.cpp
     test_udf_serialization.cpp
     test_clustering_spec.cpp
+    test_copy_finalize.cpp
     test_execute_plan.cpp
     test_physical_operator_visitor.cpp
     test_physical_plan_translator_visitor.cpp
