@@ -102,6 +102,81 @@ def test_duckdb_source_id_matches_recorded_source_tree():
     assert duckdb.__git_revision__ == embedded_source_id
 
 
+def test_release_runtime_is_self_contained_by_default():
+    connection = duckdb.connect()
+    settings = dict(
+        connection.execute(
+            """
+            SELECT name, value
+            FROM duckdb_settings()
+            WHERE name IN (
+                'allow_unsigned_extensions',
+                'autoinstall_known_extensions',
+                'autoload_known_extensions'
+            )
+            """
+        ).fetchall()
+    )
+    static_extensions = {
+        name: (installed, loaded)
+        for name, installed, loaded in connection.execute(
+            """
+            SELECT extension_name, installed, loaded
+            FROM duckdb_extensions()
+            WHERE install_mode = 'STATICALLY_LINKED'
+            """
+        ).fetchall()
+    }
+
+    expected_extensions = {"core_functions", "httpfs", "icu", "json", "parquet"}
+    if platform.system() == "Linux" and sys.maxsize > 2**32:
+        expected_extensions.add("jemalloc")
+
+    assert settings == {
+        "allow_unsigned_extensions": "false",
+        "autoinstall_known_extensions": "false",
+        "autoload_known_extensions": "false",
+    }
+    assert static_extensions == {name: (True, True) for name in expected_extensions}
+
+
+@pytest.mark.parametrize(
+    ("setting_name", "setting_value", "expected"),
+    [
+        ("http_timeout", "41", 41),
+        ("binary_as_string", "true", True),
+        ("calendar", "gregorian", "gregorian"),
+    ],
+)
+def test_static_extension_settings_are_available_during_connect(tmp_path, setting_name, setting_value, expected):
+    extension_directory = tmp_path / "extensions"
+    connection = duckdb.connect(
+        config={
+            setting_name: setting_value,
+            "extension_directory": str(extension_directory),
+            "custom_extension_repository": "http://127.0.0.1:9",
+        }
+    )
+
+    assert connection.execute(f"SELECT current_setting('{setting_name}')").fetchone()[0] == expected
+    assert not extension_directory.exists()
+
+
+def test_dynamic_extension_settings_are_rejected_during_connect_without_installing(tmp_path):
+    extension_directory = tmp_path / "extensions"
+
+    with pytest.raises(duckdb.InvalidInputException, match="sqlite_all_varchar.*sqlite_scanner.*not statically linked"):
+        duckdb.connect(
+            config={
+                "sqlite_all_varchar": "true",
+                "extension_directory": str(extension_directory),
+                "custom_extension_repository": "http://127.0.0.1:9",
+            }
+        )
+
+    assert not extension_directory.exists()
+
+
 def test_exported_tree_without_manifest_computes_source_id(tmp_path, monkeypatch):
     expected = "a" * 40
 

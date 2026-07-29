@@ -759,6 +759,7 @@ void register_ray_bindings(py::module_ &mod) {
 			                if (connection_owner && !connection_owner.is_none() &&
 			                    py::isinstance<DuckDBPyConnection>(connection_owner)) {
 				                auto &conn_wrapper = connection_owner.cast<DuckDBPyConnection &>();
+				                plan.source_connection_ = connection_owner;
 				                auto registrations = conn_wrapper.ExportDistributedPythonUDFRegistrations();
 				                if (py::len(registrations) > 0) {
 					                plan.udf_registrations_ = std::move(registrations);

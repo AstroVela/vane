@@ -238,7 +238,9 @@ void DatabaseInstance::LoadExtensionSettings() {
 			auto &value = option.second;
 
 			auto extension_name = ExtensionHelper::FindExtensionInEntries(name, EXTENSION_SETTINGS);
-			if (extension_name.empty()) {
+			if (extension_name.empty() || ExtensionHelper::IsExtensionLinked(extension_name)) {
+				// Statically linked extensions are loaded after Initialize. Keep
+				// their settings pending until their options are registered.
 				continue;
 			}
 			if (!ExtensionHelper::TryAutoLoadExtension(*this, extension_name)) {
@@ -259,9 +261,43 @@ void DatabaseInstance::LoadExtensionSettings() {
 
 		con.Commit();
 	}
-	if (!config.options.unrecognized_options.empty()) {
-		ThrowExtensionSetUnrecognizedOptions(config.options.unrecognized_options);
+
+	case_insensitive_map_t<Value> unknown_options;
+	for (auto &option : config.options.unrecognized_options) {
+		auto extension_name = ExtensionHelper::FindExtensionInEntries(option.first, EXTENSION_SETTINGS);
+		if (!extension_name.empty() && ExtensionHelper::IsExtensionLinked(extension_name)) {
+			continue;
+		}
+		if (!extension_name.empty()) {
+			throw InvalidInputException("Configuration option \"%s\" belongs to extension \"%s\", which is not "
+			                            "statically linked into this build",
+			                            option.first, extension_name);
+		}
+		unknown_options.insert(option);
 	}
+	if (!unknown_options.empty()) {
+		ThrowExtensionSetUnrecognizedOptions(unknown_options);
+	}
+}
+
+static void ApplyStaticallyLinkedExtensionSettings(DatabaseInstance &instance,
+                                                   const case_insensitive_map_t<Value> &extension_settings) {
+	if (extension_settings.empty()) {
+		return;
+	}
+
+	Connection con(instance);
+	con.BeginTransaction();
+	for (auto &setting : extension_settings) {
+		ExtensionOption extension_option;
+		if (!instance.config.TryGetExtensionOption(setting.first, extension_option)) {
+			throw InternalException("Statically linked extension did not provide the '%s' config setting",
+			                        setting.first);
+		}
+		PhysicalSet::SetExtensionVariable(*con.context, extension_option, setting.first, SetScope::GLOBAL,
+		                                  setting.second);
+	}
+	con.Commit();
 }
 
 static duckdb_ext_api_v1 CreateAPIv1Wrapper() {
@@ -334,8 +370,15 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 
 DuckDB::DuckDB(const char *path, DBConfig *new_config) : instance(make_shared_ptr<DatabaseInstance>()) {
 	instance->Initialize(path, new_config);
+	// Extension registration consumes matching entries from
+	// unrecognized_options. Preserve their original values so callbacks and
+	// type conversion can run once the statically linked extensions are loaded.
+	auto static_extension_settings = instance->config.options.unrecognized_options;
 	if (instance->config.options.load_extensions) {
 		ExtensionHelper::LoadAllExtensions(*this);
+		ApplyStaticallyLinkedExtensionSettings(*instance, static_extension_settings);
+	} else if (!static_extension_settings.empty()) {
+		ThrowExtensionSetUnrecognizedOptions(static_extension_settings);
 	}
 	instance->db_manager->FinalizeStartup();
 }

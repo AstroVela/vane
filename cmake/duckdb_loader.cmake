@@ -53,8 +53,8 @@ _duckdb_set_default(DISABLE_UNITY OFF)
 
 # Extension configuration
 _duckdb_set_default(DISABLE_BUILTIN_EXTENSIONS OFF)
-_duckdb_set_default(ENABLE_EXTENSION_AUTOINSTALL ON)
-_duckdb_set_default(ENABLE_EXTENSION_AUTOLOADING ON)
+_duckdb_set_default(ENABLE_EXTENSION_AUTOINSTALL OFF)
+_duckdb_set_default(ENABLE_EXTENSION_AUTOLOADING OFF)
 
 # Performance options - enable optimizations by default
 _duckdb_set_default(NATIVE_ARCH OFF)
