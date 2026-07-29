@@ -6187,6 +6187,119 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
 
 
 @pytest.mark.usefixtures("ray_local")
+def test_run_copy_plan_trailing_separator_uses_one_lifecycle_namespace(tmp_path, monkeypatch):
+    captured = []
+    monkeypatch.delenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", raising=False)
+
+    class _DummyRunner:
+        def run_write(self, relation):
+            captured.append(relation)
+            return {"ok": True}
+
+    import duckdb.runners as runners_mod
+
+    monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
+
+    con = duckdb.connect()
+    src = tmp_path / "copy_trailing_separator_input.parquet"
+    dst = tmp_path / "copy_trailing_separator_output"
+    dst.mkdir()
+    raw_dst = str(dst) + os.sep
+    con.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    con.sql(f"select * from read_parquet('{src}')").write_parquet(raw_dst)
+    assert captured, "expected write relation to be captured"
+
+    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        captured[0],
+        str(uuid.uuid4()),
+    ).to_physical_plan(con)
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    with _registered_low_level_plan(plan, con):
+        result = runner.run_copy_plan(plan, con)
+
+    assert result["copy_output_base_path"] == str(dst)
+    assert result["copy_output_committed"] is True
+    assert Path(result["copy_output_lifecycle_path"]).parent == Path(result["copy_output_commit_dir"])
+    assert Path(result["copy_output_committed_marker_path"]).parent == Path(result["copy_output_commit_dir"])
+    committed_paths = [Path(entry["final_path"]) for entry in result["files"]]
+    assert committed_paths
+    assert all(path.is_file() for path in committed_paths)
+
+    cleanup = duckdb.ray_cxx.cleanup_expired_copy_direct_write_runs(
+        raw_dst,
+        min_age_ms=0,
+    )
+
+    assert cleanup["scanned_runs"] == 1
+    assert cleanup["cleaned_runs"] == 0
+    assert cleanup["committed_runs"] == 1
+    assert all(path.is_file() for path in committed_paths)
+    con.close()
+
+
+@pytest.mark.usefixtures("ray_local")
+def test_run_copy_plan_existing_file_uses_final_lifecycle_namespace(tmp_path, monkeypatch):
+    captured = []
+    monkeypatch.delenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", raising=False)
+
+    class _DummyRunner:
+        def run_write(self, relation):
+            captured.append(relation)
+            return {"ok": True}
+
+    import duckdb.runners as runners_mod
+
+    monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
+
+    con = duckdb.connect()
+    src = tmp_path / "copy_tmp_file_input.parquet"
+    dst = tmp_path / "copy_tmp_file_output.parquet"
+    con.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
+    con.sql("select 0 as x").write_parquet(str(dst))
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
+    assert captured, "expected write relation to be captured"
+
+    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        captured[0],
+        str(uuid.uuid4()),
+    ).to_physical_plan(con)
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    with _registered_low_level_plan(plan, con):
+        result = runner.run_copy_plan(plan, con)
+
+    assert result["copy_output_base_path"] == str(dst)
+    assert result["copy_output_direct_write"] is True
+    assert result["copy_output_committed"] is True
+    assert Path(result["copy_output_lifecycle_path"]).parent == Path(result["copy_output_commit_dir"])
+    assert Path(result["copy_output_committed_marker_path"]).parent == Path(result["copy_output_commit_dir"])
+    assert not (tmp_path / f"tmp_{dst.name}.duckdb_commit").exists()
+    committed_paths = [Path(entry["final_path"]) for entry in result["files"]]
+    assert committed_paths
+    assert all(path.is_file() for path in committed_paths)
+    temporary_base = tmp_path / f"tmp_{dst.name}"
+    assert all(path.parent == temporary_base for path in committed_paths)
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    assert sorted(row[0] for row in con.read_parquet([str(path) for path in committed_paths]).fetchall()) == [1, 2]
+    assert con.read_parquet(str(dst)).fetchall() == [(0,)]
+
+    cleanup = duckdb.ray_cxx.cleanup_expired_copy_direct_write_runs(
+        str(dst),
+        min_age_ms=0,
+    )
+
+    assert cleanup["scanned_runs"] == 1
+    assert cleanup["cleaned_runs"] == 0
+    assert cleanup["committed_runs"] == 1
+    assert all(path.is_file() for path in committed_paths)
+    assert not Path(str(temporary_base) + ".duckdb_staging").exists()
+    con.close()
+
+
+@pytest.mark.usefixtures("ray_local")
 def test_run_copy_plan_leaves_stale_direct_write_cleanup_to_explicit_api(tmp_path, monkeypatch):
     captured = []
     monkeypatch.delenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", raising=False)

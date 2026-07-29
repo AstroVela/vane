@@ -1391,7 +1391,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    return out;
 	    },
 	    py::arg("base_path"), py::arg("run_id"),
-	    "Best-effort cleanup for an uncommitted direct-write distributed COPY run.");
+	    "Cleanup a lifecycle-registered uncommitted direct-write distributed COPY run.");
 
 	m.def(
 	    "register_copy_direct_write_run_lifecycle",
@@ -1404,13 +1404,19 @@ void register_ray_bindings(py::module_ &mod) {
 		    auto &context = *conn.context;
 		    auto &fs = FileSystem::GetFileSystem(context);
 
-		    auto register_res = WriteDistributedCopyDirectWriteLifecycle(fs, base_path, run_id, created_epoch_ms);
+		    auto canonical_res = CanonicalDistributedCopyBasePath(fs, base_path);
+		    if (canonical_res.is_err()) {
+			    throw py::value_error(canonical_res.error().what());
+		    }
+		    auto canonical_base_path = std::move(canonical_res).value();
+		    auto register_res =
+		        WriteDistributedCopyDirectWriteLifecycle(fs, canonical_base_path, run_id, created_epoch_ms);
 		    if (register_res.is_err()) {
 			    throw py::value_error(register_res.error().what());
 		    }
-		    auto paths = BuildDistributedCopyFinalizeCommitPaths(fs, base_path, run_id);
+		    auto paths = BuildDistributedCopyFinalizeCommitPaths(fs, canonical_base_path, run_id);
 		    py::dict out;
-		    out["copy_output_base_path"] = base_path;
+		    out["copy_output_base_path"] = canonical_base_path;
 		    out["copy_output_run_id"] = run_id;
 		    out["copy_output_commit_dir"] = paths.commit_dir;
 		    out["copy_output_lifecycle_path"] = paths.lifecycle_path;
@@ -4070,6 +4076,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    };
 
 		    auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, final_root, run_id);
+		    auto lifecycle_res = WriteDistributedCopyDirectWriteLifecycle(fs, final_root, run_id);
+		    if (lifecycle_res.is_err()) {
+			    throw std::runtime_error(lifecycle_res.error().what());
+		    }
 		    auto first_res = FinalizeCopyFiles(spec, "", make_files(), context, run_id);
 		    auto replay_loser_dir = BuildCopyDirectWriteTaskDirectory(final_root, run_id, "w_replay_loser");
 		    auto replay_loser_file = replay_loser_dir + "/part.parquet";
@@ -4169,6 +4179,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    };
 
 		    auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, final_root, run_id);
+		    auto lifecycle_res = WriteDistributedCopyDirectWriteLifecycle(fs, final_root, run_id);
+		    if (lifecycle_res.is_err()) {
+			    throw std::runtime_error(lifecycle_res.error().what());
+		    }
 		    auto first_res = FinalizeCopyFiles(spec, "", make_files(), context, run_id);
 		    write_file(replay_loser_file, "replay_loser");
 		    auto second_res = FinalizeCopyFiles(spec, "", make_files(), context, run_id);
@@ -4217,7 +4231,7 @@ void register_ray_bindings(py::module_ &mod) {
 
 	m.def(
 	    "distributed_copy_sink_mode_for_test",
-	    [](const std::string &output_path) {
+	    [](const std::string &output_path, bool use_tmp_file) {
 		    using namespace duckdb;
 		    using namespace duckdb::distributed;
 
@@ -4226,6 +4240,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.file_path = output_path;
 		    spec.file_extension = "parquet";
 		    spec.per_thread_output = true;
+		    spec.use_tmp_file = use_tmp_file;
 		    try {
 			    auto sink = std::make_shared<CopySinkNode>(1, PipelineNodeRef(), std::move(spec));
 			    out["construct_error"] = false;
@@ -4244,7 +4259,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    }
 		    return out;
 	    },
-	    py::arg("output_path"), "Return distributed COPY sink mode for an output path.");
+	    py::arg("output_path"), py::arg("use_tmp_file") = false,
+	    "Return distributed COPY sink mode for an output path.");
 
 	m.def(
 	    "distributed_copy_direct_write_local_invisible_file_commit_for_test",
@@ -4275,6 +4291,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    files.push_back(std::move(info));
 
 		    auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, final_root, run_id);
+		    auto lifecycle_res = WriteDistributedCopyDirectWriteLifecycle(fs, final_root, run_id);
+		    if (lifecycle_res.is_err()) {
+			    throw std::runtime_error(lifecycle_res.error().what());
+		    }
 		    auto finalize_res = FinalizeCopyFiles(spec, "", std::move(files), context, run_id);
 
 		    py::dict out;
@@ -4336,6 +4356,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    selected_files.push_back(std::move(selected_info));
 
 		    auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, final_root, run_id);
+		    auto lifecycle_res = WriteDistributedCopyDirectWriteLifecycle(fs, final_root, run_id);
+		    if (lifecycle_res.is_err()) {
+			    throw std::runtime_error(lifecycle_res.error().what());
+		    }
 		    auto manifest_res =
 		        WriteDistributedCopyFinalizeManifest(fs, commit_paths, final_root, "direct:" + run_id, selected_files);
 		    if (manifest_res.is_err()) {
@@ -4430,6 +4454,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    write_file(stale_file, stale_body);
 
 		    auto stale_commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, final_root, stale_run_id);
+		    auto stale_lifecycle_res = WriteDistributedCopyDirectWriteLifecycle(fs, final_root, stale_run_id);
+		    if (stale_lifecycle_res.is_err()) {
+			    throw std::runtime_error(stale_lifecycle_res.error().what());
+		    }
 		    std::vector<DistributedCopyFileInfo> stale_files;
 		    stale_files.push_back(make_file_info(stale_file, 1, stale_body.size()));
 		    auto stale_manifest_res = WriteDistributedCopyFinalizeManifest(fs, stale_commit_paths, final_root,
@@ -4444,6 +4472,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    write_file(committed_file, committed_body);
 
 		    auto committed_paths = BuildDistributedCopyFinalizeCommitPaths(fs, final_root, committed_run_id);
+		    auto committed_lifecycle_res = WriteDistributedCopyDirectWriteLifecycle(fs, final_root, committed_run_id);
+		    if (committed_lifecycle_res.is_err()) {
+			    throw std::runtime_error(committed_lifecycle_res.error().what());
+		    }
 		    std::vector<DistributedCopyFileInfo> committed_files;
 		    committed_files.push_back(make_file_info(committed_file, 1, committed_body.size()));
 		    auto committed_manifest_res = WriteDistributedCopyFinalizeManifest(

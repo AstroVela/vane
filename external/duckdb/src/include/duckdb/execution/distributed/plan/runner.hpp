@@ -572,12 +572,28 @@ public:
 		};
 		find_sink(pipeline_node);
 
+		std::string sink_base_path;
+		std::string sink_worker_base_path;
+		if (sink_node) {
+			auto &fs = FileSystem::GetFileSystem(*client_context_);
+			auto canonical_res = CanonicalDistributedCopyBasePath(fs, sink_node->spec());
+			if (canonical_res.is_err()) {
+				return DuckDBResult<PlanResult>::err(canonical_res.error());
+			}
+			sink_base_path = std::move(canonical_res).value();
+			auto worker_base_res = CanonicalDistributedCopyBasePath(fs, sink_node->spec().file_path);
+			if (worker_base_res.is_err()) {
+				return DuckDBResult<PlanResult>::err(worker_base_res.error());
+			}
+			sink_worker_base_path = std::move(worker_base_res).value();
+		}
+
 		if (sink_node && sink_node->staging_root_base().empty()) {
 			// Persist lifecycle metadata for explicit operator-managed cleanup. Starting a COPY must not age out
 			// other runs: elapsed time alone does not establish that another run is abandoned.
 			auto &fs = FileSystem::GetFileSystem(*client_context_);
-			auto lifecycle_res =
-			    WriteDistributedCopyDirectWriteLifecycle(fs, sink_node->spec().file_path, sink_node->staging_run_id());
+			auto lifecycle_res = WriteDistributedCopyDirectWriteLifecycle(
+			    fs, sink_base_path, sink_node->staging_run_id(), 0, sink_worker_base_path);
 			if (lifecycle_res.is_err()) {
 				return DuckDBResult<PlanResult>::err(lifecycle_res.error());
 			}
@@ -651,8 +667,7 @@ public:
 		auto cleanup_sink_output = [&]() {
 			auto &fs = FileSystem::GetFileSystem(*client_context_);
 			if (sink_node->staging_root_base().empty()) {
-				CleanupDistributedCopyUncommittedDirectWriteRun(fs, sink_node->spec().file_path,
-				                                                sink_node->staging_run_id());
+				CleanupDistributedCopyUncommittedDirectWriteRun(fs, sink_base_path, sink_node->staging_run_id());
 				return;
 			}
 			auto staging_root = fs.JoinPath(sink_node->staging_root_base(), sink_node->staging_run_id());

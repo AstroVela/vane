@@ -51,9 +51,11 @@ public:
 
 		// Direct-write is the default for every filesystem. Workers write
 		// visible run-prefixed output files under the requested output path.
-		// Shared local filesystems can opt back into staging + MoveFile/rename
-		// with VANE_DISTRIBUTED_COPY_LOCAL_STAGING=1.
-		if (!local_staging_enabled) {
+		// USE_TMP_FILE must retain DuckDB's non-conflicting temporary path in
+		// direct-write mode: coordinator staging is not visible for node-local
+		// outputs, and replacing a multi-file result cannot safely destroy the
+		// previous node-local target.
+		if (!local_staging_enabled || spec_.use_tmp_file) {
 			staging_root_base_ = "";
 		} else {
 			staging_root_base_ = spec_.file_path + ".duckdb_staging";

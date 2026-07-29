@@ -1744,6 +1744,20 @@ def test_distributed_copy_sink_mode_local_staging_env_preserves_staging(monkeypa
     assert result["uses_visible_direct_target"] is False
 
 
+def test_distributed_copy_sink_mode_tmp_file_preserves_node_local_direct_write(monkeypatch, tmp_path):
+    monkeypatch.setenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", "1")
+
+    result = duckdb.ray_cxx.distributed_copy_sink_mode_for_test(
+        str(tmp_path / "tmp_out"),
+        use_tmp_file=True,
+    )
+
+    assert result["construct_error"] is False, result["error"]
+    assert result["staging_root_base"] == ""
+    assert result["uses_direct_write"] is True
+    assert result["uses_visible_direct_target"] is True
+
+
 def test_distributed_copy_sink_mode_remote_rejects_local_staging_env(monkeypatch):
     monkeypatch.setenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", "1")
 
@@ -1816,12 +1830,15 @@ def test_distributed_copy_direct_write_uncommitted_stale_cleanup(tmp_path):
 def test_cleanup_uncommitted_copy_direct_write_run_public_api(tmp_path):
     base = tmp_path / "copy_direct_public_cleanup"
     stale_run_id = "run-public-stale"
+    stale_registration = duckdb.ray_cxx.register_copy_direct_write_run_lifecycle(
+        str(base),
+        stale_run_id,
+    )
     stale_run_dir = base / f"_vane_direct_write_{stale_run_id}" / "w_failed"
     stale_file = stale_run_dir / "part.parquet"
     stale_file.parent.mkdir(parents=True)
     stale_file.write_bytes(b"stale")
-    stale_commit_dir = Path(str(base) + ".duckdb_commit") / stale_run_id
-    stale_commit_dir.mkdir(parents=True)
+    stale_commit_dir = Path(stale_registration["copy_output_commit_dir"])
     (stale_commit_dir / "manifest.txt").write_text("partial\n")
 
     stale = duckdb.ray_cxx.cleanup_uncommitted_copy_direct_write_run(str(base), stale_run_id)
@@ -1835,12 +1852,15 @@ def test_cleanup_uncommitted_copy_direct_write_run_public_api(tmp_path):
     assert not stale_commit_dir.exists()
 
     committed_run_id = "run-public-committed"
+    committed_registration = duckdb.ray_cxx.register_copy_direct_write_run_lifecycle(
+        str(base),
+        committed_run_id,
+    )
     committed_run_dir = base / f"_vane_direct_write_{committed_run_id}" / "w_selected"
     committed_file = committed_run_dir / "part.parquet"
     committed_file.parent.mkdir(parents=True)
     committed_file.write_bytes(b"committed")
-    committed_commit_dir = Path(str(base) + ".duckdb_commit") / committed_run_id
-    committed_commit_dir.mkdir(parents=True)
+    committed_commit_dir = Path(committed_registration["copy_output_commit_dir"])
     (committed_commit_dir / "manifest.txt").write_text("committed manifest\n")
     (committed_commit_dir / "committed").write_text("committed\n")
 
@@ -1915,6 +1935,37 @@ def test_cleanup_expired_copy_direct_write_runs_public_api(tmp_path):
     assert Path(active["copy_output_lifecycle_path"]).exists()
     assert committed_file.exists()
     assert Path(committed["copy_output_lifecycle_path"]).exists()
+
+
+def test_copy_direct_write_lifecycle_uses_trimmed_base_path(tmp_path):
+    base = tmp_path / "copy_direct_trimmed_lifecycle"
+    base.mkdir()
+    raw_base = str(base) + os.sep
+    run_id = "run-trailing-separator"
+
+    registered = duckdb.ray_cxx.register_copy_direct_write_run_lifecycle(
+        raw_base,
+        run_id,
+        created_epoch_ms=1,
+    )
+    selected_file = base / f"{run_id}_w_selected_part.parquet"
+    selected_file.write_bytes(b"committed")
+    canonical_commit_dir = Path(str(base) + ".duckdb_commit") / run_id
+    canonical_commit_dir.mkdir(parents=True, exist_ok=True)
+    (canonical_commit_dir / "committed").write_text("committed\n")
+
+    cleanup = duckdb.ray_cxx.cleanup_expired_copy_direct_write_runs(
+        raw_base,
+        min_age_ms=1,
+        now_epoch_ms=10,
+    )
+
+    assert registered["copy_output_base_path"] == str(base)
+    assert Path(registered["copy_output_lifecycle_path"]).parent == canonical_commit_dir
+    assert cleanup["scanned_runs"] == 1
+    assert cleanup["cleaned_runs"] == 0
+    assert cleanup["committed_runs"] == 1
+    assert selected_file.exists()
 
 
 def test_copy_direct_write_lifecycle_cleanup_once_public_api(tmp_path):
