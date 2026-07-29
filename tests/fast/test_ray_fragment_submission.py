@@ -9679,7 +9679,7 @@ def test_start_ray_workers_keeps_flight_host_worker_local_and_skips_nested_warmu
         assert "env_overrides" not in remote_calls[index]
         assert remote_calls[index]["duckdb_memory_bytes"] == 256
         assert remote_calls[index]["task_heap_capacity_bytes"] == 615
-        assert remote_calls[index]["flight_advertise_host_fallback"] == address
+        assert remote_calls[index]["ray_node_ip_address"] == address
     assert get_calls == []
 
 

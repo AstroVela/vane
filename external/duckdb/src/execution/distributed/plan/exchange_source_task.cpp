@@ -98,7 +98,7 @@ ExchangeSourceTaskDescriptor ExchangeSourceTaskDescriptor::Deserialize(Deseriali
 			});
 			handle.attempt_id = obj.ReadPropertyWithExplicitDefault<idx_t>(5, "attempt_id", 0);
 			handle.flight_server_epoch = obj.ReadProperty<string>(6, "flight_server_epoch");
-			handle.flight_host = obj.ReadPropertyWithExplicitDefault<string>(7, "flight_host", handle.node_id);
+			handle.flight_host = obj.ReadProperty<string>(7, "flight_host");
 		});
 		result.source_handles.push_back(std::move(handle));
 	});

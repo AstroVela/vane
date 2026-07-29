@@ -111,7 +111,7 @@ def start_ray_workers(existing_worker_ids: list[str]) -> list[RayWorkerRuntime]:
                     num_gpus=int(node["Resources"].get("GPU", 0)),
                     duckdb_memory_bytes=memory_layout.worker_duckdb_memory_bytes,
                     task_heap_capacity_bytes=memory_layout.task_heap_capacity_bytes,
-                    flight_advertise_host_fallback=node_manager_address,
+                    ray_node_ip_address=node_manager_address,
                 )
                 actors.append((node, worker_id, actor))
 

@@ -123,7 +123,7 @@ ExchangeSinkInstanceTaskDescriptor ExchangeSinkInstanceTaskDescriptor::Deseriali
 	    deserializer.ReadPropertyWithDefault<idx_t>(4, "output_partition_count");
 	result.sink_instance.flight_server_epoch = deserializer.ReadProperty<string>(5, "flight_server_epoch");
 	result.sink_instance.query_id = deserializer.ReadProperty<string>(6, "query_id");
-	result.sink_instance.flight_host = deserializer.ReadPropertyWithExplicitDefault<string>(7, "flight_host", "");
+	result.sink_instance.flight_host = deserializer.ReadProperty<string>(7, "flight_host");
 	return result;
 }
 
