@@ -26,6 +26,7 @@
 #include <memory>
 #include <set>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <utility>
 #include <cstdlib>
@@ -823,6 +824,104 @@ TEST_CASE("Exchange: Flight service isolates published attempts and rejects rele
 	registry.RemoveAndCleanupByPrefix(prefix);
 }
 
+TEST_CASE("Exchange: process-local Flight shutdown is bounded and releases its service lock",
+          "[distributed][exchange]") {
+	struct ServiceGuard {
+		~ServiceGuard() {
+			FlightExchangeManager::ShutdownLocalFlightServer();
+		}
+	} guard;
+	REQUIRE(FlightExchangeManager::ShutdownLocalFlightServer().is_ok());
+
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto &context = *conn.context;
+	auto &registry = ShuffleCacheRegistry::Instance();
+	const std::string exchange_id = "stalled-flight-shutdown__sink_0__attempt_0";
+	const std::string query_id = "stalled-flight-shutdown-query";
+	const std::string node_id = "stalled-flight-shutdown-node";
+
+	ShuffleCacheConfig cache_config;
+	cache_config.shuffle_stage_id = exchange_id;
+	cache_config.node_id = node_id;
+	cache_config.num_partitions = 1;
+	cache_config.local_dirs = {TestCreatePath("stalled_flight_shutdown")};
+	auto cache = std::make_shared<ShuffleCache>(std::move(cache_config));
+	const std::string payload(256 * 1024, 'x');
+	for (idx_t batch = 0; batch < 64; batch++) {
+		DataChunk chunk;
+		chunk.Initialize(Allocator::DefaultAllocator(), {LogicalType::BLOB});
+		chunk.SetCardinality(1);
+		chunk.SetValue(0, 0, Value::BLOB_RAW(payload));
+		REQUIRE(cache->WriteChunk(context, chunk, 0, {"payload"}).is_ok());
+	}
+	REQUIRE(cache->FlushAll(context, {"payload"}).is_ok());
+	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
+
+	FlightServiceConfig service_config;
+	service_config.bind_host = "127.0.0.1";
+	service_config.advertise_host = "127.0.0.1";
+	service_config.port = 0;
+	service_config.shutdown_grace_period = std::chrono::seconds(1);
+	REQUIRE(FlightExchangeManager::EnsureLocalFlightServerStarted(service_config).is_ok());
+	const auto port = FlightExchangeManager::GetLocalFlightServerPort();
+	const auto epoch = FlightExchangeManager::GetLocalFlightServerEpoch();
+	REQUIRE(port > 0);
+	REQUIRE(!epoch.empty());
+	REQUIRE(registry.Register(exchange_id, cache, query_id, epoch, 0).is_ok());
+
+	auto location = arrow::flight::Location::Parse("grpc://127.0.0.1:" + std::to_string(port));
+	REQUIRE(location.ok());
+	auto client_result = arrow::flight::FlightClient::Connect(std::move(location).ValueOrDie());
+	REQUIRE(client_result.ok());
+	auto client = std::move(client_result).ValueOrDie();
+	FlightExchangeTicket ticket;
+	ticket.server_epoch = epoch;
+	ticket.exchange_instance_id = exchange_id;
+	ticket.node_id = node_id;
+	ticket.attempt_id = 0;
+	ticket.partition_idx = 0;
+	arrow::flight::Ticket flight_ticket;
+	flight_ticket.ticket = ticket.Serialize();
+	auto reader_result = client->DoGet(flight_ticket);
+	REQUIRE(reader_result.ok());
+	auto reader = std::move(reader_result).ValueOrDie();
+	REQUIRE(reader->GetSchema().ok());
+
+	std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	auto stop_future =
+	    std::async(std::launch::async, []() { return FlightExchangeManager::ShutdownLocalFlightServer(); });
+	std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	auto port_future =
+	    std::async(std::launch::async, []() { return FlightExchangeManager::GetLocalFlightServerPort(); });
+	const bool port_lookup_ready = port_future.wait_for(std::chrono::milliseconds(250)) == std::future_status::ready;
+	auto start_future = std::async(
+	    std::launch::async, [&]() { return FlightExchangeManager::EnsureLocalFlightServerStarted(service_config); });
+	const bool concurrent_start_ready =
+	    start_future.wait_for(std::chrono::milliseconds(250)) == std::future_status::ready;
+	const bool stopped_while_reader_open = stop_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+	if (!stopped_while_reader_open) {
+		reader->Cancel();
+	}
+	auto stop_result = stop_future.get();
+	const auto observed_port = port_future.get();
+	auto concurrent_start_result = start_future.get();
+	reader->Cancel();
+	if (concurrent_start_result.is_ok()) {
+		REQUIRE(FlightExchangeManager::ShutdownLocalFlightServer().is_ok());
+	}
+
+	REQUIRE(stop_result.is_ok());
+	REQUIRE(port_lookup_ready);
+	REQUIRE(observed_port == 0);
+	REQUIRE(concurrent_start_ready);
+	REQUIRE(concurrent_start_result.is_err());
+	REQUIRE_THAT(concurrent_start_result.error().what(), Catch::Matchers::Contains("shutting down"));
+	REQUIRE(stopped_while_reader_open);
+	registry.RemoveAndCleanupByQuery(query_id);
+	REQUIRE(registry.RetireQuery(query_id).is_ok());
+}
+
 // ═══════════════════════════════════════════════════════════
 // ShuffleCache (IPC Stream format)
 // ═══════════════════════════════════════════════════════════
@@ -1567,6 +1666,12 @@ TEST_CASE("Exchange: process-local Flight service has immutable network config a
 	auto conflicting_start = FlightExchangeManager::EnsureLocalFlightServerStarted(conflicting_config);
 	REQUIRE(conflicting_start.is_err());
 	REQUIRE_THAT(conflicting_start.error().what(), Catch::Matchers::Contains("refusing conflicting address"));
+
+	auto conflicting_grace_config = service_config;
+	conflicting_grace_config.shutdown_grace_period += std::chrono::milliseconds(1);
+	auto conflicting_grace_start = FlightExchangeManager::EnsureLocalFlightServerStarted(conflicting_grace_config);
+	REQUIRE(conflicting_grace_start.is_err());
+	REQUIRE_THAT(conflicting_grace_start.error().what(), Catch::Matchers::Contains("conflicting grace period"));
 
 	manager_a.Shutdown();
 	object_storage_manager.Shutdown();

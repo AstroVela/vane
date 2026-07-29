@@ -5,6 +5,7 @@
 
 #include "duckdb/execution/distributed/common_types.hpp"
 
+#include <chrono>
 #include <string>
 #include <memory>
 #include <thread>
@@ -13,9 +14,12 @@ namespace duckdb {
 namespace distributed {
 
 struct FlightServerConfig {
+	static constexpr std::chrono::milliseconds DEFAULT_SHUTDOWN_GRACE_PERIOD {5000};
+
 	std::string bind_host;
 	int port = 0;
 	std::string server_epoch;
+	std::chrono::milliseconds shutdown_grace_period {DEFAULT_SHUTDOWN_GRACE_PERIOD};
 };
 
 //! Build a Flight TCP URI, adding URI brackets around an IPv6 host.

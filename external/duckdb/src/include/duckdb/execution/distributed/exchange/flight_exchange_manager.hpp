@@ -51,6 +51,7 @@ struct FlightServiceConfig {
 	std::string bind_host;
 	std::string advertise_host;
 	int port = 0;
+	std::chrono::milliseconds shutdown_grace_period {FlightServerConfig::DEFAULT_SHUTDOWN_GRACE_PERIOD};
 };
 
 inline std::string ResolveFlightExchangeEnvString(const char *name) {

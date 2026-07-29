@@ -318,10 +318,7 @@ FlightServer::~FlightServer() {
 	if (!server_thread_.joinable()) {
 		return;
 	}
-	if (impl_ && impl_->server()) {
-		(void)impl_->server()->Shutdown();
-	}
-	server_thread_.join();
+	(void)Stop();
 }
 
 const FlightServerConfig &FlightServer::config() const {
@@ -363,12 +360,14 @@ DuckDBResult<void> FlightServer::Stop() {
 	if (!impl_ || !impl_->server()) {
 		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("flight server not initialized"));
 	}
-	auto status = impl_->server()->Shutdown();
+	if (!server_thread_.joinable()) {
+		return DuckDBResult<void>::ok();
+	}
+	auto deadline = std::chrono::system_clock::now() + config_.shutdown_grace_period;
+	auto status = impl_->server()->Shutdown(&deadline);
+	server_thread_.join();
 	if (!status.ok()) {
 		return DuckDBResult<void>::err(FlightServerArrowToError(status, "shutdown flight server"));
-	}
-	if (server_thread_.joinable()) {
-		server_thread_.join();
 	}
 	return DuckDBResult<void>::ok();
 }
