@@ -193,6 +193,59 @@ def test_native_background_event_loop_shutdown_completes_pending_future():
         future.result(timeout=1.0)
 
 
+def test_native_background_event_loop_request_shutdown_fences_and_shutdown_joins_sync_work():
+    background = _BackgroundEventLoop("native-fte-join-sync-work")
+    work_started = threading.Event()
+    release_work = threading.Event()
+    work_finished = threading.Event()
+    shutdown_finished = threading.Event()
+    shutdown_errors: list[BaseException] = []
+
+    def blocking_work():
+        work_started.set()
+        try:
+            assert release_work.wait(timeout=5.0)
+        finally:
+            work_finished.set()
+
+    async def run_blocking_work():
+        await asyncio.to_thread(blocking_work)
+
+    future = background.submit(run_blocking_work())
+    assert work_started.wait(timeout=1.0)
+    background.request_shutdown()
+    with pytest.raises(RuntimeError, match="stopping|closed"):
+        background.submit(asyncio.sleep(0))
+
+    def shutdown():
+        try:
+            background.shutdown(timeout_s=3.0)
+        except BaseException as exc:
+            shutdown_errors.append(exc)
+        finally:
+            shutdown_finished.set()
+
+    shutdown_thread = threading.Thread(target=shutdown)
+    shutdown_thread.start()
+    try:
+        deadline = time.monotonic() + 1.0
+        while not future.cancelled() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert future.cancelled()
+        assert not shutdown_finished.wait(timeout=0.05)
+        release_work.set()
+        shutdown_thread.join(timeout=5.0)
+    finally:
+        release_work.set()
+        shutdown_thread.join(timeout=5.0)
+
+    assert not shutdown_thread.is_alive()
+    assert shutdown_errors == []
+    assert work_finished.is_set()
+    with pytest.raises(CancelledError):
+        future.result(timeout=1.0)
+
+
 def test_native_background_event_loop_operation_timeout_cancels_coroutine():
     background = _BackgroundEventLoop(
         "native-fte-operation-timeout",
@@ -278,6 +331,16 @@ def test_native_background_event_loop_catches_pre311_future_timeout(monkeypatch)
     with pytest.raises(TimeoutError, match="operation timed out"):
         background.run(unused(), timeout_s=0.25)
     assert pending.cancelled is True
+
+
+def test_native_worker_handle_shutdown_forwards_timeout(monkeypatch):
+    worker = NativeWorkerHandle("worker-shutdown-timeout", lambda _request: None)
+    shutdown_timeouts = []
+    monkeypatch.setattr(worker._loop, "shutdown", lambda *, timeout_s: shutdown_timeouts.append(timeout_s))
+
+    worker.shutdown(timeout_s=12.5)
+
+    assert shutdown_timeouts == [12.5]
 
 
 def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
@@ -739,6 +802,7 @@ def test_native_task_result_handle_rejects_mismatched_status_identity():
     assert poll.error is not None
     assert "status identity mismatch" in str(poll.error)
     assert callback_events[-1][0]["state"] == FteTaskState.FAILED.value
+    assert callback_events[-1][0]["failure"]["error_code"] == "NATIVE_BACKEND_ERROR"
     assert callback_events[-1][1] is poll.error
 
     with pytest.raises(RuntimeError, match="status identity mismatch"):
@@ -748,6 +812,25 @@ def test_native_task_result_handle_rejects_mismatched_status_identity():
     with pytest.raises(RuntimeError, match="status identity mismatch"):
         handle.info_snapshot()
     assert callback_events[-1][1] is not None
+
+
+def test_native_task_result_handle_validates_enum_terminal_failure_payload():
+    task = _task_id(0, query_id="query-native-enum-terminal")
+
+    class _EnumTerminalWorker:
+        worker_id = "native-worker-enum-terminal"
+
+        def fte_get_task_status_cached(self, _task_id):
+            return {
+                "state": FteTaskState.FAILED,
+                "task_id": task,
+                "failure": {"message": "out of memory"},
+            }
+
+    handle = NativeTaskResultHandle(_EnumTerminalWorker(), task)
+
+    with pytest.raises(ValueError, match="requires error_code"):
+        handle.status_snapshot()
 
 
 def test_native_backend_rejects_mismatched_create_task_identity():
@@ -897,6 +980,29 @@ def test_native_worker_manager_shutdown_attempts_all_workers_and_is_retryable():
     backend.shutdown()
 
     assert shutdown_calls == ["first", "second", "first", "second"]
+    assert backend._closed is True
+
+
+def test_native_worker_manager_shutdown_shares_timeout_across_workers(monkeypatch):
+    shutdown_timeouts = []
+
+    class _Worker:
+        def __init__(self, worker_id):
+            self.worker_id = worker_id
+
+        def shutdown(self, *, timeout_s):
+            shutdown_timeouts.append((self.worker_id, timeout_s))
+
+    monotonic_values = iter([10.0, 10.25, 10.75])
+    monkeypatch.setattr(native_backend_mod.time, "monotonic", lambda: next(monotonic_values))
+    backend = NativeFteWorkerManagerBackend(workers=[_Worker("first"), _Worker("second")])
+
+    backend.shutdown(timeout_s=1.0)
+
+    assert shutdown_timeouts == [
+        ("first", pytest.approx(0.75)),
+        ("second", pytest.approx(0.25)),
+    ]
     assert backend._closed is True
 
 
@@ -2147,6 +2253,312 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
         assert "SET local_exchange_streaming=true" in conn.executed
         assert "SET local_exchange_buffer_bytes = '32MB'" in conn.executed
         assert "SET arrow_large_buffer_size=true" in conn.executed
+
+
+def test_in_process_fragment_executor_close_does_not_release_live_resources(monkeypatch):
+    from duckdb.runners.local import runner as local_runner
+
+    execute_started = threading.Event()
+    release_execute = threading.Event()
+    cursor_interrupted = threading.Event()
+
+    class FakeCursor:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def interrupt(self) -> None:
+            cursor_interrupted.set()
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeConn:
+        def __init__(self) -> None:
+            self.cursor_instance = FakeCursor()
+            self.closed = False
+
+        def cursor(self) -> FakeCursor:
+            return self.cursor_instance
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakePlanRunner:
+        def execute_native(self, *_args: Any) -> dict[str, bool]:
+            execute_started.set()
+            assert release_execute.wait(timeout=2.0)
+            return {"ok": True}
+
+    monkeypatch.setattr(
+        NativeFteWorkerManagerBackend,
+        "materialize_task_context",
+        staticmethod(lambda *_args, **_kwargs: {}),
+    )
+    monkeypatch.setattr(local_runner, "require_ray_cxx_attr", lambda *_args, **_kwargs: lambda values: values)
+
+    executor = local_runner._InProcessFragmentExecutor(close_timeout_s=1.0)
+    conn = FakeConn()
+    executor._connections.append(conn)
+    monkeypatch.setattr(executor, "_get_conn", lambda: conn)
+    monkeypatch.setattr(executor, "_get_plan_runner", lambda: FakePlanRunner())
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        execution = pool.submit(executor, {"fragment_plan": object(), "context": {}})
+        assert execute_started.wait(timeout=1.0)
+        try:
+            with pytest.raises(RuntimeError, match="did not drain.*active_executions=1"):
+                executor.close(timeout_s=0.05)
+            assert cursor_interrupted.is_set()
+            assert conn.closed is False
+        finally:
+            release_execute.set()
+        assert execution.result(timeout=2.0) == {"ok": True}
+
+    executor.close(timeout_s=1.0)
+    assert conn.closed is True
+    assert conn.cursor_instance.closed is True
+
+
+def test_in_process_fragment_executor_unregisters_cursor_before_close(monkeypatch):
+    from duckdb.runners.local import runner as local_runner
+
+    close_started = threading.Event()
+    release_close = threading.Event()
+    interrupt_calls = []
+
+    class FakeCursor:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def interrupt(self) -> None:
+            interrupt_calls.append("interrupt")
+            if self.closed:
+                raise RuntimeError("cursor already closed")
+
+        def close(self) -> None:
+            self.closed = True
+            close_started.set()
+            assert release_close.wait(timeout=2.0)
+
+    class FakeConn:
+        def __init__(self) -> None:
+            self.cursor_instance = FakeCursor()
+            self.closed = False
+
+        def cursor(self) -> FakeCursor:
+            return self.cursor_instance
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakePlanRunner:
+        def execute_native(self, *_args: Any) -> dict[str, bool]:
+            return {"ok": True}
+
+    monkeypatch.setattr(
+        NativeFteWorkerManagerBackend,
+        "materialize_task_context",
+        staticmethod(lambda *_args, **_kwargs: {}),
+    )
+    monkeypatch.setattr(local_runner, "require_ray_cxx_attr", lambda *_args, **_kwargs: lambda values: values)
+
+    executor = local_runner._InProcessFragmentExecutor(close_timeout_s=1.0)
+    conn = FakeConn()
+    executor._connections.append(conn)
+    monkeypatch.setattr(executor, "_get_conn", lambda: conn)
+    monkeypatch.setattr(executor, "_get_plan_runner", lambda: FakePlanRunner())
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        execution = pool.submit(executor, {"fragment_plan": object(), "context": {}})
+        assert close_started.wait(timeout=1.0)
+        try:
+            executor.request_shutdown()
+            assert interrupt_calls == []
+        finally:
+            release_close.set()
+        assert execution.result(timeout=2.0) == {"ok": True}
+
+    executor.close(timeout_s=1.0)
+    assert conn.closed is True
+
+
+def test_in_process_fragment_executor_interrupt_ownership_blocks_cursor_close():
+    from duckdb.runners.local import runner as local_runner
+
+    first_interrupt_started = threading.Event()
+    release_first_interrupt = threading.Event()
+    close_progressed = threading.Event()
+    close_blocked_on_lifecycle = threading.Event()
+    close_started = threading.Event()
+    close_finished = threading.Event()
+    release_close = threading.Event()
+    interrupt_during_close = threading.Event()
+    close_thread_id = []
+    shutdown_errors = []
+
+    class OrderedCursorRegistry(set[Any]):
+        def __init__(self, *values):
+            super().__init__(values)
+            self._values = list(values)
+
+        def __iter__(self):
+            return iter(list(self._values))
+
+        def discard(self, value):
+            super().discard(value)
+            if value in self._values:
+                self._values.remove(value)
+
+        def clear(self):
+            super().clear()
+            self._values.clear()
+
+    class ObservedCondition(threading.Condition):
+        def __enter__(self):
+            if close_thread_id and threading.get_ident() == close_thread_id[0]:
+                if self._lock.acquire(blocking=False):
+                    return self
+                close_blocked_on_lifecycle.set()
+                close_progressed.set()
+                self._lock.acquire()
+                return self
+            return super().__enter__()
+
+    class BlockingCursor:
+        def interrupt(self) -> None:
+            first_interrupt_started.set()
+            assert release_first_interrupt.wait(timeout=2.0)
+
+    class ClosingCursor:
+        def __init__(self) -> None:
+            self.closed = False
+            self.interrupt_calls = 0
+
+        def interrupt(self) -> None:
+            self.interrupt_calls += 1
+            if close_started.is_set() and not close_finished.is_set():
+                interrupt_during_close.set()
+            if self.closed:
+                raise RuntimeError("cursor already closed")
+
+        def close(self) -> None:
+            self.closed = True
+            close_started.set()
+            close_progressed.set()
+            try:
+                assert release_close.wait(timeout=2.0)
+            finally:
+                close_finished.set()
+
+    blocking_cursor = BlockingCursor()
+    closing_cursor = ClosingCursor()
+    executor = local_runner._InProcessFragmentExecutor(close_timeout_s=1.0)
+    lifecycle_lock = threading.RLock()
+    executor._resources_lock = lifecycle_lock
+    executor._resources_condition = ObservedCondition(lifecycle_lock)
+    executor._active_cursors = OrderedCursorRegistry(blocking_cursor, closing_cursor)
+
+    def request_shutdown():
+        try:
+            executor.request_shutdown()
+        except BaseException as exc:
+            shutdown_errors.append(exc)
+
+    def unregister_and_close():
+        close_thread_id.append(threading.get_ident())
+        executor._unregister_cursor(closing_cursor)
+        closing_cursor.close()
+
+    shutdown_thread = threading.Thread(target=request_shutdown)
+    shutdown_thread.start()
+    close_thread = threading.Thread(target=unregister_and_close)
+    close_thread_started = False
+    try:
+        assert first_interrupt_started.wait(timeout=1.0)
+        close_thread.start()
+        close_thread_started = True
+        assert close_progressed.wait(timeout=1.0)
+        close_started_before_interrupts_finished = close_started.is_set()
+        close_blocked_before_interrupts_finished = close_blocked_on_lifecycle.is_set()
+        release_first_interrupt.set()
+        shutdown_thread.join(timeout=2.0)
+    finally:
+        release_first_interrupt.set()
+        release_close.set()
+        shutdown_thread.join(timeout=2.0)
+        if close_thread_started:
+            close_thread.join(timeout=2.0)
+
+    assert close_started_before_interrupts_finished is False
+    assert close_blocked_before_interrupts_finished is True
+    assert shutdown_thread.is_alive() is False
+    assert close_thread.is_alive() is False
+    assert shutdown_errors == []
+    assert closing_cursor.interrupt_calls == 1
+    assert interrupt_during_close.is_set() is False
+    assert close_started.is_set()
+    assert close_finished.is_set()
+    executor._unregister_cursor(blocking_cursor)
+    executor.close(timeout_s=1.0)
+
+
+def test_in_process_fragment_executor_reports_active_cursor_interrupt_failure():
+    from duckdb.runners.local import runner as local_runner
+
+    class ActiveCursor:
+        def interrupt(self) -> None:
+            raise RuntimeError("active cursor interrupt failed")
+
+    cursor = ActiveCursor()
+    executor = local_runner._InProcessFragmentExecutor(close_timeout_s=1.0)
+    executor._active_cursors.add(cursor)
+
+    with pytest.raises(RuntimeError, match="active cursor interrupt failed"):
+        executor.request_shutdown()
+
+    executor._unregister_cursor(cursor)
+    executor.close(timeout_s=1.0)
+
+
+def test_in_process_fragment_executor_registration_failure_releases_execution_ownership(monkeypatch):
+    from duckdb.runners.local import runner as local_runner
+
+    class FakeCursor:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeConn:
+        def __init__(self) -> None:
+            self.cursor_instance = FakeCursor()
+
+        def cursor(self) -> FakeCursor:
+            return self.cursor_instance
+
+    monkeypatch.setattr(
+        NativeFteWorkerManagerBackend,
+        "materialize_task_context",
+        staticmethod(lambda *_args, **_kwargs: {}),
+    )
+    monkeypatch.setattr(local_runner, "require_ray_cxx_attr", lambda *_args, **_kwargs: lambda values: values)
+
+    executor = local_runner._InProcessFragmentExecutor()
+    conn = FakeConn()
+    monkeypatch.setattr(executor, "_get_conn", lambda: conn)
+
+    def fail_register(_cursor):
+        raise RuntimeError("cursor registration failed")
+
+    monkeypatch.setattr(executor, "_register_cursor", fail_register)
+
+    with pytest.raises(RuntimeError, match="cursor registration failed"):
+        executor({"fragment_plan": object(), "context": {}})
+
+    assert executor._in_flight == 0
+    assert conn.cursor_instance.closed is True
+    executor.close(timeout_s=0)
 
 
 def test_native_cxx_run_copy_plan_selected_attempt_ignores_duplicate_copy_output(tmp_path, monkeypatch):

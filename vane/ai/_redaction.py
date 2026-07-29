@@ -18,7 +18,8 @@ at construction (:func:`wrap_sensitive_options`), so repr, str, logs,
 exception messages, and assertion diffs show only the fixed placeholder —
 including for pickled copies shipped to workers. The plaintext is restored
 solely at provider execution, immediately before SDK client or engine
-construction, via :func:`unwrap_sensitive_options`.
+construction, either via :func:`unwrap_sensitive_options` or the native
+executor's strict opaque-payload decoder.
 
 This module is private; :class:`Secret` is intentionally not exported from
 the public ``vane.ai`` namespace.

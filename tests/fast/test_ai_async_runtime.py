@@ -28,20 +28,25 @@ import pytest
 def _load_functions() -> types.ModuleType:
     """Import the real ``vane.ai.functions``, even under the no-duckdb harness.
 
-    The stub harness plugin registers a placeholder for ``vane.ai.functions``
-    because the real module imports duckdb-backed modules at top level. When
-    that placeholder is present, evict it and stub just the duckdb-importing
-    dependencies so the real module under test can load. On CI (where duckdb
-    imports fine) the real module imports normally and nothing is stubbed.
+    On CI the real module imports normally and nothing is stubbed. Under the
+    no-duckdb harness the import fails on dependencies that reach into
+    ``duckdb.execution`` at module level; those get stubbed and the import is
+    retried — the wrapper tests never touch the stubbed surfaces.
     """
     module = sys.modules.get("vane.ai.functions")
     if getattr(module, "__file__", None):
         return module  # real module already loaded
     if module is not None:
         sys.modules.pop("vane.ai.functions")
+    try:
+        return importlib.import_module("vane.ai.functions")
+    except ImportError:
         stub_specs: tuple[tuple[str, tuple[str, ...]], ...] = (
             ("vane._expressions", ("as_expression", "is_expression")),
             ("vane._expression_udf", ("_build_actor_map_batches_expression",)),
+            # The real vllm provider module imports duckdb.execution at top
+            # level; the wrapper tests never touch the native vLLM plan.
+            ("vane.ai.providers.vllm", ("NativeVLLMPromptPlan", "_build_native_vllm_options_argument")),
         )
         for name, attrs in stub_specs:
             if name not in sys.modules:
@@ -49,7 +54,7 @@ def _load_functions() -> types.ModuleType:
                 for attr in attrs:
                     setattr(stub, attr, lambda *a, **k: None)
                 sys.modules[name] = stub
-    return importlib.import_module("vane.ai.functions")
+        return importlib.import_module("vane.ai.functions")
 
 
 functions = _load_functions()

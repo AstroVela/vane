@@ -27,6 +27,23 @@ static void AssignDataSourceQueryOwner(duckdb::PhysicalOperator &op, const strin
 	}
 }
 
+static std::shared_ptr<duckdb::distributed::FlightExchangeManager>
+FindFlightExchangeSinkManager(const duckdb::PhysicalOperator &op) {
+	if (op.type == duckdb::PhysicalOperatorType::EXCHANGE_SINK) {
+		auto *sink = dynamic_cast<const duckdb::PhysicalRemoteExchangeSink *>(&op);
+		if (sink) {
+			return std::dynamic_pointer_cast<duckdb::distributed::FlightExchangeManager>(sink->GetExchangeManager());
+		}
+	}
+	for (auto &child : op.children) {
+		auto manager = FindFlightExchangeSinkManager(child.get());
+		if (manager) {
+			return manager;
+		}
+	}
+	return nullptr;
+}
+
 struct PyPhysicalPlanWrapper {
 	static constexpr uint64_t INIT_MAGIC = 0x445046504C414E31ULL;
 	uint64_t init_magic_;
@@ -872,7 +889,9 @@ struct PyPhysicalPlanWrapper {
 				auto &vllm_op = op.Cast<PhysicalVLLM>();
 				idx_t node_id = vllm_counter++;
 
-				// Build pool name using the same sanitization as VLLMProjectNode.
+				// Keep distributed vLLM pools scoped to one connection session
+				// and query. Cross-query reuse requires immutable configuration
+				// validation and explicit lifecycle ownership.
 				auto safe_session = duckdb::distributed::SanitizePoolComponent(session_id);
 				auto safe_query = duckdb::distributed::SanitizePoolComponent(query_id);
 				auto pool_name = "duckdb_vllm_" + safe_session + "_" + safe_query + "_" + std::to_string(node_id);
@@ -2159,13 +2178,23 @@ struct PyPhysicalPlanWrapperRunner {
 		ApplyTaskLocalCopyOutput(*physical_plan, copy_output_info, &context);
 
 		auto &root_op = physical_plan->Root();
+		auto task_flight_manager = FindFlightExchangeSinkManager(root_op);
+		auto task_flight_port = [&]() {
+			return task_flight_manager ? task_flight_manager->GetPublishedFlightServerPort() : 0;
+		};
+		auto task_flight_host = [&]() {
+			return task_flight_manager ? task_flight_manager->GetPublishedFlightServerHost() : string();
+		};
+		auto task_flight_server_epoch = [&]() {
+			return task_flight_manager ? task_flight_manager->GetPublishedFlightServerEpoch() : string();
+		};
 		auto task_exchange_sink_instance_obj = [&]() -> py::object {
 			if (!exchange_sink_instance_task) {
 				return py::none();
 			}
 			auto completed_task = *exchange_sink_instance_task;
-			completed_task.sink_instance.flight_server_epoch =
-			    duckdb::distributed::FlightExchangeManager::GetLocalFlightServerEpoch();
+			completed_task.sink_instance.flight_host = task_flight_host();
+			completed_task.sink_instance.flight_server_epoch = task_flight_server_epoch();
 			return py::bytes(completed_task.SerializeToBytes());
 		};
 
@@ -2180,8 +2209,7 @@ struct PyPhysicalPlanWrapperRunner {
 			py::list payloads;
 			py::list metadatas;
 			return BuildNativeTaskResult(payloads, metadatas, build_result_schema(names, result_types), py::list(),
-			                             std::move(task_stats), status,
-			                             duckdb::distributed::FlightExchangeManager::GetLocalFlightServerPort(),
+			                             std::move(task_stats), status, task_flight_port(),
 			                             task_exchange_sink_instance_obj());
 		};
 		auto build_table_result = [&](const py::object &table, idx_t row_count, const duckdb::vector<string> &names,
@@ -2196,8 +2224,7 @@ struct PyPhysicalPlanWrapperRunner {
 			metadatas.append(
 			    py::cast(NativePartitionMetadata(static_cast<size_t>(row_count), GetPyPayloadSizeBytes(table))));
 			return BuildNativeTaskResult(payloads, metadatas, build_result_schema(names, result_types), py::list(),
-			                             std::move(task_stats), "ok",
-			                             duckdb::distributed::FlightExchangeManager::GetLocalFlightServerPort(),
+			                             std::move(task_stats), "ok", task_flight_port(),
 			                             task_exchange_sink_instance_obj());
 		};
 		auto build_executed_result = [&](py::object task_stats) -> py::object {

@@ -129,6 +129,108 @@ TableFunction MakeTestInOutFunction() {
 	return func;
 }
 
+void SerializePreStrictRemoteExchangeSink(Serializer &serializer) {
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	vector<unique_ptr<Expression>> partition_by;
+	vector<string> local_dirs = {"/legacy/local"};
+	vector<string> range_boundaries;
+	vector<string> range_order_modifiers;
+	serializer.WriteProperty(100, "type", PhysicalOperatorType::EXCHANGE_SINK);
+	serializer.WriteProperty(101, "types", types);
+	serializer.WriteProperty<idx_t>(102, "estimated_cardinality", 0);
+	serializer.WriteProperty(103, "shuffle_stage_id", string("legacy-sink"));
+	serializer.WriteProperty(104, "node_id", string("legacy-node"));
+	serializer.WriteProperty<idx_t>(105, "num_partitions", 1);
+	serializer.WriteProperty<uint8_t>(106, "repartition_type", static_cast<uint8_t>(RepartitionSpec::Type::Random));
+	serializer.WriteProperty(107, "partition_by", partition_by);
+	serializer.WriteProperty(108, "local_dirs", local_dirs);
+	serializer.WriteProperty(109, "flight_bind_host", string("0.0.0.0"));
+	serializer.WriteProperty<int>(110, "flight_port", 31337);
+	serializer.WriteProperty<idx_t>(111, "sink_task_partition_id", 0);
+	serializer.WriteProperty<idx_t>(112, "sink_attempt_id", 0);
+	serializer.WriteProperty(113, "sink_output_location", string("legacy-sink-attempt"));
+	serializer.WriteProperty(114, "range_boundaries", range_boundaries);
+	serializer.WriteProperty(115, "range_order_modifiers", range_order_modifiers);
+	serializer.WriteProperty(116, "flight_server_epoch", string());
+	serializer.WriteProperty(117, "query_id", string("legacy-query"));
+	serializer.WriteProperty(118, "allow_insecure_flight", true);
+	serializer.WriteList(198, "children", 0, [](Serializer::List &, idx_t) {});
+}
+
+void SerializePreStrictRemoteExchangeSource(Serializer &serializer) {
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	vector<idx_t> partition_indices = {0};
+	vector<string> source_nodes = {"legacy-node"};
+	vector<idx_t> handle_partition_ids = {0};
+	vector<string> handle_node_ids = {"legacy-node"};
+	vector<string> handle_paths = {"legacy-source-attempt"};
+	vector<int> handle_flight_ports = {31337};
+	vector<idx_t> handle_attempt_ids = {1};
+	vector<string> local_dirs = {"/legacy/local"};
+	vector<string> handle_server_epochs = {"legacy-epoch"};
+	serializer.WriteProperty(100, "type", PhysicalOperatorType::EXCHANGE_SOURCE);
+	serializer.WriteProperty(101, "types", types);
+	serializer.WriteProperty<idx_t>(102, "estimated_cardinality", 0);
+	serializer.WriteProperty(103, "shuffle_stage_id", string("legacy-source"));
+	serializer.WriteProperty(104, "partition_indices", partition_indices);
+	serializer.WriteProperty(105, "source_nodes", source_nodes);
+	serializer.WriteProperty(106, "flight_location_template", string("grpc://{node}:31337"));
+	serializer.WriteProperty<double>(107, "flight_timeout_seconds", 0);
+	serializer.WriteProperty(108, "source_handle_partition_ids", handle_partition_ids);
+	serializer.WriteProperty(109, "source_handle_node_ids", handle_node_ids);
+	serializer.WriteProperty(110, "source_handle_paths", handle_paths);
+	serializer.WriteProperty(111, "source_handle_flight_ports", handle_flight_ports);
+	serializer.WritePropertyWithDefault(112, "runtime_source_node_id", optional_idx(), optional_idx());
+	serializer.WriteProperty(113, "source_handle_attempt_ids", handle_attempt_ids);
+	serializer.WriteProperty(114, "local_dirs", local_dirs);
+	serializer.WriteProperty(115, "source_handle_flight_server_epochs", handle_server_epochs);
+	serializer.WriteProperty(116, "source_catalog_handles_explicit", true);
+	serializer.WriteProperty(117, "allow_insecure_flight", true);
+	serializer.WriteList(198, "children", 0, [](Serializer::List &, idx_t) {});
+}
+
+string SerializeSinkDescriptorWithoutFlightHost() {
+	MemoryStream stream(Allocator::DefaultAllocator());
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	serializer.WriteProperty<idx_t>(1, "task_partition_id", 0);
+	serializer.WriteProperty<idx_t>(2, "attempt_id", 0);
+	serializer.WriteProperty(3, "output_location", string("pre-strict-sink"));
+	serializer.WriteProperty<idx_t>(4, "output_partition_count", 1);
+	serializer.WriteProperty(5, "flight_server_epoch", string("pre-strict-epoch"));
+	serializer.WriteProperty(6, "query_id", string("pre-strict-query"));
+	serializer.End();
+	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
+}
+
+string SerializeSourceDescriptorWithoutFlightHost() {
+	MemoryStream stream(Allocator::DefaultAllocator());
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	serializer.WriteProperty(1, "partition_indices", vector<idx_t> {0});
+	serializer.WriteList(2, "source_handles", 1, [&](Serializer::List &list, idx_t) {
+		list.WriteObject([&](Serializer &obj) {
+			obj.WriteProperty<idx_t>(1, "partition_id", 0);
+			obj.WriteProperty(2, "node_id", string("pre-strict-node"));
+			obj.WriteProperty<int>(3, "flight_port", 5010);
+			obj.WriteList(4, "files", 1, [&](Serializer::List &files, idx_t) {
+				files.WriteObject([&](Serializer &file_obj) {
+					file_obj.WriteProperty(1, "path", string("pre-strict-source"));
+					file_obj.WriteProperty<size_t>(2, "file_size", 0);
+					file_obj.WriteProperty<idx_t>(3, "rows", 0);
+				});
+			});
+			obj.WriteProperty<idx_t>(5, "attempt_id", 0);
+			obj.WriteProperty(6, "flight_server_epoch", string("pre-strict-epoch"));
+		});
+	});
+	serializer.WriteProperty<idx_t>(3, "source_partition_count", 1);
+	serializer.WriteProperty<idx_t>(4, "source_task_count", 1);
+	serializer.WriteProperty<bool>(5, "replicated", false);
+	serializer.End();
+	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
+}
+
 } // namespace
 
 TEST_CASE("PhysicalProjection serialization roundtrip", "[serialization][physical_plan]") {
@@ -1122,13 +1224,12 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	sink_handle.query_id = "query-session-a";
 	sink_handle.output_location = "shuffle_stage__sink_7__attempt_2";
 	sink_handle.output_partition_count = 4;
+	sink_handle.flight_host = "worker-only.internal";
 	sink_handle.flight_server_epoch = "sink-epoch";
 
 	distributed::FlightExchangeConfig flight_config;
 	flight_config.node_id = "node-1";
 	flight_config.local_dirs = {"/session-a/shuffle-0", "/session-a/shuffle-1"};
-	flight_config.flight_bind_host = "127.0.0.2";
-	flight_config.flight_port = 4242;
 	auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
 
 	vector<unique_ptr<Expression>> partition_by;
@@ -1158,6 +1259,7 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	REQUIRE(sink_ptr->SinkHandle().query_id == "query-session-a");
 	REQUIRE(sink_ptr->SinkHandle().output_location == "shuffle_stage__sink_7__attempt_2");
 	REQUIRE(sink_ptr->SinkHandle().output_partition_count == 4);
+	REQUIRE(sink_ptr->SinkHandle().flight_host.empty());
 	REQUIRE(sink_ptr->SinkHandle().flight_server_epoch == "sink-epoch");
 	auto roundtrip_manager =
 	    std::dynamic_pointer_cast<distributed::FlightExchangeManager>(sink_ptr->GetExchangeManager());
@@ -1165,8 +1267,6 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	REQUIRE(roundtrip_manager != nullptr);
 	REQUIRE(roundtrip_manager->config().node_id == "node-1");
 	REQUIRE(roundtrip_manager->config().local_dirs == expected_local_dirs);
-	REQUIRE(roundtrip_manager->config().flight_bind_host == "127.0.0.2");
-	REQUIRE(roundtrip_manager->config().flight_port == 4242);
 }
 
 TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
@@ -1249,6 +1349,36 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	REQUIRE(sink.SinkHandle().output_partition_count == 4);
 }
 
+TEST_CASE("ExchangeSinkInstanceTaskDescriptor serialization preserves the worker endpoint",
+          "[serialization][physical_plan][exchange]") {
+	distributed::ExchangeSinkInstanceTaskDescriptor descriptor;
+	descriptor.sink_instance.sink_handle.task_partition_id = 3;
+	descriptor.sink_instance.attempt_id = 2;
+	descriptor.sink_instance.query_id = "endpoint-query";
+	descriptor.sink_instance.output_location = "endpoint-exchange__sink_3__attempt_2";
+	descriptor.sink_instance.output_partition_count = 4;
+	descriptor.sink_instance.flight_host = "flight-worker.internal";
+	descriptor.sink_instance.flight_server_epoch = "endpoint-epoch";
+
+	auto roundtrip =
+	    distributed::ExchangeSinkInstanceTaskDescriptor::DeserializeFromBytes(descriptor.SerializeToBytes());
+
+	REQUIRE(roundtrip.sink_instance.sink_handle.task_partition_id == 3);
+	REQUIRE(roundtrip.sink_instance.attempt_id == 2);
+	REQUIRE(roundtrip.sink_instance.query_id == "endpoint-query");
+	REQUIRE(roundtrip.sink_instance.output_location == "endpoint-exchange__sink_3__attempt_2");
+	REQUIRE(roundtrip.sink_instance.output_partition_count == 4);
+	REQUIRE(roundtrip.sink_instance.flight_host == "flight-worker.internal");
+	REQUIRE(roundtrip.sink_instance.flight_server_epoch == "endpoint-epoch");
+}
+
+TEST_CASE("Exchange task descriptors reject missing advertised hosts", "[serialization][physical_plan][exchange]") {
+	REQUIRE_THROWS(distributed::ExchangeSinkInstanceTaskDescriptor::DeserializeFromBytes(
+	    SerializeSinkDescriptorWithoutFlightHost()));
+	REQUIRE_THROWS(
+	    distributed::ExchangeSourceTaskDescriptor::DeserializeFromBytes(SerializeSourceDescriptorWithoutFlightHost()));
+}
+
 TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source handles",
           "[serialization][physical_plan][exchange]") {
 	Allocator allocator;
@@ -1263,6 +1393,8 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	handle0.partition_id = 0;
 	handle0.attempt_id = 3;
 	handle0.node_id = "node-1";
+	handle0.flight_host = "flight-node-1.internal";
+	handle0.flight_port = 6123;
 	handle0.flight_server_epoch = "epoch-1";
 	handle0.files.push_back(ExchangeSourceFile("shuffle_stage__sink_0__attempt_0", 0));
 	source_handles.push_back(handle0);
@@ -1271,6 +1403,8 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	handle1.partition_id = 0;
 	handle1.attempt_id = 4;
 	handle1.node_id = "node-2";
+	handle1.flight_host = "flight-node-2.internal";
+	handle1.flight_port = 6124;
 	handle1.flight_server_epoch = "epoch-2";
 	handle1.files.push_back(ExchangeSourceFile("shuffle_stage__sink_1__attempt_0", 0));
 	source_handles.push_back(handle1);
@@ -1279,13 +1413,14 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	handle2.partition_id = 1;
 	handle2.attempt_id = 3;
 	handle2.node_id = "node-1";
+	handle2.flight_host = "flight-node-1.internal";
+	handle2.flight_port = 6123;
 	handle2.flight_server_epoch = "epoch-1";
 	handle2.files.push_back(ExchangeSourceFile("shuffle_stage__sink_0__attempt_0", 0));
 	source_handles.push_back(handle2);
 
 	distributed::FlightExchangeConfig flight_config;
 	flight_config.node_id = "node-1";
-	flight_config.flight_location_template = "grpc://{node}:6123";
 	flight_config.flight_timeout_seconds = 7.5;
 	auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
 
@@ -1315,26 +1450,65 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	REQUIRE(source_ptr->SourceHandles()[0].partition_id == 0);
 	REQUIRE(source_ptr->SourceHandles()[0].attempt_id == 3);
 	REQUIRE(source_ptr->SourceHandles()[0].node_id == "node-1");
+	REQUIRE(source_ptr->SourceHandles()[0].flight_host == "flight-node-1.internal");
+	REQUIRE(source_ptr->SourceHandles()[0].flight_port == 6123);
 	REQUIRE(source_ptr->SourceHandles()[0].flight_server_epoch == "epoch-1");
 	REQUIRE(source_ptr->SourceHandles()[0].files.size() == 1);
 	REQUIRE(source_ptr->SourceHandles()[0].files[0].path == "shuffle_stage__sink_0__attempt_0");
 	REQUIRE(source_ptr->SourceHandles()[1].partition_id == 0);
 	REQUIRE(source_ptr->SourceHandles()[1].attempt_id == 4);
 	REQUIRE(source_ptr->SourceHandles()[1].node_id == "node-2");
+	REQUIRE(source_ptr->SourceHandles()[1].flight_host == "flight-node-2.internal");
+	REQUIRE(source_ptr->SourceHandles()[1].flight_port == 6124);
 	REQUIRE(source_ptr->SourceHandles()[1].flight_server_epoch == "epoch-2");
 	REQUIRE(source_ptr->SourceHandles()[1].files.size() == 1);
 	REQUIRE(source_ptr->SourceHandles()[1].files[0].path == "shuffle_stage__sink_1__attempt_0");
 	REQUIRE(source_ptr->SourceHandles()[2].partition_id == 1);
 	REQUIRE(source_ptr->SourceHandles()[2].attempt_id == 3);
 	REQUIRE(source_ptr->SourceHandles()[2].node_id == "node-1");
+	REQUIRE(source_ptr->SourceHandles()[2].flight_host == "flight-node-1.internal");
+	REQUIRE(source_ptr->SourceHandles()[2].flight_port == 6123);
 	REQUIRE(source_ptr->SourceHandles()[2].flight_server_epoch == "epoch-1");
 	REQUIRE(source_ptr->SourceHandles()[2].files.size() == 1);
 	REQUIRE(source_ptr->SourceHandles()[2].files[0].path == "shuffle_stage__sink_0__attempt_0");
 	auto roundtrip_manager =
 	    std::dynamic_pointer_cast<distributed::FlightExchangeManager>(source_ptr->GetExchangeManager());
 	REQUIRE(roundtrip_manager != nullptr);
-	REQUIRE(roundtrip_manager->config().flight_location_template == "grpc://{node}:6123");
 	REQUIRE(roundtrip_manager->config().flight_timeout_seconds == 7.5);
+}
+
+TEST_CASE("Remote exchange plans reject pre-strict endpoint payloads", "[serialization][physical_plan][exchange]") {
+	{
+		Allocator allocator;
+		PhysicalPlan plan(allocator);
+		MemoryStream stream(allocator);
+		SerializationOptions options;
+		BinarySerializer serializer(stream, options);
+		serializer.Begin();
+		SerializePreStrictRemoteExchangeSink(serializer);
+		serializer.End();
+
+		stream.Rewind();
+		BinaryDeserializer deserializer(stream);
+		deserializer.Begin();
+		REQUIRE_THROWS(PhysicalOperator::Deserialize(deserializer, plan));
+	}
+
+	{
+		Allocator allocator;
+		PhysicalPlan plan(allocator);
+		MemoryStream stream(allocator);
+		SerializationOptions options;
+		BinarySerializer serializer(stream, options);
+		serializer.Begin();
+		SerializePreStrictRemoteExchangeSource(serializer);
+		serializer.End();
+
+		stream.Rewind();
+		BinaryDeserializer deserializer(stream);
+		deserializer.Begin();
+		REQUIRE_THROWS(PhysicalOperator::Deserialize(deserializer, plan));
+	}
 }
 
 TEST_CASE("PhysicalRemoteExchangeSource serialization preserves runtime source binding node id",
@@ -1375,6 +1549,9 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves runtime source b
 	REQUIRE(source_ptr->SourceHandles().empty());
 	REQUIRE(source_ptr->RuntimeSourceNodeId().IsValid());
 	REQUIRE(source_ptr->RuntimeSourceNodeId().GetIndex() == 42);
+	auto roundtrip_manager =
+	    std::dynamic_pointer_cast<distributed::FlightExchangeManager>(source_ptr->GetExchangeManager());
+	REQUIRE(roundtrip_manager != nullptr);
 }
 
 TEST_CASE("PhysicalRemoteExchangeSource serialization preserves an explicit empty catalog",
@@ -1422,6 +1599,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	handle0.partition_id = 0;
 	handle0.attempt_id = 7;
 	handle0.node_id = "node-1";
+	handle0.flight_host = "flight-node-1.internal";
 	handle0.flight_port = 5010;
 	handle0.flight_server_epoch = "epoch-1";
 	handle0.files.push_back(ExchangeSourceFile("shuffle_stage__sink_0__attempt_7", 0, 11));
@@ -1431,6 +1609,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	handle1.partition_id = 1;
 	handle1.attempt_id = 2;
 	handle1.node_id = "node-2";
+	handle1.flight_host = "flight-node-2.internal";
 	handle1.flight_port = 5011;
 	handle1.flight_server_epoch = "epoch-2";
 	handle1.files.push_back(ExchangeSourceFile("shuffle_stage__sink_1__attempt_2", 0, 17));
@@ -1445,6 +1624,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	REQUIRE(roundtrip.source_handles[0].partition_id == 0);
 	REQUIRE(roundtrip.source_handles[0].attempt_id == 7);
 	REQUIRE(roundtrip.source_handles[0].node_id == "node-1");
+	REQUIRE(roundtrip.source_handles[0].flight_host == "flight-node-1.internal");
 	REQUIRE(roundtrip.source_handles[0].flight_port == 5010);
 	REQUIRE(roundtrip.source_handles[0].flight_server_epoch == "epoch-1");
 	REQUIRE(roundtrip.source_handles[0].files.size() == 1);
@@ -1453,6 +1633,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	REQUIRE(roundtrip.source_handles[1].partition_id == 1);
 	REQUIRE(roundtrip.source_handles[1].attempt_id == 2);
 	REQUIRE(roundtrip.source_handles[1].node_id == "node-2");
+	REQUIRE(roundtrip.source_handles[1].flight_host == "flight-node-2.internal");
 	REQUIRE(roundtrip.source_handles[1].flight_port == 5011);
 	REQUIRE(roundtrip.source_handles[1].flight_server_epoch == "epoch-2");
 	REQUIRE(roundtrip.source_handles[1].files.size() == 1);

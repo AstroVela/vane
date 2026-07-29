@@ -297,31 +297,25 @@ class TestWrapperPickle:
 
 
 class TestVLLMProvider:
-    """Tests for the vLLM provider and descriptor."""
+    """Tests for native vLLM provider planning metadata."""
 
     def test_provider_loads(self):
-        """Vllm provider is registered and loadable."""
         from vane.ai.provider import PROVIDERS
 
         assert "vllm" in PROVIDERS
 
     def test_descriptor_creates(self):
-        """VLLMPrompterDescriptor can be created with default settings."""
         from vane.ai.providers.vllm import VLLMPrompterDescriptor
 
-        desc = VLLMPrompterDescriptor(
-            model_name="Qwen/Qwen3-1.7B",
-        )
-        assert desc.get_provider() == "vllm"
-        assert desc.get_model() == "Qwen/Qwen3-1.7B"
+        descriptor = VLLMPrompterDescriptor(model_name="Qwen/Qwen3-1.7B")
+
+        assert descriptor.get_provider() == "vllm"
+        assert descriptor.get_model() == "Qwen/Qwen3-1.7B"
 
     def test_descriptor_pickle_roundtrip(self):
-        """VLLMPrompterDescriptor survives pickle (required for Ray)."""
-        import pickle
-
         from vane.ai.providers.vllm import VLLMPrompterDescriptor
 
-        desc = VLLMPrompterDescriptor(
+        descriptor = VLLMPrompterDescriptor(
             model_name="meta-llama/Llama-3.1-8B",
             system_message="You are a helpful assistant.",
             vllm_options={
@@ -330,183 +324,44 @@ class TestVLLMProvider:
                 "gpus_per_actor": 1,
             },
         )
-        restored = pickle.loads(pickle.dumps(desc))
-        assert restored.model_name == desc.model_name
-        assert restored.system_message == desc.system_message
-        assert restored.vllm_options == desc.vllm_options
 
-    def test_udf_options_defaults(self):
-        """VLLMPrompterDescriptor produces correct UDFOptions."""
-        from vane.ai.providers.vllm import VLLMPrompterDescriptor
+        restored = pickle.loads(pickle.dumps(descriptor))
 
-        desc = VLLMPrompterDescriptor(
-            model_name="Qwen/Qwen3-1.7B",
-            vllm_options={"gpus_per_actor": 2},
-        )
-        opts = desc.get_udf_options()
-        assert opts.num_gpus == 2
-        assert opts.on_error == "raise"
+        assert restored.model_name == descriptor.model_name
+        assert restored.system_message == descriptor.system_message
+        assert restored.vllm_options == descriptor.vllm_options
 
     def test_provider_get_prompter(self):
-        """VLLMProvider.get_prompter returns a VLLMPrompterDescriptor."""
         from vane.ai.providers.vllm import VLLMPrompterDescriptor, VLLMProvider
 
-        provider = VLLMProvider()
-        desc = provider.get_prompter(
+        descriptor = VLLMProvider().get_prompter(
             model="Qwen/Qwen3-1.7B",
             system_message="Be concise.",
             engine_args={"max_model_len": 1024},
         )
-        assert isinstance(desc, VLLMPrompterDescriptor)
-        assert desc.model_name == "Qwen/Qwen3-1.7B"
-        assert desc.system_message == "Be concise."
-        assert desc.vllm_options["engine_args"] == {"max_model_len": 1024}
 
-    def test_prompt_batch_uses_batch_api(self):
-        """_PromptBatch detects prompt_batch() method on vLLM prompter."""
-        from unittest.mock import MagicMock, patch
+        assert isinstance(descriptor, VLLMPrompterDescriptor)
+        assert descriptor.model_name == "Qwen/Qwen3-1.7B"
+        assert descriptor.system_message == "Be concise."
+        assert descriptor.vllm_options["engine_args"] == {"max_model_len": 1024}
 
-        from vane.ai.providers.vllm import VLLMPrompterDescriptor
+    def test_vllm_prompt_plan_is_not_an_executable_descriptor(self):
+        from vane.ai.protocols import NativePrompterPlan, PrompterDescriptor
+        from vane.ai.providers.vllm import NativeVLLMPromptPlan, VLLMPrompterDescriptor
 
-        desc = VLLMPrompterDescriptor(model_name="test-model")
+        plan = VLLMPrompterDescriptor(model_name="test-model")
 
-        # Mock the instantiate to return a fake prompter with prompt_batch
-        mock_prompter = MagicMock()
-        mock_prompter.prompt_batch.return_value = ["Hello!", "World!"]
-
-        with patch.object(desc, "instantiate", return_value=mock_prompter):
-            from vane.ai.functions import _PromptBatch
-
-            batch = _PromptBatch(desc, "text", "response")
-            table = pa.table({"text": ["hi", "hey"]})
-            result = _drive(batch, table)
-
-        mock_prompter.prompt_batch.assert_called_once_with(["hi", "hey"])
-        assert result.column("response").to_pylist() == ["Hello!", "World!"]
-
-    def test_prompter_rejects_multimodal_parts(self):
-        """The native vLLM adapter must not silently discard image parts."""
-        import asyncio
-
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        prompter = VLLMPrompter(model="test")
-
-        with pytest.raises(ValueError, match="multimodal prompt parts are not supported"):
-            asyncio.run(prompter.prompt(("Describe this", b"\x89PNG\r\n\x1a\n")))
-
-    def test_system_message_formatting(self):
-        """VLLMPrompter prepends system message to prompts."""
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        prompter = VLLMPrompter(
-            model="test",
-            system_message="Be brief.",
-        )
-        assert prompter._format_prompt("Hello") == "Be brief.\n\nHello"
-
-    def test_no_system_message(self):
-        """VLLMPrompter passes through prompts when no system_message."""
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        prompter = VLLMPrompter(model="test")
-        assert prompter._format_prompt("Hello") == "Hello"
-
-    def test_prompter_uses_background_executor_for_sync_actor_calls(self, monkeypatch):
-        """The synchronous prompter must not reuse the enclosing Ray actor loop."""
-        import duckdb.execution.vllm as vllm_executor
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        captured = {}
-        sentinel = object()
-
-        def fake_build_executor(model, options):
-            captured.update(model=model, options=options)
-            return sentinel
-
-        monkeypatch.setattr(vllm_executor, "build_executor", fake_build_executor)
-        prompter = VLLMPrompter(model="test", vllm_options={"use_threading": False})
-
-        assert prompter._ensure_executor() is sentinel
-        assert captured["model"] == "test"
-        assert captured["options"]["use_threading"] is True
-        assert captured["options"]["_force_background_thread"] is True
-
-    def test_local_executor_can_force_background_loop_inside_ray_actor(self, monkeypatch):
-        """Sync actor wrappers need a loop thread even when Ray reports actor context."""
-        import sys
-        import types
-
-        import duckdb.execution.vllm as vllm_executor
-
-        fake_vllm = types.ModuleType("vllm")
-
-        class SamplingParams:
-            pass
-
-        fake_vllm.SamplingParams = SamplingParams
-        monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
-        monkeypatch.setattr(vllm_executor.LocalVLLMExecutor, "_detect_ray_actor", staticmethod(lambda: True))
-
-        def fake_run_event_loop(executor):
-            executor.loop = object()
-            executor.loop_ready.set()
-
-        monkeypatch.setattr(vllm_executor.LocalVLLMExecutor, "_run_event_loop", fake_run_event_loop)
-
-        executor = vllm_executor.LocalVLLMExecutor(
-            "test-model",
-            {},
-            {},
-            force_background_thread=True,
-        )
-
-        assert executor._ray_actor_mode is False
-        assert executor.loop_ready.is_set()
-
-    def test_prompt_batch_errors_when_wait_returns_without_result(self):
-        """VLLMPrompter treats an empty wait wakeup as an executor contract error."""
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        class EmptyWakeupExecutor:
-            def __init__(self):
-                self.wait_calls = 0
-
-            def submit(self, _prefix, _prompts, _rows):
-                pass
-
-            def finished_submitting(self):
-                pass
-
-            def take_ready_result(self):
-                return None
-
-            def all_tasks_finished(self):
-                return False
-
-            def wait_for_result(self):
-                self.wait_calls += 1
-
-        prompter = VLLMPrompter(model="test")
-        executor = EmptyWakeupExecutor()
-        prompter._executor = executor
-
-        with pytest.raises(RuntimeError, match="wait_for_result returned without a ready result"):
-            prompter.prompt_batch(["a", "b"])
-        assert executor.wait_calls == 1
-
-
-# ---------------------------------------------------------------------------
-# vLLM Structured Output tests
-# ---------------------------------------------------------------------------
+        assert NativeVLLMPromptPlan is VLLMPrompterDescriptor
+        assert isinstance(plan, NativePrompterPlan)
+        assert not isinstance(plan, PrompterDescriptor)
+        assert not hasattr(plan, "instantiate")
 
 
 class TestVLLMStructuredOutput:
-    """Tests for vLLM provider structured output via guided decoding."""
+    """Tests for native vLLM structured-output configuration."""
 
     def test_json_schema_from_pydantic(self):
-        """_json_schema_from_return_format extracts schema from Pydantic model."""
-        from pydantic import BaseModel
+        BaseModel = pytest.importorskip("pydantic").BaseModel
 
         from vane.ai.providers.vllm import _json_schema_from_return_format
 
@@ -515,80 +370,32 @@ class TestVLLMStructuredOutput:
             age: int
 
         schema = _json_schema_from_return_format(Person)
+
         assert schema["type"] == "object"
-        assert "name" in schema["properties"]
-        assert "age" in schema["properties"]
+        assert {"name", "age"} <= schema["properties"].keys()
 
     def test_json_schema_from_dict(self):
-        """_json_schema_from_return_format passes dicts through."""
         from vane.ai.providers.vllm import _json_schema_from_return_format
 
         schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
+
         assert _json_schema_from_return_format(schema) is schema
 
     def test_json_schema_from_none(self):
-        """_json_schema_from_return_format returns empty dict for None."""
         from vane.ai.providers.vllm import _json_schema_from_return_format
 
         assert _json_schema_from_return_format(None) == {}
 
     def test_json_schema_bad_type(self):
-        """_json_schema_from_return_format raises for unsupported types."""
         from vane.ai.providers.vllm import _json_schema_from_return_format
 
         with pytest.raises(TypeError, match="return_format must be"):
             _json_schema_from_return_format("bad")
 
-    def test_parse_structured_output_pydantic(self):
-        """_parse_structured_output validates JSON into Pydantic model."""
-        from pydantic import BaseModel
-
-        from vane.ai.providers.vllm import _parse_structured_output
-
-        class Person(BaseModel):
-            name: str
-            age: int
-
-        result = _parse_structured_output('{"name": "Alice", "age": 30}', Person)
-        assert isinstance(result, Person)
-        assert result.name == "Alice"
-        assert result.age == 30
-
-    def test_parse_structured_output_dict_schema(self):
-        """_parse_structured_output returns dict when schema is a dict."""
-        from vane.ai.providers.vllm import _parse_structured_output
-
-        schema = {"type": "object"}
-        result = _parse_structured_output('{"x": 1}', schema)
-        assert result == {"x": 1}
-
-    def test_parse_structured_output_none(self):
-        """_parse_structured_output returns None for None input."""
-        from vane.ai.providers.vllm import _parse_structured_output
-
-        assert _parse_structured_output(None, {"type": "object"}) is None
-
-    def test_descriptor_with_return_format(self):
-        """VLLMPrompterDescriptor stores return_format."""
-        from pydantic import BaseModel
-
-        from vane.ai.providers.vllm import VLLMPrompterDescriptor
-
-        class Item(BaseModel):
-            label: str
-
-        desc = VLLMPrompterDescriptor(
-            model_name="test-model",
-            return_format=Item,
-        )
-        assert desc.return_format is Item
-
-    def test_descriptor_pickle_with_return_format(self):
-        """VLLMPrompterDescriptor with return_format survives pickle."""
-        import pickle
-
+    def test_descriptor_with_return_format_survives_pickle(self):
         import cloudpickle
-        from pydantic import BaseModel
+
+        BaseModel = pytest.importorskip("pydantic").BaseModel
 
         from vane.ai.providers.vllm import VLLMPrompterDescriptor
 
@@ -596,126 +403,31 @@ class TestVLLMStructuredOutput:
             value: float
             label: str
 
-        desc = VLLMPrompterDescriptor(
+        descriptor = VLLMPrompterDescriptor(
             model_name="test-model",
             return_format=Score,
         )
-        restored = pickle.loads(cloudpickle.dumps(desc))
-        assert restored.return_format is not None
+
+        restored = pickle.loads(cloudpickle.dumps(descriptor))
+
         assert restored.model_name == "test-model"
-        # Validate the restored return_format still works
-        obj = restored.return_format(value=1.0, label="test")
-        assert obj.value == 1.0
+        assert restored.return_format(value=1.0, label="test").value == 1.0
 
-    def test_provider_get_prompter_with_return_format(self):
-        """VLLMProvider.get_prompter forwards return_format."""
-        from pydantic import BaseModel
-
-        from vane.ai.providers.vllm import VLLMPrompterDescriptor, VLLMProvider
-
-        class Output(BaseModel):
-            text: str
-
-        provider = VLLMProvider()
-        desc = provider.get_prompter(
-            model="test-model",
-            return_format=Output,
-        )
-        assert isinstance(desc, VLLMPrompterDescriptor)
-        assert desc.return_format is Output
-
-    def test_prompter_injects_structured_output(self):
-        """VLLMPrompter injects structured output config into sampling_params."""
-        from pydantic import BaseModel
-
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        class Entity(BaseModel):
-            name: str
-            kind: str
-
-        prompter = VLLMPrompter(
-            model="test-model",
-            return_format=Entity,
-            vllm_options={"generate_args": {"sampling_params": {"max_tokens": 100}}},
-        )
-        sp = prompter._options["generate_args"]["sampling_params"]
-        schema = sp["structured_outputs"]["value"]
-        assert schema["type"] == "object"
-        assert "name" in schema["properties"]
-        assert "guided_json" not in sp
-        assert sp["max_tokens"] == 100
-
-    def test_prompter_injects_structured_output_empty_options(self):
-        """VLLMPrompter creates generate_args/sampling_params if absent."""
-        from pydantic import BaseModel
-
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        class Tag(BaseModel):
-            value: str
-
-        prompter = VLLMPrompter(
-            model="test-model",
-            return_format=Tag,
-        )
-        sp = prompter._options["generate_args"]["sampling_params"]
-        assert "structured_outputs" in sp
-        assert "guided_json" not in sp
-
-    def test_prompter_no_return_format_no_structured_output(self):
-        """VLLMPrompter without return_format does not inject structured output."""
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        prompter = VLLMPrompter(model="test-model")
-        gen_args = prompter._options.get("generate_args", {})
-        sp = gen_args.get("sampling_params", {})
-        if isinstance(sp, dict):
-            assert "guided_json" not in sp
-            assert "structured_outputs" not in sp
-
-    def test_maybe_parse_with_return_format(self):
-        """_maybe_parse parses JSON when return_format is set."""
-        from pydantic import BaseModel
-
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        class Item(BaseModel):
-            x: int
-
-        prompter = VLLMPrompter(model="test", return_format=Item)
-        result = prompter._maybe_parse('{"x": 42}')
-        assert isinstance(result, Item)
-        assert result.x == 42
-
-    def test_maybe_parse_without_return_format(self):
-        """_maybe_parse returns raw text when no return_format."""
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        prompter = VLLMPrompter(model="test")
-        assert prompter._maybe_parse("hello") == "hello"
-
-    def test_maybe_parse_none(self):
-        """_maybe_parse returns None for None input."""
-        from pydantic import BaseModel
-
-        from vane.ai.providers.vllm import VLLMPrompter
-
-        class Item(BaseModel):
-            x: int
-
-        prompter = VLLMPrompter(model="test", return_format=Item)
-        assert prompter._maybe_parse(None) is None
-
-    def test_dict_schema_structured_output(self):
-        """VLLMPrompter accepts raw dict schema for structured output."""
-        from vane.ai.providers.vllm import VLLMPrompter
+    def test_descriptor_injects_schema_into_native_sampling_params(self):
+        from vane.ai.providers.vllm import VLLMPrompterDescriptor
 
         schema = {"type": "object", "properties": {"n": {"type": "number"}}}
-        prompter = VLLMPrompter(model="test", return_format=schema)
-        sp = prompter._options["generate_args"]["sampling_params"]
-        assert sp["structured_outputs"]["value"] == schema
-        assert "guided_json" not in sp
+        descriptor = VLLMPrompterDescriptor(
+            model_name="test-model",
+            return_format=schema,
+            vllm_options={"generate_args": {"sampling_params": {"max_tokens": 100}}},
+        )
+
+        sampling_params = descriptor.build_physical_vllm_options()["generate_args"]["sampling_params"]
+
+        assert sampling_params["max_tokens"] == 100
+        assert sampling_params["structured_outputs"] == {"type": "json", "value": schema}
+        assert "guided_json" not in sampling_params
 
 
 class TestUDFExecutionOptions:
@@ -742,7 +454,12 @@ class TestUDFExecutionOptions:
 
         assert OpenAITextEmbedderDescriptor(embed_options={"num_gpus": 1}).get_udf_options().num_gpus == 1
         assert OpenAIPrompterDescriptor(prompt_options={"num_gpus": 2}).get_udf_options().num_gpus == 2
-        assert AnthropicPrompterDescriptor(prompt_options={"num_gpus": 3}).get_udf_options().num_gpus == 3
+        assert (
+            AnthropicPrompterDescriptor(model_name="claude-test-model", prompt_options={"num_gpus": 3})
+            .get_udf_options()
+            .num_gpus
+            == 3
+        )
         assert (
             GoogleTextEmbedderDescriptor(model_name="gemini-embedding-001", embed_options={"num_gpus": 4})
             .get_udf_options()
@@ -979,7 +696,7 @@ class TestAnthropicProvider:
         """Anthropic descriptor produces correct UDFOptions."""
         from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 
-        desc = AnthropicPrompterDescriptor()
+        desc = AnthropicPrompterDescriptor(model_name="claude-test-model")
         opts = desc.get_udf_options()
         assert opts.max_api_concurrency == 16
 
@@ -1007,6 +724,7 @@ class TestAnthropicProvider:
 
         provider = AnthropicProvider(api_key="ctor-key", base_url="https://ctor.example")
         desc = provider.get_prompter(
+            model="claude-test-model",
             api_key="call-key",
             base_url="https://call.example",
             timeout=30,
@@ -1024,6 +742,74 @@ class TestAnthropicProvider:
         assert "base_url" not in desc.prompt_options
         assert desc.prompt_options["max_api_concurrency"] == 6
         assert desc.prompt_options["temperature"] == 0
+
+    def test_descriptor_requires_model_name(self):
+        """AnthropicPrompterDescriptor.model_name is required."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(TypeError):
+            AnthropicPrompterDescriptor()
+
+    def test_get_prompter_without_model_raises(self):
+        """Missing model fails fast, naming both fix paths."""
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        provider = AnthropicProvider(api_key="test-key")
+        with pytest.raises(ValueError, match="No prompt model configured") as excinfo:
+            provider.get_prompter()
+        message = str(excinfo.value)
+        assert "model=" in message
+        assert "AnthropicProvider(prompt_model=" in message
+
+    def test_provider_prompt_model_flows_through(self):
+        """Provider-level prompt_model configures the descriptor model."""
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        provider = AnthropicProvider(api_key="test-key", prompt_model="claude-config-model")
+        desc = provider.get_prompter()
+        assert desc.model_name == "claude-config-model"
+        # prompt_model is provider-level config, never a request option.
+        assert "prompt_model" not in desc.prompt_options
+        assert "prompt_model" not in desc.provider_options
+
+    def test_call_model_overrides_provider_prompt_model(self):
+        """Call-site model beats provider-level prompt_model."""
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        provider = AnthropicProvider(api_key="test-key", prompt_model="claude-config-model")
+        desc = provider.get_prompter(model="claude-call-model")
+        assert desc.model_name == "claude-call-model"
+
+    @pytest.mark.parametrize("model", ["", "   "])
+    def test_blank_call_model_rejected(self, model):
+        """A blank call-site model is an error, not a provider-config fallback."""
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        provider = AnthropicProvider(api_key="test-key", prompt_model="claude-config-model")
+        with pytest.raises(ValueError, match="non-empty string"):
+            provider.get_prompter(model=model)
+
+    def test_blank_provider_prompt_model_rejected(self):
+        """A blank provider-level prompt_model fails at expression-build time."""
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        provider = AnthropicProvider(api_key="test-key", prompt_model="")
+        with pytest.raises(ValueError, match="non-empty string"):
+            provider.get_prompter()
+
+    def test_ctor_prompt_model_is_keyword_only(self):
+        """prompt_model must be passed by name; positional use is a TypeError."""
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        with pytest.raises(TypeError):
+            AnthropicProvider("anthropic", "claude-config-model")
+
+    def test_ctor_typo_is_a_type_error(self):
+        """A misspelled ctor kwarg raises immediately instead of leaking into request options."""
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        with pytest.raises(TypeError):
+            AnthropicProvider(api_key="test-key", promt_model="claude-config-model")
 
 
 # ---------------------------------------------------------------------------
@@ -1464,6 +1250,366 @@ class TestGoogleEmbeddingRowPreservation:
             asyncio.run(embedder.embed_text(["first row", "second row"]))
 
 
+class TestGoogleEmbeddingBatching:
+    """Tests for Google embedding request chunking under the API batch cap."""
+
+    def _recording_embedder(self, model, dimensions=None, options=None):
+        """Build a GoogleTextEmbedder around a recording embed_content mock.
+
+        The fake response derives each embedding value from the input text
+        (``"txt-<n>"`` embeds to ``[float(n)]``), so result order can be
+        asserted independently of request order.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.providers.google import GoogleTextEmbedder
+
+        calls: list[dict] = []
+
+        async def fake_embed_content(**kwargs):
+            calls.append(kwargs)
+            response = MagicMock()
+            response.embeddings = []
+            for item in kwargs["contents"]:
+                embedding = MagicMock()
+                embedding.values = [float(item.parts[0].text.rsplit("-", 1)[1])]
+                response.embeddings.append(embedding)
+            return response
+
+        embedder = GoogleTextEmbedder.__new__(GoogleTextEmbedder)
+        embedder._client = MagicMock()
+        embedder._client.aio.models.embed_content = AsyncMock(side_effect=fake_embed_content)
+        embedder._model = model
+        embedder._dimensions = dimensions
+        embedder._options = dict(options or {})
+        return embedder, calls
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_oversized_batch_chunked_under_cap(self):
+        """250 inputs become 3 requests of <=100, concatenated in order."""
+        import asyncio
+
+        embedder, calls = self._recording_embedder("gemini-embedding-001")
+        texts = [f"txt-{i}" for i in range(250)]
+
+        result = asyncio.run(embedder.embed_text(texts))
+
+        assert [len(call["contents"]) for call in calls] == [100, 100, 50]
+        assert all(call["model"] == "gemini-embedding-001" for call in calls)
+        # Chunks cover the inputs in order without overlap.
+        sent = [item.parts[0].text for call in calls for item in call["contents"]]
+        assert sent == texts
+        # One embedding per input row, in input order.
+        assert len(result) == len(texts)
+        assert [e[0] for e in result] == [float(i) for i in range(250)]
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    @pytest.mark.parametrize("count", [1, 100])
+    def test_batch_at_or_under_cap_is_single_request(self, count):
+        """Batches within the cap go out as one request."""
+        import asyncio
+
+        embedder, calls = self._recording_embedder("gemini-embedding-001")
+        texts = [f"txt-{i}" for i in range(count)]
+
+        result = asyncio.run(embedder.embed_text(texts))
+
+        assert len(calls) == 1
+        assert len(calls[0]["contents"]) == count
+        assert len(result) == count
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_empty_batch_makes_no_requests(self):
+        import asyncio
+
+        embedder, calls = self._recording_embedder("gemini-embedding-001")
+
+        result = asyncio.run(embedder.embed_text([]))
+
+        assert calls == []
+        assert result == []
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_aggregating_model_batches_via_separate_contents(self):
+        """gemini-embedding-2 aggregates multiple direct string inputs, so
+        each input travels as its own Content and full-size chunks stay
+        row-preserving without falling back to one request per input."""
+        import asyncio
+
+        embedder, calls = self._recording_embedder("gemini-embedding-2")
+        texts = ["txt-0", "txt-1", "txt-2"]
+
+        result = asyncio.run(embedder.embed_text(texts))
+
+        assert len(calls) == 1
+        assert [item.parts[0].text for item in calls[0]["contents"]] == texts
+        assert len(result) == len(texts)
+        assert [e[0] for e in result] == [0.0, 1.0, 2.0]
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_result_count_mismatch_raises(self):
+        """A model that does not embed inputs individually is rejected."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.providers.google import GoogleTextEmbedder
+
+        async def aggregate_embed_content(**kwargs):
+            response = MagicMock()
+            embedding = MagicMock()
+            embedding.values = [1.0]
+            response.embeddings = [embedding]  # one embedding for N inputs
+            return response
+
+        embedder = GoogleTextEmbedder.__new__(GoogleTextEmbedder)
+        embedder._client = MagicMock()
+        embedder._client.aio.models.embed_content = AsyncMock(side_effect=aggregate_embed_content)
+        embedder._model = "custom-aggregating-embedder"
+        embedder._dimensions = None
+        embedder._options = {}
+
+        with pytest.raises(ValueError, match="returned 1 embeddings for 3 inputs"):
+            asyncio.run(embedder.embed_text(["a", "b", "c"]))
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_config_forwarded_to_every_chunk(self):
+        """Dimensions and request options reach each chunked request."""
+        import asyncio
+
+        embedder, calls = self._recording_embedder(
+            "gemini-embedding-001",
+            dimensions=256,
+            options={"task_type": "RETRIEVAL_QUERY"},
+        )
+        texts = [f"txt-{i}" for i in range(150)]
+
+        asyncio.run(embedder.embed_text(texts))
+
+        assert len(calls) == 2
+        for call in calls:
+            assert call["config"]["output_dimensionality"] == 256
+            assert call["config"]["task_type"] == "RETRIEVAL_QUERY"
+
+    def test_udf_batch_size_defaults_to_request_cap(self):
+        """The descriptor's UDF batch size defaults to the per-request cap."""
+        from vane.ai.providers.google import GoogleTextEmbedderDescriptor
+
+        desc = GoogleTextEmbedderDescriptor(model_name="gemini-embedding-001")
+        assert desc.get_udf_options().batch_size == 100
+
+    def test_udf_batch_size_cap_applies_to_aggregating_model(self):
+        """Per-Content encoding keeps gemini-embedding-2 row-preserving at
+        full chunk size, so it gets the same default cap as other models."""
+        from vane.ai.providers.google import GoogleTextEmbedderDescriptor
+
+        desc = GoogleTextEmbedderDescriptor(model_name="gemini-embedding-2")
+        assert desc.get_udf_options().batch_size == 100
+
+    def test_udf_batch_size_explicit_override(self):
+        from vane.ai.providers.google import GoogleTextEmbedderDescriptor
+
+        desc = GoogleTextEmbedderDescriptor(
+            model_name="gemini-embedding-001",
+            embed_options={"batch_size": 25},
+        )
+        assert desc.get_udf_options().batch_size == 25
+
+
+class TestGoogleConversationStructure:
+    """Recording-client structural tests for Google role handling.
+
+    Asserts the exact ``Content`` / ``system_instruction`` structures the
+    prompter sends to ``generate_content``.
+    """
+
+    def _recording_prompter(self, system_message=None):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from vane.ai.providers.google import GooglePrompter
+
+        with patch("google.genai.Client"):
+            prompter = GooglePrompter(
+                provider_options={"api_key": "test"},
+                model="gemini-2.5-pro",
+                system_message=system_message,
+            )
+
+        calls: list[dict] = []
+        response = MagicMock()
+        response.text = "ok"
+        response.usage_metadata = None
+
+        async def fake_generate_content(**kwargs):
+            calls.append(kwargs)
+            return response
+
+        client = MagicMock()
+        client.aio.models.generate_content = AsyncMock(side_effect=fake_generate_content)
+        prompter._client = client
+        return prompter, calls
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_system_plus_user_string(self):
+        """Descriptor system_message routes through system_instruction."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter(system_message="Be helpful.")
+
+        result = asyncio.run(prompter.prompt(("hello",)))
+
+        assert result == "ok"
+        assert len(calls) == 1
+        assert calls[0]["model"] == "gemini-2.5-pro"
+        contents = calls[0]["contents"]
+        assert len(contents) == 1
+        assert contents[0].role == "user"
+        assert [part.text for part in contents[0].parts] == ["hello"]
+        assert calls[0]["config"].system_instruction == "Be helpful."
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_plain_string_prompt_regression(self):
+        """A plain-string prompt stays a single user turn with no config."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+
+        asyncio.run(prompter.prompt(("hello",)))
+
+        contents = calls[0]["contents"]
+        assert [content.role for content in contents] == ["user"]
+        assert [part.text for part in contents[0].parts] == ["hello"]
+        assert calls[0]["config"] is None
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_alternating_turns_preserved_in_order(self):
+        """Role-tagged dicts become ordered user/model Content turns."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+
+        asyncio.run(
+            prompter.prompt(
+                (
+                    {"role": "user", "content": "q1"},
+                    {"role": "assistant", "content": "a1"},
+                    {"role": "user", "content": "q2"},
+                )
+            )
+        )
+
+        contents = calls[0]["contents"]
+        assert [content.role for content in contents] == ["user", "model", "user"]
+        assert [content.parts[0].text for content in contents] == ["q1", "a1", "q2"]
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_system_messages_combined_in_declaration_order(self):
+        """system dicts merge with the descriptor system_message, in order,
+        and never appear as conversation turns."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter(system_message="A.")
+
+        asyncio.run(
+            prompter.prompt(
+                (
+                    {"role": "system", "content": "B."},
+                    {"role": "user", "content": "hi"},
+                )
+            )
+        )
+
+        assert calls[0]["config"].system_instruction == "A.\n\nB."
+        contents = calls[0]["contents"]
+        assert [content.role for content in contents] == ["user"]
+        assert contents[0].parts[0].text == "hi"
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    @pytest.mark.parametrize("role", ["tool", "function", "assistantt"])
+    def test_unsupported_role_raises(self, role):
+        """Unknown roles fail fast instead of degrading into user text."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+
+        with pytest.raises(ValueError, match=f"Unsupported message role '{role}'"):
+            asyncio.run(prompter.prompt(({"role": role, "content": "x"},)))
+        assert calls == []
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_mixed_text_image_parts_preserved_in_order(self):
+        """Structured part lists convert per-part, in order."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 10
+
+        asyncio.run(prompter.prompt(({"role": "user", "content": ["look", png]},)))
+
+        contents = calls[0]["contents"]
+        assert len(contents) == 1
+        assert contents[0].role == "user"
+        parts = contents[0].parts
+        assert len(parts) == 2
+        assert parts[0].text == "look"
+        assert parts[1].inline_data.mime_type == "image/png"
+        assert parts[1].inline_data.data == png
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_untagged_parts_group_into_user_turns_between_role_dicts(self):
+        """Loose parts flush into user turns around role-tagged messages."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+
+        asyncio.run(
+            prompter.prompt(
+                (
+                    "intro",
+                    {"role": "assistant", "content": "a"},
+                    "next",
+                )
+            )
+        )
+
+        contents = calls[0]["contents"]
+        assert [content.role for content in contents] == ["user", "model", "user"]
+        assert [content.parts[0].text for content in contents] == ["intro", "a", "next"]
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_dict_text_content_part_converts_without_repr(self):
+        """OpenAI-style text part dicts become real text parts."""
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+
+        asyncio.run(prompter.prompt(({"role": "user", "content": [{"type": "text", "text": "hi"}]},)))
+
+        parts = calls[0]["contents"][0].parts
+        assert [part.text for part in parts] == ["hi"]
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_unsupported_dict_content_part_raises(self):
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+
+        with pytest.raises(ValueError, match="Unsupported dict content part"):
+            asyncio.run(
+                prompter.prompt(({"role": "user", "content": [{"type": "image_url", "image_url": {"url": "u"}}]},))
+            )
+        assert calls == []
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_non_string_system_content_raises(self):
+        import asyncio
+
+        prompter, calls = self._recording_prompter()
+
+        with pytest.raises(ValueError, match="system messages must be plain text"):
+            asyncio.run(prompter.prompt(({"role": "system", "content": ["a", "b"]},)))
+        assert calls == []
+
+
 # ---------------------------------------------------------------------------
 # Anthropic Structured Output + Multimodal tests
 # ---------------------------------------------------------------------------
@@ -1475,19 +1621,19 @@ class TestAnthropicStructuredOutput:
     def test_descriptor_has_return_format(self):
         from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 
-        desc = AnthropicPrompterDescriptor(return_format=dict)
+        desc = AnthropicPrompterDescriptor(model_name="claude-test-model", return_format=dict)
         assert desc.return_format is dict
 
     def test_descriptor_default_no_return_format(self):
         from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 
-        desc = AnthropicPrompterDescriptor()
+        desc = AnthropicPrompterDescriptor(model_name="claude-test-model")
         assert desc.return_format is None
 
     def test_descriptor_pickle_with_return_format(self):
         from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 
-        desc = AnthropicPrompterDescriptor(return_format=dict)
+        desc = AnthropicPrompterDescriptor(model_name="claude-test-model", return_format=dict)
         restored = pickle.loads(pickle.dumps(desc))
         assert restored.return_format is dict
 
@@ -1495,7 +1641,7 @@ class TestAnthropicStructuredOutput:
         from vane.ai.providers.anthropic import AnthropicProvider
 
         prov = AnthropicProvider(api_key="test")
-        desc = prov.get_prompter(return_format=dict)
+        desc = prov.get_prompter(model="claude-test-model", return_format=dict)
         assert desc.return_format is dict
 
     @pytest.mark.skipif(not _has_module("anthropic"), reason="anthropic not installed")
@@ -1545,8 +1691,13 @@ class TestAnthropicStructuredOutput:
         tool_block.type = "tool_use"
         tool_block.input = {"name": "Alice", "age": 30}
 
+        mock_usage = MagicMock()
+        mock_usage.input_tokens = 12
+        mock_usage.output_tokens = 7
+
         mock_response = MagicMock()
         mock_response.content = [tool_block]
+        mock_response.usage = mock_usage
 
         async def mock_create(**kwargs):
             assert "tools" in kwargs
@@ -1570,9 +1721,16 @@ class TestAnthropicStructuredOutput:
         )
 
         text_block = MagicMock()
+        text_block.type = "text"
         text_block.text = "Hello world"
+
+        mock_usage = MagicMock()
+        mock_usage.input_tokens = 8
+        mock_usage.output_tokens = 3
+
         mock_response = MagicMock()
         mock_response.content = [text_block]
+        mock_response.usage = mock_usage
 
         async def mock_create(**kwargs):
             assert "tools" not in kwargs
@@ -1674,9 +1832,16 @@ class TestAnthropicMultimodal:
 
         captured_messages = []
         text_block = MagicMock()
+        text_block.type = "text"
         text_block.text = "I see an image"
+
+        mock_usage = MagicMock()
+        mock_usage.input_tokens = 25
+        mock_usage.output_tokens = 6
+
         mock_response = MagicMock()
         mock_response.content = [text_block]
+        mock_response.usage = mock_usage
 
         async def mock_create(**kwargs):
             captured_messages.append(kwargs["messages"])
@@ -1707,9 +1872,16 @@ class TestAnthropicMultimodal:
 
         captured_messages = []
         text_block = MagicMock()
+        text_block.type = "text"
         text_block.text = "ok"
+
+        mock_usage = MagicMock()
+        mock_usage.input_tokens = 15
+        mock_usage.output_tokens = 2
+
         mock_response = MagicMock()
         mock_response.content = [text_block]
+        mock_response.usage = mock_usage
 
         async def mock_create(**kwargs):
             captured_messages.append(kwargs["messages"])

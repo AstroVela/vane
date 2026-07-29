@@ -354,6 +354,41 @@ def test_client_owner_lease_settings_accept_one_third_heartbeat_interval(
     assert driver._client_owner_lease_settings() == (30.0, 10.0)
 
 
+@pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "invalid"])
+def test_copy_reconciliation_timeout_rejects_unsafe_values(monkeypatch, raw):
+    monkeypatch.setenv("VANE_RAY_COPY_RECONCILIATION_TIMEOUT_S", raw)
+
+    with pytest.raises(ValueError):
+        driver._copy_reconciliation_timeout_s()
+
+
+def test_copy_reconciliation_timeout_reads_environment(monkeypatch):
+    monkeypatch.setenv("VANE_RAY_COPY_RECONCILIATION_TIMEOUT_S", "0.25")
+
+    assert driver._copy_reconciliation_timeout_s() == 0.25
+
+
+def test_invalid_copy_reconciliation_timeout_prevents_write_submission(monkeypatch):
+    calls = []
+
+    class _RemoteMethod:
+        @staticmethod
+        def remote(*args):
+            calls.append(args)
+            return object()
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = SimpleNamespace(run_copy_plan=_RemoteMethod())
+    monkeypatch.setenv("VANE_RAY_COPY_RECONCILIATION_TIMEOUT_S", "0")
+
+    with pytest.raises(ValueError, match="VANE_RAY_COPY_RECONCILIATION_TIMEOUT_S"):
+        client.run_copy_plan(_FakePhysicalPlanWithoutPlanAttr("invalid-reconciliation-timeout"))
+
+    assert calls == []
+
+
 def test_driver_constructor_scrubs_inherited_session_environment(monkeypatch):
     cls = driver.RayQueryDriverActor.__ray_metadata__.modified_class
     monkeypatch.setenv("AWS_ISSUE75_INHERITED_SECRET", "inherited-aws")
@@ -1183,6 +1218,65 @@ def test_query_driver_unknown_copy_recovery_never_submits_a_write():
     assert error.value.operation_id == "unknown-copy-operation"
 
 
+def test_query_driver_copy_recovery_timeout_preserves_inflight_write(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    operation_id = "copy-recovery-timeout"
+    outcome = driver.CopyPlanOutcome(
+        operation_id=operation_id,
+        result=_committed_copy_result(rows_copied=17),
+        final_progress_snapshot={"state": "FINISHED"},
+    )
+    monkeypatch.setenv("VANE_RAY_COPY_RECONCILIATION_TIMEOUT_S", "0.01")
+
+    async def _exercise():
+        cls._ensure_copy_operation_state(runner)
+        release = asyncio.Event()
+
+        async def _finish_copy():
+            await release.wait()
+            return outcome
+
+        operation_task = asyncio.create_task(_finish_copy())
+        runner._copy_operation_identities[operation_id] = (
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+        )
+        runner._copy_operations_inflight[operation_id] = driver._CopyOperationInFlight(
+            owner_id=_TEST_RUNTIME_OWNER_ID,
+            session_id=_TEST_SESSION_ID,
+            task=operation_task,
+        )
+        try:
+            with pytest.raises(driver.CopyOutcomeUnknownError, match=operation_id) as error:
+                await cls.recover_copy_plan(
+                    runner,
+                    _TEST_RUNTIME_OWNER_ID,
+                    _TEST_SESSION_ID,
+                    operation_id,
+                )
+
+            assert error.value.operation_id == operation_id
+            assert operation_task.done() is False
+            assert operation_task.cancelled() is False
+
+            release.set()
+            await operation_task
+            recovered = await cls.recover_copy_plan(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                operation_id,
+            )
+            assert recovered.outcome == outcome
+            assert recovered.error is None
+        finally:
+            release.set()
+            if not operation_task.done():
+                await operation_task
+
+    asyncio.run(_exercise())
+
+
 def test_copy_outcome_unknown_error_preserves_operation_id_across_serialization():
     error = driver.CopyOutcomeUnknownError("unknown-copy-operation")
 
@@ -1726,6 +1820,7 @@ def test_ray_query_driver_client_recovers_ambiguous_copy_without_resubmission(mo
             outcome=outcome,
         )
 
+    monkeypatch.setenv("VANE_RAY_COPY_RECONCILIATION_TIMEOUT_S", "30")
     monkeypatch.setattr(driver, "progress_enabled", lambda: False)
     monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
     monkeypatch.setattr(
@@ -1759,7 +1854,90 @@ def test_ray_query_driver_client_recovers_ambiguous_copy_without_resubmission(mo
         (
             recovery_ref,
             {
+                "timeout": 30.0,
                 "honor_query_deadline": False,
+                "honor_object_get_timeout": False,
+            },
+        ),
+    ]
+
+
+def test_ray_query_driver_client_bounds_pending_copy_recovery_without_resubmission(monkeypatch):
+    copy_future = object()
+    recovery_future = object()
+    plan = _FakePhysicalPlanWithoutPlanAttr("copy-pending-recovery")
+    resolutions = []
+    recovery_waits = 0
+
+    class _RemoteMethod:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def remote(self, *args):
+            self.calls.append(args)
+            return self.result
+
+    run_copy_plan = _RemoteMethod(copy_future)
+    recover_copy_plan = _RemoteMethod(recovery_future)
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = SimpleNamespace(
+        run_copy_plan=run_copy_plan,
+        recover_copy_plan=recover_copy_plan,
+    )
+
+    def _resolve(ref, **kwargs):
+        nonlocal recovery_waits
+        resolutions.append((ref, kwargs))
+        if ref is copy_future:
+            raise FutureTimeoutError("COPY response wait timed out")
+        assert ref is recovery_future
+        recovery_waits += 1
+        if recovery_waits == 1:
+            raise FutureTimeoutError("COPY recovery wait timed out")
+        raise PermissionError("recovery ObjectRef was waited more than once")
+
+    monkeypatch.setenv("VANE_RAY_COPY_RECONCILIATION_TIMEOUT_S", "0.25")
+    monkeypatch.setenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", "0")
+    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+    monkeypatch.setattr(
+        driver.ray,
+        "cancel",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ambiguous COPY recovery must not cancel the write")
+        ),
+    )
+
+    with pytest.raises(driver.CopyOutcomeUnknownError) as error:
+        client.run_copy_plan(plan)
+
+    assert error.value.operation_id == "copy-pending-recovery"
+    assert recovery_waits == 1
+    assert run_copy_plan.calls == [
+        (
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            plan,
+        )
+    ]
+    assert recover_copy_plan.calls == [
+        (
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            "copy-pending-recovery",
+        )
+    ]
+    assert resolutions == [
+        (copy_future, {}),
+        (
+            recovery_future,
+            {
+                "timeout": 0.25,
+                "honor_query_deadline": False,
+                "honor_object_get_timeout": False,
             },
         ),
     ]
@@ -2194,6 +2372,7 @@ def test_ray_query_driver_client_copy_failure_recovers_without_cancel_or_close(m
             error=RuntimeError("planned COPY failure"),
         )
 
+    monkeypatch.setenv("VANE_RAY_COPY_RECONCILIATION_TIMEOUT_S", "30")
     monkeypatch.setattr(driver, "progress_enabled", lambda: False)
     monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
     monkeypatch.setattr(driver.ray, "cancel", lambda ref, *, force: cancelled.append((ref, force)))
@@ -2208,7 +2387,9 @@ def test_ray_query_driver_client_copy_failure_recovers_without_cancel_or_close(m
         (
             recovery_future,
             {
+                "timeout": 30.0,
                 "honor_query_deadline": False,
+                "honor_object_get_timeout": False,
             },
         ),
     ]
@@ -3901,7 +4082,13 @@ def test_fte_output_publication_is_bounded_by_block_target_and_task_window():
 
 class _RequiredFteWorkerCallbacks:
     def fte_cancel_task(self, _task_id):
-        return {"state": "CANCELED"}
+        return {
+            "state": "CANCELED",
+            "failure": {
+                "error_code": "TASK_CANCELED",
+                "message": "task canceled",
+            },
+        }
 
     def mark_fte_worker_failed(self, _worker_id, _error):
         return []
@@ -3953,7 +4140,14 @@ class _FakeFteStatusWorker(_RequiredFteWorkerCallbacks):
 
     def fte_cancel_task(self, task_id):
         self.calls.append(("cancel", task_id))
-        self.status = {"state": "CANCELED", "task_id": task_id}
+        self.status = {
+            "state": "CANCELED",
+            "task_id": task_id,
+            "failure": {
+                "error_code": "TASK_CANCELED",
+                "message": "task canceled",
+            },
+        }
         return dict(self.status)
 
     def fte_ack_task_result(self, task_id):
@@ -4482,7 +4676,10 @@ def test_fte_worker_task_handle_does_not_publish_failed_status_event():
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
     worker.status = {
         "state": "FAILED",
-        "failure": {"message": "remote failed"},
+        "failure": {
+            "error_code": "GENERIC_INTERNAL_ERROR",
+            "message": "remote failed",
+        },
     }
     handle = driver.FteWorkerTaskHandle(task_id, worker)
 
@@ -4501,7 +4698,10 @@ def test_fte_worker_task_handle_does_not_adopt_retry_from_data_plane():
             return {
                 "state": "FAILED",
                 "task_id": task_id,
-                "failure": {"message": "retryable"},
+                "failure": {
+                    "error_code": "GENERIC_INTERNAL_ERROR",
+                    "message": "retryable",
+                },
                 "version": 1,
             }
 
@@ -4552,7 +4752,88 @@ def test_fte_worker_task_handle_malformed_status_fails_worker_and_records_termin
     assert handle.done() is True
     assert len(worker.worker_failures) == 1
     assert worker.worker_failures[0][0] == "worker-malformed-status"
-    assert "status protocol failed" in worker.worker_failures[0][1]
+    assert "status protocol failed" in str(worker.worker_failures[0][1])
+    assert worker.terminal_attempts == ["q.1.2.0"]
+
+
+def test_fte_worker_task_handle_preserves_ray_oom_type_when_publishing_worker_failure():
+    class _OomStatusWorker(_RequiredFteWorkerCallbacks):
+        worker_id = "worker-oom-status"
+
+        def __init__(self, error):
+            self.error = error
+            self.worker_failures = []
+            self.terminal_attempts = []
+
+        def fte_wait_task_status(self, _task_id, _min_version, _timeout_s):
+            raise self.error
+
+        def mark_fte_worker_failed(self, worker_id, error):
+            self.worker_failures.append((worker_id, error))
+            return []
+
+        def record_fte_task_terminal(self, task_id):
+            self.terminal_attempts.append(str(driver.FteTaskAttemptId.coerce(task_id)))
+
+    oom_error = driver.ray.exceptions.OutOfMemoryError("Ray killed the worker for memory pressure")
+    worker = _OomStatusWorker(oom_error)
+    handle = driver.FteWorkerTaskHandle(
+        {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
+        worker,
+    )
+
+    with pytest.raises(driver.ray.exceptions.OutOfMemoryError, match="memory pressure"):
+        asyncio.run(handle.get_result())
+
+    assert len(worker.worker_failures) == 1
+    worker_id, published_error = worker.worker_failures[0]
+    assert worker_id == "worker-oom-status"
+    assert "status wait failed" in str(published_error)
+    assert published_error.__cause__ is oom_error
+    from duckdb.runners.ray.fte_fragment_scheduler import _worker_failure_payload
+
+    assert _worker_failure_payload(worker_id, published_error)["error_code"] == "OUT_OF_MEMORY"
+    assert worker.terminal_attempts == ["q.1.2.0"]
+
+
+def test_fte_worker_task_handle_publishes_failure_with_unprintable_message():
+    class _UnprintableError(RuntimeError):
+        def __str__(self):
+            raise RuntimeError("exception message is unreadable")
+
+    class _StatusWorker(_RequiredFteWorkerCallbacks):
+        worker_id = "worker-unprintable-status"
+
+        def __init__(self, error):
+            self.error = error
+            self.worker_failures = []
+            self.terminal_attempts = []
+
+        def fte_wait_task_status(self, _task_id, _min_version, _timeout_s):
+            raise self.error
+
+        def mark_fte_worker_failed(self, worker_id, error):
+            self.worker_failures.append((worker_id, error))
+            return []
+
+        def record_fte_task_terminal(self, task_id):
+            self.terminal_attempts.append(str(driver.FteTaskAttemptId.coerce(task_id)))
+
+    failure = _UnprintableError()
+    worker = _StatusWorker(failure)
+    handle = driver.FteWorkerTaskHandle(
+        {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
+        worker,
+    )
+
+    with pytest.raises(_UnprintableError):
+        asyncio.run(handle.get_result())
+
+    assert len(worker.worker_failures) == 1
+    worker_id, published_error = worker.worker_failures[0]
+    assert worker_id == "worker-unprintable-status"
+    assert str(published_error).endswith("<unprintable _UnprintableError>")
+    assert published_error.__cause__ is failure
     assert worker.terminal_attempts == ["q.1.2.0"]
 
 
@@ -4820,7 +5101,13 @@ def test_fte_worker_task_handle_failed_status_raises_result_error():
     worker = _FakeFteStatusWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
     handle = driver.FteWorkerTaskHandle(task_id, worker)
-    worker.status = {"state": "FAILED", "failure": {"message": "boom"}}
+    worker.status = {
+        "state": "FAILED",
+        "failure": {
+            "error_code": "GENERIC_INTERNAL_ERROR",
+            "message": "boom",
+        },
+    }
 
     assert _wait_batch_ready(handle) == [0]
     with pytest.raises(RuntimeError, match="boom"):
@@ -5564,8 +5851,17 @@ def test_describe_native_progress_materializes_deferred_clone_without_execution(
     assert scan_pipeline["input_rows"] == 10
 
 
-def test_remote_exchange_sink_accepts_nested_query_id_without_result_collector(tmp_path, monkeypatch):
+def test_remote_exchange_sink_accepts_nested_query_id_without_result_collector(
+    tmp_path,
+    monkeypatch,
+    request,
+):
     import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    duckdb.ray_cxx.shutdown_local_flight_service()
+    request.addfinalizer(duckdb.ray_cxx.shutdown_local_flight_service)
+    monkeypatch.setenv("VANE_FLIGHT_BIND_HOST", "127.0.0.1")
+    monkeypatch.setenv("VANE_FLIGHT_ADVERTISE_HOST", "127.0.0.1")
 
     class _CapturingWorker:
         def __init__(self):
@@ -5650,6 +5946,10 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_result_collector(t
 
     assert sink_topologies
     assert len(sink_results) == len(sink_topologies)
+    assert all(result.flight_port > 0 for result in sink_results)
+    ordinary_result = runner.execute_native(con.cursor(), _make_test_physical_plan(con), None, None)
+    assert ordinary_result.flight_port == 0
+    assert ordinary_result.exchange_sink_instance is None
     assert all(
         "RESULT_COLLECTOR" not in pipeline["operators"]
         for topology in sink_topologies

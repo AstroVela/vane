@@ -32,25 +32,15 @@ struct VLLMBucketCompare {
 	}
 };
 
-static vector<string> GetPrompts(ExpressionExecutor &executor, DataChunk &input) {
-	Vector result(LogicalType::VARCHAR);
-	executor.ExecuteExpression(input, result);
-
-	UnifiedVectorFormat format;
-	result.ToUnifiedFormat(input.size(), format);
-	auto data = reinterpret_cast<string_t *>(format.data);
-
+struct VLLMPromptInput {
 	vector<string> prompts;
-	prompts.reserve(input.size());
-	for (idx_t i = 0; i < input.size(); i++) {
-		auto idx = format.sel->get_index(i);
-		if (!format.validity.RowIsValid(idx)) {
-			throw InvalidInputException("vllm prompt cannot be NULL");
-		}
-		prompts.push_back(data[idx].GetString());
-	}
-	return prompts;
-}
+	unique_ptr<DataChunk> rows;
+};
+
+struct BufferedVLLMInput {
+	unique_ptr<DataChunk> rows;
+	vector<string> prompts;
+};
 
 static idx_t CommonPrefixLength(const string &left, const string &right) {
 	const auto max_len = MinValue<idx_t>(left.size(), right.size());
@@ -93,10 +83,12 @@ static string ComputeBucketPrefix(const vector<string> &prompts, idx_t start, id
 	return first.substr(0, CompleteUTF8PrefixLength(first, prefix_len));
 }
 
-static unique_ptr<DataChunk> CopyChunk(ClientContext &context, DataChunk &input) {
+static unique_ptr<DataChunk> SliceChunk(ClientContext &context, DataChunk &input, const SelectionVector &selection,
+                                        idx_t count) {
 	auto copy = make_uniq<DataChunk>();
-	copy->Initialize(context, input.GetTypes(), input.size());
-	copy->Append(input, true);
+	copy->Initialize(context, input.GetTypes(), count);
+	copy->Slice(input, selection, count, 0);
+	copy->Flatten();
 	return copy;
 }
 
@@ -140,6 +132,45 @@ static unique_ptr<DataChunk> BuildOutputChunk(ExecutionContext &context, DataChu
 	auto output_ptr = make_uniq<DataChunk>();
 	output_ptr->Move(output);
 	return output_ptr;
+}
+
+static VLLMPromptInput EvaluatePrompts(ExecutionContext &context, ExpressionExecutor &executor, DataChunk &input,
+                                       std::deque<unique_ptr<DataChunk>> &pending_outputs) {
+	Vector result(LogicalType::VARCHAR);
+	executor.ExecuteExpression(input, result);
+
+	UnifiedVectorFormat format;
+	result.ToUnifiedFormat(input.size(), format);
+	auto data = reinterpret_cast<string_t *>(format.data);
+
+	SelectionVector valid_selection(input.size());
+	SelectionVector null_selection(input.size());
+	idx_t valid_count = 0;
+	idx_t null_count = 0;
+	vector<string> prompts;
+	prompts.reserve(input.size());
+	for (idx_t i = 0; i < input.size(); i++) {
+		auto idx = format.sel->get_index(i);
+		if (format.validity.RowIsValid(idx)) {
+			valid_selection.set_index(valid_count++, i);
+			prompts.push_back(data[idx].GetString());
+		} else {
+			null_selection.set_index(null_count++, i);
+		}
+	}
+
+	if (null_count > 0) {
+		auto null_rows = SliceChunk(context.client, input, null_selection, null_count);
+		pending_outputs.push_back(
+		    BuildOutputChunk(context, *null_rows, vector<string>(null_count), vector<bool>(null_count, false)));
+	}
+
+	VLLMPromptInput prompt_input;
+	prompt_input.prompts = std::move(prompts);
+	if (valid_count > 0) {
+		prompt_input.rows = SliceChunk(context.client, input, valid_selection, valid_count);
+	}
+	return prompt_input;
 }
 
 struct VLLMGlobalOperatorState : public GlobalOperatorState {
@@ -255,7 +286,7 @@ struct VLLMGlobalOperatorState : public GlobalOperatorState {
 
 	VLLMWakeupRegistrationResult RegisterWakeup(ExecutionContext &context) {
 		if (!context.interrupt_state) {
-			return VLLMWakeupRegistrationResult::UNSUPPORTED;
+			throw InternalException("PhysicalVLLM requires an interrupt state for scheduler wakeup registration");
 		}
 		// Another finalizer can drain the last result and shut the shared
 		// executor down between this task's readiness check and wakeup
@@ -312,7 +343,7 @@ struct VLLMOperatorState : public OperatorState {
 
 	ExpressionExecutor prompt_executor;
 
-	vector<unique_ptr<DataChunk>> buffer;
+	vector<BufferedVLLMInput> buffer;
 	idx_t buffer_size = 0;
 	bool finished_submitting = false;
 	std::deque<unique_ptr<DataChunk>> pending_outputs;
@@ -405,14 +436,19 @@ static void PopAndSubmitTasks(ExecutionContext &context, VLLMGlobalOperatorState
 		return;
 	}
 
-	auto types = state.buffer[0]->GetTypes();
+	auto types = state.buffer[0].rows->GetTypes();
 	DataChunk concatted;
 	concatted.Initialize(context.client, types, state.buffer_size);
-	for (auto &chunk_ptr : state.buffer) {
-		concatted.Append(*chunk_ptr, true);
+	vector<string> prompts;
+	prompts.reserve(state.buffer_size);
+	for (auto &buffered : state.buffer) {
+		if (buffered.prompts.size() != buffered.rows->size()) {
+			throw InternalException("vllm buffered prompt count does not match buffered row count");
+		}
+		concatted.Append(*buffered.rows, true);
+		prompts.insert(prompts.end(), buffered.prompts.begin(), buffered.prompts.end());
 	}
 
-	auto prompts = GetPrompts(state.prompt_executor, concatted);
 	if (prompts.empty()) {
 		state.buffer.clear();
 		state.buffer_size = 0;
@@ -530,7 +566,8 @@ static void PopAndSubmitTasks(ExecutionContext &context, VLLMGlobalOperatorState
 		state.buffer_size += bucket.length;
 		auto remaining_ptr = make_uniq<DataChunk>();
 		remaining_ptr->Move(remaining);
-		state.buffer.push_back(std::move(remaining_ptr));
+		vector<string> remaining_prompts(sorted_prompts.begin() + bucket.start, sorted_prompts.begin() + bucket.end);
+		state.buffer.push_back({std::move(remaining_ptr), std::move(remaining_prompts)});
 	}
 }
 
@@ -571,29 +608,31 @@ OperatorResultType PhysicalVLLM::Execute(ExecutionContext &context, DataChunk &i
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
-	gstate.EnsureExecutor(context);
+	auto prompt_input = EvaluatePrompts(context, state.prompt_executor, input, state.pending_outputs);
+	if (!prompt_input.prompts.empty()) {
+		gstate.EnsureExecutor(context);
 
-	// Backpressure: if inflight is at limit, drain ready results and wait.
-	while (!gstate.CanSubmitMore()) {
+		// Backpressure: if inflight is at limit, drain ready results and wait.
+		while (!gstate.CanSubmitMore()) {
+			TakeReadyResultOnce(context, gstate, state, input.ColumnCount());
+			if (gstate.CanSubmitMore()) {
+				break;
+			}
+			if (!gstate.WaitForExecutorResult(context.client)) {
+				throw InternalException("vllm executor disappeared during operator backpressure");
+			}
+		}
+
+		if (gstate.config.do_prefix_routing) {
+			state.buffer_size += prompt_input.prompts.size();
+			state.buffer.push_back({std::move(prompt_input.rows), std::move(prompt_input.prompts)});
+			PopAndSubmitTasks(context, gstate, state, gstate.config.max_buffer_size);
+		} else {
+			SubmitPrompts(context, gstate, state, nullptr, prompt_input.prompts, *prompt_input.rows);
+		}
+
 		TakeReadyResultOnce(context, gstate, state, input.ColumnCount());
-		if (gstate.CanSubmitMore()) {
-			break;
-		}
-		if (!gstate.WaitForExecutorResult(context.client)) {
-			throw InternalException("vllm executor disappeared during operator backpressure");
-		}
 	}
-
-	if (gstate.config.do_prefix_routing) {
-		state.buffer_size += input.size();
-		state.buffer.push_back(CopyChunk(context.client, input));
-		PopAndSubmitTasks(context, gstate, state, gstate.config.max_buffer_size);
-	} else {
-		auto prompts = GetPrompts(state.prompt_executor, input);
-		SubmitPrompts(context, gstate, state, nullptr, prompts, input);
-	}
-
-	TakeReadyResultOnce(context, gstate, state, input.ColumnCount());
 	if (!state.pending_outputs.empty()) {
 		auto output = std::move(state.pending_outputs.front());
 		state.pending_outputs.pop_front();
@@ -655,11 +694,6 @@ OperatorFinalizeResultType PhysicalVLLM::FinalExecute(ExecutionContext &context,
 	chunk.SetCardinality(0);
 	if (wakeup_result == VLLMWakeupRegistrationResult::ARMED) {
 		return OperatorFinalizeResultType::BLOCKED;
-	}
-	if (wakeup_result == VLLMWakeupRegistrationResult::UNSUPPORTED && gstate.InflightPrompts() > 0) {
-		// Compatibility fallback for legacy executors. Waiting with zero inflight
-		// would deadlock while another producer is still able to submit.
-		gstate.WaitForExecutorResult(context.client);
 	}
 	return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
 }

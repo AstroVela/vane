@@ -32,6 +32,10 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 
 ### Security
 
+- Defined the Ray driver, workers, submitted code, and east-west network as one
+  trusted boundary. Cross-worker local-disk shuffle uses a worker-owned plaintext
+  Flight service, while same-process and object-storage reads remain network-free;
+  worker identity is now separate from the advertised Flight endpoint.
 - Documented the trust boundaries around Python UDFs, Ray workers, credentials, native parsers, and remote model code.
 - Redacted AI provider credentials from descriptor and provider-option `repr`,
   logs, exception formatting, and assertion diffs; plaintext is revealed only at

@@ -41,13 +41,16 @@ class ClientContext;
 namespace distributed {
 
 struct FlightExchangeConfig {
-	std::string flight_bind_host = "0.0.0.0";
-	int flight_port = 0;
 	std::vector<std::string> local_dirs; // shuffle directories for IPC files
 	std::string node_id;
-	std::string flight_location_template;
 	double flight_timeout_seconds = 0.0;
 	std::vector<LogicalType> expected_types;
+};
+
+struct FlightServiceConfig {
+	std::string bind_host;
+	std::string advertise_host;
+	int port = 0;
 };
 
 inline std::string ResolveFlightExchangeEnvString(const char *name) {
@@ -177,10 +180,10 @@ inline FlightExchangeConfig ResolveFlightExchangeConfigFromEnv() {
 	FlightExchangeConfig config;
 	config.node_id = ResolveFlightExchangeNodeIdFromEnv();
 	config.local_dirs = ResolveFlightExchangeLocalDirsFromEnv();
-	config.flight_bind_host = "0.0.0.0";
-	config.flight_port = ResolveFlightExchangeEnvInt("DUCKDB_FLIGHT_PORT", 0);
 	return config;
 }
+
+FlightServiceConfig ResolveFlightServiceConfigFromEnv();
 
 // ─── FlightExchange (coordinator) ────────────────────────
 
@@ -208,6 +211,7 @@ private:
 		idx_t attempt_id = 0;
 		std::string output_location;
 		std::string node_id;
+		std::string flight_host;
 		int flight_port = 0;
 		std::string flight_server_epoch;
 	};
@@ -300,9 +304,13 @@ public:
 		RefreshRuntimeNodeId();
 	}
 
+	static std::string GetLocalFlightServerHost();
 	static int GetLocalFlightServerPort();
 	static std::string GetLocalFlightServerEpoch();
-	static DuckDBResult<void> EnsureLocalFlightServerStarted(const FlightExchangeConfig &config);
+	std::string GetPublishedFlightServerHost() const;
+	int GetPublishedFlightServerPort() const;
+	std::string GetPublishedFlightServerEpoch() const;
+	static DuckDBResult<void> EnsureLocalFlightServerStarted(const FlightServiceConfig &config);
 	static DuckDBResult<void> ShutdownLocalFlightServer();
 
 	const FlightExchangeConfig &config() const {

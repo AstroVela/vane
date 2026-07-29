@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import os
+import warnings
+
+import pytest
 
 from duckdb.runners.ray.ray_env import (
     build_explicit_session_process_env,
@@ -46,6 +49,7 @@ def test_collect_vane_env_overrides_excludes_app_benchmark_env(monkeypatch):
     monkeypatch.setenv("VANE_AUTH_HEADER", "session-auth-header")
     monkeypatch.setenv("VANE_S3_ENDPOINT", "http://session-endpoint")
     monkeypatch.setenv("VANE_SERVICE_URL", "https://session-service")
+    monkeypatch.setenv("VANE_FLIGHT_ADVERTISE_HOST", "driver.example.internal")
     monkeypatch.setenv("DUCKDB_SHUFFLE_DIRS", "file:///tmp/vane-shuffle")
     monkeypatch.setenv("DUCKDB_ISSUE75_SESSION_SECRET", "session-duckdb-secret")
     monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:9000")
@@ -61,10 +65,88 @@ def test_collect_vane_env_overrides_excludes_app_benchmark_env(monkeypatch):
     assert "VANE_AUTH_HEADER" not in overrides
     assert "VANE_S3_ENDPOINT" not in overrides
     assert "VANE_SERVICE_URL" not in overrides
+    assert "VANE_FLIGHT_ADVERTISE_HOST" not in overrides
     assert overrides["DUCKDB_SHUFFLE_DIRS"] == "file:///tmp/vane-shuffle"
     assert "DUCKDB_ISSUE75_SESSION_SECRET" not in overrides
     assert "AWS_ENDPOINT_URL" not in overrides
     assert "RAY_ADDRESS" not in overrides
+
+
+@pytest.mark.usefixtures("ray_local")
+def test_node_local_flight_host_is_not_inherited_from_query_driver(monkeypatch):
+    import ray
+
+    from duckdb.runners.ray.worker_pool import _persistent_worker_runtime_env
+
+    env_key = "VANE_FLIGHT_ADVERTISE_HOST"
+    driver_host = "driver.example.internal"
+    monkeypatch.setenv(env_key, driver_host)
+    parent_env = collect_vane_env_overrides()
+    child_runtime_env = _persistent_worker_runtime_env({env_key: driver_host})
+
+    @ray.remote
+    class _ChildEnvProbe:
+        @staticmethod
+        def flight_host():
+            import os
+
+            return os.environ.get(env_key)
+
+    @ray.remote
+    class _ParentEnvProbe:
+        @staticmethod
+        def child_flight_host(runtime_env):
+            import ray
+
+            child = _ChildEnvProbe.options(runtime_env=runtime_env).remote()
+            try:
+                return ray.get(child.flight_host.remote())
+            finally:
+                ray.kill(child, no_restart=True)
+
+    parent = _ParentEnvProbe.options(runtime_env={"env_vars": parent_env}).remote()
+    try:
+        observed_host = ray.get(parent.child_flight_host.remote(child_runtime_env))
+    finally:
+        ray.kill(parent, no_restart=True)
+
+    # The target node may provide its own host; only the driver's value is invalid.
+    assert observed_host != driver_host
+    assert env_key not in parent_env
+    assert env_key not in child_runtime_env["env_vars"]
+
+
+@pytest.mark.real_ray
+@pytest.mark.ray_cluster_owner
+def test_query_driver_rejects_flight_host_in_ray_job_runtime_env():
+    import ray
+    from ray_test_profile import ray_test_object_store_bytes
+
+    from duckdb.runners.ray.driver import RayQueryDriverClient
+
+    ray.shutdown()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=r"Tip: In future versions of Ray")
+        ray.init(
+            address="local",
+            include_dashboard=False,
+            log_to_driver=False,
+            num_cpus=1,
+            object_store_memory=ray_test_object_store_bytes(),
+            runtime_env={
+                "env_vars": {
+                    "VANE_FLIGHT_ADVERTISE_HOST": "job-driver.example.internal",
+                },
+            },
+        )
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match=r"VANE_FLIGHT_ADVERTISE_HOST is node-local.*Ray Job or actor runtime_env",
+        ):
+            RayQueryDriverClient()
+    finally:
+        ray.shutdown()
 
 
 def test_shared_runtime_setup_scrubs_inherited_session_environment(monkeypatch):

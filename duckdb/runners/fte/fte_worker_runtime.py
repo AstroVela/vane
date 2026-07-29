@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from duckdb import OutOfMemoryException
 from duckdb.runners.fte.debug_memory import (
     debug_flag_enabled,
     describe_result_payload,
@@ -34,8 +35,15 @@ from duckdb.runners.fte.fte_descriptor import (
     normalize_initial_splits,
 )
 from duckdb.runners.fte.fte_exchange import collect_spooling_output_stats
+from duckdb.runners.fte.fte_failures import (
+    _failure_exception_matches,
+    _failure_payload,
+    _normalize_failure_payload,
+    _safe_failure_message,
+)
 from duckdb.runners.fte.fte_state import _TERMINAL_STATES, FteTaskState
 from duckdb.runners.fte.fte_types import FteSplit, FteTaskAttemptId
+from duckdb.runners.fte.memory_config import DuckDBMemoryLimitError
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -139,12 +147,39 @@ def fte_split_queue_space_poll_interval_s() -> float:
     return min(max(0.001, value), 0.1)
 
 
-def _failure_payload(exc: BaseException) -> dict[str, str]:
-    return {
-        "type": type(exc).__name__,
-        "message": str(exc),
-        "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
-    }
+def _safe_exception_traceback(exc: BaseException) -> str:
+    try:
+        return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    except BaseException:
+        return f"{type(exc).__name__}: {_safe_failure_message(exc)}\n"
+
+
+def _failure_payload_from_exception(exc: BaseException) -> dict[str, Any]:
+    retryable: bool | None = None
+    if _failure_exception_matches(exc, (DuckDBMemoryLimitError,)):
+        error_code = "MEMORY_LIMIT_CONFIGURATION_FAILED"
+        retryable = False
+    elif _failure_exception_matches(exc, (OutOfMemoryException, MemoryError)):
+        error_code = "OUT_OF_MEMORY"
+    else:
+        error_code = "GENERIC_INTERNAL_ERROR"
+    payload = _failure_payload(error_code, exc)
+    if retryable is not None:
+        payload["retryable"] = retryable
+    payload.update(
+        {
+            "type": type(exc).__name__,
+            "traceback": _safe_exception_traceback(exc),
+        }
+    )
+    return payload
+
+
+def _task_canceled_failure_payload(task_id: FteTaskAttemptId) -> dict[str, Any]:
+    return _failure_payload(
+        "TASK_CANCELED",
+        f"FTE task {task_id} was canceled",
+    )
 
 
 def _fte_admission_debug_enabled() -> bool:
@@ -180,7 +215,7 @@ class TaskStatus:
     task_id: FteTaskAttemptId
     state: FteTaskState
     version: int = 0
-    failure: dict[str, str] | None = None
+    failure: dict[str, Any] | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     duplicate_split_count: int = 0
@@ -356,13 +391,23 @@ class FteTaskExecution:
         self,
         state: FteTaskState,
         *,
-        failure: dict[str, str] | None = None,
+        failure: Mapping[str, Any] | None = None,
     ) -> None:
         with self._status_lock:
             if self.status.state in _TERMINAL_STATES:
                 return
+            if state in {
+                FteTaskState.FAILED,
+                FteTaskState.CANCELED,
+                FteTaskState.ABORTED,
+            }:
+                normalized_failure = _normalize_failure_payload(failure)
+            elif failure is not None:
+                raise ValueError("FTE failure payload is only valid for FAILED, CANCELED, or ABORTED states")
+            else:
+                normalized_failure = None
             self.status.state = state
-            self.status.failure = failure
+            self.status.failure = normalized_failure
             self.status.version += 1
             self.status.updated_at = time.time()
         self._publish_status_changed()
@@ -628,7 +673,10 @@ class FteTaskExecution:
                 self._record_task_stats({**final_task_stats, **final_split_stats})
             self._transition(FteTaskState.FINISHED)
         except asyncio.CancelledError:
-            self._transition(FteTaskState.CANCELED)
+            self._transition(
+                FteTaskState.CANCELED,
+                failure=_task_canceled_failure_payload(self.task_id),
+            )
             raise
         except Exception as exc:
             if result_stored and not dynamic_source_splits_completed:
@@ -641,7 +689,10 @@ class FteTaskExecution:
                     self.release_result(reason="task_failed")
                 except Exception:
                     pass
-            self._transition(FteTaskState.FAILED, failure=_failure_payload(exc))
+            self._transition(
+                FteTaskState.FAILED,
+                failure=_failure_payload_from_exception(exc),
+            )
 
     def _complete_dynamic_source_splits(self) -> None:
         queues = [
@@ -957,7 +1008,10 @@ class FteTaskExecution:
         if self._future is not None and not self._future.done():
             self._future.cancel()
         self._split_update_event.set()
-        self._transition(FteTaskState.CANCELED)
+        self._transition(
+            FteTaskState.CANCELED,
+            failure=_task_canceled_failure_payload(self.task_id),
+        )
         return self.status
 
     def _log_result_lifecycle(self, event: str, *, result: Any = None, **fields: Any) -> None:

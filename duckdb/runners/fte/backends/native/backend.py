@@ -24,6 +24,7 @@ from duckdb.runners.fte.dynamic_inputs import (
     strip_fte_dynamic_context,
 )
 from duckdb.runners.fte.fte_config import FTE_WORKER_RUNTIME, FteWorkerAdmissionConfig
+from duckdb.runners.fte.fte_failures import _failure_payload, _normalize_failure_payload
 from duckdb.runners.fte.fte_state import FteTaskState
 from duckdb.runners.fte.fte_types import (
     FteTaskAttemptId,
@@ -258,6 +259,16 @@ class _BackgroundEventLoop:
                     if failure is None:
                         failure = exc
                 try:
+                    # asyncio task cancellation does not stop work that has
+                    # already entered a synchronous native call through
+                    # asyncio.to_thread(). Join that owned executor before the
+                    # loop is considered closed so callers have a real native
+                    # execution barrier.
+                    loop.run_until_complete(loop.shutdown_default_executor())
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+                try:
                     loop.close()
                 except BaseException as exc:
                     if failure is None:
@@ -336,10 +347,8 @@ class _BackgroundEventLoop:
             future.cancel()
             raise TimeoutError(f"native FTE event-loop operation timed out after {timeout_s:.3f}s") from exc
 
-    def shutdown(self, timeout_s: float = 5.0) -> None:
-        timeout_s = float(timeout_s)
-        if not math.isfinite(timeout_s) or timeout_s < 0:
-            raise ValueError("native FTE event-loop shutdown timeout must be finite and non-negative")
+    def request_shutdown(self) -> None:
+        """Fence new work and ask the loop thread to begin teardown."""
         with self._condition:
             if self._state == self._CLOSED:
                 return
@@ -359,6 +368,13 @@ class _BackgroundEventLoop:
                     except BaseException as exc:
                         self._failure = exc
                 self._condition.notify_all()
+
+    def shutdown(self, timeout_s: float = 5.0) -> None:
+        timeout_s = float(timeout_s)
+        if not math.isfinite(timeout_s) or timeout_s < 0:
+            raise ValueError("native FTE event-loop shutdown timeout must be finite and non-negative")
+        self.request_shutdown()
+        with self._condition:
             thread = self._thread
         if thread is None or thread is threading.current_thread():
             return
@@ -599,11 +615,14 @@ class NativeTaskResultHandle:
         except Exception:
             pass
 
-    def _failure_status(self) -> dict[str, Any]:
+    def _failure_status(self, error: BaseException) -> dict[str, Any]:
+        failure = _failure_payload("NATIVE_BACKEND_ERROR", error)
+        failure["type"] = type(error).__name__
         return {
             "state": FteTaskState.FAILED.value,
             "task_id": self._task_id.to_dict(),
             "task_id_string": str(self._task_id),
+            "failure": failure,
         }
 
     def _validated_status(self, status: Any, *, operation: str) -> dict[str, Any]:
@@ -611,6 +630,14 @@ class NativeTaskResultHandle:
             raise TypeError(f"{operation} must return a status mapping")
         result = dict(status)
         validate_fte_status_identity(result, self._task_id)
+        raw_state = result.get("state")
+        state = raw_state.value if isinstance(raw_state, FteTaskState) else str(raw_state or "").upper()
+        if state in {
+            FteTaskState.FAILED.value,
+            FteTaskState.CANCELED.value,
+            FteTaskState.ABORTED.value,
+        }:
+            result["failure"] = _normalize_failure_payload(result.get("failure"))
         return result
 
     def status_snapshot(self) -> dict[str, Any]:
@@ -620,7 +647,7 @@ class NativeTaskResultHandle:
                 operation="fte_get_task_status_cached",
             )
         except BaseException as exc:
-            self._record_status(self._failure_status(), exc)
+            self._record_status(self._failure_status(exc), exc)
             raise
         self._record_status(status)
         return status
@@ -637,7 +664,7 @@ class NativeTaskResultHandle:
             )
             info["status"] = status
         except BaseException as exc:
-            self._record_status(self._failure_status(), exc)
+            self._record_status(self._failure_status(exc), exc)
             raise
         self._record_status(status)
         return info
@@ -649,11 +676,12 @@ class NativeTaskResultHandle:
                 operation="fte_get_task_status_cached",
             )
         except BaseException as exc:
-            self._record_status(self._failure_status(), exc)
+            self._record_status(self._failure_status(exc), exc)
             return TaskResultPoll(TaskResultState.ERROR, error=exc)
 
         self._record_status(status)
-        state = str(status.get("state") or "").upper()
+        raw_state = status.get("state")
+        state = raw_state.value if isinstance(raw_state, FteTaskState) else str(raw_state or "").upper()
         if state not in _TERMINAL_STATE_VALUES:
             return TaskResultPoll(TaskResultState.NOT_READY)
         if state == FteTaskState.FINISHED.value:
@@ -661,11 +689,11 @@ class NativeTaskResultHandle:
             if result is None:
                 return TaskResultPoll(TaskResultState.NO_OUTPUT)
             return TaskResultPoll(TaskResultState.MATERIALIZED_OUTPUT, output=result)
-        failure = status.get("failure")
-        message = failure.get("message") if isinstance(failure, Mapping) else None
+        failure = _normalize_failure_payload(status.get("failure"))
+        message = failure.get("message")
         return TaskResultPoll(
             TaskResultState.ERROR,
-            error=RuntimeError(message or f"native FTE task {self._task_id} ended with {state}"),
+            error=RuntimeError(message or f"native FTE task {self._task_id} ended with {failure['error_code']}"),
         )
 
     def done(self) -> bool:
@@ -1209,9 +1237,13 @@ class NativeWorkerHandle:
         stats["memory"] = self._total_memory_bytes
         return stats
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout_s: float = 5.0) -> None:
         if self._owns_loop:
-            self._loop.shutdown()
+            self._loop.shutdown(timeout_s=timeout_s)
+
+    def request_shutdown(self) -> None:
+        if self._owns_loop:
+            self._loop.request_shutdown()
 
 
 class NativeFteWorkerManagerBackend:
@@ -1586,7 +1618,8 @@ class NativeFteWorkerManagerBackend:
         progress_stats = cls._progress_stats_from_status(status)
         failure = status.get("failure")
         if error is not None:
-            failure = {"type": type(error).__name__, "message": str(error)}
+            failure = _failure_payload("NATIVE_BACKEND_ERROR", error)
+            failure["type"] = type(error).__name__
         running_attempts = []
         if running:
             running_attempts.append(
@@ -1674,7 +1707,12 @@ class NativeFteWorkerManagerBackend:
             try:
                 status = handle.status_snapshot()
             except BaseException as exc:
-                status = {"state": FteTaskState.FAILED.value}
+                failure = _failure_payload("NATIVE_BACKEND_ERROR", exc)
+                failure["type"] = type(exc).__name__
+                status = {
+                    "state": FteTaskState.FAILED.value,
+                    "failure": failure,
+                }
                 status_error = exc
             partition = self._partition_metrics_from_handle(handle, status, error=status_error)
             partition_metrics[(query_id, handle.fragment_id, str(handle.task_id.partition_id))] = partition
@@ -1751,16 +1789,45 @@ class NativeFteWorkerManagerBackend:
         if worker_errors:
             raise RuntimeError(f"native FTE query teardown failed for {query_id}: " + "; ".join(worker_errors))
 
-    def shutdown(self) -> None:
+    def request_shutdown(self) -> None:
         if self._closed:
             return
         self._closing = True
         self._stop_debug_sampler()
         worker_errors: list[str] = []
         for worker in self._workers:
+            request_shutdown = getattr(worker, "request_shutdown", None)
+            if not callable(request_shutdown):
+                continue
             worker_id = str(getattr(worker, "worker_id", "") or "<unknown>")
             try:
-                worker.shutdown()
+                request_shutdown()
+            except BaseException as exc:
+                worker_errors.append(f"{worker_id}: {type(exc).__name__}: {exc}")
+        if worker_errors:
+            raise RuntimeError("native FTE worker manager shutdown request failed: " + "; ".join(worker_errors))
+
+    def shutdown(self, timeout_s: float | None = None) -> None:
+        if self._closed:
+            return
+        deadline: float | None = None
+        if timeout_s is not None:
+            timeout_s = float(timeout_s)
+            if not math.isfinite(timeout_s) or timeout_s < 0:
+                raise ValueError("native FTE worker manager shutdown timeout must be finite and non-negative")
+            deadline = time.monotonic() + timeout_s
+        worker_errors: list[str] = []
+        try:
+            self.request_shutdown()
+        except BaseException as exc:
+            worker_errors.append(f"request: {type(exc).__name__}: {exc}")
+        for worker in self._workers:
+            worker_id = str(getattr(worker, "worker_id", "") or "<unknown>")
+            try:
+                if deadline is None:
+                    worker.shutdown()
+                else:
+                    worker.shutdown(timeout_s=max(0.0, deadline - time.monotonic()))
             except BaseException as exc:
                 worker_errors.append(f"{worker_id}: {type(exc).__name__}: {exc}")
         if worker_errors:

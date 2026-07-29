@@ -248,7 +248,7 @@ class FteWorkerSubmissionMixin:
                 )
                 if not has_matching_node:
                     no_matching_period = partition.mark_no_matching_node()
-                    if no_matching_period > _fte_allowed_no_matching_node_period_s():
+                    if no_matching_period >= _fte_allowed_no_matching_node_period_s():
                         raise RuntimeError(
                             f"No nodes available to run query {query_id}/{fragment_id}/{partition.task_id.partition_id}"
                         )

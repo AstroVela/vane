@@ -140,7 +140,7 @@ class FteWorkerPlacementMixin:
         if not current:
             cancel_fte_worker_reservation_future(future)
             return False
-        if not has_matching_node and no_matching_period > _fte_allowed_no_matching_node_period_s():
+        if not has_matching_node and no_matching_period >= _fte_allowed_no_matching_node_period_s():
             raise RuntimeError(
                 f"No nodes available to run query {future.query_id}/{future.fragment_id}/{future.partition_id}"
             )

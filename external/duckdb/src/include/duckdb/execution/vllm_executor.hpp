@@ -50,8 +50,6 @@ struct VLLMResult {
 
 //! Outcome of asking an executor to wake a blocked native pipeline task.
 enum class VLLMWakeupRegistrationResult {
-	//! The executor cannot register callbacks; the caller may use a blocking fallback.
-	UNSUPPORTED,
 	//! A one-shot callback was registered, so the caller can safely return BLOCKED.
 	ARMED,
 	//! Work or a terminal state is already ready, so the caller must not block.
@@ -69,10 +67,8 @@ public:
 	virtual void FinishedSubmitting(ClientContext &context) = 0;
 	virtual bool AllTasksFinished(ClientContext &context) = 0;
 	virtual void Shutdown() = 0;
-	//! Try to arm a one-shot scheduler wakeup; legacy executors use the unsupported default.
-	virtual VLLMWakeupRegistrationResult RegisterWakeup(InterruptState &) {
-		return VLLMWakeupRegistrationResult::UNSUPPORTED;
-	}
+	//! Arm a one-shot scheduler wakeup or report that work is already ready.
+	virtual VLLMWakeupRegistrationResult RegisterWakeup(InterruptState &) = 0;
 
 	//! Block until at least one result is available, an error occurred, or all tasks finished.
 	//! Uses event-driven wakeup.

@@ -70,6 +70,7 @@ void ExchangeSourceTaskDescriptor::Serialize(Serializer &serializer) const {
 			});
 			obj.WriteProperty(5, "attempt_id", handle.attempt_id);
 			obj.WriteProperty(6, "flight_server_epoch", handle.flight_server_epoch);
+			obj.WriteProperty(7, "flight_host", handle.flight_host);
 		});
 	});
 	serializer.WriteProperty(3, "source_partition_count", source_partition_count);
@@ -97,6 +98,7 @@ ExchangeSourceTaskDescriptor ExchangeSourceTaskDescriptor::Deserialize(Deseriali
 			});
 			handle.attempt_id = obj.ReadPropertyWithExplicitDefault<idx_t>(5, "attempt_id", 0);
 			handle.flight_server_epoch = obj.ReadProperty<string>(6, "flight_server_epoch");
+			handle.flight_host = obj.ReadProperty<string>(7, "flight_host");
 		});
 		result.source_handles.push_back(std::move(handle));
 	});

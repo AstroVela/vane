@@ -36,6 +36,7 @@ from duckdb.runners.ray.fte_fragment_scheduler import (
     _drop_fragment_plan_refs_for_query,
     _drop_fte_registry_for_query,
     _fragment_plan_ref,
+    _worker_failure_payload,
     begin_fte_registry_operation,
     begin_fte_registry_teardown_operation,
     close_fte_registry_for_query,
@@ -326,6 +327,7 @@ class FteWorkerLifecycleMixin:
         failed_worker_id = str(worker_id or self.worker_id or "")
         if not failed_worker_id:
             return []
+        failure = _worker_failure_payload(failed_worker_id, error)
         failed_worker_ids = frozenset({failed_worker_id})
         query_ids = fte_fragment_execution_query_ids()
         query_ids.update(_FTE_SCHEDULERS.query_ids())
@@ -341,7 +343,7 @@ class FteWorkerLifecycleMixin:
                 WorkerFailed(
                     query_id,
                     failed_worker_id,
-                    error,
+                    failure,
                     failed_worker_ids=failed_worker_ids,
                 )
             )
@@ -453,7 +455,7 @@ class FteWorkerLifecycleMixin:
             try:
                 self.mark_fte_worker_failed(
                     self.worker_id,
-                    f"FTE worker shutdown: {self.worker_id}",
+                    RuntimeError(f"FTE worker shutdown: {self.worker_id}"),
                 )
             except Exception:
                 pass

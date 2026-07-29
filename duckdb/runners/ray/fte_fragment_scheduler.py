@@ -11,12 +11,18 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
+from duckdb import OutOfMemoryException
 from duckdb.runners.fte import (
     FteSplit,
     FteTaskAttemptId,
     FteTaskExecutionClass,
     FteWorkerReservationUnavailable,
     validate_fte_status_identity,
+)
+from duckdb.runners.fte.fte_failures import (
+    _failure_exception_matches,
+    _failure_payload,
+    _normalize_failure_payload,
 )
 from duckdb.runners.progress import validate_pipeline_topology
 from duckdb.runners.ray.fragment_submission_window import (
@@ -2250,9 +2256,27 @@ class FteWorkerPlacementManager:
         )
 
 
+def _worker_failure_payload(worker_id: str, error: Any) -> dict[str, Any]:
+    if error is not None and not issubclass(type(error), BaseException):
+        if isinstance(error, Mapping):
+            return _normalize_failure_payload(error)
+        raise TypeError("FTE worker failure must be an exception or structured failure payload")
+    memory_error_types: tuple[type[BaseException], ...] = (
+        OutOfMemoryException,
+        MemoryError,
+        ray.exceptions.OutOfMemoryError,
+    )
+    error_code = "OUT_OF_MEMORY" if _failure_exception_matches(error, memory_error_types) else "WORKER_LOST"
+    return _failure_payload(
+        error_code,
+        error if error is not None else f"FTE worker lost: {worker_id}",
+        error_type="EXTERNAL",
+    )
+
+
 def _mark_fte_worker_failed(
     worker_id: str,
-    error: Any = None,
+    failure: Mapping[str, Any],
     *,
     query_id_filter: str | None = None,
     failed_worker_ids_override: set[str] | frozenset[str] | None = None,
@@ -2260,6 +2284,7 @@ def _mark_fte_worker_failed(
     worker_id = str(worker_id or "")
     if not worker_id:
         return []
+    failure = _normalize_failure_payload(failure)
     if query_id_filter is not None:
         query_id_filter = str(query_id_filter)
     failed_worker_ids = (
@@ -2367,7 +2392,7 @@ def _mark_fte_worker_failed(
         for failed_worker_id in sorted(failed_worker_ids):
             scheduled = fragment_execution.mark_worker_failed(
                 failed_worker_id,
-                error or f"FTE worker lost: {failed_worker_id}",
+                failure,
                 retryable=True,
                 retryable_by_partition_id=retryable_by_partition_id,
                 schedule_retries=False,
