@@ -354,29 +354,32 @@ def test_zero_capacity_does_not_consume_block_or_metadata_objects():
         collector.shutdown()
 
 
-def test_scheduled_block_read_reserves_data_capacity_across_streams():
+def test_block_prefetch_overlaps_streams_without_oversubscribing_data_capacity():
     fake_ray = _FakeRay()
     driver = _Driver()
+    block_refs = {}
+    metadata_refs = {}
 
-    def submitter(lease):
-        return _Generator(
-            [
-                _Ref(f"block-{lease['lease_id']}", ready=False, is_block=True),
-                _Ref(_metadata(lease)),
-            ],
-            completed=False,
-        )
+    def submitter(submit_id):
+        def submit(lease):
+            block_ref = _Ref(f"block-{lease['lease_id']}", ready=False, is_block=True)
+            metadata_ref = _Ref(_metadata(lease), ready=False)
+            block_refs[submit_id] = block_ref
+            metadata_refs[submit_id] = metadata_ref
+            return _Generator([block_ref, metadata_ref], completed=False)
+
+        return submit
 
     collector = AsyncResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         1,
         10,
-        _source(fake_ray, driver, request_id="reserved-read-1", submitter=submitter),
+        _source(fake_ray, driver, request_id="prefetch-read-1", submitter=submitter(10)),
     )
     collector.track_generator_ref(
         1,
         11,
-        _source(fake_ray, driver, request_id="reserved-read-2", submitter=submitter),
+        _source(fake_ray, driver, request_id="prefetch-read-2", submitter=submitter(11)),
     )
     capacity = {1: {"rows": 1, "bytes": 128, "item_bytes": 128}}
     try:
@@ -387,18 +390,65 @@ def test_scheduled_block_read_reserves_data_capacity_across_streams():
                 for record in collector._records.values()
                 if record.wait_kind == "data" and record.wait_future is not None
             ]
-        assert scheduled == [10]
+        assert scheduled == [10, 11]
+
+        fake_ray.make_ready(block_refs[10])
+        fake_ray.make_ready(block_refs[11])
+        deadline = time.monotonic() + 2.0
+        reserved = []
+        while time.monotonic() < deadline:
+            with collector._cv:
+                reserved = [record.submit_id for record in collector._records.values() if record.data_credit_reserved]
+                prefetched = [record.submit_id for record in collector._records.values() if record.phase == "metadata"]
+            if len(reserved) == 1 and prefetched == [10, 11]:
+                break
+            time.sleep(0.005)
+        assert len(reserved) == 1
+        assert prefetched == [10, 11]
 
         # A dispatcher capacity refresh must not grant the same downstream
-        # credit to the second stream while the first read remains in flight.
+        # DATA credit to the second prefetched stream while the first metadata
+        # read remains in flight.
         assert collector.drain_results(capacity) == []
         with collector._cv:
-            scheduled = [
-                record.submit_id
-                for record in collector._records.values()
-                if record.wait_kind == "data" and record.wait_future is not None
+            assert [
+                record.submit_id for record in collector._records.values() if record.data_credit_reserved
+            ] == reserved
+
+        first_submit = reserved[0]
+        second_submit = 11 if first_submit == 10 else 10
+        fake_ray.make_ready(metadata_refs[first_submit])
+        first_events = _drain_until(
+            collector,
+            capacity,
+            predicate=lambda values: any(item[2] == "data" for item in values),
+        )
+        assert [item[1] for item in first_events if item[2] == "data"] == [first_submit]
+
+        # The previous drain consumed the only advertised credit. A fresh
+        # capacity snapshot admits the already-prefetched peer metadata.
+        assert collector.drain_results(capacity) == []
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with collector._cv:
+                if any(
+                    record.submit_id == second_submit and record.data_credit_reserved
+                    for record in collector._records.values()
+                ):
+                    break
+            time.sleep(0.005)
+        with collector._cv:
+            assert [record.submit_id for record in collector._records.values() if record.data_credit_reserved] == [
+                second_submit
             ]
-        assert scheduled == [10]
+
+        fake_ray.make_ready(metadata_refs[second_submit])
+        second_events = _drain_until(
+            collector,
+            capacity,
+            predicate=lambda values: any(item[2] == "data" for item in values),
+        )
+        assert [item[1] for item in second_events if item[2] == "data"] == [second_submit]
     finally:
         collector.cancel_slot(1)
         collector.shutdown()
@@ -860,7 +910,7 @@ def test_one_slow_stream_cannot_block_a_ready_stream():
     try:
         events = _drain_until(
             collector,
-            {3: {"rows": 2, "bytes": 256, "item_bytes": 128}},
+            {3: {"rows": 1, "bytes": 128, "item_bytes": 128}},
             predicate=lambda values: any(item[1] == 31 and item[2] == "data" for item in values),
         )
         fast_data = next(item for item in events if item[1] == 31 and item[2] == "data")

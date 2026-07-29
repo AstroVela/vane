@@ -107,6 +107,7 @@ class _StreamRecord:
     wait_future: Any | None = None
     completion_future: Any | None = None
     terminal_signal_observed: bool = False
+    data_credit_reserved: bool = False
 
 
 class AsyncResultCollector:
@@ -382,14 +383,11 @@ class AsyncResultCollector:
     def _pending_data_count_locked(self, slot_id: int) -> int:
         ready = sum(1 for event in self._ready_by_slot.get(slot_id, ()) if event.kind == "data")
         in_progress = sum(
-            1
-            for record in self._records.values()
-            if record.slot_id == slot_id
-            and (record.phase != "block" or (record.wait_kind == "data" and record.wait_future is not None))
+            1 for record in self._records.values() if record.slot_id == slot_id and record.data_credit_reserved
         )
         return ready + in_progress
 
-    def _may_read_block_locked(self, record: _StreamRecord) -> bool:
+    def _may_prefetch_block_locked(self, record: _StreamRecord) -> bool:
         capacity = self._capacity_by_slot.get(record.slot_id)
         if capacity is None or capacity.rows <= 0:
             return False
@@ -397,7 +395,22 @@ class AsyncResultCollector:
             return False
         if capacity.item_bytes is not None and capacity.item_bytes <= 0:
             return False
-        return self._pending_data_count_locked(record.slot_id) < capacity.rows
+        return True
+
+    def _reserve_data_credit_locked(self, record: _StreamRecord) -> bool:
+        if record.data_credit_reserved:
+            return True
+        capacity = self._capacity_by_slot.get(record.slot_id)
+        if capacity is None or capacity.rows <= 0:
+            return False
+        if capacity.bytes is not None and capacity.bytes <= 0:
+            return False
+        if capacity.item_bytes is not None and capacity.item_bytes <= 0:
+            return False
+        if self._pending_data_count_locked(record.slot_id) >= capacity.rows:
+            return False
+        record.data_credit_reserved = True
+        return True
 
     def _run_event_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -452,17 +465,25 @@ class AsyncResultCollector:
         elif record.metadata_ref is not None:
             kind = "metadata"
             future = self._object_ref_future(record.metadata_ref)
-        elif record.phase == "metadata" or (record.phase == "block" and self._may_read_block_locked(record)):
+        elif record.phase == "metadata" and self._reserve_data_credit_locked(record):
+            # The block ObjectRef was prefetched without consuming downstream
+            # DATA capacity. Reserve one complete event before pulling its paired
+            # metadata and keep that reservation through output-lease admission.
             kind = "data"
-            if record.phase == "block":
-                capacity = self._capacity_by_slot.get(record.slot_id)
-                if capacity is None:
-                    raise RuntimeError("Ray UDF block read was scheduled without downstream capacity")
-                # Consuming the block ObjectRef is the admission point for the
-                # whole block/metadata pair. Keep its per-item limit stable;
-                # downstream capacity may legitimately fall to zero before the
-                # metadata ObjectRef becomes ready.
-                record.block_item_capacity_bytes = capacity.item_bytes
+            future = asyncio.run_coroutine_threadsafe(
+                record.adapter.read_next_ref_async(),
+                self._loop,
+            )
+        elif record.phase == "block" and self._may_prefetch_block_locked(record):
+            kind = "data"
+            capacity = self._capacity_by_slot.get(record.slot_id)
+            if capacity is None:
+                raise RuntimeError("Ray UDF block read was scheduled without downstream capacity")
+            # Prefetch one block ObjectRef per active stream so independent
+            # producers can overlap. The paired metadata transition above is
+            # still capacity-reserved, and the producer task lease bounds the
+            # stream's physical output window.
+            record.block_item_capacity_bytes = capacity.item_bytes
             future = asyncio.run_coroutine_threadsafe(
                 record.adapter.read_next_ref_async(),
                 self._loop,
@@ -637,6 +658,8 @@ class AsyncResultCollector:
     def _accept_metadata(self, record: _StreamRecord, metadata: Any) -> None:
         if record.phase != "metadata" or record.block_ref is None:
             raise RuntimeError("Ray UDF stream metadata arrived without its block")
+        if not record.data_credit_reserved:
+            raise RuntimeError("Ray UDF stream metadata arrived without reserved downstream DATA capacity")
         if isinstance(metadata, dict) and metadata.get("event_kind") == "error":
             remote_error = validate_stream_error_metadata(metadata)
             self._validate_task_identity(record, remote_error)
@@ -761,8 +784,11 @@ class AsyncResultCollector:
         with self._cv:
             stale = self._records.get((record.slot_id, record.submit_id)) is not record
             if not stale:
+                if not record.data_credit_reserved:
+                    raise RuntimeError("Ray UDF output lease completed without reserved downstream DATA capacity")
                 self._active_output_leases[(token.request_id, token.lease_id)] = token
                 self._ready_by_slot[record.slot_id].append(event)
+                record.data_credit_reserved = False
                 record.phase = "block"
                 record.block_ref = None
                 record.metadata = None
