@@ -2356,11 +2356,18 @@ def test_in_process_fragment_executor_unregisters_cursor_before_close(monkeypatc
     assert conn.closed is True
 
 
-def test_in_process_fragment_executor_ignores_stale_cursor_interrupt_failure():
+def test_in_process_fragment_executor_interrupt_ownership_blocks_cursor_close():
     from duckdb.runners.local import runner as local_runner
 
     first_interrupt_started = threading.Event()
     release_first_interrupt = threading.Event()
+    close_progressed = threading.Event()
+    close_blocked_on_lifecycle = threading.Event()
+    close_started = threading.Event()
+    close_finished = threading.Event()
+    release_close = threading.Event()
+    interrupt_during_close = threading.Event()
+    close_thread_id = []
     shutdown_errors = []
 
     class OrderedCursorRegistry(set[Any]):
@@ -2380,25 +2387,50 @@ def test_in_process_fragment_executor_ignores_stale_cursor_interrupt_failure():
             super().clear()
             self._values.clear()
 
+    class ObservedCondition(threading.Condition):
+        def __enter__(self):
+            if close_thread_id and threading.get_ident() == close_thread_id[0]:
+                if self._lock.acquire(blocking=False):
+                    return self
+                close_blocked_on_lifecycle.set()
+                close_progressed.set()
+                self._lock.acquire()
+                return self
+            return super().__enter__()
+
     class BlockingCursor:
         def interrupt(self) -> None:
             first_interrupt_started.set()
             assert release_first_interrupt.wait(timeout=2.0)
 
-    class StaleCursor:
+    class ClosingCursor:
         def __init__(self) -> None:
             self.closed = False
             self.interrupt_calls = 0
 
         def interrupt(self) -> None:
             self.interrupt_calls += 1
+            if close_started.is_set() and not close_finished.is_set():
+                interrupt_during_close.set()
             if self.closed:
                 raise RuntimeError("cursor already closed")
 
+        def close(self) -> None:
+            self.closed = True
+            close_started.set()
+            close_progressed.set()
+            try:
+                assert release_close.wait(timeout=2.0)
+            finally:
+                close_finished.set()
+
     blocking_cursor = BlockingCursor()
-    stale_cursor = StaleCursor()
+    closing_cursor = ClosingCursor()
     executor = local_runner._InProcessFragmentExecutor(close_timeout_s=1.0)
-    executor._active_cursors = OrderedCursorRegistry(blocking_cursor, stale_cursor)
+    lifecycle_lock = threading.RLock()
+    executor._resources_lock = lifecycle_lock
+    executor._resources_condition = ObservedCondition(lifecycle_lock)
+    executor._active_cursors = OrderedCursorRegistry(blocking_cursor, closing_cursor)
 
     def request_shutdown():
         try:
@@ -2406,17 +2438,41 @@ def test_in_process_fragment_executor_ignores_stale_cursor_interrupt_failure():
         except BaseException as exc:
             shutdown_errors.append(exc)
 
+    def unregister_and_close():
+        close_thread_id.append(threading.get_ident())
+        executor._unregister_cursor(closing_cursor)
+        closing_cursor.close()
+
     shutdown_thread = threading.Thread(target=request_shutdown)
     shutdown_thread.start()
-    assert first_interrupt_started.wait(timeout=1.0)
-    executor._unregister_cursor(stale_cursor)
-    stale_cursor.closed = True
-    release_first_interrupt.set()
-    shutdown_thread.join(timeout=2.0)
+    close_thread = threading.Thread(target=unregister_and_close)
+    close_thread_started = False
+    try:
+        assert first_interrupt_started.wait(timeout=1.0)
+        close_thread.start()
+        close_thread_started = True
+        assert close_progressed.wait(timeout=1.0)
+        close_started_before_interrupts_finished = close_started.is_set()
+        close_blocked_before_interrupts_finished = close_blocked_on_lifecycle.is_set()
+        release_first_interrupt.set()
+        shutdown_thread.join(timeout=2.0)
+    finally:
+        release_first_interrupt.set()
+        release_close.set()
+        shutdown_thread.join(timeout=2.0)
+        if close_thread_started:
+            close_thread.join(timeout=2.0)
 
+    assert close_started_before_interrupts_finished is False
+    assert close_blocked_before_interrupts_finished is True
     assert shutdown_thread.is_alive() is False
+    assert close_thread.is_alive() is False
     assert shutdown_errors == []
-    assert stale_cursor.interrupt_calls == 1
+    assert closing_cursor.interrupt_calls == 1
+    assert interrupt_during_close.is_set() is False
+    assert close_started.is_set()
+    assert close_finished.is_set()
+    executor._unregister_cursor(blocking_cursor)
     executor.close(timeout_s=1.0)
 
 

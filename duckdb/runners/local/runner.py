@@ -216,18 +216,19 @@ class _InProcessFragmentExecutor:
 
     def request_shutdown(self) -> None:
         """Fence new fragment calls and interrupt cursors currently in native execution."""
+        interrupt_errors: list[BaseException] = []
         with self._resources_condition:
             if self._closed:
                 return
             self._closing = True
-            active_cursors = list(self._active_cursors)
-
-        interrupt_errors: list[BaseException] = []
-        for cursor in active_cursors:
-            try:
-                cursor.interrupt()
-            except BaseException as exc:
-                with self._resources_condition:
+            # Keep cursor lifecycle ownership until every interrupt returns.
+            # The fragment finally block must unregister under this condition
+            # before it can close the cursor, so Close() cannot clear the
+            # native connection while Interrupt() is reading it.
+            for cursor in list(self._active_cursors):
+                try:
+                    cursor.interrupt()
+                except BaseException as exc:
                     if cursor in self._active_cursors:
                         interrupt_errors.append(exc)
         if interrupt_errors:
