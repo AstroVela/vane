@@ -3,10 +3,8 @@
 
 #include "duckdb/optimizer/vllm_project_rewriter.hpp"
 
-#include "duckdb/common/constants.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/function/scalar/vllm_functions.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -40,6 +38,60 @@ static bool ContainsVLLM(const Expression &expr) {
 	return found;
 }
 
+static bool IsVLLMShortCircuitBoundary(const Expression &expr) {
+	return expr.type == ExpressionType::CASE_EXPR || expr.type == ExpressionType::CONJUNCTION_AND ||
+	       expr.type == ExpressionType::CONJUNCTION_OR || expr.type == ExpressionType::OPERATOR_COALESCE;
+}
+
+struct VLLMExtractionState {
+	VLLMExtractionState(Binder &binder_p, LogicalProjection &projection_p)
+	    : binder(binder_p), projection(projection_p) {
+	}
+
+	Binder &binder;
+	LogicalProjection &projection;
+	unique_ptr<LogicalOperator> current_child;
+};
+
+static void ExtractVLLMExpressions(unique_ptr<Expression> &expr, VLLMExtractionState &state,
+                                   bool inside_short_circuit = false) {
+	if (!expr) {
+		return;
+	}
+	if (inside_short_circuit && ContainsVLLM(*expr)) {
+		throw NotImplementedException(
+		    "vllm expressions are not supported inside CASE, AND/OR, or COALESCE short-circuit expressions");
+	}
+
+	// Extract children first so nested vllm calls are available as bound columns
+	// to the operators that depend on them.
+	const bool child_inside_short_circuit = inside_short_circuit || IsVLLMShortCircuitBoundary(*expr);
+	ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
+		ExtractVLLMExpressions(child, state, child_inside_short_circuit);
+	});
+
+	if (!IsVLLMFunction(*expr)) {
+		return;
+	}
+	if (!state.current_child) {
+		D_ASSERT(state.projection.children.size() == 1);
+		state.current_child = std::move(state.projection.children[0]);
+	}
+
+	auto vllm_expr = std::move(expr);
+	auto replacement_name = vllm_expr->GetName();
+	auto output_type = vllm_expr->return_type;
+	auto table_index = state.binder.GenerateTableIndex();
+	auto output_name = StringUtil::Format("__vane_vllm_%llu", static_cast<unsigned long long>(table_index));
+	auto output_binding = ColumnBinding(table_index, 0);
+
+	auto vllm_project = make_uniq<LogicalVLLMProject>(table_index, std::move(vllm_expr), output_name);
+	vllm_project->children.push_back(std::move(state.current_child));
+	state.current_child = std::move(vllm_project);
+
+	expr = make_uniq<BoundColumnRefExpression>(replacement_name, output_type, output_binding);
+}
+
 unique_ptr<LogicalOperator> VLLMProjectRewriter::Optimize(unique_ptr<LogicalOperator> op) {
 	return Rewrite(std::move(op));
 }
@@ -57,40 +109,13 @@ unique_ptr<LogicalOperator> VLLMProjectRewriter::Rewrite(unique_ptr<LogicalOpera
 	}
 
 	auto &proj = op->Cast<LogicalProjection>();
-	idx_t vllm_index = DConstants::INVALID_INDEX;
-
-	for (idx_t i = 0; i < proj.expressions.size(); i++) {
-		auto &expr = proj.expressions[i];
-		if (!ContainsVLLM(*expr)) {
-			continue;
-		}
-		if (!IsVLLMFunction(*expr)) {
-			throw NotImplementedException("vllm must be used as a top-level projection expression");
-		}
-		if (vllm_index != DConstants::INVALID_INDEX) {
-			throw NotImplementedException("Only one vllm expression per projection is supported");
-		}
-		vllm_index = i;
+	VLLMExtractionState state(binder, proj);
+	for (auto &expr : proj.expressions) {
+		ExtractVLLMExpressions(expr, state);
 	}
-
-	if (vllm_index == DConstants::INVALID_INDEX) {
-		return op;
+	if (state.current_child) {
+		proj.children[0] = std::move(state.current_child);
 	}
-
-	D_ASSERT(proj.children.size() == 1);
-
-	auto vllm_expr = std::move(proj.expressions[vllm_index]);
-	auto output_name = vllm_expr->GetName();
-	auto output_type = vllm_expr->return_type;
-	auto table_index = binder.GenerateTableIndex();
-
-	auto output_binding = ColumnBinding(table_index, 0);
-
-	auto vllm_project = make_uniq<LogicalVLLMProject>(table_index, std::move(vllm_expr), output_name);
-	vllm_project->children.push_back(std::move(proj.children[0]));
-	proj.children[0] = std::move(vllm_project);
-
-	proj.expressions[vllm_index] = make_uniq<BoundColumnRefExpression>(output_name, output_type, output_binding);
 
 	return op;
 }
