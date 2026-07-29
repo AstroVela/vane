@@ -1178,33 +1178,81 @@ CleanupDistributedCopyPrefix(FileSystem &fs, const std::string &prefix,
 		return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(files_res.error());
 	}
 	auto files = std::move(files_res).value();
+	std::string remove_last_contents;
 	if (!remove_last.empty()) {
 		auto remove_last_it = std::find(files.begin(), files.end(), remove_last);
-		if (remove_last_it != files.end()) {
-			files.erase(remove_last_it);
-			files.push_back(remove_last);
+		if (remove_last_it == files.end()) {
+			return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(DuckDBError::io_error(
+			    "distributed COPY cleanup registration missing from prefix listing: " + remove_last));
 		}
+		auto contents_res = ReadDistributedCopyTextFile(fs, remove_last);
+		if (contents_res.is_err()) {
+			return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(contents_res.error());
+		}
+		remove_last_contents = std::move(contents_res).value();
+		files.erase(remove_last_it);
 	}
 
 	DistributedCopyPrefixCleanupResult result;
-	result.existed = !files.empty() || DistributedCopyDirectoryExistsNoThrow(fs, prefix);
+	result.existed = !files.empty() || !remove_last.empty() || DistributedCopyDirectoryExistsNoThrow(fs, prefix);
 	auto remove_res = RemoveDistributedCopyFiles(fs, files);
 	if (remove_res.is_err()) {
 		return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(remove_res.error());
 	}
 
+	auto restore_registration_after_failure =
+	    [&](const std::string &cleanup_error) -> DuckDBResult<DistributedCopyPrefixCleanupResult> {
+		try {
+			auto parent = StringUtil::GetFilePath(remove_last);
+			if (!parent.empty()) {
+				fs.CreateDirectoriesRecursive(parent);
+			}
+		} catch (const std::exception &ex) {
+			return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(DuckDBError::io_error(StringUtil::Format(
+			    "%s; additionally failed to recreate lifecycle directory: %s", cleanup_error, ex.what())));
+		}
+		auto restore_res = WriteDistributedCopyTextFileAtomically(fs, remove_last, remove_last_contents);
+		if (restore_res.is_err()) {
+			return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(DuckDBError::io_error(
+			    cleanup_error +
+			    "; additionally failed to restore lifecycle registration: " + restore_res.error().what()));
+		}
+		return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(
+		    DuckDBError::io_error(cleanup_error + "; lifecycle registration restored for retry"));
+	};
+
+	if (!remove_last.empty()) {
+		try {
+			fs.RemoveFile(remove_last);
+		} catch (const std::exception &ex) {
+			return restore_registration_after_failure(StringUtil::Format(
+			    "failed to remove distributed COPY cleanup registration \"%s\": %s", remove_last, ex.what()));
+		}
+	}
+
+	std::string directory_removal_error;
 	try {
 		fs.RemoveDirectory(prefix);
-	} catch (...) {
+	} catch (const std::exception &ex) {
+		directory_removal_error =
+		    StringUtil::Format("failed to remove distributed COPY prefix \"%s\": %s", prefix, ex.what());
 	}
 
 	auto remaining_res = ListDistributedCopyFilesUnderPrefix(fs, prefix);
 	if (remaining_res.is_err()) {
+		if (!remove_last.empty()) {
+			return restore_registration_after_failure(remaining_res.error().what());
+		}
 		return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(remaining_res.error());
 	}
 	if (!remaining_res.value().empty() || DistributedCopyDirectoryExistsNoThrow(fs, prefix)) {
-		return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(
-		    DuckDBError::io_error("distributed COPY prefix still exists after cleanup: " + prefix));
+		auto cleanup_error = directory_removal_error.empty()
+		                         ? "distributed COPY prefix still exists after cleanup: " + prefix
+		                         : directory_removal_error;
+		if (!remove_last.empty()) {
+			return restore_registration_after_failure(cleanup_error);
+		}
+		return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(DuckDBError::io_error(cleanup_error));
 	}
 	result.removed = result.existed;
 	return DuckDBResult<DistributedCopyPrefixCleanupResult>::ok(std::move(result));

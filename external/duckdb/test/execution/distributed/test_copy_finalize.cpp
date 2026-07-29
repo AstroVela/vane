@@ -197,6 +197,27 @@ private:
 	string failed_path;
 };
 
+class DirectoryRemovalFailureFileSystem : public LocalFileSystem {
+public:
+	explicit DirectoryRemovalFailureFileSystem(string failed_path) : failed_path(std::move(failed_path)) {
+	}
+
+	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
+		if (fail_removal && directory == failed_path) {
+			throw IOException("injected directory removal failure");
+		}
+		LocalFileSystem::RemoveDirectory(directory, opener);
+	}
+
+	void AllowRemoval() {
+		fail_removal = false;
+	}
+
+private:
+	string failed_path;
+	bool fail_removal = true;
+};
+
 class CopyFinalizeTestDirectory {
 public:
 	explicit CopyFinalizeTestDirectory(const string &name) : path(TestCreatePath(name)) {
@@ -662,4 +683,35 @@ TEST_CASE("Direct-write cleanup requires lifecycle registration", "[distributed]
 	REQUIRE(cleanup_res.is_err());
 	REQUIRE(StringUtil::Contains(cleanup_res.error().what(), "requires lifecycle registration"));
 	REQUIRE(fs.FileExists(data_file));
+}
+
+TEST_CASE("Direct-write cleanup restores lifecycle when directory removal fails", "[distributed][copy][lifecycle]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_restore_lifecycle");
+	auto &local_fs = test_dir.fs;
+	auto base_path = local_fs.JoinPath(test_dir.path, "out");
+	const string run_id = "run-retry-directory";
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, run_id, 1).is_ok());
+	auto data_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_failed", "part.parquet");
+	WriteTestFile(local_fs, data_file, "stale");
+	auto paths = BuildDistributedCopyFinalizeCommitPaths(local_fs, base_path, run_id);
+	WriteTestFile(local_fs, paths.manifest_path, "partial");
+
+	DirectoryRemovalFailureFileSystem failing_fs(paths.commit_dir);
+	auto first_cleanup = CleanupDistributedCopyUncommittedDirectWriteRun(failing_fs, base_path, run_id);
+
+	REQUIRE(first_cleanup.is_err());
+	REQUIRE(StringUtil::Contains(first_cleanup.error().what(), "injected directory removal failure"));
+	REQUIRE(StringUtil::Contains(first_cleanup.error().what(), "lifecycle registration restored for retry"));
+	REQUIRE_FALSE(local_fs.FileExists(data_file));
+	REQUIRE_FALSE(local_fs.FileExists(paths.manifest_path));
+	REQUIRE(local_fs.FileExists(paths.lifecycle_path));
+	REQUIRE(local_fs.DirectoryExists(paths.commit_dir));
+
+	failing_fs.AllowRemoval();
+	auto retry_cleanup = CleanupDistributedCopyUncommittedDirectWriteRun(failing_fs, base_path, run_id);
+
+	REQUIRE(retry_cleanup.is_ok());
+	REQUIRE(retry_cleanup.value().commit_dir_removed);
+	REQUIRE_FALSE(local_fs.FileExists(paths.lifecycle_path));
+	REQUIRE_FALSE(local_fs.DirectoryExists(paths.commit_dir));
 }
