@@ -588,12 +588,8 @@ def test_ai_sql_full_local_copy_in_subprocess(tmp_path, expression, expected):
     script = f"""
 import vane
 from vane.ai import provider as provider_registry
-from duckdb.runners.fte.backends.native.backend import _NativeFteProgressRegistry
 from tests.ai.test_expression_ai_sql import MockProvider
 
-# Keep this teardown regression focused on #214. Live UDF counters currently
-# trigger the independent progress-topology failure tracked by #239.
-_NativeFteProgressRegistry._topology_from_task_stats = staticmethod(lambda _task_stats: None)
 provider_registry.PROVIDERS["mock_ai_sql"] = lambda name=None, **options: MockProvider()
 vane.configure(runner="local")
 conn = vane.connect()
