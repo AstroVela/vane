@@ -52,7 +52,6 @@ private:
 	static unique_ptr<JoinFilterPushdownInfo> CopyFilterPushdownInfo(const JoinFilterPushdownInfo &info);
 	static duckdb::vector<unique_ptr<BaseStatistics>>
 	CopyJoinStats(const duckdb::vector<unique_ptr<BaseStatistics>> &stats);
-	static std::pair<bool, SubmittableTask<WorkerTask>> PollNextWithWait(SubmittableTaskStream<WorkerTask> &stream);
 
 	SubmittableTask<WorkerTask> BuildHashJoinTask(SubmittableTask<WorkerTask> left_task,
 	                                              SubmittableTask<WorkerTask> right_task,
