@@ -44,11 +44,23 @@ class AsyncRuntime:
         return self._loop.run_until_complete(coro)
 
     def close(self) -> None:
-        """Shut down async generators and close the loop. Idempotent."""
+        """Cancel outstanding tasks and close the loop. Idempotent.
+
+        Mirrors ``asyncio.run``'s teardown: background tasks a coroutine
+        left behind are cancelled and awaited (so their ``finally`` blocks
+        run) before async generators, the default executor, and the loop
+        itself are shut down.
+        """
         loop, self._loop = self._loop, None
         if loop is None or loop.is_closed():
             return
         try:
+            tasks = asyncio.all_tasks(loop)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
             loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
         finally:
             loop.close()

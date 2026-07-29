@@ -121,6 +121,32 @@ def test_async_runtime_close_before_first_run_is_noop():
     assert runtime.loop is None
 
 
+def test_async_runtime_close_cancels_pending_tasks():
+    """Background tasks left behind by a coroutine are cancelled — their
+    finally blocks run — instead of being destroyed with the loop."""
+    from duckdb.execution._async_runtime import AsyncRuntime
+
+    runtime = AsyncRuntime()
+    states: list[str] = []
+
+    async def background() -> None:
+        try:
+            states.append("started")
+            await asyncio.sleep(30)
+            states.append("finished")
+        finally:
+            states.append("cleaned-up")
+
+    async def spawn() -> None:
+        asyncio.get_running_loop().create_task(background())
+        await asyncio.sleep(0)  # let the task start
+
+    runtime.run(spawn())
+    assert states == ["started"]
+    runtime.close()
+    assert states == ["started", "cleaned-up"]
+
+
 def test_async_runtime_close_finalizes_async_generators():
     from duckdb.execution._async_runtime import AsyncRuntime
 

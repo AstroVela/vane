@@ -455,13 +455,21 @@ class _EmbedTextBatch:
         return self._embedder
 
     def close(self) -> None:
-        """Release the provider client on the bound loop. Idempotent."""
-        embedder, self._embedder = self._embedder, None
+        """Release a loop-owned provider client on the bound loop. Idempotent.
+
+        Providers without ``aclose`` (transformers, vLLM) hold no loop-bound
+        state and stay cached: task backends close the executor after every
+        invocation while the process-local callable cache keeps the wrapper,
+        so dropping them would reload the model on each task.
+        """
+        embedder = self._embedder
         if embedder is None or self._run_async is None:
             return
         aclose = getattr(embedder, "aclose", None)
-        if aclose is not None:
-            self._run_async(aclose())
+        if aclose is None:
+            return
+        self._embedder = None
+        self._run_async(aclose())
 
     def __getstate__(self) -> dict[str, Any]:
         # The cached client and the bound runtime capability are process-local.
@@ -641,13 +649,21 @@ class _PromptBatch:
         return self._prompter
 
     def close(self) -> None:
-        """Release the provider client on the bound loop. Idempotent."""
-        prompter, self._prompter = self._prompter, None
+        """Release a loop-owned provider client on the bound loop. Idempotent.
+
+        Providers without ``aclose`` (transformers, vLLM) hold no loop-bound
+        state and stay cached: task backends close the executor after every
+        invocation while the process-local callable cache keeps the wrapper,
+        so dropping them would reload the model on each task.
+        """
+        prompter = self._prompter
         if prompter is None or self._run_async is None:
             return
         aclose = getattr(prompter, "aclose", None)
-        if aclose is not None:
-            self._run_async(aclose())
+        if aclose is None:
+            return
+        self._prompter = None
+        self._run_async(aclose())
 
     def __getstate__(self) -> dict[str, Any]:
         # The cached client and the bound runtime capability are process-local.

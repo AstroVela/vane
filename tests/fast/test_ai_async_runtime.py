@@ -333,12 +333,33 @@ def test_close_before_first_batch_is_a_noop(runtime) -> None:
     assert descriptor.instantiations == 0
 
 
-def test_close_skips_providers_without_aclose(runtime) -> None:
-    wrapper = _EmbedTextBatch(PicklableEmbedDescriptor(), "text", "emb")
+def test_close_retains_providers_without_aclose(runtime) -> None:
+    """Sync providers (no loop-bound state) survive close: task backends
+    close the executor per invocation while the callable cache keeps the
+    wrapper, and dropping the provider would reload the model per task."""
+
+    class CountingSyncEmbedDescriptor:
+        def __init__(self) -> None:
+            self.instantiations = 0
+
+        def instantiate(self) -> PicklableEmbedder:
+            self.instantiations += 1
+            return PicklableEmbedder()
+
+    descriptor = CountingSyncEmbedDescriptor()
+    wrapper = _EmbedTextBatch(descriptor, "text", "emb")
     wrapper.bind_async_runtime(runtime.run)
     wrapper(pa.table({"text": ["a"]}))
 
-    wrapper.close()  # PicklableEmbedder has no aclose — must not raise
+    wrapper.close()  # no aclose — provider stays cached, must not raise
+
+    fresh = _Runtime()
+    try:
+        wrapper.bind_async_runtime(fresh.run)
+        wrapper(pa.table({"text": ["ab"]}))
+    finally:
+        fresh.close()
+    assert descriptor.instantiations == 1
 
 
 # ---------------------------------------------------------------------------

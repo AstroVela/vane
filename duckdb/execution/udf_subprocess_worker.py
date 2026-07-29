@@ -448,7 +448,8 @@ def _execute_task_submit(
             finish_before_drain=True,
         )
     finally:
-        executor.finished_submitting()
+        # close() flushes via finished_submitting() and releases the callable
+        # under its own finally, so cleanup runs even if the flush raises.
         executor.close()
 
 
