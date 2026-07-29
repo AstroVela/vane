@@ -7291,6 +7291,8 @@ def test_recv_expected_restores_socket_timeout_before_marking_broken(monkeypatch
         with pytest.raises(RuntimeError, match="connection reset"):
             executor._recv_expected((subprocess_exec._MSG_READY,), timeout_s=2.0)
     finally:
+        executor._closed = True
+        del executor._mark_broken
         parent_sock.close()
         child_sock.close()
 
