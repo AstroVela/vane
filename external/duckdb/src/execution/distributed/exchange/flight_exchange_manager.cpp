@@ -113,11 +113,13 @@ DuckDBResult<ParsedFlightHost> ParseFlightHost(std::string host) {
 struct LocalFlightServiceState {
 	std::mutex mutex;
 	std::unique_ptr<FlightServer> server;
+	bool shutting_down = false;
 	std::string bind_host;
 	std::string advertise_host;
 	int requested_port = 0;
 	int actual_port = 0;
 	std::string server_epoch;
+	std::chrono::milliseconds shutdown_grace_period {FlightServerConfig::DEFAULT_SHUTDOWN_GRACE_PERIOD};
 };
 
 LocalFlightServiceState &LocalFlightService() {
@@ -315,6 +317,10 @@ DuckDBResult<void> EnsureLocalFlightServerStartedInternal(const FlightServiceCon
 
 	auto &service = LocalFlightService();
 	std::lock_guard<std::mutex> guard(service.mutex);
+	if (service.shutting_down) {
+		return DuckDBResult<void>::err(
+		    DuckDBError::invalid_state_error("process-local Flight service is shutting down"));
+	}
 	if (service.server) {
 		if (service.bind_host != bind_host || service.advertise_host != advertise_host ||
 		    service.requested_port != config.port) {
@@ -325,6 +331,13 @@ DuckDBResult<void> EnsureLocalFlightServerStartedInternal(const FlightServiceCon
 			        << " advertised as " << advertise_host;
 			return DuckDBResult<void>::err(DuckDBError::invalid_state_error(message.str()));
 		}
+		if (service.shutdown_grace_period != config.shutdown_grace_period) {
+			std::ostringstream message;
+			message << "process-local Flight service already uses a shutdown grace period of "
+			        << service.shutdown_grace_period.count() << " ms; refusing conflicting grace period "
+			        << config.shutdown_grace_period.count() << " ms";
+			return DuckDBResult<void>::err(DuckDBError::invalid_state_error(message.str()));
+		}
 		return DuckDBResult<void>::ok();
 	}
 
@@ -332,6 +345,7 @@ DuckDBResult<void> EnsureLocalFlightServerStartedInternal(const FlightServiceCon
 	server_config.bind_host = bind_host;
 	server_config.port = config.port;
 	server_config.server_epoch = UUID::ToString(UUID::GenerateRandomUUID());
+	server_config.shutdown_grace_period = config.shutdown_grace_period;
 	auto server = std::unique_ptr<FlightServer>(new FlightServer(server_config));
 	auto start_res = server->Start();
 	if (start_res.is_err()) {
@@ -342,6 +356,7 @@ DuckDBResult<void> EnsureLocalFlightServerStartedInternal(const FlightServiceCon
 	service.requested_port = config.port;
 	service.actual_port = server->port();
 	service.server_epoch = std::move(server_config.server_epoch);
+	service.shutdown_grace_period = config.shutdown_grace_period;
 	service.server = std::move(server);
 	std::cerr << "Started plaintext cluster-internal Flight shuffle service at "
 	          << BuildFlightLocation(service.advertise_host, service.actual_port)
@@ -371,21 +386,32 @@ std::string CurrentLocalFlightServerEpoch() {
 
 DuckDBResult<void> ShutdownLocalFlightServerInternal() {
 	auto &service = LocalFlightService();
-	std::lock_guard<std::mutex> guard(service.mutex);
-	if (!service.server) {
-		return DuckDBResult<void>::ok();
+	std::unique_ptr<FlightServer> server;
+	{
+		std::lock_guard<std::mutex> guard(service.mutex);
+		if (service.shutting_down) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::invalid_state_error("process-local Flight service is already shutting down"));
+		}
+		if (!service.server) {
+			return DuckDBResult<void>::ok();
+		}
+		service.shutting_down = true;
+		server = std::move(service.server);
+		service.bind_host.clear();
+		service.advertise_host.clear();
+		service.requested_port = 0;
+		service.actual_port = 0;
+		service.server_epoch.clear();
+		service.shutdown_grace_period = FlightServerConfig::DEFAULT_SHUTDOWN_GRACE_PERIOD;
 	}
-	auto stop_res = service.server->Stop();
-	if (stop_res.is_err()) {
-		return stop_res;
+	auto stop_res = server->Stop();
+	server.reset();
+	{
+		std::lock_guard<std::mutex> guard(service.mutex);
+		service.shutting_down = false;
 	}
-	service.server.reset();
-	service.bind_host.clear();
-	service.advertise_host.clear();
-	service.requested_port = 0;
-	service.actual_port = 0;
-	service.server_epoch.clear();
-	return DuckDBResult<void>::ok();
+	return stop_res;
 }
 
 std::string BuildSinkOutputLocation(const std::string &exchange_instance_id, const ExchangeSinkHandle &handle,
