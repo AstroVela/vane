@@ -33,6 +33,7 @@ from duckdb.runners.ray.fte import (
     AssignmentResult,
     FteFragmentExecution,
     FteTaskAttemptId,
+    FteTaskExecution,
     FteTaskState,
     FteWorkerReservationUnavailable,
     NodeRequirements,
@@ -1098,6 +1099,231 @@ def test_fte_split_backpressure_terminal_status_uses_task_status_path(monkeypatc
         assert stats.event_counts.get("WorkerFailed", 0) == 0
     finally:
         fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
+
+
+@pytest.mark.parametrize(
+    ("terminal_state", "failure"),
+    [
+        pytest.param(FteTaskState.FINISHED, None, id="finished"),
+        pytest.param(
+            FteTaskState.FAILED,
+            {
+                "error_code": "GENERIC_INTERNAL_ERROR",
+                "message": "planned task failure",
+            },
+            id="failed",
+        ),
+        pytest.param(
+            FteTaskState.CANCELED,
+            {
+                "error_code": "TASK_CANCELED",
+                "message": "planned task cancellation",
+            },
+            id="canceled",
+        ),
+        pytest.param(
+            FteTaskState.ABORTED,
+            {
+                "error_code": "TASK_ABORTED",
+                "message": "planned task abort",
+            },
+            id="aborted",
+        ),
+    ],
+)
+def test_fte_late_add_splits_terminal_status_uses_task_status_path(
+    monkeypatch,
+    terminal_state,
+    failure,
+):
+    query_id = f"query-late-add-splits-{terminal_state.value.lower()}"
+    other_query_id = f"{query_id}-other"
+    attempt_id = FteTaskAttemptId.coerce(
+        {
+            "query_id": query_id,
+            "fragment_execution_id": 0,
+            "partition_id": 0,
+            "attempt_id": 0,
+        }
+    )
+
+    async def execute_fn(_request):
+        return None
+
+    execution = FteTaskExecution(
+        {
+            "task_id": attempt_id.to_dict(),
+            "dynamic_scan_source_node_ids": ["7"],
+        },
+        execute_fn,
+        default_task_memory_bytes=1,
+    )
+    execution._transition(terminal_state, failure=failure)
+    terminal_status = execution.status_payload()
+
+    class _TaskManager:
+        @staticmethod
+        async def add_splits(task_id, source_node_id, splits):
+            assert FteTaskAttemptId.coerce(task_id) == attempt_id
+            assert source_node_id == "7"
+            assert splits == [{"sequence_id": 1, "kind": "scan_task", "data": b"a"}]
+            execution.add_splits(source_node_id, splits)
+            raise AssertionError("terminal add_splits must not return normally")
+
+    class _WorkerEndpoint:
+        @staticmethod
+        def _get_fte_task_manager():
+            return _TaskManager()
+
+    actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+
+    class _LateTerminalAddActor(_FakeActor):
+        def _fte_wait_split_queue_has_space(
+            self,
+            task_id,
+            source_node_id=None,
+            max_buffered_splits=None,
+            timeout_s=None,
+        ):
+            self.fte_calls.append(
+                (
+                    "wait_split_queue",
+                    task_id,
+                    source_node_id,
+                    max_buffered_splits,
+                    timeout_s,
+                )
+            )
+            return {
+                "has_space": True,
+                "terminal": False,
+                "buffered_splits": 0,
+                "status": {
+                    "state": FteTaskState.RUNNING.value,
+                    "task_id": task_id,
+                },
+            }
+
+        def _fte_add_splits(self, task_id, source_node_id, splits, dependency=None):
+            self.fte_calls.append(("add_splits", task_id, source_node_id, splits))
+            return asyncio.run(
+                actor_class.fte_add_splits(
+                    _WorkerEndpoint(),
+                    task_id,
+                    source_node_id,
+                    splits,
+                    dependency,
+                )
+            )
+
+        def _fte_no_more_splits(self, *_args, **_kwargs):
+            raise AssertionError("terminal task must skip trailing controls")
+
+    actor = _LateTerminalAddActor()
+    handle = RayWorkerActorHandle(
+        actor,
+        memory_capacity_bytes=1 << 60,
+        worker_id=f"worker-late-add-splits-{terminal_state.value.lower()}",
+    )
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=f"{query_id}:node:7",
+        task_memory_bytes=1,
+    )
+    add_command = FteAddSplitsCommand(
+        query_id=query_id,
+        fragment_id=stage.fragment_id,
+        worker_id=handle.worker_id,
+        worker=handle,
+        attempt_id=attempt_id,
+        source_node_id="7",
+        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+    )
+    no_more_command = FteNoMoreSplitsCommand(
+        query_id=query_id,
+        fragment_id=stage.fragment_id,
+        worker_id=handle.worker_id,
+        worker=handle,
+        attempt_id=attempt_id,
+        source_node_id="7",
+    )
+    captured_events = []
+    monkeypatch.setattr(
+        handle,
+        "_handles_for_task_status_changed_event",
+        lambda event: captured_events.append(event) or [],
+    )
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+    worker_handle_mod.open_fte_registry_for_query(other_query_id)
+    other_scheduler = worker_commands_mod._FTE_SCHEDULERS.get_or_create(other_query_id)
+    handle._bind_fte_scheduler_handlers(other_scheduler)
+
+    try:
+        handle._execute_fte_fragment_execution_worker_commands(
+            stage,
+            [add_command, no_more_command],
+        )
+        scheduler = worker_commands_mod._FTE_SCHEDULERS.get(query_id)
+        assert scheduler is not None
+        scheduler.drain()
+
+        assert len(captured_events) == 1
+        assert captured_events[0].status == terminal_status
+        assert [call[0] for call in actor.fte_calls] == [
+            "wait_split_queue",
+            "add_splits",
+        ]
+        assert handle._fte_healthy is True
+        with worker_handle_mod._FTE_REGISTRY_LOCK:
+            assert worker_handle_mod._FTE_WORKER_HANDLES.get(handle.worker_id) is handle
+        assert scheduler.stats().event_counts.get("WorkerFailed", 0) == 0
+        assert other_scheduler.stats().event_counts.get("WorkerFailed", 0) == 0
+        assert handle.fte_drop_query(query_id) == {
+            "tasks_removed": 1,
+            "tasks_canceled": 0,
+            "fragments_removed": 2,
+        }
+        assert handle._has_fte_control_state_for_query(query_id) is False
+        assert handle._has_fte_teardown_state_for_query(query_id) is False
+        assert handle._fte_healthy is True
+        with worker_handle_mod._FTE_REGISTRY_LOCK:
+            assert worker_handle_mod._FTE_WORKER_HANDLES.get(handle.worker_id) is handle
+        assert other_scheduler.stats().event_counts.get("WorkerFailed", 0) == 0
+    finally:
+        fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
+        fte_fragment_scheduler_mod._drop_fte_registry_for_query(other_query_id)
+
+
+def test_fte_late_add_splits_unknown_attempt_remains_strict_error():
+    task_id = {
+        "query_id": "query-late-add-splits-unknown",
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+    }
+
+    class _TaskManager:
+        @staticmethod
+        async def add_splits(_task_id, _source_node_id, _splits):
+            raise KeyError("unknown FTE task attempt")
+
+    class _WorkerEndpoint:
+        @staticmethod
+        def _get_fte_task_manager():
+            return _TaskManager()
+
+    actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+
+    with pytest.raises(KeyError, match="unknown FTE task attempt"):
+        asyncio.run(
+            actor_class.fte_add_splits(
+                _WorkerEndpoint(),
+                task_id,
+                "7",
+                [{"sequence_id": 1, "kind": "scan_task", "data": b"a"}],
+            )
+        )
 
 
 def test_interruptible_fte_control_ref_preserves_completed_query_deadline():
@@ -2302,6 +2528,76 @@ def test_fte_worker_actor_handle_async_control_requires_dict_response(monkeypatc
         handle.enqueue_fte_no_more_splits(task_id, "7")
     with pytest.raises(TypeError, match="worker actor fte_update_task must return a dict"):
         handle.enqueue_fte_update_task(task_id, {"output_buffers": {"version": 1}})
+
+
+@pytest.mark.parametrize(
+    ("invalid_response", "error_pattern"),
+    [
+        pytest.param(
+            {
+                "state": FteTaskState.RUNNING.value,
+                "_fte_control_operation": "fte_add_splits",
+                "_fte_control_applied": False,
+            },
+            "not applied to non-terminal task",
+            id="non-terminal",
+        ),
+        pytest.param(
+            {
+                "state": FteTaskState.FAILED.value,
+                "_fte_control_operation": "fte_update_task",
+                "_fte_control_applied": False,
+            },
+            "control operation mismatch",
+            id="operation-mismatch",
+        ),
+        pytest.param(
+            {
+                "state": FteTaskState.FAILED.value,
+                "_fte_control_operation": "fte_add_splits",
+                "_fte_control_applied": False,
+                "partition_id": 2,
+            },
+            "status identity mismatch",
+            id="identity-mismatch",
+        ),
+    ],
+)
+def test_fte_worker_actor_handle_rejects_invalid_unapplied_add_status(
+    monkeypatch,
+    invalid_response,
+    error_pattern,
+):
+    task_id = {
+        "query_id": "query-invalid-unapplied-add",
+        "fragment_execution_id": 0,
+        "partition_id": 1,
+        "attempt_id": 0,
+    }
+    status = {
+        **invalid_response,
+        "task_id": {
+            **task_id,
+            "partition_id": invalid_response.get("partition_id", task_id["partition_id"]),
+        },
+    }
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-invalid-unapplied-add",
+    )
+    monkeypatch.setattr(
+        handle,
+        "_enqueue_ordered_fte_control_rpc",
+        lambda *_args, **_kwargs: status,
+    )
+
+    with pytest.raises(RuntimeError, match=error_pattern):
+        handle.enqueue_fte_add_splits(
+            task_id,
+            "7",
+            [{"sequence_id": 1}],
+        )
 
 
 def test_fte_worker_actor_handle_async_control_waits_for_remote_failure(monkeypatch):

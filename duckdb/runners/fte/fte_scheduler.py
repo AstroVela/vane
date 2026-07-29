@@ -42,7 +42,7 @@ class FteSplitSubmissionCancelled(InterruptedError):
 
 
 class FteSplitQueueTerminal(RuntimeError):
-    """The target task became terminal while split submission was backpressured."""
+    """The target task became terminal while a split submission was in flight."""
 
     def __init__(self, attempt_id: Any, status: Mapping[str, Any]) -> None:
         self.attempt_id = attempt_id
