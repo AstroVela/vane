@@ -24,6 +24,10 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 - Imported the official DuckDB baseline as a squashed Git subtree and retained
   Vane engine customizations as monorepo commits, so normal clones no longer
   require submodule initialization or carry DuckDB's complete commit history.
+- Made distributed exchange plans and task results a strict same-version
+  contract. Local-disk shuffle now requires an explicit producer identity,
+  advertised Flight host, port, and service epoch; missing or pre-contract
+  endpoint metadata is rejected instead of inferred.
 
 ### Fixed
 

@@ -521,19 +521,15 @@ void FlightExchange::SinkFinished(const ExchangeSinkInstanceHandle &instance, co
 		throw InvalidInputException("finished Flight sink port must be non-negative");
 	}
 	auto flight_host = instance.flight_host;
-	if (flight_host.empty() && flight_port > 0) {
-		// Compatibility for worker results produced before flight_host was
-		// carried separately from worker identity.
-		flight_host = node_id;
+	if (node_id.empty()) {
+		throw InvalidInputException("finished Flight sink is missing its worker identity");
 	}
+	const bool uses_network_transport = FlightExchangeUsesNetworkTransport(config_);
 	const bool has_flight_endpoint = !flight_host.empty() || flight_port > 0 || !instance.flight_server_epoch.empty();
-	if (!FlightExchangeUsesNetworkTransport(config_) && has_flight_endpoint) {
+	if (!uses_network_transport && has_flight_endpoint) {
 		throw InvalidInputException("non-local-disk Flight sink cannot publish a Flight endpoint");
 	}
-	if (has_flight_endpoint) {
-		if (node_id.empty()) {
-			throw InvalidInputException("finished Flight sink is missing its worker identity");
-		}
+	if (uses_network_transport) {
 		bool flight_host_is_wildcard = false;
 		if (!flight_host.empty()) {
 			auto flight_host_res = ParseFlightHost(flight_host);
@@ -751,14 +747,13 @@ std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 	auto build_source_file = [&](const SinkAttemptMetadata &attempt_metadata, idx_t partition_id) {
 		ExchangeSourceFile file;
 		file.path = attempt_metadata.output_location;
-		auto source_node_id = attempt_metadata.node_id.empty() ? config_.node_id : attempt_metadata.node_id;
-		if (file.path.empty() || source_node_id.empty() || config_.local_dirs.empty()) {
+		if (file.path.empty() || attempt_metadata.node_id.empty() || config_.local_dirs.empty()) {
 			return file;
 		}
 		try {
 			ShuffleCacheConfig cache_config;
 			cache_config.shuffle_stage_id = attempt_metadata.output_location;
-			cache_config.node_id = std::move(source_node_id);
+			cache_config.node_id = attempt_metadata.node_id;
 			cache_config.num_partitions = output_partition_count_;
 			cache_config.local_dirs = config_.local_dirs;
 			auto manifest_cache = MakeFlightExchangeShuffleCache(cache_config, config_, context_);
@@ -949,14 +944,44 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 	}
 
 	auto partition_id = handle.partition_id;
-	auto source_node_id = handle.node_id.empty() ? config_.node_id : handle.node_id;
+	if (handle.node_id.empty()) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
+		    DuckDBError::invalid_state_error("Flight exchange source handle is missing its producer identity"));
+	}
+	const auto &source_node_id = handle.node_id;
 	if (handle.files.empty() || handle.files[0].path.empty()) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
 		    DuckDBError::invalid_state_error("Flight exchange source handle is missing its catalog identity"));
 	}
 	auto output_location = handle.files[0].path;
-	auto source_flight_host = handle.flight_host.empty() ? source_node_id : handle.flight_host;
+	auto source_flight_host = handle.flight_host;
 	auto source_flight_port = handle.flight_port;
+	const bool uses_object_storage = FlightExchangeUsesObjectStorage(config_);
+	const bool uses_network_transport = FlightExchangeUsesNetworkTransport(config_);
+	const bool has_flight_endpoint =
+	    !source_flight_host.empty() || source_flight_port != 0 || !handle.flight_server_epoch.empty();
+	if (!uses_network_transport && has_flight_endpoint) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
+		    DuckDBError::invalid_state_error("non-local-disk Flight source handle cannot contain a Flight endpoint"));
+	}
+	if (uses_network_transport) {
+		if (source_flight_host.empty() || source_flight_port <= 0 || handle.flight_server_epoch.empty()) {
+			return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(DuckDBError::invalid_state_error(
+			    "local-disk Flight source handle requires producer identity, host, port, and server epoch"));
+		}
+		auto source_flight_host_res = ParseFlightHost(source_flight_host);
+		if (source_flight_host_res.is_err()) {
+			return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(DuckDBError::invalid_state_error(
+			    std::string("Flight exchange source handle has an invalid advertised host: ") +
+			    source_flight_host_res.error().what()));
+		}
+		const bool source_flight_host_is_wildcard = source_flight_host_res.value().is_wildcard;
+		source_flight_host = std::move(source_flight_host_res.value().host);
+		if (source_flight_host_is_wildcard || source_flight_host == "*") {
+			return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
+			    DuckDBError::invalid_state_error("Flight exchange source handle advertises a wildcard host"));
+		}
+	}
 
 	auto stream = make_uniq<PartitionStreamState>();
 	stream->expected_types.insert(stream->expected_types.end(), config_.expected_types.begin(),
@@ -965,7 +990,6 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 	DuckDBResult<ShufflePartitionFiles> files_res = DuckDBResult<ShufflePartitionFiles>::err(
 	    DuckDBError::invalid_state_error("uninitialized exchange source file result"));
 	std::shared_ptr<ShuffleCache> file_cache;
-	const bool uses_object_storage = FlightExchangeUsesObjectStorage(config_);
 	const bool uses_process_local_registry = !uses_object_storage && source_node_id == config_.node_id;
 	auto replay_object_manifest = [&]() {
 		if (config_.local_dirs.empty()) {
@@ -1035,31 +1059,6 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 		    output_location + " source_node_id=" + source_node_id + " partition=" + std::to_string(partition_id) +
 		    ": " + files_res.error().what()));
 	}
-	if (handle.flight_server_epoch.empty()) {
-		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
-		    DuckDBError::invalid_state_error("remote Flight exchange source handle is missing its server epoch"));
-	}
-	auto source_flight_host_res = ParseFlightHost(source_flight_host);
-	if (source_flight_host_res.is_err()) {
-		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(DuckDBError::invalid_state_error(
-		    std::string("remote Flight exchange source handle has an invalid advertised host: ") +
-		    source_flight_host_res.error().what()));
-	}
-	const bool source_flight_host_is_wildcard = source_flight_host_res.value().is_wildcard;
-	source_flight_host = std::move(source_flight_host_res.value().host);
-	if (source_flight_host.empty()) {
-		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
-		    DuckDBError::invalid_state_error("remote Flight exchange source handle is missing its advertised host"));
-	}
-	if (source_flight_host_is_wildcard || source_flight_host == "*") {
-		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
-		    DuckDBError::invalid_state_error("remote Flight exchange source handle advertises a wildcard host"));
-	}
-	if (source_flight_port <= 0) {
-		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
-		    DuckDBError::invalid_state_error("remote Flight exchange source handle is missing its port"));
-	}
-
 	auto location = BuildFlightLocation(source_flight_host, source_flight_port);
 	auto client_res = ConnectFlightExchangeClient(location);
 	if (client_res.is_err()) {

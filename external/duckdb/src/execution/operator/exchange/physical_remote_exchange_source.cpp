@@ -338,17 +338,17 @@ void PhysicalRemoteExchangeSource::SerializeOperatorData(Serializer &serializer)
 	serializer.WriteProperty(103, "shuffle_stage_id", exchange_id_);
 	serializer.WriteProperty(104, "partition_indices", partition_indices_);
 	serializer.WriteProperty(105, "source_nodes", source_nodes_);
-	serializer.WriteProperty(107, "flight_timeout_seconds", flight_config.flight_timeout_seconds);
-	serializer.WriteProperty(108, "source_handle_partition_ids", handle_partition_ids);
-	serializer.WriteProperty(109, "source_handle_node_ids", handle_node_ids);
-	serializer.WriteProperty(110, "source_handle_paths", handle_paths);
-	serializer.WriteProperty(111, "source_handle_flight_ports", handle_flight_ports);
-	serializer.WritePropertyWithDefault(112, "runtime_source_node_id", runtime_source_node_id_, optional_idx());
-	serializer.WriteProperty(113, "source_handle_attempt_ids", handle_attempt_ids);
-	serializer.WriteProperty(114, "local_dirs", local_dirs);
-	serializer.WriteProperty(115, "source_handle_flight_server_epochs", handle_flight_server_epochs);
-	serializer.WriteProperty(116, "source_catalog_handles_explicit", true);
-	serializer.WriteProperty(118, "source_handle_flight_hosts", handle_flight_hosts);
+	serializer.WriteProperty(106, "flight_timeout_seconds", flight_config.flight_timeout_seconds);
+	serializer.WriteProperty(107, "source_handle_partition_ids", handle_partition_ids);
+	serializer.WriteProperty(108, "source_handle_node_ids", handle_node_ids);
+	serializer.WriteProperty(109, "source_handle_paths", handle_paths);
+	serializer.WriteProperty(110, "source_handle_flight_ports", handle_flight_ports);
+	serializer.WritePropertyWithDefault(111, "runtime_source_node_id", runtime_source_node_id_, optional_idx());
+	serializer.WriteProperty(112, "source_handle_attempt_ids", handle_attempt_ids);
+	serializer.WriteProperty(113, "local_dirs", local_dirs);
+	serializer.WriteProperty(114, "source_handle_flight_server_epochs", handle_flight_server_epochs);
+	serializer.WriteProperty(115, "source_catalog_handles_explicit", true);
+	serializer.WriteProperty(116, "source_handle_flight_hosts", handle_flight_hosts);
 }
 
 } // namespace duckdb

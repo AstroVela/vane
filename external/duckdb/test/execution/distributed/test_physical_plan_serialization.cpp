@@ -129,7 +129,7 @@ TableFunction MakeTestInOutFunction() {
 	return func;
 }
 
-void SerializeLegacyRemoteExchangeSink(Serializer &serializer) {
+void SerializePreStrictRemoteExchangeSink(Serializer &serializer) {
 	vector<LogicalType> types = {LogicalType::INTEGER};
 	vector<unique_ptr<Expression>> partition_by;
 	vector<string> local_dirs = {"/legacy/local"};
@@ -157,7 +157,7 @@ void SerializeLegacyRemoteExchangeSink(Serializer &serializer) {
 	serializer.WriteList(198, "children", 0, [](Serializer::List &, idx_t) {});
 }
 
-void SerializeLegacyRemoteExchangeSource(Serializer &serializer) {
+void SerializePreStrictRemoteExchangeSource(Serializer &serializer) {
 	vector<LogicalType> types = {LogicalType::INTEGER};
 	vector<idx_t> partition_indices = {0};
 	vector<string> source_nodes = {"legacy-node"};
@@ -187,6 +187,48 @@ void SerializeLegacyRemoteExchangeSource(Serializer &serializer) {
 	serializer.WriteProperty(116, "source_catalog_handles_explicit", true);
 	serializer.WriteProperty(117, "allow_insecure_flight", true);
 	serializer.WriteList(198, "children", 0, [](Serializer::List &, idx_t) {});
+}
+
+string SerializeSinkDescriptorWithoutFlightHost() {
+	MemoryStream stream(Allocator::DefaultAllocator());
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	serializer.WriteProperty<idx_t>(1, "task_partition_id", 0);
+	serializer.WriteProperty<idx_t>(2, "attempt_id", 0);
+	serializer.WriteProperty(3, "output_location", string("pre-strict-sink"));
+	serializer.WriteProperty<idx_t>(4, "output_partition_count", 1);
+	serializer.WriteProperty(5, "flight_server_epoch", string("pre-strict-epoch"));
+	serializer.WriteProperty(6, "query_id", string("pre-strict-query"));
+	serializer.End();
+	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
+}
+
+string SerializeSourceDescriptorWithoutFlightHost() {
+	MemoryStream stream(Allocator::DefaultAllocator());
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	serializer.WriteProperty(1, "partition_indices", vector<idx_t> {0});
+	serializer.WriteList(2, "source_handles", 1, [&](Serializer::List &list, idx_t) {
+		list.WriteObject([&](Serializer &obj) {
+			obj.WriteProperty<idx_t>(1, "partition_id", 0);
+			obj.WriteProperty(2, "node_id", string("pre-strict-node"));
+			obj.WriteProperty<int>(3, "flight_port", 5010);
+			obj.WriteList(4, "files", 1, [&](Serializer::List &files, idx_t) {
+				files.WriteObject([&](Serializer &file_obj) {
+					file_obj.WriteProperty(1, "path", string("pre-strict-source"));
+					file_obj.WriteProperty<size_t>(2, "file_size", 0);
+					file_obj.WriteProperty<idx_t>(3, "rows", 0);
+				});
+			});
+			obj.WriteProperty<idx_t>(5, "attempt_id", 0);
+			obj.WriteProperty(6, "flight_server_epoch", string("pre-strict-epoch"));
+		});
+	});
+	serializer.WriteProperty<idx_t>(3, "source_partition_count", 1);
+	serializer.WriteProperty<idx_t>(4, "source_task_count", 1);
+	serializer.WriteProperty<bool>(5, "replicated", false);
+	serializer.End();
+	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
 }
 
 } // namespace
@@ -1330,6 +1372,13 @@ TEST_CASE("ExchangeSinkInstanceTaskDescriptor serialization preserves the worker
 	REQUIRE(roundtrip.sink_instance.flight_server_epoch == "endpoint-epoch");
 }
 
+TEST_CASE("Exchange task descriptors reject missing advertised hosts", "[serialization][physical_plan][exchange]") {
+	REQUIRE_THROWS(distributed::ExchangeSinkInstanceTaskDescriptor::DeserializeFromBytes(
+	    SerializeSinkDescriptorWithoutFlightHost()));
+	REQUIRE_THROWS(
+	    distributed::ExchangeSourceTaskDescriptor::DeserializeFromBytes(SerializeSourceDescriptorWithoutFlightHost()));
+}
+
 TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source handles",
           "[serialization][physical_plan][exchange]") {
 	Allocator allocator;
@@ -1428,8 +1477,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	REQUIRE(roundtrip_manager->config().flight_timeout_seconds == 7.5);
 }
 
-TEST_CASE("Legacy remote exchange payloads ignore node-local service config and derive missing advertised hosts",
-          "[serialization][physical_plan][exchange]") {
+TEST_CASE("Remote exchange plans reject pre-strict endpoint payloads", "[serialization][physical_plan][exchange]") {
 	{
 		Allocator allocator;
 		PhysicalPlan plan(allocator);
@@ -1437,20 +1485,13 @@ TEST_CASE("Legacy remote exchange payloads ignore node-local service config and 
 		SerializationOptions options;
 		BinarySerializer serializer(stream, options);
 		serializer.Begin();
-		SerializeLegacyRemoteExchangeSink(serializer);
+		SerializePreStrictRemoteExchangeSink(serializer);
 		serializer.End();
 
 		stream.Rewind();
 		BinaryDeserializer deserializer(stream);
 		deserializer.Begin();
-		auto deserialized_op = PhysicalOperator::Deserialize(deserializer, plan);
-		deserializer.End();
-		auto *sink = dynamic_cast<PhysicalRemoteExchangeSink *>(deserialized_op.get());
-		REQUIRE(sink != nullptr);
-		auto manager = std::dynamic_pointer_cast<distributed::FlightExchangeManager>(sink->GetExchangeManager());
-		REQUIRE(manager != nullptr);
-		REQUIRE(manager->config().node_id == "legacy-node");
-		REQUIRE(manager->config().local_dirs == vector<string> {"/legacy/local"});
+		REQUIRE_THROWS(PhysicalOperator::Deserialize(deserializer, plan));
 	}
 
 	{
@@ -1460,22 +1501,13 @@ TEST_CASE("Legacy remote exchange payloads ignore node-local service config and 
 		SerializationOptions options;
 		BinarySerializer serializer(stream, options);
 		serializer.Begin();
-		SerializeLegacyRemoteExchangeSource(serializer);
+		SerializePreStrictRemoteExchangeSource(serializer);
 		serializer.End();
 
 		stream.Rewind();
 		BinaryDeserializer deserializer(stream);
 		deserializer.Begin();
-		auto deserialized_op = PhysicalOperator::Deserialize(deserializer, plan);
-		deserializer.End();
-		auto *source = dynamic_cast<PhysicalRemoteExchangeSource *>(deserialized_op.get());
-		REQUIRE(source != nullptr);
-		auto manager = std::dynamic_pointer_cast<distributed::FlightExchangeManager>(source->GetExchangeManager());
-		REQUIRE(manager != nullptr);
-		REQUIRE(source->SourceHandles().size() == 1);
-		REQUIRE(source->SourceHandles()[0].node_id == "legacy-node");
-		REQUIRE(source->SourceHandles()[0].flight_host == "legacy-node");
-		REQUIRE(source->SourceHandles()[0].flight_port == 31337);
+		REQUIRE_THROWS(PhysicalOperator::Deserialize(deserializer, plan));
 	}
 }
 

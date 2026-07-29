@@ -25,7 +25,7 @@ class _RuntimeContext:
         ("flight.node.internal", "flight.node.internal"),
     ],
 )
-def test_ray_worker_init_uses_node_address_only_as_flight_host_fallback(
+def test_ray_worker_init_uses_ray_node_address_for_flight_host(
     monkeypatch,
     node_local_host,
     expected_host,
@@ -45,7 +45,7 @@ def test_ray_worker_init_uses_node_address_only_as_flight_host_fallback(
         num_gpus=0,
         duckdb_memory_bytes=128 * 1024**2,
         task_heap_capacity_bytes=128 * 1024**2,
-        flight_advertise_host_fallback="10.0.0.1",
+        ray_node_ip_address="10.0.0.1",
     )
 
     assert worker_mod.os.environ["VANE_FLIGHT_ADVERTISE_HOST"] == expected_host

@@ -1232,6 +1232,77 @@ TEST_CASE("Exchange: remote local-disk source rejects non-canonical numeric IPv4
 	}
 }
 
+TEST_CASE("Exchange: local-disk source requires explicit producer and endpoint metadata",
+          "[distributed][exchange][security]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	FlightExchangeConfig config;
+	config.node_id = "reader-node";
+	config.local_dirs = {TestCreatePath("exchange_remote_strict_endpoint")};
+	config.expected_types = {LogicalType::INTEGER};
+
+	auto read_handle = [&](ExchangeSourceHandle handle) {
+		FlightExchangeSource source(config, conn.context.get());
+		source.AddSourceHandles({std::move(handle)});
+		DataChunk output;
+		output.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
+		source.ReadChunk(output);
+	};
+
+	ExchangeSourceHandle complete;
+	complete.partition_id = 0;
+	complete.attempt_id = 1;
+	complete.node_id = "writer-worker";
+	complete.flight_host = "flight-writer.internal";
+	complete.flight_port = 5010;
+	complete.flight_server_epoch = "writer-epoch";
+	complete.files.push_back(ExchangeSourceFile("strict-endpoint-attempt", 0));
+
+	auto missing_identity = complete;
+	missing_identity.node_id.clear();
+	REQUIRE_THROWS_WITH(read_handle(std::move(missing_identity)), Catch::Matchers::Contains("producer identity"));
+
+	auto missing_host = complete;
+	missing_host.flight_host.clear();
+	REQUIRE_THROWS_WITH(read_handle(std::move(missing_host)),
+	                    Catch::Matchers::Contains("requires producer identity, host, port, and server epoch"));
+
+	auto missing_port = complete;
+	missing_port.flight_port = 0;
+	REQUIRE_THROWS_WITH(read_handle(std::move(missing_port)),
+	                    Catch::Matchers::Contains("requires producer identity, host, port, and server epoch"));
+
+	auto missing_epoch = complete;
+	missing_epoch.flight_server_epoch.clear();
+	REQUIRE_THROWS_WITH(read_handle(std::move(missing_epoch)),
+	                    Catch::Matchers::Contains("requires producer identity, host, port, and server epoch"));
+}
+
+TEST_CASE("Exchange: object-storage source rejects Flight endpoint metadata", "[distributed][exchange][security]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	FlightExchangeConfig config;
+	config.node_id = "reader-node";
+	config.local_dirs = {"s3://bucket/shuffle"};
+	config.expected_types = {LogicalType::INTEGER};
+	FlightExchangeSource source(config, conn.context.get());
+
+	ExchangeSourceHandle handle;
+	handle.partition_id = 0;
+	handle.attempt_id = 1;
+	handle.node_id = "writer-worker";
+	handle.flight_host = "flight-writer.internal";
+	handle.flight_port = 5010;
+	handle.flight_server_epoch = "writer-epoch";
+	handle.files.push_back(ExchangeSourceFile("s3://bucket/shuffle/strict-endpoint-attempt", 0));
+	source.AddSourceHandles({std::move(handle)});
+
+	DataChunk output;
+	output.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
+	REQUIRE_THROWS_WITH(source.ReadChunk(output),
+	                    Catch::Matchers::Contains("non-local-disk Flight source handle cannot contain"));
+}
+
 TEST_CASE("Exchange: FlightExchange coordinator lifecycle", "[distributed][exchange]") {
 	FlightExchangeConfig config;
 	config.node_id = "node_1";
@@ -1269,30 +1340,50 @@ TEST_CASE("Exchange: FlightExchange coordinator lifecycle", "[distributed][excha
 	REQUIRE(inst1.output_location.find(ctx.exchange_id) == string::npos);
 	REQUIRE(inst0.output_location.find("__sink_0__attempt_0") != string::npos);
 	REQUIRE(inst1.output_location.find("__sink_1__attempt_0") != string::npos);
+	inst0.flight_host = "flight-worker-0.internal";
+	inst0.flight_server_epoch = "worker-0-epoch";
+	inst1.flight_host = "flight-worker-1.internal";
+	inst1.flight_server_epoch = "worker-1-epoch";
 
 	auto wrong_query = inst0;
 	wrong_query.query_id = "other-query";
-	REQUIRE_THROWS_WITH(exchange->SinkFinished(wrong_query, "", 0), Catch::Matchers::Contains("query does not match"));
+	REQUIRE_THROWS_WITH(exchange->SinkFinished(wrong_query, "worker-0", 5000),
+	                    Catch::Matchers::Contains("query does not match"));
 	auto wrong_location = inst0;
 	wrong_location.output_location += "__wrong";
-	REQUIRE_THROWS_WITH(exchange->SinkFinished(wrong_location, "", 0),
+	REQUIRE_THROWS_WITH(exchange->SinkFinished(wrong_location, "worker-0", 5000),
 	                    Catch::Matchers::Contains("output location does not match"));
 	auto wrong_partition_count = inst0;
 	wrong_partition_count.output_partition_count++;
-	REQUIRE_THROWS_WITH(exchange->SinkFinished(wrong_partition_count, "", 0),
+	REQUIRE_THROWS_WITH(exchange->SinkFinished(wrong_partition_count, "worker-0", 5000),
 	                    Catch::Matchers::Contains("partition count does not match"));
 	REQUIRE_THROWS_WITH(exchange->SinkFinished(inst0, "worker-0", -1),
 	                    Catch::Matchers::Contains("port must be non-negative"));
 	REQUIRE_THROWS_WITH(exchange->SinkFinished(sink_handle0, 99),
 	                    Catch::Matchers::Contains("attempt was not instantiated"));
+	REQUIRE_THROWS_WITH(exchange->SinkFinished(inst0, "", 5000),
+	                    Catch::Matchers::Contains("missing its worker identity"));
+	auto missing_host = inst0;
+	missing_host.flight_host.clear();
+	REQUIRE_THROWS_WITH(exchange->SinkFinished(missing_host, "worker-0", 5000),
+	                    Catch::Matchers::Contains("endpoint requires host, port, and server epoch"));
+	REQUIRE_THROWS_WITH(exchange->SinkFinished(inst0, "worker-0", 0),
+	                    Catch::Matchers::Contains("endpoint requires host, port, and server epoch"));
+	auto missing_epoch = inst0;
+	missing_epoch.flight_server_epoch.clear();
+	REQUIRE_THROWS_WITH(exchange->SinkFinished(missing_epoch, "worker-0", 5000),
+	                    Catch::Matchers::Contains("endpoint requires host, port, and server epoch"));
 
 	// Finish sinks
-	inst0.flight_server_epoch = "worker-0-epoch";
 	exchange->SinkFinished(inst0, "worker-0", 5000);
 	exchange->SinkFinished(inst0, "worker-0", 5000);
 	auto wrong_node = inst0;
 	REQUIRE_THROWS_WITH(exchange->SinkFinished(wrong_node, "worker-other", 5000),
 	                    Catch::Matchers::Contains("node does not match"));
+	auto wrong_host = inst0;
+	wrong_host.flight_host = "flight-worker-other.internal";
+	REQUIRE_THROWS_WITH(exchange->SinkFinished(wrong_host, "worker-0", 5000),
+	                    Catch::Matchers::Contains("host does not match"));
 	auto wrong_port = inst0;
 	REQUIRE_THROWS_WITH(exchange->SinkFinished(wrong_port, "worker-0", 5001),
 	                    Catch::Matchers::Contains("port does not match"));
@@ -1300,7 +1391,7 @@ TEST_CASE("Exchange: FlightExchange coordinator lifecycle", "[distributed][excha
 	wrong_epoch.flight_server_epoch = "worker-other-epoch";
 	REQUIRE_THROWS_WITH(exchange->SinkFinished(wrong_epoch, "worker-0", 5000),
 	                    Catch::Matchers::Contains("epoch does not match"));
-	exchange->SinkFinished(sink_handle1, 0);
+	exchange->SinkFinished(inst1, "worker-1", 5001);
 	exchange->AllRequiredSinksFinished();
 
 	// Source handles should cover all partitions
@@ -1578,6 +1669,11 @@ TEST_CASE("Exchange: failed unselected-attempt cleanup releases its retry claim"
 	auto selected = exchange->InstantiateSink(sink, 0);
 	auto unselected = exchange->InstantiateSink(sink, 1);
 
+	auto endpoint_bearing = selected;
+	endpoint_bearing.flight_host = "flight-worker.internal";
+	endpoint_bearing.flight_server_epoch = "worker-epoch";
+	REQUIRE_THROWS_WITH(exchange->SinkFinished(endpoint_bearing, "worker-selected", 5010),
+	                    Catch::Matchers::Contains("non-local-disk Flight sink cannot publish"));
 	exchange->SinkFinished(selected, "worker-selected", 0);
 	REQUIRE_THROWS_WITH(exchange->SinkFinished(unselected, "worker-unselected", 0),
 	                    Catch::Matchers::Contains("requires ClientContext"));

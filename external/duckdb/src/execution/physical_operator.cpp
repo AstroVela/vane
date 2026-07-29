@@ -1143,26 +1143,21 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto repartition_type_raw = deserializer.ReadProperty<uint8_t>(106, "repartition_type");
 		auto partition_by = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(107, "partition_by");
 		auto local_dirs = deserializer.ReadProperty<vector<string>>(108, "local_dirs");
-		// Consume node-local service fields emitted by older plans, but never
-		// use driver-provided listener configuration on a worker.
-		(void)deserializer.ReadPropertyWithExplicitDefault<string>(109, "flight_bind_host", "");
-		(void)deserializer.ReadPropertyWithExplicitDefault<int>(110, "flight_port", 0);
 		auto repartition_type = static_cast<RepartitionSpec::Type>(repartition_type_raw);
 		// Create sink handle for this exchange
 		distributed::ExchangeSinkInstanceHandle sink_handle;
 		sink_handle.sink_handle.task_partition_id =
-		    deserializer.ReadPropertyWithDefault<idx_t>(111, "sink_task_partition_id");
-		sink_handle.attempt_id = deserializer.ReadPropertyWithDefault<idx_t>(112, "sink_attempt_id");
+		    deserializer.ReadPropertyWithDefault<idx_t>(109, "sink_task_partition_id");
+		sink_handle.attempt_id = deserializer.ReadPropertyWithDefault<idx_t>(110, "sink_attempt_id");
 		sink_handle.output_partition_count = num_partitions;
 		sink_handle.output_location =
-		    deserializer.ReadPropertyWithExplicitDefault<string>(113, "sink_output_location", exchange_id);
+		    deserializer.ReadPropertyWithExplicitDefault<string>(111, "sink_output_location", exchange_id);
 		auto range_boundaries =
-		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(114, "range_boundaries", {});
+		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(112, "range_boundaries", {});
 		auto range_order_modifiers =
-		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(115, "range_order_modifiers", {});
-		sink_handle.flight_server_epoch = deserializer.ReadProperty<string>(116, "flight_server_epoch");
-		sink_handle.query_id = deserializer.ReadProperty<string>(117, "query_id");
-		(void)deserializer.ReadPropertyWithExplicitDefault<bool>(118, "allow_insecure_flight", false);
+		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(113, "range_order_modifiers", {});
+		sink_handle.flight_server_epoch = deserializer.ReadProperty<string>(114, "flight_server_epoch");
+		sink_handle.query_id = deserializer.ReadProperty<string>(115, "query_id");
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.local_dirs = std::vector<std::string>(local_dirs.begin(), local_dirs.end());
@@ -1177,30 +1172,25 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto exchange_id = deserializer.ReadProperty<string>(103, "shuffle_stage_id");
 		auto partition_indices = deserializer.ReadProperty<vector<idx_t>>(104, "partition_indices");
 		auto source_nodes = deserializer.ReadProperty<vector<string>>(105, "source_nodes");
-		// Older plans carried a driver-derived location template. Endpoint
-		// selection now comes exclusively from the producing worker.
-		(void)deserializer.ReadPropertyWithExplicitDefault<string>(106, "flight_location_template", "");
-		auto timeout_seconds = deserializer.ReadProperty<double>(107, "flight_timeout_seconds");
+		auto timeout_seconds = deserializer.ReadProperty<double>(106, "flight_timeout_seconds");
 		auto source_handle_partition_ids =
-		    deserializer.ReadPropertyWithDefault<vector<idx_t>>(108, "source_handle_partition_ids");
+		    deserializer.ReadPropertyWithDefault<vector<idx_t>>(107, "source_handle_partition_ids");
 		auto source_handle_node_ids =
-		    deserializer.ReadPropertyWithDefault<vector<string>>(109, "source_handle_node_ids");
-		auto source_handle_paths = deserializer.ReadPropertyWithDefault<vector<string>>(110, "source_handle_paths");
+		    deserializer.ReadPropertyWithDefault<vector<string>>(108, "source_handle_node_ids");
+		auto source_handle_paths = deserializer.ReadPropertyWithDefault<vector<string>>(109, "source_handle_paths");
 		auto source_handle_flight_ports =
-		    deserializer.ReadPropertyWithDefault<vector<int>>(111, "source_handle_flight_ports");
-		auto runtime_source_node_id = deserializer.ReadPropertyWithDefault<optional_idx>(112, "runtime_source_node_id");
+		    deserializer.ReadPropertyWithDefault<vector<int>>(110, "source_handle_flight_ports");
+		auto runtime_source_node_id = deserializer.ReadPropertyWithDefault<optional_idx>(111, "runtime_source_node_id");
 		auto source_handle_attempt_ids =
-		    deserializer.ReadPropertyWithDefault<vector<idx_t>>(113, "source_handle_attempt_ids");
-		auto local_dirs = deserializer.ReadPropertyWithDefault<vector<string>>(114, "local_dirs");
+		    deserializer.ReadPropertyWithDefault<vector<idx_t>>(112, "source_handle_attempt_ids");
+		auto local_dirs = deserializer.ReadPropertyWithDefault<vector<string>>(113, "local_dirs");
 		auto source_handle_flight_server_epochs =
-		    deserializer.ReadProperty<vector<string>>(115, "source_handle_flight_server_epochs");
-		auto source_catalog_handles_explicit = deserializer.ReadProperty<bool>(116, "source_catalog_handles_explicit");
+		    deserializer.ReadProperty<vector<string>>(114, "source_handle_flight_server_epochs");
+		auto source_catalog_handles_explicit = deserializer.ReadProperty<bool>(115, "source_catalog_handles_explicit");
 		if (!source_catalog_handles_explicit) {
 			throw SerializationException("remote exchange source requires explicit catalog handles");
 		}
-		(void)deserializer.ReadPropertyWithExplicitDefault<bool>(117, "allow_insecure_flight", false);
-		auto source_handle_flight_hosts =
-		    deserializer.ReadPropertyWithDefault<vector<string>>(118, "source_handle_flight_hosts");
+		auto source_handle_flight_hosts = deserializer.ReadProperty<vector<string>>(116, "source_handle_flight_hosts");
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.node_id = distributed::ResolveFlightExchangeNodeIdFromEnv();
@@ -1209,11 +1199,6 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		flight_config.local_dirs = std::vector<std::string>(local_dirs.begin(), local_dirs.end());
 		auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
 		std::vector<distributed::ExchangeSourceHandle> source_handles;
-		if (source_handle_flight_hosts.empty()) {
-			// Compatibility for source handles serialized before advertised
-			// hosts were separated from worker identity.
-			source_handle_flight_hosts = source_handle_node_ids;
-		}
 		if (source_handle_partition_ids.size() != source_handle_node_ids.size() ||
 		    source_handle_partition_ids.size() != source_handle_paths.size() ||
 		    source_handle_partition_ids.size() != source_handle_flight_ports.size() ||

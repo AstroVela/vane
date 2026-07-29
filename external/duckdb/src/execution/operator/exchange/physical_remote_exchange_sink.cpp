@@ -309,13 +309,13 @@ void PhysicalRemoteExchangeSink::SerializeOperatorData(Serializer &serializer) c
 	serializer.WriteProperty(106, "repartition_type", static_cast<uint8_t>(repartition_type_));
 	serializer.WriteProperty(107, "partition_by", partition_by_);
 	serializer.WriteProperty(108, "local_dirs", local_dirs);
-	serializer.WriteProperty(111, "sink_task_partition_id", sink_handle_.sink_handle.task_partition_id);
-	serializer.WriteProperty(112, "sink_attempt_id", sink_handle_.attempt_id);
-	serializer.WriteProperty(113, "sink_output_location", sink_handle_.output_location);
-	serializer.WriteProperty(114, "range_boundaries", range_boundaries_);
-	serializer.WriteProperty(115, "range_order_modifiers", range_order_modifiers_);
-	serializer.WriteProperty(116, "flight_server_epoch", sink_handle_.flight_server_epoch);
-	serializer.WriteProperty(117, "query_id", sink_handle_.query_id);
+	serializer.WriteProperty(109, "sink_task_partition_id", sink_handle_.sink_handle.task_partition_id);
+	serializer.WriteProperty(110, "sink_attempt_id", sink_handle_.attempt_id);
+	serializer.WriteProperty(111, "sink_output_location", sink_handle_.output_location);
+	serializer.WriteProperty(112, "range_boundaries", range_boundaries_);
+	serializer.WriteProperty(113, "range_order_modifiers", range_order_modifiers_);
+	serializer.WriteProperty(114, "flight_server_epoch", sink_handle_.flight_server_epoch);
+	serializer.WriteProperty(115, "query_id", sink_handle_.query_id);
 }
 
 } // namespace duckdb
