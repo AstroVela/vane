@@ -21,7 +21,13 @@ construction, before any request is dispatched:
 - Option/model combinations the API is documented to reject (for
   example non-default sampling parameters on Claude Sonnet 5; the
   documented default ``temperature=1`` still passes) raise
-  :class:`ValueError` before dispatch.
+  :class:`ValueError` before dispatch. The same applies to
+  ``thinking.type`` values the selected model family rejects (manual
+  ``"enabled"`` on adaptive-only families, ``"disabled"`` on always-on
+  families, ``"adaptive"`` on extended-thinking-only families).
+- A forced ``tool_choice`` (``any``/``tool``) without ``return_format``
+  raises :class:`ValueError`: Vane only sends tool definitions for
+  structured output, so the API could not satisfy it.
 - ``extra_body`` is reserved for request fields the SDK does not model:
   Vane-owned fields and known request options inside it raise
   :class:`ValueError` instead of bypassing the validated contract.
@@ -96,7 +102,10 @@ _KNOWN_PROMPT_OPTIONS: frozenset[str] = frozenset(
 _VANE_OWNED_REQUEST_FIELDS: frozenset[str] = frozenset({"messages", "model", "stream", "system", "tools"})
 
 # Vane execution options that ride in ``prompt_options`` but are consumed by
-# the UDF machinery and never forwarded to the Messages API.
+# the UDF machinery (``get_udf_options``) and never forwarded to the Messages
+# API. ``concurrency`` is an alias for ``actor_number`` — the same mapping the
+# typed ``AnthropicProviderOptions.concurrency`` field uses — and conflicting
+# values for the pair are rejected at validation.
 _VANE_EXECUTION_OPTIONS: frozenset[str] = frozenset(
     {
         "actor_number",
@@ -114,18 +123,44 @@ _VANE_EXECUTION_OPTIONS: frozenset[str] = frozenset(
 # ``temperature`` has a documented default of 1.0 (Messages API reference,
 # https://platform.claude.com/docs/en/api/messages), so passing exactly that
 # value is accepted; ``top_p`` and ``top_k`` have no documented default, so
-# any explicit value is non-default and rejected. Documented sources:
-# https://platform.claude.com/docs/en/about-claude/models/whats-new-sonnet-5
-# (Claude Sonnet 5 returns a 400 error for non-default ``temperature``,
-# ``top_p``, or ``top_k``) and
-# https://platform.claude.com/docs/en/about-claude/models/migration-guide
-# ("Setting temperature, top_p, or top_k to a non-default value returns a
-# 400 error" on Claude Opus 4.7 and later Opus models).
+# any explicit value is non-default and rejected. Documented source
+# (https://platform.claude.com/docs/en/about-claude/models/extended-thinking-models#limits-and-feature-compatibility):
+# "On Claude Fable 5, Claude Mythos 5, Claude Mythos Preview, Claude Opus 5,
+# Claude Opus 4.8, Claude Opus 4.7, and Claude Sonnet 5, non-default
+# temperature, top_p, or top_k values return a 400 error on every request."
+_RESTRICTED_SAMPLING_OPTIONS: frozenset[str] = frozenset({"temperature", "top_k", "top_p"})
+
 _MODEL_UNSUPPORTED_OPTIONS: dict[str, frozenset[str]] = {
-    "claude-opus-4-7": frozenset({"temperature", "top_k", "top_p"}),
-    "claude-opus-4-8": frozenset({"temperature", "top_k", "top_p"}),
-    "claude-opus-5": frozenset({"temperature", "top_k", "top_p"}),
-    "claude-sonnet-5": frozenset({"temperature", "top_k", "top_p"}),
+    "claude-fable-5": _RESTRICTED_SAMPLING_OPTIONS,
+    "claude-mythos-5": _RESTRICTED_SAMPLING_OPTIONS,
+    "claude-mythos-preview": _RESTRICTED_SAMPLING_OPTIONS,
+    "claude-opus-4-7": _RESTRICTED_SAMPLING_OPTIONS,
+    "claude-opus-4-8": _RESTRICTED_SAMPLING_OPTIONS,
+    "claude-opus-5": _RESTRICTED_SAMPLING_OPTIONS,
+    "claude-sonnet-5": _RESTRICTED_SAMPLING_OPTIONS,
+}
+
+# ``thinking.type`` values the API rejects with a 400 per model family, from
+# the per-model table at
+# https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting#configurations-each-model-rejects:
+# adaptive-only families reject the legacy manual form (``"enabled"``),
+# always-on families additionally reject ``"disabled"``, and
+# extended-thinking-only families reject ``"adaptive"``. Claude Opus 5
+# rejects ``"disabled"`` only combined with effort xhigh/max; that
+# conditional case is not modeled here. Claude Mythos Preview still supports
+# the manual form, so it only rejects ``"disabled"``.
+_MODEL_REJECTED_THINKING_TYPES: dict[str, frozenset[str]] = {
+    "claude-fable-5": frozenset({"disabled", "enabled"}),
+    "claude-haiku-4-5": frozenset({"adaptive"}),
+    "claude-mythos-5": frozenset({"disabled", "enabled"}),
+    "claude-mythos-preview": frozenset({"disabled"}),
+    "claude-opus-4-1": frozenset({"adaptive"}),
+    "claude-opus-4-5": frozenset({"adaptive"}),
+    "claude-opus-4-7": frozenset({"enabled"}),
+    "claude-opus-4-8": frozenset({"enabled"}),
+    "claude-opus-5": frozenset({"enabled"}),
+    "claude-sonnet-4-5": frozenset({"adaptive"}),
+    "claude-sonnet-5": frozenset({"enabled"}),
 }
 
 
@@ -140,16 +175,26 @@ def _validate_prompt_options(model_name: str, options: Mapping[str, Any]) -> Non
     Raises:
         ValueError: If ``options`` contains keys that are neither known
             Messages API request options nor Vane execution options; if
+            ``actor_number`` and its alias ``concurrency`` disagree; if
             ``extra_body`` is not a mapping or carries Vane-owned or
-            otherwise-validated request fields; or if a sampling option
+            otherwise-validated request fields; if a sampling option
             carries a non-default value on a model family the API is
-            documented to reject it for.
+            documented to reject it for; or if ``thinking.type`` is a
+            value the selected model family is documented to reject.
     """
     unknown = sorted(key for key in options if key not in _KNOWN_PROMPT_OPTIONS and key not in _VANE_EXECUTION_OPTIONS)
     if unknown:
         raise ValueError(
             f"Unknown Anthropic prompt option(s) {unknown} for model {model_name!r}. "
             f"Supported Messages API request options: {sorted(_KNOWN_PROMPT_OPTIONS)}."
+        )
+    actor_number = options.get("actor_number")
+    concurrency = options.get("concurrency")
+    if actor_number is not None and concurrency is not None and actor_number != concurrency:
+        raise ValueError(
+            f"Conflicting Anthropic execution options actor_number={actor_number!r} "
+            f"and concurrency={concurrency!r}: concurrency is an alias for "
+            "actor_number. Pass only one of them."
         )
     extra_body = options.get("extra_body")
     if extra_body is not None:
@@ -184,6 +229,18 @@ def _validate_prompt_options(model_name: str, options: Mapping[str, Any]) -> Non
                     "explicit value is non-default). Omit the option(s) or select a "
                     "model that supports them."
                 )
+    thinking = options.get("thinking")
+    if isinstance(thinking, Mapping):
+        thinking_type = thinking.get("type")
+        for family, rejected_types in _MODEL_REJECTED_THINKING_TYPES.items():
+            if (model_name == family or model_name.startswith(f"{family}-")) and thinking_type in rejected_types:
+                raise ValueError(
+                    f"Anthropic model {model_name!r} does not support thinking.type "
+                    f"{thinking_type!r}: the API rejects this configuration with a 400 "
+                    "error on this model family (see the per-model table at "
+                    "https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting#configurations-each-model-rejects). "
+                    "Omit the thinking option or use a supported type."
+                )
 
 
 def _is_manual_thinking(thinking: Any) -> bool:
@@ -199,26 +256,16 @@ def _validate_option_combinations(return_format: Any | None, options: Mapping[st
     extended thinking (``thinking.type == "enabled"``) only supports
     auto/none tool choices
     (https://platform.claude.com/docs/en/about-claude/models/extended-thinking-models#thinking-with-tool-use).
-    ``max_tokens=0`` is a cache-prewarming request whose response has no
-    content, so options that imply output are rejected up front
+    Without ``return_format`` the request carries no tool definitions at
+    all, so a forced ``tool_choice`` (``any``/``tool``) cannot be
+    satisfied and the API rejects it. ``max_tokens=0`` is a
+    cache-prewarming request whose response has no content, so options
+    that imply output are rejected up front
     (https://platform.claude.com/docs/en/build-with-claude/prompt-caching#pre-warming-the-cache).
 
     Raises:
         ValueError: On any of the documented-invalid combinations above.
     """
-    if return_format is not None:
-        if "tool_choice" in options:
-            raise ValueError(
-                "return_format dispatches a forced extract_data tool choice, which "
-                f"would override the caller-supplied tool_choice {options['tool_choice']!r}. "
-                "Remove tool_choice from the options or drop return_format."
-            )
-        if _is_manual_thinking(options.get("thinking")):
-            raise ValueError(
-                "return_format dispatches a forced tool choice, which the Anthropic "
-                'API rejects together with manual extended thinking (thinking={"type": '
-                '"enabled", ...}). Use adaptive thinking or drop return_format.'
-            )
     if options.get("max_tokens") == 0:
         offending = []
         if return_format is not None:
@@ -236,6 +283,28 @@ def _validate_option_combinations(return_format: Any | None, options: Mapping[st
                 "max_tokens=0 is a cache-prewarming request whose successful response "
                 f"has no content; the API rejects it combined with {', '.join(offending)}. "
                 "Remove those options or use a positive max_tokens."
+            )
+    if return_format is not None:
+        if "tool_choice" in options:
+            raise ValueError(
+                "return_format dispatches a forced extract_data tool choice, which "
+                f"would override the caller-supplied tool_choice {options['tool_choice']!r}. "
+                "Remove tool_choice from the options or drop return_format."
+            )
+        if _is_manual_thinking(options.get("thinking")):
+            raise ValueError(
+                "return_format dispatches a forced tool choice, which the Anthropic "
+                'API rejects together with manual extended thinking (thinking={"type": '
+                '"enabled", ...}). Use adaptive thinking or drop return_format.'
+            )
+    else:
+        tool_choice = options.get("tool_choice")
+        if isinstance(tool_choice, Mapping) and tool_choice.get("type") in ("any", "tool"):
+            raise ValueError(
+                f"tool_choice {tool_choice!r} forces tool use, but without "
+                "return_format the request carries no tool definitions, which the "
+                "API cannot satisfy. Use return_format for structured output, or a "
+                'tool_choice of type "auto"/"none".'
             )
 
 
@@ -404,11 +473,15 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
         return dict(self.prompt_options)
 
     def get_udf_options(self) -> UDFOptions:
+        actor_number = self.prompt_options.get("actor_number")
+        if actor_number is None:
+            actor_number = self.prompt_options.get("concurrency")
         return UDFOptions(
             max_retries=0,  # anthropic client handles retries internally
             on_error=self.prompt_options.get("on_error", "raise"),
-            actor_number=self.prompt_options.get("actor_number"),
+            actor_number=actor_number,
             num_gpus=self.prompt_options.get("num_gpus"),
+            batch_size=self.prompt_options.get("batch_size"),
             max_api_concurrency=self.prompt_options.get("max_api_concurrency", 16),
         )
 

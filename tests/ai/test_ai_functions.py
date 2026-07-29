@@ -1201,6 +1201,58 @@ class TestAnthropicStrictOptions:
         with pytest.raises(ValueError, match="top_p"):
             self._provider(max_tokens=64).get_prompter(model="claude-sonnet-5", top_p=1.0)
 
+    @pytest.mark.parametrize("model", ["claude-fable-5", "claude-mythos-5", "claude-mythos-preview"])
+    def test_fable_mythos_sampling_option_rejected(self, model):
+        """The Fable/Mythos families document the same non-default rejection."""
+        with pytest.raises(ValueError, match="temperature") as excinfo:
+            self._provider(max_tokens=64).get_prompter(model=model, temperature=0.2)
+        assert model in str(excinfo.value)
+
+    def test_fable_default_temperature_passes(self):
+        """The documented default temperature is accepted on Fable too."""
+        desc = self._provider(max_tokens=64).get_prompter(model="claude-fable-5", temperature=1.0)
+        assert desc.prompt_options["temperature"] == 1.0
+
+    def test_fable_top_p_rejected(self):
+        with pytest.raises(ValueError, match="top_p"):
+            self._provider(max_tokens=64).get_prompter(model="claude-fable-5", top_p=1.0)
+
+    # --- per-model thinking.type restrictions -----------------------------
+
+    @pytest.mark.parametrize(
+        "model",
+        ["claude-sonnet-5", "claude-opus-4-7", "claude-fable-5", "claude-sonnet-5-20260601"],
+    )
+    def test_manual_thinking_rejected_on_adaptive_only_models(self, model):
+        """The removed manual form fails pre-dispatch on adaptive-only families."""
+        with pytest.raises(ValueError, match="thinking.type") as excinfo:
+            self._provider(max_tokens=64).get_prompter(model=model, thinking={"type": "enabled", "budget_tokens": 1024})
+        assert model in str(excinfo.value)
+
+    @pytest.mark.parametrize("model", ["claude-fable-5", "claude-mythos-5", "claude-mythos-preview"])
+    def test_disabled_thinking_rejected_on_always_on_models(self, model):
+        """Thinking cannot be turned off where it is always on."""
+        with pytest.raises(ValueError, match="disabled"):
+            self._provider(max_tokens=64).get_prompter(model=model, thinking={"type": "disabled"})
+
+    @pytest.mark.parametrize("model", ["claude-mythos-preview", "claude-opus-4-6"])
+    def test_manual_thinking_passes_where_still_supported(self, model):
+        """Mythos Preview and the 4.6 models still accept the manual form."""
+        desc = self._provider(max_tokens=64).get_prompter(
+            model=model, thinking={"type": "enabled", "budget_tokens": 1024}
+        )
+        assert desc.prompt_options["thinking"]["type"] == "enabled"
+
+    @pytest.mark.parametrize("model", ["claude-haiku-4-5", "claude-opus-4-5", "claude-sonnet-4-5"])
+    def test_adaptive_thinking_rejected_on_extended_only_models(self, model):
+        """Extended-thinking-only models reject the adaptive form."""
+        with pytest.raises(ValueError, match="adaptive"):
+            self._provider(max_tokens=64).get_prompter(model=model, thinking={"type": "adaptive"})
+
+    def test_adaptive_thinking_passes_on_adaptive_models(self):
+        desc = self._provider(max_tokens=64).get_prompter(model="claude-sonnet-5", thinking={"type": "adaptive"})
+        assert desc.prompt_options["thinking"] == {"type": "adaptive"}
+
     # --- extra_body cannot bypass the option contract ---------------------
 
     @pytest.mark.parametrize(
@@ -1396,6 +1448,42 @@ class TestAnthropicStrictOptions:
             prompt_options={"max_tokens": 64, "thinking": {"type": "adaptive"}},
         )
         assert desc.return_format is dict
+
+    # --- forced tool choice needs tool definitions ------------------------
+
+    @pytest.mark.parametrize(
+        "tool_choice",
+        [{"type": "any"}, {"type": "tool", "name": "extract_data"}],
+    )
+    def test_forced_tool_choice_without_return_format_rejected(self, tool_choice):
+        """Vane sends no tools without return_format, so forced tool use cannot be satisfied."""
+        with pytest.raises(ValueError, match="tool_choice"):
+            self._provider(max_tokens=64).get_prompter(tool_choice=tool_choice)
+
+    @pytest.mark.parametrize("tool_choice", [{"type": "auto"}, {"type": "none"}])
+    def test_no_tools_safe_tool_choice_passes(self, tool_choice):
+        """auto/none remain valid without tool definitions."""
+        desc = self._provider(max_tokens=64).get_prompter(tool_choice=tool_choice)
+        assert desc.prompt_options["tool_choice"] == tool_choice
+
+    # --- execution options flow into UDFOptions ---------------------------
+
+    def test_concurrency_and_batch_size_flow_into_udf_options(self):
+        """The raw-dict path carries concurrency/batch_size instead of dropping them."""
+        desc = self._provider(max_tokens=64).get_prompter(concurrency=3, batch_size=7)
+        udf_options = desc.get_udf_options()
+        assert udf_options.actor_number == 3
+        assert udf_options.batch_size == 7
+
+    def test_actor_number_and_matching_concurrency_pass(self):
+        """Equal values for the alias pair are not a conflict."""
+        desc = self._provider(max_tokens=64).get_prompter(actor_number=3, concurrency=3)
+        assert desc.get_udf_options().actor_number == 3
+
+    def test_conflicting_actor_number_and_concurrency_rejected(self):
+        """concurrency aliases actor_number; disagreeing values raise."""
+        with pytest.raises(ValueError, match="alias"):
+            self._provider(max_tokens=64).get_prompter(actor_number=2, concurrency=3)
 
     @pytest.mark.skipif(not _has_module("anthropic"), reason="anthropic not installed")
     def test_structured_output_dispatch_kwargs(self):
