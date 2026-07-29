@@ -106,7 +106,7 @@ inline void RemoveDistributedCopyDirectoryTree(FileSystem &fs, const std::string
 	std::vector<std::string> child_files;
 	try {
 		fs.ListFiles(dir, [&](const std::string &path, bool is_dir) {
-			auto full_path = fs.JoinPath(dir, path);
+			auto full_path = ResolveDistributedCopyListedPath(fs, dir, path);
 			if (is_dir) {
 				child_dirs.push_back(full_path);
 				return;
@@ -225,11 +225,46 @@ inline bool DistributedCopyDirectoryExistsNoThrow(FileSystem &fs, const std::str
 }
 
 inline DuckDBResult<std::string> CanonicalDistributedCopyBasePath(FileSystem &fs, const std::string &base_path) {
-	auto canonical_base_path = base_path;
-	StringUtil::RTrim(canonical_base_path, fs.PathSeparator(canonical_base_path));
-	if (canonical_base_path.empty()) {
+	if (base_path.empty()) {
 		return DuckDBResult<std::string>::err(
 		    DuckDBError::value_error("distributed COPY requires non-empty base_path"));
+	}
+
+	auto canonical_base_path = base_path;
+	auto protocol = canonical_base_path.find("://");
+	auto separator = protocol == std::string::npos ? fs.PathSeparator(canonical_base_path) : std::string("/");
+	if (separator.empty()) {
+		return DuckDBResult<std::string>::ok(std::move(canonical_base_path));
+	}
+	idx_t root_length = 0;
+	if (protocol != std::string::npos) {
+		auto authority_start = protocol + 3;
+		auto authority_end = canonical_base_path.find(separator, authority_start);
+		if (authority_end == std::string::npos && authority_start < canonical_base_path.size()) {
+			canonical_base_path += separator;
+			root_length = canonical_base_path.size();
+		} else if (authority_end != std::string::npos) {
+			root_length = authority_end + separator.size();
+		}
+	} else if (fs.IsPathAbsolute(canonical_base_path)) {
+		if (separator == "\\" && StringUtil::StartsWith(canonical_base_path, separator + separator)) {
+			auto authority_end = canonical_base_path.find(separator, separator.size() * 2);
+			if (authority_end != std::string::npos) {
+				auto share_end = canonical_base_path.find(separator, authority_end + separator.size());
+				root_length =
+				    share_end == std::string::npos ? canonical_base_path.size() : share_end + separator.size();
+			}
+		} else if (StringUtil::StartsWith(canonical_base_path, separator)) {
+			root_length = separator.size();
+		} else {
+			auto root_end = canonical_base_path.find(separator);
+			if (root_end != std::string::npos) {
+				root_length = root_end + separator.size();
+			}
+		}
+	}
+	while (canonical_base_path.size() > root_length && StringUtil::EndsWith(canonical_base_path, separator)) {
+		canonical_base_path.resize(canonical_base_path.size() - separator.size());
 	}
 	return DuckDBResult<std::string>::ok(std::move(canonical_base_path));
 }

@@ -207,6 +207,28 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	auto root = fs.PathSeparator(std::string());
 	auto root_output_path = root + "copy-output";
 	auto root_temporary_output_path = root + "tmp_copy-output";
+	auto root_res = CanonicalDistributedCopyBasePath(fs, root + root + root);
+	REQUIRE(root_res.is_ok());
+	REQUIRE(root_res.value() == root);
+	auto root_paths = BuildDistributedCopyFinalizeCommitPaths(fs, root_res.value(), "run-root");
+	REQUIRE(root_paths.commit_dir == root + ".duckdb_commit" + root + "run-root");
+
+	auto authority_root_res = CanonicalDistributedCopyBasePath(fs, "s3://bucket///");
+	REQUIRE(authority_root_res.is_ok());
+	REQUIRE(authority_root_res.value() == "s3://bucket/");
+	auto authority_root_without_separator_res = CanonicalDistributedCopyBasePath(fs, "s3://bucket");
+	REQUIRE(authority_root_without_separator_res.is_ok());
+	REQUIRE(authority_root_without_separator_res.value() == "s3://bucket/");
+	auto authority_paths =
+	    BuildDistributedCopyFinalizeCommitPaths(fs, authority_root_res.value(), "run-authority-root");
+	REQUIRE(authority_paths.commit_dir == "s3://bucket/.duckdb_commit/run-authority-root");
+	auto authority_prefix_res = CanonicalDistributedCopyBasePath(fs, "s3://bucket/prefix///");
+	REQUIRE(authority_prefix_res.is_ok());
+	REQUIRE(authority_prefix_res.value() == "s3://bucket/prefix");
+	auto empty_authority_root_res = CanonicalDistributedCopyBasePath(fs, "file:////");
+	REQUIRE(empty_authority_root_res.is_ok());
+	REQUIRE(empty_authority_root_res.value() == "file:///");
+
 	spec.file_path = root_temporary_output_path;
 	spec.use_tmp_file = true;
 	auto root_temporary_res = CanonicalDistributedCopyBasePath(fs, spec);
@@ -298,6 +320,23 @@ TEST_CASE("Distributed COPY resolves relative and qualified list paths",
 	REQUIRE(ResolveDistributedCopyListedPath(fs, local_directory, local_path) == local_path);
 	auto root = fs.PathSeparator(std::string());
 	REQUIRE(ResolveDistributedCopyListedPath(fs, root, "lifecycle.txt") == root + "lifecycle.txt");
+}
+
+TEST_CASE("Distributed COPY removes directory trees from qualified file-only listings",
+          "[distributed][copy][lifecycle][object-storage][path]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_qualified_directory_cleanup");
+	auto &local_fs = test_dir.fs;
+	auto cleanup_root = local_fs.JoinPath(test_dir.path, "cleanup");
+	auto first_file = local_fs.JoinPath(cleanup_root, "first.txt");
+	auto nested_file = local_fs.JoinPath(cleanup_root, "nested", "second.txt");
+	WriteTestFile(local_fs, first_file, "first");
+	WriteTestFile(local_fs, nested_file, "second");
+
+	FileOnlyRecursiveListFileSystem qualified_fs(true);
+	RemoveDistributedCopyDirectoryTree(qualified_fs, cleanup_root);
+
+	REQUIRE_FALSE(local_fs.FileExists(first_file));
+	REQUIRE_FALSE(local_fs.FileExists(nested_file));
 }
 
 TEST_CASE("Distributed COPY strict marker checks use the portable local missing-file contract",
