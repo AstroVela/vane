@@ -164,27 +164,35 @@ static unique_ptr<GlobalTableFunctionState> DataSourceScanInitGlobal(ClientConte
 // ── Init Local ─────────────────────────────────────────────────────
 // Each pipeline thread gets its own local state. On init, grab first task.
 
+static void DataSourceScanStartNextTask(const DataSourceScanBindData &bind_data, DataSourceScanGlobalState &gstate,
+                                        DataSourceScanLocalState &lstate) {
+	D_ASSERT(lstate.state == DataSourceScanLocalState::ScanState::NEED_TASK);
+	D_ASSERT(!lstate.stream);
+
+	auto idx = gstate.next_task_idx.fetch_add(1);
+	if (idx >= gstate.total_tasks) {
+		lstate.state = DataSourceScanLocalState::ScanState::EXHAUSTED;
+		return;
+	}
+
+	auto &pickled = bind_data.pickled_tasks[idx];
+	auto stream_wrapper = make_uniq<ArrowArrayStreamWrapper>();
+	RequireProduceStream(bind_data.produce_stream)(pickled.c_str(), pickled.size(),
+	                                               &stream_wrapper->arrow_array_stream);
+	lstate.stream = std::move(stream_wrapper);
+	lstate.state = DataSourceScanLocalState::ScanState::NEED_BATCH;
+}
+
 static unique_ptr<LocalTableFunctionState> DataSourceScanInitLocal(ExecutionContext &context,
                                                                    TableFunctionInitInput &input,
                                                                    GlobalTableFunctionState *global_state) {
 	auto &bind_data = input.bind_data->Cast<DataSourceScanBindData>();
 	auto &gstate = global_state->Cast<DataSourceScanGlobalState>();
-	auto result = make_uniq<DataSourceScanLocalState>();
-
-	// Grab first task for this thread
-	auto idx = gstate.next_task_idx.fetch_add(1);
-	if (idx >= gstate.total_tasks) {
-		result->exhausted = true;
-		return std::move(result);
+	auto result = make_uniq<DataSourceScanLocalState>(context.client);
+	for (idx_t i = 0; i < bind_data.arrow_table.GetColumns().size(); i++) {
+		result->scan_state.column_ids.push_back(i);
 	}
-
-	// Produce stream for this task
-	auto &pickled = bind_data.pickled_tasks[idx];
-	auto stream_wrapper = make_uniq<ArrowArrayStreamWrapper>();
-	RequireProduceStream(bind_data.produce_stream)(pickled.c_str(), pickled.size(),
-	                                               &stream_wrapper->arrow_array_stream);
-	result->stream = std::move(stream_wrapper);
-
+	DataSourceScanStartNextTask(bind_data, gstate, *result);
 	return std::move(result);
 }
 
@@ -192,58 +200,54 @@ static unique_ptr<LocalTableFunctionState> DataSourceScanInitLocal(ExecutionCont
 // Each pipeline thread pulls chunks from its current ArrowArrayStream.
 // When exhausted, grabs the next task.
 
-static void DataSourceScanGetData(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+static void DataSourceScanGetData(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<DataSourceScanBindData>();
 	auto &gstate = data.global_state->Cast<DataSourceScanGlobalState>();
 	auto &lstate = data.local_state->Cast<DataSourceScanLocalState>();
 
-	while (!lstate.exhausted) {
-		if (lstate.stream) {
-			// Try to get next chunk from current stream
+	while (true) {
+		switch (lstate.state) {
+		case DataSourceScanLocalState::ScanState::NEED_TASK:
+			DataSourceScanStartNextTask(bind_data, gstate, lstate);
+			break;
+		case DataSourceScanLocalState::ScanState::NEED_BATCH: {
+			D_ASSERT(lstate.stream);
+			auto &scan_state = lstate.scan_state;
+			scan_state.Reset();
 			auto chunk = lstate.stream->GetNextChunk();
-			if (chunk->arrow_array.release && chunk->arrow_array.length > 0) {
-				// Convert Arrow → DataChunk using ArrowScanLocalState
-				auto output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, NumericCast<idx_t>(chunk->arrow_array.length));
-
-				// ArrowScanLocalState needs unique_ptr, but GetNextChunk returns shared_ptr
-				// Move the ArrowArray into a new unique_ptr wrapper
-				auto owned_chunk = make_uniq<ArrowArrayWrapper>();
-				owned_chunk->arrow_array = chunk->arrow_array;
-				chunk->arrow_array.release = nullptr; // prevent double-free
-
-				ArrowScanLocalState arrow_lstate(std::move(owned_chunk), context);
-				// Set column_ids to identity mapping (no projection pushdown)
-				for (idx_t i = 0; i < bind_data.arrow_table.GetColumns().size(); i++) {
-					arrow_lstate.column_ids.push_back(i);
-				}
-
-				output.SetCardinality(output_size);
-				ArrowTableFunction::ArrowToDuckDB(arrow_lstate, bind_data.arrow_table.GetColumns(), output,
-				                                  false /* arrow_scan_is_projected */);
-				output.Verify();
-				return;
+			while (chunk->arrow_array.release && chunk->arrow_array.length == 0) {
+				chunk = lstate.stream->GetNextChunk();
 			}
-			// Stream exhausted
-			lstate.stream.reset();
+			scan_state.chunk = std::move(chunk);
+			if (scan_state.chunk->arrow_array.release) {
+				lstate.state = DataSourceScanLocalState::ScanState::SCANNING;
+			} else {
+				lstate.stream.reset();
+				lstate.state = DataSourceScanLocalState::ScanState::NEED_TASK;
+			}
+			break;
 		}
-
-		// Grab next task
-		auto idx = gstate.next_task_idx.fetch_add(1);
-		if (idx >= gstate.total_tasks) {
-			lstate.exhausted = true;
+		case DataSourceScanLocalState::ScanState::SCANNING: {
+			auto &scan_state = lstate.scan_state;
+			D_ASSERT(scan_state.chunk->arrow_array.release);
+			auto chunk_size = NumericCast<idx_t>(scan_state.chunk->arrow_array.length);
+			D_ASSERT(scan_state.chunk_offset < chunk_size);
+			auto output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, chunk_size - scan_state.chunk_offset);
+			output.SetCardinality(output_size);
+			ArrowTableFunction::ArrowToDuckDB(scan_state, bind_data.arrow_table.GetColumns(), output,
+			                                  false /* arrow_scan_is_projected */);
+			output.Verify();
+			scan_state.chunk_offset += output.size();
+			if (scan_state.chunk_offset == chunk_size) {
+				lstate.state = DataSourceScanLocalState::ScanState::NEED_BATCH;
+			}
+			return;
+		}
+		case DataSourceScanLocalState::ScanState::EXHAUSTED:
 			output.SetCardinality(0);
 			return;
 		}
-
-		// Produce new stream
-		auto &pickled = bind_data.pickled_tasks[idx];
-		auto stream_wrapper = make_uniq<ArrowArrayStreamWrapper>();
-		RequireProduceStream(bind_data.produce_stream)(pickled.c_str(), pickled.size(),
-		                                               &stream_wrapper->arrow_array_stream);
-		lstate.stream = std::move(stream_wrapper);
 	}
-
-	output.SetCardinality(0);
 }
 
 // ── Serialize/Deserialize ──────────────────────────────────────────
