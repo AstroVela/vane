@@ -74,6 +74,17 @@ class FteWorkerTaskControlMixin:
         status = dict(raw_status)
         if status.get("_fte_control_applied") is not False:
             return status
+        status = FteWorkerTaskControlMixin._validated_terminal_fte_add_splits_status(
+            task_id,
+            status,
+        )
+        raise FteSplitQueueTerminal(FteTaskAttemptId.coerce(task_id), status)
+
+    @staticmethod
+    def _validated_terminal_fte_add_splits_status(
+        task_id: str | dict[str, Any],
+        status: dict[str, Any],
+    ) -> dict[str, Any]:
         attempt_id = FteTaskAttemptId.coerce(task_id)
         validate_fte_status_identity(status, attempt_id)
         if status.get("_fte_control_operation") != "fte_add_splits":
@@ -92,7 +103,7 @@ class FteWorkerTaskControlMixin:
             )
         status.pop("_fte_control_operation", None)
         status.pop("_fte_control_applied", None)
-        raise FteSplitQueueTerminal(attempt_id, status)
+        return status
 
     def _fte_control_rpc(
         self,
@@ -695,7 +706,12 @@ class FteWorkerTaskControlMixin:
                         f"task={task_key} expected={expected_operation!r} "
                         f"actual={status.get('_fte_control_operation')!r}"
                     )
-                if status.get("_fte_control_applied") is not True:
+                if expected_operation == "fte_add_splits" and status.get("_fte_control_applied") is False:
+                    status = self._validated_terminal_fte_add_splits_status(
+                        task_key,
+                        status,
+                    )
+                elif status.get("_fte_control_applied") is not True:
                     raise RuntimeError(
                         f"FTE control barrier operation was not applied: task={task_key} operation={expected_operation}"
                     )

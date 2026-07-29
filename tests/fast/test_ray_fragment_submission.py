@@ -1279,6 +1279,17 @@ def test_fte_late_add_splits_terminal_status_uses_task_status_path(
             assert worker_handle_mod._FTE_WORKER_HANDLES.get(handle.worker_id) is handle
         assert scheduler.stats().event_counts.get("WorkerFailed", 0) == 0
         assert other_scheduler.stats().event_counts.get("WorkerFailed", 0) == 0
+        assert handle.fte_drop_query(query_id) == {
+            "tasks_removed": 1,
+            "tasks_canceled": 0,
+            "fragments_removed": 2,
+        }
+        assert handle._has_fte_control_state_for_query(query_id) is False
+        assert handle._has_fte_teardown_state_for_query(query_id) is False
+        assert handle._fte_healthy is True
+        with worker_handle_mod._FTE_REGISTRY_LOCK:
+            assert worker_handle_mod._FTE_WORKER_HANDLES.get(handle.worker_id) is handle
+        assert other_scheduler.stats().event_counts.get("WorkerFailed", 0) == 0
     finally:
         fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
         fte_fragment_scheduler_mod._drop_fte_registry_for_query(other_query_id)
