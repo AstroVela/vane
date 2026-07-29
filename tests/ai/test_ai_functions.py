@@ -725,7 +725,12 @@ class TestUDFExecutionOptions:
 
         assert OpenAITextEmbedderDescriptor(embed_options={"num_gpus": 1}).get_udf_options().num_gpus == 1
         assert OpenAIPrompterDescriptor(prompt_options={"num_gpus": 2}).get_udf_options().num_gpus == 2
-        assert AnthropicPrompterDescriptor(prompt_options={"num_gpus": 3}).get_udf_options().num_gpus == 3
+        assert (
+            AnthropicPrompterDescriptor(model_name="claude-test-model", prompt_options={"num_gpus": 3})
+            .get_udf_options()
+            .num_gpus
+            == 3
+        )
         assert (
             GoogleTextEmbedderDescriptor(model_name="gemini-embedding-001", embed_options={"num_gpus": 4})
             .get_udf_options()
@@ -962,7 +967,7 @@ class TestAnthropicProvider:
         """Anthropic descriptor produces correct UDFOptions."""
         from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 
-        desc = AnthropicPrompterDescriptor()
+        desc = AnthropicPrompterDescriptor(model_name="claude-test-model")
         opts = desc.get_udf_options()
         assert opts.max_api_concurrency == 16
 
@@ -990,6 +995,7 @@ class TestAnthropicProvider:
 
         provider = AnthropicProvider(api_key="ctor-key", base_url="https://ctor.example")
         desc = provider.get_prompter(
+            model="claude-test-model",
             api_key="call-key",
             base_url="https://call.example",
             timeout=30,
@@ -1007,6 +1013,74 @@ class TestAnthropicProvider:
         assert "base_url" not in desc.prompt_options
         assert desc.prompt_options["max_api_concurrency"] == 6
         assert desc.prompt_options["temperature"] == 0
+
+    def test_descriptor_requires_model_name(self):
+        """AnthropicPrompterDescriptor.model_name is required."""
+        from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
+
+        with pytest.raises(TypeError):
+            AnthropicPrompterDescriptor()
+
+    def test_get_prompter_without_model_raises(self):
+        """Missing model fails fast, naming both fix paths."""
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        provider = AnthropicProvider(api_key="test-key")
+        with pytest.raises(ValueError, match="No prompt model configured") as excinfo:
+            provider.get_prompter()
+        message = str(excinfo.value)
+        assert "model=" in message
+        assert "AnthropicProvider(prompt_model=" in message
+
+    def test_provider_prompt_model_flows_through(self):
+        """Provider-level prompt_model configures the descriptor model."""
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        provider = AnthropicProvider(api_key="test-key", prompt_model="claude-config-model")
+        desc = provider.get_prompter()
+        assert desc.model_name == "claude-config-model"
+        # prompt_model is provider-level config, never a request option.
+        assert "prompt_model" not in desc.prompt_options
+        assert "prompt_model" not in desc.provider_options
+
+    def test_call_model_overrides_provider_prompt_model(self):
+        """Call-site model beats provider-level prompt_model."""
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        provider = AnthropicProvider(api_key="test-key", prompt_model="claude-config-model")
+        desc = provider.get_prompter(model="claude-call-model")
+        assert desc.model_name == "claude-call-model"
+
+    @pytest.mark.parametrize("model", ["", "   "])
+    def test_blank_call_model_rejected(self, model):
+        """A blank call-site model is an error, not a provider-config fallback."""
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        provider = AnthropicProvider(api_key="test-key", prompt_model="claude-config-model")
+        with pytest.raises(ValueError, match="non-empty string"):
+            provider.get_prompter(model=model)
+
+    def test_blank_provider_prompt_model_rejected(self):
+        """A blank provider-level prompt_model fails at expression-build time."""
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        provider = AnthropicProvider(api_key="test-key", prompt_model="")
+        with pytest.raises(ValueError, match="non-empty string"):
+            provider.get_prompter()
+
+    def test_ctor_prompt_model_is_keyword_only(self):
+        """prompt_model must be passed by name; positional use is a TypeError."""
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        with pytest.raises(TypeError):
+            AnthropicProvider("anthropic", "claude-config-model")
+
+    def test_ctor_typo_is_a_type_error(self):
+        """A misspelled ctor kwarg raises immediately instead of leaking into request options."""
+        from vane.ai.providers.anthropic import AnthropicProvider
+
+        with pytest.raises(TypeError):
+            AnthropicProvider(api_key="test-key", promt_model="claude-config-model")
 
 
 # ---------------------------------------------------------------------------
@@ -1818,19 +1892,19 @@ class TestAnthropicStructuredOutput:
     def test_descriptor_has_return_format(self):
         from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 
-        desc = AnthropicPrompterDescriptor(return_format=dict)
+        desc = AnthropicPrompterDescriptor(model_name="claude-test-model", return_format=dict)
         assert desc.return_format is dict
 
     def test_descriptor_default_no_return_format(self):
         from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 
-        desc = AnthropicPrompterDescriptor()
+        desc = AnthropicPrompterDescriptor(model_name="claude-test-model")
         assert desc.return_format is None
 
     def test_descriptor_pickle_with_return_format(self):
         from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 
-        desc = AnthropicPrompterDescriptor(return_format=dict)
+        desc = AnthropicPrompterDescriptor(model_name="claude-test-model", return_format=dict)
         restored = pickle.loads(pickle.dumps(desc))
         assert restored.return_format is dict
 
@@ -1838,7 +1912,7 @@ class TestAnthropicStructuredOutput:
         from vane.ai.providers.anthropic import AnthropicProvider
 
         prov = AnthropicProvider(api_key="test")
-        desc = prov.get_prompter(return_format=dict)
+        desc = prov.get_prompter(model="claude-test-model", return_format=dict)
         assert desc.return_format is dict
 
     @pytest.mark.skipif(not _has_module("anthropic"), reason="anthropic not installed")

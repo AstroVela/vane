@@ -7,6 +7,10 @@ Supports prompting via the Anthropic Messages API with multimodal input
 (text + images) and structured output via tool_use. Anthropic does not
 offer an embedding API, so only ``get_prompter`` is implemented.
 
+Vane does not ship a default Anthropic model: the model must be supplied
+per call (``model=...``) or configured on the provider
+(``AnthropicProvider(prompt_model=...)``); the per-call model wins.
+
 Requires::
 
     pip install 'vane-ai[anthropic]'
@@ -42,14 +46,48 @@ def _guess_media_type(data: bytes) -> str:
 
 
 class AnthropicProvider(Provider):
-    """Provider backed by the Anthropic Messages API."""
+    """Provider backed by the Anthropic Messages API.
 
-    DEFAULT_MODEL = "claude-sonnet-4-20250514"
+    Vane does not choose an Anthropic model for you. Configure an
+    application-owned model via ``prompt_model=...`` here, or pass
+    ``model=...`` on each call; the per-call model takes precedence.
+
+    Args:
+        name: Optional display-name override (default ``"anthropic"``).
+        api_key: Anthropic API key. Prefer the ``ANTHROPIC_API_KEY``
+            environment variable over passing keys in code.
+        base_url: Optional API endpoint override.
+        timeout: Optional client timeout forwarded to the Anthropic client.
+        max_retries: Optional client retry count forwarded to the Anthropic
+            client.
+        prompt_model: Model used by ``get_prompter`` when the call does not
+            pass ``model=...``.
+
+    All parameters are named; a mistyped keyword raises :class:`TypeError`
+    instead of silently leaking into API request options.
+    """
+
     _CLIENT_KEYS: ClassVar[frozenset[str]] = frozenset({"api_key", "base_url", "timeout", "max_retries"})
 
-    def __init__(self, name: str | None = None, **options: Any):
+    def __init__(
+        self,
+        name: str | None = None,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        timeout: Any = None,
+        max_retries: int | None = None,
+        prompt_model: str | None = None,
+    ):
         self._name = name or "anthropic"
-        self._options: dict[str, Any] = options
+        self._prompt_model = prompt_model
+        client_options = {
+            "api_key": api_key,
+            "base_url": base_url,
+            "timeout": timeout,
+            "max_retries": max_retries,
+        }
+        self._options: dict[str, Any] = {k: v for k, v in client_options.items() if v is not None}
 
     @property
     def name(self) -> str:
@@ -68,11 +106,32 @@ class AnthropicProvider(Provider):
         return_format: Any | None = None,
         **options: Any,
     ) -> PrompterDescriptor:
+        """Build a prompter descriptor for an explicitly selected model.
+
+        The model resolves as: call-site ``model`` > provider
+        ``prompt_model`` configuration; the selected value must be a
+        non-empty string.
+
+        Raises:
+            ValueError: If no model is configured through either path, or
+                the selected model is not a non-empty string.
+        """
         provider_options, prompt_options = self._split_options(options)
+        model_name = model if model is not None else self._prompt_model
+        if model_name is None:
+            raise ValueError(
+                "No prompt model configured for the Anthropic provider. "
+                "Pass model=... or configure AnthropicProvider(prompt_model=...)."
+            )
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError(
+                f"Anthropic prompt model must be a non-empty string, got {model_name!r}. "
+                "Pass model=... or configure AnthropicProvider(prompt_model=...)."
+            )
         return AnthropicPrompterDescriptor(
             provider_name=self._name,
             provider_options=provider_options,
-            model_name=model or prompt_options.pop("model", self.DEFAULT_MODEL),
+            model_name=model_name,
             system_message=system_message,
             return_format=return_format,
             prompt_options=prompt_options,
@@ -83,13 +142,14 @@ class AnthropicProvider(Provider):
 class AnthropicPrompterDescriptor(PrompterDescriptor):
     """Serializable factory for an Anthropic Messages API prompter.
 
-    Supports structured output via Anthropic's ``tool_use`` mechanism
-    and multimodal input (text + images).
+    ``model_name`` is required — Vane does not ship a default Anthropic
+    model. Supports structured output via Anthropic's ``tool_use``
+    mechanism and multimodal input (text + images).
     """
 
+    model_name: str
     provider_name: str = "anthropic"
     provider_options: dict[str, Any] = field(default_factory=dict)
-    model_name: str = "claude-sonnet-4-20250514"
     system_message: str | None = None
     return_format: Any | None = None
     prompt_options: dict[str, Any] = field(default_factory=dict)
