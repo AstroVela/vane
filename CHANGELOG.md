@@ -24,6 +24,7 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 - Imported the official DuckDB baseline as a squashed Git subtree and retained
   Vane engine customizations as monorepo commits, so normal clones no longer
   require submodule initialization or carry DuckDB's complete commit history.
+
 ### Fixed
 
 - Released per-database runner cache entries after relation write failures
