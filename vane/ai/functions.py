@@ -45,7 +45,7 @@ import numpy as np
 import pyarrow as pa
 
 import duckdb
-from vane._expression_udf import _build_actor_map_batches_expression
+from vane._expression_udf import _build_actor_map_batches_expression, _build_map_batches_expression
 from vane._expressions import as_expression, is_expression
 from vane.ai.options import (
     AnthropicPromptOptions,
@@ -657,6 +657,37 @@ class _PromptBatch:
         return pa.table({self._output_column: results})
 
 
+class _ValidateVLLMStructuredOutputBatch:
+    """Apply the Pydantic runtime contract to native vLLM output."""
+
+    def __init__(
+        self,
+        return_format: Any,
+        input_column: str,
+        output_column: str,
+        on_error: _OnError,
+    ) -> None:
+        self._return_format = return_format
+        self._input_column = input_column
+        self._output_column = output_column
+        self._on_error = on_error
+
+    def __call__(self, table: pa.Table) -> pa.Table:
+        results: list[str | None] = []
+        for raw_text in table.column(self._input_column).to_pylist():
+            if raw_text is None:
+                results.append(None)
+                continue
+            try:
+                validated = self._return_format.model_validate(json.loads(raw_text))
+                results.append(validated.model_dump_json())
+            except Exception:
+                if self._on_error == "raise":
+                    raise
+                results.append(None)
+        return pa.table({self._output_column: pa.array(results, type=pa.string())})
+
+
 def _build_ai_batch_expression(
     wrapper: Any,
     *,
@@ -934,7 +965,30 @@ def _prompt_relation(
             if isinstance(relation_alias, str) and relation_alias
             else duckdb.ColumnExpression(column)
         )
-        expression = _build_native_vllm_expression(column_expr, descriptor).alias(output_column)
+        expression = _build_native_vllm_expression(column_expr, descriptor)
+        native_return_format = descriptor.return_format
+        if hasattr(native_return_format, "model_validate"):
+            input_column = "__vane_vllm_response"
+            raw_on_error = descriptor.vllm_options.get("on_error", "raise")
+            validation_on_error: _OnError = (
+                "ignore" if str(raw_on_error).strip().lower() in {"ignore", "log", "null"} else "raise"
+            )
+            validator = _ValidateVLLMStructuredOutputBatch(
+                native_return_format,
+                input_column,
+                output_column,
+                validation_on_error,
+            )
+            expression = _build_map_batches_expression(
+                validator.__call__,
+                name="validate_vllm_structured_output",
+                inputs={input_column: expression},
+                schema={output_column: "VARCHAR"},
+                batch_size=None,
+                row_preserving=True,
+                gpus=0,
+            )
+        expression = expression.alias(output_column)
         return rel.select(expression)
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
