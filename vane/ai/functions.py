@@ -679,7 +679,7 @@ class _ValidateVLLMStructuredOutputBatch:
                 results.append(None)
                 continue
             try:
-                validated = self._return_format.model_validate(json.loads(raw_text))
+                validated = self._return_format.model_validate_json(raw_text)
                 results.append(validated.model_dump_json())
             except Exception:
                 if self._on_error == "raise":

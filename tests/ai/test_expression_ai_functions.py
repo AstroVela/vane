@@ -7,6 +7,7 @@ import json
 import math
 from collections import Counter, deque
 from dataclasses import dataclass
+from datetime import date
 
 import numpy as np
 import pyarrow as pa
@@ -554,6 +555,32 @@ def test_ai_prompt_vllm_relation_validates_pydantic_output_and_preserves_nulls(m
     assert Counter(prompt for _prefix, prompts in executor.submissions for prompt in prompts) == Counter(
         ["valid", "invalid"]
     )
+
+
+def test_ai_prompt_vllm_relation_uses_pydantic_json_validation(monkeypatch):
+    pydantic = pytest.importorskip("pydantic")
+    import duckdb.execution.vllm as vllm_executor
+
+    class Answer(pydantic.BaseModel):
+        model_config = pydantic.ConfigDict(strict=True)
+
+        due: date
+
+    executor = _RecordingNativeVLLMExecutor({"valid": '{"due":"2026-01-02"}'})
+    monkeypatch.setattr(vllm_executor, "build_executor", lambda _model, _options: executor)
+    conn = vane.connect()
+    source = conn.sql("select 'valid'::VARCHAR as question")
+
+    result = vane.ai.prompt(
+        source,
+        "question",
+        provider="vllm",
+        return_format=Answer,
+    )
+
+    assert result.fetchall() == [('{"due":"2026-01-02"}',)]
+    assert executor.finished_count == 1
+    assert executor.shutdown_count == 1
 
 
 def test_ai_prompt_vllm_relation_rejects_pydantic_validation_failure(monkeypatch):
