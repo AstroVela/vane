@@ -2986,6 +2986,7 @@ def test_worker_local_shuffle_cleanup_skips_object_storage_rebuild(monkeypatch):
             session_config=(("AWS_PROFILE", "unavailable-profile"),),
             use_session_credentials=True,
             connection_snapshot_query_id="resource-query",
+            connection_snapshot_settings=(),
         )
     }
     cleanup = {
@@ -3032,6 +3033,7 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
             session_config=(("AWS_PROFILE", "profile-a"),),
             use_session_credentials=True,
             connection_snapshot_query_id="resource-query",
+            connection_snapshot_settings=(),
         )
     }
     events = []
@@ -3148,6 +3150,7 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
             session_config=(("AWS_ENDPOINT_URL", "https://s3.example.test"),),
             use_session_credentials=False,
             connection_snapshot_query_id="resource-query",
+            connection_snapshot_settings=(),
         )
     }
     cleanup_cursor = SimpleNamespace(close=lambda: None)
@@ -3235,6 +3238,7 @@ def test_worker_object_shuffle_cleanup_preserves_primary_error_when_cursor_close
             session_config=(),
             use_session_credentials=True,
             connection_snapshot_query_id="resource-query",
+            connection_snapshot_settings=(),
         )
     }
 
@@ -3273,10 +3277,11 @@ def test_worker_object_shuffle_cleanup_preserves_primary_error_when_cursor_close
         actor_class._cleanup_flight_shuffle_for_query_with_context(actor, "query-drop")
 
 
-def test_worker_cleanup_context_replays_snapshot_with_session_credentials():
+def test_worker_cleanup_context_replays_snapshot_with_session_credentials(monkeypatch):
     actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_class)
     actor._native_execution_condition = threading.Condition()
+    monkeypatch.setattr(worker_mod, "_query_cleanup_connection_settings", lambda *args, **kwargs: ())
 
     class _Plan:
         @staticmethod
@@ -3298,14 +3303,62 @@ def test_worker_cleanup_context_replays_snapshot_with_session_credentials():
             session_config=(("AWS_PROFILE", "profile-a"),),
             use_session_credentials=True,
             connection_snapshot_query_id="resource-query",
+            connection_snapshot_settings=(),
         )
     }
 
 
-def test_worker_cleanup_context_reuses_first_snapshot_across_query_fragments():
+def test_worker_cleanup_connection_settings_match_snapshot_replay(monkeypatch):
+    snapshot = {
+        "settings": [
+            {"name": "s3_endpoint", "value": "s3.example.test", "input_type": "VARCHAR"},
+            {"name": "s3_access_key_id", "value": "plan-key", "input_type": "VARCHAR"},
+            {"name": "s3_secret_access_key", "value": "plan-secret", "input_type": "VARCHAR"},
+            {"name": "http_timeout", "value": "30", "input_type": "BIGINT"},
+            {"name": "allow_unsigned_extensions", "value": "true", "input_type": "BOOLEAN"},
+        ]
+    }
+
+    def require(name, *, hint):
+        assert name == "_lookup_query_connection_snapshot"
+        assert hint == "Ensure the C++ ray extension is built with query replay lifecycle support."
+        return lambda query_id: snapshot if query_id == "resource-query" else None
+
+    monkeypatch.setattr(worker_mod, "require_ray_cxx_attr", require)
+
+    assert worker_mod._query_cleanup_connection_settings(
+        "resource-query",
+        apply_snapshot_s3_credentials=False,
+    ) == (
+        ("s3_endpoint", "s3.example.test", "VARCHAR"),
+        ("http_timeout", "30", "BIGINT"),
+    )
+    assert worker_mod._query_cleanup_connection_settings(
+        "resource-query",
+        apply_snapshot_s3_credentials=True,
+    ) == (
+        ("s3_endpoint", "s3.example.test", "VARCHAR"),
+        ("s3_access_key_id", "plan-key", "VARCHAR"),
+        ("s3_secret_access_key", "plan-secret", "VARCHAR"),
+        ("http_timeout", "30", "BIGINT"),
+    )
+
+
+def test_worker_cleanup_context_reuses_first_equivalent_snapshot_across_query_fragments(monkeypatch):
     actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_class)
     actor._native_execution_condition = threading.Condition()
+    snapshot_settings = {
+        "resource-query-a": (("s3_endpoint", "s3.example.test", "VARCHAR"),),
+        "resource-query-b": (("s3_endpoint", "s3.example.test", "VARCHAR"),),
+        "resource-query-c": (("s3_endpoint", "other.example.test", "VARCHAR"),),
+        "resource-query-d": (("s3_endpoint", "s3.example.test", "VARCHAR"),),
+    }
+    monkeypatch.setattr(
+        worker_mod,
+        "_query_cleanup_connection_settings",
+        lambda query_id, **kwargs: snapshot_settings[query_id],
+    )
 
     class _Plan:
         def __init__(self, resource_query_id):
@@ -3337,6 +3390,15 @@ def test_worker_cleanup_context_reuses_first_snapshot_across_query_fragments():
             actor,
             "execution-query",
             _Plan("resource-query-c"),
+            "session-a",
+            {"AWS_PROFILE": "profile-a"},
+            use_session_credentials=True,
+        )
+    with pytest.raises(RuntimeError, match="native query cleanup context changed"):
+        actor_class._register_native_query_cleanup_context(
+            actor,
+            "execution-query",
+            _Plan("resource-query-d"),
             "session-a",
             {"AWS_PROFILE": "profile-b"},
             use_session_credentials=True,

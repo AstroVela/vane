@@ -62,6 +62,20 @@ _DUCKDB_S3_SESSION_KEYS = (
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
 )
+_CONNECTION_SNAPSHOT_S3_CREDENTIAL_SETTINGS = frozenset(
+    {
+        "s3_access_key_id",
+        "s3_secret_access_key",
+        "s3_session_token",
+    }
+)
+_CONNECTION_SNAPSHOT_SECURITY_SETTINGS = frozenset(
+    {
+        "allow_unsigned_extensions",
+        "autoinstall_known_extensions",
+        "autoload_known_extensions",
+    }
+)
 
 
 async def _to_thread_with_owned_side_effects(
@@ -162,6 +176,52 @@ def _plan_resource_query_id(plan: Any) -> str:
     if not query_id:
         raise ValueError("distributed physical plan resource_query_id must not be empty")
     return query_id
+
+
+def _query_cleanup_connection_settings(
+    connection_snapshot_query_id: str,
+    *,
+    apply_snapshot_s3_credentials: bool,
+) -> tuple[tuple[str, str, str], ...]:
+    """Return the settings that cleanup snapshot replay will actually apply."""
+    lookup = require_ray_cxx_attr(
+        "_lookup_query_connection_snapshot",
+        hint="Ensure the C++ ray extension is built with query replay lifecycle support.",
+    )
+    snapshot = lookup(str(connection_snapshot_query_id))
+    if snapshot is None:
+        raise RuntimeError(
+            "query connection snapshot is unavailable during cleanup context registration: "
+            f"{connection_snapshot_query_id}"
+        )
+    if not isinstance(snapshot, Mapping):
+        raise TypeError("query connection snapshot must be a mapping")
+    raw_settings = snapshot.get("settings", [])
+    if raw_settings is None:
+        return ()
+    if not isinstance(raw_settings, list):
+        return ()
+
+    settings: list[tuple[str, str, str]] = []
+    for raw_setting in raw_settings:
+        if not isinstance(raw_setting, Mapping) or "name" not in raw_setting or "value" not in raw_setting:
+            continue
+        name = str(raw_setting["name"])
+        lower_name = name.lower()
+        if (
+            not name
+            or lower_name in _CONNECTION_SNAPSHOT_SECURITY_SETTINGS
+            or (not apply_snapshot_s3_credentials and lower_name in _CONNECTION_SNAPSHOT_S3_CREDENTIAL_SETTINGS)
+        ):
+            continue
+        settings.append(
+            (
+                lower_name,
+                str(raw_setting["value"]),
+                str(raw_setting.get("input_type", "VARCHAR")).upper(),
+            )
+        )
+    return tuple(settings)
 
 
 def _cleanup_query_python_replay_state(query_id: str) -> None:
@@ -667,6 +727,7 @@ class NativeQueryCleanupContext(NamedTuple):
     session_config: tuple[tuple[str, str], ...]
     use_session_credentials: bool
     connection_snapshot_query_id: str
+    connection_snapshot_settings: tuple[tuple[str, str, str], ...]
 
 
 @ray.remote(concurrency_groups={"execute": 128, "control": 512})
@@ -1367,11 +1428,17 @@ class RayWorkerActor:
         query_key = str(query_id or "").strip()
         if not query_key:
             return
+        connection_snapshot_query_id = _plan_resource_query_id(plan)
+        use_session_credentials = bool(use_session_credentials)
         cleanup_context = NativeQueryCleanupContext(
             session_id=str(session_id),
             session_config=tuple(sorted((str(key), str(value)) for key, value in session_config.items())),
-            use_session_credentials=bool(use_session_credentials),
-            connection_snapshot_query_id=_plan_resource_query_id(plan),
+            use_session_credentials=use_session_credentials,
+            connection_snapshot_query_id=connection_snapshot_query_id,
+            connection_snapshot_settings=_query_cleanup_connection_settings(
+                connection_snapshot_query_id,
+                apply_snapshot_s3_credentials=not use_session_credentials,
+            ),
         )
         with self._native_execution_condition:
             contexts = getattr(self, "_native_query_cleanup_contexts", None)
@@ -1382,13 +1449,13 @@ class RayWorkerActor:
             if existing is not None:
                 # One execution query can contain independently materialized
                 # fragment plans with different replay-registry keys. Their
-                # cleanup storage configuration must agree, but retaining the
-                # first live snapshot is sufficient for the query-scoped
-                # storage context.
+                # effective cleanup settings must agree, but retaining the first
+                # live snapshot is sufficient for the query-scoped storage context.
                 if (
                     existing.session_id != cleanup_context.session_id
                     or existing.session_config != cleanup_context.session_config
                     or existing.use_session_credentials != cleanup_context.use_session_credentials
+                    or existing.connection_snapshot_settings != cleanup_context.connection_snapshot_settings
                 ):
                     raise RuntimeError(f"native query cleanup context changed: {query_key}")
                 return
