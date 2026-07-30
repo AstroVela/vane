@@ -585,6 +585,7 @@ def test_native_worker_snapshots_report_resource_capacity():
 def test_native_worker_manager_drop_query_cancels_running_and_queued_tasks():
     started = threading.Event()
     release = threading.Event()
+    drop_errors: list[BaseException] = []
 
     def execute_fn(_request):
         started.set()
@@ -614,7 +615,23 @@ def test_native_worker_manager_drop_query_cancels_running_and_queued_tasks():
         assert snapshot["executor_running_task_count"] == 1
         assert snapshot["executor_queued_task_count"] == 1
 
-        backend.drop_query("query-drop")
+        def drop_query():
+            try:
+                backend.drop_query("query-drop")
+            except BaseException as exc:  # pragma: no cover - asserted below
+                drop_errors.append(exc)
+
+        drop_thread = threading.Thread(target=drop_query)
+        drop_thread.start()
+        time.sleep(0.05)
+
+        assert drop_thread.is_alive()
+        assert worker.fte_get_task_status_cached(task0)["state"] == FteTaskState.RUNNING.value
+
+        release.set()
+        drop_thread.join(timeout=2.0)
+        assert not drop_thread.is_alive()
+        assert drop_errors == []
 
         assert backend.pop_fte_result_handles("query-drop") == []
         query_status = backend.fte_query_status("query-drop")
@@ -628,6 +645,129 @@ def test_native_worker_manager_drop_query_cancels_running_and_queued_tasks():
     finally:
         release.set()
         backend.shutdown()
+
+
+def test_native_worker_cancel_barrier_outlives_operation_timeout():
+    started = threading.Event()
+    release = threading.Event()
+    background = _BackgroundEventLoop(
+        "native-fte-cancel-barrier-timeout",
+        operation_timeout_s=0.05,
+    )
+
+    def execute_fn(_request):
+        started.set()
+        assert release.wait(timeout=2.0)
+        return {"ok": True}
+
+    worker = NativeWorkerHandle(
+        "worker-cancel-barrier-timeout",
+        execute_fn,
+        loop=background,
+    )
+    task_id = _task_id(0, query_id="query-cancel-barrier-timeout")
+    cancel_results: list[dict[str, Any]] = []
+    cancel_errors: list[BaseException] = []
+    cancel_thread: threading.Thread | None = None
+    cancel_started = threading.Event()
+
+    try:
+        worker.fte_create_task(
+            {
+                "task_id": task_id,
+                "fragment_id": "query-cancel-barrier-timeout:copy",
+            }
+        )
+        assert started.wait(timeout=1.0)
+
+        def cancel_task():
+            cancel_started.set()
+            try:
+                cancel_results.append(worker.fte_cancel_task(task_id))
+            except BaseException as exc:  # pragma: no cover - asserted below
+                cancel_errors.append(exc)
+
+        cancel_thread = threading.Thread(target=cancel_task)
+        cancel_thread.start()
+        assert cancel_started.wait(timeout=1.0)
+        time.sleep(0.15)
+        outlived_operation_timeout = cancel_thread.is_alive()
+    finally:
+        release.set()
+        if cancel_thread is not None:
+            cancel_thread.join(timeout=2.0)
+        try:
+            worker.fte_drop_query("query-cancel-barrier-timeout")
+        finally:
+            background.shutdown()
+
+    assert outlived_operation_timeout
+    assert cancel_thread is not None
+    assert not cancel_thread.is_alive()
+    assert cancel_errors == []
+    assert cancel_results[0]["state"] == FteTaskState.CANCELED.value
+
+
+def test_native_worker_drop_query_barrier_outlives_operation_timeout():
+    started = threading.Event()
+    release = threading.Event()
+    background = _BackgroundEventLoop(
+        "native-fte-drop-barrier-timeout",
+        operation_timeout_s=0.05,
+    )
+
+    def execute_fn(_request):
+        started.set()
+        assert release.wait(timeout=2.0)
+        return {"ok": True}
+
+    worker = NativeWorkerHandle(
+        "worker-drop-barrier-timeout",
+        execute_fn,
+        loop=background,
+    )
+    query_id = "query-drop-barrier-timeout"
+    task_id = _task_id(0, query_id=query_id)
+    drop_results: list[dict[str, int]] = []
+    drop_errors: list[BaseException] = []
+    drop_thread: threading.Thread | None = None
+    drop_started = threading.Event()
+
+    try:
+        worker.fte_create_task(
+            {
+                "task_id": task_id,
+                "fragment_id": f"{query_id}:copy",
+            }
+        )
+        assert started.wait(timeout=1.0)
+
+        def drop_query():
+            drop_started.set()
+            try:
+                drop_results.append(worker.fte_drop_query(query_id))
+            except BaseException as exc:  # pragma: no cover - asserted below
+                drop_errors.append(exc)
+
+        drop_thread = threading.Thread(target=drop_query)
+        drop_thread.start()
+        assert drop_started.wait(timeout=1.0)
+        time.sleep(0.15)
+        outlived_operation_timeout = drop_thread.is_alive()
+    finally:
+        release.set()
+        if drop_thread is not None:
+            drop_thread.join(timeout=2.0)
+        try:
+            background.run_owned_side_effects(worker._manager.drop_query(query_id))
+        finally:
+            background.shutdown()
+
+    assert outlived_operation_timeout
+    assert drop_thread is not None
+    assert not drop_thread.is_alive()
+    assert drop_errors == []
+    assert drop_results == [{"removed": 1, "canceled": 1}]
 
 
 def test_native_worker_manager_drop_query_fans_out_after_worker_failure():

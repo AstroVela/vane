@@ -4049,6 +4049,101 @@ def test_run_plan_return_uses_native_completed_sink_descriptor(monkeypatch):
     ]
 
 
+def test_run_plan_return_cancellation_waits_for_native_execution(monkeypatch):
+    from duckdb.runners.ray import worker as worker_module
+
+    events: list[tuple[str, str]] = []
+    native_started = threading.Event()
+    release_native = threading.Event()
+
+    def fake_require(name, hint=None):
+        assert hint
+        if name == "begin_flight_shuffle_query_execution":
+            return lambda query_id: events.append(("begin", query_id))
+        if name == "end_flight_shuffle_query_execution":
+            return lambda query_id: events.append(("end", query_id))
+        raise AssertionError(f"unexpected C++ binding lookup: {name}")
+
+    native_result = duckdb.ray_cxx.NativeDistributedTaskResult(
+        [],
+        [],
+        None,
+        [],
+        "ok",
+        31338,
+        None,
+        {},
+    )
+
+    class DummyWorker:
+        _env_overrides: dict[str, str] = {}
+
+        @staticmethod
+        def _begin_worker_native_execution(query_id):
+            events.append(("worker_begin", query_id))
+
+        @staticmethod
+        def _end_worker_native_execution(query_id):
+            events.append(("worker_end", query_id))
+
+        @staticmethod
+        def _worker_native_query_is_closing(_query_id):
+            return False
+
+        @staticmethod
+        def _execute_native_task(*args, **kwargs):
+            events.append(("execute", "query-native-cancel"))
+            native_started.set()
+            assert release_native.wait(timeout=2.0)
+            events.append(("write_complete", "query-native-cancel"))
+            return native_result
+
+    monkeypatch.setattr(worker_module, "require_ray_cxx_attr", fake_require)
+    actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
+    query_lease = {
+        "lease_id": "lease-native-cancel",
+        "query_id": "resource-query-native-cancel",
+        "execution_query_id": "query-native-cancel",
+        "stage_id": "stage-native-cancel",
+        "attempt_id": "query-native-cancel.0.0.1",
+        "target_output_block_bytes": 1,
+        "output_window_bytes": 1,
+    }
+
+    async def run():
+        task = asyncio.create_task(
+            actor_class.run_plan_return(
+                DummyWorker(),
+                object(),
+                None,
+                query_lease,
+            )
+        )
+        assert await asyncio.to_thread(native_started.wait, 1.0)
+
+        task.cancel()
+        await asyncio.sleep(0.05)
+
+        assert task.done() is False
+        assert ("end", "query-native-cancel") not in events
+        assert ("worker_end", "query-native-cancel") not in events
+
+        release_native.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(run())
+
+    assert events == [
+        ("worker_begin", "query-native-cancel"),
+        ("begin", "query-native-cancel"),
+        ("execute", "query-native-cancel"),
+        ("write_complete", "query-native-cancel"),
+        ("end", "query-native-cancel"),
+        ("worker_end", "query-native-cancel"),
+    ]
+
+
 def test_normalize_native_task_result_rejects_legacy_shapes():
     with pytest.raises(TypeError, match="execute_native must return NativeDistributedTaskResult"):
         _normalize_native_task_result(([], [], None))

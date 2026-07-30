@@ -342,6 +342,7 @@ class FteTaskExecution:
         self._result_release_count = 0
         self._status_lock = threading.RLock()
         self._future: asyncio.Task[Any] | None = None
+        self._cancel_requested = False
         self._split_update_event = asyncio.Event()
         self._status_condition = asyncio.Condition()
         self._execution_started = False
@@ -690,10 +691,18 @@ class FteTaskExecution:
                     self.release_result(reason="task_failed")
                 except Exception:
                     pass
-            self._transition(
-                FteTaskState.FAILED,
-                failure=_failure_payload_from_exception(exc),
-            )
+            with self._status_lock:
+                cancel_requested = self._cancel_requested
+            if cancel_requested:
+                self._transition(
+                    FteTaskState.CANCELED,
+                    failure=_task_canceled_failure_payload(self.task_id),
+                )
+            else:
+                self._transition(
+                    FteTaskState.FAILED,
+                    failure=_failure_payload_from_exception(exc),
+                )
 
     def _complete_dynamic_source_splits(self) -> None:
         queues = [
@@ -1010,13 +1019,40 @@ class FteTaskExecution:
             queue.cancel()
         for queue in self.dynamic_scan_source_queues.values():
             queue.cancel()
-        if self._future is not None and not self._future.done():
-            self._future.cancel()
+        with self._status_lock:
+            self._cancel_requested = True
+            future = self._future
+        if future is not None and not future.done():
+            future.cancel()
+            self._split_update_event.set()
+            return self.status
         self._split_update_event.set()
         self._transition(
             FteTaskState.CANCELED,
             failure=_task_canceled_failure_payload(self.task_id),
         )
+        return self.status
+
+    async def wait_for_cancellation_barrier(self) -> TaskStatus:
+        future = self._future
+        if future is not None:
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    if not future.done():
+                        raise
+            try:
+                future.result()
+            except asyncio.CancelledError:
+                pass
+        with self._status_lock:
+            needs_transition = self._cancel_requested and self.status.state not in _TERMINAL_STATES
+        if needs_transition:
+            self._transition(
+                FteTaskState.CANCELED,
+                failure=_task_canceled_failure_payload(self.task_id),
+            )
         return self.status
 
     def _log_result_lifecycle(self, event: str, *, result: Any = None, **fields: Any) -> None:
@@ -1476,6 +1512,7 @@ class FteWorkerTaskManager:
         except ValueError:
             pass
         execution.cancel()
+        await execution.wait_for_cancellation_barrier()
         execution.release_result(reason="cancel_task")
         self.running_tasks.discard(key)
         self._sync_udf_active_fte_fragment_tasks()
@@ -1487,9 +1524,26 @@ class FteWorkerTaskManager:
     async def drop_query(self, query_id: str) -> dict[str, int]:
         query_id = str(query_id)
         task_keys = list(self.query_tasks.get(query_id, ()))
+        canceled_task_keys: set[str] = set()
+        cancellation_errors: dict[str, BaseException] = {}
+        for key in task_keys:
+            execution = self.tasks.get(key)
+            if execution is None:
+                continue
+            try:
+                self.queued_tasks.remove(key)
+            except ValueError:
+                pass
+            try:
+                if execution.status.state not in _TERMINAL_STATES:
+                    execution.cancel()
+                    canceled_task_keys.add(key)
+            except BaseException as exc:
+                cancellation_errors[key] = exc
+
         removed = 0
         canceled = 0
-        errors: list[tuple[str, BaseException]] = []
+        errors = list(cancellation_errors.items())
         for key in task_keys:
             execution = self.tasks.get(key)
             if execution is None:
@@ -1497,15 +1551,12 @@ class FteWorkerTaskManager:
                 if query_tasks is not None:
                     query_tasks.discard(key)
                 continue
+            if key in cancellation_errors:
+                continue
+            canceled_task = key in canceled_task_keys
             try:
-                self.queued_tasks.remove(key)
-            except ValueError:
-                pass
-            canceled_task = False
-            try:
-                if execution.status.state not in _TERMINAL_STATES:
-                    execution.cancel()
-                    canceled_task = True
+                if canceled_task:
+                    await execution.wait_for_cancellation_barrier()
                 execution.release_result(reason="drop_query")
                 dropped_status = self._publish_status(execution)
                 dropped_status.pop("result", None)

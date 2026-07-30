@@ -5,7 +5,11 @@
 #include "test_helpers.hpp"
 
 #include "duckdb/common/local_file_system.hpp"
+#include "duckdb/common/virtual_file_system.hpp"
 #include "duckdb/execution/distributed/copy_finalize.hpp"
+
+#include <chrono>
+#include <thread>
 
 using namespace duckdb;
 using namespace duckdb::distributed;
@@ -187,14 +191,37 @@ public:
 	}
 
 	void RemoveFile(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
-		if (path == failed_path) {
+		if (fail_removal && path == failed_path) {
 			throw IOException("injected object removal failure");
 		}
 		LocalFileSystem::RemoveFile(path, opener);
 	}
 
+	void AllowRemoval() {
+		fail_removal = false;
+	}
+
 private:
 	string failed_path;
+	bool fail_removal = true;
+};
+
+class DelayedFileRemovalFileSystem : public FileOnlyRecursiveListFileSystem {
+public:
+	DelayedFileRemovalFileSystem(string delayed_path, std::chrono::milliseconds delay)
+	    : delayed_path(std::move(delayed_path)), delay(delay) {
+	}
+
+	void RemoveFile(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		if (path == delayed_path) {
+			std::this_thread::sleep_for(delay);
+		}
+		LocalFileSystem::RemoveFile(path, opener);
+	}
+
+private:
+	string delayed_path;
+	std::chrono::milliseconds delay;
 };
 
 class DirectoryRemovalFailureFileSystem : public LocalFileSystem {
@@ -411,6 +438,127 @@ TEST_CASE("Distributed COPY temporary direct output preserves the canonical targ
 	REQUIRE(fs.FileExists(worker_file));
 	REQUIRE(fs.FileExists(output_path));
 	REQUIRE(ReadDistributedCopyTextFile(fs, output_path).value() == "old");
+}
+
+TEST_CASE("Distributed COPY direct-target empty result removes loser files before commit",
+          "[distributed][copy][lifecycle]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_empty_direct_target");
+	auto &fs = test_dir.fs;
+	auto base_path = fs.JoinPath(test_dir.path, "out");
+	const string run_id = "run-empty";
+	auto loser_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_loser", "part.parquet");
+	WriteTestFile(fs, loser_file, "loser");
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(fs, base_path, run_id).is_ok());
+
+	DuckDB db(nullptr);
+	Connection connection(db);
+	DistributedCopySpec spec;
+	spec.file_path = base_path;
+	spec.file_extension = "parquet";
+	spec.per_thread_output = true;
+
+	auto finalize_res = FinalizeCopyFiles(spec, "", {}, *connection.context, run_id);
+
+	REQUIRE(finalize_res.is_ok());
+	REQUIRE(finalize_res.value().output_committed);
+	REQUIRE(finalize_res.value().files.empty());
+	auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, base_path, run_id);
+	REQUIRE(fs.FileExists(commit_paths.committed_marker_path));
+	REQUIRE_FALSE(fs.FileExists(loser_file));
+}
+
+TEST_CASE("Distributed COPY direct-target cleanup failure prevents commit",
+          "[distributed][copy][lifecycle][object-storage]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_cleanup_before_commit");
+	auto &local_fs = test_dir.fs;
+	auto base_path = local_fs.JoinPath(test_dir.path, "out");
+	const string run_id = "run-cleanup-failure";
+	auto selected_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_selected", "part.parquet");
+	auto loser_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_loser", "part.parquet");
+	const string selected_contents = "selected";
+	WriteTestFile(local_fs, selected_file, selected_contents);
+	WriteTestFile(local_fs, loser_file, "loser");
+
+	DBConfig config;
+	auto failure_fs = make_uniq<FileRemovalFailureFileSystem>(loser_file);
+	auto failure_fs_ptr = failure_fs.get();
+	config.file_system = make_uniq<VirtualFileSystem>(std::move(failure_fs));
+	DuckDB db(nullptr, &config);
+	Connection connection(db);
+	auto &fs = FileSystem::GetFileSystem(*connection.context);
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(fs, base_path, run_id).is_ok());
+
+	DistributedCopySpec spec;
+	spec.file_path = base_path;
+	spec.file_extension = "parquet";
+	spec.per_thread_output = true;
+	DistributedCopyFileInfo selected_info;
+	selected_info.staging_path = selected_file;
+	selected_info.row_count = 1;
+	selected_info.file_size_bytes = selected_contents.size();
+	vector<DistributedCopyFileInfo> selected_files;
+	selected_files.push_back(std::move(selected_info));
+
+	auto finalize_res = FinalizeCopyFiles(spec, "", std::move(selected_files), *connection.context, run_id);
+
+	REQUIRE(finalize_res.is_err());
+	REQUIRE(StringUtil::Contains(finalize_res.error().what(), "injected object removal failure"));
+	auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, base_path, run_id);
+	REQUIRE(fs.FileExists(commit_paths.manifest_path));
+	REQUIRE_FALSE(fs.FileExists(commit_paths.committed_marker_path));
+	REQUIRE(fs.FileExists(selected_file));
+	REQUIRE(fs.FileExists(loser_file));
+
+	failure_fs_ptr->AllowRemoval();
+	auto retry_res = FinalizeCopyFiles(spec, "", {}, *connection.context, run_id);
+	REQUIRE(retry_res.is_ok());
+	REQUIRE(retry_res.value().output_committed);
+	REQUIRE(retry_res.value().files.size() == 1);
+	REQUIRE(fs.FileExists(commit_paths.committed_marker_path));
+	REQUIRE(fs.FileExists(selected_file));
+	REQUIRE_FALSE(fs.FileExists(loser_file));
+}
+
+TEST_CASE("Distributed COPY direct-target cleanup time is excluded from finalize time",
+          "[distributed][copy][lifecycle][object-storage]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_exclusive_timing");
+	auto &local_fs = test_dir.fs;
+	auto base_path = local_fs.JoinPath(test_dir.path, "out");
+	const string run_id = "run-exclusive-timing";
+	auto selected_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_selected", "part.parquet");
+	auto loser_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_loser", "part.parquet");
+	const string selected_contents = "selected";
+	WriteTestFile(local_fs, selected_file, selected_contents);
+	WriteTestFile(local_fs, loser_file, "loser");
+
+	DBConfig config;
+	auto delayed_fs = make_uniq<DelayedFileRemovalFileSystem>(loser_file, std::chrono::milliseconds(150));
+	config.file_system = make_uniq<VirtualFileSystem>(std::move(delayed_fs));
+	DuckDB db(nullptr, &config);
+	Connection connection(db);
+	auto &fs = FileSystem::GetFileSystem(*connection.context);
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(fs, base_path, run_id).is_ok());
+
+	DistributedCopySpec spec;
+	spec.file_path = base_path;
+	spec.file_extension = "parquet";
+	spec.per_thread_output = true;
+	DistributedCopyFileInfo selected_info;
+	selected_info.staging_path = selected_file;
+	selected_info.row_count = 1;
+	selected_info.file_size_bytes = selected_contents.size();
+	vector<DistributedCopyFileInfo> selected_files;
+	selected_files.push_back(std::move(selected_info));
+
+	auto wall_started = std::chrono::steady_clock::now();
+	auto finalize_res = FinalizeCopyFiles(spec, "", std::move(selected_files), *connection.context, run_id);
+	auto wall_ms = DistributedCopyElapsedMillis(wall_started);
+
+	REQUIRE(finalize_res.is_ok());
+	const auto &result = finalize_res.value();
+	REQUIRE(result.cleanup_ms >= 100);
+	REQUIRE(result.finalize_ms + result.cleanup_ms <= wall_ms + 10);
+	REQUIRE_FALSE(fs.FileExists(loser_file));
 }
 
 TEST_CASE("Distributed COPY resolves relative and qualified list paths",

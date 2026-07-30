@@ -5386,6 +5386,41 @@ def test_fte_worker_task_manager_cancel_running_task():
     asyncio.run(run())
 
 
+def test_fte_worker_task_manager_cancel_waits_for_owned_execution_to_quiesce():
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def execute_fn(_request):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+            raise
+
+    async def run():
+        manager = _fte_worker_task_manager(execute_fn)
+        task_id = "q.0.10.1"
+        await manager.create_task({"task_id": task_id, "fragment_id": "q:node:copy"})
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        cancel_task = asyncio.create_task(manager.cancel_task(task_id))
+        await asyncio.sleep(0)
+
+        assert cancel_task.done() is False
+        status_while_writing = await manager.get_task_status(task_id)
+        assert status_while_writing["state"] == FteTaskState.RUNNING.value
+
+        release.set()
+        canceled = await asyncio.wait_for(cancel_task, timeout=1.0)
+
+        assert canceled["state"] == FteTaskState.CANCELED.value
+        assert manager.tasks[task_id]._future is not None
+        assert manager.tasks[task_id]._future.done() is True
+
+    asyncio.run(run())
+
+
 def test_fte_worker_task_manager_cancel_finished_loser_releases_result_immediately():
     result_payload = {"partition_refs": ["loser-object-ref"]}
 
