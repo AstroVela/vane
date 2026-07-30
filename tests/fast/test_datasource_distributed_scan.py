@@ -129,6 +129,28 @@ class StreamingSource(DataSource):
         yield StreamingTask()
 
 
+class BatchSequenceTask(DataSourceTask):
+    def __init__(self, batches: list[list[int]]) -> None:
+        self.batches = [list(batch) for batch in batches]
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        for batch in self.batches:
+            yield pa.record_batch({"value": pa.array(batch, type=pa.int64())})
+
+
+class BatchSequenceSource(DataSource):
+    def __init__(self, tasks: list[list[list[int]]]) -> None:
+        self.tasks = [[list(batch) for batch in task] for task in tasks]
+
+    @property
+    def schema(self) -> dict[str, str]:
+        return {"value": "BIGINT"}
+
+    def get_tasks(self) -> Iterator[DataSourceTask]:
+        for task in self.tasks:
+            yield BatchSequenceTask(task)
+
+
 class SchemaCallTrackingSource(StreamingSource):
     schema_calls = 0
 
@@ -274,6 +296,20 @@ def test_datasource_factory_owner_released_when_stream_finishes(duckdb_conn):
     assert finished["registry_size"] == baseline["registry_size"]
     assert finished["factory_count"] == baseline["factory_count"]
     assert finished["owner_count"] == baseline["owner_count"]
+
+
+def test_datasource_scan_reads_entire_large_record_batch(duckdb_conn):
+    values = list(range(5000))
+
+    result = read_datasource(BatchSequenceSource([[values]]), con=duckdb_conn).fetchall()
+
+    assert result == [(value,) for value in values]
+
+
+def test_datasource_scan_continues_after_empty_record_batches(duckdb_conn):
+    source = BatchSequenceSource([[[], [10, 20], [], [], [30], []]])
+
+    assert read_datasource(source, con=duckdb_conn).fetchall() == [(10,), (20,), (30,)]
 
 
 def test_datasource_schema_is_evaluated_once(duckdb_conn):
@@ -544,3 +580,27 @@ def test_ray_runner_executes_python_datasource_task_on_worker(ray_runner, duckdb
     shared_worker_pids = creation_counts_by_run[0].keys() & creation_counts_by_run[1].keys()
     for pid in shared_worker_pids:
         assert creation_counts_by_run[1][pid] == creation_counts_by_run[0][pid] + 1
+
+
+def test_ray_runner_preserves_large_and_post_empty_datasource_batches(ray_runner, duckdb_conn):
+    class RayBatchSequenceTask(DataSourceTask):
+        def __init__(self, batches: list[list[int]]) -> None:
+            self.batches = [list(batch) for batch in batches]
+
+        def execute(self) -> Iterator[pa.RecordBatch]:
+            for batch in self.batches:
+                yield pa.record_batch({"value": pa.array(batch, type=pa.int64())})
+
+    class RayBatchSequenceSource(DataSource):
+        @property
+        def schema(self) -> dict[str, str]:
+            return {"value": "BIGINT"}
+
+        def get_tasks(self) -> Iterator[DataSourceTask]:
+            yield RayBatchSequenceTask([[], list(range(5000)), [], [5000, 5001]])
+            yield RayBatchSequenceTask([[], [6000], []])
+
+    expected = list(range(5002)) + [6000]
+    table = _collect_tables(ray_runner, read_datasource(RayBatchSequenceSource(), con=duckdb_conn))
+
+    assert sorted(table.column(0).to_pylist()) == expected

@@ -13,9 +13,9 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
-#include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/function/built_in_functions.hpp"
 #include "duckdb/function/extension_file_list_provider.hpp"
+#include "duckdb/function/table/arrow.hpp"
 
 namespace duckdb {
 
@@ -85,10 +85,22 @@ struct DataSourceScanGlobalState : public GlobalTableFunctionState {
 };
 
 struct DataSourceScanLocalState : public LocalTableFunctionState {
+	enum class ScanState {
+		NEED_TASK,
+		NEED_BATCH,
+		SCANNING,
+		EXHAUSTED,
+	};
+
+	explicit DataSourceScanLocalState(ClientContext &context) : scan_state(make_uniq<ArrowArrayWrapper>(), context) {
+	}
+
 	//! Per-thread arrow stream (one per task)
 	unique_ptr<ArrowArrayStreamWrapper> stream;
-	//! Whether this thread is done
-	bool exhausted = false;
+	//! Current Arrow batch and conversion offset, retained across output vectors
+	ArrowScanLocalState scan_state;
+	//! Explicit scan state for task, batch, and output-vector transitions
+	ScanState state = ScanState::NEED_TASK;
 };
 
 struct DataSourceScanFunction {
