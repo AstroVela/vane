@@ -99,7 +99,7 @@ class _DeferredWakeupExecutor(_RecordingExecutor):
             callback()
 
 
-def _run_recording_sql(monkeypatch, prompts, options, *, executor=None, threads=1):
+def _run_recording_sql(monkeypatch, prompts, options, *, executor=None, threads=1, query_suffix=""):
     import duckdb
     import duckdb.execution.vllm as vllm
 
@@ -119,7 +119,10 @@ def _run_recording_sql(monkeypatch, prompts, options, *, executor=None, threads=
         )
         encoded = json.dumps(options, separators=(",", ":"))
         rows = con.execute(
-            "SELECT id, prompt, vllm(prompt, 'recording-model', '" + encoded + "') AS generated FROM vllm_input"
+            "SELECT id, prompt, vllm(prompt, 'recording-model', '"
+            + encoded
+            + "') AS generated FROM vllm_input"
+            + query_suffix
         ).fetchall()
         return executor, rows
     finally:
@@ -379,6 +382,25 @@ def test_native_finalizer_blocks_and_resumes_through_a_one_shot_callback(monkeyp
     assert executor.finished_count == 1
     assert not executor.pending
     assert not executor.invalid_wait
+
+
+def test_native_downstream_limit_retires_producer_when_final_execute_is_skipped(monkeypatch):
+    prompts = [f"prompt-{index}" for index in range(5000)]
+    executor, rows = _run_recording_sql(
+        monkeypatch,
+        prompts,
+        {
+            "do_prefix_routing": False,
+            "batch_size": None,
+            "inflight_limit": 0,
+        },
+        threads=1,
+        query_suffix=" LIMIT 1",
+    )
+
+    assert rows == [(0, "prompt-0", "generated:prompt-0")]
+    assert sum(len(submitted) for _, submitted in executor.submissions) < len(prompts)
+    assert executor.finished_count == 1
 
 
 def test_distributed_collection_keeps_explicit_pool_names_query_scoped():
