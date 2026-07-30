@@ -21,7 +21,7 @@ public:
 	                            vector<column_t> projected_input, optional_idx ordinality_idx,
 	                            vector<LogicalType> output_types, idx_t estimated_cardinality)
 	    : ctx_(InheritPipelineNodeContext(child, node_id, "StreamingUDF")),
-	      config_(BuildSchema(output_types), child ? child->config().execution_config() : DuckDBExecutionConfigRef(),
+	      config_(MakeSchemaRef(output_types), child ? child->config().execution_config() : DuckDBExecutionConfigRef(),
 	              child ? child->config().clustering_spec() : ClusteringSpec::unknown_with_num_partitions(1)),
 	      child_(std::move(child)), function_(std::move(function)), bind_data_(std::move(bind_data)),
 	      column_ids_(std::move(column_ids)), projected_input_(std::move(projected_input)),
@@ -87,13 +87,6 @@ public:
 	}
 
 private:
-	static SchemaRef BuildSchema(const vector<LogicalType> &output_types) {
-		if (output_types.empty()) {
-			return nullptr;
-		}
-		return std::make_shared<duckdb::LogicalType>(output_types[0]);
-	}
-
 	PipelineNodeContext ctx_;
 	PipelineNodeConfig config_;
 	PipelineNodeRef child_;
