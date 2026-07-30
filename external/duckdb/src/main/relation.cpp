@@ -294,7 +294,20 @@ unique_ptr<QueryNode> Relation::TryGetSerializableQueryNode(Binder &binder) {
 	if (!CanSerializeToQueryNodeInternal(binder)) {
 		return nullptr;
 	}
-	return GetQueryNode();
+	return RestoreDuplicateColumnAliases(GetQueryNode(), GetAlias(), Columns());
+}
+
+unique_ptr<QueryNode> Relation::RestoreDuplicateColumnAliases(unique_ptr<QueryNode> query_node, const string &alias,
+                                                              const vector<ColumnDefinition> &columns) {
+	case_insensitive_set_t output_names;
+	for (auto &column : columns) {
+		if (!output_names.insert(column.Name()).second) {
+			// SQL table scopes deduplicate names so expressions can address every
+			// column. Restore duplicate public aliases at this query boundary.
+			return WrapQueryNode(std::move(query_node), alias, columns);
+		}
+	}
+	return query_node;
 }
 
 unique_ptr<QueryResult> Relation::Execute() {
