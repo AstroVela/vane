@@ -12,6 +12,7 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 
 namespace duckdb {
@@ -25,19 +26,16 @@ UnnestRelation::UnnestRelation(shared_ptr<Relation> child_p, string column_name_
 
 unique_ptr<QueryNode> UnnestRelation::GetQueryNode() {
 	// Fallback AST path (used by default Relation::Bind if custom Bind not called).
-	// Builds: SELECT * EXCLUDE(col), unnest(col) AS col FROM (child)
+	// Builds: SELECT * REPLACE (unnest(col) AS col) FROM (child)
 	auto result = make_uniq<SelectNode>();
 	result->from_table = GetTableRefForSerialization(*child);
 
 	auto star = make_uniq<StarExpression>();
-	star->exclude_list.insert(QualifiedColumnName(column_name));
-	result->select_list.push_back(std::move(star));
-
 	vector<unique_ptr<ParsedExpression>> unnest_args;
 	unnest_args.push_back(make_uniq<ColumnRefExpression>(column_name));
 	auto unnest_func = make_uniq<FunctionExpression>("unnest", std::move(unnest_args));
-	unnest_func->SetAlias(column_name);
-	result->select_list.push_back(std::move(unnest_func));
+	star->replace_list.emplace(column_name, std::move(unnest_func));
+	result->select_list.push_back(std::move(star));
 
 	return std::move(result);
 }
@@ -53,14 +51,22 @@ BoundStatement UnnestRelation::Bind(Binder &binder) {
 
 	// 2. Find the column to unnest
 	idx_t unnest_col_idx = DConstants::INVALID_INDEX;
+	idx_t case_insensitive_match_count = 0;
 	for (idx_t i = 0; i < child_bound.names.size(); i++) {
-		if (child_bound.names[i] == column_name) {
-			unnest_col_idx = i;
-			break;
+		if (StringUtil::CIEquals(child_bound.names[i], column_name)) {
+			case_insensitive_match_count++;
 		}
+		if (child_bound.names[i] != column_name) {
+			continue;
+		}
+		unnest_col_idx = i;
 	}
 	if (unnest_col_idx == DConstants::INVALID_INDEX) {
 		throw BinderException("Column \"%s\" not found in child relation for unnest/explode", column_name);
+	}
+	// REPLACE follows SQL's case-insensitive identifier matching, so duplicate matches cannot be serialized faithfully.
+	if (case_insensitive_match_count > 1) {
+		throw BinderException("Ambiguous reference to column name \"%s\"", column_name);
 	}
 
 	// 3. Determine element type from the list/array column
