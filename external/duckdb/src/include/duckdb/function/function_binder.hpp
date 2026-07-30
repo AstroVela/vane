@@ -72,6 +72,10 @@ public:
 	DUCKDB_API static void BindSortedAggregate(ClientContext &context, BoundAggregateExpression &expr,
 	                                           const vector<unique_ptr<Expression>> &groups,
 	                                           optional_ptr<vector<GroupingSet>> grouping_sets);
+	//! Reconstruct the portable, pre-bind representation of a sorted aggregate.
+	//! Physical plans use this before copying or serializing an aggregate because
+	//! the bound sorted-aggregate state owns query-context-specific sort objects.
+	DUCKDB_API static unique_ptr<BoundAggregateExpression> UnbindSortedAggregate(const BoundAggregateExpression &expr);
 	DUCKDB_API static void BindSortedAggregate(ClientContext &context, BoundWindowExpression &expr);
 
 	//! Cast a set of expressions to the arguments of this function

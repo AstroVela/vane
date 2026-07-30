@@ -54,7 +54,9 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/execution/distributed/pipeline_node/translator.hpp"
 #include "duckdb/execution/distributed/pipeline_node/aggregate.hpp"
+#include "duckdb/execution/distributed/pipeline_node/grouping_set_expand.hpp"
 #include "duckdb/execution/distributed/pipeline_node/limit.hpp"
+#include "duckdb/execution/distributed/pipeline_node/projection.hpp"
 #include "duckdb/execution/distributed/pipeline_node/scan_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/expression_scan.hpp"
 #include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
@@ -397,6 +399,180 @@ TEST_CASE("PhysicalPlanTranslator: grouped hash aggregate -> AggregateNode", "[d
 	auto dist = res.value();
 	auto inner = dist->inner();
 	REQUIRE(std::dynamic_pointer_cast<duckdb::distributed::AggregateNode>(inner) != nullptr);
+}
+
+TEST_CASE("PhysicalPlanTranslator: grouping sets use expand-shuffle-aggregate", "[distributed][grouping_sets]") {
+	Allocator allocator;
+	auto plan = std::make_shared<PhysicalPlan>(allocator);
+	vector<LogicalType> input_types = {LogicalType::INTEGER, LogicalType::INTEGER};
+	auto collection = make_uniq<ColumnDataCollection>(allocator, input_types);
+	auto &scan = plan->Make<PhysicalColumnDataScan>(input_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 0,
+	                                                std::move(collection));
+	auto repartition_spec = RepartitionSpec::create_random(4);
+	auto &input = plan->Make<PhysicalRepartition>(input_types, std::move(repartition_spec), 0);
+	input.children.push_back(scan);
+
+	vector<unique_ptr<Expression>> groups;
+	groups.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+	groups.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 1));
+	vector<unique_ptr<Expression>> aggregates;
+	vector<GroupingSet> grouping_sets = {{0, 1}, {0}, {0}, {}};
+	vector<unsafe_vector<idx_t>> grouping_functions = {{0, 1}};
+	vector<LogicalType> output_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BIGINT};
+
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto &aggregate = plan->Make<PhysicalHashAggregate>(
+	    *conn.context, output_types, std::move(aggregates), std::move(groups), grouping_sets, grouping_functions, 0,
+	    TupleDataValidityType::CAN_HAVE_NULL_VALUES, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+	aggregate.children.push_back(input);
+	plan->SetRoot(aggregate);
+
+	PlanConfig config;
+	config.num_partitions = 4;
+	auto result = physical_plan_to_pipeline_node(config, std::move(plan));
+
+	REQUIRE(result.is_ok());
+	auto projection = std::dynamic_pointer_cast<ProjectionNode>(result.value()->inner());
+	REQUIRE(projection != nullptr);
+	REQUIRE(SchemaColumnCount(projection->config().schema()) == output_types.size());
+	REQUIRE(projection->config().clustering_spec()->type() == ClusteringSpec::Type::Unknown);
+	REQUIRE(projection->config().clustering_spec()->num_partitions() == 4);
+
+	auto projection_children = projection->children();
+	REQUIRE(projection_children.size() == 1);
+	auto final_aggregate = std::dynamic_pointer_cast<AggregateNode>(projection_children[0]);
+	REQUIRE(final_aggregate != nullptr);
+
+	auto final_children = final_aggregate->children();
+	REQUIRE(final_children.size() == 1);
+	auto shuffle = std::dynamic_pointer_cast<RepartitionNode>(final_children[0]);
+	REQUIRE(shuffle != nullptr);
+	REQUIRE(shuffle->config().clustering_spec()->type() == ClusteringSpec::Type::Hash);
+	REQUIRE(shuffle->config().clustering_spec()->partition_by().size() == 3);
+
+	auto shuffle_children = shuffle->children();
+	REQUIRE(shuffle_children.size() == 1);
+	REQUIRE(std::dynamic_pointer_cast<GroupingSetExpandNode>(shuffle_children[0]) != nullptr);
+}
+
+TEST_CASE("PhysicalPlanTranslator: grouping-set expansion accepts exact aggregate semantics",
+          "[distributed][grouping_sets]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+
+	AggregateType aggregate_type = AggregateType::NON_DISTINCT;
+	bool with_filter = false;
+	bool with_order = false;
+	SECTION("DISTINCT") {
+		aggregate_type = AggregateType::DISTINCT;
+	}
+	SECTION("FILTER") {
+		with_filter = true;
+	}
+	SECTION("ordered aggregate") {
+		with_order = true;
+	}
+
+	auto &allocator = Allocator::DefaultAllocator();
+	auto plan = std::make_shared<PhysicalPlan>(allocator);
+	vector<LogicalType> input_types = {LogicalType::BIGINT, LogicalType::BOOLEAN};
+	auto collection = make_uniq<ColumnDataCollection>(allocator, input_types);
+	auto &scan = plan->Make<PhysicalColumnDataScan>(input_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 0,
+	                                                std::move(collection));
+	auto repartition_spec = RepartitionSpec::create_random(4);
+	auto &input = plan->Make<PhysicalRepartition>(input_types, std::move(repartition_spec), 0);
+	input.children.push_back(scan);
+
+	auto aggregate_function =
+	    AggregateFunction::NullaryAggregate<int64_t, int64_t, TestNullaryAggOp>(LogicalType::BIGINT);
+	aggregate_function.name = "test_nullary";
+	unique_ptr<Expression> filter;
+	if (with_filter) {
+		filter = make_uniq<BoundReferenceExpression>(LogicalType::BOOLEAN, 1);
+	}
+	auto aggregate_expression = make_uniq<BoundAggregateExpression>(
+	    std::move(aggregate_function), vector<unique_ptr<Expression>> {}, std::move(filter), nullptr, aggregate_type);
+	if (with_order) {
+		aggregate_expression->order_bys = make_uniq<BoundOrderModifier>();
+		aggregate_expression->order_bys->orders.emplace_back(
+		    OrderType::ASCENDING, OrderByNullType::NULLS_LAST,
+		    make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0));
+	}
+
+	vector<unique_ptr<Expression>> aggregates;
+	aggregates.push_back(std::move(aggregate_expression));
+	vector<unique_ptr<Expression>> groups;
+	groups.push_back(make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0));
+	vector<GroupingSet> grouping_sets = {{0}, {}};
+	vector<unsafe_vector<idx_t>> grouping_functions;
+	vector<LogicalType> output_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+	auto &aggregate = plan->Make<PhysicalHashAggregate>(
+	    *conn.context, output_types, std::move(aggregates), std::move(groups), std::move(grouping_sets),
+	    std::move(grouping_functions), 0, TupleDataValidityType::CAN_HAVE_NULL_VALUES,
+	    TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+	aggregate.children.push_back(input);
+	plan->SetRoot(aggregate);
+
+	PlanConfig config;
+	config.num_partitions = 4;
+	auto result = physical_plan_to_pipeline_node(config, std::move(plan));
+
+	REQUIRE(result.is_ok());
+	auto projection = std::dynamic_pointer_cast<ProjectionNode>(result.value()->inner());
+	REQUIRE(projection != nullptr);
+	auto final_aggregate = std::dynamic_pointer_cast<AggregateNode>(projection->children()[0]);
+	REQUIRE(final_aggregate != nullptr);
+	auto shuffle = std::dynamic_pointer_cast<RepartitionNode>(final_aggregate->children()[0]);
+	REQUIRE(shuffle != nullptr);
+	REQUIRE(std::dynamic_pointer_cast<GroupingSetExpandNode>(shuffle->children()[0]) != nullptr);
+}
+
+TEST_CASE("PhysicalPlanTranslator: grouping-set expansion accepts zero-column input", "[distributed][grouping_sets]") {
+	auto &allocator = Allocator::DefaultAllocator();
+	auto plan = std::make_shared<PhysicalPlan>(allocator);
+	vector<LogicalType> input_types;
+	auto collection = make_uniq<ColumnDataCollection>(allocator, input_types);
+	auto &scan = plan->Make<PhysicalColumnDataScan>(input_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 0,
+	                                                std::move(collection));
+	auto repartition_spec = RepartitionSpec::create_random(4);
+	auto &input = plan->Make<PhysicalRepartition>(input_types, std::move(repartition_spec), 0);
+	input.children.push_back(scan);
+
+	auto aggregate_function =
+	    AggregateFunction::NullaryAggregate<int64_t, int64_t, TestNullaryAggOp>(LogicalType::BIGINT);
+	aggregate_function.name = "test_nullary";
+	vector<unique_ptr<Expression>> aggregates;
+	aggregates.push_back(make_uniq<BoundAggregateExpression>(std::move(aggregate_function),
+	                                                         vector<unique_ptr<Expression>> {}, nullptr, nullptr,
+	                                                         AggregateType::NON_DISTINCT));
+	vector<unique_ptr<Expression>> groups;
+	vector<GroupingSet> grouping_sets = {{}, {}};
+	vector<unsafe_vector<idx_t>> grouping_functions;
+	vector<LogicalType> output_types = {LogicalType::BIGINT};
+
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto &aggregate = plan->Make<PhysicalHashAggregate>(
+	    *conn.context, output_types, std::move(aggregates), std::move(groups), std::move(grouping_sets),
+	    std::move(grouping_functions), 0, TupleDataValidityType::CAN_HAVE_NULL_VALUES,
+	    TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+	aggregate.children.push_back(input);
+	plan->SetRoot(aggregate);
+
+	PlanConfig config;
+	config.num_partitions = 4;
+	auto result = physical_plan_to_pipeline_node(config, std::move(plan));
+
+	REQUIRE(result.is_ok());
+	auto projection = std::dynamic_pointer_cast<ProjectionNode>(result.value()->inner());
+	REQUIRE(projection != nullptr);
+	auto final_aggregate = std::dynamic_pointer_cast<AggregateNode>(projection->children()[0]);
+	REQUIRE(final_aggregate != nullptr);
+	auto shuffle = std::dynamic_pointer_cast<RepartitionNode>(final_aggregate->children()[0]);
+	REQUIRE(shuffle != nullptr);
+	REQUIRE(shuffle->config().clustering_spec()->partition_by().size() == 1);
+	REQUIRE(std::dynamic_pointer_cast<GroupingSetExpandNode>(shuffle->children()[0]) != nullptr);
 }
 
 TEST_CASE("PhysicalPlanTranslator: distributed distinct aggregate throws", "[distributed]") {

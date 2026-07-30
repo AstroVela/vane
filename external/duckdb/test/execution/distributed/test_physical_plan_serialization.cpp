@@ -17,6 +17,7 @@
 #include "duckdb/execution/physical_plan.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
+#include "duckdb/execution/operator/projection/physical_grouping_set_expand.hpp"
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
 #include "duckdb/execution/operator/helper/physical_limit.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_limit.hpp"
@@ -1002,6 +1003,171 @@ TEST_CASE("PhysicalHashAggregate serialization roundtrip", "[serialization][phys
 
 	std::cerr << "[test] PhysicalHashAggregate serialization roundtrip PASSED" << std::endl;
 	conn.Rollback();
+}
+
+TEST_CASE("PhysicalHashAggregate grouping sets serialization roundtrip",
+          "[serialization][physical_plan][grouping_sets]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	conn.BeginTransaction();
+	auto &context = *conn.context;
+
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+
+	vector<unique_ptr<Expression>> groups;
+	groups.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+	groups.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 1));
+
+	vector<unique_ptr<Expression>> aggregates;
+	auto count = MakeCountAggregate(context, 2, LogicalType::INTEGER);
+	count->Cast<BoundAggregateExpression>().filter = make_uniq<BoundReferenceExpression>(LogicalType::BOOLEAN, 3);
+	aggregates.push_back(std::move(count));
+
+	vector<GroupingSet> grouping_sets;
+	grouping_sets.push_back({0, 1});
+	grouping_sets.push_back({0});
+	grouping_sets.push_back({0}); // Duplicate grouping sets have duplicate-row semantics.
+	grouping_sets.push_back({});
+
+	vector<unsafe_vector<idx_t>> grouping_functions;
+	grouping_functions.push_back({0, 1});
+
+	vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT};
+	auto &hash_agg = plan.Make<PhysicalHashAggregate>(
+	    context, types, std::move(aggregates), std::move(groups), grouping_sets, grouping_functions, 42,
+	    TupleDataValidityType::CAN_HAVE_NULL_VALUES, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+
+	MemoryStream stream(allocator);
+	SerializationOptions options;
+	BinarySerializer serializer(stream, options);
+	serializer.Begin();
+	hash_agg.Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Set<ClientContext &>(context);
+	deserializer.Begin();
+	auto deserialized_op = PhysicalOperator::Deserialize(deserializer, plan);
+	deserializer.End();
+
+	REQUIRE(deserialized_op != nullptr);
+	auto *hash_ptr = dynamic_cast<PhysicalHashAggregate *>(deserialized_op.get());
+	REQUIRE(hash_ptr != nullptr);
+	REQUIRE(hash_ptr->grouping_sets == grouping_sets);
+	REQUIRE(hash_ptr->grouped_aggregate_data.grouping_functions.size() == grouping_functions.size());
+	REQUIRE(hash_ptr->grouped_aggregate_data.grouping_functions[0] == grouping_functions[0]);
+	auto &aggregate = hash_ptr->grouped_aggregate_data.aggregates[0]->Cast<BoundAggregateExpression>();
+	auto &filter = aggregate.filter->Cast<BoundReferenceExpression>();
+	REQUIRE(filter.index == 1);
+	auto filter_index = hash_ptr->filter_indexes.find(aggregate.filter.get());
+	REQUIRE(filter_index != hash_ptr->filter_indexes.end());
+	REQUIRE(filter_index->second == 3);
+
+	conn.Rollback();
+}
+
+TEST_CASE("PhysicalHashAggregate sorted aggregate serialization roundtrip",
+          "[serialization][physical_plan][grouping_sets]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	conn.BeginTransaction();
+	auto &context = *conn.context;
+
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+
+	vector<unique_ptr<Expression>> groups;
+	groups.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+
+	auto aggregate = MakeCountAggregate(context, 1, LogicalType::INTEGER);
+	aggregate->order_bys = make_uniq<BoundOrderModifier>();
+	aggregate->order_bys->orders.emplace_back(OrderType::DESCENDING, OrderByNullType::NULLS_FIRST,
+	                                          make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 2));
+	FunctionBinder::BindSortedAggregate(context, *aggregate, groups, nullptr);
+	REQUIRE(aggregate->order_bys == nullptr);
+
+	vector<unique_ptr<Expression>> aggregates;
+	aggregates.push_back(std::move(aggregate));
+	vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::BIGINT};
+	auto &hash_agg = plan.Make<PhysicalHashAggregate>(context, types, std::move(aggregates), std::move(groups), 42);
+
+	// Reproduce distributed stage construction: the query transaction that
+	// created the sorted aggregate has ended before the task plan is serialized.
+	conn.Rollback();
+
+	MemoryStream stream(allocator);
+	SerializationOptions options;
+	BinarySerializer serializer(stream, options);
+	serializer.Begin();
+	hash_agg.Serialize(serializer);
+	serializer.End();
+
+	conn.BeginTransaction();
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Set<ClientContext &>(context);
+	deserializer.Begin();
+	auto deserialized_op = PhysicalOperator::Deserialize(deserializer, plan);
+	deserializer.End();
+
+	REQUIRE(deserialized_op != nullptr);
+	auto *hash_ptr = dynamic_cast<PhysicalHashAggregate *>(deserialized_op.get());
+	REQUIRE(hash_ptr != nullptr);
+	auto &roundtrip = hash_ptr->grouped_aggregate_data.aggregates[0]->Cast<BoundAggregateExpression>();
+	REQUIRE(roundtrip.order_bys == nullptr);
+	REQUIRE(roundtrip.children.size() == 2);
+
+	auto portable = FunctionBinder::UnbindSortedAggregate(roundtrip);
+	REQUIRE(portable->children.size() == 1);
+	REQUIRE(portable->order_bys != nullptr);
+	REQUIRE(portable->order_bys->orders.size() == 1);
+	auto &order = portable->order_bys->orders[0];
+	REQUIRE(order.type == OrderType::DESCENDING);
+	REQUIRE(order.null_order == OrderByNullType::NULLS_FIRST);
+	REQUIRE(order.expression->Cast<BoundReferenceExpression>().index == 2);
+
+	conn.Rollback();
+}
+
+TEST_CASE("PhysicalGroupingSetExpand serialization roundtrip", "[serialization][physical_plan][grouping_sets]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+
+	vector<unique_ptr<Expression>> groups;
+	groups.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+	groups.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 1));
+	vector<GroupingSet> grouping_sets = {{0, 1}, {0}, {0}, {}};
+	vector<vector<idx_t>> grouping_functions = {{0, 1}};
+	vector<idx_t> filter_indexes = {DConstants::INVALID_INDEX, 2};
+	vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BOOLEAN,
+	                             LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BIGINT,
+	                             LogicalType::UBIGINT, LogicalType::BOOLEAN, LogicalType::BOOLEAN};
+	auto &expand = plan.Make<PhysicalGroupingSetExpand>(types, std::move(groups), grouping_sets, grouping_functions,
+	                                                    filter_indexes, 3, true, 42);
+
+	MemoryStream stream(allocator);
+	SerializationOptions options;
+	BinarySerializer serializer(stream, options);
+	serializer.Begin();
+	expand.Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Begin();
+	auto deserialized_op = PhysicalOperator::Deserialize(deserializer, plan);
+	deserializer.End();
+
+	REQUIRE(deserialized_op != nullptr);
+	auto *expand_ptr = dynamic_cast<PhysicalGroupingSetExpand *>(deserialized_op.get());
+	REQUIRE(expand_ptr != nullptr);
+	REQUIRE(expand_ptr->grouping_sets == grouping_sets);
+	REQUIRE(expand_ptr->grouping_functions == grouping_functions);
+	REQUIRE(expand_ptr->filter_indexes == filter_indexes);
+	REQUIRE(expand_ptr->input_column_count == 3);
+	REQUIRE(expand_ptr->emit_empty_grouping_sets);
 }
 
 TEST_CASE("PhysicalPlan with chain: Projection -> Filter", "[serialization][physical_plan]") {

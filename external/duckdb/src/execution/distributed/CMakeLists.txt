@@ -41,6 +41,7 @@ set(DISTRIBUTED_SOURCES_COMMON
 set(DISTRIBUTED_SOURCES_PIPELINE_NODE
     pipeline_node/aggregate.cpp
     pipeline_node/expression_scan.cpp
+    pipeline_node/grouping_set_expand.cpp
     pipeline_node/join/broadcast_join.cpp
     pipeline_node/join/delim_join.cpp
     pipeline_node/join/hash_join.cpp

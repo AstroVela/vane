@@ -163,6 +163,8 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "INOUT_FUNCTION";
 	case PhysicalOperatorType::STREAMING_UDF:
 		return "STREAMING_UDF";
+	case PhysicalOperatorType::GROUPING_SET_EXPAND:
+		return "GROUPING_SET_EXPAND";
 	case PhysicalOperatorType::CREATE_TYPE:
 		return "CREATE_TYPE";
 	case PhysicalOperatorType::ATTACH:

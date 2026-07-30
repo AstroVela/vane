@@ -3075,6 +3075,161 @@ def test_ray_group_by_multi_partition_plan(ray_runner, duckdb_conn, parquet_path
     )
 
 
+def test_ray_grouping_sets_span_multiple_scan_tasks(ray_runner, duckdb_conn, tmp_path, monkeypatch):
+    label = "test_ray_e2e: grouping sets span multiple scan tasks"
+    input_path = tmp_path / "grouping_sets_multi_task"
+    shuffle_dir = tmp_path / "grouping_sets_multi_task_shuffle"
+
+    monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    duckdb_conn.execute("SET perfect_ht_threshold=0")
+    duckdb_conn.execute(f"""
+        COPY (
+            SELECT
+                CASE WHEN i % 7 = 0 THEN NULL ELSE (i % 3)::INTEGER END AS a,
+                CASE WHEN i % 5 = 0 THEN NULL ELSE (i % 2)::INTEGER END AS b,
+                (i + 1)::INTEGER AS value,
+                (i % 4)::INTEGER AS file_id
+            FROM range(0, 24) AS t(i)
+        ) TO '{input_path}' (FORMAT PARQUET, PARTITION_BY (file_id))
+    """)
+    source = f"read_parquet('{input_path}/**/*.parquet')"
+
+    rollup_sql = f"""
+        SELECT a, b, COUNT(*) AS cnt, SUM(value) AS total, GROUPING(a, b) AS grouping_id
+        FROM {source}
+        GROUP BY ROLLUP(a, b)
+    """
+    relation = duckdb_conn.sql(rollup_sql)
+    ray_cxx = getattr(duckdb, "ray_cxx", None)
+    if ray_cxx is None or not hasattr(ray_cxx, "PyLogicalPlan"):
+        pytest.skip("duckdb.ray_cxx.PyLogicalPlan not available in this environment")
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
+    distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
+    descriptor_counts = [len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values()]
+    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
+    plan_text = distributed_plan.repr_ascii(False)
+    normalized_plan = plan_text.upper()
+    assert plan_text and "GROUPINGSETEXPAND" in normalized_plan and "REPARTITION" in normalized_plan, (
+        f"{label}: expected expand and repartition for distributed grouping sets, got:\n{plan_text}"
+    )
+
+    cases = {
+        "rollup with real nulls": rollup_sql,
+        "cube": f"""
+            SELECT a, b, COUNT(*) AS cnt, SUM(value) AS total, GROUPING(a, b) AS grouping_id
+            FROM {source}
+            GROUP BY CUBE(a, b)
+        """,
+        "duplicate explicit sets": f"""
+            SELECT a, b, COUNT(*) AS cnt, GROUPING(a, b) AS grouping_id
+            FROM {source}
+            GROUP BY GROUPING SETS ((a, b), (a), (a), ())
+        """,
+        "duplicate sets without grouping function": f"""
+            SELECT a, b, COUNT(*) AS cnt
+            FROM {source}
+            GROUP BY GROUPING SETS ((a, b), (a), (a), ())
+        """,
+        "multiple grouping functions": f"""
+            SELECT a, b, COUNT(*) AS cnt, GROUPING(a) AS grouping_a, GROUPING(b) AS grouping_b
+            FROM {source}
+            GROUP BY CUBE(a, b)
+        """,
+        "no aggregates or grouping functions": f"""
+            SELECT a, b
+            FROM {source}
+            GROUP BY GROUPING SETS ((a, b), (a), (a), ())
+        """,
+        "distinct aggregate": f"""
+            SELECT a, COUNT(DISTINCT value % 5) AS cnt, GROUPING(a) AS grouping_id
+            FROM {source}
+            GROUP BY ROLLUP(a)
+        """,
+        "filtered aggregate": f"""
+            SELECT a, COUNT(*) FILTER (WHERE value % 2 = 0) AS cnt, GROUPING(a) AS grouping_id
+            FROM {source}
+            GROUP BY ROLLUP(a)
+        """,
+        "ordered aggregate": f"""
+            SELECT a, LIST(value ORDER BY b, value) AS values, GROUPING(a) AS grouping_id
+            FROM {source}
+            GROUP BY ROLLUP(a)
+        """,
+        "distinct filtered aggregate": f"""
+            SELECT
+                a,
+                COUNT(DISTINCT value % 5) FILTER (WHERE b = 1) AS cnt,
+                GROUPING(a) AS grouping_id
+            FROM {source}
+            GROUP BY ROLLUP(a)
+        """,
+        "distinct filtered ordered aggregate": f"""
+            SELECT
+                a,
+                STRING_AGG(
+                    DISTINCT (value % 5)::VARCHAR,
+                    ',' ORDER BY (value % 5)::VARCHAR
+                ) FILTER (WHERE b = 1) AS values,
+                GROUPING(a) AS grouping_id
+            FROM {source}
+            GROUP BY ROLLUP(a)
+        """,
+        "empty input": f"""
+            SELECT a, b, COUNT(*) AS cnt, SUM(value) AS total, GROUPING(a, b) AS grouping_id
+            FROM {source}
+            WHERE value < 0
+            GROUP BY ROLLUP(a, b)
+        """,
+        "filtered aggregate on empty input": f"""
+            SELECT
+                a,
+                COUNT(*) FILTER (WHERE b = 1) AS cnt,
+                LIST(value ORDER BY b, value) AS values,
+                GROUPING(a) AS grouping_id
+            FROM {source}
+            WHERE value < 0
+            GROUP BY ROLLUP(a)
+        """,
+        "duplicate empty sets on empty input": f"""
+            SELECT COUNT(*) AS cnt
+            FROM {source}
+            WHERE value < 0
+            GROUP BY GROUPING SETS ((), ())
+        """,
+        "duplicate empty sets without input columns": f"""
+            SELECT COUNT(*) AS cnt
+            FROM {source}
+            GROUP BY GROUPING SETS ((), ())
+        """,
+    }
+    for case_name, sql in cases.items():
+        _run_query_case(
+            duckdb_conn,
+            ray_runner,
+            sql,
+            f"{label}: {case_name}",
+            require_all=["HASH_GROUP_BY"],
+            timeout_s=60.0,
+        )
+
+    single_partition_filter_sql = """
+        SELECT a, COUNT(*) FILTER (WHERE keep) AS cnt, GROUPING(a) AS grouping_id
+        FROM (VALUES (1, TRUE), (1, FALSE), (2, FALSE)) AS t(a, keep)
+        GROUP BY ROLLUP(a)
+    """
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        single_partition_filter_sql,
+        f"{label}: single-partition FILTER",
+        require_all=["HASH_GROUP_BY"],
+        timeout_s=60.0,
+    )
+
+
 def test_ray_perfect_hash_group_by(ray_runner, duckdb_conn, parquet_path):
     label = "test_ray_e2e: perfect hash group by"
     duckdb_conn.execute("SET perfect_ht_threshold=32")

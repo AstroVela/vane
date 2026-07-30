@@ -20,7 +20,9 @@
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_window.hpp"
 #include "duckdb/execution/operator/aggregate/physical_streaming_window.hpp"
+#include "duckdb/function/function_binder.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
+#include "duckdb/execution/operator/projection/physical_grouping_set_expand.hpp"
 #include "duckdb/execution/operator/projection/physical_vllm.hpp"
 
 #include "duckdb/execution/operator/projection/physical_pivot.hpp"
@@ -796,6 +798,17 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		return make_uniq<PhysicalUnnest>(physical_plan, std::move(types), std::move(select_list),
 		                                 estimated_cardinality);
 	}
+	case PhysicalOperatorType::GROUPING_SET_EXPAND: {
+		auto groups = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "groups");
+		auto grouping_sets = deserializer.ReadProperty<vector<GroupingSet>>(104, "grouping_sets");
+		auto grouping_functions = deserializer.ReadProperty<vector<vector<idx_t>>>(105, "grouping_functions");
+		auto filter_indexes = deserializer.ReadProperty<vector<idx_t>>(106, "filter_indexes");
+		auto input_column_count = deserializer.ReadProperty<idx_t>(107, "input_column_count");
+		auto emit_empty_grouping_sets = deserializer.ReadProperty<bool>(108, "emit_empty_grouping_sets");
+		return make_uniq<PhysicalGroupingSetExpand>(
+		    physical_plan, std::move(types), std::move(groups), std::move(grouping_sets), std::move(grouping_functions),
+		    std::move(filter_indexes), input_column_count, emit_empty_grouping_sets, estimated_cardinality);
+	}
 	case PhysicalOperatorType::RESERVOIR_SAMPLE: {
 		auto options = deserializer.ReadProperty<unique_ptr<SampleOptions>>(103, "sample_options");
 		return make_uniq<PhysicalReservoirSample>(physical_plan, std::move(types), std::move(options),
@@ -1093,9 +1106,19 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 	case PhysicalOperatorType::HASH_GROUP_BY: {
 		auto groups = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "groups");
 		auto aggregates = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(104, "aggregates");
+		auto grouping_sets = deserializer.ReadProperty<vector<GroupingSet>>(105, "grouping_sets");
+		auto grouping_functions = deserializer.ReadProperty<vector<unsafe_vector<idx_t>>>(106, "grouping_functions");
 		auto &context = deserializer.Get<ClientContext &>();
-		return make_uniq<PhysicalHashAggregate>(physical_plan, context, std::move(types), std::move(aggregates),
-		                                        std::move(groups), estimated_cardinality);
+		for (auto &aggregate : aggregates) {
+			auto &bound_aggregate = aggregate->Cast<BoundAggregateExpression>();
+			if (bound_aggregate.order_bys) {
+				FunctionBinder::BindSortedAggregate(context, bound_aggregate, groups, grouping_sets);
+			}
+		}
+		return make_uniq<PhysicalHashAggregate>(
+		    physical_plan, context, std::move(types), std::move(aggregates), std::move(groups),
+		    std::move(grouping_sets), std::move(grouping_functions), estimated_cardinality,
+		    TupleDataValidityType::CAN_HAVE_NULL_VALUES, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
 	}
 	case PhysicalOperatorType::PERFECT_HASH_GROUP_BY: {
 		auto groups = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "groups");

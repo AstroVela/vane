@@ -13,6 +13,7 @@
 
 #include "duckdb/execution/distributed/common_types.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/parser/group_by_node.hpp"
 
 #include "duckdb/execution/distributed/plan/distributed_physical_plan.hpp"
 #include "duckdb/execution/distributed/plan/runner.hpp"
@@ -29,6 +30,9 @@ class AggregateNode : public PipelineNodeImpl, public std::enable_shared_from_th
 public:
 	AggregateNode(NodeID node_id, const PlanConfig &plan_config, std::vector<BoundExprRef> group_by,
 	              std::vector<BoundAggExprRef> aggs, SchemaRef output_schema, DistributedPipelineNodeRef child);
+	AggregateNode(NodeID node_id, const PlanConfig &plan_config, std::vector<BoundExprRef> group_by,
+	              std::vector<BoundAggExprRef> aggs, SchemaRef output_schema, DistributedPipelineNodeRef child,
+	              std::vector<GroupingSet> grouping_sets, std::vector<std::vector<idx_t>> grouping_functions);
 
 	static NodeName node_name(const std::vector<BoundExprRef> &group_by);
 
@@ -64,6 +68,8 @@ private:
 	std::vector<BoundExprRef> group_by_;
 	std::vector<BoundAggExprRef> aggs_;
 	DistributedPipelineNodeRef child_;
+	std::vector<GroupingSet> grouping_sets_;
+	std::vector<std::vector<idx_t>> grouping_functions_;
 };
 
 class PerfectHashAggregateNode : public PipelineNodeImpl,

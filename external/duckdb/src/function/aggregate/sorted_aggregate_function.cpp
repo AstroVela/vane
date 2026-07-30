@@ -675,6 +675,53 @@ struct SortedAggregateFunction {
 
 } // namespace
 
+unique_ptr<BoundAggregateExpression> FunctionBinder::UnbindSortedAggregate(const BoundAggregateExpression &expr) {
+	if (expr.function.update != SortedAggregateFunction::ScatterUpdate) {
+		return unique_ptr_cast<Expression, BoundAggregateExpression>(expr.Copy());
+	}
+	if (!expr.bind_info) {
+		throw InternalException("Sorted aggregate is missing bind data");
+	}
+
+	auto &sorted_bind = expr.bind_info->Cast<SortedAggregateBindData>();
+	const auto child_count = sorted_bind.scan_cols.size();
+	if (child_count > expr.children.size() || sorted_bind.orders.empty()) {
+		throw InternalException("Sorted aggregate has invalid bind data");
+	}
+
+	vector<unique_ptr<Expression>> children;
+	children.reserve(child_count);
+	for (idx_t child_idx = 0; child_idx < child_count; child_idx++) {
+		children.push_back(expr.children[child_idx]->Copy());
+	}
+
+	auto filter = expr.filter ? expr.filter->Copy() : nullptr;
+	auto bind_info = sorted_bind.bind_info ? sorted_bind.bind_info->Copy() : nullptr;
+	auto result = make_uniq<BoundAggregateExpression>(sorted_bind.function, std::move(children), std::move(filter),
+	                                                  std::move(bind_info), expr.aggr_type);
+	result->return_type = expr.return_type;
+	result->SetAlias(expr.GetAlias());
+	result->SetQueryLocation(expr.GetQueryLocation());
+	result->order_bys = make_uniq<BoundOrderModifier>();
+	result->order_bys->orders.reserve(sorted_bind.orders.size() - 1);
+	for (idx_t order_idx = 1; order_idx < sorted_bind.orders.size(); order_idx++) {
+		const auto &order = sorted_bind.orders[order_idx];
+		if (order.expression->GetExpressionType() != ExpressionType::BOUND_REF) {
+			throw InternalException("Sorted aggregate order key is not a bound reference");
+		}
+		const auto input_index = order.expression->Cast<BoundReferenceExpression>().index;
+		if (input_index == 0 || input_index > sorted_bind.buffered_cols.size()) {
+			throw InternalException("Sorted aggregate order key index is out of range");
+		}
+		const auto child_index = sorted_bind.buffered_cols[input_index - 1];
+		if (child_index >= expr.children.size()) {
+			throw InternalException("Sorted aggregate buffered column index is out of range");
+		}
+		result->order_bys->orders.emplace_back(order.type, order.null_order, expr.children[child_index]->Copy());
+	}
+	return result;
+}
+
 void FunctionBinder::BindSortedAggregate(ClientContext &context, BoundAggregateExpression &expr,
                                          const vector<unique_ptr<Expression>> &groups,
                                          optional_ptr<vector<GroupingSet>> grouping_sets) {

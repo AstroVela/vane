@@ -7,6 +7,7 @@
 #include "duckdb/planner/expression/list.hpp"
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
+#include "duckdb/execution/operator/projection/physical_grouping_set_expand.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/order/physical_order.hpp"
 #include "duckdb/execution/operator/helper/physical_limit.hpp"
@@ -175,6 +176,13 @@ void PhysicalOperatorVisitor::EnumerateExpressions(PhysicalOperator &op,
 	case PhysicalOperatorType::PROJECTION: {
 		auto &proj = op.Cast<PhysicalProjection>();
 		for (auto &expr : proj.select_list) {
+			callback(&expr);
+		}
+		break;
+	}
+	case PhysicalOperatorType::GROUPING_SET_EXPAND: {
+		auto &expand = op.Cast<PhysicalGroupingSetExpand>();
+		for (auto &expr : expand.groups) {
 			callback(&expr);
 		}
 		break;
