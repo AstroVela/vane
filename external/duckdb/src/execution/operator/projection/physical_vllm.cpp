@@ -341,6 +341,24 @@ struct VLLMOperatorState : public OperatorState {
 	VLLMOperatorState(ClientContext &context, const Expression &prompt_expr) : prompt_executor(context, prompt_expr) {
 	}
 
+	void FinishSubmitting(ClientContext &context, VLLMGlobalOperatorState &gstate) {
+		if (finished_submitting) {
+			return;
+		}
+		finished_submitting = true;
+		gstate.ThreadFinishedSubmitting(context);
+	}
+
+	void Finalize(const PhysicalOperator &op, ExecutionContext &context) override {
+		if (!op.op_state) {
+			throw InternalException("vllm operator state is missing during local finalization");
+		}
+		// A downstream operator can finish the pipeline before this operator's
+		// FinalExecute runs. Retire this producer without submitting buffered
+		// work so the global producer barrier can still complete.
+		FinishSubmitting(context.client, op.op_state->Cast<VLLMGlobalOperatorState>());
+	}
+
 	ExpressionExecutor prompt_executor;
 
 	vector<BufferedVLLMInput> buffer;
@@ -660,8 +678,7 @@ OperatorFinalizeResultType PhysicalVLLM::FinalExecute(ExecutionContext &context,
 			gstate.EnsureExecutor(context);
 			PopAndSubmitTasks(context, gstate, state, 0);
 		}
-		state.finished_submitting = true;
-		gstate.ThreadFinishedSubmitting(context.client);
+		state.FinishSubmitting(context.client, gstate);
 	}
 
 	if (!gstate.HasExecutor()) {
