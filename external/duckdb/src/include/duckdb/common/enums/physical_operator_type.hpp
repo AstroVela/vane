@@ -21,6 +21,7 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 // Physical Operator Types
 //===--------------------------------------------------------------------===//
+// After changing this enum, regenerate enum_util.hpp and enum_util.cpp with scripts/generate_enum_util.py.
 enum class PhysicalOperatorType : uint8_t {
 	INVALID,
 	ORDER_BY,
