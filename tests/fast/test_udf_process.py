@@ -357,6 +357,265 @@ def test_unregister_timeout_keeps_context_alive_during_input_conversion():
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_mixed_streaming_inputs_preserve_task_admission_owner():
+    """A lazy input must not consume a materialized input's ready grant."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        from __future__ import annotations
+
+        import threading
+        import time
+        import uuid
+
+        import duckdb
+        import duckdb.execution.udf as udf_exec
+        import pyarrow as pa
+        from duckdb.execution.ref_bundle import (
+            make_local_shm_ref_bundle_result,
+            materialize_ref_bundle,
+        )
+
+        materialized_request_started = threading.Event()
+        lazy_output_taken = threading.Event()
+        async_errors = []
+        admission_requests = []
+        downstream_submits = []
+
+
+        class Stage1:
+            def __call__(self, table):
+                return pa.table({"y": table.column(0).to_pylist()})
+
+
+        class Stage2:
+            def __call__(self, table):
+                return pa.table({"z": table.column(0).to_pylist()})
+
+
+        class FakeExecutor:
+            def __init__(self, name):
+                self._name = name
+                self._output = []
+                self._finished = False
+                self._wakeup = None
+                self._admission_state = "idle"
+                self._retained_input_bytes = 0
+                self._pending_outputs = 0
+                self._error = ""
+                self._lock = threading.Lock()
+
+            def _notify(self):
+                wakeup = self._wakeup
+                if wakeup is not None:
+                    wakeup()
+
+            def _set_ready(self):
+                with self._lock:
+                    if self._admission_state != "requested":
+                        return
+                    self._admission_state = "ready"
+                self._notify()
+
+            def _set_failed(self, error):
+                with self._lock:
+                    self._error = str(error)
+                    self._admission_state = "failed"
+                    self._pending_outputs = 0
+                async_errors.append(str(error))
+                self._notify()
+
+            def supports_async_wakeup(self):
+                return True
+
+            def register_wakeup(self, callback):
+                self._wakeup = callback
+
+            def request_task_admission(self, retained_input_bytes):
+                retained = int(retained_input_bytes)
+                with self._lock:
+                    if self._admission_state != "idle":
+                        return False
+                    self._retained_input_bytes = retained
+                    self._admission_state = "requested"
+                admission_requests.append((self._name, retained))
+                if self._name != "Stage2" or retained == 0:
+                    self._set_ready()
+                    return True
+
+                materialized_request_started.set()
+
+                def grant_after_lazy_arrives():
+                    if not lazy_output_taken.wait(timeout=10):
+                        self._set_failed("lazy output never reached the dispatcher")
+                        return
+                    # The dispatcher has converted the upstream lazy result.
+                    # Leave the materialized grant parked while the awakened
+                    # UNION pipeline moves that result into the downstream sink.
+                    time.sleep(1)
+                    self._set_ready()
+
+                threading.Thread(target=grant_after_lazy_arrives, daemon=True).start()
+                return True
+
+            def task_admission_state(self):
+                with self._lock:
+                    state = {
+                        "state": self._admission_state,
+                        "available": self._admission_state == "ready",
+                        "retained_input_bytes": self._retained_input_bytes,
+                    }
+                    if self._error:
+                        state["error"] = self._error
+                    return state
+
+            def _consume_admission(self):
+                with self._lock:
+                    self._admission_state = "idle"
+                    self._retained_input_bytes = 0
+                    self._pending_outputs += 1
+
+            def _publish(self, submit_id, table):
+                result_name = "y" if self._name == "Stage1" else "z"
+                result = pa.table({result_name: table.column(0).to_pylist()})
+                output = (
+                    "__vane_submit_result__",
+                    int(submit_id),
+                    make_local_shm_ref_bundle_result(result),
+                )
+                with self._lock:
+                    self._output.append(output)
+                    self._pending_outputs -= 1
+                self._notify()
+
+            def submit_with_id(self, submit_id, table):
+                self._consume_admission()
+                if self._name == "Stage2":
+                    downstream_submits.append("materialized")
+                    self._publish(submit_id, table)
+                    return None
+
+                def publish_after_materialized_request():
+                    if not materialized_request_started.wait(timeout=10):
+                        self._set_failed("materialized request was not registered first")
+                        return
+                    self._publish(submit_id, table)
+
+                threading.Thread(target=publish_after_materialized_request, daemon=True).start()
+                return None
+
+            def submit_ref_bundle_with_id(self, submit_id, refs, slices, metadata, names):
+                self._consume_admission()
+                if self._name != "Stage2":
+                    raise RuntimeError("only the downstream UDF accepts lazy input")
+                downstream_submits.append("lazy")
+                table = materialize_ref_bundle(refs, slices, metadata, names)
+                self._publish(submit_id, table)
+                return None
+
+            def take_ready_result(self):
+                with self._lock:
+                    if not self._output:
+                        return None
+                    result = self._output.pop(0)
+                if self._name == "Stage1":
+                    lazy_output_taken.set()
+                return result
+
+            def finished_submitting(self):
+                self._finished = True
+
+            def all_tasks_finished(self):
+                with self._lock:
+                    return self._finished and self._pending_outputs == 0 and not self._output
+
+
+        def build_executor(payload, options=None):
+            del options
+            return FakeExecutor(str(payload["udf_name"]))
+
+
+        udf_exec.build_executor = build_executor
+        connection = duckdb.connect()
+        cursor = connection.cursor()
+        lazy = connection.sql("SELECT i::BIGINT AS x FROM range(4) t(i)").map_batches(
+            Stage1,
+            schema={"y": duckdb.sqltypes.BIGINT},
+            execution_backend="ray_actor",
+            actor_number=1,
+            gpus=0.0,
+            batch_size=4,
+            task_input_max_bytes=1024 * 1024,
+        )
+        materialized = connection.sql("SELECT (100 + i)::BIGINT AS y FROM range(4) t(i)")
+        relation = materialized.union(lazy).map_batches(
+            Stage2,
+            schema={"z": duckdb.sqltypes.BIGINT},
+            execution_backend="ray_actor",
+            actor_number=1,
+            gpus=0.0,
+            batch_size=4,
+            task_input_max_bytes=1024 * 1024,
+        )
+        plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            relation,
+            f"mixed-task-admission-{uuid.uuid4().hex[:8]}",
+        ).to_physical_plan(connection)
+        handles = {
+            str(node["node_id"]): {
+                "actor_handles": [f"actor-{node['node_id']}"],
+                "actor_node_ids": ["node-a"],
+                "query_driver_handle": object(),
+                "session_config": {},
+            }
+            for node in plan.collect_udf_nodes(conn=connection)
+        }
+        plan.set_udf_actor_handles(handles, conn=connection)
+
+        try:
+            result = duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+                cursor,
+                plan,
+                None,
+                None,
+            )
+            values = sorted(
+                value
+                for partition in result.partition_payloads
+                for value in partition.column(0).to_pylist()
+            )
+            assert values == [0, 1, 2, 3, 100, 101, 102, 103], values
+            assert not async_errors, async_errors
+            downstream_requests = [
+                retained
+                for name, retained in admission_requests
+                if name == "Stage2"
+            ]
+            assert len(downstream_requests) == 2, downstream_requests
+            assert downstream_requests[0] > 0, downstream_requests
+            assert downstream_requests[1] == 0, downstream_requests
+            assert downstream_submits == ["materialized", "lazy"], downstream_submits
+        finally:
+            cursor.close()
+            connection.close()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env=os.environ.copy(),
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_create_function_rejects_removed_process_and_ray_args():
     con = duckdb.connect()
 
