@@ -91,6 +91,10 @@ private:
 			return cleanup_complete;
 		}
 
+		bool RequiresCleanupStorage() const {
+			return !retained_cache;
+		}
+
 		ShuffleCacheConfig config;
 		std::weak_ptr<ShuffleCache> cache_identity;
 		std::shared_ptr<ShuffleCache> retained_cache;
@@ -160,6 +164,7 @@ public:
 		idx_t registry_entries_removed = 0;
 		idx_t storage_entries_removed = 0;
 		idx_t cleanup_errors = 0;
+		idx_t cleanup_storage_required = 0;
 		idx_t cleanup_pending = 0;
 		idx_t active_executions = 0;
 		std::string last_error;
@@ -577,6 +582,9 @@ private:
 				auto cleanup_result = state->CleanupIfReady(cleanup_storage);
 				if (cleanup_result.is_err()) {
 					result.cleanup_errors++;
+					if (!cleanup_storage && state->RequiresCleanupStorage()) {
+						result.cleanup_storage_required++;
+					}
 					result.last_error = cleanup_result.error().what();
 					continue;
 				}

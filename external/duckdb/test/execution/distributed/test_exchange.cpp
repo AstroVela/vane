@@ -555,12 +555,14 @@ TEST_CASE("Exchange: object shuffle cleanup reconstructs storage without retaini
 
 	auto without_context = registry.RemoveAndCleanupByQuery(query_id);
 	REQUIRE(without_context.cleanup_errors == 1);
+	REQUIRE(without_context.cleanup_storage_required == 1);
 	REQUIRE(without_context.cleanup_pending == 1);
 	REQUIRE(without_context.last_error.find("requires a live filesystem context") != std::string::npos);
 
 	auto cleanup_storage = std::make_shared<MockObjectShuffleStorage>(storage_root);
 	auto with_context = registry.RemoveAndCleanupByQuery(query_id, cleanup_storage);
 	REQUIRE(with_context.cleanup_errors == 0);
+	REQUIRE(with_context.cleanup_storage_required == 0);
 	REQUIRE(with_context.cleanup_pending == 0);
 	REQUIRE(with_context.storage_entries_removed > 0);
 	ShuffleCache cleanup_probe(config, std::move(cleanup_storage));

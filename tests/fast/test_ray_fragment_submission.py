@@ -2927,6 +2927,7 @@ def test_worker_flight_shuffle_cleanup_helper_uses_cxx_binding(monkeypatch):
         "registry_entries_removed": 2,
         "storage_entries_removed": 7,
         "cleanup_errors": 0,
+        "cleanup_storage_required": 0,
         "cleanup_pending": 0,
         "active_executions": 0,
         "last_error": "",
@@ -2973,6 +2974,43 @@ def test_worker_flight_shuffle_cleanup_helper_passes_cleanup_connection_and_snap
     ]
 
 
+def test_worker_local_shuffle_cleanup_skips_object_storage_rebuild(monkeypatch):
+    actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    actor._native_execution_condition = threading.Condition()
+    actor._native_query_cleanup_contexts = {
+        "query-drop": worker_mod.NativeQueryCleanupContext(
+            session_id="session-a",
+            session_config=(("AWS_PROFILE", "unavailable-profile"),),
+            use_session_credentials=True,
+            connection_snapshot_query_id="resource-query",
+        )
+    }
+    cleanup = {
+        "registry_entries_removed": 1,
+        "storage_entries_removed": 2,
+        "cleanup_errors": 0,
+        "cleanup_storage_required": 0,
+        "cleanup_pending": 0,
+        "active_executions": 0,
+        "last_error": "",
+    }
+    monkeypatch.setattr(
+        worker_mod,
+        "_cleanup_flight_shuffle_for_query",
+        lambda query_id, connection=None, connection_snapshot_query_id="": cleanup,
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_refresh_effective_duckdb_s3_config",
+        lambda *args, **kwargs: pytest.fail("local cleanup must not refresh AWS credentials"),
+    )
+
+    result = actor_class._cleanup_flight_shuffle_for_query_with_context(actor, "query-drop")
+
+    assert result == cleanup
+
+
 def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypatch):
     actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_class)
@@ -3016,11 +3054,23 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
         return dict(config)
 
     def cleanup(query_id, connection=None, connection_snapshot_query_id=""):
+        if connection is None:
+            events.append(("probe", query_id))
+            return {
+                "registry_entries_removed": 1,
+                "storage_entries_removed": 0,
+                "cleanup_errors": 1,
+                "cleanup_storage_required": 1,
+                "cleanup_pending": 1,
+                "active_executions": 0,
+                "last_error": "shuffle cleanup requires a live filesystem context",
+            }
         events.append(("cleanup", query_id, connection, connection_snapshot_query_id))
         return {
-            "registry_entries_removed": 1,
+            "registry_entries_removed": 0,
             "storage_entries_removed": 2,
             "cleanup_errors": 0,
+            "cleanup_storage_required": 0,
             "cleanup_pending": 0,
             "active_executions": 0,
             "last_error": "",
@@ -3032,9 +3082,18 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
 
     result = actor_class._cleanup_flight_shuffle_for_query_with_context(actor, "query-drop")
 
-    assert result["storage_entries_removed"] == 2
+    assert result == {
+        "registry_entries_removed": 1,
+        "storage_entries_removed": 2,
+        "cleanup_errors": 0,
+        "cleanup_storage_required": 0,
+        "cleanup_pending": 0,
+        "active_executions": 0,
+        "last_error": "",
+    }
     assert actor._session_s3_configs["session-a"]["AWS_ACCESS_KEY_ID"] == "fresh-key"
     assert events == [
+        ("probe", "query-drop"),
         (
             "refresh",
             {"AWS_PROFILE": "profile-a"},
@@ -3079,6 +3138,28 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
     actor._get_shared_conn = lambda: SimpleNamespace(cursor=lambda: cleanup_cursor)
     cleanup_calls = []
 
+    def cleanup(query_id, connection=None, connection_snapshot_query_id=""):
+        cleanup_calls.append((query_id, connection, connection_snapshot_query_id))
+        if connection is None:
+            return {
+                "registry_entries_removed": 1,
+                "storage_entries_removed": 0,
+                "cleanup_errors": 1,
+                "cleanup_storage_required": 1,
+                "cleanup_pending": 1,
+                "active_executions": 0,
+                "last_error": "shuffle cleanup requires a live filesystem context",
+            }
+        return {
+            "registry_entries_removed": 0,
+            "storage_entries_removed": 2,
+            "cleanup_errors": 0,
+            "cleanup_storage_required": 0,
+            "cleanup_pending": 0,
+            "active_executions": 0,
+            "last_error": "",
+        }
+
     monkeypatch.setattr(
         worker_mod,
         "_refresh_effective_duckdb_s3_config",
@@ -3092,22 +3173,24 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
     monkeypatch.setattr(
         worker_mod,
         "_cleanup_flight_shuffle_for_query",
-        lambda query_id, connection=None, connection_snapshot_query_id="": (
-            cleanup_calls.append((query_id, connection, connection_snapshot_query_id))
-            or {
-                "registry_entries_removed": 1,
-                "storage_entries_removed": 2,
-                "cleanup_errors": 0,
-                "cleanup_pending": 0,
-                "active_executions": 0,
-                "last_error": "",
-            }
-        ),
+        cleanup,
     )
 
-    actor_class._cleanup_flight_shuffle_for_query_with_context(actor, "query-drop")
+    result = actor_class._cleanup_flight_shuffle_for_query_with_context(actor, "query-drop")
 
-    assert cleanup_calls == [("query-drop", cleanup_cursor, "resource-query")]
+    assert result == {
+        "registry_entries_removed": 1,
+        "storage_entries_removed": 2,
+        "cleanup_errors": 0,
+        "cleanup_storage_required": 0,
+        "cleanup_pending": 0,
+        "active_executions": 0,
+        "last_error": "",
+    }
+    assert cleanup_calls == [
+        ("query-drop", None, ""),
+        ("query-drop", cleanup_cursor, "resource-query"),
+    ]
 
 
 def test_worker_object_shuffle_cleanup_preserves_primary_error_when_cursor_close_fails(monkeypatch):
@@ -3131,6 +3214,19 @@ def test_worker_object_shuffle_cleanup_preserves_primary_error_when_cursor_close
             raise RuntimeError("cursor close failed")
 
     actor._get_shared_conn = lambda: SimpleNamespace(cursor=_CleanupCursor)
+    monkeypatch.setattr(
+        worker_mod,
+        "_cleanup_flight_shuffle_for_query",
+        lambda query_id, connection=None, connection_snapshot_query_id="": {
+            "registry_entries_removed": 1,
+            "storage_entries_removed": 0,
+            "cleanup_errors": 1,
+            "cleanup_storage_required": 1,
+            "cleanup_pending": 1,
+            "active_executions": 0,
+            "last_error": "shuffle cleanup requires a live filesystem context",
+        },
+    )
     monkeypatch.setattr(
         worker_mod,
         "_refresh_effective_duckdb_s3_config",

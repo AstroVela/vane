@@ -54,6 +54,7 @@ def test_flight_shuffle_cleanup_is_idempotent_after_snapshot_retirement():
             "registry_entries_removed": 0,
             "storage_entries_removed": 0,
             "cleanup_errors": 0,
+            "cleanup_storage_required": 0,
             "cleanup_pending": 0,
             "active_executions": 0,
             "last_error": "",

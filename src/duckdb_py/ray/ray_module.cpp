@@ -548,6 +548,7 @@ void register_ray_bindings(py::module_ &mod) {
 			    out["registry_entries_removed"] = 0;
 			    out["storage_entries_removed"] = 0;
 			    out["cleanup_errors"] = 0;
+			    out["cleanup_storage_required"] = 0;
 			    out["cleanup_pending"] = 0;
 			    out["active_executions"] = 0;
 			    out["last_error"] = "";
@@ -584,6 +585,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    out["registry_entries_removed"] = cleanup_result.registry_entries_removed;
 		    out["storage_entries_removed"] = cleanup_result.storage_entries_removed;
 		    out["cleanup_errors"] = cleanup_result.cleanup_errors;
+		    out["cleanup_storage_required"] = cleanup_result.cleanup_storage_required;
 		    out["cleanup_pending"] = cleanup_result.cleanup_pending;
 		    out["active_executions"] = cleanup_result.active_executions;
 		    out["last_error"] = cleanup_result.last_error;
@@ -2859,7 +2861,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    selected_config.num_partitions = 1;
 		    selected_config.local_dirs = {base_uri};
 		    auto &fs = FileSystem::GetFileSystem(context);
-		    auto storage = MakeDuckDBFileSystemShuffleStorage(fs);
+		    auto *opener = ClientData::Get(context).file_opener.get();
+		    auto storage = MakeDuckDBFileSystemShuffleStorage(fs, opener);
 		    ShuffleCache selected_cache(selected_config, storage);
 		    auto selected_cleanup_res = selected_cache.RemoveAttemptStorage();
 		    if (selected_cleanup_res.is_err()) {
@@ -2887,7 +2890,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    out["selected_values_after_loser_cleanup"] = selected_values_after_cleanup;
 		    out["lost_manifest_after_cleanup_error"] = lost_manifest_after_cleanup_error;
 		    out["selected_cleanup_removed"] = selected_cleanup_res.value();
-		    auto cleanup = ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(exchange_context.query_id);
+		    auto cleanup = ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(exchange_context.query_id, storage);
 		    if (cleanup.cleanup_errors != 0 || cleanup.cleanup_pending != 0) {
 			    throw std::runtime_error("failed to clean MinIO selected-attempt test query");
 		    }

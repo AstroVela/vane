@@ -183,6 +183,7 @@ def _cleanup_flight_shuffle_for_query(
             "registry_entries_removed": 0,
             "storage_entries_removed": 0,
             "cleanup_errors": 0,
+            "cleanup_storage_required": 0,
             "cleanup_pending": 0,
             "active_executions": 0,
             "last_error": "",
@@ -205,6 +206,7 @@ def _cleanup_flight_shuffle_for_query(
         "registry_entries_removed": int(raw.get("registry_entries_removed", 0)),
         "storage_entries_removed": int(raw.get("storage_entries_removed", 0)),
         "cleanup_errors": int(raw.get("cleanup_errors", 0)),
+        "cleanup_storage_required": int(raw.get("cleanup_storage_required", 0)),
         "cleanup_pending": int(raw.get("cleanup_pending", 0)),
         "active_executions": int(raw.get("active_executions", 0)),
         "last_error": str(raw.get("last_error", "")),
@@ -1385,6 +1387,13 @@ class RayWorkerActor:
         if cleanup_context is None:
             return _cleanup_flight_shuffle_for_query(query_key)
 
+        # Retained local caches need no connection context. Probe first so
+        # unrelated AWS credential failures cannot block local-only teardown.
+        probe = _cleanup_flight_shuffle_for_query(query_key)
+        cleanup_storage_required = int(probe["cleanup_storage_required"])
+        if cleanup_storage_required == 0:
+            return probe
+
         session_config = dict(cleanup_context.session_config)
         operation_lock = self._get_session_operation_lock(
             cleanup_context.session_id,
@@ -1414,11 +1423,20 @@ class RayWorkerActor:
                 effective_s3_config,
                 use_session_credentials=cleanup_context.use_session_credentials,
             )
-            return _cleanup_flight_shuffle_for_query(
+            cleanup = _cleanup_flight_shuffle_for_query(
                 query_key,
                 cleanup_cursor,
                 cleanup_context.connection_snapshot_query_id,
             )
+            cleanup["registry_entries_removed"] += probe["registry_entries_removed"]
+            cleanup["storage_entries_removed"] += probe["storage_entries_removed"]
+            # The retry satisfies only the probe errors caused by missing
+            # caller-owned storage; preserve any independent cleanup failures.
+            unresolved_probe_errors = max(0, probe["cleanup_errors"] - cleanup_storage_required)
+            cleanup["cleanup_errors"] += unresolved_probe_errors
+            if unresolved_probe_errors and not cleanup["last_error"]:
+                cleanup["last_error"] = probe["last_error"]
+            return cleanup
         finally:
             try:
                 cleanup_cursor.close()
