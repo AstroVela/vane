@@ -3380,6 +3380,65 @@ def test_ray_join_flight_shuffle_exchange(ray_runner, duckdb_conn, parquet_path,
     )
 
 
+def test_ray_hash_join_drains_unequal_repartition_event_streams(ray_runner, duckdb_conn, tmp_path, monkeypatch):
+    label = "test_ray_e2e: hash join unequal repartition event streams"
+    left_path = tmp_path / "hash_join_unequal_left"
+    right_path = tmp_path / "hash_join_unequal_right"
+    shuffle_dir = tmp_path / "hash_join_unequal_shuffle"
+
+    monkeypatch.setenv("VANE_SHUFFLE_ALGORITHM", "flight_shuffle")
+    monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
+    monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "hash")
+    monkeypatch.setenv("VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES", "0")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "8")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+
+    duckdb_conn.execute(f"""
+        COPY (
+            SELECT
+                i::INTEGER AS id,
+                i::INTEGER AS file_id
+            FROM range(0, 8) AS t(i)
+        ) TO '{left_path}' (FORMAT PARQUET, PARTITION_BY (file_id))
+    """)
+    duckdb_conn.execute(f"""
+        COPY (
+            SELECT
+                i::INTEGER AS id,
+                (i % 2)::INTEGER AS file_id
+            FROM range(0, 8) AS t(i)
+        ) TO '{right_path}' (FORMAT PARQUET, PARTITION_BY (file_id))
+    """)
+
+    sql = f"""
+        SELECT l.id
+        FROM read_parquet('{left_path}/**/*.parquet') AS l
+        JOIN read_parquet('{right_path}/**/*.parquet') AS r
+          ON l.id = r.id
+    """
+    relation = duckdb_conn.sql(sql)
+    ray_cxx = getattr(duckdb, "ray_cxx", None)
+    if ray_cxx is None or not hasattr(ray_cxx, "PyLogicalPlan"):
+        pytest.skip("duckdb.ray_cxx.PyLogicalPlan not available in this environment")
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
+    distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
+    descriptor_counts = sorted(len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values())
+    assert descriptor_counts == [2, 8], f"{label}: expected unequal scan task streams, got {descriptor_counts}"
+    plan_text = distributed_plan.repr_ascii(False)
+    assert "REPARTITION" in plan_text.upper(), f"{label}: expected repartitioned hash join, got:\n{plan_text}"
+    assert "HASH JOIN" in plan_text.upper(), f"{label}: expected hash join, got:\n{plan_text}"
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["HASH_JOIN"],
+        timeout_s=60.0,
+    )
+
+
 @pytest.mark.external_service
 def test_ray_group_by_flight_shuffle_exchange_minio_durable(ray_runner, duckdb_conn, tmp_path, monkeypatch):
     label = "test_ray_e2e: group by flight shuffle exchange minio durable"

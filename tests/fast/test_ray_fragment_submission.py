@@ -7622,6 +7622,79 @@ def test_fte_exchange_source_stream_exhaustion_sends_no_more_to_running_task(mon
     assert no_more_call[2] == "3"
 
 
+def test_fte_hash_fragment_accepts_one_sided_exchange_updates(monkeypatch):
+    monkeypatch.setattr(
+        RayWorkerActorHandle,
+        "_fte_task_handle_cls",
+        staticmethod(lambda: _FakeFteTaskHandle),
+    )
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    first_task = _FakeTask(
+        name="hash-join-exchange-initial",
+        context={"query_id": "query-fte-hash-join-fan-in", "node_id": "8"},
+        inputs={
+            "3": {
+                "kind": "exchange_source_task",
+                "data": {
+                    "partition_indices": [0],
+                    "source_partition_count": 1,
+                    "source_task_count": 1,
+                    "source_handles": [{"partition_id": 0, "path": "left-sink-a"}],
+                },
+            },
+            "4": {
+                "kind": "exchange_source_task",
+                "data": {
+                    "partition_indices": [0],
+                    "source_partition_count": 1,
+                    "source_task_count": 1,
+                    "source_handles": [{"partition_id": 0, "path": "right-sink-a"}],
+                },
+            },
+        },
+        plan={"plan": "hash-join-template"},
+    )
+    left_update = _FakeTask(
+        name="hash-join-exchange-left-update",
+        context={"query_id": "query-fte-hash-join-fan-in", "node_id": "8"},
+        inputs={
+            "3": {
+                "kind": "exchange_source_task",
+                "data": {
+                    "partition_indices": [0],
+                    "source_partition_count": 1,
+                    "source_task_count": 1,
+                    "source_handles": [{"partition_id": 0, "path": "left-sink-b"}],
+                },
+            }
+        },
+        plan={"plan": "hash-join-template"},
+    )
+
+    first_handles = handle.submit_tasks([first_task])
+    actor.fte_calls.clear()
+    update_handles = handle.submit_tasks([left_update])
+
+    assert len(first_handles) == 1
+    assert update_handles == []
+    assert [call[0] for call in actor.fte_calls] == [
+        "wait_split_queue",
+        "add_splits",
+    ]
+    add_call = actor.fte_calls[1]
+    assert add_call[2] == "3"
+    assert add_call[3][0]["data"]["source_handles"][0]["path"] == "left-sink-b"
+
+    actor.fte_calls.clear()
+    exhausted_handles = handle.task_input_stream_exhausted(["3", "4"])
+
+    assert exhausted_handles == []
+    no_more_calls = [call for call in actor.fte_calls if call[0] == "no_more_splits"]
+    assert len(no_more_calls) == 2
+    assert {call[2] for call in no_more_calls} == {"3", "4"}
+
+
 def test_fte_exchange_selector_event_updates_running_consumer(monkeypatch):
     monkeypatch.setattr(
         RayWorkerActorHandle,

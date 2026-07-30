@@ -29,6 +29,9 @@
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/parallel/task_executor.hpp"
 #include "duckdb/planner/joinside.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 
@@ -85,6 +88,140 @@ static WorkerTask MakeWorkerTaskWithoutRoot(NodeID node_id, const std::string &n
 	return WorkerTask(TaskContext::from_node_context(1, node_id, static_cast<TaskID>(node_id)), plan,
 	                  DuckDBExecutionConfigRef(),
 	                  PipelineNodeContext(1, "join-query", node_id, node_name).to_hashmap());
+}
+
+class StaticTaskNode : public PipelineNodeImpl {
+public:
+	StaticTaskNode(NodeID node_id, SourceNodeId source_node_id, const std::string &node_name,
+	               const std::vector<std::string> &input_bytes)
+	    : config_(MakeSchemaRef(std::vector<LogicalType> {LogicalType::BIGINT}),
+	              std::make_shared<DuckDBExecutionConfig>(), ClusteringSpec::unknown_with_num_partitions(1)),
+	      context_(1, "join-query", node_id, node_name) {
+		for (const auto &input : input_bytes) {
+			tasks_.push_back(MakeWorkerTaskWithInput(node_id, node_name, source_node_id, input));
+		}
+	}
+
+	const PipelineNodeContext &context() const override {
+		return context_;
+	}
+
+	const PipelineNodeConfig &config() const override {
+		return config_;
+	}
+
+	std::vector<PipelineNodeRef> children() const override {
+		return {};
+	}
+
+	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext & /*plan_context*/) override {
+		struct VectorTaskStream {
+			explicit VectorTaskStream(std::vector<WorkerTask> tasks_p) : tasks(std::move(tasks_p)) {
+			}
+
+			std::pair<bool, SubmittableTask<WorkerTask>> poll_next() {
+				if (index >= tasks.size()) {
+					return std::make_pair(false, SubmittableTask<WorkerTask>());
+				}
+				return std::make_pair(true, SubmittableTask<WorkerTask>(std::move(tasks[index++])));
+			}
+
+			std::pair<bool, SubmittableTask<WorkerTask>> try_poll_next() {
+				return poll_next();
+			}
+
+			bool is_exhausted() const {
+				return index >= tasks.size();
+			}
+
+			std::vector<WorkerTask> tasks;
+			idx_t index = 0;
+		};
+
+		auto stream = VectorTaskStream(std::move(tasks_));
+		return SubmittableTaskStream<WorkerTask>(boxed<SubmittableTask<WorkerTask>>(std::move(stream)));
+	}
+
+	std::vector<std::string> multiline_display(bool /*verbose*/) const override {
+		return {context_.node_name()};
+	}
+
+private:
+	PipelineNodeConfig config_;
+	PipelineNodeContext context_;
+	std::vector<WorkerTask> tasks_;
+};
+
+static std::shared_ptr<HashJoinNode> MakeHashJoinNode(const std::vector<std::string> &left_inputs,
+                                                      const std::vector<std::string> &right_inputs) {
+	PlanConfig plan_cfg(1, "join-query", std::make_shared<DuckDBExecutionConfig>());
+	auto left_impl = std::make_shared<StaticTaskNode>(10, 10, "left", left_inputs);
+	auto right_impl = std::make_shared<StaticTaskNode>(20, 20, "right", right_inputs);
+	auto left = std::make_shared<DistributedPipelineNode>(left_impl);
+	auto right = std::make_shared<DistributedPipelineNode>(right_impl);
+	auto schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::BIGINT, LogicalType::BIGINT});
+
+	return std::make_shared<HashJoinNode>(
+	    300, plan_cfg, vector<JoinCondition> {}, JoinType::INNER,
+	    vector<LogicalType> {LogicalType::BIGINT, LogicalType::BIGINT}, vector<LogicalType> {}, vector<LogicalType> {},
+	    PhysicalHashJoin::JoinProjectionColumns(), PhysicalHashJoin::JoinProjectionColumns(),
+	    PhysicalHashJoin::JoinProjectionColumns(), vector<unique_ptr<BaseStatistics>> {}, nullptr, 1, std::move(left),
+	    std::move(right), std::move(schema));
+}
+
+static std::vector<std::string> MakeInputNames(const std::string &prefix, idx_t count) {
+	std::vector<std::string> result;
+	for (idx_t index = 0; index < count; index++) {
+		result.push_back(prefix + std::to_string(index));
+	}
+	return result;
+}
+
+static void RequireHashJoinFanInPreservesInputs(idx_t left_count, idx_t right_count) {
+	auto left_inputs = MakeInputNames("left-", left_count);
+	auto right_inputs = MakeInputNames("right-", right_count);
+	auto node = MakeHashJoinNode(left_inputs, right_inputs);
+
+	DuckDB db(nullptr);
+	Connection connection(db);
+	auto task_executor = std::make_shared<TaskExecutor>(*connection.context);
+	PlanExecutionContext plan_context(task_executor, connection.context);
+	auto stream = node->produce_tasks(plan_context);
+
+	std::vector<std::string> actual_left_inputs;
+	std::vector<std::string> actual_right_inputs;
+	std::string fragment_node_id;
+	while (true) {
+		auto next = stream.poll_next();
+		if (!next.first) {
+			break;
+		}
+		const auto &context = next.second.task()->context();
+		auto node_id_entry = context.find("node_id");
+		REQUIRE(node_id_entry != context.end());
+		REQUIRE_FALSE(node_id_entry->second.empty());
+		if (fragment_node_id.empty()) {
+			fragment_node_id = node_id_entry->second;
+		} else {
+			REQUIRE(node_id_entry->second == fragment_node_id);
+		}
+
+		const auto &inputs = next.second.task()->inputs();
+		REQUIRE_FALSE(inputs.empty());
+		REQUIRE(inputs.size() <= 2);
+		auto left_entry = inputs.find(10);
+		if (left_entry != inputs.end()) {
+			actual_left_inputs.push_back(left_entry->second.scan_task_bytes);
+		}
+		auto right_entry = inputs.find(20);
+		if (right_entry != inputs.end()) {
+			actual_right_inputs.push_back(right_entry->second.scan_task_bytes);
+		}
+	}
+	task_executor->WorkOnTasks();
+
+	REQUIRE(actual_left_inputs == left_inputs);
+	REQUIRE(actual_right_inputs == right_inputs);
 }
 
 //===----------------------------------------------------------------------===//
@@ -310,6 +447,55 @@ TEST_CASE("HashJoinNode: replacement task preserves both side inputs", "[distrib
 	    ClonePhysicalPlanOrThrow(joined_task.task()->plan(), "hash_join_owned_children_test", nullptr);
 	REQUIRE(joined_plan_clone->HasRoot());
 	REQUIRE(joined_plan_clone->Root().children.size() == 2);
+}
+
+TEST_CASE("HashJoinNode: fan-in preserves child task streams", "[distributed][source_id][join]") {
+	SECTION("streams have equal length") {
+		RequireHashJoinFanInPreservesInputs(3, 3);
+	}
+	SECTION("left stream is longer") {
+		RequireHashJoinFanInPreservesInputs(3, 1);
+	}
+	SECTION("right stream is longer") {
+		RequireHashJoinFanInPreservesInputs(1, 3);
+	}
+}
+
+TEST_CASE("HashJoinNode: asymmetric empty child stream fails loudly", "[distributed][source_id][join]") {
+	SECTION("right stream is empty") {
+		auto node = MakeHashJoinNode(MakeInputNames("left-", 1), {});
+		DuckDB db(nullptr);
+		Connection connection(db);
+		auto task_executor = std::make_shared<TaskExecutor>(*connection.context);
+		PlanExecutionContext plan_context(task_executor, connection.context);
+		auto stream = node->produce_tasks(plan_context);
+
+		REQUIRE_THROWS_WITH(stream.poll_next(), Catch::Matchers::Contains("empty right task stream"));
+		task_executor->WorkOnTasks();
+	}
+	SECTION("left stream is empty") {
+		auto node = MakeHashJoinNode({}, MakeInputNames("right-", 1));
+		DuckDB db(nullptr);
+		Connection connection(db);
+		auto task_executor = std::make_shared<TaskExecutor>(*connection.context);
+		PlanExecutionContext plan_context(task_executor, connection.context);
+		auto stream = node->produce_tasks(plan_context);
+
+		REQUIRE_THROWS_WITH(stream.poll_next(), Catch::Matchers::Contains("empty left task stream"));
+		task_executor->WorkOnTasks();
+	}
+}
+
+TEST_CASE("HashJoinNode: two empty child streams produce no task", "[distributed][source_id][join]") {
+	auto node = MakeHashJoinNode({}, {});
+	DuckDB db(nullptr);
+	Connection connection(db);
+	auto task_executor = std::make_shared<TaskExecutor>(*connection.context);
+	PlanExecutionContext plan_context(task_executor, connection.context);
+	auto stream = node->produce_tasks(plan_context);
+
+	REQUIRE_FALSE(stream.poll_next().first);
+	task_executor->WorkOnTasks();
 }
 
 TEST_CASE("BroadcastJoinNode: replacement task preserves receiver inputs", "[distributed][source_id][join]") {
