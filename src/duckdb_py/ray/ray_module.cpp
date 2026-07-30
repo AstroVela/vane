@@ -64,6 +64,7 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/common/serializer/binary_serializer.hpp>
 #include <duckdb/common/serializer/binary_deserializer.hpp>
 #include <duckdb/main/client_context.hpp>
+#include <duckdb/main/client_data.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/database.hpp>
 #include <duckdb/common/types/data_chunk.hpp>
@@ -541,7 +542,7 @@ void register_ray_bindings(py::module_ &mod) {
 
 	m.def(
 	    "cleanup_flight_shuffle_for_query",
-	    [](const string &query_id) {
+	    [](const string &query_id, py::object cleanup_connection, const string &connection_snapshot_query_id) {
 		    py::dict out;
 		    if (query_id.empty()) {
 			    out["registry_entries_removed"] = 0;
@@ -552,9 +553,33 @@ void register_ray_bindings(py::module_ &mod) {
 			    out["last_error"] = "";
 			    return out;
 		    }
+		    std::shared_ptr<duckdb::distributed::ShuffleStorage> cleanup_storage;
+		    if (!cleanup_connection.is_none()) {
+			    auto &conn_wrapper = ExtractPyConnectionWrapper(cleanup_connection);
+			    if (conn_wrapper.con.ConnectionIsClosed()) {
+				    throw std::runtime_error("shuffle cleanup connection is closed");
+			    }
+			    if (!connection_snapshot_query_id.empty()) {
+				    auto snapshot = LookupQueryConnectionSnapshot(connection_snapshot_query_id);
+				    if (!snapshot.is_none()) {
+					    ApplyConnectionSnapshot(cleanup_connection, snapshot, false);
+				    }
+				    // Concurrent idempotent teardown can retire replay state after
+				    // this cleanup cursor was configured. Continue with its
+				    // sanitized session baseline: remaining storage failures stay
+				    // visible and retryable in the registry.
+			    }
+			    auto &context = *conn_wrapper.con.GetConnection().context;
+			    auto &fs = *duckdb::DBConfig::GetConfig(context).file_system;
+			    auto *opener = duckdb::ClientData::Get(context).file_opener.get();
+			    cleanup_storage = duckdb::distributed::MakeDuckDBFileSystemShuffleStorage(fs, opener);
+		    } else if (!connection_snapshot_query_id.empty()) {
+			    throw std::runtime_error("query connection snapshot requires a shuffle cleanup connection");
+		    }
 		    auto cleanup_result = [&]() {
 			    py::gil_scoped_release release;
-			    return duckdb::distributed::ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(query_id);
+			    return duckdb::distributed::ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(query_id,
+			                                                                                         cleanup_storage);
 		    }();
 		    out["registry_entries_removed"] = cleanup_result.registry_entries_removed;
 		    out["storage_entries_removed"] = cleanup_result.storage_entries_removed;
@@ -564,7 +589,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    out["last_error"] = cleanup_result.last_error;
 		    return out;
 	    },
-	    py::arg("query_id"));
+	    py::arg("query_id"), py::arg("cleanup_connection") = py::none(), py::arg("connection_snapshot_query_id") = "");
 
 	m.def(
 	    "retire_flight_shuffle_query",

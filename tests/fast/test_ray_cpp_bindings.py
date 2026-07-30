@@ -33,6 +33,37 @@ def _make_test_physical_plan(con=None):
     ).to_physical_plan(con)
 
 
+def test_flight_shuffle_cleanup_is_idempotent_after_snapshot_retirement():
+    query_id = f"query-cleanup-{uuid.uuid4()}"
+    snapshot_query_id = f"query-snapshot-{uuid.uuid4()}"
+    con = duckdb.connect()
+    cleanup_cursor = con.cursor()
+    plan = _make_test_physical_plan(con)
+    duckdb.ray_cxx._register_query_python_replay_state(snapshot_query_id, plan)
+    assert duckdb.ray_cxx._lookup_query_connection_snapshot(snapshot_query_id) is not None
+    duckdb.ray_cxx._cleanup_query_python_replay_state(snapshot_query_id)
+    assert duckdb.ray_cxx._lookup_query_connection_snapshot(snapshot_query_id) is None
+
+    try:
+        result = duckdb.ray_cxx.cleanup_flight_shuffle_for_query(
+            query_id,
+            cleanup_cursor,
+            snapshot_query_id,
+        )
+        assert result == {
+            "registry_entries_removed": 0,
+            "storage_entries_removed": 0,
+            "cleanup_errors": 0,
+            "cleanup_pending": 0,
+            "active_executions": 0,
+            "last_error": "",
+        }
+    finally:
+        duckdb.ray_cxx.retire_flight_shuffle_query(query_id)
+        cleanup_cursor.close()
+        con.close()
+
+
 def test_execute_native_keeps_result_collector_query_local():
     con = duckdb.connect()
     cursor = con.cursor()

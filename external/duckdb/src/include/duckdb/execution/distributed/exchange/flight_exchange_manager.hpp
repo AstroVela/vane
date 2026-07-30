@@ -239,7 +239,7 @@ private:
 class FlightExchangeSink : public ExchangeSink {
 public:
 	FlightExchangeSink(std::shared_ptr<ShuffleCache> shuffle_cache, const ExchangeSinkInstanceHandle &handle,
-	                   ClientContext *context);
+	                   ClientContext *context, bool descriptor_only_cleanup = false);
 	~FlightExchangeSink() override;
 
 	DuckDBResult<void> AddChunk(idx_t partition_id, DataChunk &chunk) override;
