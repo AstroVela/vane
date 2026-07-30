@@ -1593,10 +1593,11 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	sample_options->sample_size = Value::BIGINT(17);
 	sample_options->is_percentage = false;
 	sample_options->method = SampleMethod::RESERVOIR_SAMPLE;
-	auto &local_sample = plan.Make<PhysicalDistributedReservoirSample>(
-	                             vector<LogicalType> {LogicalType::UBIGINT, LogicalType::BLOB},
-	                             std::move(sample_options), DistributedReservoirSampleStage::LOCAL, 3, 1)
-	                         .Cast<PhysicalDistributedReservoirSample>();
+	auto &local_sample =
+	    plan.Make<PhysicalDistributedReservoirSample>(vector<LogicalType> {LogicalType::UBIGINT, LogicalType::BLOB},
+	                                                  std::move(sample_options), DistributedReservoirSampleStage::LOCAL,
+	                                                  DConstants::INVALID_INDEX, 1)
+	        .Cast<PhysicalDistributedReservoirSample>();
 	sink.children.push_back(local_sample);
 	plan.SetRoot(sink);
 
@@ -1611,7 +1612,8 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
 	REQUIRE(error.find("query") != string::npos);
 	REQUIRE(sink.SinkHandle().attempt_id == 0);
-	REQUIRE(local_sample.task_index == 3);
+	REQUIRE(local_sample.task_index == DConstants::INVALID_INDEX);
+	REQUIRE_THROWS_AS(local_sample.GetEffectiveSeed(), InternalException);
 
 	error.clear();
 	invalid = descriptor;
@@ -1630,6 +1632,7 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	REQUIRE(sink.SinkHandle().output_location == "opaque-exchange__sink_8__attempt_2");
 	REQUIRE(local_sample.task_index == 8);
 	REQUIRE(local_sample.options->GetSeed() == 42);
+	REQUIRE_NOTHROW(local_sample.GetEffectiveSeed());
 
 	error.clear();
 	invalid = descriptor;

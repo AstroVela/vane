@@ -79,6 +79,9 @@ PhysicalDistributedReservoirSample::PhysicalDistributedReservoirSample(PhysicalP
 }
 
 unique_ptr<GlobalSinkState> PhysicalDistributedReservoirSample::GetGlobalSinkState(ClientContext &context) const {
+	if (stage == DistributedReservoirSampleStage::LOCAL && task_index == DConstants::INVALID_INDEX) {
+		throw InternalException("Local distributed reservoir sample is missing its runtime task identity");
+	}
 	return make_uniq<DistributedReservoirGlobalState>(context, *this);
 }
 
@@ -182,6 +185,9 @@ void PhysicalDistributedReservoirSample::ApplyRuntimeTaskIndex(idx_t runtime_tas
 	if (stage != DistributedReservoirSampleStage::LOCAL) {
 		throw InternalException("Only a local distributed reservoir sample has a runtime task index");
 	}
+	if (runtime_task_index == DConstants::INVALID_INDEX) {
+		throw InternalException("Invalid runtime task index for local distributed reservoir sample");
+	}
 	task_index = runtime_task_index;
 }
 
@@ -189,6 +195,9 @@ int64_t PhysicalDistributedReservoirSample::GetEffectiveSeed() const {
 	const auto seed = options->GetSeed();
 	if (stage != DistributedReservoirSampleStage::LOCAL) {
 		return seed;
+	}
+	if (task_index == DConstants::INVALID_INDEX) {
+		throw InternalException("Local distributed reservoir sample is missing its runtime task identity");
 	}
 	const auto task_hash = MurmurHash64(static_cast<uint64_t>(task_index) + 0x9e3779b97f4a7c15ULL);
 	const auto derived = MurmurHash64(static_cast<uint64_t>(seed) ^ task_hash);

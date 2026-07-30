@@ -102,15 +102,20 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 	auto exchange = std::shared_ptr<Exchange>(exchange_unique.release());
 	auto sink_task_counter = std::make_shared<std::atomic<idx_t>>(0);
 
-	auto sink_plan_builder = [per_task_builder_factory, exchange, exchange_mgr, exchange_id, sink_task_counter,
+	MaterializedPlanBuilder local_plan_builder;
+	if (per_task_builder_factory) {
+		// The stream position is not a stable task identity because child tasks
+		// can arrive asynchronously. Runtime-bound operators must instead use
+		// the FTE task partition applied before execution.
+		local_plan_builder = per_task_builder_factory(DConstants::INVALID_INDEX);
+	}
+
+	auto sink_plan_builder = [local_plan_builder, exchange, exchange_mgr, exchange_id, sink_task_counter,
 	                          num_partitions](DuckPhysicalPlanRef plan) -> DuckPhysicalPlanRef {
-		auto task_partition_id = sink_task_counter->fetch_add(1);
-		if (per_task_builder_factory) {
-			auto local_plan_builder = per_task_builder_factory(task_partition_id);
-			if (local_plan_builder) {
-				plan = local_plan_builder(std::move(plan));
-			}
+		if (local_plan_builder) {
+			plan = local_plan_builder(std::move(plan));
 		}
+		auto task_partition_id = sink_task_counter->fetch_add(1);
 		auto sink_handle = exchange->AddSink(task_partition_id);
 		auto sink_instance = exchange->InstantiateSink(sink_handle, /*attempt_id=*/0);
 		return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, num_partitions, exchange_id, sink_instance,

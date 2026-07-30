@@ -84,14 +84,15 @@ SubmittableTaskStream<WorkerTask> ReservoirSampleNode::produce_tasks(PlanExecuti
 		input_plan->SetRoot(sample_op);
 		return input_plan;
 	};
-	auto per_task_builder_factory = [options_template, state_types](idx_t task_index) -> MaterializedPlanBuilder {
-		return [options_template, state_types, task_index](DuckPhysicalPlanRef input_plan) -> DuckPhysicalPlanRef {
+	auto per_task_builder_factory = [options_template, state_types](idx_t) -> MaterializedPlanBuilder {
+		return [options_template, state_types](DuckPhysicalPlanRef input_plan) -> DuckPhysicalPlanRef {
 			auto options_copy = options_template->Copy();
 			auto types = *state_types;
 
 			auto &old_root = input_plan->Root();
 			auto &sample_op = input_plan->Make<duckdb::PhysicalDistributedReservoirSample>(
-			    std::move(types), std::move(options_copy), DistributedReservoirSampleStage::LOCAL, task_index, 1);
+			    std::move(types), std::move(options_copy), DistributedReservoirSampleStage::LOCAL,
+			    DConstants::INVALID_INDEX, 1);
 			sample_op.children.push_back(old_root);
 			input_plan->SetRoot(sample_op);
 			return input_plan;
