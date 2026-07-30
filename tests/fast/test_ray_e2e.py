@@ -3307,6 +3307,69 @@ def test_ray_join_broadcast_multi_partition_plan(ray_runner, duckdb_conn, parque
     )
 
 
+def test_ray_join_auto_broadcast_keeps_preserved_side_as_receiver(ray_runner, duckdb_conn, tmp_path, monkeypatch):
+    label = "test_ray_e2e: auto broadcast keeps preserved side as receiver"
+    big_path = tmp_path / "auto_broadcast_preserved_side"
+
+    monkeypatch.delenv("VANE_DISTRIBUTED_JOIN_STRATEGY", raising=False)
+    monkeypatch.delenv("VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES", raising=False)
+    monkeypatch.setenv("VANE_DISTRIBUTED_BROADCAST_JOIN_RECEIVER_REPARTITION", "0")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+
+    duckdb_conn.execute(f"""
+        COPY (
+            SELECT
+                CASE WHEN i < 4 THEN 1 ELSE 1000 + i END::INTEGER AS k,
+                (i % 4)::INTEGER AS file_id
+            FROM range(0, 400) AS t(i)
+        ) TO '{big_path}' (FORMAT PARQUET, PARTITION_BY (file_id))
+    """)
+
+    left_join_sql = f"""
+        SELECT small.k, big.k
+        FROM (VALUES (1), (999)) AS small(k)
+        LEFT JOIN read_parquet('{big_path}/**/*.parquet') AS big
+          ON small.k = big.k
+    """
+    relation = duckdb_conn.sql(left_join_sql)
+    plan_text, _ = _get_distributed_plan_info(relation, label)
+    assert plan_text and "BROADCAST JOIN" in plan_text.upper(), f"{label}: expected automatic broadcast:\n{plan_text}"
+    assert "BROADCAST SIDE: LEFT" in plan_text.upper(), (
+        f"{label}: expected the physical left (non-preserved) side to be broadcast:\n{plan_text}"
+    )
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        left_join_sql,
+        label,
+        require_all=["HASH_JOIN"],
+    )
+
+    semi_join_sql = f"""
+        SELECT k
+        FROM (VALUES (1)) AS small(k)
+        WHERE k IN (
+            SELECT k
+            FROM read_parquet('{big_path}/**/*.parquet')
+        )
+    """
+    semi_label = f"{label} (semi join)"
+    semi_plan_text, _ = _get_distributed_plan_info(duckdb_conn.sql(semi_join_sql), semi_label)
+    assert semi_plan_text and "BROADCAST JOIN" in semi_plan_text.upper(), (
+        f"{semi_label}: expected automatic broadcast:\n{semi_plan_text}"
+    )
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        semi_join_sql,
+        semi_label,
+        require_all=["HASH_JOIN"],
+    )
+
+
 def test_ray_chained_broadcast_joins_keep_materialize_outputs_scoped(
     ray_runner, duckdb_conn, parquet_path, monkeypatch
 ):

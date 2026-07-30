@@ -21,6 +21,11 @@
 namespace duckdb {
 namespace distributed {
 
+enum class BroadcastJoinSide : uint8_t { LEFT, RIGHT };
+
+bool IsBroadcastJoinSideSemanticallySafe(JoinType join_type, BroadcastJoinSide broadcast_side);
+void ValidateBroadcastJoinSide(JoinType join_type, BroadcastJoinSide broadcast_side);
+
 class BroadcastJoinNode : public PipelineNodeImpl, public std::enable_shared_from_this<BroadcastJoinNode> {
 public:
 	BroadcastJoinNode(NodeID node_id, const PlanConfig &plan_config, duckdb::vector<JoinCondition> conditions,
@@ -30,8 +35,8 @@ public:
 	                  PhysicalHashJoin::JoinProjectionColumns lhs_output_columns,
 	                  PhysicalHashJoin::JoinProjectionColumns rhs_output_columns,
 	                  duckdb::vector<unique_ptr<BaseStatistics>> join_stats,
-	                  unique_ptr<JoinFilterPushdownInfo> filter_pushdown, idx_t estimated_cardinality, bool is_swapped,
-	                  std::shared_ptr<DistributedPipelineNode> broadcaster,
+	                  unique_ptr<JoinFilterPushdownInfo> filter_pushdown, idx_t estimated_cardinality,
+	                  BroadcastJoinSide broadcast_side, std::shared_ptr<DistributedPipelineNode> broadcaster,
 	                  std::shared_ptr<DistributedPipelineNode> receiver, SchemaRef schema,
 	                  std::shared_ptr<ExchangeManager> exchange_mgr = nullptr);
 
@@ -63,7 +68,7 @@ private:
 	PipelineNodeContext context_;
 	std::shared_ptr<DistributedPipelineNode> broadcaster_;
 	std::shared_ptr<DistributedPipelineNode> receiver_;
-	bool is_swapped_ = false;
+	BroadcastJoinSide broadcast_side_;
 
 	duckdb::vector<JoinCondition> conditions_;
 	JoinType join_type_;

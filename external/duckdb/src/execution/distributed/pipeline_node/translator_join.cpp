@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstdlib>
 
+#include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/broadcast_join.hpp"
@@ -247,16 +248,31 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 	}
 
 	auto join_override = GetJoinStrategyOverride();
-	bool force_hash_join = (join_override == DistributedJoinStrategyOverride::kHash);
-	bool force_broadcast_join = (join_override == DistributedJoinStrategyOverride::kBroadcast ||
-	                             join_override == DistributedJoinStrategyOverride::kBroadcastLeft ||
-	                             join_override == DistributedJoinStrategyOverride::kBroadcastRight);
+	Optional<BroadcastJoinSide> broadcast_side;
 
-	if (force_broadcast_join && hj.join_type == JoinType::OUTER) {
-		force_broadcast_join = false;
-	}
-
-	if (!force_hash_join && !force_broadcast_join && left_node && right_node && hj.join_type != JoinType::OUTER) {
+	if (join_override == DistributedJoinStrategyOverride::kBroadcastLeft ||
+	    join_override == DistributedJoinStrategyOverride::kBroadcastRight) {
+		auto requested_side = join_override == DistributedJoinStrategyOverride::kBroadcastLeft
+		                          ? BroadcastJoinSide::LEFT
+		                          : BroadcastJoinSide::RIGHT;
+		ValidateBroadcastJoinSide(hj.join_type, requested_side);
+		broadcast_side = requested_side;
+	} else if (join_override == DistributedJoinStrategyOverride::kBroadcast && left_node && right_node) {
+		bool left_safe = IsBroadcastJoinSideSemanticallySafe(hj.join_type, BroadcastJoinSide::LEFT);
+		bool right_safe = IsBroadcastJoinSideSemanticallySafe(hj.join_type, BroadcastJoinSide::RIGHT);
+		if (!left_safe && !right_safe) {
+			throw InvalidInputException("Cannot use broadcast strategy for a %s join because neither side can be "
+			                            "broadcast without changing its semantics",
+			                            EnumUtil::ToString(hj.join_type));
+		}
+		if (left_safe && right_safe) {
+			size_t left_parts = left_node->config().clustering_spec()->num_partitions();
+			size_t right_parts = right_node->config().clustering_spec()->num_partitions();
+			broadcast_side = left_parts > right_parts ? BroadcastJoinSide::RIGHT : BroadcastJoinSide::LEFT;
+		} else {
+			broadcast_side = left_safe ? BroadcastJoinSide::LEFT : BroadcastJoinSide::RIGHT;
+		}
+	} else if (join_override == DistributedJoinStrategyOverride::kDefault && left_node && right_node) {
 		auto threshold_bytes = GetAutoBroadcastThresholdBytes();
 		if (threshold_bytes > 0) {
 			idx_t left_card = hj.children.size() > 0 ? hj.children[0].get().estimated_cardinality : 0;
@@ -265,55 +281,30 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 			auto &right_types = hj.children.size() > 1 ? hj.children[1].get().GetTypes() : hj.GetTypes();
 			idx_t left_bytes = EstimateDataSizeBytes(left_card, left_types);
 			idx_t right_bytes = EstimateDataSizeBytes(right_card, right_types);
-			bool left_small = left_card > 0 && left_bytes <= threshold_bytes;
-			bool right_small = right_card > 0 && right_bytes <= threshold_bytes;
+			bool left_small = left_card > 0 && left_bytes <= threshold_bytes &&
+			                  IsBroadcastJoinSideSemanticallySafe(hj.join_type, BroadcastJoinSide::LEFT);
+			bool right_small = right_card > 0 && right_bytes <= threshold_bytes &&
+			                   IsBroadcastJoinSideSemanticallySafe(hj.join_type, BroadcastJoinSide::RIGHT);
 			if (left_small || right_small) {
-				force_broadcast_join = true;
 				if (left_small && right_small) {
-					join_override = (left_bytes <= right_bytes) ? DistributedJoinStrategyOverride::kBroadcastLeft
-					                                            : DistributedJoinStrategyOverride::kBroadcastRight;
+					broadcast_side = left_bytes <= right_bytes ? BroadcastJoinSide::LEFT : BroadcastJoinSide::RIGHT;
 				} else if (left_small) {
-					join_override = DistributedJoinStrategyOverride::kBroadcastLeft;
+					broadcast_side = BroadcastJoinSide::LEFT;
 				} else {
-					join_override = DistributedJoinStrategyOverride::kBroadcastRight;
+					broadcast_side = BroadcastJoinSide::RIGHT;
 				}
 			}
 		}
 	}
 
-	if (force_broadcast_join && left_node && right_node) {
-		bool is_swapped = false;
-		if (join_override == DistributedJoinStrategyOverride::kBroadcastLeft) {
-			is_swapped = false;
-		} else if (join_override == DistributedJoinStrategyOverride::kBroadcastRight) {
-			is_swapped = true;
-		} else {
-			size_t left_parts = left_node->config().clustering_spec()->num_partitions();
-			size_t right_parts = right_node->config().clustering_spec()->num_partitions();
-			bool left_is_larger = left_parts > right_parts;
-			switch (hj.join_type) {
-			case JoinType::INNER:
-				is_swapped = left_is_larger;
-				break;
-			case JoinType::LEFT:
-			case JoinType::SEMI:
-			case JoinType::ANTI:
-				is_swapped = true;
-				break;
-			case JoinType::RIGHT:
-				is_swapped = false;
-				break;
-			default:
-				is_swapped = left_is_larger;
-				break;
-			}
-		}
-		auto broadcaster = is_swapped ? right_node : left_node;
-		auto receiver = is_swapped ? left_node : right_node;
+	if (broadcast_side && left_node && right_node) {
+		bool broadcast_right = *broadcast_side == BroadcastJoinSide::RIGHT;
+		auto broadcaster = broadcast_right ? right_node : left_node;
+		auto receiver = broadcast_right ? left_node : right_node;
 
 		bool repartition_receiver = BroadcastReceiverRepartitionOverride().value_or(false);
 		if (repartition_receiver && plan_config_.num_partitions > 1) {
-			const auto &receiver_keys = is_swapped ? left_partition_by : right_partition_by;
+			const auto &receiver_keys = broadcast_right ? left_partition_by : right_partition_by;
 			if (!receiver_keys.empty()) {
 				size_t target_partitions = plan_config_.num_partitions;
 				auto receiver_spec = RepartitionSpec::create_hash(target_partitions, receiver_keys);
@@ -327,7 +318,7 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 		return std::make_shared<BroadcastJoinNode>(
 		    get_next_pipeline_node_id(), plan_config_, std::move(conditions), hj.join_type, hj.GetTypes(),
 		    hj.delim_types, hj.condition_types, hj.payload_columns, hj.lhs_output_columns, hj.rhs_output_columns,
-		    std::move(join_stats), std::move(filter_pushdown), hj.estimated_cardinality, is_swapped, broadcaster,
+		    std::move(join_stats), std::move(filter_pushdown), hj.estimated_cardinality, *broadcast_side, broadcaster,
 		    receiver, schema, exchange_mgr_);
 	}
 

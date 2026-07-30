@@ -198,7 +198,7 @@ def test_stage_collection_pairs_reordered_branch_udfs_by_stable_identity(monkeyp
 
         metadata = plan.collect_execution_stages(conn=con)
         assert metadata == plan.collect_execution_stages(conn=con)
-        assert "Swapped: true" in plan.repr_ascii(False)
+        assert "Broadcast side: right" in plan.repr_ascii(False)
 
         udf_nodes = [node for node in metadata["nodes"] if node["udf_payload"] is not None]
         by_name = {node["udf_payload"]["udf_name"].rsplit(".", 1)[-1]: node for node in udf_nodes}
