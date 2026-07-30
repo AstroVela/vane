@@ -124,6 +124,64 @@ def test_flight_shuffle_cleanup_snapshot_s3_credential_precedence(
         source_con.close()
 
 
+def test_flight_shuffle_cleanup_resolves_bootstrap_storage_config():
+    snapshot_query_id = f"query-snapshot-{uuid.uuid4()}"
+    source_con = duckdb.connect(
+        config={
+            "s3_endpoint": "bootstrap.example.test",
+            "s3_region": "bootstrap-region",
+            "s3_access_key_id": "bootstrap-key",
+            "s3_secret_access_key": "bootstrap-secret",
+            "s3_session_token": "bootstrap-token",
+        }
+    )
+    plan = _make_test_physical_plan(source_con)
+    snapshot = plan.__getstate__()[6]
+    snapshot_setting_names = {setting["name"].lower() for setting in snapshot["settings"]}
+    assert snapshot_setting_names.isdisjoint(
+        {
+            "s3_endpoint",
+            "s3_region",
+            "s3_access_key_id",
+            "s3_secret_access_key",
+            "s3_session_token",
+        }
+    )
+    assert snapshot["bootstrap"]["config"]["s3_endpoint"] == "bootstrap.example.test"
+    duckdb.ray_cxx._register_query_python_replay_state(snapshot_query_id, plan)
+
+    cleanup_con = duckdb.connect()
+    cleanup_cursor = cleanup_con.cursor()
+    cleanup_cursor.execute("LOAD httpfs")
+    cleanup_cursor.execute("SET s3_endpoint='fallback.example.test'")
+
+    try:
+        settings = duckdb.ray_cxx._resolve_flight_shuffle_cleanup_connection_for_test(
+            cleanup_cursor,
+            snapshot_query_id,
+            {
+                "AWS_ACCESS_KEY_ID": "fresh-key",
+                "AWS_SECRET_ACCESS_KEY": "fresh-secret",
+                "AWS_SESSION_TOKEN": "fresh-token",
+            },
+            False,
+        )
+
+        assert settings == {
+            "s3_endpoint": "bootstrap.example.test",
+            "s3_region": "bootstrap-region",
+            "s3_access_key_id": "fresh-key",
+            "s3_secret_access_key": "fresh-secret",
+            "s3_session_token": "fresh-token",
+            "reused_input": False,
+        }
+    finally:
+        duckdb.ray_cxx._cleanup_query_python_replay_state(snapshot_query_id)
+        cleanup_cursor.close()
+        cleanup_con.close()
+        source_con.close()
+
+
 def test_execute_native_keeps_result_collector_query_local():
     con = duckdb.connect()
     cursor = con.cursor()

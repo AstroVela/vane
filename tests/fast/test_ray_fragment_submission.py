@@ -2942,8 +2942,23 @@ def test_worker_flight_shuffle_cleanup_helper_passes_cleanup_connection_and_snap
     def _fake_require(name, hint=None):
         assert name == "cleanup_flight_shuffle_for_query"
 
-        def _cleanup(query_id, connection, snapshot_query_id, apply_snapshot_s3_credentials):
-            calls.append((query_id, connection, snapshot_query_id, apply_snapshot_s3_credentials, hint))
+        def _cleanup(
+            query_id,
+            connection,
+            snapshot_query_id,
+            apply_snapshot_s3_credentials,
+            effective_session_config,
+        ):
+            calls.append(
+                (
+                    query_id,
+                    connection,
+                    snapshot_query_id,
+                    apply_snapshot_s3_credentials,
+                    effective_session_config,
+                    hint,
+                )
+            )
             return {
                 "registry_entries_removed": 1,
                 "storage_entries_removed": 2,
@@ -2962,6 +2977,7 @@ def test_worker_flight_shuffle_cleanup_helper_passes_cleanup_connection_and_snap
         cleanup_connection,
         "resource-query",
         apply_snapshot_s3_credentials=False,
+        effective_session_config={"AWS_REGION": "region-a"},
     )
 
     assert result["storage_entries_removed"] == 2
@@ -2971,6 +2987,7 @@ def test_worker_flight_shuffle_cleanup_helper_passes_cleanup_connection_and_snap
             cleanup_connection,
             "resource-query",
             False,
+            {"AWS_REGION": "region-a"},
             "Ensure the C++ ray extension is built with Flight shuffle cleanup support.",
         )
     ]
@@ -2986,7 +3003,7 @@ def test_worker_local_shuffle_cleanup_skips_object_storage_rebuild(monkeypatch):
             session_config=(("AWS_PROFILE", "unavailable-profile"),),
             use_session_credentials=True,
             connection_snapshot_query_id="resource-query",
-            connection_snapshot_settings=(),
+            connection_snapshot_identity=worker_mod.CleanupConnectionSnapshotIdentity(":memory:", False, (), ()),
         )
     }
     cleanup = {
@@ -3033,7 +3050,7 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
             session_config=(("AWS_PROFILE", "profile-a"),),
             use_session_credentials=True,
             connection_snapshot_query_id="resource-query",
-            connection_snapshot_settings=(),
+            connection_snapshot_identity=worker_mod.CleanupConnectionSnapshotIdentity(":memory:", False, (), ()),
         )
     }
     events = []
@@ -3063,6 +3080,7 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
         connection_snapshot_query_id="",
         *,
         apply_snapshot_s3_credentials=True,
+        effective_session_config=None,
     ):
         if connection is None:
             events.append(("probe", query_id))
@@ -3082,6 +3100,7 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
                 connection,
                 connection_snapshot_query_id,
                 apply_snapshot_s3_credentials,
+                effective_session_config,
             )
         )
         return {
@@ -3132,7 +3151,18 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
             },
             True,
         ),
-        ("cleanup", "query-drop", cleanup_cursor, "resource-query", False),
+        (
+            "cleanup",
+            "query-drop",
+            cleanup_cursor,
+            "resource-query",
+            False,
+            {
+                "AWS_ACCESS_KEY_ID": "fresh-key",
+                "AWS_SECRET_ACCESS_KEY": "fresh-secret",
+                worker_mod._AWS_CREDENTIAL_REFRESH_AT_KEY: "9999999999",
+            },
+        ),
         ("close",),
     ]
 
@@ -3150,7 +3180,7 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
             session_config=(("AWS_ENDPOINT_URL", "https://s3.example.test"),),
             use_session_credentials=False,
             connection_snapshot_query_id="resource-query",
-            connection_snapshot_settings=(),
+            connection_snapshot_identity=worker_mod.CleanupConnectionSnapshotIdentity(":memory:", False, (), ()),
         )
     }
     cleanup_cursor = SimpleNamespace(close=lambda: None)
@@ -3163,6 +3193,7 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
         connection_snapshot_query_id="",
         *,
         apply_snapshot_s3_credentials=True,
+        effective_session_config=None,
     ):
         cleanup_calls.append(
             (
@@ -3170,6 +3201,7 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
                 connection,
                 connection_snapshot_query_id,
                 apply_snapshot_s3_credentials,
+                effective_session_config,
             )
         )
         if connection is None:
@@ -3220,8 +3252,14 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
         "last_error": "",
     }
     assert cleanup_calls == [
-        ("query-drop", None, "", True),
-        ("query-drop", cleanup_cursor, "resource-query", True),
+        ("query-drop", None, "", True, None),
+        (
+            "query-drop",
+            cleanup_cursor,
+            "resource-query",
+            True,
+            {"AWS_ENDPOINT_URL": "https://s3.example.test"},
+        ),
     ]
 
 
@@ -3238,7 +3276,7 @@ def test_worker_object_shuffle_cleanup_preserves_primary_error_when_cursor_close
             session_config=(),
             use_session_credentials=True,
             connection_snapshot_query_id="resource-query",
-            connection_snapshot_settings=(),
+            connection_snapshot_identity=worker_mod.CleanupConnectionSnapshotIdentity(":memory:", False, (), ()),
         )
     }
 
@@ -3281,7 +3319,8 @@ def test_worker_cleanup_context_replays_snapshot_with_session_credentials(monkey
     actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_class)
     actor._native_execution_condition = threading.Condition()
-    monkeypatch.setattr(worker_mod, "_query_cleanup_connection_settings", lambda *args, **kwargs: ())
+    default_identity = worker_mod.CleanupConnectionSnapshotIdentity(":memory:", False, (), ())
+    monkeypatch.setattr(worker_mod, "_query_cleanup_connection_identity", lambda *args, **kwargs: default_identity)
 
     class _Plan:
         @staticmethod
@@ -3303,20 +3342,28 @@ def test_worker_cleanup_context_replays_snapshot_with_session_credentials(monkey
             session_config=(("AWS_PROFILE", "profile-a"),),
             use_session_credentials=True,
             connection_snapshot_query_id="resource-query",
-            connection_snapshot_settings=(),
+            connection_snapshot_identity=default_identity,
         )
     }
 
 
-def test_worker_cleanup_connection_settings_match_snapshot_replay(monkeypatch):
+def test_worker_cleanup_connection_identity_matches_snapshot_replay(monkeypatch):
     snapshot = {
+        "bootstrap": {
+            "database": ":memory:",
+            "read_only": False,
+            "config": {
+                "s3_endpoint": "bootstrap.example.test",
+                "s3_region": "bootstrap-region",
+            },
+        },
         "settings": [
             {"name": "s3_endpoint", "value": "s3.example.test", "input_type": "VARCHAR"},
             {"name": "s3_access_key_id", "value": "plan-key", "input_type": "VARCHAR"},
             {"name": "s3_secret_access_key", "value": "plan-secret", "input_type": "VARCHAR"},
             {"name": "http_timeout", "value": "30", "input_type": "BIGINT"},
             {"name": "allow_unsigned_extensions", "value": "true", "input_type": "BOOLEAN"},
-        ]
+        ],
     }
 
     def require(name, *, hint):
@@ -3326,21 +3373,37 @@ def test_worker_cleanup_connection_settings_match_snapshot_replay(monkeypatch):
 
     monkeypatch.setattr(worker_mod, "require_ray_cxx_attr", require)
 
-    assert worker_mod._query_cleanup_connection_settings(
+    assert worker_mod._query_cleanup_connection_identity(
         "resource-query",
         apply_snapshot_s3_credentials=False,
-    ) == (
-        ("s3_endpoint", "s3.example.test", "VARCHAR"),
-        ("http_timeout", "30", "BIGINT"),
+    ) == worker_mod.CleanupConnectionSnapshotIdentity(
+        bootstrap_database=":memory:",
+        bootstrap_read_only=False,
+        bootstrap_config=(
+            ("s3_endpoint", "bootstrap.example.test"),
+            ("s3_region", "bootstrap-region"),
+        ),
+        settings=(
+            ("s3_endpoint", "s3.example.test", "VARCHAR"),
+            ("http_timeout", "30", "BIGINT"),
+        ),
     )
-    assert worker_mod._query_cleanup_connection_settings(
+    assert worker_mod._query_cleanup_connection_identity(
         "resource-query",
         apply_snapshot_s3_credentials=True,
-    ) == (
-        ("s3_endpoint", "s3.example.test", "VARCHAR"),
-        ("s3_access_key_id", "plan-key", "VARCHAR"),
-        ("s3_secret_access_key", "plan-secret", "VARCHAR"),
-        ("http_timeout", "30", "BIGINT"),
+    ) == worker_mod.CleanupConnectionSnapshotIdentity(
+        bootstrap_database=":memory:",
+        bootstrap_read_only=False,
+        bootstrap_config=(
+            ("s3_endpoint", "bootstrap.example.test"),
+            ("s3_region", "bootstrap-region"),
+        ),
+        settings=(
+            ("s3_endpoint", "s3.example.test", "VARCHAR"),
+            ("s3_access_key_id", "plan-key", "VARCHAR"),
+            ("s3_secret_access_key", "plan-secret", "VARCHAR"),
+            ("http_timeout", "30", "BIGINT"),
+        ),
     )
 
 
@@ -3348,16 +3411,27 @@ def test_worker_cleanup_context_reuses_first_equivalent_snapshot_across_query_fr
     actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_class)
     actor._native_execution_condition = threading.Condition()
-    snapshot_settings = {
-        "resource-query-a": (("s3_endpoint", "s3.example.test", "VARCHAR"),),
-        "resource-query-b": (("s3_endpoint", "s3.example.test", "VARCHAR"),),
-        "resource-query-c": (("s3_endpoint", "other.example.test", "VARCHAR"),),
-        "resource-query-d": (("s3_endpoint", "s3.example.test", "VARCHAR"),),
+    default_identity = worker_mod.CleanupConnectionSnapshotIdentity(
+        ":memory:",
+        False,
+        (("s3_endpoint", "s3.example.test"),),
+        (),
+    )
+    snapshot_identities = {
+        "resource-query-a": default_identity,
+        "resource-query-b": default_identity,
+        "resource-query-c": worker_mod.CleanupConnectionSnapshotIdentity(
+            ":memory:",
+            False,
+            (("s3_endpoint", "other.example.test"),),
+            (),
+        ),
+        "resource-query-d": default_identity,
     }
     monkeypatch.setattr(
         worker_mod,
-        "_query_cleanup_connection_settings",
-        lambda query_id, **kwargs: snapshot_settings[query_id],
+        "_query_cleanup_connection_identity",
+        lambda query_id, **kwargs: snapshot_identities[query_id],
     )
 
     class _Plan:

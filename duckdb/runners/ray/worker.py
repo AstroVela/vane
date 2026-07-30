@@ -178,12 +178,21 @@ def _plan_resource_query_id(plan: Any) -> str:
     return query_id
 
 
-def _query_cleanup_connection_settings(
+class CleanupConnectionSnapshotIdentity(NamedTuple):
+    """Connection state that determines the cleanup filesystem."""
+
+    bootstrap_database: str
+    bootstrap_read_only: bool
+    bootstrap_config: tuple[tuple[str, str], ...]
+    settings: tuple[tuple[str, str, str], ...]
+
+
+def _query_cleanup_connection_identity(
     connection_snapshot_query_id: str,
     *,
     apply_snapshot_s3_credentials: bool,
-) -> tuple[tuple[str, str, str], ...]:
-    """Return the settings that cleanup snapshot replay will actually apply."""
+) -> CleanupConnectionSnapshotIdentity:
+    """Return the bootstrap and settings that cleanup replay will apply."""
     lookup = require_ray_cxx_attr(
         "_lookup_query_connection_snapshot",
         hint="Ensure the C++ ray extension is built with query replay lifecycle support.",
@@ -196,11 +205,23 @@ def _query_cleanup_connection_settings(
         )
     if not isinstance(snapshot, Mapping):
         raise TypeError("query connection snapshot must be a mapping")
+
+    bootstrap_database = ":memory:"
+    bootstrap_read_only = False
+    bootstrap_config: tuple[tuple[str, str], ...] = ()
+    raw_bootstrap = snapshot.get("bootstrap")
+    if isinstance(raw_bootstrap, Mapping):
+        bootstrap_database = str(raw_bootstrap.get("database") or ":memory:")
+        bootstrap_read_only = bool(raw_bootstrap.get("read_only", False))
+        raw_bootstrap_config = raw_bootstrap.get("config")
+        if isinstance(raw_bootstrap_config, Mapping):
+            bootstrap_config = tuple(sorted((str(key), str(value)) for key, value in raw_bootstrap_config.items()))
+
     raw_settings = snapshot.get("settings", [])
     if raw_settings is None:
-        return ()
+        raw_settings = []
     if not isinstance(raw_settings, list):
-        return ()
+        raw_settings = []
 
     settings: list[tuple[str, str, str]] = []
     for raw_setting in raw_settings:
@@ -221,7 +242,12 @@ def _query_cleanup_connection_settings(
                 str(raw_setting.get("input_type", "VARCHAR")).upper(),
             )
         )
-    return tuple(settings)
+    return CleanupConnectionSnapshotIdentity(
+        bootstrap_database=bootstrap_database,
+        bootstrap_read_only=bootstrap_read_only,
+        bootstrap_config=bootstrap_config,
+        settings=tuple(settings),
+    )
 
 
 def _cleanup_query_python_replay_state(query_id: str) -> None:
@@ -238,6 +264,7 @@ def _cleanup_flight_shuffle_for_query(
     connection_snapshot_query_id: str = "",
     *,
     apply_snapshot_s3_credentials: bool = True,
+    effective_session_config: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     query_id = str(query_id or "").strip()
     if not query_id:
@@ -262,6 +289,9 @@ def _cleanup_flight_shuffle_for_query(
             cleanup_connection,
             str(connection_snapshot_query_id or ""),
             bool(apply_snapshot_s3_credentials),
+            None
+            if effective_session_config is None
+            else {str(key): str(value) for key, value in effective_session_config.items()},
         )
     if not isinstance(raw, dict):
         raise TypeError("Flight shuffle cleanup binding must return a dict")
@@ -727,7 +757,7 @@ class NativeQueryCleanupContext(NamedTuple):
     session_config: tuple[tuple[str, str], ...]
     use_session_credentials: bool
     connection_snapshot_query_id: str
-    connection_snapshot_settings: tuple[tuple[str, str, str], ...]
+    connection_snapshot_identity: CleanupConnectionSnapshotIdentity
 
 
 @ray.remote(concurrency_groups={"execute": 128, "control": 512})
@@ -1435,7 +1465,7 @@ class RayWorkerActor:
             session_config=tuple(sorted((str(key), str(value)) for key, value in session_config.items())),
             use_session_credentials=use_session_credentials,
             connection_snapshot_query_id=connection_snapshot_query_id,
-            connection_snapshot_settings=_query_cleanup_connection_settings(
+            connection_snapshot_identity=_query_cleanup_connection_identity(
                 connection_snapshot_query_id,
                 apply_snapshot_s3_credentials=not use_session_credentials,
             ),
@@ -1455,7 +1485,7 @@ class RayWorkerActor:
                     existing.session_id != cleanup_context.session_id
                     or existing.session_config != cleanup_context.session_config
                     or existing.use_session_credentials != cleanup_context.use_session_credentials
-                    or existing.connection_snapshot_settings != cleanup_context.connection_snapshot_settings
+                    or existing.connection_snapshot_identity != cleanup_context.connection_snapshot_identity
                 ):
                     raise RuntimeError(f"native query cleanup context changed: {query_key}")
                 return
@@ -1513,6 +1543,7 @@ class RayWorkerActor:
                 # connection credentials still replay when session credentials
                 # are intentionally disabled.
                 apply_snapshot_s3_credentials=not cleanup_context.use_session_credentials,
+                effective_session_config=effective_s3_config,
             )
             cleanup["registry_entries_removed"] += probe["registry_entries_removed"]
             cleanup["storage_entries_removed"] += probe["storage_entries_removed"]
