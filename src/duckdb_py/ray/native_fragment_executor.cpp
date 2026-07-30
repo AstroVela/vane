@@ -901,6 +901,8 @@ static void AppendDistributedCopyResultMetadata(pybind11::dict &out,
 	out["copy_output_lifecycle_path"] = result.output_lifecycle_path;
 	out["copy_output_direct_write"] = result.output_direct_write;
 	out["copy_output_committed"] = result.output_committed;
+	out["copy_output_outcome_unknown"] = result.output_outcome_unknown;
+	out["copy_output_outcome_error"] = result.output_outcome_error;
 	out["copy_staging_write_ms"] = result.staging_write_ms;
 	out["copy_finalize_ms"] = result.finalize_ms;
 	out["copy_cleanup_ms"] = result.cleanup_ms;

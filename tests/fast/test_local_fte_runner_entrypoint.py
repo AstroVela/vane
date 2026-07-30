@@ -68,6 +68,30 @@ def test_local_runner_preloads_arrow_dataset_imports():
     _preload_arrow_dataset_imports()
 
 
+def test_local_runner_rejects_unknown_native_copy_outcome():
+    from duckdb.runners import CopyOutcomeUnknownError
+    from duckdb.runners.local.runner import _require_known_copy_outcome
+
+    result = {
+        "copy_output_committed": False,
+        "copy_output_outcome_unknown": True,
+        "copy_output_outcome_error": "marker readback unavailable",
+        "copy_output_base_path": "s3://bucket/out",
+        "copy_output_run_id": "run-local-unknown",
+        "copy_output_manifest_path": "s3://bucket/out.duckdb_commit/run-local-unknown/manifest.txt",
+        "copy_output_committed_marker_path": "s3://bucket/out.duckdb_commit/run-local-unknown/committed",
+    }
+
+    try:
+        _require_known_copy_outcome("local-copy", result)
+    except CopyOutcomeUnknownError as error:
+        assert error.operation_id == "local-copy"
+        assert error.run_id == "run-local-unknown"
+        assert error.safe_to_retry is False
+    else:
+        raise AssertionError("local runner must reject an unknown COPY outcome")
+
+
 def test_local_runner_rejects_invalid_num_workers():
     from duckdb.runners.local import _normalize_num_workers
     from duckdb.runners.local.runner import _normalize_num_workers as normalize_runner

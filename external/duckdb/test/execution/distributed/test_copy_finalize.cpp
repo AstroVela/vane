@@ -206,6 +206,22 @@ private:
 	bool fail_removal = true;
 };
 
+class MissingFileRemovalFileSystem : public FileOnlyRecursiveListFileSystem {
+public:
+	explicit MissingFileRemovalFileSystem(string missing_path) : missing_path(std::move(missing_path)) {
+	}
+
+	void RemoveFile(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		if (path == missing_path) {
+			throw Exception({{"status_code", "404"}}, ExceptionType::HTTP, "injected missing object");
+		}
+		LocalFileSystem::RemoveFile(path, opener);
+	}
+
+private:
+	string missing_path;
+};
+
 class DelayedFileRemovalFileSystem : public FileOnlyRecursiveListFileSystem {
 public:
 	DelayedFileRemovalFileSystem(string delayed_path, std::chrono::milliseconds delay)
@@ -243,6 +259,42 @@ public:
 private:
 	string failed_path;
 	bool fail_removal = true;
+};
+
+enum class MarkerReadbackMode : uint8_t { VISIBLE, MISSING, ERROR };
+
+class PersistThenFailMarkerFileSystem : public LocalFileSystem {
+public:
+	PersistThenFailMarkerFileSystem(string marker_path, MarkerReadbackMode readback_mode)
+	    : marker_path(std::move(marker_path)), readback_mode(readback_mode) {
+	}
+
+	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override {
+		LocalFileSystem::MoveFile(source, target, opener);
+		if (target == marker_path) {
+			marker_write_failed = true;
+			throw IOException("injected lost committed-marker response");
+		}
+	}
+
+	bool FileExists(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		if (marker_write_failed && path == marker_path) {
+			switch (readback_mode) {
+			case MarkerReadbackMode::VISIBLE:
+				break;
+			case MarkerReadbackMode::MISSING:
+				return false;
+			case MarkerReadbackMode::ERROR:
+				throw IOException("injected committed-marker readback failure");
+			}
+		}
+		return LocalFileSystem::FileExists(path, opener);
+	}
+
+private:
+	string marker_path;
+	MarkerReadbackMode readback_mode;
+	bool marker_write_failed = false;
 };
 
 class CopyFinalizeTestDirectory {
@@ -561,6 +613,93 @@ TEST_CASE("Distributed COPY direct-target cleanup time is excluded from finalize
 	REQUIRE_FALSE(fs.FileExists(loser_file));
 }
 
+TEST_CASE("Distributed COPY accepts a committed marker after its write response is lost",
+          "[distributed][copy][lifecycle][object-storage]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_marker_response_lost");
+	auto &local_fs = test_dir.fs;
+	auto base_path = local_fs.JoinPath(test_dir.path, "out");
+	const string run_id = "run-marker-response-lost";
+	auto selected_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_selected", "part.parquet");
+	const string selected_contents = "selected";
+	WriteTestFile(local_fs, selected_file, selected_contents);
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, run_id).is_ok());
+	auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(local_fs, base_path, run_id);
+
+	DBConfig config;
+	config.file_system = make_uniq<VirtualFileSystem>(
+	    make_uniq<PersistThenFailMarkerFileSystem>(commit_paths.committed_marker_path, MarkerReadbackMode::VISIBLE));
+	DuckDB db(nullptr, &config);
+	Connection connection(db);
+
+	DistributedCopySpec spec;
+	spec.file_path = base_path;
+	spec.file_extension = "parquet";
+	spec.per_thread_output = true;
+	DistributedCopyFileInfo selected_info;
+	selected_info.staging_path = selected_file;
+	selected_info.row_count = 3;
+	selected_info.file_size_bytes = selected_contents.size();
+	vector<DistributedCopyFileInfo> selected_files;
+	selected_files.push_back(std::move(selected_info));
+
+	auto finalize_res = FinalizeCopyFiles(spec, "", std::move(selected_files), *connection.context, run_id);
+
+	REQUIRE(finalize_res.is_ok());
+	REQUIRE(finalize_res.value().output_committed);
+	REQUIRE_FALSE(finalize_res.value().output_outcome_unknown);
+	REQUIRE(finalize_res.value().rows_copied == 3);
+	REQUIRE(local_fs.FileExists(commit_paths.committed_marker_path));
+}
+
+TEST_CASE("Distributed COPY reports an unknown outcome when committed marker readback is inconclusive",
+          "[distributed][copy][lifecycle][object-storage]") {
+	for (auto readback_mode : {MarkerReadbackMode::MISSING, MarkerReadbackMode::ERROR}) {
+		CopyFinalizeTestDirectory test_dir(readback_mode == MarkerReadbackMode::MISSING
+		                                       ? "copy_finalize_marker_readback_missing"
+		                                       : "copy_finalize_marker_readback_error");
+		auto &local_fs = test_dir.fs;
+		auto base_path = local_fs.JoinPath(test_dir.path, "out");
+		const string run_id = "run-marker-readback-unknown";
+		auto selected_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_selected", "part.parquet");
+		const string selected_contents = "selected";
+		WriteTestFile(local_fs, selected_file, selected_contents);
+		REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, run_id).is_ok());
+		auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(local_fs, base_path, run_id);
+
+		DBConfig config;
+		config.file_system = make_uniq<VirtualFileSystem>(
+		    make_uniq<PersistThenFailMarkerFileSystem>(commit_paths.committed_marker_path, readback_mode));
+		DuckDB db(nullptr, &config);
+		Connection connection(db);
+
+		DistributedCopySpec spec;
+		spec.file_path = base_path;
+		spec.file_extension = "parquet";
+		spec.per_thread_output = true;
+		DistributedCopyFileInfo selected_info;
+		selected_info.staging_path = selected_file;
+		selected_info.row_count = 3;
+		selected_info.file_size_bytes = selected_contents.size();
+		vector<DistributedCopyFileInfo> selected_files;
+		selected_files.push_back(std::move(selected_info));
+
+		auto finalize_res = FinalizeCopyFiles(spec, "", std::move(selected_files), *connection.context, run_id);
+
+		REQUIRE(finalize_res.is_ok());
+		const auto &result = finalize_res.value();
+		REQUIRE_FALSE(result.output_committed);
+		REQUIRE(result.output_outcome_unknown);
+		REQUIRE(result.output_base_path == base_path);
+		REQUIRE(result.output_run_id == run_id);
+		REQUIRE(result.output_manifest_path == commit_paths.manifest_path);
+		REQUIRE(result.output_committed_marker_path == commit_paths.committed_marker_path);
+		REQUIRE(StringUtil::Contains(result.output_outcome_error, "injected lost committed-marker response"));
+		REQUIRE_FALSE(result.output_outcome_error.empty());
+		REQUIRE(local_fs.FileExists(selected_file));
+		REQUIRE(local_fs.FileExists(commit_paths.committed_marker_path));
+	}
+}
+
 TEST_CASE("Distributed COPY resolves relative and qualified list paths",
           "[distributed][copy][lifecycle][object-storage][path]") {
 	LocalFileSystem fs;
@@ -831,6 +970,62 @@ TEST_CASE("Direct-write cleanup requires lifecycle registration", "[distributed]
 	REQUIRE(cleanup_res.is_err());
 	REQUIRE(StringUtil::Contains(cleanup_res.error().what(), "requires lifecycle registration"));
 	REQUIRE(fs.FileExists(data_file));
+}
+
+TEST_CASE("Direct-write force abort removes the commit marker before run data",
+          "[distributed][copy][lifecycle][object-storage]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_force_abort");
+	auto &local_fs = test_dir.fs;
+	auto base_path = local_fs.JoinPath(test_dir.path, "out");
+	const string run_id = "run-force-abort";
+	auto data_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_selected", "part.parquet");
+	WriteTestFile(local_fs, data_file, "discard me");
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, run_id, 1).is_ok());
+	auto paths = BuildDistributedCopyFinalizeCommitPaths(local_fs, base_path, run_id);
+	WriteTestFile(local_fs, paths.manifest_path, "manifest");
+	REQUIRE(WriteDistributedCopyFinalizeCommittedMarker(local_fs, paths).is_ok());
+
+	FileRemovalFailureFileSystem failing_fs(paths.committed_marker_path);
+	auto failed_abort = ForceAbortDistributedCopyDirectWriteRun(failing_fs, base_path, run_id);
+
+	REQUIRE(failed_abort.is_err());
+	REQUIRE(StringUtil::Contains(failed_abort.error().what(), "injected object removal failure"));
+	REQUIRE(local_fs.FileExists(paths.committed_marker_path));
+	REQUIRE(local_fs.FileExists(data_file));
+	REQUIRE(local_fs.FileExists(paths.lifecycle_path));
+
+	failing_fs.AllowRemoval();
+	auto abort_res = ForceAbortDistributedCopyDirectWriteRun(failing_fs, base_path, run_id);
+
+	REQUIRE(abort_res.is_ok());
+	REQUIRE_FALSE(abort_res.value().skipped_committed);
+	REQUIRE_FALSE(local_fs.FileExists(paths.committed_marker_path));
+	REQUIRE_FALSE(local_fs.FileExists(data_file));
+	REQUIRE_FALSE(local_fs.FileExists(paths.lifecycle_path));
+	REQUIRE_FALSE(local_fs.DirectoryExists(paths.commit_dir));
+}
+
+TEST_CASE("Direct-write force abort accepts an already absent commit marker",
+          "[distributed][copy][lifecycle][object-storage]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_force_abort_missing_marker");
+	auto &local_fs = test_dir.fs;
+	auto base_path = local_fs.JoinPath(test_dir.path, "out");
+	const string run_id = "run-force-abort-missing-marker";
+	auto data_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_selected", "part.parquet");
+	WriteTestFile(local_fs, data_file, "discard me");
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, run_id, 1).is_ok());
+	auto paths = BuildDistributedCopyFinalizeCommitPaths(local_fs, base_path, run_id);
+	WriteTestFile(local_fs, paths.manifest_path, "manifest");
+	REQUIRE_FALSE(local_fs.FileExists(paths.committed_marker_path));
+
+	MissingFileRemovalFileSystem missing_fs(paths.committed_marker_path);
+	auto abort_res = ForceAbortDistributedCopyDirectWriteRun(missing_fs, base_path, run_id);
+
+	REQUIRE(abort_res.is_ok());
+	REQUIRE_FALSE(abort_res.value().skipped_committed);
+	REQUIRE_FALSE(local_fs.FileExists(data_file));
+	REQUIRE_FALSE(local_fs.FileExists(paths.lifecycle_path));
+	REQUIRE_FALSE(local_fs.DirectoryExists(paths.commit_dir));
 }
 
 TEST_CASE("Direct-write cleanup restores lifecycle when directory removal fails", "[distributed][copy][lifecycle]") {

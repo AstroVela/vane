@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from duckdb._ray_cxx import require_ray_cxx_attr
 from duckdb._vane_session import ensure_vane_session_dir
+from duckdb.runners.copy_outcome import CopyOutcomeUnknownError
 from duckdb.runners.fte.backends.native import NativeFteWorkerManagerBackend
 from duckdb.runners.fte.memory_config import apply_duckdb_memory_limit
 from duckdb.runners.progress import ProgressRenderer, build_progress_snapshot, progress_enabled
@@ -91,6 +92,12 @@ def _copy_output_info_from_context(context: dict[str, Any] | None) -> dict[str, 
         "run_id": str(run_id or ""),
         "remote_base": str(remote_base or ""),
     }
+
+
+def _require_known_copy_outcome(operation_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("copy_output_outcome_unknown") is True:
+        raise CopyOutcomeUnknownError.from_native_result(operation_id, result)
+    return result
 
 
 def _shutdown_udf_actor_pools(actor_pools: list[Any], *, kill: bool) -> list[BaseException]:
@@ -445,12 +452,15 @@ class LocalRunner(Runner):
             try:
                 future = write_executor.submit(execute_write)
                 if renderer is None:
-                    result = future.result()
+                    result = _require_known_copy_outcome(query_id, future.result())
                     write_succeeded = True
                     return result
                 while True:
                     try:
-                        result = future.result(timeout=renderer.interval_s)
+                        result = _require_known_copy_outcome(
+                            query_id,
+                            future.result(timeout=renderer.interval_s),
+                        )
                         write_succeeded = True
                         break
                     except TimeoutError:
@@ -459,12 +469,32 @@ class LocalRunner(Runner):
                 return result
             except Exception:
                 if renderer is not None:
-                    renderer.update(force=True)
+                    try:
+                        renderer.update(force=True)
+                    except Exception:
+                        # Progress is diagnostic and must not replace the
+                        # write's terminal error, especially UNKNOWN.
+                        pass
                 raise
             finally:
+                primary_error_active = sys.exc_info()[0] is not None
+                progress_error: Exception | None = None
                 if renderer is not None:
-                    renderer.finish(final_state="FINISHED" if write_succeeded else None)
-                write_executor.shutdown(wait=True)
+                    try:
+                        renderer.finish(final_state="FINISHED" if write_succeeded else None)
+                    except Exception as error:
+                        if not primary_error_active:
+                            progress_error = error
+                shutdown_error: Exception | None = None
+                try:
+                    write_executor.shutdown(wait=True)
+                except Exception as error:
+                    if not primary_error_active:
+                        shutdown_error = error
+                if shutdown_error is not None:
+                    raise shutdown_error
+                if progress_error is not None:
+                    raise progress_error
         finally:
             primary_error_active = sys.exc_info()[0] is not None
             cleanup_errors = _shutdown_local_write_resources(

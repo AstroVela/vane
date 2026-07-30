@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import duckdb as _duckdb_pkg
+from duckdb.runners.copy_outcome import CopyOutcomeUnknownError
 
 if TYPE_CHECKING:
     from duckdb.runners.runner import Runner
@@ -18,6 +19,7 @@ from duckdb.runners.local import set_runner_local
 from duckdb.runners.ray import set_runner_ray
 
 __all__ = [
+    "CopyOutcomeUnknownError",
     "get_or_create_runner",
     "get_or_infer_runner_type",
     "set_runner_local",

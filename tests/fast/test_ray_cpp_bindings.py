@@ -1944,7 +1944,12 @@ def test_distributed_copy_direct_write_committed_reader_requires_marker(tmp_path
     assert result["committed_file_path"].endswith("_vane_direct_write_run-reader/w_selected/part.parquet")
     assert result["committed_contains_loser"] is False
 
-    committed = duckdb.ray_cxx.read_committed_copy_direct_write_result(result["base_path"], result["run_id"])
+    conn = duckdb.connect()
+    committed = duckdb.ray_cxx.read_committed_copy_direct_write_result(
+        result["base_path"],
+        result["run_id"],
+        conn,
+    )
     assert committed["rows_copied"] == 7
     assert committed["copy_output_run_id"] == "run-reader"
     assert committed["copy_output_direct_write"] is True
@@ -2020,6 +2025,51 @@ def test_cleanup_uncommitted_copy_direct_write_run_public_api(tmp_path):
     assert committed_file.exists()
     assert committed_commit_dir.exists()
     assert (committed_commit_dir / "committed").exists()
+
+
+def test_inspect_and_force_abort_copy_direct_write_run_public_api(tmp_path):
+    from duckdb.runners.ray import (
+        force_abort_copy_direct_write_run,
+        inspect_copy_direct_write_run,
+    )
+
+    result = duckdb.ray_cxx.distributed_copy_direct_write_committed_reader_for_test(str(tmp_path))
+    base_path = result["base_path"]
+    run_id = result["run_id"]
+    run_dir = Path(base_path) / f"_vane_direct_write_{run_id}"
+    commit_dir = Path(f"{base_path}.duckdb_commit") / run_id
+    conn = duckdb.connect()
+
+    inspection = inspect_copy_direct_write_run(base_path, run_id, conn=conn)
+
+    assert inspection["state"] == "COMMITTED"
+    assert inspection["safe_to_retry"] is False
+    assert inspection["error"] == ""
+    assert inspection["rows_copied"] == 7
+    assert len(inspection["files"]) == 1
+    assert inspection["copy_output_run_id"] == run_id
+
+    aborted = force_abort_copy_direct_write_run(base_path, run_id, conn=conn)
+
+    assert aborted["state"] == "ABORTED"
+    assert aborted["safe_to_retry"] is True
+    assert aborted["copy_output_run_id"] == run_id
+    assert not run_dir.exists()
+    assert not commit_dir.exists()
+
+    after = inspect_copy_direct_write_run(base_path, run_id, conn=conn)
+    assert after["state"] == "UNCOMMITTED"
+    assert after["safe_to_retry"] is False
+
+
+def test_copy_direct_write_recovery_helpers_are_exported():
+    from duckdb.runners.ray import (
+        force_abort_copy_direct_write_run,
+        inspect_copy_direct_write_run,
+    )
+
+    assert callable(inspect_copy_direct_write_run)
+    assert callable(force_abort_copy_direct_write_run)
 
 
 def _register_direct_write_lifecycle_run(

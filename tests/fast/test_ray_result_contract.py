@@ -864,6 +864,65 @@ def test_query_driver_failure_immediately_after_commit_replays_success(monkeypat
     assert teardown_calls == [(plan_id, plan_id, True)]
 
 
+def test_query_driver_concurrent_startup_failure_preserves_unknown_copy_outcome(monkeypatch):
+    import duckdb.runners.ray.fte_fragment_scheduler as scheduler_mod
+
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-startup-failure-outcome-unknown"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    plan_finished = threading.Event()
+    plan_calls = 0
+    teardown_calls = []
+    unknown_result = {
+        "rows_copied": 5,
+        "copy_output_committed": False,
+        "copy_output_outcome_unknown": True,
+        "copy_output_outcome_error": "committed-marker readback was inconclusive",
+        "copy_output_base_path": "s3://bucket/out",
+        "copy_output_run_id": "run-startup-unknown",
+        "copy_output_manifest_path": "s3://bucket/out.duckdb_commit/run-startup-unknown/manifest.txt",
+        "copy_output_committed_marker_path": "s3://bucket/out.duckdb_commit/run-startup-unknown/committed",
+    }
+
+    class _PlanRunner:
+        def run_copy_plan(self, _plan, _conn):
+            nonlocal plan_calls
+            plan_calls += 1
+            plan_finished.set()
+            return unknown_result
+
+    def _fail_after_copy(_self, _actors):
+        assert plan_finished.wait(timeout=2.0)
+        raise RuntimeError("injected concurrent COPY startup failure")
+
+    def _teardown(_self, actual_plan_id, query_id, *, drop_fragments):
+        teardown_calls.append((actual_plan_id, query_id, drop_fragments))
+        cls._release_plan_session_state(runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
+    monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", _fail_after_copy)
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+    monkeypatch.setattr(
+        scheduler_mod,
+        "wait_for_fte_query_progress_topology",
+        lambda *_args, **_kwargs: plan_finished.wait(timeout=2.0),
+    )
+
+    for _ in range(2):
+        with pytest.raises(driver.CopyOutcomeUnknownError) as error:
+            asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+        assert error.value.run_id == "run-startup-unknown"
+        assert any("injected concurrent COPY startup failure" in warning for warning in error.value.cleanup_warnings)
+        assert error.value.safe_to_retry is False
+
+    assert plan_calls == 1
+    assert teardown_calls == [(plan_id, plan_id, True)]
+
+
 def test_query_driver_postcommit_startup_drain_cancellation_replays_success(monkeypatch):
     import duckdb.runners.ray.fte_fragment_scheduler as scheduler_mod
 
@@ -1135,6 +1194,70 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
     assert plan_calls == 1
 
 
+def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexecuted(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-native-outcome-unknown"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    plan_calls = 0
+    unknown_result = {
+        "rows_copied": 3,
+        "copy_output_committed": False,
+        "copy_output_outcome_unknown": True,
+        "copy_output_outcome_error": "marker PUT failed and readback was inconclusive",
+        "copy_output_base_path": "s3://bucket/out",
+        "copy_output_run_id": "run-unknown",
+        "copy_output_manifest_path": "s3://bucket/out.duckdb_commit/run-unknown/manifest.txt",
+        "copy_output_committed_marker_path": "s3://bucket/out.duckdb_commit/run-unknown/committed",
+    }
+
+    class _PlanRunner:
+        def run_copy_plan(self, _plan, _conn):
+            nonlocal plan_calls
+            plan_calls += 1
+            return unknown_result
+
+    def _teardown(_self, actual_plan_id, _query_id, *, drop_fragments):
+        assert actual_plan_id == plan_id
+        assert drop_fragments is True
+        cls._release_plan_session_state(runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    for operation in (
+        lambda: _run_actor_copy_plan(runner, logical_plan),
+        lambda: _run_actor_copy_plan(runner, logical_plan),
+    ):
+        with pytest.raises(driver.CopyOutcomeUnknownError) as error:
+            asyncio.run(operation())
+        assert error.value.operation_id == plan_id
+        assert error.value.base_path == "s3://bucket/out"
+        assert error.value.run_id == "run-unknown"
+        assert error.value.manifest_path.endswith("/manifest.txt")
+        assert error.value.committed_marker_path.endswith("/committed")
+        assert error.value.safe_to_retry is False
+        assert error.value.cleanup_warnings == ()
+        assert "readback was inconclusive" in str(error.value)
+
+    recovered = asyncio.run(
+        cls.recover_copy_plan(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            plan_id,
+        )
+    )
+
+    assert recovered.outcome is None
+    assert isinstance(recovered.error, driver.CopyOutcomeUnknownError)
+    assert recovered.error.run_id == "run-unknown"
+    assert plan_calls == 1
+
+
 def test_query_driver_evicted_copy_outcome_refuses_reexecution(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     first_plan_id = "copy-evicted-terminal-first"
@@ -1278,12 +1401,27 @@ def test_query_driver_copy_recovery_timeout_preserves_inflight_write(monkeypatch
 
 
 def test_copy_outcome_unknown_error_preserves_operation_id_across_serialization():
-    error = driver.CopyOutcomeUnknownError("unknown-copy-operation")
+    error = driver.CopyOutcomeUnknownError(
+        "unknown-copy-operation",
+        "s3://bucket/out",
+        "run-unknown",
+        "s3://bucket/out.duckdb_commit/run-unknown/manifest.txt",
+        "s3://bucket/out.duckdb_commit/run-unknown/committed",
+        "marker readback failed",
+        ("teardown warning",),
+    )
 
     restored = pickle.loads(pickle.dumps(error))
 
     assert type(restored) is driver.CopyOutcomeUnknownError
     assert restored.operation_id == error.operation_id
+    assert restored.base_path == error.base_path
+    assert restored.run_id == error.run_id
+    assert restored.manifest_path == error.manifest_path
+    assert restored.committed_marker_path == error.committed_marker_path
+    assert restored.detail == error.detail
+    assert restored.cleanup_warnings == error.cleanup_warnings
+    assert restored.safe_to_retry is False
     assert str(restored) == str(error)
 
 

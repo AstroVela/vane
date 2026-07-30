@@ -32,6 +32,7 @@ RayTaskResult = require_ray_cxx_attr(
 configure_ray_progress_logging_defaults()
 
 from duckdb.event_loop import set_event_loop
+from duckdb.runners.copy_outcome import CopyOutcomeUnknownError
 from duckdb.runners.fte import (
     FteTaskAttemptId,
     FteTaskState,
@@ -121,20 +122,6 @@ class QueryExecutionCleanupError(RuntimeError):
             primary_error=primary_error,
             cleanup_errors=cleanup,
         )
-
-
-class CopyOutcomeUnknownError(RuntimeError):
-    """The actor cannot prove whether a COPY operation committed."""
-
-    def __init__(self, operation_id: str) -> None:
-        self.operation_id = str(operation_id)
-        super().__init__(
-            f"COPY outcome is unknown for operation {self.operation_id}; "
-            "refusing to resubmit a potentially committed write"
-        )
-
-    def __reduce__(self) -> tuple[type[CopyOutcomeUnknownError], tuple[str]]:
-        return CopyOutcomeUnknownError, (self.operation_id,)
 
 
 def _client_owner_lease_settings() -> tuple[float, float]:
@@ -5132,6 +5119,8 @@ class RayQueryDriverActor:
             result = await asyncio.shield(plan_execution)
             if not isinstance(result, Mapping):
                 raise TypeError(f"native COPY returned {type(result).__name__}, expected a mapping")
+            if result.get("copy_output_outcome_unknown") is True:
+                raise CopyOutcomeUnknownError.from_native_result(plan_id, result)
             if result.get("copy_output_committed") is not True:
                 raise RuntimeError(f"native COPY plan {plan_id} returned without a committed output marker")
         except BaseException as execution_error:
@@ -5153,6 +5142,7 @@ class RayQueryDriverActor:
             # terminal result so a concurrent failure cannot escape as an
             # unobserved asyncio task exception.
             committed_result: Mapping[str, Any] | None = None
+            unknown_outcome_error = execution_error if isinstance(execution_error, CopyOutcomeUnknownError) else None
             if plan_execution is not None:
                 try:
                     await self._await_copy_operation(plan_execution)
@@ -5163,8 +5153,15 @@ class RayQueryDriverActor:
                 except BaseException:
                     pass
                 else:
-                    if isinstance(observed_result, Mapping) and observed_result.get("copy_output_committed") is True:
-                        committed_result = observed_result
+                    if isinstance(observed_result, Mapping):
+                        if observed_result.get("copy_output_outcome_unknown") is True:
+                            if unknown_outcome_error is None:
+                                unknown_outcome_error = CopyOutcomeUnknownError.from_native_result(
+                                    plan_id,
+                                    observed_result,
+                                )
+                        elif observed_result.get("copy_output_committed") is True:
+                            committed_result = observed_result
             await self._drain_copy_startup_tasks(startup_tasks)
             if committed_result is not None:
                 cleanup_warnings = self._copy_native_cleanup_warnings(committed_result) + (
@@ -5198,6 +5195,21 @@ class RayQueryDriverActor:
                     cleanup_state=cleanup_state,
                     cleanup_warnings=cleanup_warnings,
                 )
+            if unknown_outcome_error is not None:
+                if unknown_outcome_error is not execution_error:
+                    unknown_outcome_error.cleanup_warnings += (
+                        self._copy_cleanup_warning(
+                            "COPY outcome-unknown execution finalization",
+                            execution_error,
+                        ),
+                    )
+                if teardown_error is not None:
+                    unknown_outcome_error.cleanup_warnings += (
+                        self._copy_cleanup_warning("COPY outcome-unknown teardown", teardown_error),
+                    )
+                if unknown_outcome_error is execution_error:
+                    raise
+                raise unknown_outcome_error from execution_error
             if teardown_error is not None:
                 aggregate_error = QueryExecutionCleanupError.from_errors(
                     f"COPY query plan {plan_id} failed and teardown also failed",

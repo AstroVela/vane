@@ -43,6 +43,32 @@ def test_remote_ray_exception_pickle_round_trip_restores_cause_chain():
     _assert_restored_chain(restored, "pickle")
 
 
+def test_remote_ray_exception_preserves_unknown_copy_recovery_context():
+    from duckdb.runners import CopyOutcomeUnknownError
+
+    original = CopyOutcomeUnknownError(
+        "copy-operation",
+        "s3://bucket/out",
+        "run-unknown",
+        "s3://bucket/out.duckdb_commit/run-unknown/manifest.txt",
+        "s3://bucket/out.duckdb_commit/run-unknown/committed",
+        "marker readback unavailable",
+        ("teardown warning",),
+    )
+
+    restored = pickle.loads(pickle.dumps(RemoteRayException.from_exception(original))).restore()
+
+    assert type(restored) is CopyOutcomeUnknownError
+    assert restored.operation_id == original.operation_id
+    assert restored.base_path == original.base_path
+    assert restored.run_id == original.run_id
+    assert restored.manifest_path == original.manifest_path
+    assert restored.committed_marker_path == original.committed_marker_path
+    assert restored.detail == original.detail
+    assert restored.cleanup_warnings == original.cleanup_warnings
+    assert restored.safe_to_retry is False
+
+
 @pytest.mark.parametrize(
     ("original", "attributes"),
     [
