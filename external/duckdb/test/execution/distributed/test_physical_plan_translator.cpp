@@ -43,6 +43,9 @@
 #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_partitioned_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
+#include "duckdb/execution/operator/aggregate/physical_streaming_window.hpp"
+#include "duckdb/execution/operator/aggregate/physical_window.hpp"
+#include "duckdb/execution/operator/exchange/physical_repartition.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/join/physical_left_delim_join.hpp"
 #include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
@@ -54,7 +57,10 @@
 #include "duckdb/execution/distributed/pipeline_node/limit.hpp"
 #include "duckdb/execution/distributed/pipeline_node/scan_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/expression_scan.hpp"
+#include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
 #include "duckdb/execution/distributed/pipeline_node/sort.hpp"
+#include "duckdb/execution/distributed/pipeline_node/window.hpp"
+#include "duckdb/planner/expression/bound_window_expression.hpp"
 
 // Include distributed pipeline translator headers (lightweight declarations)
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
@@ -109,6 +115,73 @@ static UnaryPlan MakeUnaryScanPlan() {
 	auto &scan =
 	    plan->Make<PhysicalColumnDataScan>(types, PhysicalOperatorType::COLUMN_DATA_SCAN, 0, std::move(collection));
 	return {plan, types, &scan};
+}
+
+static DuckPhysicalPlanRef MakeWindowPlan(bool streaming, idx_t input_partitions, bool input_hash_partitioned,
+                                          const vector<idx_t> &partition_columns,
+                                          const vector<idx_t> &second_partition_columns = {},
+                                          bool swap_columns_after_repartition = false) {
+	Allocator &alloc = Allocator::DefaultAllocator();
+	auto plan = std::make_shared<PhysicalPlan>(alloc);
+	vector<LogicalType> input_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+	auto collection = make_uniq<ColumnDataCollection>(alloc, input_types);
+	auto &scan = plan->Make<PhysicalColumnDataScan>(input_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 0,
+	                                                std::move(collection));
+	PhysicalOperator *input = &scan;
+
+	if (input_partitions > 1) {
+		std::shared_ptr<RepartitionSpec> spec;
+		if (input_hash_partitioned) {
+			vector<ExprRef> by;
+			by.emplace_back(std::make_shared<BoundReferenceExpression>(LogicalType::BIGINT, 0));
+			spec = RepartitionSpec::create_hash(input_partitions, std::move(by));
+		} else {
+			spec = RepartitionSpec::create_random(input_partitions);
+		}
+		auto &repartition = plan->Make<PhysicalRepartition>(input_types, std::move(spec), 0);
+		repartition.children.push_back(scan);
+		input = &repartition;
+	}
+
+	if (swap_columns_after_repartition) {
+		vector<unique_ptr<Expression>> projections;
+		projections.push_back(make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 1));
+		projections.push_back(make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0));
+		auto &projection = plan->Make<PhysicalProjection>(input_types, std::move(projections), 0);
+		projection.children.push_back(*input);
+		input = &projection;
+	}
+
+	auto make_window_expression = [streaming](const vector<idx_t> &partitions) {
+		auto expression =
+		    make_uniq<BoundWindowExpression>(ExpressionType::WINDOW_ROW_NUMBER, LogicalType::BIGINT, nullptr, nullptr);
+		for (auto column : partitions) {
+			expression->partitions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, column));
+		}
+		if (!streaming) {
+			expression->orders.emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_LAST,
+			                                make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 1));
+		}
+		return expression;
+	};
+
+	vector<unique_ptr<Expression>> select_list;
+	select_list.push_back(make_window_expression(partition_columns));
+	if (!second_partition_columns.empty()) {
+		select_list.push_back(make_window_expression(second_partition_columns));
+	}
+	auto output_types = input_types;
+	output_types.resize(input_types.size() + select_list.size(), LogicalType::BIGINT);
+	if (streaming) {
+		auto &window = plan->Make<PhysicalStreamingWindow>(output_types, std::move(select_list), 0);
+		window.children.push_back(*input);
+		plan->SetRoot(window);
+	} else {
+		auto &window = plan->Make<PhysicalWindow>(output_types, std::move(select_list), 0);
+		window.children.push_back(*input);
+		plan->SetRoot(window);
+	}
+	return plan;
 }
 
 static unique_ptr<ColumnDataCollection> MakeSingleValueCollection(const vector<LogicalType> &types,
@@ -762,6 +835,119 @@ TEST_CASE("PhysicalPlanTranslator: top n -> TopNNode", "[distributed]") {
 	REQUIRE(res.value() != nullptr);
 	auto inner = res.value()->inner();
 	REQUIRE(std::dynamic_pointer_cast<duckdb::distributed::TopNNode>(inner) != nullptr);
+}
+
+TEST_CASE("PhysicalPlanTranslator: global window gathers multi-partition input", "[distributed][window]") {
+	auto plan = MakeWindowPlan(false, 4, false, {});
+	auto res = physical_plan_to_pipeline_node(PlanConfig {}, std::move(plan));
+
+	REQUIRE(res.is_ok());
+	auto window = std::dynamic_pointer_cast<WindowNode>(res.value()->inner());
+	REQUIRE(window != nullptr);
+	REQUIRE(SchemaColumnCount(window->config().schema()) == 3);
+	auto children = window->children();
+	REQUIRE(children.size() == 1);
+	REQUIRE(std::dynamic_pointer_cast<RepartitionNode>(children[0]) != nullptr);
+	REQUIRE(children[0]->config().clustering_spec()->num_partitions() == 1);
+}
+
+TEST_CASE("PhysicalPlanTranslator: partitioned window hash-shuffles by partition keys", "[distributed][window]") {
+	auto plan = MakeWindowPlan(false, 4, false, {0});
+	auto res = physical_plan_to_pipeline_node(PlanConfig {}, std::move(plan));
+
+	REQUIRE(res.is_ok());
+	auto window = std::dynamic_pointer_cast<WindowNode>(res.value()->inner());
+	REQUIRE(window != nullptr);
+	auto children = window->children();
+	REQUIRE(children.size() == 1);
+	REQUIRE(std::dynamic_pointer_cast<RepartitionNode>(children[0]) != nullptr);
+	auto clustering = children[0]->config().clustering_spec();
+	REQUIRE(clustering->type() == ClusteringSpec::Type::Hash);
+	REQUIRE(clustering->num_partitions() == 4);
+	auto partition_by = clustering->partition_by();
+	REQUIRE(partition_by.size() == 1);
+	REQUIRE(partition_by[0]->GetExpressionClass() == ExpressionClass::BOUND_REF);
+	REQUIRE(partition_by[0]->Cast<BoundReferenceExpression>().index == 0);
+}
+
+TEST_CASE("PhysicalPlanTranslator: streaming window gathers multi-partition input", "[distributed][window]") {
+	auto plan = MakeWindowPlan(true, 4, false, {});
+	auto res = physical_plan_to_pipeline_node(PlanConfig {}, std::move(plan));
+
+	REQUIRE(res.is_ok());
+	auto window = std::dynamic_pointer_cast<StreamingWindowNode>(res.value()->inner());
+	REQUIRE(window != nullptr);
+	REQUIRE(SchemaColumnCount(window->config().schema()) == 3);
+	auto children = window->children();
+	REQUIRE(children.size() == 1);
+	REQUIRE(std::dynamic_pointer_cast<RepartitionNode>(children[0]) != nullptr);
+	REQUIRE(children[0]->config().clustering_spec()->num_partitions() == 1);
+}
+
+TEST_CASE("PhysicalPlanTranslator: window reuses only verified partitioning", "[distributed][window]") {
+	SECTION("single-partition global window") {
+		auto plan = MakeWindowPlan(false, 1, false, {});
+		auto res = physical_plan_to_pipeline_node(PlanConfig {}, std::move(plan));
+
+		REQUIRE(res.is_ok());
+		auto window = std::dynamic_pointer_cast<WindowNode>(res.value()->inner());
+		REQUIRE(window != nullptr);
+		auto children = window->children();
+		REQUIRE(children.size() == 1);
+		REQUIRE(std::dynamic_pointer_cast<RepartitionNode>(children[0]) == nullptr);
+	}
+
+	SECTION("single-partition partitioned window") {
+		auto plan = MakeWindowPlan(false, 1, false, {0});
+		auto res = physical_plan_to_pipeline_node(PlanConfig {}, std::move(plan));
+
+		REQUIRE(res.is_ok());
+		auto window = std::dynamic_pointer_cast<WindowNode>(res.value()->inner());
+		REQUIRE(window != nullptr);
+		auto children = window->children();
+		REQUIRE(children.size() == 1);
+		REQUIRE(std::dynamic_pointer_cast<RepartitionNode>(children[0]) == nullptr);
+	}
+
+	SECTION("matching hash-partitioned input") {
+		auto plan = MakeWindowPlan(false, 4, true, {0});
+		auto res = physical_plan_to_pipeline_node(PlanConfig {}, std::move(plan));
+
+		REQUIRE(res.is_ok());
+		auto window = std::dynamic_pointer_cast<WindowNode>(res.value()->inner());
+		REQUIRE(window != nullptr);
+		auto children = window->children();
+		REQUIRE(children.size() == 1);
+		auto repartition = std::dynamic_pointer_cast<RepartitionNode>(children[0]);
+		REQUIRE(repartition != nullptr);
+		auto repartition_children = repartition->children();
+		REQUIRE(repartition_children.size() == 1);
+		REQUIRE(std::dynamic_pointer_cast<RepartitionNode>(repartition_children[0]) == nullptr);
+	}
+
+	SECTION("stale hash metadata after projection") {
+		auto plan = MakeWindowPlan(false, 4, true, {0}, {}, true);
+		auto res = physical_plan_to_pipeline_node(PlanConfig {}, std::move(plan));
+
+		REQUIRE(res.is_ok());
+		auto window = std::dynamic_pointer_cast<WindowNode>(res.value()->inner());
+		REQUIRE(window != nullptr);
+		auto children = window->children();
+		REQUIRE(children.size() == 1);
+		auto repartition = std::dynamic_pointer_cast<RepartitionNode>(children[0]);
+		REQUIRE(repartition != nullptr);
+		auto repartition_children = repartition->children();
+		REQUIRE(repartition_children.size() == 1);
+		REQUIRE(repartition_children[0]->name() == "Projection");
+	}
+}
+
+TEST_CASE("PhysicalPlanTranslator: window rejects incompatible partition definitions", "[distributed][window]") {
+	auto plan = MakeWindowPlan(false, 4, false, {0}, {1});
+	auto res = physical_plan_to_pipeline_node(PlanConfig {}, std::move(plan));
+
+	REQUIRE(res.is_err());
+	REQUIRE_THAT(res.error().what(), Catch::Matchers::Contains("incompatible partition definitions"));
 }
 
 TEST_CASE("PhysicalPlanTranslator: left delim join -> placeholder node", "[distributed]") {
