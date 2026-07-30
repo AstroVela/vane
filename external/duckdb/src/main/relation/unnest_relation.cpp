@@ -12,9 +12,19 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/common/types.hpp"
 
 namespace duckdb {
+
+static idx_t FindUnnestColumnIndex(const vector<string> &names, const string &column_name) {
+	for (idx_t i = 0; i < names.size(); i++) {
+		if (names[i] == column_name) {
+			return i;
+		}
+	}
+	throw BinderException("Column \"%s\" not found in child relation for unnest/explode", column_name);
+}
 
 UnnestRelation::UnnestRelation(shared_ptr<Relation> child_p, string column_name_p)
     : Relation(child_p->context, RelationType::UNNEST_RELATION), column_name(std::move(column_name_p)),
@@ -24,22 +34,34 @@ UnnestRelation::UnnestRelation(shared_ptr<Relation> child_p, string column_name_
 }
 
 unique_ptr<QueryNode> UnnestRelation::GetQueryNode() {
-	// Fallback AST path (used by default Relation::Bind if custom Bind not called).
-	// Builds: SELECT * EXCLUDE(col), unnest(col) AS col FROM (child)
+	// SQL serialization path: build an inner
+	// SELECT * REPLACE (unnest(col) AS col) FROM (child).
 	auto result = make_uniq<SelectNode>();
 	result->from_table = GetTableRefForSerialization(*child);
 
+	auto &child_columns = child->Columns();
+	vector<string> child_names;
+	child_names.reserve(child_columns.size());
+	for (auto &column : child_columns) {
+		child_names.push_back(column.Name());
+	}
+	auto unnest_col_idx = FindUnnestColumnIndex(child_names, column_name);
+	// A subquery gives duplicate names unique binding aliases. Address the
+	// target through its positional input alias so an earlier duplicate cannot
+	// shadow names such as x_1.
+	auto input_names = BindContext::AliasColumnNames(child->GetAlias(), child_names, {});
+	auto &input_column_name = input_names[unnest_col_idx];
+
 	auto star = make_uniq<StarExpression>();
-	star->exclude_list.insert(QualifiedColumnName(column_name));
+	vector<unique_ptr<ParsedExpression>> unnest_args;
+	unnest_args.push_back(make_uniq<ColumnRefExpression>(input_column_name));
+	auto unnest_func = make_uniq<FunctionExpression>("unnest", std::move(unnest_args));
+	star->replace_list.emplace(input_column_name, std::move(unnest_func));
 	result->select_list.push_back(std::move(star));
 
-	vector<unique_ptr<ParsedExpression>> unnest_args;
-	unnest_args.push_back(make_uniq<ColumnRefExpression>(column_name));
-	auto unnest_func = make_uniq<FunctionExpression>("unnest", std::move(unnest_args));
-	unnest_func->SetAlias(column_name);
-	result->select_list.push_back(std::move(unnest_func));
-
-	return std::move(result);
+	// Subquery binding deduplicates input names. Restore duplicate public aliases
+	// explicitly while keeping the common unique-name query free of another layer.
+	return RestoreDuplicateColumnAliases(std::move(result), GetAlias(), Columns());
 }
 
 BoundStatement UnnestRelation::Bind(Binder &binder) {
@@ -52,16 +74,7 @@ BoundStatement UnnestRelation::Bind(Binder &binder) {
 	D_ASSERT(child_bindings.size() == child_bound.names.size());
 
 	// 2. Find the column to unnest
-	idx_t unnest_col_idx = DConstants::INVALID_INDEX;
-	for (idx_t i = 0; i < child_bound.names.size(); i++) {
-		if (child_bound.names[i] == column_name) {
-			unnest_col_idx = i;
-			break;
-		}
-	}
-	if (unnest_col_idx == DConstants::INVALID_INDEX) {
-		throw BinderException("Column \"%s\" not found in child relation for unnest/explode", column_name);
-	}
+	auto unnest_col_idx = FindUnnestColumnIndex(child_bound.names, column_name);
 
 	// 3. Determine element type from the list/array column
 	auto &list_type = child_bound.types[unnest_col_idx];
@@ -76,9 +89,13 @@ BoundStatement UnnestRelation::Bind(Binder &binder) {
 	}
 
 	// 4. Create BoundUnnestExpression: unnest(col_ref) → element_type
-	auto col_ref = make_uniq<BoundColumnRefExpression>(column_name, list_type, child_bindings[unnest_col_idx]);
+	unique_ptr<Expression> unnest_child =
+	    make_uniq<BoundColumnRefExpression>(column_name, list_type, child_bindings[unnest_col_idx]);
+	// PhysicalUnnest consumes LIST vectors. Match the SQL UNNEST binder by
+	// casting ARRAY inputs to LIST while preserving their element type.
+	unnest_child = BoundCastExpression::AddArrayCastToList(binder.context, std::move(unnest_child));
 	auto unnest_expr = make_uniq<BoundUnnestExpression>(element_type);
-	unnest_expr->child = std::move(col_ref);
+	unnest_expr->child = std::move(unnest_child);
 
 	// 5. Create LogicalUnnest node
 	idx_t unnest_index = binder.GenerateTableIndex();

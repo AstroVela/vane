@@ -280,6 +280,8 @@ protected:
 	static BoundStatement BindSelectNodeOnChild(Binder &binder, Relation &child, unique_ptr<SelectNode> select_node);
 	static unique_ptr<SelectNode> WrapQueryNode(unique_ptr<QueryNode> query_node, const string &alias,
 	                                            const vector<ColumnDefinition> &columns);
+	static unique_ptr<QueryNode> RestoreDuplicateColumnAliases(unique_ptr<QueryNode> query_node, const string &alias,
+	                                                           const vector<ColumnDefinition> &columns);
 	static unique_ptr<LogicalOperator> PlanRelationFilter(Binder &binder, unique_ptr<Expression> condition,
 	                                                      unique_ptr<LogicalOperator> child);
 	static void ExpandRelationFilter(Binder &binder, unique_ptr<ParsedExpression> &condition);
