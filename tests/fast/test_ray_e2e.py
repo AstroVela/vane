@@ -2762,6 +2762,68 @@ def test_ray_map_batches_udf(ray_runner, duckdb_conn, parquet_path):
     _assert_results_match(duckdb_conn, sql, parts, label)
 
 
+def test_ray_row_preserving_batch_udf_limit_preserves_output_schema(
+    ray_runner,
+    duckdb_conn,
+    tmp_path,
+    monkeypatch,
+):
+    pa = pytest.importorskip("pyarrow")
+    import vane
+
+    if ray is None:
+        pytest.skip("ray not installed")
+
+    label = "test_ray_e2e: row-preserving batch UDF across streaming limit"
+    input_path = tmp_path / "row_preserving_udf_limit"
+    shuffle_dir = tmp_path / "row_preserving_udf_limit_shuffle"
+    monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+
+    duckdb_conn.execute(f"""
+        COPY (
+            SELECT
+                i::INTEGER AS x,
+                floor(i / 4)::INTEGER AS file_id
+            FROM range(0, 16) AS t(i)
+        ) TO '{input_path}' (FORMAT PARQUET, PARTITION_BY (file_id))
+    """)
+
+    def add_one(table):
+        values = table.column("x").to_pylist()
+        return pa.table({"y": [value + 1 for value in values]})
+
+    base = duckdb_conn.sql(f"SELECT x FROM read_parquet('{input_path}/**/*.parquet')")
+    expression = vane.func.batch(
+        add_one,
+        inputs={"x": vane.col("x")},
+        schema={"y": "INTEGER"},
+        row_preserving=True,
+    )
+    relation = base.select(vane.col("x"), expression.alias("y")).limit(5)
+
+    ray_cxx = getattr(duckdb, "ray_cxx", None)
+    if ray_cxx is None or not hasattr(ray_cxx, "PyLogicalPlan"):
+        pytest.skip("duckdb.ray_cxx.PyLogicalPlan not available in this environment")
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
+    distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
+    descriptor_counts = [len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values()]
+    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
+    assert distributed_plan.num_partitions() == 4
+    plan_text = distributed_plan.repr_ascii(False).upper()
+    assert "STREAMINGUDF" in plan_text
+    assert "STREAMINGLIMIT" in plan_text
+
+    parts = _run_iter_tables(ray_runner, relation, label, timeout_s=60.0)
+    rows = _collect_result_rows(parts)
+
+    assert len(rows) == 5
+    assert all(len(row) == 2 for row in rows)
+    assert all(int(y) == int(x) + 1 for x, y in rows)
+
+
 def test_ray_python_stream_table_udf(ray_runner, duckdb_conn, parquet_path):
     pytest.importorskip("pyarrow")
     if ray is None:

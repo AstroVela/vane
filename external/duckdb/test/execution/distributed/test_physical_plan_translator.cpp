@@ -59,6 +59,7 @@
 #include "duckdb/execution/distributed/pipeline_node/expression_scan.hpp"
 #include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
 #include "duckdb/execution/distributed/pipeline_node/sort.hpp"
+#include "duckdb/execution/distributed/pipeline_node/streaming_udf_passthrough.hpp"
 #include "duckdb/execution/distributed/pipeline_node/window.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 
@@ -209,6 +210,20 @@ static idx_t SchemaColumnCount(const SchemaRef &schema) {
 
 static std::string SQLStringLiteral(const std::string &value) {
 	return "'" + StringUtil::Replace(value, "'", "''") + "'";
+}
+
+TEST_CASE("Streaming UDF passthrough schema preserves all output columns", "[distributed][udf]") {
+	vector<LogicalType> output_types = {LogicalType::BIGINT, LogicalType::VARCHAR};
+	StreamingUDFPassthroughNode node(1, nullptr, TableFunction {}, nullptr, vector<ColumnIndex> {}, vector<column_t> {},
+	                                 optional_idx(), output_types, 0);
+
+	auto schema = node.config().schema();
+	REQUIRE(schema);
+	REQUIRE(schema->id() == LogicalTypeId::STRUCT);
+	const auto &columns = StructType::GetChildTypes(*schema);
+	REQUIRE(columns.size() == output_types.size());
+	REQUIRE(columns[0].second == output_types[0]);
+	REQUIRE(columns[1].second == output_types[1]);
 }
 
 TEST_CASE("PhysicalPlanTranslator: simple projection", "[distributed]") {
