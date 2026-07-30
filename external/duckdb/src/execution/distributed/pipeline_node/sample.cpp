@@ -84,7 +84,11 @@ SubmittableTaskStream<WorkerTask> ReservoirSampleNode::produce_tasks(PlanExecuti
 		input_plan->SetRoot(sample_op);
 		return input_plan;
 	};
-	auto per_task_builder_factory = [options_template, state_types](idx_t) -> MaterializedPlanBuilder {
+	// The factory argument is only a fragment-template position and can depend
+	// on asynchronous child arrival. The LOCAL operator stays unbound until FTE
+	// applies its stable runtime task partition before execution.
+	auto per_task_builder_factory = [options_template,
+	                                 state_types](idx_t /*provisional_task_index*/) -> MaterializedPlanBuilder {
 		return [options_template, state_types](DuckPhysicalPlanRef input_plan) -> DuckPhysicalPlanRef {
 			auto options_copy = options_template->Copy();
 			auto types = *state_types;

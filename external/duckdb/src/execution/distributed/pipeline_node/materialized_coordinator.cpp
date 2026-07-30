@@ -104,10 +104,7 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 
 	MaterializedPlanBuilder local_plan_builder;
 	if (per_task_builder_factory) {
-		// The stream position is not a stable task identity because child tasks
-		// can arrive asynchronously. Runtime-bound operators must instead use
-		// the FTE task partition applied before execution.
-		local_plan_builder = per_task_builder_factory(DConstants::INVALID_INDEX);
+		local_plan_builder = per_task_builder_factory(0);
 	}
 
 	auto sink_plan_builder = [local_plan_builder, exchange, exchange_mgr, exchange_id, sink_task_counter,
