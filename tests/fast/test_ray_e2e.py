@@ -3628,6 +3628,118 @@ def test_ray_window(ray_runner, duckdb_conn, parquet_path):
     )
 
 
+def test_ray_windows_span_multiple_scan_tasks(ray_runner, duckdb_conn, tmp_path, monkeypatch):
+    label = "test_ray_e2e: windows span multiple scan tasks"
+    window_path = tmp_path / "window_multi_task"
+    shuffle_dir = tmp_path / "window_multi_task_shuffle"
+
+    monkeypatch.setenv("VANE_SHUFFLE_ALGORITHM", "flight_shuffle")
+    monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+
+    duckdb_conn.execute(f"""
+        COPY (
+            SELECT
+                i::INTEGER AS x,
+                (i % 2)::INTEGER AS k,
+                floor(i / 3)::INTEGER AS file_id
+            FROM range(0, 12) AS t(i)
+        ) TO '{window_path}' (FORMAT PARQUET, PARTITION_BY (file_id))
+    """)
+
+    global_sql = f"""
+        SELECT x, ROW_NUMBER() OVER (ORDER BY x) AS rn
+        FROM read_parquet('{window_path}/**/*.parquet')
+    """
+    ray_cxx = getattr(duckdb, "ray_cxx", None)
+    if ray_cxx is None or not hasattr(ray_cxx, "PyLogicalPlan"):
+        pytest.skip("duckdb.ray_cxx.PyLogicalPlan not available in this environment")
+
+    def distributed_plan(sql, suffix):
+        relation = duckdb_conn.sql(sql)
+        logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-{suffix}-plan")
+        return logical_plan.to_physical_plan(duckdb_conn)
+
+    global_plan = distributed_plan(global_sql, "global")
+    descriptor_counts = [len(descriptors) for descriptors in global_plan.scan_task_descriptor_map().values()]
+    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
+    assert global_plan.num_partitions() == 1
+    assert "REPARTITION" in global_plan.repr_ascii(False).upper()
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        global_sql,
+        f"{label}: global ordered window",
+        require_all=["WINDOW"],
+        timeout_s=60.0,
+    )
+
+    partitioned_sql = f"""
+        SELECT
+            x,
+            k,
+            ROW_NUMBER() OVER (PARTITION BY k ORDER BY x) AS rn,
+            SUM(x) OVER (
+                PARTITION BY k
+                ORDER BY x
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS running_sum,
+            LAG(x) OVER (PARTITION BY k ORDER BY x) AS previous_x
+        FROM read_parquet('{window_path}/**/*.parquet')
+    """
+    partitioned_plan = distributed_plan(partitioned_sql, "partitioned")
+    assert partitioned_plan.num_partitions() == 4
+    assert "REPARTITION" in partitioned_plan.repr_ascii(False).upper()
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        partitioned_sql,
+        f"{label}: partitioned ordered windows",
+        require_all=["WINDOW"],
+        timeout_s=60.0,
+    )
+
+    stacked_sql = f"""
+        SELECT
+            x,
+            k,
+            ROW_NUMBER() OVER (ORDER BY x) AS global_rn,
+            ROW_NUMBER() OVER (PARTITION BY k ORDER BY x) AS partition_rn
+        FROM read_parquet('{window_path}/**/*.parquet')
+    """
+    stacked_plan = distributed_plan(stacked_sql, "stacked")
+    stacked_plan_text = stacked_plan.repr_ascii(False).upper()
+    assert stacked_plan_text.count("WINDOW") >= 2
+    assert "REPARTITION" in stacked_plan_text
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        stacked_sql,
+        f"{label}: stacked windows with different distributions",
+        require_all=["WINDOW"],
+        timeout_s=60.0,
+    )
+
+    streaming_sql = f"""
+        SELECT ROW_NUMBER() OVER () AS rn
+        FROM read_parquet('{window_path}/**/*.parquet')
+    """
+    streaming_plan = distributed_plan(streaming_sql, "streaming")
+    assert streaming_plan.num_partitions() == 1
+    assert "REPARTITION" in streaming_plan.repr_ascii(False).upper()
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        streaming_sql,
+        f"{label}: streaming window",
+        require_all=["STREAMING_WINDOW"],
+        timeout_s=60.0,
+    )
+
+
 def test_ray_streaming_window(ray_runner, duckdb_conn, parquet_path):
     label = "test_ray_e2e: streaming window"
     sql = f"""
