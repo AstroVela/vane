@@ -1385,6 +1385,61 @@ def test_fte_control_ref_preserves_query_deadline_when_wait_expires(monkeypatch)
         pending.cancel()
 
 
+def test_fte_cancel_barrier_outlives_configured_control_timeouts(monkeypatch):
+    query_id = "query-cancel-barrier-timeout"
+    task_id = {
+        "query_id": query_id,
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 1,
+    }
+    pending = Future()
+
+    class _DeferredCancel:
+        def options(self, **_kwargs):
+            return self
+
+        def remote(self, *_args):
+            return SimpleNamespace(future=lambda: pending)
+
+    actor = _FakeActor()
+    actor.fte_cancel_task = _DeferredCancel()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    monkeypatch.setenv("VANE_FTE_CONTROL_RPC_TIMEOUT_S", "0.05")
+    monkeypatch.setenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", "0.05")
+    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", str(time.time() - 1.0))
+    cancel_results = []
+    cancel_errors = []
+    cancel_started = threading.Event()
+
+    def cancel_task():
+        cancel_started.set()
+        try:
+            cancel_results.append(handle.fte_cancel_task(task_id))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            cancel_errors.append(exc)
+
+    cancel_thread = threading.Thread(target=cancel_task)
+    cancel_thread.start()
+    assert cancel_started.wait(timeout=1.0)
+    time.sleep(0.15)
+    outlived_control_timeout = cancel_thread.is_alive()
+    pending.set_result(
+        {
+            "state": FteTaskState.CANCELED.value,
+            "task_id": task_id,
+            "_fte_control_operation": "fte_cancel_task",
+            "_fte_control_applied": True,
+        }
+    )
+    cancel_thread.join(timeout=2.0)
+
+    assert outlived_control_timeout
+    assert not cancel_thread.is_alive()
+    assert cancel_errors == []
+    assert cancel_results[0]["state"] == FteTaskState.CANCELED.value
+
+
 def test_ordered_add_ref_is_canceled_and_unowned_after_query_close(monkeypatch):
     query_id = "query-cancel-ordered-add"
     task_id = {

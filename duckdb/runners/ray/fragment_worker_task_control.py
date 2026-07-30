@@ -158,7 +158,17 @@ class FteWorkerTaskControlMixin:
         cancel_event: Any = None,
         honor_query_deadline: bool = True,
         on_cancel: Callable[[], None] | None = None,
+        wait_for_owned_side_effects: bool = False,
     ) -> Any:
+        if wait_for_owned_side_effects:
+            # A successful cancellation may gate a COPY commit. No local
+            # control, query, or ObjectRef timeout may outlive its writer.
+            return resolve_object_refs_blocking(
+                ref,
+                timeout=None,
+                honor_query_deadline=False,
+                honor_object_get_timeout=False,
+            )
         resolved_timeout_s = _fte_control_rpc_timeout_s() if timeout_s is None else max(0.0, float(timeout_s))
         if cancel_event is not None:
             try:
@@ -216,6 +226,7 @@ class FteWorkerTaskControlMixin:
         *args: Any,
         timeout_s: float | None = None,
         cancel_event: Any = None,
+        wait_for_owned_side_effects: bool = False,
     ) -> Any:
         tracked_query_id: str | None = None
         owns_registry_operation = False
@@ -243,6 +254,7 @@ class FteWorkerTaskControlMixin:
                 timeout_s=timeout_s,
                 cancel_event=cancel_event,
                 on_cancel=on_cancel,
+                wait_for_owned_side_effects=wait_for_owned_side_effects,
             )
         finally:
             if owns_registry_operation:
@@ -780,7 +792,11 @@ class FteWorkerTaskControlMixin:
             )
 
     def fte_cancel_task(self, task_id: str | dict[str, Any]) -> dict[str, Any]:
-        raw_status = self._enqueue_ordered_fte_control_rpc("fte_cancel_task", task_id)
+        raw_status = self._enqueue_ordered_fte_control_rpc(
+            "fte_cancel_task",
+            task_id,
+            wait_for_owned_side_effects=True,
+        )
         if not isinstance(raw_status, dict):
             raise TypeError("worker actor fte_cancel_task must return a dict")
         return dict(raw_status)

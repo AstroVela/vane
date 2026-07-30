@@ -78,6 +78,20 @@ _CONNECTION_SNAPSHOT_SECURITY_SETTINGS = frozenset(
 )
 
 
+async def _await_future_with_owned_side_effects(future: asyncio.Future[Any]) -> Any:
+    """Do not expose cancellation until a future-owned mutation has finished."""
+    cancellation: asyncio.CancelledError | None = None
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError as error:
+            cancellation = error
+    result = future.result()
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 async def _to_thread_with_owned_side_effects(
     callback: Callable[..., Any],
     /,
@@ -86,16 +100,7 @@ async def _to_thread_with_owned_side_effects(
 ) -> Any:
     """Do not expose cancellation until a thread-owned mutation has finished."""
     thread_task = asyncio.create_task(asyncio.to_thread(callback, *args, **kwargs))
-    cancellation: asyncio.CancelledError | None = None
-    while not thread_task.done():
-        try:
-            await asyncio.shield(thread_task)
-        except asyncio.CancelledError as error:
-            cancellation = error
-    result = thread_task.result()
-    if cancellation is not None:
-        raise cancellation
-    return result
+    return await _await_future_with_owned_side_effects(thread_task)
 
 
 def _fte_applied_control_status(
@@ -2019,7 +2024,7 @@ class RayWorkerActor:
             finally:
                 self._end_worker_native_execution(query_id)
             raise
-        result_list = await asyncio.shield(native_future)
+        result_list = await _await_future_with_owned_side_effects(native_future)
         (
             payloads,
             partition_metadatas,

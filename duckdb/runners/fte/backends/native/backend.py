@@ -50,6 +50,26 @@ _FRAGMENT_STAT_KEYS = (
 )
 
 
+async def _to_thread_with_owned_side_effects(
+    callback: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Do not expose cancellation until a synchronous task mutation has finished."""
+    thread_task = asyncio.create_task(asyncio.to_thread(callback, *args, **kwargs))
+    cancellation: asyncio.CancelledError | None = None
+    while not thread_task.done():
+        try:
+            await asyncio.shield(thread_task)
+        except asyncio.CancelledError as error:
+            cancellation = error
+    result = thread_task.result()
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 def _native_submit_debug_enabled() -> bool:
     for name in ("VANE_FTE_ADMISSION_DEBUG", "DUCKDB_DISTRIBUTED_DEBUG"):
         value = os.getenv(name, "")
@@ -346,6 +366,10 @@ class _BackgroundEventLoop:
                 return future.result()
             future.cancel()
             raise TimeoutError(f"native FTE event-loop operation timed out after {timeout_s:.3f}s") from exc
+
+    def run_owned_side_effects(self, coro: Coroutine[Any, Any, Any]) -> Any:
+        """Wait without a fixed timeout until owned side effects are terminal."""
+        return self.submit(coro).result()
 
     def request_shutdown(self) -> None:
         """Fence new work and ask the loop thread to begin teardown."""
@@ -1181,7 +1205,7 @@ class NativeWorkerHandle:
         request_payload = dict(request)
         if inspect.iscoroutinefunction(self._execute_fn):
             return await self._execute_fn(request_payload)
-        return await asyncio.to_thread(self._execute_fn, request_payload)
+        return await _to_thread_with_owned_side_effects(self._execute_fn, request_payload)
 
     def fte_create_task(self, request: Mapping[str, Any]) -> dict[str, Any]:
         return _as_status("fte_create_task", self._loop.run(self._manager.create_task(dict(request))))
@@ -1267,10 +1291,17 @@ class NativeWorkerHandle:
         return _as_status("fte_get_task_info", self._loop.run(self._manager.get_task_info(task_id)))
 
     def fte_cancel_task(self, task_id: str | Mapping[str, Any]) -> dict[str, Any]:
-        return _as_status("fte_cancel_task", self._loop.run(self._manager.cancel_task(task_id)))
+        # A successful cancellation is a barrier for task-owned writes. The
+        # normal operation timeout must not expose a still-running writer.
+        return _as_status(
+            "fte_cancel_task",
+            self._loop.run_owned_side_effects(self._manager.cancel_task(task_id)),
+        )
 
     def fte_drop_query(self, query_id: str) -> dict[str, int]:
-        result = self._loop.run(self._manager.drop_query(str(query_id)))
+        # Query drop is also a barrier for task-owned writes and must not
+        # return while a canceled synchronous execution can still mutate data.
+        result = self._loop.run_owned_side_effects(self._manager.drop_query(str(query_id)))
         if not isinstance(result, Mapping):
             raise TypeError("fte_drop_query must return a mapping")
         return {str(key): int(value) for key, value in result.items()}
