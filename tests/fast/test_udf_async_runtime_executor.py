@@ -171,20 +171,37 @@ def test_async_runtime_close_finalizes_async_generators():
 
 
 def test_async_runtime_rejects_nested_use_no_fallback():
-    """Inside async code callers must await; there is no bridge thread."""
+    """Inside async code callers must await; there is no bridge thread.
+
+    The rejected coroutine is closed rather than left un-awaited, so no
+    ``RuntimeWarning: coroutine ... was never awaited`` escapes and no
+    fallback loop is created for the rejected runtime.
+    """
+    import gc
+    import warnings
+
     from duckdb.execution._async_runtime import AsyncRuntime
 
     outer = AsyncRuntime()
     inner = AsyncRuntime()
+    ran: list[str] = []
 
     async def nested() -> None:
         async def noop() -> None:
-            return None
+            ran.append("noop")  # must never run: run() rejects before scheduling
 
         inner.run(noop())
 
-    with pytest.raises(RuntimeError):
-        outer.run(nested())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(RuntimeError, match="await"):
+            outer.run(nested())
+        gc.collect()  # force any leaked coroutine to surface its warning here
+
+    assert ran == []  # the rejected coroutine body never executed
+    assert not any("never awaited" in str(w.message) for w in caught)
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught)
+    assert inner.loop is None  # rejection created no fallback loop
     outer.close()
     inner.close()
 

@@ -38,7 +38,28 @@ class AsyncRuntime:
         return self._loop
 
     def run(self, coro: Any) -> Any:
-        """Drive *coro* to completion on the owned loop and return its result."""
+        """Drive *coro* to completion on the owned loop and return its result.
+
+        Nested use — a loop already running on this thread — is rejected
+        *before* anything is scheduled, and the supplied coroutine is closed
+        so the rejection does not strand it un-awaited (``RuntimeWarning:
+        coroutine ... was never awaited``). Callers inside async code must
+        ``await`` instead of using this bridge.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            # Close the coroutine before raising: run_until_complete() would
+            # otherwise wrap it in a task and only then reject, leaking it.
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            raise RuntimeError(
+                "AsyncRuntime.run() cannot be called while an event loop is "
+                "already running on this thread; await the coroutine instead"
+            )
         if self._loop is None:
             self._loop = asyncio.new_event_loop()
         return self._loop.run_until_complete(coro)

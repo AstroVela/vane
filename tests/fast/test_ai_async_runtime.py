@@ -134,6 +134,95 @@ class PicklableEmbedDescriptor:
         return PicklableEmbedder()
 
 
+class SyncEmbedder:
+    """Synchronous embedder: no loop-bound state, no ``aclose``."""
+
+    def embed_text(self, texts: list[str]) -> list[list[float]]:
+        return [[float(len(t))] * 2 for t in texts]
+
+
+class CountingSyncEmbedDescriptor:
+    def __init__(self) -> None:
+        self.instantiations = 0
+
+    def instantiate(self) -> SyncEmbedder:
+        self.instantiations += 1
+        return SyncEmbedder()
+
+
+class AsyncNoAcloseEmbedder:
+    """Async (loop-bound) embedder that does not expose ``aclose`` — the
+    protocol permits this, and it must still be dropped at close (issue #139)."""
+
+    async def embed_text(self, texts: list[str]) -> list[list[float]]:
+        return [[float(len(t))] * 2 for t in texts]
+
+
+class CountingAsyncEmbedDescriptor:
+    def __init__(self) -> None:
+        self.instantiations = 0
+
+    def instantiate(self) -> AsyncNoAcloseEmbedder:
+        self.instantiations += 1
+        return AsyncNoAcloseEmbedder()
+
+
+class AwaitableReturningEmbedder:
+    """A plain ``def embed_text`` that RETURNS an awaitable, no ``aclose`` —
+    static inspection cannot classify it, only observing the awaitable can."""
+
+    def embed_text(self, texts: list[str]):
+        async def _run() -> list[list[float]]:
+            return [[float(len(t))] * 2 for t in texts]
+
+        return _run()
+
+
+class CountingAwaitableEmbedDescriptor:
+    def __init__(self) -> None:
+        self.instantiations = 0
+
+    def instantiate(self) -> AwaitableReturningEmbedder:
+        self.instantiations += 1
+        return AwaitableReturningEmbedder()
+
+
+class AsyncNoAclosePrompter:
+    """Async (loop-bound) prompter that does not expose ``aclose``."""
+
+    async def prompt(self, messages: tuple) -> str:
+        return f"echo:{messages[0]}"
+
+
+class CountingAsyncPromptDescriptor:
+    def __init__(self) -> None:
+        self.instantiations = 0
+
+    def instantiate(self) -> AsyncNoAclosePrompter:
+        self.instantiations += 1
+        return AsyncNoAclosePrompter()
+
+
+class AwaitableReturningPrompter:
+    """A plain ``def prompt`` that RETURNS an awaitable, no ``aclose`` —
+    static inspection cannot classify it, only observing the awaitable can."""
+
+    def prompt(self, messages: tuple):
+        async def _run() -> str:
+            return f"echo:{messages[0]}"
+
+        return _run()
+
+
+class CountingAwaitablePromptDescriptor:
+    def __init__(self) -> None:
+        self.instantiations = 0
+
+    def instantiate(self) -> AwaitableReturningPrompter:
+        self.instantiations += 1
+        return AwaitableReturningPrompter()
+
+
 class LoopRecordingPrompter:
     """Async prompter recording the running loop for each call."""
 
@@ -338,25 +427,17 @@ def test_close_before_first_batch_is_a_noop(runtime) -> None:
     assert descriptor.instantiations == 0
 
 
-def test_close_retains_providers_without_aclose(runtime) -> None:
-    """Sync providers (no loop-bound state) survive close: task backends
-    close the executor per invocation while the callable cache keeps the
-    wrapper, and dropping the provider would reload the model per task."""
-
-    class CountingSyncEmbedDescriptor:
-        def __init__(self) -> None:
-            self.instantiations = 0
-
-        def instantiate(self) -> PicklableEmbedder:
-            self.instantiations += 1
-            return PicklableEmbedder()
-
+def test_close_retains_sync_provider(runtime) -> None:
+    """A proven-synchronous embedder (sync ``embed_text``, no ``aclose``) holds
+    no loop-bound state and survives close: task backends close the executor
+    per invocation while the callable cache keeps the wrapper, so dropping it
+    would reload the model per task."""
     descriptor = CountingSyncEmbedDescriptor()
     wrapper = _EmbedTextBatch(descriptor, "text", "emb")
     wrapper.bind_async_runtime(runtime.run)
     wrapper(pa.table({"text": ["a"]}))
 
-    wrapper.close()  # no aclose — provider stays cached, must not raise
+    wrapper.close()  # sync provider stays cached, must not raise
 
     fresh = _Runtime()
     try:
@@ -365,6 +446,86 @@ def test_close_retains_providers_without_aclose(runtime) -> None:
     finally:
         fresh.close()
     assert descriptor.instantiations == 1
+
+
+def test_close_drops_async_embedder_without_aclose(runtime) -> None:
+    """The maintainer's #139 reproduction: an async embedder without ``aclose``
+    is loop-bound, so it is dropped at close and re-instantiated on the next
+    (fresh-loop) batch rather than reused across loops."""
+    descriptor = CountingAsyncEmbedDescriptor()
+    wrapper = _EmbedTextBatch(descriptor, "text", "emb")
+    wrapper.bind_async_runtime(runtime.run)
+    wrapper(pa.table({"text": ["a"]}))
+
+    wrapper.close()
+
+    fresh = _Runtime()
+    try:
+        wrapper.bind_async_runtime(fresh.run)
+        wrapper(pa.table({"text": ["ab"]}))
+    finally:
+        fresh.close()
+    assert descriptor.instantiations == 2
+
+
+def test_close_drops_async_prompter_without_aclose(runtime) -> None:
+    """``Prompter.prompt`` is async by protocol: a prompter without ``aclose``
+    is still loop-bound and dropped at close, then re-instantiated."""
+    descriptor = CountingAsyncPromptDescriptor()
+    wrapper = _PromptBatch(descriptor, "text", "response")
+    wrapper.bind_async_runtime(runtime.run)
+    wrapper(pa.table({"text": ["a"]}))
+
+    wrapper.close()
+
+    fresh = _Runtime()
+    try:
+        wrapper.bind_async_runtime(fresh.run)
+        wrapper(pa.table({"text": ["ab"]}))
+    finally:
+        fresh.close()
+    assert descriptor.instantiations == 2
+
+
+def test_close_drops_embedder_after_observed_awaitable(runtime) -> None:
+    """A plain ``def embed_text`` that returns an awaitable is not a coroutine
+    function, so static inspection cannot classify it; observing the awaitable
+    at runtime still marks it loop-bound, so it is dropped at close."""
+    descriptor = CountingAwaitableEmbedDescriptor()
+    wrapper = _EmbedTextBatch(descriptor, "text", "emb")
+    wrapper.bind_async_runtime(runtime.run)
+    wrapper(pa.table({"text": ["a"]}))  # observes the awaitable → marks loop-bound
+
+    wrapper.close()
+
+    fresh = _Runtime()
+    try:
+        wrapper.bind_async_runtime(fresh.run)
+        wrapper(pa.table({"text": ["ab"]}))
+    finally:
+        fresh.close()
+    assert descriptor.instantiations == 2
+
+
+def test_close_drops_prompter_after_observed_awaitable(runtime) -> None:
+    """The per-row prompt path (no ``prompt_batch``) also reports observed
+    awaitables: a plain ``def prompt`` returning an awaitable is marked
+    loop-bound and dropped at close."""
+    descriptor = CountingAwaitablePromptDescriptor()
+    wrapper = _PromptBatch(descriptor, "text", "response")
+    wrapper.bind_async_runtime(runtime.run)
+    result = wrapper(pa.table({"text": ["a"]}))  # observes the awaitable
+    assert result.column("response").to_pylist() == ["echo:a"]
+
+    wrapper.close()
+
+    fresh = _Runtime()
+    try:
+        wrapper.bind_async_runtime(fresh.run)
+        wrapper(pa.table({"text": ["ab"]}))
+    finally:
+        fresh.close()
+    assert descriptor.instantiations == 2
 
 
 # ---------------------------------------------------------------------------

@@ -89,6 +89,37 @@ def _missing_async_runtime() -> _MissingAsyncRuntimeError:
     )
 
 
+def _provider_is_loop_bound(provider: Any, method_name: str) -> bool:
+    """Whether a cached provider statically shows event-loop-bound state that
+    must be released before its loop is torn down.
+
+    Positive signals:
+
+    * the provider exposes ``aclose`` (a client that must be awaited shut) —
+      a *sufficient* signal, never a necessary one;
+    * the driven method (``embed_text`` / ``prompt``) is a coroutine function
+      — the protocol-sanctioned way to own a loop-bound async client
+      (``AsyncOpenAI`` / ``AsyncAnthropic`` / ``genai.Client``).
+
+    The strongest signal — an awaitable actually observed from the driven
+    method at runtime — is delivered separately: the wrappers pass their
+    ``_mark_loop_bound`` callback as ``on_awaitable`` to the retry helpers, so
+    even a plain ``def`` that returns an awaitable (which static inspection
+    cannot classify) upgrades to loop-bound the moment it runs.
+
+    A missing ``aclose()`` is never taken as proof of synchronicity: the public
+    ``TextEmbedder`` / ``Prompter`` protocols permit an async provider that does
+    not expose it, and treating such a provider as synchronous strands its
+    loop-bound client across event loops (issue #139). Genuinely synchronous
+    providers (e.g. the Transformers embedder) match no signal and stay cached
+    across per-task executors so their model is not reloaded.
+    """
+    if getattr(provider, "aclose", None) is not None:
+        return True
+    method = getattr(provider, method_name, None)
+    return method is not None and inspect.iscoroutinefunction(inspect.unwrap(method))
+
+
 # ---------------------------------------------------------------------------
 # Retry / on_error helpers
 # ---------------------------------------------------------------------------
@@ -117,6 +148,7 @@ def _retry_call(
     on_error: _OnError = "raise",
     default: Any = None,
     run_async: Any = None,
+    on_awaitable: Any = None,
     **kwargs: Any,
 ) -> Any:
     """Call *fn* with exponential-backoff retry and on_error handling.
@@ -130,12 +162,18 @@ def _retry_call(
         run_async: Callable used to drive awaitable results. Batch wrappers
             pass their executor-bound runtime so cached SDK clients see one
             loop across batches; required when *fn* returns an awaitable.
+        on_awaitable: Optional zero-arg callback invoked the first time *fn*
+            returns an awaitable — lets a wrapper learn its provider is
+            loop-bound even when static inspection cannot tell (a plain
+            ``def`` that returns an awaitable), so ``close()`` releases it.
     """
     last_exc: Exception | None = None
     for attempt in range(1 + max(0, max_retries)):
         try:
             result = fn(*args, **kwargs)
             if inspect.isawaitable(result):
+                if on_awaitable is not None:
+                    on_awaitable()
                 if run_async is None:
                     result.close()
                     raise _missing_async_runtime()
@@ -170,13 +208,23 @@ async def _retry_call_async(
     max_retries: int = 3,
     on_error: _OnError = "raise",
     default: Any = None,
+    on_awaitable: Any = None,
     **kwargs: Any,
 ) -> Any:
-    """Async variant of :func:`_retry_call`."""
+    """Async variant of :func:`_retry_call`.
+
+    ``on_awaitable`` mirrors :func:`_retry_call`: invoked when *fn* returns an
+    awaitable, so a wrapper learns its provider is loop-bound even when the
+    method is a plain ``def`` returning an awaitable (which
+    ``iscoroutinefunction`` cannot classify).
+    """
     last_exc: Exception | None = None
     for attempt in range(1 + max(0, max_retries)):
         try:
-            return await fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
+            if on_awaitable is not None and inspect.isawaitable(result):
+                on_awaitable()
+            return await result
         except Exception as exc:
             last_exc = exc
             if attempt < max_retries:
@@ -436,6 +484,7 @@ class _EmbedTextBatch:
         self._arrow_type = arrow_type
         self._embedder = None  # lazy: instantiate on first __call__
         self._run_async: Any = None  # executor-bound capability
+        self._embedder_loop_bound = False  # set once the embedder is known loop-bound
 
     def bind_async_runtime(self, run_async: Any) -> None:
         """Receive the executor-owned async driver (see UDFExecutor)."""
@@ -445,6 +494,9 @@ class _EmbedTextBatch:
         if self._run_async is None:
             raise _missing_async_runtime()
         return self._run_async
+
+    def _mark_loop_bound(self) -> None:
+        self._embedder_loop_bound = True
 
     def _ensure_embedder(self) -> Any:
         if self._embedder is None:
@@ -456,30 +508,39 @@ class _EmbedTextBatch:
                 return self._descriptor.instantiate()
 
             self._embedder = run_async(_instantiate())
+            if _provider_is_loop_bound(self._embedder, "embed_text"):
+                self._embedder_loop_bound = True
         return self._embedder
 
     def close(self) -> None:
-        """Release a loop-owned provider client on the bound loop. Idempotent.
+        """Release a loop-bound embedder on the bound loop. Idempotent.
 
-        Providers without ``aclose`` (transformers, vLLM) hold no loop-bound
-        state and stay cached: task backends close the executor after every
-        invocation while the process-local callable cache keeps the wrapper,
-        so dropping them would reload the model on each task.
+        ``TextEmbedder.embed_text`` may be sync or async. A loop-bound embedder
+        — a coroutine ``embed_text``, an observed awaitable result, or an
+        ``aclose()`` hook — is dropped so the next batch re-instantiates on the
+        fresh loop (issue #139); a missing ``aclose()`` is never treated as
+        proof of synchronicity. A proven-synchronous embedder (e.g. the
+        Transformers embedder) holds no loop-bound state and stays cached:
+        task backends close the executor after every invocation while the
+        process-local callable cache keeps the wrapper, so dropping it would
+        reload the model on each task.
         """
         embedder = self._embedder
         if embedder is None or self._run_async is None:
             return
-        aclose = getattr(embedder, "aclose", None)
-        if aclose is None:
+        if not self._embedder_loop_bound:
             return
         self._embedder = None
-        self._run_async(aclose())
+        aclose = getattr(embedder, "aclose", None)
+        if aclose is not None:
+            self._run_async(aclose())
 
     def __getstate__(self) -> dict[str, Any]:
         # The cached client and the bound runtime capability are process-local.
         state = self.__dict__.copy()
         state["_embedder"] = None
         state["_run_async"] = None
+        state["_embedder_loop_bound"] = False  # recomputed on next _ensure_embedder()
         return state
 
     def _zero_fill(self, count: int) -> list[Any]:
@@ -503,6 +564,7 @@ class _EmbedTextBatch:
                 max_retries=self._max_retries,
                 on_error=self._on_error,
                 run_async=self._require_run_async(),
+                on_awaitable=self._mark_loop_bound,
             )
             if result is None:
                 result = self._zero_fill(len(texts))
@@ -538,6 +600,7 @@ class _EmbedTextBatch:
         # Embed all chunks in one batch
         chunk_embeddings = self._ensure_embedder().embed_text(all_chunks)
         if inspect.isawaitable(chunk_embeddings):
+            self._mark_loop_bound()
             chunk_embeddings = self._require_run_async()(chunk_embeddings)
 
         # Reassemble: weighted average for multi-chunk texts
@@ -630,6 +693,7 @@ class _PromptBatch:
         self._on_error: _OnError = on_error
         self._prompter = None  # lazy: instantiate on first __call__
         self._run_async: Any = None  # executor-bound capability
+        self._prompter_loop_bound = False  # set once the prompter is known loop-bound
 
     def bind_async_runtime(self, run_async: Any) -> None:
         """Receive the executor-owned async driver (see UDFExecutor)."""
@@ -639,6 +703,9 @@ class _PromptBatch:
         if self._run_async is None:
             raise _missing_async_runtime()
         return self._run_async
+
+    def _mark_loop_bound(self) -> None:
+        self._prompter_loop_bound = True
 
     def _ensure_prompter(self) -> Any:
         if self._prompter is None:
@@ -650,30 +717,38 @@ class _PromptBatch:
                 return self._descriptor.instantiate()
 
             self._prompter = run_async(_instantiate())
+            if _provider_is_loop_bound(self._prompter, "prompt"):
+                self._prompter_loop_bound = True
         return self._prompter
 
     def close(self) -> None:
-        """Release a loop-owned provider client on the bound loop. Idempotent.
+        """Release a loop-bound prompter on the bound loop. Idempotent.
 
-        Providers without ``aclose`` (transformers, vLLM) hold no loop-bound
-        state and stay cached: task backends close the executor after every
-        invocation while the process-local callable cache keeps the wrapper,
-        so dropping them would reload the model on each task.
+        ``Prompter.prompt`` is ``async`` by protocol, so a conforming prompter
+        owns loop-bound state (its async SDK client) and is dropped on close so
+        the next batch re-instantiates on the fresh loop (issue #139),
+        ``aclose()`` being awaited when the client exposes it; a missing
+        ``aclose()`` is never treated as proof of synchronicity. A provider
+        that proves synchronous (no coroutine ``prompt``, no observed
+        awaitable, no ``aclose``) stays cached so per-task executors do not
+        reload it. (vLLM prompting is planner-only and is never cached here.)
         """
         prompter = self._prompter
         if prompter is None or self._run_async is None:
             return
-        aclose = getattr(prompter, "aclose", None)
-        if aclose is None:
+        if not self._prompter_loop_bound:
             return
         self._prompter = None
-        self._run_async(aclose())
+        aclose = getattr(prompter, "aclose", None)
+        if aclose is not None:
+            self._run_async(aclose())
 
     def __getstate__(self) -> dict[str, Any]:
         # The cached client and the bound runtime capability are process-local.
         state = self.__dict__.copy()
         state["_prompter"] = None
         state["_run_async"] = None
+        state["_prompter_loop_bound"] = False  # recomputed on next _ensure_prompter()
         return state
 
     def _serialize_result(self, result: Any) -> str | None:
@@ -739,6 +814,7 @@ class _PromptBatch:
                 max_retries=self._max_retries,
                 on_error=self._on_error,
                 run_async=self._require_run_async(),
+                on_awaitable=self._mark_loop_bound,
             )
             if text_results is None:
                 text_results = [None] * len(text_indices)
@@ -761,6 +837,7 @@ class _PromptBatch:
                             row_messages[idx],
                             max_retries=max_retries,
                             on_error=on_error,
+                            on_awaitable=self._mark_loop_bound,
                         )
                         return self._serialize_result(result) if self._return_format else result
 
@@ -772,6 +849,7 @@ class _PromptBatch:
                     row_messages[idx],
                     max_retries=max_retries,
                     on_error=on_error,
+                    on_awaitable=self._mark_loop_bound,
                 )
                 return self._serialize_result(result) if self._return_format else result
 
