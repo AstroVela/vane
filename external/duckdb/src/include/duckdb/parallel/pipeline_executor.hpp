@@ -145,10 +145,19 @@ private:
 	//! source_chunk should be sent through the pipeline
 	bool next_batch_blocked = false;
 
+	enum class OperatorFlushState : uint8_t {
+		//! The current operator's FinalExecute callback should be invoked
+		NEEDS_FINALIZE,
+		//! The current output must be drained before invoking FinalExecute again
+		DRAINING_MORE_OUTPUT,
+		//! The current output must be drained before advancing to the next operator
+		DRAINING_FINAL_OUTPUT
+	};
+
 	//! Current operator being flushed
 	idx_t flushing_idx;
-	//! Whether the current flushing_idx should be flushed: this needs to be stored to make flushing code re-entrant
-	bool should_flush_current_idx = true;
+	//! Persist the current operator's finalization result while downstream operators drain its output
+	OperatorFlushState operator_flush_state = OperatorFlushState::NEEDS_FINALIZE;
 	//! Whether this executor should route source/operator/sink calls through ExecutionBatch callbacks
 	bool use_execution_batches = false;
 

@@ -172,46 +172,53 @@ bool PipelineExecutor::TryFlushCachingOperators(ExecutionBudget &chunk_budget) {
 			continue;
 		}
 
-		// This slightly awkward way of increasing the flushing idx is to make the code re-entrant: We need to call this
-		// method again in the case of a Sink returning BLOCKED.
-		if (!should_flush_current_idx && in_process_operators.empty()) {
-			should_flush_current_idx = true;
+		// Resolve the persisted FinalExecute result only after downstream operators (and any blocked sink retry)
+		// have drained the current output.
+		if (in_process_operators.empty()) {
+			switch (operator_flush_state) {
+			case OperatorFlushState::NEEDS_FINALIZE:
+				break;
+			case OperatorFlushState::DRAINING_MORE_OUTPUT:
+				operator_flush_state = OperatorFlushState::NEEDS_FINALIZE;
+				break;
+			case OperatorFlushState::DRAINING_FINAL_OUTPUT:
+				operator_flush_state = OperatorFlushState::NEEDS_FINALIZE;
+				flushing_idx++;
+				continue;
+			}
 		}
 
 		auto &curr_chunk =
 		    flushing_idx + 1 >= intermediate_chunks.size() ? final_chunk : *intermediate_chunks[flushing_idx + 1];
 		auto &current_operator = pipeline.operators[flushing_idx].get();
 
-		OperatorFinalizeResultType finalize_result;
-
 		if (in_process_operators.empty()) {
+			D_ASSERT(operator_flush_state == OperatorFlushState::NEEDS_FINALIZE);
 			curr_chunk.Reset();
 			if (&curr_chunk == &final_chunk) {
 				sink_input_counted = false;
 			}
 			StartOperator(current_operator);
-			finalize_result = current_operator.FinalExecute(context, curr_chunk, *current_operator.op_state,
-			                                                *intermediate_states[flushing_idx]);
+			auto finalize_result = current_operator.FinalExecute(context, curr_chunk, *current_operator.op_state,
+			                                                     *intermediate_states[flushing_idx]);
 			EndOperator(current_operator, &curr_chunk, current_operator.op_state.get(),
 			            intermediate_states[flushing_idx].get());
-			if (finalize_result == OperatorFinalizeResultType::BLOCKED) {
+			switch (finalize_result) {
+			case OperatorFinalizeResultType::HAVE_MORE_OUTPUT:
+				operator_flush_state = OperatorFlushState::DRAINING_MORE_OUTPUT;
+				break;
+			case OperatorFinalizeResultType::FINISHED:
+				operator_flush_state = OperatorFlushState::DRAINING_FINAL_OUTPUT;
+				break;
+			case OperatorFinalizeResultType::BLOCKED:
 				D_ASSERT(curr_chunk.size() == 0);
-				should_flush_current_idx = true;
 				blocked_on_finalize = true;
 				return false;
 			}
-		} else {
-			// Reset flag and reflush the last chunk we were flushing.
-			finalize_result = OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
 		}
 
+		D_ASSERT(operator_flush_state != OperatorFlushState::NEEDS_FINALIZE);
 		auto push_result = ExecutePushInternal(curr_chunk, chunk_budget, flushing_idx + 1);
-
-		if (finalize_result == OperatorFinalizeResultType::HAVE_MORE_OUTPUT) {
-			should_flush_current_idx = true;
-		} else {
-			should_flush_current_idx = false;
-		}
 
 		switch (push_result) {
 		case OperatorResultType::BLOCKED: {
@@ -227,10 +234,6 @@ bool PipelineExecutor::TryFlushCachingOperators(ExecutionBudget &chunk_budget) {
 			return false;
 		}
 		case OperatorResultType::NEED_MORE_INPUT:
-			if (!should_flush_current_idx) {
-				// FinalExecute returned FINISHED for this operator — advance past it
-				flushing_idx++;
-			}
 			continue;
 		case OperatorResultType::FINISHED:
 			break;
@@ -256,43 +259,53 @@ bool PipelineExecutor::TryFlushCachingOperatorsBatch(ExecutionBudget &chunk_budg
 			continue;
 		}
 
-		if (!should_flush_current_idx && in_process_operators.empty()) {
-			should_flush_current_idx = true;
+		// Resolve the persisted FinalExecute result only after downstream operators (and any blocked sink retry)
+		// have drained the current output.
+		if (in_process_operators.empty()) {
+			switch (operator_flush_state) {
+			case OperatorFlushState::NEEDS_FINALIZE:
+				break;
+			case OperatorFlushState::DRAINING_MORE_OUTPUT:
+				operator_flush_state = OperatorFlushState::NEEDS_FINALIZE;
+				break;
+			case OperatorFlushState::DRAINING_FINAL_OUTPUT:
+				operator_flush_state = OperatorFlushState::NEEDS_FINALIZE;
+				flushing_idx++;
+				continue;
+			}
 		}
 
 		auto &curr_batch =
 		    flushing_idx + 1 >= intermediate_batches.size() ? final_batch : *intermediate_batches[flushing_idx + 1];
 		auto &current_operator = pipeline.operators[flushing_idx].get();
 
-		OperatorFinalizeResultType finalize_result;
-
 		if (in_process_operators.empty()) {
+			D_ASSERT(operator_flush_state == OperatorFlushState::NEEDS_FINALIZE);
 			curr_batch = ExecutionBatch();
 			if (&curr_batch == &final_batch) {
 				sink_input_counted = false;
 			}
 			StartOperator(current_operator);
-			finalize_result = current_operator.FinalExecuteBatch(context, curr_batch, *current_operator.op_state,
-			                                                     *intermediate_states[flushing_idx]);
+			auto finalize_result = current_operator.FinalExecuteBatch(context, curr_batch, *current_operator.op_state,
+			                                                          *intermediate_states[flushing_idx]);
 			EndOperator(current_operator, ExecutionBatchMaterializedChunk(curr_batch), current_operator.op_state.get(),
 			            intermediate_states[flushing_idx].get());
-			if (finalize_result == OperatorFinalizeResultType::BLOCKED) {
+			switch (finalize_result) {
+			case OperatorFinalizeResultType::HAVE_MORE_OUTPUT:
+				operator_flush_state = OperatorFlushState::DRAINING_MORE_OUTPUT;
+				break;
+			case OperatorFinalizeResultType::FINISHED:
+				operator_flush_state = OperatorFlushState::DRAINING_FINAL_OUTPUT;
+				break;
+			case OperatorFinalizeResultType::BLOCKED:
 				D_ASSERT(ExecutionBatchSize(curr_batch) == 0);
-				should_flush_current_idx = true;
 				blocked_on_finalize = true;
 				return false;
 			}
-		} else {
-			finalize_result = OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
 		}
 
+		D_ASSERT(operator_flush_state != OperatorFlushState::NEEDS_FINALIZE);
 		auto push_result = ExecutePushInternalBatch(curr_batch, chunk_budget, flushing_idx + 1);
-
-		if (finalize_result == OperatorFinalizeResultType::HAVE_MORE_OUTPUT) {
-			should_flush_current_idx = true;
-		} else {
-			should_flush_current_idx = false;
-		}
 
 		switch (push_result) {
 		case OperatorResultType::BLOCKED: {
@@ -306,9 +319,6 @@ bool PipelineExecutor::TryFlushCachingOperatorsBatch(ExecutionBudget &chunk_budg
 			return false;
 		}
 		case OperatorResultType::NEED_MORE_INPUT:
-			if (!should_flush_current_idx) {
-				flushing_idx++;
-			}
 			continue;
 		case OperatorResultType::FINISHED:
 			break;

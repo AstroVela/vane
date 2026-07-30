@@ -479,6 +479,27 @@ TEST_CASE("Test TryFlushCachingOperators interrupted ExecutePushInternal", "[api
 	}
 }
 
+TEST_CASE("Test completed FinalExecute output is not finalized again", "[api]") {
+	DuckDB db;
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("SET scheduler_process_partial = true"));
+	REQUIRE_NO_FAIL(con.Query("PRAGMA threads=1"));
+	// The streaming LEAD emits its delayed row together with FINISHED. UNNEST depletes the execution budget while
+	// pushing that row downstream, forcing the flush state machine to resume before the output is fully drained.
+	auto result = con.Query(R"(
+		SELECT count(*), sum(x)
+		FROM (
+			SELECT unnest(range(200000)) AS u, x
+			FROM (SELECT lead(i, 1, 7) OVER () AS x FROM range(1) t(i))
+			LIMIT 200001
+		)
+	)");
+	REQUIRE(!result->HasError());
+	REQUIRE(CHECK_COLUMN(result, 0, {Value::BIGINT(200000)}));
+	REQUIRE(CHECK_COLUMN(result, 1, {Value::BIGINT(1400000)}));
+}
+
 TEST_CASE("Test streaming query during stack unwinding", "[api]") {
 	DuckDB db;
 	Connection con(db);
