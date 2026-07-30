@@ -9,10 +9,12 @@
 namespace duckdb {
 namespace distributed {
 
+class ExchangeManager;
+
 class ReservoirSampleNode : public PipelineNodeImpl, public std::enable_shared_from_this<ReservoirSampleNode> {
 public:
 	ReservoirSampleNode(NodeID node_id, PipelineNodeRef child, unique_ptr<SampleOptions> options,
-	                    std::vector<LogicalType> output_types);
+	                    std::vector<LogicalType> output_types, std::shared_ptr<ExchangeManager> exchange_mgr);
 
 	std::string name() const override {
 		return "ReservoirSample";
@@ -37,6 +39,7 @@ private:
 	PipelineNodeRef child_;
 	unique_ptr<SampleOptions> options_;
 	std::vector<LogicalType> output_types_;
+	std::shared_ptr<ExchangeManager> exchange_mgr_;
 };
 
 class StreamingSampleNode : public PipelineNodeImpl, public std::enable_shared_from_this<StreamingSampleNode> {

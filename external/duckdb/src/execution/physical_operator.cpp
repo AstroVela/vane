@@ -29,6 +29,7 @@
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/operator/projection/physical_unnest.hpp"
+#include "duckdb/execution/operator/helper/physical_distributed_reservoir_sample.hpp"
 #include "duckdb/execution/operator/helper/physical_reservoir_sample.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_sample.hpp"
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
@@ -813,6 +814,13 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto options = deserializer.ReadProperty<unique_ptr<SampleOptions>>(103, "sample_options");
 		return make_uniq<PhysicalReservoirSample>(physical_plan, std::move(types), std::move(options),
 		                                          estimated_cardinality);
+	}
+	case PhysicalOperatorType::DISTRIBUTED_RESERVOIR_SAMPLE: {
+		auto options = deserializer.ReadProperty<unique_ptr<SampleOptions>>(103, "sample_options");
+		auto stage = static_cast<DistributedReservoirSampleStage>(deserializer.ReadProperty<uint8_t>(104, "stage"));
+		auto task_index = deserializer.ReadProperty<idx_t>(105, "task_index");
+		return make_uniq<PhysicalDistributedReservoirSample>(physical_plan, std::move(types), std::move(options), stage,
+		                                                     task_index, estimated_cardinality);
 	}
 	case PhysicalOperatorType::STREAMING_SAMPLE: {
 		auto options = deserializer.ReadProperty<unique_ptr<SampleOptions>>(103, "sample_options");

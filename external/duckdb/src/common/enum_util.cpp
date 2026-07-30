@@ -3816,7 +3816,9 @@ const StringUtil::EnumStringLiteral *GetPhysicalOperatorTypeValues() {
 		{ static_cast<uint32_t>(PhysicalOperatorType::REPARTITION), "REPARTITION" },
 		{ static_cast<uint32_t>(PhysicalOperatorType::LOCAL_EXCHANGE), "LOCAL_EXCHANGE" },
 		{ static_cast<uint32_t>(PhysicalOperatorType::STREAMING_UDF), "STREAMING_UDF" },
-		{ static_cast<uint32_t>(PhysicalOperatorType::GROUPING_SET_EXPAND), "GROUPING_SET_EXPAND" }
+		{ static_cast<uint32_t>(PhysicalOperatorType::GROUPING_SET_EXPAND), "GROUPING_SET_EXPAND" },
+		{ static_cast<uint32_t>(PhysicalOperatorType::DISTRIBUTED_RESERVOIR_SAMPLE),
+		  "DISTRIBUTED_RESERVOIR_SAMPLE" }
 	};
 	return values;
 }

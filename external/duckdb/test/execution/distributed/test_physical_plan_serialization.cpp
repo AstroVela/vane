@@ -22,6 +22,7 @@
 #include "duckdb/execution/operator/helper/physical_limit.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_limit.hpp"
 #include "duckdb/execution/operator/helper/physical_limit_percent.hpp"
+#include "duckdb/execution/operator/helper/physical_distributed_reservoir_sample.hpp"
 #include "duckdb/execution/operator/order/physical_order.hpp"
 #include "duckdb/execution/operator/order/physical_top_n.hpp"
 #include "duckdb/execution/operator/exchange/physical_remote_exchange_sink.hpp"
@@ -42,6 +43,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/constants.hpp"
+#include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -51,9 +53,12 @@
 #include "duckdb/common/enums/order_type.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/allocator.hpp"
+#include "duckdb/execution/reservoir_sample.hpp"
 
+#include <algorithm>
 #include <memory>
 #include <iostream>
+#include <unordered_set>
 
 using namespace duckdb;
 
@@ -230,6 +235,39 @@ string SerializeSourceDescriptorWithoutFlightHost() {
 	serializer.WriteProperty<bool>(5, "replicated", false);
 	serializer.End();
 	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
+}
+
+void AddReservoirRows(ReservoirSample &sample, Allocator &allocator, idx_t begin, idx_t end) {
+	DataChunk chunk;
+	chunk.Initialize(allocator, {LogicalType::BIGINT, LogicalType::VARCHAR});
+	for (idx_t offset = begin; offset < end;) {
+		chunk.Reset();
+		const auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, end - offset);
+		for (idx_t row_idx = 0; row_idx < count; row_idx++) {
+			const auto value = offset + row_idx;
+			chunk.SetValue(0, row_idx, Value::BIGINT(NumericCast<int64_t>(value)));
+			chunk.SetValue(1, row_idx, Value("value-" + std::to_string(value)));
+		}
+		chunk.SetCardinality(count);
+		sample.AddToReservoir(chunk);
+		offset += count;
+	}
+}
+
+unique_ptr<BlockingSample> RoundTripReservoirState(ReservoirSample &sample) {
+	sample.PrepareForMerge();
+	MemoryStream stream(Allocator::DefaultAllocator());
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	sample.Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Begin();
+	auto result = BlockingSample::Deserialize(deserializer);
+	deserializer.End();
+	return result;
 }
 
 } // namespace
@@ -465,6 +503,103 @@ TEST_CASE("PhysicalStreamingLimit serialization roundtrip", "[serialization][phy
 	REQUIRE(limit_ptr->parallel);
 
 	std::cerr << "[test] PhysicalStreamingLimit serialization roundtrip PASSED" << std::endl;
+}
+
+TEST_CASE("PhysicalDistributedReservoirSample serialization roundtrip",
+          "[serialization][physical_plan][reservoir_sample]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+
+	auto options = make_uniq<SampleOptions>(42);
+	options->sample_size = Value::BIGINT(17);
+	options->is_percentage = false;
+	options->method = SampleMethod::RESERVOIR_SAMPLE;
+	options->repeatable = true;
+	vector<LogicalType> types = {LogicalType::UBIGINT, LogicalType::BLOB};
+	auto &sample = plan.Make<PhysicalDistributedReservoirSample>(types, std::move(options),
+	                                                             DistributedReservoirSampleStage::LOCAL, 3, 1);
+
+	MemoryStream stream(allocator);
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	sample.Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Begin();
+	auto deserialized_op = PhysicalOperator::Deserialize(deserializer, plan);
+	deserializer.End();
+
+	REQUIRE(deserialized_op != nullptr);
+	auto *sample_ptr = dynamic_cast<PhysicalDistributedReservoirSample *>(deserialized_op.get());
+	REQUIRE(sample_ptr != nullptr);
+	REQUIRE(sample_ptr->stage == DistributedReservoirSampleStage::LOCAL);
+	REQUIRE(sample_ptr->task_index == 3);
+	REQUIRE(sample_ptr->options->sample_size.GetValue<int64_t>() == 17);
+	REQUIRE(sample_ptr->options->GetSeed() == 42);
+	REQUIRE(sample_ptr->options->repeatable);
+}
+
+TEST_CASE("ReservoirSample states merge arbitrary row counts and preserve strings",
+          "[serialization][physical_plan][reservoir_sample]") {
+	Allocator allocator;
+	constexpr idx_t sample_count = 2500;
+	const vector<idx_t> partition_boundaries {0, 13, 3213, 10213};
+	vector<unique_ptr<BlockingSample>> states;
+	vector<pair<double, int64_t>> weighted_candidates;
+
+	for (idx_t partition_idx = 0; partition_idx + 1 < partition_boundaries.size(); partition_idx++) {
+		ReservoirSample local(allocator, sample_count, NumericCast<int64_t>(101 + partition_idx));
+		AddReservoirRows(local, allocator, partition_boundaries[partition_idx],
+		                 partition_boundaries[partition_idx + 1]);
+		auto state = RoundTripReservoirState(local);
+		auto &reservoir = state->Cast<ReservoirSample>();
+		auto weights = reservoir.base_reservoir_sample->reservoir_weights;
+		while (!weights.empty()) {
+			const auto entry = weights.top();
+			weights.pop();
+			const auto value = reservoir.Chunk().GetValue(0, entry.second).GetValue<int64_t>();
+			weighted_candidates.emplace_back(-entry.first, value);
+		}
+		states.push_back(std::move(state));
+	}
+
+	std::sort(weighted_candidates.begin(), weighted_candidates.end(),
+	          [](const pair<double, int64_t> &left, const pair<double, int64_t> &right) {
+		          if (left.first != right.first) {
+			          return left.first > right.first;
+		          }
+		          return left.second < right.second;
+	          });
+	std::unordered_set<int64_t> expected;
+	for (idx_t candidate_idx = 0; candidate_idx < sample_count; candidate_idx++) {
+		expected.insert(weighted_candidates[candidate_idx].second);
+	}
+	REQUIRE(expected.size() == sample_count);
+
+	ReservoirSample merged(allocator, sample_count, 999);
+	for (auto &state : states) {
+		merged.Merge(std::move(state));
+	}
+	REQUIRE(merged.GetTuplesSeen() == partition_boundaries.back());
+
+	std::unordered_set<int64_t> selected;
+	idx_t output_count = 0;
+	while (true) {
+		auto chunk = merged.GetChunk();
+		if (!chunk) {
+			break;
+		}
+		for (idx_t row_idx = 0; row_idx < chunk->size(); row_idx++) {
+			const auto value = chunk->GetValue(0, row_idx).GetValue<int64_t>();
+			REQUIRE(StringValue::Get(chunk->GetValue(1, row_idx)) == "value-" + std::to_string(value));
+			REQUIRE(selected.insert(value).second);
+			output_count++;
+		}
+	}
+	REQUIRE(output_count == sample_count);
+	REQUIRE(selected == expected);
 }
 
 TEST_CASE("PhysicalLimitPercent serialization roundtrip", "[serialization][physical_plan]") {
@@ -1454,6 +1589,15 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	                                                      "diagnostic-stage", 4, RepartitionSpec::Type::Random,
 	                                                      vector<unique_ptr<Expression>> {}, plan_handle, exchange_mgr);
 	auto &sink = sink_op.Cast<PhysicalRemoteExchangeSink>();
+	auto sample_options = make_uniq<SampleOptions>(42);
+	sample_options->sample_size = Value::BIGINT(17);
+	sample_options->is_percentage = false;
+	sample_options->method = SampleMethod::RESERVOIR_SAMPLE;
+	auto &local_sample = plan.Make<PhysicalDistributedReservoirSample>(
+	                             vector<LogicalType> {LogicalType::UBIGINT, LogicalType::BLOB},
+	                             std::move(sample_options), DistributedReservoirSampleStage::LOCAL, 3, 1)
+	                         .Cast<PhysicalDistributedReservoirSample>();
+	sink.children.push_back(local_sample);
 	plan.SetRoot(sink);
 
 	distributed::ExchangeSinkInstanceTaskDescriptor descriptor;
@@ -1467,6 +1611,7 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
 	REQUIRE(error.find("query") != string::npos);
 	REQUIRE(sink.SinkHandle().attempt_id == 0);
+	REQUIRE(local_sample.task_index == 3);
 
 	error.clear();
 	invalid = descriptor;
@@ -1483,6 +1628,8 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	REQUIRE(error.empty());
 	REQUIRE(sink.SinkHandle().sink_handle.task_partition_id == 8);
 	REQUIRE(sink.SinkHandle().output_location == "opaque-exchange__sink_8__attempt_2");
+	REQUIRE(local_sample.task_index == 8);
+	REQUIRE(local_sample.options->GetSeed() == 42);
 
 	error.clear();
 	invalid = descriptor;

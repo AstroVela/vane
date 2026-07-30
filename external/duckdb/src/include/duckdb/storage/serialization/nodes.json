@@ -183,6 +183,12 @@
         "name": "seed",
         "type": "int64_t",
         "serialize_property": "GetSeed()"
+      },
+      {
+        "id": 104,
+        "name": "repeatable",
+        "type": "bool",
+        "default": "false"
       }
     ],
     "constructor": ["seed"]
@@ -262,9 +268,15 @@
         "id": 201,
         "name": "reservoir_chunk",
         "type": "unique_ptr<ReservoirChunk>"
+      },
+      {
+        "id": 202,
+        "name": "stats_sample",
+        "type": "bool",
+        "default": "true"
       }
     ],
-    "constructor": ["sample_count", "reservoir_chunk"]
+    "constructor": ["sample_count", "reservoir_chunk", "stats_sample"]
   },
   {
     "class": "ReservoirSamplePercentage",

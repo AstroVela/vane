@@ -91,7 +91,7 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 	}
 	vector<LogicalType> output_types = op.GetTypes();
 	return std::make_shared<ReservoirSampleNode>(get_next_pipeline_node_id(), child_impl, std::move(options),
-	                                             std::move(output_types));
+	                                             std::move(output_types), exchange_mgr_);
 }
 
 std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateStreamingSample(

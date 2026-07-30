@@ -18,6 +18,7 @@
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
 #include "duckdb/execution/operator/helper/physical_limit.hpp"
 #include "duckdb/execution/operator/helper/physical_limit_percent.hpp"
+#include "duckdb/execution/operator/helper/physical_reservoir_sample.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_limit.hpp"
 #include "duckdb/execution/operator/order/physical_order.hpp"
 #include "duckdb/execution/operator/order/physical_top_n.hpp"
@@ -57,6 +58,7 @@
 #include "duckdb/execution/distributed/pipeline_node/grouping_set_expand.hpp"
 #include "duckdb/execution/distributed/pipeline_node/limit.hpp"
 #include "duckdb/execution/distributed/pipeline_node/projection.hpp"
+#include "duckdb/execution/distributed/pipeline_node/sample.hpp"
 #include "duckdb/execution/distributed/pipeline_node/scan_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/expression_scan.hpp"
 #include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
@@ -1160,6 +1162,32 @@ TEST_CASE("PhysicalPlanTranslator: limit percent -> LimitPercentNode", "[distrib
 	REQUIRE(res.value() != nullptr);
 	auto inner = res.value()->inner();
 	REQUIRE(std::dynamic_pointer_cast<duckdb::distributed::LimitPercentNode>(inner) != nullptr);
+}
+
+TEST_CASE("PhysicalPlanTranslator: fixed-row reservoir sample becomes globally single-partition",
+          "[distributed][reservoir_sample]") {
+	auto plan = MakeUnaryScanPlan();
+	auto repartition_spec = RepartitionSpec::create_random(4);
+	auto &repartition = plan.plan->Make<PhysicalRepartition>(plan.types, std::move(repartition_spec), 0);
+	repartition.children.push_back(*plan.scan);
+
+	auto options = make_uniq<SampleOptions>(42);
+	options->sample_size = Value::BIGINT(2);
+	options->is_percentage = false;
+	options->method = SampleMethod::RESERVOIR_SAMPLE;
+	options->repeatable = true;
+	auto &sample = plan.plan->Make<PhysicalReservoirSample>(plan.types, std::move(options), 2);
+	sample.children.push_back(repartition);
+	plan.plan->SetRoot(sample);
+
+	auto res = physical_plan_to_pipeline_node(PlanConfig {}, plan.plan);
+	REQUIRE(res.is_ok());
+	auto sample_node = std::dynamic_pointer_cast<ReservoirSampleNode>(res.value()->inner());
+	REQUIRE(sample_node != nullptr);
+	REQUIRE(sample_node->config().clustering_spec()->num_partitions() == 1);
+	auto children = sample_node->children();
+	REQUIRE(children.size() == 1);
+	REQUIRE(children[0]->config().clustering_spec()->num_partitions() == 4);
 }
 
 TEST_CASE("PhysicalPlanTranslator: order by -> OrderByNode", "[distributed]") {

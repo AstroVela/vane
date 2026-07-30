@@ -21,7 +21,7 @@ bool ChildHasMultiplePartitions(const PipelineNodeRef &child);
 SubmittableTaskStream<WorkerTask> ProduceWithMaterializedCoordinator(
     PlanExecutionContext &plan_context, const PipelineNodeRef &child, const std::shared_ptr<PipelineNodeImpl> &node,
     MaterializedPlanBuilder final_plan_builder, PerTaskMaterializedPlanBuilderFactory per_task_builder_factory = {},
-    std::shared_ptr<ExchangeManager> exchange_mgr = nullptr);
+    std::shared_ptr<ExchangeManager> exchange_mgr = nullptr, SchemaRef materialized_schema = nullptr);
 
 } // namespace distributed
 } // namespace duckdb

@@ -15,6 +15,7 @@
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/execution/operator/exchange/physical_remote_exchange_sink.hpp"
+#include "duckdb/execution/operator/helper/physical_distributed_reservoir_sample.hpp"
 #include "duckdb/execution/physical_plan.hpp"
 
 namespace duckdb {
@@ -101,6 +102,24 @@ bool ApplyExchangeSinkInstanceToOperator(PhysicalOperator &op, const ExchangeSin
 	return true;
 }
 
+bool ApplyRuntimeTaskIndexToOperator(PhysicalOperator &op, idx_t task_partition_id, std::string *error) {
+	if (op.type == PhysicalOperatorType::DISTRIBUTED_RESERVOIR_SAMPLE) {
+		auto *sample = dynamic_cast<PhysicalDistributedReservoirSample *>(&op);
+		if (!sample) {
+			return SetValidationError(error, "DISTRIBUTED_RESERVOIR_SAMPLE operator has an unexpected implementation");
+		}
+		if (sample->stage == DistributedReservoirSampleStage::LOCAL) {
+			sample->ApplyRuntimeTaskIndex(task_partition_id);
+		}
+	}
+	for (auto &child : op.children) {
+		if (!ApplyRuntimeTaskIndexToOperator(child.get(), task_partition_id, error)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 } // namespace
 
 void ExchangeSinkInstanceTaskDescriptor::Serialize(Serializer &serializer) const {
@@ -161,10 +180,16 @@ bool ApplyExchangeSinkInstanceToPlan(duckdb::PhysicalPlan &plan, const ExchangeS
 	if (!ApplyExchangeSinkInstanceToOperator(plan.Root(), task, error, applied)) {
 		return false;
 	}
-	if (applied == 0 && error) {
-		*error = "no remote exchange sink found in plan";
+	if (applied == 0) {
+		if (error) {
+			*error = "no remote exchange sink found in plan";
+		}
+		return false;
 	}
-	return applied > 0;
+	if (!ApplyRuntimeTaskIndexToOperator(plan.Root(), task.sink_instance.sink_handle.task_partition_id, error)) {
+		return false;
+	}
+	return true;
 }
 
 } // namespace distributed
