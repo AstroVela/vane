@@ -33,6 +33,155 @@ def _make_test_physical_plan(con=None):
     ).to_physical_plan(con)
 
 
+def test_flight_shuffle_cleanup_is_idempotent_after_snapshot_retirement():
+    query_id = f"query-cleanup-{uuid.uuid4()}"
+    snapshot_query_id = f"query-snapshot-{uuid.uuid4()}"
+    con = duckdb.connect()
+    cleanup_cursor = con.cursor()
+    plan = _make_test_physical_plan(con)
+    duckdb.ray_cxx._register_query_python_replay_state(snapshot_query_id, plan)
+    assert duckdb.ray_cxx._lookup_query_connection_snapshot(snapshot_query_id) is not None
+    duckdb.ray_cxx._cleanup_query_python_replay_state(snapshot_query_id)
+    assert duckdb.ray_cxx._lookup_query_connection_snapshot(snapshot_query_id) is None
+
+    try:
+        result = duckdb.ray_cxx.cleanup_flight_shuffle_for_query(
+            query_id,
+            cleanup_cursor,
+            snapshot_query_id,
+        )
+        assert result == {
+            "registry_entries_removed": 0,
+            "storage_entries_removed": 0,
+            "cleanup_errors": 0,
+            "cleanup_storage_required": 0,
+            "cleanup_pending": 0,
+            "active_executions": 0,
+            "last_error": "",
+        }
+    finally:
+        duckdb.ray_cxx.retire_flight_shuffle_query(query_id)
+        cleanup_cursor.close()
+        con.close()
+
+
+@pytest.mark.parametrize(
+    ("apply_snapshot_s3_credentials", "expected_credential_prefix"),
+    [
+        (False, "fresh"),
+        (True, "stale"),
+    ],
+)
+def test_flight_shuffle_cleanup_snapshot_s3_credential_precedence(
+    apply_snapshot_s3_credentials,
+    expected_credential_prefix,
+):
+    query_id = f"query-cleanup-{uuid.uuid4()}"
+    snapshot_query_id = f"query-snapshot-{uuid.uuid4()}"
+    source_con = duckdb.connect()
+    source_con.execute("LOAD httpfs")
+    source_con.execute("SET s3_access_key_id='stale-key'")
+    source_con.execute("SET s3_secret_access_key='stale-secret'")
+    source_con.execute("SET s3_session_token='stale-token'")
+    source_con.execute("SET http_retries=7")
+    plan = _make_test_physical_plan(source_con)
+    duckdb.ray_cxx._register_query_python_replay_state(snapshot_query_id, plan)
+
+    cleanup_con = duckdb.connect()
+    cleanup_cursor = cleanup_con.cursor()
+    cleanup_cursor.execute("LOAD httpfs")
+    cleanup_cursor.execute("SET s3_access_key_id='fresh-key'")
+    cleanup_cursor.execute("SET s3_secret_access_key='fresh-secret'")
+    cleanup_cursor.execute("SET s3_session_token='fresh-token'")
+    cleanup_cursor.execute("SET http_retries=3")
+
+    try:
+        duckdb.ray_cxx.cleanup_flight_shuffle_for_query(
+            query_id,
+            cleanup_cursor,
+            snapshot_query_id,
+            apply_snapshot_s3_credentials,
+        )
+
+        assert (
+            cleanup_cursor.execute("SELECT current_setting('s3_access_key_id')").fetchone()[0]
+            == f"{expected_credential_prefix}-key"
+        )
+        assert (
+            cleanup_cursor.execute("SELECT current_setting('s3_secret_access_key')").fetchone()[0]
+            == f"{expected_credential_prefix}-secret"
+        )
+        assert (
+            cleanup_cursor.execute("SELECT current_setting('s3_session_token')").fetchone()[0]
+            == f"{expected_credential_prefix}-token"
+        )
+        assert cleanup_cursor.execute("SELECT current_setting('http_retries')").fetchone()[0] == 7
+    finally:
+        duckdb.ray_cxx.retire_flight_shuffle_query(query_id)
+        duckdb.ray_cxx._cleanup_query_python_replay_state(snapshot_query_id)
+        cleanup_cursor.close()
+        cleanup_con.close()
+        source_con.close()
+
+
+def test_flight_shuffle_cleanup_resolves_bootstrap_storage_config():
+    snapshot_query_id = f"query-snapshot-{uuid.uuid4()}"
+    source_con = duckdb.connect(
+        config={
+            "s3_endpoint": "bootstrap.example.test",
+            "s3_region": "bootstrap-region",
+            "s3_access_key_id": "bootstrap-key",
+            "s3_secret_access_key": "bootstrap-secret",
+            "s3_session_token": "bootstrap-token",
+        }
+    )
+    plan = _make_test_physical_plan(source_con)
+    snapshot = plan.__getstate__()[6]
+    snapshot_setting_names = {setting["name"].lower() for setting in snapshot["settings"]}
+    assert snapshot_setting_names.isdisjoint(
+        {
+            "s3_endpoint",
+            "s3_region",
+            "s3_access_key_id",
+            "s3_secret_access_key",
+            "s3_session_token",
+        }
+    )
+    assert snapshot["bootstrap"]["config"]["s3_endpoint"] == "bootstrap.example.test"
+    duckdb.ray_cxx._register_query_python_replay_state(snapshot_query_id, plan)
+
+    cleanup_con = duckdb.connect()
+    cleanup_cursor = cleanup_con.cursor()
+    cleanup_cursor.execute("LOAD httpfs")
+    cleanup_cursor.execute("SET s3_endpoint='fallback.example.test'")
+
+    try:
+        settings = duckdb.ray_cxx._resolve_flight_shuffle_cleanup_connection_for_test(
+            cleanup_cursor,
+            snapshot_query_id,
+            {
+                "AWS_ACCESS_KEY_ID": "fresh-key",
+                "AWS_SECRET_ACCESS_KEY": "fresh-secret",
+                "AWS_SESSION_TOKEN": "fresh-token",
+            },
+            False,
+        )
+
+        assert settings == {
+            "s3_endpoint": "bootstrap.example.test",
+            "s3_region": "bootstrap-region",
+            "s3_access_key_id": "fresh-key",
+            "s3_secret_access_key": "fresh-secret",
+            "s3_session_token": "fresh-token",
+            "reused_input": False,
+        }
+    finally:
+        duckdb.ray_cxx._cleanup_query_python_replay_state(snapshot_query_id)
+        cleanup_cursor.close()
+        cleanup_con.close()
+        source_con.close()
+
+
 def test_execute_native_keeps_result_collector_query_local():
     con = duckdb.connect()
     cursor = con.cursor()

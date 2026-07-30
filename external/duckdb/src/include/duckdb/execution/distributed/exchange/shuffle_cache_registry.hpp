@@ -3,12 +3,13 @@
 
 /**
  * @file shuffle_cache_registry.hpp
- * @brief Process-local catalog of published ShuffleCache instances.
+ * @brief Process-local catalog of published shuffle attempts.
  *
- * Sinks publish committed attempts after FlushAll. Sources and the Flight
- * service borrow catalog entries by opaque exchange-attempt ID. Query close
- * fences late publishers and keeps cleanup work visible until all readers and
- * native executions have drained.
+ * Local-disk entries retain their ShuffleCache so the Flight service can
+ * borrow it. Object-storage entries retain only an immutable cleanup
+ * descriptor; teardown must supply storage backed by a live cleanup context.
+ * Query close fences late publishers and keeps cleanup work visible until all
+ * readers and native executions have drained.
  */
 
 #pragma once
@@ -30,7 +31,8 @@ namespace distributed {
 class ShuffleCacheRegistry {
 private:
 	struct CacheLeaseState {
-		explicit CacheLeaseState(std::shared_ptr<ShuffleCache> cache_p) : cache(std::move(cache_p)) {
+		CacheLeaseState(const std::shared_ptr<ShuffleCache> &cache_p, bool retain_cache)
+		    : config(cache_p->config()), cache_identity(cache_p), retained_cache(retain_cache ? cache_p : nullptr) {
 		}
 
 		void AcquireWriter() {
@@ -64,12 +66,20 @@ private:
 			cleanup_requested = true;
 		}
 
-		DuckDBResult<idx_t> CleanupIfReady() {
+		DuckDBResult<idx_t> CleanupIfReady(const std::shared_ptr<ShuffleStorage> &cleanup_storage) {
 			std::lock_guard<std::mutex> lock(cleanup_mutex);
 			if (!cleanup_requested || cleanup_complete || active_writers > 0 || active_readers > 0) {
 				return DuckDBResult<idx_t>::ok(0);
 			}
-			auto result = cache->RemoveAttemptStorage();
+			DuckDBResult<idx_t> result;
+			if (retained_cache) {
+				result = retained_cache->RemoveAttemptStorage();
+			} else if (cleanup_storage) {
+				result = RemoveShuffleAttemptStorage(config, *cleanup_storage);
+			} else {
+				result = DuckDBResult<idx_t>::err(DuckDBError::invalid_state_error(
+				    "shuffle cleanup requires a live filesystem context for " + config.shuffle_stage_id));
+			}
 			if (result.is_ok()) {
 				cleanup_complete = true;
 			}
@@ -81,7 +91,13 @@ private:
 			return cleanup_complete;
 		}
 
-		std::shared_ptr<ShuffleCache> cache;
+		bool RequiresCleanupStorage() const {
+			return !retained_cache;
+		}
+
+		ShuffleCacheConfig config;
+		std::weak_ptr<ShuffleCache> cache_identity;
+		std::shared_ptr<ShuffleCache> retained_cache;
 
 	private:
 		mutable std::mutex cleanup_mutex;
@@ -137,10 +153,18 @@ private:
 	using RegistryMap = std::unordered_map<std::string, Entry>;
 
 public:
+	enum class CacheRetention : uint8_t {
+		//! Keep the cache available to process-local Flight readers and cleanup.
+		RETAIN,
+		//! Keep only path metadata; cleanup must reconstruct context-bound storage.
+		DESCRIPTOR_ONLY,
+	};
+
 	struct CleanupResult {
 		idx_t registry_entries_removed = 0;
 		idx_t storage_entries_removed = 0;
 		idx_t cleanup_errors = 0;
+		idx_t cleanup_storage_required = 0;
 		idx_t cleanup_pending = 0;
 		idx_t active_executions = 0;
 		std::string last_error;
@@ -213,9 +237,10 @@ public:
 
 	/// Track a sink attempt before it can write any storage. The returned lease
 	/// prevents query cleanup from deleting files while the sink is still writing.
+	/// DESCRIPTOR_ONLY avoids retaining context-bound storage beyond the task.
 	DuckDBResult<WriteLease> TrackPending(const std::string &exchange_id, std::shared_ptr<ShuffleCache> cache,
 	                                      const std::string &query_id, std::string server_epoch = std::string(),
-	                                      idx_t attempt_id = 0) {
+	                                      idx_t attempt_id = 0, CacheRetention retention = CacheRetention::RETAIN) {
 		if (exchange_id.empty() || query_id.empty() || !cache) {
 			return DuckDBResult<WriteLease>::err(
 			    DuckDBError::value_error("pending shuffle cache requires an exchange id, query id, and cache"));
@@ -225,7 +250,7 @@ public:
 			    "pending shuffle cache exchange id does not match its storage descriptor: " + exchange_id));
 		}
 
-		auto state = std::make_shared<CacheLeaseState>(std::move(cache));
+		auto state = std::make_shared<CacheLeaseState>(cache, retention == CacheRetention::RETAIN);
 		WriteLease writer_lease = std::make_shared<CacheWriteLease>(state);
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
@@ -280,7 +305,7 @@ public:
 			    "shuffle cache exchange id does not match its storage descriptor: " + exchange_id));
 		}
 
-		auto state = std::make_shared<CacheLeaseState>(std::move(cache));
+		auto state = std::make_shared<CacheLeaseState>(cache, true);
 		bool query_closing = false;
 		bool owns_cleanup = false;
 		{
@@ -291,7 +316,7 @@ public:
 				auto existing = registry_.find(exchange_id);
 				if (existing != registry_.end()) {
 					if (!existing->second.published ||
-					    !DescriptorsMatch(existing->second, state->cache, query_id, server_epoch, attempt_id)) {
+					    !DescriptorsMatch(existing->second, cache, query_id, server_epoch, attempt_id)) {
 						return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
 						    "conflicting shuffle cache registration for exchange " + exchange_id));
 					}
@@ -322,7 +347,7 @@ public:
 			    DuckDBError::invalid_state_error("query closed before shuffle cache publication: " + query_id));
 		}
 		state->RequestCleanup();
-		auto cleanup_result = state->CleanupIfReady();
+		auto cleanup_result = state->CleanupIfReady(nullptr);
 		RemoveCompletedDeferred();
 		if (cleanup_result.is_err()) {
 			return DuckDBResult<void>::err(cleanup_result.error());
@@ -346,12 +371,12 @@ public:
 	                                                    const std::string &node_id, idx_t attempt_id) const {
 		std::lock_guard<std::mutex> lock(mutex_);
 		auto it = registry_.find(exchange_id);
-		if (it == registry_.end() || !it->second.published || !it->second.state || !it->second.state->cache) {
+		if (it == registry_.end() || !it->second.published || !it->second.state || !it->second.state->retained_cache) {
 			return DuckDBResult<std::shared_ptr<ShuffleCache>>::err(
 			    DuckDBError::invalid_state_error("flight exchange attempt is not published: " + exchange_id));
 		}
 		const auto &entry = it->second;
-		const auto &config = entry.state->cache->config();
+		const auto &config = entry.state->config;
 		if (entry.server_epoch != server_epoch) {
 			return DuckDBResult<std::shared_ptr<ShuffleCache>>::err(
 			    DuckDBError::invalid_state_error("flight ticket server epoch is stale"));
@@ -396,8 +421,10 @@ public:
 		}
 	}
 
-	/// Retry all cleanup owned by one exact query.
-	CleanupResult RemoveAndCleanupByQuery(const std::string &query_id) {
+	/// Retry all cleanup owned by one exact query. cleanup_storage is borrowed
+	/// for this call only and is never retained by the registry.
+	CleanupResult RemoveAndCleanupByQuery(const std::string &query_id,
+	                                      std::shared_ptr<ShuffleStorage> cleanup_storage = nullptr) {
 		if (query_id.empty()) {
 			return {};
 		}
@@ -408,7 +435,8 @@ public:
 			result.last_error = close_result.error().what();
 			return result;
 		}
-		auto result = CleanupMatching([&](const Entry &entry) { return entry.query_id == query_id; }, &query_id);
+		auto result =
+		    CleanupMatching([&](const Entry &entry) { return entry.query_id == query_id; }, &query_id, cleanup_storage);
 		result.registry_entries_removed += close_result.value();
 		return result;
 	}
@@ -483,29 +511,32 @@ public:
 			return {};
 		}
 		return CleanupMatching([&](const Entry &entry) { return entry.exchange_id.rfind(exchange_id_prefix, 0) == 0; },
-		                       nullptr);
+		                       nullptr, nullptr);
 	}
 
 private:
 	ShuffleCacheRegistry() = default;
 
 	static std::shared_ptr<ShuffleCache> Borrow(const std::shared_ptr<CacheLeaseState> &state) {
-		if (!state || !state->cache || !state->TryAcquireReader()) {
+		if (!state || !state->retained_cache || !state->TryAcquireReader()) {
 			return nullptr;
 		}
 		auto lease = std::make_shared<CacheBorrowLease>(state);
-		return std::shared_ptr<ShuffleCache>(lease, state->cache.get());
+		return std::shared_ptr<ShuffleCache>(lease, state->retained_cache.get());
 	}
 
 	static bool DescriptorsMatch(const Entry &left, const std::shared_ptr<ShuffleCache> &right_cache,
 	                             const std::string &right_query_id, const std::string &right_server_epoch,
 	                             idx_t right_attempt_id) {
-		if (!left.state || !left.state->cache || !right_cache || left.state->cache.get() != right_cache.get() ||
-		    left.query_id != right_query_id || left.server_epoch != right_server_epoch ||
+		if (!left.state || !right_cache || left.query_id != right_query_id || left.server_epoch != right_server_epoch ||
 		    left.attempt_id != right_attempt_id) {
 			return false;
 		}
-		const auto &left_config = left.state->cache->config();
+		auto left_cache = left.state->cache_identity.lock();
+		if (!left_cache || left_cache.get() != right_cache.get()) {
+			return false;
+		}
+		const auto &left_config = left.state->config;
 		const auto &right_config = right_cache->config();
 		return left_config.shuffle_stage_id == right_config.shuffle_stage_id &&
 		       left_config.node_id == right_config.node_id &&
@@ -514,7 +545,8 @@ private:
 	}
 
 	template <class MATCH>
-	CleanupResult CleanupMatching(MATCH &&matches, const std::string *query_id) {
+	CleanupResult CleanupMatching(MATCH &&matches, const std::string *query_id,
+	                              const std::shared_ptr<ShuffleStorage> &cleanup_storage) {
 		CleanupResult result;
 		std::vector<std::shared_ptr<CacheLeaseState>> candidates;
 		bool query_has_active_executions = false;
@@ -547,9 +579,12 @@ private:
 		if (!query_has_active_executions) {
 			for (const auto &state : candidates) {
 				state->RequestCleanup();
-				auto cleanup_result = state->CleanupIfReady();
+				auto cleanup_result = state->CleanupIfReady(cleanup_storage);
 				if (cleanup_result.is_err()) {
 					result.cleanup_errors++;
+					if (!cleanup_storage && state->RequiresCleanupStorage()) {
+						result.cleanup_storage_required++;
+					}
 					result.last_error = cleanup_result.error().what();
 					continue;
 				}

@@ -840,7 +840,7 @@ def test_real_ray_host_loss_replays_all_owned_full_query_outputs(monkeypatch, tm
                 break
             time.sleep(0.05)
         else:
-            raise AssertionError("host-loss native scans did not enter blocked RUNNING state")
+            raise AssertionError(f"host-loss native scans did not enter blocked RUNNING state: {infos!r}")
 
         actor1 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(2, 0, 1 << 30, 1 << 60)
         handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-host-b")

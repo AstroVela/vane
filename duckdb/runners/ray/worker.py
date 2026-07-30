@@ -62,6 +62,20 @@ _DUCKDB_S3_SESSION_KEYS = (
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
 )
+_CONNECTION_SNAPSHOT_S3_CREDENTIAL_SETTINGS = frozenset(
+    {
+        "s3_access_key_id",
+        "s3_secret_access_key",
+        "s3_session_token",
+    }
+)
+_CONNECTION_SNAPSHOT_SECURITY_SETTINGS = frozenset(
+    {
+        "allow_unsigned_extensions",
+        "autoinstall_known_extensions",
+        "autoload_known_extensions",
+    }
+)
 
 
 async def _to_thread_with_owned_side_effects(
@@ -164,6 +178,78 @@ def _plan_resource_query_id(plan: Any) -> str:
     return query_id
 
 
+class CleanupConnectionSnapshotIdentity(NamedTuple):
+    """Connection state that determines the cleanup filesystem."""
+
+    bootstrap_database: str
+    bootstrap_read_only: bool
+    bootstrap_config: tuple[tuple[str, str], ...]
+    settings: tuple[tuple[str, str, str], ...]
+
+
+def _query_cleanup_connection_identity(
+    connection_snapshot_query_id: str,
+    *,
+    apply_snapshot_s3_credentials: bool,
+) -> CleanupConnectionSnapshotIdentity:
+    """Return the bootstrap and settings that cleanup replay will apply."""
+    lookup = require_ray_cxx_attr(
+        "_lookup_query_connection_snapshot",
+        hint="Ensure the C++ ray extension is built with query replay lifecycle support.",
+    )
+    snapshot = lookup(str(connection_snapshot_query_id))
+    if snapshot is None:
+        raise RuntimeError(
+            "query connection snapshot is unavailable during cleanup context registration: "
+            f"{connection_snapshot_query_id}"
+        )
+    if not isinstance(snapshot, Mapping):
+        raise TypeError("query connection snapshot must be a mapping")
+
+    bootstrap_database = ":memory:"
+    bootstrap_read_only = False
+    bootstrap_config: tuple[tuple[str, str], ...] = ()
+    raw_bootstrap = snapshot.get("bootstrap")
+    if isinstance(raw_bootstrap, Mapping):
+        bootstrap_database = str(raw_bootstrap.get("database") or ":memory:")
+        bootstrap_read_only = bool(raw_bootstrap.get("read_only", False))
+        raw_bootstrap_config = raw_bootstrap.get("config")
+        if isinstance(raw_bootstrap_config, Mapping):
+            bootstrap_config = tuple(sorted((str(key), str(value)) for key, value in raw_bootstrap_config.items()))
+
+    raw_settings = snapshot.get("settings", [])
+    if raw_settings is None:
+        raw_settings = []
+    if not isinstance(raw_settings, list):
+        raw_settings = []
+
+    settings: list[tuple[str, str, str]] = []
+    for raw_setting in raw_settings:
+        if not isinstance(raw_setting, Mapping) or "name" not in raw_setting or "value" not in raw_setting:
+            continue
+        name = str(raw_setting["name"])
+        lower_name = name.lower()
+        if (
+            not name
+            or lower_name in _CONNECTION_SNAPSHOT_SECURITY_SETTINGS
+            or (not apply_snapshot_s3_credentials and lower_name in _CONNECTION_SNAPSHOT_S3_CREDENTIAL_SETTINGS)
+        ):
+            continue
+        settings.append(
+            (
+                lower_name,
+                str(raw_setting["value"]),
+                str(raw_setting.get("input_type", "VARCHAR")).upper(),
+            )
+        )
+    return CleanupConnectionSnapshotIdentity(
+        bootstrap_database=bootstrap_database,
+        bootstrap_read_only=bootstrap_read_only,
+        bootstrap_config=bootstrap_config,
+        settings=tuple(settings),
+    )
+
+
 def _cleanup_query_python_replay_state(query_id: str) -> None:
     cleanup = require_ray_cxx_attr(
         "_cleanup_query_python_replay_state",
@@ -172,13 +258,21 @@ def _cleanup_query_python_replay_state(query_id: str) -> None:
     cleanup(str(query_id))
 
 
-def _cleanup_flight_shuffle_for_query(query_id: str) -> dict[str, Any]:
+def _cleanup_flight_shuffle_for_query(
+    query_id: str,
+    cleanup_connection: Any | None = None,
+    connection_snapshot_query_id: str = "",
+    *,
+    apply_snapshot_s3_credentials: bool = True,
+    effective_session_config: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     query_id = str(query_id or "").strip()
     if not query_id:
         return {
             "registry_entries_removed": 0,
             "storage_entries_removed": 0,
             "cleanup_errors": 0,
+            "cleanup_storage_required": 0,
             "cleanup_pending": 0,
             "active_executions": 0,
             "last_error": "",
@@ -187,13 +281,25 @@ def _cleanup_flight_shuffle_for_query(query_id: str) -> dict[str, Any]:
         "cleanup_flight_shuffle_for_query",
         hint="Ensure the C++ ray extension is built with Flight shuffle cleanup support.",
     )
-    raw = cleanup_fn(query_id)
+    if cleanup_connection is None:
+        raw = cleanup_fn(query_id)
+    else:
+        raw = cleanup_fn(
+            query_id,
+            cleanup_connection,
+            str(connection_snapshot_query_id or ""),
+            bool(apply_snapshot_s3_credentials),
+            None
+            if effective_session_config is None
+            else {str(key): str(value) for key, value in effective_session_config.items()},
+        )
     if not isinstance(raw, dict):
         raise TypeError("Flight shuffle cleanup binding must return a dict")
     return {
         "registry_entries_removed": int(raw.get("registry_entries_removed", 0)),
         "storage_entries_removed": int(raw.get("storage_entries_removed", 0)),
         "cleanup_errors": int(raw.get("cleanup_errors", 0)),
+        "cleanup_storage_required": int(raw.get("cleanup_storage_required", 0)),
         "cleanup_pending": int(raw.get("cleanup_pending", 0)),
         "active_executions": int(raw.get("active_executions", 0)),
         "last_error": str(raw.get("last_error", "")),
@@ -252,6 +358,7 @@ async def _drain_flight_shuffle_for_query(
     query_id: str,
     *,
     timeout_s: float | None = None,
+    cleanup_callback: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if timeout_s is None:
         timeout_s = _fte_control_rpc_timeout_s() * 0.8
@@ -259,8 +366,9 @@ async def _drain_flight_shuffle_for_query(
     total_registry_removed = 0
     total_storage_removed = 0
     backoff_s = 0.01
+    cleanup_once = cleanup_callback or _cleanup_flight_shuffle_for_query
     while True:
-        cleanup = await asyncio.to_thread(_cleanup_flight_shuffle_for_query, query_id)
+        cleanup = await asyncio.to_thread(cleanup_once, query_id)
         total_registry_removed += cleanup["registry_entries_removed"]
         total_storage_removed += cleanup["storage_entries_removed"]
         if cleanup["active_executions"] == 0 and cleanup["cleanup_pending"] == 0 and cleanup["cleanup_errors"] == 0:
@@ -642,6 +750,16 @@ class WorkerTaskMetadata(NamedTuple):
     exchange_sink_instance: Any = None
 
 
+class NativeQueryCleanupContext(NamedTuple):
+    """Serializable inputs for rebuilding a query-scoped cleanup cursor."""
+
+    session_id: str
+    session_config: tuple[tuple[str, str], ...]
+    use_session_credentials: bool
+    connection_snapshot_query_id: str
+    connection_snapshot_identity: CleanupConnectionSnapshotIdentity
+
+
 @ray.remote(concurrency_groups={"execute": 128, "control": 512})
 class RayWorkerActor:
     """RayWorkerActor is a ray actor that runs local physical plans on worker.
@@ -725,6 +843,7 @@ class RayWorkerActor:
         self._native_execution_condition = threading.Condition()
         self._native_execution_count = 0
         self._native_execution_counts_by_query: dict[str, int] = {}
+        self._native_query_cleanup_contexts: dict[str, NativeQueryCleanupContext] = {}
         self._active_native_cursors: set[Any] = set()
         self._native_cursor_query_ids: dict[Any, str] = {}
         self._closing_native_queries: set[str] = set()
@@ -1097,7 +1216,14 @@ class RayWorkerActor:
 
     @ray.method(concurrency_group="control")
     async def fte_cleanup_query(self, query_id: str) -> dict[str, int]:
-        flight_shuffle_cleanup = await _drain_flight_shuffle_for_query(query_id)
+        cleanup_with_context = getattr(self, "_cleanup_flight_shuffle_for_query_with_context", None)
+        if callable(cleanup_with_context):
+            flight_shuffle_cleanup = await _drain_flight_shuffle_for_query(
+                query_id,
+                cleanup_callback=cleanup_with_context,
+            )
+        else:
+            flight_shuffle_cleanup = await _drain_flight_shuffle_for_query(query_id)
         _retire_flight_shuffle_query(query_id)
         self._retire_worker_native_query(query_id)
         _cleanup_query_python_replay_state(query_id)
@@ -1320,6 +1446,122 @@ class RayWorkerActor:
                 self._session_s3_configs[session_id] = effective_s3_config
             return effective_s3_config
 
+    def _register_native_query_cleanup_context(
+        self,
+        query_id: str,
+        plan: Any,
+        session_id: str,
+        session_config: Mapping[str, str],
+        *,
+        use_session_credentials: bool,
+    ) -> None:
+        query_key = str(query_id or "").strip()
+        if not query_key:
+            return
+        connection_snapshot_query_id = _plan_resource_query_id(plan)
+        use_session_credentials = bool(use_session_credentials)
+        cleanup_context = NativeQueryCleanupContext(
+            session_id=str(session_id),
+            session_config=tuple(sorted((str(key), str(value)) for key, value in session_config.items())),
+            use_session_credentials=use_session_credentials,
+            connection_snapshot_query_id=connection_snapshot_query_id,
+            connection_snapshot_identity=_query_cleanup_connection_identity(
+                connection_snapshot_query_id,
+                apply_snapshot_s3_credentials=not use_session_credentials,
+            ),
+        )
+        with self._native_execution_condition:
+            contexts = getattr(self, "_native_query_cleanup_contexts", None)
+            if contexts is None:
+                contexts = {}
+                self._native_query_cleanup_contexts = contexts
+            existing = contexts.get(query_key)
+            if existing is not None:
+                # One execution query can contain independently materialized
+                # fragment plans with different replay-registry keys. Their
+                # effective cleanup settings must agree, but retaining the first
+                # live snapshot is sufficient for the query-scoped storage context.
+                if (
+                    existing.session_id != cleanup_context.session_id
+                    or existing.session_config != cleanup_context.session_config
+                    or existing.use_session_credentials != cleanup_context.use_session_credentials
+                    or existing.connection_snapshot_identity != cleanup_context.connection_snapshot_identity
+                ):
+                    raise RuntimeError(f"native query cleanup context changed: {query_key}")
+                return
+            contexts[query_key] = cleanup_context
+
+    def _cleanup_flight_shuffle_for_query_with_context(self, query_id: str) -> dict[str, Any]:
+        query_key = str(query_id or "").strip()
+        with self._native_execution_condition:
+            cleanup_context = getattr(self, "_native_query_cleanup_contexts", {}).get(query_key)
+        if cleanup_context is None:
+            return _cleanup_flight_shuffle_for_query(query_key)
+
+        # Retained local caches need no connection context. Probe first so
+        # unrelated AWS credential failures cannot block local-only teardown.
+        probe = _cleanup_flight_shuffle_for_query(query_key)
+        cleanup_storage_required = int(probe["cleanup_storage_required"])
+        if cleanup_storage_required == 0:
+            return probe
+
+        session_config = dict(cleanup_context.session_config)
+        operation_lock = self._get_session_operation_lock(
+            cleanup_context.session_id,
+            allow_closed=True,
+        )
+        with operation_lock:
+            with self._session_connections_lock:
+                cached_s3_config = dict(
+                    getattr(self, "_session_s3_configs", {}).get(
+                        cleanup_context.session_id,
+                        session_config,
+                    )
+                )
+            effective_s3_config = _refresh_effective_duckdb_s3_config(
+                session_config,
+                cached_s3_config,
+                use_session_credentials=cleanup_context.use_session_credentials,
+            )
+            with self._session_connections_lock:
+                if cleanup_context.session_id in getattr(self, "_session_connections", {}):
+                    self._session_s3_configs[cleanup_context.session_id] = effective_s3_config
+
+        cleanup_cursor = self._get_shared_conn().cursor()
+        try:
+            _configure_duckdb_s3(
+                cleanup_cursor,
+                effective_s3_config,
+                use_session_credentials=cleanup_context.use_session_credentials,
+            )
+            cleanup = _cleanup_flight_shuffle_for_query(
+                query_key,
+                cleanup_cursor,
+                cleanup_context.connection_snapshot_query_id,
+                # Refreshed profile/role credentials must remain newer than
+                # plan-time local settings captured in the snapshot. Explicit
+                # connection credentials still replay when session credentials
+                # are intentionally disabled.
+                apply_snapshot_s3_credentials=not cleanup_context.use_session_credentials,
+                effective_session_config=effective_s3_config,
+            )
+            cleanup["registry_entries_removed"] += probe["registry_entries_removed"]
+            cleanup["storage_entries_removed"] += probe["storage_entries_removed"]
+            # The retry satisfies only the probe errors caused by missing
+            # caller-owned storage; preserve any independent cleanup failures.
+            unresolved_probe_errors = max(0, probe["cleanup_errors"] - cleanup_storage_required)
+            cleanup["cleanup_errors"] += unresolved_probe_errors
+            if unresolved_probe_errors and not cleanup["last_error"]:
+                cleanup["last_error"] = probe["last_error"]
+            return cleanup
+        finally:
+            try:
+                cleanup_cursor.close()
+            except Exception:
+                # The cursor is no longer reachable after this callback. Keep
+                # the storage/configuration error as the retry diagnostic.
+                pass
+
     @ray.method(concurrency_group="control")
     async def close_session(self, session_id: str) -> None:
         session_key = str(session_id).strip()
@@ -1445,6 +1687,7 @@ class RayWorkerActor:
                     f"{query_id} active_executions={active_executions}"
                 )
             self._closing_native_queries.discard(query_id)
+            getattr(self, "_native_query_cleanup_contexts", {}).pop(query_id, None)
 
     def _prepare_worker_runtime_shutdown(self) -> None:
         shutdown_lock = getattr(self, "_shutdown_lock", None)
@@ -1638,6 +1881,13 @@ class RayWorkerActor:
             effective_s3_config = _configure_duckdb_s3(
                 cursor,
                 effective_s3_config,
+                use_session_credentials=use_session_credentials,
+            )
+            self._register_native_query_cleanup_context(
+                native_query_id,
+                plan,
+                session_id,
+                session_config,
                 use_session_credentials=use_session_credentials,
             )
             _ray_worker_memory_log(

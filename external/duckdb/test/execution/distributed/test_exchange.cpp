@@ -520,6 +520,56 @@ TEST_CASE("Exchange: ShuffleCacheRegistry retains and retries failed cleanup", "
 	REQUIRE(registry.RetireQuery(query_id).is_ok());
 }
 
+TEST_CASE("Exchange: object shuffle cleanup reconstructs storage without retaining task cache",
+          "[distributed][exchange]") {
+	auto &registry = ShuffleCacheRegistry::Instance();
+	const std::string query_id = "registry-object-cleanup-context-query";
+	const std::string exchange_id = "registry_object_cleanup_context__sink_0__attempt_0";
+	auto storage_root = TestCreatePath("registry_object_cleanup_context");
+
+	ShuffleCacheConfig config;
+	config.shuffle_stage_id = exchange_id;
+	config.node_id = "node-a";
+	config.num_partitions = 1;
+	config.local_dirs = {"mock://shuffle"};
+	auto task_storage = std::make_shared<MockObjectShuffleStorage>(storage_root);
+	auto cache = std::make_shared<ShuffleCache>(config, task_storage);
+	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
+	REQUIRE(cache->HasCommittedManifest());
+
+	std::weak_ptr<ShuffleStorage> task_storage_lifetime = task_storage;
+	std::weak_ptr<ShuffleCache> task_cache_lifetime = cache;
+	auto lease_result = registry.TrackPending(exchange_id, cache, query_id, "epoch-a", 0,
+	                                          ShuffleCacheRegistry::CacheRetention::DESCRIPTOR_ONLY);
+	REQUIRE(lease_result.is_ok());
+	auto writer_lease = std::move(lease_result.value());
+	REQUIRE(registry.Publish(exchange_id, cache, query_id, "epoch-a", 0).is_ok());
+	REQUIRE(registry.Get(exchange_id) == nullptr);
+	REQUIRE(registry.Resolve(exchange_id, "epoch-a", "node-a", 0).is_err());
+
+	writer_lease.reset();
+	cache.reset();
+	task_storage.reset();
+	REQUIRE(task_cache_lifetime.expired());
+	REQUIRE(task_storage_lifetime.expired());
+
+	auto without_context = registry.RemoveAndCleanupByQuery(query_id);
+	REQUIRE(without_context.cleanup_errors == 1);
+	REQUIRE(without_context.cleanup_storage_required == 1);
+	REQUIRE(without_context.cleanup_pending == 1);
+	REQUIRE(without_context.last_error.find("requires a live filesystem context") != std::string::npos);
+
+	auto cleanup_storage = std::make_shared<MockObjectShuffleStorage>(storage_root);
+	auto with_context = registry.RemoveAndCleanupByQuery(query_id, cleanup_storage);
+	REQUIRE(with_context.cleanup_errors == 0);
+	REQUIRE(with_context.cleanup_storage_required == 0);
+	REQUIRE(with_context.cleanup_pending == 0);
+	REQUIRE(with_context.storage_entries_removed > 0);
+	ShuffleCache cleanup_probe(config, std::move(cleanup_storage));
+	REQUIRE_FALSE(cleanup_probe.HasCommittedManifest());
+	REQUIRE(registry.RetireQuery(query_id).is_ok());
+}
+
 TEST_CASE("Exchange: deferred cleanup retains exclusive attempt identity", "[distributed][exchange]") {
 	auto &registry = ShuffleCacheRegistry::Instance();
 	const std::string exchange_id = "registry_deferred_identity__sink_0__attempt_0";

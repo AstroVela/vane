@@ -64,6 +64,7 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/common/serializer/binary_serializer.hpp>
 #include <duckdb/common/serializer/binary_deserializer.hpp>
 #include <duckdb/main/client_context.hpp>
+#include <duckdb/main/client_data.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/database.hpp>
 #include <duckdb/common/types/data_chunk.hpp>
@@ -153,6 +154,32 @@ public:
 
 	shared_ptr<std::atomic<idx_t>> calls;
 };
+
+static py::object ResolveFlightShuffleCleanupConnection(py::object cleanup_connection,
+                                                        const py::object &connection_snapshot,
+                                                        const py::object &effective_session_config,
+                                                        bool apply_snapshot_s3_credentials) {
+	auto resolved_connection = connection_snapshot.is_none()
+	                               ? cleanup_connection
+	                               : ResolveConnectionForSnapshot(cleanup_connection, connection_snapshot);
+	auto &resolved_wrapper = ExtractPyConnectionWrapper(resolved_connection);
+	if (resolved_wrapper.con.ConnectionIsClosed()) {
+		throw std::runtime_error("resolved shuffle cleanup connection is closed");
+	}
+	ApplyEffectiveVaneSessionConfig(resolved_wrapper.con.GetConnection(), effective_session_config);
+	ApplyConnectionSnapshot(resolved_connection, connection_snapshot, false, true, apply_snapshot_s3_credentials);
+	return resolved_connection;
+}
+
+static string QueryConnectionSettingForTest(DuckDBPyConnection &connection, const string &name) {
+	auto result = ExecuteSnapshotQuery(connection.con.GetConnection(),
+	                                   "SELECT current_setting(" + QuoteSQLStringLiteral(name) + ")");
+	for (auto &row : result->Collection().Rows()) {
+		auto value = row.GetValue(0);
+		return value.IsNull() ? string() : value.ToString();
+	}
+	throw std::runtime_error("connection setting query returned no rows: " + name);
+}
 
 void register_ray_bindings(py::module_ &mod) {
 	auto m = mod.def_submodule("ray_cxx");
@@ -541,30 +568,90 @@ void register_ray_bindings(py::module_ &mod) {
 
 	m.def(
 	    "cleanup_flight_shuffle_for_query",
-	    [](const string &query_id) {
+	    [](const string &query_id, py::object cleanup_connection, const string &connection_snapshot_query_id,
+	       bool apply_snapshot_s3_credentials, py::object effective_session_config) {
 		    py::dict out;
 		    if (query_id.empty()) {
 			    out["registry_entries_removed"] = 0;
 			    out["storage_entries_removed"] = 0;
 			    out["cleanup_errors"] = 0;
+			    out["cleanup_storage_required"] = 0;
 			    out["cleanup_pending"] = 0;
 			    out["active_executions"] = 0;
 			    out["last_error"] = "";
 			    return out;
 		    }
+		    py::object resolved_cleanup_connection = cleanup_connection;
+		    // Keep the resolved DatabaseInstance alive until after storage drops
+		    // its FileSystem and FileOpener references.
+		    std::shared_ptr<duckdb::distributed::ShuffleStorage> cleanup_storage;
+		    if (!cleanup_connection.is_none()) {
+			    auto &conn_wrapper = ExtractPyConnectionWrapper(cleanup_connection);
+			    if (conn_wrapper.con.ConnectionIsClosed()) {
+				    throw std::runtime_error("shuffle cleanup connection is closed");
+			    }
+			    py::object snapshot = py::none();
+			    if (!connection_snapshot_query_id.empty()) {
+				    snapshot = LookupQueryConnectionSnapshot(connection_snapshot_query_id);
+				    if (!snapshot.is_none()) {
+					    resolved_cleanup_connection = ResolveFlightShuffleCleanupConnection(
+					        cleanup_connection, snapshot, effective_session_config, apply_snapshot_s3_credentials);
+				    } else {
+					    ApplyEffectiveVaneSessionConfig(conn_wrapper.con.GetConnection(), effective_session_config);
+				    }
+				    // Concurrent idempotent teardown can retire replay state after
+				    // this cleanup cursor was configured. Continue with its
+				    // sanitized session baseline: remaining storage failures stay
+				    // visible and retryable in the registry.
+			    } else {
+				    ApplyEffectiveVaneSessionConfig(conn_wrapper.con.GetConnection(), effective_session_config);
+			    }
+			    auto &resolved_wrapper = ExtractPyConnectionWrapper(resolved_cleanup_connection);
+			    auto &context = *resolved_wrapper.con.GetConnection().context;
+			    auto &fs = *duckdb::DBConfig::GetConfig(context).file_system;
+			    auto *opener = duckdb::ClientData::Get(context).file_opener.get();
+			    cleanup_storage = duckdb::distributed::MakeDuckDBFileSystemShuffleStorage(fs, opener);
+		    } else if (!connection_snapshot_query_id.empty()) {
+			    throw std::runtime_error("query connection snapshot requires a shuffle cleanup connection");
+		    }
 		    auto cleanup_result = [&]() {
 			    py::gil_scoped_release release;
-			    return duckdb::distributed::ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(query_id);
+			    return duckdb::distributed::ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(query_id,
+			                                                                                         cleanup_storage);
 		    }();
 		    out["registry_entries_removed"] = cleanup_result.registry_entries_removed;
 		    out["storage_entries_removed"] = cleanup_result.storage_entries_removed;
 		    out["cleanup_errors"] = cleanup_result.cleanup_errors;
+		    out["cleanup_storage_required"] = cleanup_result.cleanup_storage_required;
 		    out["cleanup_pending"] = cleanup_result.cleanup_pending;
 		    out["active_executions"] = cleanup_result.active_executions;
 		    out["last_error"] = cleanup_result.last_error;
 		    return out;
 	    },
-	    py::arg("query_id"));
+	    py::arg("query_id"), py::arg("cleanup_connection") = py::none(), py::arg("connection_snapshot_query_id") = "",
+	    py::arg("apply_snapshot_s3_credentials") = true, py::arg("effective_session_config") = py::none());
+
+	m.def(
+	    "_resolve_flight_shuffle_cleanup_connection_for_test",
+	    [](py::object cleanup_connection, const string &connection_snapshot_query_id,
+	       py::object effective_session_config, bool apply_snapshot_s3_credentials) {
+		    auto snapshot = LookupQueryConnectionSnapshot(connection_snapshot_query_id);
+		    if (snapshot.is_none()) {
+			    throw std::runtime_error("query connection snapshot is unavailable");
+		    }
+		    auto resolved_connection = ResolveFlightShuffleCleanupConnection(
+		        cleanup_connection, snapshot, effective_session_config, apply_snapshot_s3_credentials);
+		    auto &resolved_wrapper = ExtractPyConnectionWrapper(resolved_connection);
+		    py::dict settings;
+		    for (const auto &name :
+		         {"s3_endpoint", "s3_region", "s3_access_key_id", "s3_secret_access_key", "s3_session_token"}) {
+			    settings[py::str(name)] = py::str(QueryConnectionSettingForTest(resolved_wrapper, name));
+		    }
+		    settings[py::str("reused_input")] = py::bool_(resolved_connection.ptr() == cleanup_connection.ptr());
+		    return settings;
+	    },
+	    py::arg("cleanup_connection"), py::arg("connection_snapshot_query_id"),
+	    py::arg("effective_session_config") = py::none(), py::arg("apply_snapshot_s3_credentials") = true);
 
 	m.def(
 	    "retire_flight_shuffle_query",
@@ -2834,7 +2921,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    selected_config.num_partitions = 1;
 		    selected_config.local_dirs = {base_uri};
 		    auto &fs = FileSystem::GetFileSystem(context);
-		    auto storage = MakeDuckDBFileSystemShuffleStorage(fs);
+		    auto *opener = ClientData::Get(context).file_opener.get();
+		    auto storage = MakeDuckDBFileSystemShuffleStorage(fs, opener);
 		    ShuffleCache selected_cache(selected_config, storage);
 		    auto selected_cleanup_res = selected_cache.RemoveAttemptStorage();
 		    if (selected_cleanup_res.is_err()) {
@@ -2862,7 +2950,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    out["selected_values_after_loser_cleanup"] = selected_values_after_cleanup;
 		    out["lost_manifest_after_cleanup_error"] = lost_manifest_after_cleanup_error;
 		    out["selected_cleanup_removed"] = selected_cleanup_res.value();
-		    auto cleanup = ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(exchange_context.query_id);
+		    auto cleanup = ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(exchange_context.query_id, storage);
 		    if (cleanup.cleanup_errors != 0 || cleanup.cleanup_pending != 0) {
 			    throw std::runtime_error("failed to clean MinIO selected-attempt test query");
 		    }

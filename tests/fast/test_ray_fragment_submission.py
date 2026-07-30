@@ -2927,11 +2927,556 @@ def test_worker_flight_shuffle_cleanup_helper_uses_cxx_binding(monkeypatch):
         "registry_entries_removed": 2,
         "storage_entries_removed": 7,
         "cleanup_errors": 0,
+        "cleanup_storage_required": 0,
         "cleanup_pending": 0,
         "active_executions": 0,
         "last_error": "",
     }
     assert calls == [("query-drop", "Ensure the C++ ray extension is built with Flight shuffle cleanup support.")]
+
+
+def test_worker_flight_shuffle_cleanup_helper_passes_cleanup_connection_and_snapshot(monkeypatch):
+    calls = []
+    cleanup_connection = object()
+
+    def _fake_require(name, hint=None):
+        assert name == "cleanup_flight_shuffle_for_query"
+
+        def _cleanup(
+            query_id,
+            connection,
+            snapshot_query_id,
+            apply_snapshot_s3_credentials,
+            effective_session_config,
+        ):
+            calls.append(
+                (
+                    query_id,
+                    connection,
+                    snapshot_query_id,
+                    apply_snapshot_s3_credentials,
+                    effective_session_config,
+                    hint,
+                )
+            )
+            return {
+                "registry_entries_removed": 1,
+                "storage_entries_removed": 2,
+                "cleanup_errors": 0,
+                "cleanup_pending": 0,
+                "active_executions": 0,
+                "last_error": "",
+            }
+
+        return _cleanup
+
+    monkeypatch.setattr(worker_mod, "require_ray_cxx_attr", _fake_require)
+
+    result = worker_mod._cleanup_flight_shuffle_for_query(
+        "query-drop",
+        cleanup_connection,
+        "resource-query",
+        apply_snapshot_s3_credentials=False,
+        effective_session_config={"AWS_REGION": "region-a"},
+    )
+
+    assert result["storage_entries_removed"] == 2
+    assert calls == [
+        (
+            "query-drop",
+            cleanup_connection,
+            "resource-query",
+            False,
+            {"AWS_REGION": "region-a"},
+            "Ensure the C++ ray extension is built with Flight shuffle cleanup support.",
+        )
+    ]
+
+
+def test_worker_local_shuffle_cleanup_skips_object_storage_rebuild(monkeypatch):
+    actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    actor._native_execution_condition = threading.Condition()
+    actor._native_query_cleanup_contexts = {
+        "query-drop": worker_mod.NativeQueryCleanupContext(
+            session_id="session-a",
+            session_config=(("AWS_PROFILE", "unavailable-profile"),),
+            use_session_credentials=True,
+            connection_snapshot_query_id="resource-query",
+            connection_snapshot_identity=worker_mod.CleanupConnectionSnapshotIdentity(":memory:", False, (), ()),
+        )
+    }
+    cleanup = {
+        "registry_entries_removed": 1,
+        "storage_entries_removed": 2,
+        "cleanup_errors": 0,
+        "cleanup_storage_required": 0,
+        "cleanup_pending": 0,
+        "active_executions": 0,
+        "last_error": "",
+    }
+    monkeypatch.setattr(
+        worker_mod,
+        "_cleanup_flight_shuffle_for_query",
+        lambda query_id, connection=None, connection_snapshot_query_id="": cleanup,
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_refresh_effective_duckdb_s3_config",
+        lambda *args, **kwargs: pytest.fail("local cleanup must not refresh AWS credentials"),
+    )
+
+    result = actor_class._cleanup_flight_shuffle_for_query_with_context(actor, "query-drop")
+
+    assert result == cleanup
+
+
+def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypatch):
+    actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    actor._native_execution_condition = threading.Condition()
+    actor._session_connections_lock = threading.RLock()
+    actor._session_connections = {"session-a": ({}, object())}
+    actor._session_s3_configs = {
+        "session-a": {
+            "AWS_ACCESS_KEY_ID": "stale-key",
+            "AWS_SECRET_ACCESS_KEY": "stale-secret",
+            worker_mod._AWS_CREDENTIAL_REFRESH_AT_KEY: "0",
+        }
+    }
+    actor._native_query_cleanup_contexts = {
+        "query-drop": worker_mod.NativeQueryCleanupContext(
+            session_id="session-a",
+            session_config=(("AWS_PROFILE", "profile-a"),),
+            use_session_credentials=True,
+            connection_snapshot_query_id="resource-query",
+            connection_snapshot_identity=worker_mod.CleanupConnectionSnapshotIdentity(":memory:", False, (), ()),
+        )
+    }
+    events = []
+
+    class _CleanupCursor:
+        def close(self):
+            events.append(("close",))
+
+    cleanup_cursor = _CleanupCursor()
+    actor._get_shared_conn = lambda: SimpleNamespace(cursor=lambda: cleanup_cursor)
+
+    def refresh(config, cached, *, use_session_credentials):
+        events.append(("refresh", dict(config), dict(cached), use_session_credentials))
+        return {
+            "AWS_ACCESS_KEY_ID": "fresh-key",
+            "AWS_SECRET_ACCESS_KEY": "fresh-secret",
+            worker_mod._AWS_CREDENTIAL_REFRESH_AT_KEY: "9999999999",
+        }
+
+    def configure(connection, config, *, use_session_credentials):
+        events.append(("configure", connection, dict(config), use_session_credentials))
+        return dict(config)
+
+    def cleanup(
+        query_id,
+        connection=None,
+        connection_snapshot_query_id="",
+        *,
+        apply_snapshot_s3_credentials=True,
+        effective_session_config=None,
+    ):
+        if connection is None:
+            events.append(("probe", query_id))
+            return {
+                "registry_entries_removed": 1,
+                "storage_entries_removed": 0,
+                "cleanup_errors": 1,
+                "cleanup_storage_required": 1,
+                "cleanup_pending": 1,
+                "active_executions": 0,
+                "last_error": "shuffle cleanup requires a live filesystem context",
+            }
+        events.append(
+            (
+                "cleanup",
+                query_id,
+                connection,
+                connection_snapshot_query_id,
+                apply_snapshot_s3_credentials,
+                effective_session_config,
+            )
+        )
+        return {
+            "registry_entries_removed": 0,
+            "storage_entries_removed": 2,
+            "cleanup_errors": 0,
+            "cleanup_storage_required": 0,
+            "cleanup_pending": 0,
+            "active_executions": 0,
+            "last_error": "",
+        }
+
+    monkeypatch.setattr(worker_mod, "_refresh_effective_duckdb_s3_config", refresh)
+    monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", configure)
+    monkeypatch.setattr(worker_mod, "_cleanup_flight_shuffle_for_query", cleanup)
+
+    result = actor_class._cleanup_flight_shuffle_for_query_with_context(actor, "query-drop")
+
+    assert result == {
+        "registry_entries_removed": 1,
+        "storage_entries_removed": 2,
+        "cleanup_errors": 0,
+        "cleanup_storage_required": 0,
+        "cleanup_pending": 0,
+        "active_executions": 0,
+        "last_error": "",
+    }
+    assert actor._session_s3_configs["session-a"]["AWS_ACCESS_KEY_ID"] == "fresh-key"
+    assert events == [
+        ("probe", "query-drop"),
+        (
+            "refresh",
+            {"AWS_PROFILE": "profile-a"},
+            {
+                "AWS_ACCESS_KEY_ID": "stale-key",
+                "AWS_SECRET_ACCESS_KEY": "stale-secret",
+                worker_mod._AWS_CREDENTIAL_REFRESH_AT_KEY: "0",
+            },
+            True,
+        ),
+        (
+            "configure",
+            cleanup_cursor,
+            {
+                "AWS_ACCESS_KEY_ID": "fresh-key",
+                "AWS_SECRET_ACCESS_KEY": "fresh-secret",
+                worker_mod._AWS_CREDENTIAL_REFRESH_AT_KEY: "9999999999",
+            },
+            True,
+        ),
+        (
+            "cleanup",
+            "query-drop",
+            cleanup_cursor,
+            "resource-query",
+            False,
+            {
+                "AWS_ACCESS_KEY_ID": "fresh-key",
+                "AWS_SECRET_ACCESS_KEY": "fresh-secret",
+                worker_mod._AWS_CREDENTIAL_REFRESH_AT_KEY: "9999999999",
+            },
+        ),
+        ("close",),
+    ]
+
+
+def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monkeypatch):
+    actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    actor._native_execution_condition = threading.Condition()
+    actor._session_connections_lock = threading.RLock()
+    actor._session_connections = {}
+    actor._session_s3_configs = {}
+    actor._native_query_cleanup_contexts = {
+        "query-drop": worker_mod.NativeQueryCleanupContext(
+            session_id="session-a",
+            session_config=(("AWS_ENDPOINT_URL", "https://s3.example.test"),),
+            use_session_credentials=False,
+            connection_snapshot_query_id="resource-query",
+            connection_snapshot_identity=worker_mod.CleanupConnectionSnapshotIdentity(":memory:", False, (), ()),
+        )
+    }
+    cleanup_cursor = SimpleNamespace(close=lambda: None)
+    actor._get_shared_conn = lambda: SimpleNamespace(cursor=lambda: cleanup_cursor)
+    cleanup_calls = []
+
+    def cleanup(
+        query_id,
+        connection=None,
+        connection_snapshot_query_id="",
+        *,
+        apply_snapshot_s3_credentials=True,
+        effective_session_config=None,
+    ):
+        cleanup_calls.append(
+            (
+                query_id,
+                connection,
+                connection_snapshot_query_id,
+                apply_snapshot_s3_credentials,
+                effective_session_config,
+            )
+        )
+        if connection is None:
+            return {
+                "registry_entries_removed": 1,
+                "storage_entries_removed": 0,
+                "cleanup_errors": 1,
+                "cleanup_storage_required": 1,
+                "cleanup_pending": 1,
+                "active_executions": 0,
+                "last_error": "shuffle cleanup requires a live filesystem context",
+            }
+        return {
+            "registry_entries_removed": 0,
+            "storage_entries_removed": 2,
+            "cleanup_errors": 0,
+            "cleanup_storage_required": 0,
+            "cleanup_pending": 0,
+            "active_executions": 0,
+            "last_error": "",
+        }
+
+    monkeypatch.setattr(
+        worker_mod,
+        "_refresh_effective_duckdb_s3_config",
+        lambda config, cached, *, use_session_credentials: dict(config),
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_configure_duckdb_s3",
+        lambda connection, config, *, use_session_credentials: dict(config),
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_cleanup_flight_shuffle_for_query",
+        cleanup,
+    )
+
+    result = actor_class._cleanup_flight_shuffle_for_query_with_context(actor, "query-drop")
+
+    assert result == {
+        "registry_entries_removed": 1,
+        "storage_entries_removed": 2,
+        "cleanup_errors": 0,
+        "cleanup_storage_required": 0,
+        "cleanup_pending": 0,
+        "active_executions": 0,
+        "last_error": "",
+    }
+    assert cleanup_calls == [
+        ("query-drop", None, "", True, None),
+        (
+            "query-drop",
+            cleanup_cursor,
+            "resource-query",
+            True,
+            {"AWS_ENDPOINT_URL": "https://s3.example.test"},
+        ),
+    ]
+
+
+def test_worker_object_shuffle_cleanup_preserves_primary_error_when_cursor_close_fails(monkeypatch):
+    actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    actor._native_execution_condition = threading.Condition()
+    actor._session_connections_lock = threading.RLock()
+    actor._session_connections = {}
+    actor._session_s3_configs = {}
+    actor._native_query_cleanup_contexts = {
+        "query-drop": worker_mod.NativeQueryCleanupContext(
+            session_id="session-a",
+            session_config=(),
+            use_session_credentials=True,
+            connection_snapshot_query_id="resource-query",
+            connection_snapshot_identity=worker_mod.CleanupConnectionSnapshotIdentity(":memory:", False, (), ()),
+        )
+    }
+
+    class _CleanupCursor:
+        def close(self):
+            raise RuntimeError("cursor close failed")
+
+    actor._get_shared_conn = lambda: SimpleNamespace(cursor=_CleanupCursor)
+    monkeypatch.setattr(
+        worker_mod,
+        "_cleanup_flight_shuffle_for_query",
+        lambda query_id, connection=None, connection_snapshot_query_id="": {
+            "registry_entries_removed": 1,
+            "storage_entries_removed": 0,
+            "cleanup_errors": 1,
+            "cleanup_storage_required": 1,
+            "cleanup_pending": 1,
+            "active_executions": 0,
+            "last_error": "shuffle cleanup requires a live filesystem context",
+        },
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_refresh_effective_duckdb_s3_config",
+        lambda config, cached, *, use_session_credentials: {},
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_configure_duckdb_s3",
+        lambda connection, config, *, use_session_credentials: (_ for _ in ()).throw(
+            RuntimeError("cleanup configuration failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="cleanup configuration failed"):
+        actor_class._cleanup_flight_shuffle_for_query_with_context(actor, "query-drop")
+
+
+def test_worker_cleanup_context_replays_snapshot_with_session_credentials(monkeypatch):
+    actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    actor._native_execution_condition = threading.Condition()
+    default_identity = worker_mod.CleanupConnectionSnapshotIdentity(":memory:", False, (), ())
+    monkeypatch.setattr(worker_mod, "_query_cleanup_connection_identity", lambda *args, **kwargs: default_identity)
+
+    class _Plan:
+        @staticmethod
+        def resource_query_id():
+            return "resource-query"
+
+    actor_class._register_native_query_cleanup_context(
+        actor,
+        "execution-query",
+        _Plan(),
+        "session-a",
+        {"AWS_PROFILE": "profile-a"},
+        use_session_credentials=True,
+    )
+
+    assert actor._native_query_cleanup_contexts == {
+        "execution-query": worker_mod.NativeQueryCleanupContext(
+            session_id="session-a",
+            session_config=(("AWS_PROFILE", "profile-a"),),
+            use_session_credentials=True,
+            connection_snapshot_query_id="resource-query",
+            connection_snapshot_identity=default_identity,
+        )
+    }
+
+
+def test_worker_cleanup_connection_identity_matches_snapshot_replay(monkeypatch):
+    snapshot = {
+        "bootstrap": {
+            "database": ":memory:",
+            "read_only": False,
+            "config": {
+                "s3_endpoint": "bootstrap.example.test",
+                "s3_region": "bootstrap-region",
+            },
+        },
+        "settings": [
+            {"name": "s3_endpoint", "value": "s3.example.test", "input_type": "VARCHAR"},
+            {"name": "s3_access_key_id", "value": "plan-key", "input_type": "VARCHAR"},
+            {"name": "s3_secret_access_key", "value": "plan-secret", "input_type": "VARCHAR"},
+            {"name": "http_timeout", "value": "30", "input_type": "BIGINT"},
+            {"name": "allow_unsigned_extensions", "value": "true", "input_type": "BOOLEAN"},
+        ],
+    }
+
+    def require(name, *, hint):
+        assert name == "_lookup_query_connection_snapshot"
+        assert hint == "Ensure the C++ ray extension is built with query replay lifecycle support."
+        return lambda query_id: snapshot if query_id == "resource-query" else None
+
+    monkeypatch.setattr(worker_mod, "require_ray_cxx_attr", require)
+
+    assert worker_mod._query_cleanup_connection_identity(
+        "resource-query",
+        apply_snapshot_s3_credentials=False,
+    ) == worker_mod.CleanupConnectionSnapshotIdentity(
+        bootstrap_database=":memory:",
+        bootstrap_read_only=False,
+        bootstrap_config=(
+            ("s3_endpoint", "bootstrap.example.test"),
+            ("s3_region", "bootstrap-region"),
+        ),
+        settings=(
+            ("s3_endpoint", "s3.example.test", "VARCHAR"),
+            ("http_timeout", "30", "BIGINT"),
+        ),
+    )
+    assert worker_mod._query_cleanup_connection_identity(
+        "resource-query",
+        apply_snapshot_s3_credentials=True,
+    ) == worker_mod.CleanupConnectionSnapshotIdentity(
+        bootstrap_database=":memory:",
+        bootstrap_read_only=False,
+        bootstrap_config=(
+            ("s3_endpoint", "bootstrap.example.test"),
+            ("s3_region", "bootstrap-region"),
+        ),
+        settings=(
+            ("s3_endpoint", "s3.example.test", "VARCHAR"),
+            ("s3_access_key_id", "plan-key", "VARCHAR"),
+            ("s3_secret_access_key", "plan-secret", "VARCHAR"),
+            ("http_timeout", "30", "BIGINT"),
+        ),
+    )
+
+
+def test_worker_cleanup_context_reuses_first_equivalent_snapshot_across_query_fragments(monkeypatch):
+    actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    actor._native_execution_condition = threading.Condition()
+    default_identity = worker_mod.CleanupConnectionSnapshotIdentity(
+        ":memory:",
+        False,
+        (("s3_endpoint", "s3.example.test"),),
+        (),
+    )
+    snapshot_identities = {
+        "resource-query-a": default_identity,
+        "resource-query-b": default_identity,
+        "resource-query-c": worker_mod.CleanupConnectionSnapshotIdentity(
+            ":memory:",
+            False,
+            (("s3_endpoint", "other.example.test"),),
+            (),
+        ),
+        "resource-query-d": default_identity,
+    }
+    monkeypatch.setattr(
+        worker_mod,
+        "_query_cleanup_connection_identity",
+        lambda query_id, **kwargs: snapshot_identities[query_id],
+    )
+
+    class _Plan:
+        def __init__(self, resource_query_id):
+            self._resource_query_id = resource_query_id
+
+        def resource_query_id(self):
+            return self._resource_query_id
+
+    actor_class._register_native_query_cleanup_context(
+        actor,
+        "execution-query",
+        _Plan("resource-query-a"),
+        "session-a",
+        {"AWS_PROFILE": "profile-a"},
+        use_session_credentials=True,
+    )
+    actor_class._register_native_query_cleanup_context(
+        actor,
+        "execution-query",
+        _Plan("resource-query-b"),
+        "session-a",
+        {"AWS_PROFILE": "profile-a"},
+        use_session_credentials=True,
+    )
+
+    assert actor._native_query_cleanup_contexts["execution-query"].connection_snapshot_query_id == "resource-query-a"
+    with pytest.raises(RuntimeError, match="native query cleanup context changed"):
+        actor_class._register_native_query_cleanup_context(
+            actor,
+            "execution-query",
+            _Plan("resource-query-c"),
+            "session-a",
+            {"AWS_PROFILE": "profile-a"},
+            use_session_credentials=True,
+        )
+    with pytest.raises(RuntimeError, match="native query cleanup context changed"):
+        actor_class._register_native_query_cleanup_context(
+            actor,
+            "execution-query",
+            _Plan("resource-query-d"),
+            "session-a",
+            {"AWS_PROFILE": "profile-b"},
+            use_session_credentials=True,
+        )
 
 
 def test_worker_flight_shuffle_cleanup_drain_retries_pending_work(monkeypatch):
@@ -10685,6 +11230,7 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
     assert closed == ["cursor"]
     assert actor._active_native_cursors == set()
     assert actor._native_cursor_query_ids == {}
+    assert getattr(actor, "_native_query_cleanup_contexts", {}) == {}
 
 
 def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):

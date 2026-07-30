@@ -828,10 +828,14 @@ void FlightExchange::Close() {
 // ─── FlightExchangeSink ─────────────────────────────────
 
 FlightExchangeSink::FlightExchangeSink(std::shared_ptr<ShuffleCache> shuffle_cache,
-                                       const ExchangeSinkInstanceHandle &handle, ClientContext *context)
+                                       const ExchangeSinkInstanceHandle &handle, ClientContext *context,
+                                       bool descriptor_only_cleanup)
     : shuffle_cache_(std::move(shuffle_cache)), handle_(handle), context_(context) {
-	auto track_result = ShuffleCacheRegistry::Instance().TrackPending(
-	    handle_.output_location, shuffle_cache_, handle_.query_id, handle_.flight_server_epoch, handle_.attempt_id);
+	auto retention = descriptor_only_cleanup ? ShuffleCacheRegistry::CacheRetention::DESCRIPTOR_ONLY
+	                                         : ShuffleCacheRegistry::CacheRetention::RETAIN;
+	auto track_result =
+	    ShuffleCacheRegistry::Instance().TrackPending(handle_.output_location, shuffle_cache_, handle_.query_id,
+	                                                  handle_.flight_server_epoch, handle_.attempt_id, retention);
 	if (track_result.is_err()) {
 		throw InvalidInputException("Failed to track Flight exchange sink attempt: %s", track_result.error().what());
 	}
@@ -1314,7 +1318,8 @@ std::unique_ptr<ExchangeSink> FlightExchangeManager::CreateSink(const ExchangeSi
 	auto sink_handle = handle;
 	sink_handle.flight_server_epoch = GetPublishedFlightServerEpoch();
 	auto shuffle_cache = MakeFlightExchangeShuffleCache(cache_config, config_, context_);
-	return std::unique_ptr<ExchangeSink>(new FlightExchangeSink(shuffle_cache, sink_handle, context_));
+	return std::unique_ptr<ExchangeSink>(
+	    new FlightExchangeSink(shuffle_cache, sink_handle, context_, FlightExchangeUsesObjectStorage(config_)));
 }
 
 std::unique_ptr<ExchangeSource> FlightExchangeManager::CreateSource() {

@@ -1048,21 +1048,25 @@ DuckDBResult<ShufflePartitionFiles> ShuffleCache::GetPartitionFilesFromManifest(
 }
 
 DuckDBResult<idx_t> ShuffleCache::RemoveAttemptStorage() const {
-	if (config_.shuffle_stage_id.empty()) {
+	return RemoveShuffleAttemptStorage(config_, *storage_);
+}
+
+DuckDBResult<idx_t> RemoveShuffleAttemptStorage(const ShuffleCacheConfig &config, const ShuffleStorage &storage) {
+	if (config.shuffle_stage_id.empty()) {
 		return DuckDBResult<idx_t>::err(DuckDBError::value_error("shuffle cache stage id is empty"));
 	}
-	if (config_.node_id.empty()) {
+	if (config.node_id.empty()) {
 		return DuckDBResult<idx_t>::err(DuckDBError::value_error("shuffle cache node id is empty"));
 	}
-	if (config_.local_dirs.empty()) {
+	if (config.local_dirs.empty()) {
 		return DuckDBResult<idx_t>::ok(0);
 	}
 
-	auto stage = ShuffleCacheSanitizePathComponent(config_.shuffle_stage_id);
-	auto node = ShuffleCacheSanitizePathComponent(config_.node_id);
+	auto stage = ShuffleCacheSanitizePathComponent(config.shuffle_stage_id);
+	auto node = ShuffleCacheSanitizePathComponent(config.node_id);
 	std::unordered_set<std::string> seen_attempt_dirs;
 	idx_t removed_total = 0;
-	for (const auto &base_dir : config_.local_dirs) {
+	for (const auto &base_dir : config.local_dirs) {
 		if (base_dir.empty()) {
 			continue;
 		}
@@ -1072,7 +1076,7 @@ DuckDBResult<idx_t> ShuffleCache::RemoveAttemptStorage() const {
 		if (!seen_attempt_dirs.insert(attempt_dir).second) {
 			continue;
 		}
-		auto removed_res = storage_->RemoveAll(attempt_dir);
+		auto removed_res = storage.RemoveAll(attempt_dir);
 		if (removed_res.is_err()) {
 			return DuckDBResult<idx_t>::err(removed_res.error());
 		}

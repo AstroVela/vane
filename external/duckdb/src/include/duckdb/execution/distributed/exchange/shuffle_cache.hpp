@@ -81,6 +81,7 @@ public:
 
 std::shared_ptr<ShuffleStorage> MakeDuckDBFileSystemShuffleStorage(FileSystem &fs);
 std::shared_ptr<ShuffleStorage> MakeDuckDBFileSystemShuffleStorage(FileSystem &fs, FileOpener *opener);
+DuckDBResult<idx_t> RemoveShuffleAttemptStorage(const ShuffleCacheConfig &config, const ShuffleStorage &storage);
 
 class ShuffleCache {
 public:
