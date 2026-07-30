@@ -11,7 +11,7 @@
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/execution/reservoir_sample.hpp"
 
-#include <algorithm>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -27,7 +27,7 @@ public:
 	mutex lock;
 	idx_t sample_count;
 	unique_ptr<ReservoirSample> sample;
-	vector<pair<idx_t, string>> serialized_states;
+	std::unordered_set<idx_t> merged_task_indices;
 	bool state_emitted = false;
 };
 
@@ -103,35 +103,12 @@ SinkResultType PhysicalDistributedReservoirSample::Sink(ExecutionContext &contex
 		if (task_value.IsNull() || state_value.IsNull()) {
 			throw InvalidInputException("Distributed reservoir sample received a NULL state");
 		}
-		state.serialized_states.emplace_back(task_value.GetValue<idx_t>(), StringValue::Get(state_value));
-	}
-	return SinkResultType::NEED_MORE_INPUT;
-}
-
-SinkCombineResultType PhysicalDistributedReservoirSample::Combine(ExecutionContext &context,
-                                                                  OperatorSinkCombineInput &input) const {
-	return SinkCombineResultType::FINISHED;
-}
-
-SinkFinalizeType PhysicalDistributedReservoirSample::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-                                                              OperatorSinkFinalizeInput &input) const {
-	auto &state = input.global_state.Cast<DistributedReservoirGlobalState>();
-	if (stage == DistributedReservoirSampleStage::LOCAL) {
-		state.sample->PrepareForMerge();
-		return SinkFinalizeType::READY;
-	}
-
-	std::sort(
-	    state.serialized_states.begin(), state.serialized_states.end(),
-	    [](const pair<idx_t, string> &left, const pair<idx_t, string> &right) { return left.first < right.first; });
-	optional_idx previous_task;
-	for (auto &entry : state.serialized_states) {
-		if (previous_task.IsValid() && previous_task.GetIndex() == entry.first) {
-			throw InvalidInputException("Distributed reservoir sample received duplicate task state %llu", entry.first);
+		const auto task_index = task_value.GetValue<idx_t>();
+		if (!state.merged_task_indices.insert(task_index).second) {
+			throw InvalidInputException("Distributed reservoir sample received duplicate task state %llu", task_index);
 		}
-		previous_task = entry.first;
 
-		auto other = DeserializeReservoirState(entry.second);
+		auto other = DeserializeReservoirState(StringValue::Get(state_value));
 		if (other->type != SampleType::RESERVOIR_SAMPLE) {
 			throw InvalidInputException("Distributed reservoir sample received an incompatible sample state");
 		}
@@ -149,6 +126,20 @@ SinkFinalizeType PhysicalDistributedReservoirSample::Finalize(Pipeline &pipeline
 		}
 		other_reservoir.PrepareForMerge();
 		state.sample->Merge(std::move(other));
+	}
+	return SinkResultType::NEED_MORE_INPUT;
+}
+
+SinkCombineResultType PhysicalDistributedReservoirSample::Combine(ExecutionContext &context,
+                                                                  OperatorSinkCombineInput &input) const {
+	return SinkCombineResultType::FINISHED;
+}
+
+SinkFinalizeType PhysicalDistributedReservoirSample::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+                                                              OperatorSinkFinalizeInput &input) const {
+	auto &state = input.global_state.Cast<DistributedReservoirGlobalState>();
+	if (stage == DistributedReservoirSampleStage::LOCAL) {
+		state.sample->PrepareForMerge();
 	}
 	return SinkFinalizeType::READY;
 }

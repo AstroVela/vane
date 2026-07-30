@@ -578,6 +578,12 @@ TEST_CASE("ReservoirSample states merge arbitrary row counts and preserve string
 	}
 	REQUIRE(expected.size() == sample_count);
 
+	vector<unique_ptr<BlockingSample>> reverse_states;
+	reverse_states.reserve(states.size());
+	for (const auto &state : states) {
+		reverse_states.push_back(state->Copy());
+	}
+
 	ReservoirSample merged(allocator, sample_count, 999);
 	for (auto &state : states) {
 		merged.Merge(std::move(state));
@@ -600,6 +606,26 @@ TEST_CASE("ReservoirSample states merge arbitrary row counts and preserve string
 	}
 	REQUIRE(output_count == sample_count);
 	REQUIRE(selected == expected);
+
+	ReservoirSample reverse_merged(allocator, sample_count, 999);
+	for (auto state = reverse_states.rbegin(); state != reverse_states.rend(); state++) {
+		reverse_merged.Merge(std::move(*state));
+	}
+	REQUIRE(reverse_merged.GetTuplesSeen() == partition_boundaries.back());
+
+	std::unordered_set<int64_t> reverse_selected;
+	while (true) {
+		auto chunk = reverse_merged.GetChunk();
+		if (!chunk) {
+			break;
+		}
+		for (idx_t row_idx = 0; row_idx < chunk->size(); row_idx++) {
+			const auto value = chunk->GetValue(0, row_idx).GetValue<int64_t>();
+			REQUIRE(StringValue::Get(chunk->GetValue(1, row_idx)) == "value-" + std::to_string(value));
+			REQUIRE(reverse_selected.insert(value).second);
+		}
+	}
+	REQUIRE(reverse_selected == expected);
 }
 
 TEST_CASE("PhysicalLimitPercent serialization roundtrip", "[serialization][physical_plan]") {
