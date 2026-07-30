@@ -3302,6 +3302,47 @@ def test_worker_cleanup_context_replays_snapshot_with_session_credentials():
     }
 
 
+def test_worker_cleanup_context_reuses_first_snapshot_across_query_fragments():
+    actor_class = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    actor._native_execution_condition = threading.Condition()
+
+    class _Plan:
+        def __init__(self, resource_query_id):
+            self._resource_query_id = resource_query_id
+
+        def resource_query_id(self):
+            return self._resource_query_id
+
+    actor_class._register_native_query_cleanup_context(
+        actor,
+        "execution-query",
+        _Plan("resource-query-a"),
+        "session-a",
+        {"AWS_PROFILE": "profile-a"},
+        use_session_credentials=True,
+    )
+    actor_class._register_native_query_cleanup_context(
+        actor,
+        "execution-query",
+        _Plan("resource-query-b"),
+        "session-a",
+        {"AWS_PROFILE": "profile-a"},
+        use_session_credentials=True,
+    )
+
+    assert actor._native_query_cleanup_contexts["execution-query"].connection_snapshot_query_id == "resource-query-a"
+    with pytest.raises(RuntimeError, match="native query cleanup context changed"):
+        actor_class._register_native_query_cleanup_context(
+            actor,
+            "execution-query",
+            _Plan("resource-query-c"),
+            "session-a",
+            {"AWS_PROFILE": "profile-b"},
+            use_session_credentials=True,
+        )
+
+
 def test_worker_flight_shuffle_cleanup_drain_retries_pending_work(monkeypatch):
     cleanups = iter(
         [

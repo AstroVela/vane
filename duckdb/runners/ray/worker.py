@@ -1379,8 +1379,19 @@ class RayWorkerActor:
                 contexts = {}
                 self._native_query_cleanup_contexts = contexts
             existing = contexts.get(query_key)
-            if existing is not None and existing != cleanup_context:
-                raise RuntimeError(f"native query cleanup context changed: {query_key}")
+            if existing is not None:
+                # One execution query can contain independently materialized
+                # fragment plans with different replay-registry keys. Their
+                # cleanup storage configuration must agree, but retaining the
+                # first live snapshot is sufficient for the query-scoped
+                # storage context.
+                if (
+                    existing.session_id != cleanup_context.session_id
+                    or existing.session_config != cleanup_context.session_config
+                    or existing.use_session_credentials != cleanup_context.use_session_credentials
+                ):
+                    raise RuntimeError(f"native query cleanup context changed: {query_key}")
+                return
             contexts[query_key] = cleanup_context
 
     def _cleanup_flight_shuffle_for_query_with_context(self, query_id: str) -> dict[str, Any]:
