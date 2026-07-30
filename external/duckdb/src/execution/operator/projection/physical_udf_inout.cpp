@@ -935,6 +935,120 @@ struct StreamingPendingMaterializedEnvelope {
 	idx_t bytes = 0;
 };
 
+enum class StreamingPlannedSubmitKind : uint8_t { NONE, MATERIALIZED, LAZY };
+
+// Task admission belongs to one concrete submit, not to an input channel. Keep
+// exactly one cross-channel head-of-line candidate until it is submitted or
+// cancelled so another input kind cannot consume its grant.
+struct StreamingPlannedSubmit {
+	bool HasValue() const {
+		return kind != StreamingPlannedSubmitKind::NONE;
+	}
+
+	bool IsMaterialized() const {
+		return kind == StreamingPlannedSubmitKind::MATERIALIZED;
+	}
+
+	bool IsLazy() const {
+		return kind == StreamingPlannedSubmitKind::LAZY;
+	}
+
+	const char *KindName() const {
+		switch (kind) {
+		case StreamingPlannedSubmitKind::MATERIALIZED:
+			return "materialized";
+		case StreamingPlannedSubmitKind::LAZY:
+			return "lazy";
+		case StreamingPlannedSubmitKind::NONE:
+			return "none";
+		}
+		return "unknown";
+	}
+
+	idx_t Sequence() const {
+		return sequence;
+	}
+
+	idx_t Rows() const {
+		if (IsMaterialized()) {
+			return materialized.rows;
+		}
+		if (IsLazy()) {
+			return lazy.rows;
+		}
+		return 0;
+	}
+
+	idx_t InputBytes() const {
+		if (IsMaterialized()) {
+			return materialized.bytes;
+		}
+		if (IsLazy()) {
+			return lazy.bytes;
+		}
+		return 0;
+	}
+
+	idx_t RetainedInputBytes() const {
+		return retained_input_bytes;
+	}
+
+	StreamingPendingMaterializedEnvelope &Materialized() {
+		if (!IsMaterialized()) {
+			throw InternalException("streaming UDF planned submit is not materialized");
+		}
+		return materialized;
+	}
+
+	StreamingPendingLazyInput &Lazy() {
+		if (!IsLazy()) {
+			throw InternalException("streaming UDF planned submit is not lazy");
+		}
+		return lazy;
+	}
+
+	void SetMaterialized(StreamingPendingMaterializedEnvelope &&submit, idx_t sequence_p) {
+		if (HasValue()) {
+			throw InternalException("streaming UDF cannot replace an active planned submit");
+		}
+		if (submit.chunks.empty() || submit.rows == 0) {
+			throw InternalException("streaming UDF cannot plan an empty materialized submit");
+		}
+		materialized = std::move(submit);
+		retained_input_bytes = materialized.bytes;
+		sequence = sequence_p;
+		kind = StreamingPlannedSubmitKind::MATERIALIZED;
+	}
+
+	void SetLazy(StreamingPendingLazyInput &&submit, idx_t sequence_p) {
+		if (HasValue()) {
+			throw InternalException("streaming UDF cannot replace an active planned submit");
+		}
+		if (!submit.bundle || submit.rows == 0) {
+			throw InternalException("streaming UDF cannot plan an empty lazy submit");
+		}
+		lazy = std::move(submit);
+		retained_input_bytes = 0;
+		sequence = sequence_p;
+		kind = StreamingPlannedSubmitKind::LAZY;
+	}
+
+	void Clear() {
+		materialized = StreamingPendingMaterializedEnvelope();
+		lazy = StreamingPendingLazyInput();
+		retained_input_bytes = 0;
+		sequence = 0;
+		kind = StreamingPlannedSubmitKind::NONE;
+	}
+
+private:
+	StreamingPlannedSubmitKind kind = StreamingPlannedSubmitKind::NONE;
+	idx_t sequence = 0;
+	idx_t retained_input_bytes = 0;
+	StreamingPendingMaterializedEnvelope materialized;
+	StreamingPendingLazyInput lazy;
+};
+
 struct StreamingInflightBatch {
 	idx_t submit_id = 0;
 	idx_t total_rows = 0;
@@ -1047,10 +1161,8 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 	string error;
 	std::deque<StreamingPendingInputPiece> pending_inputs;
 	std::deque<StreamingPendingLazyInput> pending_lazy_inputs;
-	// Once task admission has registered a waiter, its input identity and byte
-	// commitment are immutable until that exact submit is granted or cancelled.
-	StreamingPendingMaterializedEnvelope planned_materialized_submit;
-	StreamingPendingLazyInput planned_lazy_submit;
+	StreamingPlannedSubmit planned_submit;
+	idx_t next_planned_submit_sequence = 1;
 	idx_t pending_rows = 0;
 	idx_t reserved_rows = 0;
 	idx_t reserved_bytes = 0;
@@ -1153,7 +1265,8 @@ static void StreamingUDFDebugState(StreamingUDFState &state, const char *where, 
 	StreamingUDFDebugLog(StringUtil::Format(
 	    "state tick=%llu udf_name=%s where=%s%s pending_rows=%llu pending_bytes=%llu reserved_rows=%llu "
 	    "reserved_bytes=%llu pending_lazy=%llu inflight_batches=%llu inflight_rows=%llu inflight_bytes=%llu "
-	    "planned_materialized_rows=%llu planned_lazy_rows=%llu "
+	    "planned_submit_kind=%s planned_submit_sequence=%llu planned_submit_rows=%llu "
+	    "planned_submit_input_bytes=%llu planned_submit_retained_input_bytes=%llu "
 	    "ready_outputs=%llu ready_rows=%llu ready_bytes=%llu handoff_outputs=%llu handoff_rows=%llu "
 	    "handoff_bytes=%llu deferred_outputs=%llu deferred_rows=%llu "
 	    "deferred_bytes=%llu queued_events=%llu sink_finished=%s "
@@ -1171,8 +1284,10 @@ static void StreamingUDFDebugState(StreamingUDFState &state, const char *where, 
 	    static_cast<unsigned long long>(state.pending_lazy_inputs.size()),
 	    static_cast<unsigned long long>(state.inflight_batches.size()),
 	    static_cast<unsigned long long>(state.inflight_rows), static_cast<unsigned long long>(state.inflight_bytes),
-	    static_cast<unsigned long long>(state.planned_materialized_submit.rows),
-	    static_cast<unsigned long long>(state.planned_lazy_submit.rows),
+	    state.planned_submit.KindName(), static_cast<unsigned long long>(state.planned_submit.Sequence()),
+	    static_cast<unsigned long long>(state.planned_submit.Rows()),
+	    static_cast<unsigned long long>(state.planned_submit.InputBytes()),
+	    static_cast<unsigned long long>(state.planned_submit.RetainedInputBytes()),
 	    static_cast<unsigned long long>(state.ready_outputs.size()), static_cast<unsigned long long>(state.ready_rows),
 	    static_cast<unsigned long long>(state.ready_bytes),
 	    static_cast<unsigned long long>(state.handoff_counters->outputs.load(std::memory_order_relaxed)),
@@ -1851,7 +1966,15 @@ static idx_t RowsWithinByteLimit(idx_t candidate_rows, idx_t candidate_bytes, id
 }
 
 static bool StreamingHasLazyInput(const StreamingUDFState &state) {
-	return state.planned_lazy_submit.bundle || !state.pending_lazy_inputs.empty();
+	return state.planned_submit.IsLazy() || !state.pending_lazy_inputs.empty();
+}
+
+static idx_t NextStreamingPlannedSubmitSequence(StreamingUDFState &state) {
+	auto sequence = state.next_planned_submit_sequence++;
+	if (state.next_planned_submit_sequence == 0) {
+		state.next_planned_submit_sequence = 1;
+	}
+	return sequence;
 }
 
 static StreamingSubmitPlan StreamingIncompleteSubmitPlan(const StreamingUDFState &state, bool flush_tail) {
@@ -2228,7 +2351,10 @@ static bool CompleteStreamingSubmitLocked(StreamingUDFState &state, unique_lock<
 static bool TrySubmitStreamingLazyInput(ExecutionContext &context, StreamingUDFState &state,
                                         const unique_lock<mutex> &guard, bool flush_tail) {
 	state.VerifyLock(guard);
-	const bool retrying_planned_submit = state.planned_lazy_submit.bundle != nullptr;
+	if (state.planned_submit.HasValue() && !state.planned_submit.IsLazy()) {
+		throw InternalException("streaming UDF lazy submit attempted while a materialized submit owns admission");
+	}
+	const bool retrying_planned_submit = state.planned_submit.IsLazy();
 	if (!retrying_planned_submit && state.pending_lazy_inputs.empty()) {
 		return false;
 	}
@@ -2239,7 +2365,7 @@ static bool TrySubmitStreamingLazyInput(ExecutionContext &context, StreamingUDFS
 	StreamingPendingLazyInput candidate;
 	StreamingPendingLazyInput *pending = nullptr;
 	if (retrying_planned_submit) {
-		pending = &state.planned_lazy_submit;
+		pending = &state.planned_submit.Lazy();
 	} else {
 		auto plan = PlanStreamingLazySubmit(state, flush_tail);
 		if (!plan) {
@@ -2255,17 +2381,17 @@ static bool TrySubmitStreamingLazyInput(ExecutionContext &context, StreamingUDFS
 	idx_t submit_id = 0;
 	// Lazy refs remain charged to their upstream output leases through handoff;
 	// charging the same physical objects as retained task input would double count.
-	if (!TrySubmitRefBundleRaw(context, *state.op, *pending->bundle, submit_id, 0)) {
+	const auto retained_input_bytes = retrying_planned_submit ? state.planned_submit.RetainedInputBytes() : idx_t(0);
+	if (!TrySubmitRefBundleRaw(context, *state.op, *pending->bundle, submit_id, retained_input_bytes)) {
 		if (!retrying_planned_submit) {
-			// Preserve the exact ref bundle associated with the admission waiter.
-			state.planned_lazy_submit = std::move(candidate);
+			state.planned_submit.SetLazy(std::move(candidate), NextStreamingPlannedSubmitSequence(state));
 		}
 		return false;
 	}
 	const auto submitted_rows = pending->rows;
 	const auto submitted_bytes = pending->bytes;
 	if (retrying_planned_submit) {
-		state.planned_lazy_submit = StreamingPendingLazyInput();
+		state.planned_submit.Clear();
 	}
 	StreamingInflightBatch inflight;
 	inflight.submit_id = submit_id;
@@ -2559,71 +2685,101 @@ static bool DrainStreamingOutputEventsLocked(StreamingUDFState &state, unique_lo
 	return did_work;
 }
 
+static bool TrySubmitStreamingMaterializedInput(ExecutionContext &context, StreamingUDFState &state,
+                                                const unique_lock<mutex> &guard, bool flush_tail) {
+	state.VerifyLock(guard);
+	if (state.planned_submit.HasValue() && !state.planned_submit.IsMaterialized()) {
+		throw InternalException("streaming UDF materialized submit attempted while a lazy submit owns admission");
+	}
+	const bool retrying_planned_submit = state.planned_submit.IsMaterialized();
+	if (!retrying_planned_submit && state.pending_inputs.empty()) {
+		return false;
+	}
+	EnsureStreamingExecutor(context, state, guard);
+	StreamingPendingMaterializedEnvelope candidate;
+	StreamingPendingMaterializedEnvelope *envelope = nullptr;
+	if (retrying_planned_submit) {
+		envelope = &state.planned_submit.Materialized();
+	} else {
+		auto plan = PlanStreamingMaterializedSubmit(state, flush_tail);
+		if (!plan) {
+			return false;
+		}
+		candidate = TakeStreamingMaterializedEnvelope(context, state, plan, state.config.compute_batch_rows,
+		                                              state.config.task_input_max_bytes);
+		envelope = &candidate;
+	}
+	if (envelope->chunks.empty() || envelope->rows == 0) {
+		return false;
+	}
+	const auto rows = envelope->rows;
+	const auto bytes = envelope->bytes;
+	const auto retained_input_bytes =
+	    retrying_planned_submit ? state.planned_submit.RetainedInputBytes() : envelope->bytes;
+	idx_t submit_id = 0;
+	if (!TrySubmitMaterializedEnvelopeRaw(context, *state.op, envelope->chunks, retained_input_bytes, submit_id)) {
+		if (!retrying_planned_submit) {
+			// Keep this exact envelope at the cross-channel head of line. Its
+			// rows remain part of the shared pending byte window while admission
+			// is unavailable.
+			state.pending_rows += rows;
+			state.pending_bytes += bytes;
+			state.planned_submit.SetMaterialized(std::move(candidate), NextStreamingPlannedSubmitSequence(state));
+		}
+		return false;
+	}
+	if (retrying_planned_submit) {
+		state.pending_rows = state.pending_rows >= rows ? state.pending_rows - rows : 0;
+		state.pending_bytes = state.pending_bytes >= bytes ? state.pending_bytes - bytes : 0;
+		state.planned_submit.Clear();
+	}
+	StreamingInflightBatch inflight;
+	inflight.submit_id = submit_id;
+	inflight.total_rows = rows;
+	inflight.bytes = bytes;
+	auto inserted = state.inflight_batches.emplace(submit_id, inflight);
+	if (!inserted.second) {
+		throw InternalException("streaming UDF duplicate submit_id %llu", static_cast<unsigned long long>(submit_id));
+	}
+	AtomicAddStreamingCounter(state.submitted_input_rows, rows);
+	AtomicAddStreamingCounter(state.submitted_input_bytes, bytes);
+	state.inflight_rows += rows;
+	state.inflight_bytes += bytes;
+	state.max_active_batches =
+	    MaxValue<idx_t>(state.max_active_batches, static_cast<idx_t>(state.inflight_batches.size()));
+	state.max_outstanding_rows = MaxValue<idx_t>(state.max_outstanding_rows, state.inflight_rows);
+	state.submitted_batches.fetch_add(1);
+	StreamingUDFDebugState(state, "submit_materialized_envelope", true);
+	return true;
+}
+
+static void DriveStreamingMaterializedSubmits(ExecutionContext &context, StreamingUDFState &state,
+                                              const unique_lock<mutex> &guard, bool flush_tail) {
+	state.VerifyLock(guard);
+	while (state.pending_rows > 0 && !StreamingOutputBackpressured(state)) {
+		if (!TrySubmitStreamingMaterializedInput(context, state, guard, flush_tail)) {
+			break;
+		}
+	}
+}
+
 static void DriveStreamingSubmits(ExecutionContext &context, StreamingUDFState &state, const unique_lock<mutex> &guard,
                                   bool flush_tail) {
 	state.VerifyLock(guard);
 	ThrowIfStreamingError(state);
+	if (state.planned_submit.HasValue()) {
+		const bool submitted = state.planned_submit.IsLazy()
+		                           ? TrySubmitStreamingLazyInput(context, state, guard, flush_tail)
+		                           : TrySubmitStreamingMaterializedInput(context, state, guard, flush_tail);
+		if (!submitted) {
+			return;
+		}
+	}
 	DriveStreamingLazySubmits(context, state, guard, flush_tail);
 	if (StreamingHasLazyInput(state)) {
 		return;
 	}
-	while (state.pending_rows > 0 && !StreamingOutputBackpressured(state)) {
-		EnsureStreamingExecutor(context, state, guard);
-		const bool retrying_planned_submit = !state.planned_materialized_submit.chunks.empty();
-		StreamingPendingMaterializedEnvelope candidate;
-		StreamingPendingMaterializedEnvelope *envelope = nullptr;
-		if (retrying_planned_submit) {
-			envelope = &state.planned_materialized_submit;
-		} else {
-			auto plan = PlanStreamingMaterializedSubmit(state, flush_tail);
-			if (!plan) {
-				break;
-			}
-			candidate = TakeStreamingMaterializedEnvelope(context, state, plan, state.config.compute_batch_rows,
-			                                              state.config.task_input_max_bytes);
-			envelope = &candidate;
-		}
-		if (envelope->chunks.empty() || envelope->rows == 0) {
-			break;
-		}
-		const auto rows = envelope->rows;
-		const auto bytes = envelope->bytes;
-		idx_t submit_id = 0;
-		if (!TrySubmitMaterializedEnvelopeRaw(context, *state.op, envelope->chunks, bytes, submit_id)) {
-			if (!retrying_planned_submit) {
-				// The executor has registered admission for this exact byte
-				// commitment. Keep the envelope intact instead of restoring and
-				// repartitioning it while the waiter sleeps.
-				state.pending_rows += rows;
-				state.pending_bytes += bytes;
-				state.planned_materialized_submit = std::move(candidate);
-			}
-			break;
-		}
-		if (retrying_planned_submit) {
-			state.pending_rows = state.pending_rows >= rows ? state.pending_rows - rows : 0;
-			state.pending_bytes = state.pending_bytes >= bytes ? state.pending_bytes - bytes : 0;
-			state.planned_materialized_submit = StreamingPendingMaterializedEnvelope();
-		}
-		StreamingInflightBatch inflight;
-		inflight.submit_id = submit_id;
-		inflight.total_rows = rows;
-		inflight.bytes = bytes;
-		auto inserted = state.inflight_batches.emplace(submit_id, inflight);
-		if (!inserted.second) {
-			throw InternalException("streaming UDF duplicate submit_id %llu",
-			                        static_cast<unsigned long long>(submit_id));
-		}
-		AtomicAddStreamingCounter(state.submitted_input_rows, rows);
-		AtomicAddStreamingCounter(state.submitted_input_bytes, bytes);
-		state.inflight_rows += rows;
-		state.inflight_bytes += bytes;
-		state.max_active_batches =
-		    MaxValue<idx_t>(state.max_active_batches, static_cast<idx_t>(state.inflight_batches.size()));
-		state.max_outstanding_rows = MaxValue<idx_t>(state.max_outstanding_rows, state.inflight_rows);
-		state.submitted_batches.fetch_add(1);
-		StreamingUDFDebugState(state, "submit_materialized_envelope", true);
-	}
+	DriveStreamingMaterializedSubmits(context, state, guard, flush_tail);
 }
 
 static void DrainStreamingPendingBeforeInputBlock(ExecutionContext &context, StreamingUDFState &state,
