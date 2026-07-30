@@ -628,6 +628,68 @@ TEST_CASE("ReservoirSample states merge arbitrary row counts and preserve string
 	REQUIRE(reverse_selected == expected);
 }
 
+TEST_CASE("ReservoirSample state merge handles every skewed arrival order",
+          "[serialization][physical_plan][reservoir_sample]") {
+	Allocator allocator;
+	constexpr idx_t sample_count = 7;
+	const vector<idx_t> partition_boundaries {0, 2, 7, 27, 80};
+	vector<unique_ptr<BlockingSample>> states;
+	vector<pair<double, int64_t>> weighted_candidates;
+
+	for (idx_t partition_idx = 0; partition_idx + 1 < partition_boundaries.size(); partition_idx++) {
+		ReservoirSample local(allocator, sample_count, NumericCast<int64_t>(201 + partition_idx));
+		AddReservoirRows(local, allocator, partition_boundaries[partition_idx],
+		                 partition_boundaries[partition_idx + 1]);
+		auto state = RoundTripReservoirState(local);
+		auto &reservoir = state->Cast<ReservoirSample>();
+		auto weights = reservoir.base_reservoir_sample->reservoir_weights;
+		while (!weights.empty()) {
+			const auto entry = weights.top();
+			weights.pop();
+			const auto value = reservoir.Chunk().GetValue(0, entry.second).GetValue<int64_t>();
+			weighted_candidates.emplace_back(-entry.first, value);
+		}
+		states.push_back(std::move(state));
+	}
+
+	std::sort(weighted_candidates.begin(), weighted_candidates.end(),
+	          [](const pair<double, int64_t> &left, const pair<double, int64_t> &right) {
+		          if (left.first != right.first) {
+			          return left.first > right.first;
+		          }
+		          return left.second < right.second;
+	          });
+	std::unordered_set<int64_t> expected;
+	for (idx_t candidate_idx = 0; candidate_idx < sample_count; candidate_idx++) {
+		expected.insert(weighted_candidates[candidate_idx].second);
+	}
+
+	vector<idx_t> arrival_order {0, 1, 2, 3};
+	do {
+		vector<unique_ptr<DataChunk>> output_chunks;
+		{
+			ReservoirSample merged(allocator, sample_count, 999);
+			for (const auto partition_idx : arrival_order) {
+				merged.Merge(states[partition_idx]->Copy());
+			}
+			REQUIRE(merged.GetTuplesSeen() == partition_boundaries.back());
+			while (auto chunk = merged.GetChunk()) {
+				output_chunks.push_back(std::move(chunk));
+			}
+		}
+
+		std::unordered_set<int64_t> selected;
+		for (const auto &chunk : output_chunks) {
+			for (idx_t row_idx = 0; row_idx < chunk->size(); row_idx++) {
+				const auto value = chunk->GetValue(0, row_idx).GetValue<int64_t>();
+				REQUIRE(StringValue::Get(chunk->GetValue(1, row_idx)) == "value-" + std::to_string(value));
+				REQUIRE(selected.insert(value).second);
+			}
+		}
+		REQUIRE(selected == expected);
+	} while (std::next_permutation(arrival_order.begin(), arrival_order.end()));
+}
+
 TEST_CASE("PhysicalLimitPercent serialization roundtrip", "[serialization][physical_plan]") {
 	Allocator allocator;
 	PhysicalPlan plan(allocator);
