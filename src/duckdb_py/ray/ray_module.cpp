@@ -542,7 +542,8 @@ void register_ray_bindings(py::module_ &mod) {
 
 	m.def(
 	    "cleanup_flight_shuffle_for_query",
-	    [](const string &query_id, py::object cleanup_connection, const string &connection_snapshot_query_id) {
+	    [](const string &query_id, py::object cleanup_connection, const string &connection_snapshot_query_id,
+	       bool apply_snapshot_s3_credentials) {
 		    py::dict out;
 		    if (query_id.empty()) {
 			    out["registry_entries_removed"] = 0;
@@ -563,7 +564,8 @@ void register_ray_bindings(py::module_ &mod) {
 			    if (!connection_snapshot_query_id.empty()) {
 				    auto snapshot = LookupQueryConnectionSnapshot(connection_snapshot_query_id);
 				    if (!snapshot.is_none()) {
-					    ApplyConnectionSnapshot(cleanup_connection, snapshot, false);
+					    ApplyConnectionSnapshot(cleanup_connection, snapshot, false, true,
+					                            apply_snapshot_s3_credentials);
 				    }
 				    // Concurrent idempotent teardown can retire replay state after
 				    // this cleanup cursor was configured. Continue with its
@@ -591,7 +593,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    out["last_error"] = cleanup_result.last_error;
 		    return out;
 	    },
-	    py::arg("query_id"), py::arg("cleanup_connection") = py::none(), py::arg("connection_snapshot_query_id") = "");
+	    py::arg("query_id"), py::arg("cleanup_connection") = py::none(), py::arg("connection_snapshot_query_id") = "",
+	    py::arg("apply_snapshot_s3_credentials") = true);
 
 	m.def(
 	    "retire_flight_shuffle_query",

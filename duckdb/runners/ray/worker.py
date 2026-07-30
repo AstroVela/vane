@@ -176,6 +176,8 @@ def _cleanup_flight_shuffle_for_query(
     query_id: str,
     cleanup_connection: Any | None = None,
     connection_snapshot_query_id: str = "",
+    *,
+    apply_snapshot_s3_credentials: bool = True,
 ) -> dict[str, Any]:
     query_id = str(query_id or "").strip()
     if not query_id:
@@ -199,6 +201,7 @@ def _cleanup_flight_shuffle_for_query(
             query_id,
             cleanup_connection,
             str(connection_snapshot_query_id or ""),
+            bool(apply_snapshot_s3_credentials),
         )
     if not isinstance(raw, dict):
         raise TypeError("Flight shuffle cleanup binding must return a dict")
@@ -1427,6 +1430,11 @@ class RayWorkerActor:
                 query_key,
                 cleanup_cursor,
                 cleanup_context.connection_snapshot_query_id,
+                # Refreshed profile/role credentials must remain newer than
+                # plan-time local settings captured in the snapshot. Explicit
+                # connection credentials still replay when session credentials
+                # are intentionally disabled.
+                apply_snapshot_s3_credentials=not cleanup_context.use_session_credentials,
             )
             cleanup["registry_entries_removed"] += probe["registry_entries_removed"]
             cleanup["storage_entries_removed"] += probe["storage_entries_removed"]

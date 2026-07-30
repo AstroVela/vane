@@ -2942,8 +2942,8 @@ def test_worker_flight_shuffle_cleanup_helper_passes_cleanup_connection_and_snap
     def _fake_require(name, hint=None):
         assert name == "cleanup_flight_shuffle_for_query"
 
-        def _cleanup(query_id, connection, snapshot_query_id):
-            calls.append((query_id, connection, snapshot_query_id, hint))
+        def _cleanup(query_id, connection, snapshot_query_id, apply_snapshot_s3_credentials):
+            calls.append((query_id, connection, snapshot_query_id, apply_snapshot_s3_credentials, hint))
             return {
                 "registry_entries_removed": 1,
                 "storage_entries_removed": 2,
@@ -2961,6 +2961,7 @@ def test_worker_flight_shuffle_cleanup_helper_passes_cleanup_connection_and_snap
         "query-drop",
         cleanup_connection,
         "resource-query",
+        apply_snapshot_s3_credentials=False,
     )
 
     assert result["storage_entries_removed"] == 2
@@ -2969,6 +2970,7 @@ def test_worker_flight_shuffle_cleanup_helper_passes_cleanup_connection_and_snap
             "query-drop",
             cleanup_connection,
             "resource-query",
+            False,
             "Ensure the C++ ray extension is built with Flight shuffle cleanup support.",
         )
     ]
@@ -3053,7 +3055,13 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
         events.append(("configure", connection, dict(config), use_session_credentials))
         return dict(config)
 
-    def cleanup(query_id, connection=None, connection_snapshot_query_id=""):
+    def cleanup(
+        query_id,
+        connection=None,
+        connection_snapshot_query_id="",
+        *,
+        apply_snapshot_s3_credentials=True,
+    ):
         if connection is None:
             events.append(("probe", query_id))
             return {
@@ -3065,7 +3073,15 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
                 "active_executions": 0,
                 "last_error": "shuffle cleanup requires a live filesystem context",
             }
-        events.append(("cleanup", query_id, connection, connection_snapshot_query_id))
+        events.append(
+            (
+                "cleanup",
+                query_id,
+                connection,
+                connection_snapshot_query_id,
+                apply_snapshot_s3_credentials,
+            )
+        )
         return {
             "registry_entries_removed": 0,
             "storage_entries_removed": 2,
@@ -3114,7 +3130,7 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
             },
             True,
         ),
-        ("cleanup", "query-drop", cleanup_cursor, "resource-query"),
+        ("cleanup", "query-drop", cleanup_cursor, "resource-query", False),
         ("close",),
     ]
 
@@ -3138,8 +3154,21 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
     actor._get_shared_conn = lambda: SimpleNamespace(cursor=lambda: cleanup_cursor)
     cleanup_calls = []
 
-    def cleanup(query_id, connection=None, connection_snapshot_query_id=""):
-        cleanup_calls.append((query_id, connection, connection_snapshot_query_id))
+    def cleanup(
+        query_id,
+        connection=None,
+        connection_snapshot_query_id="",
+        *,
+        apply_snapshot_s3_credentials=True,
+    ):
+        cleanup_calls.append(
+            (
+                query_id,
+                connection,
+                connection_snapshot_query_id,
+                apply_snapshot_s3_credentials,
+            )
+        )
         if connection is None:
             return {
                 "registry_entries_removed": 1,
@@ -3188,8 +3217,8 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
         "last_error": "",
     }
     assert cleanup_calls == [
-        ("query-drop", None, ""),
-        ("query-drop", cleanup_cursor, "resource-query"),
+        ("query-drop", None, "", True),
+        ("query-drop", cleanup_cursor, "resource-query", True),
     ]
 
 

@@ -419,6 +419,15 @@ static bool IsVaneSessionBaselineConnectionSetting(const string &name) {
 	return names.find(duckdb::StringUtil::Lower(name)) != names.end();
 }
 
+static bool IsS3CredentialConnectionSetting(const string &name) {
+	static const std::unordered_set<string> names {
+	    "s3_access_key_id",
+	    "s3_secret_access_key",
+	    "s3_session_token",
+	};
+	return names.find(duckdb::StringUtil::Lower(name)) != names.end();
+}
+
 static string QuoteSQLStringLiteral(const string &value) {
 	return "'" + duckdb::StringUtil::Replace(value, "'", "''") + "'";
 }
@@ -669,7 +678,8 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper) {
 }
 
 static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snapshot_obj,
-                                    bool apply_session_config = true, bool enforce_extension_security = true) {
+                                    bool apply_session_config = true, bool enforce_extension_security = true,
+                                    bool apply_s3_credentials = true) {
 	if (snapshot_obj.is_none()) {
 		return;
 	}
@@ -725,7 +735,9 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 		auto input_type = setting_obj.contains(py::str("input_type"))
 		                      ? py::str(setting_obj[py::str("input_type")]).cast<string>()
 		                      : string("VARCHAR");
-		if (setting_name.empty() || IsExtensionSecuritySetting(duckdb::StringUtil::Lower(setting_name))) {
+		auto lower_setting_name = duckdb::StringUtil::Lower(setting_name);
+		if (setting_name.empty() || IsExtensionSecuritySetting(lower_setting_name) ||
+		    (!apply_s3_credentials && IsS3CredentialConnectionSetting(lower_setting_name))) {
 			continue;
 		}
 		string sql_value;
