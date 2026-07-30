@@ -119,6 +119,19 @@ pre-commit run --from-ref origin/main --to-ref HEAD
 
 Run `pre-commit install` once per clone.
 
+Add `--check` to verify formatting without modifying files. Use `workspace`
+when both Vane-owned files and the DuckDB subtree have changed:
+
+```bash
+scripts/format workspace --changed --check
+```
+
+To check changes relative to a committed ref, including in CI, use:
+
+```bash
+scripts/format workspace --from-ref origin/main --check
+```
+
 The root formatter deliberately excludes `external/duckdb`. Format DuckDB subtree changes with:
 
 ```bash
