@@ -42,6 +42,23 @@ def _has_module(name: str) -> bool:
         return False
 
 
+def _drive(wrapper, table: pa.Table) -> pa.Table:
+    """Call an AI batch wrapper the way a UDF executor drives it.
+
+    Wrappers no longer own event loops: the executor binds a ``run_async``
+    capability before the first batch. Tests that invoke wrappers directly
+    must do the same.
+    """
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    wrapper.bind_async_runtime(loop.run_until_complete)
+    try:
+        return wrapper(table)
+    finally:
+        loop.close()
+
+
 # ---------------------------------------------------------------------------
 # Mock implementations
 # ---------------------------------------------------------------------------
@@ -259,7 +276,7 @@ class TestWrapperPickle:
         wrapper = _EmbedTextBatch(MockTextEmbedderDescriptor(dim=4), "text", "emb")
         restored = pickle.loads(pickle.dumps(wrapper))
         table = pa.table({"text": ["hello", "world"]})
-        result = restored(table)
+        result = _drive(restored, table)
         assert result.num_rows == 2
         assert result.column_names == ["emb"]
 
@@ -587,7 +604,7 @@ class TestPromptSemaphore:
 
         batch = _PromptBatch(mock_desc, "text", "response", max_api_concurrency=2)
         table = pa.table({"text": [f"msg{i}" for i in range(10)]})
-        result = batch(table)
+        result = _drive(batch, table)
 
         assert result.num_rows == 10
         assert peak_concurrent <= 2
@@ -618,7 +635,7 @@ class TestPromptSemaphore:
 
         batch = _PromptBatch(mock_desc, "text", "response", max_api_concurrency=None)
         table = pa.table({"text": [f"msg{i}" for i in range(10)]})
-        result = batch(table)
+        result = _drive(batch, table)
 
         assert result.num_rows == 10
         # Without semaphore, all 10 should run concurrently
@@ -2665,7 +2682,7 @@ class TestChunking:
 
         # Short text (no chunking) + long text (will be chunked)
         table = pa.table({"text": ["short", "a" * 200]})
-        result = batch(table)
+        result = _drive(batch, table)
 
         assert result.num_rows == 2
         emb0 = result.column("embedding")[0].as_py()
@@ -2707,7 +2724,7 @@ class TestChunking:
         batch = _EmbedTextBatch(desc, "text", "embedding")  # no chunking
 
         table = pa.table({"text": ["a" * 5000]})
-        result = batch(table)
+        result = _drive(batch, table)
 
         assert result.num_rows == 1
         assert call_count == 1  # single call, no chunking
@@ -3115,7 +3132,7 @@ class TestStructuredOutputExecution:
             return_format=dict,
         )
         table = pa.table({"text": ["Hello", "World"]})
-        result = batch(table)
+        result = _drive(batch, table)
 
         assert result.column("response").to_pylist() == [
             '{"answer":"42"}',
@@ -3135,7 +3152,7 @@ class TestStructuredOutputExecution:
 
         batch = _PromptBatch(mock_descriptor, "text", "response")
         table = pa.table({"text": ["Hello"]})
-        result = batch(table)
+        result = _drive(batch, table)
 
         assert result.column("response").to_pylist() == ["reply to Hello"]
 
@@ -3160,7 +3177,7 @@ class TestStructuredOutputExecution:
             return_format=dict,
         )
         table = pa.table({"text": ["x", "y"]})
-        result = batch(table)
+        result = _drive(batch, table)
         assert result.column("out").to_pylist() == ['{"a":1}', '{"a":2}']
 
 
@@ -3438,7 +3455,7 @@ class TestMultimodalPromptBatch:
                 "image": [b"\x89PNG\r\n\x1a\n\x00\x00"],
             }
         )
-        result = batch(table)
+        result = _drive(batch, table)
 
         assert len(captured_messages) == 1
         assert len(captured_messages[0]) == 2  # text + image bytes
@@ -3472,7 +3489,7 @@ class TestMultimodalPromptBatch:
                 "image": pa.array([None], type=pa.binary()),
             }
         )
-        batch(table)
+        _drive(batch, table)
 
         assert len(captured_messages[0]) == 1  # just text
         assert captured_messages[0][0] == "No image here"
@@ -3504,7 +3521,7 @@ class TestMultimodalPromptBatch:
                 "img2": [b"\xff\xd8\xff"],
             }
         )
-        batch(table)
+        _drive(batch, table)
 
         assert len(captured_messages[0]) == 3  # text + 2 images
 
@@ -3546,7 +3563,7 @@ class TestMultimodalPromptBatch:
                 ),
             }
         )
-        result = batch(table)
+        result = _drive(batch, table)
 
         assert captured_messages == [
             ("Compare these", b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff"),
@@ -3594,7 +3611,7 @@ class TestMultimodalPromptBatch:
                 ),
             }
         )
-        result = batch(table)
+        result = _drive(batch, table)
 
         assert captured_batches == [["alpha", "beta", "gamma"]]
         assert result.column("response").to_pylist() == [
@@ -3635,7 +3652,7 @@ class TestMultimodalPromptBatch:
                 "image": pa.array([b"ignored", None, b"\x89PNG"], type=pa.binary()),
             }
         )
-        result = batch(table)
+        result = _drive(batch, table)
 
         assert captured_batches == [["Text only"]]
         assert captured_messages == [("With image", b"\x89PNG")]
@@ -3699,7 +3716,7 @@ class TestMultimodalPromptBatch:
                 "images": pa.array([None, [b"", None]], type=pa.list_(pa.binary())),
             }
         )
-        result = batch(table)
+        result = _drive(batch, table)
 
         assert captured_batches == [["empty blob", "empty list item"]]
         assert result.column("response").to_pylist() == [
@@ -3723,7 +3740,7 @@ class TestMultimodalPromptBatch:
 
         batch = _PromptBatch(mock_descriptor, "text", "response")
         table = pa.table({"text": ["Hello"]})
-        result = batch(table)
+        result = _drive(batch, table)
 
         assert captured_messages[0] == ("Hello",)
         assert result.column("response").to_pylist() == ["reply"]
@@ -4672,14 +4689,30 @@ class TestRetryCall:
         assert result is None
 
     def test_awaitable_result_handled(self):
-        """_retry_call correctly handles sync functions returning awaitables."""
+        """_retry_call drives awaitables through the provided run_async."""
+        import asyncio
+
         from vane.ai.functions import _retry_call
 
         async def async_fn():
             return "async_result"
 
-        result = _retry_call(async_fn, max_retries=0, on_error="raise")
+        loop = asyncio.new_event_loop()
+        try:
+            result = _retry_call(async_fn, max_retries=0, on_error="raise", run_async=loop.run_until_complete)
+        finally:
+            loop.close()
         assert result == "async_result"
+
+    def test_awaitable_result_without_run_async_raises(self):
+        """Without a bound runtime an awaitable result is a hard error."""
+        from vane.ai.functions import _retry_call
+
+        async def async_fn():
+            return "unreachable"
+
+        with pytest.raises(RuntimeError, match="bind_async_runtime"):
+            _retry_call(async_fn, max_retries=0, on_error="ignore")
 
     def test_retry_call_async(self):
         import asyncio
@@ -4752,7 +4785,7 @@ class TestWrapperRetry:
         desc = self._make_embed_descriptor(embed)
         wrapper = _EmbedTextBatch(desc, "text", "emb", max_retries=3, on_error="raise")
         table = pa.table({"text": ["hello"]})
-        result = wrapper(table)
+        result = _drive(wrapper, table)
         assert result.column("emb").length() == 1
         assert len(calls) == 2
 
@@ -4765,7 +4798,7 @@ class TestWrapperRetry:
         desc = self._make_embed_descriptor(embed)
         wrapper = _EmbedTextBatch(desc, "text", "emb", max_retries=0, on_error="ignore")
         table = pa.table({"text": ["hello"]})
-        result = wrapper(table)
+        result = _drive(wrapper, table)
         # Should return zero embeddings
         assert result.column("emb").length() == 1
 
@@ -4809,7 +4842,7 @@ class TestWrapperRetry:
             on_error="raise",
         )
         table = pa.table({"text": ["q1"]})
-        result = wrapper(table)
+        result = _drive(wrapper, table)
         assert result.column("response").to_pylist()[0] is not None
         assert call_count == 2
 
@@ -4832,7 +4865,7 @@ class TestWrapperRetry:
             on_error="ignore",
         )
         table = pa.table({"text": ["q1"]})
-        result = wrapper(table)
+        result = _drive(wrapper, table)
         assert result.column("response").to_pylist() == [None]
 
     def test_prompt_batch_api_retry(self):
@@ -4858,6 +4891,6 @@ class TestWrapperRetry:
             on_error="raise",
         )
         table = pa.table({"text": ["q1", "q2"]})
-        result = wrapper(table)
+        result = _drive(wrapper, table)
         assert result.column("response").to_pylist() == ["ok", "ok"]
         assert len(calls) == 2

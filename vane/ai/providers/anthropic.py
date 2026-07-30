@@ -531,6 +531,10 @@ class AnthropicPrompter:
         }
         self._client = AsyncAnthropic(**client_opts)
 
+    async def aclose(self) -> None:
+        """Release the SDK client's connection pool on the owning loop."""
+        await self._client.close()
+
     # --- Multimodal message processing -----------------------------------
 
     def _process_message(self, msg: Any) -> dict[str, Any]:

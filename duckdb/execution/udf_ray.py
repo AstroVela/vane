@@ -678,44 +678,50 @@ def _iter_materialized_task_outputs(
             output_index += 1
             yield block, metadata
 
-    if str(stream_payload.get("call_mode") or "") == "map":
-        for raw_table in tables:
-            for block, metadata in emit(
-                _execute_scalar_map_layout(
-                    stream_payload,
-                    _ensure_table(raw_table),
-                    executor,
-                )
-            ):
-                yield block
-                yield metadata
-        executor.finished_submitting()
-        return
+    # close() must run on every exit — errors and abandoned generators
+    # included: with callable caching the AI wrapper outlives this executor,
+    # and a skipped close would strand its provider client on a dead loop.
+    try:
+        if str(stream_payload.get("call_mode") or "") == "map":
+            for raw_table in tables:
+                for block, metadata in emit(
+                    _execute_scalar_map_layout(
+                        stream_payload,
+                        _ensure_table(raw_table),
+                        executor,
+                    )
+                ):
+                    yield block
+                    yield metadata
+            executor.finished_submitting()
+            return
 
-    if str(stream_payload.get("call_mode") or "") == "map_batches_rows":
-        for raw_table in tables:
-            for block, metadata in emit(
-                _execute_row_preserving_batch_layout(
-                    stream_payload,
-                    _ensure_table(raw_table),
-                    executor,
-                )
-            ):
-                yield block
-                yield metadata
-        executor.finished_submitting()
-        return
+        if str(stream_payload.get("call_mode") or "") == "map_batches_rows":
+            for raw_table in tables:
+                for block, metadata in emit(
+                    _execute_row_preserving_batch_layout(
+                        stream_payload,
+                        _ensure_table(raw_table),
+                        executor,
+                    )
+                ):
+                    yield block
+                    yield metadata
+            executor.finished_submitting()
+            return
 
-    for raw_table in tables:
-        for output in executor.iter_submit(_ensure_table(raw_table)):
+        for raw_table in tables:
+            for output in executor.iter_submit(_ensure_table(raw_table)):
+                for block, metadata in emit(output):
+                    yield block
+                    yield metadata
+        executor.finished_submitting()
+        for output in executor.drain_outputs():
             for block, metadata in emit(output):
                 yield block
                 yield metadata
-    executor.finished_submitting()
-    for output in executor.drain_outputs():
-        for block, metadata in emit(output):
-            yield block
-            yield metadata
+    finally:
+        executor.close()
 
 
 def _execute_row_preserving_batch_layout(
@@ -850,15 +856,22 @@ def _iter_ref_bundle_task_outputs(
                 output_count += 1
                 yield output_table, output_metadata
 
-        for output in executor.iter_submit(table):
-            for block, output_metadata in emit_output(output):
-                yield block
-                yield output_metadata
-        executor.finished_submitting()
-        for output in executor.drain_outputs():
-            for block, output_metadata in emit_output(output):
-                yield block
-                yield output_metadata
+        # close() must run on every exit — errors and abandoned generators
+        # included: with callable caching the AI wrapper outlives this
+        # executor, and a skipped close would strand its provider client on
+        # a dead loop.
+        try:
+            for output in executor.iter_submit(table):
+                for block, output_metadata in emit_output(output):
+                    yield block
+                    yield output_metadata
+            executor.finished_submitting()
+            for output in executor.drain_outputs():
+                for block, output_metadata in emit_output(output):
+                    yield block
+                    yield output_metadata
+        finally:
+            executor.close()
         if log_task:
             _ray_task_debug_log(
                 "worker_ref_bundle_finished",
@@ -873,8 +886,11 @@ def _iter_ref_bundle_task_outputs(
     if call_mode == "map_batches_rows":
         executor = RuntimeUDFExecutor(payload, cache_callable=_callable_cache_enabled(payload))
         configure_loaded_torch_threads()
-        fused = _execute_row_preserving_batch_layout(payload, table, executor)
-        executor.finished_submitting()
+        try:
+            fused = _execute_row_preserving_batch_layout(payload, table, executor)
+            executor.finished_submitting()
+        finally:
+            executor.close()
         for output_index, block in enumerate(iter_bounded_stream_blocks(fused, payload)):
             yield block
             yield make_stream_block_metadata(block, payload, output_index=output_index)
@@ -885,7 +901,10 @@ def _iter_ref_bundle_task_outputs(
 
     executor = RuntimeUDFExecutor(payload, cache_callable=_callable_cache_enabled(payload))
     configure_loaded_torch_threads()
-    fused = _execute_scalar_map_layout(payload, table, executor)
+    try:
+        fused = _execute_scalar_map_layout(payload, table, executor)
+    finally:
+        executor.close()
     for output_index, block in enumerate(iter_bounded_stream_blocks(fused, payload)):
         yield block
         yield make_stream_block_metadata(block, payload, output_index=output_index)

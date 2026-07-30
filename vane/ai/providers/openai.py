@@ -263,6 +263,10 @@ class OpenAITextEmbedder:
         }
         self._client = AsyncOpenAI(**client_opts)
 
+    async def aclose(self) -> None:
+        """Release the SDK client's connection pool on the owning loop."""
+        await self._client.close()
+
     async def embed_text(self, text: list[str]) -> list[Embedding]:
         embeddings: list[Embedding] = []
         batch: list[str] = []
@@ -444,6 +448,10 @@ class OpenAIPrompter:
             if k in {"api_key", "base_url", "organization", "timeout", "max_retries"}
         }
         self._client = AsyncOpenAI(**client_opts)
+
+    async def aclose(self) -> None:
+        """Release the SDK client's connection pool on the owning loop."""
+        await self._client.close()
 
     # --- Multimodal message processing -----------------------------------
 

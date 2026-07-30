@@ -410,6 +410,10 @@ class GoogleTextEmbedder:
             }
         }
 
+    async def aclose(self) -> None:
+        """Release the SDK client's async connection pool on the owning loop."""
+        await self._client.aio.aclose()
+
     async def embed_text(self, text: list[str]) -> list[Embedding]:
         """Embed *text*, chunking into per-request batches under the API cap.
 
@@ -554,6 +558,10 @@ class GooglePrompter:
                 "max_retries",
             }
         }
+
+    async def aclose(self) -> None:
+        """Release the SDK client's async connection pool on the owning loop."""
+        await self._client.aio.aclose()
 
     # --- Multimodal message processing -----------------------------------
 

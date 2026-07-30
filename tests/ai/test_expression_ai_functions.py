@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from collections import Counter, deque
@@ -242,7 +243,12 @@ def test_embed_zero_fill_fallback_survives_dimension_probe_failure():
             return UDFOptions(max_retries=0, on_error="ignore")
 
     wrapper = _EmbedTextBatch(FailingDescriptor(), "text", "embedding", max_retries=0, on_error="ignore")
-    out = wrapper(pa.table({"text": ["a", "b"]}))
+    loop = asyncio.new_event_loop()
+    wrapper.bind_async_runtime(loop.run_until_complete)
+    try:
+        out = wrapper(pa.table({"text": ["a", "b"]}))
+    finally:
+        loop.close()
 
     assert out.num_rows == 2
     assert out.column("embedding").to_pylist() == [None, None]
