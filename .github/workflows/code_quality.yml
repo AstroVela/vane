@@ -70,7 +70,7 @@ jobs:
           scripts/format root --check
 
   run-checks:
-    name: Format, lint and type checks
+    name: Lint, format and type checks for changed files
     needs: validate-format-script
     runs-on: ubuntu-24.04
     steps:
