@@ -10,6 +10,7 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/common/types.hpp"
@@ -76,7 +77,8 @@ BoundStatement UnnestRelation::Bind(Binder &binder) {
 	}
 
 	// 4. Create BoundUnnestExpression: unnest(col_ref) → element_type
-	auto col_ref = make_uniq<BoundColumnRefExpression>(column_name, list_type, child_bindings[unnest_col_idx]);
+	auto col_ref = BoundCastExpression::AddArrayCastToList(
+	    binder.context, make_uniq<BoundColumnRefExpression>(column_name, list_type, child_bindings[unnest_col_idx]));
 	auto unnest_expr = make_uniq<BoundUnnestExpression>(element_type);
 	unnest_expr->child = std::move(col_ref);
 
