@@ -129,12 +129,23 @@ class QueryExecutionCleanupError(RuntimeError):
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _TaskTerminalControl:
     """Compact driver-lifetime proof for one terminal task request."""
 
     identity_fingerprint: bytes
     lease_fingerprint: bytes | None
+    status: str
+    blocked_reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class _OutputTerminalControl:
+    """Compact driver-lifetime proof for one terminal output request."""
+
+    identity_fingerprint: bytes
+    lease_fingerprint: bytes | None
+    query_fingerprint: bytes
     status: str
     blocked_reason: str
 
@@ -1298,6 +1309,9 @@ class RayQueryDriverActor:
         self._query_output_lease_request_tombstones = BoundedReplayMap[str, dict[str, Any]](
             capacity=_LEASE_REQUEST_REPLAY_CAPACITY
         )
+        # Output payload replay is bounded, but a delayed release ACK must stay
+        # provable after that cache entry is evicted.
+        self._query_output_terminal_controls: dict[bytes, _OutputTerminalControl] = {}
         self._query_task_request_owner_by_identity: dict[tuple[str, str, str], str] = {}
         self._query_output_request_owner_by_identity: dict[tuple[str, str], str] = {}
         self._query_resource_closing_queries: set[str] = set()
@@ -2480,6 +2494,8 @@ class RayQueryDriverActor:
                 getattr(output_tombstones, "items", lambda: ())(),
                 capacity=_LEASE_REQUEST_REPLAY_CAPACITY,
             )
+        if not hasattr(self, "_query_output_terminal_controls"):
+            self._query_output_terminal_controls = {}
         if not hasattr(self, "_query_task_request_owner_by_identity"):
             self._query_task_request_owner_by_identity = {}
         if not hasattr(self, "_query_output_request_owner_by_identity"):
@@ -2943,6 +2959,93 @@ class RayQueryDriverActor:
             and (status is None or control.status == status)
         )
 
+    @staticmethod
+    def _output_identity_fingerprint(identity: dict[str, Any]) -> bytes:
+        encoded = json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).digest()
+
+    @staticmethod
+    def _output_request_fingerprint(request_id: str) -> bytes:
+        return hashlib.sha256(str(request_id).encode("utf-8")).digest()
+
+    @staticmethod
+    def _output_lease_fingerprint(lease_id: str) -> bytes:
+        return hashlib.sha256(str(lease_id).encode("utf-8")).digest()
+
+    @staticmethod
+    def _output_query_fingerprint(query_id: str) -> bytes:
+        return hashlib.sha256(str(query_id).encode("utf-8")).digest()
+
+    def _store_output_terminal_control(
+        self,
+        *,
+        request_id: str,
+        identity: dict[str, Any],
+        lease: dict[str, Any] | None,
+        status: str,
+        result: dict[str, Any],
+    ) -> None:
+        request_key = str(request_id)
+        request_fingerprint = self._output_request_fingerprint(request_key)
+        control = _OutputTerminalControl(
+            identity_fingerprint=self._output_identity_fingerprint(identity),
+            lease_fingerprint=(
+                None
+                if lease is None
+                else self._output_lease_fingerprint(
+                    str(lease["lease_id"]),
+                )
+            ),
+            query_fingerprint=self._output_query_fingerprint(
+                str(identity["query_id"]),
+            ),
+            status=str(status),
+            blocked_reason=str(result.get("blocked_reason") or "output_request_terminal"),
+        )
+        existing = self._query_output_terminal_controls.get(request_fingerprint)
+        if existing is not None and existing != control:
+            raise RuntimeError(f"output terminal control identity changed: {request_key}")
+        self._query_output_terminal_controls[request_fingerprint] = control
+
+    def _output_terminal_control_for_identity(
+        self,
+        request_id: str,
+        identity: dict[str, Any],
+    ) -> _OutputTerminalControl | None:
+        control = self._query_output_terminal_controls.get(self._output_request_fingerprint(request_id))
+        if control is None:
+            return None
+        if control.identity_fingerprint != self._output_identity_fingerprint(identity):
+            raise ValueError(f"output lease request_id reused with different identity: {request_id}")
+        return control
+
+    def _output_terminal_lease_matches(
+        self,
+        request_id: str,
+        *,
+        lease_id: str,
+        query_id: str = "",
+    ) -> bool:
+        control = self._query_output_terminal_controls.get(self._output_request_fingerprint(request_id))
+        return bool(
+            control is not None
+            and control.lease_fingerprint == self._output_lease_fingerprint(lease_id)
+            and (
+                not query_id
+                or control.query_fingerprint
+                == self._output_query_fingerprint(
+                    query_id,
+                )
+            )
+            and control.status in {"released", "cancelled"}
+        )
+
     def _retire_query_lease_request(
         self,
         *,
@@ -2969,6 +3072,13 @@ class RayQueryDriverActor:
         tombstones[str(request_id)] = tombstone
         identity = state["identity"]
         if "block_id" in identity:
+            self._store_output_terminal_control(
+                request_id=str(request_id),
+                identity=dict(identity),
+                lease=dict(lease) if isinstance(lease, dict) else None,
+                status=str(status),
+                result=terminal_result,
+            )
             output_owner_key = (str(identity["query_id"]), str(identity["block_id"]))
             output_owners = self._query_output_request_owner_by_identity
             if output_owners.get(output_owner_key) == str(request_id):
@@ -3960,6 +4070,18 @@ class RayQueryDriverActor:
 
         request_id, request, identity = self._parse_output_block_lease_request(payload)
         self._ensure_query_resource_admission_state()
+        terminal_control = self._output_terminal_control_for_identity(
+            request_id,
+            identity,
+        )
+        if terminal_control is not None:
+            return self._grant_payload(
+                OutputBlockGrant(
+                    False,
+                    blocked_reason=terminal_control.blocked_reason,
+                    fatal=True,
+                )
+            )
         tombstone = self._query_output_lease_request_tombstones.get(request_id)
         if tombstone is not None and tombstone["identity"] != identity:
             raise ValueError(f"output lease request_id reused with different identity: {request_id}")
@@ -4053,12 +4175,10 @@ class RayQueryDriverActor:
         request_key = str(request_id)
         state = self._query_output_lease_requests.get(request_key)
         if state is None:
-            tombstone = self._query_output_lease_request_tombstones.get(request_key)
-            replay_lease = {} if tombstone is None else tombstone.get("lease") or {}
-            if (
-                tombstone is not None
-                and str(replay_lease.get("lease_id") or "") == str(lease_id)
-                and tombstone.get("status") in {"released", "cancelled"}
+            if self._output_terminal_lease_matches(
+                request_key,
+                lease_id=str(lease_id),
+                query_id=str(query_id),
             ):
                 return {"handed_off": True}
             if str(query_id) in self._query_resource_closing_queries:
@@ -4101,12 +4221,10 @@ class RayQueryDriverActor:
         request_key = str(request_id)
         state = self._query_output_lease_requests.get(request_key)
         if state is None:
-            tombstone = self._query_output_lease_request_tombstones.get(request_key)
-            replay_lease = {} if tombstone is None else tombstone.get("lease") or {}
-            if (
-                tombstone is not None
-                and str(replay_lease.get("lease_id") or "") == str(lease_id)
-                and tombstone.get("status") in {"released", "cancelled"}
+            if self._output_terminal_lease_matches(
+                request_key,
+                lease_id=str(lease_id),
+                query_id=str(query_id),
             ):
                 return {"released": True}
             if str(query_id) in self._query_resource_closing_queries:
@@ -4145,16 +4263,12 @@ class RayQueryDriverActor:
         request_id, request, identity = self._parse_output_block_lease_request(payload)
         self._ensure_query_resource_admission_state()
         request_key = request_id
-        tombstone = self._query_output_lease_request_tombstones.get(request_key)
-        if tombstone is not None and tombstone["identity"] != identity:
-            raise ValueError(f"output lease request_id reused with different identity: {request_key}")
-        if tombstone is not None:
+        terminal_control = self._output_terminal_control_for_identity(
+            request_key,
+            identity,
+        )
+        if terminal_control is not None:
             return {"cancelled": True, "released": False}
-        if str(request.query_id) in self._query_resource_closing_queries:
-            return {"cancelled": True, "released": False}
-        state = self._query_output_lease_requests.get(request_key)
-        if state is not None and state["identity"] != identity:
-            raise ValueError(f"output lease request_id reused with different identity: {request_key}")
         denial = self._grant_payload(
             OutputBlockGrant(
                 False,
@@ -4162,6 +4276,23 @@ class RayQueryDriverActor:
                 fatal=True,
             )
         )
+        tombstone = self._query_output_lease_request_tombstones.get(request_key)
+        if tombstone is not None and tombstone["identity"] != identity:
+            raise ValueError(f"output lease request_id reused with different identity: {request_key}")
+        if tombstone is not None:
+            return {"cancelled": True, "released": False}
+        if str(request.query_id) in self._query_resource_closing_queries:
+            self._store_output_terminal_control(
+                request_id=request_key,
+                identity=identity,
+                lease=None,
+                status="cancelled",
+                result=denial,
+            )
+            return {"cancelled": True, "released": False}
+        state = self._query_output_lease_requests.get(request_key)
+        if state is not None and state["identity"] != identity:
+            raise ValueError(f"output lease request_id reused with different identity: {request_key}")
         if state is None:
             resource_identity = (
                 str(identity["query_id"]),
@@ -4183,6 +4314,13 @@ class RayQueryDriverActor:
                 "status": "cancelled",
                 "result": denial,
             }
+            self._store_output_terminal_control(
+                request_id=request_key,
+                identity=identity,
+                lease=None,
+                status="cancelled",
+                result=denial,
+            )
             self._run_query_resource_admission_pumps(request.query_id)
             return {"cancelled": True, "released": False}
         lease = state.get("lease")

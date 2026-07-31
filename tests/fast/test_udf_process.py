@@ -259,6 +259,184 @@ def test_native_dispatcher_shutdown_closes_active_executor():
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_native_dispatcher_terminal_shutdown_uses_one_aggregate_collector_deadline():
+    """Terminal Ray cleanup must not apply one collector timeout per slot."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import threading
+        import time
+
+        import _duckdb
+        import duckdb
+        import duckdb.execution.udf as udf_exec
+        import duckdb.execution.udf_stream_result_collector as collector_mod
+        import pyarrow as pa
+
+        slot_count = 4
+        state_lock = threading.Lock()
+        all_tracked = threading.Event()
+        aggregate_shutdown = threading.Event()
+        tracked_count = 0
+        cancel_calls = 0
+        shutdown_calls = 0
+
+
+        class FakeCollector:
+            def __init__(self):
+                self._wakeup = None
+
+            def set_wakeup_callback(self, callback):
+                self._wakeup = callback
+
+            def track_generator_ref(self, _slot_id, _submit_id, _source, _error_context):
+                global tracked_count
+                with state_lock:
+                    tracked_count += 1
+                    if tracked_count == slot_count:
+                        all_tracked.set()
+
+            def discard_generator_ref(self, _slot_id, _source):
+                return None
+
+            def drain_results(self, _capacities):
+                return []
+
+            def cancel_slot(self, _slot_id):
+                global cancel_calls
+                with state_lock:
+                    cancel_calls += 1
+                time.sleep(0.1)
+
+            def slot_has_pending(self, _slot_id):
+                return False
+
+            def retire_slot(self, _slot_id):
+                return None
+
+            def shutdown(self):
+                global shutdown_calls
+                with state_lock:
+                    shutdown_calls += 1
+                time.sleep(0.1)
+                aggregate_shutdown.set()
+
+
+        class FakeExecutor:
+            def __init__(self):
+                self._wakeup = None
+                self._retained_input_bytes = 0
+                self._admission_state = "idle"
+
+            def register_wakeup(self, callback):
+                self._wakeup = callback
+
+            def request_task_admission(self, retained_input_bytes):
+                self._retained_input_bytes = int(retained_input_bytes)
+                self._admission_state = "ready"
+                return True
+
+            def task_admission_state(self):
+                return {
+                    "state": self._admission_state,
+                    "available": self._admission_state == "ready",
+                    "retained_input_bytes": self._retained_input_bytes,
+                }
+
+            def submit_with_id(self, _submit_id, _table):
+                self._admission_state = "idle"
+                return object()
+
+            def take_ready_result(self):
+                return None
+
+            def finished_submitting(self):
+                return None
+
+            def all_tasks_finished(self):
+                return False
+
+            def close(self):
+                return None
+
+
+        def build_executor(_payload, options=None):
+            del options
+            return FakeExecutor()
+
+
+        def passthrough(table):
+            return pa.table({"y": table.column(0)})
+
+
+        udf_exec.build_executor = build_executor
+        collector_mod.AsyncResultCollector = FakeCollector
+        connections = [duckdb.connect() for _ in range(slot_count)]
+        relations = [
+            connection.sql("select 1::BIGINT as x").map_batches(
+                passthrough,
+                schema={"y": duckdb.sqltypes.BIGINT},
+                execution_backend="ray_task",
+            )
+            for connection in connections
+        ]
+        query_errors = []
+
+
+        def run_query(relation):
+            try:
+                relation.fetchall()
+            except BaseException as exc:
+                query_errors.append(exc)
+
+
+        query_threads = [
+            threading.Thread(target=run_query, args=(relation,))
+            for relation in relations
+        ]
+        for thread in query_threads:
+            thread.start()
+        try:
+            assert all_tracked.wait(timeout=5), "not every Ray slot reached the collector"
+            assert cancel_calls == 0, cancel_calls
+            started_at = time.monotonic()
+            _duckdb._shutdown_udf_executor_dispatcher()
+            elapsed = time.monotonic() - started_at
+            assert aggregate_shutdown.is_set(), "aggregate collector shutdown was not called"
+            assert shutdown_calls == 1, shutdown_calls
+            assert cancel_calls == 0, cancel_calls
+            assert elapsed < 1.0, elapsed
+            for thread in query_threads:
+                thread.join(timeout=5)
+            assert not any(thread.is_alive() for thread in query_threads)
+            assert len(query_errors) == slot_count, query_errors
+            assert all(
+                "shutdown interrupted active execution" in str(error)
+                for error in query_errors
+            ), query_errors
+        finally:
+            for thread in query_threads:
+                thread.join(timeout=5)
+            for connection in connections:
+                connection.close()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+        env={**os.environ},
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_unregister_timeout_detaches_stale_dispatcher_work():
     """A timed-out slot must not retain its context or poison later UDFs."""
     import os

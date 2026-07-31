@@ -369,6 +369,47 @@ def test_task_admission_cancellation_expands_slow_response_deadline(monkeypatch)
         assert timer.is_alive() is False
 
 
+def test_task_admission_cancellations_share_one_deadline_thread(monkeypatch):
+    monkeypatch.setattr(
+        task_admission,
+        "_TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_S",
+        30.0,
+    )
+    driver = _Driver()
+    responses = []
+
+    def cancel(_request):
+        response = _ObjectRef()
+        responses.append(response)
+        return response
+
+    driver.cancel_query_task_lease_request = _RemoteMethod(cancel)
+    cancellations = [
+        task_admission._TaskAdmissionCancellation(
+            driver=driver,
+            request={
+                "request_id": f"shared-cancel:{index}",
+                "resources": {},
+            },
+        )
+        for index in range(256)
+    ]
+
+    for cancellation in cancellations:
+        cancellation.start()
+
+    assert len(driver.cancel_query_task_lease_request.calls) == len(cancellations)
+    scheduler_threads = [thread for thread in threading.enumerate() if thread.name == "vane-task-admission-cleanup"]
+    assert len(scheduler_threads) == 1
+
+    for response in responses:
+        response.resolve({"cancelled": True})
+    deadline = time.monotonic() + 1.0
+    while not all(cancellation._done for cancellation in cancellations) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert all(cancellation._done for cancellation in cancellations)
+
+
 def test_local_slot_admission_owns_concrete_slots_and_wakes_one_waiter():
     authority = LocalSlotAdmissionAuthority(
         max_slots=2,

@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import heapq
 import os
 import threading
+import time
 import uuid
 import weakref
 from collections.abc import Callable
@@ -25,6 +27,98 @@ _TASK_ADMISSION_CLEANUP_RETRY_INITIAL_DELAY_S = 0.01
 _TASK_ADMISSION_CLEANUP_RETRY_MAX_DELAY_S = 1.0
 _TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_S = 1.0
 _TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_MAX_S = 30.0
+
+
+class _ScheduledCall:
+    """One cancellable deadline owned by the shared cleanup scheduler."""
+
+    def __init__(
+        self,
+        scheduler: _TaskAdmissionCancellationScheduler,
+        callback: Callable[[], None],
+    ) -> None:
+        self._scheduler = scheduler
+        self._callback: Callable[[], None] | None = callback
+        self._scheduled = False
+
+    def cancel(self) -> None:
+        self._scheduler.cancel(self)
+
+
+class _TaskAdmissionCancellationScheduler:
+    """Process-wide deadline scheduler for every admission cancellation."""
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._queue: list[tuple[float, int, _ScheduledCall]] = []
+        self._next_sequence = 0
+        self._thread: threading.Thread | None = None
+
+    def create(self, callback: Callable[[], None]) -> _ScheduledCall:
+        return _ScheduledCall(self, callback)
+
+    def schedule(self, call: _ScheduledCall, delay_s: float) -> None:
+        with self._cv:
+            if call._scheduler is not self:
+                raise RuntimeError("scheduled call belongs to a different scheduler")
+            if call._callback is None:
+                return
+            if call._scheduled:
+                raise RuntimeError("scheduled call is already armed")
+            call._scheduled = True
+            self._next_sequence += 1
+            heapq.heappush(
+                self._queue,
+                (
+                    time.monotonic() + max(0.0, float(delay_s)),
+                    self._next_sequence,
+                    call,
+                ),
+            )
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run,
+                    daemon=True,
+                    name="vane-task-admission-cleanup",
+                )
+                self._thread.start()
+            self._cv.notify()
+
+    def cancel(self, call: _ScheduledCall) -> None:
+        with self._cv:
+            if call._scheduler is not self:
+                raise RuntimeError("scheduled call belongs to a different scheduler")
+            call._callback = None
+            self._cv.notify()
+
+    def _run(self) -> None:
+        while True:
+            callback: Callable[[], None] | None = None
+            with self._cv:
+                while callback is None:
+                    while self._queue and self._queue[0][2]._callback is None:
+                        heapq.heappop(self._queue)
+                    if not self._queue:
+                        self._cv.wait()
+                        continue
+                    deadline, _sequence, call = self._queue[0]
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0:
+                        self._cv.wait(timeout=remaining)
+                        continue
+                    heapq.heappop(self._queue)
+                    callback = call._callback
+                    call._callback = None
+            if callback is not None:
+                try:
+                    callback()
+                except BaseException:
+                    # Cancellation methods own their retry/error policy. One
+                    # malformed callback must not terminate the shared clock.
+                    pass
+
+
+_TASK_ADMISSION_CANCELLATION_SCHEDULER = _TaskAdmissionCancellationScheduler()
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -78,8 +172,8 @@ class _TaskAdmissionCancellation:
         }
         self._lock = threading.Lock()
         self._response_future: Any | None = None
-        self._response_watchdog: threading.Timer | None = None
-        self._retry_timer: threading.Timer | None = None
+        self._response_deadline: _ScheduledCall | None = None
+        self._retry_call: _ScheduledCall | None = None
         self._submitting = False
         self._retry_count = 0
         self._done = False
@@ -101,9 +195,9 @@ class _TaskAdmissionCancellation:
         )
 
     def start(self) -> None:
-        """Start once; callbacks and bounded timers retain cancellation ownership."""
+        """Start once; callbacks and shared deadlines retain cleanup ownership."""
         with self._lock:
-            if self._done or self._submitting or self._response_future is not None or self._retry_timer is not None:
+            if self._done or self._submitting or self._response_future is not None or self._retry_call is not None:
                 return
             self._submitting = True
         try:
@@ -116,15 +210,12 @@ class _TaskAdmissionCancellation:
                 self._submitting = False
             self._schedule_retry()
             return
-        watchdog = threading.Timer(
-            self._response_timeout(self._retry_count),
-            self._response_timed_out,
-            args=(response_future,),
+        response_deadline = _TASK_ADMISSION_CANCELLATION_SCHEDULER.create(
+            lambda: self._response_timed_out(response_future),
         )
-        watchdog.daemon = True
         discard_response = self._publish_response_future(
             response_future,
-            watchdog,
+            response_deadline,
         )
         if discard_response:
             try:
@@ -145,21 +236,26 @@ class _TaskAdmissionCancellation:
             with self._lock:
                 if self._response_future is response_future:
                     self._response_future = None
-                    self._response_watchdog = None
-            watchdog.cancel()
+                    self._response_deadline = None
+            response_deadline.cancel()
             self._schedule_retry()
             return
         with self._lock:
-            start_watchdog = (
-                not self._done and self._response_future is response_future and self._response_watchdog is watchdog
+            start_deadline = (
+                not self._done
+                and self._response_future is response_future
+                and self._response_deadline is response_deadline
             )
-        if start_watchdog:
-            watchdog.start()
+        if start_deadline:
+            _TASK_ADMISSION_CANCELLATION_SCHEDULER.schedule(
+                response_deadline,
+                self._response_timeout(self._retry_count),
+            )
 
     def _publish_response_future(
         self,
         response_future: Any,
-        watchdog: threading.Timer,
+        response_deadline: _ScheduledCall,
     ) -> bool:
         """Publish a response unless a concurrent acknowledgement finished."""
         with self._lock:
@@ -167,7 +263,7 @@ class _TaskAdmissionCancellation:
             if self._done:
                 return True
             self._response_future = response_future
-            self._response_watchdog = watchdog
+            self._response_deadline = response_deadline
             return False
 
     def _finish(self, response_future: Any) -> None:
@@ -181,10 +277,10 @@ class _TaskAdmissionCancellation:
                 if self._done or self._response_future is not response_future:
                     return
                 self._response_future = None
-                watchdog = self._response_watchdog
-                self._response_watchdog = None
-            if watchdog is not None:
-                watchdog.cancel()
+                response_deadline = self._response_deadline
+                self._response_deadline = None
+            if response_deadline is not None:
+                response_deadline.cancel()
             self._schedule_retry()
             return
         with self._lock:
@@ -195,26 +291,26 @@ class _TaskAdmissionCancellation:
             self._done = True
             current_response = self._response_future
             self._response_future = None
-            watchdog = self._response_watchdog
-            self._response_watchdog = None
-            retry_timer = self._retry_timer
-            self._retry_timer = None
+            response_deadline = self._response_deadline
+            self._response_deadline = None
+            retry_call = self._retry_call
+            self._retry_call = None
         if current_response is not None and current_response is not response_future:
             try:
                 current_response.cancel()
             except BaseException:
                 pass
-        if watchdog is not None:
-            watchdog.cancel()
-        if retry_timer is not None:
-            retry_timer.cancel()
+        if response_deadline is not None:
+            response_deadline.cancel()
+        if retry_call is not None:
+            retry_call.cancel()
 
     def _response_timed_out(self, response_future: Any) -> None:
         with self._lock:
             if self._done or self._response_future is not response_future:
                 return
             self._response_future = None
-            self._response_watchdog = None
+            self._response_deadline = None
         try:
             cancel = getattr(response_future, "cancel", None)
             if callable(cancel):
@@ -225,20 +321,27 @@ class _TaskAdmissionCancellation:
 
     def _schedule_retry(self) -> None:
         with self._lock:
-            if self._done or self._submitting or self._response_future is not None or self._retry_timer is not None:
+            if self._done or self._submitting or self._response_future is not None or self._retry_call is not None:
                 return
             self._retry_count += 1
-            timer = threading.Timer(
-                self._retry_delay(self._retry_count),
-                self._retry,
-            )
-            timer.daemon = True
-            self._retry_timer = timer
-        timer.start()
+            retry_call: _ScheduledCall
 
-    def _retry(self) -> None:
+            def retry() -> None:
+                self._retry(retry_call)
+
+            retry_call = _TASK_ADMISSION_CANCELLATION_SCHEDULER.create(retry)
+            self._retry_call = retry_call
+            retry_delay = self._retry_delay(self._retry_count)
+        _TASK_ADMISSION_CANCELLATION_SCHEDULER.schedule(
+            retry_call,
+            retry_delay,
+        )
+
+    def _retry(self, retry_call: _ScheduledCall) -> None:
         with self._lock:
-            self._retry_timer = None
+            if self._retry_call is not retry_call:
+                return
+            self._retry_call = None
         self.start()
 
 

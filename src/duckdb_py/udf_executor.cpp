@@ -1380,6 +1380,10 @@ private:
 			}
 			D_ASSERT(lifecycle_state == DispatcherLifecycleState::ACCEPTING);
 			lifecycle_state = DispatcherLifecycleState::STOPPING;
+			// From this point, every collector record belongs to the one
+			// aggregate shutdown below. A racing unregister must not start a
+			// fresh per-slot deadline after the terminal fence linearizes.
+			terminal_collector_shutdown_owned.store(true);
 			if (!thread_running) {
 				lifecycle_state = DispatcherLifecycleState::STOPPED;
 				return;
@@ -1511,7 +1515,7 @@ private:
 			if (!slot || !IsSlotActive(*slot)) {
 				continue;
 			}
-			AbortSlotForError(*slot);
+			AbortSlotForTerminalShutdown(*slot);
 		}
 		// StopThread fences Register under global_lock before setting
 		// shutdown_requested. The fresh snapshot above therefore covers every
@@ -1858,7 +1862,9 @@ private:
 		}
 		PythonGILWrapper gil;
 		for (auto &kv : cleanup_slots) {
-			CancelSlotForCleanup_WithGIL(*kv.second);
+			// Terminal shutdown owns the process-wide collector as one unit.
+			// Per-slot cancellation would apply its full timeout once per slot.
+			CancelSlotForCleanup_WithGIL(*kv.second, false);
 			if (kv.second->py_executor) {
 				kv.second->py_executor.reset();
 			}
@@ -2080,6 +2086,9 @@ private:
 	}
 
 	bool CancelAsyncCollectorSlot_WithGIL(ExecutorSlot &slot) {
+		if (terminal_collector_shutdown_owned.load()) {
+			return true;
+		}
 		if (!PayloadUsesRayStreamCollector(slot.payload) || !async_collector || slot.collector_retired.load()) {
 			return true;
 		}
@@ -2122,11 +2131,13 @@ private:
 		return true;
 	}
 
-	void CancelSlotForCleanup_WithGIL(ExecutorSlot &slot) {
+	void CancelSlotForCleanup_WithGIL(ExecutorSlot &slot, bool cancel_collector = true) {
 		if (slot.cleanup_cancel_requested.exchange(true)) {
 			return;
 		}
-		CancelAsyncCollectorSlot_WithGIL(slot);
+		if (cancel_collector) {
+			CancelAsyncCollectorSlot_WithGIL(slot);
+		}
 		if (slot.py_executor) {
 			try {
 				slot.py_executor->obj.attr("close")();
@@ -2143,13 +2154,22 @@ private:
 		slot.all_tasks_finished.store(true);
 	}
 
-	void AbortSlotForError(ExecutorSlot &slot) {
+	bool MarkSlotAborted(ExecutorSlot &slot) {
 		const bool first_abort = !slot.abort_requested.exchange(true);
 		slot.inflight_count.store(0);
 		slot.finished_submitting_acked.store(true);
 		slot.all_tasks_finished.store(true);
 		slot.rows_by_submit_id.clear();
 		slot.ref_inputs_by_submit_id.clear();
+		return first_abort;
+	}
+
+	void AbortSlotForTerminalShutdown(ExecutorSlot &slot) {
+		MarkSlotAborted(slot);
+	}
+
+	void AbortSlotForError(ExecutorSlot &slot) {
+		const bool first_abort = MarkSlotAborted(slot);
 		if (first_abort && PythonRuntimeUsableForUDFTeardown()) {
 			try {
 				PythonGILWrapper gil;
@@ -3271,6 +3291,7 @@ private:
 	std::thread dispatcher_thread;
 	atomic<bool> stop {false};
 	atomic<bool> shutdown_requested {false};
+	atomic<bool> terminal_collector_shutdown_owned {false};
 	atomic<bool> wakeup_fired {false}; // set by async collector wakeup callback
 	atomic<bool> work_pending {false}; // set by all notify paths before signaling work_cv
 	mutex dispatcher_error_lock;

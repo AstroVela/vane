@@ -1534,6 +1534,94 @@ def test_terminal_control_ack_survives_bounded_replay_payload_eviction():
     asyncio.run(scenario())
 
 
+def test_output_terminal_control_ack_survives_bounded_replay_payload_eviction():
+    async def scenario():
+        query_id = "query-output-terminal-after-eviction"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_graph(
+            graph,
+            _allocation(),
+            on_change=lambda: runner_cls._signal_query_resource_change(
+                runner,
+                query_id,
+            ),
+        )
+        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+
+        task_request = _task_request(
+            query_id,
+            "request:output-terminal-task",
+            "task:output-terminal",
+        )
+        task = await runner_cls.acquire_query_task_lease(runner, task_request)
+        output_request = {
+            "request_id": "request:output-terminal-after-eviction",
+            "query_id": query_id,
+            "producer_stage_id": graph.stages[0].stage_id,
+            "task_lease_id": task["lease"]["lease_id"],
+            "attempt_id": task["lease"]["attempt_id"],
+            "block_id": "block:output-terminal-after-eviction",
+            "size_bytes": 10,
+        }
+        output = await runner_cls.acquire_query_output_block_lease(
+            runner,
+            output_request,
+        )
+        lease_id = output["lease"]["lease_id"]
+
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            output_request["request_id"],
+            lease_id,
+        ) == {"released": True}
+
+        runner._query_output_lease_request_tombstones.clear()
+
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            output_request["request_id"],
+            lease_id,
+        ) == {"released": True}
+        assert await runner_cls.handoff_query_output_block_lease(
+            runner,
+            output_request["request_id"],
+            lease_id,
+        ) == {"handed_off": True}
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            output_request["request_id"],
+            "wrong-output-lease",
+        ) == {"released": False}
+        replay = await runner_cls.acquire_query_output_block_lease(
+            runner,
+            output_request,
+        )
+        assert replay["granted"] is False
+        assert replay["fatal"] is True
+        assert replay["blocked_reason"] == "output_lease_request_released"
+        assert await runner_cls.cancel_query_output_block_lease_request(
+            runner,
+            output_request,
+        ) == {"cancelled": True, "released": False}
+        mismatched = dict(output_request)
+        mismatched["size_bytes"] = 11
+        with pytest.raises(ValueError, match="reused with different identity"):
+            await runner_cls.cancel_query_output_block_lease_request(
+                runner,
+                mismatched,
+            )
+
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            task["lease"]["lease_id"],
+            task["lease"]["attempt_id"],
+        ) == {"released": True}
+
+    asyncio.run(scenario())
+
+
 def test_cancelled_admission_request_replay_returns_the_same_terminal_denial():
     async def scenario():
         query_id = "query-cancelled-request-replay"
