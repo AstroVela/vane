@@ -297,6 +297,7 @@ def test_task_lease_stream_submits_immediately_from_pregranted_admission():
     adapter = RayStreamAdapter(source, ray_module=fake_ray)
 
     assert submitted == [lease]
+    assert adapter.task_lease == lease
 
     _finish_cleanup_operations(source.release_task_operations())
     _finish_cleanup_operations(source.release_task_operations())
