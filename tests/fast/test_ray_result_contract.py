@@ -2541,8 +2541,30 @@ def test_ray_query_driver_client_copy_failure_recovers_without_cancel_or_close(m
     ]
 
 
-def test_ray_query_driver_client_maps_recovery_rpc_creation_failure_to_unknown(monkeypatch):
+@pytest.mark.parametrize(
+    "structured_operation_error",
+    (False, True),
+    ids=("plain-timeout", "structured-unknown"),
+)
+def test_ray_query_driver_client_maps_recovery_rpc_creation_failure_to_unknown(
+    monkeypatch,
+    structured_operation_error,
+):
     copy_future = object()
+    operation_id = "copy-recovery-creation-failed"
+    operation_error = (
+        driver.CopyOutcomeUnknownError(
+            operation_id,
+            base_path="s3://bucket/out",
+            run_id="run-recovery-creation-failed",
+            manifest_path="s3://bucket/out.duckdb_commit/run-recovery-creation-failed/manifest.txt",
+            committed_marker_path="s3://bucket/out.duckdb_commit/run-recovery-creation-failed/committed",
+            detail="native marker readback failed",
+            cleanup_warnings=("native cleanup failed",),
+        )
+        if structured_operation_error
+        else FutureTimeoutError("COPY response wait timed out")
+    )
 
     class _RemoteMethod:
         def __init__(self, result=None, *, error=None):
@@ -2568,29 +2590,60 @@ def test_ray_query_driver_client_maps_recovery_rpc_creation_failure_to_unknown(m
     monkeypatch.setattr(client, "_runtime_is_unavailable_or_replaced", lambda: False)
 
     monkeypatch.setattr(driver, "progress_enabled", lambda: False)
-    monkeypatch.setattr(
-        driver,
-        "resolve_object_refs_blocking",
-        lambda ref, **_kwargs: (_ for _ in ()).throw(FutureTimeoutError("COPY response wait timed out")),
-    )
+
+    def _resolve(ref, **_kwargs):
+        assert ref is copy_future
+        raise operation_error
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
 
     with pytest.raises(driver.CopyOutcomeUnknownError) as error:
-        client.run_copy_plan(_FakePhysicalPlanWithoutPlanAttr("copy-recovery-creation-failed"))
+        client.run_copy_plan(_FakePhysicalPlanWithoutPlanAttr(operation_id))
 
-    assert error.value.operation_id == "copy-recovery-creation-failed"
+    assert error.value.operation_id == operation_id
+    if structured_operation_error:
+        assert error.value is operation_error
+        assert error.value.base_path == "s3://bucket/out"
+        assert error.value.run_id == "run-recovery-creation-failed"
+        assert error.value.manifest_path.endswith("/manifest.txt")
+        assert error.value.committed_marker_path.endswith("/committed")
+        assert error.value.detail == "native marker readback failed"
+        assert error.value.cleanup_warnings == ("native cleanup failed",)
     assert len(run_copy_plan.calls) == 1
     assert recover_copy_plan.calls == [
         (
             _TEST_RUNTIME_OWNER_ID,
             _TEST_SESSION_ID,
-            "copy-recovery-creation-failed",
+            operation_id,
         )
     ]
 
 
-def test_ray_query_driver_client_maps_recovery_resolution_failure_to_unknown(monkeypatch):
+@pytest.mark.parametrize(
+    "structured_operation_error",
+    (False, True),
+    ids=("plain-timeout", "structured-unknown"),
+)
+def test_ray_query_driver_client_maps_recovery_resolution_failure_to_unknown(
+    monkeypatch,
+    structured_operation_error,
+):
     copy_future = object()
     recovery_future = object()
+    operation_id = "copy-recovery-resolution-failed"
+    operation_error = (
+        driver.CopyOutcomeUnknownError(
+            operation_id,
+            base_path="s3://bucket/out",
+            run_id="run-recovery-resolution-failed",
+            manifest_path="s3://bucket/out.duckdb_commit/run-recovery-resolution-failed/manifest.txt",
+            committed_marker_path="s3://bucket/out.duckdb_commit/run-recovery-resolution-failed/committed",
+            detail="native marker readback failed",
+            cleanup_warnings=("native cleanup failed",),
+        )
+        if structured_operation_error
+        else FutureTimeoutError("COPY response wait timed out")
+    )
 
     class _RemoteMethod:
         def __init__(self, result):
@@ -2614,7 +2667,7 @@ def test_ray_query_driver_client_maps_recovery_resolution_failure_to_unknown(mon
 
     def _resolve(ref, **_kwargs):
         if ref is copy_future:
-            raise FutureTimeoutError("COPY response wait timed out")
+            raise operation_error
         assert ref is recovery_future
         raise PermissionError("runtime owner expired during COPY recovery")
 
@@ -2622,15 +2675,23 @@ def test_ray_query_driver_client_maps_recovery_resolution_failure_to_unknown(mon
     monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
 
     with pytest.raises(driver.CopyOutcomeUnknownError) as error:
-        client.run_copy_plan(_FakePhysicalPlanWithoutPlanAttr("copy-recovery-resolution-failed"))
+        client.run_copy_plan(_FakePhysicalPlanWithoutPlanAttr(operation_id))
 
-    assert error.value.operation_id == "copy-recovery-resolution-failed"
+    assert error.value.operation_id == operation_id
+    if structured_operation_error:
+        assert error.value is operation_error
+        assert error.value.base_path == "s3://bucket/out"
+        assert error.value.run_id == "run-recovery-resolution-failed"
+        assert error.value.manifest_path.endswith("/manifest.txt")
+        assert error.value.committed_marker_path.endswith("/committed")
+        assert error.value.detail == "native marker readback failed"
+        assert error.value.cleanup_warnings == ("native cleanup failed",)
     assert len(run_copy_plan.calls) == 1
     assert recover_copy_plan.calls == [
         (
             _TEST_RUNTIME_OWNER_ID,
             _TEST_SESSION_ID,
-            "copy-recovery-resolution-failed",
+            operation_id,
         )
     ]
 

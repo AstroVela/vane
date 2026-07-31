@@ -14,7 +14,7 @@ import weakref
 from collections.abc import Callable, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NoReturn
 
 from duckdb._ray_cxx import require_ray_cxx_attr
 from duckdb._ray_errors import restore_remote_ray_exception
@@ -181,6 +181,23 @@ def _runtime_error_candidates(error: BaseException) -> list[BaseException]:
                 candidate_ids.add(id(cause))
                 candidates.append(cause)
     return candidates
+
+
+def _raise_copy_outcome_unknown(
+    operation_id: str,
+    operation_error: BaseException,
+) -> NoReturn:
+    unknown_error = next(
+        (
+            candidate
+            for candidate in _runtime_error_candidates(operation_error)
+            if isinstance(candidate, CopyOutcomeUnknownError)
+        ),
+        None,
+    )
+    if unknown_error is not None:
+        raise unknown_error
+    raise CopyOutcomeUnknownError(operation_id) from operation_error
 
 
 def _runtime_error_contains(error: BaseException, error_type: type[BaseException]) -> bool:
@@ -6061,7 +6078,7 @@ class RayQueryDriverClient:
                 operation_id,
             )
         except BaseException:
-            raise CopyOutcomeUnknownError(operation_id) from operation_error
+            _raise_copy_outcome_unknown(operation_id, operation_error)
         try:
             recovery = resolve_object_refs_blocking(
                 recovery_future,
@@ -6080,16 +6097,16 @@ class RayQueryDriverClient:
             )
             if unknown_error is not None:
                 raise unknown_error
-            raise CopyOutcomeUnknownError(operation_id) from operation_error
+            _raise_copy_outcome_unknown(operation_id, operation_error)
         if not isinstance(recovery, CopyPlanRecovery):
-            raise CopyOutcomeUnknownError(operation_id) from operation_error
+            _raise_copy_outcome_unknown(operation_id, operation_error)
         if recovery.operation_id != operation_id:
-            raise CopyOutcomeUnknownError(operation_id) from operation_error
+            _raise_copy_outcome_unknown(operation_id, operation_error)
         if (recovery.outcome is None) == (recovery.error is None):
-            raise CopyOutcomeUnknownError(operation_id) from operation_error
+            _raise_copy_outcome_unknown(operation_id, operation_error)
         if recovery.error is not None:
             if not isinstance(recovery.error, BaseException):
-                raise CopyOutcomeUnknownError(operation_id) from operation_error
+                _raise_copy_outcome_unknown(operation_id, operation_error)
             restored_error = restore_remote_ray_exception(recovery.error)
             raise recovery.error if restored_error is None else restored_error
         try:
@@ -6098,7 +6115,7 @@ class RayQueryDriverClient:
                 operation_id,
             )
         except BaseException:
-            raise CopyOutcomeUnknownError(operation_id) from operation_error
+            _raise_copy_outcome_unknown(operation_id, operation_error)
 
     @staticmethod
     def _validate_copy_outcome(
