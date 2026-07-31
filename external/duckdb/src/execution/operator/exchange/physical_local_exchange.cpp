@@ -202,10 +202,14 @@ PhysicalLocalExchange::PhysicalLocalExchange(PhysicalPlan &physical_plan, Physic
                                              idx_t estimated_cardinality)
     : PhysicalOperator(physical_plan, type, std::move(types), estimated_cardinality),
       repartition_spec(std::move(repartition_spec)) {
-	if (this->repartition_spec) {
-		auto exprs = this->repartition_spec->repartition_by();
+	if (this->repartition_spec && this->repartition_spec->type() == RepartitionSpec::Type::Hash) {
+		auto *hash_spec = dynamic_cast<HashRepartitionSpec *>(this->repartition_spec.get());
+		if (!hash_spec) {
+			throw InternalException("Expected HashRepartitionSpec for local exchange");
+		}
+		const auto &exprs = hash_spec->config()->by;
 		partition_by.reserve(exprs.size());
-		for (auto &expr_ref : exprs) {
+		for (const auto &expr_ref : exprs) {
 			if (expr_ref) {
 				partition_by.push_back(expr_ref->Copy());
 			}

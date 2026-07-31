@@ -44,9 +44,9 @@ void LogicalLocalExchange::Serialize(Serializer &serializer) const {
 			if (config->num_partitions) {
 				num_partitions = optional_idx(static_cast<idx_t>(config->num_partitions));
 			}
-			auto exprs = repartition_spec->repartition_by();
+			const auto &exprs = config->by;
 			partition_by.reserve(exprs.size());
-			for (auto &expr : exprs) {
+			for (const auto &expr : exprs) {
 				if (expr) {
 					partition_by.push_back(expr->Copy());
 				}
