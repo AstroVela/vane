@@ -890,11 +890,13 @@ class AsyncResultCollector:
                     except RuntimeError:
                         pass
                     if self._thread is not threading.current_thread():
-                        self._thread.join(timeout=self._shutdown_timeout_s)
-                    if self._thread.is_alive():
-                        add_note = getattr(exc, "add_note", None)
-                        if callable(add_note):
-                            add_note("Ray UDF stream event loop did not terminate after start failure")
+                        # Construction has not transferred ownership to a
+                        # caller, so returning while this thread is alive would
+                        # orphan its loop and Ray references.  The production
+                        # thread target publishes ``_loop_ready`` before doing
+                        # any blocking work; once ``loop.stop`` is queued it
+                        # therefore has a finite path to termination.
+                        self._thread.join()
                 else:
                     self._loop.close()
                 raise

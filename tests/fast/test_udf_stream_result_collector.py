@@ -393,17 +393,22 @@ def test_event_loop_start_failure_prevents_submitted_stream_ownership(monkeypatc
 
 def test_event_loop_start_timeout_rolls_back_started_thread(monkeypatch):
     fake_ray = _FakeRay()
-    monkeypatch.setenv("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S", "0.05")
+    monkeypatch.setenv("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S", "0.02")
+    existing_threads = set(threading.enumerate())
 
     class SlowStartCollector(AsyncResultCollector):
         def _run_event_loop(self):
-            time.sleep(0.06)
+            # Stay blocked beyond both the startup deadline and the old
+            # second bounded join. Construction must still reclaim this
+            # thread before propagating its startup failure.
+            time.sleep(0.08)
             super()._run_event_loop()
 
     with pytest.raises(RuntimeError, match="event loop did not start"):
         SlowStartCollector(ray_module=fake_ray)
 
-    assert not any(thread.name == "udf-ray-stream-multiplexer" for thread in threading.enumerate())
+    new_threads = set(threading.enumerate()) - existing_threads
+    assert not any(thread.name == "udf-ray-stream-multiplexer" for thread in new_threads)
 
 
 def test_scheduler_failure_isolated_to_stream_does_not_poison_future_slots():
