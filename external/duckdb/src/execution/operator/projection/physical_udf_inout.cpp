@@ -2868,6 +2868,15 @@ void PhysicalStreamingUDF::BuildPipelines(Pipeline &current, MetaPipeline &meta_
 	if (children.size() != 1) {
 		throw InternalException("PhysicalStreamingUDF requires exactly one child");
 	}
+
+	// Prepared statements reuse physical operators. Clear the source/sink
+	// rendezvous before either side initializes state for the next execution.
+	std::shared_ptr<StreamingUDFState> previous_streaming_state;
+	{
+		lock_guard<std::mutex> guard(streaming_state_lock);
+		previous_streaming_state = std::move(streaming_state);
+	}
+	previous_streaming_state.reset();
 	auto &state = meta_pipeline.GetState();
 	state.SetPipelineSource(current, *this);
 	auto &child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, *this, MetaPipelineType::REGULAR, false);

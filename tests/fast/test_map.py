@@ -102,6 +102,25 @@ class TestMap:
         assert "INOUT_FUNCTION" not in plan
         assert result.fetchall() == [(0,), (3,), (6,)]
 
+    def test_create_table_function_prepared_statement_reuses_streaming_plan(self, duckdb_cursor):
+        def identity(table):
+            import pyarrow as pa
+
+            return pa.table({"x": table.column(0)})
+
+        duckdb_cursor.create_table_function(
+            "prepared_map_batches_test",
+            identity,
+            schema={"x": duckdb.sqltypes.BIGINT},
+        )
+        duckdb_cursor.execute(
+            "PREPARE prepared_streaming_udf AS SELECT * FROM prepared_map_batches_test((SELECT i FROM range(3) tbl(i)))"
+        )
+
+        expected = [(0,), (1,), (2,)]
+        results = [duckdb_cursor.execute("EXECUTE prepared_streaming_udf").fetchall() for _ in range(3)]
+        assert results == [expected, expected, expected]
+
     def test_create_table_function_map_batches_projects_output(self, duckdb_cursor):
         def calculate_values(table):
             import pyarrow as pa
