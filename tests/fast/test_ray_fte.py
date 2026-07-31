@@ -1285,6 +1285,23 @@ def test_derive_exchange_sink_instance_uses_full_fte_task_identity():
     assert first_identity != second_identity
 
 
+def test_derive_exchange_sink_instance_rejects_reserved_task_identity():
+    component_max = (1 << 32) - 1
+    base = {
+        "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+        "output_location": "q_coordinator__sink_0__attempt_0",
+        "fte_task_identity": True,
+    }
+
+    with pytest.raises(ValueError, match="reserved invalid task index"):
+        derive_exchange_sink_instance_for_attempt(
+            base,
+            0,
+            task_partition_id=component_max,
+            fragment_execution_id=component_max,
+        )
+
+
 def test_task_descriptor_appends_splits_idempotently_and_replays_fte_fields():
     task_id = FteTaskId("q", 2, 3)
     descriptor = TaskDescriptor(

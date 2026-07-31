@@ -78,6 +78,7 @@ def _sink_instance_payload(exchange_sink_instance: Any) -> dict[str, Any]:
 
 _FTE_TASK_IDENTITY_COMPONENT_BITS = 32
 _FTE_TASK_IDENTITY_COMPONENT_MAX = (1 << _FTE_TASK_IDENTITY_COMPONENT_BITS) - 1
+_FTE_TASK_IDENTITY_INVALID = (1 << (_FTE_TASK_IDENTITY_COMPONENT_BITS * 2)) - 1
 
 
 def _fte_task_partition_identity(fragment_execution_id: int, partition_id: int) -> int:
@@ -87,7 +88,10 @@ def _fte_task_partition_identity(fragment_execution_id: int, partition_id: int) 
         raise ValueError("fragment_execution_id exceeds the FTE sink identity range")
     if partition_id > _FTE_TASK_IDENTITY_COMPONENT_MAX:
         raise ValueError("task_partition_id exceeds the FTE sink identity range")
-    return (fragment_execution_id << _FTE_TASK_IDENTITY_COMPONENT_BITS) | partition_id
+    identity = (fragment_execution_id << _FTE_TASK_IDENTITY_COMPONENT_BITS) | partition_id
+    if identity == _FTE_TASK_IDENTITY_INVALID:
+        raise ValueError("FTE sink identity collides with the reserved invalid task index")
+    return identity
 
 
 def derive_exchange_sink_instance_for_attempt(
