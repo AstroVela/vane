@@ -943,6 +943,72 @@ def test_cleanup_ticket_retries_a_hung_control_response(monkeypatch):
         collector.shutdown()
 
 
+def test_cleanup_ticket_expands_slow_response_deadline(monkeypatch):
+    monkeypatch.setattr(
+        "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
+        0.01,
+    )
+    monkeypatch.setattr(
+        "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_MAX_S",
+        0.04,
+    )
+    collector = AsyncResultCollector(ray_module=_FakeRay())
+    attempts = []
+    response_timers = []
+    response_future = None
+
+    def transfer_owner():
+        nonlocal response_future
+        if response_future is None:
+            response_future = Future()
+            attempts.append(response_future)
+
+            def acknowledge(future=response_future):
+                if not future.cancelled():
+                    future.set_result(True)
+
+            timer = threading.Timer(0.015, acknowledge)
+            timer.daemon = True
+            timer.start()
+            response_timers.append(timer)
+        if not response_future.done():
+            return response_future
+        response_future.result()
+        response_future = None
+        return True
+
+    def abandon_wait(future):
+        nonlocal response_future
+        if response_future is future:
+            response_future = None
+        future.cancel()
+
+    tickets = collector._submit_cleanup_operations(
+        (
+            RayStreamCleanupOperation(
+                transfer_owner,
+                retry_on_error=True,
+                abandon_wait=abandon_wait,
+            ),
+        ),
+        store_error=False,
+    )
+    try:
+        assert (
+            collector._wait_cleanup_tickets(
+                tickets,
+                timeout_message="slow cleanup response was not acknowledged",
+            )
+            == ()
+        )
+        assert len(attempts) == 2
+        for timer in response_timers:
+            timer.join(timeout=1.0)
+            assert timer.is_alive() is False
+    finally:
+        collector.shutdown()
+
+
 def test_zero_capacity_does_not_consume_block_or_metadata_objects():
     fake_ray = _FakeRay()
     driver = _Driver()

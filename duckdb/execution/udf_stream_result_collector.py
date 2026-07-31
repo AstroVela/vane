@@ -34,6 +34,7 @@ _GENERATOR_READINESS_POLL_MAX_DELAY_S = 0.01
 _CLEANUP_RETRY_INITIAL_DELAY_S = 0.01
 _CLEANUP_RETRY_MAX_DELAY_S = 1.0
 _CLEANUP_RESPONSE_TIMEOUT_S = 1.0
+_CLEANUP_RESPONSE_TIMEOUT_MAX_S = 30.0
 
 
 def _collector_debug_log(event: str, record: _StreamRecord, **fields: Any) -> None:
@@ -1233,6 +1234,14 @@ class AsyncResultCollector:
             _CLEANUP_RETRY_MAX_DELAY_S,
         )
 
+    @staticmethod
+    def _cleanup_response_timeout(retry_count: int) -> float:
+        exponent = min(max(0, int(retry_count)), 30)
+        return min(
+            math.ldexp(_CLEANUP_RESPONSE_TIMEOUT_S, exponent),
+            _CLEANUP_RESPONSE_TIMEOUT_MAX_S,
+        )
+
     def _retry_cleanup_ticket(self, ticket: _CleanupTicket) -> None:
         with self._cv:
             if ticket not in self._cleanup_tickets:
@@ -1322,7 +1331,9 @@ class AsyncResultCollector:
                         with self._cv:
                             if ticket in self._cleanup_tickets and ticket.wait_future is result:
                                 ticket.wait_timeout = self._loop.call_later(
-                                    _CLEANUP_RESPONSE_TIMEOUT_S,
+                                    self._cleanup_response_timeout(
+                                        ticket.retry_count,
+                                    ),
                                     self._timeout_cleanup_ticket,
                                     ticket,
                                     result,
