@@ -4,9 +4,10 @@
 #include "duckdb/execution/operator/projection/physical_vllm.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/vllm_executor.hpp"
-#include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/execution/vllm_inflight_counter.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -193,11 +194,9 @@ struct VLLMGlobalOperatorState : public GlobalOperatorState {
 	std::mutex executor_call_mutex;
 	shared_ptr<VLLMExecutor> executor;
 
-	//! Global backpressure tracking (atomic for lock-free access).
-	//! Signed to avoid underflow when concurrent executors share an actor pool
-	//! and concurrent executors receive results belonging to another executor.
-	std::atomic<int64_t> submitted_prompts {0};
-	std::atomic<int64_t> completed_prompts {0};
+	//! Global backpressure tracking. A single atomic counter prevents readers
+	//! from combining submitted and completed values from different moments.
+	VLLMInflightCounter inflight_prompts;
 
 	//! Thread coordination for FinalExecute.
 	std::atomic<idx_t> active_threads {1};
@@ -208,21 +207,11 @@ struct VLLMGlobalOperatorState : public GlobalOperatorState {
 		active_threads.store(MaxValue<idx_t>(1, max_threads));
 	}
 
-	int64_t InflightPrompts() const {
-		const auto submitted = submitted_prompts.load();
-		const auto completed = completed_prompts.load();
-		if (completed > submitted) {
-			throw InternalException("vllm completed prompt count exceeded submitted prompt count");
-		}
-		return submitted - completed;
-	}
-
 	bool CanSubmitMore() const {
-		auto inflight = InflightPrompts();
 		if (config.inflight_limit == 0) {
 			return true; // No backpressure limit (shared pool mode)
 		}
-		return static_cast<idx_t>(inflight) < config.inflight_limit;
+		return inflight_prompts.Count() < config.inflight_limit;
 	}
 
 	void EnsureExecutor(ExecutionContext &context) {
@@ -382,7 +371,7 @@ static void SubmitPrompts(ExecutionContext &context, VLLMGlobalOperatorState &gs
 			// Publish after Python has installed its reservation and wait state.
 			// executor_call_mutex also prevents a result drain from racing ahead
 			// of this native accounting update.
-			gstate.submitted_prompts.fetch_add(prompts.size());
+			gstate.inflight_prompts.RecordSubmission(prompts.size());
 		});
 		return;
 	}
@@ -417,7 +406,7 @@ static void SubmitPrompts(ExecutionContext &context, VLLMGlobalOperatorState &gs
 
 		gstate.WithExecutor([&](VLLMExecutor &exec) {
 			exec.Submit(prefix, std::move(batch_prompts), batch_rows, context.client);
-			gstate.submitted_prompts.fetch_add(count);
+			gstate.inflight_prompts.RecordSubmission(count);
 		});
 	}
 }
@@ -440,7 +429,7 @@ static void TakeReadyResultOnce(ExecutionContext &context, VLLMGlobalOperatorSta
 		throw InvalidInputException("vllm executor returned %d columns, expected %d", result.second.rows->ColumnCount(),
 		                            input_column_count);
 	}
-	gstate.completed_prompts.fetch_add(result.second.rows->size());
+	gstate.inflight_prompts.RecordCompletion(result.second.rows->size());
 	auto output = BuildOutputChunk(context, *result.second.rows, result.second.outputs, result.second.outputs_validity);
 	state.pending_outputs.push_back(std::move(output));
 }
