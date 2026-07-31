@@ -65,15 +65,13 @@
 
 namespace duckdb {
 
-static constexpr idx_t DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES = 128ULL * 1024ULL * 1024ULL;
-
 struct ParquetWriteBindData : public TableFunctionData {
 	vector<LogicalType> sql_types;
 	vector<string> column_names;
 	duckdb_parquet::CompressionCodec::type codec = duckdb_parquet::CompressionCodec::SNAPPY;
 	vector<pair<string, string>> kv_metadata;
 	idx_t row_group_size = DEFAULT_ROW_GROUP_SIZE;
-	idx_t row_group_size_bytes = DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES;
+	idx_t row_group_size_bytes = NumericLimits<idx_t>::Maximum();
 
 	//! Encryption configuration
 	shared_ptr<ParquetEncryptionConfig> encryption_config;
