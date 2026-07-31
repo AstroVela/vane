@@ -4198,6 +4198,7 @@ def test_fte_fragment_execution_rewrites_base_sink_partition_for_dynamic_task_pa
 
 def test_fte_fragment_execution_uses_logical_fragment_identity_for_materialized_sink():
     worker = _FakeLiveWorker("worker-a")
+    registered_identities = []
     base_sink = {
         "sink_handle": {"task_partition_id": 0, "partition_id": 0},
         "task_partition_id": 0,
@@ -4210,7 +4211,10 @@ def test_fte_fragment_execution_uses_logical_fragment_identity_for_materialized_
         "q",
         12,
         fragment_id="q:node:sample",
-        logical_fragment_execution_id=4,
+        logical_fragment_identity='["ray-fte-logical-fragment-v1","node:sample:fte","node:sample"]',
+        stable_task_identity_callback=lambda stable_task_identity, identity_key: registered_identities.append(
+            (stable_task_identity, identity_key)
+        ),
         worker=worker,
         task_context_info={"exchange_sink_instance": base_sink},
     )
@@ -4221,9 +4225,11 @@ def test_fte_fragment_execution_uses_logical_fragment_identity_for_materialized_
     scheduled = scheduled_result[0]
     _execute_stage_commands(stage, scheduled_result)
     sink_instance = scheduled.request["exchange_sink_instance"]
-    expected_sink_identity = (4 << 32) | 3
+    assert len(registered_identities) == 1
+    expected_sink_identity, identity_key = registered_identities[0]
 
     assert str(scheduled.attempt_id) == "q.12.3.0"
+    assert identity_key.endswith(",3]")
     assert sink_instance["task_partition_id"] == expected_sink_identity
     assert sink_instance["sink_handle"]["task_partition_id"] == expected_sink_identity
     assert sink_instance["output_location"] == f"q_coordinator__sink_{expected_sink_identity}__attempt_0"

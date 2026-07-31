@@ -268,6 +268,7 @@ def _clear_fte_state() -> None:
     clear_query_resource_managers()
     worker_handle_mod._FTE_FRAGMENT_EXECUTION_IDS.clear()
     worker_handle_mod._FTE_QUERY_NEXT_FRAGMENT_EXECUTION_ID.clear()
+    worker_handle_mod._FTE_STABLE_TASK_IDENTITY_KEYS_BY_RESOURCE_QUERY.clear()
     worker_handle_mod._FTE_FRAGMENT_EXECUTIONS.clear()
     worker_handle_mod._FTE_PARTITION_OWNERS.clear()
     worker_handle_mod._FTE_SEQUENCES.clear()

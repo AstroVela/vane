@@ -33,6 +33,7 @@ from duckdb.runners.fte.fte_events import (
 )
 from duckdb.runners.fte.fte_exchange import (
     _sink_instance_payload,
+    _stable_fte_task_identity,
     derive_exchange_sink_instance_for_attempt,
 )
 from duckdb.runners.fte.fte_failures import (
@@ -451,7 +452,8 @@ class FteFragmentExecution:
         fragment_execution_id: int,
         *,
         fragment_id: str,
-        logical_fragment_execution_id: int | None = None,
+        logical_fragment_identity: str | None = None,
+        stable_task_identity_callback: Callable[[int, str], None] | None = None,
         worker: Any = None,
         worker_id: str | None = None,
         worker_selector: Callable[[FteTaskPartition], Any] | None = None,
@@ -480,11 +482,12 @@ class FteFragmentExecution:
         self.fragment_id = str(fragment_id).strip()
         if not self.fragment_id:
             raise ValueError("fragment_id must be non-empty")
-        self.logical_fragment_execution_id = (
-            None
-            if logical_fragment_execution_id is None
-            else _check_non_negative("logical_fragment_execution_id", logical_fragment_execution_id)
+        self.logical_fragment_identity = (
+            None if logical_fragment_identity is None else str(logical_fragment_identity).strip()
         )
+        if logical_fragment_identity is not None and not self.logical_fragment_identity:
+            raise ValueError("logical_fragment_identity must be non-empty")
+        self.stable_task_identity_callback = stable_task_identity_callback
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
         self.worker = worker
@@ -1521,13 +1524,22 @@ class FteFragmentExecution:
         sink_instance = None
         if self.exchange is None and partition.descriptor.exchange_sink_instance is not None:
             sink_payload = _sink_instance_payload(partition.descriptor.exchange_sink_instance)
-            if sink_payload.get("fte_task_identity") and self.logical_fragment_execution_id is None:
-                raise ValueError("FTE-derived exchange sink identity requires a stable logical fragment identity")
+            stable_task_identity = None
+            if sink_payload.get("fte_task_identity"):
+                logical_fragment_identity = self.logical_fragment_identity
+                if logical_fragment_identity is None:
+                    raise ValueError("FTE-derived exchange sink identity requires a stable logical fragment identity")
+                stable_task_identity, identity_key = _stable_fte_task_identity(
+                    logical_fragment_identity,
+                    partition.task_id.partition_id,
+                )
+                if self.stable_task_identity_callback is not None:
+                    self.stable_task_identity_callback(stable_task_identity, identity_key)
             sink_instance = derive_exchange_sink_instance_for_attempt(
                 partition.descriptor.exchange_sink_instance,
                 partition.next_attempt_number(),
                 task_partition_id=partition.task_id.partition_id,
-                fragment_execution_id=self.logical_fragment_execution_id,
+                stable_task_identity=stable_task_identity,
             )
         worker_id, worker = self._select_worker(partition)
         if self.exchange is not None:

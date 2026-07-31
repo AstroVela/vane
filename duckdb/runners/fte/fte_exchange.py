@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -79,6 +80,24 @@ def _sink_instance_payload(exchange_sink_instance: Any) -> dict[str, Any]:
 _FTE_TASK_IDENTITY_COMPONENT_BITS = 32
 _FTE_TASK_IDENTITY_COMPONENT_MAX = (1 << _FTE_TASK_IDENTITY_COMPONENT_BITS) - 1
 _FTE_TASK_IDENTITY_INVALID = (1 << (_FTE_TASK_IDENTITY_COMPONENT_BITS * 2)) - 1
+_FTE_STABLE_TASK_IDENTITY_MASK = (1 << 63) - 1
+
+
+def _stable_fte_task_identity(logical_fragment_identity: str, partition_id: int) -> tuple[int, str]:
+    logical_fragment_identity = str(logical_fragment_identity).strip()
+    if not logical_fragment_identity:
+        raise ValueError("logical_fragment_identity must be non-empty")
+    partition_id = _check_non_negative("task_partition_id", partition_id)
+    identity_key = json.dumps(
+        ["ray-fte-logical-task-v1", logical_fragment_identity, partition_id],
+        separators=(",", ":"),
+    )
+    digest = hashlib.blake2b(
+        identity_key.encode("utf-8"),
+        digest_size=8,
+        person=b"vane-ray-fte-v1",
+    ).digest()
+    return int.from_bytes(digest, "big") & _FTE_STABLE_TASK_IDENTITY_MASK, identity_key
 
 
 def _fte_task_partition_identity(fragment_execution_id: int, partition_id: int) -> int:

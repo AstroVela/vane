@@ -3081,6 +3081,7 @@ def test_ray_fixed_row_reservoir_sample_merges_task_states(ray_runner, duckdb_co
     monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
     monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    monkeypatch.setenv("VANE_ORDER_BY_SOURCE_TASKS", "4")
     duckdb_conn.execute("SET disabled_optimizers = 'late_materialization'")
     duckdb_conn.execute(f"""
         COPY (
@@ -3130,7 +3131,9 @@ def test_ray_fixed_row_reservoir_sample_merges_task_states(ray_runner, duckdb_co
         ) AS ordered_input
         USING SAMPLE reservoir(7 ROWS) REPEATABLE (42)
     """
-    run_once(f"{label}: ordered input", ordered_sql)
+    ordered_first = run_once(f"{label}: ordered input first", ordered_sql)
+    ordered_second = run_once(f"{label}: ordered input repeat", ordered_sql)
+    assert ordered_first == ordered_second, f"{label}: ordered-input REPEATABLE sample changed"
 
 
 def test_ray_fixed_row_reservoir_sample_preserves_hash_join_continuations(

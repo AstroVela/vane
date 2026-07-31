@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -32,6 +33,7 @@ from duckdb.runners.ray.fragment_registry import (
     _FTE_FRAGMENT_EXECUTIONS,
     _FTE_REGISTRY_LOCK,
     _FTE_SCHEDULERS,
+    _FTE_STABLE_TASK_IDENTITY_KEYS_BY_RESOURCE_QUERY,
 )
 from duckdb.runners.ray.fragment_submission_window import release_fte_partition_submission
 from duckdb.runners.ray.fragment_worker_context import (
@@ -92,21 +94,53 @@ def _registered_fte_task_memory_bytes(
     return task_memory_bytes
 
 
-def _registered_fte_logical_fragment_execution_id(
+def _registered_fte_logical_fragment_identity(
     resource_query_id: str,
     resource_stage_id: str,
-) -> int:
-    """Return the stable logical ordinal of an FTE stage in its query graph."""
+    query_id: str,
+    fragment_id: str,
+) -> str:
+    """Return a query-run-independent logical identity for one FTE fragment."""
     from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
     manager = get_query_resource_manager(resource_query_id)
     stage = manager.graph.stage_by_id(resource_stage_id)
     if stage.backend != "ray_worker":
         raise RuntimeError(f"FTE stage {resource_stage_id} has invalid registered backend {stage.backend!r}")
-    try:
-        return manager.graph.topological_stage_ids().index(resource_stage_id)
-    except ValueError as exc:
-        raise RuntimeError(f"FTE stage {resource_stage_id} is missing from its registered query graph") from exc
+    if query_id == resource_query_id:
+        execution_scope = "root"
+    elif query_id.startswith(resource_query_id):
+        execution_scope = query_id[len(resource_query_id) :]
+    else:
+        raise RuntimeError(f"FTE execution query {query_id!r} is not scoped to resource query {resource_query_id!r}")
+    query_prefix = f"{query_id}:"
+    if not fragment_id.startswith(query_prefix) or len(fragment_id) == len(query_prefix):
+        raise RuntimeError(f"FTE fragment {fragment_id!r} is not scoped to execution query {query_id!r}")
+    return json.dumps(
+        [
+            "ray-fte-logical-fragment-v1",
+            stage.physical_node_id,
+            execution_scope,
+            fragment_id[len(query_prefix) :],
+        ],
+        separators=(",", ":"),
+    )
+
+
+def _register_fte_stable_task_identity(
+    resource_query_id: str,
+    stable_task_identity: int,
+    identity_key: str,
+) -> None:
+    with _FTE_REGISTRY_LOCK:
+        identities = _FTE_STABLE_TASK_IDENTITY_KEYS_BY_RESOURCE_QUERY.setdefault(resource_query_id, {})
+        existing = identities.get(stable_task_identity)
+        if existing is not None and existing != identity_key:
+            raise ValueError(
+                "stable Ray FTE task identity collision for "
+                f"resource_query={resource_query_id} identity={stable_task_identity}"
+            )
+        identities[stable_task_identity] = identity_key
 
 
 if TYPE_CHECKING:
@@ -243,6 +277,12 @@ class FteWorkerSubmissionMixin:
         )
         resource_query_id = str(item["resource_query_id"])
         resource_stage_id = str(item["resource_stage_id"])
+        logical_fragment_identity = _registered_fte_logical_fragment_identity(
+            resource_query_id,
+            resource_stage_id,
+            query_id,
+            fragment_id,
+        )
 
         fragment_registration_result = item.get("fragment_registration_result")
 
@@ -315,14 +355,19 @@ class FteWorkerSubmissionMixin:
                 partition,
             )
 
+        def register_stable_task_identity(stable_task_identity: int, identity_key: str) -> None:
+            _register_fte_stable_task_identity(
+                resource_query_id,
+                stable_task_identity,
+                identity_key,
+            )
+
         fragment_execution = FteFragmentExecution(
             query_id,
             self._next_fte_fragment_execution_id(query_id, fragment_id),
             fragment_id=fragment_id,
-            logical_fragment_execution_id=_registered_fte_logical_fragment_execution_id(
-                resource_query_id,
-                resource_stage_id,
-            ),
+            logical_fragment_identity=logical_fragment_identity,
+            stable_task_identity_callback=register_stable_task_identity,
             worker_selector=select_partition_owner,
             execution_class_transition_callback=apply_execution_class_transitions,
             execution_admission_callback=admit_execution,
