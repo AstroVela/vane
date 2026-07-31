@@ -1496,6 +1496,7 @@ class FteFragmentExecution:
                 )
             return {
                 "failed": bool(self.failed),
+                "no_more_partitions": bool(self.no_more_partitions),
                 "partitions": partitions,
             }
 

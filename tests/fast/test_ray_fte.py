@@ -968,6 +968,7 @@ def test_fte_query_status_uses_fragment_execution_snapshot():
         def query_status_snapshot(self):
             return {
                 "failed": False,
+                "no_more_partitions": True,
                 "partitions": [
                     {
                         "partition_id": 0,
@@ -993,6 +994,140 @@ def test_fte_query_status_uses_fragment_execution_snapshot():
     assert status["finished"] is True
     assert status["finished_count"] == 1
     assert status["selected_attempt_task_ids"] == ["q.0.0.2"]
+
+
+def test_fte_query_status_scopes_completion_but_preserves_query_failure():
+    query_id = "q-status-task-scope"
+    finished_fragment_id = f"{query_id}:node:left"
+    pending_fragment_id = f"{query_id}:node:right"
+    finished_context = {
+        "query_idx": 7,
+        "last_node_id": 11,
+        "task_id": 13,
+        "node_ids": [11],
+    }
+    pending_context = {
+        "query_idx": 7,
+        "last_node_id": 17,
+        "task_id": 19,
+        "node_ids": [17],
+    }
+
+    class _FragmentExecution:
+        def __init__(self, task_context_info, partitions, *, no_more_partitions, failed=False):
+            self.task_context_info = task_context_info
+            self._partitions = partitions
+            self._no_more_partitions = no_more_partitions
+            self._failed = failed
+
+        def query_status_snapshot(self):
+            return {
+                "failed": self._failed,
+                "no_more_partitions": self._no_more_partitions,
+                "partitions": list(self._partitions),
+            }
+
+    finished = _FragmentExecution(
+        finished_context,
+        [
+            {
+                "partition_id": 0,
+                "running": False,
+                "failed": False,
+                "finished": True,
+                "selected_attempt": 1,
+                "task_id": f"{query_id}.0.0",
+                "failures": [],
+            }
+        ],
+        no_more_partitions=True,
+    )
+    pending = _FragmentExecution(
+        pending_context,
+        [
+            {
+                "partition_id": 0,
+                "running": False,
+                "failed": False,
+                "finished": True,
+                "selected_attempt": 0,
+                "task_id": f"{query_id}.1.0",
+                "failures": [],
+            }
+        ],
+        no_more_partitions=False,
+        failed=True,
+    )
+    keys = [
+        (query_id, finished_fragment_id),
+        (query_id, pending_fragment_id),
+    ]
+    with _FTE_REGISTRY_LOCK:
+        _FTE_FRAGMENT_EXECUTIONS[keys[0]] = finished
+        _FTE_FRAGMENT_EXECUTIONS[keys[1]] = pending
+    try:
+        query_status = fte_query_status(query_id)
+        scoped_status = fte_query_status(query_id, [finished_context])
+        pending_scope_status = fte_query_status(query_id, [pending_context])
+    finally:
+        with _FTE_REGISTRY_LOCK:
+            for key in keys:
+                _FTE_FRAGMENT_EXECUTIONS.pop(key, None)
+
+    assert query_status["matched"] is True
+    assert query_status["finished"] is False
+    assert scoped_status["matched"] is True
+    assert scoped_status["failed"] is True
+    assert scoped_status["finished"] is True
+    assert scoped_status["fragment_execution_count"] == 1
+    assert list(scoped_status["fragment_executions"]) == [finished_fragment_id]
+    assert scoped_status["selected_attempt_task_ids"] == [f"{query_id}.0.0.1"]
+    assert pending_scope_status["matched"] is True
+    assert pending_scope_status["finished"] is False
+    assert pending_scope_status["fragment_executions"][pending_fragment_id]["no_more_partitions"] is False
+
+
+def test_fte_query_status_reports_unmatched_task_scope():
+    query_id = "q-status-unmatched-task-scope"
+    fragment_id = f"{query_id}:node:scan"
+
+    class _FragmentExecution:
+        task_context_info = {
+            "query_idx": 1,
+            "last_node_id": 2,
+            "task_id": 3,
+            "node_ids": [2],
+        }
+
+        def query_status_snapshot(self):
+            return {
+                "failed": False,
+                "no_more_partitions": False,
+                "partitions": [],
+            }
+
+    key = (query_id, fragment_id)
+    with _FTE_REGISTRY_LOCK:
+        _FTE_FRAGMENT_EXECUTIONS[key] = _FragmentExecution()
+    try:
+        status = fte_query_status(
+            query_id,
+            [
+                {
+                    "query_idx": 1,
+                    "last_node_id": 4,
+                    "task_id": 5,
+                    "node_ids": [4],
+                }
+            ],
+        )
+    finally:
+        with _FTE_REGISTRY_LOCK:
+            _FTE_FRAGMENT_EXECUTIONS.pop(key, None)
+
+    assert status["matched"] is False
+    assert status["finished"] is False
+    assert status["fragment_execution_count"] == 0
 
 
 def test_fte_query_status_handles_multiple_running_attempts():

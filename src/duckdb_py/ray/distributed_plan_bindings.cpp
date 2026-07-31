@@ -1166,15 +1166,37 @@ public:
 			bool failed = false;
 			bool finished = false;
 			bool canceled = false;
+			bool matched = true;
 			string status_message;
 			try {
 				duckdb::PythonGILWrapper gil;
 				auto backend = backend_.get();
-				py::object status_obj = backend.attr("fte_query_status")(query_id);
+				py::object status_obj;
+				if (task_contexts.empty()) {
+					status_obj = backend.attr("fte_query_status")(query_id);
+				} else {
+					py::list py_task_contexts;
+					for (const auto &task_context : task_contexts) {
+						py::dict info;
+						info["query_idx"] = task_context.query_idx();
+						info["last_node_id"] = task_context.last_node_id();
+						info["task_id"] = task_context.task_id();
+						py::list node_ids;
+						for (auto node_id : task_context.node_ids()) {
+							node_ids.append(node_id);
+						}
+						info["node_ids"] = std::move(node_ids);
+						py_task_contexts.append(std::move(info));
+					}
+					status_obj = backend.attr("fte_query_status")(query_id, std::move(py_task_contexts));
+				}
 				status_message = PyStatusMessage(status_obj);
 				failed = RequiredStatusBool(status_obj, "failed");
 				finished = RequiredStatusBool(status_obj, "finished");
 				canceled = OptionalStatusBool(status_obj, "canceled", false);
+				if (!task_contexts.empty()) {
+					matched = RequiredStatusBool(status_obj, "matched");
+				}
 				selected_attempt_task_ids = SelectedAttemptTaskIds(status_obj);
 			} catch (const std::exception &e) {
 				ClearResultHandles(query_id);
@@ -1191,7 +1213,10 @@ public:
 				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 				    DuckDBError::external_error("Python backend FTE query canceled: " + status_message));
 			}
-			if (finished) {
+			// Submission and fragment registration are concurrent. A scoped
+			// status lookup may legitimately miss for a short interval after
+			// submit_fte_task_events returns.
+			if (matched && finished) {
 				break;
 			}
 			if (has_deadline && std::chrono::steady_clock::now() >= deadline) {

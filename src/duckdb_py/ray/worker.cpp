@@ -120,7 +120,7 @@ void FillSelectedAttemptTaskIds(const py::dict &status, RayWorkerRuntime::QueryS
 	}
 }
 
-RayWorkerRuntime::QueryStatus ParseFteQueryStatus(const py::object &status_obj) {
+RayWorkerRuntime::QueryStatus ParseFteQueryStatus(const py::object &status_obj, bool scoped) {
 	RayWorkerRuntime::QueryStatus result;
 	result.message = py::str(status_obj).cast<std::string>();
 	if (!py::isinstance<py::dict>(status_obj)) {
@@ -129,6 +129,9 @@ RayWorkerRuntime::QueryStatus ParseFteQueryStatus(const py::object &status_obj) 
 	auto status = status_obj.cast<py::dict>();
 	result.failed = RequiredStatusBool(status, "failed");
 	result.finished = RequiredStatusBool(status, "finished");
+	if (scoped) {
+		result.matched = RequiredStatusBool(status, "matched");
+	}
 	FillSelectedAttemptTaskIds(status, result);
 	return result;
 }
@@ -196,15 +199,37 @@ void RayWorkerRuntime::TaskInputStreamExhaustedForQuery(
 	ray_worker_handle_.attr("task_input_stream_exhausted_for_query")(query_id, py_source_node_ids);
 }
 
-RayWorkerRuntime::QueryStatus RayWorkerRuntime::FteQueryStatus(const string &query_id) {
+RayWorkerRuntime::QueryStatus RayWorkerRuntime::FteQueryStatus(
+    const string &query_id,
+    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
+        *task_context_filter) {
 	QueryStatus result;
 	if (query_id.empty()) {
 		result.message = "query_id is empty";
 		return result;
 	}
 	duckdb::PythonGILWrapper gil;
-	py::object status_obj = ray_worker_handle_.attr("fte_query_status")(query_id);
-	return ParseFteQueryStatus(status_obj);
+	const bool scoped = task_context_filter && !task_context_filter->empty();
+	py::object status_obj;
+	if (scoped) {
+		py::list py_task_contexts;
+		for (const auto &task_context : *task_context_filter) {
+			py::dict info;
+			info["query_idx"] = task_context.query_idx();
+			info["last_node_id"] = task_context.last_node_id();
+			info["task_id"] = task_context.task_id();
+			py::list node_ids;
+			for (auto node_id : task_context.node_ids()) {
+				node_ids.append(node_id);
+			}
+			info["node_ids"] = std::move(node_ids);
+			py_task_contexts.append(std::move(info));
+		}
+		status_obj = ray_worker_handle_.attr("fte_query_status")(query_id, std::move(py_task_contexts));
+	} else {
+		status_obj = ray_worker_handle_.attr("fte_query_status")(query_id);
+	}
+	return ParseFteQueryStatus(status_obj, scoped);
 }
 
 std::vector<RayTaskResultHandle> RayWorkerRuntime::PopFteResultHandles(const string &query_id) {

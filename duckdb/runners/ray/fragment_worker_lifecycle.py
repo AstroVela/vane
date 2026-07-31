@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import ray
@@ -407,8 +408,12 @@ class FteWorkerLifecycleMixin:
         )
         return scheduler.drain()
 
-    def fte_query_status(self, query_id: str) -> dict[str, Any]:
-        return fte_query_status(query_id)
+    def fte_query_status(
+        self,
+        query_id: str,
+        task_context_filter: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...] | None = None,
+    ) -> dict[str, Any]:
+        return fte_query_status(query_id, task_context_filter)
 
     def wait_fte_query(self, query_id: str, timeout_s: float = 0.0) -> dict[str, Any]:
         query_id = str(query_id or "").strip()

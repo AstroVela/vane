@@ -116,7 +116,10 @@ private:
 	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
 	        *task_context_filter = nullptr,
 	    bool release_payloads = true);
-	DuckDBResult<RayWorkerRuntime::QueryStatus> FteQueryStatus(const string &query_id);
+	DuckDBResult<RayWorkerRuntime::QueryStatus>
+	FteQueryStatus(const string &query_id,
+	               const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
+	                   *task_context_filter = nullptr);
 };
 
 } // namespace ray
