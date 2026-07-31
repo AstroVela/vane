@@ -2227,7 +2227,6 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MapBatches(
 		input_name_values.emplace_back(Value(col.Name()));
 	}
 	new_children.emplace_back("input_names", Value::LIST(LogicalType::VARCHAR, std::move(input_name_values)));
-	new_children.emplace_back("row_preserving", Value::BOOLEAN(false));
 	if (uses_subprocess_backend) {
 		new_children.emplace_back("produce_ref_bundle_output", Value::BOOLEAN(true));
 		new_children.emplace_back("streaming_output_mode", Value("local_shm_ref_bundle"));
@@ -2343,7 +2342,6 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FlatMap(
 			input_name_values.emplace_back(Value(col.Name()));
 		}
 		new_children.emplace_back("input_names", Value::LIST(LogicalType::VARCHAR, std::move(input_name_values)));
-		new_children.emplace_back("row_preserving", Value::BOOLEAN(false));
 		if (uses_subprocess_backend) {
 			new_children.emplace_back("produce_ref_bundle_output", Value::BOOLEAN(true));
 			new_children.emplace_back("streaming_output_mode", Value("local_shm_ref_bundle"));
