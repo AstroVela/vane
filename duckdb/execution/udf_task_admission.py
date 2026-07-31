@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import heapq
 import os
+import queue
 import threading
 import time
 import uuid
@@ -27,6 +28,7 @@ _TASK_ADMISSION_CLEANUP_RETRY_INITIAL_DELAY_S = 0.01
 _TASK_ADMISSION_CLEANUP_RETRY_MAX_DELAY_S = 1.0
 _TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_S = 1.0
 _TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_MAX_S = 30.0
+_TASK_ADMISSION_CLEANUP_SUBMISSION_WORKERS = 4
 
 
 class _ScheduledCall:
@@ -46,16 +48,33 @@ class _ScheduledCall:
 
 
 class _TaskAdmissionCancellationScheduler:
-    """Process-wide deadline scheduler for every admission cancellation."""
+    """Process-wide deadlines plus bounded Ray control submission workers."""
 
     def __init__(self) -> None:
         self._cv = threading.Condition()
         self._queue: list[tuple[float, int, _ScheduledCall]] = []
         self._next_sequence = 0
         self._thread: threading.Thread | None = None
+        self._submission_lock = threading.Lock()
+        self._submission_queue: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
+        self._submission_threads: list[threading.Thread] = []
 
     def create(self, callback: Callable[[], None]) -> _ScheduledCall:
         return _ScheduledCall(self, callback)
+
+    def submit(self, callback: Callable[[], None]) -> None:
+        """Run a potentially blocking Ray submission on the bounded worker set."""
+        with self._submission_lock:
+            while len(self._submission_threads) < _TASK_ADMISSION_CLEANUP_SUBMISSION_WORKERS:
+                index = len(self._submission_threads)
+                thread = threading.Thread(
+                    target=self._run_submission_worker,
+                    daemon=True,
+                    name=f"vane-task-admission-submit-{index}",
+                )
+                thread.start()
+                self._submission_threads.append(thread)
+        self._submission_queue.put(callback)
 
     def schedule(self, call: _ScheduledCall, delay_s: float) -> None:
         with self._cv:
@@ -116,6 +135,16 @@ class _TaskAdmissionCancellationScheduler:
                     # Cancellation methods own their retry/error policy. One
                     # malformed callback must not terminate the shared clock.
                     pass
+
+    def _run_submission_worker(self) -> None:
+        while True:
+            callback = self._submission_queue.get()
+            try:
+                callback()
+            except BaseException:
+                # Cancellation submissions own their retry/error policy. Keep
+                # one malformed callback from reducing the fixed worker set.
+                pass
 
 
 _TASK_ADMISSION_CANCELLATION_SCHEDULER = _TaskAdmissionCancellationScheduler()
@@ -200,6 +229,15 @@ class _TaskAdmissionCancellation:
             if self._done or self._submitting or self._response_future is not None or self._retry_call is not None:
                 return
             self._submitting = True
+        try:
+            _TASK_ADMISSION_CANCELLATION_SCHEDULER.submit(self._submit)
+        except BaseException:
+            with self._lock:
+                self._submitting = False
+            self._schedule_retry()
+
+    def _submit(self) -> None:
+        """Submit one driver RPC without occupying its caller or deadline thread."""
         try:
             response_ref = self._driver.cancel_query_task_lease_request.remote(
                 dict(self._request),

@@ -46,6 +46,13 @@ def _resolved_ref(value):
     return ref
 
 
+def _wait_for_remote_calls(method, count, *, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while len(method.calls) < count and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert len(method.calls) == count
+
+
 class _FailingObjectRef:
     def __init__(self, *, callback=False):
         self._callback = callback
@@ -107,6 +114,7 @@ def test_task_admission_setup_failure_cancels_the_remote_request(callback):
 
     request = driver.acquire_query_task_lease.calls[0][0][0]
     assert controller.state()["state"] == "failed"
+    _wait_for_remote_calls(driver.cancel_query_task_lease_request, 1)
     assert driver.cancel_query_task_lease_request.calls == [
         ((request,), {}),
     ]
@@ -220,6 +228,7 @@ def test_task_admission_close_cancels_pending_and_ready_leases():
     pending.close()
 
     assert pending.state()["state"] == "closed"
+    _wait_for_remote_calls(pending_driver.cancel_query_task_lease_request, 1)
     assert pending_driver.cancel_query_task_lease_request.calls == [((pending_request,), {})]
 
     pending_driver.requests[0].resolve(_grant(pending_request))
@@ -236,6 +245,7 @@ def test_task_admission_close_cancels_pending_and_ready_leases():
     ready.close()
 
     assert ready.state()["state"] == "closed"
+    _wait_for_remote_calls(ready_driver.cancel_query_task_lease_request, 1)
     assert ready_driver.cancel_query_task_lease_request.calls == [((ready_request,), {})]
 
 
@@ -252,6 +262,7 @@ def test_pending_admission_future_does_not_retain_closed_controller():
 
     assert controller_ref() is None
     driver.requests[0].resolve(_grant(request))
+    _wait_for_remote_calls(driver.cancel_query_task_lease_request, 1)
     assert driver.cancel_query_task_lease_request.calls == [((request,), {})]
 
 
@@ -266,6 +277,7 @@ def test_taken_task_admission_abandons_if_submission_never_takes_ownership():
     admission.release()
     admission.release()
 
+    _wait_for_remote_calls(driver.cancel_query_task_lease_request, 1)
     assert driver.cancel_query_task_lease_request.calls == [((request,), {})]
 
 
@@ -398,7 +410,14 @@ def test_task_admission_cancellations_share_one_deadline_thread(monkeypatch):
     for cancellation in cancellations:
         cancellation.start()
 
-    assert len(driver.cancel_query_task_lease_request.calls) == len(cancellations)
+    _wait_for_remote_calls(
+        driver.cancel_query_task_lease_request,
+        len(cancellations),
+    )
+    response_deadline = time.monotonic() + 1.0
+    while len(responses) < len(cancellations) and time.monotonic() < response_deadline:
+        time.sleep(0.005)
+    assert len(responses) == len(cancellations)
     scheduler_threads = [thread for thread in threading.enumerate() if thread.name == "vane-task-admission-cleanup"]
     assert len(scheduler_threads) == 1
 
@@ -406,6 +425,73 @@ def test_task_admission_cancellations_share_one_deadline_thread(monkeypatch):
         response.resolve({"cancelled": True})
     deadline = time.monotonic() + 1.0
     while not all(cancellation._done for cancellation in cancellations) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert all(cancellation._done for cancellation in cancellations)
+
+
+def test_task_admission_blocked_rpc_submissions_use_bounded_workers_without_blocking_deadlines():
+    driver = _Driver()
+    release_submissions = threading.Event()
+    all_workers_blocked = threading.Event()
+    entered_lock = threading.Lock()
+    entered = 0
+
+    def cancel(_request):
+        nonlocal entered
+        with entered_lock:
+            entered += 1
+            if entered == task_admission._TASK_ADMISSION_CLEANUP_SUBMISSION_WORKERS:
+                all_workers_blocked.set()
+        release_submissions.wait(timeout=5.0)
+        return _resolved_ref({"cancelled": True})
+
+    driver.cancel_query_task_lease_request = _RemoteMethod(cancel)
+    cancellation_count = task_admission._TASK_ADMISSION_CLEANUP_SUBMISSION_WORKERS + 64
+    cancellations = [
+        task_admission._TaskAdmissionCancellation(
+            driver=driver,
+            request={
+                "request_id": f"blocked-submit:{index}",
+                "resources": {},
+            },
+        )
+        for index in range(cancellation_count)
+    ]
+
+    started_at = time.monotonic()
+    for cancellation in cancellations:
+        cancellation.start()
+    start_elapsed = time.monotonic() - started_at
+
+    deadline_fired = threading.Event()
+    deadline = task_admission._TASK_ADMISSION_CANCELLATION_SCHEDULER.create(
+        deadline_fired.set,
+    )
+    task_admission._TASK_ADMISSION_CANCELLATION_SCHEDULER.schedule(
+        deadline,
+        0.01,
+    )
+    try:
+        assert start_elapsed < 1.0
+        assert all_workers_blocked.wait(timeout=2.0)
+        assert deadline_fired.wait(timeout=1.0)
+        assert (
+            len(driver.cancel_query_task_lease_request.calls)
+            == task_admission._TASK_ADMISSION_CLEANUP_SUBMISSION_WORKERS
+        )
+        submission_threads = [
+            thread for thread in threading.enumerate() if thread.name.startswith("vane-task-admission-submit-")
+        ]
+        assert len(submission_threads) == task_admission._TASK_ADMISSION_CLEANUP_SUBMISSION_WORKERS
+    finally:
+        release_submissions.set()
+
+    _wait_for_remote_calls(
+        driver.cancel_query_task_lease_request,
+        cancellation_count,
+    )
+    completion_deadline = time.monotonic() + 1.0
+    while not all(cancellation._done for cancellation in cancellations) and time.monotonic() < completion_deadline:
         time.sleep(0.005)
     assert all(cancellation._done for cancellation in cancellations)
 
