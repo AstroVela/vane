@@ -1350,6 +1350,20 @@ TEST_CASE("Empty order is an identity and inherits child serializability", "[rel
 	REQUIRE(CHECK_COLUMN(result, 0, {42}));
 }
 
+TEST_CASE("Order remains chainable above non-SQL relation inputs", "[relation_api][local_exchange]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	REQUIRE_NO_FAIL(con.Query("PRAGMA enable_verification"));
+	auto exchange = con.Values("(2), (1)", {"i"})->LocalExchange(2);
+	auto ordered = exchange->Order("(SELECT -i)")->Limit(1)->Project("i");
+
+	REQUIRE(ordered->GetQuery().empty());
+	REQUIRE_NOTHROW(result = ordered->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {2}));
+}
+
 TEST_CASE("Bound local query scopes determine relation serialization", "[relation_api]") {
 	DuckDB db(nullptr);
 	Connection con(db);

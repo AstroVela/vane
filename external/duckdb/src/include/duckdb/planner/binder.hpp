@@ -372,6 +372,11 @@ private:
 	idx_t depth;
 
 private:
+	enum class SelectPlanMode : uint8_t {
+		STANDARD,
+		PRESERVE_INPUT_BINDINGS_FOR_ORDER,
+	};
+
 	//! Determine the depth of the binder
 	idx_t GetBinderDepth() const;
 	//! Increase the depth of the binder
@@ -439,7 +444,7 @@ private:
 	BoundStatement BindNode(StatementNode &node);
 
 	unique_ptr<LogicalOperator> VisitQueryNode(BoundQueryNode &node, unique_ptr<LogicalOperator> root);
-	unique_ptr<LogicalOperator> CreatePlan(BoundSelectNode &statement);
+	unique_ptr<LogicalOperator> CreatePlan(BoundSelectNode &statement, SelectPlanMode mode = SelectPlanMode::STANDARD);
 	unique_ptr<LogicalOperator> CreatePlan(BoundSetOperationNode &node);
 	unique_ptr<LogicalOperator> CreatePlan(BoundQueryNode &node);
 
@@ -533,7 +538,10 @@ private:
 
 	LogicalType BindLogicalTypeInternal(const unique_ptr<ParsedExpression> &type_expr);
 
-	BoundStatement BindSelectNode(SelectNode &statement, BoundStatement from_table);
+	BoundStatement BindSelectNode(SelectNode &statement, BoundStatement from_table,
+	                              SelectPlanMode mode = SelectPlanMode::STANDARD);
+	//! Bind ORDER BY expressions on an already-bound input while preserving its output column bindings.
+	BoundStatement BindOrderOnInput(BoundStatement from_table, const vector<OrderByNode> &orders);
 
 	unique_ptr<LogicalOperator> BindCopyDatabaseSchema(Catalog &source_catalog, const string &target_database_name);
 	unique_ptr<LogicalOperator> BindCopyDatabaseData(Catalog &source_catalog, const string &target_database_name);

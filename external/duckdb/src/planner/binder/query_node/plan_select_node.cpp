@@ -1,12 +1,71 @@
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/common/unordered_set.hpp"
+#include "duckdb/planner/bound_result_modifier.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/query_node/bound_select_node.hpp"
 
 namespace duckdb {
+
+static void InlineOrderSelectList(unique_ptr<Expression> &expression, idx_t projection_index,
+                                  const vector<unique_ptr<Expression>> &select_list) {
+	if (expression->type == ExpressionType::BOUND_COLUMN_REF) {
+		auto &column_ref = expression->Cast<BoundColumnRefExpression>();
+		if (column_ref.binding.table_index == projection_index) {
+			if (column_ref.binding.column_index >= select_list.size()) {
+				throw InternalException(
+				    "ORDER BY select-list reference is out of range while preserving input bindings");
+			}
+			expression = select_list[column_ref.binding.column_index]->Copy();
+			return;
+		}
+	}
+	ExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<Expression> &child) {
+		InlineOrderSelectList(child, projection_index, select_list);
+	});
+}
+
+static bool TryGetOrderSelectListIndex(const Expression &expression, idx_t projection_index, idx_t &column_index) {
+	if (expression.type != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &column_ref = expression.Cast<BoundColumnRefExpression>();
+	if (column_ref.binding.table_index != projection_index) {
+		return false;
+	}
+	column_index = column_ref.binding.column_index;
+	return true;
+}
+
+static void RewriteOrderForInputBindings(BoundSelectNode &statement) {
+	if (statement.modifiers.empty()) {
+		return;
+	}
+	if (statement.modifiers.size() != 1 || statement.modifiers[0]->type != ResultModifierType::ORDER_MODIFIER) {
+		throw InternalException("Expected only an ORDER BY modifier while preserving relation input bindings");
+	}
+	auto &bound_order = statement.modifiers[0]->Cast<BoundOrderModifier>();
+	unordered_set<idx_t> seen_projection_columns;
+	vector<BoundOrderByNode> rewritten_orders;
+	rewritten_orders.reserve(bound_order.orders.size());
+	for (auto &order : bound_order.orders) {
+		idx_t projection_column;
+		if (TryGetOrderSelectListIndex(*order.expression, statement.projection_index, projection_column) &&
+		    !seen_projection_columns.insert(projection_column).second) {
+			// The SELECT binder shares identical ORDER BY expressions through one
+			// projection slot. A repeated sort key is redundant; dropping it keeps
+			// volatile expressions at one evaluation per input row.
+			continue;
+		}
+		InlineOrderSelectList(order.expression, statement.projection_index, statement.select_list);
+		rewritten_orders.push_back(std::move(order));
+	}
+	bound_order.orders = std::move(rewritten_orders);
+}
 
 unique_ptr<LogicalOperator> Binder::PlanFilter(unique_ptr<Expression> condition, unique_ptr<LogicalOperator> root) {
 	PlanSubqueries(condition, root);
@@ -15,7 +74,7 @@ unique_ptr<LogicalOperator> Binder::PlanFilter(unique_ptr<Expression> condition,
 	return std::move(filter);
 }
 
-unique_ptr<LogicalOperator> Binder::CreatePlan(BoundSelectNode &statement) {
+unique_ptr<LogicalOperator> Binder::CreatePlan(BoundSelectNode &statement, SelectPlanMode mode) {
 	D_ASSERT(statement.from_table.plan);
 	auto root = std::move(statement.from_table.plan);
 
@@ -104,6 +163,16 @@ unique_ptr<LogicalOperator> Binder::CreatePlan(BoundSelectNode &statement) {
 
 	for (auto &expr : statement.select_list) {
 		PlanSubqueries(expr, root);
+	}
+
+	if (mode == SelectPlanMode::PRESERVE_INPUT_BINDINGS_FOR_ORDER) {
+		// ORDER BY-only expressions have been bound as hidden select-list entries.
+		// Inline those structured expressions before the SELECT projection is
+		// created, then plan the modifier directly on the input. Window, UNNEST,
+		// and subquery operators planned above remain in the tree, while the
+		// input's table bindings stay visible to subsequent Relation operators.
+		RewriteOrderForInputBindings(statement);
+		return VisitQueryNode(statement, std::move(root));
 	}
 
 	auto proj = make_uniq<LogicalProjection>(statement.projection_index, std::move(statement.select_list));
