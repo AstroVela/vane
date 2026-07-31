@@ -73,6 +73,7 @@ public:
 	                                                            vector<string> boundaries);
 	static void Validate(const vector<BoundOrderByNode> &orders, size_t num_partitions,
 	                     const vector<string> &boundaries);
+	static void ValidateBoundaries(size_t num_partitions, const vector<string> &boundaries);
 
 	size_t num_partitions() const {
 		return num_partitions_;

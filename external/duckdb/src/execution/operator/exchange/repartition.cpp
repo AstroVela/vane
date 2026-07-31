@@ -5,6 +5,9 @@
 
 #include "duckdb/common/exception.hpp"
 
+#include <algorithm>
+#include <cstring>
+
 namespace duckdb {
 
 namespace {
@@ -24,6 +27,15 @@ void ValidateRangeOrders(const vector<BoundOrderByNode> &orders) {
 			throw InvalidInputException("range repartition requires explicit NULLS FIRST or NULLS LAST order");
 		}
 	}
+}
+
+bool EncodedSortKeyLess(const string &left, const string &right) {
+	const auto min_size = std::min(left.size(), right.size());
+	const auto comparison = std::memcmp(left.data(), right.data(), min_size);
+	if (comparison != 0) {
+		return comparison < 0;
+	}
+	return left.size() < right.size();
 }
 
 vector<BoundOrderByNode> CopyRangeOrders(const vector<BoundOrderByNode> &orders) {
@@ -86,11 +98,8 @@ std::shared_ptr<RandomShuffleConfig> RandomShuffleConfig::create(size_t num_part
 RangeRepartitionConfig::RangeRepartitionConfig(size_t num_partitions, vector<BoundOrderByNode> orders,
                                                vector<string> boundaries)
     : num_partitions_(num_partitions), orders_(std::move(orders)), boundaries_(std::move(boundaries)) {
-	if (num_partitions_) {
-		Validate(orders_, num_partitions_, boundaries_);
-	} else {
-		ValidateRangeOrders(orders_);
-	}
+	ValidateRangeOrders(orders_);
+	ValidateBoundaries(num_partitions_, boundaries_);
 }
 
 std::vector<std::string> RangeRepartitionConfig::multiline_display() const {
@@ -120,8 +129,17 @@ void RangeRepartitionConfig::Validate(const vector<BoundOrderByNode> &orders, si
 	if (num_partitions == 0) {
 		throw InvalidInputException("range repartition requires at least one partition");
 	}
-	if (boundaries.size() >= num_partitions) {
+	ValidateBoundaries(num_partitions, boundaries);
+}
+
+void RangeRepartitionConfig::ValidateBoundaries(size_t num_partitions, const vector<string> &boundaries) {
+	if (num_partitions && boundaries.size() >= num_partitions) {
 		throw InvalidInputException("range repartition requires fewer boundary keys than partitions");
+	}
+	for (size_t index = 1; index < boundaries.size(); index++) {
+		if (EncodedSortKeyLess(boundaries[index], boundaries[index - 1])) {
+			throw InvalidInputException("range repartition boundary keys must be sorted");
+		}
 	}
 }
 

@@ -145,9 +145,7 @@ PhysicalRemoteExchangeSink::PhysicalRemoteExchangeSink(
 				throw InvalidInputException("range repartition order expression cannot be null");
 			}
 		}
-		if (range_boundaries_.size() >= num_partitions_) {
-			throw InvalidInputException("range repartition requires fewer boundary keys than partitions");
-		}
+		RangeRepartitionConfig::ValidateBoundaries(num_partitions_, range_boundaries_);
 	}
 }
 

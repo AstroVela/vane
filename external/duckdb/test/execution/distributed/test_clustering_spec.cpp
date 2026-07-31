@@ -102,6 +102,11 @@ TEST_CASE("Range repartition rejects incomplete metadata", "[execution][repartit
 	REQUIRE_THROWS_WITH(RepartitionSpec::create_range(2, std::move(too_many_boundaries), {"a", "b"}),
 	                    Catch::Matchers::Contains("fewer boundary keys"));
 
+	auto unsorted_boundaries = TestRangeOrders();
+	REQUIRE_THROWS_WITH(RepartitionSpec::create_range(3, std::move(unsorted_boundaries), {"z", "a"}),
+	                    Catch::Matchers::Contains("sorted"));
+	REQUIRE_NOTHROW(RepartitionSpec::create_range(3, TestRangeOrders(), {"a", "a"}));
+
 	vector<BoundOrderByNode> unresolved_order;
 	unresolved_order.emplace_back(OrderType::ORDER_DEFAULT, OrderByNullType::ORDER_DEFAULT,
 	                              make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
