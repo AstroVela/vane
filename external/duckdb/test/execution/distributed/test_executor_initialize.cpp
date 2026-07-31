@@ -6,12 +6,26 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/execution/executor.hpp"
 #include "duckdb/execution/physical_plan.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 
 using namespace duckdb;
+
+namespace {
+
+class ParallelUnpartitionedDummyScan : public PhysicalDummyScan {
+public:
+	using PhysicalDummyScan::PhysicalDummyScan;
+
+	bool ParallelSource() const override {
+		return true;
+	}
+};
+
+} // namespace
 
 TEST_CASE("Executor: Initialize with dummy plan builds pipelines", "[distributed][executor]") {
 	DuckDB db(nullptr);
@@ -86,4 +100,33 @@ TEST_CASE("Executor: progress topology plans pipelines without scheduling tasks"
 	}
 	REQUIRE(found_source_role);
 	REQUIRE(found_sink_role);
+}
+
+TEST_CASE("Result collector serializes ordered plans without batch indexes",
+          "[distributed][executor][result_collector]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto &context = *con.context;
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+
+	auto prepared = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);
+	prepared->names = {"value"};
+	prepared->types = {LogicalType::INTEGER};
+	prepared->properties.return_type = StatementReturnType::QUERY_RESULT;
+	prepared->output_type = QueryResultOutputType::FORCE_MATERIALIZED;
+	prepared->memory_type = QueryResultMemoryType::IN_MEMORY;
+
+	auto plan = make_uniq<PhysicalPlan>(Allocator::DefaultAllocator());
+	auto &scan = plan->Make<ParallelUnpartitionedDummyScan>(prepared->types, 1);
+	REQUIRE(TaskScheduler::GetScheduler(context).NumberOfThreads() > 1);
+	REQUIRE(scan.ParallelSource());
+	REQUIRE_FALSE(scan.SupportsPartitioning(OperatorPartitionInfo::BatchIndex()));
+	REQUIRE(PhysicalPlanGenerator::PreserveInsertionOrder(context, scan));
+	REQUIRE_FALSE(PhysicalPlanGenerator::UseBatchIndex(context, scan));
+
+	plan->SetRoot(scan);
+	prepared->physical_plan = std::move(plan);
+	auto &collector = PhysicalResultCollector::GetResultCollector(context, *prepared);
+
+	REQUIRE_FALSE(collector.ParallelSink());
 }
