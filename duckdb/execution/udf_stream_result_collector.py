@@ -1554,8 +1554,8 @@ class AsyncResultCollector:
                         pending_data_counts[record.slot_id] = pending_data_counts.get(record.slot_id, 0) + 1
                 except BaseException as exc:
                     failures.append((record, exc))
-        for record, exc in failures:
-            self._fail_record(record, exc)
+        for record, failure in failures:
+            self._fail_record(record, failure)
 
     def _complete_producer_wait(self, record: _StreamRecord, future: Any) -> None:
         key = (record.slot_id, record.submit_id)
@@ -1959,15 +1959,19 @@ class AsyncResultCollector:
                 claimed_tokens = self._claim_output_token_releases_locked(dropped_tokens)
                 request = record.output_request
                 driver = record.adapter.driver
-                cancel_output_request = request is not None and driver is not None and not record.output_cancel_sent
-                if cancel_output_request:
+                output_cancel_operation: RayStreamCleanupOperation | None = None
+                if request is not None and driver is not None and not record.output_cancel_sent:
                     record.output_cancel_sent = True
+                    output_cancel_operation = self._output_request_cancel_operation(
+                        driver,
+                        request,
+                    )
                 terminal_signal_observed = record.terminal_signal_observed
                 cleanup_operations: list[RayStreamCleanupOperation] = [
                     self._output_token_release_operation(token) for token in claimed_tokens
                 ]
-                if cancel_output_request:
-                    cleanup_operations.append(self._output_request_cancel_operation(driver, request))
+                if output_cancel_operation is not None:
+                    cleanup_operations.append(output_cancel_operation)
                 if not cleanup_was_started:
                     if terminal_signal_observed:
                         cleanup_operations.extend(record.adapter.retire_failed_operations())
@@ -1985,7 +1989,7 @@ class AsyncResultCollector:
                     if self._records.get(key) is record:
                         if not cleanup_was_started:
                             record.cleanup_started = False
-                        if cancel_output_request:
+                        if output_cancel_operation is not None:
                             record.output_cancel_sent = False
                         self._cv.notify_all()
                 raise

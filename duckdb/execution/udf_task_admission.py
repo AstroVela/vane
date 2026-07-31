@@ -113,14 +113,10 @@ class _TaskAdmissionCancellation:
             args=(response_future,),
         )
         watchdog.daemon = True
-        discard_response = False
-        with self._lock:
-            self._submitting = False
-            if self._done:
-                discard_response = True
-            else:
-                self._response_future = response_future
-                self._response_watchdog = watchdog
+        discard_response = self._publish_response_future(
+            response_future,
+            watchdog,
+        )
         if discard_response:
             try:
                 response_future.cancel()
@@ -150,6 +146,20 @@ class _TaskAdmissionCancellation:
             )
         if start_watchdog:
             watchdog.start()
+
+    def _publish_response_future(
+        self,
+        response_future: Any,
+        watchdog: threading.Timer,
+    ) -> bool:
+        """Publish a response unless a concurrent acknowledgement finished."""
+        with self._lock:
+            self._submitting = False
+            if self._done:
+                return True
+            self._response_future = response_future
+            self._response_watchdog = watchdog
+            return False
 
     def _finish(self, response_future: Any) -> None:
         try:
@@ -197,7 +207,9 @@ class _TaskAdmissionCancellation:
             self._response_future = None
             self._response_watchdog = None
         try:
-            response_future.cancel()
+            cancel = getattr(response_future, "cancel", None)
+            if callable(cancel):
+                cancel()
         except BaseException:
             pass
         self._schedule_retry()
