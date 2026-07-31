@@ -12,6 +12,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, NoReturn
@@ -351,6 +352,42 @@ class _ClientOwnerLease:
 class _AdmissionLoopFence:
     completed: threading.Event = field(default_factory=threading.Event)
     error: BaseException | None = None
+
+
+@dataclass
+class _QueryTaskExecutionOwner:
+    """Durable ownership of one granted task across admission-table cleanup."""
+
+    query_id: str
+    allocation_generation: int
+    request_id: str
+    task_id: str
+    attempt_id: str
+    lease_id: str
+    phase: Literal[
+        "granted",
+        "submitted",
+        "completion_wait",
+        "teardown_owned",
+    ] = "granted"
+
+
+@dataclass(frozen=True)
+class _QueryTaskExecutionReplay:
+    """Bounded acknowledgement for a terminal execution-owner transition."""
+
+    query_id: str
+    allocation_generation: int
+    request_id: str
+    task_id: str
+    attempt_id: str
+    lease_id: str
+    terminal_action: Literal[
+        "cancelled",
+        "released",
+        "completion",
+        "teardown",
+    ]
 
 
 def _normalize_session_config(config: Mapping[str, Any]) -> dict[str, str]:
@@ -1283,6 +1320,14 @@ class RayQueryDriverActor:
         self._query_resource_closing_queries: set[str] = set()
         self._query_pending_execution_teardowns: dict[str, set[str]] = {}
         self._query_task_admission_pumps: set[str] = set()
+        self._query_task_execution_condition = threading.Condition()
+        self._query_task_completion_waiters: dict[str, tuple[str, asyncio.Task[None]]] = {}
+        self._query_task_execution_owners: dict[str, _QueryTaskExecutionOwner] = {}
+        self._query_task_execution_replays = BoundedReplayMap[
+            str,
+            _QueryTaskExecutionReplay,
+        ](capacity=_LEASE_REQUEST_REPLAY_CAPACITY)
+        self._query_execution_quiesced_queries: set[str] = set()
         self._query_output_admission_pumps: set[str] = set()
         self._query_fte_admission_pumps: dict[str, asyncio.Task[Any]] = {}
         self._query_fte_admission_dirty_queries: set[str] = set()
@@ -1454,6 +1499,7 @@ class RayQueryDriverActor:
                     query_id,
                     reason="query_fragments_dropped",
                     admission_fenced=True,
+                    execution_quiesced=True,
                 )
             except BaseException as exc:
                 errors.append(exc)
@@ -2460,6 +2506,22 @@ class RayQueryDriverActor:
             self._query_resource_closing_queries = set()
         if not hasattr(self, "_query_task_admission_pumps"):
             self._query_task_admission_pumps = set()
+        if not hasattr(self, "_query_task_execution_condition"):
+            self._query_task_execution_condition = threading.Condition()
+        if not hasattr(self, "_query_task_completion_waiters"):
+            self._query_task_completion_waiters = {}
+        if not hasattr(self, "_query_task_execution_owners"):
+            self._query_task_execution_owners = {}
+        execution_replays = getattr(self, "_query_task_execution_replays", None)
+        if not isinstance(execution_replays, BoundedReplayMap):
+            self._query_task_execution_replays = BoundedReplayMap[
+                str,
+                _QueryTaskExecutionReplay,
+            ](capacity=_LEASE_REQUEST_REPLAY_CAPACITY)
+        if not hasattr(self, "_query_execution_quiesced_queries"):
+            self._query_execution_quiesced_queries = set()
+        if not hasattr(self, "_query_terminal_errors"):
+            self._query_terminal_errors = {}
         if not hasattr(self, "_query_output_admission_pumps"):
             self._query_output_admission_pumps = set()
         if not hasattr(self, "_query_fte_admission_pumps"):
@@ -2637,7 +2699,14 @@ class RayQueryDriverActor:
             )
             for identity in owners
         )
-        if old_state_exists or old_owner_exists:
+        with self._query_task_execution_condition:
+            old_completion_waiter_exists = any(
+                owner_query_id == query_key for owner_query_id, _task in self._query_task_completion_waiters.values()
+            )
+            old_execution_owner_exists = any(
+                owner.query_id == query_key for owner in self._query_task_execution_owners.values()
+            )
+        if old_state_exists or old_owner_exists or old_completion_waiter_exists or old_execution_owner_exists:
             raise RuntimeError(f"cannot reopen query admission with old generation state: {query_key}")
         fte_pump = self._query_fte_admission_pumps.get(query_key)
         if fte_pump is not None and not fte_pump.done():
@@ -2647,6 +2716,8 @@ class RayQueryDriverActor:
         self._query_fte_admission_dirty_queries.discard(query_key)
         open_fte_registry_for_query(query_key)
         self._query_resource_closing_queries.discard(query_key)
+        with self._query_task_execution_condition:
+            self._query_execution_quiesced_queries.discard(query_key)
 
     def _signal_query_resource_change(self, query_id: str) -> None:
         """Coalesce a resource mutation into one task and output pump run.
@@ -2821,11 +2892,15 @@ class RayQueryDriverActor:
         state["status"] = str(status)
         self._complete_lease_request(state, terminal_result)
         active.pop(str(request_id), None)
-        tombstones[str(request_id)] = {
+        tombstone = {
             "identity": dict(state["identity"]),
             "status": str(status),
             "result": terminal_result,
         }
+        lease = state.get("lease")
+        if isinstance(lease, dict):
+            tombstone["lease"] = dict(lease)
+        tombstones[str(request_id)] = tombstone
         identity = state["identity"]
         if "block_id" in identity:
             output_owner_key = (str(identity["query_id"]), str(identity["block_id"]))
@@ -2949,8 +3024,21 @@ class RayQueryDriverActor:
             request_id, state = owned_request
             if grant.granted:
                 lease_payload = asdict(grant.lease)
-                state["status"] = "granted"
                 state["lease"] = lease_payload
+                try:
+                    self._register_query_task_execution_owner(
+                        request_id=request_id,
+                        state=state,
+                    )
+                except BaseException as registration_error:
+                    self._fail_unpublished_query_task_grant(
+                        manager=manager,
+                        request_id=request_id,
+                        state=state,
+                        registration_error=registration_error,
+                    )
+                    return
+                state["status"] = "granted"
                 _log_resource_debug(
                     "task_granted",
                     query_id=request.query_id,
@@ -3169,6 +3257,11 @@ class RayQueryDriverActor:
         request = TaskRequest(**values)
         identity = {**asdict(request), "resources": dict(raw_resources)}
         self._ensure_query_resource_admission_state()
+        tombstone = self._query_task_lease_request_tombstones.get(request_id)
+        if tombstone is not None and tombstone["identity"] != identity:
+            raise ValueError(f"task lease request_id reused with different identity: {request_id}")
+        if tombstone is not None:
+            return dict(tombstone["result"])
         if str(request.query_id) in self._query_resource_closing_queries:
             return self._grant_payload(
                 TaskGrant(
@@ -3177,11 +3270,6 @@ class RayQueryDriverActor:
                     fatal=True,
                 )
             )
-        tombstone = self._query_task_lease_request_tombstones.get(request_id)
-        if tombstone is not None and tombstone["identity"] != identity:
-            raise ValueError(f"task lease request_id reused with different identity: {request_id}")
-        if tombstone is not None:
-            return dict(tombstone["result"])
         existing = self._query_task_lease_requests.get(request_id)
         if existing is not None and existing["identity"] != identity:
             raise ValueError(f"task lease request_id reused with different identity: {request_id}")
@@ -3256,14 +3344,495 @@ class RayQueryDriverActor:
 
     async def mark_query_task_lease_submitted(self, request_id: str, lease_id: str) -> dict[str, Any]:
         self._ensure_query_resource_admission_state()
-        state = self._query_task_lease_requests.get(str(request_id))
-        if state is None or state.get("status") not in {"granted", "submitted"}:
-            return {"submitted": False}
-        lease = state.get("lease") or {}
-        if str(lease.get("lease_id") or "") != str(lease_id):
-            return {"submitted": False}
-        state["status"] = "submitted"
+        request_key = str(request_id)
+        state = self._query_task_lease_requests.get(request_key)
+        with self._query_task_execution_condition:
+            owner = self._query_task_execution_owners.get(request_key)
+            if owner is None or owner.lease_id != str(lease_id):
+                return {"submitted": False}
+            if owner.phase not in {"completion_wait", "teardown_owned"}:
+                owner.phase = "submitted"
+            self._query_task_execution_condition.notify_all()
+        if state is not None and state.get("status") in {"granted", "submitted"}:
+            state["status"] = "submitted"
         return {"submitted": True}
+
+    def _register_query_task_execution_owner(
+        self,
+        *,
+        request_id: str,
+        state: dict[str, Any],
+    ) -> None:
+        """Publish execution ownership before exposing a granted task lease."""
+        identity = state["identity"]
+        lease = state["lease"]
+        owner = _QueryTaskExecutionOwner(
+            query_id=str(identity["query_id"]),
+            allocation_generation=int(lease["allocation_generation"]),
+            request_id=str(request_id),
+            task_id=str(identity["task_id"]),
+            attempt_id=str(lease["attempt_id"]),
+            lease_id=str(lease["lease_id"]),
+        )
+        with self._query_task_execution_condition:
+            if self._query_task_execution_replays.get(owner.request_id) is not None:
+                raise RuntimeError(f"task execution request is already terminal: {owner.request_id}")
+            existing = self._query_task_execution_owners.get(owner.request_id)
+            if existing is not None and existing != owner:
+                raise RuntimeError(f"task execution owner identity changed for request {owner.request_id}")
+            self._query_task_execution_owners[owner.request_id] = owner
+            self._query_task_execution_condition.notify_all()
+
+    def _fail_unpublished_query_task_grant(
+        self,
+        *,
+        manager: Any,
+        request_id: str,
+        state: dict[str, Any],
+        registration_error: BaseException,
+    ) -> None:
+        """Fence a grant that could not publish its durable execution owner."""
+        from duckdb.runners.ray.query_resource_manager import TaskGrant
+
+        identity = state["identity"]
+        lease = state["lease"]
+        request_key = str(request_id)
+        rollback_errors: list[BaseException] = []
+        try:
+            abandoned = bool(
+                manager.abandon_task_lease(
+                    lease["lease_id"],
+                    attempt_id=lease["attempt_id"],
+                )
+            )
+        except BaseException as exc:
+            abandoned = False
+            rollback_errors.append(exc)
+
+        with self._query_task_execution_condition:
+            current_owner = self._query_task_execution_owners.get(request_key)
+            owner_matches = bool(
+                current_owner is not None
+                and self._query_task_execution_owner_matches(
+                    current_owner,
+                    lease["lease_id"],
+                    lease["attempt_id"],
+                )
+            )
+            if abandoned:
+                if owner_matches:
+                    self._query_task_execution_owners.pop(request_key, None)
+            else:
+                if current_owner is None:
+                    current_owner = _QueryTaskExecutionOwner(
+                        query_id=str(identity["query_id"]),
+                        allocation_generation=int(lease["allocation_generation"]),
+                        request_id=request_key,
+                        task_id=str(identity["task_id"]),
+                        attempt_id=str(lease["attempt_id"]),
+                        lease_id=str(lease["lease_id"]),
+                        phase="teardown_owned",
+                    )
+                    self._query_task_execution_owners[request_key] = current_owner
+                elif owner_matches:
+                    current_owner.phase = "teardown_owned"
+                else:
+                    recovery_key = f"{request_key}:unpublished:{lease['lease_id']}"
+                    self._query_task_execution_owners[recovery_key] = _QueryTaskExecutionOwner(
+                        query_id=str(identity["query_id"]),
+                        allocation_generation=int(lease["allocation_generation"]),
+                        request_id=recovery_key,
+                        task_id=str(identity["task_id"]),
+                        attempt_id=str(lease["attempt_id"]),
+                        lease_id=str(lease["lease_id"]),
+                        phase="teardown_owned",
+                    )
+            self._query_task_execution_condition.notify_all()
+
+        if abandoned:
+            try:
+                manager.mark_task_attempt_terminal(
+                    identity["task_id"],
+                    lease["attempt_id"],
+                )
+            except BaseException as exc:
+                rollback_errors.append(exc)
+
+        query_id = str(identity["query_id"])
+        try:
+            manager.close_admission()
+        except BaseException as exc:
+            rollback_errors.append(exc)
+        details = [
+            f"{type(registration_error).__name__}: {registration_error}",
+            *(f"rollback {type(exc).__name__}: {exc}" for exc in rollback_errors),
+        ]
+        self._query_terminal_errors.setdefault(
+            query_id,
+            f"task execution owner registration failed for {request_key}: " + "; ".join(details),
+        )
+        self._query_resource_closing_queries.add(query_id)
+        self._retire_query_lease_request(
+            request_id=request_key,
+            state=state,
+            result=self._grant_payload(
+                TaskGrant(
+                    False,
+                    blocked_reason="task_execution_owner_registration_failed",
+                    fatal=True,
+                )
+            ),
+            status="failed",
+            active=self._query_task_lease_requests,
+            tombstones=self._query_task_lease_request_tombstones,
+        )
+        self._fail_query_admission_requests(query_id)
+
+    @staticmethod
+    def _query_task_execution_owner_matches(
+        owner: _QueryTaskExecutionOwner,
+        lease_id: str,
+        attempt_id: str,
+    ) -> bool:
+        return owner.lease_id == str(lease_id) and owner.attempt_id == str(attempt_id)
+
+    @staticmethod
+    def _query_task_execution_replay_matches(
+        replay: _QueryTaskExecutionReplay | None,
+        *,
+        lease_id: str,
+        attempt_id: str,
+    ) -> bool:
+        return bool(replay is not None and replay.lease_id == str(lease_id) and replay.attempt_id == str(attempt_id))
+
+    def _record_query_task_execution_replay_locked(
+        self,
+        owner: _QueryTaskExecutionOwner,
+        *,
+        terminal_action: Literal[
+            "cancelled",
+            "released",
+            "completion",
+            "teardown",
+        ],
+    ) -> None:
+        self._query_task_execution_replays[owner.request_id] = _QueryTaskExecutionReplay(
+            query_id=owner.query_id,
+            allocation_generation=owner.allocation_generation,
+            request_id=owner.request_id,
+            task_id=owner.task_id,
+            attempt_id=owner.attempt_id,
+            lease_id=owner.lease_id,
+            terminal_action=terminal_action,
+        )
+
+    def _retire_query_task_execution_owner(
+        self,
+        request_id: str,
+        *,
+        lease_id: str,
+        attempt_id: str,
+        terminal_action: Literal[
+            "cancelled",
+            "released",
+            "completion",
+            "teardown",
+        ],
+    ) -> bool:
+        request_key = str(request_id)
+        with self._query_task_execution_condition:
+            owner = self._query_task_execution_owners.get(request_key)
+            if owner is None or not self._query_task_execution_owner_matches(
+                owner,
+                lease_id,
+                attempt_id,
+            ):
+                return False
+            self._record_query_task_execution_replay_locked(
+                owner,
+                terminal_action=terminal_action,
+            )
+            self._query_task_execution_owners.pop(request_key, None)
+            self._query_task_execution_condition.notify_all()
+            return True
+
+    def _mark_query_execution_quiesced(self, query_id: str) -> None:
+        """Publish structural teardown and retire its explicit fallback owners."""
+        query_key = str(query_id)
+        with self._query_task_execution_condition:
+            self._query_execution_quiesced_queries.add(query_key)
+            teardown_owned = [
+                (request_id, owner)
+                for request_id, owner in self._query_task_execution_owners.items()
+                if owner.query_id == query_key and owner.phase == "teardown_owned"
+            ]
+            for request_id, owner in teardown_owned:
+                self._record_query_task_execution_replay_locked(
+                    owner,
+                    terminal_action="teardown",
+                )
+                self._query_task_execution_owners.pop(request_id, None)
+            self._query_task_execution_condition.notify_all()
+
+    def _finish_query_task_completion_wait(
+        self,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+    ) -> dict[str, Any]:
+        """Release one lease only after its submitted Ray call is terminal."""
+        from duckdb.runners.ray.query_resource_manager import TaskGrant
+        from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
+
+        request_key = str(request_id)
+        state = self._query_task_lease_requests.get(request_key)
+        with self._query_task_execution_condition:
+            owner = self._query_task_execution_owners.get(request_key)
+            if (
+                owner is None
+                or owner.phase != "completion_wait"
+                or not self._query_task_execution_owner_matches(
+                    owner,
+                    lease_id,
+                    attempt_id,
+                )
+            ):
+                return {"released": False}
+        try:
+            released = get_query_resource_manager(owner.query_id).release_task_lease(
+                str(lease_id),
+                attempt_id=str(attempt_id),
+            )
+        except KeyError:
+            released = False
+        try:
+            get_query_resource_manager(owner.query_id).mark_task_attempt_terminal(
+                owner.task_id,
+                owner.attempt_id,
+            )
+        except KeyError:
+            pass
+        if state is not None:
+            self._retire_query_lease_request(
+                request_id=request_key,
+                state=state,
+                result=self._grant_payload(
+                    TaskGrant(
+                        False,
+                        blocked_reason="task_lease_remote_work_completed",
+                        fatal=True,
+                    )
+                ),
+                status="released_after_completion",
+                active=self._query_task_lease_requests,
+                tombstones=self._query_task_lease_request_tombstones,
+            )
+        if not self._retire_query_task_execution_owner(
+            request_key,
+            lease_id=lease_id,
+            attempt_id=attempt_id,
+            terminal_action="completion",
+        ):
+            raise RuntimeError(f"task completion owner changed while finishing request {request_key}")
+        if owner.query_id not in self._query_resource_closing_queries:
+            self._run_query_resource_admission_pumps(owner.query_id)
+        return {"released": bool(released)}
+
+    async def _wait_for_query_task_completion(
+        self,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        query_id: str,
+        completion_future: ConcurrentFuture[Any],
+    ) -> None:
+        """Observe terminal work without occupying a Ray actor RPC slot."""
+        request_key = str(request_id)
+        current = asyncio.current_task()
+        try:
+            try:
+                await asyncio.wrap_future(completion_future)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                # A failed completion ObjectRef is still terminal proof.
+                pass
+            self._finish_query_task_completion_wait(
+                request_key,
+                lease_id,
+                attempt_id,
+            )
+        except asyncio.CancelledError:
+            # Query teardown remains the conservative execution owner.
+            pass
+        except BaseException as exc:
+            self._query_terminal_errors.setdefault(
+                str(query_id),
+                f"task completion ownership transfer failed for {request_key}: {type(exc).__name__}: {exc}",
+            )
+        finally:
+            with self._query_task_execution_condition:
+                record = self._query_task_completion_waiters.get(request_key)
+                if record is not None and record[1] is current:
+                    self._query_task_completion_waiters.pop(request_key, None)
+                    self._query_task_execution_condition.notify_all()
+
+    async def release_query_task_lease_after_completion(
+        self,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        completion_refs: list[Any],
+    ) -> dict[str, Any]:
+        """Transfer task accounting to a driver-owned completion waiter."""
+        self._ensure_query_resource_admission_state()
+        if not isinstance(completion_refs, list) or len(completion_refs) != 1:
+            raise ValueError("task completion handoff requires exactly one nested ObjectRef")
+        completion_ref = completion_refs[0]
+        future_method = getattr(completion_ref, "future", None)
+        if not callable(future_method):
+            raise TypeError("task completion handoff requires an ObjectRef with future()")
+
+        request_key = str(request_id)
+        state = self._query_task_lease_requests.get(request_key)
+        with self._query_task_execution_condition:
+            owner = self._query_task_execution_owners.get(request_key)
+            if owner is None:
+                replay = self._query_task_execution_replays.get(request_key)
+                if self._query_task_execution_replay_matches(
+                    replay,
+                    lease_id=lease_id,
+                    attempt_id=attempt_id,
+                ):
+                    return {"scheduled": True}
+                tombstone = self._query_task_lease_request_tombstones.get(request_key)
+                return {"scheduled": bool(tombstone and tombstone.get("status") == "released_after_completion")}
+            if not self._query_task_execution_owner_matches(
+                owner,
+                lease_id,
+                attempt_id,
+            ):
+                return {"scheduled": False}
+            if owner.phase == "teardown_owned":
+                return {"scheduled": False}
+            if request_key in self._query_task_completion_waiters:
+                return {"scheduled": True}
+
+        completion_future = future_method()
+        if not isinstance(completion_future, ConcurrentFuture):
+            raise TypeError("task completion ObjectRef.future() must return a concurrent Future")
+        query_id = owner.query_id
+        with self._query_task_execution_condition:
+            current_owner = self._query_task_execution_owners.get(request_key)
+            if current_owner is not owner:
+                return {"scheduled": False}
+            if state is not None:
+                state["status"] = "completion_wait"
+            task = asyncio.create_task(
+                self._wait_for_query_task_completion(
+                    request_key,
+                    str(lease_id),
+                    str(attempt_id),
+                    query_id,
+                    completion_future,
+                ),
+                name=f"vane-query-task-completion:{request_key}",
+            )
+            owner.phase = "completion_wait"
+            self._query_task_completion_waiters[request_key] = (query_id, task)
+            self._query_task_execution_condition.notify_all()
+        return {"scheduled": True}
+
+    def _wait_for_query_task_execution_owners(
+        self,
+        query_id: str,
+        *,
+        timeout_s: float = 30.0,
+    ) -> None:
+        """Fence QRM release behind every granted execution owner."""
+        self._ensure_query_resource_admission_state()
+        query_key = str(query_id)
+        deadline = time.monotonic() + max(0.001, float(timeout_s))
+        with self._query_task_execution_condition:
+            while True:
+                owners = sorted(
+                    (request_id, owner.phase)
+                    for request_id, owner in self._query_task_execution_owners.items()
+                    if owner.query_id == query_key
+                )
+                if not owners:
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise QueryTeardownOwnershipError(
+                        f"query task execution owners did not quiesce for {query_key}: "
+                        + ", ".join(f"{request_id}[{phase}]" for request_id, phase in owners)
+                    )
+                self._query_task_execution_condition.wait(remaining)
+
+    async def handoff_query_task_lease_to_teardown(
+        self,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+    ) -> dict[str, Any]:
+        """Retain a submitted lease when no completion contract is available."""
+        from duckdb.runners.ray.query_resource_manager import TaskGrant
+
+        self._ensure_query_resource_admission_state()
+        request_key = str(request_id)
+        state = self._query_task_lease_requests.get(request_key)
+        with self._query_task_execution_condition:
+            owner = self._query_task_execution_owners.get(request_key)
+            if owner is None:
+                replay = self._query_task_execution_replays.get(request_key)
+                if self._query_task_execution_replay_matches(
+                    replay,
+                    lease_id=lease_id,
+                    attempt_id=attempt_id,
+                ):
+                    return {"handed_off": True}
+                tombstone = self._query_task_lease_request_tombstones.get(request_key)
+                return {"handed_off": bool(tombstone and tombstone.get("status") == "teardown_owned")}
+            if not self._query_task_execution_owner_matches(
+                owner,
+                lease_id,
+                attempt_id,
+            ):
+                return {"handed_off": False}
+            if owner.phase == "completion_wait":
+                return {"handed_off": False}
+            if owner.phase == "teardown_owned":
+                return {"handed_off": True}
+        if state is not None:
+            self._retire_query_lease_request(
+                request_id=request_key,
+                state=state,
+                result=self._grant_payload(
+                    TaskGrant(
+                        False,
+                        blocked_reason="task_lease_owned_by_query_teardown",
+                        fatal=True,
+                    )
+                ),
+                status="teardown_owned",
+                active=self._query_task_lease_requests,
+                tombstones=self._query_task_lease_request_tombstones,
+            )
+        with self._query_task_execution_condition:
+            current_owner = self._query_task_execution_owners.get(request_key)
+            if current_owner is not owner:
+                return {"handed_off": False}
+            if owner.query_id in self._query_execution_quiesced_queries:
+                self._record_query_task_execution_replay_locked(
+                    owner,
+                    terminal_action="teardown",
+                )
+                self._query_task_execution_owners.pop(request_key, None)
+            else:
+                owner.phase = "teardown_owned"
+            self._query_task_execution_condition.notify_all()
+        return {"handed_off": True}
 
     async def cancel_query_task_lease_request(self, request_id: str, *, submitted: bool) -> dict[str, Any]:
         from duckdb.runners.ray.query_resource_manager import TaskGrant
@@ -3272,9 +3841,18 @@ class RayQueryDriverActor:
         self._ensure_query_resource_admission_state()
         request_key = str(request_id)
         state = self._query_task_lease_requests.get(request_key)
-        if state is None:
+        with self._query_task_execution_condition:
+            owner = self._query_task_execution_owners.get(request_key)
+            replay = self._query_task_execution_replays.get(request_key)
+        if state is None and owner is None:
+            if replay is not None:
+                return {"cancelled": True, "released": False}
             if request_key in self._query_task_lease_request_tombstones:
                 return {"cancelled": True, "released": False}
+            return {"cancelled": False, "released": False}
+        if submitted or (owner is not None and owner.phase in {"submitted", "completion_wait", "teardown_owned"}):
+            # Cancellation submission is not terminal proof. Submitted work must
+            # use the completion-gated handoff above.
             return {"cancelled": False, "released": False}
         denial = self._grant_payload(
             TaskGrant(
@@ -3283,19 +3861,18 @@ class RayQueryDriverActor:
                 fatal=True,
             )
         )
-        lease = state.get("lease")
         released = False
-        if lease is not None:
+        if owner is not None:
             try:
-                manager = get_query_resource_manager(lease["query_id"])
-                if submitted:
-                    released = manager.release_task_lease(lease["lease_id"], attempt_id=lease["attempt_id"])
-                else:
-                    released = manager.abandon_task_lease(lease["lease_id"], attempt_id=lease["attempt_id"])
+                released = get_query_resource_manager(owner.query_id).abandon_task_lease(
+                    owner.lease_id,
+                    attempt_id=owner.attempt_id,
+                )
             except KeyError:
                 released = False
-        identity = state["identity"]
-        if lease is None:
+        identity = None if state is None else state["identity"]
+        if owner is None:
+            assert identity is not None
             try:
                 manager = get_query_resource_manager(identity["query_id"])
                 manager.remove_task_waiter(
@@ -3310,21 +3887,35 @@ class RayQueryDriverActor:
                 pass
         else:
             try:
-                get_query_resource_manager(identity["query_id"]).mark_task_attempt_terminal(
-                    identity["task_id"],
-                    identity["attempt_id"],
+                get_query_resource_manager(owner.query_id).mark_task_attempt_terminal(
+                    owner.task_id,
+                    owner.attempt_id,
                 )
             except KeyError:
                 pass
-        self._retire_query_lease_request(
-            request_id=request_key,
-            state=state,
-            result=denial,
-            status="cancelled",
-            active=self._query_task_lease_requests,
-            tombstones=self._query_task_lease_request_tombstones,
-        )
-        self._run_query_resource_admission_pumps(identity["query_id"])
+        if state is not None:
+            self._retire_query_lease_request(
+                request_id=request_key,
+                state=state,
+                result=denial,
+                status="cancelled",
+                active=self._query_task_lease_requests,
+                tombstones=self._query_task_lease_request_tombstones,
+            )
+        if owner is not None and not self._retire_query_task_execution_owner(
+            request_key,
+            lease_id=owner.lease_id,
+            attempt_id=owner.attempt_id,
+            terminal_action="cancelled",
+        ):
+            raise RuntimeError(f"task execution owner changed while cancelling request {request_key}")
+        if owner is not None:
+            query_id = owner.query_id
+        else:
+            assert identity is not None
+            query_id = str(identity["query_id"])
+        if query_id not in self._query_resource_closing_queries:
+            self._run_query_resource_admission_pumps(query_id)
         return {"cancelled": True, "released": bool(released)}
 
     async def release_query_task_lease(
@@ -3339,48 +3930,79 @@ class RayQueryDriverActor:
         self._ensure_query_resource_admission_state()
         request_key = str(request_id)
         state = self._query_task_lease_requests.get(request_key)
-        if state is None:
-            return {"released": False}
-        lease = state.get("lease") or {}
-        if str(lease.get("lease_id") or "") != str(lease_id) or str(lease.get("attempt_id") or "") != str(attempt_id):
-            return {"released": False}
+        with self._query_task_execution_condition:
+            owner = self._query_task_execution_owners.get(request_key)
+            if owner is None:
+                replay = self._query_task_execution_replays.get(request_key)
+                if self._query_task_execution_replay_matches(
+                    replay,
+                    lease_id=lease_id,
+                    attempt_id=attempt_id,
+                ):
+                    return {"released": True}
+                tombstone = self._query_task_lease_request_tombstones.get(request_key)
+                return {"released": bool(tombstone and tombstone.get("status") == "released")}
+            if owner.phase in {"completion_wait", "teardown_owned"}:
+                return {"released": False}
+            if not self._query_task_execution_owner_matches(
+                owner,
+                lease_id,
+                attempt_id,
+            ):
+                return {"released": False}
         try:
             _log_resource_debug(
                 "task_release_start",
-                query_id=lease.get("query_id", ""),
-                stage_id=lease.get("stage_id", ""),
+                query_id=owner.query_id,
+                stage_id=(state or {}).get("identity", {}).get("stage_id", ""),
                 request_id=request_key,
                 lease_id=lease_id,
             )
-            released = get_query_resource_manager(lease["query_id"]).release_task_lease(
+            released = get_query_resource_manager(owner.query_id).release_task_lease(
                 str(lease_id), attempt_id=str(attempt_id)
             )
         except KeyError:
             released = False
-        self._retire_query_lease_request(
-            request_id=request_key,
-            state=state,
-            result=self._grant_payload(
-                TaskGrant(
-                    False,
-                    blocked_reason="task_lease_request_released",
-                    fatal=True,
-                )
-            ),
-            status="released",
-            active=self._query_task_lease_requests,
-            tombstones=self._query_task_lease_request_tombstones,
-        )
+        try:
+            get_query_resource_manager(owner.query_id).mark_task_attempt_terminal(
+                owner.task_id,
+                owner.attempt_id,
+            )
+        except KeyError:
+            pass
+        if state is not None:
+            self._retire_query_lease_request(
+                request_id=request_key,
+                state=state,
+                result=self._grant_payload(
+                    TaskGrant(
+                        False,
+                        blocked_reason="task_lease_request_released",
+                        fatal=True,
+                    )
+                ),
+                status="released",
+                active=self._query_task_lease_requests,
+                tombstones=self._query_task_lease_request_tombstones,
+            )
+        if not self._retire_query_task_execution_owner(
+            request_key,
+            lease_id=lease_id,
+            attempt_id=attempt_id,
+            terminal_action="released",
+        ):
+            raise RuntimeError(f"task execution owner changed while releasing request {request_key}")
         _log_resource_debug(
             "task_release_done",
-            query_id=lease.get("query_id", ""),
-            stage_id=lease.get("stage_id", ""),
+            query_id=owner.query_id,
+            stage_id=(state or {}).get("identity", {}).get("stage_id", ""),
             request_id=request_key,
             lease_id=lease_id,
             released=bool(released),
         )
-        self._run_query_resource_admission_pumps(lease["query_id"])
-        return {"released": bool(released)}
+        if owner.query_id not in self._query_resource_closing_queries:
+            self._run_query_resource_admission_pumps(owner.query_id)
+        return {"released": True}
 
     async def acquire_query_output_block_lease(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Resolve one produced block through the query's admission pump."""
@@ -3389,6 +4011,11 @@ class RayQueryDriverActor:
 
         request_id, request, identity = self._parse_output_block_lease_request(payload)
         self._ensure_query_resource_admission_state()
+        tombstone = self._query_output_lease_request_tombstones.get(request_id)
+        if tombstone is not None and tombstone["identity"] != identity:
+            raise ValueError(f"output lease request_id reused with different identity: {request_id}")
+        if tombstone is not None:
+            return dict(tombstone["result"])
         if str(request.query_id) in self._query_resource_closing_queries:
             return self._grant_payload(
                 OutputBlockGrant(
@@ -3397,11 +4024,6 @@ class RayQueryDriverActor:
                     fatal=True,
                 )
             )
-        tombstone = self._query_output_lease_request_tombstones.get(request_id)
-        if tombstone is not None and tombstone["identity"] != identity:
-            raise ValueError(f"output lease request_id reused with different identity: {request_id}")
-        if tombstone is not None:
-            return dict(tombstone["result"])
         existing = self._query_output_lease_requests.get(request_id)
         if existing is not None and existing["identity"] != identity:
             raise ValueError(f"output lease request_id reused with different identity: {request_id}")
@@ -3467,6 +4089,7 @@ class RayQueryDriverActor:
         self,
         request_id: str,
         lease_id: str,
+        query_id: str = "",
     ) -> dict[str, Any]:
         """Transfer a live output from the producer queue to downstream input.
 
@@ -3480,14 +4103,26 @@ class RayQueryDriverActor:
         self._ensure_query_resource_admission_state()
         request_key = str(request_id)
         state = self._query_output_lease_requests.get(request_key)
-        if state is None or state.get("status") in {"released", "cancelled", "failed"}:
+        if state is None:
+            tombstone = self._query_output_lease_request_tombstones.get(request_key)
+            replay_lease = {} if tombstone is None else tombstone.get("lease") or {}
+            if (
+                tombstone is not None
+                and str(replay_lease.get("lease_id") or "") == str(lease_id)
+                and tombstone.get("status") in {"released", "cancelled"}
+            ):
+                return {"handed_off": True}
+            if str(query_id) in self._query_resource_closing_queries:
+                return {"handed_off": True}
             return {"handed_off": False}
         lease = state.get("lease") or {}
         if str(lease.get("lease_id") or "") != str(lease_id):
             return {"handed_off": False}
+        if query_id and str(lease.get("query_id") or "") != str(query_id):
+            return {"handed_off": False}
         current_state = str(lease.get("state") or "")
         if current_state == "downstream_input":
-            return {"handed_off": False}
+            return {"handed_off": True}
         if current_state != "stage_queue":
             raise RuntimeError(f"output lease handoff requires stage_queue state, got {current_state!r}")
         try:
@@ -3500,12 +4135,15 @@ class RayQueryDriverActor:
         if handed_off:
             lease["state"] = "downstream_input"
             self._run_query_resource_admission_pumps(lease["query_id"])
-        return {"handed_off": bool(handed_off)}
+        return {
+            "handed_off": bool(handed_off or str(lease.get("query_id") or "") in self._query_resource_closing_queries)
+        }
 
     async def release_query_output_block_lease(
         self,
         request_id: str,
         lease_id: str,
+        query_id: str = "",
     ) -> dict[str, Any]:
         from duckdb.runners.ray.query_resource_manager import OutputBlockGrant
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
@@ -3514,14 +4152,26 @@ class RayQueryDriverActor:
         request_key = str(request_id)
         state = self._query_output_lease_requests.get(request_key)
         if state is None:
+            tombstone = self._query_output_lease_request_tombstones.get(request_key)
+            replay_lease = {} if tombstone is None else tombstone.get("lease") or {}
+            if (
+                tombstone is not None
+                and str(replay_lease.get("lease_id") or "") == str(lease_id)
+                and tombstone.get("status") in {"released", "cancelled"}
+            ):
+                return {"released": True}
+            if str(query_id) in self._query_resource_closing_queries:
+                return {"released": True}
             return {"released": False}
         lease = state.get("lease") or {}
         if str(lease.get("lease_id") or "") != str(lease_id):
             return {"released": False}
+        if query_id and str(lease.get("query_id") or "") != str(query_id):
+            return {"released": False}
         try:
-            released = get_query_resource_manager(lease["query_id"]).release_output_block(str(lease_id))
+            get_query_resource_manager(lease["query_id"]).release_output_block(str(lease_id))
         except KeyError:
-            released = False
+            pass
         self._retire_query_lease_request(
             request_id=request_key,
             state=state,
@@ -3537,7 +4187,7 @@ class RayQueryDriverActor:
             tombstones=self._query_output_lease_request_tombstones,
         )
         self._run_query_resource_admission_pumps(lease["query_id"])
-        return {"released": bool(released)}
+        return {"released": True}
 
     async def cancel_query_output_block_lease_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         from duckdb.runners.ray.query_resource_manager import OutputBlockGrant
@@ -3545,13 +4195,13 @@ class RayQueryDriverActor:
 
         request_id, request, identity = self._parse_output_block_lease_request(payload)
         self._ensure_query_resource_admission_state()
-        if str(request.query_id) in self._query_resource_closing_queries:
-            return {"cancelled": True, "released": False}
         request_key = request_id
         tombstone = self._query_output_lease_request_tombstones.get(request_key)
         if tombstone is not None and tombstone["identity"] != identity:
             raise ValueError(f"output lease request_id reused with different identity: {request_key}")
         if tombstone is not None:
+            return {"cancelled": True, "released": False}
+        if str(request.query_id) in self._query_resource_closing_queries:
             return {"cancelled": True, "released": False}
         state = self._query_output_lease_requests.get(request_key)
         if state is not None and state["identity"] != identity:
@@ -3816,6 +4466,7 @@ class RayQueryDriverActor:
         *,
         reason: str,
         admission_fenced: bool = False,
+        execution_quiesced: bool = False,
     ) -> None:
         from duckdb.runners.ray.query_resource_runtime import release_query_resource_manager
 
@@ -3832,6 +4483,16 @@ class RayQueryDriverActor:
                 raise QueryTeardownOwnershipError(
                     f"failed to fence query resource release for {query_key}: {type(exc).__name__}: {exc}"
                 ) from exc
+        if execution_quiesced:
+            # Structural query teardown is the fallback proof for the rare
+            # submitted object that could not expose a completion ObjectRef.
+            # Completion-owned Ray calls still require their own terminal ref.
+            self._mark_query_execution_quiesced(query_key)
+        # Admission close may delete request/replay state, but every grant has
+        # an independent execution owner published before the grant Future.
+        # This fence therefore also covers terminal handoff RPCs that have been
+        # submitted by a collector but have not reached this actor yet.
+        self._wait_for_query_task_execution_owners(query_key)
         cleanup_errors: list[BaseException] = []
         deferred_teardowns: tuple[_DeferredQueryAllocationTeardown, ...] = ()
         try:
@@ -3873,6 +4534,8 @@ class RayQueryDriverActor:
                 f"{len(cleanup_errors)} error(s): "
                 + "; ".join(f"{type(exc).__name__}: {exc}" for exc in cleanup_errors)
             ) from cleanup_errors[0]
+        with self._query_task_execution_condition:
+            self._query_execution_quiesced_queries.discard(query_key)
 
     def query_resource_snapshot(
         self,
@@ -4134,6 +4797,7 @@ class RayQueryDriverActor:
         drop_fragments: bool,
     ) -> None:
         errors: list[BaseException] = []
+        execution_owner_errors: list[BaseException] = []
         self.curr_plans.pop(plan_id, None)
         self.curr_streams.pop(plan_id, None)
         with self._plan_teardown_condition:
@@ -4146,6 +4810,7 @@ class RayQueryDriverActor:
                     output_lease_owner.release()
                 except BaseException as exc:
                     errors.append(exc)
+                    execution_owner_errors.append(exc)
                 else:
                     with self._plan_teardown_condition:
                         current_refs = self._leased_result_partition_refs.get(str(plan_id))
@@ -4164,19 +4829,31 @@ class RayQueryDriverActor:
             self._cleanup_udf_actor_pools(str(plan_id))
         except BaseException as exc:
             errors.append(exc)
+            execution_owner_errors.append(exc)
         try:
             self._cleanup_vllm_actor_pools(str(plan_id))
         except BaseException as exc:
             errors.append(exc)
+            execution_owner_errors.append(exc)
         query_key = str(query_id or "").strip()
         if query_key:
             try:
                 if drop_fragments:
-                    self._drop_query_fragments_sync(query_key)
-                else:
+                    if execution_owner_errors:
+                        # Quiesce independently owned fragments, but keep the
+                        # QRM/coordinator allocation intact while an output or
+                        # actor owner failed to terminate.
+                        self._drop_query_fragments_after_admission_fence_sync(
+                            query_key,
+                            release_resources=False,
+                        )
+                    else:
+                        self._drop_query_fragments_sync(query_key)
+                elif not execution_owner_errors:
                     self._release_query_resources(
                         query_key,
                         reason="query_ended_before_fragment_start",
+                        execution_quiesced=True,
                     )
             except BaseException as exc:
                 errors.append(exc)

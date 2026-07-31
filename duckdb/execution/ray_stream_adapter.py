@@ -4,15 +4,80 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
+from duckdb.runners.ray.safe_get import resolve_object_refs_blocking
+
+RAY_STREAM_CLEANUP_CONTROL = "control"
+RAY_STREAM_CLEANUP_OUTPUT = "output"
+RAY_STREAM_CLEANUP_CANCELLATION = "cancellation"
+RAY_STREAM_CLEANUP_CORE = "core"
+_RAY_STREAM_CLEANUP_LANES = frozenset(
+    {
+        RAY_STREAM_CLEANUP_CONTROL,
+        RAY_STREAM_CLEANUP_OUTPUT,
+        RAY_STREAM_CLEANUP_CANCELLATION,
+        RAY_STREAM_CLEANUP_CORE,
+    }
+)
 _REQUIRED_GENERATOR_METHODS = ("__anext__", "completed")
 _REQUIRED_RAY_METHODS = ("wait",)
 _REQUIRED_CORE_WORKER_METHODS = (
     "async_delete_object_ref_stream",
     "is_object_ref_stream_finished",
 )
+_TASK_LEASE_CONTROL_ACK_TIMEOUT_S = 5.0
+
+
+@dataclass(frozen=True)
+class RayStreamCleanupOperation:
+    """One terminal operation assigned to a bounded failure-isolation lane."""
+
+    lane: str
+    operation: Callable[[], Any]
+    retry_on_error: bool = False
+    retry_on_incomplete: bool = False
+
+    def __post_init__(self) -> None:
+        if self.lane not in _RAY_STREAM_CLEANUP_LANES:
+            raise ValueError(f"invalid Ray stream cleanup lane: {self.lane}")
+
+    def __call__(self) -> Any:
+        return self.operation()
+
+
+def resolve_ray_control_ack(response_ref: Any, *, field: str) -> dict[str, Any]:
+    """Require driver acceptance before dropping a local resource owner."""
+    if isinstance(response_ref, dict):
+        response = response_ref
+    else:
+        response = resolve_object_refs_blocking(
+            response_ref,
+            timeout=_TASK_LEASE_CONTROL_ACK_TIMEOUT_S,
+            honor_query_deadline=False,
+            honor_object_get_timeout=False,
+        )
+    if not isinstance(response, dict) or response.get(field) is not True:
+        raise RuntimeError(f"Ray task lease control handoff was not accepted: {field}")
+    return response
+
+
+def _run_cleanup_operations(label: str, operations: Sequence[Callable[[], Any]]) -> None:
+    errors: list[BaseException] = []
+    for operation in operations:
+        try:
+            result = operation()
+        except BaseException as exc:
+            errors.append(exc)
+            continue
+        if result is False and isinstance(operation, RayStreamCleanupOperation) and operation.retry_on_incomplete:
+            errors.append(RuntimeError("Ray stream cleanup ownership transfer remained incomplete"))
+    if errors:
+        details = "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+        raise RuntimeError(f"{label}: {details}") from errors[0]
 
 
 def validate_ray_stream_contract(ray_module: Any) -> None:
@@ -57,11 +122,21 @@ class TaskLeaseObjectRefGenerator:
         self._ray = active_ray_module
         self._driver = admission.driver
         self._request_id = request_id
+        self._execution_backend = "ray_actor" if lease.get("actor_index") is not None else "ray_task"
         self._generator: Any | None = None
+        self._completion_ref: Any | None = None
         self._lease: dict[str, Any] | None = lease
-        self._submitted = False
+        self._lease_identity = dict(lease)
         self._released = False
+        self._release_submission_active = False
+        self._release_response_ref: Any | None = None
         self._cancelled = False
+        self._task_cleanup_handed_off = False
+        self._task_cleanup_handoff_active = False
+        self._task_cleanup_response_ref: Any | None = None
+        self._cancel_generator: Any | None = None
+        self._generator_cancel_submitted = False
+        self._generator_cancel_submission_active = False
         self._lock = threading.Lock()
         try:
             self._generator = submitter(dict(lease))
@@ -69,12 +144,56 @@ class TaskLeaseObjectRefGenerator:
             self._lease = None
             admission.release()
             raise
-        admission.handoff()
-        self._submitted = True
-        self._driver.mark_query_task_lease_submitted.remote(
-            self._request_id,
-            str(lease["lease_id"]),
-        )
+        try:
+            admission.handoff()
+            self._validate_and_bind_completion()
+            self._driver.mark_query_task_lease_submitted.remote(
+                self._request_id,
+                str(lease["lease_id"]),
+            )
+        except BaseException as submission_error:
+            cleanup_errors: list[BaseException] = []
+            try:
+                self.cancel()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            try:
+                admission.release()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            if cleanup_errors:
+                details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
+                raise RuntimeError(
+                    "Ray UDF task submission setup failed and cleanup was incomplete: "
+                    f"submission={type(submission_error).__name__}: {submission_error}; "
+                    f"cleanup={details}"
+                ) from submission_error
+            raise
+
+    def _validate_and_bind_completion(self) -> None:
+        generator = self._generator
+        if generator is None:
+            raise RuntimeError("Ray UDF task stream is unavailable")
+        version = str(getattr(self._ray, "__version__", "")).strip() or "unknown"
+        missing = [name for name in _REQUIRED_GENERATOR_METHODS if not callable(getattr(generator, name, None))]
+        if missing:
+            raise TypeError(
+                f"Ray {version!r} stream source is not an ObjectRefGenerator; missing " + ", ".join(missing)
+            )
+        worker = getattr(generator, "worker", None)
+        core_worker = getattr(worker, "core_worker", None)
+        missing_core = [
+            name for name in _REQUIRED_CORE_WORKER_METHODS if not callable(getattr(core_worker, name, None))
+        ]
+        if missing_core:
+            raise TypeError(
+                f"Ray {version!r} stream source is missing required CoreWorker contract: " + ", ".join(missing_core)
+            )
+        completion_ref = generator.completed()
+        if completion_ref is None:
+            raise RuntimeError("Ray stream completion ObjectRef is unavailable")
+        with self._lock:
+            self._completion_ref = completion_ref
 
     @property
     def request_id(self) -> str:
@@ -86,11 +205,18 @@ class TaskLeaseObjectRefGenerator:
 
     @property
     def lease(self) -> dict[str, Any] | None:
-        return None if self._lease is None else dict(self._lease)
+        with self._lock:
+            return None if self._lease is None else dict(self._lease)
 
     @property
     def generator(self) -> Any | None:
-        return self._generator
+        with self._lock:
+            return self._generator
+
+    @property
+    def completion_ref(self) -> Any | None:
+        with self._lock:
+            return self._completion_ref
 
     @property
     def start(self) -> Any:
@@ -99,47 +225,198 @@ class TaskLeaseObjectRefGenerator:
                 raise RuntimeError("Ray UDF task stream is not active")
             return self._generator
 
-    def release_task(self) -> None:
+    def _release_task(self) -> bool:
         with self._lock:
-            if self._released or self._lease is None:
-                return
+            if self._released or self._task_cleanup_handed_off:
+                return True
+            if self._cancelled or self._release_submission_active or self._task_cleanup_handoff_active:
+                return False
+            self._release_submission_active = True
+            lease = self._lease_identity
+            driver = self._driver
+            request_id = self._request_id
+            response_ref = self._release_response_ref
+        try:
+            if response_ref is None:
+                response_ref = driver.release_query_task_lease.remote(
+                    request_id,
+                    str(lease["lease_id"]),
+                    str(lease["attempt_id"]),
+                )
+                with self._lock:
+                    self._release_response_ref = response_ref
+            resolve_ray_control_ack(response_ref, field="released")
+        except BaseException as exc:
+            with self._lock:
+                self._release_submission_active = False
+                if not isinstance(exc, TimeoutError) and self._release_response_ref is response_ref:
+                    self._release_response_ref = None
+            raise
+        with self._lock:
+            self._release_submission_active = False
+            self._release_response_ref = None
             self._released = True
-            lease = dict(self._lease)
-        self._driver.release_query_task_lease.remote(
-            self._request_id,
-            str(lease["lease_id"]),
-            str(lease["attempt_id"]),
+        return True
+
+    def release_task(self) -> bool:
+        return self._release_task()
+
+    def release_task_operations(self) -> tuple[RayStreamCleanupOperation, ...]:
+        return (
+            RayStreamCleanupOperation(
+                RAY_STREAM_CLEANUP_CONTROL,
+                self._release_task,
+                retry_on_error=True,
+                retry_on_incomplete=True,
+            ),
         )
 
-    def cancel(self) -> None:
+    def _begin_cancellation(self, *, cancel_generator: bool) -> None:
         with self._lock:
-            if self._cancelled:
-                return
-            self._cancelled = True
-            generator = self._generator
-            submitted = self._submitted
-            self._released = True
-            self._generator = None
-        if generator is not None:
-            self._ray.cancel(generator, force=True, recursive=True)
-        self._driver.cancel_query_task_lease_request.remote(
-            self._request_id,
-            submitted=bool(submitted),
+            if not self._cancelled:
+                self._cancelled = True
+                if cancel_generator:
+                    self._cancel_generator = self._generator
+                self._generator = None
+
+    def _submit_generator_cancel(self) -> bool:
+        with self._lock:
+            if self._cancel_generator is None:
+                return self._generator_cancel_submitted or not self._cancelled
+            if self._generator_cancel_submission_active:
+                return False
+            self._generator_cancel_submission_active = True
+            generator = self._cancel_generator
+            ray_module = self._ray
+            force = self._execution_backend == "ray_task"
+        try:
+            ray_module.cancel(generator, force=force, recursive=True)
+        except BaseException:
+            with self._lock:
+                self._generator_cancel_submission_active = False
+            raise
+        with self._lock:
+            self._generator_cancel_submission_active = False
+            self._generator_cancel_submitted = True
+            if self._cancel_generator is generator:
+                self._cancel_generator = None
+        return True
+
+    def _handoff_task_completion(self) -> bool:
+        with self._lock:
+            if self._released or self._task_cleanup_handed_off:
+                return True
+            if self._release_submission_active or self._task_cleanup_handoff_active:
+                return False
+            self._task_cleanup_handoff_active = True
+            lease = self._lease_identity
+            driver = self._driver
+            request_id = self._request_id
+            completion_ref = self._completion_ref
+            response_ref = self._task_cleanup_response_ref
+        try:
+            ack_field = "handed_off" if completion_ref is None else "scheduled"
+            if response_ref is None:
+                if completion_ref is None:
+                    response_ref = driver.handoff_query_task_lease_to_teardown.remote(
+                        request_id,
+                        str(lease["lease_id"]),
+                        str(lease["attempt_id"]),
+                    )
+                else:
+                    # Ray resolves only top-level ObjectRef arguments. Nesting
+                    # the completion ref transfers ownership immediately
+                    # without making this RPC wait for the remote task itself.
+                    response_ref = driver.release_query_task_lease_after_completion.remote(
+                        request_id,
+                        str(lease["lease_id"]),
+                        str(lease["attempt_id"]),
+                        [completion_ref],
+                    )
+                with self._lock:
+                    self._task_cleanup_response_ref = response_ref
+            resolve_ray_control_ack(response_ref, field=ack_field)
+        except BaseException as exc:
+            with self._lock:
+                self._task_cleanup_handoff_active = False
+                if not isinstance(exc, TimeoutError) and self._task_cleanup_response_ref is response_ref:
+                    self._task_cleanup_response_ref = None
+            raise
+        with self._lock:
+            self._task_cleanup_handoff_active = False
+            self._task_cleanup_response_ref = None
+            self._task_cleanup_handed_off = True
+            self._completion_ref = None
+        return True
+
+    @property
+    def cancellation_started(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
+    def _generator_cancellation_complete_locked(self) -> bool:
+        return (
+            not self._cancelled
+            or self._generator_cancel_submitted
+            or (self._cancel_generator is None and not self._generator_cancel_submission_active)
         )
 
-    def retire_failed(self) -> None:
+    @property
+    def generator_cancellation_complete(self) -> bool:
+        with self._lock:
+            return self._generator_cancellation_complete_locked()
+
+    @property
+    def terminal_cleanup_complete(self) -> bool:
+        with self._lock:
+            task_complete = self._released or self._task_cleanup_handed_off
+            generator_complete = self._generator_cancellation_complete_locked()
+            return task_complete and generator_complete
+
+    def cancel_operations(self) -> tuple[RayStreamCleanupOperation, ...]:
+        self._begin_cancellation(cancel_generator=True)
+        return (
+            RayStreamCleanupOperation(
+                RAY_STREAM_CLEANUP_CONTROL,
+                self._handoff_task_completion,
+                retry_on_error=True,
+                retry_on_incomplete=True,
+            ),
+            RayStreamCleanupOperation(
+                RAY_STREAM_CLEANUP_CANCELLATION,
+                self._submit_generator_cancel,
+                retry_on_error=True,
+                retry_on_incomplete=True,
+            ),
+        )
+
+    def retire_failed_operations(self) -> tuple[RayStreamCleanupOperation, ...]:
+        self._begin_cancellation(cancel_generator=False)
+        return (
+            RayStreamCleanupOperation(
+                RAY_STREAM_CLEANUP_CONTROL,
+                self._handoff_task_completion,
+                retry_on_error=True,
+                retry_on_incomplete=True,
+            ),
+        )
+
+    def cancel(self) -> bool:
+        _run_cleanup_operations(
+            "Ray UDF task cancellation failed",
+            self.cancel_operations(),
+        )
+        self.retire_local_state()
+        return self.terminal_cleanup_complete
+
+    def retire_failed(self) -> bool:
         """Retire a terminally failed task without cancelling completed work."""
-        with self._lock:
-            if self._cancelled:
-                return
-            self._cancelled = True
-            submitted = self._submitted
-            self._released = True
-            self._generator = None
-        self._driver.cancel_query_task_lease_request.remote(
-            self._request_id,
-            submitted=bool(submitted),
+        _run_cleanup_operations(
+            "Ray UDF failed task retirement failed",
+            self.retire_failed_operations(),
         )
+        self.retire_local_state()
+        return self.terminal_cleanup_complete
 
     def retire_local_state(self) -> None:
         """Drop client-side task payload ownership after terminal cleanup."""
@@ -163,11 +440,22 @@ class RayStreamAdapter:
         self._ray = active_ray_module
         self._source = source
         self._leased = source if isinstance(source, TaskLeaseObjectRefGenerator) else None
+        self._task_request_identity = "" if self._leased is None else self._leased.request_id
         self._generator = self._leased.generator if self._leased is not None else source
         self._completion_ref: Any | None = None
         self._drained = False
-        self._task_released = False
         self._retired = False
+        self._release_owner: TaskLeaseObjectRefGenerator | None = None
+        self._cleanup_generator: Any | None = None
+        self._cleanup_completion_ref: Any | None = None
+        self._stream_cleanup_active = False
+        self._terminal_kind = ""
+        self._cancel_generator: Any | None = None
+        self._generator_cancel_active = False
+        self._generator_cancelled = False
+        self._lifecycle = threading.Condition()
+        self._active_reads = 0
+        self._active_core_calls = 0
         self._validate_generator_if_started()
 
     def _validate_generator_if_started(self) -> None:
@@ -188,77 +476,185 @@ class RayStreamAdapter:
             raise TypeError(
                 f"Ray {version!r} stream source is missing required CoreWorker contract: " + ", ".join(missing_core)
             )
-        self._completion_ref = self._generator.completed()
+        if self._leased is not None:
+            self._completion_ref = self._leased.completion_ref
+        else:
+            self._completion_ref = self._generator.completed()
+        if self._completion_ref is None:
+            raise RuntimeError("Ray stream completion ObjectRef is unavailable")
 
     @property
     def task_lease(self) -> dict[str, Any] | None:
-        return None if self._leased is None else self._leased.lease
+        with self._lifecycle:
+            leased = self._leased
+        return None if leased is None else leased.lease
 
     @property
     def task_request_id(self) -> str:
-        return "" if self._leased is None else self._leased.request_id
+        return self._task_request_identity
 
     @property
     def driver(self) -> Any | None:
-        return None if self._leased is None else self._leased.driver
+        with self._lifecycle:
+            leased = self._leased
+        return None if leased is None else leased.driver
 
     @property
     def waitable(self) -> Any:
         """Return the generator used for non-consuming readiness probes."""
-        if self._generator is None:
-            raise RuntimeError("Ray stream has no active ObjectRefGenerator")
-        return self._generator
+        with self._lifecycle:
+            if self._retired or self._generator is None:
+                raise RuntimeError("Ray stream has no active ObjectRefGenerator")
+            return self._generator
 
     async def read_next_ref_async(self) -> Any:
-        if self._generator is None:
-            raise RuntimeError("Ray stream has not acquired its task lease")
-        if self._drained:
-            raise StopAsyncIteration
-        ref = await self._generator.__anext__()
-        if hasattr(ref, "is_nil") and ref.is_nil():
-            raise RuntimeError("Ray generator returned a nil ObjectRef")
-        return ref
+        with self._lifecycle:
+            generator = self._generator
+            if self._retired or generator is None:
+                raise RuntimeError("Ray stream has not acquired its task lease")
+            if self._drained:
+                raise StopAsyncIteration
+            if self._active_reads:
+                raise RuntimeError("Ray ObjectRefGenerator does not support concurrent reads")
+            self._active_reads += 1
+        try:
+            ref = await generator.__anext__()
+            if hasattr(ref, "is_nil") and ref.is_nil():
+                raise RuntimeError("Ray generator returned a nil ObjectRef")
+            return ref
+        finally:
+            with self._lifecycle:
+                self._active_reads -= 1
+                if self._active_reads < 0:
+                    raise RuntimeError("Ray stream active read count underflow")
+                self._lifecycle.notify_all()
 
     @property
     def completion_ref(self) -> Any:
-        if self._completion_ref is None:
+        with self._lifecycle:
+            completion_ref = self._completion_ref
+        if completion_ref is None:
             raise RuntimeError("Ray stream completion ObjectRef is unavailable")
-        return self._completion_ref
+        return completion_ref
 
     def stream_finished(self) -> bool:
-        if self._generator is None:
-            return self._drained
-        return bool(self._generator.worker.core_worker.is_object_ref_stream_finished(self.completion_ref))
+        with self._lifecycle:
+            generator = self._generator
+            completion_ref = self._completion_ref
+            drained = self._drained
+            if generator is None or completion_ref is None:
+                return drained
+            self._active_core_calls += 1
+        try:
+            return bool(generator.worker.core_worker.is_object_ref_stream_finished(completion_ref))
+        finally:
+            with self._lifecycle:
+                self._active_core_calls -= 1
+                if self._active_core_calls < 0:
+                    raise RuntimeError("Ray stream active CoreWorker call count underflow")
+                self._lifecycle.notify_all()
 
     def is_terminal_ref(self, ref: Any) -> bool:
-        return self._generator is not None and ref == self._completion_ref
+        with self._lifecycle:
+            return self._generator is not None and ref == self._completion_ref
 
     def mark_drained(self) -> None:
-        self._drained = True
+        with self._lifecycle:
+            self._drained = True
 
     def release_task(self) -> None:
-        if self._task_released:
-            return
-        self._task_released = True
-        if self._leased is not None:
-            self._leased.release_task()
+        with self._lifecycle:
+            leased = self._leased if self._leased is not None else self._release_owner
+        if leased is not None:
+            leased.release_task()
+            self._drop_release_owner_if_complete(leased)
 
     @staticmethod
     def _delete_object_ref_stream(generator: Any, completion_ref: Any) -> None:
         worker = generator.worker
         core_worker = worker.core_worker
+        core_worker.async_delete_object_ref_stream(completion_ref)
+        # Ray's ObjectRefGenerator.__del__ unconditionally deletes through
+        # ``generator.worker``. Detach only after the explicit delete succeeds;
+        # a synchronous failure retains the worker for a bounded retry.
+        generator.worker = None
+
+    def _run_pending_stream_cleanup(self) -> bool:
+        with self._lifecycle:
+            if self._stream_cleanup_active:
+                return False
+            generator = self._cleanup_generator
+            completion_ref = self._cleanup_completion_ref
+            if generator is None or completion_ref is None:
+                return True
+            release_owner = self._release_owner
+            if self._terminal_kind == "cancel":
+                if release_owner is not None and not release_owner.generator_cancellation_complete:
+                    return False
+                if (
+                    release_owner is None
+                    and not self._generator_cancelled
+                    and (self._cancel_generator is not None or self._generator_cancel_active)
+                ):
+                    return False
+            if self._active_reads or self._active_core_calls:
+                # Cleanup lanes must never wait behind a stuck generator read.
+                # The bounded owner retries this operation after the in-flight
+                # call exits; retirement prevents any new call from starting.
+                return False
+            self._stream_cleanup_active = True
         try:
-            core_worker.async_delete_object_ref_stream(completion_ref)
-        finally:
-            # Ray 2.55's ObjectRefGenerator.__del__ unconditionally deletes the
-            # stream through ``generator.worker``.  We retire streams
-            # explicitly, so leaving that worker attached performs a second
-            # delete when the last local reference is dropped.  Under sustained
-            # streaming load that duplicate CoreWorker call can block the
-            # collector thread and, in a RayWorkerActor, the whole FTE consumer.
-            # Detach only after capturing the pinned CoreWorker/ref above; the
-            # adapter is terminal at every call site and must not be reused.
-            generator.worker = None
+            self._delete_object_ref_stream(generator, completion_ref)
+        except BaseException:
+            with self._lifecycle:
+                self._stream_cleanup_active = False
+                self._lifecycle.notify_all()
+            raise
+        with self._lifecycle:
+            self._stream_cleanup_active = False
+            if self._cleanup_generator is generator and self._cleanup_completion_ref is completion_ref:
+                self._cleanup_generator = None
+                self._cleanup_completion_ref = None
+            self._lifecycle.notify_all()
+        return True
+
+    def _run_unleased_generator_cancel(self) -> bool:
+        with self._lifecycle:
+            if self._generator_cancel_active:
+                return False
+            generator = self._cancel_generator
+            if generator is None:
+                return True
+            self._generator_cancel_active = True
+        try:
+            self._ray.cancel(generator, force=True, recursive=True)
+        except BaseException:
+            with self._lifecycle:
+                self._generator_cancel_active = False
+                self._lifecycle.notify_all()
+            raise
+        with self._lifecycle:
+            self._generator_cancel_active = False
+            self._generator_cancelled = True
+            if self._cancel_generator is generator:
+                self._cancel_generator = None
+            self._lifecycle.notify_all()
+        return True
+
+    def _drop_release_owner_if_complete(self, leased: TaskLeaseObjectRefGenerator) -> None:
+        with self._lifecycle:
+            if self._release_owner is leased and leased.terminal_cleanup_complete:
+                self._release_owner = None
+            self._lifecycle.notify_all()
+
+    def _leased_operation(
+        self,
+        leased: TaskLeaseObjectRefGenerator,
+        operation: Callable[[], Any],
+    ) -> Any:
+        result = operation()
+        self._drop_release_owner_if_complete(leased)
+        return result
 
     def retire(self) -> None:
         """Deterministically retire a fully drained Ray generator stream.
@@ -268,40 +664,22 @@ class RayStreamAdapter:
         ``__del__`` makes that cleanup depend on incidental Python references in
         this long-lived multiplexer, so terminal streams are retired explicitly.
         """
-        if self._retired:
-            return
-        self._retired = True
-        leased = self._leased
-        generator = self._generator
-        completion_ref = self._completion_ref
-        self.release_task()
-        self._source = None
-        self._leased = None
-        self._generator = None
-        self._completion_ref = None
-        if leased is not None:
-            leased.retire_local_state()
-        if generator is not None and completion_ref is not None:
-            self._delete_object_ref_stream(generator, completion_ref)
+        _run_cleanup_operations(
+            "Ray stream retirement failed",
+            self.retire_operations(),
+        )
+
+    def retire_operations(self) -> tuple[RayStreamCleanupOperation, ...]:
+        return self._prepare_terminal_operations("retire")
 
     def cancel(self) -> None:
-        if self._retired:
-            return
-        self._retired = True
-        leased = self._leased
-        generator = self._generator
-        completion_ref = self._completion_ref
-        self._source = None
-        self._leased = None
-        self._generator = None
-        self._completion_ref = None
-        if leased is not None:
-            leased.cancel()
-            leased.retire_local_state()
-        elif generator is not None:
-            self._ray.cancel(generator, force=True, recursive=True)
-        if generator is not None and completion_ref is not None:
-            self._delete_object_ref_stream(generator, completion_ref)
+        _run_cleanup_operations(
+            "Ray stream cancellation failed",
+            self.cancel_operations(),
+        )
+
+    def cancel_operations(self) -> tuple[RayStreamCleanupOperation, ...]:
+        return self._prepare_terminal_operations("cancel")
 
     def retire_failed(self) -> None:
         """Retire a terminal failure without racing it with ``ray.cancel``.
@@ -311,25 +689,103 @@ class RayStreamAdapter:
         normal task reply in Ray's CoreWorker.  The task lease still follows
         the failure path, but the already-ending remote work is left alone.
         """
-        if self._retired:
-            return
-        self._retired = True
-        leased = self._leased
-        generator = self._generator
-        completion_ref = self._completion_ref
-        self._source = None
-        self._leased = None
-        self._generator = None
-        self._completion_ref = None
+        _run_cleanup_operations(
+            "Ray failed stream retirement failed",
+            self.retire_failed_operations(),
+        )
+
+    def retire_failed_operations(self) -> tuple[RayStreamCleanupOperation, ...]:
+        return self._prepare_terminal_operations("failed")
+
+    def _prepare_terminal_operations(
+        self,
+        requested_kind: str,
+    ) -> tuple[RayStreamCleanupOperation, ...]:
+        if requested_kind not in {"retire", "failed", "cancel"}:
+            raise ValueError(f"invalid Ray stream terminal kind: {requested_kind}")
+        with self._lifecycle:
+            if not self._retired:
+                self._retired = True
+                self._terminal_kind = requested_kind
+                leased = self._leased
+                self._release_owner = leased
+                self._cleanup_generator = self._generator
+                self._cleanup_completion_ref = self._completion_ref
+                if requested_kind == "cancel" and leased is None:
+                    self._cancel_generator = self._generator
+                self._source = None
+                self._leased = None
+                self._generator = None
+                self._completion_ref = None
+            else:
+                leased = self._release_owner
+                # Never escalate normal completion into force-cancelling a Ray
+                # task whose terminal reply may already be in flight.
+                if self._terminal_kind == "retire" and requested_kind != "retire":
+                    self._terminal_kind = "failed"
+            terminal_kind = self._terminal_kind
+
+        leased_operations: list[RayStreamCleanupOperation] = []
         if leased is not None:
-            leased.retire_failed()
+            if terminal_kind == "cancel":
+                source_operations = leased.cancel_operations()
+            elif terminal_kind == "failed":
+                source_operations = leased.retire_failed_operations()
+            elif leased.cancellation_started:
+                source_operations = leased.cancel_operations()
+            else:
+                source_operations = leased.release_task_operations()
             leased.retire_local_state()
-        if generator is not None and completion_ref is not None:
-            self._delete_object_ref_stream(generator, completion_ref)
+            leased_operations = [
+                RayStreamCleanupOperation(
+                    operation.lane,
+                    partial(self._leased_operation, leased, operation.operation),
+                    retry_on_error=operation.retry_on_error,
+                    retry_on_incomplete=operation.retry_on_incomplete,
+                )
+                for operation in source_operations
+            ]
+
+        stream_operation = RayStreamCleanupOperation(
+            RAY_STREAM_CLEANUP_CORE,
+            self._run_pending_stream_cleanup,
+            retry_on_error=True,
+            retry_on_incomplete=True,
+        )
+        operations: list[RayStreamCleanupOperation] = [*leased_operations]
+        if terminal_kind == "cancel" and leased is None:
+            operations.append(
+                RayStreamCleanupOperation(
+                    RAY_STREAM_CLEANUP_CANCELLATION,
+                    self._run_unleased_generator_cancel,
+                    retry_on_error=True,
+                    retry_on_incomplete=True,
+                )
+            )
+        operations.append(stream_operation)
+        return tuple(operations)
+
+    @property
+    def terminal_cleanup_complete(self) -> bool:
+        with self._lifecycle:
+            stream_complete = self._cleanup_generator is None and not self._stream_cleanup_active
+            release_complete = self._release_owner is None
+            generator_complete = (
+                self._terminal_kind != "cancel"
+                or self._generator_cancelled
+                or (self._cancel_generator is None and not self._generator_cancel_active)
+            )
+            return self._retired and stream_complete and release_complete and generator_complete
 
 
 __all__ = [
+    "RAY_STREAM_CLEANUP_CANCELLATION",
+    "RAY_STREAM_CLEANUP_CONTROL",
+    "RAY_STREAM_CLEANUP_CORE",
+    "RAY_STREAM_CLEANUP_OUTPUT",
     "RayStreamAdapter",
+    "RayStreamCleanupOperation",
     "TaskLeaseObjectRefGenerator",
+    "resolve_ray_control_ack",
     "validate_ray_stream_contract",
 ]
