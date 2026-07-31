@@ -24,6 +24,7 @@ _DEFAULT_RAY_ACTOR_HEAP_BYTES = 4 * 1024**3
 _TASK_ADMISSION_CLEANUP_RETRY_INITIAL_DELAY_S = 0.01
 _TASK_ADMISSION_CLEANUP_RETRY_MAX_DELAY_S = 1.0
 _TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_S = 1.0
+_TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_MAX_S = 30.0
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -91,6 +92,14 @@ class _TaskAdmissionCancellation:
             _TASK_ADMISSION_CLEANUP_RETRY_MAX_DELAY_S,
         )
 
+    @staticmethod
+    def _response_timeout(retry_count: int) -> float:
+        exponent = min(max(0, int(retry_count)), 30)
+        return min(
+            _TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_S * (2**exponent),
+            _TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_MAX_S,
+        )
+
     def start(self) -> None:
         """Start once; callbacks and bounded timers retain cancellation ownership."""
         with self._lock:
@@ -108,7 +117,7 @@ class _TaskAdmissionCancellation:
             self._schedule_retry()
             return
         watchdog = threading.Timer(
-            _TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_S,
+            self._response_timeout(self._retry_count),
             self._response_timed_out,
             args=(response_future,),
         )

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gc
 import threading
+import time
 import weakref
 from concurrent.futures import Future
 
@@ -321,6 +322,51 @@ def test_task_admission_cancellation_retries_a_hung_response(monkeypatch):
     assert acknowledged.wait(timeout=1.0)
     assert len(driver.cancel_query_task_lease_request.calls) == 2
     assert first_response._future.cancelled()
+
+
+def test_task_admission_cancellation_expands_slow_response_deadline(monkeypatch):
+    monkeypatch.setattr(
+        task_admission,
+        "_TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_S",
+        0.01,
+    )
+    monkeypatch.setattr(
+        task_admission,
+        "_TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_MAX_S",
+        0.04,
+    )
+    driver = _Driver()
+    response_timers = []
+
+    def cancel(_request):
+        response = _ObjectRef()
+
+        def acknowledge():
+            if not response._future.cancelled():
+                response.resolve({"cancelled": True})
+
+        timer = threading.Timer(0.015, acknowledge)
+        timer.daemon = True
+        timer.start()
+        response_timers.append(timer)
+        return response
+
+    driver.cancel_query_task_lease_request = _RemoteMethod(cancel)
+    cancellation = task_admission._TaskAdmissionCancellation(
+        driver=driver,
+        request={"request_id": "slow-cancel", "resources": {}},
+    )
+
+    cancellation.start()
+
+    deadline = time.monotonic() + 1.0
+    while not cancellation._done and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert cancellation._done
+    assert len(driver.cancel_query_task_lease_request.calls) == 2
+    for timer in response_timers:
+        timer.join(timeout=1.0)
+        assert timer.is_alive() is False
 
 
 def test_local_slot_admission_owns_concrete_slots_and_wakes_one_waiter():
