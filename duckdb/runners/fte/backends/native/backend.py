@@ -121,10 +121,28 @@ def _stable_native_fte_task_identity(
         data = raw_entry.get("data")
         if kind == "scan_task":
             if isinstance(data, (bytes, bytearray, memoryview)):
-                scan_identity = hashlib.blake2b(bytes(data), digest_size=32).hexdigest()
+                import duckdb
+
+                source_task_partition_id = int(duckdb.ray_cxx.scan_task_source_partition_id(bytes(data)))
+                scan_descriptor_identity = hashlib.blake2b(bytes(data), digest_size=32).hexdigest()
+            elif isinstance(data, Mapping):
+                raw_source_task_partition_id = data.get("source_task_partition_id")
+                if raw_source_task_partition_id is None:
+                    raise ValueError("scan task is missing its stable source task partition identity")
+                source_task_partition_id = int(raw_source_task_partition_id)
+                scan_descriptor_identity = _stable_json_value(data)
             else:
-                scan_identity = _stable_json_value(data)
-            logical_inputs.append([str(node_id), kind, scan_identity])
+                raise TypeError("native FTE scan task data must be serialized bytes or a mapping")
+            logical_inputs.append(
+                [
+                    str(node_id),
+                    kind,
+                    {
+                        "source_task_partition_id": source_task_partition_id,
+                        "descriptor": scan_descriptor_identity,
+                    },
+                ]
+            )
         elif kind == "exchange_source_task":
             logical_inputs.append([str(node_id), kind, _exchange_source_logical_identity(data)])
         else:

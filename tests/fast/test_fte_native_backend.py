@@ -1543,6 +1543,42 @@ def test_native_worker_task_request_derives_stable_plan_sink_identity_from_input
     assert first_order["exchange_sink_instance"]["output_location"] == (f"shuffle__sink_{first_identity}__attempt_0")
 
 
+def test_native_worker_task_request_distinguishes_identical_scan_occurrences():
+    def make_request(source_task_partition_id: int) -> dict[str, Any]:
+        task = _FakeNativeWorkerTask(
+            context={"query_id": "query-duplicate-scan", "node_id": "4"},
+            task_context={
+                "query_idx": 0,
+                "last_node_id": 4,
+                "task_id": 99 - source_task_partition_id,
+                "node_ids": [3, 4],
+            },
+            inputs={
+                "3": {
+                    "kind": "scan_task",
+                    "data": {
+                        "source_task_partition_id": source_task_partition_id,
+                        "files": ["same.parquet"],
+                    },
+                }
+            },
+            exchange_sink_instance={
+                "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+                "attempt_id": 0,
+                "output_location": "shuffle__sink_0__attempt_0",
+            },
+        )
+        return NativeFteWorkerManagerBackend._request_from_task(task)
+
+    first = make_request(0)
+    repeated_occurrence = make_request(1)
+
+    assert (
+        first["exchange_sink_instance"]["task_partition_id"]
+        != repeated_occurrence["exchange_sink_instance"]["task_partition_id"]
+    )
+
+
 def test_native_worker_task_request_uses_explicit_static_source_partition_identity():
     def make_request(event_task_id: int) -> dict[str, Any]:
         task = _FakeNativeWorkerTask(

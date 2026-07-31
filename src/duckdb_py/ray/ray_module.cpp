@@ -1415,6 +1415,19 @@ void register_ray_bindings(py::module_ &mod) {
 	    "by concatenating their file lists.");
 
 	m.def(
+	    "scan_task_source_partition_id",
+	    [](py::bytes bytes_obj) {
+		    using namespace duckdb::distributed;
+		    string raw(bytes_obj);
+		    auto desc = ScanTaskDescriptor::DeserializeFromBytes(raw);
+		    if (desc.source_task_partition_id == DConstants::INVALID_INDEX) {
+			    throw py::value_error("scan task is missing its stable source task partition identity");
+		    }
+		    return desc.source_task_partition_id;
+	    },
+	    py::arg("bytes"), "Return the stable logical source-task partition from a scan descriptor.");
+
+	m.def(
 	    "exchange_source_task_partition_indices",
 	    [](py::bytes bytes_obj) {
 		    using namespace duckdb::distributed;

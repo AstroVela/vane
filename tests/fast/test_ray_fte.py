@@ -4196,6 +4196,68 @@ def test_fte_fragment_execution_rewrites_base_sink_partition_for_dynamic_task_pa
     assert worker.calls[0][1]["exchange_sink_instance"] == sink_instance
 
 
+def test_fte_fragment_execution_uses_logical_fragment_identity_for_materialized_sink():
+    worker = _FakeLiveWorker("worker-a")
+    base_sink = {
+        "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+        "task_partition_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+        "output_location": "q_coordinator__sink_0__attempt_0",
+        "fte_task_identity": True,
+    }
+    stage = _fte_fragment_execution(
+        "q",
+        12,
+        fragment_id="q:node:sample",
+        logical_fragment_execution_id=4,
+        worker=worker,
+        task_context_info={"exchange_sink_instance": base_sink},
+    )
+
+    scheduled_result = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(3)], sealed_partitions=[3])
+    )
+    scheduled = scheduled_result[0]
+    _execute_stage_commands(stage, scheduled_result)
+    sink_instance = scheduled.request["exchange_sink_instance"]
+    expected_sink_identity = (4 << 32) | 3
+
+    assert str(scheduled.attempt_id) == "q.12.3.0"
+    assert sink_instance["task_partition_id"] == expected_sink_identity
+    assert sink_instance["sink_handle"]["task_partition_id"] == expected_sink_identity
+    assert sink_instance["output_location"] == f"q_coordinator__sink_{expected_sink_identity}__attempt_0"
+
+
+def test_fte_fragment_execution_rejects_materialized_sink_without_logical_fragment_identity():
+    worker = _FakeLiveWorker("worker-a")
+    selected_partitions = []
+
+    def select_worker(partition):
+        selected_partitions.append(partition)
+        return worker.worker_id, worker
+
+    stage = _fte_fragment_execution(
+        "q",
+        12,
+        fragment_id="q:node:sample",
+        worker_selector=select_worker,
+        task_context_info={
+            "exchange_sink_instance": {
+                "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+                "output_location": "q_coordinator__sink_0__attempt_0",
+                "fte_task_identity": True,
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="requires a stable logical fragment identity"):
+        stage.apply_assignment_result(AssignmentResult(partitions_added=[PartitionInfo(3)], sealed_partitions=[3]))
+
+    assert selected_partitions == []
+    assert worker.calls == []
+
+
 def test_fte_fragment_execution_handle_task_status_accepts_task_id_string():
     worker = _FakeLiveWorker()
     stage = _fte_fragment_execution(

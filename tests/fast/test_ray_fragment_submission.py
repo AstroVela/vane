@@ -576,6 +576,64 @@ def _create_requests(actor):
     return [call[1] for call in actor.fte_calls if call[0] == "create"]
 
 
+def test_fte_materialized_sink_identity_is_independent_of_fragment_registration_order():
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    first_query_id = "query-logical-fragment-order-a"
+    second_query_id = "query-logical-fragment-order-b"
+    node_ids = ("7", "42")
+    for query_id in (first_query_id, second_query_id):
+        _register_test_query_graph(
+            query_id,
+            [f"{query_id}:node:{node_id}" for node_id in node_ids],
+        )
+
+    def submit_fragments(query_id, ordered_node_ids):
+        request_offset = len(_create_requests(actor))
+        handles = handle.submit_tasks(
+            [
+                _FakeTask(
+                    name=f"sample-input-{node_id}",
+                    context={"query_id": query_id, "node_id": node_id},
+                    inputs={node_id: {"kind": "scan_task", "data": node_id.encode()}},
+                    exchange_sink_instance={
+                        "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+                        "task_partition_id": 0,
+                        "partition_id": 0,
+                        "attempt_id": 0,
+                        "output_location": f"{query_id}_coordinator__sink_0__attempt_0",
+                        "fte_task_identity": True,
+                    },
+                )
+                for node_id in ordered_node_ids
+            ]
+        )
+        assert len(handles) == len(ordered_node_ids)
+        requests = _create_requests(actor)[request_offset:]
+        return {
+            request["fragment_id"].rsplit(":node:", 1)[1]: request
+            for request in requests
+            if request["task_id"]["query_id"] == query_id
+        }
+
+    first_by_node = submit_fragments(first_query_id, ("42", "7"))
+    second_by_node = submit_fragments(second_query_id, ("7", "42"))
+
+    for node_id in node_ids:
+        assert (
+            first_by_node[node_id]["exchange_sink_instance"]["task_partition_id"]
+            == second_by_node[node_id]["exchange_sink_instance"]["task_partition_id"]
+        )
+    assert (
+        first_by_node["7"]["exchange_sink_instance"]["task_partition_id"]
+        != first_by_node["42"]["exchange_sink_instance"]["task_partition_id"]
+    )
+    assert (
+        first_by_node["7"]["task_id"]["fragment_execution_id"]
+        != second_by_node["7"]["task_id"]["fragment_execution_id"]
+    )
+
+
 def test_submit_tasks_rejects_missing_query_id_before_registering_fragment():
     actor = _FakeActor()
     handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)

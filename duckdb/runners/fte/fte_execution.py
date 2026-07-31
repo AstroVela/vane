@@ -451,6 +451,7 @@ class FteFragmentExecution:
         fragment_execution_id: int,
         *,
         fragment_id: str,
+        logical_fragment_execution_id: int | None = None,
         worker: Any = None,
         worker_id: str | None = None,
         worker_selector: Callable[[FteTaskPartition], Any] | None = None,
@@ -479,6 +480,11 @@ class FteFragmentExecution:
         self.fragment_id = str(fragment_id).strip()
         if not self.fragment_id:
             raise ValueError("fragment_id must be non-empty")
+        self.logical_fragment_execution_id = (
+            None
+            if logical_fragment_execution_id is None
+            else _check_non_negative("logical_fragment_execution_id", logical_fragment_execution_id)
+        )
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
         self.worker = worker
@@ -1512,21 +1518,24 @@ class FteFragmentExecution:
             raise RuntimeError("FTE attempt mutation requires the fragment state lock")
         if self.partitions.get(partition.task_id.partition_id) is not partition:
             raise ValueError(f"partition {partition.task_id} does not belong to this fragment execution")
-        worker_id, worker = self._select_worker(partition)
         sink_instance = None
+        if self.exchange is None and partition.descriptor.exchange_sink_instance is not None:
+            sink_payload = _sink_instance_payload(partition.descriptor.exchange_sink_instance)
+            if sink_payload.get("fte_task_identity") and self.logical_fragment_execution_id is None:
+                raise ValueError("FTE-derived exchange sink identity requires a stable logical fragment identity")
+            sink_instance = derive_exchange_sink_instance_for_attempt(
+                partition.descriptor.exchange_sink_instance,
+                partition.next_attempt_number(),
+                task_partition_id=partition.task_id.partition_id,
+                fragment_execution_id=self.logical_fragment_execution_id,
+            )
+        worker_id, worker = self._select_worker(partition)
         if self.exchange is not None:
             if partition.sink_handle is None:
                 partition.sink_handle = self.exchange.add_sink(partition.task_id.partition_id)
             sink_instance = self.exchange.instantiate_sink(
                 partition.sink_handle,
                 partition.next_attempt_number(),
-            )
-        elif partition.descriptor.exchange_sink_instance is not None:
-            sink_instance = derive_exchange_sink_instance_for_attempt(
-                partition.descriptor.exchange_sink_instance,
-                partition.next_attempt_number(),
-                task_partition_id=partition.task_id.partition_id,
-                fragment_execution_id=partition.task_id.fragment_execution_id,
             )
         scheduled = partition.start_attempt(
             sink_instance=sink_instance,

@@ -92,6 +92,23 @@ def _registered_fte_task_memory_bytes(
     return task_memory_bytes
 
 
+def _registered_fte_logical_fragment_execution_id(
+    resource_query_id: str,
+    resource_stage_id: str,
+) -> int:
+    """Return the stable logical ordinal of an FTE stage in its query graph."""
+    from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
+
+    manager = get_query_resource_manager(resource_query_id)
+    stage = manager.graph.stage_by_id(resource_stage_id)
+    if stage.backend != "ray_worker":
+        raise RuntimeError(f"FTE stage {resource_stage_id} has invalid registered backend {stage.backend!r}")
+    try:
+        return manager.graph.topological_stage_ids().index(resource_stage_id)
+    except ValueError as exc:
+        raise RuntimeError(f"FTE stage {resource_stage_id} is missing from its registered query graph") from exc
+
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -302,6 +319,10 @@ class FteWorkerSubmissionMixin:
             query_id,
             self._next_fte_fragment_execution_id(query_id, fragment_id),
             fragment_id=fragment_id,
+            logical_fragment_execution_id=_registered_fte_logical_fragment_execution_id(
+                resource_query_id,
+                resource_stage_id,
+            ),
             worker_selector=select_partition_owner,
             execution_class_transition_callback=apply_execution_class_transitions,
             execution_admission_callback=admit_execution,
