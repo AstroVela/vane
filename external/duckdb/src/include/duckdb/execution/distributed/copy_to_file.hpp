@@ -97,8 +97,10 @@ struct DistributedCopyResult {
 	std::string output_manifest_path;
 	std::string output_committed_marker_path;
 	std::string output_lifecycle_path;
+	std::string output_outcome_error;
 	bool output_direct_write = false;
 	bool output_committed = false;
+	bool output_outcome_unknown = false;
 };
 
 // ── Shared path utilities (used by scheduler + worker) ──────────────────────

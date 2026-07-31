@@ -989,12 +989,58 @@ ReadCommittedDistributedCopyDirectWriteResult(FileSystem &fs, const std::string 
 			    "distributed COPY direct-write committed manifest file is outside run output: \"%s\"",
 			    info.final_path)));
 		}
-		auto validate_res = ValidateDistributedCopyFinalFile(fs, info);
+		auto validate_res = ValidateDistributedCopyDirectWriteFinalFile(fs, info);
 		if (validate_res.is_err()) {
 			return DuckDBResult<DistributedCopyResult>::err(validate_res.error());
 		}
 	}
 	return DuckDBResult<DistributedCopyResult>::ok(std::move(result));
+}
+
+enum class DistributedCopyDirectWriteRunState : uint8_t { COMMITTED, UNCOMMITTED, UNKNOWN };
+
+struct DistributedCopyDirectWriteRunInspection {
+	DistributedCopyDirectWriteRunState state = DistributedCopyDirectWriteRunState::UNKNOWN;
+	DistributedCopyFinalizeCommitPaths paths;
+	std::string base_path;
+	std::string run_id;
+	std::string error;
+	DistributedCopyResult committed_result;
+};
+
+inline DuckDBResult<DistributedCopyDirectWriteRunInspection>
+InspectDistributedCopyDirectWriteRun(FileSystem &fs, const std::string &base_path, const std::string &run_id) {
+	auto canonical_res = CanonicalDistributedCopyBasePath(fs, base_path);
+	if (canonical_res.is_err()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunInspection>::err(canonical_res.error());
+	}
+	if (run_id.empty()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunInspection>::err(
+		    DuckDBError::value_error("direct-write inspection requires non-empty run_id"));
+	}
+
+	DistributedCopyDirectWriteRunInspection inspection;
+	inspection.base_path = std::move(canonical_res).value();
+	inspection.run_id = run_id;
+	inspection.paths = BuildDistributedCopyFinalizeCommitPaths(fs, inspection.base_path, run_id);
+	auto marker_res = CheckDistributedCopyFileExists(fs, inspection.paths.committed_marker_path);
+	if (marker_res.is_err()) {
+		inspection.error = marker_res.error().what();
+		return DuckDBResult<DistributedCopyDirectWriteRunInspection>::ok(std::move(inspection));
+	}
+	if (!marker_res.value()) {
+		inspection.state = DistributedCopyDirectWriteRunState::UNCOMMITTED;
+		return DuckDBResult<DistributedCopyDirectWriteRunInspection>::ok(std::move(inspection));
+	}
+
+	auto committed_res = ReadCommittedDistributedCopyDirectWriteResult(fs, inspection.base_path, run_id);
+	if (committed_res.is_err()) {
+		inspection.error = committed_res.error().what();
+		return DuckDBResult<DistributedCopyDirectWriteRunInspection>::ok(std::move(inspection));
+	}
+	inspection.state = DistributedCopyDirectWriteRunState::COMMITTED;
+	inspection.committed_result = std::move(committed_res).value();
+	return DuckDBResult<DistributedCopyDirectWriteRunInspection>::ok(std::move(inspection));
 }
 
 inline DuckDBResult<void> MoveDistributedCopyFileOrReplay(FileSystem &fs, const DistributedCopyFileInfo &info) {
@@ -1425,6 +1471,75 @@ CleanupDistributedCopyUncommittedDirectWriteRun(FileSystem &fs, const std::strin
 	auto worker_base_path = std::move(lifecycle_res).value().worker_base_path;
 	return CleanupDistributedCopyUncommittedDirectWriteRunWithWorkerBase(fs, canonical_base_path, worker_base_path,
 	                                                                     run_id);
+}
+
+inline DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>
+ForceAbortDistributedCopyDirectWriteRun(FileSystem &fs, const std::string &base_path, const std::string &run_id) {
+	auto canonical_res = CanonicalDistributedCopyBasePath(fs, base_path);
+	if (canonical_res.is_err()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(canonical_res.error());
+	}
+	if (run_id.empty()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(
+		    DuckDBError::value_error("direct-write force abort requires non-empty run_id"));
+	}
+	auto canonical_base_path = std::move(canonical_res).value();
+	auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, canonical_base_path, run_id);
+	auto lifecycle_exists_res = CheckDistributedCopyFileExists(fs, commit_paths.lifecycle_path);
+	if (lifecycle_exists_res.is_err()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(lifecycle_exists_res.error());
+	}
+	if (!lifecycle_exists_res.value()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(DuckDBError::io_error(
+		    "direct-write force abort requires lifecycle registration: " + commit_paths.lifecycle_path));
+	}
+	auto lifecycle_res = ReadDistributedCopyDirectWriteLifecycle(fs, commit_paths, canonical_base_path, run_id);
+	if (lifecycle_res.is_err()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(lifecycle_res.error());
+	}
+	auto worker_base_path = std::move(lifecycle_res).value().worker_base_path;
+	if (!FileSystem::IsRemoteFile(worker_base_path)) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(DuckDBError::invalid_state_error(
+		    "direct-write force abort cannot prove node-local worker output was removed; "
+		    "clean the run on every worker before retrying"));
+	}
+
+	try {
+		fs.RemoveFile(commit_paths.committed_marker_path);
+	} catch (const std::exception &ex) {
+		if (!DistributedCopyExceptionIsNotFound(ex)) {
+			return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(DuckDBError::io_error(
+			    StringUtil::Format("failed to remove distributed COPY committed marker \"%s\": %s",
+			                       commit_paths.committed_marker_path, ex.what())));
+		}
+	}
+	auto marker_res = CheckDistributedCopyFileExists(fs, commit_paths.committed_marker_path);
+	if (marker_res.is_err()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(marker_res.error());
+	}
+	if (marker_res.value()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(DuckDBError::io_error(
+		    "distributed COPY committed marker still exists after force abort: " + commit_paths.committed_marker_path));
+	}
+
+	auto cleanup_res = CleanupDistributedCopyUncommittedDirectWriteRunWithWorkerBase(fs, canonical_base_path,
+	                                                                                 worker_base_path, run_id);
+	if (cleanup_res.is_err()) {
+		return cleanup_res;
+	}
+	if (cleanup_res.value().skipped_committed) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(
+		    DuckDBError::invalid_state_error("distributed COPY committed marker reappeared during force abort"));
+	}
+	auto final_marker_res = CheckDistributedCopyFileExists(fs, commit_paths.committed_marker_path);
+	if (final_marker_res.is_err()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(final_marker_res.error());
+	}
+	if (final_marker_res.value()) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(DuckDBError::io_error(
+		    "distributed COPY committed marker reappeared after force abort: " + commit_paths.committed_marker_path));
+	}
+	return cleanup_res;
 }
 
 struct DistributedCopyDirectWriteCleanupScanResult {
@@ -1874,9 +1989,23 @@ inline DuckDBResult<DistributedCopyResult> FinalizeCopyFiles(const DistributedCo
 			result.cleanup_ms += direct_write_cleanup_ms;
 			auto marker_res = WriteDistributedCopyFinalizeCommittedMarker(fs, commit_paths);
 			if (marker_res.is_err()) {
-				return DuckDBResult<DistributedCopyResult>::err(marker_res.error());
+				auto marker_error = std::string(marker_res.error().what());
+				auto committed_res = ReadCommittedDistributedCopyDirectWriteResult(fs, base_path, direct_write_run_id);
+				if (committed_res.is_ok()) {
+					// Readback proves the marker and persisted manifest. Keep the
+					// in-memory result because the manifest intentionally omits
+					// format-specific file metadata.
+					AttachDistributedCopyCommitInfo(result, commit_paths, base_path, direct_write_run_id, true, true);
+				} else {
+					AttachDistributedCopyCommitInfo(result, commit_paths, base_path, direct_write_run_id, true, false);
+					result.output_outcome_unknown = true;
+					result.output_outcome_error =
+					    StringUtil::Format("%s; committed-marker readback was inconclusive: %s", marker_error,
+					                       committed_res.error().what());
+				}
+			} else {
+				AttachDistributedCopyCommitInfo(result, commit_paths, base_path, direct_write_run_id, true, true);
 			}
-			AttachDistributedCopyCommitInfo(result, commit_paths, base_path, direct_write_run_id, true, true);
 		}
 	} else {
 		std::unordered_set<std::string> planned_final_paths;

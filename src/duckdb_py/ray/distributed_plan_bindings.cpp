@@ -1944,7 +1944,7 @@ struct PyPhysicalPlanWrapperRunner {
 			}
 
 			auto result = std::move(res).value();
-			if (!result.output_committed) {
+			if (!result.output_committed && !result.output_outcome_unknown) {
 				rethrow_submission_error(plan.idx());
 				throw py::value_error("distributed COPY completed without a committed output marker");
 			}

@@ -27,10 +27,49 @@ def read_committed_copy_direct_write_parquet(
     if conn is None:
         conn = duckdb.connect()
 
-    result = duckdb.ray_cxx.read_committed_copy_direct_write_result(str(base_path), run_id)
+    result = duckdb.ray_cxx.read_committed_copy_direct_write_result(str(base_path), run_id, conn)
     files = [entry["final_path"] for entry in result["files"]]
     if not files:
         raise ValueError(
             "committed direct-write COPY result contains no parquet files; cannot infer a schema for read_parquet"
         )
     return conn.read_parquet(files, **read_parquet_kwargs)
+
+
+def inspect_copy_direct_write_run(
+    base_path: str | PathLike[str],
+    run_id: str,
+    *,
+    conn: Any | None = None,
+) -> dict[str, Any]:
+    """Inspect a direct-write COPY run without changing its storage state.
+
+    ``UNCOMMITTED`` is an observation, not proof that a prior marker write
+    failed. A successful shared-storage
+    ``force_abort_copy_direct_write_run`` can return ``safe_to_retry=True``.
+    """
+    import duckdb
+
+    return duckdb.ray_cxx.inspect_copy_direct_write_run(str(base_path), run_id, conn)
+
+
+def force_abort_copy_direct_write_run(
+    base_path: str | PathLike[str],
+    run_id: str,
+    *,
+    conn: Any | None = None,
+) -> dict[str, Any]:
+    """Discard one direct-write COPY run after an operator chooses data loss.
+
+    The native operation is available only when worker output is on shared
+    remote storage. It removes the committed marker first, deletes only output
+    owned by ``run_id``, removes its metadata, and verifies the marker remains
+    absent. Node-local output requires cleanup on every worker and is rejected
+    without changing its marker or lifecycle record. A raised exception means
+    the run is not safe to retry. This is operator-driven recovery, not an
+    exactly-once fence: call it only after the originating COPY has terminated
+    and do not race another writer.
+    """
+    import duckdb
+
+    return duckdb.ray_cxx.force_abort_copy_direct_write_run(str(base_path), run_id, conn)

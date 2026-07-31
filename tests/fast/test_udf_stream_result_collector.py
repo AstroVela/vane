@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-import weakref
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -655,29 +654,24 @@ def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
 
     monkeypatch.setattr(RayStreamAdapter, "retire", blocking_retire)
 
-    def make_source():
-        def submitter(lease):
-            generator = _Generator(
-                [
-                    _Ref("large-block", is_block=True),
-                    _Ref(_metadata(lease, size_bytes=64)),
-                ]
-            )
-            generator_holder["generator"] = generator
-            return generator
-
-        source = _source(
-            fake_ray,
-            driver,
-            request_id="deterministic-retirement",
-            submitter=submitter,
+    def submitter(lease):
+        generator = _Generator(
+            [
+                _Ref("large-block", is_block=True),
+                _Ref(_metadata(lease, size_bytes=64)),
+            ]
         )
-        return source, weakref.ref(source)
+        generator_holder["generator"] = generator
+        return generator
 
-    source, source_ref = make_source()
+    source = _source(
+        fake_ray,
+        driver,
+        request_id="deterministic-retirement",
+        submitter=submitter,
+    )
     collector = AsyncResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(2, 22, source)
-    del source
     capacity = {2: {"rows": 1, "bytes": 128, "item_bytes": 128}}
     try:
         events = []
@@ -693,8 +687,9 @@ def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
         # has dropped the source and deleted the Ray ObjectRef stream.
         assert [item[2] for item in events] == ["data"]
         assert collector._records
-        assert source_ref() is not None
         generator = generator_holder["generator"]
+        assert source.generator is generator
+        assert source.lease is not None
         assert generator.deleted_streams == []
 
         data = next(item for item in events if item[2] == "data")
@@ -711,7 +706,8 @@ def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
 
         assert [item[2] for item in events] == ["complete"]
         assert collector._records == {}
-        assert source_ref() is None
+        assert source.generator is None
+        assert source.lease is None
         assert generator.deleted_streams == [generator.completion_ref]
     finally:
         allow_retire.set()
