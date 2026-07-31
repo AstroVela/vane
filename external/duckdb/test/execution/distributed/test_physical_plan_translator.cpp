@@ -212,6 +212,91 @@ static std::string SQLStringLiteral(const std::string &value) {
 	return "'" + StringUtil::Replace(value, "'", "''") + "'";
 }
 
+class ScopedTranslatorEnvironment {
+public:
+	ScopedTranslatorEnvironment(std::string name, const char *value) : name_(std::move(name)) {
+		const auto *existing = std::getenv(name_.c_str());
+		if (existing) {
+			had_value_ = true;
+			old_value_ = existing;
+		}
+		Set(value);
+	}
+
+	~ScopedTranslatorEnvironment() {
+		if (had_value_) {
+			Set(old_value_.c_str());
+		} else {
+			Set(nullptr);
+		}
+	}
+
+private:
+	void Set(const char *value) {
+#if defined(_WIN32)
+		_putenv_s(name_.c_str(), value ? value : "");
+#else
+		if (value) {
+			setenv(name_.c_str(), value, 1);
+		} else {
+			unsetenv(name_.c_str());
+		}
+#endif
+	}
+
+	std::string name_;
+	std::string old_value_;
+	bool had_value_ = false;
+};
+
+static DuckPhysicalPlanRef MakeHashJoinPlan(JoinType join_type, idx_t left_cardinality, idx_t right_cardinality) {
+	auto plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
+	vector<LogicalType> input_types = {LogicalType::INTEGER};
+	auto left_collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), input_types);
+	auto &left_scan = plan->Make<PhysicalColumnDataScan>(input_types, PhysicalOperatorType::COLUMN_DATA_SCAN,
+	                                                     left_cardinality, std::move(left_collection));
+	auto right_collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), input_types);
+	auto &right_scan = plan->Make<PhysicalColumnDataScan>(input_types, PhysicalOperatorType::COLUMN_DATA_SCAN,
+	                                                      right_cardinality, std::move(right_collection));
+
+	vector<JoinCondition> conditions;
+	JoinCondition condition;
+	condition.left = make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0);
+	condition.right = make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0);
+	condition.comparison = ExpressionType::COMPARE_EQUAL;
+	conditions.push_back(std::move(condition));
+
+	LogicalComparisonJoin logical_join(join_type);
+	switch (join_type) {
+	case JoinType::SEMI:
+	case JoinType::ANTI:
+	case JoinType::RIGHT_SEMI:
+	case JoinType::RIGHT_ANTI:
+		logical_join.types = input_types;
+		break;
+	case JoinType::MARK:
+		logical_join.types = {LogicalType::INTEGER, LogicalType::BOOLEAN};
+		break;
+	default:
+		logical_join.types = {LogicalType::INTEGER, LogicalType::INTEGER};
+		break;
+	}
+
+	auto &hash_join = plan->Make<PhysicalHashJoin>(logical_join, left_scan, right_scan, std::move(conditions),
+	                                               join_type, left_cardinality);
+	plan->SetRoot(hash_join);
+	return plan;
+}
+
+static bool NodeDisplayContains(const DistributedPipelineNodeRef &node, const std::string &needle) {
+	for (const auto &line : node->inner()->multiline_display(false)) {
+		if (line.find(needle) != std::string::npos) {
+			return true;
+		}
+	}
+	return false;
+}
+
 TEST_CASE("Streaming UDF passthrough schema preserves all output columns", "[distributed][udf]") {
 	vector<LogicalType> output_types = {LogicalType::BIGINT, LogicalType::VARCHAR};
 	StreamingUDFPassthroughNode node(1, nullptr, TableFunction {}, nullptr, vector<ColumnIndex> {}, vector<column_t> {},
@@ -327,6 +412,87 @@ TEST_CASE("PhysicalPlanTranslator: plan without root returns error", "[distribut
 	REQUIRE(res.is_err());
 	auto msg = std::string(res.error().what());
 	REQUIRE(msg.find("physical plan has no root") != std::string::npos);
+}
+
+TEST_CASE("PhysicalPlanTranslator: auto broadcast only considers semantically safe sides", "[distributed][join]") {
+	ScopedTranslatorEnvironment strategy("VANE_DISTRIBUTED_JOIN_STRATEGY", nullptr);
+	ScopedTranslatorEnvironment threshold("VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES", "64");
+	PlanConfig config;
+	config.num_partitions = 4;
+
+	SECTION("hash join is selected when only the small side is preserved") {
+		auto res = physical_plan_to_pipeline_node(config, MakeHashJoinPlan(JoinType::LEFT, 2, 400));
+		REQUIRE(res.is_ok());
+		REQUIRE(res.value()->name() == "HashJoin");
+	}
+
+	SECTION("optimizer-swapped plan selects hash join when only the small side is preserved") {
+		auto res = physical_plan_to_pipeline_node(config, MakeHashJoinPlan(JoinType::RIGHT, 400, 2));
+		REQUIRE(res.is_ok());
+		REQUIRE(res.value()->name() == "HashJoin");
+	}
+
+	SECTION("small non-preserved side is broadcast") {
+		auto res = physical_plan_to_pipeline_node(config, MakeHashJoinPlan(JoinType::LEFT, 400, 2));
+		REQUIRE(res.is_ok());
+		REQUIRE(res.value()->name() == "BroadcastJoin");
+		REQUIRE(NodeDisplayContains(res.value(), "Broadcast side: right"));
+	}
+
+	SECTION("optimizer-swapped small non-preserved side is broadcast") {
+		auto res = physical_plan_to_pipeline_node(config, MakeHashJoinPlan(JoinType::RIGHT, 2, 400));
+		REQUIRE(res.is_ok());
+		REQUIRE(res.value()->name() == "BroadcastJoin");
+		REQUIRE(NodeDisplayContains(res.value(), "Broadcast side: left"));
+	}
+
+	SECTION("inner join broadcasts the smaller side") {
+		auto res = physical_plan_to_pipeline_node(config, MakeHashJoinPlan(JoinType::INNER, 2, 400));
+		REQUIRE(res.is_ok());
+		REQUIRE(res.value()->name() == "BroadcastJoin");
+		REQUIRE(NodeDisplayContains(res.value(), "Broadcast side: left"));
+	}
+
+	SECTION("full outer join selects hash join") {
+		auto res = physical_plan_to_pipeline_node(config, MakeHashJoinPlan(JoinType::OUTER, 2, 2));
+		REQUIRE(res.is_ok());
+		REQUIRE(res.value()->name() == "HashJoin");
+	}
+}
+
+TEST_CASE("PhysicalPlanTranslator: forced broadcast validates the selected side", "[distributed][join]") {
+	ScopedTranslatorEnvironment threshold("VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES", "0");
+	PlanConfig config;
+	config.num_partitions = 4;
+
+	SECTION("generic strategy chooses the non-preserved side") {
+		ScopedTranslatorEnvironment strategy("VANE_DISTRIBUTED_JOIN_STRATEGY", "broadcast");
+		auto res = physical_plan_to_pipeline_node(config, MakeHashJoinPlan(JoinType::LEFT, 2, 400));
+		REQUIRE(res.is_ok());
+		REQUIRE(res.value()->name() == "BroadcastJoin");
+		REQUIRE(NodeDisplayContains(res.value(), "Broadcast side: right"));
+	}
+
+	SECTION("unsafe directional strategy fails clearly") {
+		ScopedTranslatorEnvironment strategy("VANE_DISTRIBUTED_JOIN_STRATEGY", "broadcast_left");
+		auto res = physical_plan_to_pipeline_node(config, MakeHashJoinPlan(JoinType::LEFT, 2, 400));
+		REQUIRE(res.is_err());
+		REQUIRE(std::string(res.error().what()).find("semantically preserved") != std::string::npos);
+	}
+
+	SECTION("generic full outer join fails clearly") {
+		ScopedTranslatorEnvironment strategy("VANE_DISTRIBUTED_JOIN_STRATEGY", "broadcast");
+		auto res = physical_plan_to_pipeline_node(config, MakeHashJoinPlan(JoinType::OUTER, 2, 2));
+		REQUIRE(res.is_err());
+		REQUIRE(std::string(res.error().what()).find("neither side") != std::string::npos);
+	}
+
+	SECTION("directional full outer join fails clearly") {
+		ScopedTranslatorEnvironment strategy("VANE_DISTRIBUTED_JOIN_STRATEGY", "broadcast_left");
+		auto res = physical_plan_to_pipeline_node(config, MakeHashJoinPlan(JoinType::OUTER, 2, 2));
+		REQUIRE(res.is_err());
+		REQUIRE(std::string(res.error().what()).find("semantically preserved") != std::string::npos);
+	}
 }
 
 TEST_CASE("PhysicalFilter: empty select list handled as true", "[distributed]") {

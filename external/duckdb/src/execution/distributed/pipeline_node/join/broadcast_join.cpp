@@ -8,6 +8,7 @@
 #include <unordered_set>
 
 #include "duckdb/common/allocator.hpp"
+#include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/execution/distributed/plan/exchange_source_task.hpp"
 #include "duckdb/execution/distributed/plan/runner.hpp"
@@ -23,6 +24,37 @@
 
 namespace duckdb {
 namespace distributed {
+
+bool IsBroadcastJoinSideSemanticallySafe(JoinType join_type, BroadcastJoinSide broadcast_side) {
+	switch (join_type) {
+	case JoinType::INNER:
+		return true;
+	case JoinType::LEFT:
+	case JoinType::SEMI:
+	case JoinType::ANTI:
+	case JoinType::MARK:
+	case JoinType::SINGLE:
+		return broadcast_side == BroadcastJoinSide::RIGHT;
+	case JoinType::RIGHT:
+	case JoinType::RIGHT_SEMI:
+	case JoinType::RIGHT_ANTI:
+		return broadcast_side == BroadcastJoinSide::LEFT;
+	case JoinType::OUTER:
+	case JoinType::INVALID:
+		return false;
+	}
+	return false;
+}
+
+void ValidateBroadcastJoinSide(JoinType join_type, BroadcastJoinSide broadcast_side) {
+	if (IsBroadcastJoinSideSemanticallySafe(join_type, broadcast_side)) {
+		return;
+	}
+	const auto *side_name = broadcast_side == BroadcastJoinSide::LEFT ? "left" : "right";
+	throw InvalidInputException("Cannot broadcast the %s side of a %s join because that side is semantically "
+	                            "preserved",
+	                            side_name, EnumUtil::ToString(join_type));
+}
 
 namespace {
 std::string MakeBroadcastShuffleStageId(const PipelineNodeContext &context) {
@@ -49,17 +81,18 @@ BroadcastJoinNode::BroadcastJoinNode(
     duckdb::vector<LogicalType> condition_types, PhysicalHashJoin::JoinProjectionColumns payload_columns,
     PhysicalHashJoin::JoinProjectionColumns lhs_output_columns,
     PhysicalHashJoin::JoinProjectionColumns rhs_output_columns, duckdb::vector<unique_ptr<BaseStatistics>> join_stats,
-    unique_ptr<JoinFilterPushdownInfo> filter_pushdown, idx_t estimated_cardinality, bool is_swapped,
+    unique_ptr<JoinFilterPushdownInfo> filter_pushdown, idx_t estimated_cardinality, BroadcastJoinSide broadcast_side,
     std::shared_ptr<DistributedPipelineNode> broadcaster, std::shared_ptr<DistributedPipelineNode> receiver,
     SchemaRef schema, std::shared_ptr<ExchangeManager> exchange_mgr)
     : context_(plan_config.query_idx, plan_config.query_id, node_id, "BroadcastJoin"),
-      broadcaster_(std::move(broadcaster)), receiver_(std::move(receiver)), is_swapped_(is_swapped),
+      broadcaster_(std::move(broadcaster)), receiver_(std::move(receiver)), broadcast_side_(broadcast_side),
       conditions_(std::move(conditions)), join_type_(join_type), output_types_(std::move(output_types)),
       delim_types_(std::move(delim_types)), condition_types_(std::move(condition_types)),
       payload_columns_(std::move(payload_columns)), lhs_output_columns_(std::move(lhs_output_columns)),
       rhs_output_columns_(std::move(rhs_output_columns)), join_stats_(std::move(join_stats)),
       filter_pushdown_(std::move(filter_pushdown)), estimated_cardinality_(estimated_cardinality),
       exchange_mgr_(std::move(exchange_mgr)) {
+	ValidateBroadcastJoinSide(join_type_, broadcast_side_);
 	ClusteringSpecRef clustering = ClusteringSpec::unknown_with_num_partitions(1);
 	if (receiver_) {
 		clustering = receiver_->config().clustering_spec();
@@ -85,7 +118,7 @@ std::vector<std::string> BroadcastJoinNode::multiline_display(bool /*verbose*/) 
 	res.push_back("Broadcast Join");
 	res.push_back("Join type: " + std::to_string(static_cast<int>(join_type_)));
 	res.push_back("Conditions: " + std::to_string(conditions_.size()));
-	res.push_back("Swapped: " + std::string(is_swapped_ ? "true" : "false"));
+	res.push_back("Broadcast side: " + std::string(broadcast_side_ == BroadcastJoinSide::LEFT ? "left" : "right"));
 	return res;
 }
 
@@ -196,8 +229,9 @@ SubmittableTask<WorkerTask> BroadcastJoinNode::BuildBroadcastHashJoinTask(Submit
 	auto &broadcast_root = *broadcast_root_ptr;
 
 	auto conditions = CopyConditions(conditions_);
-	auto &left_child = is_swapped_ ? input_root : broadcast_root;
-	auto &right_child = is_swapped_ ? broadcast_root : input_root;
+	auto broadcast_right = broadcast_side_ == BroadcastJoinSide::RIGHT;
+	auto &left_child = broadcast_right ? input_root : broadcast_root;
+	auto &right_child = broadcast_right ? broadcast_root : input_root;
 	FixHashJoinConditionTypes(conditions, left_child.GetTypes(), right_child.GetTypes());
 
 	LogicalComparisonJoin dummy_join(join_type_);

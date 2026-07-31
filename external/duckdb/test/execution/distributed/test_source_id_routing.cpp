@@ -505,7 +505,8 @@ TEST_CASE("BroadcastJoinNode: replacement task preserves receiver inputs", "[dis
 
 	BroadcastJoinNode node(301, plan_cfg, {}, JoinType::INNER, output_types, {}, {},
 	                       PhysicalHashJoin::JoinProjectionColumns(), PhysicalHashJoin::JoinProjectionColumns(),
-	                       PhysicalHashJoin::JoinProjectionColumns(), {}, nullptr, 1, false, nullptr, nullptr, schema);
+	                       PhysicalHashJoin::JoinProjectionColumns(), {}, nullptr, 1, BroadcastJoinSide::LEFT, nullptr,
+	                       nullptr, schema);
 
 	auto receiver_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(30, "receiver", 30, "receiver_scan"));
 	auto broadcast_plan = MakeScanPlanWithRoot();
@@ -548,7 +549,8 @@ TEST_CASE("BroadcastJoinNode: invalid receiver plan throws instead of passing th
 
 	BroadcastJoinNode node(303, plan_cfg, {}, JoinType::INNER, output_types, {}, {},
 	                       PhysicalHashJoin::JoinProjectionColumns(), PhysicalHashJoin::JoinProjectionColumns(),
-	                       PhysicalHashJoin::JoinProjectionColumns(), {}, nullptr, 1, false, nullptr, nullptr, schema);
+	                       PhysicalHashJoin::JoinProjectionColumns(), {}, nullptr, 1, BroadcastJoinSide::LEFT, nullptr,
+	                       nullptr, schema);
 
 	auto receiver_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithoutRoot(30, "receiver"));
 	auto broadcast_plan = MakeScanPlanWithRoot();
@@ -561,4 +563,35 @@ TEST_CASE("BroadcastJoinNode: invalid receiver plan throws instead of passing th
 		REQUIRE(std::string(ex.what()).find("BroadcastJoinNode cannot build join task") != std::string::npos);
 	}
 	REQUIRE(saw_error);
+}
+
+TEST_CASE("BroadcastJoinNode: broadcast side must not be semantically preserved", "[distributed][source_id][join]") {
+	struct SafetyCase {
+		JoinType join_type;
+		bool left_safe;
+		bool right_safe;
+	};
+	const std::vector<SafetyCase> cases = {
+	    {JoinType::INNER, true, true},       {JoinType::LEFT, false, true},     {JoinType::RIGHT, true, false},
+	    {JoinType::OUTER, false, false},     {JoinType::SEMI, false, true},     {JoinType::ANTI, false, true},
+	    {JoinType::MARK, false, true},       {JoinType::SINGLE, false, true},   {JoinType::RIGHT_SEMI, true, false},
+	    {JoinType::RIGHT_ANTI, true, false}, {JoinType::INVALID, false, false},
+	};
+
+	for (const auto &entry : cases) {
+		INFO("join type: " << static_cast<int>(entry.join_type));
+		REQUIRE(IsBroadcastJoinSideSemanticallySafe(entry.join_type, BroadcastJoinSide::LEFT) == entry.left_safe);
+		REQUIRE(IsBroadcastJoinSideSemanticallySafe(entry.join_type, BroadcastJoinSide::RIGHT) == entry.right_safe);
+	}
+
+	PlanConfig plan_cfg(1, "join-query", std::make_shared<DuckDBExecutionConfig>());
+	vector<LogicalType> output_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+	auto schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::BIGINT, LogicalType::BIGINT});
+
+	REQUIRE_THROWS_WITH(BroadcastJoinNode(304, plan_cfg, {}, JoinType::LEFT, output_types, {}, {},
+	                                      PhysicalHashJoin::JoinProjectionColumns(),
+	                                      PhysicalHashJoin::JoinProjectionColumns(),
+	                                      PhysicalHashJoin::JoinProjectionColumns(), {}, nullptr, 1,
+	                                      BroadcastJoinSide::LEFT, nullptr, nullptr, schema),
+	                    Catch::Matchers::Contains("semantically preserved"));
 }
