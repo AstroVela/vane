@@ -4,7 +4,8 @@
 
 option(BUILD_DISTRIBUTED "Build the distributed execution tests" ON)
 
-add_library_unity(test_execution OBJECT test_execution_batch.cpp)
+add_library_unity(test_execution OBJECT test_execution_batch.cpp
+                  test_vllm_inflight_counter.cpp)
 set(ALL_OBJECT_FILES ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:test_execution>)
 
 if(BUILD_DISTRIBUTED)
