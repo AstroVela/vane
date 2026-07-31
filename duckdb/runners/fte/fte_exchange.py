@@ -99,6 +99,7 @@ def derive_exchange_sink_instance_for_attempt(
     attempt_id: int,
     task_partition_id: int | None = None,
     fragment_execution_id: int | None = None,
+    stable_task_identity: int | None = None,
 ) -> Any:
     payload = _sink_instance_payload(exchange_sink_instance)
     if not payload:
@@ -113,9 +114,14 @@ def derive_exchange_sink_instance_for_attempt(
 
     runtime_task_partition_id = task_partition_id
     if use_fte_task_identity:
-        if task_partition_id is None or fragment_execution_id is None:
-            raise ValueError("FTE-derived exchange sink identity requires fragment and partition ids")
-        runtime_task_partition_id = _fte_task_partition_identity(fragment_execution_id, task_partition_id)
+        if stable_task_identity is not None:
+            runtime_task_partition_id = _check_non_negative("stable_task_identity", stable_task_identity)
+        else:
+            if task_partition_id is None or fragment_execution_id is None:
+                raise ValueError("FTE-derived exchange sink identity requires fragment and partition ids")
+            runtime_task_partition_id = _fte_task_partition_identity(fragment_execution_id, task_partition_id)
+        if runtime_task_partition_id == _FTE_TASK_IDENTITY_INVALID:
+            raise ValueError("FTE sink identity collides with the reserved invalid task index")
     elif runtime_task_partition_id is not None:
         runtime_task_partition_id = _check_non_negative("task_partition_id", runtime_task_partition_id)
 

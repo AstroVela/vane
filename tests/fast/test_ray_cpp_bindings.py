@@ -572,6 +572,7 @@ def test_exchange_source_task_descriptor_preserves_attempt_ids():
     handles = [
         {
             "partition_id": 0,
+            "source_task_partition_id": 11,
             "attempt_id": 7,
             "node_id": "node-a",
             "flight_port": 5010,
@@ -580,6 +581,7 @@ def test_exchange_source_task_descriptor_preserves_attempt_ids():
         },
         {
             "partition_id": 1,
+            "source_task_partition_id": 11,
             "attempt_id": 2,
             "node_id": "node-b",
             "flight_port": 5011,
@@ -597,6 +599,13 @@ def test_exchange_source_task_descriptor_preserves_attempt_ids():
 
     assert duckdb.ray_cxx.exchange_source_task_partition_indices(raw) == [0, 1]
     assert duckdb.ray_cxx.exchange_source_task_replicated(raw) is False
+    assert duckdb.ray_cxx.exchange_source_task_logical_identity(raw) == {
+        "partition_indices": [0, 1],
+        "source_task_partition_ids": [11],
+        "source_partition_count": 2,
+        "source_task_count": 2,
+        "replicated": False,
+    }
     assert duckdb.ray_cxx.exchange_source_task_source_handles_for_test(raw) == handles
 
     split = duckdb.ray_cxx.split_exchange_source_task_by_partition(raw)

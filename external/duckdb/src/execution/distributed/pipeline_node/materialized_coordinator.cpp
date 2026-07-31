@@ -126,12 +126,6 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 	}
 
 	try {
-		for (const auto &output : mat_res.outputs) {
-			if (!output.has_exchange_sink_instance()) {
-				throw InternalException("coordinator exchange sink output is missing exchange sink instance metadata");
-			}
-			exchange->AddSink(output.exchange_sink_instance().sink_handle.task_partition_id);
-		}
 		RecordRemoteExchangeFinishedSinks(*exchange, mat_res.outputs, "coordinator");
 		exchange->AllRequiredSinksFinished();
 	} catch (const std::exception &ex) {
@@ -164,7 +158,9 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 
 	TaskContext task_context =
 	    TaskContext::from_node_context(node->context().query_idx(), node->node_id(), task_id_counter->next());
-	WorkerTask final_task(task_context, final_plan, node->config().execution_config(), node->context().to_hashmap());
+	auto final_task_context = node->context().to_hashmap();
+	final_task_context["stable_task_partition_id"] = "0";
+	WorkerTask final_task(task_context, final_plan, node->config().execution_config(), std::move(final_task_context));
 
 	auto send_result = result_tx->send(SubmittableTask<WorkerTask>(std::move(final_task)));
 	result_tx->close();

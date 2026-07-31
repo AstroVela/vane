@@ -1816,6 +1816,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 
 	distributed::ExchangeSourceHandle handle0;
 	handle0.partition_id = 0;
+	handle0.source_task_partition_id = 10;
 	handle0.attempt_id = 3;
 	handle0.node_id = "node-1";
 	handle0.flight_host = "flight-node-1.internal";
@@ -1826,6 +1827,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 
 	distributed::ExchangeSourceHandle handle1;
 	handle1.partition_id = 0;
+	handle1.source_task_partition_id = 11;
 	handle1.attempt_id = 4;
 	handle1.node_id = "node-2";
 	handle1.flight_host = "flight-node-2.internal";
@@ -1836,6 +1838,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 
 	distributed::ExchangeSourceHandle handle2;
 	handle2.partition_id = 1;
+	handle2.source_task_partition_id = 10;
 	handle2.attempt_id = 3;
 	handle2.node_id = "node-1";
 	handle2.flight_host = "flight-node-1.internal";
@@ -1873,6 +1876,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	REQUIRE(source_ptr->SourceNodes() == source_nodes);
 	REQUIRE(source_ptr->SourceHandles().size() == source_handles.size());
 	REQUIRE(source_ptr->SourceHandles()[0].partition_id == 0);
+	REQUIRE(source_ptr->SourceHandles()[0].source_task_partition_id == 10);
 	REQUIRE(source_ptr->SourceHandles()[0].attempt_id == 3);
 	REQUIRE(source_ptr->SourceHandles()[0].node_id == "node-1");
 	REQUIRE(source_ptr->SourceHandles()[0].flight_host == "flight-node-1.internal");
@@ -1881,6 +1885,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	REQUIRE(source_ptr->SourceHandles()[0].files.size() == 1);
 	REQUIRE(source_ptr->SourceHandles()[0].files[0].path == "shuffle_stage__sink_0__attempt_0");
 	REQUIRE(source_ptr->SourceHandles()[1].partition_id == 0);
+	REQUIRE(source_ptr->SourceHandles()[1].source_task_partition_id == 11);
 	REQUIRE(source_ptr->SourceHandles()[1].attempt_id == 4);
 	REQUIRE(source_ptr->SourceHandles()[1].node_id == "node-2");
 	REQUIRE(source_ptr->SourceHandles()[1].flight_host == "flight-node-2.internal");
@@ -1889,6 +1894,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	REQUIRE(source_ptr->SourceHandles()[1].files.size() == 1);
 	REQUIRE(source_ptr->SourceHandles()[1].files[0].path == "shuffle_stage__sink_1__attempt_0");
 	REQUIRE(source_ptr->SourceHandles()[2].partition_id == 1);
+	REQUIRE(source_ptr->SourceHandles()[2].source_task_partition_id == 10);
 	REQUIRE(source_ptr->SourceHandles()[2].attempt_id == 3);
 	REQUIRE(source_ptr->SourceHandles()[2].node_id == "node-1");
 	REQUIRE(source_ptr->SourceHandles()[2].flight_host == "flight-node-1.internal");
@@ -2022,6 +2028,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 
 	distributed::ExchangeSourceHandle handle0;
 	handle0.partition_id = 0;
+	handle0.source_task_partition_id = 21;
 	handle0.attempt_id = 7;
 	handle0.node_id = "node-1";
 	handle0.flight_host = "flight-node-1.internal";
@@ -2032,6 +2039,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 
 	distributed::ExchangeSourceHandle handle1;
 	handle1.partition_id = 1;
+	handle1.source_task_partition_id = 22;
 	handle1.attempt_id = 2;
 	handle1.node_id = "node-2";
 	handle1.flight_host = "flight-node-2.internal";
@@ -2047,6 +2055,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	REQUIRE(roundtrip.source_task_count == 2);
 	REQUIRE(roundtrip.source_handles.size() == 2);
 	REQUIRE(roundtrip.source_handles[0].partition_id == 0);
+	REQUIRE(roundtrip.source_handles[0].source_task_partition_id == 21);
 	REQUIRE(roundtrip.source_handles[0].attempt_id == 7);
 	REQUIRE(roundtrip.source_handles[0].node_id == "node-1");
 	REQUIRE(roundtrip.source_handles[0].flight_host == "flight-node-1.internal");
@@ -2056,6 +2065,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	REQUIRE(roundtrip.source_handles[0].files[0].path == "shuffle_stage__sink_0__attempt_7");
 	REQUIRE(roundtrip.source_handles[0].files[0].file_size == 11);
 	REQUIRE(roundtrip.source_handles[1].partition_id == 1);
+	REQUIRE(roundtrip.source_handles[1].source_task_partition_id == 22);
 	REQUIRE(roundtrip.source_handles[1].attempt_id == 2);
 	REQUIRE(roundtrip.source_handles[1].node_id == "node-2");
 	REQUIRE(roundtrip.source_handles[1].flight_host == "flight-node-2.internal");

@@ -1223,6 +1223,8 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 			throw SerializationException("remote exchange source requires explicit catalog handles");
 		}
 		auto source_handle_flight_hosts = deserializer.ReadProperty<vector<string>>(116, "source_handle_flight_hosts");
+		auto source_handle_task_partition_ids =
+		    deserializer.ReadProperty<vector<idx_t>>(117, "source_handle_task_partition_ids");
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.node_id = distributed::ResolveFlightExchangeNodeIdFromEnv();
@@ -1236,13 +1238,15 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		    source_handle_partition_ids.size() != source_handle_flight_ports.size() ||
 		    source_handle_partition_ids.size() != source_handle_attempt_ids.size() ||
 		    source_handle_partition_ids.size() != source_handle_flight_server_epochs.size() ||
-		    source_handle_partition_ids.size() != source_handle_flight_hosts.size()) {
+		    source_handle_partition_ids.size() != source_handle_flight_hosts.size() ||
+		    source_handle_partition_ids.size() != source_handle_task_partition_ids.size()) {
 			throw SerializationException("remote exchange source handle metadata is inconsistent");
 		}
 		source_handles.reserve(source_handle_partition_ids.size());
 		for (idx_t i = 0; i < source_handle_partition_ids.size(); i++) {
 			distributed::ExchangeSourceHandle sh;
 			sh.partition_id = source_handle_partition_ids[i];
+			sh.source_task_partition_id = source_handle_task_partition_ids[i];
 			sh.attempt_id = source_handle_attempt_ids[i];
 			sh.node_id = source_handle_node_ids[i];
 			sh.flight_host = source_handle_flight_hosts[i];

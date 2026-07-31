@@ -74,6 +74,9 @@ struct ExchangeSourceFile {
 /// split by target_data_size).
 struct ExchangeSourceHandle {
 	idx_t partition_id = 0;
+	/// Logical upstream sink partition that produced this source handle.
+	/// Stable across attempts and independent of worker completion order.
+	idx_t source_task_partition_id = DConstants::INVALID_INDEX;
 	idx_t attempt_id = 0;
 	std::string node_id;
 	std::string flight_host;

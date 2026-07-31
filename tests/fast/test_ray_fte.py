@@ -1302,6 +1302,26 @@ def test_derive_exchange_sink_instance_rejects_reserved_task_identity():
         )
 
 
+def test_derive_exchange_sink_instance_accepts_stable_native_task_identity():
+    base = {
+        "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+        "output_location": "q_coordinator__sink_0__attempt_0",
+        "fte_task_identity": True,
+    }
+
+    derived = derive_exchange_sink_instance_for_attempt(
+        base,
+        3,
+        task_partition_id=17,
+        fragment_execution_id=9,
+        stable_task_identity=123456789,
+    )
+
+    assert derived["task_partition_id"] == 123456789
+    assert derived["sink_handle"]["task_partition_id"] == 123456789
+    assert derived["output_location"] == "q_coordinator__sink_123456789__attempt_3"
+
+
 def test_task_descriptor_appends_splits_idempotently_and_replays_fte_fields():
     task_id = FteTaskId("q", 2, 3)
     descriptor = TaskDescriptor(
