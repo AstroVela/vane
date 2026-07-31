@@ -121,6 +121,22 @@ class TestMap:
         results = [duckdb_cursor.execute("EXECUTE prepared_streaming_udf").fetchall() for _ in range(3)]
         assert results == [expected, expected, expected]
 
+    def test_create_table_function_map_batches_can_change_cardinality(self, duckdb_cursor):
+        def keep_first_three(table):
+            import pyarrow as pa
+
+            values = table.column(0).to_pylist()
+            return pa.table({"x": [value for value in values if value < 3]})
+
+        duckdb_cursor.create_table_function(
+            "filter_batches_test",
+            keep_first_three,
+            schema={"x": duckdb.sqltypes.BIGINT},
+        )
+        result = duckdb_cursor.sql("select * from filter_batches_test((select i from range(5) tbl(i)))")
+
+        assert result.fetchall() == [(0,), (1,), (2,)]
+
     def test_create_table_function_map_batches_projects_output(self, duckdb_cursor):
         def calculate_values(table):
             import pyarrow as pa

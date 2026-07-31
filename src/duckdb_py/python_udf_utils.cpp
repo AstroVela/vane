@@ -408,6 +408,7 @@ Value BuildPythonUDFPayload(
 	auto udf_display_name = PythonCallableDisplayName(udf);
 	children.emplace_back("udf_name", Value(udf_display_name));
 	children.emplace_back("call_mode", Value(flat_map ? "flat_map" : "map_batches"));
+	children.emplace_back("row_preserving", Value::BOOLEAN(false));
 	children.emplace_back("execution_backend", Value(execution_backend));
 	children.emplace_back("function_pickle", Value::BLOB_RAW(pickled_str));
 	children.emplace_back("function_pickle_size_bytes", Value::BIGINT(NumericCast<int64_t>(pickled_str.size())));
