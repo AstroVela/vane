@@ -45,7 +45,7 @@ PhysicalOperator &PhysicalResultCollector::GetResultCollector(ClientContext &con
 		if (data.output_type == QueryResultOutputType::ALLOW_STREAMING) {
 			return physical_plan.Make<PhysicalBufferedCollector>(data, false);
 		}
-		return physical_plan.Make<PhysicalMaterializedCollector>(data, true);
+		return physical_plan.Make<PhysicalMaterializedCollector>(data, false);
 	}
 
 	// Order-preserving plan, and we can use the batch index: use a batch collector.
