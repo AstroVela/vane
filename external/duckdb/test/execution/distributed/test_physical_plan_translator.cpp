@@ -72,8 +72,8 @@
 #include "test_helpers.hpp"
 
 #include <memory>
-#include <utility>
 #include <cstdlib>
+#include <utility>
 
 using namespace duckdb;
 using namespace duckdb::distributed;
@@ -1333,6 +1333,50 @@ TEST_CASE("PhysicalPlanTranslator: window rejects incompatible partition definit
 
 	REQUIRE(res.is_err());
 	REQUIRE_THAT(res.error().what(), Catch::Matchers::Contains("incompatible partition definitions"));
+}
+
+TEST_CASE("PhysicalPlanTranslator: hash join builds both required shuffles", "[distributed][join]") {
+	ScopedTranslatorEnvironment join_strategy("VANE_DISTRIBUTED_JOIN_STRATEGY", "hash");
+	PlanConfig config;
+	config.num_partitions = 4;
+
+	auto res = physical_plan_to_pipeline_node(config, MakeHashJoinPlan(JoinType::INNER, 1, 1));
+
+	REQUIRE(res.is_ok());
+	auto join = res.value()->inner();
+	REQUIRE(join != nullptr);
+	REQUIRE(join->name() == "HashJoin");
+	auto children = join->children();
+	REQUIRE(children.size() == 2);
+	for (const auto &child : children) {
+		auto shuffle = std::dynamic_pointer_cast<RepartitionNode>(child);
+		REQUIRE(shuffle != nullptr);
+		REQUIRE(shuffle->config().clustering_spec() != nullptr);
+		REQUIRE(shuffle->config().clustering_spec()->type() == ClusteringSpec::Type::Hash);
+		REQUIRE(shuffle->config().clustering_spec()->num_partitions() == 4);
+	}
+}
+
+TEST_CASE("PhysicalPlanTranslator: broadcast join builds the required receiver shuffle", "[distributed][join]") {
+	ScopedTranslatorEnvironment join_strategy("VANE_DISTRIBUTED_JOIN_STRATEGY", "broadcast_left");
+	ScopedTranslatorEnvironment repartition_receiver("VANE_DISTRIBUTED_BROADCAST_JOIN_RECEIVER_REPARTITION", "true");
+	PlanConfig config;
+	config.num_partitions = 4;
+
+	auto res = physical_plan_to_pipeline_node(config, MakeHashJoinPlan(JoinType::INNER, 1, 1));
+
+	REQUIRE(res.is_ok());
+	auto join = res.value()->inner();
+	REQUIRE(join != nullptr);
+	REQUIRE(join->name() == "BroadcastJoin");
+	auto children = join->children();
+	REQUIRE(children.size() == 2);
+	REQUIRE(std::dynamic_pointer_cast<RepartitionNode>(children[0]) == nullptr);
+	auto receiver_shuffle = std::dynamic_pointer_cast<RepartitionNode>(children[1]);
+	REQUIRE(receiver_shuffle != nullptr);
+	REQUIRE(receiver_shuffle->config().clustering_spec() != nullptr);
+	REQUIRE(receiver_shuffle->config().clustering_spec()->type() == ClusteringSpec::Type::Hash);
+	REQUIRE(receiver_shuffle->config().clustering_spec()->num_partitions() == 4);
 }
 
 TEST_CASE("PhysicalPlanTranslator: left delim join -> placeholder node", "[distributed]") {

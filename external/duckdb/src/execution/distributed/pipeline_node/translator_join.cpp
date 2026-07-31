@@ -308,10 +308,7 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 			if (!receiver_keys.empty()) {
 				size_t target_partitions = plan_config_.num_partitions;
 				auto receiver_spec = RepartitionSpec::create_hash(target_partitions, receiver_keys);
-				auto shuffle_res = gen_shuffle_node(receiver_spec, receiver->config().schema(), receiver);
-				if (shuffle_res) {
-					receiver = shuffle_res.value();
-				}
+				receiver = gen_shuffle_node(std::move(receiver_spec), receiver->config().schema(), receiver);
 			}
 		}
 
@@ -340,15 +337,9 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 			size_t target_partitions =
 			    std::max(static_cast<size_t>(plan_config_.num_partitions), static_cast<size_t>(1));
 			auto left_spec = RepartitionSpec::create_hash(target_partitions, std::move(left_partition_by));
-			auto left_shuffle_res = gen_shuffle_node(left_spec, left_node->config().schema(), left_node);
-			if (left_shuffle_res) {
-				join_left = left_shuffle_res.value();
-			}
+			join_left = gen_shuffle_node(std::move(left_spec), left_node->config().schema(), left_node);
 			auto right_spec = RepartitionSpec::create_hash(target_partitions, std::move(right_partition_by));
-			auto right_shuffle_res = gen_shuffle_node(right_spec, right_node->config().schema(), right_node);
-			if (right_shuffle_res) {
-				join_right = right_shuffle_res.value();
-			}
+			join_right = gen_shuffle_node(std::move(right_spec), right_node->config().schema(), right_node);
 		}
 	}
 

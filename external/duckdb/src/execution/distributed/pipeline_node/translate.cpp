@@ -84,19 +84,40 @@ PhysicalPlanToPipelineNodeTranslator::physical_plan_to_pipeline_node(PlanConfig 
 	return DuckDBResult<std::shared_ptr<DistributedPipelineNode>>::ok(translator.node_stack_.back());
 }
 
-DuckDBResult<std::shared_ptr<DistributedPipelineNode>>
+std::shared_ptr<DistributedPipelineNode>
 PhysicalPlanToPipelineNodeTranslator::gen_shuffle_node(std::shared_ptr<RepartitionSpec> repartition_spec,
                                                        SchemaRef schema,
                                                        std::shared_ptr<DistributedPipelineNode> child) {
-	size_t upstream_num = child->config().clustering_spec()->num_partitions();
+	if (!repartition_spec) {
+		throw InternalException("Cannot build shuffle node without a repartition specification");
+	}
+	if (!child) {
+		throw InternalException("Cannot build shuffle node without a child");
+	}
+	auto child_clustering = child->config().clustering_spec();
+	if (!child_clustering) {
+		throw InternalException("Cannot build shuffle node without child clustering metadata");
+	}
+
+	size_t upstream_num = child_clustering->num_partitions();
 	auto clustering = repartition_spec->to_clustering_spec(upstream_num);
+	if (!clustering) {
+		throw InternalException("Cannot build shuffle node without output clustering metadata");
+	}
 	size_t num_partitions = clustering->num_partitions();
 
 	auto plan_cfg_ptr = std::make_shared<PlanConfig>(plan_config_);
-	return DuckDBResult<std::shared_ptr<DistributedPipelineNode>>::ok(
-	    RepartitionNode::create(get_next_pipeline_node_id(), plan_cfg_ptr, repartition_spec, num_partitions, schema,
-	                            child, exchange_mgr_)
-	        ->into_node());
+	auto repartition_node =
+	    RepartitionNode::create(get_next_pipeline_node_id(), plan_cfg_ptr, std::move(repartition_spec), num_partitions,
+	                            std::move(schema), std::move(child), exchange_mgr_);
+	if (!repartition_node) {
+		throw InternalException("Failed to build shuffle node");
+	}
+	auto node = repartition_node->into_node();
+	if (!node) {
+		throw InternalException("Failed to wrap shuffle node");
+	}
+	return node;
 }
 
 std::shared_ptr<DistributedPipelineNode>
@@ -106,11 +127,7 @@ PhysicalPlanToPipelineNodeTranslator::gen_gather_node(std::shared_ptr<Distribute
 	}
 
 	auto spec = RepartitionSpec::create_into_partitions(1);
-	auto res = gen_shuffle_node(spec, input_node->config().schema(), input_node);
-	if (!res) {
-		throw std::runtime_error(std::string("gen_gather_node failed: ") + res.error().what());
-	}
-	return res.value();
+	return gen_shuffle_node(std::move(spec), input_node->config().schema(), input_node);
 }
 
 void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOperator &op) {

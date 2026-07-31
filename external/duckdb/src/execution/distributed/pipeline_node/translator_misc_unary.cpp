@@ -215,11 +215,7 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 			    !WindowPartitionKeysMatch(input_node, window_definition->partitions, target_partitions)) {
 				auto spec =
 				    RepartitionSpec::create_hash(target_partitions, CopyWindowPartitionKeys(*window_definition));
-				auto shuffle = gen_shuffle_node(std::move(spec), input_node->config().schema(), input_node);
-				if (!shuffle) {
-					throw InvalidInputException("Failed to repartition Window input: %s", shuffle.error().what());
-				}
-				input_node = shuffle.value();
+				input_node = gen_shuffle_node(std::move(spec), input_node->config().schema(), input_node);
 			}
 		}
 	}

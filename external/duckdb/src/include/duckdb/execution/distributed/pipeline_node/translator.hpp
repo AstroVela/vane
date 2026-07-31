@@ -86,9 +86,9 @@ private:
 	std::vector<std::shared_ptr<DistributedPipelineNode>> node_stack_;
 
 	// 生成 shuffle 节点（实现自 Rust 逻辑）
-	DuckDBResult<std::shared_ptr<DistributedPipelineNode>>
-	gen_shuffle_node(std::shared_ptr<RepartitionSpec> repartition_spec, SchemaRef schema,
-	                 std::shared_ptr<DistributedPipelineNode> child);
+	std::shared_ptr<DistributedPipelineNode> gen_shuffle_node(std::shared_ptr<RepartitionSpec> repartition_spec,
+	                                                          SchemaRef schema,
+	                                                          std::shared_ptr<DistributedPipelineNode> child);
 
 	// 生成无预聚合的聚合节点（GroupBy/Shuffle/Gather）
 	std::shared_ptr<DistributedPipelineNode> gen_without_pre_agg(std::shared_ptr<DistributedPipelineNode> input_node,
