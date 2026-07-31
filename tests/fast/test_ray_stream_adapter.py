@@ -96,6 +96,10 @@ class _FakeRay:
         self.get_calls.append(ref)
         return ref.value
 
+    @staticmethod
+    def wait(waitables, **_kwargs):
+        return list(waitables), []
+
     def cancel(self, ref, **kwargs):
         self.cancel_calls.append((ref, kwargs))
 
@@ -124,9 +128,23 @@ def _lease():
 
 
 def test_contract_accepts_unlisted_ray_version_when_capabilities_are_present():
-    ray_module = SimpleNamespace(__version__="9.0.0", ObjectRefGenerator=_Generator)
+    ray_module = SimpleNamespace(
+        __version__="9.0.0",
+        ObjectRefGenerator=_Generator,
+        wait=lambda *_args, **_kwargs: ([], []),
+    )
 
     validate_ray_stream_contract(ray_module)
+
+
+def test_contract_rejects_missing_non_consuming_wait_capability():
+    ray_module = SimpleNamespace(
+        __version__="2.56.0",
+        ObjectRefGenerator=_Generator,
+    )
+
+    with pytest.raises(RuntimeError, match="Ray '2.56.0' runtime contract is missing: wait"):
+        validate_ray_stream_contract(ray_module)
 
 
 def test_contract_rejects_missing_generator_capability_with_version_context():
@@ -134,7 +152,11 @@ def test_contract_rejects_missing_generator_capability_with_version_context():
         async def __anext__(self):
             raise StopAsyncIteration
 
-    ray_module = SimpleNamespace(__version__="2.56.0", ObjectRefGenerator=_IncompleteGenerator)
+    ray_module = SimpleNamespace(
+        __version__="2.56.0",
+        ObjectRefGenerator=_IncompleteGenerator,
+        wait=lambda *_args, **_kwargs: ([], []),
+    )
 
     with pytest.raises(RuntimeError, match="Ray '2.56.0' ObjectRefGenerator contract is missing: completed"):
         validate_ray_stream_contract(ray_module)
@@ -170,6 +192,9 @@ def test_adapter_advances_generator_asynchronously_and_never_gets_data_ref():
     generator = _Generator([])
     generator.refs = [block_ref, metadata_ref]
     adapter = RayStreamAdapter(generator, ray_module=fake_ray)
+
+    assert adapter.waitable is generator
+    assert generator.read_calls == []
 
     async def read_pair():
         return await adapter.read_next_ref_async(), await adapter.read_next_ref_async()

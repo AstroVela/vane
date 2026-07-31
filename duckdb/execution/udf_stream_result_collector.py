@@ -24,6 +24,9 @@ from duckdb.execution.udf_ray_stream_protocol import (
     validate_stream_error_metadata,
 )
 
+_GENERATOR_READINESS_POLL_INITIAL_DELAY_S = 0.001
+_GENERATOR_READINESS_POLL_MAX_DELAY_S = 0.01
+
 
 def _collector_debug_log(event: str, record: _StreamRecord, **fields: Any) -> None:
     value = os.environ.get("DUCKDB_DISTRIBUTED_DEBUG", "")
@@ -107,6 +110,9 @@ class _StreamRecord:
     wait_future: Any | None = None
     completion_future: Any | None = None
     terminal_signal_observed: bool = False
+    next_ref_ready: bool = False
+    ready_sequence: int | None = None
+    cleanup_started: bool = False
 
 
 class AsyncResultCollector:
@@ -127,6 +133,7 @@ class AsyncResultCollector:
         self._cv = threading.Condition()
         self._shutdown = False
         self._started = False
+        self._thread_started = False
         self._thread_error: BaseException | None = None
         self._wakeup_fn: Any | None = None
         self._records: dict[tuple[int, int], _StreamRecord] = {}
@@ -135,8 +142,16 @@ class AsyncResultCollector:
         self._active_output_leases: dict[tuple[str, str], _OutputLeaseToken] = {}
         self._cancelled_slots: set[int] = set()
         self._next_sequence = 0
+        self._next_ready_sequence = 0
+        self._cleanup_threads: set[threading.Thread] = set()
+        self._cleanup_errors: list[BaseException] = []
+        self._cleanup_starting = 0
+        self._readiness_delay_s = _GENERATOR_READINESS_POLL_INITIAL_DELAY_S
+        self._readiness_timer: asyncio.TimerHandle | None = None
+        self._readiness_wakeup_pending = False
         self._loop = asyncio.new_event_loop()
         self._loop_ready = threading.Event()
+        self._start_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run_event_loop,
             daemon=True,
@@ -173,14 +188,33 @@ class AsyncResultCollector:
             )
             self._next_sequence += 1
             self._records[key] = record
-            self._cv.notify_all()
+            self._signal_readiness_change_locked()
         _collector_debug_log("track", record)
-        self._ensure_started()
+        try:
+            self._ensure_started()
+            with self._cv:
+                if self._records.get(key) is not record:
+                    self._raise_if_stopped_locked()
+                    raise RuntimeError(f"Ray UDF stream slot={key[0]} submit={key[1]} was cancelled during startup")
+        except BaseException as exc:
+            with self._cv:
+                owned = self._records.pop(key, None) is record
+                record.terminal = True
+                self._cv.notify_all()
+            if owned:
+                try:
+                    record.adapter.cancel()
+                except BaseException as cleanup_exc:
+                    add_note = getattr(exc, "add_note", None)
+                    if callable(add_note):
+                        add_note(f"stream startup cleanup failed: {cleanup_exc}")
+            raise
         self._refresh_waiters()
 
     def drain_results(self, capacities: dict[Any, Any] | None = None) -> list[tuple[Any, ...]]:
         parsed = self._parse_capacities(capacities)
         results: list[tuple[Any, ...]] = []
+        readiness_changed = False
         with self._cv:
             self._raise_if_stopped_locked()
             for slot_id, capacity in parsed.items():
@@ -204,15 +238,23 @@ class AsyncResultCollector:
                         delivered_rows += 1
                         delivered_bytes += event.size_bytes
                     results.append(ready.popleft().as_tuple())
+                if delivered_rows:
+                    readiness_changed = True
                 if ready is not None and not ready:
                     self._ready_by_slot.pop(slot_id, None)
                 remaining_bytes = None if capacity.bytes is None else max(0, capacity.bytes - delivered_bytes)
-                self._capacity_by_slot[slot_id] = _DrainCapacity(
+                updated_capacity = _DrainCapacity(
                     rows=max(0, capacity.rows - delivered_rows),
                     bytes=remaining_bytes,
                     item_bytes=capacity.item_bytes,
                 )
-            self._cv.notify_all()
+                if self._capacity_by_slot.get(slot_id) != updated_capacity:
+                    readiness_changed = True
+                self._capacity_by_slot[slot_id] = updated_capacity
+            if readiness_changed:
+                self._signal_readiness_change_locked()
+            else:
+                self._cv.notify_all()
         self._refresh_waiters()
         return results
 
@@ -252,33 +294,68 @@ class AsyncResultCollector:
     def cancel_slot(self, slot_id: int) -> None:
         slot_key = int(slot_id)
         with self._cv:
+            if self._shutdown:
+                return
             records = [record for record in self._records.values() if record.slot_id == slot_key]
+            records_to_cancel = [record for record in records if not record.cleanup_started]
+            control_requests: list[tuple[Any, dict[str, Any]]] = []
             for record in records:
                 self._records.pop((record.slot_id, record.submit_id), None)
                 record.terminal = True
+                if not record.cleanup_started:
+                    record.cleanup_started = True
                 self._cancel_record_wait_locked(record)
+            for record in records_to_cancel:
+                request = record.output_request
+                driver = record.adapter.driver
+                if request is not None and driver is not None and not record.output_cancel_sent:
+                    record.output_cancel_sent = True
+                    control_requests.append((driver, request))
             ready = list(self._ready_by_slot.pop(slot_key, ()))
             tokens = [token for token in self._active_output_leases.values() if token.slot_id == slot_key]
             for token in tokens:
                 self._active_output_leases.pop((token.request_id, token.lease_id), None)
             self._capacity_by_slot.pop(slot_key, None)
             self._cancelled_slots.add(slot_key)
-            self._cv.notify_all()
+            self._cleanup_starting += 1
+            self._signal_readiness_change_locked()
 
-        for record in records:
-            self._cancel_record_control(record)
-            record.adapter.cancel()
         ready_tokens = [event.output_token for event in ready if event.output_token is not None]
         token_keys = {(token.request_id, token.lease_id) for token in tokens}
         for token in ready_tokens:
             if token is not None and (token.request_id, token.lease_id) not in token_keys:
                 tokens.append(token)
                 token_keys.add((token.request_id, token.lease_id))
-        for token in tokens:
-            token.driver.release_query_output_block_lease.remote(
-                token.request_id,
-                token.lease_id,
+
+        def cleanup_slot() -> None:
+            actions: list[Any] = [
+                lambda driver=driver, request=request: driver.cancel_query_output_block_lease_request.remote(request)
+                for driver, request in control_requests
+            ]
+            for record in records_to_cancel:
+                actions.append(record.adapter.cancel)
+            for token in tokens:
+                actions.append(
+                    lambda token=token: token.driver.release_query_output_block_lease.remote(
+                        token.request_id,
+                        token.lease_id,
+                    )
+                )
+            self._run_isolated_cleanup_actions(
+                actions,
+                name="udf-ray-stream-cancel-action",
             )
+
+        def cleanup_registered() -> None:
+            with self._cv:
+                self._cleanup_starting -= 1
+                self._cv.notify_all()
+
+        self._run_cleanup_after_scheduler_turn(
+            cleanup_slot,
+            timeout_message=f"Ray UDF slot {slot_key} cleanup did not terminate",
+            on_registered=cleanup_registered,
+        )
 
     def slot_has_pending(self, slot_id: int) -> bool:
         slot_key = int(slot_id)
@@ -294,64 +371,115 @@ class AsyncResultCollector:
             self._wakeup_fn = fn
 
     def shutdown(self) -> None:
-        with self._cv:
-            if self._shutdown:
-                return
-            self._shutdown = True
-            self._wakeup_fn = None
-            records = list(self._records.values())
-            for record in records:
-                self._cancel_record_wait_locked(record)
-            self._records.clear()
-            tokens = list(self._active_output_leases.values())
-            self._active_output_leases.clear()
-            self._ready_by_slot.clear()
-            self._capacity_by_slot.clear()
-            self._cv.notify_all()
-        if self._started:
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._started and self._thread is not threading.current_thread():
-            self._thread.join(timeout=self._shutdown_timeout_s)
-            if self._thread.is_alive():
-                raise RuntimeError("Ray UDF stream multiplexer did not terminate")
-
-        cleanup_errors: list[BaseException] = []
-
-        def cleanup_remote_state() -> None:
-            try:
+        deadline = time.monotonic() + self._shutdown_timeout_s
+        shutdown_from_scheduler = self._thread is threading.current_thread()
+        shutdown_errors: list[BaseException] = []
+        with self._start_lock:
+            with self._cv:
+                if self._shutdown:
+                    return
+                self._shutdown = True
+                self._wakeup_fn = None
+                records = list(self._records.values())
+                records_to_cancel = [record for record in records if not record.cleanup_started]
+                control_requests: list[tuple[Any, dict[str, Any]]] = []
                 for record in records:
-                    self._cancel_record_control(record)
-                    record.adapter.cancel()
-                for token in tokens:
-                    token.driver.release_query_output_block_lease.remote(
-                        token.request_id,
-                        token.lease_id,
-                    )
-            except BaseException as exc:
-                cleanup_errors.append(exc)
+                    self._cancel_record_wait_locked(record)
+                for record in records_to_cancel:
+                    request = record.output_request
+                    driver = record.adapter.driver
+                    if request is not None and driver is not None and not record.output_cancel_sent:
+                        record.output_cancel_sent = True
+                        control_requests.append((driver, request))
+                self._records.clear()
+                tokens = list(self._active_output_leases.values())
+                self._active_output_leases.clear()
+                self._ready_by_slot.clear()
+                self._capacity_by_slot.clear()
+                self._signal_readiness_change_locked()
+            if self._thread_started:
+                try:
+                    self._loop.call_soon_threadsafe(self._loop.stop)
+                except RuntimeError as exc:
+                    if self._thread.is_alive():
+                        shutdown_errors.append(exc)
+        for driver, request in control_requests:
+            self._start_tracked_cleanup(
+                name="udf-ray-stream-shutdown-control",
+                operation=lambda driver=driver, request=request: driver.cancel_query_output_block_lease_request.remote(
+                    request
+                ),
+            )
 
-        cleanup_thread = threading.Thread(
-            target=cleanup_remote_state,
-            daemon=True,
-            name="udf-ray-stream-shutdown",
-        )
-        cleanup_thread.start()
-        cleanup_thread.join(timeout=self._shutdown_timeout_s)
-        if cleanup_thread.is_alive():
-            raise RuntimeError("Ray UDF stream remote cleanup did not terminate")
-        if cleanup_errors:
-            raise RuntimeError(f"Ray UDF stream remote cleanup failed: {cleanup_errors[0]}") from cleanup_errors[0]
+        for record in records_to_cancel:
+
+            def cancel_adapter(record: _StreamRecord = record) -> None:
+                # A stalled zero-time Ray probe still owns the generator
+                # handle. Keep this daemon task as its durable cleanup owner.
+                if self._thread.is_alive() and not shutdown_from_scheduler:
+                    self._thread.join()
+                record.adapter.cancel()
+
+            self._start_tracked_cleanup(
+                name="udf-ray-stream-shutdown-adapter",
+                operation=cancel_adapter,
+            )
+        for token in tokens:
+            self._start_tracked_cleanup(
+                name="udf-ray-stream-shutdown-lease",
+                operation=lambda token=token: token.driver.release_query_output_block_lease.remote(
+                    token.request_id,
+                    token.lease_id,
+                ),
+            )
+
+        if self._thread_started and self._thread is not threading.current_thread():
+            self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if self._thread.is_alive():
+                shutdown_errors.append(RuntimeError("Ray UDF stream multiplexer did not terminate"))
+
+        with self._cv:
+            while self._cleanup_starting or self._cleanup_threads:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cv.wait(timeout=remaining)
+            if self._cleanup_starting or self._cleanup_threads:
+                shutdown_errors.append(RuntimeError("Ray UDF stream remote cleanup did not terminate"))
+            shutdown_errors.extend(self._cleanup_errors)
+            self._cleanup_errors.clear()
+        if shutdown_errors:
+            details = "; ".join(f"{type(error).__name__}: {error}" for error in shutdown_errors)
+            raise RuntimeError(f"Ray UDF stream shutdown failed: {details}") from shutdown_errors[0]
 
     # Multiplexer internals.
 
     def _ensure_started(self) -> None:
-        with self._cv:
-            if self._started:
-                return
-            self._started = True
-        self._thread.start()
-        if not self._loop_ready.wait(timeout=self._shutdown_timeout_s):
-            raise RuntimeError("Ray UDF stream event loop did not start")
+        with self._start_lock:
+            with self._cv:
+                if self._started:
+                    self._raise_if_stopped_locked()
+                    return
+                self._raise_if_stopped_locked()
+                self._started = True
+            thread_started = False
+            try:
+                self._thread.start()
+                thread_started = True
+                self._thread_started = True
+                if not self._loop_ready.wait(timeout=self._shutdown_timeout_s):
+                    raise RuntimeError("Ray UDF stream event loop did not start")
+                with self._cv:
+                    self._raise_if_stopped_locked()
+                    self._signal_readiness_change_locked()
+            except BaseException as exc:
+                with self._cv:
+                    if self._thread_error is None:
+                        self._thread_error = exc
+                    self._cv.notify_all()
+                if not thread_started:
+                    self._loop.close()
+                raise
 
     def _raise_if_stopped_locked(self) -> None:
         if self._thread_error is not None:
@@ -390,6 +518,8 @@ class AsyncResultCollector:
         return ready + in_progress
 
     def _may_read_block_locked(self, record: _StreamRecord) -> bool:
+        if not record.next_ref_ready:
+            return False
         capacity = self._capacity_by_slot.get(record.slot_id)
         if capacity is None or capacity.rows <= 0:
             return False
@@ -398,6 +528,276 @@ class AsyncResultCollector:
         if capacity.item_bytes is not None and capacity.item_bytes <= 0:
             return False
         return self._pending_data_count_locked(record.slot_id) < capacity.rows
+
+    def _signal_readiness_change_locked(self) -> None:
+        """Request an immediate scheduler pass without a remote wakeup RPC."""
+        self._cv.notify_all()
+        if (
+            self._shutdown
+            or self._thread_error is not None
+            or not self._started
+            or not self._loop_ready.is_set()
+            or self._readiness_wakeup_pending
+        ):
+            return
+        self._readiness_wakeup_pending = True
+        try:
+            self._loop.call_soon_threadsafe(self._wake_generator_readiness)
+        except RuntimeError as exc:
+            self._readiness_wakeup_pending = False
+            if not self._shutdown:
+                self._thread_error = exc
+                self._cv.notify_all()
+
+    def _readiness_waitables_locked(self) -> dict[Any, _StreamRecord]:
+        waitables: dict[Any, _StreamRecord] = {}
+        admissible_slots = {
+            slot_id
+            for slot_id, capacity in self._capacity_by_slot.items()
+            if capacity.rows > 0
+            and (capacity.bytes is None or capacity.bytes > 0)
+            and (capacity.item_bytes is None or capacity.item_bytes > 0)
+            and self._pending_data_count_locked(slot_id) < capacity.rows
+        }
+        for record in self._records.values():
+            if (
+                record.terminal
+                or record.slot_id not in admissible_slots
+                or record.phase != "block"
+                or record.next_ref_ready
+                or record.wait_future is not None
+                or record.terminal_ref is not None
+            ):
+                continue
+            waitable = record.adapter.waitable
+            if waitable in waitables:
+                raise RuntimeError("Ray UDF collector cannot observe one generator for multiple stream records")
+            waitables[waitable] = record
+        return waitables
+
+    def _scheduler_stopped_locked(self) -> bool:
+        return self._shutdown or self._thread_error is not None
+
+    def _wake_generator_readiness(self) -> None:
+        """Interrupt an idle backoff and run the central scheduler immediately."""
+        try:
+            with self._cv:
+                self._readiness_wakeup_pending = False
+                timer = self._readiness_timer
+                self._readiness_timer = None
+                if timer is not None:
+                    timer.cancel()
+                if self._shutdown or self._thread_error is not None:
+                    return
+                self._readiness_delay_s = _GENERATOR_READINESS_POLL_INITIAL_DELAY_S
+            self._poll_generator_readiness()
+        except BaseException as exc:
+            self._report_scheduler_error(exc)
+
+    def _poll_generator_readiness(self) -> None:
+        """Run one Ray Data-style non-consuming readiness scheduling pass.
+
+        The existing multiplexer event loop is the single owner of generator
+        probes, reads, and terminal retirement.  A zero-time public
+        ``ray.wait`` rebuilds the eligible set on every pass; local admission
+        changes cancel the current idle timer, while exponential backoff bounds
+        polling overhead for genuinely slow generators.
+        """
+        try:
+            self._poll_generator_readiness_once()
+        except BaseException as exc:
+            self._report_scheduler_error(exc)
+
+    def _poll_generator_readiness_once(self) -> None:
+        with self._cv:
+            self._readiness_timer = None
+            if self._scheduler_stopped_locked():
+                return
+            waitables = self._readiness_waitables_locked()
+        if not waitables:
+            with self._cv:
+                self._readiness_delay_s = _GENERATOR_READINESS_POLL_INITIAL_DELAY_S
+            return
+
+        ready, _ = self._ray.wait(
+            list(waitables),
+            num_returns=len(waitables),
+            fetch_local=False,
+            timeout=0,
+        )
+
+        ready_records: list[_StreamRecord] = []
+        with self._cv:
+            if self._scheduler_stopped_locked():
+                return
+            currently_waitable = self._readiness_waitables_locked()
+            for waitable in ready:
+                record = waitables.get(waitable)
+                if record is None:
+                    self._thread_error = RuntimeError("Ray returned an unknown generator readiness handle")
+                    self._cv.notify_all()
+                    break
+                if currently_waitable.get(waitable) is record:
+                    record.next_ref_ready = True
+                    record.ready_sequence = self._next_ready_sequence
+                    self._next_ready_sequence += 1
+                    ready_records.append(record)
+            if self._thread_error is not None:
+                notify_error = True
+            else:
+                notify_error = False
+                if ready_records:
+                    self._readiness_delay_s = _GENERATOR_READINESS_POLL_INITIAL_DELAY_S
+                    self._cv.notify_all()
+                elif not self._readiness_wakeup_pending:
+                    delay_s = self._readiness_delay_s
+                    self._readiness_delay_s = min(
+                        _GENERATOR_READINESS_POLL_MAX_DELAY_S,
+                        delay_s * 2,
+                    )
+                    self._readiness_timer = self._loop.call_later(
+                        delay_s,
+                        self._poll_generator_readiness,
+                    )
+
+        if notify_error:
+            self._notify_wakeup()
+            return
+        if ready_records:
+            for record in ready_records:
+                _collector_debug_log("generator_ready", record)
+            self._refresh_waiters()
+
+    def _report_scheduler_error(self, exc: BaseException) -> None:
+        with self._cv:
+            report = not self._shutdown and self._thread_error is None
+            if report:
+                self._thread_error = exc
+            self._cv.notify_all()
+        if report:
+            self._notify_wakeup()
+
+    def _start_tracked_cleanup(
+        self,
+        *,
+        name: str,
+        operation: Any,
+        on_done: Any | None = None,
+        store_error: bool = True,
+    ) -> tuple[threading.Thread | None, list[BaseException]]:
+        """Run a possibly blocking Ray cleanup without occupying the scheduler."""
+        errors: list[BaseException] = []
+        thread: threading.Thread
+
+        def cleanup() -> None:
+            operation_error: BaseException | None = None
+            try:
+                operation()
+            except BaseException as exc:
+                operation_error = exc
+                errors.append(exc)
+            try:
+                if on_done is not None:
+                    on_done(operation_error)
+                elif operation_error is not None and store_error:
+                    with self._cv:
+                        self._cleanup_errors.append(operation_error)
+                        self._cv.notify_all()
+            except BaseException as exc:
+                errors.append(exc)
+                if store_error:
+                    with self._cv:
+                        self._cleanup_errors.append(exc)
+                        self._cv.notify_all()
+            finally:
+                with self._cv:
+                    self._cleanup_threads.discard(thread)
+                    self._cv.notify_all()
+
+        thread = threading.Thread(
+            target=cleanup,
+            daemon=True,
+            name=name,
+        )
+        with self._cv:
+            self._cleanup_threads.add(thread)
+        try:
+            thread.start()
+        except BaseException:
+            with self._cv:
+                self._cleanup_threads.discard(thread)
+                self._cv.notify_all()
+            cleanup()
+            return None, errors
+        return thread, errors
+
+    def _run_isolated_cleanup_actions(
+        self,
+        actions: list[Any],
+        *,
+        name: str,
+    ) -> None:
+        """Attempt every independent cleanup even when one Ray call blocks."""
+        handles: list[threading.Thread] = []
+        action_errors: list[list[BaseException]] = []
+        for action in actions:
+            thread, errors = self._start_tracked_cleanup(
+                name=name,
+                operation=action,
+                store_error=False,
+            )
+            action_errors.append(errors)
+            if thread is not None:
+                handles.append(thread)
+        for thread in handles:
+            thread.join()
+        errors = [error for group in action_errors for error in group]
+        if errors:
+            details = "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+            raise RuntimeError(f"Ray UDF stream cleanup failed: {details}") from errors[0]
+
+    def _run_cleanup_after_scheduler_turn(
+        self,
+        operation: Any,
+        *,
+        timeout_message: str,
+        on_registered: Any | None = None,
+    ) -> None:
+        """Run terminal cleanup only after every earlier generator probe."""
+        scheduler_safe = threading.Event()
+        with self._cv:
+            needs_turn = self._started and self._thread.is_alive() and self._thread is not threading.current_thread()
+        if needs_turn:
+            try:
+                self._loop.call_soon_threadsafe(scheduler_safe.set)
+            except RuntimeError:
+                if not self._thread.is_alive():
+                    scheduler_safe.set()
+        else:
+            scheduler_safe.set()
+
+        def cleanup() -> None:
+            while not scheduler_safe.wait(timeout=0.1):
+                if not self._thread.is_alive():
+                    break
+            operation()
+
+        cleanup_thread, cleanup_errors = self._start_tracked_cleanup(
+            name="udf-ray-stream-cancel",
+            operation=cleanup,
+            store_error=False,
+        )
+        if on_registered is not None:
+            on_registered()
+        if cleanup_thread is None:
+            if cleanup_errors:
+                raise RuntimeError(f"{timeout_message}: {cleanup_errors[0]}") from cleanup_errors[0]
+            return
+        cleanup_thread.join(timeout=self._shutdown_timeout_s)
+        if cleanup_thread.is_alive():
+            raise RuntimeError(timeout_message)
+        if cleanup_errors:
+            raise RuntimeError(f"{timeout_message}: {cleanup_errors[0]}") from cleanup_errors[0]
 
     def _run_event_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -410,6 +810,12 @@ class AsyncResultCollector:
                 self._cv.notify_all()
             self._notify_wakeup()
         finally:
+            with self._cv:
+                timer = self._readiness_timer
+                self._readiness_timer = None
+                self._readiness_wakeup_pending = False
+            if timer is not None:
+                timer.cancel()
             pending = asyncio.all_tasks(self._loop)
             for task in pending:
                 task.cancel()
@@ -463,6 +869,9 @@ class AsyncResultCollector:
                 # downstream capacity may legitimately fall to zero before the
                 # metadata ObjectRef becomes ready.
                 record.block_item_capacity_bytes = capacity.item_bytes
+                record.next_ref_ready = False
+                record.ready_sequence = None
+                self._signal_readiness_change_locked()
             future = asyncio.run_coroutine_threadsafe(
                 record.adapter.read_next_ref_async(),
                 self._loop,
@@ -517,9 +926,16 @@ class AsyncResultCollector:
 
     def _refresh_waiters(self) -> None:
         with self._cv:
-            if self._shutdown or not self._started or not self._loop_ready.is_set():
+            if self._shutdown or self._thread_error is not None or not self._started or not self._loop_ready.is_set():
                 return
-            for record in self._records.values():
+            records = sorted(
+                self._records.values(),
+                key=lambda record: (
+                    record.phase == "block" and record.next_ref_ready,
+                    record.ready_sequence if record.ready_sequence is not None else record.sequence,
+                ),
+            )
+            for record in records:
                 self._schedule_completion_wait_locked(record)
                 self._schedule_record_wait_locked(record)
 
@@ -609,6 +1025,7 @@ class AsyncResultCollector:
                 if record.wait_future is future:
                     record.wait_future = None
                     record.wait_kind = ""
+                    self._signal_readiness_change_locked()
             self._refresh_waiters()
 
     def _accept_stream_ref(self, record: _StreamRecord, next_ref: Any) -> None:
@@ -691,8 +1108,15 @@ class AsyncResultCollector:
             stale = self._shutdown or self._records.get(key) is not record or record.terminal
             if not stale:
                 record.output_lease_ref = output_lease_ref
+            cancel_stale_request = stale and not record.output_cancel_sent
+            if cancel_stale_request:
+                record.output_cancel_sent = True
         if stale:
-            self._cancel_record_control(record)
+            if cancel_stale_request:
+                self._start_tracked_cleanup(
+                    name="udf-ray-stream-stale-control",
+                    operation=lambda: driver.cancel_query_output_block_lease_request.remote(request),
+                )
             return
         _collector_debug_log("output_lease_requested", record)
 
@@ -771,11 +1195,14 @@ class AsyncResultCollector:
                 record.output_request = None
                 record.output_lease_ref = None
                 record.output_cancel_sent = False
-                self._cv.notify_all()
+                self._signal_readiness_change_locked()
         if stale:
-            driver.release_query_output_block_lease.remote(
-                token.request_id,
-                token.lease_id,
+            self._start_tracked_cleanup(
+                name="udf-ray-stream-stale-lease",
+                operation=lambda: driver.release_query_output_block_lease.remote(
+                    token.request_id,
+                    token.lease_id,
+                ),
             )
             return
         _collector_debug_log("output_lease_granted", record)
@@ -790,18 +1217,60 @@ class AsyncResultCollector:
             return
         record.adapter.mark_drained()
         key = (record.slot_id, record.submit_id)
+
+        def finish_retirement(error: BaseException | None) -> None:
+            dropped_tokens: list[_OutputLeaseToken] = []
+            with self._cv:
+                if self._records.pop(key, None) is not record:
+                    if error is not None:
+                        self._cleanup_errors.append(error)
+                        self._cv.notify_all()
+                    return
+                if error is None:
+                    event = _ReadyEvent(record.slot_id, record.submit_id, "complete", None)
+                else:
+                    ready = self._ready_by_slot.get(record.slot_id)
+                    if ready is not None:
+                        kept: deque[_ReadyEvent] = deque()
+                        for queued in ready:
+                            if queued.submit_id == record.submit_id and queued.kind == "data":
+                                if queued.output_token is not None:
+                                    dropped_tokens.append(queued.output_token)
+                                continue
+                            kept.append(queued)
+                        self._ready_by_slot[record.slot_id] = kept
+                    for token in dropped_tokens:
+                        self._active_output_leases.pop((token.request_id, token.lease_id), None)
+                    event = _ReadyEvent(
+                        record.slot_id,
+                        record.submit_id,
+                        "error",
+                        f"{type(error).__name__}: {error}",
+                    )
+                self._ready_by_slot[record.slot_id].append(event)
+                for token in dropped_tokens:
+                    self._start_tracked_cleanup(
+                        name="udf-ray-stream-retire-leases",
+                        operation=lambda token=token: token.driver.release_query_output_block_lease.remote(
+                            token.request_id,
+                            token.lease_id,
+                        ),
+                    )
+                self._cv.notify_all()
+            _collector_debug_log("retired" if error is None else "retire_failed", record)
+            self._notify_wakeup()
+
         with self._cv:
             if self._records.get(key) is not record:
                 return
             record.terminal = True
-        record.adapter.retire()
-        with self._cv:
-            if self._records.pop(key, None) is not record:
-                return
-            self._ready_by_slot[record.slot_id].append(_ReadyEvent(record.slot_id, record.submit_id, "complete", None))
-            self._cv.notify_all()
-        _collector_debug_log("retired", record)
-        self._notify_wakeup()
+            record.cleanup_started = True
+            self._signal_readiness_change_locked()
+            self._start_tracked_cleanup(
+                name="udf-ray-stream-retire",
+                operation=record.adapter.retire,
+                on_done=finish_retirement,
+            )
 
     def _cancel_record_control(self, record: _StreamRecord) -> None:
         with self._cv:
@@ -819,6 +1288,7 @@ class AsyncResultCollector:
             if self._records.pop(key, None) is not record:
                 return
             record.terminal = True
+            record.cleanup_started = True
             ready = self._ready_by_slot.get(record.slot_id)
             dropped_tokens: list[_OutputLeaseToken] = []
             if ready is not None:
@@ -840,22 +1310,41 @@ class AsyncResultCollector:
                     f"{type(exc).__name__}: {exc}",
                 )
             )
-            self._cv.notify_all()
+            request = record.output_request
+            driver = record.adapter.driver
+            record.output_cancel_sent = request is not None and driver is not None
+            terminal_signal_observed = record.terminal_signal_observed
+            self._cleanup_starting += 1
+            self._signal_readiness_change_locked()
         # Publish the terminal event before any Ray cancellation/control work.
         # The C++ dispatcher is event-driven; delaying this callback until after
         # ray.cancel() can leave the slot asleep forever when cancellation is
         # slow or the failed generator is being reconstructed.
-        self._notify_wakeup()
-        self._cancel_record_control(record)
-        if record.terminal_signal_observed:
-            record.adapter.retire_failed()
-        else:
-            record.adapter.cancel()
-        for token in dropped_tokens:
-            token.driver.release_query_output_block_lease.remote(
-                token.request_id,
-                token.lease_id,
-            )
+        try:
+            self._notify_wakeup()
+        finally:
+            try:
+                for token in dropped_tokens:
+                    self._start_tracked_cleanup(
+                        name="udf-ray-stream-failed-lease",
+                        operation=lambda token=token: token.driver.release_query_output_block_lease.remote(
+                            token.request_id,
+                            token.lease_id,
+                        ),
+                    )
+                if request is not None and driver is not None:
+                    self._start_tracked_cleanup(
+                        name="udf-ray-stream-failed-control",
+                        operation=lambda: driver.cancel_query_output_block_lease_request.remote(request),
+                    )
+                self._start_tracked_cleanup(
+                    name="udf-ray-stream-failed-adapter",
+                    operation=record.adapter.retire_failed if terminal_signal_observed else record.adapter.cancel,
+                )
+            finally:
+                with self._cv:
+                    self._cleanup_starting -= 1
+                    self._cv.notify_all()
 
     def _notify_wakeup(self) -> None:
         with self._cv:

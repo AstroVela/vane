@@ -8,6 +8,7 @@ from collections.abc import Callable
 from typing import Any
 
 _REQUIRED_GENERATOR_METHODS = ("__anext__", "completed")
+_REQUIRED_RAY_METHODS = ("wait",)
 _REQUIRED_CORE_WORKER_METHODS = (
     "async_delete_object_ref_stream",
     "is_object_ref_stream_finished",
@@ -16,6 +17,9 @@ _REQUIRED_CORE_WORKER_METHODS = (
 
 def validate_ray_stream_contract(ray_module: Any) -> None:
     version = str(getattr(ray_module, "__version__", "")).strip() or "unknown"
+    missing_ray = [name for name in _REQUIRED_RAY_METHODS if not callable(getattr(ray_module, name, None))]
+    if missing_ray:
+        raise RuntimeError(f"Ray {version!r} runtime contract is missing: " + ", ".join(missing_ray))
     object_ref_generator = getattr(ray_module, "ObjectRefGenerator", None)
     if object_ref_generator is None:
         raise RuntimeError(f"Ray {version!r} ObjectRefGenerator implementation is unavailable")
@@ -197,6 +201,13 @@ class RayStreamAdapter:
     @property
     def driver(self) -> Any | None:
         return None if self._leased is None else self._leased.driver
+
+    @property
+    def waitable(self) -> Any:
+        """Return the generator used for non-consuming readiness probes."""
+        if self._generator is None:
+            raise RuntimeError("Ray stream has no active ObjectRefGenerator")
+        return self._generator
 
     async def read_next_ref_async(self) -> Any:
         if self._generator is None:
