@@ -98,7 +98,7 @@ def fte_query_status(
     scheduler = _FTE_SCHEDULERS.get(query_id)
     scheduler_stats = scheduler.stats().to_dict() if scheduler is not None else None
     scheduler_failed = bool(scheduler_stats and scheduler_stats.get("state") == "FAILED")
-    fragment_executions: dict[str, dict[str, int | bool]] = {}
+    fragment_executions: dict[str, dict[str, Any]] = {}
     running_count = 0
     failed_count = 0
     finished_count = 0
@@ -162,7 +162,7 @@ def fte_query_status(
     }
     if scheduler_stats is not None:
         status["scheduler_state"] = scheduler_stats.get("state")
-    if scheduler_failed:
+    if scheduler_failed and scheduler_stats is not None:
         status["scheduler_failure"] = scheduler_stats.get("failure_reason")
     return status
 
