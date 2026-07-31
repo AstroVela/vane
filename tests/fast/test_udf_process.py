@@ -148,6 +148,132 @@ def test_native_dispatcher_concurrent_shutdown_never_reopens():
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_native_dispatcher_isolates_async_task_admission_failure():
+    """An asynchronous admission failure must fail one slot, not the process."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import duckdb
+        import duckdb.execution.udf as udf_exec
+        import pyarrow as pa
+        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+
+        build_count = 0
+
+
+        class FakeExecutor:
+            def __init__(self, *, fail_admission):
+                self._fail_admission = fail_admission
+                self._wakeup = None
+                self._state = "idle"
+                self._retained_input_bytes = 0
+                self._output = None
+                self._finished = False
+
+            def register_wakeup(self, callback):
+                self._wakeup = callback
+
+            def request_task_admission(self, retained_input_bytes):
+                self._retained_input_bytes = int(retained_input_bytes)
+                self._state = "failed" if self._fail_admission else "ready"
+                if self._wakeup is not None:
+                    self._wakeup()
+                return True
+
+            def task_admission_state(self):
+                state = {
+                    "state": self._state,
+                    "available": self._state == "ready",
+                    "retained_input_bytes": self._retained_input_bytes,
+                }
+                if self._state == "failed":
+                    state["error"] = "injected asynchronous admission failure"
+                return state
+
+            def submit_with_id(self, submit_id, table):
+                if self._fail_admission:
+                    raise AssertionError("failed admission must not submit")
+                self._state = "idle"
+                values = table.column(0).to_pylist()
+                self._output = (
+                    "__vane_submit_result__",
+                    int(submit_id),
+                    make_local_shm_ref_bundle_result(
+                        pa.table({"y": [value + 1 for value in values]})
+                    ),
+                )
+                if self._wakeup is not None:
+                    self._wakeup()
+
+            def take_ready_result(self):
+                result = self._output
+                self._output = None
+                return result
+
+            def finished_submitting(self):
+                self._finished = True
+
+            def all_tasks_finished(self):
+                return self._finished and self._output is None
+
+            def close(self):
+                self._state = "closed"
+
+
+        def build_executor(_payload, options=None):
+            del options
+            global build_count
+            build_count += 1
+            return FakeExecutor(fail_admission=build_count == 1)
+
+
+        def add_one(table):
+            return pa.table({"y": [value + 1 for value in table.column(0).to_pylist()]})
+
+
+        def make_relation(connection):
+            return connection.sql("select 1::BIGINT as x").map_batches(
+                add_one,
+                schema={"y": duckdb.sqltypes.BIGINT},
+                execution_backend="subprocess_task",
+            )
+
+
+        udf_exec.build_executor = build_executor
+        failed_connection = duckdb.connect()
+        try:
+            try:
+                make_relation(failed_connection).fetchall()
+            except BaseException as exc:
+                assert "injected asynchronous admission failure" in str(exc), exc
+            else:
+                raise AssertionError("failed task admission unexpectedly succeeded")
+        finally:
+            failed_connection.close()
+
+        healthy_connection = duckdb.connect()
+        try:
+            assert make_relation(healthy_connection).fetchall() == [(2,)]
+        finally:
+            healthy_connection.close()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+        env={**os.environ, "VANE_RUNNER": "local-fast"},
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_native_dispatcher_shutdown_closes_active_executor():
     """Terminal shutdown must close Python ownership before it returns."""
     import os

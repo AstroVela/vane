@@ -1787,11 +1787,23 @@ private:
 						continue;
 					}
 					auto generation = slot->generation.load();
-					auto wake_submitter = RefreshTaskAdmission_WithGIL(*slot, generation);
-					wake_submitter |= UpdateSlotUDFStats_WithGIL(*slot, generation);
-					if (wake_submitter && IsActiveSlotGeneration(*slot, generation)) {
-						WakeupPipelineThread(*slot);
-						did_work = true;
+					try {
+						auto wake_submitter = RefreshTaskAdmission_WithGIL(*slot, generation);
+						wake_submitter |= UpdateSlotUDFStats_WithGIL(*slot, generation);
+						if (wake_submitter && IsActiveSlotGeneration(*slot, generation)) {
+							WakeupPipelineThread(*slot);
+							did_work = true;
+						}
+					} catch (const py::error_already_set &ex) {
+						if (IsActiveSlotGeneration(*slot, generation)) {
+							SetSlotError(*slot, StringUtil::Format("udf task admission refresh failed: %s", ex.what()));
+							did_work = true;
+						}
+					} catch (const std::exception &ex) {
+						if (IsActiveSlotGeneration(*slot, generation)) {
+							SetSlotError(*slot, StringUtil::Format("udf task admission refresh failed: %s", ex.what()));
+							did_work = true;
+						}
 					}
 				}
 			}
