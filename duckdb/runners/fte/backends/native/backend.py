@@ -24,6 +24,7 @@ from duckdb.runners.fte.dynamic_inputs import (
     strip_fte_dynamic_context,
 )
 from duckdb.runners.fte.fte_config import FTE_WORKER_RUNTIME, FteWorkerAdmissionConfig
+from duckdb.runners.fte.fte_exchange import derive_exchange_sink_instance_for_attempt
 from duckdb.runners.fte.fte_failures import _failure_payload, _normalize_failure_payload
 from duckdb.runners.fte.fte_state import FteTaskState
 from duckdb.runners.fte.fte_types import (
@@ -450,6 +451,29 @@ def _native_total_memory_bytes() -> int:
     return 0
 
 
+_TaskContextKey = tuple[int, int, int, tuple[int, ...]]
+_TASK_CONTEXT_FIELDS = ("query_idx", "last_node_id", "task_id", "node_ids")
+
+
+def _task_context_key(value: Any) -> _TaskContextKey | None:
+    if not isinstance(value, Mapping):
+        return None
+    if any(field not in value for field in _TASK_CONTEXT_FIELDS):
+        return None
+    try:
+        node_ids = tuple(int(node_id) for node_id in value["node_ids"])
+        if not node_ids:
+            return None
+        return (
+            int(value["query_idx"]),
+            int(value["last_node_id"]),
+            int(value["task_id"]),
+            node_ids,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def _task_context_info(task_context: Any) -> dict[str, Any]:
     if isinstance(task_context, Mapping):
         payload = dict(task_context)
@@ -847,6 +871,7 @@ class _NativeFteProgressRegistry:
         failed_partitions: Sequence[Mapping[str, Any]] | None = None,
         selected_attempt_task_ids: Sequence[str] | None = None,
         result_handle_count: int = 0,
+        task_context_filter: set[_TaskContextKey] | None = None,
     ) -> dict[str, Any]:
         query_id = str(query_id)
         partition_metrics = partition_metrics or {}
@@ -856,6 +881,7 @@ class _NativeFteProgressRegistry:
         with self._lock:
             fragments = self._fragments_by_query.get(query_id, {})
             fragment_executions: dict[str, dict[str, Any]] = {}
+            global_failed = False
             for fragment_id, registered in fragments.items():
                 partitions: dict[str, dict[str, Any]] = {}
                 for partition_id, registered_partition in registered.partitions.items():
@@ -867,10 +893,20 @@ class _NativeFteProgressRegistry:
                         registered_partition.last_metrics or self._placeholder_partition_metrics(registered_partition)
                     )
                     self._merge_fragment_progress_topology_locked(registered, metrics)
+                    global_failed = global_failed or str(metrics.get("state") or "").upper() == "FAILED"
+                    if task_context_filter is not None:
+                        request = registered_partition.request
+                        task_context = request.get("task_context_info")
+                        if task_context is None:
+                            task_context = request.get("task_context")
+                        if _task_context_key(task_context) not in task_context_filter:
+                            continue
                     partitions[partition_id] = metrics
                     if str(metrics.get("state") or "").upper() == "FINISHED":
                         selected_attempt_ids.add(str(registered_partition.task_id))
 
+                if not partitions:
+                    continue
                 partition_count = len(partitions)
                 running_count = sum(int(partition.get("running_count") or 0) for partition in partitions.values())
                 failed_count = sum(1 for partition in partitions.values() if partition.get("state") == "FAILED")
@@ -927,10 +963,11 @@ class _NativeFteProgressRegistry:
         pending_submission_count = sum(
             fragment["pending_submission_count"] for fragment in fragment_executions.values()
         )
-        failed = failed_count > 0 or any(fragment["failed"] for fragment in fragment_executions.values())
+        failed = global_failed
         finished = bool(fragment_executions) and all(fragment["finished"] for fragment in fragment_executions.values())
         return {
             "query_id": query_id,
+            "matched": bool(fragment_executions),
             "fragment_execution_count": len(fragment_executions),
             "partition_count": partition_count,
             "running_count": running_count,
@@ -1765,8 +1802,18 @@ class NativeFteWorkerManagerBackend:
             "no_more_splits": list(status.get("no_more_splits") or []),
         }
 
-    def fte_query_status(self, query_id: str) -> dict[str, Any]:
+    def fte_query_status(
+        self,
+        query_id: str,
+        task_context_filter: Sequence[Any] | None = None,
+    ) -> dict[str, Any]:
         query_id = str(query_id)
+        scoped_contexts: set[_TaskContextKey] | None = None
+        if task_context_filter:
+            parsed_contexts = {_task_context_key(context) for context in task_context_filter}
+            if None in parsed_contexts:
+                raise ValueError("task_context_filter contains an invalid task context")
+            scoped_contexts = {context for context in parsed_contexts if context is not None}
         with self._handles_lock:
             handles = list(self._handles_by_query.get(query_id, []))
         dropped_query = self._dropped_queries.get(query_id)
@@ -1781,6 +1828,7 @@ class NativeFteWorkerManagerBackend:
                 "pending_submission_count": 0,
                 "failed": False,
                 "finished": False,
+                "matched": False,
                 "canceled": True,
                 "selected_attempt_task_ids": [],
                 "fragment_executions": {},
@@ -1792,6 +1840,7 @@ class NativeFteWorkerManagerBackend:
         selected_attempt_task_ids: list[str] = []
         failed_partitions: list[dict[str, Any]] = []
         for handle in handles:
+            context_matches = scoped_contexts is None or _task_context_key(handle.task_context_info) in scoped_contexts
             status_error: BaseException | None = None
             try:
                 status = handle.status_snapshot()
@@ -1805,7 +1854,7 @@ class NativeFteWorkerManagerBackend:
                 status_error = exc
             partition = self._partition_metrics_from_handle(handle, status, error=status_error)
             partition_metrics[(query_id, handle.fragment_id, str(handle.task_id.partition_id))] = partition
-            if partition["state"] == "FAILED":
+            if context_matches and partition["state"] == "FAILED":
                 failed_partitions.append(
                     {
                         "task_id": handle.fte_task_id(),
@@ -1814,14 +1863,19 @@ class NativeFteWorkerManagerBackend:
                         else str(status.get("failure")),
                     }
                 )
-            elif partition["state"] == "FINISHED":
+            elif context_matches and partition["state"] == "FINISHED":
                 selected_attempt_task_ids.append(handle.fte_task_id())
         return self._progress_registry.query_status(
             query_id,
             partition_metrics=partition_metrics,
             failed_partitions=failed_partitions,
             selected_attempt_task_ids=selected_attempt_task_ids,
-            result_handle_count=len(handles),
+            result_handle_count=sum(
+                1
+                for handle in handles
+                if scoped_contexts is None or _task_context_key(handle.task_context_info) in scoped_contexts
+            ),
+            task_context_filter=scoped_contexts,
         )
 
     def wait_fte_query(self, query_id: str, timeout_s: float = 0.0) -> dict[str, Any]:
@@ -2043,6 +2097,18 @@ class NativeFteWorkerManagerBackend:
                     exchange_sink_instance = dict(exchange_sink_instance)
                 except (TypeError, ValueError):
                     pass
+                preserve_plan_sink_partition = str(
+                    context.get("preserve_plan_exchange_sink_instance") or ""
+                ).strip().lower() not in ("", "0", "false", "no", "off")
+                if preserve_plan_sink_partition and isinstance(exchange_sink_instance, Mapping):
+                    exchange_sink_instance = dict(exchange_sink_instance)
+                    exchange_sink_instance["preserve_plan_exchange_sink_instance"] = True
+                exchange_sink_instance = derive_exchange_sink_instance_for_attempt(
+                    exchange_sink_instance,
+                    attempt_id,
+                    task_partition_id=partition_id,
+                    fragment_execution_id=fragment_execution_id,
+                )
 
         node_name = str(context.get("node_name") or task.name() or "fragment")
         node_id = str(context.get("node_id") or task_context_info.get("last_node_id") or partition_id)
@@ -2103,6 +2169,7 @@ class NativeFteWorkerManagerBackend:
 
     @staticmethod
     def _context_key(value: Any) -> Any:
-        if isinstance(value, Mapping):
-            return tuple(sorted((str(key), value[key]) for key in value))
-        return value
+        key = _task_context_key(value)
+        if key is None:
+            raise ValueError("task context must contain query_idx, last_node_id, task_id, and node_ids")
+        return key

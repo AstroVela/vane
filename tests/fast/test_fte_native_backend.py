@@ -1197,6 +1197,136 @@ def test_native_worker_manager_exposes_ray_compatible_query_status_and_handles()
         backend.shutdown()
 
 
+def test_native_worker_manager_scopes_query_status_by_task_context():
+    release_second = threading.Event()
+    first_context = {
+        "query_idx": 1,
+        "last_node_id": 7,
+        "task_id": 9,
+        "node_ids": [7],
+    }
+    second_context = {
+        "query_idx": 1,
+        "last_node_id": 7,
+        "task_id": 10,
+        "node_ids": [7],
+    }
+
+    def execute_fn(request):
+        if request["task_id"]["partition_id"] == 1:
+            release_second.wait(timeout=5.0)
+        return {"partition": request["task_id"]["partition_id"]}
+
+    backend = NativeFteWorkerManagerBackend(execute_fn=execute_fn, max_running_tasks=2)
+    try:
+        backend.submit_tasks(
+            [
+                {
+                    "task_id": _task_id(0, query_id="query-scoped"),
+                    "fragment_id": "query-scoped:scan",
+                    "task_context": first_context,
+                },
+                {
+                    "task_id": _task_id(1, query_id="query-scoped"),
+                    "fragment_id": "query-scoped:scan",
+                    "task_context": second_context,
+                },
+            ]
+        )
+
+        deadline = time.monotonic() + 2.0
+        while True:
+            first_status = backend.fte_query_status("query-scoped", [first_context])
+            if first_status["finished"]:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+
+        assert first_status["matched"] is True
+        assert first_status["partition_count"] == 1
+        assert first_status["selected_attempt_task_ids"] == ["query-scoped.0.0.0"]
+        assert len(backend.wait_query("query-scoped", 1.0, [first_context])) == 1
+
+        global_status = backend.fte_query_status("query-scoped")
+        assert global_status["finished"] is False
+        assert global_status["partition_count"] == 2
+
+        unmatched_status = backend.fte_query_status(
+            "query-scoped",
+            [
+                {
+                    "query_idx": 1,
+                    "last_node_id": 7,
+                    "task_id": 99,
+                    "node_ids": [7],
+                }
+            ],
+        )
+        assert unmatched_status["matched"] is False
+        assert unmatched_status["finished"] is False
+        assert unmatched_status["partition_count"] == 0
+    finally:
+        release_second.set()
+        backend.drop_query("query-scoped")
+        backend.shutdown()
+
+
+def test_native_worker_manager_scoped_query_status_keeps_failures_global():
+    release_first = threading.Event()
+    first_context = {
+        "query_idx": 2,
+        "last_node_id": 8,
+        "task_id": 11,
+        "node_ids": [8],
+    }
+    second_context = {
+        "query_idx": 2,
+        "last_node_id": 8,
+        "task_id": 12,
+        "node_ids": [8],
+    }
+
+    def execute_fn(request):
+        if request["task_id"]["partition_id"] == 0:
+            release_first.wait(timeout=5.0)
+            return {"partition": 0}
+        raise RuntimeError("other scoped fragment failed")
+
+    backend = NativeFteWorkerManagerBackend(execute_fn=execute_fn, max_running_tasks=2)
+    try:
+        backend.submit_tasks(
+            [
+                {
+                    "task_id": _task_id(0, query_id="query-scoped-failure"),
+                    "fragment_id": "query-scoped-failure:scan",
+                    "task_context": first_context,
+                },
+                {
+                    "task_id": _task_id(1, query_id="query-scoped-failure"),
+                    "fragment_id": "query-scoped-failure:scan",
+                    "task_context": second_context,
+                },
+            ]
+        )
+
+        deadline = time.monotonic() + 2.0
+        while True:
+            scoped_status = backend.fte_query_status("query-scoped-failure", [first_context])
+            if scoped_status["failed"]:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+
+        assert scoped_status["matched"] is True
+        assert scoped_status["finished"] is False
+        assert scoped_status["failed_count"] == 0
+        assert scoped_status["failed_partitions"] == []
+    finally:
+        release_first.set()
+        backend.drop_query("query-scoped-failure")
+        backend.shutdown()
+
+
 def test_native_worker_manager_task_input_stream_exhausted_seals_fte_runtime_sources():
     executed = threading.Event()
 
@@ -1274,6 +1404,86 @@ def test_native_worker_task_request_converts_inputs_to_dynamic_splits():
     assert [split["sequence_id"] for split in exchange_splits] == [0, 1]
     assert [split["source_partition_id"] for split in exchange_splits] == [0, 1]
     assert [split["data"]["partition_indices"] for split in exchange_splits] == [[0], [1]]
+
+
+def test_native_worker_task_request_derives_fte_exchange_sink_identity():
+    task = _FakeNativeWorkerTask(
+        context={
+            "query_id": "query-sink-identity",
+            "node_id": "3",
+            "fragment_execution_id": 4,
+            "attempt_id": 2,
+        },
+        task_context={
+            "query_idx": 0,
+            "last_node_id": 3,
+            "task_id": 7,
+            "node_ids": [3],
+        },
+        exchange_sink_instance={
+            "sink_handle": {
+                "query_id": "query-sink-identity",
+                "exchange_id": "materialized",
+                "task_partition_id": 0,
+                "partition_id": 0,
+            },
+            "attempt_id": 0,
+            "output_location": "materialized__sink_0__attempt_0",
+            "fte_task_identity": True,
+        },
+    )
+
+    request = NativeFteWorkerManagerBackend._request_from_task(task)
+
+    expected_identity = (4 << 32) | 7
+    assert request["exchange_sink_instance"]["attempt_id"] == 2
+    assert request["exchange_sink_instance"]["task_partition_id"] == expected_identity
+    assert request["exchange_sink_instance"]["partition_id"] == expected_identity
+    assert request["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == expected_identity
+    assert request["exchange_sink_instance"]["sink_handle"]["partition_id"] == expected_identity
+    assert request["exchange_sink_instance"]["output_location"] == (
+        f"materialized__sink_{expected_identity}__attempt_2"
+    )
+
+
+def test_native_worker_task_request_preserves_plan_exchange_sink_identity():
+    task = _FakeNativeWorkerTask(
+        context={
+            "query_id": "query-plan-sink-identity",
+            "node_id": "3",
+            "fragment_execution_id": 4,
+            "attempt_id": 2,
+            "preserve_plan_exchange_sink_instance": "1",
+        },
+        task_context={
+            "query_idx": 0,
+            "last_node_id": 3,
+            "task_id": 7,
+            "node_ids": [3],
+        },
+        exchange_sink_instance={
+            "sink_handle": {
+                "query_id": "query-plan-sink-identity",
+                "exchange_id": "range",
+                "task_partition_id": 5,
+                "partition_id": 5,
+            },
+            "task_partition_id": 5,
+            "partition_id": 5,
+            "attempt_id": 0,
+            "output_location": "range__sink_5__attempt_0",
+        },
+    )
+
+    request = NativeFteWorkerManagerBackend._request_from_task(task)
+
+    assert request["exchange_sink_instance"]["attempt_id"] == 2
+    assert request["exchange_sink_instance"]["task_partition_id"] == 5
+    assert request["exchange_sink_instance"]["partition_id"] == 5
+    assert request["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == 5
+    assert request["exchange_sink_instance"]["sink_handle"]["partition_id"] == 5
+    assert request["exchange_sink_instance"]["output_location"] == "range__sink_5__attempt_2"
+    assert request["exchange_sink_instance"]["preserve_plan_exchange_sink_instance"] is True
 
 
 def test_native_fte_runtime_starts_dynamic_source_and_removes_initial_splits_before_execute():
