@@ -5197,15 +5197,15 @@ class RayQueryDriverActor:
                 )
             if unknown_outcome_error is not None:
                 if unknown_outcome_error is not execution_error:
-                    unknown_outcome_error.cleanup_warnings += (
+                    unknown_outcome_error.add_cleanup_warnings(
                         self._copy_cleanup_warning(
                             "COPY outcome-unknown execution finalization",
                             execution_error,
-                        ),
+                        )
                     )
                 if teardown_error is not None:
-                    unknown_outcome_error.cleanup_warnings += (
-                        self._copy_cleanup_warning("COPY outcome-unknown teardown", teardown_error),
+                    unknown_outcome_error.add_cleanup_warnings(
+                        self._copy_cleanup_warning("COPY outcome-unknown teardown", teardown_error)
                     )
                 if unknown_outcome_error is execution_error:
                     raise

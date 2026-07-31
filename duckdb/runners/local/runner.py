@@ -100,6 +100,24 @@ def _require_known_copy_outcome(operation_id: str, result: dict[str, Any]) -> di
     return result
 
 
+def _record_unknown_copy_cleanup_errors(
+    primary_error: BaseException | None,
+    stage: str,
+    cleanup_errors: list[BaseException],
+) -> bool:
+    if not isinstance(primary_error, CopyOutcomeUnknownError) or not cleanup_errors:
+        return False
+    warnings: list[str] = []
+    for error in cleanup_errors:
+        try:
+            message = str(error)
+        except BaseException:
+            message = "<error message unavailable>"
+        warnings.append(f"{stage} failed: {type(error).__name__}: {message}")
+    primary_error.add_cleanup_warnings(*warnings)
+    return True
+
+
 def _shutdown_udf_actor_pools(actor_pools: list[Any], *, kill: bool) -> list[BaseException]:
     errors: list[BaseException] = []
     for pool in reversed(actor_pools):
@@ -477,26 +495,40 @@ class LocalRunner(Runner):
                         pass
                 raise
             finally:
-                primary_error_active = sys.exc_info()[0] is not None
+                primary_error = sys.exc_info()[1]
                 progress_error: Exception | None = None
                 if renderer is not None:
                     try:
                         renderer.finish(final_state="FINISHED" if write_succeeded else None)
                     except Exception as error:
-                        if not primary_error_active:
+                        if (
+                            not _record_unknown_copy_cleanup_errors(
+                                primary_error,
+                                "progress finalization",
+                                [error],
+                            )
+                            and primary_error is None
+                        ):
                             progress_error = error
                 shutdown_error: Exception | None = None
                 try:
                     write_executor.shutdown(wait=True)
                 except Exception as error:
-                    if not primary_error_active:
+                    if (
+                        not _record_unknown_copy_cleanup_errors(
+                            primary_error,
+                            "write executor shutdown",
+                            [error],
+                        )
+                        and primary_error is None
+                    ):
                         shutdown_error = error
                 if shutdown_error is not None:
                     raise shutdown_error
                 if progress_error is not None:
                     raise progress_error
         finally:
-            primary_error_active = sys.exc_info()[0] is not None
+            primary_error = sys.exc_info()[1]
             cleanup_errors = _shutdown_local_write_resources(
                 backend,
                 fragment_executor,
@@ -505,6 +537,11 @@ class LocalRunner(Runner):
                 kill_actor_pools=not write_succeeded,
                 timeout_s=fragment_executor.close_timeout_s,
             )
-            if write_succeeded and not primary_error_active and cleanup_errors:
+            _record_unknown_copy_cleanup_errors(
+                primary_error,
+                "local write resource shutdown",
+                cleanup_errors,
+            )
+            if write_succeeded and primary_error is None and cleanup_errors:
                 details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
                 raise RuntimeError(f"failed to shut down local write resources: {details}") from cleanup_errors[0]

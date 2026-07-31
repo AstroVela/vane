@@ -1570,7 +1570,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    });
 	    },
 	    py::arg("base_path"), py::arg("run_id"), py::arg("conn") = py::none(),
-	    "Explicitly discard a direct-write COPY run and verify that it is safe to retry.");
+	    "Explicitly discard a shared-storage direct-write COPY run and verify that it is safe to retry.");
 
 	m.def(
 	    "register_copy_direct_write_run_lifecycle",

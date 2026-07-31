@@ -92,6 +92,33 @@ def test_local_runner_rejects_unknown_native_copy_outcome():
         raise AssertionError("local runner must reject an unknown COPY outcome")
 
 
+def test_local_runner_records_cleanup_failures_on_unknown_copy_outcome():
+    from duckdb.runners import CopyOutcomeUnknownError
+    from duckdb.runners.local.runner import _record_unknown_copy_cleanup_errors
+
+    error = CopyOutcomeUnknownError(
+        "local-copy",
+        "s3://bucket/out",
+        "run-local-unknown",
+        cleanup_warnings=("native cleanup warning",),
+    )
+
+    recorded = _record_unknown_copy_cleanup_errors(
+        error,
+        "local write resource shutdown",
+        [RuntimeError("backend join timed out"), ValueError("fragment close failed")],
+    )
+
+    assert recorded is True
+    assert error.cleanup_warnings == (
+        "native cleanup warning",
+        "local write resource shutdown failed: RuntimeError: backend join timed out",
+        "local write resource shutdown failed: ValueError: fragment close failed",
+    )
+    assert "backend join timed out" in str(error)
+    assert error.safe_to_retry is False
+
+
 def test_local_runner_rejects_invalid_num_workers():
     from duckdb.runners.local import _normalize_num_workers
     from duckdb.runners.local.runner import _normalize_num_workers as normalize_runner

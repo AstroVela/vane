@@ -2027,7 +2027,7 @@ def test_cleanup_uncommitted_copy_direct_write_run_public_api(tmp_path):
     assert (committed_commit_dir / "committed").exists()
 
 
-def test_inspect_and_force_abort_copy_direct_write_run_public_api(tmp_path):
+def test_inspect_and_force_abort_copy_direct_write_run_rejects_node_local_output(tmp_path):
     from duckdb.runners.ray import (
         force_abort_copy_direct_write_run,
         inspect_copy_direct_write_run,
@@ -2049,17 +2049,14 @@ def test_inspect_and_force_abort_copy_direct_write_run_public_api(tmp_path):
     assert len(inspection["files"]) == 1
     assert inspection["copy_output_run_id"] == run_id
 
-    aborted = force_abort_copy_direct_write_run(base_path, run_id, conn=conn)
-
-    assert aborted["state"] == "ABORTED"
-    assert aborted["safe_to_retry"] is True
-    assert aborted["copy_output_run_id"] == run_id
-    assert not run_dir.exists()
-    assert not commit_dir.exists()
+    with pytest.raises(ValueError, match="cannot prove node-local worker output was removed"):
+        force_abort_copy_direct_write_run(base_path, run_id, conn=conn)
 
     after = inspect_copy_direct_write_run(base_path, run_id, conn=conn)
-    assert after["state"] == "UNCOMMITTED"
+    assert after["state"] == "COMMITTED"
     assert after["safe_to_retry"] is False
+    assert run_dir.exists()
+    assert commit_dir.exists()
 
 
 def test_copy_direct_write_recovery_helpers_are_exported():

@@ -917,6 +917,7 @@ def test_query_driver_concurrent_startup_failure_preserves_unknown_copy_outcome(
             asyncio.run(_run_actor_copy_plan(runner, logical_plan))
         assert error.value.run_id == "run-startup-unknown"
         assert any("injected concurrent COPY startup failure" in warning for warning in error.value.cleanup_warnings)
+        assert "injected concurrent COPY startup failure" in str(error.value)
         assert error.value.safe_to_retry is False
 
     assert plan_calls == 1

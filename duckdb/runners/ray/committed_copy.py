@@ -45,8 +45,8 @@ def inspect_copy_direct_write_run(
     """Inspect a direct-write COPY run without changing its storage state.
 
     ``UNCOMMITTED`` is an observation, not proof that a prior marker write
-    failed. Only ``force_abort_copy_direct_write_run`` can return
-    ``safe_to_retry=True``.
+    failed. A successful shared-storage
+    ``force_abort_copy_direct_write_run`` can return ``safe_to_retry=True``.
     """
     import duckdb
 
@@ -61,11 +61,14 @@ def force_abort_copy_direct_write_run(
 ) -> dict[str, Any]:
     """Discard one direct-write COPY run after an operator chooses data loss.
 
-    The native operation removes the committed marker first, deletes only
-    output owned by ``run_id``, removes its metadata, and verifies the marker
-    remains absent. A raised exception means the run is not safe to retry.
-    This is operator-driven recovery, not an exactly-once fence: call it only
-    after the originating COPY has terminated and do not race another writer.
+    The native operation is available only when worker output is on shared
+    remote storage. It removes the committed marker first, deletes only output
+    owned by ``run_id``, removes its metadata, and verifies the marker remains
+    absent. Node-local output requires cleanup on every worker and is rejected
+    without changing its marker or lifecycle record. A raised exception means
+    the run is not safe to retry. This is operator-driven recovery, not an
+    exactly-once fence: call it only after the originating COPY has terminated
+    and do not race another writer.
     """
     import duckdb
 

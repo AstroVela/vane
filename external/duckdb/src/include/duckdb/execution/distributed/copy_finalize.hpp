@@ -989,7 +989,7 @@ ReadCommittedDistributedCopyDirectWriteResult(FileSystem &fs, const std::string 
 			    "distributed COPY direct-write committed manifest file is outside run output: \"%s\"",
 			    info.final_path)));
 		}
-		auto validate_res = ValidateDistributedCopyFinalFile(fs, info);
+		auto validate_res = ValidateDistributedCopyDirectWriteFinalFile(fs, info);
 		if (validate_res.is_err()) {
 			return DuckDBResult<DistributedCopyResult>::err(validate_res.error());
 		}
@@ -1498,6 +1498,11 @@ ForceAbortDistributedCopyDirectWriteRun(FileSystem &fs, const std::string &base_
 		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(lifecycle_res.error());
 	}
 	auto worker_base_path = std::move(lifecycle_res).value().worker_base_path;
+	if (!FileSystem::IsRemoteFile(worker_base_path)) {
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(DuckDBError::invalid_state_error(
+		    "direct-write force abort cannot prove node-local worker output was removed; "
+		    "clean the run on every worker before retrying"));
+	}
 
 	try {
 		fs.RemoveFile(commit_paths.committed_marker_path);
@@ -1987,9 +1992,10 @@ inline DuckDBResult<DistributedCopyResult> FinalizeCopyFiles(const DistributedCo
 				auto marker_error = std::string(marker_res.error().what());
 				auto committed_res = ReadCommittedDistributedCopyDirectWriteResult(fs, base_path, direct_write_run_id);
 				if (committed_res.is_ok()) {
-					auto cleanup_ms = result.cleanup_ms;
-					result = std::move(committed_res).value();
-					result.cleanup_ms = cleanup_ms;
+					// Readback proves the marker and persisted manifest. Keep the
+					// in-memory result because the manifest intentionally omits
+					// format-specific file metadata.
+					AttachDistributedCopyCommitInfo(result, commit_paths, base_path, direct_write_run_id, true, true);
 				} else {
 					AttachDistributedCopyCommitInfo(result, commit_paths, base_path, direct_write_run_id, true, false);
 					result.output_outcome_unknown = true;

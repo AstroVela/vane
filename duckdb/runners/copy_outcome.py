@@ -28,6 +28,9 @@ class CopyOutcomeUnknownError(RuntimeError):
         self.detail = str(detail)
         self.cleanup_warnings = tuple(str(warning) for warning in cleanup_warnings)
         self.safe_to_retry = False
+        super().__init__(self._build_message())
+
+    def _build_message(self) -> str:
         message = (
             f"COPY outcome is unknown for operation {self.operation_id}; "
             "refusing to resubmit a potentially committed write"
@@ -37,8 +40,17 @@ class CopyOutcomeUnknownError(RuntimeError):
         if self.detail:
             message += f"; {self.detail}"
         if self.base_path and self.run_id:
-            message += "; inspect or explicitly abort this run before deciding whether to retry"
-        super().__init__(message)
+            message += "; inspect and explicitly resolve this run before deciding whether to retry"
+        if self.cleanup_warnings:
+            message += "; cleanup also failed: " + "; ".join(self.cleanup_warnings)
+        return message
+
+    def add_cleanup_warnings(self, *warnings: str) -> None:
+        additions = tuple(str(warning) for warning in warnings if str(warning))
+        if not additions:
+            return
+        self.cleanup_warnings += additions
+        self.args = (self._build_message(),)
 
     @classmethod
     def from_native_result(
