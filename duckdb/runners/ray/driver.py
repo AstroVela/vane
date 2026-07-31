@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import math
 import os
 import sys
@@ -125,6 +127,16 @@ class QueryExecutionCleanupError(RuntimeError):
             primary_error=primary_error,
             cleanup_errors=cleanup,
         )
+
+
+@dataclass(frozen=True)
+class _TaskTerminalControl:
+    """Compact driver-lifetime proof for one terminal task request."""
+
+    identity_fingerprint: bytes
+    lease_fingerprint: bytes | None
+    status: str
+    blocked_reason: str
 
 
 def _client_owner_lease_settings() -> tuple[float, float]:
@@ -1278,6 +1290,11 @@ class RayQueryDriverActor:
         self._query_task_lease_request_tombstones = BoundedReplayMap[str, dict[str, Any]](
             capacity=_LEASE_REQUEST_REPLAY_CAPACITY
         )
+        # Full replay payloads are bounded, but terminal control identity must
+        # remain exact for the actor lifetime. Otherwise a lost response can
+        # become unacknowledgeable after tombstone eviction.
+        self._query_task_terminal_controls: dict[bytes, _TaskTerminalControl] = {}
+        self._query_task_terminal_attempts: set[bytes] = set()
         self._query_output_lease_request_tombstones = BoundedReplayMap[str, dict[str, Any]](
             capacity=_LEASE_REQUEST_REPLAY_CAPACITY
         )
@@ -2453,6 +2470,10 @@ class RayQueryDriverActor:
                 getattr(task_tombstones, "items", lambda: ())(),
                 capacity=_LEASE_REQUEST_REPLAY_CAPACITY,
             )
+        if not hasattr(self, "_query_task_terminal_controls"):
+            self._query_task_terminal_controls = {}
+        if not hasattr(self, "_query_task_terminal_attempts"):
+            self._query_task_terminal_attempts = set()
         output_tombstones = getattr(self, "_query_output_lease_request_tombstones", ())
         if not isinstance(output_tombstones, BoundedReplayMap):
             self._query_output_lease_request_tombstones = BoundedReplayMap(
@@ -2816,6 +2837,112 @@ class RayQueryDriverActor:
         elif not target_loop.is_closed():
             target_loop.call_soon_threadsafe(_complete)
 
+    @staticmethod
+    def _task_identity_fingerprint(identity: dict[str, Any]) -> bytes:
+        encoded = json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).digest()
+
+    @staticmethod
+    def _task_lease_fingerprint(lease_id: str, attempt_id: str) -> bytes:
+        encoded = json.dumps(
+            [str(lease_id), str(attempt_id)],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).digest()
+
+    @staticmethod
+    def _task_request_fingerprint(request_id: str) -> bytes:
+        return hashlib.sha256(str(request_id).encode("utf-8")).digest()
+
+    @classmethod
+    def _task_attempt_fingerprint(cls, identity: dict[str, Any]) -> bytes:
+        return cls._task_identity_fingerprint(
+            {
+                "query_id": str(identity["query_id"]),
+                "task_id": str(identity["task_id"]),
+                "attempt_id": str(identity["attempt_id"]),
+            }
+        )
+
+    @staticmethod
+    def _task_resource_identity(identity: dict[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(identity["query_id"]),
+            str(identity["task_id"]),
+            str(identity["attempt_id"]),
+        )
+
+    def _store_task_terminal_control(
+        self,
+        *,
+        request_id: str,
+        identity: dict[str, Any],
+        lease: dict[str, Any] | None,
+        status: str,
+        result: dict[str, Any],
+    ) -> None:
+        request_key = str(request_id)
+        request_fingerprint = self._task_request_fingerprint(request_key)
+        control = _TaskTerminalControl(
+            identity_fingerprint=self._task_identity_fingerprint(identity),
+            lease_fingerprint=(
+                None
+                if lease is None
+                else self._task_lease_fingerprint(
+                    str(lease["lease_id"]),
+                    str(lease["attempt_id"]),
+                )
+            ),
+            status=str(status),
+            blocked_reason=str(result.get("blocked_reason") or "task_request_terminal"),
+        )
+        existing = self._query_task_terminal_controls.get(request_fingerprint)
+        if existing is not None and existing != control:
+            raise RuntimeError(f"task terminal control identity changed: {request_key}")
+        self._query_task_terminal_controls[request_fingerprint] = control
+        if str(status) != "failed":
+            self._query_task_terminal_attempts.add(
+                self._task_attempt_fingerprint(identity),
+            )
+
+    def _task_terminal_control_for_identity(
+        self,
+        request_id: str,
+        identity: dict[str, Any],
+    ) -> _TaskTerminalControl | None:
+        control = self._query_task_terminal_controls.get(self._task_request_fingerprint(request_id))
+        if control is None:
+            return None
+        if control.identity_fingerprint != self._task_identity_fingerprint(identity):
+            raise ValueError(f"task lease request_id reused with different identity: {request_id}")
+        return control
+
+    def _task_terminal_lease_matches(
+        self,
+        request_id: str,
+        *,
+        lease_id: str,
+        attempt_id: str,
+        status: str | None = None,
+    ) -> bool:
+        control = self._query_task_terminal_controls.get(self._task_request_fingerprint(request_id))
+        return bool(
+            control is not None
+            and control.lease_fingerprint
+            == self._task_lease_fingerprint(
+                lease_id,
+                attempt_id,
+            )
+            and (status is None or control.status == status)
+        )
+
     def _retire_query_lease_request(
         self,
         *,
@@ -2847,6 +2974,13 @@ class RayQueryDriverActor:
             if output_owners.get(output_owner_key) == str(request_id):
                 output_owners.pop(output_owner_key, None)
         else:
+            self._store_task_terminal_control(
+                request_id=str(request_id),
+                identity=dict(identity),
+                lease=dict(lease) if isinstance(lease, dict) else None,
+                status=str(status),
+                result=terminal_result,
+            )
             task_owner_key = (
                 str(identity["query_id"]),
                 str(identity["task_id"]),
@@ -3164,10 +3298,11 @@ class RayQueryDriverActor:
         request = OutputBlockRequest(**values)
         return request_id, request, asdict(request)
 
-    async def acquire_query_task_lease(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Resolve one task lease through the query's serialized admission pump."""
-        from duckdb.runners.ray.query_resource_manager import TaskGrant, TaskRequest
-        from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
+    def _parse_task_lease_request(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[str, Any, dict[str, Any]]:
+        from duckdb.runners.ray.query_resource_manager import TaskRequest
 
         values = self._strict_lease_request(
             payload,
@@ -3187,7 +3322,36 @@ class RayQueryDriverActor:
         raw_resources = values.pop("resources")
         request = TaskRequest(**values)
         identity = {**asdict(request), "resources": dict(raw_resources)}
+        return request_id, request, identity
+
+    async def acquire_query_task_lease(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Resolve one task lease through the query's serialized admission pump."""
+        from duckdb.runners.ray.query_resource_manager import TaskGrant
+        from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
+
+        request_id, request, identity = self._parse_task_lease_request(payload)
+        raw_resources = identity["resources"]
         self._ensure_query_resource_admission_state()
+        terminal_control = self._task_terminal_control_for_identity(
+            request_id,
+            identity,
+        )
+        if terminal_control is not None:
+            return self._grant_payload(
+                TaskGrant(
+                    False,
+                    blocked_reason=terminal_control.blocked_reason,
+                    fatal=True,
+                )
+            )
+        if self._task_attempt_fingerprint(identity) in self._query_task_terminal_attempts:
+            return self._grant_payload(
+                TaskGrant(
+                    False,
+                    blocked_reason="attempt_terminal",
+                    fatal=True,
+                )
+            )
         tombstone = self._query_task_lease_request_tombstones.get(request_id)
         if tombstone is not None and tombstone["identity"] != identity:
             raise ValueError(f"task lease request_id reused with different identity: {request_id}")
@@ -3218,11 +3382,7 @@ class RayQueryDriverActor:
                 raise RuntimeError(f"invalid task lease request state: {status}")
             return await asyncio.shield(existing["future"])
 
-        resource_identity = (
-            str(identity["query_id"]),
-            str(identity["task_id"]),
-            str(identity["attempt_id"]),
-        )
+        resource_identity = self._task_resource_identity(identity)
         conflicting_owner = self._query_task_request_owner_by_identity.get(resource_identity)
         if conflicting_owner is not None:
             raise ValueError(
@@ -3243,6 +3403,13 @@ class RayQueryDriverActor:
                 "status": "failed",
                 "result": denial,
             }
+            self._store_task_terminal_control(
+                request_id=request_id,
+                identity=identity,
+                lease=None,
+                status="failed",
+                result=denial,
+            )
             return dict(denial)
 
         future = asyncio.get_running_loop().create_future()
@@ -3284,23 +3451,6 @@ class RayQueryDriverActor:
         lease = state.get("lease") or {}
         return str(lease.get("lease_id") or "") == str(lease_id) and str(lease.get("attempt_id") or "") == str(
             attempt_id
-        )
-
-    @classmethod
-    def _query_task_lease_replay_matches(
-        cls,
-        tombstone: dict[str, Any] | None,
-        *,
-        lease_id: str,
-        attempt_id: str,
-    ) -> bool:
-        return bool(
-            tombstone is not None
-            and cls._query_task_lease_matches(
-                tombstone,
-                lease_id,
-                attempt_id,
-            )
         )
 
     def _retire_query_task_lease_record(
@@ -3480,10 +3630,9 @@ class RayQueryDriverActor:
         with self._query_task_lease_condition:
             state = self._query_task_lease_requests.get(request_key)
             if state is None:
-                tombstone = self._query_task_lease_request_tombstones.get(request_key)
                 return {
-                    "scheduled": self._query_task_lease_replay_matches(
-                        tombstone,
+                    "scheduled": self._task_terminal_lease_matches(
+                        request_key,
                         lease_id=lease_id,
                         attempt_id=attempt_id,
                     )
@@ -3542,16 +3691,12 @@ class RayQueryDriverActor:
         with self._query_task_lease_condition:
             state = self._query_task_lease_requests.get(request_key)
             if state is None:
-                tombstone = self._query_task_lease_request_tombstones.get(request_key)
                 return {
-                    "handed_off": bool(
-                        tombstone is not None
-                        and tombstone.get("status") == "released_by_teardown"
-                        and self._query_task_lease_replay_matches(
-                            tombstone,
-                            lease_id=lease_id,
-                            attempt_id=attempt_id,
-                        )
+                    "handed_off": self._task_terminal_lease_matches(
+                        request_key,
+                        lease_id=lease_id,
+                        attempt_id=attempt_id,
+                        status="released_by_teardown",
                     )
                 }
             if not self._query_task_lease_matches(
@@ -3616,20 +3761,73 @@ class RayQueryDriverActor:
 
     async def cancel_query_task_lease_request(
         self,
-        request_id: str,
+        payload: dict[str, Any],
     ) -> dict[str, Any]:
         from duckdb.runners.ray.query_resource_manager import TaskGrant
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
+        request_id, request, identity = self._parse_task_lease_request(payload)
         self._ensure_query_resource_admission_state()
         request_key = str(request_id)
         with self._query_task_lease_condition:
+            terminal_control = self._task_terminal_control_for_identity(
+                request_key,
+                identity,
+            )
+            if terminal_control is not None:
+                return {"cancelled": True, "released": False}
+            if self._task_attempt_fingerprint(identity) in self._query_task_terminal_attempts:
+                raise ValueError(
+                    "task attempt is already terminal under another request_id: "
+                    f"query_id={request.query_id} task_id={request.task_id} "
+                    f"attempt_id={request.attempt_id}"
+                )
             state = self._query_task_lease_requests.get(request_key)
             if state is None:
-                return {
-                    "cancelled": request_key in self._query_task_lease_request_tombstones,
-                    "released": False,
+                resource_identity = self._task_resource_identity(identity)
+                conflicting_owner = self._query_task_request_owner_by_identity.get(resource_identity)
+                if conflicting_owner is not None:
+                    raise ValueError(
+                        "task attempt is already owned by request_id "
+                        f"{conflicting_owner}: query_id={request.query_id} "
+                        f"task_id={request.task_id} attempt_id={request.attempt_id}"
+                    )
+                denial = self._grant_payload(
+                    TaskGrant(
+                        False,
+                        blocked_reason="task_lease_request_cancelled",
+                        fatal=True,
+                    )
+                )
+                try:
+                    manager = get_query_resource_manager(request.query_id)
+                    manager.remove_task_waiter(
+                        str(request.task_id),
+                        str(request.attempt_id),
+                    )
+                    manager.mark_task_attempt_terminal(
+                        str(request.task_id),
+                        str(request.attempt_id),
+                    )
+                except KeyError:
+                    pass
+                self._query_task_lease_request_tombstones[request_key] = {
+                    "identity": identity,
+                    "status": "cancelled",
+                    "result": denial,
                 }
+                self._store_task_terminal_control(
+                    request_id=request_key,
+                    identity=identity,
+                    lease=None,
+                    status="cancelled",
+                    result=denial,
+                )
+                if str(request.query_id) not in self._query_resource_closing_queries:
+                    self._run_query_resource_admission_pumps(request.query_id)
+                return {"cancelled": True, "released": False}
+            if state["identity"] != identity:
+                raise ValueError(f"task lease request_id reused with different identity: {request_key}")
             status = str(state.get("status") or "")
             if status in {"completion_wait", "teardown_wait"}:
                 # A submitted task can only retire through its selected
@@ -3691,10 +3889,9 @@ class RayQueryDriverActor:
         with self._query_task_lease_condition:
             state = self._query_task_lease_requests.get(request_key)
             if state is None:
-                tombstone = self._query_task_lease_request_tombstones.get(request_key)
                 return {
-                    "released": self._query_task_lease_replay_matches(
-                        tombstone,
+                    "released": self._task_terminal_lease_matches(
+                        request_key,
                         lease_id=lease_id,
                         attempt_id=attempt_id,
                     )

@@ -311,14 +311,6 @@ def _assert_no_udf_direct_output_conversion():
     return counters
 
 
-@pytest.fixture(autouse=True)
-def _stop_native_udf_dispatcher_after_test():
-    yield
-    import _duckdb
-
-    _duckdb._shutdown_udf_executor_dispatcher()
-
-
 def test_execute_native_rejects_ray_scalar_without_registered_query_graph(tmp_path, monkeypatch):
     pytest.importorskip("pyarrow")
     pytest.importorskip("ray")

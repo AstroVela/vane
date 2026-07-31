@@ -331,7 +331,7 @@ def test_driver_resource_change_evaluates_only_the_selected_task_waiter():
                 continue
             await runner_cls.cancel_query_task_lease_request(
                 runner,
-                request["request_id"],
+                request,
             )
         await asyncio.gather(*pending_tasks)
         granted_request = pending_requests[pending_tasks.index(granted_task)]
@@ -410,7 +410,7 @@ def test_driver_pending_task_lease_can_be_cancelled_without_a_polling_wakeup():
 
         cancelled = await runner_cls.cancel_query_task_lease_request(
             runner,
-            pending_request["request_id"],
+            pending_request,
         )
         assert cancelled == {"cancelled": True, "released": False}
         denial = await asyncio.wait_for(pending, timeout=1)
@@ -490,7 +490,7 @@ def test_submitted_task_lease_is_released_only_after_remote_completion(completio
         ) == {"released": False}
         assert await runner_cls.cancel_query_task_lease_request(
             runner,
-            active_request["request_id"],
+            active_request,
         ) == {"cancelled": False, "released": False}
 
         if completion_error is None:
@@ -725,7 +725,7 @@ def test_missing_completion_contract_requires_explicit_teardown_ownership(
             ) == {"released": False}
             assert await runner_cls.cancel_query_task_lease_request(
                 runner,
-                request["request_id"],
+                request,
             ) == {"cancelled": False, "released": False}
             completion = Future()
             assert await runner_cls.release_query_task_lease_after_completion(
@@ -742,6 +742,7 @@ def test_missing_completion_contract_requires_explicit_teardown_ownership(
         assert lease["lease_id"] in manager.snapshot()["task_leases"]
         tombstone = runner._query_task_lease_request_tombstones[request["request_id"]]
         assert tombstone["status"] == "released_by_teardown"
+        runner._query_task_lease_request_tombstones.clear()
         assert await runner_cls.handoff_query_task_lease_to_teardown(
             runner,
             request["request_id"],
@@ -1272,7 +1273,7 @@ def test_task_attempt_rejects_a_second_request_id_instead_of_orphaning_future():
 
         assert await runner_cls.cancel_query_task_lease_request(
             runner,
-            first_request["request_id"],
+            first_request,
         ) == {"cancelled": True, "released": False}
         denial = await first_waiter
         assert denial["blocked_reason"] == "task_lease_request_cancelled"
@@ -1444,6 +1445,95 @@ def test_terminal_task_and_output_requests_are_idempotent_for_query_lifetime():
     asyncio.run(scenario())
 
 
+def test_terminal_control_ack_survives_bounded_replay_payload_eviction():
+    async def scenario():
+        query_id = "query-terminal-control-after-eviction"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_graph(
+            graph,
+            _allocation(),
+            on_change=lambda: runner_cls._signal_query_resource_change(
+                runner,
+                query_id,
+            ),
+        )
+        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+
+        task_request = _task_request(
+            query_id,
+            "request:terminal-task-after-eviction",
+            "task:terminal-after-eviction",
+        )
+        task = await runner_cls.acquire_query_task_lease(runner, task_request)
+
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            task["lease"]["lease_id"],
+            task["lease"]["attempt_id"],
+        ) == {"released": True}
+
+        runner._query_task_lease_request_tombstones.clear()
+
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            "wrong-lease",
+            task["lease"]["attempt_id"],
+        ) == {"released": False}
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            task["lease"]["lease_id"],
+            task["lease"]["attempt_id"],
+        ) == {"released": True}
+        assert await runner_cls.release_query_task_lease_after_completion(
+            runner,
+            task_request["request_id"],
+            task["lease"]["lease_id"],
+            task["lease"]["attempt_id"],
+            [SimpleNamespace(future=lambda: Future())],
+        ) == {"scheduled": True}
+        assert await runner_cls.handoff_query_task_lease_to_teardown(
+            runner,
+            task_request["request_id"],
+            task["lease"]["lease_id"],
+            task["lease"]["attempt_id"],
+        ) == {"handed_off": False}
+        conflicting_terminal_cancel = dict(task_request)
+        conflicting_terminal_cancel["request_id"] = "request:conflicting-terminal-cancel"
+        with pytest.raises(ValueError, match="already terminal under another request_id"):
+            await runner_cls.cancel_query_task_lease_request(
+                runner,
+                conflicting_terminal_cancel,
+            )
+        unseen_request = _task_request(
+            query_id,
+            "request:never-admitted",
+            "task:never-admitted",
+        )
+        assert await runner_cls.cancel_query_task_lease_request(
+            runner,
+            unseen_request,
+        ) == {"cancelled": True, "released": False}
+        unseen_denial = await runner_cls.acquire_query_task_lease(
+            runner,
+            unseen_request,
+        )
+        assert unseen_denial["granted"] is False
+        assert unseen_denial["blocked_reason"] == "task_lease_request_cancelled"
+        mismatched_unseen = dict(unseen_request)
+        mismatched_unseen["task_id"] = "task:mismatched-never-admitted"
+        with pytest.raises(ValueError, match="reused with different identity"):
+            await runner_cls.cancel_query_task_lease_request(
+                runner,
+                mismatched_unseen,
+            )
+
+    asyncio.run(scenario())
+
+
 def test_cancelled_admission_request_replay_returns_the_same_terminal_denial():
     async def scenario():
         query_id = "query-cancelled-request-replay"
@@ -1475,9 +1565,19 @@ def test_cancelled_admission_request_replay_returns_the_same_terminal_denial():
             await asyncio.sleep(0)
         assert not original_waiter.done()
 
+        conflicting_cancel = dict(cancelled_request)
+        conflicting_cancel["request_id"] = "request:conflicting-cancel"
+        with pytest.raises(ValueError, match="already owned by request_id request:cancelled"):
+            await runner_cls.cancel_query_task_lease_request(
+                runner,
+                conflicting_cancel,
+            )
+        assert not original_waiter.done()
+        assert manager.snapshot()["stages"][graph.stages[0].stage_id]["pending_task_count"] == 1
+
         assert await runner_cls.cancel_query_task_lease_request(
             runner,
-            cancelled_request["request_id"],
+            cancelled_request,
         ) == {"cancelled": True, "released": False}
         original_denial = await original_waiter
         replay_denial = await runner_cls.acquire_query_task_lease(

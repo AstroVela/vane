@@ -3,10 +3,14 @@
 
 from __future__ import annotations
 
+import gc
+import threading
+import weakref
 from concurrent.futures import Future
 
 import pytest
 
+import duckdb.execution.udf_task_admission as task_admission
 from duckdb.execution.udf_admission import (
     LocalExecutionSlotPool,
     LocalSlotAdmissionAuthority,
@@ -35,6 +39,12 @@ class _ObjectRef:
         self._future.set_result(value)
 
 
+def _resolved_ref(value):
+    ref = _ObjectRef()
+    ref.resolve(value)
+    return ref
+
+
 class _FailingObjectRef:
     def __init__(self, *, callback=False):
         self._callback = callback
@@ -55,7 +65,9 @@ class _Driver:
     def __init__(self):
         self.requests: list[_ObjectRef] = []
         self.acquire_query_task_lease = _RemoteMethod(self._acquire)
-        self.cancel_query_task_lease_request = _RemoteMethod(lambda *_args, **_kwargs: None)
+        self.cancel_query_task_lease_request = _RemoteMethod(
+            lambda *_args, **_kwargs: _resolved_ref({"cancelled": True})
+        )
 
     def _acquire(self, _request):
         ref = _ObjectRef()
@@ -95,7 +107,7 @@ def test_task_admission_setup_failure_cancels_the_remote_request(callback):
     request = driver.acquire_query_task_lease.calls[0][0][0]
     assert controller.state()["state"] == "failed"
     assert driver.cancel_query_task_lease_request.calls == [
-        ((request["request_id"],), {}),
+        ((request,), {}),
     ]
 
 
@@ -207,12 +219,11 @@ def test_task_admission_close_cancels_pending_and_ready_leases():
     pending.close()
 
     assert pending.state()["state"] == "closed"
-    assert pending_driver.cancel_query_task_lease_request.calls == [((pending_request["request_id"],), {})]
+    assert pending_driver.cancel_query_task_lease_request.calls == [((pending_request,), {})]
 
     pending_driver.requests[0].resolve(_grant(pending_request))
     assert pending_driver.cancel_query_task_lease_request.calls == [
-        ((pending_request["request_id"],), {}),
-        ((pending_request["request_id"],), {}),
+        ((pending_request,), {}),
     ]
 
     ready_driver = _Driver()
@@ -224,7 +235,23 @@ def test_task_admission_close_cancels_pending_and_ready_leases():
     ready.close()
 
     assert ready.state()["state"] == "closed"
-    assert ready_driver.cancel_query_task_lease_request.calls == [((ready_request["request_id"],), {})]
+    assert ready_driver.cancel_query_task_lease_request.calls == [((ready_request,), {})]
+
+
+def test_pending_admission_future_does_not_retain_closed_controller():
+    driver = _Driver()
+    controller = TaskAdmissionController(_payload(), driver=driver)
+    assert controller.request(32)
+    request = driver.acquire_query_task_lease.calls[0][0][0]
+    controller_ref = weakref.ref(controller)
+
+    controller.close()
+    del controller
+    gc.collect()
+
+    assert controller_ref() is None
+    driver.requests[0].resolve(_grant(request))
+    assert driver.cancel_query_task_lease_request.calls == [((request,), {})]
 
 
 def test_taken_task_admission_abandons_if_submission_never_takes_ownership():
@@ -238,7 +265,62 @@ def test_taken_task_admission_abandons_if_submission_never_takes_ownership():
     admission.release()
     admission.release()
 
-    assert driver.cancel_query_task_lease_request.calls == [((request["request_id"],), {})]
+    assert driver.cancel_query_task_lease_request.calls == [((request,), {})]
+
+
+def test_task_admission_cancellation_retries_until_driver_acknowledges():
+    driver = _Driver()
+    acknowledged = threading.Event()
+    attempts = 0
+
+    def cancel(_request_id):
+        nonlocal attempts
+        attempts += 1
+        response = _ObjectRef()
+        if attempts == 1:
+            response._future.set_exception(RuntimeError("planned transient cancellation failure"))
+        else:
+            response.resolve({"cancelled": True})
+            acknowledged.set()
+        return response
+
+    driver.cancel_query_task_lease_request = _RemoteMethod(cancel)
+    controller = TaskAdmissionController(_payload(), driver=driver)
+    assert controller.request(24)
+
+    controller.close()
+
+    assert acknowledged.wait(timeout=1.0)
+    assert len(driver.cancel_query_task_lease_request.calls) == 2
+
+
+def test_task_admission_cancellation_retries_a_hung_response(monkeypatch):
+    monkeypatch.setattr(
+        task_admission,
+        "_TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_S",
+        0.01,
+    )
+    driver = _Driver()
+    acknowledged = threading.Event()
+    first_response = _ObjectRef()
+
+    def cancel(_request):
+        if not driver.cancel_query_task_lease_request.calls:
+            raise AssertionError("remote call must be recorded before dispatch")
+        if len(driver.cancel_query_task_lease_request.calls) == 1:
+            return first_response
+        acknowledged.set()
+        return _resolved_ref({"cancelled": True})
+
+    driver.cancel_query_task_lease_request = _RemoteMethod(cancel)
+    controller = TaskAdmissionController(_payload(), driver=driver)
+    assert controller.request(24)
+
+    controller.close()
+
+    assert acknowledged.wait(timeout=1.0)
+    assert len(driver.cancel_query_task_lease_request.calls) == 2
+    assert first_response._future.cancelled()
 
 
 def test_local_slot_admission_owns_concrete_slots_and_wakes_one_waiter():

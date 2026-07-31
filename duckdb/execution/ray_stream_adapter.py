@@ -24,6 +24,7 @@ class RayStreamCleanupOperation:
     operation: Callable[[], Any]
     retry_on_error: bool = False
     retry_on_incomplete: bool = False
+    abandon_wait: Callable[[Any], None] | None = None
 
     def __call__(self) -> Any:
         return self.operation()
@@ -32,7 +33,7 @@ class RayStreamCleanupOperation:
 def validate_ray_control_ack(response: Any, *, field: str) -> dict[str, Any]:
     """Require driver acceptance before completing a cleanup ticket."""
     if not isinstance(response, dict) or response.get(field) is not True:
-        raise RuntimeError(f"Ray task lease control handoff was not accepted: {field}")
+        raise RuntimeError(f"Ray UDF control handoff was not accepted: {field}")
     return response
 
 
@@ -177,12 +178,22 @@ class TaskLeaseObjectRefGenerator:
             self._released = True
         return True
 
+    def _abandon_release_task_wait(self, response_future: Any) -> None:
+        with self._lock:
+            if self._release_response_future is response_future:
+                self._release_response_future = None
+        try:
+            response_future.cancel()
+        except BaseException:
+            pass
+
     def release_task_operations(self) -> tuple[RayStreamCleanupOperation, ...]:
         return (
             RayStreamCleanupOperation(
                 self._release_task,
                 retry_on_error=True,
                 retry_on_incomplete=True,
+                abandon_wait=self._abandon_release_task_wait,
             ),
         )
 
@@ -263,6 +274,15 @@ class TaskLeaseObjectRefGenerator:
             self._completion_ref = None
         return True
 
+    def _abandon_task_cleanup_wait(self, response_future: Any) -> None:
+        with self._lock:
+            if self._task_cleanup_response_future is response_future:
+                self._task_cleanup_response_future = None
+        try:
+            response_future.cancel()
+        except BaseException:
+            pass
+
     @property
     def cancellation_started(self) -> bool:
         with self._lock:
@@ -295,6 +315,7 @@ class TaskLeaseObjectRefGenerator:
                 self._handoff_task_completion,
                 retry_on_error=True,
                 retry_on_incomplete=True,
+                abandon_wait=self._abandon_task_cleanup_wait,
             ),
         )
 
@@ -305,6 +326,7 @@ class TaskLeaseObjectRefGenerator:
                 self._handoff_task_completion,
                 retry_on_error=True,
                 retry_on_incomplete=True,
+                abandon_wait=self._abandon_task_cleanup_wait,
             ),
         )
 
@@ -580,6 +602,7 @@ class RayStreamAdapter:
                     partial(self._leased_operation, leased, operation.operation),
                     retry_on_error=operation.retry_on_error,
                     retry_on_incomplete=operation.retry_on_incomplete,
+                    abandon_wait=operation.abandon_wait,
                 )
                 for operation in source_operations
             ]

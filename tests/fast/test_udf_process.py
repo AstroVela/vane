@@ -10,6 +10,255 @@ import pyarrow as pa
 import duckdb
 
 
+def test_native_dispatcher_shutdown_is_terminal():
+    """Process-owner shutdown must reject every later slot registration."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import _duckdb
+        import duckdb
+        import pyarrow as pa
+
+
+        def passthrough(table):
+            return pa.table({"y": table.column(0)})
+
+
+        _duckdb._shutdown_udf_executor_dispatcher()
+        _duckdb._shutdown_udf_executor_dispatcher()
+
+        connection = duckdb.connect()
+        try:
+            relation = connection.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
+                passthrough,
+                schema={"y": duckdb.sqltypes.BIGINT},
+                execution_backend="subprocess_task",
+            )
+            try:
+                relation.fetchall()
+            except BaseException as exc:
+                assert "udf dispatcher has been shut down" in str(exc), str(exc)
+            else:
+                raise AssertionError("dispatcher accepted work after terminal shutdown")
+        finally:
+            connection.close()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+        env={**os.environ},
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_native_dispatcher_concurrent_shutdown_never_reopens():
+    """Register either linearizes before shutdown or observes its terminal fence."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import threading
+
+        import _duckdb
+        import duckdb
+        import pyarrow as pa
+
+
+        def passthrough(table):
+            return pa.table({"y": table.column(0)})
+
+
+        connection = duckdb.connect()
+        relation = connection.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
+            passthrough,
+            schema={"y": duckdb.sqltypes.BIGINT},
+            execution_backend="subprocess_task",
+        )
+        barrier = threading.Barrier(3)
+        query_errors = []
+        shutdown_errors = []
+
+
+        def run_query():
+            barrier.wait()
+            try:
+                relation.fetchall()
+            except BaseException as exc:
+                query_errors.append(exc)
+
+
+        def run_shutdown():
+            barrier.wait()
+            try:
+                _duckdb._shutdown_udf_executor_dispatcher()
+            except BaseException as exc:
+                shutdown_errors.append(exc)
+
+
+        query_thread = threading.Thread(target=run_query)
+        shutdown_thread = threading.Thread(target=run_shutdown)
+        query_thread.start()
+        shutdown_thread.start()
+        barrier.wait()
+        query_thread.join(timeout=10)
+        shutdown_thread.join(timeout=10)
+        assert not query_thread.is_alive(), "query raced shutdown without terminating"
+        assert not shutdown_thread.is_alive(), "dispatcher shutdown deadlocked with Register"
+        assert not shutdown_errors, shutdown_errors
+        connection.close()
+
+        final_connection = duckdb.connect()
+        try:
+            final_relation = final_connection.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
+                passthrough,
+                schema={"y": duckdb.sqltypes.BIGINT},
+                execution_backend="subprocess_task",
+            )
+            try:
+                final_relation.fetchall()
+            except BaseException as exc:
+                assert "udf dispatcher has been shut down" in str(exc), str(exc)
+            else:
+                raise AssertionError("concurrent Register reopened the dispatcher after shutdown")
+        finally:
+            final_connection.close()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env={**os.environ},
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_native_dispatcher_shutdown_closes_active_executor():
+    """Terminal shutdown must close Python ownership before it returns."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import threading
+
+        import _duckdb
+        import duckdb
+        import duckdb.execution.udf as udf_exec
+        import pyarrow as pa
+
+        submitted = threading.Event()
+        closed = threading.Event()
+
+
+        class FakeExecutor:
+            def __init__(self):
+                self._wakeup = None
+                self._retained_input_bytes = 0
+                self._admission_state = "idle"
+
+            def register_wakeup(self, callback):
+                self._wakeup = callback
+
+            def request_task_admission(self, retained_input_bytes):
+                self._retained_input_bytes = int(retained_input_bytes)
+                self._admission_state = "ready"
+                return True
+
+            def task_admission_state(self):
+                return {
+                    "state": self._admission_state,
+                    "available": self._admission_state == "ready",
+                    "retained_input_bytes": self._retained_input_bytes,
+                }
+
+            def submit_with_id(self, _submit_id, _table):
+                self._admission_state = "idle"
+                submitted.set()
+
+            def take_ready_result(self):
+                return None
+
+            def finished_submitting(self):
+                return None
+
+            def all_tasks_finished(self):
+                return False
+
+            def close(self):
+                closed.set()
+
+
+        def build_executor(_payload, options=None):
+            del options
+            return FakeExecutor()
+
+
+        def passthrough(table):
+            return pa.table({"y": table.column(0)})
+
+
+        udf_exec.build_executor = build_executor
+        connection = duckdb.connect()
+        relation = connection.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
+            passthrough,
+            schema={"y": duckdb.sqltypes.BIGINT},
+            execution_backend="subprocess_task",
+        )
+        query_errors = []
+
+
+        def run_query():
+            try:
+                relation.fetchall()
+            except BaseException as exc:
+                query_errors.append(exc)
+
+
+        query_thread = threading.Thread(target=run_query)
+        query_thread.start()
+        try:
+            assert submitted.wait(timeout=5), "query never submitted to the fake executor"
+            _duckdb._shutdown_udf_executor_dispatcher()
+            assert closed.is_set(), "shutdown returned before closing the active executor"
+            query_thread.join(timeout=5)
+            assert not query_thread.is_alive(), "active query did not observe terminal shutdown"
+            assert query_errors, "active query unexpectedly succeeded during terminal shutdown"
+            assert "shutdown interrupted active execution" in str(query_errors[0]), query_errors[0]
+        finally:
+            query_thread.join(timeout=5)
+            connection.close()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+        env={**os.environ},
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_unregister_timeout_detaches_stale_dispatcher_work():
     """A timed-out slot must not retain its context or poison later UDFs."""
     import os
@@ -174,7 +423,8 @@ def test_unregister_timeout_detaches_stale_dispatcher_work():
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped():
+@pytest.mark.parametrize("failure_phase", ["cancel", "pending", "retire"])
+def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped(failure_phase):
     """A Ray stream returned after slot retirement must reach collector cleanup."""
     import os
     import subprocess
@@ -185,6 +435,7 @@ def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped():
         """
         from __future__ import annotations
 
+        import os
         import threading
         import time
 
@@ -198,7 +449,12 @@ def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped():
         release_submit = threading.Event()
         discarded = threading.Event()
         executor_closed = threading.Event()
+        collector_retired = threading.Event()
         submitted_ref = object()
+        failure_phase = os.environ["VANE_TEST_COLLECTOR_FAILURE_PHASE"]
+        cancel_calls = 0
+        pending_checks = 0
+        retire_calls = 0
 
 
         class FakeCollector:
@@ -208,15 +464,28 @@ def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped():
             def set_wakeup_callback(self, callback):
                 self._wakeup = callback
 
-            def discard_generator_ref(self, ref):
+            def discard_generator_ref(self, _slot_id, ref):
                 assert ref is submitted_ref
                 discarded.set()
 
             def cancel_slot(self, _slot_id):
+                global cancel_calls
+                cancel_calls += 1
+                if failure_phase == "cancel" and cancel_calls == 1:
+                    raise RuntimeError("planned transient collector cancellation failure")
                 return None
 
             def slot_has_pending(self, _slot_id):
-                return False
+                global pending_checks
+                pending_checks += 1
+                return failure_phase == "pending" and pending_checks == 1
+
+            def retire_slot(self, _slot_id):
+                global retire_calls
+                retire_calls += 1
+                if failure_phase == "retire" and retire_calls == 1:
+                    raise RuntimeError("planned transient collector retirement failure")
+                collector_retired.set()
 
             def drain_results(self, _capacities):
                 return []
@@ -305,6 +574,10 @@ def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped():
             release_submit.set()
             assert discarded.wait(timeout=5), "stale Ray stream was dropped without collector cleanup"
             assert executor_closed.wait(timeout=5), "retired executor was not eventually closed"
+            assert collector_retired.wait(timeout=5), "collector cancellation was not retried through retirement"
+            assert cancel_calls == 2
+            assert pending_checks == (1 if failure_phase == "cancel" else 2)
+            assert retire_calls == (2 if failure_phase == "retire" else 1)
         finally:
             release_submit.set()
             query_thread.join(timeout=5)
@@ -321,8 +594,235 @@ def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped():
         env={
             **os.environ,
             "VANE_ENABLE_UDF_TEST_HOOKS": "1",
+            "VANE_TEST_COLLECTOR_FAILURE_PHASE": failure_phase,
             "VANE_UDF_UNREGISTER_TIMEOUT_MS": "50",
         },
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_output_lease_callback_failure_isolated_to_owning_ray_slot():
+    """One descriptor callback must not drop or fail another slot's callback."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        from __future__ import annotations
+
+        import threading
+
+        import duckdb
+        import duckdb.execution.udf as udf_exec
+        import duckdb.execution.udf_stream_result_collector as collector_mod
+        import pyarrow as pa
+        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+
+        both_tracked = threading.Event()
+        good_handoff = threading.Event()
+
+
+        class FakeSource:
+            def __init__(self, value):
+                self.value = int(value)
+
+
+        class FakeCollector:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._wakeup = None
+                self._events = {}
+                self._tracked = set()
+                self._cancelled = set()
+
+            def set_wakeup_callback(self, callback):
+                self._wakeup = callback
+
+            def track_generator_ref(self, slot_id, submit_id, source, _error_context):
+                slot_id = int(slot_id)
+                submit_id = int(submit_id)
+                value = int(source.value)
+                request_id = "output-request:bad" if value == 1 else "output-request:good"
+                payload = make_local_shm_ref_bundle_result(pa.table({"y": [value]}))
+                with self._lock:
+                    self._tracked.add(slot_id)
+                    self._events[slot_id] = [
+                        (
+                            slot_id,
+                            submit_id,
+                            "data",
+                            payload,
+                            request_id,
+                            f"output-lease:{value}",
+                        ),
+                        (slot_id, submit_id, "complete", None),
+                    ]
+                    if len(self._tracked) == 2:
+                        both_tracked.set()
+                if self._wakeup is not None:
+                    self._wakeup()
+
+            def discard_generator_ref(self, _slot_id, _source):
+                return None
+
+            def drain_results(self, capacities):
+                if not both_tracked.is_set():
+                    return []
+                results = []
+                with self._lock:
+                    # Force the failing callback ahead of the healthy callback
+                    # in the dispatcher's same release batch.
+                    ordered = sorted(
+                        self._events,
+                        key=lambda slot_id: self._events[slot_id][0][4] != "output-request:bad",
+                    )
+                    for slot_id in ordered:
+                        if slot_id in self._cancelled:
+                            self._events.pop(slot_id, None)
+                            continue
+                        capacity = capacities.get(slot_id, {})
+                        if int(capacity.get("rows", 0)) <= 0:
+                            continue
+                        results.extend(self._events.pop(slot_id, ()))
+                return results
+
+            def handoff_output_block_lease(self, request_id, _lease_id):
+                if str(request_id) == "output-request:bad":
+                    raise RuntimeError("planned output lease handoff failure")
+                good_handoff.set()
+                return True
+
+            def release_output_block_lease(self, _request_id, _lease_id):
+                return True
+
+            def cancel_slot(self, slot_id):
+                with self._lock:
+                    self._cancelled.add(int(slot_id))
+                    self._events.pop(int(slot_id), None)
+
+            def slot_has_pending(self, _slot_id):
+                return False
+
+            def retire_slot(self, _slot_id):
+                return None
+
+            def shutdown(self):
+                return None
+
+
+        class FakeExecutor:
+            def __init__(self):
+                self._wakeup = None
+                self._admission_state = "idle"
+                self._retained_input_bytes = 0
+
+            def register_wakeup(self, callback):
+                self._wakeup = callback
+
+            def request_task_admission(self, retained_input_bytes):
+                self._retained_input_bytes = int(retained_input_bytes)
+                self._admission_state = "ready"
+                return True
+
+            def task_admission_state(self):
+                return {
+                    "state": self._admission_state,
+                    "available": self._admission_state == "ready",
+                    "retained_input_bytes": self._retained_input_bytes,
+                }
+
+            def submit_with_id(self, _submit_id, table):
+                self._admission_state = "idle"
+                return FakeSource(table.column(0).to_pylist()[0])
+
+            def take_ready_result(self):
+                return None
+
+            def finished_submitting(self):
+                return None
+
+            def all_tasks_finished(self):
+                return False
+
+            def close(self):
+                return None
+
+
+        def build_executor(_payload, options=None):
+            del options
+            return FakeExecutor()
+
+
+        def passthrough(table):
+            return pa.table({"y": table.column(0)})
+
+
+        udf_exec.build_executor = build_executor
+        collector_mod.AsyncResultCollector = FakeCollector
+        bad_connection = duckdb.connect()
+        good_connection = duckdb.connect()
+        bad_relation = bad_connection.sql("select 1::BIGINT as x").map_batches(
+            passthrough,
+            schema={"y": duckdb.sqltypes.BIGINT},
+            execution_backend="ray_task",
+        )
+        good_relation = good_connection.sql("select 2::BIGINT as x").map_batches(
+            passthrough,
+            schema={"y": duckdb.sqltypes.BIGINT},
+            execution_backend="ray_task",
+        )
+        barrier = threading.Barrier(3)
+        bad_errors = []
+        good_results = []
+        good_errors = []
+
+
+        def run_bad():
+            barrier.wait()
+            try:
+                bad_relation.fetchall()
+            except BaseException as exc:
+                bad_errors.append(exc)
+
+
+        def run_good():
+            barrier.wait()
+            try:
+                good_results.extend(good_relation.fetchall())
+            except BaseException as exc:
+                good_errors.append(exc)
+
+
+        bad_thread = threading.Thread(target=run_bad)
+        good_thread = threading.Thread(target=run_good)
+        bad_thread.start()
+        good_thread.start()
+        barrier.wait()
+        bad_thread.join(timeout=10)
+        good_thread.join(timeout=10)
+        try:
+            assert not bad_thread.is_alive(), "failing Ray slot did not terminate"
+            assert not good_thread.is_alive(), "healthy Ray slot did not terminate"
+            assert bad_errors, (bad_errors, good_errors, good_results)
+            assert "planned output lease handoff failure" in str(bad_errors[0]), bad_errors[0]
+            assert good_errors == [], (bad_errors, good_errors, good_results)
+            assert good_results == [(2,)], (bad_errors, good_errors, good_results)
+            assert good_handoff.is_set(), "healthy output lease callback was dropped"
+        finally:
+            bad_connection.close()
+            good_connection.close()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env={**os.environ},
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 

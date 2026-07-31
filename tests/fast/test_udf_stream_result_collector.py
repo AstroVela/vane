@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+import weakref
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -181,9 +182,19 @@ class _FakeRay:
 
 
 class _FailingWaitRay(_FakeRay):
+    def __init__(self):
+        super().__init__()
+        self.fail_waits = True
+
     def wait(self, waitables, *, num_returns, timeout, fetch_local):
-        del waitables, num_returns, timeout, fetch_local
-        raise RuntimeError("planned generator readiness failure")
+        if self.fail_waits:
+            raise RuntimeError("planned generator readiness failure")
+        return super().wait(
+            waitables,
+            num_returns=num_returns,
+            timeout=timeout,
+            fetch_local=fetch_local,
+        )
 
 
 class _SelectiveFailingWaitRay(_FakeRay):
@@ -380,7 +391,22 @@ def test_event_loop_start_failure_prevents_submitted_stream_ownership(monkeypatc
     assert fake_ray.cancel_calls == []
 
 
-def test_scheduler_failure_rejection_cancels_the_unpublished_submitted_stream():
+def test_event_loop_start_timeout_rolls_back_started_thread(monkeypatch):
+    fake_ray = _FakeRay()
+    monkeypatch.setenv("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S", "0.05")
+
+    class SlowStartCollector(AsyncResultCollector):
+        def _run_event_loop(self):
+            time.sleep(0.06)
+            super()._run_event_loop()
+
+    with pytest.raises(RuntimeError, match="event loop did not start"):
+        SlowStartCollector(ray_module=fake_ray)
+
+    assert not any(thread.name == "udf-ray-stream-multiplexer" for thread in threading.enumerate())
+
+
+def test_scheduler_failure_isolated_to_stream_does_not_poison_future_slots():
     fake_ray = _FailingWaitRay()
     driver = _Driver()
     collector = AsyncResultCollector(ray_module=fake_ray)
@@ -397,49 +423,41 @@ def test_scheduler_failure_rejection_cancels_the_unpublished_submitted_stream():
             ),
         ),
     )
-    collector.drain_results({1: {"rows": 1, "bytes": 128, "item_bytes": 128}})
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline:
+    try:
+        failed_events = _drain_until(
+            collector,
+            {1: {"rows": 1, "bytes": 128, "item_bytes": 128}},
+            predicate=lambda values: any(event[2] == "error" for event in values),
+        )
+        assert [event[2] for event in failed_events] == ["error"]
+        assert "planned generator readiness failure" in failed_events[0][3]
         with collector._cv:
-            if collector._thread_error is not None:
-                break
-        time.sleep(0.005)
-    else:
-        pytest.fail("readiness scheduler failure was not published")
+            assert collector._thread_error is None
 
-    rejected_generators = []
-
-    def submit_rejected(_lease):
-        generator = _Generator([], completed=False)
-        rejected_generators.append(generator)
-        return generator
-
-    with pytest.raises(RuntimeError, match="planned generator readiness failure"):
+        fake_ray.fail_waits = False
         collector.track_generator_ref(
-            1,
+            2,
             2,
             _source(
                 fake_ray,
                 driver,
-                request_id="rejected-after-readiness-failure",
-                submitter=submit_rejected,
+                request_id="healthy-after-readiness-failure",
+                submitter=lambda lease: _Generator(
+                    [
+                        _Ref("healthy", is_block=True),
+                        _Ref(_metadata(lease)),
+                    ]
+                ),
             ),
         )
-
-    rejected = rejected_generators[0]
-    assert any(ref is rejected for ref, _kwargs in fake_ray.cancel_calls)
-    assert rejected.deleted_streams == [rejected.completion_ref]
-    assert any(
-        args[:3]
-        == (
-            "rejected-after-readiness-failure",
-            "task-lease-2",
-            "attempt:rejected-after-readiness-failure",
+        healthy_events = _drain_until(
+            collector,
+            {2: {"rows": 1, "bytes": 128, "item_bytes": 128}},
+            predicate=lambda values: any(event[2] == "complete" for event in values),
         )
-        and kwargs == {}
-        for args, kwargs in driver.release_query_task_lease_after_completion.calls
-    )
-    collector.shutdown()
+        assert [event[2] for event in healthy_events] == ["data", "complete"]
+    finally:
+        collector.shutdown()
 
 
 def test_initial_waiter_registration_failure_unpublishes_and_cleans_stream():
@@ -663,12 +681,13 @@ def test_discarded_submitted_stream_enters_terminal_cleanup_ledger():
     collector = AsyncResultCollector(ray_module=fake_ray)
     try:
         collector.discard_generator_ref(
+            9,
             _source(
                 fake_ray,
                 driver,
                 request_id="stale-submission-discard",
                 submitter=lambda _lease: generator,
-            )
+            ),
         )
 
         deadline = time.monotonic() + 2
@@ -685,6 +704,51 @@ def test_discarded_submitted_stream_enters_terminal_cleanup_ledger():
         assert generator.deleted_streams == [generator.completion_ref]
         assert generator.worker is None
     finally:
+        collector.shutdown()
+
+
+def test_slot_retirement_waits_for_discarded_stream_cleanup():
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    cleanup_response = _Ref({"scheduled": True}, ready=False)
+    driver.release_query_task_lease_after_completion = _DelayedAckRemoteMethod(
+        cleanup_response,
+    )
+    generator = _Generator([], completed=False)
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector.discard_generator_ref(
+        9,
+        _source(
+            fake_ray,
+            driver,
+            request_id="stale-submission-slot-owner",
+            submitter=lambda _lease: generator,
+        ),
+    )
+    cancel_errors = []
+    cancel_thread = threading.Thread(
+        target=lambda: _capture_thread_error(
+            cancel_errors,
+            collector.cancel_slot,
+            9,
+        )
+    )
+    try:
+        assert collector.slot_has_pending(9)
+        cancel_thread.start()
+        time.sleep(0.05)
+        assert cancel_thread.is_alive()
+
+        cleanup_response.ready = True
+        cancel_thread.join(timeout=2)
+
+        assert not cancel_thread.is_alive()
+        assert cancel_errors == []
+        assert not collector.slot_has_pending(9)
+        collector.retire_slot(9)
+    finally:
+        cleanup_response.ready = True
+        cancel_thread.join(timeout=2)
         collector.shutdown()
 
 
@@ -818,6 +882,58 @@ def test_cleanup_ticket_rejects_a_broken_future_callback_contract():
         assert "planned cleanup callback registration failure" in str(errors[0])
         with collector._cv:
             assert collector._cleanup_tickets == set()
+    finally:
+        collector.shutdown()
+
+
+def test_cleanup_ticket_retries_a_hung_control_response(monkeypatch):
+    monkeypatch.setattr(
+        "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
+        0.01,
+    )
+    collector = AsyncResultCollector(ray_module=_FakeRay())
+    attempts = []
+    response_future = None
+
+    def transfer_owner():
+        nonlocal response_future
+        if response_future is None:
+            response_future = Future()
+            attempts.append(response_future)
+            if len(attempts) == 2:
+                response_future.set_result(True)
+        if not response_future.done():
+            return response_future
+        response_future.result()
+        response_future = None
+        return True
+
+    def abandon_wait(future):
+        nonlocal response_future
+        if response_future is future:
+            response_future = None
+        future.cancel()
+
+    tickets = collector._submit_cleanup_operations(
+        (
+            RayStreamCleanupOperation(
+                transfer_owner,
+                retry_on_error=True,
+                abandon_wait=abandon_wait,
+            ),
+        ),
+        store_error=False,
+    )
+    try:
+        assert (
+            collector._wait_cleanup_tickets(
+                tickets,
+                timeout_message="hung cleanup response was not retried",
+            )
+            == ()
+        )
+        assert len(attempts) == 2
+        assert attempts[0].cancelled()
     finally:
         collector.shutdown()
 
@@ -1343,24 +1459,29 @@ def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
 
     monkeypatch.setattr(RayStreamAdapter, "retire_operations", blocking_retire_operations)
 
-    def submitter(lease):
-        generator = _Generator(
-            [
-                _Ref("large-block", is_block=True),
-                _Ref(_metadata(lease, size_bytes=64)),
-            ]
-        )
-        generator_holder["generator"] = generator
-        return generator
+    def make_source():
+        def submitter(lease):
+            generator = _Generator(
+                [
+                    _Ref("large-block", is_block=True),
+                    _Ref(_metadata(lease, size_bytes=64)),
+                ]
+            )
+            generator_holder["generator"] = generator
+            return generator
 
-    source = _source(
-        fake_ray,
-        driver,
-        request_id="deterministic-retirement",
-        submitter=submitter,
-    )
+        source = _source(
+            fake_ray,
+            driver,
+            request_id="deterministic-retirement",
+            submitter=submitter,
+        )
+        return source, weakref.ref(source)
+
+    source, source_ref = make_source()
     collector = AsyncResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(2, 22, source)
+    del source
     capacity = {2: {"rows": 1, "bytes": 128, "item_bytes": 128}}
     try:
         events = []
@@ -1395,12 +1516,68 @@ def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
 
         assert [item[2] for item in events] == ["complete"]
         assert collector._records == {}
-        assert source.generator is None
-        assert source.lease is None
+        assert source_ref() is None
         assert generator.deleted_streams == [generator.completion_ref]
     finally:
         if not retirement.done():
             retirement.set_result(None)
+        collector.shutdown()
+
+
+def test_terminal_cleanup_handoff_failure_replans_owned_stream(monkeypatch):
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    generator = _Generator([])
+
+    def submitter(lease):
+        generator.refs.extend(
+            [
+                _Ref("large-block", is_block=True),
+                _Ref(_metadata(lease, size_bytes=64)),
+            ]
+        )
+        return generator
+
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector.track_generator_ref(
+        2,
+        22,
+        _source(
+            fake_ray,
+            driver,
+            request_id="retirement-handoff-failure",
+            submitter=submitter,
+        ),
+    )
+    original_submit = collector._submit_cleanup_operations
+    fail_next_handoff = True
+
+    def fail_one_cleanup_handoff(*args, **kwargs):
+        nonlocal fail_next_handoff
+        if fail_next_handoff:
+            fail_next_handoff = False
+            raise RuntimeError("planned terminal cleanup handoff failure")
+        return original_submit(*args, **kwargs)
+
+    monkeypatch.setattr(
+        collector,
+        "_submit_cleanup_operations",
+        fail_one_cleanup_handoff,
+    )
+    capacity = {2: {"rows": 1, "bytes": 128, "item_bytes": 128}}
+    try:
+        events = _drain_until(
+            collector,
+            capacity,
+            predicate=lambda values: any(item[2] == "error" for item in values),
+        )
+
+        assert [item[2] for item in events] == ["error"]
+        assert "planned terminal cleanup handoff failure" in events[0][3]
+        _wait_until(lambda: generator.deleted_streams == [generator.completion_ref])
+        assert driver.release_query_task_lease_after_completion.calls
+        assert collector._records == {}
+    finally:
         collector.shutdown()
 
 
@@ -2047,17 +2224,16 @@ def test_readiness_probe_failure_is_reported_without_dequeuing():
         ),
     )
     try:
-        collector.drain_results({3: {"rows": 1, "bytes": 128, "item_bytes": 128}})
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            with collector._cv:
-                if collector._thread_error is not None:
-                    break
-            time.sleep(0.005)
-
-        with pytest.raises(RuntimeError, match="planned generator readiness failure"):
-            collector.drain_results({3: {"rows": 1, "bytes": 128, "item_bytes": 128}})
+        events = _drain_until(
+            collector,
+            {3: {"rows": 1, "bytes": 128, "item_bytes": 128}},
+            predicate=lambda values: any(event[2] == "error" for event in values),
+        )
+        assert [event[2] for event in events] == ["error"]
+        assert "planned generator readiness failure" in events[0][3]
         assert generators[0].read_count == 0
+        with collector._cv:
+            assert collector._thread_error is None
     finally:
         collector.shutdown()
 

@@ -519,8 +519,14 @@ struct CollectorOutputLeaseCallbacks {
 	std::function<void()> release;
 };
 
-static CollectorOutputLeaseCallbacks
-MakeCollectorOutputLeaseCallbacks(const py::object &collector, const string &request_id, const string &lease_id);
+struct PendingCollectorOutputLeaseCallback {
+	uint64_t slot_id;
+	std::function<void()> callback;
+};
+
+static CollectorOutputLeaseCallbacks MakeCollectorOutputLeaseCallbacks(const py::object &collector, uint64_t slot_id,
+                                                                       const string &request_id,
+                                                                       const string &lease_id);
 
 static bool PyDictContains(const py::dict &dict, const char *key) {
 	return dict.contains(py::str(key));
@@ -777,6 +783,11 @@ static bool PayloadUsesTaskAdmission(const Value &payload) {
 	auto backend = GetStructStringField(payload, "execution_backend");
 	return backend.first && (backend.second == "ray_task" || backend.second == "ray_actor" ||
 	                         backend.second == "subprocess_task" || backend.second == "subprocess_actor");
+}
+
+static bool PayloadUsesRayStreamCollector(const Value &payload) {
+	auto backend = GetStructStringField(payload, "execution_backend");
+	return backend.first && (backend.second == "ray_task" || backend.second == "ray_actor");
 }
 
 static string GetStructStringOrDefault(const Value &payload, const string &name, const string &default_value = "") {
@@ -1083,7 +1094,7 @@ struct ExecutorSlot {
 	atomic<bool> finished_submitting_acked {false};
 	atomic<bool> all_tasks_finished {false};
 	atomic<bool> cleanup_cancel_requested {false};
-	atomic<bool> collector_cancel_requested {false};
+	atomic<bool> collector_retired {false};
 
 	// Error propagation
 	mutex error_lock;
@@ -1178,20 +1189,16 @@ public:
 		return instance;
 	}
 
-	// Register a new executor slot. Returns the slot ID, raw pointer (valid
-	// until Unregister), and the generation captured by queued commands.
+	// Register a new executor slot. The executor and dispatcher retain shared
+	// ownership so terminal shutdown can publish an error and remove the slot
+	// from the dispatcher without invalidating an in-flight pipeline callback.
 	uint64_t Register(Value payload, vector<LogicalType> output_types, vector<LogicalType> ref_output_types,
 	                  ClientContext *ctx, shared_ptr<void> actor_handles, UDFOutputConsumer output_consumer,
-	                  ExecutorSlot **out_slot, uint64_t *out_generation) {
+	                  shared_ptr<ExecutorSlot> *out_slot, uint64_t *out_generation) {
 		ThrowIfDispatcherError();
 		lock_guard<mutex> g(global_lock);
-		slot_generation++;
-		if (pending_async_shutdown.exchange(false)) {
-			{
-				lock_guard<mutex> shutdown_lock(async_shutdown_lock);
-				async_shutdown_complete = true;
-			}
-			async_shutdown_cv.notify_all();
+		if (lifecycle_state != DispatcherLifecycleState::ACCEPTING) {
+			throw InvalidInputException("udf dispatcher has been shut down");
 		}
 		auto id = next_slot_id.fetch_add(1);
 		auto slot = make_shared_ptr<ExecutorSlot>();
@@ -1207,13 +1214,17 @@ public:
 		slot->output_consumer = std::move(output_consumer);
 		slot->has_output_consumer = true;
 		slot->is_table_udf = ClassifyUDFMode(slot->payload) == UDFMode::RESULT_ONLY_BATCH;
-		auto *raw = slot.get();
-		slots[id] = std::move(slot);
-		*out_slot = raw;
-		*out_generation = raw->generation.load();
+		slots[id] = slot;
+		try {
+			StartThreadLocked();
+		} catch (...) {
+			slots.erase(id);
+			throw;
+		}
+		*out_generation = slot->generation.load();
+		*out_slot = std::move(slot);
 		UDFDebugLog(StringUtil::Format("register slot=%llu total_slots=%llu", static_cast<unsigned long long>(id),
 		                               static_cast<unsigned long long>(slots.size())));
-		StartThreadLocked();
 		return id;
 	}
 
@@ -1267,17 +1278,9 @@ public:
 			}
 		}
 		// CleanupSlot erases the map entry. This local shared_ptr keeps the slot
-		// alive through the condition-variable wait and lock destruction.
-		{
-			std::unique_lock<mutex> shutdown_lk(async_shutdown_lock);
-			ScopedGILReleaseIfHeld release_gil;
-			if (!async_shutdown_complete && !async_shutdown_cv.wait_for(shutdown_lk, unregister_timeout,
-			                                                            [this] { return async_shutdown_complete; })) {
-				UDFDebugLog(StringUtil::Format("unregister_async_shutdown_timeout deadline_ms=%llu",
-				                               static_cast<unsigned long long>(unregister_timeout.count())));
-				return;
-			}
-		}
+		// alive through the condition-variable wait and lock destruction. The
+		// process-wide collector remains alive until StopThread has quiesced
+		// every submitter, so unregister does not race a per-slot loop shutdown.
 	}
 
 	void NotifyWork() {
@@ -1285,13 +1288,17 @@ public:
 		work_cv.notify_one();
 	}
 
-	void EnqueueOutputLeaseRelease(std::function<void()> release) {
+	void EnqueueOutputLeaseRelease(uint64_t slot_id, std::function<void()> release) {
 		if (!release) {
 			return;
 		}
 		{
+			lock_guard<mutex> lifecycle_guard(global_lock);
+			if (lifecycle_state != DispatcherLifecycleState::ACCEPTING) {
+				return;
+			}
 			lock_guard<mutex> lock(output_lease_release_lock);
-			output_lease_releases.push_back(std::move(release));
+			output_lease_releases.push_back({slot_id, std::move(release)});
 		}
 		NotifyWork();
 	}
@@ -1301,6 +1308,10 @@ public:
 			return;
 		}
 		{
+			lock_guard<mutex> lifecycle_guard(global_lock);
+			if (!accept_deferred_wakeups) {
+				return;
+			}
 			lock_guard<mutex> lock(deferred_wakeup_lock);
 			deferred_wakeups.push_back(std::move(callback));
 		}
@@ -1315,6 +1326,8 @@ public:
 		// Python atexit callbacks still own a valid interpreter and normally hold
 		// the GIL.  Release it while joining so the dispatcher can acquire the GIL
 		// for its final Python-object cleanup before module/static destruction.
+		// Shutdown is terminal: accepting work again would cross the process-wide
+		// collector cleanup fence.
 		ScopedGILReleaseIfHeld release_gil;
 		StopThread();
 	}
@@ -1346,6 +1359,7 @@ private:
 	GlobalPythonDispatcher &operator=(const GlobalPythonDispatcher &) = delete;
 
 	void StartThreadLocked() {
+		D_ASSERT(lifecycle_state == DispatcherLifecycleState::ACCEPTING);
 		if (thread_running) {
 			return;
 		}
@@ -1355,16 +1369,33 @@ private:
 	}
 
 	void StopThread() {
-		if (!thread_running) {
-			return;
+		if (g_on_udf_dispatcher_thread) {
+			throw InvalidInputException("cannot shut down the UDF dispatcher from its own callback thread");
 		}
-		stop.store(true);
-		work_pending.store(true);
+		lock_guard<mutex> shutdown_guard(dispatcher_shutdown_lock);
+		{
+			lock_guard<mutex> lifecycle_lock(global_lock);
+			if (lifecycle_state == DispatcherLifecycleState::STOPPED) {
+				return;
+			}
+			D_ASSERT(lifecycle_state == DispatcherLifecycleState::ACCEPTING);
+			lifecycle_state = DispatcherLifecycleState::STOPPING;
+			if (!thread_running) {
+				lifecycle_state = DispatcherLifecycleState::STOPPED;
+				return;
+			}
+			shutdown_requested.store(true);
+			work_pending.store(true);
+		}
 		work_cv.notify_one();
 		if (dispatcher_thread.joinable()) {
 			dispatcher_thread.join();
 		}
-		thread_running = false;
+		{
+			lock_guard<mutex> lifecycle_lock(global_lock);
+			thread_running = false;
+			lifecycle_state = DispatcherLifecycleState::STOPPED;
+		}
 	}
 
 	void RecordDispatcherError(const string &msg) {
@@ -1414,14 +1445,41 @@ private:
 	}
 
 	bool DrainOutputLeaseReleases_WithGIL() {
-		std::deque<std::function<void()>> releases;
+		std::deque<PendingCollectorOutputLeaseCallback> releases;
 		{
 			lock_guard<mutex> lock(output_lease_release_lock);
 			releases.swap(output_lease_releases);
 		}
+		std::unordered_map<uint64_t, string> failures;
 		for (auto &release : releases) {
-			if (release) {
-				release();
+			if (!release.callback) {
+				continue;
+			}
+			try {
+				release.callback();
+			} catch (const py::error_already_set &ex) {
+				failures.emplace(release.slot_id, StringUtil::Format("udf output lease release failed: %s", ex.what()));
+			} catch (const std::exception &ex) {
+				failures.emplace(release.slot_id, StringUtil::Format("udf output lease release failed: %s", ex.what()));
+			} catch (...) {
+				failures.emplace(release.slot_id, "udf output lease release failed with an unknown exception");
+			}
+		}
+		for (auto &failure : failures) {
+			shared_ptr<ExecutorSlot> slot;
+			{
+				lock_guard<mutex> guard(global_lock);
+				auto entry = slots.find(failure.first);
+				if (entry != slots.end()) {
+					slot = entry->second;
+				}
+			}
+			if (slot && PayloadUsesRayStreamCollector(slot->payload)) {
+				SetSlotError(*slot, failure.second);
+			} else {
+				// A retired slot has already fenced collector ownership. Its
+				// stale descriptor callback cannot affect a later query.
+				UDFDebugLog(failure.second);
 			}
 		}
 		if (!releases.empty()) {
@@ -1431,11 +1489,45 @@ private:
 		return !releases.empty();
 	}
 
+	bool FinishTerminalShutdownIfRequested() {
+		if (!shutdown_requested.load()) {
+			return false;
+		}
+		vector<shared_ptr<ExecutorSlot>> shutdown_slots;
+		{
+			lock_guard<mutex> guard(global_lock);
+			shutdown_slots.reserve(slots.size());
+			for (auto &entry : slots) {
+				shutdown_slots.push_back(entry.second);
+			}
+		}
+		for (auto &slot : shutdown_slots) {
+			if (!slot || !IsSlotActive(*slot)) {
+				continue;
+			}
+			PublishSlotError(*slot, "udf dispatcher shutdown interrupted active execution");
+		}
+		for (auto &slot : shutdown_slots) {
+			if (!slot || !IsSlotActive(*slot)) {
+				continue;
+			}
+			AbortSlotForError(*slot);
+		}
+		// StopThread fences Register under global_lock before setting
+		// shutdown_requested. The fresh snapshot above therefore covers every
+		// slot that could have linearized before terminal shutdown.
+		stop.store(true);
+		return true;
+	}
+
 	// ── Dispatcher main loop (runs on the single dispatcher thread) ──────
 
 	void DispatcherLoop() {
 		g_on_udf_dispatcher_thread = true;
 		while (!stop.load()) {
+			if (FinishTerminalShutdownIfRequested()) {
+				continue;
+			}
 			// Consume event flags at the start of the loop. Producers set these
 			// flags before notifying work_cv; clearing them later in the loop can
 			// clobber a wakeup that races with async result draining and put the
@@ -1528,17 +1620,15 @@ private:
 				if (!sc || !sc->slot) {
 					continue;
 				}
-				auto execution_backend = GetStructStringField(sc->slot->payload, "execution_backend");
-				if (execution_backend.first &&
-				    (execution_backend.second == "ray_task" || execution_backend.second == "ray_actor")) {
+				if (PayloadUsesRayStreamCollector(sc->slot->payload)) {
 					pending_commands_need_async_collector = true;
 					break;
 				}
 			}
 			bool drain_async = (bool)async_collector || has_async_inflight;
 
-			bool needs_gil = !pending_commands.empty() || has_pending_cleanup_cancel || drain_async ||
-			                 has_output_lease_releases || pending_async_shutdown.load();
+			bool needs_gil =
+			    !pending_commands.empty() || has_pending_cleanup_cancel || drain_async || has_output_lease_releases;
 			needs_gil = needs_gil || python_wakeup_fired;
 			auto debug_loop_tick = g_udf_debug_dispatcher_tick.fetch_add(1, std::memory_order_relaxed) + 1;
 			idx_t debug_active_slots = 0;
@@ -1565,9 +1655,8 @@ private:
 					debug_command_count += static_cast<idx_t>(sc->commands.size());
 				}
 			}
-			if (UDFDebugEnabled() &&
-			    (!pending_commands.empty() || has_pending_cleanup_cancel || has_output_lease_releases ||
-			     pending_async_shutdown.load() || debug_loop_tick % 200 == 0)) {
+			if (UDFDebugEnabled() && (!pending_commands.empty() || has_pending_cleanup_cancel ||
+			                          has_output_lease_releases || debug_loop_tick % 200 == 0)) {
 				UDFDebugLog(StringUtil::Format(
 				    "dispatcher_loop tick=%llu active_slots=%llu inflight_slots=%llu inflight_total=%llu "
 				    "pending_shutdown_slots=%llu command_slots=%llu command_count=%llu async_collector=%s "
@@ -1592,25 +1681,20 @@ private:
 						EnsureAsyncCollector();
 					} catch (const std::exception &ex) {
 						auto msg = StringUtil::Format("udf async collector initialization failed: %s", ex.what());
-						bool marked_slot = false;
 						for (auto &sc : pending_commands) {
-							if (sc && sc->slot && !sc->slot->abort_requested.load()) {
+							if (sc && sc->slot && PayloadUsesRayStreamCollector(sc->slot->payload) &&
+							    !sc->slot->abort_requested.load()) {
 								SetSlotError(*sc->slot, msg);
-								marked_slot = true;
 							}
 						}
 						for (auto *slot : active) {
-							if (!slot || slot->abort_requested.load() || slot->inflight_count.load() <= 0) {
+							if (!slot || !PayloadUsesRayStreamCollector(slot->payload) ||
+							    slot->abort_requested.load() || slot->inflight_count.load() <= 0) {
 								continue;
 							}
 							SetSlotError(*slot, msg);
-							marked_slot = true;
-						}
-						if (!marked_slot) {
-							RecordDispatcherError(msg);
 						}
 						did_work = true;
-						continue;
 					}
 				}
 
@@ -1619,16 +1703,12 @@ private:
 						did_work |= DrainOutputLeaseReleases_WithGIL();
 					} catch (const std::exception &ex) {
 						auto msg = StringUtil::Format("udf output lease release failed: %s", ex.what());
-						bool marked_slot = false;
 						for (auto *slot : active) {
-							if (!slot || slot->abort_requested.load()) {
+							if (!slot || !PayloadUsesRayStreamCollector(slot->payload) ||
+							    slot->abort_requested.load()) {
 								continue;
 							}
 							SetSlotError(*slot, msg);
-							marked_slot = true;
-						}
-						if (!marked_slot) {
-							RecordDispatcherError(msg);
 						}
 						did_work = true;
 					}
@@ -1710,36 +1790,10 @@ private:
 						did_work = true;
 					}
 				}
-				// A last-slot shutdown is generation-fenced against concurrent Register.
-				// Hold global_lock through collector shutdown so a new slot either cancels
-				// the pending generation first or registers after a fully joined shutdown.
-				if (pending_async_shutdown.load()) {
-					std::unique_lock<mutex> slots_lock(global_lock);
-					const bool should_shutdown = pending_async_shutdown.load() && slots.empty() &&
-					                             pending_async_shutdown_generation == slot_generation;
-					if (should_shutdown && async_collector) {
-						try {
-							async_collector->obj.attr("shutdown")();
-							async_collector.reset();
-						} catch (const py::error_already_set &ex) {
-							RecordDispatcherError(
-							    StringUtil::Format("udf async collector shutdown failed: %s", ex.what()));
-							async_collector.reset();
-						} catch (const std::exception &ex) {
-							RecordDispatcherError(
-							    StringUtil::Format("udf async collector shutdown failed: %s", ex.what()));
-							async_collector.reset();
-						}
-					}
-					pending_async_shutdown.store(false);
-					slots_lock.unlock();
-					{
-						lock_guard<mutex> shutdown_lock(async_shutdown_lock);
-						async_shutdown_complete = true;
-					}
-					async_shutdown_cv.notify_all();
-					did_work = true;
-				}
+			}
+
+			if (FinishTerminalShutdownIfRequested()) {
+				continue;
 			}
 
 			if (!did_work) {
@@ -1765,8 +1819,13 @@ private:
 		}
 
 		// Drain every owned wakeup before destroying query/executor state. A
-		// callback may enqueue another callback while resolving an error, so run
-		// to a fixed point.
+		// callback may enqueue another callback while resolving an error. Close
+		// the producer fence first, then run the accepted callbacks to a fixed
+		// point.
+		{
+			lock_guard<mutex> guard(global_lock);
+			accept_deferred_wakeups = false;
+		}
 		while (DrainDeferredWakeups()) {
 		}
 
@@ -1797,28 +1856,31 @@ private:
 			}
 			return;
 		}
-		try {
-			PythonGILWrapper gil;
-			for (auto &kv : cleanup_slots) {
-				if (kv.second->py_executor) {
-					kv.second->py_executor.reset();
-				}
-				kv.second->actor_handles.reset();
+		PythonGILWrapper gil;
+		for (auto &kv : cleanup_slots) {
+			CancelSlotForCleanup_WithGIL(*kv.second);
+			if (kv.second->py_executor) {
+				kv.second->py_executor.reset();
 			}
-			if (cleanup_async_collector) {
-				cleanup_async_collector->obj.attr("shutdown")();
-				cleanup_async_collector.reset();
+			kv.second->actor_handles.reset();
+		}
+		try {
+			while (DrainOutputLeaseReleases_WithGIL()) {
 			}
 		} catch (const py::error_already_set &ex) {
-			RecordDispatcherError(StringUtil::Format("udf dispatcher final cleanup failed: %s", ex.what()));
-			if (cleanup_async_collector) {
-				cleanup_async_collector.reset();
-			}
+			RecordDispatcherError(StringUtil::Format("udf output lease final release failed: %s", ex.what()));
 		} catch (const std::exception &ex) {
-			RecordDispatcherError(StringUtil::Format("udf dispatcher final cleanup failed: %s", ex.what()));
-			if (cleanup_async_collector) {
-				cleanup_async_collector.reset();
+			RecordDispatcherError(StringUtil::Format("udf output lease final release failed: %s", ex.what()));
+		}
+		if (cleanup_async_collector) {
+			try {
+				cleanup_async_collector->obj.attr("shutdown")();
+			} catch (const py::error_already_set &ex) {
+				RecordDispatcherError(StringUtil::Format("udf dispatcher final cleanup failed: %s", ex.what()));
+			} catch (const std::exception &ex) {
+				RecordDispatcherError(StringUtil::Format("udf dispatcher final cleanup failed: %s", ex.what()));
 			}
+			cleanup_async_collector.reset();
 		}
 		for (auto &kv : cleanup_slots) {
 			MarkSlotCleanupComplete(*kv.second);
@@ -1858,7 +1920,10 @@ private:
 		// crashes in PyList_AsTuple/PyType_FromModuleAndSpec without GIL.
 		{
 			PythonGILWrapper gil;
-			CancelAsyncCollectorSlot_WithGIL(*slot_ptr);
+			if (!CancelAsyncCollectorSlot_WithGIL(*slot_ptr)) {
+				NotifyWork();
+				return;
+			}
 			if (slot_ptr->py_executor) {
 				try {
 					slot_ptr->py_executor->obj.attr("close")();
@@ -1879,14 +1944,6 @@ private:
 			auto it = slots.find(id);
 			if (it != slots.end() && it->second.get() == slot_ptr) {
 				slots.erase(it);
-				if (slots.empty() && (bool)async_collector) {
-					{
-						lock_guard<mutex> shutdown_lock(async_shutdown_lock);
-						async_shutdown_complete = false;
-					}
-					pending_async_shutdown.store(true);
-					pending_async_shutdown_generation = slot_generation;
-				}
 			}
 		}
 		// External unregister callers retain a shared_ptr while waiting. A
@@ -2022,32 +2079,47 @@ private:
 		WakeupPipelineThread(slot);
 	}
 
-	void CancelAsyncCollectorSlot_WithGIL(ExecutorSlot &slot) {
-		if (!async_collector) {
-			return;
-		}
-		if (slot.collector_cancel_requested.exchange(true)) {
-			return;
+	bool CancelAsyncCollectorSlot_WithGIL(ExecutorSlot &slot) {
+		if (!PayloadUsesRayStreamCollector(slot.payload) || !async_collector || slot.collector_retired.load()) {
+			return true;
 		}
 		try {
 			async_collector->obj.attr("cancel_slot")(py::int_(slot.id));
 		} catch (const py::error_already_set &ex) {
-			SetSlotError(slot, StringUtil::Format("udf async collector cancel_slot failed: %s", ex.what()));
-			return;
+			PublishSlotError(slot, StringUtil::Format("udf async collector cancel_slot failed: %s", ex.what()));
+			return false;
 		} catch (const std::exception &ex) {
-			SetSlotError(slot, StringUtil::Format("udf async collector cancel_slot failed: %s", ex.what()));
-			return;
+			PublishSlotError(slot, StringUtil::Format("udf async collector cancel_slot failed: %s", ex.what()));
+			return false;
+		}
+		bool collector_pending;
+		try {
+			collector_pending = async_collector->obj.attr("slot_has_pending")(py::int_(slot.id)).cast<bool>();
+		} catch (const py::error_already_set &ex) {
+			PublishSlotError(slot, StringUtil::Format("udf async collector slot_has_pending failed: %s", ex.what()));
+			return false;
+		} catch (const std::exception &ex) {
+			PublishSlotError(slot, StringUtil::Format("udf async collector slot_has_pending failed: %s", ex.what()));
+			return false;
+		}
+		if (collector_pending) {
+			PublishSlotError(slot, "udf async collector still has pending records after slot cancel");
+			return false;
 		}
 		try {
-			auto collector_pending = async_collector->obj.attr("slot_has_pending")(py::int_(slot.id)).cast<bool>();
-			if (collector_pending) {
-				SetSlotError(slot, "udf async collector still has pending records after slot cancel");
-			}
+			// cancel_slot is synchronous. Once it reports no ownership, this
+			// dispatcher generation is the last possible submitter for the slot,
+			// so its process-lifetime cancellation fence can go.
+			async_collector->obj.attr("retire_slot")(py::int_(slot.id));
+			slot.collector_retired.store(true);
 		} catch (const py::error_already_set &ex) {
-			SetSlotError(slot, StringUtil::Format("udf async collector slot_has_pending failed: %s", ex.what()));
+			PublishSlotError(slot, StringUtil::Format("udf async collector retire_slot failed: %s", ex.what()));
+			return false;
 		} catch (const std::exception &ex) {
-			SetSlotError(slot, StringUtil::Format("udf async collector slot_has_pending failed: %s", ex.what()));
+			PublishSlotError(slot, StringUtil::Format("udf async collector retire_slot failed: %s", ex.what()));
+			return false;
 		}
+		return true;
 	}
 
 	void CancelSlotForCleanup_WithGIL(ExecutorSlot &slot) {
@@ -2466,7 +2538,7 @@ private:
 			// preserving the C++ submit_id -> input rows association.
 			py::object ref = slot.py_executor->obj.attr("submit_with_id")(py::int_(task.submit_id), py_args);
 			if (!IsActiveSlotGeneration(slot, generation)) {
-				DiscardSubmittedPythonRef_WithGIL(ref);
+				DiscardSubmittedPythonRef_WithGIL(slot, ref);
 				return;
 			}
 			ConsumeTaskAdmissionReservation(slot);
@@ -2516,21 +2588,21 @@ private:
 		return py::make_tuple(std::move(refs), std::move(slices), std::move(metadata), std::move(names));
 	}
 
-	void DiscardSubmittedPythonRef_WithGIL(py::object &ref) {
+	void DiscardSubmittedPythonRef_WithGIL(ExecutorSlot &slot, py::object &ref) {
 		if (ref.is_none()) {
 			return;
 		}
 		if (!async_collector) {
 			throw InvalidInputException("udf async collector is unavailable for stale submitted work");
 		}
-		async_collector->obj.attr("discard_generator_ref")(ref);
+		async_collector->obj.attr("discard_generator_ref")(py::int_(slot.id), ref);
 	}
 
 	void TrackSubmittedPythonRef_WithGIL(ExecutorSlot &slot, idx_t submit_id, py::object &ref,
 	                                     unique_ptr<DataChunk> rows, uint64_t generation,
 	                                     bool require_generator_ref = false) {
 		if (!IsActiveSlotGeneration(slot, generation)) {
-			DiscardSubmittedPythonRef_WithGIL(ref);
+			DiscardSubmittedPythonRef_WithGIL(slot, ref);
 			return;
 		}
 		if (ref.is_none()) {
@@ -2552,7 +2624,7 @@ private:
 			error_context = slot.py_executor->obj.attr("error_context")();
 		}
 		if (!IsActiveSlotGeneration(slot, generation)) {
-			DiscardSubmittedPythonRef_WithGIL(ref);
+			DiscardSubmittedPythonRef_WithGIL(slot, ref);
 			return;
 		}
 		async_collector->obj.attr("track_generator_ref")(py::int_(slot.id), py::int_(submit_id), ref, error_context);
@@ -2583,7 +2655,7 @@ private:
 			py::object ref = slot.py_executor->obj.attr("submit_ref_bundle_with_id")(py::int_(task.submit_id), refs,
 			                                                                         slices, metadata, names);
 			if (!IsActiveSlotGeneration(slot, generation)) {
-				DiscardSubmittedPythonRef_WithGIL(ref);
+				DiscardSubmittedPythonRef_WithGIL(slot, ref);
 				return;
 			}
 			ConsumeTaskAdmissionReservation(slot);
@@ -2600,16 +2672,20 @@ private:
 
 	bool DrainAsyncResults_WithGIL(vector<ExecutorSlot *> &active) {
 		bool did_work = false;
+		bool has_ray_collector_slot = false;
 		std::unordered_map<uint64_t, std::pair<ExecutorSlot *, uint64_t>> slots_by_id;
 		slots_by_id.reserve(active.size());
 		for (auto *slot : active) {
-			if (slot) {
+			if (slot && PayloadUsesRayStreamCollector(slot->payload)) {
 				slots_by_id.emplace(slot->id, std::make_pair(slot, slot->generation.load()));
+				has_ray_collector_slot |=
+				    IsSlotActive(*slot) && !slot->abort_requested.load() && slot->inflight_count.load() > 0;
 			}
 		}
 		auto fail_active_slots = [&](const string &msg) {
 			for (auto *slot : active) {
-				if (!slot || !slot->py_executor || slot->abort_requested.load() || !IsSlotActive(*slot)) {
+				if (!slot || !PayloadUsesRayStreamCollector(slot->payload) || !slot->py_executor ||
+				    slot->abort_requested.load() || !IsSlotActive(*slot)) {
 					continue;
 				}
 				SetSlotError(*slot, msg);
@@ -2745,7 +2821,7 @@ private:
 			return true;
 		};
 
-		if (async_collector) {
+		if (async_collector && has_ray_collector_slot) {
 			try {
 				py::dict capacities;
 				idx_t debug_capacity_total = 0;
@@ -2755,7 +2831,8 @@ private:
 				auto debug_probe_tick = g_udf_debug_drain_tick.load(std::memory_order_relaxed);
 				bool debug_probe_slots = UDFDebugEnabled() && (debug_probe_tick >= 650 || debug_probe_tick % 200 == 0);
 				for (auto *slot : active) {
-					if (!slot || slot->abort_requested.load() || !IsSlotActive(*slot)) {
+					if (!slot || !PayloadUsesRayStreamCollector(slot->payload) || slot->abort_requested.load() ||
+					    !IsSlotActive(*slot)) {
 						continue;
 					}
 					auto generation = slot->generation.load();
@@ -2857,8 +2934,8 @@ private:
 								throw InvalidInputException(
 								    "udf async collector data event is missing output lease identity");
 							}
-							auto callbacks = MakeCollectorOutputLeaseCallbacks(async_collector->obj, output_request_id,
-							                                                   output_lease_id);
+							auto callbacks = MakeCollectorOutputLeaseCallbacks(async_collector->obj, slot_id,
+							                                                   output_request_id, output_lease_id);
 							handoff_output_lease = std::move(callbacks.handoff);
 							release_output_lease = std::move(callbacks.release);
 						}
@@ -2943,19 +3020,6 @@ private:
 					}
 				}
 
-				for (auto *slot : active) {
-					if (!slot || slot->abort_requested.load() || !IsSlotActive(*slot) || !slot->py_executor ||
-					    slot->inflight_count.load() <= 0) {
-						continue;
-					}
-					auto generation = slot->generation.load();
-					if (!ShouldDrainSyncResults(*slot, generation)) {
-						continue;
-					}
-					if (DrainSyncSlotSafely(*slot, generation)) {
-						did_work = true;
-					}
-				}
 			} catch (const py::error_already_set &ex) {
 				fail_active_slots(StringUtil::Format("udf async collector failed: %s", ex.what()));
 			} catch (const std::exception &ex) {
@@ -2963,19 +3027,17 @@ private:
 			}
 		}
 
-		if (!async_collector) {
-			for (auto *slot : active) {
-				if (!slot || slot->abort_requested.load() || !IsSlotActive(*slot) || !slot->py_executor ||
-				    slot->inflight_count.load() <= 0) {
-					continue;
-				}
-				auto generation = slot->generation.load();
-				if (!ShouldDrainSyncResults(*slot, generation)) {
-					continue;
-				}
-				if (DrainSyncSlotSafely(*slot, generation)) {
-					did_work = true;
-				}
+		for (auto *slot : active) {
+			if (!slot || slot->abort_requested.load() || !IsSlotActive(*slot) || !slot->py_executor ||
+			    slot->inflight_count.load() <= 0) {
+				continue;
+			}
+			auto generation = slot->generation.load();
+			if (!ShouldDrainSyncResults(*slot, generation)) {
+				continue;
+			}
+			if (DrainSyncSlotSafely(*slot, generation)) {
+				did_work = true;
 			}
 		}
 
@@ -2996,7 +3058,7 @@ private:
 		}
 	}
 
-	void SetSlotError(ExecutorSlot &slot, const string &msg, bool notify_output_consumer = true) {
+	bool PublishSlotError(ExecutorSlot &slot, const string &msg, bool notify_output_consumer = true) {
 		bool should_notify = false;
 		{
 			lock_guard<mutex> eg(slot.error_lock);
@@ -3006,13 +3068,12 @@ private:
 				should_notify = true;
 			}
 		}
-		AbortSlotForError(slot);
 		if (!should_notify) {
-			return;
+			return false;
 		}
 		WakeupPipelineThread(slot);
 		if (!notify_output_consumer) {
-			return;
+			return true;
 		}
 		UDFOutputConsumer output_consumer;
 		if (GetOutputConsumer(slot, output_consumer) && output_consumer.accept_error) {
@@ -3024,6 +3085,12 @@ private:
 				slot.error += StringUtil::Format("; udf output consumer accept_error failed: %s", ex.what());
 			}
 		}
+		return true;
+	}
+
+	void SetSlotError(ExecutorSlot &slot, const string &msg, bool notify_output_consumer = true) {
+		PublishSlotError(slot, msg, notify_output_consumer);
+		AbortSlotForError(slot);
 	}
 
 	void NotifySlotFinished(ExecutorSlot &slot) {
@@ -3194,27 +3261,27 @@ private:
 	}
 
 	// ── Members ──────────────────────────────────────────────────────────
+	enum class DispatcherLifecycleState : uint8_t { ACCEPTING, STOPPING, STOPPED };
+
 	mutex global_lock;
+	mutex dispatcher_shutdown_lock;
 	std::condition_variable work_cv;
 	std::unordered_map<uint64_t, shared_ptr<ExecutorSlot>> slots;
 	atomic<uint64_t> next_slot_id {1};
 	std::thread dispatcher_thread;
 	atomic<bool> stop {false};
-	atomic<bool> wakeup_fired {false};           // set by async collector wakeup callback
-	atomic<bool> work_pending {false};           // set by all notify paths before signaling work_cv
-	atomic<bool> pending_async_shutdown {false}; // deferred async_collector shutdown
-	uint64_t slot_generation = 0;
-	uint64_t pending_async_shutdown_generation = 0;
-	mutex async_shutdown_lock;
-	std::condition_variable async_shutdown_cv;
-	bool async_shutdown_complete {true};
+	atomic<bool> shutdown_requested {false};
+	atomic<bool> wakeup_fired {false}; // set by async collector wakeup callback
+	atomic<bool> work_pending {false}; // set by all notify paths before signaling work_cv
 	mutex dispatcher_error_lock;
 	atomic<bool> has_dispatcher_error {false};
 	string dispatcher_error;
+	DispatcherLifecycleState lifecycle_state = DispatcherLifecycleState::ACCEPTING;
 	bool thread_running = false;
 	mutex output_lease_release_lock;
-	std::deque<std::function<void()>> output_lease_releases;
+	std::deque<PendingCollectorOutputLeaseCallback> output_lease_releases;
 	mutex deferred_wakeup_lock;
+	bool accept_deferred_wakeups = true;
 	std::deque<std::function<void()>> deferred_wakeups;
 	unique_ptr<RegisteredObject> async_collector; // Python AsyncResultCollector
 };
@@ -3225,12 +3292,13 @@ struct CollectorOutputLeaseCallbackState {
 	bool released = false;
 };
 
-static CollectorOutputLeaseCallbacks
-MakeCollectorOutputLeaseCallbacks(const py::object &collector, const string &request_id, const string &lease_id) {
+static CollectorOutputLeaseCallbacks MakeCollectorOutputLeaseCallbacks(const py::object &collector, uint64_t slot_id,
+                                                                       const string &request_id,
+                                                                       const string &lease_id) {
 	auto collector_holder = MakePythonObjectHolder(py::reinterpret_borrow<py::object>(collector));
 	auto state = std::make_shared<CollectorOutputLeaseCallbackState>();
 	CollectorOutputLeaseCallbacks callbacks;
-	callbacks.handoff = [collector_holder, state, request_id, lease_id]() {
+	callbacks.handoff = [collector_holder, state, slot_id, request_id, lease_id]() {
 		{
 			lock_guard<mutex> guard(state->lock);
 			if (state->released || state->handed_off) {
@@ -3241,15 +3309,16 @@ MakeCollectorOutputLeaseCallbacks(const py::object &collector, const string &req
 		if (!PythonRuntimeUsableForUDFTeardown()) {
 			return;
 		}
-		GlobalPythonDispatcher::Instance().EnqueueOutputLeaseRelease([collector_holder, request_id, lease_id]() {
-			auto collector_obj = BorrowPythonObjectHolder(collector_holder);
-			if (collector_obj.is_none()) {
-				return;
-			}
-			collector_obj.attr("handoff_output_block_lease")(py::str(request_id), py::str(lease_id));
-		});
+		GlobalPythonDispatcher::Instance().EnqueueOutputLeaseRelease(
+		    slot_id, [collector_holder, request_id, lease_id]() {
+			    auto collector_obj = BorrowPythonObjectHolder(collector_holder);
+			    if (collector_obj.is_none()) {
+				    return;
+			    }
+			    collector_obj.attr("handoff_output_block_lease")(py::str(request_id), py::str(lease_id));
+		    });
 	};
-	callbacks.release = [collector_holder, state, request_id, lease_id]() {
+	callbacks.release = [collector_holder, state, slot_id, request_id, lease_id]() {
 		{
 			lock_guard<mutex> guard(state->lock);
 			if (state->released) {
@@ -3260,13 +3329,14 @@ MakeCollectorOutputLeaseCallbacks(const py::object &collector, const string &req
 		if (!PythonRuntimeUsableForUDFTeardown()) {
 			return;
 		}
-		GlobalPythonDispatcher::Instance().EnqueueOutputLeaseRelease([collector_holder, request_id, lease_id]() {
-			auto collector_obj = BorrowPythonObjectHolder(collector_holder);
-			if (collector_obj.is_none()) {
-				return;
-			}
-			collector_obj.attr("release_output_block_lease")(py::str(request_id), py::str(lease_id));
-		});
+		GlobalPythonDispatcher::Instance().EnqueueOutputLeaseRelease(
+		    slot_id, [collector_holder, request_id, lease_id]() {
+			    auto collector_obj = BorrowPythonObjectHolder(collector_holder);
+			    if (collector_obj.is_none()) {
+				    return;
+			    }
+			    collector_obj.attr("release_output_block_lease")(py::str(request_id), py::str(lease_id));
+		    });
 	};
 	return callbacks;
 }
@@ -3408,18 +3478,11 @@ public:
 	                                         idx_t retained_input_bytes, idx_t &submit_id) override {
 		lock_guard<mutex> submit_guard(submit_lock_);
 		EnsureRegistered(context);
+		ThrowIfSlotError();
 
 		if (!TryReserveTaskAdmission(retained_input_bytes)) {
 			submit_id = 0;
 			return false;
-		}
-
-		{
-			lock_guard<mutex> eg(slot_->error_lock);
-			if (slot_->has_error.load()) {
-				auto msg = slot_->error;
-				throw InvalidInputException("udf async error: %s", msg);
-			}
 		}
 
 		{
@@ -3685,7 +3748,7 @@ private:
 	shared_ptr<void> actor_handles_;
 	uint64_t slot_id_ = 0;
 	uint64_t slot_generation_ = 0;
-	ExecutorSlot *slot_ = nullptr; // raw pointer, valid from Register to Unregister
+	shared_ptr<ExecutorSlot> slot_;
 	bool registered_ = false;
 	mutex submit_lock_;
 	idx_t next_submit_id_ = 1;
