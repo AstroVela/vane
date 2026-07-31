@@ -123,9 +123,6 @@ shared_ptr<Relation> Relation::Limit(int64_t limit, int64_t offset) {
 }
 
 shared_ptr<Relation> Relation::Repartition(idx_t num_partitions, vector<unique_ptr<ParsedExpression>> partition_by) {
-	if (num_partitions > 0 && false) {
-		throw InvalidInputException("num_partitions must be greater than zero");
-	}
 	return make_shared_ptr<RepartitionRelation>(shared_from_this(), num_partitions, std::move(partition_by));
 }
 
