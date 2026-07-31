@@ -193,14 +193,17 @@ class _FakeCoordinator:
         self.calls.append(("wait_fte_query", (query_id, timeout_s)))
         return {"query_id": query_id, "finished": True, "failed": False}
 
-    def fte_query_status(self, query_id):
-        self.calls.append(("fte_query_status", (query_id,)))
-        return {
+    def fte_query_status(self, query_id, task_context_filter):
+        self.calls.append(("fte_query_status", (query_id, task_context_filter)))
+        result = {
             "query_id": query_id,
             "finished": True,
             "failed": False,
             "selected_attempt_task_ids": ["query-a.0.0.0"],
         }
+        if task_context_filter is not None:
+            result["matched"] = bool(task_context_filter)
+        return result
 
     def pop_fte_result_handles(self, query_id):
         self.calls.append(("pop_fte_result_handles", (query_id,)))
@@ -251,4 +254,20 @@ def test_ray_worker_manager_backend_exposes_cxx_query_status_contract():
         "failed": False,
         "selected_attempt_task_ids": ["query-a.0.0.0"],
     }
-    assert coordinator.calls == [("fte_query_status", ("query-a",))]
+    task_context = {
+        "query_idx": 1,
+        "last_node_id": 2,
+        "task_id": 3,
+        "node_ids": [2],
+    }
+    assert backend.fte_query_status("query-a", (task_context,)) == {
+        "query_id": "query-a",
+        "finished": True,
+        "failed": False,
+        "matched": True,
+        "selected_attempt_task_ids": ["query-a.0.0.0"],
+    }
+    assert coordinator.calls == [
+        ("fte_query_status", ("query-a", None)),
+        ("fte_query_status", ("query-a", [task_context])),
+    ]
