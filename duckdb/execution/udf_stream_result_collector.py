@@ -284,77 +284,63 @@ class AsyncResultCollector:
         key = (int(slot_id), int(submit_id))
         adapter: RayStreamAdapter | None = None
         record: _StreamRecord | None = None
-        cleanup_tickets: tuple[_CleanupTicket, ...] = ()
-        try:
-            with self._start_lock:
-                try:
-                    adapter = RayStreamAdapter(source, ray_module=self._ray)
-                    source = None
-                    self._ensure_started()
-                    with self._cv:
-                        self._raise_if_stopped_locked()
-                        if key in self._records:
-                            raise ValueError(f"duplicate Ray UDF stream identity slot={key[0]} submit={key[1]}")
-                        if key[0] in self._cancelled_slots:
-                            raise RuntimeError(f"Ray UDF slot {key[0]} is cancelled")
-                        record = _StreamRecord(
-                            slot_id=key[0],
-                            submit_id=key[1],
-                            adapter=adapter,
-                            sequence=self._next_sequence,
-                            error_context=dict(error_context) if error_context else None,
-                        )
-                        self._next_sequence += 1
-                        self._records[key] = record
-                        # Publish and install the first terminal observer under
-                        # one lock. Readiness skips unregistered records, so a
-                        # failing Future factory can never expose a half-owned
-                        # stream to the scheduler.
-                        self._schedule_completion_wait_locked(record)
-                        record.registered = True
-                        self._signal_readiness_change_locked()
-                    _collector_debug_log("track", record)
-                except BaseException:
-                    with self._cleanup_handoff_lock:
-                        cleanup_operations: Sequence[RayStreamCleanupOperation] = ()
-                        with self._cv:
-                            if record is not None and self._records.get(key) is record:
-                                record.terminal = True
-                                record.cleanup_started = True
-                                self._cancel_record_wait_locked(record)
-                                cleanup_operations = record.adapter.cancel_operations()
-                                self._signal_readiness_change_locked()
-                            elif adapter is not None:
-                                cleanup_operations = adapter.cancel_operations()
-                            elif source is not None:
-                                cleanup_operations = source.cancel_operations()
-                                source.retire_local_state()
-                        if cleanup_operations:
-                            cleanup_tickets = self._submit_cleanup_operations(
-                                cleanup_operations,
-                                store_error=False,
-                                slot_ids=(key[0],),
-                            )
-                        with self._cv:
-                            if record is not None and self._records.get(key) is record:
-                                self._records.pop(key, None)
-                                self._signal_readiness_change_locked()
-                    raise
-        except BaseException as registration_error:
-            if cleanup_tickets:
-                try:
-                    cleanup_errors = self._wait_cleanup_tickets(
-                        cleanup_tickets,
-                        timeout_message="submitted Ray stream cleanup did not terminate",
+        with self._start_lock:
+            try:
+                adapter = RayStreamAdapter(source, ray_module=self._ray)
+                source = None
+                self._ensure_started()
+                with self._cv:
+                    self._raise_if_stopped_locked()
+                    if key in self._records:
+                        raise ValueError(f"duplicate Ray UDF stream identity slot={key[0]} submit={key[1]}")
+                    if key[0] in self._cancelled_slots:
+                        raise RuntimeError(f"Ray UDF slot {key[0]} is cancelled")
+                    record = _StreamRecord(
+                        slot_id=key[0],
+                        submit_id=key[1],
+                        adapter=adapter,
+                        sequence=self._next_sequence,
+                        error_context=dict(error_context) if error_context else None,
                     )
-                    detail = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
-                except BaseException as cleanup_error:
-                    detail = f"{type(cleanup_error).__name__}: {cleanup_error}"
-                if detail:
-                    add_note = getattr(registration_error, "add_note", None)
-                    if callable(add_note):
-                        add_note(f"submitted Ray stream cleanup failed: {detail}")
-            raise
+                    self._next_sequence += 1
+                    self._records[key] = record
+                    # Publish and install the first terminal observer under
+                    # one lock. Readiness skips unregistered records, so a
+                    # failing Future factory can never expose a half-owned
+                    # stream to the scheduler.
+                    self._schedule_completion_wait_locked(record)
+                    record.registered = True
+                    self._signal_readiness_change_locked()
+                _collector_debug_log("track", record)
+            except BaseException:
+                with self._cleanup_handoff_lock:
+                    cleanup_operations: Sequence[RayStreamCleanupOperation] = ()
+                    with self._cv:
+                        if record is not None and self._records.get(key) is record:
+                            record.terminal = True
+                            record.cleanup_started = True
+                            self._cancel_record_wait_locked(record)
+                            cleanup_operations = record.adapter.cancel_operations()
+                            self._signal_readiness_change_locked()
+                        elif adapter is not None:
+                            cleanup_operations = adapter.cancel_operations()
+                        elif source is not None:
+                            cleanup_operations = source.cancel_operations()
+                            source.retire_local_state()
+                    if cleanup_operations:
+                        # Registration runs on the one native dispatcher. The
+                        # durable ticket ledger owns remote cleanup from this
+                        # point; waiting for its ACK here would stall every
+                        # otherwise healthy slot.
+                        self._submit_cleanup_operations(
+                            cleanup_operations,
+                            slot_ids=(key[0],),
+                        )
+                    with self._cv:
+                        if record is not None and self._records.get(key) is record:
+                            self._records.pop(key, None)
+                            self._signal_readiness_change_locked()
+                raise
 
     def discard_generator_ref(self, slot_id: int, source: Any) -> None:
         """Cancel a submitted stream rejected by the C++ slot-generation fence."""
@@ -1440,20 +1426,6 @@ class AsyncResultCollector:
             stop = self._shutdown and not self._cleanup_tickets
         if stop:
             self._loop.stop()
-
-    def _wait_cleanup_tickets(
-        self,
-        tickets: Sequence[_CleanupTicket],
-        *,
-        timeout_message: str,
-    ) -> tuple[BaseException, ...]:
-        deadline = time.monotonic() + self._shutdown_timeout_s
-        for ticket in tickets:
-            if ticket.callback_owned_by_current_thread():
-                continue
-            if not ticket.wait(max(0.0, deadline - time.monotonic())):
-                raise RuntimeError(timeout_message)
-        return tuple(error for ticket in tickets for error in ticket.errors)
 
     def _run_event_loop(self) -> None:
         asyncio.set_event_loop(self._loop)

@@ -358,6 +358,16 @@ def _wait_until(predicate, *, timeout=3.0):
     raise AssertionError("timed out waiting for collector state transition")
 
 
+def _wait_cleanup_tickets(tickets, *, timeout_message, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    for ticket in tickets:
+        if ticket.callback_owned_by_current_thread():
+            continue
+        if not ticket.wait(max(0.0, deadline - time.monotonic())):
+            raise AssertionError(timeout_message)
+    return tuple(error for ticket in tickets for error in ticket.errors)
+
+
 def _capture_thread_error(errors, operation, *args):
     try:
         operation(*args)
@@ -484,6 +494,7 @@ def test_initial_waiter_registration_failure_unpublishes_and_cleans_stream():
                 ),
             )
 
+        _wait_until(lambda: not collector.slot_has_pending(1))
         with collector._cv:
             assert collector._records == {}
             assert collector._cleanup_tickets == set()
@@ -496,7 +507,7 @@ def test_initial_waiter_registration_failure_unpublishes_and_cleans_stream():
         collector.shutdown()
 
 
-def test_invalid_submitted_stream_handoff_remains_owned_until_driver_ack():
+def test_invalid_submitted_stream_cleanup_does_not_block_healthy_stream():
     fake_ray = _FakeRay()
     driver = _Driver()
     handoff_ack = _Ref({"handed_off": True}, ready=False)
@@ -516,26 +527,50 @@ def test_invalid_submitted_stream_handoff_remains_owned_until_driver_ack():
     )
     try:
         track.start()
-        _wait_until(
-            lambda: bool(driver.handoff_query_task_lease_to_teardown.calls),
-        )
-
-        assert track.is_alive()
-        with collector._cv:
-            assert len(collector._cleanup_tickets) == 1
-
-        handoff_ack.ready = True
         track.join(timeout=1)
-
-        assert not track.is_alive()
+        assert track.is_alive() is False
         assert len(errors) == 1
         assert isinstance(errors[0], TypeError)
         assert "not an ObjectRefGenerator" in str(errors[0])
+
+        _wait_until(
+            lambda: bool(driver.handoff_query_task_lease_to_teardown.calls),
+        )
         with collector._cv:
-            assert collector._cleanup_tickets == set()
+            assert collector._cleanup_tickets
+        assert collector.slot_has_pending(1)
+
+        healthy_driver = _Driver()
+        collector.track_generator_ref(
+            2,
+            2,
+            _source(
+                fake_ray,
+                healthy_driver,
+                request_id="healthy-after-invalid-stream",
+                submitter=lambda lease: _Generator(
+                    [
+                        _Ref("healthy", is_block=True),
+                        _Ref(_metadata(lease)),
+                    ]
+                ),
+            ),
+        )
+        healthy_events = _drain_until(
+            collector,
+            {2: {"rows": 1, "bytes": 128, "item_bytes": 128}},
+            predicate=lambda values: any(event[2] == "complete" for event in values),
+        )
+        assert [event[2] for event in healthy_events] == ["data", "complete"]
+        assert collector.slot_has_pending(1)
+
+        handoff_ack.ready = True
+        _wait_until(lambda: not collector.slot_has_pending(1))
         assert fake_ray.cancel_calls == [
             (invalid_stream, {"force": True, "recursive": True}),
         ]
+        with collector._cv:
+            assert collector._cleanup_tickets == set()
     finally:
         handoff_ack.ready = True
         track.join(timeout=1)
@@ -808,7 +843,7 @@ def test_cleanup_tickets_retry_transient_failure_without_starving_peer():
     try:
         assert len(tickets) == 2
         assert (
-            collector._wait_cleanup_tickets(
+            _wait_cleanup_tickets(
                 tickets,
                 timeout_message="cleanup tickets did not finish",
             )
@@ -838,7 +873,7 @@ def test_cleanup_ticket_preserves_incomplete_ownership_retry():
     try:
         assert len(tickets) == 1
         assert (
-            collector._wait_cleanup_tickets(
+            _wait_cleanup_tickets(
                 tickets,
                 timeout_message="cleanup ticket did not finish",
             )
@@ -871,7 +906,7 @@ def test_cleanup_ticket_rejects_a_broken_future_callback_contract():
         store_error=False,
     )
     try:
-        errors = collector._wait_cleanup_tickets(
+        errors = _wait_cleanup_tickets(
             tickets,
             timeout_message="broken cleanup Future did not terminate",
         )
@@ -964,7 +999,7 @@ def test_cleanup_ticket_retries_a_hung_control_response(monkeypatch):
     )
     try:
         assert (
-            collector._wait_cleanup_tickets(
+            _wait_cleanup_tickets(
                 tickets,
                 timeout_message="hung cleanup response was not retried",
             )
@@ -1028,7 +1063,7 @@ def test_cleanup_ticket_expands_slow_response_deadline(monkeypatch):
     )
     try:
         assert (
-            collector._wait_cleanup_tickets(
+            _wait_cleanup_tickets(
                 tickets,
                 timeout_message="slow cleanup response was not acknowledged",
             )
@@ -2108,7 +2143,7 @@ def test_terminal_record_releases_completed_output_lease_with_exact_rpc_contract
             adapter.cancel_operations(),
             store_error=False,
         )
-        collector._wait_cleanup_tickets(
+        _wait_cleanup_tickets(
             tickets,
             timeout_message="adapter cleanup did not finish",
         )
