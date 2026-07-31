@@ -1652,11 +1652,86 @@ def test_terminal_cleanup_handoff_failure_replans_owned_stream(monkeypatch):
         collector.shutdown()
 
 
+def test_blocked_output_admission_submission_does_not_stall_healthy_stream():
+    fake_ray = _FakeRay()
+    blocked_driver = _Driver()
+    healthy_driver = _Driver()
+    output_submission_started = threading.Event()
+    release_output_submission = threading.Event()
+    healthy_block = _Ref("healthy-beside-output-admission", ready=False, is_block=True)
+    original_acquire_output = blocked_driver._acquire_output
+
+    def blocking_acquire_output(request):
+        output_submission_started.set()
+        if not release_output_submission.wait(timeout=5):
+            raise RuntimeError("test did not release blocked output admission")
+        return original_acquire_output(request)
+
+    blocked_driver.acquire_query_output_block_lease = _RemoteMethod(
+        blocking_acquire_output,
+    )
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector.track_generator_ref(
+        2,
+        24,
+        _source(
+            fake_ray,
+            blocked_driver,
+            request_id="blocked-output-admission",
+            submitter=lambda lease: _Generator(
+                [
+                    _Ref("blocked-output-block", is_block=True),
+                    _Ref(_metadata(lease)),
+                ],
+                completed=False,
+            ),
+        ),
+    )
+    collector.track_generator_ref(
+        3,
+        34,
+        _source(
+            fake_ray,
+            healthy_driver,
+            request_id="healthy-beside-output-admission",
+            submitter=lambda lease: _Generator(
+                [
+                    healthy_block,
+                    _Ref(_metadata(lease)),
+                ],
+                completed=False,
+            ),
+        ),
+    )
+    capacity = {
+        2: {"rows": 1, "bytes": 128, "item_bytes": 128},
+        3: {"rows": 1, "bytes": 128, "item_bytes": 128},
+    }
+    try:
+        collector.drain_results(capacity)
+        assert output_submission_started.wait(timeout=2)
+
+        fake_ray.make_ready(healthy_block)
+        healthy_events = _drain_until(
+            collector,
+            capacity,
+            predicate=lambda values: any(item[0] == 3 and item[2] == "data" for item in values),
+        )
+
+        assert [item[2] for item in healthy_events if item[0] == 3] == ["data"]
+        assert release_output_submission.is_set() is False
+    finally:
+        release_output_submission.set()
+        collector.cancel_slot(2)
+        collector.cancel_slot(3)
+        collector.shutdown()
+
+
 def test_blocked_terminal_retirement_does_not_stall_healthy_stream(monkeypatch):
     fake_ray = _FakeRay()
     driver = _Driver()
     retire_started = threading.Event()
-    retirement = Future()
+    release_retirement = threading.Event()
     healthy_block = _Ref("healthy-after-retire", ready=False, is_block=True)
     original_retire_operations = RayStreamAdapter.retire_operations
 
@@ -1668,9 +1743,8 @@ def test_blocked_terminal_retirement_does_not_stall_healthy_stream(monkeypatch):
 
         def block_retirement():
             retire_started.set()
-            if not retirement.done():
-                return retirement
-            retirement.result()
+            if not release_retirement.wait(timeout=5):
+                raise RuntimeError("test did not release blocked terminal retirement")
             return True
 
         return (
@@ -1726,10 +1800,9 @@ def test_blocked_terminal_retirement_does_not_stall_healthy_stream(monkeypatch):
         )
 
         assert [item[2] for item in healthy_events] == ["data"]
-        assert retirement.done() is False
+        assert release_retirement.is_set() is False
     finally:
-        if not retirement.done():
-            retirement.set_result(None)
+        release_retirement.set()
         collector.cancel_slot(3)
         collector.shutdown()
 

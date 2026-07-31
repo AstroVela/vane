@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from duckdb.execution.ray_control_submission import submit_ray_control
 from duckdb.execution.ray_stream_adapter import (
     RayStreamAdapter,
     RayStreamCleanupOperation,
@@ -116,6 +117,7 @@ class _StreamRecord:
     block_item_capacity_bytes: int | None = None
     output_request_id: str = ""
     output_request: dict[str, Any] | None = None
+    output_submit_future: Any | None = None
     output_lease_ref: Any | None = None
     output_cancel_sent: bool = False
     producer_completed: bool = False
@@ -149,6 +151,7 @@ class _CleanupTicket:
         self.retry_on_incomplete = bool(retry_on_incomplete)
         self.abandon_wait = abandon_wait
         self.retry_count = 0
+        self.operation_future: Any | None = None
         self.wait_future: Any | None = None
         self.wait_timeout: asyncio.TimerHandle | None = None
         self._done = False
@@ -206,11 +209,13 @@ class AsyncResultCollector:
     A terminal record is removed only while ``_cleanup_handoff_lock`` prevents
     shutdown from observing an ownership gap.
 
-    The asyncio thread is the sole generator readiness, read, and cleanup
-    consumer. Driver RPCs are observed through public ObjectRef futures;
-    cancellation and CoreWorker stream deletion are non-waiting submissions.
-    Every terminal operation enters the ticket ledger before its source record
-    is removed, so shutdown can never observe an ownership gap.
+    The asyncio thread is the sole generator-readiness, read, and state
+    scheduler. Potentially blocking Ray control submissions and terminal
+    operations run on one fixed process-wide daemon executor and publish their
+    results back to that loop. Driver RPCs are observed through public
+    ObjectRef futures. Every terminal operation enters the ticket ledger before
+    its source record is removed, so shutdown can never observe an ownership
+    gap.
 
     The native dispatcher keeps this collector alive across empty slot
     intervals. ``shutdown`` is the process-owner fence and is called only after
@@ -1285,70 +1290,142 @@ class AsyncResultCollector:
 
     def _drive_cleanup_ticket(self, ticket: _CleanupTicket) -> None:
         with self._cv:
-            if ticket not in self._cleanup_tickets or ticket.wait_future is not None:
+            if (
+                ticket not in self._cleanup_tickets
+                or ticket.operation_future is not None
+                or ticket.wait_future is not None
+            ):
                 return
-        error: BaseException | None = None
-        retry = False
         try:
-            result = ticket.operation()
-            if all(callable(getattr(result, name, None)) for name in ("add_done_callback", "done", "result")):
-                with self._cv:
-                    if ticket not in self._cleanup_tickets:
-                        return
-                    ticket.wait_future = result
-
-                collector_ref = weakref.ref(self)
-                ticket_ref = weakref.ref(ticket)
-
-                def ready(future: Any) -> None:
-                    collector = collector_ref()
-                    active_ticket = ticket_ref()
-                    if collector is None or active_ticket is None:
-                        return
-                    try:
-                        collector._loop.call_soon_threadsafe(
-                            collector._resume_cleanup_ticket,
-                            active_ticket,
-                            future,
-                        )
-                    except RuntimeError as exc:
-                        with collector._cv:
-                            if collector._thread_error is None:
-                                collector._thread_error = exc
-                            collector._cv.notify_all()
-
-                try:
-                    result.add_done_callback(ready)
-                except BaseException as exc:
-                    with self._cv:
-                        if ticket.wait_future is result:
-                            ticket.wait_future = None
-                    # Callback registration is part of the required public
-                    # Future contract, not a transient remote operation.
-                    error = exc
-                else:
-                    if ticket.abandon_wait is not None:
-                        with self._cv:
-                            if ticket in self._cleanup_tickets and ticket.wait_future is result:
-                                ticket.wait_timeout = self._loop.call_later(
-                                    self._cleanup_response_timeout(
-                                        ticket.retry_count,
-                                    ),
-                                    self._timeout_cleanup_ticket,
-                                    ticket,
-                                    result,
-                                )
-                    return
-            retry = result is False and ticket.retry_on_incomplete
+            operation_future = submit_ray_control(ticket.operation)
         except BaseException as exc:
+            self._finish_cleanup_operation(ticket, error=exc)
+            return
+        with self._cv:
+            if ticket not in self._cleanup_tickets:
+                operation_future.cancel()
+                return
+            ticket.operation_future = operation_future
+
+        collector_ref = weakref.ref(self)
+        ticket_ref = weakref.ref(ticket)
+
+        def ready(future: Any) -> None:
+            collector = collector_ref()
+            active_ticket = ticket_ref()
+            if collector is None or active_ticket is None:
+                return
+            try:
+                collector._loop.call_soon_threadsafe(
+                    collector._run_scheduler_callback,
+                    collector._complete_cleanup_operation,
+                    active_ticket,
+                    future,
+                )
+            except RuntimeError as exc:
+                with collector._cv:
+                    if collector._thread_error is None:
+                        collector._thread_error = exc
+                    collector._cv.notify_all()
+
+        try:
+            operation_future.add_done_callback(ready)
+        except BaseException as exc:
+            with self._cv:
+                if ticket.operation_future is operation_future:
+                    ticket.operation_future = None
+            operation_future.cancel()
+            self._finish_cleanup_operation(ticket, error=exc)
+
+    def _complete_cleanup_operation(
+        self,
+        ticket: _CleanupTicket,
+        operation_future: Any,
+    ) -> None:
+        with self._cv:
+            if ticket not in self._cleanup_tickets or ticket.operation_future is not operation_future:
+                return
+            ticket.operation_future = None
+        assert operation_future is not None
+        try:
+            result = operation_future.result()
+        except BaseException as exc:
+            self._finish_cleanup_operation(ticket, error=exc)
+            return
+        self._finish_cleanup_operation(ticket, result=result)
+
+    def _finish_cleanup_operation(
+        self,
+        ticket: _CleanupTicket,
+        *,
+        result: Any = None,
+        error: BaseException | None = None,
+    ) -> None:
+        if error is not None:
             if ticket.retry_on_error:
-                retry = True
-            else:
-                error = exc
-        if retry:
+                self._retry_cleanup_ticket(ticket)
+                return
+            ticket.finish(error)
+            self._stop_loop_after_final_cleanup_ticket()
+            return
+
+        if all(callable(getattr(result, name, None)) for name in ("add_done_callback", "done", "result")):
+            with self._cv:
+                if ticket not in self._cleanup_tickets:
+                    return
+                ticket.wait_future = result
+
+            collector_ref = weakref.ref(self)
+            ticket_ref = weakref.ref(ticket)
+
+            def ready(future: Any) -> None:
+                collector = collector_ref()
+                active_ticket = ticket_ref()
+                if collector is None or active_ticket is None:
+                    return
+                try:
+                    collector._loop.call_soon_threadsafe(
+                        collector._resume_cleanup_ticket,
+                        active_ticket,
+                        future,
+                    )
+                except RuntimeError as exc:
+                    with collector._cv:
+                        if collector._thread_error is None:
+                            collector._thread_error = exc
+                        collector._cv.notify_all()
+
+            try:
+                result.add_done_callback(ready)
+            except BaseException as exc:
+                with self._cv:
+                    if ticket.wait_future is result:
+                        ticket.wait_future = None
+                # Callback registration is part of the required public Future
+                # contract, not a transient remote operation.
+                ticket.finish(exc)
+                self._stop_loop_after_final_cleanup_ticket()
+                return
+            if ticket.abandon_wait is not None:
+                with self._cv:
+                    if ticket in self._cleanup_tickets and ticket.wait_future is result:
+                        ticket.wait_timeout = self._loop.call_later(
+                            self._cleanup_response_timeout(
+                                ticket.retry_count,
+                            ),
+                            self._timeout_cleanup_ticket,
+                            ticket,
+                            result,
+                        )
+            return
+
+        if result is False and ticket.retry_on_incomplete:
             self._retry_cleanup_ticket(ticket)
             return
-        ticket.finish(error)
+        ticket.finish(None)
+        self._stop_loop_after_final_cleanup_ticket()
+
+    def _stop_loop_after_final_cleanup_ticket(self) -> None:
         with self._cv:
             stop = self._shutdown and not self._cleanup_tickets
         if stop:
@@ -1418,13 +1495,17 @@ class AsyncResultCollector:
     def _cancel_record_wait_locked(self, record: _StreamRecord) -> None:
         future = record.wait_future
         completion_future = record.completion_future
+        output_submit_future = record.output_submit_future
         record.wait_future = None
         record.completion_future = None
+        record.output_submit_future = None
         record.wait_kind = ""
         if future is not None:
             future.cancel()
         if completion_future is not None:
             completion_future.cancel()
+        if output_submit_future is not None:
+            output_submit_future.cancel()
 
     @staticmethod
     def _object_ref_future(ref: Any) -> Any:
@@ -1731,22 +1812,90 @@ class AsyncResultCollector:
             record.output_cancel_sent = False
             record.phase = "output_lease"
 
-        output_lease_ref = driver.acquire_query_output_block_lease.remote(request)
+        output_submit_future = submit_ray_control(
+            lambda: driver.acquire_query_output_block_lease.remote(
+                dict(request),
+            )
+        )
         with self._cv:
             stale = self._shutdown or self._records.get(key) is not record or record.terminal
             if not stale:
-                record.output_lease_ref = output_lease_ref
+                record.output_submit_future = output_submit_future
             cancel_stale_request = stale and not record.output_cancel_sent
             if cancel_stale_request:
                 record.output_cancel_sent = True
         if stale:
+            output_submit_future.cancel()
             if cancel_stale_request:
                 self._submit_cleanup_operations(
                     (self._output_request_cancel_operation(driver, request),),
                     slot_ids=(record.slot_id,),
                 )
             return
+
+        collector_ref = weakref.ref(self)
+        record_ref = weakref.ref(record)
+
+        def submitted(done: Any) -> None:
+            collector = collector_ref()
+            active_record = record_ref()
+            if collector is None or active_record is None:
+                return
+            with collector._cv:
+                if collector._shutdown:
+                    return
+            try:
+                collector._loop.call_soon_threadsafe(
+                    collector._run_scheduler_callback,
+                    collector._complete_output_lease_submission,
+                    active_record,
+                    done,
+                )
+            except RuntimeError as exc:
+                with collector._cv:
+                    shutting_down = collector._shutdown
+                if not shutting_down:
+                    collector._report_scheduler_error(exc)
+
+        try:
+            output_submit_future.add_done_callback(submitted)
+        except BaseException:
+            with self._cv:
+                if record.output_submit_future is output_submit_future:
+                    record.output_submit_future = None
+            output_submit_future.cancel()
+            raise
         _collector_debug_log("output_lease_requested", record)
+
+    def _complete_output_lease_submission(
+        self,
+        record: _StreamRecord,
+        output_submit_future: Any,
+    ) -> None:
+        key = (record.slot_id, record.submit_id)
+        failure: BaseException | None = None
+        with self._cleanup_handoff_lock:
+            with self._cv:
+                if record.output_submit_future is not output_submit_future:
+                    return
+                record.output_submit_future = None
+                if self._shutdown or self._records.get(key) is not record or record.terminal:
+                    return
+            assert output_submit_future is not None
+            try:
+                output_lease_ref = output_submit_future.result()
+            except BaseException as exc:
+                failure = exc
+            else:
+                with self._cv:
+                    if self._shutdown or self._records.get(key) is not record or record.terminal:
+                        return
+                    record.output_lease_ref = output_lease_ref
+                    self._cv.notify_all()
+        if failure is not None:
+            self._fail_record(record, failure)
+            return
+        self._refresh_waiters()
 
     @staticmethod
     def _validate_task_identity(record: _StreamRecord, metadata: dict[str, Any]) -> None:

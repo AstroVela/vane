@@ -11,6 +11,7 @@ from concurrent.futures import Future
 
 import pytest
 
+import duckdb.execution.ray_control_submission as ray_control_submission
 import duckdb.execution.udf_task_admission as task_admission
 from duckdb.execution.udf_admission import (
     LocalExecutionSlotPool,
@@ -51,6 +52,23 @@ def _wait_for_remote_calls(method, count, *, timeout=1.0):
     while len(method.calls) < count and time.monotonic() < deadline:
         time.sleep(0.005)
     assert len(method.calls) == count
+
+
+def _wait_for_state(controller, expected, *, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    state = controller.state()
+    while state["state"] != expected and time.monotonic() < deadline:
+        time.sleep(0.005)
+        state = controller.state()
+    assert state["state"] == expected
+    return state
+
+
+def _wait_for_request_refs(driver, count, *, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while len(driver.requests) < count and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert len(driver.requests) == count
 
 
 class _FailingObjectRef:
@@ -107,13 +125,18 @@ def test_task_admission_setup_failure_cancels_the_remote_request(callback):
         lambda _request: _FailingObjectRef(callback=callback),
     )
     controller = TaskAdmissionController(_payload(), driver=driver)
+    failed = threading.Event()
+    controller.register_wakeup(failed.set)
 
     expected = "callback registration" if callback else "Future factory"
-    with pytest.raises(RuntimeError, match=expected):
-        controller.request(64)
+    assert controller.request(64)
 
+    assert failed.wait(timeout=1.0)
+    _wait_for_remote_calls(driver.acquire_query_task_lease, 1)
     request = driver.acquire_query_task_lease.calls[0][0][0]
     assert controller.state()["state"] == "failed"
+    with pytest.raises(RuntimeError, match=expected):
+        controller.request(64)
     _wait_for_remote_calls(driver.cancel_query_task_lease_request, 1)
     assert driver.cancel_query_task_lease_request.calls == [
         ((request,), {}),
@@ -154,6 +177,8 @@ def test_task_admission_has_one_unresolved_request_and_publishes_ready_lease():
 
     assert controller.request(64)
     assert not controller.request(64)
+    _wait_for_remote_calls(driver.acquire_query_task_lease, 1)
+    _wait_for_request_refs(driver, 1)
     assert len(driver.acquire_query_task_lease.calls) == 1
     request = driver.acquire_query_task_lease.calls[0][0][0]
     assert request["retained_input_bytes"] == 64
@@ -166,6 +191,7 @@ def test_task_admission_has_one_unresolved_request_and_publishes_ready_lease():
 
     driver.requests[0].resolve(_grant(request))
 
+    _wait_for_state(controller, "ready")
     assert wakeups == ["ready"]
     assert controller.state() == {
         "state": "ready",
@@ -187,8 +213,11 @@ def test_task_admission_does_not_consume_a_lease_for_different_input_bytes():
     driver = _Driver()
     controller = TaskAdmissionController(_payload(), driver=driver)
     assert controller.request(64)
+    _wait_for_remote_calls(driver.acquire_query_task_lease, 1)
+    _wait_for_request_refs(driver, 1)
     request = driver.acquire_query_task_lease.calls[0][0][0]
     driver.requests[0].resolve(_grant(request))
+    _wait_for_state(controller, "ready")
 
     with pytest.raises(RuntimeError, match="retained input bytes"):
         controller.take(32)
@@ -204,6 +233,8 @@ def test_task_admission_preserves_async_denial_reason():
     controller = TaskAdmissionController(_payload(), driver=driver)
     assert controller.request(16)
 
+    _wait_for_remote_calls(driver.acquire_query_task_lease, 1)
+    _wait_for_request_refs(driver, 1)
     driver.requests[0].resolve(
         {
             "granted": False,
@@ -212,7 +243,7 @@ def test_task_admission_preserves_async_denial_reason():
         }
     )
 
-    state = controller.state()
+    state = _wait_for_state(controller, "failed")
     assert state["state"] == "failed"
     assert "query_not_registered" in state["error"]
     with pytest.raises(RuntimeError, match="query_not_registered"):
@@ -223,6 +254,8 @@ def test_task_admission_close_cancels_pending_and_ready_leases():
     pending_driver = _Driver()
     pending = TaskAdmissionController(_payload(), driver=pending_driver)
     assert pending.request(32)
+    _wait_for_remote_calls(pending_driver.acquire_query_task_lease, 1)
+    _wait_for_request_refs(pending_driver, 1)
     pending_request = pending_driver.acquire_query_task_lease.calls[0][0][0]
 
     pending.close()
@@ -239,8 +272,11 @@ def test_task_admission_close_cancels_pending_and_ready_leases():
     ready_driver = _Driver()
     ready = TaskAdmissionController(_payload(), driver=ready_driver)
     assert ready.request(48)
+    _wait_for_remote_calls(ready_driver.acquire_query_task_lease, 1)
+    _wait_for_request_refs(ready_driver, 1)
     ready_request = ready_driver.acquire_query_task_lease.calls[0][0][0]
     ready_driver.requests[0].resolve(_grant(ready_request))
+    _wait_for_state(ready, "ready")
 
     ready.close()
 
@@ -253,6 +289,8 @@ def test_pending_admission_future_does_not_retain_closed_controller():
     driver = _Driver()
     controller = TaskAdmissionController(_payload(), driver=driver)
     assert controller.request(32)
+    _wait_for_remote_calls(driver.acquire_query_task_lease, 1)
+    _wait_for_request_refs(driver, 1)
     request = driver.acquire_query_task_lease.calls[0][0][0]
     controller_ref = weakref.ref(controller)
 
@@ -270,8 +308,11 @@ def test_taken_task_admission_abandons_if_submission_never_takes_ownership():
     driver = _Driver()
     controller = TaskAdmissionController(_payload(), driver=driver)
     assert controller.request(24)
+    _wait_for_remote_calls(driver.acquire_query_task_lease, 1)
+    _wait_for_request_refs(driver, 1)
     request = driver.acquire_query_task_lease.calls[0][0][0]
     driver.requests[0].resolve(_grant(request))
+    _wait_for_state(controller, "ready")
 
     admission = controller.take(24)
     admission.release()
@@ -279,6 +320,77 @@ def test_taken_task_admission_abandons_if_submission_never_takes_ownership():
 
     _wait_for_remote_calls(driver.cancel_query_task_lease_request, 1)
     assert driver.cancel_query_task_lease_request.calls == [((request,), {})]
+
+
+def test_blocked_task_admission_submission_does_not_stall_other_controller():
+    blocked_driver = _Driver()
+    blocked_submission_entered = threading.Event()
+    release_blocked_submission = threading.Event()
+
+    def blocked_acquire(request):
+        blocked_submission_entered.set()
+        if not release_blocked_submission.wait(timeout=5.0):
+            raise RuntimeError("timed out waiting to release blocked task admission")
+        return _resolved_ref(_grant(request))
+
+    blocked_driver.acquire_query_task_lease = _RemoteMethod(blocked_acquire)
+    blocked = TaskAdmissionController(_payload(), driver=blocked_driver)
+    healthy_driver = _Driver()
+    healthy = TaskAdmissionController(_payload(), driver=healthy_driver)
+    healthy_ready = threading.Event()
+    healthy.register_wakeup(healthy_ready.set)
+
+    try:
+        started_at = time.monotonic()
+        assert blocked.request(31)
+        request_elapsed = time.monotonic() - started_at
+
+        assert request_elapsed < 1.0
+        assert blocked_submission_entered.wait(timeout=1.0)
+
+        assert healthy.request(47)
+        _wait_for_remote_calls(healthy_driver.acquire_query_task_lease, 1)
+        _wait_for_request_refs(healthy_driver, 1)
+        healthy_request = healthy_driver.acquire_query_task_lease.calls[0][0][0]
+        healthy_driver.requests[0].resolve(_grant(healthy_request))
+
+        assert healthy_ready.wait(timeout=1.0)
+        assert healthy.state()["state"] == "ready"
+    finally:
+        release_blocked_submission.set()
+        blocked.close()
+        healthy.close()
+
+    _wait_for_remote_calls(blocked_driver.cancel_query_task_lease_request, 1)
+    _wait_for_remote_calls(healthy_driver.cancel_query_task_lease_request, 1)
+
+
+def test_blocked_task_admission_submission_does_not_retain_closed_controller():
+    driver = _Driver()
+    submission_entered = threading.Event()
+    release_submission = threading.Event()
+
+    def blocked_acquire(request):
+        submission_entered.set()
+        if not release_submission.wait(timeout=5.0):
+            raise RuntimeError("timed out waiting to release blocked task admission")
+        return _resolved_ref(_grant(request))
+
+    driver.acquire_query_task_lease = _RemoteMethod(blocked_acquire)
+    controller = TaskAdmissionController(_payload(), driver=driver)
+    assert controller.request(29)
+    assert submission_entered.wait(timeout=1.0)
+    controller_ref = weakref.ref(controller)
+
+    controller.close()
+    _wait_for_remote_calls(driver.cancel_query_task_lease_request, 1)
+    del controller
+    gc.collect()
+
+    try:
+        assert controller_ref() is None
+    finally:
+        release_submission.set()
 
 
 def test_task_admission_cancellation_retries_until_driver_acknowledges():
@@ -440,13 +552,13 @@ def test_task_admission_blocked_rpc_submissions_use_bounded_workers_without_bloc
         nonlocal entered
         with entered_lock:
             entered += 1
-            if entered == task_admission._TASK_ADMISSION_CLEANUP_SUBMISSION_WORKERS:
+            if entered == ray_control_submission._RAY_CONTROL_SUBMISSION_WORKERS:
                 all_workers_blocked.set()
         release_submissions.wait(timeout=5.0)
         return _resolved_ref({"cancelled": True})
 
     driver.cancel_query_task_lease_request = _RemoteMethod(cancel)
-    cancellation_count = task_admission._TASK_ADMISSION_CLEANUP_SUBMISSION_WORKERS + 64
+    cancellation_count = ray_control_submission._RAY_CONTROL_SUBMISSION_WORKERS + 64
     cancellations = [
         task_admission._TaskAdmissionCancellation(
             driver=driver,
@@ -476,13 +588,12 @@ def test_task_admission_blocked_rpc_submissions_use_bounded_workers_without_bloc
         assert all_workers_blocked.wait(timeout=2.0)
         assert deadline_fired.wait(timeout=1.0)
         assert (
-            len(driver.cancel_query_task_lease_request.calls)
-            == task_admission._TASK_ADMISSION_CLEANUP_SUBMISSION_WORKERS
+            len(driver.cancel_query_task_lease_request.calls) == ray_control_submission._RAY_CONTROL_SUBMISSION_WORKERS
         )
         submission_threads = [
-            thread for thread in threading.enumerate() if thread.name.startswith("vane-task-admission-submit-")
+            thread for thread in threading.enumerate() if thread.name.startswith("vane-ray-control-submit-")
         ]
-        assert len(submission_threads) == task_admission._TASK_ADMISSION_CLEANUP_SUBMISSION_WORKERS
+        assert len(submission_threads) == ray_control_submission._RAY_CONTROL_SUBMISSION_WORKERS
     finally:
         release_submissions.set()
 

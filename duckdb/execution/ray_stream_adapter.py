@@ -492,13 +492,17 @@ class RayStreamAdapter:
             if generator is None or completion_ref is None:
                 return True
             release_owner = self._release_owner
-            if self._terminal_kind == "cancel":
-                if release_owner is not None and not release_owner.generator_cancellation_complete:
-                    return False
-                if release_owner is None and not self._generator_cancelled and self._cancel_generator is not None:
-                    return False
+            if release_owner is not None and not release_owner.terminal_cleanup_complete:
+                return False
+            if (
+                self._terminal_kind == "cancel"
+                and release_owner is None
+                and not self._generator_cancelled
+                and self._cancel_generator is not None
+            ):
+                return False
             if self._active_reads or self._active_core_calls:
-                # The event loop retries after the in-flight call exits;
+                # The cleanup scheduler retries after the in-flight call exits;
                 # retirement prevents any new call from starting.
                 return False
             self._stream_cleanup_active = True
