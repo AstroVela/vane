@@ -174,6 +174,159 @@ def test_unregister_timeout_detaches_stale_dispatcher_work():
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped():
+    """A Ray stream returned after slot retirement must reach collector cleanup."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        from __future__ import annotations
+
+        import threading
+        import time
+
+        import _duckdb
+        import duckdb
+        import duckdb.execution.udf as udf_exec
+        import duckdb.execution.udf_stream_result_collector as collector_mod
+        import pyarrow as pa
+
+        submit_entered = threading.Event()
+        release_submit = threading.Event()
+        discarded = threading.Event()
+        executor_closed = threading.Event()
+        submitted_ref = object()
+
+
+        class FakeCollector:
+            def __init__(self):
+                self._wakeup = None
+
+            def set_wakeup_callback(self, callback):
+                self._wakeup = callback
+
+            def discard_generator_ref(self, ref):
+                assert ref is submitted_ref
+                discarded.set()
+
+            def cancel_slot(self, _slot_id):
+                return None
+
+            def slot_has_pending(self, _slot_id):
+                return False
+
+            def drain_results(self, _capacities):
+                return []
+
+            def shutdown(self):
+                return None
+
+
+        class FakeExecutor:
+            def __init__(self):
+                self._wakeup = None
+                self._admission_state = "idle"
+                self._retained_input_bytes = 0
+
+            def register_wakeup(self, callback):
+                self._wakeup = callback
+
+            def request_task_admission(self, retained_input_bytes):
+                self._retained_input_bytes = int(retained_input_bytes)
+                self._admission_state = "ready"
+                return True
+
+            def task_admission_state(self):
+                return {
+                    "state": self._admission_state,
+                    "available": self._admission_state == "ready",
+                    "retained_input_bytes": self._retained_input_bytes,
+                }
+
+            def submit_with_id(self, _submit_id, _table):
+                self._admission_state = "idle"
+                submit_entered.set()
+                if not release_submit.wait(timeout=10):
+                    raise RuntimeError("test did not release blocked Ray submit")
+                return submitted_ref
+
+            def finished_submitting(self):
+                return None
+
+            def all_tasks_finished(self):
+                return False
+
+            def close(self):
+                executor_closed.set()
+
+
+        def build_executor(_payload, options=None):
+            del options
+            return FakeExecutor()
+
+
+        def passthrough(table):
+            return pa.table({"y": table.column(0)})
+
+
+        udf_exec.build_executor = build_executor
+        collector_mod.AsyncResultCollector = FakeCollector
+        connection = duckdb.connect()
+        relation = connection.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
+            passthrough,
+            schema={"y": duckdb.sqltypes.BIGINT},
+            execution_backend="ray_task",
+        )
+        query_errors = []
+
+
+        def run_query():
+            try:
+                relation.fetchall()
+            except BaseException as exc:
+                query_errors.append(exc)
+
+
+        query_thread = threading.Thread(target=run_query)
+        query_thread.start()
+        try:
+            assert submit_entered.wait(timeout=5), "dispatcher never entered the Ray submit"
+            connection.interrupt()
+            teardown_deadline = time.monotonic() + 5
+            while query_thread.is_alive() and time.monotonic() < teardown_deadline:
+                _duckdb._wake_udf_executor_slots_for_testing()
+                query_thread.join(timeout=0.01)
+            assert not query_thread.is_alive(), "query teardown did not honor the unregister deadline"
+            assert query_errors, "the interrupted query unexpectedly succeeded"
+
+            release_submit.set()
+            assert discarded.wait(timeout=5), "stale Ray stream was dropped without collector cleanup"
+            assert executor_closed.wait(timeout=5), "retired executor was not eventually closed"
+        finally:
+            release_submit.set()
+            query_thread.join(timeout=5)
+            connection.close()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+        env={
+            **os.environ,
+            "VANE_ENABLE_UDF_TEST_HOOKS": "1",
+            "VANE_UDF_UNREGISTER_TIMEOUT_MS": "50",
+        },
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_unregister_timeout_keeps_context_alive_during_input_conversion():
     """Input Arrow conversion must not outlive its ClientContext lease."""
     import os

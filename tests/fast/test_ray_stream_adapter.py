@@ -107,7 +107,6 @@ class _FakeRay:
 def _driver(grant):
     return SimpleNamespace(
         acquire_query_task_lease=_RemoteMethod(lambda _request: _Ref(grant)),
-        mark_query_task_lease_submitted=_RemoteMethod(lambda *_args: _Ref({"submitted": True})),
         release_query_task_lease=_RemoteMethod(lambda *_args: _Ref({"released": True})),
         release_query_task_lease_after_completion=_RemoteMethod(lambda *_args: _Ref({"scheduled": True})),
         handoff_query_task_lease_to_teardown=_RemoteMethod(lambda *_args: _Ref({"handed_off": True})),
@@ -282,7 +281,6 @@ def test_task_lease_stream_submits_immediately_from_pregranted_admission():
     adapter = RayStreamAdapter(source, ray_module=fake_ray)
 
     assert submitted == [lease]
-    assert driver.mark_query_task_lease_submitted.calls[0][0] == ("request-1", "lease-1")
 
     adapter.release_task()
     adapter.release_task()

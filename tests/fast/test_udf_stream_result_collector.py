@@ -273,7 +273,6 @@ class _Driver:
         self.next_task = 0
         self.next_output = 0
         self.acquire_query_task_lease = _RemoteMethod(self._acquire_task)
-        self.mark_query_task_lease_submitted = _RemoteMethod(lambda *_args: {"submitted": True})
         self.release_query_task_lease = _RemoteMethod(lambda *_args: {"released": True})
         self.release_query_task_lease_after_completion = _RemoteMethod(lambda *_args: {"scheduled": True})
         self.handoff_query_task_lease_to_teardown = _RemoteMethod(lambda *_args: {"handed_off": True})
@@ -501,7 +500,7 @@ def test_scheduler_failure_rejection_cancels_the_unpublished_submitted_stream():
     collector.shutdown()
 
 
-def test_registration_is_not_schedulable_until_track_accepts_it(monkeypatch):
+def test_registration_is_not_visible_until_track_commits_it(monkeypatch):
     fake_ray = _FakeRay()
     driver = _Driver()
     collector = AsyncResultCollector(ray_module=fake_ray)
@@ -549,8 +548,7 @@ def test_registration_is_not_schedulable_until_track_accepts_it(monkeypatch):
         assert registration_paused.wait(timeout=1)
         time.sleep(0.05)
         with collector._cv:
-            record = collector._records[(1, 2)]
-            assert record.registration_accepted is False
+            assert (1, 2) not in collector._records
         assert generators[0].read_count == 0
         assert collector._ready_by_slot.get(1) is None
 
@@ -567,6 +565,38 @@ def test_registration_is_not_schedulable_until_track_accepts_it(monkeypatch):
     finally:
         allow_registration.set()
         registration.join(timeout=2)
+        collector.shutdown()
+
+
+def test_discarded_submitted_stream_enters_terminal_cleanup_ledger():
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    generator = _Generator([], completed=False)
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    try:
+        collector.discard_generator_ref(
+            _source(
+                fake_ray,
+                driver,
+                request_id="stale-submission-discard",
+                submitter=lambda _lease: generator,
+            )
+        )
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and generator.worker is not None:
+            time.sleep(0.005)
+
+        with collector._cv:
+            assert collector._records == {}
+            assert collector._cleanup_tickets == set()
+        assert len(driver.release_query_task_lease_after_completion.calls) == 1
+        assert fake_ray.cancel_calls == [
+            (generator, {"force": True, "recursive": True}),
+        ]
+        assert generator.deleted_streams == [generator.completion_ref]
+        assert generator.worker is None
+    finally:
         collector.shutdown()
 
 
@@ -617,7 +647,7 @@ def test_bounded_cleanup_lane_retries_transient_failure_without_starving_peer(
         if attempts < 6:
             raise RuntimeError("planned transient cleanup failure")
 
-    group = collector._submit_cleanup_operations(
+    tickets = collector._submit_cleanup_operations(
         (
             RayStreamCleanupOperation(
                 RAY_STREAM_CLEANUP_CONTROL,
@@ -632,9 +662,14 @@ def test_bounded_cleanup_lane_retries_transient_failure_without_starving_peer(
         store_error=False,
     )
     try:
-        assert group is not None
-        assert group.wait(timeout=1)
-        assert group.errors == ()
+        assert len(tickets) == 2
+        assert (
+            collector._wait_cleanup_tickets(
+                tickets,
+                timeout_message="cleanup tickets did not finish",
+            )
+            == ()
+        )
         assert order == ["retry-1", "peer", "retry-2", "retry-3", "retry-4", "retry-5", "retry-6"]
     finally:
         collector.shutdown()
@@ -658,11 +693,16 @@ def test_scheduler_fence_preserves_incomplete_ownership_retry():
             ),
         )
     )
-    group = collector._submit_cleanup_operations(operations, store_error=False)
+    tickets = collector._submit_cleanup_operations(operations, store_error=False)
     try:
-        assert group is not None
-        assert group.wait(timeout=1)
-        assert group.errors == ()
+        assert len(tickets) == 1
+        assert (
+            collector._wait_cleanup_tickets(
+                tickets,
+                timeout_message="cleanup ticket did not finish",
+            )
+            == ()
+        )
         assert attempts == 2
     finally:
         collector.shutdown()
@@ -1152,7 +1192,7 @@ def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
         # blocked, but the record cannot complete until the whole plan settles.
         assert [item[2] for item in events] == ["data"]
         assert collector._records
-        assert collector._cleanup_groups
+        assert collector._cleanup_tickets
         generator = generator_holder["generator"]
         assert source_ref() is None
         assert generator.deleted_streams == [generator.completion_ref]
@@ -2144,10 +2184,8 @@ def test_stream_error_wakes_dispatcher_before_generator_cancellation():
         ),
     )
     try:
-        deadline = time.monotonic() + 2.0
-        while not driver.mark_query_task_lease_submitted.calls and time.monotonic() < deadline:
-            time.sleep(0.005)
-        assert driver.mark_query_task_lease_submitted.calls
+        with collector._cv:
+            assert len(collector._records) == 2
         wakeup.clear()
 
         collector.drain_results({8: {"rows": 1, "bytes": 128, "item_bytes": 128}})

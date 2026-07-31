@@ -2466,6 +2466,7 @@ private:
 			// preserving the C++ submit_id -> input rows association.
 			py::object ref = slot.py_executor->obj.attr("submit_with_id")(py::int_(task.submit_id), py_args);
 			if (!IsActiveSlotGeneration(slot, generation)) {
+				DiscardSubmittedPythonRef_WithGIL(ref);
 				return;
 			}
 			ConsumeTaskAdmissionReservation(slot);
@@ -2515,10 +2516,21 @@ private:
 		return py::make_tuple(std::move(refs), std::move(slices), std::move(metadata), std::move(names));
 	}
 
+	void DiscardSubmittedPythonRef_WithGIL(py::object &ref) {
+		if (ref.is_none()) {
+			return;
+		}
+		if (!async_collector) {
+			throw InvalidInputException("udf async collector is unavailable for stale submitted work");
+		}
+		async_collector->obj.attr("discard_generator_ref")(ref);
+	}
+
 	void TrackSubmittedPythonRef_WithGIL(ExecutorSlot &slot, idx_t submit_id, py::object &ref,
 	                                     unique_ptr<DataChunk> rows, uint64_t generation,
 	                                     bool require_generator_ref = false) {
 		if (!IsActiveSlotGeneration(slot, generation)) {
+			DiscardSubmittedPythonRef_WithGIL(ref);
 			return;
 		}
 		if (ref.is_none()) {
@@ -2540,6 +2552,7 @@ private:
 			error_context = slot.py_executor->obj.attr("error_context")();
 		}
 		if (!IsActiveSlotGeneration(slot, generation)) {
+			DiscardSubmittedPythonRef_WithGIL(ref);
 			return;
 		}
 		async_collector->obj.attr("track_generator_ref")(py::int_(slot.id), py::int_(submit_id), ref, error_context);
@@ -2570,6 +2583,7 @@ private:
 			py::object ref = slot.py_executor->obj.attr("submit_ref_bundle_with_id")(py::int_(task.submit_id), refs,
 			                                                                         slices, metadata, names);
 			if (!IsActiveSlotGeneration(slot, generation)) {
+				DiscardSubmittedPythonRef_WithGIL(ref);
 				return;
 			}
 			ConsumeTaskAdmissionReservation(slot);

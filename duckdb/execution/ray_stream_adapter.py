@@ -147,10 +147,6 @@ class TaskLeaseObjectRefGenerator:
         try:
             admission.handoff()
             self._validate_and_bind_completion()
-            self._driver.mark_query_task_lease_submitted.remote(
-                self._request_id,
-                str(lease["lease_id"]),
-            )
         except BaseException as submission_error:
             cleanup_errors: list[BaseException] = []
             try:

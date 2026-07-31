@@ -135,9 +135,6 @@ def test_driver_task_lease_wait_is_event_driven_and_release_wakes_next_request()
         first = await runner_cls.acquire_query_task_lease(runner, first_request)
         assert first["granted"]
         first_lease = first["lease"]
-        assert await runner_cls.mark_query_task_lease_submitted(
-            runner, first_request["request_id"], first_lease["lease_id"]
-        ) == {"submitted": True}
 
         second_request = _task_request(query_id, "request:second", "task:second")
         second_waiter = asyncio.create_task(runner_cls.acquire_query_task_lease(runner, second_request))
@@ -457,11 +454,6 @@ def test_submitted_task_lease_is_released_only_after_remote_completion(completio
         )
         active = await runner_cls.acquire_query_task_lease(runner, active_request)
         lease = active["lease"]
-        assert await runner_cls.mark_query_task_lease_submitted(
-            runner,
-            active_request["request_id"],
-            lease["lease_id"],
-        ) == {"submitted": True}
 
         pending_request = _task_request(
             query_id,
@@ -553,12 +545,12 @@ def test_query_close_retains_completion_owner_until_remote_task_is_terminal():
         await asyncio.sleep(0)
 
         assert request["request_id"] in runner._query_task_completion_waiters
-        assert runner._query_task_lease_requests == {}
+        assert runner._query_task_lease_requests[request["request_id"]]["status"] == "completion_wait"
         assert lease["lease_id"] in manager.snapshot()["task_leases"]
 
         teardown_fence = asyncio.create_task(
             asyncio.to_thread(
-                runner_cls._wait_for_query_task_execution_owners,
+                runner_cls._wait_for_query_task_leases,
                 runner,
                 query_id,
                 timeout_s=1,
@@ -572,7 +564,7 @@ def test_query_close_retains_completion_owner_until_remote_task_is_terminal():
         await asyncio.wait_for(teardown_fence, timeout=1)
 
         assert runner._query_task_completion_waiters == {}
-        assert runner._query_task_execution_owners == {}
+        assert runner._query_task_lease_requests == {}
         assert lease["lease_id"] not in manager.snapshot()["task_leases"]
 
     asyncio.run(scenario())
@@ -593,19 +585,13 @@ def test_query_close_before_completion_handoff_cannot_erase_execution_owner():
         )
         grant = await runner_cls.acquire_query_task_lease(runner, request)
         lease = grant["lease"]
-        assert await runner_cls.mark_query_task_lease_submitted(
-            runner,
-            request["request_id"],
-            lease["lease_id"],
-        ) == {"submitted": True}
 
         runner_cls._close_query_resource_admission(runner, query_id)
-        assert runner._query_task_lease_requests == {}
-        assert runner._query_task_execution_owners[request["request_id"]].phase == "submitted"
+        assert runner._query_task_lease_requests[request["request_id"]]["status"] == "granted"
 
         teardown_fence = asyncio.create_task(
             asyncio.to_thread(
-                runner_cls._wait_for_query_task_execution_owners,
+                runner_cls._wait_for_query_task_leases,
                 runner,
                 query_id,
                 timeout_s=1,
@@ -623,13 +609,13 @@ def test_query_close_before_completion_handoff_cannot_erase_execution_owner():
             lease["attempt_id"],
             [SimpleNamespace(future=lambda: completion)],
         ) == {"scheduled": True}
-        assert runner._query_task_execution_owners[request["request_id"]].phase == "completion_wait"
+        assert runner._query_task_lease_requests[request["request_id"]]["status"] == "completion_wait"
         assert not teardown_fence.done()
 
         completion.set_result(None)
         await asyncio.wait_for(teardown_fence, timeout=1)
 
-        assert runner._query_task_execution_owners == {}
+        assert runner._query_task_lease_requests == {}
         assert runner._query_task_completion_waiters == {}
         assert manager.snapshot()["task_leases"] == {}
         assert await runner_cls.release_query_task_lease_after_completion(
@@ -661,115 +647,60 @@ def test_query_task_completion_owner_fence_is_bounded():
 
     runner_cls, runner = _runner(None)
     runner_cls._ensure_query_resource_admission_state(runner)
-    runner._query_task_execution_owners["request:still-running"] = SimpleNamespace(
-        query_id="query:still-running",
-        phase="submitted",
-    )
+    runner._query_task_lease_requests["request:still-running"] = {
+        "identity": {"query_id": "query:still-running"},
+        "status": "granted",
+    }
 
     with pytest.raises(
         QueryTeardownOwnershipError,
         match="request:still-running",
     ):
-        runner_cls._wait_for_query_task_execution_owners(
+        runner_cls._wait_for_query_task_leases(
             runner,
             "query:still-running",
             timeout_s=0.01,
         )
 
 
-def test_task_grant_owner_registration_failure_is_fatal_and_atomic():
+def test_task_grant_is_published_in_the_admission_ledger_before_future_completion():
     async def scenario():
-        query_id = "query-owner-registration-failure"
+        query_id = "query-single-task-ledger"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
         manager = register_query_graph(graph, _allocation())
         manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
         request = _task_request(
             query_id,
-            "request:owner-registration-failure",
-            "task:owner-registration-failure",
+            "request:single-ledger",
+            "task:single-ledger",
         )
+        observed = []
+        complete_request = runner_cls._complete_lease_request
 
-        def fail_registration(*, request_id, state):
-            del request_id, state
-            raise RuntimeError("planned owner registration failure")
-
-        runner._register_query_task_execution_owner = fail_registration
-        denial = await runner_cls.acquire_query_task_lease(runner, request)
-
-        assert denial["granted"] is False
-        assert denial["fatal"] is True
-        assert denial["blocked_reason"] == "task_execution_owner_registration_failed"
-        assert manager.snapshot()["task_leases"] == {}
-        assert runner._query_task_execution_owners == {}
-        assert request["request_id"] not in runner._query_task_lease_requests
-        assert runner._query_task_lease_request_tombstones[request["request_id"]]["result"] == denial
-        assert "planned owner registration failure" in runner._query_terminal_errors[query_id]
-
-        replay = await runner_cls.acquire_query_task_lease(runner, request)
-        assert replay == denial
-        late = await runner_cls.acquire_query_task_lease(
-            runner,
-            _task_request(
-                query_id,
-                "request:after-owner-registration-failure",
-                "task:after-owner-registration-failure",
-            ),
-        )
-        assert late["granted"] is False
-        assert late["fatal"] is True
-        assert late["blocked_reason"] == "query_not_registered"
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("rollback_raises", [False, True])
-def test_task_grant_owner_registration_rollback_retains_uncertain_lease_for_teardown(
-    rollback_raises,
-):
-    from duckdb.runners.ray.driver import QueryTeardownOwnershipError
-
-    async def scenario():
-        query_id = f"query-owner-registration-rollback-{rollback_raises}"
-        graph = _graph(query_id)
-        runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(graph, _allocation())
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
-        request = _task_request(
-            query_id,
-            "request:owner-registration-rollback",
-            "task:owner-registration-rollback",
-        )
-
-        def fail_registration(*, request_id, state):
-            del request_id, state
-            raise RuntimeError("planned owner registration failure")
-
-        def fail_rollback(lease_id, *, attempt_id):
-            del lease_id, attempt_id
-            if rollback_raises:
-                raise RuntimeError("planned grant rollback failure")
-            return False
-
-        runner._register_query_task_execution_owner = fail_registration
-        manager.abandon_task_lease = fail_rollback
-        denial = await runner_cls.acquire_query_task_lease(runner, request)
-
-        assert denial["granted"] is False
-        assert denial["fatal"] is True
-        owner = runner._query_task_execution_owners[request["request_id"]]
-        assert owner.query_id == query_id
-        assert owner.phase == "teardown_owned"
-        assert owner.lease_id in manager.snapshot()["task_leases"]
-        with pytest.raises(QueryTeardownOwnershipError):
-            runner_cls._wait_for_query_task_execution_owners(
-                runner,
-                query_id,
-                timeout_s=0.01,
+        def inspect_grant(state, result):
+            observed.append(
+                (
+                    runner._query_task_lease_requests.get(request["request_id"]) is state,
+                    state["status"],
+                    dict(state["lease"]),
+                )
             )
+            complete_request(state, result)
 
-        runner_cls._mark_query_execution_quiesced(runner, query_id)
-        assert runner._query_task_execution_owners == {}
+        runner._complete_lease_request = inspect_grant
+        grant = await runner_cls.acquire_query_task_lease(runner, request)
+
+        assert grant["granted"] is True
+        assert observed == [(True, "granted", grant["lease"])]
+        assert not hasattr(runner, "_query_task_execution_owners")
+        assert not hasattr(runner, "_query_task_execution_replays")
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            request["request_id"],
+            grant["lease"]["lease_id"],
+            grant["lease"]["attempt_id"],
+        ) == {"released": True}
 
     asyncio.run(scenario())
 
@@ -811,11 +742,11 @@ def test_query_resource_release_stops_before_qrm_when_grant_owner_is_unresolved(
         )
         grant = await runner_cls.acquire_query_task_lease(runner, request)
         lease = grant["lease"]
-        original_wait = runner_cls._wait_for_query_task_execution_owners.__get__(
+        original_wait = runner_cls._wait_for_query_task_leases.__get__(
             runner,
             runner_cls,
         )
-        runner._wait_for_query_task_execution_owners = lambda owner_query_id: original_wait(
+        runner._wait_for_query_task_leases = lambda owner_query_id: original_wait(
             owner_query_id,
             timeout_s=0.01,
         )
@@ -879,9 +810,8 @@ def test_missing_completion_contract_hands_live_lease_to_query_teardown():
         ) == {"handed_off": True}
 
         assert lease["lease_id"] in manager.snapshot()["task_leases"]
-        assert request["request_id"] not in runner._query_task_lease_requests
-        assert runner._query_task_lease_request_tombstones[request["request_id"]]["status"] == "teardown_owned"
-        assert runner._query_task_execution_owners[request["request_id"]].phase == "teardown_owned"
+        assert runner._query_task_lease_requests[request["request_id"]]["status"] == "teardown_owned"
+        assert request["request_id"] not in runner._query_task_lease_request_tombstones
         completion = Future()
         assert await runner_cls.release_query_task_lease_after_completion(
             runner,
@@ -893,7 +823,8 @@ def test_missing_completion_contract_hands_live_lease_to_query_teardown():
         assert runner._query_task_completion_waiters == {}
 
         runner_cls._mark_query_execution_quiesced(runner, query_id)
-        assert runner._query_task_execution_owners == {}
+        assert runner._query_task_lease_requests == {}
+        assert runner._query_task_lease_request_tombstones[request["request_id"]]["status"] == "teardown_owned"
         assert await runner_cls.handoff_query_task_lease_to_teardown(
             runner,
             request["request_id"],

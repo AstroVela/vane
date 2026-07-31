@@ -139,21 +139,20 @@ class _StreamRecord:
     next_ref_ready: bool = False
     ready_sequence: int | None = None
     cleanup_started: bool = False
-    registration_accepted: bool = True
-    registration_cancelled: bool = False
+    cleanup_remaining: int = 0
+    cleanup_error: BaseException | None = None
 
 
-class _CleanupGroup:
-    """Completion fence for one atomically accepted terminal cleanup plan."""
+class _CleanupTicket:
+    """Durable owner for one blocking terminal operation."""
 
     def __init__(
         self,
-        operation_count: int,
         *,
         on_complete: Callable[[BaseException | None], None],
     ) -> None:
-        self._remaining = int(operation_count)
-        self._errors: list[BaseException] = []
+        self._done = False
+        self._error: BaseException | None = None
         self._on_complete = on_complete
         self._callback_thread: threading.Thread | None = None
         self._callback_complete = False
@@ -161,23 +160,17 @@ class _CleanupGroup:
 
     def finish(self, error: BaseException | None) -> None:
         callback: Callable[[BaseException | None], None] | None = None
-        first_error: BaseException | None = None
         with self._cv:
-            if error is not None:
-                self._errors.append(error)
-            self._remaining -= 1
-            if self._remaining < 0:
-                raise RuntimeError("Ray UDF cleanup group count underflow")
-            if self._remaining == 0:
-                callback = self._on_complete
-                self._on_complete = lambda _error: None
-                first_error = self._errors[0] if self._errors else None
-                self._callback_thread = threading.current_thread()
-                self._cv.notify_all()
-        if callback is None:
-            return
+            if self._done:
+                raise RuntimeError("Ray UDF cleanup ticket completed twice")
+            self._done = True
+            self._error = error
+            callback = self._on_complete
+            self._on_complete = lambda _error: None
+            self._callback_thread = threading.current_thread()
+            self._cv.notify_all()
         try:
-            callback(first_error)
+            callback(error)
         finally:
             with self._cv:
                 self._callback_thread = None
@@ -188,7 +181,7 @@ class _CleanupGroup:
         deadline = time.monotonic() + max(0.0, float(timeout))
         current = threading.current_thread()
         with self._cv:
-            while self._remaining or (not self._callback_complete and self._callback_thread is not current):
+            while not self._done or (not self._callback_complete and self._callback_thread is not current):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
@@ -197,18 +190,18 @@ class _CleanupGroup:
 
     def callback_owned_by_current_thread(self) -> bool:
         with self._cv:
-            return self._remaining == 0 and self._callback_thread is threading.current_thread()
+            return self._done and self._callback_thread is threading.current_thread()
 
     @property
     def errors(self) -> tuple[BaseException, ...]:
         with self._cv:
-            return tuple(self._errors)
+            return () if self._error is None else (self._error,)
 
 
 @dataclass
 class _CleanupWorkItem:
     operation: Callable[[], Any]
-    group: _CleanupGroup
+    ticket: _CleanupTicket
     retry_on_error: bool = False
     retry_on_incomplete: bool = False
     retry_count: int = 0
@@ -263,25 +256,11 @@ class _DaemonCleanupPool:
 
     def _enqueue_locked(
         self,
-        operations: Sequence[Callable[[], Any]],
-        group: _CleanupGroup,
+        items: Sequence[_CleanupWorkItem],
     ) -> None:
         if not self._started or self._stop_when_idle:
             raise RuntimeError(f"Ray UDF cleanup pool {self._name!r} is not accepting work")
         ready_at = time.monotonic()
-        items = [
-            _CleanupWorkItem(
-                operation,
-                group,
-                retry_on_error=(
-                    operation.retry_on_error if isinstance(operation, RayStreamCleanupOperation) else False
-                ),
-                retry_on_incomplete=(
-                    operation.retry_on_incomplete if isinstance(operation, RayStreamCleanupOperation) else False
-                ),
-            )
-            for operation in operations
-        ]
         for item in items:
             sequence = self._next_queue_sequence
             self._next_queue_sequence += 1
@@ -367,7 +346,7 @@ class _DaemonCleanupPool:
                 del error
                 del result
                 continue
-            item.group.finish(error)
+            item.ticket.finish(error)
             del item
             del error
             del result
@@ -376,9 +355,9 @@ class _DaemonCleanupPool:
 class AsyncResultCollector:
     """Capacity-aware scheduler for lease-owned Ray generator streams.
 
-    ``_cv`` owns every local stream transition. A registering record is not
-    schedulable until ``track_generator_ref`` commits its accepted bit, and a
-    terminal record is removed only while ``_cleanup_handoff_lock`` prevents
+    ``_cv`` owns every published stream transition. Registration first starts
+    the scheduler, then publishes a complete record in one critical section.
+    A terminal record is removed only while ``_cleanup_handoff_lock`` prevents
     shutdown from observing an ownership gap.
 
     The asyncio thread is the sole generator readiness/read consumer. Terminal
@@ -416,8 +395,8 @@ class AsyncResultCollector:
         self._next_sequence = 0
         self._next_ready_sequence = 0
         self._cleanup_handoff_lock = threading.RLock()
-        self._cleanup_groups: set[_CleanupGroup] = set()
-        self._cleanup_groups_by_slot: dict[int, set[_CleanupGroup]] = defaultdict(set)
+        self._cleanup_tickets: set[_CleanupTicket] = set()
+        self._cleanup_tickets_by_slot: dict[int, set[_CleanupTicket]] = defaultdict(set)
         self._terminal_cleanup_errors: list[BaseException] = []
         self._cleanup_pools_stopping = False
         self._cleanup_pools = {
@@ -489,83 +468,84 @@ class AsyncResultCollector:
         key = (int(slot_id), int(submit_id))
         adapter: RayStreamAdapter | None = None
         record: _StreamRecord | None = None
-        accepted = False
+        cleanup_tickets: tuple[_CleanupTicket, ...] = ()
         try:
-            # Serialize only registration/startup against shutdown. The record
-            # stays invisible to the scheduler until the final accepted bit is
-            # committed, so a ready stream cannot retire before C++ owns its
-            # corresponding submit_id.
             with self._start_lock:
-                adapter = RayStreamAdapter(source, ray_module=self._ray)
-                source = None
-                with self._cv:
-                    self._raise_if_stopped_locked()
-                    if key in self._records:
-                        raise ValueError(f"duplicate Ray UDF stream identity slot={key[0]} submit={key[1]}")
-                    if key[0] in self._cancelled_slots:
-                        raise RuntimeError(f"Ray UDF slot {key[0]} is cancelled")
-                    record = _StreamRecord(
-                        slot_id=key[0],
-                        submit_id=key[1],
-                        adapter=adapter,
-                        sequence=self._next_sequence,
-                        error_context=dict(error_context) if error_context else None,
-                        registration_accepted=False,
-                    )
-                    self._next_sequence += 1
-                    self._records[key] = record
-                    self._cv.notify_all()
-                self._ensure_started()
-                with self._cv:
-                    if self._records.get(key) is record:
-                        record.registration_accepted = True
-                        accepted = True
-                        self._signal_readiness_change_locked()
-                    elif record.registration_cancelled:
-                        raise RuntimeError(
-                            f"Ray UDF stream slot={key[0]} submit={key[1]} was cancelled during registration"
+                try:
+                    adapter = RayStreamAdapter(source, ray_module=self._ray)
+                    source = None
+                    self._ensure_started()
+                    with self._cv:
+                        self._raise_if_stopped_locked()
+                        if key in self._records:
+                            raise ValueError(f"duplicate Ray UDF stream identity slot={key[0]} submit={key[1]}")
+                        if key[0] in self._cancelled_slots:
+                            raise RuntimeError(f"Ray UDF slot {key[0]} is cancelled")
+                        record = _StreamRecord(
+                            slot_id=key[0],
+                            submit_id=key[1],
+                            adapter=adapter,
+                            sequence=self._next_sequence,
+                            error_context=dict(error_context) if error_context else None,
                         )
-                    else:
-                        raise RuntimeError(f"Ray UDF stream slot={key[0]} submit={key[1]} lost registration ownership")
+                        self._next_sequence += 1
+                        self._records[key] = record
+                        self._signal_readiness_change_locked()
+                except BaseException:
+                    with self._cleanup_handoff_lock:
+                        cleanup_operations: Sequence[Callable[[], Any]] = ()
+                        with self._cv:
+                            if record is not None and self._records.pop(key, None) is record:
+                                record.terminal = True
+                                record.cleanup_started = True
+                                cleanup_operations = record.adapter.cancel_operations()
+                                self._signal_readiness_change_locked()
+                            elif adapter is not None:
+                                cleanup_operations = adapter.cancel_operations()
+                            elif source is not None:
+                                cleanup_operations = source.cancel_operations()
+                                source.retire_local_state()
+                        if cleanup_operations:
+                            cleanup_tickets = self._submit_cleanup_operations(
+                                self._fence_cleanup_operations(cleanup_operations),
+                                store_error=False,
+                                slot_ids=(key[0],),
+                            )
+                    raise
             assert record is not None
             _collector_debug_log("track", record)
             self._refresh_waiters()
         except BaseException as registration_error:
-            cleanup_group: _CleanupGroup | None = None
-            with self._cleanup_handoff_lock:
-                cleanup_operations: Sequence[Callable[[], Any]] = ()
-                with self._cv:
-                    if record is not None and self._records.pop(key, None) is record:
-                        record.terminal = True
-                        record.cleanup_started = True
-                        cleanup_operations = record.adapter.cancel_operations()
-                        self._signal_readiness_change_locked()
-                    elif record is None and adapter is not None:
-                        cleanup_operations = adapter.cancel_operations()
-                    elif record is None and source is not None:
-                        cleanup_operations = source.cancel_operations()
-                        source.retire_local_state()
-                if cleanup_operations:
-                    cleanup_group = self._submit_cleanup_operations(
-                        self._fence_cleanup_operations(cleanup_operations),
-                        store_error=False,
-                        slot_ids=(key[0],),
+            if cleanup_tickets:
+                try:
+                    cleanup_errors = self._wait_cleanup_tickets(
+                        cleanup_tickets,
+                        timeout_message="submitted Ray stream cleanup did not terminate",
                     )
-            if cleanup_group is not None:
-                cleanup_complete = cleanup_group.wait(self._shutdown_timeout_s)
-                cleanup_errors = cleanup_group.errors
-                if not cleanup_complete or cleanup_errors:
-                    detail = (
-                        "cleanup did not terminate"
-                        if not cleanup_complete
-                        else "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
-                    )
+                    detail = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
+                except BaseException as cleanup_error:
+                    detail = f"{type(cleanup_error).__name__}: {cleanup_error}"
+                if detail:
                     add_note = getattr(registration_error, "add_note", None)
                     if callable(add_note):
                         add_note(f"submitted Ray stream cleanup failed: {detail}")
             raise
-        if not accepted:
-            raise RuntimeError(f"Ray UDF stream slot={key[0]} submit={key[1]} was not accepted")
+
+    def discard_generator_ref(self, source: Any) -> None:
+        """Cancel a submitted stream rejected by the C++ slot-generation fence."""
+        if not isinstance(source, TaskLeaseObjectRefGenerator):
+            raise TypeError(
+                f"distributed Ray UDF discard requires TaskLeaseObjectRefGenerator; got {type(source).__name__}"
+            )
+        with self._start_lock:
+            adapter = RayStreamAdapter(source, ray_module=self._ray)
+            with self._cv:
+                self._raise_if_stopped_locked()
+            with self._cleanup_handoff_lock:
+                self._submit_cleanup_operations(
+                    adapter.cancel_operations(),
+                    store_error=True,
+                )
 
     def drain_results(self, capacities: dict[Any, Any] | None = None) -> list[tuple[Any, ...]]:
         parsed = self._parse_capacities(capacities)
@@ -635,7 +615,7 @@ class AsyncResultCollector:
         try:
             self._submit_cleanup_operations(
                 (self._output_token_release_operation(token),),
-                on_done=finish_release,
+                on_each_done=finish_release,
                 slot_ids=(token.slot_id,),
             )
         except BaseException:
@@ -670,7 +650,7 @@ class AsyncResultCollector:
         try:
             self._submit_cleanup_operations(
                 (self._output_token_handoff_operation(token),),
-                on_done=finish_handoff,
+                on_each_done=finish_handoff,
                 slot_ids=(token.slot_id,),
             )
         except BaseException:
@@ -780,20 +760,18 @@ class AsyncResultCollector:
 
     def cancel_slot(self, slot_id: int) -> None:
         slot_key = int(slot_id)
-        cleanup_groups: set[_CleanupGroup] = set()
+        cleanup_tickets: set[_CleanupTicket] = set()
         with self._cleanup_handoff_lock:
             with self._cv:
                 if self._shutdown:
                     return
-                cleanup_groups.update(self._cleanup_groups_by_slot.get(slot_key, ()))
+                cleanup_tickets.update(self._cleanup_tickets_by_slot.get(slot_key, ()))
                 records = [record for record in self._records.values() if record.slot_id == slot_key]
                 records_to_cancel = [record for record in records if not record.cleanup_started]
                 cleanup_operations: list[Callable[[], Any]] = []
                 for record in records:
                     self._records.pop((record.slot_id, record.submit_id), None)
                     record.terminal = True
-                    if not record.registration_accepted:
-                        record.registration_cancelled = True
                     if not record.cleanup_started:
                         record.cleanup_started = True
                     self._cancel_record_wait_locked(record)
@@ -822,18 +800,18 @@ class AsyncResultCollector:
             for token in tokens:
                 token.release_pending = True
             cleanup_operations.extend(self._output_token_release_operation(token) for token in tokens)
-            cleanup_group = self._submit_cleanup_operations(
-                self._fence_cleanup_operations(cleanup_operations),
-                store_error=False,
-                slot_ids=(slot_key,),
+            cleanup_tickets.update(
+                self._submit_cleanup_operations(
+                    self._fence_cleanup_operations(cleanup_operations),
+                    store_error=False,
+                    slot_ids=(slot_key,),
+                )
             )
-            if cleanup_group is not None:
-                cleanup_groups.add(cleanup_group)
 
         cleanup_errors = self._wait_slot_cleanup(
             slot_key,
             timeout_message=f"Ray UDF slot {slot_key} cleanup did not terminate",
-            initial_groups=tuple(cleanup_groups),
+            initial_tickets=tuple(cleanup_tickets),
         )
         if cleanup_errors:
             details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
@@ -846,7 +824,7 @@ class AsyncResultCollector:
                 any(record.slot_id == slot_key for record in self._records.values())
                 or bool(self._ready_by_slot.get(slot_key))
                 or any(token.slot_id == slot_key for token in self._active_output_leases.values())
-                or bool(self._cleanup_groups_by_slot.get(slot_key))
+                or bool(self._cleanup_tickets_by_slot.get(slot_key))
             )
 
     def set_wakeup_callback(self, fn: Any) -> None:
@@ -869,8 +847,6 @@ class AsyncResultCollector:
                         for record in records:
                             cleanup_slot_ids.add(record.slot_id)
                             self._cancel_record_wait_locked(record)
-                            if not record.registration_accepted:
-                                record.registration_cancelled = True
                             if record.cleanup_started:
                                 continue
                             record.cleanup_started = True
@@ -923,14 +899,14 @@ class AsyncResultCollector:
 
         with self._cv:
             while True:
-                pending = [group for group in self._cleanup_groups if not group.callback_owned_by_current_thread()]
+                pending = [ticket for ticket in self._cleanup_tickets if not ticket.callback_owned_by_current_thread()]
                 if not pending:
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 self._cv.wait(timeout=remaining)
-            pending = [group for group in self._cleanup_groups if not group.callback_owned_by_current_thread()]
+            pending = [ticket for ticket in self._cleanup_tickets if not ticket.callback_owned_by_current_thread()]
             if pending:
                 shutdown_errors.append(RuntimeError("Ray UDF stream remote cleanup did not terminate"))
             shutdown_errors.extend(self._terminal_cleanup_errors)
@@ -1056,7 +1032,6 @@ class AsyncResultCollector:
         for record in self._records.values():
             if (
                 record.terminal
-                or not record.registration_accepted
                 or record.slot_id not in admissible_slots
                 or record.phase != "block"
                 or record.next_ref_ready
@@ -1210,48 +1185,70 @@ class AsyncResultCollector:
         self,
         operations: Sequence[Callable[[], Any]],
         *,
-        on_done: Callable[[BaseException | None], None] | None = None,
+        on_each_done: Callable[[BaseException | None], None] | None = None,
         store_error: bool = True,
         slot_ids: Sequence[int] = (),
-    ) -> _CleanupGroup | None:
-        """Atomically hand one terminal plan to bounded, isolated worker lanes."""
+    ) -> tuple[_CleanupTicket, ...]:
+        """Atomically hand independent operations to bounded worker lanes."""
         actions = tuple(operations)
         if not actions:
-            if on_done is not None:
-                on_done(None)
-            return None
+            if on_each_done is not None:
+                on_each_done(None)
+            return ()
 
-        operations_by_pool: dict[_DaemonCleanupPool, list[Callable[[], Any]]] = defaultdict(list)
+        owner_slots = frozenset(int(slot_id) for slot_id in slot_ids)
+        items_by_pool: dict[_DaemonCleanupPool, list[_CleanupWorkItem]] = defaultdict(list)
+        tickets: list[_CleanupTicket] = []
+
         for action in actions:
             lane = action.lane if isinstance(action, RayStreamCleanupOperation) else RAY_STREAM_CLEANUP_CONTROL
-            operations_by_pool[self._cleanup_pools[lane]].append(action)
-        pools = tuple(pool for pool in self._cleanup_pools.values() if pool in operations_by_pool)
-        group_holder: list[_CleanupGroup] = []
-        owner_slots = frozenset(int(slot_id) for slot_id in slot_ids)
+            ticket_holder: list[_CleanupTicket] = []
 
-        def complete(first_error: BaseException | None) -> None:
-            callback_error: BaseException | None = None
-            try:
-                if on_done is not None:
-                    on_done(first_error)
-            except BaseException as exc:
-                callback_error = exc
-            finally:
-                with self._cv:
-                    if store_error:
-                        if first_error is not None:
-                            self._terminal_cleanup_errors.append(first_error)
-                    if callback_error is not None:
-                        self._terminal_cleanup_errors.append(callback_error)
-                    self._cleanup_groups.discard(group_holder[0])
-                    for slot_id in owner_slots:
-                        groups = self._cleanup_groups_by_slot.get(slot_id)
-                        if groups is not None:
-                            groups.discard(group_holder[0])
-                            if not groups:
-                                self._cleanup_groups_by_slot.pop(slot_id, None)
-                    self._cv.notify_all()
+            def complete(
+                error: BaseException | None,
+                *,
+                holder: list[_CleanupTicket] = ticket_holder,
+            ) -> None:
+                callback_error: BaseException | None = None
+                try:
+                    if on_each_done is not None:
+                        on_each_done(error)
+                except BaseException as exc:
+                    callback_error = exc
+                finally:
+                    ticket = holder[0]
+                    with self._cv:
+                        if store_error and error is not None:
+                            self._terminal_cleanup_errors.append(error)
+                        if callback_error is not None:
+                            self._terminal_cleanup_errors.append(callback_error)
+                        self._cleanup_tickets.discard(ticket)
+                        for slot_id in owner_slots:
+                            slot_tickets = self._cleanup_tickets_by_slot.get(slot_id)
+                            if slot_tickets is not None:
+                                slot_tickets.discard(ticket)
+                                if not slot_tickets:
+                                    self._cleanup_tickets_by_slot.pop(
+                                        slot_id,
+                                        None,
+                                    )
+                        self._cv.notify_all()
 
+            ticket = _CleanupTicket(on_complete=complete)
+            ticket_holder.append(ticket)
+            tickets.append(ticket)
+            items_by_pool[self._cleanup_pools[lane]].append(
+                _CleanupWorkItem(
+                    action,
+                    ticket,
+                    retry_on_error=(action.retry_on_error if isinstance(action, RayStreamCleanupOperation) else False),
+                    retry_on_incomplete=(
+                        action.retry_on_incomplete if isinstance(action, RayStreamCleanupOperation) else False
+                    ),
+                )
+            )
+
+        pools = tuple(pool for pool in self._cleanup_pools.values() if pool in items_by_pool)
         with self._cleanup_handoff_lock:
             for pool in pools:
                 pool._cv.acquire()
@@ -1260,19 +1257,17 @@ class AsyncResultCollector:
                     if not pool._started or pool._stop_when_idle:
                         raise RuntimeError(f"Ray UDF cleanup pool {pool._name!r} is not accepting work")
                     pool._ensure_worker_locked()
-                group = _CleanupGroup(len(actions), on_complete=complete)
-                group_holder.append(group)
                 with self._cv:
-                    self._cleanup_groups.add(group)
+                    self._cleanup_tickets.update(tickets)
                     for slot_id in owner_slots:
-                        self._cleanup_groups_by_slot[slot_id].add(group)
+                        self._cleanup_tickets_by_slot[slot_id].update(tickets)
                     self._cv.notify_all()
-                for pool, pool_operations in operations_by_pool.items():
-                    pool._enqueue_locked(pool_operations, group)
+                for pool, items in items_by_pool.items():
+                    pool._enqueue_locked(items)
             finally:
                 for pool in reversed(pools):
                     pool._cv.release()
-        return group
+        return tuple(tickets)
 
     def _fence_cleanup_operations(
         self,
@@ -1316,39 +1311,42 @@ class AsyncResultCollector:
             )
         return tuple(fenced)
 
-    def _wait_cleanup_group(
+    def _wait_cleanup_tickets(
         self,
-        group: _CleanupGroup | None,
+        tickets: Sequence[_CleanupTicket],
         *,
         timeout_message: str,
-    ) -> None:
-        if group is None:
-            return
-        if not group.wait(self._shutdown_timeout_s):
-            raise RuntimeError(timeout_message)
+    ) -> tuple[BaseException, ...]:
+        deadline = time.monotonic() + self._shutdown_timeout_s
+        for ticket in tickets:
+            if ticket.callback_owned_by_current_thread():
+                continue
+            if not ticket.wait(max(0.0, deadline - time.monotonic())):
+                raise RuntimeError(timeout_message)
+        return tuple(error for ticket in tickets for error in ticket.errors)
 
     def _wait_slot_cleanup(
         self,
         slot_id: int,
         *,
         timeout_message: str,
-        initial_groups: Sequence[_CleanupGroup] = (),
+        initial_tickets: Sequence[_CleanupTicket] = (),
     ) -> tuple[BaseException, ...]:
         deadline = time.monotonic() + self._shutdown_timeout_s
-        observed = set(initial_groups)
+        observed = set(initial_tickets)
         while True:
             with self._cv:
-                groups = tuple(self._cleanup_groups_by_slot.get(int(slot_id), ()))
-            observed.update(groups)
+                tickets = tuple(self._cleanup_tickets_by_slot.get(int(slot_id), ()))
+            observed.update(tickets)
             pending = [
-                group for group in observed if not group.wait(0) and not group.callback_owned_by_current_thread()
+                ticket for ticket in observed if not ticket.wait(0) and not ticket.callback_owned_by_current_thread()
             ]
             if not pending:
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not pending[0].wait(remaining):
                 raise RuntimeError(timeout_message)
-        return tuple(error for group in observed for error in group.errors)
+        return tuple(error for ticket in observed for error in ticket.errors)
 
     def _stop_cleanup_pools_when_idle(self) -> None:
         with self._cleanup_handoff_lock:
@@ -1515,7 +1513,7 @@ class AsyncResultCollector:
             if self._shutdown or self._thread_error is not None or not self._started or not self._loop_ready.is_set():
                 return
             records = sorted(
-                (record for record in self._records.values() if record.registration_accepted),
+                self._records.values(),
                 key=lambda record: (
                     record.phase == "block" and record.next_ref_ready,
                     record.ready_sequence if record.ready_sequence is not None else record.sequence,
@@ -1849,6 +1847,18 @@ class AsyncResultCollector:
             _collector_debug_log("retired" if error is None else "retire_failed", record)
             self._notify_wakeup()
 
+        def finish_cleanup_operation(error: BaseException | None) -> None:
+            with self._cv:
+                if error is not None and record.cleanup_error is None:
+                    record.cleanup_error = error
+                record.cleanup_remaining -= 1
+                if record.cleanup_remaining < 0:
+                    raise RuntimeError("Ray UDF record cleanup count underflow")
+                if record.cleanup_remaining:
+                    return
+                cleanup_error = record.cleanup_error
+            finish_retirement(cleanup_error)
+
         with self._cleanup_handoff_lock:
             with self._cv:
                 if self._records.get(key) is not record:
@@ -1857,12 +1867,17 @@ class AsyncResultCollector:
                 record.cleanup_started = True
                 self._signal_readiness_change_locked()
                 cleanup_operations = record.adapter.retire_operations()
-            self._submit_cleanup_operations(
-                cleanup_operations,
-                on_done=finish_retirement,
-                store_error=False,
-                slot_ids=(record.slot_id,),
-            )
+                record.cleanup_remaining = len(cleanup_operations)
+                record.cleanup_error = None
+            if cleanup_operations:
+                self._submit_cleanup_operations(
+                    cleanup_operations,
+                    on_each_done=finish_cleanup_operation,
+                    store_error=False,
+                    slot_ids=(record.slot_id,),
+                )
+            else:
+                finish_retirement(None)
 
     def _fail_record(self, record: _StreamRecord, exc: BaseException) -> None:
         exc = format_stateful_actor_loss(record.error_context, exc)
