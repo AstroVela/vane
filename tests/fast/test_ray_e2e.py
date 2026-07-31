@@ -3102,8 +3102,8 @@ def test_ray_fixed_row_reservoir_sample_merges_task_states(ray_runner, duckdb_co
         USING SAMPLE reservoir(7 ROWS) REPEATABLE (42)
     """
 
-    def run_once(run_label):
-        relation = duckdb_conn.sql(sql)
+    def run_once(run_label, query=sql):
+        relation = duckdb_conn.sql(query)
         _log_builder_info(relation)
         _log_distributed_plan(relation, run_label)
         parts = _run_iter_tables(ray_runner, relation, run_label, timeout_s=60.0)
@@ -3117,6 +3117,20 @@ def test_ray_fixed_row_reservoir_sample_merges_task_states(ray_runner, duckdb_co
     first = run_once(f"{label}: first")
     second = run_once(f"{label}: repeat")
     assert first == second, f"{label}: REPEATABLE sample changed between identical executions"
+
+    # OrderBy's internal range tasks preserve their own plan sink identity.
+    # A downstream sample coordinator appends a different sink whose explicit
+    # FTE-derived identity policy must not inherit that upstream context flag.
+    ordered_sql = f"""
+        SELECT id, payload
+        FROM (
+            SELECT id, payload
+            FROM read_parquet('{input_path}/**/*.parquet')
+            ORDER BY id
+        ) AS ordered_input
+        USING SAMPLE reservoir(7 ROWS) REPEATABLE (42)
+    """
+    run_once(f"{label}: ordered input", ordered_sql)
 
 
 def test_ray_fixed_row_reservoir_sample_preserves_hash_join_continuations(

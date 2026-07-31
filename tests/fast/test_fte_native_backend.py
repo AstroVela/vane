@@ -1413,6 +1413,7 @@ def test_native_worker_task_request_derives_fte_exchange_sink_identity():
             "node_id": "3",
             "fragment_execution_id": 4,
             "attempt_id": 2,
+            "preserve_plan_exchange_sink_instance": "1",
         },
         task_context={
             "query_idx": 0,
@@ -1444,6 +1445,7 @@ def test_native_worker_task_request_derives_fte_exchange_sink_identity():
     assert request["exchange_sink_instance"]["output_location"] == (
         f"materialized__sink_{expected_identity}__attempt_2"
     )
+    assert "preserve_plan_exchange_sink_instance" not in request["exchange_sink_instance"]
 
 
 def test_native_worker_task_request_preserves_plan_exchange_sink_identity():

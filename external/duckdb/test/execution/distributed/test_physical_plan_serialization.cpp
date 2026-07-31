@@ -1695,9 +1695,26 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	descriptor.sink_instance = plan_handle;
 	descriptor.sink_instance.attempt_id = 2;
 	descriptor.sink_instance.output_location = "opaque-exchange__sink_7__attempt_2";
+	descriptor.sink_instance.fte_task_identity = true;
 
 	string error;
 	auto invalid = descriptor;
+	invalid.sink_instance.fte_task_identity = false;
+	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
+	REQUIRE(error.find("FTE-derived") != string::npos);
+	REQUIRE(sink.SinkHandle().attempt_id == 0);
+	REQUIRE(local_sample.task_index == DConstants::INVALID_INDEX);
+
+	error.clear();
+	invalid = descriptor;
+	invalid.sink_instance.sink_handle.task_partition_id = DConstants::INVALID_INDEX;
+	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
+	REQUIRE(error.find("invalid task identity") != string::npos);
+	REQUIRE(sink.SinkHandle().attempt_id == 0);
+	REQUIRE(local_sample.task_index == DConstants::INVALID_INDEX);
+
+	error.clear();
+	invalid = descriptor;
 	invalid.sink_instance.query_id = "other-query";
 	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
 	REQUIRE(error.find("query") != string::npos);

@@ -9228,7 +9228,10 @@ def test_fte_attempt_create_starts_status_watcher(monkeypatch):
 
     assert ("wait_status", running.task_id.to_dict(), None, 1.0) in actor.fte_calls
     query_status = handle.fte_query_status("query-fte-watcher")
-    assert query_status["finished"] is True
+    assert query_status["finished"] is False
+    fragment_status = next(iter(query_status["fragment_executions"].values()))
+    assert fragment_status["finished_count"] == 1
+    assert fragment_status["no_more_partitions"] is False
     assert handle.fte_registry_stats()["status_watcher_count"] == 0
 
 

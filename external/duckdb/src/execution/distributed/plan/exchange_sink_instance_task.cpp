@@ -102,22 +102,42 @@ bool ApplyExchangeSinkInstanceToOperator(PhysicalOperator &op, const ExchangeSin
 	return true;
 }
 
-bool ApplyRuntimeTaskIndexToOperator(PhysicalOperator &op, idx_t task_partition_id, std::string *error) {
+bool ValidateRuntimeTaskIndexForOperator(PhysicalOperator &op, const ExchangeSinkInstanceHandle &sink_instance,
+                                         std::string *error) {
 	if (op.type == PhysicalOperatorType::DISTRIBUTED_RESERVOIR_SAMPLE) {
 		auto *sample = dynamic_cast<PhysicalDistributedReservoirSample *>(&op);
 		if (!sample) {
 			return SetValidationError(error, "DISTRIBUTED_RESERVOIR_SAMPLE operator has an unexpected implementation");
 		}
 		if (sample->stage == DistributedReservoirSampleStage::LOCAL) {
-			sample->ApplyRuntimeTaskIndex(task_partition_id);
+			if (!sink_instance.fte_task_identity) {
+				return SetValidationError(
+				    error, "local distributed reservoir sample requires an FTE-derived exchange sink identity");
+			}
+			if (sink_instance.sink_handle.task_partition_id == DConstants::INVALID_INDEX) {
+				return SetValidationError(error,
+				                          "local distributed reservoir sample received an invalid task identity");
+			}
 		}
 	}
 	for (auto &child : op.children) {
-		if (!ApplyRuntimeTaskIndexToOperator(child.get(), task_partition_id, error)) {
+		if (!ValidateRuntimeTaskIndexForOperator(child.get(), sink_instance, error)) {
 			return false;
 		}
 	}
 	return true;
+}
+
+void ApplyRuntimeTaskIndexToOperator(PhysicalOperator &op, idx_t task_partition_id) {
+	if (op.type == PhysicalOperatorType::DISTRIBUTED_RESERVOIR_SAMPLE) {
+		auto &sample = op.Cast<PhysicalDistributedReservoirSample>();
+		if (sample.stage == DistributedReservoirSampleStage::LOCAL) {
+			sample.ApplyRuntimeTaskIndex(task_partition_id);
+		}
+	}
+	for (auto &child : op.children) {
+		ApplyRuntimeTaskIndexToOperator(child.get(), task_partition_id);
+	}
 }
 
 } // namespace
@@ -178,6 +198,9 @@ bool ApplyExchangeSinkInstanceToPlan(duckdb::PhysicalPlan &plan, const ExchangeS
 		}
 		return false;
 	}
+	if (!ValidateRuntimeTaskIndexForOperator(plan.Root(), task.sink_instance, error)) {
+		return false;
+	}
 	idx_t applied = 0;
 	if (!ApplyExchangeSinkInstanceToOperator(plan.Root(), task, error, applied)) {
 		return false;
@@ -188,9 +211,7 @@ bool ApplyExchangeSinkInstanceToPlan(duckdb::PhysicalPlan &plan, const ExchangeS
 		}
 		return false;
 	}
-	if (!ApplyRuntimeTaskIndexToOperator(plan.Root(), task.sink_instance.sink_handle.task_partition_id, error)) {
-		return false;
-	}
+	ApplyRuntimeTaskIndexToOperator(plan.Root(), task.sink_instance.sink_handle.task_partition_id);
 	return true;
 }
 

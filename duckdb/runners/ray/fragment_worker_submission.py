@@ -874,7 +874,11 @@ class FteWorkerSubmissionMixin:
                 and exchange_sink_instance is not None
             ):
                 exchange_sink_instance = dict(exchange_sink_instance)
-                exchange_sink_instance["preserve_plan_exchange_sink_instance"] = True
+                # The context flag belongs to the plan that originally created
+                # the task. A downstream materialized coordinator can append a
+                # new sink with an explicit FTE-derived identity policy.
+                if not bool(exchange_sink_instance.get("fte_task_identity")):
+                    exchange_sink_instance["preserve_plan_exchange_sink_instance"] = True
             plan = None
             fragment_plan = None
             with self._fragment_registration_lock:

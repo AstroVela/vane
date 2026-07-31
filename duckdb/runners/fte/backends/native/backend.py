@@ -2102,7 +2102,11 @@ class NativeFteWorkerManagerBackend:
                 ).strip().lower() not in ("", "0", "false", "no", "off")
                 if preserve_plan_sink_partition and isinstance(exchange_sink_instance, Mapping):
                     exchange_sink_instance = dict(exchange_sink_instance)
-                    exchange_sink_instance["preserve_plan_exchange_sink_instance"] = True
+                    # The inherited context can describe an upstream plan sink.
+                    # An appended materialized-coordinator sink carries its own
+                    # explicit FTE-derived identity policy.
+                    if not bool(exchange_sink_instance.get("fte_task_identity")):
+                        exchange_sink_instance["preserve_plan_exchange_sink_instance"] = True
                 exchange_sink_instance = derive_exchange_sink_instance_for_attempt(
                     exchange_sink_instance,
                     attempt_id,
