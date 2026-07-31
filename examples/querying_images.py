@@ -142,8 +142,7 @@ def relation_from_rows(conn: Any, rows: list[dict[str, Any]]) -> Any:
         *(tuple(constant(row[column]) for column in columns) for row in rows),
     )
     projections = [
-        f'{quote_ident(source)} AS {quote_ident(column)}'
-        for source, column in zip(raw.columns, columns, strict=True)
+        f"{quote_ident(source)} AS {quote_ident(column)}" for source, column in zip(raw.columns, columns, strict=True)
     ]
     return raw.query("input_rows", f"select {', '.join(projections)} from input_rows")
 
