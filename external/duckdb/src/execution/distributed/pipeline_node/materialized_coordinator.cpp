@@ -8,7 +8,6 @@
 #include "duckdb/execution/distributed/plan/runner.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <limits>
 #include <unordered_set>
 
@@ -100,22 +99,21 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 		    DuckDBError::internal_error("materialized coordinator failed to create exchange"));
 	}
 	auto exchange = std::shared_ptr<Exchange>(exchange_unique.release());
-	auto sink_task_counter = std::make_shared<std::atomic<idx_t>>(0);
+	auto template_sink_handle = exchange->AddSink(0);
+	auto template_sink_instance = exchange->InstantiateSink(template_sink_handle, /*attempt_id=*/0);
+	template_sink_instance.fte_task_identity = true;
 
 	MaterializedPlanBuilder local_plan_builder;
 	if (per_task_builder_factory) {
 		local_plan_builder = per_task_builder_factory(0);
 	}
 
-	auto sink_plan_builder = [local_plan_builder, exchange, exchange_mgr, exchange_id, sink_task_counter,
+	auto sink_plan_builder = [local_plan_builder, exchange_mgr, exchange_id, template_sink_instance,
 	                          num_partitions](DuckPhysicalPlanRef plan) -> DuckPhysicalPlanRef {
 		if (local_plan_builder) {
 			plan = local_plan_builder(std::move(plan));
 		}
-		auto task_partition_id = sink_task_counter->fetch_add(1);
-		auto sink_handle = exchange->AddSink(task_partition_id);
-		auto sink_instance = exchange->InstantiateSink(sink_handle, /*attempt_id=*/0);
-		return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, num_partitions, exchange_id, sink_instance,
+		return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, num_partitions, exchange_id, template_sink_instance,
 		                                 exchange_mgr);
 	};
 
@@ -128,6 +126,12 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 	}
 
 	try {
+		for (const auto &output : mat_res.outputs) {
+			if (!output.has_exchange_sink_instance()) {
+				throw InternalException("coordinator exchange sink output is missing exchange sink instance metadata");
+			}
+			exchange->AddSink(output.exchange_sink_instance().sink_handle.task_partition_id);
+		}
 		RecordRemoteExchangeFinishedSinks(*exchange, mat_res.outputs, "coordinator");
 		exchange->AllRequiredSinksFinished();
 	} catch (const std::exception &ex) {

@@ -130,6 +130,7 @@ void ExchangeSinkInstanceTaskDescriptor::Serialize(Serializer &serializer) const
 	serializer.WriteProperty(5, "flight_server_epoch", sink_instance.flight_server_epoch);
 	serializer.WriteProperty(6, "query_id", sink_instance.query_id);
 	serializer.WriteProperty(7, "flight_host", sink_instance.flight_host);
+	serializer.WriteProperty(8, "fte_task_identity", sink_instance.fte_task_identity);
 }
 
 ExchangeSinkInstanceTaskDescriptor ExchangeSinkInstanceTaskDescriptor::Deserialize(Deserializer &deserializer) {
@@ -143,6 +144,7 @@ ExchangeSinkInstanceTaskDescriptor ExchangeSinkInstanceTaskDescriptor::Deseriali
 	result.sink_instance.flight_server_epoch = deserializer.ReadProperty<string>(5, "flight_server_epoch");
 	result.sink_instance.query_id = deserializer.ReadProperty<string>(6, "query_id");
 	result.sink_instance.flight_host = deserializer.ReadProperty<string>(7, "flight_host");
+	result.sink_instance.fte_task_identity = deserializer.ReadPropertyWithDefault<bool>(8, "fte_task_identity");
 	return result;
 }
 

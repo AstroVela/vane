@@ -1264,6 +1264,10 @@ void register_ray_bindings(py::module_ &mod) {
 					        exchange_sink_instance_task.sink_instance.attempt_id =
 					            py::int_(d["attempt_id"]).cast<idx_t>();
 				        }
+				        if (d.contains("fte_task_identity")) {
+					        exchange_sink_instance_task.sink_instance.fte_task_identity =
+					            py::bool_(d["fte_task_identity"]).cast<bool>();
+				        }
 				        if (d.contains("output_partition_count")) {
 					        exchange_sink_instance_task.sink_instance.output_partition_count =
 					            py::int_(d["output_partition_count"]).cast<idx_t>();

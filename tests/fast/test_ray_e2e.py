@@ -3119,6 +3119,69 @@ def test_ray_fixed_row_reservoir_sample_merges_task_states(ray_runner, duckdb_co
     assert first == second, f"{label}: REPEATABLE sample changed between identical executions"
 
 
+def test_ray_fixed_row_reservoir_sample_preserves_hash_join_continuations(
+    ray_runner,
+    duckdb_conn,
+    tmp_path,
+    monkeypatch,
+):
+    label = "test_ray_e2e: fixed-row reservoir sample preserves hash join continuations"
+    left_path = tmp_path / "reservoir_sample_join_left"
+    right_path = tmp_path / "reservoir_sample_join_right"
+    shuffle_dir = tmp_path / "reservoir_sample_join_shuffle"
+
+    monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
+    monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "hash")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "8")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    duckdb_conn.execute("SET disabled_optimizers = 'late_materialization'")
+    duckdb_conn.execute(f"""
+        COPY (
+            SELECT i::BIGINT AS id, 1::BIGINT AS k, i::BIGINT AS file_id
+            FROM range(8) AS t(i)
+        ) TO '{left_path}' (FORMAT PARQUET, PARTITION_BY (file_id))
+    """)
+    duckdb_conn.execute(f"""
+        COPY (
+            SELECT i::BIGINT AS rid, 1::BIGINT AS k, i::BIGINT AS file_id
+            FROM range(2) AS t(i)
+        ) TO '{right_path}' (FORMAT PARQUET, PARTITION_BY (file_id))
+    """)
+    join_sql = f"""
+        SELECT l.id, r.rid
+        FROM read_parquet('{left_path}/**/*.parquet') AS l
+        JOIN read_parquet('{right_path}/**/*.parquet') AS r ON l.k = r.k
+    """
+    sample_sql = f"""
+        SELECT *
+        FROM ({join_sql}) AS joined
+        USING SAMPLE reservoir(3 ROWS) REPEATABLE (42)
+    """
+    expected_join_rows = set(_expected_result_rows(duckdb_conn, join_sql))
+    assert len(expected_join_rows) == 16
+
+    def run_once(run_label):
+        relation = duckdb_conn.sql(sample_sql)
+        plan_text, num_parts = _get_distributed_plan_info(relation, run_label)
+        assert num_parts == 1
+        assert plan_text is not None
+        assert "ReservoirSample [partitions=1]" in plan_text
+        assert "Hash Join [partitions=1]" in plan_text
+        parts = _run_iter_tables(ray_runner, relation, run_label, timeout_s=60.0)
+        rows = _collect_result_rows(parts)
+        assert len(rows) == 3, f"{run_label}: expected one global three-row sample, got {len(rows)} rows"
+        assert len(set(rows)) == 3, f"{run_label}: sample contains duplicate rows"
+        assert set(rows).issubset(expected_join_rows)
+        return sorted(rows)
+
+    # The hash join does not promise a stable output order, so a seeded
+    # reservoir can select different members across executions. The scan-only
+    # regression above covers repeatability when the input order is stable.
+    run_once(f"{label}: first")
+    run_once(f"{label}: repeat")
+
+
 def test_ray_streaming_sample(ray_runner, duckdb_conn, parquet_path):
     label = "test_ray_e2e: streaming sample"
     sql = f"""

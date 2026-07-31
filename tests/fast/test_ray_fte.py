@@ -1114,6 +1114,42 @@ def test_derive_exchange_sink_instance_for_retry_attempt_rewrites_output_locatio
     assert retry["attempt_path"] == "q_shuffle_9__sink_9__attempt_2"
 
 
+def test_derive_exchange_sink_instance_uses_full_fte_task_identity():
+    base = {
+        "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+        "task_partition_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+        "output_partition_count": 1,
+        "output_location": "q_coordinator__sink_0__attempt_0",
+        "attempt_path": "q_coordinator__sink_0__attempt_0",
+        "fte_task_identity": True,
+    }
+
+    first_fragment = derive_exchange_sink_instance_for_attempt(
+        base,
+        2,
+        task_partition_id=9,
+        fragment_execution_id=3,
+    )
+    second_fragment = derive_exchange_sink_instance_for_attempt(
+        base,
+        0,
+        task_partition_id=9,
+        fragment_execution_id=4,
+    )
+    first_identity = (3 << 32) | 9
+    second_identity = (4 << 32) | 9
+
+    assert first_fragment["sink_handle"]["task_partition_id"] == first_identity
+    assert first_fragment["task_partition_id"] == first_identity
+    assert first_fragment["attempt_id"] == 2
+    assert first_fragment["output_location"] == f"q_coordinator__sink_{first_identity}__attempt_2"
+    assert second_fragment["sink_handle"]["task_partition_id"] == second_identity
+    assert second_fragment["output_location"] == f"q_coordinator__sink_{second_identity}__attempt_0"
+    assert first_identity != second_identity
+
+
 def test_task_descriptor_appends_splits_idempotently_and_replays_fte_fields():
     task_id = FteTaskId("q", 2, 3)
     descriptor = TaskDescriptor(

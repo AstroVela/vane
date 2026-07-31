@@ -41,6 +41,8 @@ struct ExchangeSinkHandle {
 struct ExchangeSinkInstanceHandle {
 	ExchangeSinkHandle sink_handle;
 	idx_t attempt_id = 0;
+	/// Derive the concrete sink identity from the FTE fragment partition.
+	bool fte_task_identity = false;
 	/// Query that owns this concrete attempt.
 	std::string query_id;
 	/// Implementation-specific: output directory (Spooling),

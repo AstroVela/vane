@@ -1524,7 +1524,8 @@ class FteFragmentExecution:
             sink_instance = derive_exchange_sink_instance_for_attempt(
                 partition.descriptor.exchange_sink_instance,
                 partition.next_attempt_number(),
-                partition.task_id.partition_id,
+                task_partition_id=partition.task_id.partition_id,
+                fragment_execution_id=partition.task_id.fragment_execution_id,
             )
         scheduled = partition.start_attempt(
             sink_instance=sink_instance,

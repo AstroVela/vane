@@ -158,6 +158,14 @@ static bool IsCompletionOnlyRemoteExchangeSinkPipeline(const duckdb::PipelinePro
 	return snapshot.operators.size() == 1 && snapshot.operators.front() == "EXCHANGE_SINK";
 }
 
+static bool IsInternalRemoteExchangeResultCollectorPipeline(const duckdb::PipelineProgressSnapshot &snapshot) {
+	if (snapshot.operators.size() == 1) {
+		return snapshot.operators.front() == "RESULT_COLLECTOR";
+	}
+	return snapshot.operators.size() == 2 && snapshot.operators[0] == "EXCHANGE_SINK" &&
+	       snapshot.operators[1] == "RESULT_COLLECTOR";
+}
+
 static std::string PipelineSnapshotName(const duckdb::PipelineProgressSnapshot &snapshot) {
 	std::string result;
 	for (idx_t i = 0; i < snapshot.operators.size(); i++) {
@@ -439,8 +447,8 @@ static py::dict BuildNativeTaskStatsDict(
     const std::unordered_map<idx_t, duckdb::distributed::ScanTaskDescriptor> *scan_task_map,
     const std::unordered_map<idx_t, duckdb::distributed::ExchangeSourceTaskDescriptor> *exchange_source_task_map,
     const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *fte_scan_source_queue_map,
-    const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>>
-        *fte_exchange_source_queue_map) {
+    const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *fte_exchange_source_queue_map,
+    bool hide_remote_exchange_result_collector = false) {
 	idx_t scan_rows =
 	    SaturatingAddIdx(ScanTaskInputRows(scan_task_map), FteQueueConsumedRows(fte_scan_source_queue_map));
 	idx_t scan_bytes =
@@ -473,7 +481,8 @@ static py::dict BuildNativeTaskStatsDict(
 	idx_t running_pipeline_tasks = 0;
 	idx_t completed_pipeline_tasks = 0;
 	for (const auto &snapshot : snapshots) {
-		if (IsCompletionOnlyRemoteExchangeSinkPipeline(snapshot)) {
+		if (IsCompletionOnlyRemoteExchangeSinkPipeline(snapshot) ||
+		    (hide_remote_exchange_result_collector && IsInternalRemoteExchangeResultCollectorPipeline(snapshot))) {
 			continue;
 		}
 		const auto pipeline_rows = snapshot.input_rows;
@@ -521,7 +530,14 @@ static py::dict BuildNativeTaskStatsDict(
 		completed_pipeline_tasks = SaturatingAddIdx(completed_pipeline_tasks, snapshot.completed_pipeline_tasks);
 
 		py::dict pipeline;
-		pipeline["pipeline_id"] = py::int_(snapshot.pipeline_index);
+		auto pipeline_index = snapshot.pipeline_index;
+		if (hide_remote_exchange_result_collector && pipeline_index > 0) {
+			// The managed query adds one collector pipeline ahead of the
+			// original exchange-sink topology. Preserve the public pipeline IDs
+			// exposed by describe_native_progress().
+			pipeline_index--;
+		}
+		pipeline["pipeline_id"] = py::int_(pipeline_index);
 		pipeline["name"] = PipelineSnapshotName(snapshot);
 		pipeline["operators"] = OperatorsToPyList(snapshot.operators);
 		pipeline["operator_details"] = OperatorDetailsToPyList(snapshot.operator_details);

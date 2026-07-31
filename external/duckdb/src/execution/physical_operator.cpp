@@ -1189,6 +1189,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(113, "range_order_modifiers", {});
 		sink_handle.flight_server_epoch = deserializer.ReadProperty<string>(114, "flight_server_epoch");
 		sink_handle.query_id = deserializer.ReadProperty<string>(115, "query_id");
+		sink_handle.fte_task_identity = deserializer.ReadPropertyWithDefault<bool>(116, "fte_task_identity");
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.local_dirs = std::vector<std::string>(local_dirs.begin(), local_dirs.end());

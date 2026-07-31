@@ -1615,6 +1615,7 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	sink_handle.output_partition_count = 4;
 	sink_handle.flight_host = "worker-only.internal";
 	sink_handle.flight_server_epoch = "sink-epoch";
+	sink_handle.fte_task_identity = true;
 
 	distributed::FlightExchangeConfig flight_config;
 	flight_config.node_id = "node-1";
@@ -1650,6 +1651,7 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	REQUIRE(sink_ptr->SinkHandle().output_partition_count == 4);
 	REQUIRE(sink_ptr->SinkHandle().flight_host.empty());
 	REQUIRE(sink_ptr->SinkHandle().flight_server_epoch == "sink-epoch");
+	REQUIRE(sink_ptr->SinkHandle().fte_task_identity);
 	auto roundtrip_manager =
 	    std::dynamic_pointer_cast<distributed::FlightExchangeManager>(sink_ptr->GetExchangeManager());
 	const std::vector<std::string> expected_local_dirs = {"/session-a/shuffle-0", "/session-a/shuffle-1"};
@@ -1763,6 +1765,7 @@ TEST_CASE("ExchangeSinkInstanceTaskDescriptor serialization preserves the worker
 	descriptor.sink_instance.output_partition_count = 4;
 	descriptor.sink_instance.flight_host = "flight-worker.internal";
 	descriptor.sink_instance.flight_server_epoch = "endpoint-epoch";
+	descriptor.sink_instance.fte_task_identity = true;
 
 	auto roundtrip =
 	    distributed::ExchangeSinkInstanceTaskDescriptor::DeserializeFromBytes(descriptor.SerializeToBytes());
@@ -1774,6 +1777,7 @@ TEST_CASE("ExchangeSinkInstanceTaskDescriptor serialization preserves the worker
 	REQUIRE(roundtrip.sink_instance.output_partition_count == 4);
 	REQUIRE(roundtrip.sink_instance.flight_host == "flight-worker.internal");
 	REQUIRE(roundtrip.sink_instance.flight_server_epoch == "endpoint-epoch");
+	REQUIRE(roundtrip.sink_instance.fte_task_identity);
 }
 
 TEST_CASE("Exchange task descriptors reject missing advertised hosts", "[serialization][physical_plan][exchange]") {
