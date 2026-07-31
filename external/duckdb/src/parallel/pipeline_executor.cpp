@@ -111,7 +111,8 @@ void ReferencePipelineBatch(ExecutionBatch &target, ExecutionBatch &source) {
 } // namespace
 
 PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_p)
-    : pipeline(pipeline_p), thread(context_p), context(context_p, thread, &pipeline_p), use_execution_batches(true) {
+    : pipeline(pipeline_p), thread(context_p), context(context_p, thread, &pipeline_p),
+      execution_mode(pipeline_p.GetExecutionMode()) {
 	D_ASSERT(pipeline.source_state);
 	if (pipeline.sink) {
 		local_sink_state = pipeline.sink->GetLocalSinkState(context);
@@ -127,19 +128,23 @@ PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_
 	}
 	local_source_state = pipeline.source->GetLocalSourceState(context, *pipeline.source_state);
 
-	intermediate_chunks.reserve(pipeline.operators.size());
-	intermediate_batches.reserve(pipeline.operators.size());
+	if (execution_mode == PipelineExecutionMode::DATA_CHUNK) {
+		intermediate_chunks.reserve(pipeline.operators.size());
+	} else {
+		intermediate_batches.reserve(pipeline.operators.size());
+	}
 	intermediate_states.reserve(pipeline.operators.size());
 	for (idx_t i = 0; i < pipeline.operators.size(); i++) {
 		auto &current_operator = pipeline.operators[i].get();
 
-		if (!use_execution_batches) {
+		if (execution_mode == PipelineExecutionMode::DATA_CHUNK) {
 			auto &prev_operator = i == 0 ? *pipeline.source : pipeline.operators[i - 1].get();
 			auto chunk = make_uniq<DataChunk>();
 			chunk->Initialize(BufferAllocator::Get(context.client), prev_operator.GetTypes());
 			intermediate_chunks.push_back(std::move(chunk));
+		} else {
+			intermediate_batches.push_back(make_uniq<ExecutionBatch>());
 		}
-		intermediate_batches.push_back(make_uniq<ExecutionBatch>());
 
 		auto op_state = current_operator.GetOperatorState(context);
 		intermediate_states.push_back(std::move(op_state));
@@ -150,7 +155,7 @@ PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_
 			FinishProcessing();
 		}
 	}
-	if (!use_execution_batches) {
+	if (execution_mode == PipelineExecutionMode::DATA_CHUNK) {
 		InitializeChunk(final_chunk);
 	}
 }
@@ -441,7 +446,7 @@ SinkNextBatchType PipelineExecutor::NextBatch(ExecutionBatch &source_batch, cons
 }
 
 PipelineExecuteResult PipelineExecutor::Execute(idx_t max_chunks) {
-	if (use_execution_batches) {
+	if (execution_mode == PipelineExecutionMode::EXECUTION_BATCH) {
 		return ExecuteBatches(max_chunks);
 	}
 	D_ASSERT(pipeline.sink);

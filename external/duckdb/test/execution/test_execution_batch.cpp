@@ -3,11 +3,13 @@
 
 #include "catch.hpp"
 
+#include "duckdb/execution/executor.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parallel/interrupt.hpp"
+#include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 
 using namespace duckdb;
@@ -70,6 +72,195 @@ public:
 	mutable vector<vector<int64_t>> observed_values;
 };
 
+class MaterializedCountingSource : public PhysicalOperator {
+public:
+	explicit MaterializedCountingSource(PhysicalPlan &physical_plan)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::TABLE_SCAN, {LogicalType::BIGINT}, 3) {
+	}
+
+	bool IsSource() const override {
+		return true;
+	}
+
+	SourceResultType GetDataBatch(ExecutionContext &context, ExecutionBatch &batch,
+	                              OperatorSourceInput &input) const override {
+		batch_calls++;
+		return PhysicalOperator::GetDataBatch(context, batch, input);
+	}
+
+	mutable idx_t data_calls = 0;
+	mutable idx_t batch_calls = 0;
+	mutable vector<const DataChunk *> output_addresses;
+
+protected:
+	SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &) const override {
+		data_calls++;
+		output_addresses.push_back(&chunk);
+		if (next_value >= 3) {
+			return SourceResultType::FINISHED;
+		}
+		chunk.SetCardinality(1);
+		chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(next_value + 1)));
+		next_value++;
+		return SourceResultType::HAVE_MORE_OUTPUT;
+	}
+
+private:
+	mutable idx_t next_value = 0;
+};
+
+class MaterializedCountingOperator : public PhysicalOperator {
+public:
+	explicit MaterializedCountingOperator(PhysicalPlan &physical_plan, bool requires_batch_p = false)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::PROJECTION, {LogicalType::BIGINT}, 3),
+	      requires_batch(requires_batch_p) {
+	}
+
+	OperatorResultType Execute(ExecutionContext &, DataChunk &input, DataChunk &output, GlobalOperatorState &,
+	                           OperatorState &) const override {
+		execute_calls++;
+		output_addresses.push_back(&output);
+		output.Reference(input);
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+
+	OperatorResultType ExecuteBatch(ExecutionContext &context, ExecutionBatch &input, ExecutionBatch &output,
+	                                GlobalOperatorState &gstate, OperatorState &state) const override {
+		batch_calls++;
+		return PhysicalOperator::ExecuteBatch(context, input, output, gstate, state);
+	}
+
+	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole role) const override {
+		return requires_batch && role == PipelineOperatorRole::INTERMEDIATE ? ExecutionBatchRequirement::REQUIRED
+		                                                                    : ExecutionBatchRequirement::OPTIONAL;
+	}
+
+	mutable idx_t execute_calls = 0;
+	mutable idx_t batch_calls = 0;
+	mutable vector<const DataChunk *> output_addresses;
+
+private:
+	bool requires_batch;
+};
+
+class MaterializedCountingSink : public PhysicalOperator {
+public:
+	explicit MaterializedCountingSink(PhysicalPlan &physical_plan, bool requires_batch_p = false)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::RESULT_COLLECTOR, {}, 3),
+	      requires_batch(requires_batch_p) {
+	}
+
+	bool IsSink() const override {
+		return true;
+	}
+
+	SinkResultType Sink(ExecutionContext &, DataChunk &chunk, OperatorSinkInput &) const override {
+		sink_calls++;
+		for (idx_t row = 0; row < chunk.size(); row++) {
+			values.push_back(chunk.GetValue(0, row).GetValue<int64_t>());
+		}
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+
+	SinkResultType SinkBatch(ExecutionContext &context, ExecutionBatch &batch,
+	                         OperatorSinkInput &input) const override {
+		batch_calls++;
+		return PhysicalOperator::SinkBatch(context, batch, input);
+	}
+
+	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole role) const override {
+		return requires_batch && role == PipelineOperatorRole::SINK ? ExecutionBatchRequirement::REQUIRED
+		                                                            : ExecutionBatchRequirement::OPTIONAL;
+	}
+
+	mutable idx_t sink_calls = 0;
+	mutable idx_t batch_calls = 0;
+	mutable vector<int64_t> values;
+
+private:
+	bool requires_batch;
+};
+
+class LazyBatchSource : public PhysicalOperator {
+public:
+	explicit LazyBatchSource(PhysicalPlan &physical_plan)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::TABLE_SCAN, {LogicalType::BIGINT}, 3) {
+	}
+
+	bool IsSource() const override {
+		return true;
+	}
+
+	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole role) const override {
+		return role == PipelineOperatorRole::SOURCE ? ExecutionBatchRequirement::REQUIRED
+		                                            : ExecutionBatchRequirement::OPTIONAL;
+	}
+
+	SourceResultType GetDataBatch(ExecutionContext &, ExecutionBatch &batch, OperatorSourceInput &) const override {
+		batch_calls++;
+		batch = ExecutionBatch();
+		if (emitted) {
+			return SourceResultType::FINISHED;
+		}
+
+		ExternalBlockDescriptor block;
+		block.metadata.num_rows = 3;
+		block.metadata.size_bytes = 24;
+		auto lazy = make_uniq<LazyDataChunk>();
+		lazy->logical_types = types;
+		lazy->names = {"value"};
+		lazy->blocks.push_back(std::move(block));
+		lazy->RecomputeCardinality();
+
+		batch.kind = ExecutionBatchKind::LAZY_DATA_CHUNK;
+		batch.rows = lazy->cardinality;
+		batch.estimated_bytes = lazy->EstimatedBytes();
+		batch.lazy = std::move(lazy);
+		emitted = true;
+		return SourceResultType::HAVE_MORE_OUTPUT;
+	}
+
+	mutable idx_t data_calls = 0;
+	mutable idx_t batch_calls = 0;
+
+protected:
+	SourceResultType GetDataInternal(ExecutionContext &, DataChunk &, OperatorSourceInput &) const override {
+		data_calls++;
+		throw InternalException("LazyBatchSource requires ExecutionBatch execution");
+	}
+
+private:
+	mutable bool emitted = false;
+};
+
+class LazyBatchSink : public PhysicalOperator {
+public:
+	explicit LazyBatchSink(PhysicalPlan &physical_plan)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::RESULT_COLLECTOR, {}, 3) {
+	}
+
+	bool IsSink() const override {
+		return true;
+	}
+
+	SinkResultType Sink(ExecutionContext &, DataChunk &, OperatorSinkInput &) const override {
+		data_calls++;
+		throw InternalException("LazyBatchSink received materialized input");
+	}
+
+	SinkResultType SinkBatch(ExecutionContext &, ExecutionBatch &batch, OperatorSinkInput &) const override {
+		batch_calls++;
+		REQUIRE(batch.kind == ExecutionBatchKind::LAZY_DATA_CHUNK);
+		REQUIRE(batch.lazy);
+		accepted_rows += batch.lazy->cardinality;
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+
+	mutable idx_t data_calls = 0;
+	mutable idx_t batch_calls = 0;
+	mutable idx_t accepted_rows = 0;
+};
+
 static void RequireRetryablePayload(const ExecutionBatch &batch, const DataChunk *expected_payload) {
 	REQUIRE(batch.kind == ExecutionBatchKind::MATERIALIZED_CHUNK);
 	REQUIRE(batch.rows == 3);
@@ -125,6 +316,105 @@ static void VerifyStreamingBackpressure(idx_t threads) {
 }
 
 } // namespace
+
+TEST_CASE("Materialized pipelines use and reuse DataChunk callbacks", "[execution_batch][pipeline]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	Executor executor(*con.context);
+	Pipeline pipeline(executor);
+	PipelineBuildState build_state;
+	PhysicalPlan physical_plan(Allocator::DefaultAllocator());
+	MaterializedCountingSource source(physical_plan);
+	MaterializedCountingOperator op(physical_plan);
+	MaterializedCountingSink sink(physical_plan);
+
+	build_state.SetPipelineSource(pipeline, source);
+	build_state.AddPipelineOperator(pipeline, op);
+	build_state.SetPipelineSink(pipeline, sink, 0);
+	pipeline.Ready();
+	REQUIRE(pipeline.GetExecutionMode() == PipelineExecutionMode::DATA_CHUNK);
+
+	pipeline.Reset();
+	PipelineExecutor pipeline_executor(*con.context, pipeline);
+	REQUIRE(pipeline_executor.Execute() == PipelineExecuteResult::FINISHED);
+
+	REQUIRE(source.data_calls == 4);
+	REQUIRE(source.batch_calls == 0);
+	REQUIRE(op.execute_calls == 3);
+	REQUIRE(op.batch_calls == 0);
+	REQUIRE(sink.sink_calls == 3);
+	REQUIRE(sink.batch_calls == 0);
+	REQUIRE(sink.values == vector<int64_t> {1, 2, 3});
+
+	REQUIRE_FALSE(source.output_addresses.empty());
+	for (auto address : source.output_addresses) {
+		REQUIRE(address == source.output_addresses.front());
+	}
+	REQUIRE_FALSE(op.output_addresses.empty());
+	for (auto address : op.output_addresses) {
+		REQUIRE(address == op.output_addresses.front());
+	}
+}
+
+TEST_CASE("Batch-required sources preserve lazy payloads through the pipeline", "[execution_batch][pipeline]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	Executor executor(*con.context);
+	Pipeline pipeline(executor);
+	PipelineBuildState build_state;
+	PhysicalPlan physical_plan(Allocator::DefaultAllocator());
+	LazyBatchSource source(physical_plan);
+	LazyBatchSink sink(physical_plan);
+
+	build_state.SetPipelineSource(pipeline, source);
+	build_state.SetPipelineSink(pipeline, sink, 0);
+	pipeline.Ready();
+	REQUIRE(pipeline.GetExecutionMode() == PipelineExecutionMode::EXECUTION_BATCH);
+
+	pipeline.Reset();
+	PipelineExecutor pipeline_executor(*con.context, pipeline);
+	REQUIRE(pipeline_executor.Execute() == PipelineExecuteResult::FINISHED);
+
+	REQUIRE(source.data_calls == 0);
+	REQUIRE(source.batch_calls == 2);
+	REQUIRE(sink.data_calls == 0);
+	REQUIRE(sink.batch_calls == 1);
+	REQUIRE(sink.accepted_rows == 3);
+}
+
+TEST_CASE("Intermediate and sink requirements select ExecutionBatch", "[execution_batch][pipeline]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	PhysicalPlan physical_plan(Allocator::DefaultAllocator());
+
+	SECTION("intermediate operator") {
+		Executor executor(*con.context);
+		Pipeline pipeline(executor);
+		PipelineBuildState build_state;
+		MaterializedCountingSource source(physical_plan);
+		MaterializedCountingOperator op(physical_plan, true);
+		MaterializedCountingSink sink(physical_plan);
+
+		build_state.SetPipelineSource(pipeline, source);
+		build_state.AddPipelineOperator(pipeline, op);
+		build_state.SetPipelineSink(pipeline, sink, 0);
+		pipeline.Ready();
+		REQUIRE(pipeline.GetExecutionMode() == PipelineExecutionMode::EXECUTION_BATCH);
+	}
+
+	SECTION("sink") {
+		Executor executor(*con.context);
+		Pipeline pipeline(executor);
+		PipelineBuildState build_state;
+		MaterializedCountingSource source(physical_plan);
+		MaterializedCountingSink sink(physical_plan, true);
+
+		build_state.SetPipelineSource(pipeline, source);
+		build_state.SetPipelineSink(pipeline, sink, 0);
+		pipeline.Ready();
+		REQUIRE(pipeline.GetExecutionMode() == PipelineExecutionMode::EXECUTION_BATCH);
+	}
+}
 
 TEST_CASE("ExecutionBatch payload remains retryable after a sink blocks", "[execution_batch][sink]") {
 	DuckDB db(nullptr);
@@ -221,7 +511,7 @@ TEST_CASE("ExecutionBatch payload remains stable while an operator has more outp
 	}
 }
 
-TEST_CASE("Native streaming preserves ExecutionBatch payload through backpressure", "[execution_batch][streaming]") {
+TEST_CASE("Native streaming preserves rows through backpressure", "[execution_batch][streaming]") {
 	SECTION("single-threaded") {
 		VerifyStreamingBackpressure(1);
 	}

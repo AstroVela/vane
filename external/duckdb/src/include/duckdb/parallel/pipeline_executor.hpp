@@ -158,8 +158,8 @@ private:
 	idx_t flushing_idx;
 	//! Persist the current operator's finalization result while downstream operators drain its output
 	OperatorFlushState operator_flush_state = OperatorFlushState::NEEDS_FINALIZE;
-	//! Whether this executor should route source/operator/sink calls through ExecutionBatch callbacks
-	bool use_execution_batches = false;
+	//! The representation selected from the source/operator/sink requirements during pipeline construction.
+	PipelineExecutionMode execution_mode;
 
 private:
 	void StartOperator(PhysicalOperator &op);

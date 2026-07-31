@@ -61,6 +61,11 @@ public:
 		return OrderPreservationType::NO_ORDER;
 	}
 
+	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole role) const override {
+		return role == PipelineOperatorRole::SOURCE ? ExecutionBatchRequirement::REQUIRED
+		                                            : ExecutionBatchRequirement::OPTIONAL;
+	}
+
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;

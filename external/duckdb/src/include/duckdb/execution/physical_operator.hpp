@@ -45,6 +45,12 @@ class Deserializer;
 
 enum class OperatorCachingMode : uint8_t { NONE, PARTITIONED, ORDERED, UNORDERED };
 
+//! The role a physical operator has in a specific execution pipeline.
+enum class PipelineOperatorRole : uint8_t { SOURCE, INTERMEDIATE, SINK };
+
+//! Whether a role needs ExecutionBatch callbacks to preserve its execution semantics.
+enum class ExecutionBatchRequirement : uint8_t { OPTIONAL, REQUIRED };
+
 //! PhysicalOperator is the base class of the physical operators present in the execution plan.
 class PhysicalOperator {
 public:
@@ -135,6 +141,12 @@ public:
 	//! The influence the operator has on order (insertion order means no influence)
 	virtual OrderPreservationType OperatorOrder() const {
 		return OrderPreservationType::INSERTION_ORDER;
+	}
+
+	//! Whether this operator needs ExecutionBatch callbacks for the role it has in a pipeline.
+	//! OPTIONAL operators remain compatible with ExecutionBatch pipelines through the default materializing wrappers.
+	virtual ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole) const {
+		return ExecutionBatchRequirement::OPTIONAL;
 	}
 
 public:
