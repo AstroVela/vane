@@ -22,6 +22,12 @@ repos:
       # Run the formatter.
       - id: ruff-format
         exclude: ^benchmarking/(parquet|tpcds)/
+      - id: ruff-format
+        alias: ruff-format-check
+        name: ruff format (check)
+        args: [--check]
+        exclude: ^benchmarking/(parquet|tpcds)/
+        stages: [manual]
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
     # Root formatter only. external/duckdb uses DuckDB's own clang-format 11 formatter.
@@ -29,11 +35,23 @@ repos:
     hooks:
       - id: clang-format
         files: \.(c|cc|cpp|cxx|h|hh|hpp|hxx|ipp)$
+      - id: clang-format
+        alias: clang-format-check
+        name: clang-format (check)
+        entry: clang-format --dry-run --Werror
+        files: \.(c|cc|cpp|cxx|h|hh|hpp|hxx|ipp)$
+        stages: [manual]
 
   - repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: e2c2116d86a80e72e7146a06e68b7c228afc6319 # frozen: v0.6.13
     hooks:
       - id: cmake-format
+      - id: cmake-format
+        alias: cmake-format-check
+        name: cmake-format (check)
+        entry: cmake-format --check
+        args: []
+        stages: [manual]
 
   - repo: https://github.com/python-jsonschema/check-jsonschema
     rev: 1a4bb160cab6417b3045e1b37b6b72449243e658 # frozen: 0.37.4
@@ -64,3 +82,9 @@ repos:
         entry: shfmt -w -ln=bash -i=2 -ci -bn
         language: system
         types: [shell]
+      - id: shfmt-check
+        name: shfmt (check)
+        entry: shfmt -d -ln=bash -i=2 -ci -bn
+        language: system
+        types: [shell]
+        stages: [manual]

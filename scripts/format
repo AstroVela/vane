@@ -7,12 +7,16 @@ set -u
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/format root [--all|--changed|--staged]
-  scripts/format duckdb [--all|--changed]
-  scripts/format workspace [--all|--changed]
+  scripts/format root [--all|--changed|--staged|--from-ref REF] [--check]
+  scripts/format duckdb [--all|--changed|--from-ref REF] [--check]
+  scripts/format workspace [--all|--changed|--from-ref REF] [--check]
   scripts/format -h|--help
 
 No action is run without a subcommand. With a subcommand, the default file set is --changed.
+
+Actions:
+  default     Format files in place.
+  --check     Verify formatting without modifying files.
 
 Subcommands:
   root        Format the root repository only. Does not enter external/duckdb.
@@ -23,6 +27,7 @@ Root repository file sets:
   --all       All root git-tracked files.
   --changed   Root files changed relative to HEAD. Default.
   --staged    Root files staged with git add. This is not git stash.
+  --from-ref  Files changed relative to REF.
 
 Root formatter hooks:
   ruff-format, clang-format, cmake-format, shfmt.
@@ -30,20 +35,25 @@ Root formatter hooks:
 DuckDB file sets:
   --all       Full external/duckdb formatter pass.
   --changed   external/duckdb files changed relative to the monorepo HEAD. Default.
+  --from-ref  external/duckdb files changed relative to REF.
 
 Examples:
   scripts/format root
+  scripts/format root --changed --check
+  scripts/format root --from-ref origin/main --check
   scripts/format root --staged
   scripts/format root --all
   scripts/format duckdb
+  scripts/format duckdb --changed --check
   scripts/format workspace --all
+  scripts/format workspace --all --check
 
 Notes:
   external/duckdb contains C++, Python, CMake, test, and benchmark files.
   Its formatter is intentionally separate from the root repository formatter.
   workspace runs root and external/duckdb independently, then reports failures.
   root requires pre-commit on PATH.
-  duckdb requires black>=24, clang-format 11.0.1, and cmake-format on PATH.
+  duckdb requires black 24.x, clang-format 11.0.1, and cmake-format on PATH.
 EOF
 }
 
@@ -77,20 +87,34 @@ case "$1" in
 esac
 
 file_set=""
+check_only=false
+diff_ref=""
 
 while (($#)); do
   case "$1" in
     --all)
-      [[ -z "$file_set" ]] || die "Choose only one file set: --all, --changed, or --staged."
+      [[ -z "$file_set" ]] || die "Choose only one file set: --all, --changed, --staged, or --from-ref."
       file_set="all"
       ;;
     --changed)
-      [[ -z "$file_set" ]] || die "Choose only one file set: --all, --changed, or --staged."
+      [[ -z "$file_set" ]] || die "Choose only one file set: --all, --changed, --staged, or --from-ref."
       file_set="changed"
       ;;
     --staged)
-      [[ -z "$file_set" ]] || die "Choose only one file set: --all, --changed, or --staged."
+      [[ -z "$file_set" ]] || die "Choose only one file set: --all, --changed, --staged, or --from-ref."
       file_set="staged"
+      ;;
+    --from-ref)
+      [[ -z "$file_set" ]] || die "Choose only one file set: --all, --changed, --staged, or --from-ref."
+      if (($# < 2)) || [[ "$2" == -* ]]; then
+        die "--from-ref requires a Git revision."
+      fi
+      file_set="from_ref"
+      diff_ref="$2"
+      shift
+      ;;
+    --check)
+      check_only=true
       ;;
     -h | --help)
       usage
@@ -111,6 +135,11 @@ if [[ "$command_name" != "root" && "$file_set" == "staged" ]]; then
   die "--staged is only valid with: scripts/format root"
 fi
 
+if [[ "$file_set" == "from_ref" ]] \
+  && ! git rev-parse --verify --quiet --end-of-options "${diff_ref}^{commit}" >/dev/null; then
+  die "Invalid Git revision for --from-ref: $diff_ref"
+fi
+
 pre_commit=()
 
 load_pre_commit() {
@@ -126,11 +155,19 @@ load_pre_commit() {
 }
 
 root_hooks() {
-  printf '%s\n' ruff-format clang-format cmake-format shfmt
+  if [[ "$check_only" == true ]]; then
+    printf '%s\n' ruff-format-check clang-format-check cmake-format-check shfmt-check
+  else
+    printf '%s\n' ruff-format clang-format cmake-format shfmt
+  fi
 }
 
 root_changed_files() {
-  git diff --name-only --diff-filter=ACMRT HEAD -- . ':(exclude)external/duckdb/**'
+  if [[ "$file_set" == "from_ref" ]]; then
+    git diff --name-only --diff-filter=ACMRT "$diff_ref" -- . ':(exclude)external/duckdb/**'
+  else
+    git diff --name-only --diff-filter=ACMRT HEAD -- . ':(exclude)external/duckdb/**'
+  fi
 }
 
 require_duckdb_formatters() {
@@ -138,14 +175,14 @@ require_duckdb_formatters() {
   local version
 
   if ! command -v black >/dev/null 2>&1; then
-    echo "black>=24 is required to format external/duckdb." >&2
-    echo 'Install it in your active environment, for example: python -m pip install "black>=24"' >&2
+    echo "black 24.x is required to format external/duckdb." >&2
+    echo 'Install it in your active environment, for example: python -m pip install "black==24.*"' >&2
     status=127
   else
     version="$(black --version 2>/dev/null || true)"
-    if [[ ! "$version" =~ ([0-9]+)\. ]] || ((BASH_REMATCH[1] < 24)); then
-      echo "black>=24 is required to format external/duckdb. Found: ${version:-unknown}" >&2
-      echo 'Install it in your active environment, for example: python -m pip install "black>=24"' >&2
+    if [[ ! "$version" =~ ([0-9]+)\. ]] || ((BASH_REMATCH[1] != 24)); then
+      echo "black 24.x is required to format external/duckdb. Found: ${version:-unknown}" >&2
+      echo 'Install it in your active environment, for example: python -m pip install "black==24.*"' >&2
       status=127
     fi
   fi
@@ -177,16 +214,25 @@ run_root_format() {
   local hook
   local code
   local files=()
+  local hook_stage=()
 
   load_pre_commit || return $?
 
-  if [[ "$file_set" == "changed" ]]; then
+  if [[ "$check_only" == true ]]; then
+    hook_stage=(--hook-stage manual)
+  fi
+
+  if [[ "$file_set" == "changed" || "$file_set" == "from_ref" ]]; then
     while IFS= read -r file; do
       [[ -n "$file" ]] && files+=("$file")
     done < <(root_changed_files)
 
     if ((${#files[@]} == 0)); then
-      echo "No root files changed relative to HEAD."
+      if [[ "$file_set" == "from_ref" ]]; then
+        echo "No root files changed relative to $diff_ref."
+      else
+        echo "No root files changed relative to HEAD."
+      fi
       return 0
     fi
   fi
@@ -194,13 +240,13 @@ run_root_format() {
   while IFS= read -r hook; do
     case "$file_set" in
       all)
-        "${pre_commit[@]}" run "$hook" --all-files --color=always
+        "${pre_commit[@]}" run "$hook" "${hook_stage[@]}" --all-files --color=always
         ;;
       staged)
-        "${pre_commit[@]}" run "$hook" --color=always
+        "${pre_commit[@]}" run "$hook" "${hook_stage[@]}" --color=always
         ;;
-      changed)
-        "${pre_commit[@]}" run "$hook" --files "${files[@]}" --color=always
+      changed | from_ref)
+        "${pre_commit[@]}" run "$hook" "${hook_stage[@]}" --files "${files[@]}" --color=always
         ;;
     esac
 
@@ -220,20 +266,24 @@ run_root_format_with_verify() {
   run_root_format
   first_status=$?
 
-  if [[ $first_status -ne 0 ]]; then
-    echo "Re-running root format hooks to verify after automatic edits..."
-    run_root_format
-    second_status=$?
-    if [[ $second_status -ne 0 ]]; then
-      return "$second_status"
-    fi
+  if [[ "$check_only" == true || $first_status -eq 0 ]]; then
+    return "$first_status"
   fi
+
+  echo "Re-running root format hooks to verify after automatic edits..."
+  run_root_format
+  second_status=$?
+  return "$second_status"
 }
 
 run_duckdb_format() {
   local duckdb_dir="$repo_root/external/duckdb"
   local format_status
   local temp_dir
+  local file
+  local added_files=()
+  local format_args=()
+  local index_ref="HEAD"
 
   if [[ ! -f "$duckdb_dir/scripts/format.py" ]]; then
     echo "external/duckdb formatter not found. Is the DuckDB source present?" >&2
@@ -242,20 +292,46 @@ run_duckdb_format() {
 
   require_duckdb_formatters || return $?
 
-  echo "Formatting external/duckdb with DuckDB's own formatter..."
+  if [[ "$check_only" == true ]]; then
+    echo "Checking external/duckdb with DuckDB's own formatter..."
+    export PYTHONDONTWRITEBYTECODE=1
+    format_args=(--check --silent)
+  else
+    echo "Formatting external/duckdb with DuckDB's own formatter..."
+    format_args=(--fix --noconfirm)
+  fi
 
   if [[ "$file_set" == "all" ]]; then
     (
       cd "$duckdb_dir" || exit 1
-      python scripts/format.py --all --fix --noconfirm
+      python scripts/format.py --all "${format_args[@]}"
     )
     format_status=$?
   else
     # DuckDB's formatter expects paths relative to its source root. Build a
-    # temporary index at the monorepo HEAD and ask git diff to strip the subtree
-    # prefix so both staged and unstaged DuckDB changes are formatted correctly.
+    # temporary index at the selected comparison ref and ask git diff to strip
+    # the subtree prefix.
+    if [[ "$file_set" == "from_ref" ]]; then
+      index_ref="$diff_ref"
+    fi
+
     temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/vane-duckdb-format.XXXXXX")" || return 1
-    if ! GIT_INDEX_FILE="$temp_dir/index" git read-tree HEAD; then
+    if ! GIT_INDEX_FILE="$temp_dir/index" git read-tree "$index_ref"; then
+      rm -rf "$temp_dir"
+      return 1
+    fi
+
+    # Added paths would otherwise be untracked, which git diff does not report.
+    while IFS= read -r -d '' file; do
+      [[ -f "$file" ]] && added_files+=("$file")
+    done < <(git diff --no-renames --name-only --diff-filter=A -z "$index_ref" HEAD -- external/duckdb)
+
+    while IFS= read -r -d '' file; do
+      [[ -f "$file" ]] && added_files+=("$file")
+    done < <(git diff --cached --no-renames --name-only --diff-filter=A -z HEAD -- external/duckdb)
+
+    if ((${#added_files[@]} > 0)) \
+      && ! GIT_INDEX_FILE="$temp_dir/index" git add --intent-to-add -- "${added_files[@]}"; then
       rm -rf "$temp_dir"
       return 1
     fi
@@ -264,7 +340,7 @@ run_duckdb_format() {
       trap 'rm -rf "$temp_dir"' EXIT
       export GIT_INDEX_FILE="$temp_dir/index"
       cd "$duckdb_dir" || exit 1
-      python scripts/format.py --fix --noconfirm -- "--relative=external/duckdb"
+      python scripts/format.py "${format_args[@]}" -- "--relative=external/duckdb"
     )
     format_status=$?
   fi
@@ -279,12 +355,22 @@ run_duckdb_format() {
 run_workspace_format() {
   local root_status=0
   local duckdb_status=0
+  local action="Formatting"
+  local file_set_label="--$file_set"
 
-  echo "==> Formatting root repository (--$file_set)"
+  if [[ "$check_only" == true ]]; then
+    action="Checking"
+  fi
+
+  if [[ "$file_set" == "from_ref" ]]; then
+    file_set_label="--from-ref $diff_ref"
+  fi
+
+  echo "==> $action root repository ($file_set_label)"
   run_root_format_with_verify
   root_status=$?
 
-  echo "==> Formatting external/duckdb (--$file_set)"
+  echo "==> $action external/duckdb ($file_set_label)"
   run_duckdb_format
   duckdb_status=$?
 

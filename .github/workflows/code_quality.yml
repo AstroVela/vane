@@ -67,7 +67,7 @@ jobs:
         run: |
           bash -n scripts/format
           scripts/format --help
-          scripts/format root
+          scripts/format root --check
 
   run-checks:
     name: Lint, format and type checks for changed files
@@ -90,7 +90,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y shfmt
-          python -m pip install pre-commit
+          python -m pip install \
+            "black==24.*" \
+            "clang_format==11.0.1" \
+            cmake-format \
+            pre-commit
 
       - name: Restore pre-commit cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -98,16 +102,21 @@ jobs:
           path: ~/.cache/pre-commit
           key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
 
-      - name: Run pre-commit for the changed range
+      - name: Run checks for the changed range
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
+          export PRE_COMMIT_HOME="$HOME/.cache/pre-commit"
+          format_hooks="ruff-format,clang-format,cmake-format,shfmt"
           head_ref="$(git rev-parse HEAD)"
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             base_ref="$PR_BASE_SHA"
-            pre-commit run \
+            scripts/format workspace --from-ref "$base_ref" --check
+            git diff --exit-code
+            git diff --cached --exit-code
+            SKIP="$format_hooks" pre-commit run \
               --show-diff-on-failure \
               --color=always \
               --from-ref "$base_ref" \
@@ -119,7 +128,13 @@ jobs:
           elif git rev-parse HEAD^ >/dev/null 2>&1; then
             base_ref="HEAD^"
           else
-            pre-commit run --show-diff-on-failure --color=always --all-files
+            scripts/format workspace --all --check
+            git diff --exit-code
+            git diff --cached --exit-code
+            SKIP="$format_hooks" pre-commit run \
+              --show-diff-on-failure \
+              --color=always \
+              --all-files
             exit
           fi
 
@@ -134,7 +149,10 @@ jobs:
             exit
           fi
 
-          pre-commit run \
+          scripts/format workspace --from-ref "$base_ref" --check
+          git diff --exit-code
+          git diff --cached --exit-code
+          SKIP="$format_hooks" pre-commit run \
             --show-diff-on-failure \
             --color=always \
             --files "${changed_files[@]}"
