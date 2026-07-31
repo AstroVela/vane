@@ -117,23 +117,32 @@ class TaskAdmissionController:
             self._state = "requested"
             self._request_id = str(request["request_id"])
             self._retained_input_bytes = retained
+        request_id = str(request["request_id"])
         try:
             request_ref = self._driver_actor().acquire_query_task_lease.remote(request)
             future = request_ref.future()
+            with self._lock:
+                if self._state == "requested" and self._request_id == request_id:
+                    self._request_ref = request_ref
+            future.add_done_callback(
+                lambda done, request_id=request_id: self._finish_request(
+                    request_id,
+                    done,
+                )
+            )
         except BaseException as exc:
             with self._lock:
-                self._state = "failed"
-                self._error = exc
+                if self._state == "requested" and self._request_id == request_id:
+                    self._request_ref = None
+                    self._state = "failed"
+                    self._error = exc
+            try:
+                self._driver_actor().cancel_query_task_lease_request.remote(request_id)
+            except BaseException as cleanup_error:
+                add_note = getattr(exc, "add_note", None)
+                if callable(add_note):
+                    add_note(f"task admission setup cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}")
             raise
-        with self._lock:
-            if self._state == "requested" and self._request_id == request["request_id"]:
-                self._request_ref = request_ref
-        future.add_done_callback(
-            lambda done, request_id=str(request["request_id"]): self._finish_request(
-                request_id,
-                done,
-            )
-        )
         return True
 
     def _finish_request(self, request_id: str, future: Any) -> None:
@@ -164,10 +173,7 @@ class TaskAdmissionController:
                 self._error = exc
                 wakeup = self._wakeup
         if abandon:
-            self._driver_actor().cancel_query_task_lease_request.remote(
-                request_id,
-                submitted=False,
-            )
+            self._driver_actor().cancel_query_task_lease_request.remote(request_id)
             return
         if wakeup is not None:
             wakeup()
@@ -190,10 +196,7 @@ class TaskAdmissionController:
                 request_id=request_id,
                 retained_input_bytes=self._retained_input_bytes,
                 lease=dict(self._ready_lease),
-                _release_callback=lambda: driver.cancel_query_task_lease_request.remote(
-                    request_id,
-                    submitted=False,
-                ),
+                _release_callback=lambda: driver.cancel_query_task_lease_request.remote(request_id),
             )
             self._state = "idle"
             self._request_id = ""
@@ -232,10 +235,7 @@ class TaskAdmissionController:
             self._ready_lease = None
             self._wakeup = None
         if request_id:
-            self._driver_actor().cancel_query_task_lease_request.remote(
-                request_id,
-                submitted=False,
-            )
+            self._driver_actor().cancel_query_task_lease_request.remote(request_id)
 
 
 class TaskAdmissionExecutorMixin(AdmissionExecutorMixin):

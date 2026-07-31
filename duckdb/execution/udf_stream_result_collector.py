@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import heapq
 import math
 import os
 import sys
@@ -16,14 +15,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from duckdb.execution.ray_stream_adapter import (
-    RAY_STREAM_CLEANUP_CANCELLATION,
-    RAY_STREAM_CLEANUP_CONTROL,
-    RAY_STREAM_CLEANUP_CORE,
-    RAY_STREAM_CLEANUP_OUTPUT,
     RayStreamAdapter,
     RayStreamCleanupOperation,
     TaskLeaseObjectRefGenerator,
-    resolve_ray_control_ack,
+    ray_object_ref_future,
+    validate_ray_control_ack,
 )
 from duckdb.execution.udf_ray_actor_state import format_stateful_actor_loss
 from duckdb.execution.udf_ray_config import REF_BUNDLE_RESULT_MARKER
@@ -34,19 +30,8 @@ from duckdb.execution.udf_ray_stream_protocol import (
 
 _GENERATOR_READINESS_POLL_INITIAL_DELAY_S = 0.001
 _GENERATOR_READINESS_POLL_MAX_DELAY_S = 0.01
-_DEFAULT_CONTROL_CLEANUP_WORKERS = 4
-_DEFAULT_OUTPUT_CLEANUP_WORKERS = 4
-_DEFAULT_CANCELLATION_CLEANUP_WORKERS = 2
-_DEFAULT_CORE_CLEANUP_WORKERS = 2
 _CLEANUP_RETRY_INITIAL_DELAY_S = 0.01
 _CLEANUP_RETRY_MAX_DELAY_S = 1.0
-
-
-def _cleanup_worker_count(name: str, default: int) -> int:
-    value = int(os.environ.get(name, str(default)))
-    if value <= 0 or value > 256:
-        raise ValueError(f"{name} must be between 1 and 256")
-    return value
 
 
 def _collector_debug_log(event: str, record: _StreamRecord, **fields: Any) -> None:
@@ -85,8 +70,8 @@ class _OutputLeaseToken:
     handed_off: bool = False
     handoff_pending: bool = False
     release_pending: bool = False
-    handoff_response_ref: Any | None = None
-    release_response_ref: Any | None = None
+    handoff_response_future: Any | None = None
+    release_response_future: Any | None = None
 
 
 @dataclass
@@ -119,6 +104,7 @@ class _StreamRecord:
     submit_id: int
     adapter: RayStreamAdapter
     sequence: int
+    registered: bool = False
     phase: str = "block"
     block_ref: Any | None = None
     metadata_ref: Any | None = None
@@ -144,13 +130,21 @@ class _StreamRecord:
 
 
 class _CleanupTicket:
-    """Durable owner for one blocking terminal operation."""
+    """Durable owner for one event-loop-driven terminal operation."""
 
     def __init__(
         self,
         *,
+        operation: Callable[[], Any],
+        retry_on_error: bool,
+        retry_on_incomplete: bool,
         on_complete: Callable[[BaseException | None], None],
     ) -> None:
+        self.operation = operation
+        self.retry_on_error = bool(retry_on_error)
+        self.retry_on_incomplete = bool(retry_on_incomplete)
+        self.retry_count = 0
+        self.wait_future: Any | None = None
         self._done = False
         self._error: BaseException | None = None
         self._on_complete = on_complete
@@ -198,160 +192,6 @@ class _CleanupTicket:
             return () if self._error is None else (self._error,)
 
 
-@dataclass
-class _CleanupWorkItem:
-    operation: Callable[[], Any]
-    ticket: _CleanupTicket
-    retry_on_error: bool = False
-    retry_on_incomplete: bool = False
-    retry_count: int = 0
-
-
-class _DaemonCleanupPool:
-    """Lazily scaled, fixed-size daemon bulkhead for blocking terminal calls."""
-
-    def __init__(self, worker_count: int, *, name: str) -> None:
-        self._worker_count = int(worker_count)
-        self._name = str(name)
-        self._cv = threading.Condition()
-        self._queue: list[tuple[float, int, _CleanupWorkItem]] = []
-        self._next_queue_sequence = 0
-        self._threads: list[threading.Thread] = []
-        self._started = False
-        self._stop_when_idle = False
-        self._idle_workers = 0
-
-    def start(self) -> None:
-        with self._cv:
-            if self._started:
-                return
-            self._started = True
-
-    def _ensure_worker_locked(self) -> None:
-        if self._threads:
-            return
-        try:
-            self._start_worker_locked()
-        except BaseException as exc:
-            raise RuntimeError(f"Ray UDF cleanup pool {self._name!r} did not start") from exc
-
-    def _start_worker_locked(self) -> None:
-        worker = threading.Thread(
-            target=self._run,
-            daemon=True,
-            name=f"{self._name}-{len(self._threads)}",
-        )
-        worker.start()
-        self._threads.append(worker)
-
-    def _scale_workers_locked(self) -> None:
-        needed = max(0, len(self._queue) - self._idle_workers)
-        available = self._worker_count - len(self._threads)
-        for _index in range(min(needed, available)):
-            try:
-                self._start_worker_locked()
-            except BaseException:
-                # The already-running worker remains the durable queue owner.
-                break
-
-    def _enqueue_locked(
-        self,
-        items: Sequence[_CleanupWorkItem],
-    ) -> None:
-        if not self._started or self._stop_when_idle:
-            raise RuntimeError(f"Ray UDF cleanup pool {self._name!r} is not accepting work")
-        ready_at = time.monotonic()
-        for item in items:
-            sequence = self._next_queue_sequence
-            self._next_queue_sequence += 1
-            heapq.heappush(self._queue, (ready_at, sequence, item))
-        self._scale_workers_locked()
-        self._cv.notify_all()
-
-    def stop_when_idle(self) -> None:
-        with self._cv:
-            self._stop_when_idle = True
-            self._cv.notify_all()
-
-    def join(self, timeout: float) -> bool:
-        deadline = time.monotonic() + max(0.0, float(timeout))
-        with self._cv:
-            threads = tuple(self._threads)
-        current = threading.current_thread()
-        for worker in threads:
-            if worker is current:
-                continue
-            worker.join(timeout=max(0.0, deadline - time.monotonic()))
-        return not any(worker is not current and worker.is_alive() for worker in threads)
-
-    @property
-    def threads(self) -> tuple[threading.Thread, ...]:
-        with self._cv:
-            return tuple(self._threads)
-
-    def _take_ready_item_locked(self) -> tuple[_CleanupWorkItem | None, float | None]:
-        if not self._queue:
-            return None, None
-        now = time.monotonic()
-        ready_at, _sequence, item = self._queue[0]
-        if ready_at <= now:
-            heapq.heappop(self._queue)
-            return item, None
-        return None, max(0.0, ready_at - now)
-
-    @staticmethod
-    def _retry_delay(retry_count: int) -> float:
-        exponent = min(max(0, int(retry_count) - 1), 30)
-        return min(
-            math.ldexp(_CLEANUP_RETRY_INITIAL_DELAY_S, exponent),
-            _CLEANUP_RETRY_MAX_DELAY_S,
-        )
-
-    def _run(self) -> None:
-        while True:
-            with self._cv:
-                item: _CleanupWorkItem | None = None
-                while item is None:
-                    item, retry_wait = self._take_ready_item_locked()
-                    if item is not None:
-                        break
-                    if not self._queue and self._stop_when_idle:
-                        return
-                    self._idle_workers += 1
-                    try:
-                        self._cv.wait(timeout=retry_wait)
-                    finally:
-                        self._idle_workers -= 1
-            error: BaseException | None = None
-            retry = False
-            result: Any = None
-            try:
-                result = item.operation()
-            except BaseException as exc:
-                if item.retry_on_error:
-                    retry = True
-                else:
-                    error = exc
-            else:
-                retry = result is False and item.retry_on_incomplete
-            if retry:
-                item.retry_count += 1
-                ready_at = time.monotonic() + self._retry_delay(item.retry_count)
-                with self._cv:
-                    sequence = self._next_queue_sequence
-                    self._next_queue_sequence += 1
-                    heapq.heappush(self._queue, (ready_at, sequence, item))
-                    self._cv.notify_all()
-                del item
-                del error
-                del result
-                continue
-            item.ticket.finish(error)
-            del item
-            del error
-            del result
-
-
 class AsyncResultCollector:
     """Capacity-aware scheduler for lease-owned Ray generator streams.
 
@@ -360,13 +200,11 @@ class AsyncResultCollector:
     A terminal record is removed only while ``_cleanup_handoff_lock`` prevents
     shutdown from observing an ownership gap.
 
-    The asyncio thread is the sole generator readiness/read consumer. Terminal
-    Ray, driver, and CoreWorker calls run in fixed-size lane-specific daemon
-    pools; task admission bounds the queued plans, while lane isolation keeps a
-    blocked cancellation from withholding stream deletion or unrelated control
-    work. Cancellation acceptance intentionally precedes task-lease release so
-    running work remains budgeted. User wakeups are invoked only after the
-    complete terminal plan has an accepted cleanup owner.
+    The asyncio thread is the sole generator readiness, read, and cleanup
+    consumer. Driver RPCs are observed through public ObjectRef futures;
+    cancellation and CoreWorker stream deletion are non-waiting submissions.
+    Every terminal operation enters the ticket ledger before its source record
+    is removed, so shutdown can never observe an ownership gap.
     """
 
     def __init__(self, *, ray_module: Any | None = None) -> None:
@@ -398,37 +236,6 @@ class AsyncResultCollector:
         self._cleanup_tickets: set[_CleanupTicket] = set()
         self._cleanup_tickets_by_slot: dict[int, set[_CleanupTicket]] = defaultdict(set)
         self._terminal_cleanup_errors: list[BaseException] = []
-        self._cleanup_pools_stopping = False
-        self._cleanup_pools = {
-            RAY_STREAM_CLEANUP_CONTROL: _DaemonCleanupPool(
-                _cleanup_worker_count(
-                    "VANE_UDF_STREAM_CONTROL_CLEANUP_WORKERS",
-                    _DEFAULT_CONTROL_CLEANUP_WORKERS,
-                ),
-                name="udf-ray-stream-control-cleanup",
-            ),
-            RAY_STREAM_CLEANUP_OUTPUT: _DaemonCleanupPool(
-                _cleanup_worker_count(
-                    "VANE_UDF_STREAM_OUTPUT_CLEANUP_WORKERS",
-                    _DEFAULT_OUTPUT_CLEANUP_WORKERS,
-                ),
-                name="udf-ray-stream-output-cleanup",
-            ),
-            RAY_STREAM_CLEANUP_CANCELLATION: _DaemonCleanupPool(
-                _cleanup_worker_count(
-                    "VANE_UDF_STREAM_CANCELLATION_CLEANUP_WORKERS",
-                    _DEFAULT_CANCELLATION_CLEANUP_WORKERS,
-                ),
-                name="udf-ray-stream-cancellation-cleanup",
-            ),
-            RAY_STREAM_CLEANUP_CORE: _DaemonCleanupPool(
-                _cleanup_worker_count(
-                    "VANE_UDF_STREAM_CORE_CLEANUP_WORKERS",
-                    _DEFAULT_CORE_CLEANUP_WORKERS,
-                ),
-                name="udf-ray-stream-core-cleanup",
-            ),
-        }
         self._readiness_delay_s = _GENERATOR_READINESS_POLL_INITIAL_DELAY_S
         self._readiness_timer: asyncio.TimerHandle | None = None
         self._readiness_wakeup_pending = False
@@ -440,17 +247,10 @@ class AsyncResultCollector:
             daemon=True,
             name="udf-ray-stream-multiplexer",
         )
-        started_pools: list[_DaemonCleanupPool] = []
-        try:
-            for pool in self._cleanup_pools.values():
-                pool.start()
-                started_pools.append(pool)
-        except BaseException:
-            for pool in started_pools:
-                pool.stop_when_idle()
-            for pool in started_pools:
-                pool.join(self._shutdown_timeout_s)
-            raise
+        # Start before any submitted generator can be transferred into this
+        # collector.  A collector that cannot own its event loop therefore
+        # fails construction instead of creating a post-submit cleanup gap.
+        self._ensure_started()
 
     # Public API called by the C++ dispatcher while it owns the GIL.
 
@@ -490,14 +290,22 @@ class AsyncResultCollector:
                         )
                         self._next_sequence += 1
                         self._records[key] = record
+                        # Publish and install the first terminal observer under
+                        # one lock. Readiness skips unregistered records, so a
+                        # failing Future factory can never expose a half-owned
+                        # stream to the scheduler.
+                        self._schedule_completion_wait_locked(record)
+                        record.registered = True
                         self._signal_readiness_change_locked()
+                    _collector_debug_log("track", record)
                 except BaseException:
                     with self._cleanup_handoff_lock:
-                        cleanup_operations: Sequence[Callable[[], Any]] = ()
+                        cleanup_operations: Sequence[RayStreamCleanupOperation] = ()
                         with self._cv:
-                            if record is not None and self._records.pop(key, None) is record:
+                            if record is not None and self._records.get(key) is record:
                                 record.terminal = True
                                 record.cleanup_started = True
+                                self._cancel_record_wait_locked(record)
                                 cleanup_operations = record.adapter.cancel_operations()
                                 self._signal_readiness_change_locked()
                             elif adapter is not None:
@@ -507,14 +315,15 @@ class AsyncResultCollector:
                                 source.retire_local_state()
                         if cleanup_operations:
                             cleanup_tickets = self._submit_cleanup_operations(
-                                self._fence_cleanup_operations(cleanup_operations),
+                                cleanup_operations,
                                 store_error=False,
                                 slot_ids=(key[0],),
                             )
+                        with self._cv:
+                            if record is not None and self._records.get(key) is record:
+                                self._records.pop(key, None)
+                                self._signal_readiness_change_locked()
                     raise
-            assert record is not None
-            _collector_debug_log("track", record)
-            self._refresh_waiters()
         except BaseException as registration_error:
             if cleanup_tickets:
                 try:
@@ -538,12 +347,19 @@ class AsyncResultCollector:
                 f"distributed Ray UDF discard requires TaskLeaseObjectRefGenerator; got {type(source).__name__}"
             )
         with self._start_lock:
-            adapter = RayStreamAdapter(source, ray_module=self._ray)
+            try:
+                adapter = RayStreamAdapter(source, ray_module=self._ray)
+            except BaseException:
+                cleanup_operations = source.cancel_operations()
+                source.retire_local_state()
+            else:
+                cleanup_operations = adapter.cancel_operations()
             with self._cv:
-                self._raise_if_stopped_locked()
+                if self._shutdown:
+                    raise RuntimeError("Ray UDF stream collector is shut down")
             with self._cleanup_handoff_lock:
                 self._submit_cleanup_operations(
-                    adapter.cancel_operations(),
+                    cleanup_operations,
                     store_error=True,
                 )
 
@@ -596,33 +412,34 @@ class AsyncResultCollector:
 
     def release_output_block_lease(self, request_id: str, lease_id: str) -> bool:
         key = (str(request_id), str(lease_id))
-        with self._cv:
-            token = self._active_output_leases.get(key)
-            if token is None or token.release_pending:
-                return False
-            token.release_pending = True
-            self._cv.notify_all()
-
-        def finish_release(error: BaseException | None) -> None:
+        with self._cleanup_handoff_lock:
             with self._cv:
-                if error is None:
-                    if self._active_output_leases.get(key) is token:
-                        self._active_output_leases.pop(key, None)
-                else:
+                token = self._active_output_leases.get(key)
+                if token is None or token.release_pending:
+                    return False
+                token.release_pending = True
+                self._cv.notify_all()
+
+            def finish_release(error: BaseException | None) -> None:
+                with self._cv:
+                    if error is None:
+                        if self._active_output_leases.get(key) is token:
+                            self._active_output_leases.pop(key, None)
+                    else:
+                        token.release_pending = False
+                    self._cv.notify_all()
+
+            try:
+                self._submit_cleanup_operations(
+                    (self._output_token_release_operation(token),),
+                    on_each_done=finish_release,
+                    slot_ids=(token.slot_id,),
+                )
+            except BaseException:
+                with self._cv:
                     token.release_pending = False
-                self._cv.notify_all()
-
-        try:
-            self._submit_cleanup_operations(
-                (self._output_token_release_operation(token),),
-                on_each_done=finish_release,
-                slot_ids=(token.slot_id,),
-            )
-        except BaseException:
-            with self._cv:
-                token.release_pending = False
-                self._cv.notify_all()
-            raise
+                    self._cv.notify_all()
+                raise
         return True
 
     def handoff_output_block_lease(self, request_id: str, lease_id: str) -> bool:
@@ -633,88 +450,120 @@ class AsyncResultCollector:
         idempotent transition: it must never drop the physical ObjectRef lease.
         """
         key = (str(request_id), str(lease_id))
-        with self._cv:
-            token = self._active_output_leases.get(key)
-            if token is None or token.handed_off or token.handoff_pending:
-                return False
-            token.handoff_pending = True
-            self._cv.notify_all()
-
-        def finish_handoff(error: BaseException | None) -> None:
+        with self._cleanup_handoff_lock:
             with self._cv:
-                token.handoff_pending = False
-                if error is None and not token.release_pending and self._active_output_leases.get(key) is token:
-                    token.handed_off = True
+                token = self._active_output_leases.get(key)
+                if token is None or token.handed_off or token.handoff_pending:
+                    return False
+                token.handoff_pending = True
                 self._cv.notify_all()
 
-        try:
-            self._submit_cleanup_operations(
-                (self._output_token_handoff_operation(token),),
-                on_each_done=finish_handoff,
-                slot_ids=(token.slot_id,),
-            )
-        except BaseException:
-            with self._cv:
-                token.handoff_pending = False
-                self._cv.notify_all()
-            raise
+            def finish_handoff(error: BaseException | None) -> None:
+                with self._cv:
+                    token.handoff_pending = False
+                    if error is None and not token.release_pending and self._active_output_leases.get(key) is token:
+                        token.handed_off = True
+                    self._cv.notify_all()
+
+            try:
+                self._submit_cleanup_operations(
+                    (self._output_token_handoff_operation(token),),
+                    on_each_done=finish_handoff,
+                    slot_ids=(token.slot_id,),
+                )
+            except BaseException:
+                with self._cv:
+                    token.handoff_pending = False
+                    self._cv.notify_all()
+                raise
         return True
 
-    def _run_output_token_handoff(self, token: _OutputLeaseToken) -> bool:
+    def _run_output_token_handoff(self, token: _OutputLeaseToken) -> bool | Any:
         key = (token.request_id, token.lease_id)
         with self._cv:
             if token.release_pending or self._active_output_leases.get(key) is not token:
+                token.handoff_response_future = None
                 return True
-            response_ref = token.handoff_response_ref
+            response_future = token.handoff_response_future
         try:
-            if response_ref is None:
+            if response_future is None:
                 response_ref = token.driver.handoff_query_output_block_lease.remote(
                     token.request_id,
                     token.lease_id,
                     token.query_id,
                 )
+                response_future = ray_object_ref_future(response_ref)
                 with self._cv:
-                    token.handoff_response_ref = response_ref
-            resolve_ray_control_ack(response_ref, field="handed_off")
-        except BaseException as exc:
-            if not isinstance(exc, TimeoutError):
-                with self._cv:
-                    if token.handoff_response_ref is response_ref:
-                        token.handoff_response_ref = None
+                    token.handoff_response_future = response_future
+            if not response_future.done():
+                return response_future
+            validate_ray_control_ack(response_future.result(), field="handed_off")
+        except BaseException:
+            with self._cv:
+                if token.handoff_response_future is response_future:
+                    token.handoff_response_future = None
             raise
         with self._cv:
-            token.handoff_response_ref = None
+            token.handoff_response_future = None
         return True
 
-    def _run_output_token_release(self, token: _OutputLeaseToken) -> bool:
+    def _run_output_token_release(self, token: _OutputLeaseToken) -> bool | Any:
         with self._cv:
-            response_ref = token.release_response_ref
+            response_future = token.release_response_future
         try:
-            if response_ref is None:
+            if response_future is None:
                 response_ref = token.driver.release_query_output_block_lease.remote(
                     token.request_id,
                     token.lease_id,
                     token.query_id,
                 )
+                response_future = ray_object_ref_future(response_ref)
                 with self._cv:
-                    token.release_response_ref = response_ref
-            resolve_ray_control_ack(response_ref, field="released")
-        except BaseException as exc:
-            if not isinstance(exc, TimeoutError):
-                with self._cv:
-                    if token.release_response_ref is response_ref:
-                        token.release_response_ref = None
+                    token.release_response_future = response_future
+            if not response_future.done():
+                return response_future
+            validate_ray_control_ack(response_future.result(), field="released")
+        except BaseException:
+            with self._cv:
+                if token.release_response_future is response_future:
+                    token.release_response_future = None
             raise
         with self._cv:
-            token.release_response_ref = None
+            token.release_response_future = None
         return True
+
+    @staticmethod
+    def _claim_output_token_releases_locked(
+        tokens: Sequence[_OutputLeaseToken],
+    ) -> tuple[_OutputLeaseToken, ...]:
+        """Claim each physical output lease once before its ticket handoff."""
+        claimed: list[_OutputLeaseToken] = []
+        seen: set[tuple[str, str]] = set()
+        for token in tokens:
+            key = (token.request_id, token.lease_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            if token.release_pending:
+                continue
+            token.release_pending = True
+            claimed.append(token)
+        return tuple(claimed)
+
+    def _restore_output_token_release_claims(
+        self,
+        tokens: Sequence[_OutputLeaseToken],
+    ) -> None:
+        with self._cv:
+            for token in tokens:
+                token.release_pending = False
+            self._cv.notify_all()
 
     def _output_token_handoff_operation(
         self,
         token: _OutputLeaseToken,
     ) -> RayStreamCleanupOperation:
         return RayStreamCleanupOperation(
-            RAY_STREAM_CLEANUP_OUTPUT,
             lambda: self._run_output_token_handoff(token),
             retry_on_error=True,
             retry_on_incomplete=True,
@@ -725,7 +574,6 @@ class AsyncResultCollector:
         token: _OutputLeaseToken,
     ) -> RayStreamCleanupOperation:
         return RayStreamCleanupOperation(
-            RAY_STREAM_CLEANUP_OUTPUT,
             lambda: self._run_output_token_release(token),
             retry_on_error=True,
             retry_on_incomplete=True,
@@ -736,23 +584,24 @@ class AsyncResultCollector:
         driver: Any,
         request: dict[str, Any],
     ) -> RayStreamCleanupOperation:
-        response_ref: Any | None = None
+        response_future: Any | None = None
 
-        def cancel() -> bool:
-            nonlocal response_ref
+        def cancel() -> bool | Any:
+            nonlocal response_future
             try:
-                if response_ref is None:
+                if response_future is None:
                     response_ref = driver.cancel_query_output_block_lease_request.remote(request)
-                resolve_ray_control_ack(response_ref, field="cancelled")
-            except BaseException as exc:
-                if not isinstance(exc, TimeoutError):
-                    response_ref = None
+                    response_future = ray_object_ref_future(response_ref)
+                if not response_future.done():
+                    return response_future
+                validate_ray_control_ack(response_future.result(), field="cancelled")
+            except BaseException:
+                response_future = None
                 raise
-            response_ref = None
+            response_future = None
             return True
 
         return RayStreamCleanupOperation(
-            RAY_STREAM_CLEANUP_OUTPUT,
             cancel,
             retry_on_error=True,
             retry_on_incomplete=True,
@@ -768,9 +617,9 @@ class AsyncResultCollector:
                 cleanup_tickets.update(self._cleanup_tickets_by_slot.get(slot_key, ()))
                 records = [record for record in self._records.values() if record.slot_id == slot_key]
                 records_to_cancel = [record for record in records if not record.cleanup_started]
-                cleanup_operations: list[Callable[[], Any]] = []
+                cleanup_operations: list[RayStreamCleanupOperation] = []
+                output_cancel_records: list[_StreamRecord] = []
                 for record in records:
-                    self._records.pop((record.slot_id, record.submit_id), None)
                     record.terminal = True
                     if not record.cleanup_started:
                         record.cleanup_started = True
@@ -780,33 +629,50 @@ class AsyncResultCollector:
                     driver = record.adapter.driver
                     if request is not None and driver is not None and not record.output_cancel_sent:
                         record.output_cancel_sent = True
+                        output_cancel_records.append(record)
                         cleanup_operations.append(self._output_request_cancel_operation(driver, request))
                     cleanup_operations.extend(record.adapter.cancel_operations())
-                ready = list(self._ready_by_slot.pop(slot_key, ()))
+                ready = list(self._ready_by_slot.get(slot_key, ()))
                 tokens = [token for token in self._active_output_leases.values() if token.slot_id == slot_key]
+                token_keys = {(token.request_id, token.lease_id) for token in tokens}
+                for event in ready:
+                    token = event.output_token
+                    if token is not None and (token.request_id, token.lease_id) not in token_keys:
+                        tokens.append(token)
+                        token_keys.add((token.request_id, token.lease_id))
+                claimed_tokens = self._claim_output_token_releases_locked(tokens)
+                cleanup_operations.extend(self._output_token_release_operation(token) for token in claimed_tokens)
+                self._signal_readiness_change_locked()
+
+            try:
+                cleanup_tickets.update(
+                    self._submit_cleanup_operations(
+                        cleanup_operations,
+                        store_error=False,
+                        slot_ids=(slot_key,),
+                    )
+                )
+            except BaseException:
+                self._restore_output_token_release_claims(claimed_tokens)
+                with self._cv:
+                    for record in records_to_cancel:
+                        if self._records.get((record.slot_id, record.submit_id)) is record:
+                            record.cleanup_started = False
+                    for record in output_cancel_records:
+                        if self._records.get((record.slot_id, record.submit_id)) is record:
+                            record.output_cancel_sent = False
+                    self._cv.notify_all()
+                raise
+            with self._cv:
+                for record in records:
+                    if self._records.get((record.slot_id, record.submit_id)) is record:
+                        self._records.pop((record.slot_id, record.submit_id), None)
+                self._ready_by_slot.pop(slot_key, None)
                 for token in tokens:
-                    token.release_pending = True
                     self._active_output_leases.pop((token.request_id, token.lease_id), None)
                 self._capacity_by_slot.pop(slot_key, None)
                 self._cancelled_slots.add(slot_key)
                 self._signal_readiness_change_locked()
-
-            ready_tokens = [event.output_token for event in ready if event.output_token is not None]
-            token_keys = {(token.request_id, token.lease_id) for token in tokens}
-            for token in ready_tokens:
-                if token is not None and (token.request_id, token.lease_id) not in token_keys:
-                    tokens.append(token)
-                    token_keys.add((token.request_id, token.lease_id))
-            for token in tokens:
-                token.release_pending = True
-            cleanup_operations.extend(self._output_token_release_operation(token) for token in tokens)
-            cleanup_tickets.update(
-                self._submit_cleanup_operations(
-                    self._fence_cleanup_operations(cleanup_operations),
-                    store_error=False,
-                    slot_ids=(slot_key,),
-                )
-            )
 
         cleanup_errors = self._wait_slot_cleanup(
             slot_key,
@@ -838,7 +704,7 @@ class AsyncResultCollector:
             with self._cleanup_handoff_lock:
                 with self._cv:
                     first_shutdown = not self._shutdown
-                    cleanup_operations: list[Callable[[], Any]] = []
+                    cleanup_operations: list[RayStreamCleanupOperation] = []
                     cleanup_slot_ids: set[int] = set()
                     if first_shutdown:
                         self._shutdown = True
@@ -846,6 +712,7 @@ class AsyncResultCollector:
                         records = list(self._records.values())
                         for record in records:
                             cleanup_slot_ids.add(record.slot_id)
+                            record.terminal = True
                             self._cancel_record_wait_locked(record)
                             if record.cleanup_started:
                                 continue
@@ -856,7 +723,6 @@ class AsyncResultCollector:
                                 record.output_cancel_sent = True
                                 cleanup_operations.append(self._output_request_cancel_operation(driver, request))
                             cleanup_operations.extend(record.adapter.cancel_operations())
-                        self._records.clear()
                         ready = [event for events in self._ready_by_slot.values() for event in events]
                         tokens = list(self._active_output_leases.values())
                         token_keys = {(token.request_id, token.lease_id) for token in tokens}
@@ -866,36 +732,37 @@ class AsyncResultCollector:
                             if token is not None and (token.request_id, token.lease_id) not in token_keys:
                                 tokens.append(token)
                                 token_keys.add((token.request_id, token.lease_id))
-                        self._active_output_leases.clear()
-                        self._ready_by_slot.clear()
-                        self._capacity_by_slot.clear()
-                        for token in tokens:
-                            token.release_pending = True
-                        cleanup_operations.extend(self._output_token_release_operation(token) for token in tokens)
+                        claimed_tokens = self._claim_output_token_releases_locked(tokens)
+                        cleanup_operations.extend(
+                            self._output_token_release_operation(token) for token in claimed_tokens
+                        )
                         cleanup_slot_ids.update(token.slot_id for token in tokens)
                         self._signal_readiness_change_locked()
-                    if self._thread_started and self._thread.is_alive():
-                        try:
-                            self._loop.call_soon_threadsafe(self._loop.stop)
-                        except RuntimeError as exc:
-                            if self._thread.is_alive():
-                                shutdown_errors.append(exc)
                 if first_shutdown and cleanup_operations:
                     try:
                         self._submit_cleanup_operations(
-                            self._fence_cleanup_operations(cleanup_operations),
+                            cleanup_operations,
                             slot_ids=tuple(cleanup_slot_ids),
                         )
                     except BaseException as exc:
+                        self._restore_output_token_release_claims(claimed_tokens)
                         shutdown_errors.append(exc)
+                if first_shutdown and not shutdown_errors:
+                    with self._cv:
+                        self._records.clear()
+                        self._active_output_leases.clear()
+                        self._ready_by_slot.clear()
+                        self._capacity_by_slot.clear()
+                        stop_now = not self._cleanup_tickets
+                        self._cv.notify_all()
+                    if stop_now and self._thread.is_alive():
+                        self._loop.call_soon_threadsafe(self._loop.stop)
 
-        if self._thread_started and self._thread is not threading.current_thread():
-            self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
-            if self._thread.is_alive():
-                shutdown_errors.append(RuntimeError("Ray UDF stream multiplexer did not terminate"))
-
-        if not self._thread.is_alive():
-            self._stop_cleanup_pools_when_idle()
+        if self._thread is threading.current_thread():
+            if shutdown_errors:
+                details = "; ".join(f"{type(error).__name__}: {error}" for error in shutdown_errors)
+                raise RuntimeError(f"Ray UDF stream shutdown failed: {details}") from shutdown_errors[0]
+            return
 
         with self._cv:
             while True:
@@ -910,8 +777,13 @@ class AsyncResultCollector:
             if pending:
                 shutdown_errors.append(RuntimeError("Ray UDF stream remote cleanup did not terminate"))
             shutdown_errors.extend(self._terminal_cleanup_errors)
-        if not self._thread.is_alive():
-            shutdown_errors.extend(self._join_cleanup_pools(deadline))
+
+        if not pending and self._thread.is_alive():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread_started and self._thread is not threading.current_thread() and not pending:
+            self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if self._thread.is_alive():
+                shutdown_errors.append(RuntimeError("Ray UDF stream multiplexer did not terminate"))
         if shutdown_errors:
             details = "; ".join(f"{type(error).__name__}: {error}" for error in shutdown_errors)
             raise RuntimeError(f"Ray UDF stream shutdown failed: {details}") from shutdown_errors[0]
@@ -1032,6 +904,7 @@ class AsyncResultCollector:
         for record in self._records.values():
             if (
                 record.terminal
+                or not record.registered
                 or record.slot_id not in admissible_slots
                 or record.phase != "block"
                 or record.next_ref_ready
@@ -1183,13 +1056,13 @@ class AsyncResultCollector:
 
     def _submit_cleanup_operations(
         self,
-        operations: Sequence[Callable[[], Any]],
+        operations: Sequence[RayStreamCleanupOperation],
         *,
         on_each_done: Callable[[BaseException | None], None] | None = None,
         store_error: bool = True,
         slot_ids: Sequence[int] = (),
     ) -> tuple[_CleanupTicket, ...]:
-        """Atomically hand independent operations to bounded worker lanes."""
+        """Atomically transfer operations into the event-loop ticket ledger."""
         actions = tuple(operations)
         if not actions:
             if on_each_done is not None:
@@ -1197,11 +1070,9 @@ class AsyncResultCollector:
             return ()
 
         owner_slots = frozenset(int(slot_id) for slot_id in slot_ids)
-        items_by_pool: dict[_DaemonCleanupPool, list[_CleanupWorkItem]] = defaultdict(list)
         tickets: list[_CleanupTicket] = []
 
         for action in actions:
-            lane = action.lane if isinstance(action, RayStreamCleanupOperation) else RAY_STREAM_CLEANUP_CONTROL
             ticket_holder: list[_CleanupTicket] = []
 
             def complete(
@@ -1234,82 +1105,119 @@ class AsyncResultCollector:
                                     )
                         self._cv.notify_all()
 
-            ticket = _CleanupTicket(on_complete=complete)
+            ticket = _CleanupTicket(
+                operation=action,
+                retry_on_error=action.retry_on_error,
+                retry_on_incomplete=action.retry_on_incomplete,
+                on_complete=complete,
+            )
             ticket_holder.append(ticket)
             tickets.append(ticket)
-            items_by_pool[self._cleanup_pools[lane]].append(
-                _CleanupWorkItem(
-                    action,
-                    ticket,
-                    retry_on_error=(action.retry_on_error if isinstance(action, RayStreamCleanupOperation) else False),
-                    retry_on_incomplete=(
-                        action.retry_on_incomplete if isinstance(action, RayStreamCleanupOperation) else False
-                    ),
-                )
-            )
 
-        pools = tuple(pool for pool in self._cleanup_pools.values() if pool in items_by_pool)
         with self._cleanup_handoff_lock:
-            for pool in pools:
-                pool._cv.acquire()
-            try:
-                for pool in pools:
-                    if not pool._started or pool._stop_when_idle:
-                        raise RuntimeError(f"Ray UDF cleanup pool {pool._name!r} is not accepting work")
-                    pool._ensure_worker_locked()
-                with self._cv:
-                    self._cleanup_tickets.update(tickets)
-                    for slot_id in owner_slots:
-                        self._cleanup_tickets_by_slot[slot_id].update(tickets)
-                    self._cv.notify_all()
-                for pool, items in items_by_pool.items():
-                    pool._enqueue_locked(items)
-            finally:
-                for pool in reversed(pools):
-                    pool._cv.release()
+            with self._cv:
+                if not self._thread_started or not self._thread.is_alive() or self._loop.is_closed():
+                    raise RuntimeError("Ray UDF cleanup event loop is not available")
+            if self._thread is threading.current_thread():
+                self._loop.call_soon(self._start_cleanup_tickets, tuple(tickets))
+            else:
+                self._loop.call_soon_threadsafe(self._start_cleanup_tickets, tuple(tickets))
+            # The scheduled callback first acquires _cleanup_handoff_lock.  Add
+            # ledger ownership before releasing that lock, so it cannot drive
+            # or finish a ticket before the transfer is externally visible.
+            with self._cv:
+                self._cleanup_tickets.update(tickets)
+                for slot_id in owner_slots:
+                    self._cleanup_tickets_by_slot[slot_id].update(tickets)
+                self._cv.notify_all()
         return tuple(tickets)
 
-    def _fence_cleanup_operations(
-        self,
-        operations: Sequence[Callable[[], Any]],
-    ) -> tuple[RayStreamCleanupOperation, ...]:
-        """Delay generator teardown until every earlier scheduler probe exits."""
-        actions = tuple(operations)
-        if not actions:
-            return ()
-        scheduler_safe = threading.Event()
+    def _start_cleanup_tickets(self, tickets: tuple[_CleanupTicket, ...]) -> None:
+        """Start tickets only after their ledger handoff is visible."""
+        with self._cleanup_handoff_lock:
+            with self._cv:
+                active = tuple(ticket for ticket in tickets if ticket in self._cleanup_tickets)
+        for ticket in active:
+            self._drive_cleanup_ticket(ticket)
+
+    @staticmethod
+    def _cleanup_retry_delay(retry_count: int) -> float:
+        exponent = min(max(0, int(retry_count) - 1), 30)
+        return min(
+            math.ldexp(_CLEANUP_RETRY_INITIAL_DELAY_S, exponent),
+            _CLEANUP_RETRY_MAX_DELAY_S,
+        )
+
+    def _retry_cleanup_ticket(self, ticket: _CleanupTicket) -> None:
         with self._cv:
-            needs_turn = self._started and self._thread.is_alive() and self._thread is not threading.current_thread()
-        if needs_turn:
-            try:
-                self._loop.call_soon_threadsafe(scheduler_safe.set)
-            except RuntimeError:
-                if not self._thread.is_alive():
-                    scheduler_safe.set()
-        else:
-            scheduler_safe.set()
+            if ticket not in self._cleanup_tickets:
+                return
+        ticket.retry_count += 1
+        self._loop.call_later(
+            self._cleanup_retry_delay(ticket.retry_count),
+            self._drive_cleanup_ticket,
+            ticket,
+        )
 
-        fenced: list[RayStreamCleanupOperation] = []
-        for action in actions:
-            lane = action.lane if isinstance(action, RayStreamCleanupOperation) else RAY_STREAM_CLEANUP_CONTROL
-            retry_on_error = action.retry_on_error if isinstance(action, RayStreamCleanupOperation) else False
-            retry_on_incomplete = action.retry_on_incomplete if isinstance(action, RayStreamCleanupOperation) else False
+    def _resume_cleanup_ticket(self, ticket: _CleanupTicket, future: Any) -> None:
+        with self._cv:
+            if ticket not in self._cleanup_tickets or ticket.wait_future is not future:
+                return
+            ticket.wait_future = None
+        self._drive_cleanup_ticket(ticket)
 
-            def run(action: Callable[[], Any] = action) -> Any:
-                while not scheduler_safe.wait(timeout=0.1):
-                    if not self._thread.is_alive():
-                        break
-                return action()
+    def _drive_cleanup_ticket(self, ticket: _CleanupTicket) -> None:
+        with self._cv:
+            if ticket not in self._cleanup_tickets or ticket.wait_future is not None:
+                return
+        error: BaseException | None = None
+        retry = False
+        try:
+            result = ticket.operation()
+            if all(callable(getattr(result, name, None)) for name in ("add_done_callback", "done", "result")):
+                with self._cv:
+                    if ticket not in self._cleanup_tickets:
+                        return
+                    ticket.wait_future = result
 
-            fenced.append(
-                RayStreamCleanupOperation(
-                    lane,
-                    run,
-                    retry_on_error=retry_on_error,
-                    retry_on_incomplete=retry_on_incomplete,
-                )
-            )
-        return tuple(fenced)
+                def ready(future: Any) -> None:
+                    try:
+                        self._loop.call_soon_threadsafe(
+                            self._resume_cleanup_ticket,
+                            ticket,
+                            future,
+                        )
+                    except RuntimeError as exc:
+                        with self._cv:
+                            if self._thread_error is None:
+                                self._thread_error = exc
+                            self._cv.notify_all()
+
+                try:
+                    result.add_done_callback(ready)
+                except BaseException as exc:
+                    with self._cv:
+                        if ticket.wait_future is result:
+                            ticket.wait_future = None
+                    # Callback registration is part of the required public
+                    # Future contract, not a transient remote operation.
+                    error = exc
+                else:
+                    return
+            retry = result is False and ticket.retry_on_incomplete
+        except BaseException as exc:
+            if ticket.retry_on_error:
+                retry = True
+            else:
+                error = exc
+        if retry:
+            self._retry_cleanup_ticket(ticket)
+            return
+        ticket.finish(error)
+        with self._cv:
+            stop = self._shutdown and not self._cleanup_tickets
+        if stop:
+            self._loop.stop()
 
     def _wait_cleanup_tickets(
         self,
@@ -1348,21 +1256,6 @@ class AsyncResultCollector:
                 raise RuntimeError(timeout_message)
         return tuple(error for ticket in observed for error in ticket.errors)
 
-    def _stop_cleanup_pools_when_idle(self) -> None:
-        with self._cleanup_handoff_lock:
-            if self._cleanup_pools_stopping:
-                return
-            self._cleanup_pools_stopping = True
-            for pool in self._cleanup_pools.values():
-                pool.stop_when_idle()
-
-    def _join_cleanup_pools(self, deadline: float) -> list[BaseException]:
-        errors: list[BaseException] = []
-        for lane, pool in self._cleanup_pools.items():
-            if not pool.join(max(0.0, deadline - time.monotonic())):
-                errors.append(RuntimeError(f"Ray UDF {lane} cleanup workers did not terminate"))
-        return errors
-
     def _run_event_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
         self._loop_ready.set()
@@ -1386,10 +1279,6 @@ class AsyncResultCollector:
             if pending:
                 self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             self._loop.close()
-            with self._cv:
-                shutting_down = self._shutdown
-            if shutting_down:
-                self._stop_cleanup_pools_when_idle()
 
     def _cancel_record_wait_locked(self, record: _StreamRecord) -> None:
         future = record.wait_future
@@ -1404,13 +1293,7 @@ class AsyncResultCollector:
 
     @staticmethod
     def _object_ref_future(ref: Any) -> Any:
-        future_factory = getattr(ref, "future", None)
-        if not callable(future_factory):
-            raise TypeError("Ray UDF control ObjectRef does not expose future()")
-        future = future_factory()
-        if not callable(getattr(future, "add_done_callback", None)):
-            raise TypeError("Ray UDF control ObjectRef future does not support callbacks")
-        return future
+        return ray_object_ref_future(ref)
 
     def _schedule_record_wait_locked(
         self,
@@ -1509,6 +1392,7 @@ class AsyncResultCollector:
         future.add_done_callback(on_done)
 
     def _refresh_waiters(self) -> None:
+        failures: list[tuple[_StreamRecord, BaseException]] = []
         with self._cv:
             if self._shutdown or self._thread_error is not None or not self._started or not self._loop_ready.is_set():
                 return
@@ -1521,101 +1405,107 @@ class AsyncResultCollector:
             )
             pending_data_counts = self._pending_data_counts_locked()
             for record in records:
-                self._schedule_completion_wait_locked(record)
-                if self._schedule_record_wait_locked(
-                    record,
-                    pending_data_count=pending_data_counts.get(record.slot_id, 0),
-                ):
-                    pending_data_counts[record.slot_id] = pending_data_counts.get(record.slot_id, 0) + 1
+                if not record.registered:
+                    continue
+                try:
+                    self._schedule_completion_wait_locked(record)
+                    if self._schedule_record_wait_locked(
+                        record,
+                        pending_data_count=pending_data_counts.get(record.slot_id, 0),
+                    ):
+                        pending_data_counts[record.slot_id] = pending_data_counts.get(record.slot_id, 0) + 1
+                except BaseException as exc:
+                    failures.append((record, exc))
+        for record, exc in failures:
+            self._fail_record(record, exc)
 
     def _complete_producer_wait(self, record: _StreamRecord, future: Any) -> None:
         key = (record.slot_id, record.submit_id)
-        with self._cv:
-            if (
-                self._shutdown
-                or self._records.get(key) is not record
-                or record.terminal
-                or record.completion_future is not future
-            ):
-                return
-            if future is None:
-                return
-        try:
-            future.result()
-            record.producer_completed = True
-            if record.adapter.stream_finished():
-                record.adapter.mark_drained()
-            self._maybe_complete_record(record)
-        except BaseException as exc:
-            # A failed completion ObjectRef means Ray has already made the task
-            # terminal.  Force-cancelling that task can race its normal reply.
-            record.terminal_signal_observed = True
+        with self._cleanup_handoff_lock:
             with self._cv:
-                shutting_down = self._shutdown
-            if not shutting_down:
-                self._fail_record(record, exc)
-        finally:
-            # Keep the completed future installed until its state transition is
-            # fully applied. A concurrent dispatcher capacity refresh calls
-            # _refresh_waiters(); exposing an empty slot earlier can register a
-            # duplicate callback for the same completion ObjectRef.
-            with self._cv:
-                if record.completion_future is future:
-                    record.completion_future = None
-            self._refresh_waiters()
+                if (
+                    self._shutdown
+                    or self._records.get(key) is not record
+                    or record.terminal
+                    or record.completion_future is not future
+                ):
+                    return
+                if future is None:
+                    return
+            try:
+                future.result()
+                record.producer_completed = True
+                if record.adapter.stream_finished():
+                    record.adapter.mark_drained()
+                self._maybe_complete_record(record)
+            except BaseException as exc:
+                # A failed completion ObjectRef means Ray has already made the
+                # task terminal. Force-cancelling it can race its normal reply.
+                record.terminal_signal_observed = True
+                with self._cv:
+                    shutting_down = self._shutdown
+                if not shutting_down:
+                    self._fail_record(record, exc)
+            finally:
+                # Keep the completed future installed until its state transition
+                # is fully applied. A concurrent capacity refresh must not
+                # register a duplicate callback for the completion ObjectRef.
+                with self._cv:
+                    if record.completion_future is future:
+                        record.completion_future = None
+        self._refresh_waiters()
 
     def _complete_record_wait(self, record: _StreamRecord, kind: str, future: Any) -> None:
         key = (record.slot_id, record.submit_id)
-        with self._cv:
-            if (
-                self._shutdown
-                or self._records.get(key) is not record
-                or record.terminal
-                or record.wait_future is not future
-            ):
-                return
-            if future is None:
-                return
-        try:
-            value = future.result()
-            _collector_debug_log(f"ready_{kind}", record)
-            if kind == "data":
-                self._accept_stream_ref(record, value)
-            elif kind == "metadata":
-                record.metadata_ref = None
-                self._accept_metadata(record, value)
-            elif kind == "output_lease":
-                self._finish_output_lease(record, value)
-                self._maybe_complete_record(record)
-            elif kind == "terminal":
-                record.terminal_ref = None
-                self._finish_stream(record)
-            else:
-                raise RuntimeError(f"unknown Ray stream readiness kind {kind!r}")
-        except StopAsyncIteration:
+        with self._cleanup_handoff_lock:
+            with self._cv:
+                if (
+                    self._shutdown
+                    or self._records.get(key) is not record
+                    or record.terminal
+                    or record.wait_future is not future
+                ):
+                    return
+                if future is None:
+                    return
             try:
-                self._finish_stream(record)
+                value = future.result()
+                _collector_debug_log(f"ready_{kind}", record)
+                if kind == "data":
+                    self._accept_stream_ref(record, value)
+                elif kind == "metadata":
+                    record.metadata_ref = None
+                    self._accept_metadata(record, value)
+                elif kind == "output_lease":
+                    self._finish_output_lease(record, value)
+                    self._maybe_complete_record(record)
+                elif kind == "terminal":
+                    record.terminal_ref = None
+                    self._finish_stream(record)
+                else:
+                    raise RuntimeError(f"unknown Ray stream readiness kind {kind!r}")
+            except StopAsyncIteration:
+                try:
+                    self._finish_stream(record)
+                except BaseException as exc:
+                    self._fail_record(record, exc)
             except BaseException as exc:
-                self._fail_record(record, exc)
-        except BaseException as exc:
-            if kind == "terminal":
-                record.terminal_signal_observed = True
-            with self._cv:
-                shutting_down = self._shutdown
-            if not shutting_down:
-                self._fail_record(record, exc)
-        finally:
-            # wait_future is also the transition-in-progress fence. Clearing
-            # it before block/metadata/output state is updated lets a capacity
-            # refresh schedule a second waiter for the same ObjectRef. That
-            # duplicate callback observes the next phase and corrupts the
-            # strict block/metadata pairing.
-            with self._cv:
-                if record.wait_future is future:
-                    record.wait_future = None
-                    record.wait_kind = ""
-                    self._signal_readiness_change_locked()
-            self._refresh_waiters()
+                if kind == "terminal":
+                    record.terminal_signal_observed = True
+                with self._cv:
+                    shutting_down = self._shutdown
+                if not shutting_down:
+                    self._fail_record(record, exc)
+            finally:
+                # wait_future is also the transition-in-progress fence. Clearing
+                # it before block/metadata/output state is updated lets a
+                # capacity refresh corrupt the strict block/metadata pairing.
+                with self._cv:
+                    if record.wait_future is future:
+                        record.wait_future = None
+                        record.wait_kind = ""
+                        self._signal_readiness_change_locked()
+        self._refresh_waiters()
 
     def _accept_stream_ref(self, record: _StreamRecord, next_ref: Any) -> None:
         if record.adapter.is_terminal_ref(next_ref):
@@ -1772,27 +1662,37 @@ class AsyncResultCollector:
             size_bytes=token.size_bytes,
             output_token=token,
         )
-        with self._cv:
-            stale = self._records.get((record.slot_id, record.submit_id)) is not record
-            if not stale:
-                self._active_output_leases[(token.request_id, token.lease_id)] = token
-                self._ready_by_slot[record.slot_id].append(event)
-                record.phase = "block"
-                record.block_ref = None
-                record.metadata = None
-                record.block_item_capacity_bytes = None
-                record.output_request_id = ""
-                record.output_request = None
-                record.output_lease_ref = None
-                record.output_cancel_sent = False
-                self._signal_readiness_change_locked()
-        if stale:
-            token.release_pending = True
-            self._submit_cleanup_operations(
-                (self._output_token_release_operation(token),),
-                slot_ids=(record.slot_id,),
-            )
-            return
+        with self._cleanup_handoff_lock:
+            with self._cv:
+                stale = (
+                    self._shutdown
+                    or record.terminal
+                    or self._records.get((record.slot_id, record.submit_id)) is not record
+                )
+                if not stale:
+                    self._active_output_leases[(token.request_id, token.lease_id)] = token
+                    self._ready_by_slot[record.slot_id].append(event)
+                    record.phase = "block"
+                    record.block_ref = None
+                    record.metadata = None
+                    record.block_item_capacity_bytes = None
+                    record.output_request_id = ""
+                    record.output_request = None
+                    record.output_lease_ref = None
+                    record.output_cancel_sent = False
+                    self._signal_readiness_change_locked()
+                else:
+                    claimed_tokens = self._claim_output_token_releases_locked((token,))
+            if stale:
+                try:
+                    self._submit_cleanup_operations(
+                        tuple(self._output_token_release_operation(item) for item in claimed_tokens),
+                        slot_ids=(record.slot_id,),
+                    )
+                except BaseException:
+                    self._restore_output_token_release_claims(claimed_tokens)
+                    raise
+                return
         _collector_debug_log("output_lease_granted", record)
         self._notify_wakeup()
 
@@ -1807,8 +1707,30 @@ class AsyncResultCollector:
         key = (record.slot_id, record.submit_id)
 
         def finish_retirement(error: BaseException | None) -> None:
-            dropped_tokens: list[_OutputLeaseToken] = []
             with self._cleanup_handoff_lock:
+                with self._cv:
+                    if self._records.get(key) is not record:
+                        if error is not None:
+                            self._terminal_cleanup_errors.append(error)
+                            self._cv.notify_all()
+                        return
+                    dropped_tokens: list[_OutputLeaseToken] = []
+                    if error is not None:
+                        ready = self._ready_by_slot.get(record.slot_id)
+                        if ready is not None:
+                            for queued in ready:
+                                if queued.submit_id == record.submit_id and queued.kind == "data":
+                                    if queued.output_token is not None:
+                                        dropped_tokens.append(queued.output_token)
+                    claimed_tokens = self._claim_output_token_releases_locked(dropped_tokens)
+                try:
+                    self._submit_cleanup_operations(
+                        tuple(self._output_token_release_operation(token) for token in claimed_tokens),
+                        slot_ids=(record.slot_id,),
+                    )
+                except BaseException:
+                    self._restore_output_token_release_claims(claimed_tokens)
+                    raise
                 with self._cv:
                     if self._records.pop(key, None) is not record:
                         if error is not None:
@@ -1820,16 +1742,12 @@ class AsyncResultCollector:
                     else:
                         ready = self._ready_by_slot.get(record.slot_id)
                         if ready is not None:
-                            kept: deque[_ReadyEvent] = deque()
-                            for queued in ready:
-                                if queued.submit_id == record.submit_id and queued.kind == "data":
-                                    if queued.output_token is not None:
-                                        dropped_tokens.append(queued.output_token)
-                                    continue
-                                kept.append(queued)
-                            self._ready_by_slot[record.slot_id] = kept
+                            self._ready_by_slot[record.slot_id] = deque(
+                                queued
+                                for queued in ready
+                                if not (queued.submit_id == record.submit_id and queued.kind == "data")
+                            )
                         for token in dropped_tokens:
-                            token.release_pending = True
                             self._active_output_leases.pop((token.request_id, token.lease_id), None)
                         event = _ReadyEvent(
                             record.slot_id,
@@ -1839,11 +1757,6 @@ class AsyncResultCollector:
                         )
                     self._ready_by_slot[record.slot_id].append(event)
                     self._cv.notify_all()
-                if dropped_tokens:
-                    self._submit_cleanup_operations(
-                        tuple(self._output_token_release_operation(token) for token in dropped_tokens),
-                        slot_ids=(record.slot_id,),
-                    )
             _collector_debug_log("retired" if error is None else "retire_failed", record)
             self._notify_wakeup()
 
@@ -1884,23 +1797,61 @@ class AsyncResultCollector:
         key = (record.slot_id, record.submit_id)
         with self._cleanup_handoff_lock:
             with self._cv:
-                if self._records.pop(key, None) is not record:
+                if self._records.get(key) is not record:
                     return
                 record.terminal = True
+                cleanup_was_started = record.cleanup_started
                 record.cleanup_started = True
                 ready = self._ready_by_slot.get(record.slot_id)
                 dropped_tokens: list[_OutputLeaseToken] = []
                 if ready is not None:
-                    kept: deque[_ReadyEvent] = deque()
                     for event in ready:
                         if event.submit_id == record.submit_id and event.kind == "data":
                             if event.output_token is not None:
                                 dropped_tokens.append(event.output_token)
-                            continue
-                        kept.append(event)
-                    self._ready_by_slot[record.slot_id] = kept
+                claimed_tokens = self._claim_output_token_releases_locked(dropped_tokens)
+                request = record.output_request
+                driver = record.adapter.driver
+                cancel_output_request = request is not None and driver is not None and not record.output_cancel_sent
+                if cancel_output_request:
+                    record.output_cancel_sent = True
+                terminal_signal_observed = record.terminal_signal_observed
+                cleanup_operations: list[RayStreamCleanupOperation] = [
+                    self._output_token_release_operation(token) for token in claimed_tokens
+                ]
+                if cancel_output_request:
+                    cleanup_operations.append(self._output_request_cancel_operation(driver, request))
+                if not cleanup_was_started:
+                    if terminal_signal_observed:
+                        cleanup_operations.extend(record.adapter.retire_failed_operations())
+                    else:
+                        cleanup_operations.extend(record.adapter.cancel_operations())
+                self._signal_readiness_change_locked()
+            try:
+                self._submit_cleanup_operations(
+                    cleanup_operations,
+                    slot_ids=(record.slot_id,),
+                )
+            except BaseException:
+                self._restore_output_token_release_claims(claimed_tokens)
+                with self._cv:
+                    if self._records.get(key) is record:
+                        if not cleanup_was_started:
+                            record.cleanup_started = False
+                        if cancel_output_request:
+                            record.output_cancel_sent = False
+                        self._cv.notify_all()
+                raise
+            with self._cv:
+                if self._records.get(key) is not record:
+                    return
+                self._records.pop(key, None)
+                ready = self._ready_by_slot.get(record.slot_id)
+                if ready is not None:
+                    self._ready_by_slot[record.slot_id] = deque(
+                        event for event in ready if not (event.submit_id == record.submit_id and event.kind == "data")
+                    )
                 for token in dropped_tokens:
-                    token.release_pending = True
                     self._active_output_leases.pop((token.request_id, token.lease_id), None)
                 self._ready_by_slot[record.slot_id].append(
                     _ReadyEvent(
@@ -1910,26 +1861,9 @@ class AsyncResultCollector:
                         f"{type(exc).__name__}: {exc}",
                     )
                 )
-                request = record.output_request
-                driver = record.adapter.driver
-                record.output_cancel_sent = request is not None and driver is not None
-                terminal_signal_observed = record.terminal_signal_observed
-                cleanup_operations: list[Callable[[], Any]] = [
-                    self._output_token_release_operation(token) for token in dropped_tokens
-                ]
-                if request is not None and driver is not None:
-                    cleanup_operations.append(self._output_request_cancel_operation(driver, request))
-                if terminal_signal_observed:
-                    cleanup_operations.extend(record.adapter.retire_failed_operations())
-                else:
-                    cleanup_operations.extend(record.adapter.cancel_operations())
                 self._signal_readiness_change_locked()
-            self._submit_cleanup_operations(
-                cleanup_operations,
-                slot_ids=(record.slot_id,),
-            )
 
-        # The entire terminal plan has a durable bounded-lane owner before an
+        # The complete terminal plan has a durable ticket owner before an
         # arbitrary dispatcher callback can reenter shutdown.
         self._notify_wakeup()
 

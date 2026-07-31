@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import weakref
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
@@ -23,19 +24,14 @@ class _Ref:
         self.value = value
         self._nil = nil
         self.future_result_calls = []
+        self._future = Future()
+        self._future.set_result(value)
 
     def is_nil(self):
         return self._nil
 
     def future(self):
-        ref = self
-
-        class _Future:
-            def result(self, timeout=None):
-                ref.future_result_calls.append(timeout)
-                return ref.value
-
-        return _Future()
+        return self._future
 
 
 class _Generator:
@@ -129,6 +125,31 @@ def _lease():
     }
 
 
+def _finish_cleanup_operations(operations):
+    pending = list(operations)
+    errors = []
+    for _attempt in range(20):
+        if not pending:
+            break
+        remaining = []
+        for operation in pending:
+            try:
+                result = operation()
+                if all(callable(getattr(result, name, None)) for name in ("done", "result")):
+                    if not result.done():
+                        remaining.append(operation)
+                        continue
+                    result = operation()
+                if result is False:
+                    remaining.append(operation)
+            except BaseException as exc:
+                errors.append(exc)
+        pending = remaining
+    if errors:
+        raise RuntimeError("; ".join(str(error) for error in errors)) from errors[0]
+    assert pending == []
+
+
 def test_contract_accepts_unlisted_ray_version_when_capabilities_are_present():
     ray_module = SimpleNamespace(
         __version__="9.0.0",
@@ -219,12 +240,12 @@ def test_adapter_uses_public_completion_ref_for_stream_lifecycle():
     assert adapter.stream_finished() is True
     assert adapter.is_terminal_ref(generator.completion) is True
 
-    adapter.retire()
+    _finish_cleanup_operations(adapter.retire_operations())
 
     assert generator.deleted_streams == [generator.completion]
 
 
-def test_stream_cleanup_retries_without_blocking_a_cleanup_lane_on_active_read():
+def test_stream_cleanup_retries_without_blocking_on_an_active_read():
     async def scenario():
         read_started = asyncio.Event()
         finish_read = asyncio.Event()
@@ -241,18 +262,13 @@ def test_stream_cleanup_retries_without_blocking_a_cleanup_lane_on_active_read()
         read = asyncio.create_task(adapter.read_next_ref_async())
         await read_started.wait()
 
-        first_cancel = asyncio.create_task(asyncio.to_thread(adapter.cancel))
-        try:
-            with pytest.raises(RuntimeError, match="remained incomplete"):
-                await asyncio.wait_for(asyncio.shield(first_cancel), timeout=0.2)
-        finally:
-            finish_read.set()
+        operations = adapter.cancel_operations()
+        with pytest.raises(AssertionError):
+            _finish_cleanup_operations(operations)
+        finish_read.set()
         assert (await read).value == "block"
-        if not first_cancel.done():
-            with pytest.raises(RuntimeError, match="remained incomplete"):
-                await first_cancel
 
-        adapter.cancel()
+        _finish_cleanup_operations(adapter.cancel_operations())
         assert generator.deleted_streams == [generator.completion]
 
     asyncio.run(scenario())
@@ -282,8 +298,8 @@ def test_task_lease_stream_submits_immediately_from_pregranted_admission():
 
     assert submitted == [lease]
 
-    adapter.release_task()
-    adapter.release_task()
+    _finish_cleanup_operations(source.release_task_operations())
+    _finish_cleanup_operations(source.release_task_operations())
     assert len(driver.release_query_task_lease.calls) == 1
 
 
@@ -296,10 +312,7 @@ def test_task_lease_stream_abandons_pregranted_lease_when_submitter_fails():
         request_id=request_id,
         retained_input_bytes=0,
         lease=_lease(),
-        _release_callback=lambda: driver.cancel_query_task_lease_request.remote(
-            request_id,
-            submitted=False,
-        ),
+        _release_callback=lambda: driver.cancel_query_task_lease_request.remote(request_id),
     )
 
     with pytest.raises(RuntimeError, match="submit failed"):
@@ -309,7 +322,61 @@ def test_task_lease_stream_abandons_pregranted_lease_when_submitter_fails():
             ray_module=fake_ray,
         )
 
-    assert driver.cancel_query_task_lease_request.calls == [((request_id,), {"submitted": False})]
+    assert driver.cancel_query_task_lease_request.calls == [((request_id,), {})]
+
+
+def test_invalid_submitted_stream_hands_cancelled_lease_to_query_teardown():
+    fake_ray = _FakeRay()
+    driver = _driver({"granted": True, "lease": _lease()})
+    invalid_stream = SimpleNamespace()
+    source = TaskLeaseObjectRefGenerator(
+        admission=_admission(driver, "request-invalid-stream"),
+        submitter=lambda _lease: invalid_stream,
+        ray_module=fake_ray,
+    )
+
+    with pytest.raises(TypeError, match="not an ObjectRefGenerator"):
+        RayStreamAdapter(source, ray_module=fake_ray)
+
+    cancel, handoff = source.cancel_operations()
+    assert cancel() is True
+    assert handoff() is True
+    assert fake_ray.cancel_calls == [(invalid_stream, {"force": True, "recursive": True})]
+    assert driver.handoff_query_task_lease_to_teardown.calls == [
+        (("request-invalid-stream", "lease-1", "attempt-1"), {}),
+    ]
+    assert driver.release_query_task_lease_after_completion.calls == []
+
+
+def test_missing_completion_ref_cannot_handoff_before_cancel_submission():
+    class _FailingCancelRay(_FakeRay):
+        def cancel(self, ref, **kwargs):
+            self.cancel_calls.append((ref, kwargs))
+            raise RuntimeError("planned cancellation submission failure")
+
+    class _MissingCompletionGenerator(_Generator):
+        def completed(self):
+            return None
+
+    fake_ray = _FailingCancelRay()
+    driver = _driver({"granted": True, "lease": _lease()})
+    generator = _MissingCompletionGenerator([])
+    source = TaskLeaseObjectRefGenerator(
+        admission=_admission(driver, "request-missing-completion"),
+        submitter=lambda _lease: generator,
+        ray_module=fake_ray,
+    )
+
+    with pytest.raises(RuntimeError, match="completion ObjectRef is unavailable"):
+        RayStreamAdapter(source, ray_module=fake_ray)
+
+    cancel, handoff = source.cancel_operations()
+    with pytest.raises(RuntimeError, match="before generator cancellation is submitted"):
+        handoff()
+    with pytest.raises(RuntimeError, match="planned cancellation submission failure"):
+        cancel()
+    assert fake_ray.cancel_calls == [(generator, {"force": True, "recursive": True})]
+    assert driver.handoff_query_task_lease_to_teardown.calls == []
 
 
 def test_successful_submission_releases_captured_input_ownership_immediately():
@@ -359,8 +426,8 @@ def test_cancelling_started_stream_uses_backend_safe_ray_cancel(
     )
     adapter = RayStreamAdapter(source, ray_module=fake_ray)
 
-    adapter.cancel()
-    adapter.cancel()
+    _finish_cleanup_operations(adapter.cancel_operations())
+    _finish_cleanup_operations(adapter.cancel_operations())
 
     assert fake_ray.cancel_calls == [(generator, {"force": force, "recursive": True})]
     assert driver.release_query_task_lease_after_completion.calls == [
@@ -399,14 +466,14 @@ def test_stream_delete_waits_for_generator_cancel_submission():
     adapter = RayStreamAdapter(source, ray_module=fake_ray)
 
     with pytest.raises(RuntimeError, match="planned cancellation submission failure"):
-        adapter.cancel()
+        _finish_cleanup_operations(adapter.cancel_operations())
 
     assert len(driver.release_query_task_lease_after_completion.calls) == 1
     assert generator.deleted_streams == []
     assert generator.worker is not None
 
     fake_ray.fail_cancel = False
-    adapter.cancel()
+    _finish_cleanup_operations(adapter.cancel_operations())
 
     assert generator.deleted_streams == [generator.completion]
     assert generator.worker is None
@@ -423,8 +490,8 @@ def test_retiring_terminal_failure_does_not_cancel_already_ending_remote_work():
     )
     adapter = RayStreamAdapter(source, ray_module=fake_ray)
 
-    adapter.retire_failed()
-    adapter.retire_failed()
+    _finish_cleanup_operations(adapter.retire_failed_operations())
+    _finish_cleanup_operations(adapter.retire_failed_operations())
 
     assert fake_ray.cancel_calls == []
     assert driver.release_query_task_lease.calls == []
@@ -440,8 +507,8 @@ def test_terminal_stream_cleanup_disarms_ray_generator_destructor(terminal_actio
     generator = _Generator([])
     adapter = RayStreamAdapter(generator, ray_module=fake_ray)
 
-    getattr(adapter, terminal_action)()
-    getattr(adapter, terminal_action)()
+    _finish_cleanup_operations(getattr(adapter, f"{terminal_action}_operations")())
+    _finish_cleanup_operations(getattr(adapter, f"{terminal_action}_operations")())
 
     assert generator.deleted_streams == [generator.completion]
     assert generator.worker is None

@@ -35,6 +35,22 @@ class _ObjectRef:
         self._future.set_result(value)
 
 
+class _FailingObjectRef:
+    def __init__(self, *, callback=False):
+        self._callback = callback
+
+    def future(self):
+        if not self._callback:
+            raise RuntimeError("planned admission Future factory failure")
+
+        class _FailingCallbackFuture(Future):
+            def add_done_callback(self, fn, *, context=None):
+                del fn, context
+                raise RuntimeError("planned admission callback registration failure")
+
+        return _FailingCallbackFuture()
+
+
 class _Driver:
     def __init__(self):
         self.requests: list[_ObjectRef] = []
@@ -62,6 +78,25 @@ def _payload():
 def test_task_admission_requires_explicit_query_driver_handle():
     with pytest.raises(ValueError, match="query driver handle"):
         TaskAdmissionController(_payload(), driver=None)
+
+
+@pytest.mark.parametrize("callback", [False, True])
+def test_task_admission_setup_failure_cancels_the_remote_request(callback):
+    driver = _Driver()
+    driver.acquire_query_task_lease = _RemoteMethod(
+        lambda _request: _FailingObjectRef(callback=callback),
+    )
+    controller = TaskAdmissionController(_payload(), driver=driver)
+
+    expected = "callback registration" if callback else "Future factory"
+    with pytest.raises(RuntimeError, match=expected):
+        controller.request(64)
+
+    request = driver.acquire_query_task_lease.calls[0][0][0]
+    assert controller.state()["state"] == "failed"
+    assert driver.cancel_query_task_lease_request.calls == [
+        ((request["request_id"],), {}),
+    ]
 
 
 def _grant(request):
@@ -172,14 +207,12 @@ def test_task_admission_close_cancels_pending_and_ready_leases():
     pending.close()
 
     assert pending.state()["state"] == "closed"
-    assert pending_driver.cancel_query_task_lease_request.calls == [
-        ((pending_request["request_id"],), {"submitted": False})
-    ]
+    assert pending_driver.cancel_query_task_lease_request.calls == [((pending_request["request_id"],), {})]
 
     pending_driver.requests[0].resolve(_grant(pending_request))
     assert pending_driver.cancel_query_task_lease_request.calls == [
-        ((pending_request["request_id"],), {"submitted": False}),
-        ((pending_request["request_id"],), {"submitted": False}),
+        ((pending_request["request_id"],), {}),
+        ((pending_request["request_id"],), {}),
     ]
 
     ready_driver = _Driver()
@@ -191,9 +224,7 @@ def test_task_admission_close_cancels_pending_and_ready_leases():
     ready.close()
 
     assert ready.state()["state"] == "closed"
-    assert ready_driver.cancel_query_task_lease_request.calls == [
-        ((ready_request["request_id"],), {"submitted": False})
-    ]
+    assert ready_driver.cancel_query_task_lease_request.calls == [((ready_request["request_id"],), {})]
 
 
 def test_taken_task_admission_abandons_if_submission_never_takes_ownership():
@@ -207,7 +238,7 @@ def test_taken_task_admission_abandons_if_submission_never_takes_ownership():
     admission.release()
     admission.release()
 
-    assert driver.cancel_query_task_lease_request.calls == [((request["request_id"],), {"submitted": False})]
+    assert driver.cancel_query_task_lease_request.calls == [((request["request_id"],), {})]
 
 
 def test_local_slot_admission_owns_concrete_slots_and_wakes_one_waiter():

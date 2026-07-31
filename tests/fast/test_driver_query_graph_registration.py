@@ -907,6 +907,7 @@ def test_driver_exposes_query_task_and_output_lease_api():
     required = {
         "acquire_query_task_lease",
         "release_query_task_lease",
+        "handoff_query_task_lease_to_teardown",
         "acquire_query_output_block_lease",
         "handoff_query_output_block_lease",
         "release_query_output_block_lease",

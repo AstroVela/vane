@@ -11,10 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import duckdb.execution.ray_stream_adapter as stream_adapter_module
 import duckdb.execution.udf_stream_result_collector as collector_module
 from duckdb.execution.ray_stream_adapter import (
-    RAY_STREAM_CLEANUP_CONTROL,
     RayStreamAdapter,
     RayStreamCleanupOperation,
     TaskLeaseObjectRefGenerator,
@@ -75,6 +73,11 @@ class _Ref:
 
         future.result = tracked_result
         return future
+
+
+class _FailingFutureRef(_Ref):
+    def future(self):
+        raise RuntimeError("planned Future registration failure")
 
 
 class _Generator:
@@ -177,39 +180,6 @@ class _FakeRay:
             self._cv.notify_all()
 
 
-class _BlockingCancelRay(_FakeRay):
-    def __init__(self):
-        super().__init__()
-        self.cancel_started = threading.Event()
-        self.allow_cancel = threading.Event()
-        self.cancel_started_count = 0
-        self.cancel_started_lock = threading.Lock()
-
-    def cancel(self, ref, **kwargs):
-        with self.cancel_started_lock:
-            self.cancel_started_count += 1
-        self.cancel_started.set()
-        self.allow_cancel.wait(timeout=2.0)
-        super().cancel(ref, **kwargs)
-
-
-class _BlockingWaitRay(_FakeRay):
-    def __init__(self):
-        super().__init__()
-        self.wait_started = threading.Event()
-        self.allow_wait = threading.Event()
-
-    def wait(self, waitables, *, num_returns, timeout, fetch_local):
-        self.wait_started.set()
-        assert self.allow_wait.wait(timeout=2)
-        return super().wait(
-            waitables,
-            num_returns=num_returns,
-            timeout=timeout,
-            fetch_local=fetch_local,
-        )
-
-
 class _FailingWaitRay(_FakeRay):
     def wait(self, waitables, *, num_returns, timeout, fetch_local):
         del waitables, num_returns, timeout, fetch_local
@@ -244,20 +214,6 @@ class _RemoteMethod:
         return _Ref(self.fn(*args, **kwargs))
 
 
-class _BlockingRemoteMethod(_RemoteMethod):
-    def __init__(self, fn):
-        super().__init__(fn)
-        self.started = threading.Event()
-        self.release = threading.Event()
-
-    def remote(self, *args, **kwargs):
-        self.calls.append((args, kwargs))
-        self.started.set()
-        if not self.release.wait(timeout=2.0):
-            raise TimeoutError("timed out waiting to release blocked remote call")
-        return _Ref(self.fn(*args, **kwargs))
-
-
 class _DelayedAckRemoteMethod:
     def __init__(self, response_ref):
         self.response_ref = response_ref
@@ -266,6 +222,12 @@ class _DelayedAckRemoteMethod:
     def remote(self, *args, **kwargs):
         self.calls.append((args, kwargs))
         return self.response_ref
+
+
+class _FailingFutureRemoteMethod(_RemoteMethod):
+    def remote(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return _FailingFutureRef(self.fn(*args, **kwargs))
 
 
 class _Driver:
@@ -402,40 +364,20 @@ def test_collector_requires_task_lease_stream_and_has_no_raw_generator_fallback(
         collector.shutdown()
 
 
-def test_event_loop_start_failure_releases_the_registered_stream(monkeypatch):
+def test_event_loop_start_failure_prevents_submitted_stream_ownership(monkeypatch):
     fake_ray = _FakeRay()
-    driver = _Driver()
-    generators = []
+    original_start = threading.Thread.start
 
-    def submitter(_lease):
-        generator = _Generator([], completed=False)
-        generators.append(generator)
-        return generator
+    def fail_start(thread):
+        if thread.name == "udf-ray-stream-multiplexer":
+            raise RuntimeError("planned thread start failure")
+        return original_start(thread)
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
-
-    def fail_start():
-        raise RuntimeError("planned thread start failure")
-
-    monkeypatch.setattr(collector._thread, "start", fail_start)
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
     with pytest.raises(RuntimeError, match="planned thread start failure"):
-        collector.track_generator_ref(
-            1,
-            2,
-            _source(
-                fake_ray,
-                driver,
-                request_id="start-failure",
-                submitter=submitter,
-            ),
-        )
+        AsyncResultCollector(ray_module=fake_ray)
 
-    assert collector._records == {}
-    assert len(fake_ray.cancel_calls) == 1
-    assert generators[0].deleted_streams == [generators[0].completion_ref]
-    with pytest.raises(RuntimeError, match="planned thread start failure"):
-        collector.drain_results({})
-    collector.shutdown()
+    assert fake_ray.cancel_calls == []
 
 
 def test_scheduler_failure_rejection_cancels_the_unpublished_submitted_stream():
@@ -498,6 +440,152 @@ def test_scheduler_failure_rejection_cancels_the_unpublished_submitted_stream():
         for args, kwargs in driver.release_query_task_lease_after_completion.calls
     )
     collector.shutdown()
+
+
+def test_initial_waiter_registration_failure_unpublishes_and_cleans_stream():
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    generator = _Generator([], completed=False)
+    generator.completion_ref = _FailingFutureRef(None, ready=False)
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    try:
+        with pytest.raises(RuntimeError, match="planned Future registration failure"):
+            collector.track_generator_ref(
+                1,
+                1,
+                _source(
+                    fake_ray,
+                    driver,
+                    request_id="initial-waiter-failure",
+                    submitter=lambda _lease: generator,
+                ),
+            )
+
+        with collector._cv:
+            assert collector._records == {}
+            assert collector._cleanup_tickets == set()
+        assert fake_ray.cancel_calls == [
+            (generator, {"force": True, "recursive": True}),
+        ]
+        assert generator.deleted_streams == [generator.completion_ref]
+        assert len(driver.release_query_task_lease_after_completion.calls) == 1
+    finally:
+        collector.shutdown()
+
+
+def test_invalid_submitted_stream_handoff_remains_owned_until_driver_ack():
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    handoff_ack = _Ref({"handed_off": True}, ready=False)
+    driver.handoff_query_task_lease_to_teardown = _DelayedAckRemoteMethod(handoff_ack)
+    invalid_stream = SimpleNamespace()
+    source = _source(
+        fake_ray,
+        driver,
+        request_id="invalid-stream-delayed-handoff",
+        submitter=lambda _lease: invalid_stream,
+    )
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    errors = []
+    track = threading.Thread(
+        target=_capture_thread_error,
+        args=(errors, collector.track_generator_ref, 1, 1, source),
+    )
+    try:
+        track.start()
+        _wait_until(
+            lambda: bool(driver.handoff_query_task_lease_to_teardown.calls),
+        )
+
+        assert track.is_alive()
+        with collector._cv:
+            assert len(collector._cleanup_tickets) == 1
+
+        handoff_ack.ready = True
+        track.join(timeout=1)
+
+        assert not track.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], TypeError)
+        assert "not an ObjectRefGenerator" in str(errors[0])
+        with collector._cv:
+            assert collector._cleanup_tickets == set()
+        assert fake_ray.cancel_calls == [
+            (invalid_stream, {"force": True, "recursive": True}),
+        ]
+    finally:
+        handoff_ack.ready = True
+        track.join(timeout=1)
+        collector.shutdown()
+
+
+def test_midstream_waiter_registration_failure_is_isolated_to_its_stream():
+    fake_ray = _FakeRay()
+    failed_driver = _Driver()
+    failed_driver.acquire_query_output_block_lease = _FailingFutureRemoteMethod(
+        failed_driver._acquire_output,
+    )
+    healthy_driver = _Driver()
+    failed_generator = None
+
+    def submit_failed(lease):
+        nonlocal failed_generator
+        failed_generator = _Generator(
+            [_Ref("failed-block", is_block=True), _Ref(_metadata(lease))],
+        )
+        return failed_generator
+
+    def submit_healthy(lease):
+        return _Generator(
+            [_Ref("healthy-block", is_block=True), _Ref(_metadata(lease))],
+        )
+
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector.track_generator_ref(
+        1,
+        1,
+        _source(
+            fake_ray,
+            failed_driver,
+            request_id="midstream-waiter-failure",
+            submitter=submit_failed,
+        ),
+    )
+    collector.track_generator_ref(
+        2,
+        2,
+        _source(
+            fake_ray,
+            healthy_driver,
+            request_id="healthy-beside-waiter-failure",
+            submitter=submit_healthy,
+        ),
+    )
+    try:
+        events = _drain_until(
+            collector,
+            {
+                1: {"rows": 1, "bytes": 128, "item_bytes": 128},
+                2: {"rows": 1, "bytes": 128, "item_bytes": 128},
+            },
+            predicate=lambda values: (
+                any(item[0] == 1 and item[2] == "error" for item in values)
+                and any(item[0] == 2 and item[2] == "complete" for item in values)
+            ),
+        )
+
+        assert any(
+            item[0] == 1 and item[2] == "error" and "planned Future registration failure" in item[3] for item in events
+        )
+        assert [item[2] for item in events if item[0] == 2] == ["data", "complete"]
+        assert failed_generator is not None
+        assert failed_generator.deleted_streams == [failed_generator.completion_ref]
+        with collector._cv:
+            assert collector._thread_error is None
+    finally:
+        collector.cancel_slot(1)
+        collector.cancel_slot(2)
+        collector.shutdown()
 
 
 def test_registration_is_not_visible_until_track_commits_it(monkeypatch):
@@ -632,10 +720,7 @@ def test_failure_wakeup_can_reenter_shutdown_after_cleanup_handoff():
     collector.shutdown()
 
 
-def test_bounded_cleanup_lane_retries_transient_failure_without_starving_peer(
-    monkeypatch,
-):
-    monkeypatch.setenv("VANE_UDF_STREAM_CONTROL_CLEANUP_WORKERS", "1")
+def test_cleanup_tickets_retry_transient_failure_without_starving_peer():
     collector = AsyncResultCollector(ray_module=_FakeRay())
     attempts = 0
     order = []
@@ -650,12 +735,10 @@ def test_bounded_cleanup_lane_retries_transient_failure_without_starving_peer(
     tickets = collector._submit_cleanup_operations(
         (
             RayStreamCleanupOperation(
-                RAY_STREAM_CLEANUP_CONTROL,
                 fail_transiently,
                 retry_on_error=True,
             ),
             RayStreamCleanupOperation(
-                RAY_STREAM_CLEANUP_CONTROL,
                 lambda: order.append("peer"),
             ),
         ),
@@ -675,7 +758,7 @@ def test_bounded_cleanup_lane_retries_transient_failure_without_starving_peer(
         collector.shutdown()
 
 
-def test_scheduler_fence_preserves_incomplete_ownership_retry():
+def test_cleanup_ticket_preserves_incomplete_ownership_retry():
     collector = AsyncResultCollector(ray_module=_FakeRay())
     attempts = 0
 
@@ -684,14 +767,11 @@ def test_scheduler_fence_preserves_incomplete_ownership_retry():
         attempts += 1
         return attempts >= 2
 
-    operations = collector._fence_cleanup_operations(
-        (
-            RayStreamCleanupOperation(
-                RAY_STREAM_CLEANUP_CONTROL,
-                transfer_owner,
-                retry_on_incomplete=True,
-            ),
-        )
+    operations = (
+        RayStreamCleanupOperation(
+            transfer_owner,
+            retry_on_incomplete=True,
+        ),
     )
     tickets = collector._submit_cleanup_operations(operations, store_error=False)
     try:
@@ -704,6 +784,40 @@ def test_scheduler_fence_preserves_incomplete_ownership_retry():
             == ()
         )
         assert attempts == 2
+    finally:
+        collector.shutdown()
+
+
+def test_cleanup_ticket_rejects_a_broken_future_callback_contract():
+    class _BrokenFuture:
+        def add_done_callback(self, _callback):
+            raise RuntimeError("planned cleanup callback registration failure")
+
+        def done(self):
+            return False
+
+        def result(self):
+            raise AssertionError("broken Future must never be resolved")
+
+    collector = AsyncResultCollector(ray_module=_FakeRay())
+    tickets = collector._submit_cleanup_operations(
+        (
+            RayStreamCleanupOperation(
+                _BrokenFuture,
+                retry_on_error=True,
+            ),
+        ),
+        store_error=False,
+    )
+    try:
+        errors = collector._wait_cleanup_tickets(
+            tickets,
+            timeout_message="broken cleanup Future did not terminate",
+        )
+        assert len(errors) == 1
+        assert "planned cleanup callback registration failure" in str(errors[0])
+        with collector._cv:
+            assert collector._cleanup_tickets == set()
     finally:
         collector.shutdown()
 
@@ -928,12 +1042,7 @@ def test_output_lease_control_retries_until_driver_acknowledges_ownership(operat
         collector.shutdown()
 
 
-def test_output_control_timeout_reuses_the_inflight_driver_response(monkeypatch):
-    monkeypatch.setattr(
-        stream_adapter_module,
-        "_TASK_LEASE_CONTROL_ACK_TIMEOUT_S",
-        0.01,
-    )
+def test_output_control_waits_on_one_inflight_driver_response():
     fake_ray = _FakeRay()
     driver = _Driver()
     response_ref = _Ref({"released": True}, ready=False)
@@ -954,7 +1063,7 @@ def test_output_control_timeout_reuses_the_inflight_driver_response(monkeypatch)
     try:
         assert collector.release_output_block_lease(*key) is True
         _wait_until(lambda: bool(driver.release_query_output_block_lease.calls))
-        time.sleep(0.08)
+        time.sleep(0.05)
 
         assert len(driver.release_query_output_block_lease.calls) == 1
         with collector._cv:
@@ -966,6 +1075,121 @@ def test_output_control_timeout_reuses_the_inflight_driver_response(monkeypatch)
         assert len(driver.release_query_output_block_lease.calls) == 1
     finally:
         response_ref.ready = True
+        collector.shutdown()
+
+
+def test_output_release_ticket_handoff_is_atomic_with_shutdown(monkeypatch):
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    token = _OutputLeaseToken(
+        request_id="output-request:shutdown-race",
+        lease_id="output-lease-shutdown-race",
+        query_id="q1",
+        driver=driver,
+        slot_id=2,
+        submit_id=22,
+        size_bytes=64,
+    )
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    key = (token.request_id, token.lease_id)
+    with collector._cv:
+        collector._active_output_leases[key] = token
+
+    handoff_started = threading.Event()
+    allow_handoff = threading.Event()
+    original_submit = collector._submit_cleanup_operations
+
+    def blocking_submit(*args, **kwargs):
+        handoff_started.set()
+        assert allow_handoff.wait(timeout=2)
+        return original_submit(*args, **kwargs)
+
+    monkeypatch.setattr(collector, "_submit_cleanup_operations", blocking_submit)
+    release_errors = []
+    shutdown_errors = []
+    release_thread = threading.Thread(
+        target=lambda: _capture_thread_error(
+            release_errors,
+            collector.release_output_block_lease,
+            *key,
+        )
+    )
+    shutdown_thread = threading.Thread(
+        target=lambda: _capture_thread_error(
+            shutdown_errors,
+            collector.shutdown,
+        )
+    )
+    try:
+        release_thread.start()
+        assert handoff_started.wait(timeout=1)
+        shutdown_thread.start()
+        time.sleep(0.05)
+        assert shutdown_thread.is_alive()
+
+        allow_handoff.set()
+        release_thread.join(timeout=2)
+        shutdown_thread.join(timeout=2)
+
+        assert release_thread.is_alive() is False
+        assert shutdown_thread.is_alive() is False
+        assert release_errors == []
+        assert shutdown_errors == []
+        assert len(driver.release_query_output_block_lease.calls) == 1
+        assert collector._thread.is_alive() is False
+    finally:
+        allow_handoff.set()
+        release_thread.join(timeout=2)
+        shutdown_thread.join(timeout=2)
+        collector.shutdown()
+
+
+def test_slot_cancel_reuses_an_already_claimed_output_release_ticket():
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    release_response = _Ref({"released": True}, ready=False)
+    driver.release_query_output_block_lease = _DelayedAckRemoteMethod(release_response)
+    token = _OutputLeaseToken(
+        request_id="output-request:cancel-release-race",
+        lease_id="output-lease-cancel-release-race",
+        query_id="q1",
+        driver=driver,
+        slot_id=2,
+        submit_id=23,
+        size_bytes=64,
+    )
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    key = (token.request_id, token.lease_id)
+    with collector._cv:
+        collector._active_output_leases[key] = token
+
+    cancel_errors = []
+    cancel_thread = threading.Thread(
+        target=lambda: _capture_thread_error(
+            cancel_errors,
+            collector.cancel_slot,
+            token.slot_id,
+        )
+    )
+    try:
+        assert collector.release_output_block_lease(*key) is True
+        _wait_until(lambda: len(driver.release_query_output_block_lease.calls) == 1)
+
+        cancel_thread.start()
+        time.sleep(0.05)
+        assert cancel_thread.is_alive()
+        assert len(driver.release_query_output_block_lease.calls) == 1
+
+        release_response.ready = True
+        cancel_thread.join(timeout=2)
+
+        assert cancel_thread.is_alive() is False
+        assert cancel_errors == []
+        assert len(driver.release_query_output_block_lease.calls) == 1
+        assert collector.slot_has_pending(token.slot_id) is False
+    finally:
+        release_response.ready = True
+        cancel_thread.join(timeout=2)
         collector.shutdown()
 
 
@@ -1027,48 +1251,6 @@ def test_metadata_transition_is_atomic_with_concurrent_capacity_refresh(
         assert [item[2] for item in events] == ["data", "complete"]
     finally:
         allow_transition.set()
-        collector.shutdown()
-
-
-def test_slot_cancel_fences_output_lease_acquire_before_ref_publication():
-    fake_ray = _FakeRay()
-    driver = _Driver()
-    acquire = _BlockingRemoteMethod(driver._acquire_output)
-    driver.acquire_query_output_block_lease = acquire
-
-    def submitter(lease):
-        return _Generator(
-            [_Ref("block", is_block=True), _Ref(_metadata(lease))],
-            completed=False,
-        )
-
-    collector = AsyncResultCollector(ray_module=fake_ray)
-    collector.track_generator_ref(
-        2,
-        24,
-        _source(
-            fake_ray,
-            driver,
-            request_id="cancel-during-output-acquire",
-            submitter=submitter,
-        ),
-    )
-    try:
-        collector.drain_results({2: {"rows": 1, "bytes": 128, "item_bytes": 128}})
-        assert acquire.started.wait(timeout=2.0)
-
-        collector.cancel_slot(2)
-        acquire.release.set()
-
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline and not driver.cancel_query_output_block_lease_request.calls:
-            time.sleep(0.005)
-
-        assert len(driver.cancel_query_output_block_lease_request.calls) == 1
-        assert driver.cancel_query_output_block_lease_request.calls[0] == acquire.calls[0]
-        assert collector.slot_has_pending(2) is False
-    finally:
-        acquire.release.set()
         collector.shutdown()
 
 
@@ -1139,7 +1321,7 @@ def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
     driver = _Driver()
     generator_holder = {}
     retire_started = threading.Event()
-    allow_retire = threading.Event()
+    retirement = Future()
     original_retire_operations = RayStreamAdapter.retire_operations
 
     def blocking_retire_operations(adapter):
@@ -1147,11 +1329,13 @@ def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
 
         def block_retirement():
             retire_started.set()
-            allow_retire.wait()
+            if not retirement.done():
+                return retirement
+            retirement.result()
+            return True
 
         return (
             RayStreamCleanupOperation(
-                RAY_STREAM_CLEANUP_CONTROL,
                 block_retirement,
             ),
             *operations,
@@ -1187,9 +1371,9 @@ def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
         assert retire_started.is_set()
         events.extend(collector.drain_results(capacity))
 
-        # Completion is the observable retirement boundary. Independent lanes
-        # may already delete the local stream while task-accounting cleanup is
-        # blocked, but the record cannot complete until the whole plan settles.
+        # Completion is the observable retirement boundary. Independent
+        # tickets may finish while one control Future remains pending, but the
+        # record cannot complete until the whole plan settles.
         assert [item[2] for item in events] == ["data"]
         assert collector._records
         assert collector._cleanup_tickets
@@ -1202,7 +1386,7 @@ def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
         del data
         del events
 
-        allow_retire.set()
+        retirement.set_result(None)
         events = _drain_until(
             collector,
             capacity,
@@ -1215,7 +1399,8 @@ def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
         assert source.lease is None
         assert generator.deleted_streams == [generator.completion_ref]
     finally:
-        allow_retire.set()
+        if not retirement.done():
+            retirement.set_result(None)
         collector.shutdown()
 
 
@@ -1223,7 +1408,7 @@ def test_blocked_terminal_retirement_does_not_stall_healthy_stream(monkeypatch):
     fake_ray = _FakeRay()
     driver = _Driver()
     retire_started = threading.Event()
-    allow_retire = threading.Event()
+    retirement = Future()
     healthy_block = _Ref("healthy-after-retire", ready=False, is_block=True)
     original_retire_operations = RayStreamAdapter.retire_operations
 
@@ -1235,11 +1420,13 @@ def test_blocked_terminal_retirement_does_not_stall_healthy_stream(monkeypatch):
 
         def block_retirement():
             retire_started.set()
-            allow_retire.wait()
+            if not retirement.done():
+                return retirement
+            retirement.result()
+            return True
 
         return (
             RayStreamCleanupOperation(
-                RAY_STREAM_CLEANUP_CONTROL,
                 block_retirement,
             ),
             *operations,
@@ -1291,9 +1478,10 @@ def test_blocked_terminal_retirement_does_not_stall_healthy_stream(monkeypatch):
         )
 
         assert [item[2] for item in healthy_events] == ["data"]
-        assert allow_retire.is_set() is False
+        assert retirement.done() is False
     finally:
-        allow_retire.set()
+        if not retirement.done():
+            retirement.set_result(None)
         collector.cancel_slot(3)
         collector.shutdown()
 
@@ -1302,7 +1490,7 @@ def test_slot_cancel_waits_for_already_claimed_terminal_retirement(monkeypatch):
     fake_ray = _FakeRay()
     driver = _Driver()
     retire_started = threading.Event()
-    allow_retire = threading.Event()
+    retirement = Future()
     original_retire_operations = RayStreamAdapter.retire_operations
 
     def blocking_retire_operations(adapter):
@@ -1310,11 +1498,13 @@ def test_slot_cancel_waits_for_already_claimed_terminal_retirement(monkeypatch):
 
         def block_retirement():
             retire_started.set()
-            assert allow_retire.wait(timeout=2)
+            if not retirement.done():
+                return retirement
+            retirement.result()
+            return True
 
         return (
             RayStreamCleanupOperation(
-                RAY_STREAM_CLEANUP_CONTROL,
                 block_retirement,
             ),
             *operations,
@@ -1342,13 +1532,14 @@ def test_slot_cancel_waits_for_already_claimed_terminal_retirement(monkeypatch):
         time.sleep(0.05)
         assert cancel_thread.is_alive()
 
-        allow_retire.set()
+        retirement.set_result(None)
         cancel_thread.join(timeout=2)
         assert cancel_thread.is_alive() is False
         assert cancel_errors == []
         assert collector.slot_has_pending(4) is False
     finally:
-        allow_retire.set()
+        if not retirement.done():
+            retirement.set_result(None)
         cancel_thread.join(timeout=2)
         collector.shutdown()
 
@@ -1412,7 +1603,96 @@ def test_completion_ready_before_final_metadata_does_not_fail_valid_pair():
         collector.shutdown()
 
 
-def test_stale_record_releases_completed_output_lease_with_exact_rpc_contract():
+def test_output_grant_transition_is_atomic_with_slot_cancellation():
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector.track_generator_ref(
+        2,
+        19,
+        _source(
+            fake_ray,
+            driver,
+            request_id="output-grant-cancel-race",
+            submitter=lambda _lease: _Generator([], completed=False),
+        ),
+    )
+    with collector._cv:
+        record = collector._records[(2, 19)]
+        metadata = _metadata(record.adapter.task_lease)
+        request = {
+            "request_id": f"output-request:{metadata['block_id']}",
+            "query_id": metadata["query_id"],
+            "producer_stage_id": metadata["producer_stage_id"],
+            "task_lease_id": metadata["task_lease_id"],
+            "attempt_id": metadata["attempt_id"],
+            "block_id": metadata["block_id"],
+            "size_bytes": metadata["size_bytes"],
+        }
+        record.phase = "output_lease"
+        record.block_ref = _Ref("large-block", is_block=True)
+        record.metadata = metadata
+        record.output_request_id = request["request_id"]
+        record.output_request = request
+
+    grant = driver._acquire_output(request)
+    result_started = threading.Event()
+    allow_result = threading.Event()
+
+    class _BlockingGrantFuture:
+        def result(self):
+            result_started.set()
+            assert allow_result.wait(timeout=2)
+            return grant
+
+    grant_future = _BlockingGrantFuture()
+    with collector._cv:
+        record.wait_kind = "output_lease"
+        record.wait_future = grant_future
+
+    transition_errors = []
+    cancel_errors = []
+    transition_thread = threading.Thread(
+        target=lambda: _capture_thread_error(
+            transition_errors,
+            collector._complete_record_wait,
+            record,
+            "output_lease",
+            grant_future,
+        )
+    )
+    cancel_thread = threading.Thread(
+        target=lambda: _capture_thread_error(
+            cancel_errors,
+            collector.cancel_slot,
+            record.slot_id,
+        )
+    )
+    try:
+        transition_thread.start()
+        assert result_started.wait(timeout=1)
+        cancel_thread.start()
+        time.sleep(0.05)
+        assert cancel_thread.is_alive()
+
+        allow_result.set()
+        transition_thread.join(timeout=2)
+        cancel_thread.join(timeout=2)
+
+        assert transition_thread.is_alive() is False
+        assert cancel_thread.is_alive() is False
+        assert transition_errors == []
+        assert cancel_errors == []
+        assert len(driver.release_query_output_block_lease.calls) == 1
+        assert collector.slot_has_pending(record.slot_id) is False
+    finally:
+        allow_result.set()
+        transition_thread.join(timeout=2)
+        cancel_thread.join(timeout=2)
+        collector.shutdown()
+
+
+def test_terminal_record_releases_completed_output_lease_with_exact_rpc_contract():
     fake_ray = _FakeRay()
     driver = _Driver()
     source = _source(
@@ -1445,6 +1725,10 @@ def test_stale_record_releases_completed_output_lease_with_exact_rpc_contract():
         output_lease_ref=_Ref(driver._acquire_output(output_request)),
     )
     collector = AsyncResultCollector(ray_module=fake_ray)
+    record.registered = True
+    record.terminal = True
+    with collector._cv:
+        collector._records[(record.slot_id, record.submit_id)] = record
     original_release = driver.release_query_output_block_lease
 
     class _LockCheckingRelease:
@@ -1467,8 +1751,17 @@ def test_stale_record_releases_completed_output_lease_with_exact_rpc_contract():
             ((record.output_request_id, "output-lease-1", metadata["query_id"]), {}),
         ]
     finally:
+        with collector._cv:
+            collector._records.pop((record.slot_id, record.submit_id), None)
+        tickets = collector._submit_cleanup_operations(
+            adapter.cancel_operations(),
+            store_error=False,
+        )
+        collector._wait_cleanup_tickets(
+            tickets,
+            timeout_message="adapter cleanup did not finish",
+        )
         collector.shutdown()
-        adapter.cancel()
 
 
 def test_one_slow_stream_cannot_block_a_ready_stream():
@@ -1727,91 +2020,6 @@ def test_local_eligibility_change_interrupts_idle_readiness_backoff():
     finally:
         collector.cancel_slot(3)
         collector.shutdown()
-
-
-def test_slot_cancel_fences_the_active_zero_time_readiness_probe():
-    fake_ray = _BlockingWaitRay()
-    driver = _Driver()
-    collector = AsyncResultCollector(ray_module=fake_ray)
-    collector.track_generator_ref(
-        3,
-        40,
-        _source(
-            fake_ray,
-            driver,
-            request_id="cancel-readiness-probe",
-            submitter=lambda lease: _Generator(
-                [_Ref("slow", ready=False, is_block=True), _Ref(_metadata(lease))],
-                completed=False,
-            ),
-        ),
-    )
-    assert collector.drain_results({3: {"rows": 1, "bytes": 128, "item_bytes": 128}}) == []
-    assert fake_ray.wait_started.wait(timeout=1)
-    errors = []
-    cancel_thread = threading.Thread(
-        target=lambda: _capture_thread_error(errors, collector.cancel_slot, 3),
-    )
-    cancel_thread.start()
-    try:
-        time.sleep(0.05)
-        assert cancel_thread.is_alive()
-        assert fake_ray.cancel_calls == []
-
-        fake_ray.allow_wait.set()
-        cancel_thread.join(timeout=1)
-        assert cancel_thread.is_alive() is False
-        assert errors == []
-        assert len(fake_ray.cancel_calls) == 1
-    finally:
-        fake_ray.allow_wait.set()
-        cancel_thread.join(timeout=1)
-        collector.shutdown()
-
-
-def test_shutdown_retains_cleanup_after_a_stuck_readiness_probe(monkeypatch):
-    monkeypatch.setenv("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S", "0.05")
-    fake_ray = _BlockingWaitRay()
-    driver = _Driver()
-    generators = []
-
-    def submitter(lease):
-        generator = _Generator(
-            [_Ref("slow", ready=False, is_block=True), _Ref(_metadata(lease))],
-            completed=False,
-        )
-        generators.append(generator)
-        return generator
-
-    collector = AsyncResultCollector(ray_module=fake_ray)
-    collector.track_generator_ref(
-        3,
-        41,
-        _source(
-            fake_ray,
-            driver,
-            request_id="shutdown-readiness-probe",
-            submitter=submitter,
-        ),
-    )
-    assert collector.drain_results({3: {"rows": 1, "bytes": 128, "item_bytes": 128}}) == []
-    assert fake_ray.wait_started.wait(timeout=1)
-
-    started_at = time.monotonic()
-    with pytest.raises(RuntimeError, match="multiplexer did not terminate"):
-        collector.shutdown()
-    assert time.monotonic() - started_at < 0.5
-    assert fake_ray.cancel_calls == []
-
-    fake_ray.allow_wait.set()
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline and (not fake_ray.cancel_calls or not generators[0].deleted_streams):
-        time.sleep(0.005)
-
-    assert len(fake_ray.cancel_calls) == 1
-    assert generators[0].deleted_streams == [generators[0].completion_ref]
-    collector._thread.join(timeout=1)
-    assert collector._thread.is_alive() is False
 
 
 def test_readiness_probe_failure_is_reported_without_dequeuing():
@@ -2155,16 +2363,22 @@ def test_malformed_metadata_fails_only_its_stream_without_output_admission():
 
 
 def test_stream_error_wakes_dispatcher_before_generator_cancellation():
-    fake_ray = _BlockingCancelRay()
+    fake_ray = _FakeRay()
     driver = _Driver()
     wakeup = threading.Event()
+    cancel_counts_at_wakeup = []
     healthy_block = _Ref("healthy-block", ready=False, is_block=True)
 
     def submitter(_lease):
         return _Generator([_Ref("block", is_block=True), _Ref({"size_bytes": 1})])
 
     collector = AsyncResultCollector(ray_module=fake_ray)
-    collector.set_wakeup_callback(wakeup.set)
+
+    def notify():
+        cancel_counts_at_wakeup.append(len(fake_ray.cancel_calls))
+        wakeup.set()
+
+    collector.set_wakeup_callback(notify)
     collector.track_generator_ref(
         8,
         80,
@@ -2187,11 +2401,12 @@ def test_stream_error_wakes_dispatcher_before_generator_cancellation():
         with collector._cv:
             assert len(collector._records) == 2
         wakeup.clear()
+        cancel_counts_at_wakeup.clear()
 
         collector.drain_results({8: {"rows": 1, "bytes": 128, "item_bytes": 128}})
 
-        assert fake_ray.cancel_started.wait(timeout=2.0)
-        assert wakeup.is_set(), "terminal error was not published before ray.cancel"
+        assert wakeup.wait(timeout=2.0)
+        assert cancel_counts_at_wakeup[0] == 0
         fake_ray.make_ready(healthy_block)
         healthy_events = _drain_until(
             collector,
@@ -2200,25 +2415,20 @@ def test_stream_error_wakes_dispatcher_before_generator_cancellation():
         )
         assert [item[2] for item in healthy_events] == ["data"]
 
-        fake_ray.allow_cancel.set()
         events = _drain_until(
             collector,
             {8: {"rows": 1, "bytes": 128, "item_bytes": 128}},
             predicate=lambda values: any(item[2] == "error" for item in values),
         )
         assert [item[2] for item in events] == ["error"]
+        assert len(fake_ray.cancel_calls) == 1
     finally:
-        fake_ray.allow_cancel.set()
         collector.cancel_slot(9)
         collector.shutdown()
 
 
-def test_blocked_cancellations_use_bounded_workers_and_preserve_delete_ordering(
-    monkeypatch,
-):
-    monkeypatch.setenv("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S", "0.05")
-    monkeypatch.setenv("VANE_UDF_STREAM_CANCELLATION_CLEANUP_WORKERS", "2")
-    fake_ray = _BlockingCancelRay()
+def test_many_cancellations_complete_on_the_cleanup_event_loop():
+    fake_ray = _FakeRay()
     driver = _Driver()
     generators = []
     collector = AsyncResultCollector(ray_module=fake_ray)
@@ -2237,37 +2447,21 @@ def test_blocked_cancellations_use_bounded_workers_and_preserve_delete_ordering(
         )
 
     try:
-        with pytest.raises(RuntimeError, match="cleanup did not terminate"):
-            collector.cancel_slot(18)
+        collector.cancel_slot(18)
 
-        assert fake_ray.cancel_started_count == 2
-        cancellation_pool = collector._cleanup_pools["cancellation"]
-        assert len(cancellation_pool.threads) == 2
         assert driver.cancel_query_task_lease_request.calls == []
         assert len(driver.release_query_task_lease_after_completion.calls) == len(generators)
-        assert all(generator.deleted_streams == [] for generator in generators)
-
-        fake_ray.allow_cancel.set()
-        deadline = time.monotonic() + 3
-        while (
-            len(fake_ray.cancel_calls) < len(generators)
-            or not all(generator.deleted_streams for generator in generators)
-        ) and time.monotonic() < deadline:
-            time.sleep(0.005)
         assert len(fake_ray.cancel_calls) == len(generators)
         assert all(generator.deleted_streams == [generator.completion_ref] for generator in generators)
     finally:
-        fake_ray.allow_cancel.set()
         collector.shutdown()
 
 
-def test_blocked_output_controls_do_not_withhold_task_or_stream_cleanup(
-    monkeypatch,
-):
-    monkeypatch.setenv("VANE_UDF_STREAM_OUTPUT_CLEANUP_WORKERS", "2")
+def test_pending_output_control_futures_do_not_withhold_task_or_stream_cleanup():
     fake_ray = _FakeRay()
     driver = _Driver()
-    blocked_release = _BlockingRemoteMethod(lambda *_args: {"released": True})
+    release_response = _Ref({"released": True}, ready=False)
+    blocked_release = _DelayedAckRemoteMethod(release_response)
     driver.release_query_output_block_lease = blocked_release
     collector = AsyncResultCollector(ray_module=fake_ray)
     output_tokens = [
@@ -2310,7 +2504,7 @@ def test_blocked_output_controls_do_not_withhold_task_or_stream_cleanup(
         assert len(driver.release_query_task_lease_after_completion.calls) == 1
         assert all(token.release_pending for token in output_tokens)
     finally:
-        blocked_release.release.set()
+        release_response.ready = True
         _wait_until(
             lambda: all(
                 (token.request_id, token.lease_id) not in collector._active_output_leases for token in output_tokens
@@ -2404,4 +2598,4 @@ def test_shutdown_clears_callback_and_fully_joins_owned_thread():
 
     assert collector._wakeup_fn is None
     assert collector._thread.is_alive() is False
-    assert all(not thread.is_alive() for pool in collector._cleanup_pools.values() for thread in pool.threads)
+    assert collector._cleanup_tickets == set()
