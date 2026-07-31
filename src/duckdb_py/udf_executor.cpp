@@ -1094,6 +1094,7 @@ struct ExecutorSlot {
 	atomic<bool> finished_submitting_acked {false};
 	atomic<bool> all_tasks_finished {false};
 	atomic<bool> cleanup_cancel_requested {false};
+	atomic<bool> collector_cleanup_retry_consumed {false};
 	atomic<bool> collector_retired {false};
 
 	// Error propagation
@@ -1121,7 +1122,7 @@ struct ExecutorSlot {
 	atomic<idx_t> udf_output_budget_limit_bytes {0};
 	atomic<idx_t> udf_output_budget_usage_bytes {0};
 
-	// Synchronous cleanup: signaled by CleanupSlot, waited on by Unregister
+	// Cleanup completion fence: signaled by CleanupSlot, waited on by Unregister.
 	mutex cleanup_lock;
 	std::condition_variable cleanup_cv;
 	bool cleanup_complete {false};
@@ -1589,8 +1590,7 @@ private:
 							has_pending_cleanup_cancel = true;
 							continue;
 						}
-						CleanupSlot(slot->id);
-						did_work = true;
+						did_work |= CleanupSlot(slot->id);
 					}
 					slot = nullptr; // prevent dangling pointer in subsequent loops
 					continue;
@@ -1902,13 +1902,15 @@ private:
 		slot.cleanup_cv.notify_all();
 	}
 
-	void CleanupSlot(uint64_t id) {
+	enum class AsyncCollectorSlotCancelStatus : uint8_t { COMPLETE, PENDING, RETRY };
+
+	bool CleanupSlot(uint64_t id) {
 		shared_ptr<ExecutorSlot> slot;
 		{
 			lock_guard<mutex> g(global_lock);
 			auto it = slots.find(id);
 			if (it == slots.end()) {
-				return;
+				return true;
 			}
 			slot = it->second;
 		}
@@ -1926,9 +1928,17 @@ private:
 		// crashes in PyList_AsTuple/PyType_FromModuleAndSpec without GIL.
 		{
 			PythonGILWrapper gil;
-			if (!CancelAsyncCollectorSlot_WithGIL(*slot_ptr)) {
-				NotifyWork();
-				return;
+			slot_ptr->cleanup_cancel_requested.store(true);
+			auto cancel_status = CancelAsyncCollectorSlot_WithGIL(*slot_ptr);
+			if (cancel_status != AsyncCollectorSlotCancelStatus::COMPLETE) {
+				// A pending ticket owns its eventual wakeup. Give a synchronous
+				// handoff failure one immediate retry, then wait for external work
+				// instead of spinning the process-wide dispatcher.
+				if (cancel_status == AsyncCollectorSlotCancelStatus::RETRY &&
+				    !slot_ptr->collector_cleanup_retry_consumed.exchange(true)) {
+					NotifyWork();
+				}
+				return false;
 			}
 			if (slot_ptr->py_executor) {
 				try {
@@ -1957,6 +1967,7 @@ private:
 		// the final owner after the map entry is erased.
 		MarkSlotCleanupComplete(*slot_ptr);
 		UDFDebugLog(StringUtil::Format("cleanup_done slot=%llu", static_cast<unsigned long long>(id)));
+		return true;
 	}
 
 	// ── Submit/ready-result helpers (caller must hold GIL) ──────────────────────
@@ -2085,50 +2096,53 @@ private:
 		WakeupPipelineThread(slot);
 	}
 
-	bool CancelAsyncCollectorSlot_WithGIL(ExecutorSlot &slot) {
+	AsyncCollectorSlotCancelStatus CancelAsyncCollectorSlot_WithGIL(ExecutorSlot &slot) {
 		if (terminal_collector_shutdown_owned.load()) {
-			return true;
+			return AsyncCollectorSlotCancelStatus::COMPLETE;
 		}
 		if (!PayloadUsesRayStreamCollector(slot.payload) || !async_collector || slot.collector_retired.load()) {
-			return true;
+			return AsyncCollectorSlotCancelStatus::COMPLETE;
 		}
 		try {
 			async_collector->obj.attr("cancel_slot")(py::int_(slot.id));
 		} catch (const py::error_already_set &ex) {
 			PublishSlotError(slot, StringUtil::Format("udf async collector cancel_slot failed: %s", ex.what()));
-			return false;
+			return AsyncCollectorSlotCancelStatus::RETRY;
 		} catch (const std::exception &ex) {
 			PublishSlotError(slot, StringUtil::Format("udf async collector cancel_slot failed: %s", ex.what()));
-			return false;
+			return AsyncCollectorSlotCancelStatus::RETRY;
 		}
 		bool collector_pending;
 		try {
 			collector_pending = async_collector->obj.attr("slot_has_pending")(py::int_(slot.id)).cast<bool>();
 		} catch (const py::error_already_set &ex) {
 			PublishSlotError(slot, StringUtil::Format("udf async collector slot_has_pending failed: %s", ex.what()));
-			return false;
+			return AsyncCollectorSlotCancelStatus::RETRY;
 		} catch (const std::exception &ex) {
 			PublishSlotError(slot, StringUtil::Format("udf async collector slot_has_pending failed: %s", ex.what()));
-			return false;
+			return AsyncCollectorSlotCancelStatus::RETRY;
 		}
 		if (collector_pending) {
-			PublishSlotError(slot, "udf async collector still has pending records after slot cancel");
-			return false;
+			return AsyncCollectorSlotCancelStatus::PENDING;
 		}
 		try {
-			// cancel_slot is synchronous. Once it reports no ownership, this
-			// dispatcher generation is the last possible submitter for the slot,
-			// so its process-lifetime cancellation fence can go.
-			async_collector->obj.attr("retire_slot")(py::int_(slot.id));
+			// Once the collector reports no ownership, this dispatcher generation
+			// is the last possible submitter, so its process-lifetime cancellation
+			// fence can go.
+			auto cleanup_error = async_collector->obj.attr("retire_slot")(py::int_(slot.id));
 			slot.collector_retired.store(true);
+			if (!cleanup_error.is_none()) {
+				PublishSlotError(slot, StringUtil::Format("udf async collector slot cleanup failed: %s",
+				                                          py::str(cleanup_error).cast<string>()));
+			}
 		} catch (const py::error_already_set &ex) {
 			PublishSlotError(slot, StringUtil::Format("udf async collector retire_slot failed: %s", ex.what()));
-			return false;
+			return AsyncCollectorSlotCancelStatus::RETRY;
 		} catch (const std::exception &ex) {
 			PublishSlotError(slot, StringUtil::Format("udf async collector retire_slot failed: %s", ex.what()));
-			return false;
+			return AsyncCollectorSlotCancelStatus::RETRY;
 		}
-		return true;
+		return AsyncCollectorSlotCancelStatus::COMPLETE;
 	}
 
 	void CancelSlotForCleanup_WithGIL(ExecutorSlot &slot, bool cancel_collector = true) {
@@ -2136,7 +2150,10 @@ private:
 			return;
 		}
 		if (cancel_collector) {
-			CancelAsyncCollectorSlot_WithGIL(slot);
+			if (CancelAsyncCollectorSlot_WithGIL(slot) == AsyncCollectorSlotCancelStatus::RETRY) {
+				// The current dispatcher pass is already the bounded retry wake.
+				slot.collector_cleanup_retry_consumed.store(true);
+			}
 		}
 		if (slot.py_executor) {
 			try {
@@ -2173,7 +2190,9 @@ private:
 		if (first_abort && PythonRuntimeUsableForUDFTeardown()) {
 			try {
 				PythonGILWrapper gil;
-				CancelAsyncCollectorSlot_WithGIL(slot);
+				if (CancelAsyncCollectorSlot_WithGIL(slot) == AsyncCollectorSlotCancelStatus::RETRY) {
+					slot.collector_cleanup_retry_consumed.store(true);
+				}
 			} catch (const py::error_already_set &ex) {
 				SetSlotError(slot, StringUtil::Format("udf async collector cancel_slot failed: %s", ex.what()));
 			} catch (const std::exception &ex) {

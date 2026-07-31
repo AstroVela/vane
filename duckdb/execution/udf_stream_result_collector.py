@@ -250,6 +250,7 @@ class AsyncResultCollector:
         self._cleanup_handoff_lock = threading.RLock()
         self._cleanup_tickets: set[_CleanupTicket] = set()
         self._cleanup_tickets_by_slot: dict[int, set[_CleanupTicket]] = defaultdict(set)
+        self._slot_cancellation_tickets: dict[int, set[_CleanupTicket]] = defaultdict(set)
         self._terminal_cleanup_errors: list[BaseException] = []
         self._readiness_delay_s = _GENERATOR_READINESS_POLL_INITIAL_DELAY_S
         self._readiness_timer: asyncio.TimerHandle | None = None
@@ -669,13 +670,13 @@ class AsyncResultCollector:
         )
 
     def cancel_slot(self, slot_id: int) -> None:
+        """Fence a slot and atomically hand its remote cleanup to the event loop."""
         slot_key = int(slot_id)
-        cleanup_tickets: set[_CleanupTicket] = set()
         with self._cleanup_handoff_lock:
             with self._cv:
                 if self._shutdown:
                     return
-                cleanup_tickets.update(self._cleanup_tickets_by_slot.get(slot_key, ()))
+                self._slot_cancellation_tickets[slot_key].update(self._cleanup_tickets_by_slot.get(slot_key, ()))
                 records = [record for record in self._records.values() if record.slot_id == slot_key]
                 records_to_cancel = [record for record in records if not record.cleanup_started]
                 cleanup_operations: list[RayStreamCleanupOperation] = []
@@ -706,12 +707,10 @@ class AsyncResultCollector:
                 self._signal_readiness_change_locked()
 
             try:
-                cleanup_tickets.update(
-                    self._submit_cleanup_operations(
-                        cleanup_operations,
-                        store_error=False,
-                        slot_ids=(slot_key,),
-                    )
+                cleanup_tickets = self._submit_cleanup_operations(
+                    cleanup_operations,
+                    store_error=False,
+                    slot_ids=(slot_key,),
                 )
             except BaseException:
                 self._restore_output_token_release_claims(claimed_tokens)
@@ -725,6 +724,7 @@ class AsyncResultCollector:
                     self._cv.notify_all()
                 raise
             with self._cv:
+                self._slot_cancellation_tickets[slot_key].update(cleanup_tickets)
                 for record in records:
                     if self._records.get((record.slot_id, record.submit_id)) is record:
                         self._records.pop((record.slot_id, record.submit_id), None)
@@ -734,15 +734,6 @@ class AsyncResultCollector:
                 self._capacity_by_slot.pop(slot_key, None)
                 self._cancelled_slots.add(slot_key)
                 self._signal_readiness_change_locked()
-
-        cleanup_errors = self._wait_slot_cleanup(
-            slot_key,
-            timeout_message=f"Ray UDF slot {slot_key} cleanup did not terminate",
-            initial_tickets=tuple(cleanup_tickets),
-        )
-        if cleanup_errors:
-            details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
-            raise RuntimeError(f"Ray UDF slot {slot_key} cleanup failed: {details}") from cleanup_errors[0]
 
     def slot_has_pending(self, slot_id: int) -> bool:
         slot_key = int(slot_id)
@@ -754,8 +745,8 @@ class AsyncResultCollector:
                 or bool(self._cleanup_tickets_by_slot.get(slot_key))
             )
 
-    def retire_slot(self, slot_id: int) -> None:
-        """Drop the cancellation fence after the native submitter is quiescent."""
+    def retire_slot(self, slot_id: int) -> str | None:
+        """Drop a quiescent slot fence and return any terminal cleanup failure."""
         slot_key = int(slot_id)
         with self._cv:
             if (
@@ -765,9 +756,14 @@ class AsyncResultCollector:
                 or bool(self._cleanup_tickets_by_slot.get(slot_key))
             ):
                 raise RuntimeError(f"Ray UDF slot {slot_key} still owns collector state")
+            cancellation_tickets = self._slot_cancellation_tickets.pop(slot_key, ())
             self._cancelled_slots.discard(slot_key)
             self._capacity_by_slot.pop(slot_key, None)
             self._cv.notify_all()
+        cleanup_errors = tuple(error for ticket in cancellation_tickets for error in ticket.errors)
+        if not cleanup_errors:
+            return None
+        return "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
 
     def set_wakeup_callback(self, fn: Any) -> None:
         with self._cv:
@@ -853,7 +849,20 @@ class AsyncResultCollector:
             pending = [ticket for ticket in self._cleanup_tickets if not ticket.callback_owned_by_current_thread()]
             if pending:
                 shutdown_errors.append(RuntimeError("Ray UDF stream remote cleanup did not terminate"))
-            shutdown_errors.extend(self._terminal_cleanup_errors)
+            recorded_errors = [
+                *self._terminal_cleanup_errors,
+                *(
+                    error
+                    for tickets in self._slot_cancellation_tickets.values()
+                    for ticket in tickets
+                    for error in ticket.errors
+                ),
+            ]
+            known_error_ids = {id(error) for error in shutdown_errors}
+            for error in recorded_errors:
+                if id(error) not in known_error_ids:
+                    known_error_ids.add(id(error))
+                    shutdown_errors.append(error)
 
         if not pending and self._thread.is_alive():
             self._loop.call_soon_threadsafe(self._loop.stop)
@@ -1194,6 +1203,7 @@ class AsyncResultCollector:
                                         None,
                                     )
                         self._cv.notify_all()
+                    self._notify_wakeup()
 
             ticket = _CleanupTicket(
                 operation=action,
@@ -1444,29 +1454,6 @@ class AsyncResultCollector:
             if not ticket.wait(max(0.0, deadline - time.monotonic())):
                 raise RuntimeError(timeout_message)
         return tuple(error for ticket in tickets for error in ticket.errors)
-
-    def _wait_slot_cleanup(
-        self,
-        slot_id: int,
-        *,
-        timeout_message: str,
-        initial_tickets: Sequence[_CleanupTicket] = (),
-    ) -> tuple[BaseException, ...]:
-        deadline = time.monotonic() + self._shutdown_timeout_s
-        observed = set(initial_tickets)
-        while True:
-            with self._cv:
-                tickets = tuple(self._cleanup_tickets_by_slot.get(int(slot_id), ()))
-            observed.update(tickets)
-            pending = [
-                ticket for ticket in observed if not ticket.wait(0) and not ticket.callback_owned_by_current_thread()
-            ]
-            if not pending:
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not pending[0].wait(remaining):
-                raise RuntimeError(timeout_message)
-        return tuple(error for ticket in observed for error in ticket.errors)
 
     def _run_event_loop(self) -> None:
         asyncio.set_event_loop(self._loop)

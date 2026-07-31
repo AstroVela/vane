@@ -163,7 +163,7 @@ TaskAdmission: TypeAlias = AdmissionLease
 
 
 class _TaskAdmissionCancellation:
-    """Durably drive one pre-submission lease cancellation to acknowledgement."""
+    """Durably drive one task-admission cancellation to acknowledgement."""
 
     def __init__(self, *, driver: Any, request: dict[str, Any]) -> None:
         self._driver = driver

@@ -19,7 +19,7 @@ _REQUIRED_CORE_WORKER_METHODS = (
 
 @dataclass(frozen=True)
 class RayStreamCleanupOperation:
-    """One non-blocking terminal transition driven by the collector loop."""
+    """One terminal transition scheduled by the collector and run off its loop."""
 
     operation: Callable[[], Any]
     retry_on_error: bool = False
@@ -38,7 +38,7 @@ def validate_ray_control_ack(response: Any, *, field: str) -> dict[str, Any]:
 
 
 def ray_object_ref_future(response_ref: Any) -> Any:
-    """Return the public concurrent Future used by the cleanup event loop."""
+    """Return the public concurrent Future used to observe a Ray control reply."""
     future_method = getattr(response_ref, "future", None)
     if not callable(future_method):
         raise TypeError("Ray control ObjectRef does not expose future()")

@@ -656,7 +656,10 @@ def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped(failure_ph
             def slot_has_pending(self, _slot_id):
                 global pending_checks
                 pending_checks += 1
-                return failure_phase == "pending" and pending_checks == 1
+                pending = failure_phase == "pending" and pending_checks == 1
+                if pending and self._wakeup is not None:
+                    self._wakeup()
+                return pending
 
             def retire_slot(self, _slot_id):
                 global retire_calls
@@ -774,6 +777,260 @@ def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped(failure_ph
             "VANE_ENABLE_UDF_TEST_HOOKS": "1",
             "VANE_TEST_COLLECTOR_FAILURE_PHASE": failure_phase,
             "VANE_UDF_UNREGISTER_TIMEOUT_MS": "50",
+        },
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_pending_ray_slot_cleanup_does_not_spin_or_block_healthy_slot():
+    """A remote cleanup ACK may delay its slot, never the process dispatcher."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        from __future__ import annotations
+
+        import threading
+        import time
+
+        import _duckdb
+        import duckdb
+        import duckdb.execution.udf as udf_exec
+        import duckdb.execution.udf_stream_result_collector as collector_mod
+        import pyarrow as pa
+        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+
+        state_lock = threading.Lock()
+        slow_tracked = threading.Event()
+        slow_cancel_started = threading.Event()
+        slow_retired = threading.Event()
+        collector_instance = None
+
+
+        class FakeSource:
+            def __init__(self, value):
+                self.value = int(value)
+
+
+        class FakeCollector:
+            def __init__(self):
+                global collector_instance
+                self._wakeup = None
+                self._slow_slot = None
+                self._pending = set()
+                self._cancelled = set()
+                self._events = {}
+                self.pending_checks = 0
+                collector_instance = self
+
+            def set_wakeup_callback(self, callback):
+                self._wakeup = callback
+
+            def track_generator_ref(self, slot_id, submit_id, source, _error_context):
+                slot_id = int(slot_id)
+                submit_id = int(submit_id)
+                if source.value == 1:
+                    with state_lock:
+                        self._slow_slot = slot_id
+                    slow_tracked.set()
+                    return
+                payload = make_local_shm_ref_bundle_result(pa.table({"y": [source.value]}))
+                with state_lock:
+                    self._events[slot_id] = [
+                        (
+                            slot_id,
+                            submit_id,
+                            "data",
+                            payload,
+                            "output-request:healthy",
+                            "output-lease:healthy",
+                        ),
+                        (slot_id, submit_id, "complete", None),
+                    ]
+                if self._wakeup is not None:
+                    self._wakeup()
+
+            def discard_generator_ref(self, _slot_id, _source):
+                return None
+
+            def drain_results(self, capacities):
+                results = []
+                with state_lock:
+                    for slot_id in list(self._events):
+                        if int(capacities.get(slot_id, {}).get("rows", 0)) <= 0:
+                            continue
+                        results.extend(self._events.pop(slot_id))
+                return results
+
+            def handoff_output_block_lease(self, _request_id, _lease_id):
+                return True
+
+            def release_output_block_lease(self, _request_id, _lease_id):
+                return True
+
+            def cancel_slot(self, slot_id):
+                slot_id = int(slot_id)
+                with state_lock:
+                    self._events.pop(slot_id, None)
+                    if slot_id == self._slow_slot and slot_id not in self._cancelled:
+                        self._cancelled.add(slot_id)
+                        self._pending.add(slot_id)
+                        slow_cancel_started.set()
+
+            def slot_has_pending(self, slot_id):
+                with state_lock:
+                    self.pending_checks += 1
+                    return int(slot_id) in self._pending
+
+            def retire_slot(self, slot_id):
+                if int(slot_id) == self._slow_slot:
+                    slow_retired.set()
+                return None
+
+            def release_slow_cleanup(self):
+                with state_lock:
+                    self._pending.discard(self._slow_slot)
+                    wakeup = self._wakeup
+                if wakeup is not None:
+                    wakeup()
+
+            def shutdown(self):
+                return None
+
+
+        class FakeExecutor:
+            def __init__(self):
+                self._wakeup = None
+                self._admission_state = "idle"
+                self._retained_input_bytes = 0
+
+            def register_wakeup(self, callback):
+                self._wakeup = callback
+
+            def request_task_admission(self, retained_input_bytes):
+                self._retained_input_bytes = int(retained_input_bytes)
+                self._admission_state = "ready"
+                return True
+
+            def task_admission_state(self):
+                return {
+                    "state": self._admission_state,
+                    "available": self._admission_state == "ready",
+                    "retained_input_bytes": self._retained_input_bytes,
+                }
+
+            def submit_with_id(self, _submit_id, table):
+                self._admission_state = "idle"
+                return FakeSource(table.column(0).to_pylist()[0])
+
+            def take_ready_result(self):
+                return None
+
+            def finished_submitting(self):
+                return None
+
+            def all_tasks_finished(self):
+                return False
+
+            def close(self):
+                return None
+
+
+        def build_executor(_payload, options=None):
+            del options
+            return FakeExecutor()
+
+
+        def passthrough(table):
+            return pa.table({"y": table.column(0)})
+
+
+        udf_exec.build_executor = build_executor
+        collector_mod.AsyncResultCollector = FakeCollector
+        slow_connection = duckdb.connect()
+        healthy_connection = duckdb.connect()
+        slow_relation = slow_connection.sql("select 1::BIGINT as x").map_batches(
+            passthrough,
+            schema={"y": duckdb.sqltypes.BIGINT},
+            execution_backend="ray_task",
+        )
+        healthy_relation = healthy_connection.sql("select 2::BIGINT as x").map_batches(
+            passthrough,
+            schema={"y": duckdb.sqltypes.BIGINT},
+            execution_backend="ray_task",
+        )
+        slow_errors = []
+
+
+        def run_slow():
+            try:
+                slow_relation.fetchall()
+            except BaseException as exc:
+                slow_errors.append(exc)
+
+
+        slow_thread = threading.Thread(target=run_slow)
+        slow_thread.start()
+        try:
+            assert slow_tracked.wait(timeout=5), "slow Ray slot was not tracked"
+            slow_connection.interrupt()
+            deadline = time.monotonic() + 5
+            while not slow_cancel_started.is_set() and time.monotonic() < deadline:
+                _duckdb._wake_udf_executor_slots_for_testing()
+                time.sleep(0.01)
+            assert slow_cancel_started.is_set(), "slow Ray slot never entered cleanup"
+
+            with state_lock:
+                checks_before_idle = collector_instance.pending_checks
+            time.sleep(0.1)
+            with state_lock:
+                idle_checks = collector_instance.pending_checks - checks_before_idle
+            assert idle_checks <= 1, f"pending cleanup busy-spun dispatcher: {idle_checks} checks"
+
+            healthy_result = []
+            healthy_errors = []
+
+            def run_healthy():
+                try:
+                    healthy_result.extend(healthy_relation.fetchall())
+                except BaseException as exc:
+                    healthy_errors.append(exc)
+
+            healthy_thread = threading.Thread(target=run_healthy)
+            healthy_thread.start()
+            healthy_thread.join(timeout=5)
+            assert not healthy_thread.is_alive(), "pending cleanup blocked the healthy Ray slot"
+            assert healthy_errors == [], healthy_errors
+            assert healthy_result == [(2,)], healthy_result
+            assert not slow_retired.is_set(), "slow slot retired before its cleanup ACK"
+
+            collector_instance.release_slow_cleanup()
+            assert slow_retired.wait(timeout=5), "cleanup ACK did not wake slot retirement"
+            slow_thread.join(timeout=5)
+            assert not slow_thread.is_alive(), "slow query did not finish after cleanup ACK"
+            assert slow_errors, "interrupted slow query unexpectedly succeeded"
+        finally:
+            if collector_instance is not None:
+                collector_instance.release_slow_cleanup()
+            slow_thread.join(timeout=5)
+            slow_connection.close()
+            healthy_connection.close()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env={
+            **os.environ,
+            "VANE_ENABLE_UDF_TEST_HOOKS": "1",
+            "VANE_UDF_UNREGISTER_TIMEOUT_MS": "5000",
         },
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr

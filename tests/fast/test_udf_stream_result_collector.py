@@ -712,7 +712,7 @@ def test_discarded_submitted_stream_enters_terminal_cleanup_ledger():
         collector.shutdown()
 
 
-def test_slot_retirement_waits_for_discarded_stream_cleanup():
+def test_slot_cancel_is_nonblocking_and_cleanup_completion_wakes_dispatcher():
     fake_ray = _FakeRay()
     driver = _Driver()
     cleanup_response = _Ref({"scheduled": True}, ready=False)
@@ -721,6 +721,8 @@ def test_slot_retirement_waits_for_discarded_stream_cleanup():
     )
     generator = _Generator([], completed=False)
     collector = AsyncResultCollector(ray_module=fake_ray)
+    cleanup_wakeup = threading.Event()
+    collector.set_wakeup_callback(cleanup_wakeup.set)
     collector.discard_generator_ref(
         9,
         _source(
@@ -730,30 +732,20 @@ def test_slot_retirement_waits_for_discarded_stream_cleanup():
             submitter=lambda _lease: generator,
         ),
     )
-    cancel_errors = []
-    cancel_thread = threading.Thread(
-        target=lambda: _capture_thread_error(
-            cancel_errors,
-            collector.cancel_slot,
-            9,
-        )
-    )
     try:
         assert collector.slot_has_pending(9)
-        cancel_thread.start()
-        time.sleep(0.05)
-        assert cancel_thread.is_alive()
+        started_at = time.monotonic()
+        collector.cancel_slot(9)
+        assert time.monotonic() - started_at < 0.1
+        assert collector.slot_has_pending(9)
 
+        cleanup_wakeup.clear()
         cleanup_response.ready = True
-        cancel_thread.join(timeout=2)
-
-        assert not cancel_thread.is_alive()
-        assert cancel_errors == []
-        assert not collector.slot_has_pending(9)
+        assert cleanup_wakeup.wait(timeout=2)
+        _wait_until(lambda: not collector.slot_has_pending(9))
         collector.retire_slot(9)
     finally:
         cleanup_response.ready = True
-        cancel_thread.join(timeout=2)
         collector.shutdown()
 
 
@@ -888,6 +880,47 @@ def test_cleanup_ticket_rejects_a_broken_future_callback_contract():
         with collector._cv:
             assert collector._cleanup_tickets == set()
     finally:
+        collector.shutdown()
+
+
+def test_slot_retirement_reports_async_cancellation_ticket_failure():
+    operation_started = threading.Event()
+    allow_operation = threading.Event()
+
+    class _BrokenFuture:
+        def add_done_callback(self, _callback):
+            raise RuntimeError("planned slot cleanup callback registration failure")
+
+        def done(self):
+            return False
+
+        def result(self):
+            raise AssertionError("broken Future must never be resolved")
+
+    def broken_cleanup():
+        operation_started.set()
+        assert allow_operation.wait(timeout=2)
+        return _BrokenFuture()
+
+    collector = AsyncResultCollector(ray_module=_FakeRay())
+    collector._submit_cleanup_operations(
+        (RayStreamCleanupOperation(broken_cleanup, retry_on_error=True),),
+        store_error=False,
+        slot_ids=(7,),
+    )
+    try:
+        assert operation_started.wait(timeout=1)
+        collector.cancel_slot(7)
+        assert collector.slot_has_pending(7)
+
+        allow_operation.set()
+        _wait_until(lambda: not collector.slot_has_pending(7))
+        cleanup_error = collector.retire_slot(7)
+
+        assert cleanup_error is not None
+        assert "planned slot cleanup callback registration failure" in cleanup_error
+    finally:
+        allow_operation.set()
         collector.shutdown()
 
 
@@ -1363,17 +1396,17 @@ def test_slot_cancel_reuses_an_already_claimed_output_release_ticket():
         _wait_until(lambda: len(driver.release_query_output_block_lease.calls) == 1)
 
         cancel_thread.start()
-        time.sleep(0.05)
-        assert cancel_thread.is_alive()
+        cancel_thread.join(timeout=0.5)
+        assert cancel_thread.is_alive() is False
+        assert cancel_errors == []
+        assert collector.slot_has_pending(token.slot_id)
         assert len(driver.release_query_output_block_lease.calls) == 1
 
         release_response.ready = True
-        cancel_thread.join(timeout=2)
+        _wait_until(lambda: not collector.slot_has_pending(token.slot_id))
 
-        assert cancel_thread.is_alive() is False
-        assert cancel_errors == []
         assert len(driver.release_query_output_block_lease.calls) == 1
-        assert collector.slot_has_pending(token.slot_id) is False
+        collector.retire_slot(token.slot_id)
     finally:
         release_response.ready = True
         cancel_thread.join(timeout=2)
@@ -1807,7 +1840,7 @@ def test_blocked_terminal_retirement_does_not_stall_healthy_stream(monkeypatch):
         collector.shutdown()
 
 
-def test_slot_cancel_waits_for_already_claimed_terminal_retirement(monkeypatch):
+def test_slot_cancel_observes_claimed_terminal_retirement_without_waiting(monkeypatch):
     fake_ray = _FakeRay()
     driver = _Driver()
     retire_started = threading.Event()
@@ -1846,22 +1879,18 @@ def test_slot_cancel_waits_for_already_claimed_terminal_retirement(monkeypatch):
     collector.drain_results({4: {"rows": 0, "bytes": 0, "item_bytes": 0}})
     assert retire_started.wait(timeout=1)
 
-    cancel_errors = []
-    cancel_thread = threading.Thread(target=lambda: _capture_thread_error(cancel_errors, collector.cancel_slot, 4))
     try:
-        cancel_thread.start()
-        time.sleep(0.05)
-        assert cancel_thread.is_alive()
+        started_at = time.monotonic()
+        collector.cancel_slot(4)
+        assert time.monotonic() - started_at < 0.1
+        assert collector.slot_has_pending(4)
 
         retirement.set_result(None)
-        cancel_thread.join(timeout=2)
-        assert cancel_thread.is_alive() is False
-        assert cancel_errors == []
-        assert collector.slot_has_pending(4) is False
+        _wait_until(lambda: not collector.slot_has_pending(4))
+        collector.retire_slot(4)
     finally:
         if not retirement.done():
             retirement.set_result(None)
-        cancel_thread.join(timeout=2)
         collector.shutdown()
 
 
@@ -2004,8 +2033,9 @@ def test_output_grant_transition_is_atomic_with_slot_cancellation():
         assert cancel_thread.is_alive() is False
         assert transition_errors == []
         assert cancel_errors == []
+        _wait_until(lambda: not collector.slot_has_pending(record.slot_id))
         assert len(driver.release_query_output_block_lease.calls) == 1
-        assert collector.slot_has_pending(record.slot_id) is False
+        collector.retire_slot(record.slot_id)
     finally:
         allow_result.set()
         transition_thread.join(timeout=2)
@@ -2768,6 +2798,7 @@ def test_many_cancellations_complete_on_the_cleanup_event_loop():
 
     try:
         collector.cancel_slot(18)
+        _wait_until(lambda: not collector.slot_has_pending(18))
 
         assert driver.cancel_query_task_lease_request.calls == []
         assert len(driver.release_query_task_lease_after_completion.calls) == len(generators)
@@ -2816,6 +2847,7 @@ def test_pending_output_control_futures_do_not_withhold_task_or_stream_cleanup()
     )
     try:
         collector.cancel_slot(72)
+        _wait_until(lambda: not collector.slot_has_pending(72))
 
         assert fake_ray.cancel_calls == [
             (generator, {"force": True, "recursive": True}),
@@ -2890,6 +2922,7 @@ def test_slot_cancellation_recursively_cancels_stream_and_releases_output_lease(
         )
         assert events[0][2] == "data"
         collector.cancel_slot(6)
+        _wait_until(lambda: not collector.slot_has_pending(6))
         assert fake_ray.cancel_calls
         assert fake_ray.cancel_calls[-1][1] == {"force": True, "recursive": True}
         assert len(driver.release_query_output_block_lease.calls) == 1
