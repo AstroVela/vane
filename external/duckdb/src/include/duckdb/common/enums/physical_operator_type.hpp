@@ -141,6 +141,7 @@ enum class PhysicalOperatorType : uint8_t {
 	VLLM_PROJECT,
 	REPARTITION,
 	STREAMING_UDF,
+	GROUPING_SET_EXPAND,
 };
 
 string PhysicalOperatorToString(PhysicalOperatorType type);

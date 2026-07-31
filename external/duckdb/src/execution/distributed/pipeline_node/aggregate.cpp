@@ -246,9 +246,18 @@ SchemaRef MakeSchemaFromTypes(const std::vector<LogicalType> &types, const Schem
 AggregateNode::AggregateNode(NodeID node_id, const PlanConfig &plan_config, std::vector<BoundExprRef> group_by,
                              std::vector<BoundAggExprRef> aggs, SchemaRef output_schema,
                              DistributedPipelineNodeRef child)
+    : AggregateNode(node_id, plan_config, std::move(group_by), std::move(aggs), std::move(output_schema),
+                    std::move(child), {}, {}) {
+}
+
+AggregateNode::AggregateNode(NodeID node_id, const PlanConfig &plan_config, std::vector<BoundExprRef> group_by,
+                             std::vector<BoundAggExprRef> aggs, SchemaRef output_schema,
+                             DistributedPipelineNodeRef child, std::vector<GroupingSet> grouping_sets,
+                             std::vector<std::vector<idx_t>> grouping_functions)
     : config_(output_schema, plan_config.config, child ? child->config().clustering_spec() : ClusteringSpecRef()),
       context_(plan_config.query_idx, plan_config.query_id, node_id, AggregateNode::node_name(group_by)),
-      node_id_(node_id), group_by_(std::move(group_by)), aggs_(std::move(aggs)), child_(std::move(child)) {
+      node_id_(node_id), group_by_(std::move(group_by)), aggs_(std::move(aggs)), child_(std::move(child)),
+      grouping_sets_(std::move(grouping_sets)), grouping_functions_(std::move(grouping_functions)) {
 }
 
 NodeName AggregateNode::node_name(const std::vector<BoundExprRef> &group_by) {
@@ -286,7 +295,9 @@ SubmittableTaskStream<WorkerTask> AggregateNode::produce_tasks(PlanExecutionCont
 		    auto plan = input; // base scan plan
 		    Allocator &alloc = Allocator::DefaultAllocator();
 
-		    if (self->group_by_.empty()) {
+		    const bool use_hash_aggregate =
+		        !self->group_by_.empty() || !self->grouping_sets_.empty() || !self->grouping_functions_.empty();
+		    if (!use_hash_aggregate) {
 			    // Un-grouped aggregate
 			    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> agg_exprs;
 			    duckdb::vector<duckdb::LogicalType> out_types;
@@ -329,6 +340,18 @@ SubmittableTaskStream<WorkerTask> AggregateNode::produce_tasks(PlanExecutionCont
 				    types.push_back(g->return_type);
 			    for (auto &a : agg_exprs)
 				    types.push_back(a->return_type);
+			    types.resize(types.size() + self->grouping_functions_.size(), LogicalType::BIGINT);
+
+			    duckdb::vector<GroupingSet> grouping_sets;
+			    grouping_sets.reserve(self->grouping_sets_.size());
+			    for (const auto &grouping_set : self->grouping_sets_) {
+				    grouping_sets.push_back(grouping_set);
+			    }
+			    duckdb::vector<unsafe_vector<idx_t>> grouping_functions;
+			    grouping_functions.reserve(self->grouping_functions_.size());
+			    for (const auto &grouping_function : self->grouping_functions_) {
+				    grouping_functions.emplace_back(grouping_function.begin(), grouping_function.end());
+			    }
 
 			    idx_t estimated_cardinality = 0;
 			    // `plan` is a dependent type, so use `template` to disambiguate the
@@ -336,7 +359,9 @@ SubmittableTaskStream<WorkerTask> AggregateNode::produce_tasks(PlanExecutionCont
 			    // type `duckdb::PhysicalHashAggregate` is visible.
 			    auto &old_root = plan->Root();
 			    auto &hash_agg = plan->template Make<duckdb::PhysicalHashAggregate>(
-			        *client, types, std::move(agg_exprs), std::move(group_exprs), estimated_cardinality);
+			        *client, types, std::move(agg_exprs), std::move(group_exprs), std::move(grouping_sets),
+			        std::move(grouping_functions), estimated_cardinality, TupleDataValidityType::CAN_HAVE_NULL_VALUES,
+			        TupleDataValidityType::CAN_HAVE_NULL_VALUES);
 			    hash_agg.children.push_back(old_root);
 			    plan->SetRoot(hash_agg);
 			    return plan;

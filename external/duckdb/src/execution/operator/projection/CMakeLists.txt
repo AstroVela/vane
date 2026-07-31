@@ -10,6 +10,7 @@ add_library_unity(
   duckdb_operator_projection
   OBJECT
   physical_projection.cpp
+  physical_grouping_set_expand.cpp
   physical_tableinout_function.cpp
   physical_pivot.cpp
   physical_unnest.cpp

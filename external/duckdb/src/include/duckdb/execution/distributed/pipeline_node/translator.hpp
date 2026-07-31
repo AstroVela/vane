@@ -109,6 +109,12 @@ private:
 	                                                       SchemaRef output_schema,
 	                                                       const std::vector<BoundExpr> &partition_by);
 
+	std::shared_ptr<DistributedPipelineNode>
+	gen_grouping_sets_agg(std::shared_ptr<DistributedPipelineNode> input_node, const std::vector<BoundExpr> &group_by,
+	                      const std::vector<BoundAggExpr> &aggregations, const std::vector<GroupingSet> &grouping_sets,
+	                      const std::vector<std::vector<idx_t>> &grouping_functions,
+	                      const std::vector<LogicalType> &input_types, SchemaRef output_schema);
+
 	// 生成 gather 节点（使用 RepartitionNode with num_partitions=1）
 	std::shared_ptr<DistributedPipelineNode> gen_gather_node(std::shared_ptr<DistributedPipelineNode> input_node);
 

@@ -13,6 +13,7 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/aggregate_hashtable.hpp"
 #include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
+#include "duckdb/function/function_binder.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parallel/base_pipeline_event.hpp"
 #include "duckdb/parallel/interrupt.hpp"
@@ -949,7 +950,24 @@ InsertionOrderPreservingMap<string> PhysicalHashAggregate::ParamsToString() cons
 
 void PhysicalHashAggregate::SerializeOperatorData(Serializer &serializer) const {
 	serializer.WriteProperty(103, "groups", grouped_aggregate_data.groups);
-	serializer.WriteProperty(104, "aggregates", grouped_aggregate_data.aggregates);
+	vector<unique_ptr<Expression>> aggregates;
+	aggregates.reserve(grouped_aggregate_data.aggregates.size());
+	for (const auto &expression : grouped_aggregate_data.aggregates) {
+		auto &aggregate = expression->Cast<BoundAggregateExpression>();
+		unique_ptr<Expression> copy = FunctionBinder::UnbindSortedAggregate(aggregate);
+		if (aggregate.filter) {
+			auto filter_index = filter_indexes.find(aggregate.filter.get());
+			if (filter_index == filter_indexes.end()) {
+				throw InternalException("hash aggregate filter is missing its input index");
+			}
+			auto &copied_filter = copy->Cast<BoundAggregateExpression>().filter->Cast<BoundReferenceExpression>();
+			copied_filter.index = filter_index->second;
+		}
+		aggregates.push_back(std::move(copy));
+	}
+	serializer.WriteProperty(104, "aggregates", aggregates);
+	serializer.WriteProperty(105, "grouping_sets", grouping_sets);
+	serializer.WriteProperty(106, "grouping_functions", grouped_aggregate_data.grouping_functions);
 }
 
 } // namespace duckdb

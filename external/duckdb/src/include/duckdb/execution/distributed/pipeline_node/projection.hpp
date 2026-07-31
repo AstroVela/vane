@@ -18,10 +18,13 @@ namespace distributed {
 class ProjectionNode : public PipelineNodeImpl, public std::enable_shared_from_this<ProjectionNode> {
 public:
 	ProjectionNode(NodeID node_id, PipelineNodeRef child, std::vector<ExpressionRef> projection,
-	               std::vector<std::string> projection_names, SchemaRef schema)
+	               std::vector<std::string> projection_names, SchemaRef schema,
+	               ClusteringSpecRef clustering_override = nullptr)
 	    : ctx_(InheritPipelineNodeContext(child, node_id, "Projection")),
 	      config_(std::move(schema), child ? child->config().execution_config() : DuckDBExecutionConfigRef(),
-	              child ? child->config().clustering_spec() : ClusteringSpec::unknown_with_num_partitions(1)),
+	              clustering_override
+	                  ? std::move(clustering_override)
+	                  : (child ? child->config().clustering_spec() : ClusteringSpec::unknown_with_num_partitions(1))),
 	      child_(std::move(child)), projection_(std::move(projection)), projection_names_(std::move(projection_names)) {
 	}
 
