@@ -30,6 +30,8 @@ class MetaPipeline;
 class PipelineExecutor;
 class Pipeline;
 
+enum class PipelineExecutionMode : uint8_t { DATA_CHUNK, EXECUTION_BATCH };
+
 class PipelineTask : public ExecutorTask {
 	static constexpr const idx_t PARTIAL_CHUNK_COUNT = 50;
 
@@ -129,6 +131,9 @@ public:
 	//! Returns whether any of the operators in the pipeline care about preserving order
 	bool IsOrderDependent() const;
 
+	//! Returns the representation selected for data flowing through this pipeline.
+	PipelineExecutionMode GetExecutionMode() const;
+
 	//! Registers a new batch index for a pipeline executor - returns the current minimum batch index
 	idx_t RegisterNewBatchIndex();
 
@@ -156,6 +161,8 @@ private:
 	vector<reference<PhysicalOperator>> operators;
 	//! The sink (i.e. destination) for data; this is e.g. a hash table to-be-built
 	optional_ptr<PhysicalOperator> sink;
+	//! The representation selected from the requirements of the source, intermediate operators, and sink.
+	PipelineExecutionMode execution_mode = PipelineExecutionMode::DATA_CHUNK;
 
 	//! The global source state
 	unique_ptr<GlobalSourceState> source_state;
@@ -176,6 +183,7 @@ private:
 	multiset<idx_t> batch_indexes;
 
 private:
+	void ResolveExecutionMode();
 	void ScheduleSequentialTask(shared_ptr<Event> &event);
 	bool LaunchScanTasks(shared_ptr<Event> &event, idx_t max_threads);
 

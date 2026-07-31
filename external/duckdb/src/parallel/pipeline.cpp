@@ -305,6 +305,31 @@ void Pipeline::Ready() {
 	}
 	ready = true;
 	std::reverse(operators.begin(), operators.end());
+	ResolveExecutionMode();
+}
+
+void Pipeline::ResolveExecutionMode() {
+	execution_mode = PipelineExecutionMode::DATA_CHUNK;
+	if (source &&
+	    source->GetExecutionBatchRequirement(PipelineOperatorRole::SOURCE) == ExecutionBatchRequirement::REQUIRED) {
+		execution_mode = PipelineExecutionMode::EXECUTION_BATCH;
+		return;
+	}
+	for (auto &op_ref : operators) {
+		if (op_ref.get().GetExecutionBatchRequirement(PipelineOperatorRole::INTERMEDIATE) ==
+		    ExecutionBatchRequirement::REQUIRED) {
+			execution_mode = PipelineExecutionMode::EXECUTION_BATCH;
+			return;
+		}
+	}
+	if (sink && sink->GetExecutionBatchRequirement(PipelineOperatorRole::SINK) == ExecutionBatchRequirement::REQUIRED) {
+		execution_mode = PipelineExecutionMode::EXECUTION_BATCH;
+	}
+}
+
+PipelineExecutionMode Pipeline::GetExecutionMode() const {
+	D_ASSERT(ready);
+	return execution_mode;
 }
 
 void Pipeline::AddDependency(shared_ptr<Pipeline> &pipeline) {

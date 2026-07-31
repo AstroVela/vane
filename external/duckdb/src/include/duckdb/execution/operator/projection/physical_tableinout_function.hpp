@@ -75,6 +75,8 @@ public:
 		return function.order_preservation_type;
 	}
 
+	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole role) const override;
+
 private:
 	//! The table function
 	TableFunction function;
