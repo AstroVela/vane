@@ -289,6 +289,7 @@ class FteRegistryState:
     registry_condition: Any = field(init=False)
     fragment_execution_ids: dict[tuple[str, str], int] = field(default_factory=dict)
     query_next_fragment_execution_id: dict[str, int] = field(default_factory=dict)
+    stable_task_identity_keys_by_resource_query: dict[str, dict[int, str]] = field(default_factory=dict)
     fragment_executions: dict[tuple[str, str], FteFragmentExecution] = field(default_factory=dict)
     fragment_progress_topologies: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
     fragment_progress_topology_builds: set[tuple[str, str]] = field(default_factory=set)
@@ -336,6 +337,7 @@ _FTE_REGISTRY_LOCK = _FTE_REGISTRY_STATE.registry_lock
 _FTE_REGISTRY_CONDITION = _FTE_REGISTRY_STATE.registry_condition
 _FTE_FRAGMENT_EXECUTION_IDS = _FTE_REGISTRY_STATE.fragment_execution_ids
 _FTE_QUERY_NEXT_FRAGMENT_EXECUTION_ID = _FTE_REGISTRY_STATE.query_next_fragment_execution_id
+_FTE_STABLE_TASK_IDENTITY_KEYS_BY_RESOURCE_QUERY = _FTE_REGISTRY_STATE.stable_task_identity_keys_by_resource_query
 _FTE_FRAGMENT_EXECUTIONS = _FTE_REGISTRY_STATE.fragment_executions
 _FTE_FRAGMENT_PROGRESS_TOPOLOGIES = _FTE_REGISTRY_STATE.fragment_progress_topologies
 _FTE_FRAGMENT_PROGRESS_TOPOLOGY_BUILDS = _FTE_REGISTRY_STATE.fragment_progress_topology_builds
@@ -383,6 +385,7 @@ __all__ = [
     "_FTE_SEQUENCES",
     "_FTE_STAGE_SUBMISSION_BLOCKS",
     "_FTE_STAGE_SUBMISSION_PROBES",
+    "_FTE_STABLE_TASK_IDENTITY_KEYS_BY_RESOURCE_QUERY",
     "_FTE_STATUS_WATCHERS",
     "_FTE_WORKER_HANDLES",
     "_FTE_WORKER_RESERVATION_GENERATIONS",

@@ -29,6 +29,7 @@
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/operator/projection/physical_unnest.hpp"
+#include "duckdb/execution/operator/helper/physical_distributed_reservoir_sample.hpp"
 #include "duckdb/execution/operator/helper/physical_reservoir_sample.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_sample.hpp"
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
@@ -814,6 +815,13 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		return make_uniq<PhysicalReservoirSample>(physical_plan, std::move(types), std::move(options),
 		                                          estimated_cardinality);
 	}
+	case PhysicalOperatorType::DISTRIBUTED_RESERVOIR_SAMPLE: {
+		auto options = deserializer.ReadProperty<unique_ptr<SampleOptions>>(103, "sample_options");
+		auto stage = static_cast<DistributedReservoirSampleStage>(deserializer.ReadProperty<uint8_t>(104, "stage"));
+		auto task_index = deserializer.ReadProperty<idx_t>(105, "task_index");
+		return make_uniq<PhysicalDistributedReservoirSample>(physical_plan, std::move(types), std::move(options), stage,
+		                                                     task_index, estimated_cardinality);
+	}
 	case PhysicalOperatorType::STREAMING_SAMPLE: {
 		auto options = deserializer.ReadProperty<unique_ptr<SampleOptions>>(103, "sample_options");
 		return make_uniq<PhysicalStreamingSample>(physical_plan, std::move(types), std::move(options),
@@ -1181,6 +1189,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(113, "range_order_modifiers", {});
 		sink_handle.flight_server_epoch = deserializer.ReadProperty<string>(114, "flight_server_epoch");
 		sink_handle.query_id = deserializer.ReadProperty<string>(115, "query_id");
+		sink_handle.fte_task_identity = deserializer.ReadPropertyWithDefault<bool>(116, "fte_task_identity");
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.local_dirs = std::vector<std::string>(local_dirs.begin(), local_dirs.end());
@@ -1214,6 +1223,8 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 			throw SerializationException("remote exchange source requires explicit catalog handles");
 		}
 		auto source_handle_flight_hosts = deserializer.ReadProperty<vector<string>>(116, "source_handle_flight_hosts");
+		auto source_handle_task_partition_ids =
+		    deserializer.ReadProperty<vector<idx_t>>(117, "source_handle_task_partition_ids");
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.node_id = distributed::ResolveFlightExchangeNodeIdFromEnv();
@@ -1227,13 +1238,15 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		    source_handle_partition_ids.size() != source_handle_flight_ports.size() ||
 		    source_handle_partition_ids.size() != source_handle_attempt_ids.size() ||
 		    source_handle_partition_ids.size() != source_handle_flight_server_epochs.size() ||
-		    source_handle_partition_ids.size() != source_handle_flight_hosts.size()) {
+		    source_handle_partition_ids.size() != source_handle_flight_hosts.size() ||
+		    source_handle_partition_ids.size() != source_handle_task_partition_ids.size()) {
 			throw SerializationException("remote exchange source handle metadata is inconsistent");
 		}
 		source_handles.reserve(source_handle_partition_ids.size());
 		for (idx_t i = 0; i < source_handle_partition_ids.size(); i++) {
 			distributed::ExchangeSourceHandle sh;
 			sh.partition_id = source_handle_partition_ids[i];
+			sh.source_task_partition_id = source_handle_task_partition_ids[i];
 			sh.attempt_id = source_handle_attempt_ids[i];
 			sh.node_id = source_handle_node_ids[i];
 			sh.flight_host = source_handle_flight_hosts[i];

@@ -247,8 +247,13 @@ class RayWorkerManagerBackend:
         for handle in self._adapt_handles(raw_handles or []):
             self._handles_by_query[str(query_id)].append(handle)
 
-    def fte_query_status(self, query_id: str) -> dict[str, Any]:
-        result = _required_method(self._coordinator, "fte_query_status")(str(query_id))
+    def fte_query_status(
+        self,
+        query_id: str,
+        task_context_filter: Sequence[Any] | None = None,
+    ) -> dict[str, Any]:
+        context_filter = None if task_context_filter is None else list(task_context_filter)
+        result = _required_method(self._coordinator, "fte_query_status")(str(query_id), context_filter)
         return _dict_result("fte_query_status", result)
 
     def wait_query(

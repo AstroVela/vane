@@ -8,7 +8,6 @@
 #include "duckdb/execution/distributed/plan/runner.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <limits>
 #include <unordered_set>
 
@@ -72,14 +71,15 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
                                               const PerTaskMaterializedPlanBuilderFactory &per_task_builder_factory,
                                               std::shared_ptr<FteTaskSubmitter> fte_task_submitter,
                                               ::duckdb::ClientContext *client_context,
-                                              std::shared_ptr<ExchangeManager> exchange_mgr) {
+                                              std::shared_ptr<ExchangeManager> exchange_mgr,
+                                              const SchemaRef &materialized_schema) {
 	if (!exchange_mgr) {
 		result_tx->close();
 		return DuckDBResult<void>::err(
 		    DuckDBError::invalid_state_error("materialized coordinator requires an ExchangeManager"));
 	}
 
-	auto types_res = ResolveSchemaTypes(node->config().schema());
+	auto types_res = ResolveSchemaTypes(materialized_schema ? materialized_schema : node->config().schema());
 	if (types_res.is_err()) {
 		result_tx->close();
 		return DuckDBResult<void>::err(types_res.error());
@@ -99,22 +99,21 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 		    DuckDBError::internal_error("materialized coordinator failed to create exchange"));
 	}
 	auto exchange = std::shared_ptr<Exchange>(exchange_unique.release());
-	auto sink_task_counter = std::make_shared<std::atomic<idx_t>>(0);
+	auto template_sink_handle = exchange->AddSink(0);
+	auto template_sink_instance = exchange->InstantiateSink(template_sink_handle, /*attempt_id=*/0);
+	template_sink_instance.fte_task_identity = true;
 
 	MaterializedPlanBuilder local_plan_builder;
 	if (per_task_builder_factory) {
 		local_plan_builder = per_task_builder_factory(0);
 	}
 
-	auto sink_plan_builder = [local_plan_builder, exchange, exchange_mgr, exchange_id, sink_task_counter,
+	auto sink_plan_builder = [local_plan_builder, exchange_mgr, exchange_id, template_sink_instance,
 	                          num_partitions](DuckPhysicalPlanRef plan) -> DuckPhysicalPlanRef {
 		if (local_plan_builder) {
 			plan = local_plan_builder(std::move(plan));
 		}
-		auto task_partition_id = sink_task_counter->fetch_add(1);
-		auto sink_handle = exchange->AddSink(task_partition_id);
-		auto sink_instance = exchange->InstantiateSink(sink_handle, /*attempt_id=*/0);
-		return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, num_partitions, exchange_id, sink_instance,
+		return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, num_partitions, exchange_id, template_sink_instance,
 		                                 exchange_mgr);
 	};
 
@@ -159,7 +158,9 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 
 	TaskContext task_context =
 	    TaskContext::from_node_context(node->context().query_idx(), node->node_id(), task_id_counter->next());
-	WorkerTask final_task(task_context, final_plan, node->config().execution_config(), node->context().to_hashmap());
+	auto final_task_context = node->context().to_hashmap();
+	final_task_context["stable_task_partition_id"] = "0";
+	WorkerTask final_task(task_context, final_plan, node->config().execution_config(), std::move(final_task_context));
 
 	auto send_result = result_tx->send(SubmittableTask<WorkerTask>(std::move(final_task)));
 	result_tx->close();
@@ -186,7 +187,7 @@ bool ChildHasMultiplePartitions(const PipelineNodeRef &child) {
 SubmittableTaskStream<WorkerTask> ProduceWithMaterializedCoordinator(
     PlanExecutionContext &plan_context, const PipelineNodeRef &child, const std::shared_ptr<PipelineNodeImpl> &node,
     MaterializedPlanBuilder final_plan_builder, PerTaskMaterializedPlanBuilderFactory per_task_builder_factory,
-    std::shared_ptr<ExchangeManager> exchange_mgr) {
+    std::shared_ptr<ExchangeManager> exchange_mgr, SchemaRef materialized_schema) {
 	auto input_stream = child->produce_tasks(plan_context);
 
 	auto channel_pair = create_channel<SubmittableTask<WorkerTask>>(1);
@@ -199,14 +200,15 @@ SubmittableTaskStream<WorkerTask> ProduceWithMaterializedCoordinator(
 	auto final_plan_builder_ptr = std::make_shared<MaterializedPlanBuilder>(std::move(final_plan_builder));
 	auto per_task_builder_factory_ptr =
 	    std::make_shared<PerTaskMaterializedPlanBuilderFactory>(std::move(per_task_builder_factory));
+	auto materialized_schema_ptr = std::make_shared<SchemaRef>(std::move(materialized_schema));
 	auto fte_task_submitter = plan_context.fte_task_submitter_ref();
 
 	plan_context.spawn([node, input_stream_ptr, result_tx_ptr, task_id_counter, final_plan_builder_ptr,
-	                    per_task_builder_factory_ptr, fte_task_submitter, client_context,
-	                    exchange_mgr]() mutable -> DuckDBResult<void> {
+	                    per_task_builder_factory_ptr, fte_task_submitter, client_context, exchange_mgr,
+	                    materialized_schema_ptr]() mutable -> DuckDBResult<void> {
 		return RunMaterializedCoordinator(node, input_stream_ptr, result_tx_ptr, task_id_counter,
 		                                  *final_plan_builder_ptr, *per_task_builder_factory_ptr, fte_task_submitter,
-		                                  client_context, exchange_mgr);
+		                                  client_context, exchange_mgr, *materialized_schema_ptr);
 	});
 
 	return SubmittableTaskStream<WorkerTask>::from_receiver(std::move(result_rx));

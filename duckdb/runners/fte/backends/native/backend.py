@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import inspect
+import json
 import math
 import os
 import sys
@@ -24,6 +26,7 @@ from duckdb.runners.fte.dynamic_inputs import (
     strip_fte_dynamic_context,
 )
 from duckdb.runners.fte.fte_config import FTE_WORKER_RUNTIME, FteWorkerAdmissionConfig
+from duckdb.runners.fte.fte_exchange import derive_exchange_sink_instance_for_attempt
 from duckdb.runners.fte.fte_failures import _failure_payload, _normalize_failure_payload
 from duckdb.runners.fte.fte_state import FteTaskState
 from duckdb.runners.fte.fte_types import (
@@ -48,6 +51,124 @@ _FRAGMENT_STAT_KEYS = (
     "executor_admission_limited",
     "executor_reserved_memory_bytes",
 )
+
+_NATIVE_STABLE_TASK_IDENTITY_KEY = "_native_stable_task_identity_key"
+_NATIVE_STABLE_TASK_IDENTITY_MASK = (1 << 63) - 1
+
+
+def _stable_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"bytes": bytes(value).hex()}
+    if isinstance(value, Mapping):
+        return {
+            str(key): _stable_json_value(item) for key, item in sorted(value.items(), key=lambda entry: str(entry[0]))
+        }
+    if isinstance(value, Sequence):
+        return [_stable_json_value(item) for item in value]
+    raise TypeError(f"unsupported stable native FTE identity value: {type(value).__name__}")
+
+
+def _exchange_source_logical_identity(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        partition_indices = [int(item) for item in value.get("partition_indices") or ()]
+        source_task_partition_ids = value.get("source_task_partition_ids")
+        if source_task_partition_ids is None:
+            handles = value.get("source_handles") or ()
+            source_task_partition_ids = [
+                handle.get("source_task_partition_id")
+                for handle in handles
+                if isinstance(handle, Mapping) and handle.get("source_task_partition_id") is not None
+            ]
+        source_task_partition_ids = sorted({int(item) for item in source_task_partition_ids or ()})
+        source_partition_count = int(value.get("source_partition_count") or 0)
+        source_task_count = int(value.get("source_task_count") or 0)
+        replicated = bool(value.get("replicated"))
+    else:
+        import duckdb
+
+        metadata = dict(duckdb.ray_cxx.exchange_source_task_logical_identity(value))
+        partition_indices = [int(item) for item in metadata.get("partition_indices") or ()]
+        source_task_partition_ids = sorted({int(item) for item in metadata.get("source_task_partition_ids") or ()})
+        source_partition_count = int(metadata.get("source_partition_count") or 0)
+        source_task_count = int(metadata.get("source_task_count") or 0)
+        replicated = bool(metadata.get("replicated"))
+
+    if not source_task_partition_ids:
+        raise ValueError("exchange source task is missing stable source task partition identities")
+    if not partition_indices:
+        raise ValueError("exchange source task is missing partition indices for stable task identity")
+    return {
+        "partition_indices": partition_indices,
+        "source_task_partition_ids": source_task_partition_ids,
+        "source_partition_count": source_partition_count,
+        "source_task_count": source_task_count,
+        "replicated": replicated,
+    }
+
+
+def _stable_native_fte_task_identity(
+    task_inputs: Mapping[Any, Any],
+    task_context_info: Mapping[str, Any],
+    context: Mapping[str, Any],
+) -> tuple[int, str]:
+    logical_inputs: list[Any] = []
+    for node_id, raw_entry in sorted(task_inputs.items(), key=lambda entry: str(entry[0])):
+        if not isinstance(raw_entry, Mapping):
+            raise TypeError("native FTE task inputs must be mappings")
+        kind = str(raw_entry.get("kind") or "")
+        data = raw_entry.get("data")
+        if kind == "scan_task":
+            if isinstance(data, (bytes, bytearray, memoryview)):
+                import duckdb
+
+                source_task_partition_id = int(duckdb.ray_cxx.scan_task_source_partition_id(bytes(data)))
+                scan_descriptor_identity = hashlib.blake2b(bytes(data), digest_size=32).hexdigest()
+            elif isinstance(data, Mapping):
+                raw_source_task_partition_id = data.get("source_task_partition_id")
+                if raw_source_task_partition_id is None:
+                    raise ValueError("scan task is missing its stable source task partition identity")
+                source_task_partition_id = int(raw_source_task_partition_id)
+                scan_descriptor_identity = _stable_json_value(data)
+            else:
+                raise TypeError("native FTE scan task data must be serialized bytes or a mapping")
+            logical_inputs.append(
+                [
+                    str(node_id),
+                    kind,
+                    {
+                        "source_task_partition_id": source_task_partition_id,
+                        "descriptor": scan_descriptor_identity,
+                    },
+                ]
+            )
+        elif kind == "exchange_source_task":
+            logical_inputs.append([str(node_id), kind, _exchange_source_logical_identity(data)])
+        else:
+            raise ValueError(f"unsupported native FTE task input kind: {kind!r}")
+
+    lineage = {
+        "last_node_id": int(task_context_info.get("last_node_id") or 0),
+        "node_ids": [int(node_id) for node_id in task_context_info.get("node_ids") or ()],
+    }
+    if not logical_inputs:
+        stable_partition_id = context.get("stable_task_partition_id")
+        if stable_partition_id is None:
+            stable_partition_id = task_context_info.get("task_id")
+        lineage["source_free_task_id"] = int(stable_partition_id or 0)
+    identity_key = json.dumps(
+        ["native-fte-logical-task-v1", lineage, logical_inputs],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.blake2b(
+        identity_key.encode("utf-8"),
+        digest_size=8,
+        person=b"vane-fte-task-v1",
+    ).digest()
+    identity = int.from_bytes(digest, "big") & _NATIVE_STABLE_TASK_IDENTITY_MASK
+    return identity, identity_key
 
 
 async def _to_thread_with_owned_side_effects(
@@ -450,6 +571,29 @@ def _native_total_memory_bytes() -> int:
     return 0
 
 
+_TaskContextKey = tuple[int, int, int, tuple[int, ...]]
+_TASK_CONTEXT_FIELDS = ("query_idx", "last_node_id", "task_id", "node_ids")
+
+
+def _task_context_key(value: Any) -> _TaskContextKey | None:
+    if not isinstance(value, Mapping):
+        return None
+    if any(field not in value for field in _TASK_CONTEXT_FIELDS):
+        return None
+    try:
+        node_ids = tuple(int(node_id) for node_id in value["node_ids"])
+        if not node_ids:
+            return None
+        return (
+            int(value["query_idx"]),
+            int(value["last_node_id"]),
+            int(value["task_id"]),
+            node_ids,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def _task_context_info(task_context: Any) -> dict[str, Any]:
     if isinstance(task_context, Mapping):
         payload = dict(task_context)
@@ -847,6 +991,7 @@ class _NativeFteProgressRegistry:
         failed_partitions: Sequence[Mapping[str, Any]] | None = None,
         selected_attempt_task_ids: Sequence[str] | None = None,
         result_handle_count: int = 0,
+        task_context_filter: set[_TaskContextKey] | None = None,
     ) -> dict[str, Any]:
         query_id = str(query_id)
         partition_metrics = partition_metrics or {}
@@ -856,6 +1001,7 @@ class _NativeFteProgressRegistry:
         with self._lock:
             fragments = self._fragments_by_query.get(query_id, {})
             fragment_executions: dict[str, dict[str, Any]] = {}
+            global_failed = False
             for fragment_id, registered in fragments.items():
                 partitions: dict[str, dict[str, Any]] = {}
                 for partition_id, registered_partition in registered.partitions.items():
@@ -867,10 +1013,20 @@ class _NativeFteProgressRegistry:
                         registered_partition.last_metrics or self._placeholder_partition_metrics(registered_partition)
                     )
                     self._merge_fragment_progress_topology_locked(registered, metrics)
+                    global_failed = global_failed or str(metrics.get("state") or "").upper() == "FAILED"
+                    if task_context_filter is not None:
+                        request = registered_partition.request
+                        task_context = request.get("task_context_info")
+                        if task_context is None:
+                            task_context = request.get("task_context")
+                        if _task_context_key(task_context) not in task_context_filter:
+                            continue
                     partitions[partition_id] = metrics
                     if str(metrics.get("state") or "").upper() == "FINISHED":
                         selected_attempt_ids.add(str(registered_partition.task_id))
 
+                if not partitions:
+                    continue
                 partition_count = len(partitions)
                 running_count = sum(int(partition.get("running_count") or 0) for partition in partitions.values())
                 failed_count = sum(1 for partition in partitions.values() if partition.get("state") == "FAILED")
@@ -927,10 +1083,11 @@ class _NativeFteProgressRegistry:
         pending_submission_count = sum(
             fragment["pending_submission_count"] for fragment in fragment_executions.values()
         )
-        failed = failed_count > 0 or any(fragment["failed"] for fragment in fragment_executions.values())
+        failed = global_failed
         finished = bool(fragment_executions) and all(fragment["finished"] for fragment in fragment_executions.values())
         return {
             "query_id": query_id,
+            "matched": bool(fragment_executions),
             "fragment_execution_count": len(fragment_executions),
             "partition_count": partition_count,
             "running_count": running_count,
@@ -1373,6 +1530,8 @@ class NativeFteWorkerManagerBackend:
         self._next_worker_index = 0
         self._handles_by_query: dict[str, list[NativeTaskResultHandle]] = defaultdict(list)
         self._handles_lock = threading.RLock()
+        self._stable_task_identity_lock = threading.RLock()
+        self._stable_task_identity_keys_by_query: dict[str, dict[int, str]] = defaultdict(dict)
         self._dropped_queries: dict[str, dict[str, Any]] = {}
         self._progress_registry = _NativeFteProgressRegistry()
         self._closed = False
@@ -1427,6 +1586,7 @@ class NativeFteWorkerManagerBackend:
             worker_count=len(self._workers),
         )
         requests = [self._request_from_task(task) for task in tasks]
+        self._register_stable_task_identities(requests)
         for request in requests:
             self._dropped_queries.pop(_query_id_from_task_id(request.get("task_id")), None)
         self._progress_registry.register_requests(requests)
@@ -1765,8 +1925,18 @@ class NativeFteWorkerManagerBackend:
             "no_more_splits": list(status.get("no_more_splits") or []),
         }
 
-    def fte_query_status(self, query_id: str) -> dict[str, Any]:
+    def fte_query_status(
+        self,
+        query_id: str,
+        task_context_filter: Sequence[Any] | None = None,
+    ) -> dict[str, Any]:
         query_id = str(query_id)
+        scoped_contexts: set[_TaskContextKey] | None = None
+        if task_context_filter:
+            parsed_contexts = {_task_context_key(context) for context in task_context_filter}
+            if None in parsed_contexts:
+                raise ValueError("task_context_filter contains an invalid task context")
+            scoped_contexts = {context for context in parsed_contexts if context is not None}
         with self._handles_lock:
             handles = list(self._handles_by_query.get(query_id, []))
         dropped_query = self._dropped_queries.get(query_id)
@@ -1781,6 +1951,7 @@ class NativeFteWorkerManagerBackend:
                 "pending_submission_count": 0,
                 "failed": False,
                 "finished": False,
+                "matched": False,
                 "canceled": True,
                 "selected_attempt_task_ids": [],
                 "fragment_executions": {},
@@ -1792,6 +1963,7 @@ class NativeFteWorkerManagerBackend:
         selected_attempt_task_ids: list[str] = []
         failed_partitions: list[dict[str, Any]] = []
         for handle in handles:
+            context_matches = scoped_contexts is None or _task_context_key(handle.task_context_info) in scoped_contexts
             status_error: BaseException | None = None
             try:
                 status = handle.status_snapshot()
@@ -1805,7 +1977,7 @@ class NativeFteWorkerManagerBackend:
                 status_error = exc
             partition = self._partition_metrics_from_handle(handle, status, error=status_error)
             partition_metrics[(query_id, handle.fragment_id, str(handle.task_id.partition_id))] = partition
-            if partition["state"] == "FAILED":
+            if context_matches and partition["state"] == "FAILED":
                 failed_partitions.append(
                     {
                         "task_id": handle.fte_task_id(),
@@ -1814,14 +1986,19 @@ class NativeFteWorkerManagerBackend:
                         else str(status.get("failure")),
                     }
                 )
-            elif partition["state"] == "FINISHED":
+            elif context_matches and partition["state"] == "FINISHED":
                 selected_attempt_task_ids.append(handle.fte_task_id())
         return self._progress_registry.query_status(
             query_id,
             partition_metrics=partition_metrics,
             failed_partitions=failed_partitions,
             selected_attempt_task_ids=selected_attempt_task_ids,
-            result_handle_count=len(handles),
+            result_handle_count=sum(
+                1
+                for handle in handles
+                if scoped_contexts is None or _task_context_key(handle.task_context_info) in scoped_contexts
+            ),
+            task_context_filter=scoped_contexts,
         )
 
     def wait_fte_query(self, query_id: str, timeout_s: float = 0.0) -> dict[str, Any]:
@@ -1855,6 +2032,8 @@ class NativeFteWorkerManagerBackend:
         query_id = str(query_id)
         with self._handles_lock:
             self._handles_by_query.pop(query_id, None)
+        with self._stable_task_identity_lock:
+            self._stable_task_identity_keys_by_query.pop(query_id, None)
         worker_errors: list[str] = []
         try:
             self._progress_registry.drop_query(query_id)
@@ -2017,11 +2196,15 @@ class NativeFteWorkerManagerBackend:
         if not query_id:
             raise ValueError("native FTE worker task requires non-empty query_id")
         task_context_info = dict(task.task_context() or {})
-        partition_id = int(task_context_info.get("task_id") or context.get("task_id") or 0)
+        raw_partition_id = task_context_info.get("task_id")
+        if raw_partition_id is None:
+            raw_partition_id = context.get("task_id")
+        partition_id = int(raw_partition_id or 0)
         fragment_execution_id = int(context.get("fragment_execution_id") or 0)
         attempt_id = int(context.get("attempt_id") or 0)
+        task_inputs = dict(task.Inputs() or {})
 
-        for node_id, entry in dict(task.Inputs() or {}).items():
+        for node_id, entry in task_inputs.items():
             if not isinstance(entry, Mapping):
                 continue
             source_node_id = str(node_id)
@@ -2035,6 +2218,7 @@ class NativeFteWorkerManagerBackend:
                 raise ValueError(f"unsupported native FTE task input kind: {kind!r}")
 
         exchange_sink_instance = None
+        stable_task_identity_key = None
         exchange_sink_instance_fn = getattr(task, "exchange_sink_instance", None)
         if callable(exchange_sink_instance_fn):
             exchange_sink_instance = exchange_sink_instance_fn()
@@ -2043,6 +2227,40 @@ class NativeFteWorkerManagerBackend:
                     exchange_sink_instance = dict(exchange_sink_instance)
                 except (TypeError, ValueError):
                     pass
+                preserve_plan_sink_partition = str(
+                    context.get("preserve_plan_exchange_sink_instance") or ""
+                ).strip().lower() not in ("", "0", "false", "no", "off")
+                if preserve_plan_sink_partition and isinstance(exchange_sink_instance, Mapping):
+                    exchange_sink_instance = dict(exchange_sink_instance)
+                    # The inherited context can describe an upstream plan sink.
+                    # An appended materialized-coordinator sink carries its own
+                    # explicit FTE-derived identity policy.
+                    if not bool(exchange_sink_instance.get("fte_task_identity")):
+                        exchange_sink_instance["preserve_plan_exchange_sink_instance"] = True
+                stable_task_identity = None
+                runtime_task_partition_id = partition_id
+                preserve_plan_sink_identity = isinstance(exchange_sink_instance, Mapping) and bool(
+                    exchange_sink_instance.get("preserve_plan_exchange_sink_instance")
+                )
+                if isinstance(exchange_sink_instance, Mapping) and not preserve_plan_sink_identity:
+                    stable_task_identity, stable_task_identity_key = _stable_native_fte_task_identity(
+                        task_inputs,
+                        task_context_info,
+                        context,
+                    )
+                    runtime_task_partition_id = stable_task_identity
+                exchange_sink_instance = derive_exchange_sink_instance_for_attempt(
+                    exchange_sink_instance,
+                    attempt_id,
+                    task_partition_id=runtime_task_partition_id,
+                    fragment_execution_id=fragment_execution_id,
+                    stable_task_identity=(
+                        stable_task_identity
+                        if isinstance(exchange_sink_instance, Mapping)
+                        and bool(exchange_sink_instance.get("fte_task_identity"))
+                        else None
+                    ),
+                )
 
         node_name = str(context.get("node_name") or task.name() or "fragment")
         node_id = str(context.get("node_id") or task_context_info.get("last_node_id") or partition_id)
@@ -2071,7 +2289,7 @@ class NativeFteWorkerManagerBackend:
             initial_splits[split.source_node_id].append(split.to_dict())
         source_node_ids = prepared_inputs.dynamic_scan_sources | prepared_inputs.dynamic_exchange_sources
 
-        return {
+        request = {
             "query_id": query_id,
             "fragment_id": fragment_id,
             "task_id": FteTaskAttemptId(
@@ -2090,6 +2308,39 @@ class NativeFteWorkerManagerBackend:
             "exchange_sink_instance": exchange_sink_instance,
             "worker_runtime": FTE_WORKER_RUNTIME,
         }
+        if stable_task_identity_key is not None:
+            request[_NATIVE_STABLE_TASK_IDENTITY_KEY] = stable_task_identity_key
+        return request
+
+    def _register_stable_task_identities(self, requests: Sequence[dict[str, Any]]) -> None:
+        pending: list[tuple[str, int, str]] = []
+        for request in requests:
+            identity_key = request.pop(_NATIVE_STABLE_TASK_IDENTITY_KEY, None)
+            if identity_key is None:
+                continue
+            query_id = _query_id_from_task_id(request.get("task_id"))
+            exchange_sink_instance = request.get("exchange_sink_instance")
+            if not isinstance(exchange_sink_instance, Mapping):
+                raise ValueError("stable native FTE task identity requires an exchange sink instance")
+            stable_identity = exchange_sink_instance.get("task_partition_id")
+            if stable_identity is None:
+                raise ValueError("stable native FTE task identity was not bound to the exchange sink")
+            pending.append((query_id, int(stable_identity), str(identity_key)))
+
+        with self._stable_task_identity_lock:
+            validated: dict[tuple[str, int], str] = {}
+            for query_id, stable_identity, identity_key in pending:
+                registry_key = (query_id, stable_identity)
+                existing = validated.get(registry_key)
+                if existing is None:
+                    existing = self._stable_task_identity_keys_by_query.get(query_id, {}).get(stable_identity)
+                if existing is not None and existing != identity_key:
+                    raise ValueError(
+                        f"stable native FTE task identity collision for query={query_id} identity={stable_identity}"
+                    )
+                validated[registry_key] = identity_key
+            for (query_id, stable_identity), identity_key in validated.items():
+                self._stable_task_identity_keys_by_query[query_id][stable_identity] = identity_key
 
     @staticmethod
     def materialize_task_context(
@@ -2103,6 +2354,7 @@ class NativeFteWorkerManagerBackend:
 
     @staticmethod
     def _context_key(value: Any) -> Any:
-        if isinstance(value, Mapping):
-            return tuple(sorted((str(key), value[key]) for key in value))
-        return value
+        key = _task_context_key(value)
+        if key is None:
+            raise ValueError("task context must contain query_idx, last_node_id, task_id, and node_ids")
+        return key

@@ -791,6 +791,8 @@ def test_native_worker_manager_drop_query_fans_out_after_worker_failure():
     backend = object.__new__(NativeFteWorkerManagerBackend)
     backend._handles_lock = threading.Lock()
     backend._handles_by_query = {"query-best-effort": [object()]}
+    backend._stable_task_identity_lock = threading.Lock()
+    backend._stable_task_identity_keys_by_query = {"query-best-effort": {7: "logical-task"}}
     backend._progress_registry = _ProgressRegistry()
     backend._workers = [
         _Worker("worker-dead", fail=True),
@@ -807,6 +809,7 @@ def test_native_worker_manager_drop_query_fans_out_after_worker_failure():
         ("worker-live", "query-best-effort"),
     ]
     assert "query-best-effort" not in backend._handles_by_query
+    assert "query-best-effort" not in backend._stable_task_identity_keys_by_query
     assert backend._dropped_queries["query-best-effort"] == {
         "removed": 1,
         "canceled": 1,
@@ -1197,6 +1200,136 @@ def test_native_worker_manager_exposes_ray_compatible_query_status_and_handles()
         backend.shutdown()
 
 
+def test_native_worker_manager_scopes_query_status_by_task_context():
+    release_second = threading.Event()
+    first_context = {
+        "query_idx": 1,
+        "last_node_id": 7,
+        "task_id": 9,
+        "node_ids": [7],
+    }
+    second_context = {
+        "query_idx": 1,
+        "last_node_id": 7,
+        "task_id": 10,
+        "node_ids": [7],
+    }
+
+    def execute_fn(request):
+        if request["task_id"]["partition_id"] == 1:
+            release_second.wait(timeout=5.0)
+        return {"partition": request["task_id"]["partition_id"]}
+
+    backend = NativeFteWorkerManagerBackend(execute_fn=execute_fn, max_running_tasks=2)
+    try:
+        backend.submit_tasks(
+            [
+                {
+                    "task_id": _task_id(0, query_id="query-scoped"),
+                    "fragment_id": "query-scoped:scan",
+                    "task_context": first_context,
+                },
+                {
+                    "task_id": _task_id(1, query_id="query-scoped"),
+                    "fragment_id": "query-scoped:scan",
+                    "task_context": second_context,
+                },
+            ]
+        )
+
+        deadline = time.monotonic() + 2.0
+        while True:
+            first_status = backend.fte_query_status("query-scoped", [first_context])
+            if first_status["finished"]:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+
+        assert first_status["matched"] is True
+        assert first_status["partition_count"] == 1
+        assert first_status["selected_attempt_task_ids"] == ["query-scoped.0.0.0"]
+        assert len(backend.wait_query("query-scoped", 1.0, [first_context])) == 1
+
+        global_status = backend.fte_query_status("query-scoped")
+        assert global_status["finished"] is False
+        assert global_status["partition_count"] == 2
+
+        unmatched_status = backend.fte_query_status(
+            "query-scoped",
+            [
+                {
+                    "query_idx": 1,
+                    "last_node_id": 7,
+                    "task_id": 99,
+                    "node_ids": [7],
+                }
+            ],
+        )
+        assert unmatched_status["matched"] is False
+        assert unmatched_status["finished"] is False
+        assert unmatched_status["partition_count"] == 0
+    finally:
+        release_second.set()
+        backend.drop_query("query-scoped")
+        backend.shutdown()
+
+
+def test_native_worker_manager_scoped_query_status_keeps_failures_global():
+    release_first = threading.Event()
+    first_context = {
+        "query_idx": 2,
+        "last_node_id": 8,
+        "task_id": 11,
+        "node_ids": [8],
+    }
+    second_context = {
+        "query_idx": 2,
+        "last_node_id": 8,
+        "task_id": 12,
+        "node_ids": [8],
+    }
+
+    def execute_fn(request):
+        if request["task_id"]["partition_id"] == 0:
+            release_first.wait(timeout=5.0)
+            return {"partition": 0}
+        raise RuntimeError("other scoped fragment failed")
+
+    backend = NativeFteWorkerManagerBackend(execute_fn=execute_fn, max_running_tasks=2)
+    try:
+        backend.submit_tasks(
+            [
+                {
+                    "task_id": _task_id(0, query_id="query-scoped-failure"),
+                    "fragment_id": "query-scoped-failure:scan",
+                    "task_context": first_context,
+                },
+                {
+                    "task_id": _task_id(1, query_id="query-scoped-failure"),
+                    "fragment_id": "query-scoped-failure:scan",
+                    "task_context": second_context,
+                },
+            ]
+        )
+
+        deadline = time.monotonic() + 2.0
+        while True:
+            scoped_status = backend.fte_query_status("query-scoped-failure", [first_context])
+            if scoped_status["failed"]:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+
+        assert scoped_status["matched"] is True
+        assert scoped_status["finished"] is False
+        assert scoped_status["failed_count"] == 0
+        assert scoped_status["failed_partitions"] == []
+    finally:
+        release_first.set()
+        backend.drop_query("query-scoped-failure")
+        backend.shutdown()
+
+
 def test_native_worker_manager_task_input_stream_exhausted_seals_fte_runtime_sources():
     executed = threading.Event()
 
@@ -1274,6 +1407,269 @@ def test_native_worker_task_request_converts_inputs_to_dynamic_splits():
     assert [split["sequence_id"] for split in exchange_splits] == [0, 1]
     assert [split["source_partition_id"] for split in exchange_splits] == [0, 1]
     assert [split["data"]["partition_indices"] for split in exchange_splits] == [[0], [1]]
+
+
+def test_native_worker_task_request_derives_fte_exchange_sink_identity():
+    def make_request(
+        *,
+        source_task_partition_id: int,
+        event_task_id: int,
+        attempt_id: int,
+        physical_suffix: str,
+    ) -> dict[str, Any]:
+        exchange_source = duckdb.ray_cxx.make_exchange_source_task_descriptor_for_test(
+            [
+                {
+                    "partition_id": 0,
+                    "source_task_partition_id": source_task_partition_id,
+                    "attempt_id": attempt_id,
+                    "node_id": f"node-{physical_suffix}",
+                    "flight_host": f"host-{physical_suffix}",
+                    "flight_port": 5000 + attempt_id,
+                    "flight_server_epoch": f"epoch-{physical_suffix}",
+                    "files": [
+                        {
+                            "path": f"random-{physical_suffix}__sink_{source_task_partition_id}__attempt_{attempt_id}",
+                            "file_size": 11,
+                        }
+                    ],
+                }
+            ],
+            [0],
+            1,
+            1,
+        )
+        task = _FakeNativeWorkerTask(
+            context={
+                "query_id": "query-sink-identity",
+                "node_id": "3",
+                "fragment_execution_id": 4,
+                "attempt_id": attempt_id,
+                "preserve_plan_exchange_sink_instance": "1",
+            },
+            task_context={
+                "query_idx": 0,
+                "last_node_id": 3,
+                "task_id": event_task_id,
+                "node_ids": [3],
+            },
+            inputs={
+                "3": {
+                    "kind": "exchange_source_task",
+                    "data": exchange_source,
+                }
+            },
+            exchange_sink_instance={
+                "sink_handle": {
+                    "query_id": "query-sink-identity",
+                    "exchange_id": "materialized",
+                    "task_partition_id": 0,
+                    "partition_id": 0,
+                },
+                "attempt_id": 0,
+                "output_location": "materialized__sink_0__attempt_0",
+                "fte_task_identity": True,
+            },
+        )
+        return NativeFteWorkerManagerBackend._request_from_task(task)
+
+    first_order = make_request(
+        source_task_partition_id=41,
+        event_task_id=7,
+        attempt_id=0,
+        physical_suffix="first",
+    )
+    reversed_order = make_request(
+        source_task_partition_id=41,
+        event_task_id=99,
+        attempt_id=2,
+        physical_suffix="retry",
+    )
+    different_source = make_request(
+        source_task_partition_id=42,
+        event_task_id=7,
+        attempt_id=0,
+        physical_suffix="second",
+    )
+
+    stable_identity = first_order["exchange_sink_instance"]["task_partition_id"]
+    assert reversed_order["exchange_sink_instance"]["task_partition_id"] == stable_identity
+    assert different_source["exchange_sink_instance"]["task_partition_id"] != stable_identity
+    assert stable_identity != (4 << 32) | 7
+    assert reversed_order["exchange_sink_instance"]["attempt_id"] == 2
+    assert reversed_order["exchange_sink_instance"]["output_location"] == (
+        f"materialized__sink_{stable_identity}__attempt_2"
+    )
+    assert first_order["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == stable_identity
+    assert "preserve_plan_exchange_sink_instance" not in first_order["exchange_sink_instance"]
+
+
+def test_native_worker_task_request_derives_stable_plan_sink_identity_from_inputs():
+    def make_request(event_task_id: int, source_task_partition_id: int) -> dict[str, Any]:
+        task = _FakeNativeWorkerTask(
+            context={"query_id": "query-plan-derived", "node_id": "4"},
+            task_context={
+                "query_idx": 0,
+                "last_node_id": 4,
+                "task_id": event_task_id,
+                "node_ids": [3, 4],
+            },
+            inputs={
+                "3": {
+                    "kind": "exchange_source_task",
+                    "data": {
+                        "partition_indices": [0],
+                        "source_task_partition_ids": [source_task_partition_id],
+                        "source_partition_count": 1,
+                        "source_task_count": 1,
+                    },
+                }
+            },
+            exchange_sink_instance={
+                "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+                "attempt_id": 0,
+                "output_location": "shuffle__sink_0__attempt_0",
+            },
+        )
+        return NativeFteWorkerManagerBackend._request_from_task(task)
+
+    first_order = make_request(7, 41)
+    reversed_order = make_request(99, 41)
+    different_source = make_request(7, 42)
+
+    first_identity = first_order["exchange_sink_instance"]["task_partition_id"]
+    assert reversed_order["exchange_sink_instance"]["task_partition_id"] == first_identity
+    assert different_source["exchange_sink_instance"]["task_partition_id"] != first_identity
+    assert first_order["exchange_sink_instance"]["output_location"] == (f"shuffle__sink_{first_identity}__attempt_0")
+
+
+def test_native_worker_task_request_distinguishes_identical_scan_occurrences():
+    def make_request(source_task_partition_id: int) -> dict[str, Any]:
+        task = _FakeNativeWorkerTask(
+            context={"query_id": "query-duplicate-scan", "node_id": "4"},
+            task_context={
+                "query_idx": 0,
+                "last_node_id": 4,
+                "task_id": 99 - source_task_partition_id,
+                "node_ids": [3, 4],
+            },
+            inputs={
+                "3": {
+                    "kind": "scan_task",
+                    "data": {
+                        "source_task_partition_id": source_task_partition_id,
+                        "files": ["same.parquet"],
+                    },
+                }
+            },
+            exchange_sink_instance={
+                "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+                "attempt_id": 0,
+                "output_location": "shuffle__sink_0__attempt_0",
+            },
+        )
+        return NativeFteWorkerManagerBackend._request_from_task(task)
+
+    first = make_request(0)
+    repeated_occurrence = make_request(1)
+
+    assert (
+        first["exchange_sink_instance"]["task_partition_id"]
+        != repeated_occurrence["exchange_sink_instance"]["task_partition_id"]
+    )
+
+
+def test_native_worker_task_request_uses_explicit_static_source_partition_identity():
+    def make_request(event_task_id: int) -> dict[str, Any]:
+        task = _FakeNativeWorkerTask(
+            context={
+                "query_id": "query-static-source",
+                "node_id": "4",
+                "stable_task_partition_id": "3",
+            },
+            task_context={
+                "query_idx": 0,
+                "last_node_id": 4,
+                "task_id": event_task_id,
+                "node_ids": [3, 4],
+            },
+            exchange_sink_instance={
+                "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+                "attempt_id": 0,
+                "output_location": "shuffle__sink_0__attempt_0",
+            },
+        )
+        return NativeFteWorkerManagerBackend._request_from_task(task)
+
+    first_order = make_request(7)
+    reversed_order = make_request(99)
+
+    assert (
+        reversed_order["exchange_sink_instance"]["task_partition_id"]
+        == (first_order["exchange_sink_instance"]["task_partition_id"])
+    )
+
+
+def test_native_worker_task_request_preserves_plan_exchange_sink_identity():
+    task = _FakeNativeWorkerTask(
+        context={
+            "query_id": "query-plan-sink-identity",
+            "node_id": "3",
+            "fragment_execution_id": 4,
+            "attempt_id": 2,
+            "preserve_plan_exchange_sink_instance": "1",
+        },
+        task_context={
+            "query_idx": 0,
+            "last_node_id": 3,
+            "task_id": 7,
+            "node_ids": [3],
+        },
+        exchange_sink_instance={
+            "sink_handle": {
+                "query_id": "query-plan-sink-identity",
+                "exchange_id": "range",
+                "task_partition_id": 5,
+                "partition_id": 5,
+            },
+            "task_partition_id": 5,
+            "partition_id": 5,
+            "attempt_id": 0,
+            "output_location": "range__sink_5__attempt_0",
+        },
+    )
+
+    request = NativeFteWorkerManagerBackend._request_from_task(task)
+
+    assert request["exchange_sink_instance"]["attempt_id"] == 2
+    assert request["exchange_sink_instance"]["task_partition_id"] == 5
+    assert request["exchange_sink_instance"]["partition_id"] == 5
+    assert request["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == 5
+    assert request["exchange_sink_instance"]["sink_handle"]["partition_id"] == 5
+    assert request["exchange_sink_instance"]["output_location"] == "range__sink_5__attempt_2"
+    assert request["exchange_sink_instance"]["preserve_plan_exchange_sink_instance"] is True
+
+
+def test_native_worker_manager_rejects_stable_task_identity_collisions():
+    backend = NativeFteWorkerManagerBackend(execute_fn=lambda request: request)
+    identity_key_field = native_backend_mod._NATIVE_STABLE_TASK_IDENTITY_KEY
+    requests = [
+        {
+            "task_id": _task_id(1, query_id="query-collision"),
+            "exchange_sink_instance": {"task_partition_id": 123},
+            identity_key_field: "logical-task-a",
+        },
+        {
+            "task_id": _task_id(2, query_id="query-collision"),
+            "exchange_sink_instance": {"task_partition_id": 123},
+            identity_key_field: "logical-task-b",
+        },
+    ]
+    try:
+        with pytest.raises(ValueError, match="stable native FTE task identity collision"):
+            backend._register_stable_task_identities(requests)
+    finally:
+        backend.shutdown()
 
 
 def test_native_fte_runtime_starts_dynamic_source_and_removes_initial_splits_before_execute():

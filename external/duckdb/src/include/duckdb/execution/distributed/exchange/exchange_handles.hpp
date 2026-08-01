@@ -41,6 +41,8 @@ struct ExchangeSinkHandle {
 struct ExchangeSinkInstanceHandle {
 	ExchangeSinkHandle sink_handle;
 	idx_t attempt_id = 0;
+	/// Derive the concrete sink identity from the FTE fragment partition.
+	bool fte_task_identity = false;
 	/// Query that owns this concrete attempt.
 	std::string query_id;
 	/// Implementation-specific: output directory (Spooling),
@@ -72,6 +74,9 @@ struct ExchangeSourceFile {
 /// split by target_data_size).
 struct ExchangeSourceHandle {
 	idx_t partition_id = 0;
+	/// Logical upstream sink partition that produced this source handle.
+	/// Stable across attempts and independent of worker completion order.
+	idx_t source_task_partition_id = DConstants::INVALID_INDEX;
 	idx_t attempt_id = 0;
 	std::string node_id;
 	std::string flight_host;

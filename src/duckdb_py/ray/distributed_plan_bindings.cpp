@@ -1166,15 +1166,37 @@ public:
 			bool failed = false;
 			bool finished = false;
 			bool canceled = false;
+			bool matched = true;
 			string status_message;
 			try {
 				duckdb::PythonGILWrapper gil;
 				auto backend = backend_.get();
-				py::object status_obj = backend.attr("fte_query_status")(query_id);
+				py::object status_obj;
+				if (task_contexts.empty()) {
+					status_obj = backend.attr("fte_query_status")(query_id);
+				} else {
+					py::list py_task_contexts;
+					for (const auto &task_context : task_contexts) {
+						py::dict info;
+						info["query_idx"] = task_context.query_idx();
+						info["last_node_id"] = task_context.last_node_id();
+						info["task_id"] = task_context.task_id();
+						py::list node_ids;
+						for (auto node_id : task_context.node_ids()) {
+							node_ids.append(node_id);
+						}
+						info["node_ids"] = std::move(node_ids);
+						py_task_contexts.append(std::move(info));
+					}
+					status_obj = backend.attr("fte_query_status")(query_id, std::move(py_task_contexts));
+				}
 				status_message = PyStatusMessage(status_obj);
 				failed = RequiredStatusBool(status_obj, "failed");
 				finished = RequiredStatusBool(status_obj, "finished");
 				canceled = OptionalStatusBool(status_obj, "canceled", false);
+				if (!task_contexts.empty()) {
+					matched = RequiredStatusBool(status_obj, "matched");
+				}
 				selected_attempt_task_ids = SelectedAttemptTaskIds(status_obj);
 			} catch (const std::exception &e) {
 				ClearResultHandles(query_id);
@@ -1191,7 +1213,10 @@ public:
 				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 				    DuckDBError::external_error("Python backend FTE query canceled: " + status_message));
 			}
-			if (finished) {
+			// Submission and fragment registration are concurrent. A scoped
+			// status lookup may legitimately miss for a short interval after
+			// submit_fte_task_events returns.
+			if (matched && finished) {
 				break;
 			}
 			if (has_deadline && std::chrono::steady_clock::now() >= deadline) {
@@ -2241,7 +2266,13 @@ struct PyPhysicalPlanWrapperRunner {
 		// Materialize operators that return rows to the caller. A terminal remote
 		// exchange sink is different: its source side is a zero-row completion
 		// interface and its data output is already carried by Arrow Flight.
-		const bool needs_result_collector = NativePlanNeedsResultCollector(root_op);
+		// Terminal exchange sinks still need a managed DuckDB query. Operators
+		// below the sink (notably hash joins) can schedule follow-up work through
+		// ClientContext::GetExecutor(), which requires the active-query lifecycle
+		// installed by PendingQueryPreparedStatementNoRebind. The collector only
+		// consumes the sink's zero-row completion source; data remains on Flight.
+		const bool terminal_exchange_sink = root_op.type == PhysicalOperatorType::EXCHANGE_SINK;
+		const bool needs_result_collector = terminal_exchange_sink || NativePlanNeedsResultCollector(root_op);
 		if (needs_result_collector) {
 
 			auto prepared_data = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);
@@ -2310,6 +2341,10 @@ struct PyPhysicalPlanWrapperRunner {
 				auto last_native_progress = std::chrono::steady_clock::now();
 				bool native_progress_callback_failed = false;
 				auto emit_native_progress = [&](bool force) {
+					auto snapshots = executor.GetPipelinesProgressSnapshots();
+					if (!snapshots.empty()) {
+						stable_pipeline_snapshots = snapshots;
+					}
 					if (!has_native_progress_callback || native_progress_callback_failed) {
 						return;
 					}
@@ -2319,15 +2354,11 @@ struct PyPhysicalPlanWrapperRunner {
 					if (!force && elapsed_ms < native_progress_ms) {
 						return;
 					}
-					auto snapshots = executor.GetPipelinesProgressSnapshots();
-					if (!snapshots.empty()) {
-						stable_pipeline_snapshots = snapshots;
-					}
 					py::gil_scoped_acquire acquire;
 					try {
-						auto stats =
-						    BuildNativeTaskStatsDict(stable_pipeline_snapshots, scan_task_map, exchange_source_task_map,
-						                             fte_scan_source_queue_map, fte_exchange_source_queue_map);
+						auto stats = BuildNativeTaskStatsDict(stable_pipeline_snapshots, scan_task_map,
+						                                      exchange_source_task_map, fte_scan_source_queue_map,
+						                                      fte_exchange_source_queue_map, terminal_exchange_sink);
 						native_progress_callback(stats);
 						last_native_progress = now;
 					} catch (const std::exception &ex) {
@@ -2339,9 +2370,9 @@ struct PyPhysicalPlanWrapperRunner {
 				if (has_native_progress_callback) {
 					py::gil_scoped_acquire acquire;
 					try {
-						auto stats =
-						    BuildNativeTaskStatsDict(stable_pipeline_snapshots, scan_task_map, exchange_source_task_map,
-						                             fte_scan_source_queue_map, fte_exchange_source_queue_map);
+						auto stats = BuildNativeTaskStatsDict(stable_pipeline_snapshots, scan_task_map,
+						                                      exchange_source_task_map, fte_scan_source_queue_map,
+						                                      fte_exchange_source_queue_map, terminal_exchange_sink);
 						native_progress_callback(stats);
 					} catch (const std::exception &ex) {
 						native_progress_callback_failed = true;
@@ -2534,6 +2565,18 @@ struct PyPhysicalPlanWrapperRunner {
 
 			auto &materialized = query_result->Cast<MaterializedQueryResult>();
 			auto &collection = materialized.Collection();
+			if (terminal_exchange_sink) {
+				auto task_stats =
+				    BuildNativeTaskStatsDict(stable_pipeline_snapshots, scan_task_map, exchange_source_task_map,
+				                             fte_scan_source_queue_map, fte_exchange_source_queue_map, true);
+				MarkTaskStatsCompleted(task_stats);
+				plan_guard.release();
+				if (collection.Count() != 0) {
+					throw py::value_error("Execution failed: terminal exchange sink produced local result rows");
+				}
+				return build_executed_result(std::move(task_stats));
+			}
+
 			auto table = CollectionToArrowTable(collection, context);
 			const auto payload_bytes = static_cast<idx_t>(GetPyPayloadSizeBytes(table));
 			auto materialized_stats = BuildMaterializedInputTaskStats(

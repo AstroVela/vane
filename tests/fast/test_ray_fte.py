@@ -968,6 +968,7 @@ def test_fte_query_status_uses_fragment_execution_snapshot():
         def query_status_snapshot(self):
             return {
                 "failed": False,
+                "no_more_partitions": True,
                 "partitions": [
                     {
                         "partition_id": 0,
@@ -993,6 +994,140 @@ def test_fte_query_status_uses_fragment_execution_snapshot():
     assert status["finished"] is True
     assert status["finished_count"] == 1
     assert status["selected_attempt_task_ids"] == ["q.0.0.2"]
+
+
+def test_fte_query_status_scopes_completion_but_preserves_query_failure():
+    query_id = "q-status-task-scope"
+    finished_fragment_id = f"{query_id}:node:left"
+    pending_fragment_id = f"{query_id}:node:right"
+    finished_context = {
+        "query_idx": 7,
+        "last_node_id": 11,
+        "task_id": 13,
+        "node_ids": [11],
+    }
+    pending_context = {
+        "query_idx": 7,
+        "last_node_id": 17,
+        "task_id": 19,
+        "node_ids": [17],
+    }
+
+    class _FragmentExecution:
+        def __init__(self, task_context_info, partitions, *, no_more_partitions, failed=False):
+            self.task_context_info = task_context_info
+            self._partitions = partitions
+            self._no_more_partitions = no_more_partitions
+            self._failed = failed
+
+        def query_status_snapshot(self):
+            return {
+                "failed": self._failed,
+                "no_more_partitions": self._no_more_partitions,
+                "partitions": list(self._partitions),
+            }
+
+    finished = _FragmentExecution(
+        finished_context,
+        [
+            {
+                "partition_id": 0,
+                "running": False,
+                "failed": False,
+                "finished": True,
+                "selected_attempt": 1,
+                "task_id": f"{query_id}.0.0",
+                "failures": [],
+            }
+        ],
+        no_more_partitions=True,
+    )
+    pending = _FragmentExecution(
+        pending_context,
+        [
+            {
+                "partition_id": 0,
+                "running": False,
+                "failed": False,
+                "finished": True,
+                "selected_attempt": 0,
+                "task_id": f"{query_id}.1.0",
+                "failures": [],
+            }
+        ],
+        no_more_partitions=False,
+        failed=True,
+    )
+    keys = [
+        (query_id, finished_fragment_id),
+        (query_id, pending_fragment_id),
+    ]
+    with _FTE_REGISTRY_LOCK:
+        _FTE_FRAGMENT_EXECUTIONS[keys[0]] = finished
+        _FTE_FRAGMENT_EXECUTIONS[keys[1]] = pending
+    try:
+        query_status = fte_query_status(query_id)
+        scoped_status = fte_query_status(query_id, [finished_context])
+        pending_scope_status = fte_query_status(query_id, [pending_context])
+    finally:
+        with _FTE_REGISTRY_LOCK:
+            for key in keys:
+                _FTE_FRAGMENT_EXECUTIONS.pop(key, None)
+
+    assert query_status["matched"] is True
+    assert query_status["finished"] is False
+    assert scoped_status["matched"] is True
+    assert scoped_status["failed"] is True
+    assert scoped_status["finished"] is True
+    assert scoped_status["fragment_execution_count"] == 1
+    assert list(scoped_status["fragment_executions"]) == [finished_fragment_id]
+    assert scoped_status["selected_attempt_task_ids"] == [f"{query_id}.0.0.1"]
+    assert pending_scope_status["matched"] is True
+    assert pending_scope_status["finished"] is False
+    assert pending_scope_status["fragment_executions"][pending_fragment_id]["no_more_partitions"] is False
+
+
+def test_fte_query_status_reports_unmatched_task_scope():
+    query_id = "q-status-unmatched-task-scope"
+    fragment_id = f"{query_id}:node:scan"
+
+    class _FragmentExecution:
+        task_context_info = {
+            "query_idx": 1,
+            "last_node_id": 2,
+            "task_id": 3,
+            "node_ids": [2],
+        }
+
+        def query_status_snapshot(self):
+            return {
+                "failed": False,
+                "no_more_partitions": False,
+                "partitions": [],
+            }
+
+    key = (query_id, fragment_id)
+    with _FTE_REGISTRY_LOCK:
+        _FTE_FRAGMENT_EXECUTIONS[key] = _FragmentExecution()
+    try:
+        status = fte_query_status(
+            query_id,
+            [
+                {
+                    "query_idx": 1,
+                    "last_node_id": 4,
+                    "task_id": 5,
+                    "node_ids": [4],
+                }
+            ],
+        )
+    finally:
+        with _FTE_REGISTRY_LOCK:
+            _FTE_FRAGMENT_EXECUTIONS.pop(key, None)
+
+    assert status["matched"] is False
+    assert status["finished"] is False
+    assert status["fragment_execution_count"] == 0
 
 
 def test_fte_query_status_handles_multiple_running_attempts():
@@ -1112,6 +1247,79 @@ def test_derive_exchange_sink_instance_for_retry_attempt_rewrites_output_locatio
     assert retry["output_partition_count"] == 8
     assert retry["output_location"] == "q_shuffle_9__sink_9__attempt_2"
     assert retry["attempt_path"] == "q_shuffle_9__sink_9__attempt_2"
+
+
+def test_derive_exchange_sink_instance_uses_full_fte_task_identity():
+    base = {
+        "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+        "task_partition_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+        "output_partition_count": 1,
+        "output_location": "q_coordinator__sink_0__attempt_0",
+        "attempt_path": "q_coordinator__sink_0__attempt_0",
+        "fte_task_identity": True,
+    }
+
+    first_fragment = derive_exchange_sink_instance_for_attempt(
+        base,
+        2,
+        task_partition_id=9,
+        fragment_execution_id=3,
+    )
+    second_fragment = derive_exchange_sink_instance_for_attempt(
+        base,
+        0,
+        task_partition_id=9,
+        fragment_execution_id=4,
+    )
+    first_identity = (3 << 32) | 9
+    second_identity = (4 << 32) | 9
+
+    assert first_fragment["sink_handle"]["task_partition_id"] == first_identity
+    assert first_fragment["task_partition_id"] == first_identity
+    assert first_fragment["attempt_id"] == 2
+    assert first_fragment["output_location"] == f"q_coordinator__sink_{first_identity}__attempt_2"
+    assert second_fragment["sink_handle"]["task_partition_id"] == second_identity
+    assert second_fragment["output_location"] == f"q_coordinator__sink_{second_identity}__attempt_0"
+    assert first_identity != second_identity
+
+
+def test_derive_exchange_sink_instance_rejects_reserved_task_identity():
+    component_max = (1 << 32) - 1
+    base = {
+        "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+        "output_location": "q_coordinator__sink_0__attempt_0",
+        "fte_task_identity": True,
+    }
+
+    with pytest.raises(ValueError, match="reserved invalid task index"):
+        derive_exchange_sink_instance_for_attempt(
+            base,
+            0,
+            task_partition_id=component_max,
+            fragment_execution_id=component_max,
+        )
+
+
+def test_derive_exchange_sink_instance_accepts_stable_native_task_identity():
+    base = {
+        "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+        "output_location": "q_coordinator__sink_0__attempt_0",
+        "fte_task_identity": True,
+    }
+
+    derived = derive_exchange_sink_instance_for_attempt(
+        base,
+        3,
+        task_partition_id=17,
+        fragment_execution_id=9,
+        stable_task_identity=123456789,
+    )
+
+    assert derived["task_partition_id"] == 123456789
+    assert derived["sink_handle"]["task_partition_id"] == 123456789
+    assert derived["output_location"] == "q_coordinator__sink_123456789__attempt_3"
 
 
 def test_task_descriptor_appends_splits_idempotently_and_replays_fte_fields():
@@ -3986,6 +4194,74 @@ def test_fte_fragment_execution_rewrites_base_sink_partition_for_dynamic_task_pa
     assert sink_instance["partition_id"] == 3
     assert sink_instance["output_location"] == "q_shuffle_3__sink_3__attempt_0"
     assert worker.calls[0][1]["exchange_sink_instance"] == sink_instance
+
+
+def test_fte_fragment_execution_uses_logical_fragment_identity_for_materialized_sink():
+    worker = _FakeLiveWorker("worker-a")
+    registered_identities = []
+    base_sink = {
+        "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+        "task_partition_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+        "output_location": "q_coordinator__sink_0__attempt_0",
+        "fte_task_identity": True,
+    }
+    stage = _fte_fragment_execution(
+        "q",
+        12,
+        fragment_id="q:node:sample",
+        logical_fragment_identity='["ray-fte-logical-fragment-v1","node:sample:fte","node:sample"]',
+        stable_task_identity_callback=lambda stable_task_identity, identity_key: registered_identities.append(
+            (stable_task_identity, identity_key)
+        ),
+        worker=worker,
+        task_context_info={"exchange_sink_instance": base_sink},
+    )
+
+    scheduled_result = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(3)], sealed_partitions=[3])
+    )
+    scheduled = scheduled_result[0]
+    _execute_stage_commands(stage, scheduled_result)
+    sink_instance = scheduled.request["exchange_sink_instance"]
+    assert len(registered_identities) == 1
+    expected_sink_identity, identity_key = registered_identities[0]
+
+    assert str(scheduled.attempt_id) == "q.12.3.0"
+    assert identity_key.endswith(",3]")
+    assert sink_instance["task_partition_id"] == expected_sink_identity
+    assert sink_instance["sink_handle"]["task_partition_id"] == expected_sink_identity
+    assert sink_instance["output_location"] == f"q_coordinator__sink_{expected_sink_identity}__attempt_0"
+
+
+def test_fte_fragment_execution_rejects_materialized_sink_without_logical_fragment_identity():
+    worker = _FakeLiveWorker("worker-a")
+    selected_partitions = []
+
+    def select_worker(partition):
+        selected_partitions.append(partition)
+        return worker.worker_id, worker
+
+    stage = _fte_fragment_execution(
+        "q",
+        12,
+        fragment_id="q:node:sample",
+        worker_selector=select_worker,
+        task_context_info={
+            "exchange_sink_instance": {
+                "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+                "output_location": "q_coordinator__sink_0__attempt_0",
+                "fte_task_identity": True,
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="requires a stable logical fragment identity"):
+        stage.apply_assignment_result(AssignmentResult(partitions_added=[PartitionInfo(3)], sealed_partitions=[3]))
+
+    assert selected_partitions == []
+    assert worker.calls == []
 
 
 def test_fte_fragment_execution_handle_task_status_accepts_task_id_string():

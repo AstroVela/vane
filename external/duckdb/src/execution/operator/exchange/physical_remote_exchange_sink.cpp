@@ -316,6 +316,7 @@ void PhysicalRemoteExchangeSink::SerializeOperatorData(Serializer &serializer) c
 	serializer.WriteProperty(113, "range_order_modifiers", range_order_modifiers_);
 	serializer.WriteProperty(114, "flight_server_epoch", sink_handle_.flight_server_epoch);
 	serializer.WriteProperty(115, "query_id", sink_handle_.query_id);
+	serializer.WriteProperty(116, "fte_task_identity", sink_handle_.fte_task_identity);
 }
 
 } // namespace duckdb

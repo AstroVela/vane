@@ -10,9 +10,8 @@
 #include <string>
 #include <vector>
 
-#include "duckdb/parallel/task_executor.hpp"
-
 #include "duckdb/execution/distributed/common_types.hpp"
+#include "duckdb/execution/distributed/plan/plan_task_executor.hpp"
 #include "duckdb/execution/distributed/utils/channel.hpp"
 #include "duckdb/execution/distributed/utils/stream.hpp"
 
@@ -81,60 +80,26 @@ private:
 	DistributedPhysicalPlan() = delete;
 };
 
-// Shared status for background plan execution. The execute task can finish
-// after run_plan() has returned a stream, so errors need an explicit side
-// channel rather than a local return value.
-class PlanExecutionStatus {
-public:
-	void RecordError(const DuckDBError &error) {
-		std::lock_guard<std::mutex> lock(mutex_);
-		if (!error_) {
-			error_ = std::make_shared<DuckDBError>(error);
-		}
-	}
-
-	std::shared_ptr<DuckDBError> GetError() const {
-		std::lock_guard<std::mutex> lock(mutex_);
-		return error_;
-	}
-
-	void ThrowIfError() const {
-		auto error = GetError();
-		if (error) {
-			throw *error;
-		}
-	}
-
-private:
-	mutable std::mutex mutex_;
-	std::shared_ptr<DuckDBError> error_;
-};
-
 // PlanResultStream — flattens MaterializedOutput → ResultPartitionRef.
 //
-// Background plan tasks run on DuckDB's
-// TaskScheduler thread pool via TaskExecutor. Destructor explicitly
-// closes receiver (→ tasks detect send failure and exit), then calls
-// WorkOnTasks() to wait for completion.
+// Blocking plan-control tasks use PlanTaskExecutor rather than DuckDB's
+// compute scheduler. The stream owns the executor while results are consumed.
 class PlanResultStream {
 public:
 	PlanResultStream() = default;
-	PlanResultStream(std::shared_ptr<TaskExecutor> executor, UnboundedReceiver<MaterializedOutput> rx,
+	PlanResultStream(std::shared_ptr<PlanTaskExecutor> executor, UnboundedReceiver<MaterializedOutput> rx,
 	                 std::shared_ptr<PlanExecutionStatus> status = nullptr)
 	    : executor_(std::move(executor)), receiver_(std::move(rx)), status_(std::move(status)) {
 	}
 
 	~PlanResultStream() {
 		// Close the channel so background plan tasks
-		// detect send() failure and exit on their own.  We intentionally do NOT
-		// call executor_->WorkOnTasks() here because the destructor may run on
-		// the Python asyncio event-loop thread (during coroutine-frame GC).
-		// WorkOnTasks() spin-waits for ALL executor tasks to finish, which would
-		// block the event loop and prevent Ray from delivering the final result
-		// back to the client — causing a hang.
-		//
-		// Safety: both background tasks capture a shared_ptr<TaskExecutor>,
-		// keeping the executor alive until they finish naturally.
+		// detect send() failure and exit on their own. We intentionally do not
+		// wait here because the destructor may run on the Python asyncio event-loop
+		// thread (during coroutine-frame GC).
+		// Waiting for control tasks here would block the event loop and prevent
+		// Ray from delivering the final result back to the client. Each detached
+		// task retains the ClientContext and status until it finishes naturally.
 		receiver_ = UnboundedReceiver<MaterializedOutput>();
 	}
 
@@ -180,7 +145,7 @@ public:
 	}
 
 private:
-	std::shared_ptr<TaskExecutor> executor_;
+	std::shared_ptr<PlanTaskExecutor> executor_;
 	UnboundedReceiver<MaterializedOutput> receiver_;
 	std::shared_ptr<PlanExecutionStatus> status_;
 	std::vector<ResultPartitionRef> curr_fragments_;

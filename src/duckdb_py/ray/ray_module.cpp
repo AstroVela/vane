@@ -40,6 +40,8 @@
 #include <duckdb/common/types/uuid.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 
+#include <set>
+
 static inline int DuckdbGetEnvIntMs(const char *name) {
 	const char *val = std::getenv(name);
 	if (!val || !*val) {
@@ -1264,6 +1266,10 @@ void register_ray_bindings(py::module_ &mod) {
 					        exchange_sink_instance_task.sink_instance.attempt_id =
 					            py::int_(d["attempt_id"]).cast<idx_t>();
 				        }
+				        if (d.contains("fte_task_identity")) {
+					        exchange_sink_instance_task.sink_instance.fte_task_identity =
+					            py::bool_(d["fte_task_identity"]).cast<bool>();
+				        }
 				        if (d.contains("output_partition_count")) {
 					        exchange_sink_instance_task.sink_instance.output_partition_count =
 					            py::int_(d["output_partition_count"]).cast<idx_t>();
@@ -1409,6 +1415,19 @@ void register_ray_bindings(py::module_ &mod) {
 	    "by concatenating their file lists.");
 
 	m.def(
+	    "scan_task_source_partition_id",
+	    [](py::bytes bytes_obj) {
+		    using namespace duckdb::distributed;
+		    string raw(bytes_obj);
+		    auto desc = ScanTaskDescriptor::DeserializeFromBytes(raw);
+		    if (desc.source_task_partition_id == DConstants::INVALID_INDEX) {
+			    throw py::value_error("scan task is missing its stable source task partition identity");
+		    }
+		    return desc.source_task_partition_id;
+	    },
+	    py::arg("bytes"), "Return the stable logical source-task partition from a scan descriptor.");
+
+	m.def(
 	    "exchange_source_task_partition_indices",
 	    [](py::bytes bytes_obj) {
 		    using namespace duckdb::distributed;
@@ -1427,6 +1446,36 @@ void register_ray_bindings(py::module_ &mod) {
 		    return desc.replicated;
 	    },
 	    py::arg("bytes"), "Return whether a raw ExchangeSourceTaskDescriptor is replicated.");
+
+	m.def(
+	    "exchange_source_task_logical_identity",
+	    [](py::bytes bytes_obj) {
+		    using namespace duckdb::distributed;
+		    string raw(bytes_obj);
+		    auto desc = ExchangeSourceTaskDescriptor::DeserializeFromBytes(raw);
+		    std::set<idx_t> source_task_partition_ids;
+		    for (const auto &handle : desc.source_handles) {
+			    if (handle.source_task_partition_id == DConstants::INVALID_INDEX) {
+				    throw py::value_error(
+				        "exchange source handle is missing its stable source task partition identity");
+			    }
+			    source_task_partition_ids.insert(handle.source_task_partition_id);
+		    }
+		    if (source_task_partition_ids.empty()) {
+			    throw py::value_error("exchange source task has no source task partition identities");
+		    }
+
+		    py::dict out;
+		    out["partition_indices"] = desc.partition_indices;
+		    out["source_task_partition_ids"] =
+		        vector<idx_t>(source_task_partition_ids.begin(), source_task_partition_ids.end());
+		    out["source_partition_count"] = desc.source_partition_count;
+		    out["source_task_count"] = desc.source_task_count;
+		    out["replicated"] = desc.replicated;
+		    return out;
+	    },
+	    py::arg("bytes"),
+	    "Return completion-order-independent logical identity metadata from an exchange source task.");
 
 	m.def(
 	    "read_committed_copy_direct_write_result",
@@ -1660,6 +1709,9 @@ void register_ray_bindings(py::module_ &mod) {
 			    py::dict d = item.cast<py::dict>();
 			    ExchangeSourceHandle handle;
 			    handle.partition_id = py::int_(d["partition_id"]).cast<idx_t>();
+			    if (d.contains("source_task_partition_id")) {
+				    handle.source_task_partition_id = py::int_(d["source_task_partition_id"]).cast<idx_t>();
+			    }
 			    if (d.contains("attempt_id")) {
 				    handle.attempt_id = py::int_(d["attempt_id"]).cast<idx_t>();
 			    }
@@ -1710,6 +1762,9 @@ void register_ray_bindings(py::module_ &mod) {
 		    for (const auto &handle : desc.source_handles) {
 			    py::dict d;
 			    d["partition_id"] = handle.partition_id;
+			    if (handle.source_task_partition_id != DConstants::INVALID_INDEX) {
+				    d["source_task_partition_id"] = handle.source_task_partition_id;
+			    }
 			    d["attempt_id"] = handle.attempt_id;
 			    d["node_id"] = handle.node_id;
 			    if (!handle.flight_host.empty()) {

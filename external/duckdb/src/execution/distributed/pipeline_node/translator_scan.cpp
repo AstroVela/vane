@@ -321,6 +321,7 @@ std::vector<ScanTaskDescriptor> MakeTableScanTasks(const PhysicalTableScan &scan
 		task.files = std::move(files);
 		task.estimated_cardinality = estimated_scan_rows;
 		task.estimated_bytes = static_cast<idx_t>(total_file_bytes);
+		task.source_task_partition_id = 0;
 		tasks.push_back(std::move(task));
 		return tasks;
 	}
@@ -392,6 +393,7 @@ std::vector<ScanTaskDescriptor> MakeTableScanTasks(const PhysicalTableScan &scan
 		task.files = std::move(task_files);
 		task.estimated_cardinality = estimate_rows_for_task(task_bytes, group.size());
 		task.estimated_bytes = static_cast<idx_t>(task_bytes);
+		task.source_task_partition_id = tasks.size();
 		tasks.push_back(std::move(task));
 	}
 

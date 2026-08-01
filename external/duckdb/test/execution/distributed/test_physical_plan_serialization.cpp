@@ -22,6 +22,7 @@
 #include "duckdb/execution/operator/helper/physical_limit.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_limit.hpp"
 #include "duckdb/execution/operator/helper/physical_limit_percent.hpp"
+#include "duckdb/execution/operator/helper/physical_distributed_reservoir_sample.hpp"
 #include "duckdb/execution/operator/order/physical_order.hpp"
 #include "duckdb/execution/operator/order/physical_top_n.hpp"
 #include "duckdb/execution/operator/exchange/physical_remote_exchange_sink.hpp"
@@ -42,6 +43,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/constants.hpp"
+#include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -51,9 +53,12 @@
 #include "duckdb/common/enums/order_type.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/allocator.hpp"
+#include "duckdb/execution/reservoir_sample.hpp"
 
+#include <algorithm>
 #include <memory>
 #include <iostream>
+#include <unordered_set>
 
 using namespace duckdb;
 
@@ -230,6 +235,39 @@ string SerializeSourceDescriptorWithoutFlightHost() {
 	serializer.WriteProperty<bool>(5, "replicated", false);
 	serializer.End();
 	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
+}
+
+void AddReservoirRows(ReservoirSample &sample, Allocator &allocator, idx_t begin, idx_t end) {
+	DataChunk chunk;
+	chunk.Initialize(allocator, {LogicalType::BIGINT, LogicalType::VARCHAR});
+	for (idx_t offset = begin; offset < end;) {
+		chunk.Reset();
+		const auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, end - offset);
+		for (idx_t row_idx = 0; row_idx < count; row_idx++) {
+			const auto value = offset + row_idx;
+			chunk.SetValue(0, row_idx, Value::BIGINT(NumericCast<int64_t>(value)));
+			chunk.SetValue(1, row_idx, Value("value-" + std::to_string(value)));
+		}
+		chunk.SetCardinality(count);
+		sample.AddToReservoir(chunk);
+		offset += count;
+	}
+}
+
+unique_ptr<BlockingSample> RoundTripReservoirState(ReservoirSample &sample) {
+	sample.PrepareForMerge();
+	MemoryStream stream(Allocator::DefaultAllocator());
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	sample.Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Begin();
+	auto result = BlockingSample::Deserialize(deserializer);
+	deserializer.End();
+	return result;
 }
 
 } // namespace
@@ -465,6 +503,191 @@ TEST_CASE("PhysicalStreamingLimit serialization roundtrip", "[serialization][phy
 	REQUIRE(limit_ptr->parallel);
 
 	std::cerr << "[test] PhysicalStreamingLimit serialization roundtrip PASSED" << std::endl;
+}
+
+TEST_CASE("PhysicalDistributedReservoirSample serialization roundtrip",
+          "[serialization][physical_plan][reservoir_sample]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+
+	auto options = make_uniq<SampleOptions>(42);
+	options->sample_size = Value::BIGINT(17);
+	options->is_percentage = false;
+	options->method = SampleMethod::RESERVOIR_SAMPLE;
+	options->repeatable = true;
+	vector<LogicalType> types = {LogicalType::UBIGINT, LogicalType::BLOB};
+	auto &sample = plan.Make<PhysicalDistributedReservoirSample>(types, std::move(options),
+	                                                             DistributedReservoirSampleStage::LOCAL, 3, 1);
+
+	MemoryStream stream(allocator);
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	sample.Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Begin();
+	auto deserialized_op = PhysicalOperator::Deserialize(deserializer, plan);
+	deserializer.End();
+
+	REQUIRE(deserialized_op != nullptr);
+	auto *sample_ptr = dynamic_cast<PhysicalDistributedReservoirSample *>(deserialized_op.get());
+	REQUIRE(sample_ptr != nullptr);
+	REQUIRE(sample_ptr->stage == DistributedReservoirSampleStage::LOCAL);
+	REQUIRE(sample_ptr->task_index == 3);
+	REQUIRE(sample_ptr->options->sample_size.GetValue<int64_t>() == 17);
+	REQUIRE(sample_ptr->options->GetSeed() == 42);
+	REQUIRE(sample_ptr->options->repeatable);
+}
+
+TEST_CASE("ReservoirSample states merge arbitrary row counts and preserve strings",
+          "[serialization][physical_plan][reservoir_sample]") {
+	Allocator allocator;
+	constexpr idx_t sample_count = 2500;
+	const vector<idx_t> partition_boundaries {0, 13, 3213, 10213};
+	vector<unique_ptr<BlockingSample>> states;
+	vector<pair<double, int64_t>> weighted_candidates;
+
+	for (idx_t partition_idx = 0; partition_idx + 1 < partition_boundaries.size(); partition_idx++) {
+		ReservoirSample local(allocator, sample_count, NumericCast<int64_t>(101 + partition_idx));
+		AddReservoirRows(local, allocator, partition_boundaries[partition_idx],
+		                 partition_boundaries[partition_idx + 1]);
+		auto state = RoundTripReservoirState(local);
+		auto &reservoir = state->Cast<ReservoirSample>();
+		auto weights = reservoir.base_reservoir_sample->reservoir_weights;
+		while (!weights.empty()) {
+			const auto entry = weights.top();
+			weights.pop();
+			const auto value = reservoir.Chunk().GetValue(0, entry.second).GetValue<int64_t>();
+			weighted_candidates.emplace_back(-entry.first, value);
+		}
+		states.push_back(std::move(state));
+	}
+
+	std::sort(weighted_candidates.begin(), weighted_candidates.end(),
+	          [](const pair<double, int64_t> &left, const pair<double, int64_t> &right) {
+		          if (left.first != right.first) {
+			          return left.first > right.first;
+		          }
+		          return left.second < right.second;
+	          });
+	std::unordered_set<int64_t> expected;
+	for (idx_t candidate_idx = 0; candidate_idx < sample_count; candidate_idx++) {
+		expected.insert(weighted_candidates[candidate_idx].second);
+	}
+	REQUIRE(expected.size() == sample_count);
+
+	vector<unique_ptr<BlockingSample>> reverse_states;
+	reverse_states.reserve(states.size());
+	for (const auto &state : states) {
+		reverse_states.push_back(state->Copy());
+	}
+
+	ReservoirSample merged(allocator, sample_count, 999);
+	for (auto &state : states) {
+		merged.Merge(std::move(state));
+	}
+	REQUIRE(merged.GetTuplesSeen() == partition_boundaries.back());
+
+	std::unordered_set<int64_t> selected;
+	idx_t output_count = 0;
+	while (true) {
+		auto chunk = merged.GetChunk();
+		if (!chunk) {
+			break;
+		}
+		for (idx_t row_idx = 0; row_idx < chunk->size(); row_idx++) {
+			const auto value = chunk->GetValue(0, row_idx).GetValue<int64_t>();
+			REQUIRE(StringValue::Get(chunk->GetValue(1, row_idx)) == "value-" + std::to_string(value));
+			REQUIRE(selected.insert(value).second);
+			output_count++;
+		}
+	}
+	REQUIRE(output_count == sample_count);
+	REQUIRE(selected == expected);
+
+	ReservoirSample reverse_merged(allocator, sample_count, 999);
+	for (auto state = reverse_states.rbegin(); state != reverse_states.rend(); state++) {
+		reverse_merged.Merge(std::move(*state));
+	}
+	REQUIRE(reverse_merged.GetTuplesSeen() == partition_boundaries.back());
+
+	std::unordered_set<int64_t> reverse_selected;
+	while (true) {
+		auto chunk = reverse_merged.GetChunk();
+		if (!chunk) {
+			break;
+		}
+		for (idx_t row_idx = 0; row_idx < chunk->size(); row_idx++) {
+			const auto value = chunk->GetValue(0, row_idx).GetValue<int64_t>();
+			REQUIRE(StringValue::Get(chunk->GetValue(1, row_idx)) == "value-" + std::to_string(value));
+			REQUIRE(reverse_selected.insert(value).second);
+		}
+	}
+	REQUIRE(reverse_selected == expected);
+}
+
+TEST_CASE("ReservoirSample state merge handles every skewed arrival order",
+          "[serialization][physical_plan][reservoir_sample]") {
+	Allocator allocator;
+	constexpr idx_t sample_count = 7;
+	const vector<idx_t> partition_boundaries {0, 2, 7, 27, 80};
+	vector<unique_ptr<BlockingSample>> states;
+	vector<pair<double, int64_t>> weighted_candidates;
+
+	for (idx_t partition_idx = 0; partition_idx + 1 < partition_boundaries.size(); partition_idx++) {
+		ReservoirSample local(allocator, sample_count, NumericCast<int64_t>(201 + partition_idx));
+		AddReservoirRows(local, allocator, partition_boundaries[partition_idx],
+		                 partition_boundaries[partition_idx + 1]);
+		auto state = RoundTripReservoirState(local);
+		auto &reservoir = state->Cast<ReservoirSample>();
+		auto weights = reservoir.base_reservoir_sample->reservoir_weights;
+		while (!weights.empty()) {
+			const auto entry = weights.top();
+			weights.pop();
+			const auto value = reservoir.Chunk().GetValue(0, entry.second).GetValue<int64_t>();
+			weighted_candidates.emplace_back(-entry.first, value);
+		}
+		states.push_back(std::move(state));
+	}
+
+	std::sort(weighted_candidates.begin(), weighted_candidates.end(),
+	          [](const pair<double, int64_t> &left, const pair<double, int64_t> &right) {
+		          if (left.first != right.first) {
+			          return left.first > right.first;
+		          }
+		          return left.second < right.second;
+	          });
+	std::unordered_set<int64_t> expected;
+	for (idx_t candidate_idx = 0; candidate_idx < sample_count; candidate_idx++) {
+		expected.insert(weighted_candidates[candidate_idx].second);
+	}
+
+	vector<idx_t> arrival_order {0, 1, 2, 3};
+	do {
+		vector<unique_ptr<DataChunk>> output_chunks;
+		{
+			ReservoirSample merged(allocator, sample_count, 999);
+			for (const auto partition_idx : arrival_order) {
+				merged.Merge(states[partition_idx]->Copy());
+			}
+			REQUIRE(merged.GetTuplesSeen() == partition_boundaries.back());
+			while (auto chunk = merged.GetChunk()) {
+				output_chunks.push_back(std::move(chunk));
+			}
+		}
+
+		std::unordered_set<int64_t> selected;
+		for (const auto &chunk : output_chunks) {
+			for (idx_t row_idx = 0; row_idx < chunk->size(); row_idx++) {
+				const auto value = chunk->GetValue(0, row_idx).GetValue<int64_t>();
+				REQUIRE(StringValue::Get(chunk->GetValue(1, row_idx)) == "value-" + std::to_string(value));
+				REQUIRE(selected.insert(value).second);
+			}
+		}
+		REQUIRE(selected == expected);
+	} while (std::next_permutation(arrival_order.begin(), arrival_order.end()));
 }
 
 TEST_CASE("PhysicalLimitPercent serialization roundtrip", "[serialization][physical_plan]") {
@@ -1392,6 +1615,7 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	sink_handle.output_partition_count = 4;
 	sink_handle.flight_host = "worker-only.internal";
 	sink_handle.flight_server_epoch = "sink-epoch";
+	sink_handle.fte_task_identity = true;
 
 	distributed::FlightExchangeConfig flight_config;
 	flight_config.node_id = "node-1";
@@ -1427,6 +1651,7 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	REQUIRE(sink_ptr->SinkHandle().output_partition_count == 4);
 	REQUIRE(sink_ptr->SinkHandle().flight_host.empty());
 	REQUIRE(sink_ptr->SinkHandle().flight_server_epoch == "sink-epoch");
+	REQUIRE(sink_ptr->SinkHandle().fte_task_identity);
 	auto roundtrip_manager =
 	    std::dynamic_pointer_cast<distributed::FlightExchangeManager>(sink_ptr->GetExchangeManager());
 	const std::vector<std::string> expected_local_dirs = {"/session-a/shuffle-0", "/session-a/shuffle-1"};
@@ -1454,19 +1679,48 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	                                                      "diagnostic-stage", 4, RepartitionSpec::Type::Random,
 	                                                      vector<unique_ptr<Expression>> {}, plan_handle, exchange_mgr);
 	auto &sink = sink_op.Cast<PhysicalRemoteExchangeSink>();
+	auto sample_options = make_uniq<SampleOptions>(42);
+	sample_options->sample_size = Value::BIGINT(17);
+	sample_options->is_percentage = false;
+	sample_options->method = SampleMethod::RESERVOIR_SAMPLE;
+	auto &local_sample =
+	    plan.Make<PhysicalDistributedReservoirSample>(vector<LogicalType> {LogicalType::UBIGINT, LogicalType::BLOB},
+	                                                  std::move(sample_options), DistributedReservoirSampleStage::LOCAL,
+	                                                  DConstants::INVALID_INDEX, 1)
+	        .Cast<PhysicalDistributedReservoirSample>();
+	sink.children.push_back(local_sample);
 	plan.SetRoot(sink);
 
 	distributed::ExchangeSinkInstanceTaskDescriptor descriptor;
 	descriptor.sink_instance = plan_handle;
 	descriptor.sink_instance.attempt_id = 2;
 	descriptor.sink_instance.output_location = "opaque-exchange__sink_7__attempt_2";
+	descriptor.sink_instance.fte_task_identity = true;
 
 	string error;
 	auto invalid = descriptor;
+	invalid.sink_instance.fte_task_identity = false;
+	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
+	REQUIRE(error.find("FTE-derived") != string::npos);
+	REQUIRE(sink.SinkHandle().attempt_id == 0);
+	REQUIRE(local_sample.task_index == DConstants::INVALID_INDEX);
+
+	error.clear();
+	invalid = descriptor;
+	invalid.sink_instance.sink_handle.task_partition_id = DConstants::INVALID_INDEX;
+	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
+	REQUIRE(error.find("invalid task identity") != string::npos);
+	REQUIRE(sink.SinkHandle().attempt_id == 0);
+	REQUIRE(local_sample.task_index == DConstants::INVALID_INDEX);
+
+	error.clear();
+	invalid = descriptor;
 	invalid.sink_instance.query_id = "other-query";
 	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
 	REQUIRE(error.find("query") != string::npos);
 	REQUIRE(sink.SinkHandle().attempt_id == 0);
+	REQUIRE(local_sample.task_index == DConstants::INVALID_INDEX);
+	REQUIRE_THROWS_AS(local_sample.GetEffectiveSeed(), InternalException);
 
 	error.clear();
 	invalid = descriptor;
@@ -1483,6 +1737,9 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	REQUIRE(error.empty());
 	REQUIRE(sink.SinkHandle().sink_handle.task_partition_id == 8);
 	REQUIRE(sink.SinkHandle().output_location == "opaque-exchange__sink_8__attempt_2");
+	REQUIRE(local_sample.task_index == 8);
+	REQUIRE(local_sample.options->GetSeed() == 42);
+	REQUIRE_NOTHROW(local_sample.GetEffectiveSeed());
 
 	error.clear();
 	invalid = descriptor;
@@ -1525,6 +1782,7 @@ TEST_CASE("ExchangeSinkInstanceTaskDescriptor serialization preserves the worker
 	descriptor.sink_instance.output_partition_count = 4;
 	descriptor.sink_instance.flight_host = "flight-worker.internal";
 	descriptor.sink_instance.flight_server_epoch = "endpoint-epoch";
+	descriptor.sink_instance.fte_task_identity = true;
 
 	auto roundtrip =
 	    distributed::ExchangeSinkInstanceTaskDescriptor::DeserializeFromBytes(descriptor.SerializeToBytes());
@@ -1536,6 +1794,7 @@ TEST_CASE("ExchangeSinkInstanceTaskDescriptor serialization preserves the worker
 	REQUIRE(roundtrip.sink_instance.output_partition_count == 4);
 	REQUIRE(roundtrip.sink_instance.flight_host == "flight-worker.internal");
 	REQUIRE(roundtrip.sink_instance.flight_server_epoch == "endpoint-epoch");
+	REQUIRE(roundtrip.sink_instance.fte_task_identity);
 }
 
 TEST_CASE("Exchange task descriptors reject missing advertised hosts", "[serialization][physical_plan][exchange]") {
@@ -1557,6 +1816,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 
 	distributed::ExchangeSourceHandle handle0;
 	handle0.partition_id = 0;
+	handle0.source_task_partition_id = 10;
 	handle0.attempt_id = 3;
 	handle0.node_id = "node-1";
 	handle0.flight_host = "flight-node-1.internal";
@@ -1567,6 +1827,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 
 	distributed::ExchangeSourceHandle handle1;
 	handle1.partition_id = 0;
+	handle1.source_task_partition_id = 11;
 	handle1.attempt_id = 4;
 	handle1.node_id = "node-2";
 	handle1.flight_host = "flight-node-2.internal";
@@ -1577,6 +1838,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 
 	distributed::ExchangeSourceHandle handle2;
 	handle2.partition_id = 1;
+	handle2.source_task_partition_id = 10;
 	handle2.attempt_id = 3;
 	handle2.node_id = "node-1";
 	handle2.flight_host = "flight-node-1.internal";
@@ -1614,6 +1876,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	REQUIRE(source_ptr->SourceNodes() == source_nodes);
 	REQUIRE(source_ptr->SourceHandles().size() == source_handles.size());
 	REQUIRE(source_ptr->SourceHandles()[0].partition_id == 0);
+	REQUIRE(source_ptr->SourceHandles()[0].source_task_partition_id == 10);
 	REQUIRE(source_ptr->SourceHandles()[0].attempt_id == 3);
 	REQUIRE(source_ptr->SourceHandles()[0].node_id == "node-1");
 	REQUIRE(source_ptr->SourceHandles()[0].flight_host == "flight-node-1.internal");
@@ -1622,6 +1885,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	REQUIRE(source_ptr->SourceHandles()[0].files.size() == 1);
 	REQUIRE(source_ptr->SourceHandles()[0].files[0].path == "shuffle_stage__sink_0__attempt_0");
 	REQUIRE(source_ptr->SourceHandles()[1].partition_id == 0);
+	REQUIRE(source_ptr->SourceHandles()[1].source_task_partition_id == 11);
 	REQUIRE(source_ptr->SourceHandles()[1].attempt_id == 4);
 	REQUIRE(source_ptr->SourceHandles()[1].node_id == "node-2");
 	REQUIRE(source_ptr->SourceHandles()[1].flight_host == "flight-node-2.internal");
@@ -1630,6 +1894,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	REQUIRE(source_ptr->SourceHandles()[1].files.size() == 1);
 	REQUIRE(source_ptr->SourceHandles()[1].files[0].path == "shuffle_stage__sink_1__attempt_0");
 	REQUIRE(source_ptr->SourceHandles()[2].partition_id == 1);
+	REQUIRE(source_ptr->SourceHandles()[2].source_task_partition_id == 10);
 	REQUIRE(source_ptr->SourceHandles()[2].attempt_id == 3);
 	REQUIRE(source_ptr->SourceHandles()[2].node_id == "node-1");
 	REQUIRE(source_ptr->SourceHandles()[2].flight_host == "flight-node-1.internal");
@@ -1763,6 +2028,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 
 	distributed::ExchangeSourceHandle handle0;
 	handle0.partition_id = 0;
+	handle0.source_task_partition_id = 21;
 	handle0.attempt_id = 7;
 	handle0.node_id = "node-1";
 	handle0.flight_host = "flight-node-1.internal";
@@ -1773,6 +2039,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 
 	distributed::ExchangeSourceHandle handle1;
 	handle1.partition_id = 1;
+	handle1.source_task_partition_id = 22;
 	handle1.attempt_id = 2;
 	handle1.node_id = "node-2";
 	handle1.flight_host = "flight-node-2.internal";
@@ -1788,6 +2055,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	REQUIRE(roundtrip.source_task_count == 2);
 	REQUIRE(roundtrip.source_handles.size() == 2);
 	REQUIRE(roundtrip.source_handles[0].partition_id == 0);
+	REQUIRE(roundtrip.source_handles[0].source_task_partition_id == 21);
 	REQUIRE(roundtrip.source_handles[0].attempt_id == 7);
 	REQUIRE(roundtrip.source_handles[0].node_id == "node-1");
 	REQUIRE(roundtrip.source_handles[0].flight_host == "flight-node-1.internal");
@@ -1797,6 +2065,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	REQUIRE(roundtrip.source_handles[0].files[0].path == "shuffle_stage__sink_0__attempt_7");
 	REQUIRE(roundtrip.source_handles[0].files[0].file_size == 11);
 	REQUIRE(roundtrip.source_handles[1].partition_id == 1);
+	REQUIRE(roundtrip.source_handles[1].source_task_partition_id == 22);
 	REQUIRE(roundtrip.source_handles[1].attempt_id == 2);
 	REQUIRE(roundtrip.source_handles[1].node_id == "node-2");
 	REQUIRE(roundtrip.source_handles[1].flight_host == "flight-node-2.internal");

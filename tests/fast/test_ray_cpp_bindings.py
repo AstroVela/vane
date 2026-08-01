@@ -572,6 +572,7 @@ def test_exchange_source_task_descriptor_preserves_attempt_ids():
     handles = [
         {
             "partition_id": 0,
+            "source_task_partition_id": 11,
             "attempt_id": 7,
             "node_id": "node-a",
             "flight_port": 5010,
@@ -580,6 +581,7 @@ def test_exchange_source_task_descriptor_preserves_attempt_ids():
         },
         {
             "partition_id": 1,
+            "source_task_partition_id": 11,
             "attempt_id": 2,
             "node_id": "node-b",
             "flight_port": 5011,
@@ -597,6 +599,13 @@ def test_exchange_source_task_descriptor_preserves_attempt_ids():
 
     assert duckdb.ray_cxx.exchange_source_task_partition_indices(raw) == [0, 1]
     assert duckdb.ray_cxx.exchange_source_task_replicated(raw) is False
+    assert duckdb.ray_cxx.exchange_source_task_logical_identity(raw) == {
+        "partition_indices": [0, 1],
+        "source_task_partition_ids": [11],
+        "source_partition_count": 2,
+        "source_task_count": 2,
+        "replicated": False,
+    }
     assert duckdb.ray_cxx.exchange_source_task_source_handles_for_test(raw) == handles
 
     split = duckdb.ray_cxx.split_exchange_source_task_by_partition(raw)
@@ -2498,6 +2507,26 @@ def _make_two_file_dynamic_scan_plan(tmp_path):
     node_id, descriptors = next(iter(scan_task_descriptors.items()))
     assert len(descriptors) == 2
     return con, plan, str(node_id), descriptors
+
+
+def test_scan_task_descriptors_have_stable_distinct_logical_partitions_for_duplicate_files(tmp_path):
+    pytest.importorskip("pyarrow")
+
+    con = duckdb.connect()
+    source = tmp_path / "duplicate_scan_source.parquet"
+    con.execute(f"COPY (SELECT * FROM range(3)) TO '{source}' (FORMAT PARQUET)")
+    relation = con.sql(f"SELECT * FROM read_parquet(['{source}', '{source}'])")
+    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation,
+        str(uuid.uuid4()),
+    ).to_physical_plan(con)
+    descriptor_map = plan.scan_task_descriptor_map()
+    assert len(descriptor_map) == 1
+    descriptors = next(iter(descriptor_map.values()))
+    assert len(descriptors) == 2
+
+    assert [duckdb.ray_cxx.scan_task_source_partition_id(bytes(item)) for item in descriptors] == [0, 1]
+    assert bytes(descriptors[0]) != bytes(descriptors[1])
 
 
 def test_distributed_physical_plan_clones_use_independent_fte_scan_queues(tmp_path):

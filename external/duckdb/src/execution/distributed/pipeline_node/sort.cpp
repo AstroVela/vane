@@ -318,6 +318,7 @@ static DuckDBResult<void> RecordOrderByExchangeSinkOutput(Exchange &exchange, co
 		node_id = *worker_id;
 	}
 	const auto &sink_instance = output.exchange_sink_instance();
+	exchange.AddSink(sink_instance.sink_handle.task_partition_id);
 	exchange.SinkFinished(sink_instance, node_id, output.flight_port());
 	return DuckDBResult<void>::ok();
 }
@@ -522,6 +523,7 @@ BuildExchangeSourceTasks(const PipelineNodeContext &context, const PipelineNodeC
 		}
 		task_context_map["fragment_id"] = effective_query_id + ":orderby:" + std::to_string(context.node_id()) + ":" +
 		                                  task_name + ":" + std::to_string(task_idx);
+		task_context_map["stable_task_partition_id"] = std::to_string(task_idx);
 		task_context_map["preserve_plan_exchange_sink_instance"] = "1";
 		WorkerTask task(task_context, plan, config.execution_config(), std::move(task_context_map), task_name);
 		tasks.push_back(std::move(task));

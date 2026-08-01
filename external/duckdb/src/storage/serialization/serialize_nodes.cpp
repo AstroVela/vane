@@ -441,12 +441,14 @@ void ReservoirSample::Serialize(Serializer &serializer) const {
 	BlockingSample::Serialize(serializer);
 	serializer.WritePropertyWithDefault<idx_t>(200, "sample_count", sample_count);
 	serializer.WritePropertyWithDefault<unique_ptr<ReservoirChunk>>(201, "reservoir_chunk", reservoir_chunk);
+	serializer.WritePropertyWithDefault<bool>(202, "stats_sample", stats_sample, true);
 }
 
 unique_ptr<BlockingSample> ReservoirSample::Deserialize(Deserializer &deserializer) {
 	auto sample_count = deserializer.ReadPropertyWithDefault<idx_t>(200, "sample_count");
 	auto reservoir_chunk = deserializer.ReadPropertyWithDefault<unique_ptr<ReservoirChunk>>(201, "reservoir_chunk");
-	auto result = duckdb::unique_ptr<ReservoirSample>(new ReservoirSample(sample_count, std::move(reservoir_chunk)));
+	auto stats_sample = deserializer.ReadPropertyWithExplicitDefault<bool>(202, "stats_sample", true);
+	auto result = duckdb::unique_ptr<ReservoirSample>(new ReservoirSample(sample_count, std::move(reservoir_chunk), stats_sample));
 	return std::move(result);
 }
 
@@ -490,6 +492,7 @@ void SampleOptions::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<bool>(101, "is_percentage", is_percentage);
 	serializer.WriteProperty<SampleMethod>(102, "method", method);
 	serializer.WritePropertyWithDefault<int64_t>(103, "seed", GetSeed());
+	serializer.WritePropertyWithDefault<bool>(104, "repeatable", repeatable, false);
 }
 
 unique_ptr<SampleOptions> SampleOptions::Deserialize(Deserializer &deserializer) {
@@ -501,6 +504,7 @@ unique_ptr<SampleOptions> SampleOptions::Deserialize(Deserializer &deserializer)
 	result->sample_size = sample_size;
 	result->is_percentage = is_percentage;
 	result->method = method;
+	deserializer.ReadPropertyWithExplicitDefault<bool>(104, "repeatable", result->repeatable, false);
 	return result;
 }
 

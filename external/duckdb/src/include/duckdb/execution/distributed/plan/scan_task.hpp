@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "duckdb/common/constants.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -33,6 +34,9 @@ struct ScanTaskDescriptor {
 	vector<OpenFileInfo> files;
 	idx_t estimated_cardinality = 0;
 	idx_t estimated_bytes = 0;
+	//! Stable ordinal within the logical scan source. This distinguishes
+	//! repeated occurrences of an otherwise identical file descriptor.
+	idx_t source_task_partition_id = DConstants::INVALID_INDEX;
 
 	idx_t file_count() const {
 		return static_cast<idx_t>(files.size());

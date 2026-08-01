@@ -165,6 +165,8 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "STREAMING_UDF";
 	case PhysicalOperatorType::GROUPING_SET_EXPAND:
 		return "GROUPING_SET_EXPAND";
+	case PhysicalOperatorType::DISTRIBUTED_RESERVOIR_SAMPLE:
+		return "DISTRIBUTED_RESERVOIR_SAMPLE";
 	case PhysicalOperatorType::CREATE_TYPE:
 		return "CREATE_TYPE";
 	case PhysicalOperatorType::ATTACH:

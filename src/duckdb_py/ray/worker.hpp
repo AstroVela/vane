@@ -32,6 +32,7 @@ public:
 	struct QueryStatus {
 		bool failed = false;
 		bool finished = false;
+		bool matched = true;
 		std::string message;
 		std::unordered_set<string> selected_attempt_task_ids;
 	};
@@ -57,7 +58,10 @@ public:
 	void SubmitFteTaskEvents(const std::vector<WorkerTask> &tasks);
 	void TaskInputStreamExhaustedForQuery(const string &query_id,
 	                                      const std::unordered_set<duckdb::distributed::SourceNodeId> &source_node_ids);
-	QueryStatus FteQueryStatus(const string &query_id);
+	QueryStatus
+	FteQueryStatus(const string &query_id,
+	               const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
+	                   *task_context_filter = nullptr);
 	std::vector<RayTaskResultHandle> PopFteResultHandles(const string &query_id);
 	void PrepareDropQuery(const string &query_id);
 	void CleanupQuery(const string &query_id);

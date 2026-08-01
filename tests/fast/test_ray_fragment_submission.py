@@ -444,6 +444,7 @@ def _patch_ray_worker_handle_test_state(monkeypatch):
     worker_handle_mod._stop_fte_status_watchers()
     worker_handle_mod._FTE_FRAGMENT_EXECUTION_IDS.clear()
     worker_handle_mod._FTE_QUERY_NEXT_FRAGMENT_EXECUTION_ID.clear()
+    worker_handle_mod._FTE_STABLE_TASK_IDENTITY_KEYS_BY_RESOURCE_QUERY.clear()
     worker_handle_mod._FTE_FRAGMENT_EXECUTIONS.clear()
     worker_handle_mod._FTE_PARTITION_OWNERS.clear()
     worker_handle_mod._FTE_SEQUENCES.clear()
@@ -574,6 +575,126 @@ def test_fragment_plan_cache_drop_uses_exact_query_ownership(monkeypatch):
 
 def _create_requests(actor):
     return [call[1] for call in actor.fte_calls if call[0] == "create"]
+
+
+def test_fte_materialized_sink_identity_is_independent_of_fragment_registration_order():
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    first_query_id = "query-logical-fragment-order-a"
+    second_query_id = "query-logical-fragment-order-b"
+    node_ids = ("7", "42")
+    for query_id in (first_query_id, second_query_id):
+        _register_test_query_graph(
+            query_id,
+            [f"{query_id}:node:{node_id}" for node_id in node_ids],
+        )
+
+    def submit_fragments(query_id, ordered_node_ids):
+        request_offset = len(_create_requests(actor))
+        handles = handle.submit_tasks(
+            [
+                _FakeTask(
+                    name=f"sample-input-{node_id}",
+                    context={"query_id": query_id, "node_id": node_id},
+                    inputs={node_id: {"kind": "scan_task", "data": node_id.encode()}},
+                    exchange_sink_instance={
+                        "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+                        "task_partition_id": 0,
+                        "partition_id": 0,
+                        "attempt_id": 0,
+                        "output_location": f"{query_id}_coordinator__sink_0__attempt_0",
+                        "fte_task_identity": True,
+                    },
+                )
+                for node_id in ordered_node_ids
+            ]
+        )
+        assert len(handles) == len(ordered_node_ids)
+        requests = _create_requests(actor)[request_offset:]
+        return {
+            request["fragment_id"].rsplit(":node:", 1)[1]: request
+            for request in requests
+            if request["task_id"]["query_id"] == query_id
+        }
+
+    first_by_node = submit_fragments(first_query_id, ("42", "7"))
+    second_by_node = submit_fragments(second_query_id, ("7", "42"))
+
+    for node_id in node_ids:
+        assert (
+            first_by_node[node_id]["exchange_sink_instance"]["task_partition_id"]
+            == second_by_node[node_id]["exchange_sink_instance"]["task_partition_id"]
+        )
+    assert (
+        first_by_node["7"]["exchange_sink_instance"]["task_partition_id"]
+        != first_by_node["42"]["exchange_sink_instance"]["task_partition_id"]
+    )
+    assert (
+        first_by_node["7"]["task_id"]["fragment_execution_id"]
+        != second_by_node["7"]["task_id"]["fragment_execution_id"]
+    )
+
+
+def test_fte_materialized_sink_identity_distinguishes_explicit_fragments_in_one_stage():
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+
+    def submit_fragments(resource_query_id, ordered_task_indices):
+        execution_query_id = f"{resource_query_id}_orderby_42_final"
+        resource_stage_id = f"stage:{resource_query_id}:node:42:fte"
+        _register_test_query_graph(resource_query_id, [f"{resource_query_id}:node:42"])
+        request_offset = len(_create_requests(actor))
+        handles = handle.submit_tasks(
+            [
+                _FakeTask(
+                    name="OrderByFinal",
+                    context={
+                        "query_id": execution_query_id,
+                        "resource_query_id": resource_query_id,
+                        "resource_stage_id": resource_stage_id,
+                        "fragment_id": f"{execution_query_id}:orderby:42:OrderByFinal:{task_idx}",
+                        "stable_task_partition_id": str(task_idx),
+                    },
+                    exchange_sink_instance={
+                        "sink_handle": {"task_partition_id": 0, "partition_id": 0},
+                        "task_partition_id": 0,
+                        "partition_id": 0,
+                        "attempt_id": 0,
+                        "output_location": f"{execution_query_id}_coordinator__sink_0__attempt_0",
+                        "fte_task_identity": True,
+                    },
+                )
+                for task_idx in ordered_task_indices
+            ]
+        )
+        assert len(handles) == len(ordered_task_indices)
+        requests = _create_requests(actor)[request_offset:]
+        return {request["fragment_id"].rsplit(":", 1)[1]: request for request in requests}
+
+    first_by_task = submit_fragments("query-explicit-fragment-a", (1, 0))
+    second_by_task = submit_fragments("query-explicit-fragment-b", (0, 1))
+
+    for task_idx in ("0", "1"):
+        assert (
+            first_by_task[task_idx]["exchange_sink_instance"]["task_partition_id"]
+            == second_by_task[task_idx]["exchange_sink_instance"]["task_partition_id"]
+        )
+    assert (
+        first_by_task["0"]["exchange_sink_instance"]["task_partition_id"]
+        != first_by_task["1"]["exchange_sink_instance"]["task_partition_id"]
+    )
+    assert (
+        first_by_task["0"]["task_id"]["fragment_execution_id"]
+        != second_by_task["0"]["task_id"]["fragment_execution_id"]
+    )
+
+
+def test_fte_stable_task_identity_registry_rejects_hash_collisions():
+    fragment_submission_mod._register_fte_stable_task_identity("query-collision", 17, "logical-task-a")
+    fragment_submission_mod._register_fte_stable_task_identity("query-collision", 17, "logical-task-a")
+
+    with pytest.raises(ValueError, match="stable Ray FTE task identity collision"):
+        fragment_submission_mod._register_fte_stable_task_identity("query-collision", 17, "logical-task-b")
 
 
 def test_submit_tasks_rejects_missing_query_id_before_registering_fragment():
@@ -9228,7 +9349,10 @@ def test_fte_attempt_create_starts_status_watcher(monkeypatch):
 
     assert ("wait_status", running.task_id.to_dict(), None, 1.0) in actor.fte_calls
     query_status = handle.fte_query_status("query-fte-watcher")
-    assert query_status["finished"] is True
+    assert query_status["finished"] is False
+    fragment_status = next(iter(query_status["fragment_executions"].values()))
+    assert fragment_status["finished_count"] == 1
+    assert fragment_status["no_more_partitions"] is False
     assert handle.fte_registry_stats()["status_watcher_count"] == 0
 
 

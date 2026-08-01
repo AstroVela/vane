@@ -75,6 +75,7 @@ from duckdb.runners.ray.fragment_registry import (
     _FTE_RETRY_DELAYS,
     _FTE_SCHEDULERS,
     _FTE_SEQUENCES,
+    _FTE_STABLE_TASK_IDENTITY_KEYS_BY_RESOURCE_QUERY,
     _FTE_STAGE_SUBMISSION_BLOCKS,
     _FTE_STAGE_SUBMISSION_PROBES,
     _FTE_STATUS_WATCHERS,
@@ -684,6 +685,10 @@ def open_fte_registry_for_query(query_id: str) -> None:
                 ),
                 ("retry_delay", query_key in _FTE_RETRY_DELAYS),
                 ("fragment_execution_counter", query_key in _FTE_QUERY_NEXT_FRAGMENT_EXECUTION_ID),
+                (
+                    "stable_task_identities",
+                    query_key in _FTE_STABLE_TASK_IDENTITY_KEYS_BY_RESOURCE_QUERY,
+                ),
                 ("event_scheduler", _FTE_SCHEDULERS.get(query_key) is not None),
                 (
                     "fragment_plan_refs",
@@ -778,8 +783,6 @@ def fte_query_remote_teardown_blockers(query_id: str) -> tuple[str, ...]:
         if teardown_count:
             blockers.append(f"active_teardown={teardown_count}")
         for worker_id, handle in _FTE_WORKER_HANDLES.items():
-            if handle is None:
-                continue
             if _worker_has_fte_control_state_for_query(handle, query_key):
                 blockers.append(f"worker_control={worker_id}")
             if _worker_has_fte_teardown_state_for_query(handle, query_key):
@@ -829,6 +832,7 @@ def _drop_fte_registry_for_query(query_id: str) -> None:
                 _FTE_FRAGMENT_STATES.pop(key, None)
         _FTE_RETRY_DELAYS.pop(query_id, None)
         _FTE_QUERY_NEXT_FRAGMENT_EXECUTION_ID.pop(query_id, None)
+        _FTE_STABLE_TASK_IDENTITY_KEYS_BY_RESOURCE_QUERY.pop(query_id, None)
         _FTE_ACTIVE_OPERATIONS_BY_QUERY.pop(query_id, None)
         worker_handles = [handle for handle in _FTE_WORKER_HANDLES.values() if handle is not None]
         _FTE_REGISTRY_CONDITION.notify_all()

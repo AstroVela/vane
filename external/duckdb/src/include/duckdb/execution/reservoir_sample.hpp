@@ -184,7 +184,7 @@ public:
 	constexpr static double SAVE_PERCENTAGE = 0.01;
 
 	ReservoirSample(Allocator &allocator, idx_t sample_count, int64_t seed = 1);
-	explicit ReservoirSample(idx_t sample_count, unique_ptr<ReservoirChunk> = nullptr);
+	explicit ReservoirSample(idx_t sample_count, unique_ptr<ReservoirChunk> = nullptr, bool stats_sample = true);
 
 	//! methods used to help with serializing and deserializing
 	void EvictOverBudgetSamples();
@@ -213,6 +213,9 @@ public:
 	void AddToReservoir(DataChunk &input) override;
 	//! Merge two Reservoir Samples. Other must be a reservoir sample
 	void Merge(unique_ptr<BlockingSample> other);
+	//! Compact the sample and materialize comparable reservoir weights before
+	//! transporting it to another process for merging.
+	void PrepareForMerge();
 
 	void ShuffleSel(SelectionVector &sel, idx_t range, idx_t size) const;
 

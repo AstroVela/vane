@@ -795,10 +795,12 @@ std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 
 	for (idx_t partition_id = 0; partition_id < output_partition_count_; partition_id++) {
 		for (const auto &entry : selected_attempts) {
+			const auto source_task_partition_id = entry.first;
 			const auto attempt_id = entry.second.attempt_id;
 			const auto &attempt_metadata = entry.second;
 			ExchangeSourceHandle handle;
 			handle.partition_id = partition_id;
+			handle.source_task_partition_id = source_task_partition_id;
 			handle.attempt_id = attempt_id;
 			handle.node_id = attempt_metadata.node_id;
 			if (FlightExchangeUsesNetworkTransport(config_)) {

@@ -324,6 +324,7 @@ void ScanTaskDescriptor::Serialize(Serializer &serializer) const {
 	});
 	serializer.WriteProperty(3, "estimated_cardinality", estimated_cardinality);
 	serializer.WriteProperty(4, "estimated_bytes", estimated_bytes);
+	serializer.WriteProperty(5, "source_task_partition_id", source_task_partition_id);
 }
 
 ScanTaskDescriptor ScanTaskDescriptor::Deserialize(Deserializer &deserializer) {
@@ -343,6 +344,7 @@ ScanTaskDescriptor ScanTaskDescriptor::Deserialize(Deserializer &deserializer) {
 	});
 	deserializer.ReadPropertyWithDefault<idx_t>(3, "estimated_cardinality", desc.estimated_cardinality);
 	deserializer.ReadPropertyWithDefault<idx_t>(4, "estimated_bytes", desc.estimated_bytes);
+	desc.source_task_partition_id = deserializer.ReadProperty<idx_t>(5, "source_task_partition_id");
 	return desc;
 }
 

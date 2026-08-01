@@ -1785,6 +1785,7 @@ TEST_CASE("Exchange: FlightExchange selects first successful sink attempt", "[di
 		REQUIRE(handle.files.size() == 1);
 		if (handle.files[0].path.find("__sink_0__") != std::string::npos) {
 			sink0_handles++;
+			REQUIRE(handle.source_task_partition_id == 0);
 			REQUIRE(handle.attempt_id == 1);
 			REQUIRE(handle.node_id == "worker-retry");
 			REQUIRE(handle.flight_host == "flight-retry.internal");
@@ -1794,6 +1795,7 @@ TEST_CASE("Exchange: FlightExchange selects first successful sink attempt", "[di
 			REQUIRE(handle.files[0].path.find("__attempt_0") == std::string::npos);
 		} else if (handle.files[0].path.find("__sink_1__") != std::string::npos) {
 			sink1_handles++;
+			REQUIRE(handle.source_task_partition_id == 1);
 			REQUIRE(handle.attempt_id == 0);
 			REQUIRE(handle.node_id == "worker-first");
 			REQUIRE(handle.flight_host == "flight-first.internal");

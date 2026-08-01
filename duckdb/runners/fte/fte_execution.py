@@ -33,6 +33,7 @@ from duckdb.runners.fte.fte_events import (
 )
 from duckdb.runners.fte.fte_exchange import (
     _sink_instance_payload,
+    _stable_fte_task_identity,
     derive_exchange_sink_instance_for_attempt,
 )
 from duckdb.runners.fte.fte_failures import (
@@ -451,6 +452,8 @@ class FteFragmentExecution:
         fragment_execution_id: int,
         *,
         fragment_id: str,
+        logical_fragment_identity: str | None = None,
+        stable_task_identity_callback: Callable[[int, str], None] | None = None,
         worker: Any = None,
         worker_id: str | None = None,
         worker_selector: Callable[[FteTaskPartition], Any] | None = None,
@@ -479,6 +482,12 @@ class FteFragmentExecution:
         self.fragment_id = str(fragment_id).strip()
         if not self.fragment_id:
             raise ValueError("fragment_id must be non-empty")
+        self.logical_fragment_identity = (
+            None if logical_fragment_identity is None else str(logical_fragment_identity).strip()
+        )
+        if logical_fragment_identity is not None and not self.logical_fragment_identity:
+            raise ValueError("logical_fragment_identity must be non-empty")
+        self.stable_task_identity_callback = stable_task_identity_callback
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
         self.worker = worker
@@ -1496,6 +1505,7 @@ class FteFragmentExecution:
                 )
             return {
                 "failed": bool(self.failed),
+                "no_more_partitions": bool(self.no_more_partitions),
                 "partitions": partitions,
             }
 
@@ -1511,20 +1521,33 @@ class FteFragmentExecution:
             raise RuntimeError("FTE attempt mutation requires the fragment state lock")
         if self.partitions.get(partition.task_id.partition_id) is not partition:
             raise ValueError(f"partition {partition.task_id} does not belong to this fragment execution")
-        worker_id, worker = self._select_worker(partition)
         sink_instance = None
+        if self.exchange is None and partition.descriptor.exchange_sink_instance is not None:
+            sink_payload = _sink_instance_payload(partition.descriptor.exchange_sink_instance)
+            stable_task_identity = None
+            if sink_payload.get("fte_task_identity"):
+                logical_fragment_identity = self.logical_fragment_identity
+                if logical_fragment_identity is None:
+                    raise ValueError("FTE-derived exchange sink identity requires a stable logical fragment identity")
+                stable_task_identity, identity_key = _stable_fte_task_identity(
+                    logical_fragment_identity,
+                    partition.task_id.partition_id,
+                )
+                if self.stable_task_identity_callback is not None:
+                    self.stable_task_identity_callback(stable_task_identity, identity_key)
+            sink_instance = derive_exchange_sink_instance_for_attempt(
+                partition.descriptor.exchange_sink_instance,
+                partition.next_attempt_number(),
+                task_partition_id=partition.task_id.partition_id,
+                stable_task_identity=stable_task_identity,
+            )
+        worker_id, worker = self._select_worker(partition)
         if self.exchange is not None:
             if partition.sink_handle is None:
                 partition.sink_handle = self.exchange.add_sink(partition.task_id.partition_id)
             sink_instance = self.exchange.instantiate_sink(
                 partition.sink_handle,
                 partition.next_attempt_number(),
-            )
-        elif partition.descriptor.exchange_sink_instance is not None:
-            sink_instance = derive_exchange_sink_instance_for_attempt(
-                partition.descriptor.exchange_sink_instance,
-                partition.next_attempt_number(),
-                partition.task_id.partition_id,
             )
         scheduled = partition.start_attempt(
             sink_instance=sink_instance,

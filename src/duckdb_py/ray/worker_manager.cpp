@@ -920,7 +920,10 @@ RayWorkerManager::wait_fte_query(const string &query_id, double timeout_s) {
 	return wait_fte_query(query_id, timeout_s, {});
 }
 
-DuckDBResult<RayWorkerRuntime::QueryStatus> RayWorkerManager::FteQueryStatus(const string &query_id) {
+DuckDBResult<RayWorkerRuntime::QueryStatus> RayWorkerManager::FteQueryStatus(
+    const string &query_id,
+    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
+        *task_context_filter) {
 	if (query_id.empty()) {
 		return DuckDBResult<RayWorkerRuntime::QueryStatus>::err(DuckDBError::value_error("query_id must be non-empty"));
 	}
@@ -934,7 +937,7 @@ DuckDBResult<RayWorkerRuntime::QueryStatus> RayWorkerManager::FteQueryStatus(con
 	}
 	try {
 		for (auto &worker : workers) {
-			auto status = worker->FteQueryStatus(query_id);
+			auto status = worker->FteQueryStatus(query_id, task_context_filter);
 			return DuckDBResult<RayWorkerRuntime::QueryStatus>::ok(std::move(status));
 		}
 	} catch (const std::exception &e) {
@@ -977,7 +980,8 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 
 	try {
 		while (true) {
-			auto status_res = FteQueryStatus(query_id);
+			const auto *task_context_filter = task_contexts.empty() ? nullptr : &task_contexts;
+			auto status_res = FteQueryStatus(query_id, task_context_filter);
 			if (status_res.is_err()) {
 				ClearFteResultHandles(query_id);
 				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(status_res.error());
@@ -993,7 +997,11 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 				ClearFteResultHandles(query_id);
 				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(collect_res.error());
 			}
-			if (status.finished) {
+			// A materializer can enter this wait immediately after submitting
+			// its events while another thread is still registering the matching
+			// fragment. Treat an unmatched scope as pending until it either
+			// appears, the query fails, or the ordinary wait deadline expires.
+			if ((!task_context_filter || status.matched) && status.finished) {
 				finished_status = status;
 				has_finished_status = true;
 				break;

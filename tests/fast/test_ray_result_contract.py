@@ -6146,7 +6146,7 @@ def test_describe_native_progress_materializes_deferred_clone_without_execution(
     assert scan_pipeline["input_rows"] == 10
 
 
-def test_remote_exchange_sink_accepts_nested_query_id_without_result_collector(
+def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_collector(
     tmp_path,
     monkeypatch,
     request,
@@ -6164,6 +6164,17 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_result_collector(
 
         def submit_tasks(self, tasks):
             self.tasks.extend(tasks)
+            return []
+
+        def fte_query_status(self, _query_id, _task_contexts=None):
+            return {
+                "failed": False,
+                "finished": True,
+                "matched": True,
+                "selected_attempt_task_ids": [],
+            }
+
+        def pop_fte_result_handles(self, _query_id):
             return []
 
         def stats_fragments(self):
@@ -6242,6 +6253,7 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_result_collector(
     assert sink_topologies
     assert len(sink_results) == len(sink_topologies)
     assert all(result.flight_port > 0 for result in sink_results)
+    assert all(result.completion_status == "executed" for result in sink_results)
     ordinary_result = runner.execute_native(con.cursor(), _make_test_physical_plan(con), None, None)
     assert ordinary_result.flight_port == 0
     assert ordinary_result.exchange_sink_instance is None
@@ -6255,7 +6267,7 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_result_collector(
         assert [(pipeline["pipeline_id"], pipeline["operators"]) for pipeline in final_pipelines] == [
             (pipeline["pipeline_id"], pipeline["operators"]) for pipeline in topology["pipelines"]
         ]
-        assert sum(pipeline["input_rows"] for pipeline in final_pipelines) == 32
+        assert sum(pipeline["input_rows"] for pipeline in final_pipelines) == 32, final_pipelines
         assert all(
             pipeline["total_pipeline_tasks"] > 0
             and pipeline["completed_pipeline_tasks"] == pipeline["total_pipeline_tasks"]
