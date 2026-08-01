@@ -859,6 +859,58 @@ def test_cleanup_tickets_retry_transient_failure_without_starving_peer():
         collector.shutdown()
 
 
+def test_cleanup_ticket_ledger_retains_ownership_when_loop_notification_fails(
+    monkeypatch,
+):
+    collector = AsyncResultCollector(ray_module=_FakeRay())
+    operation_calls = []
+    original_call_soon_threadsafe = collector._loop.call_soon_threadsafe
+
+    def fail_notification(*_args, **_kwargs):
+        raise RuntimeError("planned cleanup loop notification failure")
+
+    monkeypatch.setattr(
+        collector._loop,
+        "call_soon_threadsafe",
+        fail_notification,
+    )
+    tickets = collector._submit_cleanup_operations(
+        (
+            RayStreamCleanupOperation(
+                lambda: operation_calls.append("cleaned"),
+                submission_scope=_CLEANUP_SUBMISSION_SCOPE,
+            ),
+        ),
+        store_error=False,
+        slot_ids=(17,),
+    )
+
+    with collector._cv:
+        assert set(tickets) <= collector._cleanup_tickets
+        assert set(tickets) <= collector._cleanup_tickets_by_slot[17]
+        assert "planned cleanup loop notification failure" in str(collector._thread_error)
+    assert operation_calls == []
+
+    monkeypatch.setattr(
+        collector._loop,
+        "call_soon_threadsafe",
+        original_call_soon_threadsafe,
+    )
+    original_call_soon_threadsafe(
+        collector._start_cleanup_tickets,
+        tickets,
+    )
+    assert (
+        _wait_cleanup_tickets(
+            tickets,
+            timeout_message="retained cleanup ticket did not finish",
+        )
+        == ()
+    )
+    assert operation_calls == ["cleaned"]
+    collector.shutdown()
+
+
 def test_cleanup_ticket_preserves_incomplete_ownership_retry():
     collector = AsyncResultCollector(ray_module=_FakeRay())
     attempts = 0
@@ -3014,3 +3066,58 @@ def test_shutdown_clears_callback_and_fully_joins_owned_thread():
     assert collector._wakeup_fn is None
     assert collector._thread.is_alive() is False
     assert collector._cleanup_tickets == set()
+
+
+def test_shutdown_cleanup_handoff_failure_is_retryable(monkeypatch):
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    generator = _Generator([], completed=False)
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector.track_generator_ref(
+        8,
+        81,
+        _source(
+            fake_ray,
+            driver,
+            request_id="shutdown-handoff-retry",
+            submitter=lambda _lease: generator,
+        ),
+    )
+    output_request = {
+        "request_id": "output-request:shutdown-handoff-retry",
+    }
+    with collector._cv:
+        collector._records[(8, 81)].output_request = output_request
+    original_submit = collector._submit_cleanup_operations
+    fail_next_handoff = True
+
+    def fail_one_cleanup_handoff(*args, **kwargs):
+        nonlocal fail_next_handoff
+        if fail_next_handoff:
+            fail_next_handoff = False
+            raise RuntimeError("planned shutdown cleanup handoff failure")
+        return original_submit(*args, **kwargs)
+
+    monkeypatch.setattr(
+        collector,
+        "_submit_cleanup_operations",
+        fail_one_cleanup_handoff,
+    )
+
+    with pytest.raises(RuntimeError, match="planned shutdown cleanup handoff failure"):
+        collector.shutdown()
+
+    assert collector._records
+    assert collector._thread.is_alive()
+
+    collector.shutdown()
+
+    assert collector._records == {}
+    assert collector._cleanup_tickets == set()
+    assert collector._thread.is_alive() is False
+    assert fake_ray.cancel_calls == [
+        (generator, {"force": True, "recursive": True}),
+    ]
+    assert driver.cancel_query_output_block_lease_request.calls == [
+        ((output_request,), {}),
+    ]

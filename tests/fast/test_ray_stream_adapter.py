@@ -214,7 +214,12 @@ def test_adapter_advances_generator_asynchronously_and_never_gets_data_ref():
     metadata_ref = _Ref({"size_bytes": 10})
     generator = _Generator([])
     generator.refs = [block_ref, metadata_ref]
-    adapter = RayStreamAdapter(generator, ray_module=fake_ray)
+    source = _leased_source(
+        fake_ray,
+        generator,
+        request_id="request-async-read",
+    )
+    adapter = RayStreamAdapter(source, ray_module=fake_ray)
 
     assert adapter.waitable is generator
     assert generator.read_calls == []
@@ -233,8 +238,14 @@ def test_adapter_advances_generator_asynchronously_and_never_gets_data_ref():
 
 
 def test_adapter_uses_public_completion_ref_for_stream_lifecycle():
+    fake_ray = _FakeRay()
     generator = _Generator([])
-    adapter = RayStreamAdapter(generator, ray_module=_FakeRay())
+    source = _leased_source(
+        fake_ray,
+        generator,
+        request_id="request-public-completion",
+    )
+    adapter = RayStreamAdapter(source, ray_module=fake_ray)
 
     assert adapter.completion_ref is generator.completion
     assert adapter.stream_finished() is True
@@ -258,7 +269,12 @@ def test_stream_cleanup_retries_without_blocking_on_an_active_read():
 
         fake_ray = _FakeRay()
         generator = _BlockedGenerator([])
-        adapter = RayStreamAdapter(generator, ray_module=fake_ray)
+        source = _leased_source(
+            fake_ray,
+            generator,
+            request_id="request-active-read",
+        )
+        adapter = RayStreamAdapter(source, ray_module=fake_ray)
         read = asyncio.create_task(adapter.read_next_ref_async())
         await read_started.wait()
 
@@ -282,6 +298,21 @@ def _admission(driver, request_id="request-1", *, lease=None):
         lease=_lease() if lease is None else lease,
         submission_scope=f"test-stream:{request_id}",
     )
+
+
+def _leased_source(fake_ray, generator, *, request_id):
+    driver = _driver({"granted": True, "lease": _lease()})
+    return TaskLeaseObjectRefGenerator(
+        admission=_admission(driver, request_id),
+        submitter=lambda _lease: generator,
+        ray_module=fake_ray,
+    )
+
+
+def test_adapter_rejects_raw_generator_without_task_lease():
+    fake_ray = _FakeRay()
+    with pytest.raises(TypeError, match="requires a TaskLeaseObjectRefGenerator"):
+        RayStreamAdapter(_Generator([]), ray_module=fake_ray)
 
 
 def test_task_lease_stream_submits_immediately_from_pregranted_admission():
@@ -349,6 +380,27 @@ def test_invalid_submitted_stream_hands_cancelled_lease_to_query_teardown():
         (("request-invalid-stream", "lease-1", "attempt-1"), {}),
     ]
     assert driver.release_query_task_lease_after_completion.calls == []
+
+
+def test_missing_submitted_stream_hands_lease_to_query_teardown_without_cancel():
+    fake_ray = _FakeRay()
+    driver = _driver({"granted": True, "lease": _lease()})
+    source = TaskLeaseObjectRefGenerator(
+        admission=_admission(driver, "request-missing-stream"),
+        submitter=lambda _lease: None,
+        ray_module=fake_ray,
+    )
+
+    with pytest.raises(TypeError, match="did not return an ObjectRefGenerator"):
+        RayStreamAdapter(source, ray_module=fake_ray)
+
+    cancel, handoff = source.cancel_operations()
+    assert cancel() is True
+    assert handoff() is True
+    assert fake_ray.cancel_calls == []
+    assert driver.handoff_query_task_lease_to_teardown.calls == [
+        (("request-missing-stream", "lease-1", "attempt-1"), {}),
+    ]
 
 
 def test_missing_completion_ref_cannot_handoff_before_cancel_submission():
@@ -508,7 +560,12 @@ def test_retiring_terminal_failure_does_not_cancel_already_ending_remote_work():
 def test_terminal_stream_cleanup_disarms_ray_generator_destructor(terminal_action):
     fake_ray = _FakeRay()
     generator = _Generator([])
-    adapter = RayStreamAdapter(generator, ray_module=fake_ray)
+    source = _leased_source(
+        fake_ray,
+        generator,
+        request_id=f"request-terminal-{terminal_action}",
+    )
+    adapter = RayStreamAdapter(source, ray_module=fake_ray)
 
     _finish_cleanup_operations(getattr(adapter, f"{terminal_action}_operations")())
     _finish_cleanup_operations(getattr(adapter, f"{terminal_action}_operations")())

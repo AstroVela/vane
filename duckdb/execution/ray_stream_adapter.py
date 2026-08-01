@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import threading
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
@@ -219,6 +218,8 @@ class TaskLeaseObjectRefGenerator:
                 self._cancelled = True
                 if cancel_generator:
                     self._cancel_generator = self._generator
+                    if self._cancel_generator is None:
+                        self._generator_cancel_submitted = True
                 self._generator = None
 
     def _submit_generator_cancel(self) -> bool:
@@ -368,14 +369,13 @@ class RayStreamAdapter:
             active_ray_module = ray_module
 
         validate_ray_stream_contract(active_ray_module)
+        if not isinstance(source, TaskLeaseObjectRefGenerator):
+            raise TypeError(f"RayStreamAdapter requires a TaskLeaseObjectRefGenerator; got {type(source).__name__}")
         self._ray = active_ray_module
-        self._source = source
-        self._leased = source if isinstance(source, TaskLeaseObjectRefGenerator) else None
-        self._submission_scope = (
-            self._leased.submission_scope if self._leased is not None else f"stream:{uuid.uuid4().hex}"
-        )
-        self._task_request_identity = "" if self._leased is None else self._leased.request_id
-        self._generator = self._leased.generator if self._leased is not None else source
+        self._leased: TaskLeaseObjectRefGenerator | None = source
+        self._submission_scope = source.submission_scope
+        self._task_request_identity = source.request_id
+        self._generator = source.generator
         self._completion_ref: Any | None = None
         self._drained = False
         self._retired = False
@@ -384,8 +384,6 @@ class RayStreamAdapter:
         self._cleanup_completion_ref: Any | None = None
         self._stream_cleanup_active = False
         self._terminal_kind = ""
-        self._cancel_generator: Any | None = None
-        self._generator_cancelled = False
         self._lifecycle = threading.Condition()
         self._active_reads = 0
         self._active_core_calls = 0
@@ -393,7 +391,7 @@ class RayStreamAdapter:
 
     def _validate_generator_if_started(self) -> None:
         if self._generator is None:
-            return
+            raise TypeError("Ray UDF submission did not return an ObjectRefGenerator")
         version = str(getattr(self._ray, "__version__", "")).strip() or "unknown"
         missing = [name for name in _REQUIRED_GENERATOR_METHODS if not callable(getattr(self._generator, name, None))]
         if missing:
@@ -412,8 +410,8 @@ class RayStreamAdapter:
         completion_ref = self._generator.completed()
         if completion_ref is None:
             raise RuntimeError("Ray stream completion ObjectRef is unavailable")
-        if self._leased is not None:
-            self._leased._bind_completion_ref(completion_ref)
+        assert self._leased is not None
+        self._leased._bind_completion_ref(completion_ref)
         self._completion_ref = completion_ref
 
     @property
@@ -433,8 +431,8 @@ class RayStreamAdapter:
     @property
     def driver(self) -> Any | None:
         with self._lifecycle:
-            leased = self._leased
-        return None if leased is None else leased.driver
+            owner = self._leased if self._leased is not None else self._release_owner
+        return None if owner is None else owner.driver
 
     @property
     def waitable(self) -> Any:
@@ -520,13 +518,6 @@ class RayStreamAdapter:
             release_owner = self._release_owner
             if release_owner is not None and not release_owner.terminal_cleanup_complete:
                 return False
-            if (
-                self._terminal_kind == "cancel"
-                and release_owner is None
-                and not self._generator_cancelled
-                and self._cancel_generator is not None
-            ):
-                return False
             if self._active_reads or self._active_core_calls:
                 # The cleanup scheduler retries after the in-flight call exits;
                 # retirement prevents any new call from starting.
@@ -544,22 +535,6 @@ class RayStreamAdapter:
             if self._cleanup_generator is generator and self._cleanup_completion_ref is completion_ref:
                 self._cleanup_generator = None
                 self._cleanup_completion_ref = None
-            self._lifecycle.notify_all()
-        return True
-
-    def _run_unleased_generator_cancel(self) -> bool:
-        with self._lifecycle:
-            generator = self._cancel_generator
-            if generator is None:
-                return True
-        try:
-            self._ray.cancel(generator, force=True, recursive=True)
-        except BaseException:
-            raise
-        with self._lifecycle:
-            self._generator_cancelled = True
-            if self._cancel_generator is generator:
-                self._cancel_generator = None
             self._lifecycle.notify_all()
         return True
 
@@ -599,12 +574,11 @@ class RayStreamAdapter:
                 self._retired = True
                 self._terminal_kind = requested_kind
                 leased = self._leased
+                if leased is None:
+                    raise RuntimeError("Ray stream lost task-lease ownership before retirement")
                 self._release_owner = leased
                 self._cleanup_generator = self._generator
                 self._cleanup_completion_ref = self._completion_ref
-                if requested_kind == "cancel" and leased is None:
-                    self._cancel_generator = self._generator
-                self._source = None
                 self._leased = None
                 self._generator = None
                 self._completion_ref = None
@@ -645,15 +619,6 @@ class RayStreamAdapter:
             retry_on_incomplete=True,
         )
         operations: list[RayStreamCleanupOperation] = [*leased_operations]
-        if terminal_kind == "cancel" and leased is None:
-            operations.append(
-                RayStreamCleanupOperation(
-                    self._run_unleased_generator_cancel,
-                    submission_scope=self._submission_scope,
-                    retry_on_error=True,
-                    retry_on_incomplete=True,
-                )
-            )
         operations.append(stream_operation)
         return tuple(operations)
 
@@ -662,10 +627,7 @@ class RayStreamAdapter:
         with self._lifecycle:
             stream_complete = self._cleanup_generator is None and not self._stream_cleanup_active
             release_complete = self._release_owner is None
-            generator_complete = (
-                self._terminal_kind != "cancel" or self._generator_cancelled or self._cancel_generator is None
-            )
-            return self._retired and stream_complete and release_complete and generator_complete
+            return self._retired and stream_complete and release_complete
 
 
 __all__ = [

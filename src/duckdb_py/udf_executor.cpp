@@ -2152,14 +2152,15 @@ private:
 	}
 
 	void CancelSlotForCleanup_WithGIL(ExecutorSlot &slot, bool cancel_collector = true) {
-		if (slot.cleanup_cancel_requested.exchange(true)) {
-			return;
-		}
-		if (cancel_collector) {
+		const bool first_cancel = !slot.cleanup_cancel_requested.exchange(true);
+		if (first_cancel && cancel_collector) {
 			if (CancelAsyncCollectorSlot_WithGIL(slot) == AsyncCollectorSlotCancelStatus::RETRY) {
 				ScheduleCollectorCleanupRetry(slot);
 			}
 		}
+		// Local executor close is independently idempotent and must not be
+		// skipped when process shutdown takes over a slot whose collector
+		// cancellation was already pending.
 		if (slot.py_executor) {
 			try {
 				slot.py_executor->obj.attr("close")();

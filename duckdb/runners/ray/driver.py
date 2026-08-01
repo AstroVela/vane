@@ -2966,6 +2966,14 @@ class RayQueryDriverActor:
             self._query_lease_generation_ids[query_key] = generation_id
         return generation_id
 
+    def _capability_targets_inactive_query_generation(
+        self,
+        query_id: str,
+        generation_id: str,
+    ) -> bool:
+        active_generation_id = self._query_lease_generation_ids.get(str(query_id))
+        return active_generation_id != str(generation_id)
+
     def _issue_lease_capability(
         self,
         *,
@@ -3099,12 +3107,14 @@ class RayQueryDriverActor:
         manager_lease_id: str,
         query_id: str,
     ) -> str:
+        query_key = str(query_id)
         return self._issue_lease_capability(
             kind="output",
             fields=(
                 str(request_id),
                 str(manager_lease_id),
-                str(query_id),
+                query_key,
+                self._query_lease_generation_id(query_key),
             ),
         )
 
@@ -3114,18 +3124,23 @@ class RayQueryDriverActor:
         request_id: str,
         lease_id: str,
         query_id: str = "",
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, str] | None:
         fields = self._decode_lease_capability(
             lease_id,
             kind="output",
-            field_count=3,
+            field_count=4,
         )
         if fields is None:
             return None
-        capability_request_id, manager_lease_id, capability_query_id = fields
+        (
+            capability_request_id,
+            manager_lease_id,
+            capability_query_id,
+            capability_generation_id,
+        ) = fields
         if capability_request_id != str(request_id) or (query_id and capability_query_id != str(query_id)):
             return None
-        return manager_lease_id, capability_query_id
+        return manager_lease_id, capability_query_id, capability_generation_id
 
     def _store_output_terminal_control(
         self,
@@ -3526,7 +3541,9 @@ class RayQueryDriverActor:
     def _parse_output_block_lease_request(
         self,
         payload: dict[str, Any],
-    ) -> tuple[str, Any, dict[str, Any]]:
+        *,
+        allow_inactive_generation: bool = False,
+    ) -> tuple[str, Any, dict[str, Any], bool]:
         from duckdb.runners.ray.query_resource_manager import OutputBlockRequest
 
         values = self._strict_lease_request(
@@ -3558,14 +3575,17 @@ class RayQueryDriverActor:
             _task_request_id,
             capability_generation_id,
         ) = capability
-        active_generation_id = self._query_lease_generation_ids.get(capability_query_id)
-        if active_generation_id is not None and active_generation_id != capability_generation_id:
+        generation_is_active = not self._capability_targets_inactive_query_generation(
+            capability_query_id,
+            capability_generation_id,
+        )
+        if not generation_is_active and not allow_inactive_generation:
             raise ValueError("output block request belongs to an inactive query generation")
         values["task_lease_id"] = manager_task_lease_id
         request = OutputBlockRequest(**values)
         identity = asdict(request)
         identity["task_lease_id"] = task_lease_id
-        return request_id, request, identity
+        return request_id, request, identity, generation_is_active
 
     def _parse_task_lease_request(
         self,
@@ -3901,8 +3921,13 @@ class RayQueryDriverActor:
             _capability_attempt_id,
             capability_query_id,
             _capability_request_id,
-            _capability_generation_id,
+            capability_generation_id,
         ) = capability
+        if self._capability_targets_inactive_query_generation(
+            capability_query_id,
+            capability_generation_id,
+        ):
+            return {"scheduled": True}
         with self._query_task_lease_condition:
             state = self._query_task_lease_requests.get(request_key)
             if state is None:
@@ -3981,8 +4006,13 @@ class RayQueryDriverActor:
             _capability_attempt_id,
             capability_query_id,
             _capability_request_id,
-            _capability_generation_id,
+            capability_generation_id,
         ) = capability
+        if self._capability_targets_inactive_query_generation(
+            capability_query_id,
+            capability_generation_id,
+        ):
+            return {"handed_off": True}
         with self._query_task_lease_condition:
             state = self._query_task_lease_requests.get(request_key)
             if state is None:
@@ -4190,8 +4220,13 @@ class RayQueryDriverActor:
             _capability_attempt_id,
             capability_query_id,
             _capability_request_id,
-            _capability_generation_id,
+            capability_generation_id,
         ) = capability
+        if self._capability_targets_inactive_query_generation(
+            capability_query_id,
+            capability_generation_id,
+        ):
+            return {"released": True}
         with self._query_task_lease_condition:
             state = self._query_task_lease_requests.get(request_key)
             if state is None:
@@ -4263,7 +4298,7 @@ class RayQueryDriverActor:
         from duckdb.runners.ray.query_resource_manager import OutputBlockGrant
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
-        request_id, request, identity = self._parse_output_block_lease_request(payload)
+        request_id, request, identity, _generation_is_active = self._parse_output_block_lease_request(payload)
         self._ensure_query_resource_admission_state()
         terminal_control = self._output_terminal_control_for_identity(
             request_id,
@@ -4375,7 +4410,12 @@ class RayQueryDriverActor:
         )
         if capability is None:
             return {"handed_off": False}
-        manager_lease_id, capability_query_id = capability
+        manager_lease_id, capability_query_id, capability_generation_id = capability
+        if self._capability_targets_inactive_query_generation(
+            capability_query_id,
+            capability_generation_id,
+        ):
+            return {"handed_off": True}
         state = self._query_output_lease_requests.get(request_key)
         if state is None:
             return {"handed_off": True}
@@ -4421,9 +4461,25 @@ class RayQueryDriverActor:
         )
         if capability is None:
             return {"released": False}
-        manager_lease_id, capability_query_id = capability
+        manager_lease_id, capability_query_id, capability_generation_id = capability
+        if self._capability_targets_inactive_query_generation(
+            capability_query_id,
+            capability_generation_id,
+        ):
+            return {"released": True}
         state = self._query_output_lease_requests.get(request_key)
         if state is None:
+            # Query close drops request payload state before the QRM itself can
+            # be released. The signed capability still authorizes this exact
+            # internal lease in the current generation, so reclaim it
+            # idempotently instead of retaining object-store accounting behind
+            # an unrelated task-teardown fence.
+            try:
+                get_query_resource_manager(capability_query_id).release_output_block(
+                    manager_lease_id,
+                )
+            except KeyError:
+                pass
             return {"released": True}
         lease = state.get("lease") or {}
         if str(lease.get("lease_id") or "") != str(lease_id):
@@ -4455,8 +4511,17 @@ class RayQueryDriverActor:
         from duckdb.runners.ray.query_resource_manager import OutputBlockGrant
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
-        request_id, request, identity = self._parse_output_block_lease_request(payload)
+        request_id, request, identity, generation_is_active = self._parse_output_block_lease_request(
+            payload,
+            allow_inactive_generation=True,
+        )
         self._ensure_query_resource_admission_state()
+        # A valid task capability from an older query generation proves that
+        # this cancellation cannot own anything in the current manager.  ACK it
+        # without publishing a tombstone or terminal block into the reopened
+        # generation; the remote cleanup owner can then retire durably.
+        if not generation_is_active:
+            return {"cancelled": True, "released": False}
         request_key = request_id
         terminal_control = self._output_terminal_control_for_identity(
             request_key,
