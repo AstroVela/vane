@@ -27,6 +27,7 @@ import duckdb.runners.ray.fte_fragment_scheduler as fte_fragment_scheduler_mod
 import duckdb.runners.ray.worker as worker_mod
 import duckdb.runners.ray.worker_handle as worker_handle_mod
 from duckdb.runners.common import QueryDeadlineExceeded
+from duckdb.runners.fte.fte_attempts import FragmentExecutionMutationResult
 from duckdb.runners.fte.fte_config import FteWorkerAdmissionConfig
 from duckdb.runners.ray.fragment_worker_context import fragment_id_for_task
 from duckdb.runners.ray.fte import (
@@ -34,6 +35,7 @@ from duckdb.runners.ray.fte import (
     FteFragmentExecution,
     FteTaskAttemptId,
     FteTaskExecution,
+    FteTaskId,
     FteTaskState,
     FteWorkerReservationUnavailable,
     NodeRequirements,
@@ -1077,6 +1079,288 @@ def test_fte_split_backpressure_remote_error_is_canceled_by_query_close():
 
         assert add_called.is_set() is False
         assert query_id not in worker_handle_mod._FTE_ACTIVE_OPERATIONS_BY_QUERY
+    finally:
+        fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
+
+
+def test_fte_worker_command_dispatch_preserves_healthy_tail_and_new_outbox_commands(monkeypatch):
+    query_id = "query-command-owned-tail"
+    coordinator = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-command-coordinator",
+    )
+    failed_a = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-command-failed-a",
+    )
+    healthy = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-command-healthy",
+    )
+    failed_b = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-command-failed-b",
+    )
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=f"{query_id}:node:7",
+        task_memory_bytes=1,
+    )
+
+    def add_command(worker, partition_id):
+        return FteAddSplitsCommand(
+            query_id=query_id,
+            fragment_id=stage.fragment_id,
+            worker_id=worker.worker_id,
+            worker=worker,
+            attempt_id=FteTaskAttemptId(FteTaskId(query_id, 0, partition_id), 0),
+            source_node_id="7",
+            splits=({"sequence_id": partition_id, "kind": "scan_task", "data": b"x"},),
+        )
+
+    failed_first = add_command(failed_a, 0)
+    failed_same_worker_tail = add_command(failed_a, 1)
+    healthy_first = add_command(healthy, 2)
+    failed_other_worker = add_command(failed_b, 3)
+    healthy_second = add_command(healthy, 4)
+    appended_during_dispatch = add_command(healthy, 5)
+    stage._worker_command_outbox.extend(
+        [
+            failed_first,
+            failed_same_worker_tail,
+            healthy_first,
+            failed_other_worker,
+            healthy_second,
+        ]
+    )
+
+    fte_fragment_scheduler_mod.open_fte_registry_for_query(query_id)
+    scheduler = worker_commands_mod._FTE_SCHEDULERS.get_or_create(query_id)
+    executed = []
+    appended = False
+
+    def execute(command, **_kwargs):
+        nonlocal appended
+        executed.append((command.worker_id, command.attempt_id.partition_id))
+        if command is failed_first or command is failed_other_worker:
+            raise RuntimeError(f"planned control failure for {command.worker_id}")
+        if command is healthy_first:
+            assert failed_a._fte_healthy is False
+            if not appended:
+                stage._record_worker_command(appended_during_dispatch)
+                appended = True
+        if command is healthy_second:
+            assert failed_b._fte_healthy is False
+
+    monkeypatch.setattr(scheduler.worker_command_executor, "execute", execute)
+
+    try:
+        dispatch = coordinator._execute_fte_fragment_execution_outbox(stage)
+
+        assert executed == [
+            (failed_a.worker_id, 0),
+            (healthy.worker_id, 2),
+            (failed_b.worker_id, 3),
+            (healthy.worker_id, 4),
+        ]
+        assert dispatch.failed_worker_ids == {failed_a.worker_id, failed_b.worker_id}
+        assert len(dispatch.failures) == 2
+        assert dispatch.query_closed is False
+        assert [command.attempt_id.partition_id for command in stage._worker_command_outbox] == [5]
+        assert failed_a._fte_healthy is False
+        assert failed_b._fte_healthy is False
+        assert healthy._fte_healthy is True
+        assert scheduler.stats().event_counts.get("WorkerFailed", 0) == 2
+    finally:
+        fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
+
+
+def test_fte_worker_command_dispatch_publishes_only_successful_healthy_creates(monkeypatch):
+    query_id = "query-command-create-outcomes"
+    coordinator = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-create-coordinator",
+    )
+    create_failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-create-failed",
+    )
+    failed_after_create = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-failed-after-create",
+    )
+    healthy = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-create-healthy",
+    )
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=f"{query_id}:node:7",
+        task_memory_bytes=1,
+    )
+
+    scheduled_attempts = []
+    create_commands = []
+    for partition_id, worker in enumerate((create_failed, failed_after_create, healthy)):
+        partition = stage.add_partition(partition_id)
+        scheduled = partition.start_attempt(worker_id=worker.worker_id, remote_handle=worker)
+        scheduled_attempts.append(scheduled)
+        create_commands.append(
+            FteCreateTaskCommand(
+                query_id=query_id,
+                fragment_id=stage.fragment_id,
+                worker_id=worker.worker_id,
+                worker=worker,
+                attempt_id=scheduled.attempt_id,
+                partition_id=partition_id,
+                request=scheduled.request,
+                scheduled_attempt=scheduled,
+            )
+        )
+    fail_after_create_command = FteAddSplitsCommand(
+        query_id=query_id,
+        fragment_id=stage.fragment_id,
+        worker_id=failed_after_create.worker_id,
+        worker=failed_after_create,
+        attempt_id=scheduled_attempts[1].attempt_id,
+        source_node_id="7",
+        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"x"},),
+    )
+    mutation_result = FragmentExecutionMutationResult.from_attempts(
+        scheduled_attempts,
+        [
+            create_commands[0],
+            create_commands[1],
+            fail_after_create_command,
+            create_commands[2],
+        ],
+    )
+
+    fte_fragment_scheduler_mod.open_fte_registry_for_query(query_id)
+    scheduler = worker_commands_mod._FTE_SCHEDULERS.get_or_create(query_id)
+    executed = []
+
+    def execute(command, **_kwargs):
+        executed.append((command.command_type, command.worker_id))
+        if command is create_commands[0] or command is fail_after_create_command:
+            raise RuntimeError(f"planned control failure for {command.worker_id}")
+
+    monkeypatch.setattr(scheduler.worker_command_executor, "execute", execute)
+    monkeypatch.setattr(worker_commands_mod, "fte_partition_task_lease_payload", lambda *_args: {})
+
+    try:
+        dispatch = coordinator._execute_fte_fragment_execution_mutation_result(stage, mutation_result)
+
+        assert executed == [
+            ("FteCreateTaskCommand", create_failed.worker_id),
+            ("FteCreateTaskCommand", failed_after_create.worker_id),
+            ("FteAddSplitsCommand", failed_after_create.worker_id),
+            ("FteCreateTaskCommand", healthy.worker_id),
+        ]
+        assert dispatch.failed_worker_ids == {create_failed.worker_id, failed_after_create.worker_id}
+        assert dispatch.scheduled_attempts == (scheduled_attempts[2],)
+        assert str(scheduled_attempts[1].attempt_id) not in {
+            str(attempt.attempt_id) for attempt in dispatch.scheduled_attempts
+        }
+        assert healthy.fte_pressure_stats()["running_attempt_count"] == 1
+        assert scheduler.stats().event_counts.get("WorkerFailed", 0) == 2
+    finally:
+        fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
+
+
+def test_fte_worker_command_dispatch_claim_owns_all_create_publication(monkeypatch):
+    query_id = "query-command-create-claim"
+    workers = [
+        RayWorkerActorHandle(
+            _FakeActor(),
+            memory_capacity_bytes=1 << 60,
+            worker_id=f"worker-create-claim-{partition_id}",
+        )
+        for partition_id in range(2)
+    ]
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=f"{query_id}:node:7",
+        worker_selector=lambda partition: (
+            workers[partition.task_id.partition_id].worker_id,
+            workers[partition.task_id.partition_id],
+        ),
+        task_memory_bytes=1,
+    )
+    coordinator = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-create-claim-coordinator",
+    )
+
+    fte_fragment_scheduler_mod.open_fte_registry_for_query(query_id)
+    scheduler = worker_commands_mod._FTE_SCHEDULERS.get_or_create(query_id)
+    monkeypatch.setattr(scheduler.worker_command_executor, "execute", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker_commands_mod, "fte_partition_task_lease_payload", lambda *_args: {})
+
+    try:
+        first = stage.start_attempt_with_worker(stage.add_partition(0))
+        second = stage.start_attempt_with_worker(stage.add_partition(1))
+
+        claimed = coordinator._execute_fte_fragment_execution_outbox(stage)
+        already_claimed = coordinator._execute_fte_fragment_execution_outbox(stage)
+
+        assert claimed.scheduled_attempts == (first, second)
+        assert already_claimed.scheduled_attempts == ()
+        assert [worker.fte_pressure_stats()["running_attempt_count"] for worker in workers] == [1, 1]
+    finally:
+        fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
+
+
+def test_fte_worker_command_dispatch_query_close_owns_successful_create(monkeypatch):
+    query_id = "query-command-close-after-create"
+    worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-command-close-after-create",
+    )
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=f"{query_id}:node:7",
+        worker=worker,
+        worker_id=worker.worker_id,
+        task_memory_bytes=1,
+    )
+    coordinator = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-command-close-coordinator",
+    )
+
+    fte_fragment_scheduler_mod.open_fte_registry_for_query(query_id)
+    scheduled = stage.start_attempt_with_worker(stage.add_partition(0))
+    scheduler = worker_commands_mod._FTE_SCHEDULERS.get_or_create(query_id)
+    monkeypatch.setattr(
+        scheduler.worker_command_executor,
+        "execute",
+        lambda *_args, **_kwargs: worker_handle_mod.close_fte_registry_for_query(query_id),
+    )
+    monkeypatch.setattr(worker_commands_mod, "fte_partition_task_lease_payload", lambda *_args: {})
+
+    try:
+        dispatch = coordinator._execute_fte_fragment_execution_outbox(stage)
+
+        assert dispatch.query_closed is True
+        assert dispatch.scheduled_attempts == ()
+        assert worker.fte_pressure_stats()["running_attempt_count"] == 1
+        assert str(scheduled.attempt_id) not in worker_handle_mod._FTE_STATUS_WATCHERS
     finally:
         fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
 
@@ -4247,11 +4531,9 @@ def test_fte_split_ack_before_create_ack_is_merged_into_running_pressure(monkeyp
         worker_id=handle.worker_id,
         remote_handle=handle,
     )
-    request = {
-        **scheduled.request,
-        "initial_splits": {
-            "7": ({"sequence_id": 0, "kind": "scan_task", "data": b"base"},),
-        },
+    request = scheduled.request
+    request["initial_splits"] = {
+        "7": ({"sequence_id": 0, "kind": "scan_task", "data": b"base"},),
     }
     handle.reserve_fte_partition(
         query_id,
@@ -4268,6 +4550,7 @@ def test_fte_split_ack_before_create_ack_is_merged_into_running_pressure(monkeyp
         attempt_id=scheduled.attempt_id,
         partition_id=0,
         request=request,
+        scheduled_attempt=scheduled,
     )
     add_command = FteAddSplitsCommand(
         query_id=query_id,

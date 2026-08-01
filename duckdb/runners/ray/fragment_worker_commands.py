@@ -6,10 +6,11 @@ from __future__ import annotations
 import os
 import sys
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from duckdb.runners.common import QueryDeadlineExceeded
-from duckdb.runners.fte import fte_status_wait_timeout_s
+from duckdb.runners.fte import FteWorkerControlFailure, fte_status_wait_timeout_s
 from duckdb.runners.fte.fte_events import FteCreateTaskCommand, TaskStatusChanged
 from duckdb.runners.fte.fte_scheduler import (
     FteAttemptStatusWatcher,
@@ -22,6 +23,7 @@ from duckdb.runners.ray.fragment_registry import (
     _FTE_SCHEDULERS,
     _FTE_STATUS_WATCHERS,
 )
+from duckdb.runners.ray.fragment_worker_failures import quarantine_fte_worker
 from duckdb.runners.ray.fte_fragment_scheduler import (
     _store_fte_result_handles,
     begin_fte_registry_operation,
@@ -62,26 +64,67 @@ class _FteQueryClosingEvent:
             return self._query_id in _FTE_CLOSING_QUERIES
 
 
+@dataclass(frozen=True)
+class FteWorkerCommandDispatchResult:
+    """Settled ownership of one driver-side worker-command batch."""
+
+    scheduled_attempts: tuple[Any, ...] = ()
+    recovery_handles: tuple[Any, ...] = ()
+    failures: tuple[FteWorkerControlFailure, ...] = ()
+    query_closed: bool = False
+
+    @property
+    def failed_worker_ids(self) -> frozenset[str]:
+        return frozenset(failure.worker_id for failure in self.failures if failure.worker_id)
+
+
 class FteWorkerCommandMixin:
     if TYPE_CHECKING:
         # Supplied by the other mixins on the composed Ray worker handle.
         _bind_fte_scheduler_handlers: Any
         _fte_partition_owner: Any
         _fte_task_handle_cls: Any
+        _handles_for_fte_worker_control_failure: Any
 
     def _execute_fte_fragment_execution_worker_commands(
         self,
         fragment_execution: FteFragmentExecution,
         worker_commands: list[Any] | tuple[Any, ...],
-    ) -> None:
+    ) -> FteWorkerCommandDispatchResult:
+        commands = tuple(worker_commands)
         terminal_attempts: set[str] = set()
-        for command_index, command in enumerate(worker_commands):
+        successful_create_attempts: dict[str, Any] = {}
+        failed_worker_keys: set[tuple[str, Any]] = set()
+        failures: list[FteWorkerControlFailure] = []
+        query_closed = False
+        abort_error: BaseException | None = None
+
+        for command_index, command in enumerate(commands):
             query_id = str(command.query_id)
             attempt_id = getattr(command, "attempt_id", None)
             if attempt_id is not None and str(attempt_id) in terminal_attempts:
                 continue
+            worker_id = str(getattr(command, "worker_id", None) or "")
+            worker_key: tuple[str, Any]
+            if worker_id:
+                worker_key = ("worker_id", worker_id)
+            else:
+                worker_key = ("worker_handle", id(getattr(command, "worker", None)))
+            if worker_key in failed_worker_keys:
+                _fte_command_debug_log(
+                    "execute_command_skipped_failed_worker",
+                    command_index=command_index,
+                    command_count=len(commands),
+                    command_type=getattr(command, "command_type", type(command).__name__),
+                    query_id=getattr(command, "query_id", ""),
+                    fragment_id=getattr(command, "fragment_id", ""),
+                    attempt_id=attempt_id,
+                    worker_id=worker_id,
+                )
+                continue
             if not begin_fte_registry_operation(query_id):
-                return
+                query_closed = True
+                break
             try:
                 scheduler = _FTE_SCHEDULERS.get_or_create(query_id)
                 self._bind_fte_scheduler_handlers(scheduler)
@@ -91,7 +134,7 @@ class FteWorkerCommandMixin:
                 _fte_command_debug_log(
                     "execute_command_start",
                     command_index=command_index,
-                    command_count=len(worker_commands),
+                    command_count=len(commands),
                     command_type=command_type,
                     query_id=getattr(command, "query_id", ""),
                     fragment_id=getattr(command, "fragment_id", ""),
@@ -110,13 +153,16 @@ class FteWorkerCommandMixin:
                         command,
                         cancel_event=query_closing,
                     )
-                except FteSplitSubmissionCancelled:
+                except FteSplitSubmissionCancelled as exc:
                     if query_closing.is_set():
-                        return
-                    raise
+                        query_closed = True
+                    else:
+                        abort_error = exc
+                    break
                 except FteSplitQueueTerminal as exc:
                     if query_closing.is_set():
-                        return
+                        query_closed = True
+                        break
                     terminal_attempts.add(str(exc.attempt_id))
                     scheduler.enqueue(
                         TaskStatusChanged.from_status(
@@ -127,15 +173,17 @@ class FteWorkerCommandMixin:
                         priority=True,
                     )
                     continue
-                except QueryDeadlineExceeded:
-                    raise
+                except QueryDeadlineExceeded as exc:
+                    abort_error = exc
+                    break
                 except Exception as exc:
                     if query_closing.is_set():
-                        return
+                        query_closed = True
+                        break
                     _fte_command_debug_log(
                         "execute_command_error",
                         command_index=command_index,
-                        command_count=len(worker_commands),
+                        command_count=len(commands),
                         command_type=command_type,
                         query_id=getattr(command, "query_id", ""),
                         fragment_id=getattr(command, "fragment_id", ""),
@@ -145,21 +193,39 @@ class FteWorkerCommandMixin:
                         error_type=type(exc).__name__,
                         error=exc,
                     )
-                    raise fragment_execution.worker_control_failure_for_command(command, exc) from exc
+                    failure = fragment_execution.worker_control_failure_for_command(command, exc)
+                    failed_worker_keys.add(worker_key)
+                    failures.append(failure)
+                    if failure.worker_id:
+                        # Fence immediately, before another command or thread can
+                        # select the failed worker. The scheduler reconciliation
+                        # remains deferred until this batch's healthy tail owns a
+                        # terminal outcome.
+                        quarantine_fte_worker(failure.worker_id)
+                    continue
+                try:
+                    if isinstance(command, FteCreateTaskCommand):
+                        command.worker.record_fte_task_started_from_reservation(
+                            command.query_id,
+                            command.fragment_id,
+                            command.partition_id,
+                            command.attempt_id,
+                            command.request,
+                        )
+                    else:
+                        fragment_execution.handle_worker_command_success(command)
+                except Exception as exc:
+                    abort_error = exc
+                    break
+                if query_closing.is_set():
+                    query_closed = True
+                    break
                 if isinstance(command, FteCreateTaskCommand):
-                    command.worker.record_fte_task_started_from_reservation(
-                        command.query_id,
-                        command.fragment_id,
-                        command.partition_id,
-                        command.attempt_id,
-                        command.request,
-                    )
-                else:
-                    fragment_execution.handle_worker_command_success(command)
+                    successful_create_attempts[str(command.attempt_id)] = command.scheduled_attempt
                 _fte_command_debug_log(
                     "execute_command_done",
                     command_index=command_index,
-                    command_count=len(worker_commands),
+                    command_count=len(commands),
                     command_type=command_type,
                     query_id=getattr(command, "query_id", ""),
                     fragment_id=getattr(command, "fragment_id", ""),
@@ -170,18 +236,53 @@ class FteWorkerCommandMixin:
             finally:
                 end_fte_registry_operation(query_id)
 
-    def _execute_fte_fragment_execution_outbox(self, fragment_execution: FteFragmentExecution) -> None:
-        self._execute_fte_fragment_execution_worker_commands(
-            fragment_execution, fragment_execution.pop_worker_commands()
+        recovery_handles: list[Any] = []
+        unknown_worker_failure: FteWorkerControlFailure | None = None
+        for failure in failures:
+            if not failure.worker_id:
+                unknown_worker_failure = unknown_worker_failure or failure
+                continue
+            recovery_handles.extend(self._handles_for_fte_worker_control_failure(failure))
+
+        if abort_error is not None:
+            raise abort_error
+        if unknown_worker_failure is not None:
+            raise unknown_worker_failure from unknown_worker_failure.cause
+
+        failed_worker_ids = frozenset(failure.worker_id for failure in failures if failure.worker_id)
+        successful_scheduled_attempts: tuple[Any, ...] = ()
+        if not query_closed:
+            successful_scheduled_attempts = tuple(
+                scheduled_attempt
+                for scheduled_attempt in successful_create_attempts.values()
+                if str(scheduled_attempt.worker_id or "") not in failed_worker_ids
+            )
+
+        return FteWorkerCommandDispatchResult(
+            scheduled_attempts=successful_scheduled_attempts,
+            recovery_handles=tuple(recovery_handles),
+            failures=tuple(failures),
+            query_closed=query_closed,
+        )
+
+    def _execute_fte_fragment_execution_outbox(
+        self,
+        fragment_execution: FteFragmentExecution,
+    ) -> FteWorkerCommandDispatchResult:
+        return self._execute_fte_fragment_execution_worker_commands(
+            fragment_execution,
+            fragment_execution.pop_worker_commands(),
         )
 
     def _execute_fte_fragment_execution_mutation_result(
         self,
         fragment_execution: FteFragmentExecution,
         result: Any,
-    ) -> list[Any]:
-        self._execute_fte_fragment_execution_worker_commands(fragment_execution, list(result.worker_commands))
-        return list(result)
+    ) -> FteWorkerCommandDispatchResult:
+        return self._execute_fte_fragment_execution_worker_commands(
+            fragment_execution,
+            list(result.worker_commands),
+        )
 
     def _handles_for_fte_scheduled_attempts(
         self,

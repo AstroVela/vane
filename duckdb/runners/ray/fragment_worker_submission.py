@@ -14,7 +14,6 @@ from duckdb.runners.fte import (
     AssignmentResult,
     FteFragmentExecution,
     FteTaskExecutionClass,
-    FteWorkerControlFailure,
     FteWorkerReservationUnavailable,
     PartitionInfo,
 )
@@ -455,31 +454,30 @@ class FteWorkerSubmissionMixin:
             ):
                 if max_scheduled_attempts is not None and scheduled_attempt_count >= max_scheduled_attempts:
                     break
-                try:
-                    pending_reservation_done_count_before = fte_pending_worker_reservation_done_count(query_id_filter)
-                    scheduled = fragment_execution.schedule_next_pending_partition(execution_class)
-                    pending_reservation_done_count_after = fte_pending_worker_reservation_done_count(query_id_filter)
-                    if scheduled is not None:
-                        self._execute_fte_fragment_execution_outbox(fragment_execution)
-                except FteWorkerControlFailure as exc:
-                    handles.extend(self._handles_for_fte_worker_control_failure(exc))
-                    should_drain_events = True
-                    break
+                pending_reservation_done_count_before = fte_pending_worker_reservation_done_count(query_id_filter)
+                scheduled = fragment_execution.schedule_next_pending_partition(execution_class)
+                pending_reservation_done_count_after = fte_pending_worker_reservation_done_count(query_id_filter)
                 if scheduled is None:
                     if pending_reservation_done_count_after > pending_reservation_done_count_before:
                         made_progress = True
                         should_drain_events = True
                         break
                     continue
-                made_progress = True
-                scheduled_attempt_count += 1
+                dispatch = self._execute_fte_fragment_execution_outbox(fragment_execution)
+                handles.extend(dispatch.recovery_handles)
+                successful_scheduled_attempts = list(dispatch.scheduled_attempts)
+                made_progress = bool(successful_scheduled_attempts) or made_progress
+                scheduled_attempt_count += len(successful_scheduled_attempts)
                 handles.extend(
                     self._handles_for_fte_scheduled_attempts(
                         query_id,
                         fragment_id,
-                        [scheduled],
+                        successful_scheduled_attempts,
                     )
                 )
+                if dispatch.failures or dispatch.query_closed:
+                    should_drain_events = True
+                    break
             return made_progress, should_drain_events
 
         while True:
@@ -793,28 +791,25 @@ class FteWorkerSubmissionMixin:
                     partition_id=partition.task_id.partition_id,
                     elapsed_ms=int((time.monotonic() - item_started_at) * 1000),
                 )
-                try:
-                    scheduled_result = fragment_execution.apply_assignment_result(
-                        AssignmentResult(
-                            partitions_added=[PartitionInfo(0)],
-                            sealed_partitions=[0],
-                            no_more_partitions=True,
-                        )
+                scheduled_result = fragment_execution.apply_assignment_result(
+                    AssignmentResult(
+                        partitions_added=[PartitionInfo(0)],
+                        sealed_partitions=[0],
+                        no_more_partitions=True,
                     )
-                    _fte_submission_debug_log(
-                        "pending_item_empty_source_apply_done",
-                        prepared_index=prepared_index,
-                        scheduled_count=len(scheduled_result),
-                        command_count=len(scheduled_result.worker_commands),
-                        elapsed_ms=int((time.monotonic() - item_started_at) * 1000),
-                    )
-                    scheduled = self._execute_fte_fragment_execution_mutation_result(
-                        fragment_execution, scheduled_result
-                    )
-                except FteWorkerControlFailure as exc:
-                    handles.extend(self._handles_for_fte_worker_control_failure(exc))
-                    scheduled = []
-                scheduled_attempts.extend(scheduled)
+                )
+                _fte_submission_debug_log(
+                    "pending_item_empty_source_apply_done",
+                    prepared_index=prepared_index,
+                    scheduled_count=len(scheduled_result),
+                    command_count=len(scheduled_result.worker_commands),
+                    elapsed_ms=int((time.monotonic() - item_started_at) * 1000),
+                )
+                dispatch = self._execute_fte_fragment_execution_mutation_result(fragment_execution, scheduled_result)
+                handles.extend(dispatch.recovery_handles)
+                scheduled_attempts.extend(dispatch.scheduled_attempts)
+                if dispatch.query_closed:
+                    return handles
 
             for source_node_id, source_splits in by_source.items():
                 _fte_submission_debug_log(
@@ -863,27 +858,24 @@ class FteWorkerSubmissionMixin:
                         partition_id=partition_info.partition_id,
                         elapsed_ms=int((time.monotonic() - item_started_at) * 1000),
                     )
-                try:
-                    _fte_submission_debug_log(
-                        "pending_item_apply_start",
-                        prepared_index=prepared_index,
-                        elapsed_ms=int((time.monotonic() - item_started_at) * 1000),
-                    )
-                    scheduled_result = fragment_execution.apply_assignment_result(result)
-                    _fte_submission_debug_log(
-                        "pending_item_apply_done",
-                        prepared_index=prepared_index,
-                        scheduled_count=len(scheduled_result),
-                        command_count=len(scheduled_result.worker_commands),
-                        elapsed_ms=int((time.monotonic() - item_started_at) * 1000),
-                    )
-                    scheduled = self._execute_fte_fragment_execution_mutation_result(
-                        fragment_execution, scheduled_result
-                    )
-                except FteWorkerControlFailure as exc:
-                    handles.extend(self._handles_for_fte_worker_control_failure(exc))
-                    scheduled = []
-                scheduled_attempts.extend(scheduled)
+                _fte_submission_debug_log(
+                    "pending_item_apply_start",
+                    prepared_index=prepared_index,
+                    elapsed_ms=int((time.monotonic() - item_started_at) * 1000),
+                )
+                scheduled_result = fragment_execution.apply_assignment_result(result)
+                _fte_submission_debug_log(
+                    "pending_item_apply_done",
+                    prepared_index=prepared_index,
+                    scheduled_count=len(scheduled_result),
+                    command_count=len(scheduled_result.worker_commands),
+                    elapsed_ms=int((time.monotonic() - item_started_at) * 1000),
+                )
+                dispatch = self._execute_fte_fragment_execution_mutation_result(fragment_execution, scheduled_result)
+                handles.extend(dispatch.recovery_handles)
+                scheduled_attempts.extend(dispatch.scheduled_attempts)
+                if dispatch.query_closed:
+                    return handles
 
             _fte_submission_debug_log(
                 "pending_item_handles_start",

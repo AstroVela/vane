@@ -12,7 +12,6 @@ import ray
 
 from duckdb.runners.fte import (
     FteTaskAttemptId,
-    FteWorkerControlFailure,
     validate_fte_status_identity,
 )
 from duckdb.runners.fte.fte_events import (
@@ -270,15 +269,12 @@ class FteWorkerLifecycleMixin:
                         partition,
                         fragment_execution=fragment_execution,
                     )
-                try:
-                    scheduled_result = fragment_execution.apply_assignment_result(result)
-                    scheduled = self._execute_fte_fragment_execution_mutation_result(
-                        fragment_execution, scheduled_result
-                    )
-                except FteWorkerControlFailure as exc:
-                    handles.extend(self._handles_for_fte_worker_control_failure(exc))
-                    scheduled = []
-                scheduled_attempts.extend(scheduled)
+                scheduled_result = fragment_execution.apply_assignment_result(result)
+                dispatch = self._execute_fte_fragment_execution_mutation_result(fragment_execution, scheduled_result)
+                handles.extend(dispatch.recovery_handles)
+                scheduled_attempts.extend(dispatch.scheduled_attempts)
+                if dispatch.query_closed:
+                    break
             handles.extend(
                 self._handles_for_fte_scheduled_attempts(
                     query_id,

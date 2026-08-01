@@ -3,13 +3,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from duckdb.runners.fte import FteTaskAttemptId
+    from duckdb.runners.fte import FteTaskAttemptId, ScheduledAttempt
 
 
 @dataclass(frozen=True)
@@ -150,6 +150,22 @@ class FteCreateTaskCommand(FteWorkerCommand):
     attempt_id: FteTaskAttemptId
     partition_id: int
     request: dict[str, Any]
+    scheduled_attempt: ScheduledAttempt = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.scheduled_attempt.attempt_id != self.attempt_id:
+            raise ValueError(
+                "FTE create command scheduled attempt mismatch: "
+                f"command={self.attempt_id} scheduled={self.scheduled_attempt.attempt_id}"
+            )
+        if self.scheduled_attempt.request is not self.request:
+            raise ValueError("FTE create command must own its scheduled attempt request")
+        if str(self.scheduled_attempt.worker_id or "") != str(self.worker_id or ""):
+            raise ValueError(
+                "FTE create command scheduled worker mismatch: "
+                f"command={self.worker_id or '<unknown>'} "
+                f"scheduled={self.scheduled_attempt.worker_id or '<unknown>'}"
+            )
 
 
 @dataclass(frozen=True)
