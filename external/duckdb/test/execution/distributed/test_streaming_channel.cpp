@@ -18,6 +18,7 @@
 #include <memory>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "catch.hpp"
@@ -32,6 +33,12 @@ static_assert(!std::is_copy_constructible<UnboundedReceiver<int>>::value,
               "unbounded channels must have exactly one receiver owner");
 static_assert(!std::is_copy_assignable<UnboundedReceiver<int>>::value,
               "unbounded channels must have exactly one receiver owner");
+static_assert(std::is_nothrow_move_assignable<UnboundedReceiver<int>>::value,
+              "replacing an unbounded receiver must not throw");
+static_assert(std::is_nothrow_destructible<UnboundedReceiver<int>>::value,
+              "destroying an unbounded receiver must not throw");
+static_assert(noexcept(std::declval<UnboundedReceiver<int> &>().close()),
+              "closing an unbounded receiver must not throw");
 
 //==============================================================================
 // Section 1: UnboundedSender temporary lifecycle tests

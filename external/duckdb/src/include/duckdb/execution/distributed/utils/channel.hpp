@@ -366,12 +366,26 @@ public:
 	}
 
 	/// Disconnect the receiver and release queued values that can no longer be consumed.
-	void disconnect_receiver() {
-		std::queue<T> abandoned;
-		{
-			std::lock_guard<std::mutex> lock(mutex_);
-			closed_ = true;
-			queue_.swap(abandoned);
+	void disconnect_receiver() noexcept {
+		try {
+			std::queue<T> abandoned;
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				closed_ = true;
+				queue_.swap(abandoned);
+			}
+		} catch (...) {
+			// Receiver cleanup runs from noexcept move/destruction paths. If allocating
+			// the temporary queue fails, close and drain in place as a best effort.
+			try {
+				std::lock_guard<std::mutex> lock(mutex_);
+				closed_ = true;
+				while (!queue_.empty()) {
+					queue_.pop();
+				}
+			} catch (...) {
+				// No safe cleanup remains if locking or in-place destruction also fails.
+			}
 		}
 		not_empty_.notify_all();
 	}
@@ -488,12 +502,12 @@ public:
 		return *this;
 	}
 
-	~UnboundedReceiver() {
+	~UnboundedReceiver() noexcept {
 		close();
 	}
 
 	/// Close the receive side and discard values that no consumer can observe.
-	void close() {
+	void close() noexcept {
 		if (!state_) {
 			return;
 		}
