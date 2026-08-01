@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
 
 #include <atomic>
@@ -26,6 +27,7 @@ class ColumnDataCollection;
 class FileOpener;
 class FileSystem;
 class LogicalType;
+class TemporaryMemoryState;
 
 namespace distributed {
 
@@ -105,14 +107,26 @@ public:
 	                                                                  const vector<LogicalType> &expected_types);
 	DuckDBResult<std::shared_ptr<arrow::io::InputStream>> OpenPartitionFile(const std::string &path) const;
 
-	//! Flush all remaining buffered data to disk. Called by the destructor and
-	//! can also be called explicitly before the cache is destroyed.
+	//! Flush all remaining buffered data to disk. This must be called explicitly
+	//! before publishing the cache; the destructor only discards buffered data.
 	DuckDBResult<void> FlushAll(ClientContext &context, const vector<string> &names);
 
 	//! Get the buffered column names.
-	const vector<string> &BufferedNames() const {
-		return buffered_names_;
+	vector<string> BufferedNames() const;
+	//! Retained partition-buffer allocations charged to DuckDB's buffer pool.
+	idx_t GetBufferedBytes() const {
+		return buffered_bytes_.load();
 	}
+	//! Current manager-provided upper bound for retained partition buffers.
+	idx_t GetBufferBudgetBytes() const {
+		return buffer_budget_bytes_.load();
+	}
+	//! Peak retained bytes, including transient overshoot by concurrent appends.
+	idx_t GetPeakBufferedBytes() const {
+		return peak_buffered_bytes_.load();
+	}
+	//! Release uncommitted in-memory buffers without writing them.
+	void DiscardBufferedData();
 
 	DuckDBResult<void> RegisterPartitionFile(idx_t partition_idx, ShufflePartitionFile file);
 	DuckDBResult<ShufflePartitionFiles> GetPartitionFiles(idx_t partition_idx) const;
@@ -143,6 +157,14 @@ private:
 	//! Flush a single partition buffer to an IPC file.
 	DuckDBResult<ShufflePartitionFile> FlushBuffer(ClientContext &context, idx_t partition_idx,
 	                                               const vector<string> &names);
+	//! Flush a partition whose buffer mutex is already held.
+	DuckDBResult<ShufflePartitionFile> FlushBufferLocked(ClientContext &context, idx_t partition_idx,
+	                                                     const vector<string> &names);
+	DuckDBResult<void> FlushUnderMemoryPressure(ClientContext &context, const vector<string> &names);
+	void EnsureMemoryBudget(ClientContext &context);
+	void RefreshMemoryBudget(ClientContext &context);
+	void ReleaseMemoryReservation();
+	void UpdatePeakBufferedBytes(idx_t buffered_bytes);
 	//! Write a ColumnDataCollection to a single IPC file (shared implementation).
 	DuckDBResult<ShufflePartitionFile> WriteCollectionToFile(ClientContext &context, ColumnDataCollection &collection,
 	                                                         idx_t partition_idx, const vector<string> &names);
@@ -164,12 +186,23 @@ private:
 	//! Per-partition write buffers.
 	std::vector<std::unique_ptr<ColumnDataCollection>> write_buffers_;
 	//! Accumulated allocated bytes per partition buffer.
-	std::vector<idx_t> buffer_bytes_;
+	std::vector<std::atomic<idx_t>> buffer_bytes_;
 	//! Flush threshold resolved when the cache is constructed.
 	idx_t flush_threshold_bytes_;
+	//! Optional configured upper bound on the manager-provided memory budget.
+	optional_idx configured_max_buffered_bytes_;
+	std::atomic<idx_t> buffered_bytes_ {0};
+	std::atomic<idx_t> peak_buffered_bytes_ {0};
+	std::atomic<idx_t> buffer_budget_bytes_ {0};
+	std::atomic<bool> memory_budget_initialized_ {false};
 	//! Per-partition mutex for thread-safe buffer access.
 	std::vector<std::unique_ptr<std::mutex>> buffer_mutexes_;
+	//! Serializes cross-partition pressure flushes without serializing normal appends.
+	std::mutex pressure_mutex_;
+	std::mutex memory_state_mutex_;
+	std::unique_ptr<TemporaryMemoryState> temporary_memory_state_;
 	//! Column names captured on first WriteChunk call.
+	mutable std::mutex buffered_names_mutex_;
 	vector<string> buffered_names_;
 	//! Whether FlushAll has already been called.
 	bool flushed_ = false;

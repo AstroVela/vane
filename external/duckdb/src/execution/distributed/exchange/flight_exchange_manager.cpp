@@ -871,12 +871,12 @@ DuckDBResult<void> FlightExchangeSink::AddChunk(idx_t partition_id, DataChunk &c
 }
 
 bool FlightExchangeSink::IsBlocked() const {
-	// Disk-first: no memory backpressure needed
+	// AddChunk handles memory pressure by flushing retained buffers directly to shuffle storage.
 	return false;
 }
 
 void FlightExchangeSink::WaitUnblocked() {
-	// No-op: disk writes don't block
+	// No-op: AddChunk does not return until any required pressure flush completes.
 }
 
 DuckDBResult<void> FlightExchangeSink::Finish() {
@@ -915,6 +915,7 @@ DuckDBResult<void> FlightExchangeSink::Abort() {
 	if (finished_) {
 		return DuckDBResult<void>::ok();
 	}
+	shuffle_cache_->DiscardBufferedData();
 	ShuffleCacheRegistry::Instance().RemoveForDeferredCleanup(handle_.output_location);
 	write_lease_.reset();
 	finished_ = true;
@@ -922,7 +923,7 @@ DuckDBResult<void> FlightExchangeSink::Abort() {
 }
 
 size_t FlightExchangeSink::GetMemoryUsage() const {
-	return 0; // Disk-first: memory usage is transient buffer only
+	return shuffle_cache_->GetBufferedBytes();
 }
 
 DuckDBResult<void> FlightExchangeSink::EnsureSchema(ClientContext &context, const vector<LogicalType> &types,

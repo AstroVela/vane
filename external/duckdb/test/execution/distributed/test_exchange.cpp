@@ -28,6 +28,7 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <utility>
 #include <cstdlib>
 #include <condition_variable>
@@ -1054,6 +1055,105 @@ TEST_CASE("Exchange: ShuffleCache flushes large BLOB buffers by actual allocatio
 	REQUIRE(collection->Count() == static_cast<idx_t>(ids.size()));
 }
 
+TEST_CASE("Exchange: ShuffleCache bounds aggregate buffers across partitions", "[distributed][exchange]") {
+	static constexpr idx_t PARTITION_COUNT = 512;
+	static constexpr idx_t WRITER_COUNT = 8;
+	static constexpr idx_t MAX_BUFFERED_BYTES = 1024 * 1024;
+	ScopedEnvVar max_buffered_bytes("VANE_SHUFFLE_CACHE_MAX_BUFFERED_BYTES", std::to_string(MAX_BUFFERED_BYTES));
+
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto &context = *conn.context;
+
+	ShuffleCacheConfig config;
+	config.shuffle_stage_id = "stage_aggregate_buffer_budget";
+	config.node_id = "node_budget";
+	config.num_partitions = PARTITION_COUNT;
+	config.local_dirs = {TestCreatePath("exchange_cache_aggregate_buffer_budget")};
+	ShuffleCache cache(std::move(config));
+
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), types);
+	chunk.SetCardinality(1);
+	chunk.SetValue(0, 0, Value::INTEGER(42));
+
+	REQUIRE(cache.WriteChunk(context, chunk, 0, {}).is_ok());
+	const auto single_partition_bytes = cache.GetBufferedBytes();
+	const auto buffer_budget = cache.GetBufferBudgetBytes();
+	REQUIRE(single_partition_bytes > 0);
+	REQUIRE(buffer_budget > 0);
+	REQUIRE(buffer_budget <= MAX_BUFFERED_BYTES);
+
+	std::mutex start_mutex;
+	std::condition_variable start_cv;
+	idx_t ready_writers = 0;
+	bool start_writers = false;
+	vector<std::future<bool>> writers;
+	for (idx_t writer_idx = 0; writer_idx < WRITER_COUNT; writer_idx++) {
+		writers.push_back(std::async(std::launch::async, [&, writer_idx]() {
+			DataChunk writer_chunk;
+			writer_chunk.Initialize(Allocator::DefaultAllocator(), types);
+			writer_chunk.SetCardinality(1);
+			writer_chunk.SetValue(0, 0, Value::INTEGER(static_cast<int32_t>(writer_idx)));
+			{
+				std::unique_lock<std::mutex> lock(start_mutex);
+				ready_writers++;
+				start_cv.notify_all();
+				start_cv.wait(lock, [&]() { return start_writers; });
+			}
+			for (idx_t partition_idx = writer_idx + 1; partition_idx < PARTITION_COUNT; partition_idx += WRITER_COUNT) {
+				if (cache.WriteChunk(context, writer_chunk, partition_idx, {"value"}).is_err()) {
+					return false;
+				}
+			}
+			return true;
+		}));
+	}
+	{
+		std::unique_lock<std::mutex> lock(start_mutex);
+		start_cv.wait(lock, [&]() { return ready_writers == WRITER_COUNT; });
+		start_writers = true;
+	}
+	start_cv.notify_all();
+	for (auto &writer : writers) {
+		REQUIRE(writer.get());
+	}
+	REQUIRE(cache.BufferedNames() == vector<string> {"value"});
+	REQUIRE(cache.GetBufferedBytes() <= buffer_budget);
+	REQUIRE(cache.GetPeakBufferedBytes() <= buffer_budget + WRITER_COUNT * single_partition_bytes);
+
+	idx_t pressure_flushed_files = 0;
+	for (idx_t partition_idx = 0; partition_idx < PARTITION_COUNT; partition_idx++) {
+		auto files_res = cache.GetPartitionFiles(partition_idx);
+		REQUIRE(files_res.is_ok());
+		pressure_flushed_files += files_res.value().files.size();
+	}
+	REQUIRE(pressure_flushed_files > 0);
+
+	REQUIRE(cache.FlushAll(context, {"value"}).is_ok());
+	REQUIRE(cache.GetBufferedBytes() == 0);
+	idx_t total_rows = 0;
+	for (idx_t partition_idx = 0; partition_idx < PARTITION_COUNT; partition_idx++) {
+		auto files_res = cache.GetPartitionFiles(partition_idx);
+		REQUIRE(files_res.is_ok());
+		total_rows += files_res.value().total_rows;
+	}
+	REQUIRE(total_rows == PARTITION_COUNT);
+}
+
+TEST_CASE("Exchange: ShuffleCache validates aggregate buffer budget", "[distributed][exchange]") {
+	ScopedEnvVar max_buffered_bytes("VANE_SHUFFLE_CACHE_MAX_BUFFERED_BYTES",
+	                                std::to_string(std::numeric_limits<idx_t>::max()));
+	ShuffleCacheConfig config;
+	config.shuffle_stage_id = "stage_invalid_buffer_budget";
+	config.node_id = "node_budget";
+	config.num_partitions = 1;
+	config.local_dirs = {TestCreatePath("exchange_cache_invalid_buffer_budget")};
+
+	REQUIRE_THROWS_WITH(ShuffleCache(std::move(config)), Catch::Matchers::Contains("must be less than idx_t max"));
+}
+
 TEST_CASE("Exchange: ShuffleCache committed manifest replay via object storage backend", "[distributed][exchange]") {
 	DuckDB db(nullptr);
 	Connection conn(db);
@@ -1869,7 +1969,7 @@ TEST_CASE("Exchange: FlightExchangeSink write and flush", "[distributed][exchang
 
 	FlightExchangeSink sink(cache, handle, &context);
 
-	// Should not be blocked (disk-first, no backpressure)
+	// Synchronous pressure flushing does not expose an asynchronous blocked state.
 	REQUIRE(sink.IsBlocked() == false);
 
 	// Write data
@@ -1888,6 +1988,7 @@ TEST_CASE("Exchange: FlightExchangeSink write and flush", "[distributed][exchang
 	// Finish should flush and register in ShuffleCacheRegistry
 	auto finish_res = sink.Finish();
 	REQUIRE(finish_res.is_ok());
+	REQUIRE(sink.GetMemoryUsage() == 0);
 
 	// Verify ShuffleCacheRegistry has the cache
 	auto registered = ShuffleCacheRegistry::Instance().Get("sink_test_stage");
@@ -1935,9 +2036,16 @@ TEST_CASE("Exchange: FlightExchangeSink memory usage", "[distributed][exchange]"
 
 	FlightExchangeSink sink(cache, handle, conn.context.get());
 
-	// Memory usage should be 0 (disk-first)
-	REQUIRE(sink.GetMemoryUsage() == 0);
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), types);
+	chunk.SetCardinality(1);
+	chunk.SetValue(0, 0, Value::INTEGER(42));
+	REQUIRE(sink.AddChunk(0, chunk).is_ok());
+	REQUIRE(sink.GetMemoryUsage() > 0);
+	REQUIRE(sink.GetMemoryUsage() == cache->GetBufferedBytes());
 	REQUIRE(sink.Abort().is_ok());
+	REQUIRE(sink.GetMemoryUsage() == 0);
 	auto cleanup = ShuffleCacheRegistry::Instance().RemoveAndCleanupByQuery(handle.query_id);
 	REQUIRE(cleanup.cleanup_errors == 0);
 	REQUIRE(cleanup.cleanup_pending == 0);

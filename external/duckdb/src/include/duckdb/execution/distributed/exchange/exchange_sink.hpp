@@ -25,9 +25,9 @@ namespace distributed {
 /// Lifecycle: Created by ExchangeManager::CreateSink() → Add() data →
 ///            Finish() on success or Abort() on failure.
 ///
-/// Threading: A single ExchangeSink is used by one operator thread.
-///            Implementations must be safe for concurrent access from
-///            the backpressure mechanism.
+/// Threading: A global ExchangeSink can be used by parallel operator threads.
+///            Implementations must synchronize concurrent writes and access
+///            from the backpressure mechanism.
 class ExchangeSink {
 public:
 	virtual ~ExchangeSink() = default;
