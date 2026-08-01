@@ -86,7 +86,6 @@ public:
 	virtual bool SupportsAsyncWakeup() = 0;
 	virtual UDFWakeupRegistrationResult RegisterWakeup(InterruptState &interrupt_state) = 0;
 	virtual void RegisterWakeupCallback(std::function<void()> callback) = 0;
-	virtual void EnqueueDeferredWakeup(std::function<void()> callback) = 0;
 	// Register exactly once, before the first submission.
 	virtual void RegisterOutputConsumer(UDFOutputConsumer consumer) = 0;
 	virtual void NotifyOutputConsumerSpaceAvailable() = 0;

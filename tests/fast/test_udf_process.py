@@ -274,6 +274,59 @@ def test_native_dispatcher_isolates_async_task_admission_failure():
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_streaming_task_wakeup_epoch_handles_early_and_duplicate_callbacks():
+    """Early and duplicate callbacks must each schedule a blocked task at most once."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import vane
+
+
+        @vane.func(return_dtype="INTEGER")
+        def add_one(value):
+            return value + 1
+
+
+        @vane.func(return_dtype="INTEGER")
+        def times_two(value):
+            return value * 2
+
+
+        connection = vane.connect()
+        try:
+            relation = connection.sql("select i::INTEGER as x from range(3) t(i)")
+            result = relation.select(
+                add_one(vane.col("x")).alias("a"),
+                times_two(vane.col("x")).alias("b"),
+                times_two(add_one(vane.col("x"))).alias("nested"),
+            )
+            assert result.fetchall() == [(1, 0, 2), (2, 2, 4), (3, 4, 6)]
+            assert connection.sql("select 42").fetchall() == [(42,)]
+        finally:
+            connection.close()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+        env={
+            **os.environ,
+            "VANE_ENABLE_UDF_TEST_HOOKS": "1",
+            "VANE_TEST_DUPLICATE_UDF_WAKEUPS": "1",
+            "VANE_RUNNER": "local-fast",
+        },
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_native_dispatcher_shutdown_closes_active_executor():
     """Terminal shutdown must close Python ownership before it returns."""
     import os
@@ -775,7 +828,7 @@ def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped(failure_ph
             def cancel_slot(self, _slot_id):
                 global cancel_calls
                 cancel_calls += 1
-                if failure_phase == "cancel" and cancel_calls == 1:
+                if failure_phase == "cancel" and cancel_calls <= 3:
                     raise RuntimeError("planned transient collector cancellation failure")
                 return None
 
@@ -790,7 +843,7 @@ def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped(failure_ph
             def retire_slot(self, _slot_id):
                 global retire_calls
                 retire_calls += 1
-                if failure_phase == "retire" and retire_calls == 1:
+                if failure_phase == "retire" and retire_calls <= 3:
                     raise RuntimeError("planned transient collector retirement failure")
                 collector_retired.set()
 
@@ -882,9 +935,9 @@ def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped(failure_ph
             assert discarded.wait(timeout=5), "stale Ray stream was dropped without collector cleanup"
             assert executor_closed.wait(timeout=5), "retired executor was not eventually closed"
             assert collector_retired.wait(timeout=5), "collector cancellation was not retried through retirement"
-            assert cancel_calls == 2
-            assert pending_checks == (1 if failure_phase == "cancel" else 2)
-            assert retire_calls == (2 if failure_phase == "retire" else 1)
+            assert cancel_calls == (4 if failure_phase in {"cancel", "retire"} else 2)
+            assert pending_checks == (1 if failure_phase == "cancel" else 4 if failure_phase == "retire" else 2)
+            assert retire_calls == (4 if failure_phase == "retire" else 1)
         finally:
             release_submit.set()
             query_thread.join(timeout=5)

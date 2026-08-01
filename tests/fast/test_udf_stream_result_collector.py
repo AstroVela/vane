@@ -26,6 +26,8 @@ from duckdb.execution.udf_stream_result_collector import (
 )
 from duckdb.execution.udf_task_admission import TaskAdmission
 
+_CLEANUP_SUBMISSION_SCOPE = "query:test-cleanup"
+
 
 class _Ref:
     def __init__(self, value=None, *, ready=True, is_block=False):
@@ -332,6 +334,7 @@ def _source(fake_ray, driver, *, request_id, submitter):
             request_id=request_id,
             retained_input_bytes=0,
             lease=lease,
+            submission_scope=f"test-stream:{request_id}",
         ),
         submitter=submitter,
         ray_module=fake_ray,
@@ -832,10 +835,12 @@ def test_cleanup_tickets_retry_transient_failure_without_starving_peer():
         (
             RayStreamCleanupOperation(
                 fail_transiently,
+                submission_scope=_CLEANUP_SUBMISSION_SCOPE,
                 retry_on_error=True,
             ),
             RayStreamCleanupOperation(
                 lambda: order.append("peer"),
+                submission_scope=_CLEANUP_SUBMISSION_SCOPE,
             ),
         ),
         store_error=False,
@@ -866,6 +871,7 @@ def test_cleanup_ticket_preserves_incomplete_ownership_retry():
     operations = (
         RayStreamCleanupOperation(
             transfer_owner,
+            submission_scope=_CLEANUP_SUBMISSION_SCOPE,
             retry_on_incomplete=True,
         ),
     )
@@ -900,6 +906,7 @@ def test_cleanup_ticket_rejects_a_broken_future_callback_contract():
         (
             RayStreamCleanupOperation(
                 _BrokenFuture,
+                submission_scope=_CLEANUP_SUBMISSION_SCOPE,
                 retry_on_error=True,
             ),
         ),
@@ -939,7 +946,13 @@ def test_slot_retirement_reports_async_cancellation_ticket_failure():
 
     collector = AsyncResultCollector(ray_module=_FakeRay())
     collector._submit_cleanup_operations(
-        (RayStreamCleanupOperation(broken_cleanup, retry_on_error=True),),
+        (
+            RayStreamCleanupOperation(
+                broken_cleanup,
+                submission_scope=_CLEANUP_SUBMISSION_SCOPE,
+                retry_on_error=True,
+            ),
+        ),
         store_error=False,
         slot_ids=(7,),
     )
@@ -991,6 +1004,7 @@ def test_cleanup_ticket_retries_a_hung_control_response(monkeypatch):
         (
             RayStreamCleanupOperation(
                 transfer_owner,
+                submission_scope=_CLEANUP_SUBMISSION_SCOPE,
                 retry_on_error=True,
                 abandon_wait=abandon_wait,
             ),
@@ -1055,6 +1069,7 @@ def test_cleanup_ticket_expands_slow_response_deadline(monkeypatch):
         (
             RayStreamCleanupOperation(
                 transfer_owner,
+                submission_scope=_CLEANUP_SUBMISSION_SCOPE,
                 retry_on_error=True,
                 abandon_wait=abandon_wait,
             ),
@@ -1183,6 +1198,7 @@ def test_data_capacity_does_not_count_interleaved_control_events():
         lease_id="strict-consumer-lease",
         query_id="q1",
         driver=object(),
+        submission_scope="test-output:strict-consumer",
         slot_id=1,
         submit_id=11,
         size_bytes=64,
@@ -1273,6 +1289,7 @@ def test_output_lease_control_retries_until_driver_acknowledges_ownership(operat
         lease_id="output-lease-retry",
         query_id="q1",
         driver=driver,
+        submission_scope="test-output:retry",
         slot_id=2,
         submit_id=20,
         size_bytes=64,
@@ -1307,6 +1324,7 @@ def test_output_control_waits_on_one_inflight_driver_response():
         lease_id="output-lease-delayed-ack",
         query_id="q1",
         driver=driver,
+        submission_scope="test-output:delayed-ack",
         slot_id=2,
         submit_id=21,
         size_bytes=64,
@@ -1341,6 +1359,7 @@ def test_output_release_ticket_handoff_is_atomic_with_shutdown(monkeypatch):
         lease_id="output-lease-shutdown-race",
         query_id="q1",
         driver=driver,
+        submission_scope="test-output:shutdown-race",
         slot_id=2,
         submit_id=22,
         size_bytes=64,
@@ -1409,6 +1428,7 @@ def test_slot_cancel_reuses_an_already_claimed_output_release_ticket():
         lease_id="output-lease-cancel-release-race",
         query_id="q1",
         driver=driver,
+        submission_scope="test-output:cancel-release-race",
         slot_id=2,
         submit_id=23,
         size_bytes=64,
@@ -1592,6 +1612,7 @@ def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
         return (
             RayStreamCleanupOperation(
                 block_retirement,
+                submission_scope=_CLEANUP_SUBMISSION_SCOPE,
             ),
             *operations,
         )
@@ -1722,20 +1743,23 @@ def test_terminal_cleanup_handoff_failure_replans_owned_stream(monkeypatch):
 
 def test_blocked_output_admission_submission_does_not_stall_healthy_stream():
     fake_ray = _FakeRay()
-    blocked_driver = _Driver()
-    healthy_driver = _Driver()
+    driver = _Driver()
     output_submission_started = threading.Event()
     release_output_submission = threading.Event()
     healthy_block = _Ref("healthy-beside-output-admission", ready=False, is_block=True)
-    original_acquire_output = blocked_driver._acquire_output
+    original_acquire_output = driver._acquire_output
+    first_submission = True
 
     def blocking_acquire_output(request):
-        output_submission_started.set()
-        if not release_output_submission.wait(timeout=5):
-            raise RuntimeError("test did not release blocked output admission")
+        nonlocal first_submission
+        if first_submission:
+            first_submission = False
+            output_submission_started.set()
+            if not release_output_submission.wait(timeout=5):
+                raise RuntimeError("test did not release blocked output admission")
         return original_acquire_output(request)
 
-    blocked_driver.acquire_query_output_block_lease = _RemoteMethod(
+    driver.acquire_query_output_block_lease = _RemoteMethod(
         blocking_acquire_output,
     )
     collector = AsyncResultCollector(ray_module=fake_ray)
@@ -1744,7 +1768,7 @@ def test_blocked_output_admission_submission_does_not_stall_healthy_stream():
         24,
         _source(
             fake_ray,
-            blocked_driver,
+            driver,
             request_id="blocked-output-admission",
             submitter=lambda lease: _Generator(
                 [
@@ -1760,7 +1784,7 @@ def test_blocked_output_admission_submission_does_not_stall_healthy_stream():
         34,
         _source(
             fake_ray,
-            healthy_driver,
+            driver,
             request_id="healthy-beside-output-admission",
             submitter=lambda lease: _Generator(
                 [
@@ -1818,6 +1842,7 @@ def test_blocked_terminal_retirement_does_not_stall_healthy_stream(monkeypatch):
         return (
             RayStreamCleanupOperation(
                 block_retirement,
+                submission_scope=adapter.submission_scope,
             ),
             *operations,
         )
@@ -1895,6 +1920,7 @@ def test_slot_cancel_observes_claimed_terminal_retirement_without_waiting(monkey
         return (
             RayStreamCleanupOperation(
                 block_retirement,
+                submission_scope=_CLEANUP_SUBMISSION_SCOPE,
             ),
             *operations,
         )
@@ -2856,6 +2882,7 @@ def test_pending_output_control_futures_do_not_withhold_task_or_stream_cleanup()
             lease_id=f"output-lease-blocked-{index}",
             query_id="q1",
             driver=driver,
+            submission_scope=f"test-output:blocked:{index}",
             slot_id=71,
             submit_id=index,
             size_bytes=64,

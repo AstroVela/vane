@@ -75,6 +75,21 @@ static bool StreamingUDFDebugEnabled() {
 	return cached == 1;
 }
 
+static bool DuplicateStreamingWakeupsForTesting() {
+	static const bool enabled =
+	    DebugEnvFlagEnabled("VANE_ENABLE_UDF_TEST_HOOKS") && DebugEnvFlagEnabled("VANE_TEST_DUPLICATE_UDF_WAKEUPS");
+	return enabled;
+}
+
+static bool InjectEarlyStreamingWakeupForTesting() {
+	if (!DuplicateStreamingWakeupsForTesting()) {
+		return false;
+	}
+	static atomic<bool> injected {false};
+	bool expected = false;
+	return injected.compare_exchange_strong(expected, true);
+}
+
 static void StreamingUDFDebugLog(const string &message) {
 	if (!StreamingUDFDebugEnabled()) {
 		return;
@@ -1422,53 +1437,20 @@ static bool RunStreamingWakeCallbacksUnlocked(StreamingUDFState &state, vector<I
 	}
 	auto shared_state = state.self.lock();
 	if (!shared_state) {
-		throw InternalException("streaming UDF deferred wakeup queue is not initialized");
-	}
-	if (!state.op || !state.op->executor) {
-		// A zero-input UDF can reach its terminal state without ever creating an
-		// executor. Its blocked source tasks are already descheduled, so wake them
-		// directly outside the state lock. Every non-terminal path still requires
-		// the joined executor dispatcher for deferred wakeup ordering.
-		if (!StreamingTerminalReady(state)) {
-			throw InternalException("streaming UDF deferred wakeup queue is not initialized");
-		}
-		guard.unlock();
-		for (auto &entry : callbacks) {
-			try {
-				entry.Callback();
-			} catch (const std::exception &ex) {
-				SetStreamingError(*shared_state,
-				                  StringUtil::Format("streaming UDF terminal wakeup callback failed: %s", ex.what()));
-			} catch (...) {
-				SetStreamingError(*shared_state,
-				                  "streaming UDF terminal wakeup callback failed with an unknown exception");
-			}
-		}
-		guard.lock();
-		return true;
+		throw InternalException("streaming UDF wakeup state is not initialized");
 	}
 	guard.unlock();
-	try {
-		// Every queued function owns at least one blocked task callback, so queue
-		// growth is bounded by the query's pipeline task count. The joined UDF
-		// dispatcher executes it on its next event-loop turn, after the target task
-		// has had a chance to finish descheduling.
-		state.op->executor->EnqueueDeferredWakeup([shared_state = std::move(shared_state),
-		                                           callbacks = std::move(callbacks)]() mutable {
-			for (auto &entry : callbacks) {
-				try {
-					entry.Callback();
-				} catch (const std::exception &ex) {
-					SetStreamingError(*shared_state,
-					                  StringUtil::Format("streaming UDF wakeup callback failed: %s", ex.what()));
-				} catch (...) {
-					SetStreamingError(*shared_state, "streaming UDF wakeup callback failed with an unknown exception");
-				}
+	for (auto &entry : callbacks) {
+		try {
+			entry.Callback();
+			if (DuplicateStreamingWakeupsForTesting()) {
+				entry.Callback();
 			}
-		});
-	} catch (...) {
-		guard.lock();
-		throw;
+		} catch (const std::exception &ex) {
+			SetStreamingError(*shared_state, StringUtil::Format("streaming UDF wakeup callback failed: %s", ex.what()));
+		} catch (...) {
+			SetStreamingError(*shared_state, "streaming UDF wakeup callback failed with an unknown exception");
+		}
 	}
 	guard.lock();
 	return true;
@@ -1484,6 +1466,9 @@ static bool BlockStreamingTask(StreamingUDFState &state, const unique_lock<mutex
 		state.blocked_source_tasks.push_back(interrupt_state);
 	} else {
 		state.blocked_control_tasks.push_back(interrupt_state);
+	}
+	if (InjectEarlyStreamingWakeupForTesting()) {
+		interrupt_state.Callback();
 	}
 	return true;
 }

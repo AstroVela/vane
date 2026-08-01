@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/parallel/task.hpp"
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 
 namespace duckdb {
@@ -26,7 +27,8 @@ public:
 
 public:
 	void Deschedule() override;
-	void Reschedule() override;
+	uint64_t CurrentInterruptEpoch() const override;
+	void Reschedule(uint64_t interrupt_epoch) override;
 
 public:
 	Executor &executor;
@@ -35,6 +37,23 @@ public:
 	optional_ptr<const PhysicalOperator> op;
 
 private:
+	enum class InterruptExecutionState : uint8_t {
+		IDLE,
+		RUNNING,
+		BLOCKING,
+		DESCHEDULING,
+		DESCHEDULED,
+		RESCHEDULED,
+		FINISHED
+	};
+
+	void BeginInterruptExecution();
+	void FinishInterruptExecution(TaskExecutionResult result);
+
+	mutable mutex interrupt_lock;
+	uint64_t interrupt_epoch = 0;
+	InterruptExecutionState interrupt_execution_state = InterruptExecutionState::IDLE;
+	bool interrupt_reschedule_requested = false;
 	ClientContext &context;
 
 public:

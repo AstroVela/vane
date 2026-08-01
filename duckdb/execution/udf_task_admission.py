@@ -10,7 +10,8 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable
-from typing import Any, TypeAlias
+from dataclasses import dataclass
+from typing import Any
 
 from duckdb.execution.ray_control_submission import submit_ray_control
 from duckdb.execution.ray_stream_adapter import (
@@ -159,18 +160,36 @@ def ray_udf_task_resource_spec(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-TaskAdmission: TypeAlias = AdmissionLease
+@dataclass(kw_only=True)
+class TaskAdmission(AdmissionLease):
+    """Ray task admission plus its long-lived local control owner."""
+
+    submission_scope: str
+
+    def __post_init__(self) -> None:
+        self.submission_scope = str(self.submission_scope or "").strip()
+        if not self.submission_scope:
+            raise ValueError("Ray task admission requires an explicit submission scope")
 
 
 class _TaskAdmissionCancellation:
     """Durably drive one task-admission cancellation to acknowledgement."""
 
-    def __init__(self, *, driver: Any, request: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        *,
+        driver: Any,
+        request: dict[str, Any],
+        submission_scope: str,
+    ) -> None:
         self._driver = driver
         self._request = {
             **request,
             "resources": dict(request["resources"]),
         }
+        self._submission_scope = str(submission_scope or "").strip()
+        if not self._submission_scope:
+            raise ValueError("Ray task admission cancellation requires an explicit submission scope")
         self._lock = threading.Lock()
         self._response_future: Any | None = None
         self._response_deadline: _ScheduledCall | None = None
@@ -202,7 +221,7 @@ class _TaskAdmissionCancellation:
                 return
             self._submitting = True
         try:
-            submit_ray_control(self._submit)
+            submit_ray_control(self._submission_scope, self._submit)
         except BaseException:
             with self._lock:
                 self._submitting = False
@@ -369,6 +388,7 @@ class TaskAdmissionController:
         self._resources = ray_udf_task_resource_spec(self._payload)
         self._driver = driver
         self._executor_id = uuid.uuid4().hex
+        self._submission_scope = f"udf-executor:{self._executor_id}"
         self._sequence = 0
         self._lock = threading.Lock()
         self._state = "idle"
@@ -419,6 +439,7 @@ class TaskAdmissionController:
             cancellation = _TaskAdmissionCancellation(
                 driver=self._driver_actor(),
                 request=request,
+                submission_scope=self._submission_scope,
             )
             self._cancellation = cancellation
         request_id = str(request["request_id"])
@@ -429,6 +450,7 @@ class TaskAdmissionController:
         }
         try:
             submission = submit_ray_control(
+                self._submission_scope,
                 lambda: driver.acquire_query_task_lease.remote(submitted_request),
             )
         except BaseException as exc:
@@ -623,6 +645,7 @@ class TaskAdmissionController:
                 request_id=request_id,
                 retained_input_bytes=self._retained_input_bytes,
                 lease=dict(self._ready_lease),
+                submission_scope=self._submission_scope,
                 _release_callback=cancellation.start,
             )
             self._state = "idle"

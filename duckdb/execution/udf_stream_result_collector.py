@@ -68,6 +68,7 @@ class _OutputLeaseToken:
     lease_id: str
     query_id: str
     driver: Any
+    submission_scope: str
     slot_id: int
     submit_id: int
     size_bytes: int
@@ -140,7 +141,7 @@ class _CleanupTicket:
     def __init__(
         self,
         *,
-        operation: Callable[[], Any],
+        operation: RayStreamCleanupOperation,
         retry_on_error: bool,
         retry_on_incomplete: bool,
         abandon_wait: Callable[[Any], None] | None,
@@ -211,11 +212,13 @@ class AsyncResultCollector:
 
     The asyncio thread is the sole generator-readiness, read, and state
     scheduler. Potentially blocking Ray control submissions and terminal
-    operations run on one fixed process-wide daemon executor and publish their
-    results back to that loop. Driver RPCs are observed through public
-    ObjectRef futures. Every terminal operation enters the ticket ledger before
-    its source record is removed, so shutdown can never observe an ownership
-    gap.
+    operations run on admitted stream-owner daemon workers and publish their
+    results back to that loop. One blocked stream therefore cannot consume a
+    healthy peer's submission progress, and worker cardinality follows the
+    existing task-admission bound rather than an arbitrary lane count. Driver
+    RPCs are observed through public ObjectRef futures. Every terminal operation
+    enters the ticket ledger before its source record is removed, so shutdown
+    can never observe an ownership gap.
 
     The native dispatcher keeps this collector alive across empty slot
     intervals. ``shutdown`` is the process-owner fence and is called only after
@@ -595,6 +598,7 @@ class AsyncResultCollector:
     ) -> RayStreamCleanupOperation:
         return RayStreamCleanupOperation(
             lambda: self._run_output_token_handoff(token),
+            submission_scope=token.submission_scope,
             retry_on_error=True,
             retry_on_incomplete=True,
             abandon_wait=lambda future: self._abandon_output_token_handoff(
@@ -609,6 +613,7 @@ class AsyncResultCollector:
     ) -> RayStreamCleanupOperation:
         return RayStreamCleanupOperation(
             lambda: self._run_output_token_release(token),
+            submission_scope=token.submission_scope,
             retry_on_error=True,
             retry_on_incomplete=True,
             abandon_wait=lambda future: self._abandon_output_token_release(
@@ -621,6 +626,7 @@ class AsyncResultCollector:
     def _output_request_cancel_operation(
         driver: Any,
         request: dict[str, Any],
+        submission_scope: str,
     ) -> RayStreamCleanupOperation:
         response_future: Any | None = None
 
@@ -650,6 +656,7 @@ class AsyncResultCollector:
 
         return RayStreamCleanupOperation(
             cancel,
+            submission_scope=submission_scope,
             retry_on_error=True,
             retry_on_incomplete=True,
             abandon_wait=abandon_wait,
@@ -678,7 +685,13 @@ class AsyncResultCollector:
                     if request is not None and driver is not None and not record.output_cancel_sent:
                         record.output_cancel_sent = True
                         output_cancel_records.append(record)
-                        cleanup_operations.append(self._output_request_cancel_operation(driver, request))
+                        cleanup_operations.append(
+                            self._output_request_cancel_operation(
+                                driver,
+                                request,
+                                record.adapter.submission_scope,
+                            )
+                        )
                     cleanup_operations.extend(record.adapter.cancel_operations())
                 ready = list(self._ready_by_slot.get(slot_key, ()))
                 tokens = [token for token in self._active_output_leases.values() if token.slot_id == slot_key]
@@ -780,7 +793,13 @@ class AsyncResultCollector:
                             driver = record.adapter.driver
                             if request is not None and driver is not None and not record.output_cancel_sent:
                                 record.output_cancel_sent = True
-                                cleanup_operations.append(self._output_request_cancel_operation(driver, request))
+                                cleanup_operations.append(
+                                    self._output_request_cancel_operation(
+                                        driver,
+                                        request,
+                                        record.adapter.submission_scope,
+                                    )
+                                )
                             cleanup_operations.extend(record.adapter.cancel_operations())
                         ready = [event for events in self._ready_by_slot.values() for event in events]
                         tokens = list(self._active_output_leases.values())
@@ -1293,7 +1312,10 @@ class AsyncResultCollector:
             ):
                 return
         try:
-            operation_future = submit_ray_control(ticket.operation)
+            operation_future = submit_ray_control(
+                ticket.operation.submission_scope,
+                ticket.operation,
+            )
         except BaseException as exc:
             self._finish_cleanup_operation(ticket, error=exc)
             return
@@ -1772,9 +1794,10 @@ class AsyncResultCollector:
             record.phase = "output_lease"
 
         output_submit_future = submit_ray_control(
+            record.adapter.submission_scope,
             lambda: driver.acquire_query_output_block_lease.remote(
                 dict(request),
-            )
+            ),
         )
         with self._cv:
             stale = self._shutdown or self._records.get(key) is not record or record.terminal
@@ -1787,7 +1810,13 @@ class AsyncResultCollector:
             output_submit_future.cancel()
             if cancel_stale_request:
                 self._submit_cleanup_operations(
-                    (self._output_request_cancel_operation(driver, request),),
+                    (
+                        self._output_request_cancel_operation(
+                            driver,
+                            request,
+                            record.adapter.submission_scope,
+                        ),
+                    ),
                     slot_ids=(record.slot_id,),
                 )
             return
@@ -1891,6 +1920,7 @@ class AsyncResultCollector:
             lease_id=str(lease["lease_id"]),
             query_id=str(metadata["query_id"]),
             driver=driver,
+            submission_scope=record.adapter.submission_scope,
             slot_id=record.slot_id,
             submit_id=record.submit_id,
             size_bytes=int(metadata["size_bytes"]),
@@ -2084,6 +2114,7 @@ class AsyncResultCollector:
                     output_cancel_operation = self._output_request_cancel_operation(
                         driver,
                         request,
+                        record.adapter.submission_scope,
                     )
                 terminal_signal_observed = record.terminal_signal_observed
                 cleanup_operations: list[RayStreamCleanupOperation] = [

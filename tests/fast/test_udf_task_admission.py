@@ -323,20 +323,22 @@ def test_taken_task_admission_abandons_if_submission_never_takes_ownership():
 
 
 def test_blocked_task_admission_submission_does_not_stall_other_controller():
-    blocked_driver = _Driver()
+    driver = _Driver()
     blocked_submission_entered = threading.Event()
     release_blocked_submission = threading.Event()
+    original_acquire = driver._acquire
 
-    def blocked_acquire(request):
-        blocked_submission_entered.set()
-        if not release_blocked_submission.wait(timeout=5.0):
-            raise RuntimeError("timed out waiting to release blocked task admission")
-        return _resolved_ref(_grant(request))
+    def selectively_blocking_acquire(request):
+        if request["retained_input_bytes"] == 31:
+            blocked_submission_entered.set()
+            if not release_blocked_submission.wait(timeout=5.0):
+                raise RuntimeError("timed out waiting to release blocked task admission")
+            return _resolved_ref(_grant(request))
+        return original_acquire(request)
 
-    blocked_driver.acquire_query_task_lease = _RemoteMethod(blocked_acquire)
-    blocked = TaskAdmissionController(_payload(), driver=blocked_driver)
-    healthy_driver = _Driver()
-    healthy = TaskAdmissionController(_payload(), driver=healthy_driver)
+    driver.acquire_query_task_lease = _RemoteMethod(selectively_blocking_acquire)
+    blocked = TaskAdmissionController(_payload(), driver=driver)
+    healthy = TaskAdmissionController(_payload(), driver=driver)
     healthy_ready = threading.Event()
     healthy.register_wakeup(healthy_ready.set)
 
@@ -349,10 +351,12 @@ def test_blocked_task_admission_submission_does_not_stall_other_controller():
         assert blocked_submission_entered.wait(timeout=1.0)
 
         assert healthy.request(47)
-        _wait_for_remote_calls(healthy_driver.acquire_query_task_lease, 1)
-        _wait_for_request_refs(healthy_driver, 1)
-        healthy_request = healthy_driver.acquire_query_task_lease.calls[0][0][0]
-        healthy_driver.requests[0].resolve(_grant(healthy_request))
+        _wait_for_remote_calls(driver.acquire_query_task_lease, 2)
+        _wait_for_request_refs(driver, 1)
+        healthy_request = next(
+            call[0][0] for call in driver.acquire_query_task_lease.calls if call[0][0]["retained_input_bytes"] == 47
+        )
+        driver.requests[0].resolve(_grant(healthy_request))
 
         assert healthy_ready.wait(timeout=1.0)
         assert healthy.state()["state"] == "ready"
@@ -361,8 +365,7 @@ def test_blocked_task_admission_submission_does_not_stall_other_controller():
         blocked.close()
         healthy.close()
 
-    _wait_for_remote_calls(blocked_driver.cancel_query_task_lease_request, 1)
-    _wait_for_remote_calls(healthy_driver.cancel_query_task_lease_request, 1)
+    _wait_for_remote_calls(driver.cancel_query_task_lease_request, 2)
 
 
 def test_blocked_task_admission_submission_does_not_retain_closed_controller():
@@ -383,7 +386,6 @@ def test_blocked_task_admission_submission_does_not_retain_closed_controller():
     controller_ref = weakref.ref(controller)
 
     controller.close()
-    _wait_for_remote_calls(driver.cancel_query_task_lease_request, 1)
     del controller
     gc.collect()
 
@@ -391,6 +393,7 @@ def test_blocked_task_admission_submission_does_not_retain_closed_controller():
         assert controller_ref() is None
     finally:
         release_submission.set()
+    _wait_for_remote_calls(driver.cancel_query_task_lease_request, 1)
 
 
 def test_task_admission_cancellation_retries_until_driver_acknowledges():
@@ -478,7 +481,12 @@ def test_task_admission_cancellation_expands_slow_response_deadline(monkeypatch)
     driver.cancel_query_task_lease_request = _RemoteMethod(cancel)
     cancellation = task_admission._TaskAdmissionCancellation(
         driver=driver,
-        request={"request_id": "slow-cancel", "resources": {}},
+        request={
+            "request_id": "slow-cancel",
+            "query_id": "query:slow-cancel",
+            "resources": {},
+        },
+        submission_scope="test-admission:slow-cancel",
     )
 
     cancellation.start()
@@ -513,8 +521,10 @@ def test_task_admission_cancellations_share_one_deadline_thread(monkeypatch):
             driver=driver,
             request={
                 "request_id": f"shared-cancel:{index}",
+                "query_id": "query:shared-cancel",
                 "resources": {},
             },
+            submission_scope="test-admission:shared-cancel",
         )
         for index in range(256)
     ]
@@ -541,70 +551,65 @@ def test_task_admission_cancellations_share_one_deadline_thread(monkeypatch):
     assert all(cancellation._done for cancellation in cancellations)
 
 
-def test_task_admission_blocked_rpc_submissions_use_bounded_workers_without_blocking_deadlines():
-    driver = _Driver()
+def test_ray_control_submissions_isolate_blocked_owner_and_retire_idle_workers():
+    executor = ray_control_submission._RayControlSubmissionExecutor(
+        idle_timeout_s=0.01,
+    )
+    blocked_owner = "owner:blocked"
+    healthy_owner = "owner:healthy"
     release_submissions = threading.Event()
-    all_workers_blocked = threading.Event()
-    entered_lock = threading.Lock()
+    blocked_submission_entered = threading.Event()
     entered = 0
 
-    def cancel(_request):
+    def blocked_submission():
         nonlocal entered
-        with entered_lock:
-            entered += 1
-            if entered == ray_control_submission._RAY_CONTROL_SUBMISSION_WORKERS:
-                all_workers_blocked.set()
-        release_submissions.wait(timeout=5.0)
-        return _resolved_ref({"cancelled": True})
+        entered += 1
+        blocked_submission_entered.set()
+        if not release_submissions.wait(timeout=5.0):
+            raise RuntimeError("timed out waiting to release blocked driver")
+        return "released"
 
-    driver.cancel_query_task_lease_request = _RemoteMethod(cancel)
-    cancellation_count = ray_control_submission._RAY_CONTROL_SUBMISSION_WORKERS + 64
-    cancellations = [
-        task_admission._TaskAdmissionCancellation(
-            driver=driver,
-            request={
-                "request_id": f"blocked-submit:{index}",
-                "resources": {},
-            },
+    blocked_futures = [
+        executor.submit(
+            blocked_owner,
+            blocked_submission,
         )
-        for index in range(cancellation_count)
+        for _ in range(65)
     ]
 
-    started_at = time.monotonic()
-    for cancellation in cancellations:
-        cancellation.start()
-    start_elapsed = time.monotonic() - started_at
-
-    deadline_fired = threading.Event()
-    deadline = task_admission._TASK_ADMISSION_CANCELLATION_SCHEDULER.create(
-        deadline_fired.set,
-    )
-    task_admission._TASK_ADMISSION_CANCELLATION_SCHEDULER.schedule(
-        deadline,
-        0.01,
-    )
     try:
-        assert start_elapsed < 1.0
-        assert all_workers_blocked.wait(timeout=2.0)
-        assert deadline_fired.wait(timeout=1.0)
-        assert (
-            len(driver.cancel_query_task_lease_request.calls) == ray_control_submission._RAY_CONTROL_SUBMISSION_WORKERS
-        )
-        submission_threads = [
-            thread for thread in threading.enumerate() if thread.name.startswith("vane-ray-control-submit-")
-        ]
-        assert len(submission_threads) == ray_control_submission._RAY_CONTROL_SUBMISSION_WORKERS
+        assert blocked_submission_entered.wait(timeout=1.0)
+        assert entered == 1
+        healthy = executor.submit(healthy_owner, lambda: "healthy")
+        assert healthy.result(timeout=1.0) == "healthy"
+        assert entered == 1
     finally:
         release_submissions.set()
 
-    _wait_for_remote_calls(
-        driver.cancel_query_task_lease_request,
-        cancellation_count,
-    )
+    assert [future.result(timeout=1.0) for future in blocked_futures] == ["released"] * len(blocked_futures)
     completion_deadline = time.monotonic() + 1.0
-    while not all(cancellation._done for cancellation in cancellations) and time.monotonic() < completion_deadline:
+    while executor._workers and time.monotonic() < completion_deadline:
         time.sleep(0.005)
-    assert all(cancellation._done for cancellation in cancellations)
+    assert executor._workers == {}
+
+
+def test_ray_control_submission_does_not_retain_worker_when_thread_start_fails(
+    monkeypatch,
+):
+    executor = ray_control_submission._RayControlSubmissionExecutor()
+
+    def fail_start(_worker):
+        raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(
+        ray_control_submission._RayControlSubmissionWorker,
+        "start",
+        fail_start,
+    )
+    with pytest.raises(RuntimeError, match="thread unavailable"):
+        executor.submit("owner:start-failure", lambda: None)
+
+    assert executor._workers == {}
 
 
 def test_local_slot_admission_owns_concrete_slots_and_wakes_one_waiter():

@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -131,20 +134,19 @@ class QueryExecutionCleanupError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class _TaskTerminalControl:
-    """Compact driver-lifetime proof for one terminal task request."""
+    """Bounded payload-replay identity for one terminal task request."""
 
     identity_fingerprint: bytes
-    lease_fingerprint: bytes | None
+    query_fingerprint: bytes
     status: str
     blocked_reason: str
 
 
 @dataclass(frozen=True, slots=True)
 class _OutputTerminalControl:
-    """Compact driver-lifetime proof for one terminal output request."""
+    """Bounded payload-replay identity for one terminal output request."""
 
     identity_fingerprint: bytes
-    lease_fingerprint: bytes | None
     query_fingerprint: bytes
     status: str
     blocked_reason: str
@@ -1301,17 +1303,24 @@ class RayQueryDriverActor:
         self._query_task_lease_request_tombstones = BoundedReplayMap[str, dict[str, Any]](
             capacity=_LEASE_REQUEST_REPLAY_CAPACITY
         )
-        # Full replay payloads are bounded, but terminal control identity must
-        # remain exact for the actor lifetime. Otherwise a lost response can
-        # become unacknowledgeable after tombstone eviction.
-        self._query_task_terminal_controls: dict[bytes, _TaskTerminalControl] = {}
-        self._query_task_terminal_attempts: set[bytes] = set()
+        # Request payload replay is bounded and query-scoped. Granted task
+        # lease IDs are signed capabilities, so cleanup ACK replay does not
+        # depend on retaining an entry in either compact denial ledger.
+        self._query_task_terminal_controls = BoundedReplayMap[bytes, _TaskTerminalControl](
+            capacity=_LEASE_REQUEST_REPLAY_CAPACITY
+        )
+        self._query_task_terminal_attempts = BoundedReplayMap[bytes, bytes](capacity=_LEASE_REQUEST_REPLAY_CAPACITY)
         self._query_output_lease_request_tombstones = BoundedReplayMap[str, dict[str, Any]](
             capacity=_LEASE_REQUEST_REPLAY_CAPACITY
         )
-        # Output payload replay is bounded, but a delayed release ACK must stay
-        # provable after that cache entry is evicted.
-        self._query_output_terminal_controls: dict[bytes, _OutputTerminalControl] = {}
+        # Request payload replay is bounded and query-scoped. Granted output
+        # lease IDs are signed capabilities, so cleanup ACK replay does not
+        # depend on retaining an entry in this map.
+        self._query_output_terminal_controls = BoundedReplayMap[bytes, _OutputTerminalControl](
+            capacity=_LEASE_REQUEST_REPLAY_CAPACITY
+        )
+        self._query_lease_control_key = os.urandom(32)
+        self._query_lease_generation_ids: dict[str, str] = {}
         self._query_task_request_owner_by_identity: dict[tuple[str, str, str], str] = {}
         self._query_output_request_owner_by_identity: dict[tuple[str, str], str] = {}
         self._query_resource_closing_queries: set[str] = set()
@@ -2478,24 +2487,30 @@ class RayQueryDriverActor:
             self._query_task_lease_requests = {}
         if not hasattr(self, "_query_output_lease_requests"):
             self._query_output_lease_requests = {}
-        task_tombstones = getattr(self, "_query_task_lease_request_tombstones", ())
-        if not isinstance(task_tombstones, BoundedReplayMap):
+        if not hasattr(self, "_query_task_lease_request_tombstones"):
             self._query_task_lease_request_tombstones = BoundedReplayMap(
-                getattr(task_tombstones, "items", lambda: ())(),
                 capacity=_LEASE_REQUEST_REPLAY_CAPACITY,
             )
         if not hasattr(self, "_query_task_terminal_controls"):
-            self._query_task_terminal_controls = {}
+            self._query_task_terminal_controls = BoundedReplayMap(
+                capacity=_LEASE_REQUEST_REPLAY_CAPACITY,
+            )
         if not hasattr(self, "_query_task_terminal_attempts"):
-            self._query_task_terminal_attempts = set()
-        output_tombstones = getattr(self, "_query_output_lease_request_tombstones", ())
-        if not isinstance(output_tombstones, BoundedReplayMap):
+            self._query_task_terminal_attempts = BoundedReplayMap(
+                capacity=_LEASE_REQUEST_REPLAY_CAPACITY,
+            )
+        if not hasattr(self, "_query_output_lease_request_tombstones"):
             self._query_output_lease_request_tombstones = BoundedReplayMap(
-                getattr(output_tombstones, "items", lambda: ())(),
                 capacity=_LEASE_REQUEST_REPLAY_CAPACITY,
             )
         if not hasattr(self, "_query_output_terminal_controls"):
-            self._query_output_terminal_controls = {}
+            self._query_output_terminal_controls = BoundedReplayMap(
+                capacity=_LEASE_REQUEST_REPLAY_CAPACITY,
+            )
+        if not hasattr(self, "_query_lease_control_key"):
+            self._query_lease_control_key = os.urandom(32)
+        if not hasattr(self, "_query_lease_generation_ids"):
+            self._query_lease_generation_ids = {}
         if not hasattr(self, "_query_task_request_owner_by_identity"):
             self._query_task_request_owner_by_identity = {}
         if not hasattr(self, "_query_output_request_owner_by_identity"):
@@ -2618,6 +2633,26 @@ class RayQueryDriverActor:
         if fence.error is not None:
             raise fence.error
 
+    def _discard_query_admission_replay(self, query_id: str) -> None:
+        """Drop bounded replay caches that must never cross a query generation."""
+        query_key = str(query_id)
+        query_fingerprint = self._query_fingerprint(query_key)
+        self._query_task_lease_request_tombstones.discard_where(
+            lambda _request_id, state: state.get("identity", {}).get("query_id") == query_key
+        )
+        self._query_output_lease_request_tombstones.discard_where(
+            lambda _request_id, state: state.get("identity", {}).get("query_id") == query_key
+        )
+        self._query_task_terminal_controls.discard_where(
+            lambda _request_fingerprint, control: control.query_fingerprint == query_fingerprint
+        )
+        self._query_task_terminal_attempts.discard_where(
+            lambda _attempt_fingerprint, owner_query_fingerprint: owner_query_fingerprint == query_fingerprint
+        )
+        self._query_output_terminal_controls.discard_where(
+            lambda _request_fingerprint, control: control.query_fingerprint == query_fingerprint
+        )
+
     def _close_query_resource_admission(self, query_id: str) -> None:
         """Fence new requests and resolve all old requests on the owner loop."""
         from duckdb.runners.ray.fte_fragment_scheduler import close_fte_registry_for_query
@@ -2641,9 +2676,7 @@ class RayQueryDriverActor:
             for request_id, state in self._query_output_lease_requests.items()
             if state.get("identity", {}).get("query_id") != query_key
         }
-        self._query_output_lease_request_tombstones.discard_where(
-            lambda _request_id, state: state.get("identity", {}).get("query_id") == query_key
-        )
+        self._discard_query_admission_replay(query_key)
         self._query_output_request_owner_by_identity = {
             identity: request_id
             for identity, request_id in self._query_output_request_owner_by_identity.items()
@@ -2667,7 +2700,6 @@ class RayQueryDriverActor:
             for table in (
                 self._query_task_lease_requests,
                 self._query_output_lease_requests,
-                self._query_output_lease_request_tombstones,
             )
             for state in table.values()
         )
@@ -2692,7 +2724,9 @@ class RayQueryDriverActor:
         self._query_fte_admission_pumps.pop(query_key, None)
         self._query_fte_admission_done_events.pop(query_key, None)
         self._query_fte_admission_dirty_queries.discard(query_key)
+        self._discard_query_admission_replay(query_key)
         open_fte_registry_for_query(query_key)
+        self._query_lease_generation_ids[query_key] = uuid.uuid4().hex
         self._query_resource_closing_queries.discard(query_key)
 
     def _signal_query_resource_change(self, query_id: str) -> None:
@@ -2865,15 +2899,6 @@ class RayQueryDriverActor:
         return hashlib.sha256(encoded).digest()
 
     @staticmethod
-    def _task_lease_fingerprint(lease_id: str, attempt_id: str) -> bytes:
-        encoded = json.dumps(
-            [str(lease_id), str(attempt_id)],
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).digest()
-
-    @staticmethod
     def _task_request_fingerprint(request_id: str) -> bytes:
         return hashlib.sha256(str(request_id).encode("utf-8")).digest()
 
@@ -2900,7 +2925,6 @@ class RayQueryDriverActor:
         *,
         request_id: str,
         identity: dict[str, Any],
-        lease: dict[str, Any] | None,
         status: str,
         result: dict[str, Any],
     ) -> None:
@@ -2908,13 +2932,8 @@ class RayQueryDriverActor:
         request_fingerprint = self._task_request_fingerprint(request_key)
         control = _TaskTerminalControl(
             identity_fingerprint=self._task_identity_fingerprint(identity),
-            lease_fingerprint=(
-                None
-                if lease is None
-                else self._task_lease_fingerprint(
-                    str(lease["lease_id"]),
-                    str(lease["attempt_id"]),
-                )
+            query_fingerprint=self._query_fingerprint(
+                str(identity["query_id"]),
             ),
             status=str(status),
             blocked_reason=str(result.get("blocked_reason") or "task_request_terminal"),
@@ -2924,9 +2943,7 @@ class RayQueryDriverActor:
             raise RuntimeError(f"task terminal control identity changed: {request_key}")
         self._query_task_terminal_controls[request_fingerprint] = control
         if str(status) != "failed":
-            self._query_task_terminal_attempts.add(
-                self._task_attempt_fingerprint(identity),
-            )
+            self._query_task_terminal_attempts[self._task_attempt_fingerprint(identity)] = control.query_fingerprint
 
     def _task_terminal_control_for_identity(
         self,
@@ -2940,23 +2957,120 @@ class RayQueryDriverActor:
             raise ValueError(f"task lease request_id reused with different identity: {request_id}")
         return control
 
-    def _task_terminal_lease_matches(
+    def _query_lease_generation_id(self, query_id: str) -> str:
+        self._ensure_query_resource_admission_state()
+        query_key = str(query_id)
+        generation_id = self._query_lease_generation_ids.get(query_key)
+        if generation_id is None:
+            generation_id = uuid.uuid4().hex
+            self._query_lease_generation_ids[query_key] = generation_id
+        return generation_id
+
+    def _issue_lease_capability(
         self,
+        *,
+        kind: str,
+        fields: tuple[str, ...],
+    ) -> str:
+        self._ensure_query_resource_admission_state()
+        payload = json.dumps(
+            [f"vane-{kind}-lease-v1", *fields],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        encoded = base64.urlsafe_b64encode(payload).rstrip(b"=")
+        signature = hmac.new(
+            self._query_lease_control_key,
+            encoded,
+            hashlib.sha256,
+        ).hexdigest()
+        return f"v1.{encoded.decode('ascii')}.{signature}"
+
+    def _decode_lease_capability(
+        self,
+        lease_id: str,
+        *,
+        kind: str,
+        field_count: int,
+    ) -> tuple[str, ...] | None:
+        self._ensure_query_resource_admission_state()
+        try:
+            version, encoded_text, supplied_signature = str(lease_id).split(".", 2)
+            if version != "v1":
+                return None
+            encoded = encoded_text.encode("ascii")
+            expected_signature = hmac.new(
+                self._query_lease_control_key,
+                encoded,
+                hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(supplied_signature, expected_signature):
+                return None
+            padding = b"=" * (-len(encoded) % 4)
+            values = json.loads(base64.urlsafe_b64decode(encoded + padding).decode("utf-8"))
+        except (UnicodeError, ValueError, TypeError, binascii.Error):
+            return None
+        if not isinstance(values, list) or len(values) != field_count + 1 or values[0] != f"vane-{kind}-lease-v1":
+            return None
+        fields = tuple(str(value) for value in values[1:])
+        if any(not value for value in fields):
+            return None
+        return fields
+
+    def _issue_task_lease_capability(
+        self,
+        *,
         request_id: str,
+        manager_lease_id: str,
+        attempt_id: str,
+        query_id: str,
+    ) -> str:
+        query_key = str(query_id)
+        return self._issue_lease_capability(
+            kind="task",
+            fields=(
+                str(request_id),
+                str(manager_lease_id),
+                str(attempt_id),
+                query_key,
+                self._query_lease_generation_id(query_key),
+            ),
+        )
+
+    def _verify_task_lease_capability(
+        self,
         *,
         lease_id: str,
-        attempt_id: str,
-        status: str | None = None,
-    ) -> bool:
-        control = self._query_task_terminal_controls.get(self._task_request_fingerprint(request_id))
-        return bool(
-            control is not None
-            and control.lease_fingerprint
-            == self._task_lease_fingerprint(
-                lease_id,
-                attempt_id,
-            )
-            and (status is None or control.status == status)
+        request_id: str = "",
+        attempt_id: str = "",
+        query_id: str = "",
+    ) -> tuple[str, str, str, str, str] | None:
+        fields = self._decode_lease_capability(
+            lease_id,
+            kind="task",
+            field_count=5,
+        )
+        if fields is None:
+            return None
+        (
+            capability_request_id,
+            manager_lease_id,
+            capability_attempt_id,
+            capability_query_id,
+            capability_generation_id,
+        ) = fields
+        if (
+            (request_id and capability_request_id != str(request_id))
+            or (attempt_id and capability_attempt_id != str(attempt_id))
+            or (query_id and capability_query_id != str(query_id))
+        ):
+            return None
+        return (
+            manager_lease_id,
+            capability_attempt_id,
+            capability_query_id,
+            capability_request_id,
+            capability_generation_id,
         )
 
     @staticmethod
@@ -2975,19 +3089,49 @@ class RayQueryDriverActor:
         return hashlib.sha256(str(request_id).encode("utf-8")).digest()
 
     @staticmethod
-    def _output_lease_fingerprint(lease_id: str) -> bytes:
-        return hashlib.sha256(str(lease_id).encode("utf-8")).digest()
-
-    @staticmethod
-    def _output_query_fingerprint(query_id: str) -> bytes:
+    def _query_fingerprint(query_id: str) -> bytes:
         return hashlib.sha256(str(query_id).encode("utf-8")).digest()
+
+    def _issue_output_lease_capability(
+        self,
+        *,
+        request_id: str,
+        manager_lease_id: str,
+        query_id: str,
+    ) -> str:
+        return self._issue_lease_capability(
+            kind="output",
+            fields=(
+                str(request_id),
+                str(manager_lease_id),
+                str(query_id),
+            ),
+        )
+
+    def _verify_output_lease_capability(
+        self,
+        *,
+        request_id: str,
+        lease_id: str,
+        query_id: str = "",
+    ) -> tuple[str, str] | None:
+        fields = self._decode_lease_capability(
+            lease_id,
+            kind="output",
+            field_count=3,
+        )
+        if fields is None:
+            return None
+        capability_request_id, manager_lease_id, capability_query_id = fields
+        if capability_request_id != str(request_id) or (query_id and capability_query_id != str(query_id)):
+            return None
+        return manager_lease_id, capability_query_id
 
     def _store_output_terminal_control(
         self,
         *,
         request_id: str,
         identity: dict[str, Any],
-        lease: dict[str, Any] | None,
         status: str,
         result: dict[str, Any],
     ) -> None:
@@ -2995,14 +3139,7 @@ class RayQueryDriverActor:
         request_fingerprint = self._output_request_fingerprint(request_key)
         control = _OutputTerminalControl(
             identity_fingerprint=self._output_identity_fingerprint(identity),
-            lease_fingerprint=(
-                None
-                if lease is None
-                else self._output_lease_fingerprint(
-                    str(lease["lease_id"]),
-                )
-            ),
-            query_fingerprint=self._output_query_fingerprint(
+            query_fingerprint=self._query_fingerprint(
                 str(identity["query_id"]),
             ),
             status=str(status),
@@ -3024,27 +3161,6 @@ class RayQueryDriverActor:
         if control.identity_fingerprint != self._output_identity_fingerprint(identity):
             raise ValueError(f"output lease request_id reused with different identity: {request_id}")
         return control
-
-    def _output_terminal_lease_matches(
-        self,
-        request_id: str,
-        *,
-        lease_id: str,
-        query_id: str = "",
-    ) -> bool:
-        control = self._query_output_terminal_controls.get(self._output_request_fingerprint(request_id))
-        return bool(
-            control is not None
-            and control.lease_fingerprint == self._output_lease_fingerprint(lease_id)
-            and (
-                not query_id
-                or control.query_fingerprint
-                == self._output_query_fingerprint(
-                    query_id,
-                )
-            )
-            and control.status in {"released", "cancelled"}
-        )
 
     def _retire_query_lease_request(
         self,
@@ -3075,7 +3191,6 @@ class RayQueryDriverActor:
             self._store_output_terminal_control(
                 request_id=str(request_id),
                 identity=dict(identity),
-                lease=dict(lease) if isinstance(lease, dict) else None,
                 status=str(status),
                 result=terminal_result,
             )
@@ -3087,7 +3202,6 @@ class RayQueryDriverActor:
             self._store_task_terminal_control(
                 request_id=str(request_id),
                 identity=dict(identity),
-                lease=dict(lease) if isinstance(lease, dict) else None,
                 status=str(status),
                 result=terminal_result,
             )
@@ -3207,10 +3321,25 @@ class RayQueryDriverActor:
             request_id, state = owned_request
             if grant.granted:
                 lease_payload = asdict(grant.lease)
+                manager_lease_id = str(lease_payload["lease_id"])
+                public_lease_id = self._issue_task_lease_capability(
+                    request_id=request_id,
+                    manager_lease_id=manager_lease_id,
+                    attempt_id=lease_payload["attempt_id"],
+                    query_id=lease_payload["query_id"],
+                )
+                lease_payload["lease_id"] = public_lease_id
+                if lease_payload.get("actor_index") is None:
+                    # A task execution slot is a public per-lease identity.
+                    # Keep the QRM's raw lease ID from being used as an
+                    # authoritative external control token and bind the
+                    # worker-visible slot to the signed capability.
+                    lease_payload["execution_slot_id"] = f"ray_task:{lease_payload['stage_id']}:{public_lease_id}"
                 # This request record is both the admission result and the
                 # durable execution owner. Publish it before completing the
                 # caller's Future so teardown can never miss a visible grant.
                 with self._query_task_lease_condition:
+                    state["manager_lease_id"] = manager_lease_id
                     state["lease"] = lease_payload
                     state["status"] = "granted"
                     self._query_task_lease_condition.notify_all()
@@ -3221,9 +3350,11 @@ class RayQueryDriverActor:
                     request_id=request_id,
                     lease_id=lease_payload["lease_id"],
                 )
+                result = self._grant_payload(grant)
+                result["lease"] = lease_payload
                 self._complete_lease_request(
                     state,
-                    self._grant_payload(grant),
+                    result,
                 )
                 return
             if grant.fatal:
@@ -3311,6 +3442,13 @@ class RayQueryDriverActor:
                 if lease.state != "stage_queue":
                     raise RuntimeError("queued output admission must atomically grant stage_queue ownership")
                 lease_payload = asdict(lease)
+                manager_lease_id = str(lease_payload["lease_id"])
+                lease_payload["lease_id"] = self._issue_output_lease_capability(
+                    request_id=request_id,
+                    manager_lease_id=manager_lease_id,
+                    query_id=lease_payload["query_id"],
+                )
+                state["manager_lease_id"] = manager_lease_id
                 state["status"] = "granted"
                 state["lease"] = lease_payload
                 _log_resource_debug(
@@ -3405,8 +3543,29 @@ class RayQueryDriverActor:
             kind="output block",
         )
         request_id = values.pop("request_id")
+        task_lease_id = str(values["task_lease_id"])
+        capability = self._verify_task_lease_capability(
+            lease_id=task_lease_id,
+            attempt_id=str(values["attempt_id"]),
+            query_id=str(values["query_id"]),
+        )
+        if capability is None:
+            raise ValueError("output block request has an invalid task lease capability")
+        (
+            manager_task_lease_id,
+            _attempt_id,
+            capability_query_id,
+            _task_request_id,
+            capability_generation_id,
+        ) = capability
+        active_generation_id = self._query_lease_generation_ids.get(capability_query_id)
+        if active_generation_id is not None and active_generation_id != capability_generation_id:
+            raise ValueError("output block request belongs to an inactive query generation")
+        values["task_lease_id"] = manager_task_lease_id
         request = OutputBlockRequest(**values)
-        return request_id, request, asdict(request)
+        identity = asdict(request)
+        identity["task_lease_id"] = task_lease_id
+        return request_id, request, identity
 
     def _parse_task_lease_request(
         self,
@@ -3516,7 +3675,6 @@ class RayQueryDriverActor:
             self._store_task_terminal_control(
                 request_id=request_id,
                 identity=identity,
-                lease=None,
                 status="failed",
                 result=denial,
             )
@@ -3640,10 +3798,11 @@ class RayQueryDriverActor:
             ):
                 return {"released": False}
             identity = dict(state["identity"])
+            manager_lease_id = str(state["manager_lease_id"])
         query_id = str(identity["query_id"])
         try:
             released = get_query_resource_manager(query_id).release_task_lease(
-                str(lease_id),
+                manager_lease_id,
                 attempt_id=str(attempt_id),
             )
         except KeyError:
@@ -3729,29 +3888,35 @@ class RayQueryDriverActor:
     ) -> dict[str, Any]:
         """Transfer task accounting to a driver-owned completion waiter."""
         self._ensure_query_resource_admission_state()
-        if not isinstance(completion_refs, list) or len(completion_refs) != 1:
-            raise ValueError("task completion handoff requires exactly one nested ObjectRef")
-        completion_ref = completion_refs[0]
-        future_method = getattr(completion_ref, "future", None)
-        if not callable(future_method):
-            raise TypeError("task completion handoff requires an ObjectRef with future()")
-
         request_key = str(request_id)
+        capability = self._verify_task_lease_capability(
+            request_id=request_key,
+            lease_id=str(lease_id),
+            attempt_id=str(attempt_id),
+        )
+        if capability is None:
+            return {"scheduled": False}
+        (
+            manager_lease_id,
+            _capability_attempt_id,
+            capability_query_id,
+            _capability_request_id,
+            _capability_generation_id,
+        ) = capability
         with self._query_task_lease_condition:
             state = self._query_task_lease_requests.get(request_key)
             if state is None:
-                return {
-                    "scheduled": self._task_terminal_lease_matches(
-                        request_key,
-                        lease_id=lease_id,
-                        attempt_id=attempt_id,
-                    )
-                }
-            if not self._query_task_lease_matches(
-                state,
-                lease_id,
-                attempt_id,
+                return {"scheduled": True}
+            if (
+                not self._query_task_lease_matches(
+                    state,
+                    lease_id,
+                    attempt_id,
+                )
+                or str(state.get("manager_lease_id") or "") != manager_lease_id
             ):
+                return {"scheduled": False}
+            if str(state["identity"]["query_id"]) != capability_query_id:
                 return {"scheduled": False}
             if state.get("status") == "teardown_wait":
                 return {"scheduled": False}
@@ -3760,6 +3925,12 @@ class RayQueryDriverActor:
                 return {"scheduled": True}
             query_id = str(state["identity"]["query_id"])
 
+        if not isinstance(completion_refs, list) or len(completion_refs) != 1:
+            raise ValueError("task completion handoff requires exactly one nested ObjectRef")
+        completion_ref = completion_refs[0]
+        future_method = getattr(completion_ref, "future", None)
+        if not callable(future_method):
+            raise TypeError("task completion handoff requires an ObjectRef with future()")
         completion_future = future_method()
         if not isinstance(completion_future, ConcurrentFuture):
             raise TypeError("task completion ObjectRef.future() must return a concurrent Future")
@@ -3798,22 +3969,34 @@ class RayQueryDriverActor:
 
         self._ensure_query_resource_admission_state()
         request_key = str(request_id)
+        capability = self._verify_task_lease_capability(
+            request_id=request_key,
+            lease_id=str(lease_id),
+            attempt_id=str(attempt_id),
+        )
+        if capability is None:
+            return {"handed_off": False}
+        (
+            manager_lease_id,
+            _capability_attempt_id,
+            capability_query_id,
+            _capability_request_id,
+            _capability_generation_id,
+        ) = capability
         with self._query_task_lease_condition:
             state = self._query_task_lease_requests.get(request_key)
             if state is None:
-                return {
-                    "handed_off": self._task_terminal_lease_matches(
-                        request_key,
-                        lease_id=lease_id,
-                        attempt_id=attempt_id,
-                        status="released_by_teardown",
-                    )
-                }
-            if not self._query_task_lease_matches(
-                state,
-                lease_id,
-                attempt_id,
+                return {"handed_off": True}
+            if (
+                not self._query_task_lease_matches(
+                    state,
+                    lease_id,
+                    attempt_id,
+                )
+                or str(state.get("manager_lease_id") or "") != manager_lease_id
             ):
+                return {"handed_off": False}
+            if str(state["identity"]["query_id"]) != capability_query_id:
                 return {"handed_off": False}
             status = str(state.get("status") or "")
             if status == "completion_wait":
@@ -3929,7 +4112,6 @@ class RayQueryDriverActor:
                 self._store_task_terminal_control(
                     request_id=request_key,
                     identity=identity,
-                    lease=None,
                     status="cancelled",
                     result=denial,
                 )
@@ -3952,7 +4134,7 @@ class RayQueryDriverActor:
             manager = get_query_resource_manager(query_id)
             if isinstance(lease, dict):
                 released = manager.abandon_task_lease(
-                    str(lease["lease_id"]),
+                    str(state["manager_lease_id"]),
                     attempt_id=str(lease["attempt_id"]),
                 )
             else:
@@ -3996,23 +4178,36 @@ class RayQueryDriverActor:
 
         self._ensure_query_resource_admission_state()
         request_key = str(request_id)
+        capability = self._verify_task_lease_capability(
+            request_id=request_key,
+            lease_id=str(lease_id),
+            attempt_id=str(attempt_id),
+        )
+        if capability is None:
+            return {"released": False}
+        (
+            manager_lease_id,
+            _capability_attempt_id,
+            capability_query_id,
+            _capability_request_id,
+            _capability_generation_id,
+        ) = capability
         with self._query_task_lease_condition:
             state = self._query_task_lease_requests.get(request_key)
             if state is None:
-                return {
-                    "released": self._task_terminal_lease_matches(
-                        request_key,
-                        lease_id=lease_id,
-                        attempt_id=attempt_id,
-                    )
-                }
+                return {"released": True}
             if state.get("status") in {"completion_wait", "teardown_wait"}:
                 return {"released": False}
-            if not self._query_task_lease_matches(
-                state,
-                lease_id,
-                attempt_id,
+            if (
+                not self._query_task_lease_matches(
+                    state,
+                    lease_id,
+                    attempt_id,
+                )
+                or str(state.get("manager_lease_id") or "") != manager_lease_id
             ):
+                return {"released": False}
+            if str(state["identity"]["query_id"]) != capability_query_id:
                 return {"released": False}
             identity = dict(state["identity"])
         query_id = str(identity["query_id"])
@@ -4025,7 +4220,7 @@ class RayQueryDriverActor:
                 lease_id=lease_id,
             )
             released = get_query_resource_manager(query_id).release_task_lease(
-                str(lease_id),
+                manager_lease_id,
                 attempt_id=str(attempt_id),
             )
         except KeyError:
@@ -4173,21 +4368,21 @@ class RayQueryDriverActor:
 
         self._ensure_query_resource_admission_state()
         request_key = str(request_id)
+        capability = self._verify_output_lease_capability(
+            request_id=request_key,
+            lease_id=str(lease_id),
+            query_id=str(query_id),
+        )
+        if capability is None:
+            return {"handed_off": False}
+        manager_lease_id, capability_query_id = capability
         state = self._query_output_lease_requests.get(request_key)
         if state is None:
-            if self._output_terminal_lease_matches(
-                request_key,
-                lease_id=str(lease_id),
-                query_id=str(query_id),
-            ):
-                return {"handed_off": True}
-            if str(query_id) in self._query_resource_closing_queries:
-                return {"handed_off": True}
-            return {"handed_off": False}
+            return {"handed_off": True}
         lease = state.get("lease") or {}
         if str(lease.get("lease_id") or "") != str(lease_id):
             return {"handed_off": False}
-        if query_id and str(lease.get("query_id") or "") != str(query_id):
+        if str(lease.get("query_id") or "") != capability_query_id:
             return {"handed_off": False}
         current_state = str(lease.get("state") or "")
         if current_state == "downstream_input":
@@ -4195,8 +4390,8 @@ class RayQueryDriverActor:
         if current_state != "stage_queue":
             raise RuntimeError(f"output lease handoff requires stage_queue state, got {current_state!r}")
         try:
-            handed_off = get_query_resource_manager(lease["query_id"]).transition_output_block(
-                str(lease_id),
+            handed_off = get_query_resource_manager(capability_query_id).transition_output_block(
+                manager_lease_id,
                 "downstream_input",
             )
         except KeyError:
@@ -4219,24 +4414,24 @@ class RayQueryDriverActor:
 
         self._ensure_query_resource_admission_state()
         request_key = str(request_id)
+        capability = self._verify_output_lease_capability(
+            request_id=request_key,
+            lease_id=str(lease_id),
+            query_id=str(query_id),
+        )
+        if capability is None:
+            return {"released": False}
+        manager_lease_id, capability_query_id = capability
         state = self._query_output_lease_requests.get(request_key)
         if state is None:
-            if self._output_terminal_lease_matches(
-                request_key,
-                lease_id=str(lease_id),
-                query_id=str(query_id),
-            ):
-                return {"released": True}
-            if str(query_id) in self._query_resource_closing_queries:
-                return {"released": True}
-            return {"released": False}
+            return {"released": True}
         lease = state.get("lease") or {}
         if str(lease.get("lease_id") or "") != str(lease_id):
             return {"released": False}
-        if query_id and str(lease.get("query_id") or "") != str(query_id):
+        if str(lease.get("query_id") or "") != capability_query_id:
             return {"released": False}
         try:
-            get_query_resource_manager(lease["query_id"]).release_output_block(str(lease_id))
+            get_query_resource_manager(capability_query_id).release_output_block(manager_lease_id)
         except KeyError:
             pass
         self._retire_query_lease_request(
@@ -4285,7 +4480,6 @@ class RayQueryDriverActor:
             self._store_output_terminal_control(
                 request_id=request_key,
                 identity=identity,
-                lease=None,
                 status="cancelled",
                 result=denial,
             )
@@ -4317,7 +4511,6 @@ class RayQueryDriverActor:
             self._store_output_terminal_control(
                 request_id=request_key,
                 identity=identity,
-                lease=None,
                 status="cancelled",
                 result=denial,
             )
@@ -4327,7 +4520,9 @@ class RayQueryDriverActor:
         released = False
         if lease is not None:
             try:
-                released = get_query_resource_manager(lease["query_id"]).release_output_block(lease["lease_id"])
+                released = get_query_resource_manager(lease["query_id"]).release_output_block(
+                    str(state["manager_lease_id"])
+                )
             except KeyError:
                 released = False
         else:
@@ -4622,6 +4817,7 @@ class RayQueryDriverActor:
             ) from cleanup_errors[0]
         with self._query_task_lease_condition:
             self._query_execution_quiesced_queries.discard(query_key)
+        self._query_lease_generation_ids.pop(query_key, None)
 
     def query_resource_snapshot(
         self,

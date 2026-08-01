@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import threading
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
@@ -22,9 +23,16 @@ class RayStreamCleanupOperation:
     """One terminal transition scheduled by the collector and run off its loop."""
 
     operation: Callable[[], Any]
+    submission_scope: str
     retry_on_error: bool = False
     retry_on_incomplete: bool = False
     abandon_wait: Callable[[Any], None] | None = None
+
+    def __post_init__(self) -> None:
+        scope = str(self.submission_scope or "").strip()
+        if not scope:
+            raise ValueError("Ray stream cleanup requires an explicit submission scope")
+        object.__setattr__(self, "submission_scope", scope)
 
     def __call__(self) -> Any:
         return self.operation()
@@ -84,12 +92,15 @@ class TaskLeaseObjectRefGenerator:
             admission.release()
             raise
         request_id = str(admission.request_id or "").strip()
+        submission_scope = str(admission.submission_scope or "").strip()
         lease = dict(admission.lease)
-        if not request_id or not str(lease.get("lease_id") or ""):
+        query_id = str(lease.get("query_id") or "").strip()
+        if not request_id or not submission_scope or not str(lease.get("lease_id") or "") or not query_id:
             admission.release()
             raise ValueError("pregranted Ray UDF task admission is missing identity")
         self._ray = active_ray_module
         self._driver = admission.driver
+        self._submission_scope = submission_scope
         self._request_id = request_id
         self._execution_backend = "ray_actor" if lease.get("actor_index") is not None else "ray_task"
         self._generator: Any | None = None
@@ -134,6 +145,10 @@ class TaskLeaseObjectRefGenerator:
     @property
     def driver(self) -> Any:
         return self._driver
+
+    @property
+    def submission_scope(self) -> str:
+        return self._submission_scope
 
     @property
     def lease(self) -> dict[str, Any] | None:
@@ -191,6 +206,7 @@ class TaskLeaseObjectRefGenerator:
         return (
             RayStreamCleanupOperation(
                 self._release_task,
+                submission_scope=self._submission_scope,
                 retry_on_error=True,
                 retry_on_incomplete=True,
                 abandon_wait=self._abandon_release_task_wait,
@@ -308,11 +324,13 @@ class TaskLeaseObjectRefGenerator:
         return (
             RayStreamCleanupOperation(
                 self._submit_generator_cancel,
+                submission_scope=self._submission_scope,
                 retry_on_error=True,
                 retry_on_incomplete=True,
             ),
             RayStreamCleanupOperation(
                 self._handoff_task_completion,
+                submission_scope=self._submission_scope,
                 retry_on_error=True,
                 retry_on_incomplete=True,
                 abandon_wait=self._abandon_task_cleanup_wait,
@@ -324,6 +342,7 @@ class TaskLeaseObjectRefGenerator:
         return (
             RayStreamCleanupOperation(
                 self._handoff_task_completion,
+                submission_scope=self._submission_scope,
                 retry_on_error=True,
                 retry_on_incomplete=True,
                 abandon_wait=self._abandon_task_cleanup_wait,
@@ -352,6 +371,9 @@ class RayStreamAdapter:
         self._ray = active_ray_module
         self._source = source
         self._leased = source if isinstance(source, TaskLeaseObjectRefGenerator) else None
+        self._submission_scope = (
+            self._leased.submission_scope if self._leased is not None else f"stream:{uuid.uuid4().hex}"
+        )
         self._task_request_identity = "" if self._leased is None else self._leased.request_id
         self._generator = self._leased.generator if self._leased is not None else source
         self._completion_ref: Any | None = None
@@ -403,6 +425,10 @@ class RayStreamAdapter:
     @property
     def task_request_id(self) -> str:
         return self._task_request_identity
+
+    @property
+    def submission_scope(self) -> str:
+        return self._submission_scope
 
     @property
     def driver(self) -> Any | None:
@@ -604,6 +630,7 @@ class RayStreamAdapter:
             leased_operations = [
                 RayStreamCleanupOperation(
                     partial(self._leased_operation, leased, operation.operation),
+                    submission_scope=operation.submission_scope,
                     retry_on_error=operation.retry_on_error,
                     retry_on_incomplete=operation.retry_on_incomplete,
                     abandon_wait=operation.abandon_wait,
@@ -613,6 +640,7 @@ class RayStreamAdapter:
 
         stream_operation = RayStreamCleanupOperation(
             self._run_pending_stream_cleanup,
+            submission_scope=self._submission_scope,
             retry_on_error=True,
             retry_on_incomplete=True,
         )
@@ -621,6 +649,7 @@ class RayStreamAdapter:
             operations.append(
                 RayStreamCleanupOperation(
                     self._run_unleased_generator_cancel,
+                    submission_scope=self._submission_scope,
                     retry_on_error=True,
                     retry_on_incomplete=True,
                 )

@@ -280,6 +280,7 @@ def _admission(driver, request_id="request-1", *, lease=None):
         request_id=request_id,
         retained_input_bytes=0,
         lease=_lease() if lease is None else lease,
+        submission_scope=f"test-stream:{request_id}",
     )
 
 
@@ -313,6 +314,7 @@ def test_task_lease_stream_abandons_pregranted_lease_when_submitter_fails():
         request_id=request_id,
         retained_input_bytes=0,
         lease=_lease(),
+        submission_scope=f"test-stream:{request_id}",
         _release_callback=lambda: driver.cancel_query_task_lease_request.remote(request_id),
     )
 

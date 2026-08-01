@@ -1094,8 +1094,10 @@ struct ExecutorSlot {
 	atomic<bool> finished_submitting_acked {false};
 	atomic<bool> all_tasks_finished {false};
 	atomic<bool> cleanup_cancel_requested {false};
-	atomic<bool> collector_cleanup_retry_consumed {false};
 	atomic<bool> collector_retired {false};
+	idx_t collector_cleanup_retry_count = 0;
+	bool collector_cleanup_retry_scheduled = false;
+	std::chrono::steady_clock::time_point collector_cleanup_retry_deadline;
 
 	// Error propagation
 	mutex error_lock;
@@ -1304,21 +1306,6 @@ public:
 		NotifyWork();
 	}
 
-	void EnqueueDeferredWakeup(std::function<void()> callback) {
-		if (!callback) {
-			return;
-		}
-		{
-			lock_guard<mutex> lifecycle_guard(global_lock);
-			if (!accept_deferred_wakeups) {
-				return;
-			}
-			lock_guard<mutex> lock(deferred_wakeup_lock);
-			deferred_wakeups.push_back(std::move(callback));
-		}
-		NotifyWork();
-	}
-
 	~GlobalPythonDispatcher() {
 		StopThread();
 	}
@@ -1347,11 +1334,6 @@ public:
 				WakeupPipelineThread(*slot);
 			}
 		}
-		// Strict streaming operators defer task callbacks onto the dispatcher
-		// after their executor wakeup callback runs. The test hook must also
-		// flush that second hop so it can wake teardown while the dispatcher is
-		// deliberately blocked inside a Python conversion callback.
-		DrainDeferredWakeups();
 	}
 
 private:
@@ -1426,27 +1408,6 @@ private:
 	bool HasPendingOutputLeaseReleases() {
 		lock_guard<mutex> lock(output_lease_release_lock);
 		return !output_lease_releases.empty();
-	}
-
-	bool DrainDeferredWakeups() {
-		std::deque<std::function<void()>> callbacks;
-		{
-			lock_guard<mutex> lock(deferred_wakeup_lock);
-			callbacks.swap(deferred_wakeups);
-		}
-		for (auto &callback : callbacks) {
-			if (!callback) {
-				continue;
-			}
-			try {
-				callback();
-			} catch (const std::exception &ex) {
-				RecordDispatcherError(StringUtil::Format("deferred UDF wakeup failed: %s", ex.what()));
-			} catch (...) {
-				RecordDispatcherError("deferred UDF wakeup failed with an unknown exception");
-			}
-		}
-		return !callbacks.empty();
 	}
 
 	bool DrainOutputLeaseReleases_WithGIL() {
@@ -1555,7 +1516,18 @@ private:
 			// enqueues its last submit. Since inflight_count is only incremented
 			// once the dispatcher runs the Python submit, cleanup must not run
 			// before already-queued commands are dispatched.
-			bool did_work = DrainDeferredWakeups();
+			bool did_work = false;
+			bool has_collector_cleanup_retry_deadline = false;
+			auto next_collector_cleanup_retry_deadline = std::chrono::steady_clock::time_point::max();
+			auto note_collector_cleanup_retry = [&](const ExecutorSlot &slot) {
+				if (!slot.collector_cleanup_retry_scheduled) {
+					return;
+				}
+				has_collector_cleanup_retry_deadline = true;
+				if (slot.collector_cleanup_retry_deadline < next_collector_cleanup_retry_deadline) {
+					next_collector_cleanup_retry_deadline = slot.collector_cleanup_retry_deadline;
+				}
+			};
 			struct SlotCommands {
 				ExecutorSlot *slot;
 				std::deque<DispatcherCommand> commands;
@@ -1590,7 +1562,17 @@ private:
 							has_pending_cleanup_cancel = true;
 							continue;
 						}
-						did_work |= CleanupSlot(slot->id);
+						if (slot->collector_cleanup_retry_scheduled &&
+						    std::chrono::steady_clock::now() < slot->collector_cleanup_retry_deadline) {
+							note_collector_cleanup_retry(*slot);
+							continue;
+						}
+						slot->collector_cleanup_retry_scheduled = false;
+						const auto cleanup_complete = CleanupSlot(slot->id);
+						did_work |= cleanup_complete;
+						if (!cleanup_complete) {
+							note_collector_cleanup_retry(*slot);
+						}
 					}
 					slot = nullptr; // prevent dangling pointer in subsequent loops
 					continue;
@@ -1827,22 +1809,15 @@ private:
 					    static_cast<unsigned long long>(debug_inflight_total), work_pending.load() ? "true" : "false",
 					    wakeup_fired.load() ? "true" : "false"));
 				}
-				// Pure event-driven wait: only wake on actual events. All producers
-				// (NotifyWork, Unregister, StopThread, Python executor wakeup, async
-				// collector wakeup) set work_pending/wakeup_fired before signaling.
-				work_cv.wait(lk, predicate);
+				// Normal progress is event-driven. A synchronous collector
+				// ownership-handoff failure is the sole timed path because it
+				// has no Future callback capable of waking this dispatcher.
+				if (has_collector_cleanup_retry_deadline) {
+					work_cv.wait_until(lk, next_collector_cleanup_retry_deadline, predicate);
+				} else {
+					work_cv.wait(lk, predicate);
+				}
 			}
-		}
-
-		// Drain every owned wakeup before destroying query/executor state. A
-		// callback may enqueue another callback while resolving an error. Close
-		// the producer fence first, then run the accepted callbacks to a fixed
-		// point.
-		{
-			lock_guard<mutex> guard(global_lock);
-			accept_deferred_wakeups = false;
-		}
-		while (DrainDeferredWakeups()) {
 		}
 
 		// Final cleanup: only touch Python while the interpreter is still alive.
@@ -1916,6 +1891,23 @@ private:
 
 	enum class AsyncCollectorSlotCancelStatus : uint8_t { COMPLETE, PENDING, RETRY };
 
+	static std::chrono::milliseconds CollectorCleanupRetryDelay(idx_t retry_count) {
+		const auto exponent = MinValue<idx_t>(retry_count > 0 ? retry_count - 1 : 0, 7);
+		return std::chrono::milliseconds(MinValue<idx_t>(idx_t(10) << exponent, 1000));
+	}
+
+	static void ResetCollectorCleanupRetry(ExecutorSlot &slot) {
+		slot.collector_cleanup_retry_count = 0;
+		slot.collector_cleanup_retry_scheduled = false;
+	}
+
+	static void ScheduleCollectorCleanupRetry(ExecutorSlot &slot) {
+		slot.collector_cleanup_retry_count++;
+		slot.collector_cleanup_retry_deadline =
+		    std::chrono::steady_clock::now() + CollectorCleanupRetryDelay(slot.collector_cleanup_retry_count);
+		slot.collector_cleanup_retry_scheduled = true;
+	}
+
 	bool CleanupSlot(uint64_t id) {
 		shared_ptr<ExecutorSlot> slot;
 		{
@@ -1943,15 +1935,17 @@ private:
 			slot_ptr->cleanup_cancel_requested.store(true);
 			auto cancel_status = CancelAsyncCollectorSlot_WithGIL(*slot_ptr);
 			if (cancel_status != AsyncCollectorSlotCancelStatus::COMPLETE) {
-				// A pending ticket owns its eventual wakeup. Give a synchronous
-				// handoff failure one immediate retry, then wait for external work
-				// instead of spinning the process-wide dispatcher.
-				if (cancel_status == AsyncCollectorSlotCancelStatus::RETRY &&
-				    !slot_ptr->collector_cleanup_retry_consumed.exchange(true)) {
-					NotifyWork();
+				// A pending ticket owns its eventual wakeup. A synchronous
+				// ownership-handoff failure has no such event, so retain the
+				// slot and retry it on the dispatcher's bounded backoff clock.
+				if (cancel_status == AsyncCollectorSlotCancelStatus::RETRY) {
+					ScheduleCollectorCleanupRetry(*slot_ptr);
+				} else {
+					ResetCollectorCleanupRetry(*slot_ptr);
 				}
 				return false;
 			}
+			ResetCollectorCleanupRetry(*slot_ptr);
 			if (slot_ptr->py_executor) {
 				try {
 					slot_ptr->py_executor->obj.attr("close")();
@@ -2163,8 +2157,7 @@ private:
 		}
 		if (cancel_collector) {
 			if (CancelAsyncCollectorSlot_WithGIL(slot) == AsyncCollectorSlotCancelStatus::RETRY) {
-				// The current dispatcher pass is already the bounded retry wake.
-				slot.collector_cleanup_retry_consumed.store(true);
+				ScheduleCollectorCleanupRetry(slot);
 			}
 		}
 		if (slot.py_executor) {
@@ -2203,7 +2196,7 @@ private:
 			try {
 				PythonGILWrapper gil;
 				if (CancelAsyncCollectorSlot_WithGIL(slot) == AsyncCollectorSlotCancelStatus::RETRY) {
-					slot.collector_cleanup_retry_consumed.store(true);
+					ScheduleCollectorCleanupRetry(slot);
 				}
 			} catch (const py::error_already_set &ex) {
 				SetSlotError(slot, StringUtil::Format("udf async collector cancel_slot failed: %s", ex.what()));
@@ -3332,9 +3325,6 @@ private:
 	bool thread_running = false;
 	mutex output_lease_release_lock;
 	std::deque<PendingCollectorOutputLeaseCallback> output_lease_releases;
-	mutex deferred_wakeup_lock;
-	bool accept_deferred_wakeups = true;
-	std::deque<std::function<void()>> deferred_wakeups;
 	unique_ptr<RegisteredObject> async_collector; // Python AsyncResultCollector
 };
 
@@ -3658,13 +3648,6 @@ public:
 		}
 		lock_guard<mutex> wg(slot_->wakeup_lock);
 		slot_->wakeup_callback = wakeup_callback_;
-	}
-
-	void EnqueueDeferredWakeup(std::function<void()> callback) override {
-		if (!registered_ || !slot_) {
-			throw InvalidInputException("cannot enqueue a deferred wakeup for an unregistered UDF executor");
-		}
-		GlobalPythonDispatcher::Instance().EnqueueDeferredWakeup(std::move(callback));
 	}
 
 private:
