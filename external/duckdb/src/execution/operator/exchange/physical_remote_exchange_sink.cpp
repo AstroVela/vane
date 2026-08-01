@@ -140,9 +140,12 @@ PhysicalRemoteExchangeSink::PhysicalRemoteExchangeSink(
 		if (partition_by_.size() != range_order_modifiers_.size()) {
 			throw InvalidInputException("range repartition requires one order modifier per partition expression");
 		}
-		if (range_boundaries_.size() >= num_partitions_) {
-			throw InvalidInputException("range repartition requires fewer boundary keys than partitions");
+		for (const auto &expression : partition_by_) {
+			if (!expression) {
+				throw InvalidInputException("range repartition order expression cannot be null");
+			}
 		}
+		RangeRepartitionConfig::ValidateBoundaries(num_partitions_, range_boundaries_);
 	}
 }
 

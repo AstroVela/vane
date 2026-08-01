@@ -3,16 +3,18 @@
 
 #pragma once
 
-#include <memory>
-#include <vector>
-#include <string>
+#include "duckdb/planner/bound_result_modifier.hpp"
+
 #include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace duckdb {
 
 // 前置声明
 class Expression;
-class RecordBatch;
 class ClusteringSpec;
 
 using ExprRef = std::shared_ptr<Expression>;
@@ -64,19 +66,30 @@ public:
 // 范围重新分区配置
 class RangeRepartitionConfig : public BaseConfig {
 public:
-	size_t num_partitions; // 0 means auto
-	std::shared_ptr<RecordBatch> boundaries;
-	std::vector<std::shared_ptr<class BoundExpr>> by;
-	std::vector<bool> descending;
-
-	RangeRepartitionConfig(size_t num_partitions, std::shared_ptr<RecordBatch> boundaries,
-	                       std::vector<std::shared_ptr<class BoundExpr>> by, std::vector<bool> descending);
+	RangeRepartitionConfig(size_t num_partitions, vector<BoundOrderByNode> orders, vector<string> boundaries);
 	std::vector<std::string> multiline_display() const override;
 
-	static std::shared_ptr<RangeRepartitionConfig> create(size_t num_partitions,
-	                                                      std::shared_ptr<RecordBatch> boundaries,
-	                                                      std::vector<std::shared_ptr<class BoundExpr>> by,
-	                                                      std::vector<bool> descending);
+	static std::shared_ptr<const RangeRepartitionConfig> create(size_t num_partitions, vector<BoundOrderByNode> orders,
+	                                                            vector<string> boundaries);
+	static void Validate(const vector<BoundOrderByNode> &orders, size_t num_partitions,
+	                     const vector<string> &boundaries);
+	static void ValidateBoundaries(size_t num_partitions, const vector<string> &boundaries);
+
+	size_t num_partitions() const {
+		return num_partitions_;
+	}
+	const vector<BoundOrderByNode> &orders() const {
+		return orders_;
+	}
+	const vector<string> &boundaries() const {
+		return boundaries_;
+	}
+	vector<BoundOrderByNode> CopyOrders() const;
+
+private:
+	size_t num_partitions_; // 0 means auto
+	vector<BoundOrderByNode> orders_;
+	vector<string> boundaries_;
 };
 
 // 分区数配置
@@ -99,7 +112,6 @@ public:
 
 	virtual Type type() const = 0;
 	virtual std::string var_name() const = 0;
-	virtual std::vector<ExprRef> repartition_by() const = 0;
 	virtual std::vector<std::string> multiline_display() const = 0;
 	virtual ClusteringSpecRef to_clustering_spec(size_t upstream_num_partitions) const = 0;
 
@@ -107,9 +119,8 @@ public:
 	static std::shared_ptr<RepartitionSpec> create_hash(size_t num_partitions, std::vector<ExprRef> by);
 	static std::shared_ptr<RepartitionSpec> create_random(size_t num_partitions);
 	static std::shared_ptr<RepartitionSpec> create_into_partitions(size_t num_partitions);
-	static std::shared_ptr<RepartitionSpec> create_range(size_t num_partitions, std::shared_ptr<RecordBatch> boundaries,
-	                                                     std::vector<std::shared_ptr<class BoundExpr>> by,
-	                                                     std::vector<bool> descending);
+	static std::shared_ptr<RepartitionSpec> create_range(size_t num_partitions, vector<BoundOrderByNode> orders,
+	                                                     vector<string> boundaries);
 };
 
 // 聚类规范（ClusteringSpec）基础类
@@ -129,7 +140,7 @@ public:
 
 	static ClusteringSpecRef unknown();
 	static ClusteringSpecRef unknown_with_num_partitions(size_t num_partitions);
-	static ClusteringSpecRef from_range_config(const RangeClusteringConfig &config);
+	static ClusteringSpecRef from_range_config(RangeClusteringConfig config);
 	static ClusteringSpecRef from_hash_config(const HashClusteringConfig &config);
 	static ClusteringSpecRef from_random_config(const RandomClusteringConfig &config);
 	static ClusteringSpecRef from_unknown_config(const UnknownClusteringConfig &config);
@@ -159,7 +170,6 @@ public:
 	std::string var_name() const override {
 		return "Hash";
 	}
-	std::vector<ExprRef> repartition_by() const override;
 	std::vector<std::string> multiline_display() const override;
 	ClusteringSpecRef to_clustering_spec(size_t upstream_num_partitions) const override;
 
@@ -181,7 +191,6 @@ public:
 	std::string var_name() const override {
 		return "Random";
 	}
-	std::vector<ExprRef> repartition_by() const override;
 	std::vector<std::string> multiline_display() const override;
 	ClusteringSpecRef to_clustering_spec(size_t upstream_num_partitions) const override;
 
@@ -203,7 +212,6 @@ public:
 	std::string var_name() const override {
 		return "IntoPartitions";
 	}
-	std::vector<ExprRef> repartition_by() const override;
 	std::vector<std::string> multiline_display() const override;
 	ClusteringSpecRef to_clustering_spec(size_t upstream_num_partitions) const override;
 
@@ -214,10 +222,10 @@ public:
 
 class RangeRepartitionSpec : public RepartitionSpec {
 private:
-	std::shared_ptr<RangeRepartitionConfig> config_;
+	std::shared_ptr<const RangeRepartitionConfig> config_;
 
 public:
-	RangeRepartitionSpec(std::shared_ptr<RangeRepartitionConfig> config);
+	explicit RangeRepartitionSpec(std::shared_ptr<const RangeRepartitionConfig> config);
 
 	Type type() const override {
 		return Type::Range;
@@ -225,23 +233,34 @@ public:
 	std::string var_name() const override {
 		return "Range";
 	}
-	std::vector<ExprRef> repartition_by() const override;
 	std::vector<std::string> multiline_display() const override;
 	ClusteringSpecRef to_clustering_spec(size_t upstream_num_partitions) const override;
 
-	const std::shared_ptr<RangeRepartitionConfig> &config() const {
-		return config_;
+	const RangeRepartitionConfig &config() const {
+		return *config_;
 	}
 };
 
 class RangeClusteringConfig : public BaseConfig {
 public:
-	size_t num_partitions;
-	std::vector<ExprRef> by;
-	std::vector<bool> descending;
-
-	RangeClusteringConfig(size_t num_partitions, std::vector<ExprRef> by, std::vector<bool> descending);
+	RangeClusteringConfig(size_t num_partitions, vector<BoundOrderByNode> orders);
+	RangeClusteringConfig(const RangeClusteringConfig &other);
+	RangeClusteringConfig &operator=(const RangeClusteringConfig &other);
+	RangeClusteringConfig(RangeClusteringConfig &&other) noexcept = default;
+	RangeClusteringConfig &operator=(RangeClusteringConfig &&other) noexcept = default;
 	std::vector<std::string> multiline_display() const override;
+
+	size_t num_partitions() const {
+		return num_partitions_;
+	}
+	const vector<BoundOrderByNode> &orders() const {
+		return orders_;
+	}
+	std::vector<ExprRef> partition_by() const;
+
+private:
+	size_t num_partitions_;
+	vector<BoundOrderByNode> orders_;
 };
 
 class HashClusteringConfig : public BaseConfig {
@@ -275,7 +294,7 @@ private:
 	RangeClusteringConfig config_;
 
 public:
-	RangeClusteringSpec(const RangeClusteringConfig &config);
+	explicit RangeClusteringSpec(RangeClusteringConfig config);
 
 	Type type() const override {
 		return Type::Range;
@@ -346,10 +365,6 @@ public:
 	std::vector<std::string> multiline_display() const override;
 };
 
-// 聚类规范转换函数
-ClusteringSpecRef translate_clustering_spec(ClusteringSpecRef input_clustering_spec,
-                                            const std::vector<ExprRef> &projection);
-
 // Default implementations for ClusteringSpec that mirror the Rust `impl`.
 inline std::string ClusteringSpec::var_name() const {
 	switch (type()) {
@@ -415,8 +430,8 @@ inline ClusteringSpecRef ClusteringSpec::unknown_with_num_partitions(size_t num_
 	return std::make_shared<UnknownClusteringSpec>(UnknownClusteringConfig(num_partitions));
 }
 
-inline ClusteringSpecRef ClusteringSpec::from_range_config(const RangeClusteringConfig &config) {
-	return std::make_shared<RangeClusteringSpec>(config);
+inline ClusteringSpecRef ClusteringSpec::from_range_config(RangeClusteringConfig config) {
+	return std::make_shared<RangeClusteringSpec>(std::move(config));
 }
 
 inline ClusteringSpecRef ClusteringSpec::from_hash_config(const HashClusteringConfig &config) {

@@ -48,14 +48,22 @@ std::string ExchangeSourceHandleKey(const ExchangeSourceHandle &handle) {
 	return ss.str();
 }
 
-vector<unique_ptr<Expression>> CopyPartitionByExpressions(const std::shared_ptr<RepartitionSpec> &spec) {
+vector<unique_ptr<Expression>> CopyHashPartitionByExpressions(const std::shared_ptr<RepartitionSpec> &spec) {
 	vector<unique_ptr<Expression>> result;
-	if (!spec) {
+	if (!spec || spec->type() == RepartitionSpec::Type::Random ||
+	    spec->type() == RepartitionSpec::Type::IntoPartitions) {
 		return result;
 	}
-	auto exprs = spec->repartition_by();
+	if (spec->type() != RepartitionSpec::Type::Hash) {
+		throw InternalException("Expected HashRepartitionSpec for generic exchange sink");
+	}
+	auto *hash_spec = dynamic_cast<HashRepartitionSpec *>(spec.get());
+	if (!hash_spec) {
+		throw InternalException("Expected HashRepartitionSpec for generic exchange sink");
+	}
+	const auto &exprs = hash_spec->config()->by;
 	result.reserve(exprs.size());
-	for (auto &expr_ref : exprs) {
+	for (const auto &expr_ref : exprs) {
 		if (expr_ref) {
 			result.push_back(expr_ref->Copy());
 		} else {
@@ -113,7 +121,19 @@ DuckPhysicalPlanRef AddRemoteExchangeSinkPlan(DuckPhysicalPlanRef plan, const st
 	if (!plan || !plan->HasRoot()) {
 		return plan;
 	}
-	auto partition_exprs = CopyPartitionByExpressions(spec);
+	if (spec && spec->type() == RepartitionSpec::Type::Range) {
+		auto *range_spec = dynamic_cast<RangeRepartitionSpec *>(spec.get());
+		if (!range_spec) {
+			throw InternalException("Expected RangeRepartitionSpec for range exchange sink");
+		}
+		const auto &config = range_spec->config();
+		if (config.num_partitions() && config.num_partitions() != num_partitions) {
+			throw InvalidInputException("range repartition partition count does not match exchange partition count");
+		}
+		return AddRemoteRangeExchangeSinkPlan(std::move(plan), config.orders(), num_partitions, exchange_id,
+		                                      sink_handle, std::move(exchange_mgr), config.boundaries());
+	}
+	auto partition_exprs = CopyHashPartitionByExpressions(spec);
 	auto repartition_type = ResolveRepartitionType(spec);
 	auto &old_root = plan->Root();
 	auto estimated = old_root.estimated_cardinality;
@@ -133,6 +153,7 @@ DuckPhysicalPlanRef AddRemoteRangeExchangeSinkPlan(DuckPhysicalPlanRef plan, con
 	if (!plan || !plan->HasRoot()) {
 		return plan;
 	}
+	RangeRepartitionConfig::Validate(orders, num_partitions, boundary_keys);
 	vector<unique_ptr<Expression>> partition_exprs;
 	vector<string> order_modifiers;
 	partition_exprs.reserve(orders.size());
