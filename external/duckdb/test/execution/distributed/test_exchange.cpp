@@ -1142,16 +1142,29 @@ TEST_CASE("Exchange: ShuffleCache bounds aggregate buffers across partitions", "
 	REQUIRE(total_rows == PARTITION_COUNT);
 }
 
-TEST_CASE("Exchange: ShuffleCache validates aggregate buffer budget", "[distributed][exchange]") {
-	ScopedEnvVar max_buffered_bytes("VANE_SHUFFLE_CACHE_MAX_BUFFERED_BYTES",
-	                                std::to_string(std::numeric_limits<idx_t>::max()));
-	ShuffleCacheConfig config;
-	config.shuffle_stage_id = "stage_invalid_buffer_budget";
-	config.node_id = "node_budget";
-	config.num_partitions = 1;
-	config.local_dirs = {TestCreatePath("exchange_cache_invalid_buffer_budget")};
+TEST_CASE("Exchange: ShuffleCache validates buffer byte settings", "[distributed][exchange]") {
+	auto make_config = []() {
+		ShuffleCacheConfig config;
+		config.shuffle_stage_id = "stage_invalid_buffer_budget";
+		config.node_id = "node_budget";
+		config.num_partitions = 1;
+		config.local_dirs = {TestCreatePath("exchange_cache_invalid_buffer_budget")};
+		return config;
+	};
 
-	REQUIRE_THROWS_WITH(ShuffleCache(std::move(config)), Catch::Matchers::Contains("must be less than idx_t max"));
+	SECTION("aggregate budget cannot use the optional_idx sentinel") {
+		ScopedEnvVar max_buffered_bytes("VANE_SHUFFLE_CACHE_MAX_BUFFERED_BYTES",
+		                                std::to_string(std::numeric_limits<idx_t>::max()));
+		REQUIRE_THROWS_WITH(ShuffleCache(make_config()), Catch::Matchers::Contains("must be less than idx_t max"));
+	}
+	SECTION("flush threshold rejects a whitespace-prefixed negative value") {
+		ScopedEnvVar flush_threshold("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES", " -2");
+		REQUIRE_THROWS_WITH(ShuffleCache(make_config()), Catch::Matchers::Contains("positive integer byte count"));
+	}
+	SECTION("aggregate budget rejects a whitespace-prefixed negative value") {
+		ScopedEnvVar max_buffered_bytes("VANE_SHUFFLE_CACHE_MAX_BUFFERED_BYTES", " -2");
+		REQUIRE_THROWS_WITH(ShuffleCache(make_config()), Catch::Matchers::Contains("positive integer byte count"));
+	}
 }
 
 TEST_CASE("Exchange: ShuffleCache committed manifest replay via object storage backend", "[distributed][exchange]") {

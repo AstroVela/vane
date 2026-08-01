@@ -26,7 +26,8 @@
 #include <arrow/ipc/api.h>
 #include <arrow/io/api.h>
 #include <algorithm>
-#include <cerrno>
+#include <charconv>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
@@ -126,18 +127,23 @@ bool IsArrowCompatibleType(const LogicalType &arrow_type, const LogicalType &exp
 	return false;
 }
 
+unsigned long long ParsePositiveByteCount(const char *name, const char *raw) {
+	unsigned long long value = 0;
+	auto end = raw + std::strlen(raw);
+	auto result = std::from_chars(raw, end, value, 10);
+	if (result.ec != std::errc() || result.ptr != end || value == 0) {
+		throw InvalidInputException(std::string(name) + " must be a positive integer byte count");
+	}
+	return value;
+}
+
 idx_t ResolveShuffleCacheFlushThresholdBytes() {
 	const char *raw = std::getenv("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES");
 	if (!raw || !*raw) {
 		return ShuffleCache::DEFAULT_FLUSH_THRESHOLD_BYTES;
 	}
 
-	errno = 0;
-	char *end = nullptr;
-	auto value = std::strtoull(raw, &end, 10);
-	if (raw[0] == '-' || errno != 0 || end == raw || !end || *end != '\0' || value == 0) {
-		throw InvalidInputException("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES must be a positive integer byte count");
-	}
+	auto value = ParsePositiveByteCount("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES", raw);
 	if (value > static_cast<unsigned long long>(std::numeric_limits<idx_t>::max())) {
 		throw InvalidInputException("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES exceeds idx_t max");
 	}
@@ -150,12 +156,7 @@ optional_idx ResolveShuffleCacheMaxBufferedBytes() {
 		return optional_idx();
 	}
 
-	errno = 0;
-	char *end = nullptr;
-	auto value = std::strtoull(raw, &end, 10);
-	if (raw[0] == '-' || errno != 0 || end == raw || !end || *end != '\0' || value == 0) {
-		throw InvalidInputException("VANE_SHUFFLE_CACHE_MAX_BUFFERED_BYTES must be a positive integer byte count");
-	}
+	auto value = ParsePositiveByteCount("VANE_SHUFFLE_CACHE_MAX_BUFFERED_BYTES", raw);
 	if (value >= static_cast<unsigned long long>(std::numeric_limits<idx_t>::max())) {
 		throw InvalidInputException("VANE_SHUFFLE_CACHE_MAX_BUFFERED_BYTES must be less than idx_t max");
 	}
