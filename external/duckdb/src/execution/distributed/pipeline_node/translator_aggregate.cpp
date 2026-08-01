@@ -37,12 +37,7 @@ std::shared_ptr<DistributedPipelineNode> PhysicalPlanToPipelineNodeTranslator::g
 		                             ? plan_config_.num_partitions
 		                             : input_node->config().clustering_spec()->num_partitions();
 		auto spec = RepartitionSpec::create_hash(target_partitions, std::move(by));
-		auto res = gen_shuffle_node(spec, input_node->config().schema(), input_node);
-		if (!res) {
-			throw std::runtime_error(std::string("gen_shuffle_node failed in aggregate translation: ") +
-			                         res.error().what());
-		}
-		agg_input = res.value();
+		agg_input = gen_shuffle_node(std::move(spec), input_node->config().schema(), input_node);
 	}
 	if (!agg_input) {
 		throw std::runtime_error("aggregate translation produced null shuffle/gather input");
@@ -73,12 +68,7 @@ PhysicalPlanToPipelineNodeTranslator::gen_with_pre_agg(std::shared_ptr<Distribut
 			by.push_back(e);
 		}
 		auto spec = RepartitionSpec::create_hash(num_partitions, std::move(by));
-		auto res = gen_shuffle_node(spec, split_details.second_stage_schema, initial_agg);
-		if (!res) {
-			throw std::runtime_error(std::string("gen_shuffle_node failed in aggregate translation: ") +
-			                         res.error().what());
-		}
-		shuffle = res.value();
+		shuffle = gen_shuffle_node(std::move(spec), split_details.second_stage_schema, initial_agg);
 	}
 
 	auto final_aggregation =
@@ -193,11 +183,7 @@ std::shared_ptr<DistributedPipelineNode> PhysicalPlanToPipelineNodeTranslator::g
 	    plan_config_.num_partitions > 0 ? std::min(raw_partitions, plan_config_.num_partitions) : raw_partitions;
 	const auto target_partitions = std::max<size_t>(1, configured_partitions);
 	auto repartition_spec = RepartitionSpec::create_hash(target_partitions, std::move(partition_by));
-	auto shuffle_res = gen_shuffle_node(repartition_spec, expanded_schema, expanded);
-	if (shuffle_res.is_err()) {
-		throw std::runtime_error(std::string("gen_shuffle_node failed in grouping sets translation: ") +
-		                         shuffle_res.error().what());
-	}
+	auto shuffle = gen_shuffle_node(std::move(repartition_spec), std::move(expanded_schema), expanded);
 
 	std::vector<BoundExpr> final_group_by;
 	final_group_by.reserve(group_by.size() + grouping_functions.size() + 1);
@@ -234,10 +220,9 @@ std::shared_ptr<DistributedPipelineNode> PhysicalPlanToPipelineNodeTranslator::g
 		final_aggregate_types.push_back(aggregate->return_type);
 	}
 	auto final_aggregate_schema = MakeSchemaRef(final_aggregate_types);
-	auto final_aggregation =
-	    std::make_shared<AggregateNode>(get_next_pipeline_node_id(), plan_config_, final_group_by, final_aggregations,
-	                                    final_aggregate_schema, shuffle_res.value())
-	        ->into_node();
+	auto final_aggregation = std::make_shared<AggregateNode>(get_next_pipeline_node_id(), plan_config_, final_group_by,
+	                                                         final_aggregations, final_aggregate_schema, shuffle)
+	                             ->into_node();
 
 	std::vector<BoundExpr> final_expressions;
 	final_expressions.reserve(group_by.size() + aggregations.size() + grouping_functions.size());

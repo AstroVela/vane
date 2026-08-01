@@ -110,11 +110,7 @@ std::shared_ptr<DistributedPipelineNode> PhysicalPlanToPipelineNodeTranslator::T
 	if (!spec) {
 		spec = RepartitionSpec::create_random(0);
 	}
-	auto shuffle_result = gen_shuffle_node(spec, schema, children[0]);
-	if (!shuffle_result) {
-		throw InternalException("Failed to create RepartitionNode for REPARTITION: %s", shuffle_result.error().what());
-	}
-	return shuffle_result.value();
+	return gen_shuffle_node(std::move(spec), std::move(schema), children[0]);
 }
 
 std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateVLLMProject(
