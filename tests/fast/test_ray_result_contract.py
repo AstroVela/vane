@@ -6166,6 +6166,17 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
             self.tasks.extend(tasks)
             return []
 
+        def fte_query_status(self, _query_id, _task_contexts=None):
+            return {
+                "failed": False,
+                "finished": True,
+                "matched": True,
+                "selected_attempt_task_ids": [],
+            }
+
+        def pop_fte_result_handles(self, _query_id):
+            return []
+
         def stats_fragments(self):
             return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
 

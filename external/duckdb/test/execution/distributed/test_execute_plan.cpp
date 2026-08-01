@@ -13,14 +13,59 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/connection.hpp"
-#include "duckdb/parallel/task_executor.hpp"
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <mutex>
 #include "duckdb/execution/distributed/utils/optional.hpp"
 #include <string>
 
 using namespace duckdb;
 using namespace duckdb::distributed;
+
+TEST_CASE("PlanTaskExecutor does not depend on DuckDB compute threads", "[distributed][plan]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	conn.Query("SET threads=1");
+
+	auto status = std::make_shared<PlanExecutionStatus>();
+	auto executor = std::make_shared<PlanTaskExecutor>(conn.context, status);
+	struct BarrierState {
+		std::mutex mutex;
+		std::condition_variable cv;
+		idx_t started = 0;
+		idx_t completed = 0;
+		bool release = false;
+	};
+	auto barrier = std::make_shared<BarrierState>();
+	constexpr idx_t TASK_COUNT = 8;
+	for (idx_t task_idx = 0; task_idx < TASK_COUNT; task_idx++) {
+		executor->ScheduleTask([barrier]() {
+			std::unique_lock<std::mutex> lock(barrier->mutex);
+			barrier->started++;
+			barrier->cv.notify_all();
+			barrier->cv.wait(lock, [&]() { return barrier->release; });
+			barrier->completed++;
+			barrier->cv.notify_all();
+		});
+	}
+
+	bool all_started;
+	bool all_completed;
+	{
+		std::unique_lock<std::mutex> lock(barrier->mutex);
+		all_started =
+		    barrier->cv.wait_for(lock, std::chrono::seconds(5), [&]() { return barrier->started == TASK_COUNT; });
+		barrier->release = true;
+		barrier->cv.notify_all();
+		all_completed =
+		    barrier->cv.wait_for(lock, std::chrono::seconds(5), [&]() { return barrier->completed == TASK_COUNT; });
+	}
+	REQUIRE(all_started);
+	REQUIRE(all_completed);
+	REQUIRE_FALSE(status->GetError());
+}
 
 TEST_CASE("Pipeline produce_tasks: basic pipeline (scan->proj->filter)", "[distributed][plan]") {
 	// Build a tiny pipeline: ScanSource -> Projection -> Filter
@@ -43,10 +88,10 @@ TEST_CASE("Pipeline produce_tasks: basic pipeline (scan->proj->filter)", "[distr
 	auto filter_impl = std::make_shared<FilterNode>(3, proj_impl, pred_expr);
 	auto root = std::make_shared<DistributedPipelineNode>(filter_impl);
 
-	// Create a DuckDB instance + TaskExecutor so spawn() works
+	// Create a DuckDB instance + plan-control executor so spawn() works
 	duckdb::DuckDB db(nullptr);
 	duckdb::Connection conn(db);
-	auto task_executor = std::make_shared<TaskExecutor>(*conn.context);
+	auto task_executor = std::make_shared<PlanTaskExecutor>(conn.context);
 
 	// Create current plan execution context and produce tasks.
 	PlanExecutionContext ctx(task_executor, conn.context);
@@ -85,7 +130,7 @@ TEST_CASE("Pipeline produce_tasks yields a task with a printable plan", "[distri
 
 	duckdb::DuckDB db2(nullptr);
 	duckdb::Connection conn2(db2);
-	auto task_executor2 = std::make_shared<TaskExecutor>(*conn2.context);
+	auto task_executor2 = std::make_shared<PlanTaskExecutor>(conn2.context);
 
 	PlanExecutionContext ctx(task_executor2, conn2.context);
 

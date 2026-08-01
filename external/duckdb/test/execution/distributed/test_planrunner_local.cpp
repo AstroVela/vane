@@ -24,7 +24,7 @@ TEST_CASE("PlanRunner instantiation", "[distributed][plan][local]") {
 	auto workers = setup_workers({{make_worker_id("local-w1"), 4}});
 	auto worker_mgr = std::make_shared<MockWorkerManager>(std::move(workers));
 
-	// 2. Create DuckDB database + ClientContext (needed for TaskExecutor)
+	// 2. Create DuckDB database + ClientContext (needed for plan control)
 	DuckDB db;
 	Connection con(db);
 

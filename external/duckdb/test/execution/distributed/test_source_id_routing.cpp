@@ -184,7 +184,7 @@ static void RequireHashJoinFanInPreservesInputs(idx_t left_count, idx_t right_co
 
 	DuckDB db(nullptr);
 	Connection connection(db);
-	auto task_executor = std::make_shared<TaskExecutor>(*connection.context);
+	auto task_executor = std::make_shared<PlanTaskExecutor>(connection.context);
 	PlanExecutionContext plan_context(task_executor, connection.context);
 	auto stream = node->produce_tasks(plan_context);
 
@@ -218,8 +218,6 @@ static void RequireHashJoinFanInPreservesInputs(idx_t left_count, idx_t right_co
 			actual_right_inputs.push_back(right_entry->second.scan_task_bytes);
 		}
 	}
-	task_executor->WorkOnTasks();
-
 	REQUIRE(actual_left_inputs == left_inputs);
 	REQUIRE(actual_right_inputs == right_inputs);
 }
@@ -466,23 +464,21 @@ TEST_CASE("HashJoinNode: asymmetric empty child stream fails loudly", "[distribu
 		auto node = MakeHashJoinNode(MakeInputNames("left-", 1), {});
 		DuckDB db(nullptr);
 		Connection connection(db);
-		auto task_executor = std::make_shared<TaskExecutor>(*connection.context);
+		auto task_executor = std::make_shared<PlanTaskExecutor>(connection.context);
 		PlanExecutionContext plan_context(task_executor, connection.context);
 		auto stream = node->produce_tasks(plan_context);
 
 		REQUIRE_THROWS_WITH(stream.poll_next(), Catch::Matchers::Contains("empty right task stream"));
-		task_executor->WorkOnTasks();
 	}
 	SECTION("left stream is empty") {
 		auto node = MakeHashJoinNode({}, MakeInputNames("right-", 1));
 		DuckDB db(nullptr);
 		Connection connection(db);
-		auto task_executor = std::make_shared<TaskExecutor>(*connection.context);
+		auto task_executor = std::make_shared<PlanTaskExecutor>(connection.context);
 		PlanExecutionContext plan_context(task_executor, connection.context);
 		auto stream = node->produce_tasks(plan_context);
 
 		REQUIRE_THROWS_WITH(stream.poll_next(), Catch::Matchers::Contains("empty left task stream"));
-		task_executor->WorkOnTasks();
 	}
 }
 
@@ -490,12 +486,11 @@ TEST_CASE("HashJoinNode: two empty child streams produce no task", "[distributed
 	auto node = MakeHashJoinNode({}, {});
 	DuckDB db(nullptr);
 	Connection connection(db);
-	auto task_executor = std::make_shared<TaskExecutor>(*connection.context);
+	auto task_executor = std::make_shared<PlanTaskExecutor>(connection.context);
 	PlanExecutionContext plan_context(task_executor, connection.context);
 	auto stream = node->produce_tasks(plan_context);
 
 	REQUIRE_FALSE(stream.poll_next().first);
-	task_executor->WorkOnTasks();
 }
 
 TEST_CASE("BroadcastJoinNode: replacement task preserves receiver inputs", "[distributed][source_id][join]") {

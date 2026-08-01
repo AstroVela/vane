@@ -3153,6 +3153,7 @@ def test_ray_fixed_row_reservoir_sample_preserves_hash_join_continuations(
     monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "8")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
     duckdb_conn.execute("SET disabled_optimizers = 'late_materialization'")
+    duckdb_conn.execute("SET threads = 4")
     duckdb_conn.execute(f"""
         COPY (
             SELECT i::BIGINT AS id, 1::BIGINT AS k, i::BIGINT AS file_id

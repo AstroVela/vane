@@ -29,7 +29,6 @@
 #include "duckdb/execution/distributed/common_types.hpp"
 
 #include "duckdb/execution/distributed/utils/channel.hpp"
-#include "duckdb/execution/distributed/utils/distributed_task.hpp"
 #include "duckdb/execution/distributed/scheduling/worker.hpp"
 #include "duckdb/execution/distributed/plan/plan_config.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
@@ -179,13 +178,13 @@ public:
 class PlanExecutionContext {
 private:
 	duckdb::shared_ptr<::duckdb::ClientContext> client_context_;
-	std::shared_ptr<TaskExecutor> task_executor_;
+	std::shared_ptr<PlanTaskExecutor> task_executor_;
 	std::shared_ptr<FteTaskSubmitter> fte_task_submitter_;
 	TaskIDCounter task_id_counter_;
 	TaskInputs initial_inputs_;
 
 public:
-	explicit PlanExecutionContext(std::shared_ptr<TaskExecutor> task_executor,
+	explicit PlanExecutionContext(std::shared_ptr<PlanTaskExecutor> task_executor,
 	                              duckdb::shared_ptr<::duckdb::ClientContext> client_context = nullptr,
 	                              TaskInputs initial_inputs = {},
 	                              std::shared_ptr<FteTaskSubmitter> fte_task_submitter = nullptr)
@@ -207,13 +206,13 @@ public:
 	void spawn(F &&task) {
 		typedef typename std::decay<F>::type TaskFunc;
 		auto task_ptr = std::make_shared<TaskFunc>(std::forward<F>(task));
-		task_executor_->ScheduleTask(make_uniq<DistributedPlanTask>(*task_executor_, [task_ptr]() mutable {
+		task_executor_->ScheduleTask([task_ptr]() mutable {
 			auto result = (*task_ptr)();
 			if (result.is_err()) {
 				auto msg = std::string("[PlanExecutionContext::spawn] task error: ") + result.error().what();
 				throw InternalException(msg);
 			}
-		}));
+		});
 	}
 
 	// Return a new TaskIDCounter reference that allows generating new task ids
@@ -287,7 +286,7 @@ public:
 	// Execute a pipeline node by forwarding its task stream to the FTE
 	// coordinator. This runs in a background thread spawned by run_plan.
 	DuckDBResult<void> execute_plan(std::shared_ptr<DistributedPipelineNode> pipeline_node,
-	                                std::shared_ptr<TaskExecutor> task_executor,
+	                                std::shared_ptr<PlanTaskExecutor> task_executor,
 	                                UnboundedSender<MaterializedOutput> output_sender, TaskInputs initial_inputs = {}) {
 		auto fte_task_submitter = std::make_shared<WorkerManagerFteTaskSubmitter>(worker_manager_);
 		PlanExecutionContext ctx(task_executor, client_context_, std::move(initial_inputs), fte_task_submitter);
@@ -475,7 +474,8 @@ public:
 		DistributedCopyResult copy_result;
 
 		// Streaming constructor
-		static PlanResult make_streaming(std::shared_ptr<TaskExecutor> te, UnboundedReceiver<MaterializedOutput> recv,
+		static PlanResult make_streaming(std::shared_ptr<PlanTaskExecutor> te,
+		                                 UnboundedReceiver<MaterializedOutput> recv,
 		                                 std::shared_ptr<PlanExecutionStatus> status) {
 			PlanResult r;
 			r.tag = STREAMING;
@@ -608,7 +608,7 @@ public:
 		if (worker_manager_) {
 			worker_manager_->set_streaming_results_channel_state(sender.state());
 		}
-		auto task_executor = std::make_shared<TaskExecutor>(*client_context_);
+		auto task_executor = std::make_shared<PlanTaskExecutor>(client_context_, execute_status);
 
 		auto self = std::shared_ptr<PlanRunner>(this->shared_from_this());
 		if (!self) {
@@ -617,43 +617,41 @@ public:
 		}
 		auto sender_ptr = std::make_shared<UnboundedSender<MaterializedOutput>>(std::move(sender));
 		auto initial_inputs_ptr = std::make_shared<TaskInputs>(std::move(initial_inputs));
-		task_executor->ScheduleTask(make_uniq<distributed::DistributedPlanTask>(
-		    *task_executor, [self, pipeline_node, sender_ptr, output_state, execute_status, task_executor,
-		                     initial_inputs_ptr]() mutable {
-			    std::unique_ptr<UnboundedSender<MaterializedOutput>> output_lifetime_guard;
-			    auto publish_error = [&](const DuckDBError &error) {
-				    execute_status->RecordError(error);
-				    if (output_state) {
-					    output_state->close();
-				    }
-			    };
-			    auto clear_worker_channel = [&]() {
-				    if (self->worker_manager_) {
-					    self->worker_manager_->clear_streaming_results_channel_state();
-				    }
-			    };
-			    try {
-				    output_lifetime_guard = make_uniq<UnboundedSender<MaterializedOutput>>(sender_ptr->clone());
-				    auto result = self->execute_plan(pipeline_node, task_executor, std::move(*sender_ptr),
-				                                     std::move(*initial_inputs_ptr));
-				    clear_worker_channel();
-				    if (result.is_err()) {
-					    publish_error(result.error());
-				    }
-				    output_lifetime_guard.reset();
-			    } catch (const std::exception &ex) {
-				    clear_worker_channel();
-				    DuckDBError error =
-				        DuckDBError::external_error(std::string("execute_plan task threw: ") + ex.what());
-				    publish_error(error);
-				    output_lifetime_guard.reset();
-			    } catch (...) {
-				    clear_worker_channel();
-				    DuckDBError error = DuckDBError::external_error("execute_plan task threw unknown exception");
-				    publish_error(error);
-				    output_lifetime_guard.reset();
-			    }
-		    }));
+		task_executor->ScheduleTask([self, pipeline_node, sender_ptr, output_state, execute_status, task_executor,
+		                             initial_inputs_ptr]() mutable {
+			std::unique_ptr<UnboundedSender<MaterializedOutput>> output_lifetime_guard;
+			auto publish_error = [&](const DuckDBError &error) {
+				execute_status->RecordError(error);
+				if (output_state) {
+					output_state->close();
+				}
+			};
+			auto clear_worker_channel = [&]() {
+				if (self->worker_manager_) {
+					self->worker_manager_->clear_streaming_results_channel_state();
+				}
+			};
+			try {
+				output_lifetime_guard = make_uniq<UnboundedSender<MaterializedOutput>>(sender_ptr->clone());
+				auto result = self->execute_plan(pipeline_node, task_executor, std::move(*sender_ptr),
+				                                 std::move(*initial_inputs_ptr));
+				clear_worker_channel();
+				if (result.is_err()) {
+					publish_error(result.error());
+				}
+				output_lifetime_guard.reset();
+			} catch (const std::exception &ex) {
+				clear_worker_channel();
+				DuckDBError error = DuckDBError::external_error(std::string("execute_plan task threw: ") + ex.what());
+				publish_error(error);
+				output_lifetime_guard.reset();
+			} catch (...) {
+				clear_worker_channel();
+				DuckDBError error = DuckDBError::external_error("execute_plan task threw unknown exception");
+				publish_error(error);
+				output_lifetime_guard.reset();
+			}
+		});
 
 		// ── Step 4: Dispatch based on sink presence ──
 		if (!sink_node) {
