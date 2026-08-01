@@ -59,7 +59,24 @@ class _TaskAdmissionCancellationScheduler:
     def create(self, callback: Callable[[], None]) -> _ScheduledCall:
         return _ScheduledCall(self, callback)
 
+    def ensure_started(self) -> None:
+        """Start before remote work can transfer cleanup ownership to this clock."""
+        with self._cv:
+            if self._thread is not None:
+                return
+            thread = threading.Thread(
+                target=self._run,
+                daemon=True,
+                name="vane-task-admission-cleanup",
+            )
+            # Publish only a successfully started thread.  If start() raises,
+            # a later controller can retry instead of inheriting a permanently
+            # poisoned scheduler with no worker.
+            thread.start()
+            self._thread = thread
+
     def schedule(self, call: _ScheduledCall, delay_s: float) -> None:
+        self.ensure_started()
         with self._cv:
             if call._scheduler is not self:
                 raise RuntimeError("scheduled call belongs to a different scheduler")
@@ -77,13 +94,6 @@ class _TaskAdmissionCancellationScheduler:
                     call,
                 ),
             )
-            if self._thread is None:
-                self._thread = threading.Thread(
-                    target=self._run,
-                    daemon=True,
-                    name="vane-task-admission-cleanup",
-                )
-                self._thread.start()
             self._cv.notify()
 
     def cancel(self, call: _ScheduledCall) -> None:
@@ -385,6 +395,10 @@ class TaskAdmissionController:
             raise ValueError("distributed Ray UDF task admission requires query_id and stage_id")
         if driver is None:
             raise ValueError("distributed Ray UDF task admission requires an explicit query driver handle")
+        # The cancellation deadline owner must exist before this controller can
+        # submit any remote lease request.  Startup failure is therefore a
+        # pre-submit construction error, never a post-submit ownership gap.
+        _TASK_ADMISSION_CANCELLATION_SCHEDULER.ensure_started()
         self._resources = ray_udf_task_resource_spec(self._payload)
         self._driver = driver
         self._executor_id = uuid.uuid4().hex

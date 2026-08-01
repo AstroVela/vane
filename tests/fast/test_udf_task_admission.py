@@ -551,6 +551,32 @@ def test_task_admission_cancellations_share_one_deadline_thread(monkeypatch):
     assert all(cancellation._done for cancellation in cancellations)
 
 
+def test_task_admission_deadline_scheduler_start_failure_is_retryable(
+    monkeypatch,
+):
+    scheduler = task_admission._TaskAdmissionCancellationScheduler()
+    original_start = threading.Thread.start
+    starts = 0
+
+    def fail_first_start(thread):
+        nonlocal starts
+        if thread.name == "vane-task-admission-cleanup":
+            starts += 1
+            if starts == 1:
+                raise RuntimeError("deadline thread unavailable")
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_first_start)
+    with pytest.raises(RuntimeError, match="deadline thread unavailable"):
+        scheduler.ensure_started()
+
+    assert scheduler._thread is None
+
+    scheduler.ensure_started()
+    assert scheduler._thread is not None
+    assert scheduler._thread.is_alive()
+
+
 def test_ray_control_submissions_isolate_blocked_owner_and_retire_idle_workers():
     executor = ray_control_submission._RayControlSubmissionExecutor(
         idle_timeout_s=0.01,
