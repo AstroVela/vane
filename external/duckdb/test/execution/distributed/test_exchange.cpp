@@ -1224,6 +1224,12 @@ TEST_CASE("Exchange: ShuffleCache empty partition handling", "[distributed][exch
 	ShuffleCache cache(std::move(config));
 
 	vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::VARCHAR};
+	DataChunk zero_row_chunk;
+	zero_row_chunk.Initialize(Allocator::DefaultAllocator(), types);
+	REQUIRE(cache.WriteChunk(context, zero_row_chunk, 0, {"id", "name"}).is_ok());
+	REQUIRE(cache.GetBufferedBytes() == 0);
+	REQUIRE(cache.GetBufferBudgetBytes() == 0);
+
 	auto empty_res = cache.ReadPartition(context, 0, types);
 	REQUIRE(empty_res.is_ok());
 	auto empty_collection = std::move(empty_res.value());

@@ -1203,8 +1203,8 @@ void ShuffleCache::EnsureMemoryBudget(ClientContext &context) {
 	}
 	if (desired_bytes > 0) {
 		// One target-size partition is the guaranteed floor. The manager may grant
-		// more of the default share while memory is available and shrink it under
-		// contention from other temporary operators or shuffle sinks.
+		// more of the default share while memory is available; that grant remains
+		// accounted for until this state refreshes or releases it.
 		auto minimum_reservation = MinValue(temporary_memory_state_->GetMinimumReservation(), flush_threshold_bytes_);
 		minimum_reservation = MinValue(minimum_reservation, desired_bytes);
 		temporary_memory_state_->SetMinimumReservation(minimum_reservation);
@@ -1254,6 +1254,9 @@ DuckDBResult<void> ShuffleCache::WriteChunk(ClientContext &context, DataChunk &c
 	}
 	if (chunk.ColumnCount() == 0) {
 		return DuckDBResult<void>::err(DuckDBError::value_error("shuffle cache write requires at least one column"));
+	}
+	if (chunk.size() == 0) {
+		return DuckDBResult<void>::ok();
 	}
 	EnsureMemoryBudget(context);
 
@@ -1309,7 +1312,20 @@ DuckDBResult<ShufflePartitionFile> ShuffleCache::FlushBuffer(ClientContext &cont
 DuckDBResult<ShufflePartitionFile> ShuffleCache::FlushBufferLocked(ClientContext &context, idx_t partition_idx,
                                                                    const vector<string> &names) {
 	auto &buffer = write_buffers_[partition_idx];
-	if (!buffer || buffer->Count() == 0) {
+	if (!buffer) {
+		ShufflePartitionFile empty;
+		return DuckDBResult<ShufflePartitionFile>::ok(std::move(empty));
+	}
+	if (buffer->Count() == 0) {
+		// InitializeAppend can allocate storage before seeing an empty chunk. Do not
+		// leave an unflushable allocation in the pressure-victim set.
+		auto released_bytes = buffer_bytes_[partition_idx].load();
+		buffer.reset();
+		if (released_bytes > 0) {
+			auto previous_total = buffered_bytes_.fetch_sub(released_bytes);
+			D_ASSERT(previous_total >= released_bytes);
+		}
+		buffer_bytes_[partition_idx].store(0);
 		ShufflePartitionFile empty;
 		return DuckDBResult<ShufflePartitionFile>::ok(std::move(empty));
 	}
@@ -1343,6 +1359,11 @@ DuckDBResult<void> ShuffleCache::FlushUnderMemoryPressure(ClientContext &context
 			}
 		}
 		if (!victim_partition.IsValid()) {
+			// A concurrent threshold flush can release the last candidate between the
+			// aggregate check and this unlocked scan.
+			if (buffered_bytes_.load() <= buffer_budget_bytes_.load()) {
+				continue;
+			}
 			return DuckDBResult<void>::err(
 			    DuckDBError::internal_error("shuffle cache memory accounting exceeded its budget without a buffer"));
 		}
