@@ -19,13 +19,15 @@
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/storage/temporary_memory_manager.hpp"
 
 #include <arrow/api.h>
 #include <arrow/c/bridge.h>
 #include <arrow/ipc/api.h>
 #include <arrow/io/api.h>
 #include <algorithm>
-#include <cerrno>
+#include <charconv>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
@@ -125,22 +127,40 @@ bool IsArrowCompatibleType(const LogicalType &arrow_type, const LogicalType &exp
 	return false;
 }
 
+unsigned long long ParsePositiveByteCount(const char *name, const char *raw) {
+	unsigned long long value = 0;
+	auto end = raw + std::strlen(raw);
+	auto result = std::from_chars(raw, end, value, 10);
+	if (result.ec != std::errc() || result.ptr != end || value == 0) {
+		throw InvalidInputException(std::string(name) + " must be a positive integer byte count");
+	}
+	return value;
+}
+
 idx_t ResolveShuffleCacheFlushThresholdBytes() {
 	const char *raw = std::getenv("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES");
 	if (!raw || !*raw) {
 		return ShuffleCache::DEFAULT_FLUSH_THRESHOLD_BYTES;
 	}
 
-	errno = 0;
-	char *end = nullptr;
-	auto value = std::strtoull(raw, &end, 10);
-	if (errno != 0 || end == raw || !end || *end != '\0' || value == 0) {
-		throw InvalidInputException("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES must be a positive integer byte count");
-	}
+	auto value = ParsePositiveByteCount("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES", raw);
 	if (value > static_cast<unsigned long long>(std::numeric_limits<idx_t>::max())) {
 		throw InvalidInputException("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES exceeds idx_t max");
 	}
 	return static_cast<idx_t>(value);
+}
+
+optional_idx ResolveShuffleCacheMaxBufferedBytes() {
+	const char *raw = std::getenv("VANE_SHUFFLE_CACHE_MAX_BUFFERED_BYTES");
+	if (!raw || !*raw) {
+		return optional_idx();
+	}
+
+	auto value = ParsePositiveByteCount("VANE_SHUFFLE_CACHE_MAX_BUFFERED_BYTES", raw);
+	if (value >= static_cast<unsigned long long>(std::numeric_limits<idx_t>::max())) {
+		throw InvalidInputException("VANE_SHUFFLE_CACHE_MAX_BUFFERED_BYTES must be less than idx_t max");
+	}
+	return optional_idx(static_cast<idx_t>(value));
 }
 
 void CastChunk(ClientContext &context, DataChunk &input, DataChunk &output, const vector<LogicalType> &target_types) {
@@ -690,8 +710,9 @@ ShuffleCache::ShuffleCache(ShuffleCacheConfig config) : ShuffleCache(std::move(c
 
 ShuffleCache::ShuffleCache(ShuffleCacheConfig config, std::shared_ptr<ShuffleStorage> storage)
     : config_(std::move(config)), partitions_(config_.num_partitions), next_file_ids_(config_.num_partitions),
-      storage_(std::move(storage)), write_buffers_(config_.num_partitions), buffer_bytes_(config_.num_partitions, 0),
-      flush_threshold_bytes_(ResolveShuffleCacheFlushThresholdBytes()) {
+      storage_(std::move(storage)), write_buffers_(config_.num_partitions), buffer_bytes_(config_.num_partitions),
+      flush_threshold_bytes_(ResolveShuffleCacheFlushThresholdBytes()),
+      configured_max_buffered_bytes_(ResolveShuffleCacheMaxBufferedBytes()) {
 	if (!storage_) {
 		throw InvalidInputException("ShuffleCache storage backend must not be null");
 	}
@@ -711,6 +732,9 @@ ShuffleCache::ShuffleCache(ShuffleCacheConfig config, std::shared_ptr<ShuffleSto
 	for (auto &entry : next_file_ids_) {
 		entry.store(0);
 	}
+	for (auto &entry : buffer_bytes_) {
+		entry.store(0);
+	}
 	buffer_mutexes_.reserve(config_.num_partitions);
 	for (idx_t i = 0; i < config_.num_partitions; i++) {
 		buffer_mutexes_.push_back(make_uniq<std::mutex>());
@@ -718,11 +742,17 @@ ShuffleCache::ShuffleCache(ShuffleCacheConfig config, std::shared_ptr<ShuffleSto
 }
 
 ShuffleCache::~ShuffleCache() {
-	// FlushAll is called explicitly via SinkFinalize; no destructor flush needed.
+	// FlushAll is called explicitly via SinkFinalize; never write from a destructor.
+	DiscardBufferedData();
 }
 
 const ShuffleCacheConfig &ShuffleCache::config() const {
 	return config_;
+}
+
+vector<string> ShuffleCache::BufferedNames() const {
+	std::lock_guard<std::mutex> lock(buffered_names_mutex_);
+	return buffered_names_;
 }
 
 DuckDBResult<void> ShuffleCache::EnsurePartitionDirectory(idx_t partition_idx) const {
@@ -1153,6 +1183,70 @@ DuckDBResult<void> ShuffleCache::EnsureSchemaFile(ClientContext &context, const 
 	return DuckDBResult<void>::ok();
 }
 
+void ShuffleCache::EnsureMemoryBudget(ClientContext &context) {
+	if (memory_budget_initialized_.load()) {
+		return;
+	}
+
+	std::lock_guard<std::mutex> guard(memory_state_mutex_);
+	if (memory_budget_initialized_.load()) {
+		return;
+	}
+	temporary_memory_state_ = TemporaryMemoryManager::Get(context).Register(context);
+	auto max_bytes = std::numeric_limits<idx_t>::max();
+	auto aggregate_target = config_.num_partitions > max_bytes / flush_threshold_bytes_
+	                            ? max_bytes
+	                            : config_.num_partitions * flush_threshold_bytes_;
+	auto desired_bytes = MinValue(temporary_memory_state_->GetRemainingSize(), aggregate_target);
+	if (configured_max_buffered_bytes_.IsValid()) {
+		desired_bytes = MinValue(desired_bytes, configured_max_buffered_bytes_.GetIndex());
+	}
+	if (desired_bytes > 0) {
+		// One target-size partition is the guaranteed floor. The manager may grant
+		// more of the default share while memory is available; that grant remains
+		// accounted for until this state refreshes or releases it.
+		auto minimum_reservation = MinValue(temporary_memory_state_->GetMinimumReservation(), flush_threshold_bytes_);
+		minimum_reservation = MinValue(minimum_reservation, desired_bytes);
+		temporary_memory_state_->SetMinimumReservation(minimum_reservation);
+		temporary_memory_state_->SetRemainingSizeAndUpdateReservation(context, desired_bytes);
+	}
+	auto budget = temporary_memory_state_->GetReservation();
+	if (configured_max_buffered_bytes_.IsValid()) {
+		budget = MinValue(budget, configured_max_buffered_bytes_.GetIndex());
+	}
+	buffer_budget_bytes_.store(budget);
+	memory_budget_initialized_.store(true);
+}
+
+void ShuffleCache::RefreshMemoryBudget(ClientContext &context) {
+	std::lock_guard<std::mutex> guard(memory_state_mutex_);
+	if (!temporary_memory_state_) {
+		return;
+	}
+	temporary_memory_state_->UpdateReservation(context);
+	auto budget = temporary_memory_state_->GetReservation();
+	if (configured_max_buffered_bytes_.IsValid()) {
+		budget = MinValue(budget, configured_max_buffered_bytes_.GetIndex());
+	}
+	buffer_budget_bytes_.store(budget);
+}
+
+void ShuffleCache::ReleaseMemoryReservation() {
+	std::lock_guard<std::mutex> guard(memory_state_mutex_);
+	if (temporary_memory_state_) {
+		temporary_memory_state_->SetZero();
+		temporary_memory_state_.reset();
+	}
+	buffer_budget_bytes_.store(0);
+	memory_budget_initialized_.store(false);
+}
+
+void ShuffleCache::UpdatePeakBufferedBytes(idx_t buffered_bytes) {
+	auto peak = peak_buffered_bytes_.load();
+	while (peak < buffered_bytes && !peak_buffered_bytes_.compare_exchange_weak(peak, buffered_bytes)) {
+	}
+}
+
 DuckDBResult<void> ShuffleCache::WriteChunk(ClientContext &context, DataChunk &chunk, idx_t partition_idx,
                                             const vector<string> &names) {
 	if (partition_idx >= partitions_.size()) {
@@ -1161,70 +1255,162 @@ DuckDBResult<void> ShuffleCache::WriteChunk(ClientContext &context, DataChunk &c
 	if (chunk.ColumnCount() == 0) {
 		return DuckDBResult<void>::err(DuckDBError::value_error("shuffle cache write requires at least one column"));
 	}
+	if (chunk.size() == 0) {
+		return DuckDBResult<void>::ok();
+	}
+	EnsureMemoryBudget(context);
 
 	// Capture column names for later FlushAll calls.
-	if (buffered_names_.empty() && !names.empty()) {
-		buffered_names_ = names;
-	}
-
-	// Lock this partition's buffer for thread-safe access.
-	std::lock_guard<std::mutex> lock(*buffer_mutexes_[partition_idx]);
-
-	// Lazily create the write buffer for this partition.
-	if (!write_buffers_[partition_idx]) {
-		write_buffers_[partition_idx] =
-		    make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), chunk.GetTypes());
-	}
-
-	// Append the chunk to the in-memory buffer.
-	write_buffers_[partition_idx]->Append(chunk);
-	buffer_bytes_[partition_idx] = write_buffers_[partition_idx]->AllocationSize();
-
-	// Flush if we exceeded the threshold.
-	if (buffer_bytes_[partition_idx] >= flush_threshold_bytes_) {
-		auto flush_res = FlushBuffer(context, partition_idx, names);
-		if (flush_res.is_err()) {
-			return DuckDBResult<void>::err(flush_res.error());
+	if (!names.empty()) {
+		std::lock_guard<std::mutex> names_guard(buffered_names_mutex_);
+		if (buffered_names_.empty()) {
+			buffered_names_ = names;
 		}
 	}
 
+	{
+		// Lock this partition's buffer for thread-safe access.
+		std::lock_guard<std::mutex> lock(*buffer_mutexes_[partition_idx]);
+
+		// Keep disk-first buffers in memory, but charge them to DuckDB's memory limit.
+		if (!write_buffers_[partition_idx]) {
+			write_buffers_[partition_idx] =
+			    make_uniq<ColumnDataCollection>(BufferAllocator::Get(context), chunk.GetTypes());
+		}
+
+		// Account allocated capacity rather than row payload size, including varlen blocks.
+		auto previous_bytes = buffer_bytes_[partition_idx].load();
+		write_buffers_[partition_idx]->Append(chunk);
+		auto current_bytes = write_buffers_[partition_idx]->AllocationSize();
+		D_ASSERT(current_bytes >= previous_bytes);
+		buffer_bytes_[partition_idx].store(current_bytes);
+		auto allocated_bytes = current_bytes - previous_bytes;
+		auto total_bytes = buffered_bytes_.fetch_add(allocated_bytes) + allocated_bytes;
+		UpdatePeakBufferedBytes(total_bytes);
+
+		// The per-partition threshold remains a target output segment size.
+		if (current_bytes >= flush_threshold_bytes_) {
+			auto flush_res = FlushBufferLocked(context, partition_idx, names);
+			if (flush_res.is_err()) {
+				return DuckDBResult<void>::err(flush_res.error());
+			}
+		}
+	}
+
+	if (buffered_bytes_.load() > buffer_budget_bytes_.load()) {
+		return FlushUnderMemoryPressure(context, names);
+	}
 	return DuckDBResult<void>::ok();
 }
 
 DuckDBResult<ShufflePartitionFile> ShuffleCache::FlushBuffer(ClientContext &context, idx_t partition_idx,
                                                              const vector<string> &names) {
+	std::lock_guard<std::mutex> lock(*buffer_mutexes_[partition_idx]);
+	return FlushBufferLocked(context, partition_idx, names);
+}
+
+DuckDBResult<ShufflePartitionFile> ShuffleCache::FlushBufferLocked(ClientContext &context, idx_t partition_idx,
+                                                                   const vector<string> &names) {
 	auto &buffer = write_buffers_[partition_idx];
-	if (!buffer || buffer->Count() == 0) {
+	if (!buffer) {
+		ShufflePartitionFile empty;
+		return DuckDBResult<ShufflePartitionFile>::ok(std::move(empty));
+	}
+	if (buffer->Count() == 0) {
+		// InitializeAppend can allocate storage before seeing an empty chunk. Do not
+		// leave an unflushable allocation in the pressure-victim set.
+		auto released_bytes = buffer_bytes_[partition_idx].load();
+		buffer.reset();
+		if (released_bytes > 0) {
+			auto previous_total = buffered_bytes_.fetch_sub(released_bytes);
+			D_ASSERT(previous_total >= released_bytes);
+		}
+		buffer_bytes_[partition_idx].store(0);
 		ShufflePartitionFile empty;
 		return DuckDBResult<ShufflePartitionFile>::ok(std::move(empty));
 	}
 
 	auto result = WriteCollectionToFile(context, *buffer, partition_idx, names);
 
-	// Reset the buffer.
+	// Release accounting only after the synchronous write no longer needs the buffer.
+	auto released_bytes = buffer_bytes_[partition_idx].load();
 	buffer.reset();
-	buffer_bytes_[partition_idx] = 0;
+	if (released_bytes > 0) {
+		auto previous_total = buffered_bytes_.fetch_sub(released_bytes);
+		D_ASSERT(previous_total >= released_bytes);
+	}
+	buffer_bytes_[partition_idx].store(0);
 
 	return result;
 }
 
+DuckDBResult<void> ShuffleCache::FlushUnderMemoryPressure(ClientContext &context, const vector<string> &names) {
+	std::lock_guard<std::mutex> pressure_guard(pressure_mutex_);
+	RefreshMemoryBudget(context);
+
+	while (buffered_bytes_.load() > buffer_budget_bytes_.load()) {
+		optional_idx victim_partition;
+		idx_t victim_bytes = 0;
+		for (idx_t partition_idx = 0; partition_idx < buffer_bytes_.size(); partition_idx++) {
+			auto partition_bytes = buffer_bytes_[partition_idx].load();
+			if (partition_bytes > victim_bytes) {
+				victim_partition = partition_idx;
+				victim_bytes = partition_bytes;
+			}
+		}
+		if (!victim_partition.IsValid()) {
+			// A concurrent threshold flush can release the last candidate between the
+			// aggregate check and this unlocked scan.
+			if (buffered_bytes_.load() <= buffer_budget_bytes_.load()) {
+				continue;
+			}
+			return DuckDBResult<void>::err(
+			    DuckDBError::internal_error("shuffle cache memory accounting exceeded its budget without a buffer"));
+		}
+
+		auto partition_idx = victim_partition.GetIndex();
+		std::lock_guard<std::mutex> partition_guard(*buffer_mutexes_[partition_idx]);
+		if (buffer_bytes_[partition_idx].load() == 0) {
+			continue;
+		}
+		auto flush_res = FlushBufferLocked(context, partition_idx, names);
+		if (flush_res.is_err()) {
+			return DuckDBResult<void>::err(flush_res.error());
+		}
+	}
+	return DuckDBResult<void>::ok();
+}
+
 DuckDBResult<void> ShuffleCache::FlushAll(ClientContext &context, const vector<string> &names) {
+	std::lock_guard<std::mutex> pressure_guard(pressure_mutex_);
 	if (flushed_) {
 		return DuckDBResult<void>::ok();
 	}
 	flushed_ = true;
 
-	idx_t total_flushed = 0;
 	for (idx_t i = 0; i < write_buffers_.size(); i++) {
-		if (write_buffers_[i] && write_buffers_[i]->Count() > 0) {
-			auto res = FlushBuffer(context, i, names);
-			if (res.is_err()) {
-				return DuckDBResult<void>::err(res.error());
-			}
-			total_flushed++;
+		auto res = FlushBuffer(context, i, names);
+		if (res.is_err()) {
+			return DuckDBResult<void>::err(res.error());
 		}
 	}
+	ReleaseMemoryReservation();
 	return DuckDBResult<void>::ok();
+}
+
+void ShuffleCache::DiscardBufferedData() {
+	std::lock_guard<std::mutex> pressure_guard(pressure_mutex_);
+	for (idx_t partition_idx = 0; partition_idx < write_buffers_.size(); partition_idx++) {
+		std::lock_guard<std::mutex> partition_guard(*buffer_mutexes_[partition_idx]);
+		auto released_bytes = buffer_bytes_[partition_idx].load();
+		write_buffers_[partition_idx].reset();
+		if (released_bytes > 0) {
+			auto previous_total = buffered_bytes_.fetch_sub(released_bytes);
+			D_ASSERT(previous_total >= released_bytes);
+		}
+		buffer_bytes_[partition_idx].store(0);
+	}
+	ReleaseMemoryReservation();
 }
 
 DuckDBResult<ShufflePartitionFile> ShuffleCache::WriteCollectionToFile(ClientContext &context,
