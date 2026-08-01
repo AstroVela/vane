@@ -3,30 +3,42 @@
 
 /**
  * @file test_streaming_channel.cpp
- * @brief Unit tests for the T2 removal and dispatcher streaming channel changes.
+ * @brief Unit tests for distributed streaming channel lifecycle behavior.
  *
  * These tests verify that:
  * 1. Temporary senders created from UnboundedChannelState correctly manage
  *    sender counts (increment on create, decrement on destroy).
- * 2. The streaming channel state can be stored and retrieved from a
- *    WorkerManager (simulating the execute_plan → dispatcher path).
- * 3. Channel close ordering is correct: the channel only closes when ALL
- *    senders (including temporaries) are destroyed.
- * 4. Concurrent creation of temporary senders is thread-safe.
+ * 2. Sender completion preserves queued values for the receiver to drain.
+ * 3. Receiver abandonment closes the channel and releases queued values.
+ * 4. Moving a receiver transfers its single-consumer ownership.
+ * 5. Concurrent sender activity and receiver closure are thread-safe.
  */
 
 #include <atomic>
-#include <chrono>
 #include <memory>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "catch.hpp"
 #include "test_common.hpp"
+#include "duckdb/execution/distributed/plan/distributed_physical_plan.hpp"
 #include "duckdb/execution/distributed/utils/channel.hpp"
 
 using namespace duckdb::distributed;
 using namespace duckdb::distributed::testing;
+
+static_assert(!std::is_copy_constructible<UnboundedReceiver<int>>::value,
+              "unbounded channels must have exactly one receiver owner");
+static_assert(!std::is_copy_assignable<UnboundedReceiver<int>>::value,
+              "unbounded channels must have exactly one receiver owner");
+static_assert(std::is_nothrow_move_assignable<UnboundedReceiver<int>>::value,
+              "replacing an unbounded receiver must not throw");
+static_assert(std::is_nothrow_destructible<UnboundedReceiver<int>>::value,
+              "destroying an unbounded receiver must not throw");
+static_assert(noexcept(std::declval<UnboundedReceiver<int> &>().close()),
+              "closing an unbounded receiver must not throw");
 
 //==============================================================================
 // Section 1: UnboundedSender temporary lifecycle tests
@@ -153,6 +165,112 @@ TEST_CASE("Streaming channel: channel closes only when all senders drop", "[dist
 	REQUIRE(values[1] == 2);
 	REQUIRE(values[2] == 3);
 	REQUIRE(values[3] == 4);
+}
+
+//==============================================================================
+// Section 2: UnboundedReceiver lifecycle tests
+//==============================================================================
+
+TEST_CASE("Streaming channel: dropping receiver closes channel and rejects sends", "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<int>();
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	auto state = sender.state();
+
+	{ auto dropped_receiver = std::move(receiver); }
+
+	REQUIRE(state->is_closed());
+	REQUIRE(state->is_empty());
+	REQUIRE(sender.send(42).is_err());
+}
+
+TEST_CASE("Streaming channel: closing receiver releases queued values", "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<std::shared_ptr<int>>();
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	auto state = sender.state();
+	auto payload = std::make_shared<int>(42);
+	std::weak_ptr<int> payload_lifetime = payload;
+
+	REQUIRE(sender.send(std::move(payload)).is_ok());
+	REQUIRE_FALSE(payload_lifetime.expired());
+
+	receiver.close();
+	receiver.close();
+
+	REQUIRE(state->is_closed());
+	REQUIRE(state->is_empty());
+	REQUIRE(payload_lifetime.expired());
+	REQUIRE(sender.send(std::make_shared<int>(43)).is_err());
+}
+
+TEST_CASE("Streaming channel: moving receiver transfers channel ownership", "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<int>();
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	auto moved_receiver = std::move(receiver);
+
+	REQUIRE(sender.send(42).is_ok());
+	auto item = moved_receiver.recv();
+	REQUIRE(item.first);
+	REQUIRE(item.second == 42);
+}
+
+TEST_CASE("Streaming channel: receiver move assignment closes replaced channel", "[distributed][streaming_channel]") {
+	auto old_pair = create_unbounded_channel<int>();
+	auto old_sender = std::move(old_pair.first);
+	auto old_receiver = std::move(old_pair.second);
+	auto replacement_pair = create_unbounded_channel<int>();
+	auto replacement_sender = std::move(replacement_pair.first);
+	auto replacement_receiver = std::move(replacement_pair.second);
+
+	old_receiver = std::move(replacement_receiver);
+
+	REQUIRE(old_sender.send(1).is_err());
+	REQUIRE(replacement_sender.send(2).is_ok());
+	auto item = old_receiver.recv();
+	REQUIRE(item.first);
+	REQUIRE(item.second == 2);
+}
+
+TEST_CASE("Streaming channel: dropping plan result stream disconnects result receiver",
+          "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<MaterializedOutput>();
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+
+	{ PlanResultStream stream(nullptr, std::move(receiver)); }
+
+	REQUIRE(sender.send(MaterializedOutput()).is_err());
+}
+
+TEST_CASE("Streaming channel: receiver close races safely with active sender", "[distributed][streaming_channel]") {
+	for (idx_t iteration = 0; iteration < 64; iteration++) {
+		auto ch_pair_ = create_unbounded_channel<int>();
+		auto sender = std::move(ch_pair_.first);
+		auto receiver = std::move(ch_pair_.second);
+		auto state = sender.state();
+		std::atomic<bool> start {false};
+
+		std::thread producer([concurrent_sender = sender.clone(), &start]() mutable {
+			while (!start.load(std::memory_order_acquire)) {
+				std::this_thread::yield();
+			}
+			for (idx_t value = 0; value < 128; value++) {
+				if (concurrent_sender.send(static_cast<int>(value)).is_err()) {
+					break;
+				}
+			}
+		});
+
+		start.store(true, std::memory_order_release);
+		receiver.close();
+		producer.join();
+
+		REQUIRE(state->is_closed());
+		REQUIRE(state->is_empty());
+		REQUIRE(sender.send(42).is_err());
+	}
 }
 
 //==============================================================================

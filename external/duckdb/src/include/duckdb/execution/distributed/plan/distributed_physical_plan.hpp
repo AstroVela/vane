@@ -93,14 +93,14 @@ public:
 	}
 
 	~PlanResultStream() {
-		// Close the channel so background plan tasks
-		// detect send() failure and exit on their own. We intentionally do not
+		// Disconnect the receiver so background plan tasks detect send() failure
+		// and queued outputs are released. We intentionally do not
 		// wait here because the destructor may run on the Python asyncio event-loop
 		// thread (during coroutine-frame GC).
 		// Waiting for control tasks here would block the event loop and prevent
 		// Ray from delivering the final result back to the client. Each detached
 		// task retains the ClientContext and status until it finishes naturally.
-		receiver_ = UnboundedReceiver<MaterializedOutput>();
+		receiver_.close();
 	}
 
 	PlanResultStream(PlanResultStream &&) = default;

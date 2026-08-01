@@ -358,10 +358,35 @@ public:
 		return std::make_pair(true, std::move(value));
 	}
 
-	/// Close the channel
+	/// Close the channel to new sends while preserving queued values for the receiver.
 	void close() {
 		std::lock_guard<std::mutex> lock(mutex_);
 		closed_ = true;
+		not_empty_.notify_all();
+	}
+
+	/// Disconnect the receiver and release queued values that can no longer be consumed.
+	void disconnect_receiver() noexcept {
+		try {
+			std::queue<T> abandoned;
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				closed_ = true;
+				queue_.swap(abandoned);
+			}
+		} catch (...) {
+			// Receiver cleanup runs from noexcept move/destruction paths. If allocating
+			// the temporary queue fails, close and drain in place as a best effort.
+			try {
+				std::lock_guard<std::mutex> lock(mutex_);
+				closed_ = true;
+				while (!queue_.empty()) {
+					queue_.pop();
+				}
+			} catch (...) {
+				// No safe cleanup remains if locking or in-place destruction also fails.
+			}
+		}
 		not_empty_.notify_all();
 	}
 
@@ -460,6 +485,34 @@ public:
 	UnboundedReceiver() = default;
 
 	explicit UnboundedReceiver(std::shared_ptr<UnboundedChannelState<T>> state) : state_(std::move(state)) {
+	}
+
+	// Move-only receiver semantics (tokio::mpsc-style single receiver).
+	UnboundedReceiver(const UnboundedReceiver &) = delete;
+	UnboundedReceiver &operator=(const UnboundedReceiver &) = delete;
+
+	UnboundedReceiver(UnboundedReceiver &&other) noexcept : state_(std::move(other.state_)) {
+	}
+
+	UnboundedReceiver &operator=(UnboundedReceiver &&other) noexcept {
+		if (this != &other) {
+			close();
+			state_ = std::move(other.state_);
+		}
+		return *this;
+	}
+
+	~UnboundedReceiver() noexcept {
+		close();
+	}
+
+	/// Close the receive side and discard values that no consumer can observe.
+	void close() noexcept {
+		if (!state_) {
+			return;
+		}
+		auto state = std::move(state_);
+		state->disconnect_receiver();
 	}
 
 	/// Receive a value (blocking)
