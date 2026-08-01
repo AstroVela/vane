@@ -1548,6 +1548,7 @@ class FteFragmentExecution:
             attempt_id=scheduled.attempt_id,
             partition_id=partition.task_id.partition_id,
             request=scheduled.request,
+            scheduled_attempt=scheduled,
         )
         self._record_worker_command(command)
         return scheduled

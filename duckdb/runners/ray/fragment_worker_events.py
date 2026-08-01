@@ -100,11 +100,9 @@ class FteWorkerEventHandlingMixin:
                     continue
                 fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get((query_id, fragment_id))
             if fragment_execution is not None:
-                try:
-                    self._execute_fte_fragment_execution_outbox(fragment_execution)
-                except FteWorkerControlFailure as exc:
-                    handles.extend(self._handles_for_fte_worker_control_failure(exc))
-                    continue
+                dispatch = self._execute_fte_fragment_execution_outbox(fragment_execution)
+                handles.extend(dispatch.recovery_handles)
+                scheduled_attempts = list(dispatch.scheduled_attempts)
             handles.extend(
                 self._handles_for_fte_scheduled_attempts(
                     query_id,
@@ -200,17 +198,18 @@ class FteWorkerEventHandlingMixin:
                     finally:
                         request_fte_pending_task_drain()
                 return []
-            self._execute_fte_fragment_execution_worker_commands(
+            dispatch = self._execute_fte_fragment_execution_worker_commands(
                 fragment_execution,
                 worker_commands,
             )
-            handles = self._handles_for_fte_scheduled_attempts(
-                event.query_id,
-                str(event.fragment_id),
-                [scheduled],
+            handles = list(dispatch.recovery_handles)
+            handles.extend(
+                self._handles_for_fte_scheduled_attempts(
+                    event.query_id,
+                    str(event.fragment_id),
+                    list(dispatch.scheduled_attempts),
+                )
             )
-        except FteWorkerControlFailure as exc:
-            return self._handles_for_fte_worker_control_failure(exc)
         except FteWorkerReservationUnavailable:
             return request_fte_pending_task_drain()
         except Exception:
@@ -254,16 +253,15 @@ class FteWorkerEventHandlingMixin:
             with _FTE_REGISTRY_LOCK:
                 closing = query_id in _FTE_CLOSING_QUERIES
             if not closing and scheduled is not None:
-                self._execute_fte_fragment_execution_outbox(fragment_execution)
+                dispatch = self._execute_fte_fragment_execution_outbox(fragment_execution)
+                handles.extend(dispatch.recovery_handles)
                 handles.extend(
                     self._handles_for_fte_scheduled_attempts(
                         query_id,
                         fragment_id,
-                        [scheduled],
+                        list(dispatch.scheduled_attempts),
                     )
                 )
-        except FteWorkerControlFailure as exc:
-            handles.extend(self._handles_for_fte_worker_control_failure(exc))
         except Exception:
             with _FTE_REGISTRY_LOCK:
                 if query_id not in _FTE_CLOSING_QUERIES:
@@ -305,19 +303,21 @@ class FteWorkerEventHandlingMixin:
                 partition,
                 fragment_execution=fragment_execution,
             )
-        try:
-            scheduled_result = fragment_execution.apply_assignment_result(result)
-            with _FTE_REGISTRY_LOCK:
-                if query_id in _FTE_CLOSING_QUERIES:
-                    return []
-            scheduled = self._execute_fte_fragment_execution_mutation_result(fragment_execution, scheduled_result)
-        except FteWorkerControlFailure as exc:
-            return self._handles_for_fte_worker_control_failure(exc)
+        scheduled_result = fragment_execution.apply_assignment_result(result)
+        with _FTE_REGISTRY_LOCK:
+            if query_id in _FTE_CLOSING_QUERIES:
+                return []
+        dispatch = self._execute_fte_fragment_execution_mutation_result(fragment_execution, scheduled_result)
 
-        handles = self._handles_for_fte_scheduled_attempts(
-            query_id,
-            fragment_id,
-            scheduled,
+        handles = list(dispatch.recovery_handles)
+        if dispatch.query_closed:
+            return handles
+        handles.extend(
+            self._handles_for_fte_scheduled_attempts(
+                query_id,
+                fragment_id,
+                list(dispatch.scheduled_attempts),
+            )
         )
         if selector_snapshot.final:
             with _FTE_REGISTRY_LOCK:
