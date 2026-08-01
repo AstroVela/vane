@@ -908,6 +908,182 @@ def test_fte_task_execution_terminal_status_refreshes_split_stats_with_fallback(
 
 
 @pytest.mark.parametrize(
+    ("dynamic_source_field", "queue_attribute", "source_node_id", "split_kind"),
+    [
+        ("dynamic_scan_source_node_ids", "dynamic_scan_source_queues", "7", "scan_task"),
+        (
+            "dynamic_exchange_source_node_ids",
+            "dynamic_exchange_source_queues",
+            "9",
+            "exchange_source_task",
+        ),
+    ],
+)
+def test_fte_task_execution_dynamic_split_payloads_are_queue_owned(
+    dynamic_source_field,
+    queue_attribute,
+    source_node_id,
+    split_kind,
+):
+    async def execute_fn(_request):
+        return None
+
+    initial_payload = b"initial-payload" * 1024
+    added_payload = b"added-payload" * 1024
+    execution = FteTaskExecution(
+        {
+            "task_id": f"q-dynamic-payload.0.{source_node_id}.0",
+            dynamic_source_field: [source_node_id],
+            "initial_splits": {
+                source_node_id: [
+                    {
+                        "sequence_id": 0,
+                        "kind": split_kind,
+                        "data": initial_payload,
+                    }
+                ],
+            },
+        },
+        execute_fn,
+        default_task_memory_bytes=1,
+    )
+
+    queue = getattr(execution, queue_attribute)[source_node_id]
+    assert execution.initial_splits == {}
+    assert execution.request["initial_splits"] == {}
+    assert execution.seen_sequences == {source_node_id: {0}}
+    assert execution.info()["initial_split_counts"] == {}
+
+    execution.add_splits(
+        source_node_id,
+        [{"sequence_id": 1, "kind": split_kind, "data": added_payload}],
+    )
+
+    assert execution.initial_splits == {}
+    assert execution.request["initial_splits"] == {}
+    assert execution.seen_sequences == {source_node_id: {0, 1}}
+    assert queue.buffered_splits() == 2
+    assert queue.buffered_bytes() == len(initial_payload) + len(added_payload)
+    status = execution.split_queue_status()
+    assert status["submitted_split_count"] == 2
+    assert status["submitted_split_count_by_source"] == {source_node_id: 2}
+
+    assert queue.try_get_next()["data"] == initial_payload
+    assert queue.try_get_next()["data"] == added_payload
+    assert queue.buffered_splits() == 0
+    assert queue.buffered_bytes() == 0
+
+    duplicate_status = execution.add_splits(
+        source_node_id,
+        [{"sequence_id": 1, "kind": split_kind, "data": b"duplicate"}],
+    )
+    assert duplicate_status.duplicate_split_count == 1
+    assert queue.try_get_next() == {"state": "BLOCKED"}
+    assert execution.initial_splits == {}
+
+
+@pytest.mark.parametrize(
+    ("dynamic_source_field", "queue_attribute", "source_node_id", "split_kind"),
+    [
+        ("dynamic_scan_source_node_ids", "dynamic_scan_source_queues", "7", "scan_task"),
+        (
+            "dynamic_exchange_source_node_ids",
+            "dynamic_exchange_source_queues",
+            "9",
+            "exchange_source_task",
+        ),
+    ],
+)
+def test_fte_task_execution_dynamic_source_update_transfers_and_releases_retained_splits(
+    dynamic_source_field,
+    queue_attribute,
+    source_node_id,
+    split_kind,
+):
+    async def execute_fn(_request):
+        return None
+
+    execution = FteTaskExecution(
+        {
+            "task_id": "q-dynamic-update.0.0.0",
+            "initial_splits": {
+                source_node_id: [
+                    {
+                        "sequence_id": 0,
+                        "kind": split_kind,
+                        "data": b"retained-before-update",
+                    }
+                ],
+            },
+        },
+        execute_fn,
+        default_task_memory_bytes=1,
+    )
+    assert [split.data for split in execution.initial_splits[source_node_id]] == [b"retained-before-update"]
+
+    execution.update_task(
+        {
+            dynamic_source_field: [source_node_id],
+            "initial_splits": {
+                source_node_id: [
+                    {
+                        "sequence_id": 1,
+                        "kind": split_kind,
+                        "data": b"added-with-update",
+                    }
+                ],
+            },
+        }
+    )
+
+    queue = getattr(execution, queue_attribute)[source_node_id]
+    assert execution.initial_splits == {}
+    assert execution.request["initial_splits"] == {}
+    assert execution.seen_sequences == {source_node_id: {0, 1}}
+    assert execution.info()["initial_split_counts"] == {}
+    assert queue.buffered_splits() == 2
+    assert queue.try_get_next()["data"] == b"retained-before-update"
+    assert queue.try_get_next()["data"] == b"added-with-update"
+
+    duplicate_status = execution.update_task(
+        {
+            "initial_splits": {
+                source_node_id: [
+                    {
+                        "sequence_id": 1,
+                        "kind": split_kind,
+                        "data": b"duplicate",
+                    }
+                ],
+            },
+        }
+    )
+    assert duplicate_status.duplicate_split_count == 1
+    assert queue.try_get_next() == {"state": "BLOCKED"}
+    assert execution.initial_splits == {}
+
+
+def test_fte_task_execution_empty_split_batch_only_registers_static_source():
+    async def execute_fn(_request):
+        return None
+
+    execution = FteTaskExecution(
+        {
+            "task_id": "q-empty-splits.0.0.0",
+            "dynamic_scan_source_node_ids": ["dynamic"],
+        },
+        execute_fn,
+        default_task_memory_bytes=1,
+    )
+
+    execution.add_splits("static", [])
+    execution.add_splits("dynamic", [])
+
+    assert execution.initial_splits == {"static": []}
+    assert execution.seen_sequences == {"static": set(), "dynamic": set()}
+
+
+@pytest.mark.parametrize(
     "terminal_state",
     [
         FteTaskState.FINISHED,

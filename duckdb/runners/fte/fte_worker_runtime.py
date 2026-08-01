@@ -335,6 +335,7 @@ class FteTaskExecution:
         self.seen_sequences: dict[str, set[int]] = {
             source_id: {split.sequence_id for split in splits} for source_id, splits in self.initial_splits.items()
         }
+        self._discard_dynamic_initial_splits()
         self.status = TaskStatus(self.task_id, FteTaskState.PLANNED)
         self._last_split_queue_status: dict[str, Any] = {}
         self.result: Any = None
@@ -388,6 +389,32 @@ class FteTaskExecution:
             queue.add_exchange_source_split(data)
         else:
             raise ValueError(f"unsupported dynamic split kind: {expected_kind}")
+
+    def _store_accepted_split(self, source_node_id: str, split: FteSplit) -> None:
+        scan_queue = self.dynamic_scan_source_queues.get(source_node_id)
+        exchange_queue = self.dynamic_exchange_source_queues.get(source_node_id)
+        if scan_queue is None and exchange_queue is None:
+            self.initial_splits.setdefault(source_node_id, []).append(split)
+            return
+        if scan_queue is not None:
+            self._add_split_to_dynamic_queue(scan_queue, split, "scan_task")
+        if exchange_queue is not None:
+            self._add_split_to_dynamic_queue(exchange_queue, split, "exchange_source_task")
+
+    def _register_static_split_source(self, source_node_id: str) -> None:
+        if (
+            source_node_id not in self.dynamic_scan_source_queues
+            and source_node_id not in self.dynamic_exchange_source_queues
+        ):
+            self.initial_splits.setdefault(source_node_id, [])
+
+    def _discard_dynamic_initial_splits(self) -> None:
+        dynamic_sources = self.dynamic_scan_source_ids | self.dynamic_exchange_source_ids
+        if not dynamic_sources:
+            return
+        for source_id in dynamic_sources:
+            self.initial_splits.pop(source_id, None)
+        self._refresh_request_splits()
 
     def _transition(
         self,
@@ -467,9 +494,7 @@ class FteTaskExecution:
             **self.dynamic_exchange_source_queues,
         }
         submitted_by_source = {
-            source_id: int(queues_by_source[source_id].submitted_splits())
-            for source_id in sorted(self.initial_splits)
-            if source_id in queues_by_source
+            source_id: int(queue.submitted_splits()) for source_id, queue in sorted(queues_by_source.items())
         }
         buffered_by_source = {
             source_id: int(queue.buffered_splits()) for source_id, queue in sorted(queues_by_source.items())
@@ -820,21 +845,15 @@ class FteTaskExecution:
             if source_node_id in self.no_more_split_sources:
                 raise RuntimeError(f"source {source_node_id} is already marked no_more_splits")
             seen = self.seen_sequences.setdefault(source_node_id, set())
-            target = self.initial_splits.setdefault(source_node_id, [])
+            self._register_static_split_source(source_node_id)
             added = False
             for payload in splits:
                 split = FteSplit.from_dict(source_node_id, payload)
                 if split.sequence_id in seen:
                     self.status.duplicate_split_count += 1
                     continue
+                self._store_accepted_split(source_node_id, split)
                 seen.add(split.sequence_id)
-                target.append(split)
-                scan_queue = self.dynamic_scan_source_queues.get(source_node_id)
-                if scan_queue is not None:
-                    self._add_split_to_dynamic_queue(scan_queue, split, "scan_task")
-                exchange_queue = self.dynamic_exchange_source_queues.get(source_node_id)
-                if exchange_queue is not None:
-                    self._add_split_to_dynamic_queue(exchange_queue, split, "exchange_source_task")
                 added = True
             if added:
                 self.status.version += 1
@@ -885,20 +904,14 @@ class FteTaskExecution:
         if source_node_id in self.no_more_split_sources and splits:
             raise RuntimeError(f"source {source_node_id} is already marked no_more_splits")
         seen = self.seen_sequences.setdefault(source_node_id, set())
-        target = self.initial_splits.setdefault(source_node_id, [])
+        self._register_static_split_source(source_node_id)
         added = False
         for split in splits:
             if split.sequence_id in seen:
                 self.status.duplicate_split_count += 1
                 continue
+            self._store_accepted_split(source_node_id, split)
             seen.add(split.sequence_id)
-            target.append(split)
-            scan_queue = self.dynamic_scan_source_queues.get(source_node_id)
-            if scan_queue is not None:
-                self._add_split_to_dynamic_queue(scan_queue, split, "scan_task")
-            exchange_queue = self.dynamic_exchange_source_queues.get(source_node_id)
-            if exchange_queue is not None:
-                self._add_split_to_dynamic_queue(exchange_queue, split, "exchange_source_task")
             added = True
         return added
 
@@ -934,12 +947,14 @@ class FteTaskExecution:
             if merged_source_node_ids != current:
                 self.request["source_node_ids"] = sorted(merged_source_node_ids)
                 changed = True
+        dynamic_sources_changed = False
         if update_request.dynamic_scan_source_node_ids:
             merged_scan_source_ids = self.dynamic_scan_source_ids | set(update_request.dynamic_scan_source_node_ids)
             if merged_scan_source_ids != self.dynamic_scan_source_ids:
                 self.dynamic_scan_source_ids = merged_scan_source_ids
                 self._add_dynamic_source_queues("scan_task", merged_scan_source_ids)
                 self.request["dynamic_scan_source_node_ids"] = sorted(merged_scan_source_ids)
+                dynamic_sources_changed = True
                 changed = True
         if update_request.dynamic_exchange_source_node_ids:
             merged_exchange_source_ids = self.dynamic_exchange_source_ids | set(
@@ -949,7 +964,11 @@ class FteTaskExecution:
                 self.dynamic_exchange_source_ids = merged_exchange_source_ids
                 self._add_dynamic_source_queues("exchange_source_task", merged_exchange_source_ids)
                 self.request["dynamic_exchange_source_node_ids"] = sorted(merged_exchange_source_ids)
+                dynamic_sources_changed = True
                 changed = True
+
+        if dynamic_sources_changed:
+            self._discard_dynamic_initial_splits()
 
         for source_id, splits in update_request.initial_splits.items():
             changed = self._append_update_splits(source_id, list(splits)) or changed
