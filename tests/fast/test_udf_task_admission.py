@@ -1166,9 +1166,9 @@ def test_exhausted_completion_callbacks_do_not_block_control_state(monkeypatch):
         callback_executor,
     )
     all_callback_workers_blocked = threading.Event()
-    all_callbacks_ran = threading.Event()
     release_callbacks = threading.Event()
     state_callback_ran = threading.Event()
+    dropped_abandonment_ran = threading.Event()
     entered_lock = threading.Lock()
     entered = 0
 
@@ -1178,16 +1178,36 @@ def test_exhausted_completion_callbacks_do_not_block_control_state(monkeypatch):
             entered += 1
             if entered == 2:
                 all_callback_workers_blocked.set()
-            if entered == 3:
-                all_callbacks_ran.set()
         assert release_callbacks.wait(timeout=5.0)
 
-    for index in range(3):
+    for index in range(2):
         ray_control_submission.dispatch_ray_control_abandonment(
             f"owner:blocked-abandonment:{index}",
             blocked_callback,
         )
     assert all_callback_workers_blocked.wait(timeout=1.0)
+    stalled_deadline = time.monotonic() + 1.0
+    while time.monotonic() < stalled_deadline:
+        with callback_executor._condition:
+            if callback_executor._stalled_worker_count_locked() > 1:
+                break
+        time.sleep(0.005)
+    else:
+        raise AssertionError("completion callback capacity was not exhausted")
+
+    class _DroppedAbandonment:
+        def cancel(self):
+            dropped_abandonment_ran.set()
+
+    dropped_abandonment = _DroppedAbandonment()
+    dropped_ref = weakref.ref(dropped_abandonment)
+    ray_control_submission.dispatch_ray_control_abandonment(
+        "owner:dropped-abandonment",
+        dropped_abandonment.cancel,
+    )
+    del dropped_abandonment
+    gc.collect()
+    assert dropped_ref() is None
 
     state_call = ray_control_submission.create_ray_control_deadline(
         "owner:state-beside-exhausted-completions",
@@ -1201,7 +1221,7 @@ def test_exhausted_completion_callbacks_do_not_block_control_state(monkeypatch):
             assert len(callback_executor._workers) <= 2
     finally:
         release_callbacks.set()
-    assert all_callbacks_ran.wait(timeout=1.0)
+    assert dropped_abandonment_ran.is_set() is False
     completion_deadline = time.monotonic() + 1.0
     while callback_executor._workers and time.monotonic() < completion_deadline:
         time.sleep(0.005)

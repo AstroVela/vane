@@ -561,6 +561,7 @@ def _dispatch_ray_control_callback(
     callback: Callable[[], None],
     *,
     still_owned: Callable[[], bool] = lambda: True,
+    retry_rejected: bool = True,
     retry_delay_s: float = _RAY_CONTROL_CALLBACK_RETRY_INITIAL_DELAY_S,
 ) -> None:
     """Hand one callback to its isolated, bounded ownership domain."""
@@ -591,6 +592,7 @@ def _dispatch_ray_control_callback(
                 owner_scope,
                 callback,
                 still_owned=still_owned,
+                retry_rejected=retry_rejected,
                 retry_delay_s=next_retry_delay,
             )
         )
@@ -605,7 +607,11 @@ def _dispatch_ray_control_callback(
             invoke,
         )
     except BaseException:
-        retry_dispatch()
+        if retry_rejected:
+            retry_dispatch()
+        return
+
+    if not retry_rejected:
         return
 
     def resubmit_rejected_dispatch(done: Future[Any]) -> None:
@@ -647,7 +653,12 @@ def dispatch_ray_control_abandonment(
     owner_scope: str,
     callback: Callable[[], None],
 ) -> None:
-    """Run potentially blocking best-effort abandonment off state workers."""
+    """Attempt blocking abandonment once, off state workers.
+
+    The caller has already published durable remote cleanup ownership, so an
+    exhausted completion domain drops this local optimization instead of
+    retaining an unbounded retry chain.
+    """
     owner_key = str(owner_scope or "").strip()
     if not owner_key:
         raise ValueError("Ray control abandonment requires an explicit owner scope")
@@ -657,6 +668,7 @@ def dispatch_ray_control_abandonment(
         _RAY_CONTROL_COMPLETION_CALLBACK_EXECUTOR,
         f"{owner_key}:abandonment",
         callback,
+        retry_rejected=False,
     )
 
 
