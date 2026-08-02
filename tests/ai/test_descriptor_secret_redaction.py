@@ -5,7 +5,7 @@
 
 Covers vane#105: descriptors must never expose API keys through repr, str,
 logging, exception rendering, or pickled copies, while ``instantiate()`` (and
-the OpenAI dimension probe / native vLLM executor) still hands the real
+the native vLLM executor) still hands the real
 plaintext to the SDK client or execution boundary.
 """
 
@@ -44,7 +44,7 @@ def _openai_embedder_descriptor():
         provider_options={"api_key": API_KEY, "organization": ORGANIZATION, "base_url": "https://api.example"},
         model_name="text-embedding-3-small",
         dimensions=512,
-        embed_options={"batch_size": 32, "auth_token": API_KEY},
+        embed_options={"encoding_format": "base64"},
     )
 
 
@@ -77,7 +77,7 @@ def _google_embedder_descriptor():
     return GoogleTextEmbedderDescriptor(
         provider_options={"api_key": API_KEY},
         model_name="gemini-embedding-001",
-        embed_options={"task_type": "RETRIEVAL_QUERY", "auth_token": API_KEY},
+        embed_options={"task_type": "RETRIEVAL_QUERY"},
     )
 
 
@@ -109,7 +109,7 @@ def _transformers_embedder_descriptor():
 
     return TransformersTextEmbedderDescriptor(
         model="sentence-transformers/all-MiniLM-L6-v2",
-        embed_options={"batch_size": 8, "revision": "pinned", "token": HUB_TOKEN},
+        embed_options={"revision": "pinned"},
     )
 
 
@@ -129,7 +129,6 @@ ALL_DESCRIPTOR_FACTORIES = [
     pytest.param(_google_embedder_descriptor, id="google-embedder"),
     pytest.param(_google_prompter_descriptor, id="google-prompter"),
     pytest.param(_vllm_prompter_descriptor, id="vllm-prompter"),
-    pytest.param(_transformers_embedder_descriptor, id="transformers-embedder"),
     pytest.param(_transformers_classifier_descriptor, id="transformers-classifier"),
 ]
 
@@ -212,15 +211,14 @@ class TestDescriptorReprRedaction:
         assert isinstance(descriptor.prompt_options["auth_token"], Secret)
         assert descriptor.prompt_options["temperature"] == 0.3
 
-    def test_credential_kwarg_landing_in_embed_options_is_redacted(self):
+    def test_credential_kwarg_cannot_land_in_embed_options(self):
         from vane.ai.providers.google import GoogleProvider
 
-        descriptor = GoogleProvider(api_key=API_KEY).get_text_embedder(
-            model="gemini-embedding-001", auth_token=API_KEY, task_type="RETRIEVAL_QUERY"
-        )
-        assert API_KEY not in repr(descriptor)
-        assert isinstance(descriptor.embed_options["auth_token"], Secret)
-        assert descriptor.embed_options["task_type"] == "RETRIEVAL_QUERY"
+        with pytest.raises(TypeError, match="auth_token") as exc_info:
+            GoogleProvider(api_key=API_KEY).get_text_embedder(
+                model="gemini-embedding-001", auth_token=API_KEY, task_type="RETRIEVAL_QUERY"
+            )
+        assert API_KEY not in str(exc_info.value)
 
     def test_vllm_nested_engine_and_generate_args_are_redacted(self):
         descriptor = _vllm_prompter_descriptor()
@@ -230,11 +228,15 @@ class TestDescriptorReprRedaction:
         assert isinstance(descriptor.vllm_options["engine_args"]["hf_token"], Secret)
         assert isinstance(descriptor.vllm_options["generate_args"]["api_key"], Secret)
 
-    def test_transformers_hub_token_is_redacted(self):
-        descriptor = _transformers_embedder_descriptor()
-        assert HUB_TOKEN not in repr(descriptor)
-        assert isinstance(descriptor.embed_options["token"], Secret)
-        assert descriptor.embed_options["revision"] == "pinned"
+    def test_transformers_embedder_rejects_hub_token(self):
+        from vane.ai.providers.transformers import TransformersTextEmbedderDescriptor
+
+        with pytest.raises(TypeError, match="token") as exc_info:
+            TransformersTextEmbedderDescriptor(
+                model="sentence-transformers/all-MiniLM-L6-v2",
+                embed_options={"revision": "pinned", "token": HUB_TOKEN},
+            )
+        assert HUB_TOKEN not in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +321,14 @@ class TestUnwrapAtExecutionBoundary:
         client = _fresh_recording_client()
         _install_fake_openai(monkeypatch, client)
         _openai_embedder_descriptor().instantiate()
-        assert client.calls == [{"api_key": API_KEY, "organization": ORGANIZATION, "base_url": "https://api.example"}]
+        assert client.calls == [
+            {
+                "api_key": API_KEY,
+                "organization": ORGANIZATION,
+                "base_url": "https://api.example",
+                "max_retries": 0,
+            }
+        ]
 
     def test_openai_prompter_client_receives_plaintext_and_options_are_unwrapped(self, monkeypatch):
         client = _fresh_recording_client()
@@ -329,7 +338,7 @@ class TestUnwrapAtExecutionBoundary:
         # prompt-time options forwarded to the SDK must be plain again
         assert prompter._options == {"temperature": 0.5, "auth_token": API_KEY}
 
-    def test_openai_get_dimensions_probe_receives_plaintext(self, monkeypatch):
+    def test_openai_unknown_dimensions_do_not_probe_with_plaintext(self, monkeypatch):
         from vane.ai.providers.openai import OpenAITextEmbedderDescriptor
 
         probe_calls = []
@@ -346,8 +355,9 @@ class TestUnwrapAtExecutionBoundary:
             provider_options={"api_key": API_KEY, "base_url": "https://api.example"},
             model_name="custom-served-model",
         )
-        assert descriptor.get_dimensions().size == 7
-        assert probe_calls == [{"api_key": API_KEY, "base_url": "https://api.example"}]
+        with pytest.raises(ValueError, match="pass dimensions"):
+            descriptor.get_dimensions()
+        assert probe_calls == []
 
     def test_anthropic_client_receives_plaintext(self, monkeypatch):
         client = _fresh_recording_client()
@@ -377,7 +387,7 @@ class TestUnwrapAtExecutionBoundary:
         assert options["generate_args"]["sampling_params"] == {"max_tokens": 64}
         assert options["use_threading"] is True
 
-    def test_transformers_get_dimensions_receives_plaintext_token(self, monkeypatch):
+    def test_transformers_get_dimensions_uses_static_metadata_without_loading_config(self, monkeypatch):
         auto_config_calls = []
 
         class FakeAutoConfig:
@@ -389,14 +399,9 @@ class TestUnwrapAtExecutionBoundary:
         monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoConfig=FakeAutoConfig))
         descriptor = _transformers_embedder_descriptor()
         assert descriptor.get_dimensions().size == 384
-        assert auto_config_calls == [
-            (
-                "sentence-transformers/all-MiniLM-L6-v2",
-                {"trust_remote_code": False, "revision": "pinned", "token": HUB_TOKEN},
-            )
-        ]
+        assert auto_config_calls == []
 
-    def test_transformers_embedder_model_receives_plaintext_token(self, monkeypatch):
+    def test_transformers_embedder_model_receives_registered_loading_options(self, monkeypatch):
         calls = []
 
         class FakeSentenceTransformer:
@@ -413,7 +418,7 @@ class TestUnwrapAtExecutionBoundary:
         assert calls == [
             (
                 "sentence-transformers/all-MiniLM-L6-v2",
-                {"trust_remote_code": False, "backend": "torch", "revision": "pinned", "token": HUB_TOKEN},
+                {"trust_remote_code": False, "backend": "torch", "revision": "pinned"},
             )
         ]
 
@@ -460,7 +465,14 @@ class TestPickleRoundTrip:
         _install_fake_openai(monkeypatch, client)
         restored = pickle.loads(pickle.dumps(_openai_embedder_descriptor()))
         restored.instantiate()
-        assert client.calls == [{"api_key": API_KEY, "organization": ORGANIZATION, "base_url": "https://api.example"}]
+        assert client.calls == [
+            {
+                "api_key": API_KEY,
+                "organization": ORGANIZATION,
+                "base_url": "https://api.example",
+                "max_retries": 0,
+            }
+        ]
 
     def test_anthropic_pickled_descriptor_still_builds_working_client(self, monkeypatch):
         client = _fresh_recording_client()

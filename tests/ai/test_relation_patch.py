@@ -12,6 +12,7 @@ import numpy as np
 import pyarrow as pa
 
 import duckdb
+import vane
 from vane.ai.protocols import (
     TextClassifierDescriptor,
     TextEmbedderDescriptor,
@@ -94,18 +95,19 @@ class MockProvider(Provider):
 
 
 class TestRelationPatch:
-    """Verify .embed_text() and .classify_text() work as relation methods."""
+    """Verify .embed() and .classify_text() work as relation methods."""
 
-    def test_embed_text_on_relation(self):
-        """rel.embed_text() produces embeddings."""
+    def test_embed_on_relation(self):
+        """rel.embed() preserves source columns and appends embeddings."""
         conn = duckdb.connect()
         rel = conn.sql("SELECT 'hello' AS text UNION ALL SELECT 'world' AS text")
 
-        result = rel.embed_text("text", provider=MockProvider())
+        result = rel.embed(vane.col("text"), provider=MockProvider())
         rows = result.fetchall()
         assert len(rows) == 2
         for row in rows:
-            assert len(row[0]) == 4
+            assert row[0] in {"hello", "world"}
+            assert len(row[1]) == 4
 
     def test_classify_text_on_relation(self):
         """rel.classify_text() produces labels."""
@@ -120,7 +122,8 @@ class TestRelationPatch:
 
     def test_methods_exist_on_relation(self):
         """DuckDBPyRelation has the patched methods."""
-        assert hasattr(duckdb.DuckDBPyRelation, "embed_text")
+        assert hasattr(duckdb.DuckDBPyRelation, "embed")
+        assert not hasattr(duckdb.DuckDBPyRelation, "embed_text")
         assert hasattr(duckdb.DuckDBPyRelation, "classify_text")
         assert hasattr(duckdb.DuckDBPyRelation, "prompt")
 
@@ -129,14 +132,14 @@ class TestRelationPatch:
         import vane.ai._relation_patch
 
         vane.ai._relation_patch._patch()
-        assert hasattr(duckdb.DuckDBPyRelation, "embed_text")
+        assert hasattr(duckdb.DuckDBPyRelation, "embed")
 
-    def test_embed_text_chaining(self):
-        """embed_text returns a relation that can be further queried."""
+    def test_embed_chaining(self):
+        """embed returns a relation that can be further queried."""
         conn = duckdb.connect()
         rel = conn.sql("SELECT 'test' AS text")
 
-        result = rel.embed_text("text", provider=MockProvider())
+        result = rel.embed(vane.col("text"), provider=MockProvider())
         # Should be queryable — count rows
         count = result.aggregate("count(*)").fetchone()
         assert count[0] == 1

@@ -107,14 +107,14 @@ def test_openai_embed_sql_real_provider() -> None:
     rows = conn.sql(f"""
         SELECT ai_embed(
             chunk,
-            struct_pack(
-                provider := 'openai',
-                model := {_sql_string(model)},
+            provider := 'openai',
+            model := {_sql_string(model)},
+            dimensions := {dimensions_sql},
+            options := struct_pack(
                 base_url := {"NULL" if not base_url else _sql_string(base_url)},
-                dimensions := {dimensions_sql},
                 encoding_format := 'float',
                 normalize := false,
-                concurrency := 1
+                actor_number := 1
             )
         ) AS embedding
         FROM (SELECT 'vector database retrieval' AS chunk)

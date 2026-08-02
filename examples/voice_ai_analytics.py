@@ -14,7 +14,7 @@ subtitle segments for later retrieval. This Vane version keeps the same shape:
 1. Build a relation of audio bytes from generated samples or local files.
 2. Apply a batch UDF that returns transcripts and timestamped segments.
 3. Produce summaries and subtitle rows.
-4. Embed subtitle text with ``vane.ai.embed_text``.
+4. Embed subtitle text with ``vane.ai.embed``.
 
 The default transcription backend is a deterministic placeholder so the
 example can run without downloading a speech model. Use
@@ -40,7 +40,7 @@ import pyarrow as pa
 
 import duckdb
 import vane
-from vane.ai import embed_text
+from vane.ai import embed
 
 DEFAULT_WHISPER_MODEL_ID = "deepdml/faster-whisper-large-v3-turbo-ct2"
 DEFAULT_EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
@@ -496,15 +496,6 @@ def subtitle_rows(table: pa.Table, *, translated_language: str) -> list[dict[str
     return rows
 
 
-def append_embedding(base: pa.Table, embedding_rel: Any) -> pa.Table:
-    embeddings = collect_relation(embedding_rel)
-    if base.num_rows != embeddings.num_rows:
-        raise RuntimeError(f"Embedding row count mismatch: {embeddings.num_rows} vs {base.num_rows}")
-    if "embedding" not in embeddings.column_names:
-        raise RuntimeError("Embedding output column was not returned.")
-    return base.append_column("embedding", embeddings["embedding"])
-
-
 def embedding_dims(value: Any) -> int:
     try:
         return len(value)
@@ -598,15 +589,15 @@ def run(args: argparse.Namespace) -> None:
         translated_language=args.translated_language,
     )
     subtitle_rel = relation_from_dicts(conn, subtitles)
-    embedded_only = embed_text(
+    embedded = embed(
         subtitle_rel,
-        "text",
+        vane.col("text"),
         provider="transformers",
         model=args.embedding_model_id,
         output_column="embedding",
         batch_size=args.embedding_batch_size,
     )
-    embedded_table = append_embedding(collect_relation(subtitle_rel), embedded_only)
+    embedded_table = collect_relation(embedded)
 
     output_dir = Path(args.output_dir)
     save_outputs(

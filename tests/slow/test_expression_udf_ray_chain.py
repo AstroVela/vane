@@ -451,12 +451,12 @@ try:
         embed_relation = con.sql(f'''
             SELECT chunk, ai_embed(
                 chunk,
-                struct_pack(
-                    provider := 'mock_ai_sql',
-                    model := 'ray-embedding-model',
-                    dimensions := 5,
+                provider := 'mock_ai_sql',
+                model := 'ray-embedding-model',
+                dimensions := 5,
+                options := struct_pack(
                     normalize := true,
-                    concurrency := 3,
+                    actor_number := 3,
                     batch_size := 2
                 )
             ) AS embedding
@@ -479,7 +479,10 @@ try:
         ]
         assert [len(vector) for _, vector in embedding_rows] == [5, 5, 5, 5]
         assert all(abs(float(np.linalg.norm(vector)) - 1.0) < 1e-6 for _, vector in embedding_rows)
-        print("AI_RAY_OPTIONS provider=mock_ai_sql model=ray-model dimensions=5 concurrency=3")
+        print(
+            "AI_RAY_OPTIONS provider=mock_ai_sql model=ray-model dimensions=5 "
+            "prompt_concurrency=3 embed_actor_number=3"
+        )
         print("AI_RAY_ACTOR_POOL 3")
 finally:
     runner.close()
@@ -499,7 +502,9 @@ finally:
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "AI_RAY_OPTIONS provider=mock_ai_sql model=ray-model dimensions=5 concurrency=3" in result.stdout
+    assert (
+        "AI_RAY_OPTIONS provider=mock_ai_sql model=ray-model dimensions=5 prompt_concurrency=3 embed_actor_number=3"
+    ) in result.stdout
     assert "AI_RAY_ACTOR_POOL 3" in result.stdout
 
 

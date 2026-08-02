@@ -31,16 +31,17 @@ class TestProviderLoading:
         provider = TransformersProvider()
         assert provider.name == "transformers"
 
-    def test_transformers_provider_merges_constructor_options(self):
+    def test_transformers_provider_keeps_only_registered_embed_options(self):
         from vane.ai.providers.transformers import TransformersProvider
 
-        provider = TransformersProvider(batch_size=16, max_retries=2)
+        provider = TransformersProvider(revision="pinned-revision")
 
-        embedder = provider.get_text_embedder(max_retries=4)
-        classifier = provider.get_text_classifier(on_error="ignore")
+        embedder = provider.get_text_embedder(device="cpu")
 
-        assert embedder.embed_options == {"batch_size": 16, "max_retries": 4}
-        assert classifier.classify_options == {"batch_size": 16, "max_retries": 2, "on_error": "ignore"}
+        assert embedder.embed_options == {"revision": "pinned-revision", "device": "cpu"}
+
+        with pytest.raises(TypeError, match="batch_size"):
+            TransformersProvider(batch_size=16).get_text_embedder()
 
     def test_load_openai_provider(self):
         from vane.ai.providers.openai import OpenAIProvider
@@ -69,7 +70,7 @@ class TestTransformersDescriptorPickle:
         desc = TransformersTextEmbedderDescriptor(
             model="sentence-transformers/all-MiniLM-L6-v2",
             dimensions=128,
-            embed_options={"batch_size": 32},
+            embed_options={"revision": "pinned-revision"},
         )
 
         # Pickle round-trip
@@ -109,7 +110,7 @@ class TestOpenAIDescriptorPickle:
             provider_options={"api_key": "test-key"},
             model_name="text-embedding-3-small",
             dimensions=512,
-            embed_options={"batch_size": 32},
+            embed_options={"encoding_format": "base64"},
         )
 
         data = pickle.dumps(desc)
@@ -174,22 +175,24 @@ class TestDescriptorAPI:
 
         desc = TransformersTextEmbedderDescriptor(
             model="test-model",
-            embed_options={"batch_size": 16, "max_retries": 5},
+            embed_options={"device": "cpu"},
         )
         opts = desc.get_udf_options()
-        assert opts.batch_size == 16
-        assert opts.max_retries == 5
+        assert opts.batch_size == 64
+        assert opts.max_retries == 3
+        assert opts.num_gpus == 0
 
     def test_udf_options_from_openai(self):
         from vane.ai.providers.openai import OpenAITextEmbedderDescriptor
 
         desc = OpenAITextEmbedderDescriptor(
             model_name="text-embedding-3-small",
-            embed_options={"batch_size": 128},
+            embed_options={"encoding_format": "float"},
         )
         opts = desc.get_udf_options()
-        assert opts.batch_size == 128
-        assert opts.max_retries == 0  # OpenAI client retries internally
+        assert opts.batch_size == 64
+        assert opts.max_retries == 3
+        assert opts.num_gpus == 0
 
     def test_embedding_dimensions_arrow_type(self):
         from vane.ai.typing import EmbeddingDimensions

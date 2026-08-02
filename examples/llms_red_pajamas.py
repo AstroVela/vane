@@ -14,7 +14,7 @@ low-scoring questions to related high-scoring questions.
 This Vane version keeps the same workflow:
 
 1. Load sample StackExchange-style questions, or the same S3 JSONL dataset.
-2. Embed question text with ``vane.ai.embed_text``.
+2. Embed question text with ``vane.ai.embed``.
 3. Compute cosine similarity between low-score and high-score questions.
 4. Print and optionally save the top matches.
 """
@@ -32,7 +32,7 @@ import pyarrow as pa
 
 import duckdb
 import vane
-from vane.ai import embed_text
+from vane.ai import embed
 
 DEFAULT_REDJAMA_PATH = "s3://daft-oss-public-data/redpajama-1t-sample/stackexchange_sample.jsonl"
 DEFAULT_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
@@ -189,15 +189,6 @@ def load_redpajama_relation(conn: Any, path: str, limit: int) -> Any:
     )
 
 
-def append_embedding(base: pa.Table, embedding_rel: Any) -> pa.Table:
-    embeddings = collect_relation(embedding_rel)
-    if base.num_rows != embeddings.num_rows:
-        raise RuntimeError(f"Embedding row count mismatch: {embeddings.num_rows} vs {base.num_rows}")
-    if "embedding" not in embeddings.column_names:
-        raise RuntimeError("Embedding output column was not returned.")
-    return base.append_column("embedding", embeddings["embedding"])
-
-
 def normalize_embedding(value: Any) -> np.ndarray:
     array = np.asarray(value, dtype=np.float32)
     norm = np.linalg.norm(array)
@@ -294,16 +285,16 @@ def run(args: argparse.Namespace) -> None:
             """,
         )
 
-    embedded_only = embed_text(
+    embedded = embed(
         rel,
-        "text",
+        vane.col("text"),
         provider="transformers",
         model=args.model_id,
         output_column="embedding",
         max_chunk_chars=args.max_chunk_chars,
         batch_size=args.batch_size,
     )
-    embedded_table = append_embedding(collect_relation(rel), embedded_only)
+    embedded_table = collect_relation(embedded)
 
     matches = semantic_matches(
         embedded_table,

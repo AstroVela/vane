@@ -111,7 +111,7 @@ class MockProvider(Provider):
         return "mock_ai_sql"
 
     def get_text_embedder(self, model: str | None = None, dimensions: int | None = None, **options: object):
-        actor_number = options.get("actor_number", options.get("concurrency"))
+        actor_number = options.get("actor_number")
         return MockTextEmbedderDescriptor(
             dim=dimensions or 4,
             actor_number=actor_number,
@@ -362,12 +362,12 @@ def test_ai_embed_fixed_dimensions_survive_round_trip():
     relation = source.sql("""
         SELECT ai_embed(
             chunk,
-            struct_pack(
-                provider := 'mock_ai_sql',
-                model := 'round-trip-embedding',
-                dimensions := 4,
+            provider := 'mock_ai_sql',
+            model := 'round-trip-embedding',
+            dimensions := 4,
+            options := struct_pack(
                 normalize := true,
-                concurrency := 1
+                actor_number := 1
             )
         ) AS embedding
         FROM (VALUES ('abc')) AS t(chunk)
@@ -573,7 +573,9 @@ def test_ai_prompt_sql_with_mock_provider():
             """
             ai_embed(
                 'abc',
-                struct_pack(provider := 'mock_ai_sql', dimensions := 4, concurrency := 1)
+                provider := 'mock_ai_sql',
+                dimensions := 4,
+                options := struct_pack(actor_number := 1)
             )
             """,
             [3.0, 3.0, 3.0, 3.0],
@@ -617,14 +619,22 @@ assert row == {expected_row!r}, row
     [
         "ai_prompt(NULL, struct_pack(provider := 'mock_ai_sql', concurrency := 1))",
         "ai_prompt(NULL::VARCHAR, struct_pack(provider := 'mock_ai_sql', concurrency := 1))",
-        "ai_embed(NULL, struct_pack(provider := 'mock_ai_sql', dimensions := 4, concurrency := 1))",
-        "ai_embed(NULL::VARCHAR, struct_pack(provider := 'mock_ai_sql', dimensions := 4, concurrency := 1))",
+        "ai_embed(NULL, provider := 'mock_ai_sql', dimensions := 4, options := struct_pack(actor_number := 1))",
+        "ai_embed(NULL::VARCHAR, provider := 'mock_ai_sql', dimensions := 4, options := struct_pack(actor_number := 1))",
         "ai_prompt('alpha', NULL)",
-        "ai_embed('abc', NULL)",
     ],
 )
-def test_ai_sql_text_signatures_preserve_legacy_null_propagation(monkeypatch, expression):
+def test_ai_sql_text_inputs_propagate_null_without_runtime_calls(monkeypatch, expression):
     provider_calls = []
+    embed_runtime_calls = []
+
+    original_embed = MockTextEmbedder.embed_text
+
+    def recording_embed(embedder, text):
+        embed_runtime_calls.append(list(text))
+        return original_embed(embedder, text)
+
+    monkeypatch.setattr(MockTextEmbedder, "embed_text", recording_embed)
 
     def recording_provider(name=None, **options):
         provider_calls.append((name, options))
@@ -634,8 +644,13 @@ def test_ai_sql_text_signatures_preserve_legacy_null_propagation(monkeypatch, ex
     monkeypatch.setitem(provider_registry.PROVIDERS, "openai", recording_provider)
     conn = vane.connect()
 
-    assert conn.sql(f"SELECT {expression} AS result").fetchall() == [(None,)]
-    assert provider_calls == []
+    relation = conn.sql(f"SELECT {expression} AS result")
+    if expression.startswith("ai_embed"):
+        assert [str(dtype) for dtype in relation.types] == ["FLOAT[4]"]
+    assert relation.fetchall() == [(None,)]
+    assert embed_runtime_calls == []
+    if not expression.startswith("ai_embed"):
+        assert provider_calls == []
 
 
 @pytest.mark.parametrize("null_prompt", ["NULL", "NULL::VARCHAR"])
@@ -872,7 +887,9 @@ def test_ai_embed_sql_with_mock_provider_and_dimensions():
     rows = conn.sql("""
         SELECT ai_embed(
             chunk,
-            struct_pack(provider := 'mock_ai_sql', dimensions := 4, concurrency := 1)
+            provider := 'mock_ai_sql',
+            dimensions := 4,
+            options := struct_pack(actor_number := 1)
         ) AS embedding
         FROM (VALUES ('abc')) AS t(chunk)
     """).fetchall()
@@ -882,14 +899,38 @@ def test_ai_embed_sql_with_mock_provider_and_dimensions():
     assert embedding == [3.0, 3.0, 3.0, 3.0]
 
 
+def test_ai_embed_sql_uses_trusted_provider_dimension_metadata():
+    conn = vane.connect()
+    relation = conn.sql("""
+        SELECT ai_embed('abc', provider := 'mock_ai_sql') AS embedding
+    """)
+
+    assert [str(value) for value in relation.types] == ["FLOAT[4]"]
+    assert list(relation.fetchone()[0]) == [3.0, 3.0, 3.0, 3.0]
+
+
+def test_ai_embed_sql_unknown_model_requires_explicit_dimensions():
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match="without network or model loading.*dimensions"):
+        conn.sql("""
+            SELECT ai_embed(
+                'abc',
+                provider := 'openai',
+                model := 'compatible-endpoint-model'
+            )
+        """)
+
+
 def test_ai_embed_sql_rejects_vllm_provider():
     conn = vane.connect()
 
-    with pytest.raises(Exception, match="not an embedding provider|embed_text"):
+    with pytest.raises(Exception, match="not an embedding provider"):
         conn.sql("""
             SELECT ai_embed(
                 'hello',
-                struct_pack(provider := 'vllm')
+                provider := 'vllm',
+                dimensions := 4
             )
         """).fetchall()
 
@@ -902,6 +943,139 @@ def test_ai_sql_options_must_be_constant():
             SELECT ai_prompt(chunk, struct_pack(provider := provider_name))
             FROM (VALUES ('alpha', 'mock_ai_sql')) AS t(chunk, provider_name)
         """).fetchall()
+
+
+@pytest.mark.parametrize(
+    "options_sql",
+    [
+        "42",
+        "'{}'::JSON",
+        "map(['actor_number'], [1])",
+        "'actor_number=1'",
+    ],
+)
+def test_ai_embed_sql_options_must_be_struct_or_null(options_sql):
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match="options.*STRUCT"):
+        conn.sql(f"""
+            SELECT ai_embed(
+                'abc',
+                provider := 'mock_ai_sql',
+                dimensions := 4,
+                options := {options_sql}
+            )
+        """).fetchall()
+
+
+def test_ai_embed_sql_struct_options_must_be_foldable():
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match="options.*constant"):
+        conn.sql("""
+            SELECT ai_embed(
+                chunk,
+                provider := 'mock_ai_sql',
+                dimensions := 4,
+                options := struct_pack(normalize := length(chunk) > 0)
+            )
+            FROM (VALUES ('abc')) AS t(chunk)
+        """).fetchall()
+
+
+@pytest.mark.parametrize("argument", ["provider", "model", "dimensions", "on_error"])
+def test_ai_embed_sql_call_level_arguments_must_be_foldable(argument):
+    conn = vane.connect()
+    arguments = {
+        "provider": "'mock_ai_sql'",
+        "model": "'model'",
+        "dimensions": "4",
+        "on_error": "'raise'",
+    }
+    arguments[argument] = {
+        "provider": "provider_name",
+        "model": "model_name",
+        "dimensions": "dimension_count",
+        "on_error": "error_mode",
+    }[argument]
+
+    with pytest.raises(Exception, match=rf"{argument}.*constant"):
+        conn.sql(f"""
+            SELECT ai_embed(
+                chunk,
+                provider := {arguments["provider"]},
+                model := {arguments["model"]},
+                dimensions := {arguments["dimensions"]},
+                on_error := {arguments["on_error"]}
+            )
+            FROM (VALUES ('abc', 'mock_ai_sql', 'model', 4, 'raise'))
+                AS t(chunk, provider_name, model_name, dimension_count, error_mode)
+        """).fetchall()
+
+
+def test_ai_embed_sql_rejects_removed_options_and_old_overload():
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match="concurrency"):
+        conn.sql("""
+            SELECT ai_embed(
+                'abc',
+                provider := 'mock_ai_sql',
+                dimensions := 4,
+                options := struct_pack(concurrency := 1)
+            )
+        """).fetchall()
+
+    with pytest.raises(Exception, match="does not support|Candidate macros|VARCHAR"):
+        conn.sql("""
+            SELECT ai_embed(
+                'abc',
+                struct_pack(provider := 'mock_ai_sql', dimensions := 4)
+            )
+        """).fetchall()
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "actor_number",
+        "batch_size",
+        "batch_token_limit",
+        "max_retries",
+        "concurrency",
+        "max_api_concurrency",
+        "max_concurrency_per_actor",
+        "unknown_embed_option",
+    ],
+)
+def test_ai_embed_sql_explicit_null_does_not_bypass_option_validation(option):
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match=option):
+        conn.sql(f"""
+            SELECT ai_embed(
+                'abc',
+                dimensions := 4,
+                options := struct_pack({option} := NULL)
+            )
+        """)
+
+
+def test_ai_embed_sql_preserves_nullable_options_as_omitted_values():
+    conn = vane.connect()
+    relation = conn.sql("""
+        SELECT ai_embed(
+            'abc',
+            dimensions := 4,
+            options := struct_pack(
+                base_url := NULL::VARCHAR,
+                timeout := NULL::DOUBLE,
+                input_text_token_limit := NULL::INTEGER
+            )
+        ) AS embedding
+    """)
+
+    assert [str(value) for value in relation.types] == ["FLOAT[4]"]
 
 
 def test_ai_prompt_sql_explain_uses_native_actor_backend(monkeypatch):
@@ -1131,7 +1305,11 @@ def test_ai_sql_helper_normalizes_decimal_sql_options(monkeypatch):
 def test_ai_sql_helper_builds_embed_spec_with_fixed_dimensions():
     from vane.ai._sql import build_ai_embed_sql_spec
 
-    spec = build_ai_embed_sql_spec({"provider": "mock_ai_sql", "dimensions": 4, "concurrency": 1})
+    spec = build_ai_embed_sql_spec(
+        "mock_ai_sql",
+        dimensions=4,
+        options={"actor_number": 1},
+    )
 
     assert spec["name"] == "ai_embed"
     assert spec["input_names"] == ["text"]
@@ -1175,7 +1353,9 @@ def test_ai_embed_sql_batch_size_and_max_retries_map_to_spec_not_provider(monkey
     monkeypatch.setitem(provider_registry.PROVIDERS, "mock_ai_sql", lambda name=None, **options: RecordingProvider())
 
     spec = ai_sql.build_ai_embed_sql_spec(
-        {"provider": "mock_ai_sql", "batch_size": Decimal(4), "max_retries": Decimal(0)}
+        "mock_ai_sql",
+        dimensions=4,
+        options={"batch_size": Decimal(4), "max_retries": Decimal(0)},
     )
 
     assert spec["batch_size"] == 4

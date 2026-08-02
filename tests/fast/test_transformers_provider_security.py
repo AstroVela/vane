@@ -58,18 +58,14 @@ def test_remote_code_requires_an_explicit_option(monkeypatch):
 
     descriptor = TransformersTextEmbedderDescriptor(
         model="reviewed-model",
-        embed_options={"batch_size": 8, "revision": "pinned-revision", "trust_remote_code": True},
+        dimensions=384,
+        embed_options={"revision": "pinned-revision", "trust_remote_code": True},
     )
 
     assert descriptor.get_dimensions().size == 384
     descriptor.instantiate()
 
-    assert auto_config_calls == [
-        (
-            "reviewed-model",
-            {"trust_remote_code": True, "revision": "pinned-revision"},
-        )
-    ]
+    assert auto_config_calls == []
     assert sentence_transformer_calls == [
         (
             "reviewed-model",

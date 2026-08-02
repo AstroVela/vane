@@ -8,14 +8,13 @@ from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
 
-import pyarrow as pa
-
 from vane.ai._redaction import is_sensitive_option_key
 from vane.ai.functions import (
     _actor_number_or_one,
     _adapt_batch_wrapper_for_backend,
     _EmbedTextBatch,
     _gpus_or_zero,
+    _prepare_embed_call,
     _PromptBatch,
     _resolve_ai_batch_size,
     _resolve_provider,
@@ -30,8 +29,10 @@ def _drop_none(options: dict[str, Any]) -> dict[str, Any]:
 _INT_OPTION_NAMES = {
     "actor_number",
     "batch_size",
+    "batch_token_limit",
     "concurrency",
     "dimensions",
+    "input_text_token_limit",
     "max_api_concurrency",
     "max_output_tokens",
     "max_retries",
@@ -124,12 +125,8 @@ def _pop_execution_options(opts: dict[str, Any]) -> tuple[int | None, int | None
     return batch_size, max_retries
 
 
-def _embedding_output_type(dimensions: int | None) -> str:
-    return "FLOAT[]" if dimensions is None else f"FLOAT[{dimensions}]"
-
-
-def _embedding_arrow_type(dimensions: int | None) -> pa.DataType:
-    return pa.list_(pa.float32()) if dimensions is None else pa.list_(pa.float32(), dimensions)
+def _embedding_output_type(dimensions: int) -> str:
+    return f"FLOAT[{dimensions}]"
 
 
 def _normalize_sql_options(options: dict[str, Any] | None) -> dict[str, Any]:
@@ -145,6 +142,16 @@ def _normalize_sql_options(options: dict[str, Any] | None) -> dict[str, Any]:
             opts[target] = _normalize_option_value(json.loads(str(raw)), target)
     _reject_inline_credentials(opts)
     return opts
+
+
+def _normalize_embed_sql_options(options: dict[str, Any] | None) -> dict[str, Any]:
+    _reject_inline_credentials(options or {})
+    # Preserve explicit NULL fields until the closed Embed validator sees
+    # them.  Dropping them here would let removed/unknown option names and
+    # non-nullable values such as actor_number := NULL bypass planning-time
+    # validation.  Provider options whose contract explicitly permits None
+    # remain valid.
+    return {key: _normalize_option_value(value, key) for key, value in dict(options or {}).items()}
 
 
 def build_ai_prompt_sql_spec(
@@ -220,30 +227,30 @@ def build_ai_prompt_sql_spec(
     }
 
 
-def build_ai_embed_sql_spec(options: dict[str, Any] | None = None) -> dict[str, Any]:
-    opts = _normalize_sql_options(options)
-    provider = opts.pop("provider", "openai")
-    model = opts.pop("model", None)
-    dimensions = _int_or_none(opts.pop("dimensions", None), "dimensions")
-    normalize = bool(opts.pop("normalize", False))
-    batch_size, max_retries = _pop_execution_options(opts)
-
-    prov = _resolve_provider(provider, "openai")
-    try:
-        descriptor = prov.get_text_embedder(model=model, dimensions=dimensions, **opts)
-    except NotImplementedError as exc:
-        raise ValueError(f"Provider {provider!r} is not an embedding provider") from exc
-
-    udf_opts = descriptor.get_udf_options()
-    resolved_max_retries = udf_opts.max_retries if max_retries is None else max_retries
+def build_ai_embed_sql_spec(
+    provider: str = "openai",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: str = "raise",
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    opts = _normalize_embed_sql_options(options)
+    descriptor, resolved_dimensions, udf_opts, normalize, _, _, _, _ = _prepare_embed_call(
+        provider,
+        model,
+        dimensions,
+        on_error,
+        opts,
+        relation=False,
+    )
     wrapper = _EmbedTextBatch(
         descriptor,
         "text",
         "embedding",
-        max_retries=resolved_max_retries,
+        resolved_dimensions,
+        max_retries=udf_opts.max_retries,
         on_error=udf_opts.on_error,
         normalize=normalize,
-        arrow_type=_embedding_arrow_type(dimensions),
     )
     actor_callable = _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True)
     return {
@@ -251,11 +258,11 @@ def build_ai_embed_sql_spec(options: dict[str, Any] | None = None) -> dict[str, 
         "name": "ai_embed",
         "provider": descriptor.get_provider(),
         "model": descriptor.get_model(),
-        "dimensions": dimensions,
-        "return_type": _embedding_output_type(dimensions),
+        "dimensions": resolved_dimensions,
+        "return_type": _embedding_output_type(resolved_dimensions),
         "input_names": ["text"],
-        "schema": {"embedding": _embedding_output_type(dimensions)},
-        "batch_size": batch_size if batch_size is not None else _resolve_ai_batch_size(udf_opts),
+        "schema": {"embedding": _embedding_output_type(resolved_dimensions)},
+        "batch_size": _resolve_ai_batch_size(udf_opts),
         "row_preserving": True,
         "actor_number": _actor_number_or_one(udf_opts),
         "gpus": _gpus_or_zero(udf_opts),

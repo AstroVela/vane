@@ -108,6 +108,7 @@ def test_openai_embed_expression_real_provider() -> None:
     dimensions_env = os.getenv("VANE_E2E_OPENAI_EMBED_DIMENSIONS")
     dimensions = int(dimensions_env) if dimensions_env else None
     started = time.monotonic()
+    _openai_provider_options()
 
     conn = vane.connect()
     try:
@@ -116,9 +117,11 @@ def test_openai_embed_expression_real_provider() -> None:
             vane.col("chunk"),
             provider="openai",
             model=model,
-            provider_options=_openai_provider_options(),
-            embedding_options=vane.ai.OpenAIEmbeddingOptions(encoding_format="float"),
             dimensions=dimensions,
+            encoding_format="float",
+            base_url=os.getenv("OPENAI_BASE_URL") or None,
+            timeout=float(os.getenv("OPENAI_TIMEOUT", "60")),
+            actor_number=1,
             normalize=False,
         ).alias("embedding")
 

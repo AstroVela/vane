@@ -21,10 +21,8 @@ from vane.ai._redaction import REDACTED_PLACEHOLDER
 from vane.ai.options import (
     AnthropicPromptOptions,
     AnthropicProviderOptions,
-    GoogleEmbeddingOptions,
     GooglePromptOptions,
     GoogleProviderOptions,
-    OpenAIEmbeddingOptions,
     OpenAIPromptOptions,
     OpenAIProviderOptions,
     VLLMPromptOptions,
@@ -41,10 +39,8 @@ API_KEY_OPTIONS_CLASSES = [
 
 CREDENTIAL_FREE_OPTIONS_CLASSES = [
     OpenAIPromptOptions,
-    OpenAIEmbeddingOptions,
     AnthropicPromptOptions,
     GooglePromptOptions,
-    GoogleEmbeddingOptions,
 ]
 
 

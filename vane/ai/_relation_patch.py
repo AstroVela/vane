@@ -3,49 +3,53 @@
 
 """Monkey-patch AI convenience methods onto DuckDBPyRelation.
 
-This module adds ``.embed_text()``, ``.classify_text()``, and ``.prompt()``
+This module adds ``.embed()``, ``.classify_text()``, and ``.prompt()``
 directly to :class:`duckdb.DuckDBPyRelation` so users can write::
 
-    rel.embed_text("text_col", provider="transformers")
+    rel.embed(vane.col("text_col"), provider="transformers")
 
 instead of the functional form::
 
-    from vane.ai import embed_text
+    from vane.ai import embed
 
-    embed_text(rel, "text_col", provider="transformers")
+    embed(rel, vane.col("text_col"), provider="transformers")
 
 The patch is applied once when this module is imported.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
-from duckdb import DuckDBPyRelation
+from typing_extensions import Unpack
+
+from duckdb import DuckDBPyRelation, Expression
+from vane.ai.options import EmbedOptions
+from vane.ai.provider import Provider
 
 
-def _embed_text(
+def _embed(
     self: DuckDBPyRelation,
-    column: str,
+    text: Expression,
     *,
-    provider: Any = None,
+    provider: str | Provider = "openai",
     model: str | None = None,
     dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
     output_column: str = "embedding",
-    execution_backend: str | None = None,
-    **options: Any,
+    **options: Unpack[EmbedOptions],
 ) -> DuckDBPyRelation:
-    """Embed a text column. See :func:`vane.ai.embed_text` for details."""
-    from vane.ai.functions import embed_text
+    """Append a fixed-size embedding column. See :func:`vane.ai.embed`."""
+    from vane.ai.functions import embed
 
-    return embed_text(
+    return embed(
         self,
-        column,
+        text,
         provider=provider,
         model=model,
         dimensions=dimensions,
+        on_error=on_error,
         output_column=output_column,
-        execution_backend=execution_backend,
         **options,
     )
 
@@ -110,11 +114,12 @@ def _prompt(
 
 def _patch() -> None:
     """Apply AI methods to DuckDBPyRelation (idempotent)."""
-    if hasattr(DuckDBPyRelation, "embed_text"):
-        return
-    DuckDBPyRelation.embed_text = _embed_text  # type: ignore[attr-defined]
-    DuckDBPyRelation.classify_text = _classify_text  # type: ignore[attr-defined]
-    DuckDBPyRelation.prompt = _prompt  # type: ignore[attr-defined]
+    if not hasattr(DuckDBPyRelation, "embed"):
+        DuckDBPyRelation.embed = _embed  # type: ignore[attr-defined]
+    if not hasattr(DuckDBPyRelation, "classify_text"):
+        DuckDBPyRelation.classify_text = _classify_text  # type: ignore[attr-defined]
+    if not hasattr(DuckDBPyRelation, "prompt"):
+        DuckDBPyRelation.prompt = _prompt  # type: ignore[attr-defined]
 
 
 _patch()

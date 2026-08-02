@@ -19,13 +19,18 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa
 
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
+from vane.ai.options import validate_embed_options
 from vane.ai.protocols import TextClassifierDescriptor, TextEmbedderDescriptor
-from vane.ai.provider import Provider
+from vane.ai.provider import Provider, ProviderCapabilityError
 from vane.ai.typing import EmbeddingDimensions, UDFOptions
 
 if TYPE_CHECKING:
     from vane.ai.protocols import TextClassifier, TextEmbedder
     from vane.ai.typing import Embedding, Label, Options
+
+
+_EMBEDDING_DIMS = {"sentence-transformers/all-MiniLM-L6-v2": 384}
+_EMBED_OPTIONS = frozenset({"cache_folder", "device", "local_files_only", "revision", "trust_remote_code"})
 
 
 # ---------------------------------------------------------------------------
@@ -53,10 +58,16 @@ class TransformersProvider(Provider):
         dimensions: int | None = None,
         **options: Any,
     ) -> TextEmbedderDescriptor:
+        merged = {**self._options, **options}
+        unknown = sorted(set(merged) - _EMBED_OPTIONS)
+        if unknown:
+            raise TypeError(f"Unsupported Transformers Embed option(s): {', '.join(unknown)}")
+        validate_embed_options("transformers", merged, relation=False)
         return TransformersTextEmbedderDescriptor(
             model=model or self.DEFAULT_TEXT_EMBEDDER,
+            provider_name=self._name,
             dimensions=dimensions,
-            embed_options={**self._options, **options},
+            embed_options=merged,
         )
 
     def get_text_classifier(self, model: str | None = None, **options: Any) -> TextClassifierDescriptor:
@@ -77,13 +88,27 @@ class TransformersTextEmbedderDescriptor(TextEmbedderDescriptor):
 
     model: str
     dimensions: int | None = None
-    embed_options: dict[str, Any] = field(default_factory=lambda: {"batch_size": 64})
+    embed_options: dict[str, Any] = field(default_factory=dict)
+    provider_name: str = "transformers"
 
     def __post_init__(self) -> None:
+        unknown = sorted(set(self.embed_options) - _EMBED_OPTIONS)
+        if unknown:
+            raise TypeError(f"Unsupported Transformers Embed option(s): {', '.join(unknown)}")
+        if self.dimensions is not None and (
+            isinstance(self.dimensions, bool) or not isinstance(self.dimensions, int) or self.dimensions <= 0
+        ):
+            raise ValueError("Embedding dimensions must be a positive integer")
+        native_dimensions = _EMBEDDING_DIMS.get(self.model)
+        if self.dimensions is not None and native_dimensions is not None and self.dimensions > native_dimensions:
+            raise ValueError(
+                f"Transformers model {self.model!r} has {native_dimensions} dimensions and cannot produce "
+                f"{self.dimensions} dimensions"
+            )
         self.embed_options = wrap_sensitive_options(self.embed_options)
 
     def get_provider(self) -> str:
-        return "transformers"
+        return self.provider_name
 
     def get_model(self) -> str:
         return self.model
@@ -92,45 +117,37 @@ class TransformersTextEmbedderDescriptor(TextEmbedderDescriptor):
         return dict(self.embed_options)
 
     def get_dimensions(self) -> EmbeddingDimensions:
-        from transformers import AutoConfig
-
         if self.dimensions is not None:
             return EmbeddingDimensions(size=self.dimensions, dtype=pa.float32())
-        config_options: dict[str, Any] = {
-            "trust_remote_code": self.embed_options.get("trust_remote_code") is True,
-        }
-        for name in ("local_files_only", "revision", "token"):
-            if name in self.embed_options:
-                config_options[name] = self.embed_options[name]
-        if "cache_folder" in self.embed_options:
-            config_options["cache_dir"] = self.embed_options["cache_folder"]
-        # Hub access is an execution boundary: restore the plaintext token.
-        config_options = unwrap_sensitive_options(config_options)
-        hidden = AutoConfig.from_pretrained(self.model, **config_options).hidden_size
-        return EmbeddingDimensions(size=hidden, dtype=pa.float32())
+        if self.model in _EMBEDDING_DIMS:
+            return EmbeddingDimensions(size=_EMBEDDING_DIMS[self.model], dtype=pa.float32())
+        raise ValueError(
+            f"Cannot determine embedding dimensions for Transformers model {self.model!r} "
+            "from trusted local metadata; pass dimensions=... explicitly"
+        )
 
     def get_udf_options(self) -> UDFOptions:
-        import torch
-
-        has_gpu = torch.cuda.is_available()
+        device = self.embed_options.get("device")
+        has_gpu = device is not None and str(device).startswith("cuda")
         opts = UDFOptions(
-            batch_size=self.embed_options.get("batch_size", 64),
-            max_retries=self.embed_options.get("max_retries", 3),
-            on_error=self.embed_options.get("on_error", "raise"),
+            batch_size=64,
+            max_retries=3,
+            on_error="raise",
+            actor_number=None,
+            num_gpus=1 if has_gpu else 0,
         )
-        if has_gpu:
-            opts.num_gpus = 1
         return opts
 
     def instantiate(self) -> TextEmbedder:
         model_options = {
             name: value
             for name, value in self.embed_options.items()
-            if name in {"cache_folder", "device", "local_files_only", "revision", "token", "trust_remote_code"}
+            if name in {"cache_folder", "device", "local_files_only", "revision", "trust_remote_code"}
         }
         return TransformersTextEmbedder(
             self.model,
             dimensions=self.dimensions,
+            provider_name=self.provider_name,
             **model_options,
         )
 
@@ -142,6 +159,7 @@ class TransformersTextEmbedder:
         self,
         model_name_or_path: str,
         dimensions: int | None = None,
+        provider_name: str = "transformers",
         **model_options: Any,
     ):
         from sentence_transformers import SentenceTransformer
@@ -150,12 +168,22 @@ class TransformersTextEmbedder:
         # from direct callers pass through unchanged.
         model_options = unwrap_sensitive_options(model_options)
         trust_remote_code = model_options.pop("trust_remote_code", False) is True
-        self.model = SentenceTransformer(
-            model_name_or_path,
-            trust_remote_code=trust_remote_code,
-            backend="torch",
-            **model_options,
-        )
+        self._provider_name = provider_name
+        self._model_name = model_name_or_path
+        try:
+            self.model = SentenceTransformer(
+                model_name_or_path,
+                trust_remote_code=trust_remote_code,
+                backend="torch",
+                **model_options,
+            )
+        except NotImplementedError as exc:
+            raise ProviderCapabilityError(
+                getattr(self, "_provider_name", "transformers"),
+                model_name_or_path,
+                "embedding model",
+                original_error=exc,
+            ) from exc
         self.model.eval()
         self.dimensions = dimensions
 
@@ -163,7 +191,15 @@ class TransformersTextEmbedder:
         import torch
 
         with torch.inference_mode():
-            batch = self.model.encode(text, convert_to_numpy=True, truncate_dim=self.dimensions)
+            try:
+                batch = self.model.encode(text, convert_to_numpy=True, truncate_dim=self.dimensions)
+            except NotImplementedError as exc:
+                raise ProviderCapabilityError(
+                    getattr(self, "_provider_name", "transformers"),
+                    self._model_name,
+                    "embedding model",
+                    original_error=exc,
+                ) from exc
             return list(batch)
 
 

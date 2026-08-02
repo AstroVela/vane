@@ -11,15 +11,15 @@ These functions create stateful wrapper classes that:
 Usage::
 
     import vane
-    from vane.ai.functions import embed_text, classify_text
+    from vane.ai.functions import classify_text, embed
 
     conn = vane.connect()
     rel = conn.sql("SELECT text FROM documents")
 
     # Text embedding — returns relation with 'embedding' column
-    embedded = embed_text(
+    embedded = embed(
         rel,
-        "text",
+        vane.col("text"),
         provider="transformers",
         model="sentence-transformers/all-MiniLM-L6-v2",
     )
@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any, Literal, overload
 
 import numpy as np
 import pyarrow as pa
+from typing_extensions import Unpack
 
 import duckdb
 from vane._expression_udf import _build_actor_map_batches_expression, _build_map_batches_expression
@@ -50,23 +51,22 @@ from vane._expressions import as_expression, is_expression
 from vane.ai.options import (
     AnthropicPromptOptions,
     AnthropicProviderOptions,
-    GoogleEmbeddingOptions,
+    EmbedOptions,
     GooglePromptOptions,
     GoogleProviderOptions,
-    OpenAIEmbeddingOptions,
     OpenAIPromptOptions,
     OpenAIProviderOptions,
     VLLMPromptOptions,
     VLLMProviderOptions,
+    validate_embed_options,
 )
 from vane.ai.protocols import NativePrompterPlan
-from vane.ai.provider import load_provider
+from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError, load_provider
 from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_options_argument
 from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
     from vane import Expression, Relation
-    from vane.ai.provider import Provider
 
 
 def _resolve_provider(provider: str | Provider | None, default: str = "transformers") -> Provider:
@@ -141,6 +141,47 @@ class RetryAfterError(Exception):
         self.__cause__ = original
 
 
+_TRANSIENT_EMBED_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+
+def _is_transient_embed_error(exc: Exception) -> bool:
+    """Whether an idempotent Embed request failed for a transient reason."""
+
+    if isinstance(exc, RetryAfterError):
+        return True
+
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (TimeoutError, ConnectionError)):
+            return True
+
+        for status in (
+            getattr(current, "status_code", None),
+            getattr(current, "code", None),
+            getattr(getattr(current, "response", None), "status_code", None),
+        ):
+            if isinstance(status, int) and not isinstance(status, bool):
+                if status in _TRANSIENT_EMBED_HTTP_STATUS_CODES:
+                    return True
+
+        # OpenAI connection errors retain their underlying httpx transport
+        # error as the cause.  Avoid importing an optional SDK just to classify
+        # it; httpx itself is likewise optional for non-network providers.
+        try:
+            import httpx
+        except ImportError:
+            pass
+        else:
+            if isinstance(current, httpx.TransportError):
+                return True
+
+        current = current.__cause__
+
+    return False
+
+
 def _retry_call(
     fn: Any,
     *args: Any,
@@ -149,6 +190,7 @@ def _retry_call(
     default: Any = None,
     run_async: Any = None,
     on_awaitable: Any = None,
+    retry_if: Any = None,
     **kwargs: Any,
 ) -> Any:
     """Call *fn* with exponential-backoff retry and on_error handling.
@@ -166,6 +208,9 @@ def _retry_call(
             returns an awaitable — lets a wrapper learn its provider is
             loop-bound even when static inspection cannot tell (a plain
             ``def`` that returns an awaitable), so ``close()`` releases it.
+        retry_if: Optional predicate that must accept an exception and return
+            true for retryable failures. By default, ordinary exceptions keep
+            the historical retry behavior.
     """
     last_exc: Exception | None = None
     for attempt in range(1 + max(0, max_retries)):
@@ -185,6 +230,10 @@ def _retry_call(
             raise
         except Exception as exc:
             last_exc = exc
+            if isinstance(exc, (ProviderCapabilityError, _ProviderResultError)):
+                break
+            if retry_if is not None and not retry_if(exc):
+                break
             if attempt < max_retries:
                 if isinstance(exc, RetryAfterError):
                     wait = min(exc.retry_after, 120)
@@ -227,6 +276,8 @@ async def _retry_call_async(
             return await result
         except Exception as exc:
             last_exc = exc
+            if isinstance(exc, (ProviderCapabilityError, _ProviderResultError)):
+                break
             if attempt < max_retries:
                 if isinstance(exc, RetryAfterError):
                     wait = min(exc.retry_after, 120)
@@ -286,6 +337,139 @@ def _merge_options(*objects: Any) -> dict[str, Any]:
         else:
             raise TypeError(f"Unsupported AI options object: {type(obj).__name__}")
     return merged
+
+
+def _embedding_provider_family(provider: Any) -> str | None:
+    """Return the closed options family implemented by a built-in provider."""
+
+    module = type(provider).__module__
+    if module == "vane.ai.providers.openai":
+        return "openai"
+    if module == "vane.ai.providers.google":
+        return "google"
+    if module == "vane.ai.providers.transformers":
+        return "transformers"
+    name = getattr(provider, "name", None)
+    if isinstance(name, str) and name.casefold() in {"openai", "google", "transformers"}:
+        return name.casefold()
+    return None
+
+
+_BUILTIN_EMBED_PROVIDER_SENSITIVE_FIELDS = {
+    "vane.ai.providers.openai": frozenset({"api_key", "organization"}),
+    "vane.ai.providers.google": frozenset({"api_key"}),
+}
+
+
+def _reject_builtin_embed_provider_credentials(provider: Provider) -> None:
+    """Keep built-in Provider presets containing secrets out of Embed plans."""
+
+    sensitive_fields = _BUILTIN_EMBED_PROVIDER_SENSITIVE_FIELDS.get(type(provider).__module__)
+    configured = getattr(provider, "_options", None)
+    if sensitive_fields is None or not isinstance(configured, dict):
+        return
+    offending = sorted(field for field in sensitive_fields if configured.get(field) is not None)
+    if not offending:
+        return
+    label = "field" if len(offending) == 1 else "fields"
+    raise ValueError(
+        f"Embed provider configuration cannot include inline credential or sensitive {label}: "
+        f"{', '.join(offending)}; configure credentials through the environment or runtime secret management"
+    )
+
+
+def _validate_embedding_dimension(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("dimensions must be a positive integer or None")
+    return int(value)
+
+
+def _resolve_embedding_dimension(descriptor: Any, explicit: int | None) -> int:
+    if explicit is not None:
+        return explicit
+    try:
+        metadata = descriptor.get_dimensions()
+        resolved = getattr(metadata, "size", metadata)
+    except Exception as exc:
+        model = getattr(descriptor, "get_model", lambda: "unknown")()
+        raise ValueError(
+            f"Cannot determine embedding dimensions for model {model!r} without network or model loading; "
+            "pass dimensions=... explicitly"
+        ) from exc
+    if isinstance(resolved, bool) or not isinstance(resolved, int) or resolved <= 0:
+        raise ValueError("Provider embedding dimension metadata must be a positive integer")
+    return int(resolved)
+
+
+def _prepare_embed_call(
+    provider: Any,
+    model: str | None,
+    dimensions: int | None,
+    on_error: str,
+    options: dict[str, Any],
+    *,
+    relation: bool,
+) -> tuple[Any, int, UDFOptions, bool, int | None, int, str | None, bool]:
+    """Resolve one Embed call without performing network or model I/O."""
+
+    if provider is None:
+        raise TypeError("provider must be a provider name or Provider object, not None")
+    if model is not None and (not isinstance(model, str) or not model.strip()):
+        raise ValueError("model must be a non-empty string or None")
+    explicit_dimensions = _validate_embedding_dimension(dimensions)
+    if on_error not in {"raise", "ignore"}:
+        raise ValueError("on_error must be 'raise' or 'ignore'")
+
+    resolved_provider = _resolve_provider(provider, "openai")
+    if not isinstance(resolved_provider, Provider):
+        raise TypeError("provider must be a provider name or Provider object")
+    _reject_builtin_embed_provider_credentials(resolved_provider)
+    prepared = validate_embed_options(
+        _embedding_provider_family(resolved_provider),
+        options,
+        relation=relation,
+    )
+    normalize = prepared.pop("normalize", False)
+    execution_backend = prepared.pop("execution_backend", None)
+    max_chunk_chars = prepared.pop("max_chunk_chars", None)
+    chunk_overlap_chars = prepared.pop("chunk_overlap_chars", 200)
+    actor_number_explicit = "actor_number" in prepared
+    batch_size = prepared.pop("batch_size", None)
+    max_retries = prepared.pop("max_retries", None)
+    actor_number = prepared.pop("actor_number", None)
+
+    try:
+        descriptor = resolved_provider.get_text_embedder(
+            model=model,
+            dimensions=explicit_dimensions,
+            **prepared,
+        )
+    except NotImplementedError as exc:
+        provider_name = getattr(resolved_provider, "name", type(resolved_provider).__name__)
+        raise ValueError(f"Provider {provider_name!r} is not an embedding provider") from exc
+
+    resolved_dimensions = _resolve_embedding_dimension(descriptor, explicit_dimensions)
+    udf_options = descriptor.get_udf_options()
+    udf_options.on_error = on_error
+    if batch_size is not None:
+        udf_options.batch_size = batch_size
+    if max_retries is not None:
+        udf_options.max_retries = max_retries
+    if actor_number is not None:
+        udf_options.actor_number = actor_number
+
+    return (
+        descriptor,
+        resolved_dimensions,
+        udf_options,
+        normalize,
+        max_chunk_chars,
+        chunk_overlap_chars,
+        execution_backend,
+        actor_number_explicit,
+    )
 
 
 def _adapt_batch_wrapper_for_backend(wrapper: Any, execution_backend: str | None, *, force_actor: bool = False) -> Any:
@@ -378,12 +562,6 @@ def _weighted_average_embeddings(
     return averaged.astype(np.float32)
 
 
-def _schema_for_embedding(dimensions: int | None) -> dict[str, str]:
-    if dimensions is None:
-        return {"embedding": "FLOAT[]"}
-    return {"embedding": f"FLOAT[{dimensions}]"}
-
-
 def _actor_number_or_one(udf_opts: UDFOptions) -> int:
     return udf_opts.actor_number or 1
 
@@ -414,34 +592,6 @@ def _normalize_embeddings(values: list[Any]) -> list[Any]:
     return normalized
 
 
-def _as_positive_int(value: Any) -> int | None:
-    if isinstance(value, (int, np.integer)) and value > 0:
-        return int(value)
-    return None
-
-
-def _embedding_zero_size(descriptor: Any, arrow_type: Any | None) -> int:
-    if arrow_type is not None and pa.types.is_fixed_size_list(arrow_type):
-        return arrow_type.list_size
-
-    dimensions = descriptor.get_dimensions()
-    for value in (getattr(dimensions, "size", None), getattr(dimensions, "list_size", None)):
-        size = _as_positive_int(value)
-        if size is not None:
-            return size
-
-    as_arrow_type = getattr(dimensions, "as_arrow_type", None)
-    if callable(as_arrow_type):
-        dimension_type = as_arrow_type()
-        if pa.types.is_fixed_size_list(dimension_type):
-            return dimension_type.list_size
-        size = _as_positive_int(getattr(dimension_type, "list_size", None))
-        if size is not None:
-            return size
-
-    raise ValueError("Could not determine embedding dimension for zero fallback")
-
-
 # ---------------------------------------------------------------------------
 # Module-level wrapper classes (must be at module level for pickle)
 # ---------------------------------------------------------------------------
@@ -463,25 +613,23 @@ class _EmbedTextBatch:
         descriptor: Any,
         column: str,
         output_column: str,
+        dimensions: int,
         max_chunk_chars: int | None = None,
         chunk_overlap_chars: int = 200,
         max_retries: int = 3,
         on_error: _OnError = "raise",
         normalize: bool = False,
-        arrow_type: Any | None = None,
     ) -> None:
         self._descriptor = descriptor
         self._column = column
         self._output_column = output_column
+        self._dimensions = dimensions
         self._max_chunk_chars = max_chunk_chars
         self._chunk_overlap_chars = chunk_overlap_chars
         self._max_retries = max_retries
         self._on_error: _OnError = on_error
         self._normalize = normalize
-        # Keep expression construction lazy: unknown OpenAI-compatible models can
-        # probe dimensions over the network, so callers pass a schema-aligned
-        # Arrow type when they already know the dimensions.
-        self._arrow_type = arrow_type
+        self._arrow_type = pa.list_(pa.float32(), dimensions)
         self._embedder = None  # lazy: instantiate on first __call__
         self._run_async: Any = None  # executor-bound capability
         self._embedder_loop_bound = False  # set once the embedder is known loop-bound
@@ -543,43 +691,90 @@ class _EmbedTextBatch:
         state["_embedder_loop_bound"] = False  # recomputed on next _ensure_embedder()
         return state
 
-    def _zero_fill(self, count: int) -> list[Any]:
-        """Zero embeddings when possible; nulls when the dimension is unknowable."""
+    def _coerce_embedding(self, value: Any) -> np.ndarray:
         try:
-            zero_size = _embedding_zero_size(self._descriptor, self._arrow_type)
+            embedding = np.asarray(value, dtype=np.float32)
+        except Exception as exc:
+            raise TypeError("Provider returned a non-numeric embedding") from exc
+        if embedding.ndim != 1 or embedding.size != self._dimensions:
+            raise TypeError(
+                f"Provider {self._descriptor.get_provider()!r} model {self._descriptor.get_model()!r} "
+                f"returned an embedding with length {embedding.size}; expected {self._dimensions}"
+            )
+        return embedding
+
+    def _invoke_embedder(self, texts: list[str]) -> list[np.ndarray]:
+        raw = _retry_call(
+            self._ensure_embedder().embed_text,
+            texts,
+            max_retries=self._max_retries,
+            on_error="raise",
+            run_async=self._require_run_async(),
+            on_awaitable=self._mark_loop_bound,
+            retry_if=_is_transient_embed_error,
+        )
+        try:
+            values = list(raw)
+        except TypeError as exc:
+            raise TypeError("Provider embedding result must be a sequence") from exc
+        if len(values) != len(texts):
+            raise ValueError(
+                f"Provider returned {len(values)} embeddings for {len(texts)} inputs; "
+                "embedding calls must preserve row count and order"
+            )
+        return [self._coerce_embedding(value) for value in values]
+
+    def _embed_texts(self, texts: list[str]) -> list[np.ndarray | None]:
+        if not texts:
+            return []
+        try:
+            return self._invoke_embedder(texts)
+        except _MissingAsyncRuntimeError:
+            raise
+        except ProviderCapabilityError:
+            if self._on_error == "raise":
+                raise
+            return [None] * len(texts)
         except Exception:
-            return [None] * count
-        return [np.zeros(zero_size, dtype=np.float32) for _ in range(count)]
+            if self._on_error == "raise":
+                raise
+
+        # A batch-level failure does not identify the failing row. Isolate the
+        # inputs so on_error="ignore" nulls only rows that fail independently.
+        isolated: list[np.ndarray | None] = []
+        for text in texts:
+            try:
+                isolated.append(self._invoke_embedder([text])[0])
+            except _MissingAsyncRuntimeError:
+                raise
+            except Exception:
+                isolated.append(None)
+        return isolated
 
     def __call__(self, table: pa.Table) -> pa.Table:
         texts = table.column(self._column).to_pylist()
-        texts = [t if t is not None else "" for t in texts]
+        active_indices = [index for index, text in enumerate(texts) if text is not None]
+        results: list[Any] = [None] * len(texts)
 
-        if self._max_chunk_chars is not None:
-            result = self._embed_with_chunking(texts)
-        else:
-            result = _retry_call(
-                self._ensure_embedder().embed_text,
-                texts,
-                max_retries=self._max_retries,
-                on_error=self._on_error,
-                run_async=self._require_run_async(),
-                on_awaitable=self._mark_loop_bound,
-            )
-            if result is None:
-                result = self._zero_fill(len(texts))
+        if active_indices:
+            active_texts = [texts[index] for index in active_indices]
+            if self._max_chunk_chars is not None:
+                active_results = self._embed_with_chunking(active_texts)
+            else:
+                active_results = self._embed_texts(active_texts)
 
-        if self._normalize:
-            result = _normalize_embeddings(result)
+            if self._normalize:
+                active_results = _normalize_embeddings(active_results)
+            for index, value in zip(active_indices, active_results, strict=True):
+                results[index] = value
 
-        arrow_type = self._arrow_type or pa.list_(pa.float32())
         embeddings = pa.array(
-            [None if r is None else (r.tolist() if hasattr(r, "tolist") else list(r)) for r in result],
-            type=arrow_type,
+            [None if value is None else value.tolist() for value in results],
+            type=self._arrow_type,
         )
         return pa.table({self._output_column: embeddings})
 
-    def _embed_with_chunking(self, texts: list[str]) -> list[Any]:
+    def _embed_with_chunking(self, texts: list[str]) -> list[np.ndarray | None]:
         """Embed texts with automatic chunking for long inputs."""
         # Build chunk plan: (original_idx, chunk_text, chunk_weight)
         all_chunks: list[str] = []
@@ -597,21 +792,20 @@ class _EmbedTextBatch:
                 all_chunks.append(c)
             chunk_map.append(entry)
 
-        # Embed all chunks in one batch
-        chunk_embeddings = self._ensure_embedder().embed_text(all_chunks)
-        if inspect.isawaitable(chunk_embeddings):
-            self._mark_loop_bound()
-            chunk_embeddings = self._require_run_async()(chunk_embeddings)
+        chunk_embeddings = self._embed_texts(all_chunks)
 
         # Reassemble: weighted average for multi-chunk texts
-        results: list[Any] = []
+        results: list[np.ndarray | None] = []
         for entry in chunk_map:
+            embeddings = [chunk_embeddings[index] for index, _ in entry]
+            if any(embedding is None for embedding in embeddings):
+                results.append(None)
+                continue
             if len(entry) == 1:
-                results.append(chunk_embeddings[entry[0][0]])
+                results.append(embeddings[0])
             else:
-                embs = [chunk_embeddings[idx] for idx, _ in entry]
                 weights = [w for _, w in entry]
-                results.append(_weighted_average_embeddings(embs, weights))
+                results.append(_weighted_average_embeddings(embeddings, weights))
         return results
 
 
@@ -902,121 +1096,134 @@ def _build_ai_batch_expression(
     output_type: str,
     udf_opts: UDFOptions,
     name: str,
+    execution_backend: str | None = None,
+    force_actor: bool = True,
 ) -> Any:
-    actor_callable = _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True)
-    return _build_actor_map_batches_expression(
-        actor_callable,
+    actor_backend = execution_backend in {"subprocess_actor", "ray_actor"}
+    if execution_backend is None and force_actor:
+        actor_callable = _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True)
+        return _build_actor_map_batches_expression(
+            actor_callable,
+            name=name,
+            inputs={input_name: as_expression(input_expr)},
+            schema={output_column: output_type},
+            batch_size=_resolve_ai_batch_size(udf_opts),
+            row_preserving=True,
+            actor_number=_actor_number_or_one(udf_opts),
+            gpus=_gpus_or_zero(udf_opts),
+        )
+
+    configured = _adapt_batch_wrapper_for_backend(
+        wrapper,
+        execution_backend,
+        force_actor=actor_backend,
+    )
+    return _build_map_batches_expression(
+        configured,
         name=name,
         inputs={input_name: as_expression(input_expr)},
         schema={output_column: output_type},
         batch_size=_resolve_ai_batch_size(udf_opts),
         row_preserving=True,
-        actor_number=_actor_number_or_one(udf_opts),
         gpus=_gpus_or_zero(udf_opts),
+        execution_backend=execution_backend,
+        actor_number=_actor_number_or_one(udf_opts) if actor_backend else None,
     )
 
 
 # ---------------------------------------------------------------------------
-# embed_text
+# embed
 # ---------------------------------------------------------------------------
 
 
-def embed_text(
-    rel: Any,
-    column: str,
-    *,
-    provider: str | Provider | None = None,
-    model: str | None = None,
-    dimensions: int | None = None,
-    output_column: str = "embedding",
-    max_chunk_chars: int | None = None,
-    chunk_overlap_chars: int = 200,
-    execution_backend: str | None = None,
-    **options: Any,
-) -> Any:
-    """Embed a text column using the specified provider.
-
-    Args:
-        rel: A DuckDB relation containing the source data.
-        column: Name of the text column to embed.
-        provider: Provider name or instance (default: ``"transformers"``).
-        model: Model identifier. Providers without a library default (e.g.
-            ``"google"``) require an explicit model here or on the provider
-            instance and raise :class:`ValueError` otherwise.
-        dimensions: Output embedding dimensions (model default if ``None``).
-        output_column: Name of the output column (default: ``"embedding"``).
-        max_chunk_chars: If set, texts longer than this are split into
-            overlapping chunks, embedded separately, and combined via
-            length-weighted average. ``None`` disables chunking.
-        chunk_overlap_chars: Characters of overlap between adjacent chunks
-            (default: 200). Only used when ``max_chunk_chars`` is set.
-        execution_backend: Optional UDF backend. If omitted, the relation API infers task backend
-            from the active runner.
-        **options: Forwarded to the provider's ``get_text_embedder``.
-
-    Returns:
-        A new relation with the ``output_column`` appended.
-    """
-    prov = _resolve_provider(provider, "transformers")
-    descriptor = prov.get_text_embedder(model=model, dimensions=dimensions, **options)
-    udf_opts = descriptor.get_udf_options()
-
-    wrapper = _EmbedTextBatch(
-        descriptor,
-        column,
-        output_column,
-        max_chunk_chars=max_chunk_chars,
-        chunk_overlap_chars=chunk_overlap_chars,
-        max_retries=udf_opts.max_retries,
-        on_error=udf_opts.on_error,
-    )
-    kwargs = _map_batches_kwargs(udf_opts, execution_backend)
-    kwargs["schema"] = {output_column: "FLOAT[]"}
-    udf = _adapt_batch_wrapper_for_backend(
-        wrapper,
-        kwargs.get("execution_backend"),
-        force_actor="actor_number" in kwargs,
-    )
-    return rel.map_batches(udf, **kwargs)
-
-
-def embed(
+def _embed_expression(
     text: Any,
     *,
-    provider: str | Provider = "openai",
-    model: str | None = None,
-    provider_options: OpenAIProviderOptions | GoogleProviderOptions | dict[str, Any] | None = None,
-    embedding_options: OpenAIEmbeddingOptions | GoogleEmbeddingOptions | dict[str, Any] | None = None,
-    dimensions: int | None = None,
-    normalize: bool | None = None,
+    provider: Any,
+    model: str | None,
+    dimensions: int | None,
+    on_error: str,
+    options: dict[str, Any],
 ) -> Any:
-    """Build an expression that embeds a text expression through an AI provider.
+    if not is_expression(text):
+        raise TypeError("vane.ai.embed expression API requires a text Expression")
+    descriptor, resolved_dimensions, udf_opts, normalize, _, _, _, _ = _prepare_embed_call(
+        provider,
+        model,
+        dimensions,
+        on_error,
+        options,
+        relation=False,
+    )
+    wrapper = _EmbedTextBatch(
+        descriptor,
+        "text",
+        "embedding",
+        resolved_dimensions,
+        max_retries=udf_opts.max_retries,
+        on_error=udf_opts.on_error,
+        normalize=normalize,
+    )
+    output_type = f"FLOAT[{resolved_dimensions}]"
+    return _build_ai_batch_expression(
+        wrapper,
+        input_name="text",
+        input_expr=text,
+        output_column="embedding",
+        output_type=output_type,
+        udf_opts=udf_opts,
+        name="ai_embed",
+    ).cast(output_type)
 
-    If provider options do not set ``concurrency``, the expression uses one
-    actor. Provider ``concurrency`` maps internally to UDF ``actor_number``.
-    Prefer provider environment variables such as ``OPENAI_API_KEY`` or
-    ``GOOGLE_API_KEY`` over passing API keys in code or SQL text.
-    """
-    prov = _resolve_provider(provider, "openai")
-    descriptor_options = _merge_options(provider_options, embedding_options)
-    try:
-        descriptor = prov.get_text_embedder(model=model, dimensions=dimensions, **descriptor_options)
-    except NotImplementedError as exc:
-        raise ValueError(f"Provider {provider!r} is not an embedding provider") from exc
-    udf_opts = descriptor.get_udf_options()
 
-    output_column = "embedding"
-    output_type = _schema_for_embedding(dimensions)[output_column]
+def _embed_relation(
+    rel: Any,
+    text: Any,
+    *,
+    provider: Any,
+    model: str | None,
+    dimensions: int | None,
+    on_error: str,
+    output_column: str,
+    options: dict[str, Any],
+) -> Any:
+    if not _is_relation_like(rel):
+        raise TypeError("vane.ai.embed relation API requires a Relation")
+    if not is_expression(text):
+        raise TypeError("vane.ai.embed relation API requires a text Expression")
+    if not isinstance(output_column, str) or not output_column.strip():
+        raise ValueError("output_column must be a non-empty string")
+
+    (
+        descriptor,
+        resolved_dimensions,
+        udf_opts,
+        normalize,
+        max_chunk_chars,
+        chunk_overlap_chars,
+        execution_backend,
+        actor_number_explicit,
+    ) = _prepare_embed_call(
+        provider,
+        model,
+        dimensions,
+        on_error,
+        options,
+        relation=True,
+    )
     wrapper = _EmbedTextBatch(
         descriptor,
         "text",
         output_column,
+        resolved_dimensions,
+        max_chunk_chars=max_chunk_chars,
+        chunk_overlap_chars=chunk_overlap_chars,
         max_retries=udf_opts.max_retries,
         on_error=udf_opts.on_error,
-        normalize=bool(normalize),
-        arrow_type=pa.list_(pa.float32(), dimensions) if dimensions is not None else pa.list_(pa.float32()),
+        normalize=normalize,
     )
-    return _build_ai_batch_expression(
+    output_type = f"FLOAT[{resolved_dimensions}]"
+    expression = _build_ai_batch_expression(
         wrapper,
         input_name="text",
         input_expr=text,
@@ -1024,6 +1231,116 @@ def embed(
         output_type=output_type,
         udf_opts=udf_opts,
         name="ai_embed",
+        execution_backend=execution_backend,
+        force_actor=actor_number_explicit,
+    ).cast(output_type)
+    return rel.select(duckdb.StarExpression(), expression.alias(output_column))
+
+
+_EMBED_ARGUMENT_UNSET = object()
+
+
+@overload
+def embed(
+    text: Expression,
+    *,
+    provider: str | Provider = "openai",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    **options: Unpack[EmbedOptions],
+) -> Expression: ...
+
+
+@overload
+def embed(
+    *,
+    text: Expression,
+    provider: str | Provider = "openai",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    **options: Unpack[EmbedOptions],
+) -> Expression: ...
+
+
+@overload
+def embed(
+    rel: Relation,
+    text: Expression,
+    *,
+    provider: str | Provider = "openai",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = "embedding",
+    **options: Unpack[EmbedOptions],
+) -> Relation: ...
+
+
+@overload
+def embed(
+    *,
+    rel: Relation,
+    text: Expression,
+    provider: str | Provider = "openai",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = "embedding",
+    **options: Unpack[EmbedOptions],
+) -> Relation: ...
+
+
+def embed(
+    first: Any = _EMBED_ARGUMENT_UNSET,
+    /,
+    text: Any = _EMBED_ARGUMENT_UNSET,
+    *,
+    rel: Any = _EMBED_ARGUMENT_UNSET,
+    provider: Any = "openai",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: str = "raise",
+    **options: Any,
+) -> Any:
+    """Embed an Expression or append an embedding column to a Relation."""
+
+    if first is not _EMBED_ARGUMENT_UNSET and rel is not _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed received both first and rel; pass only one relation argument")
+
+    relation = rel if rel is not _EMBED_ARGUMENT_UNSET else first
+    if relation is not _EMBED_ARGUMENT_UNSET and _is_relation_like(relation):
+        if text is _EMBED_ARGUMENT_UNSET:
+            raise TypeError("vane.ai.embed relation API requires a text Expression")
+        output_column = options.pop("output_column", "embedding")
+        return _embed_relation(
+            relation,
+            text,
+            provider=provider,
+            model=model,
+            dimensions=dimensions,
+            on_error=on_error,
+            output_column=output_column,
+            options=options,
+        )
+
+    if rel is not _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed rel= must be a Relation")
+    if first is not _EMBED_ARGUMENT_UNSET and text is not _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed expression API accepts a single text Expression")
+    expression = text if first is _EMBED_ARGUMENT_UNSET else first
+    if expression is _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed requires a text Expression or a Relation plus text Expression")
+    if "output_column" in options:
+        raise TypeError("vane.ai.embed expression API does not accept output_column; use .alias(...)")
+    return _embed_expression(
+        expression,
+        provider=provider,
+        model=model,
+        dimensions=dimensions,
+        on_error=on_error,
+        options=options,
     )
 
 

@@ -19,6 +19,7 @@ import pyarrow as pa
 import pytest
 
 import duckdb
+import vane
 from vane.ai.protocols import (
     TextClassifierDescriptor,
     TextEmbedderDescriptor,
@@ -135,17 +136,17 @@ class MockProvider(Provider):
 # ---------------------------------------------------------------------------
 
 
-class TestEmbedText:
-    def test_embed_text_basic(self):
-        """embed_text produces a relation with embedding column."""
-        from vane.ai.functions import embed_text
+class TestEmbed:
+    def test_embed_basic(self):
+        """embed preserves the source relation and appends an embedding."""
+        from vane.ai.functions import embed
 
         conn = duckdb.connect()
         rel = conn.sql("SELECT 'hello' AS text UNION ALL SELECT 'world' AS text")
 
-        result = embed_text(
+        result = embed(
             rel,
-            "text",
+            vane.col("text"),
             provider=MockProvider(),
         )
 
@@ -153,60 +154,60 @@ class TestEmbedText:
         assert len(rows) == 2
         # Each embedding should be a list of 4 floats
         for row in rows:
-            emb = row[0]
+            emb = row[1]
             assert len(emb) == 4
 
-    def test_embed_text_custom_dimensions(self):
-        """embed_text respects dimensions parameter."""
-        from vane.ai.functions import embed_text
+    def test_embed_custom_dimensions(self):
+        """embed respects dimensions parameter."""
+        from vane.ai.functions import embed
 
         conn = duckdb.connect()
         rel = conn.sql("SELECT 'test' AS text")
 
-        result = embed_text(
+        result = embed(
             rel,
-            "text",
+            vane.col("text"),
             provider=MockProvider(),
             dimensions=8,
         )
 
         rows = result.fetchall()
-        assert len(rows[0][0]) == 8
+        assert len(rows[0][1]) == 8
 
-    def test_embed_text_custom_output_column(self):
-        """embed_text uses custom output column name."""
-        from vane.ai.functions import embed_text
+    def test_embed_custom_output_column(self):
+        """embed uses a custom output column name."""
+        from vane.ai.functions import embed
 
         conn = duckdb.connect()
         rel = conn.sql("SELECT 'test' AS text")
 
-        result = embed_text(
+        result = embed(
             rel,
-            "text",
+            vane.col("text"),
             provider=MockProvider(),
             output_column="my_emb",
         )
 
         rows = result.fetchall()
         assert len(rows) == 1
+        assert result.columns == ["text", "my_emb"]
 
-    def test_embed_text_handles_null(self):
-        """embed_text handles NULL values by converting to empty string."""
-        from vane.ai.functions import embed_text
+    def test_embed_propagates_null(self):
+        """embed propagates NULL without sending an empty-string request."""
+        from vane.ai.functions import embed
 
         conn = duckdb.connect()
         rel = conn.sql("SELECT NULL::VARCHAR AS text")
 
-        result = embed_text(
+        result = embed(
             rel,
-            "text",
+            vane.col("text"),
             provider=MockProvider(),
         )
 
         rows = result.fetchall()
         assert len(rows) == 1
-        # Empty string → len 0, so all zeros
-        assert all(v == 0.0 for v in rows[0][0])
+        assert rows[0][1] is None
 
 
 class TestClassifyText:
@@ -273,7 +274,7 @@ class TestWrapperPickle:
     def test_embed_wrapper_pickle(self):
         from vane.ai.functions import _EmbedTextBatch
 
-        wrapper = _EmbedTextBatch(MockTextEmbedderDescriptor(dim=4), "text", "emb")
+        wrapper = _EmbedTextBatch(MockTextEmbedderDescriptor(dim=4), "text", "emb", 4)
         restored = pickle.loads(pickle.dumps(wrapper))
         table = pa.table({"text": ["hello", "world"]})
         result = _drive(restored, table)
@@ -447,12 +448,13 @@ class TestUDFExecutionOptions:
         assert kwargs["actor_number"] == 2
         assert kwargs["gpus"] == 1
 
-    def test_provider_descriptors_preserve_num_gpus(self):
+    def test_prompt_descriptors_preserve_num_gpus_but_embed_descriptors_do_not(self):
         from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
         from vane.ai.providers.google import GooglePrompterDescriptor, GoogleTextEmbedderDescriptor
         from vane.ai.providers.openai import OpenAIPrompterDescriptor, OpenAITextEmbedderDescriptor
 
-        assert OpenAITextEmbedderDescriptor(embed_options={"num_gpus": 1}).get_udf_options().num_gpus == 1
+        with pytest.raises(TypeError, match="num_gpus"):
+            OpenAITextEmbedderDescriptor(embed_options={"num_gpus": 1})
         assert OpenAIPrompterDescriptor(prompt_options={"num_gpus": 2}).get_udf_options().num_gpus == 2
         assert (
             AnthropicPrompterDescriptor(
@@ -462,12 +464,8 @@ class TestUDFExecutionOptions:
             .num_gpus
             == 3
         )
-        assert (
+        with pytest.raises(TypeError, match="num_gpus"):
             GoogleTextEmbedderDescriptor(model_name="gemini-embedding-001", embed_options={"num_gpus": 4})
-            .get_udf_options()
-            .num_gpus
-            == 4
-        )
         assert (
             GooglePrompterDescriptor(model_name="gemini-3.6-flash", prompt_options={"num_gpus": 5})
             .get_udf_options()
@@ -1706,14 +1704,15 @@ class TestGoogleProvider:
             model="gemini-embedding-001",
             api_key="call-key",
             task_type="RETRIEVAL_QUERY",
-            on_error="log",
         )
 
         # Credentials are sealed on the descriptor (vane#105).
         assert desc.provider_options == {"api_key": Secret("call-key")}
         assert "api_key" not in desc.embed_options
         assert desc.embed_options["task_type"] == "RETRIEVAL_QUERY"
-        assert desc.embed_options["on_error"] == "log"
+
+        with pytest.raises(TypeError, match="on_error"):
+            provider.get_text_embedder(model="gemini-embedding-001", on_error="log")
 
 
 class TestGoogleEmbeddingRowPreservation:
@@ -1769,7 +1768,7 @@ class TestGoogleEmbeddingRowPreservation:
 
         embedder, _ = self._make_embedder([SimpleNamespace(values=[0.1, 0.2])])
 
-        with pytest.raises(ValueError, match="one embedding per input row"):
+        with pytest.raises(TypeError, match="preserve row count and order"):
             asyncio.run(embedder.embed_text(["first row", "second row"]))
 
 
@@ -1891,7 +1890,7 @@ class TestGoogleEmbeddingBatching:
         embedder._dimensions = None
         embedder._options = {}
 
-        with pytest.raises(ValueError, match="returned 1 embeddings for 3 inputs"):
+        with pytest.raises(TypeError, match="returned 1 embeddings for 3 inputs"):
             asyncio.run(embedder.embed_text(["a", "b", "c"]))
 
     @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
@@ -1928,14 +1927,14 @@ class TestGoogleEmbeddingBatching:
         desc = GoogleTextEmbedderDescriptor(model_name="gemini-embedding-2")
         assert desc.get_udf_options().batch_size == 100
 
-    def test_udf_batch_size_explicit_override(self):
+    def test_descriptor_rejects_legacy_batch_size_override(self):
         from vane.ai.providers.google import GoogleTextEmbedderDescriptor
 
-        desc = GoogleTextEmbedderDescriptor(
-            model_name="gemini-embedding-001",
-            embed_options={"batch_size": 25},
-        )
-        assert desc.get_udf_options().batch_size == 25
+        with pytest.raises(TypeError, match="batch_size"):
+            GoogleTextEmbedderDescriptor(
+                model_name="gemini-embedding-001",
+                embed_options={"batch_size": 25},
+            )
 
 
 class TestGoogleConversationStructure:
@@ -2678,7 +2677,7 @@ class TestChunking:
                 return FakeEmbedder()
 
         desc = FakeDescriptor()
-        batch = _EmbedTextBatch(desc, "text", "embedding", max_chunk_chars=50, chunk_overlap_chars=10)
+        batch = _EmbedTextBatch(desc, "text", "embedding", dim, max_chunk_chars=50, chunk_overlap_chars=10)
 
         # Short text (no chunking) + long text (will be chunked)
         table = pa.table({"text": ["short", "a" * 200]})
@@ -2721,7 +2720,7 @@ class TestChunking:
                 return CountingEmbedder()
 
         desc = FakeDescriptor()
-        batch = _EmbedTextBatch(desc, "text", "embedding")  # no chunking
+        batch = _EmbedTextBatch(desc, "text", "embedding", dim)  # no chunking
 
         table = pa.table({"text": ["a" * 5000]})
         result = _drive(batch, table)
@@ -2757,7 +2756,7 @@ class TestChunking:
                 return SimpleEmbedder()
 
         desc = FakeDescriptor()
-        batch = _EmbedTextBatch(desc, "text", "embedding", max_chunk_chars=500, chunk_overlap_chars=50)
+        batch = _EmbedTextBatch(desc, "text", "embedding", dim, max_chunk_chars=500, chunk_overlap_chars=50)
         assert batch._max_chunk_chars == 500
         assert batch._chunk_overlap_chars == 50
 
@@ -4091,6 +4090,7 @@ class TestOpenAITokenMetrics:
         mock_usage.total_tokens = 25
 
         mock_embedding = MagicMock()
+        mock_embedding.index = 0
         mock_embedding.embedding = [0.1, 0.2, 0.3]
 
         mock_response = MagicMock()
@@ -4148,6 +4148,74 @@ class TestOpenAITokenMetrics:
 class TestOpenAITokenLimits:
     """Tests for per-model input token limits and oversized-text chunking."""
 
+    def test_embedding_response_indices_restore_input_order(self):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.providers.openai import OpenAITextEmbedder
+
+        response = SimpleNamespace(
+            data=[
+                SimpleNamespace(index=1, embedding=[20.0]),
+                SimpleNamespace(index=0, embedding=[10.0]),
+            ],
+            usage=None,
+        )
+        embedder = OpenAITextEmbedder.__new__(OpenAITextEmbedder)
+        embedder._client = MagicMock()
+        embedder._client.embeddings.create = AsyncMock(return_value=response)
+        embedder._model = "compatible-model"
+        embedder._dimensions = 1
+
+        result = asyncio.run(embedder._embed_batch(["row-0", "row-1"]))
+
+        assert [embedding.tolist() for embedding in result] == [[10.0], [20.0]]
+
+    def test_embedding_response_without_indices_preserves_physical_order(self):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.providers.openai import OpenAITextEmbedder
+
+        response = SimpleNamespace(
+            data=[
+                SimpleNamespace(embedding=[10.0]),
+                SimpleNamespace(embedding=[20.0]),
+            ],
+            usage=None,
+        )
+        embedder = OpenAITextEmbedder.__new__(OpenAITextEmbedder)
+        embedder._client = MagicMock()
+        embedder._client.embeddings.create = AsyncMock(return_value=response)
+        embedder._model = "compatible-model"
+        embedder._dimensions = 1
+
+        result = asyncio.run(embedder._embed_batch(["row-0", "row-1"]))
+
+        assert [embedding.tolist() for embedding in result] == [[10.0], [20.0]]
+
+    @pytest.mark.parametrize("indices", [(0,), (0, 0), (0, 2), (0, "1")])
+    def test_embedding_response_rejects_mixed_or_invalid_indices(self, indices):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.providers.openai import OpenAITextEmbedder
+
+        data = [SimpleNamespace(index=index, embedding=[float(position)]) for position, index in enumerate(indices)]
+        data.extend(SimpleNamespace(embedding=[float(position)]) for position in range(len(data), 2))
+        response = SimpleNamespace(data=data, usage=None)
+        embedder = OpenAITextEmbedder.__new__(OpenAITextEmbedder)
+        embedder._client = MagicMock()
+        embedder._client.embeddings.create = AsyncMock(return_value=response)
+        embedder._model = "compatible-model"
+        embedder._dimensions = 1
+
+        with pytest.raises(TypeError, match="invalid embedding indices"):
+            asyncio.run(embedder._embed_batch(["row-0", "row-1"]))
+
     def test_get_input_token_limit_known_model(self):
         from vane.ai.providers.openai import _get_input_token_limit
 
@@ -4193,8 +4261,9 @@ class TestOpenAITokenLimits:
             mock_response = MagicMock()
             mock_response.usage = None
             mock_response.data = []
-            for _t in texts:
+            for index, _t in enumerate(texts):
                 emb = MagicMock()
+                emb.index = index
                 emb.embedding = [1.0, 0.0, 0.0]
                 mock_response.data.append(emb)
             return mock_response
@@ -4219,6 +4288,31 @@ class TestOpenAITokenLimits:
         norm = np.linalg.norm(result[0])
         np.testing.assert_allclose(norm, 1.0, atol=1e-6)
 
+    def test_oversized_input_chunks_still_respect_batch_token_limit(self):
+        """Chunks from one long input are split across bounded requests."""
+        import asyncio
+
+        from vane.ai.providers.openai import OpenAITextEmbedder
+
+        calls: list[list[str]] = []
+
+        async def mock_embed_batch(texts):
+            calls.append(list(texts))
+            return [np.ones(2, dtype=np.float32) for _ in texts]
+
+        embedder = OpenAITextEmbedder.__new__(OpenAITextEmbedder)
+        embedder._model = "test-model"
+        embedder._dimensions = 2
+        embedder._batch_token_limit = 5
+        embedder._input_text_token_limit = 3
+        embedder._embed_batch = mock_embed_batch
+
+        result = asyncio.run(embedder.embed_text(["a" * 60]))
+
+        assert len(result) == 1
+        assert len(calls) > 1
+        assert all(sum((len(text) + 2) // 3 for text in call) <= 5 for call in calls)
+
     def test_normal_input_not_chunked(self):
         """Inputs within token limit are batched normally, not chunked."""
         import asyncio
@@ -4234,8 +4328,9 @@ class TestOpenAITokenLimits:
             mock_response = MagicMock()
             mock_response.usage = None
             mock_response.data = []
-            for _ in texts:
+            for index, _ in enumerate(texts):
                 emb = MagicMock()
+                emb.index = index
                 emb.embedding = [0.5, 0.5]
                 mock_response.data.append(emb)
             return mock_response
@@ -4272,8 +4367,9 @@ class TestOpenAITokenLimits:
             mock_response = MagicMock()
             mock_response.usage = None
             mock_response.data = []
-            for _ in texts:
+            for index, _ in enumerate(texts):
                 emb = MagicMock()
+                emb.index = index
                 emb.embedding = [1.0]
                 mock_response.data.append(emb)
             return mock_response
@@ -4310,6 +4406,7 @@ class TestOpenAITokenLimits:
             mock_response.data = []
             for i, _t in enumerate(texts):
                 emb = MagicMock()
+                emb.index = i
                 emb.embedding = [float(i + 1), 0.0]
                 mock_response.data.append(emb)
             return mock_response
@@ -4621,6 +4718,272 @@ class TestGoogleRetryHandling:
         _raise_retry_after_on_google_error(exc)
 
 
+class TestEmbedProviderCapabilityErrors:
+    @pytest.mark.parametrize("name", ["batch_size", "actor_number", "batch_token_limit"])
+    def test_non_nullable_integer_options_reject_explicit_none_during_planning(self, name):
+        with pytest.raises(ValueError, match=name):
+            vane.ai.embed(vane.col("text"), dimensions=4, **{name: None})
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "file:///tmp/embed",
+            "https://user:provider-url-secret-sentinel@example.test/v1",
+            "https://example.test/v1?organization=provider-url-secret-sentinel",
+        ],
+    )
+    def test_openai_provider_preset_reuses_safe_base_url_validation(self, base_url):
+        from vane.ai.providers.openai import OpenAIProvider
+
+        with pytest.raises(ValueError) as exc_info:
+            vane.ai.embed(vane.col("text"), provider=OpenAIProvider(base_url=base_url), dimensions=4)
+
+        assert "provider-url-secret-sentinel" not in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"trust_remote_code": True},
+            {"local_files_only": "yes"},
+            {"revision": "   "},
+        ],
+    )
+    def test_transformers_provider_preset_reuses_embed_value_validation(self, options):
+        from vane.ai.providers.transformers import TransformersProvider
+
+        with pytest.raises(ValueError):
+            vane.ai.embed(vane.col("text"), provider=TransformersProvider(**options))
+
+    @pytest.mark.parametrize("status_code", [404, 405, 501])
+    def test_openai_dynamic_endpoint_error_preserves_capability_context(self, monkeypatch, status_code):
+        import asyncio
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.provider import ProviderCapabilityError
+        from vane.ai.providers.openai import OpenAIProvider
+
+        class EndpointError(Exception):
+            pass
+
+        original = EndpointError("model is unavailable on this endpoint")
+        original.status_code = status_code
+        client = MagicMock()
+        client.embeddings.create = AsyncMock(side_effect=original)
+        monkeypatch.setitem(
+            sys.modules,
+            "openai",
+            SimpleNamespace(OpenAIError=EndpointError, AsyncOpenAI=MagicMock(return_value=client)),
+        )
+
+        descriptor = OpenAIProvider(name="openai-compatible-alias").get_text_embedder(
+            model="endpoint-only-model",
+            dimensions=4,
+        )
+        embedder = descriptor.instantiate()
+
+        with pytest.raises(ProviderCapabilityError) as exc_info:
+            asyncio.run(embedder._embed_batch(["hello"]))
+
+        error = exc_info.value
+        assert (error.provider, error.model, error.capability) == (
+            "openai-compatible-alias",
+            "endpoint-only-model",
+            "embedding endpoint/model",
+        )
+        assert error.original_error is original
+        assert error.__cause__ is original
+
+    def test_openai_input_validation_error_is_not_misclassified_as_capability(self, monkeypatch):
+        import asyncio
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.providers.openai import OpenAITextEmbedder
+
+        class InputError(Exception):
+            status_code = 400
+            param = "input"
+            code = "context_length_exceeded"
+
+        original = InputError("one input is too long")
+        monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAIError=InputError))
+
+        embedder = OpenAITextEmbedder.__new__(OpenAITextEmbedder)
+        embedder._client = MagicMock()
+        embedder._client.embeddings.create = AsyncMock(side_effect=original)
+        embedder._model = "endpoint-model"
+        embedder._dimensions = 4
+
+        with pytest.raises(InputError) as exc_info:
+            asyncio.run(embedder._embed_batch(["bad input"]))
+
+        assert exc_info.value is original
+
+    def test_openai_structured_model_error_is_a_capability_error(self, monkeypatch):
+        import asyncio
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.provider import ProviderCapabilityError
+        from vane.ai.providers.openai import OpenAITextEmbedder
+
+        class ModelError(Exception):
+            status_code = 400
+            param = "model"
+            code = "model_not_found"
+
+        original = ModelError("selected model cannot embed")
+        monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAIError=ModelError))
+
+        embedder = OpenAITextEmbedder.__new__(OpenAITextEmbedder)
+        embedder._client = MagicMock()
+        embedder._client.embeddings.create = AsyncMock(side_effect=original)
+        embedder._model = "chat-only-model"
+        embedder._dimensions = 4
+
+        with pytest.raises(ProviderCapabilityError) as exc_info:
+            asyncio.run(embedder._embed_batch(["hello"]))
+
+        assert exc_info.value.original_error is original
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    @pytest.mark.parametrize(
+        ("code", "status"),
+        [
+            (404, None),
+            (405, None),
+            (501, None),
+            (None, "NOT_FOUND"),
+            (None, "UNIMPLEMENTED"),
+        ],
+    )
+    def test_google_dynamic_endpoint_error_preserves_capability_context(self, monkeypatch, code, status):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from google import genai
+
+        from vane.ai.provider import ProviderCapabilityError
+        from vane.ai.providers.google import GoogleProvider
+
+        class EndpointError(Exception):
+            pass
+
+        original = EndpointError("model does not implement embed_content")
+        original.code = code
+        original.status = status
+        client = MagicMock()
+        monkeypatch.setattr(genai, "Client", lambda **_kwargs: client)
+        provider = GoogleProvider(
+            name="google-alias",
+            embedding_model="chat-only-model",
+            embedding_dimensions=4,
+        )
+        descriptor = provider.get_text_embedder()
+        embedder = descriptor.instantiate()
+        embedder._client.aio.models.embed_content = AsyncMock(side_effect=original)
+
+        with pytest.raises(ProviderCapabilityError) as exc_info:
+            asyncio.run(embedder.embed_text(["hello"]))
+
+        error = exc_info.value
+        assert (error.provider, error.model, error.capability) == (
+            "google-alias",
+            "chat-only-model",
+            "embedding endpoint/model",
+        )
+        assert error.original_error is original
+        assert error.__cause__ is original
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_google_generic_invalid_input_is_not_misclassified_as_capability(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.providers.google import GoogleTextEmbedder
+
+        class InputError(Exception):
+            code = 400
+            status = "INVALID_ARGUMENT"
+            details = {"error": {"message": "input is too long"}}
+
+        original = InputError("input is too long")
+        embedder = GoogleTextEmbedder.__new__(GoogleTextEmbedder)
+        embedder._client = MagicMock()
+        embedder._client.aio.models.embed_content = AsyncMock(side_effect=original)
+        embedder._model = "embedding-model"
+        embedder._dimensions = 4
+        embedder._options = {}
+
+        with pytest.raises(InputError) as exc_info:
+            asyncio.run(embedder.embed_text(["bad input"]))
+
+        assert exc_info.value is original
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_google_structured_model_field_error_is_a_capability_error(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.provider import ProviderCapabilityError
+        from vane.ai.providers.google import GoogleTextEmbedder
+
+        class ModelError(Exception):
+            code = 400
+            status = "INVALID_ARGUMENT"
+            details = {"fieldViolations": [{"field": "request.model"}]}
+
+        original = ModelError("selected model cannot embed")
+        embedder = GoogleTextEmbedder.__new__(GoogleTextEmbedder)
+        embedder._client = MagicMock()
+        embedder._client.aio.models.embed_content = AsyncMock(side_effect=original)
+        embedder._model = "chat-only-model"
+        embedder._dimensions = 4
+        embedder._options = {}
+
+        with pytest.raises(ProviderCapabilityError) as exc_info:
+            asyncio.run(embedder.embed_text(["hello"]))
+
+        assert exc_info.value.original_error is original
+
+    def test_transformers_not_implemented_model_is_a_capability_error(self, monkeypatch):
+        import contextlib
+        import sys
+        from types import SimpleNamespace
+
+        from vane.ai.provider import ProviderCapabilityError
+        from vane.ai.providers.transformers import TransformersProvider
+
+        class UnsupportedModel:
+            def eval(self):
+                return self
+
+            def encode(self, *_args, **_kwargs):
+                raise NotImplementedError("model has no sentence-embedding capability")
+
+        model = UnsupportedModel()
+        monkeypatch.setitem(
+            sys.modules,
+            "sentence_transformers",
+            SimpleNamespace(SentenceTransformer=lambda *_args, **_kwargs: model),
+        )
+        monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(inference_mode=contextlib.nullcontext))
+        provider = TransformersProvider(name="transformers-alias")
+        descriptor = provider.get_text_embedder(model="chat-only-model", dimensions=4)
+        embedder = descriptor.instantiate()
+
+        with pytest.raises(ProviderCapabilityError) as exc_info:
+            embedder.embed_text(["hello"])
+
+        assert descriptor.get_provider() == "transformers-alias"
+        assert exc_info.value.provider == "transformers-alias"
+        assert exc_info.value.original_error is not None
+
+
 class TestRetryCall:
     """Tests for _retry_call and _retry_call_async helpers."""
 
@@ -4771,23 +5134,71 @@ class TestWrapperRetry:
         desc.instantiate = MagicMock(return_value=embedder)
         return desc
 
-    def test_embed_retry_success(self):
+    def test_embed_retry_success(self, monkeypatch):
         from vane.ai.functions import _EmbedTextBatch
 
+        monkeypatch.setattr("vane.ai.functions.time.sleep", lambda _seconds: None)
         calls = []
+
+        class ServiceUnavailableError(RuntimeError):
+            status_code = 503
 
         def embed(texts):
             calls.append(1)
             if len(calls) < 2:
-                raise RuntimeError("API error")
+                raise ServiceUnavailableError("API error")
             return [np.array([1.0, 2.0, 3.0])] * len(texts)
 
         desc = self._make_embed_descriptor(embed)
-        wrapper = _EmbedTextBatch(desc, "text", "emb", max_retries=3, on_error="raise")
+        wrapper = _EmbedTextBatch(desc, "text", "emb", 3, max_retries=3, on_error="raise")
         table = pa.table({"text": ["hello"]})
         result = _drive(wrapper, table)
         assert result.column("emb").length() == 1
         assert len(calls) == 2
+
+    @pytest.mark.parametrize("status_code", [None, 400, 401, 403, 404, 405, 422, 501])
+    def test_embed_does_not_retry_nontransient_http_error(self, status_code):
+        from vane.ai.functions import _EmbedTextBatch
+
+        calls = []
+
+        class NonTransientError(RuntimeError):
+            pass
+
+        error = NonTransientError("invalid input")
+        if status_code is not None:
+            error.status_code = status_code
+
+        def embed(texts):
+            calls.append(list(texts))
+            raise error
+
+        desc = self._make_embed_descriptor(embed)
+        wrapper = _EmbedTextBatch(desc, "text", "emb", 3, max_retries=3, on_error="raise")
+
+        with pytest.raises(NonTransientError, match="invalid input"):
+            _drive(wrapper, pa.table({"text": ["hello"]}))
+
+        assert calls == [["hello"]]
+
+    def test_embed_ignore_isolates_without_retrying_nontransient_error(self):
+        from vane.ai.functions import _EmbedTextBatch
+
+        calls = []
+
+        class UnprocessableInputError(RuntimeError):
+            status_code = 422
+
+        def embed(texts):
+            calls.append(list(texts))
+            raise UnprocessableInputError("invalid input")
+
+        desc = self._make_embed_descriptor(embed)
+        wrapper = _EmbedTextBatch(desc, "text", "emb", 3, max_retries=3, on_error="ignore")
+        result = _drive(wrapper, pa.table({"text": ["first", "second"]}))
+
+        assert result.column("emb").to_pylist() == [None, None]
+        assert calls == [["first", "second"], ["first"], ["second"]]
 
     def test_embed_on_error_ignore(self):
         from vane.ai.functions import _EmbedTextBatch
@@ -4796,11 +5207,10 @@ class TestWrapperRetry:
             raise RuntimeError("permanent failure")
 
         desc = self._make_embed_descriptor(embed)
-        wrapper = _EmbedTextBatch(desc, "text", "emb", max_retries=0, on_error="ignore")
+        wrapper = _EmbedTextBatch(desc, "text", "emb", 3, max_retries=0, on_error="ignore")
         table = pa.table({"text": ["hello"]})
         result = _drive(wrapper, table)
-        # Should return zero embeddings
-        assert result.column("emb").length() == 1
+        assert result.column("emb").to_pylist() == [None]
 
     def test_classify_on_error_log(self):
         from vane.ai.functions import _ClassifyTextBatch

@@ -4,13 +4,18 @@
 #include "duckdb_python/ai_sql_functions.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/scalar_macro_function.hpp"
 #include "duckdb/function/scalar/vllm_functions.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/parsed_data/create_macro_info.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb_python/pybind11/gil_wrapper.hpp"
@@ -22,6 +27,8 @@ namespace duckdb {
 namespace {
 
 enum class AISQLKind : uint8_t { PROMPT, EMBED };
+
+static constexpr const char *HIDDEN_EMBED_FUNCTION = "__vane_ai_embed";
 
 struct NativeVLLMSpec {
 	string model;
@@ -76,13 +83,10 @@ static py::object DictGetOrNone(const py::dict &dict, const char *key) {
 
 static idx_t OptionsArgumentIndex(AISQLKind kind, idx_t argument_count) {
 	if (kind == AISQLKind::EMBED) {
-		if (argument_count == 1) {
-			return argument_count;
+		if (argument_count == 6) {
+			return 5;
 		}
-		if (argument_count == 2) {
-			return 1;
-		}
-		throw BinderException("ai_embed requires one or two arguments");
+		throw BinderException("%s requires six arguments supplied by the ai_embed macro", HIDDEN_EMBED_FUNCTION);
 	}
 	if (argument_count == 1) {
 		return argument_count;
@@ -97,7 +101,7 @@ static idx_t OptionsArgumentIndex(AISQLKind kind, idx_t argument_count) {
 }
 
 static py::object OptionsToPython(ClientContext &context, vector<unique_ptr<Expression>> &arguments,
-                                  idx_t options_index) {
+                                  idx_t options_index, bool require_struct) {
 	if (options_index >= arguments.size()) {
 		return py::none();
 	}
@@ -107,14 +111,36 @@ static py::object OptionsToPython(ClientContext &context, vector<unique_ptr<Expr
 	if (options.IsNull()) {
 		return py::none();
 	}
+	if (require_struct && options.type().id() != LogicalTypeId::STRUCT) {
+		throw BinderException("ai_embed options must be NULL or a foldable STRUCT, not %s", options.type().ToString());
+	}
 	return PythonObject::FromValue(options, options.type(), context.GetClientProperties());
 }
 
-static py::dict BuildAISQLSpec(AISQLKind kind, const py::object &py_options, bool image_input) {
+static py::object ConstantArgumentToPython(ClientContext &context, vector<unique_ptr<Expression>> &arguments,
+                                           idx_t index, const string &name) {
+	auto &argument = *arguments[index];
+	ThrowIfNotConstant(argument, name);
+	auto value = EvaluateConstant(context, argument);
+	if (value.IsNull()) {
+		return py::none();
+	}
+	return PythonObject::FromValue(value, value.type(), context.GetClientProperties());
+}
+
+static py::dict BuildAISQLSpec(AISQLKind kind, ClientContext &context, vector<unique_ptr<Expression>> &arguments,
+                               idx_t options_index, bool image_input) {
 	auto sql_module = py::module_::import("vane.ai._sql");
-	auto builder = kind == AISQLKind::PROMPT ? sql_module.attr("build_ai_prompt_sql_spec")
-	                                         : sql_module.attr("build_ai_embed_sql_spec");
-	return py::cast<py::dict>(kind == AISQLKind::PROMPT ? builder(py_options, image_input) : builder(py_options));
+	auto py_options = OptionsToPython(context, arguments, options_index, kind == AISQLKind::EMBED);
+	if (kind == AISQLKind::PROMPT) {
+		return py::cast<py::dict>(sql_module.attr("build_ai_prompt_sql_spec")(py_options, image_input));
+	}
+	auto provider = ConstantArgumentToPython(context, arguments, 1, "provider");
+	auto model = ConstantArgumentToPython(context, arguments, 2, "model");
+	auto dimensions = ConstantArgumentToPython(context, arguments, 3, "dimensions");
+	auto on_error = ConstantArgumentToPython(context, arguments, 4, "on_error");
+	return py::cast<py::dict>(
+	    sql_module.attr("build_ai_embed_sql_spec")(provider, model, dimensions, on_error, py_options));
 }
 
 static string ParseExecutionKind(const py::dict &spec) {
@@ -233,8 +259,7 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	unique_ptr<NativeVLLMSpec> native_vllm;
 	{
 		PythonGILWrapper acquire;
-		auto py_options = OptionsToPython(context, arguments, options_index);
-		auto spec = BuildAISQLSpec(kind, py_options, image_input);
+		auto spec = BuildAISQLSpec(kind, context, arguments, options_index, image_input);
 		auto execution_kind = ParseExecutionKind(spec);
 		if (execution_kind == "native_vllm") {
 			if (kind != AISQLKind::PROMPT) {
@@ -257,7 +282,14 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	}
 	auto return_type = udf_helpers::ResolvePayloadReturnType(payload);
 	bound_function.SetReturnType(return_type);
-	if (options_index < arguments.size()) {
+	if (kind == AISQLKind::EMBED) {
+		// The public macro forwards five call-level constants after the text
+		// expression. They are fully consumed by this binder and must not become
+		// row inputs to the lowered expression UDF.
+		for (idx_t index = arguments.size(); index-- > 1;) {
+			Function::EraseArgument(bound_function, arguments, index);
+		}
+	} else if (options_index < arguments.size()) {
 		Function::EraseArgument(bound_function, arguments, options_index);
 	}
 	bound_function.SetExtraFunctionInfo(make_shared_ptr<RegisteredUDFFunctionInfo>(payload));
@@ -288,6 +320,20 @@ static unique_ptr<Expression> LowerAISQLImageExpressionUDF(FunctionBindExpressio
 		return make_uniq<BoundConstantExpression>(Value(registered_data.return_type));
 	}
 	return LowerRegisteredExpressionUDFPreservingFoldableNulls(input);
+}
+
+static unique_ptr<Expression> LowerAISQLEmbedExpressionUDF(FunctionBindExpressionInput &input) {
+	if (!input.bind_data) {
+		throw BinderException("registered expression UDF is missing bind payload");
+	}
+	if (input.children.size() != 1) {
+		throw BinderException("ai_embed expected one runtime argument");
+	}
+	if (IsFoldableNull(input.context, *input.children[0])) {
+		auto &registered_data = input.bind_data->Cast<UDFFunctionData>();
+		return make_uniq<BoundConstantExpression>(Value(registered_data.return_type));
+	}
+	return LowerRegisteredExpressionUDF(input);
 }
 
 static void AddAISQLFunctions(ScalarFunctionSet &set, bind_scalar_function_t bind, bool include_image_inputs) {
@@ -327,10 +373,58 @@ ScalarFunctionSet AISQLFunction::GetPromptFunctions() {
 	return set;
 }
 
-ScalarFunctionSet AISQLFunction::GetEmbedFunctions() {
-	ScalarFunctionSet set("ai_embed");
-	AddAISQLFunctions(set, AISQLEmbedBind, false);
+ScalarFunctionSet AISQLFunction::GetEmbedImplementationFunctions() {
+	ScalarFunctionSet set(HIDDEN_EMBED_FUNCTION);
+	auto implementation = ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                                      LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::ANY},
+	                                     LogicalType::ANY, AISQLExecute, AISQLEmbedBind, nullptr, nullptr, nullptr,
+	                                     LogicalType::INVALID, FunctionStability::VOLATILE);
+	// model, dimensions, and options legitimately default to NULL. The binder
+	// must still run so it can consume those call-level constants, resolve the
+	// fixed output type, and preserve it for a NULL text input.
+	implementation.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	implementation.SetBindExpressionCallback(LowerAISQLEmbedExpressionUDF);
+	set.AddFunction(std::move(implementation));
 	return set;
+}
+
+unique_ptr<CreateMacroInfo> AISQLFunction::GetEmbedMacro() {
+	auto expressions = Parser::ParseExpressionList(
+	    StringUtil::Format("%s(text, provider, model, dimensions, on_error, options)", HIDDEN_EMBED_FUNCTION));
+	if (expressions.size() != 1) {
+		throw InternalException("Expected one ai_embed macro expression");
+	}
+	auto function = make_uniq<ScalarMacroFunction>(std::move(expressions[0]));
+
+	auto add_parameter = [&](const string &name, const LogicalType &type, const char *default_sql) {
+		function->parameters.push_back(make_uniq<ColumnRefExpression>(name));
+		function->types.push_back(type);
+		if (!default_sql) {
+			return;
+		}
+		auto defaults = Parser::ParseExpressionList(default_sql);
+		if (defaults.size() != 1) {
+			throw InternalException("Expected one default expression for ai_embed parameter '%s'", name);
+		}
+		function->default_parameters.insert(make_pair(name, std::move(defaults[0])));
+	};
+
+	add_parameter("text", LogicalType::VARCHAR, nullptr);
+	add_parameter("provider", LogicalType::VARCHAR, "'openai'");
+	add_parameter("model", LogicalType::VARCHAR, "NULL");
+	add_parameter("dimensions", LogicalType::INTEGER, "NULL");
+	add_parameter("on_error", LogicalType::VARCHAR, "'raise'");
+	// Macro parameters cannot use ANY. UNKNOWN leaves options uncast so the
+	// hidden binder can require a foldable STRUCT (or NULL) precisely.
+	add_parameter("options", LogicalType::UNKNOWN, "NULL");
+
+	auto info = make_uniq<CreateMacroInfo>(CatalogType::MACRO_ENTRY);
+	info->schema = DEFAULT_SCHEMA;
+	info->name = "ai_embed";
+	info->temporary = true;
+	info->internal = true;
+	info->macros.push_back(std::move(function));
+	return info;
 }
 
 } // namespace duckdb

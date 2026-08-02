@@ -35,6 +35,35 @@ class ProviderImportError(ImportError):
         super().__init__(f"Please `pip install 'vane-ai[{extra}]'`{fn_msg} with this provider.")
 
 
+class ProviderCapabilityError(RuntimeError):
+    """A runtime endpoint or model cannot satisfy a requested AI capability.
+
+    Static capability mismatches are rejected while preparing the call. This
+    error is reserved for facts that can only be learned from the selected
+    endpoint or loaded model at execution time.
+    """
+
+    def __init__(
+        self,
+        provider: str,
+        model: str,
+        capability: str,
+        *,
+        original_error: Exception | None = None,
+    ) -> None:
+        self.provider = provider
+        self.model = model
+        self.capability = capability
+        self.original_error = original_error
+        super().__init__(
+            f"Provider {provider!r} model {model!r} does not support the requested {capability} capability"
+        )
+
+
+class _ProviderResultError(TypeError):
+    """A Provider response violates the row-preserving typed result contract."""
+
+
 # ---------------------------------------------------------------------------
 # Lazy loader functions
 # ---------------------------------------------------------------------------

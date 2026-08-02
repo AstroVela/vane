@@ -32,6 +32,7 @@ dependencies = [
     "numpy",
     "pyarrow>=14.0.0",
     "ray>=2.53.0,<3",
+    "typing-extensions",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

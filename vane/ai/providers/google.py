@@ -27,7 +27,7 @@ import numpy as np
 
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
-from vane.ai.provider import Provider, ProviderImportError
+from vane.ai.provider import Provider, ProviderCapabilityError, ProviderImportError, _ProviderResultError
 from vane.ai.typing import EmbeddingDimensions, UDFOptions
 
 if TYPE_CHECKING:
@@ -80,6 +80,47 @@ def _raise_retry_after_on_google_error(exc: Exception) -> None:
     raise RetryAfterError(retry_after=retry_after, original=exc) from exc
 
 
+_EMBED_CAPABILITY_FIELD_SUFFIXES = (
+    "model",
+    "dimensions",
+    "outputdimensionality",
+    "tasktype",
+)
+
+
+def _google_error_fields(value: Any) -> list[str]:
+    fields: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).casefold() in {"field", "param"} and isinstance(item, str):
+                fields.append(item)
+            fields.extend(_google_error_fields(item))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            fields.extend(_google_error_fields(item))
+    return fields
+
+
+def _is_embedding_capability_error(exc: Exception) -> bool:
+    """Classify only structured endpoint/model embedding failures."""
+    code = getattr(exc, "code", None)
+    status = str(getattr(exc, "status", "") or "").strip().upper()
+    if code in {404, 405, 501} or status in {"NOT_FOUND", "UNIMPLEMENTED"}:
+        return True
+    if code not in {400, 422}:
+        return False
+
+    fields = _google_error_fields(getattr(exc, "details", None))
+    direct_field = getattr(exc, "field", None) or getattr(exc, "param", None)
+    if isinstance(direct_field, str):
+        fields.append(direct_field)
+    for field in fields:
+        normalized = "".join(character for character in field.casefold() if character.isalnum())
+        if normalized.endswith(_EMBED_CAPABILITY_FIELD_SUFFIXES):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Model metadata
 # ---------------------------------------------------------------------------
@@ -105,6 +146,7 @@ _EMBEDDING_DIM_RANGE: dict[str, tuple[int, int]] = {
 # batches with "BatchEmbedContentsRequest.requests: at most 100 requests can
 # be in one batch", so 100 is the server-enforced limit.
 _EMBED_BATCH_LIMIT = 100
+_EMBED_REQUEST_OPTIONS = frozenset({"task_type", "title"})
 
 # Conversation roles supported by the Gemini API, mapped from the
 # OpenAI/Anthropic-style role names used in Vane message dicts to the wire
@@ -252,6 +294,9 @@ class GoogleProvider(Provider):
                 be resolved for the selected model.
         """
         provider_options, embed_options = self._split_options(options)
+        unknown = sorted(set(embed_options) - _EMBED_REQUEST_OPTIONS)
+        if unknown:
+            raise TypeError(f"Unsupported Google Embed option(s): {', '.join(unknown)}")
         model_name = model if model is not None else self._embedding_model
         if model_name is None:
             raise ValueError(
@@ -334,7 +379,14 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
     embed_options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        unknown = sorted(set(self.embed_options) - _EMBED_REQUEST_OPTIONS)
+        if unknown:
+            raise TypeError(f"Unsupported Google Embed option(s): {', '.join(unknown)}")
         _validate_embedding_dimensions(self.model_name, self.dimensions)
+        task_type = self.embed_options.get("task_type")
+        title = self.embed_options.get("title")
+        if title is not None and task_type != "RETRIEVAL_DOCUMENT":
+            raise ValueError("Google embedding title is only valid with task_type='RETRIEVAL_DOCUMENT'")
         self.provider_options = wrap_sensitive_options(self.provider_options)
         self.embed_options = wrap_sensitive_options(self.embed_options)
 
@@ -354,11 +406,11 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
 
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(
-            batch_size=self.embed_options.get("batch_size", _EMBED_BATCH_LIMIT),
-            max_retries=self.embed_options.get("max_retries", 3),
-            on_error=self.embed_options.get("on_error", "raise"),
-            actor_number=self.embed_options.get("actor_number"),
-            num_gpus=self.embed_options.get("num_gpus"),
+            batch_size=_EMBED_BATCH_LIMIT,
+            max_retries=3,
+            on_error="raise",
+            actor_number=None,
+            num_gpus=0,
         )
 
     def is_async(self) -> bool:
@@ -369,6 +421,7 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
             provider_options=self.provider_options,
             model=self.model_name,
             dimensions=self.dimensions,
+            provider_name=self.provider_name,
             **self.embed_options,
         )
 
@@ -381,6 +434,7 @@ class GoogleTextEmbedder:
         provider_options: dict[str, Any],
         model: str,
         dimensions: int | None = None,
+        provider_name: str = "google",
         **options: Any,
     ):
         from google import genai
@@ -391,24 +445,10 @@ class GoogleTextEmbedder:
         options = unwrap_sensitive_options(options)
         api_key = provider_options.get("api_key")
         self._client = genai.Client(api_key=api_key) if api_key else genai.Client()
+        self._provider_name = provider_name
         self._model = model
         self._dimensions = dimensions
-        self._options = {
-            k: v
-            for k, v in options.items()
-            if k
-            not in {
-                "api_key",
-                "on_error",
-                "actor_number",
-                "num_gpus",
-                "concurrency",
-                "max_api_concurrency",
-                "max_retries",
-                "model",
-                "batch_size",
-            }
-        }
+        self._options = dict(options)
 
     async def aclose(self) -> None:
         """Release the SDK client's async connection pool on the owning loop."""
@@ -443,13 +483,19 @@ class GoogleTextEmbedder:
                 result = await self._client.aio.models.embed_content(**kwargs)
             except Exception as exc:
                 _raise_retry_after_on_google_error(exc)
+                if _is_embedding_capability_error(exc):
+                    raise ProviderCapabilityError(
+                        getattr(self, "_provider_name", "google"),
+                        self._model,
+                        "embedding endpoint/model",
+                        original_error=exc,
+                    ) from exc
                 raise
             chunk_embeddings = result.embeddings or []
             if len(chunk_embeddings) != len(chunk):
-                raise ValueError(
-                    f"Google embed_content returned {len(chunk_embeddings)} embeddings for "
-                    f"{len(chunk)} inputs with model {self._model!r}; embedding calls "
-                    "must return exactly one embedding per input row."
+                raise _ProviderResultError(
+                    f"Google embed_content returned {len(chunk_embeddings)} embeddings for {len(chunk)} inputs; "
+                    "embedding calls must preserve row count and order"
                 )
             embeddings.extend(np.array(e.values, dtype=np.float32) for e in chunk_embeddings)
         return embeddings
