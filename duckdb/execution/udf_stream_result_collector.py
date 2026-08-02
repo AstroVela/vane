@@ -27,6 +27,7 @@ from duckdb.execution.ray_control_submission import (
 from duckdb.execution.ray_stream_adapter import (
     RayStreamAdapter,
     RayStreamCleanupOperation,
+    RayStreamCleanupWait,
     TaskLeaseObjectRefGenerator,
     ray_object_ref_future,
     validate_ray_control_ack,
@@ -83,8 +84,6 @@ class _OutputLeaseToken:
     handed_off: bool = False
     handoff_pending: bool = False
     release_pending: bool = False
-    handoff_response_future: Any | None = None
-    release_response_future: Any | None = None
 
 
 @dataclass
@@ -153,17 +152,16 @@ class _CleanupTicket:
         operation: RayStreamCleanupOperation,
         retry_on_error: bool,
         retry_on_incomplete: bool,
-        release_wait: Callable[[Any], None] | None,
         on_complete: Callable[[BaseException | None], None],
     ) -> None:
         self.operation = operation
         self.retry_on_error = bool(retry_on_error)
         self.retry_on_incomplete = bool(retry_on_incomplete)
-        self.release_wait = release_wait
         self.retry_count = 0
         self.submitting = False
         self.operation_future: Any | None = None
         self.wait_future: Any | None = None
+        self.wait_response: RayStreamCleanupWait | None = None
         self.retry_call: RayControlScheduledCall | None = None
         self.wait_timeout: RayControlScheduledCall | None = None
         self._done = False
@@ -173,11 +171,11 @@ class _CleanupTicket:
         self._callback_complete = False
         self._cv = threading.Condition()
 
-    def finish(self, error: BaseException | None) -> None:
+    def finish(self, error: BaseException | None) -> bool:
         callback: Callable[[BaseException | None], None] | None = None
         with self._cv:
             if self._done:
-                raise RuntimeError("Ray UDF cleanup ticket completed twice")
+                return False
             self._done = True
             self._error = error
             callback = self._on_complete
@@ -191,6 +189,7 @@ class _CleanupTicket:
                 self._callback_thread = None
                 self._callback_complete = True
                 self._cv.notify_all()
+        return True
 
     def wait(self, timeout: float) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout))
@@ -507,77 +506,45 @@ class AsyncResultCollector:
                 raise
         return True
 
-    def _run_output_token_handoff(self, token: _OutputLeaseToken) -> bool | Any:
+    def _run_output_token_handoff(
+        self,
+        token: _OutputLeaseToken,
+    ) -> bool | RayStreamCleanupWait:
         key = (token.request_id, token.lease_id)
         with self._cv:
             if token.release_pending or self._active_output_leases.get(key) is not token:
-                token.handoff_response_future = None
                 return True
-            response_future = token.handoff_response_future
-        try:
-            if response_future is None:
-                response_ref = token.driver.handoff_query_output_block_lease.remote(
-                    token.request_id,
-                    token.lease_id,
-                    token.query_id,
-                )
-                response_future = ray_object_ref_future(response_ref)
-                with self._cv:
-                    token.handoff_response_future = response_future
-            if not response_future.done():
-                return response_future
-            validate_ray_control_ack(response_future.result(), field="handed_off")
-        except BaseException:
-            with self._cv:
-                if token.handoff_response_future is response_future:
-                    token.handoff_response_future = None
-            raise
-        with self._cv:
-            token.handoff_response_future = None
-        return True
+        response_ref = token.driver.handoff_query_output_block_lease.remote(
+            token.request_id,
+            token.lease_id,
+            token.query_id,
+        )
+        response_future = ray_object_ref_future(response_ref)
+        return RayStreamCleanupWait(
+            response_future,
+            lambda response: validate_ray_control_ack(
+                response,
+                field="handed_off",
+            ),
+        )
 
-    def _release_output_token_handoff_wait(
+    def _run_output_token_release(
         self,
         token: _OutputLeaseToken,
-        response_future: Any,
-    ) -> None:
-        with self._cv:
-            if token.handoff_response_future is response_future:
-                token.handoff_response_future = None
-
-    def _run_output_token_release(self, token: _OutputLeaseToken) -> bool | Any:
-        with self._cv:
-            response_future = token.release_response_future
-        try:
-            if response_future is None:
-                response_ref = token.driver.release_query_output_block_lease.remote(
-                    token.request_id,
-                    token.lease_id,
-                    token.query_id,
-                )
-                response_future = ray_object_ref_future(response_ref)
-                with self._cv:
-                    token.release_response_future = response_future
-            if not response_future.done():
-                return response_future
-            validate_ray_control_ack(response_future.result(), field="released")
-        except BaseException:
-            with self._cv:
-                if token.release_response_future is response_future:
-                    token.release_response_future = None
-            raise
-        with self._cv:
-            token.release_response_future = None
-        return True
-
-    def _release_output_token_release_wait(
-        self,
-        token: _OutputLeaseToken,
-        response_future: Any,
-    ) -> None:
-        with self._cv:
-            if token.release_response_future is response_future:
-                token.release_response_future = None
+    ) -> RayStreamCleanupWait:
+        response_ref = token.driver.release_query_output_block_lease.remote(
+            token.request_id,
+            token.lease_id,
+            token.query_id,
+        )
+        response_future = ray_object_ref_future(response_ref)
+        return RayStreamCleanupWait(
+            response_future,
+            lambda response: validate_ray_control_ack(
+                response,
+                field="released",
+            ),
+        )
 
     @staticmethod
     def _claim_output_token_releases_locked(
@@ -615,10 +582,6 @@ class AsyncResultCollector:
             submission_scope=token.submission_scope,
             retry_on_error=True,
             retry_on_incomplete=True,
-            release_wait=lambda future: self._release_output_token_handoff_wait(
-                token,
-                future,
-            ),
         )
 
     def _output_token_release_operation(
@@ -630,10 +593,6 @@ class AsyncResultCollector:
             submission_scope=token.submission_scope,
             retry_on_error=True,
             retry_on_incomplete=True,
-            release_wait=lambda future: self._release_output_token_release_wait(
-                token,
-                future,
-            ),
         )
 
     @staticmethod
@@ -642,34 +601,22 @@ class AsyncResultCollector:
         request: dict[str, Any],
         submission_scope: str,
     ) -> RayStreamCleanupOperation:
-        response_future: Any | None = None
-
-        def cancel() -> bool | Any:
-            nonlocal response_future
-            try:
-                if response_future is None:
-                    response_ref = driver.cancel_query_output_block_lease_request.remote(request)
-                    response_future = ray_object_ref_future(response_ref)
-                if not response_future.done():
-                    return response_future
-                validate_ray_control_ack(response_future.result(), field="cancelled")
-            except BaseException:
-                response_future = None
-                raise
-            response_future = None
-            return True
-
-        def release_wait(future: Any) -> None:
-            nonlocal response_future
-            if response_future is future:
-                response_future = None
+        def cancel() -> RayStreamCleanupWait:
+            response_ref = driver.cancel_query_output_block_lease_request.remote(request)
+            response_future = ray_object_ref_future(response_ref)
+            return RayStreamCleanupWait(
+                response_future,
+                lambda response: validate_ray_control_ack(
+                    response,
+                    field="cancelled",
+                ),
+            )
 
         return RayStreamCleanupOperation(
             cancel,
             submission_scope=submission_scope,
             retry_on_error=True,
             retry_on_incomplete=True,
-            release_wait=release_wait,
         )
 
     def cancel_slot(self, slot_id: int) -> None:
@@ -1253,7 +1200,6 @@ class AsyncResultCollector:
                 operation=action,
                 retry_on_error=action.retry_on_error,
                 retry_on_incomplete=action.retry_on_incomplete,
-                release_wait=action.release_wait,
                 on_complete=complete,
             )
             ticket_holder.append(ticket)
@@ -1333,41 +1279,76 @@ class AsyncResultCollector:
             ticket.retry_call = None
         self._drive_cleanup_ticket(ticket)
 
-    def _resume_cleanup_ticket(self, ticket: _CleanupTicket, future: Any) -> None:
+    def _resume_cleanup_ticket(
+        self,
+        ticket: _CleanupTicket,
+        future: Any,
+        accept_response: Callable[[Any], Any] | None,
+    ) -> None:
         with self._cv:
-            if ticket not in self._cleanup_tickets or ticket.wait_future is not future:
+            if ticket not in self._cleanup_tickets:
                 return
-            ticket.wait_future = None
-            timeout = ticket.wait_timeout
-            ticket.wait_timeout = None
+            current = ticket.wait_future is future
+            if current:
+                ticket.wait_future = None
+                ticket.wait_response = None
+                timeout = ticket.wait_timeout
+                ticket.wait_timeout = None
+            else:
+                timeout = None
         if timeout is not None:
             timeout.cancel()
-        self._drive_cleanup_ticket(ticket)
+        if accept_response is None:
+            if current:
+                self._drive_cleanup_ticket(ticket)
+            return
+        try:
+            accept_response(future.result())
+        except BaseException as exc:
+            if current:
+                self._finish_cleanup_operation(ticket, error=exc)
+            return
+
+        # A valid acknowledgement from any timed-out attempt proves that the
+        # idempotent terminal transition completed. Retire a newer observer or
+        # pending retry before publishing ticket completion.
+        with self._cv:
+            if ticket not in self._cleanup_tickets:
+                return
+            wait_timeout = ticket.wait_timeout
+            retry_call = ticket.retry_call
+            ticket.wait_future = None
+            ticket.wait_response = None
+            ticket.wait_timeout = None
+            ticket.retry_call = None
+        if wait_timeout is not None:
+            wait_timeout.cancel()
+        if retry_call is not None:
+            retry_call.cancel()
+        ticket.finish(None)
 
     def _timeout_cleanup_ticket(
         self,
         ticket: _CleanupTicket,
         future: Any,
+        response: RayStreamCleanupWait,
         timeout_call: RayControlScheduledCall,
     ) -> None:
         with self._cv:
             if (
                 ticket not in self._cleanup_tickets
                 or ticket.wait_future is not future
+                or ticket.wait_response is not response
                 or ticket.wait_timeout is not timeout_call
             ):
                 return
             ticket.wait_future = None
+            ticket.wait_response = None
             ticket.wait_timeout = None
-        # Publish the retry owner before releasing attempt-local state. The
-        # release hook is not allowed to call Future.cancel(), but an
-        # unexpected hook failure must not drop durable cleanup ownership.
+        # The Future callback retains this response attempt, so a later valid
+        # acknowledgement can still complete the ticket while the retry owns
+        # forward progress.
         self._retry_cleanup_ticket(ticket)
-        try:
-            assert ticket.release_wait is not None
-            ticket.release_wait(future)
-        except BaseException:
-            pass
 
     def _drive_cleanup_ticket(self, ticket: _CleanupTicket) -> None:
         with self._cv:
@@ -1453,16 +1434,21 @@ class AsyncResultCollector:
             ticket.finish(error)
             return
 
-        if all(callable(getattr(result, name, None)) for name in ("add_done_callback", "done", "result")):
+        response = result if isinstance(result, RayStreamCleanupWait) else None
+        future = response.future if response is not None else result
+        if all(callable(getattr(future, name, None)) for name in ("add_done_callback", "done", "result")):
             with self._cv:
                 if ticket not in self._cleanup_tickets:
                     return
-                ticket.wait_future = result
+                ticket.wait_future = future
+                ticket.wait_response = response
 
             collector_ref = weakref.ref(self)
             ticket_ref = weakref.ref(ticket)
+            response_holder = [None if response is None else response.accept]
 
-            def ready(future: Any) -> None:
+            def ready(done: Any) -> None:
+                accept_response = response_holder.pop() if response_holder else None
                 collector = collector_ref()
                 active_ticket = ticket_ref()
                 if collector is None or active_ticket is None:
@@ -1470,15 +1456,17 @@ class AsyncResultCollector:
                 collector._run_scheduler_callback(
                     collector._resume_cleanup_ticket,
                     active_ticket,
-                    future,
+                    done,
+                    accept_response,
                 )
 
             try:
-                result.add_done_callback(ready)
+                future.add_done_callback(ready)
             except BaseException as exc:
                 with self._cv:
-                    if ticket in self._cleanup_tickets and ticket.wait_future is result:
+                    if ticket in self._cleanup_tickets and ticket.wait_future is future:
                         ticket.wait_future = None
+                        ticket.wait_response = None
                         active = True
                     else:
                         active = False
@@ -1487,13 +1475,14 @@ class AsyncResultCollector:
                 if active:
                     ticket.finish(exc)
                 return
-            if ticket.release_wait is not None:
+            if response is not None:
                 timeout_call: RayControlScheduledCall
 
                 def response_timed_out() -> None:
                     self._timeout_cleanup_ticket(
                         ticket,
-                        result,
+                        future,
+                        response,
                         timeout_call,
                     )
 
@@ -1502,7 +1491,11 @@ class AsyncResultCollector:
                     response_timed_out,
                 )
                 with self._cv:
-                    if ticket in self._cleanup_tickets and ticket.wait_future is result:
+                    if (
+                        ticket in self._cleanup_tickets
+                        and ticket.wait_future is future
+                        and ticket.wait_response is response
+                    ):
                         ticket.wait_timeout = timeout_call
                         start_timeout = True
                     else:
@@ -1515,18 +1508,21 @@ class AsyncResultCollector:
                         )
                     except BaseException as exc:
                         with self._cv:
-                            if ticket.wait_timeout is timeout_call and ticket.wait_future is result:
+                            if (
+                                ticket.wait_timeout is timeout_call
+                                and ticket.wait_future is future
+                                and ticket.wait_response is response
+                            ):
                                 ticket.wait_timeout = None
                                 ticket.wait_future = None
+                                ticket.wait_response = None
                                 active = ticket in self._cleanup_tickets
                             else:
                                 active = False
                         if active:
-                            try:
-                                ticket.release_wait(result)
-                            except BaseException:
-                                pass
                             ticket.finish(exc)
+                else:
+                    timeout_call.cancel()
             return
 
         if result is False and ticket.retry_on_incomplete:

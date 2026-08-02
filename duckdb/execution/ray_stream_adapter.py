@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import threading
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
@@ -19,17 +20,12 @@ _REQUIRED_CORE_WORKER_METHODS = (
 
 @dataclass(frozen=True)
 class RayStreamCleanupOperation:
-    """One terminal transition scheduled by the collector and run off its loop.
-
-    ``release_wait`` only detaches operation-local attempt state. It must not
-    call methods on the observed Future; those can invoke arbitrary callbacks.
-    """
+    """One terminal transition scheduled by the collector and run off its loop."""
 
     operation: Callable[[], Any]
     submission_scope: str
     retry_on_error: bool = False
     retry_on_incomplete: bool = False
-    release_wait: Callable[[Any], None] | None = None
 
     def __post_init__(self) -> None:
         scope = str(self.submission_scope or "").strip()
@@ -39,6 +35,32 @@ class RayStreamCleanupOperation:
 
     def __call__(self) -> Any:
         return self.operation()
+
+
+@dataclass(frozen=True)
+class RayStreamCleanupWait:
+    """One retryable control response whose late acknowledgement remains valid.
+
+    ``accept`` validates the resolved response and commits only bounded local
+    state; it must not call methods on another Future.
+    """
+
+    future: Any
+    accept: Callable[[Any], Any]
+
+    def __post_init__(self) -> None:
+        missing = [
+            name for name in ("add_done_callback", "done", "result") if not callable(getattr(self.future, name, None))
+        ]
+        if missing:
+            raise TypeError("Ray stream cleanup Future is missing: " + ", ".join(missing))
+        if not callable(self.accept):
+            raise TypeError("Ray stream cleanup response acceptor must be callable")
+
+    def complete(self) -> None:
+        if not self.future.done():
+            raise RuntimeError("Ray stream cleanup response is still pending")
+        self.accept(self.future.result())
 
 
 def validate_ray_control_ack(response: Any, *, field: str) -> dict[str, Any]:
@@ -111,10 +133,8 @@ class TaskLeaseObjectRefGenerator:
         self._lease: dict[str, Any] | None = lease
         self._lease_identity = dict(lease)
         self._released = False
-        self._release_response_future: Any | None = None
         self._cancelled = False
         self._task_cleanup_handed_off = False
-        self._task_cleanup_response_future: Any | None = None
         self._cancel_generator: Any | None = None
         self._generator_cancel_submitted = False
         self._lock = threading.Lock()
@@ -163,7 +183,7 @@ class TaskLeaseObjectRefGenerator:
         with self._lock:
             return self._generator
 
-    def _release_task(self) -> bool | Any:
+    def _release_task(self) -> bool | RayStreamCleanupWait:
         with self._lock:
             if self._released or self._task_cleanup_handed_off:
                 return True
@@ -172,34 +192,22 @@ class TaskLeaseObjectRefGenerator:
             lease = self._lease_identity
             driver = self._driver
             request_id = self._request_id
-            response_future = self._release_response_future
-        try:
-            if response_future is None:
-                response_ref = driver.release_query_task_lease.remote(
-                    request_id,
-                    str(lease["lease_id"]),
-                    str(lease["attempt_id"]),
-                )
-                response_future = ray_object_ref_future(response_ref)
-                with self._lock:
-                    self._release_response_future = response_future
-            if not response_future.done():
-                return response_future
-            validate_ray_control_ack(response_future.result(), field="released")
-        except BaseException:
-            with self._lock:
-                if self._release_response_future is response_future:
-                    self._release_response_future = None
-            raise
-        with self._lock:
-            self._release_response_future = None
-            self._released = True
-        return True
+        response_ref = driver.release_query_task_lease.remote(
+            request_id,
+            str(lease["lease_id"]),
+            str(lease["attempt_id"]),
+        )
+        response_future = ray_object_ref_future(response_ref)
+        owner_ref = weakref.ref(self)
 
-    def _release_task_wait(self, response_future: Any) -> None:
-        with self._lock:
-            if self._release_response_future is response_future:
-                self._release_response_future = None
+        def accept(response: Any) -> None:
+            validate_ray_control_ack(response, field="released")
+            owner = owner_ref()
+            if owner is not None:
+                with owner._lock:
+                    owner._released = True
+
+        return RayStreamCleanupWait(response_future, accept)
 
     def release_task_operations(self) -> tuple[RayStreamCleanupOperation, ...]:
         return (
@@ -208,7 +216,6 @@ class TaskLeaseObjectRefGenerator:
                 submission_scope=self._submission_scope,
                 retry_on_error=True,
                 retry_on_incomplete=True,
-                release_wait=self._release_task_wait,
             ),
         )
 
@@ -239,7 +246,7 @@ class TaskLeaseObjectRefGenerator:
                 self._cancel_generator = None
         return True
 
-    def _handoff_task_completion(self) -> bool | Any:
+    def _handoff_task_completion(self) -> bool | RayStreamCleanupWait:
         with self._lock:
             if self._released or self._task_cleanup_handed_off:
                 return True
@@ -247,7 +254,6 @@ class TaskLeaseObjectRefGenerator:
             driver = self._driver
             request_id = self._request_id
             completion_ref = self._completion_ref
-            response_future = self._task_cleanup_response_future
             if completion_ref is None:
                 if not self._generator_cancel_submitted:
                     raise RuntimeError(
@@ -256,45 +262,34 @@ class TaskLeaseObjectRefGenerator:
                 ack_field = "handed_off"
             else:
                 ack_field = "scheduled"
-        try:
-            if response_future is None:
-                if completion_ref is None:
-                    response_ref = driver.handoff_query_task_lease_to_teardown.remote(
-                        request_id,
-                        str(lease["lease_id"]),
-                        str(lease["attempt_id"]),
-                    )
-                else:
-                    # Ray resolves only top-level ObjectRef arguments. Nesting
-                    # the completion ref transfers ownership immediately
-                    # without making this RPC wait for the remote task itself.
-                    response_ref = driver.release_query_task_lease_after_completion.remote(
-                        request_id,
-                        str(lease["lease_id"]),
-                        str(lease["attempt_id"]),
-                        [completion_ref],
-                    )
-                response_future = ray_object_ref_future(response_ref)
-                with self._lock:
-                    self._task_cleanup_response_future = response_future
-            if not response_future.done():
-                return response_future
-            validate_ray_control_ack(response_future.result(), field=ack_field)
-        except BaseException:
-            with self._lock:
-                if self._task_cleanup_response_future is response_future:
-                    self._task_cleanup_response_future = None
-            raise
-        with self._lock:
-            self._task_cleanup_response_future = None
-            self._task_cleanup_handed_off = True
-            self._completion_ref = None
-        return True
+        if completion_ref is None:
+            response_ref = driver.handoff_query_task_lease_to_teardown.remote(
+                request_id,
+                str(lease["lease_id"]),
+                str(lease["attempt_id"]),
+            )
+        else:
+            # Ray resolves only top-level ObjectRef arguments. Nesting the
+            # completion ref transfers ownership immediately without making
+            # this RPC wait for the remote task itself.
+            response_ref = driver.release_query_task_lease_after_completion.remote(
+                request_id,
+                str(lease["lease_id"]),
+                str(lease["attempt_id"]),
+                [completion_ref],
+            )
+        response_future = ray_object_ref_future(response_ref)
+        owner_ref = weakref.ref(self)
 
-    def _release_task_cleanup_wait(self, response_future: Any) -> None:
-        with self._lock:
-            if self._task_cleanup_response_future is response_future:
-                self._task_cleanup_response_future = None
+        def accept(response: Any) -> None:
+            validate_ray_control_ack(response, field=ack_field)
+            owner = owner_ref()
+            if owner is not None:
+                with owner._lock:
+                    owner._task_cleanup_handed_off = True
+                    owner._completion_ref = None
+
+        return RayStreamCleanupWait(response_future, accept)
 
     @property
     def cancellation_started(self) -> bool:
@@ -330,7 +325,6 @@ class TaskLeaseObjectRefGenerator:
                 submission_scope=self._submission_scope,
                 retry_on_error=True,
                 retry_on_incomplete=True,
-                release_wait=self._release_task_cleanup_wait,
             ),
         )
 
@@ -342,7 +336,6 @@ class TaskLeaseObjectRefGenerator:
                 submission_scope=self._submission_scope,
                 retry_on_error=True,
                 retry_on_incomplete=True,
-                release_wait=self._release_task_cleanup_wait,
             ),
         )
 
@@ -546,6 +539,19 @@ class RayStreamAdapter:
         operation: Callable[[], Any],
     ) -> Any:
         result = operation()
+        if isinstance(result, RayStreamCleanupWait):
+            adapter_ref = weakref.ref(self)
+            leased_ref = weakref.ref(leased)
+            accept_response = result.accept
+
+            def accept(response: Any) -> None:
+                accept_response(response)
+                adapter = adapter_ref()
+                release_owner = leased_ref()
+                if adapter is not None and release_owner is not None:
+                    adapter._drop_release_owner_if_complete(release_owner)
+
+            return RayStreamCleanupWait(result.future, accept)
         self._drop_release_owner_if_complete(leased)
         return result
 
@@ -603,7 +609,6 @@ class RayStreamAdapter:
                     submission_scope=operation.submission_scope,
                     retry_on_error=operation.retry_on_error,
                     retry_on_incomplete=operation.retry_on_incomplete,
-                    release_wait=operation.release_wait,
                 )
                 for operation in source_operations
             ]
@@ -629,6 +634,7 @@ class RayStreamAdapter:
 __all__ = [
     "RayStreamAdapter",
     "RayStreamCleanupOperation",
+    "RayStreamCleanupWait",
     "TaskLeaseObjectRefGenerator",
     "ray_object_ref_future",
     "validate_ray_stream_contract",

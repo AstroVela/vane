@@ -16,6 +16,7 @@ import duckdb.execution.udf_stream_result_collector as collector_module
 from duckdb.execution.ray_stream_adapter import (
     RayStreamAdapter,
     RayStreamCleanupOperation,
+    RayStreamCleanupWait,
     TaskLeaseObjectRefGenerator,
 )
 from duckdb.execution.udf_stream_result_collector import (
@@ -369,6 +370,10 @@ def _wait_cleanup_tickets(tickets, *, timeout_message, timeout=3.0):
         if not ticket.wait(max(0.0, deadline - time.monotonic())):
             raise AssertionError(timeout_message)
     return tuple(error for ticket in tickets for error in ticket.errors)
+
+
+def _accept_true_cleanup_response(response):
+    assert response is True
 
 
 def _capture_thread_error(errors, operation, *args):
@@ -1126,25 +1131,16 @@ def test_cleanup_ticket_retries_a_hung_control_response(monkeypatch):
     )
     collector = AsyncResultCollector(ray_module=_FakeRay())
     attempts = []
-    response_future = None
 
     def transfer_owner():
-        nonlocal response_future
-        if response_future is None:
-            response_future = Future()
-            attempts.append(response_future)
-            if len(attempts) > 1:
-                response_future.set_result(True)
-        if not response_future.done():
-            return response_future
-        response_future.result()
-        response_future = None
-        return True
-
-    def release_wait(future):
-        nonlocal response_future
-        if response_future is future:
-            response_future = None
+        response_future = Future()
+        attempts.append(response_future)
+        if len(attempts) > 1:
+            response_future.set_result(True)
+        return RayStreamCleanupWait(
+            response_future,
+            _accept_true_cleanup_response,
+        )
 
     tickets = collector._submit_cleanup_operations(
         (
@@ -1152,7 +1148,6 @@ def test_cleanup_ticket_retries_a_hung_control_response(monkeypatch):
                 transfer_owner,
                 submission_scope=_CLEANUP_SUBMISSION_SCOPE,
                 retry_on_error=True,
-                release_wait=release_wait,
             ),
         ),
         store_error=False,
@@ -1171,6 +1166,163 @@ def test_cleanup_ticket_retries_a_hung_control_response(monkeypatch):
         collector.shutdown()
 
 
+def test_cleanup_ticket_accepts_late_ack_from_timed_out_attempt(monkeypatch):
+    monkeypatch.setattr(
+        "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
+        0.01,
+    )
+    collector = AsyncResultCollector(ray_module=_FakeRay())
+    attempts = []
+    second_attempt_started = threading.Event()
+
+    def transfer_owner():
+        response_future = Future()
+        attempts.append(response_future)
+        if len(attempts) == 2:
+            second_attempt_started.set()
+        return RayStreamCleanupWait(
+            response_future,
+            _accept_true_cleanup_response,
+        )
+
+    tickets = collector._submit_cleanup_operations(
+        (
+            RayStreamCleanupOperation(
+                transfer_owner,
+                submission_scope=_CLEANUP_SUBMISSION_SCOPE,
+                retry_on_error=True,
+            ),
+        ),
+        store_error=False,
+    )
+    try:
+        assert second_attempt_started.wait(timeout=1.0)
+        attempts[0].set_result(True)
+        assert (
+            _wait_cleanup_tickets(
+                tickets,
+                timeout_message="late cleanup acknowledgement was discarded",
+            )
+            == ()
+        )
+        assert len(attempts) == 2
+        assert not attempts[1].done()
+    finally:
+        collector.shutdown()
+
+
+def test_cleanup_ticket_ignores_invalid_late_ack(monkeypatch):
+    monkeypatch.setattr(
+        "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
+        0.01,
+    )
+    collector = AsyncResultCollector(ray_module=_FakeRay())
+    attempts = []
+    second_attempt_started = threading.Event()
+
+    def transfer_owner():
+        response_future = Future()
+        attempts.append(response_future)
+        if len(attempts) == 2:
+            second_attempt_started.set()
+        return RayStreamCleanupWait(
+            response_future,
+            _accept_true_cleanup_response,
+        )
+
+    tickets = collector._submit_cleanup_operations(
+        (
+            RayStreamCleanupOperation(
+                transfer_owner,
+                submission_scope=_CLEANUP_SUBMISSION_SCOPE,
+                retry_on_error=True,
+            ),
+        ),
+        store_error=False,
+    )
+    try:
+        assert second_attempt_started.wait(timeout=1.0)
+        attempts[0].set_result(False)
+        assert tickets[0].wait(0.0) is False
+
+        attempts[1].set_result(True)
+        assert (
+            _wait_cleanup_tickets(
+                tickets,
+                timeout_message="valid current cleanup acknowledgement was lost",
+            )
+            == ()
+        )
+        assert len(attempts) == 2
+    finally:
+        collector.shutdown()
+
+
+def test_cleanup_ticket_finishes_once_when_retried_acks_race(monkeypatch):
+    monkeypatch.setattr(
+        "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
+        0.01,
+    )
+    collector = AsyncResultCollector(ray_module=_FakeRay())
+    attempts = []
+    second_attempt_started = threading.Event()
+    completions = []
+
+    def transfer_owner():
+        response_future = Future()
+        attempts.append(response_future)
+        if len(attempts) == 2:
+            second_attempt_started.set()
+        return RayStreamCleanupWait(
+            response_future,
+            _accept_true_cleanup_response,
+        )
+
+    tickets = collector._submit_cleanup_operations(
+        (
+            RayStreamCleanupOperation(
+                transfer_owner,
+                submission_scope=_CLEANUP_SUBMISSION_SCOPE,
+                retry_on_error=True,
+            ),
+        ),
+        on_each_done=completions.append,
+        store_error=False,
+    )
+    release_acknowledgements = threading.Barrier(3)
+
+    def acknowledge(future):
+        release_acknowledgements.wait()
+        future.set_result(True)
+
+    acknowledgement_threads = []
+    try:
+        assert second_attempt_started.wait(timeout=1.0)
+        acknowledgement_threads = [
+            threading.Thread(
+                target=acknowledge,
+                args=(future,),
+            )
+            for future in attempts
+        ]
+        for thread in acknowledgement_threads:
+            thread.start()
+        release_acknowledgements.wait(timeout=1.0)
+        for thread in acknowledgement_threads:
+            thread.join(timeout=1.0)
+            assert thread.is_alive() is False
+        assert (
+            _wait_cleanup_tickets(
+                tickets,
+                timeout_message="racing cleanup acknowledgements did not finish",
+            )
+            == ()
+        )
+        assert completions == [None]
+    finally:
+        collector.shutdown()
+
+
 def test_cleanup_ticket_expands_slow_response_deadline(monkeypatch):
     monkeypatch.setattr(
         "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
@@ -1183,32 +1335,23 @@ def test_cleanup_ticket_expands_slow_response_deadline(monkeypatch):
     collector = AsyncResultCollector(ray_module=_FakeRay())
     attempts = []
     response_timers = []
-    response_future = None
 
     def transfer_owner():
-        nonlocal response_future
-        if response_future is None:
-            response_future = Future()
-            attempts.append(response_future)
+        response_future = Future()
+        attempts.append(response_future)
+        if len(attempts) > 1:
 
             def acknowledge(future=response_future):
-                if not future.cancelled():
-                    future.set_result(True)
+                future.set_result(True)
 
             timer = threading.Timer(0.015, acknowledge)
             timer.daemon = True
             timer.start()
             response_timers.append(timer)
-        if not response_future.done():
-            return response_future
-        response_future.result()
-        response_future = None
-        return True
-
-    def release_wait(future):
-        nonlocal response_future
-        if response_future is future:
-            response_future = None
+        return RayStreamCleanupWait(
+            response_future,
+            _accept_true_cleanup_response,
+        )
 
     tickets = collector._submit_cleanup_operations(
         (
@@ -1216,7 +1359,6 @@ def test_cleanup_ticket_expands_slow_response_deadline(monkeypatch):
                 transfer_owner,
                 submission_scope=_CLEANUP_SUBMISSION_SCOPE,
                 retry_on_error=True,
-                release_wait=release_wait,
             ),
         ),
         store_error=False,

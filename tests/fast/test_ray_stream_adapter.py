@@ -13,6 +13,7 @@ import pytest
 
 from duckdb.execution.ray_stream_adapter import (
     RayStreamAdapter,
+    RayStreamCleanupWait,
     TaskLeaseObjectRefGenerator,
     validate_ray_stream_contract,
 )
@@ -135,6 +136,12 @@ def _finish_cleanup_operations(operations):
         for operation in pending:
             try:
                 result = operation()
+                if isinstance(result, RayStreamCleanupWait):
+                    if not result.future.done():
+                        remaining.append(operation)
+                        continue
+                    result.complete()
+                    continue
                 if all(callable(getattr(result, name, None)) for name in ("done", "result")):
                     if not result.done():
                         remaining.append(operation)
@@ -374,7 +381,7 @@ def test_invalid_submitted_stream_hands_cancelled_lease_to_query_teardown():
 
     cancel, handoff = source.cancel_operations()
     assert cancel() is True
-    assert handoff() is True
+    _finish_cleanup_operations((handoff,))
     assert fake_ray.cancel_calls == [(invalid_stream, {"force": True, "recursive": True})]
     assert driver.handoff_query_task_lease_to_teardown.calls == [
         (("request-invalid-stream", "lease-1", "attempt-1"), {}),
@@ -396,7 +403,7 @@ def test_missing_submitted_stream_hands_lease_to_query_teardown_without_cancel()
 
     cancel, handoff = source.cancel_operations()
     assert cancel() is True
-    assert handoff() is True
+    _finish_cleanup_operations((handoff,))
     assert fake_ray.cancel_calls == []
     assert driver.handoff_query_task_lease_to_teardown.calls == [
         (("request-missing-stream", "lease-1", "attempt-1"), {}),
