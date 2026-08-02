@@ -387,7 +387,13 @@ class _TaskAdmissionCancellation:
 class TaskAdmissionController:
     """One-lookahead query task admission that never blocks its dispatcher."""
 
-    def __init__(self, payload: dict[str, Any], *, driver: Any) -> None:
+    def __init__(
+        self,
+        payload: dict[str, Any],
+        *,
+        driver: Any,
+        query_generation_capability: str,
+    ) -> None:
         self._payload = dict(payload)
         self._query_id = str(self._payload.get("query_id") or "").strip()
         self._stage_id = str(self._payload.get("stage_id") or "").strip()
@@ -395,6 +401,9 @@ class TaskAdmissionController:
             raise ValueError("distributed Ray UDF task admission requires query_id and stage_id")
         if driver is None:
             raise ValueError("distributed Ray UDF task admission requires an explicit query driver handle")
+        self._query_generation_capability = str(query_generation_capability or "").strip()
+        if not self._query_generation_capability:
+            raise ValueError("distributed Ray UDF task admission requires a query generation capability")
         # The cancellation deadline owner must exist before this controller can
         # submit any remote lease request.  Startup failure is therefore a
         # pre-submit construction error, never a post-submit ownership gap.
@@ -434,6 +443,7 @@ class TaskAdmissionController:
             "node_id": None,
             "retained_input_bytes": retained_input_bytes,
             "resources": dict(self._resources),
+            "query_generation_capability": self._query_generation_capability,
         }
 
     def request(self, retained_input_bytes: int) -> bool:
@@ -472,10 +482,12 @@ class TaskAdmissionController:
                 if self._state == "requested" and self._request_id == request_id:
                     self._state = "failed"
                     self._error = exc
+                    self._cancellation = None
                     wakeup = self._wakeup
                 else:
                     wakeup = None
-            cancellation.start()
+            # submit_ray_control rejects atomically, so this request never
+            # crossed the remote boundary and owns nothing to cancel.
             if wakeup is not None:
                 wakeup()
             raise
@@ -716,8 +728,13 @@ class TaskAdmissionExecutorMixin(AdmissionExecutorMixin):
         payload: dict[str, Any],
         *,
         driver: Any,
+        query_generation_capability: str,
     ) -> None:
-        authority = TaskAdmissionController(payload, driver=driver)
+        authority = TaskAdmissionController(
+            payload,
+            driver=driver,
+            query_generation_capability=query_generation_capability,
+        )
         self._task_admission = authority
         self._initialize_admission(authority)
 

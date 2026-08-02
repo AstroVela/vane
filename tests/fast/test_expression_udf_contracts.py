@@ -352,6 +352,7 @@ def test_actor_gpu_reservation_follows_resolved_backend(
             nodes,
             actor_node_ids_by_stage={stage_id: ("node-a",)},
             query_driver_handle=object(),
+            query_generation_capability="test-query-generation-capability",
             session_config={},
         )
 
@@ -463,6 +464,7 @@ def test_stateless_ray_actor_pool_size_and_gpu_options_follow_physical_payload(m
         nodes,
         actor_node_ids_by_stage={stage_id: ("node-a", "node-a", "node-a")},
         query_driver_handle=object(),
+        query_generation_capability="test-query-generation-capability",
         session_config={},
     )
 

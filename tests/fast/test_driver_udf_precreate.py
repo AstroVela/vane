@@ -16,6 +16,8 @@ from types import SimpleNamespace
 
 import pytest
 
+_QUERY_GENERATION_CAPABILITY = "test-query-generation-capability"
+
 
 class _FakePlan:
     def __init__(self, nodes):
@@ -301,11 +303,13 @@ def test_precreate_udf_actors_injects_driver_handle_for_ray_task(monkeypatch):
         *,
         actor_node_ids_by_stage,
         query_driver_handle,
+        query_generation_capability,
         session_config,
         conn=None,
     ):
         assert actor_node_ids_by_stage == {}
         assert query_driver_handle is driver_handle
+        assert query_generation_capability == _QUERY_GENERATION_CAPABILITY
         assert session_config == {"AWS_ACCESS_KEY_ID": "session-access-key"}
         assert conn is query_connection
         created = []
@@ -315,6 +319,7 @@ def test_precreate_udf_actors_injects_driver_handle_for_ray_task(monkeypatch):
             if payload.get("execution_backend") in {"ray_task", "ray_actor"}:
                 handles_map[str(node["node_id"])] = {
                     "query_driver_handle": query_driver_handle,
+                    "query_generation_capability": query_generation_capability,
                     "session_config": dict(session_config),
                 }
         if handles_map:
@@ -329,6 +334,7 @@ def test_precreate_udf_actors_injects_driver_handle_for_ray_task(monkeypatch):
     runner = SimpleNamespace(
         _driver_handle=driver_handle,
         _active_udf_actors=[],
+        _issue_query_task_admission_capability=lambda _query_id: _QUERY_GENERATION_CAPABILITY,
     )
     query_connection = object()
 
@@ -350,7 +356,7 @@ def test_precreate_udf_actors_injects_driver_handle_for_ray_task(monkeypatch):
     created = runner_cls._precreate_udf_actors(
         runner,
         plan,
-        SimpleNamespace(stages=()),
+        SimpleNamespace(query_id="test-plan", stages=()),
         SimpleNamespace(actor_node_ids_for_stage=lambda _stage_id: ()),
         query_connection=query_connection,
         session_config={"AWS_ACCESS_KEY_ID": "session-access-key"},
@@ -362,6 +368,7 @@ def test_precreate_udf_actors_injects_driver_handle_for_ray_task(monkeypatch):
             "handles_map": {
                 "7": {
                     "query_driver_handle": driver_handle,
+                    "query_generation_capability": _QUERY_GENERATION_CAPABILITY,
                     "session_config": {
                         "AWS_ACCESS_KEY_ID": "session-access-key",
                     },
@@ -387,6 +394,7 @@ def test_precreate_udf_actors_skips_non_ray_nodes(monkeypatch):
         _driver_handle=object(),
         _duckdb_conn=object(),
         _active_udf_actors=[],
+        _issue_query_task_admission_capability=lambda _query_id: _QUERY_GENERATION_CAPABILITY,
     )
 
     plan = _FakePlan(
@@ -404,7 +412,7 @@ def test_precreate_udf_actors_skips_non_ray_nodes(monkeypatch):
     created = runner_cls._precreate_udf_actors(
         runner,
         plan,
-        SimpleNamespace(stages=()),
+        SimpleNamespace(query_id="test-plan", stages=()),
         SimpleNamespace(actor_node_ids_for_stage=lambda _stage_id: ()),
         query_connection=object(),
         session_config={},
@@ -457,6 +465,7 @@ def test_precreate_retains_partially_created_actor_pool_for_teardown(
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = SimpleNamespace(
         _driver_handle=object(),
+        _issue_query_task_admission_capability=lambda _query_id: _QUERY_GENERATION_CAPABILITY,
         **{
             active_attr: [],
             by_plan_attr: {},
@@ -470,7 +479,7 @@ def test_precreate_retains_partially_created_actor_pool_for_teardown(
             method(
                 runner,
                 plan,
-                SimpleNamespace(stages=()),
+                SimpleNamespace(query_id="test-plan", stages=()),
                 SimpleNamespace(actor_node_ids_for_stage=lambda _stage_id: ()),
                 query_connection=object(),
                 session_config={},
@@ -691,6 +700,7 @@ def test_precreate_udf_actors_enable_generic_async_for_distributed_pool(
         plan,
         actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
         query_driver_handle=object(),
+        query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
         conn=object(),
     )
@@ -762,6 +772,7 @@ def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name
         plan,
         actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
         query_driver_handle=query_driver_handle,
+        query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
         conn=object(),
     )
@@ -848,6 +859,7 @@ def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_
         plan,
         actor_node_ids_by_stage={"stage:test:stateful": ("node-a",)},
         query_driver_handle=object(),
+        query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
         conn=object(),
     )
@@ -922,6 +934,7 @@ def test_ensure_actor_pools_for_plan_disables_retries_for_side_effecting_udf(mon
         plan,
         actor_node_ids_by_stage={"stage:test:side-effects": ("node-a",)},
         query_driver_handle=object(),
+        query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
         conn=object(),
     )
@@ -993,6 +1006,7 @@ def test_ensure_actor_pools_for_plan_keeps_default_retry_policy_for_non_stateful
         plan,
         actor_node_ids_by_stage={"stage:test:retry-policy": ("node-a",)},
         query_driver_handle=object(),
+        query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
         conn=object(),
     )
@@ -1118,6 +1132,7 @@ def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):
         nodes,
         actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
         query_driver_handle=object(),
+        query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
         set_handles=inject,
     )
@@ -1172,6 +1187,7 @@ def test_ray_plan_injects_session_context_for_explicit_subprocess_backends(monke
         nodes,
         actor_node_ids_by_stage={},
         query_driver_handle=object(),
+        query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config=session_config,
         set_handles=injected.append,
     )
@@ -1247,6 +1263,7 @@ def test_prepare_actor_pools_publishes_handles_before_waiting_for_init(monkeypat
             "stage:test:deferred-ready": ("node-a", "node-b"),
         },
         query_driver_handle=object(),
+        query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
     )
 
@@ -1468,6 +1485,7 @@ def test_ensure_actor_pools_for_plan_does_not_fail_fast_on_cluster_resource_snap
         plan,
         actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
         query_driver_handle=object(),
+        query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
         conn=object(),
     )
@@ -1524,6 +1542,7 @@ def test_ensure_actor_pools_for_plan_publishes_driver_handle_for_ray_task(monkey
         plan,
         actor_node_ids_by_stage={},
         query_driver_handle=query_driver_handle,
+        query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
         conn=object(),
     )
@@ -1532,6 +1551,7 @@ def test_ensure_actor_pools_for_plan_publishes_driver_handle_for_ray_task(monkey
     assert handles_map == {
         "9": {
             "query_driver_handle": query_driver_handle,
+            "query_generation_capability": _QUERY_GENERATION_CAPABILITY,
             "session_config": {},
         }
     }
@@ -1553,6 +1573,7 @@ def test_ensure_actor_pools_for_plan_propagates_collect_errors(monkeypatch):
             _BadPlan(),
             actor_node_ids_by_stage={},
             query_driver_handle=object(),
+            query_generation_capability=_QUERY_GENERATION_CAPABILITY,
             session_config={},
             conn=object(),
         )
@@ -1598,6 +1619,7 @@ def test_ensure_actor_pools_for_plan_propagates_actor_creation_errors(monkeypatc
             plan,
             actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
             query_driver_handle=object(),
+            query_generation_capability=_QUERY_GENERATION_CAPABILITY,
             session_config={},
             conn=object(),
         )
@@ -1726,6 +1748,7 @@ def test_physical_plan_structured_executor_options_reach_udf_builder(monkeypatch
                     "actor_handles": ["actor-0"],
                     "actor_node_ids": ["node-a"],
                     "query_driver_handle": query_driver_handle,
+                    "query_generation_capability": _QUERY_GENERATION_CAPABILITY,
                     "session_config": {},
                 }
             },
@@ -1742,6 +1765,7 @@ def test_physical_plan_structured_executor_options_reach_udf_builder(monkeypatch
     assert build_calls[0]["options"]["actor_handles"] == ["actor-0"]
     assert build_calls[0]["options"]["actor_node_ids"] == ["node-a"]
     assert build_calls[0]["options"]["query_driver_handle"] is query_driver_handle
+    assert build_calls[0]["options"]["query_generation_capability"] == _QUERY_GENERATION_CAPABILITY
     assert build_calls[0]["options"]["session_config"] == {}
     assert sorted(table.column(0).to_pylist()) == [2, 3]
 
@@ -1849,6 +1873,7 @@ def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
                     "actor_handles": ["actor-0"],
                     "actor_node_ids": ["node-a"],
                     "query_driver_handle": object(),
+                    "query_generation_capability": "test-query-generation-capability",
                 }
             },
             conn=con,
@@ -1959,6 +1984,7 @@ def test_ensure_actor_pools_for_plan_uses_coordinator_actor_nodes(monkeypatch):
         plan,
         actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
         query_driver_handle=object(),
+        query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
     )
 
@@ -2038,6 +2064,7 @@ def test_ensure_actor_pools_waits_for_init_refs_before_ready_lookup(monkeypatch)
         plan,
         actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
         query_driver_handle=object(),
+        query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
     )
 

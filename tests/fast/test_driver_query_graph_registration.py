@@ -658,6 +658,10 @@ def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_
             "heap_bytes": 128,
             "object_store_bytes": 0,
         },
+        "query_generation_capability": runner_cls._issue_query_task_admission_capability(
+            runner,
+            streaming_query_id,
+        ),
     }
 
     async def _run_concurrently():

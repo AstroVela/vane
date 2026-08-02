@@ -24,6 +24,7 @@ _ALLOWED_OPTIONS = frozenset(
         "actor_dispatch_indices",
         "local_actor_pool",
         "query_driver_handle",
+        "query_generation_capability",
         "session_config",
     }
 )

@@ -3025,6 +3025,34 @@ class RayQueryDriverActor:
             return None
         return fields
 
+    def _issue_query_task_admission_capability(self, query_id: str) -> str:
+        query_key = str(query_id)
+        return self._issue_lease_capability(
+            kind="task-admission",
+            fields=(
+                query_key,
+                self._query_lease_generation_id(query_key),
+            ),
+        )
+
+    def _verify_query_task_admission_capability(
+        self,
+        *,
+        capability: str,
+        query_id: str,
+    ) -> str | None:
+        fields = self._decode_lease_capability(
+            capability,
+            kind="task-admission",
+            field_count=2,
+        )
+        if fields is None:
+            return None
+        capability_query_id, capability_generation_id = fields
+        if capability_query_id != str(query_id):
+            return None
+        return capability_generation_id
+
     def _issue_task_lease_capability(
         self,
         *,
@@ -3590,11 +3618,13 @@ class RayQueryDriverActor:
     def _parse_task_lease_request(
         self,
         payload: dict[str, Any],
-    ) -> tuple[str, Any, dict[str, Any]]:
+    ) -> tuple[str, Any, dict[str, Any], str]:
         from duckdb.runners.ray.query_resource_manager import TaskRequest
 
+        raw_values = dict(payload)
+        generation_capability = str(raw_values.pop("query_generation_capability", "") or "").strip()
         values = self._strict_lease_request(
-            payload,
+            raw_values,
             fields={
                 "request_id",
                 "query_id",
@@ -3611,16 +3641,39 @@ class RayQueryDriverActor:
         raw_resources = values.pop("resources")
         request = TaskRequest(**values)
         identity = {**asdict(request), "resources": dict(raw_resources)}
-        return request_id, request, identity
+        return request_id, request, identity, generation_capability
 
     async def acquire_query_task_lease(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Resolve one task lease through the query's serialized admission pump."""
         from duckdb.runners.ray.query_resource_manager import TaskGrant
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
-        request_id, request, identity = self._parse_task_lease_request(payload)
+        request_id, request, identity, generation_capability = self._parse_task_lease_request(payload)
         raw_resources = identity["resources"]
         self._ensure_query_resource_admission_state()
+        generation_id = self._verify_query_task_admission_capability(
+            capability=generation_capability,
+            query_id=request.query_id,
+        )
+        if generation_id is None:
+            return self._grant_payload(
+                TaskGrant(
+                    False,
+                    blocked_reason="invalid_query_generation_capability",
+                    fatal=True,
+                )
+            )
+        if self._capability_targets_inactive_query_generation(
+            request.query_id,
+            generation_id,
+        ):
+            return self._grant_payload(
+                TaskGrant(
+                    False,
+                    blocked_reason="query_generation_inactive",
+                    fatal=True,
+                )
+            )
         terminal_control = self._task_terminal_control_for_identity(
             request_id,
             identity,
@@ -4089,8 +4142,20 @@ class RayQueryDriverActor:
         from duckdb.runners.ray.query_resource_manager import TaskGrant
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
-        request_id, request, identity = self._parse_task_lease_request(payload)
+        request_id, request, identity, generation_capability = self._parse_task_lease_request(payload)
         self._ensure_query_resource_admission_state()
+        generation_id = self._verify_query_task_admission_capability(
+            capability=generation_capability,
+            query_id=request.query_id,
+        )
+        if generation_id is None or self._capability_targets_inactive_query_generation(
+            request.query_id,
+            generation_id,
+        ):
+            # A stale or unsigned cleanup request owns no state in the active
+            # generation. Acknowledge the no-op so its durable retry owner can
+            # retire without touching a reopened query with the same ID.
+            return {"cancelled": True, "released": False}
         request_key = str(request_id)
         with self._query_task_lease_condition:
             terminal_control = self._task_terminal_control_for_identity(
@@ -4990,6 +5055,9 @@ class RayQueryDriverActor:
                 plan,
                 actor_node_ids_by_stage=actor_node_ids_by_stage,
                 query_driver_handle=self._driver_handle,
+                query_generation_capability=self._issue_query_task_admission_capability(
+                    graph.query_id,
+                ),
                 session_config=session_config,
                 conn=query_connection,
             )

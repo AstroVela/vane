@@ -1992,6 +1992,7 @@ def test_mixed_streaming_inputs_preserve_task_admission_owner():
                 "actor_handles": [f"actor-{node['node_id']}"],
                 "actor_node_ids": ["node-a"],
                 "query_driver_handle": object(),
+                "query_generation_capability": "test-query-generation-capability",
                 "session_config": {},
             }
             for node in plan.collect_udf_nodes(conn=connection)

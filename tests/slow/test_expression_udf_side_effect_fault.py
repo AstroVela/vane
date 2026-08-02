@@ -122,6 +122,7 @@ try:
         FakePlan(),
         actor_node_ids_by_stage={"stage:side-effect-fault": (node_id,)},
         query_driver_handle=object(),
+        query_generation_capability="test-query-generation-capability",
         session_config={},
     )
     assert len(created) == 1

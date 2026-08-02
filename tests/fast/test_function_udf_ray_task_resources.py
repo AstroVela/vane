@@ -232,6 +232,7 @@ def test_task_executor_consumes_pregranted_admission_with_exact_resources(monkey
         run_bundle_stream=object(),
         run_ref_bundle_stream=object(),
         query_driver_handle=object(),
+        query_generation_capability="test-query-generation-capability",
     )
     admission = SimpleNamespace(
         driver=object(),
@@ -277,6 +278,7 @@ def test_task_submission_starts_immediately_from_pregranted_lease(monkeypatch):
         run_bundle_stream=_Remote(),
         run_ref_bundle_stream=_Remote(),
         query_driver_handle=object(),
+        query_generation_capability="test-query-generation-capability",
     )
     lease = {
         "query_id": "q1",
