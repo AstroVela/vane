@@ -3,16 +3,18 @@
 
 from __future__ import annotations
 
-import heapq
 import os
 import threading
-import time
 import uuid
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from duckdb.execution.ray_control_deadline import (
+    RAY_CONTROL_DEADLINE_SCHEDULER,
+    RayControlScheduledCall,
+)
 from duckdb.execution.ray_control_submission import submit_ray_control
 from duckdb.execution.ray_stream_adapter import (
     ray_object_ref_future,
@@ -29,108 +31,6 @@ _TASK_ADMISSION_CLEANUP_RETRY_INITIAL_DELAY_S = 0.01
 _TASK_ADMISSION_CLEANUP_RETRY_MAX_DELAY_S = 1.0
 _TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_S = 1.0
 _TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_MAX_S = 30.0
-
-
-class _ScheduledCall:
-    """One cancellable deadline owned by the shared cleanup scheduler."""
-
-    def __init__(
-        self,
-        scheduler: _TaskAdmissionCancellationScheduler,
-        callback: Callable[[], None],
-    ) -> None:
-        self._scheduler = scheduler
-        self._callback: Callable[[], None] | None = callback
-        self._scheduled = False
-
-    def cancel(self) -> None:
-        self._scheduler.cancel(self)
-
-
-class _TaskAdmissionCancellationScheduler:
-    """Process-wide deadline scheduler for every admission cancellation."""
-
-    def __init__(self) -> None:
-        self._cv = threading.Condition()
-        self._queue: list[tuple[float, int, _ScheduledCall]] = []
-        self._next_sequence = 0
-        self._thread: threading.Thread | None = None
-
-    def create(self, callback: Callable[[], None]) -> _ScheduledCall:
-        return _ScheduledCall(self, callback)
-
-    def ensure_started(self) -> None:
-        """Start before remote work can transfer cleanup ownership to this clock."""
-        with self._cv:
-            if self._thread is not None:
-                return
-            thread = threading.Thread(
-                target=self._run,
-                daemon=True,
-                name="vane-task-admission-cleanup",
-            )
-            # Publish only a successfully started thread.  If start() raises,
-            # a later controller can retry instead of inheriting a permanently
-            # poisoned scheduler with no worker.
-            thread.start()
-            self._thread = thread
-
-    def schedule(self, call: _ScheduledCall, delay_s: float) -> None:
-        self.ensure_started()
-        with self._cv:
-            if call._scheduler is not self:
-                raise RuntimeError("scheduled call belongs to a different scheduler")
-            if call._callback is None:
-                return
-            if call._scheduled:
-                raise RuntimeError("scheduled call is already armed")
-            call._scheduled = True
-            self._next_sequence += 1
-            heapq.heappush(
-                self._queue,
-                (
-                    time.monotonic() + max(0.0, float(delay_s)),
-                    self._next_sequence,
-                    call,
-                ),
-            )
-            self._cv.notify()
-
-    def cancel(self, call: _ScheduledCall) -> None:
-        with self._cv:
-            if call._scheduler is not self:
-                raise RuntimeError("scheduled call belongs to a different scheduler")
-            call._callback = None
-            self._cv.notify()
-
-    def _run(self) -> None:
-        while True:
-            callback: Callable[[], None] | None = None
-            with self._cv:
-                while callback is None:
-                    while self._queue and self._queue[0][2]._callback is None:
-                        heapq.heappop(self._queue)
-                    if not self._queue:
-                        self._cv.wait()
-                        continue
-                    deadline, _sequence, call = self._queue[0]
-                    remaining = deadline - time.monotonic()
-                    if remaining > 0:
-                        self._cv.wait(timeout=remaining)
-                        continue
-                    heapq.heappop(self._queue)
-                    callback = call._callback
-                    call._callback = None
-            if callback is not None:
-                try:
-                    callback()
-                except BaseException:
-                    # Cancellation methods own their retry/error policy. One
-                    # malformed callback must not terminate the shared clock.
-                    pass
-
-
-_TASK_ADMISSION_CANCELLATION_SCHEDULER = _TaskAdmissionCancellationScheduler()
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -202,8 +102,8 @@ class _TaskAdmissionCancellation:
             raise ValueError("Ray task admission cancellation requires an explicit submission scope")
         self._lock = threading.Lock()
         self._response_future: Any | None = None
-        self._response_deadline: _ScheduledCall | None = None
-        self._retry_call: _ScheduledCall | None = None
+        self._response_deadline: RayControlScheduledCall | None = None
+        self._retry_call: RayControlScheduledCall | None = None
         self._submitting = False
         self._retry_count = 0
         self._done = False
@@ -271,7 +171,7 @@ class _TaskAdmissionCancellation:
                 self._submitting = False
             self._schedule_retry()
             return
-        response_deadline = _TASK_ADMISSION_CANCELLATION_SCHEDULER.create(
+        response_deadline = RAY_CONTROL_DEADLINE_SCHEDULER.create(
             lambda: self._response_timed_out(response_future),
         )
         discard_response = self._publish_response_future(
@@ -308,7 +208,7 @@ class _TaskAdmissionCancellation:
                 and self._response_deadline is response_deadline
             )
         if start_deadline:
-            _TASK_ADMISSION_CANCELLATION_SCHEDULER.schedule(
+            RAY_CONTROL_DEADLINE_SCHEDULER.schedule(
                 response_deadline,
                 self._response_timeout(self._retry_count),
             )
@@ -316,7 +216,7 @@ class _TaskAdmissionCancellation:
     def _publish_response_future(
         self,
         response_future: Any,
-        response_deadline: _ScheduledCall,
+        response_deadline: RayControlScheduledCall,
     ) -> bool:
         """Publish a response unless a concurrent acknowledgement finished."""
         with self._lock:
@@ -385,20 +285,20 @@ class _TaskAdmissionCancellation:
             if self._done or self._submitting or self._response_future is not None or self._retry_call is not None:
                 return
             self._retry_count += 1
-            retry_call: _ScheduledCall
+            retry_call: RayControlScheduledCall
 
             def retry() -> None:
                 self._retry(retry_call)
 
-            retry_call = _TASK_ADMISSION_CANCELLATION_SCHEDULER.create(retry)
+            retry_call = RAY_CONTROL_DEADLINE_SCHEDULER.create(retry)
             self._retry_call = retry_call
             retry_delay = self._retry_delay(self._retry_count)
-        _TASK_ADMISSION_CANCELLATION_SCHEDULER.schedule(
+        RAY_CONTROL_DEADLINE_SCHEDULER.schedule(
             retry_call,
             retry_delay,
         )
 
-    def _retry(self, retry_call: _ScheduledCall) -> None:
+    def _retry(self, retry_call: RayControlScheduledCall) -> None:
         with self._lock:
             if self._retry_call is not retry_call:
                 return
@@ -429,7 +329,7 @@ class TaskAdmissionController:
         # The cancellation deadline owner must exist before this controller can
         # submit any remote lease request.  Startup failure is therefore a
         # pre-submit construction error, never a post-submit ownership gap.
-        _TASK_ADMISSION_CANCELLATION_SCHEDULER.ensure_started()
+        RAY_CONTROL_DEADLINE_SCHEDULER.ensure_started()
         self._resources = ray_udf_task_resource_spec(self._payload)
         self._driver = driver
         self._executor_id = uuid.uuid4().hex

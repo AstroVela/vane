@@ -15,6 +15,10 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from duckdb.execution.ray_control_deadline import (
+    RAY_CONTROL_DEADLINE_SCHEDULER,
+    RayControlScheduledCall,
+)
 from duckdb.execution.ray_control_submission import submit_ray_control
 from duckdb.execution.ray_stream_adapter import (
     RayStreamAdapter,
@@ -136,7 +140,7 @@ class _StreamRecord:
 
 
 class _CleanupTicket:
-    """Durable owner for one event-loop-driven terminal operation."""
+    """Durable owner for one independently driven terminal operation."""
 
     def __init__(
         self,
@@ -152,9 +156,11 @@ class _CleanupTicket:
         self.retry_on_incomplete = bool(retry_on_incomplete)
         self.abandon_wait = abandon_wait
         self.retry_count = 0
+        self.submitting = False
         self.operation_future: Any | None = None
         self.wait_future: Any | None = None
-        self.wait_timeout: asyncio.TimerHandle | None = None
+        self.retry_call: RayControlScheduledCall | None = None
+        self.wait_timeout: RayControlScheduledCall | None = None
         self._done = False
         self._error: BaseException | None = None
         self._on_complete = on_complete
@@ -210,15 +216,15 @@ class AsyncResultCollector:
     A terminal record is removed only while ``_cleanup_handoff_lock`` prevents
     shutdown from observing an ownership gap.
 
-    The asyncio thread is the sole generator-readiness, read, and state
+    The asyncio thread is the sole generator-readiness, read, and stream-state
     scheduler. Potentially blocking Ray control submissions and terminal
-    operations run on admitted stream-owner daemon workers and publish their
-    results back to that loop. One blocked stream therefore cannot consume a
-    healthy peer's submission progress, and worker cardinality follows the
-    existing task-admission bound. Driver RPCs are observed through public
-    ObjectRef futures. Every terminal operation enters the ticket ledger before
-    its source record is removed, so shutdown can never observe an ownership
-    gap.
+    operations run on admitted stream-owner daemon workers. Cleanup tickets use
+    the process-wide control deadline clock directly, so loop shutdown cannot
+    orphan a retry or response timeout. One blocked stream therefore cannot
+    consume a healthy peer's submission progress. Driver RPCs are observed
+    through public ObjectRef futures. Every terminal operation enters the ticket
+    ledger before its source record is removed, so shutdown can never observe an
+    ownership gap.
 
     The native dispatcher keeps this collector alive across empty slot
     intervals. ``shutdown`` is the process-owner fence and is called only after
@@ -237,6 +243,9 @@ class AsyncResultCollector:
         self._shutdown_timeout_s = float(os.environ.get("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S", "5"))
         if not math.isfinite(self._shutdown_timeout_s) or self._shutdown_timeout_s <= 0:
             raise ValueError("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S must be positive")
+        # Cleanup ownership can outlive the asyncio loop, so its process-wide
+        # deadline owner must exist before this collector accepts any stream.
+        RAY_CONTROL_DEADLINE_SCHEDULER.ensure_started()
         self._cv = threading.Condition()
         self._shutdown = False
         self._started = False
@@ -841,8 +850,8 @@ class AsyncResultCollector:
                         self._capacity_by_slot.clear()
                         stop_now = not self._cleanup_tickets
                         self._cv.notify_all()
-                    if stop_now and self._thread.is_alive():
-                        self._loop.call_soon_threadsafe(self._loop.stop)
+                    if stop_now:
+                        self._request_event_loop_stop()
 
         if self._thread is threading.current_thread():
             if shutdown_errors:
@@ -878,8 +887,8 @@ class AsyncResultCollector:
                     shutdown_errors.append(error)
             owns_stream_state = bool(self._records or self._active_output_leases or self._ready_by_slot)
 
-        if not pending and not owns_stream_state and self._thread.is_alive():
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        if not pending and not owns_stream_state:
+            self._request_event_loop_stop()
         if (
             self._thread_started
             and self._thread is not threading.current_thread()
@@ -919,10 +928,7 @@ class AsyncResultCollector:
                         self._thread_error = exc
                     self._cv.notify_all()
                 if thread_started:
-                    try:
-                        self._loop.call_soon_threadsafe(self._loop.stop)
-                    except RuntimeError:
-                        pass
+                    self._request_event_loop_stop()
                     if self._thread is not threading.current_thread():
                         # Construction has not transferred ownership to a
                         # caller, so returning while this thread is alive would
@@ -1166,7 +1172,7 @@ class AsyncResultCollector:
         callback: Callable[..., Any],
         *args: Any,
     ) -> None:
-        """Turn every event-loop callback failure into visible collector state."""
+        """Turn every asynchronous callback failure into visible collector state."""
         try:
             callback(*args)
         except BaseException as exc:
@@ -1180,7 +1186,7 @@ class AsyncResultCollector:
         store_error: bool = True,
         slot_ids: Sequence[int] = (),
     ) -> tuple[_CleanupTicket, ...]:
-        """Atomically transfer operations into the event-loop ticket ledger."""
+        """Atomically transfer operations into the durable cleanup ledger."""
         actions = tuple(operations)
         if not actions:
             if on_each_done is not None:
@@ -1223,6 +1229,7 @@ class AsyncResultCollector:
                                     )
                         self._cv.notify_all()
                     self._notify_wakeup()
+                    self._stop_loop_after_final_cleanup_ticket()
 
             ticket = _CleanupTicket(
                 operation=action,
@@ -1234,44 +1241,18 @@ class AsyncResultCollector:
             ticket_holder.append(ticket)
             tickets.append(ticket)
 
-        schedule_error: BaseException | None = None
         with self._cleanup_handoff_lock:
-            # Publish ledger ownership before scheduling. The callback also
-            # acquires _cleanup_handoff_lock, so it cannot drive or finish a
-            # ticket before the transfer is externally visible. If the loop
-            # becomes unavailable, the ledger deliberately retains ownership
-            # and the collector becomes failed instead of silently orphaning
-            # remote resources after a caller drops its source record.
+            # Publish durable ownership before any operation can run. Driving a
+            # ticket only queues bounded control work, so it does not need an
+            # asyncio handoff and remains viable after that loop has stopped.
             with self._cv:
                 self._cleanup_tickets.update(tickets)
                 for slot_id in owner_slots:
                     self._cleanup_tickets_by_slot[slot_id].update(tickets)
                 self._cv.notify_all()
-                loop_available = self._thread_started and self._thread.is_alive() and not self._loop.is_closed()
-            try:
-                if not loop_available:
-                    raise RuntimeError("Ray UDF cleanup event loop is not available")
-                if self._thread is threading.current_thread():
-                    self._loop.call_soon(self._start_cleanup_tickets, tuple(tickets))
-                else:
-                    self._loop.call_soon_threadsafe(self._start_cleanup_tickets, tuple(tickets))
-            except BaseException as exc:
-                schedule_error = exc
-                with self._cv:
-                    if not self._shutdown and self._thread_error is None:
-                        self._thread_error = exc
-                    self._cv.notify_all()
-        if schedule_error is not None and not self._shutdown:
-            self._notify_wakeup()
+            for ticket in tickets:
+                self._drive_cleanup_ticket(ticket)
         return tuple(tickets)
-
-    def _start_cleanup_tickets(self, tickets: tuple[_CleanupTicket, ...]) -> None:
-        """Start tickets only after their ledger handoff is visible."""
-        with self._cleanup_handoff_lock:
-            with self._cv:
-                active = tuple(ticket for ticket in tickets if ticket in self._cleanup_tickets)
-        for ticket in active:
-            self._drive_cleanup_ticket(ticket)
 
     @staticmethod
     def _cleanup_retry_delay(retry_count: int) -> float:
@@ -1291,14 +1272,45 @@ class AsyncResultCollector:
 
     def _retry_cleanup_ticket(self, ticket: _CleanupTicket) -> None:
         with self._cv:
-            if ticket not in self._cleanup_tickets:
+            if (
+                ticket not in self._cleanup_tickets
+                or ticket.submitting
+                or ticket.operation_future is not None
+                or ticket.wait_future is not None
+                or ticket.retry_call is not None
+            ):
                 return
-        ticket.retry_count += 1
-        self._loop.call_later(
-            self._cleanup_retry_delay(ticket.retry_count),
-            self._drive_cleanup_ticket,
-            ticket,
-        )
+            ticket.retry_count += 1
+            retry_call: RayControlScheduledCall
+
+            def retry() -> None:
+                self._run_cleanup_retry(ticket, retry_call)
+
+            retry_call = RAY_CONTROL_DEADLINE_SCHEDULER.create(retry)
+            ticket.retry_call = retry_call
+            retry_delay = self._cleanup_retry_delay(ticket.retry_count)
+        try:
+            RAY_CONTROL_DEADLINE_SCHEDULER.schedule(retry_call, retry_delay)
+        except BaseException as exc:
+            with self._cv:
+                if ticket.retry_call is retry_call:
+                    ticket.retry_call = None
+                    active = ticket in self._cleanup_tickets
+                else:
+                    active = False
+            if active:
+                ticket.finish(exc)
+
+    def _run_cleanup_retry(
+        self,
+        ticket: _CleanupTicket,
+        retry_call: RayControlScheduledCall,
+    ) -> None:
+        with self._cv:
+            if ticket not in self._cleanup_tickets or ticket.retry_call is not retry_call:
+                return
+            ticket.retry_call = None
+        self._drive_cleanup_ticket(ticket)
 
     def _resume_cleanup_ticket(self, ticket: _CleanupTicket, future: Any) -> None:
         with self._cv:
@@ -1311,9 +1323,18 @@ class AsyncResultCollector:
             timeout.cancel()
         self._drive_cleanup_ticket(ticket)
 
-    def _timeout_cleanup_ticket(self, ticket: _CleanupTicket, future: Any) -> None:
+    def _timeout_cleanup_ticket(
+        self,
+        ticket: _CleanupTicket,
+        future: Any,
+        timeout_call: RayControlScheduledCall,
+    ) -> None:
         with self._cv:
-            if ticket not in self._cleanup_tickets or ticket.wait_future is not future:
+            if (
+                ticket not in self._cleanup_tickets
+                or ticket.wait_future is not future
+                or ticket.wait_timeout is not timeout_call
+            ):
                 return
             ticket.wait_future = None
             ticket.wait_timeout = None
@@ -1323,10 +1344,6 @@ class AsyncResultCollector:
         except BaseException as exc:
             if not ticket.retry_on_error:
                 ticket.finish(exc)
-                with self._cv:
-                    stop = self._shutdown and not self._cleanup_tickets
-                if stop:
-                    self._loop.stop()
                 return
         self._retry_cleanup_ticket(ticket)
 
@@ -1334,19 +1351,25 @@ class AsyncResultCollector:
         with self._cv:
             if (
                 ticket not in self._cleanup_tickets
+                or ticket.submitting
                 or ticket.operation_future is not None
                 or ticket.wait_future is not None
+                or ticket.retry_call is not None
             ):
                 return
+            ticket.submitting = True
         try:
             operation_future = submit_ray_control(
                 ticket.operation.submission_scope,
                 ticket.operation,
             )
         except BaseException as exc:
+            with self._cv:
+                ticket.submitting = False
             self._finish_cleanup_operation(ticket, error=exc)
             return
         with self._cv:
+            ticket.submitting = False
             if ticket not in self._cleanup_tickets:
                 operation_future.cancel()
                 return
@@ -1360,24 +1383,24 @@ class AsyncResultCollector:
             active_ticket = ticket_ref()
             if collector is None or active_ticket is None:
                 return
-            try:
-                collector._loop.call_soon_threadsafe(
-                    collector._run_scheduler_callback,
-                    collector._complete_cleanup_operation,
-                    active_ticket,
-                    future,
-                )
-            except RuntimeError as exc:
-                collector._report_scheduler_error(exc)
+            collector._run_scheduler_callback(
+                collector._complete_cleanup_operation,
+                active_ticket,
+                future,
+            )
 
         try:
             operation_future.add_done_callback(ready)
         except BaseException as exc:
             with self._cv:
-                if ticket.operation_future is operation_future:
+                if ticket in self._cleanup_tickets and ticket.operation_future is operation_future:
                     ticket.operation_future = None
-            operation_future.cancel()
-            self._finish_cleanup_operation(ticket, error=exc)
+                    active = True
+                else:
+                    active = False
+            if active:
+                operation_future.cancel()
+                self._finish_cleanup_operation(ticket, error=exc)
 
     def _complete_cleanup_operation(
         self,
@@ -1408,7 +1431,6 @@ class AsyncResultCollector:
                 self._retry_cleanup_ticket(ticket)
                 return
             ticket.finish(error)
-            self._stop_loop_after_final_cleanup_ticket()
             return
 
         if all(callable(getattr(result, name, None)) for name in ("add_done_callback", "done", "result")):
@@ -1425,50 +1447,89 @@ class AsyncResultCollector:
                 active_ticket = ticket_ref()
                 if collector is None or active_ticket is None:
                     return
-                try:
-                    collector._loop.call_soon_threadsafe(
-                        collector._resume_cleanup_ticket,
-                        active_ticket,
-                        future,
-                    )
-                except RuntimeError as exc:
-                    collector._report_scheduler_error(exc)
+                collector._run_scheduler_callback(
+                    collector._resume_cleanup_ticket,
+                    active_ticket,
+                    future,
+                )
 
             try:
                 result.add_done_callback(ready)
             except BaseException as exc:
                 with self._cv:
-                    if ticket.wait_future is result:
+                    if ticket in self._cleanup_tickets and ticket.wait_future is result:
                         ticket.wait_future = None
+                        active = True
+                    else:
+                        active = False
                 # Callback registration is part of the required public Future
                 # contract, not a transient remote operation.
-                ticket.finish(exc)
-                self._stop_loop_after_final_cleanup_ticket()
+                if active:
+                    ticket.finish(exc)
                 return
             if ticket.abandon_wait is not None:
+                timeout_call: RayControlScheduledCall
+
+                def response_timed_out() -> None:
+                    self._timeout_cleanup_ticket(
+                        ticket,
+                        result,
+                        timeout_call,
+                    )
+
+                timeout_call = RAY_CONTROL_DEADLINE_SCHEDULER.create(response_timed_out)
                 with self._cv:
                     if ticket in self._cleanup_tickets and ticket.wait_future is result:
-                        ticket.wait_timeout = self._loop.call_later(
-                            self._cleanup_response_timeout(
-                                ticket.retry_count,
-                            ),
-                            self._timeout_cleanup_ticket,
-                            ticket,
-                            result,
+                        ticket.wait_timeout = timeout_call
+                        start_timeout = True
+                    else:
+                        start_timeout = False
+                if start_timeout:
+                    try:
+                        RAY_CONTROL_DEADLINE_SCHEDULER.schedule(
+                            timeout_call,
+                            self._cleanup_response_timeout(ticket.retry_count),
                         )
+                    except BaseException as exc:
+                        with self._cv:
+                            if ticket.wait_timeout is timeout_call and ticket.wait_future is result:
+                                ticket.wait_timeout = None
+                                ticket.wait_future = None
+                                active = ticket in self._cleanup_tickets
+                            else:
+                                active = False
+                        if active:
+                            try:
+                                ticket.abandon_wait(result)
+                            except BaseException:
+                                pass
+                            ticket.finish(exc)
             return
 
         if result is False and ticket.retry_on_incomplete:
             self._retry_cleanup_ticket(ticket)
             return
         ticket.finish(None)
-        self._stop_loop_after_final_cleanup_ticket()
 
     def _stop_loop_after_final_cleanup_ticket(self) -> None:
         with self._cv:
             stop = self._shutdown and not self._cleanup_tickets
         if stop:
+            self._request_event_loop_stop()
+
+    def _request_event_loop_stop(self) -> None:
+        """Idempotently wake a live loop without racing its final close."""
+        if not self._thread.is_alive():
+            return
+        if self._thread is threading.current_thread():
             self._loop.stop()
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        except RuntimeError:
+            if not self._loop.is_closed() and self._thread.is_alive():
+                raise
+            # The loop completed between the liveness check and notification.
 
     def _run_event_loop(self) -> None:
         asyncio.set_event_loop(self._loop)

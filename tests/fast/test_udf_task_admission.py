@@ -11,6 +11,7 @@ from concurrent.futures import Future
 
 import pytest
 
+import duckdb.execution.ray_control_deadline as ray_control_deadline
 import duckdb.execution.ray_control_submission as ray_control_submission
 import duckdb.execution.udf_task_admission as task_admission
 from duckdb.execution.udf_admission import (
@@ -718,7 +719,7 @@ def test_task_admission_cancellations_share_one_deadline_thread(monkeypatch):
     while len(responses) < len(cancellations) and time.monotonic() < response_deadline:
         time.sleep(0.005)
     assert len(responses) == len(cancellations)
-    scheduler_threads = [thread for thread in threading.enumerate() if thread.name == "vane-task-admission-cleanup"]
+    scheduler_threads = [thread for thread in threading.enumerate() if thread.name == "vane-ray-control-deadlines"]
     assert len(scheduler_threads) == 1
 
     for response in responses:
@@ -732,13 +733,13 @@ def test_task_admission_cancellations_share_one_deadline_thread(monkeypatch):
 def test_task_admission_deadline_scheduler_start_failure_is_retryable(
     monkeypatch,
 ):
-    scheduler = task_admission._TaskAdmissionCancellationScheduler()
+    scheduler = ray_control_deadline.RayControlDeadlineScheduler()
     original_start = threading.Thread.start
     starts = 0
 
     def fail_first_start(thread):
         nonlocal starts
-        if thread.name == "vane-task-admission-cleanup":
+        if thread.name == "vane-ray-control-deadlines":
             starts += 1
             if starts == 1:
                 raise RuntimeError("deadline thread unavailable")
@@ -902,6 +903,101 @@ def test_stalled_control_owners_do_not_consume_the_schedulable_pool():
     assert executor._pending_submissions == 0
 
 
+def test_blocked_future_callbacks_do_not_consume_the_schedulable_pool():
+    executor = ray_control_submission._RayControlSubmissionExecutor(
+        idle_timeout_s=0.01,
+        stall_timeout_s=0.2,
+        max_workers=2,
+        max_stalled_workers=2,
+        max_pending_submissions=8,
+        max_pending_per_owner=1,
+    )
+    callbacks_may_return = threading.Event()
+    release_completion_callbacks = threading.Event()
+    submissions_entered = threading.Event()
+    completion_callbacks_entered = threading.Event()
+    counter_lock = threading.Lock()
+    entered_submissions = 0
+    entered_callbacks = 0
+
+    def submission():
+        nonlocal entered_submissions
+        with counter_lock:
+            entered_submissions += 1
+            if entered_submissions == 2:
+                submissions_entered.set()
+        assert callbacks_may_return.wait(timeout=5.0)
+        return "completed"
+
+    def block_completion(_future):
+        nonlocal entered_callbacks
+        with counter_lock:
+            entered_callbacks += 1
+            if entered_callbacks == 2:
+                completion_callbacks_entered.set()
+        assert release_completion_callbacks.wait(timeout=5.0)
+
+    blocked = [executor.submit(f"owner:blocked-completion:{index}", submission) for index in range(2)]
+    assert submissions_entered.wait(timeout=1.0)
+    for future in blocked:
+        future.add_done_callback(block_completion)
+    callbacks_may_return.set()
+    assert completion_callbacks_entered.wait(timeout=1.0)
+
+    healthy = executor.submit("owner:healthy-after-completion-stalls", lambda: "healthy")
+    assert healthy.result(timeout=1.0) == "healthy"
+    with executor._condition:
+        assert sum(worker.stalled for worker in executor._workers.values()) >= 1
+        assert len(executor._workers) <= 4
+
+    release_completion_callbacks.set()
+    assert [future.result(timeout=1.0) for future in blocked] == ["completed"] * 2
+    completion_deadline = time.monotonic() + 1.0
+    while executor._workers and time.monotonic() < completion_deadline:
+        time.sleep(0.005)
+    assert executor._workers == {}
+    assert executor._owners == {}
+    assert executor._pending_submissions == 0
+
+
+def test_control_deadline_uses_lock_free_completion_timestamps():
+    executor = ray_control_submission._RayControlSubmissionExecutor(
+        idle_timeout_s=0.5,
+        stall_timeout_s=0.1,
+        max_workers=1,
+        max_stalled_workers=1,
+        max_pending_submissions=3,
+        max_pending_per_owner=1,
+    )
+    submission_entered = threading.Event()
+    callback_may_return = threading.Event()
+
+    def submission():
+        submission_entered.set()
+        assert callback_may_return.wait(timeout=5.0)
+        return "first"
+
+    first = executor.submit("owner:lock-contention:first", submission)
+    assert submission_entered.wait(timeout=1.0)
+    healthy = executor.submit("owner:lock-contention:healthy", lambda: "healthy")
+
+    with executor._condition:
+        original_worker = next(iter(executor._workers.values()))
+        callback_may_return.set()
+        timestamp_deadline = time.monotonic() + 1.0
+        while original_worker.completion_finished_at is None and time.monotonic() < timestamp_deadline:
+            time.sleep(0.001)
+        assert original_worker.callback_finished_at is not None
+        assert original_worker.completion_finished_at is not None
+        # Hold the bookkeeping lock beyond both phase deadlines. The worker's
+        # already-published timestamps must prevent a false stall classification.
+        time.sleep(0.25)
+
+    assert first.result(timeout=1.0) == "first"
+    assert healthy.result(timeout=1.0) == "healthy"
+    assert original_worker.stalled is False
+
+
 def test_stalled_control_owner_retains_fifo_while_healthy_owner_progresses():
     executor = ray_control_submission._RayControlSubmissionExecutor(
         idle_timeout_s=0.01,
@@ -981,31 +1077,33 @@ def test_control_submissions_fail_fast_at_stalled_worker_bound_and_recover():
     assert recovery.result(timeout=1.0) == "recovered"
 
 
-def test_ray_control_submission_watchdog_start_failure_is_retryable(monkeypatch):
+def test_ray_control_submission_deadline_start_failure_does_not_admit_work(monkeypatch):
+    scheduler = ray_control_deadline.RayControlDeadlineScheduler()
     executor = ray_control_submission._RayControlSubmissionExecutor(
         idle_timeout_s=0.01,
+        deadline_scheduler=scheduler,
     )
     original_start = threading.Thread.start
     starts = 0
 
-    def fail_first_watchdog_start(thread):
+    def fail_first_deadline_start(thread):
         nonlocal starts
-        if thread.name.startswith("vane-ray-control-submit-watchdog-"):
+        if thread.name == "vane-ray-control-deadlines":
             starts += 1
             if starts == 1:
-                raise RuntimeError("control watchdog unavailable")
+                raise RuntimeError("control deadline clock unavailable")
         return original_start(thread)
 
-    monkeypatch.setattr(threading.Thread, "start", fail_first_watchdog_start)
-    with pytest.raises(RuntimeError, match="control watchdog unavailable"):
-        executor.submit("owner:watchdog-start-failure", lambda: "unexpected")
+    monkeypatch.setattr(threading.Thread, "start", fail_first_deadline_start)
+    with pytest.raises(RuntimeError, match="control deadline clock unavailable"):
+        executor.submit("owner:deadline-start-failure", lambda: "unexpected")
 
-    assert executor._watchdog_thread is None
+    assert scheduler._thread is None
     assert executor._workers == {}
     assert executor._owners == {}
     assert executor._pending_submissions == 0
 
-    retry = executor.submit("owner:watchdog-start-retry", lambda: "recovered")
+    retry = executor.submit("owner:deadline-start-retry", lambda: "recovered")
     assert retry.result(timeout=1.0) == "recovered"
 
 

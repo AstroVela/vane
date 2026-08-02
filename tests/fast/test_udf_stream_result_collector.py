@@ -859,7 +859,7 @@ def test_cleanup_tickets_retry_transient_failure_without_starving_peer():
         collector.shutdown()
 
 
-def test_cleanup_ticket_ledger_retains_ownership_when_loop_notification_fails(
+def test_cleanup_tickets_progress_when_loop_notification_fails(
     monkeypatch,
 ):
     collector = AsyncResultCollector(ray_module=_FakeRay())
@@ -874,6 +874,47 @@ def test_cleanup_ticket_ledger_retains_ownership_when_loop_notification_fails(
         "call_soon_threadsafe",
         fail_notification,
     )
+    try:
+        tickets = collector._submit_cleanup_operations(
+            (
+                RayStreamCleanupOperation(
+                    lambda: operation_calls.append("cleaned"),
+                    submission_scope=_CLEANUP_SUBMISSION_SCOPE,
+                ),
+            ),
+            store_error=False,
+            slot_ids=(17,),
+        )
+
+        assert (
+            _wait_cleanup_tickets(
+                tickets,
+                timeout_message="self-driven cleanup ticket did not finish",
+            )
+            == ()
+        )
+        assert operation_calls == ["cleaned"]
+        with collector._cv:
+            assert collector._cleanup_tickets == set()
+            assert collector._cleanup_tickets_by_slot.get(17) is None
+            assert collector._thread_error is None
+    finally:
+        monkeypatch.setattr(
+            collector._loop,
+            "call_soon_threadsafe",
+            original_call_soon_threadsafe,
+        )
+        collector.shutdown()
+
+
+def test_cleanup_tickets_progress_after_event_loop_exits():
+    collector = AsyncResultCollector(ray_module=_FakeRay())
+    operation_calls = []
+    collector._request_event_loop_stop()
+    collector._thread.join(timeout=1.0)
+    assert collector._thread.is_alive() is False
+    assert collector._loop.is_closed()
+
     tickets = collector._submit_cleanup_operations(
         (
             RayStreamCleanupOperation(
@@ -882,33 +923,20 @@ def test_cleanup_ticket_ledger_retains_ownership_when_loop_notification_fails(
             ),
         ),
         store_error=False,
-        slot_ids=(17,),
     )
-
-    with collector._cv:
-        assert set(tickets) <= collector._cleanup_tickets
-        assert set(tickets) <= collector._cleanup_tickets_by_slot[17]
-        assert "planned cleanup loop notification failure" in str(collector._thread_error)
-    assert operation_calls == []
-
-    monkeypatch.setattr(
-        collector._loop,
-        "call_soon_threadsafe",
-        original_call_soon_threadsafe,
-    )
-    original_call_soon_threadsafe(
-        collector._start_cleanup_tickets,
-        tickets,
-    )
-    assert (
-        _wait_cleanup_tickets(
-            tickets,
-            timeout_message="retained cleanup ticket did not finish",
+    try:
+        assert (
+            _wait_cleanup_tickets(
+                tickets,
+                timeout_message="cleanup ticket did not survive loop exit",
+            )
+            == ()
         )
-        == ()
-    )
-    assert operation_calls == ["cleaned"]
-    collector.shutdown()
+        assert operation_calls == ["cleaned"]
+        with collector._cv:
+            assert collector._cleanup_tickets == set()
+    finally:
+        collector.shutdown()
 
 
 def test_cleanup_ticket_preserves_incomplete_ownership_retry():
