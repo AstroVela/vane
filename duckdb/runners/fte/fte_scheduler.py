@@ -320,6 +320,7 @@ class FteAttemptStatusWatcher:
 
     def _run(self) -> None:
         min_version = None
+        manager_instance_id = str(getattr(self.worker, "manager_instance_id", ""))
         while not self._stop.is_set():
             try:
                 status = self._wait_task_status(min_version)
@@ -335,6 +336,7 @@ class FteAttemptStatusWatcher:
                         self.scheduler.query_id,
                         str(self.worker.worker_id),
                         exc,
+                        manager_instance_id=manager_instance_id,
                     )
                 )
                 return
@@ -346,6 +348,7 @@ class FteAttemptStatusWatcher:
                         self.scheduler.query_id,
                         str(self.worker.worker_id),
                         TypeError("fte_wait_task_status must return a dict"),
+                        manager_instance_id=manager_instance_id,
                     )
                 )
                 return
@@ -357,6 +360,7 @@ class FteAttemptStatusWatcher:
                         self.scheduler.query_id,
                         str(self.worker.worker_id),
                         exc,
+                        manager_instance_id=manager_instance_id,
                     )
                 )
                 return
@@ -375,6 +379,7 @@ class FteAttemptStatusWatcher:
                         self.scheduler.query_id,
                         str(self.worker.worker_id),
                         ValueError(f"unknown FTE task state: {raw_state!r}"),
+                        manager_instance_id=manager_instance_id,
                     )
                 )
                 return
@@ -562,6 +567,31 @@ class FteQueryScheduler:
         self._queued_internal_admission_classes: set[str | None] = set()
         self._failed_worker_ids: set[str] = set()
         self._task_sources: dict[str, FteTaskSourceRegistration] = {}
+        self._manager_instance_id: str | None = None
+
+    def bind_manager_instance(
+        self,
+        manager_instance_id: str,
+        *,
+        handlers: FteEventHandlers | None = None,
+    ) -> None:
+        manager_instance_id = str(manager_instance_id or "").strip()
+        with self._lock:
+            if self._manager_instance_id is None:
+                self._manager_instance_id = manager_instance_id
+            elif self._manager_instance_id != manager_instance_id:
+                raise RuntimeError(
+                    "FTE query scheduler manager ownership mismatch: "
+                    f"query={self.query_id} owner={self._manager_instance_id or '<default>'} "
+                    f"requested={manager_instance_id or '<default>'}"
+                )
+            if handlers is not None:
+                self._handlers = handlers
+
+    def is_owned_by_manager_instance(self, manager_instance_id: str) -> bool:
+        manager_instance_id = str(manager_instance_id or "").strip()
+        with self._lock:
+            return self._manager_instance_id == manager_instance_id
 
     def set_handlers(self, handlers: FteEventHandlers) -> None:
         with self._lock:

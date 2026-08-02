@@ -5,6 +5,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from duckdb.runners.fte import (
+    FteWorkerControlFailure,
+)
+from duckdb.runners.fte.fte_events import MemoryPressureDetected
 from duckdb.runners.ray.fragment_registry import (
     _FTE_FRAGMENT_EXECUTIONS,
     _FTE_REGISTRY_LOCK,
@@ -15,10 +19,6 @@ from duckdb.runners.ray.fragment_worker_state import (
     fte_fragment_execution_items,
     fte_fragment_execution_query_ids,
 )
-from duckdb.runners.fte import (
-    FteWorkerControlFailure,
-)
-from duckdb.runners.fte.fte_events import MemoryPressureDetected
 from duckdb.runners.ray.fte_fragment_scheduler import (
     _fte_effective_worker_memory_budget_bytes,
     _fte_pressure_total_memory_bytes,
@@ -37,6 +37,15 @@ if TYPE_CHECKING:
 
 
 class FteWorkerTransitionMixin:
+    if TYPE_CHECKING:
+        # Supplied by the other mixins on the composed Ray worker handle.
+        _bind_fte_scheduler_handlers: Any
+        _drain_fte_pending_tasks: Any
+        _fte_partition_owner: Any
+        _fte_worker_placement_manager: Any
+        _handles_for_fte_worker_control_failure: Any
+        manager_instance_id: str
+
     def _release_deferred_fte_execution_partitions(
         self,
         fragment_execution_items: list[tuple[tuple[str, str], FteFragmentExecution]],
@@ -142,6 +151,8 @@ class FteWorkerTransitionMixin:
             scheduler = _FTE_SCHEDULERS.get(query_id)
             if scheduler is None:
                 continue
+            if not scheduler.is_owned_by_manager_instance(self.manager_instance_id):
+                continue
             self._bind_fte_scheduler_handlers(scheduler)
             scheduler.enqueue(MemoryPressureDetected(query_id, max_count_per_worker))
             handles.extend(scheduler.drain())
@@ -155,17 +166,18 @@ class FteWorkerTransitionMixin:
     ) -> list[Any]:
         if query_id_filter is not None:
             query_id_filter = str(query_id_filter)
+        manager_instance_id = str(getattr(self, "manager_instance_id", ""))
         with _FTE_REGISTRY_LOCK:
             workers = [
                 handle
                 for _, handle in sorted(_FTE_WORKER_HANDLES.items())
-                if handle is not None and handle._fte_healthy
+                if handle is not None
+                and handle._fte_healthy
+                and str(getattr(handle, "manager_instance_id", "")) == manager_instance_id
             ]
         revoked_any = False
         for worker in workers:
             budget_bytes = _fte_effective_worker_memory_budget_bytes(worker, None)
-            if budget_bytes is None:
-                continue
             worker_id = str(worker.worker_id)
             if not worker_id:
                 continue

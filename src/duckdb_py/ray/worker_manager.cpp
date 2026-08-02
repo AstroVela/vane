@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb_python/pybind11/gil_wrapper.hpp"
 
 namespace py = pybind11;
@@ -19,6 +20,10 @@ using duckdb::distributed::TaskResourceRequest;
 using duckdb::distributed::WorkerSnapshot;
 
 static constexpr auto REFRESH_INTERVAL = std::chrono::seconds(5);
+
+RayWorkerManager::RayWorkerManager()
+    : manager_instance_id_(duckdb::UUID::ToString(duckdb::UUID::GenerateRandomUUID())) {
+}
 
 static std::vector<std::string> AbortWorkers(const std::vector<std::shared_ptr<RayWorkerRuntime>> &workers) {
 	std::vector<std::string> errors;
@@ -564,7 +569,7 @@ RayWorkerManager::WorkerSnapshotResult RayWorkerManager::WorkerSnapshotsWithoutG
 		duckdb::PythonGILWrapper gil;
 		try {
 			py::module_ worker_pool_obj = py::module_::import("duckdb.runners.ray.worker_pool");
-			py::object py_workers_obj = worker_pool_obj.attr("start_ray_workers")(existing_ids);
+			py::object py_workers_obj = worker_pool_obj.attr("start_ray_workers")(existing_ids, manager_instance_id_);
 
 			py::iterable workers_iter;
 			try {

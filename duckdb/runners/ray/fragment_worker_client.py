@@ -51,6 +51,8 @@ class RayWorkerActorHandle(
         memory_capacity_bytes: int,
         node_id: str,
         worker_id: str,
+        host: str | None = None,
+        manager_instance_id: str | None = None,
     ):
         memory_capacity_bytes = int(memory_capacity_bytes)
         if memory_capacity_bytes <= 0:
@@ -61,9 +63,14 @@ class RayWorkerActorHandle(
         worker_id = str(worker_id).strip()
         if not worker_id:
             raise ValueError("worker_id must be non-empty")
+        host = str(host if host is not None else worker_id.rsplit("#", 1)[0]).strip()
+        if not host:
+            raise ValueError("host must be non-empty")
         self.actor_handle = actor_handle
         self.worker_id = worker_id
         self.node_id = node_id
+        self.host = host
+        self.manager_instance_id = str(manager_instance_id or "").strip()
         self.memory_capacity_bytes = memory_capacity_bytes
         self._registered_fragment_ids: set[str] = set()
         self._fragment_registration_refs: dict[str, Any] = {}
@@ -85,6 +92,9 @@ class RayWorkerActorHandle(
         self._fragment_drop_incomplete_queries: set[str] = set()
         self._worker_shutdown_started = False
         with _FTE_REGISTRY_LOCK:
+            current = _FTE_WORKER_HANDLES.get(worker_id)
+            if current is not None and current is not self:
+                raise RuntimeError(f"FTE worker id is already registered: {worker_id}")
             _FTE_WORKER_HANDLES[worker_id] = self
 
     def close_session(self, session_id: str) -> None:

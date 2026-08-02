@@ -998,14 +998,6 @@ def fte_execution_query_ids_for_resource(
     return tuple(sorted(execution_query_ids))
 
 
-def _worker_id_host_and_index(worker_id: str) -> tuple[str, str]:
-    worker_id = str(worker_id or "")
-    if "#" not in worker_id:
-        return worker_id, ""
-    host_id, worker_index = worker_id.rsplit("#", 1)
-    return host_id, worker_index
-
-
 def _node_requirements_host(node_requirements: NodeRequirements | Mapping[str, Any] | None) -> str | None:
     if node_requirements is None:
         return None
@@ -1063,8 +1055,7 @@ def _worker_matches_node_requirements(
     host = _node_requirements_host(node_requirements)
     if host is None:
         return True
-    worker_host, _ = _worker_id_host_and_index(str(handle.worker_id))
-    return worker_host == host
+    return str(handle.host) == host
 
 
 def _filter_workers_for_node_requirements(
@@ -1555,6 +1546,7 @@ def _fte_worker_selection_key(
 def _select_replacement_fte_worker(
     exclude_worker_id: str | set[str],
     *,
+    manager_instance_id: str | None = None,
     memory_requirement_bytes: Any = None,
     execution_class: FteTaskExecutionClass | str | None = None,
     node_requirements: NodeRequirements | Mapping[str, Any] | None = None,
@@ -1569,7 +1561,10 @@ def _select_replacement_fte_worker(
         candidates = [
             handle
             for worker_id, handle in sorted(_FTE_WORKER_HANDLES.items())
-            if str(worker_id) not in exclude_worker_ids and handle is not None and handle._fte_healthy
+            if str(worker_id) not in exclude_worker_ids
+            and handle is not None
+            and handle._fte_healthy
+            and (manager_instance_id is None or str(getattr(handle, "manager_instance_id", "")) == manager_instance_id)
         ]
     if not candidates:
         return None
@@ -1605,6 +1600,7 @@ def _select_replacement_fte_worker(
 def _has_replacement_fte_worker(
     exclude_worker_id: str | set[str],
     *,
+    manager_instance_id: str | None = None,
     node_requirements: NodeRequirements | Mapping[str, Any] | None = None,
     node_requirements_wait_started_at: float | None = None,
 ) -> bool:
@@ -1617,7 +1613,10 @@ def _has_replacement_fte_worker(
         candidates = [
             handle
             for worker_id, handle in _FTE_WORKER_HANDLES.items()
-            if str(worker_id) not in exclude_worker_ids and handle is not None and handle._fte_healthy
+            if str(worker_id) not in exclude_worker_ids
+            and handle is not None
+            and handle._fte_healthy
+            and (manager_instance_id is None or str(getattr(handle, "manager_instance_id", "")) == manager_instance_id)
         ]
     return bool(
         _filter_workers_for_node_requirements(
@@ -2284,6 +2283,7 @@ def _mark_fte_worker_failed(
     *,
     query_id_filter: str | None = None,
     failed_worker_ids_override: set[str] | frozenset[str] | None = None,
+    manager_instance_id: str | None = None,
 ) -> list[tuple[str, str, list[Any], list[Any]]]:
     worker_id = str(worker_id or "")
     if not worker_id:
@@ -2291,6 +2291,7 @@ def _mark_fte_worker_failed(
     failure = _normalize_failure_payload(failure)
     if query_id_filter is not None:
         query_id_filter = str(query_id_filter)
+    normalized_manager_instance_id = None if manager_instance_id is None else str(manager_instance_id or "").strip()
     failed_worker_ids = (
         {str(item) for item in failed_worker_ids_override} if failed_worker_ids_override is not None else {worker_id}
     )
@@ -2306,8 +2307,14 @@ def _mark_fte_worker_failed(
     ] = []
     with _FTE_REGISTRY_LOCK:
         for failed_worker_id in sorted(failed_worker_ids):
-            failed_handle = _FTE_WORKER_HANDLES.pop(failed_worker_id, None)
+            failed_handle = _FTE_WORKER_HANDLES.get(failed_worker_id)
             if failed_handle is not None:
+                failed_handle_manager_instance_id = str(getattr(failed_handle, "manager_instance_id", ""))
+                if normalized_manager_instance_id is None:
+                    normalized_manager_instance_id = failed_handle_manager_instance_id
+                elif failed_handle_manager_instance_id != normalized_manager_instance_id:
+                    continue
+                _FTE_WORKER_HANDLES.pop(failed_worker_id, None)
                 failed_handle._fte_healthy = False
                 if failed_worker_id != worker_id:
                     handles_to_kill.append(failed_handle)
@@ -2350,6 +2357,7 @@ def _mark_fte_worker_failed(
         wait_started_at = time.time()
         replacement = _select_replacement_fte_worker(
             failed_worker_ids,
+            manager_instance_id=normalized_manager_instance_id,
             memory_requirement_bytes=memory_requirement_bytes,
             execution_class=execution_class,
             node_requirements=node_requirements,
@@ -2357,6 +2365,7 @@ def _mark_fte_worker_failed(
         )
         retryable_by_owner_key[owner_key] = replacement is not None or _has_replacement_fte_worker(
             failed_worker_ids,
+            manager_instance_id=normalized_manager_instance_id,
             node_requirements=node_requirements,
             node_requirements_wait_started_at=wait_started_at,
         )

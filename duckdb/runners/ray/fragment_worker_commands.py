@@ -85,6 +85,7 @@ class FteWorkerCommandMixin:
         _fte_partition_owner: Any
         _fte_task_handle_cls: Any
         _handles_for_fte_worker_control_failure: Any
+        manager_instance_id: str
 
     def _execute_fte_fragment_execution_worker_commands(
         self,
@@ -201,7 +202,10 @@ class FteWorkerCommandMixin:
                         # select the failed worker. The scheduler reconciliation
                         # remains deferred until this batch's healthy tail owns a
                         # terminal outcome.
-                        quarantine_fte_worker(failure.worker_id)
+                        quarantine_fte_worker(
+                            failure.worker_id,
+                            manager_instance_id=self.manager_instance_id,
+                        )
                     continue
                 try:
                     if isinstance(command, FteCreateTaskCommand):
