@@ -27,6 +27,8 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 
 ### Fixed
 
+- Required PyArrow 14.0.0 or newer at runtime and added minimum-version UDF
+  coverage for table-concatenation paths that use the PyArrow 14 API.
 - Released per-database runner cache entries after relation write failures
   without resetting the process-wide runner used by other queries.
 
