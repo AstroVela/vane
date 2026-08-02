@@ -62,6 +62,38 @@ def test_stage_collection_marks_blocking_distributed_materializers(tmp_path):
         con.close()
 
 
+@pytest.mark.parametrize(
+    ("sample_clause", "expected_blocking"),
+    [
+        ("reservoir(3 ROWS)", True),
+        ("reservoir(50 PERCENT)", False),
+    ],
+)
+def test_stage_collection_classifies_reservoir_sample_materialization(
+    tmp_path,
+    sample_clause,
+    expected_blocking,
+):
+    con = duckdb.connect()
+    try:
+        path = tmp_path / "sample_input.parquet"
+        con.execute(f"COPY (SELECT i::BIGINT AS x FROM range(8) tbl(i)) TO '{path}' (FORMAT PARQUET)")
+        relation = con.sql(f"SELECT x FROM read_parquet('{path}') USING SAMPLE {sample_clause}")
+        plan = _physical_plan(relation, con, "graph-reservoir-sample")
+
+        metadata = plan.collect_execution_stages(conn=con)
+        (sample_node,) = (node for node in metadata["nodes"] if node["node_name"] == "ReservoirSample")
+        graph = build_query_execution_graph(metadata, env={})
+        sample_stage = next(
+            stage for stage in graph.stages if stage.physical_node_id == f"node:{sample_node['node_id']}:fte"
+        )
+
+        assert sample_node["is_blocking_materializing"] is expected_blocking
+        assert sample_stage.spill_mode == ("barrier" if expected_blocking else "streaming")
+    finally:
+        con.close()
+
+
 def test_stage_collection_does_not_treat_generic_inout_as_python_udf(tmp_path):
     con = duckdb.connect()
     try:

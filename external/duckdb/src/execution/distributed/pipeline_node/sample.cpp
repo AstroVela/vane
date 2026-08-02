@@ -60,7 +60,7 @@ SubmittableTaskStream<WorkerTask> ReservoirSampleNode::produce_tasks(PlanExecuti
 		return input_plan;
 	};
 
-	if (!options_template || options_template->is_percentage) {
+	if (!is_blocking_materializing()) {
 		auto input_stream = child_->produce_tasks(plan_context);
 		return input_stream.pipeline_instruction(shared_from_this(), std::move(single_stage_builder),
 		                                         plan_context.client_context());

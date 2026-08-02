@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "duckdb/execution/distributed/pipeline_node/materialized_coordinator.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/execution/distributed/exchange/exchange.hpp"
 #include "duckdb/execution/distributed/exchange/exchange_manager.hpp"
 #include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
@@ -196,6 +197,13 @@ SubmittableTaskStream<WorkerTask> ProduceWithMaterializedCoordinator(
     PlanExecutionContext &plan_context, const PipelineNodeRef &child, const std::shared_ptr<PipelineNodeImpl> &node,
     MaterializedPlanBuilder final_plan_builder, PerTaskMaterializedPlanBuilderFactory per_task_builder_factory,
     std::shared_ptr<ExchangeManager> exchange_mgr, SchemaRef materialized_schema) {
+	if (!node) {
+		throw InternalException("Materialized coordinator requires a pipeline node");
+	}
+	if (!node->is_blocking_materializing()) {
+		throw InternalException("Materialized coordinator node %s must be marked as blocking materializing",
+		                        node->name());
+	}
 	auto input_stream = child->produce_tasks(plan_context);
 
 	auto channel_pair = create_channel<SubmittableTask<WorkerTask>>(1);

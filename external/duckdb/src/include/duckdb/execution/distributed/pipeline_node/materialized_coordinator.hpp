@@ -18,6 +18,9 @@ using PerTaskMaterializedPlanBuilderFactory = std::function<MaterializedPlanBuil
 
 bool ChildHasMultiplePartitions(const PipelineNodeRef &child);
 
+//! Produce a local-materialization phase followed by one coordinator task.
+//! The node must report is_blocking_materializing() so resource metadata and
+//! runtime phase completion share one contract; the implementation enforces it.
 SubmittableTaskStream<WorkerTask> ProduceWithMaterializedCoordinator(
     PlanExecutionContext &plan_context, const PipelineNodeRef &child, const std::shared_ptr<PipelineNodeImpl> &node,
     MaterializedPlanBuilder final_plan_builder, PerTaskMaterializedPlanBuilderFactory per_task_builder_factory = {},

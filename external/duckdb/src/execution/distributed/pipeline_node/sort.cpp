@@ -579,7 +579,7 @@ SubmittableTaskStream<WorkerTask> OrderByNode::produce_tasks(PlanExecutionContex
 		return AddPhysicalOrderPlan(std::move(input_plan), *orders_ptr, *projections_ptr, is_index_sort);
 	};
 
-	if (!ChildHasMultiplePartitions(child_)) {
+	if (!is_blocking_materializing()) {
 		auto input_stream = child_->produce_tasks(plan_context);
 		return input_stream.pipeline_instruction(shared_from_this(), order_plan_builder, plan_context.client_context());
 	}
@@ -905,7 +905,7 @@ SubmittableTaskStream<WorkerTask> TopNNode::produce_tasks(PlanExecutionContext &
 	};
 
 	// Single-partition path: just use pipeline_instruction (no coordinator).
-	if (!ChildHasMultiplePartitions(child_)) {
+	if (!is_blocking_materializing()) {
 		auto input_stream = child_->produce_tasks(plan_context);
 		return input_stream.pipeline_instruction(shared_from_this(), final_plan_builder, plan_context.client_context());
 	}
