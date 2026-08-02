@@ -27,6 +27,8 @@ def quarantine_fte_worker(
 
     worker_id = str(worker_id or "")
     failed_worker_ids = frozenset({worker_id}) if worker_id else frozenset()
+    # Preserve "" as the explicit legacy scope. Only None means that the
+    # caller has no ownership metadata and requires the compatibility path.
     normalized_manager_instance_id = None if manager_instance_id is None else str(manager_instance_id or "").strip()
     with _FTE_REGISTRY_LOCK:
         for failed_worker_id in failed_worker_ids:
@@ -49,6 +51,7 @@ def mark_fte_worker_failed_for_event(event: Any) -> list[tuple[str, str, list[An
         scheduler = _FTE_SCHEDULERS.get(event.query_id)
     if scheduler is None:
         return []
+    # Do not collapse "" into None: legacy schedulers are explicitly owned.
     manager_instance_id = getattr(event, "manager_instance_id", None)
     if manager_instance_id is not None and not scheduler.is_owned_by_manager_instance(manager_instance_id):
         return []

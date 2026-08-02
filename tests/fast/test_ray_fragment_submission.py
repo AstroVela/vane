@@ -24,6 +24,7 @@ import duckdb.runners.ray.fragment_worker_placement as worker_placement_mod
 import duckdb.runners.ray.fragment_worker_selection as worker_selection_mod
 import duckdb.runners.ray.fragment_worker_submission as fragment_submission_mod
 import duckdb.runners.ray.fragment_worker_task_control as task_control_mod
+import duckdb.runners.ray.fragment_worker_transitions as worker_transitions_mod
 import duckdb.runners.ray.fte_fragment_scheduler as fte_fragment_scheduler_mod
 import duckdb.runners.ray.worker as worker_mod
 import duckdb.runners.ray.worker_handle as worker_handle_mod
@@ -5763,6 +5764,58 @@ def test_fte_worker_quarantine_rejects_cross_manager_identity():
     assert other_manager._fte_healthy is True
 
 
+def test_fte_blank_manager_scope_remains_legacy_and_fail_closed():
+    legacy = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="legacy#0",
+    )
+    managed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-b:node-a:0",
+        manager_instance_id="manager-b",
+    )
+
+    failed_worker_ids = worker_failures_mod.quarantine_fte_worker(
+        managed.worker_id,
+        manager_instance_id="   ",
+    )
+    scheduled = fte_fragment_scheduler_mod._mark_fte_worker_failed(
+        managed.worker_id,
+        fte_fragment_scheduler_mod._worker_failure_payload(
+            managed.worker_id,
+            RuntimeError("planned failure"),
+        ),
+        manager_instance_id="   ",
+    )
+
+    assert failed_worker_ids == frozenset()
+    assert scheduled == []
+    assert worker_handle_mod._FTE_WORKER_HANDLES[managed.worker_id] is managed
+    assert managed._fte_healthy is True
+    assert worker_failures_mod.quarantine_fte_worker(
+        legacy.worker_id,
+        manager_instance_id="   ",
+    ) == frozenset({legacy.worker_id})
+    assert legacy._fte_healthy is False
+
+
+def test_fte_memory_pressure_skips_worker_without_budget(monkeypatch):
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="legacy#0",
+    )
+    monkeypatch.setattr(
+        worker_transitions_mod,
+        "_fte_effective_worker_memory_budget_bytes",
+        lambda _worker, _execution_class: None,
+    )
+
+    assert handle._revoke_fte_speculative_tasks_for_memory_pressure_direct() == []
+
+
 def test_fte_query_scheduler_rejects_cross_manager_rebinding():
     first = RayWorkerActorHandle(
         _FakeActor(),
@@ -5804,12 +5857,13 @@ def test_fte_global_worker_failure_does_not_claim_unbound_scheduler():
     assert scheduler.is_owned_by_manager_instance("manager-b")
 
 
-def test_fte_worker_failure_event_rejects_cross_manager_scheduler():
+@pytest.mark.parametrize("failed_manager_instance_id", ["manager-a", ""])
+def test_fte_worker_failure_event_rejects_cross_manager_scheduler(failed_manager_instance_id):
     failed = RayWorkerActorHandle(
         _FakeActor(),
         memory_capacity_bytes=1 << 60,
-        worker_id="manager-a:node-a:0",
-        manager_instance_id="manager-a",
+        worker_id=f"{failed_manager_instance_id or 'legacy'}:node-a:0",
+        manager_instance_id=failed_manager_instance_id,
     )
     owner = RayWorkerActorHandle(
         _FakeActor(),
@@ -5825,7 +5879,7 @@ def test_fte_worker_failure_event_rejects_cross_manager_scheduler():
             scheduler.query_id,
             failed.worker_id,
             RuntimeError("planned failure"),
-            manager_instance_id="manager-a",
+            manager_instance_id=failed_manager_instance_id,
         )
     )
 

@@ -177,7 +177,9 @@ class FteWorkerTransitionMixin:
             ]
         revoked_any = False
         for worker in workers:
-            budget_bytes = _fte_effective_worker_memory_budget_bytes(worker, None)
+            budget_bytes: int | None = _fte_effective_worker_memory_budget_bytes(worker, None)
+            if budget_bytes is None:
+                continue
             worker_id = str(worker.worker_id)
             if not worker_id:
                 continue

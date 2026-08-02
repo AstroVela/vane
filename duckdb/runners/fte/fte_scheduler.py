@@ -320,6 +320,8 @@ class FteAttemptStatusWatcher:
 
     def _run(self) -> None:
         min_version = None
+        # Missing metadata belongs to the explicit legacy scope. None is
+        # reserved for events whose ownership is genuinely unknown.
         manager_instance_id = str(getattr(self.worker, "manager_instance_id", ""))
         while not self._stop.is_set():
             try:
@@ -567,6 +569,7 @@ class FteQueryScheduler:
         self._queued_internal_admission_classes: set[str | None] = set()
         self._failed_worker_ids: set[str] = set()
         self._task_sources: dict[str, FteTaskSourceRegistration] = {}
+        # None means unbound; "" is the bound legacy/default manager scope.
         self._manager_instance_id: str | None = None
 
     def bind_manager_instance(

@@ -2291,6 +2291,7 @@ def _mark_fte_worker_failed(
     failure = _normalize_failure_payload(failure)
     if query_id_filter is not None:
         query_id_filter = str(query_id_filter)
+    # Preserve "" as the explicit legacy scope; None alone is unscoped.
     normalized_manager_instance_id = None if manager_instance_id is None else str(manager_instance_id or "").strip()
     failed_worker_ids = (
         {str(item) for item in failed_worker_ids_override} if failed_worker_ids_override is not None else {worker_id}
