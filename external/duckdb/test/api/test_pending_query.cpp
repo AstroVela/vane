@@ -44,6 +44,7 @@ struct BlockingExecutorTaskState {
 	std::condition_variable cv;
 	bool started = false;
 	bool release = false;
+	bool interrupted = false;
 	bool finished = false;
 };
 
@@ -62,7 +63,12 @@ public:
 		std::unique_lock<std::mutex> lock(state->lock);
 		state->started = true;
 		state->cv.notify_all();
-		state->cv.wait(lock, [&]() { return state->release; });
+		while (!state->release && !executor.context.IsInterrupted()) {
+			state->cv.wait_for(lock, std::chrono::milliseconds(1));
+		}
+		if (!state->release) {
+			state->interrupted = executor.context.IsInterrupted();
+		}
 		state->finished = true;
 		state->cv.notify_all();
 		return TaskExecutionResult::TASK_FINISHED;
@@ -82,9 +88,9 @@ TEST_CASE("ClientContext drains executor tasks during exception unwinding", "[ap
 
 	auto state = make_shared_ptr<BlockingExecutorTaskState>();
 	std::thread executor_task;
-	std::thread release_task;
 
 	bool finished_before_catch = false;
+	bool interrupted_before_catch = false;
 	string caught_message;
 	try {
 		Connection connection(db);
@@ -107,34 +113,29 @@ TEST_CASE("ClientContext drains executor tasks during exception unwinding", "[ap
 		{
 			std::unique_lock<std::mutex> lock(state->lock);
 			if (!state->cv.wait_for(lock, std::chrono::seconds(5), [&]() { return state->started; })) {
+				state->release = true;
+				state->cv.notify_all();
+				lock.unlock();
+				executor_task.join();
 				throw std::runtime_error("executor task did not start");
 			}
 		}
-		release_task = std::thread([state]() {
-			std::this_thread::sleep_for(std::chrono::milliseconds(200));
-			std::lock_guard<std::mutex> lock(state->lock);
-			state->release = true;
-			state->cv.notify_all();
-		});
 		throw std::runtime_error("trigger exception unwinding");
 	} catch (const std::exception &ex) {
 		std::lock_guard<std::mutex> lock(state->lock);
 		finished_before_catch = state->finished;
+		interrupted_before_catch = state->interrupted;
 		caught_message = ex.what();
-		if (!release_task.joinable()) {
-			state->release = true;
-			state->cv.notify_all();
-		}
+		state->release = true;
+		state->cv.notify_all();
 	}
 
-	if (release_task.joinable()) {
-		release_task.join();
-	}
 	if (executor_task.joinable()) {
 		executor_task.join();
 	}
 	REQUIRE(caught_message == "trigger exception unwinding");
 	REQUIRE(finished_before_catch);
+	REQUIRE(interrupted_before_catch);
 }
 
 TEST_CASE("Test Pending Query API", "[api][.]") {

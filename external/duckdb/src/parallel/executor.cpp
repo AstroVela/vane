@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 
 namespace duckdb {
 
@@ -516,6 +517,9 @@ void Executor::InitializeInternal(PhysicalOperator &plan, bool schedule_events) 
 }
 
 void Executor::CancelTasks() {
+	if (executor_tasks > 0) {
+		context.interrupted = true;
+	}
 	task.reset();
 	// Blocked tasks have to be released before draining, otherwise their task
 	// registrations keep executor_tasks non-zero indefinitely.
@@ -532,6 +536,9 @@ void Executor::CancelTasks() {
 	// states, so those must stay alive until all tasks have completed.
 	while (executor_tasks > 0) {
 		WorkOnTasks();
+		if (executor_tasks > 0) {
+			std::this_thread::yield();
+		}
 	}
 
 	vector<shared_ptr<MetaPipeline>> recursive_pipelines_to_destroy;
