@@ -314,6 +314,7 @@ class _RayControlSubmissionExecutor:
 
             result: Any = None
             error: BaseException | None = None
+            retire_stalled_worker = False
             try:
                 result = callback()
             except BaseException as exc:
@@ -372,9 +373,9 @@ class _RayControlSubmissionExecutor:
                             )
                     self._condition.notify_all()
                 self._fail_submissions(rejected, rejection_message)
-                if retire_stalled_worker:
-                    return
-                idle_deadline = time.monotonic() + self._idle_timeout_s
+            if retire_stalled_worker:
+                return
+            idle_deadline = time.monotonic() + self._idle_timeout_s
 
     def _reject_queued_submissions_locked(self) -> list[Future[Any]]:
         """Fail admitted-but-unclaimed work when stalled capacity is spent."""
