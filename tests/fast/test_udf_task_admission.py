@@ -559,6 +559,43 @@ def test_task_admission_cancellation_retries_until_driver_acknowledges():
     assert len(driver.cancel_query_task_lease_request.calls) == 2
 
 
+def test_task_admission_cancellation_retries_async_submission_rejection(
+    monkeypatch,
+):
+    driver = _Driver()
+    submissions = []
+
+    def submit_control(_owner_scope, callback):
+        future = Future()
+        submissions.append((future, callback))
+        if len(submissions) > 1:
+            callback()
+            future.set_result(None)
+        return future
+
+    monkeypatch.setattr(task_admission, "submit_ray_control", submit_control)
+    cancellation = task_admission._TaskAdmissionCancellation(
+        driver=driver,
+        request={
+            "request_id": "async-submission-rejection",
+            "query_id": "query:async-submission-rejection",
+            "resources": {},
+        },
+        submission_scope="test-admission:async-submission-rejection",
+    )
+
+    cancellation.start()
+    assert cancellation._submitting
+    submissions[0][0].set_exception(RuntimeError("planned async queue rejection"))
+
+    deadline = time.monotonic() + 1.0
+    while not cancellation._done and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert cancellation._done
+    assert len(submissions) == 2
+    assert len(driver.cancel_query_task_lease_request.calls) == 1
+
+
 def test_task_admission_cancellation_retries_a_hung_response(monkeypatch):
     monkeypatch.setattr(
         task_admission,
@@ -760,6 +797,18 @@ def test_ray_control_submissions_isolate_blocked_owner_and_retire_idle_workers()
     assert executor._workers == {}
 
 
+def test_ray_control_submissions_require_one_recovery_capacity_slot():
+    with pytest.raises(
+        ValueError,
+        match="pending capacity must exceed max_stalled_workers",
+    ):
+        ray_control_submission._RayControlSubmissionExecutor(
+            max_workers=2,
+            max_stalled_workers=2,
+            max_pending_submissions=2,
+        )
+
+
 def test_ray_control_submissions_bound_stalled_workers_and_queued_owners():
     executor = ray_control_submission._RayControlSubmissionExecutor(
         idle_timeout_s=0.01,
@@ -800,6 +849,164 @@ def test_ray_control_submissions_bound_stalled_workers_and_queued_owners():
     assert executor._workers == {}
     assert executor._owners == {}
     assert executor._pending_submissions == 0
+
+
+def test_stalled_control_owners_do_not_consume_the_schedulable_pool():
+    executor = ray_control_submission._RayControlSubmissionExecutor(
+        idle_timeout_s=0.01,
+        stall_timeout_s=0.02,
+        max_workers=32,
+        max_stalled_workers=32,
+        max_pending_submissions=64,
+        max_pending_per_owner=1,
+    )
+    release_submissions = threading.Event()
+    all_workers_blocked = threading.Event()
+    entered_lock = threading.Lock()
+    entered = 0
+
+    def blocked_submission():
+        nonlocal entered
+        with entered_lock:
+            entered += 1
+            if entered == 32:
+                all_workers_blocked.set()
+        if not release_submissions.wait(timeout=5.0):
+            raise RuntimeError("timed out waiting to release stalled control owner")
+        return "released"
+
+    blocked = [executor.submit(f"owner:stalled:{index}", blocked_submission) for index in range(32)]
+    assert all_workers_blocked.wait(timeout=1.0)
+    stall_deadline = time.monotonic() + 1.0
+    while time.monotonic() < stall_deadline:
+        with executor._condition:
+            stalled_workers = sum(worker.stalled for worker in executor._workers.values())
+        if stalled_workers == 32:
+            break
+        time.sleep(0.005)
+
+    healthy = executor.submit("owner:healthy-after-stalls", lambda: "healthy")
+    assert healthy.result(timeout=1.0) == "healthy"
+    with executor._condition:
+        assert sum(worker.stalled for worker in executor._workers.values()) == 32
+        assert len(executor._workers) <= 64
+        assert executor._pending_submissions == 32
+
+    release_submissions.set()
+    assert [future.result(timeout=1.0) for future in blocked] == ["released"] * 32
+    completion_deadline = time.monotonic() + 1.0
+    while executor._workers and time.monotonic() < completion_deadline:
+        time.sleep(0.005)
+    assert executor._workers == {}
+    assert executor._owners == {}
+    assert executor._pending_submissions == 0
+
+
+def test_stalled_control_owner_retains_fifo_while_healthy_owner_progresses():
+    executor = ray_control_submission._RayControlSubmissionExecutor(
+        idle_timeout_s=0.01,
+        stall_timeout_s=0.02,
+        max_workers=1,
+        max_stalled_workers=1,
+        max_pending_submissions=3,
+        max_pending_per_owner=2,
+    )
+    release_submission = threading.Event()
+    blocked_submission_entered = threading.Event()
+    same_owner_followup_entered = threading.Event()
+
+    def blocked_submission():
+        blocked_submission_entered.set()
+        if not release_submission.wait(timeout=5.0):
+            raise RuntimeError("timed out waiting to release FIFO control owner")
+        return "first"
+
+    first = executor.submit("owner:stalled-fifo", blocked_submission)
+    assert blocked_submission_entered.wait(timeout=1.0)
+    second = executor.submit(
+        "owner:stalled-fifo",
+        lambda: same_owner_followup_entered.set() or "second",
+    )
+    healthy = executor.submit("owner:healthy-beside-stall", lambda: "healthy")
+
+    assert healthy.result(timeout=1.0) == "healthy"
+    assert same_owner_followup_entered.is_set() is False
+    assert second.done() is False
+
+    release_submission.set()
+    assert first.result(timeout=1.0) == "first"
+    assert second.result(timeout=1.0) == "second"
+    assert same_owner_followup_entered.is_set()
+
+
+def test_control_submissions_fail_fast_at_stalled_worker_bound_and_recover():
+    executor = ray_control_submission._RayControlSubmissionExecutor(
+        idle_timeout_s=0.01,
+        stall_timeout_s=0.02,
+        max_workers=2,
+        max_stalled_workers=1,
+        max_pending_submissions=4,
+        max_pending_per_owner=2,
+    )
+    release_submissions = threading.Event()
+    all_workers_blocked = threading.Event()
+    entered_lock = threading.Lock()
+    entered = 0
+
+    def blocked_submission():
+        nonlocal entered
+        with entered_lock:
+            entered += 1
+            if entered == 2:
+                all_workers_blocked.set()
+        if not release_submissions.wait(timeout=5.0):
+            raise RuntimeError("timed out waiting to release bounded stalled worker")
+        return "released"
+
+    blocked = [executor.submit(f"owner:bounded-stall:{index}", blocked_submission) for index in range(2)]
+    assert all_workers_blocked.wait(timeout=1.0)
+    queued = executor.submit("owner:bounded-stall:0", lambda: "unexpected")
+
+    with pytest.raises(RuntimeError, match="stalled callback capacity is exhausted"):
+        queued.result(timeout=1.0)
+    with pytest.raises(RuntimeError, match="stalled callback capacity is exhausted"):
+        executor.submit("owner:rejected-while-exhausted", lambda: "unexpected")
+    with executor._condition:
+        assert len(executor._workers) == 2
+        assert executor._pending_submissions == 2
+
+    release_submissions.set()
+    assert [future.result(timeout=1.0) for future in blocked] == ["released"] * 2
+    recovery = executor.submit("owner:recovered", lambda: "recovered")
+    assert recovery.result(timeout=1.0) == "recovered"
+
+
+def test_ray_control_submission_watchdog_start_failure_is_retryable(monkeypatch):
+    executor = ray_control_submission._RayControlSubmissionExecutor(
+        idle_timeout_s=0.01,
+    )
+    original_start = threading.Thread.start
+    starts = 0
+
+    def fail_first_watchdog_start(thread):
+        nonlocal starts
+        if thread.name.startswith("vane-ray-control-submit-watchdog-"):
+            starts += 1
+            if starts == 1:
+                raise RuntimeError("control watchdog unavailable")
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_first_watchdog_start)
+    with pytest.raises(RuntimeError, match="control watchdog unavailable"):
+        executor.submit("owner:watchdog-start-failure", lambda: "unexpected")
+
+    assert executor._watchdog_thread is None
+    assert executor._workers == {}
+    assert executor._owners == {}
+    assert executor._pending_submissions == 0
+
+    retry = executor.submit("owner:watchdog-start-retry", lambda: "recovered")
+    assert retry.result(timeout=1.0) == "recovered"
 
 
 def test_ray_control_submissions_bound_one_owner_queue():

@@ -231,9 +231,31 @@ class _TaskAdmissionCancellation:
                 return
             self._submitting = True
         try:
-            submit_ray_control(self._submission_scope, self._submit)
+            submission_future = submit_ray_control(
+                self._submission_scope,
+                self._submit,
+            )
         except BaseException:
             with self._lock:
+                self._submitting = False
+            self._schedule_retry()
+            return
+        try:
+            submission_future.add_done_callback(self._finish_submission)
+        except BaseException:
+            submission_future.cancel()
+            with self._lock:
+                self._submitting = False
+            self._schedule_retry()
+
+    def _finish_submission(self, submission_future: Any) -> None:
+        """Retry if admitted control work is rejected before invocation."""
+        try:
+            submission_future.result()
+        except BaseException:
+            with self._lock:
+                if self._done or not self._submitting:
+                    return
                 self._submitting = False
             self._schedule_retry()
 
