@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+from typing import cast
+
+from typing_extensions import assert_type
+
+import vane
+from vane.ai import prompt
+
+text = vane.col("text")
+image = vane.col("image")
+relation = cast(vane.Relation, None)
+
+assert_type(prompt(text), vane.Expression)
+assert_type(prompt(messages=[text, image], max_output_tokens=64), vane.Expression)
+assert_type(prompt(relation, text), vane.Relation)
+assert_type(prompt(rel=relation, messages=[text, image]), vane.Relation)
+assert_type(relation.prompt([text, image], output_column="answer"), vane.Relation)

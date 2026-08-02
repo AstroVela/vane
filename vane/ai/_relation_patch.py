@@ -24,7 +24,7 @@ from typing import Any, Literal
 from typing_extensions import Unpack
 
 from duckdb import DuckDBPyRelation, Expression
-from vane.ai.options import EmbedOptions
+from vane.ai.options import EmbedOptions, PromptOptions
 from vane.ai.provider import Provider
 
 
@@ -82,32 +82,26 @@ def _classify_text(
 
 def _prompt(
     self: DuckDBPyRelation,
-    column: str,
+    messages: Expression | list[Expression],
     *,
-    image_columns: list[str] | None = None,
-    provider: Any = None,
-    model: str | None = None,
     system_message: str | None = None,
-    return_format: Any | None = None,
-    use_chat_completions: bool = True,
+    provider: str | Provider = "openai",
+    model: str | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
     output_column: str = "response",
-    execution_backend: str | None = None,
-    **options: Any,
+    **options: Unpack[PromptOptions],
 ) -> DuckDBPyRelation:
-    """Generate LLM responses. See :func:`vane.ai.prompt` for details."""
+    """Append basic Prompt responses. See :func:`vane.ai.prompt`."""
     from vane.ai.functions import prompt
 
     return prompt(
         self,
-        column,
-        image_columns=image_columns,
+        messages,
+        system_message=system_message,
         provider=provider,
         model=model,
-        system_message=system_message,
-        return_format=return_format,
-        use_chat_completions=use_chat_completions,
+        on_error=on_error,
         output_column=output_column,
-        execution_backend=execution_backend,
         **options,
     )
 

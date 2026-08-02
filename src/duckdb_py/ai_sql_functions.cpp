@@ -29,6 +29,7 @@ namespace {
 enum class AISQLKind : uint8_t { PROMPT, EMBED };
 
 static constexpr const char *HIDDEN_EMBED_FUNCTION = "__vane_ai_embed";
+static constexpr const char *HIDDEN_PROMPT_FUNCTION = "__vane_ai_prompt";
 
 struct NativeVLLMSpec {
 	string model;
@@ -88,16 +89,13 @@ static idx_t OptionsArgumentIndex(AISQLKind kind, idx_t argument_count) {
 		}
 		throw BinderException("%s requires six arguments supplied by the ai_embed macro", HIDDEN_EMBED_FUNCTION);
 	}
-	if (argument_count == 1) {
-		return argument_count;
+	if (argument_count == 6) {
+		return 5;
 	}
-	if (argument_count == 2) {
-		return 1;
+	if (argument_count == 7) {
+		return 6;
 	}
-	if (argument_count == 3) {
-		return 2;
-	}
-	throw BinderException("ai_prompt requires one, two, or three arguments");
+	throw BinderException("%s requires six or seven arguments supplied by the ai_prompt macro", HIDDEN_PROMPT_FUNCTION);
 }
 
 static py::object OptionsToPython(ClientContext &context, vector<unique_ptr<Expression>> &arguments,
@@ -112,7 +110,7 @@ static py::object OptionsToPython(ClientContext &context, vector<unique_ptr<Expr
 		return py::none();
 	}
 	if (require_struct && options.type().id() != LogicalTypeId::STRUCT) {
-		throw BinderException("ai_embed options must be NULL or a foldable STRUCT, not %s", options.type().ToString());
+		throw BinderException("ai SQL options must be NULL or a foldable STRUCT, not %s", options.type().ToString());
 	}
 	return PythonObject::FromValue(options, options.type(), context.GetClientProperties());
 }
@@ -131,9 +129,15 @@ static py::object ConstantArgumentToPython(ClientContext &context, vector<unique
 static py::dict BuildAISQLSpec(AISQLKind kind, ClientContext &context, vector<unique_ptr<Expression>> &arguments,
                                idx_t options_index, bool image_input) {
 	auto sql_module = py::module_::import("vane.ai._sql");
-	auto py_options = OptionsToPython(context, arguments, options_index, kind == AISQLKind::EMBED);
+	auto py_options = OptionsToPython(context, arguments, options_index, true);
 	if (kind == AISQLKind::PROMPT) {
-		return py::cast<py::dict>(sql_module.attr("build_ai_prompt_sql_spec")(py_options, image_input));
+		auto constant_offset = image_input ? idx_t(2) : idx_t(1);
+		auto system_message = ConstantArgumentToPython(context, arguments, constant_offset, "system_message");
+		auto provider = ConstantArgumentToPython(context, arguments, constant_offset + 1, "provider");
+		auto model = ConstantArgumentToPython(context, arguments, constant_offset + 2, "model");
+		auto on_error = ConstantArgumentToPython(context, arguments, constant_offset + 3, "on_error");
+		return py::cast<py::dict>(sql_module.attr("build_ai_prompt_sql_spec")(provider, model, system_message, on_error,
+		                                                                      py_options, image_input));
 	}
 	auto provider = ConstantArgumentToPython(context, arguments, 1, "provider");
 	auto model = ConstantArgumentToPython(context, arguments, 2, "model");
@@ -238,9 +242,10 @@ static unique_ptr<Expression> LowerNativeVLLMPrompt(FunctionBindExpressionInput 
 static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction &bound_function,
                                           vector<unique_ptr<Expression>> &arguments, AISQLKind kind) {
 	auto options_index = OptionsArgumentIndex(kind, arguments.size());
-	auto image_input = kind == AISQLKind::PROMPT && arguments.size() == 3;
+	auto image_input = kind == AISQLKind::PROMPT && arguments.size() == 7;
+	auto runtime_argument_count = image_input ? idx_t(2) : idx_t(1);
 	auto input_type_id = arguments[0]->return_type.id();
-	if (input_type_id != LogicalTypeId::VARCHAR && !(image_input && input_type_id == LogicalTypeId::SQLNULL)) {
+	if (input_type_id != LogicalTypeId::VARCHAR && input_type_id != LogicalTypeId::SQLNULL) {
 		throw BinderException("ai SQL input argument must be VARCHAR");
 	}
 	if (image_input && arguments[1]->return_type != LogicalType::BLOB &&
@@ -248,13 +253,6 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	    arguments[1]->return_type.id() != LogicalTypeId::SQLNULL) {
 		throw BinderException("ai_prompt image argument must be BLOB or BLOB[]");
 	}
-	if (image_input && IsFoldableNull(context, *arguments[0])) {
-		auto return_type = LogicalType::VARCHAR;
-		bound_function.SetReturnType(return_type);
-		// A NULL payload is a local bind-state marker consumed by the image lowerer.
-		return make_uniq<UDFFunctionData>(Value(LogicalType::SQLNULL), std::move(return_type));
-	}
-
 	Value payload;
 	unique_ptr<NativeVLLMSpec> native_vllm;
 	{
@@ -275,7 +273,9 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 
 	if (native_vllm) {
 		arguments[0] = BuildNativeVLLMPromptArgument(context, std::move(arguments[0]), native_vllm->system_message);
-		Function::EraseArgument(bound_function, arguments, options_index);
+		for (idx_t index = arguments.size(); index-- > runtime_argument_count;) {
+			Function::EraseArgument(bound_function, arguments, index);
+		}
 		bound_function.SetReturnType(LogicalType::VARCHAR);
 		bound_function.SetBindExpressionCallback(LowerNativeVLLMPrompt);
 		return make_uniq<VLLMFunctionData>(std::move(native_vllm->model), Value(std::move(native_vllm->options_json)));
@@ -289,8 +289,12 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 		for (idx_t index = arguments.size(); index-- > 1;) {
 			Function::EraseArgument(bound_function, arguments, index);
 		}
-	} else if (options_index < arguments.size()) {
-		Function::EraseArgument(bound_function, arguments, options_index);
+	} else {
+		// Prompt call-level constants are consumed by the binder. Only the
+		// prompt and optional image expression become row inputs.
+		for (idx_t index = arguments.size(); index-- > runtime_argument_count;) {
+			Function::EraseArgument(bound_function, arguments, index);
+		}
 	}
 	bound_function.SetExtraFunctionInfo(make_shared_ptr<RegisteredUDFFunctionInfo>(payload));
 	return make_uniq<UDFFunctionData>(std::move(payload), std::move(return_type));
@@ -311,12 +315,15 @@ static void AISQLExecute(DataChunk &, ExpressionState &, Vector &) {
 	    "ai SQL functions can only be used in a projection and must be planned as UDF operators");
 }
 
-static unique_ptr<Expression> LowerAISQLImageExpressionUDF(FunctionBindExpressionInput &input) {
+static unique_ptr<Expression> LowerAISQLPromptExpressionUDF(FunctionBindExpressionInput &input) {
 	if (!input.bind_data) {
 		throw BinderException("registered expression UDF is missing bind payload");
 	}
 	auto &registered_data = input.bind_data->Cast<UDFFunctionData>();
-	if (registered_data.payload.IsNull()) {
+	if (input.children.empty() || input.children.size() > 2) {
+		throw BinderException("ai_prompt expected one or two runtime arguments");
+	}
+	if (IsFoldableNull(input.context, *input.children[0])) {
 		return make_uniq<BoundConstantExpression>(Value(registered_data.return_type));
 	}
 	return LowerRegisteredExpressionUDFPreservingFoldableNulls(input);
@@ -354,41 +361,75 @@ static unique_ptr<Expression> LowerAIEmbedTextInput(FunctionBindExpressionInput 
 	return std::move(text);
 }
 
-static void AddAISQLFunctions(ScalarFunctionSet &set, bind_scalar_function_t bind, bool include_image_inputs) {
-	auto base = ScalarFunction({LogicalType::VARCHAR}, LogicalType::ANY, AISQLExecute, bind, nullptr, nullptr, nullptr,
-	                           LogicalType::INVALID, FunctionStability::VOLATILE);
-	base.SetBindExpressionCallback(LowerRegisteredExpressionUDF);
-	set.AddFunction(std::move(base));
-
-	auto with_options = ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY, AISQLExecute, bind,
-	                                   nullptr, nullptr, nullptr, LogicalType::INVALID, FunctionStability::VOLATILE);
-	with_options.SetBindExpressionCallback(LowerRegisteredExpressionUDF);
-	set.AddFunction(std::move(with_options));
-
-	if (!include_image_inputs) {
-		return;
-	}
-	auto with_image =
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::ANY}, LogicalType::ANY, AISQLExecute,
-	                   bind, nullptr, nullptr, nullptr, LogicalType::INVALID, FunctionStability::VOLATILE);
-	with_image.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	with_image.SetBindExpressionCallback(LowerAISQLImageExpressionUDF);
-	set.AddFunction(std::move(with_image));
-
-	auto with_images = ScalarFunction({LogicalType::VARCHAR, LogicalType::LIST(LogicalType::BLOB), LogicalType::ANY},
-	                                  LogicalType::ANY, AISQLExecute, bind, nullptr, nullptr, nullptr,
-	                                  LogicalType::INVALID, FunctionStability::VOLATILE);
-	with_images.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	with_images.SetBindExpressionCallback(LowerAISQLImageExpressionUDF);
-	set.AddFunction(std::move(with_images));
-}
-
 } // namespace
 
-ScalarFunctionSet AISQLFunction::GetPromptFunctions() {
-	ScalarFunctionSet set("ai_prompt");
-	AddAISQLFunctions(set, AISQLPromptBind, true);
+ScalarFunctionSet AISQLFunction::GetPromptImplementationFunctions() {
+	ScalarFunctionSet set(HIDDEN_PROMPT_FUNCTION);
+	auto add_implementation = [&](vector<LogicalType> arguments) {
+		auto implementation =
+		    ScalarFunction(std::move(arguments), LogicalType::VARCHAR, AISQLExecute, AISQLPromptBind, nullptr, nullptr,
+		                   nullptr, LogicalType::INVALID, FunctionStability::VOLATILE);
+		implementation.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+		implementation.SetBindExpressionCallback(LowerAISQLPromptExpressionUDF);
+		set.AddFunction(std::move(implementation));
+	};
+
+	add_implementation({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                    LogicalType::VARCHAR, LogicalType::ANY});
+	add_implementation({LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY});
+	add_implementation({LogicalType::VARCHAR, LogicalType::LIST(LogicalType::BLOB), LogicalType::VARCHAR,
+	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY});
 	return set;
+}
+
+unique_ptr<CreateMacroInfo> AISQLFunction::GetPromptMacro() {
+	auto make_function = [&](const LogicalType *image_type) {
+		auto macro_arguments = image_type ? "prompt, image, system_message, provider, model, on_error, options"
+		                                  : "prompt, system_message, provider, model, on_error, options";
+		auto expressions =
+		    Parser::ParseExpressionList(StringUtil::Format("%s(%s)", HIDDEN_PROMPT_FUNCTION, macro_arguments));
+		if (expressions.size() != 1) {
+			throw InternalException("Expected one ai_prompt macro expression");
+		}
+		auto function = make_uniq<ScalarMacroFunction>(std::move(expressions[0]));
+
+		auto add_parameter = [&](const string &name, const LogicalType &type, const char *default_sql) {
+			function->parameters.push_back(make_uniq<ColumnRefExpression>(name));
+			function->types.push_back(type);
+			if (!default_sql) {
+				return;
+			}
+			auto defaults = Parser::ParseExpressionList(default_sql);
+			if (defaults.size() != 1) {
+				throw InternalException("Expected one default expression for ai_prompt parameter '%s'", name);
+			}
+			function->default_parameters.insert(make_pair(name, std::move(defaults[0])));
+		};
+
+		add_parameter("prompt", LogicalType::VARCHAR, nullptr);
+		if (image_type) {
+			add_parameter("image", *image_type, nullptr);
+		}
+		add_parameter("system_message", LogicalType::VARCHAR, "NULL");
+		add_parameter("provider", LogicalType::VARCHAR, "'openai'");
+		add_parameter("model", LogicalType::VARCHAR, "NULL");
+		add_parameter("on_error", LogicalType::VARCHAR, "'raise'");
+		add_parameter("options", LogicalType::UNKNOWN, "NULL");
+		return function;
+	};
+
+	auto info = make_uniq<CreateMacroInfo>(CatalogType::MACRO_ENTRY);
+	info->schema = DEFAULT_SCHEMA;
+	info->name = "ai_prompt";
+	info->temporary = true;
+	info->internal = true;
+	info->macros.push_back(make_function(nullptr));
+	LogicalType blob_type(LogicalTypeId::BLOB);
+	info->macros.push_back(make_function(&blob_type));
+	auto blob_list_type = LogicalType::LIST(LogicalType::BLOB);
+	info->macros.push_back(make_function(&blob_list_type));
+	return info;
 }
 
 ScalarFunctionSet AISQLFunction::GetEmbedImplementationFunctions() {

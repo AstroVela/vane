@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""vLLM provider — wraps the existing ``duckdb.execution.vllm`` engine.
+"""Basic text-only Prompt provider for the native vLLM engine.
 
 The vLLM executor already manages its own ``AsyncLLMEngine`` event loop,
 request queuing, prefix routing, and Ray actor pool. This provider wraps that
@@ -11,36 +11,17 @@ machinery in a planner-only Vane AI provider so users can write::
 
     result = prompt(
         rel,
-        "text",
+        vane.col("text"),
         provider="vllm",
         model="Qwen/Qwen3-1.7B",
         engine_args={"max_model_len": 2048},
         generate_args={"sampling_params": {"max_tokens": 256}},
     )
 
-Structured Output is supported via vLLM structured decoding.  Pass a
-Pydantic ``BaseModel`` as ``return_format``::
-
-    class Person(BaseModel):
-        name: str
-        age: int
-
-
-    result = prompt(
-        rel,
-        "text",
-        provider="vllm",
-        model="Qwen/Qwen3-1.7B",
-        return_format=Person,
-    )
-
-Under the hood the model's JSON schema is injected into
-``SamplingParams.structured_outputs``.
 """
 
 from __future__ import annotations
 
-import copy
 import json
 import math
 from collections.abc import Mapping
@@ -59,29 +40,12 @@ from duckdb.execution._vllm_options_protocol import (
     _dump_vllm_protocol_json,
 )
 from vane.ai._redaction import Secret, wrap_sensitive_options
+from vane.ai.options import validate_prompt_options
 from vane.ai.protocols import NativePrompterPlan
 from vane.ai.provider import Provider
 
 if TYPE_CHECKING:
     from vane.ai.typing import Options
-
-
-def _json_schema_from_return_format(return_format: Any) -> dict[str, Any]:
-    """Extract a JSON schema dict from a return_format value.
-
-    Accepts:
-    - Pydantic BaseModel *class*  → ``model_json_schema()``
-    - ``dict``                    → used as-is (assumed to be a valid JSON schema)
-    """
-    if return_format is None:
-        return {}
-    if isinstance(return_format, dict):
-        return return_format
-    if hasattr(return_format, "model_json_schema"):
-        return return_format.model_json_schema()
-    raise TypeError(
-        f"return_format must be a Pydantic BaseModel class or a JSON schema dict, got {type(return_format).__name__}"
-    )
 
 
 def _canonicalize_native_json(value: Any, path: str = "options") -> Any:
@@ -192,15 +156,17 @@ class VLLMProvider(Provider):
         self,
         model: str | None = None,
         system_message: str | None = None,
-        return_format: Any | None = None,
         **options: Any,
     ) -> NativeVLLMPromptPlan:
         merged = {**self._options, **options}
+        validate_prompt_options("vllm", merged, relation=False)
+        model_name = model or self.DEFAULT_MODEL
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError("vLLM prompt model must be a non-empty string")
         return NativeVLLMPromptPlan(
             provider_name=self._name,
-            model_name=model or merged.pop("model", self.DEFAULT_MODEL),
+            model_name=model_name,
             system_message=system_message,
-            return_format=return_format,
             vllm_options=merged,
         )
 
@@ -218,10 +184,13 @@ class NativeVLLMPromptPlan(NativePrompterPlan):
     provider_name: str = "vllm"
     model_name: str = "Qwen/Qwen3-1.7B"
     system_message: str | None = None
-    return_format: Any | None = None
+    on_error: str = "raise"
     vllm_options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.model_name, str) or not self.model_name.strip():
+            raise ValueError("vLLM prompt model must be a non-empty string")
+        validate_prompt_options("vllm", self.vllm_options, relation=False)
         self.vllm_options = wrap_sensitive_options(self.vllm_options)
 
     def get_provider(self) -> str:
@@ -238,10 +207,8 @@ class NativeVLLMPromptPlan(NativePrompterPlan):
 
         The Python UDF path used ``actor_number`` to control the number of
         outer UDF actors. The native operator owns one executor instead, so
-        that capacity becomes the executor's ``concurrency``. Structured
-        output configuration is copied into vLLM sampling parameters without
-        mutating the descriptor or caller-owned nested dictionaries. Sensitive
-        values stay sealed until the options argument is encoded for the plan.
+        that capacity becomes the executor's internal actor-pool size.
+        Caller-owned nested dictionaries are never mutated.
         """
         options = _canonicalize_native_plan_json(self.vllm_options)
         assert isinstance(options, dict)
@@ -262,8 +229,7 @@ class NativeVLLMPromptPlan(NativePrompterPlan):
 
         # The public AI API calls the null-producing policy ``ignore`` while
         # the native vLLM executor calls the same policy ``null``.
-        if options.get("on_error") == "ignore":
-            options["on_error"] = "null"
+        options["on_error"] = "null" if self.on_error == "ignore" else "raise"
 
         sampling_overrides: dict[str, Any] = {}
         for name in ("max_tokens", "temperature"):
@@ -273,7 +239,7 @@ class NativeVLLMPromptPlan(NativePrompterPlan):
 
         generate_args = options.get("generate_args")
         has_sampling_params = isinstance(generate_args, Mapping) and generate_args.get("sampling_params") is not None
-        if self.return_format is None and not sampling_overrides and not has_sampling_params:
+        if not sampling_overrides and not has_sampling_params:
             return options
 
         if generate_args is None:
@@ -304,15 +270,6 @@ class NativeVLLMPromptPlan(NativePrompterPlan):
         for name, value in sampling_overrides.items():
             sampling_params.setdefault(name, value)
 
-        if self.return_format is not None:
-            schema = copy.deepcopy(_json_schema_from_return_format(self.return_format))
-            sampling_params["structured_outputs"] = {"type": "json", "value": schema}
         canonical = _canonicalize_native_plan_json(options)
         assert isinstance(canonical, dict)
         return canonical
-
-
-# Compatibility import for callers that used the original name. The object is
-# now explicitly planner-only and no longer inherits PrompterDescriptor or
-# exposes an instantiate() method.
-VLLMPrompterDescriptor = NativeVLLMPromptPlan

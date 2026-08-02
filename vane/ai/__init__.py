@@ -21,26 +21,19 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from vane.ai.functions import embed
-    from vane.ai.options import EmbedOptions
+    from vane.ai.functions import embed, prompt
+    from vane.ai.options import EmbedOptions, PromptOptions
     from vane.ai.provider import ProviderCapabilityError
 
 __all__ = [
-    "AnthropicPromptOptions",
-    "AnthropicProviderOptions",
     "Descriptor",
     "EmbedOptions",
-    "GooglePromptOptions",
-    "GoogleProviderOptions",
-    "OpenAIPromptOptions",
-    "OpenAIProviderOptions",
+    "PromptOptions",
     "Provider",
     "ProviderCapabilityError",
     "RetryAfterError",
     "TokenMetricsEntry",
     "UDFOptions",
-    "VLLMPromptOptions",
-    "VLLMProviderOptions",
     "classify_text",
     "embed",
     "get_token_metrics",
@@ -54,20 +47,13 @@ __all__ = [
 
 _LAZY_EXPORTS = {
     "Descriptor": ("vane.ai.typing", "Descriptor"),
-    "AnthropicPromptOptions": ("vane.ai.options", "AnthropicPromptOptions"),
-    "AnthropicProviderOptions": ("vane.ai.options", "AnthropicProviderOptions"),
     "EmbedOptions": ("vane.ai.options", "EmbedOptions"),
-    "GooglePromptOptions": ("vane.ai.options", "GooglePromptOptions"),
-    "GoogleProviderOptions": ("vane.ai.options", "GoogleProviderOptions"),
-    "OpenAIProviderOptions": ("vane.ai.options", "OpenAIProviderOptions"),
-    "OpenAIPromptOptions": ("vane.ai.options", "OpenAIPromptOptions"),
+    "PromptOptions": ("vane.ai.options", "PromptOptions"),
     "Provider": ("vane.ai.provider", "Provider"),
     "ProviderCapabilityError": ("vane.ai.provider", "ProviderCapabilityError"),
     "RetryAfterError": ("vane.ai.functions", "RetryAfterError"),
     "TokenMetricsEntry": ("vane.ai.metrics", "TokenMetricsEntry"),
     "UDFOptions": ("vane.ai.typing", "UDFOptions"),
-    "VLLMProviderOptions": ("vane.ai.options", "VLLMProviderOptions"),
-    "VLLMPromptOptions": ("vane.ai.options", "VLLMPromptOptions"),
     "classify_text": ("vane.ai.functions", "classify_text"),
     "embed": ("vane.ai.functions", "embed"),
     "get_token_metrics": ("vane.ai.metrics", "get_token_metrics"),

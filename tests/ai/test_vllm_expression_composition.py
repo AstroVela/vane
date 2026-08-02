@@ -73,7 +73,7 @@ def test_python_vllm_expressions_support_multiple_nested_outputs(monkeypatch):
             vane.col("chunk"),
             provider="vllm",
             model="PY-UPPER",
-            prompt_options={"do_prefix_routing": False},
+            do_prefix_routing=False,
         ),
     ).alias("lowered")
     wrapped_prompt = duckdb.FunctionExpression(
@@ -83,7 +83,7 @@ def test_python_vllm_expressions_support_multiple_nested_outputs(monkeypatch):
             vane.col("chunk"),
             provider="vllm",
             model="py-wrapped",
-            prompt_options={"do_prefix_routing": False},
+            do_prefix_routing=False,
         ),
         duckdb.ConstantExpression("]"),
     ).alias("wrapped")
@@ -110,13 +110,13 @@ def test_python_vllm_expressions_support_chained_native_prompts(monkeypatch):
         vane.col("chunk"),
         provider="vllm",
         model="inner",
-        prompt_options={"do_prefix_routing": False},
+        do_prefix_routing=False,
     )
     chained_prompt = vane.ai.prompt(
         inner_prompt,
         provider="vllm",
         model="outer",
-        prompt_options={"do_prefix_routing": False},
+        do_prefix_routing=False,
     ).alias("chained")
 
     result = rel.select(vane.col("id"), chained_prompt).order("id")
@@ -140,18 +140,18 @@ def test_sql_ai_prompt_supports_multiple_calls_nested_in_eager_expressions(monke
         SELECT id, concat(
             lower(ai_prompt(
                 chunk,
-                struct_pack(
-                    provider := 'vllm',
-                    model := 'SQL-UPPER',
+                provider := 'vllm',
+                model := 'SQL-UPPER',
+                options := struct_pack(
                     do_prefix_routing := false
                 )
             )),
             ' / ',
             ai_prompt(
                 chunk,
-                struct_pack(
-                    provider := 'vllm',
-                    model := 'sql-plain',
+                provider := 'vllm',
+                model := 'sql-plain',
+                options := struct_pack(
                     do_prefix_routing := false
                 )
             )

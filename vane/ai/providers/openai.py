@@ -3,8 +3,8 @@
 
 """OpenAI provider for Vane AI.
 
-Supports text embedding via the OpenAI Embeddings API and prompting via
-the Chat Completions API or the newer Responses API (with Structured Output).
+Supports text embedding via the OpenAI Embeddings API and basic text/image
+Prompt calls via the Responses API or Chat Completions API.
 
 Requires::
 
@@ -21,9 +21,9 @@ import numpy as np
 import pyarrow as pa
 
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
-from vane.ai.options import validate_embed_options
+from vane.ai.options import validate_embed_options, validate_prompt_options
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
-from vane.ai.provider import Provider, ProviderCapabilityError, ProviderImportError, _ProviderResultError
+from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
 from vane.ai.typing import EmbeddingDimensions, UDFOptions
 
 if TYPE_CHECKING:
@@ -105,6 +105,28 @@ def _is_embedding_capability_error(exc: Exception) -> bool:
     return normalized_param in _EMBED_CAPABILITY_ERROR_PARAMS or normalized_code in _EMBED_CAPABILITY_ERROR_CODES
 
 
+def _is_prompt_capability_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code in {404, 405, 501}:
+        return True
+    if status_code not in {400, 422}:
+        return False
+    param = getattr(exc, "param", None)
+    code = getattr(exc, "code", None)
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        details = body.get("error", body)
+        if isinstance(details, dict):
+            param = param or details.get("param")
+            code = code or details.get("code")
+    normalized_param = str(param or "").strip().casefold()
+    normalized_code = str(code or "").strip().casefold()
+    capability_params = {"model", "image", "input_image", "input"}
+    return normalized_param in capability_params or any(
+        marker in normalized_code for marker in ("model_not_found", "unsupported_model", "unsupported_image")
+    )
+
+
 # OpenAI-specific keys sealed in addition to the shared sensitive-key table.
 # ``organization`` identifies the paying account and must not leak via repr,
 # but it is not a generic credential, so it stays out of the shared table
@@ -138,6 +160,7 @@ class OpenAIProvider(Provider):
         return self._name
 
     _CLIENT_KEYS = {"api_key", "base_url", "organization", "timeout", "max_retries"}
+    _PROMPT_CLIENT_KEYS = {"api_key", "base_url", "organization", "timeout"}
     _EMBED_CLIENT_KEYS = _CLIENT_KEYS - {"max_retries"}
     _EMBED_REQUEST_KEYS = {"encoding_format", "batch_token_limit", "input_text_token_limit"}
 
@@ -174,22 +197,29 @@ class OpenAIProvider(Provider):
         self,
         model: str | None = None,
         system_message: str | None = None,
-        return_format: Any | None = None,
-        use_chat_completions: bool = True,
         **options: Any,
     ) -> PrompterDescriptor:
-        provider_opts = {**self._options}
-        for k in self._CLIENT_KEYS:
-            if k in options:
-                provider_opts[k] = options.pop(k)
+        provider_opts = {key: value for key, value in self._options.items() if key in self._PROMPT_CLIENT_KEYS}
+        prompt_options = {key: value for key, value in self._options.items() if key not in self._PROMPT_CLIENT_KEYS}
+        prompt_options.update(options)
+        validation_options = {key: value for key, value in provider_opts.items() if key in {"base_url", "timeout"}}
+        validation_options.update(prompt_options)
+        validate_prompt_options("openai", validation_options, relation=False)
+        for key in ("base_url", "timeout"):
+            if key in prompt_options:
+                value = prompt_options.pop(key)
+                if value is None:
+                    provider_opts.pop(key, None)
+                else:
+                    provider_opts[key] = value
+        use_chat_completions = prompt_options.pop("use_chat_completions", False)
         return OpenAIPrompterDescriptor(
             provider_name=self._name,
             provider_options=provider_opts,
             model_name=model or self.DEFAULT_PROMPTER_MODEL,
             system_message=system_message,
-            return_format=return_format,
             use_chat_completions=use_chat_completions,
-            prompt_options=options,
+            prompt_options=prompt_options,
         )
 
 
@@ -454,21 +484,23 @@ class OpenAITextEmbedder:
 
 @dataclass
 class OpenAIPrompterDescriptor(PrompterDescriptor):
-    """Serializable factory for an OpenAI prompter.
-
-    Supports both Chat Completions API and the newer Responses API,
-    with optional Structured Output via ``return_format``.
-    """
+    """Serializable factory for a basic text/image OpenAI prompter."""
 
     provider_name: str = "openai"
     provider_options: dict[str, Any] = field(default_factory=dict)
     model_name: str = "gpt-4o-mini"
     system_message: str | None = None
-    return_format: Any | None = None
-    use_chat_completions: bool = True
+    use_chat_completions: bool = False
     prompt_options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.model_name, str) or not self.model_name.strip():
+            raise ValueError("OpenAI prompt model must be a non-empty string")
+        validation_options = {
+            key: value for key, value in self.provider_options.items() if key in {"base_url", "timeout"}
+        }
+        validation_options.update(self.prompt_options)
+        validate_prompt_options("openai", validation_options, relation=False)
         self.provider_options = _wrap_openai_options(self.provider_options)
         self.prompt_options = _wrap_openai_options(self.prompt_options)
 
@@ -483,74 +515,55 @@ class OpenAIPrompterDescriptor(PrompterDescriptor):
 
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(
-            max_retries=0,  # OpenAI client handles retries internally
-            on_error=self.prompt_options.get("on_error", "raise"),
-            actor_number=self.prompt_options.get("actor_number"),
-            num_gpus=self.prompt_options.get("num_gpus"),
-            max_api_concurrency=self.prompt_options.get("max_api_concurrency", 32),
+            max_retries=self.prompt_options.get("max_retries", 3),
+            actor_number=self.prompt_options.get("actor_number", 1),
+            num_gpus=0,
+            batch_size=self.prompt_options.get("batch_size", 32),
+            max_concurrency_per_actor=self.prompt_options.get("max_concurrency_per_actor", 32),
         )
 
     def instantiate(self) -> Prompter:
         return OpenAIPrompter(
             provider_options=self.provider_options,
+            provider_name=self.provider_name,
             model=self.model_name,
             system_message=self.system_message,
-            return_format=self.return_format,
             use_chat_completions=self.use_chat_completions,
             **self.prompt_options,
         )
 
 
 class OpenAIPrompter:
-    """Async prompter supporting Chat Completions and Responses APIs.
-
-    Features:
-    - Chat Completions API: ``completions.create()`` / ``completions.parse()``
-    - Responses API: ``responses.create()`` / ``responses.parse()``
-    - Structured Output: pass ``return_format`` (Pydantic BaseModel) to get
-      typed responses parsed by the API.
-    - Multimodal input: str, bytes (images), numpy arrays (images), and
-      pre-built dicts are all supported as message parts.
-    """
+    """Async basic text/image prompter for Responses or Chat Completions."""
 
     def __init__(
         self,
         provider_options: dict[str, Any],
         model: str,
         system_message: str | None = None,
-        return_format: Any | None = None,
-        use_chat_completions: bool = True,
+        use_chat_completions: bool = False,
+        provider_name: str = "openai",
         **options: Any,
-    ):
+    ) -> None:
         from openai import AsyncOpenAI
 
         # Restore plaintext credentials sealed by the descriptor; plain dicts
         # from direct callers pass through unchanged.
         provider_options = unwrap_sensitive_options(provider_options)
         options = unwrap_sensitive_options(options)
+        self._provider_name = provider_name
         self._model = model
         self._system_message = system_message
-        self._return_format = return_format
         self._use_chat_completions = use_chat_completions
         self._options = {
-            k: v
-            for k, v in options.items()
-            if k
-            not in {
-                "on_error",
-                "actor_number",
-                "num_gpus",
-                "concurrency",
-                "max_api_concurrency",
-                "model",
-                "batch_size",
-            }
+            key: value
+            for key, value in options.items()
+            if key in {"temperature", "max_output_tokens", "top_p", "stop_sequences"} and value is not None
         }
         client_opts = {
-            k: v
-            for k, v in provider_options.items()
-            if k in {"api_key", "base_url", "organization", "timeout", "max_retries"}
+            k: v for k, v in provider_options.items() if k in {"api_key", "base_url", "organization", "timeout"}
         }
+        client_opts["max_retries"] = 0
         self._client = AsyncOpenAI(**client_opts)
 
     async def aclose(self) -> None:
@@ -560,26 +573,12 @@ class OpenAIPrompter:
     # --- Multimodal message processing -----------------------------------
 
     def _process_message(self, msg: Any) -> dict[str, Any]:
-        """Convert a message part into an OpenAI content-part dict.
-
-        Dispatches based on type:
-        - str → text part
-        - bytes → base64-encoded image/file part (MIME auto-detected)
-        - numpy ndarray → PNG-encoded image part
-        - dict → passed through as-is (already a content part)
-        """
+        """Convert one validated Vane text/image part to the OpenAI shape."""
         if isinstance(msg, str):
             return self._process_str(msg)
         if isinstance(msg, bytes):
             return self._process_bytes(msg)
-        if isinstance(msg, dict):
-            return msg
-        # numpy array — check without hard import
-        type_name = type(msg).__name__
-        mod = getattr(type(msg), "__module__", "")
-        if type_name == "ndarray" and "numpy" in mod:
-            return self._process_ndarray(msg)
-        raise ValueError(f"Unsupported multimodal content type: {type(msg)}")
+        raise TypeError(f"Unsupported Prompt content type: {type(msg).__name__}")
 
     def _process_str(self, msg: str) -> dict[str, Any]:
         if self._use_chat_completions:
@@ -590,45 +589,16 @@ class OpenAIPrompter:
         import base64
 
         mime_type = _guess_mime_type(msg)
+        if mime_type is None:
+            raise ValueError("Prompt image BLOB has an unsupported or unrecognized image format")
         b64 = base64.b64encode(msg).decode("utf-8")
         data_url = f"data:{mime_type};base64,{b64}"
-
-        if mime_type.startswith("image/"):
-            return self._build_image_part(data_url)
-        return self._build_file_part(data_url)
-
-    def _process_ndarray(self, arr: Any) -> dict[str, Any]:
-        import base64
-        import io
-
-        try:
-            from PIL import Image
-        except ImportError as exc:
-            raise ProviderImportError("image", function="ndarray image input") from exc
-
-        img = Image.fromarray(arr)
-        buf = io.BytesIO()
-        img.save(buf, "PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        data_url = f"data:image/png;base64,{b64}"
         return self._build_image_part(data_url)
 
     def _build_image_part(self, data_url: str) -> dict[str, Any]:
         if self._use_chat_completions:
             return {"type": "image_url", "image_url": {"url": data_url}}
         return {"type": "input_image", "image_url": data_url}
-
-    def _build_file_part(self, data_url: str, filename: str = "file") -> dict[str, Any]:
-        if self._use_chat_completions:
-            return {
-                "type": "file",
-                "file": {"filename": filename, "file_data": data_url},
-            }
-        return {
-            "type": "input_file",
-            "filename": filename,
-            "file_data": data_url,
-        }
 
     # --- API dispatch -----------------------------------------------------
 
@@ -652,110 +622,74 @@ class OpenAIPrompter:
 
     def _chat_completions_options(self) -> dict[str, Any]:
         options = dict(self._options)
-        if "max_tokens" not in options and "max_output_tokens" in options:
+        if "max_output_tokens" in options:
             options["max_tokens"] = options["max_output_tokens"]
         options.pop("max_output_tokens", None)
+        if "stop_sequences" in options:
+            options["stop"] = options.pop("stop_sequences")
         return options
 
     def _responses_options(self) -> dict[str, Any]:
         options = dict(self._options)
-        if "max_output_tokens" not in options and "max_tokens" in options:
-            options["max_output_tokens"] = options["max_tokens"]
-        options.pop("max_tokens", None)
+        if "stop_sequences" in options:
+            options["stop"] = options.pop("stop_sequences")
         return options
 
-    async def _prompt_chat_completions(self, messages: list[dict[str, Any]]) -> Any:
+    async def _prompt_chat_completions(self, messages: list[dict[str, Any]]) -> str | None:
         """Prompt using the Chat Completions API."""
         options = self._chat_completions_options()
-        if self._return_format is not None:
-            response = await self._client.chat.completions.parse(
-                model=self._model,
-                messages=messages,
-                response_format=self._return_format,
-                **options,
-            )
-            result = response.choices[0].message.parsed
-        else:
+        try:
             response = await self._client.chat.completions.create(
                 model=self._model,
                 messages=messages,
                 **options,
             )
-            result = response.choices[0].message.content
+        except Exception as exc:
+            if _is_prompt_capability_error(exc):
+                raise ProviderCapabilityError(
+                    self._provider_name,
+                    self._model,
+                    "basic Prompt text/image generation",
+                    original_error=exc,
+                ) from exc
+            raise
         self._record_usage(response)
-        return result
+        return response.choices[0].message.content
 
-    async def _prompt_responses(self, messages: list[dict[str, Any]]) -> Any:
+    async def _prompt_responses(self, messages: list[dict[str, Any]]) -> str | None:
         """Prompt using the Responses API."""
         options = self._responses_options()
-        if self._return_format is not None:
-            response = await self._client.responses.parse(
-                model=self._model,
-                input=messages,
-                text_format=self._return_format,
-                **options,
-            )
-            result = response.output_parsed
-        else:
+        try:
             response = await self._client.responses.create(
                 model=self._model,
                 input=messages,
                 **options,
             )
-            result = response.output_text
+        except Exception as exc:
+            if _is_prompt_capability_error(exc):
+                raise ProviderCapabilityError(
+                    self._provider_name,
+                    self._model,
+                    "basic Prompt text/image generation",
+                    original_error=exc,
+                ) from exc
+            raise
         self._record_usage(response)
-        return result
+        return response.output_text
 
-    async def prompt(self, messages: tuple[Any, ...]) -> Any:
-        """Generate a response for the given message(s).
-
-        Each element of *messages* may be a ``str``, ``bytes`` (image),
-        ``numpy.ndarray`` (image), or a pre-built ``dict``.
-
-        - A ``dict`` with a ``"role"`` key is treated as a **complete message**
-          and appended directly to the message list (e.g. assistant turns).
-        - All other elements are assembled into a single user message with a
-          content array (multimodal).
-
-        Dispatches to Chat Completions or Responses API based on
-        ``use_chat_completions``.  When ``return_format`` is set,
-        uses ``parse()`` for structured output.
-        """
+    async def prompt(self, messages: tuple[Any, ...]) -> str | None:
         chat_messages: list[dict[str, Any]] = []
-        if self._system_message:
+        if self._system_message is not None:
             chat_messages.append({"role": "system", "content": self._system_message})
-
-        # Separate complete messages (dicts with "role") from content parts
-        content_parts: list[dict[str, Any]] = []
-
-        def _flush_content() -> None:
-            if not content_parts:
-                return
-            if len(content_parts) == 1 and content_parts[0].get("type") in (
-                "text",
-                "input_text",
-            ):
-                chat_messages.append({"role": "user", "content": content_parts[0]["text"]})
-            else:
-                chat_messages.append({"role": "user", "content": list(content_parts)})
-            content_parts.clear()
-
-        for msg in messages:
-            if isinstance(msg, dict) and "role" in msg:
-                _flush_content()
-                chat_messages.append(msg)
-            else:
-                content_parts.append(self._process_message(msg))
-
-        _flush_content()
+        chat_messages.append({"role": "user", "content": [self._process_message(msg) for msg in messages]})
 
         if self._use_chat_completions:
             return await self._prompt_chat_completions(chat_messages)
         return await self._prompt_responses(chat_messages)
 
 
-def _guess_mime_type(data: bytes) -> str:
-    """Guess MIME type from magic bytes. Returns image type or octet-stream."""
+def _guess_mime_type(data: bytes) -> str | None:
+    """Guess a supported image MIME type from magic bytes."""
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         return "image/png"
     if data[:2] == b"\xff\xd8":
@@ -764,6 +698,4 @@ def _guess_mime_type(data: bytes) -> str:
         return "image/gif"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
-    if data[:4] == b"%PDF":
-        return "application/pdf"
-    return "application/octet-stream"
+    return None

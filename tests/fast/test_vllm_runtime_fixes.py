@@ -19,22 +19,24 @@ import pytest
 
 
 def _packed_native_vllm_secret_options():
-    from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_options_argument
+    from vane.ai._redaction import Secret
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
 
-    descriptor = NativeVLLMPromptPlan(
-        model_name="secret-model",
-        vllm_options={
+    # P2 rejects plaintext credentials at the public Prompt boundary. Exercise
+    # the lower-level native envelope with already-sealed values so its runtime
+    # decoder remains covered for internal callers.
+    return _build_native_vllm_options_argument(
+        {
             "engine_args": {
-                "hf_token": "hf_OPAQUE-ENGINE-TOKEN",
+                "hf_token": Secret("hf_OPAQUE-ENGINE-TOKEN"),
                 "max_model_len": 2048,
             },
             "generate_args": {
-                "api_key": "sk-OPAQUE-GENERATE-KEY",
+                "api_key": Secret("sk-OPAQUE-GENERATE-KEY"),
                 "sampling_params": {"max_tokens": 16},
             },
-        },
+        }
     )
-    return _build_native_vllm_options_argument(descriptor.build_physical_vllm_options())
 
 
 def test_vllm_control_rpc_timeout_is_configurable(monkeypatch):
@@ -249,7 +251,7 @@ def test_vllm_opaque_secret_payload_is_strictly_validated(secret_payload, messag
 
 def test_native_descriptor_forces_background_loop_inside_ray_actor(monkeypatch):
     import duckdb.execution.vllm as vllm_executor
-    from vane.ai.providers.vllm import VLLMPrompterDescriptor
+    from vane.ai.providers.vllm import NativeVLLMPromptPlan
 
     fake_vllm = types.ModuleType("vllm")
 
@@ -266,7 +268,7 @@ def test_native_descriptor_forces_background_loop_inside_ray_actor(monkeypatch):
 
     monkeypatch.setattr(vllm_executor.LocalVLLMExecutor, "_run_event_loop", fake_run_event_loop)
 
-    options = VLLMPrompterDescriptor(vllm_options={"use_threading": False}).build_physical_vllm_options()
+    options = NativeVLLMPromptPlan().build_physical_vllm_options()
     executor = vllm_executor.build_executor("test-model", options)
 
     assert executor._ray_actor_mode is False

@@ -3071,10 +3071,14 @@ void InstantiateNewInstance(DuckDB &db) {
 	vllm_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	system_catalog.CreateFunction(transaction, vllm_info);
 
-	auto ai_prompt_set = AISQLFunction::GetPromptFunctions();
-	CreateScalarFunctionInfo ai_prompt_info(std::move(ai_prompt_set));
-	ai_prompt_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
-	system_catalog.CreateFunction(transaction, ai_prompt_info);
+	auto ai_prompt_implementation_set = AISQLFunction::GetPromptImplementationFunctions();
+	CreateScalarFunctionInfo ai_prompt_implementation_info(std::move(ai_prompt_implementation_set));
+	ai_prompt_implementation_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, ai_prompt_implementation_info);
+
+	auto ai_prompt_macro = AISQLFunction::GetPromptMacro();
+	ai_prompt_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, *ai_prompt_macro);
 
 	auto ai_embed_implementation_set = AISQLFunction::GetEmbedImplementationFunctions();
 	CreateScalarFunctionInfo ai_embed_implementation_info(std::move(ai_embed_implementation_set));

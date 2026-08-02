@@ -312,7 +312,7 @@ def test_embed_client_created_and_used_on_the_bound_loop(runtime) -> None:
 
 def test_prompt_batches_share_the_bound_loop(runtime) -> None:
     descriptor = LoopRecordingPromptDescriptor()
-    wrapper = _PromptBatch(descriptor, "text", "response")
+    wrapper = _PromptBatch(descriptor, ["text"], "response")
     wrapper.bind_async_runtime(runtime.run)
 
     first = wrapper(pa.table({"text": ["a", "b"]}))
@@ -325,7 +325,7 @@ def test_prompt_batches_share_the_bound_loop(runtime) -> None:
 
 def test_prompt_retry_reruns_on_the_same_loop(runtime) -> None:
     descriptor = FlakyOncePromptDescriptor()
-    wrapper = _PromptBatch(descriptor, "text", "response", max_retries=2)
+    wrapper = _PromptBatch(descriptor, ["text"], "response", max_retries=2)
     wrapper.bind_async_runtime(runtime.run)
 
     result = wrapper(pa.table({"text": ["q"]}))
@@ -337,7 +337,7 @@ def test_prompt_retry_reruns_on_the_same_loop(runtime) -> None:
 
 def test_prompt_semaphore_and_ordering_on_bound_loop(runtime) -> None:
     descriptor = ConcurrencyTrackingPromptDescriptor()
-    wrapper = _PromptBatch(descriptor, "text", "response", max_api_concurrency=2)
+    wrapper = _PromptBatch(descriptor, ["text"], "response", max_concurrency_per_actor=2)
     wrapper.bind_async_runtime(runtime.run)
 
     texts = [f"m{i}" for i in range(8)]
@@ -370,7 +370,7 @@ def test_unbound_embed_wrapper_raises() -> None:
 
 
 def test_unbound_prompt_wrapper_raises() -> None:
-    wrapper = _PromptBatch(LoopRecordingPromptDescriptor(), "text", "response")
+    wrapper = _PromptBatch(LoopRecordingPromptDescriptor(), ["text"], "response")
     with pytest.raises(RuntimeError, match="bind_async_runtime"):
         wrapper(pa.table({"text": ["a"]}))
 
@@ -472,7 +472,7 @@ def test_close_drops_async_prompter_without_aclose(runtime) -> None:
     """``Prompter.prompt`` is async by protocol: a prompter without ``aclose``
     is still loop-bound and dropped at close, then re-instantiated."""
     descriptor = CountingAsyncPromptDescriptor()
-    wrapper = _PromptBatch(descriptor, "text", "response")
+    wrapper = _PromptBatch(descriptor, ["text"], "response")
     wrapper.bind_async_runtime(runtime.run)
     wrapper(pa.table({"text": ["a"]}))
 
@@ -512,7 +512,7 @@ def test_close_drops_prompter_after_observed_awaitable(runtime) -> None:
     awaitables: a plain ``def prompt`` returning an awaitable is marked
     loop-bound and dropped at close."""
     descriptor = CountingAwaitablePromptDescriptor()
-    wrapper = _PromptBatch(descriptor, "text", "response")
+    wrapper = _PromptBatch(descriptor, ["text"], "response")
     wrapper.bind_async_runtime(runtime.run)
     result = wrapper(pa.table({"text": ["a"]}))  # observes the awaitable
     assert result.column("response").to_pylist() == ["echo:a"]
@@ -556,7 +556,7 @@ def test_pickle_clears_client_and_capability(runtime) -> None:
 
 def test_prompt_pickle_clears_client_and_capability(runtime) -> None:
     descriptor = LoopRecordingPromptDescriptor()
-    wrapper = _PromptBatch(descriptor, "text", "response", max_api_concurrency=4)
+    wrapper = _PromptBatch(descriptor, ["text"], "response", max_concurrency_per_actor=4)
     wrapper.bind_async_runtime(runtime.run)
     wrapper(pa.table({"text": ["warm"]}))
 
@@ -564,7 +564,7 @@ def test_prompt_pickle_clears_client_and_capability(runtime) -> None:
 
     assert state["_run_async"] is None
     assert state["_prompter"] is None
-    assert state["_max_api_concurrency"] == 4
+    assert state["_max_concurrency_per_actor"] == 4
 
 
 # ---------------------------------------------------------------------------

@@ -1,18 +1,17 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+"""SQL coverage for the closed P2 Prompt API and the P1 Embed API."""
+
 from __future__ import annotations
 
-import logging
+import json
 import os
 import pickle
-import subprocess
-import sys
 import uuid
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
-from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
@@ -27,17 +26,16 @@ from vane.ai.typing import EmbeddingDimensions, UDFOptions
 
 
 class MockTextEmbedder:
-    def __init__(self, dim: int) -> None:
-        self._dim = dim
+    def __init__(self, dimensions: int) -> None:
+        self._dimensions = dimensions
 
     def embed_text(self, text: list[str]) -> list[np.ndarray]:
-        return [np.ones(self._dim, dtype=np.float32) * float(len(item)) for item in text]
+        return [np.full(self._dimensions, len(item), dtype=np.float32) for item in text]
 
 
 @dataclass
 class MockTextEmbedderDescriptor(TextEmbedderDescriptor):
-    dim: int
-    actor_number: int | None = None
+    dimensions: int = 4
     model_name: str = "mock-embedding"
 
     def get_provider(self) -> str:
@@ -47,39 +45,36 @@ class MockTextEmbedderDescriptor(TextEmbedderDescriptor):
         return self.model_name
 
     def get_options(self) -> dict[str, object]:
-        return {"batch_size": 2, "actor_number": self.actor_number}
+        return {}
 
     def get_dimensions(self) -> EmbeddingDimensions:
-        return EmbeddingDimensions(size=self.dim, dtype=pa.float32())
+        return EmbeddingDimensions(self.dimensions)
 
     def get_udf_options(self) -> UDFOptions:
-        return UDFOptions(actor_number=self.actor_number, num_gpus=0, max_retries=0, on_error="raise", batch_size=2)
+        return UDFOptions(num_gpus=0, batch_size=2, max_retries=0)
 
     def instantiate(self) -> MockTextEmbedder:
-        return MockTextEmbedder(self.dim)
+        return MockTextEmbedder(self.dimensions)
 
 
 class MockPrompter:
-    def __init__(self, prefix: str = "topic") -> None:
-        self._prefix = prefix
-
-    def prompt_batch(self, text: list[str]) -> list[str]:
-        return [f"{self._prefix}:{item}" for item in text]
+    def __init__(self, model: str, system_message: str | None) -> None:
+        self._model = model
+        self._system_message = system_message
 
     async def prompt(self, messages: tuple[object, ...]) -> str:
-        text = str(messages[0]) if messages else ""
-        images = [part.hex() for part in messages[1:] if isinstance(part, bytes)]
-        image_suffix = f":images={','.join(images)}" if images else ""
-        return f"{self._prefix}:{text}{image_suffix}"
+        parts = [self._model]
+        if self._system_message is not None:
+            parts.append(f"system={self._system_message}")
+        for message in messages:
+            parts.append(message if isinstance(message, str) else bytes(message).hex())
+        return ":".join(parts)
 
 
 @dataclass
 class MockPrompterDescriptor(PrompterDescriptor):
-    actor_number: int | None = None
-    prefix: str = "topic"
-    model_name: str = "mock-prompt"
-    required_env_name: str | None = None
-    fail_after_env_check: bool = False
+    model_name: str = "topic"
+    system_message: str | None = None
 
     def get_provider(self) -> str:
         return "mock_ai_sql"
@@ -88,46 +83,38 @@ class MockPrompterDescriptor(PrompterDescriptor):
         return self.model_name
 
     def get_options(self) -> dict[str, object]:
-        return {"batch_size": 2, "actor_number": self.actor_number}
+        return {}
 
     def get_udf_options(self) -> UDFOptions:
-        return UDFOptions(actor_number=self.actor_number, num_gpus=0, max_retries=0, on_error="raise", batch_size=2)
+        return UDFOptions(num_gpus=0, batch_size=2, max_retries=0)
 
     def instantiate(self) -> MockPrompter:
-        if self.required_env_name:
-            if not os.getenv(self.required_env_name):
-                raise RuntimeError(
-                    f"required provider credential environment variable {self.required_env_name} is missing"
-                )
-            if self.fail_after_env_check:
-                raise RuntimeError("mock provider initialization failed after credential lookup")
-            return MockPrompter("credential-present")
-        return MockPrompter(self.prefix)
+        return MockPrompter(self.model_name, self.system_message)
 
 
 class MockProvider(Provider):
+    def __init__(self, provider_name: str = "mock_ai_sql") -> None:
+        self._provider_name = provider_name
+
     @property
     def name(self) -> str:
-        return "mock_ai_sql"
+        return self._provider_name
 
-    def get_text_embedder(self, model: str | None = None, dimensions: int | None = None, **options: object):
-        actor_number = options.get("actor_number")
-        return MockTextEmbedderDescriptor(
-            dim=dimensions or 4,
-            actor_number=actor_number,
-            model_name=model or "mock-embedding",
-        )
+    def get_text_embedder(
+        self,
+        model: str | None = None,
+        dimensions: int | None = None,
+        **options: object,
+    ) -> MockTextEmbedderDescriptor:
+        return MockTextEmbedderDescriptor(dimensions or 4, model or "mock-embedding")
 
-    def get_prompter(self, model: str | None = None, **options: object):
-        actor_number = options.get("actor_number", options.get("concurrency"))
-        resolved_model = model or "mock-prompt"
-        return MockPrompterDescriptor(
-            actor_number=actor_number,
-            prefix=model or "topic",
-            model_name=resolved_model,
-            required_env_name=options.get("required_env_name"),
-            fail_after_env_check=bool(options.get("fail_after_env_check", False)),
-        )
+    def get_prompter(
+        self,
+        model: str | None = None,
+        system_message: str | None = None,
+        **options: object,
+    ) -> MockPrompterDescriptor:
+        return MockPrompterDescriptor(model or "topic", system_message)
 
 
 class RecordingNativeVLLMExecutor:
@@ -166,17 +153,20 @@ class RecordingNativeVLLMExecutor:
 
 @pytest.fixture(autouse=True)
 def mock_ai_provider(monkeypatch):
-    monkeypatch.setitem(provider_registry.PROVIDERS, "mock_ai_sql", lambda name=None, **options: MockProvider())
+    monkeypatch.setitem(
+        provider_registry.PROVIDERS,
+        "mock_ai_sql",
+        lambda name=None, **options: MockProvider(),
+    )
 
 
-def _round_trip_ai_plan(relation, *, runner: str = "local-fast"):
-    source_types = list(relation.types)
+def _round_trip_ai_plan(relation):
     logical = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4()))
     serialized = pickle.dumps(logical)
     restored = pickle.loads(serialized)
     previous_runner = os.environ.get("VANE_RUNNER")
     try:
-        os.environ["VANE_RUNNER"] = runner
+        os.environ["VANE_RUNNER"] = "local-fast"
         target = vane.connect()
         physical = restored.to_physical_plan(target)
     finally:
@@ -184,7 +174,7 @@ def _round_trip_ai_plan(relation, *, runner: str = "local-fast"):
             os.environ.pop("VANE_RUNNER", None)
         else:
             os.environ["VANE_RUNNER"] = previous_runner
-    return source_types, target, physical, serialized
+    return target, physical, serialized
 
 
 def _execute_ai_physical_plan(target, physical):
@@ -200,941 +190,282 @@ def _execute_ai_physical_plan(target, physical):
             pool.shutdown(kill=True)
 
 
-@pytest.mark.parametrize(
-    ("env_runner", "task_backend", "actor_backend"),
-    [
-        pytest.param(None, "ray_task", "ray_actor", id="default-ray"),
-        pytest.param("  LOCAL-FAST  ", "subprocess_task", "subprocess_actor", id="env-local-fast"),
-        pytest.param("  LoCaL  ", "subprocess_task", "subprocess_actor", id="env-local"),
-        pytest.param("  RaY  ", "ray_task", "ray_actor", id="env-ray"),
-        pytest.param("   ", "ray_task", "ray_actor", id="blank-env-is-ray"),
-    ],
-)
-def test_expression_runner_resolution_matrix(
-    monkeypatch,
-    env_runner,
-    task_backend,
-    actor_backend,
-):
-    if env_runner is None:
-        monkeypatch.delenv("VANE_RUNNER", raising=False)
-    else:
-        monkeypatch.setenv("VANE_RUNNER", env_runner)
-
-    conn = vane.connect()
-    relation = conn.sql("SELECT 1::INTEGER AS value")
-
-    @vane.func(return_dtype="INTEGER")
-    def add_one(value):
-        return value + 1
-
-    scalar_plan = relation.select(add_one(vane.col("value")).alias("result")).explain()
-
-    def add_one_batch(table):
-        return pa.table({"result": [value + 1 for value in table.column("value").to_pylist()]})
-
-    batch_expression = vane.func.batch(
-        add_one_batch,
-        inputs={"value": vane.col("value")},
-        schema={"result": "INTEGER"},
-    )
-    batch_plan = relation.select(batch_expression.alias("result")).explain()
-
-    @vane.cls(actor_number=1, return_dtype="INTEGER", gpus=0)
-    class StatefulIdentity:
-        def __call__(self, value: int) -> int:
-            return value
-
-    class_plan = relation.select(StatefulIdentity()(vane.col("value")).alias("result")).explain()
-
-    ai_plan = "\n".join(
-        str(row)
-        for row in conn.sql("""
-            EXPLAIN SELECT ai_prompt(
-                'alpha',
-                struct_pack(provider := 'mock_ai_sql', concurrency := 1)
-            )
-        """).fetchall()
-    )
-
-    assert task_backend in scalar_plan
-    assert task_backend in batch_plan
-    assert actor_backend in class_plan
-    assert actor_backend in ai_plan
-    opposite_task_backend = "subprocess_task" if task_backend == "ray_task" else "ray_task"
-    opposite_actor_backend = "subprocess_actor" if actor_backend == "ray_actor" else "ray_actor"
-    assert opposite_task_backend not in scalar_plan
-    assert opposite_task_backend not in batch_plan
-    assert opposite_actor_backend not in class_plan
-    assert opposite_actor_backend not in ai_plan
-
-
-def test_ai_prompt_options_survive_logical_plan_pickle_to_fresh_connection():
-    source = vane.connect()
-    relation = source.sql("""
-        SELECT ai_prompt(
-            chunk,
-            struct_pack(provider := 'mock_ai_sql', model := 'round-trip-model', concurrency := 1)
-        ) AS response
-        FROM (VALUES ('alpha'), ('beta')) AS t(chunk)
-        ORDER BY chunk
-    """)
-
-    _, target, physical, serialized = _round_trip_ai_plan(relation)
-    udf_node = physical.collect_udf_nodes()[0]
-    table = _execute_ai_physical_plan(target, physical)
-
-    assert table.column(0).to_pylist() == ["round-trip-model:alpha", "round-trip-model:beta"]
-    assert udf_node["payload"]["ai_provider"] == "mock_ai_sql"
-    assert udf_node["payload"]["ai_model"] == "round-trip-model"
-    assert udf_node["payload"]["ai_return_type"] == "VARCHAR"
-    assert udf_node["payload"]["ai_dimensions"] is None
-    assert udf_node["payload"]["function_pickle_size_bytes"] > 0
-    assert 0 < len(serialized) < 1_000_000
-
-
-def test_ai_prompt_image_input_survives_plan_round_trip_as_row_data():
-    image_hex = "89504e470d0a1a0a49535355453138524f5744415441"
-    image_bytes = bytes.fromhex(image_hex)
-    source = vane.connect()
-    relation = source.sql(f"""
-        SELECT ai_prompt(
-            prompt,
-            image,
-            struct_pack(provider := 'mock_ai_sql', model := 'round-trip-vision', concurrency := 1)
-        ) AS response
-        FROM (
-            VALUES ('describe', from_hex('{image_hex}'))
-        ) AS t(prompt, image)
-    """)
-
-    _, target, physical, _ = _round_trip_ai_plan(relation)
-    udf_node = physical.collect_udf_nodes()[0]
-    table = _execute_ai_physical_plan(target, physical)
-    payload = udf_node["payload"]
-
-    assert table.column(0).to_pylist() == [f"round-trip-vision:describe:images={image_hex}"]
-    assert payload["input_names"] == ["messages", "images"]
-    assert payload["scalar_arg_count"] == 2
-    assert image_bytes not in payload["function_pickle"]
-
-
-def test_ai_prompt_vllm_survives_logical_plan_pickle_as_native_operator(monkeypatch):
-    import duckdb.execution.vllm as vllm_executor
-
-    executor = RecordingNativeVLLMExecutor()
-    builds: list[tuple[str, dict[str, object]]] = []
-
-    def build_executor(model, options):
-        builds.append((model, dict(options)))
-        return executor
-
-    monkeypatch.setattr(vllm_executor, "build_executor", build_executor)
-    source = vane.connect()
-    relation = source.sql("""
-        SELECT ai_prompt(
-            chunk,
-            struct_pack(
-                provider := 'vllm',
-                model := 'round-trip-vllm',
-                batch_size := 1,
-                do_prefix_routing := false
-            )
-        ) AS response
-        FROM (VALUES ('alpha'), ('beta')) AS t(chunk)
-    """)
-
-    _, target, physical, serialized = _round_trip_ai_plan(relation)
-    table = _execute_ai_physical_plan(target, physical)
-
-    assert physical.collect_udf_nodes() == []
-    assert table.column(0).to_pylist() == ["native:alpha", "native:beta"]
-    assert len(builds) == 1
-    assert builds[0][0] == "round-trip-vllm"
-    assert builds[0][1]["batch_size"] == 1
-    assert executor.finished_count == 1
-    assert executor.shutdown_count == 1
-    assert 0 < len(serialized) < 10_000
-
-
-def test_ai_embed_fixed_dimensions_survive_round_trip():
-    source = vane.connect()
-    relation = source.sql("""
-        SELECT ai_embed(
-            chunk,
-            provider := 'mock_ai_sql',
-            model := 'round-trip-embedding',
-            dimensions := 4,
-            options := struct_pack(
-                normalize := true,
-                actor_number := 1
-            )
-        ) AS embedding
-        FROM (VALUES ('abc')) AS t(chunk)
-    """)
-
-    source_types, target, physical, _ = _round_trip_ai_plan(relation)
-    udf_node = physical.collect_udf_nodes()[0]
-    table = _execute_ai_physical_plan(target, physical)
-    embedding = table.column(0).to_pylist()[0]
-
-    assert str(source_types[0]) == "FLOAT[4]"
-    assert udf_node["payload"]["ai_provider"] == "mock_ai_sql"
-    assert udf_node["payload"]["ai_model"] == "round-trip-embedding"
-    assert udf_node["payload"]["ai_dimensions"] == 4
-    assert udf_node["payload"]["ai_return_type"] == "FLOAT[4]"
-    assert udf_node["payload"]["output_schema"][0]["type"] == "FLOAT[4]"
-    assert table.schema.field(0).type.list_size == 4
-    assert len(embedding) == 4
-    assert np.linalg.norm(embedding) == pytest.approx(1.0)
-
-
-def test_udf_rejects_unknown_expression_payload_version():
-    conn = vane.connect()
-
-    with pytest.raises(Exception, match="unsupported payload_version 999"):
-        conn.sql("""
-            SELECT udf(
-                1,
-                struct_pack(
-                    payload_version := 999,
-                    expression_udf := true,
-                    method_return_type := 'INTEGER'
-                )
-            )
-        """).fetchall()
-
-
-def test_ai_actor_concurrency_survives_round_trip():
-    source = vane.connect()
-    relation = source.sql("""
-        SELECT ai_prompt(
-            chunk,
-            struct_pack(provider := 'mock_ai_sql', model := 'pool-model', concurrency := 3)
-        ) AS response
-        FROM (VALUES ('alpha')) AS t(chunk)
-    """)
-
-    _, _, physical, _ = _round_trip_ai_plan(relation, runner="ray")
-    udf_node = physical.collect_udf_nodes()[0]
-
-    assert udf_node["payload"]["actor_number"] == 3
-    assert udf_node["actor_pool_size"] == 3
-
-
-@pytest.mark.parametrize(
-    "credential_options",
-    [
-        "api_key := 'INLINE_SECRET_SENTINEL'",
-        "openai_api_key := 'INLINE_SECRET_SENTINEL'",
-        "provider_options := struct_pack(aws_access_key_id := 'INLINE_SECRET_SENTINEL')",
-        "provider_options := struct_pack(aws_secret_access_key := 'INLINE_SECRET_SENTINEL')",
-        "provider_options := struct_pack(azure_client_secret_value := 'INLINE_SECRET_SENTINEL')",
-        "credentials := struct_pack(access_token := 'INLINE_SECRET_SENTINEL')",
-        "provider_options := map(['client-secret'], ['INLINE_SECRET_SENTINEL'])",
-        "provider_options := map(['google-api-token'], ['INLINE_SECRET_SENTINEL'])",
-        "provider_options := map(['Proxy-Authorization'], ['Bearer INLINE_SECRET_SENTINEL'])",
-        'engine_args_json := \'{"api_key":"INLINE_SECRET_SENTINEL"}\'',
-        'generate_args_json := \'{"nested":{"access_token":"INLINE_SECRET_SENTINEL"}}\'',
-    ],
-)
-def test_ai_sql_rejects_inline_credentials(credential_options):
-    conn = vane.connect()
-
-    with pytest.raises(Exception, match="credential|secret|sensitive"):
-        conn.sql(f"""
-            SELECT ai_prompt(
-                'alpha',
-                struct_pack(provider := 'mock_ai_sql', {credential_options})
-            )
-        """).fetchall()
-
-
-def test_ai_sql_secret_sentinel_stays_out_of_plan_explain_results_and_logs(monkeypatch, capfd, caplog):
-    caplog.set_level(logging.DEBUG)
-    sentinel = "ENV_SECRET_SENTINEL_38A972"
-    monkeypatch.setenv("OPENAI_API_KEY", sentinel)
-    source = vane.connect()
-    relation = source.sql("""
-        SELECT ai_prompt(
-            'alpha',
-            struct_pack(
-                provider := 'mock_ai_sql',
-                model := 'safe-model',
-                concurrency := 1,
-                required_env_name := 'OPENAI_API_KEY'
-            )
-        ) AS response
-    """)
-
-    _, target, physical, serialized = _round_trip_ai_plan(relation)
-    explain = "\n".join(
-        str(row)
-        for row in source.sql("""
-            EXPLAIN SELECT ai_prompt(
-                'alpha',
-                struct_pack(
-                    provider := 'mock_ai_sql',
-                    model := 'safe-model',
-                    concurrency := 1,
-                    required_env_name := 'OPENAI_API_KEY'
-                )
-            ) AS response
-        """).fetchall()
-    )
-    table = _execute_ai_physical_plan(target, physical)
-    captured = capfd.readouterr()
-
-    assert sentinel.encode() not in serialized
-    assert sentinel not in explain
-    assert table.column(0).to_pylist() == ["credential-present:alpha"]
-    assert sentinel not in captured.out
-    assert sentinel not in captured.err
-    assert sentinel not in caplog.text
-
-
-def test_ai_sql_worker_failure_after_env_lookup_does_not_leak_secret(monkeypatch, capfd, caplog):
-    caplog.set_level(logging.DEBUG)
-    sentinel = "ENV_SECRET_SENTINEL_FAILURE_91B4"
-    monkeypatch.setenv("OPENAI_API_KEY", sentinel)
-    source = vane.connect()
-    relation = source.sql("""
-        SELECT ai_prompt(
-            'alpha',
-            struct_pack(
-                provider := 'mock_ai_sql',
-                concurrency := 1,
-                required_env_name := 'OPENAI_API_KEY',
-                fail_after_env_check := true
-            )
-        ) AS response
-    """)
-    _, target, physical, serialized = _round_trip_ai_plan(relation)
-
-    with pytest.raises(Exception, match="mock provider initialization failed") as exc_info:
-        _execute_ai_physical_plan(target, physical)
-    captured = capfd.readouterr()
-
-    assert sentinel.encode() not in serialized
-    assert sentinel not in str(exc_info.value)
-    assert sentinel not in captured.out
-    assert sentinel not in captured.err
-    assert sentinel not in caplog.text
-
-
-def test_ai_sql_worker_reports_missing_credential_env_without_secret_value(monkeypatch):
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    source = vane.connect()
-    relation = source.sql("""
-        SELECT ai_prompt(
-            'alpha',
-            struct_pack(
-                provider := 'mock_ai_sql',
-                concurrency := 1,
-                required_env_name := 'OPENAI_API_KEY'
-            )
-        ) AS response
-    """)
-    _, target, physical, _ = _round_trip_ai_plan(relation)
-
-    with pytest.raises(Exception, match="OPENAI_API_KEY.*missing"):
-        _execute_ai_physical_plan(target, physical)
-
-
-def test_ai_prompt_sql_with_mock_provider():
+def test_ai_prompt_sql_exact_text_overload_and_named_parameters():
     conn = vane.connect()
 
     rows = conn.sql("""
-        SELECT ai_prompt(
-            chunk,
-            struct_pack(provider := 'mock_ai_sql', concurrency := 1)
-        ) AS topic
-        FROM (VALUES ('alpha'), ('beta')) AS t(chunk)
-        ORDER BY chunk
-    """).fetchall()
-
-    assert rows == [("topic:alpha",), ("topic:beta",)]
-
-
-@pytest.mark.parametrize(
-    ("expression", "expected"),
-    [
-        pytest.param(
-            """
-            ai_prompt(
-                'describe',
-                struct_pack(provider := 'mock_ai_sql', model := 'text-model', concurrency := 1)
-            )
-            """,
-            "text-model:describe",
-            id="prompt",
-        ),
-        pytest.param(
-            """
-            ai_embed(
-                'abc',
-                provider := 'mock_ai_sql',
-                dimensions := 4,
-                options := struct_pack(actor_number := 1)
-            )
-            """,
-            [3.0, 3.0, 3.0, 3.0],
-            id="embed",
-        ),
-    ],
-)
-def test_ai_sql_full_local_copy_in_subprocess(tmp_path, expression, expected):
-    repo_root = Path(__file__).resolve().parents[2]
-    output = tmp_path / "ai-local-copy.parquet"
-    expected_row = (expected,)
-    script = f"""
-import vane
-from vane.ai import provider as provider_registry
-from tests.ai.test_expression_ai_sql import MockProvider
-
-provider_registry.PROVIDERS["mock_ai_sql"] = lambda name=None, **options: MockProvider()
-vane.configure(runner="local")
-conn = vane.connect()
-conn.sql({f"SELECT {expression} AS result"!r}).write_parquet({str(output)!r})
-row = conn.read_parquet({str(output)!r}).fetchone()
-assert row == {expected_row!r}, row
-"""
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(entry for entry in (str(repo_root), env.get("PYTHONPATH")) if entry)
-    env["PYTHONFAULTHANDLER"] = "1"
-    env["VANE_PROGRESS"] = "0"
-
-    subprocess.run(
-        [sys.executable, "-c", script],
-        check=True,
-        cwd=repo_root,
-        env=env,
-        timeout=60,
-    )
-    assert output.exists()
-
-
-@pytest.mark.parametrize(
-    "expression",
-    [
-        "ai_prompt(NULL, struct_pack(provider := 'mock_ai_sql', concurrency := 1))",
-        "ai_prompt(NULL::VARCHAR, struct_pack(provider := 'mock_ai_sql', concurrency := 1))",
-        "ai_embed(NULL, provider := 'mock_ai_sql', dimensions := 4, options := struct_pack(actor_number := 1))",
-        "ai_embed(NULL::VARCHAR, provider := 'mock_ai_sql', dimensions := 4, options := struct_pack(actor_number := 1))",
-        "ai_prompt('alpha', NULL)",
-    ],
-)
-def test_ai_sql_text_inputs_propagate_null_without_runtime_calls(monkeypatch, expression):
-    provider_calls = []
-    embed_runtime_calls = []
-
-    original_embed = MockTextEmbedder.embed_text
-
-    def recording_embed(embedder, text):
-        embed_runtime_calls.append(list(text))
-        return original_embed(embedder, text)
-
-    monkeypatch.setattr(MockTextEmbedder, "embed_text", recording_embed)
-
-    def recording_provider(name=None, **options):
-        provider_calls.append((name, options))
-        return MockProvider()
-
-    monkeypatch.setitem(provider_registry.PROVIDERS, "mock_ai_sql", recording_provider)
-    monkeypatch.setitem(provider_registry.PROVIDERS, "openai", recording_provider)
-    conn = vane.connect()
-
-    relation = conn.sql(f"SELECT {expression} AS result")
-    if expression.startswith("ai_embed"):
-        assert [str(dtype) for dtype in relation.types] == ["FLOAT[4]"]
-    assert relation.fetchall() == [(None,)]
-    assert embed_runtime_calls == []
-    if not expression.startswith("ai_embed"):
-        assert provider_calls == []
-
-
-@pytest.mark.parametrize("null_prompt", ["NULL", "NULL::VARCHAR"])
-def test_ai_prompt_image_input_propagates_literal_null_prompt(monkeypatch, null_prompt):
-    provider_calls = []
-
-    def recording_provider(name=None, **options):
-        provider_calls.append((name, options))
-        return MockProvider()
-
-    monkeypatch.setitem(provider_registry.PROVIDERS, "mock_ai_sql", recording_provider)
-    conn = vane.connect()
-
-    relation = conn.sql(f"""
-        SELECT ai_prompt(
-            {null_prompt},
-            from_hex('89504e47'),
-            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
-        ) AS response
-    """)
-
-    assert provider_calls == []
-    assert [str(dtype) for dtype in relation.types] == ["VARCHAR"]
-    assert relation.fetchall() == [(None,)]
-    assert provider_calls == []
-
-    _, target, physical, _ = _round_trip_ai_plan(relation)
-    assert physical.collect_udf_nodes() == []
-    table = _execute_ai_physical_plan(target, physical)
-    assert table.column(0).to_pylist() == [None]
-    assert provider_calls == []
-
-
-def test_ai_prompt_literal_null_prompt_skips_invalid_provider():
-    conn = vane.connect()
-
-    relation = conn.sql("""
-        SELECT ai_prompt(
-            NULL,
-            from_hex('89504e47'),
-            struct_pack(provider := 'does_not_exist')
-        ) AS response
-    """)
-
-    assert [str(dtype) for dtype in relation.types] == ["VARCHAR"]
-    assert relation.fetchall() == [(None,)]
-
-
-def test_ai_prompt_literal_null_prompt_skips_nonconstant_options():
-    conn = vane.connect()
-
-    rows = conn.sql("""
-        SELECT ai_prompt(
-            NULL,
-            image,
-            struct_pack(provider := provider_name)
-        ) AS response
-        FROM (
-            VALUES (from_hex('89504e47'), 'does_not_exist')
-        ) AS t(image, provider_name)
-    """).fetchall()
-
-    assert rows == [(None,)]
-
-
-@pytest.mark.parametrize(
-    "image_expression",
-    [
-        "from_hex('89504e47')",
-        "[from_hex('89504e47')]::BLOB[]",
-    ],
-)
-def test_ai_prompt_image_input_propagates_column_null_prompt(image_expression):
-    conn = vane.connect()
-
-    rows = conn.sql(f"""
         SELECT id, ai_prompt(
             prompt,
-            image,
-            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
+            system_message := 'be brief',
+            provider := 'mock_ai_sql',
+            model := 'model-a',
+            on_error := 'raise',
+            options := struct_pack(actor_number := 1, batch_size := 2)
         ) AS response
-        FROM (
-            VALUES
-                (1, NULL::VARCHAR, {image_expression}),
-                (2, 'alpha', {image_expression})
-        ) AS t(id, prompt, image)
+        FROM (VALUES (1, 'alpha'), (2, 'beta')) AS source(id, prompt)
         ORDER BY id
     """).fetchall()
 
     assert rows == [
-        (1, None),
-        (2, "vision-model:alpha:images=89504e47"),
+        (1, "model-a:system=be brief:alpha"),
+        (2, "model-a:system=be brief:beta"),
     ]
 
 
-@pytest.mark.parametrize("null_image", ["NULL", "NULL::BLOB", "NULL::BLOB[]"])
-def test_ai_prompt_sql_with_literal_null_image(null_image):
+def test_ai_prompt_sql_exact_blob_overload_preserves_text_then_image_order():
     conn = vane.connect()
 
-    relation = conn.sql(f"""
+    rows = conn.sql("""
         SELECT ai_prompt(
             'describe',
-            {null_image},
-            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
-        ) AS response
-    """)
+            from_hex('89504e47'),
+            provider := 'mock_ai_sql',
+            model := 'vision'
+        )
+    """).fetchall()
 
-    assert [str(dtype) for dtype in relation.types] == ["VARCHAR"]
-    assert relation.fetchall() == [("vision-model:describe",)]
-
-    _, target, physical, _ = _round_trip_ai_plan(relation)
-    table = _execute_ai_physical_plan(target, physical)
-    assert table.column(0).to_pylist() == ["vision-model:describe"]
+    assert rows == [("vision:describe:89504e47",)]
 
 
-def test_ai_prompt_sql_with_null_options_uses_default_provider(monkeypatch):
-    monkeypatch.setitem(provider_registry.PROVIDERS, "openai", lambda name=None, **options: MockProvider())
+def test_ai_prompt_sql_exact_blob_list_overload_flattens_in_place():
+    conn = vane.connect()
+
+    rows = conn.sql("""
+        SELECT ai_prompt(
+            'compare',
+            [from_hex('89504e47'), NULL, from_hex('ffd8ff')]::BLOB[],
+            provider := 'mock_ai_sql',
+            model := 'vision'
+        )
+    """).fetchall()
+
+    assert rows == [("vision:compare:89504e47:ffd8ff",)]
+
+
+@pytest.mark.parametrize("image", ["NULL::BLOB", "NULL::BLOB[]", "[]::BLOB[]"])
+def test_ai_prompt_sql_null_and_empty_image_inputs_are_omitted(image):
+    conn = vane.connect()
+
+    rows = conn.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            {image},
+            provider := 'mock_ai_sql',
+            model := 'vision'
+        )
+    """).fetchall()
+
+    assert rows == [("vision:describe",)]
+
+
+@pytest.mark.parametrize("image", ["''::BLOB", "[''::BLOB]::BLOB[]"])
+def test_ai_prompt_sql_zero_length_image_is_a_row_error(image):
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match="zero length"):
+        conn.sql(f"""
+            SELECT ai_prompt(
+                'describe',
+                {image},
+                provider := 'mock_ai_sql'
+            )
+        """).fetchall()
+
+    assert conn.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            {image},
+            provider := 'mock_ai_sql',
+            on_error := 'ignore'
+        )
+    """).fetchall() == [(None,)]
+
+
+def test_ai_prompt_sql_null_prompt_is_null_even_with_an_image():
     conn = vane.connect()
 
     relation = conn.sql("""
         SELECT ai_prompt(
-            'describe',
+            prompt,
             from_hex('89504e47'),
-            NULL
+            provider := 'mock_ai_sql'
         ) AS response
+        FROM (VALUES (NULL::VARCHAR), ('alpha')) AS source(prompt)
     """)
 
-    assert [str(dtype) for dtype in relation.types] == ["VARCHAR"]
-    assert relation.fetchall() == [("topic:describe:images=89504e47",)]
+    assert relation.fetchall() == [(None,), ("topic:alpha:89504e47",)]
 
 
-def test_ai_prompt_literal_null_image_still_validates_provider():
+def test_ai_prompt_sql_literal_null_has_varchar_type_and_no_udf_operator():
+    conn = vane.connect()
+    relation = conn.sql("SELECT ai_prompt(NULL, provider := 'mock_ai_sql') AS response")
+
+    assert [str(value) for value in relation.types] == ["VARCHAR"]
+    assert relation.fetchall() == [(None,)]
+    _, physical, _ = _round_trip_ai_plan(relation)
+    assert physical.collect_udf_nodes() == []
+
+
+def test_ai_prompt_sql_result_is_nullable_varchar():
+    conn = vane.connect()
+    relation = conn.sql("""
+        SELECT ai_prompt(prompt, provider := 'mock_ai_sql') AS response
+        FROM (VALUES ('alpha'), (NULL::VARCHAR)) AS source(prompt)
+    """)
+
+    assert [str(value) for value in relation.types] == ["VARCHAR"]
+    assert relation.fetchall() == [("topic:alpha",), (None,)]
+
+
+def test_ai_prompt_sql_expression_udf_survives_plan_round_trip():
+    source = vane.connect()
+    relation = source.sql("""
+        SELECT ai_prompt(
+            prompt,
+            image,
+            provider := 'mock_ai_sql',
+            model := 'round-trip',
+            options := struct_pack(actor_number := 1)
+        ) AS response
+        FROM (VALUES ('alpha', from_hex('89504e47'))) AS source(prompt, image)
+    """)
+
+    target, physical, serialized = _round_trip_ai_plan(relation)
+    node = physical.collect_udf_nodes()[0]
+    table = _execute_ai_physical_plan(target, physical)
+
+    assert table.column(0).to_pylist() == ["round-trip:alpha:89504e47"]
+    assert node["payload"]["input_names"] == ["message_0", "message_1"]
+    assert node["payload"]["ai_provider"] == "mock_ai_sql"
+    assert node["payload"]["ai_model"] == "round-trip"
+    assert node["payload"]["ai_return_type"] == "VARCHAR"
+    assert 0 < len(serialized) < 1_000_000
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT ai_prompt('x', struct_pack(provider := 'mock_ai_sql'))",
+        "SELECT ai_prompt('x', 42)",
+        "SELECT ai_prompt('x', from_hex('89'), from_hex('50'))",
+    ],
+)
+def test_ai_prompt_sql_removed_or_untyped_overloads_do_not_bind(sql):
     conn = vane.connect()
 
-    with pytest.raises(Exception, match="Provider 'does_not_exist' is not supported"):
-        conn.sql("""
+    with pytest.raises(Exception, match="No function matches|Binder"):
+        conn.sql(sql).fetchall()
+
+
+@pytest.mark.parametrize(
+    "removed",
+    [
+        "provider := 'mock_ai_sql'",
+        "model := 'old-model'",
+        "system_message := 'old-system'",
+        "on_error := 'ignore'",
+        "output_column := 'answer'",
+        "return_format := 'json'",
+        "return_raw_response := true",
+        "provider_options := struct_pack(value := 1)",
+        "prompt_options := struct_pack(value := 1)",
+        "concurrency := 1",
+        "max_api_concurrency := 1",
+    ],
+)
+def test_ai_prompt_sql_options_are_closed_and_first_class_fields_are_not_nested(removed):
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match="Unsupported Prompt option"):
+        conn.sql(f"""
             SELECT ai_prompt(
-                'describe',
-                NULL::BLOB,
-                struct_pack(provider := 'does_not_exist')
+                'alpha',
+                provider := 'mock_ai_sql',
+                options := struct_pack({removed})
             )
         """).fetchall()
 
 
-def test_ai_prompt_sql_rejects_native_vllm_image_input():
+def test_ai_prompt_sql_options_must_be_a_foldable_struct_or_null():
     conn = vane.connect()
 
-    with pytest.raises(Exception, match="native vLLM ai_prompt does not support image inputs"):
+    with pytest.raises(Exception, match="STRUCT"):
+        conn.sql("""
+            SELECT ai_prompt(
+                'alpha',
+                provider := 'mock_ai_sql',
+                options := map(['batch_size'], ['2'])
+            )
+        """).fetchall()
+
+    with pytest.raises(Exception, match="constant"):
+        conn.sql("""
+            SELECT ai_prompt(
+                'alpha',
+                provider := 'mock_ai_sql',
+                options := struct_pack(batch_size := id)
+            )
+            FROM (VALUES (2)) AS source(id)
+        """).fetchall()
+
+
+@pytest.mark.parametrize("argument", ["system_message", "provider", "model", "on_error"])
+def test_ai_prompt_sql_call_level_configuration_must_be_foldable(argument):
+    values = {
+        "system_message": "value",
+        "provider": "mock_ai_sql",
+        "model": "model-a",
+        "on_error": "raise",
+    }
+    assignments = [
+        f"{name} := source_value" if name == argument else f"{name} := '{value}'" for name, value in values.items()
+    ]
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match="constant"):
+        conn.sql(f"""
+            SELECT ai_prompt('alpha', {", ".join(assignments)})
+            FROM (VALUES ('dynamic')) AS source(source_value)
+        """).fetchall()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        "struct_pack(api_key := 'INLINE_SECRET_SENTINEL')",
+        "struct_pack(engine_args := struct_pack(hf_token := 'INLINE_SECRET_SENTINEL'))",
+        "struct_pack(generate_args := struct_pack(authorization := 'INLINE_SECRET_SENTINEL'))",
+    ],
+)
+def test_ai_prompt_sql_rejects_sensitive_options_recursively(options):
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match="sensitive|credential") as exc_info:
+        conn.sql(f"""
+            SELECT ai_prompt(
+                'alpha',
+                provider := 'vllm',
+                options := {options}
+            )
+        """).fetchall()
+    assert "INLINE_SECRET_SENTINEL" not in str(exc_info.value)
+
+
+def test_ai_prompt_sql_on_error_does_not_hide_planning_capability_errors():
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match="does not support image inputs"):
         conn.sql("""
             SELECT ai_prompt(
                 'describe',
                 from_hex('89504e47'),
-                struct_pack(provider := 'vllm', model := 'test-model')
-            )
-        """).fetchall()
-
-
-def test_ai_prompt_sql_with_single_image_blob_and_null_image():
-    conn = vane.connect()
-
-    rows = conn.sql("""
-        SELECT id, ai_prompt(
-            prompt,
-            image,
-            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
-        ) AS response
-        FROM (
-            VALUES
-                (1, 'alpha', from_hex('89504e470d0a1a0a')),
-                (2, 'beta', NULL::BLOB)
-        ) AS t(id, prompt, image)
-        ORDER BY id
-    """).fetchall()
-
-    assert rows == [
-        (1, "vision-model:alpha:images=89504e470d0a1a0a"),
-        (2, "vision-model:beta"),
-    ]
-
-
-def test_ai_prompt_sql_with_image_blob_list():
-    conn = vane.connect()
-
-    rows = conn.sql("""
-        SELECT id, ai_prompt(
-            prompt,
-            images,
-            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
-        ) AS response
-        FROM (
-            VALUES
-                (
-                    1,
-                    'compare',
-                    [from_hex('89504e47'), NULL, from_hex('ffd8ff')]::BLOB[]
-                ),
-                (2, 'empty', []::BLOB[]),
-                (3, 'null', NULL::BLOB[])
-        ) AS t(id, prompt, images)
-        ORDER BY id
-    """).fetchall()
-
-    assert rows == [
-        (1, "vision-model:compare:images=89504e47,ffd8ff"),
-        (2, "vision-model:empty"),
-        (3, "vision-model:null"),
-    ]
-
-
-@pytest.mark.parametrize(
-    "empty_image",
-    [
-        "''::BLOB",
-        "[''::BLOB]::BLOB[]",
-    ],
-)
-def test_ai_prompt_sql_treats_zero_length_image_as_empty(empty_image):
-    conn = vane.connect()
-
-    rows = conn.sql(f"""
-        SELECT ai_prompt(
-            'describe',
-            {empty_image},
-            struct_pack(provider := 'mock_ai_sql', model := 'vision-model', concurrency := 1)
-        ) AS response
-    """).fetchall()
-
-    assert rows == [("vision-model:describe",)]
-
-
-def test_ai_embed_sql_with_mock_provider_and_dimensions():
-    conn = vane.connect()
-
-    rows = conn.sql("""
-        SELECT ai_embed(
-            chunk,
-            provider := 'mock_ai_sql',
-            dimensions := 4,
-            options := struct_pack(actor_number := 1)
-        ) AS embedding
-        FROM (VALUES ('abc')) AS t(chunk)
-    """).fetchall()
-
-    assert len(rows) == 1
-    embedding = list(rows[0][0])
-    assert embedding == [3.0, 3.0, 3.0, 3.0]
-
-
-def test_ai_embed_sql_uses_trusted_provider_dimension_metadata():
-    conn = vane.connect()
-    relation = conn.sql("""
-        SELECT ai_embed('abc', provider := 'mock_ai_sql') AS embedding
-    """)
-
-    assert [str(value) for value in relation.types] == ["FLOAT[4]"]
-    assert list(relation.fetchone()[0]) == [3.0, 3.0, 3.0, 3.0]
-
-
-def test_ai_embed_sql_unknown_model_requires_explicit_dimensions():
-    conn = vane.connect()
-
-    with pytest.raises(Exception, match="without network or model loading.*dimensions"):
-        conn.sql("""
-            SELECT ai_embed(
-                'abc',
-                provider := 'openai',
-                model := 'compatible-endpoint-model'
-            )
-        """)
-
-
-def test_ai_embed_sql_rejects_vllm_provider():
-    conn = vane.connect()
-
-    with pytest.raises(Exception, match="not an embedding provider"):
-        conn.sql("""
-            SELECT ai_embed(
-                'hello',
                 provider := 'vllm',
-                dimensions := 4
+                on_error := 'ignore'
             )
         """).fetchall()
 
 
-def test_ai_sql_options_must_be_constant():
-    conn = vane.connect()
-
-    with pytest.raises(Exception, match="options.*constant|must be constant"):
-        conn.sql("""
-            SELECT ai_prompt(chunk, struct_pack(provider := provider_name))
-            FROM (VALUES ('alpha', 'mock_ai_sql')) AS t(chunk, provider_name)
-        """).fetchall()
-
-
-@pytest.mark.parametrize(
-    "options_sql",
-    [
-        "42",
-        "'{}'::JSON",
-        "map(['actor_number'], [1])",
-        "'actor_number=1'",
-    ],
-)
-def test_ai_embed_sql_options_must_be_struct_or_null(options_sql):
-    conn = vane.connect()
-
-    with pytest.raises(Exception, match="options.*STRUCT"):
-        conn.sql(f"""
-            SELECT ai_embed(
-                'abc',
-                provider := 'mock_ai_sql',
-                dimensions := 4,
-                options := {options_sql}
-            )
-        """).fetchall()
-
-
-def test_ai_embed_sql_struct_options_must_be_foldable():
-    conn = vane.connect()
-
-    with pytest.raises(Exception, match="options.*constant"):
-        conn.sql("""
-            SELECT ai_embed(
-                chunk,
-                provider := 'mock_ai_sql',
-                dimensions := 4,
-                options := struct_pack(normalize := length(chunk) > 0)
-            )
-            FROM (VALUES ('abc')) AS t(chunk)
-        """).fetchall()
-
-
-@pytest.mark.parametrize("argument", ["provider", "model", "dimensions", "on_error"])
-def test_ai_embed_sql_call_level_arguments_must_be_foldable(argument):
-    conn = vane.connect()
-    arguments = {
-        "provider": "'mock_ai_sql'",
-        "model": "'model'",
-        "dimensions": "4",
-        "on_error": "'raise'",
-    }
-    arguments[argument] = {
-        "provider": "provider_name",
-        "model": "model_name",
-        "dimensions": "dimension_count",
-        "on_error": "error_mode",
-    }[argument]
-
-    with pytest.raises(Exception, match=rf"{argument}.*constant"):
-        conn.sql(f"""
-            SELECT ai_embed(
-                chunk,
-                provider := {arguments["provider"]},
-                model := {arguments["model"]},
-                dimensions := {arguments["dimensions"]},
-                on_error := {arguments["on_error"]}
-            )
-            FROM (VALUES ('abc', 'mock_ai_sql', 'model', 4, 'raise'))
-                AS t(chunk, provider_name, model_name, dimension_count, error_mode)
-        """).fetchall()
-
-
-def test_ai_embed_sql_rejects_removed_options_and_old_overload():
-    conn = vane.connect()
-
-    with pytest.raises(Exception, match="concurrency"):
-        conn.sql("""
-            SELECT ai_embed(
-                'abc',
-                provider := 'mock_ai_sql',
-                dimensions := 4,
-                options := struct_pack(concurrency := 1)
-            )
-        """).fetchall()
-
-    with pytest.raises(Exception, match="does not support|Candidate macros|VARCHAR"):
-        conn.sql("""
-            SELECT ai_embed(
-                'abc',
-                struct_pack(provider := 'mock_ai_sql', dimensions := 4)
-            )
-        """).fetchall()
-
-
-@pytest.mark.parametrize(
-    "option",
-    [
-        "actor_number",
-        "batch_size",
-        "batch_token_limit",
-        "max_retries",
-        "concurrency",
-        "max_api_concurrency",
-        "max_concurrency_per_actor",
-        "unknown_embed_option",
-    ],
-)
-def test_ai_embed_sql_explicit_null_does_not_bypass_option_validation(option):
-    conn = vane.connect()
-
-    with pytest.raises(Exception, match=option):
-        conn.sql(f"""
-            SELECT ai_embed(
-                'abc',
-                dimensions := 4,
-                options := struct_pack({option} := NULL)
-            )
-        """)
-
-
-def test_ai_embed_sql_preserves_nullable_options_as_omitted_values():
-    conn = vane.connect()
-    relation = conn.sql("""
-        SELECT ai_embed(
-            'abc',
-            dimensions := 4,
-            options := struct_pack(
-                base_url := NULL::VARCHAR,
-                timeout := NULL::DOUBLE,
-                input_text_token_limit := NULL::INTEGER
-            )
-        ) AS embedding
-    """)
-
-    assert [str(value) for value in relation.types] == ["FLOAT[4]"]
-
-
-def test_ai_prompt_sql_explain_uses_native_actor_backend(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    conn = vane.connect()
-
-    plan = conn.sql("""
-        EXPLAIN SELECT ai_prompt(
-            chunk,
-            struct_pack(provider := 'mock_ai_sql', concurrency := 1)
-        )
-        FROM (VALUES ('alpha')) AS t(chunk)
-    """).fetchall()
-    text = "\n".join(str(row) for row in plan)
-
-    assert "subprocess_actor" in text
-    assert "actor_number: 1" in text
-
-
-def test_ai_prompt_sql_explain_uses_ray_actor_backend(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "ray")
-    conn = vane.connect()
-
-    plan = conn.sql("""
-        EXPLAIN SELECT ai_prompt(
-            chunk,
-            struct_pack(provider := 'mock_ai_sql', concurrency := 1)
-        )
-        FROM (VALUES ('alpha')) AS t(chunk)
-    """).fetchall()
-    text = "\n".join(str(row) for row in plan)
-
-    assert "ray_actor" in text
-    assert "actor_number: 1" in text
-
-
-def test_ai_prompt_sql_vllm_explain_uses_native_operator():
-    conn = vane.connect()
-
-    plan = conn.sql("""
-        EXPLAIN SELECT ai_prompt(
-            chunk,
-            struct_pack(
-                provider := 'vllm',
-                model := 'recording-model',
-                concurrency := 2,
-                batch_size := 1
-            )
-        )
-        FROM (VALUES ('alpha')) AS t(chunk)
-    """).fetchall()
-    text = "\n".join(str(row) for row in plan)
-
-    assert "VLLM_PROJECT" in text
-    assert "subprocess_actor" not in text
-    assert "ray_actor" not in text
-
-
-def test_ai_prompt_sql_vllm_reuses_one_native_executor_across_batches(monkeypatch):
+def test_ai_prompt_sql_vllm_uses_one_native_executor_and_skips_null_rows(monkeypatch):
     import duckdb.execution.vllm as vllm_executor
 
     executor = RecordingNativeVLLMExecutor()
@@ -1147,20 +478,21 @@ def test_ai_prompt_sql_vllm_reuses_one_native_executor_across_batches(monkeypatc
     monkeypatch.setattr(vllm_executor, "build_executor", build_executor)
     conn = vane.connect()
     conn.execute("PRAGMA threads=1")
+
     rows = conn.sql("""
         SELECT id, ai_prompt(
-            chunk,
-            struct_pack(
-                provider := 'vllm',
-                model := 'recording-model',
-                system_message := 'Answer briefly.',
-                concurrency := 2,
+            prompt,
+            system_message := 'Answer briefly.',
+            provider := 'vllm',
+            model := 'recording-model',
+            on_error := 'ignore',
+            options := struct_pack(
+                actor_number := 2,
                 batch_size := 1,
-                do_prefix_routing := false,
-                on_error := 'ignore'
+                do_prefix_routing := false
             )
         ) AS response
-        FROM (VALUES (1, 'alpha'), (2, NULL), (3, 'beta')) AS t(id, chunk)
+        FROM (VALUES (1, 'alpha'), (2, NULL), (3, 'beta')) AS source(id, prompt)
         ORDER BY id
     """).fetchall()
 
@@ -1174,204 +506,133 @@ def test_ai_prompt_sql_vllm_reuses_one_native_executor_across_batches(monkeypatc
     assert builds[0][1]["concurrency"] == 2
     assert builds[0][1]["batch_size"] == 1
     assert builds[0][1]["on_error"] == "null"
-    assert sorted(prompts for _, prompts in executor.submissions) == sorted(
-        [
-            ("Answer briefly.\n\nalpha",),
-            ("Answer briefly.\n\nbeta",),
-        ]
-    )
     assert executor.finished_count == 1
     assert executor.shutdown_count == 1
 
 
-def test_ai_sql_helper_builds_prompt_spec_without_execution():
-    from vane.ai._sql import build_ai_prompt_sql_spec
+def test_ai_prompt_sql_vllm_survives_plan_round_trip_as_native_operator(monkeypatch):
+    import duckdb.execution.vllm as vllm_executor
 
-    spec = build_ai_prompt_sql_spec({"provider": "mock_ai_sql", "concurrency": 1})
+    executor = RecordingNativeVLLMExecutor()
+    monkeypatch.setattr(vllm_executor, "build_executor", lambda model, options: executor)
+    source = vane.connect()
+    relation = source.sql("""
+        SELECT ai_prompt(
+            prompt,
+            provider := 'vllm',
+            model := 'round-trip-vllm',
+            options := struct_pack(batch_size := 1, do_prefix_routing := false)
+        ) AS response
+        FROM (VALUES ('alpha'), ('beta')) AS source(prompt)
+    """)
 
-    assert spec["name"] == "ai_prompt"
-    assert spec["input_names"] == ["messages"]
-    assert spec["schema"] == {"response": "VARCHAR"}
-    assert spec["actor_number"] == 1
-    assert spec["gpus"] == 0
+    target, physical, serialized = _round_trip_ai_plan(relation)
+    table = _execute_ai_physical_plan(target, physical)
+
+    assert physical.collect_udf_nodes() == []
+    assert table.column(0).to_pylist() == ["native:alpha", "native:beta"]
+    assert executor.finished_count == 1
+    assert executor.shutdown_count == 1
+    assert 0 < len(serialized) < 10_000
 
 
-def test_ai_sql_helper_builds_multimodal_prompt_spec_without_execution():
+def test_ai_sql_helper_builds_prompt_specs_without_execution():
     from vane.ai._sql import build_ai_prompt_sql_spec
 
     spec = build_ai_prompt_sql_spec(
-        {"provider": "mock_ai_sql", "concurrency": 1},
-        image_input=True,
+        "mock_ai_sql",
+        "model-a",
+        "system-a",
+        "ignore",
+        {"actor_number": Decimal(2), "batch_size": Decimal(4)},
+        True,
     )
 
     assert spec["name"] == "ai_prompt"
-    assert spec["input_names"] == ["messages", "images"]
+    assert spec["input_names"] == ["message_0", "message_1"]
     assert spec["schema"] == {"response": "VARCHAR"}
-    assert spec["actor_number"] == 1
+    assert spec["actor_number"] == 2
+    assert spec["batch_size"] == 4
     assert spec["gpus"] == 0
 
 
-def test_ai_sql_helper_rejects_native_vllm_multimodal_prompt():
-    from vane.ai._sql import build_ai_prompt_sql_spec
-
-    with pytest.raises(ValueError, match="native vLLM ai_prompt does not support image inputs"):
-        build_ai_prompt_sql_spec(
-            {"provider": "vllm", "model": "recording-model"},
-            image_input=True,
-        )
-
-
-def test_ai_sql_helper_builds_native_vllm_spec_without_udf_wrapper():
-    import json
-
+def test_ai_sql_helper_builds_closed_native_vllm_spec():
     from vane.ai._sql import build_ai_prompt_sql_spec
 
     spec = build_ai_prompt_sql_spec(
+        "vllm",
+        "model-a",
+        "system-a",
+        "ignore",
         {
-            "provider": "vllm",
-            "model": "recording-model",
-            "system_message": "Answer briefly.",
-            "concurrency": Decimal(3),
+            "actor_number": Decimal(3),
             "batch_size": Decimal(4),
-            "on_error": "ignore",
-        }
+            "max_tokens": Decimal(32),
+            "generate_args": {"sampling_params": {"max_tokens": Decimal(8)}},
+        },
     )
-    native_options = json.loads(spec["options_json"])
+    native = json.loads(spec["options_json"])
 
     assert spec["execution_kind"] == "native_vllm"
-    assert spec["model"] == "recording-model"
-    assert spec["system_message"] == "Answer briefly."
+    assert spec["model"] == "model-a"
+    assert spec["system_message"] == "system-a"
     assert "function" not in spec
-    assert native_options["concurrency"] == 3
-    assert native_options["batch_size"] == 4
-    assert native_options["on_error"] == "null"
-    assert "actor_number" not in native_options
+    assert native["concurrency"] == 3
+    assert native["batch_size"] == 4
+    assert native["generate_args"]["sampling_params"]["max_tokens"] == 8
+    assert native["on_error"] == "null"
 
 
-def test_ai_sql_helper_rejects_vllm_udf_retry_policy():
-    from vane.ai._sql import build_ai_prompt_sql_spec
-
-    with pytest.raises(ValueError, match="native vLLM ai_prompt does not support max_retries"):
-        build_ai_prompt_sql_spec({"provider": "vllm", "max_retries": Decimal(1)})
-
-
-def test_ai_sql_helper_rejects_non_json_vllm_options_with_path():
-    from vane.ai._sql import build_ai_prompt_sql_spec
-
-    with pytest.raises(TypeError, match=r"engine_args\.dtype.*JSON-compatible.*object"):
-        build_ai_prompt_sql_spec(
-            {
-                "provider": "vllm",
-                "engine_args": {"dtype": object()},
-            }
-        )
-
-
-def test_ai_sql_helper_normalizes_decimal_sql_options(monkeypatch):
-    from vane.ai._sql import build_ai_prompt_sql_spec
-
-    captured: dict[str, object] = {}
-
-    class CapturingProvider(MockProvider):
-        def get_prompter(self, model: str | None = None, **options: object):
-            captured.update(options)
-            return super().get_prompter(model=model, **options)
-
-    monkeypatch.setitem(provider_registry.PROVIDERS, "capture_ai_sql", lambda name=None, **options: CapturingProvider())
-
-    build_ai_prompt_sql_spec(
-        {
-            "provider": "capture_ai_sql",
-            "concurrency": Decimal("1"),
-            "timeout": Decimal("90.0"),
-            "max_tokens": Decimal("32"),
-            "max_api_concurrency": Decimal("2"),
-            "temperature": Decimal("0.25"),
-        }
-    )
-
-    assert type(captured["actor_number"]) is int
-    assert captured["actor_number"] == 1
-    assert type(captured["timeout"]) is float
-    assert captured["timeout"] == 90.0
-    assert type(captured["max_tokens"]) is int
-    assert captured["max_tokens"] == 32
-    assert type(captured["max_api_concurrency"]) is int
-    assert captured["max_api_concurrency"] == 2
-    assert type(captured["temperature"]) is float
-    assert captured["temperature"] == 0.25
-
-
-def test_ai_sql_helper_builds_embed_spec_with_fixed_dimensions():
-    from vane.ai._sql import build_ai_embed_sql_spec
-
-    spec = build_ai_embed_sql_spec(
-        "mock_ai_sql",
-        dimensions=4,
-        options={"actor_number": 1},
-    )
-
-    assert spec["name"] == "ai_embed"
-    assert spec["input_names"] == ["text"]
-    assert spec["schema"] == {"embedding": "FLOAT[4]"}
-    assert spec["actor_number"] == 1
-
-
-def test_ai_prompt_sql_batch_size_maps_to_spec_not_provider(monkeypatch):
-    from vane.ai import _sql as ai_sql
-
-    captured: dict[str, object] = {}
-
-    class RecordingProvider(MockProvider):
-        def get_prompter(self, model: str | None = None, **options: object):
-            captured.update(options)
-            return super().get_prompter(model=model, **options)
-
-    monkeypatch.setitem(provider_registry.PROVIDERS, "mock_ai_sql", lambda name=None, **options: RecordingProvider())
-
-    spec = ai_sql.build_ai_prompt_sql_spec({"provider": "mock_ai_sql", "batch_size": Decimal(8)})
-
-    assert spec["batch_size"] == 8
-    assert "batch_size" not in captured
-
-
-def test_ai_embed_sql_batch_size_and_max_retries_map_to_spec_not_provider(monkeypatch):
-    from vane.ai import _sql as ai_sql
-
-    captured: dict[str, object] = {}
-
-    class RecordingProvider(MockProvider):
-        def get_text_embedder(
-            self,
-            model: str | None = None,
-            dimensions: int | None = None,
-            **options: object,
-        ):
-            captured.update(options)
-            return super().get_text_embedder(model=model, dimensions=dimensions, **options)
-
-    monkeypatch.setitem(provider_registry.PROVIDERS, "mock_ai_sql", lambda name=None, **options: RecordingProvider())
-
-    spec = ai_sql.build_ai_embed_sql_spec(
-        "mock_ai_sql",
-        dimensions=4,
-        options={"batch_size": Decimal(4), "max_retries": Decimal(0)},
-    )
-
-    assert spec["batch_size"] == 4
-    assert "batch_size" not in captured
-    assert "max_retries" not in captured
-
-
-def test_ai_prompt_sql_with_batch_size_executes(mock_ai_provider):
+def test_ai_embed_sql_fixed_dimensions_and_null_contract_are_preserved():
     conn = vane.connect()
-    rows = conn.sql("""
-        SELECT ai_prompt(
-            chunk,
-            struct_pack(provider := 'mock_ai_sql', concurrency := 1, batch_size := 2)
-        ) AS topic
-        FROM (VALUES ('alpha'), ('beta'), ('gamma')) AS t(chunk)
-        ORDER BY chunk
-    """).fetchall()
+    relation = conn.sql("""
+        SELECT ai_embed(
+            text,
+            provider := 'mock_ai_sql',
+            dimensions := 4,
+            options := struct_pack(actor_number := 1)
+        ) AS embedding
+        FROM (VALUES ('abc'), (NULL::VARCHAR)) AS source(text)
+    """)
 
-    assert rows == [("topic:alpha",), ("topic:beta",), ("topic:gamma",)]
+    assert [str(value) for value in relation.types] == ["FLOAT[4]"]
+    rows = relation.fetchall()
+    assert list(rows[0][0]) == [3.0, 3.0, 3.0, 3.0]
+    assert rows[1][0] is None
+
+
+def test_ai_embed_sql_survives_plan_round_trip():
+    source = vane.connect()
+    relation = source.sql("""
+        SELECT ai_embed(
+            'abc',
+            provider := 'mock_ai_sql',
+            model := 'round-trip-embed',
+            dimensions := 4,
+            options := struct_pack(actor_number := 1, normalize := true)
+        ) AS embedding
+    """)
+
+    target, physical, _ = _round_trip_ai_plan(relation)
+    node = physical.collect_udf_nodes()[0]
+    table = _execute_ai_physical_plan(target, physical)
+
+    assert node["payload"]["ai_provider"] == "mock_ai_sql"
+    assert node["payload"]["ai_model"] == "round-trip-embed"
+    assert node["payload"]["ai_dimensions"] == 4
+    assert table.schema.field(0).type.list_size == 4
+    assert np.linalg.norm(table.column(0).to_pylist()[0]) == pytest.approx(1.0)
+
+
+def test_ai_embed_sql_keeps_closed_options_contract():
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match="Unsupported Embed option"):
+        conn.sql("""
+            SELECT ai_embed(
+                'abc',
+                provider := 'mock_ai_sql',
+                dimensions := 4,
+                options := struct_pack(provider := 'mock_ai_sql')
+            )
+        """).fetchall()

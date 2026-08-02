@@ -14,6 +14,7 @@ import pyarrow as pa
 import duckdb
 import vane
 from vane.ai.protocols import (
+    PrompterDescriptor,
     TextClassifierDescriptor,
     TextEmbedderDescriptor,
 )
@@ -21,7 +22,7 @@ from vane.ai.provider import Provider
 from vane.ai.typing import EmbeddingDimensions
 
 if TYPE_CHECKING:
-    from vane.ai.protocols import TextClassifier, TextEmbedder
+    from vane.ai.protocols import Prompter, TextClassifier, TextEmbedder
     from vane.ai.typing import Options
 
 # ---------------------------------------------------------------------------
@@ -77,6 +78,26 @@ class MockTextClassifierDescriptor(TextClassifierDescriptor):
         return MockTextClassifier()
 
 
+class MockPrompter:
+    async def prompt(self, messages: tuple[object, ...]) -> str:
+        return "prompt:" + ":".join(part if isinstance(part, str) else bytes(part).hex() for part in messages)
+
+
+@dataclass
+class MockPrompterDescriptor(PrompterDescriptor):
+    def get_provider(self) -> str:
+        return "mock"
+
+    def get_model(self) -> str:
+        return "mock-prompter"
+
+    def get_options(self) -> Options:
+        return {"batch_size": 2}
+
+    def instantiate(self) -> Prompter:
+        return MockPrompter()
+
+
 class MockProvider(Provider):
     @property
     def name(self) -> str:
@@ -88,6 +109,9 @@ class MockProvider(Provider):
     def get_text_classifier(self, model=None, **options):
         return MockTextClassifierDescriptor()
 
+    def get_prompter(self, model=None, system_message=None, **options):
+        return MockPrompterDescriptor()
+
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -95,7 +119,7 @@ class MockProvider(Provider):
 
 
 class TestRelationPatch:
-    """Verify .embed() and .classify_text() work as relation methods."""
+    """Verify the AI relation methods execute and preserve source columns."""
 
     def test_embed_on_relation(self):
         """rel.embed() preserves source columns and appends embeddings."""
@@ -119,6 +143,28 @@ class TestRelationPatch:
         assert len(rows) == 2
         for row in rows:
             assert row[0] == "positive"
+
+    def test_prompt_on_relation(self):
+        conn = vane.connect()
+        rel = conn.sql("SELECT 1 AS id, 'hello' AS text, from_hex('89504e47') AS image")
+
+        result = rel.prompt(
+            [vane.col("text"), vane.col("image")],
+            provider=MockProvider(),
+            output_column="answer",
+        )
+
+        assert result.columns == ["id", "text", "image", "answer"]
+        assert result.fetchone() == (1, "hello", bytes.fromhex("89504e47"), "prompt:hello:89504e47")
+
+    def test_prompt_replaces_existing_output_column(self):
+        conn = vane.connect()
+        rel = conn.sql("SELECT 'hello' AS text, 'old' AS response")
+
+        result = rel.prompt(vane.col("text"), provider=MockProvider())
+
+        assert result.columns == ["text", "response"]
+        assert result.fetchone() == ("hello", "prompt:hello")
 
     def test_methods_exist_on_relation(self):
         """DuckDBPyRelation has the patched methods."""

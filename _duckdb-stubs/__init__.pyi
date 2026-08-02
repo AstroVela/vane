@@ -21,7 +21,7 @@ if typing.TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence, Mapping
     from duckdb import sqltypes, func
     from builtins import list as lst  # needed to avoid mypy error on DuckDBPyRelation.list method shadowing
-    from vane.ai.options import EmbedOptions
+    from vane.ai.options import EmbedOptions, PromptOptions
     from vane.ai.provider import Provider
 
     # the field_ids argument to to_parquet and write_parquet has a recursive structure
@@ -573,6 +573,17 @@ class DuckDBPyRelation:
         on_error: typing.Literal["raise", "ignore"] = "raise",
         output_column: str = "embedding",
         **options: Unpack[EmbedOptions],
+    ) -> DuckDBPyRelation: ...
+    def prompt(
+        self,
+        messages: Expression | lst[Expression],
+        *,
+        system_message: str | None = None,
+        provider: str | Provider = "openai",
+        model: str | None = None,
+        on_error: typing.Literal["raise", "ignore"] = "raise",
+        output_column: str = "response",
+        **options: Unpack[PromptOptions],
     ) -> DuckDBPyRelation: ...
     def except_(self, other_rel: DuckDBPyRelation) -> DuckDBPyRelation: ...
     def execute(self) -> DuckDBPyRelation: ...

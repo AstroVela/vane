@@ -37,8 +37,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import time
+from collections.abc import Mapping
 from typing import Any, Literal, overload
 
 import numpy as np
@@ -50,16 +50,10 @@ from vane._expression_udf import _build_actor_map_batches_expression, _build_map
 from vane._expressions import as_expression, is_expression
 from vane._typing import Expression, Relation
 from vane.ai.options import (
-    AnthropicPromptOptions,
-    AnthropicProviderOptions,
     EmbedOptions,
-    GooglePromptOptions,
-    GoogleProviderOptions,
-    OpenAIPromptOptions,
-    OpenAIProviderOptions,
-    VLLMPromptOptions,
-    VLLMProviderOptions,
+    PromptOptions,
     validate_embed_options,
+    validate_prompt_options,
 )
 from vane.ai.protocols import NativePrompterPlan
 from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError, load_provider
@@ -321,20 +315,6 @@ def _map_batches_kwargs(
     if extra:
         kwargs.update(extra)
     return kwargs
-
-
-def _merge_options(*objects: Any) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    for obj in objects:
-        if obj is None:
-            continue
-        if hasattr(obj, "to_descriptor_options"):
-            merged.update(obj.to_descriptor_options())
-        elif isinstance(obj, dict):
-            merged.update(obj)
-        else:
-            raise TypeError(f"Unsupported AI options object: {type(obj).__name__}")
-    return merged
 
 
 def _embedding_provider_family(provider: Any) -> str | None:
@@ -846,41 +826,25 @@ class _ClassifyTextBatch:
 
 
 class _PromptBatch:
-    """Stateful wrapper for LLM prompting.
-
-    Supports both plain text and structured output (Pydantic models).
-    When ``return_format`` is set, responses are serialized to JSON strings.
-    When ``image_columns`` is set, image data from those columns is packed
-    alongside text into multimodal message tuples. List-valued image cells are
-    expanded in order and NULL or zero-length image values are skipped.
-
-    Async execution is driven exclusively through an executor-bound
-    ``run_async`` capability (see ``UDFExecutor._bind_async_runtime``); the
-    wrapper never creates event loops or threads. The provider runtime is
-    instantiated inside the bound loop so its async SDK client binds to the
-    loop that serves every batch, and ``close()`` releases the client on
-    that same loop at actor shutdown.
-    """
+    """Stateful row-preserving wrapper for ordered text/image Prompt parts."""
 
     def __init__(
         self,
         descriptor: Any,
-        column: str,
+        message_columns: list[str],
         output_column: str,
-        max_api_concurrency: int | None = None,
-        return_format: Any | None = None,
-        image_columns: list[str] | None = None,
-        propagate_null_prompts: bool = False,
+        max_concurrency_per_actor: int | None = None,
+        single_message: bool = False,
         max_retries: int = 3,
         on_error: _OnError = "raise",
     ) -> None:
+        if not message_columns:
+            raise ValueError("Prompt message_columns cannot be empty")
         self._descriptor = descriptor
-        self._column = column
+        self._message_columns = list(message_columns)
         self._output_column = output_column
-        self._max_api_concurrency = max_api_concurrency
-        self._return_format = return_format
-        self._image_columns = image_columns or []
-        self._propagate_null_prompts = propagate_null_prompts
+        self._max_concurrency_per_actor = max_concurrency_per_actor
+        self._single_message = single_message
         self._max_retries = max_retries
         self._on_error: _OnError = on_error
         self._prompter = None  # lazy: instantiate on first __call__
@@ -943,153 +907,110 @@ class _PromptBatch:
         state["_prompter_loop_bound"] = False  # recomputed on next _ensure_prompter()
         return state
 
-    def _serialize_result(self, result: Any) -> str | None:
-        """Convert a prompt result to a string for the output column."""
-        if result is None:
-            return None
-        if isinstance(result, str):
-            return result
-        # Structured output — Pydantic model or dict
-        if hasattr(result, "model_dump_json"):
-            return result.model_dump_json()
-        if hasattr(result, "json"):
-            return result.json()
+    @staticmethod
+    def _append_message_value(parts: list[Any], value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, str):
+            parts.append(value)
+            return
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            image = bytes(value)
+            if not image:
+                raise ValueError("Prompt image BLOB cannot be zero length")
+            parts.append(image)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                if item is None:
+                    continue
+                if not isinstance(item, (bytes, bytearray, memoryview)):
+                    raise TypeError("Prompt BLOB[] content must contain only BLOB or NULL values")
+                image = bytes(item)
+                if not image:
+                    raise ValueError("Prompt image BLOB cannot be zero length")
+                parts.append(image)
+            return
+        raise TypeError(
+            f"Prompt messages expressions must produce VARCHAR, BLOB, or BLOB[] values; got {type(value).__name__}"
+        )
 
-        return json.dumps(result, default=str)
+    def _build_row_messages(self, columns: list[list[Any]], index: int) -> tuple[Any, ...] | None:
+        if self._single_message and columns[0][index] is None:
+            return None
+        parts: list[Any] = []
+        for column in columns:
+            self._append_message_value(parts, column[index])
+        return tuple(parts) if parts else None
+
+    @staticmethod
+    def _validate_result(result: Any) -> str | None:
+        if result is None or isinstance(result, str):
+            return result
+        raise _ProviderResultError(
+            f"Prompt provider returned {type(result).__name__}; basic Prompt results must be text or NULL"
+        )
 
     def __call__(self, table: pa.Table) -> pa.Table:
-        texts = table.column(self._column).to_pylist()
-        active_indices = [idx for idx, text in enumerate(texts) if not (self._propagate_null_prompts and text is None)]
-        results: list[Any] = [None] * len(texts)
-        if self._propagate_null_prompts and not active_indices:
+        columns = [table.column(name).to_pylist() for name in self._message_columns]
+        row_count = table.num_rows
+        results: list[str | None] = [None] * row_count
+        row_messages: dict[int, tuple[Any, ...]] = {}
+        for index in range(row_count):
+            try:
+                messages = self._build_row_messages(columns, index)
+            except Exception:
+                if self._on_error == "raise":
+                    raise
+                continue
+            if messages is not None:
+                row_messages[index] = messages
+
+        if not row_messages:
             return pa.table({self._output_column: pa.array(results, type=pa.string())})
 
-        self._ensure_prompter()
-        texts = [t if t is not None else "" for t in texts]
-
-        # Build per-row message tuples (text + optional image columns)
-        image_lists: list[list[Any]] = [table.column(col_name).to_pylist() for col_name in self._image_columns]
-
-        def has_image_data(value: Any) -> bool:
-            if value is None:
-                return False
-            if isinstance(value, (bytes, bytearray, memoryview)):
-                return len(value) > 0
-            return True
-
-        def build_messages(idx: int) -> tuple[Any, ...]:
-            parts: list[Any] = [texts[idx]]
-            for img_col in image_lists:
-                val = img_col[idx]
-                if isinstance(val, list):
-                    parts.extend(item for item in val if has_image_data(item))
-                elif has_image_data(val):
-                    parts.append(val)
-            return tuple(parts)
-
-        row_messages = [build_messages(idx) for idx in range(len(texts))]
-
-        # Keep text-only rows on the batch API (e.g. vLLM's continuous
-        # batching), even when other rows in the Arrow batch contain images.
-        prompt_batch = getattr(self._prompter, "prompt_batch", None)
-        if callable(prompt_batch):
-            text_indices = [idx for idx in active_indices if len(row_messages[idx]) == 1]
-            prompt_indices = [idx for idx in active_indices if len(row_messages[idx]) > 1]
-        else:
-            text_indices = []
-            prompt_indices = active_indices
-
-        if text_indices:
-            text_results = _retry_call(
-                prompt_batch,
-                [texts[idx] for idx in text_indices],
-                max_retries=self._max_retries,
-                on_error=self._on_error,
-                run_async=self._require_run_async(),
-                on_awaitable=self._mark_loop_bound,
-            )
-            if text_results is None:
-                text_results = [None] * len(text_indices)
-            if self._return_format is not None:
-                text_results = [self._serialize_result(result) for result in text_results]
-            for idx, result in zip(text_indices, text_results, strict=True):
-                results[idx] = result
+        prompter = self._ensure_prompter()
 
         max_retries = self._max_retries
         on_error = self._on_error
 
-        async def run_all() -> list[str | None]:
-            if self._max_api_concurrency is not None and self._max_api_concurrency > 0:
-                sem = asyncio.Semaphore(self._max_api_concurrency)
-
-                async def limited(idx: int) -> str | None:
-                    async with sem:
-                        result = await _retry_call_async(
-                            self._prompter.prompt,
-                            row_messages[idx],
-                            max_retries=max_retries,
-                            on_error=on_error,
-                            on_awaitable=self._mark_loop_bound,
-                        )
-                        return self._serialize_result(result) if self._return_format else result
-
-                return await asyncio.gather(*(limited(idx) for idx in prompt_indices))
-
-            async def single(idx: int) -> str | None:
-                result = await _retry_call_async(
-                    self._prompter.prompt,
-                    row_messages[idx],
-                    max_retries=max_retries,
-                    on_error=on_error,
-                    on_awaitable=self._mark_loop_bound,
-                )
-                return self._serialize_result(result) if self._return_format else result
-
-            return await asyncio.gather(*(single(idx) for idx in prompt_indices))
-
-        if prompt_indices:
-            prompt_results = self._require_run_async()(run_all())
-            for idx, result in zip(prompt_indices, prompt_results, strict=True):
-                results[idx] = result
-        return pa.table({self._output_column: results})
-
-
-class _ValidateVLLMStructuredOutputBatch:
-    """Apply the Pydantic runtime contract to native vLLM output."""
-
-    def __init__(
-        self,
-        return_format: Any,
-        input_column: str,
-        output_column: str,
-        on_error: _OnError,
-    ) -> None:
-        self._return_format = return_format
-        self._input_column = input_column
-        self._output_column = output_column
-        self._on_error = on_error
-
-    def __call__(self, table: pa.Table) -> pa.Table:
-        results: list[str | None] = []
-        for raw_text in table.column(self._input_column).to_pylist():
-            if raw_text is None:
-                results.append(None)
-                continue
+        async def invoke(index: int) -> str | None:
+            result = await _retry_call_async(
+                prompter.prompt,
+                row_messages[index],
+                max_retries=max_retries,
+                on_error=on_error,
+                on_awaitable=self._mark_loop_bound,
+            )
             try:
-                validated = self._return_format.model_validate_json(raw_text)
-                results.append(validated.model_dump_json())
-            except Exception:
-                if self._on_error == "raise":
+                return self._validate_result(result)
+            except _ProviderResultError:
+                if on_error == "raise":
                     raise
-                results.append(None)
+                return None
+
+        async def run_all(indices: list[int]) -> list[str | None]:
+            if self._max_concurrency_per_actor is None:
+                return await asyncio.gather(*(invoke(index) for index in indices))
+            semaphore = asyncio.Semaphore(self._max_concurrency_per_actor)
+
+            async def limited(index: int) -> str | None:
+                async with semaphore:
+                    return await invoke(index)
+
+            return await asyncio.gather(*(limited(index) for index in indices))
+
+        indices = list(row_messages)
+        prompt_results = self._require_run_async()(run_all(indices))
+        for index, result in zip(indices, prompt_results, strict=True):
+            results[index] = result
         return pa.table({self._output_column: pa.array(results, type=pa.string())})
 
 
 def _build_ai_batch_expression(
     wrapper: Any,
     *,
-    input_name: str,
-    input_expr: Any,
+    inputs: Mapping[str, Any],
     output_column: str,
     output_type: str,
     udf_opts: UDFOptions,
@@ -1103,7 +1024,7 @@ def _build_ai_batch_expression(
         return _build_actor_map_batches_expression(
             actor_callable,
             name=name,
-            inputs={input_name: as_expression(input_expr)},
+            inputs={name: as_expression(expression) for name, expression in inputs.items()},
             schema={output_column: output_type},
             batch_size=_resolve_ai_batch_size(udf_opts),
             row_preserving=True,
@@ -1119,7 +1040,7 @@ def _build_ai_batch_expression(
     return _build_map_batches_expression(
         configured,
         name=name,
-        inputs={input_name: as_expression(input_expr)},
+        inputs={name: as_expression(expression) for name, expression in inputs.items()},
         schema={output_column: output_type},
         batch_size=_resolve_ai_batch_size(udf_opts),
         row_preserving=True,
@@ -1170,8 +1091,7 @@ def _embed_expression(
     output_type = f"FLOAT[{resolved_dimensions}]"
     return _build_ai_batch_expression(
         wrapper,
-        input_name="text",
-        input_expr=_validated_embed_text(text),
+        inputs={"text": _validated_embed_text(text)},
         output_column="embedding",
         output_type=output_type,
         udf_opts=udf_opts,
@@ -1228,8 +1148,7 @@ def _embed_relation(
     output_type = f"FLOAT[{resolved_dimensions}]"
     expression = _build_ai_batch_expression(
         wrapper,
-        input_name="text",
-        input_expr=_validated_embed_text(text),
+        inputs={"text": _validated_embed_text(text)},
         output_column=output_column,
         output_type=output_type,
         udf_opts=udf_opts,
@@ -1414,9 +1333,148 @@ def classify_text(
 # ---------------------------------------------------------------------------
 
 
-def _build_native_vllm_expression(messages: Any, descriptor: NativeVLLMPromptPlan) -> duckdb.Expression:
+def _prompt_provider_family(provider: Any) -> str | None:
+    module = type(provider).__module__
+    families = {
+        "vane.ai.providers.openai": "openai",
+        "vane.ai.providers.anthropic": "anthropic",
+        "vane.ai.providers.google": "google",
+        "vane.ai.providers.vllm": "vllm",
+    }
+    if module in families:
+        return families[module]
+    name = getattr(provider, "name", None)
+    if isinstance(name, str) and name.casefold() in {"openai", "anthropic", "google", "vllm"}:
+        return name.casefold()
+    return None
+
+
+_BUILTIN_PROMPT_PROVIDER_SENSITIVE_FIELDS = {
+    "vane.ai.providers.openai": ("_options", frozenset({"api_key", "organization"})),
+    "vane.ai.providers.anthropic": ("_client_options", frozenset({"api_key"})),
+    "vane.ai.providers.google": ("_options", frozenset({"api_key"})),
+}
+
+
+def _reject_builtin_prompt_provider_credentials(provider: Provider) -> None:
+    configured_rule = _BUILTIN_PROMPT_PROVIDER_SENSITIVE_FIELDS.get(type(provider).__module__)
+    if configured_rule is None:
+        return
+    attribute, sensitive_fields = configured_rule
+    configured = getattr(provider, attribute, None)
+    if not isinstance(configured, dict):
+        return
+    offending = sorted(field for field in sensitive_fields if configured.get(field) is not None)
+    if not offending:
+        return
+    label = "field" if len(offending) == 1 else "fields"
+    raise ValueError(
+        f"Prompt provider configuration cannot include inline credential or sensitive {label}: "
+        f"{', '.join(offending)}; configure credentials through the environment or runtime secret management"
+    )
+
+
+def _prepare_prompt_call(
+    provider: Any,
+    model: str | None,
+    system_message: str | None,
+    on_error: str,
+    options: dict[str, Any],
+    *,
+    relation: bool,
+) -> tuple[Any, UDFOptions, str | None]:
+    """Resolve one basic Prompt call without endpoint or model I/O."""
+
+    if provider is None:
+        raise TypeError("provider must be a provider name or Provider object, not None")
+    if model is not None and (not isinstance(model, str) or not model.strip()):
+        raise ValueError("model must be a non-empty string or None")
+    if system_message is not None and not isinstance(system_message, str):
+        raise TypeError("system_message must be a string or None")
+    if on_error not in {"raise", "ignore"}:
+        raise ValueError("on_error must be 'raise' or 'ignore'")
+
+    resolved_provider = _resolve_provider(provider, "openai")
+    if not isinstance(resolved_provider, Provider):
+        raise TypeError("provider must be a provider name or Provider object")
+    _reject_builtin_prompt_provider_credentials(resolved_provider)
+    family = _prompt_provider_family(resolved_provider)
+    prepared = validate_prompt_options(family, options, relation=relation)
+
+    execution_backend = prepared.pop("execution_backend", None)
+    batch_size = prepared.pop("batch_size", None)
+    actor_number = prepared.pop("actor_number", None)
+    max_concurrency = prepared.pop("max_concurrency_per_actor", None)
+    max_retries = prepared.pop("max_retries", None)
+
+    if family == "vllm":
+        prepared["actor_number"] = actor_number if actor_number is not None else 1
+        prepared["batch_size"] = batch_size if batch_size is not None else 128
+        prepared["max_retries"] = max_retries if max_retries is not None else 0
+
+    try:
+        descriptor = resolved_provider.get_prompter(
+            model=model,
+            system_message=system_message,
+            **prepared,
+        )
+    except NotImplementedError as exc:
+        provider_name = getattr(resolved_provider, "name", type(resolved_provider).__name__)
+        raise ValueError(f"Provider {provider_name!r} is not a prompt provider") from exc
+
+    if isinstance(descriptor, NativeVLLMPromptPlan):
+        descriptor.on_error = on_error
+        return descriptor, UDFOptions(on_error=on_error), execution_backend
+    if isinstance(descriptor, NativePrompterPlan):
+        return descriptor, UDFOptions(on_error=on_error), execution_backend
+
+    udf_options = descriptor.get_udf_options()
+    udf_options.on_error = on_error
+    udf_options.actor_number = actor_number if actor_number is not None else 1
+    udf_options.batch_size = batch_size if batch_size is not None else 32
+    udf_options.max_retries = max_retries if max_retries is not None else 3
+    if max_concurrency is not None:
+        udf_options.max_concurrency_per_actor = max_concurrency
+    elif udf_options.max_concurrency_per_actor is None:
+        udf_options.max_concurrency_per_actor = (
+            32 if family == "openai" else 16 if family in {"anthropic", "google"} else None
+        )
+    return descriptor, udf_options, execution_backend
+
+
+def _normalize_prompt_messages(messages: Any) -> tuple[list[Any], bool]:
+    if is_expression(messages):
+        return [messages], True
+    if not isinstance(messages, list):
+        raise TypeError("Prompt messages must be an Expression or a non-empty list of Expressions")
+    if not messages:
+        raise ValueError("Prompt messages list cannot be empty")
+    for index, expression in enumerate(messages):
+        if not is_expression(expression):
+            raise TypeError(f"Prompt messages[{index}] must be an Expression")
+    return list(messages), False
+
+
+def _prompt_relation_types(rel: Any, messages: list[Any]) -> list[str]:
+    types = [str(value).upper() for value in rel.select(*messages).types]
+    allowed = {"VARCHAR", "BLOB", "BLOB[]"}
+    for index, value in enumerate(types):
+        if value not in allowed:
+            raise TypeError(f"Prompt messages[{index}] must have type VARCHAR, BLOB, or BLOB[]; got {value}")
+    return types
+
+
+def _build_native_vllm_expression(messages: list[Any], descriptor: NativeVLLMPromptPlan) -> duckdb.Expression:
     """Build the native row-preserving ``vllm()`` expression."""
-    messages_expr = as_expression(messages)
+    message_expressions = [as_expression(message) for message in messages]
+    if len(message_expressions) == 1:
+        messages_expr = message_expressions[0]
+    else:
+        any_present = message_expressions[0].isnotnull()
+        for expression in message_expressions[1:]:
+            any_present = any_present | expression.isnotnull()
+        combined = duckdb.FunctionExpression("concat", *message_expressions)
+        messages_expr = duckdb.CaseExpression(any_present, combined)
     if descriptor.system_message:
         # Unlike concat(), the || operator propagates NULL inputs.
         messages_expr = duckdb.FunctionExpression(
@@ -1437,255 +1495,215 @@ def _build_native_vllm_expression(messages: Any, descriptor: NativeVLLMPromptPla
 
 def _prompt_relation(
     rel: Any,
-    column: str,
+    messages: Any,
     *,
-    image_columns: list[str] | None = None,
-    provider: str | Provider | None = "openai",
+    provider: Any,
     model: str | None = None,
-    provider_options: (
-        OpenAIProviderOptions
-        | VLLMProviderOptions
-        | AnthropicProviderOptions
-        | GoogleProviderOptions
-        | dict[str, Any]
-        | None
-    ) = None,
-    prompt_options: (
-        OpenAIPromptOptions | VLLMPromptOptions | AnthropicPromptOptions | GooglePromptOptions | dict[str, Any] | None
-    ) = None,
     system_message: str | None = None,
-    return_format: Any | None = None,
-    use_chat_completions: bool = True,
+    on_error: str = "raise",
     output_column: str = "response",
-    execution_backend: str | None = None,
-    **options: Any,
+    options: dict[str, Any],
 ) -> Any:
-    """Generate responses for a relation column via ``rel.map_batches()``.
+    if not _is_relation_like(rel):
+        raise TypeError("vane.ai.prompt relation API requires a Relation")
+    message_expressions, single_message = _normalize_prompt_messages(messages)
+    message_types = _prompt_relation_types(rel, message_expressions)
+    if not isinstance(output_column, str) or not output_column.strip():
+        raise ValueError("output_column must be a non-empty string")
 
-    ``execution_backend`` is optional for Python UDF providers; native vLLM
-    prompting rejects it because execution is owned by the query runner.
-    Prefer provider environment variables such as ``OPENAI_API_KEY``,
-    ``ANTHROPIC_API_KEY``, or ``GOOGLE_API_KEY`` over passing API keys in call
-    options.
-    """
-    prov = _resolve_provider(provider, "openai")
-    prompter_kwargs: dict[str, Any] = {
-        "model": model,
-        "system_message": system_message,
-    }
-    if return_format is not None:
-        prompter_kwargs["return_format"] = return_format
-    if not use_chat_completions:
-        prompter_kwargs["use_chat_completions"] = False
-    prompter_kwargs.update(_merge_options(provider_options, prompt_options, options))
-
-    try:
-        descriptor = prov.get_prompter(**prompter_kwargs)
-    except NotImplementedError as exc:
-        raise ValueError(f"Provider {provider!r} is not a prompt provider") from exc
+    descriptor, udf_options, execution_backend = _prepare_prompt_call(
+        provider,
+        model,
+        system_message,
+        on_error,
+        options,
+        relation=True,
+    )
 
     if isinstance(descriptor, NativeVLLMPromptPlan):
-        if image_columns:
-            raise ValueError("native vLLM prompting does not support image_columns")
-        if execution_backend is not None:
-            raise ValueError(
-                "execution_backend applies only to Python UDF providers; "
-                "native vLLM routing is derived from the query runner"
-            )
-        relation_alias = getattr(rel, "alias", None)
-        column_expr = (
-            duckdb.ColumnExpression(relation_alias, column)
-            if isinstance(relation_alias, str) and relation_alias
-            else duckdb.ColumnExpression(column)
+        if any(value != "VARCHAR" for value in message_types):
+            raise ValueError("Provider 'vllm' does not support Prompt image inputs")
+        expression = _build_native_vllm_expression(message_expressions, descriptor).alias(output_column)
+        star = (
+            duckdb.StarExpression(exclude=[output_column]) if output_column in rel.columns else duckdb.StarExpression()
         )
-        expression = _build_native_vllm_expression(column_expr, descriptor)
-        native_return_format = descriptor.return_format
-        if hasattr(native_return_format, "model_validate"):
-            input_column = "__vane_vllm_response"
-            raw_on_error = descriptor.vllm_options.get("on_error", "raise")
-            validation_on_error: _OnError = (
-                "ignore" if str(raw_on_error).strip().lower() in {"ignore", "log", "null"} else "raise"
-            )
-            validator = _ValidateVLLMStructuredOutputBatch(
-                native_return_format,
-                input_column,
-                output_column,
-                validation_on_error,
-            )
-            expression = _build_map_batches_expression(
-                validator.__call__,
-                name="validate_vllm_structured_output",
-                inputs={input_column: expression},
-                schema={output_column: "VARCHAR"},
-                batch_size=None,
-                row_preserving=True,
-                gpus=0,
-            )
-        expression = expression.alias(output_column)
-        return rel.select(expression)
+        return rel.select(star, expression)
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
 
-    udf_opts = descriptor.get_udf_options()
-
+    input_names = [f"message_{index}" for index in range(len(message_expressions))]
     wrapper = _PromptBatch(
         descriptor,
-        column,
+        input_names,
         output_column,
-        udf_opts.max_api_concurrency,
-        return_format=return_format,
-        image_columns=image_columns,
-        max_retries=udf_opts.max_retries,
-        on_error=udf_opts.on_error,
+        udf_options.max_concurrency_per_actor,
+        single_message=single_message,
+        max_retries=udf_options.max_retries,
+        on_error=udf_options.on_error,
     )
-    udf_opts_copy = UDFOptions(
-        actor_number=udf_opts.actor_number,
-        num_gpus=udf_opts.num_gpus,
-        max_retries=udf_opts.max_retries,
-        on_error=udf_opts.on_error,
-        batch_size=udf_opts.batch_size or 1,
-        max_api_concurrency=udf_opts.max_api_concurrency,
-    )
-    kwargs = _map_batches_kwargs(udf_opts_copy, execution_backend)
-    kwargs["schema"] = {output_column: "VARCHAR"}
-    udf = _adapt_batch_wrapper_for_backend(
+    expression = _build_ai_batch_expression(
         wrapper,
-        kwargs.get("execution_backend"),
-        force_actor="actor_number" in kwargs,
-    )
-    return rel.map_batches(udf, **kwargs)
+        inputs=dict(zip(input_names, message_expressions, strict=True)),
+        output_column=output_column,
+        output_type="VARCHAR",
+        udf_opts=udf_options,
+        name="ai_prompt",
+        execution_backend=execution_backend,
+    ).cast("VARCHAR")
+    star = duckdb.StarExpression(exclude=[output_column]) if output_column in rel.columns else duckdb.StarExpression()
+    return rel.select(star, expression.alias(output_column))
 
 
 def _prompt_expression(
     messages: Any,
     *,
-    provider: str | Provider = "openai",
+    provider: Any,
     model: str | None = None,
-    provider_options: (
-        OpenAIProviderOptions
-        | VLLMProviderOptions
-        | AnthropicProviderOptions
-        | GoogleProviderOptions
-        | dict[str, Any]
-        | None
-    ) = None,
-    prompt_options: (
-        OpenAIPromptOptions | VLLMPromptOptions | AnthropicPromptOptions | GooglePromptOptions | dict[str, Any] | None
-    ) = None,
     system_message: str | None = None,
+    on_error: str = "raise",
+    options: dict[str, Any],
 ) -> Any:
-    """Build a row-preserving expression prompt.
-
-    Supported expression kwargs are ``provider``, ``model``,
-    ``provider_options``, ``prompt_options``, and ``system_message``. Prefer
-    provider environment variables such as ``OPENAI_API_KEY``,
-    ``ANTHROPIC_API_KEY``, or ``GOOGLE_API_KEY`` over passing API keys in
-    prompt options.
-    """
-    prov = _resolve_provider(provider, "openai")
-    descriptor_options = _merge_options(provider_options, prompt_options)
-    try:
-        descriptor = prov.get_prompter(model=model, system_message=system_message, **descriptor_options)
-    except NotImplementedError as exc:
-        raise ValueError(f"Provider {provider!r} is not a prompt provider") from exc
+    message_expressions, single_message = _normalize_prompt_messages(messages)
+    descriptor, udf_options, _ = _prepare_prompt_call(
+        provider,
+        model,
+        system_message,
+        on_error,
+        options,
+        relation=False,
+    )
 
     if isinstance(descriptor, NativeVLLMPromptPlan):
-        return _build_native_vllm_expression(messages, descriptor)
+        return _build_native_vllm_expression(message_expressions, descriptor)
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
 
-    udf_opts = descriptor.get_udf_options()
-
+    input_names = [f"message_{index}" for index in range(len(message_expressions))]
     wrapper = _PromptBatch(
         descriptor,
-        "messages",
+        input_names,
         "response",
-        udf_opts.max_api_concurrency,
-        max_retries=udf_opts.max_retries,
-        on_error=udf_opts.on_error,
+        udf_options.max_concurrency_per_actor,
+        single_message=single_message,
+        max_retries=udf_options.max_retries,
+        on_error=udf_options.on_error,
     )
     return _build_ai_batch_expression(
         wrapper,
-        input_name="messages",
-        input_expr=messages,
+        inputs=dict(zip(input_names, message_expressions, strict=True)),
         output_column="response",
         output_type="VARCHAR",
-        udf_opts=udf_opts,
+        udf_opts=udf_options,
         name="ai_prompt",
-    )
+    ).cast("VARCHAR")
 
 
 def _is_relation_like(value: Any) -> bool:
     return hasattr(value, "map_batches") and hasattr(value, "select")
 
 
-_PROMPT_RELATION_ONLY_KWARGS = (
-    "output_column",
-    "return_format",
-    "image_columns",
-    "use_chat_completions",
-    "execution_backend",
-)
-
 _PROMPT_ARGUMENT_UNSET = object()
 
 
-def _reject_relation_only_prompt_kwargs(kwargs: dict[str, Any]) -> None:
-    unsupported = [name for name in _PROMPT_RELATION_ONLY_KWARGS if name in kwargs]
-    if unsupported:
-        raise TypeError(
-            "vane.ai.prompt expression API does not support: "
-            + ", ".join(unsupported)
-            + ". Rename the output with .alias(...); use the relation API "
-            "prompt(rel, column, ...) for return_format/image_columns/execution_backend."
-        )
+@overload
+def prompt(
+    messages: Expression | list[Expression],
+    *,
+    system_message: str | None = None,
+    provider: str | Provider = "openai",
+    model: str | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    **options: Unpack[PromptOptions],
+) -> Expression: ...
 
 
 @overload
-def prompt(first: Relation, column: str, **kwargs: Any) -> Relation: ...
+def prompt(
+    *,
+    messages: Expression | list[Expression],
+    system_message: str | None = None,
+    provider: str | Provider = "openai",
+    model: str | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    **options: Unpack[PromptOptions],
+) -> Expression: ...
 
 
 @overload
-def prompt(first: Expression, column: None = None, **kwargs: Any) -> Expression: ...
+def prompt(
+    rel: Relation,
+    messages: Expression | list[Expression],
+    *,
+    system_message: str | None = None,
+    provider: str | Provider = "openai",
+    model: str | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = "response",
+    **options: Unpack[PromptOptions],
+) -> Relation: ...
 
 
 @overload
-def prompt(*, rel: Relation, column: str, **kwargs: Any) -> Relation: ...
+def prompt(
+    *,
+    rel: Relation,
+    messages: Expression | list[Expression],
+    system_message: str | None = None,
+    provider: str | Provider = "openai",
+    model: str | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = "response",
+    **options: Unpack[PromptOptions],
+) -> Relation: ...
 
 
 def prompt(
     first: Any = _PROMPT_ARGUMENT_UNSET,
-    column: str | None = None,
+    /,
+    messages: Any = _PROMPT_ARGUMENT_UNSET,
     *,
     rel: Any = _PROMPT_ARGUMENT_UNSET,
-    **kwargs: Any,
+    system_message: str | None = None,
+    provider: Any = "openai",
+    model: str | None = None,
+    on_error: str = "raise",
+    output_column: Any = _PROMPT_ARGUMENT_UNSET,
+    **options: Any,
 ) -> Any:
-    """Generate LLM responses from either a relation column or expression.
-
-    ``prompt(rel, "column", ...)`` and ``prompt(rel=rel, column="column",
-    ...)`` preserve the relation API.
-    The relation API accepts ``execution_backend`` for Python UDF providers;
-    native vLLM prompting rejects explicit values because the query runner owns
-    its execution mode.
-    ``prompt(vane.col("column"), ...)`` returns a row-preserving expression.
-    The expression API supports ``provider``, ``model``,
-    ``provider_options``, ``prompt_options``, and ``system_message``. When
-    provider options do not set ``concurrency``, the expression API uses one
-    actor. Prefer provider environment variables such as ``OPENAI_API_KEY``,
-    ``ANTHROPIC_API_KEY``, or ``GOOGLE_API_KEY`` over passing API keys in call
-    options or SQL text.
-    """
+    """Prompt over ordered VARCHAR, BLOB, or BLOB[] Expressions."""
     if first is not _PROMPT_ARGUMENT_UNSET and rel is not _PROMPT_ARGUMENT_UNSET:
         raise TypeError("vane.ai.prompt received both first and rel; pass only one relation argument")
-    if first is _PROMPT_ARGUMENT_UNSET and rel is _PROMPT_ARGUMENT_UNSET:
-        raise TypeError("vane.ai.prompt requires a messages expression or a relation via rel=")
 
-    target = rel if rel is not _PROMPT_ARGUMENT_UNSET else first
-    if is_expression(target) or (column is None and not _is_relation_like(target)):
-        if column is not None:
-            raise TypeError("vane.ai.prompt expression API accepts a single messages expression")
-        _reject_relation_only_prompt_kwargs(kwargs)
-        return _prompt_expression(target, **kwargs)
-    if column is None:
-        raise TypeError("vane.ai.prompt relation API requires a column name")
-    return _prompt_relation(target, column, **kwargs)
+    relation = rel if rel is not _PROMPT_ARGUMENT_UNSET else first
+    if relation is not _PROMPT_ARGUMENT_UNSET and _is_relation_like(relation):
+        if messages is _PROMPT_ARGUMENT_UNSET:
+            raise TypeError("vane.ai.prompt relation API requires messages")
+        resolved_output = "response" if output_column is _PROMPT_ARGUMENT_UNSET else output_column
+        return _prompt_relation(
+            relation,
+            messages,
+            provider=provider,
+            model=model,
+            system_message=system_message,
+            on_error=on_error,
+            output_column=resolved_output,
+            options=options,
+        )
+
+    if rel is not _PROMPT_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.prompt rel= must be a Relation")
+    if first is not _PROMPT_ARGUMENT_UNSET and messages is not _PROMPT_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.prompt expression API accepts one messages argument")
+    expression_messages = messages if first is _PROMPT_ARGUMENT_UNSET else first
+    if expression_messages is _PROMPT_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.prompt requires messages or a Relation plus messages")
+    if output_column is not _PROMPT_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.prompt expression API does not accept output_column; use .alias(...)")
+    return _prompt_expression(
+        expression_messages,
+        provider=provider,
+        model=model,
+        system_message=system_message,
+        on_error=on_error,
+        options=options,
+    )

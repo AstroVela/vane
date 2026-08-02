@@ -88,4 +88,4 @@ class UDFOptions:
     max_retries: int = 3
     on_error: Literal["raise", "log", "ignore"] = "raise"
     batch_size: int | None = None
-    max_api_concurrency: int | None = None
+    max_concurrency_per_actor: int | None = None
