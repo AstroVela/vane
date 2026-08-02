@@ -3,9 +3,17 @@
 
 #include <thread>
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/execution/operator/helper/physical_batch_collector.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/main/client_config.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_context_state.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/parallel/task.hpp"
+
+#include <condition_variable>
+#include <mutex>
+#include <stdexcept>
 
 using namespace duckdb;
 using namespace std;
@@ -31,7 +39,103 @@ public:
 	}
 };
 
+struct BlockingExecutorTaskState {
+	std::mutex lock;
+	std::condition_variable cv;
+	bool started = false;
+	bool release = false;
+	bool finished = false;
+};
+
+class BlockingExecutorTask : public Task {
+public:
+	BlockingExecutorTask(Executor &executor_p, duckdb::shared_ptr<BlockingExecutorTaskState> state_p)
+	    : executor(executor_p), state(std::move(state_p)) {
+		executor.RegisterTask();
+	}
+
+	~BlockingExecutorTask() override {
+		executor.UnregisterTask();
+	}
+
+	TaskExecutionResult Execute(TaskExecutionMode) override {
+		std::unique_lock<std::mutex> lock(state->lock);
+		state->started = true;
+		state->cv.notify_all();
+		state->cv.wait(lock, [&]() { return state->release; });
+		state->finished = true;
+		state->cv.notify_all();
+		return TaskExecutionResult::TASK_FINISHED;
+	}
+
+private:
+	Executor &executor;
+	duckdb::shared_ptr<BlockingExecutorTaskState> state;
+};
+
 } // namespace
+
+TEST_CASE("ClientContext drains executor tasks during exception unwinding", "[api][executor][lifecycle]") {
+	DuckDB db(nullptr);
+	Connection setup(db);
+	REQUIRE_NO_FAIL(setup.Query("SET threads = 2"));
+
+	auto state = make_shared_ptr<BlockingExecutorTaskState>();
+	std::thread executor_task;
+	std::thread release_task;
+
+	bool finished_before_catch = false;
+	string caught_message;
+	try {
+		Connection connection(db);
+		PendingQueryParameters parameters;
+		parameters.get_result_collector = [](ClientContext &, PreparedStatementData &data) -> PhysicalOperator & {
+			return data.physical_plan->Make<PhysicalBatchCollector>(data);
+		};
+		auto pending = connection.PendingQuery("SELECT 42", parameters);
+		if (pending->HasError()) {
+			pending->ThrowError();
+		}
+
+		auto &executor = connection.context->GetExecutor();
+		duckdb::shared_ptr<Task> task = make_shared_ptr<BlockingExecutorTask>(executor, state);
+		executor_task = std::thread([task = std::move(task)]() mutable {
+			task->Execute(TaskExecutionMode::PROCESS_ALL);
+			task.reset();
+		});
+
+		{
+			std::unique_lock<std::mutex> lock(state->lock);
+			if (!state->cv.wait_for(lock, std::chrono::seconds(5), [&]() { return state->started; })) {
+				throw std::runtime_error("executor task did not start");
+			}
+		}
+		release_task = std::thread([state]() {
+			std::this_thread::sleep_for(std::chrono::milliseconds(200));
+			std::lock_guard<std::mutex> lock(state->lock);
+			state->release = true;
+			state->cv.notify_all();
+		});
+		throw std::runtime_error("trigger exception unwinding");
+	} catch (const std::exception &ex) {
+		std::lock_guard<std::mutex> lock(state->lock);
+		finished_before_catch = state->finished;
+		caught_message = ex.what();
+		if (!release_task.joinable()) {
+			state->release = true;
+			state->cv.notify_all();
+		}
+	}
+
+	if (release_task.joinable()) {
+		release_task.join();
+	}
+	if (executor_task.joinable()) {
+		executor_task.join();
+	}
+	REQUIRE(caught_message == "trigger exception unwinding");
+	REQUIRE(finished_before_catch);
+}
 
 TEST_CASE("Test Pending Query API", "[api][.]") {
 	DuckDB db;
