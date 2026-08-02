@@ -4,19 +4,23 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import math
 from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import date
+from typing import Literal, get_overloads, get_type_hints
 
 import numpy as np
 import pyarrow as pa
 import pytest
+from typing_extensions import Unpack
 
 import duckdb
 import vane
 from vane.ai import provider as provider_registry
+from vane.ai.options import EmbedOptions
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider
 from vane.ai.typing import EmbeddingDimensions, UDFOptions
@@ -193,6 +197,25 @@ def test_ai_embed_is_public_expression_api():
     }
 
 
+def test_ai_embed_runtime_signature_matches_public_contract():
+    signature = inspect.signature(vane.ai.embed, eval_str=True)
+    parameters = signature.parameters
+
+    assert parameters["first"].annotation == vane.Expression | vane.Relation
+    assert parameters["text"].annotation is vane.Expression
+    assert parameters["rel"].annotation is vane.Relation
+    assert parameters["provider"].annotation == str | Provider
+    assert parameters["on_error"].annotation == Literal["raise", "ignore"]
+    assert parameters["output_column"].annotation is str
+    assert parameters["output_column"].default == "embedding"
+    assert parameters["options"].kind is inspect.Parameter.VAR_KEYWORD
+
+    hints = get_type_hints(vane.ai.embed, include_extras=True)
+    assert hints["options"] == Unpack[EmbedOptions]
+    assert hints["return"] == vane.Expression | vane.Relation
+    assert len(get_overloads(vane.ai.embed)) == 4
+
+
 def test_ai_embed_literal_null_is_fixed_type_without_runtime_calls(monkeypatch):
     runtime_calls = []
     original_embed = MockTextEmbedder.embed_text
@@ -295,7 +318,7 @@ def test_ai_embed_normalize_returns_unit_vectors():
     ("provider", "model", "expected_type"),
     [
         ("openai", None, "FLOAT[1536]"),
-        ("google", "gemini-embedding-001", "FLOAT[3072]"),
+        ("google", None, "FLOAT[3072]"),
         ("transformers", None, "FLOAT[384]"),
     ],
 )
@@ -393,6 +416,57 @@ def test_ai_embed_expression_rejects_relation_only_options():
             provider=MockProvider(),
             execution_backend="subprocess_task",
         )
+
+
+@pytest.mark.parametrize("output_column", ["embedding", "custom_embedding"])
+def test_ai_embed_expression_rejects_explicit_output_column(output_column):
+    with pytest.raises(TypeError, match="output_column"):
+        vane.ai.embed(
+            vane.col("text"),
+            provider=MockProvider(),
+            output_column=output_column,
+        )
+
+
+@pytest.mark.parametrize("output_column", [None, 7, True])
+def test_ai_embed_relation_rejects_non_string_output_column(output_column):
+    rel = vane.connect().sql("SELECT 'text'::VARCHAR AS text")
+
+    with pytest.raises(ValueError, match="output_column must be a non-empty string"):
+        vane.ai.embed(
+            rel,
+            vane.col("text"),
+            provider=MockProvider(),
+            dimensions=4,
+            output_column=output_column,
+        )
+
+
+@pytest.mark.parametrize(
+    "text_sql",
+    ["1::INTEGER", "TRUE", "from_hex('00')", "[1, 2]", "NULL::INTEGER"],
+)
+@pytest.mark.parametrize("relation_api", [False, True])
+def test_ai_embed_python_entries_reject_non_varchar_during_planning(relation_api, text_sql):
+    rel = vane.connect().sql(f"SELECT {text_sql} AS text")
+
+    with pytest.raises(duckdb.BinderException, match="ai SQL input argument must be VARCHAR"):
+        if relation_api:
+            vane.ai.embed(
+                rel,
+                vane.col("text"),
+                provider=MockProvider(),
+                dimensions=4,
+                on_error="ignore",
+            )
+        else:
+            expression = vane.ai.embed(
+                vane.col("text"),
+                provider=MockProvider(),
+                dimensions=4,
+                on_error="ignore",
+            )
+            rel.select(expression)
 
 
 def test_ai_embed_relation_rejects_actor_count_with_task_backend():

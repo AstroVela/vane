@@ -7,11 +7,10 @@ Supports text embedding via ``embed_content`` and prompting via
 ``generate_content`` with multimodal input (text + images) and
 structured output via ``response_schema``.
 
-Vane does not choose Google models: every prompt or embedding call must
-name a model, either per call (``model=...``) or through explicit
-provider configuration (``GoogleProvider(prompt_model=...,
-embedding_model=...)``). Missing configuration raises :class:`ValueError`
-at expression-build time.
+Prompt calls must name a model, either per call (``model=...``) or through
+``GoogleProvider(prompt_model=...)``. Embed calls use the provider's pinned
+default unless overridden per call or through
+``GoogleProvider(embedding_model=...)``.
 
 Requires::
 
@@ -231,9 +230,9 @@ def _validate_embedding_dimensions(model_name: str, dimensions: int | None) -> N
 class GoogleProvider(Provider):
     """Provider backed by Google Generative AI (Gemini).
 
-    The provider ships no default model IDs: a model must be supplied per
-    call (``model=...``) or through the named constructor parameters below.
-    Call-site arguments always win over constructor configuration.
+    Embed calls default to :attr:`DEFAULT_TEXT_EMBEDDER`. Prompt calls still
+    require a model per call or through ``prompt_model``. Call-site arguments
+    always win over constructor configuration.
 
     Args:
         name: Optional display-name override (default ``"google"``).
@@ -251,6 +250,7 @@ class GoogleProvider(Provider):
     instead of silently leaking into API request options.
     """
 
+    DEFAULT_TEXT_EMBEDDER: ClassVar[str] = "gemini-embedding-2"
     _CLIENT_KEYS: ClassVar[frozenset[str]] = frozenset({"api_key"})
 
     def __init__(
@@ -286,12 +286,11 @@ class GoogleProvider(Provider):
         dimensions: int | None = None,
         **options: Any,
     ) -> TextEmbedderDescriptor:
-        """Build an embedder descriptor for an explicitly selected model.
+        """Build an embedder descriptor for the selected or default model.
 
         Raises:
-            ValueError: If neither ``model=...`` nor the provider's
-                ``embedding_model`` is configured, or if dimensions cannot
-                be resolved for the selected model.
+            ValueError: If dimensions cannot be resolved for the selected
+                model or the model/option combination is invalid.
         """
         provider_options, embed_options = self._split_options(options)
         unknown = sorted(set(embed_options) - _EMBED_REQUEST_OPTIONS)
@@ -299,10 +298,7 @@ class GoogleProvider(Provider):
             raise TypeError(f"Unsupported Google Embed option(s): {', '.join(unknown)}")
         model_name = model if model is not None else self._embedding_model
         if model_name is None:
-            raise ValueError(
-                "No embedding model configured for the Google provider. "
-                "Pass model=... or configure GoogleProvider(embedding_model=...)."
-            )
+            model_name = self.DEFAULT_TEXT_EMBEDDER
         if not isinstance(model_name, str) or not model_name.strip():
             raise ValueError(
                 f"Google embedding model must be a non-empty string, got {model_name!r}. "
@@ -383,6 +379,14 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
         if unknown:
             raise TypeError(f"Unsupported Google Embed option(s): {', '.join(unknown)}")
         _validate_embedding_dimensions(self.model_name, self.dimensions)
+        if _canonical_model_id(self.model_name) == "gemini-embedding-2":
+            unsupported = sorted(
+                option for option in ("task_type", "title") if self.embed_options.get(option) is not None
+            )
+            if unsupported:
+                raise ValueError(
+                    f"Google model {self.model_name!r} does not support embedding option(s): {', '.join(unsupported)}"
+                )
         task_type = self.embed_options.get("task_type")
         title = self.embed_options.get("title")
         if title is not None and task_type != "RETRIEVAL_DOCUMENT":

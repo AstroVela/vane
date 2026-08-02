@@ -39,7 +39,7 @@ import asyncio
 import inspect
 import json
 import time
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import Any, Literal, overload
 
 import numpy as np
 import pyarrow as pa
@@ -48,6 +48,7 @@ from typing_extensions import Unpack
 import duckdb
 from vane._expression_udf import _build_actor_map_batches_expression, _build_map_batches_expression
 from vane._expressions import as_expression, is_expression
+from vane._typing import Expression, Relation
 from vane.ai.options import (
     AnthropicPromptOptions,
     AnthropicProviderOptions,
@@ -64,9 +65,6 @@ from vane.ai.protocols import NativePrompterPlan
 from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError, load_provider
 from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_options_argument
 from vane.ai.typing import UDFOptions
-
-if TYPE_CHECKING:
-    from vane import Expression, Relation
 
 
 def _resolve_provider(provider: str | Provider | None, default: str = "transformers") -> Provider:
@@ -1136,6 +1134,11 @@ def _build_ai_batch_expression(
 # ---------------------------------------------------------------------------
 
 
+def _validated_embed_text(text: Any) -> Any:
+    """Add a bind-only VARCHAR guard that is removed during planning."""
+    return duckdb.FunctionExpression("__vane_ai_embed", text)
+
+
 def _embed_expression(
     text: Any,
     *,
@@ -1168,7 +1171,7 @@ def _embed_expression(
     return _build_ai_batch_expression(
         wrapper,
         input_name="text",
-        input_expr=text,
+        input_expr=_validated_embed_text(text),
         output_column="embedding",
         output_type=output_type,
         udf_opts=udf_opts,
@@ -1226,7 +1229,7 @@ def _embed_relation(
     expression = _build_ai_batch_expression(
         wrapper,
         input_name="text",
-        input_expr=text,
+        input_expr=_validated_embed_text(text),
         output_column=output_column,
         output_type=output_type,
         udf_opts=udf_opts,
@@ -1237,7 +1240,14 @@ def _embed_relation(
     return rel.select(duckdb.StarExpression(), expression.alias(output_column))
 
 
-_EMBED_ARGUMENT_UNSET = object()
+_EMBED_ARGUMENT_UNSET: Any = object()
+
+
+class _DefaultEmbedOutputColumn(str):
+    """Distinguish an omitted Relation-only keyword from an explicit value."""
+
+
+_EMBED_OUTPUT_COLUMN_DEFAULT = _DefaultEmbedOutputColumn("embedding")
 
 
 @overload
@@ -1293,17 +1303,18 @@ def embed(
 
 
 def embed(
-    first: Any = _EMBED_ARGUMENT_UNSET,
+    first: Expression | Relation = _EMBED_ARGUMENT_UNSET,
     /,
-    text: Any = _EMBED_ARGUMENT_UNSET,
+    text: Expression = _EMBED_ARGUMENT_UNSET,
     *,
-    rel: Any = _EMBED_ARGUMENT_UNSET,
-    provider: Any = "openai",
+    rel: Relation = _EMBED_ARGUMENT_UNSET,
+    provider: str | Provider = "openai",
     model: str | None = None,
     dimensions: int | None = None,
-    on_error: str = "raise",
-    **options: Any,
-) -> Any:
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = _EMBED_OUTPUT_COLUMN_DEFAULT,
+    **options: Unpack[EmbedOptions],
+) -> Expression | Relation:
     """Embed an Expression or append an embedding column to a Relation."""
 
     if first is not _EMBED_ARGUMENT_UNSET and rel is not _EMBED_ARGUMENT_UNSET:
@@ -1313,7 +1324,7 @@ def embed(
     if relation is not _EMBED_ARGUMENT_UNSET and _is_relation_like(relation):
         if text is _EMBED_ARGUMENT_UNSET:
             raise TypeError("vane.ai.embed relation API requires a text Expression")
-        output_column = options.pop("output_column", "embedding")
+        resolved_output_column = "embedding" if output_column is _EMBED_OUTPUT_COLUMN_DEFAULT else output_column
         return _embed_relation(
             relation,
             text,
@@ -1321,7 +1332,7 @@ def embed(
             model=model,
             dimensions=dimensions,
             on_error=on_error,
-            output_column=output_column,
+            output_column=resolved_output_column,
             options=options,
         )
 
@@ -1332,7 +1343,7 @@ def embed(
     expression = text if first is _EMBED_ARGUMENT_UNSET else first
     if expression is _EMBED_ARGUMENT_UNSET:
         raise TypeError("vane.ai.embed requires a text Expression or a Relation plus text Expression")
-    if "output_column" in options:
+    if output_column is not _EMBED_OUTPUT_COLUMN_DEFAULT:
         raise TypeError("vane.ai.embed expression API does not accept output_column; use .alias(...)")
     return _embed_expression(
         expression,

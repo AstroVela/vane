@@ -336,6 +336,24 @@ static unique_ptr<Expression> LowerAISQLEmbedExpressionUDF(FunctionBindExpressio
 	return LowerRegisteredExpressionUDF(input);
 }
 
+static unique_ptr<Expression> LowerAIEmbedTextInput(FunctionBindExpressionInput &input) {
+	if (input.children.size() != 1) {
+		throw BinderException("ai_embed text validation expected one runtime argument");
+	}
+	auto &text = input.children[0];
+	auto input_type_id = text->return_type.id();
+	if (input_type_id == LogicalTypeId::UNKNOWN) {
+		throw ParameterNotResolvedException();
+	}
+	if (input_type_id == LogicalTypeId::SQLNULL) {
+		return make_uniq<BoundConstantExpression>(Value(LogicalType::VARCHAR));
+	}
+	if (input_type_id != LogicalTypeId::VARCHAR) {
+		throw BinderException("ai SQL input argument must be VARCHAR");
+	}
+	return std::move(text);
+}
+
 static void AddAISQLFunctions(ScalarFunctionSet &set, bind_scalar_function_t bind, bool include_image_inputs) {
 	auto base = ScalarFunction({LogicalType::VARCHAR}, LogicalType::ANY, AISQLExecute, bind, nullptr, nullptr, nullptr,
 	                           LogicalType::INVALID, FunctionStability::VOLATILE);
@@ -375,6 +393,11 @@ ScalarFunctionSet AISQLFunction::GetPromptFunctions() {
 
 ScalarFunctionSet AISQLFunction::GetEmbedImplementationFunctions() {
 	ScalarFunctionSet set(HIDDEN_EMBED_FUNCTION);
+	auto text_input = ScalarFunction({LogicalType::ANY}, LogicalType::VARCHAR, AISQLExecute);
+	text_input.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	text_input.SetBindExpressionCallback(LowerAIEmbedTextInput);
+	set.AddFunction(std::move(text_input));
+
 	auto implementation = ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                                      LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::ANY},
 	                                     LogicalType::ANY, AISQLExecute, AISQLEmbedBind, nullptr, nullptr, nullptr,

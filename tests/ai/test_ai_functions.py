@@ -1468,17 +1468,14 @@ class TestGoogleProvider:
         desc = provider.get_prompter(model="gemini-3.6-flash")
         assert desc.model_name == "gemini-3.6-flash"
 
-    def test_get_text_embedder_missing_model_raises(self):
-        """No call-site model and no provider config fails fast."""
+    def test_get_text_embedder_uses_builtin_default(self):
+        """No call-site model or provider override uses the pinned default."""
         from vane.ai.providers.google import GoogleProvider
 
         provider = GoogleProvider(api_key="test")
-        with pytest.raises(ValueError) as excinfo:
-            provider.get_text_embedder()
-        message = str(excinfo.value)
-        assert "No embedding model configured" in message
-        assert "model=" in message
-        assert "GoogleProvider(embedding_model=...)" in message
+        desc = provider.get_text_embedder()
+        assert desc.model_name == "gemini-embedding-2"
+        assert desc.get_dimensions().size == 3072
 
     def test_get_text_embedder_provider_config_flow_through(self):
         """Provider-level embedding_model is used when the call omits model."""
@@ -1496,6 +1493,36 @@ class TestGoogleProvider:
         provider = GoogleProvider(api_key="test", embedding_model="gemini-embedding-2")
         desc = provider.get_text_embedder(model="gemini-embedding-001")
         assert desc.model_name == "gemini-embedding-001"
+
+    def test_get_text_embedder_default_rejects_unsupported_request_options(self):
+        """The pinned Embedding 2 default rejects known unsupported fields."""
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(api_key="test")
+        with pytest.raises(ValueError, match=r"gemini-embedding-2.*task_type"):
+            provider.get_text_embedder(task_type="RETRIEVAL_QUERY")
+
+    @pytest.mark.parametrize("model", ["gemini-embedding-2", "models/gemini-embedding-2"])
+    @pytest.mark.parametrize(
+        "embed_options",
+        [
+            {"task_type": "RETRIEVAL_QUERY"},
+            {"task_type": "RETRIEVAL_DOCUMENT", "title": "Document title"},
+        ],
+    )
+    def test_embedding_2_rejects_unsupported_request_options_on_direct_descriptor(self, model, embed_options):
+        """Both resource-name forms fail before endpoint execution."""
+        from vane.ai.providers.google import GoogleTextEmbedderDescriptor
+
+        with pytest.raises(ValueError, match=r"gemini-embedding-2.*task_type|title"):
+            GoogleTextEmbedderDescriptor(model_name=model, embed_options=embed_options)
+
+    def test_embedding_2_accepts_explicit_null_request_options(self):
+        """Nullable SQL/Python options do not become unsupported requests."""
+        from vane.ai.providers.google import GoogleProvider
+
+        desc = GoogleProvider(api_key="test").get_text_embedder(task_type=None, title=None)
+        assert desc.model_name == "gemini-embedding-2"
 
     def test_get_text_embedder_provider_dimensions_flow_through(self):
         """Provider-level embedding_dimensions covers models without metadata."""
