@@ -13,6 +13,7 @@
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 
 namespace duckdb {
@@ -22,6 +23,21 @@ static idx_t FindUnnestColumnIndex(const vector<string> &names, const string &co
 		if (names[i] == column_name) {
 			return i;
 		}
+	}
+
+	idx_t case_insensitive_match = DConstants::INVALID_INDEX;
+	for (idx_t i = 0; i < names.size(); i++) {
+		if (!StringUtil::CIEquals(names[i], column_name)) {
+			continue;
+		}
+		if (case_insensitive_match != DConstants::INVALID_INDEX) {
+			throw BinderException("Ambiguous reference to column name \"%s\" in child relation for unnest/explode",
+			                      column_name);
+		}
+		case_insensitive_match = i;
+	}
+	if (case_insensitive_match != DConstants::INVALID_INDEX) {
+		return case_insensitive_match;
 	}
 	throw BinderException("Column \"%s\" not found in child relation for unnest/explode", column_name);
 }
@@ -75,6 +91,7 @@ BoundStatement UnnestRelation::Bind(Binder &binder) {
 
 	// 2. Find the column to unnest
 	auto unnest_col_idx = FindUnnestColumnIndex(child_bound.names, column_name);
+	const auto &unnest_column_name = child_bound.names[unnest_col_idx];
 
 	// 3. Determine element type from the list/array column
 	auto &list_type = child_bound.types[unnest_col_idx];
@@ -90,7 +107,7 @@ BoundStatement UnnestRelation::Bind(Binder &binder) {
 
 	// 4. Create BoundUnnestExpression: unnest(col_ref) → element_type
 	unique_ptr<Expression> unnest_child =
-	    make_uniq<BoundColumnRefExpression>(column_name, list_type, child_bindings[unnest_col_idx]);
+	    make_uniq<BoundColumnRefExpression>(unnest_column_name, list_type, child_bindings[unnest_col_idx]);
 	// PhysicalUnnest consumes LIST vectors. Match the SQL UNNEST binder by
 	// casting ARRAY inputs to LIST while preserving their element type.
 	unnest_child = BoundCastExpression::AddArrayCastToList(binder.context, std::move(unnest_child));
@@ -114,9 +131,10 @@ BoundStatement UnnestRelation::Bind(Binder &binder) {
 	for (idx_t i = 0; i < child_bound.names.size(); i++) {
 		if (i == unnest_col_idx) {
 			// Replace the list column with the unnested scalar
-			auto ref = make_uniq<BoundColumnRefExpression>(column_name, element_type, ColumnBinding(unnest_index, 0));
+			auto ref =
+			    make_uniq<BoundColumnRefExpression>(unnest_column_name, element_type, ColumnBinding(unnest_index, 0));
 			proj_exprs.push_back(std::move(ref));
-			result.names.push_back(column_name);
+			result.names.push_back(unnest_column_name);
 			result.types.push_back(element_type);
 		} else {
 			// Pass-through: reference the child's original column binding

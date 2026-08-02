@@ -3,6 +3,8 @@
 
 import pytest
 
+import duckdb
+
 EXPECTED_COLUMNS = ["x", "a", "y"]
 EXPECTED_ROWS = [(10, 20, 30), (10, 21, 30)]
 
@@ -27,6 +29,25 @@ def test_explode_serialized_query_matches_direct_binding(duckdb_cursor, collecti
     assert serialized.columns == EXPECTED_COLUMNS
     assert serialized.types == exploded.types
     assert serialized.fetchall() == EXPECTED_ROWS
+
+
+@pytest.mark.parametrize("collection_type", ["INTEGER[]", "INTEGER[2]"])
+def test_explode_unique_target_name_is_case_insensitive(duckdb_cursor, collection_type):
+    exploded = middle_collection_relation(duckdb_cursor, collection_type).explode("A")
+    serialized = duckdb_cursor.sql(exploded.sql_query())
+
+    assert exploded.columns == EXPECTED_COLUMNS
+    assert exploded.fetchall() == EXPECTED_ROWS
+    assert serialized.columns == EXPECTED_COLUMNS
+    assert serialized.types == exploded.types
+    assert serialized.fetchall() == EXPECTED_ROWS
+
+
+def test_explode_case_insensitive_target_requires_unique_match(duckdb_cursor):
+    relation = duckdb_cursor.sql('SELECT [20, 21]::INTEGER[] AS target, [30, 31]::INTEGER[] AS "TARGET"')
+
+    with pytest.raises(duckdb.BinderException, match="Ambiguous reference to column"):
+        relation.explode("Target")
 
 
 @pytest.mark.parametrize("duplicate_name", ["x", "X"])
