@@ -23,6 +23,11 @@ _RAY_CONTROL_SUBMISSION_STALL_TIMEOUT_S = 1.0
 _RAY_CONTROL_SUBMISSION_MAX_WORKERS = 32
 _RAY_CONTROL_SUBMISSION_MAX_PENDING = 4096
 _RAY_CONTROL_SUBMISSION_MAX_PENDING_PER_OWNER = 256
+_RAY_CONTROL_DEADLINE_CALLBACK_MAX_WORKERS = 32
+_RAY_CONTROL_DEADLINE_CALLBACK_MAX_STALLED_WORKERS = 32
+_RAY_CONTROL_DEADLINE_CALLBACK_RETRY_INITIAL_DELAY_S = 0.01
+_RAY_CONTROL_DEADLINE_CALLBACK_RETRY_MAX_DELAY_S = 1.0
+_RAY_CONTROL_DEADLINE_LOCK_RETRY_DELAY_S = 0.001
 
 _T = TypeVar("_T")
 _Submission = tuple[Future[Any], Callable[[], Any]]
@@ -60,7 +65,7 @@ class _RayControlSubmissionWorker:
         self.thread = threading.Thread(
             target=self._run,
             daemon=True,
-            name=f"vane-ray-control-submit-{sequence}",
+            name=f"{executor._thread_name_prefix}-{sequence}",
         )
 
     def start(self) -> None:
@@ -83,6 +88,7 @@ class _RayControlSubmissionExecutor:
         max_pending_submissions: int = _RAY_CONTROL_SUBMISSION_MAX_PENDING,
         max_pending_per_owner: int = _RAY_CONTROL_SUBMISSION_MAX_PENDING_PER_OWNER,
         deadline_scheduler: RayControlDeadlineScheduler | None = None,
+        thread_name_prefix: str = "vane-ray-control-submit",
     ) -> None:
         if not math.isfinite(idle_timeout_s) or idle_timeout_s <= 0:
             raise ValueError("Ray control submission idle timeout must be finite and positive")
@@ -101,6 +107,9 @@ class _RayControlSubmissionExecutor:
             raise ValueError("Ray control submission pending capacity must be at least max_workers")
         if max_pending_submissions <= resolved_max_stalled_workers:
             raise ValueError("Ray control submission pending capacity must exceed max_stalled_workers")
+        resolved_thread_name_prefix = str(thread_name_prefix or "").strip()
+        if not resolved_thread_name_prefix:
+            raise ValueError("Ray control submission thread name prefix must not be empty")
         self._condition = threading.Condition()
         self._owners: dict[str, _RayControlSubmissionOwner] = {}
         self._ready_owners: deque[str] = deque()
@@ -114,6 +123,7 @@ class _RayControlSubmissionExecutor:
         self._max_stalled_workers = int(resolved_max_stalled_workers)
         self._max_pending_submissions = int(max_pending_submissions)
         self._max_pending_per_owner = int(max_pending_per_owner)
+        self._thread_name_prefix = resolved_thread_name_prefix
 
     def submit(self, owner_scope: str, callback: Callable[[], _T]) -> Future[_T]:
         """Admit one callback atomically or raise before it can run."""
@@ -265,7 +275,7 @@ class _RayControlSubmissionExecutor:
                             deadline=callback_deadline,
                         )
 
-                    deadline_call = self._deadline_scheduler.create(deadline_elapsed)
+                    deadline_call = self._deadline_scheduler.create_inline(deadline_elapsed)
                     self._deadline_scheduler.schedule_at(deadline_call, callback_deadline)
                     owner.running = True
                     worker.running_future = future
@@ -382,12 +392,26 @@ class _RayControlSubmissionExecutor:
     @staticmethod
     def _fail_submissions(futures: list[Future[Any]], message: str) -> None:
         for future in futures:
-            if future.done():
-                continue
-            try:
-                future.set_exception(RuntimeError(message))
-            except BaseException:
-                pass
+
+            def fail_submission(
+                rejected_future: Future[Any] = future,
+                rejection_message: str = message,
+            ) -> None:
+                if rejected_future.done():
+                    return
+                try:
+                    rejected_future.set_exception(RuntimeError(rejection_message))
+                except BaseException:
+                    pass
+
+            def submission_is_pending(rejected_future: Future[Any] = future) -> bool:
+                return not rejected_future.done()
+
+            _dispatch_ray_control_callback(
+                f"submission-failure:{id(future):x}",
+                fail_submission,
+                still_owned=submission_is_pending,
+            )
 
     def _worker_deadline_elapsed(
         self,
@@ -397,84 +421,210 @@ class _RayControlSubmissionExecutor:
         phase: str,
         deadline: float,
     ) -> None:
-        """Replace a genuinely stalled worker without inferring from lock delay."""
-        rejected: list[Future[Any]] = []
-        rejection_message = ""
-        with self._condition:
-            if (
-                self._workers.get(worker.sequence) is not worker
-                or worker.running_future is None
-                or worker.stalled
-                or worker.deadline_call is not call
-            ):
-                return
-
-            finished_at = worker.callback_finished_at if phase == "callback" else worker.completion_finished_at
-            phase_finished_in_time = finished_at is not None and finished_at <= deadline
-            if phase == "callback" and phase_finished_in_time:
-                assert finished_at is not None
-                completion_deadline = finished_at + self._stall_timeout_s
-                completion_finished_at = worker.completion_finished_at
-                if completion_finished_at is not None and completion_finished_at <= completion_deadline:
-                    worker.deadline_call = None
-                    self._condition.notify_all()
-                    return
-                if completion_finished_at is None:
-                    completion_call: RayControlScheduledCall
-
-                    def completion_deadline_elapsed() -> None:
-                        self._worker_deadline_elapsed(
-                            worker,
-                            completion_call,
-                            phase="completion",
-                            deadline=completion_deadline,
-                        )
-
-                    completion_call = self._deadline_scheduler.create(completion_deadline_elapsed)
-                    worker.deadline_call = completion_call
-                    try:
-                        self._deadline_scheduler.schedule_at(
-                            completion_call,
-                            completion_deadline,
-                        )
-                    except BaseException:
-                        # Losing deadline supervision is equivalent to losing a
-                        # schedulable worker: retire it after completion and let
-                        # a replacement own unrelated queued work.
-                        worker.deadline_call = None
-                    else:
-                        self._condition.notify_all()
-                        return
-            elif phase == "completion" and phase_finished_in_time:
-                worker.deadline_call = None
-                self._condition.notify_all()
-                return
-
-            worker.stalled = True
-            worker.deadline_call = None
-            if self._stalled_worker_count_locked() > self._max_stalled_workers:
-                # At most max_workers callbacks can cross the threshold at one
-                # deadline. Stop admitting more until they return, bounding live
-                # callback workers by max_stalled_workers + max_workers.
-                rejected = self._reject_queued_submissions_locked()
-                rejection_message = (
-                    "Ray control submission stalled callback capacity "
-                    f"is exhausted: capacity={self._max_stalled_workers}"
+        """Replace a genuinely stalled worker without occupying the clock."""
+        if not self._condition.acquire(blocking=False):
+            # Executor bookkeeping can briefly contend with a worker that has
+            # already published its lock-free phase timestamps. Retry the
+            # inspection instead of delaying every unrelated process deadline.
+            retry_call = self._deadline_scheduler.create_inline(
+                lambda: self._worker_deadline_elapsed(
+                    worker,
+                    call,
+                    phase=phase,
+                    deadline=deadline,
                 )
-            else:
-                try:
-                    self._start_workers_if_needed_locked()
-                except BaseException as exc:
-                    if self._active_worker_count_locked() == 0 and self._ready_owners:
-                        rejected = self._reject_queued_submissions_locked()
-                        rejection_message = (
-                            f"Ray control submission replacement worker is unavailable: {type(exc).__name__}: {exc}"
-                        )
-            self._condition.notify_all()
+            )
+            self._deadline_scheduler.schedule(
+                retry_call,
+                _RAY_CONTROL_DEADLINE_LOCK_RETRY_DELAY_S,
+            )
+            return
+        try:
+            rejected, rejection_message = self._worker_deadline_elapsed_locked(
+                worker,
+                call,
+                phase=phase,
+                deadline=deadline,
+            )
+        finally:
+            self._condition.release()
         self._fail_submissions(rejected, rejection_message)
 
+    def _worker_deadline_elapsed_locked(
+        self,
+        worker: _RayControlSubmissionWorker,
+        call: RayControlScheduledCall,
+        *,
+        phase: str,
+        deadline: float,
+    ) -> tuple[list[Future[Any]], str]:
+        """Apply one deadline transition while ``_condition`` is held."""
+        rejected: list[Future[Any]] = []
+        rejection_message = ""
+        if (
+            self._workers.get(worker.sequence) is not worker
+            or worker.running_future is None
+            or worker.stalled
+            or worker.deadline_call is not call
+        ):
+            return rejected, rejection_message
 
+        finished_at = worker.callback_finished_at if phase == "callback" else worker.completion_finished_at
+        phase_finished_in_time = finished_at is not None and finished_at <= deadline
+        if phase == "callback" and phase_finished_in_time:
+            assert finished_at is not None
+            completion_deadline = finished_at + self._stall_timeout_s
+            completion_finished_at = worker.completion_finished_at
+            if completion_finished_at is not None and completion_finished_at <= completion_deadline:
+                worker.deadline_call = None
+                self._condition.notify_all()
+                return rejected, rejection_message
+            if completion_finished_at is None:
+                completion_call: RayControlScheduledCall
+
+                def completion_deadline_elapsed() -> None:
+                    self._worker_deadline_elapsed(
+                        worker,
+                        completion_call,
+                        phase="completion",
+                        deadline=completion_deadline,
+                    )
+
+                completion_call = self._deadline_scheduler.create_inline(completion_deadline_elapsed)
+                worker.deadline_call = completion_call
+                try:
+                    self._deadline_scheduler.schedule_at(
+                        completion_call,
+                        completion_deadline,
+                    )
+                except BaseException:
+                    # Losing deadline supervision is equivalent to losing a
+                    # schedulable worker: retire it after completion and let a
+                    # replacement own unrelated queued work.
+                    worker.deadline_call = None
+                else:
+                    self._condition.notify_all()
+                    return rejected, rejection_message
+        elif phase == "completion" and phase_finished_in_time:
+            worker.deadline_call = None
+            self._condition.notify_all()
+            return rejected, rejection_message
+
+        worker.stalled = True
+        worker.deadline_call = None
+        if self._stalled_worker_count_locked() > self._max_stalled_workers:
+            # At most max_workers callbacks can cross the threshold at one
+            # deadline. Stop admitting more until they return, bounding live
+            # callback workers by max_stalled_workers + max_workers.
+            rejected = self._reject_queued_submissions_locked()
+            rejection_message = (
+                f"Ray control submission stalled callback capacity is exhausted: capacity={self._max_stalled_workers}"
+            )
+        else:
+            try:
+                self._start_workers_if_needed_locked()
+            except BaseException as exc:
+                if self._active_worker_count_locked() == 0 and self._ready_owners:
+                    rejected = self._reject_queued_submissions_locked()
+                    rejection_message = (
+                        f"Ray control submission replacement worker is unavailable: {type(exc).__name__}: {exc}"
+                    )
+        self._condition.notify_all()
+        return rejected, rejection_message
+
+
+_RAY_CONTROL_DEADLINE_CALLBACK_EXECUTOR = _RayControlSubmissionExecutor(
+    max_workers=_RAY_CONTROL_DEADLINE_CALLBACK_MAX_WORKERS,
+    max_stalled_workers=_RAY_CONTROL_DEADLINE_CALLBACK_MAX_STALLED_WORKERS,
+    max_pending_per_owner=1,
+    thread_name_prefix="vane-ray-control-deadline-callback",
+)
 _RAY_CONTROL_SUBMISSION_EXECUTOR = _RayControlSubmissionExecutor()
+
+
+def _dispatch_ray_control_callback(
+    owner_scope: str,
+    callback: Callable[[], None],
+    *,
+    still_owned: Callable[[], bool] = lambda: True,
+    retry_delay_s: float = _RAY_CONTROL_DEADLINE_CALLBACK_RETRY_INITIAL_DELAY_S,
+) -> None:
+    """Hand potentially blocking work to the bounded, recoverable pool."""
+    if not still_owned():
+        return
+
+    def invoke() -> None:
+        if not still_owned():
+            return
+        try:
+            callback()
+        except BaseException:
+            # Scheduled owners implement their own terminal/retry policy. Keep
+            # a malformed owner callback from consuming a reusable worker.
+            pass
+
+    next_retry_delay = min(
+        max(float(retry_delay_s), _RAY_CONTROL_DEADLINE_CALLBACK_RETRY_INITIAL_DELAY_S) * 2,
+        _RAY_CONTROL_DEADLINE_CALLBACK_RETRY_MAX_DELAY_S,
+    )
+
+    def retry_dispatch() -> None:
+        if not still_owned():
+            return
+        retry_call = RAY_CONTROL_DEADLINE_SCHEDULER.create_inline(
+            lambda: _dispatch_ray_control_callback(
+                owner_scope,
+                callback,
+                still_owned=still_owned,
+                retry_delay_s=next_retry_delay,
+            )
+        )
+        RAY_CONTROL_DEADLINE_SCHEDULER.schedule(
+            retry_call,
+            retry_delay_s,
+        )
+
+    try:
+        dispatch_future = _RAY_CONTROL_DEADLINE_CALLBACK_EXECUTOR.submit(
+            owner_scope,
+            invoke,
+        )
+    except BaseException:
+        retry_dispatch()
+        return
+
+    def resubmit_rejected_dispatch(done: Future[Any]) -> None:
+        try:
+            done.result()
+        except BaseException:
+            retry_dispatch()
+
+    # This is an executor-owned ``concurrent.futures.Future``; the callback is
+    # internal and cannot be replaced by an owner implementation.
+    dispatch_future.add_done_callback(resubmit_rejected_dispatch)
+
+
+def create_ray_control_deadline(
+    owner_scope: str,
+    callback: Callable[[], None],
+) -> RayControlScheduledCall:
+    """Create a cancellable deadline whose owner work never runs on the clock."""
+    owner_key = str(owner_scope or "").strip()
+    if not owner_key:
+        raise ValueError("Ray control deadline requires an explicit owner scope")
+    if not callable(callback):
+        raise TypeError("Ray control deadline callback must be callable")
+    scheduled_call: RayControlScheduledCall
+
+    def deadline_elapsed() -> None:
+        _dispatch_ray_control_callback(
+            f"{owner_key}:deadline:{id(scheduled_call):x}",
+            callback,
+            still_owned=lambda: not scheduled_call.cancelled(),
+        )
+
+    scheduled_call = RAY_CONTROL_DEADLINE_SCHEDULER.create_inline(deadline_elapsed)
+    return scheduled_call
 
 
 def submit_ray_control(owner_scope: str, callback: Callable[[], _T]) -> Future[_T]:
@@ -482,4 +632,4 @@ def submit_ray_control(owner_scope: str, callback: Callable[[], _T]) -> Future[_
     return _RAY_CONTROL_SUBMISSION_EXECUTOR.submit(owner_scope, callback)
 
 
-__all__ = ["submit_ray_control"]
+__all__ = ["create_ray_control_deadline", "submit_ray_control"]

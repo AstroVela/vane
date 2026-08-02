@@ -606,6 +606,15 @@ def test_task_admission_cancellation_retries_a_hung_response(monkeypatch):
     driver = _Driver()
     acknowledged = threading.Event()
     first_response = _ObjectRef()
+    cancel_callback_entered = threading.Event()
+    release_cancel_callback = threading.Event()
+
+    def block_cancel_callback(_future):
+        assert threading.current_thread().name != "vane-ray-control-deadlines"
+        cancel_callback_entered.set()
+        assert release_cancel_callback.wait(timeout=5.0)
+
+    first_response._future.add_done_callback(block_cancel_callback)
 
     def cancel(_request):
         if not driver.cancel_query_task_lease_request.calls:
@@ -625,9 +634,15 @@ def test_task_admission_cancellation_retries_a_hung_response(monkeypatch):
 
     controller.close()
 
-    assert acknowledged.wait(timeout=1.0)
-    assert len(driver.cancel_query_task_lease_request.calls) == 2
-    assert first_response._future.cancelled()
+    try:
+        assert cancel_callback_entered.wait(timeout=1.0)
+        # The next attempt is published before Future.cancel can invoke a
+        # blocking completion callback inline.
+        assert acknowledged.wait(timeout=1.0)
+        assert len(driver.cancel_query_task_lease_request.calls) == 2
+        assert first_response._future.cancelled()
+    finally:
+        release_cancel_callback.set()
 
 
 def test_task_admission_cancellation_expands_slow_response_deadline(monkeypatch):
@@ -980,6 +995,7 @@ def test_control_deadline_uses_lock_free_completion_timestamps():
     first = executor.submit("owner:lock-contention:first", submission)
     assert submission_entered.wait(timeout=1.0)
     healthy = executor.submit("owner:lock-contention:healthy", lambda: "healthy")
+    unrelated_deadline_ran = threading.Event()
 
     with executor._condition:
         original_worker = next(iter(executor._workers.values()))
@@ -990,8 +1006,18 @@ def test_control_deadline_uses_lock_free_completion_timestamps():
         assert original_worker.callback_finished_at is not None
         assert original_worker.completion_finished_at is not None
         # Hold the bookkeeping lock beyond both phase deadlines. The worker's
-        # already-published timestamps must prevent a false stall classification.
-        time.sleep(0.25)
+        # already-published timestamps must prevent a false stall classification
+        # without delaying an unrelated deadline behind this lock.
+        time.sleep(0.12)
+        unrelated_call = ray_control_submission.create_ray_control_deadline(
+            "owner:unrelated-lock-contention",
+            unrelated_deadline_ran.set,
+        )
+        ray_control_deadline.RAY_CONTROL_DEADLINE_SCHEDULER.schedule(
+            unrelated_call,
+            0,
+        )
+        assert unrelated_deadline_ran.wait(timeout=0.2)
 
     assert first.result(timeout=1.0) == "first"
     assert healthy.result(timeout=1.0) == "healthy"
@@ -1075,6 +1101,105 @@ def test_control_submissions_fail_fast_at_stalled_worker_bound_and_recover():
     assert [future.result(timeout=1.0) for future in blocked] == ["released"] * 2
     recovery = executor.submit("owner:recovered", lambda: "recovered")
     assert recovery.result(timeout=1.0) == "recovered"
+
+
+def test_stalled_capacity_failures_do_not_run_future_callbacks_on_the_clock():
+    executor = ray_control_submission._RayControlSubmissionExecutor(
+        idle_timeout_s=0.01,
+        stall_timeout_s=0.02,
+        max_workers=2,
+        max_stalled_workers=1,
+        max_pending_submissions=6,
+        max_pending_per_owner=2,
+    )
+    release_submissions = threading.Event()
+    all_workers_blocked = threading.Event()
+    failure_callback_entered = threading.Event()
+    release_failure_callback = threading.Event()
+    entered_lock = threading.Lock()
+    entered = 0
+
+    def blocked_submission():
+        nonlocal entered
+        with entered_lock:
+            entered += 1
+            if entered == 2:
+                all_workers_blocked.set()
+        assert release_submissions.wait(timeout=5.0)
+        return "released"
+
+    def block_failure_callback(_future):
+        assert threading.current_thread().name != "vane-ray-control-deadlines"
+        failure_callback_entered.set()
+        assert release_failure_callback.wait(timeout=5.0)
+
+    running = [
+        executor.submit("owner:isolated-failure:0", blocked_submission),
+        executor.submit("owner:isolated-failure:1", blocked_submission),
+    ]
+    assert all_workers_blocked.wait(timeout=1.0)
+    first_rejected = executor.submit("owner:isolated-failure:0", lambda: "unexpected")
+    second_rejected = executor.submit("owner:isolated-failure:1", lambda: "unexpected")
+    first_rejected.add_done_callback(block_failure_callback)
+
+    try:
+        assert failure_callback_entered.wait(timeout=1.0)
+        # A callback blocked by the first set_exception must not prevent the
+        # second rejected Future from becoming terminal.
+        with pytest.raises(RuntimeError, match="stalled callback capacity is exhausted"):
+            second_rejected.result(timeout=1.0)
+    finally:
+        release_failure_callback.set()
+        release_submissions.set()
+
+    with pytest.raises(RuntimeError, match="stalled callback capacity is exhausted"):
+        first_rejected.result(timeout=1.0)
+    assert [future.result(timeout=1.0) for future in running] == ["released"] * 2
+
+
+def test_deadline_callback_dispatch_replaces_a_blocked_worker(monkeypatch):
+    callback_executor = ray_control_submission._RayControlSubmissionExecutor(
+        idle_timeout_s=0.01,
+        stall_timeout_s=0.02,
+        max_workers=1,
+        max_stalled_workers=1,
+        max_pending_submissions=3,
+        max_pending_per_owner=1,
+        thread_name_prefix="test-ray-control-deadline-callback",
+    )
+    monkeypatch.setattr(
+        ray_control_submission,
+        "_RAY_CONTROL_DEADLINE_CALLBACK_EXECUTOR",
+        callback_executor,
+    )
+    blocked_callback_entered = threading.Event()
+    release_blocked_callback = threading.Event()
+    healthy_callback_ran = threading.Event()
+
+    def blocked_callback():
+        assert threading.current_thread().name != "vane-ray-control-deadlines"
+        blocked_callback_entered.set()
+        assert release_blocked_callback.wait(timeout=5.0)
+
+    blocked_call = ray_control_submission.create_ray_control_deadline(
+        "owner:blocked-deadline-callback",
+        blocked_callback,
+    )
+    ray_control_deadline.RAY_CONTROL_DEADLINE_SCHEDULER.schedule(blocked_call, 0)
+    assert blocked_callback_entered.wait(timeout=1.0)
+
+    healthy_call = ray_control_submission.create_ray_control_deadline(
+        "owner:healthy-deadline-callback",
+        healthy_callback_ran.set,
+    )
+    ray_control_deadline.RAY_CONTROL_DEADLINE_SCHEDULER.schedule(healthy_call, 0)
+    try:
+        assert healthy_callback_ran.wait(timeout=1.0)
+        with callback_executor._condition:
+            assert any(worker.stalled for worker in callback_executor._workers.values())
+            assert len(callback_executor._workers) <= 2
+    finally:
+        release_blocked_callback.set()
 
 
 def test_ray_control_submission_deadline_start_failure_does_not_admit_work(monkeypatch):

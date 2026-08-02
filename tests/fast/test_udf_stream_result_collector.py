@@ -1060,13 +1060,22 @@ def test_cleanup_ticket_retries_a_hung_control_response(monkeypatch):
     collector = AsyncResultCollector(ray_module=_FakeRay())
     attempts = []
     response_future = None
+    cancel_callback_entered = threading.Event()
+    release_cancel_callback = threading.Event()
+
+    def block_cancel_callback(_future):
+        assert threading.current_thread().name != "vane-ray-control-deadlines"
+        cancel_callback_entered.set()
+        assert release_cancel_callback.wait(timeout=5.0)
 
     def transfer_owner():
         nonlocal response_future
         if response_future is None:
             response_future = Future()
             attempts.append(response_future)
-            if len(attempts) == 2:
+            if len(attempts) == 1:
+                response_future.add_done_callback(block_cancel_callback)
+            else:
                 response_future.set_result(True)
         if not response_future.done():
             return response_future
@@ -1092,16 +1101,18 @@ def test_cleanup_ticket_retries_a_hung_control_response(monkeypatch):
         store_error=False,
     )
     try:
+        assert cancel_callback_entered.wait(timeout=1.0)
         assert (
             _wait_cleanup_tickets(
                 tickets,
-                timeout_message="hung cleanup response was not retried",
+                timeout_message="blocking cancellation callback orphaned cleanup retry",
             )
             == ()
         )
         assert len(attempts) == 2
         assert attempts[0].cancelled()
     finally:
+        release_cancel_callback.set()
         collector.shutdown()
 
 

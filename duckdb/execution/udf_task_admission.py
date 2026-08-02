@@ -15,7 +15,10 @@ from duckdb.execution.ray_control_deadline import (
     RAY_CONTROL_DEADLINE_SCHEDULER,
     RayControlScheduledCall,
 )
-from duckdb.execution.ray_control_submission import submit_ray_control
+from duckdb.execution.ray_control_submission import (
+    create_ray_control_deadline,
+    submit_ray_control,
+)
 from duckdb.execution.ray_stream_adapter import (
     ray_object_ref_future,
     validate_ray_control_ack,
@@ -171,7 +174,8 @@ class _TaskAdmissionCancellation:
                 self._submitting = False
             self._schedule_retry()
             return
-        response_deadline = RAY_CONTROL_DEADLINE_SCHEDULER.create(
+        response_deadline = create_ray_control_deadline(
+            f"{self._submission_scope}:response-timeout",
             lambda: self._response_timed_out(response_future),
         )
         discard_response = self._publish_response_future(
@@ -272,13 +276,15 @@ class _TaskAdmissionCancellation:
                 return
             self._response_future = None
             self._response_deadline = None
+        # Publish the next owner before best-effort cancellation. Future.cancel
+        # invokes completion callbacks inline and may never return.
+        self._schedule_retry()
         try:
             cancel = getattr(response_future, "cancel", None)
             if callable(cancel):
                 cancel()
         except BaseException:
             pass
-        self._schedule_retry()
 
     def _schedule_retry(self) -> None:
         with self._lock:
@@ -290,7 +296,10 @@ class _TaskAdmissionCancellation:
             def retry() -> None:
                 self._retry(retry_call)
 
-            retry_call = RAY_CONTROL_DEADLINE_SCHEDULER.create(retry)
+            retry_call = create_ray_control_deadline(
+                f"{self._submission_scope}:retry",
+                retry,
+            )
             self._retry_call = retry_call
             retry_delay = self._retry_delay(self._retry_count)
         RAY_CONTROL_DEADLINE_SCHEDULER.schedule(

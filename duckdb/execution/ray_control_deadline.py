@@ -11,7 +11,7 @@ from collections.abc import Callable
 
 
 class RayControlScheduledCall:
-    """One cancellable callback owned by the process-wide deadline clock."""
+    """One cancellable, one-shot callback owned by the deadline clock."""
 
     def __init__(
         self,
@@ -21,13 +21,18 @@ class RayControlScheduledCall:
         self._scheduler = scheduler
         self._callback: Callable[[], None] | None = callback
         self._scheduled = False
+        self._cancelled = False
 
     def cancel(self) -> None:
         self._scheduler.cancel(self)
 
+    def cancelled(self) -> bool:
+        with self._scheduler._condition:
+            return self._cancelled
+
 
 class RayControlDeadlineScheduler:
-    """One process clock for control stalls, retries, and response timeouts."""
+    """One process clock that runs only bounded, non-blocking bookkeeping."""
 
     def __init__(self) -> None:
         self._condition = threading.Condition()
@@ -35,7 +40,13 @@ class RayControlDeadlineScheduler:
         self._next_sequence = 0
         self._thread: threading.Thread | None = None
 
-    def create(self, callback: Callable[[], None]) -> RayControlScheduledCall:
+    def create_inline(self, callback: Callable[[], None]) -> RayControlScheduledCall:
+        """Create an internal callback that is safe to run on the clock.
+
+        Potentially blocking owner work must use
+        ``create_ray_control_deadline`` from ``ray_control_submission`` so the
+        clock only hands that work to the bounded callback executor.
+        """
         if not callable(callback):
             raise TypeError("Ray control deadline callback must be callable")
         return RayControlScheduledCall(self, callback)
@@ -69,7 +80,7 @@ class RayControlDeadlineScheduler:
         with self._condition:
             if call._scheduler is not self:
                 raise RuntimeError("scheduled call belongs to a different deadline scheduler")
-            if call._callback is None:
+            if call._callback is None or call._cancelled:
                 return
             if call._scheduled:
                 raise RuntimeError("scheduled call is already armed")
@@ -87,6 +98,7 @@ class RayControlDeadlineScheduler:
                 raise RuntimeError("scheduled call belongs to a different deadline scheduler")
             # Clearing the callback also releases everything captured by a
             # cancelled heap entry before that entry reaches the queue head.
+            call._cancelled = True
             call._callback = None
             call._scheduled = False
             self._condition.notify()

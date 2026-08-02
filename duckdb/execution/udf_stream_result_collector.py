@@ -19,7 +19,10 @@ from duckdb.execution.ray_control_deadline import (
     RAY_CONTROL_DEADLINE_SCHEDULER,
     RayControlScheduledCall,
 )
-from duckdb.execution.ray_control_submission import submit_ray_control
+from duckdb.execution.ray_control_submission import (
+    create_ray_control_deadline,
+    submit_ray_control,
+)
 from duckdb.execution.ray_stream_adapter import (
     RayStreamAdapter,
     RayStreamCleanupOperation,
@@ -219,12 +222,12 @@ class AsyncResultCollector:
     The asyncio thread is the sole generator-readiness, read, and stream-state
     scheduler. Potentially blocking Ray control submissions and terminal
     operations run on admitted stream-owner daemon workers. Cleanup tickets use
-    the process-wide control deadline clock directly, so loop shutdown cannot
-    orphan a retry or response timeout. One blocked stream therefore cannot
-    consume a healthy peer's submission progress. Driver RPCs are observed
-    through public ObjectRef futures. Every terminal operation enters the ticket
-    ledger before its source record is removed, so shutdown can never observe an
-    ownership gap.
+    the process-wide control deadline clock, which hands owner callbacks to a
+    separate bounded/recoverable executor, so loop shutdown and one blocked
+    Future callback cannot orphan unrelated retries or response timeouts.
+    Driver RPCs are observed through public ObjectRef futures. Every terminal
+    operation enters the ticket ledger before its source record is removed, so
+    shutdown can never observe an ownership gap.
 
     The native dispatcher keeps this collector alive across empty slot
     intervals. ``shutdown`` is the process-owner fence and is called only after
@@ -1286,7 +1289,10 @@ class AsyncResultCollector:
             def retry() -> None:
                 self._run_cleanup_retry(ticket, retry_call)
 
-            retry_call = RAY_CONTROL_DEADLINE_SCHEDULER.create(retry)
+            retry_call = create_ray_control_deadline(
+                f"{ticket.operation.submission_scope}:cleanup-retry",
+                retry,
+            )
             ticket.retry_call = retry_call
             retry_delay = self._cleanup_retry_delay(ticket.retry_count)
         try:
@@ -1338,14 +1344,16 @@ class AsyncResultCollector:
                 return
             ticket.wait_future = None
             ticket.wait_timeout = None
+        # Make the ticket self-driving before abandoning the old response.
+        # Future.cancel invokes completion callbacks inline and may block.
+        self._retry_cleanup_ticket(ticket)
         try:
             assert ticket.abandon_wait is not None
             ticket.abandon_wait(future)
-        except BaseException as exc:
-            if not ticket.retry_on_error:
-                ticket.finish(exc)
-                return
-        self._retry_cleanup_ticket(ticket)
+        except BaseException:
+            # Abandonment is best-effort; the newly published retry owns the
+            # idempotent remote terminal transition from this point onward.
+            pass
 
     def _drive_cleanup_ticket(self, ticket: _CleanupTicket) -> None:
         with self._cv:
@@ -1477,7 +1485,10 @@ class AsyncResultCollector:
                         timeout_call,
                     )
 
-                timeout_call = RAY_CONTROL_DEADLINE_SCHEDULER.create(response_timed_out)
+                timeout_call = create_ray_control_deadline(
+                    f"{ticket.operation.submission_scope}:cleanup-response-timeout",
+                    response_timed_out,
+                )
                 with self._cv:
                     if ticket in self._cleanup_tickets and ticket.wait_future is result:
                         ticket.wait_timeout = timeout_call
