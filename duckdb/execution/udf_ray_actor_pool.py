@@ -488,7 +488,7 @@ def _create_actor_pools_for_nodes(
             if backend not in {"ray_task", "ray_actor", "subprocess_task", "subprocess_actor"}:
                 continue
             node_id = str(node["node_id"])
-            executor_options = {
+            executor_options: dict[str, Any] = {
                 "session_config": normalized_session_config,
             }
             actor_handles_map[node_id] = executor_options
