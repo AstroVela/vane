@@ -296,6 +296,8 @@ class FteWorkerLifecycleMixin:
             scheduler = _FTE_SCHEDULERS.get(query_id)
             if scheduler is None:
                 continue
+            if not scheduler.is_owned_by_manager_instance(self.manager_instance_id):
+                continue
             self._bind_fte_scheduler_handlers(scheduler)
             scheduler.enqueue(SourceInputExhausted.from_source_node_ids(query_id, exhausted_sources))
             handles.extend(scheduler.drain())
@@ -335,6 +337,8 @@ class FteWorkerLifecycleMixin:
             scheduler = _FTE_SCHEDULERS.get(query_id)
             if scheduler is None:
                 continue
+            if not scheduler.is_owned_by_manager_instance(self.manager_instance_id):
+                continue
             self._bind_fte_scheduler_handlers(scheduler)
             scheduler.enqueue(
                 WorkerFailed(
@@ -342,6 +346,7 @@ class FteWorkerLifecycleMixin:
                     failed_worker_id,
                     failure,
                     failed_worker_ids=failed_worker_ids,
+                    manager_instance_id=self.manager_instance_id,
                 )
             )
             handles.extend(scheduler.drain())
@@ -453,6 +458,9 @@ class FteWorkerLifecycleMixin:
             return
         self._worker_shutdown_started = True
         if self.worker_id:
+            with _FTE_REGISTRY_LOCK:
+                if _FTE_WORKER_HANDLES.get(str(self.worker_id)) is not self:
+                    return
             try:
                 self.mark_fte_worker_failed(
                     self.worker_id,

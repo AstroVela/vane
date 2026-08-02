@@ -264,8 +264,9 @@ class FteWorkerSubmissionMixin:
         with _FTE_REGISTRY_LOCK:
             if fte_registry_query_is_closing(query_id):
                 raise RuntimeError(f"FTE query registry is closing: {query_id}")
-            _FTE_SCHEDULERS.get_or_create(query_id)
+            scheduler = _FTE_SCHEDULERS.get_or_create(query_id)
             existing = _FTE_FRAGMENT_EXECUTIONS.get(key)
+        self._bind_fte_scheduler_handlers(scheduler)
         if existing is not None:
             return merge_existing(existing)
 

@@ -65,29 +65,37 @@ def _cleanup_started_workers(
     return errors
 
 
-def start_ray_workers(existing_worker_ids: list[str]) -> list[RayWorkerRuntime]:
+def start_ray_workers(existing_worker_ids: list[str], manager_instance_id: str) -> list[RayWorkerRuntime]:
     ACTOR_STARTUP_TIMEOUT = 120
+    manager_instance_id = str(manager_instance_id or "").strip()
+    if not manager_instance_id:
+        raise ValueError("manager_instance_id must be non-empty")
     env_overrides = _collect_vane_env_overrides()
     actors = []
     worker_handles = []
     try:
         for node in ray.nodes():
             node_manager_address = str(node.get("NodeManagerAddress") or "").strip()
-            base_worker_id = node_manager_address or str(node.get("NodeID") or "")
+            node_id = str(node.get("NodeID") or "").strip()
+            worker_host = node_manager_address or node_id
             if (
                 "Resources" in node
                 and "CPU" in node["Resources"]
                 and "memory" in node["Resources"]
                 and node["Resources"]["CPU"] > 0
                 and node["Resources"]["memory"] > 0
-                and base_worker_id
+                and node_id
+                and worker_host
             ):
-                worker_id = base_worker_id
+                worker_id = f"{manager_instance_id}:{node_id}:0"
                 if worker_id in existing_worker_ids:
                     continue
                 worker_env = dict(env_overrides)
+                worker_env["VANE_WORKER_HOST"] = worker_host
                 worker_env["VANE_WORKER_ID"] = worker_id
                 worker_env["VANE_WORKER_INDEX"] = "0"
+                worker_env["VANE_WORKER_MANAGER_INSTANCE_ID"] = manager_instance_id
+                worker_env["VANE_WORKER_NODE_ID"] = node_id
                 memory_layout = build_ray_node_memory_layout(int(node["Resources"]["memory"]))
                 # max_concurrency limits how many control/execute RPCs can queue
                 # inside the actor. FTE backpressure is handled by task
@@ -103,7 +111,7 @@ def start_ray_workers(existing_worker_ids: list[str]) -> list[RayWorkerRuntime]:
                     memory=(memory_layout.worker_duckdb_memory_bytes + memory_layout.runtime_reserve_bytes),
                     runtime_env=_persistent_worker_runtime_env(worker_env),
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                        node_id=node["NodeID"],
+                        node_id=node_id,
                         soft=False,
                     ),
                 ).remote(
@@ -133,7 +141,9 @@ def start_ray_workers(existing_worker_ids: list[str]) -> list[RayWorkerRuntime]:
             actor_handle = RayWorkerActorHandle(
                 actor,
                 worker_id=worker_id,
-                node_id=str(node["NodeID"]),
+                node_id=str(node["NodeID"]).strip(),
+                host=str(node.get("NodeManagerAddress") or "").strip() or str(node["NodeID"]).strip(),
+                manager_instance_id=manager_instance_id,
                 memory_capacity_bytes=build_ray_node_memory_layout(
                     int(node["Resources"]["memory"])
                 ).task_heap_capacity_bytes,

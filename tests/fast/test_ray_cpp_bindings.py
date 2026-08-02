@@ -367,7 +367,7 @@ def test_worker_submission_preserves_worker_plan_exception_cause(monkeypatch, ma
         monkeypatch.setattr(
             ray_worker_handle,
             "start_ray_workers",
-            lambda _existing_ids: [
+            lambda _existing_ids, _manager_instance_id: [
                 duckdb.ray_cxx.RayWorkerRuntime(
                     "worker-1",
                     target,
@@ -2692,7 +2692,7 @@ def test_ray_worker_manager_integration(monkeypatch):
 
     dummy_worker_handle = DummyRayWorkerHandle()
 
-    def start_ray_workers(_existing_ids):
+    def start_ray_workers(_existing_ids, _manager_instance_id):
         return [duckdb.ray_cxx.RayWorkerRuntime("worker-1", dummy_worker_handle, 1.0, 0.0, 1024)]
 
     autoscale_called = {}
@@ -2728,6 +2728,44 @@ def test_ray_worker_manager_integration(monkeypatch):
     assert dummy_worker_handle.fte_cleanup_query_calls == ["query-lifecycle"]
 
 
+def test_ray_worker_manager_instances_use_distinct_worker_scopes(monkeypatch):
+    start_calls = []
+
+    class DummyRayWorkerHandle:
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    def start_ray_workers(existing_ids, manager_instance_id):
+        start_calls.append((tuple(existing_ids), manager_instance_id))
+        worker_id = f"{manager_instance_id}:node-a:0"
+        return [duckdb.ray_cxx.RayWorkerRuntime(worker_id, DummyRayWorkerHandle(), 1.0, 0.0, 1024)]
+
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(ray_worker_handle, "start_ray_workers", start_ray_workers)
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    first_manager = duckdb.ray_cxx.RayWorkerManager()
+    second_manager = duckdb.ray_cxx.RayWorkerManager()
+
+    first_snapshots = first_manager.worker_snapshots()
+    second_snapshots = second_manager.worker_snapshots()
+
+    assert [existing_ids for existing_ids, _manager_id in start_calls] == [(), ()]
+    assert start_calls[0][1]
+    assert start_calls[1][1]
+    assert start_calls[0][1] != start_calls[1][1]
+    assert first_snapshots[0]["worker_id"] != second_snapshots[0]["worker_id"]
+
+    first_manager.shutdown()
+    second_manager.shutdown()
+
+
 def test_ray_worker_manager_worker_snapshot_refresh_is_single_flight(monkeypatch):
     thread_count = 8
     caller_barrier = threading.Barrier(thread_count)
@@ -2745,7 +2783,7 @@ def test_ray_worker_manager_worker_snapshot_refresh_is_single_flight(monkeypatch
         def abort_shutdown(self):
             return None
 
-    def start_ray_workers(existing_ids):
+    def start_ray_workers(existing_ids, _manager_instance_id):
         with start_condition:
             start_calls.append(tuple(existing_ids))
             start_condition.notify_all()
@@ -2819,9 +2857,9 @@ def test_ray_worker_manager_failed_snapshot_refresh_is_shared_and_retryable(monk
         def abort_shutdown(self):
             return None
 
-    def start_ray_workers(existing_ids):
+    def start_ray_workers(existing_ids, manager_instance_id):
         with start_condition:
-            start_calls.append(tuple(existing_ids))
+            start_calls.append((tuple(existing_ids), manager_instance_id))
             call_number = len(start_calls)
             start_condition.notify_all()
             if call_number == 1:
@@ -2866,7 +2904,8 @@ def test_ray_worker_manager_failed_snapshot_refresh_is_shared_and_retryable(monk
 
     snapshots = manager.worker_snapshots()
     assert [snapshot["worker_id"] for snapshot in snapshots] == ["worker-retry"]
-    assert start_calls == [(), ()]
+    assert [existing_ids for existing_ids, _manager_id in start_calls] == [(), ()]
+    assert start_calls[0][1] == start_calls[1][1]
     manager.shutdown()
 
 
@@ -2889,7 +2928,7 @@ def test_ray_worker_manager_rejects_and_cleans_duplicate_refresh_workers(monkeyp
             if self.label == "first":
                 raise RuntimeError("planned first abort failure")
 
-    def start_ray_workers(existing_ids):
+    def start_ray_workers(existing_ids, _manager_instance_id):
         start_calls.append(tuple(existing_ids))
         if len(start_calls) == 1:
             return [
@@ -2946,7 +2985,7 @@ def test_ray_worker_manager_cleans_all_runtimes_after_invalid_refresh_entry(monk
         def abort_shutdown(self):
             aborted.append(self.label)
 
-    def start_ray_workers(_existing_ids):
+    def start_ray_workers(_existing_ids, _manager_instance_id):
         return [
             duckdb.ray_cxx.RayWorkerRuntime(
                 "worker-before-invalid",
@@ -3002,7 +3041,7 @@ def test_ray_worker_manager_snapshot_refresh_shutdown_has_no_deadlock(monkeypatc
         def abort_shutdown(self):
             aborted.append("worker-racing-shutdown")
 
-    def start_ray_workers(existing_ids):
+    def start_ray_workers(existing_ids, _manager_instance_id):
         start_calls.append(tuple(existing_ids))
         refresh_entered.set()
         assert release_refresh.wait(timeout=10)
@@ -3099,7 +3138,7 @@ def test_ray_worker_manager_drop_is_best_effort_across_worker_failures(monkeypat
         def shutdown(self):
             pass
 
-    def start_ray_workers(_existing_ids):
+    def start_ray_workers(_existing_ids, _manager_instance_id):
         return [
             duckdb.ray_cxx.RayWorkerRuntime(
                 "worker-dead",
@@ -3185,7 +3224,7 @@ def test_ray_worker_manager_drop_fans_out_after_result_payload_release_failure(m
         def shutdown(self):
             pass
 
-    def start_ray_workers(_existing_ids):
+    def start_ray_workers(_existing_ids, _manager_instance_id):
         return [
             duckdb.ray_cxx.RayWorkerRuntime(
                 "worker-with-result",
@@ -3246,7 +3285,7 @@ def test_ray_worker_manager_shutdown_uses_global_prepare_barrier(monkeypatch):
         def abort_shutdown(self):
             raise AssertionError("successful shutdown must not force-terminate actors")
 
-    def start_ray_workers(_existing_ids):
+    def start_ray_workers(_existing_ids, _manager_instance_id):
         return [
             duckdb.ray_cxx.RayWorkerRuntime(
                 "worker-a",
@@ -3306,7 +3345,7 @@ def test_ray_worker_manager_concurrent_shutdown_waits_for_first_result(monkeypat
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [
+        lambda _existing_ids, _manager_instance_id: [
             duckdb.ray_cxx.RayWorkerRuntime(
                 "worker-a",
                 DummyRayWorkerHandle(),
@@ -3380,7 +3419,7 @@ def test_ray_worker_manager_shutdown_waits_for_entered_result_collection(monkeyp
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [
+        lambda _existing_ids, _manager_instance_id: [
             duckdb.ray_cxx.RayWorkerRuntime(
                 "worker-a",
                 DummyRayWorkerHandle(),
@@ -3444,7 +3483,7 @@ def test_ray_worker_manager_shutdown_aborts_all_actors_after_prepare_error(monke
         def abort_shutdown(self):
             calls.append(("abort", self.worker_id))
 
-    def start_ray_workers(_existing_ids):
+    def start_ray_workers(_existing_ids, _manager_instance_id):
         return [
             duckdb.ray_cxx.RayWorkerRuntime(
                 "worker-failing",
@@ -3502,7 +3541,7 @@ def test_ray_worker_manager_shutdown_finishes_all_actors_after_finish_error(monk
         def abort_shutdown(self):
             raise AssertionError("a finish error happens after the prepare barrier")
 
-    def start_ray_workers(_existing_ids):
+    def start_ray_workers(_existing_ids, _manager_instance_id):
         return [
             duckdb.ray_cxx.RayWorkerRuntime(
                 "worker-failing",
@@ -3542,7 +3581,7 @@ def test_ray_worker_manager_shutdown_finishes_all_actors_after_finish_error(monk
 
 
 def test_ray_worker_manager_worker_snapshots_fail_fast(monkeypatch):
-    def start_ray_workers(_existing_ids):
+    def start_ray_workers(_existing_ids, _manager_instance_id):
         raise RuntimeError("start-ray-workers boom")
 
     def try_autoscale(_bundles):
@@ -3559,7 +3598,7 @@ def test_ray_worker_manager_worker_snapshots_fail_fast(monkeypatch):
 
 
 def test_ray_worker_manager_try_autoscale_fail_fast(monkeypatch):
-    def start_ray_workers(_existing_ids):
+    def start_ray_workers(_existing_ids, _manager_instance_id):
         return []
 
     def try_autoscale(_bundles):

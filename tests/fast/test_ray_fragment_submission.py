@@ -19,10 +19,12 @@ ray = pytest.importorskip("ray")
 
 import duckdb.runners.fte.fte_execution as fte_execution_mod
 import duckdb.runners.ray.fragment_worker_commands as worker_commands_mod
+import duckdb.runners.ray.fragment_worker_failures as worker_failures_mod
 import duckdb.runners.ray.fragment_worker_placement as worker_placement_mod
 import duckdb.runners.ray.fragment_worker_selection as worker_selection_mod
 import duckdb.runners.ray.fragment_worker_submission as fragment_submission_mod
 import duckdb.runners.ray.fragment_worker_task_control as task_control_mod
+import duckdb.runners.ray.fragment_worker_transitions as worker_transitions_mod
 import duckdb.runners.ray.fte_fragment_scheduler as fte_fragment_scheduler_mod
 import duckdb.runners.ray.worker as worker_mod
 import duckdb.runners.ray.worker_handle as worker_handle_mod
@@ -46,6 +48,7 @@ from duckdb.runners.ray.fte_events import (
     FteCreateTaskCommand,
     FteNoMoreSplitsCommand,
     TaskStatusChanged,
+    WorkerFailed,
     WorkerReservationCompleted,
 )
 from duckdb.runners.ray.query_execution_graph import (
@@ -78,12 +81,16 @@ class RayWorkerActorHandle(_ProductionRayWorkerActorHandle):
         memory_capacity_bytes,
         worker_id=None,
         node_id=None,
+        host=None,
+        manager_instance_id=None,
     ):
         super().__init__(
             actor_handle,
             memory_capacity_bytes=memory_capacity_bytes,
             worker_id=str(worker_id or f"test-worker-{id(actor_handle)}"),
             node_id=str(node_id or _test_ray_node_id()),
+            host=host,
+            manager_instance_id=manager_instance_id,
         )
 
     def record_fte_task_result_ready(self, attempt_id):
@@ -5661,14 +5668,307 @@ def test_fte_reservation_failure_does_not_publish_owner(monkeypatch):
 def test_fte_owner_selection_prefers_node_requirement_host(monkeypatch):
     actor0 = _FakeActor()
     actor1 = _FakeActor()
-    non_matching = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="aaa#0")
-    matching = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="zzz#0")
+    non_matching = RayWorkerActorHandle(
+        actor0,
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:0",
+        host="aaa",
+    )
+    matching = RayWorkerActorHandle(
+        actor1,
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-b:0",
+        host="zzz",
+    )
 
     selected = non_matching._select_fte_worker(
         node_requirements=NodeRequirements(host="zzz"),
     )
 
     assert selected is matching
+
+
+def test_fte_worker_registry_rejects_duplicate_worker_identity():
+    first = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:0",
+        host="10.0.0.1",
+    )
+
+    with pytest.raises(RuntimeError, match="FTE worker id is already registered: manager-a:node-a:0"):
+        RayWorkerActorHandle(
+            _FakeActor(),
+            memory_capacity_bytes=1 << 60,
+            worker_id="manager-a:node-a:0",
+            host="10.0.0.1",
+        )
+
+    assert worker_handle_mod._FTE_WORKER_HANDLES["manager-a:node-a:0"] is first
+    assert first._fte_healthy is True
+
+
+def test_fte_worker_selection_stays_with_manager_scope():
+    current = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-z:0",
+        manager_instance_id="manager-a",
+    )
+    RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-b:node-a:0",
+        manager_instance_id="manager-b",
+    )
+
+    assert current._select_fte_worker() is current
+
+
+def test_fte_registry_stats_exposes_worker_topology():
+    worker_id = "manager-a:node-a:0"
+    RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id=worker_id,
+        node_id="node-a",
+        host="10.0.0.1",
+        manager_instance_id="manager-a",
+    )
+
+    worker_stats = worker_handle_mod.fte_registry_stats()["workers"][worker_id]
+
+    assert worker_stats["worker_id"] == worker_id
+    assert worker_stats["manager_instance_id"] == "manager-a"
+    assert worker_stats["node_id"] == "node-a"
+    assert worker_stats["host"] == "10.0.0.1"
+
+
+def test_fte_worker_failure_payload_exposes_worker_topology():
+    worker_id = "manager-a:node-a:0"
+    RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id=worker_id,
+        node_id="node-a",
+        host="10.0.0.1",
+        manager_instance_id="manager-a",
+    )
+
+    failure = fte_fragment_scheduler_mod._worker_failure_payload(worker_id, RuntimeError("worker lost"))
+
+    assert failure["worker_id"] == worker_id
+    assert failure["manager_instance_id"] == "manager-a"
+    assert failure["node_id"] == "node-a"
+    assert failure["host"] == "10.0.0.1"
+
+
+def test_fte_worker_command_debug_fields_exposes_worker_topology():
+    worker_id = "manager-a:node-a:0"
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id=worker_id,
+        node_id="node-a",
+        host="10.0.0.1",
+        manager_instance_id="manager-a",
+    )
+    command = SimpleNamespace(worker=handle, worker_id=worker_id)
+
+    assert worker_commands_mod._fte_worker_command_debug_fields(command) == {
+        "worker_id": worker_id,
+        "manager_instance_id": "manager-a",
+        "node_id": "node-a",
+        "host": "10.0.0.1",
+    }
+
+
+def test_fte_worker_failure_replacement_stays_with_manager_scope():
+    same_manager = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-z:0",
+        manager_instance_id="manager-a",
+    )
+    RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-b:node-a:0",
+        manager_instance_id="manager-b",
+    )
+
+    replacement = fte_fragment_scheduler_mod._select_replacement_fte_worker(
+        "manager-a:failed:0",
+        manager_instance_id="manager-a",
+    )
+
+    assert replacement is same_manager
+
+
+def test_fte_worker_quarantine_rejects_cross_manager_identity():
+    other_manager = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-b:node-a:0",
+        manager_instance_id="manager-b",
+    )
+
+    failed_worker_ids = worker_failures_mod.quarantine_fte_worker(
+        other_manager.worker_id,
+        manager_instance_id="manager-a",
+    )
+
+    assert failed_worker_ids == frozenset()
+    assert other_manager._fte_healthy is True
+
+
+def test_fte_blank_manager_scope_remains_legacy_and_fail_closed():
+    legacy = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="legacy#0",
+    )
+    managed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-b:node-a:0",
+        manager_instance_id="manager-b",
+    )
+
+    failed_worker_ids = worker_failures_mod.quarantine_fte_worker(
+        managed.worker_id,
+        manager_instance_id="   ",
+    )
+    scheduled = fte_fragment_scheduler_mod._mark_fte_worker_failed(
+        managed.worker_id,
+        fte_fragment_scheduler_mod._worker_failure_payload(
+            managed.worker_id,
+            RuntimeError("planned failure"),
+        ),
+        manager_instance_id="   ",
+    )
+
+    assert failed_worker_ids == frozenset()
+    assert scheduled == []
+    assert worker_handle_mod._FTE_WORKER_HANDLES[managed.worker_id] is managed
+    assert managed._fte_healthy is True
+    assert worker_failures_mod.quarantine_fte_worker(
+        legacy.worker_id,
+        manager_instance_id="   ",
+    ) == frozenset({legacy.worker_id})
+    assert legacy._fte_healthy is False
+
+
+def test_fte_memory_pressure_skips_worker_without_budget(monkeypatch):
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="legacy#0",
+    )
+    monkeypatch.setattr(
+        worker_transitions_mod,
+        "_fte_effective_worker_memory_budget_bytes",
+        lambda _worker, _execution_class: None,
+    )
+
+    assert handle._revoke_fte_speculative_tasks_for_memory_pressure_direct() == []
+
+
+def test_fte_query_scheduler_rejects_cross_manager_rebinding():
+    first = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:0",
+        manager_instance_id="manager-a",
+    )
+    second = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-b:node-a:0",
+        manager_instance_id="manager-b",
+    )
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create("query-manager-scope")
+    first._bind_fte_scheduler_handlers(scheduler)
+
+    with pytest.raises(RuntimeError, match="FTE query scheduler manager ownership mismatch"):
+        second._bind_fte_scheduler_handlers(scheduler)
+
+
+def test_fte_global_worker_failure_does_not_claim_unbound_scheduler():
+    first = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:0",
+        manager_instance_id="manager-a",
+    )
+    second = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-b:node-a:0",
+        manager_instance_id="manager-b",
+    )
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create("query-unbound-manager-scope")
+
+    first.mark_fte_worker_failed(first.worker_id, RuntimeError("planned failure"))
+    second._bind_fte_scheduler_handlers(scheduler)
+
+    assert scheduler.is_owned_by_manager_instance("manager-b")
+
+
+@pytest.mark.parametrize("failed_manager_instance_id", ["manager-a", ""])
+def test_fte_worker_failure_event_rejects_cross_manager_scheduler(failed_manager_instance_id):
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id=f"{failed_manager_instance_id or 'legacy'}:node-a:0",
+        manager_instance_id=failed_manager_instance_id,
+    )
+    owner = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-b:node-a:0",
+        manager_instance_id="manager-b",
+    )
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create("query-cross-manager-failure")
+    owner._bind_fte_scheduler_handlers(scheduler)
+
+    scheduled = worker_failures_mod.mark_fte_worker_failed_for_event(
+        WorkerFailed(
+            scheduler.query_id,
+            failed.worker_id,
+            RuntimeError("planned failure"),
+            manager_instance_id=failed_manager_instance_id,
+        )
+    )
+
+    assert scheduled == []
+    assert scheduler.stats().failed_worker_count == 0
+    assert worker_handle_mod._FTE_WORKER_HANDLES[failed.worker_id] is failed
+    assert failed._fte_healthy is True
+
+
+def test_stale_worker_shutdown_does_not_fail_current_registry_owner(monkeypatch):
+    stale = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:0",
+        host="10.0.0.1",
+    )
+    current = SimpleNamespace(_fte_healthy=True)
+    failure_calls = []
+    monkeypatch.setattr(
+        stale,
+        "mark_fte_worker_failed",
+        lambda worker_id, error: failure_calls.append((worker_id, error)),
+    )
+    with worker_handle_mod._FTE_REGISTRY_LOCK:
+        worker_handle_mod._FTE_WORKER_HANDLES[stale.worker_id] = current
+
+    stale._begin_worker_shutdown()
+
+    assert failure_calls == []
+    assert worker_handle_mod._FTE_WORKER_HANDLES[stale.worker_id] is current
+    assert current._fte_healthy is True
 
 
 def test_fte_non_remote_node_requirement_requires_matching_host(monkeypatch):
@@ -10773,7 +11073,7 @@ assert restored.__name__ == actor_cls.__name__
     assert result.returncode == 0, result.stderr or result.stdout
 
 
-def test_ray_worker_fte_admission_log_uses_worker_id(monkeypatch, capsys):
+def test_ray_worker_fte_debug_logs_use_worker_topology(monkeypatch, capsys):
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
     actor._fte_task_manager = None
@@ -10790,7 +11090,11 @@ def test_ray_worker_fte_admission_log_uses_worker_id(monkeypatch, capsys):
 
     actor._execute_fte_request = execute_fte_request
     monkeypatch.setenv("VANE_FTE_ADMISSION_DEBUG", "1")
+    monkeypatch.setenv("VANE_FTE_RESULT_DEBUG", "1")
     monkeypatch.setenv("VANE_WORKER_ID", "ray-worker-log")
+    monkeypatch.setenv("VANE_WORKER_MANAGER_INSTANCE_ID", "manager-log")
+    monkeypatch.setenv("VANE_WORKER_NODE_ID", "node-log")
+    monkeypatch.setenv("VANE_WORKER_HOST", "10.0.0.9")
 
     async def run():
         task_id = {
@@ -10835,12 +11139,21 @@ def test_ray_worker_fte_admission_log_uses_worker_id(monkeypatch, capsys):
 
     assert "[vane-fte-admission" in captured
     assert "worker_id=ray-worker-log" in captured
+    assert "manager_instance_id=manager-log" in captured
+    assert "node_id=node-log" in captured
+    assert "host=10.0.0.9" in captured
     assert "event=manager_init" in captured
     assert "event=create_task" in captured
     assert "event=start_task" in captured
     assert "event=task_done" in captured
     assert "task_id=ray-log.0.0.0" in captured
     assert "max_running=4" in captured
+    result_lines = [line for line in captured.splitlines() if "[vane-fte-result" in line]
+    assert result_lines
+    assert all("worker_id=ray-worker-log" in line for line in result_lines)
+    assert all("manager_instance_id=manager-log" in line for line in result_lines)
+    assert all("node_id=node-log" in line for line in result_lines)
+    assert all("host=10.0.0.9" in line for line in result_lines)
 
 
 def test_drop_query_fragments_clears_local_registry():
@@ -11037,17 +11350,40 @@ def test_start_ray_workers_keeps_flight_host_worker_local_and_skips_nested_warmu
         lambda **kwargs: ("node-affinity", kwargs),
     )
 
-    runtimes = worker_handle_mod.start_ray_workers(existing_worker_ids=[])
+    runtimes = worker_handle_mod.start_ray_workers(
+        existing_worker_ids=[],
+        manager_instance_id="manager-a",
+    )
+    other_manager_runtimes = worker_handle_mod.start_ray_workers(
+        existing_worker_ids=[],
+        manager_instance_id="manager-b",
+    )
+    refreshed_runtimes = worker_handle_mod.start_ray_workers(
+        existing_worker_ids=["manager-a:node-a:0", "manager-a:node-b:0"],
+        manager_instance_id="manager-a",
+    )
 
     assert len(runtimes) == 2
-    for index, address in enumerate(("10.0.0.1", "10.0.0.2")):
+    assert len(other_manager_runtimes) == 2
+    assert refreshed_runtimes == []
+    assert sorted(worker_handle_mod._FTE_WORKER_HANDLES) == [
+        "manager-a:node-a:0",
+        "manager-a:node-b:0",
+        "manager-b:node-a:0",
+        "manager-b:node-b:0",
+    ]
+    for index, (node_id, address) in enumerate((("node-a", "10.0.0.1"), ("node-b", "10.0.0.2"))):
+        worker_id = f"manager-a:{node_id}:0"
         assert option_calls[index]["memory"] == 358
         assert option_calls[index]["runtime_env"] == {
             "env_vars": {
                 "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
                 "VANE_WORKER": "1",
-                "VANE_WORKER_ID": address,
+                "VANE_WORKER_HOST": address,
+                "VANE_WORKER_ID": worker_id,
                 "VANE_WORKER_INDEX": "0",
+                "VANE_WORKER_MANAGER_INSTANCE_ID": "manager-a",
+                "VANE_WORKER_NODE_ID": node_id,
             },
         }
         assert "num_cpus" not in option_calls[index]
@@ -11056,6 +11392,12 @@ def test_start_ray_workers_keeps_flight_host_worker_local_and_skips_nested_warmu
         assert remote_calls[index]["duckdb_memory_bytes"] == 256
         assert remote_calls[index]["task_heap_capacity_bytes"] == 615
         assert remote_calls[index]["ray_node_ip_address"] == address
+        assert worker_handle_mod._FTE_WORKER_HANDLES[worker_id].host == address
+        assert worker_handle_mod._FTE_WORKER_HANDLES[worker_id].manager_instance_id == "manager-a"
+        other_worker_id = f"manager-b:{node_id}:0"
+        assert option_calls[index + 2]["runtime_env"]["env_vars"]["VANE_WORKER_ID"] == other_worker_id
+        assert worker_handle_mod._FTE_WORKER_HANDLES[other_worker_id].host == address
+        assert worker_handle_mod._FTE_WORKER_HANDLES[other_worker_id].manager_instance_id == "manager-b"
     assert get_calls == []
 
 
@@ -11121,7 +11463,10 @@ def test_start_ray_workers_cleans_up_actors_after_warmup_failure(monkeypatch, wa
     )
 
     with pytest.raises(RuntimeError, match=error_match):
-        worker_handle_mod.start_ray_workers(existing_worker_ids=[])
+        worker_handle_mod.start_ray_workers(
+            existing_worker_ids=[],
+            manager_instance_id="manager-a",
+        )
 
     assert sorted(killed) == [("node-a", True), ("node-b", True)]
 

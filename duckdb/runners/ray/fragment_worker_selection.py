@@ -28,11 +28,15 @@ def available_fte_workers(
     exclude: set[str] | None = None,
 ) -> list[Any]:
     exclude = exclude or set()
+    manager_instance_id = str(getattr(current_worker, "manager_instance_id", ""))
     with _FTE_REGISTRY_LOCK:
         workers = [
             handle
             for worker_id, handle in sorted(_FTE_WORKER_HANDLES.items())
-            if handle is not None and str(worker_id) not in exclude and handle._fte_healthy
+            if handle is not None
+            and str(worker_id) not in exclude
+            and handle._fte_healthy
+            and str(getattr(handle, "manager_instance_id", "")) == manager_instance_id
         ]
         include_current_worker = (
             current_worker not in workers

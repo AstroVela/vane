@@ -18,6 +18,52 @@ class _RuntimeContext:
         return "node-a"
 
 
+def test_ray_worker_observability_log_treats_off_as_disabled(monkeypatch, capsys):
+    monkeypatch.setenv("VANE_FTE_ADMISSION_DEBUG", "off")
+    monkeypatch.delenv("VANE_RAY_WORKER_MEMORY_DEBUG", raising=False)
+    monkeypatch.delenv("VANE_FTE_RESULT_DEBUG", raising=False)
+    monkeypatch.delenv("DUCKDB_DISTRIBUTED_DEBUG", raising=False)
+
+    worker_mod._ray_worker_observability_log("worker_registered", worker_id="worker-a")
+
+    assert capsys.readouterr().err == ""
+
+
+def test_ray_worker_init_logs_worker_topology(monkeypatch, capfd):
+    class _ActorRuntimeContext(_RuntimeContext):
+        def get_actor_id(self):
+            return "actor-a"
+
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    monkeypatch.setenv("VANE_FTE_ADMISSION_DEBUG", "1")
+    monkeypatch.setenv("VANE_WORKER_ID", "manager-a:node-a:0")
+    monkeypatch.setenv("VANE_WORKER_MANAGER_INSTANCE_ID", "manager-a")
+    monkeypatch.setenv("VANE_WORKER_NODE_ID", "node-a")
+    monkeypatch.setenv("VANE_WORKER_HOST", "10.0.0.1")
+    monkeypatch.setattr(worker_mod.ray, "get_runtime_context", _ActorRuntimeContext)
+    monkeypatch.setattr(worker_mod, "_warm_up_python_native_dependencies", lambda: None)
+    monkeypatch.setattr(worker_mod, "_ensure_python_datasource_runtime", lambda: None)
+    monkeypatch.setattr(actor_cls, "_get_shared_conn", lambda _self: None)
+
+    actor = actor_cls(
+        num_cpus=2,
+        num_gpus=0,
+        duckdb_memory_bytes=128 * 1024**2,
+        task_heap_capacity_bytes=128 * 1024**2,
+        ray_node_ip_address="10.0.0.1",
+    )
+    actor_cls.__del__(actor)
+    captured = capfd.readouterr().err
+
+    assert "[vane-ray-worker" in captured
+    assert "event=worker_registered" in captured
+    assert "worker_id=manager-a:node-a:0" in captured
+    assert "manager_instance_id=manager-a" in captured
+    assert "node_id=node-a" in captured
+    assert "host=10.0.0.1" in captured
+    assert "actor_id=actor-a" in captured
+
+
 @pytest.mark.parametrize(
     ("node_local_host", "expected_host"),
     [

@@ -69,6 +69,7 @@ class WorkerFailed(FteEvent):
     worker_id: str
     error: Any = None
     failed_worker_ids: frozenset[str] | None = None
+    manager_instance_id: str | None = None
 
 
 @dataclass(frozen=True)

@@ -29,6 +29,8 @@ string SubmissionErrorOwnerQueryId(const std::vector<duckdb::distributed::Worker
 
 class RayWorkerManager : public duckdb::distributed::WorkerManager {
 public:
+	RayWorkerManager();
+
 	DuckDBResult<void> submit_fte_task_events(std::vector<duckdb::distributed::WorkerTask> tasks) override;
 
 	// WorkerManager interface implementations (one-to-one with Rust trait)
@@ -96,6 +98,7 @@ private:
 		bool active_;
 	};
 
+	const string manager_instance_id_;
 	mutable mutex mutex_;
 	mutable std::condition_variable shutdown_cv_;
 	mutable State state_;

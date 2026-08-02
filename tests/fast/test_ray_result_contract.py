@@ -6255,7 +6255,9 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [duckdb.ray_cxx.RayWorkerRuntime("node-a", worker, 4.0, 0.0, 8 << 30)],
+        lambda _existing_ids, _manager_instance_id: [
+            duckdb.ray_cxx.RayWorkerRuntime("node-a", worker, 4.0, 0.0, 8 << 30)
+        ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
@@ -6991,7 +6993,9 @@ def test_run_copy_plan_propagates_worker_task_failure_before_finalize(tmp_path, 
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [duckdb.ray_cxx.RayWorkerRuntime("worker-fail", failing_worker, 1.0, 0.0, 1024)],
+        lambda _existing_ids, _manager_instance_id: [
+            duckdb.ray_cxx.RayWorkerRuntime("worker-fail", failing_worker, 1.0, 0.0, 1024)
+        ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
@@ -7128,7 +7132,9 @@ def test_run_copy_plan_direct_write_failure_cleans_uncommitted_run(tmp_path, mon
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [duckdb.ray_cxx.RayWorkerRuntime("worker-direct-fail", failing_worker, 1.0, 0.0, 1024)],
+        lambda _existing_ids, _manager_instance_id: [
+            duckdb.ray_cxx.RayWorkerRuntime("worker-direct-fail", failing_worker, 1.0, 0.0, 1024)
+        ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
@@ -7193,7 +7199,9 @@ def test_wait_fte_query_propagates_status_errors(monkeypatch):
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [duckdb.ray_cxx.RayWorkerRuntime("worker-status-fail", failing_worker, 1.0, 0.0, 1024)],
+        lambda _existing_ids, _manager_instance_id: [
+            duckdb.ray_cxx.RayWorkerRuntime("worker-status-fail", failing_worker, 1.0, 0.0, 1024)
+        ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
@@ -7251,7 +7259,9 @@ def test_wait_fte_query_releases_gil_while_waiting(monkeypatch):
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [duckdb.ray_cxx.RayWorkerRuntime("worker-gil-wait", worker, 1.0, 0.0, 1024)],
+        lambda _existing_ids, _manager_instance_id: [
+            duckdb.ray_cxx.RayWorkerRuntime("worker-gil-wait", worker, 1.0, 0.0, 1024)
+        ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
@@ -7308,7 +7318,9 @@ def test_wait_fte_query_rejects_malformed_query_status(monkeypatch):
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [duckdb.ray_cxx.RayWorkerRuntime("worker-status-malformed", worker, 1.0, 0.0, 1024)],
+        lambda _existing_ids, _manager_instance_id: [
+            duckdb.ray_cxx.RayWorkerRuntime("worker-status-malformed", worker, 1.0, 0.0, 1024)
+        ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
@@ -7376,7 +7388,9 @@ def test_wait_fte_query_rejects_result_handles_without_task_id(monkeypatch):
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [duckdb.ray_cxx.RayWorkerRuntime("worker-handle-malformed", worker, 1.0, 0.0, 1024)],
+        lambda _existing_ids, _manager_instance_id: [
+            duckdb.ray_cxx.RayWorkerRuntime("worker-handle-malformed", worker, 1.0, 0.0, 1024)
+        ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
@@ -7445,7 +7459,9 @@ def test_wait_fte_query_rejects_result_handles_without_worker_id(monkeypatch):
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [duckdb.ray_cxx.RayWorkerRuntime("worker-coordinator", worker, 1.0, 0.0, 1024)],
+        lambda _existing_ids, _manager_instance_id: [
+            duckdb.ray_cxx.RayWorkerRuntime("worker-coordinator", worker, 1.0, 0.0, 1024)
+        ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
@@ -7536,7 +7552,9 @@ def test_wait_fte_query_propagates_selected_attempt_handle_errors(monkeypatch):
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [duckdb.ray_cxx.RayWorkerRuntime("worker-selected", worker, 1.0, 0.0, 1024)],
+        lambda _existing_ids, _manager_instance_id: [
+            duckdb.ray_cxx.RayWorkerRuntime("worker-selected", worker, 1.0, 0.0, 1024)
+        ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
@@ -7659,7 +7677,9 @@ def test_wait_fte_query_ignores_retry_loser_attempt_errors(monkeypatch):
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [duckdb.ray_cxx.RayWorkerRuntime("worker-retry", worker, 1.0, 0.0, 1024)],
+        lambda _existing_ids, _manager_instance_id: [
+            duckdb.ray_cxx.RayWorkerRuntime("worker-retry", worker, 1.0, 0.0, 1024)
+        ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
@@ -7764,7 +7784,7 @@ def test_wait_fte_query_release_failure_preserves_failed_handle_and_releases_res
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [
+        lambda _existing_ids, _manager_instance_id: [
             duckdb.ray_cxx.RayWorkerRuntime(
                 "worker-release-failure",
                 worker,
@@ -7898,7 +7918,9 @@ def test_wait_fte_query_does_not_drain_pending_retry_loser_attempt(monkeypatch):
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [duckdb.ray_cxx.RayWorkerRuntime("worker-retry-pending", worker, 1.0, 0.0, 1024)],
+        lambda _existing_ids, _manager_instance_id: [
+            duckdb.ray_cxx.RayWorkerRuntime("worker-retry-pending", worker, 1.0, 0.0, 1024)
+        ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
@@ -7999,7 +8021,9 @@ def test_wait_fte_query_clears_cached_handles_after_failed_status(monkeypatch):
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [duckdb.ray_cxx.RayWorkerRuntime("worker-stale-failed", worker, 1.0, 0.0, 1024)],
+        lambda _existing_ids, _manager_instance_id: [
+            duckdb.ray_cxx.RayWorkerRuntime("worker-stale-failed", worker, 1.0, 0.0, 1024)
+        ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
@@ -8093,7 +8117,9 @@ def test_wait_fte_query_timeout_preserves_collected_handles(monkeypatch):
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [duckdb.ray_cxx.RayWorkerRuntime("worker-timeout-preserve", worker, 1.0, 0.0, 1024)],
+        lambda _existing_ids, _manager_instance_id: [
+            duckdb.ray_cxx.RayWorkerRuntime("worker-timeout-preserve", worker, 1.0, 0.0, 1024)
+        ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
@@ -8189,7 +8215,9 @@ def test_wait_fte_query_respects_timeout_after_finished_status_during_drain(monk
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [duckdb.ray_cxx.RayWorkerRuntime("worker-drain-timeout", worker, 1.0, 0.0, 1024)],
+        lambda _existing_ids, _manager_instance_id: [
+            duckdb.ray_cxx.RayWorkerRuntime("worker-drain-timeout", worker, 1.0, 0.0, 1024)
+        ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
@@ -8239,7 +8267,7 @@ def test_worker_manager_close_session_attempts_every_worker_before_retry(monkeyp
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
-        lambda _existing_ids: [
+        lambda _existing_ids, _manager_instance_id: [
             duckdb.ray_cxx.RayWorkerRuntime("worker-a", first, 1.0, 0.0, 1024),
             duckdb.ray_cxx.RayWorkerRuntime("worker-b", second, 1.0, 0.0, 1024),
         ],

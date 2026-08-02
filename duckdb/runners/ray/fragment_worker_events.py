@@ -49,6 +49,7 @@ class FteWorkerEventHandlingMixin:
         _submit_fte_pending_tasks: Any
         _task_input_stream_exhausted_direct: Any
         _try_reserve_fte_partition_for_node_wait: Any
+        manager_instance_id: str
 
     def _handles_for_fte_worker_control_failure(
         self,
@@ -56,7 +57,10 @@ class FteWorkerEventHandlingMixin:
     ) -> list[Any]:
         """Fence a failed worker before queued work can observe it as live."""
 
-        failed_worker_ids = quarantine_fte_worker(failure.worker_id)
+        failed_worker_ids = quarantine_fte_worker(
+            failure.worker_id,
+            manager_instance_id=self.manager_instance_id,
+        )
         query_ids = set(_FTE_SCHEDULERS.query_ids())
         query_ids.add(failure.attempt_id.task_id.query_id)
         schedulers = []
@@ -67,6 +71,8 @@ class FteWorkerEventHandlingMixin:
             scheduler = _FTE_SCHEDULERS.get(query_id)
             if scheduler is None:
                 continue
+            if not scheduler.is_owned_by_manager_instance(self.manager_instance_id):
+                continue
             self._bind_fte_scheduler_handlers(scheduler)
             scheduler.enqueue(
                 WorkerFailed(
@@ -74,6 +80,7 @@ class FteWorkerEventHandlingMixin:
                     failure.worker_id,
                     failure,
                     failed_worker_ids=failed_worker_ids,
+                    manager_instance_id=self.manager_instance_id,
                 ),
                 # Control failures happen inside an active drain.  Reconcile
                 # them before reservation completions already in that queue.
@@ -331,8 +338,9 @@ class FteWorkerEventHandlingMixin:
                 query_id_filter=scheduler.query_id,
             )
 
-        scheduler.set_handlers(
-            FteEventHandlers(
+        scheduler.bind_manager_instance(
+            self.manager_instance_id,
+            handlers=FteEventHandlers(
                 on_split_events=self._submit_fte_pending_tasks,
                 on_source_input_exhausted=on_source_input_exhausted,
                 on_task_status_changed=self._handles_for_task_status_changed_event,
@@ -349,5 +357,5 @@ class FteWorkerEventHandlingMixin:
                 on_worker_reservation_completed=self._handles_for_worker_reservation_completed_event,
                 on_retry_delay_expired=lambda _event: request_fte_pending_task_drain(),
                 on_exchange_selector_updated=self._handles_for_exchange_selector_updated_event,
-            )
+            ),
         )

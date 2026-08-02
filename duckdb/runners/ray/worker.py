@@ -30,9 +30,14 @@ from duckdb.runners.fte import (
     materialize_task_inputs,
     validate_fte_status_identity,
 )
-from duckdb.runners.fte.debug_memory import describe_result_payload, log_debug, process_memory_snapshot
+from duckdb.runners.fte.debug_memory import (
+    debug_flag_enabled,
+    describe_result_payload,
+    log_debug,
+    process_memory_snapshot,
+)
 from duckdb.runners.fte.fte_config import FteWorkerAdmissionConfig
-from duckdb.runners.fte.fte_failures import FteTaskTerminalControlError
+from duckdb.runners.fte.fte_failures import FteTaskTerminalControlError, _safe_failure_message
 from duckdb.runners.fte.memory_config import apply_duckdb_memory_limit
 from duckdb.runners.ray.admission_ledger import BoundedReplayMap
 from duckdb.runners.ray.fte_scheduler_config import _fte_control_rpc_timeout_s
@@ -145,8 +150,30 @@ def _ray_worker_memory_log(event: str, **fields: Any) -> None:
     log_debug("vane-ray-worker-memory", event, **payload)
 
 
+def _ray_worker_observability_log(event: str, **fields: Any) -> None:
+    if not debug_flag_enabled(
+        "VANE_RAY_WORKER_MEMORY_DEBUG",
+        "VANE_FTE_RESULT_DEBUG",
+        "VANE_FTE_ADMISSION_DEBUG",
+        "DUCKDB_DISTRIBUTED_DEBUG",
+    ):
+        return
+    log_debug("vane-ray-worker", event, **fields)
+
+
 def _fte_worker_label() -> str:
     return os.getenv("VANE_WORKER_ID", "").strip() or os.getenv("VANE_FTE_WORKER_ID", "").strip() or "-"
+
+
+def _ray_worker_log_fields(worker: Any) -> dict[str, str]:
+    return {
+        "worker_id": str(getattr(worker, "_worker_id", "") or _fte_worker_label()),
+        "manager_instance_id": str(
+            getattr(worker, "_manager_instance_id", "") or os.getenv("VANE_WORKER_MANAGER_INSTANCE_ID", "")
+        ).strip(),
+        "node_id": str(getattr(worker, "_node_id", "") or os.getenv("VANE_WORKER_NODE_ID", "")).strip(),
+        "host": str(getattr(worker, "_host", "") or os.getenv("VANE_WORKER_HOST", "")).strip(),
+    }
 
 
 def _ensure_python_datasource_runtime() -> None:
@@ -790,9 +817,15 @@ class RayWorkerActor:
             raise ValueError("Ray worker duckdb_memory_bytes must be positive")
         if task_heap_capacity_bytes <= 0:
             raise ValueError("Ray worker task_heap_capacity_bytes must be positive")
-        self._node_id = str(ray.get_runtime_context().get_node_id() or "").strip()
+        runtime_context = ray.get_runtime_context()
+        self._node_id = str(runtime_context.get_node_id() or "").strip()
         if not self._node_id:
             raise RuntimeError("Ray worker runtime context is missing node_id")
+        self._worker_id = _fte_worker_label()
+        self._manager_instance_id = os.getenv("VANE_WORKER_MANAGER_INSTANCE_ID", "").strip()
+        self._host = ray_node_ip_address or os.getenv("VANE_WORKER_HOST", "").strip() or self._node_id
+        get_actor_id = getattr(runtime_context, "get_actor_id", None)
+        self._actor_id = str(get_actor_id() or "").strip() if callable(get_actor_id) else ""
         self._duckdb_memory_bytes = duckdb_memory_bytes
         self._task_heap_capacity_bytes = task_heap_capacity_bytes
         try:
@@ -856,12 +889,21 @@ class RayWorkerActor:
         self._shutdown_prepared = False
         self._shutdown_complete = False
         self._get_shared_conn()  # eagerly initialize
+        _ray_worker_observability_log(
+            "worker_registered",
+            **self._worker_log_fields(),
+            actor_id=self._actor_id or "-",
+        )
         _ray_worker_memory_log(
             "actor_initialized",
             num_cpus=num_cpus,
             num_gpus=num_gpus,
-            worker_label=_fte_worker_label(),
+            worker_label=self._worker_id,
+            **self._worker_log_fields(),
         )
+
+    def _worker_log_fields(self) -> dict[str, str]:
+        return _ray_worker_log_fields(self)
 
     def _ensure_worker_runtime_running(self) -> None:
         shutdown_lock = getattr(self, "_shutdown_lock", None)
@@ -999,11 +1041,13 @@ class RayWorkerActor:
             if getattr(self, "_shutdown_started", False):
                 raise RuntimeError("Ray worker runtime is shutting down")
             if self._fte_task_manager is None:
+                worker_log_fields = self._worker_log_fields()
                 self._fte_task_manager = FteWorkerTaskManager(
                     self._execute_fte_request,
                     admission_config=self._fte_admission_config,
                     require_query_task_lease=True,
-                    worker_label=_fte_worker_label(),
+                    worker_label=worker_log_fields["worker_id"],
+                    worker_log_fields=worker_log_fields,
                 )
             return self._fte_task_manager
 
@@ -1814,11 +1858,35 @@ class RayWorkerActor:
 
     @ray.method(concurrency_group="control")
     def prepare_shutdown(self) -> None:
-        self._prepare_worker_runtime_shutdown()
+        worker_log_fields = self._worker_log_fields()
+        _ray_worker_observability_log("worker_shutdown_prepare_start", **worker_log_fields)
+        try:
+            self._prepare_worker_runtime_shutdown()
+        except BaseException as exc:
+            _ray_worker_observability_log(
+                "worker_shutdown_prepare_error",
+                **worker_log_fields,
+                error_type=type(exc).__name__,
+                error=_safe_failure_message(exc),
+            )
+            raise
+        _ray_worker_observability_log("worker_shutdown_prepare_done", **worker_log_fields)
 
     @ray.method(concurrency_group="control")
     def finish_shutdown(self) -> None:
-        self._finish_worker_runtime_shutdown()
+        worker_log_fields = self._worker_log_fields()
+        _ray_worker_observability_log("worker_shutdown_finish_start", **worker_log_fields)
+        try:
+            self._finish_worker_runtime_shutdown()
+        except BaseException as exc:
+            _ray_worker_observability_log(
+                "worker_shutdown_finish_error",
+                **worker_log_fields,
+                error_type=type(exc).__name__,
+                error=_safe_failure_message(exc),
+            )
+            raise
+        _ray_worker_observability_log("worker_shutdown_finish_done", **worker_log_fields)
 
     def _shutdown_worker_runtime(self) -> None:
         self._prepare_worker_runtime_shutdown()
@@ -1867,6 +1935,8 @@ class RayWorkerActor:
         cursor = None
         cursor_registered = False
         debug_context = dict(debug_context or {})
+        worker_log_context = dict(debug_context)
+        worker_log_context.update(_ray_worker_log_fields(self))
         start = time.monotonic()
 
         try:
@@ -1897,7 +1967,7 @@ class RayWorkerActor:
             )
             _ray_worker_memory_log(
                 "native_execute_start",
-                **debug_context,
+                **worker_log_context,
                 scan_task_map_count=len(scan_task_map or {}),
                 exchange_source_task_map_count=len(exchange_source_task_map or {}),
                 has_exchange_sink_instance=exchange_sink_instance is not None,
@@ -1921,14 +1991,14 @@ class RayWorkerActor:
             )
             _ray_worker_memory_log(
                 "native_execute_done",
-                **debug_context,
+                **worker_log_context,
                 duration_ms=int((time.monotonic() - start) * 1000),
             )
             return result
         except BaseException as exc:
             _ray_worker_memory_log(
                 "native_execute_error",
-                **debug_context,
+                **worker_log_context,
                 duration_ms=int((time.monotonic() - start) * 1000),
                 error_type=type(exc).__name__,
                 error=str(exc),
@@ -1965,11 +2035,13 @@ class RayWorkerActor:
     ) -> Any:
         """Run a plan on worker and return a Ray-serializable result tuple."""
         debug_context = dict(debug_context or {})
+        worker_log_context = dict(debug_context)
+        worker_log_context.update(_ray_worker_log_fields(self))
 
         copy_output_info = _copy_output_info_from_context(context)
         scan_task_map, exchange_source_task_map = _extract_native_task_maps_from_context(context)
         run_start = time.monotonic()
-        _ray_worker_memory_log("run_plan_return_start", **debug_context)
+        _ray_worker_memory_log("run_plan_return_start", **worker_log_context)
         # Native execution, shuffle publication, and actor teardown are owned by
         # the execution query. The resource query can differ for nested
         # executions and is only the owner of the admission lease.
@@ -2037,7 +2109,7 @@ class RayWorkerActor:
         ) = _normalize_native_task_result(result_list)
         _ray_worker_memory_log(
             "native_result_normalized",
-            **debug_context,
+            **worker_log_context,
             duration_ms=int((time.monotonic() - run_start) * 1000),
             stats_len=len(stats_payload or []),
             **describe_result_payload(
@@ -2081,7 +2153,7 @@ class RayWorkerActor:
             partition_metas_for_ray.append((metadata.num_rows, size_bytes))
         _ray_worker_memory_log(
             "ray_put_done",
-            **debug_context,
+            **worker_log_context,
             duration_ms=int((time.monotonic() - run_start) * 1000),
             ray_put_count=ray_put_count,
             **describe_result_payload(

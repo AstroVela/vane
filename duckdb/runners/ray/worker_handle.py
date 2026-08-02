@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 import types
+from typing import Any
 
 from duckdb.runners.ray import fragment_registry as _fragment_registry
 from duckdb.runners.ray import fragment_worker_client as _fragment_worker_client
@@ -55,12 +56,12 @@ def _sync_worker_pool_overrides() -> None:
             setattr(_worker_pool, name, globals()[name])
 
 
-def start_ray_workers(existing_worker_ids):
+def start_ray_workers(existing_worker_ids: list[str], manager_instance_id: str) -> list[Any]:
     _sync_worker_pool_overrides()
-    return _worker_pool.start_ray_workers(existing_worker_ids)
+    return _worker_pool.start_ray_workers(existing_worker_ids, manager_instance_id)
 
 
-def try_autoscale(bundles):
+def try_autoscale(bundles: list[dict[str, int]]) -> None:
     _sync_worker_pool_overrides()
     return _worker_pool.try_autoscale(bundles)
 
@@ -70,7 +71,7 @@ _FACADE_TRY_AUTOSCALE = try_autoscale
 
 
 class _WorkerHandleFacadeModule(types.ModuleType):
-    def __setattr__(self, name, value):
+    def __setattr__(self, name: str, value: Any) -> None:
         super().__setattr__(name, value)
         if name == "start_ray_workers" and value is _FACADE_START_RAY_WORKERS:
             setattr(_worker_pool, name, _ORIGINAL_WORKER_POOL_START_RAY_WORKERS)
