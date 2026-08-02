@@ -33,14 +33,26 @@ def _expected_duckdb_source_id(repository_root: Path) -> str:
     return result.stdout.strip()
 
 
-def test_base_distribution_installs_expression_runtime_dependencies():
-    base_requirements = set()
+def _base_requirements():
+    base_requirements = {}
     for raw_requirement in requires("vane-ai") or []:
         requirement = Requirement(raw_requirement)
         if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
-            base_requirements.add(canonicalize_name(requirement.name))
+            base_requirements[canonicalize_name(requirement.name)] = requirement
 
-    assert {"numpy", "pyarrow"} <= base_requirements
+    return base_requirements
+
+
+def test_base_distribution_installs_expression_runtime_dependencies():
+    base_requirements = _base_requirements()
+
+    assert {"numpy", "pyarrow"} <= set(base_requirements)
+
+
+def test_base_distribution_requires_pyarrow_14_or_newer():
+    pyarrow_requirement = _base_requirements()["pyarrow"]
+
+    assert pyarrow_requirement.specifier == SpecifierSet(">=14.0.0")
 
 
 def test_artifact_mode_imports_installed_python_packages():
