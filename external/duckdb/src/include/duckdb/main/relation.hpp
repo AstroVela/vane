@@ -278,6 +278,8 @@ protected:
 	                                               const ParsedExpression &expression);
 	static unique_ptr<TableRef> BindRelationInput(Binder &binder, Relation &child);
 	static BoundStatement BindSelectNodeOnChild(Binder &binder, Relation &child, unique_ptr<SelectNode> select_node);
+	//! Bind an ORDER BY through the SELECT binder without replacing the child's output bindings.
+	static BoundStatement BindOrderOnChild(Binder &binder, Relation &child, const vector<OrderByNode> &orders);
 	static unique_ptr<SelectNode> WrapQueryNode(unique_ptr<QueryNode> query_node, const string &alias,
 	                                            const vector<ColumnDefinition> &columns);
 	static unique_ptr<QueryNode> RestoreDuplicateColumnAliases(unique_ptr<QueryNode> query_node, const string &alias,

@@ -418,7 +418,21 @@ void Binder::BindWhereStarExpression(unique_ptr<ParsedExpression> &expr) {
 	}
 }
 
-BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from_table) {
+BoundStatement Binder::BindOrderOnInput(BoundStatement from_table, const vector<OrderByNode> &orders) {
+	if (orders.empty()) {
+		return from_table;
+	}
+	SelectNode statement;
+	statement.select_list.push_back(make_uniq<StarExpression>());
+	auto order_node = make_uniq<OrderModifier>();
+	for (auto &order : orders) {
+		order_node->orders.emplace_back(order.type, order.null_order, order.expression->Copy());
+	}
+	statement.modifiers.push_back(std::move(order_node));
+	return BindSelectNode(statement, std::move(from_table), SelectPlanMode::PRESERVE_INPUT_BINDINGS_FOR_ORDER);
+}
+
+BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from_table, SelectPlanMode mode) {
 	D_ASSERT(from_table.plan);
 	D_ASSERT(!statement.from_table);
 	auto result_ptr = make_uniq<BoundSelectNode>();
@@ -701,7 +715,7 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 	BoundStatement result_statement;
 	result_statement.types = result.types;
 	result_statement.names = result.names;
-	result_statement.plan = CreatePlan(result);
+	result_statement.plan = CreatePlan(result, mode);
 	result_statement.extra_info.original_expressions = std::move(result.bind_state.original_expressions);
 	return result_statement;
 }

@@ -137,6 +137,22 @@ def test_relational_operations_preserve_exchange(duckdb_cursor, exchange_method,
         assert sorted(rows) == expected
 
 
+@pytest.mark.parametrize(
+    ("exchange_method", "plan_node"),
+    [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
+)
+def test_order_after_exchange_preserves_bindings_for_downstream_relations(duckdb_cursor, exchange_method, plan_node):
+    duckdb_cursor.execute("PRAGMA enable_verification")
+    left = duckdb_cursor.sql("SELECT * FROM (VALUES (1), (2)) data(id)").set_alias("left_data")
+    right = duckdb_cursor.sql("SELECT * FROM (VALUES (1, 10), (2, 20)) data(id, value)").set_alias("right_data")
+    exchanged = getattr(left.join(right, "left_data.id = right_data.id"), exchange_method)(2)
+
+    result = exchanged.order("(SELECT -left_data.id)").limit(1).project("left_data.id, right_data.value")
+
+    assert plan_node in result.explain()
+    assert result.fetchall() == [(2, 20)]
+
+
 @pytest.mark.parametrize("exchange_method", ["repartition", "local_exchange"])
 @pytest.mark.parametrize("outer_operation", ["project", "filter"])
 def test_distinct_preserves_collation_through_exchange(duckdb_cursor, exchange_method, outer_operation):

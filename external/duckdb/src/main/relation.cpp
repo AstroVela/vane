@@ -881,6 +881,12 @@ BoundStatement Relation::BindSelectNodeOnChild(Binder &binder, Relation &child, 
 	return binder.Bind(stmt.Cast<SQLStatement>());
 }
 
+BoundStatement Relation::BindOrderOnChild(Binder &binder, Relation &child, const vector<OrderByNode> &orders) {
+	auto child_ref = BindRelationInput(binder, child);
+	auto child_bound = binder.Bind(*child_ref);
+	return binder.BindOrderOnInput(std::move(child_bound), orders);
+}
+
 unique_ptr<SelectNode> Relation::WrapQueryNode(unique_ptr<QueryNode> query_node, const string &alias,
                                                const vector<ColumnDefinition> &columns) {
 	auto statement = make_uniq<SelectStatement>();

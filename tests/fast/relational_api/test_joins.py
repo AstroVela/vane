@@ -143,6 +143,22 @@ class TestRAPIJoins:
         assert relation.order("(SELECT -id)").fetchall() == [(2,), (1,)]
 
     @pytest.mark.parametrize(
+        ("order_expression", "limit", "expected"),
+        [
+            ("(SELECT -l.id)", 1, [(2, 20)]),
+            ("unnest(l.sort_keys) DESC", 2, [(2, 20), (2, 20)]),
+        ],
+    )
+    def test_chained_order_only_expression_preserves_qualified_inputs(self, con, order_expression, limit, expected):
+        con.execute("PRAGMA enable_verification")
+        left = con.sql("SELECT * FROM (VALUES (1, [2, 1]), (2, [4, 3])) data(id, sort_keys)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (1, 10), (2, 20)) data(id, value)").set_alias("r")
+
+        result = left.join(right, "l.id = r.id").order(order_expression).limit(limit).project("l.id, r.value")
+
+        assert result.fetchall() == expected
+
+    @pytest.mark.parametrize(
         ("operation", "expected"),
         [
             ("direct", [(2, 1), (2, 1), (3, 1)]),
