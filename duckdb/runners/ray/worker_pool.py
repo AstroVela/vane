@@ -91,8 +91,11 @@ def start_ray_workers(existing_worker_ids: list[str], manager_instance_id: str) 
                 if worker_id in existing_worker_ids:
                     continue
                 worker_env = dict(env_overrides)
+                worker_env["VANE_WORKER_HOST"] = worker_host
                 worker_env["VANE_WORKER_ID"] = worker_id
                 worker_env["VANE_WORKER_INDEX"] = "0"
+                worker_env["VANE_WORKER_MANAGER_INSTANCE_ID"] = manager_instance_id
+                worker_env["VANE_WORKER_NODE_ID"] = node_id
                 memory_layout = build_ray_node_memory_layout(int(node["Resources"]["memory"]))
                 # max_concurrency limits how many control/execute RPCs can queue
                 # inside the actor. FTE backpressure is handled by task
@@ -103,7 +106,7 @@ def start_ray_workers(existing_worker_ids: list[str], manager_instance_id: str) 
                 # and Ray-backed UDFs, so reserving the node's full CPU/GPU capacity
                 # here would prevent those child Ray workloads from being scheduled.
                 _actor_max_conc = int(os.environ.get("VANE_RAY_ACTOR_MAX_CONCURRENCY", "256"))
-                actor = RayWorkerActor.options(
+                actor = RayWorkerActor.options(  # type: ignore[attr-defined]
                     max_concurrency=_actor_max_conc,
                     memory=(memory_layout.worker_duckdb_memory_bytes + memory_layout.runtime_reserve_bytes),
                     runtime_env=_persistent_worker_runtime_env(worker_env),

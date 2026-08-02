@@ -2262,19 +2262,34 @@ class FteWorkerPlacementManager:
 def _worker_failure_payload(worker_id: str, error: Any) -> dict[str, Any]:
     if error is not None and not issubclass(type(error), BaseException):
         if isinstance(error, Mapping):
-            return _normalize_failure_payload(error)
-        raise TypeError("FTE worker failure must be an exception or structured failure payload")
-    memory_error_types: tuple[type[BaseException], ...] = (
-        OutOfMemoryException,
-        MemoryError,
-        ray.exceptions.OutOfMemoryError,
-    )
-    error_code = "OUT_OF_MEMORY" if _failure_exception_matches(error, memory_error_types) else "WORKER_LOST"
-    return _failure_payload(
-        error_code,
-        error if error is not None else f"FTE worker lost: {worker_id}",
-        error_type="EXTERNAL",
-    )
+            failure = _normalize_failure_payload(error)
+        else:
+            raise TypeError("FTE worker failure must be an exception or structured failure payload")
+    else:
+        memory_error_types: tuple[type[BaseException], ...] = (
+            OutOfMemoryException,
+            MemoryError,
+            ray.exceptions.OutOfMemoryError,
+        )
+        error_code = "OUT_OF_MEMORY" if _failure_exception_matches(error, memory_error_types) else "WORKER_LOST"
+        failure = _failure_payload(
+            error_code,
+            error if error is not None else f"FTE worker lost: {worker_id}",
+            error_type="EXTERNAL",
+        )
+    worker_id = str(worker_id or "")
+    failure["worker_id"] = worker_id
+    with _FTE_REGISTRY_LOCK:
+        handle = _FTE_WORKER_HANDLES.get(worker_id)
+        if handle is not None:
+            failure.update(
+                {
+                    "manager_instance_id": str(getattr(handle, "manager_instance_id", "")),
+                    "node_id": str(getattr(handle, "node_id", "")),
+                    "host": str(getattr(handle, "host", "")),
+                }
+            )
+    return failure
 
 
 def _mark_fte_worker_failed(
@@ -2899,9 +2914,20 @@ def fte_registry_stats() -> dict[str, Any]:
         }
 
     event_scheduler_stats = _FTE_SCHEDULERS.stats()
-    worker_stats = {
-        str(worker_id): handle.fte_pressure_stats() for worker_id, handle in worker_handles if handle is not None
-    }
+    worker_stats: dict[str, dict[str, Any]] = {}
+    for worker_id, handle in worker_handles:
+        if handle is None:
+            continue
+        metrics: dict[str, Any] = dict(handle.fte_pressure_stats())
+        metrics.update(
+            {
+                "worker_id": str(worker_id),
+                "manager_instance_id": str(getattr(handle, "manager_instance_id", "")),
+                "node_id": str(getattr(handle, "node_id", "")),
+                "host": str(getattr(handle, "host", "")),
+            }
+        )
+        worker_stats[str(worker_id)] = metrics
     return {
         **registry_counts,
         "submission_window": fte_submission_window_snapshot(),

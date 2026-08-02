@@ -53,6 +53,16 @@ def _fte_command_debug_log(event: str, **fields: Any) -> None:
     print("[vane-fte-command] " + " ".join(parts), file=sys.stderr, flush=True)
 
 
+def _fte_worker_command_debug_fields(command: Any) -> dict[str, str]:
+    worker = getattr(command, "worker", None)
+    return {
+        "worker_id": str(getattr(command, "worker_id", None) or getattr(worker, "worker_id", "") or ""),
+        "manager_instance_id": str(getattr(worker, "manager_instance_id", "") or ""),
+        "node_id": str(getattr(worker, "node_id", "") or ""),
+        "host": str(getattr(worker, "host", "") or ""),
+    }
+
+
 class _FteQueryClosingEvent:
     """Event-compatible view of one query's registry close state."""
 
@@ -111,6 +121,7 @@ class FteWorkerCommandMixin:
                 worker_key = ("worker_id", worker_id)
             else:
                 worker_key = ("worker_handle", id(getattr(command, "worker", None)))
+            worker_debug_fields = _fte_worker_command_debug_fields(command)
             if worker_key in failed_worker_keys:
                 _fte_command_debug_log(
                     "execute_command_skipped_failed_worker",
@@ -120,7 +131,7 @@ class FteWorkerCommandMixin:
                     query_id=getattr(command, "query_id", ""),
                     fragment_id=getattr(command, "fragment_id", ""),
                     attempt_id=attempt_id,
-                    worker_id=worker_id,
+                    **worker_debug_fields,
                 )
                 continue
             if not begin_fte_registry_operation(query_id):
@@ -141,6 +152,7 @@ class FteWorkerCommandMixin:
                     fragment_id=getattr(command, "fragment_id", ""),
                     partition_id=getattr(command, "partition_id", ""),
                     attempt_id=attempt_id,
+                    **worker_debug_fields,
                 )
                 try:
                     if isinstance(command, FteCreateTaskCommand):
@@ -193,6 +205,7 @@ class FteWorkerCommandMixin:
                         elapsed_ms=int((time.monotonic() - started_at) * 1000),
                         error_type=type(exc).__name__,
                         error=exc,
+                        **worker_debug_fields,
                     )
                     failure = fragment_execution.worker_control_failure_for_command(command, exc)
                     failed_worker_keys.add(worker_key)
@@ -236,6 +249,7 @@ class FteWorkerCommandMixin:
                     partition_id=getattr(command, "partition_id", ""),
                     attempt_id=attempt_id,
                     elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                    **worker_debug_fields,
                 )
             finally:
                 end_fte_registry_operation(query_id)

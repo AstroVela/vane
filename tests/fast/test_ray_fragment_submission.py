@@ -5725,6 +5725,64 @@ def test_fte_worker_selection_stays_with_manager_scope():
     assert current._select_fte_worker() is current
 
 
+def test_fte_registry_stats_exposes_worker_topology():
+    worker_id = "manager-a:node-a:0"
+    RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id=worker_id,
+        node_id="node-a",
+        host="10.0.0.1",
+        manager_instance_id="manager-a",
+    )
+
+    worker_stats = worker_handle_mod.fte_registry_stats()["workers"][worker_id]
+
+    assert worker_stats["worker_id"] == worker_id
+    assert worker_stats["manager_instance_id"] == "manager-a"
+    assert worker_stats["node_id"] == "node-a"
+    assert worker_stats["host"] == "10.0.0.1"
+
+
+def test_fte_worker_failure_payload_exposes_worker_topology():
+    worker_id = "manager-a:node-a:0"
+    RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id=worker_id,
+        node_id="node-a",
+        host="10.0.0.1",
+        manager_instance_id="manager-a",
+    )
+
+    failure = fte_fragment_scheduler_mod._worker_failure_payload(worker_id, RuntimeError("worker lost"))
+
+    assert failure["worker_id"] == worker_id
+    assert failure["manager_instance_id"] == "manager-a"
+    assert failure["node_id"] == "node-a"
+    assert failure["host"] == "10.0.0.1"
+
+
+def test_fte_worker_command_debug_fields_exposes_worker_topology():
+    worker_id = "manager-a:node-a:0"
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id=worker_id,
+        node_id="node-a",
+        host="10.0.0.1",
+        manager_instance_id="manager-a",
+    )
+    command = SimpleNamespace(worker=handle, worker_id=worker_id)
+
+    assert worker_commands_mod._fte_worker_command_debug_fields(command) == {
+        "worker_id": worker_id,
+        "manager_instance_id": "manager-a",
+        "node_id": "node-a",
+        "host": "10.0.0.1",
+    }
+
+
 def test_fte_worker_failure_replacement_stays_with_manager_scope():
     same_manager = RayWorkerActorHandle(
         _FakeActor(),
@@ -11015,7 +11073,7 @@ assert restored.__name__ == actor_cls.__name__
     assert result.returncode == 0, result.stderr or result.stdout
 
 
-def test_ray_worker_fte_admission_log_uses_worker_id(monkeypatch, capsys):
+def test_ray_worker_fte_debug_logs_use_worker_topology(monkeypatch, capsys):
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
     actor._fte_task_manager = None
@@ -11032,7 +11090,11 @@ def test_ray_worker_fte_admission_log_uses_worker_id(monkeypatch, capsys):
 
     actor._execute_fte_request = execute_fte_request
     monkeypatch.setenv("VANE_FTE_ADMISSION_DEBUG", "1")
+    monkeypatch.setenv("VANE_FTE_RESULT_DEBUG", "1")
     monkeypatch.setenv("VANE_WORKER_ID", "ray-worker-log")
+    monkeypatch.setenv("VANE_WORKER_MANAGER_INSTANCE_ID", "manager-log")
+    monkeypatch.setenv("VANE_WORKER_NODE_ID", "node-log")
+    monkeypatch.setenv("VANE_WORKER_HOST", "10.0.0.9")
 
     async def run():
         task_id = {
@@ -11077,12 +11139,21 @@ def test_ray_worker_fte_admission_log_uses_worker_id(monkeypatch, capsys):
 
     assert "[vane-fte-admission" in captured
     assert "worker_id=ray-worker-log" in captured
+    assert "manager_instance_id=manager-log" in captured
+    assert "node_id=node-log" in captured
+    assert "host=10.0.0.9" in captured
     assert "event=manager_init" in captured
     assert "event=create_task" in captured
     assert "event=start_task" in captured
     assert "event=task_done" in captured
     assert "task_id=ray-log.0.0.0" in captured
     assert "max_running=4" in captured
+    result_lines = [line for line in captured.splitlines() if "[vane-fte-result" in line]
+    assert result_lines
+    assert all("worker_id=ray-worker-log" in line for line in result_lines)
+    assert all("manager_instance_id=manager-log" in line for line in result_lines)
+    assert all("node_id=node-log" in line for line in result_lines)
+    assert all("host=10.0.0.9" in line for line in result_lines)
 
 
 def test_drop_query_fragments_clears_local_registry():
@@ -11308,8 +11379,11 @@ def test_start_ray_workers_keeps_flight_host_worker_local_and_skips_nested_warmu
             "env_vars": {
                 "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
                 "VANE_WORKER": "1",
+                "VANE_WORKER_HOST": address,
                 "VANE_WORKER_ID": worker_id,
                 "VANE_WORKER_INDEX": "0",
+                "VANE_WORKER_MANAGER_INSTANCE_ID": "manager-a",
+                "VANE_WORKER_NODE_ID": node_id,
             },
         }
         assert "num_cpus" not in option_calls[index]

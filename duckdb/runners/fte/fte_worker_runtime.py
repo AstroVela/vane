@@ -298,10 +298,12 @@ class FteTaskExecution:
         status_callback: Callable[["FteTaskExecution"], object] | None = None,
         require_query_task_lease: bool = False,
         default_task_memory_bytes: int | None = None,
+        debug_fields: Mapping[str, Any] | None = None,
     ) -> None:
         self.request = dict(request)
         self.task_id = FteTaskAttemptId.coerce(self.request["task_id"])
         self.execute_fn = execute_fn
+        self._debug_fields = dict(debug_fields or {})
         self._status_callback = status_callback
         self.initial_splits = normalize_initial_splits(self.request.get("initial_splits"))
         self.no_more_split_sources = {str(source) for source in self.request.get("no_more_splits") or []}
@@ -1077,14 +1079,17 @@ class FteTaskExecution:
     def _log_result_lifecycle(self, event: str, *, result: Any = None, **fields: Any) -> None:
         if not _fte_result_debug_enabled():
             return
-        payload = {
-            "task_id": str(self.task_id),
-            "query_id": self.task_id.query_id,
-            "fragment_execution_id": self.task_id.fragment_execution_id,
-            "partition_id": self.task_id.partition_id,
-            "attempt_id": self.task_id.attempt_id,
-            "state": self.status.state.value,
-        }
+        payload = dict(self._debug_fields)
+        payload.update(
+            {
+                "task_id": str(self.task_id),
+                "query_id": self.task_id.query_id,
+                "fragment_execution_id": self.task_id.fragment_execution_id,
+                "partition_id": self.task_id.partition_id,
+                "attempt_id": self.task_id.attempt_id,
+                "state": self.status.state.value,
+            }
+        )
         payload.update(fields)
         if result is not None:
             payload.update(describe_result_payload(result))
@@ -1135,6 +1140,7 @@ class FteWorkerTaskManager:
         admission_config: FteWorkerAdmissionConfig,
         require_query_task_lease: bool = False,
         worker_label: str | None = None,
+        worker_log_fields: Mapping[str, Any] | None = None,
         sync_udf_active_fragment_tasks: bool = False,
     ) -> None:
         self.execute_fn = execute_fn
@@ -1142,6 +1148,12 @@ class FteWorkerTaskManager:
         self.query_tasks: dict[str, set[str]] = {}
         self.admission_config = admission_config
         self.worker_label = str(worker_label or os.getenv("VANE_FTE_WORKER_ID") or "-")
+        raw_worker_log_fields = worker_log_fields or {}
+        self.worker_log_fields = {
+            field: str(raw_worker_log_fields[field]).strip()
+            for field in ("manager_instance_id", "node_id", "host")
+            if raw_worker_log_fields.get(field) is not None and str(raw_worker_log_fields[field]).strip()
+        }
         self.max_running_tasks = self.admission_config.max_running_tasks
         self.require_query_task_lease = bool(require_query_task_lease)
         self.sync_udf_active_fragment_tasks = bool(sync_udf_active_fragment_tasks)
@@ -1166,6 +1178,7 @@ class FteWorkerTaskManager:
                 status_callback=self._publish_status,
                 require_query_task_lease=self.require_query_task_lease,
                 default_task_memory_bytes=self.admission_config.task_memory_bytes,
+                debug_fields={"worker_id": self.worker_label, **self.worker_log_fields},
             )
             key = str(execution.task_id)
             existing = self.tasks.get(key)
@@ -1421,6 +1434,7 @@ class FteWorkerTaskManager:
             f"memory_budget_bytes={_format_admission_field(stats.get('executor_memory_budget_bytes'))}",
             f"task_memory_bytes={_format_admission_field(stats.get('executor_task_memory_bytes'))}",
         ]
+        parts.extend(f"{key}={_format_admission_field(value)}" for key, value in self.worker_log_fields.items())
         if execution is not None:
             task_id = execution.task_id
             parts.extend(
