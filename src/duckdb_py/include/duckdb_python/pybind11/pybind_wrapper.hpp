@@ -78,13 +78,25 @@ inline bool isinstance(handle obj, handle type) {
 }
 
 template <class T>
+bool is_valid_try_cast_result(const T &) {
+	return true;
+}
+
+// Pybind11 accepts None for holder types and returns an empty holder. Callers use a successful
+// try_cast as permission to dereference the result, so an empty shared_ptr is not a valid result.
+template <class T, bool SAFE>
+bool is_valid_try_cast_result(const shared_ptr<T, SAFE> &result) {
+	return result != nullptr;
+}
+
+template <class T>
 bool try_cast(const handle &object, T &result) {
 	try {
 		result = cast<T>(object);
 	} catch (pybind11::cast_error &) {
 		return false;
 	}
-	return true;
+	return is_valid_try_cast_result(result);
 }
 
 } // namespace py
