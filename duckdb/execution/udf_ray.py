@@ -331,6 +331,7 @@ def ensure_actor_pools_for_plan(
     *,
     actor_node_ids_by_stage: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
+    query_generation_capability: str,
     session_config: dict[str, str],
     conn: Any = None,
 ) -> tuple[list[_UDFActorPoolBase], dict[str, Any]]:
@@ -339,6 +340,7 @@ def ensure_actor_pools_for_plan(
         conn=conn,
         actor_node_ids_by_stage=actor_node_ids_by_stage,
         query_driver_handle=query_driver_handle,
+        query_generation_capability=query_generation_capability,
         session_config=session_config,
         actor_pool_cls=UDFActorPool,
         is_vane_worker_process=_is_vane_worker_process,
@@ -356,6 +358,7 @@ def ensure_actor_pools_for_nodes(
     *,
     actor_node_ids_by_stage: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
+    query_generation_capability: str,
     session_config: dict[str, str],
     set_handles: Any = None,
 ) -> tuple[list[_UDFActorPoolBase], dict[str, Any]]:
@@ -363,6 +366,7 @@ def ensure_actor_pools_for_nodes(
         udf_nodes,
         actor_node_ids_by_stage=actor_node_ids_by_stage,
         query_driver_handle=query_driver_handle,
+        query_generation_capability=query_generation_capability,
         session_config=session_config,
         set_handles=set_handles,
         actor_pool_cls=UDFActorPool,
@@ -381,6 +385,7 @@ def prepare_actor_pools_for_plan(
     *,
     actor_node_ids_by_stage: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
+    query_generation_capability: str,
     session_config: dict[str, str],
     conn: Any = None,
 ) -> tuple[list[_UDFActorPoolBase], dict[str, Any]]:
@@ -389,6 +394,7 @@ def prepare_actor_pools_for_plan(
         conn=conn,
         actor_node_ids_by_stage=actor_node_ids_by_stage,
         query_driver_handle=query_driver_handle,
+        query_generation_capability=query_generation_capability,
         session_config=session_config,
         actor_pool_cls=UDFActorPool,
         is_vane_worker_process=_is_vane_worker_process,
@@ -420,12 +426,14 @@ class RemoteUDFExecutor(
         payload: dict[str, Any],
         *,
         query_driver_handle: Any,
+        query_generation_capability: str,
     ) -> None:
         self._actors_obj = actors
         self._payload = payload
         self._initialize_task_admission(
             payload,
             driver=query_driver_handle,
+            query_generation_capability=query_generation_capability,
         )
         self.actors = actors.actors
         # Actor readiness lifecycle:
@@ -492,6 +500,9 @@ def _build_ray_actor_executor(payload: dict[str, Any], options: dict[str, Any]) 
         query_driver_handle = options.get("query_driver_handle")
         if query_driver_handle is None:
             raise RuntimeError("Ray actor UDF executor requires an explicit query driver handle")
+        query_generation_capability = str(options.get("query_generation_capability") or "").strip()
+        if not query_generation_capability:
+            raise RuntimeError("Ray actor UDF executor requires a query generation capability")
         if "session_config" not in options:
             raise RuntimeError("Ray actor UDF executor requires explicit Vane session config")
         actors = UDFActorPool._from_handles(
@@ -504,6 +515,7 @@ def _build_ray_actor_executor(payload: dict[str, Any], options: dict[str, Any]) 
             actors,
             payload,
             query_driver_handle=query_driver_handle,
+            query_generation_capability=query_generation_capability,
         )
 
     raise RuntimeError(
@@ -519,6 +531,7 @@ class RayTaskUDFExecutor(TaskAdmissionExecutorMixin, UDFExecutor):
         run_ref_bundle_stream: Any,
         *,
         query_driver_handle: Any,
+        query_generation_capability: str,
     ) -> None:
         self.payload = payload
         self.run_bundle_stream = run_bundle_stream
@@ -527,6 +540,7 @@ class RayTaskUDFExecutor(TaskAdmissionExecutorMixin, UDFExecutor):
         self._initialize_task_admission(
             payload,
             driver=query_driver_handle,
+            query_generation_capability=query_generation_capability,
         )
         _ray_payload_requires_block_stream(payload)
         _ray_task_debug_log(
@@ -958,6 +972,9 @@ def _build_ray_task_executor(payload: dict[str, Any], options: dict[str, Any]) -
     query_driver_handle = options.get("query_driver_handle")
     if query_driver_handle is None:
         raise RuntimeError("Ray task UDF executor requires an explicit query driver handle")
+    query_generation_capability = str(options.get("query_generation_capability") or "").strip()
+    if not query_generation_capability:
+        raise RuntimeError("Ray task UDF executor requires a query generation capability")
     if "session_config" not in options:
         raise RuntimeError("Ray task UDF executor requires explicit Vane session config")
     ray_options = dict(options.get("ray_options") or {})
@@ -994,6 +1011,7 @@ def _build_ray_task_executor(payload: dict[str, Any], options: dict[str, Any]) -
             session_runtime_env_vars,
         ),
         query_driver_handle=query_driver_handle,
+        query_generation_capability=query_generation_capability,
     )
 
 

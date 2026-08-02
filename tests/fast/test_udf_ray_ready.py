@@ -66,6 +66,7 @@ def _executor(actors, *, dispatch_indices=None, payload=None, node_ids=None):
         pool,
         payload or _payload(),
         query_driver_handle=object(),
+        query_generation_capability="test-query-generation-capability",
     )
 
 
@@ -215,6 +216,7 @@ def test_existing_actor_handles_require_explicit_dispatch_eligibility():
         pool,
         _payload(),
         query_driver_handle=object(),
+        query_generation_capability="test-query-generation-capability",
     )
     assert executor._ready_actor_indices == []
     assert executor._actor_init_errors[0] == "ray actor does not expose __ray_ready__ readiness probe"
@@ -234,7 +236,7 @@ def test_actor_executor_uses_explicit_query_driver_handle():
     with pytest.raises(RuntimeError, match="explicit query driver handle"):
         _build_ray_actor_executor(_payload(), options)
 
-    with pytest.raises(RuntimeError, match="explicit Vane session config"):
+    with pytest.raises(RuntimeError, match="query generation capability"):
         _build_ray_actor_executor(
             _payload(),
             {
@@ -243,11 +245,22 @@ def test_actor_executor_uses_explicit_query_driver_handle():
             },
         )
 
+    with pytest.raises(RuntimeError, match="explicit Vane session config"):
+        _build_ray_actor_executor(
+            _payload(),
+            {
+                **options,
+                "query_driver_handle": query_driver_handle,
+                "query_generation_capability": "test-query-generation-capability",
+            },
+        )
+
     executor = _build_ray_actor_executor(
         _payload(),
         {
             **options,
             "query_driver_handle": query_driver_handle,
+            "query_generation_capability": "test-query-generation-capability",
             "session_config": {},
         },
     )

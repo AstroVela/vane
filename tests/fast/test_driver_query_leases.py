@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
 
+from duckdb.runners.ray.admission_ledger import BoundedReplayMap
 from duckdb.runners.ray.query_execution_graph import (
     NodeResourceAllocation,
     QueryAllocation,
@@ -73,7 +76,18 @@ def _runner(loop: asyncio.AbstractEventLoop):
     return runner_cls, runner
 
 
-def _task_request(query_id: str, request_id: str, task_id: str) -> dict:
+def _manager_task_lease_id(runner_cls, runner, lease: dict) -> str:
+    capability = runner_cls._verify_task_lease_capability(
+        runner,
+        lease_id=lease["lease_id"],
+        attempt_id=lease["attempt_id"],
+        query_id=lease["query_id"],
+    )
+    assert capability is not None
+    return capability[0]
+
+
+def _task_request(runner, query_id: str, request_id: str, task_id: str) -> dict:
     return {
         "request_id": request_id,
         "query_id": query_id,
@@ -88,6 +102,9 @@ def _task_request(query_id: str, request_id: str, task_id: str) -> dict:
             "heap_bytes": 100,
             "object_store_bytes": 0,
         },
+        "query_generation_capability": runner._issue_query_task_admission_capability(
+            query_id,
+        ),
     }
 
 
@@ -130,15 +147,12 @@ def test_driver_task_lease_wait_is_event_driven_and_release_wakes_next_request()
         )
         manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
 
-        first_request = _task_request(query_id, "request:first", "task:first")
+        first_request = _task_request(runner, query_id, "request:first", "task:first")
         first = await runner_cls.acquire_query_task_lease(runner, first_request)
         assert first["granted"]
         first_lease = first["lease"]
-        assert await runner_cls.mark_query_task_lease_submitted(
-            runner, first_request["request_id"], first_lease["lease_id"]
-        ) == {"submitted": True}
 
-        second_request = _task_request(query_id, "request:second", "task:second")
+        second_request = _task_request(runner, query_id, "request:second", "task:second")
         second_waiter = asyncio.create_task(runner_cls.acquire_query_task_lease(runner, second_request))
         for _ in range(3):
             await asyncio.sleep(0)
@@ -170,6 +184,7 @@ def test_driver_task_lease_wait_is_event_driven_and_release_wakes_next_request()
                 "size_bytes": 10,
             },
         )
+        output_manager_lease_id = runner._query_output_lease_requests["output-request:block-1"]["manager_lease_id"]
         assert output["granted"]
         assert output["lease"]["state"] == "stage_queue"
         assert await runner_cls.handoff_query_output_block_lease(
@@ -177,17 +192,27 @@ def test_driver_task_lease_wait_is_event_driven_and_release_wakes_next_request()
             "output-request:block-1",
             output["lease"]["lease_id"],
         ) == {"handed_off": True}
-        assert manager.snapshot()["output_leases"][output["lease"]["lease_id"]]["state"] == "downstream_input"
+        assert manager.snapshot()["output_leases"][output_manager_lease_id]["state"] == "downstream_input"
         assert await runner_cls.handoff_query_output_block_lease(
             runner,
             "output-request:block-1",
             output["lease"]["lease_id"],
-        ) == {"handed_off": False}
+        ) == {"handed_off": True}
         assert await runner_cls.release_query_output_block_lease(
             runner,
             "output-request:block-1",
             output["lease"]["lease_id"],
         ) == {"released": True}
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            "output-request:block-1",
+            output["lease"]["lease_id"],
+        ) == {"released": True}
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            "output-request:block-1",
+            "wrong-output-lease",
+        ) == {"released": False}
         assert await runner_cls.release_query_task_lease(
             runner,
             second_request["request_id"],
@@ -199,6 +224,132 @@ def test_driver_task_lease_wait_is_event_driven_and_release_wakes_next_request()
         assert snapshot["output_leases"] == {}
         assert runner._query_task_lease_requests == {}
         assert runner._query_output_lease_requests == {}
+
+    asyncio.run(scenario())
+
+
+def test_task_admission_rejects_unsigned_or_tampered_generation_capabilities():
+    async def scenario():
+        query_id = "query-admission-capability"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_graph(graph, _allocation())
+        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+
+        valid_request = _task_request(
+            runner,
+            query_id,
+            "request:admission-capability",
+            "task:admission-capability",
+        )
+        unsigned_request = dict(valid_request)
+        unsigned_request.pop("query_generation_capability")
+        unsigned_denial = await runner_cls.acquire_query_task_lease(
+            runner,
+            unsigned_request,
+        )
+        assert unsigned_denial["granted"] is False
+        assert unsigned_denial["blocked_reason"] == "invalid_query_generation_capability"
+        assert await runner_cls.cancel_query_task_lease_request(
+            runner,
+            unsigned_request,
+        ) == {"cancelled": True, "released": False}
+
+        tampered_request = dict(valid_request)
+        tampered_request["query_generation_capability"] += "tampered"
+        tampered_denial = await runner_cls.acquire_query_task_lease(
+            runner,
+            tampered_request,
+        )
+        assert tampered_denial["granted"] is False
+        assert tampered_denial["blocked_reason"] == "invalid_query_generation_capability"
+        assert manager.snapshot()["task_leases"] == {}
+        assert runner._query_task_lease_requests == {}
+
+        grant = await runner_cls.acquire_query_task_lease(
+            runner,
+            valid_request,
+        )
+        assert grant["granted"] is True
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            valid_request["request_id"],
+            grant["lease"]["lease_id"],
+            grant["lease"]["attempt_id"],
+        ) == {"released": True}
+
+    asyncio.run(scenario())
+
+
+def test_late_output_controls_transfer_to_fenced_query_teardown():
+    async def scenario():
+        query_id = "query-late-output-control"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_graph(graph, _allocation())
+        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        task_request = _task_request(
+            runner,
+            query_id,
+            "request:late-output-task",
+            "task:late-output-task",
+        )
+        task = await runner_cls.acquire_query_task_lease(runner, task_request)
+        output_request = {
+            "request_id": "request:late-output",
+            "query_id": query_id,
+            "producer_stage_id": graph.stages[0].stage_id,
+            "task_lease_id": task["lease"]["lease_id"],
+            "attempt_id": task["lease"]["attempt_id"],
+            "block_id": "block:late-output",
+            "size_bytes": 10,
+        }
+        output = await runner_cls.acquire_query_output_block_lease(
+            runner,
+            output_request,
+        )
+        output_manager_lease_id = runner._query_output_lease_requests[output_request["request_id"]]["manager_lease_id"]
+
+        runner_cls._close_query_resource_admission(runner, query_id)
+
+        assert runner._query_output_lease_requests == {}
+        assert output_manager_lease_id in manager.snapshot()["output_leases"]
+        assert await runner_cls.handoff_query_output_block_lease(
+            runner,
+            output_request["request_id"],
+            output["lease"]["lease_id"],
+            query_id,
+        ) == {"handed_off": True}
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            output_request["request_id"],
+            output["lease"]["lease_id"],
+            query_id,
+        ) == {"released": True}
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            output_request["request_id"],
+            output["lease"]["lease_id"],
+            "different-query",
+        ) == {"released": False}
+        # Query close has discarded only the public request record. The signed
+        # capability still identifies the exact current-generation manager
+        # lease, so release must reclaim its object-store accounting. Replays
+        # remain successful and cannot affect another lease.
+        assert output_manager_lease_id not in manager.snapshot()["output_leases"]
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            output_request["request_id"],
+            output["lease"]["lease_id"],
+            query_id,
+        ) == {"released": True}
+
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            task["lease"]["lease_id"],
+            task["lease"]["attempt_id"],
+        ) == {"released": True}
 
     asyncio.run(scenario())
 
@@ -215,11 +366,11 @@ def test_driver_resource_change_evaluates_only_the_selected_task_waiter():
         )
         manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
 
-        active_request = _task_request(query_id, "request:active", "task:active")
+        active_request = _task_request(runner, query_id, "request:active", "task:active")
         active = await runner_cls.acquire_query_task_lease(runner, active_request)
 
         pending_requests = [
-            _task_request(query_id, f"request:pending:{index}", f"task:pending:{index}") for index in range(6)
+            _task_request(runner, query_id, f"request:pending:{index}", f"task:pending:{index}") for index in range(6)
         ]
         pending_tasks = [
             asyncio.create_task(runner_cls.acquire_query_task_lease(runner, request)) for request in pending_requests
@@ -259,8 +410,7 @@ def test_driver_resource_change_evaluates_only_the_selected_task_waiter():
                 continue
             await runner_cls.cancel_query_task_lease_request(
                 runner,
-                request["request_id"],
-                submitted=False,
+                request,
             )
         await asyncio.gather(*pending_tasks)
         granted_request = pending_requests[pending_tasks.index(granted_task)]
@@ -326,9 +476,9 @@ def test_driver_pending_task_lease_can_be_cancelled_without_a_polling_wakeup():
         )
         manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
 
-        active_request = _task_request(query_id, "request:active", "task:active")
+        active_request = _task_request(runner, query_id, "request:active", "task:active")
         active = await runner_cls.acquire_query_task_lease(runner, active_request)
-        pending_request = _task_request(query_id, "request:pending", "task:pending")
+        pending_request = _task_request(runner, query_id, "request:pending", "task:pending")
         pending = asyncio.create_task(runner_cls.acquire_query_task_lease(runner, pending_request))
         for _ in range(3):
             await asyncio.sleep(0)
@@ -339,8 +489,7 @@ def test_driver_pending_task_lease_can_be_cancelled_without_a_polling_wakeup():
 
         cancelled = await runner_cls.cancel_query_task_lease_request(
             runner,
-            pending_request["request_id"],
-            submitted=False,
+            pending_request,
         )
         assert cancelled == {"cancelled": True, "released": False}
         denial = await asyncio.wait_for(pending, timeout=1)
@@ -363,6 +512,497 @@ def test_driver_pending_task_lease_can_be_cancelled_without_a_polling_wakeup():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("completion_error", [None, RuntimeError("planned remote failure")])
+def test_submitted_task_lease_is_released_only_after_remote_completion(completion_error):
+    async def scenario():
+        query_id = "query-completion-gated-cancel"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_graph(
+            graph,
+            _allocation(),
+            on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
+        )
+        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+
+        active_request = _task_request(
+            runner,
+            query_id,
+            "request:completion-gated",
+            "task:completion-gated",
+        )
+        active = await runner_cls.acquire_query_task_lease(runner, active_request)
+        lease = active["lease"]
+
+        pending_request = _task_request(
+            runner,
+            query_id,
+            "request:completion-gated-pending",
+            "task:completion-gated-pending",
+        )
+        pending = asyncio.create_task(runner_cls.acquire_query_task_lease(runner, pending_request))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert not pending.done()
+
+        completion = Future()
+        completion_ref = SimpleNamespace(future=lambda: completion)
+        assert await runner_cls.release_query_task_lease_after_completion(
+            runner,
+            active_request["request_id"],
+            lease["lease_id"],
+            lease["attempt_id"],
+            [completion_ref],
+        ) == {"scheduled": True}
+        replay = await runner_cls.acquire_query_task_lease(
+            runner,
+            active_request,
+        )
+        assert replay["granted"] is True
+        assert replay["lease"] == lease
+
+        manager_lease_id = _manager_task_lease_id(runner_cls, runner, lease)
+        assert manager_lease_id in manager.snapshot()["task_leases"]
+        assert not pending.done()
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            active_request["request_id"],
+            lease["lease_id"],
+            lease["attempt_id"],
+        ) == {"released": False}
+        assert await runner_cls.cancel_query_task_lease_request(
+            runner,
+            active_request,
+        ) == {"cancelled": False, "released": False}
+
+        if completion_error is None:
+            completion.set_result(None)
+        else:
+            completion.set_exception(completion_error)
+        granted = await asyncio.wait_for(pending, timeout=1)
+
+        assert granted["granted"] is True
+        assert manager_lease_id not in manager.snapshot()["task_leases"]
+        assert runner._query_task_completion_waiters == {}
+        tombstone = runner._query_task_lease_request_tombstones[active_request["request_id"]]
+        assert tombstone["status"] == "released_after_completion"
+
+        await runner_cls.release_query_task_lease(
+            runner,
+            pending_request["request_id"],
+            granted["lease"]["lease_id"],
+            granted["lease"]["attempt_id"],
+        )
+
+    asyncio.run(scenario())
+
+
+def test_query_close_retains_completion_owner_until_remote_task_is_terminal():
+    async def scenario():
+        query_id = "query-close-retains-live-task"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_graph(graph, _allocation())
+        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+
+        request = _task_request(
+            runner,
+            query_id,
+            "request:query-close-retains",
+            "task:query-close-retains",
+        )
+        grant = await runner_cls.acquire_query_task_lease(runner, request)
+        lease = grant["lease"]
+        completion = Future()
+        assert await runner_cls.release_query_task_lease_after_completion(
+            runner,
+            request["request_id"],
+            lease["lease_id"],
+            lease["attempt_id"],
+            [SimpleNamespace(future=lambda: completion)],
+        ) == {"scheduled": True}
+
+        runner_cls._close_query_resource_admission(runner, query_id)
+        await asyncio.sleep(0)
+
+        assert request["request_id"] in runner._query_task_completion_waiters
+        assert runner._query_task_lease_requests[request["request_id"]]["status"] == "completion_wait"
+        manager_lease_id = _manager_task_lease_id(runner_cls, runner, lease)
+        assert manager_lease_id in manager.snapshot()["task_leases"]
+
+        teardown_fence = asyncio.create_task(
+            asyncio.to_thread(
+                runner_cls._wait_for_query_task_leases,
+                runner,
+                query_id,
+                timeout_s=1,
+            )
+        )
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert not teardown_fence.done()
+
+        completion.set_result(None)
+        await asyncio.wait_for(teardown_fence, timeout=1)
+
+        assert runner._query_task_completion_waiters == {}
+        assert runner._query_task_lease_requests == {}
+        assert manager_lease_id not in manager.snapshot()["task_leases"]
+
+    asyncio.run(scenario())
+
+
+def test_completed_task_cleanup_retries_without_losing_its_ledger_owner(monkeypatch):
+    async def scenario():
+        query_id = "query-completion-cleanup-retry"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_graph(graph, _allocation())
+        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+
+        request = _task_request(
+            runner,
+            query_id,
+            "request:completion-cleanup-retry",
+            "task:completion-cleanup-retry",
+        )
+        grant = await runner_cls.acquire_query_task_lease(runner, request)
+        lease = grant["lease"]
+        completion = Future()
+        release_attempts = 0
+        original_release = manager.release_task_lease
+
+        def fail_once(lease_id, *, attempt_id):
+            nonlocal release_attempts
+            release_attempts += 1
+            if release_attempts == 1:
+                raise RuntimeError("planned completion cleanup failure")
+            return original_release(lease_id, attempt_id=attempt_id)
+
+        monkeypatch.setattr(manager, "release_task_lease", fail_once)
+        assert await runner_cls.release_query_task_lease_after_completion(
+            runner,
+            request["request_id"],
+            lease["lease_id"],
+            lease["attempt_id"],
+            [SimpleNamespace(future=lambda: completion)],
+        ) == {"scheduled": True}
+
+        completion.set_result(None)
+        deadline = time.monotonic() + 1
+        while request["request_id"] in runner._query_task_lease_requests and time.monotonic() < deadline:
+            await asyncio.sleep(0.001)
+
+        assert release_attempts == 2
+        assert runner._query_task_lease_requests == {}
+        assert runner._query_task_completion_waiters == {}
+        assert manager.snapshot()["task_leases"] == {}
+        tombstone = runner._query_task_lease_request_tombstones[request["request_id"]]
+        assert tombstone["status"] == "released_after_completion"
+
+    asyncio.run(scenario())
+
+
+def test_query_close_before_completion_handoff_cannot_erase_execution_owner():
+    async def scenario():
+        query_id = "query-close-before-completion-handoff"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_graph(graph, _allocation())
+        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+
+        request = _task_request(
+            runner,
+            query_id,
+            "request:close-before-handoff",
+            "task:close-before-handoff",
+        )
+        grant = await runner_cls.acquire_query_task_lease(runner, request)
+        lease = grant["lease"]
+
+        runner_cls._close_query_resource_admission(runner, query_id)
+        assert runner._query_task_lease_requests[request["request_id"]]["status"] == "granted"
+
+        teardown_fence = asyncio.create_task(
+            asyncio.to_thread(
+                runner_cls._wait_for_query_task_leases,
+                runner,
+                query_id,
+                timeout_s=1,
+            )
+        )
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert not teardown_fence.done()
+
+        completion = Future()
+        assert await runner_cls.release_query_task_lease_after_completion(
+            runner,
+            request["request_id"],
+            lease["lease_id"],
+            lease["attempt_id"],
+            [SimpleNamespace(future=lambda: completion)],
+        ) == {"scheduled": True}
+        assert runner._query_task_lease_requests[request["request_id"]]["status"] == "completion_wait"
+        assert not teardown_fence.done()
+
+        completion.set_result(None)
+        await asyncio.wait_for(teardown_fence, timeout=1)
+
+        assert runner._query_task_lease_requests == {}
+        assert runner._query_task_completion_waiters == {}
+        assert manager.snapshot()["task_leases"] == {}
+        assert await runner_cls.release_query_task_lease_after_completion(
+            runner,
+            request["request_id"],
+            lease["lease_id"],
+            lease["attempt_id"],
+            [SimpleNamespace(future=lambda: completion)],
+        ) == {"scheduled": True}
+        assert runner._query_task_completion_waiters == {}
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            request["request_id"],
+            lease["lease_id"],
+            lease["attempt_id"],
+        ) == {"released": True}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("quiesce_first", [False, True])
+def test_missing_completion_contract_requires_explicit_teardown_ownership(
+    quiesce_first,
+):
+    async def scenario():
+        query_id = f"query-missing-completion:{quiesce_first}"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_graph(graph, _allocation())
+        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+
+        request = _task_request(
+            runner,
+            query_id,
+            f"request:teardown-wait:{quiesce_first}",
+            f"task:teardown-wait:{quiesce_first}",
+        )
+        grant = await runner_cls.acquire_query_task_lease(runner, request)
+        lease = grant["lease"]
+
+        if quiesce_first:
+            runner_cls._mark_query_execution_quiesced(runner, query_id)
+            assert runner._query_task_lease_requests[request["request_id"]]["status"] == "granted"
+            assert _manager_task_lease_id(runner_cls, runner, lease) in manager.snapshot()["task_leases"]
+
+        assert await runner_cls.handoff_query_task_lease_to_teardown(
+            runner,
+            request["request_id"],
+            lease["lease_id"],
+            lease["attempt_id"],
+        ) == {"handed_off": True}
+
+        if not quiesce_first:
+            assert runner._query_task_lease_requests[request["request_id"]]["status"] == "teardown_wait"
+            assert await runner_cls.release_query_task_lease(
+                runner,
+                request["request_id"],
+                lease["lease_id"],
+                lease["attempt_id"],
+            ) == {"released": False}
+            assert await runner_cls.cancel_query_task_lease_request(
+                runner,
+                request,
+            ) == {"cancelled": False, "released": False}
+            completion = Future()
+            assert await runner_cls.release_query_task_lease_after_completion(
+                runner,
+                request["request_id"],
+                lease["lease_id"],
+                lease["attempt_id"],
+                [SimpleNamespace(future=lambda: completion)],
+            ) == {"scheduled": False}
+            assert runner._query_task_completion_waiters == {}
+            runner_cls._mark_query_execution_quiesced(runner, query_id)
+
+        assert runner._query_task_lease_requests == {}
+        assert _manager_task_lease_id(runner_cls, runner, lease) in manager.snapshot()["task_leases"]
+        tombstone = runner._query_task_lease_request_tombstones[request["request_id"]]
+        assert tombstone["status"] == "released_by_teardown"
+        runner._query_task_lease_request_tombstones.clear()
+        assert await runner_cls.handoff_query_task_lease_to_teardown(
+            runner,
+            request["request_id"],
+            lease["lease_id"],
+            lease["attempt_id"],
+        ) == {"handed_off": True}
+        completion = Future()
+        assert await runner_cls.release_query_task_lease_after_completion(
+            runner,
+            request["request_id"],
+            lease["lease_id"],
+            lease["attempt_id"],
+            [SimpleNamespace(future=lambda: completion)],
+        ) == {"scheduled": True}
+
+    asyncio.run(scenario())
+
+
+def test_query_task_completion_owner_fence_is_bounded():
+    from duckdb.runners.ray.driver import QueryTeardownOwnershipError
+
+    runner_cls, runner = _runner(None)
+    runner_cls._ensure_query_resource_admission_state(runner)
+    runner._query_task_lease_requests["request:still-running"] = {
+        "identity": {"query_id": "query:still-running"},
+        "status": "granted",
+    }
+
+    with pytest.raises(
+        QueryTeardownOwnershipError,
+        match="request:still-running",
+    ):
+        runner_cls._wait_for_query_task_leases(
+            runner,
+            "query:still-running",
+            timeout_s=0.01,
+        )
+
+
+def test_task_grant_is_published_in_the_admission_ledger_before_future_completion():
+    async def scenario():
+        query_id = "query-single-task-ledger"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_graph(graph, _allocation())
+        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        request = _task_request(
+            runner,
+            query_id,
+            "request:single-ledger",
+            "task:single-ledger",
+        )
+        observed = []
+        complete_request = runner_cls._complete_lease_request
+
+        def inspect_grant(state, result):
+            observed.append(
+                (
+                    runner._query_task_lease_requests.get(request["request_id"]) is state,
+                    state["status"],
+                    dict(state["lease"]),
+                )
+            )
+            complete_request(state, result)
+
+        runner._complete_lease_request = inspect_grant
+        grant = await runner_cls.acquire_query_task_lease(runner, request)
+
+        assert grant["granted"] is True
+        assert observed == [(True, "granted", grant["lease"])]
+        assert not hasattr(runner, "_query_task_execution_owners")
+        assert not hasattr(runner, "_query_task_execution_replays")
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            request["request_id"],
+            grant["lease"]["lease_id"],
+            grant["lease"]["attempt_id"],
+        ) == {"released": True}
+
+    asyncio.run(scenario())
+
+
+def test_query_resource_release_waits_for_late_submission_completion_handoff():
+    from duckdb.runners.ray.driver import QueryTeardownOwnershipError
+    from duckdb.runners.ray.query_resource_runtime import (
+        get_query_resource_manager,
+    )
+
+    class _Coordinator:
+        def __init__(self):
+            self.release_calls = []
+
+        def release_query(self, query_id, generation):
+            self.release_calls.append((query_id, generation))
+            return True
+
+        def snapshot(self):
+            return {"queries": {}}
+
+    async def scenario():
+        query_id = "query-unresolved-grant-owner"
+        graph = _graph(query_id)
+        allocation = _allocation()
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_graph(graph, allocation)
+        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        runner._query_resource_lock = threading.RLock()
+        runner._query_resource_coordinator = _Coordinator()
+        runner._query_graphs = {query_id: graph}
+        runner._query_allocations = {query_id: allocation}
+        runner._synchronize_query_allocations = lambda: ()
+
+        request = _task_request(
+            runner,
+            query_id,
+            "request:unresolved-grant",
+            "task:unresolved-grant",
+        )
+        grant = await runner_cls.acquire_query_task_lease(runner, request)
+        lease = grant["lease"]
+        original_wait = runner_cls._wait_for_query_task_leases.__get__(
+            runner,
+            runner_cls,
+        )
+        runner._wait_for_query_task_leases = lambda owner_query_id: original_wait(
+            owner_query_id,
+            timeout_s=0.01,
+        )
+
+        with pytest.raises(
+            QueryTeardownOwnershipError,
+            match=r"request:unresolved-grant\[granted\]",
+        ):
+            runner_cls._release_query_resources(
+                runner,
+                query_id,
+                reason="unresolved_owner",
+            )
+
+        assert runner._query_resource_coordinator.release_calls == []
+        assert get_query_resource_manager(query_id) is manager
+        assert _manager_task_lease_id(runner_cls, runner, lease) in manager.snapshot()["task_leases"]
+
+        completion = Future()
+        assert await runner_cls.release_query_task_lease_after_completion(
+            runner,
+            request["request_id"],
+            lease["lease_id"],
+            lease["attempt_id"],
+            [SimpleNamespace(future=lambda: completion)],
+        ) == {"scheduled": True}
+        assert runner._query_task_lease_requests[request["request_id"]]["status"] == "completion_wait"
+        completion.set_result(None)
+        deadline = time.monotonic() + 1
+        while runner._query_task_lease_requests and time.monotonic() < deadline:
+            await asyncio.sleep(0.001)
+        assert runner._query_task_lease_requests == {}
+        runner_cls._release_query_resources(
+            runner,
+            query_id,
+            reason="owner_resolved",
+            admission_fenced=True,
+        )
+
+        assert runner._query_resource_coordinator.release_calls == [
+            (query_id, allocation.generation),
+        ]
+        with pytest.raises(KeyError):
+            get_query_resource_manager(query_id)
+
+    asyncio.run(scenario())
+
+
 def test_driver_rejects_runtime_resources_that_diverge_from_registered_stage():
     async def scenario():
         query_id = "query-lease-resource-mismatch"
@@ -374,7 +1014,7 @@ def test_driver_rejects_runtime_resources_that_diverge_from_registered_stage():
             on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
         )
         manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
-        request = _task_request(query_id, "request:mismatch", "task:mismatch")
+        request = _task_request(runner, query_id, "request:mismatch", "task:mismatch")
         request["resources"]["heap_bytes"] = 99
 
         denial = await runner_cls.acquire_query_task_lease(runner, request)
@@ -389,6 +1029,7 @@ def test_driver_rejects_runtime_resources_that_diverge_from_registered_stage():
         assert owner_identity not in runner._query_task_request_owner_by_identity
 
         corrected = _task_request(
+            runner,
             query_id,
             "request:mismatch-corrected",
             "task:mismatch",
@@ -412,7 +1053,7 @@ def test_driver_pending_output_waiter_is_live_and_cancel_cleanup_is_complete():
         )
         stage_id = graph.stages[0].stage_id
         manager.update_stage_state(stage_id, runnable=True)
-        task_request = _task_request(query_id, "request:task", "task:output")
+        task_request = _task_request(runner, query_id, "request:task", "task:output")
         task = await runner_cls.acquire_query_task_lease(runner, task_request)
         owned = await _fill_task_output_window(
             runner_cls,
@@ -474,7 +1115,7 @@ def test_driver_output_cancel_before_acquire_is_durable_and_restores_budget():
         )
         stage_id = graph.stages[0].stage_id
         manager.update_stage_state(stage_id, runnable=True)
-        task_request = _task_request(query_id, "request:task", "task:pre-cancel-output")
+        task_request = _task_request(runner, query_id, "request:task", "task:pre-cancel-output")
         task = await runner_cls.acquire_query_task_lease(runner, task_request)
         output_request = {
             "request_id": "request:pre-cancel-output",
@@ -530,7 +1171,7 @@ def test_driver_output_cancel_after_grant_releases_late_lease_and_restores_budge
         )
         stage_id = graph.stages[0].stage_id
         manager.update_stage_state(stage_id, runnable=True)
-        task_request = _task_request(query_id, "request:task", "task:late-grant-output")
+        task_request = _task_request(runner, query_id, "request:task", "task:late-grant-output")
         task = await runner_cls.acquire_query_task_lease(runner, task_request)
         output_request = {
             "request_id": "request:late-grant-output",
@@ -592,7 +1233,7 @@ def test_driver_output_pump_evaluates_each_waiter_once_per_state_transition():
         )
         stage_id = graph.stages[0].stage_id
         manager.update_stage_state(stage_id, runnable=True)
-        task_request = _task_request(query_id, "request:task", "task:output-pump")
+        task_request = _task_request(runner, query_id, "request:task", "task:output-pump")
         task = await runner_cls.acquire_query_task_lease(runner, task_request)
         owned = await _fill_task_output_window(
             runner_cls,
@@ -697,12 +1338,14 @@ def test_task_attempt_rejects_a_second_request_id_instead_of_orphaning_future():
         )
         manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
         active_request = _task_request(
+            runner,
             query_id,
             "request:active",
             "task:active",
         )
         active = await runner_cls.acquire_query_task_lease(runner, active_request)
         first_request = _task_request(
+            runner,
             query_id,
             "request:first-owner",
             "task:duplicate",
@@ -722,8 +1365,7 @@ def test_task_attempt_rejects_a_second_request_id_instead_of_orphaning_future():
 
         assert await runner_cls.cancel_query_task_lease_request(
             runner,
-            first_request["request_id"],
-            submitted=False,
+            first_request,
         ) == {"cancelled": True, "released": False}
         denial = await first_waiter
         assert denial["blocked_reason"] == "task_lease_request_cancelled"
@@ -753,6 +1395,7 @@ def test_output_block_rejects_a_second_request_id_instead_of_orphaning_future():
         stage_id = graph.stages[0].stage_id
         manager.update_stage_state(stage_id, runnable=True)
         task_request = _task_request(
+            runner,
             query_id,
             "request:task",
             "task:output-owner",
@@ -824,6 +1467,7 @@ def test_terminal_task_and_output_requests_are_idempotent_for_query_lifetime():
         manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
 
         task_request = _task_request(
+            runner,
             query_id,
             "request:terminal-task",
             "task:terminal",
@@ -895,6 +1539,317 @@ def test_terminal_task_and_output_requests_are_idempotent_for_query_lifetime():
     asyncio.run(scenario())
 
 
+def test_signed_task_lease_ack_survives_eviction_and_query_id_reuse():
+    async def scenario():
+        query_id = "query-terminal-control-after-eviction"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        runner._query_task_terminal_controls = BoundedReplayMap(capacity=1)
+        runner._query_task_terminal_attempts = BoundedReplayMap(capacity=1)
+        manager = register_query_graph(
+            graph,
+            _allocation(),
+            on_change=lambda: runner_cls._signal_query_resource_change(
+                runner,
+                query_id,
+            ),
+        )
+        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+
+        task_request = _task_request(
+            runner,
+            query_id,
+            "request:terminal-task-after-eviction",
+            "task:terminal-after-eviction",
+        )
+        task = await runner_cls.acquire_query_task_lease(runner, task_request)
+
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            task["lease"]["lease_id"],
+            task["lease"]["attempt_id"],
+        ) == {"released": True}
+
+        runner._query_task_lease_request_tombstones.clear()
+        conflicting_terminal_cancel = dict(task_request)
+        conflicting_terminal_cancel["request_id"] = "request:conflicting-terminal-cancel"
+        with pytest.raises(ValueError, match="already terminal under another request_id"):
+            await runner_cls.cancel_query_task_lease_request(
+                runner,
+                conflicting_terminal_cancel,
+            )
+        unseen_request = _task_request(
+            runner,
+            query_id,
+            "request:never-admitted",
+            "task:never-admitted",
+        )
+        assert await runner_cls.cancel_query_task_lease_request(
+            runner,
+            unseen_request,
+        ) == {"cancelled": True, "released": False}
+        unseen_denial = await runner_cls.acquire_query_task_lease(
+            runner,
+            unseen_request,
+        )
+        assert unseen_denial["granted"] is False
+        assert unseen_denial["blocked_reason"] == "task_lease_request_cancelled"
+        mismatched_unseen = dict(unseen_request)
+        mismatched_unseen["task_id"] = "task:mismatched-never-admitted"
+        with pytest.raises(ValueError, match="reused with different identity"):
+            await runner_cls.cancel_query_task_lease_request(
+                runner,
+                mismatched_unseen,
+            )
+
+        assert len(runner._query_task_terminal_controls) == 1
+        assert len(runner._query_task_terminal_attempts) == 1
+        assert (
+            runner_cls._task_request_fingerprint(
+                task_request["request_id"],
+            )
+            not in runner._query_task_terminal_controls
+        )
+        assert runner_cls._task_attempt_fingerprint(task_request) not in runner._query_task_terminal_attempts
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            "wrong-lease",
+            task["lease"]["attempt_id"],
+        ) == {"released": False}
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            task["lease"]["lease_id"],
+            task["lease"]["attempt_id"],
+        ) == {"released": True}
+        assert await runner_cls.release_query_task_lease_after_completion(
+            runner,
+            task_request["request_id"],
+            task["lease"]["lease_id"],
+            task["lease"]["attempt_id"],
+            [SimpleNamespace(future=lambda: Future())],
+        ) == {"scheduled": True}
+        assert await runner_cls.handoff_query_task_lease_to_teardown(
+            runner,
+            task_request["request_id"],
+            task["lease"]["lease_id"],
+            task["lease"]["attempt_id"],
+        ) == {"handed_off": True}
+
+        old_capability = task["lease"]["lease_id"]
+        old_manager_lease_id = _manager_task_lease_id(
+            runner_cls,
+            runner,
+            task["lease"],
+        )
+        closing_request = _task_request(
+            runner,
+            query_id,
+            "request:released-after-close",
+            "task:released-after-close",
+        )
+        closing_task = await runner_cls.acquire_query_task_lease(
+            runner,
+            closing_request,
+        )
+        assert closing_task["granted"] is True
+        runner_cls._close_query_resource_admission(runner, query_id)
+        assert len(runner._query_task_lease_request_tombstones) == 0
+        assert len(runner._query_task_terminal_controls) == 0
+        assert len(runner._query_task_terminal_attempts) == 0
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            closing_request["request_id"],
+            closing_task["lease"]["lease_id"],
+            closing_task["lease"]["attempt_id"],
+        ) == {"released": True}
+        assert len(runner._query_task_lease_request_tombstones) == 1
+        assert len(runner._query_task_terminal_controls) == 1
+        assert len(runner._query_task_terminal_attempts) == 1
+
+        clear_query_resource_managers()
+        next_manager = register_query_graph(graph, _allocation())
+        next_manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        runner_cls._open_query_resource_admission(runner, query_id)
+        assert len(runner._query_task_lease_request_tombstones) == 0
+        assert len(runner._query_task_terminal_controls) == 0
+        assert len(runner._query_task_terminal_attempts) == 0
+        task_request = _task_request(
+            runner,
+            query_id,
+            task_request["request_id"],
+            task_request["task_id"],
+        )
+        replacement = await runner_cls.acquire_query_task_lease(
+            runner,
+            task_request,
+        )
+        assert replacement["granted"] is True
+        assert replacement["lease"]["lease_id"] != old_capability
+        replacement_manager_lease_id = _manager_task_lease_id(
+            runner_cls,
+            runner,
+            replacement["lease"],
+        )
+
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            old_capability,
+            task["lease"]["attempt_id"],
+        ) == {"released": True}
+        assert await runner_cls.release_query_task_lease_after_completion(
+            runner,
+            task_request["request_id"],
+            old_capability,
+            task["lease"]["attempt_id"],
+            [SimpleNamespace(future=lambda: Future())],
+        ) == {"scheduled": True}
+        assert await runner_cls.handoff_query_task_lease_to_teardown(
+            runner,
+            task_request["request_id"],
+            old_capability,
+            task["lease"]["attempt_id"],
+        ) == {"handed_off": True}
+        assert replacement_manager_lease_id in next_manager.snapshot()["task_leases"]
+        assert old_manager_lease_id not in next_manager.snapshot()["task_leases"]
+
+        stale_output_request = {
+            "request_id": "request:stale-generation-output",
+            "query_id": query_id,
+            "producer_stage_id": graph.stages[0].stage_id,
+            "task_lease_id": old_capability,
+            "attempt_id": task["lease"]["attempt_id"],
+            "block_id": "block:generation-fence",
+            "size_bytes": 10,
+        }
+        assert await runner_cls.cancel_query_output_block_lease_request(
+            runner,
+            stale_output_request,
+        ) == {"cancelled": True, "released": False}
+
+        current_output_request = dict(stale_output_request)
+        current_output_request["request_id"] = "request:current-generation-output"
+        current_output_request["task_lease_id"] = replacement["lease"]["lease_id"]
+        current_output = await runner_cls.acquire_query_output_block_lease(
+            runner,
+            current_output_request,
+        )
+        assert current_output["granted"] is True
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            current_output_request["request_id"],
+            current_output["lease"]["lease_id"],
+            query_id,
+        ) == {"released": True}
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            replacement["lease"]["lease_id"],
+            replacement["lease"]["attempt_id"],
+        ) == {"released": True}
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            old_capability,
+            task["lease"]["attempt_id"],
+        ) == {"released": True}
+        assert next_manager.snapshot()["task_leases"] == {}
+
+    asyncio.run(scenario())
+
+
+def test_output_terminal_control_ack_survives_bounded_replay_payload_eviction():
+    async def scenario():
+        query_id = "query-output-terminal-after-eviction"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_graph(
+            graph,
+            _allocation(),
+            on_change=lambda: runner_cls._signal_query_resource_change(
+                runner,
+                query_id,
+            ),
+        )
+        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+
+        task_request = _task_request(
+            runner,
+            query_id,
+            "request:output-terminal-task",
+            "task:output-terminal",
+        )
+        task = await runner_cls.acquire_query_task_lease(runner, task_request)
+        output_request = {
+            "request_id": "request:output-terminal-after-eviction",
+            "query_id": query_id,
+            "producer_stage_id": graph.stages[0].stage_id,
+            "task_lease_id": task["lease"]["lease_id"],
+            "attempt_id": task["lease"]["attempt_id"],
+            "block_id": "block:output-terminal-after-eviction",
+            "size_bytes": 10,
+        }
+        output = await runner_cls.acquire_query_output_block_lease(
+            runner,
+            output_request,
+        )
+        lease_id = output["lease"]["lease_id"]
+
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            output_request["request_id"],
+            lease_id,
+        ) == {"released": True}
+
+        runner._query_output_lease_request_tombstones.clear()
+
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            output_request["request_id"],
+            lease_id,
+        ) == {"released": True}
+        assert await runner_cls.handoff_query_output_block_lease(
+            runner,
+            output_request["request_id"],
+            lease_id,
+        ) == {"handed_off": True}
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            output_request["request_id"],
+            "wrong-output-lease",
+        ) == {"released": False}
+        replay = await runner_cls.acquire_query_output_block_lease(
+            runner,
+            output_request,
+        )
+        assert replay["granted"] is False
+        assert replay["fatal"] is True
+        assert replay["blocked_reason"] == "output_lease_request_released"
+        assert await runner_cls.cancel_query_output_block_lease_request(
+            runner,
+            output_request,
+        ) == {"cancelled": True, "released": False}
+        mismatched = dict(output_request)
+        mismatched["size_bytes"] = 11
+        with pytest.raises(ValueError, match="reused with different identity"):
+            await runner_cls.cancel_query_output_block_lease_request(
+                runner,
+                mismatched,
+            )
+
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            task["lease"]["lease_id"],
+            task["lease"]["attempt_id"],
+        ) == {"released": True}
+
+    asyncio.run(scenario())
+
+
 def test_cancelled_admission_request_replay_returns_the_same_terminal_denial():
     async def scenario():
         query_id = "query-cancelled-request-replay"
@@ -911,12 +1866,14 @@ def test_cancelled_admission_request_replay_returns_the_same_terminal_denial():
         manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
 
         active_request = _task_request(
+            runner,
             query_id,
             "request:active-for-cancel",
             "task:active-for-cancel",
         )
         active = await runner_cls.acquire_query_task_lease(runner, active_request)
         cancelled_request = _task_request(
+            runner,
             query_id,
             "request:cancelled",
             "task:cancelled",
@@ -926,10 +1883,19 @@ def test_cancelled_admission_request_replay_returns_the_same_terminal_denial():
             await asyncio.sleep(0)
         assert not original_waiter.done()
 
+        conflicting_cancel = dict(cancelled_request)
+        conflicting_cancel["request_id"] = "request:conflicting-cancel"
+        with pytest.raises(ValueError, match="already owned by request_id request:cancelled"):
+            await runner_cls.cancel_query_task_lease_request(
+                runner,
+                conflicting_cancel,
+            )
+        assert not original_waiter.done()
+        assert manager.snapshot()["stages"][graph.stages[0].stage_id]["pending_task_count"] == 1
+
         assert await runner_cls.cancel_query_task_lease_request(
             runner,
-            cancelled_request["request_id"],
-            submitted=False,
+            cancelled_request,
         ) == {"cancelled": True, "released": False}
         original_denial = await original_waiter
         replay_denial = await runner_cls.acquire_query_task_lease(
@@ -981,7 +1947,7 @@ def test_query_teardown_resolves_all_pending_admission_futures():
         runner._query_graphs = {query_id: graph}
         runner._query_allocations = {query_id: allocation}
 
-        active_request = _task_request(query_id, "request:active", "task:active")
+        active_request = _task_request(runner, query_id, "request:active", "task:active")
         active = await runner_cls.acquire_query_task_lease(runner, active_request)
         await _fill_task_output_window(
             runner_cls,
@@ -992,6 +1958,7 @@ def test_query_teardown_resolves_all_pending_admission_futures():
             prefix="teardown",
         )
         pending_task_request = _task_request(
+            runner,
             query_id,
             "request:pending",
             "task:pending",
@@ -1016,10 +1983,21 @@ def test_query_teardown_resolves_all_pending_admission_futures():
         assert not pending_task.done()
         assert not pending_output.done()
 
+        # This resource-layer test has no fragment/collector to perform the
+        # terminal task handoff. Model that owner explicitly before releasing
+        # the whole query.
+        runner_cls._close_query_resource_admission(runner, query_id)
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            active_request["request_id"],
+            active["lease"]["lease_id"],
+            active["lease"]["attempt_id"],
+        ) == {"released": True}
         runner_cls._release_query_resources(
             runner,
             query_id,
             reason="test_teardown",
+            admission_fenced=True,
         )
         task_denial, output_denial = await asyncio.wait_for(
             asyncio.gather(pending_task, pending_output),
@@ -1691,6 +2669,7 @@ def test_background_query_teardown_fences_new_admission_before_table_purge():
         runner._query_allocations = {query_id: allocation}
 
         active_request = _task_request(
+            runner,
             query_id,
             "request:active",
             "task:active",
@@ -1722,8 +2701,28 @@ def test_background_query_teardown_fences_new_admission_before_table_purge():
             )
         )
         await asyncio.to_thread(failed_pending.wait, 1)
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            active_request["request_id"],
+            active["lease"]["lease_id"],
+            active["lease"]["attempt_id"],
+        ) == {"released": True}
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            active_request["request_id"],
+            active["lease"]["lease_id"],
+            active["lease"]["attempt_id"],
+        ) == {"released": True}
+        assert await runner_cls.release_query_task_lease_after_completion(
+            runner,
+            active_request["request_id"],
+            active["lease"]["lease_id"],
+            active["lease"]["attempt_id"],
+            [SimpleNamespace(future=Future)],
+        ) == {"scheduled": True}
 
         late_request = _task_request(
+            runner,
             query_id,
             "request:late",
             "task:late",
@@ -1755,9 +2754,10 @@ def test_task_admission_pump_resolves_waiter_when_stage_becomes_terminal():
         )
         stage_id = graph.stages[0].stage_id
         manager.update_stage_state(stage_id, runnable=True)
-        active_request = _task_request(query_id, "request:active", "task:active")
+        active_request = _task_request(runner, query_id, "request:active", "task:active")
         active = await runner_cls.acquire_query_task_lease(runner, active_request)
         pending_request = _task_request(
+            runner,
             query_id,
             "request:pending",
             "task:pending",
@@ -1819,16 +2819,29 @@ def test_new_query_generation_reopens_admission_after_old_state_is_purged():
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
         register_query_graph(graph, _allocation())
+        delayed_old_request = _task_request(
+            runner,
+            query_id,
+            "request:reused-generation",
+            "task:reused-generation",
+        )
 
         runner_cls._close_query_resource_admission(runner, query_id)
         assert query_id in runner._query_resource_closing_queries
+        retired_task_lease_id = runner_cls._issue_task_lease_capability(
+            runner,
+            request_id="request:retired-old-generation-task",
+            manager_lease_id="lease:retired-old-generation-task",
+            attempt_id="attempt:retired-old-generation-task",
+            query_id=query_id,
+        )
         late_cancel = await runner_cls.cancel_query_output_block_lease_request(
             runner,
             {
                 "request_id": "request:late-old-generation-output",
                 "query_id": query_id,
                 "producer_stage_id": graph.stages[0].stage_id,
-                "task_lease_id": "lease:retired-old-generation-task",
+                "task_lease_id": retired_task_lease_id,
                 "attempt_id": "attempt:retired-old-generation-task",
                 "block_id": "block:late-old-generation-output",
                 "size_bytes": 10,
@@ -1836,17 +2849,239 @@ def test_new_query_generation_reopens_admission_after_old_state_is_purged():
         )
         assert late_cancel == {"cancelled": True, "released": False}
         assert len(runner._query_output_lease_request_tombstones) == 0
+        runner._query_lease_generation_ids.pop(query_id)
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            "request:retired-old-generation-task",
+            retired_task_lease_id,
+            "attempt:retired-old-generation-task",
+        ) == {"released": True}
+        assert await runner_cls.release_query_task_lease_after_completion(
+            runner,
+            "request:retired-old-generation-task",
+            retired_task_lease_id,
+            "attempt:retired-old-generation-task",
+            [],
+        ) == {"scheduled": True}
+        assert await runner_cls.handoff_query_task_lease_to_teardown(
+            runner,
+            "request:retired-old-generation-task",
+            retired_task_lease_id,
+            "attempt:retired-old-generation-task",
+        ) == {"handed_off": True}
+        closed_generation_cancel = dict(
+            request_id="request:closed-generation-output",
+            query_id=query_id,
+            producer_stage_id=graph.stages[0].stage_id,
+            task_lease_id=retired_task_lease_id,
+            attempt_id="attempt:retired-old-generation-task",
+            block_id="block:closed-generation-output",
+            size_bytes=10,
+        )
+        assert await runner_cls.cancel_query_output_block_lease_request(
+            runner,
+            closed_generation_cancel,
+        ) == {"cancelled": True, "released": False}
+        assert len(runner._query_output_lease_request_tombstones) == 0
         clear_query_resource_managers()
 
         manager = register_query_graph(graph, _allocation())
         manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
         runner_cls._open_query_resource_admission(runner, query_id)
+
+        stale_grant = await runner_cls.acquire_query_task_lease(
+            runner,
+            delayed_old_request,
+        )
+        assert stale_grant["granted"] is False
+        assert stale_grant["blocked_reason"] == "query_generation_inactive"
+        assert stale_grant["fatal"] is True
+        assert manager.snapshot()["task_leases"] == {}
+        assert runner._query_task_lease_requests == {}
+
+        current_request = _task_request(
+            runner,
+            query_id,
+            delayed_old_request["request_id"],
+            delayed_old_request["task_id"],
+        )
         grant = await runner_cls.acquire_query_task_lease(
             runner,
-            _task_request(query_id, "request:new-generation", "task:new-generation"),
+            current_request,
         )
 
         assert grant["granted"] is True
+        manager_lease_id = _manager_task_lease_id(runner_cls, runner, grant["lease"])
+        assert await runner_cls.cancel_query_task_lease_request(
+            runner,
+            delayed_old_request,
+        ) == {"cancelled": True, "released": False}
+        assert manager_lease_id in manager.snapshot()["task_leases"]
+        assert runner._query_task_lease_requests[current_request["request_id"]]["status"] == "granted"
         assert query_id not in runner._query_resource_closing_queries
+
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            current_request["request_id"],
+            grant["lease"]["lease_id"],
+            grant["lease"]["attempt_id"],
+        ) == {"released": True}
+
+    asyncio.run(scenario())
+
+
+def test_signed_output_lease_ack_survives_teardown_and_query_id_reuse():
+    async def scenario():
+        query_id = "query-signed-output-reopen"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        runner._query_output_terminal_controls = BoundedReplayMap(capacity=1)
+        manager = register_query_graph(graph, _allocation())
+        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+
+        task_request = _task_request(
+            runner,
+            query_id,
+            "request:signed-output-task",
+            "task:signed-output-task",
+        )
+        task = await runner_cls.acquire_query_task_lease(
+            runner,
+            task_request,
+        )
+
+        def output_request(index):
+            return {
+                "request_id": f"request:signed-output:{index}",
+                "query_id": query_id,
+                "producer_stage_id": graph.stages[0].stage_id,
+                "task_lease_id": task["lease"]["lease_id"],
+                "attempt_id": task["lease"]["attempt_id"],
+                "block_id": f"block:signed-output:{index}",
+                "size_bytes": 10,
+            }
+
+        released_request = output_request(0)
+        released = await runner_cls.acquire_query_output_block_lease(
+            runner,
+            released_request,
+        )
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            released_request["request_id"],
+            released["lease"]["lease_id"],
+            query_id,
+        ) == {"released": True}
+        assert len(runner._query_output_terminal_controls) == 1
+
+        evicting_request = output_request(1)
+        evicting = await runner_cls.acquire_query_output_block_lease(
+            runner,
+            evicting_request,
+        )
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            evicting_request["request_id"],
+            evicting["lease"]["lease_id"],
+            query_id,
+        ) == {"released": True}
+        assert len(runner._query_output_terminal_controls) == 1
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            released_request["request_id"],
+            released["lease"]["lease_id"],
+            query_id,
+        ) == {"released": True}
+
+        active_request = output_request(2)
+        active = await runner_cls.acquire_query_output_block_lease(
+            runner,
+            active_request,
+        )
+        active_capability = active["lease"]["lease_id"]
+
+        runner_cls._close_query_resource_admission(runner, query_id)
+        assert runner._query_output_lease_requests == {}
+        assert len(runner._query_output_terminal_controls) == 0
+        assert len(manager.snapshot()["output_leases"]) == 1
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            active_request["request_id"],
+            active_capability,
+            query_id,
+        ) == {"released": True}
+        assert manager.snapshot()["output_leases"] == {}
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            task["lease"]["lease_id"],
+            task["lease"]["attempt_id"],
+        ) == {"released": True}
+
+        clear_query_resource_managers()
+        next_manager = register_query_graph(graph, _allocation())
+        next_manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        runner_cls._open_query_resource_admission(runner, query_id)
+
+        task_request = _task_request(
+            runner,
+            query_id,
+            task_request["request_id"],
+            task_request["task_id"],
+        )
+        replacement_task = await runner_cls.acquire_query_task_lease(
+            runner,
+            task_request,
+        )
+        replacement_request = {
+            **active_request,
+            "task_lease_id": replacement_task["lease"]["lease_id"],
+            "attempt_id": replacement_task["lease"]["attempt_id"],
+        }
+        replacement_output = await runner_cls.acquire_query_output_block_lease(
+            runner,
+            replacement_request,
+        )
+        assert replacement_output["lease"]["lease_id"] != active_capability
+
+        assert await runner_cls.handoff_query_output_block_lease(
+            runner,
+            active_request["request_id"],
+            active_capability,
+            query_id,
+        ) == {"handed_off": True}
+        assert len(next_manager.snapshot()["output_leases"]) == 1
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            active_request["request_id"],
+            active_capability,
+            query_id,
+        ) == {"released": True}
+        assert len(next_manager.snapshot()["output_leases"]) == 1
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            active_request["request_id"],
+            active_capability,
+            "different-query",
+        ) == {"released": False}
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            active_request["request_id"],
+            "forged-output-capability",
+            query_id,
+        ) == {"released": False}
+        assert await runner_cls.release_query_output_block_lease(
+            runner,
+            replacement_request["request_id"],
+            replacement_output["lease"]["lease_id"],
+            query_id,
+        ) == {"released": True}
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            replacement_task["lease"]["lease_id"],
+            replacement_task["lease"]["attempt_id"],
+        ) == {"released": True}
+        assert next_manager.snapshot()["output_leases"] == {}
 
     asyncio.run(scenario())

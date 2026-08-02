@@ -332,6 +332,7 @@ def ensure_actor_pools_for_plan(
     *,
     actor_node_ids_by_stage: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
+    query_generation_capability: str,
     session_config: dict[str, str],
     actor_pool_cls: type[UDFActorPoolBase],
     is_vane_worker_process: Callable[[], bool],
@@ -347,6 +348,7 @@ def ensure_actor_pools_for_plan(
         udf_nodes,
         actor_node_ids_by_stage=actor_node_ids_by_stage,
         query_driver_handle=query_driver_handle,
+        query_generation_capability=query_generation_capability,
         session_config=session_config,
         set_handles=lambda actor_handles_map: plan.set_udf_actor_handles(actor_handles_map, conn=conn),
         actor_pool_cls=actor_pool_cls,
@@ -366,6 +368,7 @@ def prepare_actor_pools_for_plan(
     *,
     actor_node_ids_by_stage: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
+    query_generation_capability: str,
     session_config: dict[str, str],
     actor_pool_cls: type[UDFActorPoolBase],
     is_vane_worker_process: Callable[[], bool],
@@ -388,6 +391,7 @@ def prepare_actor_pools_for_plan(
         udf_nodes,
         actor_node_ids_by_stage=actor_node_ids_by_stage,
         query_driver_handle=query_driver_handle,
+        query_generation_capability=query_generation_capability,
         session_config=session_config,
         set_handles=lambda actor_handles_map: plan.set_udf_actor_handles(actor_handles_map, conn=conn),
         actor_pool_cls=actor_pool_cls,
@@ -407,6 +411,7 @@ def ensure_actor_pools_for_nodes(
     *,
     actor_node_ids_by_stage: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
+    query_generation_capability: str,
     session_config: dict[str, str],
     set_handles: Callable[[dict[str, Any]], None] | None = None,
     actor_pool_cls: type[UDFActorPoolBase],
@@ -422,6 +427,7 @@ def ensure_actor_pools_for_nodes(
         udf_nodes,
         actor_node_ids_by_stage=actor_node_ids_by_stage,
         query_driver_handle=query_driver_handle,
+        query_generation_capability=query_generation_capability,
         session_config=session_config,
         set_handles=set_handles,
         actor_pool_cls=actor_pool_cls,
@@ -441,6 +447,7 @@ def _create_actor_pools_for_nodes(
     *,
     actor_node_ids_by_stage: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
+    query_generation_capability: str,
     session_config: dict[str, str],
     set_handles: Callable[[dict[str, Any]], None] | None,
     actor_pool_cls: type[UDFActorPoolBase],
@@ -460,6 +467,9 @@ def _create_actor_pools_for_nodes(
         return [], {}
     if query_driver_handle is None:
         raise ValueError("Ray UDF executor preparation requires an explicit query driver handle")
+    generation_capability = str(query_generation_capability or "").strip()
+    if not generation_capability:
+        raise ValueError("Ray UDF executor preparation requires a query generation capability")
     normalized_session_config = {str(key): str(value) for key, value in session_config.items()}
     session_runtime_env_vars = build_session_runtime_env_vars(normalized_session_config)
 
@@ -478,13 +488,14 @@ def _create_actor_pools_for_nodes(
             if backend not in {"ray_task", "ray_actor", "subprocess_task", "subprocess_actor"}:
                 continue
             node_id = str(node["node_id"])
-            executor_options = {
+            executor_options: dict[str, Any] = {
                 "session_config": normalized_session_config,
             }
             actor_handles_map[node_id] = executor_options
             if backend in {"subprocess_task", "subprocess_actor"}:
                 continue
             executor_options["query_driver_handle"] = query_driver_handle
+            executor_options["query_generation_capability"] = generation_capability
             if not requires_actor_pool_fn(raw_payload):
                 continue
             payload = normalize_actor_pool_payload(raw_payload)

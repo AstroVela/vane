@@ -658,6 +658,10 @@ def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_
             "heap_bytes": 128,
             "object_store_bytes": 0,
         },
+        "query_generation_capability": runner_cls._issue_query_task_admission_capability(
+            runner,
+            streaming_query_id,
+        ),
     }
 
     async def _run_concurrently():
@@ -906,8 +910,8 @@ def test_driver_exposes_query_task_and_output_lease_api():
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     required = {
         "acquire_query_task_lease",
-        "mark_query_task_lease_submitted",
         "release_query_task_lease",
+        "handoff_query_task_lease_to_teardown",
         "acquire_query_output_block_lease",
         "handoff_query_output_block_lease",
         "release_query_output_block_lease",

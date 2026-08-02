@@ -43,8 +43,14 @@ public:
 		throw InternalException("Cannot deschedule task of base Task class");
 	};
 
-	//! Ensures a task is rescheduled to the correct queue
-	virtual void Reschedule() {
+	//! Return the execution epoch captured by a task interrupt callback.
+	virtual uint64_t CurrentInterruptEpoch() const {
+		throw InternalException("Cannot read interrupt epoch of base Task class");
+	}
+
+	//! Ensures a task is rescheduled to the correct queue for the captured execution epoch.
+	virtual void Reschedule(uint64_t interrupt_epoch) {
+		(void)interrupt_epoch;
 		throw InternalException("Cannot reschedule task of base Task class");
 	}
 

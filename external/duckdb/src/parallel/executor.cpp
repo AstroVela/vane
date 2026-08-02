@@ -591,21 +591,21 @@ void Executor::WaitForTask() {
 }
 
 void Executor::RescheduleTask(shared_ptr<Task> &task_p) {
-	// This function will spin lock until the task provided is added to the to_be_rescheduled_tasks
-	while (true) {
-		lock_guard<mutex> l(executor_lock);
-		if (cancelled) {
-			return;
-		}
-		auto entry = to_be_rescheduled_tasks.find(task_p.get());
-		if (entry != to_be_rescheduled_tasks.end()) {
-			auto &scheduler = TaskScheduler::GetScheduler(context);
-			to_be_rescheduled_tasks.erase(task_p.get());
-			scheduler.ScheduleTask(GetToken(), task_p);
-			SignalTaskRescheduled(l);
-			break;
-		}
+	lock_guard<mutex> l(executor_lock);
+	if (cancelled) {
+		return;
 	}
+	auto entry = to_be_rescheduled_tasks.find(task_p.get());
+	if (entry == to_be_rescheduled_tasks.end()) {
+		// Cancellation/reset can remove the executor's final strong reference
+		// after a callback has already locked its weak task reference. The
+		// callback is terminally stale and must not affect the next execution.
+		return;
+	}
+	auto &scheduler = TaskScheduler::GetScheduler(context);
+	to_be_rescheduled_tasks.erase(task_p.get());
+	scheduler.ScheduleTask(GetToken(), task_p);
+	SignalTaskRescheduled(l);
 }
 
 bool Executor::ResultCollectorIsBlocked() {

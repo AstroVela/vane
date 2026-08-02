@@ -2814,8 +2814,8 @@ def test_query_driver_run_plan_start_failure_runs_complete_teardown(monkeypatch)
         calls.append(("actors", plan_id))
         raise RuntimeError("actor cleanup failed")
 
-    def _drop_fragments(_self, query_id):
-        calls.append(("fragments", query_id))
+    def _drop_fragments(_self, query_id, *, release_resources):
+        calls.append(("fragments", query_id, release_resources))
         raise RuntimeError("fragment cleanup failed")
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
@@ -2828,7 +2828,11 @@ def test_query_driver_run_plan_start_failure_runs_complete_teardown(monkeypatch)
     )
     monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", _cleanup_udf_actors)
-    monkeypatch.setattr(cls, "_drop_query_fragments_sync", _drop_fragments)
+    monkeypatch.setattr(
+        cls,
+        "_drop_query_fragments_after_admission_fence_sync",
+        _drop_fragments,
+    )
 
     with pytest.raises(RuntimeError, match="failed to start and teardown also failed") as exc_info:
         asyncio.run(_run_actor_stream_plan(runner, logical_plan))
@@ -2839,7 +2843,7 @@ def test_query_driver_run_plan_start_failure_runs_complete_teardown(monkeypatch)
     assert "fragment cleanup failed" in message
     assert calls == [
         ("actors", "failed-plan"),
-        ("fragments", "failed-query"),
+        ("fragments", "failed-query", False),
     ]
     assert "failed-plan" not in runner.curr_plans
     assert "failed-plan" not in runner.curr_streams
@@ -2890,8 +2894,8 @@ def test_teardown_plan_resources_attempts_every_owned_release(monkeypatch):
         if attempts["vllm"] == 1:
             raise RuntimeError("vllm actor release failed")
 
-    def _drop_fragments(_self, query_id):
-        calls.append(f"fragments:{query_id}")
+    def _drop_fragments(_self, query_id, *, release_resources=True):
+        calls.append(f"fragments:{query_id}:release={release_resources}")
         attempts["fragments"] += 1
         if attempts["fragments"] == 1:
             raise RuntimeError("fragment release failed")
@@ -2899,6 +2903,11 @@ def test_teardown_plan_resources_attempts_every_owned_release(monkeypatch):
     monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", _cleanup_actors)
     monkeypatch.setattr(cls, "_cleanup_vllm_actor_pools", _cleanup_vllm_actors)
     monkeypatch.setattr(cls, "_drop_query_fragments_sync", _drop_fragments)
+    monkeypatch.setattr(
+        cls,
+        "_drop_query_fragments_after_admission_fence_sync",
+        _drop_fragments,
+    )
 
     with pytest.raises(RuntimeError, match="teardown failed") as exc_info:
         cls._teardown_plan_resources(
@@ -2916,7 +2925,7 @@ def test_teardown_plan_resources_attempts_every_owned_release(monkeypatch):
         "output",
         "actors:teardown-plan",
         "vllm:teardown-plan",
-        "fragments:teardown-query",
+        "fragments:teardown-query:release=False",
     ]
     assert plan_id not in runner.curr_plans
     assert plan_id not in runner.curr_streams
@@ -2936,11 +2945,11 @@ def test_teardown_plan_resources_attempts_every_owned_release(monkeypatch):
         "output",
         "actors:teardown-plan",
         "vllm:teardown-plan",
-        "fragments:teardown-query",
+        "fragments:teardown-query:release=False",
         "output",
         "actors:teardown-plan",
         "vllm:teardown-plan",
-        "fragments:teardown-query",
+        "fragments:teardown-query:release=True",
     ]
     assert plan_id not in runner._plan_query_ids
     assert plan_id not in runner._plan_session_ids
@@ -2982,6 +2991,50 @@ def test_query_actor_pool_cleanup_retains_failed_pool_for_retry(cleanup_method, 
 
     assert getattr(runner, active_attr) == []
     assert getattr(runner, by_plan_attr) == {}
+
+
+def test_failed_execution_owner_cleanup_blocks_query_resource_release(monkeypatch):
+    from duckdb.runners.ray.query_resource_runtime import (
+        get_query_resource_manager,
+        release_query_resource_manager,
+    )
+
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "execution-owner-release-gate"
+    query_id = "execution-owner-release-gate-query"
+    manager = _bind_test_query_resource_owner(runner, plan_id, query_id=query_id)
+    runner.curr_plans[plan_id] = object()
+    runner.curr_streams[plan_id] = _DummyStream([])
+    fragment_calls = []
+
+    def fail_actor_cleanup(_self, actual_plan_id):
+        assert actual_plan_id == plan_id
+        raise RuntimeError("planned live actor owner")
+
+    def quiesce_without_release(_self, actual_query_id, *, release_resources):
+        fragment_calls.append((actual_query_id, release_resources))
+
+    monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", fail_actor_cleanup)
+    monkeypatch.setattr(
+        cls,
+        "_drop_query_fragments_after_admission_fence_sync",
+        quiesce_without_release,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="planned live actor owner"):
+            cls._teardown_plan_resources(
+                runner,
+                plan_id,
+                query_id,
+                drop_fragments=True,
+            )
+
+        assert fragment_calls == [(query_id, False)]
+        assert get_query_resource_manager(query_id) is manager
+        assert runner._plan_query_ids[plan_id] == query_id
+    finally:
+        release_query_resource_manager(query_id, reason="test_complete")
 
 
 def test_teardown_fence_failure_retains_retryable_query_ownership(monkeypatch):

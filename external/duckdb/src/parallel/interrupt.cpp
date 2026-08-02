@@ -10,6 +10,10 @@ namespace duckdb {
 InterruptState::InterruptState() : mode(InterruptMode::NO_INTERRUPTS) {
 }
 InterruptState::InterruptState(weak_ptr<Task> task) : mode(InterruptMode::TASK), current_task(std::move(task)) {
+	auto task_ref = current_task.lock();
+	if (task_ref) {
+		task_interrupt_epoch = task_ref->CurrentInterruptEpoch();
+	}
 }
 InterruptState::InterruptState(weak_ptr<InterruptDoneSignalState> signal_state_p)
     : mode(InterruptMode::BLOCKING), signal_state(std::move(signal_state_p)) {
@@ -23,7 +27,7 @@ void InterruptState::Callback() const {
 			return;
 		}
 
-		task->Reschedule();
+		task->Reschedule(task_interrupt_epoch);
 	} else if (mode == InterruptMode::BLOCKING) {
 		auto signal_state_l = signal_state.lock();
 

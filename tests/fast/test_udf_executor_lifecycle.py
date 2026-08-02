@@ -6564,6 +6564,7 @@ def _ray_task_executor(*, stream_result="stream-ref", ref_stream_result="ref-str
         run_stream,
         run_ref_stream,
         query_driver_handle=object(),
+        query_generation_capability="test-query-generation-capability",
     )
     return executor, run_stream, run_ref_stream
 

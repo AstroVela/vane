@@ -64,6 +64,8 @@ protected:
 	InterruptMode mode;
 	//! Task ptr for InterruptMode::TASK
 	weak_ptr<Task> current_task;
+	//! Execution epoch that owns this one-shot task callback
+	uint64_t task_interrupt_epoch = 0;
 	//! Signal state for InterruptMode::BLOCKING
 	weak_ptr<InterruptDoneSignalState> signal_state;
 };
