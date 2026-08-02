@@ -411,7 +411,6 @@ class TaskAdmissionController:
         self._resources = ray_udf_task_resource_spec(self._payload)
         self._driver = driver
         self._executor_id = uuid.uuid4().hex
-        self._submission_scope = f"udf-executor:{self._executor_id}"
         self._sequence = 0
         self._lock = threading.Lock()
         self._state = "idle"
@@ -446,6 +445,13 @@ class TaskAdmissionController:
             "query_generation_capability": self._query_generation_capability,
         }
 
+    @staticmethod
+    def _submission_scope_for_request(request_id: str) -> str:
+        request_key = str(request_id or "").strip()
+        if not request_key:
+            raise ValueError("Ray task admission submission scope requires a request identity")
+        return f"udf-stream:{request_key}"
+
     def request(self, retained_input_bytes: int) -> bool:
         retained = int(retained_input_bytes)
         if retained < 0:
@@ -460,10 +466,11 @@ class TaskAdmissionController:
             self._state = "requested"
             self._request_id = str(request["request_id"])
             self._retained_input_bytes = retained
+            submission_scope = self._submission_scope_for_request(self._request_id)
             cancellation = _TaskAdmissionCancellation(
                 driver=self._driver_actor(),
                 request=request,
-                submission_scope=self._submission_scope,
+                submission_scope=submission_scope,
             )
             self._cancellation = cancellation
         request_id = str(request["request_id"])
@@ -474,7 +481,7 @@ class TaskAdmissionController:
         }
         try:
             submission = submit_ray_control(
-                self._submission_scope,
+                submission_scope,
                 lambda: driver.acquire_query_task_lease.remote(submitted_request),
             )
         except BaseException as exc:
@@ -671,7 +678,7 @@ class TaskAdmissionController:
                 request_id=request_id,
                 retained_input_bytes=self._retained_input_bytes,
                 lease=dict(self._ready_lease),
-                submission_scope=self._submission_scope,
+                submission_scope=self._submission_scope_for_request(request_id),
                 _release_callback=cancellation.start,
             )
             self._state = "idle"

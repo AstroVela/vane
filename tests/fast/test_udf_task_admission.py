@@ -443,6 +443,60 @@ def test_blocked_task_admission_submission_does_not_stall_other_controller():
     _wait_for_remote_calls(driver.cancel_query_task_lease_request, 2)
 
 
+def test_blocked_stream_control_does_not_stall_next_admission_from_same_controller():
+    driver = _Driver()
+    blocked_cancel_entered = threading.Event()
+    release_blocked_cancel = threading.Event()
+    first_request_id = ""
+
+    def selectively_blocking_cancel(request):
+        if request["request_id"] == first_request_id:
+            blocked_cancel_entered.set()
+            if not release_blocked_cancel.wait(timeout=5.0):
+                raise RuntimeError("timed out waiting to release blocked stream control")
+        return _resolved_ref({"cancelled": True})
+
+    driver.cancel_query_task_lease_request = _RemoteMethod(
+        selectively_blocking_cancel,
+    )
+    controller = TaskAdmissionController(
+        _payload(),
+        driver=driver,
+        query_generation_capability=_QUERY_GENERATION_CAPABILITY,
+    )
+
+    try:
+        assert controller.request(31)
+        _wait_for_remote_calls(driver.acquire_query_task_lease, 1)
+        _wait_for_request_refs(driver, 1)
+        first_request = driver.acquire_query_task_lease.calls[0][0][0]
+        first_request_id = first_request["request_id"]
+        driver.requests[0].resolve(_grant(first_request))
+        _wait_for_state(controller, "ready")
+
+        first_admission = controller.take(31)
+        assert first_admission.submission_scope == f"udf-stream:{first_request_id}"
+        first_admission.release()
+        assert blocked_cancel_entered.wait(timeout=1.0)
+
+        assert controller.request(47)
+        _wait_for_remote_calls(driver.acquire_query_task_lease, 2)
+        _wait_for_request_refs(driver, 2)
+        second_request = driver.acquire_query_task_lease.calls[1][0][0]
+        driver.requests[1].resolve(_grant(second_request))
+        _wait_for_state(controller, "ready")
+
+        second_admission = controller.take(47)
+        assert second_admission.submission_scope == f"udf-stream:{second_request['request_id']}"
+        assert second_admission.submission_scope != first_admission.submission_scope
+        second_admission.release()
+        _wait_for_remote_calls(driver.cancel_query_task_lease_request, 2)
+        assert release_blocked_cancel.is_set() is False
+    finally:
+        release_blocked_cancel.set()
+        controller.close()
+
+
 def test_blocked_task_admission_submission_does_not_retain_closed_controller():
     driver = _Driver()
     submission_entered = threading.Event()
