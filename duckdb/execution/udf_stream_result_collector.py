@@ -21,6 +21,7 @@ from duckdb.execution.ray_control_deadline import (
 )
 from duckdb.execution.ray_control_submission import (
     create_ray_control_deadline,
+    dispatch_ray_control_abandonment,
     submit_ray_control,
 )
 from duckdb.execution.ray_stream_adapter import (
@@ -134,6 +135,7 @@ class _StreamRecord:
     wait_kind: str = ""
     wait_future: Any | None = None
     completion_future: Any | None = None
+    detached_waits: tuple[Any, ...] = ()
     terminal_signal_observed: bool = False
     next_ref_ready: bool = False
     ready_sequence: int | None = None
@@ -151,13 +153,13 @@ class _CleanupTicket:
         operation: RayStreamCleanupOperation,
         retry_on_error: bool,
         retry_on_incomplete: bool,
-        abandon_wait: Callable[[Any], None] | None,
+        release_wait: Callable[[Any], None] | None,
         on_complete: Callable[[BaseException | None], None],
     ) -> None:
         self.operation = operation
         self.retry_on_error = bool(retry_on_error)
         self.retry_on_incomplete = bool(retry_on_incomplete)
-        self.abandon_wait = abandon_wait
+        self.release_wait = release_wait
         self.retry_count = 0
         self.submitting = False
         self.operation_future: Any | None = None
@@ -222,9 +224,10 @@ class AsyncResultCollector:
     The asyncio thread is the sole generator-readiness, read, and stream-state
     scheduler. Potentially blocking Ray control submissions and terminal
     operations run on admitted stream-owner daemon workers. Cleanup tickets use
-    the process-wide control deadline clock, which hands owner callbacks to a
-    separate bounded/recoverable executor, so loop shutdown and one blocked
-    Future callback cannot orphan unrelated retries or response timeouts.
+    the process-wide control deadline clock, which hands state transitions and
+    potentially blocking completion/abandonment work to separate bounded,
+    recoverable domains. Loop shutdown and one blocked Future callback therefore
+    cannot orphan unrelated retries or response timeouts.
     Driver RPCs are observed through public ObjectRef futures. Every terminal
     operation enters the ticket ledger before its source record is removed, so
     shutdown can never observe an ownership gap.
@@ -299,6 +302,7 @@ class AsyncResultCollector:
         key = (int(slot_id), int(submit_id))
         adapter: RayStreamAdapter | None = None
         record: _StreamRecord | None = None
+        detached_waits: tuple[Any, ...] = ()
         with self._start_lock:
             try:
                 adapter = RayStreamAdapter(source, ray_module=self._ray)
@@ -334,7 +338,7 @@ class AsyncResultCollector:
                         if record is not None and self._records.get(key) is record:
                             record.terminal = True
                             record.cleanup_started = True
-                            self._cancel_record_wait_locked(record)
+                            self._detach_record_waits_locked(record)
                             cleanup_operations = record.adapter.cancel_operations()
                             self._signal_readiness_change_locked()
                         elif adapter is not None:
@@ -353,8 +357,14 @@ class AsyncResultCollector:
                         )
                     with self._cv:
                         if record is not None and self._records.get(key) is record:
+                            detached_waits = record.detached_waits
+                            record.detached_waits = ()
                             self._records.pop(key, None)
                             self._signal_readiness_change_locked()
+                self._abandon_record_waits(
+                    detached_waits,
+                    owner_scope=f"collector:{id(self):x}:track:{key[0]}:{key[1]}",
+                )
                 raise
 
     def discard_generator_ref(self, slot_id: int, source: Any) -> None:
@@ -526,7 +536,7 @@ class AsyncResultCollector:
             token.handoff_response_future = None
         return True
 
-    def _abandon_output_token_handoff(
+    def _release_output_token_handoff_wait(
         self,
         token: _OutputLeaseToken,
         response_future: Any,
@@ -534,10 +544,6 @@ class AsyncResultCollector:
         with self._cv:
             if token.handoff_response_future is response_future:
                 token.handoff_response_future = None
-        try:
-            response_future.cancel()
-        except BaseException:
-            pass
 
     def _run_output_token_release(self, token: _OutputLeaseToken) -> bool | Any:
         with self._cv:
@@ -564,7 +570,7 @@ class AsyncResultCollector:
             token.release_response_future = None
         return True
 
-    def _abandon_output_token_release(
+    def _release_output_token_release_wait(
         self,
         token: _OutputLeaseToken,
         response_future: Any,
@@ -572,10 +578,6 @@ class AsyncResultCollector:
         with self._cv:
             if token.release_response_future is response_future:
                 token.release_response_future = None
-        try:
-            response_future.cancel()
-        except BaseException:
-            pass
 
     @staticmethod
     def _claim_output_token_releases_locked(
@@ -613,7 +615,7 @@ class AsyncResultCollector:
             submission_scope=token.submission_scope,
             retry_on_error=True,
             retry_on_incomplete=True,
-            abandon_wait=lambda future: self._abandon_output_token_handoff(
+            release_wait=lambda future: self._release_output_token_handoff_wait(
                 token,
                 future,
             ),
@@ -628,7 +630,7 @@ class AsyncResultCollector:
             submission_scope=token.submission_scope,
             retry_on_error=True,
             retry_on_incomplete=True,
-            abandon_wait=lambda future: self._abandon_output_token_release(
+            release_wait=lambda future: self._release_output_token_release_wait(
                 token,
                 future,
             ),
@@ -657,26 +659,23 @@ class AsyncResultCollector:
             response_future = None
             return True
 
-        def abandon_wait(future: Any) -> None:
+        def release_wait(future: Any) -> None:
             nonlocal response_future
             if response_future is future:
                 response_future = None
-            try:
-                future.cancel()
-            except BaseException:
-                pass
 
         return RayStreamCleanupOperation(
             cancel,
             submission_scope=submission_scope,
             retry_on_error=True,
             retry_on_incomplete=True,
-            abandon_wait=abandon_wait,
+            release_wait=release_wait,
         )
 
     def cancel_slot(self, slot_id: int) -> None:
         """Fence a slot and atomically hand its remote cleanup to the event loop."""
         slot_key = int(slot_id)
+        detached_waits: list[Any] = []
         with self._cleanup_handoff_lock:
             with self._cv:
                 if self._shutdown:
@@ -690,7 +689,7 @@ class AsyncResultCollector:
                     record.terminal = True
                     if not record.cleanup_started:
                         record.cleanup_started = True
-                    self._cancel_record_wait_locked(record)
+                    self._detach_record_waits_locked(record)
                 for record in records_to_cancel:
                     request = record.output_request
                     driver = record.adapter.driver
@@ -738,6 +737,8 @@ class AsyncResultCollector:
                 self._slot_cancellation_tickets[slot_key].update(cleanup_tickets)
                 for record in records:
                     if self._records.get((record.slot_id, record.submit_id)) is record:
+                        detached_waits.extend(record.detached_waits)
+                        record.detached_waits = ()
                         self._records.pop((record.slot_id, record.submit_id), None)
                 self._ready_by_slot.pop(slot_key, None)
                 for token in tokens:
@@ -745,6 +746,10 @@ class AsyncResultCollector:
                 self._capacity_by_slot.pop(slot_key, None)
                 self._cancelled_slots.add(slot_key)
                 self._signal_readiness_change_locked()
+        self._abandon_record_waits(
+            detached_waits,
+            owner_scope=f"collector:{id(self):x}:cancel-slot:{slot_key}",
+        )
 
     def slot_has_pending(self, slot_id: int) -> bool:
         slot_key = int(slot_id)
@@ -784,6 +789,7 @@ class AsyncResultCollector:
         """Stop the process-owned loop after the native submitter is quiescent."""
         deadline = time.monotonic() + self._shutdown_timeout_s
         shutdown_errors: list[BaseException] = []
+        detached_waits: list[Any] = []
         with self._start_lock:
             with self._cleanup_handoff_lock:
                 with self._cv:
@@ -797,7 +803,7 @@ class AsyncResultCollector:
                     for record in records:
                         cleanup_slot_ids.add(record.slot_id)
                         record.terminal = True
-                        self._cancel_record_wait_locked(record)
+                        self._detach_record_waits_locked(record)
                         if record.cleanup_started:
                             continue
                         record.cleanup_started = True
@@ -847,6 +853,9 @@ class AsyncResultCollector:
                         shutdown_errors.append(exc)
                 if not shutdown_errors:
                     with self._cv:
+                        for record in records:
+                            detached_waits.extend(record.detached_waits)
+                            record.detached_waits = ()
                         self._records.clear()
                         self._active_output_leases.clear()
                         self._ready_by_slot.clear()
@@ -855,6 +864,12 @@ class AsyncResultCollector:
                         self._cv.notify_all()
                     if stop_now:
                         self._request_event_loop_stop()
+
+        if not shutdown_errors:
+            self._abandon_record_waits(
+                detached_waits,
+                owner_scope=f"collector:{id(self):x}:shutdown",
+            )
 
         if self._thread is threading.current_thread():
             if shutdown_errors:
@@ -1238,7 +1253,7 @@ class AsyncResultCollector:
                 operation=action,
                 retry_on_error=action.retry_on_error,
                 retry_on_incomplete=action.retry_on_incomplete,
-                abandon_wait=action.abandon_wait,
+                release_wait=action.release_wait,
                 on_complete=complete,
             )
             ticket_holder.append(ticket)
@@ -1344,15 +1359,14 @@ class AsyncResultCollector:
                 return
             ticket.wait_future = None
             ticket.wait_timeout = None
-        # Make the ticket self-driving before abandoning the old response.
-        # Future.cancel invokes completion callbacks inline and may block.
+        # Publish the retry owner before releasing attempt-local state. The
+        # release hook is not allowed to call Future.cancel(), but an
+        # unexpected hook failure must not drop durable cleanup ownership.
         self._retry_cleanup_ticket(ticket)
         try:
-            assert ticket.abandon_wait is not None
-            ticket.abandon_wait(future)
+            assert ticket.release_wait is not None
+            ticket.release_wait(future)
         except BaseException:
-            # Abandonment is best-effort; the newly published retry owns the
-            # idempotent remote terminal transition from this point onward.
             pass
 
     def _drive_cleanup_ticket(self, ticket: _CleanupTicket) -> None:
@@ -1379,7 +1393,6 @@ class AsyncResultCollector:
         with self._cv:
             ticket.submitting = False
             if ticket not in self._cleanup_tickets:
-                operation_future.cancel()
                 return
             ticket.operation_future = operation_future
 
@@ -1407,7 +1420,6 @@ class AsyncResultCollector:
                 else:
                     active = False
             if active:
-                operation_future.cancel()
                 self._finish_cleanup_operation(ticket, error=exc)
 
     def _complete_cleanup_operation(
@@ -1475,7 +1487,7 @@ class AsyncResultCollector:
                 if active:
                     ticket.finish(exc)
                 return
-            if ticket.abandon_wait is not None:
+            if ticket.release_wait is not None:
                 timeout_call: RayControlScheduledCall
 
                 def response_timed_out() -> None:
@@ -1511,7 +1523,7 @@ class AsyncResultCollector:
                                 active = False
                         if active:
                             try:
-                                ticket.abandon_wait(result)
+                                ticket.release_wait(result)
                             except BaseException:
                                 pass
                             ticket.finish(exc)
@@ -1566,20 +1578,48 @@ class AsyncResultCollector:
                 self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             self._loop.close()
 
-    def _cancel_record_wait_locked(self, record: _StreamRecord) -> None:
-        future = record.wait_future
-        completion_future = record.completion_future
-        output_submit_future = record.output_submit_future
+    @staticmethod
+    def _detach_record_waits_locked(record: _StreamRecord) -> None:
+        """Detach local observers while retaining handles until cleanup handoff."""
+        futures = (
+            *record.detached_waits,
+            record.wait_future,
+            record.completion_future,
+            record.output_submit_future,
+        )
         record.wait_future = None
         record.completion_future = None
         record.output_submit_future = None
         record.wait_kind = ""
-        if future is not None:
-            future.cancel()
-        if completion_future is not None:
-            completion_future.cancel()
-        if output_submit_future is not None:
-            output_submit_future.cancel()
+        unique: list[Any] = []
+        seen: set[int] = set()
+        for future in futures:
+            if future is None or id(future) in seen:
+                continue
+            seen.add(id(future))
+            unique.append(future)
+        record.detached_waits = tuple(unique)
+
+    @staticmethod
+    def _abandon_record_waits(
+        futures: Sequence[Any],
+        *,
+        owner_scope: str,
+    ) -> None:
+        """Cancel detached observers only after durable cleanup owns the record."""
+        for future in futures:
+            cancel = getattr(future, "cancel", None)
+            if not callable(cancel):
+                continue
+            try:
+                dispatch_ray_control_abandonment(
+                    f"{owner_scope}:future:{id(future):x}",
+                    cancel,
+                )
+            except BaseException:
+                # Remote ownership is already durable. Event-loop shutdown is
+                # the final fallback for local observers if dispatch fails.
+                pass
 
     @staticmethod
     def _object_ref_future(ref: Any) -> Any:
@@ -1900,7 +1940,6 @@ class AsyncResultCollector:
             if cancel_stale_request:
                 record.output_cancel_sent = True
         if stale:
-            output_submit_future.cancel()
             if cancel_stale_request:
                 self._submit_cleanup_operations(
                     (
@@ -1944,7 +1983,6 @@ class AsyncResultCollector:
             with self._cv:
                 if record.output_submit_future is output_submit_future:
                     record.output_submit_future = None
-            output_submit_future.cancel()
             raise
         _collector_debug_log("output_lease_requested", record)
 

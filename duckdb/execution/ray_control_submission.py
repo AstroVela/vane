@@ -23,10 +23,12 @@ _RAY_CONTROL_SUBMISSION_STALL_TIMEOUT_S = 1.0
 _RAY_CONTROL_SUBMISSION_MAX_WORKERS = 32
 _RAY_CONTROL_SUBMISSION_MAX_PENDING = 4096
 _RAY_CONTROL_SUBMISSION_MAX_PENDING_PER_OWNER = 256
-_RAY_CONTROL_DEADLINE_CALLBACK_MAX_WORKERS = 32
-_RAY_CONTROL_DEADLINE_CALLBACK_MAX_STALLED_WORKERS = 32
-_RAY_CONTROL_DEADLINE_CALLBACK_RETRY_INITIAL_DELAY_S = 0.01
-_RAY_CONTROL_DEADLINE_CALLBACK_RETRY_MAX_DELAY_S = 1.0
+_RAY_CONTROL_STATE_CALLBACK_MAX_WORKERS = 32
+_RAY_CONTROL_STATE_CALLBACK_MAX_STALLED_WORKERS = 32
+_RAY_CONTROL_COMPLETION_CALLBACK_MAX_WORKERS = 32
+_RAY_CONTROL_COMPLETION_CALLBACK_MAX_STALLED_WORKERS = 32
+_RAY_CONTROL_CALLBACK_RETRY_INITIAL_DELAY_S = 0.01
+_RAY_CONTROL_CALLBACK_RETRY_MAX_DELAY_S = 1.0
 _RAY_CONTROL_DEADLINE_LOCK_RETRY_DELAY_S = 0.001
 
 _T = TypeVar("_T")
@@ -389,8 +391,12 @@ class _RayControlSubmissionExecutor:
                 self._owners.pop(owner_key, None)
         return rejected
 
-    @staticmethod
-    def _fail_submissions(futures: list[Future[Any]], message: str) -> None:
+    def _fail_submissions(self, futures: list[Future[Any]], message: str) -> None:
+        failure_executor = (
+            _RAY_CONTROL_STATE_CALLBACK_EXECUTOR
+            if self is _RAY_CONTROL_COMPLETION_CALLBACK_EXECUTOR
+            else _RAY_CONTROL_COMPLETION_CALLBACK_EXECUTOR
+        )
         for future in futures:
 
             def fail_submission(
@@ -408,6 +414,7 @@ class _RayControlSubmissionExecutor:
                 return not rejected_future.done()
 
             _dispatch_ray_control_callback(
+                failure_executor,
                 f"submission-failure:{id(future):x}",
                 fail_submission,
                 still_owned=submission_is_pending,
@@ -533,23 +540,30 @@ class _RayControlSubmissionExecutor:
         return rejected, rejection_message
 
 
-_RAY_CONTROL_DEADLINE_CALLBACK_EXECUTOR = _RayControlSubmissionExecutor(
-    max_workers=_RAY_CONTROL_DEADLINE_CALLBACK_MAX_WORKERS,
-    max_stalled_workers=_RAY_CONTROL_DEADLINE_CALLBACK_MAX_STALLED_WORKERS,
+_RAY_CONTROL_STATE_CALLBACK_EXECUTOR = _RayControlSubmissionExecutor(
+    max_workers=_RAY_CONTROL_STATE_CALLBACK_MAX_WORKERS,
+    max_stalled_workers=_RAY_CONTROL_STATE_CALLBACK_MAX_STALLED_WORKERS,
     max_pending_per_owner=1,
-    thread_name_prefix="vane-ray-control-deadline-callback",
+    thread_name_prefix="vane-ray-control-state",
+)
+_RAY_CONTROL_COMPLETION_CALLBACK_EXECUTOR = _RayControlSubmissionExecutor(
+    max_workers=_RAY_CONTROL_COMPLETION_CALLBACK_MAX_WORKERS,
+    max_stalled_workers=_RAY_CONTROL_COMPLETION_CALLBACK_MAX_STALLED_WORKERS,
+    max_pending_per_owner=1,
+    thread_name_prefix="vane-ray-control-completion",
 )
 _RAY_CONTROL_SUBMISSION_EXECUTOR = _RayControlSubmissionExecutor()
 
 
 def _dispatch_ray_control_callback(
+    executor: _RayControlSubmissionExecutor,
     owner_scope: str,
     callback: Callable[[], None],
     *,
     still_owned: Callable[[], bool] = lambda: True,
-    retry_delay_s: float = _RAY_CONTROL_DEADLINE_CALLBACK_RETRY_INITIAL_DELAY_S,
+    retry_delay_s: float = _RAY_CONTROL_CALLBACK_RETRY_INITIAL_DELAY_S,
 ) -> None:
-    """Hand potentially blocking work to the bounded, recoverable pool."""
+    """Hand one callback to its isolated, bounded ownership domain."""
     if not still_owned():
         return
 
@@ -564,8 +578,8 @@ def _dispatch_ray_control_callback(
             pass
 
     next_retry_delay = min(
-        max(float(retry_delay_s), _RAY_CONTROL_DEADLINE_CALLBACK_RETRY_INITIAL_DELAY_S) * 2,
-        _RAY_CONTROL_DEADLINE_CALLBACK_RETRY_MAX_DELAY_S,
+        max(float(retry_delay_s), _RAY_CONTROL_CALLBACK_RETRY_INITIAL_DELAY_S) * 2,
+        _RAY_CONTROL_CALLBACK_RETRY_MAX_DELAY_S,
     )
 
     def retry_dispatch() -> None:
@@ -573,6 +587,7 @@ def _dispatch_ray_control_callback(
             return
         retry_call = RAY_CONTROL_DEADLINE_SCHEDULER.create_inline(
             lambda: _dispatch_ray_control_callback(
+                executor,
                 owner_scope,
                 callback,
                 still_owned=still_owned,
@@ -585,7 +600,7 @@ def _dispatch_ray_control_callback(
         )
 
     try:
-        dispatch_future = _RAY_CONTROL_DEADLINE_CALLBACK_EXECUTOR.submit(
+        dispatch_future = executor.submit(
             owner_scope,
             invoke,
         )
@@ -608,7 +623,7 @@ def create_ray_control_deadline(
     owner_scope: str,
     callback: Callable[[], None],
 ) -> RayControlScheduledCall:
-    """Create a cancellable deadline whose owner work never runs on the clock."""
+    """Create a deadline for a controlled, non-blocking state transition."""
     owner_key = str(owner_scope or "").strip()
     if not owner_key:
         raise ValueError("Ray control deadline requires an explicit owner scope")
@@ -618,6 +633,7 @@ def create_ray_control_deadline(
 
     def deadline_elapsed() -> None:
         _dispatch_ray_control_callback(
+            _RAY_CONTROL_STATE_CALLBACK_EXECUTOR,
             f"{owner_key}:deadline:{id(scheduled_call):x}",
             callback,
             still_owned=lambda: not scheduled_call.cancelled(),
@@ -627,9 +643,30 @@ def create_ray_control_deadline(
     return scheduled_call
 
 
+def dispatch_ray_control_abandonment(
+    owner_scope: str,
+    callback: Callable[[], None],
+) -> None:
+    """Run potentially blocking best-effort abandonment off state workers."""
+    owner_key = str(owner_scope or "").strip()
+    if not owner_key:
+        raise ValueError("Ray control abandonment requires an explicit owner scope")
+    if not callable(callback):
+        raise TypeError("Ray control abandonment callback must be callable")
+    _dispatch_ray_control_callback(
+        _RAY_CONTROL_COMPLETION_CALLBACK_EXECUTOR,
+        f"{owner_key}:abandonment",
+        callback,
+    )
+
+
 def submit_ray_control(owner_scope: str, callback: Callable[[], _T]) -> Future[_T]:
     """Submit one Ray control call with bounded, owner-ordered execution."""
     return _RAY_CONTROL_SUBMISSION_EXECUTOR.submit(owner_scope, callback)
 
 
-__all__ = ["create_ray_control_deadline", "submit_ray_control"]
+__all__ = [
+    "create_ray_control_deadline",
+    "dispatch_ray_control_abandonment",
+    "submit_ray_control",
+]

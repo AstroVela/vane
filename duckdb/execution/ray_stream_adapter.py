@@ -19,13 +19,17 @@ _REQUIRED_CORE_WORKER_METHODS = (
 
 @dataclass(frozen=True)
 class RayStreamCleanupOperation:
-    """One terminal transition scheduled by the collector and run off its loop."""
+    """One terminal transition scheduled by the collector and run off its loop.
+
+    ``release_wait`` only detaches operation-local attempt state. It must not
+    call methods on the observed Future; those can invoke arbitrary callbacks.
+    """
 
     operation: Callable[[], Any]
     submission_scope: str
     retry_on_error: bool = False
     retry_on_incomplete: bool = False
-    abandon_wait: Callable[[Any], None] | None = None
+    release_wait: Callable[[Any], None] | None = None
 
     def __post_init__(self) -> None:
         scope = str(self.submission_scope or "").strip()
@@ -192,14 +196,10 @@ class TaskLeaseObjectRefGenerator:
             self._released = True
         return True
 
-    def _abandon_release_task_wait(self, response_future: Any) -> None:
+    def _release_task_wait(self, response_future: Any) -> None:
         with self._lock:
             if self._release_response_future is response_future:
                 self._release_response_future = None
-        try:
-            response_future.cancel()
-        except BaseException:
-            pass
 
     def release_task_operations(self) -> tuple[RayStreamCleanupOperation, ...]:
         return (
@@ -208,7 +208,7 @@ class TaskLeaseObjectRefGenerator:
                 submission_scope=self._submission_scope,
                 retry_on_error=True,
                 retry_on_incomplete=True,
-                abandon_wait=self._abandon_release_task_wait,
+                release_wait=self._release_task_wait,
             ),
         )
 
@@ -291,14 +291,10 @@ class TaskLeaseObjectRefGenerator:
             self._completion_ref = None
         return True
 
-    def _abandon_task_cleanup_wait(self, response_future: Any) -> None:
+    def _release_task_cleanup_wait(self, response_future: Any) -> None:
         with self._lock:
             if self._task_cleanup_response_future is response_future:
                 self._task_cleanup_response_future = None
-        try:
-            response_future.cancel()
-        except BaseException:
-            pass
 
     @property
     def cancellation_started(self) -> bool:
@@ -334,7 +330,7 @@ class TaskLeaseObjectRefGenerator:
                 submission_scope=self._submission_scope,
                 retry_on_error=True,
                 retry_on_incomplete=True,
-                abandon_wait=self._abandon_task_cleanup_wait,
+                release_wait=self._release_task_cleanup_wait,
             ),
         )
 
@@ -346,7 +342,7 @@ class TaskLeaseObjectRefGenerator:
                 submission_scope=self._submission_scope,
                 retry_on_error=True,
                 retry_on_incomplete=True,
-                abandon_wait=self._abandon_task_cleanup_wait,
+                release_wait=self._release_task_cleanup_wait,
             ),
         )
 
@@ -607,7 +603,7 @@ class RayStreamAdapter:
                     submission_scope=operation.submission_scope,
                     retry_on_error=operation.retry_on_error,
                     retry_on_incomplete=operation.retry_on_incomplete,
-                    abandon_wait=operation.abandon_wait,
+                    release_wait=operation.release_wait,
                 )
                 for operation in source_operations
             ]

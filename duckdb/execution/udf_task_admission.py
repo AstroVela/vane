@@ -146,7 +146,6 @@ class _TaskAdmissionCancellation:
         try:
             submission_future.add_done_callback(self._finish_submission)
         except BaseException:
-            submission_future.cancel()
             with self._lock:
                 self._submitting = False
             self._schedule_retry()
@@ -183,10 +182,6 @@ class _TaskAdmissionCancellation:
             response_deadline,
         )
         if discard_response:
-            try:
-                response_future.cancel()
-            except BaseException:
-                pass
             return
         owner_ref = weakref.ref(self)
 
@@ -254,17 +249,11 @@ class _TaskAdmissionCancellation:
             # A late acknowledgement from a timed-out attempt is still a valid
             # proof for this idempotent cancellation request.
             self._done = True
-            current_response = self._response_future
             self._response_future = None
             response_deadline = self._response_deadline
             self._response_deadline = None
             retry_call = self._retry_call
             self._retry_call = None
-        if current_response is not None and current_response is not response_future:
-            try:
-                current_response.cancel()
-            except BaseException:
-                pass
         if response_deadline is not None:
             response_deadline.cancel()
         if retry_call is not None:
@@ -276,15 +265,9 @@ class _TaskAdmissionCancellation:
                 return
             self._response_future = None
             self._response_deadline = None
-        # Publish the next owner before best-effort cancellation. Future.cancel
-        # invokes completion callbacks inline and may never return.
+        # The idempotent retry supersedes this local response observer. Do not
+        # call Future.cancel(): arbitrary completion callbacks execute inline.
         self._schedule_retry()
-        try:
-            cancel = getattr(response_future, "cancel", None)
-            if callable(cancel):
-                cancel()
-        except BaseException:
-            pass
 
     def _schedule_retry(self) -> None:
         with self._lock:
@@ -434,7 +417,6 @@ class TaskAdmissionController:
             if publish:
                 self._request_submit_future = submission
         if not publish:
-            submission.cancel()
             cancellation.start()
             return True
 
@@ -454,7 +436,6 @@ class TaskAdmissionController:
         try:
             submission.add_done_callback(finish_submission)
         except BaseException as exc:
-            submission.cancel()
             with self._lock:
                 if (
                     self._state == "requested"
@@ -638,12 +619,10 @@ class TaskAdmissionController:
 
     def close(self) -> None:
         cancellation: _TaskAdmissionCancellation | None = None
-        submission: Any | None = None
         with self._lock:
             if self._state == "closed" and self._cancellation is None:
                 return
             cancellation = self._cancellation
-            submission = self._request_submit_future
             self._state = "closed"
             self._request_id = ""
             self._retained_input_bytes = 0
@@ -652,8 +631,6 @@ class TaskAdmissionController:
             self._ready_lease = None
             self._cancellation = None
             self._wakeup = None
-        if submission is not None:
-            submission.cancel()
         if cancellation is not None:
             cancellation.start()
 

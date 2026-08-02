@@ -43,9 +43,10 @@ class RayControlDeadlineScheduler:
     def create_inline(self, callback: Callable[[], None]) -> RayControlScheduledCall:
         """Create an internal callback that is safe to run on the clock.
 
-        Potentially blocking owner work must use
-        ``create_ray_control_deadline`` from ``ray_control_submission`` so the
-        clock only hands that work to the bounded callback executor.
+        Owner-facing deadlines must use ``create_ray_control_deadline`` from
+        ``ray_control_submission``. Its callback is restricted to a controlled
+        state transition; blocking abandonment belongs to the separate
+        completion domain.
         """
         if not callable(callback):
             raise TypeError("Ray control deadline callback must be callable")

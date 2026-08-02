@@ -787,6 +787,73 @@ def test_slot_cancel_is_nonblocking_and_cleanup_completion_wakes_dispatcher():
         collector.shutdown()
 
 
+def test_slot_cancel_hands_off_cleanup_before_blocking_record_future_cancel():
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    read_started = threading.Event()
+    cancel_callback_entered = threading.Event()
+    release_cancel_callback = threading.Event()
+    cleanup_owned_at_cancel = []
+
+    class _BlockingReadGenerator(_Generator):
+        async def __anext__(self):
+            read_started.set()
+            await asyncio.sleep(3600)
+
+    generator = _BlockingReadGenerator(
+        [
+            _Ref("blocked-local-read", is_block=True),
+            _Ref({"unused": True}),
+        ],
+        completed=False,
+    )
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector.track_generator_ref(
+        19,
+        1,
+        _source(
+            fake_ray,
+            driver,
+            request_id="blocking-record-future-cancel",
+            submitter=lambda _lease: generator,
+        ),
+    )
+    collector.drain_results({19: {"rows": 1, "bytes": 128, "item_bytes": 128}})
+    assert read_started.wait(timeout=1.0)
+    with collector._cv:
+        record_future = collector._records[(19, 1)].wait_future
+    assert record_future is not None
+
+    def block_cancel_callback(_future):
+        with collector._cv:
+            cleanup_owned_at_cancel.append(bool(collector._slot_cancellation_tickets.get(19)))
+        cancel_callback_entered.set()
+        assert release_cancel_callback.wait(timeout=5.0)
+
+    record_future.add_done_callback(block_cancel_callback)
+    cancel_errors = []
+    cancellation = threading.Thread(
+        target=_capture_thread_error,
+        args=(cancel_errors, collector.cancel_slot, 19),
+    )
+    try:
+        cancellation.start()
+        assert cancel_callback_entered.wait(timeout=1.0)
+        cancellation.join(timeout=0.2)
+        assert cancellation.is_alive() is False
+        assert cancel_errors == []
+        assert cleanup_owned_at_cancel == [True]
+
+        _wait_until(lambda: not collector.slot_has_pending(19))
+        collector.shutdown()
+        assert collector._thread.is_alive() is False
+    finally:
+        release_cancel_callback.set()
+        cancellation.join(timeout=1.0)
+        if collector._thread.is_alive():
+            collector.shutdown()
+
+
 def test_failure_wakeup_can_reenter_shutdown_after_cleanup_handoff():
     fake_ray = _FakeRay()
     driver = _Driver()
@@ -1060,22 +1127,13 @@ def test_cleanup_ticket_retries_a_hung_control_response(monkeypatch):
     collector = AsyncResultCollector(ray_module=_FakeRay())
     attempts = []
     response_future = None
-    cancel_callback_entered = threading.Event()
-    release_cancel_callback = threading.Event()
-
-    def block_cancel_callback(_future):
-        assert threading.current_thread().name != "vane-ray-control-deadlines"
-        cancel_callback_entered.set()
-        assert release_cancel_callback.wait(timeout=5.0)
 
     def transfer_owner():
         nonlocal response_future
         if response_future is None:
             response_future = Future()
             attempts.append(response_future)
-            if len(attempts) == 1:
-                response_future.add_done_callback(block_cancel_callback)
-            else:
+            if len(attempts) > 1:
                 response_future.set_result(True)
         if not response_future.done():
             return response_future
@@ -1083,11 +1141,10 @@ def test_cleanup_ticket_retries_a_hung_control_response(monkeypatch):
         response_future = None
         return True
 
-    def abandon_wait(future):
+    def release_wait(future):
         nonlocal response_future
         if response_future is future:
             response_future = None
-        future.cancel()
 
     tickets = collector._submit_cleanup_operations(
         (
@@ -1095,24 +1152,22 @@ def test_cleanup_ticket_retries_a_hung_control_response(monkeypatch):
                 transfer_owner,
                 submission_scope=_CLEANUP_SUBMISSION_SCOPE,
                 retry_on_error=True,
-                abandon_wait=abandon_wait,
+                release_wait=release_wait,
             ),
         ),
         store_error=False,
     )
     try:
-        assert cancel_callback_entered.wait(timeout=1.0)
         assert (
             _wait_cleanup_tickets(
                 tickets,
-                timeout_message="blocking cancellation callback orphaned cleanup retry",
+                timeout_message="hung cleanup response was not retried",
             )
             == ()
         )
         assert len(attempts) == 2
-        assert attempts[0].cancelled()
+        assert not attempts[0].cancelled()
     finally:
-        release_cancel_callback.set()
         collector.shutdown()
 
 
@@ -1150,11 +1205,10 @@ def test_cleanup_ticket_expands_slow_response_deadline(monkeypatch):
         response_future = None
         return True
 
-    def abandon_wait(future):
+    def release_wait(future):
         nonlocal response_future
         if response_future is future:
             response_future = None
-        future.cancel()
 
     tickets = collector._submit_cleanup_operations(
         (
@@ -1162,7 +1216,7 @@ def test_cleanup_ticket_expands_slow_response_deadline(monkeypatch):
                 transfer_owner,
                 submission_scope=_CLEANUP_SUBMISSION_SCOPE,
                 retry_on_error=True,
-                abandon_wait=abandon_wait,
+                release_wait=release_wait,
             ),
         ),
         store_error=False,
@@ -3110,7 +3164,20 @@ def test_shutdown_clears_callback_and_fully_joins_owned_thread():
 def test_shutdown_cleanup_handoff_failure_is_retryable(monkeypatch):
     fake_ray = _FakeRay()
     driver = _Driver()
-    generator = _Generator([], completed=False)
+    read_started = threading.Event()
+
+    class _BlockingReadGenerator(_Generator):
+        async def __anext__(self):
+            read_started.set()
+            await asyncio.sleep(3600)
+
+    generator = _BlockingReadGenerator(
+        [
+            _Ref("shutdown-retry-blocked-read", is_block=True),
+            _Ref({"unused": True}),
+        ],
+        completed=False,
+    )
     collector = AsyncResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         8,
@@ -3127,6 +3194,8 @@ def test_shutdown_cleanup_handoff_failure_is_retryable(monkeypatch):
     }
     with collector._cv:
         collector._records[(8, 81)].output_request = output_request
+    collector.drain_results({8: {"rows": 1, "bytes": 128, "item_bytes": 128}})
+    assert read_started.wait(timeout=1.0)
     original_submit = collector._submit_cleanup_operations
     fail_next_handoff = True
 
@@ -3148,6 +3217,8 @@ def test_shutdown_cleanup_handoff_failure_is_retryable(monkeypatch):
 
     assert collector._records
     assert collector._thread.is_alive()
+    with collector._cv:
+        assert collector._records[(8, 81)].detached_waits
 
     collector.shutdown()
 
