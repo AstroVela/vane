@@ -2211,35 +2211,222 @@ def test_copy_direct_write_lifecycle_cleanup_once_public_api(tmp_path):
     assert Path(active["copy_output_lifecycle_path"]).exists()
 
 
-def test_copy_direct_write_lifecycle_cleanup_loop_public_api(tmp_path):
-    from duckdb.runners.ray import run_copy_direct_write_lifecycle_cleanup_loop
+def test_copy_direct_write_lifecycle_cleanup_once_uses_connection_filesystem():
+    from duckdb.runners.ray import cleanup_copy_direct_write_lifecycle_once
 
-    base = tmp_path / "copy_direct_lifecycle_loop"
-    stale_run_id = "run-lifecycle-loop-stale"
+    fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
+    filesystem = fsspec.filesystem("memory", skip_instance_cache=True)
+    filesystem.store = {}
+    filesystem.pseudo_dirs = [""]
+
+    conn = duckdb.connect()
+    try:
+        conn.register_filesystem(filesystem)
+        base_path = "memory://bucket/copy_direct_lifecycle_once"
+        run_id = "run-connection-filesystem"
+        run_dir = f"{base_path}/_vane_direct_write_{run_id}"
+        lifecycle_path = f"{base_path}.duckdb_commit/{run_id}/lifecycle.txt"
+        data_path = f"{run_dir}/w_failed/part.parquet"
+        lifecycle = textwrap.dedent(
+            f"""\
+            version=2
+            mode=direct_write
+            base_path={base_path}
+            worker_base_path={base_path}
+            run_id={run_id}
+            created_epoch_ms=1000
+            direct_write_run_dir={run_dir}
+            """
+        ).encode()
+        filesystem.pipe(lifecycle_path, lifecycle)
+        filesystem.pipe(data_path, b"stale")
+
+        summary = cleanup_copy_direct_write_lifecycle_once(
+            base_path,
+            min_age_ms=5_000,
+            now_epoch_ms=10_000,
+            conn=conn,
+        )
+    finally:
+        conn.close()
+
+    assert summary["scanned_runs"] == 1
+    assert summary["cleaned_runs"] == 1
+    assert summary["errors"] == 0
+    assert summary["cleaned_run_ids"] == [{"base_path": base_path, "run_id": run_id}]
+    assert not filesystem.exists(lifecycle_path)
+    assert not filesystem.exists(data_path)
+
+
+def test_copy_direct_write_lifecycle_cleanup_releases_gil_before_connection_lock():
+    pytest.importorskip("fsspec", minversion="2022.11.0")
+    script = textwrap.dedent(
+        """
+        import threading
+        import time
+
+        import duckdb
+        import fsspec
+        from duckdb.runners.ray import cleanup_copy_direct_write_lifecycle_once
+
+        filesystem = fsspec.filesystem("memory", skip_instance_cache=True)
+        filesystem.store = {}
+        filesystem.pseudo_dirs = [""]
+        original_ls = filesystem.ls
+        entered_first_scan = threading.Event()
+        delayed = False
+
+        def delayed_ls(path, *args, **kwargs):
+            global delayed
+            if not delayed:
+                delayed = True
+                entered_first_scan.set()
+                time.sleep(1)
+            return original_ls(path, *args, **kwargs)
+
+        filesystem.ls = delayed_ls
+        conn = duckdb.connect()
+        conn.register_filesystem(filesystem)
+        errors = []
+
+        def first_scan():
+            try:
+                cleanup_copy_direct_write_lifecycle_once(
+                    "memory://bucket/copy",
+                    min_age_ms=1,
+                    conn=conn,
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=first_scan)
+        thread.start()
+        assert entered_first_scan.wait(timeout=2)
+        cleanup_copy_direct_write_lifecycle_once(
+            "memory://bucket/copy",
+            min_age_ms=1,
+            conn=conn,
+        )
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert not errors
+        conn.close()
+        """
+    )
+
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=os.getcwd(),
+        check=True,
+        timeout=15,
+    )
+
+
+def test_copy_direct_write_lifecycle_cleanup_error_does_not_abort_caller_transaction(monkeypatch):
+    from duckdb.runners.ray import cleanup_copy_direct_write_lifecycle_once
+
+    fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
+    filesystem = fsspec.filesystem("memory", skip_instance_cache=True)
+    filesystem.store = {}
+    filesystem.pseudo_dirs = [""]
+
+    def fail_list(*_args, **_kwargs):
+        raise OSError("intentional lifecycle cleanup failure")
+
+    monkeypatch.setattr(filesystem, "ls", fail_list)
+    conn = duckdb.connect()
+    try:
+        conn.register_filesystem(filesystem)
+        conn.execute("BEGIN")
+        summary = cleanup_copy_direct_write_lifecycle_once(
+            "memory://bucket/copy",
+            min_age_ms=1,
+            conn=conn,
+        )
+
+        assert summary["errors"] == 1
+        assert "intentional lifecycle cleanup failure" in summary["error_messages"][0]
+        assert conn.execute("SELECT 42").fetchone() == (42,)
+        conn.execute("ROLLBACK")
+    finally:
+        conn.close()
+
+
+def test_copy_direct_write_lifecycle_cleanup_runs_in_invalidated_transaction(tmp_path):
+    from duckdb.runners.ray import cleanup_copy_direct_write_lifecycle_once
+
+    base = tmp_path / "copy_direct_lifecycle_invalidated_transaction"
+    run_id = "run-invalidated-transaction"
     stale, stale_file = _register_direct_write_lifecycle_run(
         base,
-        stale_run_id,
-        created_epoch_ms=1_000,
+        run_id,
+        created_epoch_ms=1,
         worker_dir="w_failed",
     )
-    seen = []
 
-    result = run_copy_direct_write_lifecycle_cleanup_loop(
-        str(base),
-        min_age_ms=5_000,
-        interval_seconds=0,
-        max_iterations=2,
-        now_epoch_ms_fn=lambda: 10_000,
-        on_iteration=seen.append,
-    )
+    conn = duckdb.connect()
+    try:
+        conn.execute("BEGIN")
+        with pytest.raises(duckdb.ConversionException):
+            conn.execute("SELECT CAST('invalid' AS INTEGER)")
 
-    assert result["iterations"] == 2
-    assert seen[0]["cleaned_runs"] == 1
-    assert result["summaries"][0]["cleaned_run_ids"] == [{"base_path": str(base), "run_id": stale_run_id}]
-    assert result["summaries"][1]["cleaned_runs"] == 0
-    assert result["last_summary"]["errors"] == 0
-    assert not stale_file.exists()
-    assert not Path(stale["copy_output_commit_dir"]).exists()
+        summary = cleanup_copy_direct_write_lifecycle_once(
+            str(base),
+            min_age_ms=1,
+            now_epoch_ms=10,
+            conn=conn,
+        )
+
+        assert summary["errors"] == 0
+        assert summary["cleaned_runs"] == 1
+        assert not stale_file.exists()
+        assert not Path(stale["copy_output_commit_dir"]).exists()
+        conn.execute("ROLLBACK")
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("invalidate_transaction", [False, True], ids=["valid", "invalidated"])
+def test_copy_direct_write_lifecycle_cleanup_once_uses_connection_s3_config(invalidate_transaction):
+    from duckdb.runners.ray import cleanup_copy_direct_write_lifecycle_once
+
+    server, thread, handler = _start_s3_list_ok_server()
+    try:
+        endpoint = f"127.0.0.1:{server.server_address[1]}"
+        conn = duckdb.connect()
+        transaction_started = False
+        try:
+            conn.execute("LOAD httpfs")
+            conn.execute(
+                "CREATE TEMPORARY SECRET lifecycle_cleanup_s3 ("
+                "TYPE S3, KEY_ID 'access-key', SECRET 'secret-key', REGION 'us-east-1', "
+                f"ENDPOINT {_sql_string_literal(endpoint)}, URL_STYLE 'path', USE_SSL false)"
+            )
+            if invalidate_transaction:
+                conn.execute("BEGIN")
+                transaction_started = True
+                with pytest.raises(duckdb.ConversionException):
+                    conn.execute("SELECT CAST('invalid' AS INTEGER)")
+            summary = cleanup_copy_direct_write_lifecycle_once(
+                "s3://bucket/prefix",
+                min_age_ms=5_000,
+                fail_fast=True,
+                conn=conn,
+            )
+        finally:
+            if transaction_started:
+                conn.execute("ROLLBACK")
+            conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert summary["scanned_runs"] == 0
+    assert summary["cleaned_runs"] == 0
+    assert summary["errors"] == 0
+    assert handler.requests
+    assert all("list-type=2" in path and "prefix=prefix.duckdb_commit" in path for _, path in handler.requests)
 
 
 def test_copy_direct_write_lifecycle_cleanup_cli_once(tmp_path):
@@ -2263,13 +2450,13 @@ def test_copy_direct_write_lifecycle_cleanup_cli_once(tmp_path):
             "5000",
             "--now-epoch-ms",
             "10000",
-            "--once",
             "--json",
         ],
         cwd=os.getcwd(),
         capture_output=True,
         text=True,
         env=os.environ.copy(),
+        timeout=10,
     )
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
