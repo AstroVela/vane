@@ -948,10 +948,15 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         raise RuntimeError("UDF subprocess submit result loop exited unexpectedly")
 
     def _submit_ref_bundle_direct(self, payload: dict[str, Any]) -> Any | None:
+        lease_id_raw = payload.get("input_lease_id")
         if payload.get("estimated_num_rows") == 0:
+            # The worker will never receive this bundle and therefore cannot
+            # acknowledge its lease. Cancel rather than consume it so an empty
+            # result does not leave behind unused output credit.
+            if lease_id_raw is not None:
+                cancel_local_shm_input_lease(int(lease_id_raw), name="udf-input-zero-row")
             return None
         sock = self._require_socket()
-        lease_id_raw = payload.get("input_lease_id")
         lease_id = int(lease_id_raw) if lease_id_raw is not None else None
         scope = self._current_execution_scope()
         scope.raise_if_cancelled("UDF subprocess submit")
