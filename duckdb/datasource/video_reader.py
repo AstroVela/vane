@@ -27,7 +27,7 @@ import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from itertools import islice, repeat
+from itertools import repeat
 from types import ModuleType
 from typing import Any, cast
 
@@ -94,6 +94,30 @@ class RemoteVideoTooLargeError(VideoReadError):
 
 class SourceFrameTooLargeError(VideoReadError):
     """A decoded source frame exceeded its configured working-set bound."""
+
+
+def _video_read_error(video_path: str, exc: Exception) -> VideoReadError:
+    return VideoReadError(video_path, f"{type(exc).__name__}: {exc}")
+
+
+def _is_decord_error(exc: Exception) -> bool:
+    """Return whether *exc* is one of Decord's direct Exception subclasses."""
+    try:
+        decord_base = importlib.import_module("decord._ffi.base")
+    except ImportError:
+        return False
+    return any(
+        isinstance(error_type, type) and isinstance(exc, error_type)
+        for error_type in (
+            getattr(decord_base, "DECORDError", None),
+            getattr(decord_base, "DECORDLimitReachedError", None),
+        )
+    )
+
+
+def _is_decord_read_error(exc: Exception) -> bool:
+    """Return whether a decoder-boundary failure means the source is unreadable."""
+    return isinstance(exc, (OSError, RuntimeError)) or _is_decord_error(exc)
 
 
 def _read_bool_env(name: str, default: bool) -> bool:
@@ -369,7 +393,10 @@ def _materialize_video_path(
     canonical_path, _ = _video_source_identity(video_path)
     object_path = canonical_path[len("s3://") :]
     fs = _s3_filesystem()
-    file_info = fs.get_file_info(object_path)
+    try:
+        file_info = fs.get_file_info(object_path)
+    except OSError as exc:
+        raise _video_read_error(canonical_path, exc) from exc
     object_size_value = file_info.size
     object_size = None if object_size_value is None else int(object_size_value)
     if object_size is not None and object_size >= 0 and object_size > max_remote_video_bytes:
@@ -387,19 +414,27 @@ def _materialize_video_path(
     )
     local_path = temporary.name
     try:
-        with temporary, fs.open_input_file(object_path) as source:
-            copied_bytes = 0
-            while True:
-                chunk = source.read(_REMOTE_VIDEO_READ_CHUNK_BYTES)
-                if not chunk:
-                    break
-                copied_bytes += len(chunk)
-                if copied_bytes > max_remote_video_bytes:
-                    raise RemoteVideoTooLargeError(
-                        canonical_path,
-                        f"remote object exceeded limit {max_remote_video_bytes} while downloading",
-                    )
-                temporary.write(chunk)
+        with temporary:
+            try:
+                source = fs.open_input_file(object_path)
+            except OSError as exc:
+                raise _video_read_error(canonical_path, exc) from exc
+            with source:
+                copied_bytes = 0
+                while True:
+                    try:
+                        chunk = source.read(_REMOTE_VIDEO_READ_CHUNK_BYTES)
+                    except OSError as exc:
+                        raise _video_read_error(canonical_path, exc) from exc
+                    if not chunk:
+                        break
+                    copied_bytes += len(chunk)
+                    if copied_bytes > max_remote_video_bytes:
+                        raise RemoteVideoTooLargeError(
+                            canonical_path,
+                            f"remote object exceeded limit {max_remote_video_bytes} while downloading",
+                        )
+                    temporary.write(chunk)
         yield local_path
     finally:
         try:
@@ -435,14 +470,61 @@ def _constant_string_array(value: str, count: int) -> pa.Array:
     return pa.Array.from_buffers(pa.string(), count, [None, pa.py_buffer(offsets), pa.py_buffer(data)])
 
 
-def _open_decord_reader(video_path: str, *, width: int, height: int) -> Any:
+def _open_decord_reader(
+    decoder_path: str,
+    *,
+    width: int,
+    height: int,
+    source_path: str | None = None,
+) -> Any:
     VideoReader = _import_video_dependency("decord", "decord").VideoReader
-    return VideoReader(
-        video_path,
-        width=int(width),
-        height=int(height),
-        num_threads=_VIDEO_DECODE_THREADS,
-    )
+    try:
+        return VideoReader(
+            decoder_path,
+            width=int(width),
+            height=int(height),
+            num_threads=_VIDEO_DECODE_THREADS,
+        )
+    except Exception as exc:
+        if not _is_decord_read_error(exc):
+            raise
+        raise _video_read_error(source_path or decoder_path, exc) from exc
+
+
+def _iter_decord_frames(
+    reader: Any,
+    *,
+    video_path: str,
+    max_frames: int | None,
+) -> Iterator[Any]:
+    try:
+        frames = iter(reader)
+    except Exception as exc:
+        if not _is_decord_read_error(exc):
+            raise
+        raise _video_read_error(video_path, exc) from exc
+
+    frame_count = 0
+    while max_frames is None or frame_count < max_frames:
+        try:
+            frame = next(frames)
+        except StopIteration:
+            return
+        except Exception as exc:
+            if not _is_decord_read_error(exc):
+                raise
+            raise _video_read_error(video_path, exc) from exc
+        yield frame
+        frame_count += 1
+
+
+def _decord_frame_asnumpy(frame: Any, *, video_path: str) -> npt.NDArray[np.uint8]:
+    try:
+        return frame.asnumpy()
+    except Exception as exc:
+        if not _is_decord_error(exc):
+            raise
+        raise _video_read_error(video_path, exc) from exc
 
 
 def _video_decoder_dimensions(*, width: int, height: int) -> tuple[int, int]:
@@ -613,21 +695,28 @@ def _decode_video_batches(
             decoder_path,
             width=decoder_width,
             height=decoder_height,
+            source_path=source_path,
         )
         open_s = time.perf_counter() - open_start
         if _VIDEO_RESIZE_THREADS > 1:
             resize_executor = ThreadPoolExecutor(max_workers=_VIDEO_RESIZE_THREADS)
         try:
-            frames = reader if max_frames is None else islice(reader, max_frames)
-            for frame_idx, frame in enumerate(frames):
-                shape_frame_bytes = _source_frame_bytes_from_shape(frame)
+            for frame_idx, frame in enumerate(
+                _iter_decord_frames(reader, video_path=source_path, max_frames=max_frames)
+            ):
+                try:
+                    shape_frame_bytes = _source_frame_bytes_from_shape(frame)
+                except Exception as exc:
+                    if not _is_decord_error(exc):
+                        raise
+                    raise _video_read_error(source_path, exc) from exc
                 if shape_frame_bytes is not None and shape_frame_bytes > max_source_frame_bytes:
                     raise SourceFrameTooLargeError(
                         source_path,
                         f"source frame size {shape_frame_bytes} exceeds limit {max_source_frame_bytes}",
                     )
                 decode_start = time.perf_counter()
-                array = frame.asnumpy()
+                array = _decord_frame_asnumpy(frame, video_path=source_path)
                 decode_s += time.perf_counter() - decode_start
                 if array.nbytes > max_source_frame_bytes:
                     raise SourceFrameTooLargeError(
@@ -693,21 +782,6 @@ def _validate_video_error_mode(on_error: str) -> str:
     return on_error
 
 
-def _is_decord_error(exc: Exception) -> bool:
-    """Return whether *exc* is one of Decord's direct Exception subclasses."""
-    try:
-        decord_base = importlib.import_module("decord._ffi.base")
-    except ImportError:
-        return False
-    return any(
-        isinstance(error_type, type) and isinstance(exc, error_type)
-        for error_type in (
-            getattr(decord_base, "DECORDError", None),
-            getattr(decord_base, "DECORDLimitReachedError", None),
-        )
-    )
-
-
 def _decode_video_with_policy(
     video_path: str,
     *,
@@ -734,26 +808,16 @@ def _decode_video_with_policy(
             max_source_path_bytes=max_source_path_bytes,
             remote_temp_dir=remote_temp_dir,
         )
-    except Exception as exc:
-        if not isinstance(exc, (OSError, RuntimeError, ValueError)) and not _is_decord_error(exc):
-            raise
-        if isinstance(exc, VideoReadError):
-            error = exc
-        else:
-            try:
-                source_path, _ = _video_source_identity(video_path)
-            except ValueError:
-                source_path = video_path
-            error = VideoReadError(source_path, f"{type(exc).__name__}: {exc}")
+    except VideoReadError as error:
         if on_error == "raise":
-            if error is exc:
-                raise
-            raise error from exc
+            raise
+        cause = error.__cause__
+        reported_error = cause if isinstance(cause, Exception) else error
         _LOGGER.warning(
             "Skipping unreadable video source=%r error_type=%s error=%s",
             error.video_path,
-            type(exc).__name__,
-            exc,
+            type(reported_error).__name__,
+            reported_error,
         )
 
 
@@ -1323,6 +1387,8 @@ class VideoFrameSource(DataSource):
     ``on_error="skip"`` keeps frames emitted before the error, skips the
     remainder of that file, and continues with the next file. Frames that
     decord recovers without raising are considered successfully decoded.
+    Configuration, task-infrastructure, and result-construction failures
+    always fail the query instead of being classified as unreadable input.
     """
 
     def __init__(
