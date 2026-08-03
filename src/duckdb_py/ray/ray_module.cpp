@@ -155,6 +155,22 @@ public:
 	shared_ptr<std::atomic<idx_t>> calls;
 };
 
+class ScopedShuffleCacheRegistrationForTest {
+public:
+	explicit ScopedShuffleCacheRegistrationForTest(string exchange_id) : exchange_id_(std::move(exchange_id)) {
+	}
+
+	~ScopedShuffleCacheRegistrationForTest() {
+		distributed::ShuffleCacheRegistry::Instance().Remove(exchange_id_);
+	}
+
+	ScopedShuffleCacheRegistrationForTest(const ScopedShuffleCacheRegistrationForTest &) = delete;
+	ScopedShuffleCacheRegistrationForTest &operator=(const ScopedShuffleCacheRegistrationForTest &) = delete;
+
+private:
+	string exchange_id_;
+};
+
 static py::object ResolveFlightShuffleCleanupConnection(py::object cleanup_connection,
                                                         const py::object &connection_snapshot,
                                                         const py::object &effective_session_config,
@@ -2505,6 +2521,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    if (register_res.is_err()) {
 			    throw std::runtime_error(register_res.error().what());
 		    }
+		    ScopedShuffleCacheRegistrationForTest registration(write_config.shuffle_stage_id);
 		    FlightExchangeConfig source_config;
 		    source_config.node_id = write_config.node_id;
 		    ExchangeSourceHandle handle;
@@ -2513,7 +2530,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    handle.node_id = write_config.node_id;
 		    handle.files.push_back(ExchangeSourceFile(write_config.shuffle_stage_id, 0));
 		    auto values = ReadIntegerExchangeSourceForTest(context, source_config, std::move(handle));
-		    ShuffleCacheRegistry::Instance().Remove(write_config.shuffle_stage_id);
 
 		    py::dict out;
 		    out["memory_file_count"] = memory_files_res.value().files.size();
@@ -2630,6 +2646,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    if (register_res.is_err()) {
 			    throw std::runtime_error(register_res.error().what());
 		    }
+		    ScopedShuffleCacheRegistrationForTest registration(config.shuffle_stage_id);
 		    FlightExchangeConfig source_config;
 		    source_config.node_id = config.node_id;
 		    ExchangeSourceHandle handle;
@@ -2638,7 +2655,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    handle.node_id = config.node_id;
 		    handle.files.push_back(ExchangeSourceFile(config.shuffle_stage_id, 0));
 		    auto values = ReadIntegerExchangeSourceForTest(context, source_config, std::move(handle));
-		    ShuffleCacheRegistry::Instance().Remove(config.shuffle_stage_id);
 
 		    py::dict out;
 		    out["committed_manifest"] = reader->HasCommittedManifest();
