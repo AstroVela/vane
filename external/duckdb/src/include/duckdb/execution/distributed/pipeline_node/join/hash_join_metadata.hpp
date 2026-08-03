@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "duckdb/common/vector.hpp"
+#include "duckdb/execution/distributed/pipeline_node/join/join_output_types.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
@@ -91,7 +92,7 @@ inline void FixHashJoinOutputColumnTypes(PhysicalHashJoin &join, const duckdb::v
                                          const duckdb::vector<LogicalType> &right_types) {
 	EnsureHashJoinProjectionColumns(join.lhs_output_columns, left_types);
 
-	if (join.join_type == JoinType::ANTI || join.join_type == JoinType::SEMI || join.join_type == JoinType::MARK) {
+	if (!JoinOutputsRight(join.join_type)) {
 		return;
 	}
 
@@ -125,23 +126,8 @@ inline void RepairHashJoinMetadataAfterChildAttach(PhysicalHashJoin &join,
 	FixHashJoinConditionTypes(join.conditions, left_types, right_types, join.condition_types);
 	FixHashJoinOutputColumnTypes(join, left_types, right_types);
 
-	duckdb::vector<LogicalType> join_types;
-	join_types.reserve(join.lhs_output_columns.col_idxs.size() + join.rhs_output_columns.col_idxs.size() + 1);
-	if (join.join_type != JoinType::RIGHT_SEMI && join.join_type != JoinType::RIGHT_ANTI) {
-		for (auto idx : join.lhs_output_columns.col_idxs) {
-			if (idx < left_types.size()) {
-				join_types.push_back(left_types[idx]);
-			}
-		}
-	}
-	if (join.join_type != JoinType::ANTI && join.join_type != JoinType::SEMI && join.join_type != JoinType::MARK) {
-		for (auto &col_type : join.rhs_output_columns.col_types) {
-			join_types.push_back(col_type);
-		}
-	}
-	if (join.join_type == JoinType::MARK) {
-		join_types.push_back(LogicalType::BOOLEAN);
-	}
+	auto join_types =
+	    BuildJoinOutputTypes(join.join_type, join.lhs_output_columns.col_types, join.rhs_output_columns.col_types);
 	if (!join_types.empty()) {
 		join.types = std::move(join_types);
 	}

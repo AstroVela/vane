@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <functional>
 
+#include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/hash_join_metadata.hpp"
+#include "duckdb/execution/distributed/pipeline_node/join/join_output_types.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/distributed/plan/runner.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -384,15 +386,16 @@ SubmittableTask<WorkerTask> HashJoinNode::BuildHashJoinTask(SubmittableTask<Work
 		const auto &right_types = right_root.GetTypes();
 		FixHashJoinConditionTypes(nlj.conditions, left_types, right_types);
 
-		// Recompute output types: [all LHS cols, all RHS cols] for INNER join
-		duckdb::vector<LogicalType> nlj_types;
-		for (auto &t : left_types) {
-			nlj_types.push_back(t);
+		// The translated output types are the schema contract for this node. Validate
+		// that contract against the attached children, but do not replace it: doing so
+		// would make the physical plan disagree with HashJoinNode::config().schema().
+		auto child_derived_types = BuildJoinOutputTypes(join_type_, left_types, right_types);
+		if (nlj.GetTypes() != child_derived_types) {
+			throw InternalException(
+			    "HashJoinNode translated a %s nested loop join with an output schema that does not match its children "
+			    "(%llu translated columns, %llu child-derived columns)",
+			    EnumUtil::ToString(join_type_), nlj.GetTypes().size(), child_derived_types.size());
 		}
-		for (auto &t : right_types) {
-			nlj_types.push_back(t);
-		}
-		nlj.types = nlj_types;
 
 		left_plan->SetRoot(nlj);
 	} else {
