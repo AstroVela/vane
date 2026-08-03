@@ -53,6 +53,9 @@ bool ApplyExchangeSourceTasksToOperator(PhysicalOperator &op,
 } // namespace
 
 void ExchangeSourceTaskDescriptor::Serialize(Serializer &serializer) const {
+	if (!mark_join_build_summary.IsConsistent()) {
+		throw SerializationException("invalid MARK join build summary in exchange source task");
+	}
 	serializer.WriteProperty(1, "partition_indices", partition_indices);
 	serializer.WriteList(2, "source_handles", source_handles.size(), [&](Serializer::List &list, idx_t i) {
 		list.WriteObject([&](Serializer &obj) {
@@ -77,6 +80,9 @@ void ExchangeSourceTaskDescriptor::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(3, "source_partition_count", source_partition_count);
 	serializer.WriteProperty(4, "source_task_count", source_task_count);
 	serializer.WritePropertyWithDefault<bool>(5, "replicated", replicated, false);
+	serializer.WritePropertyWithDefault<bool>(6, "mark_join_build_summary_valid", mark_join_build_summary.valid, false);
+	serializer.WritePropertyWithDefault<bool>(7, "mark_join_build_has_rows", mark_join_build_summary.has_rows, false);
+	serializer.WritePropertyWithDefault<bool>(8, "mark_join_build_has_null", mark_join_build_summary.has_null, false);
 }
 
 ExchangeSourceTaskDescriptor ExchangeSourceTaskDescriptor::Deserialize(Deserializer &deserializer) {
@@ -107,6 +113,13 @@ ExchangeSourceTaskDescriptor ExchangeSourceTaskDescriptor::Deserialize(Deseriali
 	deserializer.ReadPropertyWithDefault<idx_t>(3, "source_partition_count", result.source_partition_count);
 	deserializer.ReadPropertyWithDefault<idx_t>(4, "source_task_count", result.source_task_count);
 	deserializer.ReadPropertyWithDefault<bool>(5, "replicated", result.replicated);
+	deserializer.ReadPropertyWithDefault<bool>(6, "mark_join_build_summary_valid",
+	                                           result.mark_join_build_summary.valid);
+	deserializer.ReadPropertyWithDefault<bool>(7, "mark_join_build_has_rows", result.mark_join_build_summary.has_rows);
+	deserializer.ReadPropertyWithDefault<bool>(8, "mark_join_build_has_null", result.mark_join_build_summary.has_null);
+	if (!result.mark_join_build_summary.IsConsistent()) {
+		throw SerializationException("invalid MARK join build summary in exchange source task");
+	}
 	if (result.source_partition_count == 0 && !result.partition_indices.empty()) {
 		for (auto partition_idx : result.partition_indices) {
 			result.source_partition_count = std::max(result.source_partition_count, partition_idx + 1);

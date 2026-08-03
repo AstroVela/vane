@@ -30,6 +30,8 @@ private:
 	size_t num_partitions_;
 	std::shared_ptr<DistributedPipelineNode> child_;
 	std::shared_ptr<ExchangeManager> exchange_mgr_;
+	bool collect_mark_join_build_summary_ = false;
+	vector<unique_ptr<Expression>> mark_join_build_expressions_;
 
 	static constexpr const char *NODE_NAME = "Repartition";
 
@@ -52,6 +54,15 @@ public:
 	std::vector<PipelineNodeRef> children() const override;
 
 	std::vector<std::string> multiline_display(bool verbose) const override;
+
+	void EnableMarkJoinBuildSummary(vector<unique_ptr<Expression>> expressions) {
+		collect_mark_join_build_summary_ = true;
+		mark_join_build_expressions_ = std::move(expressions);
+	}
+
+	bool CollectsMarkJoinBuildSummary() const {
+		return collect_mark_join_build_summary_;
+	}
 
 	// 生成任务流（核心方法）
 	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override;
@@ -76,7 +87,9 @@ DuckPhysicalPlanRef AddRemoteExchangeSinkPlan(DuckPhysicalPlanRef plan,
                                               const std::shared_ptr<::duckdb::RepartitionSpec> &spec,
                                               idx_t num_partitions, const std::string &exchange_id,
                                               const ExchangeSinkInstanceHandle &sink_handle,
-                                              std::shared_ptr<ExchangeManager> exchange_mgr);
+                                              std::shared_ptr<ExchangeManager> exchange_mgr,
+                                              bool collect_mark_join_build_summary = false,
+                                              vector<unique_ptr<Expression>> mark_join_build_expressions = {});
 
 DuckPhysicalPlanRef AddRemoteRangeExchangeSinkPlan(DuckPhysicalPlanRef plan,
                                                    const vector<::duckdb::BoundOrderByNode> &orders,

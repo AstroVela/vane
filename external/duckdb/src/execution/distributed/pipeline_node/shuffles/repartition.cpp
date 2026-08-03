@@ -45,7 +45,18 @@ std::string ExchangeSourceHandleKey(const ExchangeSourceHandle &handle) {
 	for (const auto &file : handle.files) {
 		ss << '|' << file.path << ':' << file.rows << ':' << file.file_size;
 	}
+	const auto &summary = handle.mark_join_build_summary;
+	ss << '|' << summary.valid << ':' << summary.has_rows << ':' << summary.has_null;
 	return ss.str();
+}
+
+vector<unique_ptr<Expression>> CopyExpressions(const vector<unique_ptr<Expression>> &expressions) {
+	vector<unique_ptr<Expression>> result;
+	result.reserve(expressions.size());
+	for (const auto &expression : expressions) {
+		result.push_back(expression->Copy());
+	}
+	return result;
 }
 
 vector<unique_ptr<Expression>> CopyHashPartitionByExpressions(const std::shared_ptr<RepartitionSpec> &spec) {
@@ -117,7 +128,9 @@ idx_t ResolveExchangeSourceTaskCount(idx_t num_partitions, const DuckDBExecution
 DuckPhysicalPlanRef AddRemoteExchangeSinkPlan(DuckPhysicalPlanRef plan, const std::shared_ptr<RepartitionSpec> &spec,
                                               idx_t num_partitions, const std::string &exchange_id,
                                               const distributed::ExchangeSinkInstanceHandle &sink_handle,
-                                              std::shared_ptr<distributed::ExchangeManager> exchange_mgr) {
+                                              std::shared_ptr<distributed::ExchangeManager> exchange_mgr,
+                                              bool collect_mark_join_build_summary,
+                                              vector<unique_ptr<Expression>> mark_join_build_expressions) {
 	if (!plan || !plan->HasRoot()) {
 		return plan;
 	}
@@ -137,9 +150,12 @@ DuckPhysicalPlanRef AddRemoteExchangeSinkPlan(DuckPhysicalPlanRef plan, const st
 	auto repartition_type = ResolveRepartitionType(spec);
 	auto &old_root = plan->Root();
 	auto estimated = old_root.estimated_cardinality;
-	auto &sink = plan->Make<PhysicalRemoteExchangeSink>(old_root.GetTypes(), estimated, exchange_id, num_partitions,
-	                                                    repartition_type, std::move(partition_exprs), sink_handle,
-	                                                    std::move(exchange_mgr));
+	auto &sink = static_cast<PhysicalRemoteExchangeSink &>(plan->Make<PhysicalRemoteExchangeSink>(
+	    old_root.GetTypes(), estimated, exchange_id, num_partitions, repartition_type, std::move(partition_exprs),
+	    sink_handle, std::move(exchange_mgr)));
+	if (collect_mark_join_build_summary) {
+		sink.EnableMarkJoinBuildSummary(std::move(mark_join_build_expressions));
+	}
 	sink.children.push_back(old_root);
 	plan->SetRoot(sink);
 	return plan;
@@ -248,6 +264,9 @@ std::vector<std::string> RepartitionNode::multiline_display(bool verbose) const 
 	// here and provide a simplified display string. A full implementation
 	// would call into the RepartitionSpec for richer details.
 	result.push_back("Repartition");
+	if (collect_mark_join_build_summary_) {
+		result.push_back("MARK build summary: global");
+	}
 
 	return result;
 }
@@ -323,14 +342,15 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 
 		// Build sink plan builder: RemoteExchangeSink
 		auto repartition_spec = self_shared->repartition_spec_;
-		auto plan_builder = [repartition_spec, num_partitions, shuffle_stage_id, exchange, exchange_mgr,
+		auto plan_builder = [self_shared, repartition_spec, num_partitions, shuffle_stage_id, exchange, exchange_mgr,
 		                     sink_task_counter](DuckPhysicalPlanRef plan) {
 			// Each task gets its own sink handle via the Exchange SPI
 			auto task_partition_id = sink_task_counter->fetch_add(1);
 			auto sink_handle_obj = exchange->AddSink(task_partition_id);
 			auto sink_instance = exchange->InstantiateSink(sink_handle_obj, /*attempt_id=*/0);
 			return AddRemoteExchangeSinkPlan(std::move(plan), repartition_spec, num_partitions, shuffle_stage_id,
-			                                 sink_instance, exchange_mgr);
+			                                 sink_instance, exchange_mgr, self_shared->collect_mark_join_build_summary_,
+			                                 CopyExpressions(self_shared->mark_join_build_expressions_));
 		};
 		auto node_ref = std::static_pointer_cast<PipelineNodeImpl>(self_shared);
 		auto first_with_sink =
@@ -420,6 +440,22 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 				return DuckDBResult<void>::ok();
 			}
 			auto source_nodes = CollectShuffleSourceNodes(handles);
+			MarkJoinBuildSummary mark_join_build_summary;
+			for (const auto &handle : handles) {
+				if (!handle.mark_join_build_summary.IsConsistent()) {
+					return DuckDBResult<void>::err(
+					    DuckDBError::invalid_state_error("shuffle source has an invalid MARK build summary"));
+				}
+				if (self_shared->collect_mark_join_build_summary_ && !handle.mark_join_build_summary.valid) {
+					return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
+					    "MARK join build shuffle source is missing its global build summary"));
+				}
+				mark_join_build_summary.Merge(handle.mark_join_build_summary);
+			}
+			if (self_shared->collect_mark_join_build_summary_ && !mark_join_build_summary.valid) {
+				return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
+				    "MARK join build shuffle completed without a global build summary"));
+			}
 			for (idx_t task_idx = 0; task_idx < target_tasks; task_idx++) {
 				idx_t part_start = task_idx * num_partitions / target_tasks;
 				idx_t part_end = (task_idx + 1) * num_partitions / target_tasks;
@@ -448,6 +484,7 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 				source_task.source_handles = std::move(task_handles);
 				source_task.source_partition_count = num_partitions;
 				source_task.source_task_count = target_tasks;
+				source_task.mark_join_build_summary = mark_join_build_summary;
 				auto plan =
 				    MakeRemoteExchangeSourcePlan(output_types, estimated_cardinality, shuffle_stage_id, {}, {},
 				                                 exchange_mgr, source_nodes, optional_idx(self_shared->node_id()));
@@ -477,7 +514,7 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 			}
 			return make_source_update_tasks(new_handles, reason);
 		};
-		auto on_sink_output = [exchange,
+		auto on_sink_output = [self_shared, exchange,
 		                       send_new_source_handles](const MaterializedOutput &output) -> DuckDBResult<void> {
 			if (!output.has_exchange_sink_instance()) {
 				return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
@@ -491,6 +528,9 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 			const auto &sink_instance = output.exchange_sink_instance();
 			exchange->AddSink(sink_instance.sink_handle.task_partition_id);
 			exchange->SinkFinished(sink_instance, node_id, output.flight_port());
+			if (self_shared->collect_mark_join_build_summary_) {
+				return DuckDBResult<void>::ok();
+			}
 			return send_new_source_handles("sink_output");
 		};
 		auto materialize_profile_start = std::chrono::steady_clock::now();

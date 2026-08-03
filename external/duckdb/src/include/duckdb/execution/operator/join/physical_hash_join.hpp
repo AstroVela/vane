@@ -16,6 +16,7 @@
 
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
+#include "duckdb/execution/mark_join_build_summary.hpp"
 #include "duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
 #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
 #include "duckdb/execution/physical_operator.hpp"
@@ -63,6 +64,10 @@ public:
 	//! Join Keys statistics (optional)
 	vector<unique_ptr<BaseStatistics>> join_stats;
 
+	//! Global RHS state for an uncorrelated partitioned MARK join. Invalid for
+	//! ordinary local, gathered, broadcast, and correlated MARK joins.
+	MarkJoinBuildSummary mark_join_build_summary;
+
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 	void SerializeOperatorData(Serializer &serializer) const override;
@@ -70,6 +75,7 @@ public:
 public:
 	// Operator Interface
 	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override;
+	void ConstructEmptyMarkJoinResult(DataChunk &join_keys, DataChunk &input, DataChunk &result) const;
 
 	bool ParallelOperator() const override {
 		return true;

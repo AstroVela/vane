@@ -1114,6 +1114,49 @@ TEST_CASE("PhysicalHashJoin serialization roundtrip", "[serialization][physical_
 	std::cerr << "[test] PhysicalHashJoin serialization roundtrip PASSED" << std::endl;
 }
 
+TEST_CASE("PhysicalHashJoin serialization preserves a global MARK build summary",
+          "[serialization][physical_plan][join]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+	vector<LogicalType> input_types = {LogicalType::INTEGER};
+	auto &left_scan = MakeColumnDataScan(plan, input_types);
+	auto &right_scan = MakeColumnDataScan(plan, input_types);
+
+	JoinCondition condition;
+	condition.left = make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0);
+	condition.right = make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0);
+	condition.comparison = ExpressionType::COMPARE_EQUAL;
+	vector<JoinCondition> conditions;
+	conditions.push_back(std::move(condition));
+
+	LogicalComparisonJoin logical_join(JoinType::MARK);
+	logical_join.types = {LogicalType::INTEGER, LogicalType::BOOLEAN};
+	auto &hash_join =
+	    plan.Make<PhysicalHashJoin>(logical_join, left_scan, right_scan, std::move(conditions), JoinType::MARK, 100)
+	        .Cast<PhysicalHashJoin>();
+	hash_join.mark_join_build_summary = MarkJoinBuildSummary::Create(true, true);
+
+	MemoryStream stream(allocator);
+	SerializationOptions options;
+	BinarySerializer serializer(stream, options);
+	serializer.Begin();
+	hash_join.Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Begin();
+	auto deserialized_op = PhysicalOperator::Deserialize(deserializer, plan);
+	deserializer.End();
+
+	auto *join_ptr = dynamic_cast<PhysicalHashJoin *>(deserialized_op.get());
+	REQUIRE(join_ptr != nullptr);
+	REQUIRE(join_ptr->join_type == JoinType::MARK);
+	REQUIRE(join_ptr->mark_join_build_summary.valid);
+	REQUIRE(join_ptr->mark_join_build_summary.has_rows);
+	REQUIRE(join_ptr->mark_join_build_summary.has_null);
+}
+
 TEST_CASE("PhysicalUngroupedAggregate serialization roundtrip", "[serialization][physical_plan]") {
 	DuckDB db(nullptr);
 	Connection conn(db);
@@ -1625,6 +1668,9 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	vector<unique_ptr<Expression>> partition_by;
 	auto &sink = plan.Make<PhysicalRemoteExchangeSink>(types, 123, "shuffle_stage", 4, RepartitionSpec::Type::Random,
 	                                                   std::move(partition_by), sink_handle, exchange_mgr);
+	vector<unique_ptr<Expression>> mark_join_build_expressions;
+	mark_join_build_expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+	sink.Cast<PhysicalRemoteExchangeSink>().EnableMarkJoinBuildSummary(std::move(mark_join_build_expressions));
 
 	MemoryStream stream(allocator);
 	SerializationOptions options;
@@ -1652,6 +1698,9 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	REQUIRE(sink_ptr->SinkHandle().flight_host.empty());
 	REQUIRE(sink_ptr->SinkHandle().flight_server_epoch == "sink-epoch");
 	REQUIRE(sink_ptr->SinkHandle().fte_task_identity);
+	REQUIRE(sink_ptr->CollectsMarkJoinBuildSummary());
+	REQUIRE(sink_ptr->MarkJoinBuildExpressions().size() == 1);
+	REQUIRE(sink_ptr->MarkJoinBuildExpressions()[0]->return_type == LogicalType::INTEGER);
 	auto roundtrip_manager =
 	    std::dynamic_pointer_cast<distributed::FlightExchangeManager>(sink_ptr->GetExchangeManager());
 	const std::vector<std::string> expected_local_dirs = {"/session-a/shuffle-0", "/session-a/shuffle-1"};
@@ -1783,6 +1832,7 @@ TEST_CASE("ExchangeSinkInstanceTaskDescriptor serialization preserves the worker
 	descriptor.sink_instance.flight_host = "flight-worker.internal";
 	descriptor.sink_instance.flight_server_epoch = "endpoint-epoch";
 	descriptor.sink_instance.fte_task_identity = true;
+	descriptor.sink_instance.mark_join_build_summary = MarkJoinBuildSummary::Create(true, true);
 
 	auto roundtrip =
 	    distributed::ExchangeSinkInstanceTaskDescriptor::DeserializeFromBytes(descriptor.SerializeToBytes());
@@ -1795,6 +1845,24 @@ TEST_CASE("ExchangeSinkInstanceTaskDescriptor serialization preserves the worker
 	REQUIRE(roundtrip.sink_instance.flight_host == "flight-worker.internal");
 	REQUIRE(roundtrip.sink_instance.flight_server_epoch == "endpoint-epoch");
 	REQUIRE(roundtrip.sink_instance.fte_task_identity);
+	REQUIRE(roundtrip.sink_instance.mark_join_build_summary.valid);
+	REQUIRE(roundtrip.sink_instance.mark_join_build_summary.has_rows);
+	REQUIRE(roundtrip.sink_instance.mark_join_build_summary.has_null);
+}
+
+TEST_CASE("Exchange task descriptors reject MARK summary payload without validity",
+          "[serialization][physical_plan][exchange]") {
+	SECTION("sink task") {
+		distributed::ExchangeSinkInstanceTaskDescriptor descriptor;
+		descriptor.sink_instance.mark_join_build_summary.has_rows = true;
+		REQUIRE_THROWS(descriptor.SerializeToBytes());
+	}
+
+	SECTION("source task") {
+		distributed::ExchangeSourceTaskDescriptor descriptor;
+		descriptor.mark_join_build_summary.has_rows = true;
+		REQUIRE_THROWS(descriptor.SerializeToBytes());
+	}
 }
 
 TEST_CASE("Exchange task descriptors reject missing advertised hosts", "[serialization][physical_plan][exchange]") {
@@ -2025,6 +2093,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	descriptor.partition_indices = {0, 1};
 	descriptor.source_partition_count = 2;
 	descriptor.source_task_count = 2;
+	descriptor.mark_join_build_summary = MarkJoinBuildSummary::Create(true, true);
 
 	distributed::ExchangeSourceHandle handle0;
 	handle0.partition_id = 0;
@@ -2053,6 +2122,9 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	REQUIRE(roundtrip.partition_indices == descriptor.partition_indices);
 	REQUIRE(roundtrip.source_partition_count == 2);
 	REQUIRE(roundtrip.source_task_count == 2);
+	REQUIRE(roundtrip.mark_join_build_summary.valid);
+	REQUIRE(roundtrip.mark_join_build_summary.has_rows);
+	REQUIRE(roundtrip.mark_join_build_summary.has_null);
 	REQUIRE(roundtrip.source_handles.size() == 2);
 	REQUIRE(roundtrip.source_handles[0].partition_id == 0);
 	REQUIRE(roundtrip.source_handles[0].source_task_partition_id == 21);

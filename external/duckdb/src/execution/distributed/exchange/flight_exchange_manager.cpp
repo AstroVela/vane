@@ -536,6 +536,9 @@ void FlightExchange::SinkFinished(const ExchangeSinkHandle &handle, idx_t attemp
 
 void FlightExchange::SinkFinished(const ExchangeSinkInstanceHandle &instance, const std::string &node_id,
                                   int flight_port) {
+	if (!instance.mark_join_build_summary.IsConsistent()) {
+		throw InvalidInputException("finished Flight sink has an invalid MARK join build summary");
+	}
 	if (instance.query_id != ctx_.query_id) {
 		throw InvalidInputException("finished Flight sink query does not match its exchange");
 	}
@@ -630,6 +633,13 @@ void FlightExchange::SinkFinished(const ExchangeSinkInstanceHandle &instance, co
 		}
 		if (!instance.flight_server_epoch.empty()) {
 			attempt_metadata.flight_server_epoch = instance.flight_server_epoch;
+		}
+		if (attempt_metadata.mark_join_build_summary.valid && instance.mark_join_build_summary.valid &&
+		    !(attempt_metadata.mark_join_build_summary == instance.mark_join_build_summary)) {
+			throw InvalidInputException("finished Flight sink MARK join build summary changed for one attempt");
+		}
+		if (instance.mark_join_build_summary.valid) {
+			attempt_metadata.mark_join_build_summary = instance.mark_join_build_summary;
 		}
 
 		auto selected_entry = selected_attempts_.find(handle.task_partition_id);
@@ -768,6 +778,22 @@ std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 	if (selected_attempts.empty()) {
 		return handles;
 	}
+	MarkJoinBuildSummary mark_join_build_summary;
+	bool has_attempt_without_mark_summary = false;
+	for (const auto &entry : selected_attempts) {
+		const auto &attempt_summary = entry.second.mark_join_build_summary;
+		if (!attempt_summary.IsConsistent()) {
+			throw InvalidInputException("selected Flight sink has an invalid MARK join build summary");
+		}
+		if (!attempt_summary.valid) {
+			has_attempt_without_mark_summary = true;
+			continue;
+		}
+		mark_join_build_summary.Merge(attempt_summary);
+	}
+	if (mark_join_build_summary.valid && has_attempt_without_mark_summary) {
+		throw InvalidInputException("selected Flight sink attempts have inconsistent MARK join build summaries");
+	}
 
 	auto build_source_file = [&](const SinkAttemptMetadata &attempt_metadata, idx_t partition_id) {
 		ExchangeSourceFile file;
@@ -802,6 +828,7 @@ std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 			handle.source_task_partition_id = source_task_partition_id;
 			handle.attempt_id = attempt_id;
 			handle.node_id = attempt_metadata.node_id;
+			handle.mark_join_build_summary = mark_join_build_summary;
 			if (FlightExchangeUsesNetworkTransport(config_)) {
 				handle.flight_host = attempt_metadata.flight_host;
 				handle.flight_port = attempt_metadata.flight_port;

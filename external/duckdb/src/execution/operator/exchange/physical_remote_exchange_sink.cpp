@@ -16,11 +16,13 @@
 #include "duckdb/common/types/string_type.hpp"
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/function/create_sort_key.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 namespace duckdb {
@@ -32,11 +34,13 @@ struct RemoteSinkGlobalState : public GlobalSinkState {
 	}
 
 	std::unique_ptr<distributed::ExchangeSink> sink;
+	std::atomic<bool> mark_join_build_has_rows {false};
+	std::atomic<bool> mark_join_build_has_null {false};
 };
 
 struct RemoteSinkLocalState : public LocalSinkState {
 	explicit RemoteSinkLocalState(ClientContext &context, const PhysicalRemoteExchangeSink &op)
-	    : executor(context), hash(LogicalType::HASH), sort_key(LogicalType::BLOB) {
+	    : executor(context), mark_join_build_executor(context), hash(LogicalType::HASH), sort_key(LogicalType::BLOB) {
 		const auto &exprs = op.PartitionBy();
 		if (!exprs.empty()) {
 			vector<LogicalType> types;
@@ -57,6 +61,16 @@ struct RemoteSinkLocalState : public LocalSinkState {
 				range_modifiers.push_back(OrderModifiers::Parse(modifier));
 			}
 		}
+		if (op.CollectsMarkJoinBuildSummary()) {
+			vector<LogicalType> types;
+			for (const auto &expr : op.MarkJoinBuildExpressions()) {
+				mark_join_build_executor.AddExpression(*expr);
+				types.push_back(expr->return_type);
+			}
+			if (!types.empty()) {
+				mark_join_build_keys.InitializeEmpty(types);
+			}
+		}
 		selections.reserve(op.NumPartitions());
 		for (idx_t i = 0; i < op.NumPartitions(); i++) {
 			selections.emplace_back(STANDARD_VECTOR_SIZE);
@@ -66,6 +80,8 @@ struct RemoteSinkLocalState : public LocalSinkState {
 
 	ExpressionExecutor executor;
 	DataChunk key_chunk;
+	ExpressionExecutor mark_join_build_executor;
+	DataChunk mark_join_build_keys;
 	Vector hash;
 	Vector sort_key;
 	vector<OrderModifiers> range_modifiers;
@@ -180,6 +196,19 @@ SinkResultType PhysicalRemoteExchangeSink::Sink(ExecutionContext &context, DataC
 	auto &lstate = input.local_state.Cast<RemoteSinkLocalState>();
 	const auto count = chunk.size();
 	const auto partitions = num_partitions_;
+	if (collect_mark_join_build_summary_) {
+		gstate.mark_join_build_has_rows.store(true, std::memory_order_relaxed);
+		if (!mark_join_build_expressions_.empty() && !gstate.mark_join_build_has_null.load(std::memory_order_relaxed)) {
+			lstate.mark_join_build_keys.Reset();
+			lstate.mark_join_build_executor.Execute(chunk, lstate.mark_join_build_keys);
+			for (auto &key : lstate.mark_join_build_keys.data) {
+				if (VectorOperations::HasNull(key, count)) {
+					gstate.mark_join_build_has_null.store(true, std::memory_order_relaxed);
+					break;
+				}
+			}
+		}
+	}
 
 	std::fill(lstate.sel_counts.begin(), lstate.sel_counts.end(), 0);
 
@@ -282,6 +311,11 @@ SinkFinalizeType PhysicalRemoteExchangeSink::Finalize(Pipeline &pipeline, Event 
 		}
 		throw IOException(message);
 	}
+	if (collect_mark_join_build_summary_) {
+		sink_handle_.mark_join_build_summary =
+		    MarkJoinBuildSummary::Create(gstate.mark_join_build_has_rows.load(std::memory_order_relaxed),
+		                                 gstate.mark_join_build_has_null.load(std::memory_order_relaxed));
+	}
 	return SinkFinalizeType::READY;
 }
 
@@ -320,6 +354,11 @@ void PhysicalRemoteExchangeSink::SerializeOperatorData(Serializer &serializer) c
 	serializer.WriteProperty(114, "flight_server_epoch", sink_handle_.flight_server_epoch);
 	serializer.WriteProperty(115, "query_id", sink_handle_.query_id);
 	serializer.WriteProperty(116, "fte_task_identity", sink_handle_.fte_task_identity);
+	serializer.WritePropertyWithDefault<bool>(117, "collect_mark_join_build_summary", collect_mark_join_build_summary_,
+	                                          false);
+	if (collect_mark_join_build_summary_) {
+		serializer.WriteProperty(118, "mark_join_build_expressions", mark_join_build_expressions_);
+	}
 }
 
 } // namespace duckdb

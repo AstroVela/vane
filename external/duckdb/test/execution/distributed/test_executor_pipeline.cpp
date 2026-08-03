@@ -28,9 +28,12 @@
 #include "duckdb/main/pending_query_result.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
+#include "duckdb/execution/operator/exchange/physical_remote_exchange_sink.hpp"
+#include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 
 #include <functional>
 
@@ -44,6 +47,209 @@ static idx_t GetRowCount(unique_ptr<QueryResult> &result) {
 // Helper function to get value from query result
 static Value GetResultValue(unique_ptr<QueryResult> &result, idx_t col, idx_t row) {
 	return result->Cast<MaterializedQueryResult>().GetValue(col, row);
+}
+
+static unique_ptr<ColumnDataCollection> MakeIntegerCollection(const vector<Value> &values) {
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	auto collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
+	if (values.empty()) {
+		return collection;
+	}
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), types);
+	for (idx_t row_idx = 0; row_idx < values.size(); row_idx++) {
+		chunk.SetValue(0, row_idx, values[row_idx]);
+	}
+	chunk.SetCardinality(values.size());
+	collection->Append(chunk);
+	return collection;
+}
+
+class MarkSummaryTestExchangeSink final : public distributed::ExchangeSink {
+public:
+	DuckDBResult<void> AddChunk(idx_t partition_id, DataChunk &chunk) override {
+		return DuckDBResult<void>::ok();
+	}
+
+	bool IsBlocked() const override {
+		return false;
+	}
+
+	void WaitUnblocked() override {
+	}
+
+	DuckDBResult<void> Finish() override {
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<void> Abort() override {
+		return DuckDBResult<void>::ok();
+	}
+
+	size_t GetMemoryUsage() const override {
+		return 0;
+	}
+};
+
+class MarkSummaryTestExchangeManager final : public distributed::ExchangeManager {
+public:
+	std::unique_ptr<distributed::Exchange> CreateExchange(const distributed::ExchangeContext &ctx,
+	                                                      idx_t output_partition_count) override {
+		return nullptr;
+	}
+
+	std::unique_ptr<distributed::ExchangeSink>
+	CreateSink(const distributed::ExchangeSinkInstanceHandle &handle) override {
+		return std::unique_ptr<distributed::ExchangeSink>(new MarkSummaryTestExchangeSink());
+	}
+
+	std::unique_ptr<distributed::ExchangeSource> CreateSource() override {
+		return nullptr;
+	}
+
+	void Shutdown() override {
+	}
+};
+
+static MarkJoinBuildSummary ExecuteMarkJoinSummarySink(Connection &con, const vector<Value> &right_values) {
+	auto physical_plan = make_uniq<PhysicalPlan>(Allocator::DefaultAllocator());
+	vector<LogicalType> input_types = {LogicalType::INTEGER};
+	auto &scan = physical_plan->Make<PhysicalColumnDataScan>(input_types, PhysicalOperatorType::COLUMN_DATA_SCAN,
+	                                                         right_values.size(), MakeIntegerCollection(right_values));
+
+	vector<unique_ptr<Expression>> partition_by;
+	partition_by.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+	distributed::ExchangeSinkInstanceHandle sink_handle;
+	sink_handle.output_partition_count = 2;
+	auto exchange_manager = std::make_shared<MarkSummaryTestExchangeManager>();
+	auto &sink = physical_plan
+	                 ->Make<PhysicalRemoteExchangeSink>(input_types, right_values.size(), "mark-summary-test", 2,
+	                                                    RepartitionSpec::Type::Hash, std::move(partition_by),
+	                                                    sink_handle, std::move(exchange_manager))
+	                 .Cast<PhysicalRemoteExchangeSink>();
+	vector<unique_ptr<Expression>> summary_expressions;
+	summary_expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+	sink.EnableMarkJoinBuildSummary(std::move(summary_expressions));
+	sink.children.push_back(scan);
+	physical_plan->SetRoot(sink);
+
+	auto prepared = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);
+	prepared->names = {"value"};
+	prepared->types = input_types;
+	prepared->properties.return_type = StatementReturnType::QUERY_RESULT;
+	prepared->output_type = QueryResultOutputType::FORCE_MATERIALIZED;
+	prepared->memory_type = QueryResultMemoryType::IN_MEMORY;
+	prepared->physical_plan = std::move(physical_plan);
+
+	PendingQueryParameters parameters;
+	auto pending = con.context->PendingQueryPreparedStatementNoRebind("test:mark_summary_sink", prepared, parameters);
+	if (!pending || pending->HasError()) {
+		throw InvalidInputException(pending ? pending->GetError() : "failed to start MARK summary sink test query");
+	}
+	auto result = pending->Execute();
+	if (!result || result->HasError()) {
+		throw InvalidInputException(result ? result->GetError() : "failed to execute MARK summary sink test query");
+	}
+	return sink.SinkHandle().mark_join_build_summary;
+}
+
+TEST_CASE("Remote exchange sink: MARK build summary records empty and NULL-bearing inputs",
+          "[distributed][executor][exchange][join]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto empty = ExecuteMarkJoinSummarySink(con, {});
+	REQUIRE(empty.valid);
+	REQUIRE_FALSE(empty.has_rows);
+	REQUIRE_FALSE(empty.has_null);
+
+	auto with_null =
+	    ExecuteMarkJoinSummarySink(con, {Value::INTEGER(1), Value(LogicalType::INTEGER), Value::INTEGER(2)});
+	REQUIRE(with_null.valid);
+	REQUIRE(with_null.has_rows);
+	REQUIRE(with_null.has_null);
+}
+
+static unique_ptr<QueryResult> ExecuteMarkJoinFragment(Connection &con, const vector<Value> &left_values,
+                                                       const vector<Value> &local_right_values,
+                                                       MarkJoinBuildSummary summary) {
+	auto physical_plan = make_uniq<PhysicalPlan>(Allocator::DefaultAllocator());
+	vector<LogicalType> input_types = {LogicalType::INTEGER};
+	auto &left = physical_plan->Make<PhysicalColumnDataScan>(input_types, PhysicalOperatorType::COLUMN_DATA_SCAN,
+	                                                         left_values.size(), MakeIntegerCollection(left_values));
+	auto &right = physical_plan->Make<PhysicalColumnDataScan>(input_types, PhysicalOperatorType::COLUMN_DATA_SCAN,
+	                                                          local_right_values.size(),
+	                                                          MakeIntegerCollection(local_right_values));
+
+	JoinCondition condition;
+	condition.left = make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0);
+	condition.right = make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0);
+	condition.comparison = ExpressionType::COMPARE_EQUAL;
+	vector<JoinCondition> conditions;
+	conditions.push_back(std::move(condition));
+	LogicalComparisonJoin logical_join(JoinType::MARK);
+	logical_join.types = {LogicalType::INTEGER, LogicalType::BOOLEAN};
+	auto &join = physical_plan
+	                 ->Make<PhysicalHashJoin>(logical_join, left, right, std::move(conditions), JoinType::MARK,
+	                                          left_values.size())
+	                 .Cast<PhysicalHashJoin>();
+	join.mark_join_build_summary = summary;
+	physical_plan->SetRoot(join);
+
+	auto prepared = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);
+	prepared->names = {"value", "mark"};
+	prepared->types = logical_join.types;
+	prepared->properties.return_type = StatementReturnType::QUERY_RESULT;
+	prepared->output_type = QueryResultOutputType::FORCE_MATERIALIZED;
+	prepared->memory_type = QueryResultMemoryType::IN_MEMORY;
+	prepared->physical_plan = std::move(physical_plan);
+
+	PendingQueryParameters parameters;
+	auto pending =
+	    con.context->PendingQueryPreparedStatementNoRebind("test:partitioned_mark_join", prepared, parameters);
+	if (!pending || pending->HasError()) {
+		throw InvalidInputException(pending ? pending->GetError() : "failed to start MARK join test query");
+	}
+	return pending->Execute();
+}
+
+TEST_CASE("Hash join: global MARK build summary distinguishes an empty RHS from an empty local partition",
+          "[distributed][executor][join]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	con.Query("SET threads=1");
+
+	SECTION("globally empty RHS returns false even for a NULL probe") {
+		auto result = ExecuteMarkJoinFragment(con, {Value::INTEGER(7), Value(LogicalType::INTEGER)}, {},
+		                                      MarkJoinBuildSummary::Create(false, false));
+		REQUIRE_FALSE(result->HasError());
+		REQUIRE(GetResultValue(result, 1, 0) == Value::BOOLEAN(false));
+		REQUIRE(GetResultValue(result, 1, 1) == Value::BOOLEAN(false));
+	}
+
+	SECTION("globally non-empty RHS without NULL preserves a NULL probe") {
+		auto result = ExecuteMarkJoinFragment(con, {Value::INTEGER(7), Value(LogicalType::INTEGER)}, {},
+		                                      MarkJoinBuildSummary::Create(true, false));
+		REQUIRE_FALSE(result->HasError());
+		REQUIRE(GetResultValue(result, 1, 0) == Value::BOOLEAN(false));
+		REQUIRE(GetResultValue(result, 1, 1).IsNull());
+	}
+
+	SECTION("a global NULL makes every unmatched probe unknown") {
+		auto result = ExecuteMarkJoinFragment(con, {Value::INTEGER(7), Value(LogicalType::INTEGER)}, {},
+		                                      MarkJoinBuildSummary::Create(true, true));
+		REQUIRE_FALSE(result->HasError());
+		REQUIRE(GetResultValue(result, 1, 0).IsNull());
+		REQUIRE(GetResultValue(result, 1, 1).IsNull());
+	}
+
+	SECTION("a local match remains true when another partition contains NULL") {
+		auto result = ExecuteMarkJoinFragment(con, {Value::INTEGER(1), Value::INTEGER(2)}, {Value::INTEGER(1)},
+		                                      MarkJoinBuildSummary::Create(true, true));
+		REQUIRE_FALSE(result->HasError());
+		REQUIRE(GetResultValue(result, 1, 0) == Value::BOOLEAN(true));
+		REQUIRE(GetResultValue(result, 1, 1).IsNull());
+	}
 }
 
 TEST_CASE("Executor: Pipeline count for different query types", "[distributed][executor][pipeline]") {

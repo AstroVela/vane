@@ -237,9 +237,22 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 
 	std::vector<duckdb::ExprRef> left_partition_by;
 	std::vector<duckdb::ExprRef> right_partition_by;
+	duckdb::vector<unique_ptr<Expression>> mark_join_build_summary_expressions;
+	const bool correlated_mark_counts =
+	    hj.join_type == JoinType::MARK && !hj.delim_types.empty() && hj.delim_types.size() + 1 == conditions.size();
+	const auto partition_condition_count = correlated_mark_counts ? hj.delim_types.size() : conditions.size();
 	left_partition_by.reserve(conditions.size());
 	right_partition_by.reserve(conditions.size());
-	for (const auto &cond : conditions) {
+	for (idx_t condition_idx = 0; condition_idx < conditions.size(); condition_idx++) {
+		const auto &cond = conditions[condition_idx];
+		if (hj.join_type == JoinType::MARK && !correlated_mark_counts && cond.right &&
+		    cond.comparison != ExpressionType::COMPARE_DISTINCT_FROM &&
+		    cond.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			mark_join_build_summary_expressions.push_back(cond.right->Copy());
+		}
+		if (condition_idx >= partition_condition_count) {
+			continue;
+		}
 		if (cond.comparison != ExpressionType::COMPARE_EQUAL &&
 		    cond.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 			continue;
@@ -324,6 +337,7 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 
 	DistributedPipelineNodeRef join_left = left_node;
 	DistributedPipelineNodeRef join_right = right_node;
+	optional_idx mark_build_summary_source_node_id;
 	bool needs_join_repartition = (plan_config_.num_partitions > 1);
 	if (!needs_join_repartition && left_node && right_node) {
 		size_t left_parts = left_node->config().clustering_spec()->num_partitions();
@@ -343,13 +357,22 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 			join_left = gen_shuffle_node(std::move(left_spec), left_node->config().schema(), left_node);
 			auto right_spec = RepartitionSpec::create_hash(target_partitions, std::move(right_partition_by));
 			join_right = gen_shuffle_node(std::move(right_spec), right_node->config().schema(), right_node);
+			if (hj.join_type == JoinType::MARK && !correlated_mark_counts && target_partitions > 1) {
+				auto right_repartition = std::dynamic_pointer_cast<RepartitionNode>(join_right->inner());
+				if (!right_repartition) {
+					throw InternalException("MARK join build shuffle is not a RepartitionNode");
+				}
+				right_repartition->EnableMarkJoinBuildSummary(std::move(mark_join_build_summary_expressions));
+				mark_build_summary_source_node_id = optional_idx(right_repartition->node_id());
+			}
 		}
 	}
 
-	return std::make_shared<HashJoinNode>(
-	    get_next_pipeline_node_id(), plan_config_, std::move(conditions), hj.join_type, hj.GetTypes(), hj.delim_types,
-	    hj.condition_types, hj.payload_columns, hj.lhs_output_columns, hj.rhs_output_columns, std::move(join_stats),
-	    std::move(filter_pushdown), hj.estimated_cardinality, join_left, join_right, schema);
+	return std::make_shared<HashJoinNode>(get_next_pipeline_node_id(), plan_config_, std::move(conditions),
+	                                      hj.join_type, hj.GetTypes(), hj.delim_types, hj.condition_types,
+	                                      hj.payload_columns, hj.lhs_output_columns, hj.rhs_output_columns,
+	                                      std::move(join_stats), std::move(filter_pushdown), hj.estimated_cardinality,
+	                                      join_left, join_right, schema, mark_build_summary_source_node_id);
 }
 
 std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateDelimJoin(

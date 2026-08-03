@@ -138,6 +138,18 @@ bool ParseExchangeSinkInstanceObject(py::object obj, duckdb::distributed::Exchan
 	if (d.contains("query_id")) {
 		out.query_id = py::str(d["query_id"]).cast<string>();
 	}
+	if (d.contains("mark_join_build_summary_valid")) {
+		out.mark_join_build_summary.valid = py::bool_(d["mark_join_build_summary_valid"]).cast<bool>();
+	}
+	if (d.contains("mark_join_build_has_rows")) {
+		out.mark_join_build_summary.has_rows = py::bool_(d["mark_join_build_has_rows"]).cast<bool>();
+	}
+	if (d.contains("mark_join_build_has_null")) {
+		out.mark_join_build_summary.has_null = py::bool_(d["mark_join_build_has_null"]).cast<bool>();
+	}
+	if (!out.mark_join_build_summary.IsConsistent()) {
+		throw py::value_error("exchange_sink_instance has an invalid MARK join build summary");
+	}
 	return true;
 }
 
@@ -1252,6 +1264,9 @@ py::object RayWorkerTask::ExchangeSinkInstance() const {
 		return py::none();
 	}
 	const auto &instance = sink->SinkHandle();
+	if (!instance.mark_join_build_summary.IsConsistent()) {
+		throw py::value_error("exchange_sink_instance has an invalid MARK join build summary");
+	}
 	py::dict sink_handle;
 	sink_handle["task_partition_id"] = instance.sink_handle.task_partition_id;
 	sink_handle["partition_id"] = instance.sink_handle.task_partition_id;
@@ -1275,6 +1290,11 @@ py::object RayWorkerTask::ExchangeSinkInstance() const {
 	if (!instance.output_location.empty()) {
 		result["output_location"] = instance.output_location;
 		result["attempt_path"] = instance.output_location;
+	}
+	if (instance.mark_join_build_summary.valid) {
+		result["mark_join_build_summary_valid"] = true;
+		result["mark_join_build_has_rows"] = instance.mark_join_build_summary.has_rows;
+		result["mark_join_build_has_null"] = instance.mark_join_build_summary.has_null;
 	}
 	return result;
 }

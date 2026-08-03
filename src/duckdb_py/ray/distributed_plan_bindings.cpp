@@ -44,6 +44,18 @@ FindFlightExchangeSinkManager(const duckdb::PhysicalOperator &op) {
 	return nullptr;
 }
 
+static const duckdb::PhysicalRemoteExchangeSink *FindRemoteExchangeSinkOperator(const duckdb::PhysicalOperator &op) {
+	if (op.type == duckdb::PhysicalOperatorType::EXCHANGE_SINK) {
+		return dynamic_cast<const duckdb::PhysicalRemoteExchangeSink *>(&op);
+	}
+	for (auto &child : op.children) {
+		if (auto *sink = FindRemoteExchangeSinkOperator(child.get())) {
+			return sink;
+		}
+	}
+	return nullptr;
+}
+
 struct PyPhysicalPlanWrapper {
 	static constexpr uint64_t INIT_MAGIC = 0x445046504C414E31ULL;
 	uint64_t init_magic_;
@@ -2220,6 +2232,9 @@ struct PyPhysicalPlanWrapperRunner {
 				return py::none();
 			}
 			auto completed_task = *exchange_sink_instance_task;
+			if (auto *sink = FindRemoteExchangeSinkOperator(root_op)) {
+				completed_task.sink_instance = sink->SinkHandle();
+			}
 			completed_task.sink_instance.flight_host = task_flight_host();
 			completed_task.sink_instance.flight_server_epoch = task_flight_server_epoch();
 			return py::bytes(completed_task.SerializeToBytes());

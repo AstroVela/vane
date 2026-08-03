@@ -215,6 +215,7 @@ private:
 		std::string flight_host;
 		int flight_port = 0;
 		std::string flight_server_epoch;
+		MarkJoinBuildSummary mark_join_build_summary;
 	};
 
 	ExchangeContext ctx_;

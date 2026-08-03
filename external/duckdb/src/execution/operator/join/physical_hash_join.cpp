@@ -273,8 +273,22 @@ public:
 };
 
 unique_ptr<JoinHashTable> PhysicalHashJoin::InitializeHashTable(ClientContext &context) const {
+	if (!mark_join_build_summary.IsConsistent()) {
+		throw InternalException("invalid global MARK join build summary on PhysicalHashJoin");
+	}
+	if (mark_join_build_summary.valid) {
+		if (join_type != JoinType::MARK) {
+			throw InternalException("invalid global MARK join build summary on PhysicalHashJoin");
+		}
+		if (!delim_types.empty() && delim_types.size() + 1 == conditions.size()) {
+			throw InternalException("global MARK join build summary cannot be used with correlated per-group counts");
+		}
+	}
 	auto result = make_uniq<JoinHashTable>(context, *this, conditions, payload_columns.col_types, join_type,
 	                                       rhs_output_columns.col_idxs);
+	if (mark_join_build_summary.valid) {
+		result->has_null = mark_join_build_summary.has_null;
+	}
 	if (!delim_types.empty() && join_type == JoinType::MARK) {
 		// correlated MARK join
 		if (delim_types.size() + 1 == conditions.size()) {
@@ -1111,6 +1125,36 @@ unique_ptr<OperatorState> PhysicalHashJoin::GetOperatorState(ExecutionContext &c
 	return std::move(state);
 }
 
+void PhysicalHashJoin::ConstructEmptyMarkJoinResult(DataChunk &join_keys, DataChunk &input, DataChunk &result) const {
+	D_ASSERT(join_type == JoinType::MARK);
+	D_ASSERT(mark_join_build_summary.IsValid());
+	ConstructEmptyJoinResult(join_type, mark_join_build_summary.has_null, input, result);
+	if (!mark_join_build_summary.has_rows || mark_join_build_summary.has_null) {
+		return;
+	}
+
+	auto &mask = FlatVector::Validity(result.data.back());
+	mask.SetAllValid(result.size());
+	for (idx_t condition_idx = 0; condition_idx < conditions.size(); condition_idx++) {
+		auto comparison = conditions[condition_idx].comparison;
+		if (comparison == ExpressionType::COMPARE_DISTINCT_FROM ||
+		    comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			continue;
+		}
+		UnifiedVectorFormat key_data;
+		join_keys.data[condition_idx].ToUnifiedFormat(join_keys.size(), key_data);
+		if (key_data.validity.AllValid()) {
+			continue;
+		}
+		for (idx_t row_idx = 0; row_idx < join_keys.size(); row_idx++) {
+			auto key_idx = key_data.sel->get_index(row_idx);
+			if (!key_data.validity.RowIsValidUnsafe(key_idx)) {
+				mask.SetInvalid(row_idx);
+			}
+		}
+	}
+}
+
 OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
                                                      GlobalOperatorState &gstate, OperatorState &state_p) const {
 	auto &state = state_p.Cast<HashJoinOperatorState>();
@@ -1123,7 +1167,15 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 			return OperatorResultType::FINISHED;
 		}
 		state.lhs_output.ReferenceColumns(input, lhs_output_columns.col_idxs);
-		ConstructEmptyJoinResult(sink.hash_table->join_type, sink.hash_table->has_null, state.lhs_output, chunk);
+		if (join_type == JoinType::MARK && mark_join_build_summary.valid) {
+			if (mark_join_build_summary.has_rows && !mark_join_build_summary.has_null) {
+				state.lhs_join_keys.Reset();
+				state.probe_executor.Execute(input, state.lhs_join_keys);
+			}
+			ConstructEmptyMarkJoinResult(state.lhs_join_keys, state.lhs_output, chunk);
+		} else {
+			ConstructEmptyJoinResult(sink.hash_table->join_type, sink.hash_table->has_null, state.lhs_output, chunk);
+		}
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
@@ -1543,7 +1595,12 @@ void HashJoinLocalSourceState::ExternalProbe(HashJoinGlobalSinkState &sink, Hash
 	lhs_output.ReferenceColumns(lhs_probe_chunk, sink.op.lhs_output_columns.col_idxs);
 
 	if (sink.hash_table->Count() == 0 && !gstate.op.EmptyResultIfRHSIsEmpty()) {
-		gstate.op.ConstructEmptyJoinResult(sink.hash_table->join_type, sink.hash_table->has_null, lhs_output, chunk);
+		if (gstate.op.join_type == JoinType::MARK && gstate.op.mark_join_build_summary.valid) {
+			gstate.op.ConstructEmptyMarkJoinResult(lhs_join_keys, lhs_output, chunk);
+		} else {
+			gstate.op.ConstructEmptyJoinResult(sink.hash_table->join_type, sink.hash_table->has_null, lhs_output,
+			                                   chunk);
+		}
 		empty_ht_probe_in_progress = true;
 		return;
 	}
@@ -1668,6 +1725,9 @@ InsertionOrderPreservingMap<string> PhysicalHashJoin::ParamsToString() const {
 }
 
 void PhysicalHashJoin::SerializeOperatorData(Serializer &serializer) const {
+	if (!mark_join_build_summary.IsConsistent()) {
+		throw SerializationException("invalid global MARK join build summary for hash join");
+	}
 	serializer.WriteProperty(103, "join_type", join_type);
 	serializer.WriteProperty(104, "conditions", conditions);
 	serializer.WriteProperty(105, "condition_types", condition_types);
@@ -1692,6 +1752,10 @@ void PhysicalHashJoin::SerializeOperatorData(Serializer &serializer) const {
 		});
 	}
 	serializer.WritePropertyWithDefault(114, "filter_pushdown", filter_pushdown);
+	serializer.WritePropertyWithDefault<bool>(115, "mark_join_build_summary_valid", mark_join_build_summary.valid,
+	                                          false);
+	serializer.WritePropertyWithDefault<bool>(116, "mark_join_build_has_rows", mark_join_build_summary.has_rows, false);
+	serializer.WritePropertyWithDefault<bool>(117, "mark_join_build_has_null", mark_join_build_summary.has_null, false);
 }
 
 } // namespace duckdb
