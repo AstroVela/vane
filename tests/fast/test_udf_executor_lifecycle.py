@@ -6179,6 +6179,146 @@ def test_subprocess_pool_zero_row_submit_wakeup_sees_no_inflight():
         executor.close()
 
 
+def test_subprocess_zero_row_ref_bundle_releases_input_lease(monkeypatch):
+    from duckdb.execution import ref_bundle
+    from duckdb.execution.udf_subprocess import UDFExecutor
+
+    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1 << 30)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+
+    def identity(table):
+        return table
+
+    executor = UDFExecutor(
+        _subprocess_map_payload(
+            identity,
+            produce_ref_bundle_output=True,
+            streaming_output_mode="local_shm_ref_bundle",
+        )
+    )
+    expected_lease_state = {
+        "active_input_leases": 0,
+        "active_input_ref_holds": 0,
+        "active_input_ref_hold_count": 0,
+        "input_lease_bytes": 0,
+        "active_output_credits": 0,
+        "output_credit_bytes": 0,
+    }
+
+    def lease_state():
+        snapshot = manager.snapshot()
+        return {key: snapshot[key] for key in expected_lease_state}
+
+    try:
+        for submit_id in range(256):
+            _marker, refs, metadata, names = ref_bundle.make_local_shm_ref_bundle_result(
+                pa.table({"x": pa.array([], type=pa.int64())})
+            )
+            try:
+                assert len(refs) == 1
+                assert metadata[0]["num_rows"] == 0
+                assert metadata[0]["ipc_size_bytes"] > 0
+                _submit_ref_bundle_with_admission(executor, submit_id, refs, None, metadata, names)
+                assert _wait_for_results(executor, 1, timeout_s=10.0) == [
+                    (ref_bundle.SUBMIT_RESULT_MARKER, submit_id, None)
+                ]
+            finally:
+                for ref in refs:
+                    ref.release()
+
+        after_results = lease_state()
+        executor.close()
+        after_close = lease_state()
+
+        assert after_results == expected_lease_state
+        assert after_close == expected_lease_state
+    finally:
+        executor.close(kill=True)
+
+
+def test_zero_row_ref_bundle_release_is_idempotent_with_outer_close_cleanup(monkeypatch):
+    import duckdb.execution.udf_subprocess as subprocess_exec
+    from duckdb.execution import ref_bundle
+
+    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1024)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+
+    class CountingRef:
+        name = "zero-row-ref"
+        size = 144
+
+        def __init__(self):
+            self.release_count = 0
+
+        def release_budget(self):
+            self.release_count += 1
+            return self.size
+
+    ref = CountingRef()
+    lease_id = manager.create_input_lease([ref], ref.size, name="zero-row-input")
+    original_cancel = subprocess_exec.cancel_local_shm_input_lease
+    cancel_barrier = threading.Barrier(2, timeout=5.0)
+    cancel_calls = []
+
+    def synchronized_cancel(candidate_lease_id, *, name):
+        cancel_calls.append((candidate_lease_id, name))
+        cancel_barrier.wait()
+        return original_cancel(candidate_lease_id, name=name)
+
+    monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", synchronized_cancel)
+
+    worker = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    outer = object.__new__(subprocess_exec.UDFExecutor)
+    outer._active_input_leases = {lease_id}
+    outer._active_input_leases_lock = threading.Lock()
+    results = []
+    errors = []
+
+    def finish_zero_row_submit():
+        try:
+            results.append(
+                worker._submit_ref_bundle_direct(
+                    {
+                        "estimated_num_rows": 0,
+                        "input_lease_id": lease_id,
+                    }
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def close_outer_inputs():
+        try:
+            outer._cancel_active_input_leases()
+        except BaseException as exc:
+            errors.append(exc)
+
+    submit_thread = threading.Thread(target=finish_zero_row_submit)
+    close_thread = threading.Thread(target=close_outer_inputs)
+    submit_thread.start()
+    close_thread.start()
+    submit_thread.join(timeout=10.0)
+    close_thread.join(timeout=10.0)
+
+    assert not submit_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert errors == []
+    assert results == [None]
+    assert set(cancel_calls) == {
+        (lease_id, "udf-input-zero-row"),
+        (lease_id, "udf-input-close"),
+    }
+    assert ref.release_count == 1
+    assert outer._active_input_leases == set()
+    snapshot = manager.snapshot()
+    assert snapshot["active_input_leases"] == 0
+    assert snapshot["active_input_ref_holds"] == 0
+    assert snapshot["active_input_ref_hold_count"] == 0
+    assert snapshot["input_lease_bytes"] == 0
+    assert snapshot["active_output_credits"] == 0
+    assert snapshot["output_credit_bytes"] == 0
+
+
 def test_subprocess_admission_holds_worker_slot_until_completed_result_is_consumed():
     from duckdb.execution.ref_bundle import SUBMIT_RESULT_MARKER
     from duckdb.execution.udf_subprocess import UDFExecutor
