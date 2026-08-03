@@ -28,7 +28,7 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cerrno>
+#include <thread>
 
 namespace duckdb {
 
@@ -517,36 +517,48 @@ void Executor::InitializeInternal(PhysicalOperator &plan, bool schedule_events) 
 }
 
 void Executor::CancelTasks() {
+	if (executor_tasks > 0) {
+		context.interrupted = true;
+	}
 	task.reset();
+	// Blocked tasks have to be released before draining, otherwise their task
+	// registrations keep executor_tasks non-zero indefinitely.
 	{
-		vector<shared_ptr<MetaPipeline>> recursive_pipelines_to_destroy;
-		vector<shared_ptr<Pipeline>> pipelines_to_destroy;
-		vector<shared_ptr<Pipeline>> root_pipelines_to_destroy;
 		unordered_map<Task *, shared_ptr<Task>> tasks_to_destroy;
-		vector<shared_ptr<Event>> events_to_destroy;
 		{
 			lock_guard<mutex> elock(executor_lock);
 			// mark the query as cancelled so tasks will early-out
 			cancelled = true;
-			// Detach pipelines, events and blocked tasks while holding executor_lock,
-			// then destroy them after releasing it. Pipeline state destructors can
-			// synchronously wait on external callbacks that reschedule tasks through
-			// this executor.
-			for (auto &rec_cte_ref : recursive_ctes) {
-				auto &rec_cte = rec_cte_ref.get().Cast<PhysicalRecursiveCTE>();
-				if (rec_cte.recursive_meta_pipeline) {
-					recursive_pipelines_to_destroy.push_back(std::move(rec_cte.recursive_meta_pipeline));
-				}
-			}
-			pipelines_to_destroy = std::move(pipelines);
-			root_pipelines_to_destroy = std::move(root_pipelines);
 			tasks_to_destroy = std::move(to_be_rescheduled_tasks);
-			events_to_destroy = std::move(events);
 		}
 	}
-	// Take all pending tasks and execute them until they cancel
+	// Drain all tasks first. They hold references to pipelines, events and
+	// states, so those must stay alive until all tasks have completed.
 	while (executor_tasks > 0) {
 		WorkOnTasks();
+		if (executor_tasks > 0) {
+			std::this_thread::yield();
+		}
+	}
+
+	vector<shared_ptr<MetaPipeline>> recursive_pipelines_to_destroy;
+	vector<shared_ptr<Pipeline>> pipelines_to_destroy;
+	vector<shared_ptr<Pipeline>> root_pipelines_to_destroy;
+	vector<shared_ptr<Event>> events_to_destroy;
+	{
+		lock_guard<mutex> elock(executor_lock);
+		// Detach pipeline state while holding executor_lock, then destroy it
+		// after releasing the lock. State destructors can synchronously wait on
+		// external callbacks that reschedule tasks through this executor.
+		for (auto &rec_cte_ref : recursive_ctes) {
+			auto &rec_cte = rec_cte_ref.get().Cast<PhysicalRecursiveCTE>();
+			if (rec_cte.recursive_meta_pipeline) {
+				recursive_pipelines_to_destroy.push_back(std::move(rec_cte.recursive_meta_pipeline));
+			}
+		}
+		pipelines_to_destroy = std::move(pipelines);
+		root_pipelines_to_destroy = std::move(root_pipelines);
+		events_to_destroy = std::move(events);
 	}
 }
 
@@ -774,24 +786,9 @@ vector<LogicalType> Executor::GetTypes() {
 
 void Executor::PushError(ErrorData exception) {
 	// push the exception onto the stack
-	// Use try-catch to handle the case where error_manager's mutex has been destroyed
-	// This can happen during cleanup when Executor is being destroyed but TaskScheduler
-	// threads are still running and trying to push errors
-	try {
-		error_manager.PushError(std::move(exception));
-		// interrupt execution of any other pipelines that belong to this executor
-		context.interrupted = true;
-	} catch (const std::system_error &e) {
-		// Mutex has been destroyed or is in an invalid state - this can happen during cleanup
-		// Ignore the error to avoid worker crash, as the Executor is being destroyed anyway
-		// The error code "Invalid argument" (EINVAL) typically indicates the mutex is invalid
-		if (e.code().value() == EINVAL) {
-			// Mutex is invalid - Executor is being destroyed, ignore the error
-			return;
-		}
-		// Re-throw other system errors
-		throw;
-	}
+	error_manager.PushError(std::move(exception));
+	// interrupt execution of any other pipelines that belong to this executor
+	context.interrupted = true;
 }
 
 bool Executor::HasError() {

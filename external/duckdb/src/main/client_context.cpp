@@ -189,6 +189,9 @@ ClientContext::ClientContext(shared_ptr<DatabaseInstance> database)
 
 ClientContext::~ClientContext() {
 	if (Exception::UncaughtException()) {
+		if (active_query && active_query->executor) {
+			active_query->executor->CancelTasks();
+		}
 		return;
 	}
 	// destroy the client context and rollback if there is an active transaction
