@@ -185,13 +185,18 @@ static string QueryConnectionSettingForTest(DuckDBPyConnection &connection, cons
 
 static py::dict WithCopyRecoveryContext(py::object conn_obj,
                                         const std::function<py::dict(duckdb::ClientContext &)> &callback) {
+	auto run_callback = [&](duckdb::ClientContext &context) {
+		py::dict result;
+		context.RunFunctionInTransaction([&]() { result = callback(context); });
+		return result;
+	};
 	if (!conn_obj.is_none()) {
 		auto &conn_wrapper = ExtractPyConnectionWrapper(std::move(conn_obj));
-		return callback(*conn_wrapper.con.GetConnection().context);
+		return run_callback(*conn_wrapper.con.GetConnection().context);
 	}
 	duckdb::DuckDB db(nullptr);
 	duckdb::Connection conn(db);
-	return callback(*conn.context);
+	return run_callback(*conn.context);
 }
 
 void register_ray_bindings(py::module_ &mod) {
@@ -1656,40 +1661,41 @@ void register_ray_bindings(py::module_ &mod) {
 
 	m.def(
 	    "cleanup_expired_copy_direct_write_runs",
-	    [](const std::string &base_path, idx_t min_age_ms, idx_t now_epoch_ms) {
+	    [](const std::string &base_path, idx_t min_age_ms, idx_t now_epoch_ms, py::object conn_obj) {
 		    using namespace duckdb;
 		    using namespace duckdb::distributed;
 
-		    DuckDB db(nullptr);
-		    Connection conn(db);
-		    auto &context = *conn.context;
-		    auto &fs = FileSystem::GetFileSystem(context);
-
-		    auto cleanup_res = CleanupExpiredDistributedCopyDirectWriteRuns(fs, base_path, min_age_ms, now_epoch_ms);
-		    if (cleanup_res.is_err()) {
-			    throw py::value_error(cleanup_res.error().what());
-		    }
-		    auto cleanup = std::move(cleanup_res).value();
-		    py::dict out;
-		    out["scanned_runs"] = cleanup.scanned_runs;
-		    out["cleaned_runs"] = cleanup.cleaned_runs;
-		    out["committed_runs"] = cleanup.committed_runs;
-		    out["active_runs"] = cleanup.active_runs;
-		    out["skipped_unregistered_runs"] = cleanup.skipped_unregistered_runs;
-		    out["errors"] = cleanup.errors;
-		    py::list cleaned_run_ids;
-		    for (const auto &run_id : cleanup.cleaned_run_ids) {
-			    cleaned_run_ids.append(run_id);
-		    }
-		    out["cleaned_run_ids"] = cleaned_run_ids;
-		    py::list error_messages;
-		    for (const auto &message : cleanup.error_messages) {
-			    error_messages.append(message);
-		    }
-		    out["error_messages"] = error_messages;
-		    return out;
+		    return WithCopyRecoveryContext(std::move(conn_obj), [&](ClientContext &context) {
+			    auto &fs = FileSystem::GetFileSystem(context);
+			    auto cleanup_res = [&]() {
+				    py::gil_scoped_release release;
+				    return CleanupExpiredDistributedCopyDirectWriteRuns(fs, base_path, min_age_ms, now_epoch_ms);
+			    }();
+			    if (cleanup_res.is_err()) {
+				    throw py::value_error(cleanup_res.error().what());
+			    }
+			    auto cleanup = std::move(cleanup_res).value();
+			    py::dict out;
+			    out["scanned_runs"] = cleanup.scanned_runs;
+			    out["cleaned_runs"] = cleanup.cleaned_runs;
+			    out["committed_runs"] = cleanup.committed_runs;
+			    out["active_runs"] = cleanup.active_runs;
+			    out["skipped_unregistered_runs"] = cleanup.skipped_unregistered_runs;
+			    out["errors"] = cleanup.errors;
+			    py::list cleaned_run_ids;
+			    for (const auto &run_id : cleanup.cleaned_run_ids) {
+				    cleaned_run_ids.append(run_id);
+			    }
+			    out["cleaned_run_ids"] = cleaned_run_ids;
+			    py::list error_messages;
+			    for (const auto &message : cleanup.error_messages) {
+				    error_messages.append(message);
+			    }
+			    out["error_messages"] = error_messages;
+			    return out;
+		    });
 	    },
-	    py::arg("base_path"), py::arg("min_age_ms"), py::arg("now_epoch_ms") = 0,
+	    py::arg("base_path"), py::arg("min_age_ms"), py::arg("now_epoch_ms") = 0, py::arg("conn") = py::none(),
 	    "TTL cleanup scan for uncommitted direct-write distributed COPY runs.");
 
 	m.def(

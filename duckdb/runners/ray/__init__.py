@@ -14,10 +14,7 @@ from duckdb.runners.ray.committed_copy import (
     inspect_copy_direct_write_run,
     read_committed_copy_direct_write_parquet,
 )
-from duckdb.runners.ray.lifecycle import (
-    cleanup_copy_direct_write_lifecycle_once,
-    run_copy_direct_write_lifecycle_cleanup_loop,
-)
+from duckdb.runners.ray.lifecycle import cleanup_copy_direct_write_lifecycle_once
 from duckdb.runners.ray.runner import RayRunner
 
 if TYPE_CHECKING:
@@ -31,7 +28,6 @@ __all__ = [
     "force_abort_copy_direct_write_run",
     "inspect_copy_direct_write_run",
     "read_committed_copy_direct_write_parquet",
-    "run_copy_direct_write_lifecycle_cleanup_loop",
     "set_runner_ray",
 ]
 

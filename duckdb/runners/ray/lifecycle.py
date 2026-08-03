@@ -5,16 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import signal
 import sys
-import threading
-import time
 from dataclasses import dataclass
 from os import PathLike, fspath
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Iterable, Sequence
 
 BasePath = str | PathLike[str]
 
@@ -111,13 +108,15 @@ def cleanup_copy_direct_write_lifecycle_once(
     min_age_ms: int,
     now_epoch_ms: int = 0,
     fail_fast: bool = False,
+    conn: Any | None = None,
 ) -> dict[str, Any]:
     """Run one direct-write COPY lifecycle cleanup scan.
 
-    This is the standalone-process entry point for stale uncommitted
-    direct-write COPY results. It delegates correctness decisions to the C++
-    manifest/marker aware scanner: committed runs are skipped, active runs are
-    kept, and only lifecycle-registered stale uncommitted runs are removed.
+    This is the one-shot entry point for stale uncommitted direct-write COPY
+    results. It delegates correctness decisions to the C++ manifest/marker
+    aware scanner: committed runs are skipped, active runs are kept, and only
+    lifecycle-registered stale uncommitted runs are removed. Pass the DuckDB
+    connection that owns any connection-scoped filesystem or secret config.
 
     The caller must ensure that no COPY is running for any supplied base path.
     Elapsed time does not prove that an uncommitted run is abandoned.
@@ -132,6 +131,7 @@ def cleanup_copy_direct_write_lifecycle_once(
                 base_path,
                 min_age_ms=int(min_age_ms),
                 now_epoch_ms=int(now_epoch_ms),
+                conn=conn,
             )
             scans.append(CopyDirectWriteLifecycleScan.from_api_result(base_path, raw))
         except Exception as exc:
@@ -139,64 +139,6 @@ def cleanup_copy_direct_write_lifecycle_once(
                 raise
             scans.append(CopyDirectWriteLifecycleScan.from_exception(base_path, exc))
     return _aggregate_scans(scans)
-
-
-def run_copy_direct_write_lifecycle_cleanup_loop(
-    base_paths: BasePath | Iterable[BasePath],
-    *,
-    min_age_ms: int,
-    interval_seconds: float = 300.0,
-    stop_event: threading.Event | None = None,
-    max_iterations: int | None = None,
-    fail_fast: bool = False,
-    now_epoch_ms_fn: Callable[[], int] | None = None,
-    sleep_fn: Callable[[float], None] | None = None,
-    on_iteration: Callable[[dict[str, Any]], None] | None = None,
-) -> dict[str, Any]:
-    """Run direct-write lifecycle cleanup periodically until stopped.
-
-    The caller must keep every supplied base path free of concurrent COPY
-    operations for the lifetime of the loop.
-    """
-    if max_iterations is not None and max_iterations <= 0:
-        raise ValueError("max_iterations must be positive when provided")
-    if interval_seconds < 0:
-        raise ValueError("interval_seconds must be non-negative")
-
-    paths = _normalize_base_paths(base_paths)
-    stop = stop_event or threading.Event()
-    sleep = sleep_fn or time.sleep
-    summaries: list[dict[str, Any]] = []
-    iteration = 0
-
-    while not stop.is_set():
-        now_epoch_ms = int(now_epoch_ms_fn()) if now_epoch_ms_fn is not None else 0
-        summary = cleanup_copy_direct_write_lifecycle_once(
-            paths,
-            min_age_ms=min_age_ms,
-            now_epoch_ms=now_epoch_ms,
-            fail_fast=fail_fast,
-        )
-        summary["iteration"] = iteration
-        summaries.append(summary)
-        if on_iteration is not None:
-            on_iteration(summary)
-
-        iteration += 1
-        if max_iterations is not None and iteration >= max_iterations:
-            break
-        if interval_seconds == 0:
-            continue
-        if stop_event is not None:
-            stop.wait(interval_seconds)
-        else:
-            sleep(interval_seconds)
-
-    return {
-        "iterations": iteration,
-        "last_summary": summaries[-1] if summaries else None,
-        "summaries": summaries,
-    }
 
 
 def _format_summary(summary: dict[str, Any]) -> str:
@@ -209,14 +151,6 @@ def _format_summary(summary: dict[str, Any]) -> str:
         f"active={summary['active_runs']} "
         f"errors={summary['errors']}"
     )
-
-
-def _install_signal_handlers(stop_event: threading.Event) -> None:
-    def _stop(_signum: int, _frame: Any) -> None:
-        stop_event.set()
-
-    signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGINT, _stop)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -239,46 +173,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Minimum uncommitted run age before cleanup. Defaults to 24h.",
     )
     parser.add_argument(
-        "--interval-seconds",
-        type=float,
-        default=300.0,
-        help="Sleep interval between scans when running as a loop.",
+        "--now-epoch-ms",
+        type=int,
+        default=0,
+        help="Override the current epoch time for deterministic maintenance runs.",
     )
-    parser.add_argument("--once", action="store_true", help="Run one cleanup scan and exit.")
-    parser.add_argument("--max-iterations", type=int, default=None)
-    parser.add_argument("--now-epoch-ms", type=int, default=0)
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args(argv)
 
-    if args.once:
-        summary = cleanup_copy_direct_write_lifecycle_once(
-            args.base_path,
-            min_age_ms=args.min_age_ms,
-            now_epoch_ms=args.now_epoch_ms,
-            fail_fast=args.fail_fast,
-        )
-        print(json.dumps(summary, sort_keys=True) if args.as_json else _format_summary(summary))
-        return 1 if summary["errors"] else 0
-
-    stop_event = threading.Event()
-    _install_signal_handlers(stop_event)
-
-    loop_result = run_copy_direct_write_lifecycle_cleanup_loop(
+    summary = cleanup_copy_direct_write_lifecycle_once(
         args.base_path,
         min_age_ms=args.min_age_ms,
-        interval_seconds=args.interval_seconds,
-        stop_event=stop_event,
-        max_iterations=args.max_iterations,
+        now_epoch_ms=args.now_epoch_ms,
         fail_fast=args.fail_fast,
-        now_epoch_ms_fn=(lambda: args.now_epoch_ms) if args.now_epoch_ms else None,
-        on_iteration=lambda summary: print(
-            json.dumps(summary, sort_keys=True) if args.as_json else _format_summary(summary),
-            flush=True,
-        ),
     )
-    last_summary = loop_result.get("last_summary") or {}
-    return 1 if last_summary.get("errors") else 0
+    print(json.dumps(summary, sort_keys=True) if args.as_json else _format_summary(summary))
+    return 1 if summary["errors"] else 0
 
 
 if __name__ == "__main__":
