@@ -19,13 +19,19 @@ The patch is applied once when this module is imported.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from typing_extensions import Unpack
 
 from duckdb import DuckDBPyRelation, Expression
 from vane.ai.options import EmbedOptions, PromptOptions
 from vane.ai.provider import Provider
+from vane.ai.typing import JSONSchema
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
+else:
+    BaseModel = Any
 
 
 def _embed(
@@ -84,22 +90,26 @@ def _prompt(
     self: DuckDBPyRelation,
     messages: Expression | list[Expression],
     *,
+    return_format: type[BaseModel] | JSONSchema | None = None,
     system_message: str | None = None,
     provider: str | Provider = "openai",
     model: str | None = None,
+    return_raw_response: bool = False,
     on_error: Literal["raise", "ignore"] = "raise",
     output_column: str = "response",
     **options: Unpack[PromptOptions],
 ) -> DuckDBPyRelation:
-    """Append basic Prompt responses. See :func:`vane.ai.prompt`."""
+    """Append text, structured, or raw Prompt responses. See :func:`vane.ai.prompt`."""
     from vane.ai.functions import prompt
 
     return prompt(
         self,
         messages,
+        return_format=return_format,
         system_message=system_message,
         provider=provider,
         model=model,
+        return_raw_response=return_raw_response,
         on_error=on_error,
         output_column=output_column,
         **options,

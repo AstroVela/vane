@@ -21,6 +21,7 @@ import numpy as np
 import pyarrow as pa
 
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
+from vane.ai._schema import serialize_raw_response
 from vane.ai.options import validate_embed_options, validate_prompt_options
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
@@ -135,6 +136,17 @@ def _is_prompt_capability_error(exc: Exception) -> bool:
 _EXTRA_SENSITIVE_KEYS = frozenset({"organization"})
 
 
+def _structured_output_name(schema: dict[str, Any]) -> str:
+    title = schema.get("title")
+    if (
+        isinstance(title, str)
+        and 1 <= len(title) <= 64
+        and all(character.isascii() and (character.isalnum() or character in "_-") for character in title)
+    ):
+        return title
+    return "vane_response"
+
+
 def _wrap_openai_options(options: Mapping[str, Any]) -> dict[str, Any]:
     """Seal shared sensitive keys plus OpenAI-specific ones (``organization``) at any depth."""
     return wrap_sensitive_options(options, extra_keys=_EXTRA_SENSITIVE_KEYS)
@@ -197,6 +209,8 @@ class OpenAIProvider(Provider):
         self,
         model: str | None = None,
         system_message: str | None = None,
+        return_format: dict[str, Any] | None = None,
+        return_raw_response: bool = False,
         **options: Any,
     ) -> PrompterDescriptor:
         provider_opts = {key: value for key, value in self._options.items() if key in self._PROMPT_CLIENT_KEYS}
@@ -219,6 +233,8 @@ class OpenAIProvider(Provider):
             model_name=model or self.DEFAULT_PROMPTER_MODEL,
             system_message=system_message,
             use_chat_completions=use_chat_completions,
+            return_format=return_format,
+            return_raw_response=return_raw_response,
             prompt_options=prompt_options,
         )
 
@@ -491,6 +507,8 @@ class OpenAIPrompterDescriptor(PrompterDescriptor):
     model_name: str = "gpt-4o-mini"
     system_message: str | None = None
     use_chat_completions: bool = False
+    return_format: dict[str, Any] | None = None
+    return_raw_response: bool = False
     prompt_options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -531,6 +549,8 @@ class OpenAIPrompterDescriptor(PrompterDescriptor):
             model=self.model_name,
             system_message=self.system_message,
             use_chat_completions=self.use_chat_completions,
+            return_format=self.return_format,
+            return_raw_response=self.return_raw_response,
             **self.prompt_options,
         )
 
@@ -544,6 +564,8 @@ class OpenAIPrompter:
         model: str,
         system_message: str | None = None,
         use_chat_completions: bool = False,
+        return_format: dict[str, Any] | None = None,
+        return_raw_response: bool = False,
         provider_name: str = "openai",
         **options: Any,
     ) -> None:
@@ -557,6 +579,8 @@ class OpenAIPrompter:
         self._model = model
         self._system_message = system_message
         self._use_chat_completions = use_chat_completions
+        self._return_format = return_format
+        self._return_raw_response = return_raw_response
         self._options = {
             key: value
             for key, value in options.items()
@@ -571,6 +595,17 @@ class OpenAIPrompter:
     async def aclose(self) -> None:
         """Release the SDK client's connection pool on the owning loop."""
         await self._client.close()
+
+    def _requested_capability(self) -> str:
+        structured = getattr(self, "_return_format", None) is not None
+        raw = getattr(self, "_return_raw_response", False)
+        if structured and raw:
+            return "structured Prompt generation with raw response body"
+        if structured:
+            return "structured Prompt generation"
+        if raw:
+            return "Prompt raw response body"
+        return "basic Prompt text/image generation"
 
     # --- Multimodal message processing -----------------------------------
 
@@ -629,10 +664,31 @@ class OpenAIPrompter:
         options.pop("max_output_tokens", None)
         if "stop_sequences" in options:
             options["stop"] = options.pop("stop_sequences")
+        return_format = getattr(self, "_return_format", None)
+        if return_format is not None:
+            options["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": _structured_output_name(return_format),
+                    "schema": return_format,
+                    "strict": True,
+                },
+            }
         return options
 
     def _responses_options(self) -> dict[str, Any]:
-        return dict(self._options)
+        options = dict(self._options)
+        return_format = getattr(self, "_return_format", None)
+        if return_format is not None:
+            options["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": _structured_output_name(return_format),
+                    "schema": return_format,
+                    "strict": True,
+                }
+            }
+        return options
 
     async def _prompt_chat_completions(self, messages: list[dict[str, Any]]) -> str | None:
         """Prompt using the Chat Completions API."""
@@ -648,11 +704,13 @@ class OpenAIPrompter:
                 raise ProviderCapabilityError(
                     self._provider_name,
                     self._model,
-                    "basic Prompt text/image generation",
+                    self._requested_capability(),
                     original_error=exc,
                 ) from exc
             raise
         self._record_usage(response)
+        if getattr(self, "_return_raw_response", False):
+            return serialize_raw_response(response)
         return response.choices[0].message.content
 
     async def _prompt_responses(self, messages: list[dict[str, Any]]) -> str | None:
@@ -669,11 +727,13 @@ class OpenAIPrompter:
                 raise ProviderCapabilityError(
                     self._provider_name,
                     self._model,
-                    "basic Prompt text/image generation",
+                    self._requested_capability(),
                     original_error=exc,
                 ) from exc
             raise
         self._record_usage(response)
+        if getattr(self, "_return_raw_response", False):
+            return serialize_raw_response(response)
         return response.output_text
 
     async def prompt(self, messages: tuple[Any, ...]) -> str | None:

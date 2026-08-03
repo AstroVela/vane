@@ -261,6 +261,12 @@ class LocalVLLMExecutor(VLLMExecutor):
                 except json.JSONDecodeError as exc:
                     raise ValueError("vllm sampling_params JSON could not be parsed") from exc
             if isinstance(sampling_params, dict):
+                structured_outputs = sampling_params.get("structured_outputs")
+                if isinstance(structured_outputs, Mapping):
+                    from vllm.sampling_params import StructuredOutputsParams
+
+                    sampling_params = dict(sampling_params)
+                    sampling_params["structured_outputs"] = StructuredOutputsParams(**structured_outputs)
                 self.sampling_params = SamplingParams(**sampling_params)
             else:
                 raise TypeError("vllm sampling_params must be a dict, JSON string, or SamplingParams instance")

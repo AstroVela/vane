@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""SQL coverage for the closed P2 Prompt API and the P1 Embed API."""
+"""SQL coverage for the closed P3 Prompt API and the P1 Embed API."""
 
 from __future__ import annotations
 
@@ -58,23 +58,38 @@ class MockTextEmbedderDescriptor(TextEmbedderDescriptor):
 
 
 class MockPrompter:
-    def __init__(self, model: str, system_message: str | None) -> None:
+    def __init__(
+        self,
+        model: str,
+        system_message: str | None,
+        return_format: dict[str, object] | None = None,
+        return_raw_response: bool = False,
+    ) -> None:
         self._model = model
         self._system_message = system_message
+        self._return_format = return_format
+        self._return_raw_response = return_raw_response
 
-    async def prompt(self, messages: tuple[object, ...]) -> str:
+    async def prompt(self, messages: tuple[object, ...]) -> object:
         parts = [self._model]
         if self._system_message is not None:
             parts.append(f"system={self._system_message}")
         for message in messages:
             parts.append(message if isinstance(message, str) else bytes(message).hex())
-        return ":".join(parts)
+        result = ":".join(parts)
+        if self._return_raw_response:
+            return json.dumps({"id": f"raw-{self._model}", "output": [{"text": result}]})
+        if self._return_format is not None:
+            return json.dumps({"answer": result, "score": len(result)})
+        return result
 
 
 @dataclass
 class MockPrompterDescriptor(PrompterDescriptor):
     model_name: str = "topic"
     system_message: str | None = None
+    return_format: dict[str, object] | None = None
+    return_raw_response: bool = False
 
     def get_provider(self) -> str:
         return "mock_ai_sql"
@@ -89,7 +104,12 @@ class MockPrompterDescriptor(PrompterDescriptor):
         return UDFOptions(num_gpus=0, batch_size=2, max_retries=0)
 
     def instantiate(self) -> MockPrompter:
-        return MockPrompter(self.model_name, self.system_message)
+        return MockPrompter(
+            self.model_name,
+            self.system_message,
+            self.return_format,
+            self.return_raw_response,
+        )
 
 
 class MockProvider(Provider):
@@ -112,13 +132,21 @@ class MockProvider(Provider):
         self,
         model: str | None = None,
         system_message: str | None = None,
+        return_format: dict[str, object] | None = None,
+        return_raw_response: bool = False,
         **options: object,
     ) -> MockPrompterDescriptor:
-        return MockPrompterDescriptor(model or "topic", system_message)
+        return MockPrompterDescriptor(
+            model or "topic",
+            system_message,
+            return_format,
+            return_raw_response,
+        )
 
 
 class RecordingNativeVLLMExecutor:
-    def __init__(self) -> None:
+    def __init__(self, responses: dict[str, str] | None = None) -> None:
+        self.responses = responses
         self.submissions: list[tuple[str | None, tuple[str, ...]]] = []
         self.ready = deque()
         self.finished_count = 0
@@ -127,7 +155,12 @@ class RecordingNativeVLLMExecutor:
     def submit(self, prefix, prompts, rows) -> None:
         prompt_values = tuple(prompts)
         self.submissions.append((prefix, prompt_values))
-        self.ready.append(([f"native:{prompt}" for prompt in prompt_values], rows))
+        output_values = (
+            [f"native:{prompt}" for prompt in prompt_values]
+            if self.responses is None
+            else [self.responses[prompt] for prompt in prompt_values]
+        )
+        self.ready.append((output_values, rows))
 
     def take_ready_result(self):
         try:
@@ -210,6 +243,112 @@ def test_ai_prompt_sql_exact_text_overload_and_named_parameters():
         (1, "model-a:system=be brief:alpha"),
         (2, "model-a:system=be brief:beta"),
     ]
+
+
+def test_ai_prompt_sql_structured_output_has_native_struct_type():
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string"},
+                "score": {"type": "integer"},
+            },
+            "required": ["answer", "score"],
+            "additionalProperties": False,
+        }
+    )
+    conn = vane.connect()
+    relation = conn.sql(f"""
+        SELECT ai_prompt(
+            prompt,
+            return_format := json '{schema}',
+            provider := 'mock_ai_sql',
+            model := 'structured'
+        ) AS response
+        FROM (VALUES ('alpha'::VARCHAR), (NULL::VARCHAR)) AS source(prompt)
+    """)
+
+    assert str(relation.types[0]) == "STRUCT(answer VARCHAR, score BIGINT)"
+    assert sorted(relation.fetchall(), key=lambda row: row[0] is None) == [
+        ({"answer": "structured:alpha", "score": 16},),
+        (None,),
+    ]
+
+
+def test_ai_prompt_sql_structured_output_composes_with_positional_image():
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string"},
+                "score": {"type": "integer"},
+            },
+            "required": ["answer", "score"],
+            "additionalProperties": False,
+        }
+    )
+    relation = vane.connect().sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            from_hex('89504e47'),
+            return_format := json '{schema}',
+            provider := 'mock_ai_sql',
+            model := 'structured'
+        ) AS response
+    """)
+
+    assert str(relation.types[0]) == "STRUCT(answer VARCHAR, score BIGINT)"
+    assert relation.fetchone() == ({"answer": "structured:describe:89504e47", "score": 28},)
+
+
+def test_ai_prompt_sql_structured_plus_raw_returns_provider_body_varchar():
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string"},
+                "score": {"type": "integer"},
+            },
+            "required": ["answer", "score"],
+            "additionalProperties": False,
+        }
+    )
+    relation = vane.connect().sql(f"""
+        SELECT ai_prompt(
+            'alpha',
+            return_format := json '{schema}',
+            provider := 'mock_ai_sql',
+            model := 'structured',
+            return_raw_response := true
+        ) AS response
+    """)
+
+    assert str(relation.types[0]) == "VARCHAR"
+    raw = relation.fetchone()[0]
+    assert json.loads(raw) == {
+        "id": "raw-structured",
+        "output": [{"text": "structured:alpha"}],
+    }
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "array", "items": {"type": "string"}},
+        {"type": "object", "properties": {"bad.name": {"type": "string"}}},
+        {"type": "object", "properties": {"x": {"type": "number", "minimum": 0}}},
+    ],
+)
+def test_ai_prompt_sql_rejects_invalid_schema_during_planning(schema):
+    encoded = json.dumps(schema)
+    with pytest.raises(Exception, match="return_format|root type|property names|unsupported"):
+        vane.connect().sql(f"""
+            SELECT ai_prompt(
+                'alpha',
+                return_format := json '{encoded}',
+                provider := 'mock_ai_sql'
+            )
+        """).fetchall()
 
 
 def test_ai_prompt_sql_exact_blob_overload_preserves_text_then_image_order():
@@ -358,6 +497,37 @@ def test_ai_prompt_sql_expression_udf_survives_plan_round_trip():
     assert 0 < len(serialized) < 1_000_000
 
 
+def test_ai_prompt_sql_structured_type_survives_plan_round_trip():
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string"},
+                "score": {"type": "integer"},
+            },
+            "required": ["answer", "score"],
+            "additionalProperties": False,
+        }
+    )
+    relation = vane.connect().sql(f"""
+        SELECT ai_prompt(
+            'alpha',
+            return_format := json '{schema}',
+            provider := 'mock_ai_sql',
+            model := 'structured',
+            options := struct_pack(actor_number := 1)
+        ) AS response
+    """)
+
+    target, physical, _ = _round_trip_ai_plan(relation)
+    node = physical.collect_udf_nodes()[0]
+    table = _execute_ai_physical_plan(target, physical)
+
+    assert table.schema.field(0).type == pa.struct([pa.field("answer", pa.string()), pa.field("score", pa.int64())])
+    assert table.column(0).to_pylist() == [{"answer": "structured:alpha", "score": 16}]
+    assert node["payload"]["ai_return_type"] == 'STRUCT("answer" VARCHAR, "score" BIGINT)'
+
+
 @pytest.mark.parametrize(
     "sql",
     [
@@ -445,6 +615,30 @@ def test_ai_prompt_sql_call_level_configuration_must_be_foldable(argument):
         """).fetchall()
 
 
+def test_ai_prompt_sql_schema_and_raw_flag_must_be_foldable():
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match="constant"):
+        conn.sql("""
+            SELECT ai_prompt(
+                'alpha',
+                return_format := schema,
+                provider := 'mock_ai_sql'
+            )
+            FROM (VALUES (json '{"type":"object","properties":{"x":{"type":"string"}}}')) source(schema)
+        """).fetchall()
+
+    with pytest.raises(Exception, match="constant"):
+        conn.sql("""
+            SELECT ai_prompt(
+                'alpha',
+                provider := 'mock_ai_sql',
+                return_raw_response := enabled
+            )
+            FROM (VALUES (true)) source(enabled)
+        """).fetchall()
+
+
 @pytest.mark.parametrize(
     "options",
     [
@@ -524,6 +718,52 @@ def test_ai_prompt_sql_vllm_uses_one_native_executor_and_skips_null_rows(monkeyp
     assert builds[0][1]["on_error"] == "null"
     assert executor.finished_count == 1
     assert executor.shutdown_count == 1
+
+
+def test_ai_prompt_sql_vllm_rejects_raw_response_during_planning():
+    with pytest.raises(Exception, match="does not support return_raw_response"):
+        vane.connect().sql("""
+            SELECT ai_prompt(
+                'alpha',
+                provider := 'vllm',
+                return_raw_response := true
+            )
+        """).fetchall()
+
+
+def test_ai_prompt_sql_vllm_validates_structured_output(monkeypatch):
+    import duckdb.execution.vllm as vllm_executor
+
+    executor = RecordingNativeVLLMExecutor({"alpha": '{"answer":"ok"}', "beta": '{"answer":1}'})
+    builds = []
+
+    def build_executor(model, options):
+        builds.append((model, options))
+        return executor
+
+    monkeypatch.setattr(vllm_executor, "build_executor", build_executor)
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        }
+    )
+    relation = vane.connect().sql(f"""
+        SELECT id, ai_prompt(
+            prompt,
+            return_format := json '{schema}',
+            provider := 'vllm',
+            model := 'recording-model',
+            on_error := 'ignore'
+        ) AS response
+        FROM (VALUES (1, 'alpha'), (2, 'beta'), (3, NULL::VARCHAR)) source(id, prompt)
+    """)
+
+    assert str(relation.types[-1]) == "STRUCT(answer VARCHAR)"
+    assert sorted(relation.fetchall()) == [(1, {"answer": "ok"}), (2, None), (3, None)]
+    assert builds[0][1]["generate_args"]["sampling_params"]["structured_outputs"] == {"json": json.loads(schema)}
 
 
 def test_ai_prompt_sql_vllm_survives_plan_round_trip_as_native_operator(monkeypatch):

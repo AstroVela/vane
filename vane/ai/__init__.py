@@ -21,17 +21,22 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from vane.ai._schema import OutputValidationError, SchemaValidationError
     from vane.ai.functions import embed, prompt
     from vane.ai.options import EmbedOptions, PromptOptions
     from vane.ai.provider import ProviderCapabilityError
+    from vane.ai.typing import JSONSchema
 
 __all__ = [
     "Descriptor",
     "EmbedOptions",
+    "JSONSchema",
+    "OutputValidationError",
     "PromptOptions",
     "Provider",
     "ProviderCapabilityError",
     "RetryAfterError",
+    "SchemaValidationError",
     "TokenMetricsEntry",
     "UDFOptions",
     "classify_text",
@@ -48,10 +53,13 @@ __all__ = [
 _LAZY_EXPORTS = {
     "Descriptor": ("vane.ai.typing", "Descriptor"),
     "EmbedOptions": ("vane.ai.options", "EmbedOptions"),
+    "JSONSchema": ("vane.ai.typing", "JSONSchema"),
+    "OutputValidationError": ("vane.ai._schema", "OutputValidationError"),
     "PromptOptions": ("vane.ai.options", "PromptOptions"),
     "Provider": ("vane.ai.provider", "Provider"),
     "ProviderCapabilityError": ("vane.ai.provider", "ProviderCapabilityError"),
     "RetryAfterError": ("vane.ai.functions", "RetryAfterError"),
+    "SchemaValidationError": ("vane.ai._schema", "SchemaValidationError"),
     "TokenMetricsEntry": ("vane.ai.metrics", "TokenMetricsEntry"),
     "UDFOptions": ("vane.ai.typing", "UDFOptions"),
     "classify_text": ("vane.ai.functions", "classify_text"),

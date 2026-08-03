@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
@@ -17,9 +18,9 @@ from vane.ai.functions import (
     _prepare_prompt_call,
     _PromptBatch,
     _resolve_ai_batch_size,
+    _ValidateStructuredOutputBatch,
 )
 from vane.ai.protocols import NativePrompterPlan
-
 
 _INT_OPTION_NAMES = {
     "actor_number",
@@ -129,13 +130,22 @@ def build_ai_prompt_sql_spec(
     on_error: str = "raise",
     options: dict[str, Any] | None = None,
     image_input: bool = False,
+    return_format: str | dict[str, Any] | None = None,
+    return_raw_response: bool = False,
 ) -> dict[str, Any]:
     """Build the row-preserving SQL prompt UDF specification."""
     opts = _normalize_sql_options(options)
-    descriptor, udf_opts, _ = _prepare_prompt_call(
+    if isinstance(return_format, str):
+        try:
+            return_format = json.loads(return_format)
+        except json.JSONDecodeError as exc:
+            raise ValueError("AI_PROMPT return_format must be valid JSON") from exc
+    descriptor, udf_opts, _, structured_output = _prepare_prompt_call(
         provider,
         model,
+        return_format,
         system_message,
+        return_raw_response,
         on_error,
         opts,
         relation=False,
@@ -153,15 +163,41 @@ def build_ai_prompt_sql_spec(
         native_options = descriptor.build_physical_vllm_options()
         options_json = _serialize_native_vllm_options(native_options)
 
-        return {
+        spec = {
             "execution_kind": "native_vllm",
             "name": "ai_prompt",
             "provider": descriptor.get_provider(),
             "model": descriptor.get_model(),
-            "return_type": "VARCHAR",
+            "return_type": structured_output.duckdb_type if structured_output is not None else "VARCHAR",
             "system_message": descriptor.system_message,
             "options_json": options_json,
         }
+        if structured_output is not None:
+            validator = _ValidateStructuredOutputBatch(
+                structured_output,
+                "response",
+                "response",
+                udf_opts.on_error,
+            )
+            actor_callable = _adapt_batch_wrapper_for_backend(
+                validator,
+                "subprocess_actor",
+                force_actor=True,
+            )
+            spec["validation_spec"] = {
+                "function": actor_callable,
+                "name": "validate_vllm_structured_output",
+                "provider": descriptor.get_provider(),
+                "model": descriptor.get_model(),
+                "return_type": "VARCHAR",
+                "input_names": ["response"],
+                "schema": {"response": "VARCHAR"},
+                "batch_size": None,
+                "row_preserving": True,
+                "actor_number": 1,
+                "gpus": 0,
+            }
+        return spec
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
 
@@ -172,6 +208,8 @@ def build_ai_prompt_sql_spec(
         "response",
         udf_opts.max_concurrency_per_actor,
         single_message=True,
+        return_format=None if return_raw_response else structured_output,
+        return_raw_response=return_raw_response,
         max_retries=udf_opts.max_retries,
         on_error=udf_opts.on_error,
     )
@@ -181,7 +219,9 @@ def build_ai_prompt_sql_spec(
         "name": "ai_prompt",
         "provider": descriptor.get_provider(),
         "model": descriptor.get_model(),
-        "return_type": "VARCHAR",
+        "return_type": (
+            structured_output.duckdb_type if structured_output is not None and not return_raw_response else "VARCHAR"
+        ),
         "input_names": input_names,
         "schema": {"response": "VARCHAR"},
         "batch_size": _resolve_ai_batch_size(udf_opts),

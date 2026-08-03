@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
+from vane.ai._schema import OutputValidationError, serialize_raw_response
 from vane.ai.options import validate_prompt_options
 from vane.ai.protocols import PrompterDescriptor
 from vane.ai.provider import Provider, ProviderCapabilityError
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
 
 _REQUEST_OPTIONS = frozenset({"max_tokens", "temperature", "top_p", "top_k", "stop_sequences"})
 _EXECUTION_OPTIONS = frozenset({"batch_size", "actor_number", "max_concurrency_per_actor", "max_retries"})
+_STRUCTURED_OUTPUT_TOOL = "vane_structured_output"
 
 
 def _guess_media_type(data: bytes) -> str | None:
@@ -94,6 +96,8 @@ class AnthropicProvider(Provider):
         self,
         model: str | None = None,
         system_message: str | None = None,
+        return_format: dict[str, Any] | None = None,
+        return_raw_response: bool = False,
         **options: Any,
     ) -> PrompterDescriptor:
         model_name = model if model is not None else self._prompt_model
@@ -129,6 +133,8 @@ class AnthropicProvider(Provider):
             provider_options=provider_options,
             model_name=model_name,
             system_message=system_message,
+            return_format=return_format,
+            return_raw_response=return_raw_response,
             prompt_options=prompt_options,
         )
 
@@ -141,6 +147,8 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
     provider_name: str = "anthropic"
     provider_options: dict[str, Any] = field(default_factory=dict)
     system_message: str | None = None
+    return_format: dict[str, Any] | None = None
+    return_raw_response: bool = False
     prompt_options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -183,6 +191,8 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
             provider_name=self.provider_name,
             model=self.model_name,
             system_message=self.system_message,
+            return_format=self.return_format,
+            return_raw_response=self.return_raw_response,
             **self.prompt_options,
         )
 
@@ -195,6 +205,8 @@ class AnthropicPrompter:
         provider_options: dict[str, Any],
         model: str,
         system_message: str | None = None,
+        return_format: dict[str, Any] | None = None,
+        return_raw_response: bool = False,
         provider_name: str = "anthropic",
         **options: Any,
     ) -> None:
@@ -205,6 +217,8 @@ class AnthropicPrompter:
         self._provider_name = provider_name
         self._model = model
         self._system_message = system_message
+        self._return_format = return_format
+        self._return_raw_response = return_raw_response
         self._options = {key: value for key, value in options.items() if key in _REQUEST_OPTIONS and value is not None}
         client_options = {
             key: value for key, value in provider_options.items() if key in {"api_key", "base_url", "timeout"}
@@ -214,6 +228,17 @@ class AnthropicPrompter:
 
     async def aclose(self) -> None:
         await self._client.close()
+
+    def _requested_capability(self) -> str:
+        structured = getattr(self, "_return_format", None) is not None
+        raw = getattr(self, "_return_raw_response", False)
+        if structured and raw:
+            return "structured Prompt generation with raw response body"
+        if structured:
+            return "structured Prompt generation"
+        if raw:
+            return "Prompt raw response body"
+        return "basic Prompt text/image generation"
 
     @staticmethod
     def _process_message(message: Any) -> dict[str, Any]:
@@ -233,7 +258,7 @@ class AnthropicPrompter:
             }
         raise TypeError(f"Unsupported Prompt content type: {type(message).__name__}")
 
-    async def prompt(self, messages: tuple[Any, ...]) -> str | None:
+    async def prompt(self, messages: tuple[Any, ...]) -> Any:
         content = [self._process_message(message) for message in messages]
         kwargs: dict[str, Any] = {
             "model": self._model,
@@ -242,6 +267,21 @@ class AnthropicPrompter:
         }
         if self._system_message is not None:
             kwargs["system"] = self._system_message
+        return_format = getattr(self, "_return_format", None)
+        if return_format is not None:
+            kwargs["tools"] = [
+                {
+                    "name": _STRUCTURED_OUTPUT_TOOL,
+                    "description": "Return the response in the requested structured format.",
+                    "input_schema": return_format,
+                    "strict": True,
+                }
+            ]
+            kwargs["tool_choice"] = {
+                "type": "tool",
+                "name": _STRUCTURED_OUTPUT_TOOL,
+                "disable_parallel_tool_use": True,
+            }
 
         try:
             response = await self._client.messages.create(**kwargs)
@@ -250,7 +290,7 @@ class AnthropicPrompter:
                 raise ProviderCapabilityError(
                     self._provider_name,
                     self._model,
-                    "basic Prompt text/image generation",
+                    self._requested_capability(),
                     original_error=exc,
                 ) from exc
             raise
@@ -267,6 +307,9 @@ class AnthropicPrompter:
                 output_tokens=getattr(usage, "output_tokens", None),
             )
 
+        if getattr(self, "_return_raw_response", False):
+            return serialize_raw_response(response)
+
         if getattr(response, "stop_reason", None) == "max_tokens":
             if self._options.get("max_tokens") == 0:
                 return None
@@ -276,5 +319,17 @@ class AnthropicPrompter:
             )
 
         blocks = getattr(response, "content", None) or []
+        if return_format is not None:
+            tool_uses = [
+                block.input
+                for block in blocks
+                if getattr(block, "type", None) == "tool_use"
+                and getattr(block, "name", None) == _STRUCTURED_OUTPUT_TOOL
+            ]
+            if len(tool_uses) != 1:
+                raise OutputValidationError(
+                    "Anthropic structured output must contain exactly one vane_structured_output tool call"
+                )
+            return tool_uses[0]
         text_blocks = [block.text for block in blocks if getattr(block, "type", None) == "text"]
         return "".join(text_blocks) if text_blocks else None

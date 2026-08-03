@@ -19,6 +19,7 @@ else:
     Embedding: TypeAlias = Any
 
 Options = dict[str, Any]
+JSONSchema: TypeAlias = dict[str, Any]
 Label = str
 
 T = TypeVar("T")

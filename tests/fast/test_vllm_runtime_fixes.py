@@ -276,6 +276,49 @@ def test_native_descriptor_forces_background_loop_inside_ray_actor(monkeypatch):
     assert executor.loop_ready.is_set()
 
 
+def test_native_executor_materializes_structured_outputs_params(monkeypatch):
+    import duckdb.execution.vllm as vllm_executor
+
+    fake_vllm = types.ModuleType("vllm")
+    fake_sampling_params = types.ModuleType("vllm.sampling_params")
+
+    class StructuredOutputsParams:
+        def __init__(self, **options):
+            self.options = options
+
+    class SamplingParams:
+        def __init__(self, *, structured_outputs=None, **options):
+            self.structured_outputs = structured_outputs
+            self.options = options
+
+    fake_vllm.SamplingParams = SamplingParams
+    fake_sampling_params.StructuredOutputsParams = StructuredOutputsParams
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", fake_sampling_params)
+    monkeypatch.setattr(vllm_executor.LocalVLLMExecutor, "_detect_ray_actor", staticmethod(lambda: False))
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    }
+
+    executor = vllm_executor.LocalVLLMExecutor(
+        "test-model",
+        {},
+        {
+            "sampling_params": {
+                "max_tokens": 8,
+                "structured_outputs": {"json": schema},
+            }
+        },
+        use_threading=False,
+    )
+
+    assert isinstance(executor.sampling_params.structured_outputs, StructuredOutputsParams)
+    assert executor.sampling_params.structured_outputs.options == {"json": schema}
+    assert executor.sampling_params.options == {"max_tokens": 8}
+
+
 def test_ray_actor_releases_only_terminal_per_executor_state():
     from duckdb.execution.vllm import RayLocalVLLMExecutor
 

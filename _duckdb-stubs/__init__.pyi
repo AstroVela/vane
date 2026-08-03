@@ -23,9 +23,14 @@ if typing.TYPE_CHECKING:
     from builtins import list as lst  # needed to avoid mypy error on DuckDBPyRelation.list method shadowing
     from vane.ai.options import EmbedOptions, PromptOptions
     from vane.ai.provider import Provider
+    from vane.ai.typing import JSONSchema
 
     # the field_ids argument to to_parquet and write_parquet has a recursive structure
     ParquetFieldIdsType = Mapping[str, int | "ParquetFieldIdsType"]
+
+class _PydanticModel(typing.Protocol):
+    @classmethod
+    def model_json_schema(cls) -> dict[str, typing.Any]: ...
 
 _ExpressionLike: typing.TypeAlias = (
     "Expression"
@@ -572,18 +577,20 @@ class DuckDBPyRelation:
         dimensions: int | None = None,
         on_error: typing.Literal["raise", "ignore"] = "raise",
         output_column: str = "embedding",
-        **options: Unpack[EmbedOptions],
+        **options: Unpack[EmbedOptions],  # type: ignore[misc]
     ) -> DuckDBPyRelation: ...
     def prompt(
         self,
         messages: Expression | lst[Expression],
         *,
+        return_format: typing.Type[_PydanticModel] | JSONSchema | None = None,
         system_message: str | None = None,
         provider: str | Provider = "openai",
         model: str | None = None,
+        return_raw_response: bool = False,
         on_error: typing.Literal["raise", "ignore"] = "raise",
         output_column: str = "response",
-        **options: Unpack[PromptOptions],
+        **options: Unpack[PromptOptions],  # type: ignore[misc]
     ) -> DuckDBPyRelation: ...
     def except_(self, other_rel: DuckDBPyRelation) -> DuckDBPyRelation: ...
     def execute(self) -> DuckDBPyRelation: ...

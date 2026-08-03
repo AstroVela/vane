@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import numpy as np
 
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
+from vane.ai._schema import serialize_raw_response
 from vane.ai.options import validate_prompt_options
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
@@ -113,8 +114,8 @@ def _is_embedding_capability_error(exc: Exception) -> bool:
     direct_field = getattr(exc, "field", None) or getattr(exc, "param", None)
     if isinstance(direct_field, str):
         fields.append(direct_field)
-    for field in fields:
-        normalized = "".join(character for character in field.casefold() if character.isalnum())
+    for error_field in fields:
+        normalized = "".join(character for character in error_field.casefold() if character.isalnum())
         if normalized.endswith(_EMBED_CAPABILITY_FIELD_SUFFIXES):
             return True
     return False
@@ -323,6 +324,8 @@ class GoogleProvider(Provider):
         self,
         model: str | None = None,
         system_message: str | None = None,
+        return_format: dict[str, Any] | None = None,
+        return_raw_response: bool = False,
         **options: Any,
     ) -> PrompterDescriptor:
         """Build a prompter descriptor for an explicitly selected model.
@@ -350,6 +353,8 @@ class GoogleProvider(Provider):
             provider_name=self._name,
             provider_options=provider_options,
             system_message=system_message,
+            return_format=return_format,
+            return_raw_response=return_raw_response,
             prompt_options=prompt_options,
         )
 
@@ -522,6 +527,8 @@ class GooglePrompterDescriptor(PrompterDescriptor):
     provider_name: str = "google"
     provider_options: dict[str, Any] = field(default_factory=dict)
     system_message: str | None = None
+    return_format: dict[str, Any] | None = None
+    return_raw_response: bool = False
     prompt_options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -556,6 +563,8 @@ class GooglePrompterDescriptor(PrompterDescriptor):
             provider_name=self.provider_name,
             model=self.model_name,
             system_message=self.system_message,
+            return_format=self.return_format,
+            return_raw_response=self.return_raw_response,
             **self.prompt_options,
         )
 
@@ -568,6 +577,8 @@ class GooglePrompter:
         provider_options: dict[str, Any],
         model: str,
         system_message: str | None = None,
+        return_format: dict[str, Any] | None = None,
+        return_raw_response: bool = False,
         provider_name: str = "google",
         **options: Any,
     ) -> None:
@@ -588,6 +599,8 @@ class GooglePrompter:
         self._provider_name = provider_name
         self._model = model
         self._system_message = system_message
+        self._return_format = return_format
+        self._return_raw_response = return_raw_response
         self._options = {
             k: v
             for k, v in options.items()
@@ -597,6 +610,17 @@ class GooglePrompter:
     async def aclose(self) -> None:
         """Release the SDK client's async connection pool on the owning loop."""
         await self._client.aio.aclose()
+
+    def _requested_capability(self) -> str:
+        structured = getattr(self, "_return_format", None) is not None
+        raw = getattr(self, "_return_raw_response", False)
+        if structured and raw:
+            return "structured Prompt generation with raw response body"
+        if structured:
+            return "structured Prompt generation"
+        if raw:
+            return "Prompt raw response body"
+        return "basic Prompt text/image generation"
 
     # --- Multimodal message processing -----------------------------------
 
@@ -624,6 +648,10 @@ class GooglePrompter:
         for k in ("temperature", "top_p", "top_k", "max_output_tokens", "stop_sequences"):
             if k in self._options:
                 config_kwargs[k] = self._options[k]
+        return_format = getattr(self, "_return_format", None)
+        if return_format is not None:
+            config_kwargs["response_mime_type"] = "application/json"
+            config_kwargs["response_json_schema"] = return_format
 
         config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
@@ -639,7 +667,7 @@ class GooglePrompter:
                 raise ProviderCapabilityError(
                     self._provider_name,
                     self._model,
-                    "basic Prompt text/image generation",
+                    self._requested_capability(),
                     original_error=exc,
                 ) from exc
             raise
@@ -656,6 +684,12 @@ class GooglePrompter:
                 input_tokens=getattr(um, "prompt_token_count", None),
                 output_tokens=getattr(um, "candidates_token_count", None),
                 total_tokens=getattr(um, "total_token_count", None),
+            )
+
+        if getattr(self, "_return_raw_response", False):
+            return serialize_raw_response(
+                response,
+                exclude={"automatic_function_calling_history", "parsed", "sdk_http_response"},
             )
 
         text = response.text

@@ -13,6 +13,11 @@ All notable user-visible changes are documented here. Vane is currently in alpha
   `VARCHAR`, `BLOB`, and `BLOB[]` message parts support OpenAI, Anthropic, and
   Google; native vLLM remains text-only. NULL image parts are omitted, while a
   zero-length image follows the selected row-level `on_error` policy.
+- Added first-class Prompt `return_format` and `return_raw_response` parameters.
+  A portable finite JSON Schema subset maps to native DuckDB `STRUCT` values
+  and constrains OpenAI, Anthropic, Google, and vLLM requests. Raw mode returns
+  the provider SDK response body as JSON `VARCHAR`; vLLM rejects raw mode at
+  planning time.
 
 ### Changed
 

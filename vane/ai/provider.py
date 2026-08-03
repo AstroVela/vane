@@ -184,6 +184,8 @@ class Provider(ABC):
         self,
         model: str | None = None,
         system_message: str | None = None,
+        return_format: dict[str, Any] | None = None,
+        return_raw_response: bool = False,
         **options: Any,
     ) -> PrompterDescriptor | NativePrompterPlan:
         raise _not_implemented(self, "prompt")

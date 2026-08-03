@@ -5,11 +5,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import math
-from collections import Counter, deque
+from collections import deque
 from dataclasses import dataclass
-from datetime import date
 from typing import Literal, get_overloads, get_type_hints
 
 import numpy as np
@@ -963,8 +961,6 @@ def test_ai_prompt_expression_accepts_supported_types_during_planning():
         {"image_columns": ["image"]},
         {"provider_options": {}},
         {"prompt_options": {}},
-        {"return_format": dict},
-        {"return_raw_response": True},
         {"concurrency": 2},
         {"max_api_concurrency": 2},
     ],
@@ -1034,6 +1030,65 @@ def test_vllm_prompt_options_fold_without_mutating_callers():
         "temperature": 0.25,
     }
     assert generate_args == {"sampling_params": {"top_p": 0.8}}
+
+
+def test_vllm_prompt_injects_structured_schema_without_mutating_callers():
+    from vane.ai.providers.vllm import NativeVLLMPromptPlan
+
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    plan = NativeVLLMPromptPlan(model_name="test-model", return_format=schema)
+
+    physical = plan.build_physical_vllm_options()
+
+    assert physical["generate_args"]["sampling_params"]["structured_outputs"] == {"json": schema}
+    assert schema == {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+
+
+def test_ai_prompt_vllm_validates_structured_output_and_nulls_invalid_rows(monkeypatch):
+    import duckdb.execution.vllm as vllm_executor
+
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    executor = _RecordingNativeVLLMExecutor({"valid": '{"answer":"ok"}', "invalid": '{"answer":1}'})
+    monkeypatch.setattr(vllm_executor, "build_executor", lambda _model, _options: executor)
+    relation = vane.connect().sql(
+        "select * from (values (1, 'valid'::VARCHAR), (2, 'invalid'::VARCHAR), "
+        "(3, NULL::VARCHAR)) source(id, prompt) order by id"
+    )
+
+    result = vane.ai.prompt(
+        relation,
+        vane.col("prompt"),
+        provider="vllm",
+        return_format=schema,
+        on_error="ignore",
+    )
+
+    assert str(result.types[-1]) == "STRUCT(answer VARCHAR)"
+    assert sorted(result.fetchall()) == [
+        (1, "valid", {"answer": "ok"}),
+        (2, "invalid", None),
+        (3, None, None),
+    ]
+
+
+def test_ai_prompt_vllm_rejects_raw_response_during_planning():
+    with pytest.raises(ValueError, match="does not support return_raw_response"):
+        vane.ai.prompt(vane.col("prompt"), provider="vllm", return_raw_response=True)
 
 
 @pytest.mark.parametrize(

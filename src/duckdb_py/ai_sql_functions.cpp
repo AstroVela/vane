@@ -17,6 +17,7 @@
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb_python/pybind11/gil_wrapper.hpp"
 #include "duckdb_python/python_objects.hpp"
@@ -35,6 +36,28 @@ struct NativeVLLMSpec {
 	string model;
 	string options_json;
 	Value system_message;
+};
+
+struct NativeVLLMAISQLFunctionData : public FunctionData {
+	NativeVLLMAISQLFunctionData(string model_p, Value options_p, Value validation_payload_p, LogicalType return_type_p)
+	    : model(std::move(model_p)), options(std::move(options_p)), validation_payload(std::move(validation_payload_p)),
+	      return_type(std::move(return_type_p)) {
+	}
+
+	string model;
+	Value options;
+	Value validation_payload;
+	LogicalType return_type;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<NativeVLLMAISQLFunctionData>(model, options, validation_payload, return_type);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<NativeVLLMAISQLFunctionData>();
+		return model == other.model && options == other.options && validation_payload == other.validation_payload &&
+		       return_type == other.return_type;
+	}
 };
 
 static void ThrowIfNotConstant(const Expression &arg, const string &name) {
@@ -89,13 +112,14 @@ static idx_t OptionsArgumentIndex(AISQLKind kind, idx_t argument_count) {
 		}
 		throw BinderException("%s requires six arguments supplied by the ai_embed macro", HIDDEN_EMBED_FUNCTION);
 	}
-	if (argument_count == 6) {
-		return 5;
+	if (argument_count == 8) {
+		return 7;
 	}
-	if (argument_count == 7) {
-		return 6;
+	if (argument_count == 9) {
+		return 8;
 	}
-	throw BinderException("%s requires six or seven arguments supplied by the ai_prompt macro", HIDDEN_PROMPT_FUNCTION);
+	throw BinderException("%s requires eight or nine arguments supplied by the ai_prompt macro",
+	                      HIDDEN_PROMPT_FUNCTION);
 }
 
 static py::object OptionsToPython(ClientContext &context, vector<unique_ptr<Expression>> &arguments,
@@ -132,12 +156,15 @@ static py::dict BuildAISQLSpec(AISQLKind kind, ClientContext &context, vector<un
 	auto py_options = OptionsToPython(context, arguments, options_index, true);
 	if (kind == AISQLKind::PROMPT) {
 		auto constant_offset = image_input ? idx_t(2) : idx_t(1);
-		auto system_message = ConstantArgumentToPython(context, arguments, constant_offset, "system_message");
-		auto provider = ConstantArgumentToPython(context, arguments, constant_offset + 1, "provider");
-		auto model = ConstantArgumentToPython(context, arguments, constant_offset + 2, "model");
-		auto on_error = ConstantArgumentToPython(context, arguments, constant_offset + 3, "on_error");
-		return py::cast<py::dict>(sql_module.attr("build_ai_prompt_sql_spec")(provider, model, system_message, on_error,
-		                                                                      py_options, image_input));
+		auto return_format = ConstantArgumentToPython(context, arguments, constant_offset, "return_format");
+		auto system_message = ConstantArgumentToPython(context, arguments, constant_offset + 1, "system_message");
+		auto provider = ConstantArgumentToPython(context, arguments, constant_offset + 2, "provider");
+		auto model = ConstantArgumentToPython(context, arguments, constant_offset + 3, "model");
+		auto return_raw_response =
+		    ConstantArgumentToPython(context, arguments, constant_offset + 4, "return_raw_response");
+		auto on_error = ConstantArgumentToPython(context, arguments, constant_offset + 5, "on_error");
+		return py::cast<py::dict>(sql_module.attr("build_ai_prompt_sql_spec")(
+		    provider, model, system_message, on_error, py_options, image_input, return_format, return_raw_response));
 	}
 	auto provider = ConstantArgumentToPython(context, arguments, 1, "provider");
 	auto model = ConstantArgumentToPython(context, arguments, 2, "model");
@@ -226,7 +253,7 @@ static unique_ptr<Expression> LowerNativeVLLMPrompt(FunctionBindExpressionInput 
 	if (!input.bind_data) {
 		throw BinderException("native vLLM ai_prompt is missing bind data");
 	}
-	auto &data = input.bind_data->Cast<VLLMFunctionData>();
+	auto &data = input.bind_data->Cast<NativeVLLMAISQLFunctionData>();
 	if (input.children.size() != 1) {
 		throw BinderException("native vLLM ai_prompt expected one runtime argument");
 	}
@@ -236,13 +263,24 @@ static unique_ptr<Expression> LowerNativeVLLMPrompt(FunctionBindExpressionInput 
 	children.push_back(std::move(input.children[0]));
 	children.push_back(make_uniq<BoundConstantExpression>(Value(data.model)));
 	children.push_back(make_uniq<BoundConstantExpression>(data.options));
-	return BindScalarFunction(input.context, "vllm", std::move(children));
+	auto result = BindScalarFunction(input.context, "vllm", std::move(children));
+	if (!data.validation_payload.IsNull()) {
+		vector<unique_ptr<Expression>> validation_children;
+		validation_children.reserve(2);
+		validation_children.push_back(std::move(result));
+		validation_children.push_back(make_uniq<BoundConstantExpression>(data.validation_payload));
+		result = BindScalarFunction(input.context, UDFFunction::Name, std::move(validation_children));
+	}
+	if (result->return_type != data.return_type) {
+		result = BoundCastExpression::AddCastToType(input.context, std::move(result), data.return_type);
+	}
+	return result;
 }
 
 static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction &bound_function,
                                           vector<unique_ptr<Expression>> &arguments, AISQLKind kind) {
 	auto options_index = OptionsArgumentIndex(kind, arguments.size());
-	auto image_input = kind == AISQLKind::PROMPT && arguments.size() == 7;
+	auto image_input = kind == AISQLKind::PROMPT && arguments.size() == 9;
 	auto runtime_argument_count = image_input ? idx_t(2) : idx_t(1);
 	auto input_type_id = arguments[0]->return_type.id();
 	if (input_type_id != LogicalTypeId::VARCHAR && input_type_id != LogicalTypeId::SQLNULL) {
@@ -254,16 +292,31 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 		throw BinderException("ai_prompt image argument must be BLOB or BLOB[]");
 	}
 	Value payload;
+	Value native_validation_payload;
+	LogicalType public_return_type;
 	unique_ptr<NativeVLLMSpec> native_vllm;
 	{
 		PythonGILWrapper acquire;
 		auto spec = BuildAISQLSpec(kind, context, arguments, options_index, image_input);
+		auto return_type_obj = DictGetOrNone(spec, "return_type");
+		if (!py::isinstance<py::str>(return_type_obj)) {
+			throw BinderException("ai SQL helper returned invalid return_type");
+		}
+		public_return_type = TransformStringToLogicalType(py::cast<string>(return_type_obj), context);
 		auto execution_kind = ParseExecutionKind(spec);
 		if (execution_kind == "native_vllm") {
 			if (kind != AISQLKind::PROMPT) {
 				throw BinderException("native vLLM execution is only valid for ai_prompt");
 			}
 			native_vllm = make_uniq<NativeVLLMSpec>(ParseNativeVLLMSpec(spec));
+			auto validation_spec = DictGetOrNone(spec, "validation_spec");
+			if (!validation_spec.is_none()) {
+				if (!py::isinstance<py::dict>(validation_spec)) {
+					throw BinderException("ai SQL native vLLM helper returned invalid validation_spec");
+				}
+				native_validation_payload =
+				    BuildAISQLPayload(context, py::reinterpret_borrow<py::dict>(validation_spec));
+			}
 		} else if (execution_kind == "expression_udf") {
 			payload = BuildAISQLPayload(context, spec);
 		} else {
@@ -276,12 +329,14 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 		for (idx_t index = arguments.size(); index-- > runtime_argument_count;) {
 			Function::EraseArgument(bound_function, arguments, index);
 		}
-		bound_function.SetReturnType(LogicalType::VARCHAR);
+		bound_function.SetReturnType(public_return_type);
 		bound_function.SetBindExpressionCallback(LowerNativeVLLMPrompt);
-		return make_uniq<VLLMFunctionData>(std::move(native_vllm->model), Value(std::move(native_vllm->options_json)));
+		return make_uniq<NativeVLLMAISQLFunctionData>(
+		    std::move(native_vllm->model), Value(std::move(native_vllm->options_json)),
+		    std::move(native_validation_payload), std::move(public_return_type));
 	}
-	auto return_type = udf_helpers::ResolvePayloadReturnType(payload);
-	bound_function.SetReturnType(return_type);
+	auto internal_return_type = udf_helpers::ResolvePayloadReturnType(payload);
+	bound_function.SetReturnType(public_return_type);
 	if (kind == AISQLKind::EMBED) {
 		// The public macro forwards five call-level constants after the text
 		// expression. They are fully consumed by this binder and must not become
@@ -297,7 +352,7 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 		}
 	}
 	bound_function.SetExtraFunctionInfo(make_shared_ptr<RegisteredUDFFunctionInfo>(payload));
-	return make_uniq<UDFFunctionData>(std::move(payload), std::move(return_type));
+	return make_uniq<UDFFunctionData>(std::move(payload), std::move(internal_return_type));
 }
 
 static unique_ptr<FunctionData> AISQLPromptBind(ClientContext &context, ScalarFunction &bound_function,
@@ -324,9 +379,23 @@ static unique_ptr<Expression> LowerAISQLPromptExpressionUDF(FunctionBindExpressi
 		throw BinderException("ai_prompt expected one or two runtime arguments");
 	}
 	if (IsFoldableNull(input.context, *input.children[0])) {
-		return make_uniq<BoundConstantExpression>(Value(registered_data.return_type));
+		auto public_type = UDFPayloadStringField(registered_data.payload, "ai_return_type");
+		if (!public_type.first) {
+			throw BinderException("ai_prompt payload is missing ai_return_type");
+		}
+		return make_uniq<BoundConstantExpression>(
+		    Value(TransformStringToLogicalType(public_type.second, input.context)));
 	}
-	return LowerRegisteredExpressionUDFPreservingFoldableNulls(input);
+	auto result = LowerRegisteredExpressionUDFPreservingFoldableNulls(input);
+	auto public_type = UDFPayloadStringField(registered_data.payload, "ai_return_type");
+	if (!public_type.first) {
+		throw BinderException("ai_prompt payload is missing ai_return_type");
+	}
+	auto target_type = TransformStringToLogicalType(public_type.second, input.context);
+	if (result->return_type != target_type) {
+		result = BoundCastExpression::AddCastToType(input.context, std::move(result), target_type);
+	}
+	return result;
 }
 
 static unique_ptr<Expression> LowerAISQLEmbedExpressionUDF(FunctionBindExpressionInput &input) {
@@ -422,12 +491,14 @@ ScalarFunctionSet AISQLFunction::GetPromptImplementationFunctions() {
 		set.AddFunction(std::move(implementation));
 	};
 
-	add_implementation({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	add_implementation({LogicalType::VARCHAR, LogicalType::JSON(), LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                    LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::ANY});
+	add_implementation({LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::JSON(), LogicalType::VARCHAR,
+	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
+	                    LogicalType::ANY});
+	add_implementation({LogicalType::VARCHAR, LogicalType::LIST(LogicalType::BLOB), LogicalType::JSON(),
+	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
 	                    LogicalType::VARCHAR, LogicalType::ANY});
-	add_implementation({LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY});
-	add_implementation({LogicalType::VARCHAR, LogicalType::LIST(LogicalType::BLOB), LogicalType::VARCHAR,
-	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY});
 	return set;
 }
 
@@ -435,8 +506,10 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetPromptMacro() {
 	auto make_function = [&](const LogicalType *image_type, const char *image_parameter) {
 		auto macro_arguments =
 		    image_type
-		        ? StringUtil::Format("prompt, %s, system_message, provider, model, on_error, options", image_parameter)
-		        : "prompt, system_message, provider, model, on_error, options";
+		        ? StringUtil::Format("prompt, %s, return_format, system_message, provider, model, return_raw_response, "
+		                             "on_error, options",
+		                             image_parameter)
+		        : "prompt, return_format, system_message, provider, model, return_raw_response, on_error, options";
 		auto expressions =
 		    Parser::ParseExpressionList(StringUtil::Format("%s(%s)", HIDDEN_PROMPT_FUNCTION, macro_arguments));
 		if (expressions.size() != 1) {
@@ -461,9 +534,15 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetPromptMacro() {
 		if (image_type) {
 			add_parameter(image_parameter, *image_type, nullptr);
 		}
+		// JSON registers a zero-cost implicit cast from BLOB, which makes a
+		// positional image ambiguous with the text overload's return_format.
+		// VARCHAR accepts JSON with a low-cost cast while excluding BLOB; the
+		// hidden implementation then casts the value back to JSON.
+		add_parameter("return_format", LogicalType::VARCHAR, "NULL");
 		add_parameter("system_message", LogicalType::VARCHAR, "NULL");
 		add_parameter("provider", LogicalType::VARCHAR, "'openai'");
 		add_parameter("model", LogicalType::VARCHAR, "NULL");
+		add_parameter("return_raw_response", LogicalType::BOOLEAN, "FALSE");
 		add_parameter("on_error", LogicalType::VARCHAR, "'raise'");
 		add_parameter("options", LogicalType::UNKNOWN, "NULL");
 		return function;

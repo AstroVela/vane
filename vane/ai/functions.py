@@ -39,7 +39,7 @@ import asyncio
 import inspect
 import time
 from collections.abc import Mapping
-from typing import Any, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import numpy as np
 import pyarrow as pa
@@ -49,6 +49,13 @@ import duckdb
 from vane._expression_udf import _build_actor_map_batches_expression, _build_map_batches_expression
 from vane._expressions import as_expression, is_expression
 from vane._typing import Expression, Relation
+from vane.ai._schema import (
+    OutputValidationError,
+    RawResponseSerializationError,
+    StructuredOutputSpec,
+    compile_return_format,
+    validate_raw_response_json,
+)
 from vane.ai.options import (
     EmbedOptions,
     PromptOptions,
@@ -58,7 +65,12 @@ from vane.ai.options import (
 from vane.ai.protocols import NativePrompterPlan
 from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError, load_provider
 from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_options_argument
-from vane.ai.typing import UDFOptions
+from vane.ai.typing import JSONSchema, UDFOptions
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
+else:
+    BaseModel = Any
 
 
 def _resolve_provider(provider: str | Provider | None, default: str = "transformers") -> Provider:
@@ -222,7 +234,10 @@ def _retry_call(
             raise
         except Exception as exc:
             last_exc = exc
-            if isinstance(exc, (ProviderCapabilityError, _ProviderResultError)):
+            if isinstance(
+                exc,
+                (ProviderCapabilityError, _ProviderResultError, OutputValidationError, RawResponseSerializationError),
+            ):
                 break
             if retry_if is not None and not retry_if(exc):
                 break
@@ -268,7 +283,10 @@ async def _retry_call_async(
             return await result
         except Exception as exc:
             last_exc = exc
-            if isinstance(exc, (ProviderCapabilityError, _ProviderResultError)):
+            if isinstance(
+                exc,
+                (ProviderCapabilityError, _ProviderResultError, OutputValidationError, RawResponseSerializationError),
+            ):
                 break
             if attempt < max_retries:
                 if isinstance(exc, RetryAfterError):
@@ -835,6 +853,8 @@ class _PromptBatch:
         output_column: str,
         max_concurrency_per_actor: int | None = None,
         single_message: bool = False,
+        return_format: StructuredOutputSpec | None = None,
+        return_raw_response: bool = False,
         max_retries: int = 3,
         on_error: _OnError = "raise",
     ) -> None:
@@ -845,6 +865,8 @@ class _PromptBatch:
         self._output_column = output_column
         self._max_concurrency_per_actor = max_concurrency_per_actor
         self._single_message = single_message
+        self._return_format = return_format
+        self._return_raw_response = return_raw_response
         self._max_retries = max_retries
         self._on_error: _OnError = on_error
         self._prompter = None  # lazy: instantiate on first __call__
@@ -943,8 +965,13 @@ class _PromptBatch:
             self._append_message_value(parts, column[index])
         return tuple(parts) if parts else None
 
-    @staticmethod
-    def _validate_result(result: Any) -> str | None:
+    def _validate_result(self, result: Any) -> str | None:
+        if self._return_raw_response:
+            return validate_raw_response_json(result)
+        if self._return_format is not None:
+            if result is None:
+                raise OutputValidationError("Prompt provider returned NULL for a structured output row")
+            return self._return_format.validate_json(result)
         if result is None or isinstance(result, str):
             return result
         raise _ProviderResultError(
@@ -984,7 +1011,7 @@ class _PromptBatch:
             )
             try:
                 return self._validate_result(result)
-            except _ProviderResultError:
+            except (_ProviderResultError, OutputValidationError, RawResponseSerializationError):
                 if on_error == "raise":
                     raise
                 return None
@@ -1004,6 +1031,36 @@ class _PromptBatch:
         prompt_results = self._require_run_async()(run_all(indices))
         for index, result in zip(indices, prompt_results, strict=True):
             results[index] = result
+        return pa.table({self._output_column: pa.array(results, type=pa.string())})
+
+
+class _ValidateStructuredOutputBatch:
+    """Validate native structured decoding before exposing a typed value."""
+
+    def __init__(
+        self,
+        return_format: StructuredOutputSpec,
+        input_column: str,
+        output_column: str,
+        on_error: _OnError,
+    ) -> None:
+        self._return_format = return_format
+        self._input_column = input_column
+        self._output_column = output_column
+        self._on_error = on_error
+
+    def __call__(self, table: pa.Table) -> pa.Table:
+        results: list[str | None] = []
+        for raw_text in table.column(self._input_column).to_pylist():
+            if raw_text is None:
+                results.append(None)
+                continue
+            try:
+                results.append(self._return_format.validate_json(raw_text))
+            except OutputValidationError:
+                if self._on_error == "raise":
+                    raise
+                results.append(None)
         return pa.table({self._output_column: pa.array(results, type=pa.string())})
 
 
@@ -1377,13 +1434,15 @@ def _reject_builtin_prompt_provider_credentials(provider: Provider) -> None:
 def _prepare_prompt_call(
     provider: Any,
     model: str | None,
+    return_format: Any,
     system_message: str | None,
+    return_raw_response: bool,
     on_error: str,
     options: dict[str, Any],
     *,
     relation: bool,
-) -> tuple[Any, UDFOptions, str | None]:
-    """Resolve one basic Prompt call without endpoint or model I/O."""
+) -> tuple[Any, UDFOptions, str | None, StructuredOutputSpec | None]:
+    """Resolve one Prompt call without endpoint or model I/O."""
 
     if provider is None:
         raise TypeError("provider must be a provider name or Provider object, not None")
@@ -1391,8 +1450,11 @@ def _prepare_prompt_call(
         raise ValueError("model must be a non-empty string or None")
     if system_message is not None and not isinstance(system_message, str):
         raise TypeError("system_message must be a string or None")
+    if not isinstance(return_raw_response, bool):
+        raise TypeError("return_raw_response must be a bool")
     if on_error not in {"raise", "ignore"}:
         raise ValueError("on_error must be 'raise' or 'ignore'")
+    structured_output = compile_return_format(return_format)
 
     resolved_provider = _resolve_provider(provider, "openai")
     if not isinstance(resolved_provider, Provider):
@@ -1408,14 +1470,22 @@ def _prepare_prompt_call(
     max_retries = prepared.pop("max_retries", None)
 
     if family == "vllm":
+        if return_raw_response:
+            raise ValueError("Provider 'vllm' does not support return_raw_response")
         prepared["actor_number"] = actor_number if actor_number is not None else 1
         prepared["batch_size"] = batch_size if batch_size is not None else 128
         prepared["max_retries"] = max_retries if max_retries is not None else 0
 
     try:
+        contract_options: dict[str, Any] = {}
+        if structured_output is not None:
+            contract_options["return_format"] = structured_output.schema
+        if return_raw_response:
+            contract_options["return_raw_response"] = True
         descriptor = resolved_provider.get_prompter(
             model=model,
             system_message=system_message,
+            **contract_options,
             **prepared,
         )
     except NotImplementedError as exc:
@@ -1424,9 +1494,12 @@ def _prepare_prompt_call(
 
     if isinstance(descriptor, NativeVLLMPromptPlan):
         descriptor.on_error = on_error
-        return descriptor, UDFOptions(on_error=on_error), execution_backend
+        return descriptor, UDFOptions(on_error=on_error), execution_backend, structured_output
     if isinstance(descriptor, NativePrompterPlan):
-        return descriptor, UDFOptions(on_error=on_error), execution_backend
+        return descriptor, UDFOptions(on_error=on_error), execution_backend, structured_output
+
+    if family == "openai" and structured_output is not None:
+        structured_output.validate_openai_gpt_contract(descriptor.get_model())
 
     udf_options = descriptor.get_udf_options()
     udf_options.on_error = on_error
@@ -1439,7 +1512,7 @@ def _prepare_prompt_call(
         udf_options.max_concurrency_per_actor = (
             32 if family == "openai" else 16 if family in {"anthropic", "google"} else None
         )
-    return descriptor, udf_options, execution_backend
+    return descriptor, udf_options, execution_backend, structured_output
 
 
 def _normalize_prompt_messages(messages: Any) -> tuple[list[Any], bool]:
@@ -1506,7 +1579,9 @@ def _prompt_relation(
     *,
     provider: Any,
     model: str | None = None,
+    return_format: Any = None,
     system_message: str | None = None,
+    return_raw_response: bool = False,
     on_error: str = "raise",
     output_column: str = "response",
     options: dict[str, Any],
@@ -1518,10 +1593,12 @@ def _prompt_relation(
     if not isinstance(output_column, str) or not output_column.strip():
         raise ValueError("output_column must be a non-empty string")
 
-    descriptor, udf_options, execution_backend = _prepare_prompt_call(
+    descriptor, udf_options, execution_backend, structured_output = _prepare_prompt_call(
         provider,
         model,
+        return_format,
         system_message,
+        return_raw_response,
         on_error,
         options,
         relation=True,
@@ -1530,7 +1607,25 @@ def _prompt_relation(
     if isinstance(descriptor, NativeVLLMPromptPlan):
         if any(value != "VARCHAR" for value in message_types):
             raise ValueError("Provider 'vllm' does not support Prompt image inputs")
-        expression = _build_native_vllm_expression(message_expressions, descriptor).alias(output_column)
+        expression = _build_native_vllm_expression(message_expressions, descriptor)
+        if structured_output is not None:
+            input_column = "__vane_vllm_response"
+            validator = _ValidateStructuredOutputBatch(
+                structured_output,
+                input_column,
+                output_column,
+                udf_options.on_error,
+            )
+            expression = _build_map_batches_expression(
+                validator.__call__,
+                name="validate_vllm_structured_output",
+                inputs={input_column: expression},
+                schema={output_column: "VARCHAR"},
+                batch_size=None,
+                row_preserving=True,
+                gpus=0,
+            ).cast(structured_output.duckdb_type)
+        expression = expression.alias(output_column)
         star = (
             duckdb.StarExpression(exclude=[output_column]) if output_column in rel.columns else duckdb.StarExpression()
         )
@@ -1545,8 +1640,13 @@ def _prompt_relation(
         output_column,
         udf_options.max_concurrency_per_actor,
         single_message=single_message,
+        return_format=None if return_raw_response else structured_output,
+        return_raw_response=return_raw_response,
         max_retries=udf_options.max_retries,
         on_error=udf_options.on_error,
+    )
+    output_type = (
+        structured_output.duckdb_type if structured_output is not None and not return_raw_response else "VARCHAR"
     )
     expression = _build_ai_batch_expression(
         wrapper,
@@ -1556,7 +1656,7 @@ def _prompt_relation(
         udf_opts=udf_options,
         name="ai_prompt",
         execution_backend=execution_backend,
-    ).cast("VARCHAR")
+    ).cast(output_type)
     star = duckdb.StarExpression(exclude=[output_column]) if output_column in rel.columns else duckdb.StarExpression()
     return rel.select(star, expression.alias(output_column))
 
@@ -1566,15 +1666,19 @@ def _prompt_expression(
     *,
     provider: Any,
     model: str | None = None,
+    return_format: Any = None,
     system_message: str | None = None,
+    return_raw_response: bool = False,
     on_error: str = "raise",
     options: dict[str, Any],
 ) -> Any:
     message_expressions, single_message = _normalize_prompt_messages(messages)
-    descriptor, udf_options, _ = _prepare_prompt_call(
+    descriptor, udf_options, _, structured_output = _prepare_prompt_call(
         provider,
         model,
+        return_format,
         system_message,
+        return_raw_response,
         on_error,
         options,
         relation=False,
@@ -1582,7 +1686,25 @@ def _prompt_expression(
 
     if isinstance(descriptor, NativeVLLMPromptPlan):
         validated_messages = [_validated_prompt_message(message, text_only=True) for message in message_expressions]
-        return _build_native_vllm_expression(validated_messages, descriptor)
+        expression = _build_native_vllm_expression(validated_messages, descriptor)
+        if structured_output is None:
+            return expression
+        input_column = "__vane_vllm_response"
+        validator = _ValidateStructuredOutputBatch(
+            structured_output,
+            input_column,
+            "response",
+            udf_options.on_error,
+        )
+        return _build_map_batches_expression(
+            validator.__call__,
+            name="validate_vllm_structured_output",
+            inputs={input_column: expression},
+            schema={"response": "VARCHAR"},
+            batch_size=None,
+            row_preserving=True,
+            gpus=0,
+        ).cast(structured_output.duckdb_type)
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
 
@@ -1594,8 +1716,13 @@ def _prompt_expression(
         "response",
         udf_options.max_concurrency_per_actor,
         single_message=single_message,
+        return_format=None if return_raw_response else structured_output,
+        return_raw_response=return_raw_response,
         max_retries=udf_options.max_retries,
         on_error=udf_options.on_error,
+    )
+    output_type = (
+        structured_output.duckdb_type if structured_output is not None and not return_raw_response else "VARCHAR"
     )
     return _build_ai_batch_expression(
         wrapper,
@@ -1604,7 +1731,7 @@ def _prompt_expression(
         output_type="VARCHAR",
         udf_opts=udf_options,
         name="ai_prompt",
-    ).cast("VARCHAR")
+    ).cast(output_type)
 
 
 def _is_relation_like(value: Any) -> bool:
@@ -1618,9 +1745,11 @@ _PROMPT_ARGUMENT_UNSET = object()
 def prompt(
     messages: Expression | list[Expression],
     *,
+    return_format: type[BaseModel] | JSONSchema | None = None,
     system_message: str | None = None,
     provider: str | Provider = "openai",
     model: str | None = None,
+    return_raw_response: bool = False,
     on_error: Literal["raise", "ignore"] = "raise",
     **options: Unpack[PromptOptions],
 ) -> Expression: ...
@@ -1630,9 +1759,11 @@ def prompt(
 def prompt(
     *,
     messages: Expression | list[Expression],
+    return_format: type[BaseModel] | JSONSchema | None = None,
     system_message: str | None = None,
     provider: str | Provider = "openai",
     model: str | None = None,
+    return_raw_response: bool = False,
     on_error: Literal["raise", "ignore"] = "raise",
     **options: Unpack[PromptOptions],
 ) -> Expression: ...
@@ -1643,9 +1774,11 @@ def prompt(
     rel: Relation,
     messages: Expression | list[Expression],
     *,
+    return_format: type[BaseModel] | JSONSchema | None = None,
     system_message: str | None = None,
     provider: str | Provider = "openai",
     model: str | None = None,
+    return_raw_response: bool = False,
     on_error: Literal["raise", "ignore"] = "raise",
     output_column: str = "response",
     **options: Unpack[PromptOptions],
@@ -1657,9 +1790,11 @@ def prompt(
     *,
     rel: Relation,
     messages: Expression | list[Expression],
+    return_format: type[BaseModel] | JSONSchema | None = None,
     system_message: str | None = None,
     provider: str | Provider = "openai",
     model: str | None = None,
+    return_raw_response: bool = False,
     on_error: Literal["raise", "ignore"] = "raise",
     output_column: str = "response",
     **options: Unpack[PromptOptions],
@@ -1672,14 +1807,22 @@ def prompt(
     messages: Any = _PROMPT_ARGUMENT_UNSET,
     *,
     rel: Any = _PROMPT_ARGUMENT_UNSET,
+    return_format: Any = None,
     system_message: str | None = None,
     provider: Any = "openai",
     model: str | None = None,
+    return_raw_response: bool = False,
     on_error: str = "raise",
     output_column: Any = _PROMPT_ARGUMENT_UNSET,
     **options: Any,
 ) -> Any:
-    """Prompt over ordered VARCHAR, BLOB, or BLOB[] Expressions."""
+    """Prompt over ordered VARCHAR, BLOB, or BLOB[] Expressions.
+
+    ``return_format`` accepts a Pydantic model class or the portable JSON
+    Schema subset and exposes a native STRUCT. ``return_raw_response=True``
+    instead exposes the provider SDK response body as JSON VARCHAR while
+    still using any supplied schema to constrain generation.
+    """
     if first is not _PROMPT_ARGUMENT_UNSET and rel is not _PROMPT_ARGUMENT_UNSET:
         raise TypeError("vane.ai.prompt received both first and rel; pass only one relation argument")
 
@@ -1693,7 +1836,9 @@ def prompt(
             messages,
             provider=provider,
             model=model,
+            return_format=return_format,
             system_message=system_message,
+            return_raw_response=return_raw_response,
             on_error=on_error,
             output_column=resolved_output,
             options=options,
@@ -1712,7 +1857,9 @@ def prompt(
         expression_messages,
         provider=provider,
         model=model,
+        return_format=return_format,
         system_message=system_message,
+        return_raw_response=return_raw_response,
         on_error=on_error,
         options=options,
     )

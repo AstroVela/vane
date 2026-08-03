@@ -156,8 +156,12 @@ class VLLMProvider(Provider):
         self,
         model: str | None = None,
         system_message: str | None = None,
+        return_format: dict[str, Any] | None = None,
+        return_raw_response: bool = False,
         **options: Any,
     ) -> NativeVLLMPromptPlan:
+        if return_raw_response:
+            raise ValueError("Provider 'vllm' does not support return_raw_response")
         merged = {**self._options, **options}
         validate_prompt_options("vllm", merged, relation=False)
         model_name = model or self.DEFAULT_MODEL
@@ -167,6 +171,7 @@ class VLLMProvider(Provider):
             provider_name=self._name,
             model_name=model_name,
             system_message=system_message,
+            return_format=return_format,
             vllm_options=merged,
         )
 
@@ -185,6 +190,7 @@ class NativeVLLMPromptPlan(NativePrompterPlan):
     model_name: str = "Qwen/Qwen3-1.7B"
     system_message: str | None = None
     on_error: str = "raise"
+    return_format: dict[str, Any] | None = None
     vllm_options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -239,7 +245,7 @@ class NativeVLLMPromptPlan(NativePrompterPlan):
 
         generate_args = options.get("generate_args")
         has_sampling_params = isinstance(generate_args, Mapping) and generate_args.get("sampling_params") is not None
-        if not sampling_overrides and not has_sampling_params:
+        if self.return_format is None and not sampling_overrides and not has_sampling_params:
             return options
 
         if generate_args is None:
@@ -269,6 +275,8 @@ class NativeVLLMPromptPlan(NativePrompterPlan):
 
         for name, value in sampling_overrides.items():
             sampling_params.setdefault(name, value)
+        if self.return_format is not None:
+            sampling_params["structured_outputs"] = {"json": self.return_format}
 
         canonical = _canonicalize_native_plan_json(options)
         assert isinstance(canonical, dict)

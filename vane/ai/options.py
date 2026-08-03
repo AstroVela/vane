@@ -12,7 +12,6 @@ from urllib.parse import parse_qsl, urlsplit
 
 from vane.ai._redaction import is_sensitive_option_key
 
-
 VLLMJSONPrimitive: TypeAlias = str | int | float | bool | None
 VLLMJSONValue: TypeAlias = VLLMJSONPrimitive | list["VLLMJSONValue"] | dict[str, "VLLMJSONValue"]
 
@@ -367,7 +366,9 @@ def _validate_vllm_json(value: Any, path: str) -> None:
             if not isinstance(key, str):
                 raise TypeError(f"Prompt option {path} must use string keys; got {type(key).__name__}")
             if key == "structured_outputs":
-                raise ValueError("Prompt option generate_args cannot configure structured_outputs before P3")
+                raise ValueError(
+                    "Prompt option generate_args cannot configure structured_outputs directly; use return_format"
+                )
             _validate_vllm_json(item, f"{path}.{key}")
         return
     if isinstance(value, list):
