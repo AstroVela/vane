@@ -99,8 +99,6 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/common/arrow/arrow_type_extension.hpp>
 #include <duckdb/common/string_util.hpp>
 #include <duckdb/execution/distributed/exchange/flight_exchange_manager.hpp>
-#include <duckdb/execution/distributed/exchange/flight_client.hpp>
-#include <duckdb/execution/distributed/exchange/flight_ticket.hpp>
 #include <duckdb/execution/distributed/exchange/shuffle_cache_registry.hpp>
 
 #include <cstdlib>
@@ -192,6 +190,26 @@ static py::dict WithCopyRecoveryContext(py::object conn_obj,
 	duckdb::DuckDB db(nullptr);
 	duckdb::Connection conn(db);
 	return callback(*conn.context);
+}
+
+static py::list ReadIntegerExchangeSourceForTest(duckdb::ClientContext &context,
+                                                 duckdb::distributed::FlightExchangeConfig config,
+                                                 duckdb::distributed::ExchangeSourceHandle handle) {
+	using namespace duckdb::distributed;
+	config.expected_types = {LogicalType::INTEGER};
+	FlightExchangeSource source(config, &context);
+	source.AddSourceHandles({std::move(handle)});
+	vector<LogicalType> output_types = {LogicalType::INTEGER};
+	DataChunk output;
+	output.Initialize(Allocator::DefaultAllocator(), output_types);
+	py::list values;
+	while (source.ReadChunk(output)) {
+		for (idx_t row = 0; row < output.size(); row++) {
+			values.append(output.GetValue(0, row).GetValue<int32_t>());
+		}
+	}
+	source.Close();
+	return values;
 }
 
 void register_ray_bindings(py::module_ &mod) {
@@ -2473,34 +2491,36 @@ void register_ray_bindings(py::module_ &mod) {
 			    throw std::runtime_error(manifest_res.error().what());
 		    }
 
-		    ShuffleCache reader(write_config);
-		    auto memory_files_res = reader.GetPartitionFiles(1);
+		    auto reader = std::make_shared<ShuffleCache>(write_config);
+		    auto memory_files_res = reader->GetPartitionFiles(1);
 		    if (memory_files_res.is_err()) {
 			    throw std::runtime_error(memory_files_res.error().what());
 		    }
-		    auto manifest_files_res = reader.GetPartitionFilesFromManifest(1);
+		    auto manifest_files_res = reader->GetPartitionFilesFromManifest(1);
 		    if (manifest_files_res.is_err()) {
 			    throw std::runtime_error(manifest_files_res.error().what());
 		    }
-		    auto collection_res = reader.ReadPartition(context, 1, types);
-		    if (collection_res.is_err()) {
-			    throw std::runtime_error(collection_res.error().what());
+		    auto register_res = ShuffleCacheRegistry::Instance().Register(
+		        write_config.shuffle_stage_id, reader, "shuffle-cache-manifest-recovery-query", "", 1);
+		    if (register_res.is_err()) {
+			    throw std::runtime_error(register_res.error().what());
 		    }
-		    auto collection = std::move(collection_res.value());
-
-		    py::list values;
-		    for (auto &chunk : collection->Chunks()) {
-			    for (idx_t row = 0; row < chunk.size(); row++) {
-				    values.append(chunk.GetValue(0, row).GetValue<int32_t>());
-			    }
-		    }
+		    FlightExchangeConfig source_config;
+		    source_config.node_id = write_config.node_id;
+		    ExchangeSourceHandle handle;
+		    handle.partition_id = 1;
+		    handle.attempt_id = 1;
+		    handle.node_id = write_config.node_id;
+		    handle.files.push_back(ExchangeSourceFile(write_config.shuffle_stage_id, 0));
+		    auto values = ReadIntegerExchangeSourceForTest(context, source_config, std::move(handle));
+		    ShuffleCacheRegistry::Instance().Remove(write_config.shuffle_stage_id);
 
 		    py::dict out;
 		    out["memory_file_count"] = memory_files_res.value().files.size();
 		    out["manifest_file_count"] = manifest_files_res.value().files.size();
-		    out["row_count"] = collection->Count();
+		    out["row_count"] = values.size();
 		    out["values"] = values;
-		    out["manifest_path"] = reader.ManifestFilePath();
+		    out["manifest_path"] = reader->ManifestFilePath();
 		    return out;
 	    },
 	    py::arg("local_dir"), "Exercise ShuffleCache manifest-backed recovery after in-memory registry loss.");
@@ -2543,16 +2563,18 @@ void register_ray_bindings(py::module_ &mod) {
 		    }
 
 		    ShuffleCache reader(write_config);
-		    auto collection_res = reader.ReadPartition(context, 0, types);
-		    if (collection_res.is_err()) {
-			    throw std::runtime_error(collection_res.error().what());
+		    auto manifest_files_res = reader.GetPartitionFilesFromManifest(0);
+		    if (manifest_files_res.is_err()) {
+			    throw std::runtime_error(manifest_files_res.error().what());
 		    }
-		    auto collection = std::move(collection_res.value());
+		    if (!manifest_files_res.value().files.empty()) {
+			    throw std::runtime_error("uncommitted shuffle files unexpectedly became visible");
+		    }
 
 		    py::dict out;
 		    out["partial_file_count"] = partial_files_res.value().files.size();
 		    out["committed_manifest"] = reader.HasCommittedManifest();
-		    out["recovered_row_count"] = collection->Count();
+		    out["recovered_row_count"] = manifest_files_res.value().total_rows;
 		    return out;
 	    },
 	    py::arg("local_dir"), "Exercise that uncommitted shuffle files are invisible without committed manifest.");
@@ -2598,32 +2620,34 @@ void register_ray_bindings(py::module_ &mod) {
 			    throw std::runtime_error(manifest_res.error().what());
 		    }
 
-		    ShuffleCache reader(config, storage);
-		    auto manifest_files_res = reader.GetPartitionFilesFromManifest(0);
+		    auto reader = std::make_shared<ShuffleCache>(config, storage);
+		    auto manifest_files_res = reader->GetPartitionFilesFromManifest(0);
 		    if (manifest_files_res.is_err()) {
 			    throw std::runtime_error(manifest_files_res.error().what());
 		    }
-		    auto collection_res = reader.ReadPartition(context, 0, types);
-		    if (collection_res.is_err()) {
-			    throw std::runtime_error(collection_res.error().what());
+		    auto register_res = ShuffleCacheRegistry::Instance().Register(
+		        config.shuffle_stage_id, reader, "shuffle-cache-duckdb-fs-storage-query", "", 1);
+		    if (register_res.is_err()) {
+			    throw std::runtime_error(register_res.error().what());
 		    }
-		    auto collection = std::move(collection_res.value());
-
-		    py::list values;
-		    for (auto &chunk : collection->Chunks()) {
-			    for (idx_t row = 0; row < chunk.size(); row++) {
-				    values.append(chunk.GetValue(0, row).GetValue<int32_t>());
-			    }
-		    }
+		    FlightExchangeConfig source_config;
+		    source_config.node_id = config.node_id;
+		    ExchangeSourceHandle handle;
+		    handle.partition_id = 0;
+		    handle.attempt_id = 1;
+		    handle.node_id = config.node_id;
+		    handle.files.push_back(ExchangeSourceFile(config.shuffle_stage_id, 0));
+		    auto values = ReadIntegerExchangeSourceForTest(context, source_config, std::move(handle));
+		    ShuffleCacheRegistry::Instance().Remove(config.shuffle_stage_id);
 
 		    py::dict out;
-		    out["committed_manifest"] = reader.HasCommittedManifest();
+		    out["committed_manifest"] = reader->HasCommittedManifest();
 		    out["manifest_file_count"] = manifest_files_res.value().files.size();
 		    out["manifest_total_rows"] = manifest_files_res.value().total_rows;
-		    out["row_count"] = collection->Count();
+		    out["row_count"] = values.size();
 		    out["values"] = values;
-		    out["manifest_tmp_exists"] = fs.FileExists(reader.ManifestFilePath() + ".tmp");
-		    out["marker_tmp_exists"] = fs.FileExists(reader.CommittedMarkerPath() + ".tmp");
+		    out["manifest_tmp_exists"] = fs.FileExists(reader->ManifestFilePath() + ".tmp");
+		    out["marker_tmp_exists"] = fs.FileExists(reader->CommittedMarkerPath() + ".tmp");
 		    return out;
 	    },
 	    py::arg("local_dir"), "Exercise ShuffleCache roundtrip through the DuckDB FileSystem backed storage backend.");
@@ -2687,18 +2711,15 @@ void register_ray_bindings(py::module_ &mod) {
 		    if (manifest_files_res.is_err()) {
 			    throw std::runtime_error(manifest_files_res.error().what());
 		    }
-		    auto collection_res = reader.ReadPartition(context, 0, types);
-		    if (collection_res.is_err()) {
-			    throw std::runtime_error(collection_res.error().what());
-		    }
-		    auto collection = std::move(collection_res.value());
-
-		    py::list values;
-		    for (auto &chunk : collection->Chunks()) {
-			    for (idx_t row = 0; row < chunk.size(); row++) {
-				    values.append(chunk.GetValue(0, row).GetValue<int32_t>());
-			    }
-		    }
+		    FlightExchangeConfig source_config;
+		    source_config.local_dirs = {base_uri};
+		    source_config.node_id = "reader-node";
+		    ExchangeSourceHandle handle;
+		    handle.partition_id = 0;
+		    handle.attempt_id = 1;
+		    handle.node_id = config.node_id;
+		    handle.files.push_back(ExchangeSourceFile(config.shuffle_stage_id, 0));
+		    auto values = ReadIntegerExchangeSourceForTest(context, source_config, std::move(handle));
 
 		    auto cleanup_res = reader.RemoveAttemptStorage();
 		    if (cleanup_res.is_err()) {
@@ -2716,7 +2737,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    out["manifest_file_count"] = manifest_files_res.value().files.size();
 		    out["manifest_total_rows"] = manifest_files_res.value().total_rows;
 		    out["manifest_total_bytes"] = manifest_files_res.value().total_bytes;
-		    out["row_count"] = collection->Count();
+		    out["row_count"] = values.size();
 		    out["values"] = values;
 		    out["manifest_tmp_exists"] = manifest_tmp_exists;
 		    out["marker_tmp_exists"] = marker_tmp_exists;
@@ -3672,7 +3693,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    Connection conn(db);
 		    auto &context = *conn.context;
 
-		    vector<LogicalType> types = {LogicalType::INTEGER};
 		    FlightServerConfig server_config;
 		    server_config.bind_host = "127.0.0.1";
 		    server_config.port = 0;
@@ -3683,24 +3703,31 @@ void register_ray_bindings(py::module_ &mod) {
 			    throw std::runtime_error(start_res.error().what());
 		    }
 
-		    FlightClientConfig client_config;
-		    client_config.location = "grpc://127.0.0.1:" + std::to_string(server.port());
-		    FlightClient client(std::move(client_config));
-		    FlightExchangeTicket ticket;
-		    ticket.server_epoch = "shared-manifest-reader-epoch";
-		    ticket.exchange_instance_id = output_location;
-		    ticket.node_id = writer_node_id;
-		    ticket.attempt_id = 1;
-		    ticket.partition_idx = static_cast<idx_t>(partition_id);
-		    auto collection_res = client.FetchPartition(context, ticket, types);
+		    FlightExchangeConfig source_config;
+		    source_config.local_dirs = {local_dir};
+		    source_config.node_id = "reader-node";
+		    ExchangeSourceHandle handle;
+		    handle.partition_id = static_cast<idx_t>(partition_id);
+		    handle.attempt_id = 1;
+		    handle.node_id = writer_node_id;
+		    handle.flight_host = "127.0.0.1";
+		    handle.flight_port = server.port();
+		    handle.flight_server_epoch = "shared-manifest-reader-epoch";
+		    handle.files.push_back(ExchangeSourceFile(output_location, 0));
+		    string read_error;
+		    try {
+			    ReadIntegerExchangeSourceForTest(context, source_config, std::move(handle));
+		    } catch (const std::exception &ex) {
+			    read_error = ex.what();
+		    }
 		    auto stop_res = server.Stop();
 		    if (stop_res.is_err()) {
 			    throw std::runtime_error(stop_res.error().what());
 		    }
 
 		    py::dict out;
-		    out["fetch_error"] = collection_res.is_err();
-		    out["error"] = collection_res.is_err() ? collection_res.error().what() : "";
+		    out["fetch_error"] = !read_error.empty();
+		    out["error"] = read_error;
 		    out["registry_present"] = ShuffleCacheRegistry::Instance().Get(output_location) != nullptr;
 		    return out;
 	    },
@@ -3888,24 +3915,31 @@ void register_ray_bindings(py::module_ &mod) {
 			    throw std::runtime_error(start_res.error().what());
 		    }
 
-		    FlightClientConfig client_config;
-		    client_config.location = "grpc://127.0.0.1:" + std::to_string(server.port());
-		    FlightClient client(std::move(client_config));
-		    FlightExchangeTicket ticket;
-		    ticket.server_epoch = "unpublished-manifest-epoch";
-		    ticket.exchange_instance_id = output_location;
-		    ticket.node_id = node_id;
-		    ticket.attempt_id = 1;
-		    ticket.partition_idx = 1;
-		    auto collection_res = client.FetchPartition(context, ticket, types);
+		    FlightExchangeConfig source_config;
+		    source_config.local_dirs = {local_dir};
+		    source_config.node_id = "reader-node";
+		    ExchangeSourceHandle handle;
+		    handle.partition_id = 1;
+		    handle.attempt_id = 1;
+		    handle.node_id = node_id;
+		    handle.flight_host = "127.0.0.1";
+		    handle.flight_port = server.port();
+		    handle.flight_server_epoch = "unpublished-manifest-epoch";
+		    handle.files.push_back(ExchangeSourceFile(output_location, 0));
+		    string read_error;
+		    try {
+			    ReadIntegerExchangeSourceForTest(context, source_config, std::move(handle));
+		    } catch (const std::exception &ex) {
+			    read_error = ex.what();
+		    }
 		    auto stop_res = server.Stop();
 		    if (stop_res.is_err()) {
 			    throw std::runtime_error(stop_res.error().what());
 		    }
 
 		    py::dict out;
-		    out["fetch_error"] = collection_res.is_err();
-		    out["error"] = collection_res.is_err() ? collection_res.error().what() : "";
+		    out["fetch_error"] = !read_error.empty();
+		    out["error"] = read_error;
 		    out["registry_present"] = ShuffleCacheRegistry::Instance().Get(output_location) != nullptr;
 		    return out;
 	    },
@@ -3966,16 +4000,23 @@ void register_ray_bindings(py::module_ &mod) {
 			    throw std::runtime_error(start_res.error().what());
 		    }
 
-		    FlightClientConfig client_config;
-		    client_config.location = "grpc://127.0.0.1:" + std::to_string(server.port());
-		    FlightClient client(std::move(client_config));
-		    FlightExchangeTicket ticket;
-		    ticket.server_epoch = server_epoch;
-		    ticket.exchange_instance_id = output_location;
-		    ticket.node_id = node_id;
-		    ticket.attempt_id = 1;
-		    ticket.partition_idx = 0;
-		    auto collection_res = client.FetchPartition(context, ticket, types);
+		    FlightExchangeConfig source_config;
+		    source_config.local_dirs = {local_dir};
+		    source_config.node_id = "reader-node";
+		    ExchangeSourceHandle handle;
+		    handle.partition_id = 0;
+		    handle.attempt_id = 1;
+		    handle.node_id = node_id;
+		    handle.flight_host = "127.0.0.1";
+		    handle.flight_port = server.port();
+		    handle.flight_server_epoch = server_epoch;
+		    handle.files.push_back(ExchangeSourceFile(output_location, 0));
+		    string read_error;
+		    try {
+			    ReadIntegerExchangeSourceForTest(context, source_config, std::move(handle));
+		    } catch (const std::exception &ex) {
+			    read_error = ex.what();
+		    }
 		    auto stop_res = server.Stop();
 		    ShuffleCacheRegistry::Instance().Remove(output_location);
 		    if (stop_res.is_err()) {
@@ -3985,8 +4026,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    py::dict out;
 		    out["partial_file_count"] = partial_files_res.value().files.size();
 		    out["committed_manifest"] = writer->HasCommittedManifest();
-		    out["fetch_error"] = collection_res.is_err();
-		    out["error"] = collection_res.is_err() ? collection_res.error().what() : "";
+		    out["fetch_error"] = !read_error.empty();
+		    out["error"] = read_error;
 		    return out;
 	    },
 	    py::arg("local_dir"), "Exercise that FlightServer rejects uncommitted attempts without committed manifest.");

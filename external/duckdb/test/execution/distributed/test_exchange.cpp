@@ -6,19 +6,19 @@
 #include "test_helpers.hpp"
 
 #include "duckdb/common/types/data_chunk.hpp"
-#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/execution/distributed/exchange/flight_ticket.hpp"
-#include "duckdb/execution/distributed/exchange/flight_client.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache_registry.hpp"
 #include "duckdb/execution/distributed/exchange/flight_exchange_manager.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 
+#include "arrow/api.h"
 #include "arrow/flight/api.h"
 #include "arrow/io/api.h"
+#include "arrow/ipc/api.h"
 
 #include <string>
 #include <sstream>
@@ -103,29 +103,51 @@ private:
 	bool had_value_ = false;
 };
 
-void RequireCollectionValues(ColumnDataCollection &collection, const vector<int32_t> &ids,
-                             const vector<string> &names) {
-	REQUIRE(collection.ColumnCount() == 2);
-	REQUIRE(collection.Count() == static_cast<idx_t>(ids.size()));
+using MaterializedRows = vector<vector<Value>>;
 
-	idx_t row_index = 0;
-	for (auto &chunk : collection.Chunks()) {
-		for (idx_t row = 0; row < chunk.size(); row++) {
-			REQUIRE(chunk.GetValue(0, row).GetValue<int32_t>() == ids[row_index]);
-			REQUIRE(chunk.GetValue(1, row).GetValue<string>() == names[row_index]);
-			row_index++;
-		}
-	}
-	REQUIRE(row_index == static_cast<idx_t>(ids.size()));
+ExchangeSourceHandle MakeSourceHandle(const string &output_location, const string &node_id, idx_t partition_id,
+                                      idx_t attempt_id = 0) {
+	ExchangeSourceHandle handle;
+	handle.partition_id = partition_id;
+	handle.attempt_id = attempt_id;
+	handle.node_id = node_id;
+	handle.files.push_back(ExchangeSourceFile(output_location, 0));
+	return handle;
 }
 
-/// Collect all row values from a ColumnDataCollection into vectors for comparison.
-void CollectCollectionRows(ColumnDataCollection &collection, vector<int32_t> &out_ids, vector<string> &out_names) {
-	for (auto &chunk : collection.Chunks()) {
-		for (idx_t row = 0; row < chunk.size(); row++) {
-			out_ids.push_back(chunk.GetValue(0, row).GetValue<int32_t>());
-			out_names.push_back(chunk.GetValue(1, row).GetValue<string>());
+MaterializedRows ReadSourceRows(ClientContext &context, FlightExchangeConfig config,
+                                vector<ExchangeSourceHandle> handles) {
+	if (config.expected_types.empty()) {
+		throw std::runtime_error("test source requires expected types");
+	}
+	FlightExchangeSource source(config, &context);
+	source.AddSourceHandles(std::move(handles));
+
+	MaterializedRows rows;
+	vector<LogicalType> output_types(config.expected_types.begin(), config.expected_types.end());
+	DataChunk output;
+	output.Initialize(Allocator::DefaultAllocator(), output_types);
+	while (source.ReadChunk(output)) {
+		for (idx_t row_idx = 0; row_idx < output.size(); row_idx++) {
+			vector<Value> row;
+			row.reserve(output.ColumnCount());
+			for (idx_t col_idx = 0; col_idx < output.ColumnCount(); col_idx++) {
+				row.push_back(output.GetValue(col_idx, row_idx));
+			}
+			rows.push_back(std::move(row));
 		}
+	}
+	source.Close();
+	return rows;
+}
+
+void RequireTwoColumnRows(const MaterializedRows &rows, const vector<int32_t> &ids, const vector<string> &names) {
+	REQUIRE(rows.size() == ids.size());
+	REQUIRE(rows.size() == names.size());
+	for (idx_t row_idx = 0; row_idx < rows.size(); row_idx++) {
+		REQUIRE(rows[row_idx].size() == 2);
+		REQUIRE(rows[row_idx][0].GetValue<int32_t>() == ids[row_idx]);
+		REQUIRE(rows[row_idx][1].GetValue<string>() == names[row_idx]);
 	}
 }
 
@@ -831,44 +853,38 @@ TEST_CASE("Exchange: Flight service isolates published attempts and rejects rele
 	server_config.server_epoch = epoch;
 	FlightServer server(std::move(server_config));
 	REQUIRE(server.Start().is_ok());
-	FlightClientConfig client_config;
-	client_config.location = "grpc://127.0.0.1:" + std::to_string(server.port());
-	FlightClient client(std::move(client_config));
+	FlightExchangeConfig source_config;
+	source_config.local_dirs = {TestCreatePath("flight_catalog_isolation_reader")};
+	source_config.node_id = "reader-node";
+	source_config.expected_types = {LogicalType::INTEGER};
 
 	auto fetch = [&](const std::string &exchange_id, const std::string &ticket_epoch) {
-		FlightExchangeTicket ticket;
-		ticket.server_epoch = ticket_epoch;
-		ticket.exchange_instance_id = exchange_id;
-		ticket.node_id = node_id;
-		ticket.attempt_id = 1;
-		ticket.partition_idx = 0;
-		return client.FetchPartition(context, ticket, {LogicalType::INTEGER});
+		auto handle = MakeSourceHandle(exchange_id, node_id, 0, 1);
+		handle.flight_host = "127.0.0.1";
+		handle.flight_port = server.port();
+		handle.flight_server_epoch = ticket_epoch;
+		try {
+			auto rows = ReadSourceRows(context, source_config, {std::move(handle)});
+			vector<int32_t> values;
+			for (const auto &row : rows) {
+				values.push_back(row[0].GetValue<int32_t>());
+			}
+			return std::make_pair(std::move(values), string());
+		} catch (const std::exception &ex) {
+			return std::make_pair(vector<int32_t>(), string(ex.what()));
+		}
 	};
 	auto fetched_a = fetch(exchange_a, epoch);
 	auto fetched_b = fetch(exchange_b, epoch);
-	REQUIRE(fetched_a.is_ok());
-	REQUIRE(fetched_b.is_ok());
-	REQUIRE(fetched_a.value()->Count() == 1);
-	REQUIRE(fetched_b.value()->Count() == 1);
-	vector<int32_t> values_a;
-	vector<int32_t> values_b;
-	for (auto &chunk : fetched_a.value()->Chunks()) {
-		for (idx_t row = 0; row < chunk.size(); row++) {
-			values_a.push_back(chunk.GetValue(0, row).GetValue<int32_t>());
-		}
-	}
-	for (auto &chunk : fetched_b.value()->Chunks()) {
-		for (idx_t row = 0; row < chunk.size(); row++) {
-			values_b.push_back(chunk.GetValue(0, row).GetValue<int32_t>());
-		}
-	}
-	REQUIRE(values_a == vector<int32_t> {11});
-	REQUIRE(values_b == vector<int32_t> {22});
+	REQUIRE(fetched_a.second.empty());
+	REQUIRE(fetched_b.second.empty());
+	REQUIRE(fetched_a.first == vector<int32_t> {11});
+	REQUIRE(fetched_b.first == vector<int32_t> {22});
 
 	registry.RemoveForDeferredCleanup(exchange_a);
-	REQUIRE(fetch(exchange_a, epoch).is_err());
-	REQUIRE(fetch(exchange_b, epoch).is_ok());
-	REQUIRE(fetch(exchange_b, "stale-epoch").is_err());
+	REQUIRE_FALSE(fetch(exchange_a, epoch).second.empty());
+	REQUIRE(fetch(exchange_b, epoch).second.empty());
+	REQUIRE_FALSE(fetch(exchange_b, "stale-epoch").second.empty());
 
 	REQUIRE(server.Stop().is_ok());
 	registry.RemoveForDeferredCleanup(exchange_b);
@@ -987,7 +1003,7 @@ TEST_CASE("Exchange: ShuffleCache write/read", "[distributed][exchange]") {
 	config.node_id = "node_1";
 	config.num_partitions = 2;
 	config.local_dirs = {TestCreatePath("exchange_cache_basic")};
-	ShuffleCache cache(std::move(config));
+	auto cache = std::make_shared<ShuffleCache>(std::move(config));
 
 	vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::VARCHAR};
 	vector<int32_t> ids = {1, 2, 3};
@@ -995,13 +1011,13 @@ TEST_CASE("Exchange: ShuffleCache write/read", "[distributed][exchange]") {
 	DataChunk chunk;
 	PopulateTwoColumnChunk(chunk, types, ids, names);
 
-	auto write_res = cache.WriteChunk(context, chunk, 1, {"id", "name"});
+	auto write_res = cache->WriteChunk(context, chunk, 1, {"id", "name"});
 	REQUIRE(write_res.is_ok());
 
-	auto flush_res = cache.FlushAll(context, cache.BufferedNames());
+	auto flush_res = cache->FlushAll(context, cache->BufferedNames());
 	REQUIRE(flush_res.is_ok());
 
-	auto files_res = cache.GetPartitionFiles(1);
+	auto files_res = cache->GetPartitionFiles(1);
 	REQUIRE(files_res.is_ok());
 	auto files = files_res.value();
 	REQUIRE(files.files.size() == 1);
@@ -1012,11 +1028,14 @@ TEST_CASE("Exchange: ShuffleCache write/read", "[distributed][exchange]") {
 	REQUIRE(files.total_rows == static_cast<idx_t>(ids.size()));
 	REQUIRE(files.total_bytes >= file.bytes);
 
-	auto read_res = cache.ReadPartition(context, 1, types);
-	REQUIRE(read_res.is_ok());
-	auto collection = std::move(read_res.value());
-	REQUIRE(collection != nullptr);
-	RequireCollectionValues(*collection, ids, names);
+	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("stage_1", cache, "cache-basic-query").is_ok());
+	FlightExchangeConfig source_config;
+	source_config.node_id = "node_1";
+	source_config.expected_types = types;
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_1", "node_1", 1)});
+	RequireTwoColumnRows(rows, ids, names);
+	ShuffleCacheRegistry::Instance().Remove("stage_1");
 }
 
 TEST_CASE("Exchange: ShuffleCache flushes large BLOB buffers by actual allocation size", "[distributed][exchange]") {
@@ -1031,16 +1050,16 @@ TEST_CASE("Exchange: ShuffleCache flushes large BLOB buffers by actual allocatio
 	config.node_id = "node_blob";
 	config.num_partitions = 1;
 	config.local_dirs = {TestCreatePath("exchange_cache_large_blob")};
-	ShuffleCache cache(std::move(config));
+	auto cache = std::make_shared<ShuffleCache>(std::move(config));
 
 	vector<int32_t> ids = {1, 2};
 	vector<string> blobs = {string(4096, 'a'), string(4096, 'b')};
 	DataChunk chunk;
 	PopulateBlobChunk(chunk, ids, blobs);
 
-	REQUIRE(cache.WriteChunk(context, chunk, 0, {"id", "payload"}).is_ok());
+	REQUIRE(cache->WriteChunk(context, chunk, 0, {"id", "payload"}).is_ok());
 
-	auto files_res = cache.GetPartitionFiles(0);
+	auto files_res = cache->GetPartitionFiles(0);
 	REQUIRE(files_res.is_ok());
 	auto files = files_res.value();
 	REQUIRE(files.files.size() == 1);
@@ -1048,11 +1067,15 @@ TEST_CASE("Exchange: ShuffleCache flushes large BLOB buffers by actual allocatio
 	REQUIRE(files.total_bytes > 0);
 
 	vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::BLOB};
-	auto read_res = cache.ReadPartition(context, 0, types);
-	REQUIRE(read_res.is_ok());
-	auto collection = std::move(read_res.value());
-	REQUIRE(collection != nullptr);
-	REQUIRE(collection->Count() == static_cast<idx_t>(ids.size()));
+	REQUIRE(cache->FlushAll(context, {"id", "payload"}).is_ok());
+	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("stage_large_blob", cache, "cache-blob-query").is_ok());
+	FlightExchangeConfig source_config;
+	source_config.node_id = "node_blob";
+	source_config.expected_types = types;
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_large_blob", "node_blob", 0)});
+	REQUIRE(rows.size() == ids.size());
+	ShuffleCacheRegistry::Instance().Remove("stage_large_blob");
 }
 
 TEST_CASE("Exchange: ShuffleCache bounds aggregate buffers across partitions", "[distributed][exchange]") {
@@ -1203,12 +1226,27 @@ TEST_CASE("Exchange: ShuffleCache committed manifest replay via object storage b
 	    },
 	    storage);
 
-	auto read_res = replay_cache.ReadPartition(context, 1, types);
-	REQUIRE(read_res.is_ok());
-	auto collection = std::move(read_res.value());
-	REQUIRE(collection != nullptr);
-	REQUIRE(collection->Count() == static_cast<idx_t>(ids.size()));
-	RequireCollectionValues(*collection, ids, names);
+	auto files_res = replay_cache.GetPartitionFilesFromManifest(1);
+	REQUIRE(files_res.is_ok());
+	REQUIRE(files_res.value().total_rows == static_cast<idx_t>(ids.size()));
+	REQUIRE(files_res.value().files.size() == 1);
+	auto input_res = replay_cache.OpenPartitionFile(files_res.value().files[0].path);
+	REQUIRE(input_res.is_ok());
+	auto reader_res = arrow::ipc::RecordBatchStreamReader::Open(input_res.value());
+	REQUIRE(reader_res.ok());
+	auto reader = std::move(reader_res).ValueOrDie();
+	std::shared_ptr<arrow::RecordBatch> batch;
+	REQUIRE(reader->ReadNext(&batch).ok());
+	REQUIRE(batch != nullptr);
+	REQUIRE(batch->num_rows() == static_cast<int64_t>(ids.size()));
+	auto id_array = std::static_pointer_cast<arrow::Int32Array>(batch->column(0));
+	auto name_array = std::static_pointer_cast<arrow::StringArray>(batch->column(1));
+	for (idx_t row_idx = 0; row_idx < ids.size(); row_idx++) {
+		REQUIRE(id_array->Value(row_idx) == ids[row_idx]);
+		REQUIRE(name_array->GetString(row_idx) == names[row_idx]);
+	}
+	REQUIRE(reader->ReadNext(&batch).ok());
+	REQUIRE(batch == nullptr);
 }
 
 TEST_CASE("Exchange: ShuffleCache empty partition handling", "[distributed][exchange]") {
@@ -1221,32 +1259,32 @@ TEST_CASE("Exchange: ShuffleCache empty partition handling", "[distributed][exch
 	config.node_id = "node_empty";
 	config.num_partitions = 1;
 	config.local_dirs = {TestCreatePath("exchange_cache_empty")};
-	ShuffleCache cache(std::move(config));
+	auto cache = std::make_shared<ShuffleCache>(std::move(config));
 
 	vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::VARCHAR};
 	DataChunk zero_row_chunk;
 	zero_row_chunk.Initialize(Allocator::DefaultAllocator(), types);
-	REQUIRE(cache.WriteChunk(context, zero_row_chunk, 0, {"id", "name"}).is_ok());
-	REQUIRE(cache.GetBufferedBytes() == 0);
-	REQUIRE(cache.GetBufferBudgetBytes() == 0);
-
-	auto empty_res = cache.ReadPartition(context, 0, types);
-	REQUIRE(empty_res.is_ok());
-	auto empty_collection = std::move(empty_res.value());
-	REQUIRE(empty_collection != nullptr);
-	REQUIRE(empty_collection->Count() == 0);
-	REQUIRE(empty_collection->Types() == types);
-
-	auto missing_types_res = cache.ReadPartition(context, 0, {});
-	REQUIRE(missing_types_res.is_err());
+	REQUIRE(cache->WriteChunk(context, zero_row_chunk, 0, {"id", "name"}).is_ok());
+	REQUIRE(cache->GetBufferedBytes() == 0);
+	REQUIRE(cache->GetBufferBudgetBytes() == 0);
+	REQUIRE(cache->EnsureSchemaFile(context, types, {"id", "name"}).is_ok());
+	REQUIRE(cache->FlushAll(context, {"id", "name"}).is_ok());
+	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("stage_empty", cache, "cache-empty-query").is_ok());
+	FlightExchangeConfig source_config;
+	source_config.node_id = "node_empty";
+	source_config.expected_types = types;
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_empty", "node_empty", 0)});
+	REQUIRE(rows.empty());
 
 	vector<int32_t> ids = {9};
 	vector<string> names_vec = {"x"};
 	DataChunk chunk;
 	PopulateTwoColumnChunk(chunk, types, ids, names_vec);
 
-	auto bad_partition_res = cache.WriteChunk(context, chunk, 2, {"id", "name"});
+	auto bad_partition_res = cache->WriteChunk(context, chunk, 2, {"id", "name"});
 	REQUIRE(bad_partition_res.is_err());
+	ShuffleCacheRegistry::Instance().Remove("stage_empty");
 }
 
 TEST_CASE("Exchange: ShuffleCache multiple chunks to same partition", "[distributed][exchange]") {
@@ -1259,7 +1297,7 @@ TEST_CASE("Exchange: ShuffleCache multiple chunks to same partition", "[distribu
 	config.node_id = "node_1";
 	config.num_partitions = 1;
 	config.local_dirs = {TestCreatePath("exchange_cache_multi_chunk")};
-	ShuffleCache cache(std::move(config));
+	auto cache = std::make_shared<ShuffleCache>(std::move(config));
 
 	vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::VARCHAR};
 
@@ -1268,27 +1306,29 @@ TEST_CASE("Exchange: ShuffleCache multiple chunks to same partition", "[distribu
 	vector<string> names1 = {"a", "b"};
 	DataChunk chunk1;
 	PopulateTwoColumnChunk(chunk1, types, ids1, names1);
-	REQUIRE(cache.WriteChunk(context, chunk1, 0, {"id", "name"}).is_ok());
+	REQUIRE(cache->WriteChunk(context, chunk1, 0, {"id", "name"}).is_ok());
 
 	// Write second chunk
 	vector<int32_t> ids2 = {3, 4, 5};
 	vector<string> names2 = {"c", "d", "e"};
 	DataChunk chunk2;
 	PopulateTwoColumnChunk(chunk2, types, ids2, names2);
-	REQUIRE(cache.WriteChunk(context, chunk2, 0, {"id", "name"}).is_ok());
+	REQUIRE(cache->WriteChunk(context, chunk2, 0, {"id", "name"}).is_ok());
 
-	REQUIRE(cache.FlushAll(context, cache.BufferedNames()).is_ok());
-
-	auto read_res = cache.ReadPartition(context, 0, types);
-	REQUIRE(read_res.is_ok());
-	auto collection = std::move(read_res.value());
-	REQUIRE(collection != nullptr);
-	REQUIRE(collection->Count() == 5);
+	REQUIRE(cache->FlushAll(context, cache->BufferedNames()).is_ok());
+	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("stage_multi_chunk", cache, "cache-multi-chunk-query").is_ok());
+	FlightExchangeConfig source_config;
+	source_config.node_id = "node_1";
+	source_config.expected_types = types;
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_multi_chunk", "node_1", 0)});
+	REQUIRE(rows.size() == 5);
 
 	// All rows should be present
 	vector<int32_t> all_ids = {1, 2, 3, 4, 5};
 	vector<string> all_names = {"a", "b", "c", "d", "e"};
-	RequireCollectionValues(*collection, all_ids, all_names);
+	RequireTwoColumnRows(rows, all_ids, all_names);
+	ShuffleCacheRegistry::Instance().Remove("stage_multi_chunk");
 }
 
 TEST_CASE("Exchange: ShuffleCache write to multiple partitions", "[distributed][exchange]") {
@@ -1301,7 +1341,7 @@ TEST_CASE("Exchange: ShuffleCache write to multiple partitions", "[distributed][
 	config.node_id = "node_1";
 	config.num_partitions = 3;
 	config.local_dirs = {TestCreatePath("exchange_cache_multi_part")};
-	ShuffleCache cache(std::move(config));
+	auto cache = std::make_shared<ShuffleCache>(std::move(config));
 
 	vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::VARCHAR};
 
@@ -1310,33 +1350,34 @@ TEST_CASE("Exchange: ShuffleCache write to multiple partitions", "[distributed][
 	vector<string> names0 = {"ten", "twenty"};
 	DataChunk chunk0;
 	PopulateTwoColumnChunk(chunk0, types, ids0, names0);
-	REQUIRE(cache.WriteChunk(context, chunk0, 0, {"id", "name"}).is_ok());
+	REQUIRE(cache->WriteChunk(context, chunk0, 0, {"id", "name"}).is_ok());
 
 	// Write to partition 2
 	vector<int32_t> ids2 = {30};
 	vector<string> names2 = {"thirty"};
 	DataChunk chunk2;
 	PopulateTwoColumnChunk(chunk2, types, ids2, names2);
-	REQUIRE(cache.WriteChunk(context, chunk2, 2, {"id", "name"}).is_ok());
+	REQUIRE(cache->WriteChunk(context, chunk2, 2, {"id", "name"}).is_ok());
 
-	REQUIRE(cache.FlushAll(context, cache.BufferedNames()).is_ok());
+	REQUIRE(cache->FlushAll(context, cache->BufferedNames()).is_ok());
+	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("stage_multi_part", cache, "cache-multi-part-query").is_ok());
+	FlightExchangeConfig source_config;
+	source_config.node_id = "node_1";
+	source_config.expected_types = types;
 
 	// Partition 0 should have 2 rows
-	auto read0 = cache.ReadPartition(context, 0, types);
-	REQUIRE(read0.is_ok());
-	REQUIRE(read0.value()->Count() == 2);
-	RequireCollectionValues(*read0.value(), ids0, names0);
+	auto rows0 = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_multi_part", "node_1", 0)});
+	RequireTwoColumnRows(rows0, ids0, names0);
 
 	// Partition 1 should be empty
-	auto read1 = cache.ReadPartition(context, 1, types);
-	REQUIRE(read1.is_ok());
-	REQUIRE(read1.value()->Count() == 0);
+	auto rows1 = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_multi_part", "node_1", 1)});
+	REQUIRE(rows1.empty());
 
 	// Partition 2 should have 1 row
-	auto read2 = cache.ReadPartition(context, 2, types);
-	REQUIRE(read2.is_ok());
-	REQUIRE(read2.value()->Count() == 1);
-	RequireCollectionValues(*read2.value(), ids2, names2);
+	auto rows2 = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_multi_part", "node_1", 2)});
+	RequireTwoColumnRows(rows2, ids2, names2);
+	ShuffleCacheRegistry::Instance().Remove("stage_multi_part");
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2026,10 +2067,11 @@ TEST_CASE("Exchange: FlightExchangeSink write and flush", "[distributed][exchang
 	REQUIRE(manifest_contents.find("file=0") != std::string::npos);
 
 	// Verify data was written
-	auto read_res = cache->ReadPartition(context, 0, types);
-	REQUIRE(read_res.is_ok());
-	REQUIRE(read_res.value()->Count() == 3);
-	RequireCollectionValues(*read_res.value(), ids, names);
+	FlightExchangeConfig source_config;
+	source_config.node_id = "node_1";
+	source_config.expected_types = types;
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("sink_test_stage", "node_1", 0)});
+	RequireTwoColumnRows(rows, ids, names);
 
 	// Cleanup
 	ShuffleCacheRegistry::Instance().Remove("sink_test_stage");
@@ -2190,6 +2232,69 @@ TEST_CASE("Exchange: FlightExchangeSource read from registry", "[distributed][ex
 
 	source.Close();
 	ShuffleCacheRegistry::Instance().Remove("source_test_stage");
+}
+
+TEST_CASE("Exchange: FlightExchangeSource accepts RecordBatches larger than a standard vector",
+          "[distributed][exchange]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto &context = *conn.context;
+	const string output_location = "source_oversized_batch";
+	const string node_id = "node_oversized";
+	const idx_t row_count = STANDARD_VECTOR_SIZE + 1;
+	const auto file_path = TestCreatePath("exchange_source_oversized_batch.arrow");
+
+	arrow::Int32Builder builder;
+	for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
+		REQUIRE(builder.Append(static_cast<int32_t>(row_idx)).ok());
+	}
+	std::shared_ptr<arrow::Array> values;
+	REQUIRE(builder.Finish(&values).ok());
+	auto schema = arrow::schema({arrow::field("value", arrow::int32())});
+	auto batch = arrow::RecordBatch::Make(schema, static_cast<int64_t>(row_count), {std::move(values)});
+	auto output_res = arrow::io::FileOutputStream::Open(file_path);
+	REQUIRE(output_res.ok());
+	auto file_output = std::move(output_res).ValueOrDie();
+	auto writer_res = arrow::ipc::MakeStreamWriter(file_output, schema);
+	REQUIRE(writer_res.ok());
+	auto writer = std::move(writer_res).ValueOrDie();
+	REQUIRE(writer->WriteRecordBatch(*batch).ok());
+	REQUIRE(writer->Close().ok());
+	REQUIRE(file_output->Close().ok());
+
+	ShuffleCacheConfig cache_config;
+	cache_config.shuffle_stage_id = output_location;
+	cache_config.node_id = node_id;
+	cache_config.num_partitions = 1;
+	cache_config.local_dirs = {TestCreatePath("exchange_source_oversized_cache")};
+	auto cache = std::make_shared<ShuffleCache>(std::move(cache_config));
+	auto fs = FileSystem::CreateLocal();
+	auto file_handle = fs->OpenFile(file_path, FileOpenFlags(FileOpenFlags::FILE_FLAGS_READ));
+	ShufflePartitionFile file;
+	file.path = file_path;
+	file.rows = row_count;
+	file.bytes = file_handle->GetFileSize();
+	REQUIRE(cache->RegisterPartitionFile(0, std::move(file)).is_ok());
+	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
+	REQUIRE(ShuffleCacheRegistry::Instance().Register(output_location, cache, "source-oversized-query").is_ok());
+
+	FlightExchangeConfig source_config;
+	source_config.node_id = node_id;
+	source_config.expected_types = {LogicalType::INTEGER};
+	FlightExchangeSource source(source_config, &context);
+	source.AddSourceHandles({MakeSourceHandle(output_location, node_id, 0)});
+	vector<LogicalType> output_types = {LogicalType::INTEGER};
+	DataChunk output;
+	output.Initialize(Allocator::DefaultAllocator(), output_types);
+	REQUIRE(output.GetCapacity() == STANDARD_VECTOR_SIZE);
+	REQUIRE(source.ReadChunk(output));
+	REQUIRE(output.size() == row_count);
+	REQUIRE(output.GetCapacity() >= row_count);
+	REQUIRE(output.GetValue(0, 0).GetValue<int32_t>() == 0);
+	REQUIRE(output.GetValue(0, row_count - 1).GetValue<int32_t>() == static_cast<int32_t>(row_count - 1));
+	REQUIRE_FALSE(source.ReadChunk(output));
+	source.Close();
+	ShuffleCacheRegistry::Instance().Remove(output_location);
 }
 
 TEST_CASE("Exchange: FlightExchangeSource multiple partitions", "[distributed][exchange]") {

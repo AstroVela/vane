@@ -199,7 +199,7 @@ unique_ptr<GlobalSourceState> PhysicalRemoteExchangeSource::GetGlobalSourceState
 	}
 
 	// Pass worker-side ClientContext to the ExchangeManager so that
-	// FlightExchangeSource receives a valid context for ReadPartition().
+	// FlightExchangeSource can open and convert partition streams.
 	// During deserialization the manager is created without a context.
 	exchange_mgr_->SetContext(&context);
 	auto max_threads =

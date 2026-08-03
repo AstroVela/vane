@@ -5,7 +5,6 @@
 
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
-#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -15,7 +14,6 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
-#include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
@@ -115,16 +113,6 @@ vector<LogicalType> ToArrowTypes(const vector<LogicalType> &types) {
 		}
 	}
 	return result;
-}
-
-bool IsArrowCompatibleType(const LogicalType &arrow_type, const LogicalType &expected_type) {
-	if (arrow_type == expected_type) {
-		return true;
-	}
-	if (expected_type.id() == LogicalTypeId::AGGREGATE_STATE && arrow_type.id() == LogicalTypeId::BLOB) {
-		return true;
-	}
-	return false;
 }
 
 unsigned long long ParsePositiveByteCount(const char *name, const char *raw) {
@@ -1562,145 +1550,6 @@ DuckDBResult<std::vector<ShufflePartitionFile>> ShuffleCache::WriteCollection(Cl
 		return DuckDBResult<std::vector<ShufflePartitionFile>>::err(files_res.error());
 	}
 	return DuckDBResult<std::vector<ShufflePartitionFile>>::ok(std::move(files_res.value().files));
-}
-
-DuckDBResult<std::unique_ptr<ColumnDataCollection>>
-ShuffleCache::ReadPartition(ClientContext &context, idx_t partition_idx, const vector<LogicalType> &expected_types) {
-	auto files_res = GetPartitionFiles(partition_idx);
-	ShufflePartitionFiles files;
-	if (files_res.is_err()) {
-		return DuckDBResult<std::unique_ptr<ColumnDataCollection>>::err(files_res.error());
-	}
-	files = std::move(files_res.value());
-
-	// Durable recovery path: if the in-memory partition registry has no files,
-	// read the committed manifest for this attempt and use it as the source of truth.
-	if (files.files.empty() && !config_.local_dirs.empty()) {
-		if (HasCommittedManifest()) {
-			auto manifest_files_res = GetPartitionFilesFromManifest(partition_idx);
-			if (manifest_files_res.is_err()) {
-				return DuckDBResult<std::unique_ptr<ColumnDataCollection>>::err(manifest_files_res.error());
-			}
-			files = std::move(manifest_files_res.value());
-		}
-	}
-	if (files.files.empty()) {
-		if (expected_types.empty()) {
-			return DuckDBResult<std::unique_ptr<ColumnDataCollection>>::err(
-			    DuckDBError::value_error("shuffle partition is empty and expected types are missing"));
-		}
-		std::unique_ptr<ColumnDataCollection> empty(
-		    new ColumnDataCollection(Allocator::DefaultAllocator(), expected_types));
-		return DuckDBResult<std::unique_ptr<ColumnDataCollection>>::ok(std::move(empty));
-	}
-
-	auto first_input = storage_->OpenArrowInput(files.files[0].path);
-	if (first_input.is_err()) {
-		return DuckDBResult<std::unique_ptr<ColumnDataCollection>>::err(first_input.error());
-	}
-	auto first_reader_res = arrow::ipc::RecordBatchStreamReader::Open(first_input.value());
-	if (!first_reader_res.ok()) {
-		return DuckDBResult<std::unique_ptr<ColumnDataCollection>>::err(
-		    ShuffleCacheArrowToError(first_reader_res.status(), "open ipc reader"));
-	}
-	auto first_reader = std::move(first_reader_res).ValueOrDie();
-	auto schema = first_reader->schema();
-
-	ArrowSchema c_schema;
-	c_schema.Init();
-	auto export_status = arrow::ExportSchema(*schema, &c_schema);
-	if (!export_status.ok()) {
-		return DuckDBResult<std::unique_ptr<ColumnDataCollection>>::err(
-		    ShuffleCacheArrowToError(export_status, "export schema"));
-	}
-
-	ArrowTableSchema arrow_table;
-	ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, c_schema);
-	if (c_schema.release) {
-		c_schema.release(&c_schema);
-	}
-	auto &types = arrow_table.GetTypes();
-	auto output_types = expected_types;
-	bool needs_cast = false;
-
-	if (!expected_types.empty()) {
-		if (types.size() != expected_types.size()) {
-			return DuckDBResult<std::unique_ptr<ColumnDataCollection>>::err(
-			    DuckDBError::value_error("shuffle partition types mismatch"));
-		}
-		for (idx_t idx = 0; idx < types.size(); idx++) {
-			if (!IsArrowCompatibleType(types[idx], expected_types[idx])) {
-				return DuckDBResult<std::unique_ptr<ColumnDataCollection>>::err(
-				    DuckDBError::value_error("shuffle partition types mismatch"));
-			}
-			if (types[idx] != expected_types[idx]) {
-				needs_cast = true;
-			}
-		}
-	} else {
-		output_types = types;
-	}
-
-	std::unique_ptr<ColumnDataCollection> collection(
-	    new ColumnDataCollection(Allocator::DefaultAllocator(), output_types));
-	ColumnDataAppendState append_state;
-	collection->InitializeAppend(append_state);
-
-	for (const auto &file : files.files) {
-		auto input_res = storage_->OpenArrowInput(file.path);
-		if (input_res.is_err()) {
-			return DuckDBResult<std::unique_ptr<ColumnDataCollection>>::err(input_res.error());
-		}
-		auto reader_res = arrow::ipc::RecordBatchStreamReader::Open(input_res.value());
-		if (!reader_res.ok()) {
-			return DuckDBResult<std::unique_ptr<ColumnDataCollection>>::err(
-			    ShuffleCacheArrowToError(reader_res.status(), "open ipc reader"));
-		}
-		auto reader = std::move(reader_res).ValueOrDie();
-		// Stream reader: iterate until Next() returns nullptr
-		while (true) {
-			std::shared_ptr<arrow::RecordBatch> batch;
-			auto next_status = reader->ReadNext(&batch);
-			if (!next_status.ok()) {
-				return DuckDBResult<std::unique_ptr<ColumnDataCollection>>::err(
-				    ShuffleCacheArrowToError(next_status, "read record batch"));
-			}
-			if (!batch) {
-				break; // end of stream
-			}
-			if (batch->num_rows() == 0) {
-				continue;
-			}
-
-			ArrowArray c_array;
-			c_array.Init();
-			auto export_array_status = arrow::ExportRecordBatch(*batch, &c_array);
-			if (!export_array_status.ok()) {
-				return DuckDBResult<std::unique_ptr<ColumnDataCollection>>::err(
-				    ShuffleCacheArrowToError(export_array_status, "export record batch"));
-			}
-
-			auto array_wrapper = make_uniq<ArrowArrayWrapper>();
-			array_wrapper->arrow_array = c_array;
-			ArrowScanLocalState scan_state(std::move(array_wrapper), context);
-			scan_state.chunk_offset = 0;
-
-			DataChunk output;
-			output.Initialize(Allocator::DefaultAllocator(), types);
-			output.SetCardinality(batch->num_rows());
-			ArrowTableFunction::ArrowToDuckDB(scan_state, arrow_table.GetColumns(), output, 0);
-			if (needs_cast) {
-				DataChunk casted;
-				casted.Initialize(Allocator::DefaultAllocator(), output_types);
-				CastChunk(context, output, casted, output_types);
-				collection->Append(append_state, casted);
-			} else {
-				collection->Append(append_state, output);
-			}
-		}
-	}
-
-	return DuckDBResult<std::unique_ptr<ColumnDataCollection>>::ok(std::move(collection));
 }
 
 DuckDBResult<std::shared_ptr<arrow::io::InputStream>> ShuffleCache::OpenPartitionFile(const std::string &path) const {
