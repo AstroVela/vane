@@ -17,6 +17,7 @@ if typing.TYPE_CHECKING:
     import numpy as np
     import polars
     import pandas
+    from pydantic import BaseModel as _PydanticModel  # type: ignore[import-not-found]
     import pyarrow.lib
     from collections.abc import Callable, Iterable, Sequence, Mapping
     from duckdb import sqltypes, func
@@ -27,10 +28,6 @@ if typing.TYPE_CHECKING:
 
     # the field_ids argument to to_parquet and write_parquet has a recursive structure
     ParquetFieldIdsType = Mapping[str, int | "ParquetFieldIdsType"]
-
-class _PydanticModel(typing.Protocol):
-    @classmethod
-    def model_json_schema(cls) -> dict[str, typing.Any]: ...
 
 _ExpressionLike: typing.TypeAlias = (
     "Expression"

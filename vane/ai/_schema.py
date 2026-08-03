@@ -255,8 +255,8 @@ class StructuredOutputSpec:
         if isinstance(value, str):
             try:
                 decoded = _strict_json_loads(value)
-            except (TypeError, ValueError) as exc:
-                raise OutputValidationError("Prompt structured output is not valid JSON") from exc
+            except (TypeError, ValueError):
+                raise OutputValidationError("Prompt structured output is not valid JSON") from None
         elif isinstance(value, Mapping):
             decoded = dict(value)
         else:
@@ -266,8 +266,8 @@ class StructuredOutputSpec:
         validated = self.root.validate(decoded)
         try:
             return json.dumps(validated, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        except (TypeError, ValueError) as exc:
-            raise OutputValidationError("Prompt structured output is not strict JSON") from exc
+        except (TypeError, ValueError):
+            raise OutputValidationError("Prompt structured output is not strict JSON") from None
 
     def validate_openai_gpt_contract(self, model: str) -> None:
         """Enforce the stricter object rules required by OpenAI GPT models."""
@@ -475,9 +475,14 @@ def _pointer_escape(value: str) -> str:
 
 
 def _copy_json_schema(value: Any) -> dict[str, Any]:
-    model_json_schema = getattr(value, "model_json_schema", None)
-    if isinstance(value, type) and callable(model_json_schema):
-        value = model_json_schema()
+    if isinstance(value, type):
+        try:
+            from pydantic import BaseModel
+        except ImportError:
+            raise TypeError("return_format requires pydantic when passing a Pydantic BaseModel class") from None
+        if not issubclass(value, BaseModel):
+            raise TypeError("return_format class must be a Pydantic BaseModel subclass")
+        value = value.model_json_schema()
     elif not isinstance(value, Mapping):
         raise TypeError("return_format must be a Pydantic BaseModel class, a JSON schema mapping, or None")
     try:
@@ -548,22 +553,20 @@ def serialize_raw_response(response: Any, *, exclude: set[str] | None = None) ->
             )
         try:
             body = model_dump(mode="json", by_alias=True, exclude_unset=True, exclude=excluded)
-        except Exception as exc:
-            raise RawResponseSerializationError("Provider raw response body model_dump() failed") from exc
+        except Exception:
+            raise RawResponseSerializationError("Provider raw response body model_dump() failed") from None
     try:
         return json.dumps(body, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-    except (TypeError, ValueError) as exc:
-        raise RawResponseSerializationError("Provider raw response body is not strict JSON") from exc
+    except (TypeError, ValueError):
+        raise RawResponseSerializationError("Provider raw response body is not strict JSON") from None
 
 
 def validate_raw_response_json(value: Any) -> str:
     """Validate the public raw-response VARCHAR contract without rewriting it."""
     if not isinstance(value, str):
-        raise RawResponseSerializationError(
-            f"Prompt raw response must be a JSON string, got {type(value).__name__}"
-        )
+        raise RawResponseSerializationError(f"Prompt raw response must be a JSON string, got {type(value).__name__}")
     try:
         _strict_json_loads(value)
-    except (TypeError, ValueError) as exc:
-        raise RawResponseSerializationError("Prompt raw response is not valid JSON") from exc
+    except (TypeError, ValueError):
+        raise RawResponseSerializationError("Prompt raw response is not valid JSON") from None
     return value

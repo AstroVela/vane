@@ -3031,6 +3031,53 @@ def test_explicit_remote_error_pair_preserves_cause_without_output_lease():
         collector.shutdown()
 
 
+def test_remote_provider_capability_error_preserves_safe_details():
+    from duckdb.execution.udf_ray_stream_protocol import make_stream_error_pair
+    from vane.ai.provider import ProviderCapabilityError
+
+    fake_ray = _FakeRay()
+    driver = _Driver()
+
+    def submitter(lease):
+        payload = {
+            "query_id": lease["query_id"],
+            "stage_id": lease["stage_id"],
+            "task_lease_id": lease["lease_id"],
+            "attempt_id": lease["attempt_id"],
+        }
+        error = ProviderCapabilityError(
+            "openai-compatible",
+            "chat-only-model",
+            "structured Prompt generation",
+            original_error=RuntimeError("endpoint rejected schema"),
+        )
+        block, metadata = make_stream_error_pair(payload, error)
+        return _Generator([_Ref(block, is_block=True), _Ref(metadata)])
+
+    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector.track_generator_ref(
+        10,
+        101,
+        _source(fake_ray, driver, request_id="provider-capability-error", submitter=submitter),
+    )
+    try:
+        events = _drain_until(
+            collector,
+            {10: {"rows": 1, "bytes": 128, "item_bytes": 128}},
+            predicate=lambda values: any(item[2] == "error" for item in values),
+        )
+        assert [item[2] for item in events] == ["error"]
+        message = events[0][3]
+        assert "ProviderCapabilityError" in message
+        assert "openai-compatible" in message
+        assert "chat-only-model" in message
+        assert "structured Prompt generation" in message
+        assert "RuntimeError" in message
+        assert "endpoint rejected schema" not in message
+    finally:
+        collector.shutdown()
+
+
 def test_malformed_metadata_fails_only_its_stream_without_output_admission():
     fake_ray = _FakeRay()
     driver = _Driver()

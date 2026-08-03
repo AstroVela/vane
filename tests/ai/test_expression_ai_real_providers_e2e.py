@@ -14,6 +14,8 @@ import pytest
 
 import vane
 
+pytestmark = pytest.mark.external_service
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -137,6 +139,7 @@ def test_openai_embed_expression_real_provider() -> None:
     )
 
 
+@pytest.mark.gpu
 def test_vllm_prompt_expression_real_provider() -> None:
     _require_real_e2e("VANE_E2E_VLLM")
     pytest.importorskip("vllm")

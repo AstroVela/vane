@@ -63,12 +63,20 @@ from vane.ai.options import (
     validate_prompt_options,
 )
 from vane.ai.protocols import NativePrompterPlan
-from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError, load_provider
+from vane.ai.provider import (
+    Provider,
+    ProviderCapabilityError,
+    _ProviderResultError,
+    _safe_original_error_summary,
+    _safe_provider_capability_error,
+    _safe_provider_execution_error,
+    load_provider,
+)
 from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_options_argument
 from vane.ai.typing import JSONSchema, UDFOptions
 
 if TYPE_CHECKING:
-    from pydantic import BaseModel
+    from pydantic import BaseModel  # type: ignore[import-not-found]
 else:
     BaseModel = Any
 
@@ -140,9 +148,18 @@ class RetryAfterError(Exception):
     """
 
     def __init__(self, retry_after: float, original: Exception | None = None) -> None:
-        super().__init__(str(original) if original else "RetryAfterError")
         self.retry_after = retry_after
-        self.__cause__ = original
+        if original is None:
+            super().__init__("RetryAfterError")
+            return
+        super().__init__(_safe_original_error_summary(original))
+        for name in ("status_code", "status", "code"):
+            try:
+                value = getattr(original, name, None)
+            except Exception:
+                continue
+            if type(value) is int and -999_999 <= value <= 999_999:
+                setattr(self, name, value)
 
 
 _TRANSIENT_EMBED_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
@@ -218,6 +235,7 @@ def _retry_call(
     """
     last_exc: Exception | None = None
     for attempt in range(1 + max(0, max_retries)):
+        wait: float | None = None
         try:
             result = fn(*args, **kwargs)
             if inspect.isawaitable(result):
@@ -246,14 +264,14 @@ def _retry_call(
                     wait = min(exc.retry_after, 120)
                 else:
                     wait = min(2**attempt, 30)  # 1, 2, 4, 8, ... capped at 30s
-                time.sleep(wait)
+        # Do not sleep while the provider exception is the active exception.
+        # Otherwise an interrupt can retain the raw SDK error as its context.
+        if wait is not None:
+            time.sleep(wait)
 
     # All retries exhausted
     assert last_exc is not None
     if on_error == "raise":
-        # Unwrap RetryAfterError to expose the original exception
-        if isinstance(last_exc, RetryAfterError) and last_exc.__cause__:
-            raise last_exc.__cause__
         raise last_exc
     return default
 
@@ -276,6 +294,7 @@ async def _retry_call_async(
     """
     last_exc: Exception | None = None
     for attempt in range(1 + max(0, max_retries)):
+        wait: float | None = None
         try:
             result = fn(*args, **kwargs)
             if on_awaitable is not None and inspect.isawaitable(result):
@@ -293,12 +312,13 @@ async def _retry_call_async(
                     wait = min(exc.retry_after, 120)
                 else:
                     wait = min(2**attempt, 30)
-                await asyncio.sleep(wait)
+        # Keep cancellation outside the raw provider exception handler so the
+        # provider error cannot become CancelledError.__context__.
+        if wait is not None:
+            await asyncio.sleep(wait)
 
     assert last_exc is not None
     if on_error == "raise":
-        if isinstance(last_exc, RetryAfterError) and last_exc.__cause__:
-            raise last_exc.__cause__
         raise last_exc
     return default
 
@@ -574,6 +594,20 @@ def _resolve_ai_batch_size(udf_opts: UDFOptions, default: int = 32) -> int:
     return default
 
 
+def _descriptor_identity(descriptor: Any) -> tuple[str, str]:
+    """Read optional diagnostic identity without trusting descriptor errors."""
+    values: list[str] = []
+    for method_name, fallback in (("get_provider", "unknown"), ("get_model", "unknown")):
+        try:
+            method = getattr(descriptor, method_name, None)
+            value = method() if callable(method) else None
+        except Exception:
+            value = None
+        candidate = value[:256].strip() if isinstance(value, str) else ""
+        values.append(candidate or fallback)
+    return values[0], values[1]
+
+
 def _normalize_embeddings(values: list[Any]) -> list[Any]:
     normalized: list[Any] = []
     for value in values:
@@ -675,9 +709,21 @@ class _EmbedTextBatch:
         if not self._embedder_loop_bound:
             return
         self._embedder = None
-        aclose = getattr(embedder, "aclose", None)
-        if aclose is not None:
-            self._run_async(aclose())
+        close_error: Exception | None = None
+        try:
+            aclose = getattr(embedder, "aclose", None)
+            if aclose is not None:
+                self._run_async(aclose())
+        except Exception as exc:
+            close_error = exc
+        if close_error is not None:
+            provider, model = _descriptor_identity(self._descriptor)
+            raise _safe_provider_execution_error(
+                provider,
+                model,
+                "Embed cleanup",
+                close_error,
+            ) from None
 
     def __getstate__(self) -> dict[str, Any]:
         # The cached client and the bound runtime capability are process-local.
@@ -690,29 +736,46 @@ class _EmbedTextBatch:
     def _coerce_embedding(self, value: Any) -> np.ndarray:
         try:
             embedding = np.asarray(value, dtype=np.float32)
-        except Exception as exc:
-            raise TypeError("Provider returned a non-numeric embedding") from exc
+        except Exception:
+            raise TypeError("Provider returned a non-numeric embedding") from None
         if embedding.ndim != 1 or embedding.size != self._dimensions:
+            provider, model = _descriptor_identity(self._descriptor)
             raise TypeError(
-                f"Provider {self._descriptor.get_provider()!r} model {self._descriptor.get_model()!r} "
+                f"Provider {provider!r} model {model!r} "
                 f"returned an embedding with length {embedding.size}; expected {self._dimensions}"
             )
         return embedding
 
     def _invoke_embedder(self, texts: list[str]) -> list[np.ndarray]:
-        raw = _retry_call(
-            self._ensure_embedder().embed_text,
-            texts,
-            max_retries=self._max_retries,
-            on_error="raise",
-            run_async=self._require_run_async(),
-            on_awaitable=self._mark_loop_bound,
-            retry_if=_is_transient_embed_error,
-        )
+        capability_error: ProviderCapabilityError | None = None
+        provider_error: Exception | None = None
+        try:
+            raw = _retry_call(
+                self._ensure_embedder().embed_text,
+                texts,
+                max_retries=self._max_retries,
+                on_error="raise",
+                run_async=self._require_run_async(),
+                on_awaitable=self._mark_loop_bound,
+                retry_if=_is_transient_embed_error,
+            )
+        except _MissingAsyncRuntimeError:
+            raise
+        except ProviderCapabilityError as exc:
+            capability_error = exc
+        except (_ProviderResultError, OutputValidationError, RawResponseSerializationError):
+            raise
+        except Exception as exc:
+            provider_error = exc
+        if capability_error is not None:
+            raise _safe_provider_capability_error(capability_error) from None
+        if provider_error is not None:
+            provider, model = _descriptor_identity(self._descriptor)
+            raise _safe_provider_execution_error(provider, model, "Embed execution", provider_error) from None
         try:
             values = list(raw)
-        except TypeError as exc:
-            raise TypeError("Provider embedding result must be a sequence") from exc
+        except TypeError:
+            raise TypeError("Provider embedding result must be a sequence") from None
         if len(values) != len(texts):
             raise ValueError(
                 f"Provider returned {len(values)} embeddings for {len(texts)} inputs; "
@@ -826,17 +889,29 @@ class _ClassifyTextBatch:
         self._classifier = None  # lazy: instantiate on first __call__
 
     def __call__(self, table: pa.Table) -> pa.Table:
-        if self._classifier is None:
-            self._classifier = self._descriptor.instantiate()
-        texts = table.column(self._column).to_pylist()
-        texts = [t if t is not None else "" for t in texts]
-        results = _retry_call(
-            self._classifier.classify_text,
-            texts,
-            self._labels,
-            max_retries=self._max_retries,
-            on_error=self._on_error,
-        )
+        capability_error: ProviderCapabilityError | None = None
+        provider_error: Exception | None = None
+        try:
+            if self._classifier is None:
+                self._classifier = self._descriptor.instantiate()
+            texts = table.column(self._column).to_pylist()
+            texts = [t if t is not None else "" for t in texts]
+            results = _retry_call(
+                self._classifier.classify_text,
+                texts,
+                self._labels,
+                max_retries=self._max_retries,
+                on_error=self._on_error,
+            )
+        except ProviderCapabilityError as exc:
+            capability_error = exc
+        except Exception as exc:
+            provider_error = exc
+        if capability_error is not None:
+            raise _safe_provider_capability_error(capability_error) from None
+        if provider_error is not None:
+            provider, model = _descriptor_identity(self._descriptor)
+            raise _safe_provider_execution_error(provider, model, "classification", provider_error) from None
         if results is None:
             results = [None] * len(texts)
 
@@ -917,9 +992,21 @@ class _PromptBatch:
         if not self._prompter_loop_bound:
             return
         self._prompter = None
-        aclose = getattr(prompter, "aclose", None)
-        if aclose is not None:
-            self._run_async(aclose())
+        close_error: Exception | None = None
+        try:
+            aclose = getattr(prompter, "aclose", None)
+            if aclose is not None:
+                self._run_async(aclose())
+        except Exception as exc:
+            close_error = exc
+        if close_error is not None:
+            provider, model = _descriptor_identity(self._descriptor)
+            raise _safe_provider_execution_error(
+                provider,
+                model,
+                "Prompt cleanup",
+                close_error,
+            ) from None
 
     def __getstate__(self) -> dict[str, Any]:
         # The cached client and the bound runtime capability are process-local.
@@ -996,19 +1083,47 @@ class _PromptBatch:
         if not row_messages:
             return pa.table({self._output_column: pa.array(results, type=pa.string())})
 
-        prompter = self._ensure_prompter()
+        capability_error: ProviderCapabilityError | None = None
+        provider_error: Exception | None = None
+        try:
+            prompter = self._ensure_prompter()
+        except _MissingAsyncRuntimeError:
+            raise
+        except ProviderCapabilityError as exc:
+            capability_error = exc
+        except Exception as exc:
+            provider_error = exc
+        if capability_error is not None:
+            raise _safe_provider_capability_error(capability_error) from None
+        if provider_error is not None:
+            provider, model = _descriptor_identity(self._descriptor)
+            raise _safe_provider_execution_error(provider, model, "Prompt initialization", provider_error) from None
 
         max_retries = self._max_retries
         on_error = self._on_error
 
         async def invoke(index: int) -> str | None:
-            result = await _retry_call_async(
-                prompter.prompt,
-                row_messages[index],
-                max_retries=max_retries,
-                on_error=on_error,
-                on_awaitable=self._mark_loop_bound,
-            )
+            capability_error: ProviderCapabilityError | None = None
+            provider_error: Exception | None = None
+            try:
+                result = await _retry_call_async(
+                    prompter.prompt,
+                    row_messages[index],
+                    max_retries=max_retries,
+                    on_error=on_error,
+                    on_awaitable=self._mark_loop_bound,
+                )
+            except ProviderCapabilityError as exc:
+                capability_error = exc
+            except (_ProviderResultError, OutputValidationError, RawResponseSerializationError):
+                raise
+            except Exception as exc:
+                provider_error = exc
+            if capability_error is not None:
+                raise _safe_provider_capability_error(capability_error) from None
+            if provider_error is not None:
+                provider, model = _descriptor_identity(self._descriptor)
+                raise _safe_provider_execution_error(provider, model, "Prompt execution", provider_error) from None
             try:
                 return self._validate_result(result)
             except (_ProviderResultError, OutputValidationError, RawResponseSerializationError):

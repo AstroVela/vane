@@ -18,14 +18,13 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import duckdb
 import vane
 from vane.ai.protocols import (
     TextClassifierDescriptor,
     TextEmbedderDescriptor,
 )
 from vane.ai.provider import Provider
-from vane.ai.typing import EmbeddingDimensions, UDFOptions
+from vane.ai.typing import EmbeddingDimensions
 
 if TYPE_CHECKING:
     from vane.ai.protocols import TextClassifier, TextEmbedder
@@ -332,6 +331,47 @@ class TestGoogleProviderEmbedPlanning:
         descriptor = GoogleProvider(api_key="test").get_text_embedder(task_type=None, title=None)
 
         assert descriptor.model_name == "gemini-embedding-2"
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_provider_dimension_metadata_is_not_sent_as_request_override(self):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from vane.ai.providers.google import GoogleProvider
+
+        async def request_for(descriptor):
+            client = MagicMock()
+            client.aio.models.embed_content = AsyncMock(
+                return_value=SimpleNamespace(
+                    embeddings=[SimpleNamespace(values=[1.0] * descriptor.get_dimensions().size)]
+                )
+            )
+            with patch("google.genai.Client", return_value=client):
+                embedder = descriptor.instantiate()
+            await embedder.embed_text(["row"])
+            return client.aio.models.embed_content.await_args.kwargs
+
+        provider = GoogleProvider(embedding_model="custom-fixed-model", embedding_dimensions=4)
+        metadata_only = provider.get_text_embedder()
+        explicit_override = provider.get_text_embedder(dimensions=3)
+
+        assert metadata_only.get_dimensions().size == 4
+        assert "config" not in asyncio.run(request_for(metadata_only))
+        explicit_request = asyncio.run(request_for(explicit_override))
+        assert explicit_request["config"]["output_dimensionality"] == 3
+
+    @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+    def test_google_embed_disables_sdk_retries(self):
+        from unittest.mock import patch
+
+        from vane.ai.providers.google import GoogleTextEmbedder
+
+        with patch("google.genai.Client") as client:
+            GoogleTextEmbedder(provider_options={"api_key": "test"}, model="embedding-model")
+
+        retry_options = client.call_args.kwargs["http_options"].retry_options
+        assert retry_options.attempts == 1
 
 
 class TestGoogleEmbeddingRowPreservation:
@@ -1567,8 +1607,7 @@ class TestRetryAfterError:
         assert gap >= 0.08  # allow timing slack
         assert gap < 0.5  # definitely not exponential backoff (1s)
 
-    def test_retry_call_unwraps_original_on_exhaust(self):
-        """When retries exhausted, the original exception is raised, not RetryAfterError."""
+    def test_retry_call_exhaustion_keeps_only_safe_diagnostics(self):
         from vane.ai.functions import RetryAfterError, _retry_call
 
         original = RuntimeError("rate limited")
@@ -1576,8 +1615,10 @@ class TestRetryAfterError:
         def fn():
             raise RetryAfterError(retry_after=0.01, original=original)
 
-        with pytest.raises(RuntimeError, match="rate limited"):
+        with pytest.raises(RetryAfterError, match="RuntimeError") as exc_info:
             _retry_call(fn, max_retries=0, on_error="raise")
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
 
     def test_retry_call_async_honors_retry_after(self):
         import asyncio
@@ -1596,7 +1637,7 @@ class TestRetryAfterError:
         assert result == "done"
         assert len(calls) == 2
 
-    def test_retry_call_async_unwraps_original(self):
+    def test_retry_call_async_exhaustion_keeps_only_safe_diagnostics(self):
         import asyncio
 
         from vane.ai.functions import RetryAfterError, _retry_call_async
@@ -1604,8 +1645,10 @@ class TestRetryAfterError:
         async def fn():
             raise RetryAfterError(retry_after=0.01, original=ValueError("overloaded"))
 
-        with pytest.raises(ValueError, match="overloaded"):
+        with pytest.raises(RetryAfterError, match="ValueError") as exc_info:
             asyncio.run(_retry_call_async(fn, max_retries=0, on_error="raise"))
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
 
 
 class TestGoogleRetryHandling:
@@ -1623,7 +1666,8 @@ class TestGoogleRetryHandling:
         with pytest.raises(RetryAfterError) as ctx:
             _raise_retry_after_on_google_error(exc)
         assert ctx.value.retry_after == 5.0  # default
-        assert ctx.value.__cause__ is exc
+        assert ctx.value.__cause__ is None
+        assert ctx.value.__context__ is None
 
     def test_google_503_raises_retry_after(self):
         """Google APIError with code=503 is converted to RetryAfterError."""
@@ -1750,8 +1794,10 @@ class TestEmbedProviderCapabilityErrors:
             "endpoint-only-model",
             "embedding endpoint/model",
         )
-        assert error.original_error is original
-        assert error.__cause__ is original
+        assert error.original_error is not original
+        assert str(error.original_error) == f"EndpointError (status_code={status_code})"
+        assert error.__cause__ is None
+        assert error.__context__ is None
 
     def test_openai_input_validation_error_is_not_misclassified_as_capability(self, monkeypatch):
         import asyncio
@@ -1806,7 +1852,8 @@ class TestEmbedProviderCapabilityErrors:
         with pytest.raises(ProviderCapabilityError) as exc_info:
             asyncio.run(embedder._embed_batch(["hello"]))
 
-        assert exc_info.value.original_error is original
+        assert exc_info.value.original_error is not original
+        assert str(exc_info.value.original_error) == "ModelError (status_code=400)"
 
     @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
     @pytest.mark.parametrize(
@@ -1854,8 +1901,11 @@ class TestEmbedProviderCapabilityErrors:
             "chat-only-model",
             "embedding endpoint/model",
         )
-        assert error.original_error is original
-        assert error.__cause__ is original
+        assert error.original_error is not original
+        expected_summary = "EndpointError" if code is None else f"EndpointError (code={code})"
+        assert str(error.original_error) == expected_summary
+        assert error.__cause__ is None
+        assert error.__context__ is None
 
     @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
     def test_google_generic_invalid_input_is_not_misclassified_as_capability(self):
@@ -1906,7 +1956,8 @@ class TestEmbedProviderCapabilityErrors:
         with pytest.raises(ProviderCapabilityError) as exc_info:
             asyncio.run(embedder.embed_text(["hello"]))
 
-        assert exc_info.value.original_error is original
+        assert exc_info.value.original_error is not original
+        assert str(exc_info.value.original_error) == "ModelError (code=400)"
 
     def test_transformers_not_implemented_model_is_a_capability_error(self, monkeypatch):
         import contextlib
@@ -2134,9 +2185,13 @@ class TestWrapperRetry:
         desc = self._make_embed_descriptor(embed)
         wrapper = _EmbedTextBatch(desc, "text", "emb", 3, max_retries=3, on_error="raise")
 
-        with pytest.raises(NonTransientError, match="invalid input"):
+        with pytest.raises(RuntimeError, match="Embed execution; upstream error: NonTransientError") as exc_info:
             _drive(wrapper, pa.table({"text": ["hello"]}))
 
+        if status_code is not None:
+            assert f"status_code={status_code}" in str(exc_info.value)
+        assert "invalid input" not in str(exc_info.value)
+        assert exc_info.value.__context__ is None
         assert calls == [["hello"]]
 
     def test_embed_ignore_isolates_without_retrying_nontransient_error(self):
@@ -2245,7 +2300,7 @@ def test_openai_responses_request_mapping_preserves_part_order():
 
 
 def test_openai_responses_rejects_stop_sequences_during_planning():
-    from vane.ai.providers.openai import OpenAIProvider, OpenAIPrompterDescriptor
+    from vane.ai.providers.openai import OpenAIPrompterDescriptor, OpenAIProvider
 
     with pytest.raises(ValueError, match="use_chat_completions=True"):
         OpenAIProvider().get_prompter(stop_sequences=["END"])
@@ -2389,11 +2444,91 @@ def test_prompt_provider_capability_error_preserves_context():
     with pytest.raises(ProviderCapabilityError) as error:
         asyncio.run(prompter.prompt(("hello",)))
 
-    assert (error.value.provider, error.value.model, error.value.original_error) == (
+    assert (error.value.provider, error.value.model) == (
         "compatible-endpoint",
         "unknown-model",
-        original,
     )
+    assert error.value.original_error is not original
+    assert str(error.value.original_error) == "EndpointError (status_code=404)"
+
+
+def test_provider_capability_error_redacts_upstream_credentials_and_round_trips(monkeypatch):
+    import asyncio
+    import sys
+    import traceback
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    import cloudpickle
+
+    from vane.ai.provider import ProviderCapabilityError
+    from vane.ai.providers.openai import OpenAITextEmbedder
+
+    secret = "AIzaSyD4n0m5M_NTpvI_GlTgQeX82aBcDeFgHi"
+
+    class EndpointError(Exception):
+        status_code = 404
+
+    original = EndpointError(f"GET https://api.example/v1?key={secret} failed")
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAIError=EndpointError))
+    embedder = OpenAITextEmbedder.__new__(OpenAITextEmbedder)
+    embedder._client = MagicMock()
+    embedder._client.embeddings.create = AsyncMock(side_effect=original)
+    embedder._provider_name = "openai-compatible"
+    embedder._model = "chat-only-model"
+    embedder._dimensions = 4
+    embedder._encoding_format = "float"
+
+    with pytest.raises(ProviderCapabilityError) as exc_info:
+        asyncio.run(embedder._embed_batch(["hello"]))
+
+    error = exc_info.value
+    traceback_text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    surfaces = (str(error), repr(error.original_error), repr(error.__dict__), traceback_text)
+    assert all(secret not in surface for surface in surfaces)
+    assert error.original_error is not original
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert str(error.original_error) == "EndpointError (status_code=404)"
+
+    from duckdb.execution.udf_ray_stream_protocol import make_stream_error_pair
+
+    _, stream_metadata = make_stream_error_pair(
+        {
+            "query_id": "query",
+            "stage_id": "stage",
+            "task_lease_id": "lease",
+            "attempt_id": "attempt",
+        },
+        error,
+    )
+    assert secret not in repr(stream_metadata)
+
+    for serializer in (pickle, cloudpickle):
+        restored = serializer.loads(serializer.dumps(error))
+        assert (restored.provider, restored.model, restored.capability) == (
+            error.provider,
+            error.model,
+            error.capability,
+        )
+        assert restored.original_error_summary == error.original_error_summary
+        assert secret not in repr(restored.__dict__)
+
+
+def test_provider_capability_error_never_stringifies_unbounded_upstream_text():
+    from vane.ai.provider import ProviderCapabilityError
+
+    class UnboundedError(Exception):
+        status_code = 503
+
+        def __str__(self):
+            raise AssertionError("upstream message must not be inspected")
+
+    original = UnboundedError("x " * 1_048_576)
+    error = ProviderCapabilityError("provider", "model", "capability", original_error=original)
+
+    assert error.original_error_summary == "UnboundedError (status_code=503)"
+    assert original not in error.__dict__.values()
 
 
 def test_prompt_batch_retry_and_row_isolation():

@@ -164,6 +164,8 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
                 "No max_tokens configured for the Anthropic provider. "
                 "Pass max_tokens=... or configure AnthropicProvider(max_tokens=...)."
             )
+        if self.prompt_options["max_tokens"] == 0 and self.return_format is not None:
+            raise ValueError("Anthropic max_tokens=0 cannot be used with structured Prompt output")
         self.provider_options = wrap_sensitive_options(self.provider_options)
         self.prompt_options = wrap_sensitive_options(self.prompt_options)
 
@@ -283,17 +285,21 @@ class AnthropicPrompter:
                 "disable_parallel_tool_use": True,
             }
 
+        capability_error: ProviderCapabilityError | None = None
         try:
             response = await self._client.messages.create(**kwargs)
         except Exception as exc:
             if _is_prompt_capability_error(exc):
-                raise ProviderCapabilityError(
+                capability_error = ProviderCapabilityError(
                     self._provider_name,
                     self._model,
                     self._requested_capability(),
                     original_error=exc,
-                ) from exc
-            raise
+                )
+            else:
+                raise
+        if capability_error is not None:
+            raise capability_error from None
 
         usage = getattr(response, "usage", None)
         if usage is not None:

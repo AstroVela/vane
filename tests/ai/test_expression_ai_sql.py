@@ -766,6 +766,28 @@ def test_ai_prompt_sql_vllm_validates_structured_output(monkeypatch):
     assert builds[0][1]["generate_args"]["sampling_params"]["structured_outputs"] == {"json": json.loads(schema)}
 
 
+def test_ai_prompt_sql_rejects_anthropic_zero_tokens_with_structured_output():
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        }
+    )
+
+    with pytest.raises(Exception, match="max_tokens=0.*structured"):
+        vane.connect().sql(f"""
+            SELECT ai_prompt(
+                'hello',
+                return_format := json '{schema}',
+                provider := 'anthropic',
+                model := 'claude-test',
+                options := struct_pack(max_tokens := 0)
+            )
+        """)
+
+
 def test_ai_prompt_sql_vllm_survives_plan_round_trip_as_native_operator(monkeypatch):
     import duckdb.execution.vllm as vllm_executor
 

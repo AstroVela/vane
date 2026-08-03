@@ -33,6 +33,7 @@ from duckdb.execution._vllm_options_protocol import (
 )
 from duckdb.runners.ray.ray_env import build_session_runtime_env_vars, install_explicit_session_runtime_env
 from duckdb.runners.ray.safe_get import configured_ray_get_timeout_s, resolve_object_refs_blocking
+from vane.ai.provider import _safe_provider_execution_error, _SafeProviderError
 
 
 def _positive_float_env(name: str, default: float | None = None) -> float | None:
@@ -346,11 +347,12 @@ class LocalVLLMExecutor(VLLMExecutor):
             args = AsyncEngineArgs(model=self.model, **self.engine_args)
             self.llm = AsyncLLMEngine.from_engine_args(args)
         except Exception as exc:
+            error_message = str(_safe_provider_execution_error("vllm", self.model, "engine initialization", exc))
             if self.on_error == "raise":
                 with self.error_lock:
                     if self.error_message is None:
-                        self.error_message = f"{type(exc).__name__}: {exc}"
-            self.engine_error_message = f"{type(exc).__name__}: {exc}"
+                        self.error_message = error_message
+            self.engine_error_message = error_message
         finally:
             self.engine_ready.set()
 
@@ -361,11 +363,12 @@ class LocalVLLMExecutor(VLLMExecutor):
             args = AsyncEngineArgs(model=self.model, **self.engine_args)
             self.llm = AsyncLLMEngine.from_engine_args(args)
         except Exception as exc:
+            error_message = str(_safe_provider_execution_error("vllm", self.model, "engine initialization", exc))
             if self.on_error == "raise":
                 with self.error_lock:
                     if self.error_message is None:
-                        self.error_message = f"{type(exc).__name__}: {exc}"
-            self.engine_error_message = f"{type(exc).__name__}: {exc}"
+                        self.error_message = error_message
+            self.engine_error_message = error_message
         finally:
             self.engine_ready.set()
 
@@ -397,9 +400,9 @@ class LocalVLLMExecutor(VLLMExecutor):
             if not self._ray_actor_mode and not self.engine_ready.is_set():
                 await self._wait_for_engine_ready_async()
             if self.engine_error_message is not None:
-                raise RuntimeError(f"vllm engine init failed: {self.engine_error_message}")
+                raise _SafeProviderError(f"vllm engine init failed: {self.engine_error_message}")
             if self.llm is None:
-                raise RuntimeError("vllm engine not initialized")
+                raise _SafeProviderError("vllm engine not initialized")
             with self.counter_lock:
                 request_id = str(self.counter)
                 self.counter += 1
@@ -412,7 +415,7 @@ class LocalVLLMExecutor(VLLMExecutor):
                 final_output = output
 
             if final_output is None or not final_output.outputs:
-                raise RuntimeError("vllm returned no outputs")
+                raise _SafeProviderError("vllm returned no outputs")
 
             output_text: str = final_output.outputs[0].text
             if executor_id:
@@ -422,7 +425,7 @@ class LocalVLLMExecutor(VLLMExecutor):
             self._notify_state_change()
         except Exception as exc:
             if self.on_error == "raise":
-                error_message = f"{type(exc).__name__}: {exc}"
+                error_message = str(_safe_provider_execution_error("vllm", self.model, "generation", exc))
                 if executor_id:
                     with self.task_count_lock:
                         self._per_executor_errors.setdefault(executor_id, error_message)

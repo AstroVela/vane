@@ -69,6 +69,12 @@ def test_artifact_mode_imports_installed_python_packages():
         )
 
 
+def test_vane_distribution_declares_inline_types():
+    import vane
+
+    assert Path(vane.__file__).with_name("py.typed").is_file()
+
+
 def _requirements_for_extra(extra):
     selected = set()
     for raw_requirement in requires("vane-ai") or []:

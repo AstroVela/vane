@@ -49,11 +49,7 @@ def test_finite_schema_maps_to_duckdb_arrow_and_validated_json():
             pa.field("status", pa.string(), nullable=False),
         ]
     )
-    assert json.loads(
-        spec.validate_json(
-            '{"active":true,"items":[1,2],"meta":{"score":null},"status":"ok"}'
-        )
-    ) == {
+    assert json.loads(spec.validate_json('{"active":true,"items":[1,2],"meta":{"score":null},"status":"ok"}')) == {
         "active": True,
         "items": [1, 2],
         "meta": {"score": None},
@@ -211,6 +207,16 @@ def test_pydantic_model_and_equivalent_json_schema_compile_identically():
     assert from_model.arrow_type == from_schema.arrow_type
 
 
+def test_non_pydantic_class_with_schema_method_is_rejected():
+    class FakeModel:
+        @classmethod
+        def model_json_schema(cls):
+            return PORTABLE_SCHEMA
+
+    with pytest.raises(TypeError, match="Pydantic BaseModel subclass"):
+        compile_return_format(FakeModel)
+
+
 @pytest.mark.parametrize(
     ("schema", "match"),
     [
@@ -227,9 +233,7 @@ def test_pydantic_model_and_equivalent_json_schema_compile_identically():
         (
             {
                 "type": "object",
-                "properties": {
-                    "x": {"oneOf": [{"type": "string"}, {"type": "integer"}]}
-                },
+                "properties": {"x": {"oneOf": [{"type": "string"}, {"type": "integer"}]}},
             },
             "T \\| null",
         ),

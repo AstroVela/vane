@@ -386,7 +386,7 @@ def test_prompt_failure_cancels_and_drains_sibling_requests(runtime) -> None:
     )
     wrapper.bind_async_runtime(runtime.run)
 
-    with pytest.raises(RuntimeError, match="row failed"):
+    with pytest.raises(RuntimeError, match="Prompt execution; upstream error: RuntimeError"):
         wrapper(pa.table({"text": ["slow", "fail"]}))
 
     assert descriptor.prompter.cancelled == 1

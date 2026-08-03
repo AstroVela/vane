@@ -50,9 +50,8 @@ def _guess_media_type(data: bytes) -> str | None:
     return None
 
 
-def _raise_retry_after_on_google_error(exc: Exception) -> None:
-    """Re-raise *exc* as a :class:`RetryAfterError` when the Google API
-    returns 429 (rate-limited) or 503 (service unavailable).
+def _retry_after_error_from_google_error(exc: Exception) -> Exception | None:
+    """Build a safe retry signal for Google 429/503 responses, if applicable.
 
     Parses the ``Retry-After`` header if present; otherwise falls back to
     a 5-second default wait.
@@ -61,7 +60,7 @@ def _raise_retry_after_on_google_error(exc: Exception) -> None:
 
     code = getattr(exc, "code", None)
     if code not in (429, 503):
-        return  # not retryable
+        return None
 
     # Try to extract Retry-After from the response headers
     response = getattr(exc, "response", None)
@@ -77,7 +76,14 @@ def _raise_retry_after_on_google_error(exc: Exception) -> None:
     if retry_after is None:
         retry_after = 5.0  # default wait for 429/503
 
-    raise RetryAfterError(retry_after=retry_after, original=exc) from exc
+    return RetryAfterError(retry_after=retry_after, original=exc)
+
+
+def _raise_retry_after_on_google_error(exc: Exception) -> None:
+    """Compatibility helper used by focused provider retry tests."""
+    retry_error = _retry_after_error_from_google_error(exc)
+    if retry_error is not None:
+        raise retry_error from None
 
 
 _EMBED_CAPABILITY_FIELD_SUFFIXES = (
@@ -248,9 +254,10 @@ class GoogleProvider(Provider):
             pass ``model=...``.
         embedding_model: Model used by ``get_text_embedder`` when the call
             does not pass ``model=...``.
-        embedding_dimensions: Embedding output dimensionality used when the
-            call does not pass ``dimensions=...``. Required (here or per
-            call) for embedding models without trusted dimension metadata.
+        embedding_dimensions: Trusted fixed output dimensionality used to
+            type results for models without built-in metadata. Unlike an
+            explicit call-level ``dimensions=...``, it is not sent as a
+            server-side dimensionality override.
 
     All parameters are named; a mistyped keyword raises :class:`TypeError`
     instead of silently leaking into API request options.
@@ -310,6 +317,7 @@ class GoogleProvider(Provider):
                 f"Google embedding model must be a non-empty string, got {model_name!r}. "
                 "Pass model=... or configure GoogleProvider(embedding_model=...)."
             )
+        request_dimensions = dimensions
         if dimensions is None:
             dimensions = self._embedding_dimensions
         return GoogleTextEmbedderDescriptor(
@@ -317,6 +325,7 @@ class GoogleProvider(Provider):
             provider_name=self._name,
             provider_options=provider_options,
             dimensions=dimensions,
+            request_dimensions=request_dimensions,
             embed_options=embed_options,
         )
 
@@ -368,9 +377,9 @@ class GoogleProvider(Provider):
 class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
     """Serializable factory for a Google Generative AI text embedder.
 
-    ``model_name`` is required. ``dimensions`` is required unless the model
-    has trusted metadata in :data:`_EMBEDDING_DIMS`; both are validated at
-    construction time, before anything ships to workers.
+    ``model_name`` is required. ``dimensions`` fixes the output type when the
+    provider supplies metadata for an otherwise unknown model, while
+    ``request_dimensions`` records only an explicit public call override.
 
     The default UDF ``batch_size`` matches the per-request input cap
     (:data:`_EMBED_BATCH_LIMIT`); the embedder additionally chunks
@@ -381,6 +390,7 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
     provider_name: str = "google"
     provider_options: dict[str, Any] = field(default_factory=dict)
     dimensions: int | None = None
+    request_dimensions: int | None = None
     embed_options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -433,7 +443,7 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
         return GoogleTextEmbedder(
             provider_options=self.provider_options,
             model=self.model_name,
-            dimensions=self.dimensions,
+            dimensions=self.request_dimensions,
             provider_name=self.provider_name,
             **self.embed_options,
         )
@@ -451,13 +461,19 @@ class GoogleTextEmbedder:
         **options: Any,
     ):
         from google import genai
+        from google.genai import types
 
         # Restore plaintext credentials sealed by the descriptor; plain dicts
         # from direct callers pass through unchanged.
         provider_options = unwrap_sensitive_options(provider_options)
         options = unwrap_sensitive_options(options)
         api_key = provider_options.get("api_key")
-        self._client = genai.Client(api_key=api_key) if api_key else genai.Client()
+        http_options = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
+        self._client = (
+            genai.Client(api_key=api_key, http_options=http_options)
+            if api_key
+            else genai.Client(http_options=http_options)
+        )
         self._provider_name = provider_name
         self._model = model
         self._dimensions = dimensions
@@ -492,18 +508,25 @@ class GoogleTextEmbedder:
             }
             if config:
                 kwargs["config"] = config
+            retry_error = None
+            capability_error: ProviderCapabilityError | None = None
             try:
                 result = await self._client.aio.models.embed_content(**kwargs)
             except Exception as exc:
-                _raise_retry_after_on_google_error(exc)
-                if _is_embedding_capability_error(exc):
-                    raise ProviderCapabilityError(
+                retry_error = _retry_after_error_from_google_error(exc)
+                if retry_error is None and _is_embedding_capability_error(exc):
+                    capability_error = ProviderCapabilityError(
                         getattr(self, "_provider_name", "google"),
                         self._model,
                         "embedding endpoint/model",
                         original_error=exc,
-                    ) from exc
-                raise
+                    )
+                elif retry_error is None:
+                    raise
+            if retry_error is not None:
+                raise retry_error from None
+            if capability_error is not None:
+                raise capability_error from None
             chunk_embeddings = result.embeddings or []
             if len(chunk_embeddings) != len(chunk):
                 raise _ProviderResultError(
@@ -655,6 +678,8 @@ class GooglePrompter:
 
         config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
+        retry_error = None
+        capability_error: ProviderCapabilityError | None = None
         try:
             response = await self._client.aio.models.generate_content(
                 model=self._model,
@@ -662,15 +687,20 @@ class GooglePrompter:
                 config=config,
             )
         except Exception as exc:
-            _raise_retry_after_on_google_error(exc)
-            if _is_prompt_capability_error(exc):
-                raise ProviderCapabilityError(
+            retry_error = _retry_after_error_from_google_error(exc)
+            if retry_error is None and _is_prompt_capability_error(exc):
+                capability_error = ProviderCapabilityError(
                     self._provider_name,
                     self._model,
                     self._requested_capability(),
                     original_error=exc,
-                ) from exc
-            raise
+                )
+            elif retry_error is None:
+                raise
+        if retry_error is not None:
+            raise retry_error from None
+        if capability_error is not None:
+            raise capability_error from None
 
         # Record token usage metrics
         um = getattr(response, "usage_metadata", None)

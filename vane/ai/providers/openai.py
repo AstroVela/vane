@@ -443,6 +443,7 @@ class OpenAITextEmbedder:
     async def _embed_batch(self, texts: list[str]) -> list[Embedding]:
         from openai import OpenAIError
 
+        capability_error: ProviderCapabilityError | None = None
         try:
             encoding_format = getattr(self, "_encoding_format", "float")
             kwargs: dict[str, Any] = {
@@ -484,13 +485,17 @@ class OpenAITextEmbedder:
             return [np.array(e.embedding, dtype=np.float32) for e in response_data]
         except OpenAIError as ex:
             if _is_embedding_capability_error(ex):
-                raise ProviderCapabilityError(
+                capability_error = ProviderCapabilityError(
                     getattr(self, "_provider_name", "openai"),
                     self._model,
                     "embedding endpoint/model",
                     original_error=ex,
-                ) from ex
-            raise
+                )
+            else:
+                raise
+        if capability_error is not None:
+            raise capability_error from None
+        raise AssertionError("OpenAI embedding request completed without a result")
 
 
 # ---------------------------------------------------------------------------
@@ -693,6 +698,7 @@ class OpenAIPrompter:
     async def _prompt_chat_completions(self, messages: list[dict[str, Any]]) -> str | None:
         """Prompt using the Chat Completions API."""
         options = self._chat_completions_options()
+        capability_error: ProviderCapabilityError | None = None
         try:
             response = await self._client.chat.completions.create(
                 model=self._model,
@@ -701,13 +707,16 @@ class OpenAIPrompter:
             )
         except Exception as exc:
             if _is_prompt_capability_error(exc):
-                raise ProviderCapabilityError(
+                capability_error = ProviderCapabilityError(
                     self._provider_name,
                     self._model,
                     self._requested_capability(),
                     original_error=exc,
-                ) from exc
-            raise
+                )
+            else:
+                raise
+        if capability_error is not None:
+            raise capability_error from None
         self._record_usage(response)
         if getattr(self, "_return_raw_response", False):
             return serialize_raw_response(response)
@@ -716,6 +725,7 @@ class OpenAIPrompter:
     async def _prompt_responses(self, messages: list[dict[str, Any]]) -> str | None:
         """Prompt using the Responses API."""
         options = self._responses_options()
+        capability_error: ProviderCapabilityError | None = None
         try:
             response = await self._client.responses.create(
                 model=self._model,
@@ -724,13 +734,16 @@ class OpenAIPrompter:
             )
         except Exception as exc:
             if _is_prompt_capability_error(exc):
-                raise ProviderCapabilityError(
+                capability_error = ProviderCapabilityError(
                     self._provider_name,
                     self._model,
                     self._requested_capability(),
                     original_error=exc,
-                ) from exc
-            raise
+                )
+            else:
+                raise
+        if capability_error is not None:
+            raise capability_error from None
         self._record_usage(response)
         if getattr(self, "_return_raw_response", False):
             return serialize_raw_response(response)

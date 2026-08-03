@@ -54,8 +54,16 @@ _ERROR_METADATA_FIELDS = {
     "attempt_id",
     "exception_type",
     "exception_message",
+    "exception_details",
 }
 _MAX_ERROR_TEXT_CHARS = 16 * 1024
+_PROVIDER_CAPABILITY_DETAIL_FIELDS = {
+    "kind",
+    "provider",
+    "model",
+    "capability",
+    "original_error_summary",
+}
 
 
 def _stream_identity(payload: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -226,6 +234,17 @@ def make_stream_error_pair(
     exception_message = str(exc)
     if len(exception_message) > _MAX_ERROR_TEXT_CHARS:
         exception_message = exception_message[:_MAX_ERROR_TEXT_CHARS] + "…<truncated>"
+    exception_details = None
+    from vane.ai.provider import ProviderCapabilityError
+
+    if isinstance(exc, ProviderCapabilityError):
+        exception_details = {
+            "kind": "provider_capability",
+            "provider": exc.provider,
+            "model": exc.model,
+            "capability": exc.capability,
+            "original_error_summary": exc.original_error_summary,
+        }
     sentinel = pa.table({})
     return sentinel, {
         "protocol_version": RAY_UDF_STREAM_PROTOCOL_VERSION,
@@ -236,6 +255,7 @@ def make_stream_error_pair(
         "attempt_id": attempt_id,
         "exception_type": exception_type,
         "exception_message": exception_message,
+        "exception_details": exception_details,
     }
 
 
@@ -307,6 +327,19 @@ def validate_stream_error_metadata(metadata: Any) -> dict[str, Any]:
     result["exception_message"] = str(result["exception_message"] or "")
     if len(result["exception_message"]) > _MAX_ERROR_TEXT_CHARS + len("…<truncated>"):
         raise ValueError("Ray UDF stream error metadata exception_message is too large")
+    details = result["exception_details"]
+    if details is not None:
+        if not isinstance(details, dict) or set(details) != _PROVIDER_CAPABILITY_DETAIL_FIELDS:
+            raise ValueError("Ray UDF stream provider capability details have invalid fields")
+        if details["kind"] != "provider_capability":
+            raise ValueError("Ray UDF stream provider capability details have invalid kind")
+        for name in ("provider", "model", "capability"):
+            value = details[name]
+            if not isinstance(value, str) or not value or len(value) > _MAX_ERROR_TEXT_CHARS:
+                raise ValueError(f"Ray UDF stream provider capability detail {name} is invalid")
+        summary = details["original_error_summary"]
+        if summary is not None and (not isinstance(summary, str) or len(summary) > _MAX_ERROR_TEXT_CHARS):
+            raise ValueError("Ray UDF stream provider capability original error summary is invalid")
     return result
 
 

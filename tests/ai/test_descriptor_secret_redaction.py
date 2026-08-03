@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vane.ai._redaction import REDACTED_PLACEHOLDER, Secret
+from vane.ai._redaction import REDACTED_PLACEHOLDER
 
 API_KEY = "sk-PLAINTEXT-API-KEY-SENTINEL-0123456789"
 ORGANIZATION = "org-PLAINTEXT-ORG-SENTINEL-0123456789"
@@ -135,7 +135,18 @@ def _install_fake_openai(monkeypatch, async_client, sync_client=None):
 
 
 def _install_fake_google(monkeypatch, client):
-    fake_genai = SimpleNamespace(Client=client)
+    class HttpRetryOptions:
+        def __init__(self, *, attempts):
+            self.attempts = attempts
+
+    class HttpOptions:
+        def __init__(self, *, retry_options):
+            self.retry_options = retry_options
+
+    fake_genai = SimpleNamespace(
+        Client=client,
+        types=SimpleNamespace(HttpOptions=HttpOptions, HttpRetryOptions=HttpRetryOptions),
+    )
     monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=fake_genai))
     monkeypatch.setitem(sys.modules, "google.genai", fake_genai)
 
@@ -304,7 +315,9 @@ class TestUnwrapAtExecutionBoundary:
         client = _fresh_recording_client()
         _install_fake_google(monkeypatch, client)
         _google_embedder_descriptor().instantiate()
-        assert client.calls == [{"api_key": API_KEY}]
+        assert len(client.calls) == 1
+        assert client.calls[0]["api_key"] == API_KEY
+        assert client.calls[0]["http_options"].retry_options.attempts == 1
 
     def test_transformers_get_dimensions_uses_static_metadata_without_loading_config(self, monkeypatch):
         auto_config_calls = []

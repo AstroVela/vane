@@ -712,12 +712,13 @@ def test_embed_dynamic_capability_error_is_preserved_and_not_retried_per_row():
         "embedding endpoint/model",
         original_error=original,
     )
-    assert (error.provider, error.model, error.capability, error.original_error) == (
+    assert (error.provider, error.model, error.capability) == (
         "mock",
         "chat-only-model",
         "embedding endpoint/model",
-        original,
     )
+    assert error.original_error is not original
+    assert str(error.original_error) == "RuntimeError"
 
 
 def test_embed_dynamic_dimension_mismatch_is_a_result_type_error():
@@ -776,6 +777,30 @@ def test_ai_prompt_runtime_signature_matches_public_contract():
     assert hints["options"] == Unpack[PromptOptions]
     assert hints["return"] == vane.Expression | vane.Relation
     assert len(get_overloads(vane.ai.prompt)) == 4
+
+
+def test_anthropic_zero_tokens_rejects_structured_python_entries():
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    relation = vane.connect().sql("select 'hello'::VARCHAR as message")
+    message = vane.col("message")
+    common = {
+        "provider": "anthropic",
+        "model": "claude-test",
+        "return_format": schema,
+        "max_tokens": 0,
+    }
+
+    with pytest.raises(ValueError, match="max_tokens=0.*structured"):
+        vane.ai.prompt(message, **common)
+    with pytest.raises(ValueError, match="max_tokens=0.*structured"):
+        vane.ai.prompt(relation, message, **common)
+    with pytest.raises(ValueError, match="max_tokens=0.*structured"):
+        relation.prompt(message, **common)
 
 
 def test_ai_prompt_four_public_entries_are_equivalent():

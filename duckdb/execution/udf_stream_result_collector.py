@@ -1885,6 +1885,16 @@ class UDFStreamResultCollector:
             # generator is already returning, even if Ray's completion reply
             # has not reached this worker yet.
             record.terminal_signal_observed = True
+            details = remote_error["exception_details"]
+            if details is not None:
+                from vane.ai.provider import ProviderCapabilityError
+
+                raise ProviderCapabilityError._from_safe_summary(
+                    details["provider"],
+                    details["model"],
+                    details["capability"],
+                    details["original_error_summary"],
+                ) from None
             raise RuntimeError(
                 f"remote Ray UDF failed: {remote_error['exception_type']}: {remote_error['exception_message']}"
             )

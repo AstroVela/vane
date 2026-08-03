@@ -37,6 +37,11 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 
 - Released per-database runner cache entries after relation write failures
   without resetting the process-wide runner used by other queries.
+- Kept provider capability failures serializable and credential-safe across
+  local and Ray execution while preserving bounded upstream diagnostics.
+- Stopped Google Embed metadata dimensions and SDK retries from overriding the
+  public request contract, rejected Anthropic zero-token structured requests,
+  and restricted Pydantic structured formats to actual `BaseModel` subclasses.
 
 ### Security
 

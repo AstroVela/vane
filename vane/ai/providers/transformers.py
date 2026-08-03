@@ -170,6 +170,7 @@ class TransformersTextEmbedder:
         trust_remote_code = model_options.pop("trust_remote_code", False) is True
         self._provider_name = provider_name
         self._model_name = model_name_or_path
+        capability_error: ProviderCapabilityError | None = None
         try:
             self.model = SentenceTransformer(
                 model_name_or_path,
@@ -178,29 +179,34 @@ class TransformersTextEmbedder:
                 **model_options,
             )
         except NotImplementedError as exc:
-            raise ProviderCapabilityError(
+            capability_error = ProviderCapabilityError(
                 getattr(self, "_provider_name", "transformers"),
                 model_name_or_path,
                 "embedding model",
                 original_error=exc,
-            ) from exc
+            )
+        if capability_error is not None:
+            raise capability_error from None
         self.model.eval()
         self.dimensions = dimensions
 
     def embed_text(self, text: list[str]) -> list[Embedding]:
         import torch
 
+        capability_error: ProviderCapabilityError | None = None
         with torch.inference_mode():
             try:
                 batch = self.model.encode(text, convert_to_numpy=True, truncate_dim=self.dimensions)
             except NotImplementedError as exc:
-                raise ProviderCapabilityError(
+                capability_error = ProviderCapabilityError(
                     getattr(self, "_provider_name", "transformers"),
                     self._model_name,
                     "embedding model",
                     original_error=exc,
-                ) from exc
-            return list(batch)
+                )
+        if capability_error is not None:
+            raise capability_error from None
+        return list(batch)
 
 
 # ---------------------------------------------------------------------------
