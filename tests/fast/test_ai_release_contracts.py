@@ -24,6 +24,13 @@ def _drive(wrapper, table: pa.Table) -> pa.Table:
         loop.close()
 
 
+def _assert_only_cancellation_context(error: asyncio.CancelledError) -> None:
+    context = error.__context__
+    while context is not None:
+        assert isinstance(context, asyncio.CancelledError)
+        context = context.__context__
+
+
 def _install_fake_google(monkeypatch, calls: list[dict[str, object]]) -> None:
     class HttpRetryOptions:
         def __init__(self, *, attempts):
@@ -260,7 +267,7 @@ def test_retry_after_cancellation_retains_no_original_exception_data():
         return exc_info.value
 
     error = asyncio.run(cancel_during_backoff())
-    assert error.__context__ is None
+    _assert_only_cancellation_context(error)
     surfaces = ("".join(traceback.format_exception(type(error), error, error.__traceback__)),)
     assert all(secret not in surface for surface in surfaces)
 
@@ -282,7 +289,7 @@ def test_ordinary_provider_error_is_not_attached_to_backoff_cancellation(monkeyp
         asyncio.run(_retry_call_async(fail, max_retries=1))
 
     error = exc_info.value
-    assert error.__context__ is None
+    _assert_only_cancellation_context(error)
     traceback_text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
     assert secret not in traceback_text
 

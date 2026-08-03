@@ -106,9 +106,7 @@ def test_structured_output_has_native_struct_type_on_every_python_entry():
 
     results = [
         relation.select(vane.ai.prompt(message, provider=provider, return_format=SCHEMA).alias("response")),
-        relation.select(
-            vane.ai.prompt(messages=message, provider=provider, return_format=SCHEMA).alias("response")
-        ),
+        relation.select(vane.ai.prompt(messages=message, provider=provider, return_format=SCHEMA).alias("response")),
         vane.ai.prompt(relation, message, provider=provider, return_format=SCHEMA),
         vane.ai.prompt(rel=relation, messages=message, provider=provider, return_format=SCHEMA),
         relation.prompt(message, provider=provider, return_format=SCHEMA),

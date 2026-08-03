@@ -132,8 +132,7 @@ def _actor_sample(rows: int, batch_size: int, actor_number: int, delay_s: float)
     connection = vane.connect()
     try:
         source = connection.sql(
-            "SELECT i::BIGINT AS row_id, concat('row-', i::VARCHAR)::VARCHAR AS text "
-            f"FROM range({rows}) AS source(i)"
+            f"SELECT i::BIGINT AS row_id, concat('row-', i::VARCHAR)::VARCHAR AS text FROM range({rows}) AS source(i)"
         ).repartition(actor_number)
         gc.collect()
         tracemalloc.start()
