@@ -23,6 +23,7 @@ from duckdb.runners.fte.fte_failures import (
     _failure_exception_matches,
     _failure_payload,
     _normalize_failure_payload,
+    _safe_failure_message,
 )
 from duckdb.runners.progress import validate_pipeline_topology
 from duckdb.runners.ray.fragment_submission_window import (
@@ -2292,6 +2293,62 @@ def _worker_failure_payload(worker_id: str, error: Any) -> dict[str, Any]:
     return failure
 
 
+def _query_ids_owned_by_fte_workers(worker_ids: set[str]) -> set[str]:
+    with _FTE_REGISTRY_LOCK:
+        fragment_execution_items = list(_FTE_FRAGMENT_EXECUTIONS.items())
+        query_ids = {
+            query_id
+            for (query_id, _fragment_id, _partition_id), owner in _FTE_PARTITION_OWNERS.items()
+            if str(getattr(owner, "worker_id", "")) in worker_ids
+        }
+    for (query_id, _fragment_id), fragment_execution in fragment_execution_items:
+        if any(fragment_execution.has_retryable_running_attempt_on_worker(worker_id) for worker_id in worker_ids):
+            query_ids.add(query_id)
+    return query_ids
+
+
+def _running_partition_requirements_on_fte_workers(
+    worker_ids: set[str],
+    *,
+    query_id_filter: str | None = None,
+) -> dict[
+    tuple[str, str, int],
+    tuple[int | None, FteTaskExecutionClass, NodeRequirements | None],
+]:
+    with _FTE_REGISTRY_LOCK:
+        fragment_execution_items = [
+            item
+            for item in _FTE_FRAGMENT_EXECUTIONS.items()
+            if query_id_filter is None or item[0][0] == query_id_filter
+        ]
+    requirements = {}
+    for (query_id, fragment_id), fragment_execution in fragment_execution_items:
+        with fragment_execution._state_lock:
+            for partition_id, partition in fragment_execution.partitions.items():
+                if not any(str(running.worker_id) in worker_ids for running in partition.running_attempts.values()):
+                    continue
+                requirements[(query_id, fragment_id, int(partition_id))] = (
+                    partition.memory_requirement_bytes,
+                    FteTaskExecutionClass.coerce(partition.execution_class),
+                    partition.node_requirements,
+                )
+    return requirements
+
+
+def _fail_queries_after_worker_quiescence_error(query_ids: set[str], error: BaseException) -> None:
+    with _FTE_REGISTRY_LOCK:
+        schedulers = [_FTE_SCHEDULERS.get(query_id) for query_id in sorted(query_ids)]
+    reason = f"failed to quiesce FTE worker side effects before retry: {_safe_failure_message(error)}"
+    for scheduler in schedulers:
+        if scheduler is not None:
+            scheduler.fail(reason)
+
+
+def _worker_actor_death_confirms_quiescence(error: BaseException) -> bool:
+    actor_died_error_type = getattr(ray.exceptions, "ActorDiedError", None)
+    return isinstance(actor_died_error_type, type) and _failure_exception_matches(error, (actor_died_error_type,))
+
+
 def _mark_fte_worker_failed(
     worker_id: str,
     failure: Mapping[str, Any],
@@ -2299,6 +2356,7 @@ def _mark_fte_worker_failed(
     query_id_filter: str | None = None,
     failed_worker_ids_override: set[str] | frozenset[str] | None = None,
     manager_instance_id: str | None = None,
+    primary_worker_process_terminated: bool = False,
 ) -> list[tuple[str, str, list[Any], list[Any]]]:
     worker_id = str(worker_id or "")
     if not worker_id:
@@ -2311,6 +2369,54 @@ def _mark_fte_worker_failed(
     failed_worker_ids = (
         {str(item) for item in failed_worker_ids_override} if failed_worker_ids_override is not None else {worker_id}
     )
+    failed_handles: dict[str, RayWorkerActorHandle] = {}
+    with _FTE_REGISTRY_LOCK:
+        for failed_worker_id in sorted(failed_worker_ids):
+            failed_handle = _FTE_WORKER_HANDLES.get(failed_worker_id)
+            if failed_handle is None:
+                continue
+            failed_handle_manager_instance_id = str(getattr(failed_handle, "manager_instance_id", ""))
+            if normalized_manager_instance_id is None:
+                normalized_manager_instance_id = failed_handle_manager_instance_id
+            elif failed_handle_manager_instance_id != normalized_manager_instance_id:
+                continue
+            failed_handle._fte_healthy = False
+            failed_handles[failed_worker_id] = failed_handle
+
+    # Owner cleanup can race while the worker barrier is in flight. Preserve
+    # every affected running partition's placement requirements before that
+    # cleanup so losing the owner entry cannot silently make the retry fatal.
+    failed_partition_requirements = _running_partition_requirements_on_fte_workers(
+        failed_worker_ids,
+        query_id_filter=query_id_filter,
+    )
+
+    # A failed status/control RPC does not prove that the actor stopped its
+    # storage side effects. Fence and drain it before removing attempts or
+    # making their replacements eligible to commit.
+    affected_query_ids = _query_ids_owned_by_fte_workers(failed_worker_ids)
+    if query_id_filter is not None:
+        affected_query_ids.add(query_id_filter)
+    for failed_worker_id, failed_handle in failed_handles.items():
+        if primary_worker_process_terminated and failed_worker_id == worker_id:
+            # The original RPC observed this actor's terminal death. Do not
+            # require a method lookup on a handle whose process no longer
+            # exists. Other workers grouped into the same failure still need
+            # their own fence-and-drain acknowledgement.
+            continue
+        try:
+            failed_handle.prepare_failed_worker_shutdown()
+        except BaseException as exc:
+            # Confirmed process death is the only failure response that also
+            # proves the worker cannot issue another write.
+            if _worker_actor_death_confirms_quiescence(exc):
+                continue
+            affected_query_ids.update(_query_ids_owned_by_fte_workers(failed_worker_ids))
+            _fail_queries_after_worker_quiescence_error(affected_query_ids, exc)
+            raise RuntimeError(
+                f"failed to quiesce FTE worker {failed_worker_id} before retry: {_safe_failure_message(exc)}"
+            ) from exc
+
     handles_to_kill: list[RayWorkerActorHandle] = []
     pending_worker_reservation_futures_to_cancel: list[FteWorkerReservationFuture] = []
     retryable_by_owner_key: dict[tuple[str, str, int], bool] = {}
@@ -2355,7 +2461,13 @@ def _mark_fte_worker_failed(
             if query_id_filter is None or item[0][0] == query_id_filter
         ]
 
-    for owner_key, owner, fragment_execution in failed_owner_items:
+    scheduling_requirements_by_owner_key: dict[
+        tuple[str, str, int],
+        tuple[int | None, FteTaskExecutionClass, NodeRequirements | None] | None,
+    ] = dict(failed_partition_requirements)
+    for owner_key, _owner, fragment_execution in failed_owner_items:
+        if owner_key in scheduling_requirements_by_owner_key:
+            continue
         scheduling_requirements = None
         if fragment_execution is not None:
             with _FTE_REGISTRY_LOCK:
@@ -2364,6 +2476,9 @@ def _mark_fte_worker_failed(
                 scheduling_requirements = fragment_execution.partition_scheduling_requirements(
                     owner_key[2],
                 )
+        scheduling_requirements_by_owner_key[owner_key] = scheduling_requirements
+
+    for owner_key, scheduling_requirements in scheduling_requirements_by_owner_key.items():
         if scheduling_requirements is None:
             memory_requirement_bytes = None
             execution_class = FteTaskExecutionClass.STANDARD
@@ -2385,6 +2500,8 @@ def _mark_fte_worker_failed(
             node_requirements=node_requirements,
             node_requirements_wait_started_at=wait_started_at,
         )
+
+    for owner_key, owner, _fragment_execution in failed_owner_items:
         FteWorkerPlacementManager.release_owner(
             query_id=owner_key[0],
             fragment_id=owner_key[1],

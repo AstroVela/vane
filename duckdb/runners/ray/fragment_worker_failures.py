@@ -14,6 +14,7 @@ from duckdb.runners.ray.fragment_registry import (
 from duckdb.runners.ray.fte_fragment_scheduler import (
     _fte_retry_remaining_delay_s,
     _mark_fte_worker_failed,
+    _worker_actor_death_confirms_quiescence,
     _worker_failure_payload,
 )
 
@@ -74,6 +75,7 @@ def mark_fte_worker_failed_for_event(event: Any) -> list[tuple[str, str, list[An
         query_id_filter=event.query_id,
         failed_worker_ids_override=new_failed_worker_ids,
         manager_instance_id=manager_instance_id,
+        primary_worker_process_terminated=_worker_actor_death_confirms_quiescence(event.error),
     )
     delay_s = _fte_retry_remaining_delay_s(event.query_id)
     if delay_s > 0:

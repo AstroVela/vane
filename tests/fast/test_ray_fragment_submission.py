@@ -169,6 +169,7 @@ class _FakeActor:
         self.register_payloads = []
         self.fragment_calls = []
         self.drop_calls = []
+        self.shutdown_calls = []
         self.fte_calls = []
         self.fragment_stats_calls = 0
         self.register_fragments = _FakeRemoteMethod(self._register_fragments)
@@ -188,6 +189,7 @@ class _FakeActor:
         self.fte_drop_query = _FakeRemoteMethod(self._fte_drop_query)
         self.fte_prepare_drop_query = _FakeRemoteMethod(self._fte_drop_query)
         self.fte_cleanup_query = _FakeRemoteMethod(self._fte_cleanup_query)
+        self.prepare_shutdown = _FakeRemoteMethod(self._prepare_shutdown)
 
     def _register_fragments(self, payload):
         self.register_payloads.append(payload)
@@ -275,6 +277,9 @@ class _FakeActor:
     def _fte_cleanup_query(self, query_id):
         self.fte_calls.append(("cleanup_query", query_id))
         return {}
+
+    def _prepare_shutdown(self):
+        self.shutdown_calls.append("prepare")
 
 
 class _FakeFteTaskHandle:
@@ -483,6 +488,7 @@ def _patch_ray_worker_handle_test_state(monkeypatch):
     monkeypatch.setattr(worker_handle_mod.ray, "get", lambda value, *_args, **_kwargs: value)
     monkeypatch.setattr(worker_handle_mod.ray, "put", lambda value, *_args, **_kwargs: value)
     monkeypatch.setattr(worker_handle_mod.ray, "wait", lambda refs, **_kwargs: (list(refs), []))
+    monkeypatch.setattr(worker_handle_mod.ray, "kill", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         RayWorkerActorHandle,
         "_fte_task_handle_cls",
@@ -8154,7 +8160,14 @@ def test_fte_worker_failure_does_not_invert_attempt_start_lock_order(monkeypatch
         (query_id, fragment_id),
         stage,
     )
+    original_has_running_attempt = stage.has_retryable_running_attempt_on_worker
     original_requirements = stage.partition_scheduling_requirements
+
+    def observed_has_running_attempt(*args, **kwargs):
+        is_owned = getattr(fte_fragment_scheduler_mod._FTE_REGISTRY_LOCK, "_is_owned", None)
+        assert callable(is_owned) and not is_owned()
+        failure_reads_state_without_registry.set()
+        return original_has_running_attempt(*args, **kwargs)
 
     def observed_requirements(partition_id):
         is_owned = getattr(fte_fragment_scheduler_mod._FTE_REGISTRY_LOCK, "_is_owned", None)
@@ -8162,6 +8175,7 @@ def test_fte_worker_failure_does_not_invert_attempt_start_lock_order(monkeypatch
         failure_reads_state_without_registry.set()
         return original_requirements(partition_id)
 
+    monkeypatch.setattr(stage, "has_retryable_running_attempt_on_worker", observed_has_running_attempt)
     monkeypatch.setattr(stage, "partition_scheduling_requirements", observed_requirements)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -8196,6 +8210,8 @@ def test_fte_worker_failure_replays_descriptor_on_new_owner(monkeypatch):
     )
     actor0 = _FakeActor()
     actor1 = _FakeActor()
+    kill_calls = []
+    monkeypatch.setattr(worker_handle_mod.ray, "kill", lambda actor: kill_calls.append(actor))
     handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-0")
     handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-1")
     task = _FakeTask(
@@ -8226,6 +8242,8 @@ def test_fte_worker_failure_replays_descriptor_on_new_owner(monkeypatch):
     assert retry_request["task_id"]["attempt_id"] == 1
     assert retry_request["fragment_plan"] is None
     assert retry_request["initial_splits"]["7"][0]["data"] == b"a"
+    assert actor0.shutdown_calls == ["prepare"]
+    assert kill_calls == []
     assert "worker-0" not in worker_handle_mod._FTE_WORKER_HANDLES
     stats = handle1.fte_registry_stats()["event_schedulers"]["query-fte-worker-lost"]
     assert stats["event_counts"] == {
@@ -8233,6 +8251,224 @@ def test_fte_worker_failure_replays_descriptor_on_new_owner(monkeypatch):
         "WorkerReservationCompleted": 2,
         "WorkerFailed": 1,
     }
+
+
+def test_fte_worker_failure_waits_for_worker_quiescence_before_retry(monkeypatch):
+    monkeypatch.setattr(
+        RayWorkerActorHandle,
+        "_fte_task_handle_cls",
+        staticmethod(lambda: _FakeFteTaskHandle),
+    )
+    quiescence = Future()
+    quiescence_started = threading.Event()
+
+    class _DeferredPrepare:
+        def remote(self):
+            quiescence_started.set()
+            return SimpleNamespace(future=lambda: quiescence)
+
+    actor0 = _FakeActor()
+    actor0.prepare_shutdown = _DeferredPrepare()
+    actor1 = _FakeActor()
+    handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-0")
+    handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-1")
+    task = _FakeTask(
+        name="copy-task",
+        context={
+            "query_id": "query-copy-worker-lost",
+            "node_id": "copy",
+            "copy_output_base": "s3://bucket/output",
+            "copy_output_run_id": "run-1",
+        },
+        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        plan={"plan": "copy-template"},
+    )
+    first = handle0.submit_tasks([task])
+    retries = []
+    errors = []
+
+    def mark_failed():
+        try:
+            retries.extend(handle1.mark_fte_worker_failed("worker-0", RuntimeError("status RPC failed")))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    failure_thread = threading.Thread(target=mark_failed)
+    failure_thread.start()
+    assert quiescence_started.wait(timeout=1.0)
+
+    assert failure_thread.is_alive()
+    assert [call for call in actor1.fte_calls if call[0] == "create"] == []
+    stage = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[("query-copy-worker-lost", "query-copy-worker-lost:node:copy")]
+    assert stage.partitions[0].running_attempt.worker_id == "worker-0"
+    with worker_handle_mod._FTE_REGISTRY_LOCK:
+        worker_handle_mod._FTE_PARTITION_OWNERS.pop(
+            ("query-copy-worker-lost", "query-copy-worker-lost:node:copy", 0),
+            None,
+        )
+
+    quiescence.set_result(None)
+    failure_thread.join(timeout=2.0)
+
+    assert not failure_thread.is_alive()
+    assert errors == []
+    assert len(first) == 1
+    assert len(retries) == 1
+    assert retries[0].worker_handle is handle1
+    assert [call for call in actor1.fte_calls if call[0] == "create"]
+
+
+def test_fte_worker_failure_without_confirmed_quiescence_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        RayWorkerActorHandle,
+        "_fte_task_handle_cls",
+        staticmethod(lambda: _FakeFteTaskHandle),
+    )
+    quiescence = Future()
+    quiescence_started = threading.Event()
+
+    class _FailingPrepare:
+        def remote(self):
+            quiescence_started.set()
+            return SimpleNamespace(future=lambda: quiescence)
+
+    actor0 = _FakeActor()
+    actor0.prepare_shutdown = _FailingPrepare()
+    actor1 = _FakeActor()
+    handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-0")
+    handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-1")
+    task = _FakeTask(
+        name="copy-task",
+        context={
+            "query_id": "query-copy-quiescence-failed",
+            "node_id": "copy",
+            "copy_output_base": "s3://bucket/output",
+            "copy_output_run_id": "run-2",
+        },
+        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        plan={"plan": "copy-template"},
+    )
+    first = handle0.submit_tasks([task])
+    errors = []
+
+    def mark_failed():
+        try:
+            handle1.mark_fte_worker_failed("worker-0", RuntimeError("status RPC failed"))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    failure_thread = threading.Thread(target=mark_failed)
+    failure_thread.start()
+    assert quiescence_started.wait(timeout=1.0)
+
+    owner_key = (
+        "query-copy-quiescence-failed",
+        "query-copy-quiescence-failed:node:copy",
+        0,
+    )
+    stage = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[owner_key[:2]]
+    with worker_handle_mod._FTE_REGISTRY_LOCK:
+        worker_handle_mod._FTE_PARTITION_OWNERS.pop(owner_key, None)
+    with stage._state_lock:
+        stage.partitions[0].running_attempts.clear()
+    quiescence.set_exception(RuntimeError("worker side effects still active"))
+    failure_thread.join(timeout=2.0)
+
+    assert not failure_thread.is_alive()
+    assert len(errors) == 1
+    assert "failed to quiesce FTE worker worker-0 before retry" in str(errors[0])
+    assert len(first) == 1
+    assert [call for call in actor1.fte_calls if call[0] == "create"] == []
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get("query-copy-quiescence-failed")
+    assert scheduler is not None
+    assert scheduler.stats().state == "FAILED"
+    assert "worker-0" in worker_handle_mod._FTE_WORKER_HANDLES
+    assert stage.partitions[0].running_attempts == {}
+
+
+def test_fte_worker_failure_accepts_confirmed_actor_death_as_quiescence(monkeypatch):
+    monkeypatch.setattr(
+        RayWorkerActorHandle,
+        "_fte_task_handle_cls",
+        staticmethod(lambda: _FakeFteTaskHandle),
+    )
+    quiescence = Future()
+    quiescence.set_exception(ray.exceptions.ActorDiedError())
+
+    class _DeadActorPrepare:
+        def remote(self):
+            return SimpleNamespace(future=lambda: quiescence)
+
+    actor0 = _FakeActor()
+    actor0.prepare_shutdown = _DeadActorPrepare()
+    actor1 = _FakeActor()
+    handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-0")
+    handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-1")
+    task = _FakeTask(
+        name="copy-task",
+        context={
+            "query_id": "query-copy-worker-dead",
+            "node_id": "copy",
+            "copy_output_base": "s3://bucket/output",
+            "copy_output_run_id": "run-3",
+        },
+        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        plan={"plan": "copy-template"},
+    )
+    first = handle0.submit_tasks([task])
+
+    retries = handle1.mark_fte_worker_failed("worker-0", RuntimeError("actor died"))
+
+    assert len(first) == 1
+    assert len(retries) == 1
+    assert retries[0].worker_handle is handle1
+    assert "worker-0" not in worker_handle_mod._FTE_WORKER_HANDLES
+
+
+def test_fte_worker_failure_event_uses_confirmed_actor_death_without_prepare(monkeypatch):
+    monkeypatch.setattr(
+        RayWorkerActorHandle,
+        "_fte_task_handle_cls",
+        staticmethod(lambda: _FakeFteTaskHandle),
+    )
+    actor0 = _FakeActor()
+    actor0.prepare_shutdown = None
+    actor1 = _FakeActor()
+    handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-0")
+    handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-1")
+    task = _FakeTask(
+        name="copy-task",
+        context={
+            "query_id": "query-copy-worker-confirmed-dead",
+            "node_id": "copy",
+            "copy_output_base": "s3://bucket/output",
+            "copy_output_run_id": "run-4",
+        },
+        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        plan={"plan": "copy-template"},
+    )
+    first = handle0.submit_tasks([task])
+
+    retries = handle1._handles_for_worker_failed_event(
+        WorkerFailed(
+            "query-copy-worker-confirmed-dead",
+            "worker-0",
+            ray.exceptions.ActorDiedError(),
+            manager_instance_id=handle0.manager_instance_id,
+        )
+    )
+
+    assert len(first) == 1
+    assert len(retries) == 1
+    assert retries[0].worker_handle is handle1
+    assert "worker-0" not in worker_handle_mod._FTE_WORKER_HANDLES
+
+
+def test_worker_quiescence_requires_terminal_actor_death():
+    assert fte_fragment_scheduler_mod._worker_actor_death_confirms_quiescence(ray.exceptions.ActorDiedError())
+    assert not fte_fragment_scheduler_mod._worker_actor_death_confirms_quiescence(
+        ray.exceptions.ActorUnavailableError("actor temporarily unavailable", b"\0" * 16)
+    )
 
 
 def test_fte_worker_failure_keeps_retryability_partition_local():

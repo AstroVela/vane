@@ -476,6 +476,10 @@ class FteWorkerLifecycleMixin:
     def prepare_shutdown(self) -> None:
         """Fence and drain this worker without stopping its Flight service."""
         self._begin_worker_shutdown()
+        self.prepare_failed_worker_shutdown()
+
+    def prepare_failed_worker_shutdown(self) -> None:
+        """Fence and drain a failed worker without publishing failure recursively."""
         prepare_method = getattr(self.actor_handle, "prepare_shutdown", None)
         if prepare_method is None:
             raise RuntimeError("Ray worker actor does not expose prepare_shutdown")

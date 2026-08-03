@@ -108,6 +108,30 @@ def test_worker_two_phase_shutdown_keeps_actor_alive_until_finish(monkeypatch):
     assert events == ["prepare-rpc", "prepare-resolved", "finish-rpc", "finish-resolved", "kill"]
 
 
+def test_failed_worker_prepare_does_not_publish_failure_recursively(monkeypatch):
+    from duckdb.runners.ray import fragment_worker_lifecycle as lifecycle_module
+
+    events: list[str] = []
+    prepare_result = object()
+
+    class Actor:
+        prepare_shutdown = _RemoteMethod(events, prepare_result, "prepare-rpc")
+
+    lifecycle = _lifecycle(Actor())
+    lifecycle._begin_worker_shutdown = lambda: events.append("failure-published")
+
+    def resolve(ref, **kwargs):
+        assert ref is prepare_result
+        assert kwargs == {"timeout": 30, "honor_query_deadline": False}
+        events.append("prepare-resolved")
+
+    monkeypatch.setattr(lifecycle_module, "resolve_object_refs_blocking", resolve)
+
+    lifecycle.prepare_failed_worker_shutdown()
+
+    assert events == ["prepare-rpc", "prepare-resolved"]
+
+
 def test_query_close_interrupts_only_owned_native_cursors():
     from duckdb.runners.ray import worker as worker_module
 
