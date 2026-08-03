@@ -663,35 +663,58 @@ class ClusterQueryResourceCoordinator:
             gpu=total_capacity.gpu,
             heap_bytes=total_capacity.heap_bytes,
         )
-        headroom: dict[str, ResourceVector] = {
+        # Water-fill each query's final weighted dominant share. Hard minima
+        # are already allocated, so fairness must start from those shares
+        # instead of treating every query's remaining headroom as a fresh zero.
+        states_by_id = {state.demand.query_id: state for state in admitted}
+        minimum: dict[str, ResourceVector] = {
             state.demand.query_id: ResourceVector(
-                cpu=(state.demand.desired - state.demand.minimum).cpu,
-                gpu=(state.demand.desired - state.demand.minimum).gpu,
-                heap_bytes=(state.demand.desired - state.demand.minimum).heap_bytes,
+                cpu=state.demand.minimum.cpu,
+                gpu=state.demand.minimum.gpu,
+                heap_bytes=state.demand.minimum.heap_bytes,
             )
             for state in admitted
         }
-        dominant: dict[str, float] = {
-            query_id: vector.dominant_share(hard_total_capacity) for query_id, vector in headroom.items()
+        desired: dict[str, ResourceVector] = {
+            state.demand.query_id: ResourceVector(
+                cpu=state.demand.desired.cpu,
+                gpu=state.demand.desired.gpu,
+                heap_bytes=state.demand.desired.heap_bytes,
+            )
+            for state in admitted
         }
-        states_by_id = {state.demand.query_id: state for state in admitted}
+        headroom = {query_id: desired[query_id] - minimum[query_id] for query_id in states_by_id}
+        minimum_share = {query_id: minimum[query_id].dominant_share(hard_total_capacity) for query_id in states_by_id}
+        desired_share = {query_id: desired[query_id].dominant_share(hard_total_capacity) for query_id in states_by_id}
         finite_limits = [
-            dominant[query_id] / states_by_id[query_id].demand.weight
+            desired_share[query_id] / states_by_id[query_id].demand.weight
             for query_id in headroom
-            if dominant[query_id] > 0 and math.isfinite(dominant[query_id])
+            if not headroom[query_id].is_zero() and math.isfinite(desired_share[query_id])
         ]
 
-        def allocation_at(level: float) -> dict[str, ResourceVector]:
-            result: dict[str, ResourceVector] = {}
-            for query_id, room in headroom.items():
-                room_dominant = dominant[query_id]
-                if room_dominant <= 0 or not math.isfinite(room_dominant):
-                    result[query_id] = ResourceVector()
+        def minimum_factor_at(query_id: str, level: float) -> float:
+            """Return the least headroom fraction that reaches a weighted share."""
+            room = headroom[query_id]
+            if room.is_zero():
+                return 0.0
+            weight = states_by_id[query_id].demand.weight
+            target_share = level * weight
+            if minimum_share[query_id] >= target_share - _EPSILON:
+                return 0.0
+            factors: list[float] = []
+            for field_name in ("cpu", "gpu", "heap_bytes"):
+                room_amount = float(getattr(room, field_name))
+                if room_amount <= 0:
                     continue
-                weight = states_by_id[query_id].demand.weight
-                factor = min(1.0, level * weight / room_dominant)
-                result[query_id] = room.scale(factor)
-            return result
+                capacity = float(getattr(hard_total_capacity, field_name))
+                if capacity <= 0:
+                    return 0.0
+                base_amount = float(getattr(minimum[query_id], field_name))
+                factors.append((target_share * capacity - base_amount) / room_amount)
+            return min(1.0, max(0.0, min(factors, default=0.0)))
+
+        def allocation_at(level: float) -> dict[str, ResourceVector]:
+            return {query_id: room.scale(minimum_factor_at(query_id, level)) for query_id, room in headroom.items()}
 
         def feasible(level: float) -> bool:
             total = _sum_resources(list(allocation_at(level).values()))
@@ -710,6 +733,56 @@ class ClusterQueryResourceCoordinator:
                     else:
                         high = middle
             allocated = allocation_at(low)
+
+            # A query can have headroom in a non-dominant dimension. Fill as
+            # much of that plateau as capacity permits without raising its
+            # weighted dominant share above the water level. This preserves
+            # max-min fairness while avoiding stranded divisible capacity.
+            remaining = _positive_difference(
+                hard_extra_capacity,
+                _sum_resources(list(allocated.values())),
+            )
+            for state in sorted(
+                admitted,
+                key=lambda item: (-item.demand.priority, item.sequence, item.demand.query_id),
+            ):
+                query_id = state.demand.query_id
+                unit_headroom = headroom[query_id]
+                if unit_headroom.is_zero():
+                    continue
+                current_factor = minimum_factor_at(query_id, low)
+                share_ceiling = max(minimum_share[query_id], low * state.demand.weight)
+                upper_factors: list[float] = []
+                for field_name in ("cpu", "gpu", "heap_bytes"):
+                    room_amount = float(getattr(unit_headroom, field_name))
+                    if room_amount <= 0:
+                        continue
+                    capacity = float(getattr(hard_total_capacity, field_name))
+                    if capacity <= 0:
+                        upper_factors.append(0.0)
+                        continue
+                    base_amount = float(getattr(minimum[query_id], field_name))
+                    upper_factors.append((share_ceiling * capacity - base_amount) / room_amount)
+                maximum_factor = min(1.0, max(0.0, min(upper_factors, default=0.0)))
+                if maximum_factor <= current_factor + _EPSILON:
+                    continue
+
+                candidate = unit_headroom.scale(maximum_factor)
+                delta = candidate - allocated[query_id]
+                if not delta.fits_within(remaining):
+                    lower = current_factor
+                    upper = maximum_factor
+                    for _ in range(80):
+                        middle = (lower + upper) / 2.0
+                        middle_delta = unit_headroom.scale(middle) - allocated[query_id]
+                        if middle_delta.fits_within(remaining):
+                            lower = middle
+                        else:
+                            upper = middle
+                    candidate = unit_headroom.scale(lower)
+                    delta = candidate - allocated[query_id]
+                allocated[query_id] = candidate
+                remaining = remaining - delta
         else:
             allocated = {state.demand.query_id: ResourceVector() for state in admitted}
 
@@ -743,8 +816,8 @@ class ClusterQueryResourceCoordinator:
             )
             for state in candidates:
                 query_id = state.demand.query_id
-                room = int(getattr(headroom[query_id], field_name) - getattr(allocated[query_id], field_name))
-                amount = min(tail, max(0, room))
+                field_headroom = int(getattr(headroom[query_id], field_name) - getattr(allocated[query_id], field_name))
+                amount = min(tail, max(0, field_headroom))
                 if amount <= 0:
                     continue
                 allocated[query_id] = _replace_resource(

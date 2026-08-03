@@ -273,6 +273,66 @@ def test_equal_weight_queries_receive_equal_dominant_shares():
     assert allocation_a + allocation_b == total
 
 
+def test_weighted_drf_accounts_for_unequal_hard_minimum_shares():
+    coordinator = ClusterQueryResourceCoordinator(
+        (_node("n1", cpu=10, heap=1_000),),
+        heartbeat_timeout_s=30,
+    )
+    coordinator.register_query(
+        _demand(
+            "large-minimum",
+            minimum=_r(cpu=8, heap=800),
+            desired=_r(cpu=10, heap=1_000),
+        ),
+        now=0,
+    )
+    coordinator.register_query(
+        _demand(
+            "small-minimum",
+            minimum=_r(cpu=1, heap=100),
+            desired=_r(cpu=10, heap=1_000),
+        ),
+        now=0,
+    )
+
+    queries = coordinator.snapshot()["queries"]
+    large = ResourceVector.from_dict(queries["large-minimum"]["allocation"]["resources"])
+    small = ResourceVector.from_dict(queries["small-minimum"]["allocation"]["resources"])
+
+    assert large == _r(cpu=8, heap=800)
+    assert small == _r(cpu=2, heap=200)
+
+
+def test_weighted_drf_fills_non_dominant_minimum_plateau_without_changing_fair_share():
+    coordinator = ClusterQueryResourceCoordinator(
+        (_node("n1", cpu=10, heap=1_000),),
+        heartbeat_timeout_s=30,
+    )
+    coordinator.register_query(
+        _demand(
+            "cpu-heavy",
+            minimum=_r(cpu=8),
+            desired=_r(cpu=8, heap=1_000),
+        ),
+        now=0,
+    )
+    coordinator.register_query(
+        _demand(
+            "heap-progress",
+            minimum=_r(cpu=1),
+            desired=_r(cpu=1, heap=1_000),
+        ),
+        now=0,
+    )
+
+    queries = coordinator.snapshot()["queries"]
+    cpu_heavy = ResourceVector.from_dict(queries["cpu-heavy"]["allocation"]["resources"])
+    heap_progress = ResourceVector.from_dict(queries["heap-progress"]["allocation"]["resources"])
+
+    assert cpu_heavy == _r(cpu=8, heap=200)
+    assert heap_progress == _r(cpu=1, heap=800)
+
+
 def test_weighted_dominant_fairness_gives_double_share_to_weight_two_query():
     coordinator = ClusterQueryResourceCoordinator(
         (_node("n1", cpu=12, heap=1_200, store=1_200),),
