@@ -1059,8 +1059,9 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		deserializer.ReadPropertyWithDefault<bool>(115, "mark_join_build_summary_valid", mark_join_build_summary.valid);
 		deserializer.ReadPropertyWithDefault<bool>(116, "mark_join_build_has_rows", mark_join_build_summary.has_rows);
 		deserializer.ReadPropertyWithDefault<bool>(117, "mark_join_build_has_null", mark_join_build_summary.has_null);
-		if (mark_join_build_summary.valid && (join_type != JoinType::MARK || !mark_join_build_summary.IsValid() ||
-		                                      (!delim_types.empty() && delim_types.size() + 1 == conditions.size()))) {
+		if (!mark_join_build_summary.IsConsistent() ||
+		    (mark_join_build_summary.valid &&
+		     (join_type != JoinType::MARK || (!delim_types.empty() && delim_types.size() + 1 == conditions.size())))) {
 			throw SerializationException("invalid global MARK join build summary for hash join");
 		}
 

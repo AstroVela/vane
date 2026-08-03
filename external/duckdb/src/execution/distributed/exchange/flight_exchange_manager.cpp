@@ -536,7 +536,7 @@ void FlightExchange::SinkFinished(const ExchangeSinkHandle &handle, idx_t attemp
 
 void FlightExchange::SinkFinished(const ExchangeSinkInstanceHandle &instance, const std::string &node_id,
                                   int flight_port) {
-	if (instance.mark_join_build_summary.valid && !instance.mark_join_build_summary.IsValid()) {
+	if (!instance.mark_join_build_summary.IsConsistent()) {
 		throw InvalidInputException("finished Flight sink has an invalid MARK join build summary");
 	}
 	if (instance.query_id != ctx_.query_id) {
@@ -782,12 +782,12 @@ std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 	bool has_attempt_without_mark_summary = false;
 	for (const auto &entry : selected_attempts) {
 		const auto &attempt_summary = entry.second.mark_join_build_summary;
+		if (!attempt_summary.IsConsistent()) {
+			throw InvalidInputException("selected Flight sink has an invalid MARK join build summary");
+		}
 		if (!attempt_summary.valid) {
 			has_attempt_without_mark_summary = true;
 			continue;
-		}
-		if (!attempt_summary.IsValid()) {
-			throw InvalidInputException("selected Flight sink has an invalid MARK join build summary");
 		}
 		mark_join_build_summary.Merge(attempt_summary);
 	}

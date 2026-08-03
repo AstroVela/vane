@@ -1850,6 +1850,21 @@ TEST_CASE("ExchangeSinkInstanceTaskDescriptor serialization preserves the worker
 	REQUIRE(roundtrip.sink_instance.mark_join_build_summary.has_null);
 }
 
+TEST_CASE("Exchange task descriptors reject MARK summary payload without validity",
+          "[serialization][physical_plan][exchange]") {
+	SECTION("sink task") {
+		distributed::ExchangeSinkInstanceTaskDescriptor descriptor;
+		descriptor.sink_instance.mark_join_build_summary.has_rows = true;
+		REQUIRE_THROWS(descriptor.SerializeToBytes());
+	}
+
+	SECTION("source task") {
+		distributed::ExchangeSourceTaskDescriptor descriptor;
+		descriptor.mark_join_build_summary.has_rows = true;
+		REQUIRE_THROWS(descriptor.SerializeToBytes());
+	}
+}
+
 TEST_CASE("Exchange task descriptors reject missing advertised hosts", "[serialization][physical_plan][exchange]") {
 	REQUIRE_THROWS(distributed::ExchangeSinkInstanceTaskDescriptor::DeserializeFromBytes(
 	    SerializeSinkDescriptorWithoutFlightHost()));

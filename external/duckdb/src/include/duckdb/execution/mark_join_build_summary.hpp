@@ -24,7 +24,12 @@ struct MarkJoinBuildSummary {
 	}
 
 	bool IsValid() const {
-		return valid && (!has_null || has_rows);
+		return valid && IsConsistent();
+	}
+
+	//! An absent summary must not carry payload bits, and a NULL requires at least one build row.
+	bool IsConsistent() const {
+		return valid ? (!has_null || has_rows) : (!has_rows && !has_null);
 	}
 
 	void Merge(const MarkJoinBuildSummary &other) {

@@ -1364,8 +1364,7 @@ void register_ray_bindings(py::module_ &mod) {
 					        exchange_sink_instance_task.sink_instance.mark_join_build_summary.has_null =
 					            py::bool_(d["mark_join_build_has_null"]).cast<bool>();
 				        }
-				        if (exchange_sink_instance_task.sink_instance.mark_join_build_summary.valid &&
-				            !exchange_sink_instance_task.sink_instance.mark_join_build_summary.IsValid()) {
+				        if (!exchange_sink_instance_task.sink_instance.mark_join_build_summary.IsConsistent()) {
 					        throw py::value_error("exchange_sink_instance has an invalid MARK join build summary");
 				        }
 				        has_exchange_sink_instance_task = true;

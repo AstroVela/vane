@@ -143,6 +143,9 @@ void ApplyRuntimeTaskIndexToOperator(PhysicalOperator &op, idx_t task_partition_
 } // namespace
 
 void ExchangeSinkInstanceTaskDescriptor::Serialize(Serializer &serializer) const {
+	if (!sink_instance.mark_join_build_summary.IsConsistent()) {
+		throw SerializationException("invalid MARK join build summary in exchange sink task");
+	}
 	serializer.WriteProperty(1, "task_partition_id", sink_instance.sink_handle.task_partition_id);
 	serializer.WriteProperty(2, "attempt_id", sink_instance.attempt_id);
 	serializer.WriteProperty(3, "output_location", sink_instance.output_location);
@@ -177,7 +180,7 @@ ExchangeSinkInstanceTaskDescriptor ExchangeSinkInstanceTaskDescriptor::Deseriali
 	                                           result.sink_instance.mark_join_build_summary.has_rows);
 	deserializer.ReadPropertyWithDefault<bool>(11, "mark_join_build_has_null",
 	                                           result.sink_instance.mark_join_build_summary.has_null);
-	if (result.sink_instance.mark_join_build_summary.valid && !result.sink_instance.mark_join_build_summary.IsValid()) {
+	if (!result.sink_instance.mark_join_build_summary.IsConsistent()) {
 		throw SerializationException("invalid MARK join build summary in exchange sink task");
 	}
 	return result;

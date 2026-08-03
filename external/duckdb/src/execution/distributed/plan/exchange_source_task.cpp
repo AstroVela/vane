@@ -53,6 +53,9 @@ bool ApplyExchangeSourceTasksToOperator(PhysicalOperator &op,
 } // namespace
 
 void ExchangeSourceTaskDescriptor::Serialize(Serializer &serializer) const {
+	if (!mark_join_build_summary.IsConsistent()) {
+		throw SerializationException("invalid MARK join build summary in exchange source task");
+	}
 	serializer.WriteProperty(1, "partition_indices", partition_indices);
 	serializer.WriteList(2, "source_handles", source_handles.size(), [&](Serializer::List &list, idx_t i) {
 		list.WriteObject([&](Serializer &obj) {
@@ -114,7 +117,7 @@ ExchangeSourceTaskDescriptor ExchangeSourceTaskDescriptor::Deserialize(Deseriali
 	                                           result.mark_join_build_summary.valid);
 	deserializer.ReadPropertyWithDefault<bool>(7, "mark_join_build_has_rows", result.mark_join_build_summary.has_rows);
 	deserializer.ReadPropertyWithDefault<bool>(8, "mark_join_build_has_null", result.mark_join_build_summary.has_null);
-	if (result.mark_join_build_summary.valid && !result.mark_join_build_summary.IsValid()) {
+	if (!result.mark_join_build_summary.IsConsistent()) {
 		throw SerializationException("invalid MARK join build summary in exchange source task");
 	}
 	if (result.source_partition_count == 0 && !result.partition_indices.empty()) {

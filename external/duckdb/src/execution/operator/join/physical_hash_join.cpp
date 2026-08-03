@@ -273,8 +273,11 @@ public:
 };
 
 unique_ptr<JoinHashTable> PhysicalHashJoin::InitializeHashTable(ClientContext &context) const {
+	if (!mark_join_build_summary.IsConsistent()) {
+		throw InternalException("invalid global MARK join build summary on PhysicalHashJoin");
+	}
 	if (mark_join_build_summary.valid) {
-		if (join_type != JoinType::MARK || !mark_join_build_summary.IsValid()) {
+		if (join_type != JoinType::MARK) {
 			throw InternalException("invalid global MARK join build summary on PhysicalHashJoin");
 		}
 		if (!delim_types.empty() && delim_types.size() + 1 == conditions.size()) {
@@ -1722,6 +1725,9 @@ InsertionOrderPreservingMap<string> PhysicalHashJoin::ParamsToString() const {
 }
 
 void PhysicalHashJoin::SerializeOperatorData(Serializer &serializer) const {
+	if (!mark_join_build_summary.IsConsistent()) {
+		throw SerializationException("invalid global MARK join build summary for hash join");
+	}
 	serializer.WriteProperty(103, "join_type", join_type);
 	serializer.WriteProperty(104, "conditions", conditions);
 	serializer.WriteProperty(105, "condition_types", condition_types);

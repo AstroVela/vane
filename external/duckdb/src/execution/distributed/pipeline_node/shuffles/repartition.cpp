@@ -442,13 +442,13 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 			auto source_nodes = CollectShuffleSourceNodes(handles);
 			MarkJoinBuildSummary mark_join_build_summary;
 			for (const auto &handle : handles) {
+				if (!handle.mark_join_build_summary.IsConsistent()) {
+					return DuckDBResult<void>::err(
+					    DuckDBError::invalid_state_error("shuffle source has an invalid MARK build summary"));
+				}
 				if (self_shared->collect_mark_join_build_summary_ && !handle.mark_join_build_summary.valid) {
 					return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
 					    "MARK join build shuffle source is missing its global build summary"));
-				}
-				if (handle.mark_join_build_summary.valid && !handle.mark_join_build_summary.IsValid()) {
-					return DuckDBResult<void>::err(
-					    DuckDBError::invalid_state_error("shuffle source has an invalid MARK build summary"));
 				}
 				mark_join_build_summary.Merge(handle.mark_join_build_summary);
 			}

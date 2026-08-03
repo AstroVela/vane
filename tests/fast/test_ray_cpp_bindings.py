@@ -647,6 +647,47 @@ def test_exchange_source_task_split_preserves_mark_join_build_summary():
     assert duckdb.ray_cxx.exchange_source_task_mark_join_build_summary_for_test(split[0][1]) == expected
 
 
+@pytest.mark.parametrize("payload_field", ["mark_join_build_has_rows", "mark_join_build_has_null"])
+def test_execute_native_rejects_mark_summary_payload_without_validity(payload_field):
+    con = duckdb.connect()
+    cursor = con.cursor()
+    plan = _make_test_physical_plan(con)
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+
+    try:
+        with pytest.raises(ValueError, match="invalid MARK join build summary"):
+            runner.execute_native(
+                cursor,
+                plan,
+                exchange_sink_instance={payload_field: True},
+            )
+    finally:
+        cursor.close()
+        con.close()
+
+
+@pytest.mark.parametrize("payload_field", ["mark_join_build_has_rows", "mark_join_build_has_null"])
+def test_ray_task_result_rejects_mark_summary_payload_without_validity(payload_field):
+    class _MalformedSummaryHandle:
+        worker_id = "worker-malformed-summary"
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            return duckdb.ray_cxx.RayTaskResult.success(
+                [],
+                [],
+                exchange_sink_instance={payload_field: True},
+            )
+
+        def release_result_payload(self):
+            return None
+
+    with pytest.raises(RuntimeError, match="invalid MARK join build summary"):
+        duckdb.ray_cxx.ray_task_result_handle_refreshed_worker_id_for_test(_MalformedSummaryHandle())
+
+
 def test_exchange_source_task_descriptor_preserves_replicated_distribution():
     handles = [
         {

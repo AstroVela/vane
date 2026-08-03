@@ -1774,6 +1774,12 @@ TEST_CASE("Exchange: FlightExchange reduces MARK build summaries from selected a
 	second.flight_server_epoch = "mark-epoch-1";
 	second.mark_join_build_summary = MarkJoinBuildSummary::Create(true, false);
 
+	auto malformed = first;
+	malformed.mark_join_build_summary = MarkJoinBuildSummary();
+	malformed.mark_join_build_summary.has_rows = true;
+	REQUIRE_THROWS_WITH(exchange->SinkFinished(malformed, "mark-worker-0", 5100),
+	                    Catch::Matchers::Contains("invalid MARK join build summary"));
+
 	exchange->SinkFinished(first, "mark-worker-0", 5100);
 	exchange->SinkFinished(first_retry, "mark-worker-retry", 5102);
 	exchange->SinkFinished(second, "mark-worker-1", 5101);
