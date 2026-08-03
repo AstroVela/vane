@@ -10,6 +10,7 @@
 
 #include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/distributed/plan/plan_config.hpp"
@@ -33,7 +34,7 @@ public:
 	             duckdb::vector<unique_ptr<BaseStatistics>> join_stats,
 	             unique_ptr<JoinFilterPushdownInfo> filter_pushdown, idx_t estimated_cardinality,
 	             std::shared_ptr<DistributedPipelineNode> left, std::shared_ptr<DistributedPipelineNode> right,
-	             SchemaRef schema);
+	             SchemaRef schema, optional_idx mark_build_summary_source_node_id = optional_idx());
 
 	std::shared_ptr<DistributedPipelineNode> into_node();
 
@@ -75,6 +76,7 @@ private:
 	duckdb::vector<unique_ptr<BaseStatistics>> join_stats_;
 	unique_ptr<JoinFilterPushdownInfo> filter_pushdown_;
 	idx_t estimated_cardinality_;
+	optional_idx mark_build_summary_source_node_id_;
 };
 
 } // namespace distributed

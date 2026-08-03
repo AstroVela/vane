@@ -292,6 +292,34 @@ static DuckPhysicalPlanRef MakeHashJoinPlan(JoinType join_type, idx_t left_cardi
 	return plan;
 }
 
+static DuckPhysicalPlanRef MakeCorrelatedMarkJoinPlan() {
+	auto plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
+	vector<LogicalType> input_types = {LogicalType::INTEGER, LogicalType::INTEGER};
+	auto left_collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), input_types);
+	auto &left_scan = plan->Make<PhysicalColumnDataScan>(input_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 1,
+	                                                     std::move(left_collection));
+	auto right_collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), input_types);
+	auto &right_scan = plan->Make<PhysicalColumnDataScan>(input_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 1,
+	                                                      std::move(right_collection));
+
+	vector<JoinCondition> conditions;
+	for (idx_t column_idx = 0; column_idx < input_types.size(); column_idx++) {
+		JoinCondition condition;
+		condition.left = make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, column_idx);
+		condition.right = make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, column_idx);
+		condition.comparison = ExpressionType::COMPARE_EQUAL;
+		conditions.push_back(std::move(condition));
+	}
+
+	LogicalComparisonJoin logical_join(JoinType::MARK);
+	logical_join.types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BOOLEAN};
+	auto &hash_join = plan->Make<PhysicalHashJoin>(logical_join, left_scan, right_scan, std::move(conditions),
+	                                               JoinType::MARK, vector<idx_t> {}, vector<idx_t> {},
+	                                               vector<LogicalType> {LogicalType::INTEGER}, 1, nullptr);
+	plan->SetRoot(hash_join);
+	return plan;
+}
+
 static bool NodeDisplayContains(const DistributedPipelineNodeRef &node, const std::string &needle) {
 	for (const auto &line : node->inner()->multiline_display(false)) {
 		if (line.find(needle) != std::string::npos) {
@@ -1354,6 +1382,39 @@ TEST_CASE("PhysicalPlanTranslator: hash join builds both required shuffles", "[d
 		REQUIRE(shuffle->config().clustering_spec() != nullptr);
 		REQUIRE(shuffle->config().clustering_spec()->type() == ClusteringSpec::Type::Hash);
 		REQUIRE(shuffle->config().clustering_spec()->num_partitions() == 4);
+	}
+}
+
+TEST_CASE("PhysicalPlanTranslator: partitioned MARK joins preserve global build semantics", "[distributed][join]") {
+	ScopedTranslatorEnvironment join_strategy("VANE_DISTRIBUTED_JOIN_STRATEGY", "hash");
+	PlanConfig config;
+	config.num_partitions = 4;
+
+	SECTION("uncorrelated MARK build shuffle collects one global summary") {
+		auto res = physical_plan_to_pipeline_node(config, MakeHashJoinPlan(JoinType::MARK, 1, 1));
+		REQUIRE(res.is_ok());
+		auto children = res.value()->inner()->children();
+		REQUIRE(children.size() == 2);
+		auto left_shuffle = std::dynamic_pointer_cast<RepartitionNode>(children[0]);
+		auto right_shuffle = std::dynamic_pointer_cast<RepartitionNode>(children[1]);
+		REQUIRE(left_shuffle != nullptr);
+		REQUIRE(right_shuffle != nullptr);
+		REQUIRE_FALSE(left_shuffle->CollectsMarkJoinBuildSummary());
+		REQUIRE(right_shuffle->CollectsMarkJoinBuildSummary());
+		REQUIRE(NodeDisplayContains(right_shuffle->into_node(), "MARK build summary: global"));
+	}
+
+	SECTION("correlated MARK rows are co-located by correlation keys") {
+		auto res = physical_plan_to_pipeline_node(config, MakeCorrelatedMarkJoinPlan());
+		REQUIRE(res.is_ok());
+		auto children = res.value()->inner()->children();
+		REQUIRE(children.size() == 2);
+		for (const auto &child : children) {
+			auto shuffle = std::dynamic_pointer_cast<RepartitionNode>(child);
+			REQUIRE(shuffle != nullptr);
+			REQUIRE_FALSE(shuffle->CollectsMarkJoinBuildSummary());
+			REQUIRE(shuffle->config().clustering_spec()->partition_by().size() == 1);
+		}
 	}
 }
 

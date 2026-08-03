@@ -84,6 +84,16 @@ public:
 	const vector<string> &RangeOrderModifiers() const {
 		return range_order_modifiers_;
 	}
+	void EnableMarkJoinBuildSummary(vector<unique_ptr<Expression>> expressions) {
+		collect_mark_join_build_summary_ = true;
+		mark_join_build_expressions_ = std::move(expressions);
+	}
+	bool CollectsMarkJoinBuildSummary() const {
+		return collect_mark_join_build_summary_;
+	}
+	const vector<unique_ptr<Expression>> &MarkJoinBuildExpressions() const {
+		return mark_join_build_expressions_;
+	}
 
 private:
 	static idx_t SelectPartitionHash(const hash_t hash, const idx_t num_partitions);
@@ -94,10 +104,12 @@ private:
 	idx_t num_partitions_;
 	RepartitionSpec::Type repartition_type_;
 	vector<unique_ptr<Expression>> partition_by_;
-	distributed::ExchangeSinkInstanceHandle sink_handle_;
+	mutable distributed::ExchangeSinkInstanceHandle sink_handle_;
 	std::shared_ptr<distributed::ExchangeManager> exchange_mgr_;
 	vector<string> range_boundaries_;
 	vector<string> range_order_modifiers_;
+	bool collect_mark_join_build_summary_ = false;
+	vector<unique_ptr<Expression>> mark_join_build_expressions_;
 };
 
 } // namespace duckdb

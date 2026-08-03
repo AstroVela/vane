@@ -1055,6 +1055,14 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		});
 		auto filter_pushdown =
 		    deserializer.ReadPropertyWithDefault<unique_ptr<JoinFilterPushdownInfo>>(114, "filter_pushdown");
+		MarkJoinBuildSummary mark_join_build_summary;
+		deserializer.ReadPropertyWithDefault<bool>(115, "mark_join_build_summary_valid", mark_join_build_summary.valid);
+		deserializer.ReadPropertyWithDefault<bool>(116, "mark_join_build_has_rows", mark_join_build_summary.has_rows);
+		deserializer.ReadPropertyWithDefault<bool>(117, "mark_join_build_has_null", mark_join_build_summary.has_null);
+		if (mark_join_build_summary.valid && (join_type != JoinType::MARK || !mark_join_build_summary.IsValid() ||
+		                                      (!delim_types.empty() && delim_types.size() + 1 == conditions.size()))) {
+			throw SerializationException("invalid global MARK join build summary for hash join");
+		}
 
 		LogicalComparisonJoin dummy_join(join_type);
 		dummy_join.types = std::move(types);
@@ -1070,6 +1078,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		join->rhs_output_columns.col_types = std::move(rhs_col_types);
 		join->join_stats = std::move(join_stats);
 		join->filter_pushdown = std::move(filter_pushdown);
+		join->mark_join_build_summary = mark_join_build_summary;
 		return unique_ptr<PhysicalOperator>(std::move(join));
 	}
 	case PhysicalOperatorType::LEFT_DELIM_JOIN:
@@ -1190,15 +1199,23 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		sink_handle.flight_server_epoch = deserializer.ReadProperty<string>(114, "flight_server_epoch");
 		sink_handle.query_id = deserializer.ReadProperty<string>(115, "query_id");
 		sink_handle.fte_task_identity = deserializer.ReadPropertyWithDefault<bool>(116, "fte_task_identity");
+		auto collect_mark_join_build_summary =
+		    deserializer.ReadPropertyWithDefault<bool>(117, "collect_mark_join_build_summary");
+		auto mark_join_build_expressions =
+		    deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(118, "mark_join_build_expressions");
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.local_dirs = std::vector<std::string>(local_dirs.begin(), local_dirs.end());
 		flight_config.node_id = node_id;
 		auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
-		return make_uniq<PhysicalRemoteExchangeSink>(
+		auto result = make_uniq<PhysicalRemoteExchangeSink>(
 		    physical_plan, std::move(types), estimated_cardinality, std::move(exchange_id), num_partitions,
 		    repartition_type, std::move(partition_by), std::move(sink_handle), std::move(exchange_mgr),
 		    std::move(range_boundaries), std::move(range_order_modifiers));
+		if (collect_mark_join_build_summary) {
+			result->EnableMarkJoinBuildSummary(std::move(mark_join_build_expressions));
+		}
+		return unique_ptr<PhysicalOperator>(std::move(result));
 	}
 	case PhysicalOperatorType::EXCHANGE_SOURCE: {
 		auto exchange_id = deserializer.ReadProperty<string>(103, "shuffle_stage_id");

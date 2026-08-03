@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 #include "duckdb/common/types.hpp"
+#include "duckdb/execution/mark_join_build_summary.hpp"
 
 namespace duckdb {
 namespace distributed {
@@ -53,6 +54,9 @@ struct ExchangeSinkInstanceHandle {
 	std::string flight_host;
 	/// Process-local Flight service incarnation that published this attempt.
 	std::string flight_server_epoch;
+	/// Present only for a MARK-join build shuffle. This is the summary produced
+	/// by this concrete sink attempt.
+	MarkJoinBuildSummary mark_join_build_summary;
 };
 
 // ─── Source Handles ──────────────────────────────────────
@@ -83,6 +87,9 @@ struct ExchangeSourceHandle {
 	int flight_port = 0;
 	std::string flight_server_epoch;
 	std::vector<ExchangeSourceFile> files;
+	/// Global summary reduced across all selected sink attempts. When present,
+	/// every source handle for the exchange carries the same value.
+	MarkJoinBuildSummary mark_join_build_summary;
 };
 
 } // namespace distributed

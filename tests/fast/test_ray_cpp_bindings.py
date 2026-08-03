@@ -620,6 +620,33 @@ def test_exchange_source_task_descriptor_preserves_attempt_ids():
     assert duckdb.ray_cxx.exchange_source_task_source_handles_for_test(split[1][1]) == [handles[1]]
 
 
+def test_exchange_source_task_split_preserves_mark_join_build_summary():
+    raw = duckdb.ray_cxx.make_exchange_source_task_descriptor_for_test(
+        [
+            {
+                "partition_id": 0,
+                "source_task_partition_id": 17,
+                "attempt_id": 0,
+                "node_id": "node-a",
+                "flight_port": 5010,
+                "files": [{"path": "mark-shuffle", "file_size": 11}],
+            }
+        ],
+        [0],
+        1,
+        1,
+        mark_join_build_summary_valid=True,
+        mark_join_build_has_rows=True,
+        mark_join_build_has_null=True,
+    )
+    expected = {"valid": True, "has_rows": True, "has_null": True}
+
+    assert duckdb.ray_cxx.exchange_source_task_mark_join_build_summary_for_test(raw) == expected
+    split = duckdb.ray_cxx.split_exchange_source_task_by_partition(raw)
+    assert len(split) == 1
+    assert duckdb.ray_cxx.exchange_source_task_mark_join_build_summary_for_test(split[0][1]) == expected
+
+
 def test_exchange_source_task_descriptor_preserves_replicated_distribution():
     handles = [
         {

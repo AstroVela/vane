@@ -31,6 +31,7 @@ struct ExchangeSourceTaskDescriptor {
 	idx_t source_partition_count = 0;
 	idx_t source_task_count = 0;
 	bool replicated = false;
+	MarkJoinBuildSummary mark_join_build_summary;
 
 	void Serialize(Serializer &serializer) const;
 	static ExchangeSourceTaskDescriptor Deserialize(Deserializer &deserializer);

@@ -1352,6 +1352,22 @@ void register_ray_bindings(py::module_ &mod) {
 				        if (d.contains("query_id")) {
 					        exchange_sink_instance_task.sink_instance.query_id = py::str(d["query_id"]).cast<string>();
 				        }
+				        if (d.contains("mark_join_build_summary_valid")) {
+					        exchange_sink_instance_task.sink_instance.mark_join_build_summary.valid =
+					            py::bool_(d["mark_join_build_summary_valid"]).cast<bool>();
+				        }
+				        if (d.contains("mark_join_build_has_rows")) {
+					        exchange_sink_instance_task.sink_instance.mark_join_build_summary.has_rows =
+					            py::bool_(d["mark_join_build_has_rows"]).cast<bool>();
+				        }
+				        if (d.contains("mark_join_build_has_null")) {
+					        exchange_sink_instance_task.sink_instance.mark_join_build_summary.has_null =
+					            py::bool_(d["mark_join_build_has_null"]).cast<bool>();
+				        }
+				        if (exchange_sink_instance_task.sink_instance.mark_join_build_summary.valid &&
+				            !exchange_sink_instance_task.sink_instance.mark_join_build_summary.IsValid()) {
+					        throw py::value_error("exchange_sink_instance has an invalid MARK join build summary");
+				        }
 				        has_exchange_sink_instance_task = true;
 			        } else {
 				        throw py::value_error("exchange_sink_instance must be bytes or dict");
@@ -1506,6 +1522,20 @@ void register_ray_bindings(py::module_ &mod) {
 		    return desc.replicated;
 	    },
 	    py::arg("bytes"), "Return whether a raw ExchangeSourceTaskDescriptor is replicated.");
+
+	m.def(
+	    "exchange_source_task_mark_join_build_summary_for_test",
+	    [](py::bytes bytes_obj) {
+		    using namespace duckdb::distributed;
+		    string raw(bytes_obj);
+		    auto desc = ExchangeSourceTaskDescriptor::DeserializeFromBytes(raw);
+		    py::dict out;
+		    out["valid"] = desc.mark_join_build_summary.valid;
+		    out["has_rows"] = desc.mark_join_build_summary.has_rows;
+		    out["has_null"] = desc.mark_join_build_summary.has_null;
+		    return out;
+	    },
+	    py::arg("bytes"), "Return MARK build summary metadata from an exchange source descriptor.");
 
 	m.def(
 	    "exchange_source_task_logical_identity",
@@ -1753,7 +1783,8 @@ void register_ray_bindings(py::module_ &mod) {
 	m.def(
 	    "make_exchange_source_task_descriptor_for_test",
 	    [](py::list handles, py::list partition_indices, idx_t source_partition_count, idx_t source_task_count,
-	       bool replicated) {
+	       bool replicated, bool mark_join_build_summary_valid, bool mark_join_build_has_rows,
+	       bool mark_join_build_has_null) {
 		    using namespace duckdb::distributed;
 		    ExchangeSourceTaskDescriptor desc;
 		    for (auto item : partition_indices) {
@@ -1762,6 +1793,15 @@ void register_ray_bindings(py::module_ &mod) {
 		    desc.source_partition_count = source_partition_count;
 		    desc.source_task_count = source_task_count;
 		    desc.replicated = replicated;
+		    if (mark_join_build_summary_valid) {
+			    desc.mark_join_build_summary =
+			        MarkJoinBuildSummary::Create(mark_join_build_has_rows, mark_join_build_has_null);
+			    if (!desc.mark_join_build_summary.IsValid()) {
+				    throw py::value_error("invalid MARK join build summary");
+			    }
+		    } else if (mark_join_build_has_rows || mark_join_build_has_null) {
+			    throw py::value_error("MARK join build summary values require a valid summary");
+		    }
 
 		    for (auto item : handles) {
 			    py::dict d = item.cast<py::dict>();
@@ -1807,7 +1847,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    return py::bytes(bytes);
 	    },
 	    py::arg("handles"), py::arg("partition_indices"), py::arg("source_partition_count"),
-	    py::arg("source_task_count"), py::arg("replicated") = false,
+	    py::arg("source_task_count"), py::arg("replicated") = false, py::arg("mark_join_build_summary_valid") = false,
+	    py::arg("mark_join_build_has_rows") = false, py::arg("mark_join_build_has_null") = false,
 	    "Build a raw ExchangeSourceTaskDescriptor for Python fast tests.");
 
 	m.def(
@@ -4859,6 +4900,7 @@ void register_ray_bindings(py::module_ &mod) {
 			    single.source_partition_count = partition_count;
 			    single.source_task_count = desc.source_task_count;
 			    single.replicated = desc.replicated;
+			    single.mark_join_build_summary = desc.mark_join_build_summary;
 			    for (const auto &handle : desc.source_handles) {
 				    if (handle.partition_id == partition_id) {
 					    single.source_handles.push_back(handle);

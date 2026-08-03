@@ -11,6 +11,7 @@
 #include "duckdb/execution/distributed/pipeline_node/join/hash_join_metadata.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/join_output_types.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
+#include "duckdb/execution/distributed/plan/exchange_source_task.hpp"
 #include "duckdb/execution/distributed/plan/runner.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
@@ -38,6 +39,21 @@ void MoveTaskInputsOrThrow(TaskInputs &target, TaskInputs &source) {
 		}
 	}
 	source.clear();
+}
+
+MarkJoinBuildSummary ExtractMarkJoinBuildSummary(const TaskInputs &inputs, optional_idx source_node_id) {
+	if (!source_node_id.IsValid()) {
+		return MarkJoinBuildSummary();
+	}
+	auto entry = inputs.find(static_cast<SourceNodeId>(source_node_id.GetIndex()));
+	if (entry == inputs.end() || entry->second.kind != TaskInput::Kind::ExchangeSourceTask) {
+		throw InvalidInputException("HashJoinNode is missing its MARK build exchange source input");
+	}
+	auto descriptor = ExchangeSourceTaskDescriptor::DeserializeFromBytes(entry->second.exchange_source_task_bytes);
+	if (!descriptor.mark_join_build_summary.valid || !descriptor.mark_join_build_summary.IsValid()) {
+		throw InvalidInputException("HashJoinNode received an invalid global MARK build summary");
+	}
+	return descriptor.mark_join_build_summary;
 }
 
 class HashJoinTaskFanInStream {
@@ -239,14 +255,16 @@ HashJoinNode::HashJoinNode(NodeID node_id, const PlanConfig &plan_config, duckdb
                            duckdb::vector<unique_ptr<BaseStatistics>> join_stats,
                            unique_ptr<JoinFilterPushdownInfo> filter_pushdown, idx_t estimated_cardinality,
                            std::shared_ptr<DistributedPipelineNode> left,
-                           std::shared_ptr<DistributedPipelineNode> right, SchemaRef schema)
+                           std::shared_ptr<DistributedPipelineNode> right, SchemaRef schema,
+                           optional_idx mark_build_summary_source_node_id)
     : context_(plan_config.query_idx, plan_config.query_id, node_id, "HashJoin"), left_(std::move(left)),
       right_(std::move(right)), conditions_(std::move(conditions)), join_type_(join_type),
       output_types_(std::move(output_types)), delim_types_(std::move(delim_types)),
       condition_types_(std::move(condition_types)), payload_columns_(std::move(payload_columns)),
       lhs_output_columns_(std::move(lhs_output_columns)), rhs_output_columns_(std::move(rhs_output_columns)),
       join_stats_(std::move(join_stats)), filter_pushdown_(std::move(filter_pushdown)),
-      estimated_cardinality_(estimated_cardinality) {
+      estimated_cardinality_(estimated_cardinality),
+      mark_build_summary_source_node_id_(mark_build_summary_source_node_id) {
 	size_t num_partitions = 1;
 	if (left_ && right_) {
 		num_partitions = std::max(left_->config().clustering_spec()->num_partitions(),
@@ -399,6 +417,8 @@ SubmittableTask<WorkerTask> HashJoinNode::BuildHashJoinTask(SubmittableTask<Work
 
 		left_plan->SetRoot(nlj);
 	} else {
+		auto mark_build_summary =
+		    ExtractMarkJoinBuildSummary(right_task.task()->inputs(), mark_build_summary_source_node_id_);
 		// Has equality conditions: use PhysicalHashJoin (normal path)
 		auto &hash_join = left_plan
 		                      ->Make<PhysicalHashJoin>(dummy_join, std::move(conditions), join_type_, delim_types_,
@@ -410,6 +430,7 @@ SubmittableTask<WorkerTask> HashJoinNode::BuildHashJoinTask(SubmittableTask<Work
 		hash_join.lhs_output_columns = lhs_output_columns_;
 		hash_join.rhs_output_columns = rhs_output_columns_;
 		hash_join.join_stats = CopyJoinStats(join_stats_);
+		hash_join.mark_join_build_summary = mark_build_summary;
 		if (filter_pushdown_) {
 			hash_join.filter_pushdown = CopyFilterPushdownInfo(*filter_pushdown_);
 		}

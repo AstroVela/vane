@@ -151,6 +151,12 @@ void ExchangeSinkInstanceTaskDescriptor::Serialize(Serializer &serializer) const
 	serializer.WriteProperty(6, "query_id", sink_instance.query_id);
 	serializer.WriteProperty(7, "flight_host", sink_instance.flight_host);
 	serializer.WriteProperty(8, "fte_task_identity", sink_instance.fte_task_identity);
+	serializer.WritePropertyWithDefault<bool>(9, "mark_join_build_summary_valid",
+	                                          sink_instance.mark_join_build_summary.valid, false);
+	serializer.WritePropertyWithDefault<bool>(10, "mark_join_build_has_rows",
+	                                          sink_instance.mark_join_build_summary.has_rows, false);
+	serializer.WritePropertyWithDefault<bool>(11, "mark_join_build_has_null",
+	                                          sink_instance.mark_join_build_summary.has_null, false);
 }
 
 ExchangeSinkInstanceTaskDescriptor ExchangeSinkInstanceTaskDescriptor::Deserialize(Deserializer &deserializer) {
@@ -165,6 +171,15 @@ ExchangeSinkInstanceTaskDescriptor ExchangeSinkInstanceTaskDescriptor::Deseriali
 	result.sink_instance.query_id = deserializer.ReadProperty<string>(6, "query_id");
 	result.sink_instance.flight_host = deserializer.ReadProperty<string>(7, "flight_host");
 	result.sink_instance.fte_task_identity = deserializer.ReadPropertyWithDefault<bool>(8, "fte_task_identity");
+	deserializer.ReadPropertyWithDefault<bool>(9, "mark_join_build_summary_valid",
+	                                           result.sink_instance.mark_join_build_summary.valid);
+	deserializer.ReadPropertyWithDefault<bool>(10, "mark_join_build_has_rows",
+	                                           result.sink_instance.mark_join_build_summary.has_rows);
+	deserializer.ReadPropertyWithDefault<bool>(11, "mark_join_build_has_null",
+	                                           result.sink_instance.mark_join_build_summary.has_null);
+	if (result.sink_instance.mark_join_build_summary.valid && !result.sink_instance.mark_join_build_summary.IsValid()) {
+		throw SerializationException("invalid MARK join build summary in exchange sink task");
+	}
 	return result;
 }
 

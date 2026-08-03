@@ -24,6 +24,7 @@
 #include "duckdb/execution/distributed/common_types.hpp"
 #include "duckdb/execution/distributed/exchange/exchange_manager.hpp"
 #include "duckdb/execution/distributed/scheduling/task.hpp"
+#include "duckdb/execution/distributed/plan/exchange_source_task.hpp"
 #include "duckdb/execution/distributed/plan/runner.hpp"
 #include "duckdb/execution/distributed/pipeline_node/translator.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/join_output_types.hpp"
@@ -541,6 +542,39 @@ TEST_CASE("HashJoinNode: non-equality joins reject a stale output schema", "[dis
 
 	REQUIRE_THROWS_WITH(node.BuildHashJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr),
 	                    Catch::Matchers::Contains("output schema that does not match its children"));
+}
+
+TEST_CASE("HashJoinNode: MARK join embeds the global build summary from its right source",
+          "[distributed][source_id][join]") {
+	PlanConfig plan_cfg(1, "mark-join-query", std::make_shared<DuckDBExecutionConfig>());
+	JoinCondition condition;
+	condition.left = make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0);
+	condition.right = make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0);
+	condition.comparison = ExpressionType::COMPARE_EQUAL;
+	vector<JoinCondition> conditions;
+	conditions.push_back(std::move(condition));
+	auto schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::BIGINT, LogicalType::BOOLEAN});
+
+	HashJoinNode node(301, plan_cfg, std::move(conditions), JoinType::MARK,
+	                  vector<LogicalType> {LogicalType::BIGINT, LogicalType::BOOLEAN}, {},
+	                  vector<LogicalType> {LogicalType::BIGINT}, PhysicalHashJoin::JoinProjectionColumns(),
+	                  PhysicalHashJoin::JoinProjectionColumns(), PhysicalHashJoin::JoinProjectionColumns(), {}, nullptr,
+	                  1, nullptr, nullptr, schema, optional_idx(20));
+
+	auto left_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(10, "left", 10, "left_scan"));
+	auto right_worker = MakeWorkerTaskWithInput(20, "right", 21, "right_scan");
+	ExchangeSourceTaskDescriptor right_source;
+	right_source.mark_join_build_summary = MarkJoinBuildSummary::Create(true, true);
+	right_worker.mutable_inputs()[20] = TaskInput::make_exchange_source_task(right_source.SerializeToBytes());
+	auto right_task = SubmittableTask<WorkerTask>(std::move(right_worker));
+	TaskIDCounter task_id_counter;
+
+	auto joined_task = node.BuildHashJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+	auto *join = dynamic_cast<PhysicalHashJoin *>(&joined_task.task()->plan()->Root());
+	REQUIRE(join != nullptr);
+	REQUIRE(join->mark_join_build_summary.valid);
+	REQUIRE(join->mark_join_build_summary.has_rows);
+	REQUIRE(join->mark_join_build_summary.has_null);
 }
 
 TEST_CASE("HashJoinNode: fan-in preserves child task streams", "[distributed][source_id][join]") {

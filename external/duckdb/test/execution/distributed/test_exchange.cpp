@@ -1747,6 +1747,47 @@ TEST_CASE("Exchange: FlightExchange with no sinks has no unpublished source hand
 	exchange->Close();
 }
 
+TEST_CASE("Exchange: FlightExchange reduces MARK build summaries from selected attempts only",
+          "[distributed][exchange][join]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+
+	FlightExchangeConfig config;
+	config.node_id = "mark-summary-coordinator";
+	config.local_dirs = {TestCreatePath("exchange_mark_build_summary")};
+	FlightExchangeManager manager(config, conn.context.get());
+
+	ExchangeContext ctx;
+	ctx.query_id = "mark-summary-query";
+	ctx.exchange_id = "mark-summary-stage";
+	auto exchange = manager.CreateExchange(ctx, 3);
+	auto first = exchange->InstantiateSink(exchange->AddSink(0), 0);
+	auto first_retry = exchange->InstantiateSink(exchange->AddSink(0), 1);
+	auto second = exchange->InstantiateSink(exchange->AddSink(1), 0);
+	first.flight_host = "mark-worker-0.internal";
+	first.flight_server_epoch = "mark-epoch-0";
+	first.mark_join_build_summary = MarkJoinBuildSummary::Create(false, false);
+	first_retry.flight_host = "mark-worker-retry.internal";
+	first_retry.flight_server_epoch = "mark-epoch-retry";
+	first_retry.mark_join_build_summary = MarkJoinBuildSummary::Create(true, true);
+	second.flight_host = "mark-worker-1.internal";
+	second.flight_server_epoch = "mark-epoch-1";
+	second.mark_join_build_summary = MarkJoinBuildSummary::Create(true, false);
+
+	exchange->SinkFinished(first, "mark-worker-0", 5100);
+	exchange->SinkFinished(first_retry, "mark-worker-retry", 5102);
+	exchange->SinkFinished(second, "mark-worker-1", 5101);
+	exchange->AllRequiredSinksFinished();
+	auto handles = exchange->GetSourceHandles();
+	REQUIRE(handles.size() == 6);
+	for (const auto &handle : handles) {
+		REQUIRE(handle.mark_join_build_summary.valid);
+		REQUIRE(handle.mark_join_build_summary.has_rows);
+		REQUIRE_FALSE(handle.mark_join_build_summary.has_null);
+	}
+	exchange->Close();
+}
+
 TEST_CASE("Exchange: same logical stage has isolated exchange instances and directories", "[distributed][exchange]") {
 	DuckDB db(nullptr);
 	Connection conn(db);
