@@ -2008,7 +2008,7 @@ class RayQueryDriverActor:
                 self._client_lease_maintenance_error = f"{type(error).__name__}: {error}"
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
-            except TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):
                 continue
 
     async def stop_client_lease_maintenance(self) -> None:
@@ -2469,7 +2469,7 @@ class RayQueryDriverActor:
                 self._query_resource_maintenance_error = f"{type(exc).__name__}: {exc}"
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
-            except TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):
                 continue
 
     async def stop_query_resource_maintenance(self) -> None:
