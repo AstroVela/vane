@@ -310,9 +310,9 @@ class TaskAdmissionController:
     ) -> None:
         self._payload = dict(payload)
         self._query_id = str(self._payload.get("query_id") or "").strip()
-        self._stage_id = str(self._payload.get("stage_id") or "").strip()
-        if not self._query_id or not self._stage_id:
-            raise ValueError("distributed Ray UDF task admission requires query_id and stage_id")
+        self._resource_unit_id = str(self._payload.get("resource_unit_id") or "").strip()
+        if not self._query_id or not self._resource_unit_id:
+            raise ValueError("distributed Ray UDF task admission requires query_id and resource_unit_id")
         if driver is None:
             raise ValueError("distributed Ray UDF task admission requires an explicit query driver handle")
         self._query_generation_capability = str(query_generation_capability or "").strip()
@@ -348,10 +348,10 @@ class TaskAdmissionController:
         self._sequence += 1
         identity = f"executor:{self._executor_id}:admission:{self._sequence}"
         return {
-            "request_id": f"request:task:{self._stage_id}:{identity}",
+            "request_id": f"request:task:{self._resource_unit_id}:{identity}",
             "query_id": self._query_id,
-            "stage_id": self._stage_id,
-            "task_id": f"task:{self._stage_id}:{identity}",
+            "resource_unit_id": self._resource_unit_id,
+            "task_id": f"task:{self._resource_unit_id}:{identity}",
             "attempt_id": f"attempt:{self._executor_id}:{self._sequence}",
             "node_id": None,
             "retained_input_bytes": retained_input_bytes,

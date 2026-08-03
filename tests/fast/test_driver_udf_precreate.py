@@ -301,13 +301,13 @@ def test_precreate_udf_actors_injects_driver_handle_for_ray_task(monkeypatch):
     def _fake_prepare_actor_pools_for_plan(
         plan,
         *,
-        actor_node_ids_by_stage,
+        actor_node_ids_by_unit,
         query_driver_handle,
         query_generation_capability,
         session_config,
         conn=None,
     ):
-        assert actor_node_ids_by_stage == {}
+        assert actor_node_ids_by_unit == {}
         assert query_driver_handle is driver_handle
         assert query_generation_capability == _QUERY_GENERATION_CAPABILITY
         assert session_config == {"AWS_ACCESS_KEY_ID": "session-access-key"}
@@ -356,8 +356,8 @@ def test_precreate_udf_actors_injects_driver_handle_for_ray_task(monkeypatch):
     created = runner_cls._precreate_udf_actors(
         runner,
         plan,
-        SimpleNamespace(query_id="test-plan", stages=()),
-        SimpleNamespace(actor_node_ids_for_stage=lambda _stage_id: ()),
+        SimpleNamespace(query_id="test-plan", units=()),
+        SimpleNamespace(actor_node_ids_for_unit=lambda _resource_unit_id: ()),
         query_connection=query_connection,
         session_config={"AWS_ACCESS_KEY_ID": "session-access-key"},
     )
@@ -412,8 +412,8 @@ def test_precreate_udf_actors_skips_non_ray_nodes(monkeypatch):
     created = runner_cls._precreate_udf_actors(
         runner,
         plan,
-        SimpleNamespace(query_id="test-plan", stages=()),
-        SimpleNamespace(actor_node_ids_for_stage=lambda _stage_id: ()),
+        SimpleNamespace(query_id="test-plan", units=()),
+        SimpleNamespace(actor_node_ids_for_unit=lambda _resource_unit_id: ()),
         query_connection=object(),
         session_config={},
     )
@@ -479,8 +479,8 @@ def test_precreate_retains_partially_created_actor_pool_for_teardown(
             method(
                 runner,
                 plan,
-                SimpleNamespace(query_id="test-plan", stages=()),
-                SimpleNamespace(actor_node_ids_for_stage=lambda _stage_id: ()),
+                SimpleNamespace(query_id="test-plan", units=()),
+                SimpleNamespace(actor_node_ids_for_unit=lambda _resource_unit_id: ()),
                 query_connection=object(),
                 session_config={},
             )
@@ -588,7 +588,7 @@ def test_stateful_actor_loss_during_synchronous_submit_keeps_recoverability_cont
             self.actors = [Actor()]
             self._payload = {
                 "query_id": "query-submit",
-                "stage_id": "stage-submit",
+                "resource_unit_id": "stage-submit",
                 "execution_backend": "ray_actor",
                 "udf_output_target_max_bytes": 1,
             }
@@ -606,7 +606,7 @@ def test_stateful_actor_loss_during_synchronous_submit_keeps_recoverability_cont
             return SimpleNamespace(
                 lease={
                     "query_id": "query-submit",
-                    "stage_id": "stage-submit",
+                    "resource_unit_id": "stage-submit",
                     "lease_id": "lease-submit",
                     "attempt_id": "attempt-submit",
                     "node_id": "node-submit",
@@ -690,7 +690,7 @@ def test_precreate_udf_actors_enable_generic_async_for_distributed_pool(
                 "payload": {
                     "udf_name": "decode_images",
                     "execution_backend": "ray_actor",
-                    "stage_id": "stage:test:actor",
+                    "resource_unit_id": "resource:test:actor",
                 },
             }
         ]
@@ -698,7 +698,7 @@ def test_precreate_udf_actors_enable_generic_async_for_distributed_pool(
 
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
+        actor_node_ids_by_unit={"resource:test:actor": ("node-a", "node-b")},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -761,7 +761,7 @@ def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name
                 "payload": {
                     "udf_name": "decode_images",
                     "execution_backend": "ray_actor",
-                    "stage_id": "stage:test:actor",
+                    "resource_unit_id": "resource:test:actor",
                 },
             }
         ]
@@ -770,7 +770,7 @@ def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name
     query_driver_handle = object()
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
+        actor_node_ids_by_unit={"resource:test:actor": ("node-a", "node-b")},
         query_driver_handle=query_driver_handle,
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -782,7 +782,7 @@ def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name
     assert calls[0]["payload"] == {
         "udf_name": "decode_images",
         "execution_backend": "ray_actor",
-        "stage_id": "stage:test:actor",
+        "resource_unit_id": "resource:test:actor",
     }
     assert calls[0]["concurrency"] == 2
     assert calls[0]["gpus_per_actor"] == 0.0
@@ -849,7 +849,7 @@ def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_
                     "stateful": True,
                     "side_effects": True,
                     "actor_number": 1,
-                    "stage_id": "stage:test:stateful",
+                    "resource_unit_id": "resource:test:stateful",
                 },
             }
         ]
@@ -857,7 +857,7 @@ def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_
 
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_stage={"stage:test:stateful": ("node-a",)},
+        actor_node_ids_by_unit={"resource:test:stateful": ("node-a",)},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -874,7 +874,7 @@ def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_
                 "stateful": True,
                 "side_effects": True,
                 "actor_number": 1,
-                "stage_id": "stage:test:stateful",
+                "resource_unit_id": "resource:test:stateful",
             },
             "concurrency": 1,
             "actor_node_ids": ["node-a"],
@@ -924,7 +924,7 @@ def test_ensure_actor_pools_for_plan_disables_retries_for_side_effecting_udf(mon
                     "execution_backend": "ray_actor",
                     "stateful": False,
                     "side_effects": True,
-                    "stage_id": "stage:test:side-effects",
+                    "resource_unit_id": "resource:test:side-effects",
                 },
             }
         ]
@@ -932,7 +932,7 @@ def test_ensure_actor_pools_for_plan_disables_retries_for_side_effecting_udf(mon
 
     created, _ = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_stage={"stage:test:side-effects": ("node-a",)},
+        actor_node_ids_by_unit={"resource:test:side-effects": ("node-a",)},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -951,13 +951,13 @@ def test_ensure_actor_pools_for_plan_disables_retries_for_side_effecting_udf(mon
             "execution_backend": "ray_actor",
             "stateful": False,
             "side_effects": False,
-            "stage_id": "stage:test:retry-policy",
+            "resource_unit_id": "resource:test:retry-policy",
         },
         {
             "udf_name": "ai_prompt",
             "execution_backend": "ray_actor",
             "ai_operation": "prompt",
-            "stage_id": "stage:test:retry-policy",
+            "resource_unit_id": "resource:test:retry-policy",
         },
     ],
     ids=["stateless", "ai"],
@@ -1004,7 +1004,7 @@ def test_ensure_actor_pools_for_plan_keeps_default_retry_policy_for_non_stateful
 
     created, _ = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_stage={"stage:test:retry-policy": ("node-a",)},
+        actor_node_ids_by_unit={"resource:test:retry-policy": ("node-a",)},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -1120,7 +1120,7 @@ def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):
             "payload": {
                 "udf_name": "decode_images",
                 "execution_backend": "ray_actor",
-                "stage_id": "stage:test:actor",
+                "resource_unit_id": "resource:test:actor",
             },
         }
     ]
@@ -1130,7 +1130,7 @@ def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):
 
     created, handles_map = udf_ray.ensure_actor_pools_for_nodes(
         nodes,
-        actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
+        actor_node_ids_by_unit={"resource:test:actor": ("node-a", "node-b")},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -1142,7 +1142,7 @@ def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):
     assert calls[0]["payload"] == {
         "udf_name": "decode_images",
         "execution_backend": "ray_actor",
-        "stage_id": "stage:test:actor",
+        "resource_unit_id": "resource:test:actor",
     }
     assert calls[0]["concurrency"] == 2
     assert calls[0]["gpus_per_actor"] == 0.0
@@ -1185,7 +1185,7 @@ def test_ray_plan_injects_session_context_for_explicit_subprocess_backends(monke
 
     created, handles_map = udf_ray.ensure_actor_pools_for_nodes(
         nodes,
-        actor_node_ids_by_stage={},
+        actor_node_ids_by_unit={},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config=session_config,
@@ -1251,7 +1251,7 @@ def test_prepare_actor_pools_publishes_handles_before_waiting_for_init(monkeypat
                 "payload": {
                     "udf_name": "embed",
                     "execution_backend": "ray_actor",
-                    "stage_id": "stage:test:deferred-ready",
+                    "resource_unit_id": "resource:test:deferred-ready",
                 },
             }
         ]
@@ -1259,8 +1259,8 @@ def test_prepare_actor_pools_publishes_handles_before_waiting_for_init(monkeypat
 
     pools, handles = udf_ray.prepare_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_stage={
-            "stage:test:deferred-ready": ("node-a", "node-b"),
+        actor_node_ids_by_unit={
+            "resource:test:deferred-ready": ("node-a", "node-b"),
         },
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
@@ -1474,7 +1474,7 @@ def test_ensure_actor_pools_for_plan_does_not_fail_fast_on_cluster_resource_snap
                 "payload": {
                     "udf_name": "decode_images",
                     "execution_backend": "ray_actor",
-                    "stage_id": "stage:test:actor",
+                    "resource_unit_id": "resource:test:actor",
                     "cpus": 1.0,
                 },
             }
@@ -1483,7 +1483,7 @@ def test_ensure_actor_pools_for_plan_does_not_fail_fast_on_cluster_resource_snap
 
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
+        actor_node_ids_by_unit={"resource:test:actor": ("node-a", "node-b")},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -1540,7 +1540,7 @@ def test_ensure_actor_pools_for_plan_publishes_driver_handle_for_ray_task(monkey
     query_driver_handle = object()
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_stage={},
+        actor_node_ids_by_unit={},
         query_driver_handle=query_driver_handle,
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -1571,7 +1571,7 @@ def test_ensure_actor_pools_for_plan_propagates_collect_errors(monkeypatch):
     with pytest.raises(RuntimeError, match="collect failed"):
         udf_ray.ensure_actor_pools_for_plan(
             _BadPlan(),
-            actor_node_ids_by_stage={},
+            actor_node_ids_by_unit={},
             query_driver_handle=object(),
             query_generation_capability=_QUERY_GENERATION_CAPABILITY,
             session_config={},
@@ -1608,7 +1608,7 @@ def test_ensure_actor_pools_for_plan_propagates_actor_creation_errors(monkeypatc
                 "gpus": 0.0,
                 "payload": {
                     "execution_backend": "ray_actor",
-                    "stage_id": "stage:test:actor",
+                    "resource_unit_id": "resource:test:actor",
                 },
             }
         ]
@@ -1617,7 +1617,7 @@ def test_ensure_actor_pools_for_plan_propagates_actor_creation_errors(monkeypatc
     with pytest.raises(RuntimeError, match="create failed"):
         udf_ray.ensure_actor_pools_for_plan(
             plan,
-            actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
+            actor_node_ids_by_unit={"resource:test:actor": ("node-a", "node-b")},
             query_driver_handle=object(),
             query_generation_capability=_QUERY_GENERATION_CAPABILITY,
             session_config={},
@@ -1973,7 +1973,7 @@ def test_ensure_actor_pools_for_plan_uses_coordinator_actor_nodes(monkeypatch):
                 "gpus": 1.0,
                 "payload": {
                     "execution_backend": "ray_actor",
-                    "stage_id": "stage:test:actor",
+                    "resource_unit_id": "resource:test:actor",
                     "gpus": 1.0,
                 },
             }
@@ -1982,7 +1982,7 @@ def test_ensure_actor_pools_for_plan_uses_coordinator_actor_nodes(monkeypatch):
 
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
+        actor_node_ids_by_unit={"resource:test:actor": ("node-a", "node-b")},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -2053,7 +2053,7 @@ def test_ensure_actor_pools_waits_for_init_refs_before_ready_lookup(monkeypatch)
                 "gpus": 0.0,
                 "payload": {
                     "execution_backend": "ray_actor",
-                    "stage_id": "stage:test:actor",
+                    "resource_unit_id": "resource:test:actor",
                     "gpus": 0.0,
                 },
             }
@@ -2062,7 +2062,7 @@ def test_ensure_actor_pools_waits_for_init_refs_before_ready_lookup(monkeypatch)
 
     _, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_stage={"stage:test:actor": ("node-a", "node-b")},
+        actor_node_ids_by_unit={"resource:test:actor": ("node-a", "node-b")},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},

@@ -265,7 +265,7 @@ class _Driver:
             "lease": {
                 "lease_id": f"task-lease-{self.next_task}",
                 "query_id": request["query_id"],
-                "stage_id": request["stage_id"],
+                "resource_unit_id": request["resource_unit_id"],
                 "task_id": request["task_id"],
                 "attempt_id": request["attempt_id"],
                 "resources": {
@@ -290,12 +290,12 @@ class _Driver:
             "lease": {
                 "lease_id": f"output-lease-{self.next_output}",
                 "query_id": request["query_id"],
-                "producer_stage_id": request["producer_stage_id"],
+                "producer_unit_id": request["producer_unit_id"],
                 "task_lease_id": request["task_lease_id"],
                 "attempt_id": request["attempt_id"],
                 "block_id": request["block_id"],
                 "size_bytes": request["size_bytes"],
-                "state": "stage_queue",
+                "state": "unit_queue",
                 "liveness": False,
                 "allocation_generation": 1,
             },
@@ -309,7 +309,7 @@ def _metadata(lease, *, index=0, size_bytes=64, rows=1):
     return {
         "protocol_version": 1,
         "query_id": lease["query_id"],
-        "producer_stage_id": lease["stage_id"],
+        "producer_unit_id": lease["resource_unit_id"],
         "task_lease_id": lease["lease_id"],
         "attempt_id": lease["attempt_id"],
         "block_id": f"block:{lease['lease_id']}:{index}",
@@ -323,7 +323,7 @@ def _source(fake_ray, driver, *, request_id, submitter):
     request = {
         "request_id": request_id,
         "query_id": "q1",
-        "stage_id": "stage:q1:node:1:udf",
+        "resource_unit_id": "resource:q1:udf:node:1",
         "task_id": f"task:{request_id}",
         "attempt_id": f"attempt:{request_id}",
         "retained_input_bytes": 0,
@@ -2411,7 +2411,7 @@ def test_output_grant_transition_is_atomic_with_slot_cancellation():
         request = {
             "request_id": f"output-request:{metadata['block_id']}",
             "query_id": metadata["query_id"],
-            "producer_stage_id": metadata["producer_stage_id"],
+            "producer_unit_id": metadata["producer_unit_id"],
             "task_lease_id": metadata["task_lease_id"],
             "attempt_id": metadata["attempt_id"],
             "block_id": metadata["block_id"],
@@ -2496,7 +2496,7 @@ def test_terminal_record_releases_completed_output_lease_with_exact_rpc_contract
     metadata = _metadata(lease)
     output_request = {
         "query_id": metadata["query_id"],
-        "producer_stage_id": metadata["producer_stage_id"],
+        "producer_unit_id": metadata["producer_unit_id"],
         "task_lease_id": metadata["task_lease_id"],
         "attempt_id": metadata["attempt_id"],
         "block_id": metadata["block_id"],
@@ -2936,7 +2936,7 @@ def test_real_ray_generator_wait_is_non_consuming_and_preserves_pair_order():
         metadata = {
             "protocol_version": 1,
             "query_id": lease["query_id"],
-            "producer_stage_id": lease["stage_id"],
+            "producer_unit_id": lease["resource_unit_id"],
             "task_lease_id": lease["lease_id"],
             "attempt_id": lease["attempt_id"],
             "block_id": "real-ray:block:0",
@@ -3084,7 +3084,7 @@ def test_explicit_remote_error_pair_preserves_cause_without_output_lease():
     def submitter(lease):
         payload = {
             "query_id": lease["query_id"],
-            "stage_id": lease["stage_id"],
+            "resource_unit_id": lease["resource_unit_id"],
             "task_lease_id": lease["lease_id"],
             "attempt_id": lease["attempt_id"],
         }

@@ -41,7 +41,7 @@ def _rows_payload(fn: Any) -> dict[str, Any]:
         "actor_number": 1,
         "produce_ray_block_stream": True,
         "query_id": "query-row-preserving",
-        "stage_id": "stage-row-preserving",
+        "resource_unit_id": "stage-row-preserving",
         "task_lease_id": "lease-row-preserving",
         "attempt_id": "attempt-row-preserving",
         "node_id": "node-row-preserving",

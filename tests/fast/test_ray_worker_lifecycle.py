@@ -35,14 +35,14 @@ def _lifecycle(actor: object) -> FteWorkerLifecycleMixin:
     return lifecycle
 
 
-def test_blocking_materialization_completion_routes_native_node_to_query_stage(monkeypatch):
+def test_blocking_materialization_completion_routes_native_node_to_resource_unit(monkeypatch):
     from duckdb.runners.ray import query_resource_runtime
 
     calls: list[str] = []
 
     class Manager:
-        def mark_materializing_stage_completed(self, stage_id: str) -> bool:
-            calls.append(stage_id)
+        def mark_barrier_unit_completed(self, resource_unit_id: str) -> bool:
+            calls.append(resource_unit_id)
             return True
 
     def get_manager(query_id: str) -> Manager:
@@ -53,7 +53,7 @@ def test_blocking_materialization_completion_routes_native_node_to_query_stage(m
     lifecycle = _lifecycle(object())
 
     assert lifecycle.blocking_materialization_completed("query-a", "42") is True
-    assert calls == ["stage:query-a:node:42:fte"]
+    assert calls == ["resource:query-a:fragment:node:42"]
 
     with pytest.raises(ValueError, match="requires query_id and node_id"):
         lifecycle.blocking_materialization_completed("", "42")

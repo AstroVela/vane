@@ -7,15 +7,15 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-from duckdb.runners.ray.query_execution_graph import QueryAllocation, QueryExecutionGraph
+from duckdb.runners.ray.query_resource_graph import QueryAllocation, QueryResourceGraph
 from duckdb.runners.ray.query_resource_manager import QueryResourceManager
 
 _LOCK = threading.RLock()
 _MANAGERS: dict[str, QueryResourceManager] = {}
 
 
-def register_query_graph(
-    graph: QueryExecutionGraph,
+def register_query_resource_graph(
+    graph: QueryResourceGraph,
     allocation: QueryAllocation,
     *,
     reservation_ratio: float = 0.5,
@@ -33,7 +33,7 @@ def register_query_graph(
     query_id = graph.query_id
     with _LOCK:
         if query_id in _MANAGERS:
-            raise ValueError(f"query graph is already registered: {query_id}")
+            raise ValueError(f"query resource graph is already registered: {query_id}")
         _MANAGERS[query_id] = manager
     return manager
 
@@ -45,7 +45,7 @@ def get_query_resource_manager(query_id: str) -> QueryResourceManager:
     with _LOCK:
         manager = _MANAGERS.get(query_key)
     if manager is None:
-        raise KeyError(f"query graph is not registered: {query_key}")
+        raise KeyError(f"query resource graph is not registered: {query_key}")
     return manager
 
 
@@ -85,6 +85,6 @@ __all__ = [
     "clear_query_resource_managers",
     "get_query_resource_manager",
     "query_resource_manager_snapshot",
-    "register_query_graph",
+    "register_query_resource_graph",
     "release_query_resource_manager",
 ]

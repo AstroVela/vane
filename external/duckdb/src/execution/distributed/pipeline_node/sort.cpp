@@ -818,13 +818,13 @@ SubmittableTaskStream<WorkerTask> OrderByNode::produce_tasks(PlanExecutionContex
 			DebugOrderByOutputs("range-output", range_mat_res.outputs);
 			DebugOrderByHandles("range-handles", range_handles);
 			auto range_estimated_cardinality = EstimateRowsFromHandles(range_handles, staging_estimated_cardinality);
-			auto phase_res = fte_task_submitter->blocking_materialization_completed(self_shared->context().query_id(),
-			                                                                        self_shared->node_id());
-			if (phase_res.is_err()) {
+			auto barrier_result = fte_task_submitter->blocking_materialization_completed(
+			    self_shared->context().query_id(), self_shared->node_id());
+			if (barrier_result.is_err()) {
 				result_tx_ptr->close();
 				range_exchange->Close();
 				staging_exchange->Close();
-				return DuckDBResult<void>::err(phase_res.error());
+				return DuckDBResult<void>::err(barrier_result.error());
 			}
 
 			auto final_tasks =

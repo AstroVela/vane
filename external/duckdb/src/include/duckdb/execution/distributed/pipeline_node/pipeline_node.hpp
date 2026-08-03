@@ -84,7 +84,7 @@ public:
 		    {"query_id", query_id_}, {"node_id", std::to_string(node_id_)}, {"node_name", node_name_}};
 		if (!query_id_.empty()) {
 			result.emplace("resource_query_id", query_id_);
-			result.emplace("resource_stage_id", "stage:" + query_id_ + ":node:" + std::to_string(node_id_) + ":fte");
+			result.emplace("resource_unit_id", "resource:" + query_id_ + ":fragment:node:" + std::to_string(node_id_));
 		}
 		return result;
 	}

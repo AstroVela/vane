@@ -433,12 +433,12 @@ SubmittableTaskStream<WorkerTask> BroadcastJoinNode::produce_tasks(PlanExecution
 		exchange->AllRequiredSinksFinished();
 		auto broadcast_handles = exchange->GetSourceHandles();
 		auto source_nodes = CollectSourceNodes(broadcast_handles);
-		auto phase_res = fte_task_submitter->blocking_materialization_completed(self_shared->context().query_id(),
-		                                                                        self_shared->node_id());
-		if (phase_res.is_err()) {
+		auto barrier_result = fte_task_submitter->blocking_materialization_completed(self_shared->context().query_id(),
+		                                                                             self_shared->node_id());
+		if (barrier_result.is_err()) {
 			result_tx_ptr->close();
 			exchange->Close();
-			return DuckDBResult<void>::err(phase_res.error());
+			return DuckDBResult<void>::err(barrier_result.error());
 		}
 
 		while (true) {

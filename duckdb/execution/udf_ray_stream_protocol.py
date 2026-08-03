@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from typing import Any
 
 import pyarrow as pa
-from _duckdb import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE
+from _duckdb import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE  # type: ignore[import-not-found]
 
 from duckdb.execution._common import ensure_table, estimate_table_bytes
 
@@ -37,7 +37,7 @@ def validate_task_runtime_node(payload: dict[str, Any]) -> str:
 _RAW_METADATA_FIELDS = {
     "protocol_version",
     "query_id",
-    "producer_stage_id",
+    "producer_unit_id",
     "task_lease_id",
     "attempt_id",
     "block_id",
@@ -49,7 +49,7 @@ _ERROR_METADATA_FIELDS = {
     "protocol_version",
     "event_kind",
     "query_id",
-    "producer_stage_id",
+    "producer_unit_id",
     "task_lease_id",
     "attempt_id",
     "exception_type",
@@ -68,36 +68,38 @@ _PROVIDER_CAPABILITY_DETAIL_FIELDS = {
 
 def _stream_identity(payload: dict[str, Any]) -> tuple[str, str, str, str]:
     query_id = str(payload.get("query_id") or "").strip()
-    stage_id = str(payload.get("stage_id") or "").strip()
+    resource_unit_id = str(payload.get("resource_unit_id") or "").strip()
     task_lease_id = str(payload.get("task_lease_id") or "").strip()
     attempt_id = str(payload.get("attempt_id") or "").strip()
-    if not query_id or not stage_id or not task_lease_id or not attempt_id:
-        raise RuntimeError("Ray UDF stream output requires query_id, stage_id, task_lease_id, and attempt_id")
-    return query_id, stage_id, task_lease_id, attempt_id
+    if not query_id or not resource_unit_id or not task_lease_id or not attempt_id:
+        raise RuntimeError("Ray UDF stream output requires query_id, resource_unit_id, task_lease_id, and attempt_id")
+    return query_id, resource_unit_id, task_lease_id, attempt_id
 
 
 def task_payload_with_lease(payload: dict[str, Any], lease: dict[str, Any]) -> dict[str, Any]:
     """Bind a remote UDF invocation to its pre-admitted task lease."""
     merged = dict(payload)
     query_id = str(lease.get("query_id") or "").strip()
-    stage_id = str(lease.get("stage_id") or "").strip()
+    resource_unit_id = str(lease.get("resource_unit_id") or "").strip()
     lease_id = str(lease.get("lease_id") or "").strip()
     attempt_id = str(lease.get("attempt_id") or "").strip()
     node_id = str(lease.get("node_id") or "").strip()
     execution_slot_id = str(lease.get("execution_slot_id") or "").strip()
     output_window_bytes = int(lease.get("output_window_bytes") or 0)
-    if not query_id or not stage_id or not lease_id or not attempt_id or not node_id or not execution_slot_id:
-        raise ValueError("task lease is missing query, stage, lease, attempt, Ray node, or execution slot identity")
+    if not query_id or not resource_unit_id or not lease_id or not attempt_id or not node_id or not execution_slot_id:
+        raise ValueError(
+            "task lease is missing query, resource unit, lease, attempt, Ray node, or execution slot identity"
+        )
     if str(merged.get("query_id") or "").strip() != query_id:
         raise ValueError("UDF payload query_id does not match task lease")
-    if str(merged.get("stage_id") or "").strip() != stage_id:
-        raise ValueError("UDF payload stage_id does not match task lease")
+    if str(merged.get("resource_unit_id") or "").strip() != resource_unit_id:
+        raise ValueError("UDF payload resource_unit_id does not match task lease")
     backend = str(merged.get("execution_backend") or "").strip()
     raw_actor_index = lease.get("actor_index")
     if backend == "ray_actor":
         if isinstance(raw_actor_index, bool) or not isinstance(raw_actor_index, int) or raw_actor_index < 0:
             raise ValueError("Ray actor task lease is missing a valid actor_index")
-        expected_slot_id = f"ray_actor:{stage_id}:{raw_actor_index}"
+        expected_slot_id = f"ray_actor:{resource_unit_id}:{raw_actor_index}"
         if execution_slot_id != expected_slot_id:
             raise ValueError(
                 "Ray actor task lease execution slot does not match actor_index: "
@@ -106,7 +108,7 @@ def task_payload_with_lease(payload: dict[str, Any], lease: dict[str, Any]) -> d
     elif backend == "ray_task":
         if raw_actor_index is not None:
             raise ValueError("Ray task lease must not contain actor_index")
-        expected_slot_id = f"ray_task:{stage_id}:{lease_id}"
+        expected_slot_id = f"ray_task:{resource_unit_id}:{lease_id}"
         if execution_slot_id != expected_slot_id:
             raise ValueError(
                 "Ray task lease execution slot does not match lease_id: "
@@ -158,10 +160,10 @@ def iter_bounded_stream_blocks(
         yield block
         return
     if block.num_rows <= 1:
-        query_id, stage_id, task_lease_id, attempt_id = _stream_identity(payload)
+        query_id, resource_unit_id, task_lease_id, attempt_id = _stream_identity(payload)
         raise RuntimeError(
             "Ray UDF single output row exceeds the pre-publication block target: "
-            f"query={query_id} stage={stage_id} task_lease={task_lease_id} "
+            f"query={query_id} resource_unit={resource_unit_id} task_lease={task_lease_id} "
             f"attempt={attempt_id} size_bytes={size_bytes} target_bytes={target_bytes}"
         )
 
@@ -186,10 +188,10 @@ def iter_bounded_stream_blocks(
         if best_block is None:
             single_row = block.slice(offset, 1)
             single_row_bytes = max(1, int(estimate_table_bytes(single_row)))
-            query_id, stage_id, task_lease_id, attempt_id = _stream_identity(payload)
+            query_id, resource_unit_id, task_lease_id, attempt_id = _stream_identity(payload)
             raise RuntimeError(
                 "Ray UDF single output row exceeds the pre-publication block target: "
-                f"query={query_id} stage={stage_id} task_lease={task_lease_id} "
+                f"query={query_id} resource_unit={resource_unit_id} task_lease={task_lease_id} "
                 f"attempt={attempt_id} row={offset} size_bytes={single_row_bytes} "
                 f"target_bytes={target_bytes}"
             )
@@ -205,14 +207,14 @@ def make_stream_block_metadata(
 ) -> dict[str, Any]:
     """Build the bounded control object paired with one direct Ray block."""
     block = ensure_table(table)
-    query_id, stage_id, task_lease_id, attempt_id = _stream_identity(payload)
+    query_id, resource_unit_id, task_lease_id, attempt_id = _stream_identity(payload)
     index = int(output_index)
     if index < 0:
         raise ValueError("output_index must be >= 0")
     return {
         "protocol_version": RAY_UDF_STREAM_PROTOCOL_VERSION,
         "query_id": query_id,
-        "producer_stage_id": stage_id,
+        "producer_unit_id": resource_unit_id,
         "task_lease_id": task_lease_id,
         "attempt_id": attempt_id,
         "block_id": f"block:{task_lease_id}:{index}",
@@ -229,7 +231,7 @@ def make_stream_error_pair(
     exc: BaseException,
 ) -> tuple[pa.Table, dict[str, Any]]:
     """Encode an application failure as one bounded block/control pair."""
-    query_id, stage_id, task_lease_id, attempt_id = _stream_identity(payload)
+    query_id, resource_unit_id, task_lease_id, attempt_id = _stream_identity(payload)
     exception_type = type(exc).__name__[:256] or "Exception"
     exception_message = str(exc)
     if len(exception_message) > _MAX_ERROR_TEXT_CHARS:
@@ -250,7 +252,7 @@ def make_stream_error_pair(
         "protocol_version": RAY_UDF_STREAM_PROTOCOL_VERSION,
         "event_kind": "error",
         "query_id": query_id,
-        "producer_stage_id": stage_id,
+        "producer_unit_id": resource_unit_id,
         "task_lease_id": task_lease_id,
         "attempt_id": attempt_id,
         "exception_type": exception_type,
@@ -276,7 +278,7 @@ def validate_stream_block_metadata(metadata: Any) -> dict[str, Any]:
         raise ValueError(f"unsupported Ray UDF stream protocol version: {result['protocol_version']}")
     for name in (
         "query_id",
-        "producer_stage_id",
+        "producer_unit_id",
         "task_lease_id",
         "attempt_id",
         "block_id",
@@ -315,7 +317,7 @@ def validate_stream_error_metadata(metadata: Any) -> dict[str, Any]:
         raise ValueError("Ray UDF stream error metadata event_kind must be 'error'")
     for name in (
         "query_id",
-        "producer_stage_id",
+        "producer_unit_id",
         "task_lease_id",
         "attempt_id",
         "exception_type",

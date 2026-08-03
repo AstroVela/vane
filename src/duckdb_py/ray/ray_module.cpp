@@ -759,7 +759,8 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("repr_ascii", &PyPhysicalPlanWrapper::repr_ascii)
 	    .def("repr_mermaid", &PyPhysicalPlanWrapper::repr_mermaid)
 	    .def("scan_task_descriptor_map", &PyPhysicalPlanWrapper::scan_task_descriptor_map)
-	    .def("collect_execution_stages", &PyPhysicalPlanWrapper::collect_execution_stages, py::arg("conn") = py::none())
+	    .def("collect_query_resource_graph_metadata", &PyPhysicalPlanWrapper::collect_query_resource_graph_metadata,
+	         py::arg("conn") = py::none())
 	    .def("collect_udf_nodes", &PyPhysicalPlanWrapper::collect_udf_nodes, py::arg("conn") = py::none())
 	    .def("collect_vllm_nodes", &PyPhysicalPlanWrapper::collect_vllm_nodes, py::arg("conn") = py::none())
 	    .def("set_udf_actor_handles", &PyPhysicalPlanWrapper::set_udf_actor_handles, py::arg("handles_map"),

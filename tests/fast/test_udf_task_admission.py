@@ -108,7 +108,7 @@ def _payload():
     return {
         "execution_backend": "ray_task",
         "query_id": "q",
-        "stage_id": "stage:q:node:3:udf",
+        "resource_unit_id": "resource:q:udf:node:3",
         "cpus": 1.0,
         "gpus": 0.0,
         "memory_bytes": 256,
@@ -188,7 +188,7 @@ def _grant(request):
         "lease": {
             "lease_id": "lease-1",
             "query_id": request["query_id"],
-            "stage_id": request["stage_id"],
+            "resource_unit_id": request["resource_unit_id"],
             "task_id": request["task_id"],
             "attempt_id": request["attempt_id"],
             "node_id": "node-a",

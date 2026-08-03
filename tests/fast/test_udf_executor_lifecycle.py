@@ -2804,7 +2804,7 @@ def test_ray_task_ref_bundle_stream_flushes_compute_tail_after_finished_submitti
     )
     payload.update(
         query_id="query-tail",
-        stage_id="stage:query-tail:node:1:udf",
+        resource_unit_id="resource:query-tail:udf:node:1",
         task_lease_id="lease-tail",
         attempt_id="attempt-tail",
         node_id="node-a",
@@ -2849,7 +2849,7 @@ def test_ray_task_ref_bundle_map_batches_without_batch_size_passes_entire_block(
     )
     payload.update(
         query_id="query-whole-block",
-        stage_id="stage:query-whole-block:node:1:udf",
+        resource_unit_id="resource:query-whole-block:udf:node:1",
         task_lease_id="lease-whole-block",
         attempt_id="attempt-whole-block",
         node_id="node-a",
@@ -6712,7 +6712,7 @@ def _ray_task_executor(*, stream_result="stream-ref", ref_stream_result="ref-str
             "call_mode": "map_batches",
             "execution_backend": "ray_task",
             "query_id": "query-submit",
-            "stage_id": "stage:query-submit:node:1:udf",
+            "resource_unit_id": "resource:query-submit:udf:node:1",
             "produce_ray_block_stream": True,
             "udf_output_target_max_bytes": 128 * 1024**2,
             "udf_task_input_max_bytes": 128 * 1024**2,
@@ -6749,11 +6749,11 @@ def test_ray_task_submit_with_id_uses_generator_remote_with_pregranted_lease(mon
     table = pa.table({"x": [1, 2]})
     lease = {
         "query_id": "query-submit",
-        "stage_id": "stage:query-submit:node:1:udf",
+        "resource_unit_id": "resource:query-submit:udf:node:1",
         "lease_id": "lease-42",
         "attempt_id": "attempt-42",
         "node_id": "node-a",
-        "execution_slot_id": "ray_task:stage:query-submit:node:1:udf:lease-42",
+        "execution_slot_id": "ray_task:resource:query-submit:udf:node:1:lease-42",
         "output_window_bytes": 256 * 1024**2,
     }
     admission = types.SimpleNamespace(driver=object(), request_id="request-42", lease=lease)
@@ -6799,11 +6799,11 @@ def test_ray_task_submit_ref_bundle_with_id_uses_pregranted_lease(monkeypatch):
     executor, _, run_ref_stream = _ray_task_executor(ref_stream_result="ref-generator")
     lease = {
         "query_id": "query-submit",
-        "stage_id": "stage:query-submit:node:1:udf",
+        "resource_unit_id": "resource:query-submit:udf:node:1",
         "lease_id": "lease-7",
         "attempt_id": "attempt-7",
         "node_id": "node-a",
-        "execution_slot_id": "ray_task:stage:query-submit:node:1:udf:lease-7",
+        "execution_slot_id": "ray_task:resource:query-submit:udf:node:1:lease-7",
         "output_window_bytes": 256 * 1024**2,
     }
     admission = types.SimpleNamespace(driver=object(), request_id="request-7", lease=lease)

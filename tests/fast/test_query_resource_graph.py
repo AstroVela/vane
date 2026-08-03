@@ -3,13 +3,13 @@
 
 import pytest
 
-from duckdb.runners.ray.query_execution_graph import (
+from duckdb.runners.ray.query_resource_graph import (
     ActorPlacement,
     NodeResourceAllocation,
     QueryAllocation,
-    QueryExecutionGraph,
+    QueryResourceGraph,
+    ResourceUnitSpec,
     ResourceVector,
-    StageResourceSpec,
 )
 
 MIB = 1024 * 1024
@@ -39,8 +39,8 @@ def _allocation(resources: ResourceVector, *, generation: int) -> QueryAllocatio
     )
 
 
-def _stage(
-    stage_id: str,
+def _unit(
+    resource_unit_id: str,
     *,
     inputs: tuple[str, ...] = (),
     physical_node_id: str | None = None,
@@ -52,8 +52,9 @@ def _stage(
     max_concurrency: int | None = None,
     actor_pool_size: int = 0,
     actor_prefetch_depth: int = 1,
-    spill_mode: str = "streaming",
-) -> StageResourceSpec:
+    unit_kind: str | None = None,
+    is_barrier: bool = False,
+) -> ResourceUnitSpec:
     requested = per_task or _resources()
     if backend == "ray_actor":
         resident = resident_per_actor or ResourceVector(
@@ -65,13 +66,21 @@ def _stage(
     else:
         resident = ResourceVector()
         invocation = requested
-    return StageResourceSpec(
+    resolved_unit_kind = (
+        unit_kind
+        or {
+            "ray_worker": "native_fragment",
+            "ray_task": "ray_task_udf",
+            "ray_actor": "ray_actor_pool",
+        }[backend]
+    )
+    return ResourceUnitSpec(
         query_id="q1",
-        stage_id=stage_id,
-        physical_node_id=physical_node_id or stage_id.rsplit(":", 1)[-1],
-        stage_kind="udf" if "udf" in stage_id else "fte",
+        resource_unit_id=resource_unit_id,
+        physical_node_id=physical_node_id or resource_unit_id.rsplit(":", 1)[-1],
+        unit_kind=resolved_unit_kind,
         backend=backend,
-        input_stage_ids=inputs,
+        input_unit_ids=inputs,
         per_task=invocation,
         target_output_block_bytes=target_output_block_bytes,
         generator_buffer_blocks=generator_buffer_blocks,
@@ -79,16 +88,16 @@ def _stage(
         resident_per_actor=resident,
         actor_pool_size=actor_pool_size,
         actor_prefetch_depth=actor_prefetch_depth,
-        spill_mode=spill_mode,
+        is_barrier=is_barrier,
     )
 
 
-def _graph(*stages: StageResourceSpec, terminals: tuple[str, ...]) -> QueryExecutionGraph:
-    return QueryExecutionGraph(
+def _graph(*units: ResourceUnitSpec, terminals: tuple[str, ...]) -> QueryResourceGraph:
+    return QueryResourceGraph(
         query_id="q1",
         plan_digest="sha256:abc123",
-        stages=tuple(stages),
-        terminal_stage_ids=terminals,
+        units=tuple(units),
+        terminal_unit_ids=terminals,
     )
 
 
@@ -137,169 +146,204 @@ def test_resource_vector_fit_and_dominant_share_include_every_dimension():
     assert not _resources(cpu=5).fits_within(capacity)
 
 
-def test_graph_orders_stages_deterministically_and_preserves_one_stage_identity_for_all_attempts():
-    scan = _stage("stage:fragment-1:scan", backend="ray_worker", max_concurrency=36)
-    cpu_udf = _stage("stage:fragment-1:cpu-udf", inputs=(scan.stage_id,))
-    gpu_udf = _stage(
-        "stage:fragment-1:gpu-udf",
-        inputs=(cpu_udf.stage_id,),
+def test_graph_orders_units_deterministically_and_preserves_one_unit_identity_for_all_attempts():
+    scan = _unit("resource:fragment-1:scan", backend="ray_worker", max_concurrency=36)
+    cpu_udf = _unit("resource:fragment-1:cpu-udf", inputs=(scan.resource_unit_id,))
+    gpu_udf = _unit(
+        "resource:fragment-1:gpu-udf",
+        inputs=(cpu_udf.resource_unit_id,),
         backend="ray_actor",
         per_task=_resources(cpu=1, gpu=1, heap_bytes=1024 * MIB),
         max_concurrency=None,
         actor_pool_size=1,
     )
-    graph = _graph(gpu_udf, scan, cpu_udf, terminals=(gpu_udf.stage_id,))
+    graph = _graph(gpu_udf, scan, cpu_udf, terminals=(gpu_udf.resource_unit_id,))
 
-    assert graph.topological_stage_ids() == (scan.stage_id, cpu_udf.stage_id, gpu_udf.stage_id)
-    assert graph.reverse_topological_stage_ids() == (gpu_udf.stage_id, cpu_udf.stage_id, scan.stage_id)
-    assert graph.stage_id_for_physical_node("scan") == scan.stage_id
-    assert graph.task_identity(scan.stage_id, partition_id=0, attempt_id="a1") == (
-        "task:stage:fragment-1:scan:partition:0:attempt:a1"
+    assert graph.topological_unit_ids() == (scan.resource_unit_id, cpu_udf.resource_unit_id, gpu_udf.resource_unit_id)
+    assert graph.reverse_topological_unit_ids() == (
+        gpu_udf.resource_unit_id,
+        cpu_udf.resource_unit_id,
+        scan.resource_unit_id,
     )
-    assert graph.task_identity(scan.stage_id, partition_id=35, attempt_id="a2").startswith(
-        "task:stage:fragment-1:scan:"
+    assert graph.unit_id_for_physical_node("scan") == scan.resource_unit_id
+    assert graph.task_identity(scan.resource_unit_id, partition_id=0, attempt_id="a1") == (
+        "task:resource:fragment-1:scan:partition:0:attempt:a1"
+    )
+    assert graph.task_identity(scan.resource_unit_id, partition_id=35, attempt_id="a2").startswith(
+        "task:resource:fragment-1:scan:"
     )
 
 
-def test_graph_identifies_downstream_fte_slots_after_non_fte_boundaries():
-    first_fte = _stage(
-        "stage:fragment-1:first-fte",
+def test_graph_identifies_downstream_native_fragment_slots_after_remote_process_boundaries():
+    first_native_fragment = _unit(
+        "resource:fragment-1:first-native_fragment",
         backend="ray_worker",
         max_concurrency=36,
     )
-    direct_fte = _stage(
-        "stage:fragment-1:direct-fte",
-        inputs=(first_fte.stage_id,),
+    direct_native_fragment = _unit(
+        "resource:fragment-1:direct-native_fragment",
+        inputs=(first_native_fragment.resource_unit_id,),
         backend="ray_worker",
         max_concurrency=36,
     )
-    cpu_udf = _stage(
-        "stage:fragment-1:cpu-udf",
-        inputs=(direct_fte.stage_id,),
+    cpu_udf = _unit(
+        "resource:fragment-1:cpu-udf",
+        inputs=(direct_native_fragment.resource_unit_id,),
     )
-    post_task_fte = _stage(
-        "stage:fragment-2:post-task-fte",
-        inputs=(cpu_udf.stage_id,),
+    post_task_native_fragment = _unit(
+        "resource:fragment-2:post-task-native_fragment",
+        inputs=(cpu_udf.resource_unit_id,),
         backend="ray_worker",
         max_concurrency=36,
     )
-    gpu_udf = _stage(
-        "stage:fragment-2:gpu-udf",
-        inputs=(post_task_fte.stage_id,),
+    gpu_udf = _unit(
+        "resource:fragment-2:gpu-udf",
+        inputs=(post_task_native_fragment.resource_unit_id,),
         backend="ray_actor",
         per_task=_resources(gpu=1),
         actor_pool_size=1,
     )
-    post_actor_fte = _stage(
-        "stage:fragment-3:post-actor-fte",
-        inputs=(gpu_udf.stage_id,),
+    post_actor_native_fragment = _unit(
+        "resource:fragment-3:post-actor-native_fragment",
+        inputs=(gpu_udf.resource_unit_id,),
         backend="ray_worker",
         max_concurrency=36,
         target_output_block_bytes=0,
         generator_buffer_blocks=0,
     )
     graph = _graph(
-        post_actor_fte,
+        post_actor_native_fragment,
         cpu_udf,
-        first_fte,
+        first_native_fragment,
         gpu_udf,
-        direct_fte,
-        post_task_fte,
-        terminals=(post_actor_fte.stage_id,),
+        direct_native_fragment,
+        post_task_native_fragment,
+        terminals=(post_actor_native_fragment.resource_unit_id,),
     )
 
-    assert graph.downstream_fte_stage_ids_requiring_separate_slot(first_fte.stage_id) == (
-        post_task_fte.stage_id,
-        post_actor_fte.stage_id,
+    assert graph.downstream_native_fragment_unit_ids_requiring_separate_slot(
+        first_native_fragment.resource_unit_id
+    ) == (
+        post_task_native_fragment.resource_unit_id,
+        post_actor_native_fragment.resource_unit_id,
     )
-    assert graph.downstream_fte_stage_ids_requiring_separate_slot(direct_fte.stage_id) == (
-        post_task_fte.stage_id,
-        post_actor_fte.stage_id,
+    assert graph.downstream_native_fragment_unit_ids_requiring_separate_slot(
+        direct_native_fragment.resource_unit_id
+    ) == (
+        post_task_native_fragment.resource_unit_id,
+        post_actor_native_fragment.resource_unit_id,
     )
-    assert graph.downstream_fte_stage_ids_requiring_separate_slot(cpu_udf.stage_id) == (
-        post_task_fte.stage_id,
-        post_actor_fte.stage_id,
+    assert graph.downstream_native_fragment_unit_ids_requiring_separate_slot(cpu_udf.resource_unit_id) == (
+        post_task_native_fragment.resource_unit_id,
+        post_actor_native_fragment.resource_unit_id,
     )
-    assert graph.downstream_fte_stage_ids_requiring_separate_slot(post_task_fte.stage_id) == (post_actor_fte.stage_id,)
-    assert graph.downstream_fte_stage_ids_requiring_separate_slot(gpu_udf.stage_id) == (post_actor_fte.stage_id,)
-    assert graph.downstream_fte_stage_ids_requiring_separate_slot(post_actor_fte.stage_id) == ()
+    assert graph.downstream_native_fragment_unit_ids_requiring_separate_slot(
+        post_task_native_fragment.resource_unit_id
+    ) == (post_actor_native_fragment.resource_unit_id,)
+    assert graph.downstream_native_fragment_unit_ids_requiring_separate_slot(gpu_udf.resource_unit_id) == (
+        post_actor_native_fragment.resource_unit_id,
+    )
+    assert (
+        graph.downstream_native_fragment_unit_ids_requiring_separate_slot(post_actor_native_fragment.resource_unit_id)
+        == ()
+    )
 
 
 def test_graph_serialization_round_trip_is_strict_and_stable():
-    scan = _stage("stage:fragment-1:scan")
-    sink = _stage(
-        "stage:fragment-2:sink",
-        inputs=(scan.stage_id,),
+    scan = _unit("resource:fragment-1:scan")
+    sink = _unit(
+        "resource:fragment-2:sink",
+        inputs=(scan.resource_unit_id,),
         backend="ray_worker",
         target_output_block_bytes=0,
         generator_buffer_blocks=0,
     )
-    graph = _graph(scan, sink, terminals=(sink.stage_id,))
+    graph = _graph(scan, sink, terminals=(sink.resource_unit_id,))
 
     payload = graph.to_dict()
 
-    assert QueryExecutionGraph.from_dict(payload) == graph
-    assert list(payload) == ["query_id", "plan_digest", "stages", "terminal_stage_ids"]
+    assert QueryResourceGraph.from_dict(payload) == graph
+    assert list(payload) == ["query_id", "plan_digest", "units", "terminal_unit_ids"]
     with pytest.raises(ValueError, match="unknown fields"):
-        QueryExecutionGraph.from_dict({**payload, "legacy_operator_specs": []})
+        QueryResourceGraph.from_dict({**payload, "legacy_operator_specs": []})
 
 
-def test_graph_rejects_duplicate_stage_ids():
-    first = _stage("stage:fragment-1:scan", physical_node_id="scan-a")
-    duplicate = _stage("stage:fragment-1:scan", physical_node_id="scan-b")
+def test_graph_rejects_duplicate_unit_ids():
+    first = _unit("resource:fragment-1:scan", physical_node_id="scan-a")
+    duplicate = _unit("resource:fragment-1:scan", physical_node_id="scan-b")
 
-    with pytest.raises(ValueError, match="duplicate stage_id"):
-        _graph(first, duplicate, terminals=(first.stage_id,))
+    with pytest.raises(ValueError, match="duplicate resource_unit_id"):
+        _graph(first, duplicate, terminals=(first.resource_unit_id,))
 
 
 def test_graph_rejects_missing_dependencies():
-    sink = _stage("stage:fragment-1:sink", inputs=("stage:fragment-1:missing",))
+    sink = _unit("resource:fragment-1:sink", inputs=("resource:fragment-1:missing",))
 
-    with pytest.raises(ValueError, match="missing input stage"):
-        _graph(sink, terminals=(sink.stage_id,))
+    with pytest.raises(ValueError, match="missing input unit"):
+        _graph(sink, terminals=(sink.resource_unit_id,))
 
 
 def test_graph_rejects_cycles():
-    left = _stage("stage:fragment-1:left", inputs=("stage:fragment-1:right",))
-    right = _stage("stage:fragment-1:right", inputs=(left.stage_id,))
+    left = _unit("resource:fragment-1:left", inputs=("resource:fragment-1:right",))
+    right = _unit("resource:fragment-1:right", inputs=(left.resource_unit_id,))
 
     with pytest.raises(ValueError, match="cycle"):
-        _graph(left, right, terminals=(right.stage_id,))
+        _graph(left, right, terminals=(right.resource_unit_id,))
 
 
-def test_graph_rejects_non_terminal_branch_and_terminal_with_downstream_stage():
-    scan = _stage("stage:fragment-1:scan")
-    used = _stage("stage:fragment-1:used", inputs=(scan.stage_id,))
-    orphan = _stage("stage:fragment-1:orphan")
+def test_graph_rejects_non_terminal_branch_and_terminal_with_downstream_unit():
+    scan = _unit("resource:fragment-1:scan")
+    used = _unit("resource:fragment-1:used", inputs=(scan.resource_unit_id,))
+    orphan = _unit("resource:fragment-1:orphan")
 
     with pytest.raises(ValueError, match="does not reach a terminal"):
-        _graph(scan, used, orphan, terminals=(used.stage_id,))
+        _graph(scan, used, orphan, terminals=(used.resource_unit_id,))
 
-    with pytest.raises(ValueError, match="terminal stage.*has downstream"):
-        _graph(scan, used, terminals=(scan.stage_id,))
+    with pytest.raises(ValueError, match="terminal unit.*has downstream"):
+        _graph(scan, used, terminals=(scan.resource_unit_id,))
 
 
 @pytest.mark.parametrize("backend", ["ray_task", "ray_actor", "ray_worker"])
 def test_graph_rejects_zero_heap_for_every_ray_python_process(backend):
-    stage = _stage(
-        "stage:fragment-1:udf",
+    unit = _unit(
+        "resource:fragment-1:udf",
         backend=backend,
         per_task=_resources(heap_bytes=0),
         actor_pool_size=1 if backend == "ray_actor" else 0,
     )
 
     with pytest.raises(ValueError, match="non-zero heap_bytes"):
-        _graph(stage, terminals=(stage.stage_id,))
+        _graph(unit, terminals=(unit.resource_unit_id,))
 
 
-def test_graph_rejects_ray_stage_without_cpu_or_gpu_scheduling_resources():
-    stage = _stage(
-        "stage:fragment-1:udf",
+def test_graph_rejects_ray_unit_without_cpu_or_gpu_scheduling_resources():
+    unit = _unit(
+        "resource:fragment-1:udf",
         per_task=_resources(cpu=0, gpu=0),
     )
 
     with pytest.raises(ValueError, match="CPU or GPU"):
-        _graph(stage, terminals=(stage.stage_id,))
+        _graph(unit, terminals=(unit.resource_unit_id,))
+
+
+@pytest.mark.parametrize(
+    ("backend", "unit_kind"),
+    [
+        ("ray_worker", "ray_task_udf"),
+        ("ray_task", "native_fragment"),
+        ("ray_actor", "ray_task_udf"),
+    ],
+)
+def test_graph_rejects_resource_unit_kind_that_does_not_match_backend(backend, unit_kind):
+    unit = _unit(
+        "resource:fragment-1:mismatched-kind",
+        backend=backend,
+        actor_pool_size=1 if backend == "ray_actor" else 0,
+        unit_kind=unit_kind,
+    )
+
+    with pytest.raises(ValueError, match="does not match backend"):
+        _graph(unit, terminals=(unit.resource_unit_id,))
 
 
 @pytest.mark.parametrize(
@@ -316,66 +360,66 @@ def test_graph_rejects_invalid_actor_pool(changes, message):
         "actor_pool_size": 1,
         **changes,
     }
-    stage = _stage("stage:fragment-1:gpu-udf", **params)
+    unit = _unit("resource:fragment-1:gpu-udf", **params)
 
     with pytest.raises(ValueError, match=message):
-        _graph(stage, terminals=(stage.stage_id,))
+        _graph(unit, terminals=(unit.resource_unit_id,))
 
 
-def test_graph_rejects_actor_pool_on_non_actor_stage():
-    stage = _stage(
-        "stage:fragment-1:udf",
+def test_graph_rejects_actor_pool_on_non_actor_unit():
+    unit = _unit(
+        "resource:fragment-1:udf",
         backend="ray_task",
         actor_pool_size=1,
     )
 
     with pytest.raises(ValueError, match="only valid for ray_actor"):
-        _graph(stage, terminals=(stage.stage_id,))
+        _graph(unit, terminals=(unit.resource_unit_id,))
 
 
 def test_graph_rejects_invalid_actor_prefetch_depth():
-    actor = _stage(
-        "stage:fragment-1:gpu-udf",
+    actor = _unit(
+        "resource:fragment-1:gpu-udf",
         backend="ray_actor",
         actor_pool_size=1,
         actor_prefetch_depth=0,
     )
     with pytest.raises(ValueError, match="actor_prefetch_depth"):
-        _graph(actor, terminals=(actor.stage_id,))
+        _graph(actor, terminals=(actor.resource_unit_id,))
 
-    task = _stage(
-        "stage:fragment-1:cpu-udf",
+    task = _unit(
+        "resource:fragment-1:cpu-udf",
         backend="ray_task",
         actor_prefetch_depth=2,
     )
     with pytest.raises(ValueError, match="only configurable for ray_actor"):
-        _graph(task, terminals=(task.stage_id,))
+        _graph(task, terminals=(task.resource_unit_id,))
 
 
-@pytest.mark.parametrize("spill_mode", ["disk", "unbounded", "legacy"])
-def test_graph_rejects_unknown_spill_mode(spill_mode):
-    stage = _stage("stage:fragment-1:scan", spill_mode=spill_mode)
+@pytest.mark.parametrize("is_barrier", [0, 1, "barrier", None])
+def test_graph_rejects_non_boolean_barrier_flag(is_barrier):
+    unit = _unit("resource:fragment-1:scan", is_barrier=is_barrier)
 
-    with pytest.raises(ValueError, match="spill_mode"):
-        _graph(stage, terminals=(stage.stage_id,))
+    with pytest.raises(ValueError, match="is_barrier must be a boolean"):
+        _graph(unit, terminals=(unit.resource_unit_id,))
 
 
 def test_graph_rejects_inconsistent_output_window_shape():
-    no_target = _stage(
-        "stage:fragment-1:no-target",
+    no_target = _unit(
+        "resource:fragment-1:no-target",
         target_output_block_bytes=0,
         generator_buffer_blocks=2,
     )
-    no_window = _stage(
-        "stage:fragment-1:no-window",
+    no_window = _unit(
+        "resource:fragment-1:no-window",
         target_output_block_bytes=16 * MIB,
         generator_buffer_blocks=0,
     )
 
     with pytest.raises(ValueError, match="both be zero"):
-        _graph(no_target, terminals=(no_target.stage_id,))
+        _graph(no_target, terminals=(no_target.resource_unit_id,))
     with pytest.raises(ValueError, match="both be positive"):
-        _graph(no_window, terminals=(no_window.stage_id,))
+        _graph(no_window, terminals=(no_window.resource_unit_id,))
 
 
 def test_legacy_intermediate_resource_dimension_is_rejected():
@@ -387,13 +431,13 @@ def test_legacy_intermediate_resource_dimension_is_rejected():
 
 
 def test_allocation_validation_keeps_heap_hard_and_object_windows_soft():
-    stage = _stage(
-        "stage:fragment-1:decode",
+    unit = _unit(
+        "resource:fragment-1:decode",
         per_task=_resources(cpu=1, heap_bytes=300, object_store_bytes=50),
         target_output_block_bytes=100,
         generator_buffer_blocks=2,
     )
-    graph = _graph(stage, terminals=(stage.stage_id,))
+    graph = _graph(unit, terminals=(unit.resource_unit_id,))
     allocation = _allocation(
         _resources(
             cpu=4,
@@ -419,12 +463,12 @@ def test_allocation_validation_keeps_heap_hard_and_object_windows_soft():
 
 
 def test_allocation_accepts_one_output_window_larger_than_soft_object_store_budget():
-    stage = _stage(
-        "stage:fragment-1:decode",
+    unit = _unit(
+        "resource:fragment-1:decode",
         target_output_block_bytes=101,
         generator_buffer_blocks=2,
     )
-    graph = _graph(stage, terminals=(stage.stage_id,))
+    graph = _graph(unit, terminals=(unit.resource_unit_id,))
     allocation = _allocation(
         _resources(cpu=4, heap_bytes=1024 * MIB, object_store_bytes=201),
         generation=1,
@@ -434,13 +478,13 @@ def test_allocation_accepts_one_output_window_larger_than_soft_object_store_budg
 
 
 def test_allocation_rejects_aggregate_resources_that_do_not_form_a_runnable_node():
-    stage = _stage(
-        "stage:fragment-1:decode",
+    unit = _unit(
+        "resource:fragment-1:decode",
         per_task=_resources(cpu=2, heap_bytes=300, object_store_bytes=0),
         target_output_block_bytes=100,
         generator_buffer_blocks=2,
     )
-    graph = _graph(stage, terminals=(stage.stage_id,))
+    graph = _graph(unit, terminals=(unit.resource_unit_id,))
     allocation = QueryAllocation(
         resources=_resources(cpu=2, heap_bytes=300, object_store_bytes=200),
         node_allocations=(
@@ -462,13 +506,13 @@ def test_allocation_rejects_aggregate_resources_that_do_not_form_a_runnable_node
 
 
 def test_runtime_allocation_validation_accepts_pending_zero_capacity():
-    stage = _stage(
-        "stage:fragment-1:decode",
+    unit = _unit(
+        "resource:fragment-1:decode",
         per_task=_resources(cpu=1, heap_bytes=300),
         target_output_block_bytes=100,
         generator_buffer_blocks=2,
     )
-    graph = _graph(stage, terminals=(stage.stage_id,))
+    graph = _graph(unit, terminals=(unit.resource_unit_id,))
     pending = QueryAllocation(
         resources=ResourceVector(),
         node_allocations=(),
@@ -483,8 +527,8 @@ def test_runtime_allocation_validation_accepts_pending_zero_capacity():
 
 
 def test_allocation_rejects_cumulative_actor_placements_on_one_node():
-    actor = _stage(
-        "stage:fragment-1:gpu",
+    actor = _unit(
+        "resource:fragment-1:gpu",
         backend="ray_actor",
         per_task=_resources(object_store_bytes=10),
         resident_per_actor=_resources(cpu=1, gpu=1, heap_bytes=100),
@@ -493,7 +537,7 @@ def test_allocation_rejects_cumulative_actor_placements_on_one_node():
         max_concurrency=None,
         actor_pool_size=2,
     )
-    graph = _graph(actor, terminals=(actor.stage_id,))
+    graph = _graph(actor, terminals=(actor.resource_unit_id,))
     per_node = _resources(cpu=1, gpu=1, heap_bytes=100, object_store_bytes=30)
     allocation = QueryAllocation(
         resources=per_node.scale(2),
@@ -502,8 +546,8 @@ def test_allocation_rejects_cumulative_actor_placements_on_one_node():
             NodeResourceAllocation(node_id="node-b", resources=per_node),
         ),
         actor_placements=(
-            ActorPlacement(stage_id=actor.stage_id, actor_index=0, node_id="node-a"),
-            ActorPlacement(stage_id=actor.stage_id, actor_index=1, node_id="node-a"),
+            ActorPlacement(resource_unit_id=actor.resource_unit_id, actor_index=0, node_id="node-a"),
+            ActorPlacement(resource_unit_id=actor.resource_unit_id, actor_index=1, node_id="node-a"),
         ),
         generation=1,
     )

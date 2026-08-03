@@ -13,7 +13,7 @@ def _payload(**overrides):
     value = {
         "execution_backend": "ray_actor",
         "query_id": "q1",
-        "stage_id": "stage:q1:node:1:udf",
+        "resource_unit_id": "resource:q1:udf:node:1",
         "produce_ray_block_stream": True,
         "actor_pool_size": 1,
         "cpus": 1.0,
@@ -76,11 +76,11 @@ def _run_after_lease(executor, monkeypatch, *, actor_index=0):
 
     lease = {
         "query_id": executor._payload["query_id"],
-        "stage_id": executor._payload["stage_id"],
+        "resource_unit_id": executor._payload["resource_unit_id"],
         "lease_id": f"lease-{actor_index}",
         "attempt_id": f"attempt-{actor_index}",
         "node_id": "node-a",
-        "execution_slot_id": f"ray_actor:{executor._payload['stage_id']}:{actor_index}",
+        "execution_slot_id": f"ray_actor:{executor._payload['resource_unit_id']}:{actor_index}",
         "actor_index": actor_index,
         "output_window_bytes": executor._payload["output_window_bytes"],
     }

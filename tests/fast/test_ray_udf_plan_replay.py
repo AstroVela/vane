@@ -311,7 +311,7 @@ def _assert_no_udf_direct_output_conversion():
     return counters
 
 
-def test_execute_native_rejects_ray_scalar_without_registered_query_graph(tmp_path, monkeypatch):
+def test_execute_native_rejects_ray_scalar_without_registered_query_resource_graph(tmp_path, monkeypatch):
     pytest.importorskip("pyarrow")
     pytest.importorskip("ray")
 
@@ -463,7 +463,7 @@ def test_ray_runner_replays_map_batches_udf_via_task_plan_pickle(tmp_path, monke
     con.close()
 
 
-def test_map_batches_ray_task_rejects_direct_execution_without_query_graph(tmp_path, monkeypatch):
+def test_map_batches_ray_task_rejects_direct_execution_without_query_resource_graph(tmp_path, monkeypatch):
     pytest.importorskip("pyarrow")
     pytest.importorskip("ray")
     import pyarrow as pa

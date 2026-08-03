@@ -481,7 +481,7 @@ def _run_subprocess_lazy_byte_submit_probe(tmp_path):
 
 
 def test_map_batches_requires_strict_streaming_contract():
-    """Ray stages always use the graph-owned direct block stream."""
+    """Ray resource units always use the graph-owned direct block stream."""
     import duckdb
 
     def identity(table):

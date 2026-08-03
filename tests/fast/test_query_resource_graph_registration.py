@@ -7,7 +7,7 @@ import uuid
 import pytest
 
 import duckdb
-from duckdb.runners.ray.query_graph_builder import build_query_execution_graph
+from duckdb.runners.ray.query_resource_graph_builder import build_query_resource_graph, udf_unit_id_for_node
 
 
 def _physical_plan(relation, con, prefix):
@@ -23,14 +23,14 @@ def _parquet_relation(con, tmp_path):
     return con.read_parquet(str(path))
 
 
-def test_physical_plan_exports_complete_deterministic_execution_stage_metadata(tmp_path):
+def test_physical_plan_exports_complete_deterministic_resource_unit_metadata(tmp_path):
     con = duckdb.connect()
     try:
         plan = _physical_plan(_parquet_relation(con, tmp_path), con, "graph-plain")
 
-        first = plan.collect_execution_stages(conn=con)
-        second = plan.collect_execution_stages(conn=con)
-        graph = build_query_execution_graph(first, env={})
+        first = plan.collect_query_resource_graph_metadata(conn=con)
+        second = plan.collect_query_resource_graph_metadata(conn=con)
+        graph = build_query_resource_graph(first, env={})
 
         assert first == second
         assert first["query_id"] == plan.idx()
@@ -44,19 +44,19 @@ def test_physical_plan_exports_complete_deterministic_execution_stage_metadata(t
         con.close()
 
 
-def test_stage_collection_marks_blocking_distributed_materializers(tmp_path):
+def test_resource_unit_collection_marks_blocking_distributed_materializers(tmp_path):
     con = duckdb.connect()
     try:
         relation = _parquet_relation(con, tmp_path).repartition(2).order("x")
         plan = _physical_plan(relation, con, "graph-materializing")
 
-        metadata = plan.collect_execution_stages(conn=con)
+        metadata = plan.collect_query_resource_graph_metadata(conn=con)
         materializing_names = {node["node_name"] for node in metadata["nodes"] if node["is_blocking_materializing"]}
-        graph = build_query_execution_graph(metadata, env={})
+        graph = build_query_resource_graph(metadata, env={})
 
         assert {"Repartition", "OrderBy"} <= materializing_names
-        assert {stage.physical_node_id for stage in graph.stages if stage.spill_mode == "barrier"} == {
-            f"node:{node['node_id']}:fte" for node in metadata["nodes"] if node["is_blocking_materializing"]
+        assert {unit.physical_node_id for unit in graph.units if unit.is_barrier} == {
+            f"node:{node['node_id']}:native-fragment" for node in metadata["nodes"] if node["is_blocking_materializing"]
         }
     finally:
         con.close()
@@ -69,7 +69,7 @@ def test_stage_collection_marks_blocking_distributed_materializers(tmp_path):
         ("reservoir(50 PERCENT)", False),
     ],
 )
-def test_stage_collection_classifies_reservoir_sample_materialization(
+def test_resource_unit_collection_classifies_reservoir_sample_materialization(
     tmp_path,
     sample_clause,
     expected_blocking,
@@ -81,20 +81,20 @@ def test_stage_collection_classifies_reservoir_sample_materialization(
         relation = con.sql(f"SELECT x FROM read_parquet('{path}') USING SAMPLE {sample_clause}")
         plan = _physical_plan(relation, con, "graph-reservoir-sample")
 
-        metadata = plan.collect_execution_stages(conn=con)
+        metadata = plan.collect_query_resource_graph_metadata(conn=con)
         (sample_node,) = (node for node in metadata["nodes"] if node["node_name"] == "ReservoirSample")
-        graph = build_query_execution_graph(metadata, env={})
-        sample_stage = next(
-            stage for stage in graph.stages if stage.physical_node_id == f"node:{sample_node['node_id']}:fte"
+        graph = build_query_resource_graph(metadata, env={})
+        sample_unit = next(
+            unit for unit in graph.units if unit.physical_node_id == f"node:{sample_node['node_id']}:native-fragment"
         )
 
         assert sample_node["is_blocking_materializing"] is expected_blocking
-        assert sample_stage.spill_mode == ("barrier" if expected_blocking else "streaming")
+        assert sample_unit.is_barrier is expected_blocking
     finally:
         con.close()
 
 
-def test_stage_collection_does_not_treat_generic_inout_as_python_udf(tmp_path):
+def test_resource_unit_collection_does_not_treat_generic_inout_as_python_udf(tmp_path):
     con = duckdb.connect()
     try:
         path = tmp_path / "generic_inout.parquet"
@@ -103,8 +103,8 @@ def test_stage_collection_does_not_treat_generic_inout_as_python_udf(tmp_path):
         relation = con.sql(f"SELECT * FROM unnest((SELECT [x, x + 1] FROM read_parquet('{path}')))")
         plan = _physical_plan(relation, con, "graph-generic-inout")
 
-        metadata = plan.collect_execution_stages(conn=con)
-        graph = build_query_execution_graph(metadata, env={})
+        metadata = plan.collect_query_resource_graph_metadata(conn=con)
+        graph = build_query_resource_graph(metadata, env={})
 
         assert graph.query_id == plan.idx()
         assert all(node["udf_payload"] is None for node in metadata["nodes"])
@@ -112,7 +112,7 @@ def test_stage_collection_does_not_treat_generic_inout_as_python_udf(tmp_path):
         con.close()
 
 
-def test_stage_collection_preannotates_ray_udf_payload_on_original_plan(tmp_path):
+def test_resource_unit_collection_preannotates_ray_udf_payload_on_original_plan(tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
@@ -131,7 +131,7 @@ def test_stage_collection_preannotates_ray_udf_payload_on_original_plan(tmp_path
         )
         plan = _physical_plan(relation, con, "graph-udf")
 
-        metadata = plan.collect_execution_stages(conn=con)
+        metadata = plan.collect_query_resource_graph_metadata(conn=con)
         udf_nodes = [node for node in metadata["nodes"] if node["udf_payload"] is not None]
         replay_nodes = plan.collect_udf_nodes(conn=con)
 
@@ -140,16 +140,16 @@ def test_stage_collection_preannotates_ray_udf_payload_on_original_plan(tmp_path
         payload = udf_nodes[0]["udf_payload"]
         replay_payload = replay_nodes[0]["payload"]
         assert payload["query_id"] == plan.idx()
-        assert payload["stage_id"].endswith(f":node:{udf_nodes[0]['node_id']}:udf")
+        assert payload["resource_unit_id"] == udf_unit_id_for_node(plan.idx(), udf_nodes[0]["node_id"])
         assert replay_payload["query_id"] == payload["query_id"]
-        assert replay_payload["stage_id"] == payload["stage_id"]
-        graph = build_query_execution_graph(metadata, env={})
-        assert graph.stage_by_id(payload["stage_id"]).backend == "ray_actor"
+        assert replay_payload["resource_unit_id"] == payload["resource_unit_id"]
+        graph = build_query_resource_graph(metadata, env={})
+        assert graph.unit_by_id(payload["resource_unit_id"]).backend == "ray_actor"
     finally:
         con.close()
 
 
-def test_stage_collection_preserves_distinct_stage_identity_for_nested_udfs(tmp_path):
+def test_resource_unit_collection_preserves_distinct_identity_for_nested_udfs(tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
@@ -179,27 +179,30 @@ def test_stage_collection_preserves_distinct_stage_identity_for_nested_udfs(tmp_
         )
         plan = _physical_plan(relation, con, "graph-nested-udf")
 
-        metadata = plan.collect_execution_stages(conn=con)
+        metadata = plan.collect_query_resource_graph_metadata(conn=con)
         udf_nodes = [node for node in metadata["nodes"] if node["udf_payload"] is not None]
         replay_nodes = plan.collect_udf_nodes(conn=con)
 
         assert len(udf_nodes) == 2
         assert len(replay_nodes) == 2
-        metadata_by_stage = {node["udf_payload"]["stage_id"]: node for node in udf_nodes}
-        replay_by_stage = {node["payload"]["stage_id"]: node for node in replay_nodes}
-        assert metadata_by_stage.keys() == replay_by_stage.keys()
+        metadata_by_unit = {node["udf_payload"]["resource_unit_id"]: node for node in udf_nodes}
+        replay_by_unit = {node["payload"]["resource_unit_id"]: node for node in replay_nodes}
+        assert metadata_by_unit.keys() == replay_by_unit.keys()
         assert {node["udf_payload"]["execution_backend"] for node in udf_nodes} == {
             "ray_task",
             "ray_actor",
         }
-        for stage_id, node in metadata_by_stage.items():
-            assert stage_id.endswith(f":node:{node['node_id']}:udf")
-            assert replay_by_stage[stage_id]["payload"]["execution_backend"] == node["udf_payload"]["execution_backend"]
+        for resource_unit_id, node in metadata_by_unit.items():
+            assert resource_unit_id == udf_unit_id_for_node(plan.idx(), node["node_id"])
+            assert (
+                replay_by_unit[resource_unit_id]["payload"]["execution_backend"]
+                == node["udf_payload"]["execution_backend"]
+            )
     finally:
         con.close()
 
 
-def test_stage_collection_pairs_reordered_branch_udfs_by_stable_identity(monkeypatch, tmp_path):
+def test_resource_unit_collection_pairs_reordered_branch_udfs_by_stable_identity(monkeypatch, tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
@@ -247,8 +250,8 @@ def test_stage_collection_pairs_reordered_branch_udfs_by_stable_identity(monkeyp
         relation = left.join(right, "l.id = r.id").project("l.id, l.left_value, r.right_value")
         plan = _physical_plan(relation, con, "graph-branch-udfs")
 
-        metadata = plan.collect_execution_stages(conn=con)
-        assert metadata == plan.collect_execution_stages(conn=con)
+        metadata = plan.collect_query_resource_graph_metadata(conn=con)
+        assert metadata == plan.collect_query_resource_graph_metadata(conn=con)
         assert "Broadcast side: right" in plan.repr_ascii(False)
 
         udf_nodes = [node for node in metadata["nodes"] if node["udf_payload"] is not None]
@@ -264,23 +267,25 @@ def test_stage_collection_pairs_reordered_branch_udfs_by_stable_identity(monkeyp
         assert right_node["udf_payload"]["cpus"] == 3.0
         assert left_node["udf_payload"]["memory_bytes"] == 1 << 30
         assert right_node["udf_payload"]["memory_bytes"] == 3 << 30
-        assert left_node["udf_payload"]["stage_id"].endswith(f":node:{left_node['node_id']}:udf")
-        assert right_node["udf_payload"]["stage_id"].endswith(f":node:{right_node['node_id']}:udf")
+        assert left_node["udf_payload"]["resource_unit_id"] == udf_unit_id_for_node(plan.idx(), left_node["node_id"])
+        assert right_node["udf_payload"]["resource_unit_id"] == udf_unit_id_for_node(plan.idx(), right_node["node_id"])
         assert left_node["udf_payload"]["_vane_udf_operator_id"] != right_node["udf_payload"]["_vane_udf_operator_id"]
 
         replay_by_name = {
             node["payload"]["udf_name"].rsplit(".", 1)[-1]: node for node in plan.collect_udf_nodes(conn=con)
         }
-        assert replay_by_name["left_udf"]["payload"]["stage_id"] == left_node["udf_payload"]["stage_id"]
-        assert replay_by_name["right_udf"]["payload"]["stage_id"] == right_node["udf_payload"]["stage_id"]
+        assert replay_by_name["left_udf"]["payload"]["resource_unit_id"] == left_node["udf_payload"]["resource_unit_id"]
+        assert (
+            replay_by_name["right_udf"]["payload"]["resource_unit_id"] == right_node["udf_payload"]["resource_unit_id"]
+        )
 
-        graph = build_query_execution_graph(metadata, env={})
-        left_stage = graph.stage_by_id(left_node["udf_payload"]["stage_id"])
-        right_stage = graph.stage_by_id(right_node["udf_payload"]["stage_id"])
-        assert left_stage.per_task.cpu == 1.0
-        assert right_stage.per_task.cpu == 3.0
-        assert left_stage.per_task.heap_bytes == 1 << 30
-        assert right_stage.per_task.heap_bytes == 3 << 30
+        graph = build_query_resource_graph(metadata, env={})
+        left_unit = graph.unit_by_id(left_node["udf_payload"]["resource_unit_id"])
+        right_unit = graph.unit_by_id(right_node["udf_payload"]["resource_unit_id"])
+        assert left_unit.per_task.cpu == 1.0
+        assert right_unit.per_task.cpu == 3.0
+        assert left_unit.per_task.heap_bytes == 1 << 30
+        assert right_unit.per_task.heap_bytes == 3 << 30
 
         operator_ids = [
             left_node["udf_payload"]["_vane_udf_operator_id"],
@@ -292,6 +297,6 @@ def test_stage_collection_pairs_reordered_branch_udfs_by_stable_identity(monkeyp
             serialized_plan.replace(operator_ids[1].encode(), operator_ids[0].encode())
         ).clone(con)
         with pytest.raises(duckdb.InvalidInputException, match="duplicate physical UDF operator identity"):
-            corrupted_plan.collect_execution_stages(conn=con)
+            corrupted_plan.collect_query_resource_graph_metadata(conn=con)
     finally:
         con.close()

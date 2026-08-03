@@ -57,16 +57,16 @@ from duckdb.runners.ray.fte import (
 )
 from duckdb.runners.ray.fte_attempts import RunningAttempt
 from duckdb.runners.ray.fte_events import FteAddSplitsCommand
-from duckdb.runners.ray.query_execution_graph import (
+from duckdb.runners.ray.query_resource_graph import (
     NodeResourceAllocation,
     QueryAllocation,
-    QueryExecutionGraph,
+    QueryResourceGraph,
+    ResourceUnitSpec,
     ResourceVector,
-    StageResourceSpec,
 )
 from duckdb.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
-    register_query_graph,
+    register_query_resource_graph,
 )
 
 
@@ -108,7 +108,7 @@ def test_fte_partition_admission_uses_non_persistent_descriptor_arbitration(monk
         "_fte_fragment_resource_identity",
         lambda query_id, _fragment_id: (
             query_id,
-            f"stage:{query_id}:node:scan:fte",
+            f"resource:{query_id}:fragment:node:scan",
         ),
     )
     monkeypatch.setattr(
@@ -236,32 +236,32 @@ async def _wait_for_terminal_task_status(manager, task_id, initial_status):
 
 
 def _register_fte_query(query_id: str, node_id: str, *, partitions: int, task_slots: int):
-    stage_id = f"stage:{query_id}:node:{node_id}:fte"
-    graph = QueryExecutionGraph(
+    resource_unit_id = f"resource:{query_id}:fragment:node:{node_id}"
+    graph = QueryResourceGraph(
         query_id=query_id,
         plan_digest=f"sha256:{query_id}",
-        stages=(
-            StageResourceSpec(
+        units=(
+            ResourceUnitSpec(
                 query_id=query_id,
-                stage_id=stage_id,
-                physical_node_id=f"node:{node_id}:fte",
-                stage_kind="fte",
+                resource_unit_id=resource_unit_id,
+                physical_node_id=f"node:{node_id}:native-fragment",
+                unit_kind="native_fragment",
                 backend="ray_worker",
-                input_stage_ids=(),
+                input_unit_ids=(),
                 per_task=ResourceVector(cpu=1, heap_bytes=2 * _GIB),
                 target_output_block_bytes=128 * _MIB,
                 generator_buffer_blocks=2,
                 max_concurrency=partitions,
             ),
         ),
-        terminal_stage_ids=(stage_id,),
+        terminal_unit_ids=(resource_unit_id,),
     )
     allocation_resources = ResourceVector(
         cpu=task_slots,
         heap_bytes=task_slots * 2 * _GIB,
         object_store_bytes=task_slots * 256 * _MIB,
     )
-    manager = register_query_graph(
+    manager = register_query_resource_graph(
         graph,
         QueryAllocation(
             resources=allocation_resources,
@@ -275,15 +275,15 @@ def _register_fte_query(query_id: str, node_id: str, *, partitions: int, task_sl
             generation=1,
         ),
     )
-    manager.update_stage_state(stage_id, runnable=True)
-    return manager, stage_id
+    manager.update_unit_state(resource_unit_id, runnable=True)
+    return manager, resource_unit_id
 
 
 def _install_fte_fragment(query_id: str, node_id: str, *, partitions: int, context=None):
     fragment_id = f"{query_id}:node:{node_id}"
     stage_context = {
         "resource_query_id": query_id,
-        "resource_stage_id": f"stage:{query_id}:node:{node_id}:fte",
+        "resource_unit_id": f"resource:{query_id}:fragment:node:{node_id}",
         **dict(context or {}),
     }
     stage = _fte_fragment_execution(
@@ -324,10 +324,10 @@ def test_fte_failure_retryability_parses_boolean_strings():
     assert _failure_allows_retry({"retryable": "false"}) is False
 
 
-def test_fte_stage_uses_one_global_lease_domain_for_all_36_partitions():
-    query_id = "q-fte-stage-leases"
+def test_fte_fragment_execution_uses_one_global_lease_domain_for_all_36_partitions():
+    query_id = "q-fte-fragment-execution-leases"
     clear_query_resource_managers()
-    manager, stage_id = _register_fte_query(query_id, "scan", partitions=36, task_slots=14)
+    manager, resource_unit_id = _register_fte_query(query_id, "scan", partitions=36, task_slots=14)
     _, fragment_id = _install_fte_fragment(query_id, "scan", partitions=36)
     worker = _PlacementWorker()
     placement = fte_fragment_scheduler.FteWorkerPlacementManager(_PlacementCoordinator(worker))
@@ -347,9 +347,9 @@ def test_fte_stage_uses_one_global_lease_domain_for_all_36_partitions():
 
         snapshot = manager.snapshot()
         assert len(reservations) == 14
-        assert {reservation.stage_id for reservation in reservations} == {stage_id}
+        assert {reservation.resource_unit_id for reservation in reservations} == {resource_unit_id}
         assert len({reservation.task_lease_id for reservation in reservations}) == 14
-        assert snapshot["stages"][stage_id]["active_task_count"] == 14
+        assert snapshot["units"][resource_unit_id]["active_task_count"] == 14
         assert snapshot["liveness"]["task_grants_total"] == 0
         assert len(snapshot["task_leases"]) == 14
     finally:
@@ -359,7 +359,7 @@ def test_fte_stage_uses_one_global_lease_domain_for_all_36_partitions():
 def test_fte_task_lease_uses_attempt_identity_and_releases_once_at_terminal():
     query_id = "q-fte-attempt-lease"
     clear_query_resource_managers()
-    manager, stage_id = _register_fte_query(query_id, "scan", partitions=1, task_slots=1)
+    manager, resource_unit_id = _register_fte_query(query_id, "scan", partitions=1, task_slots=1)
     stage, fragment_id = _install_fte_fragment(query_id, "scan", partitions=1)
     worker = _PlacementWorker()
     placement = fte_fragment_scheduler.FteWorkerPlacementManager(_PlacementCoordinator(worker))
@@ -367,7 +367,7 @@ def test_fte_task_lease_uses_attempt_identity_and_releases_once_at_terminal():
         reservation = placement.acquire(query_id=query_id, fragment_id=fragment_id, partition_id=0)
         expected_attempt = FteTaskAttemptId(stage.partitions[0].task_id, 0)
 
-        assert reservation.stage_id == stage_id
+        assert reservation.resource_unit_id == resource_unit_id
         assert reservation.attempt_id == str(expected_attempt)
         lease = manager.snapshot()["task_leases"][reservation.task_lease_id]
         assert lease["task_id"] == str(stage.partitions[0].task_id)
@@ -387,7 +387,7 @@ def test_internal_fte_query_uses_outer_query_resource_identity():
     execution_query_id = f"{resource_query_id}_orderby_stage"
     fragment_id = f"{execution_query_id}:orderby:2:stage:0"
     clear_query_resource_managers()
-    manager, stage_id = _register_fte_query(
+    manager, resource_unit_id = _register_fte_query(
         resource_query_id,
         "scan",
         partitions=1,
@@ -399,7 +399,7 @@ def test_internal_fte_query_uses_outer_query_resource_identity():
         fragment_id=fragment_id,
         context={
             "resource_query_id": resource_query_id,
-            "resource_stage_id": stage_id,
+            "resource_unit_id": resource_unit_id,
         },
     )
     stage.add_partition(0)
@@ -421,7 +421,7 @@ def test_internal_fte_query_uses_outer_query_resource_identity():
             reservation.attempt_id,
         )
 
-        assert reservation.stage_id == stage_id
+        assert reservation.resource_unit_id == resource_unit_id
         assert manager.snapshot()["task_leases"][reservation.task_lease_id]["query_id"] == resource_query_id
         assert payload["query_id"] == resource_query_id
         assert payload["execution_query_id"] == execution_query_id
@@ -474,11 +474,11 @@ def test_fte_worker_selection_or_reservation_failure_releases_task_lease(worker,
         _cleanup_fte_query(query_id)
 
 
-def test_fte_write_sink_updates_registered_stage_state_instead_of_registering_an_operator():
-    query_id = "q-write-sink-stage"
+def test_fte_write_sink_updates_registered_unit_state_instead_of_registering_an_operator():
+    query_id = "q-write-sink-unit"
     clear_query_resource_managers()
-    manager, stage_id = _register_fte_query(query_id, "sink", partitions=1, task_slots=1)
-    stage, fragment_id = _install_fte_fragment(
+    manager, resource_unit_id = _register_fte_query(query_id, "sink", partitions=1, task_slots=1)
+    fragment_execution, fragment_id = _install_fte_fragment(
         query_id,
         "sink",
         partitions=1,
@@ -490,22 +490,22 @@ def test_fte_write_sink_updates_registered_stage_state_instead_of_registering_an
         },
     )
     try:
-        fte_fragment_scheduler._sync_write_sink_stage_for_fragment(stage)
-        assert manager.snapshot()["stages"][stage_id]["runnable"] is False
+        fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
+        assert manager.snapshot()["units"][resource_unit_id]["runnable"] is False
 
-        stage.partitions[0].mark_ready_for_execution()
-        fte_fragment_scheduler._sync_write_sink_stage_for_fragment(stage)
-        assert manager.snapshot()["stages"][stage_id]["runnable"] is True
+        fragment_execution.partitions[0].mark_ready_for_execution()
+        fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
+        assert manager.snapshot()["units"][resource_unit_id]["runnable"] is True
         assert fragment_id == f"{query_id}:node:sink"
     finally:
         _cleanup_fte_query(query_id)
 
 
-def test_fte_write_sink_stage_snapshot_owns_fragment_state_lock():
-    query_id = "q-write-sink-stage-lock"
+def test_fte_write_sink_unit_snapshot_owns_fragment_state_lock():
+    query_id = "q-write-sink-unit-lock"
     clear_query_resource_managers()
-    _manager, _stage_id = _register_fte_query(query_id, "sink", partitions=1, task_slots=1)
-    stage, _fragment_id = _install_fte_fragment(
+    _manager, _resource_unit_id = _register_fte_query(query_id, "sink", partitions=1, task_slots=1)
+    fragment_execution, _fragment_id = _install_fte_fragment(
         query_id,
         "sink",
         partitions=1,
@@ -519,14 +519,14 @@ def test_fte_write_sink_stage_snapshot_owns_fragment_state_lock():
 
     class _LockCheckingPartitions(dict):
         def values(self):
-            assert stage._state_lock_owned_by_current_thread()
+            assert fragment_execution._state_lock_owned_by_current_thread()
             return super().values()
 
-    stage.partitions = _LockCheckingPartitions(stage.partitions)
+    fragment_execution.partitions = _LockCheckingPartitions(fragment_execution.partitions)
     try:
-        fte_fragment_scheduler._sync_write_sink_stage_for_fragment(stage)
+        fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
     finally:
-        stage.partitions = dict(stage.partitions)
+        fragment_execution.partitions = dict(fragment_execution.partitions)
         _cleanup_fte_query(query_id)
 
 
@@ -587,7 +587,7 @@ def test_registry_snapshot_is_observation_only(monkeypatch, snapshot_kind):
     _, fragment_id = _install_fte_fragment(query_id, "sink", partitions=1)
     monkeypatch.setattr(
         fte_fragment_scheduler,
-        "_sync_write_sink_stage_for_fragment",
+        "_sync_write_sink_unit_for_fragment",
         lambda _fragment: (_ for _ in ()).throw(AssertionError("progress collection must not mutate scheduler state")),
     )
     try:
@@ -4396,7 +4396,7 @@ def test_fte_fragment_execution_uses_logical_fragment_identity_for_materialized_
         "q",
         12,
         fragment_id="q:node:sample",
-        logical_fragment_identity='["ray-fte-logical-fragment-v1","node:sample:fte","node:sample"]',
+        logical_fragment_identity='["ray-fte-logical-fragment-v1","node:sample:native-fragment","node:sample"]',
         stable_task_identity_callback=lambda stable_task_identity, identity_key: registered_identities.append(
             (stable_task_identity, identity_key)
         ),
@@ -6211,7 +6211,7 @@ def test_ray_fte_worker_requires_exact_query_lease_heap():
                 "lease_id": "lease-qlease",
                 "query_id": "qlease",
                 "execution_query_id": "qlease",
-                "stage_id": "stage:qlease:node:scan:fte",
+                "resource_unit_id": "resource:qlease:fragment:node:scan",
                 "task_id": "qlease.0.0",
                 "attempt_id": "qlease.0.0.0",
                 "resources": {
@@ -6275,7 +6275,7 @@ def test_ray_fte_worker_rejects_lease_larger_than_node_capacity():
                 "lease_id": "lease-qoversize",
                 "query_id": "qoversize",
                 "execution_query_id": "qoversize",
-                "stage_id": "stage:qoversize:node:scan:fte",
+                "resource_unit_id": "resource:qoversize:fragment:node:scan",
                 "task_id": "qoversize.0.0",
                 "attempt_id": "qoversize.0.0.0",
                 "resources": {

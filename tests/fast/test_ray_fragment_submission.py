@@ -51,18 +51,18 @@ from duckdb.runners.ray.fte_events import (
     WorkerFailed,
     WorkerReservationCompleted,
 )
-from duckdb.runners.ray.query_execution_graph import (
+from duckdb.runners.ray.query_resource_graph import (
     NodeResourceAllocation,
     QueryAllocation,
-    QueryExecutionGraph,
+    QueryResourceGraph,
+    ResourceUnitSpec,
     ResourceVector,
-    StageResourceSpec,
 )
-from duckdb.runners.ray.query_graph_builder import fte_stage_id_for_fragment
+from duckdb.runners.ray.query_resource_graph_builder import native_fragment_unit_id_for_fragment
 from duckdb.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
     get_query_resource_manager,
-    register_query_graph,
+    register_query_resource_graph,
 )
 from duckdb.runners.ray.worker_handle import RayWorkerActorHandle as _ProductionRayWorkerActorHandle
 
@@ -307,8 +307,8 @@ class _FakeTask:
         if query_id and node_id:
             self._context.setdefault("resource_query_id", query_id)
             self._context.setdefault(
-                "resource_stage_id",
-                f"stage:{query_id}:node:{node_id}:fte",
+                "resource_unit_id",
+                f"resource:{query_id}:fragment:node:{node_id}",
             )
         self._inputs = inputs or {}
         self._plan = plan if plan is not None else {"plan": name}
@@ -378,7 +378,7 @@ def _exchange_selector_payload(
     return payload
 
 
-def _register_test_query_graph(query_id, fragment_ids, *, max_concurrency=256):
+def _register_test_query_resource_graph(query_id, fragment_ids, *, max_concurrency=256):
     try:
         return get_query_resource_manager(query_id)
     except KeyError:
@@ -388,14 +388,14 @@ def _register_test_query_graph(query_id, fragment_ids, *, max_concurrency=256):
     fragment_ids.update(
         f"{query_id}:node:{node_id}" for node_id in ("scan", "exchange", "upstream-worker", "worker-retry")
     )
-    stages = tuple(
-        StageResourceSpec(
+    units = tuple(
+        ResourceUnitSpec(
             query_id=query_id,
-            stage_id=fte_stage_id_for_fragment(query_id, fragment_id),
-            physical_node_id=f"node:{fragment_id.rsplit(':node:', 1)[1]}:fte",
-            stage_kind="fte",
+            resource_unit_id=native_fragment_unit_id_for_fragment(query_id, fragment_id),
+            physical_node_id=f"node:{fragment_id.rsplit(':node:', 1)[1]}:native-fragment",
+            unit_kind="native_fragment",
             backend="ray_worker",
-            input_stage_ids=(),
+            input_unit_ids=(),
             per_task=ResourceVector(cpu=1, heap_bytes=10),
             target_output_block_bytes=1,
             generator_buffer_blocks=1,
@@ -403,18 +403,18 @@ def _register_test_query_graph(query_id, fragment_ids, *, max_concurrency=256):
         )
         for fragment_id in sorted(fragment_ids)
     )
-    graph = QueryExecutionGraph(
+    graph = QueryResourceGraph(
         query_id=query_id,
         plan_digest=f"sha256:test:{query_id}",
-        stages=stages,
-        terminal_stage_ids=tuple(stage.stage_id for stage in stages),
+        units=units,
+        terminal_unit_ids=tuple(unit.resource_unit_id for unit in units),
     )
     allocation_resources = ResourceVector(
         cpu=256,
         heap_bytes=2560,
         object_store_bytes=256,
     )
-    manager = register_query_graph(
+    manager = register_query_resource_graph(
         graph,
         QueryAllocation(
             resources=allocation_resources,
@@ -428,21 +428,21 @@ def _register_test_query_graph(query_id, fragment_ids, *, max_concurrency=256):
             generation=1,
         ),
     )
-    for stage in stages:
-        manager.update_stage_state(stage.stage_id, runnable=True)
+    for unit in units:
+        manager.update_unit_state(unit.resource_unit_id, runnable=True)
     return manager
 
 
 def _install_manual_test_fragment(query_id, node_id, *, partition_count=1):
     fragment_id = f"{query_id}:node:{node_id}"
-    _register_test_query_graph(query_id, [fragment_id])
+    _register_test_query_resource_graph(query_id, [fragment_id])
     fragment_execution = FteFragmentExecution(
         query_id,
         7,
         fragment_id=fragment_id,
         context={
             "resource_query_id": query_id,
-            "resource_stage_id": f"stage:{query_id}:node:{node_id}:fte",
+            "resource_unit_id": f"resource:{query_id}:fragment:node:{node_id}",
         },
         task_memory_bytes=10,
     )
@@ -467,8 +467,8 @@ def _patch_ray_worker_handle_test_state(monkeypatch):
     worker_handle_mod._FTE_WORKER_RESERVATION_GENERATIONS.clear()
     worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS.clear()
     worker_handle_mod._FTE_PARTITION_TASK_WAITERS.clear()
-    worker_handle_mod._FTE_STAGE_SUBMISSION_PROBES.clear()
-    worker_handle_mod._FTE_STAGE_SUBMISSION_BLOCKS.clear()
+    worker_handle_mod._FTE_RESOURCE_UNIT_SUBMISSION_PROBES.clear()
+    worker_handle_mod._FTE_RESOURCE_UNIT_SUBMISSION_BLOCKS.clear()
     worker_handle_mod._FTE_PARTITION_TASK_LEASES.clear()
     worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY.clear()
     worker_handle_mod._FTE_RETRY_DELAYS.clear()
@@ -507,7 +507,7 @@ def _patch_ray_worker_handle_test_state(monkeypatch):
                 continue
             stages_by_query.setdefault(query_id, set()).add(fragment_id)
         for query_id, fragment_ids in stages_by_query.items():
-            _register_test_query_graph(query_id, fragment_ids)
+            _register_test_query_resource_graph(query_id, fragment_ids)
         return original_submit_tasks(handle, tasks)
 
     original_get_or_create = RayWorkerActorHandle._get_or_create_fte_fragment_execution
@@ -516,14 +516,14 @@ def _patch_ray_worker_handle_test_state(monkeypatch):
         query_id = str(item["query_id"])
         fragment_id = str(item["fragment_id"])
         if ":node:" in fragment_id:
-            _register_test_query_graph(query_id, [fragment_id])
-            stage_id = fte_stage_id_for_fragment(query_id, fragment_id)
+            _register_test_query_resource_graph(query_id, [fragment_id])
+            resource_unit_id = native_fragment_unit_id_for_fragment(query_id, fragment_id)
             item = dict(item)
             item.setdefault("resource_query_id", query_id)
-            item.setdefault("resource_stage_id", stage_id)
+            item.setdefault("resource_unit_id", resource_unit_id)
             item["context"] = {
                 "resource_query_id": query_id,
-                "resource_stage_id": stage_id,
+                "resource_unit_id": resource_unit_id,
                 **dict(item.get("context") or {}),
             }
         return original_get_or_create(handle, item, *args, **kwargs)
@@ -599,7 +599,7 @@ def test_fte_materialized_sink_identity_is_independent_of_fragment_registration_
     second_query_id = "query-logical-fragment-order-b"
     node_ids = ("7", "42")
     for query_id in (first_query_id, second_query_id):
-        _register_test_query_graph(
+        _register_test_query_resource_graph(
             query_id,
             [f"{query_id}:node:{node_id}" for node_id in node_ids],
         )
@@ -656,8 +656,8 @@ def test_fte_materialized_sink_identity_distinguishes_explicit_fragments_in_one_
 
     def submit_fragments(resource_query_id, ordered_task_indices):
         execution_query_id = f"{resource_query_id}_orderby_42_final"
-        resource_stage_id = f"stage:{resource_query_id}:node:42:fte"
-        _register_test_query_graph(resource_query_id, [f"{resource_query_id}:node:42"])
+        resource_unit_id = f"resource:{resource_query_id}:fragment:node:42"
+        _register_test_query_resource_graph(resource_query_id, [f"{resource_query_id}:node:42"])
         request_offset = len(_create_requests(actor))
         handles = handle.submit_tasks(
             [
@@ -666,7 +666,7 @@ def test_fte_materialized_sink_identity_distinguishes_explicit_fragments_in_one_
                     context={
                         "query_id": execution_query_id,
                         "resource_query_id": resource_query_id,
-                        "resource_stage_id": resource_stage_id,
+                        "resource_unit_id": resource_unit_id,
                         "fragment_id": f"{execution_query_id}:orderby:42:OrderByFinal:{task_idx}",
                         "stable_task_partition_id": str(task_idx),
                     },
@@ -810,11 +810,11 @@ def test_submit_tasks_registers_fragment_and_creates_fte_task():
         "query_id": "query-1",
         "node_id": "17",
         "resource_query_id": "query-1",
-        "resource_stage_id": "stage:query-1:node:17:fte",
+        "resource_unit_id": "resource:query-1:fragment:node:17",
     }
     assert request["worker_runtime"] == "fte"
     assert request["fragment_plan"] is None
-    assert request["query_task_lease"]["stage_id"] == "stage:query-1:node:17:fte"
+    assert request["query_task_lease"]["resource_unit_id"] == "resource:query-1:fragment:node:17"
     assert request["query_task_lease"]["attempt_id"] == str(handles[0].task_id)
     assert request["query_task_lease"]["resources"]["heap_bytes"] == 10
     assert "duckdb_memory_bytes" not in request["query_task_lease"]
@@ -835,7 +835,7 @@ def test_submit_tasks_rejects_fragment_without_pre_registered_physical_node_id()
         plan={"plan": "aggregate"},
     )
 
-    with pytest.raises(ValueError, match="requires resource_query_id and resource_stage_id"):
+    with pytest.raises(ValueError, match="requires resource_query_id and resource_unit_id"):
         handle.submit_tasks([task])
 
     assert _create_requests(actor) == []
@@ -871,7 +871,7 @@ def test_submit_tasks_creates_fte_tasks_for_distinct_fragments():
     assert actor.fragment_calls == []
 
 
-def test_submit_tasks_coalesces_same_fragment_scan_splits_in_fte_stage():
+def test_submit_tasks_coalesces_same_fragment_scan_splits_in_fte_fragment_execution():
     actor = _FakeActor()
     handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
     task0 = _FakeTask(
@@ -934,7 +934,7 @@ def test_submit_tasks_allows_copy_tasks_with_attempt_aware_final_writes():
     assert task.plan_calls == 1
 
 
-def test_submit_tasks_rejects_variant_fragment_ids_outside_physical_stage_identity():
+def test_submit_tasks_rejects_variant_fragment_ids_outside_registered_resource_unit_identity():
     actor = _FakeActor()
     handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
     task0 = _FakeTask(
@@ -955,7 +955,7 @@ def test_submit_tasks_rejects_variant_fragment_ids_outside_physical_stage_identi
         },
         plan={"plan": "exchange-b"},
     )
-    with pytest.raises(ValueError, match="invalid FTE fragment_id"):
+    with pytest.raises(ValueError, match="invalid native fragment_id"):
         handle.submit_tasks([task0, task1])
 
     assert _create_requests(actor) == []
@@ -5173,13 +5173,13 @@ def test_fte_node_wait_placement_rechecks_terminal_partition_after_admission(mon
         fragment_id=fragment_id,
         context={
             "resource_query_id": query_id,
-            "resource_stage_id": f"stage:{query_id}:node:7:fte",
+            "resource_unit_id": f"resource:{query_id}:fragment:node:7",
         },
         task_memory_bytes=64,
     )
     partition = stage.add_partition(0)
     next_partition = stage.add_partition(1)
-    _register_test_query_graph(query_id, [fragment_id])
+    _register_test_query_resource_graph(query_id, [fragment_id])
     monkeypatch.setitem(
         worker_handle_mod._FTE_FRAGMENT_EXECUTIONS,
         (query_id, fragment_id),
@@ -5257,7 +5257,7 @@ def test_fte_ready_attempt_releases_admission_when_partition_finishes_before_han
         fragment_id=fragment_id,
         context={
             "resource_query_id": query_id,
-            "resource_stage_id": f"stage:{query_id}:node:7:fte",
+            "resource_unit_id": f"resource:{query_id}:fragment:node:7",
         },
         task_memory_bytes=64,
     )
@@ -5265,7 +5265,7 @@ def test_fte_ready_attempt_releases_admission_when_partition_finishes_before_han
     next_partition = stage.add_partition(1)
     with stage._state_lock:
         partition.mark_ready_for_execution()
-    _register_test_query_graph(query_id, [fragment_id])
+    _register_test_query_resource_graph(query_id, [fragment_id])
     monkeypatch.setitem(
         worker_handle_mod._FTE_FRAGMENT_EXECUTIONS,
         (query_id, fragment_id),
@@ -5343,12 +5343,12 @@ def test_fte_async_reservation_releases_admission_for_terminal_partition(monkeyp
         fragment_id=fragment_id,
         context={
             "resource_query_id": query_id,
-            "resource_stage_id": f"stage:{query_id}:node:7:fte",
+            "resource_unit_id": f"resource:{query_id}:fragment:node:7",
         },
         task_memory_bytes=64,
     )
     partition = stage.add_partition(0)
-    _register_test_query_graph(query_id, [fragment_id])
+    _register_test_query_resource_graph(query_id, [fragment_id])
     monkeypatch.setitem(
         worker_handle_mod._FTE_FRAGMENT_EXECUTIONS,
         (query_id, fragment_id),
@@ -5454,7 +5454,7 @@ def test_fte_async_placement_releases_reservation_when_partition_finishes_before
         fragment_id=fragment_id,
         context={
             "resource_query_id": query_id,
-            "resource_stage_id": f"stage:{query_id}:node:7:fte",
+            "resource_unit_id": f"resource:{query_id}:fragment:node:7",
         },
         task_memory_bytes=64,
     )
@@ -5517,7 +5517,7 @@ def test_fte_async_placement_releases_reservation_when_partition_finishes_before
     ]
 
 
-def test_fte_registry_stats_reports_query_stage_partition_metrics(monkeypatch):
+def test_fte_registry_stats_reports_query_fragment_partition_metrics(monkeypatch):
     monkeypatch.setattr(
         RayWorkerActorHandle,
         "_fte_task_handle_cls",
@@ -5536,16 +5536,16 @@ def test_fte_registry_stats_reports_query_stage_partition_metrics(monkeypatch):
 
     stats = handle.fte_registry_stats()
     query = stats["queries"]["query-fte-metrics"]
-    stage = query["fragment_executions"]["query-fte-metrics:node:7"]
-    partition = stage["partitions"]["0"]
+    fragment = query["fragment_executions"]["query-fte-metrics:node:7"]
+    partition = fragment["partitions"]["0"]
 
     assert [str(task_handle.task_id) for task_handle in task_handles] == ["query-fte-metrics.0.0.0"]
     assert query["fragment_execution_count"] == 1
     assert query["partition_count"] == 1
     assert query["running_count"] == 1
     assert query["waiting_for_node_count"] == 0
-    assert stage["running_count"] == 1
-    assert stage["execution_class_counts"] == {"STANDARD": 1}
+    assert fragment["running_count"] == 1
+    assert fragment["execution_class_counts"] == {"STANDARD": 1}
     assert partition["state"] == "RUNNING"
     assert partition["owner_worker_id"] == "worker-0"
     assert partition["initial_split_count_by_source"] == {"7": 1}
@@ -6521,7 +6521,7 @@ def _completed_test_reservation(future, worker):
         fragment_id=future.fragment_id,
         partition_id=future.partition_id,
         worker=worker,
-        stage_id=fte_stage_id_for_fragment(future.query_id, future.fragment_id),
+        resource_unit_id=native_fragment_unit_id_for_fragment(future.query_id, future.fragment_id),
         task_lease_id=f"test-lease-{future.reservation_generation}",
         attempt_id=f"{future.query_id}.{future.fragment_execution_id}.{future.partition_id}.0",
     )
@@ -7099,11 +7099,11 @@ def test_fte_denied_descriptor_is_not_registered_and_block_is_removed_when_aband
         )
 
     assert exc_info.value.blocked_reason == "allocation_pending"
-    stage_id = fte_stage_id_for_fragment(query_id, fragment_id)
-    assert manager.snapshot()["stages"][stage_id]["pending_task_count"] == 0
+    resource_unit_id = native_fragment_unit_id_for_fragment(query_id, fragment_id)
+    assert manager.snapshot()["units"][resource_unit_id]["pending_task_count"] == 0
     stats = worker_handle_mod.fte_registry_stats()
     assert stats["partition_task_waiter_count"] == 0
-    assert stats["stage_submission_block_count"] == 1
+    assert stats["resource_unit_submission_block_count"] == 1
 
     worker_handle_mod.FteWorkerPlacementManager.release_owner(
         query_id=query_id,
@@ -7111,10 +7111,10 @@ def test_fte_denied_descriptor_is_not_registered_and_block_is_removed_when_aband
         partition_id=0,
     )
 
-    assert manager.snapshot()["stages"][stage_id]["pending_task_count"] == 0
+    assert manager.snapshot()["units"][resource_unit_id]["pending_task_count"] == 0
     stats = worker_handle_mod.fte_registry_stats()
     assert stats["partition_task_waiter_count"] == 0
-    assert stats["stage_submission_block_count"] == 0
+    assert stats["resource_unit_submission_block_count"] == 0
 
 
 def test_fte_worker_capacity_tracks_all_node_waiters_without_a_second_cap(monkeypatch):
@@ -7190,7 +7190,7 @@ def test_fte_worker_capacity_tracks_all_node_waiters_without_a_second_cap(monkey
 
 
 def test_fte_dynamic_exchange_running_window_defers_extra_partitions(monkeypatch):
-    _register_test_query_graph(
+    _register_test_query_resource_graph(
         "query-dynamic-window",
         ["query-dynamic-window:node:8"],
         max_concurrency=1,
@@ -7234,11 +7234,14 @@ def test_fte_dynamic_exchange_running_window_defers_extra_partitions(monkeypatch
     assert stage.partitions[1].ready_for_scheduling is False
     assert stage.partitions[1].execution_ready_deferred is True
     assert stage.partitions[1].node_wait_started_at is None
-    stage_id = fte_stage_id_for_fragment(
+    resource_unit_id = native_fragment_unit_id_for_fragment(
         "query-dynamic-window",
         stage.fragment_id,
     )
-    assert get_query_resource_manager("query-dynamic-window").snapshot()["stages"][stage_id]["pending_task_count"] == 0
+    assert (
+        get_query_resource_manager("query-dynamic-window").snapshot()["units"][resource_unit_id]["pending_task_count"]
+        == 0
+    )
     assert [call[1]["task_id"]["partition_id"] for call in actor.fte_calls if call[0] == "create"] == [0]
     assert [str(task_handle.task_id) for task_handle in handle.pop_fte_result_handles("query-dynamic-window")] == [
         "query-dynamic-window.0.0.0"
@@ -7259,7 +7262,7 @@ def test_fte_dynamic_exchange_running_window_defers_extra_partitions(monkeypatch
 def test_fte_submission_window_keeps_36_descriptors_but_only_7_in_qrm(monkeypatch):
     query_id = "query-36-descriptors-7-running"
     fragment_id = f"{query_id}:node:8"
-    _register_test_query_graph(query_id, [fragment_id], max_concurrency=7)
+    _register_test_query_resource_graph(query_id, [fragment_id], max_concurrency=7)
     monkeypatch.setattr(
         fragment_submission_mod,
         "_split_exchange_source_task_by_partition",
@@ -7288,19 +7291,19 @@ def test_fte_submission_window_keeps_36_descriptors_but_only_7_in_qrm(monkeypatc
 
     handles = handle.submit_tasks(tasks)
     stage = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[(query_id, fragment_id)]
-    stage_id = fte_stage_id_for_fragment(query_id, fragment_id)
+    resource_unit_id = native_fragment_unit_id_for_fragment(query_id, fragment_id)
     manager = get_query_resource_manager(query_id)
     snapshot = manager.snapshot()
     stats = handle.fte_registry_stats()
 
     assert len(stage.partitions) == 36
     assert [attempt.task_id.partition_id for attempt in handles] == list(range(7))
-    assert snapshot["stages"][stage_id]["active_task_count"] == 7
-    assert snapshot["stages"][stage_id]["pending_task_count"] == 0
+    assert snapshot["units"][resource_unit_id]["active_task_count"] == 7
+    assert snapshot["units"][resource_unit_id]["pending_task_count"] == 0
     assert stats["partition_task_waiter_count"] == 0
     assert stats["pending_worker_reservation_count"] == 0
-    assert stats["stage_submission_probe_count"] == 0
-    assert stats["stage_submission_block_count"] == 1
+    assert stats["resource_unit_submission_probe_count"] == 0
+    assert stats["resource_unit_submission_block_count"] == 1
     assert sum(partition.execution_ready_deferred for partition in stage.partitions.values()) == 29
     assert (
         sum(
@@ -7322,8 +7325,8 @@ def test_fte_submission_window_keeps_36_descriptors_but_only_7_in_qrm(monkeypatc
     stats = handle.fte_registry_stats()
 
     assert [attempt.task_id.partition_id for attempt in refill] == [7]
-    assert snapshot["stages"][stage_id]["active_task_count"] == 7
-    assert snapshot["stages"][stage_id]["pending_task_count"] == 0
+    assert snapshot["units"][resource_unit_id]["active_task_count"] == 7
+    assert snapshot["units"][resource_unit_id]["pending_task_count"] == 0
     assert stats["partition_task_waiter_count"] == 0
     assert stats["pending_worker_reservation_count"] == 0
     assert sum(partition.execution_ready_deferred for partition in stage.partitions.values()) == 28
@@ -7654,7 +7657,7 @@ def test_fte_resource_waiter_scan_isolates_failed_query():
     class _FragmentExecution:
         context = {
             "resource_query_id": resource_query_id,
-            "resource_stage_id": f"stage:{resource_query_id}:node:8:fte",
+            "resource_unit_id": f"resource:{resource_query_id}:fragment:node:8",
         }
 
         def __init__(self, error=None):
@@ -9933,7 +9936,7 @@ def test_fte_exchange_selector_event_requires_selector_payload(monkeypatch):
 
 
 def test_fte_exchange_selector_event_updates_running_and_pending_consumers(monkeypatch):
-    _register_test_query_graph(
+    _register_test_query_resource_graph(
         "query-fte-selector-mixed",
         ["query-fte-selector-mixed:node:8"],
         max_concurrency=1,
@@ -11950,7 +11953,7 @@ def test_ray_worker_fte_debug_logs_use_worker_topology(monkeypatch, capsys):
                     "lease_id": "lease-ray-log",
                     "query_id": "ray-log",
                     "execution_query_id": "ray-log",
-                    "stage_id": "stage:ray-log:node:scan:fte",
+                    "resource_unit_id": "resource:ray-log:fragment:node:scan",
                     "task_id": "ray-log.0.0",
                     "attempt_id": "ray-log.0.0.0",
                     "resources": {

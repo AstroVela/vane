@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from duckdb.runners.ray.query_execution_graph import (
+from duckdb.runners.ray.query_resource_graph import (
     ActorPlacement,
     NodeResourceAllocation,
     QueryAllocation,
@@ -105,20 +105,20 @@ class NodeCapacity:
 
 @dataclass(frozen=True)
 class ActorResourceBundle:
-    stage_id: str
+    resource_unit_id: str
     actor_index: int
     resources: ResourceVector
 
     def __post_init__(self) -> None:
-        stage_id = str(self.stage_id).strip()
+        resource_unit_id = str(self.resource_unit_id).strip()
         actor_index = int(self.actor_index)
-        if not stage_id:
-            raise ValueError("actor resource bundle stage_id must be non-empty")
+        if not resource_unit_id:
+            raise ValueError("actor resource bundle resource_unit_id must be non-empty")
         if actor_index < 0:
             raise ValueError("actor resource bundle actor_index must be >= 0")
         if self.resources.is_zero():
             raise ValueError("actor resource bundle must own non-zero resources")
-        object.__setattr__(self, "stage_id", stage_id)
+        object.__setattr__(self, "resource_unit_id", resource_unit_id)
         object.__setattr__(self, "actor_index", actor_index)
 
 
@@ -158,9 +158,9 @@ class QueryDemand:
             raise ValueError("weight must be finite and > 0")
         actor_bundles = tuple(self.actor_bundles)
         task_bundles = tuple(self.task_bundles)
-        actor_keys = [(bundle.stage_id, bundle.actor_index) for bundle in actor_bundles]
+        actor_keys = [(bundle.resource_unit_id, bundle.actor_index) for bundle in actor_bundles]
         if len(set(actor_keys)) != len(actor_keys):
-            raise ValueError("actor resource bundles contain duplicate stage/index identities")
+            raise ValueError("actor resource bundles contain duplicate resource-unit/index identities")
         actor_total = _sum_resources([bundle.resources for bundle in actor_bundles])
         task_total = _sum_resources(task_bundles)
         bundle_total = actor_total + task_total
@@ -462,11 +462,11 @@ class ClusterQueryResourceCoordinator:
             trial_remaining = dict(remaining)
             placement_valid = True
             actor_bundles = {
-                (bundle.stage_id, bundle.actor_index): bundle.resources for bundle in state.demand.actor_bundles
+                (bundle.resource_unit_id, bundle.actor_index): bundle.resources for bundle in state.demand.actor_bundles
             }
             pinned_allocations: dict[str, ResourceVector] = {}
             for placement in state.actor_placements:
-                vector = actor_bundles.get((placement.stage_id, placement.actor_index))
+                vector = actor_bundles.get((placement.resource_unit_id, placement.actor_index))
                 capacity = trial_remaining.get(placement.node_id)
                 if vector is None or capacity is None or not vector.fits_within(capacity):
                     placement_valid = False
@@ -505,7 +505,7 @@ class ClusterQueryResourceCoordinator:
                         break
                     new_actor_placements.append(
                         ActorPlacement(
-                            stage_id=actor_bundle.stage_id,
+                            resource_unit_id=actor_bundle.resource_unit_id,
                             actor_index=actor_bundle.actor_index,
                             node_id=node_id,
                         )

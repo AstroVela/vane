@@ -32,14 +32,14 @@ from duckdb.runners.ray.worker import (
 @contextmanager
 def _registered_low_level_plan(plan, con, *, node_id=None):
     """Exercise the internal C++ runner under the mandatory graph contract."""
-    from duckdb.runners.ray.query_execution_graph import (
+    from duckdb.runners.ray.query_resource_graph import (
         NodeResourceAllocation,
         QueryAllocation,
         ResourceVector,
     )
-    from duckdb.runners.ray.query_graph_builder import build_query_execution_graph
+    from duckdb.runners.ray.query_resource_graph_builder import build_query_resource_graph
     from duckdb.runners.ray.query_resource_runtime import (
-        register_query_graph,
+        register_query_resource_graph,
         release_query_resource_manager,
     )
 
@@ -53,10 +53,10 @@ def _registered_low_level_plan(plan, con, *, node_id=None):
     if not node_id:
         raise ValueError("low-level distributed plan registration requires a non-empty node_id")
 
-    graph = build_query_execution_graph(
-        plan.collect_execution_stages(conn=con),
+    graph = build_query_resource_graph(
+        plan.collect_query_resource_graph_metadata(conn=con),
         env={
-            "VANE_FTE_TASK_HEAP_BYTES": "1",
+            "VANE_NATIVE_FRAGMENT_TASK_HEAP_BYTES": "1",
             "VANE_TARGET_OUTPUT_BLOCK_BYTES": str(1024**2),
         },
     )
@@ -66,7 +66,7 @@ def _registered_low_level_plan(plan, con, *, node_id=None):
         heap_bytes=1 << 50,
         object_store_bytes=1 << 50,
     )
-    manager = register_query_graph(
+    manager = register_query_resource_graph(
         graph,
         QueryAllocation(
             resources=allocation_resources,
@@ -80,9 +80,9 @@ def _registered_low_level_plan(plan, con, *, node_id=None):
             generation=1,
         ),
     )
-    for stage in graph.stages:
-        manager.update_stage_state(
-            stage.stage_id,
+    for unit in graph.units:
+        manager.update_unit_state(
+            unit.resource_unit_id,
             runnable=True,
             actor_ready=True,
         )
@@ -113,7 +113,7 @@ class _DummyStream:
 
 class _FakeOutputLeaseOwner:
     def __init__(self) -> None:
-        self.states = ["stage_queue"]
+        self.states = ["unit_queue"]
         self.released = False
 
     def transition_to(self, state):
@@ -276,7 +276,7 @@ def _query_registration_stub(query_id: str):
         expected_plan_id=None,
     ):
         del query_connection, expected_plan_id
-        return SimpleNamespace(query_id=query_id, stages=()), object()
+        return SimpleNamespace(query_id=query_id, units=()), object()
 
     return _register
 
@@ -475,36 +475,36 @@ def _bind_test_query_resource_owner(
     *,
     query_id: str | None = None,
 ):
-    from duckdb.runners.ray.query_execution_graph import (
+    from duckdb.runners.ray.query_resource_graph import (
         NodeResourceAllocation,
         QueryAllocation,
-        QueryExecutionGraph,
+        QueryResourceGraph,
+        ResourceUnitSpec,
         ResourceVector,
-        StageResourceSpec,
     )
-    from duckdb.runners.ray.query_resource_runtime import register_query_graph
+    from duckdb.runners.ray.query_resource_runtime import register_query_resource_graph
 
     query_id = str(plan_id if query_id is None else query_id)
-    stage = StageResourceSpec(
+    unit = ResourceUnitSpec(
         query_id=query_id,
-        stage_id=f"stage:{query_id}:result",
+        resource_unit_id=f"resource:{query_id}:result",
         physical_node_id="result",
-        stage_kind="fte",
+        unit_kind="native_fragment",
         backend="ray_worker",
-        input_stage_ids=(),
+        input_unit_ids=(),
         per_task=ResourceVector(cpu=1, heap_bytes=1),
         target_output_block_bytes=1,
         generator_buffer_blocks=1,
         max_concurrency=1,
     )
-    graph = QueryExecutionGraph(
+    graph = QueryResourceGraph(
         query_id=query_id,
         plan_digest=f"sha256:{query_id}",
-        stages=(stage,),
-        terminal_stage_ids=(stage.stage_id,),
+        units=(unit,),
+        terminal_unit_ids=(unit.resource_unit_id,),
     )
     resources = ResourceVector(cpu=1, heap_bytes=1, object_store_bytes=1)
-    manager = register_query_graph(
+    manager = register_query_resource_graph(
         graph,
         QueryAllocation(
             resources=resources,
@@ -513,7 +513,7 @@ def _bind_test_query_resource_owner(
             generation=1,
         ),
     )
-    manager.update_stage_state(stage.stage_id, runnable=True)
+    manager.update_unit_state(unit.resource_unit_id, runnable=True)
     runner._plan_query_ids[str(plan_id)] = query_id
     runner._plan_session_ids[str(plan_id)] = _TEST_SESSION_ID
     runner._sessions[_TEST_SESSION_ID].plan_ids.add(str(plan_id))
@@ -682,7 +682,7 @@ def test_session_close_does_not_block_actor_loop_during_stream_startup(monkeypat
         "_register_query_resources",
         _query_registration_stub("slow-stream-startup"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
 
     def _cleanup(_self, plan_id):
         runner.curr_plans.pop(plan_id, None)
@@ -754,7 +754,7 @@ def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(mon
         "_register_query_resources",
         _query_registration_stub("copy-plan"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda _self, _graph: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda _self, _graph: None)
     monkeypatch.setattr(
         cls,
         "_drop_query_fragments_sync",
@@ -800,7 +800,7 @@ def test_query_driver_committed_copy_preserves_terminal_actor_placement_warning(
         "_register_query_resources",
         _query_registration_stub("copy-query-terminal"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
 
     def _teardown(_self, plan_id, query_id, *, drop_fragments):
         teardown_calls.append((plan_id, query_id, drop_fragments))
@@ -835,7 +835,7 @@ def test_query_driver_copy_progress_failure_returns_committed_warning(monkeypatc
         "_register_query_resources",
         _query_registration_stub("copy-progress-contract-failure"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(
         cls,
         "_build_local_progress_snapshot",
@@ -894,7 +894,7 @@ def test_query_driver_failure_immediately_after_commit_replays_success(monkeypat
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
     monkeypatch.setattr(
         scheduler_mod,
@@ -956,7 +956,7 @@ def test_query_driver_concurrent_startup_failure_preserves_unknown_copy_outcome(
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
     monkeypatch.setattr(
         scheduler_mod,
@@ -1021,7 +1021,7 @@ def test_query_driver_postcommit_startup_drain_cancellation_replays_success(monk
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
     monkeypatch.setattr(driver.asyncio, "gather", _tracked_gather)
     monkeypatch.setattr(
@@ -1081,7 +1081,7 @@ def test_query_driver_concurrent_copy_retries_share_one_write(monkeypatch):
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
@@ -1124,7 +1124,7 @@ def test_query_driver_copy_result_logging_failure_replays_committed_success(monk
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
     monkeypatch.setattr(
@@ -1169,7 +1169,7 @@ def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(m
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
@@ -1222,7 +1222,7 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
     for operation in (
@@ -1278,7 +1278,7 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
     for operation in (
@@ -1338,7 +1338,7 @@ def test_query_driver_evicted_copy_outcome_refuses_reexecution(monkeypatch):
         del query_connection
         plan_id = str(plan.idx())
         assert expected_plan_id == plan_id
-        return SimpleNamespace(query_id=plan_id, stages=()), object()
+        return SimpleNamespace(query_id=plan_id, units=()), object()
 
     def _teardown(_self, plan_id, query_id, *, drop_fragments):
         assert query_id == plan_id
@@ -1350,7 +1350,7 @@ def test_query_driver_evicted_copy_outcome_refuses_reexecution(monkeypatch):
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _register)
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
@@ -1518,7 +1518,7 @@ def test_query_driver_copy_progress_cancellation_waits_before_teardown(monkeypat
         "_register_query_resources",
         _query_registration_stub(plan_id),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", _build_snapshot)
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
@@ -1569,7 +1569,7 @@ def test_query_driver_copy_operation_cancellation_waits_for_native_commit(monkey
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
@@ -1623,7 +1623,7 @@ def test_query_driver_copy_teardown_cancellation_reports_cleanup_complete(monkey
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
@@ -1689,7 +1689,7 @@ def test_query_driver_copy_opens_actor_stage_after_topology_and_actor_barriers(m
         "_register_query_resources",
         _query_registration_stub("copy-startup-order"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", mark_actor_stages)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", mark_actor_stages)
     monkeypatch.setattr(cls, "_teardown_plan_resources", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {})
     monkeypatch.setattr(
@@ -1748,7 +1748,7 @@ def test_query_driver_copy_accepts_plan_success_before_startup_barriers(monkeypa
         "_register_query_resources",
         _query_registration_stub("copy-plan-before-startup-barriers"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", mark_actor_stages)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", mark_actor_stages)
     monkeypatch.setattr(cls, "_teardown_plan_resources", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {})
     monkeypatch.setattr(
@@ -1801,7 +1801,7 @@ def test_query_driver_copy_plan_failure_interrupts_startup_barriers(monkeypatch)
     )
     monkeypatch.setattr(
         cls,
-        "_mark_query_actor_stages_ready",
+        "_mark_query_actor_units_ready",
         lambda *_args: marked_ready.append(True),
     )
     monkeypatch.setattr(cls, "_teardown_plan_resources", teardown)
@@ -1865,7 +1865,7 @@ def test_query_driver_copy_startup_barrier_failure_tears_down_plan(
     )
     monkeypatch.setattr(
         cls,
-        "_mark_query_actor_stages_ready",
+        "_mark_query_actor_units_ready",
         lambda *_args: marked_ready.append(True),
     )
     monkeypatch.setattr(cls, "_teardown_plan_resources", teardown)
@@ -2836,7 +2836,7 @@ def test_query_driver_run_plan_passes_distributed_physical_plan_wrapper(monkeypa
         "_register_query_resources",
         _query_registration_stub("stream-plan"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda _self, _graph: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda _self, _graph: None)
     monkeypatch.setattr(
         cls,
         "_release_query_resources",
@@ -2878,7 +2878,7 @@ def test_query_driver_run_plan_start_failure_runs_complete_teardown(monkeypatch)
         "_register_query_resources",
         _query_registration_stub("failed-query"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_stages_ready", lambda *_args: None)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", _cleanup_udf_actors)
     monkeypatch.setattr(
         cls,
@@ -4324,7 +4324,7 @@ def test_run_plan_return_uses_native_completed_sink_descriptor(monkeypatch):
         "lease_id": "lease-native-descriptor",
         "query_id": "resource-query-native-descriptor",
         "execution_query_id": "query-native-descriptor",
-        "stage_id": "stage-native-descriptor",
+        "resource_unit_id": "stage-native-descriptor",
         "attempt_id": "query-native-descriptor.0.0.0",
         "target_output_block_bytes": 1,
         "output_window_bytes": 1,
@@ -4409,7 +4409,7 @@ def test_run_plan_return_cancellation_waits_for_native_execution(monkeypatch):
         "lease_id": "lease-native-cancel",
         "query_id": "resource-query-native-cancel",
         "execution_query_id": "query-native-cancel",
-        "stage_id": "stage-native-cancel",
+        "resource_unit_id": "stage-native-cancel",
         "attempt_id": "query-native-cancel.0.0.1",
         "target_output_block_bytes": 1,
         "output_window_bytes": 1,
@@ -4458,7 +4458,7 @@ def test_fte_output_publication_is_bounded_by_block_target_and_task_window():
     lease = {
         "lease_id": "lease-1",
         "query_id": "q",
-        "stage_id": "stage:q:node:1:fte",
+        "resource_unit_id": "resource:q:fragment:node:1",
         "attempt_id": "q.0.0.0",
         "target_output_block_bytes": 10,
         "output_window_bytes": 20,

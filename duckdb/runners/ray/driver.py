@@ -1293,7 +1293,7 @@ class RayQueryDriverActor:
         self._active_vllm_actors: list[Any] = []
         self._active_vllm_actors_by_plan: dict[str, list[Any]] = {}
         self._query_resource_lock = threading.RLock()
-        self._query_graphs: dict[str, Any] = {}
+        self._query_resource_graphs: dict[str, Any] = {}
         self._query_allocations: dict[str, Any] = {}
         self._query_node_capacities: tuple[Any, ...] = ()
         self._query_allocation_teardowns_pending: dict[
@@ -2180,7 +2180,7 @@ class RayQueryDriverActor:
 
     @staticmethod
     def _sum_node_capacity(node_capacities: tuple[Any, ...]) -> Any:
-        from duckdb.runners.ray.query_execution_graph import ResourceVector
+        from duckdb.runners.ray.query_resource_graph import ResourceVector
 
         total = ResourceVector()
         for node in node_capacities:
@@ -2235,7 +2235,7 @@ class RayQueryDriverActor:
         The caller owns ``_query_resource_lock``. Returned work may perform
         remote calls and must run only after that lock is released.
         """
-        from duckdb.runners.ray.query_execution_graph import QueryAllocation
+        from duckdb.runners.ray.query_resource_graph import QueryAllocation
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
         self._ensure_query_allocation_teardown_state()
@@ -2246,7 +2246,7 @@ class RayQueryDriverActor:
         if terminal_errors is None:
             terminal_errors = {}
             self._query_terminal_errors = terminal_errors
-        for query_id, graph in self._query_graphs.items():
+        for query_id, graph in self._query_resource_graphs.items():
             query_snapshot = coordinator_queries.get(query_id)
             if query_snapshot is None:
                 raise RuntimeError(f"coordinator lost registered query {query_id}")
@@ -2309,7 +2309,7 @@ class RayQueryDriverActor:
                 with self._query_resource_lock:
                     if (
                         self._query_allocation_teardowns_pending.get(query_id) == teardown
-                        and query_id in self._query_graphs
+                        and query_id in self._query_resource_graphs
                     ):
                         self._query_terminal_errors[query_id] = (
                             f"{teardown.reason}; fragment cancellation failed: {type(exc).__name__}: {exc}"
@@ -2386,7 +2386,7 @@ class RayQueryDriverActor:
         transiently unavailable, the last complete Ray snapshot remains valid
         for this cycle while active query heartbeats and usage still advance.
         """
-        from duckdb.runners.ray.query_execution_graph import ResourceVector
+        from duckdb.runners.ray.query_resource_graph import ResourceVector
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
         timestamp = time.monotonic() if now is None else float(now)
@@ -2423,7 +2423,7 @@ class RayQueryDriverActor:
 
                 observed_usage: dict[str, ResourceVector] = {}
                 generations: dict[str, int] = {}
-                for query_id in sorted(self._query_graphs):
+                for query_id in sorted(self._query_resource_graphs):
                     manager = get_query_resource_manager(query_id)
                     observed_usage[query_id] = ResourceVector.from_dict(manager.snapshot()["usage"])
                     generations[query_id] = self._query_allocations[query_id].generation
@@ -3360,14 +3360,17 @@ class RayQueryDriverActor:
                 _log_resource_debug(
                     "task_admission_yield",
                     query_id=query_key,
-                    stage_id=request.stage_id,
+                    resource_unit_id=request.resource_unit_id,
                     task_id=request.task_id,
                     reason=grant.blocked_reason,
                 )
                 return
             request_id, state = owned_request
             if grant.granted:
-                lease_payload = asdict(grant.lease)
+                lease = grant.lease
+                if lease is None:
+                    raise RuntimeError("QRM granted a queued task without returning its lease")
+                lease_payload = asdict(lease)
                 manager_lease_id = str(lease_payload["lease_id"])
                 public_lease_id = self._issue_task_lease_capability(
                     request_id=request_id,
@@ -3381,7 +3384,9 @@ class RayQueryDriverActor:
                     # Keep the QRM's raw lease ID from being used as an
                     # authoritative external control token and bind the
                     # worker-visible slot to the signed capability.
-                    lease_payload["execution_slot_id"] = f"ray_task:{lease_payload['stage_id']}:{public_lease_id}"
+                    lease_payload["execution_slot_id"] = (
+                        f"ray_task:{lease_payload['resource_unit_id']}:{public_lease_id}"
+                    )
                 # This request record is both the admission result and the
                 # durable execution owner. Publish it before completing the
                 # caller's Future so teardown can never miss a visible grant.
@@ -3393,7 +3398,7 @@ class RayQueryDriverActor:
                 _log_resource_debug(
                     "task_granted",
                     query_id=request.query_id,
-                    stage_id=request.stage_id,
+                    resource_unit_id=request.resource_unit_id,
                     request_id=request_id,
                     lease_id=lease_payload["lease_id"],
                 )
@@ -3418,7 +3423,7 @@ class RayQueryDriverActor:
             _log_resource_debug(
                 "task_blocked",
                 query_id=request.query_id,
-                stage_id=request.stage_id,
+                resource_unit_id=request.resource_unit_id,
                 request_id=request_id,
                 reason=grant.blocked_reason,
             )
@@ -3486,8 +3491,8 @@ class RayQueryDriverActor:
             if grant.granted:
                 lease = grant.lease
                 assert lease is not None
-                if lease.state != "stage_queue":
-                    raise RuntimeError("queued output admission must atomically grant stage_queue ownership")
+                if lease.state != "unit_queue":
+                    raise RuntimeError("queued output admission must atomically grant unit_queue ownership")
                 lease_payload = asdict(lease)
                 manager_lease_id = str(lease_payload["lease_id"])
                 lease_payload["lease_id"] = self._issue_output_lease_capability(
@@ -3501,7 +3506,7 @@ class RayQueryDriverActor:
                 _log_resource_debug(
                     "output_granted",
                     query_id=request.query_id,
-                    stage_id=request.producer_stage_id,
+                    resource_unit_id=request.producer_unit_id,
                     request_id=request_id,
                     lease_id=lease_payload["lease_id"],
                 )
@@ -3530,7 +3535,7 @@ class RayQueryDriverActor:
             _log_resource_debug(
                 "output_blocked",
                 query_id=request.query_id,
-                stage_id=request.producer_stage_id,
+                resource_unit_id=request.producer_unit_id,
                 request_id=request_id,
                 reason=grant.blocked_reason,
             )
@@ -3583,7 +3588,7 @@ class RayQueryDriverActor:
             fields={
                 "request_id",
                 "query_id",
-                "producer_stage_id",
+                "producer_unit_id",
                 "task_lease_id",
                 "attempt_id",
                 "block_id",
@@ -3632,7 +3637,7 @@ class RayQueryDriverActor:
             fields={
                 "request_id",
                 "query_id",
-                "stage_id",
+                "resource_unit_id",
                 "task_id",
                 "attempt_id",
                 "node_id",
@@ -3741,7 +3746,7 @@ class RayQueryDriverActor:
             manager = get_query_resource_manager(request.query_id)
         except KeyError:
             return self._grant_payload(TaskGrant(False, blocked_reason="query_not_registered", fatal=True))
-        expected_resources = manager.graph.stage_by_id(request.stage_id).per_task.to_dict()
+        expected_resources = manager.graph.unit_by_id(request.resource_unit_id).per_task.to_dict()
         if dict(raw_resources) != expected_resources:
             denial = self._grant_payload(TaskGrant(False, blocked_reason="task_resource_spec_mismatch", fatal=True))
             self._query_task_lease_request_tombstones[request_id] = {
@@ -3770,7 +3775,7 @@ class RayQueryDriverActor:
         _log_resource_debug(
             "task_request",
             query_id=request.query_id,
-            stage_id=request.stage_id,
+            resource_unit_id=request.resource_unit_id,
             request_id=request_id,
         )
         try:
@@ -4319,7 +4324,7 @@ class RayQueryDriverActor:
             _log_resource_debug(
                 "task_release_start",
                 query_id=query_id,
-                stage_id=identity.get("stage_id", ""),
+                resource_unit_id=identity.get("resource_unit_id", ""),
                 request_id=request_key,
                 lease_id=lease_id,
             )
@@ -4353,7 +4358,7 @@ class RayQueryDriverActor:
         _log_resource_debug(
             "task_release_done",
             query_id=query_id,
-            stage_id=identity.get("stage_id", ""),
+            resource_unit_id=identity.get("resource_unit_id", ""),
             request_id=request_key,
             lease_id=lease_id,
             released=bool(released),
@@ -4465,7 +4470,7 @@ class RayQueryDriverActor:
 
         This returns producer-side liveness credit. The output lease itself
         remains active, so its bytes continue to count against the query and
-        stage soft object-store budgets until the final descriptor owner
+        resource-unit soft object-store budgets until the final descriptor owner
         releases it.
         """
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
@@ -4496,8 +4501,8 @@ class RayQueryDriverActor:
         current_state = str(lease.get("state") or "")
         if current_state == "downstream_input":
             return {"handed_off": True}
-        if current_state != "stage_queue":
-            raise RuntimeError(f"output lease handoff requires stage_queue state, got {current_state!r}")
+        if current_state != "unit_queue":
+            raise RuntimeError(f"output lease handoff requires unit_queue state, got {current_state!r}")
         try:
             handed_off = get_query_resource_manager(capability_query_id).transition_output_block(
                 manager_lease_id,
@@ -4692,18 +4697,18 @@ class RayQueryDriverActor:
         query_connection: Any,
         expected_plan_id: str | None = None,
     ) -> _PreparedQueryResourceRegistration:
-        from duckdb.runners.ray.query_graph_builder import (
-            build_query_execution_graph,
+        from duckdb.runners.ray.query_resource_graph_builder import (
+            build_query_resource_graph,
         )
 
-        metadata = plan.collect_execution_stages(conn=query_connection)
-        graph = build_query_execution_graph(metadata)
+        metadata = plan.collect_query_resource_graph_metadata(conn=query_connection)
+        graph = build_query_resource_graph(metadata)
         # The session preparation step already compared the logical and
         # physical IDs. Reuse that immutable identity after handing the plan to
         # the registration thread instead of re-entering the physical wrapper.
         plan_id = str(plan.idx()) if expected_plan_id is None else str(expected_plan_id)
         if graph.query_id != plan_id:
-            raise ValueError(f"execution graph query_id mismatch: graph={graph.query_id!r} plan={plan_id!r}")
+            raise ValueError(f"resource graph query_id mismatch: graph={graph.query_id!r} plan={plan_id!r}")
         capacity_snapshot_started_at = time.monotonic()
         capacities = self._read_query_node_capacities()
         if not capacities:
@@ -4754,16 +4759,16 @@ class RayQueryDriverActor:
         *,
         deferred_teardowns: list[_DeferredQueryAllocationTeardown],
     ) -> tuple[Any, Any]:
-        from duckdb.runners.ray.query_graph_builder import build_query_demand
+        from duckdb.runners.ray.query_resource_graph_builder import build_query_demand
         from duckdb.runners.ray.query_resource_runtime import (
-            register_query_graph,
+            register_query_resource_graph,
             release_query_resource_manager,
         )
 
         graph = prepared.graph
         with self._query_resource_lock:
-            if graph.query_id in self._query_graphs:
-                raise ValueError(f"query graph is already registered: {graph.query_id}")
+            if graph.query_id in self._query_resource_graphs:
+                raise ValueError(f"query resource graph is already registered: {graph.query_id}")
             self._ensure_query_allocation_teardown_state()
             if graph.query_id in self._query_allocation_teardowns_pending:
                 raise RuntimeError(f"query {graph.query_id} still has a pending allocation-loss teardown")
@@ -4780,20 +4785,20 @@ class RayQueryDriverActor:
             manager_registered = False
             try:
                 deferred_teardowns.extend(self._synchronize_query_allocations())
-                manager = register_query_graph(
+                manager = register_query_resource_graph(
                     graph,
                     allocation,
                     reservation_ratio=float(os.environ.get("VANE_QUERY_RESOURCE_RESERVATION_RATIO", "0.5")),
                     on_change=lambda: self._signal_query_resource_change(graph.query_id),
                 )
                 manager_registered = True
-                for stage in graph.stages:
-                    manager.update_stage_state(
-                        stage.stage_id,
-                        runnable=not stage.input_stage_ids,
-                        actor_ready=stage.backend != "ray_actor",
+                for unit in graph.units:
+                    manager.update_unit_state(
+                        unit.resource_unit_id,
+                        runnable=not unit.input_unit_ids,
+                        actor_ready=unit.backend != "ray_actor",
                     )
-                self._query_graphs[graph.query_id] = graph
+                self._query_resource_graphs[graph.query_id] = graph
                 self._query_allocations[graph.query_id] = allocation
                 self._open_query_resource_admission(graph.query_id)
                 return graph, allocation
@@ -4821,10 +4826,10 @@ class RayQueryDriverActor:
                     except BaseException as exc:
                         cleanup_errors.append(exc)
                 if coordinator_released:
-                    self._query_graphs.pop(graph.query_id, None)
+                    self._query_resource_graphs.pop(graph.query_id, None)
                     self._query_allocations.pop(graph.query_id, None)
                 else:
-                    self._query_graphs[graph.query_id] = graph
+                    self._query_resource_graphs[graph.query_id] = graph
                     self._query_allocations[graph.query_id] = allocation
                 try:
                     deferred_teardowns.extend(self._synchronize_query_allocations())
@@ -4838,13 +4843,13 @@ class RayQueryDriverActor:
                     ) from registration_error
                 raise
 
-    def _mark_query_actor_stages_ready(self, graph: Any) -> None:
+    def _mark_query_actor_units_ready(self, graph: Any) -> None:
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
         manager = get_query_resource_manager(graph.query_id)
-        for stage in graph.stages:
-            if stage.backend == "ray_actor":
-                manager.set_stage_actor_ready(stage.stage_id, True)
+        for unit in graph.units:
+            if unit.backend == "ray_actor":
+                manager.set_unit_actor_ready(unit.resource_unit_id, True)
 
     def _fence_query_resource_admission_for_teardown(self, query_id: str) -> None:
         from duckdb.runners.ray.fte_fragment_scheduler import quiesce_fte_registry_for_query
@@ -4935,7 +4940,7 @@ class RayQueryDriverActor:
                         release_query_resource_manager(query_key, reason=reason)
                     except BaseException as exc:
                         cleanup_errors.append(exc)
-                    self._query_graphs.pop(query_key, None)
+                    self._query_resource_graphs.pop(query_key, None)
                     self._query_allocations.pop(query_key, None)
                 try:
                     deferred_teardowns = self._synchronize_query_allocations()
@@ -5049,15 +5054,15 @@ class RayQueryDriverActor:
         from duckdb.execution.udf_ray import prepare_actor_pools_for_plan
 
         plan_id = str(plan.idx())
-        actor_node_ids_by_stage = {
-            stage.stage_id: allocation.actor_node_ids_for_stage(stage.stage_id)
-            for stage in graph.stages
-            if stage.backend == "ray_actor"
+        actor_node_ids_by_unit = {
+            unit.resource_unit_id: allocation.actor_node_ids_for_unit(unit.resource_unit_id)
+            for unit in graph.units
+            if unit.backend == "ray_actor"
         }
         try:
             created, _ = prepare_actor_pools_for_plan(
                 plan,
-                actor_node_ids_by_stage=actor_node_ids_by_stage,
+                actor_node_ids_by_unit=actor_node_ids_by_unit,
                 query_driver_handle=self._driver_handle,
                 query_generation_capability=self._issue_query_task_admission_capability(
                     graph.query_id,
@@ -5655,7 +5660,7 @@ class RayQueryDriverActor:
             # Fragment/Pipeline topology, but its Ray-actor UDF dispatcher
             # cannot obtain a QRM lease until model initialization succeeds.
             self._wait_for_udf_actors_ready(udf_actors)
-            self._mark_query_actor_stages_ready(graph)
+            self._mark_query_actor_units_ready(graph)
         except BaseException as start_error:
             query_id = self._plan_query_ids.get(plan_id, "")
             try:
@@ -6223,7 +6228,7 @@ class RayQueryDriverActor:
                             continue
                         await task
                         pending_startup.discard(task)
-            self._mark_query_actor_stages_ready(graph)
+            self._mark_query_actor_units_ready(graph)
             # Cancellation must reach the exception path promptly so teardown
             # can interrupt a still-running native write, but it must not
             # cancel the asyncio wrapper around that thread. The exception path

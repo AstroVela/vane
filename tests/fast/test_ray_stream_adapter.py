@@ -115,7 +115,7 @@ def _lease():
     return {
         "lease_id": "lease-1",
         "query_id": "q1",
-        "stage_id": "stage:q1:node:1:udf",
+        "resource_unit_id": "resource:q1:udf:node:1",
         "task_id": "task-1",
         "attempt_id": "attempt-1",
         "actor_index": None,
@@ -202,7 +202,7 @@ def test_stream_blocks_never_exceed_duckdb_vector_size():
     target_bytes = 1024**3
     payload = {
         "query_id": "q1",
-        "stage_id": "stage:q1:node:1:udf",
+        "resource_unit_id": "resource:q1:udf:node:1",
         "task_lease_id": "lease-1",
         "attempt_id": "attempt-1",
         "udf_output_target_max_bytes": target_bytes,

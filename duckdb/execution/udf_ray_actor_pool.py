@@ -330,7 +330,7 @@ def ensure_actor_pools_for_plan(
     plan: Any,
     conn: Any = None,
     *,
-    actor_node_ids_by_stage: dict[str, tuple[str, ...]],
+    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -346,7 +346,7 @@ def ensure_actor_pools_for_plan(
     udf_nodes = plan.collect_udf_nodes(conn=conn)
     return ensure_actor_pools_for_nodes(
         udf_nodes,
-        actor_node_ids_by_stage=actor_node_ids_by_stage,
+        actor_node_ids_by_unit=actor_node_ids_by_unit,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -366,7 +366,7 @@ def prepare_actor_pools_for_plan(
     plan: Any,
     conn: Any = None,
     *,
-    actor_node_ids_by_stage: dict[str, tuple[str, ...]],
+    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -381,7 +381,7 @@ def prepare_actor_pools_for_plan(
 ) -> tuple[list[UDFActorPoolBase], dict[str, Any]]:
     """Create actors and publish immutable handles without waiting for init.
 
-    The query coordinator keeps every Ray-actor QRM stage closed until
+    The query coordinator keeps every Ray-actor resource unit closed until
     :func:`wait_for_actor_pools_ready` succeeds.  Publishing the handles first
     lets native fragment executors initialize and expose their real pipeline
     topology while expensive user-model initialization is still running.
@@ -389,7 +389,7 @@ def prepare_actor_pools_for_plan(
     udf_nodes = plan.collect_udf_nodes(conn=conn)
     return _create_actor_pools_for_nodes(
         udf_nodes,
-        actor_node_ids_by_stage=actor_node_ids_by_stage,
+        actor_node_ids_by_unit=actor_node_ids_by_unit,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -409,7 +409,7 @@ def prepare_actor_pools_for_plan(
 def ensure_actor_pools_for_nodes(
     udf_nodes: Any,
     *,
-    actor_node_ids_by_stage: dict[str, tuple[str, ...]],
+    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -425,7 +425,7 @@ def ensure_actor_pools_for_nodes(
 ) -> tuple[list[UDFActorPoolBase], dict[str, Any]]:
     return _create_actor_pools_for_nodes(
         udf_nodes,
-        actor_node_ids_by_stage=actor_node_ids_by_stage,
+        actor_node_ids_by_unit=actor_node_ids_by_unit,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -445,7 +445,7 @@ def ensure_actor_pools_for_nodes(
 def _create_actor_pools_for_nodes(
     udf_nodes: Any,
     *,
-    actor_node_ids_by_stage: dict[str, tuple[str, ...]],
+    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -504,15 +504,15 @@ def _create_actor_pools_for_nodes(
             if not requires_actor_pool_fn(payload):
                 continue
 
-            stage_id = str(payload.get("stage_id") or "").strip()
-            if not stage_id:
-                raise RuntimeError(f"Ray actor UDF node {node_id} is missing stage_id")
+            resource_unit_id = str(payload.get("resource_unit_id") or "").strip()
+            if not resource_unit_id:
+                raise RuntimeError(f"Ray actor UDF node {node_id} is missing resource_unit_id")
             concurrency = required_positive_int(node, "actor_pool_size")
             _validate_stateful_actor_pool_contract(payload, concurrency)
-            assigned_node_ids = tuple(actor_node_ids_by_stage.get(stage_id, ()))
+            assigned_node_ids = tuple(actor_node_ids_by_unit.get(resource_unit_id, ()))
             if len(assigned_node_ids) != concurrency:
                 raise RuntimeError(
-                    f"Ray actor UDF stage {stage_id} requires {concurrency} coordinator placements, "
+                    f"Ray actor UDF resource unit {resource_unit_id} requires {concurrency} coordinator placements, "
                     f"got {len(assigned_node_ids)}"
                 )
             cpus = resolve_actor_num_cpus(payload)

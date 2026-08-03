@@ -106,7 +106,7 @@ def _query_task_lease_heap_bytes(
         "lease_id": str(lease.get("lease_id") or "").strip(),
         "query_id": str(lease.get("query_id") or "").strip(),
         "execution_query_id": str(lease.get("execution_query_id") or "").strip(),
-        "stage_id": str(lease.get("stage_id") or "").strip(),
+        "resource_unit_id": str(lease.get("resource_unit_id") or "").strip(),
         "attempt_id": str(lease.get("attempt_id") or "").strip(),
     }
     missing = [name for name, value in required_identity.items() if not value]

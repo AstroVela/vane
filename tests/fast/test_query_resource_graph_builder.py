@@ -4,13 +4,13 @@
 import pytest
 
 from duckdb.runners.ray.cluster_resource_coordinator import ActorResourceBundle
-from duckdb.runners.ray.query_execution_graph import ResourceVector
-from duckdb.runners.ray.query_graph_builder import (
+from duckdb.runners.ray.query_resource_graph import ResourceVector
+from duckdb.runners.ray.query_resource_graph_builder import (
     build_query_demand,
-    build_query_execution_graph,
-    fte_stage_id_for_fragment,
-    fte_stage_id_for_node,
-    udf_stage_id_for_node,
+    build_query_resource_graph,
+    native_fragment_unit_id_for_fragment,
+    native_fragment_unit_id_for_node,
+    udf_unit_id_for_node,
 )
 
 GIB = 1024**3
@@ -40,7 +40,7 @@ def _metadata():
                 "num_partitions": 36,
                 "udf_payload": {
                     "execution_backend": "ray_task",
-                    "stage_id": udf_stage_id_for_node(query_id, "2"),
+                    "resource_unit_id": udf_unit_id_for_node(query_id, "2"),
                     "cpus": 1.0,
                     "gpus": 0.0,
                     "memory_bytes": 1536 * MIB,
@@ -57,7 +57,7 @@ def _metadata():
                 "num_partitions": 1,
                 "udf_payload": {
                     "execution_backend": "ray_actor",
-                    "stage_id": udf_stage_id_for_node(query_id, "3"),
+                    "resource_unit_id": udf_unit_id_for_node(query_id, "3"),
                     "cpus": 1.0,
                     "gpus": 1.0,
                     "memory_bytes": 3 * GIB,
@@ -80,22 +80,22 @@ def _metadata():
     }
 
 
-def test_builder_registers_complete_pipeline_and_nested_udf_stages_before_execution():
-    graph = build_query_execution_graph(_metadata(), env={})
+def test_builder_registers_complete_pipeline_and_nested_resource_units_before_execution():
+    graph = build_query_resource_graph(_metadata(), env={})
 
     assert graph.query_id == "query-7"
     assert graph.plan_digest.startswith("sha256:")
-    assert len(graph.stages) == 6
-    assert graph.topological_stage_ids() == (
-        fte_stage_id_for_node("query-7", "1"),
-        fte_stage_id_for_node("query-7", "2"),
-        udf_stage_id_for_node("query-7", "2"),
-        fte_stage_id_for_node("query-7", "3"),
-        udf_stage_id_for_node("query-7", "3"),
-        fte_stage_id_for_node("query-7", "4"),
+    assert len(graph.units) == 6
+    assert graph.topological_unit_ids() == (
+        native_fragment_unit_id_for_node("query-7", "1"),
+        native_fragment_unit_id_for_node("query-7", "2"),
+        udf_unit_id_for_node("query-7", "2"),
+        native_fragment_unit_id_for_node("query-7", "3"),
+        udf_unit_id_for_node("query-7", "3"),
+        native_fragment_unit_id_for_node("query-7", "4"),
     )
-    assert graph.terminal_stage_ids == (fte_stage_id_for_node("query-7", "4"),)
-    assert graph.stage_by_id(fte_stage_id_for_node("query-7", "4")).spill_mode == "barrier"
+    assert graph.terminal_unit_ids == (native_fragment_unit_id_for_node("query-7", "4"),)
+    assert graph.unit_by_id(native_fragment_unit_id_for_node("query-7", "4")).is_barrier
 
 
 def test_builder_uses_native_materialization_metadata_instead_of_sink_shape():
@@ -103,20 +103,20 @@ def test_builder_uses_native_materialization_metadata_instead_of_sink_shape():
     metadata["nodes"][1]["is_blocking_materializing"] = True
     metadata["nodes"][3]["is_blocking_materializing"] = False
 
-    graph = build_query_execution_graph(metadata, env={})
+    graph = build_query_resource_graph(metadata, env={})
 
-    assert graph.stage_by_id(fte_stage_id_for_node("query-7", "2")).spill_mode == "barrier"
-    assert graph.stage_by_id(fte_stage_id_for_node("query-7", "4")).spill_mode == "streaming"
+    assert graph.unit_by_id(native_fragment_unit_id_for_node("query-7", "2")).is_barrier
+    assert not graph.unit_by_id(native_fragment_unit_id_for_node("query-7", "4")).is_barrier
 
 
 def test_builder_counts_each_nested_ray_process_and_never_uses_zero_heap():
-    graph = build_query_execution_graph(_metadata(), env={})
-    cpu_udf = graph.stage_by_id(udf_stage_id_for_node("query-7", "2"))
-    gpu_udf = graph.stage_by_id(udf_stage_id_for_node("query-7", "3"))
-    scan = graph.stage_by_id(fte_stage_id_for_node("query-7", "1"))
-    cpu_udf_parent = graph.stage_by_id(fte_stage_id_for_node("query-7", "2"))
-    gpu_udf_parent = graph.stage_by_id(fte_stage_id_for_node("query-7", "3"))
-    native_sink = graph.stage_by_id(fte_stage_id_for_node("query-7", "4"))
+    graph = build_query_resource_graph(_metadata(), env={})
+    cpu_udf = graph.unit_by_id(udf_unit_id_for_node("query-7", "2"))
+    gpu_udf = graph.unit_by_id(udf_unit_id_for_node("query-7", "3"))
+    scan = graph.unit_by_id(native_fragment_unit_id_for_node("query-7", "1"))
+    cpu_udf_parent = graph.unit_by_id(native_fragment_unit_id_for_node("query-7", "2"))
+    gpu_udf_parent = graph.unit_by_id(native_fragment_unit_id_for_node("query-7", "3"))
+    native_sink = graph.unit_by_id(native_fragment_unit_id_for_node("query-7", "4"))
 
     assert scan.backend == "ray_worker"
     # Node 1 is the task-producing feeder immediately before the remote UDF.
@@ -136,31 +136,31 @@ def test_builder_counts_each_nested_ray_process_and_never_uses_zero_heap():
 
 
 def test_builder_configures_stateless_actor_prefetch_and_disables_it_for_stateful_udfs():
-    configured = build_query_execution_graph(
+    configured = build_query_resource_graph(
         _metadata(),
         env={"VANE_RAY_ACTOR_PREFETCH_DEPTH": "3"},
     )
-    assert configured.stage_by_id(udf_stage_id_for_node("query-7", "3")).actor_prefetch_depth == 3
+    assert configured.unit_by_id(udf_unit_id_for_node("query-7", "3")).actor_prefetch_depth == 3
 
     stateful_metadata = _metadata()
     stateful_metadata["nodes"][2]["udf_payload"]["stateful"] = True
-    stateful = build_query_execution_graph(
+    stateful = build_query_resource_graph(
         stateful_metadata,
         env={"VANE_RAY_ACTOR_PREFETCH_DEPTH": "3"},
     )
-    assert stateful.stage_by_id(udf_stage_id_for_node("query-7", "3")).actor_prefetch_depth == 1
+    assert stateful.unit_by_id(udf_unit_id_for_node("query-7", "3")).actor_prefetch_depth == 1
 
     with pytest.raises(ValueError, match="VANE_RAY_ACTOR_PREFETCH_DEPTH"):
-        build_query_execution_graph(
+        build_query_resource_graph(
             _metadata(),
             env={"VANE_RAY_ACTOR_PREFETCH_DEPTH": "0"},
         )
 
 
-def test_builder_uses_two_logical_output_blocks_for_all_streaming_stages():
-    graph = build_query_execution_graph(_metadata(), env={})
-    cpu_udf = graph.stage_by_id(udf_stage_id_for_node("query-7", "2"))
-    gpu_udf = graph.stage_by_id(udf_stage_id_for_node("query-7", "3"))
+def test_builder_uses_two_logical_output_blocks_for_all_streaming_units():
+    graph = build_query_resource_graph(_metadata(), env={})
+    cpu_udf = graph.unit_by_id(udf_unit_id_for_node("query-7", "2"))
+    gpu_udf = graph.unit_by_id(udf_unit_id_for_node("query-7", "3"))
 
     assert cpu_udf.target_output_block_bytes == 64 * MIB
     assert cpu_udf.generator_buffer_blocks == 2
@@ -176,8 +176,8 @@ def test_builder_sizes_upstream_retention_window_for_downstream_compute_batch():
     producer["udf_output_target_max_bytes"] = 1024
     consumer["udf_task_input_max_bytes"] = 64 * 1024
 
-    graph = build_query_execution_graph(metadata, env={})
-    cpu_udf = graph.stage_by_id(udf_stage_id_for_node("query-7", "2"))
+    graph = build_query_resource_graph(metadata, env={})
+    cpu_udf = graph.unit_by_id(udf_unit_id_for_node("query-7", "2"))
 
     assert cpu_udf.target_output_block_bytes == 1024
     assert cpu_udf.generator_buffer_blocks == 64
@@ -189,36 +189,36 @@ def test_builder_defaults_are_new_positive_production_limits_not_host_memory():
     del metadata["nodes"][1]["udf_payload"]["memory_bytes"]
     del metadata["nodes"][2]["udf_payload"]["memory_bytes"]
 
-    graph = build_query_execution_graph(metadata, env={})
+    graph = build_query_resource_graph(metadata, env={})
 
-    assert graph.stage_by_id(udf_stage_id_for_node("query-7", "2")).per_task.heap_bytes == 2 * GIB
-    assert graph.stage_by_id(udf_stage_id_for_node("query-7", "3")).resident_per_actor.heap_bytes == 4 * GIB
+    assert graph.unit_by_id(udf_unit_id_for_node("query-7", "2")).per_task.heap_bytes == 2 * GIB
+    assert graph.unit_by_id(udf_unit_id_for_node("query-7", "3")).resident_per_actor.heap_bytes == 4 * GIB
 
 
 def test_builder_accepts_only_positive_new_resource_configuration():
-    with pytest.raises(ValueError, match="VANE_FTE_TASK_HEAP_BYTES"):
-        build_query_execution_graph(_metadata(), env={"VANE_FTE_TASK_HEAP_BYTES": "0"})
-    with pytest.raises(ValueError, match="VANE_FTE_UDF_DRIVER_HEAP_BYTES"):
-        build_query_execution_graph(
+    with pytest.raises(ValueError, match="VANE_NATIVE_FRAGMENT_TASK_HEAP_BYTES"):
+        build_query_resource_graph(_metadata(), env={"VANE_NATIVE_FRAGMENT_TASK_HEAP_BYTES": "0"})
+    with pytest.raises(ValueError, match="VANE_NATIVE_FRAGMENT_UDF_DRIVER_HEAP_BYTES"):
+        build_query_resource_graph(
             _metadata(),
-            env={"VANE_FTE_UDF_DRIVER_HEAP_BYTES": "0"},
+            env={"VANE_NATIVE_FRAGMENT_UDF_DRIVER_HEAP_BYTES": "0"},
         )
     with pytest.raises(ValueError, match="memory_bytes"):
         metadata = _metadata()
         metadata["nodes"][1]["udf_payload"]["memory_bytes"] = 0
-        build_query_execution_graph(metadata, env={})
+        build_query_resource_graph(metadata, env={})
 
 
-def test_builder_rejects_missing_or_mismatched_preannotated_udf_stage_identity():
+def test_builder_rejects_missing_or_mismatched_preannotated_udf_resource_unit_identity():
     missing = _metadata()
-    missing["nodes"][1]["udf_payload"].pop("stage_id")
-    with pytest.raises(ValueError, match="missing pre-registered stage_id"):
-        build_query_execution_graph(missing, env={})
+    missing["nodes"][1]["udf_payload"].pop("resource_unit_id")
+    with pytest.raises(ValueError, match="missing pre-registered resource_unit_id"):
+        build_query_resource_graph(missing, env={})
 
     mismatch = _metadata()
-    mismatch["nodes"][1]["udf_payload"]["stage_id"] = "stage:legacy:operator"
-    with pytest.raises(ValueError, match="stage_id mismatch"):
-        build_query_execution_graph(mismatch, env={})
+    mismatch["nodes"][1]["udf_payload"]["resource_unit_id"] = "resource:legacy:operator"
+    with pytest.raises(ValueError, match="resource_unit_id mismatch"):
+        build_query_resource_graph(mismatch, env={})
 
 
 @pytest.mark.parametrize(
@@ -235,7 +235,7 @@ def test_builder_rejects_incomplete_or_legacy_metadata(mutation, message):
     mutation(metadata)
 
     with pytest.raises(ValueError, match=message):
-        build_query_execution_graph(metadata, env={})
+        build_query_resource_graph(metadata, env={})
 
 
 def test_plan_digest_is_stable_for_node_order_but_changes_with_resources():
@@ -245,16 +245,16 @@ def test_plan_digest_is_stable_for_node_order_but_changes_with_resources():
     changed = _metadata()
     changed["nodes"][1]["udf_payload"]["memory_bytes"] += 1
 
-    graph_a = build_query_execution_graph(first, env={})
-    graph_b = build_query_execution_graph(reordered, env={})
-    graph_c = build_query_execution_graph(changed, env={})
+    graph_a = build_query_resource_graph(first, env={})
+    graph_b = build_query_resource_graph(reordered, env={})
+    graph_c = build_query_resource_graph(changed, env={})
 
     assert graph_a.plan_digest == graph_b.plan_digest
     assert graph_a.plan_digest != graph_c.plan_digest
 
 
-def test_query_demand_reserves_hard_actor_pool_and_downstream_fte_progress_slot():
-    graph = build_query_execution_graph(_metadata(), env={})
+def test_query_demand_reserves_hard_actor_pool_and_downstream_native_fragment_progress_slot():
+    graph = build_query_resource_graph(_metadata(), env={})
     cluster = ResourceVector(cpu=64, gpu=4, heap_bytes=64 * GIB, object_store_bytes=64 * GIB)
 
     demand = build_query_demand(graph, cluster)
@@ -268,7 +268,7 @@ def test_query_demand_reserves_hard_actor_pool_and_downstream_fte_progress_slot(
     )
     assert demand.actor_bundles == (
         ActorResourceBundle(
-            stage_id="stage:query-7:node:3:udf",
+            resource_unit_id="resource:query-7:udf:node:3",
             actor_index=0,
             resources=ResourceVector(
                 cpu=1,
@@ -292,7 +292,7 @@ def test_query_demand_reserves_hard_actor_pool_and_downstream_fte_progress_slot(
 def test_query_demand_treats_pipeline_windows_as_soft_budget_regression_issue_38():
     metadata = _metadata()
     metadata["nodes"][2]["udf_payload"]["actor_pool_size"] = 2
-    graph = build_query_execution_graph(metadata, env={})
+    graph = build_query_resource_graph(metadata, env={})
     cluster = ResourceVector(
         cpu=64,
         gpu=4,
@@ -311,7 +311,7 @@ def test_query_demand_treats_pipeline_windows_as_soft_budget_regression_issue_38
 def test_query_demand_reserves_gpu_ray_task_as_an_indivisible_task_bundle():
     metadata = _metadata()
     metadata["nodes"][1]["udf_payload"]["gpus"] = 1.0
-    graph = build_query_execution_graph(metadata, env={})
+    graph = build_query_resource_graph(metadata, env={})
     cluster = ResourceVector(cpu=64, gpu=4, heap_bytes=64 * GIB, object_store_bytes=64 * GIB)
 
     demand = build_query_demand(graph, cluster)
@@ -327,22 +327,24 @@ def test_query_demand_reserves_every_fractional_gpu_actor_in_fixed_pool():
     actor_payload = metadata["nodes"][2]["udf_payload"]
     actor_payload["actor_pool_size"] = 3
     actor_payload["gpus"] = 0.25
-    graph = build_query_execution_graph(metadata, env={})
+    graph = build_query_resource_graph(metadata, env={})
     cluster = ResourceVector(cpu=64, gpu=4, heap_bytes=64 * GIB, object_store_bytes=64 * GIB)
 
     demand = build_query_demand(graph, cluster)
-    actor_stage = graph.stage_by_id(udf_stage_id_for_node("query-7", "3"))
+    actor_unit = graph.unit_by_id(udf_unit_id_for_node("query-7", "3"))
 
-    assert actor_stage.actor_pool_size == 3
+    assert actor_unit.actor_pool_size == 3
     assert [bundle.actor_index for bundle in demand.actor_bundles] == [0, 1, 2]
     assert all(bundle.resources.gpu == 0.25 for bundle in demand.actor_bundles)
     assert demand.minimum.gpu == 0.75
     assert demand.desired.gpu == demand.minimum.gpu
 
 
-def test_fragment_identity_maps_directly_to_pre_registered_fte_stage():
-    assert fte_stage_id_for_fragment("query-7", "query-7:node:12") == fte_stage_id_for_node("query-7", "12")
+def test_fragment_identity_maps_directly_to_pre_registered_native_fragment_unit():
+    assert native_fragment_unit_id_for_fragment("query-7", "query-7:node:12") == native_fragment_unit_id_for_node(
+        "query-7", "12"
+    )
     with pytest.raises(ValueError, match="does not belong to query"):
-        fte_stage_id_for_fragment("query-7", "other:node:12")
-    with pytest.raises(ValueError, match="invalid FTE fragment_id"):
-        fte_stage_id_for_fragment("query-7", "query-7:task:12")
+        native_fragment_unit_id_for_fragment("query-7", "other:node:12")
+    with pytest.raises(ValueError, match="invalid native fragment_id"):
+        native_fragment_unit_id_for_fragment("query-7", "query-7:task:12")

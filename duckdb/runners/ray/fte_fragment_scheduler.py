@@ -72,13 +72,13 @@ from duckdb.runners.ray.fragment_registry import (
     _FTE_QUERY_NEXT_FRAGMENT_EXECUTION_ID,
     _FTE_REGISTRY_CONDITION,
     _FTE_REGISTRY_LOCK,
+    _FTE_RESOURCE_UNIT_SUBMISSION_BLOCKS,
+    _FTE_RESOURCE_UNIT_SUBMISSION_PROBES,
     _FTE_RESULT_HANDLES_BY_QUERY,
     _FTE_RETRY_DELAYS,
     _FTE_SCHEDULERS,
     _FTE_SEQUENCES,
     _FTE_STABLE_TASK_IDENTITY_KEYS_BY_RESOURCE_QUERY,
-    _FTE_STAGE_SUBMISSION_BLOCKS,
-    _FTE_STAGE_SUBMISSION_PROBES,
     _FTE_STATUS_WATCHERS,
     _FTE_WORKER_HANDLES,
     _FTE_WORKER_RESERVATION_GENERATIONS,
@@ -661,12 +661,16 @@ def open_fte_registry_for_query(query_id: str) -> None:
                 ("partition_task_leases", any(key[0] == query_key for key in _FTE_PARTITION_TASK_LEASES)),
                 ("partition_task_waiters", any(key[0] == query_key for key in _FTE_PARTITION_TASK_WAITERS)),
                 (
-                    "stage_submission_probes",
-                    any(partition_key[0] == query_key for partition_key in _FTE_STAGE_SUBMISSION_PROBES.values()),
+                    "resource_unit_submission_probes",
+                    any(
+                        partition_key[0] == query_key for partition_key in _FTE_RESOURCE_UNIT_SUBMISSION_PROBES.values()
+                    ),
                 ),
                 (
-                    "stage_submission_blocks",
-                    any(stage_key[0] == query_key for stage_key in _FTE_STAGE_SUBMISSION_BLOCKS),
+                    "resource_unit_submission_blocks",
+                    any(
+                        resource_unit_key[0] == query_key for resource_unit_key in _FTE_RESOURCE_UNIT_SUBMISSION_BLOCKS
+                    ),
                 ),
                 ("pending_worker_reservations", any(key[0] == query_key for key in _FTE_PENDING_WORKER_RESERVATIONS)),
                 (
@@ -943,7 +947,7 @@ def _fte_execution_queries_waiting_for_resource(
         if scheduler is None or scheduler.stats().state != "RUNNING":
             continue
         try:
-            owner_query_id, _stage_id = resource_identity_from_context(fragment_execution.context)
+            owner_query_id, _resource_unit_id = resource_identity_from_context(fragment_execution.context)
             if owner_query_id != resource_query_key:
                 continue
             has_pending_partitions = fragment_execution.has_pending_partitions()
@@ -1154,20 +1158,20 @@ def _write_sink_has_input(fragment_execution: Any) -> tuple[bool, bool]:
     return False, all_terminal
 
 
-def _sync_write_sink_stage_for_fragment(fragment_execution: Any) -> str | None:
+def _sync_write_sink_unit_for_fragment(fragment_execution: Any) -> str | None:
     from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
     with fragment_execution._state_lock:
         if not _is_write_sink_fragment(fragment_execution):
             return None
-        resource_query_id, stage_id = resource_identity_from_context(fragment_execution.context)
+        resource_query_id, resource_unit_id = resource_identity_from_context(fragment_execution.context)
         has_input, all_terminal = _write_sink_has_input(fragment_execution)
-    get_query_resource_manager(resource_query_id).update_stage_state(
-        stage_id,
+    get_query_resource_manager(resource_query_id).update_unit_state(
+        resource_unit_id,
         runnable=has_input,
         completed=all_terminal,
     )
-    return stage_id
+    return resource_unit_id
 
 
 def _fte_partition_resource_key(query_id: str, fragment_id: str, partition_id: int) -> tuple[str, str, int]:
@@ -1247,7 +1251,7 @@ def _acquire_fte_partition_task_lease(
     with _FTE_REGISTRY_LOCK:
         if str(query_id) in _FTE_CLOSING_QUERIES:
             raise RuntimeError(f"FTE query registry is closing: {query_id}")
-    resource_query_id, stage_id = _fte_fragment_resource_identity(
+    resource_query_id, resource_unit_id = _fte_fragment_resource_identity(
         query_id,
         fragment_id,
     )
@@ -1279,7 +1283,7 @@ def _acquire_fte_partition_task_lease(
     manager = get_query_resource_manager(resource_query_id)
     request = TaskRequest(
         query_id=resource_query_id,
-        stage_id=stage_id,
+        resource_unit_id=resource_unit_id,
         task_id=task_id,
         attempt_id=attempt_id,
         node_id=str(node_id),
@@ -1298,6 +1302,9 @@ def _acquire_fte_partition_task_lease(
         )
         raise
     if grant.granted:
+        lease = grant.lease
+        if lease is None:
+            raise RuntimeError("QRM granted an FTE task without returning its lease")
         resolve_fte_partition_submission(
             query_id,
             fragment_id,
@@ -1308,11 +1315,11 @@ def _acquire_fte_partition_task_lease(
             query_closing = str(query_id) in _FTE_CLOSING_QUERIES
         if query_closing:
             manager.abandon_task_lease(
-                grant.lease.lease_id,
-                attempt_id=grant.lease.attempt_id,
+                lease.lease_id,
+                attempt_id=lease.attempt_id,
             )
             raise RuntimeError(f"FTE query registry is closing: {query_id}")
-        return grant.lease
+        return lease
     _set_fte_pending_reservation_blocked_reason(
         query_id,
         fragment_id,
@@ -1429,18 +1436,18 @@ def fte_partition_task_lease_payload(
         raise RuntimeError(f"FTE task lease attempt mismatch: lease={lease.attempt_id} command={actual_attempt_id}")
     from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
-    stage = get_query_resource_manager(lease.query_id).graph.stage_by_id(lease.stage_id)
+    unit = get_query_resource_manager(lease.query_id).graph.unit_by_id(lease.resource_unit_id)
     return {
         "lease_id": lease.lease_id,
         "query_id": lease.query_id,
         "execution_query_id": str(query_id),
-        "stage_id": lease.stage_id,
+        "resource_unit_id": lease.resource_unit_id,
         "task_id": lease.task_id,
         "attempt_id": lease.attempt_id,
         "node_id": lease.node_id,
         "resources": lease.resources.to_dict(),
         "output_window_bytes": lease.output_window_bytes,
-        "target_output_block_bytes": stage.target_output_block_bytes,
+        "target_output_block_bytes": unit.target_output_block_bytes,
         "liveness": lease.liveness,
         "allocation_generation": lease.allocation_generation,
     }
@@ -1731,7 +1738,7 @@ def _admit_fte_partition_execution_ready(
     partition: Any,
 ) -> bool:
     if fragment_execution is not None:
-        _sync_write_sink_stage_for_fragment(fragment_execution)
+        _sync_write_sink_unit_for_fragment(fragment_execution)
     if fragment_execution is None:
         return False
     return admit_fte_partition_submission(
@@ -1747,7 +1754,7 @@ def _admit_fte_partition_node_wait(
     fragment_execution: FteFragmentExecution | None = None,
 ) -> bool:
     if fragment_execution is not None:
-        _sync_write_sink_stage_for_fragment(fragment_execution)
+        _sync_write_sink_unit_for_fragment(fragment_execution)
     with _FTE_REGISTRY_LOCK:
         fragment_execution_items = [
             item for item in _FTE_FRAGMENT_EXECUTIONS.items() if item[0][0] not in _FTE_CLOSING_QUERIES
@@ -1777,7 +1784,7 @@ class FteWorkerReservation:
         fragment_id: str,
         partition_id: int,
         worker: RayWorkerActorHandle,
-        stage_id: str,
+        resource_unit_id: str,
         task_lease_id: str,
         attempt_id: str,
     ) -> None:
@@ -1787,7 +1794,7 @@ class FteWorkerReservation:
         self.partition_id = int(partition_id)
         self.worker = worker
         self.worker_id = str(worker.worker_id)
-        self.stage_id = str(stage_id)
+        self.resource_unit_id = str(resource_unit_id)
         self.task_lease_id = str(task_lease_id)
         self.attempt_id = str(attempt_id)
 
@@ -2001,13 +2008,13 @@ class FteWorkerPlacementManager:
         fragment_execution_id = _fte_partition_fragment_execution_id(query_id, fragment_id, partition_id)
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
-        resource_query_id, stage_id = _fte_fragment_resource_identity(
+        resource_query_id, resource_unit_id = _fte_fragment_resource_identity(
             query_id,
             fragment_id,
         )
-        eligible_node_ids = set(get_query_resource_manager(resource_query_id).task_eligible_node_ids(stage_id))
+        eligible_node_ids = set(get_query_resource_manager(resource_query_id).task_eligible_node_ids(resource_unit_id))
         if not eligible_node_ids:
-            raise RuntimeError(f"FTE stage {stage_id} has no feasible node in its query allocation")
+            raise RuntimeError(f"FTE resource unit {resource_unit_id} has no feasible node in its query allocation")
         with _FTE_REGISTRY_LOCK:
             if query_id in _FTE_CLOSING_QUERIES:
                 raise RuntimeError(f"FTE query registry is closing: {query_id}")
@@ -2088,7 +2095,7 @@ class FteWorkerPlacementManager:
                     live_worker_node_ids = {str(worker.node_id) for worker in available_workers}
                     if eligible_node_ids.isdisjoint(live_worker_node_ids):
                         raise RuntimeError(
-                            f"FTE stage {stage_id} allocation has no live Ray worker: "
+                            f"FTE resource unit {resource_unit_id} allocation has no live Ray worker: "
                             f"allocated_nodes={sorted(eligible_node_ids)} "
                             f"worker_nodes={sorted(live_worker_node_ids)}"
                         )
@@ -2151,7 +2158,7 @@ class FteWorkerPlacementManager:
             fragment_id=fragment_id,
             partition_id=partition_id,
             worker=owner,
-            stage_id=task_lease.stage_id,
+            resource_unit_id=task_lease.resource_unit_id,
             task_lease_id=task_lease.lease_id,
             attempt_id=task_lease.attempt_id,
         )
@@ -2181,12 +2188,12 @@ class FteWorkerPlacementManager:
             owner = _FTE_PARTITION_OWNERS.pop(owner_key, None)
             lease_record = _FTE_PARTITION_TASK_LEASES.pop(owner_key, None)
             waiter_identity = _FTE_PARTITION_TASK_WAITERS.pop(owner_key, None)
-            for stage_key, partition_key in list(_FTE_STAGE_SUBMISSION_PROBES.items()):
+            for resource_unit_key, partition_key in list(_FTE_RESOURCE_UNIT_SUBMISSION_PROBES.items()):
                 if partition_key == owner_key:
-                    _FTE_STAGE_SUBMISSION_PROBES.pop(stage_key, None)
-            for stage_key, blocked in list(_FTE_STAGE_SUBMISSION_BLOCKS.items()):
+                    _FTE_RESOURCE_UNIT_SUBMISSION_PROBES.pop(resource_unit_key, None)
+            for resource_unit_key, blocked in list(_FTE_RESOURCE_UNIT_SUBMISSION_BLOCKS.items()):
                 if blocked[2] == owner_key:
-                    _FTE_STAGE_SUBMISSION_BLOCKS.pop(stage_key, None)
+                    _FTE_RESOURCE_UNIT_SUBMISSION_BLOCKS.pop(resource_unit_key, None)
             if terminal is None and lease_record is not None:
                 fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get((query_id, fragment_id))
         if terminal is None and lease_record is not None:
@@ -2650,7 +2657,7 @@ def _mark_fte_worker_failed(
     for future in pending_worker_reservation_futures_to_cancel:
         future.cancel()
 
-    scheduled_by_stage: list[tuple[str, str, list[Any], list[Any]]] = []
+    scheduled_fragment_batches: list[tuple[str, str, list[Any], list[Any]]] = []
     delayed_query_ids: set[str] = set()
     for (query_id, fragment_id), fragment_execution in fragment_execution_items:
         retryable_by_partition_id = {
@@ -2679,8 +2686,8 @@ def _mark_fte_worker_failed(
                 schedule_retries=False,
             )
             if scheduled:
-                scheduled_by_stage.append((query_id, fragment_id, scheduled, []))
-    return scheduled_by_stage
+                scheduled_fragment_batches.append((query_id, fragment_id, scheduled, []))
+    return scheduled_fragment_batches
 
 
 def _collect_vane_env_overrides() -> dict[str, str]:
@@ -2753,7 +2760,7 @@ def _fte_partition_metrics(
         "pending_worker_reservation_blocked_reason": (
             "" if pending_reservation is None else str(pending_reservation.blocked_reason)
         ),
-        "resource_stage_id": None if task_lease is None else task_lease.stage_id,
+        "resource_unit_id": None if task_lease is None else task_lease.resource_unit_id,
         "task_lease_id": None if task_lease is None else task_lease.lease_id,
         "task_lease_active": task_lease is not None,
         "running_attempts": [
@@ -3153,8 +3160,8 @@ def fte_registry_stats() -> dict[str, Any]:
             "pending_worker_reservation_count": len(_FTE_PENDING_WORKER_RESERVATIONS),
             "partition_task_lease_count": len(_FTE_PARTITION_TASK_LEASES),
             "partition_task_waiter_count": len(_FTE_PARTITION_TASK_WAITERS),
-            "stage_submission_probe_count": len(_FTE_STAGE_SUBMISSION_PROBES),
-            "stage_submission_block_count": len(_FTE_STAGE_SUBMISSION_BLOCKS),
+            "resource_unit_submission_probe_count": len(_FTE_RESOURCE_UNIT_SUBMISSION_PROBES),
+            "resource_unit_submission_block_count": len(_FTE_RESOURCE_UNIT_SUBMISSION_BLOCKS),
             "pending_worker_reservation_done_count": sum(
                 1 for future in _FTE_PENDING_WORKER_RESERVATIONS.values() if future.done()
             ),

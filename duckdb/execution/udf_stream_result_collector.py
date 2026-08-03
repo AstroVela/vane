@@ -1986,7 +1986,7 @@ class UDFStreamResultCollector:
             raise RuntimeError(
                 "Ray UDF block exceeds downstream item capacity: "
                 f"query={validated['query_id']} "
-                f"stage={validated['producer_stage_id']} "
+                f"resource_unit={validated['producer_unit_id']} "
                 f"task_lease={validated['task_lease_id']} "
                 f"block={validated['block_id']} "
                 f"size_bytes={validated['size_bytes']} "
@@ -1999,7 +1999,7 @@ class UDFStreamResultCollector:
         request = {
             "request_id": request_id,
             "query_id": validated["query_id"],
-            "producer_stage_id": validated["producer_stage_id"],
+            "producer_unit_id": validated["producer_unit_id"],
             "task_lease_id": validated["task_lease_id"],
             "attempt_id": validated["attempt_id"],
             "block_id": validated["block_id"],
@@ -2115,7 +2115,7 @@ class UDFStreamResultCollector:
             raise RuntimeError("Ray UDF stream metadata arrived before task lease admission")
         expected = {
             "query_id": str(lease["query_id"]),
-            "producer_stage_id": str(lease["stage_id"]),
+            "producer_unit_id": str(lease["resource_unit_id"]),
             "task_lease_id": str(lease["lease_id"]),
             "attempt_id": str(lease["attempt_id"]),
         }
@@ -2150,7 +2150,7 @@ class UDFStreamResultCollector:
         )
         descriptor = {
             "query_id": metadata["query_id"],
-            "producer_stage_id": metadata["producer_stage_id"],
+            "producer_unit_id": metadata["producer_unit_id"],
             "task_lease_id": metadata["task_lease_id"],
             "attempt_id": metadata["attempt_id"],
             "block_id": metadata["block_id"],

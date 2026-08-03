@@ -343,14 +343,14 @@ def test_actor_gpu_reservation_follows_resolved_backend(
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
     monkeypatch.setattr(udf_ray, "_is_vane_worker_process", lambda: False)
     monkeypatch.setattr(udf_ray, "UDFActorPool", FakeRayPool)
-    stage_id = f"stage:test:gpu-order:{decorator_runner}:{resolved_runner}"
-    payload["stage_id"] = stage_id
+    resource_unit_id = f"resource:test:gpu-order:{decorator_runner}:{resolved_runner}"
+    payload["resource_unit_id"] = resource_unit_id
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
         pools, _ = udf_ray.ensure_actor_pools_for_nodes(
             nodes,
-            actor_node_ids_by_stage={stage_id: ("node-a",)},
+            actor_node_ids_by_unit={resource_unit_id: ("node-a",)},
             query_driver_handle=object(),
             query_generation_capability="test-query-generation-capability",
             session_config={},
@@ -458,11 +458,11 @@ def test_stateless_ray_actor_pool_size_and_gpu_options_follow_physical_payload(m
     monkeypatch.setattr(udf_ray, "_is_vane_worker_process", lambda: False)
     monkeypatch.setattr(udf_ray, "UDFActorPool", FakeRayPool)
 
-    stage_id = "stage:test:stateless-three-actor"
-    nodes[0]["payload"]["stage_id"] = stage_id
+    resource_unit_id = "resource:test:stateless-three-actor"
+    nodes[0]["payload"]["resource_unit_id"] = resource_unit_id
     pools, _ = udf_ray.ensure_actor_pools_for_nodes(
         nodes,
-        actor_node_ids_by_stage={stage_id: ("node-a", "node-a", "node-a")},
+        actor_node_ids_by_unit={resource_unit_id: ("node-a", "node-a", "node-a")},
         query_driver_handle=object(),
         query_generation_capability="test-query-generation-capability",
         session_config={},

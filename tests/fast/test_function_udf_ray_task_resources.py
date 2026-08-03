@@ -18,7 +18,7 @@ def _distributed_payload(**overrides):
     payload = {
         "execution_backend": "ray_task",
         "query_id": "q1",
-        "stage_id": "stage:q1:node:1:udf",
+        "resource_unit_id": "resource:q1:udf:node:1",
         "node_id": _NODE_ID,
         "produce_ray_block_stream": True,
         "call_mode": "map_batches",
@@ -82,10 +82,10 @@ def test_task_payload_accepts_registered_downstream_retention_window_multiple():
     lease = {
         "lease_id": "lease-retention",
         "query_id": payload["query_id"],
-        "stage_id": payload["stage_id"],
+        "resource_unit_id": payload["resource_unit_id"],
         "attempt_id": "attempt-retention",
         "node_id": _NODE_ID,
-        "execution_slot_id": f"ray_task:{payload['stage_id']}:lease-retention",
+        "execution_slot_id": f"ray_task:{payload['resource_unit_id']}:lease-retention",
         "output_window_bytes": 64 * 1024,
     }
 
@@ -102,10 +102,10 @@ def test_task_payload_rejects_invalid_registered_retention_window(window):
     lease = {
         "lease_id": "lease-invalid-retention",
         "query_id": payload["query_id"],
-        "stage_id": payload["stage_id"],
+        "resource_unit_id": payload["resource_unit_id"],
         "attempt_id": "attempt-invalid-retention",
         "node_id": _NODE_ID,
-        "execution_slot_id": f"ray_task:{payload['stage_id']}:lease-invalid-retention",
+        "execution_slot_id": f"ray_task:{payload['resource_unit_id']}:lease-invalid-retention",
         "output_window_bytes": window,
     }
 
@@ -198,11 +198,11 @@ def test_actor_call_uses_fixed_four_raw_objects_for_two_logical_blocks():
     assert method.calls == [{"_generator_backpressure_num_objects": 4}]
 
 
-def test_distributed_payload_requires_registered_query_stage_and_new_protocol():
+def test_distributed_payload_requires_registered_resource_unit_and_new_protocol():
     import duckdb.execution.udf_ray as fur
 
     assert fur._ray_payload_requires_block_stream(_distributed_payload()) is True
-    for missing in ("query_id", "stage_id", "produce_ray_block_stream"):
+    for missing in ("query_id", "resource_unit_id", "produce_ray_block_stream"):
         payload = _distributed_payload()
         payload.pop(missing)
         with pytest.raises(RuntimeError):
@@ -240,7 +240,7 @@ def test_task_executor_consumes_pregranted_admission_with_exact_resources(monkey
         lease={
             "lease_id": "lease-7",
             "node_id": _NODE_ID,
-            "execution_slot_id": "ray_task:stage:q1:node:1:udf:lease-7",
+            "execution_slot_id": "ray_task:resource:q1:udf:node:1:lease-7",
         },
     )
     monkeypatch.setattr(executor, "_take_task_admission", lambda: admission)
@@ -282,11 +282,11 @@ def test_task_submission_starts_immediately_from_pregranted_lease(monkeypatch):
     )
     lease = {
         "query_id": "q1",
-        "stage_id": "stage:q1:node:1:udf",
+        "resource_unit_id": "resource:q1:udf:node:1",
         "lease_id": "lease-8",
         "attempt_id": "attempt-8",
         "node_id": _NODE_ID,
-        "execution_slot_id": "ray_task:stage:q1:node:1:udf:lease-8",
+        "execution_slot_id": "ray_task:resource:q1:udf:node:1:lease-8",
         "output_window_bytes": 2 * _DEFAULT_OUTPUT_TARGET,
     }
     admission = SimpleNamespace(driver=object(), request_id="request-8", lease=lease)
@@ -343,7 +343,7 @@ def test_task_stream_producer_yields_direct_block_then_bounded_metadata():
     assert outputs[1] == {
         "protocol_version": 1,
         "query_id": "q1",
-        "producer_stage_id": "stage:q1:node:1:udf",
+        "producer_unit_id": "resource:q1:udf:node:1",
         "task_lease_id": "lease-1",
         "attempt_id": "attempt-1",
         "block_id": "block:lease-1:0",

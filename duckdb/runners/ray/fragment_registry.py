@@ -309,14 +309,14 @@ class FteRegistryState:
     ] = field(default_factory=dict)
     # FTE keeps logical task descriptors outside QRM until one descriptor can
     # actually enter the execution window.  At most one partition per
-    # resource stage may probe admission at a time.  A denial is memoized at
+    # resource unit may probe admission at a time.  A denial is memoized at
     # the QRM admission epoch so the remaining descriptors stay passive until
     # a real resource/accounting change occurs.
-    stage_submission_probes: dict[
+    resource_unit_submission_probes: dict[
         tuple[str, str],
         tuple[str, str, int],
     ] = field(default_factory=dict)
-    stage_submission_blocks: dict[
+    resource_unit_submission_blocks: dict[
         tuple[str, str],
         tuple[int, str, tuple[str, str, int]],
     ] = field(default_factory=dict)
@@ -352,8 +352,8 @@ _FTE_ACTIVE_TEARDOWN_OPERATIONS_BY_QUERY = _FTE_REGISTRY_STATE.active_teardown_o
 _FTE_WORKER_RESERVATION_GENERATIONS = _FTE_REGISTRY_STATE.worker_reservation_generations
 _FTE_PENDING_WORKER_RESERVATIONS = _FTE_REGISTRY_STATE.pending_worker_reservations
 _FTE_PARTITION_TASK_WAITERS = _FTE_REGISTRY_STATE.partition_task_waiters
-_FTE_STAGE_SUBMISSION_PROBES = _FTE_REGISTRY_STATE.stage_submission_probes
-_FTE_STAGE_SUBMISSION_BLOCKS = _FTE_REGISTRY_STATE.stage_submission_blocks
+_FTE_RESOURCE_UNIT_SUBMISSION_PROBES = _FTE_REGISTRY_STATE.resource_unit_submission_probes
+_FTE_RESOURCE_UNIT_SUBMISSION_BLOCKS = _FTE_REGISTRY_STATE.resource_unit_submission_blocks
 _FTE_PARTITION_TASK_LEASES = _FTE_REGISTRY_STATE.partition_task_leases
 _FTE_RESULT_HANDLES_BY_QUERY = _FTE_REGISTRY_STATE.result_handles_by_query
 _FTE_FRAGMENT_STATES = _FTE_REGISTRY_STATE.fragment_states
@@ -383,8 +383,8 @@ __all__ = [
     "_FTE_RETRY_DELAYS",
     "_FTE_SCHEDULERS",
     "_FTE_SEQUENCES",
-    "_FTE_STAGE_SUBMISSION_BLOCKS",
-    "_FTE_STAGE_SUBMISSION_PROBES",
+    "_FTE_RESOURCE_UNIT_SUBMISSION_BLOCKS",
+    "_FTE_RESOURCE_UNIT_SUBMISSION_PROBES",
     "_FTE_STABLE_TASK_IDENTITY_KEYS_BY_RESOURCE_QUERY",
     "_FTE_STATUS_WATCHERS",
     "_FTE_WORKER_HANDLES",

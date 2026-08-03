@@ -150,8 +150,8 @@ def _ray_payload_requires_block_stream(payload: dict[str, Any]) -> bool:
         raise RuntimeError("distributed Ray UDF output requires produce_ray_block_stream=True")
     if not str(payload.get("query_id") or "").strip():
         raise RuntimeError("distributed Ray UDF payload requires query_id")
-    if not str(payload.get("stage_id") or "").strip():
-        raise RuntimeError("distributed Ray UDF payload requires pre-registered stage_id")
+    if not str(payload.get("resource_unit_id") or "").strip():
+        raise RuntimeError("distributed Ray UDF payload requires pre-registered resource_unit_id")
     return True
 
 
@@ -329,7 +329,7 @@ def _apply_actor_node_options(
 def ensure_actor_pools_for_plan(
     plan: Any,
     *,
-    actor_node_ids_by_stage: dict[str, tuple[str, ...]],
+    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -338,7 +338,7 @@ def ensure_actor_pools_for_plan(
     return _ensure_actor_pools_for_plan_impl(
         plan,
         conn=conn,
-        actor_node_ids_by_stage=actor_node_ids_by_stage,
+        actor_node_ids_by_unit=actor_node_ids_by_unit,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -356,7 +356,7 @@ def ensure_actor_pools_for_plan(
 def ensure_actor_pools_for_nodes(
     udf_nodes: Any,
     *,
-    actor_node_ids_by_stage: dict[str, tuple[str, ...]],
+    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -364,7 +364,7 @@ def ensure_actor_pools_for_nodes(
 ) -> tuple[list[_UDFActorPoolBase], dict[str, Any]]:
     return _ensure_actor_pools_for_nodes_impl(
         udf_nodes,
-        actor_node_ids_by_stage=actor_node_ids_by_stage,
+        actor_node_ids_by_unit=actor_node_ids_by_unit,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -383,7 +383,7 @@ def ensure_actor_pools_for_nodes(
 def prepare_actor_pools_for_plan(
     plan: Any,
     *,
-    actor_node_ids_by_stage: dict[str, tuple[str, ...]],
+    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -392,7 +392,7 @@ def prepare_actor_pools_for_plan(
     return _prepare_actor_pools_for_plan_impl(
         plan,
         conn=conn,
-        actor_node_ids_by_stage=actor_node_ids_by_stage,
+        actor_node_ids_by_unit=actor_node_ids_by_unit,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,

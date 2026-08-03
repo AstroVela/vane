@@ -3,18 +3,18 @@
 
 import pytest
 
-from duckdb.runners.ray.query_execution_graph import (
+from duckdb.runners.ray.query_resource_graph import (
     NodeResourceAllocation,
     QueryAllocation,
-    QueryExecutionGraph,
+    QueryResourceGraph,
+    ResourceUnitSpec,
     ResourceVector,
-    StageResourceSpec,
 )
 from duckdb.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
     get_query_resource_manager,
     query_resource_manager_snapshot,
-    register_query_graph,
+    register_query_resource_graph,
     release_query_resource_manager,
 )
 
@@ -27,19 +27,19 @@ def _clear_registry():
 
 
 def _graph(digest="sha256:a"):
-    stage = StageResourceSpec(
+    unit = ResourceUnitSpec(
         query_id="q",
-        stage_id="stage:f:scan",
+        resource_unit_id="resource:f:scan",
         physical_node_id="scan",
-        stage_kind="fte",
+        unit_kind="native_fragment",
         backend="ray_worker",
-        input_stage_ids=(),
+        input_unit_ids=(),
         per_task=ResourceVector(cpu=1, heap_bytes=100),
         target_output_block_bytes=10,
         generator_buffer_blocks=2,
         max_concurrency=4,
     )
-    return QueryExecutionGraph("q", digest, (stage,), (stage.stage_id,))
+    return QueryResourceGraph("q", digest, (unit,), (unit.resource_unit_id,))
 
 
 def _allocation(generation=1):
@@ -53,20 +53,20 @@ def _allocation(generation=1):
 
 
 def test_runtime_never_lazily_creates_manager_before_graph_registration():
-    with pytest.raises(KeyError, match="query graph is not registered"):
+    with pytest.raises(KeyError, match="query resource graph is not registered"):
         get_query_resource_manager("q")
     assert query_resource_manager_snapshot("q") == {}
 
 
 def test_runtime_registers_graph_atomically_and_rejects_every_duplicate():
-    manager = register_query_graph(_graph(), _allocation())
+    manager = register_query_resource_graph(_graph(), _allocation())
 
     assert get_query_resource_manager("q") is manager
     assert query_resource_manager_snapshot("q")["graph"]["plan_digest"] == "sha256:a"
     with pytest.raises(ValueError, match="already registered"):
-        register_query_graph(_graph(), _allocation())
+        register_query_resource_graph(_graph(), _allocation())
     with pytest.raises(ValueError, match="already registered"):
-        register_query_graph(_graph("sha256:different"), _allocation())
+        register_query_resource_graph(_graph("sha256:different"), _allocation())
 
 
 def test_runtime_graph_validation_finishes_before_registry_visibility():
@@ -80,12 +80,12 @@ def test_runtime_graph_validation_finishes_before_registry_visibility():
     )
 
     with pytest.raises(ValueError, match="heap_bytes"):
-        register_query_graph(graph, too_small)
+        register_query_resource_graph(graph, too_small)
     assert query_resource_manager_snapshot("q") == {}
 
 
 def test_runtime_release_cancels_and_removes_manager_idempotently():
-    register_query_graph(_graph(), _allocation())
+    register_query_resource_graph(_graph(), _allocation())
 
     first = release_query_resource_manager("q", reason="completed")
     second = release_query_resource_manager("q", reason="completed")

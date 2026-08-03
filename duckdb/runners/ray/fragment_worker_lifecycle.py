@@ -327,7 +327,7 @@ class FteWorkerLifecycleMixin:
         return scheduler.drain()
 
     def blocking_materialization_completed(self, query_id: str, node_id: str) -> bool:
-        from duckdb.runners.ray.query_graph_builder import fte_stage_id_for_node
+        from duckdb.runners.ray.query_resource_graph_builder import native_fragment_unit_id_for_node
         from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
         query_key = str(query_id or "").strip()
@@ -335,8 +335,8 @@ class FteWorkerLifecycleMixin:
         if not query_key or not node_key:
             raise ValueError("blocking materialization completion requires query_id and node_id")
         manager = get_query_resource_manager(query_key)
-        return manager.mark_materializing_stage_completed(
-            fte_stage_id_for_node(query_key, node_key),
+        return manager.mark_barrier_unit_completed(
+            native_fragment_unit_id_for_node(query_key, node_key),
         )
 
     def mark_fte_worker_failed(

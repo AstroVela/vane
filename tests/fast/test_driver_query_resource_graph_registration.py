@@ -15,13 +15,13 @@ import duckdb
 from duckdb._ray_cxx import validate_plan_serialization_for_submission
 from duckdb._ray_errors import RemoteRayException
 from duckdb.runners.ray.cluster_resource_coordinator import NodeCapacity
-from duckdb.runners.ray.query_execution_graph import (
+from duckdb.runners.ray.query_resource_graph import (
     ActorPlacement,
     NodeResourceAllocation,
     QueryAllocation,
-    QueryExecutionGraph,
+    QueryResourceGraph,
+    ResourceUnitSpec,
     ResourceVector,
-    StageResourceSpec,
 )
 from duckdb.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
@@ -90,7 +90,7 @@ class _FakePhysicalPlan:
     def session_config(self):
         return {}
 
-    def collect_execution_stages(self, conn=None):
+    def collect_query_resource_graph_metadata(self, conn=None):
         assert conn is not None
         self._events.append("collect_graph")
         return self._metadata
@@ -128,7 +128,7 @@ class _FakeCoordinator:
             node_allocations=(NodeResourceAllocation(node_id="node-a", resources=resources),),
             actor_placements=tuple(
                 ActorPlacement(
-                    stage_id=bundle.stage_id,
+                    resource_unit_id=bundle.resource_unit_id,
                     actor_index=bundle.actor_index,
                     node_id="node-a",
                 )
@@ -179,7 +179,7 @@ def _metadata(query_id: str) -> dict:
                 "num_partitions": 4,
                 "udf_payload": {
                     "query_id": query_id,
-                    "stage_id": f"stage:{query_id}:node:1:udf",
+                    "resource_unit_id": f"resource:{query_id}:udf:node:1",
                     "execution_backend": "ray_actor",
                     "actor_pool_size": 1,
                     "cpus": 1.0,
@@ -227,7 +227,7 @@ def _runner(events, coordinator):
     runner._query_resource_coordinator = coordinator
     runner._query_resource_lock = threading.RLock()
     runner._query_allocations = {}
-    runner._query_graphs = {}
+    runner._query_resource_graphs = {}
     runner._active_udf_actors = []
     runner._active_udf_actors_by_plan = {}
     runner._active_vllm_actors = []
@@ -268,10 +268,10 @@ def test_driver_starts_plan_runner_before_opening_actor_readiness_gate():
         assert query_connection is not None
         assert session_config == {}
         assert graph.query_id == query_id
-        assert allocation.actor_node_ids_for_stage(f"stage:{query_id}:node:1:udf") == ("node-a",)
+        assert allocation.actor_node_ids_for_unit(f"resource:{query_id}:udf:node:1") == ("node-a",)
         manager = get_query_resource_manager(query_id)
-        actor_stage = manager.snapshot()["stages"][f"stage:{query_id}:node:1:udf"]
-        assert actor_stage["actor_ready"] is False
+        actor_unit = manager.snapshot()["units"][f"resource:{query_id}:udf:node:1"]
+        assert actor_unit["actor_ready"] is False
         events.append("actors_created")
         pool = SimpleNamespace(shutdown=lambda: None)
         runner._active_udf_actors.append(pool)
@@ -294,16 +294,16 @@ def test_driver_starts_plan_runner_before_opening_actor_readiness_gate():
 
     def _wait_for_ready(_actor_pools):
         manager = get_query_resource_manager(query_id)
-        actor_stage = manager.snapshot()["stages"][f"stage:{query_id}:node:1:udf"]
-        assert actor_stage["actor_ready"] is False
+        actor_unit = manager.snapshot()["units"][f"resource:{query_id}:udf:node:1"]
+        assert actor_unit["actor_ready"] is False
         events.append("actors_ready")
 
     runner._wait_for_udf_actors_ready = _wait_for_ready
 
     def _run_plan(plan, conn):
         manager = get_query_resource_manager(query_id)
-        actor_stage = manager.snapshot()["stages"][f"stage:{query_id}:node:1:udf"]
-        assert actor_stage["actor_ready"] is False
+        actor_unit = manager.snapshot()["units"][f"resource:{query_id}:udf:node:1"]
+        assert actor_unit["actor_ready"] is False
         events.append("plan_runner")
         return "stream"
 
@@ -329,7 +329,7 @@ def test_driver_starts_plan_runner_before_opening_actor_readiness_gate():
         "actors_ready",
     ]
     manager = get_query_resource_manager(query_id)
-    assert manager.snapshot()["stages"][f"stage:{query_id}:node:1:udf"]["actor_ready"] is True
+    assert manager.snapshot()["units"][f"resource:{query_id}:udf:node:1"]["actor_ready"] is True
     assert runner.curr_streams[query_id] == "stream"
     assert runner._active_vllm_actors_by_plan[query_id] == [vllm_pool]
 
@@ -339,7 +339,7 @@ def test_run_plan_does_not_read_physical_plan_id_after_registration():
     coordinator = _FakeCoordinator(events)
     runner_cls, runner = _runner(events, coordinator)
     runner._precreate_udf_actors = lambda *_args, **_kwargs: []
-    runner._mark_query_actor_stages_ready = lambda _graph: None
+    runner._mark_query_actor_units_ready = lambda _graph: None
     query_id = "query-single-use-plan-id"
     physical_plan = _RegistrationOnlyIdxPhysicalPlan(
         query_id,
@@ -375,7 +375,7 @@ def test_run_plan_cancellation_releases_registration_before_startup_worker_claim
     )
 
     runner._precreate_udf_actors = lambda *_args, **_kwargs: startup_entered.set() or []
-    runner._mark_query_actor_stages_ready = lambda _graph: None
+    runner._mark_query_actor_units_ready = lambda _graph: None
 
     async def _exercise() -> None:
         loop = asyncio.get_running_loop()
@@ -442,11 +442,11 @@ def test_run_plan_cancellation_releases_registration_before_startup_worker_claim
         blocker_release.set()
         executor.shutdown(wait=True)
 
-    with pytest.raises(KeyError, match="query graph is not registered"):
+    with pytest.raises(KeyError, match="query resource graph is not registered"):
         get_query_resource_manager(query_id)
     assert startup_entered.is_set() is False
     assert coordinator.released == [(query_id, 7)]
-    assert query_id not in runner._query_graphs
+    assert query_id not in runner._query_resource_graphs
     assert query_id not in runner._query_allocations
 
 
@@ -474,7 +474,7 @@ def test_run_plan_cancellation_after_startup_claim_tears_down_once():
 
     runner._precreate_udf_actors = _precreate_udf_actors
     runner._wait_for_udf_actors_ready = lambda _actors: None
-    runner._mark_query_actor_stages_ready = lambda _graph: None
+    runner._mark_query_actor_units_ready = lambda _graph: None
     runner._drop_query_fragments_sync = _drop_query_fragments
 
     async def _exercise() -> None:
@@ -498,14 +498,14 @@ def test_run_plan_cancellation_after_startup_claim_tears_down_once():
 
     asyncio.run(_exercise())
 
-    with pytest.raises(KeyError, match="query graph is not registered"):
+    with pytest.raises(KeyError, match="query resource graph is not registered"):
         get_query_resource_manager(query_id)
     assert fragment_drops == [query_id]
     assert coordinator.released == [(query_id, 7)]
     assert query_id not in runner.curr_plans
     assert query_id not in runner.curr_streams
     assert query_id not in runner._plan_query_ids
-    assert query_id not in runner._query_graphs
+    assert query_id not in runner._query_resource_graphs
     assert query_id not in runner._query_allocations
 
 
@@ -534,7 +534,7 @@ def test_driver_rolls_back_graph_and_cluster_allocation_when_actor_initializatio
             )
         )
 
-    with pytest.raises(KeyError, match="query graph is not registered"):
+    with pytest.raises(KeyError, match="query resource graph is not registered"):
         get_query_resource_manager(query_id)
     assert coordinator.released == [(query_id, 7)]
     assert query_id not in runner.curr_plans
@@ -545,7 +545,7 @@ def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_
     monkeypatch,
 ):
     from duckdb.runners.ray import driver as driver_module
-    from duckdb.runners.ray.query_resource_runtime import register_query_graph
+    from duckdb.runners.ray.query_resource_runtime import register_query_resource_graph
 
     events: list[str] = []
     coordinator = _FakeCoordinator(events)
@@ -560,7 +560,7 @@ def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_
             "copy_output_committed": True,
         },
     )
-    runner._mark_query_actor_stages_ready = lambda _graph: None
+    runner._mark_query_actor_units_ready = lambda _graph: None
     runner._build_local_progress_snapshot = lambda query_id, _started_at: {
         "query_id": query_id,
         "state": "FINISHED",
@@ -569,23 +569,23 @@ def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_
     runner._open_query_resource_admission = lambda _query_id: None
 
     streaming_query_id = "query-streaming-admission"
-    streaming_stage = StageResourceSpec(
+    streaming_unit = ResourceUnitSpec(
         query_id=streaming_query_id,
-        stage_id=f"stage:{streaming_query_id}:udf",
+        resource_unit_id=f"resource:{streaming_query_id}:udf",
         physical_node_id="node:streaming:udf",
-        stage_kind="udf",
+        unit_kind="ray_task_udf",
         backend="ray_task",
-        input_stage_ids=(),
+        input_unit_ids=(),
         per_task=ResourceVector(cpu=1, heap_bytes=128),
         target_output_block_bytes=64,
         generator_buffer_blocks=1,
         max_concurrency=None,
     )
-    streaming_graph = QueryExecutionGraph(
+    streaming_graph = QueryResourceGraph(
         query_id=streaming_query_id,
         plan_digest="sha256:streaming-admission",
-        stages=(streaming_stage,),
-        terminal_stage_ids=(streaming_stage.stage_id,),
+        units=(streaming_unit,),
+        terminal_unit_ids=(streaming_unit.resource_unit_id,),
     )
     streaming_resources = ResourceVector(
         cpu=2,
@@ -603,17 +603,17 @@ def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_
         actor_placements=(),
         generation=1,
     )
-    streaming_manager = register_query_graph(
+    streaming_manager = register_query_resource_graph(
         streaming_graph,
         streaming_allocation,
     )
-    streaming_manager.update_stage_state(
-        streaming_stage.stage_id,
+    streaming_manager.update_unit_state(
+        streaming_unit.resource_unit_id,
         runnable=True,
         actor_ready=True,
     )
     coordinator.allocations[streaming_query_id] = streaming_allocation
-    runner._query_graphs[streaming_query_id] = streaming_graph
+    runner._query_resource_graphs[streaming_query_id] = streaming_graph
     runner._query_allocations[streaming_query_id] = streaming_allocation
 
     nodes_started = threading.Event()
@@ -649,7 +649,7 @@ def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_
     lease_request = {
         "request_id": "request:streaming-during-copy",
         "query_id": streaming_query_id,
-        "stage_id": streaming_stage.stage_id,
+        "resource_unit_id": streaming_unit.resource_unit_id,
         "task_id": "task:streaming-during-copy",
         "attempt_id": "attempt:streaming-during-copy",
         "node_id": None,
@@ -756,7 +756,7 @@ def test_pending_allocation_teardown_fences_query_id_reuse_until_remote_drop_fin
         _DeferredQueryAllocationTeardown,
         _PreparedQueryResourceRegistration,
     )
-    from duckdb.runners.ray.query_graph_builder import build_query_execution_graph
+    from duckdb.runners.ray.query_resource_graph_builder import build_query_resource_graph
 
     events: list[str] = []
     coordinator = _FakeCoordinator(events)
@@ -764,7 +764,7 @@ def test_pending_allocation_teardown_fences_query_id_reuse_until_remote_drop_fin
     runner._query_resource_lock = threading.Lock()
     runner._open_query_resource_admission = lambda _query_id: None
     query_id = "query-generation-fence"
-    graph = build_query_execution_graph(_metadata(query_id))
+    graph = build_query_resource_graph(_metadata(query_id))
     node = NodeCapacity(
         "node-a",
         ResourceVector(
@@ -841,7 +841,7 @@ def test_failed_allocation_teardown_remains_retryable():
     runner._query_allocation_teardowns_pending = {query_id: teardown}
     runner._query_allocation_teardowns_claimed = set()
     runner._query_allocation_teardown_futures = set()
-    runner._query_graphs = {query_id: object()}
+    runner._query_resource_graphs = {query_id: object()}
     runner._query_allocations = {
         query_id: SimpleNamespace(generation=teardown.generation + 1),
     }
@@ -861,7 +861,7 @@ def test_failed_allocation_teardown_remains_retryable():
     assert runner._query_allocation_teardowns_pending == {query_id: teardown}
     assert "transient remote teardown failure" in runner._query_terminal_errors[query_id]
 
-    runner._query_graphs = {}
+    runner._query_resource_graphs = {}
     runner._query_allocations = {}
     retry = runner_cls._synchronize_query_allocations(runner)
     assert retry == (teardown,)
@@ -894,11 +894,11 @@ def test_driver_rejects_non_serializable_plan_before_query_registration(entrypoi
     assert isinstance(exc_info.value, RemoteRayException)
     assert isinstance(exc_info.value.__cause__, duckdb.NotImplementedException)
     assert "INTENTIONALLY_NON_SERIALIZABLE operator cannot be serialized" in str(exc_info.value.__cause__)
-    with pytest.raises(KeyError, match="query graph is not registered"):
+    with pytest.raises(KeyError, match="query resource graph is not registered"):
         get_query_resource_manager(query_id)
     assert coordinator.released == []
     assert coordinator.allocations == {}
-    assert runner._query_graphs == {}
+    assert runner._query_resource_graphs == {}
     assert runner._query_allocations == {}
     assert query_id not in runner.curr_plans
     assert query_id not in runner.curr_streams
@@ -927,17 +927,17 @@ def test_driver_maintenance_refreshes_ray_capacity_usage_and_heartbeat_atomicall
         NodeCapacity,
     )
     from duckdb.runners.ray.driver import RayQueryDriverActor
-    from duckdb.runners.ray.query_graph_builder import (
+    from duckdb.runners.ray.query_resource_graph_builder import (
         build_query_demand,
-        build_query_execution_graph,
+        build_query_resource_graph,
     )
     from duckdb.runners.ray.query_resource_manager import TaskRequest
-    from duckdb.runners.ray.query_resource_runtime import register_query_graph
+    from duckdb.runners.ray.query_resource_runtime import register_query_resource_graph
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
     query_id = "query-driver-maintenance"
-    graph = build_query_execution_graph(_metadata(query_id))
+    graph = build_query_resource_graph(_metadata(query_id))
     initial_node = NodeCapacity(
         "node-a",
         ResourceVector(
@@ -953,18 +953,18 @@ def test_driver_maintenance_refreshes_ray_capacity_usage_and_heartbeat_atomicall
         initial_node.resources,
     )
     allocation = coordinator.register_query(demand, now=0)
-    manager = register_query_graph(graph, allocation)
-    for stage in graph.stages:
-        manager.update_stage_state(
-            stage.stage_id,
+    manager = register_query_resource_graph(graph, allocation)
+    for unit in graph.units:
+        manager.update_unit_state(
+            unit.resource_unit_id,
             runnable=True,
-            actor_ready=stage.backend != "ray_actor",
+            actor_ready=unit.backend != "ray_actor",
         )
-    fte_stage = next(stage for stage in graph.stages if stage.backend == "ray_worker")
+    fte_unit = next(unit for unit in graph.units if unit.backend == "ray_worker")
     task_grant = manager.try_acquire_task(
         TaskRequest(
             query_id=query_id,
-            stage_id=fte_stage.stage_id,
+            resource_unit_id=fte_unit.resource_unit_id,
             task_id="fte-task-1",
             attempt_id="fte-attempt-1",
             node_id="node-a",
@@ -974,7 +974,7 @@ def test_driver_maintenance_refreshes_ray_capacity_usage_and_heartbeat_atomicall
 
     runner._query_resource_lock = threading.RLock()
     runner._query_resource_coordinator = coordinator
-    runner._query_graphs = {query_id: graph}
+    runner._query_resource_graphs = {query_id: graph}
     runner._query_allocations = {query_id: allocation}
     runner._query_node_capacities = (initial_node,)
     runner._query_resource_admission_loop = None
@@ -1022,16 +1022,16 @@ def test_driver_cancels_query_when_fixed_actor_placement_node_is_lost():
         NodeCapacity,
     )
     from duckdb.runners.ray.driver import RayQueryDriverActor
-    from duckdb.runners.ray.query_graph_builder import (
+    from duckdb.runners.ray.query_resource_graph_builder import (
         build_query_demand,
-        build_query_execution_graph,
+        build_query_resource_graph,
     )
-    from duckdb.runners.ray.query_resource_runtime import register_query_graph
+    from duckdb.runners.ray.query_resource_runtime import register_query_resource_graph
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
     query_id = "query-actor-node-loss"
-    graph = build_query_execution_graph(_metadata(query_id))
+    graph = build_query_resource_graph(_metadata(query_id))
     node_resources = ResourceVector(
         cpu=8,
         gpu=1,
@@ -1046,11 +1046,11 @@ def test_driver_cancels_query_when_fixed_actor_placement_node_is_lost():
         build_query_demand(graph, node_resources),
         now=0,
     )
-    manager = register_query_graph(graph, allocation)
+    manager = register_query_resource_graph(graph, allocation)
     dropped = []
 
     runner._query_resource_coordinator = coordinator
-    runner._query_graphs = {query_id: graph}
+    runner._query_resource_graphs = {query_id: graph}
     runner._query_allocations = {query_id: allocation}
     runner._query_terminal_errors = {}
     runner._query_resource_lock = threading.Lock()

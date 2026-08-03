@@ -54,9 +54,9 @@ def _actor_debug_log(event: str, payload: dict[str, Any] | None = None, **fields
     query_id = payload.get("query_id")
     if query_id:
         parts.append(f"query_id={query_id}")
-    stage_id = payload.get("stage_id")
-    if stage_id:
-        parts.append(f"stage_id={stage_id}")
+    resource_unit_id = payload.get("resource_unit_id")
+    if resource_unit_id:
+        parts.append(f"resource_unit_id={resource_unit_id}")
     backend = payload.get("backend")
     if backend:
         parts.append(f"backend={backend}")

@@ -15,7 +15,7 @@ from duckdb.runners.ray.cluster_resource_coordinator import (
     QueryDemand,
     read_ray_node_capacities,
 )
-from duckdb.runners.ray.query_execution_graph import ActorPlacement, ResourceVector
+from duckdb.runners.ray.query_resource_graph import ActorPlacement, ResourceVector
 
 
 def _r(
@@ -50,7 +50,7 @@ def _demand(
 ) -> QueryDemand:
     tagged_actor_bundles = tuple(
         ActorResourceBundle(
-            stage_id="stage:actor",
+            resource_unit_id="resource:actor",
             actor_index=index,
             resources=bundle,
         )
@@ -390,7 +390,9 @@ def test_fixed_gpu_bundle_receives_only_divisible_cpu_and_memory_headroom():
     )
 
     assert allocation.resources == desired
-    assert allocation.actor_placements == (ActorPlacement(stage_id="stage:actor", actor_index=0, node_id="gpu-node"),)
+    assert allocation.actor_placements == (
+        ActorPlacement(resource_unit_id="resource:actor", actor_index=0, node_id="gpu-node"),
+    )
 
 
 def test_fractional_gpu_actor_bundles_are_placed_whole_on_heterogeneous_nodes():
@@ -415,9 +417,9 @@ def test_fractional_gpu_actor_bundles_are_placed_whole_on_heterogeneous_nodes():
 
     assert allocation.resources == fixed_pool
     assert allocation.actor_placements == (
-        ActorPlacement(stage_id="stage:actor", actor_index=0, node_id="quarter-gpu"),
-        ActorPlacement(stage_id="stage:actor", actor_index=1, node_id="half-gpu"),
-        ActorPlacement(stage_id="stage:actor", actor_index=2, node_id="half-gpu"),
+        ActorPlacement(resource_unit_id="resource:actor", actor_index=0, node_id="quarter-gpu"),
+        ActorPlacement(resource_unit_id="resource:actor", actor_index=1, node_id="half-gpu"),
+        ActorPlacement(resource_unit_id="resource:actor", actor_index=2, node_id="half-gpu"),
     )
 
 
@@ -812,5 +814,7 @@ def test_pinned_actor_allocation_remains_valid_when_task_minimum_is_temporarily_
     assert pending["state"] == "PENDING_RESOURCES"
     assert pending["allocation"]["resources"] == actor.to_dict()
     assert pending["allocation"]["node_allocations"] == [{"node_id": "n1", "resources": actor.to_dict()}]
-    assert pending["allocation"]["actor_placements"] == [{"stage_id": "stage:actor", "actor_index": 0, "node_id": "n1"}]
+    assert pending["allocation"]["actor_placements"] == [
+        {"resource_unit_id": "resource:actor", "actor_index": 0, "node_id": "n1"}
+    ]
     assert pending["can_admit_new_tasks"] is False

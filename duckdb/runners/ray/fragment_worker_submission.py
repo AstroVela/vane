@@ -79,23 +79,23 @@ RayWorkerTask = require_ray_cxx_attr(
 
 def _registered_fte_task_memory_bytes(
     resource_query_id: str,
-    resource_stage_id: str,
+    resource_unit_id: str,
 ) -> int:
     from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
     manager = get_query_resource_manager(resource_query_id)
-    stage = manager.graph.stage_by_id(resource_stage_id)
-    if stage.backend != "ray_worker":
-        raise RuntimeError(f"FTE stage {resource_stage_id} has invalid registered backend {stage.backend!r}")
-    task_memory_bytes = int(stage.per_task.heap_bytes)
+    unit = manager.graph.unit_by_id(resource_unit_id)
+    if unit.backend != "ray_worker":
+        raise RuntimeError(f"FTE resource unit {resource_unit_id} has invalid registered backend {unit.backend!r}")
+    task_memory_bytes = int(unit.per_task.heap_bytes)
     if task_memory_bytes <= 0:
-        raise RuntimeError(f"FTE stage {resource_stage_id} has invalid per-task heap lease {task_memory_bytes}")
+        raise RuntimeError(f"FTE resource unit {resource_unit_id} has invalid per-task heap lease {task_memory_bytes}")
     return task_memory_bytes
 
 
 def _registered_fte_logical_fragment_identity(
     resource_query_id: str,
-    resource_stage_id: str,
+    resource_unit_id: str,
     query_id: str,
     fragment_id: str,
 ) -> str:
@@ -103,9 +103,9 @@ def _registered_fte_logical_fragment_identity(
     from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
     manager = get_query_resource_manager(resource_query_id)
-    stage = manager.graph.stage_by_id(resource_stage_id)
-    if stage.backend != "ray_worker":
-        raise RuntimeError(f"FTE stage {resource_stage_id} has invalid registered backend {stage.backend!r}")
+    unit = manager.graph.unit_by_id(resource_unit_id)
+    if unit.backend != "ray_worker":
+        raise RuntimeError(f"FTE resource unit {resource_unit_id} has invalid registered backend {unit.backend!r}")
     if query_id == resource_query_id:
         execution_scope = "root"
     elif query_id.startswith(resource_query_id):
@@ -118,7 +118,7 @@ def _registered_fte_logical_fragment_identity(
     return json.dumps(
         [
             "ray-fte-logical-fragment-v1",
-            stage.physical_node_id,
+            unit.physical_node_id,
             execution_scope,
             fragment_id[len(query_prefix) :],
         ],
@@ -276,10 +276,10 @@ class FteWorkerSubmissionMixin:
             dynamic_exchange_sources,
         )
         resource_query_id = str(item["resource_query_id"])
-        resource_stage_id = str(item["resource_stage_id"])
+        resource_unit_id = str(item["resource_unit_id"])
         logical_fragment_identity = _registered_fte_logical_fragment_identity(
             resource_query_id,
-            resource_stage_id,
+            resource_unit_id,
             query_id,
             fragment_id,
         )
@@ -394,7 +394,7 @@ class FteWorkerSubmissionMixin:
             dynamic_exchange_source_node_ids=dynamic_exchange_sources,
             task_memory_bytes=_registered_fte_task_memory_bytes(
                 resource_query_id,
-                resource_stage_id,
+                resource_unit_id,
             ),
         )
         with _FTE_REGISTRY_LOCK:
@@ -925,7 +925,7 @@ class FteWorkerSubmissionMixin:
             task_context_info = dict(task.task_context() or {})
             context = extract_task_inputs(task, context)
             exchange_sink_instance = task.exchange_sink_instance()
-            resource_query_id, resource_stage_id = resource_identity_from_context(context)
+            resource_query_id, resource_unit_id = resource_identity_from_context(context)
 
             query_id, fragment_id = fragment_id_for_task(context, task_name)
             if (
@@ -970,7 +970,7 @@ class FteWorkerSubmissionMixin:
                     "fragment_plan": fragment_plan,
                     "query_id": query_id,
                     "resource_query_id": resource_query_id,
-                    "resource_stage_id": resource_stage_id,
+                    "resource_unit_id": resource_unit_id,
                     "task_context_info": task_context_info,
                     "exchange_sink_instance": exchange_sink_instance,
                 }

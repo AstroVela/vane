@@ -12,16 +12,16 @@ from types import SimpleNamespace
 import pytest
 
 from duckdb.runners.ray.admission_ledger import BoundedReplayMap
-from duckdb.runners.ray.query_execution_graph import (
+from duckdb.runners.ray.query_resource_graph import (
     NodeResourceAllocation,
     QueryAllocation,
-    QueryExecutionGraph,
+    QueryResourceGraph,
+    ResourceUnitSpec,
     ResourceVector,
-    StageResourceSpec,
 )
 from duckdb.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
-    register_query_graph,
+    register_query_resource_graph,
 )
 
 
@@ -32,24 +32,24 @@ def _clean_query_runtime():
     clear_query_resource_managers()
 
 
-def _graph(query_id: str) -> QueryExecutionGraph:
-    stage = StageResourceSpec(
+def _graph(query_id: str) -> QueryResourceGraph:
+    unit = ResourceUnitSpec(
         query_id=query_id,
-        stage_id=f"stage:{query_id}:udf",
+        resource_unit_id=f"resource:{query_id}:udf",
         physical_node_id="node:1:udf",
-        stage_kind="udf",
+        unit_kind="ray_task_udf",
         backend="ray_task",
-        input_stage_ids=(),
+        input_unit_ids=(),
         per_task=ResourceVector(cpu=1, heap_bytes=100),
         target_output_block_bytes=10,
         generator_buffer_blocks=2,
         max_concurrency=None,
     )
-    return QueryExecutionGraph(
+    return QueryResourceGraph(
         query_id=query_id,
         plan_digest="sha256:test-driver-query-leases",
-        stages=(stage,),
-        terminal_stage_ids=(stage.stage_id,),
+        units=(unit,),
+        terminal_unit_ids=(unit.resource_unit_id,),
     )
 
 
@@ -91,7 +91,7 @@ def _task_request(runner, query_id: str, request_id: str, task_id: str) -> dict:
     return {
         "request_id": request_id,
         "query_id": query_id,
-        "stage_id": f"stage:{query_id}:udf",
+        "resource_unit_id": f"resource:{query_id}:udf",
         "task_id": task_id,
         "attempt_id": f"attempt:{task_id}",
         "node_id": None,
@@ -108,13 +108,13 @@ def _task_request(runner, query_id: str, request_id: str, task_id: str) -> dict:
     }
 
 
-async def _fill_task_output_window(runner_cls, runner, query_id, stage_id, task, *, prefix):
+async def _fill_task_output_window(runner_cls, runner, query_id, resource_unit_id, task, *, prefix):
     owned = []
     for index in range(2):
         request = {
             "request_id": f"request:{prefix}:window:{index}",
             "query_id": query_id,
-            "producer_stage_id": stage_id,
+            "producer_unit_id": resource_unit_id,
             "task_lease_id": task["lease"]["lease_id"],
             "attempt_id": task["lease"]["attempt_id"],
             "block_id": f"block:{prefix}:window:{index}",
@@ -140,12 +140,12 @@ def test_driver_task_lease_wait_is_event_driven_and_release_wakes_next_request()
         query_id = "query-lease-wakeup"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
         )
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
 
         first_request = _task_request(runner, query_id, "request:first", "task:first")
         first = await runner_cls.acquire_query_task_lease(runner, first_request)
@@ -177,7 +177,7 @@ def test_driver_task_lease_wait_is_event_driven_and_release_wakes_next_request()
             {
                 "request_id": "output-request:block-1",
                 "query_id": query_id,
-                "producer_stage_id": graph.stages[0].stage_id,
+                "producer_unit_id": graph.units[0].resource_unit_id,
                 "task_lease_id": second["lease"]["lease_id"],
                 "attempt_id": second["lease"]["attempt_id"],
                 "block_id": "block-1",
@@ -186,7 +186,7 @@ def test_driver_task_lease_wait_is_event_driven_and_release_wakes_next_request()
         )
         output_manager_lease_id = runner._query_output_lease_requests["output-request:block-1"]["manager_lease_id"]
         assert output["granted"]
-        assert output["lease"]["state"] == "stage_queue"
+        assert output["lease"]["state"] == "unit_queue"
         assert await runner_cls.handoff_query_output_block_lease(
             runner,
             "output-request:block-1",
@@ -233,8 +233,8 @@ def test_task_admission_rejects_unsigned_or_tampered_generation_capabilities():
         query_id = "query-admission-capability"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(graph, _allocation())
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager = register_query_resource_graph(graph, _allocation())
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
 
         valid_request = _task_request(
             runner,
@@ -286,8 +286,8 @@ def test_late_output_controls_transfer_to_fenced_query_teardown():
         query_id = "query-late-output-control"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(graph, _allocation())
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager = register_query_resource_graph(graph, _allocation())
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
         task_request = _task_request(
             runner,
             query_id,
@@ -298,7 +298,7 @@ def test_late_output_controls_transfer_to_fenced_query_teardown():
         output_request = {
             "request_id": "request:late-output",
             "query_id": query_id,
-            "producer_stage_id": graph.stages[0].stage_id,
+            "producer_unit_id": graph.units[0].resource_unit_id,
             "task_lease_id": task["lease"]["lease_id"],
             "attempt_id": task["lease"]["attempt_id"],
             "block_id": "block:late-output",
@@ -359,12 +359,12 @@ def test_driver_resource_change_evaluates_only_the_selected_task_waiter():
         query_id = "query-single-admission-pump"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
         )
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
 
         active_request = _task_request(runner, query_id, "request:active", "task:active")
         active = await runner_cls.acquire_query_task_lease(runner, active_request)
@@ -377,7 +377,7 @@ def test_driver_resource_change_evaluates_only_the_selected_task_waiter():
         ]
         for _ in range(5):
             await asyncio.sleep(0)
-        assert manager.snapshot()["stages"][graph.stages[0].stage_id]["pending_task_count"] == 6
+        assert manager.snapshot()["units"][graph.units[0].resource_unit_id]["pending_task_count"] == 6
 
         evaluated_task_ids = []
         original_block_reason = manager._normal_task_block_reason_locked
@@ -469,12 +469,12 @@ def test_driver_pending_task_lease_can_be_cancelled_without_a_polling_wakeup():
         query_id = "query-lease-cancel"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
         )
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
 
         active_request = _task_request(runner, query_id, "request:active", "task:active")
         active = await runner_cls.acquire_query_task_lease(runner, active_request)
@@ -483,9 +483,9 @@ def test_driver_pending_task_lease_can_be_cancelled_without_a_polling_wakeup():
         for _ in range(3):
             await asyncio.sleep(0)
         assert not pending.done()
-        waiting_stage = manager.snapshot()["stages"][graph.stages[0].stage_id]
-        assert waiting_stage["pending_task_count"] == 1
-        assert waiting_stage["queued_input_bytes"] == 1
+        waiting_unit = manager.snapshot()["units"][graph.units[0].resource_unit_id]
+        assert waiting_unit["pending_task_count"] == 1
+        assert waiting_unit["queued_input_bytes"] == 1
 
         cancelled = await runner_cls.cancel_query_task_lease_request(
             runner,
@@ -496,7 +496,7 @@ def test_driver_pending_task_lease_can_be_cancelled_without_a_polling_wakeup():
         assert denial["granted"] is False
         assert denial["fatal"] is True
         assert denial["blocked_reason"] == "task_lease_request_cancelled"
-        assert manager.snapshot()["stages"][graph.stages[0].stage_id]["pending_task_count"] == 0
+        assert manager.snapshot()["units"][graph.units[0].resource_unit_id]["pending_task_count"] == 0
         assert pending_request["request_id"] not in runner._query_task_lease_requests
         assert active_request["request_id"] in runner._query_task_lease_requests
 
@@ -518,12 +518,12 @@ def test_submitted_task_lease_is_released_only_after_remote_completion(completio
         query_id = "query-completion-gated-cancel"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
         )
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
 
         active_request = _task_request(
             runner,
@@ -602,8 +602,8 @@ def test_query_close_retains_completion_owner_until_remote_task_is_terminal():
         query_id = "query-close-retains-live-task"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(graph, _allocation())
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager = register_query_resource_graph(graph, _allocation())
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
 
         request = _task_request(
             runner,
@@ -657,8 +657,8 @@ def test_completed_task_cleanup_retries_without_losing_its_ledger_owner(monkeypa
         query_id = "query-completion-cleanup-retry"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(graph, _allocation())
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager = register_query_resource_graph(graph, _allocation())
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
 
         request = _task_request(
             runner,
@@ -708,8 +708,8 @@ def test_query_close_before_completion_handoff_cannot_erase_execution_owner():
         query_id = "query-close-before-completion-handoff"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(graph, _allocation())
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager = register_query_resource_graph(graph, _allocation())
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
 
         request = _task_request(
             runner,
@@ -778,8 +778,8 @@ def test_missing_completion_contract_requires_explicit_teardown_ownership(
         query_id = f"query-missing-completion:{quiesce_first}"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(graph, _allocation())
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager = register_query_resource_graph(graph, _allocation())
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
 
         request = _task_request(
             runner,
@@ -874,8 +874,8 @@ def test_task_grant_is_published_in_the_admission_ledger_before_future_completio
         query_id = "query-single-task-ledger"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(graph, _allocation())
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager = register_query_resource_graph(graph, _allocation())
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
         request = _task_request(
             runner,
             query_id,
@@ -934,11 +934,11 @@ def test_query_resource_release_waits_for_late_submission_completion_handoff():
         graph = _graph(query_id)
         allocation = _allocation()
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(graph, allocation)
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager = register_query_resource_graph(graph, allocation)
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
         runner._query_resource_lock = threading.RLock()
         runner._query_resource_coordinator = _Coordinator()
-        runner._query_graphs = {query_id: graph}
+        runner._query_resource_graphs = {query_id: graph}
         runner._query_allocations = {query_id: allocation}
         runner._synchronize_query_allocations = lambda: ()
 
@@ -1003,17 +1003,17 @@ def test_query_resource_release_waits_for_late_submission_completion_handoff():
     asyncio.run(scenario())
 
 
-def test_driver_rejects_runtime_resources_that_diverge_from_registered_stage():
+def test_driver_rejects_runtime_resources_that_diverge_from_registered_unit():
     async def scenario():
         query_id = "query-lease-resource-mismatch"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
         )
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
         request = _task_request(runner, query_id, "request:mismatch", "task:mismatch")
         request["resources"]["heap_bytes"] = 99
 
@@ -1023,7 +1023,7 @@ def test_driver_rejects_runtime_resources_that_diverge_from_registered_stage():
         assert denial["fatal"] is True
         assert denial["blocked_reason"] == "task_resource_spec_mismatch"
         assert manager.snapshot()["task_leases"] == {}
-        assert manager.snapshot()["stages"][graph.stages[0].stage_id]["pending_task_count"] == 0
+        assert manager.snapshot()["units"][graph.units[0].resource_unit_id]["pending_task_count"] == 0
         assert runner._query_task_lease_requests == {}
         owner_identity = (query_id, "task:mismatch", "attempt:task:mismatch")
         assert owner_identity not in runner._query_task_request_owner_by_identity
@@ -1046,27 +1046,27 @@ def test_driver_pending_output_waiter_is_live_and_cancel_cleanup_is_complete():
         query_id = "query-output-waiter-cancel"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
         )
-        stage_id = graph.stages[0].stage_id
-        manager.update_stage_state(stage_id, runnable=True)
+        resource_unit_id = graph.units[0].resource_unit_id
+        manager.update_unit_state(resource_unit_id, runnable=True)
         task_request = _task_request(runner, query_id, "request:task", "task:output")
         task = await runner_cls.acquire_query_task_lease(runner, task_request)
         owned = await _fill_task_output_window(
             runner_cls,
             runner,
             query_id,
-            stage_id,
+            resource_unit_id,
             task,
             prefix="cancel",
         )
         output_request = {
             "request_id": "request:output",
             "query_id": query_id,
-            "producer_stage_id": stage_id,
+            "producer_unit_id": resource_unit_id,
             "task_lease_id": task["lease"]["lease_id"],
             "attempt_id": task["lease"]["attempt_id"],
             "block_id": "blocked-output",
@@ -1076,9 +1076,9 @@ def test_driver_pending_output_waiter_is_live_and_cancel_cleanup_is_complete():
         for _ in range(3):
             await asyncio.sleep(0)
         assert pending.done() is False
-        stage_snapshot = manager.snapshot()["stages"][stage_id]
-        assert stage_snapshot["pending_output_count"] == 1
-        assert stage_snapshot["queued_output_bytes"] == 30
+        unit_snapshot = manager.snapshot()["units"][resource_unit_id]
+        assert unit_snapshot["pending_output_count"] == 1
+        assert unit_snapshot["queued_output_bytes"] == 30
 
         assert await runner_cls.cancel_query_output_block_lease_request(
             runner,
@@ -1087,7 +1087,7 @@ def test_driver_pending_output_waiter_is_live_and_cancel_cleanup_is_complete():
         denial = await asyncio.wait_for(pending, timeout=1)
         assert denial["blocked_reason"] == "output_lease_request_cancelled"
         assert denial["fatal"] is True
-        assert manager.snapshot()["stages"][stage_id]["pending_output_count"] == 0
+        assert manager.snapshot()["units"][resource_unit_id]["pending_output_count"] == 0
         assert set(runner._query_output_lease_requests) == {request["request_id"] for request, _grant in owned}
 
         await _release_owned_outputs(runner_cls, runner, owned)
@@ -1108,19 +1108,19 @@ def test_driver_output_cancel_before_acquire_is_durable_and_restores_budget():
         query_id = "query-output-pre-cancel"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
         )
-        stage_id = graph.stages[0].stage_id
-        manager.update_stage_state(stage_id, runnable=True)
+        resource_unit_id = graph.units[0].resource_unit_id
+        manager.update_unit_state(resource_unit_id, runnable=True)
         task_request = _task_request(runner, query_id, "request:task", "task:pre-cancel-output")
         task = await runner_cls.acquire_query_task_lease(runner, task_request)
         output_request = {
             "request_id": "request:pre-cancel-output",
             "query_id": query_id,
-            "producer_stage_id": stage_id,
+            "producer_unit_id": resource_unit_id,
             "task_lease_id": task["lease"]["lease_id"],
             "attempt_id": task["lease"]["attempt_id"],
             "block_id": "block:pre-cancel-output",
@@ -1143,10 +1143,12 @@ def test_driver_output_cancel_before_acquire_is_durable_and_restores_budget():
         snapshot = manager.snapshot()
         assert snapshot["output_leases"] == baseline["output_leases"]
         assert (
-            snapshot["stages"][stage_id]["pending_output_count"] == baseline["stages"][stage_id]["pending_output_count"]
+            snapshot["units"][resource_unit_id]["pending_output_count"]
+            == baseline["units"][resource_unit_id]["pending_output_count"]
         )
         assert (
-            snapshot["stages"][stage_id]["queued_output_bytes"] == baseline["stages"][stage_id]["queued_output_bytes"]
+            snapshot["units"][resource_unit_id]["queued_output_bytes"]
+            == baseline["units"][resource_unit_id]["queued_output_bytes"]
         )
 
         assert await runner_cls.release_query_task_lease(
@@ -1164,19 +1166,19 @@ def test_driver_output_cancel_after_grant_releases_late_lease_and_restores_budge
         query_id = "query-output-late-grant-cancel"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
         )
-        stage_id = graph.stages[0].stage_id
-        manager.update_stage_state(stage_id, runnable=True)
+        resource_unit_id = graph.units[0].resource_unit_id
+        manager.update_unit_state(resource_unit_id, runnable=True)
         task_request = _task_request(runner, query_id, "request:task", "task:late-grant-output")
         task = await runner_cls.acquire_query_task_lease(runner, task_request)
         output_request = {
             "request_id": "request:late-grant-output",
             "query_id": query_id,
-            "producer_stage_id": stage_id,
+            "producer_unit_id": resource_unit_id,
             "task_lease_id": task["lease"]["lease_id"],
             "attempt_id": task["lease"]["attempt_id"],
             "block_id": "block:late-grant-output",
@@ -1199,10 +1201,12 @@ def test_driver_output_cancel_after_grant_releases_late_lease_and_restores_budge
         snapshot = manager.snapshot()
         assert snapshot["output_leases"] == baseline["output_leases"]
         assert (
-            snapshot["stages"][stage_id]["pending_output_count"] == baseline["stages"][stage_id]["pending_output_count"]
+            snapshot["units"][resource_unit_id]["pending_output_count"]
+            == baseline["units"][resource_unit_id]["pending_output_count"]
         )
         assert (
-            snapshot["stages"][stage_id]["queued_output_bytes"] == baseline["stages"][stage_id]["queued_output_bytes"]
+            snapshot["units"][resource_unit_id]["queued_output_bytes"]
+            == baseline["units"][resource_unit_id]["queued_output_bytes"]
         )
         replay = await runner_cls.acquire_query_output_block_lease(
             runner,
@@ -1226,20 +1230,20 @@ def test_driver_output_pump_evaluates_each_waiter_once_per_state_transition():
         query_id = "query-single-output-admission-pump"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
         )
-        stage_id = graph.stages[0].stage_id
-        manager.update_stage_state(stage_id, runnable=True)
+        resource_unit_id = graph.units[0].resource_unit_id
+        manager.update_unit_state(resource_unit_id, runnable=True)
         task_request = _task_request(runner, query_id, "request:task", "task:output-pump")
         task = await runner_cls.acquire_query_task_lease(runner, task_request)
         owned = await _fill_task_output_window(
             runner_cls,
             runner,
             query_id,
-            stage_id,
+            resource_unit_id,
             task,
             prefix="pump",
         )
@@ -1248,7 +1252,7 @@ def test_driver_output_pump_evaluates_each_waiter_once_per_state_transition():
             {
                 "request_id": f"request:output:{index}",
                 "query_id": query_id,
-                "producer_stage_id": stage_id,
+                "producer_unit_id": resource_unit_id,
                 "task_lease_id": task["lease"]["lease_id"],
                 "attempt_id": task["lease"]["attempt_id"],
                 "block_id": f"blocked-output:{index}",
@@ -1328,7 +1332,7 @@ def test_task_attempt_rejects_a_second_request_id_instead_of_orphaning_future():
         query_id = "query-duplicate-task-owner"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(
@@ -1336,7 +1340,7 @@ def test_task_attempt_rejects_a_second_request_id_instead_of_orphaning_future():
                 query_id,
             ),
         )
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
         active_request = _task_request(
             runner,
             query_id,
@@ -1384,7 +1388,7 @@ def test_output_block_rejects_a_second_request_id_instead_of_orphaning_future():
         query_id = "query-duplicate-output-owner"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(
@@ -1392,8 +1396,8 @@ def test_output_block_rejects_a_second_request_id_instead_of_orphaning_future():
                 query_id,
             ),
         )
-        stage_id = graph.stages[0].stage_id
-        manager.update_stage_state(stage_id, runnable=True)
+        resource_unit_id = graph.units[0].resource_unit_id
+        manager.update_unit_state(resource_unit_id, runnable=True)
         task_request = _task_request(
             runner,
             query_id,
@@ -1405,14 +1409,14 @@ def test_output_block_rejects_a_second_request_id_instead_of_orphaning_future():
             runner_cls,
             runner,
             query_id,
-            stage_id,
+            resource_unit_id,
             task,
             prefix="duplicate",
         )
         first_request = {
             "request_id": "request:first-output-owner",
             "query_id": query_id,
-            "producer_stage_id": stage_id,
+            "producer_unit_id": resource_unit_id,
             "task_lease_id": task["lease"]["lease_id"],
             "attempt_id": task["lease"]["attempt_id"],
             "block_id": "block:duplicate",
@@ -1456,7 +1460,7 @@ def test_terminal_task_and_output_requests_are_idempotent_for_query_lifetime():
         query_id = "query-terminal-request-replay"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(
@@ -1464,7 +1468,7 @@ def test_terminal_task_and_output_requests_are_idempotent_for_query_lifetime():
                 query_id,
             ),
         )
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
 
         task_request = _task_request(
             runner,
@@ -1476,7 +1480,7 @@ def test_terminal_task_and_output_requests_are_idempotent_for_query_lifetime():
         output_request = {
             "request_id": "request:terminal-output",
             "query_id": query_id,
-            "producer_stage_id": graph.stages[0].stage_id,
+            "producer_unit_id": graph.units[0].resource_unit_id,
             "task_lease_id": task["lease"]["lease_id"],
             "attempt_id": task["lease"]["attempt_id"],
             "block_id": "block:terminal",
@@ -1546,7 +1550,7 @@ def test_signed_task_lease_ack_survives_eviction_and_query_id_reuse():
         runner_cls, runner = _runner(asyncio.get_running_loop())
         runner._query_task_terminal_controls = BoundedReplayMap(capacity=1)
         runner._query_task_terminal_attempts = BoundedReplayMap(capacity=1)
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(
@@ -1554,7 +1558,7 @@ def test_signed_task_lease_ack_survives_eviction_and_query_id_reuse():
                 query_id,
             ),
         )
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
 
         task_request = _task_request(
             runner,
@@ -1670,8 +1674,8 @@ def test_signed_task_lease_ack_survives_eviction_and_query_id_reuse():
         assert len(runner._query_task_terminal_attempts) == 1
 
         clear_query_resource_managers()
-        next_manager = register_query_graph(graph, _allocation())
-        next_manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        next_manager = register_query_resource_graph(graph, _allocation())
+        next_manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
         runner_cls._open_query_resource_admission(runner, query_id)
         assert len(runner._query_task_lease_request_tombstones) == 0
         assert len(runner._query_task_terminal_controls) == 0
@@ -1719,7 +1723,7 @@ def test_signed_task_lease_ack_survives_eviction_and_query_id_reuse():
         stale_output_request = {
             "request_id": "request:stale-generation-output",
             "query_id": query_id,
-            "producer_stage_id": graph.stages[0].stage_id,
+            "producer_unit_id": graph.units[0].resource_unit_id,
             "task_lease_id": old_capability,
             "attempt_id": task["lease"]["attempt_id"],
             "block_id": "block:generation-fence",
@@ -1766,7 +1770,7 @@ def test_output_terminal_control_ack_survives_bounded_replay_payload_eviction():
         query_id = "query-output-terminal-after-eviction"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(
@@ -1774,7 +1778,7 @@ def test_output_terminal_control_ack_survives_bounded_replay_payload_eviction():
                 query_id,
             ),
         )
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
 
         task_request = _task_request(
             runner,
@@ -1786,7 +1790,7 @@ def test_output_terminal_control_ack_survives_bounded_replay_payload_eviction():
         output_request = {
             "request_id": "request:output-terminal-after-eviction",
             "query_id": query_id,
-            "producer_stage_id": graph.stages[0].stage_id,
+            "producer_unit_id": graph.units[0].resource_unit_id,
             "task_lease_id": task["lease"]["lease_id"],
             "attempt_id": task["lease"]["attempt_id"],
             "block_id": "block:output-terminal-after-eviction",
@@ -1855,7 +1859,7 @@ def test_cancelled_admission_request_replay_returns_the_same_terminal_denial():
         query_id = "query-cancelled-request-replay"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(
@@ -1863,7 +1867,7 @@ def test_cancelled_admission_request_replay_returns_the_same_terminal_denial():
                 query_id,
             ),
         )
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
 
         active_request = _task_request(
             runner,
@@ -1891,7 +1895,7 @@ def test_cancelled_admission_request_replay_returns_the_same_terminal_denial():
                 conflicting_cancel,
             )
         assert not original_waiter.done()
-        assert manager.snapshot()["stages"][graph.stages[0].stage_id]["pending_task_count"] == 1
+        assert manager.snapshot()["units"][graph.units[0].resource_unit_id]["pending_task_count"] == 1
 
         assert await runner_cls.cancel_query_task_lease_request(
             runner,
@@ -1935,16 +1939,16 @@ def test_query_teardown_resolves_all_pending_admission_futures():
         graph = _graph(query_id)
         allocation = _allocation()
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             allocation,
             on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
         )
-        stage_id = graph.stages[0].stage_id
-        manager.update_stage_state(stage_id, runnable=True)
+        resource_unit_id = graph.units[0].resource_unit_id
+        manager.update_unit_state(resource_unit_id, runnable=True)
         runner._query_resource_lock = threading.RLock()
         runner._query_resource_coordinator = _CoordinatorStub()
-        runner._query_graphs = {query_id: graph}
+        runner._query_resource_graphs = {query_id: graph}
         runner._query_allocations = {query_id: allocation}
 
         active_request = _task_request(runner, query_id, "request:active", "task:active")
@@ -1953,7 +1957,7 @@ def test_query_teardown_resolves_all_pending_admission_futures():
             runner_cls,
             runner,
             query_id,
-            stage_id,
+            resource_unit_id,
             active,
             prefix="teardown",
         )
@@ -1970,7 +1974,7 @@ def test_query_teardown_resolves_all_pending_admission_futures():
                 {
                     "request_id": "request:output",
                     "query_id": query_id,
-                    "producer_stage_id": stage_id,
+                    "producer_unit_id": resource_unit_id,
                     "task_lease_id": active["lease"]["lease_id"],
                     "attempt_id": active["lease"]["attempt_id"],
                     "block_id": "blocked-output",
@@ -2032,11 +2036,11 @@ def test_query_teardown_cleans_local_state_when_coordinator_lease_expired():
         allocation = _allocation()
         runner_cls, runner = _runner(asyncio.get_running_loop())
         runner_cls._ensure_query_resource_admission_state(runner)
-        register_query_graph(graph, allocation)
+        register_query_resource_graph(graph, allocation)
         coordinator = _ExpiredCoordinator()
         runner._query_resource_lock = threading.RLock()
         runner._query_resource_coordinator = coordinator
-        runner._query_graphs = {query_id: graph}
+        runner._query_resource_graphs = {query_id: graph}
         runner._query_allocations = {query_id: allocation}
         runner._synchronize_query_allocations = lambda: ()
 
@@ -2052,7 +2056,7 @@ def test_query_teardown_cleans_local_state_when_coordinator_lease_expired():
 
         with pytest.raises(KeyError):
             get_query_resource_manager(query_id)
-        assert runner._query_graphs == {}
+        assert runner._query_resource_graphs == {}
         assert runner._query_allocations == {}
         assert coordinator.calls == [(query_id, allocation.generation)]
 
@@ -2082,10 +2086,10 @@ def test_fragment_drop_waits_for_fte_admission_pump_before_registry_drop(monkeyp
         allocation = _allocation()
         runner_cls, runner = _runner(asyncio.get_running_loop())
         runner_cls._ensure_query_resource_admission_state(runner)
-        register_query_graph(graph, allocation)
+        register_query_resource_graph(graph, allocation)
         runner._query_resource_lock = threading.RLock()
         runner._query_resource_coordinator = _CoordinatorStub()
-        runner._query_graphs = {query_id: graph}
+        runner._query_resource_graphs = {query_id: graph}
         runner._query_allocations = {query_id: allocation}
         runner._synchronize_query_allocations = lambda: ()
 
@@ -2160,11 +2164,11 @@ def test_fragment_drop_keeps_query_resources_when_local_fte_registry_cannot_quie
         allocation = _allocation()
         runner_cls, runner = _runner(asyncio.get_running_loop())
         runner_cls._ensure_query_resource_admission_state(runner)
-        manager = register_query_graph(graph, allocation)
+        manager = register_query_resource_graph(graph, allocation)
         coordinator = _CoordinatorStub()
         runner._query_resource_lock = threading.RLock()
         runner._query_resource_coordinator = coordinator
-        runner._query_graphs = {query_id: graph}
+        runner._query_resource_graphs = {query_id: graph}
         runner._query_allocations = {query_id: allocation}
         runner._synchronize_query_allocations = lambda: ()
         runner._get_plan_runner = lambda: SimpleNamespace(
@@ -2185,7 +2189,7 @@ def test_fragment_drop_keeps_query_resources_when_local_fte_registry_cannot_quie
             )
 
         assert get_query_resource_manager(query_id) is manager
-        assert runner._query_graphs == {query_id: graph}
+        assert runner._query_resource_graphs == {query_id: graph}
         assert runner._query_allocations == {query_id: allocation}
         assert coordinator.released == []
         assert query_id in runner._query_resource_closing_queries
@@ -2219,11 +2223,11 @@ def test_fragment_drop_retains_query_owner_while_remote_teardown_is_incomplete(m
         allocation = _allocation()
         runner_cls, runner = _runner(asyncio.get_running_loop())
         runner_cls._ensure_query_resource_admission_state(runner)
-        manager = register_query_graph(graph, allocation)
+        manager = register_query_resource_graph(graph, allocation)
         coordinator = _CoordinatorStub()
         runner._query_resource_lock = threading.RLock()
         runner._query_resource_coordinator = coordinator
-        runner._query_graphs = {query_id: graph}
+        runner._query_resource_graphs = {query_id: graph}
         runner._query_allocations = {query_id: allocation}
         runner._synchronize_query_allocations = lambda: ()
         runner._fence_query_resource_admission_for_teardown = lambda _query_id: None
@@ -2260,7 +2264,7 @@ def test_fragment_drop_retains_query_owner_while_remote_teardown_is_incomplete(m
         assert "planned worker teardown timeout" in str(exc_info.value)
         assert "active_teardown=1" in str(exc_info.value)
         assert get_query_resource_manager(query_id) is manager
-        assert runner._query_graphs == {query_id: graph}
+        assert runner._query_resource_graphs == {query_id: graph}
         assert runner._query_allocations == {query_id: allocation}
         assert coordinator.released == []
 
@@ -2387,7 +2391,7 @@ def test_owner_loop_sync_fence_timeout_isolated_to_query_until_callback_settles(
 
 
 def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
-    import duckdb.runners.ray.query_graph_builder as graph_builder
+    import duckdb.runners.ray.query_resource_graph_builder as graph_builder
     from duckdb.runners.ray.query_resource_runtime import (
         get_query_resource_manager,
     )
@@ -2411,7 +2415,7 @@ def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
 
     monkeypatch.setattr(
         graph_builder,
-        "build_query_execution_graph",
+        "build_query_resource_graph",
         lambda _metadata: graph,
     )
     monkeypatch.setattr(
@@ -2426,7 +2430,7 @@ def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
     runner = object.__new__(runner_cls)
     runner._duckdb_conn = None
     runner._query_resource_lock = threading.RLock()
-    runner._query_graphs = {}
+    runner._query_resource_graphs = {}
     runner._query_allocations = {}
     runner._query_resource_coordinator = _Coordinator()
     capacity = ResourceVector(cpu=1, heap_bytes=101, object_store_bytes=20)
@@ -2438,7 +2442,7 @@ def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
 
     runner._open_query_resource_admission = fail_open
     plan = SimpleNamespace(
-        collect_execution_stages=lambda conn: object(),
+        collect_query_resource_graph_metadata=lambda conn: object(),
         idx=lambda: query_id,
     )
 
@@ -2454,12 +2458,12 @@ def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
     with pytest.raises(KeyError):
         get_query_resource_manager(query_id)
     assert released == [(query_id, allocation.generation)]
-    assert runner._query_graphs == {}
+    assert runner._query_resource_graphs == {}
     assert runner._query_allocations == {}
 
 
 def test_query_registration_retains_failed_coordinator_release_for_retry(monkeypatch):
-    import duckdb.runners.ray.query_graph_builder as graph_builder
+    import duckdb.runners.ray.query_resource_graph_builder as graph_builder
     from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
     query_id = "query-registration-release-retry"
@@ -2484,7 +2488,7 @@ def test_query_registration_retains_failed_coordinator_release_for_retry(monkeyp
                 raise RuntimeError("planned coordinator release failure")
             return True
 
-    monkeypatch.setattr(graph_builder, "build_query_execution_graph", lambda _metadata: graph)
+    monkeypatch.setattr(graph_builder, "build_query_resource_graph", lambda _metadata: graph)
     monkeypatch.setattr(graph_builder, "build_query_demand", lambda _graph, _capacity: "demand")
 
     from duckdb.runners.ray.driver import RayQueryDriverActor
@@ -2492,7 +2496,7 @@ def test_query_registration_retains_failed_coordinator_release_for_retry(monkeyp
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
     runner._query_resource_lock = threading.RLock()
-    runner._query_graphs = {}
+    runner._query_resource_graphs = {}
     runner._query_allocations = {}
     runner._query_resource_coordinator = _Coordinator()
     capacity = ResourceVector(cpu=1, heap_bytes=101, object_store_bytes=20)
@@ -2503,7 +2507,7 @@ def test_query_registration_retains_failed_coordinator_release_for_retry(monkeyp
     )
     runner._fence_query_resource_admission_for_teardown = lambda _query_id: None
     plan = SimpleNamespace(
-        collect_execution_stages=lambda conn: object(),
+        collect_query_resource_graph_metadata=lambda conn: object(),
         idx=lambda: query_id,
     )
 
@@ -2516,7 +2520,7 @@ def test_query_registration_retains_failed_coordinator_release_for_retry(monkeyp
             )
         )
 
-    assert runner._query_graphs == {query_id: graph}
+    assert runner._query_resource_graphs == {query_id: graph}
     assert runner._query_allocations == {query_id: allocation}
     assert get_query_resource_manager(query_id) is not None
 
@@ -2527,7 +2531,7 @@ def test_query_registration_retains_failed_coordinator_release_for_retry(monkeyp
     )
 
     assert runner._query_resource_coordinator.release_calls == 2
-    assert runner._query_graphs == {}
+    assert runner._query_resource_graphs == {}
     assert runner._query_allocations == {}
     with pytest.raises(KeyError):
         get_query_resource_manager(query_id)
@@ -2615,7 +2619,7 @@ def test_query_teardown_retries_manager_after_coordinator_release():
     coordinator = _Coordinator()
     runner._query_resource_lock = threading.RLock()
     runner._query_resource_coordinator = coordinator
-    runner._query_graphs = {query_id: graph}
+    runner._query_resource_graphs = {query_id: graph}
     runner._query_allocations = {query_id: allocation}
     runner._fence_query_resource_admission_for_teardown = lambda _query_id: None
     with runtime._LOCK:
@@ -2629,7 +2633,7 @@ def test_query_teardown_retries_manager_after_coordinator_release():
             )
 
         assert coordinator.release_calls == [(query_id, allocation.generation)]
-        assert runner._query_graphs == {}
+        assert runner._query_resource_graphs == {}
         assert runner._query_allocations == {}
         with runtime._LOCK:
             assert runtime._MANAGERS[query_id] is manager
@@ -2661,11 +2665,11 @@ def test_background_query_teardown_fences_new_admission_before_table_purge():
         graph = _graph(query_id)
         allocation = _allocation()
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(graph, allocation)
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager = register_query_resource_graph(graph, allocation)
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
         runner._query_resource_lock = threading.RLock()
         runner._query_resource_coordinator = _CoordinatorStub()
-        runner._query_graphs = {query_id: graph}
+        runner._query_resource_graphs = {query_id: graph}
         runner._query_allocations = {query_id: allocation}
 
         active_request = _task_request(
@@ -2742,18 +2746,18 @@ def test_background_query_teardown_fences_new_admission_before_table_purge():
     asyncio.run(scenario())
 
 
-def test_task_admission_pump_resolves_waiter_when_stage_becomes_terminal():
+def test_task_admission_pump_resolves_waiter_when_unit_becomes_terminal():
     async def scenario():
-        query_id = "query-task-stage-terminal"
+        query_id = "query-task-unit-terminal"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        manager = register_query_graph(
+        manager = register_query_resource_graph(
             graph,
             _allocation(),
             on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
         )
-        stage_id = graph.stages[0].stage_id
-        manager.update_stage_state(stage_id, runnable=True)
+        resource_unit_id = graph.units[0].resource_unit_id
+        manager.update_unit_state(resource_unit_id, runnable=True)
         active_request = _task_request(runner, query_id, "request:active", "task:active")
         active = await runner_cls.acquire_query_task_lease(runner, active_request)
         pending_request = _task_request(
@@ -2772,11 +2776,11 @@ def test_task_admission_pump_resolves_waiter_when_stage_becomes_terminal():
             await asyncio.sleep(0)
         assert not pending.done()
 
-        manager.update_stage_state(stage_id, runnable=False, completed=True)
+        manager.update_unit_state(resource_unit_id, runnable=False, completed=True)
         denial = await asyncio.wait_for(pending, timeout=1)
         assert denial["granted"] is False
         assert denial["fatal"] is True
-        assert denial["blocked_reason"] == "stage_completed"
+        assert denial["blocked_reason"] == "unit_completed"
         assert (
             await runner_cls.acquire_query_task_lease(
                 runner,
@@ -2818,7 +2822,7 @@ def test_new_query_generation_reopens_admission_after_old_state_is_purged():
         query_id = "query-generation-reopen"
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
-        register_query_graph(graph, _allocation())
+        register_query_resource_graph(graph, _allocation())
         delayed_old_request = _task_request(
             runner,
             query_id,
@@ -2840,7 +2844,7 @@ def test_new_query_generation_reopens_admission_after_old_state_is_purged():
             {
                 "request_id": "request:late-old-generation-output",
                 "query_id": query_id,
-                "producer_stage_id": graph.stages[0].stage_id,
+                "producer_unit_id": graph.units[0].resource_unit_id,
                 "task_lease_id": retired_task_lease_id,
                 "attempt_id": "attempt:retired-old-generation-task",
                 "block_id": "block:late-old-generation-output",
@@ -2872,7 +2876,7 @@ def test_new_query_generation_reopens_admission_after_old_state_is_purged():
         closed_generation_cancel = dict(
             request_id="request:closed-generation-output",
             query_id=query_id,
-            producer_stage_id=graph.stages[0].stage_id,
+            producer_unit_id=graph.units[0].resource_unit_id,
             task_lease_id=retired_task_lease_id,
             attempt_id="attempt:retired-old-generation-task",
             block_id="block:closed-generation-output",
@@ -2885,8 +2889,8 @@ def test_new_query_generation_reopens_admission_after_old_state_is_purged():
         assert len(runner._query_output_lease_request_tombstones) == 0
         clear_query_resource_managers()
 
-        manager = register_query_graph(graph, _allocation())
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager = register_query_resource_graph(graph, _allocation())
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
         runner_cls._open_query_resource_admission(runner, query_id)
 
         stale_grant = await runner_cls.acquire_query_task_lease(
@@ -2936,8 +2940,8 @@ def test_signed_output_lease_ack_survives_teardown_and_query_id_reuse():
         graph = _graph(query_id)
         runner_cls, runner = _runner(asyncio.get_running_loop())
         runner._query_output_terminal_controls = BoundedReplayMap(capacity=1)
-        manager = register_query_graph(graph, _allocation())
-        manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        manager = register_query_resource_graph(graph, _allocation())
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
 
         task_request = _task_request(
             runner,
@@ -2954,7 +2958,7 @@ def test_signed_output_lease_ack_survives_teardown_and_query_id_reuse():
             return {
                 "request_id": f"request:signed-output:{index}",
                 "query_id": query_id,
-                "producer_stage_id": graph.stages[0].stage_id,
+                "producer_unit_id": graph.units[0].resource_unit_id,
                 "task_lease_id": task["lease"]["lease_id"],
                 "attempt_id": task["lease"]["attempt_id"],
                 "block_id": f"block:signed-output:{index}",
@@ -3019,8 +3023,8 @@ def test_signed_output_lease_ack_survives_teardown_and_query_id_reuse():
         ) == {"released": True}
 
         clear_query_resource_managers()
-        next_manager = register_query_graph(graph, _allocation())
-        next_manager.update_stage_state(graph.stages[0].stage_id, runnable=True)
+        next_manager = register_query_resource_graph(graph, _allocation())
+        next_manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
         runner_cls._open_query_resource_admission(runner, query_id)
 
         task_request = _task_request(
