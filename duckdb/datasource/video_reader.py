@@ -1384,11 +1384,11 @@ class VideoFrameSource(DataSource):
     decoding.
 
     ``on_error="raise"`` fails the query on an unreadable file.
-    ``on_error="skip"`` keeps frames emitted before the error, skips the
-    remainder of that file, and continues with the next file. Frames that
-    decord recovers without raising are considered successfully decoded.
-    Configuration, task-infrastructure, and result-construction failures
-    always fail the query instead of being classified as unreadable input.
+    ``on_error="skip"`` suppresses only failures classified as
+    :class:`VideoReadError`: it keeps frames emitted before the error, skips
+    the remainder of that file, and continues with the next file. Every other
+    exception propagates and fails the query. Frames that decord recovers
+    without raising are considered successfully decoded.
     """
 
     def __init__(
