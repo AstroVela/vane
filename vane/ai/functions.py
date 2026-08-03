@@ -1018,14 +1018,28 @@ class _PromptBatch:
 
         async def run_all(indices: list[int]) -> list[str | None]:
             if self._max_concurrency_per_actor is None:
-                return await asyncio.gather(*(invoke(index) for index in indices))
-            semaphore = asyncio.Semaphore(self._max_concurrency_per_actor)
+                calls = [invoke(index) for index in indices]
+            else:
+                semaphore = asyncio.Semaphore(self._max_concurrency_per_actor)
 
-            async def limited(index: int) -> str | None:
-                async with semaphore:
-                    return await invoke(index)
+                async def limited(index: int) -> str | None:
+                    async with semaphore:
+                        return await invoke(index)
 
-            return await asyncio.gather(*(limited(index) for index in indices))
+                calls = [limited(index) for index in indices]
+
+            tasks = [asyncio.create_task(call) for call in calls]
+            try:
+                return await asyncio.gather(*tasks)
+            except BaseException:
+                # ``gather`` propagates the first failure but leaves sibling
+                # requests running.  Drain their cancellation before this
+                # batch returns so a failed row cannot leak work into the
+                # next batch or outlive the executor-owned event loop.
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
 
         indices = list(row_messages)
         prompt_results = self._require_run_async()(run_all(indices))
@@ -1738,7 +1752,14 @@ def _is_relation_like(value: Any) -> bool:
     return hasattr(value, "map_batches") and hasattr(value, "select")
 
 
-_PROMPT_ARGUMENT_UNSET = object()
+_PROMPT_ARGUMENT_UNSET: Any = object()
+
+
+class _DefaultPromptOutputColumn(str):
+    """Distinguish an omitted Relation-only keyword from an explicit value."""
+
+
+_PROMPT_OUTPUT_COLUMN_DEFAULT = _DefaultPromptOutputColumn("response")
 
 
 @overload
@@ -1802,20 +1823,20 @@ def prompt(
 
 
 def prompt(
-    first: Any = _PROMPT_ARGUMENT_UNSET,
+    first: Expression | list[Expression] | Relation = _PROMPT_ARGUMENT_UNSET,
     /,
-    messages: Any = _PROMPT_ARGUMENT_UNSET,
+    messages: Expression | list[Expression] = _PROMPT_ARGUMENT_UNSET,
     *,
-    rel: Any = _PROMPT_ARGUMENT_UNSET,
-    return_format: Any = None,
+    rel: Relation = _PROMPT_ARGUMENT_UNSET,
+    return_format: type[BaseModel] | JSONSchema | None = None,
     system_message: str | None = None,
-    provider: Any = "openai",
+    provider: str | Provider = "openai",
     model: str | None = None,
     return_raw_response: bool = False,
-    on_error: str = "raise",
-    output_column: Any = _PROMPT_ARGUMENT_UNSET,
-    **options: Any,
-) -> Any:
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = _PROMPT_OUTPUT_COLUMN_DEFAULT,
+    **options: Unpack[PromptOptions],
+) -> Expression | Relation:
     """Prompt over ordered VARCHAR, BLOB, or BLOB[] Expressions.
 
     ``return_format`` accepts a Pydantic model class or the portable JSON
@@ -1830,7 +1851,7 @@ def prompt(
     if relation is not _PROMPT_ARGUMENT_UNSET and _is_relation_like(relation):
         if messages is _PROMPT_ARGUMENT_UNSET:
             raise TypeError("vane.ai.prompt relation API requires messages")
-        resolved_output = "response" if output_column is _PROMPT_ARGUMENT_UNSET else output_column
+        resolved_output = "response" if output_column is _PROMPT_OUTPUT_COLUMN_DEFAULT else output_column
         return _prompt_relation(
             relation,
             messages,
@@ -1851,7 +1872,7 @@ def prompt(
     expression_messages = messages if first is _PROMPT_ARGUMENT_UNSET else first
     if expression_messages is _PROMPT_ARGUMENT_UNSET:
         raise TypeError("vane.ai.prompt requires messages or a Relation plus messages")
-    if output_column is not _PROMPT_ARGUMENT_UNSET:
+    if output_column is not _PROMPT_OUTPUT_COLUMN_DEFAULT:
         raise TypeError("vane.ai.prompt expression API does not accept output_column; use .alias(...)")
     return _prompt_expression(
         expression_messages,

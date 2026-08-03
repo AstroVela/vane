@@ -8,7 +8,7 @@ import inspect
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Literal, get_overloads, get_type_hints
+from typing import Any, Literal, get_overloads, get_type_hints
 
 import numpy as np
 import pyarrow as pa
@@ -18,7 +18,7 @@ from typing_extensions import Unpack
 import duckdb
 import vane
 from vane.ai import provider as provider_registry
-from vane.ai.options import EmbedOptions
+from vane.ai.options import EmbedOptions, PromptOptions
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider
 from vane.ai.typing import EmbeddingDimensions, UDFOptions
@@ -756,6 +756,26 @@ def test_ai_prompt_expression_basic():
     expr = vane.ai.prompt(vane.col("chunk"), provider=MockProvider()).alias("topic")
 
     assert rel.select(expr).fetchall() == [("topic:search",), ("topic:ranking",)]
+
+
+def test_ai_prompt_runtime_signature_matches_public_contract():
+    signature = inspect.signature(vane.ai.prompt, eval_str=True)
+    parameters = signature.parameters
+
+    assert parameters["first"].annotation == vane.Expression | list[vane.Expression] | vane.Relation
+    assert parameters["messages"].annotation == vane.Expression | list[vane.Expression]
+    assert parameters["rel"].annotation is vane.Relation
+    assert parameters["return_format"].annotation == type[Any] | vane.ai.JSONSchema | None
+    assert parameters["provider"].annotation == str | Provider
+    assert parameters["on_error"].annotation == Literal["raise", "ignore"]
+    assert parameters["output_column"].annotation is str
+    assert parameters["output_column"].default == "response"
+    assert parameters["options"].kind is inspect.Parameter.VAR_KEYWORD
+
+    hints = get_type_hints(vane.ai.prompt, include_extras=True)
+    assert hints["options"] == Unpack[PromptOptions]
+    assert hints["return"] == vane.Expression | vane.Relation
+    assert len(get_overloads(vane.ai.prompt)) == 4
 
 
 def test_ai_prompt_four_public_entries_are_equivalent():

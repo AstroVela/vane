@@ -108,19 +108,12 @@ def _embedding_output_type(dimensions: int) -> str:
 
 def _normalize_sql_options(options: dict[str, Any] | None) -> dict[str, Any]:
     _reject_inline_credentials(options or {})
+    # Preserve explicit NULL fields until the closed API validators see them.
+    # Dropping them here would let removed/unknown names and non-nullable
+    # values bypass planning-time validation.
     opts = {key: _normalize_option_value(value, key) for key, value in dict(options or {}).items()}
     _reject_inline_credentials(opts)
     return opts
-
-
-def _normalize_embed_sql_options(options: dict[str, Any] | None) -> dict[str, Any]:
-    _reject_inline_credentials(options or {})
-    # Preserve explicit NULL fields until the closed Embed validator sees
-    # them.  Dropping them here would let removed/unknown option names and
-    # non-nullable values such as actor_number := NULL bypass planning-time
-    # validation.  Provider options whose contract explicitly permits None
-    # remain valid.
-    return {key: _normalize_option_value(value, key) for key, value in dict(options or {}).items()}
 
 
 def build_ai_prompt_sql_spec(
@@ -238,7 +231,7 @@ def build_ai_embed_sql_spec(
     on_error: str = "raise",
     options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    opts = _normalize_embed_sql_options(options)
+    opts = _normalize_sql_options(options)
     descriptor, resolved_dimensions, udf_opts, normalize, _, _, _, _ = _prepare_embed_call(
         provider,
         model,

@@ -113,8 +113,28 @@ _GOOGLE_EMBED_TASK_TYPES = frozenset(
         "CODE_RETRIEVAL_QUERY",
     }
 )
-_EMBED_EXECUTION_BACKENDS = frozenset({"subprocess_task", "subprocess_actor", "ray_task", "ray_actor"})
-_OPENAI_EMBED_EXTRA_SENSITIVE_KEYS = frozenset({"organization"})
+_EXECUTION_BACKENDS = frozenset({"subprocess_task", "subprocess_actor", "ray_task", "ray_actor"})
+_OPENAI_EXTRA_SENSITIVE_KEYS = frozenset({"organization"})
+
+
+def _validate_base_url_option(options: Mapping[str, Any], *, api: Literal["Embed", "Prompt"]) -> None:
+    if "base_url" not in options or options["base_url"] is None:
+        return
+    value = options["base_url"]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{api} option 'base_url' must be a non-empty HTTP(S) URL or None")
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{api} option 'base_url' must be a non-empty HTTP(S) URL or None")
+    sensitive_query_keys = [
+        key
+        for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
+        if is_sensitive_option_key(key, _OPENAI_EXTRA_SENSITIVE_KEYS)
+    ]
+    if parsed.username or parsed.password or sensitive_query_keys:
+        raise ValueError(f"{api} option 'base_url' cannot contain credentials")
+    if parsed.fragment:
+        raise ValueError(f"{api} option 'base_url' cannot contain a URL fragment")
 
 
 def _reject_sensitive_embed_options(value: Any, path: str = "options") -> None:
@@ -178,7 +198,7 @@ def validate_embed_options(
 
     backend = copied.get("execution_backend")
     if backend is not None:
-        if not isinstance(backend, str) or backend not in _EMBED_EXECUTION_BACKENDS:
+        if not isinstance(backend, str) or backend not in _EXECUTION_BACKENDS:
             raise ValueError(
                 "Embed option 'execution_backend' must be one of: "
                 "subprocess_task, subprocess_actor, ray_task, ray_actor"
@@ -201,22 +221,7 @@ def validate_embed_options(
         encoding_format = copied.get("encoding_format", "float")
         if encoding_format not in {"float", "base64"}:
             raise ValueError("Embed option 'encoding_format' must be 'float' or 'base64'")
-        base_url = copied.get("base_url")
-        if base_url is not None:
-            if not isinstance(base_url, str) or not base_url.strip():
-                raise ValueError("Embed option 'base_url' must be a non-empty HTTP(S) URL or None")
-            parsed = urlsplit(base_url)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                raise ValueError("Embed option 'base_url' must be a non-empty HTTP(S) URL or None")
-            sensitive_query_keys = [
-                key
-                for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
-                if is_sensitive_option_key(key, _OPENAI_EMBED_EXTRA_SENSITIVE_KEYS)
-            ]
-            if parsed.username or parsed.password or sensitive_query_keys:
-                raise ValueError("Embed option 'base_url' cannot contain credentials")
-            if parsed.fragment:
-                raise ValueError("Embed option 'base_url' cannot contain a URL fragment")
+        _validate_base_url_option(copied, api="Embed")
         timeout = copied.get("timeout")
         if timeout is not None:
             if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
@@ -269,8 +274,6 @@ _PROMPT_PROVIDER_OPTIONS = {
         }
     ),
 }
-_PROMPT_EXECUTION_BACKENDS = frozenset({"subprocess_task", "subprocess_actor", "ray_task", "ray_actor"})
-_OPENAI_PROMPT_EXTRA_SENSITIVE_KEYS = frozenset({"organization"})
 
 
 def _reject_sensitive_prompt_options(value: Any, path: str = "options") -> None:
@@ -278,7 +281,7 @@ def _reject_sensitive_prompt_options(value: Any, path: str = "options") -> None:
         for key, item in value.items():
             if not isinstance(key, str):
                 raise TypeError(f"Prompt option {path} must use string keys; got {type(key).__name__}")
-            if is_sensitive_option_key(key, _OPENAI_PROMPT_EXTRA_SENSITIVE_KEYS):
+            if is_sensitive_option_key(key, _OPENAI_EXTRA_SENSITIVE_KEYS):
                 raise ValueError(
                     f"Prompt options cannot include sensitive field {path}.{key}; "
                     "configure credentials through the environment or runtime secret management"
@@ -334,26 +337,6 @@ def _validate_prompt_stop_sequences(options: Mapping[str, Any]) -> None:
         raise ValueError("Prompt option 'stop_sequences' must contain only non-empty strings")
 
 
-def _validate_prompt_base_url(options: Mapping[str, Any]) -> None:
-    if "base_url" not in options or options["base_url"] is None:
-        return
-    value = options["base_url"]
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("Prompt option 'base_url' must be a non-empty HTTP(S) URL or None")
-    parsed = urlsplit(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("Prompt option 'base_url' must be a non-empty HTTP(S) URL or None")
-    sensitive_query_keys = [
-        key
-        for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
-        if is_sensitive_option_key(key, _OPENAI_PROMPT_EXTRA_SENSITIVE_KEYS)
-    ]
-    if parsed.username or parsed.password or sensitive_query_keys:
-        raise ValueError("Prompt option 'base_url' cannot contain credentials")
-    if parsed.fragment:
-        raise ValueError("Prompt option 'base_url' cannot contain a URL fragment")
-
-
 def _validate_vllm_json(value: Any, path: str) -> None:
     if value is None or isinstance(value, (str, bool, int)):
         return
@@ -407,7 +390,7 @@ def validate_prompt_options(
 
     backend = copied.get("execution_backend")
     if backend is not None:
-        if not isinstance(backend, str) or backend not in _PROMPT_EXECUTION_BACKENDS:
+        if not isinstance(backend, str) or backend not in _EXECUTION_BACKENDS:
             raise ValueError(
                 "Prompt option 'execution_backend' must be one of: "
                 "subprocess_task, subprocess_actor, ray_task, ray_actor"
@@ -450,7 +433,7 @@ def validate_prompt_options(
     if family in {"openai", "anthropic", "google"}:
         _require_prompt_number(copied, "top_p", minimum=0, maximum=1, nullable=True)
         _validate_prompt_stop_sequences(copied)
-        _validate_prompt_base_url(copied)
+        _validate_base_url_option(copied, api="Prompt")
         _require_prompt_number(copied, "timeout", minimum=0, nullable=True)
         if copied.get("timeout") == 0:
             raise ValueError("Prompt option 'timeout' must be a finite positive number or None")

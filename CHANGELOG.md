@@ -22,9 +22,8 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 ### Changed
 
 - Positioned the current project as the Vane Data developer preview.
-- Replaced the former Prompt column/image-column and open provider-option APIs
-  with `messages`, first-class call parameters, and the closed `PromptOptions`
-  keyword surface. OpenAI Responses is now the default endpoint.
+- Prompt uses ordered `messages`, first-class call parameters, and the closed
+  `PromptOptions` keyword surface. OpenAI Responses is the default endpoint.
 - Defined `DuckDBPyRelation.map` exclusively as a row-wise scalar UDF with a
   required `return_type`; batch transforms use `map_batches` with an explicit
   output `schema`. The inherited pandas DataFrame-style DuckDB `map` contract

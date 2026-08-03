@@ -267,6 +267,34 @@ class ConcurrencyTrackingPromptDescriptor:
         return self.prompter
 
 
+class FailingConcurrentPrompter:
+    """Wait for a sibling request, then fail and observe its cancellation."""
+
+    def __init__(self) -> None:
+        self.slow_started = asyncio.Event()
+        self.cancelled = 0
+
+    async def prompt(self, messages: tuple) -> str:
+        if messages[0] == "slow":
+            self.slow_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+        await self.slow_started.wait()
+        raise RuntimeError("row failed")
+
+
+class FailingConcurrentPromptDescriptor:
+    def __init__(self) -> None:
+        self.prompter: FailingConcurrentPrompter | None = None
+
+    def instantiate(self) -> FailingConcurrentPrompter:
+        self.prompter = FailingConcurrentPrompter()
+        return self.prompter
+
+
 class FlakyOncePrompter:
     """Fails the first call with a zero-wait retryable error, then succeeds."""
 
@@ -345,6 +373,23 @@ def test_prompt_semaphore_and_ordering_on_bound_loop(runtime) -> None:
 
     assert result.column("response").to_pylist() == [f"echo:{t}" for t in texts]
     assert descriptor.prompter.peak <= 2
+
+
+def test_prompt_failure_cancels_and_drains_sibling_requests(runtime) -> None:
+    descriptor = FailingConcurrentPromptDescriptor()
+    wrapper = _PromptBatch(
+        descriptor,
+        ["text"],
+        "response",
+        max_concurrency_per_actor=2,
+        max_retries=0,
+    )
+    wrapper.bind_async_runtime(runtime.run)
+
+    with pytest.raises(RuntimeError, match="row failed"):
+        wrapper(pa.table({"text": ["slow", "fail"]}))
+
+    assert descriptor.prompter.cancelled == 1
 
 
 def test_embed_chunking_drives_chunks_on_the_bound_loop(runtime) -> None:
