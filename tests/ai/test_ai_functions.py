@@ -2707,6 +2707,29 @@ class TestChunking:
         assert len(emb0) == dim
         assert len(emb1) == dim
 
+    @pytest.mark.parametrize(
+        ("normalize", "expected"),
+        [
+            (False, [5.2, 5.2]),
+            (True, [2**-0.5, 2**-0.5]),
+        ],
+    )
+    def test_embed_batch_chunking_respects_normalization(self, normalize, expected):
+        from vane.ai.functions import _EmbedTextBatch
+
+        batch = _EmbedTextBatch(
+            MockTextEmbedderDescriptor(dim=2),
+            "text",
+            "embedding",
+            max_chunk_chars=6,
+            chunk_overlap_chars=0,
+            normalize=normalize,
+        )
+
+        result = _drive(batch, pa.table({"text": ["abcdefghij"]}))
+
+        assert result.column("embedding")[0].as_py() == pytest.approx(expected)
+
     def test_embed_batch_no_chunking_by_default(self):
         """_EmbedTextBatch without max_chunk_chars doesn't chunk."""
         from vane.ai.functions import _EmbedTextBatch

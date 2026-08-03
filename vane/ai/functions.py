@@ -366,15 +366,18 @@ def chunk_text(
 def _weighted_average_embeddings(
     embeddings: list[Any],
     weights: list[float],
+    *,
+    normalize: bool = True,
 ) -> Any:
     """Compute length-weighted average of embeddings."""
     arr = np.array(embeddings, dtype=np.float64)
     w = np.array(weights, dtype=np.float64)
     w /= w.sum()
     averaged = (arr * w[:, np.newaxis]).sum(axis=0)
-    norm = np.linalg.norm(averaged)
-    if norm > 0:
-        averaged /= norm
+    if normalize:
+        norm = np.linalg.norm(averaged)
+        if norm > 0:
+            averaged /= norm
     return averaged.astype(np.float32)
 
 
@@ -618,7 +621,7 @@ class _EmbedTextBatch:
             else:
                 embs = [chunk_embeddings[idx] for idx, _ in entry]
                 weights = [w for _, w in entry]
-                results.append(_weighted_average_embeddings(embs, weights))
+                results.append(_weighted_average_embeddings(embs, weights, normalize=False))
         return results
 
 
@@ -952,8 +955,9 @@ def embed_text(
             ``"google"``) require an explicit model here or on the provider
             instance and raise :class:`ValueError` otherwise.
         dimensions: Output embedding dimensions (model default if ``None``).
-        normalize: Whether to L2-normalize embeddings. ``None`` uses the
-            provider/model default.
+        normalize: Whether Vane should locally L2-normalize provider outputs.
+            ``None`` uses the provider/model default. ``False`` does not undo
+            normalization already applied by the provider.
         output_column: Name of the output column (default: ``"embedding"``).
         max_chunk_chars: If set, texts longer than this are split into
             overlapping chunks, embedded separately, and combined via
@@ -1007,6 +1011,9 @@ def embed(
     actor. Provider ``concurrency`` maps internally to UDF ``actor_number``.
     Prefer provider environment variables such as ``OPENAI_API_KEY`` or
     ``GOOGLE_API_KEY`` over passing API keys in code or SQL text.
+
+    ``normalize`` controls Vane's local L2 post-processing. ``None`` uses the
+    provider/model default; ``False`` does not undo provider-side normalization.
     """
     prov = _resolve_provider(provider, "openai")
     descriptor_options = _merge_options(provider_options, embedding_options)
