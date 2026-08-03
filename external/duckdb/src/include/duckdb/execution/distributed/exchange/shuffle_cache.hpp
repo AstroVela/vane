@@ -103,8 +103,6 @@ public:
 	DuckDBResult<std::vector<ShufflePartitionFile>> WriteCollection(ClientContext &context,
 	                                                                ColumnDataCollection &collection,
 	                                                                idx_t partition_idx, const vector<string> &names);
-	DuckDBResult<std::unique_ptr<ColumnDataCollection>> ReadPartition(ClientContext &context, idx_t partition_idx,
-	                                                                  const vector<LogicalType> &expected_types);
 	DuckDBResult<std::shared_ptr<arrow::io::InputStream>> OpenPartitionFile(const std::string &path) const;
 
 	//! Flush all remaining buffered data to disk. This must be called explicitly

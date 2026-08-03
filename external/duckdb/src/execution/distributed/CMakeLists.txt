@@ -21,8 +21,7 @@ set(DISTRIBUTED_SOURCES_EXCHANGE)
 if(BUILD_DISTRIBUTED_EXCHANGE)
   set(DISTRIBUTED_SOURCES_EXCHANGE
       exchange/flight_ticket.cpp exchange/shuffle_cache.cpp
-      exchange/flight_client.cpp exchange/flight_server.cpp
-      exchange/flight_exchange_manager.cpp)
+      exchange/flight_server.cpp exchange/flight_exchange_manager.cpp)
 else()
   set(DISTRIBUTED_SOURCES_EXCHANGE exchange/flight_exchange_manager_stub.cpp)
 endif()

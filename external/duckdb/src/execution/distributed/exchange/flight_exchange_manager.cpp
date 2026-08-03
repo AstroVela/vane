@@ -19,7 +19,6 @@
  */
 
 #include "duckdb/execution/distributed/exchange/flight_exchange_manager.hpp"
-#include "duckdb/execution/distributed/exchange/flight_client.hpp"
 #include "duckdb/execution/distributed/exchange/flight_ticket.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
