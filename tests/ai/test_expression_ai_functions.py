@@ -35,12 +35,13 @@ class MockTextEmbedderDescriptor(TextEmbedderDescriptor):
     dim: int
     actor_number: int | None = None
     max_api_concurrency: int | None = None
+    model_name: str = "mock-embedding"
 
     def get_provider(self) -> str:
         return "mock"
 
     def get_model(self) -> str:
-        return "mock-embedding"
+        return self.model_name
 
     def get_options(self) -> dict[str, object]:
         return {
@@ -51,6 +52,9 @@ class MockTextEmbedderDescriptor(TextEmbedderDescriptor):
 
     def get_dimensions(self) -> EmbeddingDimensions:
         return EmbeddingDimensions(size=self.dim, dtype=pa.float32())
+
+    def normalize_embeddings_by_default(self) -> bool:
+        return self.model_name == "normalize-by-default"
 
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(
@@ -123,6 +127,7 @@ class MockProvider(Provider):
             dim=dimensions or 4,
             actor_number=options.get("actor_number"),
             max_api_concurrency=options.get("max_api_concurrency"),
+            model_name=model or "mock-embedding",
         )
 
     def get_prompter(self, model: str | None = None, **options: object) -> PrompterDescriptor:
@@ -210,6 +215,36 @@ def test_ai_embed_normalize_returns_unit_vectors():
 
     vector = rel.select(expr).fetchone()[0]
     assert pytest.approx(math.sqrt(sum(item * item for item in vector)), rel=1e-6) == 1.0
+
+
+def test_ai_embed_uses_provider_normalization_default_when_omitted():
+    conn = vane.connect()
+    rel = conn.sql("select 'abc'::VARCHAR as text")
+
+    expr = vane.ai.embed(
+        vane.col("text"),
+        provider=MockProvider(),
+        model="normalize-by-default",
+        dimensions=4,
+    ).alias("embedding")
+
+    vector = rel.select(expr).fetchone()[0]
+    assert pytest.approx(math.sqrt(sum(item * item for item in vector)), rel=1e-6) == 1.0
+
+
+def test_ai_embed_explicit_false_overrides_provider_normalization_default():
+    conn = vane.connect()
+    rel = conn.sql("select 'abc'::VARCHAR as text")
+
+    expr = vane.ai.embed(
+        vane.col("text"),
+        provider=MockProvider(),
+        model="normalize-by-default",
+        dimensions=4,
+        normalize=False,
+    ).alias("embedding")
+
+    assert list(rel.select(expr).fetchone()[0]) == [3.0, 3.0, 3.0, 3.0]
 
 
 def test_ai_embed_accepts_registered_embedding_provider_name(monkeypatch):

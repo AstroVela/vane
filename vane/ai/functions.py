@@ -414,6 +414,13 @@ def _normalize_embeddings(values: list[Any]) -> list[Any]:
     return normalized
 
 
+def _resolve_embedding_normalization(descriptor: Any, normalize: bool | None) -> bool:
+    if normalize is not None:
+        return bool(normalize)
+    provider_default = getattr(descriptor, "normalize_embeddings_by_default", None)
+    return bool(provider_default()) if callable(provider_default) else False
+
+
 def _as_positive_int(value: Any) -> int | None:
     if isinstance(value, (int, np.integer)) and value > 0:
         return int(value)
@@ -467,7 +474,7 @@ class _EmbedTextBatch:
         chunk_overlap_chars: int = 200,
         max_retries: int = 3,
         on_error: _OnError = "raise",
-        normalize: bool = False,
+        normalize: bool | None = None,
         arrow_type: Any | None = None,
     ) -> None:
         self._descriptor = descriptor
@@ -477,7 +484,7 @@ class _EmbedTextBatch:
         self._chunk_overlap_chars = chunk_overlap_chars
         self._max_retries = max_retries
         self._on_error: _OnError = on_error
-        self._normalize = normalize
+        self._normalize = _resolve_embedding_normalization(descriptor, normalize)
         # Keep expression construction lazy: unknown OpenAI-compatible models can
         # probe dimensions over the network, so callers pass a schema-aligned
         # Arrow type when they already know the dimensions.
@@ -928,6 +935,7 @@ def embed_text(
     provider: str | Provider | None = None,
     model: str | None = None,
     dimensions: int | None = None,
+    normalize: bool | None = None,
     output_column: str = "embedding",
     max_chunk_chars: int | None = None,
     chunk_overlap_chars: int = 200,
@@ -944,6 +952,8 @@ def embed_text(
             ``"google"``) require an explicit model here or on the provider
             instance and raise :class:`ValueError` otherwise.
         dimensions: Output embedding dimensions (model default if ``None``).
+        normalize: Whether to L2-normalize embeddings. ``None`` uses the
+            provider/model default.
         output_column: Name of the output column (default: ``"embedding"``).
         max_chunk_chars: If set, texts longer than this are split into
             overlapping chunks, embedded separately, and combined via
@@ -969,6 +979,7 @@ def embed_text(
         chunk_overlap_chars=chunk_overlap_chars,
         max_retries=udf_opts.max_retries,
         on_error=udf_opts.on_error,
+        normalize=normalize,
     )
     kwargs = _map_batches_kwargs(udf_opts, execution_backend)
     kwargs["schema"] = {output_column: "FLOAT[]"}
@@ -1013,7 +1024,7 @@ def embed(
         output_column,
         max_retries=udf_opts.max_retries,
         on_error=udf_opts.on_error,
-        normalize=bool(normalize),
+        normalize=normalize,
         arrow_type=pa.list_(pa.float32(), dimensions) if dimensions is not None else pa.list_(pa.float32()),
     )
     return _build_ai_batch_expression(

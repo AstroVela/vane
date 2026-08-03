@@ -42,6 +42,10 @@ class TextEmbedderDescriptor(Descriptor["TextEmbedder"]):
         """Return the embedding dimensions produced by this embedder."""
         ...
 
+    def normalize_embeddings_by_default(self) -> bool:
+        """Whether Vane should L2-normalize outputs when the caller leaves it unspecified."""
+        return False
+
     def is_async(self) -> bool:
         """Whether ``embed_text`` returns an awaitable."""
         return False

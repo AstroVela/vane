@@ -1372,6 +1372,23 @@ class TestGoogleProvider:
         dims = desc.get_dimensions()
         assert dims.size == 256
 
+    @pytest.mark.parametrize(
+        ("model", "dimensions", "expected"),
+        [
+            ("gemini-embedding-001", None, False),
+            ("gemini-embedding-001", 3072, False),
+            ("gemini-embedding-001", 768, True),
+            ("models/gemini-embedding-001", 768, True),
+            ("gemini-embedding-2", 768, False),
+        ],
+    )
+    def test_embedder_default_normalization_is_model_and_dimension_aware(self, model, dimensions, expected):
+        from vane.ai.providers.google import GoogleTextEmbedderDescriptor
+
+        desc = GoogleTextEmbedderDescriptor(model_name=model, dimensions=dimensions)
+
+        assert desc.normalize_embeddings_by_default() is expected
+
     def test_embedder_descriptor_pickle(self):
         """GoogleTextEmbedderDescriptor survives pickle."""
         from vane.ai.providers.google import GoogleTextEmbedderDescriptor

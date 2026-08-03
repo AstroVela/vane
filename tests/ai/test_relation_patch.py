@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import pyarrow as pa
+import pytest
 
 import duckdb
 from vane.ai.protocols import (
@@ -39,18 +40,22 @@ class MockTextEmbedder:
 @dataclass
 class MockTextEmbedderDescriptor(TextEmbedderDescriptor):
     dim: int = 4
+    model_name: str = "mock-embedder"
 
     def get_provider(self) -> str:
         return "mock"
 
     def get_model(self) -> str:
-        return "mock-embedder"
+        return self.model_name
 
     def get_options(self) -> Options:
         return {"batch_size": 2}
 
     def get_dimensions(self) -> EmbeddingDimensions:
         return EmbeddingDimensions(size=self.dim, dtype=pa.float32())
+
+    def normalize_embeddings_by_default(self) -> bool:
+        return self.model_name == "normalize-by-default"
 
     def instantiate(self) -> TextEmbedder:
         return MockTextEmbedder(dim=self.dim)
@@ -82,7 +87,7 @@ class MockProvider(Provider):
         return "mock"
 
     def get_text_embedder(self, model=None, dimensions=None, **options):
-        return MockTextEmbedderDescriptor(dim=dimensions or 4)
+        return MockTextEmbedderDescriptor(dim=dimensions or 4, model_name=model or "mock-embedder")
 
     def get_text_classifier(self, model=None, **options):
         return MockTextClassifierDescriptor()
@@ -106,6 +111,25 @@ class TestRelationPatch:
         assert len(rows) == 2
         for row in rows:
             assert len(row[0]) == 4
+
+    def test_embed_text_uses_provider_normalization_default_and_allows_opt_out(self):
+        conn = duckdb.connect()
+        rel = conn.sql("SELECT 'abc' AS text")
+
+        normalized = rel.embed_text(
+            "text",
+            provider=MockProvider(),
+            model="normalize-by-default",
+        ).fetchone()[0]
+        raw = rel.embed_text(
+            "text",
+            provider=MockProvider(),
+            model="normalize-by-default",
+            normalize=False,
+        ).fetchone()[0]
+
+        assert np.linalg.norm(normalized) == pytest.approx(1.0)
+        assert list(raw) == [3.0, 3.0, 3.0, 3.0]
 
     def test_classify_text_on_relation(self):
         """rel.classify_text() produces labels."""
