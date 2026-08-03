@@ -2311,12 +2311,14 @@ struct PyPhysicalPlanWrapperRunner {
 			} plan_guard(prepared_data->physical_plan);
 
 			PendingQueryParameters parameters;
-			// Force a parallel result collector for this query only. This enables multi-threaded pipeline
-			// execution for UDF-heavy workloads without changing the connection's collector callback.
-			parameters.get_result_collector = [](duckdb::ClientContext &,
+			// execute_native always returns a materialized result. Keep that collector contract query-local,
+			// while only allowing parallel collection when the plan does not require order preservation.
+			parameters.get_result_collector = [](duckdb::ClientContext &context,
 			                                     duckdb::PreparedStatementData &data) -> duckdb::PhysicalOperator & {
 				auto &physical_plan = *data.physical_plan;
-				return physical_plan.Make<duckdb::PhysicalMaterializedCollector>(data, true);
+				const bool preserve_order =
+				    duckdb::PhysicalPlanGenerator::PreserveInsertionOrder(context, physical_plan.Root());
+				return physical_plan.Make<duckdb::PhysicalMaterializedCollector>(data, !preserve_order);
 			};
 			std::unique_ptr<QueryResult> query_result;
 			vector<PipelineProgressSnapshot> stable_pipeline_snapshots;

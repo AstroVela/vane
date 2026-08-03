@@ -200,6 +200,39 @@ def test_execute_native_keeps_result_collector_query_local():
     assert duckdb.ray_cxx._connection_result_collector_calls_for_test(cursor) == 2
 
 
+def test_execute_native_preserves_materialized_order(tmp_path):
+    pytest.importorskip("pyarrow")
+    row_count = 200_000
+    source = tmp_path / "execute_native_order.parquet"
+    con = duckdb.connect()
+    try:
+        con.execute("SET threads=4")
+        con.execute(
+            f"""
+            COPY (
+                SELECT ({row_count - 1} - i)::BIGINT AS i
+                FROM range({row_count}) tbl(i)
+            ) TO '{source}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)
+            """
+        )
+        relation = con.sql(f"SELECT i FROM read_parquet('{source}') ORDER BY i")
+        plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            relation,
+            str(uuid.uuid4()),
+        ).to_physical_plan(con)
+
+        result = duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+            con.cursor(),
+            plan,
+        )
+
+        assert result.completion_status == "ok"
+        assert len(result.partition_payloads) == 1
+        assert result.partition_payloads[0].column(0).to_pylist() == list(range(row_count))
+    finally:
+        con.close()
+
+
 def test_physical_plan_pickle_propagates_non_serializable_operator_error():
     plan = duckdb.ray_cxx._make_non_serializable_physical_plan_for_test("query-non-serializable")
 
