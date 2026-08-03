@@ -13,6 +13,7 @@
 
 #include "catch.hpp"
 
+#include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
@@ -25,6 +26,7 @@
 #include "duckdb/execution/distributed/scheduling/task.hpp"
 #include "duckdb/execution/distributed/plan/runner.hpp"
 #include "duckdb/execution/distributed/pipeline_node/translator.hpp"
+#include "duckdb/execution/distributed/pipeline_node/join/join_output_types.hpp"
 #include "duckdb/execution/distributed/pipeline_node/scan_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
@@ -72,6 +74,27 @@ static DuckPhysicalPlanRef MakeScanPlanWithRoot() {
 	    plan->Make<PhysicalColumnDataScan>(types, PhysicalOperatorType::COLUMN_DATA_SCAN, 0, std::move(collection));
 	plan->SetRoot(scan);
 	return plan;
+}
+
+static vector<JoinCondition> MakeNonEqualityJoinConditions() {
+	vector<JoinCondition> conditions;
+	JoinCondition condition;
+	condition.left = make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0);
+	condition.right = make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0);
+	condition.comparison = ExpressionType::COMPARE_GREATERTHAN;
+	conditions.push_back(std::move(condition));
+	return conditions;
+}
+
+static PhysicalHashJoin::JoinProjectionColumns MakeProjectionColumns(const vector<LogicalType> &types) {
+	PhysicalHashJoin::JoinProjectionColumns result;
+	result.col_idxs.reserve(types.size());
+	result.col_types.reserve(types.size());
+	for (idx_t index = 0; index < types.size(); index++) {
+		result.col_idxs.push_back(index);
+		result.col_types.push_back(types[index]);
+	}
+	return result;
 }
 
 static WorkerTask MakeWorkerTaskWithInput(NodeID node_id, const std::string &node_name, SourceNodeId source_node_id,
@@ -445,6 +468,79 @@ TEST_CASE("HashJoinNode: replacement task preserves both side inputs", "[distrib
 	    ClonePhysicalPlanOrThrow(joined_task.task()->plan(), "hash_join_owned_children_test", nullptr);
 	REQUIRE(joined_plan_clone->HasRoot());
 	REQUIRE(joined_plan_clone->Root().children.size() == 2);
+}
+
+TEST_CASE("Join output types follow join semantics", "[distributed][join]") {
+	const vector<LogicalType> left_types = {LogicalType::INTEGER, LogicalType::VARCHAR};
+	const vector<LogicalType> right_types = {LogicalType::BIGINT, LogicalType::DOUBLE};
+	const vector<LogicalType> both_types = {LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT,
+	                                        LogicalType::DOUBLE};
+	const vector<LogicalType> mark_types = {LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BOOLEAN};
+
+	for (auto join_type : {JoinType::INNER, JoinType::LEFT, JoinType::RIGHT, JoinType::OUTER, JoinType::SINGLE}) {
+		CAPTURE(static_cast<int>(join_type));
+		REQUIRE(BuildJoinOutputTypes(join_type, left_types, right_types) == both_types);
+	}
+	for (auto join_type : {JoinType::SEMI, JoinType::ANTI}) {
+		CAPTURE(static_cast<int>(join_type));
+		REQUIRE(BuildJoinOutputTypes(join_type, left_types, right_types) == left_types);
+	}
+	REQUIRE(BuildJoinOutputTypes(JoinType::MARK, left_types, right_types) == mark_types);
+	for (auto join_type : {JoinType::RIGHT_SEMI, JoinType::RIGHT_ANTI}) {
+		CAPTURE(static_cast<int>(join_type));
+		REQUIRE(BuildJoinOutputTypes(join_type, left_types, right_types) == right_types);
+	}
+}
+
+TEST_CASE("HashJoinNode: non-equality simple joins preserve their output schema", "[distributed][source_id][join]") {
+	struct TestCase {
+		JoinType join_type;
+		vector<LogicalType> output_types;
+	};
+	const vector<TestCase> test_cases = {
+	    {JoinType::SEMI, {LogicalType::BIGINT}},
+	    {JoinType::ANTI, {LogicalType::BIGINT}},
+	    {JoinType::MARK, {LogicalType::BIGINT, LogicalType::BOOLEAN}},
+	};
+
+	for (const auto &test_case : test_cases) {
+		CAPTURE(static_cast<int>(test_case.join_type));
+		PlanConfig plan_cfg(1, "join-query", std::make_shared<DuckDBExecutionConfig>());
+		auto schema = MakeSchemaRef(test_case.output_types);
+		auto lhs_output_columns = MakeProjectionColumns({LogicalType::BIGINT});
+		HashJoinNode node(300, plan_cfg, MakeNonEqualityJoinConditions(), test_case.join_type, test_case.output_types,
+		                  {}, {LogicalType::BIGINT}, PhysicalHashJoin::JoinProjectionColumns(),
+		                  std::move(lhs_output_columns), PhysicalHashJoin::JoinProjectionColumns(), {}, nullptr, 1,
+		                  nullptr, nullptr, std::move(schema));
+
+		auto left_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(10, "left", 10, "left_scan"));
+		auto right_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(20, "right", 20, "right_scan"));
+		TaskIDCounter task_id_counter;
+		auto joined_task =
+		    node.BuildHashJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+
+		REQUIRE(joined_task.task()->plan()->Root().type == PhysicalOperatorType::NESTED_LOOP_JOIN);
+		REQUIRE(joined_task.task()->plan()->Root().GetTypes() == test_case.output_types);
+		auto cloned_plan = ClonePhysicalPlanOrThrow(joined_task.task()->plan(), "nlj_output_schema_test", nullptr);
+		REQUIRE(cloned_plan->Root().GetTypes() == test_case.output_types);
+	}
+}
+
+TEST_CASE("HashJoinNode: non-equality joins reject a stale output schema", "[distributed][source_id][join]") {
+	PlanConfig plan_cfg(1, "join-query", std::make_shared<DuckDBExecutionConfig>());
+	vector<LogicalType> stale_output_types = {LogicalType::INTEGER};
+	auto schema = MakeSchemaRef(stale_output_types);
+	auto lhs_output_columns = MakeProjectionColumns({LogicalType::BIGINT});
+	HashJoinNode node(300, plan_cfg, MakeNonEqualityJoinConditions(), JoinType::SEMI, stale_output_types, {},
+	                  {LogicalType::BIGINT}, PhysicalHashJoin::JoinProjectionColumns(), std::move(lhs_output_columns),
+	                  PhysicalHashJoin::JoinProjectionColumns(), {}, nullptr, 1, nullptr, nullptr, std::move(schema));
+
+	auto left_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(10, "left", 10, "left_scan"));
+	auto right_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(20, "right", 20, "right_scan"));
+	TaskIDCounter task_id_counter;
+
+	REQUIRE_THROWS_WITH(node.BuildHashJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr),
+	                    Catch::Matchers::Contains("output schema that does not match its children"));
 }
 
 TEST_CASE("HashJoinNode: fan-in preserves child task streams", "[distributed][source_id][join]") {

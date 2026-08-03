@@ -14,6 +14,7 @@
 #include "duckdb/execution/distributed/pipeline_node/join/broadcast_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/delim_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/hash_join.hpp"
+#include "duckdb/execution/distributed/pipeline_node/join/join_output_types.hpp"
 #include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
 #include "duckdb/execution/distributed/utils/optional.hpp"
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
@@ -42,13 +43,15 @@ duckdb::vector<std::string> BuildJoinOutputNames(const PhysicalHashJoin &hj, con
 		}
 	};
 
-	if (!hj.lhs_output_columns.col_idxs.empty()) {
-		append_by_index(left_names, hj.lhs_output_columns.col_idxs);
-	} else if (!left_names.empty()) {
-		output_names.insert(output_names.end(), left_names.begin(), left_names.end());
+	if (JoinOutputsLeft(hj.join_type)) {
+		if (!hj.lhs_output_columns.col_idxs.empty()) {
+			append_by_index(left_names, hj.lhs_output_columns.col_idxs);
+		} else if (!left_names.empty()) {
+			output_names.insert(output_names.end(), left_names.begin(), left_names.end());
+		}
 	}
 
-	if (hj.join_type != JoinType::ANTI && hj.join_type != JoinType::SEMI && hj.join_type != JoinType::MARK) {
+	if (JoinOutputsRight(hj.join_type)) {
 		if (!hj.payload_columns.col_idxs.empty()) {
 			append_by_index(right_names, hj.payload_columns.col_idxs);
 		} else if (!right_names.empty()) {
@@ -403,7 +406,7 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 	PhysicalHashJoin::JoinProjectionColumns payload_columns;
 	PhysicalHashJoin::JoinProjectionColumns rhs_output_columns;
 
-	if (nlj.join_type != JoinType::ANTI && nlj.join_type != JoinType::SEMI && nlj.join_type != JoinType::MARK) {
+	if (JoinOutputsRight(nlj.join_type)) {
 		for (idx_t rhs_col = 0; rhs_col < rhs_input_types.size(); rhs_col++) {
 			auto &rhs_col_type = rhs_input_types[rhs_col];
 			auto it = build_columns_in_conditions.find(rhs_col);
