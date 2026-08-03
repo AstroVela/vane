@@ -354,6 +354,58 @@ def test_client_owner_lease_settings_accept_one_third_heartbeat_interval(
     assert driver._client_owner_lease_settings() == (30.0, 10.0)
 
 
+@pytest.mark.parametrize("maintenance_kind", ["client_lease", "query_resource"])
+def test_maintenance_loops_continue_after_pre311_asyncio_timeout(
+    monkeypatch,
+    maintenance_kind,
+):
+    class _Pre311AsyncioTimeout(Exception):
+        pass
+
+    runner_cls = driver.RayQueryDriverActor.__ray_metadata__.modified_class
+    runner = object.__new__(runner_cls)
+    maintenance_calls = []
+
+    async def scenario():
+        stop = asyncio.Event()
+        if maintenance_kind == "client_lease":
+            runner._client_lease_maintenance_stop = stop
+            runner._client_heartbeat_interval_s = 0.25
+            runner._client_lease_maintenance_error = ""
+            runner._client_lease_maintenance_failures = 0
+            runner._schedule_expired_client_reclamations = lambda: maintenance_calls.append(None)
+            maintenance_loop = runner_cls._client_lease_maintenance_loop
+        else:
+            runner._query_resource_maintenance_stop = stop
+            runner._query_resource_maintenance_interval_s = 0.25
+            runner._query_resource_maintenance_error = ""
+            runner._query_resource_maintenance_failures = 0
+            runner._maintain_query_resources_once = lambda: maintenance_calls.append(None)
+            maintenance_loop = runner_cls._query_resource_maintenance_loop
+
+        wait_calls = 0
+
+        async def wait_for(awaitable, *, timeout):
+            nonlocal wait_calls
+            assert timeout == 0.25
+            wait_calls += 1
+            if wait_calls == 1:
+                awaitable.close()
+                raise _Pre311AsyncioTimeout
+            stop.set()
+            return await awaitable
+
+        monkeypatch.setattr(driver.asyncio, "TimeoutError", _Pre311AsyncioTimeout)
+        monkeypatch.setattr(driver.asyncio, "wait_for", wait_for)
+
+        await maintenance_loop(runner)
+        assert wait_calls == 2
+
+    asyncio.run(scenario())
+
+    assert maintenance_calls == [None, None]
+
+
 @pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "invalid"])
 def test_copy_reconciliation_timeout_rejects_unsafe_values(monkeypatch, raw):
     monkeypatch.setenv("VANE_RAY_COPY_RECONCILIATION_TIMEOUT_S", raw)
