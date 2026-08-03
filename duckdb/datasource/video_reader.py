@@ -29,6 +29,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from itertools import repeat
 from types import ModuleType
 from typing import Any, cast
@@ -64,7 +65,7 @@ _DEFAULT_MAX_SOURCE_PATH_BYTES = 4096
 # This version covers both the structured fields and their normalization. Bump
 # it whenever either changes so a source ID never silently changes meaning.
 _S3_SOURCE_IDENTITY_VERSION = 1
-_S3_DEFAULT_ENDPOINT_NAMESPACE = "aws"
+_S3_DEFAULT_AWS_PARTITION = "aws"
 _S3_DEFAULT_TRANSPORT_SCHEME = "https"
 _SOURCE_ID_BYTES = hashlib.sha256().digest_size * 2
 _ARROW_STRING_OFFSET_BYTES = np.dtype(np.int32).itemsize
@@ -89,6 +90,8 @@ class _S3EndpointSettings:
     scheme_override: str | None
     endpoint_override: str | None
     namespace: str
+    region: str | None
+    partition: str | None
 
 
 class VideoReadError(RuntimeError):
@@ -323,11 +326,62 @@ def _wait_for_memory() -> None:
             return
 
 
+def _configured_s3_region() -> str | None:
+    """Resolve the region that will be passed explicitly to PyArrow."""
+    region = _read_optional_text_env(("AWS_REGION", "AWS_DEFAULT_REGION"))
+    if region is not None:
+        return region
+
+    # Match the standard AWS configuration chain for profile/shared-config
+    # regions, then pass the result explicitly to PyArrow so provenance and I/O
+    # cannot resolve different regions.
+    from botocore.exceptions import ProfileNotFound  # type: ignore[import-not-found]
+    from botocore.session import Session  # type: ignore[import-not-found]
+
+    try:
+        configured_region = Session().get_config_variable("region")
+    except ProfileNotFound:
+        # Preserve the existing contract that profile validation belongs to
+        # the AWS SDK during I/O; a credentials-only or missing profile does
+        # not itself define a different source namespace.
+        return None
+    if configured_region is None:
+        return None
+    region = str(configured_region).strip()
+    return region or None
+
+
+@lru_cache(maxsize=None)
+def _aws_partition_for_region(region: str) -> str:
+    """Resolve an AWS region to a partition using Botocore endpoint metadata."""
+    from botocore.exceptions import UnknownRegionError
+    from botocore.session import Session
+
+    try:
+        partition = str(Session().get_partition_for_region(region)).strip()
+    except UnknownRegionError as exc:
+        raise ValueError(
+            f"cannot determine the AWS partition for region {region!r}; "
+            "update botocore or set AWS_ENDPOINT_URL explicitly"
+        ) from exc
+    if not partition:
+        raise ValueError(f"botocore returned an empty AWS partition for region {region!r}")
+    return partition
+
+
 def _s3_endpoint_settings() -> _S3EndpointSettings:
-    """Return the pyarrow overrides and stable namespace for the effective S3 endpoint."""
+    """Return one region/endpoint snapshot and its stable source namespace."""
+    region = _configured_s3_region()
     endpoint_url = _read_optional_text_env(("AWS_ENDPOINT_URL",))
     if endpoint_url is None:
-        return _S3EndpointSettings(None, None, _S3_DEFAULT_ENDPOINT_NAMESPACE)
+        partition = _S3_DEFAULT_AWS_PARTITION if region is None else _aws_partition_for_region(region)
+        return _S3EndpointSettings(
+            scheme_override=None,
+            endpoint_override=None,
+            namespace=partition,
+            region=region,
+            partition=partition,
+        )
 
     # Treat a scheme-less value as an authority so paths are discarded
     # consistently from endpoint_override.
@@ -357,7 +411,13 @@ def _s3_endpoint_settings() -> _S3EndpointSettings:
     default_port = (effective_scheme == "http" and port == 80) or (effective_scheme == "https" and port == 443)
     namespace_authority = namespace_host if port is None or default_port else f"{namespace_host}:{port}"
     endpoint_namespace = f"{effective_scheme}://{namespace_authority}"
-    return _S3EndpointSettings(scheme_override, endpoint_override, endpoint_namespace)
+    return _S3EndpointSettings(
+        scheme_override=scheme_override,
+        endpoint_override=endpoint_override,
+        namespace=endpoint_namespace,
+        region=region,
+        partition=None,
+    )
 
 
 def _s3_filesystem_kwargs(endpoint_settings: _S3EndpointSettings | None = None) -> dict[str, str | bool]:
@@ -370,9 +430,8 @@ def _s3_filesystem_kwargs(endpoint_settings: _S3EndpointSettings | None = None) 
             kwargs["scheme"] = settings.scheme_override
         kwargs["endpoint_override"] = settings.endpoint_override
 
-    region = _read_optional_text_env(("AWS_REGION", "AWS_DEFAULT_REGION"))
-    if region is not None:
-        kwargs["region"] = region
+    if settings.region is not None:
+        kwargs["region"] = settings.region
 
     if _read_bool_env("S3FS_ANON", False):
         kwargs["anonymous"] = True

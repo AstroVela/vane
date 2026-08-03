@@ -40,9 +40,12 @@ _S3_ENV_NAMES = (
     "AWS_ROLE_ARN",
     "AWS_ROLE_SESSION_NAME",
     "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_DEFAULT_PROFILE",
     "AWS_REGION",
     "AWS_DEFAULT_REGION",
     "AWS_ENDPOINT_URL",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
 )
 
 
@@ -71,6 +74,8 @@ def recording_s3_filesystem(monkeypatch):
 def _clear_s3_environment(monkeypatch):
     for name in _S3_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_CONFIG_FILE", os.devnull)
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", os.devnull)
 
 
 def _source_identity(video_reader, video_path):
@@ -526,6 +531,9 @@ def test_video_s3_source_identity_is_versioned_and_endpoint_scoped(monkeypatch):
     monkeypatch.setenv("AWS_ENDPOINT_URL", "HTTPS://OBJECTS.EXAMPLE.TEST:443/prefix")
     source_path, first_source_id = _source_identity(video_reader, path)
 
+    monkeypatch.setenv("AWS_REGION", "future-moon-1")
+    _, arbitrary_region_source_id = _source_identity(video_reader, path)
+
     monkeypatch.setenv("AWS_ENDPOINT_URL", "objects.example.test/another-prefix")
     _, equivalent_endpoint_source_id = _source_identity(video_reader, path)
 
@@ -540,10 +548,97 @@ def test_video_s3_source_identity_is_versioned_and_endpoint_scoped(monkeypatch):
 
     assert source_path == path
     assert first_source_id == "39874672dd4d30134572b88928574d43945bdfe2207847eabad0408b9e46debf"
+    assert arbitrary_region_source_id == first_source_id
     assert equivalent_endpoint_source_id == first_source_id
     assert other_endpoint_source_id != first_source_id
     assert other_scheme_source_id != first_source_id
     assert other_port_source_id != first_source_id
+
+
+def test_video_s3_default_source_identity_is_partition_scoped(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    _clear_s3_environment(monkeypatch)
+    path = "s3://shared-name/clips/example.mp4"
+
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    _, standard_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv("AWS_REGION", "eu-west-1")
+    _, other_standard_region_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv("AWS_REGION", "cn-north-1")
+    _, china_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv("AWS_REGION", "us-gov-west-1")
+    _, govcloud_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv("AWS_REGION", "eusc-de-east-1")
+    _, sovereign_cloud_source_id = _source_identity(video_reader, path)
+
+    assert other_standard_region_source_id == standard_source_id
+    assert len({standard_source_id, china_source_id, govcloud_source_id, sovereign_cloud_source_id}) == 4
+
+
+def test_video_s3_profile_region_is_reused_for_identity_and_io(
+    monkeypatch,
+    recording_s3_filesystem,
+    tmp_path,
+):
+    import duckdb.datasource.video_reader as video_reader
+
+    _clear_s3_environment(monkeypatch)
+    config_path = tmp_path / "aws-config"
+    config_path.write_text("[profile sovereign]\nregion = eusc-de-east-1\n", encoding="utf-8")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(config_path))
+    monkeypatch.setenv("AWS_PROFILE", "sovereign")
+
+    source_path = video_reader._video_source_path("s3://shared-name/clips/example.mp4")
+    settings = video_reader._s3_endpoint_settings()
+    profile_source_id = video_reader._video_source_id(source_path, endpoint_settings=settings)
+
+    monkeypatch.setenv("AWS_REGION", "eusc-de-east-1")
+    _, environment_source_id = _source_identity(video_reader, source_path)
+    video_reader._s3_filesystem(settings)
+
+    assert settings.region == "eusc-de-east-1"
+    assert settings.partition == "aws-eusc"
+    assert settings.namespace == "aws-eusc"
+    assert profile_source_id == environment_source_id
+    assert recording_s3_filesystem["kwargs"] == {"region": "eusc-de-east-1"}
+
+
+def test_video_s3_region_snapshot_is_reused_after_environment_changes(
+    monkeypatch,
+    recording_s3_filesystem,
+):
+    import duckdb.datasource.video_reader as video_reader
+
+    _clear_s3_environment(monkeypatch)
+    source_path = video_reader._video_source_path("s3://shared-name/clips/example.mp4")
+    monkeypatch.setenv("AWS_REGION", "cn-north-1")
+    settings = video_reader._s3_endpoint_settings()
+    china_source_id = video_reader._video_source_id(source_path, endpoint_settings=settings)
+
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    _, standard_source_id = _source_identity(video_reader, source_path)
+    video_reader._s3_filesystem(settings)
+
+    assert settings.region == "cn-north-1"
+    assert settings.partition == "aws-cn"
+    assert china_source_id != standard_source_id
+    assert video_reader._video_source_id(source_path, endpoint_settings=settings) == china_source_id
+    assert recording_s3_filesystem["kwargs"] == {"region": "cn-north-1"}
+
+
+def test_video_s3_unknown_default_region_fails_closed(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    _clear_s3_environment(monkeypatch)
+    monkeypatch.setenv("AWS_REGION", "future-moon-1")
+
+    with pytest.raises(ValueError, match="cannot determine the AWS partition"):
+        _source_identity(video_reader, "s3://shared-name/clips/example.mp4")
 
 
 def test_video_s3_source_identity_excludes_credentials_and_request_options(monkeypatch):
@@ -1044,6 +1139,8 @@ def test_remote_video_decode_uses_temporary_path_and_preserves_remote_identity(
     tmp_path,
 ):
     import duckdb.datasource.video_reader as video_reader
+
+    _clear_s3_environment(monkeypatch)
 
     class FakeFrame:
         def asnumpy(self):
