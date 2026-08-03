@@ -934,6 +934,28 @@ def test_ai_prompt_relation_rejects_unsupported_expression_type():
         vane.ai.prompt(relation, vane.col("value"), provider=MockProvider())
 
 
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+def test_ai_prompt_expression_rejects_unsupported_type_during_planning(on_error):
+    relation = vane.connect().sql("select 1::INTEGER as value")
+    expression = vane.ai.prompt(vane.col("value"), provider=MockProvider(), on_error=on_error)
+
+    with pytest.raises(Exception, match="VARCHAR, BLOB, or BLOB"):
+        relation.select(expression).types
+
+
+def test_ai_prompt_expression_accepts_supported_types_during_planning():
+    relation = vane.connect().sql("""
+        select
+            'question'::VARCHAR as text,
+            from_hex('89504e47') as image,
+            [from_hex('ffd8ff')]::BLOB[] as images
+    """)
+
+    for column in ("text", "image", "images"):
+        expression = vane.ai.prompt(vane.col(column), provider=MockProvider())
+        assert [str(value) for value in relation.select(expression).types] == ["VARCHAR"]
+
+
 @pytest.mark.parametrize(
     "option",
     [
@@ -1044,6 +1066,19 @@ def test_ai_prompt_vllm_rejects_images_and_execution_backend():
             provider="vllm",
             execution_backend="ray_actor",
         )
+
+
+@pytest.mark.parametrize("image_type", ["BLOB", "BLOB[]"])
+def test_ai_prompt_expression_vllm_rejects_mixed_image_input_during_planning(image_type):
+    image = "'\\x89504e470d0a1a0a'::BLOB" if image_type == "BLOB" else "['\\x89504e470d0a1a0a'::BLOB]"
+    relation = vane.connect().sql(f"select 'question'::VARCHAR as question, {image} as image")
+    expression = vane.ai.prompt(
+        [vane.col("question"), vane.col("image")],
+        provider="vllm",
+    )
+
+    with pytest.raises(Exception, match="VARCHAR"):
+        relation.select(expression).types
 
 
 def test_ai_prompt_replaces_existing_output_column():

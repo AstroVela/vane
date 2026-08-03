@@ -501,6 +501,8 @@ class OpenAIPrompterDescriptor(PrompterDescriptor):
         }
         validation_options.update(self.prompt_options)
         validate_prompt_options("openai", validation_options, relation=False)
+        if self.prompt_options.get("stop_sequences") is not None and not self.use_chat_completions:
+            raise ValueError("OpenAI stop_sequences requires use_chat_completions=True")
         self.provider_options = _wrap_openai_options(self.provider_options)
         self.prompt_options = _wrap_openai_options(self.prompt_options)
 
@@ -630,10 +632,7 @@ class OpenAIPrompter:
         return options
 
     def _responses_options(self) -> dict[str, Any]:
-        options = dict(self._options)
-        if "stop_sequences" in options:
-            options["stop"] = options.pop("stop_sequences")
-        return options
+        return dict(self._options)
 
     async def _prompt_chat_completions(self, messages: list[dict[str, Any]]) -> str | None:
         """Prompt using the Chat Completions API."""

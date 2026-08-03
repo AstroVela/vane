@@ -361,10 +361,58 @@ static unique_ptr<Expression> LowerAIEmbedTextInput(FunctionBindExpressionInput 
 	return std::move(text);
 }
 
+static unique_ptr<Expression> LowerAIPromptInput(FunctionBindExpressionInput &input) {
+	if (input.children.size() != 1) {
+		throw BinderException("ai_prompt input validation expected one runtime argument");
+	}
+	auto &message = input.children[0];
+	auto &input_type = message->return_type;
+	if (input_type.id() == LogicalTypeId::UNKNOWN) {
+		throw ParameterNotResolvedException();
+	}
+	if (input_type.id() == LogicalTypeId::SQLNULL) {
+		return make_uniq<BoundConstantExpression>(Value(LogicalType::VARCHAR));
+	}
+	if (input_type != LogicalType::VARCHAR && input_type != LogicalType::BLOB &&
+	    input_type != LogicalType::LIST(LogicalType::BLOB)) {
+		throw BinderException("Prompt messages must have type VARCHAR, BLOB, or BLOB[]");
+	}
+	return std::move(message);
+}
+
+static unique_ptr<Expression> LowerAIPromptTextInput(FunctionBindExpressionInput &input) {
+	if (input.children.size() != 2) {
+		throw BinderException("ai_prompt text validation expected one runtime argument");
+	}
+	auto &message = input.children[0];
+	auto input_type_id = message->return_type.id();
+	if (input_type_id == LogicalTypeId::UNKNOWN) {
+		throw ParameterNotResolvedException();
+	}
+	if (input_type_id == LogicalTypeId::SQLNULL) {
+		return make_uniq<BoundConstantExpression>(Value(LogicalType::VARCHAR));
+	}
+	if (input_type_id != LogicalTypeId::VARCHAR) {
+		throw BinderException("Provider 'vllm' Prompt messages must have type VARCHAR");
+	}
+	return std::move(message);
+}
+
 } // namespace
 
 ScalarFunctionSet AISQLFunction::GetPromptImplementationFunctions() {
 	ScalarFunctionSet set(HIDDEN_PROMPT_FUNCTION);
+	auto prompt_input = ScalarFunction({LogicalType::ANY}, LogicalType::ANY, AISQLExecute);
+	prompt_input.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	prompt_input.SetBindExpressionCallback(LowerAIPromptInput);
+	set.AddFunction(std::move(prompt_input));
+
+	auto prompt_text_input =
+	    ScalarFunction({LogicalType::ANY, LogicalType::BOOLEAN}, LogicalType::VARCHAR, AISQLExecute);
+	prompt_text_input.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	prompt_text_input.SetBindExpressionCallback(LowerAIPromptTextInput);
+	set.AddFunction(std::move(prompt_text_input));
+
 	auto add_implementation = [&](vector<LogicalType> arguments) {
 		auto implementation =
 		    ScalarFunction(std::move(arguments), LogicalType::VARCHAR, AISQLExecute, AISQLPromptBind, nullptr, nullptr,
@@ -384,9 +432,11 @@ ScalarFunctionSet AISQLFunction::GetPromptImplementationFunctions() {
 }
 
 unique_ptr<CreateMacroInfo> AISQLFunction::GetPromptMacro() {
-	auto make_function = [&](const LogicalType *image_type) {
-		auto macro_arguments = image_type ? "prompt, image, system_message, provider, model, on_error, options"
-		                                  : "prompt, system_message, provider, model, on_error, options";
+	auto make_function = [&](const LogicalType *image_type, const char *image_parameter) {
+		auto macro_arguments =
+		    image_type
+		        ? StringUtil::Format("prompt, %s, system_message, provider, model, on_error, options", image_parameter)
+		        : "prompt, system_message, provider, model, on_error, options";
 		auto expressions =
 		    Parser::ParseExpressionList(StringUtil::Format("%s(%s)", HIDDEN_PROMPT_FUNCTION, macro_arguments));
 		if (expressions.size() != 1) {
@@ -409,7 +459,7 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetPromptMacro() {
 
 		add_parameter("prompt", LogicalType::VARCHAR, nullptr);
 		if (image_type) {
-			add_parameter("image", *image_type, nullptr);
+			add_parameter(image_parameter, *image_type, nullptr);
 		}
 		add_parameter("system_message", LogicalType::VARCHAR, "NULL");
 		add_parameter("provider", LogicalType::VARCHAR, "'openai'");
@@ -424,11 +474,11 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetPromptMacro() {
 	info->name = "ai_prompt";
 	info->temporary = true;
 	info->internal = true;
-	info->macros.push_back(make_function(nullptr));
+	info->macros.push_back(make_function(nullptr, nullptr));
 	LogicalType blob_type(LogicalTypeId::BLOB);
-	info->macros.push_back(make_function(&blob_type));
+	info->macros.push_back(make_function(&blob_type, "image"));
 	auto blob_list_type = LogicalType::LIST(LogicalType::BLOB);
-	info->macros.push_back(make_function(&blob_list_type));
+	info->macros.push_back(make_function(&blob_list_type, "images"));
 	return info;
 }
 

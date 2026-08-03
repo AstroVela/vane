@@ -1464,6 +1464,13 @@ def _prompt_relation_types(rel: Any, messages: list[Any]) -> list[str]:
     return types
 
 
+def _validated_prompt_message(message: Any, *, text_only: bool = False) -> Any:
+    """Add a bind-only Prompt type guard that is removed during planning."""
+    if text_only:
+        return duckdb.FunctionExpression("__vane_ai_prompt", message, duckdb.ConstantExpression(True))
+    return duckdb.FunctionExpression("__vane_ai_prompt", message)
+
+
 def _build_native_vllm_expression(messages: list[Any], descriptor: NativeVLLMPromptPlan) -> duckdb.Expression:
     """Build the native row-preserving ``vllm()`` expression."""
     message_expressions = [as_expression(message) for message in messages]
@@ -1574,11 +1581,13 @@ def _prompt_expression(
     )
 
     if isinstance(descriptor, NativeVLLMPromptPlan):
-        return _build_native_vllm_expression(message_expressions, descriptor)
+        validated_messages = [_validated_prompt_message(message, text_only=True) for message in message_expressions]
+        return _build_native_vllm_expression(validated_messages, descriptor)
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
 
     input_names = [f"message_{index}" for index in range(len(message_expressions))]
+    validated_messages = [_validated_prompt_message(message) for message in message_expressions]
     wrapper = _PromptBatch(
         descriptor,
         input_names,
@@ -1590,7 +1599,7 @@ def _prompt_expression(
     )
     return _build_ai_batch_expression(
         wrapper,
-        inputs=dict(zip(input_names, message_expressions, strict=True)),
+        inputs=dict(zip(input_names, validated_messages, strict=True)),
         output_column="response",
         output_type="VARCHAR",
         udf_opts=udf_options,

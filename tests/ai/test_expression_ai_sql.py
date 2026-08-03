@@ -233,13 +233,29 @@ def test_ai_prompt_sql_exact_blob_list_overload_flattens_in_place():
     rows = conn.sql("""
         SELECT ai_prompt(
             'compare',
-            [from_hex('89504e47'), NULL, from_hex('ffd8ff')]::BLOB[],
+            images := [from_hex('89504e47'), NULL, from_hex('ffd8ff')]::BLOB[],
             provider := 'mock_ai_sql',
             model := 'vision'
         )
     """).fetchall()
 
     assert rows == [("vision:compare:89504e47:ffd8ff",)]
+
+
+@pytest.mark.parametrize("image_argument", ["image := NULL", "images := NULL"])
+def test_ai_prompt_sql_named_untyped_null_image_selects_exact_overload(image_argument):
+    conn = vane.connect()
+
+    rows = conn.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            {image_argument},
+            provider := 'mock_ai_sql',
+            model := 'vision'
+        )
+    """).fetchall()
+
+    assert rows == [("vision:describe",)]
 
 
 @pytest.mark.parametrize("image", ["NULL::BLOB", "NULL::BLOB[]", "[]::BLOB[]"])

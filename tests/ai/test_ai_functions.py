@@ -2224,7 +2224,6 @@ def test_openai_responses_request_mapping_preserves_part_order():
         "temperature": 0.2,
         "max_output_tokens": 17,
         "top_p": 0.8,
-        "stop_sequences": ["END"],
     }
     response = SimpleNamespace(output_text="answer", usage=None)
     prompter._client = MagicMock()
@@ -2236,13 +2235,22 @@ def test_openai_responses_request_mapping_preserves_part_order():
     kwargs = prompter._client.responses.create.await_args.kwargs
     assert kwargs["model"] == "response-model"
     assert kwargs["max_output_tokens"] == 17
-    assert kwargs["stop"] == ["END"]
+    assert "stop" not in kwargs
     assert [part["type"] for part in kwargs["input"][1]["content"]] == [
         "input_text",
         "input_image",
         "input_text",
     ]
     assert kwargs["input"][0] == {"role": "system", "content": "system"}
+
+
+def test_openai_responses_rejects_stop_sequences_during_planning():
+    from vane.ai.providers.openai import OpenAIProvider, OpenAIPrompterDescriptor
+
+    with pytest.raises(ValueError, match="use_chat_completions=True"):
+        OpenAIProvider().get_prompter(stop_sequences=["END"])
+    with pytest.raises(ValueError, match="use_chat_completions=True"):
+        OpenAIPrompterDescriptor(prompt_options={"stop_sequences": ["END"]})
 
 
 def test_openai_chat_request_maps_max_output_tokens_and_stop_sequences():
