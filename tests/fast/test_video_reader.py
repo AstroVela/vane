@@ -221,6 +221,78 @@ def test_remote_video_materialization_allows_unknown_size_metadata(monkeypatch, 
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("failure_point", ["metadata", "open", "read"])
+def test_remote_video_source_io_errors_are_video_read_errors(monkeypatch, tmp_path, failure_point):
+    import duckdb.datasource.video_reader as video_reader
+
+    failure = OSError(f"planned {failure_point} failure")
+    temporary_files = []
+
+    class FailingRemoteFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size):
+            raise failure
+
+    class FailingS3FileSystem:
+        def get_file_info(self, _path):
+            if failure_point == "metadata":
+                raise failure
+            return type("FileInfo", (), {"size": 1})()
+
+        def open_input_file(self, _path):
+            if failure_point == "open":
+                raise failure
+            return FailingRemoteFile()
+
+    real_named_temporary_file = video_reader.tempfile.NamedTemporaryFile
+
+    def recording_named_temporary_file(*args, **kwargs):
+        temporary = real_named_temporary_file(*args, **kwargs)
+        temporary_files.append(temporary)
+        return temporary
+
+    monkeypatch.setattr(video_reader, "_s3_filesystem", FailingS3FileSystem)
+    monkeypatch.setattr(video_reader.tempfile, "NamedTemporaryFile", recording_named_temporary_file)
+
+    with pytest.raises(video_reader.VideoReadError, match=f"planned {failure_point} failure") as raised:
+        with video_reader._materialize_video_path(
+            "s3://media-bucket/clips/example.mp4",
+            max_remote_video_bytes=1024,
+            remote_temp_dir=str(tmp_path),
+        ):
+            pytest.fail("a failed remote read must not yield a decoder path")
+
+    assert raised.value.__cause__ is failure
+    assert raised.value.video_path == "s3://media-bucket/clips/example.mp4"
+    assert len(temporary_files) == (0 if failure_point == "metadata" else 1)
+    assert all(temporary.closed for temporary in temporary_files)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_remote_video_tempfile_errors_are_not_classified_as_bad_input(
+    recording_s3_filesystem,
+    tmp_path,
+):
+    import duckdb.datasource.video_reader as video_reader
+
+    missing_temp_dir = tmp_path / "missing"
+
+    with pytest.raises(FileNotFoundError) as raised:
+        with video_reader._materialize_video_path(
+            "s3://media-bucket/clips/example.mp4",
+            max_remote_video_bytes=1024,
+            remote_temp_dir=str(missing_temp_dir),
+        ):
+            pytest.fail("temporary-file creation failure must not yield a decoder path")
+
+    assert not isinstance(raised.value, video_reader.VideoReadError)
+
+
 def test_video_source_identity_distinguishes_same_basename_sources():
     import duckdb.datasource.video_reader as video_reader
 
@@ -714,6 +786,95 @@ def test_video_decoder_uses_one_thread_for_bounded_native_buffering(monkeypatch)
     assert calls == [("clip.avi", 320, 180, 1)]
 
 
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+def test_video_decoder_open_errors_use_public_source_identity(monkeypatch, error_type):
+    import duckdb.datasource.video_reader as video_reader
+
+    failure = error_type("planned decoder open failure")
+
+    class FailingVideoReader:
+        def __init__(self, *_args, **_kwargs):
+            raise failure
+
+    class FakeDecordModule:
+        VideoReader = FailingVideoReader
+
+    monkeypatch.setattr(video_reader, "_import_video_dependency", lambda *_args: FakeDecordModule)
+
+    with pytest.raises(video_reader.VideoReadError, match="planned decoder open failure") as raised:
+        video_reader._open_decord_reader(
+            "/tmp/materialized.mp4",
+            width=320,
+            height=180,
+            source_path="s3://media-bucket/clips/example.mp4",
+        )
+
+    assert raised.value.__cause__ is failure
+    assert raised.value.video_path == "s3://media-bucket/clips/example.mp4"
+
+
+def test_video_decoder_iteration_wraps_direct_decord_errors(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    class FakeDecordError(Exception):
+        pass
+
+    class FakeDecordLimitReachedError(Exception):
+        pass
+
+    class FakeDecordBase:
+        DECORDError = FakeDecordError
+        DECORDLimitReachedError = FakeDecordLimitReachedError
+
+    failure = FakeDecordError("planned frame decode failure")
+
+    class FailingReader:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise failure
+
+    real_import_module = video_reader.importlib.import_module
+
+    def fake_import_module(module_name, *args, **kwargs):
+        if module_name == "decord._ffi.base":
+            return FakeDecordBase
+        return real_import_module(module_name, *args, **kwargs)
+
+    monkeypatch.setattr(video_reader.importlib, "import_module", fake_import_module)
+    assert video_reader._is_decord_error(FakeDecordLimitReachedError("recovery limit"))
+
+    with pytest.raises(video_reader.VideoReadError, match="planned frame decode failure") as raised:
+        list(
+            video_reader._iter_decord_frames(
+                FailingReader(),
+                video_path="clip.avi",
+                max_frames=None,
+            )
+        )
+
+    assert raised.value.__cause__ is failure
+    assert raised.value.video_path == "clip.avi"
+
+
+def test_video_frame_conversion_does_not_wrap_generic_runtime_errors(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    failure = RuntimeError("planned frame conversion invariant failure")
+
+    class FailingFrame:
+        def asnumpy(self):
+            raise failure
+
+    monkeypatch.setattr(video_reader, "_is_decord_error", lambda _exc: False)
+
+    with pytest.raises(RuntimeError, match="planned frame conversion invariant failure") as raised:
+        video_reader._decord_frame_asnumpy(FailingFrame(), video_path="clip.avi")
+
+    assert raised.value is failure
+
+
 def test_video_decode_aligns_narrow_decord_output_before_exact_resize(monkeypatch):
     import duckdb.datasource.video_reader as video_reader
 
@@ -742,7 +903,7 @@ def test_video_decode_aligns_narrow_decord_output_before_exact_resize(monkeypatc
     )
 
     source_path, _ = video_reader._video_source_identity("clip.avi")
-    assert calls == [(source_path, {"width": 32, "height": 2})]
+    assert calls == [(source_path, {"width": 32, "height": 2, "source_path": source_path})]
     assert batches[0].column("frame").type.shape == [2, 2, 3]
 
 
@@ -799,7 +960,11 @@ def test_remote_video_decode_uses_temporary_path_and_preserves_remote_identity(
     decoder_paths = []
 
     def fake_open_decoder(path, **kwargs):
-        assert kwargs == {"width": 32, "height": 2}
+        assert kwargs == {
+            "width": 32,
+            "height": 2,
+            "source_path": "s3://media-bucket/clips/example.mp4",
+        }
         decoder_path = Path(path)
         assert decoder_path.is_file()
         decoder_paths.append(decoder_path)
@@ -840,7 +1005,11 @@ def test_remote_video_decode_cleans_temporary_path_when_consumer_stops_early(
     decoder_paths = []
 
     def fake_open_decoder(path, **kwargs):
-        assert kwargs == {"width": 32, "height": 2}
+        assert kwargs == {
+            "width": 32,
+            "height": 2,
+            "source_path": "s3://media-bucket/clips/example.mp4",
+        }
         decoder_paths.append(Path(path))
         return [FakeFrame(), FakeFrame(), FakeFrame()]
 
@@ -1249,20 +1418,6 @@ def test_video_frame_source_map_batches_skips_bad_file_and_continues(
     class FakeDecordError(Exception):
         pass
 
-    class FakeDecordLimitReachedError(Exception):
-        pass
-
-    class FakeDecordBase:
-        DECORDError = FakeDecordError
-        DECORDLimitReachedError = FakeDecordLimitReachedError
-
-    real_import_module = video_reader.importlib.import_module
-
-    def fake_import_module(module_name, *args, **kwargs):
-        if module_name == "decord._ffi.base":
-            return FakeDecordBase
-        return real_import_module(module_name, *args, **kwargs)
-
     def fake_decode(video_path, **_kwargs):
         source_path, source_id = video_reader._video_source_identity(video_path)
         row_count = 1 if video_path == "bad.avi" else 2
@@ -1275,11 +1430,12 @@ def test_video_frame_source_map_batches_skips_bad_file_and_continues(
             }
         )
         if video_path == "bad.avi":
-            raise FakeDecordError("corrupt video")
+            failure = FakeDecordError("corrupt video")
+            raise video_reader.VideoReadError(
+                source_path,
+                f"{type(failure).__name__}: {failure}",
+            ) from failure
 
-    monkeypatch.setattr(video_reader.importlib, "import_module", fake_import_module)
-    assert video_reader._is_decord_error(FakeDecordError("corrupt"))
-    assert video_reader._is_decord_error(FakeDecordLimitReachedError("recovery limit"))
     monkeypatch.setattr(video_reader, "_wait_for_memory", lambda: None)
     monkeypatch.setattr(video_reader, "_decode_video_batches", fake_decode)
     manifest = pa.table(
@@ -1311,14 +1467,19 @@ def test_video_frame_source_map_batches_skips_bad_file_and_continues(
     assert f"Skipping unreadable video source={bad_path!r}" in caplog.text
 
 
-def test_video_read_error_mode_raise_wraps_file_failure(monkeypatch):
+def test_video_read_error_mode_raise_preserves_decoder_boundary_failure(monkeypatch):
     import duckdb.datasource.video_reader as video_reader
 
-    def fake_decode(_video_path, **_kwargs):
-        raise OSError("corrupt video")
-        yield
+    failure = OSError("corrupt video")
 
-    monkeypatch.setattr(video_reader, "_decode_video_batches", fake_decode)
+    class FailingVideoReader:
+        def __init__(self, *_args, **_kwargs):
+            raise failure
+
+    class FakeDecordModule:
+        VideoReader = FailingVideoReader
+
+    monkeypatch.setattr(video_reader, "_import_video_dependency", lambda *_args: FakeDecordModule)
 
     with pytest.raises(video_reader.VideoReadError, match="corrupt video") as raised:
         list(
@@ -1335,9 +1496,71 @@ def test_video_read_error_mode_raise_wraps_file_failure(monkeypatch):
             )
         )
 
-    assert isinstance(raised.value.__cause__, OSError)
+    assert raised.value.__cause__ is failure
     expected_path, _ = video_reader._video_source_identity("bad.avi")
     assert raised.value.video_path == expected_path
+
+
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError, ValueError])
+def test_video_skip_mode_propagates_non_video_read_errors(monkeypatch, caplog, error_type):
+    import duckdb.datasource.video_reader as video_reader
+
+    failure = error_type("planned internal failure")
+
+    def fake_decode(*_args, **_kwargs):
+        raise failure
+        yield
+
+    monkeypatch.setattr(video_reader, "_decode_video_batches", fake_decode)
+
+    with (
+        caplog.at_level(logging.WARNING, logger=video_reader.__name__),
+        pytest.raises(error_type, match="planned internal failure") as raised,
+    ):
+        list(
+            video_reader._decode_video_with_policy(
+                "input.mp4",
+                height=2,
+                width=2,
+                max_partition_bytes=1024,
+                max_frames=None,
+                max_remote_video_bytes=4096,
+                max_source_frame_bytes=2048,
+                remote_temp_dir=None,
+                on_error="skip",
+            )
+        )
+
+    assert raised.value is failure
+    assert "Skipping unreadable video" not in caplog.text
+
+
+def test_video_skip_mode_propagates_resize_invariant(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    class FakeFrame:
+        shape = (2, 32, 3)
+
+        def asnumpy(self):
+            return np.zeros(self.shape, dtype=np.uint8)
+
+    monkeypatch.setattr(video_reader, "_open_decord_reader", lambda *_args, **_kwargs: [FakeFrame()])
+    monkeypatch.setattr(video_reader, "_resize_frame_batch", lambda *_args, **_kwargs: [])
+
+    with pytest.raises(RuntimeError, match="video resize returned a different number of frames"):
+        list(
+            video_reader._decode_video_with_policy(
+                "input.mp4",
+                height=2,
+                width=2,
+                max_partition_bytes=1024,
+                max_frames=None,
+                max_remote_video_bytes=4096,
+                max_source_frame_bytes=2048,
+                remote_temp_dir=None,
+                on_error="skip",
+            )
+        )
 
 
 def test_resize_frame_batch_preserves_order_and_uses_configured_threads(monkeypatch):
