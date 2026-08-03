@@ -40,6 +40,8 @@
 #include <duckdb/common/types/uuid.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 
+#include <exception>
+#include <optional>
 #include <set>
 
 static inline int DuckdbGetEnvIntMs(const char *name) {
@@ -183,12 +185,31 @@ static string QueryConnectionSettingForTest(DuckDBPyConnection &connection, cons
 	throw std::runtime_error("connection setting query returned no rows: " + name);
 }
 
-static py::dict WithCopyRecoveryContext(py::object conn_obj,
-                                        const std::function<py::dict(duckdb::ClientContext &)> &callback) {
+template <typename CALLBACK>
+static auto WithCopyRecoveryContext(py::object conn_obj, CALLBACK callback) {
 	auto run_callback = [&](duckdb::ClientContext &context) {
-		py::dict result;
-		context.RunFunctionInTransaction([&]() { result = callback(context); });
-		return result;
+		using Result = decltype(callback(context));
+		std::optional<Result> result;
+		std::exception_ptr callback_error;
+		{
+			py::gil_scoped_release release;
+			context.RunFunctionInTransaction(
+			    [&]() {
+				    // Match normal query startup after a failed query leaves a stale interrupt flag behind.
+				    context.ClearInterrupt();
+				    try {
+					    result.emplace(callback(context));
+				    } catch (...) {
+					    callback_error = std::current_exception();
+				    }
+			    },
+			    false);
+		}
+		if (callback_error) {
+			std::rethrow_exception(callback_error);
+		}
+		D_ASSERT(result.has_value());
+		return std::move(result.value());
 	};
 	if (!conn_obj.is_none()) {
 		auto &conn_wrapper = ExtractPyConnectionWrapper(std::move(conn_obj));
@@ -1488,30 +1509,30 @@ void register_ray_bindings(py::module_ &mod) {
 		    using namespace duckdb;
 		    using namespace duckdb::distributed;
 
-		    return WithCopyRecoveryContext(std::move(conn_obj), [&](ClientContext &context) {
+		    auto read_res = WithCopyRecoveryContext(std::move(conn_obj), [&](ClientContext &context) {
 			    auto &fs = FileSystem::GetFileSystem(context);
-			    auto read_res = ReadCommittedDistributedCopyDirectWriteResult(fs, base_path, run_id);
-			    if (read_res.is_err()) {
-				    throw py::value_error(read_res.error().what());
-			    }
-			    auto result = std::move(read_res).value();
-
-			    py::dict out;
-			    out["rows_copied"] = result.rows_copied;
-			    py::list files;
-			    for (const auto &info : result.files) {
-				    py::dict entry;
-				    entry["staging_path"] = info.staging_path;
-				    entry["worker_output_path"] = info.staging_path;
-				    entry["final_path"] = info.final_path;
-				    entry["row_count"] = info.row_count;
-				    entry["file_size_bytes"] = info.file_size_bytes;
-				    files.append(entry);
-			    }
-			    out["files"] = files;
-			    AppendDistributedCopyResultMetadata(out, result);
-			    return out;
+			    return ReadCommittedDistributedCopyDirectWriteResult(fs, base_path, run_id);
 		    });
+		    if (read_res.is_err()) {
+			    throw py::value_error(read_res.error().what());
+		    }
+		    auto result = std::move(read_res).value();
+
+		    py::dict out;
+		    out["rows_copied"] = result.rows_copied;
+		    py::list files;
+		    for (const auto &info : result.files) {
+			    py::dict entry;
+			    entry["staging_path"] = info.staging_path;
+			    entry["worker_output_path"] = info.staging_path;
+			    entry["final_path"] = info.final_path;
+			    entry["row_count"] = info.row_count;
+			    entry["file_size_bytes"] = info.file_size_bytes;
+			    files.append(entry);
+		    }
+		    out["files"] = files;
+		    AppendDistributedCopyResultMetadata(out, result);
+		    return out;
 	    },
 	    py::arg("base_path"), py::arg("run_id"), py::arg("conn") = py::none(),
 	    "Read a committed direct-write distributed COPY result through its committed manifest.");
@@ -1549,51 +1570,51 @@ void register_ray_bindings(py::module_ &mod) {
 		    using namespace duckdb;
 		    using namespace duckdb::distributed;
 
-		    return WithCopyRecoveryContext(std::move(conn_obj), [&](ClientContext &context) {
+		    auto inspection_res = WithCopyRecoveryContext(std::move(conn_obj), [&](ClientContext &context) {
 			    auto &fs = FileSystem::GetFileSystem(context);
-			    auto inspection_res = InspectDistributedCopyDirectWriteRun(fs, base_path, run_id);
-			    if (inspection_res.is_err()) {
-				    throw py::value_error(inspection_res.error().what());
-			    }
-			    auto inspection = std::move(inspection_res).value();
-			    py::dict out;
-			    switch (inspection.state) {
-			    case DistributedCopyDirectWriteRunState::COMMITTED:
-				    out["state"] = "COMMITTED";
-				    break;
-			    case DistributedCopyDirectWriteRunState::UNCOMMITTED:
-				    out["state"] = "UNCOMMITTED";
-				    break;
-			    case DistributedCopyDirectWriteRunState::UNKNOWN:
-				    out["state"] = "UNKNOWN";
-				    break;
-			    }
-			    out["safe_to_retry"] = false;
-			    out["error"] = inspection.error;
-			    out["copy_output_base_path"] = inspection.base_path;
-			    out["copy_output_run_id"] = inspection.run_id;
-			    out["copy_output_commit_dir"] = inspection.paths.commit_dir;
-			    out["copy_output_manifest_path"] = inspection.paths.manifest_path;
-			    out["copy_output_committed_marker_path"] = inspection.paths.committed_marker_path;
-			    out["copy_output_lifecycle_path"] = inspection.paths.lifecycle_path;
-			    py::list files;
-			    if (inspection.state == DistributedCopyDirectWriteRunState::COMMITTED) {
-				    out["rows_copied"] = inspection.committed_result.rows_copied;
-				    for (const auto &info : inspection.committed_result.files) {
-					    py::dict entry;
-					    entry["staging_path"] = info.staging_path;
-					    entry["worker_output_path"] = info.staging_path;
-					    entry["final_path"] = info.final_path;
-					    entry["row_count"] = info.row_count;
-					    entry["file_size_bytes"] = info.file_size_bytes;
-					    files.append(entry);
-				    }
-			    } else {
-				    out["rows_copied"] = py::none();
-			    }
-			    out["files"] = files;
-			    return out;
+			    return InspectDistributedCopyDirectWriteRun(fs, base_path, run_id);
 		    });
+		    if (inspection_res.is_err()) {
+			    throw py::value_error(inspection_res.error().what());
+		    }
+		    auto inspection = std::move(inspection_res).value();
+		    py::dict out;
+		    switch (inspection.state) {
+		    case DistributedCopyDirectWriteRunState::COMMITTED:
+			    out["state"] = "COMMITTED";
+			    break;
+		    case DistributedCopyDirectWriteRunState::UNCOMMITTED:
+			    out["state"] = "UNCOMMITTED";
+			    break;
+		    case DistributedCopyDirectWriteRunState::UNKNOWN:
+			    out["state"] = "UNKNOWN";
+			    break;
+		    }
+		    out["safe_to_retry"] = false;
+		    out["error"] = inspection.error;
+		    out["copy_output_base_path"] = inspection.base_path;
+		    out["copy_output_run_id"] = inspection.run_id;
+		    out["copy_output_commit_dir"] = inspection.paths.commit_dir;
+		    out["copy_output_manifest_path"] = inspection.paths.manifest_path;
+		    out["copy_output_committed_marker_path"] = inspection.paths.committed_marker_path;
+		    out["copy_output_lifecycle_path"] = inspection.paths.lifecycle_path;
+		    py::list files;
+		    if (inspection.state == DistributedCopyDirectWriteRunState::COMMITTED) {
+			    out["rows_copied"] = inspection.committed_result.rows_copied;
+			    for (const auto &info : inspection.committed_result.files) {
+				    py::dict entry;
+				    entry["staging_path"] = info.staging_path;
+				    entry["worker_output_path"] = info.staging_path;
+				    entry["final_path"] = info.final_path;
+				    entry["row_count"] = info.row_count;
+				    entry["file_size_bytes"] = info.file_size_bytes;
+				    files.append(entry);
+			    }
+		    } else {
+			    out["rows_copied"] = py::none();
+		    }
+		    out["files"] = files;
+		    return out;
 	    },
 	    py::arg("base_path"), py::arg("run_id"), py::arg("conn") = py::none(),
 	    "Inspect a direct-write COPY run without making an uncommitted run safe to retry.");
@@ -1604,24 +1625,24 @@ void register_ray_bindings(py::module_ &mod) {
 		    using namespace duckdb;
 		    using namespace duckdb::distributed;
 
-		    return WithCopyRecoveryContext(std::move(conn_obj), [&](ClientContext &context) {
+		    auto abort_res = WithCopyRecoveryContext(std::move(conn_obj), [&](ClientContext &context) {
 			    auto &fs = FileSystem::GetFileSystem(context);
-			    auto abort_res = ForceAbortDistributedCopyDirectWriteRun(fs, base_path, run_id);
-			    if (abort_res.is_err()) {
-				    throw py::value_error(abort_res.error().what());
-			    }
-			    auto cleanup = std::move(abort_res).value();
-			    py::dict out;
-			    out["state"] = "ABORTED";
-			    out["safe_to_retry"] = true;
-			    out["copy_output_base_path"] = base_path;
-			    out["copy_output_run_id"] = run_id;
-			    out["data_run_dir_existed"] = cleanup.data_run_dir_existed;
-			    out["data_run_dir_removed"] = cleanup.data_run_dir_removed;
-			    out["commit_dir_existed"] = cleanup.commit_dir_existed;
-			    out["commit_dir_removed"] = cleanup.commit_dir_removed;
-			    return out;
+			    return ForceAbortDistributedCopyDirectWriteRun(fs, base_path, run_id);
 		    });
+		    if (abort_res.is_err()) {
+			    throw py::value_error(abort_res.error().what());
+		    }
+		    auto cleanup = std::move(abort_res).value();
+		    py::dict out;
+		    out["state"] = "ABORTED";
+		    out["safe_to_retry"] = true;
+		    out["copy_output_base_path"] = base_path;
+		    out["copy_output_run_id"] = run_id;
+		    out["data_run_dir_existed"] = cleanup.data_run_dir_existed;
+		    out["data_run_dir_removed"] = cleanup.data_run_dir_removed;
+		    out["commit_dir_existed"] = cleanup.commit_dir_existed;
+		    out["commit_dir_removed"] = cleanup.commit_dir_removed;
+		    return out;
 	    },
 	    py::arg("base_path"), py::arg("run_id"), py::arg("conn") = py::none(),
 	    "Explicitly discard a shared-storage direct-write COPY run and verify that it is safe to retry.");
@@ -1665,35 +1686,32 @@ void register_ray_bindings(py::module_ &mod) {
 		    using namespace duckdb;
 		    using namespace duckdb::distributed;
 
-		    return WithCopyRecoveryContext(std::move(conn_obj), [&](ClientContext &context) {
+		    auto cleanup_res = WithCopyRecoveryContext(std::move(conn_obj), [&](ClientContext &context) {
 			    auto &fs = FileSystem::GetFileSystem(context);
-			    auto cleanup_res = [&]() {
-				    py::gil_scoped_release release;
-				    return CleanupExpiredDistributedCopyDirectWriteRuns(fs, base_path, min_age_ms, now_epoch_ms);
-			    }();
-			    if (cleanup_res.is_err()) {
-				    throw py::value_error(cleanup_res.error().what());
-			    }
-			    auto cleanup = std::move(cleanup_res).value();
-			    py::dict out;
-			    out["scanned_runs"] = cleanup.scanned_runs;
-			    out["cleaned_runs"] = cleanup.cleaned_runs;
-			    out["committed_runs"] = cleanup.committed_runs;
-			    out["active_runs"] = cleanup.active_runs;
-			    out["skipped_unregistered_runs"] = cleanup.skipped_unregistered_runs;
-			    out["errors"] = cleanup.errors;
-			    py::list cleaned_run_ids;
-			    for (const auto &run_id : cleanup.cleaned_run_ids) {
-				    cleaned_run_ids.append(run_id);
-			    }
-			    out["cleaned_run_ids"] = cleaned_run_ids;
-			    py::list error_messages;
-			    for (const auto &message : cleanup.error_messages) {
-				    error_messages.append(message);
-			    }
-			    out["error_messages"] = error_messages;
-			    return out;
+			    return CleanupExpiredDistributedCopyDirectWriteRuns(fs, base_path, min_age_ms, now_epoch_ms);
 		    });
+		    if (cleanup_res.is_err()) {
+			    throw py::value_error(cleanup_res.error().what());
+		    }
+		    auto cleanup = std::move(cleanup_res).value();
+		    py::dict out;
+		    out["scanned_runs"] = cleanup.scanned_runs;
+		    out["cleaned_runs"] = cleanup.cleaned_runs;
+		    out["committed_runs"] = cleanup.committed_runs;
+		    out["active_runs"] = cleanup.active_runs;
+		    out["skipped_unregistered_runs"] = cleanup.skipped_unregistered_runs;
+		    out["errors"] = cleanup.errors;
+		    py::list cleaned_run_ids;
+		    for (const auto &run_id : cleanup.cleaned_run_ids) {
+			    cleaned_run_ids.append(run_id);
+		    }
+		    out["cleaned_run_ids"] = cleaned_run_ids;
+		    py::list error_messages;
+		    for (const auto &message : cleanup.error_messages) {
+			    error_messages.append(message);
+		    }
+		    out["error_messages"] = error_messages;
+		    return out;
 	    },
 	    py::arg("base_path"), py::arg("min_age_ms"), py::arg("now_epoch_ms") = 0, py::arg("conn") = py::none(),
 	    "TTL cleanup scan for uncommitted direct-write distributed COPY runs.");
