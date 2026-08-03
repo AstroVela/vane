@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 
 import pytest
-from ray_test_profile import ray_test_object_store_bytes
+from ray_test_profile import ray_test_object_store_options
 
 import duckdb
 
@@ -65,7 +65,6 @@ class _ControlFaultRayWorkerActorHandle(RayWorkerActorHandle):
                     "pipeline_id": 1,
                     "operators": ["TABLE_SCAN"],
                     "operator_details": [{}],
-                    "stage_ids": [],
                 }
             ],
         }
@@ -290,7 +289,6 @@ def _register_fault_query(tasks) -> None:
         raise ValueError("fault query tasks must share one query_id")
     query_id = query_ids.pop()
     fragment_ids = sorted({f"{query_id}:node:{task.context()['node_id']}" for task in tasks})
-    heap_bytes = 64 * 1024 * 1024
     target_output_block_bytes = 1024 * 1024
     units = tuple(
         ResourceUnitSpec(
@@ -300,7 +298,7 @@ def _register_fault_query(tasks) -> None:
             unit_kind="native_fragment",
             backend="ray_worker",
             input_unit_ids=(),
-            per_task=ResourceVector(cpu=1, heap_bytes=heap_bytes),
+            per_task=ResourceVector(),
             target_output_block_bytes=target_output_block_bytes,
             generator_buffer_blocks=1,
             max_concurrency=max(1, len(tasks)),
@@ -309,7 +307,7 @@ def _register_fault_query(tasks) -> None:
     )
     allocation_resources = ResourceVector(
         cpu=max(1, len(tasks)),
-        heap_bytes=max(1, len(tasks)) * heap_bytes,
+        heap_bytes=max(1, len(tasks)) * 64 * 1024 * 1024,
         object_store_bytes=max(1, len(tasks)) * target_output_block_bytes,
     )
     manager = register_query_resource_graph(
@@ -382,7 +380,7 @@ def _init_ray_for_fault_test(monkeypatch) -> None:
             include_dashboard=False,
             num_cpus=int(os.environ.get("VANE_TEST_RAY_NUM_CPUS", "4")),
             num_gpus=0,
-            object_store_memory=ray_test_object_store_bytes(),
+            **ray_test_object_store_options(),
         )
         ray.init(
             address=cluster.address,

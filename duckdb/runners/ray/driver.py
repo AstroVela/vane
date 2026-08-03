@@ -2773,13 +2773,13 @@ class RayQueryDriverActor:
     def _schedule_query_fte_admission_pump(self, query_id: str) -> None:
         """Wake the FTE ownership domain without blocking the actor loop."""
         from duckdb.runners.ray.fte_fragment_scheduler import (
-            has_fte_resource_admission_waiter,
+            has_fte_resource_admission_demand,
         )
 
         query_key = str(query_id)
         if query_key in self._query_resource_closing_queries:
             return
-        if not has_fte_resource_admission_waiter(query_key):
+        if not has_fte_resource_admission_demand(query_key):
             return
         self._query_fte_admission_dirty_queries.add(query_key)
         existing = self._query_fte_admission_pumps.get(query_key)

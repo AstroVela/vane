@@ -33,18 +33,6 @@ BoundLimitNode CopyBoundLimitNode(const BoundLimitNode &node) {
 	return BoundLimitNode();
 }
 
-bool LimitNode::is_blocking_materializing() const {
-	return ChildHasMultiplePartitions(child_);
-}
-
-bool StreamingLimitNode::is_blocking_materializing() const {
-	return ChildHasMultiplePartitions(child_);
-}
-
-bool LimitPercentNode::is_blocking_materializing() const {
-	return ChildHasMultiplePartitions(child_);
-}
-
 namespace {
 using PlanBuilder = MaterializedPlanBuilder;
 using PerTaskBuilderFactory = PerTaskMaterializedPlanBuilderFactory;
@@ -131,7 +119,7 @@ SubmittableTaskStream<WorkerTask> LimitNode::produce_tasks(PlanExecutionContext 
 		return input_plan;
 	};
 
-	if (!is_blocking_materializing()) {
+	if (!ChildHasMultiplePartitions(child_)) {
 		auto input_stream = child_->produce_tasks(plan_context);
 		return input_stream.pipeline_instruction(shared_from_this(), final_plan_builder, plan_context.client_context());
 	}
@@ -197,7 +185,7 @@ SubmittableTaskStream<WorkerTask> StreamingLimitNode::produce_tasks(PlanExecutio
 		return input_plan;
 	};
 
-	if (!is_blocking_materializing()) {
+	if (!ChildHasMultiplePartitions(child_)) {
 		auto input_stream = child_->produce_tasks(plan_context);
 		return input_stream.pipeline_instruction(shared_from_this(), final_plan_builder, plan_context.client_context());
 	}
@@ -259,7 +247,7 @@ SubmittableTaskStream<WorkerTask> LimitPercentNode::produce_tasks(PlanExecutionC
 		return input_plan;
 	};
 
-	if (!is_blocking_materializing()) {
+	if (!ChildHasMultiplePartitions(child_)) {
 		auto input_stream = child_->produce_tasks(plan_context);
 		return input_stream.pipeline_instruction(shared_from_this(), final_plan_builder, plan_context.client_context());
 	}

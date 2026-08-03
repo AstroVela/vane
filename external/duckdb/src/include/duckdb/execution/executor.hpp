@@ -53,7 +53,6 @@ struct PipelineProgressSnapshot {
 	idx_t completed_pipeline_tasks = 0;
 	vector<string> operators;
 	vector<InsertionOrderPreservingMap<string>> operator_details;
-	vector<idx_t> stage_ids;
 };
 
 class Executor {

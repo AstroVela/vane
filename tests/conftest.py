@@ -13,7 +13,7 @@ from importlib import import_module
 from pathlib import Path
 
 import pytest
-from ray_test_profile import ray_test_object_store_bytes
+from ray_test_profile import ray_test_object_store_options
 
 import duckdb
 
@@ -313,7 +313,7 @@ def _ray_local_cluster():
                     include_dashboard=False,
                     num_cpus=resources.num_cpus,
                     num_gpus=resources.num_gpus,
-                    object_store_memory=ray_test_object_store_bytes(),
+                    **ray_test_object_store_options(),
                 )
 
         yield ray, cluster.address, env_vars

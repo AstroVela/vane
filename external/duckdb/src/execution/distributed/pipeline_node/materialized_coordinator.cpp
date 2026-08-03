@@ -135,14 +135,6 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 		return DuckDBResult<void>::err(DuckDBError::internal_error(ex.what()));
 	}
 
-	auto barrier_result =
-	    fte_task_submitter->blocking_materialization_completed(node->context().query_id(), node->node_id());
-	if (barrier_result.is_err()) {
-		result_tx->close();
-		exchange->Close();
-		return DuckDBResult<void>::err(barrier_result.error());
-	}
-
 	auto source_handles = exchange->GetSourceHandles();
 	auto source_nodes = CollectCoordinatorSourceNodes(source_handles);
 	auto estimated_cardinality = EstimateRowsFromHandles(source_handles);
@@ -199,10 +191,6 @@ SubmittableTaskStream<WorkerTask> ProduceWithMaterializedCoordinator(
     std::shared_ptr<ExchangeManager> exchange_mgr, SchemaRef materialized_schema) {
 	if (!node) {
 		throw InternalException("Materialized coordinator requires a pipeline node");
-	}
-	if (!node->is_blocking_materializing()) {
-		throw InternalException("Materialized coordinator node %s must be marked as blocking materializing",
-		                        node->name());
 	}
 	auto input_stream = child->produce_tasks(plan_context);
 

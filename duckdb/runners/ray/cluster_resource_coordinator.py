@@ -118,6 +118,8 @@ class ActorResourceBundle:
             raise ValueError("actor resource bundle actor_index must be >= 0")
         if self.resources.is_zero():
             raise ValueError("actor resource bundle must own non-zero resources")
+        if self.resources.object_store_bytes != 0:
+            raise ValueError("actor resource bundles may not hard-reserve object-store bytes")
         object.__setattr__(self, "resource_unit_id", resource_unit_id)
         object.__setattr__(self, "actor_index", actor_index)
 
@@ -158,6 +160,10 @@ class QueryDemand:
             raise ValueError("weight must be finite and > 0")
         actor_bundles = tuple(self.actor_bundles)
         task_bundles = tuple(self.task_bundles)
+        if self.minimum.object_store_bytes != 0:
+            raise ValueError("minimum query resources may not hard-reserve object-store bytes")
+        if any(bundle.object_store_bytes != 0 for bundle in task_bundles):
+            raise ValueError("task resource bundles may not hard-reserve object-store bytes")
         actor_keys = [(bundle.resource_unit_id, bundle.actor_index) for bundle in actor_bundles]
         if len(set(actor_keys)) != len(actor_keys):
             raise ValueError("actor resource bundles contain duplicate resource-unit/index identities")

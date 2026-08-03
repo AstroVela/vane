@@ -74,10 +74,10 @@ class FteWorkerEventHandlingMixin:
 
     def _handles_for_marked_fte_worker_failed(
         self,
-        scheduled_by_stage: list[tuple[str, str, list[Any], list[Any]]],
+        scheduled_by_fragment: list[tuple[str, str, list[Any], list[Any]]],
     ) -> list[Any]:
         handles: list[Any] = []
-        for query_id, fragment_id, scheduled_attempts, _ in scheduled_by_stage:
+        for query_id, fragment_id, scheduled_attempts, _ in scheduled_by_fragment:
             with _FTE_REGISTRY_LOCK:
                 if query_id in _FTE_CLOSING_QUERIES:
                     continue
@@ -98,9 +98,9 @@ class FteWorkerEventHandlingMixin:
     def _handles_for_worker_failed_event(self, event: WorkerFailed) -> list[Any]:
         handles: list[Any] = []
         try:
-            scheduled_by_stage = mark_fte_worker_failed_for_event(event)
-            if scheduled_by_stage:
-                handles.extend(self._handles_for_marked_fte_worker_failed(scheduled_by_stage))
+            scheduled_by_fragment = mark_fte_worker_failed_for_event(event)
+            if scheduled_by_fragment:
+                handles.extend(self._handles_for_marked_fte_worker_failed(scheduled_by_fragment))
         finally:
             handles.extend(request_fte_pending_task_drain())
         return handles

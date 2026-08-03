@@ -252,10 +252,6 @@ public:
 		return DuckDBResult<void>::ok();
 	}
 
-	DuckDBResult<void> blocking_materialization_completed(const std::string &query_id, NodeID node_id) override {
-		return worker_manager_->blocking_materialization_completed(query_id, node_id);
-	}
-
 	DuckDBResult<std::vector<MaterializedOutput>> wait_query_finished(const std::string &query_id,
 	                                                                  double timeout_s) override {
 		return worker_manager_->wait_fte_query(query_id, timeout_s);

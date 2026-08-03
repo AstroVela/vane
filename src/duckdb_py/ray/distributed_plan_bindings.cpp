@@ -664,7 +664,6 @@ struct PyPhysicalPlanWrapper {
 			}
 			metadata[py::str("input_node_ids")] = std::move(input_node_ids);
 			metadata[py::str("is_sink")] = py::bool_(node->is_sink());
-			metadata[py::str("is_blocking_materializing")] = py::bool_(node->is_blocking_materializing());
 			metadata[py::str("num_partitions")] = py::int_(std::max<size_t>(1, node->num_partitions()));
 			auto udf_entry = udf_by_node.find(node->node_id());
 			if (udf_entry == udf_by_node.end()) {

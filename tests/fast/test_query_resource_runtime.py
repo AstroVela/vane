@@ -34,7 +34,7 @@ def _graph(digest="sha256:a"):
         unit_kind="native_fragment",
         backend="ray_worker",
         input_unit_ids=(),
-        per_task=ResourceVector(cpu=1, heap_bytes=100),
+        per_task=ResourceVector(),
         target_output_block_bytes=10,
         generator_buffer_blocks=2,
         max_concurrency=4,
@@ -70,7 +70,19 @@ def test_runtime_registers_graph_atomically_and_rejects_every_duplicate():
 
 
 def test_runtime_graph_validation_finishes_before_registry_visibility():
-    graph = _graph()
+    unit = ResourceUnitSpec(
+        query_id="q",
+        resource_unit_id="resource:f:udf",
+        physical_node_id="udf",
+        unit_kind="ray_task_udf",
+        backend="ray_task",
+        input_unit_ids=(),
+        per_task=ResourceVector(cpu=1, heap_bytes=100),
+        target_output_block_bytes=10,
+        generator_buffer_blocks=2,
+        max_concurrency=None,
+    )
+    graph = QueryResourceGraph("q", "sha256:remote", (unit,), (unit.resource_unit_id,))
     too_small_resources = ResourceVector(cpu=1, heap_bytes=99, object_store_bytes=1_000)
     too_small = QueryAllocation(
         resources=too_small_resources,

@@ -40,14 +40,6 @@ static vector<BoundOrderByNode> CopyOrderBys(const vector<BoundOrderByNode> &ord
 	return copies;
 }
 
-bool OrderByNode::is_blocking_materializing() const {
-	return ChildHasMultiplePartitions(child_);
-}
-
-bool TopNNode::is_blocking_materializing() const {
-	return ChildHasMultiplePartitions(child_);
-}
-
 static void FixOrderByReferenceTypes(Expression &expr, const vector<LogicalType> &input_types) {
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
 		auto &ref = expr.Cast<BoundReferenceExpression>();
@@ -579,7 +571,7 @@ SubmittableTaskStream<WorkerTask> OrderByNode::produce_tasks(PlanExecutionContex
 		return AddPhysicalOrderPlan(std::move(input_plan), *orders_ptr, *projections_ptr, is_index_sort);
 	};
 
-	if (!is_blocking_materializing()) {
+	if (!ChildHasMultiplePartitions(child_)) {
 		auto input_stream = child_->produce_tasks(plan_context);
 		return input_stream.pipeline_instruction(shared_from_this(), order_plan_builder, plan_context.client_context());
 	}
@@ -818,14 +810,6 @@ SubmittableTaskStream<WorkerTask> OrderByNode::produce_tasks(PlanExecutionContex
 			DebugOrderByOutputs("range-output", range_mat_res.outputs);
 			DebugOrderByHandles("range-handles", range_handles);
 			auto range_estimated_cardinality = EstimateRowsFromHandles(range_handles, staging_estimated_cardinality);
-			auto barrier_result = fte_task_submitter->blocking_materialization_completed(
-			    self_shared->context().query_id(), self_shared->node_id());
-			if (barrier_result.is_err()) {
-				result_tx_ptr->close();
-				range_exchange->Close();
-				staging_exchange->Close();
-				return DuckDBResult<void>::err(barrier_result.error());
-			}
 
 			auto final_tasks =
 			    BuildExchangeSourceTasks(self_shared->context(), self_shared->config(), *task_id_counter, exchange_mgr,
@@ -905,7 +889,7 @@ SubmittableTaskStream<WorkerTask> TopNNode::produce_tasks(PlanExecutionContext &
 	};
 
 	// Single-partition path: just use pipeline_instruction (no coordinator).
-	if (!is_blocking_materializing()) {
+	if (!ChildHasMultiplePartitions(child_)) {
 		auto input_stream = child_->produce_tasks(plan_context);
 		return input_stream.pipeline_instruction(shared_from_this(), final_plan_builder, plan_context.client_context());
 	}

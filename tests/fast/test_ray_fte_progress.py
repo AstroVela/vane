@@ -43,7 +43,6 @@ def _topology(
                 "pipeline_id": pipeline_id,
                 "operators": operators,
                 "operator_details": (operator_details if operator_details is not None else [{} for _ in operators]),
-                "stage_ids": [],
             }
             for pipeline_id, operators, operator_details in pipelines
         ],
@@ -60,7 +59,7 @@ def test_progress_snapshot_includes_query_resource_manager():
             unit_kind="native_fragment",
             backend="ray_worker",
             input_unit_ids=(),
-            per_task=ResourceVector(cpu=1, heap_bytes=1),
+            per_task=ResourceVector(),
             target_output_block_bytes=1,
             generator_buffer_blocks=1,
             max_concurrency=1,
@@ -364,13 +363,11 @@ def test_progress_snapshot_publishes_native_topology_before_first_partition_runs
                 "pipeline_id": 1,
                 "operators": ["RESULT_COLLECTOR"],
                 "operator_details": [{}],
-                "stage_ids": [],
             },
             {
                 "pipeline_id": 2,
                 "operators": ["TABLE_SCAN", "PROJECTION", "RESULT_COLLECTOR"],
                 "operator_details": [{}, {}, {}],
-                "stage_ids": [],
             },
         ],
     }
@@ -414,13 +411,11 @@ def test_progress_snapshot_overlays_only_live_counters_matching_planned_topology
                 "pipeline_id": 1,
                 "operators": ["RESULT_COLLECTOR"],
                 "operator_details": [{}],
-                "stage_ids": [],
             },
             {
                 "pipeline_id": 2,
                 "operators": ["TABLE_SCAN", "PROJECTION", "RESULT_COLLECTOR"],
                 "operator_details": [{}, {}, {}],
-                "stage_ids": [],
             },
         ],
     }
@@ -491,7 +486,6 @@ def test_fragment_does_not_mix_deferred_partitions_with_native_pipeline_tasks():
                 "name": "ExchangeSource->Transform",
                 "operators": ["EXCHANGE_SOURCE", "PROJECTION"],
                 "operator_details": [{}, {}],
-                "stage_ids": [],
                 "total_pipeline_tasks": 36,
                 "queued_pipeline_tasks": 0,
                 "running_pipeline_tasks": 0,
@@ -503,7 +497,6 @@ def test_fragment_does_not_mix_deferred_partitions_with_native_pipeline_tasks():
                     "name": f"Pipeline{pipeline_id}",
                     "operators": ["PROJECTION"],
                     "operator_details": [{}],
-                    "stage_ids": [],
                     "total_pipeline_tasks": 1,
                     "queued_pipeline_tasks": int(pipeline_id <= 2),
                     "running_pipeline_tasks": int(pipeline_id in {3, 4}),

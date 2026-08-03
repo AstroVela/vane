@@ -54,9 +54,6 @@ public:
 	std::vector<PipelineNodeRef> children() const override;
 
 	std::vector<std::string> multiline_display(bool verbose) const override;
-	bool is_blocking_materializing() const override {
-		return true;
-	}
 
 	void EnableMarkJoinBuildSummary(vector<unique_ptr<Expression>> expressions) {
 		collect_mark_join_build_summary_ = true;

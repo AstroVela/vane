@@ -49,7 +49,7 @@ struct ShuffleManifestPartitionFile {
 };
 
 struct ShuffleAttemptManifest {
-	std::string shuffle_stage_id;
+	std::string exchange_id;
 	std::string node_id;
 	idx_t sink_partition_id = 0;
 	idx_t attempt_id = 0;
@@ -58,7 +58,7 @@ struct ShuffleAttemptManifest {
 };
 
 struct ShuffleCacheConfig {
-	std::string shuffle_stage_id;
+	std::string exchange_id;
 	std::string node_id;
 	idx_t num_partitions = 0;
 	std::vector<std::string> local_dirs;

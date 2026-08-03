@@ -8,10 +8,10 @@ from collections.abc import Callable
 from typing import Any
 
 from duckdb.runners.ray.query_resource_graph import QueryAllocation, QueryResourceGraph
-from duckdb.runners.ray.query_resource_manager import QueryResourceManager
+from duckdb.runners.ray.query_resource_manager import RayQueryResourceManager
 
 _LOCK = threading.RLock()
-_MANAGERS: dict[str, QueryResourceManager] = {}
+_MANAGERS: dict[str, RayQueryResourceManager] = {}
 
 
 def register_query_resource_graph(
@@ -20,11 +20,11 @@ def register_query_resource_graph(
     *,
     reservation_ratio: float = 0.5,
     on_change: Callable[[], None] | None = None,
-) -> QueryResourceManager:
+) -> RayQueryResourceManager:
     """Validate and atomically publish the only resource manager for a query."""
 
     graph.validate_allocation(allocation)
-    manager = QueryResourceManager(
+    manager = RayQueryResourceManager(
         graph,
         allocation,
         reservation_ratio=reservation_ratio,
@@ -38,7 +38,7 @@ def register_query_resource_graph(
     return manager
 
 
-def get_query_resource_manager(query_id: str) -> QueryResourceManager:
+def get_query_resource_manager(query_id: str) -> RayQueryResourceManager:
     query_key = str(query_id or "").strip()
     if not query_key:
         raise ValueError("query_id must be non-empty")

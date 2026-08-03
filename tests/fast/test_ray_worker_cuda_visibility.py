@@ -7,7 +7,7 @@ import pytest
 
 ray = pytest.importorskip("ray")
 
-from ray_test_profile import ray_test_object_store_bytes
+from ray_test_profile import ray_test_object_store_options
 
 import duckdb.runners.ray.worker as worker_mod
 from duckdb.runners.ray.worker_pool import _persistent_worker_runtime_env
@@ -145,7 +145,7 @@ def test_zero_gpu_ray_worker_preserves_non_contiguous_node_cuda_visibility(monke
             log_to_driver=True,
             num_cpus=1,
             num_gpus=2,
-            object_store_memory=ray_test_object_store_bytes(),
+            **ray_test_object_store_options(),
         )
     actor = None
     try:

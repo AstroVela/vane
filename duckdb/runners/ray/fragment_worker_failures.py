@@ -106,7 +106,7 @@ def mark_fte_worker_failed_for_event(event: Any) -> list[tuple[str, str, list[An
             reconciliation_schedulers[query_id] = scheduler
     reconciliation_query_ids = set(reconciliation_schedulers)
     try:
-        scheduled_by_stage = _mark_fte_worker_failed(
+        scheduled_by_fragment = _mark_fte_worker_failed(
             event.worker_id,
             failure,
             query_id_filters=reconciliation_query_ids,
@@ -123,4 +123,4 @@ def mark_fte_worker_failed_for_event(event: Any) -> list[tuple[str, str, list[An
         delay_s = _fte_retry_remaining_delay_s(query_id)
         if delay_s > 0:
             scheduler.arm_retry_delay(delay_s)
-    return scheduled_by_stage
+    return scheduled_by_fragment

@@ -338,7 +338,7 @@ void PhysicalRemoteExchangeSource::SerializeOperatorData(Serializer &serializer)
 		handle_source_task_partition_ids.push_back(handle.source_task_partition_id);
 		handle_flight_server_epochs.push_back(handle.flight_server_epoch);
 	}
-	serializer.WriteProperty(103, "shuffle_stage_id", exchange_id_);
+	serializer.WriteProperty(103, "exchange_id", exchange_id_);
 	serializer.WriteProperty(104, "partition_indices", partition_indices_);
 	serializer.WriteProperty(105, "source_nodes", source_nodes_);
 	serializer.WriteProperty(106, "flight_timeout_seconds", flight_config.flight_timeout_seconds);

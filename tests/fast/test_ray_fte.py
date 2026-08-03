@@ -248,7 +248,7 @@ def _register_fte_query(query_id: str, node_id: str, *, partitions: int, task_sl
                 unit_kind="native_fragment",
                 backend="ray_worker",
                 input_unit_ids=(),
-                per_task=ResourceVector(cpu=1, heap_bytes=2 * _GIB),
+                per_task=ResourceVector(),
                 target_output_block_bytes=128 * _MIB,
                 generator_buffer_blocks=2,
                 max_concurrency=partitions,
@@ -306,7 +306,6 @@ def _install_fte_fragment(query_id: str, node_id: str, *, partitions: int, conte
                     "pipeline_id": 1,
                     "operators": ["TABLE_SCAN"],
                     "operator_details": [{}],
-                    "stage_ids": [],
                 }
             ],
         },
@@ -384,8 +383,8 @@ def test_fte_task_lease_uses_attempt_identity_and_releases_once_at_terminal():
 
 def test_internal_fte_query_uses_outer_query_resource_identity():
     resource_query_id = "q-fte-resource-owner"
-    execution_query_id = f"{resource_query_id}_orderby_stage"
-    fragment_id = f"{execution_query_id}:orderby:2:stage:0"
+    execution_query_id = f"{resource_query_id}_orderby_execution"
+    fragment_id = f"{execution_query_id}:orderby:2:fragment:0"
     clear_query_resource_managers()
     manager, resource_unit_id = _register_fte_query(
         resource_query_id,
@@ -611,7 +610,6 @@ def test_progress_registry_publishes_immutable_native_topology_before_fragment_e
                 "pipeline_id": 1,
                 "operators": ["TABLE_SCAN", "PROJECTION"],
                 "operator_details": [{}, {}],
-                "stage_ids": [],
             }
         ],
     }
@@ -674,7 +672,6 @@ def test_progress_topology_concurrent_registration_builds_exactly_once():
                     "pipeline_id": 1,
                     "operators": ["TABLE_SCAN"],
                     "operator_details": [{}],
-                    "stage_ids": [],
                 }
             ],
         }
@@ -724,7 +721,6 @@ def test_progress_topology_failed_build_releases_ownership_for_retry():
                 "pipeline_id": 1,
                 "operators": ["TABLE_SCAN"],
                 "operator_details": [{}],
-                "stage_ids": [],
             }
         ],
     }
@@ -1702,7 +1698,7 @@ def test_task_descriptor_spooling_output_buffers_keep_partition_count_stable():
 
 
 def test_fte_exchange_tracker_selects_first_successful_attempt_only():
-    exchange = FteExchangeTracker("q", "stage-0")
+    exchange = FteExchangeTracker("q", "exchange-0")
     sink = exchange.add_sink(0)
 
     instance0 = exchange.instantiate_sink(sink, 0)
@@ -1717,7 +1713,7 @@ def test_fte_exchange_tracker_selects_first_successful_attempt_only():
         {
             "sink_handle": {
                 "query_id": "q",
-                "exchange_id": "stage-0",
+                "exchange_id": "exchange-0",
                 "partition_id": 0,
             },
             "attempt_id": 1,
@@ -1868,7 +1864,7 @@ def test_hash_exchange_selector_final_waits_for_all_sources():
 
 
 def test_fte_exchange_tracker_rejects_new_sinks_after_final():
-    exchange = FteExchangeTracker("q", "stage-final")
+    exchange = FteExchangeTracker("q", "exchange-final")
     sink = exchange.add_sink(0)
 
     exchange.sink_finished(sink, 0)
@@ -1885,7 +1881,7 @@ def test_fte_exchange_tracker_rejects_new_sinks_after_final():
 
 
 def test_fte_exchange_tracker_late_success_after_final_keeps_source_handles_stable():
-    exchange = FteExchangeTracker("q", "stage-late")
+    exchange = FteExchangeTracker("q", "exchange-late")
     sink0 = exchange.add_sink(0)
     sink1 = exchange.add_sink(1)
 
@@ -1906,7 +1902,7 @@ def test_fte_exchange_tracker_late_success_after_final_keeps_source_handles_stab
 
 
 def test_spooling_exchange_manager_late_success_after_final_does_not_replace_selected_files(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-late-spool")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-late-spool")
     sink = exchange.add_sink(0)
     selected = exchange.instantiate_sink(sink, 0)
     late = exchange.instantiate_sink(sink, 1)
@@ -1928,7 +1924,7 @@ def test_spooling_exchange_manager_late_success_after_final_does_not_replace_sel
 
 
 def test_spooling_exchange_manager_writes_markers_and_selected_source_handles(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-0")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-0")
     sink = exchange.add_sink(0)
 
     attempt0 = exchange.instantiate_sink(sink, 0)
@@ -1947,13 +1943,13 @@ def test_spooling_exchange_manager_writes_markers_and_selected_source_handles(tm
     assert handles[0].attempt_id == 1
     assert handles[0].files == (path1,)
     assert handles[0].attempt_path == attempt1.attempt_path
-    assert (tmp_path / "q" / "stage-0" / "sink_0" / "attempt_1" / "committed").exists()
-    assert (tmp_path / "q" / "stage-0" / "sink_0" / "attempt_1" / "manifest.json").exists()
+    assert (tmp_path / "q" / "exchange-0" / "sink_0" / "attempt_1" / "committed").exists()
+    assert (tmp_path / "q" / "exchange-0" / "sink_0" / "attempt_1" / "manifest.json").exists()
     assert path0 != path1
 
 
 def test_collect_spooling_output_stats_from_attempt_path(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-0")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-0")
     sink = exchange.add_sink(1)
     attempt = exchange.instantiate_sink(sink, 3)
     path0 = exchange.record_output_file(attempt, 0, "a", b"aaa")
@@ -1976,7 +1972,7 @@ def test_collect_spooling_output_stats_from_attempt_path(tmp_path):
 
 
 def test_spooling_exchange_manager_abort_cleanup_and_destroy_query(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-0")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-0")
     sink = exchange.add_sink(2)
     attempt0 = exchange.instantiate_sink(sink, 0)
     attempt1 = exchange.instantiate_sink(sink, 1)
@@ -1987,8 +1983,8 @@ def test_spooling_exchange_manager_abort_cleanup_and_destroy_query(tmp_path):
     exchange.finish_attempt(attempt1)
     exchange.sink_finished(sink, 1)
 
-    attempt0_dir = tmp_path / "q" / "stage-0" / "sink_2" / "attempt_0"
-    attempt1_dir = tmp_path / "q" / "stage-0" / "sink_2" / "attempt_1"
+    attempt0_dir = tmp_path / "q" / "exchange-0" / "sink_2" / "attempt_0"
+    attempt1_dir = tmp_path / "q" / "exchange-0" / "sink_2" / "attempt_1"
     assert (attempt0_dir / "aborted").exists()
     assert attempt1_dir.exists()
 
@@ -2001,7 +1997,7 @@ def test_spooling_exchange_manager_abort_cleanup_and_destroy_query(tmp_path):
 
 
 def test_spooling_exchange_manager_removes_committed_but_unselected_attempt(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-0")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-0")
     sink = exchange.add_sink(0)
     attempt0 = exchange.instantiate_sink(sink, 0)
     attempt1 = exchange.instantiate_sink(sink, 1)
@@ -2016,14 +2012,14 @@ def test_spooling_exchange_manager_removes_committed_but_unselected_attempt(tmp_
     assert len(handles) == 1
     assert handles[0].attempt_id == 1
     assert handles[0].files == (selected_path,)
-    assert (tmp_path / "q" / "stage-0" / "sink_0" / "attempt_0" / "committed").exists()
+    assert (tmp_path / "q" / "exchange-0" / "sink_0" / "attempt_0" / "committed").exists()
     assert exchange.cleanup_unselected_attempts() == 1
-    assert not (tmp_path / "q" / "stage-0" / "sink_0" / "attempt_0").exists()
-    assert (tmp_path / "q" / "stage-0" / "sink_0" / "attempt_1").exists()
+    assert not (tmp_path / "q" / "exchange-0" / "sink_0" / "attempt_0").exists()
+    assert (tmp_path / "q" / "exchange-0" / "sink_0" / "attempt_1").exists()
 
 
 def test_spooling_exchange_manager_duplicate_successful_attempts_select_one(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-0")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-0")
     sink = exchange.add_sink(0)
     attempt0 = exchange.instantiate_sink(sink, 0)
     attempt1 = exchange.instantiate_sink(sink, 1)
@@ -2044,7 +2040,7 @@ def test_spooling_exchange_manager_duplicate_successful_attempts_select_one(tmp_
 
 
 def test_two_stage_query_dag_worker_loss_uses_selected_attempt_for_final_result(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-upstream")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-upstream")
     upstream = _fte_fragment_execution(
         "q",
         11,
@@ -2347,6 +2343,21 @@ def test_fte_worker_command_outbox_pop_owns_attempt_scheduling_lock():
     assert acquired_during_copy is False
     assert popped == ["first"]
     assert stage._worker_command_outbox == []
+
+
+def test_fte_fragment_without_native_heap_requirement_omits_request_memory():
+    stage = FteFragmentExecution(
+        "query-duckdb-memory",
+        0,
+        fragment_id="query-duckdb-memory:node:1",
+        task_memory_bytes=None,
+    )
+    partition = stage.add_partition(0)
+
+    scheduled = partition.start_attempt()
+
+    assert partition.memory_requirement_bytes is None
+    assert "memory_requirement_bytes" not in scheduled.request
 
 
 def test_fte_add_partition_owns_state_lock_and_is_idempotent_under_concurrency():
@@ -3841,7 +3852,7 @@ def test_fte_fragment_execution_oom_is_terminal_for_fixed_heap():
 def test_fte_fragment_execution_finish_removes_descriptor_and_finalizes_exchange():
     worker = _FakeLiveWorker()
     storage = TaskDescriptorStorage()
-    exchange = FteExchangeTracker("q", "stage-5")
+    exchange = FteExchangeTracker("q", "exchange-5")
     stage = _fte_fragment_execution(
         "q",
         5,
@@ -3881,7 +3892,7 @@ def test_fte_fragment_execution_finish_cancels_unselected_running_attempts():
 
     winner_worker = _AccountingWorker("worker-winner")
     loser_worker = _AccountingWorker("worker-loser")
-    exchange = FteExchangeTracker("q", "stage-selected")
+    exchange = FteExchangeTracker("q", "exchange-selected")
     stage = _fte_fragment_execution(
         "q",
         61,
@@ -3949,7 +3960,7 @@ def test_fte_fragment_execution_handle_finished_status_marks_task_finished():
 def test_fte_fragment_execution_handle_finished_missing_stats_retries_exchange_attempt():
     worker = _FakeLiveWorker()
     storage = TaskDescriptorStorage()
-    exchange = FteExchangeTracker("q", "stage-missing-stats")
+    exchange = FteExchangeTracker("q", "exchange-missing-stats")
     stage = _fte_fragment_execution(
         "q",
         41,
@@ -4211,7 +4222,7 @@ def test_fte_fragment_execution_handle_failed_status_marks_stage_failed_when_att
 def test_fte_fragment_execution_worker_lost_uses_retry_attempt_as_durable_output(tmp_path):
     worker0 = _FakeLiveWorker("worker-a")
     worker1 = _FakeLiveWorker("worker-b")
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-fte-lost")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-fte-lost")
 
     def select_worker(partition):
         return worker0 if partition.next_attempt_number() == 0 else worker1
@@ -5350,7 +5361,7 @@ def test_fte_worker_task_manager_fte_update_before_execution_updates_descriptor_
 
 
 def test_fte_worker_task_manager_returns_spooling_output_stats(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-0")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-0")
     sink = exchange.add_sink(0)
     attempt = exchange.instantiate_sink(sink, 0)
 
@@ -6234,6 +6245,57 @@ def test_ray_fte_worker_requires_exact_query_lease_heap():
         assert final["state"] == FteTaskState.FINISHED.value
 
         await manager.drop_query("qlease")
+
+    asyncio.run(run())
+
+
+def test_ray_fte_worker_accepts_native_task_with_zero_heap_lease():
+    async def execute_fn(request):
+        return {"ok": str(FteTaskAttemptId.coerce(request["task_id"]))}
+
+    async def run():
+        manager = _fte_worker_task_manager(
+            execute_fn,
+            admission_config=FteWorkerAdmissionConfig(
+                max_running_tasks=4,
+                mode="lease",
+                memory_budget_bytes=20,
+                task_memory_bytes=None,
+            ),
+            require_query_task_lease=True,
+        )
+        task_id = {
+            "query_id": "q-native-lease",
+            "fragment_execution_id": 0,
+            "partition_id": 0,
+            "attempt_id": 0,
+        }
+        status = await manager.create_task(
+            {
+                "task_id": task_id,
+                "fragment_id": "q-native-lease:node:scan",
+                "query_task_lease": {
+                    "lease_id": "lease-q-native",
+                    "query_id": "q-native-lease",
+                    "execution_query_id": "q-native-lease",
+                    "resource_unit_id": "resource:q-native-lease:fragment:node:scan",
+                    "task_id": "q-native-lease.0.0",
+                    "attempt_id": "q-native-lease.0.0.0",
+                    "resources": {
+                        "cpu": 0.0,
+                        "gpu": 0.0,
+                        "heap_bytes": 0,
+                        "object_store_bytes": 0,
+                    },
+                },
+            }
+        )
+
+        assert status["executor_task_memory_requirement_bytes"] == 0
+        final = await manager.wait_task_status(task_id, status["version"], timeout_s=1.0)
+        assert final["state"] == FteTaskState.FINISHED.value
+
+        await manager.drop_query("q-native-lease")
 
     asyncio.run(run())
 

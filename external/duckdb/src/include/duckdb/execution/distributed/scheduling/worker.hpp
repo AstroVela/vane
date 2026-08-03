@@ -127,12 +127,6 @@ public:
 		    DuckDBError::invalid_state_error("worker manager does not support FTE source exhaustion"));
 	}
 
-	/// Notify resource coordination that one blocking pipeline phase finished
-	/// collecting its complete input. The stage may still emit final tasks.
-	virtual DuckDBResult<void> blocking_materialization_completed(const std::string &query_id, NodeID node_id) {
-		return DuckDBResult<void>::ok();
-	}
-
 	/// Submit task-stream events directly to the FTE task-update coordinator.
 	virtual DuckDBResult<void> submit_fte_task_events(std::vector<WorkerTask> tasks) {
 		return DuckDBResult<void>::err(

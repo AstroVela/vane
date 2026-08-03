@@ -115,9 +115,6 @@ public:
 	virtual DuckDBResult<void> submit_fte_task_events(std::vector<WorkerTask> tasks) = 0;
 	virtual DuckDBResult<void> task_input_stream_exhausted(const std::string &query_id,
 	                                                       const std::unordered_set<SourceNodeId> &source_node_ids) = 0;
-	virtual DuckDBResult<void> blocking_materialization_completed(const std::string &query_id, NodeID node_id) {
-		return DuckDBResult<void>::ok();
-	}
 	virtual DuckDBResult<std::vector<MaterializedOutput>> wait_query_finished(const std::string &query_id,
 	                                                                          double timeout_s) = 0;
 	virtual DuckDBResult<std::vector<MaterializedOutput>>
@@ -437,11 +434,6 @@ public:
 	virtual bool is_sink() const {
 		return false;
 	}
-	/// Returns true when this node must collect its complete distributed input
-	/// before the next pipeline phase can make progress.
-	virtual bool is_blocking_materializing() const {
-		return false;
-	}
 	virtual std::vector<std::string> multiline_display(bool verbose) const = 0;
 };
 
@@ -512,10 +504,6 @@ public:
 
 	bool is_sink() const override {
 		return op_->is_sink();
-	}
-
-	bool is_blocking_materializing() const override {
-		return op_->is_blocking_materializing();
 	}
 
 	const PipelineNodeRef &implementation() const {

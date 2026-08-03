@@ -44,15 +44,13 @@ def _fixed_ray_runtime_node(monkeypatch):
     )
 
 
-def test_ray_udf_cpu_and_memory_defaults_are_nonzero(monkeypatch):
+def test_ray_udf_cpu_defaults_to_one_and_heap_is_unreserved_when_omitted():
     import duckdb.execution.udf_ray as fur
     from duckdb.execution.udf_task_admission import ray_udf_task_memory_bytes
 
-    monkeypatch.delenv("VANE_UDF_TASK_HEAP_BYTES", raising=False)
-    monkeypatch.delenv("VANE_UDF_ACTOR_HEAP_BYTES", raising=False)
     assert fur._payload_num_cpus({}) == 1.0
-    assert ray_udf_task_memory_bytes({"execution_backend": "ray_task"}) == 2 * _GIB
-    assert ray_udf_task_memory_bytes({"execution_backend": "ray_actor"}) == 4 * _GIB
+    assert ray_udf_task_memory_bytes({"execution_backend": "ray_task"}) == 0
+    assert ray_udf_task_memory_bytes({"execution_backend": "ray_actor"}) == 0
     with pytest.raises(ValueError, match="memory_bytes must be positive"):
         ray_udf_task_memory_bytes({"execution_backend": "ray_task", "memory_bytes": 0})
 
@@ -67,6 +65,20 @@ def test_ray_task_options_use_exact_logical_resources_and_fixed_pair_window():
         "num_cpus": 1.5,
         "num_gpus": 0.25,
         "memory": 3 * _GIB,
+        "max_retries": 2,
+        "_generator_backpressure_num_objects": 4,
+    }
+
+
+def test_ray_task_options_omit_undeclared_heap_and_remove_runtime_override():
+    import duckdb.execution.udf_ray as fur
+
+    options = fur._task_remote_options(1.5, 0.25, 0, 2, {"name": "task", "memory": 3 * _GIB})
+
+    assert options == {
+        "name": "task",
+        "num_cpus": 1.5,
+        "num_gpus": 0.25,
         "max_retries": 2,
         "_generator_backpressure_num_objects": 4,
     }
@@ -512,6 +524,61 @@ def test_actor_pool_requests_logical_memory_and_initializes_eagerly(monkeypatch)
     assert actor_options[0]["scheduling_strategy"].soft is False
     assert len(init_calls) == 1
     assert len(init_calls[0]) == 1
+
+
+def test_actor_pool_omits_undeclared_heap_and_removes_runtime_override(monkeypatch):
+    from duckdb.execution.udf_ray_actor_pool import UDFActorPoolBase
+
+    actor_options = []
+
+    class _Init:
+        def remote(self, *_args):
+            return "ready"
+
+    class _ActorHandle:
+        init_payload = _Init()
+
+    class _ActorFactory:
+        @classmethod
+        def options(cls, **options):
+            actor_options.append(options)
+            return SimpleNamespace(remote=lambda: _ActorHandle())
+
+    class _Pool(UDFActorPoolBase):
+        @staticmethod
+        def _actor_class(*_args):
+            return _ActorFactory
+
+        @staticmethod
+        def _resolve_actor_num_cpus(_payload):
+            return 1.0
+
+        @staticmethod
+        def _resolve_actor_memory_bytes(_payload):
+            return 0
+
+        @staticmethod
+        def _build_actor_runtime_env(_options):
+            return {}
+
+        @staticmethod
+        def _normalize_actor_node_ids(node_ids, *, expected_count):
+            return node_ids
+
+    fake_ray = SimpleNamespace(put=lambda value: ("payload-ref", value))
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    _Pool(
+        payload={
+            "execution_backend": "ray_actor",
+            "cpus": 1.0,
+        },
+        concurrency=1,
+        gpus_per_actor=0.0,
+        actor_node_ids=[_NODE_ID],
+        ray_options={"memory": 3 * _GIB},
+    )
+
+    assert "memory" not in actor_options[0]
 
 
 def test_actor_pool_thread_env_uses_payload_cpu_allocation(monkeypatch):

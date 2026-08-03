@@ -25,6 +25,7 @@ from duckdb.execution.udf_stream_result_collector import (
     _ReadyEvent,
     _StreamRecord,
 )
+from duckdb.execution.udf_ray_stream_protocol import validate_stream_block_metadata
 from duckdb.execution.udf_task_admission import TaskAdmission
 
 _CLEANUP_SUBMISSION_SCOPE = "query:test-cleanup"
@@ -317,6 +318,21 @@ def _metadata(lease, *, index=0, size_bytes=64, rows=1):
         "num_rows": rows,
         "names": ["value"],
     }
+
+
+def test_v1_stream_metadata_rejects_the_removed_producer_stage_field():
+    metadata = _metadata(
+        {
+            "query_id": "q1",
+            "resource_unit_id": "resource:q1:udf:node:1",
+            "lease_id": "lease-1",
+            "attempt_id": "attempt-1",
+        }
+    )
+    metadata["producer_stage_id"] = metadata.pop("producer_unit_id")
+
+    with pytest.raises(ValueError, match="unknown=producer_stage_id"):
+        validate_stream_block_metadata(metadata)
 
 
 def _source(fake_ray, driver, *, request_id, submitter):

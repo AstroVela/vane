@@ -53,9 +53,8 @@ def _unit(
     actor_pool_size: int = 0,
     actor_prefetch_depth: int = 1,
     unit_kind: str | None = None,
-    is_barrier: bool = False,
 ) -> ResourceUnitSpec:
-    requested = per_task or _resources()
+    requested = per_task if per_task is not None else (ResourceVector() if backend == "ray_worker" else _resources())
     if backend == "ray_actor":
         resident = resident_per_actor or ResourceVector(
             cpu=requested.cpu,
@@ -88,7 +87,6 @@ def _unit(
         resident_per_actor=resident,
         actor_pool_size=actor_pool_size,
         actor_prefetch_depth=actor_prefetch_depth,
-        is_barrier=is_barrier,
     )
 
 
@@ -174,81 +172,6 @@ def test_graph_orders_units_deterministically_and_preserves_one_unit_identity_fo
     )
 
 
-def test_graph_identifies_downstream_native_fragment_slots_after_remote_process_boundaries():
-    first_native_fragment = _unit(
-        "resource:fragment-1:first-native_fragment",
-        backend="ray_worker",
-        max_concurrency=36,
-    )
-    direct_native_fragment = _unit(
-        "resource:fragment-1:direct-native_fragment",
-        inputs=(first_native_fragment.resource_unit_id,),
-        backend="ray_worker",
-        max_concurrency=36,
-    )
-    cpu_udf = _unit(
-        "resource:fragment-1:cpu-udf",
-        inputs=(direct_native_fragment.resource_unit_id,),
-    )
-    post_task_native_fragment = _unit(
-        "resource:fragment-2:post-task-native_fragment",
-        inputs=(cpu_udf.resource_unit_id,),
-        backend="ray_worker",
-        max_concurrency=36,
-    )
-    gpu_udf = _unit(
-        "resource:fragment-2:gpu-udf",
-        inputs=(post_task_native_fragment.resource_unit_id,),
-        backend="ray_actor",
-        per_task=_resources(gpu=1),
-        actor_pool_size=1,
-    )
-    post_actor_native_fragment = _unit(
-        "resource:fragment-3:post-actor-native_fragment",
-        inputs=(gpu_udf.resource_unit_id,),
-        backend="ray_worker",
-        max_concurrency=36,
-        target_output_block_bytes=0,
-        generator_buffer_blocks=0,
-    )
-    graph = _graph(
-        post_actor_native_fragment,
-        cpu_udf,
-        first_native_fragment,
-        gpu_udf,
-        direct_native_fragment,
-        post_task_native_fragment,
-        terminals=(post_actor_native_fragment.resource_unit_id,),
-    )
-
-    assert graph.downstream_native_fragment_unit_ids_requiring_separate_slot(
-        first_native_fragment.resource_unit_id
-    ) == (
-        post_task_native_fragment.resource_unit_id,
-        post_actor_native_fragment.resource_unit_id,
-    )
-    assert graph.downstream_native_fragment_unit_ids_requiring_separate_slot(
-        direct_native_fragment.resource_unit_id
-    ) == (
-        post_task_native_fragment.resource_unit_id,
-        post_actor_native_fragment.resource_unit_id,
-    )
-    assert graph.downstream_native_fragment_unit_ids_requiring_separate_slot(cpu_udf.resource_unit_id) == (
-        post_task_native_fragment.resource_unit_id,
-        post_actor_native_fragment.resource_unit_id,
-    )
-    assert graph.downstream_native_fragment_unit_ids_requiring_separate_slot(
-        post_task_native_fragment.resource_unit_id
-    ) == (post_actor_native_fragment.resource_unit_id,)
-    assert graph.downstream_native_fragment_unit_ids_requiring_separate_slot(gpu_udf.resource_unit_id) == (
-        post_actor_native_fragment.resource_unit_id,
-    )
-    assert (
-        graph.downstream_native_fragment_unit_ids_requiring_separate_slot(post_actor_native_fragment.resource_unit_id)
-        == ()
-    )
-
-
 def test_graph_serialization_round_trip_is_strict_and_stable():
     scan = _unit("resource:fragment-1:scan")
     sink = _unit(
@@ -266,6 +189,11 @@ def test_graph_serialization_round_trip_is_strict_and_stable():
     assert list(payload) == ["query_id", "plan_digest", "units", "terminal_unit_ids"]
     with pytest.raises(ValueError, match="unknown fields"):
         QueryResourceGraph.from_dict({**payload, "legacy_operator_specs": []})
+
+    unit_payload = dict(payload["units"][0])
+    unit_payload["stage_id"] = unit_payload.pop("resource_unit_id")
+    with pytest.raises(ValueError, match="unknown fields: stage_id"):
+        ResourceUnitSpec.from_dict(unit_payload)
 
 
 def test_graph_rejects_duplicate_unit_ids():
@@ -303,8 +231,8 @@ def test_graph_rejects_non_terminal_branch_and_terminal_with_downstream_unit():
         _graph(scan, used, terminals=(scan.resource_unit_id,))
 
 
-@pytest.mark.parametrize("backend", ["ray_task", "ray_actor", "ray_worker"])
-def test_graph_rejects_zero_heap_for_every_ray_python_process(backend):
+@pytest.mark.parametrize("backend", ["ray_task", "ray_actor"])
+def test_graph_accepts_undeclared_heap_for_ray_python_process(backend):
     unit = _unit(
         "resource:fragment-1:udf",
         backend=backend,
@@ -312,7 +240,21 @@ def test_graph_rejects_zero_heap_for_every_ray_python_process(backend):
         actor_pool_size=1 if backend == "ray_actor" else 0,
     )
 
-    with pytest.raises(ValueError, match="non-zero heap_bytes"):
+    graph = _graph(unit, terminals=(unit.resource_unit_id,))
+    registered = graph.unit_by_id(unit.resource_unit_id)
+    process_resources = registered.resident_per_actor if backend == "ray_actor" else registered.per_task
+
+    assert process_resources.heap_bytes == 0
+
+
+def test_graph_rejects_native_process_resources_owned_outside_duckdb():
+    unit = _unit(
+        "resource:fragment-1:native",
+        backend="ray_worker",
+        per_task=_resources(cpu=1, heap_bytes=256 * MIB, object_store_bytes=10),
+    )
+
+    with pytest.raises(ValueError, match="process resources are owned by DuckDB"):
         _graph(unit, terminals=(unit.resource_unit_id,))
 
 
@@ -394,14 +336,6 @@ def test_graph_rejects_invalid_actor_prefetch_depth():
     )
     with pytest.raises(ValueError, match="only configurable for ray_actor"):
         _graph(task, terminals=(task.resource_unit_id,))
-
-
-@pytest.mark.parametrize("is_barrier", [0, 1, "barrier", None])
-def test_graph_rejects_non_boolean_barrier_flag(is_barrier):
-    unit = _unit("resource:fragment-1:scan", is_barrier=is_barrier)
-
-    with pytest.raises(ValueError, match="is_barrier must be a boolean"):
-        _graph(unit, terminals=(unit.resource_unit_id,))
 
 
 def test_graph_rejects_inconsistent_output_window_shape():

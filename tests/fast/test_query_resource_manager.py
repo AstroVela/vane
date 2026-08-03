@@ -13,7 +13,7 @@ from duckdb.runners.ray.query_resource_graph import (
 )
 from duckdb.runners.ray.query_resource_manager import (
     OutputBlockRequest,
-    QueryResourceManager,
+    RayQueryResourceManager,
     TaskRequest,
 )
 
@@ -48,7 +48,6 @@ def _unit(
     actor_prefetch_depth=1,
     resident=None,
     unit_kind=None,
-    is_barrier=False,
 ):
     requested = resources or _r(cpu=1, heap=10)
     if backend == "ray_actor":
@@ -57,6 +56,9 @@ def _unit(
             gpu=requested.gpu,
             heap=requested.heap_bytes,
         )
+        task_resources = _r(store=requested.object_store_bytes)
+    elif backend == "ray_worker":
+        resident_resources = _r()
         task_resources = _r(store=requested.object_store_bytes)
     else:
         resident_resources = _r()
@@ -83,7 +85,6 @@ def _unit(
         resident_per_actor=resident_resources,
         actor_pool_size=actor_pool_size,
         actor_prefetch_depth=actor_prefetch_depth,
-        is_barrier=is_barrier,
     )
 
 
@@ -114,7 +115,7 @@ def _manager(
         nodes=nodes,
     )
     graph.validate_allocation(allocation)
-    return QueryResourceManager(
+    return RayQueryResourceManager(
         graph,
         allocation,
         reservation_ratio=reservation_ratio,
@@ -166,253 +167,31 @@ def test_task_admission_requires_runnable_registered_unit_and_ready_actor():
     assert granted.lease.output_window_bytes == 20
 
 
-def test_only_first_pending_reservation_scope_and_its_upstream_receive_reservations_without_gating():
-    source = _unit(
-        "resource:f:scope-source",
-        resources=_r(cpu=1, heap=10),
-        target=1,
+def test_dynamic_reservations_follow_real_runnable_demand_without_static_scope():
+    upstream = _unit("resource:f:upstream", resources=_r(cpu=1, heap=10, store=5), target=5, blocks=1)
+    downstream = _unit(
+        "resource:f:downstream",
+        inputs=(upstream.resource_unit_id,),
+        resources=_r(cpu=1, heap=10, store=5),
+        target=5,
         blocks=1,
-        backend="ray_worker",
-        unit_kind="native_fragment",
     )
-    first_barrier = _unit(
-        "resource:f:scope-first-barrier",
-        inputs=(source.resource_unit_id,),
-        resources=_r(cpu=1, heap=10),
-        target=1,
-        blocks=1,
-        backend="ray_worker",
-        unit_kind="native_fragment",
-        is_barrier=True,
-    )
-    between = _unit(
-        "resource:f:scope-between",
-        inputs=(first_barrier.resource_unit_id,),
-        resources=_r(cpu=1, heap=10),
-        target=1,
-        blocks=1,
-        backend="ray_worker",
-        unit_kind="native_fragment",
-    )
-    second_barrier = _unit(
-        "resource:f:scope-second-barrier",
-        inputs=(between.resource_unit_id,),
-        resources=_r(cpu=1, heap=10),
-        target=1,
-        blocks=1,
-        backend="ray_worker",
-        unit_kind="native_fragment",
-        is_barrier=True,
-    )
-    terminal = _unit(
-        "resource:f:scope-terminal",
-        inputs=(second_barrier.resource_unit_id,),
-        resources=_r(cpu=1, heap=10),
-        target=1,
-        blocks=1,
-        backend="ray_worker",
-        unit_kind="native_fragment",
-    )
-    manager = _manager(
-        source,
-        first_barrier,
-        between,
-        second_barrier,
-        terminal,
-        resources=_r(cpu=5, heap=100, store=100),
-    )
-    _ready(
-        manager,
-        source.resource_unit_id,
-        first_barrier.resource_unit_id,
-        between.resource_unit_id,
-        second_barrier.resource_unit_id,
-        terminal.resource_unit_id,
-    )
-    for unit in (source, first_barrier, between, second_barrier, terminal):
-        manager.note_task_waiting(_task(unit.resource_unit_id, "waiting"))
+    manager = _manager(upstream, downstream, resources=_r(cpu=2, heap=20, store=20))
+    _ready(manager, upstream.resource_unit_id, downstream.resource_unit_id)
+    manager.note_task_waiting(_task(upstream.resource_unit_id, "waiting"))
+    manager.note_task_waiting(_task(downstream.resource_unit_id, "waiting"))
 
-    first_snapshot = manager.snapshot()
-    unreserved_between = manager.try_acquire_task(_task(between.resource_unit_id, 0))
-
-    assert first_snapshot["reservation_scope"] == {
-        "barrier_unit_id": first_barrier.resource_unit_id,
-        "resource_unit_ids": [source.resource_unit_id, first_barrier.resource_unit_id],
-        "object_store_backpressure_disabled": True,
-        "object_store_unlimited_unit_ids": [
-            source.resource_unit_id,
-            first_barrier.resource_unit_id,
-        ],
-    }
-    assert first_snapshot["admission"]["reservation_unit_ids"]["cpu"] == [
-        source.resource_unit_id,
-        first_barrier.resource_unit_id,
-    ]
-    assert unreserved_between.granted
-    assert unreserved_between.liveness is False
-    assert between.resource_unit_id not in first_snapshot["admission"]["reservation_unit_ids"]["cpu"]
-    assert manager.release_task_lease(unreserved_between.lease.lease_id, attempt_id="0")
-
-    with pytest.raises(ValueError, match="not a blocking materializer"):
-        manager.mark_barrier_unit_completed(source.resource_unit_id)
-    assert manager.mark_barrier_unit_completed(first_barrier.resource_unit_id)
-    assert not manager.mark_barrier_unit_completed(first_barrier.resource_unit_id)
-    second_snapshot = manager.snapshot()
-
-    assert second_snapshot["reservation_scope"]["barrier_unit_id"] == second_barrier.resource_unit_id
-    assert second_snapshot["reservation_scope"]["resource_unit_ids"] == [
-        source.resource_unit_id,
-        first_barrier.resource_unit_id,
-        between.resource_unit_id,
-        second_barrier.resource_unit_id,
-    ]
-    assert second_snapshot["units"][source.resource_unit_id]["completed"] is False
-    assert second_snapshot["units"][first_barrier.resource_unit_id]["completed"] is False
-    assert second_snapshot["units"][first_barrier.resource_unit_id]["materialization_completed"] is True
-    assert second_snapshot["units"][source.resource_unit_id]["reservation_scope_eligible"] is True
-    assert second_snapshot["units"][first_barrier.resource_unit_id]["reservation_scope_eligible"] is True
-    assert second_snapshot["units"][between.resource_unit_id]["reservation_scope_eligible"] is True
-    assert second_snapshot["units"][terminal.resource_unit_id]["reservation_scope_eligible"] is False
-    assert manager.try_acquire_task(_task(between.resource_unit_id, 1)).granted
-    assert manager.try_acquire_task(_task(first_barrier.resource_unit_id, 1)).granted
-
-
-def test_blocking_materialization_disables_only_corresponding_object_store_soft_limits():
-    early = _unit(
-        "resource:f:spill-early",
-        resources=_r(cpu=1, heap=10),
-        target=10,
-        blocks=1,
-    )
-    producer = _unit(
-        "resource:f:spill-producer",
-        inputs=(early.resource_unit_id,),
-        resources=_r(cpu=1, heap=10),
-        target=10,
-        blocks=1,
-    )
-    barrier = _unit(
-        "resource:f:spill-barrier",
-        inputs=(producer.resource_unit_id,),
-        resources=_r(cpu=1, heap=10),
-        target=10,
-        blocks=1,
-        is_barrier=True,
-    )
-    terminal = _unit(
-        "resource:f:spill-terminal",
-        inputs=(barrier.resource_unit_id,),
-        resources=_r(cpu=1, heap=10),
-        target=10,
-        blocks=1,
-    )
-    manager = _manager(
-        early,
-        producer,
-        barrier,
-        terminal,
-        resources=_r(cpu=4, heap=100, store=10),
-    )
-    _ready(
-        manager, early.resource_unit_id, producer.resource_unit_id, barrier.resource_unit_id, terminal.resource_unit_id
-    )
-
-    producer_task = manager.try_acquire_task(_task(producer.resource_unit_id, 0, retained=0))
-    barrier_task = manager.try_acquire_task(_task(barrier.resource_unit_id, 0, retained=0))
-    manager.note_task_waiting(_task(early.resource_unit_id, "waiting", retained=0))
-    early_normal_reason = manager._normal_task_block_reason_locked(_task(early.resource_unit_id, 0, retained=0))[0]
-    early_task = manager.try_acquire_task(_task(early.resource_unit_id, 0, retained=0))
-    output = manager.try_acquire_output_block(
-        OutputBlockRequest(
-            query_id="q",
-            producer_unit_id=producer.resource_unit_id,
-            task_lease_id=producer_task.lease.lease_id,
-            attempt_id="0",
-            block_id="materialized-input",
-            size_bytes=25,
-        )
-    )
     snapshot = manager.snapshot()
 
-    assert producer_task.granted and producer_task.liveness is False
-    assert barrier_task.granted and barrier_task.liveness is False
-    assert early_normal_reason == "query_soft_object_store_bytes"
-    assert not early_task.granted
-    assert early_task.blocked_reason == "liveness_not_needed"
-    assert output.granted and output.liveness is False
-    assert snapshot["usage"]["object_store_bytes"] > snapshot["allocation"]["resources"]["object_store_bytes"]
-    assert snapshot["reservation_scope"]["object_store_unlimited_unit_ids"] == [
-        producer.resource_unit_id,
-        barrier.resource_unit_id,
+    assert "reservation_scope" not in snapshot
+    assert snapshot["admission"]["reservation_unit_ids"]["cpu"] == [
+        upstream.resource_unit_id,
+        downstream.resource_unit_id,
     ]
     assert snapshot["admission"]["reservation_unit_ids"]["object_store_bytes"] == [
-        early.resource_unit_id,
+        upstream.resource_unit_id,
+        downstream.resource_unit_id,
     ]
-
-
-def test_nested_materializers_activate_spill_exemptions_on_real_demand():
-    inner_input = _unit("resource:f:nested-inner-input", resources=_r(cpu=1, heap=10))
-    receiver = _unit("resource:f:nested-receiver", resources=_r(cpu=1, heap=10))
-    inner_barrier = _unit(
-        "resource:f:nested-inner-barrier",
-        inputs=(inner_input.resource_unit_id, receiver.resource_unit_id),
-        resources=_r(cpu=1, heap=10),
-        is_barrier=True,
-    )
-    middle_input = _unit("resource:f:nested-middle-input", resources=_r(cpu=1, heap=10))
-    middle_barrier = _unit(
-        "resource:f:nested-middle-barrier",
-        inputs=(middle_input.resource_unit_id, inner_barrier.resource_unit_id),
-        resources=_r(cpu=1, heap=10),
-        is_barrier=True,
-    )
-    outer_input = _unit("resource:f:nested-outer-input", resources=_r(cpu=1, heap=10))
-    outer_barrier = _unit(
-        "resource:f:nested-outer-barrier",
-        inputs=(outer_input.resource_unit_id, middle_barrier.resource_unit_id),
-        resources=_r(cpu=1, heap=10),
-        is_barrier=True,
-    )
-    manager = _manager(
-        inner_input,
-        receiver,
-        inner_barrier,
-        middle_input,
-        middle_barrier,
-        outer_input,
-        outer_barrier,
-        resources=_r(cpu=7, heap=100, store=10),
-    )
-    _ready(
-        manager,
-        inner_input.resource_unit_id,
-        receiver.resource_unit_id,
-        inner_barrier.resource_unit_id,
-        middle_input.resource_unit_id,
-        middle_barrier.resource_unit_id,
-        outer_input.resource_unit_id,
-        outer_barrier.resource_unit_id,
-    )
-
-    initial = manager.snapshot()
-    outer_task = manager.try_acquire_task(_task(outer_input.resource_unit_id, 0, retained=0))
-    after_outer_demand = manager.snapshot()
-    middle_task = manager.try_acquire_task(_task(middle_input.resource_unit_id, 0, retained=0))
-    after_middle_demand = manager.snapshot()
-
-    assert initial["reservation_scope"]["barrier_unit_id"] == inner_barrier.resource_unit_id
-    assert initial["reservation_scope"]["object_store_unlimited_unit_ids"] == [
-        inner_input.resource_unit_id,
-        receiver.resource_unit_id,
-        inner_barrier.resource_unit_id,
-    ]
-    assert outer_task.granted and outer_task.liveness is False
-    assert outer_input.resource_unit_id not in initial["admission"]["reservation_unit_ids"]["object_store_bytes"]
-    assert after_outer_demand["units"][outer_input.resource_unit_id]["object_store_backpressure_disabled"] is True
-    assert after_outer_demand["units"][middle_input.resource_unit_id]["object_store_backpressure_disabled"] is False
-    assert middle_task.granted and middle_task.liveness is False
-    assert after_middle_demand["units"][middle_input.resource_unit_id]["object_store_backpressure_disabled"] is True
-    assert after_middle_demand["reservation_scope"]["barrier_unit_id"] == inner_barrier.resource_unit_id
 
 
 def test_actor_task_leases_own_distinct_concrete_actor_slots():
@@ -634,6 +413,83 @@ def test_soft_heap_reservation_does_not_exceed_cross_dimension_unit_capacity():
     assert denied.blocked_reason == "hard_heap_bytes"
 
 
+def test_native_fragment_uses_fte_node_outside_query_allocation_attribution():
+    native = _unit(
+        "resource:f:native-external-node",
+        resources=_r(store=10),
+        target=10,
+        blocks=2,
+        backend="ray_worker",
+    )
+    manager = _manager(
+        native,
+        resources=_r(store=100),
+        nodes=(("node-a", _r(store=100)),),
+    )
+    _ready(manager, native.resource_unit_id)
+
+    task_grant = manager.try_acquire_task(
+        _task(native.resource_unit_id, 0, node_id="node-b"),
+    )
+
+    assert task_grant.granted
+    assert task_grant.lease.node_id == "node-b"
+    output_grant = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            query_id="q",
+            producer_unit_id=native.resource_unit_id,
+            task_lease_id=task_grant.lease.lease_id,
+            attempt_id=task_grant.lease.attempt_id,
+            block_id="native-external-output",
+            size_bytes=30,
+        )
+    )
+    assert output_grant.granted
+    snapshot = manager.snapshot()
+    assert snapshot["allocation"]["node_allocations"] == [
+        {"node_id": "node-a", "resources": _r(store=100).to_dict()},
+    ]
+    assert snapshot["node_usage"]["node-b"] == _r(store=40).to_dict()
+    assert snapshot["node_allocation_debt"]["node-b"] == _r().to_dict()
+
+
+def test_external_native_node_keeps_remote_continuation_on_allocated_node():
+    native = _unit(
+        "resource:f:native-external-parent",
+        resources=_r(),
+        target=0,
+        blocks=0,
+        backend="ray_worker",
+    )
+    remote = _unit(
+        "resource:f:remote-continuation",
+        inputs=(native.resource_unit_id,),
+        resources=_r(cpu=1, heap=10),
+        target=0,
+        blocks=0,
+    )
+    manager = _manager(
+        native,
+        remote,
+        resources=_r(cpu=1, heap=10),
+        nodes=(("node-a", _r(cpu=1, heap=10)),),
+    )
+    _ready(manager, native.resource_unit_id, remote.resource_unit_id)
+
+    native_grant = manager.try_acquire_task(
+        _task(native.resource_unit_id, 0, node_id="node-b"),
+    )
+
+    assert native_grant.granted
+    assert native_grant.lease.node_id == "node-b"
+    credits = manager.snapshot()["continuation_credits"]
+    assert len(credits) == 1
+    assert next(iter(credits.values()))["node_id"] == "node-a"
+    remote_grant = manager.try_acquire_task(_task(remote.resource_unit_id, 0, node_id="node-a"))
+    assert remote_grant.granted
+    assert remote_grant.lease.node_id == "node-a"
+
+
 def test_empty_runnable_units_do_not_dilute_live_task_reservation():
     units = []
     for index in range(4):
@@ -735,7 +591,7 @@ def test_driver_subset_yields_when_global_winner_is_fte_owned():
         blocks=0,
     )
     downstream = _unit(
-        "resource:f:fte-downstream",
+        "resource:f:native-downstream",
         inputs=(upstream.resource_unit_id,),
         resources=_r(cpu=1, heap=2),
         target=0,
@@ -761,7 +617,7 @@ def test_driver_subset_yields_when_global_winner_is_fte_owned():
 
 def test_fte_request_yields_when_global_winner_is_driver_owned():
     upstream = _unit(
-        "resource:f:fte-upstream",
+        "resource:f:native-upstream",
         resources=_r(cpu=1, heap=2),
         target=0,
         blocks=0,
@@ -929,9 +785,9 @@ def test_reapplying_identical_unit_state_does_not_publish_resource_change():
     assert changes == ["changed"]
 
 
-def test_parent_fte_owns_transferable_credit_for_one_nested_udf_task():
+def test_parent_native_fragment_owns_transferable_credit_for_one_nested_udf_task():
     parent = _unit(
-        "resource:f:parent-fte",
+        "resource:f:parent-native",
         resources=_r(cpu=1, heap=2),
         target=0,
         blocks=0,
@@ -939,7 +795,7 @@ def test_parent_fte_owns_transferable_credit_for_one_nested_udf_task():
         unit_kind="native_fragment",
     )
     bridge = _unit(
-        "resource:f:bridge-fte",
+        "resource:f:bridge-native",
         inputs=(parent.resource_unit_id,),
         resources=_r(cpu=1, heap=2),
         target=0,
@@ -967,16 +823,13 @@ def test_parent_fte_owns_transferable_credit_for_one_nested_udf_task():
     assert sum(grant.granted for grant in parent_grants) == 3
     assert parent_grants[3].blocked_reason == "continuation_capacity"
     snapshot = manager.snapshot()
-    assert snapshot["usage"]["heap_bytes"] == 30
+    assert snapshot["usage"]["heap_bytes"] == 24
     assert len(snapshot["continuation_credits"]) == 3
     assert all(credit["borrowed_by_task_lease_id"] is None for credit in snapshot["continuation_credits"].values())
     admission = snapshot["admission"]
-    assert admission["live_demand_unit_ids"]["heap_bytes"] == [parent.resource_unit_id]
-    assert admission["continuation_unit_ids"]["heap_bytes"] == [child.resource_unit_id]
-    assert admission["reservation_unit_ids"]["heap_bytes"] == [
-        parent.resource_unit_id,
-        child.resource_unit_id,
-    ]
+    assert admission["live_demand_unit_ids"]["heap_bytes"] == []
+    assert admission["continuation_unit_ids"]["heap_bytes"] == []
+    assert admission["reservation_unit_ids"]["heap_bytes"] == []
 
     child_requests = [_task(child.resource_unit_id, partition) for partition in range(3)]
     for request in child_requests:
@@ -985,7 +838,7 @@ def test_parent_fte_owns_transferable_credit_for_one_nested_udf_task():
 
     assert all(grant.granted for grant in child_grants)
     borrowed = manager.snapshot()
-    assert borrowed["usage"]["heap_bytes"] == 30
+    assert borrowed["usage"]["heap_bytes"] == 24
     assert {credit["borrowed_by_task_lease_id"] for credit in borrowed["continuation_credits"].values()} == {
         grant.lease.lease_id for grant in child_grants
     }
@@ -1003,12 +856,12 @@ def test_parent_fte_owns_transferable_credit_for_one_nested_udf_task():
     )
     replacement = manager.try_acquire_queued_task(fourth_child)
     assert replacement.granted
-    assert manager.snapshot()["usage"]["heap_bytes"] == 30
+    assert manager.snapshot()["usage"]["heap_bytes"] == 24
 
 
 def test_nested_udf_uses_normal_allocation_after_continuation_reserve_is_borrowed():
     parent = _unit(
-        "resource:f:parent-fte-normal-overflow",
+        "resource:f:parent-native-normal-overflow",
         resources=_r(cpu=1, heap=2),
         target=0,
         blocks=0,
@@ -1052,12 +905,12 @@ def test_nested_udf_uses_normal_allocation_after_continuation_reserve_is_borrowe
         credit["borrowed_by_task_lease_id"] != second.lease.lease_id
         for credit in snapshot["continuation_credits"].values()
     )
-    assert snapshot["usage"] == _r(cpu=3, heap=18, store=0).to_dict()
+    assert snapshot["usage"] == _r(cpu=2, heap=16, store=0).to_dict()
 
 
 def test_borrowed_continuation_credit_outlives_parent_until_child_releases():
     parent = _unit(
-        "resource:f:parent-fte",
+        "resource:f:parent-native",
         resources=_r(cpu=1, heap=2),
         target=0,
         blocks=0,
@@ -1100,7 +953,7 @@ def test_borrowed_continuation_credit_outlives_parent_until_child_releases():
 
 def test_released_child_returns_credit_to_active_parent():
     parent = _unit(
-        "resource:f:parent-fte",
+        "resource:f:parent-native",
         resources=_r(cpu=1, heap=2),
         target=0,
         blocks=0,
@@ -1128,19 +981,19 @@ def test_released_child_returns_credit_to_active_parent():
         attempt_id=first_child.lease.attempt_id,
     )
     snapshot = manager.snapshot()
-    assert snapshot["usage"]["heap_bytes"] == 10
+    assert snapshot["usage"]["heap_bytes"] == 8
     assert next(iter(snapshot["continuation_credits"].values()))["borrowed_by_task_lease_id"] is None
 
     second_request = _task(child.resource_unit_id, 1)
     manager.note_task_waiting(second_request)
     second_child = manager.try_acquire_queued_task(second_request)
     assert second_child.granted
-    assert manager.snapshot()["usage"]["heap_bytes"] == 10
+    assert manager.snapshot()["usage"]["heap_bytes"] == 8
 
 
-def test_continuation_credit_can_reserve_a_different_node_from_parent_fte():
+def test_continuation_credit_can_reserve_a_different_node_from_parent_native_fragment():
     parent = _unit(
-        "resource:f:parent-fte",
+        "resource:f:parent-native",
         resources=_r(cpu=1, heap=2),
         target=0,
         blocks=0,
@@ -1179,7 +1032,7 @@ def test_continuation_credit_can_reserve_a_different_node_from_parent_fte():
 
 def test_child_outputs_keep_credit_borrowed_until_last_output_releases():
     parent = _unit(
-        "resource:f:parent-fte",
+        "resource:f:parent-native",
         resources=_r(cpu=1, heap=2),
         target=0,
         blocks=0,
@@ -1217,7 +1070,7 @@ def test_child_outputs_keep_credit_borrowed_until_last_output_releases():
         attempt_id=first_child.lease.attempt_id,
     )
     snapshot = manager.snapshot()
-    assert snapshot["usage"] == _r(cpu=2, heap=10, store=10).to_dict()
+    assert snapshot["usage"] == _r(cpu=1, heap=8, store=10).to_dict()
     credit = next(iter(snapshot["continuation_credits"].values()))
     assert credit["borrowed_by_task_lease_id"] == first_child.lease.lease_id
 
@@ -1234,7 +1087,7 @@ def test_child_outputs_keep_credit_borrowed_until_last_output_releases():
 
 def test_handed_off_child_output_recycles_credit_without_unaccounting_physical_bytes():
     parent = _unit(
-        "resource:f:parent-fte",
+        "resource:f:parent-native",
         resources=_r(cpu=1, heap=2),
         target=0,
         blocks=0,
@@ -1283,7 +1136,7 @@ def test_handed_off_child_output_recycles_credit_without_unaccounting_physical_b
     assert after_handoff.granted
     snapshot = manager.snapshot()
     assert first_output.lease.lease_id in snapshot["output_leases"]
-    assert snapshot["usage"] == _r(cpu=2, heap=10, store=10).to_dict()
+    assert snapshot["usage"] == _r(cpu=1, heap=8, store=10).to_dict()
     credit = next(iter(snapshot["continuation_credits"].values()))
     assert credit["borrowed_by_task_lease_id"] == after_handoff.lease.lease_id
     assert snapshot["output_leases"][first_output.lease.lease_id]["continuation_credit_id"] == credit["credit_id"]
@@ -1302,7 +1155,7 @@ def test_handed_off_child_output_recycles_credit_without_unaccounting_physical_b
     with_both_outputs = manager.snapshot()
     # Recycling compute ownership never recycles bytes: both physical blocks
     # remain charged to the query and node flow-control budgets.
-    assert with_both_outputs["usage"] == _r(cpu=2, heap=10, store=20).to_dict()
+    assert with_both_outputs["usage"] == _r(cpu=1, heap=8, store=20).to_dict()
     assert (
         with_both_outputs["output_leases"][second_output.lease.lease_id]["continuation_credit_id"]
         == credit["credit_id"]
@@ -1310,14 +1163,14 @@ def test_handed_off_child_output_recycles_credit_without_unaccounting_physical_b
 
     assert manager.release_output_block(first_output.lease.lease_id)
     released = manager.snapshot()
-    assert released["usage"] == _r(cpu=2, heap=10, store=10).to_dict()
+    assert released["usage"] == _r(cpu=1, heap=8, store=10).to_dict()
     credit = next(iter(released["continuation_credits"].values()))
     assert credit["borrowed_by_task_lease_id"] == after_handoff.lease.lease_id
 
 
 def test_cross_unit_credit_reuse_checks_historical_outputs_before_grant():
     parent = _unit(
-        "resource:f:parent-fte",
+        "resource:f:parent-native",
         resources=_r(cpu=1, heap=2),
         target=0,
         blocks=0,
@@ -1381,7 +1234,7 @@ def test_cross_unit_credit_reuse_checks_historical_outputs_before_grant():
 
 def test_continuation_borrow_reuses_idle_credit_with_smallest_live_output_delta():
     parent = _unit(
-        "resource:f:parent-fte",
+        "resource:f:parent-native",
         resources=_r(cpu=1, heap=2),
         target=0,
         blocks=0,
@@ -1447,7 +1300,7 @@ def test_continuation_borrow_reuses_idle_credit_with_smallest_live_output_delta(
 
 def test_cross_unit_idle_credit_output_excess_is_attributed_exactly_once():
     parent = _unit(
-        "resource:f:parent-fte",
+        "resource:f:parent-native",
         resources=_r(cpu=1, heap=2),
         target=0,
         blocks=0,
@@ -1517,7 +1370,7 @@ def test_cross_unit_idle_credit_output_excess_is_attributed_exactly_once():
 
 def test_continuation_unit_usage_matches_query_usage_for_active_and_idle_borrower():
     parent = _unit(
-        "resource:f:parent-fte",
+        "resource:f:parent-native",
         resources=_r(cpu=1, heap=2),
         target=0,
         blocks=0,
@@ -1570,7 +1423,7 @@ def test_continuation_unit_usage_matches_query_usage_for_active_and_idle_borrowe
 
 def test_live_output_from_deleted_continuation_credit_remains_in_unit_usage():
     parent = _unit(
-        "resource:f:parent-fte",
+        "resource:f:parent-native",
         resources=_r(cpu=1, heap=2),
         target=0,
         blocks=0,
@@ -1625,7 +1478,7 @@ def test_live_output_from_deleted_continuation_credit_remains_in_unit_usage():
 
 def test_query_cancellation_clears_idle_and_borrowed_continuation_credits():
     parent = _unit(
-        "resource:f:parent-fte",
+        "resource:f:parent-native",
         resources=_r(cpu=1, heap=2),
         target=0,
         blocks=0,
@@ -1657,7 +1510,7 @@ def test_query_cancellation_clears_idle_and_borrowed_continuation_credits():
     assert snapshot["usage"] == _r().to_dict()
 
 
-def test_parent_fte_admission_preserves_largest_nested_udf_commitment():
+def test_parent_native_fragment_admission_preserves_largest_nested_udf_commitment():
     parent = _unit(
         "resource:f:safe-parent",
         resources=_r(cpu=1, heap=2),
@@ -1702,7 +1555,7 @@ def test_parent_fte_admission_preserves_largest_nested_udf_commitment():
     assert child_grant.granted
 
 
-def test_parent_fte_placement_preserves_pinned_actor_continuation_node():
+def test_native_fragment_placement_does_not_reserve_pinned_actor_process_capacity():
     parent = _unit(
         "resource:f:placed-parent",
         resources=_r(cpu=1, heap=4),
@@ -1731,13 +1584,13 @@ def test_parent_fte_placement_preserves_pinned_actor_continuation_node():
     )
     manager.update_unit_state(parent.resource_unit_id, runnable=True, actor_ready=True)
 
-    pinned_node_request = manager.try_acquire_task(_task(parent.resource_unit_id, "bad-node", node_id="node-a"))
+    pinned_node_request = manager.try_acquire_task(_task(parent.resource_unit_id, "pinned-node", node_id="node-a"))
     automatic_request = manager.try_acquire_task(_task(parent.resource_unit_id, "auto-node"))
 
-    assert not pinned_node_request.granted
-    assert pinned_node_request.blocked_reason == "node_capacity"
+    assert pinned_node_request.granted
+    assert pinned_node_request.lease.node_id == "node-a"
     assert automatic_request.granted
-    assert automatic_request.lease.node_id == "node-b"
+    assert automatic_request.lease.node_id == "node-a"
 
 
 def test_ray_task_placement_keeps_actor_invocation_bytes_out_of_hard_reservations():
@@ -1748,7 +1601,7 @@ def test_ray_task_placement_keeps_actor_invocation_bytes_out_of_hard_reservation
         blocks=1,
     )
     consumer = _unit(
-        "resource:f:placed-fte-consumer",
+        "resource:f:placed-native-consumer",
         inputs=(producer.resource_unit_id,),
         resources=_r(cpu=1, heap=2),
         target=0,
@@ -1778,7 +1631,6 @@ def test_ray_task_placement_keeps_actor_invocation_bytes_out_of_hard_reservation
     )
     manager.update_unit_state(producer.resource_unit_id, runnable=True, actor_ready=True)
 
-    assert manager.task_eligible_node_ids(producer.resource_unit_id) == ("node-a", "node-b")
     pinned = manager.try_acquire_task(_task(producer.resource_unit_id, "pinned", node_id="node-a"))
     automatic = manager.try_acquire_task(_task(producer.resource_unit_id, "automatic"))
 
@@ -1827,7 +1679,7 @@ def test_cold_topology_caps_upstream_fanout_until_direct_downstream_starts():
     assert first_downstream.granted
 
 
-def test_latent_fte_and_actor_reservations_cap_ray_task_fanout():
+def test_native_continuation_does_not_add_process_reservation_to_ray_task_fanout():
     producer = _unit(
         "resource:f:image-cpu-producer",
         resources=_r(cpu=1, heap=2),
@@ -1859,21 +1711,18 @@ def test_latent_fte_and_actor_reservations_cap_ray_task_fanout():
         gpu_actor,
         resources=_r(cpu=36, gpu=1, heap=41, store=10),
     )
-    # The downstream units are deliberately latent. Admission must reserve
-    # them before their first input makes them runnable.
+    # The downstream units are deliberately latent. The actor's resident
+    # process remains hard-accounted, while the native continuation is owned
+    # by DuckDB and adds no Vane process reservation.
     manager.update_unit_state(producer.resource_unit_id, runnable=True, actor_ready=True)
 
-    producer_grants = [manager.try_acquire_task(_task(producer.resource_unit_id, partition)) for partition in range(9)]
-    blocked_producer = manager.try_acquire_task(_task(producer.resource_unit_id, 9))
+    producer_grants = [manager.try_acquire_task(_task(producer.resource_unit_id, partition)) for partition in range(10)]
+    blocked_producer = manager.try_acquire_task(_task(producer.resource_unit_id, 10))
 
     assert all(grant.granted for grant in producer_grants)
     assert not blocked_producer.granted
-    assert blocked_producer.blocked_reason == "continuation_capacity"
-    reservations = manager.snapshot()["admission"]["downstream_reservations"][producer.resource_unit_id]
-    assert [reservation["reservation_id"] for reservation in reservations] == [
-        f"native-fragment:{producer.resource_unit_id}",
-    ]
-    assert sum(reservation["resources"]["object_store_bytes"] for reservation in reservations) == 0
+    assert blocked_producer.blocked_reason == "hard_heap_bytes"
+    assert producer.resource_unit_id not in manager.snapshot()["admission"]["downstream_reservations"]
 
     manager.update_unit_state(consumer.resource_unit_id, runnable=True, actor_ready=True)
     consumer_grant = manager.try_acquire_task(_task(consumer.resource_unit_id, 0))
@@ -1889,12 +1738,12 @@ def test_latent_fte_and_actor_reservations_cap_ray_task_fanout():
             cpu=10,
             gpu=1,
             heap=40,
-            store=11,
+            store=12,
         ).to_dict()
     )
 
 
-def test_upstream_fanout_preserves_concurrent_ray_task_and_fte_slots():
+def test_upstream_fanout_preserves_remote_task_continuation_without_native_slot():
     upstream = _unit(
         "resource:f:streaming-upstream",
         resources=_r(cpu=1, heap=2),
@@ -1919,8 +1768,8 @@ def test_upstream_fanout_preserves_concurrent_ray_task_and_fte_slots():
         target=0,
         blocks=0,
     )
-    terminal_fte = _unit(
-        "resource:f:streaming-terminal-fte",
+    terminal_native = _unit(
+        "resource:f:streaming-terminal-native",
         inputs=(downstream.resource_unit_id,),
         resources=_r(cpu=1, heap=2),
         target=0,
@@ -1932,21 +1781,20 @@ def test_upstream_fanout_preserves_concurrent_ray_task_and_fte_slots():
         upstream,
         actor,
         downstream,
-        terminal_fte,
+        terminal_native,
         resources=_r(cpu=20, gpu=1, heap=24, store=20),
     )
     manager.update_unit_state(upstream.resource_unit_id, runnable=True, actor_ready=True)
 
-    upstream_grants = [manager.try_acquire_task(_task(upstream.resource_unit_id, partition)) for partition in range(8)]
+    upstream_grants = [manager.try_acquire_task(_task(upstream.resource_unit_id, partition)) for partition in range(9)]
     assert all(grant.granted for grant in upstream_grants)
-    blocked_upstream = manager.try_acquire_task(_task(upstream.resource_unit_id, 8))
+    blocked_upstream = manager.try_acquire_task(_task(upstream.resource_unit_id, 9))
     assert not blocked_upstream.granted
-    assert blocked_upstream.blocked_reason == "continuation_capacity"
+    assert blocked_upstream.blocked_reason == "liveness_not_needed"
     snapshot = manager.snapshot()
-    assert snapshot["usage"]["heap_bytes"] == 20
+    assert snapshot["usage"]["heap_bytes"] == 22
     reservations = snapshot["admission"]["downstream_reservations"][upstream.resource_unit_id]
     assert [reservation["reservation_id"] for reservation in reservations] == [
-        f"native-fragment:{upstream.resource_unit_id}",
         f"actor_continuation:{upstream.resource_unit_id}:{downstream.resource_unit_id}",
     ]
 
@@ -1967,9 +1815,9 @@ def test_upstream_fanout_preserves_concurrent_ray_task_and_fte_slots():
     }
     assert downstream_grant.granted
     assert not downstream_grant.liveness
-    assert manager.snapshot()["usage"]["heap_bytes"] == 22
+    assert manager.snapshot()["usage"]["heap_bytes"] == 24
 
-    terminal_request = _task(terminal_fte.resource_unit_id, 0)
+    terminal_request = _task(terminal_native.resource_unit_id, 0)
     manager.note_task_waiting(terminal_request)
     terminal_grant = manager.try_acquire_queued_task(terminal_request)
 
@@ -1978,9 +1826,52 @@ def test_upstream_fanout_preserves_concurrent_ray_task_and_fte_slots():
     assert manager.snapshot()["usage"]["heap_bytes"] == 24
 
 
-def test_registered_minimum_supports_parent_task_and_downstream_fte_progress():
+def test_hard_minimum_can_start_with_soft_actor_continuation_reservation():
+    upstream = _unit(
+        "resource:f:minimum-upstream",
+        resources=_r(cpu=1, heap=2),
+        target=0,
+        blocks=0,
+    )
+    actor = _unit(
+        "resource:f:minimum-actor",
+        inputs=(upstream.resource_unit_id,),
+        resources=_r(),
+        resident=_r(cpu=1, heap=4),
+        target=0,
+        blocks=0,
+        backend="ray_actor",
+        actor_pool_size=1,
+    )
+    downstream = _unit(
+        "resource:f:minimum-downstream",
+        inputs=(actor.resource_unit_id,),
+        resources=_r(cpu=1, heap=2),
+        target=0,
+        blocks=0,
+    )
+    manager = _manager(
+        upstream,
+        actor,
+        downstream,
+        resources=_r(cpu=2, heap=6),
+    )
+    manager.update_unit_state(upstream.resource_unit_id, runnable=True, actor_ready=True)
+
+    grant = manager.try_acquire_task(_task(upstream.resource_unit_id, 0))
+
+    assert grant.granted and grant.liveness
+    snapshot = manager.snapshot()
+    assert snapshot["usage"]["heap_bytes"] == 6
+    reservations = snapshot["admission"]["downstream_reservations"][upstream.resource_unit_id]
+    assert [reservation["reservation_id"] for reservation in reservations] == [
+        f"actor_continuation:{upstream.resource_unit_id}:{downstream.resource_unit_id}",
+    ]
+
+
+def test_remote_process_usage_excludes_native_parent_and_downstream_fragments():
     parent = _unit(
-        "resource:f:image-parent-fte",
+        "resource:f:image-parent-native",
         resources=_r(cpu=1, heap=2),
         target=0,
         blocks=0,
@@ -1995,7 +1886,7 @@ def test_registered_minimum_supports_parent_task_and_downstream_fte_progress():
         blocks=1,
     )
     consumer = _unit(
-        "resource:f:image-downstream-fte",
+        "resource:f:image-downstream-native",
         inputs=(producer.resource_unit_id,),
         resources=_r(cpu=1, heap=3),
         target=0,
@@ -2013,8 +1904,8 @@ def test_registered_minimum_supports_parent_task_and_downstream_fte_progress():
         backend="ray_actor",
         actor_pool_size=1,
     )
-    # actor resident + invocation, one Ray task credit, the invoking FTE task,
-    # and one downstream FTE progress slot: this is the registered minimum.
+    # Only the actor resident process and Ray task are hard-accounted. Both
+    # native fragments execute inside the node-owned DuckDB budget.
     manager = _manager(
         parent,
         producer,
@@ -2041,17 +1932,17 @@ def test_registered_minimum_supports_parent_task_and_downstream_fte_progress():
     assert (
         manager.snapshot()["usage"]
         == _r(
-            cpu=3,
+            cpu=1,
             gpu=1,
-            heap=19,
+            heap=14,
             store=2,
         ).to_dict()
     )
 
 
-def test_parent_fte_fanout_preserves_shared_fte_slot_across_nested_ray_task():
+def test_native_fanout_is_capped_only_by_remote_continuation_credits():
     parent = _unit(
-        "resource:f:image-parent-fte",
+        "resource:f:image-parent-native",
         resources=_r(cpu=1, heap=1),
         target=0,
         blocks=0,
@@ -2059,7 +1950,7 @@ def test_parent_fte_fanout_preserves_shared_fte_slot_across_nested_ray_task():
         unit_kind="native_fragment",
     )
     direct_fte = _unit(
-        "resource:f:image-direct-fte",
+        "resource:f:image-direct-native",
         inputs=(parent.resource_unit_id,),
         resources=_r(cpu=1, heap=1),
         target=0,
@@ -2075,7 +1966,7 @@ def test_parent_fte_fanout_preserves_shared_fte_slot_across_nested_ray_task():
         blocks=0,
     )
     downstream_fte = _unit(
-        "resource:f:image-downstream-fte",
+        "resource:f:image-downstream-native",
         inputs=(cpu_udf.resource_unit_id,),
         resources=_r(cpu=1, heap=4),
         target=0,
@@ -2103,18 +1994,14 @@ def test_parent_fte_fanout_preserves_shared_fte_slot_across_nested_ray_task():
     )
     manager.update_unit_state(parent.resource_unit_id, runnable=True, actor_ready=True)
 
-    parent_grants = [manager.try_acquire_task(_task(parent.resource_unit_id, partition)) for partition in range(8)]
+    parent_grants = [manager.try_acquire_task(_task(parent.resource_unit_id, partition)) for partition in range(11)]
 
-    assert all(grant.granted for grant in parent_grants[:7])
-    assert not parent_grants[7].granted
-    assert parent_grants[7].blocked_reason == "continuation_capacity"
+    assert all(grant.granted for grant in parent_grants[:10])
+    assert not parent_grants[10].granted
+    assert parent_grants[10].blocked_reason == "continuation_capacity"
     snapshot = manager.snapshot()
-    assert snapshot["usage"]["heap_bytes"] == 43
-    reservations = snapshot["admission"]["downstream_reservations"][parent.resource_unit_id]
-    assert len(reservations) == 1
-    assert reservations[0]["reservation_id"] == f"native-fragment:{parent.resource_unit_id}"
-    assert reservations[0]["unit_ids"] == [downstream_fte.resource_unit_id]
-    assert reservations[0]["resources"]["heap_bytes"] == 4
+    assert snapshot["usage"]["heap_bytes"] == 48
+    assert parent.resource_unit_id not in snapshot["admission"]["downstream_reservations"]
 
     manager.update_unit_state(cpu_udf.resource_unit_id, runnable=True, actor_ready=True)
     cpu_request = _task(cpu_udf.resource_unit_id, 0)
@@ -2133,7 +2020,7 @@ def test_parent_fte_fanout_preserves_shared_fte_slot_across_nested_ray_task():
     assert cpu_grant.lease.lease_id in {
         credit["borrowed_by_task_lease_id"] for credit in final_snapshot["continuation_credits"].values()
     }
-    assert final_snapshot["usage"]["heap_bytes"] == 47
+    assert final_snapshot["usage"]["heap_bytes"] == 48
 
 
 def test_hard_heap_limit_is_never_bypassed_by_object_store_liveness():
@@ -2668,7 +2555,7 @@ def test_released_output_block_identity_cannot_be_leased_again():
 
 def test_fte_task_completion_atomically_transfers_window_to_output_leases():
     unit = _unit(
-        "resource:f:fte",
+        "resource:f:native",
         resources=_r(cpu=1, heap=100, store=5),
         target=10,
         blocks=2,
@@ -2696,7 +2583,7 @@ def test_fte_task_completion_atomically_transfers_window_to_output_leases():
 
 def test_fte_task_completion_rejects_outputs_above_precommitted_window_without_mutation():
     unit = _unit(
-        "resource:f:fte",
+        "resource:f:native",
         resources=_r(cpu=1, heap=100),
         target=10,
         blocks=2,

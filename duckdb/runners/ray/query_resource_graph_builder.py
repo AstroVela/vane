@@ -18,13 +18,7 @@ from duckdb.runners.ray.query_resource_graph import (
     ResourceVector,
 )
 
-_GIB = 1024**3
-_MIB = 1024**2
-_DEFAULT_NATIVE_FRAGMENT_TASK_HEAP_BYTES = 2 * _GIB
-_DEFAULT_NATIVE_FRAGMENT_UDF_DRIVER_HEAP_BYTES = 512 * _MIB
-_DEFAULT_UDF_TASK_HEAP_BYTES = 2 * _GIB
-_DEFAULT_UDF_ACTOR_HEAP_BYTES = 4 * _GIB
-_DEFAULT_TARGET_OUTPUT_BLOCK_BYTES = 128 * _MIB
+_DEFAULT_TARGET_OUTPUT_BLOCK_BYTES = 128 * 1024**2
 _DEFAULT_RAY_ACTOR_PREFETCH_DEPTH = 2
 _GENERATOR_BUFFER_BLOCKS = 2
 _TOP_LEVEL_FIELDS = ("query_id", "nodes", "terminal_node_ids")
@@ -33,7 +27,6 @@ _NODE_FIELDS = (
     "node_name",
     "input_node_ids",
     "is_sink",
-    "is_blocking_materializing",
     "num_partitions",
     "udf_payload",
 )
@@ -65,16 +58,6 @@ def _positive_int(value: Any, name: str) -> int:
         raise ValueError(f"{name} must be a positive integer") from exc
     if parsed <= 0:
         raise ValueError(f"{name} must be a positive integer")
-    return parsed
-
-
-def _positive_float(value: Any, name: str) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a positive number") from exc
-    if parsed <= 0:
-        raise ValueError(f"{name} must be a positive number")
     return parsed
 
 
@@ -145,7 +128,6 @@ def _normalize_metadata(metadata: Mapping[str, Any]) -> tuple[str, dict[str, dic
         node["input_node_ids"] = tuple(str(item).strip() for item in node["input_node_ids"])
         node["num_partitions"] = _positive_int(node["num_partitions"], "num_partitions")
         node["is_sink"] = bool(node["is_sink"])
-        node["is_blocking_materializing"] = bool(node["is_blocking_materializing"])
         if node["udf_payload"] is not None and not isinstance(node["udf_payload"], Mapping):
             raise TypeError(f"resource unit node {node_id} udf_payload must be a mapping or None")
         node["udf_payload"] = None if node["udf_payload"] is None else dict(node["udf_payload"])
@@ -194,12 +176,8 @@ def _udf_unit(
     gpu = _nonnegative_float(payload.get("gpus", 0.0), "gpus")
     if cpu <= 0 and gpu <= 0:
         raise ValueError(f"Ray UDF node {node_id} must request CPU or GPU resources")
-    default_heap = (
-        _env_positive_int(env, "VANE_UDF_ACTOR_HEAP_BYTES", _DEFAULT_UDF_ACTOR_HEAP_BYTES)
-        if backend == "ray_actor"
-        else _env_positive_int(env, "VANE_UDF_TASK_HEAP_BYTES", _DEFAULT_UDF_TASK_HEAP_BYTES)
-    )
-    heap_bytes = _positive_int(payload.get("memory_bytes", default_heap), "memory_bytes")
+    declared_heap = payload.get("memory_bytes")
+    heap_bytes = 0 if declared_heap is None else _positive_int(declared_heap, "memory_bytes")
     target = _positive_int(
         payload.get(
             "udf_output_target_max_bytes",
@@ -266,7 +244,6 @@ def _udf_unit(
         resident_per_actor=resident_per_actor,
         actor_pool_size=actor_pool_size,
         actor_prefetch_depth=actor_prefetch_depth,
-        is_barrier=False,
     )
 
 
@@ -277,25 +254,13 @@ def build_query_resource_graph(
 ) -> QueryResourceGraph:
     environment = os.environ if env is None else env
     query_id, nodes, terminal_node_ids = _normalize_metadata(metadata)
-    native_fragment_heap = _env_positive_int(
-        environment, "VANE_NATIVE_FRAGMENT_TASK_HEAP_BYTES", _DEFAULT_NATIVE_FRAGMENT_TASK_HEAP_BYTES
-    )
     native_fragment_target = _env_positive_int(
         environment,
         "VANE_TARGET_OUTPUT_BLOCK_BYTES",
         _DEFAULT_TARGET_OUTPUT_BLOCK_BYTES,
     )
-    native_fragment_udf_driver_heap = _env_positive_int(
-        environment,
-        "VANE_NATIVE_FRAGMENT_UDF_DRIVER_HEAP_BYTES",
-        max(
-            _DEFAULT_NATIVE_FRAGMENT_UDF_DRIVER_HEAP_BYTES,
-            native_fragment_target * _GENERATOR_BUFFER_BLOCKS,
-        ),
-    )
 
     output_unit_by_node: dict[str, str] = {}
-    remote_udf_driver_node_ids: set[str] = set()
     downstream_node_ids: dict[str, list[str]] = {node_id: [] for node_id in nodes}
     for child_id, child in nodes.items():
         for parent_id in child["input_node_ids"]:
@@ -336,7 +301,7 @@ def build_query_resource_graph(
 
     for node_id, node in nodes.items():
         udf_payload = node["udf_payload"]
-        has_remote_udf = udf_payload is not None and str(udf_payload.get("execution_backend") or "") in {
+        has_remote_udf = udf_payload is not None and str(udf_payload.get("execution_backend") or "").strip() in {
             "ray_task",
             "ray_actor",
         }
@@ -345,14 +310,6 @@ def build_query_resource_graph(
             if has_remote_udf
             else native_fragment_unit_id_for_node(query_id, node_id)
         )
-        if has_remote_udf:
-            # Distributed task fragments terminate at the native node feeding
-            # a remote UDF; the UDF node's native fragment unit is a logical
-            # wrapper.
-            # Both are orchestration units, while the separately leased UDF
-            # process owns the standalone heap commitment.
-            remote_udf_driver_node_ids.add(node_id)
-            remote_udf_driver_node_ids.update(node["input_node_ids"])
 
     units: list[ResourceUnitSpec] = []
     for node_id in sorted(nodes, key=_node_sort_key):
@@ -360,8 +317,6 @@ def build_query_resource_graph(
         native_fragment_unit_id = native_fragment_unit_id_for_node(query_id, node_id)
         input_unit_ids = tuple(output_unit_by_node[parent] for parent in node["input_node_ids"])
         is_sink = bool(node["is_sink"])
-        is_blocking_materializing = bool(node["is_blocking_materializing"])
-        remote_udf_driver = node_id in remote_udf_driver_node_ids
         units.append(
             ResourceUnitSpec(
                 query_id=query_id,
@@ -370,22 +325,14 @@ def build_query_resource_graph(
                 unit_kind="native_fragment",
                 backend="ray_worker",
                 input_unit_ids=input_unit_ids,
-                # A Ray UDF node runs its user code in a separately leased Ray
-                # process. The parent native fragment task is an in-process
-                # orchestration continuation in the shared RayWorkerActor, so
-                # charging the full standalone-process default again
-                # double-counts heap.
-                # Its incremental commitment is instead bounded by the paired
-                # stream window, with a conservative 512 MiB floor. Native
-                # fragment units retain the 2 GiB default for joins/sorts/spill.
-                per_task=ResourceVector(
-                    cpu=1,
-                    heap_bytes=native_fragment_udf_driver_heap if remote_udf_driver else native_fragment_heap,
-                ),
+                # All native fragments on a Ray node execute inside one shared
+                # DuckDB DatabaseInstance. Its TaskScheduler, BufferManager,
+                # TemporaryMemoryManager, and memory_limit own native process
+                # resources; Vane only accounts cross-process object flow.
+                per_task=ResourceVector(),
                 target_output_block_bytes=0 if is_sink else native_fragment_target,
                 generator_buffer_blocks=0 if is_sink else _GENERATOR_BUFFER_BLOCKS,
                 max_concurrency=int(node["num_partitions"]),
-                is_barrier=is_blocking_materializing,
             )
         )
         udf_unit = _udf_unit(
@@ -446,10 +393,7 @@ def build_query_demand(
     priority: int = 0,
 ) -> QueryDemand:
     actor_bundles: list[ActorResourceBundle] = []
-    native_fragment_tasks: list[ResourceVector] = []
     ray_tasks: list[ResourceVector] = []
-    downstream_native_fragment_tasks: list[ResourceVector] = []
-    unit_by_id = {unit.resource_unit_id: unit for unit in graph.units}
     for unit in graph.units:
         commitment = _hard_task_commitment(unit)
         if unit.backend == "ray_actor":
@@ -463,50 +407,23 @@ def build_query_demand(
             )
         elif unit.backend == "ray_task":
             ray_tasks.append(commitment)
-        elif unit.backend == "ray_worker":
-            native_fragment_tasks.append(commitment)
-    downstream_native_fragment_unit_ids = {
-        downstream_unit_id
-        for unit in graph.units
-        if unit.backend != "ray_worker"
-        for downstream_unit_id in (
-            graph.downstream_native_fragment_unit_ids_requiring_separate_slot(unit.resource_unit_id)
-        )
-    }
-    downstream_native_fragment_tasks.extend(
-        _hard_task_commitment(unit_by_id[resource_unit_id])
-        for resource_unit_id in graph.topological_unit_ids()
-        if resource_unit_id in downstream_native_fragment_unit_ids
-    )
     minimum = ResourceVector()
     for required_actor in actor_bundles:
         minimum = minimum + required_actor.resources
-    task_bundles = tuple(
-        bundle
-        # Reserve the nested Ray process before its parent native fragment
-        # bundle. The minimum is component-wise identical either way on one node, but the
-        # order is placement-significant on heterogeneous/multi-node clusters
-        # and must preserve continuation capacity.
-        # A remote-process streaming producer can remain alive while a
-        # downstream native fragment task drains it. Keep that progress slot
-        # separate from the native fragment task that invoked the producer;
-        # QRM enforces the same shared reservation dynamically before
-        # admitting additional producers.
-        for bundle in (
-            _component_max(ray_tasks),
-            _component_max(native_fragment_tasks),
-            _component_max(downstream_native_fragment_tasks),
-        )
-        if not bundle.is_zero()
-    )
+    task_bundles = tuple(bundle for bundle in (_component_max(ray_tasks),) if not bundle.is_zero())
     for task_bundle in task_bundles:
         minimum = minimum + task_bundle
     desired = ResourceVector(
-        cpu=cluster_capacity.cpu,
+        # Ray tasks can use elastic process headroom. Actor-only and pure
+        # native queries have no additional hard-process demand beyond their
+        # resident actor pool; native capacity is node-owned by DuckDB.
+        cpu=cluster_capacity.cpu if ray_tasks else minimum.cpu,
         # GPU commitments remain fixed indivisible bundles. Only CPU and
         # memory headroom participate in elastic DRF allocation.
         gpu=minimum.gpu,
-        heap_bytes=cluster_capacity.heap_bytes,
+        heap_bytes=(
+            cluster_capacity.heap_bytes if any(task.heap_bytes > 0 for task in ray_tasks) else minimum.heap_bytes
+        ),
         object_store_bytes=cluster_capacity.object_store_bytes,
     )
     return QueryDemand(

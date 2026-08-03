@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 import uuid
 import weakref
@@ -28,8 +27,6 @@ from duckdb.execution.udf_admission import (
     AdmissionLease,
 )
 
-_DEFAULT_RAY_TASK_HEAP_BYTES = 2 * 1024**3
-_DEFAULT_RAY_ACTOR_HEAP_BYTES = 4 * 1024**3
 _TASK_ADMISSION_CLEANUP_RETRY_INITIAL_DELAY_S = 0.01
 _TASK_ADMISSION_CLEANUP_RETRY_MAX_DELAY_S = 1.0
 _TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_S = 1.0
@@ -45,17 +42,11 @@ def _positive_int(value: Any, name: str) -> int:
 
 def ray_udf_task_memory_bytes(payload: dict[str, Any]) -> int:
     backend = str(payload.get("execution_backend") or "").strip()
-    if backend == "ray_task":
-        env_name = "VANE_UDF_TASK_HEAP_BYTES"
-        default = _DEFAULT_RAY_TASK_HEAP_BYTES
-    elif backend == "ray_actor":
-        env_name = "VANE_UDF_ACTOR_HEAP_BYTES"
-        default = _DEFAULT_RAY_ACTOR_HEAP_BYTES
-    else:
+    if backend not in {"ray_task", "ray_actor"}:
         raise ValueError(f"task admission requires a Ray UDF backend, got {backend!r}")
     raw = payload.get("memory_bytes")
     if raw is None:
-        raw = os.environ.get(env_name, str(default))
+        return 0
     return _positive_int(raw, "memory_bytes")
 
 

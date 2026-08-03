@@ -481,7 +481,7 @@ class FteFragmentExecution:
         source_node_ids: set[str] | list[str] | tuple[str, ...] | None = None,
         dynamic_scan_source_node_ids: set[str] | list[str] | tuple[str, ...] | None = None,
         dynamic_exchange_source_node_ids: set[str] | list[str] | tuple[str, ...] | None = None,
-        task_memory_bytes: int,
+        task_memory_bytes: int | None,
     ) -> None:
         self.query_id = str(query_id).strip()
         if not self.query_id:
@@ -537,8 +537,8 @@ class FteFragmentExecution:
         self._attempt_scheduling_lock = threading.RLock()
         self._current_worker_commands: list[Any] | None = None
         self._worker_command_outbox: list[Any] = []
-        self.task_memory_bytes = int(task_memory_bytes)
-        if self.task_memory_bytes <= 0:
+        self.task_memory_bytes = None if task_memory_bytes is None else int(task_memory_bytes)
+        if self.task_memory_bytes is not None and self.task_memory_bytes <= 0:
             raise ValueError("FTE task_memory_bytes must be positive")
 
     def add_partition(

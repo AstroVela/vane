@@ -3,9 +3,9 @@
 
 /**
  * @file exchange.hpp
- * @brief Abstract Exchange interface — per-stage coordinator.
+ * @brief Abstract Exchange interface — per-exchange coordinator.
  *
- * An Exchange object is created for each shuffle stage and manages the
+ * An Exchange object is created for each logical exchange and manages the
  * lifecycle of sinks and sources. The coordinator uses it to track which sinks
  * have completed and to produce source handles for downstream tasks.
  */
@@ -22,7 +22,7 @@
 namespace duckdb {
 namespace distributed {
 
-/// Abstract interface for coordinating a single shuffle stage's exchange.
+/// Abstract interface for coordinating one logical exchange.
 ///
 /// Lifecycle (coordinator side):
 ///   1. CreateExchange() via ExchangeManager

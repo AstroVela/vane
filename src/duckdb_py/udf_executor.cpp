@@ -1069,7 +1069,7 @@ struct ExecutorSlot {
 	std::deque<DispatcherCommand> cmd_queue;
 
 	// One scheduling lookahead for distributed Ray task admission. Active task
-	// concurrency is owned by QueryResourceManager task leases, not this slot.
+	// concurrency is owned by RayQueryResourceManager task leases, not this slot.
 	mutex task_admission_lock;
 	bool task_admission_request_pending = false;
 	bool task_admission_available = false;

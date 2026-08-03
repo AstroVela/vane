@@ -1437,12 +1437,11 @@ def test_video_source_udf_cpu_allocation_must_be_positive(monkeypatch):
         video_reader._video_source_udf_kwargs()
 
 
-def test_video_source_udf_memory_is_stage_specific(monkeypatch):
+def test_video_source_udf_memory_is_source_specific(monkeypatch):
     import duckdb.datasource.video_reader as video_reader
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_MEMORY_BYTES", "268435456")
-    monkeypatch.setenv("VANE_UDF_TASK_HEAP_BYTES", "1073741824")
     monkeypatch.delenv("VANE_VIDEO_SOURCE_UDF_OUTPUT_BATCH_SIZE", raising=False)
 
     expected_peak = video_reader._video_source_peak_memory_bytes(

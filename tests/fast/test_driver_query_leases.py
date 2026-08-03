@@ -432,7 +432,7 @@ def test_driver_resource_change_event_drives_fte_owner_without_polling(monkeypat
 
     monkeypatch.setattr(
         fte_scheduler,
-        "has_fte_resource_admission_waiter",
+        "has_fte_resource_admission_demand",
         lambda query_id: query_id == "query-fte-resource-wake",
     )
 

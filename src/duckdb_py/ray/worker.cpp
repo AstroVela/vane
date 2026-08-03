@@ -199,11 +199,6 @@ void RayWorkerRuntime::TaskInputStreamExhaustedForQuery(
 	ray_worker_handle_.attr("task_input_stream_exhausted_for_query")(query_id, py_source_node_ids);
 }
 
-void RayWorkerRuntime::BlockingMaterializationCompleted(const string &query_id, duckdb::distributed::NodeID node_id) {
-	duckdb::PythonGILWrapper gil;
-	ray_worker_handle_.attr("blocking_materialization_completed")(query_id, std::to_string(node_id));
-}
-
 RayWorkerRuntime::QueryStatus RayWorkerRuntime::FteQueryStatus(
     const string &query_id,
     const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>

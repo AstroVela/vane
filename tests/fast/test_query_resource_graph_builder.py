@@ -27,7 +27,6 @@ def _metadata():
                 "node_name": "ScanSource",
                 "input_node_ids": [],
                 "is_sink": False,
-                "is_blocking_materializing": False,
                 "num_partitions": 36,
                 "udf_payload": None,
             },
@@ -36,7 +35,6 @@ def _metadata():
                 "node_name": "StreamingUDF",
                 "input_node_ids": ["1"],
                 "is_sink": False,
-                "is_blocking_materializing": False,
                 "num_partitions": 36,
                 "udf_payload": {
                     "execution_backend": "ray_task",
@@ -53,7 +51,6 @@ def _metadata():
                 "node_name": "StreamingUDF",
                 "input_node_ids": ["2"],
                 "is_sink": False,
-                "is_blocking_materializing": False,
                 "num_partitions": 1,
                 "udf_payload": {
                     "execution_backend": "ray_actor",
@@ -71,7 +68,6 @@ def _metadata():
                 "node_name": "CopyFinish",
                 "input_node_ids": ["3"],
                 "is_sink": True,
-                "is_blocking_materializing": True,
                 "num_partitions": 1,
                 "udf_payload": None,
             },
@@ -95,21 +91,9 @@ def test_builder_registers_complete_pipeline_and_nested_resource_units_before_ex
         native_fragment_unit_id_for_node("query-7", "4"),
     )
     assert graph.terminal_unit_ids == (native_fragment_unit_id_for_node("query-7", "4"),)
-    assert graph.unit_by_id(native_fragment_unit_id_for_node("query-7", "4")).is_barrier
 
 
-def test_builder_uses_native_materialization_metadata_instead_of_sink_shape():
-    metadata = _metadata()
-    metadata["nodes"][1]["is_blocking_materializing"] = True
-    metadata["nodes"][3]["is_blocking_materializing"] = False
-
-    graph = build_query_resource_graph(metadata, env={})
-
-    assert graph.unit_by_id(native_fragment_unit_id_for_node("query-7", "2")).is_barrier
-    assert not graph.unit_by_id(native_fragment_unit_id_for_node("query-7", "4")).is_barrier
-
-
-def test_builder_counts_each_nested_ray_process_and_never_uses_zero_heap():
+def test_builder_delegates_native_process_resources_and_counts_each_ray_process():
     graph = build_query_resource_graph(_metadata(), env={})
     cpu_udf = graph.unit_by_id(udf_unit_id_for_node("query-7", "2"))
     gpu_udf = graph.unit_by_id(udf_unit_id_for_node("query-7", "3"))
@@ -119,11 +103,10 @@ def test_builder_counts_each_nested_ray_process_and_never_uses_zero_heap():
     native_sink = graph.unit_by_id(native_fragment_unit_id_for_node("query-7", "4"))
 
     assert scan.backend == "ray_worker"
-    # Node 1 is the task-producing feeder immediately before the remote UDF.
-    assert scan.per_task == ResourceVector(cpu=1, heap_bytes=512 * MIB)
-    assert cpu_udf_parent.per_task == ResourceVector(cpu=1, heap_bytes=512 * MIB)
-    assert gpu_udf_parent.per_task == ResourceVector(cpu=1, heap_bytes=512 * MIB)
-    assert native_sink.per_task == ResourceVector(cpu=1, heap_bytes=2 * GIB)
+    assert scan.per_task == ResourceVector()
+    assert cpu_udf_parent.per_task == ResourceVector()
+    assert gpu_udf_parent.per_task == ResourceVector()
+    assert native_sink.per_task == ResourceVector()
     assert cpu_udf.backend == "ray_task"
     assert cpu_udf.per_task == ResourceVector(cpu=1, heap_bytes=1536 * MIB, object_store_bytes=128 * MIB)
     assert cpu_udf.max_concurrency is None
@@ -184,25 +167,23 @@ def test_builder_sizes_upstream_retention_window_for_downstream_compute_batch():
     assert cpu_udf.output_window_bytes == 64 * 1024
 
 
-def test_builder_defaults_are_new_positive_production_limits_not_host_memory():
+def test_builder_leaves_udf_heap_unreserved_when_memory_is_not_declared():
     metadata = _metadata()
     del metadata["nodes"][1]["udf_payload"]["memory_bytes"]
     del metadata["nodes"][2]["udf_payload"]["memory_bytes"]
 
     graph = build_query_resource_graph(metadata, env={})
 
-    assert graph.unit_by_id(udf_unit_id_for_node("query-7", "2")).per_task.heap_bytes == 2 * GIB
-    assert graph.unit_by_id(udf_unit_id_for_node("query-7", "3")).resident_per_actor.heap_bytes == 4 * GIB
+    assert graph.unit_by_id(udf_unit_id_for_node("query-7", "2")).per_task.heap_bytes == 0
+    assert graph.unit_by_id(udf_unit_id_for_node("query-7", "3")).resident_per_actor.heap_bytes == 0
+
+    cluster = ResourceVector(cpu=64, gpu=4, heap_bytes=64 * GIB, object_store_bytes=64 * GIB)
+    demand = build_query_demand(graph, cluster)
+    assert demand.minimum.heap_bytes == 0
+    assert demand.desired.heap_bytes == 0
 
 
-def test_builder_accepts_only_positive_new_resource_configuration():
-    with pytest.raises(ValueError, match="VANE_NATIVE_FRAGMENT_TASK_HEAP_BYTES"):
-        build_query_resource_graph(_metadata(), env={"VANE_NATIVE_FRAGMENT_TASK_HEAP_BYTES": "0"})
-    with pytest.raises(ValueError, match="VANE_NATIVE_FRAGMENT_UDF_DRIVER_HEAP_BYTES"):
-        build_query_resource_graph(
-            _metadata(),
-            env={"VANE_NATIVE_FRAGMENT_UDF_DRIVER_HEAP_BYTES": "0"},
-        )
+def test_builder_requires_declared_heap_to_be_positive():
     with pytest.raises(ValueError, match="memory_bytes"):
         metadata = _metadata()
         metadata["nodes"][1]["udf_payload"]["memory_bytes"] = 0
@@ -253,7 +234,7 @@ def test_plan_digest_is_stable_for_node_order_but_changes_with_resources():
     assert graph_a.plan_digest != graph_c.plan_digest
 
 
-def test_query_demand_reserves_hard_actor_pool_and_downstream_native_fragment_progress_slot():
+def test_query_demand_reserves_only_remote_process_bundles():
     graph = build_query_resource_graph(_metadata(), env={})
     cluster = ResourceVector(cpu=64, gpu=4, heap_bytes=64 * GIB, object_store_bytes=64 * GIB)
 
@@ -277,16 +258,29 @@ def test_query_demand_reserves_hard_actor_pool_and_downstream_native_fragment_pr
             ),
         ),
     )
-    assert demand.task_bundles == (
-        ResourceVector(cpu=1, heap_bytes=1536 * MIB),
-        ResourceVector(cpu=1, heap_bytes=2 * GIB),
-        ResourceVector(cpu=1, heap_bytes=2 * GIB),
-    )
+    assert demand.task_bundles == (ResourceVector(cpu=1, heap_bytes=1536 * MIB),)
     assert demand.minimum == ResourceVector(
-        cpu=4,
+        cpu=2,
         gpu=1,
-        heap_bytes=3 * GIB + 4 * GIB + 1536 * MIB,
+        heap_bytes=3 * GIB + 1536 * MIB,
     )
+
+
+def test_pure_native_query_demands_only_a_soft_object_store_budget():
+    metadata = _metadata()
+    for node in metadata["nodes"]:
+        node["udf_payload"] = None
+    graph = build_query_resource_graph(metadata, env={})
+    cluster = ResourceVector(cpu=64, gpu=4, heap_bytes=64 * GIB, object_store_bytes=8 * GIB)
+
+    demand = build_query_demand(graph, cluster)
+
+    assert all(unit.backend == "ray_worker" for unit in graph.units)
+    assert all(unit.per_task == ResourceVector() for unit in graph.units)
+    assert demand.minimum == ResourceVector()
+    assert demand.task_bundles == ()
+    assert demand.actor_bundles == ()
+    assert demand.desired == ResourceVector(object_store_bytes=8 * GIB)
 
 
 def test_query_demand_treats_pipeline_windows_as_soft_budget_regression_issue_38():

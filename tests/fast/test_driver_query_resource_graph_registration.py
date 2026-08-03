@@ -166,7 +166,6 @@ def _metadata(query_id: str) -> dict:
                 "node_name": "ScanSource",
                 "input_node_ids": [],
                 "is_sink": False,
-                "is_blocking_materializing": False,
                 "num_partitions": 4,
                 "udf_payload": None,
             },
@@ -175,7 +174,6 @@ def _metadata(query_id: str) -> dict:
                 "node_name": "StreamingUDF",
                 "input_node_ids": ["0"],
                 "is_sink": False,
-                "is_blocking_materializing": False,
                 "num_partitions": 4,
                 "udf_payload": {
                     "query_id": query_id,
@@ -960,11 +958,11 @@ def test_driver_maintenance_refreshes_ray_capacity_usage_and_heartbeat_atomicall
             runnable=True,
             actor_ready=unit.backend != "ray_actor",
         )
-    fte_unit = next(unit for unit in graph.units if unit.backend == "ray_worker")
+    native_fragment_unit = next(unit for unit in graph.units if unit.backend == "ray_worker")
     task_grant = manager.try_acquire_task(
         TaskRequest(
             query_id=query_id,
-            resource_unit_id=fte_unit.resource_unit_id,
+            resource_unit_id=native_fragment_unit.resource_unit_id,
             task_id="fte-task-1",
             attempt_id="fte-attempt-1",
             node_id="node-a",

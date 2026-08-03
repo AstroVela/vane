@@ -77,22 +77,6 @@ RayWorkerTask = require_ray_cxx_attr(
 )
 
 
-def _registered_fte_task_memory_bytes(
-    resource_query_id: str,
-    resource_unit_id: str,
-) -> int:
-    from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
-
-    manager = get_query_resource_manager(resource_query_id)
-    unit = manager.graph.unit_by_id(resource_unit_id)
-    if unit.backend != "ray_worker":
-        raise RuntimeError(f"FTE resource unit {resource_unit_id} has invalid registered backend {unit.backend!r}")
-    task_memory_bytes = int(unit.per_task.heap_bytes)
-    if task_memory_bytes <= 0:
-        raise RuntimeError(f"FTE resource unit {resource_unit_id} has invalid per-task heap lease {task_memory_bytes}")
-    return task_memory_bytes
-
-
 def _registered_fte_logical_fragment_identity(
     resource_query_id: str,
     resource_unit_id: str,
@@ -392,10 +376,11 @@ class FteWorkerSubmissionMixin:
             source_node_ids=dynamic_scan_sources | dynamic_exchange_sources,
             dynamic_scan_source_node_ids=dynamic_scan_sources,
             dynamic_exchange_source_node_ids=dynamic_exchange_sources,
-            task_memory_bytes=_registered_fte_task_memory_bytes(
-                resource_query_id,
-                resource_unit_id,
-            ),
+            # Native fragments share the node-local DuckDB instance. DuckDB's
+            # memory_limit and buffer manager own their working-memory
+            # admission; the query resource graph does not synthesize a
+            # per-fragment heap requirement.
+            task_memory_bytes=None,
         )
         with _FTE_REGISTRY_LOCK:
             if fte_registry_query_is_closing(query_id):

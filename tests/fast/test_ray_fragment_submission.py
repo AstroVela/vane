@@ -115,7 +115,6 @@ class RayWorkerActorHandle(_ProductionRayWorkerActorHandle):
                     "pipeline_id": 1,
                     "operators": ["TABLE_SCAN"],
                     "operator_details": [{}],
-                    "stage_ids": [],
                 }
             ],
         }
@@ -396,7 +395,7 @@ def _register_test_query_resource_graph(query_id, fragment_ids, *, max_concurren
             unit_kind="native_fragment",
             backend="ray_worker",
             input_unit_ids=(),
-            per_task=ResourceVector(cpu=1, heap_bytes=10),
+            per_task=ResourceVector(),
             target_output_block_bytes=1,
             generator_buffer_blocks=1,
             max_concurrency=max_concurrency,
@@ -526,7 +525,13 @@ def _patch_ray_worker_handle_test_state(monkeypatch):
                 "resource_unit_id": resource_unit_id,
                 **dict(item.get("context") or {}),
             }
-        return original_get_or_create(handle, item, *args, **kwargs)
+        fragment_execution = original_get_or_create(handle, item, *args, **kwargs)
+        # Keep the worker-reservation race tests exercising an explicit
+        # synthetic requirement. Production Ray native fragments pass None
+        # and delegate working-memory admission to DuckDB.
+        if fragment_execution.task_memory_bytes is None:
+            fragment_execution.task_memory_bytes = 10
+        return fragment_execution
 
     monkeypatch.setattr(RayWorkerActorHandle, "submit_tasks", _submit_tasks_with_registered_test_graph)
     monkeypatch.setattr(
@@ -816,7 +821,7 @@ def test_submit_tasks_registers_fragment_and_creates_fte_task():
     assert request["fragment_plan"] is None
     assert request["query_task_lease"]["resource_unit_id"] == "resource:query-1:fragment:node:17"
     assert request["query_task_lease"]["attempt_id"] == str(handles[0].task_id)
-    assert request["query_task_lease"]["resources"]["heap_bytes"] == 10
+    assert request["query_task_lease"]["resources"]["heap_bytes"] == 0
     assert "duckdb_memory_bytes" not in request["query_task_lease"]
     assert request["memory_requirement_bytes"] == 10
 

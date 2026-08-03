@@ -321,9 +321,10 @@ class QueryAllocation:
 class ResourceUnitSpec:
     """Resource accounting for one independently scheduled execution family.
 
-    A unit represents native fragment tasks, Ray task UDFs, or a Ray actor
-    pool. It does not gate pipeline execution; ``is_barrier`` only marks the
-    materialization boundary used to calculate the current reservation scope.
+    Native-fragment units retain graph identity and managed object-flow
+    windows, but do not own process resources: the node-local shared DuckDB
+    instance schedules their threads and manages their working memory. Ray
+    task and actor units own the process resources declared by their UDFs.
     """
 
     query_id: str
@@ -339,7 +340,6 @@ class ResourceUnitSpec:
     resident_per_actor: ResourceVector = field(default_factory=ResourceVector)
     actor_pool_size: int = 0
     actor_prefetch_depth: int = 1
-    is_barrier: bool = False
 
     _FIELDS: ClassVar[tuple[str, ...]] = (
         "query_id",
@@ -355,7 +355,6 @@ class ResourceUnitSpec:
         "resident_per_actor",
         "actor_pool_size",
         "actor_prefetch_depth",
-        "is_barrier",
     )
 
     @property
@@ -377,7 +376,6 @@ class ResourceUnitSpec:
             "resident_per_actor": self.resident_per_actor.to_dict(),
             "actor_pool_size": int(self.actor_pool_size),
             "actor_prefetch_depth": int(self.actor_prefetch_depth),
-            "is_barrier": self.is_barrier,
         }
 
     @classmethod
@@ -399,7 +397,6 @@ class ResourceUnitSpec:
             resident_per_actor=ResourceVector.from_dict(values["resident_per_actor"]),
             actor_pool_size=int(values["actor_pool_size"]),
             actor_prefetch_depth=int(values["actor_prefetch_depth"]),
-            is_barrier=values["is_barrier"],
         )
 
 
@@ -526,14 +523,13 @@ class QueryResourceGraph:
             )
         if unit.max_concurrency is not None and int(unit.max_concurrency) <= 0:
             raise ValueError(f"unit {unit.resource_unit_id} max_concurrency must be > 0")
-        if not isinstance(unit.is_barrier, bool):
-            raise ValueError(f"unit {unit.resource_unit_id} is_barrier must be a boolean")
-
-        process_resources = unit.resident_per_actor if unit.backend == "ray_actor" else unit.per_task
-        if process_resources.cpu <= 0 and process_resources.gpu <= 0:
-            raise ValueError(f"unit {unit.resource_unit_id} process commitment must request CPU or GPU resources")
-        if process_resources.heap_bytes <= 0:
-            raise ValueError(f"unit {unit.resource_unit_id} process commitment must request non-zero heap_bytes")
+        process_resources = unit.resident_per_actor if unit.backend == "ray_actor" else _hard_resources(unit.per_task)
+        if unit.backend == "ray_worker":
+            if not process_resources.is_zero():
+                raise ValueError(f"native fragment unit {unit.resource_unit_id} process resources are owned by DuckDB")
+        else:
+            if process_resources.cpu <= 0 and process_resources.gpu <= 0:
+                raise ValueError(f"unit {unit.resource_unit_id} process commitment must request CPU or GPU resources")
 
         actor_pool_size = int(unit.actor_pool_size)
         actor_prefetch_depth = int(unit.actor_prefetch_depth)
@@ -599,50 +595,6 @@ class QueryResourceGraph:
 
     def reverse_topological_unit_ids(self) -> tuple[str, ...]:
         return tuple(reversed(self.topological_unit_ids()))
-
-    def downstream_native_fragment_unit_ids_requiring_separate_slot(
-        self,
-        source_unit_id: str,
-    ) -> tuple[str, ...]:
-        """Return downstream native fragment units separated by a remote-process boundary.
-
-        A native fragment task can normally hand its capacity directly to a
-        downstream native fragment after it finishes. That capacity is not
-        transferable while the fragment is blocked inside a nested Ray task
-        or actor invocation: the producer remains alive until the remote
-        continuation returns. Every native fragment reachable after such a
-        boundary therefore shares one additional progress slot that admission
-        must keep placeable.
-
-        The source itself counts as a boundary when it is not a Ray worker.
-        Results follow the graph's deterministic topological order.  For a
-        join, one boundary-crossing input path is sufficient to require the
-        separate slot.
-        """
-        source = self.unit_by_id(source_unit_id)
-        by_id = {unit.resource_unit_id: unit for unit in self.units}
-        downstream: dict[str, set[str]] = {resource_unit_id: set() for resource_unit_id in by_id}
-        for unit in self.units:
-            for input_unit_id in unit.input_unit_ids:
-                downstream[input_unit_id].add(unit.resource_unit_id)
-
-        crossed_remote_process: dict[str, bool] = {source.resource_unit_id: source.backend != "ray_worker"}
-        ordered = self.topological_unit_ids()
-        for resource_unit_id in ordered:
-            crossed = crossed_remote_process.get(resource_unit_id)
-            if crossed is None:
-                continue
-            for child_id in downstream[resource_unit_id]:
-                child_crossed = crossed or by_id[child_id].backend != "ray_worker"
-                crossed_remote_process[child_id] = crossed_remote_process.get(child_id, False) or child_crossed
-
-        return tuple(
-            resource_unit_id
-            for resource_unit_id in ordered
-            if resource_unit_id != source.resource_unit_id
-            and by_id[resource_unit_id].backend == "ray_worker"
-            and crossed_remote_process.get(resource_unit_id, False)
-        )
 
     def task_identity(self, resource_unit_id: str, *, partition_id: int | str, attempt_id: int | str) -> str:
         unit = self.unit_by_id(resource_unit_id)

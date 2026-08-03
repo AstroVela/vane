@@ -102,7 +102,12 @@ class UDFActorPoolBase:
             raise ValueError("UDF actor scheduling_strategy is owned by the query coordinator")
         options["num_cpus"] = self._resolve_actor_num_cpus(payload)
         options["num_gpus"] = gpus_per_actor
-        options["memory"] = self._resolve_actor_memory_bytes(payload)
+        options.pop("memory", None)
+        memory_bytes = int(self._resolve_actor_memory_bytes(payload))
+        if memory_bytes < 0:
+            raise ValueError("memory_bytes must be non-negative")
+        if memory_bytes > 0:
+            options["memory"] = memory_bytes
         runtime_env = _with_actor_thread_env(
             self._build_actor_runtime_env(options),
             payload,

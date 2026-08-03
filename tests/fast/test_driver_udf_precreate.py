@@ -588,7 +588,7 @@ def test_stateful_actor_loss_during_synchronous_submit_keeps_recoverability_cont
             self.actors = [Actor()]
             self._payload = {
                 "query_id": "query-submit",
-                "resource_unit_id": "stage-submit",
+                "resource_unit_id": "resource:test:udf:submit",
                 "execution_backend": "ray_actor",
                 "udf_output_target_max_bytes": 1,
             }
@@ -606,11 +606,11 @@ def test_stateful_actor_loss_during_synchronous_submit_keeps_recoverability_cont
             return SimpleNamespace(
                 lease={
                     "query_id": "query-submit",
-                    "resource_unit_id": "stage-submit",
+                    "resource_unit_id": "resource:test:udf:submit",
                     "lease_id": "lease-submit",
                     "attempt_id": "attempt-submit",
                     "node_id": "node-submit",
-                    "execution_slot_id": "ray_actor:stage-submit:0",
+                    "execution_slot_id": "ray_actor:resource:test:udf:submit:0",
                     "actor_index": 0,
                     "output_window_bytes": 2,
                 }

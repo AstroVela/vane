@@ -56,7 +56,6 @@ def _registered_low_level_plan(plan, con, *, node_id=None):
     graph = build_query_resource_graph(
         plan.collect_query_resource_graph_metadata(conn=con),
         env={
-            "VANE_NATIVE_FRAGMENT_TASK_HEAP_BYTES": "1",
             "VANE_TARGET_OUTPUT_BLOCK_BYTES": str(1024**2),
         },
     )
@@ -492,7 +491,7 @@ def _bind_test_query_resource_owner(
         unit_kind="native_fragment",
         backend="ray_worker",
         input_unit_ids=(),
-        per_task=ResourceVector(cpu=1, heap_bytes=1),
+        per_task=ResourceVector(),
         target_output_block_bytes=1,
         generator_buffer_blocks=1,
         max_concurrency=1,
@@ -1648,21 +1647,21 @@ def test_query_driver_copy_teardown_cancellation_reports_cleanup_complete(monkey
     assert not any("CancelledError" in warning for warning in outcome.cleanup_warnings)
 
 
-def test_query_driver_copy_opens_actor_stage_after_topology_and_actor_barriers(monkeypatch):
+def test_query_driver_copy_opens_actor_unit_after_topology_and_actor_barriers(monkeypatch):
     import duckdb.runners.ray.fte_fragment_scheduler as scheduler_mod
 
     cls, runner = _make_local_query_driver_actor()
     physical_plan = _FakePhysicalPlanWithoutPlanAttr("copy-startup-order")
     logical_plan = _FakeLogicalPlan(physical_plan)
     plan_started = threading.Event()
-    actor_stage_open = threading.Event()
+    actor_unit_open = threading.Event()
     events: list[str] = []
 
     class _PlanRunner:
         def run_copy_plan(self, _plan, _conn):
             events.append("plan-started")
             plan_started.set()
-            assert actor_stage_open.wait(timeout=2.0)
+            assert actor_unit_open.wait(timeout=2.0)
             events.append("plan-finished")
             return _committed_copy_result(ok=True)
 
@@ -1676,9 +1675,9 @@ def test_query_driver_copy_opens_actor_stage_after_topology_and_actor_barriers(m
         assert actor_pools == ["actor-pool"]
         events.append("actors-ready")
 
-    def mark_actor_stages(_self, _graph):
-        events.append("actor-stage-open")
-        actor_stage_open.set()
+    def mark_actor_units(_self, _graph):
+        events.append("actor-unit-open")
+        actor_unit_open.set()
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
     monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", wait_for_actors)
@@ -1689,7 +1688,7 @@ def test_query_driver_copy_opens_actor_stage_after_topology_and_actor_barriers(m
         "_register_query_resources",
         _query_registration_stub("copy-startup-order"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", mark_actor_stages)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", mark_actor_units)
     monkeypatch.setattr(cls, "_teardown_plan_resources", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {})
     monkeypatch.setattr(
@@ -1702,7 +1701,7 @@ def test_query_driver_copy_opens_actor_stage_after_topology_and_actor_barriers(m
 
     assert outcome.result["ok"] is True
     assert outcome.write_state == "committed"
-    open_index = events.index("actor-stage-open")
+    open_index = events.index("actor-unit-open")
     assert events.index("topology-ready") < open_index
     assert events.index("actors-ready") < open_index
     assert open_index < events.index("plan-finished")
@@ -1736,8 +1735,8 @@ def test_query_driver_copy_accepts_plan_success_before_startup_barriers(monkeypa
         assert release_barriers.wait(timeout=2.0)
         events.append("actors-ready")
 
-    def mark_actor_stages(_self, _graph):
-        events.append("actor-stage-open")
+    def mark_actor_units(_self, _graph):
+        events.append("actor-unit-open")
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
     monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", wait_for_actors)
@@ -1748,7 +1747,7 @@ def test_query_driver_copy_accepts_plan_success_before_startup_barriers(monkeypa
         "_register_query_resources",
         _query_registration_stub("copy-plan-before-startup-barriers"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", mark_actor_stages)
+    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", mark_actor_units)
     monkeypatch.setattr(cls, "_teardown_plan_resources", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {})
     monkeypatch.setattr(
@@ -1767,7 +1766,7 @@ def test_query_driver_copy_accepts_plan_success_before_startup_barriers(monkeypa
 
     assert outcome.result["rows_copied"] == 0
     assert outcome.write_state == "committed"
-    open_index = events.index("actor-stage-open")
+    open_index = events.index("actor-unit-open")
     assert events.index("plan-finished") < events.index("topology-ready") < open_index
     assert events.index("plan-finished") < events.index("actors-ready") < open_index
 
@@ -4324,7 +4323,7 @@ def test_run_plan_return_uses_native_completed_sink_descriptor(monkeypatch):
         "lease_id": "lease-native-descriptor",
         "query_id": "resource-query-native-descriptor",
         "execution_query_id": "query-native-descriptor",
-        "resource_unit_id": "stage-native-descriptor",
+        "resource_unit_id": "resource:test:fragment:native-descriptor",
         "attempt_id": "query-native-descriptor.0.0.0",
         "target_output_block_bytes": 1,
         "output_window_bytes": 1,
@@ -4409,7 +4408,7 @@ def test_run_plan_return_cancellation_waits_for_native_execution(monkeypatch):
         "lease_id": "lease-native-cancel",
         "query_id": "resource-query-native-cancel",
         "execution_query_id": "query-native-cancel",
-        "resource_unit_id": "stage-native-cancel",
+        "resource_unit_id": "resource:test:fragment:native-cancel",
         "attempt_id": "query-native-cancel.0.0.1",
         "target_output_block_bytes": 1,
         "output_window_bytes": 1,
@@ -6250,10 +6249,7 @@ def test_describe_native_progress_materializes_deferred_clone_without_execution(
     assert topology["schema"] == "pipeline_topology"
     assert topology["pipelines"]
     assert any("TABLE_SCAN" in pipeline["operators"] for pipeline in topology["pipelines"])
-    assert all(
-        set(pipeline) == {"pipeline_id", "operators", "operator_details", "stage_ids"}
-        for pipeline in topology["pipelines"]
-    )
+    assert all(set(pipeline) == {"pipeline_id", "operators", "operator_details"} for pipeline in topology["pipelines"])
     result_collector_roles = {
         pipeline["operator_details"][index].get("pipeline_role")
         for pipeline in topology["pipelines"]
@@ -6295,7 +6291,6 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
     class _CapturingWorker:
         def __init__(self):
             self.tasks = []
-            self.blocking_materialization_completions = []
 
         def submit_tasks(self, tasks):
             self.tasks.extend(tasks)
@@ -6323,10 +6318,6 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
 
         def task_input_stream_exhausted_for_query(self, _query_id, _source_node_ids):
             return []
-
-        def blocking_materialization_completed(self, query_id, node_id):
-            self.blocking_materialization_completions.append((query_id, node_id))
-            return True
 
         def prepare_shutdown(self):
             return None
@@ -6393,8 +6384,6 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
 
     assert sink_topologies
     assert len(sink_results) == len(sink_topologies)
-    assert len(worker.blocking_materialization_completions) == 1
-    assert worker.blocking_materialization_completions[0][0] == plan.idx()
     assert all(result.flight_port > 0 for result in sink_results)
     assert all(result.completion_status == "executed" for result in sink_results)
     ordinary_result = runner.execute_native(con.cursor(), _make_test_physical_plan(con), None, None)

@@ -30,7 +30,6 @@ public:
 	const PipelineNodeConfig &config() const override {
 		return config_;
 	}
-	bool is_blocking_materializing() const override;
 
 	std::vector<PipelineNodeRef> children() const override {
 		return {child_};
@@ -64,7 +63,6 @@ public:
 	const PipelineNodeConfig &config() const override {
 		return config_;
 	}
-	bool is_blocking_materializing() const override;
 
 	std::vector<PipelineNodeRef> children() const override {
 		return {child_};
@@ -99,7 +97,6 @@ public:
 	const PipelineNodeConfig &config() const override {
 		return config_;
 	}
-	bool is_blocking_materializing() const override;
 
 	std::vector<PipelineNodeRef> children() const override {
 		return {child_};

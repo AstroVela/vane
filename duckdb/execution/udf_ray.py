@@ -649,7 +649,12 @@ def _task_remote_options(
     options = dict(ray_options or {})
     options["num_cpus"] = num_cpus
     options["num_gpus"] = num_gpus
-    options["memory"] = int(memory_bytes)
+    options.pop("memory", None)
+    declared_memory_bytes = int(memory_bytes)
+    if declared_memory_bytes < 0:
+        raise ValueError("memory_bytes must be non-negative")
+    if declared_memory_bytes > 0:
+        options["memory"] = declared_memory_bytes
     options["max_retries"] = max_retries
     options["_generator_backpressure_num_objects"] = RAY_UDF_GENERATOR_BACKPRESSURE_OBJECTS
     return options

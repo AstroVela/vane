@@ -156,12 +156,14 @@ class _TaskAdmissionPlan:
 
 @dataclass(frozen=True)
 class _DownstreamReservation:
-    """One shared resource bundle that keeps a downstream path runnable.
+    """One soft shared resource preference for a downstream runnable path.
 
     Unlike a per-parent continuation credit, this reservation is not charged
     once for every producer. Admission only proves that the bundle remains
     placeable after granting the producer. The real downstream task consumes
-    that capacity through its normal task lease when it becomes runnable.
+    that capacity through its normal task lease when it becomes runnable. If
+    preserving the bundle would prevent all progress, the existing bounded
+    liveness escape may start one hard-feasible task without preserving it.
     """
 
     reservation_id: str
@@ -221,7 +223,7 @@ class OutputBlockGrant:
 class OutputBlockLeaseOwner:
     """Shared lifetime owner carried with one query-produced ObjectRef."""
 
-    def __init__(self, manager: QueryResourceManager, lease: OutputBlockLease) -> None:
+    def __init__(self, manager: RayQueryResourceManager, lease: OutputBlockLease) -> None:
         self._manager = manager
         self._lease_id = str(lease.lease_id)
         self._state = str(lease.state)
@@ -287,8 +289,13 @@ class _ResourceUnitState:
     completed: bool = False
 
 
-class QueryResourceManager:
-    """Own all task and streaming-output resources for one immutable query DAG."""
+class RayQueryResourceManager:
+    """Own Ray execution and streaming-output resources for one query DAG.
+
+    DuckDB owns native-fragment CPU, heap, scheduling, and spill. Native units
+    remain in this graph only so Ray-side object-store windows, task leases,
+    backpressure, and liveness can be coordinated across native/UDF edges.
+    """
 
     def __init__(
         self,
@@ -325,21 +332,8 @@ class QueryResourceManager:
         self._reverse_topological_rank = {
             resource_unit_id: index for index, resource_unit_id in enumerate(self._reverse_topological_unit_ids)
         }
-        self._upstream_unit_ids: dict[str, tuple[str, ...]] = {}
-        for resource_unit_id in self._topological_unit_ids:
-            upstream: set[str] = set()
-            for input_unit_id in self._units[resource_unit_id].spec.input_unit_ids:
-                upstream.add(input_unit_id)
-                upstream.update(self._upstream_unit_ids[input_unit_id])
-            self._upstream_unit_ids[resource_unit_id] = tuple(
-                candidate for candidate in self._topological_unit_ids if candidate in upstream
-            )
         self._reachable_unit_ids: dict[str, tuple[str, ...]] = {}
         self._reachable_udf_unit_ids: dict[str, tuple[str, ...]] = {}
-        self._downstream_native_fragment_unit_ids_requiring_separate_slot = {
-            resource_unit_id: graph.downstream_native_fragment_unit_ids_requiring_separate_slot(resource_unit_id)
-            for resource_unit_id in self._topological_unit_ids
-        }
         for source_unit_id in self._topological_unit_ids:
             reachable: set[str] = set()
             pending = list(self._direct_downstream_unit_ids[source_unit_id])
@@ -390,7 +384,6 @@ class QueryResourceManager:
         self._active_liveness_output_lease_id: str | None = None
         self._task_liveness_grants_total = 0
         self._output_liveness_grants_total = 0
-        self._completed_barrier_unit_ids: set[str] = set()
         self._external_consumer_waiting = False
         self._cancelled = False
         self._cancel_reason = ""
@@ -593,21 +586,6 @@ class QueryResourceManager:
             unit.actor_ready = ready
             self._publish_change_locked()
 
-    def mark_barrier_unit_completed(self, resource_unit_id: str) -> bool:
-        """Record one blocking barrier as materialized without completing its output unit."""
-        unit_key = str(resource_unit_id)
-        with self._lock:
-            unit = self._units.get(unit_key)
-            if unit is None:
-                raise KeyError(f"unit is not registered: {unit_key}")
-            if not unit.spec.is_barrier:
-                raise ValueError(f"unit is not a blocking materializer: {unit_key}")
-            if self._barrier_unit_completed_locked(unit_key):
-                return False
-            self._completed_barrier_unit_ids.add(unit_key)
-            self._publish_change_locked()
-            return True
-
     def update_allocation(
         self,
         allocation: QueryAllocation,
@@ -635,75 +613,6 @@ class QueryResourceManager:
                 return
             self._allocation_admission_open = False
             self._publish_change_locked()
-
-    def task_eligible_node_ids(self, resource_unit_id: str) -> tuple[str, ...]:
-        """Return statically feasible placement nodes for one registered unit."""
-        with self._lock:
-            if not self._allocation_admission_open:
-                return ()
-            unit = self._units.get(str(resource_unit_id))
-            if unit is None:
-                raise KeyError(f"unit is not registered: {resource_unit_id}")
-            commitment = self._task_commitment(unit.spec)
-            allowed_actor_nodes = (
-                set(self.allocation.actor_node_ids_for_unit(unit.spec.resource_unit_id))
-                if unit.spec.backend == "ray_actor"
-                else None
-            )
-            if self._continuation_parent_unit_ids_by_ray_task.get(unit.spec.resource_unit_id):
-                return tuple(
-                    dict.fromkeys(
-                        credit.node_id
-                        for credit in self._continuation_credits.values()
-                        if credit.parent_active
-                        and credit.borrowed_by_task_lease_id is None
-                        and unit.spec.resource_unit_id in credit.eligible_unit_ids
-                        and commitment.fits_within(credit.resources)
-                    )
-                )
-            credit_template = self._continuation_credit_template_locked(unit.spec)
-            credit_resources = ResourceVector() if credit_template is None else credit_template[2]
-            downstream_reservations = self._downstream_reservations_locked(unit.spec)
-            allocation_by_node = {
-                allocation.node_id: allocation.resources for allocation in self.allocation.node_allocations
-            }
-            base_remaining: dict[str, ResourceVector] = {}
-            for node_id, capacity in allocation_by_node.items():
-                resident = self._actor_resident_usage_locked(node_id=node_id)
-                hard_capacity = _hard_resources(capacity)
-                if resident.fits_within(hard_capacity):
-                    base_remaining[node_id] = hard_capacity - resident
-
-            def preserves_registered_minimum(task_node_id: str) -> bool:
-                task_capacity = base_remaining.get(task_node_id)
-                if task_capacity is None or not commitment.fits_within(task_capacity):
-                    return False
-                after_task = dict(base_remaining)
-                after_task[task_node_id] = task_capacity - commitment
-                if credit_resources.is_zero():
-                    return self._remaining_preserves_downstream_locked(
-                        after_task,
-                        downstream_reservations,
-                    )
-                for credit_node_id in sorted(after_task):
-                    credit_capacity = after_task[credit_node_id]
-                    if not credit_resources.fits_within(credit_capacity):
-                        continue
-                    after_credit = dict(after_task)
-                    after_credit[credit_node_id] = credit_capacity - credit_resources
-                    if self._remaining_preserves_downstream_locked(
-                        after_credit,
-                        downstream_reservations,
-                    ):
-                        return True
-                return False
-
-            return tuple(
-                allocation.node_id
-                for allocation in self.allocation.node_allocations
-                if preserves_registered_minimum(allocation.node_id)
-                and (allowed_actor_nodes is None or allocation.node_id in allowed_actor_nodes)
-            )
 
     def try_acquire_task(self, request: TaskRequest) -> TaskGrant:
         with self._lock:
@@ -1031,23 +940,17 @@ class QueryResourceManager:
         if hard_exceeded:
             reason = "continuation_capacity" if credit_template is not None else f"hard_{hard_exceeded[0]}"
             return reason, False, empty_plan
-        object_store_unlimited = (
-            unit.spec.resource_unit_id
-            in self._materializing_object_store_unlimited_unit_ids_locked(
-                requested_unit_id=unit.spec.resource_unit_id,
-            )
-        )
         query_soft_blocked = (
-            not object_store_unlimited
-            and admission_commitment.object_store_bytes > 0
+            admission_commitment.object_store_bytes > 0
             and usage_after.object_store_bytes > self.allocation.resources.object_store_bytes
         )
         downstream_reservations = self._downstream_reservations_locked(unit.spec)
+        downstream_reservation_soft_blocked = False
         if downstream_reservations:
             remaining = _hard_resources(self.allocation.resources) - _hard_resources(query_usage + admission_commitment)
             reservation_total = self._downstream_reservation_total(downstream_reservations)
             if not reservation_total.fits_within(remaining):
-                return "continuation_capacity", False, empty_plan
+                downstream_reservation_soft_blocked = True
 
         new_credit_plan: _NewContinuationCreditPlan | None = None
         if credit_template is not None:
@@ -1056,8 +959,19 @@ class QueryResourceManager:
                 request.node_id,
                 hard_commitment,
                 credit_resources,
+                allow_unallocated_task_node=unit.spec.backend == "ray_worker",
                 downstream_reservations=downstream_reservations,
             )
+            if node_blocked_reason == "continuation_node_capacity" and downstream_reservations:
+                node_id, credit_node_id, node_blocked_reason, node_fatal = self._select_task_and_credit_nodes_locked(
+                    request.node_id,
+                    hard_commitment,
+                    credit_resources,
+                    allow_unallocated_task_node=unit.spec.backend == "ray_worker",
+                    downstream_reservations=(),
+                )
+                if node_blocked_reason is None:
+                    downstream_reservation_soft_blocked = True
             if node_blocked_reason is None:
                 new_credit_plan = _NewContinuationCreditPlan(
                     eligible_unit_ids=eligible_unit_ids,
@@ -1075,8 +989,18 @@ class QueryResourceManager:
                 request.node_id,
                 _hard_resources(admission_commitment),
                 allowed_node_ids=allowed_node_ids,
+                allow_unallocated_node=unit.spec.backend == "ray_worker",
                 downstream_reservations=downstream_reservations,
             )
+            if node_blocked_reason == "continuation_node_capacity" and downstream_reservations:
+                node_id, node_blocked_reason, node_fatal = self._select_task_node_locked(
+                    request.node_id,
+                    _hard_resources(admission_commitment),
+                    allowed_node_ids=allowed_node_ids,
+                    allow_unallocated_node=unit.spec.backend == "ray_worker",
+                )
+                if node_blocked_reason is None:
+                    downstream_reservation_soft_blocked = True
         if node_blocked_reason is not None:
             return node_blocked_reason, node_fatal, empty_plan
 
@@ -1100,6 +1024,8 @@ class QueryResourceManager:
             new_credit=new_credit_plan,
             borrowed_credit_id=(None if borrowed_credit is None else borrowed_credit.credit_id),
         )
+        if downstream_reservation_soft_blocked:
+            return "unit_soft_limit", False, plan
         if active_unit_tasks > 0 and any(
             downstream_id not in self._started_unit_ids
             and self._units[downstream_id].runnable
@@ -1113,7 +1039,6 @@ class QueryResourceManager:
             soft_reason = self._unit_soft_block_reason_locked(
                 unit.spec.resource_unit_id,
                 commitment,
-                ignore_object_store=object_store_unlimited,
             )
             if soft_reason is not None:
                 return soft_reason, False, plan
@@ -1125,29 +1050,39 @@ class QueryResourceManager:
         commitment: ResourceVector,
         *,
         allowed_node_ids: set[str] | None,
+        allow_unallocated_node: bool = False,
         downstream_reservations: tuple[_DownstreamReservation, ...] = (),
     ) -> tuple[str, str | None, bool]:
         allocation_by_node = {
             item.node_id: _hard_resources(item.resources) for item in self.allocation.node_allocations
         }
         requested = "" if requested_node_id is None else str(requested_node_id).strip()
-        if requested and requested not in allocation_by_node:
+        external_requested = bool(requested and requested not in allocation_by_node)
+        if external_requested and (
+            not allow_unallocated_node
+            or not commitment.is_zero()
+            or (allowed_node_ids is not None and requested not in allowed_node_ids)
+        ):
             return "", "node_not_allocated", True
 
-        static_candidates = [
-            node_id
-            for node_id, capacity in allocation_by_node.items()
-            if commitment.fits_within(capacity)
-            and (not requested or node_id == requested)
-            and (allowed_node_ids is None or node_id in allowed_node_ids)
-        ]
+        static_candidates = (
+            [requested]
+            if external_requested
+            else [
+                node_id
+                for node_id, capacity in allocation_by_node.items()
+                if commitment.fits_within(capacity)
+                and (not requested or node_id == requested)
+                and (allowed_node_ids is None or node_id in allowed_node_ids)
+            ]
+        )
         if not static_candidates:
             return "", "task_does_not_fit_allocated_node", True
 
         available_candidates: list[tuple[str, ResourceVector]] = []
         debt_detected = False
         for node_id in static_candidates:
-            capacity = allocation_by_node[node_id]
+            capacity = allocation_by_node.get(node_id, ResourceVector())
             usage = _hard_resources(self._node_usage_locked(node_id))
             if not usage.fits_within(capacity):
                 debt_detected = True
@@ -1191,6 +1126,7 @@ class QueryResourceManager:
         task_commitment: ResourceVector,
         credit_resources: ResourceVector,
         *,
+        allow_unallocated_task_node: bool = False,
         downstream_reservations: tuple[_DownstreamReservation, ...],
     ) -> tuple[str, str, str | None, bool]:
         """Place one parent task and its continuation ownership atomically."""
@@ -1198,14 +1134,19 @@ class QueryResourceManager:
             item.node_id: _hard_resources(item.resources) for item in self.allocation.node_allocations
         }
         requested = "" if requested_node_id is None else str(requested_node_id).strip()
-        if requested and requested not in allocation_by_node:
+        external_requested = bool(requested and requested not in allocation_by_node)
+        if external_requested and (not allow_unallocated_task_node or not task_commitment.is_zero()):
             return "", "", "node_not_allocated", True
 
-        task_nodes = [
-            node_id
-            for node_id, capacity in allocation_by_node.items()
-            if task_commitment.fits_within(capacity) and (not requested or node_id == requested)
-        ]
+        task_nodes = (
+            [requested]
+            if external_requested
+            else [
+                node_id
+                for node_id, capacity in allocation_by_node.items()
+                if task_commitment.fits_within(capacity) and (not requested or node_id == requested)
+            ]
+        )
         if not task_nodes:
             return "", "", "task_does_not_fit_allocated_node", True
         credit_nodes = [
@@ -1218,9 +1159,9 @@ class QueryResourceManager:
         debt_detected = False
         for task_node_id in task_nodes:
             for credit_node_id in credit_nodes:
-                proposed: dict[str, ResourceVector] = {
-                    task_node_id: task_commitment,
-                }
+                proposed: dict[str, ResourceVector] = {}
+                if task_node_id in allocation_by_node:
+                    proposed[task_node_id] = task_commitment
                 proposed[credit_node_id] = proposed.get(credit_node_id, ResourceVector()) + credit_resources
                 remaining_by_node: dict[str, ResourceVector] = {}
                 feasible = True
@@ -1253,10 +1194,10 @@ class QueryResourceManager:
         task_node_id, credit_node_id, _ = min(
             candidates,
             key=lambda item: (
-                item[2][item[0]].gpu,
-                item[2][item[0]].cpu,
-                item[2][item[0]].heap_bytes,
-                item[2][item[0]].object_store_bytes,
+                item[2].get(item[0], ResourceVector()).gpu,
+                item[2].get(item[0], ResourceVector()).cpu,
+                item[2].get(item[0], ResourceVector()).heap_bytes,
+                item[2].get(item[0], ResourceVector()).object_store_bytes,
                 item[0],
                 item[1],
             ),
@@ -1357,89 +1298,16 @@ class QueryResourceManager:
             heap_bytes=spec.per_task.heap_bytes,
         )
 
-    def _first_pending_barrier_unit_id_locked(self) -> str | None:
-        """Return the first unfinished blocking unit in source-to-sink order."""
-        return next(
-            (
-                resource_unit_id
-                for resource_unit_id in self._topological_unit_ids
-                if self._units[resource_unit_id].spec.is_barrier
-                and not self._barrier_unit_completed_locked(resource_unit_id)
-            ),
-            None,
-        )
-
-    def _barrier_unit_completed_locked(self, resource_unit_id: str) -> bool:
-        return self._units[resource_unit_id].completed or resource_unit_id in self._completed_barrier_unit_ids
-
-    def _reservation_scope_unit_ids_locked(self) -> tuple[str, ...]:
-        """Return unfinished units eligible in the current reservation scope."""
-        barrier_unit_id = self._first_pending_barrier_unit_id_locked()
-        if barrier_unit_id is None:
-            return tuple(
-                resource_unit_id
-                for resource_unit_id in self._topological_unit_ids
-                if not self._units[resource_unit_id].completed
-            )
-        scope = set(self._upstream_unit_ids[barrier_unit_id])
-        scope.add(barrier_unit_id)
-        return tuple(
-            resource_unit_id
-            for resource_unit_id in self._topological_unit_ids
-            if resource_unit_id in scope and not self._units[resource_unit_id].completed
-        )
-
-    def _materializing_object_store_unlimited_unit_ids_locked(
-        self,
-        *,
-        requested_unit_id: str | None = None,
-    ) -> tuple[str, ...]:
-        """Return units whose data must be collectable beyond the soft budget.
-
-        Vane accounts a block to its producer even after the block becomes a
-        downstream input. Therefore the blocking unit and its direct input
-        producers share the spill exemption. DuckDB may concurrently start
-        nested materializers (notably chained broadcast joins), so a blocking
-        boundary becomes active when its own unit or one of its direct inputs
-        is requested or has started. The first unfinished boundary is always
-        active. Earlier streaming producers keep their normal soft budgets and
-        bounded liveness escape.
-        """
-        first_barrier_unit_id = self._first_pending_barrier_unit_id_locked()
-        if first_barrier_unit_id is None:
-            return ()
-        requested = None if requested_unit_id is None else str(requested_unit_id)
-        unlimited: set[str] = set()
-        for barrier_unit_id in self._topological_unit_ids:
-            barrier = self._units[barrier_unit_id]
-            if not barrier.spec.is_barrier or self._barrier_unit_completed_locked(barrier_unit_id):
-                continue
-            boundary = set(barrier.spec.input_unit_ids)
-            boundary.add(barrier_unit_id)
-            active = (
-                barrier_unit_id == first_barrier_unit_id
-                or requested in boundary
-                or bool(boundary & self._started_unit_ids)
-            )
-            if active:
-                unlimited.update(boundary)
-        return tuple(
-            resource_unit_id for resource_unit_id in self._topological_unit_ids if resource_unit_id in unlimited
-        )
-
     def _continuation_credit_template_locked(
         self,
         parent: ResourceUnitSpec,
     ) -> tuple[tuple[str, ...], str, ResourceVector] | None:
         if parent.backend != "ray_worker":
             return None
-        scope_unit_ids = set(self._reservation_scope_unit_ids_locked())
         eligible_specs = tuple(
             self._units[resource_unit_id].spec
             for resource_unit_id in self._reachable_udf_unit_ids[parent.resource_unit_id]
-            if resource_unit_id in scope_unit_ids
-            and self._units[resource_unit_id].spec.backend == "ray_task"
-            and not self._units[resource_unit_id].completed
+            if self._units[resource_unit_id].spec.backend == "ray_task" and not self._units[resource_unit_id].completed
         )
         if not eligible_specs:
             return None
@@ -1538,12 +1406,11 @@ class QueryResourceManager:
         self,
         parent: ResourceUnitSpec,
     ) -> tuple[_DownstreamReservation, ...]:
-        """Return shared bundles required to keep this producer drainable.
+        """Return soft shared bundles that prefer a drainable producer path.
 
-        Query demand owns one transferable native-fragment bundle, while
-        nested Ray tasks
-        use the explicit per-parent continuation credit above. A streaming
-        actor boundary additionally needs one slot for every inactive
+        Native fragments do not consume Vane-owned process resources. Nested
+        Ray tasks use the explicit per-parent continuation credit above. A
+        streaming actor boundary additionally needs one slot for every inactive
         downstream Ray-task continuation: the actor input producer, actor call,
         and downstream consumer can all remain live while generator output is
         drained, so the transferable component-max process credit alone is not
@@ -1551,38 +1418,17 @@ class QueryResourceManager:
         input/output bytes use the query's dynamic object-store budget.
 
         Reservations include latent units: waiting for a unit to become
-        runnable is too late because an upstream producer may already have
-        consumed the last non-spillable process slot by then.
+        runnable is too late to bias upstream fanout. They remain soft so an
+        allocation at the graph's hard minimum can still start through the
+        bounded liveness escape.
         """
-        scope_unit_ids = set(self._reservation_scope_unit_ids_locked())
         reachable = tuple(
             self._units[resource_unit_id]
             for resource_unit_id in self._reachable_unit_ids[parent.resource_unit_id]
-            if resource_unit_id in scope_unit_ids and not self._units[resource_unit_id].completed
+            if not self._units[resource_unit_id].completed
         )
         reservations: list[_DownstreamReservation] = []
         allocation_node_ids = tuple(sorted(allocation.node_id for allocation in self.allocation.node_allocations))
-
-        inactive_native_fragments = tuple(
-            self._units[resource_unit_id].spec
-            for resource_unit_id in self._downstream_native_fragment_unit_ids_requiring_separate_slot[
-                parent.resource_unit_id
-            ]
-            if resource_unit_id in scope_unit_ids
-            and not self._units[resource_unit_id].completed
-            and self._active_task_count_for_unit_locked(resource_unit_id) == 0
-        )
-        if inactive_native_fragments:
-            resources = _component_max(tuple(self._task_commitment(unit) for unit in inactive_native_fragments))
-            if not resources.is_zero():
-                reservations.append(
-                    _DownstreamReservation(
-                        reservation_id=f"native-fragment:{parent.resource_unit_id}",
-                        unit_ids=tuple(unit.resource_unit_id for unit in inactive_native_fragments),
-                        resources=resources,
-                        allowed_node_ids=allocation_node_ids,
-                    )
-                )
 
         def is_after_streaming_actor(resource_unit_id: str) -> bool:
             if parent.backend == "ray_actor":
@@ -1657,24 +1503,9 @@ class QueryResourceManager:
         *,
         requested_unit_id: str | None,
     ) -> tuple[str, ...]:
-        scope_unit_ids = set(self._reservation_scope_unit_ids_locked())
-        object_store_unlimited_unit_ids = (
-            set(
-                self._materializing_object_store_unlimited_unit_ids_locked(
-                    requested_unit_id=requested_unit_id,
-                )
-            )
-            if field_name == "object_store_bytes"
-            else set()
-        )
         unit_ids: list[str] = []
         for resource_unit_id, unit in self._units.items():
-            if (
-                resource_unit_id not in scope_unit_ids
-                or resource_unit_id in object_store_unlimited_unit_ids
-                or not unit.runnable
-                or unit.completed
-            ):
+            if not unit.runnable or unit.completed:
                 continue
             task_demand = (
                 (requested_unit_id is not None and resource_unit_id == requested_unit_id)
@@ -1699,12 +1530,6 @@ class QueryResourceManager:
         live_unit_ids: tuple[str, ...],
     ) -> tuple[str, ...]:
         live = set(live_unit_ids)
-        scope_unit_ids = set(self._reservation_scope_unit_ids_locked())
-        object_store_unlimited_unit_ids = (
-            set(self._materializing_object_store_unlimited_unit_ids_locked())
-            if field_name == "object_store_bytes"
-            else set()
-        )
         continuation_ids: set[str] = set()
         for source_unit_id in live_unit_ids:
             if self._units[source_unit_id].spec.backend != "ray_worker":
@@ -1713,8 +1538,6 @@ class QueryResourceManager:
                 unit = self._units[resource_unit_id]
                 if (
                     resource_unit_id not in live
-                    and resource_unit_id in scope_unit_ids
-                    and resource_unit_id not in object_store_unlimited_unit_ids
                     and not unit.completed
                     and self._unit_dimension_commitment(unit.spec, field_name) > 0
                 ):
@@ -1750,24 +1573,17 @@ class QueryResourceManager:
         self,
         resource_unit_id: str,
         request: ResourceVector,
-        *,
-        ignore_object_store: bool = False,
     ) -> str | None:
-        # The current reservation scope defines which units receive a designated
-        # reservation; they are not an execution gate.  DuckDB can demand a
-        # downstream unit while an earlier blocking barrier is still pending
-        # (nested broadcast joins do this from concurrent materializers).
-        # Match Ray Data's allocator semantics: an out-of-scope unit has no
-        # per-unit budget, while query/node hard limits and the query's
-        # object-store soft limit still apply.
-        if resource_unit_id not in self._reservation_scope_unit_ids_locked():
-            return None
+        """Enforce dynamic shares among units with real runnable demand.
+
+        DuckDB owns native execution phases. QRM therefore does not infer a
+        static barrier scope: every active or queued unit participates in the
+        dimensions it actually requests, and unused capacity remains shared.
+        """
         usage_by_unit = {key: self._unit_usage_locked(key) for key in self._units}
         current = usage_by_unit[resource_unit_id]
         limits = self.allocation.resources
         for field_name in _RESOURCE_FIELDS:
-            if ignore_object_store and field_name == "object_store_bytes":
-                continue
             amount = getattr(request, field_name)
             if amount <= 0:
                 continue
@@ -2529,20 +2345,12 @@ class QueryResourceManager:
         delta = after - before
         object_limit = self.allocation.resources.object_store_bytes
         usage_after = self._query_usage_locked() + ResourceVector(object_store_bytes=delta)
-        object_store_unlimited = (
-            unit.spec.resource_unit_id in self._materializing_object_store_unlimited_unit_ids_locked()
-        )
-        if not object_store_unlimited and delta > 0 and usage_after.object_store_bytes > object_limit:
+        if delta > 0 and usage_after.object_store_bytes > object_limit:
             return "query_soft_object_store_bytes", False, delta
         if delta > 0:
-            try:
-                self.allocation.resources_for_node(task.node_id)
-            except KeyError:
-                return "node_not_allocated", True, delta
             soft = self._unit_soft_block_reason_locked(
                 unit.spec.resource_unit_id,
                 ResourceVector(object_store_bytes=delta),
-                ignore_object_store=object_store_unlimited,
             )
             if soft is not None:
                 return soft, False, delta
@@ -2964,9 +2772,6 @@ class QueryResourceManager:
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             usage = self._query_usage_locked()
-            barrier_unit_id = self._first_pending_barrier_unit_id_locked()
-            reservation_scope_unit_ids = self._reservation_scope_unit_ids_locked()
-            materializing_object_store_unlimited_unit_ids = self._materializing_object_store_unlimited_unit_ids_locked()
             preferred_task, grant_class = self._preferred_waiting_task_locked()
             allocation_by_node = {item.node_id: item.resources for item in self.allocation.node_allocations}
             reservation_source_unit_ids = {lease.resource_unit_id for lease in self._task_leases.values()} | {
@@ -3022,12 +2827,6 @@ class QueryResourceManager:
                     for node_id, resources in node_usage.items()
                 },
                 "reservation_ratio": self.reservation_ratio,
-                "reservation_scope": {
-                    "barrier_unit_id": barrier_unit_id,
-                    "resource_unit_ids": list(reservation_scope_unit_ids),
-                    "object_store_backpressure_disabled": bool(materializing_object_store_unlimited_unit_ids),
-                    "object_store_unlimited_unit_ids": list(materializing_object_store_unlimited_unit_ids),
-                },
                 "cancelled": self._cancelled,
                 "cancel_reason": self._cancel_reason,
                 "external_consumer_waiting": self._external_consumer_waiting,
@@ -3108,11 +2907,6 @@ class QueryResourceManager:
                         "queued_output_bytes": unit.queued_output_bytes,
                         "pending_output_count": unit.pending_output_count,
                         "completed": unit.completed,
-                        "materialization_completed": (self._barrier_unit_completed_locked(resource_unit_id)),
-                        "reservation_scope_eligible": resource_unit_id in reservation_scope_unit_ids,
-                        "object_store_backpressure_disabled": (
-                            resource_unit_id in materializing_object_store_unlimited_unit_ids
-                        ),
                         "usage": self._unit_usage_locked(resource_unit_id).to_dict(),
                         "active_task_count": self._active_task_count_for_unit_locked(resource_unit_id),
                     }
@@ -3149,7 +2943,7 @@ __all__ = [
     "OutputBlockLease",
     "OutputBlockLeaseOwner",
     "OutputBlockRequest",
-    "QueryResourceManager",
+    "RayQueryResourceManager",
     "TaskGrant",
     "TaskLease",
     "TaskRequest",

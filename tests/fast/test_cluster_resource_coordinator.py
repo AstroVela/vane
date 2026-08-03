@@ -155,6 +155,25 @@ def test_ray_capacity_never_uses_host_memory_or_cpu_fallback(monkeypatch):
     assert capacities[0].resources == _r(cpu=2, heap=180, store=200)
 
 
+def test_soft_only_query_gets_node_allocation_without_native_hard_minimum():
+    coordinator = ClusterQueryResourceCoordinator(
+        (_node("node-a", cpu=8, heap=1_000, store=400),),
+    )
+
+    allocation = coordinator.register_query(
+        _demand(
+            "native-only",
+            minimum=_r(),
+            desired=_r(store=400),
+        ),
+        now=0,
+    )
+
+    assert allocation.resources == _r(store=400)
+    assert allocation.node_allocations[0].node_id == "node-a"
+    assert allocation.node_allocations[0].resources == _r(store=400)
+
+
 @pytest.mark.parametrize(
     ("target_name", "attribute", "fail_on_call"),
     [
@@ -182,7 +201,7 @@ def test_register_query_failure_is_atomic_across_rebalance_phases(
     coordinator.register_query(
         _demand(
             "existing",
-            minimum=_r(cpu=1, heap=100, store=100),
+            minimum=_r(cpu=1, heap=100),
             desired=_r(cpu=4, heap=400, store=400),
         ),
         now=0,
@@ -222,7 +241,7 @@ def test_register_query_failure_is_atomic_across_rebalance_phases(
     coordinator.register_query(
         _demand(
             "recovery",
-            minimum=_r(cpu=1, heap=100, store=100),
+            minimum=_r(cpu=1, heap=100),
             desired=_r(cpu=3, heap=300, store=300),
         ),
         now=6,
@@ -252,12 +271,12 @@ def test_equal_weight_queries_receive_equal_dominant_shares():
     )
     demand_a = _demand(
         "a",
-        minimum=_r(cpu=1, heap=100, store=100),
+        minimum=_r(cpu=1, heap=100),
         desired=_r(cpu=12, heap=1_200, store=1_200),
     )
     demand_b = _demand(
         "b",
-        minimum=_r(cpu=1, heap=100, store=100),
+        minimum=_r(cpu=1, heap=100),
         desired=_r(cpu=12, heap=1_200, store=1_200),
     )
 
@@ -341,7 +360,7 @@ def test_weighted_dominant_fairness_gives_double_share_to_weight_two_query():
     coordinator.register_query(
         _demand(
             "weight-one",
-            minimum=_r(cpu=0.1, heap=10, store=10),
+            minimum=_r(cpu=0.1, heap=10),
             desired=_r(cpu=12, heap=1_200, store=1_200),
             weight=1,
         ),
@@ -350,7 +369,7 @@ def test_weighted_dominant_fairness_gives_double_share_to_weight_two_query():
     coordinator.register_query(
         _demand(
             "weight-two",
-            minimum=_r(cpu=0.1, heap=10, store=10),
+            minimum=_r(cpu=0.1, heap=10),
             desired=_r(cpu=12, heap=1_200, store=1_200),
             weight=2,
         ),
@@ -396,13 +415,38 @@ def test_query_desired_resources_are_downward_caps_not_capacity_overrides():
     allocation = coordinator.register_query(
         _demand(
             "capped",
-            minimum=_r(cpu=1, heap=100, store=100),
+            minimum=_r(cpu=1, heap=100),
             desired=_r(cpu=3, heap=300, store=400),
         ),
         now=0,
     )
 
     assert allocation.resources == _r(cpu=3, heap=300, store=400)
+
+
+def test_query_demand_rejects_object_store_hard_minimum_and_placement_bundles():
+    with pytest.raises(ValueError, match="minimum query resources may not hard-reserve object-store bytes"):
+        QueryDemand(
+            query_id="minimum-store",
+            minimum=_r(cpu=1, store=1),
+            desired=_r(cpu=1, store=10),
+            task_bundles=(_r(cpu=1, store=1),),
+        )
+
+    with pytest.raises(ValueError, match="task resource bundles may not hard-reserve object-store bytes"):
+        QueryDemand(
+            query_id="task-store",
+            minimum=_r(cpu=1),
+            desired=_r(cpu=1, store=10),
+            task_bundles=(_r(cpu=1, store=1),),
+        )
+
+    with pytest.raises(ValueError, match="actor resource bundles may not hard-reserve object-store bytes"):
+        ActorResourceBundle(
+            resource_unit_id="resource:actor-store",
+            actor_index=0,
+            resources=_r(cpu=1, store=1),
+        )
 
 
 def test_query_demand_rejects_elastic_gpu_headroom_before_registration():
@@ -531,7 +575,7 @@ def test_minimum_task_vector_must_fit_one_node_not_cross_node_dimensions():
             _node("memory-node", cpu=0, heap=199, store=199),
         )
     )
-    minimum = _r(cpu=2, heap=200, store=200)
+    minimum = _r(cpu=2, heap=200)
 
     allocation = coordinator.register_query(
         _demand("coherent-task", minimum=minimum, desired=minimum),
@@ -623,7 +667,7 @@ def test_capacity_shrink_preserves_observed_usage_as_debt_and_stops_new_admissio
     allocation = coordinator.register_query(
         _demand(
             "q",
-            minimum=_r(cpu=1, heap=100, store=100),
+            minimum=_r(cpu=1, heap=100),
             desired=_r(cpu=4, heap=400, store=400),
         ),
         now=0,
@@ -722,7 +766,7 @@ def test_refresh_queries_updates_all_usage_and_heartbeats_atomically():
     def demand(query_id):
         return _demand(
             query_id,
-            minimum=_r(cpu=1, heap=100, store=100),
+            minimum=_r(cpu=1, heap=100),
             desired=_r(cpu=8, heap=800, store=800),
         )
 
@@ -801,7 +845,7 @@ def test_node_allocations_never_exceed_any_node_capacity():
     coordinator.register_query(
         _demand(
             "cpu",
-            minimum=_r(cpu=1, heap=100, store=100),
+            minimum=_r(cpu=1, heap=100),
             desired=_r(cpu=4, heap=400, store=600),
         ),
         now=0,

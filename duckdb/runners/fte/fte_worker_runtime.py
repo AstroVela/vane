@@ -120,8 +120,8 @@ def _query_task_lease_heap_bytes(
     if not isinstance(resources, Mapping):
         raise RuntimeError("Ray FTE query_task_lease resources must be a mapping")
     heap_bytes = int(resources.get("heap_bytes") or 0)
-    if heap_bytes <= 0:
-        raise RuntimeError("Ray FTE query_task_lease heap_bytes must be positive")
+    if heap_bytes < 0:
+        raise RuntimeError("Ray FTE query_task_lease heap_bytes must be non-negative")
     explicit = _memory_requirement_from_request(request, None) if _has_explicit_memory_requirement(request) else None
     if explicit is not None and int(explicit) != heap_bytes:
         raise RuntimeError(

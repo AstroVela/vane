@@ -976,10 +976,9 @@ def drain_fte_resource_admission_change(query_id: str) -> list[Any]:
     return request_fte_pending_task_drain()
 
 
-def has_fte_resource_admission_waiter(query_id: str) -> bool:
-    # Kept as a compatibility name for the driver bridge.  Demand now includes
-    # passive FTE descriptors; FTE task waiters are intentionally absent from
-    # QRM when the execution window is full.
+def has_fte_resource_admission_demand(query_id: str) -> bool:
+    # Demand includes passive FTE descriptors; FTE task waiters are
+    # intentionally absent from QRM when the execution window is full.
     return bool(_fte_execution_queries_waiting_for_resource(query_id))
 
 
@@ -2006,21 +2005,12 @@ class FteWorkerPlacementManager:
         partition_id = int(partition_id)
         owner_key = (query_id, fragment_id, partition_id)
         fragment_execution_id = _fte_partition_fragment_execution_id(query_id, fragment_id, partition_id)
-        from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
-
-        resource_query_id, resource_unit_id = _fte_fragment_resource_identity(
-            query_id,
-            fragment_id,
-        )
-        eligible_node_ids = set(get_query_resource_manager(resource_query_id).task_eligible_node_ids(resource_unit_id))
-        if not eligible_node_ids:
-            raise RuntimeError(f"FTE resource unit {resource_unit_id} has no feasible node in its query allocation")
         with _FTE_REGISTRY_LOCK:
             if query_id in _FTE_CLOSING_QUERIES:
                 raise RuntimeError(f"FTE query registry is closing: {query_id}")
             lease_record = _FTE_PARTITION_TASK_LEASES.get(owner_key)
             owner = _FTE_PARTITION_OWNERS.get(owner_key)
-            if owner is not None and (not owner._fte_healthy or str(owner.node_id) not in eligible_node_ids):
+            if owner is not None and not owner._fte_healthy:
                 _FTE_PARTITION_OWNERS.pop(owner_key, None)
                 _release_fte_partition_task_lease_for_key(
                     query_id,
@@ -2063,7 +2053,6 @@ class FteWorkerPlacementManager:
                 try:
                     owner = self.coordinator._select_fte_worker(
                         exclude=excluded_worker_ids,
-                        allowed_node_ids=eligible_node_ids,
                         memory_requirement_bytes=memory_requirement_bytes,
                         execution_class=execution_class,
                         node_requirements=node_requirements,
@@ -2084,21 +2073,6 @@ class FteWorkerPlacementManager:
                         fragment_id,
                         partition_id,
                     )
-                    from duckdb.runners.ray.fragment_worker_selection import (
-                        available_fte_workers,
-                    )
-
-                    available_workers = available_fte_workers(
-                        self.coordinator,
-                        getattr(self.coordinator, "worker_id", None),
-                    )
-                    live_worker_node_ids = {str(worker.node_id) for worker in available_workers}
-                    if eligible_node_ids.isdisjoint(live_worker_node_ids):
-                        raise RuntimeError(
-                            f"FTE resource unit {resource_unit_id} allocation has no live Ray worker: "
-                            f"allocated_nodes={sorted(eligible_node_ids)} "
-                            f"worker_nodes={sorted(live_worker_node_ids)}"
-                        )
                     raise FteWorkerReservationUnavailable(
                         query_id=query_id,
                         fragment_id=fragment_id,
