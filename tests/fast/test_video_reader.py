@@ -559,6 +559,24 @@ def test_video_s3_source_identity_is_versioned_and_endpoint_scoped(monkeypatch):
     assert other_port_source_id != first_source_id
 
 
+def test_video_s3_source_identity_canonicalizes_ipv6_endpoint_literals(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    _clear_s3_environment(monkeypatch)
+    path = "s3://media-bucket/clips/example.mp4"
+
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://[2001:db8::1]")
+    _, compressed_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv(
+        "AWS_ENDPOINT_URL",
+        "https://[2001:0DB8:0000:0000:0000:0000:0000:0001]:443/prefix",
+    )
+    _, expanded_source_id = _source_identity(video_reader, path)
+
+    assert expanded_source_id == compressed_source_id
+
+
 def test_video_s3_default_source_identity_is_partition_scoped(monkeypatch):
     import duckdb.datasource.video_reader as video_reader
 
