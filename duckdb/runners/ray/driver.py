@@ -48,15 +48,15 @@ from duckdb.runners.fte import (
 from duckdb.runners.fte.fte_failures import _normalize_failure_payload, _safe_failure_message
 from duckdb.runners.progress import ProgressRenderer, progress_enabled
 from duckdb.runners.ray.admission_ledger import BoundedReplayMap
-from duckdb.runners.ray.ray_env import (
-    collect_vane_env_overrides,
-    reject_node_local_ray_runtime_env,
-    scrub_shared_runtime_session_env,
-)
 from duckdb.runners.ray.query_runtime_protocol import (
     RAY_QUERY_RUNTIME_ACTOR_NAMESPACE,
     query_runtime_actor_name,
     ray_runtime_job_id,
+)
+from duckdb.runners.ray.ray_env import (
+    collect_vane_env_overrides,
+    reject_node_local_ray_runtime_env,
+    scrub_shared_runtime_session_env,
 )
 from duckdb.runners.ray.safe_get import QueryDeadlineExceeded, resolve_object_refs_blocking
 from duckdb.runners.ray.worker import WorkerTaskMetadata

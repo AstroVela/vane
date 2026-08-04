@@ -25,8 +25,8 @@ from duckdb.runners.ray.fragment_registry import (
 )
 from duckdb.runners.ray.fragment_worker_failures import quarantine_fte_worker
 from duckdb.runners.ray.fte_fragment_scheduler import (
-    _sync_write_sink_unit_for_fragment,
     _store_fte_result_handles,
+    _sync_write_sink_unit_for_fragment,
     begin_fte_registry_operation,
     end_fte_registry_operation,
     fte_partition_task_lease_payload,

@@ -21,7 +21,6 @@ from duckdb.execution.udf_threading import (
     ray_actor_thread_env,
     ray_actor_thread_policy,
 )
-from duckdb.runners.ray.ray_env import build_session_runtime_env_vars
 from duckdb.runners.ray.query_runtime_protocol import (
     RAY_ACTOR_GENERATION_CAPABILITY_ENV,
     RAY_ACTOR_INDEX_ENV,
@@ -29,6 +28,7 @@ from duckdb.runners.ray.query_runtime_protocol import (
     RAY_ACTOR_QUERY_ID_ENV,
     RAY_ACTOR_RESOURCE_UNIT_ID_ENV,
 )
+from duckdb.runners.ray.ray_env import build_session_runtime_env_vars
 from duckdb.runners.ray.safe_get import (
     configured_ray_get_timeout_s,
     resolve_object_refs_blocking,
@@ -178,6 +178,7 @@ class UDFActorPoolBase:
             raise
         self._confirmed_ready: set[int] = set()
         self._vane_retired = False
+        self._vane_location_nonce = ""
         self._vane_readiness_futures: list[Any] = []
         self._vane_init_errors: dict[int, BaseException] = {}
 
@@ -231,6 +232,7 @@ class UDFActorPoolBase:
             raise ValueError(f"actor_dispatch_indices contains out-of-range indices: {invalid}")
         instance._confirmed_ready = set(parsed_dispatch_indices)
         instance._vane_retired = False
+        instance._vane_location_nonce = ""
         instance._vane_readiness_futures = []
         instance._vane_init_errors = {}
         instance._payload = payload or {}

@@ -29,7 +29,6 @@ from duckdb.execution.udf_ray_stream_protocol import (
     make_stream_error_pair,
 )
 from duckdb.execution.udf_threading import configure_ray_actor_loaded_torch_threads
-from duckdb.runners.ray.ray_env import install_explicit_session_runtime_env
 from duckdb.runners.ray.query_runtime_protocol import (
     RAY_ACTOR_GENERATION_CAPABILITY_ENV,
     RAY_ACTOR_INDEX_ENV,
@@ -40,6 +39,7 @@ from duckdb.runners.ray.query_runtime_protocol import (
     query_runtime_actor_name,
     ray_runtime_job_id,
 )
+from duckdb.runners.ray.ray_env import install_explicit_session_runtime_env
 from duckdb.runners.ray.safe_get import resolve_object_refs_blocking
 
 
