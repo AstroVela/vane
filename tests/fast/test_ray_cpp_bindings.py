@@ -886,6 +886,41 @@ def _assert_successful_poller_outcome(outcome, worker_id):
     }
 
 
+def _run_ray_task_result_poller_shutdown_race_script(body):
+    script = textwrap.dedent(
+        f"""
+        import atexit
+        import weakref
+
+        def verify_shutdown():
+            status = "stopped" if handle_ref() is None else "reference-live"
+            print(f"poller-{{status}}", flush=True)
+
+        atexit.register(verify_shutdown)
+
+        import duckdb
+
+        class PendingHandle:
+            def done(self):
+                return False
+
+        handle = PendingHandle()
+        handle_ref = weakref.ref(handle)
+        duckdb.ray_cxx._prepare_ray_task_result_poller_shutdown_race_for_test(handle)
+        del handle
+        {body}
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "poller-stopped" in completed.stdout, completed.stdout + completed.stderr
+
+
 def test_ray_task_result_poller_isolates_handle_done_failure_and_recovers():
     healthy = _PollerTestHandle("healthy", ready_after=3)
     outcomes = _poll_with_shared_ray_task_result_poller(
@@ -982,6 +1017,26 @@ def test_ray_task_result_poller_isolates_per_handle_completion_failure():
     assert "task_id=poller-test.0" in outcomes[0]["error"]
     assert "injected completion failure" in outcomes[0]["error"]
     _assert_successful_poller_outcome(outcomes[1], "worker-healthy")
+
+
+def test_ray_task_result_poller_stops_before_python_finalization():
+    _run_ray_task_result_poller_shutdown_race_script("")
+
+
+def test_ray_task_result_poller_shutdown_is_terminal_and_idempotent():
+    _run_ray_task_result_poller_shutdown_race_script(
+        """
+        duckdb.ray_cxx._shutdown_ray_task_result_poller_for_test()
+        duckdb.ray_cxx._shutdown_ray_task_result_poller_for_test()
+        try:
+            duckdb.ray_cxx._ray_task_result_poller_batch_for_test([PendingHandle()])
+        except Exception as ex:
+            if "poller is shut down" not in str(ex):
+                raise
+        else:
+            raise AssertionError("Ray task result poller restarted after shutdown")
+        """
+    )
 
 
 def test_flight_exchange_source_reads_only_selected_retry_attempt_data(tmp_path):

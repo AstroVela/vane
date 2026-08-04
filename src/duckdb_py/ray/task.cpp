@@ -18,6 +18,8 @@
 #include <duckdb/common/arrow/arrow.hpp>
 #include <duckdb/common/arrow/arrow_type_extension.hpp>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <iostream>
 #include <mutex>
@@ -549,6 +551,9 @@ public:
 
 	uint64_t Register(const std::shared_ptr<RayTaskPollState> &state) {
 		lock_guard<mutex> guard(mutex_);
+		if (shutting_down_) {
+			throw duckdb::InternalException("Ray task result poller is shut down");
+		}
 		state->id = next_id_++;
 		tasks_[state->id] = state;
 		EnsureStartedLocked();
@@ -561,9 +566,49 @@ public:
 	}
 
 	void Shutdown() {
-		stop_.store(true);
+		lock_guard<mutex> shutdown_guard(shutdown_mutex_);
+		if (shutdown_complete_) {
+			return;
+		}
+		{
+			lock_guard<mutex> guard(mutex_);
+			shutting_down_ = true;
+			stop_.store(true);
+		}
+		ReleaseBeforeGILPauseForTest();
 		if (thread_.joinable()) {
 			thread_.join();
+		}
+		shutdown_complete_ = true;
+	}
+
+	void ClearPythonReferencesUnderGIL() {
+		std::vector<std::shared_ptr<RayTaskPollState>> states;
+		{
+			lock_guard<mutex> guard(mutex_);
+			states.reserve(tasks_.size());
+			for (auto &entry : tasks_) {
+				entry.second->done_sent.store(true);
+				states.push_back(std::move(entry.second));
+			}
+			tasks_.clear();
+		}
+		for (auto &state : states) {
+			state->handle.reset_with_gil();
+		}
+	}
+
+	void PauseBeforeNextGILForTest() {
+		lock_guard<mutex> guard(test_mutex_);
+		test_reached_before_gil_ = false;
+		test_release_before_gil_ = false;
+		test_pause_before_gil_.store(true, std::memory_order_release);
+	}
+
+	void WaitUntilPausedBeforeGILForTest() {
+		unique_lock<mutex> lock(test_mutex_);
+		if (!test_cv_.wait_for(lock, std::chrono::seconds(5), [this]() { return test_reached_before_gil_; })) {
+			throw duckdb::InternalException("Timed out waiting for Ray task result poller before GIL acquisition");
 		}
 	}
 
@@ -580,6 +625,28 @@ private:
 		}
 		stop_.store(false);
 		thread_ = std::thread([this]() { Run(); });
+	}
+
+	void PauseBeforeGILForTest() {
+		if (!test_pause_before_gil_.load(std::memory_order_acquire)) {
+			return;
+		}
+		unique_lock<mutex> lock(test_mutex_);
+		if (!test_pause_before_gil_.load(std::memory_order_relaxed)) {
+			return;
+		}
+		test_reached_before_gil_ = true;
+		test_cv_.notify_all();
+		test_cv_.wait(lock, [this]() { return test_release_before_gil_; });
+		test_pause_before_gil_.store(false, std::memory_order_release);
+	}
+
+	void ReleaseBeforeGILPauseForTest() {
+		{
+			lock_guard<mutex> guard(test_mutex_);
+			test_release_before_gil_ = true;
+		}
+		test_cv_.notify_all();
 	}
 
 	static std::string TaskFailureMessage(const std::shared_ptr<RayTaskPollState> &state, const std::string &operation,
@@ -706,6 +773,7 @@ private:
 			bool had_progress = false;
 			std::string operation = "acquire Python GIL";
 			try {
+				PauseBeforeGILForTest();
 				// Keep one GIL acquisition per cycle. The batch helper remains
 				// the fast path, while an isolated per-handle path recovers from
 				// helper and result-contract failures.
@@ -918,11 +986,19 @@ private:
 	}
 
 	mutex mutex_;
+	mutex shutdown_mutex_;
 	std::unordered_map<uint64_t, std::shared_ptr<RayTaskPollState>> tasks_;
 	std::atomic<bool> stop_ {false};
+	bool shutdown_complete_ = false;
 	std::atomic<uint64_t> next_id_ {1};
 	std::thread thread_;
 	std::string last_batch_failure_;
+	bool shutting_down_ = false;
+	mutex test_mutex_;
+	std::condition_variable test_cv_;
+	std::atomic<bool> test_pause_before_gil_ {false};
+	bool test_reached_before_gil_ = false;
+	bool test_release_before_gil_ = false;
 };
 
 } // namespace
@@ -930,6 +1006,30 @@ private:
 } // namespace python
 } // namespace distributed
 } // namespace duckdb
+
+void duckdb::distributed::python::ray::ShutdownRayTaskResultPoller() {
+	auto &poller = RayTaskResultPoller::Get();
+	{
+		// Python atexit callbacks hold the GIL, while the poller may already
+		// be waiting to acquire it. Release it before joining to avoid a
+		// circular wait.
+		py::gil_scoped_release release;
+		poller.Shutdown();
+	}
+	poller.ClearPythonReferencesUnderGIL();
+}
+
+void duckdb::distributed::python::ray::PrepareRayTaskResultPollerShutdownRaceForTest(py::object handle) {
+	auto &poller = RayTaskResultPoller::Get();
+	poller.PauseBeforeNextGILForTest();
+	auto state = std::make_shared<RayTaskPollState>();
+	state->handle = SafePyObject(std::move(handle));
+	poller.Register(state);
+	{
+		py::gil_scoped_release release;
+		poller.WaitUntilPausedBeforeGILForTest();
+	}
+}
 
 RayTaskResultHandle::RayTaskResultHandle(TaskContext task_context, py::object handle, WorkerId worker_id,
                                          std::string fte_task_id)

@@ -2047,6 +2047,10 @@ void register_ray_bindings(py::module_ &mod) {
 	    py::arg("handle"),
 	    "Verify RayTaskResultHandle records the current Python handle worker_id at completion time.");
 
+	m.def("_prepare_ray_task_result_poller_shutdown_race_for_test",
+	      &duckdb::distributed::python::ray::PrepareRayTaskResultPollerShutdownRaceForTest, py::arg("handle"));
+	m.def("_shutdown_ray_task_result_poller_for_test", &duckdb::distributed::python::ray::ShutdownRayTaskResultPoller);
+
 	m.def(
 	    "_ray_task_result_poller_batch_for_test",
 	    [](py::list handles, int timeout_ms) {
@@ -4935,6 +4939,11 @@ void register_ray_bindings(py::module_ &mod) {
 	} catch (...) {
 		// swallow: package may not be importable in some contexts during build
 	}
+
+	// Stop the poller before CPython enters late finalization. The callback is
+	// registered after the other Ray cleanup hook, so it runs first at exit.
+	py::module_::import("atexit").attr("register")(
+	    py::cpp_function([]() { duckdb::distributed::python::ray::ShutdownRayTaskResultPoller(); }));
 }
 
 } // namespace duckdb

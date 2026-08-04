@@ -34,6 +34,14 @@ namespace py = pybind11;
 
 struct RayTaskPollState;
 
+// Stop the process-wide Ray task result poller while Python is still usable.
+// Must be called with the GIL held; it temporarily releases the GIL while the
+// poller thread is joined.
+void ShutdownRayTaskResultPoller();
+
+// Arrange the deterministic shutdown race used by subprocess regression tests.
+void PrepareRayTaskResultPollerShutdownRaceForTest(py::object handle);
+
 // RayTaskResult mirrors the Rust enum with an extra task-level result_schema
 // carrier used by the distributed Python runner.
 struct RayTaskResult {
