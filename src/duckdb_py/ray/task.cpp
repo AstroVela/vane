@@ -18,6 +18,7 @@
 #include <duckdb/common/arrow/arrow.hpp>
 #include <duckdb/common/arrow/arrow_type_extension.hpp>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <iostream>
