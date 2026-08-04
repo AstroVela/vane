@@ -195,7 +195,7 @@ void SerializePreStrictRemoteExchangeSource(Serializer &serializer) {
 	serializer.WriteList(198, "children", 0, [](Serializer::List &, idx_t) {});
 }
 
-void SerializeRemoteExchangeSourceWithoutIdleTimeout(Serializer &serializer) {
+void SerializeRemoteExchangeSourceWithoutReadTimeout(Serializer &serializer) {
 	vector<LogicalType> types = {LogicalType::INTEGER};
 	vector<idx_t> partition_indices = {0};
 	vector<string> source_nodes = {"node-1"};
@@ -1952,7 +1952,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	distributed::FlightExchangeConfig flight_config;
 	flight_config.node_id = "node-1";
 	flight_config.flight_timeout_seconds = 7.5;
-	flight_config.flight_read_idle_timeout_seconds = 3.25;
+	flight_config.flight_read_timeout_seconds = 3.25;
 	auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
 
 	auto &source = plan.Make<PhysicalRemoteExchangeSource>(types, 456, "shuffle_stage", partition_indices,
@@ -2009,10 +2009,10 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	    std::dynamic_pointer_cast<distributed::FlightExchangeManager>(source_ptr->GetExchangeManager());
 	REQUIRE(roundtrip_manager != nullptr);
 	REQUIRE(roundtrip_manager->config().flight_timeout_seconds == 7.5);
-	REQUIRE(roundtrip_manager->config().flight_read_idle_timeout_seconds == 3.25);
+	REQUIRE(roundtrip_manager->config().flight_read_timeout_seconds == 3.25);
 }
 
-TEST_CASE("PhysicalRemoteExchangeSource defaults a missing Flight idle timeout",
+TEST_CASE("PhysicalRemoteExchangeSource defaults a missing Flight read timeout",
           "[serialization][physical_plan][exchange]") {
 	Allocator allocator;
 	PhysicalPlan plan(allocator);
@@ -2020,7 +2020,7 @@ TEST_CASE("PhysicalRemoteExchangeSource defaults a missing Flight idle timeout",
 	SerializationOptions options;
 	BinarySerializer serializer(stream, options);
 	serializer.Begin();
-	SerializeRemoteExchangeSourceWithoutIdleTimeout(serializer);
+	SerializeRemoteExchangeSourceWithoutReadTimeout(serializer);
 	serializer.End();
 
 	stream.Rewind();
@@ -2032,8 +2032,8 @@ TEST_CASE("PhysicalRemoteExchangeSource defaults a missing Flight idle timeout",
 	REQUIRE(source != nullptr);
 	auto manager = std::dynamic_pointer_cast<distributed::FlightExchangeManager>(source->GetExchangeManager());
 	REQUIRE(manager != nullptr);
-	REQUIRE(manager->config().flight_read_idle_timeout_seconds ==
-	        distributed::FlightExchangeConfig::DEFAULT_FLIGHT_READ_IDLE_TIMEOUT_SECONDS);
+	REQUIRE(manager->config().flight_read_timeout_seconds ==
+	        distributed::FlightExchangeConfig::DEFAULT_FLIGHT_READ_TIMEOUT_SECONDS);
 }
 
 TEST_CASE("Remote exchange plans reject pre-strict endpoint payloads", "[serialization][physical_plan][exchange]") {

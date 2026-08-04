@@ -105,7 +105,7 @@ A worker lazily starts one process-owned plaintext `grpc://` Flight service when
 
 Workers advertise their Ray private address by default. `VANE_FLIGHT_BIND_HOST` may select a different local bind address, including `0.0.0.0` in a container with appropriate network policy, while `VANE_FLIGHT_ADVERTISE_HOST` must always be a routable non-wildcard address. The advertised-host override is worker-local: set it in each worker node's environment rather than on the driver or in a Ray Job/actor runtime environment. `DUCKDB_FLIGHT_PORT` selects a fixed worker-local port; the default `0` lets the operating system allocate one. See [SECURITY.md](SECURITY.md) for the complete trust boundary.
 
-Cross-worker reads have a one-hour call deadline and a 60-second per-read idle timeout by default. Override them with `VANE_FLIGHT_CALL_TIMEOUT_S` and `VANE_FLIGHT_READ_IDLE_TIMEOUT_S`; either value may be set to `0` to disable that timeout. Query interruption also cancels an in-flight Flight call, so stalled consumers release the producer-side stream and its shuffle-file read lease.
+Cross-worker reads have a one-hour call deadline and a 60-second maximum duration for each blocking DoGet, schema, or batch-read operation by default. Override them with `VANE_FLIGHT_CALL_TIMEOUT_S` and `VANE_FLIGHT_READ_TIMEOUT_S`; either value may be set to `0` to disable that timeout. The read timeout measures the complete Arrow operation, not byte-level network idleness. Query interruption also cancels an in-flight Flight call, so stalled consumers release the producer-side stream and its shuffle-file read lease.
 
 ### More Resources
 
