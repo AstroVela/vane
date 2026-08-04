@@ -2493,6 +2493,7 @@ def _mark_fte_worker_failed(
     ) -> bool:
         if _FTE_WORKER_HANDLES.get(failed_worker_id) is not failed_handle:
             return False
+        assert failed_handle is not None
         if not _worker_matches_failure_incarnation(
             failed_handle,
             failed_worker_ids,
