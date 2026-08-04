@@ -405,7 +405,9 @@ def _s3_endpoint_settings() -> _S3EndpointSettings:
         raise ValueError(f"AWS_ENDPOINT_URL scheme must be http or https, got {effective_scheme!r}")
 
     endpoint_override = parsed.netloc
-    namespace_host = hostname.lower()
+    # A terminal dot only makes a DNS hostname absolute; it does not identify
+    # a different endpoint. Exclude it from the stable provenance namespace.
+    namespace_host = hostname.lower().removesuffix(".")
     if ":" in namespace_host:
         namespace_host = f"[{namespace_host}]"
     default_port = (effective_scheme == "http" and port == 80) or (effective_scheme == "https" and port == 443)

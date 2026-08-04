@@ -534,6 +534,9 @@ def test_video_s3_source_identity_is_versioned_and_endpoint_scoped(monkeypatch):
     monkeypatch.setenv("AWS_REGION", "future-moon-1")
     _, arbitrary_region_source_id = _source_identity(video_reader, path)
 
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://objects.example.test./another-prefix")
+    _, absolute_dns_name_source_id = _source_identity(video_reader, path)
+
     monkeypatch.setenv("AWS_ENDPOINT_URL", "objects.example.test/another-prefix")
     _, equivalent_endpoint_source_id = _source_identity(video_reader, path)
 
@@ -548,6 +551,7 @@ def test_video_s3_source_identity_is_versioned_and_endpoint_scoped(monkeypatch):
 
     assert source_path == path
     assert first_source_id == "39874672dd4d30134572b88928574d43945bdfe2207847eabad0408b9e46debf"
+    assert absolute_dns_name_source_id == first_source_id
     assert arbitrary_region_source_id == first_source_id
     assert equivalent_endpoint_source_id == first_source_id
     assert other_endpoint_source_id != first_source_id
