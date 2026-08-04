@@ -366,15 +366,18 @@ def chunk_text(
 def _weighted_average_embeddings(
     embeddings: list[Any],
     weights: list[float],
+    *,
+    normalize: bool = True,
 ) -> Any:
     """Compute length-weighted average of embeddings."""
     arr = np.array(embeddings, dtype=np.float64)
     w = np.array(weights, dtype=np.float64)
     w /= w.sum()
     averaged = (arr * w[:, np.newaxis]).sum(axis=0)
-    norm = np.linalg.norm(averaged)
-    if norm > 0:
-        averaged /= norm
+    if normalize:
+        norm = np.linalg.norm(averaged)
+        if norm > 0:
+            averaged /= norm
     return averaged.astype(np.float32)
 
 
@@ -412,6 +415,13 @@ def _normalize_embeddings(values: list[Any]) -> list[Any]:
             arr = arr / norm
         normalized.append(arr)
     return normalized
+
+
+def _resolve_embedding_normalization(descriptor: Any, normalize: bool | None) -> bool:
+    if normalize is not None:
+        return bool(normalize)
+    provider_default = getattr(descriptor, "normalize_embeddings_by_default", None)
+    return bool(provider_default()) if callable(provider_default) else False
 
 
 def _as_positive_int(value: Any) -> int | None:
@@ -467,7 +477,7 @@ class _EmbedTextBatch:
         chunk_overlap_chars: int = 200,
         max_retries: int = 3,
         on_error: _OnError = "raise",
-        normalize: bool = False,
+        normalize: bool | None = None,
         arrow_type: Any | None = None,
     ) -> None:
         self._descriptor = descriptor
@@ -477,7 +487,7 @@ class _EmbedTextBatch:
         self._chunk_overlap_chars = chunk_overlap_chars
         self._max_retries = max_retries
         self._on_error: _OnError = on_error
-        self._normalize = normalize
+        self._normalize = _resolve_embedding_normalization(descriptor, normalize)
         # Keep expression construction lazy: unknown OpenAI-compatible models can
         # probe dimensions over the network, so callers pass a schema-aligned
         # Arrow type when they already know the dimensions.
@@ -611,7 +621,7 @@ class _EmbedTextBatch:
             else:
                 embs = [chunk_embeddings[idx] for idx, _ in entry]
                 weights = [w for _, w in entry]
-                results.append(_weighted_average_embeddings(embs, weights))
+                results.append(_weighted_average_embeddings(embs, weights, normalize=False))
         return results
 
 
@@ -928,6 +938,7 @@ def embed_text(
     provider: str | Provider | None = None,
     model: str | None = None,
     dimensions: int | None = None,
+    normalize: bool | None = None,
     output_column: str = "embedding",
     max_chunk_chars: int | None = None,
     chunk_overlap_chars: int = 200,
@@ -944,6 +955,9 @@ def embed_text(
             ``"google"``) require an explicit model here or on the provider
             instance and raise :class:`ValueError` otherwise.
         dimensions: Output embedding dimensions (model default if ``None``).
+        normalize: Whether Vane should locally L2-normalize provider outputs.
+            ``None`` uses the provider/model default. ``False`` does not undo
+            normalization already applied by the provider.
         output_column: Name of the output column (default: ``"embedding"``).
         max_chunk_chars: If set, texts longer than this are split into
             overlapping chunks, embedded separately, and combined via
@@ -969,6 +983,7 @@ def embed_text(
         chunk_overlap_chars=chunk_overlap_chars,
         max_retries=udf_opts.max_retries,
         on_error=udf_opts.on_error,
+        normalize=normalize,
     )
     kwargs = _map_batches_kwargs(udf_opts, execution_backend)
     kwargs["schema"] = {output_column: "FLOAT[]"}
@@ -996,6 +1011,9 @@ def embed(
     actor. Provider ``concurrency`` maps internally to UDF ``actor_number``.
     Prefer provider environment variables such as ``OPENAI_API_KEY`` or
     ``GOOGLE_API_KEY`` over passing API keys in code or SQL text.
+
+    ``normalize`` controls Vane's local L2 post-processing. ``None`` uses the
+    provider/model default; ``False`` does not undo provider-side normalization.
     """
     prov = _resolve_provider(provider, "openai")
     descriptor_options = _merge_options(provider_options, embedding_options)
@@ -1013,7 +1031,7 @@ def embed(
         output_column,
         max_retries=udf_opts.max_retries,
         on_error=udf_opts.on_error,
-        normalize=bool(normalize),
+        normalize=normalize,
         arrow_type=pa.list_(pa.float32(), dimensions) if dimensions is not None else pa.list_(pa.float32()),
     )
     return _build_ai_batch_expression(

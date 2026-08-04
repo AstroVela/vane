@@ -225,7 +225,7 @@ def build_ai_embed_sql_spec(options: dict[str, Any] | None = None) -> dict[str, 
     provider = opts.pop("provider", "openai")
     model = opts.pop("model", None)
     dimensions = _int_or_none(opts.pop("dimensions", None), "dimensions")
-    normalize = bool(opts.pop("normalize", False))
+    normalize = opts.pop("normalize", None)
     batch_size, max_retries = _pop_execution_options(opts)
 
     prov = _resolve_provider(provider, "openai")

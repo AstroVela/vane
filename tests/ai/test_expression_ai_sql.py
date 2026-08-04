@@ -52,6 +52,9 @@ class MockTextEmbedderDescriptor(TextEmbedderDescriptor):
     def get_dimensions(self) -> EmbeddingDimensions:
         return EmbeddingDimensions(size=self.dim, dtype=pa.float32())
 
+    def normalize_embeddings_by_default(self) -> bool:
+        return self.model_name == "normalize-by-default"
+
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(actor_number=self.actor_number, num_gpus=0, max_retries=0, on_error="raise", batch_size=2)
 
@@ -880,6 +883,43 @@ def test_ai_embed_sql_with_mock_provider_and_dimensions():
     assert len(rows) == 1
     embedding = list(rows[0][0])
     assert embedding == [3.0, 3.0, 3.0, 3.0]
+
+
+def test_ai_embed_sql_uses_provider_normalization_default_when_omitted():
+    conn = vane.connect()
+
+    vector = conn.sql("""
+        SELECT ai_embed(
+            'abc',
+            struct_pack(
+                provider := 'mock_ai_sql',
+                model := 'normalize-by-default',
+                dimensions := 4,
+                concurrency := 1
+            )
+        )
+    """).fetchone()[0]
+
+    assert np.linalg.norm(vector) == pytest.approx(1.0)
+
+
+def test_ai_embed_sql_explicit_false_overrides_provider_normalization_default():
+    conn = vane.connect()
+
+    vector = conn.sql("""
+        SELECT ai_embed(
+            'abc',
+            struct_pack(
+                provider := 'mock_ai_sql',
+                model := 'normalize-by-default',
+                dimensions := 4,
+                normalize := false,
+                concurrency := 1
+            )
+        )
+    """).fetchone()[0]
+
+    assert list(vector) == [3.0, 3.0, 3.0, 3.0]
 
 
 def test_ai_embed_sql_rejects_vllm_provider():

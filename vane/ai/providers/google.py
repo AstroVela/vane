@@ -352,6 +352,11 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
             return EmbeddingDimensions(size=self.dimensions)
         return EmbeddingDimensions(size=_EMBEDDING_DIMS[_canonical_model_id(self.model_name)])
 
+    def normalize_embeddings_by_default(self) -> bool:
+        """Apply the manual renormalization required for truncated 001 outputs."""
+        canonical = _canonical_model_id(self.model_name)
+        return canonical == "gemini-embedding-001" and self.get_dimensions().size != _EMBEDDING_DIMS[canonical]
+
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(
             batch_size=self.embed_options.get("batch_size", _EMBED_BATCH_LIMIT),
