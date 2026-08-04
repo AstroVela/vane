@@ -49,6 +49,18 @@
 #include <sstream>
 #include <thread>
 
+// Arrow 24 exports this idempotent registration hook, but does not install the
+// transport-specific header that declares it.
+namespace arrow {
+namespace flight {
+namespace transport {
+namespace grpc {
+ARROW_FLIGHT_EXPORT void InitializeFlightGrpcClient();
+} // namespace grpc
+} // namespace transport
+} // namespace flight
+} // namespace arrow
+
 namespace duckdb {
 namespace distributed {
 
@@ -281,18 +293,6 @@ DuckDBResult<void> ConvertArrowRecordBatchToChunk(ClientContext &context, const 
 	return DuckDBResult<void>::ok();
 }
 
-arrow::Status EnsureFlightExchangeClientTransportRegistered(const arrow::flight::Location &location) {
-	static std::once_flag register_once;
-	static arrow::Status register_status;
-	std::call_once(register_once, [&]() {
-		auto client_res = arrow::flight::FlightClient::Connect(location);
-		if (!client_res.ok()) {
-			register_status = client_res.status();
-		}
-	});
-	return register_status;
-}
-
 // FlightClient::DoGet reads the initial schema before returning its FlightStreamReader. Use Arrow's exported
 // transport stream directly so the watchdog can obtain a cancellation handle before the first blocking read.
 DuckDBResult<std::unique_ptr<arrow::flight::internal::ClientTransport>>
@@ -303,11 +303,7 @@ ConnectFlightExchangeTransport(const std::string &location_string) {
 		    FlightExchangeArrowToError(location_res.status(), "parse flight location"));
 	}
 	auto location = std::move(location_res).ValueOrDie();
-	auto register_status = EnsureFlightExchangeClientTransportRegistered(location);
-	if (!register_status.ok()) {
-		return DuckDBResult<std::unique_ptr<arrow::flight::internal::ClientTransport>>::err(
-		    FlightExchangeArrowToError(register_status, "register flight client transport"));
-	}
+	arrow::flight::transport::grpc::InitializeFlightGrpcClient();
 
 	auto uri_res = arrow::util::Uri::FromString(location.ToString());
 	if (!uri_res.ok()) {
