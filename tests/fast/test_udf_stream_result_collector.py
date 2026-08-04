@@ -931,6 +931,96 @@ def test_cleanup_tickets_retry_transient_failure_without_starving_peer():
         collector.shutdown()
 
 
+def test_cleanup_ticket_total_deadline_stops_permanent_error_retries(monkeypatch):
+    monkeypatch.setenv("VANE_UDF_STREAM_CLEANUP_TIMEOUT_S", "0.08")
+    collector = UDFStreamResultCollector(ray_module=_FakeRay())
+    attempts = 0
+    slot_id = 31
+
+    def fail_permanently():
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("planned permanent cleanup failure")
+
+    tickets = collector._submit_cleanup_operations(
+        (
+            RayStreamCleanupOperation(
+                fail_permanently,
+                submission_scope=_CLEANUP_SUBMISSION_SCOPE,
+                retry_on_error=True,
+            ),
+        ),
+        store_error=False,
+        slot_ids=(slot_id,),
+    )
+    try:
+        collector.cancel_slot(slot_id)
+        assert collector.slot_has_pending(slot_id)
+
+        errors = _wait_cleanup_tickets(
+            tickets,
+            timeout_message="permanently failing cleanup ticket did not expire",
+        )
+        assert len(errors) == 1
+        assert isinstance(errors[0], TimeoutError)
+        assert "remote cleanup did not terminate within 0.08s" in str(errors[0])
+        assert attempts >= 2
+        assert collector.slot_has_pending(slot_id) is False
+        with collector._cv:
+            assert collector._cleanup_tickets == set()
+            assert collector._cleanup_tickets_by_slot.get(slot_id) is None
+
+        cleanup_error = collector.retire_slot(slot_id)
+        assert cleanup_error is not None
+        assert "TimeoutError" in cleanup_error
+        attempts_after_expiry = attempts
+        time.sleep(0.12)
+        assert attempts == attempts_after_expiry
+    finally:
+        if not collector.slot_has_pending(slot_id):
+            collector.retire_slot(slot_id)
+        collector.shutdown()
+
+
+def test_cleanup_ticket_total_deadline_expires_unresolved_future(monkeypatch):
+    monkeypatch.setenv("VANE_UDF_STREAM_CLEANUP_TIMEOUT_S", "0.08")
+    collector = UDFStreamResultCollector(ray_module=_FakeRay())
+    unresolved = Future()
+    slot_id = 32
+    tickets = collector._submit_cleanup_operations(
+        (
+            RayStreamCleanupOperation(
+                lambda: unresolved,
+                submission_scope=_CLEANUP_SUBMISSION_SCOPE,
+                retry_on_error=True,
+            ),
+        ),
+        store_error=False,
+        slot_ids=(slot_id,),
+    )
+    try:
+        collector.cancel_slot(slot_id)
+        assert collector.slot_has_pending(slot_id)
+
+        errors = _wait_cleanup_tickets(
+            tickets,
+            timeout_message="unresolved cleanup Future did not expire",
+        )
+        assert len(errors) == 1
+        assert isinstance(errors[0], TimeoutError)
+        assert collector.slot_has_pending(slot_id) is False
+        assert tickets[0].wait_future is None
+
+        cleanup_error = collector.retire_slot(slot_id)
+        assert cleanup_error is not None
+        assert "TimeoutError" in cleanup_error
+    finally:
+        unresolved.cancel()
+        if not collector.slot_has_pending(slot_id):
+            collector.retire_slot(slot_id)
+        collector.shutdown()
+
+
 def test_cleanup_tickets_progress_when_loop_notification_fails(
     monkeypatch,
 ):

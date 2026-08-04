@@ -619,8 +619,8 @@ def test_native_dispatcher_terminal_shutdown_uses_one_aggregate_collector_deadli
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_native_dispatcher_terminal_shutdown_closes_executor_after_pending_collector_handoff():
-    """Aggregate shutdown must close local ownership after per-slot cleanup stalls."""
+def test_native_dispatcher_pending_collector_handoff_releases_local_executor():
+    """Remote cleanup ownership must not retain query-local executor state."""
     import os
     import subprocess
     import sys
@@ -629,6 +629,7 @@ def test_native_dispatcher_terminal_shutdown_closes_executor_after_pending_colle
     script = textwrap.dedent(
         """
         import threading
+        import weakref
 
         import _duckdb
         import duckdb
@@ -639,6 +640,8 @@ def test_native_dispatcher_terminal_shutdown_closes_executor_after_pending_colle
         tracked = threading.Event()
         cancel_started = threading.Event()
         executor_closed = threading.Event()
+        executor_released = threading.Event()
+        executor_close_calls = []
 
 
         class FakeCollector:
@@ -715,12 +718,15 @@ def test_native_dispatcher_terminal_shutdown_closes_executor_after_pending_colle
                 return False
 
             def close(self):
+                executor_close_calls.append(None)
                 executor_closed.set()
 
 
         def build_executor(_payload, options=None):
             del options
-            return FakeExecutor()
+            executor = FakeExecutor()
+            weakref.finalize(executor, executor_released.set)
+            return executor
 
 
         def passthrough(table):
@@ -753,10 +759,12 @@ def test_native_dispatcher_terminal_shutdown_closes_executor_after_pending_colle
             assert not query_thread.is_alive(), "completed query did not reach unregister"
             assert query_errors == [], query_errors
             assert cancel_started.is_set(), "slot cleanup never transferred to the collector"
-            assert not executor_closed.is_set(), "pending per-slot cleanup unexpectedly closed the executor"
+            assert executor_closed.wait(timeout=5), "pending remote cleanup retained the local executor"
+            assert executor_released.wait(timeout=5), "pending remote cleanup retained the executor object"
+            assert len(executor_close_calls) == 1
 
             _duckdb._shutdown_udf_executor_dispatcher()
-            assert executor_closed.is_set(), "terminal shutdown skipped the pending slot's executor close"
+            assert len(executor_close_calls) == 1, "terminal shutdown closed an already released executor again"
         finally:
             query_thread.join(timeout=5)
             connection.close()

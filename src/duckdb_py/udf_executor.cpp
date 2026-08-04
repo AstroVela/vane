@@ -1863,10 +1863,6 @@ private:
 			// Terminal shutdown owns the process-wide collector as one unit.
 			// Per-slot cancellation would apply its full timeout once per slot.
 			CancelSlotForCleanup_WithGIL(*kv.second, false);
-			if (kv.second->py_executor) {
-				kv.second->py_executor.reset();
-			}
-			kv.second->actor_handles.reset();
 		}
 		try {
 			while (DrainOutputLeaseReleases_WithGIL()) {
@@ -1924,6 +1920,53 @@ private:
 		slot.collector_cleanup_retry_scheduled = true;
 	}
 
+	void ReleaseSlotLocalResources_WithGIL(ExecutorSlot &slot) {
+		// The process-wide collector independently owns remote stream state, and
+		// cancel_slot transfers terminal operations into its durable ticket
+		// ledger. None of the query-local executor state is needed while those
+		// tickets reach a terminal state, so release it without coupling local
+		// lifetime to a remote acknowledgement.
+		if (slot.py_executor) {
+			try {
+				slot.py_executor->obj.attr("close")();
+			} catch (const py::error_already_set &ex) {
+				SetSlotError(slot, StringUtil::Format("udf executor close failed: %s", ex.what()));
+			} catch (const std::exception &ex) {
+				SetSlotError(slot, StringUtil::Format("udf executor close failed: %s", ex.what()));
+			}
+			slot.py_executor.reset();
+			slot.py_executor_initialized = false;
+		}
+		slot.actor_handles.reset();
+		{
+			lock_guard<mutex> guard(slot.cmd_lock);
+			slot.cmd_queue.clear();
+		}
+		slot.rows_by_submit_id.clear();
+		slot.terminal_submit_ids.clear();
+		slot.ref_inputs_by_submit_id.clear();
+		{
+			lock_guard<mutex> guard(slot.task_admission_lock);
+			slot.task_admission_request_pending = false;
+			slot.task_admission_available = false;
+			slot.task_admission_reserved = false;
+			slot.task_admission_retained_input_bytes = 0;
+		}
+		{
+			lock_guard<mutex> guard(slot.consumer_lock);
+			slot.has_output_consumer = false;
+			slot.output_consumer = {};
+		}
+		{
+			lock_guard<mutex> guard(slot.wakeup_lock);
+			slot.has_interrupt_state = false;
+			slot.wakeup_callback = nullptr;
+		}
+		slot.inflight_count.store(0);
+		slot.finished_submitting_acked.store(true);
+		slot.all_tasks_finished.store(true);
+	}
+
 	bool CleanupSlot(uint64_t id) {
 		shared_ptr<ExecutorSlot> slot;
 		{
@@ -1950,10 +1993,12 @@ private:
 			PythonGILWrapper gil;
 			slot_ptr->cleanup_cancel_requested.store(true);
 			auto cancel_status = CancelUDFStreamResultCollectorSlot_WithGIL(*slot_ptr);
+			ReleaseSlotLocalResources_WithGIL(*slot_ptr);
 			if (cancel_status != UDFStreamResultCollectorSlotCancelStatus::COMPLETE) {
-				// A pending ticket owns its eventual wakeup. A synchronous
-				// ownership-handoff failure has no such event, so retain the
-				// slot and retry it on the dispatcher's bounded backoff clock.
+				// Keep only the lightweight retirement fence. A pending ticket
+				// owns its eventual wakeup; a synchronous ownership-handoff
+				// failure has no such event, so retry it on the dispatcher's
+				// bounded backoff clock.
 				if (cancel_status == UDFStreamResultCollectorSlotCancelStatus::RETRY) {
 					ScheduleCollectorCleanupRetry(*slot_ptr);
 				} else {
@@ -1962,21 +2007,7 @@ private:
 				return false;
 			}
 			ResetCollectorCleanupRetry(*slot_ptr);
-			if (slot_ptr->py_executor) {
-				try {
-					slot_ptr->py_executor->obj.attr("close")();
-				} catch (const py::error_already_set &ex) {
-					SetSlotError(*slot_ptr, StringUtil::Format("udf executor close failed: %s", ex.what()));
-				} catch (const std::exception &ex) {
-					SetSlotError(*slot_ptr, StringUtil::Format("udf executor close failed: %s", ex.what()));
-				}
-				slot_ptr->py_executor.reset();
-			}
-			slot_ptr->actor_handles.reset();
 		}
-		slot_ptr->rows_by_submit_id.clear();
-		slot_ptr->ref_inputs_by_submit_id.clear();
-		slot_ptr->inflight_count.store(0);
 		{
 			lock_guard<mutex> g(global_lock);
 			auto it = slots.find(id);
@@ -2178,23 +2209,10 @@ private:
 				ScheduleCollectorCleanupRetry(slot);
 			}
 		}
-		// Local executor close is independently idempotent and must not be
-		// skipped when process shutdown takes over a slot whose collector
-		// cancellation was already pending.
-		if (slot.py_executor) {
-			try {
-				slot.py_executor->obj.attr("close")();
-			} catch (const py::error_already_set &ex) {
-				SetSlotError(slot, StringUtil::Format("udf executor close failed: %s", ex.what()));
-			} catch (const std::exception &ex) {
-				SetSlotError(slot, StringUtil::Format("udf executor close failed: %s", ex.what()));
-			}
-		}
-		slot.rows_by_submit_id.clear();
-		slot.ref_inputs_by_submit_id.clear();
-		slot.inflight_count.store(0);
-		slot.finished_submitting_acked.store(true);
-		slot.all_tasks_finished.store(true);
+		// Local release is independently idempotent and must not be skipped
+		// when process shutdown takes over a slot whose collector cancellation
+		// was already pending.
+		ReleaseSlotLocalResources_WithGIL(slot);
 	}
 
 	bool MarkSlotAborted(ExecutorSlot &slot) {
