@@ -58,7 +58,7 @@ class FteWorkerEventHandlingMixin:
     ) -> list[Any]:
         """Fence a failed worker before queued work can observe it as live."""
 
-        failed_worker_ids = quarantine_fte_worker(
+        quarantine_fte_worker(
             failure.worker_id,
             manager_instance_id=self.manager_instance_id,
             worker_incarnation_id=failure.worker_incarnation_id,
@@ -69,7 +69,6 @@ class FteWorkerEventHandlingMixin:
             retire_fte_worker_for_failure(
                 failure.worker_id,
                 failure,
-                failed_worker_ids=failed_worker_ids,
                 manager_instance_id=self.manager_instance_id,
                 worker_incarnation_id=failure.worker_incarnation_id,
             )
@@ -91,12 +90,11 @@ class FteWorkerEventHandlingMixin:
             self._bind_fte_scheduler_handlers(scheduler)
             scheduler.enqueue(
                 WorkerFailed(
-                    query_id,
-                    failure.worker_id,
-                    failure,
-                    failed_worker_ids=failed_worker_ids,
-                    manager_instance_id=self.manager_instance_id,
+                    query_id=query_id,
+                    worker_id=failure.worker_id,
                     worker_incarnation_id=failure.worker_incarnation_id,
+                    manager_instance_id=self.manager_instance_id,
+                    error=failure,
                 ),
                 # Control failures happen inside an active drain.  Reconcile
                 # them before reservation completions already in that queue.

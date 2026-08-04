@@ -4481,6 +4481,10 @@ def test_fte_output_publication_is_bounded_by_block_target_and_task_window():
 
 
 class _RequiredFteWorkerCallbacks:
+    @property
+    def worker_incarnation_id(self):
+        return f"incarnation-{self.worker_id}"
+
     def fte_cancel_task(self, _task_id):
         return {
             "state": "CANCELED",
@@ -4490,7 +4494,7 @@ class _RequiredFteWorkerCallbacks:
             },
         }
 
-    def mark_fte_worker_failed(self, _worker_id, _error):
+    def mark_fte_worker_failed(self, _worker_id, _error, *, worker_incarnation_id):
         return []
 
     def handle_fte_task_status(self, _status):
@@ -4784,6 +4788,8 @@ def test_fte_terminal_record_failure_is_not_masked_by_adopted_result():
 
 def test_fte_worker_task_handle_requires_status_wait_protocol():
     class _StatusOnlyWorker(_RequiredFteWorkerCallbacks):
+        worker_id = "worker-without-status-wait"
+
         def fte_get_task_status(self, task_id):
             return {"state": "FINISHED", "task_id": task_id, "stats": [1]}
 
@@ -4798,8 +4804,24 @@ def test_fte_worker_task_handle_requires_worker_id():
             return {"state": "FINISHED", "task_id": task_id, "stats": [1]}
 
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    with pytest.raises(RuntimeError, match="non-empty worker_id"):
+    with pytest.raises(AttributeError, match="worker_id"):
         driver.FteWorkerTaskHandle(task_id, _NoWorkerIdWorker())
+
+
+def test_fte_worker_task_handle_requires_worker_incarnation_id():
+    class _NoWorkerIncarnationIdWorker(_RequiredFteWorkerCallbacks):
+        worker_id = "worker-without-incarnation"
+
+        @property
+        def worker_incarnation_id(self):
+            raise AttributeError("worker_incarnation_id")
+
+        def fte_wait_task_status(self, task_id, _min_version, _timeout_s):
+            return {"state": "FINISHED", "task_id": task_id, "stats": [1]}
+
+    task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
+    with pytest.raises(AttributeError, match="worker_incarnation_id"):
+        driver.FteWorkerTaskHandle(task_id, _NoWorkerIncarnationIdWorker())
 
 
 def test_fte_worker_task_handle_finishes_with_result_payload():
@@ -5133,7 +5155,7 @@ def test_fte_worker_task_handle_malformed_status_fails_worker_and_records_termin
                 "version": 1,
             }
 
-        def mark_fte_worker_failed(self, worker_id, error):
+        def mark_fte_worker_failed(self, worker_id, error, *, worker_incarnation_id):
             self.worker_failures.append((worker_id, error))
             return []
 
@@ -5168,7 +5190,7 @@ def test_fte_worker_task_handle_preserves_ray_oom_type_when_publishing_worker_fa
         def fte_wait_task_status(self, _task_id, _min_version, _timeout_s):
             raise self.error
 
-        def mark_fte_worker_failed(self, worker_id, error):
+        def mark_fte_worker_failed(self, worker_id, error, *, worker_incarnation_id):
             self.worker_failures.append((worker_id, error))
             return []
 
@@ -5192,7 +5214,14 @@ def test_fte_worker_task_handle_preserves_ray_oom_type_when_publishing_worker_fa
     assert published_error.__cause__ is oom_error
     from duckdb.runners.ray.fte_fragment_scheduler import _worker_failure_payload
 
-    assert _worker_failure_payload(worker_id, published_error)["error_code"] == "OUT_OF_MEMORY"
+    assert (
+        _worker_failure_payload(
+            worker_id,
+            published_error,
+            worker_incarnation_id=worker.worker_incarnation_id,
+        )["error_code"]
+        == "OUT_OF_MEMORY"
+    )
     assert worker.terminal_attempts == ["q.1.2.0"]
 
 
@@ -5212,7 +5241,7 @@ def test_fte_worker_task_handle_publishes_failure_with_unprintable_message():
         def fte_wait_task_status(self, _task_id, _min_version, _timeout_s):
             raise self.error
 
-        def mark_fte_worker_failed(self, worker_id, error):
+        def mark_fte_worker_failed(self, worker_id, error, *, worker_incarnation_id):
             self.worker_failures.append((worker_id, error))
             return []
 
@@ -5257,7 +5286,7 @@ def test_fte_worker_task_handle_rejects_mismatched_status_identity():
                 "version": 1,
             }
 
-        def mark_fte_worker_failed(self, worker_id, error):
+        def mark_fte_worker_failed(self, worker_id, error, *, worker_incarnation_id):
             self.worker_failures.append((worker_id, error))
             return []
 
@@ -5289,7 +5318,7 @@ def test_fte_worker_task_handle_treats_query_deadline_as_hard_failure():
         def fte_wait_task_status(self, _task_id, _min_version, _timeout_s):
             raise QueryDeadlineExceeded("query deadline expired before Ray ObjectRef get")
 
-        def mark_fte_worker_failed(self, worker_id, error):
+        def mark_fte_worker_failed(self, worker_id, error, *, worker_incarnation_id):
             self.worker_failures.append((worker_id, error))
             return []
 
@@ -5418,7 +5447,7 @@ def test_fte_worker_task_handle_publishes_worker_loss_without_adopting_retry():
             self.calls.append(("wait", task_id, min_version, timeout_s))
             raise RuntimeError("actor lost")
 
-        def mark_fte_worker_failed(self, worker_id, error):
+        def mark_fte_worker_failed(self, worker_id, error, *, worker_incarnation_id):
             self.calls.append(("mark_failed", worker_id, error))
             return [
                 driver.FteWorkerTaskHandle(
@@ -5477,7 +5506,7 @@ def test_fte_worker_task_handle_does_not_pop_scheduler_result_registry_after_wor
         def fte_wait_task_status(self, _task_id, _min_version, _timeout_s):
             raise RuntimeError("actor lost")
 
-        def mark_fte_worker_failed(self, _worker_id, _error):
+        def mark_fte_worker_failed(self, _worker_id, _error, *, worker_incarnation_id):
             return []
 
         def pop_fte_result_handle_for_task(self, task_id):

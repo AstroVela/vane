@@ -323,29 +323,30 @@ class FteWorkerLifecycleMixin:
         scheduler.enqueue(SourceInputExhausted.from_source_node_ids(query_id, exhausted_sources))
         return scheduler.drain()
 
-    def mark_fte_worker_failed(self, worker_id: str | None = None, error: Any = None) -> list[Any]:
-        failed_worker_id = str(worker_id or self.worker_id or "")
+    def mark_fte_worker_failed(
+        self,
+        worker_id: str,
+        error: Any,
+        *,
+        worker_incarnation_id: str,
+    ) -> list[Any]:
+        failed_worker_id = str(worker_id)
         if not failed_worker_id:
-            return []
-        if failed_worker_id == str(self.worker_id or ""):
-            worker_incarnation_id = self.worker_incarnation_id
-        else:
-            with _FTE_REGISTRY_LOCK:
-                failed_handle = _FTE_WORKER_HANDLES.get(failed_worker_id)
-                worker_incarnation_id = getattr(failed_handle, "worker_incarnation_id", None)
+            raise ValueError("worker_id must be non-empty")
+        worker_incarnation_id = str(worker_incarnation_id)
+        if not worker_incarnation_id:
+            raise ValueError("worker_incarnation_id must be non-empty")
         failure = _worker_failure_payload(
             failed_worker_id,
             error,
             worker_incarnation_id=worker_incarnation_id,
         )
-        failed_worker_ids = frozenset({failed_worker_id})
         query_ids = fte_fragment_execution_query_ids()
         query_ids.update(_FTE_SCHEDULERS.query_ids())
         if query_ids:
             retire_fte_worker_for_failure(
                 failed_worker_id,
                 error,
-                failed_worker_ids=failed_worker_ids,
                 manager_instance_id=self.manager_instance_id,
                 worker_incarnation_id=worker_incarnation_id,
             )
@@ -361,12 +362,11 @@ class FteWorkerLifecycleMixin:
             self._bind_fte_scheduler_handlers(scheduler)
             scheduler.enqueue(
                 WorkerFailed(
-                    query_id,
-                    failed_worker_id,
-                    failure,
-                    failed_worker_ids=failed_worker_ids,
-                    manager_instance_id=self.manager_instance_id,
+                    query_id=query_id,
+                    worker_id=failed_worker_id,
                     worker_incarnation_id=worker_incarnation_id,
+                    manager_instance_id=self.manager_instance_id,
+                    error=failure,
                 )
             )
             handles.extend(scheduler.drain())
@@ -486,6 +486,7 @@ class FteWorkerLifecycleMixin:
                 self.mark_fte_worker_failed(
                     self.worker_id,
                     RuntimeError(f"FTE worker shutdown: {self.worker_id}"),
+                    worker_incarnation_id=self.worker_incarnation_id,
                 )
             except Exception:
                 pass

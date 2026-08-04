@@ -75,19 +75,23 @@ class FteWorkerControlFailure(RuntimeError):
     def __init__(
         self,
         *,
-        worker_id: str | None,
+        worker_id: str,
+        worker_incarnation_id: str,
         attempt_id: FteTaskAttemptId,
         method_name: str,
         cause: BaseException,
-        worker_incarnation_id: str | None = None,
     ) -> None:
-        self.worker_id = str(worker_id or "")
-        self.worker_incarnation_id = None if worker_incarnation_id is None else str(worker_incarnation_id)
+        self.worker_id = str(worker_id)
+        if not self.worker_id:
+            raise ValueError("FTE worker control failure requires a non-empty worker_id")
+        self.worker_incarnation_id = str(worker_incarnation_id)
+        if not self.worker_incarnation_id:
+            raise ValueError("FTE worker control failure requires a non-empty worker_incarnation_id")
         self.attempt_id = attempt_id
         self.method_name = str(method_name)
         self.cause = cause
         super().__init__(
-            f"FTE worker {self.worker_id or '<unknown>'} failed during "
+            f"FTE worker {self.worker_id} failed during "
             f"{self.method_name} for {self.attempt_id}: {_safe_failure_message(cause)}"
         )
 
@@ -199,7 +203,8 @@ class FteTaskPartition:
         self,
         *,
         sink_instance: Any = None,
-        worker_id: str | None = None,
+        worker_id: str,
+        worker_incarnation_id: str,
         remote_handle: Any = None,
     ) -> ScheduledAttempt:
         if self.finished or self.failed:
@@ -223,7 +228,7 @@ class FteTaskPartition:
         self.running_attempts[attempt_number] = RunningAttempt(
             attempt_id,
             worker_id=worker_id,
-            worker_incarnation_id=getattr(remote_handle, "worker_incarnation_id", None),
+            worker_incarnation_id=worker_incarnation_id,
             remote_handle=remote_handle,
             sink_instance=sink_instance,
         )
@@ -458,7 +463,6 @@ class FteFragmentExecution:
         logical_fragment_identity: str | None = None,
         stable_task_identity_callback: Callable[[int, str], None] | None = None,
         worker: Any = None,
-        worker_id: str | None = None,
         worker_selector: Callable[[FteTaskPartition], Any] | None = None,
         execution_class_transition_callback: Callable[[list[ExecutionClassTransition]], None] | None = None,
         execution_admission_callback: Callable[[FteTaskPartition], bool] | None = None,
@@ -494,7 +498,6 @@ class FteFragmentExecution:
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
         self.worker = worker
-        self.worker_id = worker_id
         self.worker_selector = worker_selector
         self.execution_class_transition_callback = execution_class_transition_callback
         self.execution_admission_callback = execution_admission_callback
@@ -883,10 +886,10 @@ class FteFragmentExecution:
         worker_id: str,
         retryable_by_partition_id: Mapping[int, bool] | None = None,
         *,
-        worker_incarnation_id: str | None = None,
+        worker_incarnation_id: str,
     ) -> bool:
         worker_id = str(worker_id)
-        worker_incarnation_id = None if worker_incarnation_id is None else str(worker_incarnation_id)
+        worker_incarnation_id = str(worker_incarnation_id)
         with self._state_lock:
             for partition in self.partitions.values():
                 if retryable_by_partition_id is not None and not bool(
@@ -894,8 +897,7 @@ class FteFragmentExecution:
                 ):
                     continue
                 if any(
-                    running.worker_id == worker_id
-                    and (worker_incarnation_id is None or running.worker_incarnation_id == worker_incarnation_id)
+                    running.worker_id == worker_id and running.worker_incarnation_id == worker_incarnation_id
                     for running in partition.running_attempts.values()
                 ):
                     return True
@@ -1380,20 +1382,19 @@ class FteFragmentExecution:
         worker_id: str,
         error: Mapping[str, Any],
         *,
-        worker_incarnation_id: str | None = None,
+        worker_incarnation_id: str,
         retryable: bool = True,
         retryable_by_partition_id: Mapping[int, bool] | None = None,
         schedule_retries: bool = True,
     ) -> list[ScheduledAttempt]:
         worker_id = str(worker_id)
-        worker_incarnation_id = None if worker_incarnation_id is None else str(worker_incarnation_id)
+        worker_incarnation_id = str(worker_incarnation_id)
         with self._state_lock:
             failed_attempts = [
                 (running.attempt_id, int(partition.task_id.partition_id))
                 for partition in self.partitions.values()
                 for running in partition.running_attempts.values()
-                if running.worker_id == worker_id
-                and (worker_incarnation_id is None or running.worker_incarnation_id == worker_incarnation_id)
+                if running.worker_id == worker_id and running.worker_incarnation_id == worker_incarnation_id
             ]
         scheduled: list[ScheduledAttempt] = []
         for attempt, partition_id in failed_attempts:
@@ -1566,6 +1567,7 @@ class FteFragmentExecution:
         scheduled = partition.start_attempt(
             sink_instance=sink_instance,
             worker_id=worker_id,
+            worker_incarnation_id=worker.worker_incarnation_id,
             remote_handle=worker,
         )
         registration_result = worker.ensure_fragment_registered(
@@ -1617,23 +1619,22 @@ class FteFragmentExecution:
         else:
             raise TypeError(f"unsupported FTE worker command: {type(command).__name__}")
         return FteWorkerControlFailure(
-            worker_id=command.worker_id,
+            worker_id=str(command.worker.worker_id),
             attempt_id=command.attempt_id,
             method_name=method_name,
             cause=exc,
-            worker_incarnation_id=getattr(command.worker, "worker_incarnation_id", None),
+            worker_incarnation_id=command.worker.worker_incarnation_id,
         )
 
-    def _select_worker(self, partition: FteTaskPartition) -> tuple[str | None, Any]:
+    def _select_worker(self, partition: FteTaskPartition) -> tuple[str, Any]:
         if self.worker_selector is not None:
             selected = self.worker_selector(partition)
             if isinstance(selected, tuple) and len(selected) == 2:
-                return selected[0], selected[1]
-            worker_id = getattr(selected, "worker_id", None)
-            return worker_id, selected
+                return str(selected[0]), selected[1]
+            return str(selected.worker_id), selected
         if self.worker is None:
             raise RuntimeError("FteFragmentExecution requires a worker or worker_selector")
-        return self.worker_id, self.worker
+        return str(self.worker.worker_id), self.worker
 
     @staticmethod
     def _attempt_id_from_status(status: Mapping[str, Any]) -> FteTaskAttemptId:

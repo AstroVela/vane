@@ -3025,6 +3025,7 @@ def test_ray_worker_manager_replaces_failure_retired_worker_before_shutdown(monk
                 failed_worker_id,
                 {"error_code": "WORKER_LOST", "message": "status RPC failed"},
                 manager_instance_id=handles[0].manager_instance_id,
+                worker_incarnation_id=handles[0].worker_incarnation_id,
             )
             == []
         )
@@ -3090,7 +3091,7 @@ def test_ray_worker_failure_retirement_survives_query_close_and_stale_event(monk
             scheduler = ray_worker_handle._FTE_SCHEDULERS.get_or_create(query_id)
             failed_handle._bind_fte_scheduler_handlers(scheduler)
 
-        failed_worker_ids = worker_failures.quarantine_fte_worker(
+        worker_failures.quarantine_fte_worker(
             failed_worker_id,
             manager_instance_id=failed_handle.manager_instance_id,
             worker_incarnation_id=failed_handle.worker_incarnation_id,
@@ -3099,12 +3100,11 @@ def test_ray_worker_failure_retirement_survives_query_close_and_stale_event(monk
             ray_worker_handle._FTE_CLOSING_QUERIES.add(closing_query_id)
 
         closing_event = WorkerFailed(
-            closing_query_id,
-            failed_worker_id,
-            RuntimeError("planned worker failure during query close"),
-            failed_worker_ids=failed_worker_ids,
-            manager_instance_id=failed_handle.manager_instance_id,
+            query_id=closing_query_id,
+            worker_id=failed_worker_id,
             worker_incarnation_id=failed_handle.worker_incarnation_id,
+            manager_instance_id=failed_handle.manager_instance_id,
+            error=RuntimeError("planned worker failure during query close"),
         )
         assert worker_failures.mark_fte_worker_failed_for_event(closing_event) == []
         assert actors[0].killed
@@ -3115,14 +3115,14 @@ def test_ray_worker_failure_retirement_survives_query_close_and_stale_event(monk
         assert start_calls == [(), ()]
         assert len(handles) == 2
         replacement = handles[1]
+        assert replacement.worker_incarnation_id != failed_handle.worker_incarnation_id
 
         delayed_event = WorkerFailed(
-            delayed_query_id,
-            failed_worker_id,
-            closing_event.error,
-            failed_worker_ids=failed_worker_ids,
-            manager_instance_id=failed_handle.manager_instance_id,
+            query_id=delayed_query_id,
+            worker_id=failed_worker_id,
             worker_incarnation_id=failed_handle.worker_incarnation_id,
+            manager_instance_id=failed_handle.manager_instance_id,
+            error=closing_event.error,
         )
         assert worker_failures.mark_fte_worker_failed_for_event(delayed_event) == []
         assert ray_worker_handle._FTE_WORKER_HANDLES[failed_worker_id] is replacement
@@ -3188,6 +3188,7 @@ def test_ray_worker_manager_replaces_worker_after_quiescence_failure(monkeypatch
                 failed_worker_id,
                 {"error_code": "WORKER_LOST", "message": "status RPC failed"},
                 manager_instance_id=handles[0].manager_instance_id,
+                worker_incarnation_id=handles[0].worker_incarnation_id,
             )
 
         assert actors[0].shutdown_calls == ["prepare"]
@@ -3225,6 +3226,7 @@ def test_ray_worker_manager_does_not_commit_worker_retired_during_refresh(monkey
                 self.worker_id,
                 {"error_code": "WORKER_LOST", "message": "failed during refresh"},
                 manager_instance_id=self.manager_instance_id,
+                worker_incarnation_id=self.worker_incarnation_id,
             )
 
     start_calls = []
@@ -3257,6 +3259,7 @@ def test_ray_worker_manager_does_not_commit_worker_retired_during_refresh(monkey
                 worker_id,
                 {"error_code": "WORKER_LOST", "message": "failed before callback installation"},
                 manager_instance_id=manager_instance_id,
+                worker_incarnation_id=handle.worker_incarnation_id,
             )
         return [runtime]
 
@@ -3346,6 +3349,7 @@ def test_ray_worker_failure_retirement_is_linearized_with_manager_shutdown(monke
                 failed_worker_id,
                 {"error_code": "WORKER_LOST", "message": "status RPC failed"},
                 manager_instance_id=failed_handle.manager_instance_id,
+                worker_incarnation_id=failed_handle.worker_incarnation_id,
             )
         except BaseException as exc:
             failure_errors.append(exc)

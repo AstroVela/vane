@@ -23,11 +23,11 @@ class ReadyTask:
 @dataclass(frozen=True)
 class RunningAttempt:
     attempt_id: FteTaskAttemptId
-    worker_id: str | None = None
+    worker_incarnation_id: str
+    worker_id: str
     remote_handle: Any = None
     sink_instance: Any = None
     started_at: float = field(default_factory=time.time)
-    worker_incarnation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -35,8 +35,8 @@ class ScheduledAttempt:
     attempt_id: FteTaskAttemptId
     descriptor: TaskDescriptor
     request: dict[str, Any]
+    worker_id: str
     sink_instance: Any = None
-    worker_id: str | None = None
 
 
 @dataclass(frozen=True)

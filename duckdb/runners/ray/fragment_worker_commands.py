@@ -54,9 +54,9 @@ def _fte_command_debug_log(event: str, **fields: Any) -> None:
 
 
 def _fte_worker_command_debug_fields(command: Any) -> dict[str, str]:
-    worker = getattr(command, "worker", None)
+    worker = command.worker
     return {
-        "worker_id": str(getattr(command, "worker_id", None) or getattr(worker, "worker_id", "") or ""),
+        "worker_id": str(command.worker_id),
         "manager_instance_id": str(getattr(worker, "manager_instance_id", "") or ""),
         "node_id": str(getattr(worker, "node_id", "") or ""),
         "host": str(getattr(worker, "host", "") or ""),
@@ -85,7 +85,7 @@ class FteWorkerCommandDispatchResult:
 
     @property
     def failed_worker_ids(self) -> frozenset[str]:
-        return frozenset(failure.worker_id for failure in self.failures if failure.worker_id)
+        return frozenset(failure.worker_id for failure in self.failures)
 
 
 class FteWorkerCommandMixin:
@@ -115,12 +115,10 @@ class FteWorkerCommandMixin:
             attempt_id = getattr(command, "attempt_id", None)
             if attempt_id is not None and str(attempt_id) in terminal_attempts:
                 continue
-            worker_id = str(getattr(command, "worker_id", None) or "")
-            worker_key: tuple[str, Any]
-            if worker_id:
-                worker_key = ("worker_id", worker_id)
-            else:
-                worker_key = ("worker_handle", id(getattr(command, "worker", None)))
+            worker_id = str(command.worker_id)
+            if not worker_id:
+                raise ValueError("FTE worker command requires a non-empty worker_id")
+            worker_key: tuple[str, Any] = ("worker_id", worker_id)
             worker_debug_fields = _fte_worker_command_debug_fields(command)
             if worker_key in failed_worker_keys:
                 _fte_command_debug_log(
@@ -256,25 +254,19 @@ class FteWorkerCommandMixin:
                 end_fte_registry_operation(query_id)
 
         recovery_handles: list[Any] = []
-        unknown_worker_failure: FteWorkerControlFailure | None = None
         for failure in failures:
-            if not failure.worker_id:
-                unknown_worker_failure = unknown_worker_failure or failure
-                continue
             recovery_handles.extend(self._handles_for_fte_worker_control_failure(failure))
 
         if abort_error is not None:
             raise abort_error
-        if unknown_worker_failure is not None:
-            raise unknown_worker_failure from unknown_worker_failure.cause
 
-        failed_worker_ids = frozenset(failure.worker_id for failure in failures if failure.worker_id)
+        failed_worker_ids = frozenset(failure.worker_id for failure in failures)
         successful_scheduled_attempts: tuple[Any, ...] = ()
         if not query_closed:
             successful_scheduled_attempts = tuple(
                 scheduled_attempt
                 for scheduled_attempt in successful_create_attempts.values()
-                if str(scheduled_attempt.worker_id or "") not in failed_worker_ids
+                if scheduled_attempt.worker_id not in failed_worker_ids
             )
 
         return FteWorkerCommandDispatchResult(

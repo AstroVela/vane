@@ -1549,20 +1549,18 @@ def _worker_matches_failure_incarnation(
     worker_ids: set[str],
     worker_incarnation_ids: Mapping[str, str],
 ) -> bool:
-    worker_id = str(getattr(worker, "worker_id", ""))
+    worker_id = str(worker.worker_id)
     if worker_id not in worker_ids:
         return False
-    expected_incarnation_id = worker_incarnation_ids.get(worker_id)
-    if expected_incarnation_id is None:
-        return True
-    return str(getattr(worker, "worker_incarnation_id", "")) == expected_incarnation_id
+    expected_incarnation_id = worker_incarnation_ids[worker_id]
+    return str(worker.worker_incarnation_id) == expected_incarnation_id
 
 
 def _select_replacement_fte_worker(
     exclude_worker_id: str | set[str],
     *,
-    exclude_worker_incarnation_ids: Mapping[str, str] | None = None,
-    manager_instance_id: str | None = None,
+    exclude_worker_incarnation_ids: Mapping[str, str],
+    manager_instance_id: str,
     memory_requirement_bytes: Any = None,
     execution_class: FteTaskExecutionClass | str | None = None,
     node_requirements: NodeRequirements | Mapping[str, Any] | None = None,
@@ -1574,8 +1572,7 @@ def _select_replacement_fte_worker(
         else {str(worker_id) for worker_id in exclude_worker_id}
     )
     excluded_incarnations = {
-        str(worker_id): str(incarnation_id)
-        for worker_id, incarnation_id in (exclude_worker_incarnation_ids or {}).items()
+        str(worker_id): str(incarnation_id) for worker_id, incarnation_id in exclude_worker_incarnation_ids.items()
     }
     with _FTE_REGISTRY_LOCK:
         candidates = [
@@ -1584,7 +1581,7 @@ def _select_replacement_fte_worker(
             if handle is not None
             and not _worker_matches_failure_incarnation(handle, exclude_worker_ids, excluded_incarnations)
             and handle._fte_healthy
-            and (manager_instance_id is None or str(getattr(handle, "manager_instance_id", "")) == manager_instance_id)
+            and str(handle.manager_instance_id) == manager_instance_id
         ]
     if not candidates:
         return None
@@ -1620,8 +1617,8 @@ def _select_replacement_fte_worker(
 def _has_replacement_fte_worker(
     exclude_worker_id: str | set[str],
     *,
-    exclude_worker_incarnation_ids: Mapping[str, str] | None = None,
-    manager_instance_id: str | None = None,
+    exclude_worker_incarnation_ids: Mapping[str, str],
+    manager_instance_id: str,
     node_requirements: NodeRequirements | Mapping[str, Any] | None = None,
     node_requirements_wait_started_at: float | None = None,
 ) -> bool:
@@ -1631,8 +1628,7 @@ def _has_replacement_fte_worker(
         else {str(worker_id) for worker_id in exclude_worker_id}
     )
     excluded_incarnations = {
-        str(worker_id): str(incarnation_id)
-        for worker_id, incarnation_id in (exclude_worker_incarnation_ids or {}).items()
+        str(worker_id): str(incarnation_id) for worker_id, incarnation_id in exclude_worker_incarnation_ids.items()
     }
     with _FTE_REGISTRY_LOCK:
         candidates = [
@@ -1641,7 +1637,7 @@ def _has_replacement_fte_worker(
             if handle is not None
             and not _worker_matches_failure_incarnation(handle, exclude_worker_ids, excluded_incarnations)
             and handle._fte_healthy
-            and (manager_instance_id is None or str(getattr(handle, "manager_instance_id", "")) == manager_instance_id)
+            and str(handle.manager_instance_id) == manager_instance_id
         ]
     return bool(
         _filter_workers_for_node_requirements(
@@ -2288,7 +2284,7 @@ def _worker_failure_payload(
     worker_id: str,
     error: Any,
     *,
-    worker_incarnation_id: str | None = None,
+    worker_incarnation_id: str,
 ) -> dict[str, Any]:
     if error is not None and not issubclass(type(error), BaseException):
         if isinstance(error, Mapping):
@@ -2307,21 +2303,22 @@ def _worker_failure_payload(
             error if error is not None else f"FTE worker lost: {worker_id}",
             error_type="EXTERNAL",
         )
-    worker_id = str(worker_id or "")
+    worker_id = str(worker_id)
+    if not worker_id:
+        raise ValueError("worker_id must be non-empty")
+    worker_incarnation_id = str(worker_incarnation_id)
+    if not worker_incarnation_id:
+        raise ValueError("worker_incarnation_id must be non-empty")
     failure["worker_id"] = worker_id
-    if worker_incarnation_id is not None:
-        failure["worker_incarnation_id"] = str(worker_incarnation_id)
+    failure["worker_incarnation_id"] = worker_incarnation_id
     with _FTE_REGISTRY_LOCK:
         handle = _FTE_WORKER_HANDLES.get(worker_id)
-        if handle is not None and (
-            worker_incarnation_id is None
-            or str(getattr(handle, "worker_incarnation_id", "")) == str(worker_incarnation_id)
-        ):
+        if handle is not None and str(handle.worker_incarnation_id) == worker_incarnation_id:
             failure.update(
                 {
-                    "manager_instance_id": str(getattr(handle, "manager_instance_id", "")),
-                    "node_id": str(getattr(handle, "node_id", "")),
-                    "host": str(getattr(handle, "host", "")),
+                    "manager_instance_id": str(handle.manager_instance_id),
+                    "node_id": str(handle.node_id),
+                    "host": str(handle.host),
                 }
             )
     return failure
@@ -2329,10 +2326,10 @@ def _worker_failure_payload(
 
 def _query_ids_owned_by_fte_workers(
     worker_ids: set[str],
-    worker_incarnation_ids: Mapping[str, str] | None = None,
+    worker_incarnation_ids: Mapping[str, str],
 ) -> set[str]:
     normalized_incarnation_ids = {
-        str(worker_id): str(incarnation_id) for worker_id, incarnation_id in (worker_incarnation_ids or {}).items()
+        str(worker_id): str(incarnation_id) for worker_id, incarnation_id in worker_incarnation_ids.items()
     }
     with _FTE_REGISTRY_LOCK:
         fragment_execution_items = list(_FTE_FRAGMENT_EXECUTIONS.items())
@@ -2345,7 +2342,7 @@ def _query_ids_owned_by_fte_workers(
         if any(
             fragment_execution.has_retryable_running_attempt_on_worker(
                 worker_id,
-                worker_incarnation_id=normalized_incarnation_ids.get(worker_id),
+                worker_incarnation_id=normalized_incarnation_ids[worker_id],
             )
             for worker_id in worker_ids
         ):
@@ -2356,7 +2353,7 @@ def _query_ids_owned_by_fte_workers(
 def _running_partition_requirements_on_fte_workers(
     worker_ids: set[str],
     *,
-    worker_incarnation_ids: Mapping[str, str] | None = None,
+    worker_incarnation_ids: Mapping[str, str],
     query_id_filter: str | None = None,
 ) -> dict[
     tuple[str, str, int],
@@ -2369,7 +2366,7 @@ def _running_partition_requirements_on_fte_workers(
             if query_id_filter is None or item[0][0] == query_id_filter
         ]
     normalized_incarnation_ids = {
-        str(worker_id): str(incarnation_id) for worker_id, incarnation_id in (worker_incarnation_ids or {}).items()
+        str(worker_id): str(incarnation_id) for worker_id, incarnation_id in worker_incarnation_ids.items()
     }
     requirements = {}
     for (query_id, fragment_id), fragment_execution in fragment_execution_items:
@@ -2407,27 +2404,23 @@ def _mark_fte_worker_failed(
     failure: Mapping[str, Any],
     *,
     query_id_filter: str | None = None,
-    failed_worker_ids_override: set[str] | frozenset[str] | None = None,
-    manager_instance_id: str | None = None,
-    worker_incarnation_id: str | None = None,
+    manager_instance_id: str,
+    worker_incarnation_id: str,
     primary_worker_process_terminated: bool = False,
     reconcile_query: bool = True,
 ) -> list[tuple[str, str, list[Any], list[Any]]]:
-    worker_id = str(worker_id or "")
+    worker_id = str(worker_id)
     if not worker_id:
-        return []
+        raise ValueError("worker_id must be non-empty")
     failure = _normalize_failure_payload(failure)
     if query_id_filter is not None:
         query_id_filter = str(query_id_filter)
-    # Preserve "" as the explicit legacy scope; None alone is unscoped.
-    normalized_manager_instance_id = None if manager_instance_id is None else str(manager_instance_id or "").strip()
-    failed_worker_ids = (
-        {str(item) for item in failed_worker_ids_override} if failed_worker_ids_override is not None else {worker_id}
-    )
-    normalized_worker_incarnation_id = None if worker_incarnation_id is None else str(worker_incarnation_id)
-    failed_worker_incarnation_ids = (
-        {worker_id: normalized_worker_incarnation_id} if normalized_worker_incarnation_id is not None else {}
-    )
+    normalized_manager_instance_id = str(manager_instance_id).strip()
+    failed_worker_ids = {worker_id}
+    worker_incarnation_id = str(worker_incarnation_id)
+    if not worker_incarnation_id:
+        raise ValueError("worker_incarnation_id must be non-empty")
+    failed_worker_incarnation_ids = {worker_id: worker_incarnation_id}
     failed_handles: dict[str, RayWorkerActorHandle] = {}
     with _FTE_REGISTRY_LOCK:
         for failed_worker_id in sorted(failed_worker_ids):
@@ -2440,10 +2433,8 @@ def _mark_fte_worker_failed(
                 failed_worker_incarnation_ids,
             ):
                 continue
-            failed_handle_manager_instance_id = str(getattr(failed_handle, "manager_instance_id", ""))
-            if normalized_manager_instance_id is None:
-                normalized_manager_instance_id = failed_handle_manager_instance_id
-            elif failed_handle_manager_instance_id != normalized_manager_instance_id:
+            failed_handle_manager_instance_id = str(failed_handle.manager_instance_id)
+            if failed_handle_manager_instance_id != normalized_manager_instance_id:
                 continue
             failed_handle._fte_healthy = False
             failed_handles[failed_worker_id] = failed_handle
@@ -2460,10 +2451,7 @@ def _mark_fte_worker_failed(
             failed_worker_incarnation_ids,
         ):
             return False
-        if (
-            normalized_manager_instance_id is not None
-            and str(getattr(failed_handle, "manager_instance_id", "")) != normalized_manager_instance_id
-        ):
+        if str(failed_handle.manager_instance_id) != normalized_manager_instance_id:
             return False
         failed_handle._fte_healthy = False
         retire_from_manager = getattr(failed_handle, "_retire_from_manager_for_failure", None)
@@ -2661,7 +2649,7 @@ def _mark_fte_worker_failed(
             fragment_execution.has_retryable_running_attempt_on_worker(
                 failed_worker_id,
                 retryable_by_partition_id,
-                worker_incarnation_id=failed_worker_incarnation_ids.get(failed_worker_id),
+                worker_incarnation_id=failed_worker_incarnation_ids[failed_worker_id],
             )
             for failed_worker_id in failed_worker_ids
         )
@@ -2672,7 +2660,7 @@ def _mark_fte_worker_failed(
             scheduled = fragment_execution.mark_worker_failed(
                 failed_worker_id,
                 failure,
-                worker_incarnation_id=failed_worker_incarnation_ids.get(failed_worker_id),
+                worker_incarnation_id=failed_worker_incarnation_ids[failed_worker_id],
                 retryable=True,
                 retryable_by_partition_id=retryable_by_partition_id,
                 schedule_retries=False,

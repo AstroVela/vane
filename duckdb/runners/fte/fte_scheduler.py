@@ -320,10 +320,8 @@ class FteAttemptStatusWatcher:
 
     def _run(self) -> None:
         min_version = None
-        # Missing metadata belongs to the explicit legacy scope. None is
-        # reserved for events whose ownership is genuinely unknown.
-        manager_instance_id = str(getattr(self.worker, "manager_instance_id", ""))
-        worker_incarnation_id = getattr(self.worker, "worker_incarnation_id", None)
+        manager_instance_id = str(self.worker.manager_instance_id)
+        worker_incarnation_id = str(self.worker.worker_incarnation_id)
         while not self._stop.is_set():
             try:
                 status = self._wait_task_status(min_version)
@@ -336,11 +334,11 @@ class FteAttemptStatusWatcher:
                     continue
                 self._enqueue_and_drain(
                     WorkerFailed(
-                        self.scheduler.query_id,
-                        str(self.worker.worker_id),
-                        exc,
-                        manager_instance_id=manager_instance_id,
+                        query_id=self.scheduler.query_id,
+                        worker_id=str(self.worker.worker_id),
                         worker_incarnation_id=worker_incarnation_id,
+                        manager_instance_id=manager_instance_id,
+                        error=exc,
                     )
                 )
                 return
@@ -349,11 +347,11 @@ class FteAttemptStatusWatcher:
             if not isinstance(status, dict):
                 self._enqueue_and_drain(
                     WorkerFailed(
-                        self.scheduler.query_id,
-                        str(self.worker.worker_id),
-                        TypeError("fte_wait_task_status must return a dict"),
-                        manager_instance_id=manager_instance_id,
+                        query_id=self.scheduler.query_id,
+                        worker_id=str(self.worker.worker_id),
                         worker_incarnation_id=worker_incarnation_id,
+                        manager_instance_id=manager_instance_id,
+                        error=TypeError("fte_wait_task_status must return a dict"),
                     )
                 )
                 return
@@ -362,11 +360,11 @@ class FteAttemptStatusWatcher:
             except Exception as exc:
                 self._enqueue_and_drain(
                     WorkerFailed(
-                        self.scheduler.query_id,
-                        str(self.worker.worker_id),
-                        exc,
-                        manager_instance_id=manager_instance_id,
+                        query_id=self.scheduler.query_id,
+                        worker_id=str(self.worker.worker_id),
                         worker_incarnation_id=worker_incarnation_id,
+                        manager_instance_id=manager_instance_id,
+                        error=exc,
                     )
                 )
                 return
@@ -382,11 +380,11 @@ class FteAttemptStatusWatcher:
             except (TypeError, ValueError):
                 self._enqueue_and_drain(
                     WorkerFailed(
-                        self.scheduler.query_id,
-                        str(self.worker.worker_id),
-                        ValueError(f"unknown FTE task state: {raw_state!r}"),
-                        manager_instance_id=manager_instance_id,
+                        query_id=self.scheduler.query_id,
+                        worker_id=str(self.worker.worker_id),
                         worker_incarnation_id=worker_incarnation_id,
+                        manager_instance_id=manager_instance_id,
+                        error=ValueError(f"unknown FTE task state: {raw_state!r}"),
                     )
                 )
                 return
@@ -775,22 +773,16 @@ class FteQueryScheduler:
 
     def record_worker_failure(
         self,
-        worker_ids: set[str] | frozenset[str] | list[str] | tuple[str, ...],
+        worker_id: str,
         *,
-        worker_incarnation_id: str | None = None,
-    ) -> frozenset[str]:
-        normalized = frozenset(str(worker_id) for worker_id in worker_ids if str(worker_id))
-        if not normalized:
-            return frozenset()
-        incarnation_id = "" if worker_incarnation_id is None else str(worker_incarnation_id)
+        worker_incarnation_id: str,
+    ) -> bool:
+        failure_identity = (str(worker_id), str(worker_incarnation_id))
         with self._lock:
-            new_worker_ids = frozenset(
-                worker_id
-                for worker_id in normalized
-                if (worker_id, incarnation_id) not in self._failed_worker_incarnations
-            )
-            self._failed_worker_incarnations.update((worker_id, incarnation_id) for worker_id in new_worker_ids)
-            return new_worker_ids
+            if failure_identity in self._failed_worker_incarnations:
+                return False
+            self._failed_worker_incarnations.add(failure_identity)
+            return True
 
     def retry_delay_generation(self) -> int:
         with self._lock:

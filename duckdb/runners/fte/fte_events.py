@@ -67,10 +67,9 @@ class TaskStatusChanged(FteEvent):
 @dataclass(frozen=True)
 class WorkerFailed(FteEvent):
     worker_id: str
+    worker_incarnation_id: str
+    manager_instance_id: str
     error: Any = None
-    failed_worker_ids: frozenset[str] | None = None
-    manager_instance_id: str | None = None
-    worker_incarnation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -139,7 +138,7 @@ class QueryAbort(FteEvent):
 class FteWorkerCommand:
     query_id: str
     fragment_id: str
-    worker_id: str | None
+    worker_id: str
     worker: Any
 
     @property
@@ -162,11 +161,10 @@ class FteCreateTaskCommand(FteWorkerCommand):
             )
         if self.scheduled_attempt.request is not self.request:
             raise ValueError("FTE create command must own its scheduled attempt request")
-        if str(self.scheduled_attempt.worker_id or "") != str(self.worker_id or ""):
+        if self.scheduled_attempt.worker_id != self.worker_id:
             raise ValueError(
                 "FTE create command scheduled worker mismatch: "
-                f"command={self.worker_id or '<unknown>'} "
-                f"scheduled={self.scheduled_attempt.worker_id or '<unknown>'}"
+                f"command={self.worker_id} scheduled={self.scheduled_attempt.worker_id}"
             )
 
 
