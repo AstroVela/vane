@@ -218,6 +218,7 @@ class FteWorkerCommandMixin:
                         quarantine_fte_worker(
                             failure.worker_id,
                             manager_instance_id=self.manager_instance_id,
+                            worker_incarnation_id=failure.worker_incarnation_id,
                         )
                     continue
                 try:

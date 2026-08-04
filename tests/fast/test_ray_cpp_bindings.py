@@ -3047,6 +3047,105 @@ def test_ray_worker_manager_replaces_failure_retired_worker_before_shutdown(monk
                 pass
 
 
+def test_ray_worker_failure_retirement_survives_query_close_and_stale_event(monkeypatch):
+    import duckdb.runners.ray.fragment_worker_failures as worker_failures
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    from duckdb.runners.fte.fte_events import WorkerFailed
+    from duckdb.runners.ray.fragment_worker_client import RayWorkerActorHandle
+
+    start_calls = []
+    handles = []
+    actors = []
+
+    def start_ray_workers(existing_ids, manager_instance_id):
+        start_calls.append(tuple(existing_ids))
+        worker_id = f"{manager_instance_id}:node-a:0"
+        if worker_id in existing_ids:
+            return []
+        actor = _FakeRayWorkerActor()
+        handle = RayWorkerActorHandle(
+            actor,
+            memory_capacity_bytes=1024,
+            node_id="node-a",
+            worker_id=worker_id,
+            manager_instance_id=manager_instance_id,
+        )
+        actors.append(actor)
+        handles.append(handle)
+        return [duckdb.ray_cxx.RayWorkerRuntime(worker_id, handle, 1.0, 0.0, 1024)]
+
+    def kill_actor(actor, **_kwargs):
+        actor.killed = True
+
+    monkeypatch.setattr(ray_worker_handle, "start_ray_workers", start_ray_workers)
+    monkeypatch.setattr(ray_worker_handle.ray, "kill", kill_actor)
+    manager = duckdb.ray_cxx.RayWorkerManager()
+    closing_query_id = "query-worker-failure-closing"
+    delayed_query_id = "query-worker-failure-delayed"
+    shutdown_complete = False
+    try:
+        failed_worker_id = manager.worker_snapshots()[0]["worker_id"]
+        failed_handle = handles[0]
+        for query_id in (closing_query_id, delayed_query_id):
+            scheduler = ray_worker_handle._FTE_SCHEDULERS.get_or_create(query_id)
+            failed_handle._bind_fte_scheduler_handlers(scheduler)
+
+        failed_worker_ids = worker_failures.quarantine_fte_worker(
+            failed_worker_id,
+            manager_instance_id=failed_handle.manager_instance_id,
+            worker_incarnation_id=failed_handle.worker_incarnation_id,
+        )
+        with ray_worker_handle._FTE_REGISTRY_LOCK:
+            ray_worker_handle._FTE_CLOSING_QUERIES.add(closing_query_id)
+
+        closing_event = WorkerFailed(
+            closing_query_id,
+            failed_worker_id,
+            RuntimeError("planned worker failure during query close"),
+            failed_worker_ids=failed_worker_ids,
+            manager_instance_id=failed_handle.manager_instance_id,
+            worker_incarnation_id=failed_handle.worker_incarnation_id,
+        )
+        assert worker_failures.mark_fte_worker_failed_for_event(closing_event) == []
+        assert actors[0].killed
+        assert ray_worker_handle._FTE_WORKER_HANDLES.get(failed_worker_id) is None
+
+        recovered_snapshots = manager.worker_snapshots()
+        assert [snapshot["worker_id"] for snapshot in recovered_snapshots] == [failed_worker_id]
+        assert start_calls == [(), ()]
+        assert len(handles) == 2
+        replacement = handles[1]
+
+        delayed_event = WorkerFailed(
+            delayed_query_id,
+            failed_worker_id,
+            closing_event.error,
+            failed_worker_ids=failed_worker_ids,
+            manager_instance_id=failed_handle.manager_instance_id,
+            worker_incarnation_id=failed_handle.worker_incarnation_id,
+        )
+        assert worker_failures.mark_fte_worker_failed_for_event(delayed_event) == []
+        assert ray_worker_handle._FTE_WORKER_HANDLES[failed_worker_id] is replacement
+        assert replacement._fte_healthy is True
+        assert actors[1].killed is False
+        assert manager.worker_snapshots() == recovered_snapshots
+
+        manager.shutdown()
+        shutdown_complete = True
+        assert actors[1].shutdown_calls == ["prepare", "prepare", "finish"]
+        assert actors[1].killed
+    finally:
+        with ray_worker_handle._FTE_REGISTRY_LOCK:
+            ray_worker_handle._FTE_CLOSING_QUERIES.discard(closing_query_id)
+        ray_worker_handle._FTE_SCHEDULERS.drop_query(closing_query_id)
+        ray_worker_handle._FTE_SCHEDULERS.drop_query(delayed_query_id)
+        if not shutdown_complete:
+            try:
+                manager.shutdown()
+            except Exception:
+                pass
+
+
 def test_ray_worker_manager_replaces_worker_after_quiescence_failure(monkeypatch):
     import duckdb.runners.ray.worker_handle as ray_worker_handle
     from duckdb.runners.ray.fragment_worker_client import RayWorkerActorHandle

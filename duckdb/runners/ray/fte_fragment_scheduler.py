@@ -1544,9 +1544,24 @@ def _fte_worker_selection_key(
     )
 
 
+def _worker_matches_failure_incarnation(
+    worker: Any,
+    worker_ids: set[str],
+    worker_incarnation_ids: Mapping[str, str],
+) -> bool:
+    worker_id = str(getattr(worker, "worker_id", ""))
+    if worker_id not in worker_ids:
+        return False
+    expected_incarnation_id = worker_incarnation_ids.get(worker_id)
+    if expected_incarnation_id is None:
+        return True
+    return str(getattr(worker, "worker_incarnation_id", "")) == expected_incarnation_id
+
+
 def _select_replacement_fte_worker(
     exclude_worker_id: str | set[str],
     *,
+    exclude_worker_incarnation_ids: Mapping[str, str] | None = None,
     manager_instance_id: str | None = None,
     memory_requirement_bytes: Any = None,
     execution_class: FteTaskExecutionClass | str | None = None,
@@ -1558,12 +1573,16 @@ def _select_replacement_fte_worker(
         if isinstance(exclude_worker_id, str)
         else {str(worker_id) for worker_id in exclude_worker_id}
     )
+    excluded_incarnations = {
+        str(worker_id): str(incarnation_id)
+        for worker_id, incarnation_id in (exclude_worker_incarnation_ids or {}).items()
+    }
     with _FTE_REGISTRY_LOCK:
         candidates = [
             handle
             for worker_id, handle in sorted(_FTE_WORKER_HANDLES.items())
-            if str(worker_id) not in exclude_worker_ids
-            and handle is not None
+            if handle is not None
+            and not _worker_matches_failure_incarnation(handle, exclude_worker_ids, excluded_incarnations)
             and handle._fte_healthy
             and (manager_instance_id is None or str(getattr(handle, "manager_instance_id", "")) == manager_instance_id)
         ]
@@ -1601,6 +1620,7 @@ def _select_replacement_fte_worker(
 def _has_replacement_fte_worker(
     exclude_worker_id: str | set[str],
     *,
+    exclude_worker_incarnation_ids: Mapping[str, str] | None = None,
     manager_instance_id: str | None = None,
     node_requirements: NodeRequirements | Mapping[str, Any] | None = None,
     node_requirements_wait_started_at: float | None = None,
@@ -1610,12 +1630,16 @@ def _has_replacement_fte_worker(
         if isinstance(exclude_worker_id, str)
         else {str(worker_id) for worker_id in exclude_worker_id}
     )
+    excluded_incarnations = {
+        str(worker_id): str(incarnation_id)
+        for worker_id, incarnation_id in (exclude_worker_incarnation_ids or {}).items()
+    }
     with _FTE_REGISTRY_LOCK:
         candidates = [
             handle
             for worker_id, handle in _FTE_WORKER_HANDLES.items()
-            if str(worker_id) not in exclude_worker_ids
-            and handle is not None
+            if handle is not None
+            and not _worker_matches_failure_incarnation(handle, exclude_worker_ids, excluded_incarnations)
             and handle._fte_healthy
             and (manager_instance_id is None or str(getattr(handle, "manager_instance_id", "")) == manager_instance_id)
         ]
@@ -2260,7 +2284,12 @@ class FteWorkerPlacementManager:
         )
 
 
-def _worker_failure_payload(worker_id: str, error: Any) -> dict[str, Any]:
+def _worker_failure_payload(
+    worker_id: str,
+    error: Any,
+    *,
+    worker_incarnation_id: str | None = None,
+) -> dict[str, Any]:
     if error is not None and not issubclass(type(error), BaseException):
         if isinstance(error, Mapping):
             failure = _normalize_failure_payload(error)
@@ -2280,9 +2309,14 @@ def _worker_failure_payload(worker_id: str, error: Any) -> dict[str, Any]:
         )
     worker_id = str(worker_id or "")
     failure["worker_id"] = worker_id
+    if worker_incarnation_id is not None:
+        failure["worker_incarnation_id"] = str(worker_incarnation_id)
     with _FTE_REGISTRY_LOCK:
         handle = _FTE_WORKER_HANDLES.get(worker_id)
-        if handle is not None:
+        if handle is not None and (
+            worker_incarnation_id is None
+            or str(getattr(handle, "worker_incarnation_id", "")) == str(worker_incarnation_id)
+        ):
             failure.update(
                 {
                     "manager_instance_id": str(getattr(handle, "manager_instance_id", "")),
@@ -2293,16 +2327,28 @@ def _worker_failure_payload(worker_id: str, error: Any) -> dict[str, Any]:
     return failure
 
 
-def _query_ids_owned_by_fte_workers(worker_ids: set[str]) -> set[str]:
+def _query_ids_owned_by_fte_workers(
+    worker_ids: set[str],
+    worker_incarnation_ids: Mapping[str, str] | None = None,
+) -> set[str]:
+    normalized_incarnation_ids = {
+        str(worker_id): str(incarnation_id) for worker_id, incarnation_id in (worker_incarnation_ids or {}).items()
+    }
     with _FTE_REGISTRY_LOCK:
         fragment_execution_items = list(_FTE_FRAGMENT_EXECUTIONS.items())
         query_ids = {
             query_id
             for (query_id, _fragment_id, _partition_id), owner in _FTE_PARTITION_OWNERS.items()
-            if str(getattr(owner, "worker_id", "")) in worker_ids
+            if _worker_matches_failure_incarnation(owner, worker_ids, normalized_incarnation_ids)
         }
     for (query_id, _fragment_id), fragment_execution in fragment_execution_items:
-        if any(fragment_execution.has_retryable_running_attempt_on_worker(worker_id) for worker_id in worker_ids):
+        if any(
+            fragment_execution.has_retryable_running_attempt_on_worker(
+                worker_id,
+                worker_incarnation_id=normalized_incarnation_ids.get(worker_id),
+            )
+            for worker_id in worker_ids
+        ):
             query_ids.add(query_id)
     return query_ids
 
@@ -2310,6 +2356,7 @@ def _query_ids_owned_by_fte_workers(worker_ids: set[str]) -> set[str]:
 def _running_partition_requirements_on_fte_workers(
     worker_ids: set[str],
     *,
+    worker_incarnation_ids: Mapping[str, str] | None = None,
     query_id_filter: str | None = None,
 ) -> dict[
     tuple[str, str, int],
@@ -2321,11 +2368,17 @@ def _running_partition_requirements_on_fte_workers(
             for item in _FTE_FRAGMENT_EXECUTIONS.items()
             if query_id_filter is None or item[0][0] == query_id_filter
         ]
+    normalized_incarnation_ids = {
+        str(worker_id): str(incarnation_id) for worker_id, incarnation_id in (worker_incarnation_ids or {}).items()
+    }
     requirements = {}
     for (query_id, fragment_id), fragment_execution in fragment_execution_items:
         with fragment_execution._state_lock:
             for partition_id, partition in fragment_execution.partitions.items():
-                if not any(str(running.worker_id) in worker_ids for running in partition.running_attempts.values()):
+                if not any(
+                    _worker_matches_failure_incarnation(running, worker_ids, normalized_incarnation_ids)
+                    for running in partition.running_attempts.values()
+                ):
                     continue
                 requirements[(query_id, fragment_id, int(partition_id))] = (
                     partition.memory_requirement_bytes,
@@ -2356,7 +2409,9 @@ def _mark_fte_worker_failed(
     query_id_filter: str | None = None,
     failed_worker_ids_override: set[str] | frozenset[str] | None = None,
     manager_instance_id: str | None = None,
+    worker_incarnation_id: str | None = None,
     primary_worker_process_terminated: bool = False,
+    reconcile_query: bool = True,
 ) -> list[tuple[str, str, list[Any], list[Any]]]:
     worker_id = str(worker_id or "")
     if not worker_id:
@@ -2369,11 +2424,21 @@ def _mark_fte_worker_failed(
     failed_worker_ids = (
         {str(item) for item in failed_worker_ids_override} if failed_worker_ids_override is not None else {worker_id}
     )
+    normalized_worker_incarnation_id = None if worker_incarnation_id is None else str(worker_incarnation_id)
+    failed_worker_incarnation_ids = (
+        {worker_id: normalized_worker_incarnation_id} if normalized_worker_incarnation_id is not None else {}
+    )
     failed_handles: dict[str, RayWorkerActorHandle] = {}
     with _FTE_REGISTRY_LOCK:
         for failed_worker_id in sorted(failed_worker_ids):
             failed_handle = _FTE_WORKER_HANDLES.get(failed_worker_id)
             if failed_handle is None:
+                continue
+            if not _worker_matches_failure_incarnation(
+                failed_handle,
+                failed_worker_ids,
+                failed_worker_incarnation_ids,
+            ):
                 continue
             failed_handle_manager_instance_id = str(getattr(failed_handle, "manager_instance_id", ""))
             if normalized_manager_instance_id is None:
@@ -2388,6 +2453,12 @@ def _mark_fte_worker_failed(
         failed_handle: RayWorkerActorHandle,
     ) -> bool:
         if _FTE_WORKER_HANDLES.get(failed_worker_id) is not failed_handle:
+            return False
+        if not _worker_matches_failure_incarnation(
+            failed_handle,
+            failed_worker_ids,
+            failed_worker_incarnation_ids,
+        ):
             return False
         if (
             normalized_manager_instance_id is not None
@@ -2411,15 +2482,23 @@ def _mark_fte_worker_failed(
     # Owner cleanup can race while the worker barrier is in flight. Preserve
     # every affected running partition's placement requirements before that
     # cleanup so losing the owner entry cannot silently make the retry fatal.
-    failed_partition_requirements = _running_partition_requirements_on_fte_workers(
-        failed_worker_ids,
-        query_id_filter=query_id_filter,
+    failed_partition_requirements = (
+        _running_partition_requirements_on_fte_workers(
+            failed_worker_ids,
+            worker_incarnation_ids=failed_worker_incarnation_ids,
+            query_id_filter=query_id_filter,
+        )
+        if reconcile_query
+        else {}
     )
 
     # A failed status/control RPC does not prove that the actor stopped its
     # storage side effects. Fence and drain it before removing attempts or
     # making their replacements eligible to commit.
-    affected_query_ids = _query_ids_owned_by_fte_workers(failed_worker_ids)
+    affected_query_ids = _query_ids_owned_by_fte_workers(
+        failed_worker_ids,
+        failed_worker_incarnation_ids,
+    )
     if query_id_filter is not None:
         affected_query_ids.add(query_id_filter)
     handles_to_kill: list[RayWorkerActorHandle] = []
@@ -2437,20 +2516,27 @@ def _mark_fte_worker_failed(
             # proves the worker cannot issue another write.
             if _worker_actor_death_confirms_quiescence(exc):
                 continue
-            affected_query_ids.update(_query_ids_owned_by_fte_workers(failed_worker_ids))
+            affected_query_ids.update(
+                _query_ids_owned_by_fte_workers(
+                    failed_worker_ids,
+                    failed_worker_incarnation_ids,
+                )
+            )
             try:
                 _fail_queries_after_worker_quiescence_error(affected_query_ids, exc)
             finally:
-                with _FTE_REGISTRY_LOCK:
-                    for captured_worker_id in sorted(failed_handles):
-                        handle_to_retire = failed_handles[captured_worker_id]
-                        if _retire_captured_handle_locked(captured_worker_id, handle_to_retire):
-                            handles_to_kill.append(handle_to_retire)
-                for handle in handles_to_kill:
-                    try:
-                        ray.kill(handle.actor_handle)
-                    except Exception:
-                        pass
+                try:
+                    with _FTE_REGISTRY_LOCK:
+                        for captured_worker_id in sorted(failed_handles):
+                            handle_to_retire = failed_handles[captured_worker_id]
+                            if _retire_captured_handle_locked(captured_worker_id, handle_to_retire):
+                                handles_to_kill.append(handle_to_retire)
+                finally:
+                    for handle in handles_to_kill:
+                        try:
+                            ray.kill(handle.actor_handle)
+                        except Exception:
+                            pass
             raise RuntimeError(
                 f"failed to quiesce FTE worker {failed_worker_id} before retry: {_safe_failure_message(exc)}"
             ) from exc
@@ -2470,26 +2556,33 @@ def _mark_fte_worker_failed(
                 captured_handle = failed_handles[failed_worker_id]
                 if _retire_captured_handle_locked(failed_worker_id, captured_handle):
                     handles_to_kill.append(captured_handle)
-            for owner_key, owner in list(_FTE_PARTITION_OWNERS.items()):
-                if query_id_filter is not None and owner_key[0] != query_id_filter:
-                    continue
-                if str(owner.worker_id) not in failed_worker_ids:
-                    continue
-                failed_owner_items.append(
-                    (
-                        owner_key,
+            if reconcile_query:
+                for owner_key, owner in list(_FTE_PARTITION_OWNERS.items()):
+                    if query_id_filter is not None and owner_key[0] != query_id_filter:
+                        continue
+                    if not _worker_matches_failure_incarnation(
                         owner,
-                        _FTE_FRAGMENT_EXECUTIONS.get((owner_key[0], owner_key[1])),
+                        failed_worker_ids,
+                        failed_worker_incarnation_ids,
+                    ):
+                        continue
+                    failed_owner_items.append(
+                        (
+                            owner_key,
+                            owner,
+                            _FTE_FRAGMENT_EXECUTIONS.get((owner_key[0], owner_key[1])),
+                        )
                     )
-                )
-                future = _FTE_PENDING_WORKER_RESERVATIONS.pop(owner_key, None)
-                if future is not None:
-                    pending_worker_reservation_futures_to_cancel.append(future)
-            fragment_execution_items = [
-                item
-                for item in _FTE_FRAGMENT_EXECUTIONS.items()
-                if query_id_filter is None or item[0][0] == query_id_filter
-            ]
+                    future = _FTE_PENDING_WORKER_RESERVATIONS.pop(owner_key, None)
+                    if future is not None:
+                        pending_worker_reservation_futures_to_cancel.append(future)
+                fragment_execution_items = [
+                    item
+                    for item in _FTE_FRAGMENT_EXECUTIONS.items()
+                    if query_id_filter is None or item[0][0] == query_id_filter
+                ]
+            else:
+                fragment_execution_items = []
     finally:
         # Native retirement transfers actor termination ownership to this
         # failure path. Complete that handoff even if later retry bookkeeping
@@ -2499,6 +2592,9 @@ def _mark_fte_worker_failed(
                 ray.kill(handle.actor_handle)
             except Exception:
                 pass
+
+    if not reconcile_query:
+        return []
 
     scheduling_requirements_by_owner_key: dict[
         tuple[str, str, int],
@@ -2527,6 +2623,7 @@ def _mark_fte_worker_failed(
         wait_started_at = time.time()
         replacement = _select_replacement_fte_worker(
             failed_worker_ids,
+            exclude_worker_incarnation_ids=failed_worker_incarnation_ids,
             manager_instance_id=normalized_manager_instance_id,
             memory_requirement_bytes=memory_requirement_bytes,
             execution_class=execution_class,
@@ -2535,6 +2632,7 @@ def _mark_fte_worker_failed(
         )
         retryable_by_owner_key[owner_key] = replacement is not None or _has_replacement_fte_worker(
             failed_worker_ids,
+            exclude_worker_incarnation_ids=failed_worker_incarnation_ids,
             manager_instance_id=normalized_manager_instance_id,
             node_requirements=node_requirements,
             node_requirements_wait_started_at=wait_started_at,
@@ -2563,6 +2661,7 @@ def _mark_fte_worker_failed(
             fragment_execution.has_retryable_running_attempt_on_worker(
                 failed_worker_id,
                 retryable_by_partition_id,
+                worker_incarnation_id=failed_worker_incarnation_ids.get(failed_worker_id),
             )
             for failed_worker_id in failed_worker_ids
         )
@@ -2573,6 +2672,7 @@ def _mark_fte_worker_failed(
             scheduled = fragment_execution.mark_worker_failed(
                 failed_worker_id,
                 failure,
+                worker_incarnation_id=failed_worker_incarnation_ids.get(failed_worker_id),
                 retryable=True,
                 retryable_by_partition_id=retryable_by_partition_id,
                 schedule_retries=False,

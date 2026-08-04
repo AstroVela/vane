@@ -5828,6 +5828,37 @@ def test_fte_worker_quarantine_rejects_cross_manager_identity():
     assert other_manager._fte_healthy is True
 
 
+def test_fte_worker_failure_deduplicates_each_worker_incarnation():
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create("query-worker-incarnation-dedup")
+
+    assert scheduler.record_worker_failure({"worker-0"}, worker_incarnation_id="incarnation-0") == frozenset(
+        {"worker-0"}
+    )
+    assert scheduler.record_worker_failure({"worker-0"}, worker_incarnation_id="incarnation-0") == frozenset()
+    assert scheduler.record_worker_failure({"worker-0"}, worker_incarnation_id="incarnation-1") == frozenset(
+        {"worker-0"}
+    )
+    assert scheduler.stats().failed_worker_count == 2
+
+
+def test_fte_stale_worker_quarantine_does_not_fence_replacement():
+    replacement = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:0",
+        manager_instance_id="manager-a",
+    )
+
+    failed_worker_ids = worker_failures_mod.quarantine_fte_worker(
+        replacement.worker_id,
+        manager_instance_id=replacement.manager_instance_id,
+        worker_incarnation_id="retired-incarnation",
+    )
+
+    assert failed_worker_ids == frozenset({replacement.worker_id})
+    assert replacement._fte_healthy is True
+
+
 def test_fte_blank_manager_scope_remains_legacy_and_fail_closed():
     legacy = RayWorkerActorHandle(
         _FakeActor(),
@@ -8635,6 +8666,55 @@ def test_fte_worker_failure_keeps_retryability_partition_local():
     assert all(str(handle.task_id) != f"{query_id}.0.1.1" for handle in handles)
 
 
+def test_fte_stale_worker_failure_only_reconciles_matching_incarnation():
+    query_id = "query-fte-worker-incarnation"
+    fragment_id = f"{query_id}:node:7"
+    worker_id = "manager-a:node-a:0"
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id=worker_id,
+        manager_instance_id="manager-a",
+    )
+    stage = failed._get_or_create_fte_fragment_execution(
+        {
+            "query_id": query_id,
+            "fragment_id": fragment_id,
+            "cfg": {"cfg": "scan"},
+            "context": {},
+            "task_context_info": {},
+        },
+        dynamic_scan_sources={"7"},
+        dynamic_exchange_sources=set(),
+    )
+    failed_partition = stage.add_partition(0)
+    failed_partition.start_attempt(worker_id=worker_id, remote_handle=failed)
+    with worker_handle_mod._FTE_REGISTRY_LOCK:
+        worker_handle_mod._FTE_WORKER_HANDLES.pop(worker_id)
+    replacement = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id=worker_id,
+        manager_instance_id="manager-a",
+    )
+    replacement_partition = stage.add_partition(1)
+    replacement_partition.start_attempt(worker_id=worker_id, remote_handle=replacement)
+
+    scheduled = stage.mark_worker_failed(
+        worker_id,
+        {"error_code": "WORKER_LOST", "message": "old incarnation failed"},
+        worker_incarnation_id=failed.worker_incarnation_id,
+        retryable=False,
+        schedule_retries=False,
+    )
+
+    assert scheduled == []
+    assert failed_partition.failed is True
+    assert replacement_partition.failed is False
+    assert replacement_partition.running_attempt is not None
+    assert replacement_partition.running_attempt.remote_handle is replacement
+
+
 def test_fte_worker_failure_retry_waits_for_scheduling_delayer(monkeypatch):
     monkeypatch.setenv("VANE_FTE_RETRY_INITIAL_DELAY_S", "0.5")
     monkeypatch.setenv("VANE_FTE_RETRY_MAX_DELAY_S", "2")
@@ -8751,6 +8831,52 @@ def test_fte_split_append_control_failure_replays_on_replacement(monkeypatch):
         "WorkerReservationCompleted": 2,
         "WorkerFailed": 1,
     }
+
+
+def test_fte_control_quiescence_failure_does_not_skip_later_worker_retirement():
+    class _FailingPrepareActor(_FakeActor):
+        def _prepare_shutdown(self):
+            self.shutdown_calls.append("prepare")
+            raise RuntimeError("worker side effects still active")
+
+    first_actor = _FailingPrepareActor()
+    second_actor = _FakeActor()
+    first = RayWorkerActorHandle(
+        first_actor,
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:0",
+        manager_instance_id="manager-a",
+    )
+    second = RayWorkerActorHandle(
+        second_actor,
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-b:0",
+        manager_instance_id="manager-a",
+    )
+    failures = [
+        fte_execution_mod.FteWorkerControlFailure(
+            worker_id=worker.worker_id,
+            attempt_id=FteTaskAttemptId.coerce(f"query-control-retire-{index}.0.0.0"),
+            method_name="fte_create_task",
+            cause=RuntimeError(f"planned control failure {index}"),
+            worker_incarnation_id=worker.worker_incarnation_id,
+        )
+        for index, worker in enumerate((first, second))
+    ]
+    schedulers = []
+    for failure in failures:
+        scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create(failure.attempt_id.task_id.query_id)
+        first._bind_fte_scheduler_handlers(scheduler)
+        schedulers.append(scheduler)
+
+    for failure in failures:
+        first._handles_for_fte_worker_control_failure(failure)
+
+    assert first_actor.shutdown_calls == ["prepare"]
+    assert second_actor.shutdown_calls == ["prepare"]
+    assert first.worker_id not in worker_handle_mod._FTE_WORKER_HANDLES
+    assert second.worker_id not in worker_handle_mod._FTE_WORKER_HANDLES
+    assert "failed to quiesce FTE worker" in str(schedulers[0].stats().failure_reason)
 
 
 def test_fte_control_failure_preempts_queued_work_across_queries(monkeypatch):

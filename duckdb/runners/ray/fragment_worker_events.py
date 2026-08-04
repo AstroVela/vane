@@ -25,6 +25,7 @@ from duckdb.runners.ray.fragment_worker_exchange import apply_exchange_selector_
 from duckdb.runners.ray.fragment_worker_failures import (
     mark_fte_worker_failed_for_event,
     quarantine_fte_worker,
+    retire_fte_worker_for_failure,
 )
 from duckdb.runners.ray.fragment_worker_ordering import fragment_execution_key_for_fte_attempt
 from duckdb.runners.ray.fragment_worker_reservations import (
@@ -60,9 +61,23 @@ class FteWorkerEventHandlingMixin:
         failed_worker_ids = quarantine_fte_worker(
             failure.worker_id,
             manager_instance_id=self.manager_instance_id,
+            worker_incarnation_id=failure.worker_incarnation_id,
         )
         query_ids = set(_FTE_SCHEDULERS.query_ids())
         query_ids.add(failure.attempt_id.task_id.query_id)
+        try:
+            retire_fte_worker_for_failure(
+                failure.worker_id,
+                failure,
+                failed_worker_ids=failed_worker_ids,
+                manager_instance_id=self.manager_instance_id,
+                worker_incarnation_id=failure.worker_incarnation_id,
+            )
+        except Exception as exc:
+            scheduler = _FTE_SCHEDULERS.get(failure.attempt_id.task_id.query_id)
+            if scheduler is not None and scheduler.is_owned_by_manager_instance(self.manager_instance_id):
+                scheduler.fail(f"FTE worker failure handling failed: {exc}")
+            return request_fte_pending_task_drain()
         schedulers = []
         for query_id in sorted(query_ids):
             with _FTE_REGISTRY_LOCK:
@@ -81,6 +96,7 @@ class FteWorkerEventHandlingMixin:
                     failure,
                     failed_worker_ids=failed_worker_ids,
                     manager_instance_id=self.manager_instance_id,
+                    worker_incarnation_id=failure.worker_incarnation_id,
                 ),
                 # Control failures happen inside an active drain.  Reconcile
                 # them before reservation completions already in that queue.
@@ -120,9 +136,6 @@ class FteWorkerEventHandlingMixin:
         return handles
 
     def _handles_for_worker_failed_event(self, event: WorkerFailed) -> list[Any]:
-        with _FTE_REGISTRY_LOCK:
-            if str(event.query_id) in _FTE_CLOSING_QUERIES:
-                return []
         handles: list[Any] = []
         try:
             scheduled_by_stage = mark_fte_worker_failed_for_event(event)

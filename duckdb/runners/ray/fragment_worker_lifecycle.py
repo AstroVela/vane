@@ -27,6 +27,7 @@ from duckdb.runners.ray.fragment_registry import (
     _FTE_SCHEDULERS,
     _FTE_WORKER_HANDLES,
 )
+from duckdb.runners.ray.fragment_worker_failures import retire_fte_worker_for_failure
 from duckdb.runners.ray.fragment_worker_results import (
     fte_query_status,
     pop_fte_result_handles,
@@ -326,10 +327,28 @@ class FteWorkerLifecycleMixin:
         failed_worker_id = str(worker_id or self.worker_id or "")
         if not failed_worker_id:
             return []
-        failure = _worker_failure_payload(failed_worker_id, error)
+        if failed_worker_id == str(self.worker_id or ""):
+            worker_incarnation_id = self.worker_incarnation_id
+        else:
+            with _FTE_REGISTRY_LOCK:
+                failed_handle = _FTE_WORKER_HANDLES.get(failed_worker_id)
+                worker_incarnation_id = getattr(failed_handle, "worker_incarnation_id", None)
+        failure = _worker_failure_payload(
+            failed_worker_id,
+            error,
+            worker_incarnation_id=worker_incarnation_id,
+        )
         failed_worker_ids = frozenset({failed_worker_id})
         query_ids = fte_fragment_execution_query_ids()
         query_ids.update(_FTE_SCHEDULERS.query_ids())
+        if query_ids:
+            retire_fte_worker_for_failure(
+                failed_worker_id,
+                error,
+                failed_worker_ids=failed_worker_ids,
+                manager_instance_id=self.manager_instance_id,
+                worker_incarnation_id=worker_incarnation_id,
+            )
         handles: list[Any] = []
         for query_id in sorted(query_ids):
             if fte_registry_query_is_closing(query_id):
@@ -347,6 +366,7 @@ class FteWorkerLifecycleMixin:
                     failure,
                     failed_worker_ids=failed_worker_ids,
                     manager_instance_id=self.manager_instance_id,
+                    worker_incarnation_id=worker_incarnation_id,
                 )
             )
             handles.extend(scheduler.drain())
