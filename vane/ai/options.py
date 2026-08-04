@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+import re
 from collections.abc import Mapping
 from typing import Any, Literal, TypeAlias, TypedDict
 from urllib.parse import parse_qsl, urlsplit
@@ -115,6 +117,22 @@ _GOOGLE_EMBED_TASK_TYPES = frozenset(
 )
 _EXECUTION_BACKENDS = frozenset({"subprocess_task", "subprocess_actor", "ray_task", "ray_actor"})
 _OPENAI_EXTRA_SENSITIVE_KEYS = frozenset({"organization"})
+_HUGGING_FACE_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}")
+_VLLM_REMOTE_CODE_SPECULATIVE_METHODS = frozenset(
+    {
+        "mtp",
+        "deepseek_mtp",
+        "mimo_mtp",
+        "glm4_moe_mtp",
+        "ernie_mtp",
+        "qwen3_next_mtp",
+        "longcat_flash_mtp",
+    }
+)
+
+
+def _is_hugging_face_commit_sha(value: Any) -> bool:
+    return isinstance(value, str) and _HUGGING_FACE_COMMIT_SHA.fullmatch(value) is not None
 
 
 def _validate_base_url_option(options: Mapping[str, Any], *, api: Literal["Embed", "Prompt"]) -> None:
@@ -208,6 +226,8 @@ def validate_embed_options(
 
     max_chunk_chars = copied.get("max_chunk_chars")
     if max_chunk_chars is not None:
+        if family == "openai" and copied.get("input_text_token_limit") is not None:
+            raise ValueError("Embed options 'max_chunk_chars' and 'input_text_token_limit' cannot be used together")
         _require_embed_int(copied, "max_chunk_chars", minimum=1)
         overlap = copied.get("chunk_overlap_chars", 200)
         if isinstance(overlap, bool) or not isinstance(overlap, int) or overlap < 0:
@@ -243,8 +263,12 @@ def validate_embed_options(
         for name in ("local_files_only", "trust_remote_code"):
             if name in copied and not isinstance(copied[name], bool):
                 raise ValueError(f"Embed option {name!r} must be a bool")
-        if copied.get("trust_remote_code") is True and copied.get("revision") is None:
-            raise ValueError("Embed option 'trust_remote_code=True' requires a pinned revision")
+        if copied.get("trust_remote_code") is True:
+            revision = copied.get("revision")
+            if not _is_hugging_face_commit_sha(revision):
+                raise ValueError(
+                    "Embed option 'trust_remote_code=True' requires a pinned revision as a full 40-character commit SHA"
+                )
 
     return copied
 
@@ -348,10 +372,8 @@ def _validate_vllm_json(value: Any, path: str) -> None:
         for key, item in value.items():
             if not isinstance(key, str):
                 raise TypeError(f"Prompt option {path} must use string keys; got {type(key).__name__}")
-            if key == "structured_outputs":
-                raise ValueError(
-                    "Prompt option generate_args cannot configure structured_outputs directly; use return_format"
-                )
+            if key in {"structured_outputs", "guided_decoding"}:
+                raise ValueError(f"Prompt option generate_args cannot configure {key} directly; use return_format")
             _validate_vllm_json(item, f"{path}.{key}")
         return
     if isinstance(value, list):
@@ -427,6 +449,45 @@ def validate_prompt_options(
                 if not isinstance(value, Mapping):
                     raise TypeError(f"Prompt option {name!r} must be a mapping")
                 _validate_vllm_json(value, name)
+        generate_args = copied.get("generate_args", {})
+        sampling_params = generate_args.get("sampling_params")
+        if isinstance(sampling_params, str):
+            try:
+                decoded_sampling_params = json.loads(sampling_params)
+            except json.JSONDecodeError as exc:
+                raise ValueError("Prompt option 'generate_args.sampling_params' must be valid JSON") from exc
+            if not isinstance(decoded_sampling_params, Mapping):
+                raise ValueError("Prompt option 'generate_args.sampling_params' JSON must decode to a mapping")
+            _reject_sensitive_prompt_options(
+                decoded_sampling_params,
+                path="options.generate_args.sampling_params",
+            )
+            _validate_vllm_json(decoded_sampling_params, "generate_args.sampling_params")
+        engine_args = copied.get("engine_args", {})
+        if "trust_remote_code" in engine_args and not isinstance(engine_args["trust_remote_code"], bool):
+            raise ValueError("Prompt option 'engine_args.trust_remote_code' must be a bool")
+        if engine_args.get("trust_remote_code") is True:
+            for revision_name in ("code_revision", "tokenizer_revision"):
+                if not _is_hugging_face_commit_sha(engine_args.get(revision_name)):
+                    raise ValueError(
+                        "Prompt option 'engine_args.trust_remote_code=True' requires "
+                        f"engine_args.{revision_name} as a full 40-character commit SHA"
+                    )
+            speculative_config = engine_args.get("speculative_config")
+            speculative_model = speculative_config.get("model") if isinstance(speculative_config, Mapping) else None
+            speculative_method = speculative_config.get("method") if isinstance(speculative_config, Mapping) else None
+            if (
+                isinstance(speculative_config, Mapping)
+                and (
+                    (speculative_model is not None and speculative_model not in {"ngram", "[ngram]"})
+                    or speculative_method in _VLLM_REMOTE_CODE_SPECULATIVE_METHODS
+                )
+                and not _is_hugging_face_commit_sha(speculative_config.get("code_revision"))
+            ):
+                raise ValueError(
+                    "Prompt option 'engine_args.trust_remote_code=True' with a speculative model requires "
+                    "engine_args.speculative_config.code_revision as a full 40-character commit SHA"
+                )
         if copied.get("max_retries", 0) != 0:
             raise ValueError("native vLLM prompting only accepts max_retries=0")
 

@@ -25,6 +25,8 @@ from vane.ai.provider import Provider, ProviderCapabilityError
 from vane.ai.typing import EmbeddingDimensions, UDFOptions
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from vane.ai.protocols import TextClassifier, TextEmbedder
     from vane.ai.typing import Embedding, Label, Options
 
@@ -44,9 +46,8 @@ class TransformersProvider(Provider):
     DEFAULT_TEXT_EMBEDDER = "sentence-transformers/all-MiniLM-L6-v2"
     DEFAULT_TEXT_CLASSIFIER = "facebook/bart-large-mnli"
 
-    def __init__(self, name: str | None = None, **options: Any):
+    def __init__(self, name: str | None = None):
         self._name = name or "transformers"
-        self._options: dict[str, Any] = options
 
     @property
     def name(self) -> str:
@@ -56,24 +57,21 @@ class TransformersProvider(Provider):
         self,
         model: str | None = None,
         dimensions: int | None = None,
-        **options: Any,
+        *,
+        options: Mapping[str, Any] | None = None,
     ) -> TextEmbedderDescriptor:
-        merged = {**self._options, **options}
-        unknown = sorted(set(merged) - _EMBED_OPTIONS)
-        if unknown:
-            raise TypeError(f"Unsupported Transformers Embed option(s): {', '.join(unknown)}")
-        validate_embed_options("transformers", merged, relation=False)
+        resolved_options = dict(options or {})
         return TransformersTextEmbedderDescriptor(
             model=model or self.DEFAULT_TEXT_EMBEDDER,
             provider_name=self._name,
             dimensions=dimensions,
-            embed_options=merged,
+            options=resolved_options,
         )
 
     def get_text_classifier(self, model: str | None = None, **options: Any) -> TextClassifierDescriptor:
         return TransformersTextClassifierDescriptor(
             model=model or self.DEFAULT_TEXT_CLASSIFIER,
-            classify_options={**self._options, **options},
+            classify_options=options,
         )
 
 
@@ -88,13 +86,14 @@ class TransformersTextEmbedderDescriptor(TextEmbedderDescriptor):
 
     model: str
     dimensions: int | None = None
-    embed_options: dict[str, Any] = field(default_factory=dict)
+    options: dict[str, Any] = field(default_factory=dict)
     provider_name: str = "transformers"
 
     def __post_init__(self) -> None:
-        unknown = sorted(set(self.embed_options) - _EMBED_OPTIONS)
+        unknown = sorted(set(self.options) - _EMBED_OPTIONS)
         if unknown:
             raise TypeError(f"Unsupported Transformers Embed option(s): {', '.join(unknown)}")
+        validated_options = validate_embed_options("transformers", self.options, relation=False)
         if self.dimensions is not None and (
             isinstance(self.dimensions, bool) or not isinstance(self.dimensions, int) or self.dimensions <= 0
         ):
@@ -105,7 +104,10 @@ class TransformersTextEmbedderDescriptor(TextEmbedderDescriptor):
                 f"Transformers model {self.model!r} has {native_dimensions} dimensions and cannot produce "
                 f"{self.dimensions} dimensions"
             )
-        self.embed_options = wrap_sensitive_options(self.embed_options)
+        resolved_options = validated_options
+        if resolved_options.get("device") is None:
+            resolved_options["device"] = "cpu"
+        self.options = wrap_sensitive_options(resolved_options)
 
     def get_provider(self) -> str:
         return self.provider_name
@@ -114,7 +116,7 @@ class TransformersTextEmbedderDescriptor(TextEmbedderDescriptor):
         return self.model
 
     def get_options(self) -> Options:
-        return dict(self.embed_options)
+        return dict(self.options)
 
     def get_dimensions(self) -> EmbeddingDimensions:
         if self.dimensions is not None:
@@ -127,21 +129,13 @@ class TransformersTextEmbedderDescriptor(TextEmbedderDescriptor):
         )
 
     def get_udf_options(self) -> UDFOptions:
-        device = self.embed_options.get("device")
-        has_gpu = device is not None and str(device).startswith("cuda")
-        opts = UDFOptions(
-            batch_size=64,
-            max_retries=3,
-            on_error="raise",
-            actor_number=None,
-            num_gpus=1 if has_gpu else 0,
-        )
-        return opts
+        has_gpu = str(self.options["device"]).startswith("cuda")
+        return UDFOptions(num_gpus=1 if has_gpu else 0)
 
     def instantiate(self) -> TextEmbedder:
         model_options = {
             name: value
-            for name, value in self.embed_options.items()
+            for name, value in self.options.items()
             if name in {"cache_folder", "device", "local_files_only", "revision", "trust_remote_code"}
         }
         return TransformersTextEmbedder(
@@ -167,6 +161,8 @@ class TransformersTextEmbedder:
         # Restore plaintext credentials sealed by the descriptor; plain dicts
         # from direct callers pass through unchanged.
         model_options = unwrap_sensitive_options(model_options)
+        if model_options.get("device") is None:
+            model_options["device"] = "cpu"
         trust_remote_code = model_options.pop("trust_remote_code", False) is True
         self._provider_name = provider_name
         self._model_name = model_name_or_path

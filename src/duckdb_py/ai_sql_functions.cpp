@@ -3,6 +3,7 @@
 
 #include "duckdb_python/ai_sql_functions.hpp"
 
+#include "duckdb_python/python_conversion.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -34,7 +35,7 @@ static constexpr const char *HIDDEN_PROMPT_FUNCTION = "__vane_ai_prompt";
 
 struct NativeVLLMSpec {
 	string model;
-	string options_json;
+	Value options;
 	Value system_message;
 };
 
@@ -187,9 +188,9 @@ static string ParseExecutionKind(const py::dict &spec) {
 
 static NativeVLLMSpec ParseNativeVLLMSpec(const py::dict &spec) {
 	auto model_obj = DictGetOrNone(spec, "model");
-	auto options_obj = DictGetOrNone(spec, "options_json");
-	if (!py::isinstance<py::str>(model_obj) || !py::isinstance<py::str>(options_obj)) {
-		throw BinderException("ai SQL native vLLM helper returned invalid model or options_json");
+	auto options_obj = DictGetOrNone(spec, "options");
+	if (!py::isinstance<py::str>(model_obj) || !py::isinstance<py::dict>(options_obj)) {
+		throw BinderException("ai SQL native vLLM helper returned invalid model or options envelope");
 	}
 	auto system_message_obj = DictGetOrNone(spec, "system_message");
 	Value system_message;
@@ -199,7 +200,7 @@ static NativeVLLMSpec ParseNativeVLLMSpec(const py::dict &spec) {
 		}
 		system_message = Value(py::cast<string>(system_message_obj));
 	}
-	return {py::cast<string>(model_obj), py::cast<string>(options_obj), std::move(system_message)};
+	return {py::cast<string>(model_obj), TransformPythonValue(options_obj), std::move(system_message)};
 }
 
 static Value BuildAISQLPayload(ClientContext &context, const py::dict &spec) {
@@ -331,9 +332,9 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 		}
 		bound_function.SetReturnType(public_return_type);
 		bound_function.SetBindExpressionCallback(LowerNativeVLLMPrompt);
-		return make_uniq<NativeVLLMAISQLFunctionData>(
-		    std::move(native_vllm->model), Value(std::move(native_vllm->options_json)),
-		    std::move(native_validation_payload), std::move(public_return_type));
+		return make_uniq<NativeVLLMAISQLFunctionData>(std::move(native_vllm->model), std::move(native_vllm->options),
+		                                              std::move(native_validation_payload),
+		                                              std::move(public_return_type));
 	}
 	auto internal_return_type = udf_helpers::ResolvePayloadReturnType(payload);
 	bound_function.SetReturnType(public_return_type);
@@ -451,7 +452,7 @@ static unique_ptr<Expression> LowerAIPromptInput(FunctionBindExpressionInput &in
 
 static unique_ptr<Expression> LowerAIPromptTextInput(FunctionBindExpressionInput &input) {
 	if (input.children.size() != 2) {
-		throw BinderException("ai_prompt text validation expected one runtime argument");
+		throw BinderException("ai_prompt text validation expected two runtime arguments");
 	}
 	auto &message = input.children[0];
 	auto input_type_id = message->return_type.id();

@@ -25,7 +25,12 @@ import numpy as np
 
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import serialize_raw_response
-from vane.ai.options import validate_prompt_options
+from vane.ai.options import (
+    validate_embed_options as validate_closed_embed_options,
+)
+from vane.ai.options import (
+    validate_prompt_options as validate_closed_prompt_options,
+)
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
 from vane.ai.typing import EmbeddingDimensions, UDFOptions
@@ -168,6 +173,7 @@ _EMBEDDING_DIM_RANGE: dict[str, tuple[int, int]] = {
 # be in one batch", so 100 is the server-enforced limit.
 _EMBED_BATCH_LIMIT = 100
 _EMBED_REQUEST_OPTIONS = frozenset({"task_type", "title"})
+_PROMPT_REQUEST_OPTIONS = frozenset({"temperature", "top_p", "top_k", "max_output_tokens", "stop_sequences"})
 
 # Request options rejected per model before dispatch. Gemini 3.6 Flash and
 # 3.5 Flash-Lite deprecate the classic sampling parameters: the API ignores
@@ -248,8 +254,6 @@ class GoogleProvider(Provider):
 
     Args:
         name: Optional display-name override (default ``"google"``).
-        api_key: Google API key. Prefer the ``GOOGLE_API_KEY`` environment
-            variable over passing keys in code.
         prompt_model: Model used by ``get_prompter`` when the call does not
             pass ``model=...``.
         embedding_model: Model used by ``get_text_embedder`` when the call
@@ -264,13 +268,11 @@ class GoogleProvider(Provider):
     """
 
     DEFAULT_TEXT_EMBEDDER: ClassVar[str] = "gemini-embedding-2"
-    _CLIENT_KEYS: ClassVar[frozenset[str]] = frozenset({"api_key"})
 
     def __init__(
         self,
         name: str | None = None,
         *,
-        api_key: str | None = None,
         prompt_model: str | None = None,
         embedding_model: str | None = None,
         embedding_dimensions: int | None = None,
@@ -279,25 +281,17 @@ class GoogleProvider(Provider):
         self._prompt_model = prompt_model
         self._embedding_model = embedding_model
         self._embedding_dimensions = embedding_dimensions
-        self._options: dict[str, Any] = {}
-        if api_key is not None:
-            self._options["api_key"] = api_key
 
     @property
     def name(self) -> str:
         return self._name
 
-    def _split_options(self, options: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        merged = {**self._options, **options}
-        provider_options = {k: v for k, v in merged.items() if k in self._CLIENT_KEYS}
-        request_options = {k: v for k, v in merged.items() if k not in self._CLIENT_KEYS}
-        return provider_options, request_options
-
     def get_text_embedder(
         self,
         model: str | None = None,
         dimensions: int | None = None,
-        **options: Any,
+        *,
+        options: Mapping[str, Any] | None = None,
     ) -> TextEmbedderDescriptor:
         """Build an embedder descriptor for the selected or default model.
 
@@ -305,10 +299,7 @@ class GoogleProvider(Provider):
             ValueError: If dimensions cannot be resolved for the selected
                 model or the model/option combination is invalid.
         """
-        provider_options, embed_options = self._split_options(options)
-        unknown = sorted(set(embed_options) - _EMBED_REQUEST_OPTIONS)
-        if unknown:
-            raise TypeError(f"Unsupported Google Embed option(s): {', '.join(unknown)}")
+        resolved_options = dict(options or {})
         model_name = model if model is not None else self._embedding_model
         if model_name is None:
             model_name = self.DEFAULT_TEXT_EMBEDDER
@@ -318,15 +309,14 @@ class GoogleProvider(Provider):
                 "Pass model=... or configure GoogleProvider(embedding_model=...)."
             )
         request_dimensions = dimensions
-        if dimensions is None:
+        if dimensions is None and _canonical_model_id(model_name) not in _EMBEDDING_DIMS:
             dimensions = self._embedding_dimensions
         return GoogleTextEmbedderDescriptor(
             model_name=model_name,
             provider_name=self._name,
-            provider_options=provider_options,
             dimensions=dimensions,
             request_dimensions=request_dimensions,
-            embed_options=embed_options,
+            options=resolved_options,
         )
 
     def get_prompter(
@@ -335,7 +325,8 @@ class GoogleProvider(Provider):
         system_message: str | None = None,
         return_format: dict[str, Any] | None = None,
         return_raw_response: bool = False,
-        **options: Any,
+        *,
+        options: Mapping[str, Any] | None = None,
     ) -> PrompterDescriptor:
         """Build a prompter descriptor for an explicitly selected model.
 
@@ -344,8 +335,7 @@ class GoogleProvider(Provider):
                 ``prompt_model`` is configured, or if the selected model
                 does not support one of the requested options.
         """
-        provider_options, prompt_options = self._split_options(options)
-        validate_prompt_options("google", prompt_options, relation=False)
+        resolved_options = dict(options or {})
         model_name = model if model is not None else self._prompt_model
         if model_name is None:
             raise ValueError(
@@ -360,11 +350,10 @@ class GoogleProvider(Provider):
         return GooglePrompterDescriptor(
             model_name=model_name,
             provider_name=self._name,
-            provider_options=provider_options,
             system_message=system_message,
             return_format=return_format,
             return_raw_response=return_raw_response,
-            prompt_options=prompt_options,
+            options=resolved_options,
         )
 
 
@@ -388,30 +377,33 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
 
     model_name: str
     provider_name: str = "google"
-    provider_options: dict[str, Any] = field(default_factory=dict)
     dimensions: int | None = None
     request_dimensions: int | None = None
-    embed_options: dict[str, Any] = field(default_factory=dict)
+    options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        unknown = sorted(set(self.embed_options) - _EMBED_REQUEST_OPTIONS)
+        if not isinstance(self.model_name, str) or not self.model_name.strip():
+            raise ValueError("Google embedding model must be a non-empty string")
+        unknown = sorted(set(self.options) - _EMBED_REQUEST_OPTIONS)
         if unknown:
             raise TypeError(f"Unsupported Google Embed option(s): {', '.join(unknown)}")
+        validated_options = validate_closed_embed_options("google", self.options, relation=False)
+        if _canonical_model_id(self.model_name) in _MODEL_UNSUPPORTED_OPTIONS:
+            raise ValueError(f"Google model {self.model_name!r} supports Prompt, not Embed")
         _validate_embedding_dimensions(self.model_name, self.dimensions)
         if _canonical_model_id(self.model_name) == "gemini-embedding-2":
             unsupported = sorted(
-                option for option in ("task_type", "title") if self.embed_options.get(option) is not None
+                option for option in ("task_type", "title") if validated_options.get(option) is not None
             )
             if unsupported:
                 raise ValueError(
                     f"Google model {self.model_name!r} does not support embedding option(s): {', '.join(unsupported)}"
                 )
-        task_type = self.embed_options.get("task_type")
-        title = self.embed_options.get("title")
+        task_type = validated_options.get("task_type")
+        title = validated_options.get("title")
         if title is not None and task_type != "RETRIEVAL_DOCUMENT":
             raise ValueError("Google embedding title is only valid with task_type='RETRIEVAL_DOCUMENT'")
-        self.provider_options = wrap_sensitive_options(self.provider_options)
-        self.embed_options = wrap_sensitive_options(self.embed_options)
+        self.options = wrap_sensitive_options(validated_options)
 
     def get_provider(self) -> str:
         return self.provider_name
@@ -420,7 +412,7 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
         return self.model_name
 
     def get_options(self) -> Options:
-        return dict(self.embed_options)
+        return dict(self.options)
 
     def get_dimensions(self) -> EmbeddingDimensions:
         if self.dimensions is not None:
@@ -428,24 +420,17 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
         return EmbeddingDimensions(size=_EMBEDDING_DIMS[_canonical_model_id(self.model_name)])
 
     def get_udf_options(self) -> UDFOptions:
-        return UDFOptions(
-            batch_size=_EMBED_BATCH_LIMIT,
-            max_retries=3,
-            on_error="raise",
-            actor_number=None,
-            num_gpus=0,
-        )
+        return UDFOptions(num_gpus=0)
 
     def is_async(self) -> bool:
         return True
 
     def instantiate(self) -> TextEmbedder:
         return GoogleTextEmbedder(
-            provider_options=self.provider_options,
+            options=self.options,
             model=self.model_name,
             dimensions=self.request_dimensions,
             provider_name=self.provider_name,
-            **self.embed_options,
         )
 
 
@@ -454,26 +439,17 @@ class GoogleTextEmbedder:
 
     def __init__(
         self,
-        provider_options: dict[str, Any],
+        options: dict[str, Any],
         model: str,
         dimensions: int | None = None,
         provider_name: str = "google",
-        **options: Any,
     ):
         from google import genai
         from google.genai import types
 
-        # Restore plaintext credentials sealed by the descriptor; plain dicts
-        # from direct callers pass through unchanged.
-        provider_options = unwrap_sensitive_options(provider_options)
         options = unwrap_sensitive_options(options)
-        api_key = provider_options.get("api_key")
         http_options = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
-        self._client = (
-            genai.Client(api_key=api_key, http_options=http_options)
-            if api_key
-            else genai.Client(http_options=http_options)
-        )
+        self._client = genai.Client(http_options=http_options)
         self._provider_name = provider_name
         self._model = model
         self._dimensions = dimensions
@@ -548,19 +524,22 @@ class GooglePrompterDescriptor(PrompterDescriptor):
 
     model_name: str
     provider_name: str = "google"
-    provider_options: dict[str, Any] = field(default_factory=dict)
     system_message: str | None = None
     return_format: dict[str, Any] | None = None
     return_raw_response: bool = False
-    prompt_options: dict[str, Any] = field(default_factory=dict)
+    options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("Google prompt model must be a non-empty string")
-        validate_prompt_options("google", self.prompt_options, relation=False)
-        _validate_prompt_options(self.model_name, self.prompt_options)
-        self.provider_options = wrap_sensitive_options(self.provider_options)
-        self.prompt_options = wrap_sensitive_options(self.prompt_options)
+        unknown = sorted(set(self.options) - _PROMPT_REQUEST_OPTIONS)
+        if unknown:
+            raise TypeError(f"Unsupported Google Prompt option(s): {', '.join(unknown)}")
+        validated_options = validate_closed_prompt_options("google", self.options, relation=False)
+        if _canonical_model_id(self.model_name) in _EMBEDDING_DIMS:
+            raise ValueError(f"Google model {self.model_name!r} supports Embed, not Prompt")
+        _validate_prompt_options(self.model_name, validated_options)
+        self.options = wrap_sensitive_options(validated_options)
 
     def get_provider(self) -> str:
         return self.provider_name
@@ -569,26 +548,19 @@ class GooglePrompterDescriptor(PrompterDescriptor):
         return self.model_name
 
     def get_options(self) -> Options:
-        return dict(self.prompt_options)
+        return dict(self.options)
 
     def get_udf_options(self) -> UDFOptions:
-        return UDFOptions(
-            max_retries=self.prompt_options.get("max_retries", 3),
-            actor_number=self.prompt_options.get("actor_number", 1),
-            num_gpus=0,
-            batch_size=self.prompt_options.get("batch_size", 32),
-            max_concurrency_per_actor=self.prompt_options.get("max_concurrency_per_actor", 16),
-        )
+        return UDFOptions(num_gpus=0)
 
     def instantiate(self) -> Prompter:
         return GooglePrompter(
-            provider_options=self.provider_options,
+            options=self.options,
             provider_name=self.provider_name,
             model=self.model_name,
             system_message=self.system_message,
             return_format=self.return_format,
             return_raw_response=self.return_raw_response,
-            **self.prompt_options,
         )
 
 
@@ -597,38 +569,25 @@ class GooglePrompter:
 
     def __init__(
         self,
-        provider_options: dict[str, Any],
+        options: dict[str, Any],
         model: str,
         system_message: str | None = None,
         return_format: dict[str, Any] | None = None,
         return_raw_response: bool = False,
         provider_name: str = "google",
-        **options: Any,
     ) -> None:
         from google import genai
         from google.genai import types
 
-        # Restore plaintext credentials sealed by the descriptor; plain dicts
-        # from direct callers pass through unchanged.
-        provider_options = unwrap_sensitive_options(provider_options)
         options = unwrap_sensitive_options(options)
-        api_key = provider_options.get("api_key")
         http_options = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
-        self._client = (
-            genai.Client(api_key=api_key, http_options=http_options)
-            if api_key
-            else genai.Client(http_options=http_options)
-        )
+        self._client = genai.Client(http_options=http_options)
         self._provider_name = provider_name
         self._model = model
         self._system_message = system_message
         self._return_format = return_format
         self._return_raw_response = return_raw_response
-        self._options = {
-            k: v
-            for k, v in options.items()
-            if k in {"temperature", "top_p", "top_k", "max_output_tokens", "stop_sequences"} and v is not None
-        }
+        self._options = {k: v for k, v in options.items() if k in _PROMPT_REQUEST_OPTIONS and v is not None}
 
     async def aclose(self) -> None:
         """Release the SDK client's async connection pool on the owning loop."""

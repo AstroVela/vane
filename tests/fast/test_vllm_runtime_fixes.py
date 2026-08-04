@@ -18,6 +18,20 @@ import pyarrow as pa
 import pytest
 
 
+def _packed_native_vllm_options(options):
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
+    return _build_native_vllm_options_argument(options)
+
+
+def _native_vllm_envelope(public_options_json):
+    return {
+        "__vane_vllm_payload_version": 1,
+        "__vane_vllm_public_options_json": public_options_json,
+        "__vane_vllm_secret_payload": b'{"payload_version":1,"values":[]}',
+    }
+
+
 def _packed_native_vllm_secret_options():
     from vane.ai._redaction import Secret
     from vane.ai.providers.vllm import _build_native_vllm_options_argument
@@ -37,6 +51,34 @@ def _packed_native_vllm_secret_options():
             },
         }
     )
+
+
+def test_native_vllm_options_without_secrets_use_the_versioned_envelope():
+    from duckdb.execution.vllm import normalize_options
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
+    packed = _build_native_vllm_options_argument({"batch_size": 4})
+
+    assert packed["__vane_vllm_payload_version"] == 1
+    assert json.loads(packed["__vane_vllm_public_options_json"]) == {"batch_size": 4}
+    assert json.loads(packed["__vane_vllm_secret_payload"]) == {
+        "payload_version": 1,
+        "values": [],
+    }
+    normalized = normalize_options(packed)
+    assert normalized["batch_size"] == 4
+    assert normalize_options(normalized) is normalized
+
+
+def test_native_vllm_struct_wire_rejects_legacy_naked_options():
+    from duckdb.execution.vllm import normalize_options
+
+    with pytest.raises(ValueError, match="versioned envelope"):
+        normalize_options({"batch_size": 4})
+    with pytest.raises(ValueError, match="versioned envelope"):
+        normalize_options('{"batch_size":4}')
+    with pytest.raises(ValueError, match="versioned envelope"):
+        normalize_options(None)
 
 
 def test_vllm_control_rpc_timeout_is_configurable(monkeypatch):
@@ -71,14 +113,14 @@ def test_vllm_control_rpc_timeout_falls_back_for_invalid_values(monkeypatch, con
         ({"batch_size": 0}, "batch_size"),
         ({"batch_size": True}, "batch_size"),
         ({"batch_size": 1.5}, "batch_size"),
-        ({"prefix_match_threshold": float("nan")}, "prefix_match_threshold"),
-        ({"prefix_match_threshold": float("inf")}, "prefix_match_threshold"),
+        ({"prefix_match_threshold": float("nan")}, "strict JSON"),
+        ({"prefix_match_threshold": float("inf")}, "strict JSON"),
         ({"prefix_match_threshold": True}, "prefix_match_threshold"),
         ({"prefix_match_threshold": Decimal("1.01")}, "prefix_match_threshold"),
         ({"gpus_per_actor": 0}, "gpus_per_actor"),
         ({"gpus_per_actor": 1.5}, "gpus_per_actor"),
         ({"gpus_per_actor": True}, "gpus_per_actor"),
-        ({"gpus_per_actor": Decimal("NaN")}, "gpus_per_actor"),
+        ({"gpus_per_actor": Decimal("NaN")}, "strict JSON"),
         ({"gpus_per_actor": Decimal("1.5")}, "gpus_per_actor"),
         ({"concurrency": True}, "concurrency"),
         ({"do_prefix_routing": "false"}, "do_prefix_routing"),
@@ -90,24 +132,31 @@ def test_vllm_numeric_options_are_strict(options, message):
     from duckdb.execution.vllm import normalize_options
 
     with pytest.raises(ValueError, match=message):
-        normalize_options(options)
+        normalize_options(_native_vllm_envelope(json.dumps(options, default=float)))
 
 
 def test_vllm_fractional_gpu_option_is_preserved():
     from duckdb.execution.vllm import normalize_options
 
-    assert normalize_options({"gpus_per_actor": 0.25})["gpus_per_actor"] == pytest.approx(0.25)
+    assert normalize_options(_packed_native_vllm_options({"gpus_per_actor": 0.25}))["gpus_per_actor"] == pytest.approx(
+        0.25
+    )
 
 
 def test_vllm_decimal_options_are_normalized_to_floats():
     from duckdb.execution.vllm import normalize_options
 
     normalized = normalize_options(
-        {
-            "gpus_per_actor": Decimal("0.25"),
-            "prefix_match_threshold": Decimal("0.33"),
-            "engine_init_timeout_s": Decimal("1.5"),
-        }
+        _native_vllm_envelope(
+            json.dumps(
+                {
+                    "gpus_per_actor": Decimal("0.25"),
+                    "prefix_match_threshold": Decimal("0.33"),
+                    "engine_init_timeout_s": Decimal("1.5"),
+                },
+                default=float,
+            )
+        )
     )
 
     assert normalized["gpus_per_actor"] == pytest.approx(0.25)
@@ -132,16 +181,16 @@ def test_vllm_execution_boolean_options_are_strict(name):
     from duckdb.execution.vllm import normalize_options
 
     with pytest.raises(ValueError, match=rf"vllm {name} must be a boolean"):
-        normalize_options({name: "false"})
+        normalize_options(_packed_native_vllm_options({name: "false"}))
 
-    assert normalize_options({name: False})[name] is False
+    assert normalize_options(_packed_native_vllm_options({name: False}))[name] is False
 
 
 def test_vllm_unknown_top_level_options_are_rejected():
     from duckdb.execution.vllm import normalize_options
 
     with pytest.raises(ValueError, match=r"unknown vllm option.*gpus_per_actorr"):
-        normalize_options({"gpus_per_actorr": 0.25})
+        normalize_options(_packed_native_vllm_options({"gpus_per_actorr": 0.25}))
 
 
 def test_vllm_opaque_secrets_restore_only_when_local_executor_is_created(monkeypatch):
@@ -268,7 +317,9 @@ def test_native_descriptor_forces_background_loop_inside_ray_actor(monkeypatch):
 
     monkeypatch.setattr(vllm_executor.LocalVLLMExecutor, "_run_event_loop", fake_run_event_loop)
 
-    options = NativeVLLMPromptPlan().build_physical_vllm_options()
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
+    options = _build_native_vllm_options_argument(NativeVLLMPromptPlan().build_physical_vllm_options())
     executor = vllm_executor.build_executor("test-model", options)
 
     assert executor._ray_actor_mode is False

@@ -16,12 +16,18 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 import numpy as np
 import pyarrow as pa
 
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
-from vane.ai._schema import serialize_raw_response
+from vane.ai._schema import (
+    _is_known_openai_prompt_model,
+    _openai_structured_outputs_capability,
+    _uses_openai_strict_structured_outputs,
+    serialize_raw_response,
+)
 from vane.ai.options import validate_embed_options, validate_prompt_options
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
@@ -54,6 +60,7 @@ _MODEL_INPUT_TOKEN_LIMITS: dict[str, int] = {
     "text-embedding-3-large": 8191,
 }
 _DEFAULT_INPUT_TOKEN_LIMIT = 8192
+_OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 _EMBED_CAPABILITY_ERROR_PARAMS = frozenset({"model", "dimensions", "encoding_format"})
 _EMBED_CAPABILITY_ERROR_CODES = frozenset(
@@ -67,6 +74,92 @@ _EMBED_CAPABILITY_ERROR_CODES = frozenset(
         "unsupported_model",
     }
 )
+_OPENAI_RESPONSES_ONLY_MODELS = frozenset(
+    {
+        "o1-pro",
+        "o1-pro-2025-03-19",
+        "o3-pro",
+        "o3-pro-2025-06-10",
+        "gpt-5-pro",
+        "gpt-5-pro-2025-10-06",
+    }
+)
+_OPENAI_CHAT_COMPLETIONS_ONLY_MODELS = frozenset(
+    {
+        "gpt-4o-search-preview",
+        "gpt-4o-search-preview-2025-03-11",
+        "gpt-4o-mini-search-preview",
+        "gpt-4o-mini-search-preview-2025-03-11",
+    }
+)
+_OPENAI_TEXT_ONLY_PROMPT_MODELS = frozenset(
+    {
+        "o1-mini",
+        "o1-mini-2024-09-12",
+        "o1-preview",
+        "o1-preview-2024-09-12",
+        "o3-mini",
+        "o3-mini-2025-01-31",
+        "gpt-4o-search-preview",
+        "gpt-4o-search-preview-2025-03-11",
+        "gpt-4o-mini-search-preview",
+        "gpt-4o-mini-search-preview-2025-03-11",
+    }
+)
+
+
+def _uses_official_openai_endpoint(base_url: Any) -> bool:
+    if base_url is None:
+        return True
+    if not isinstance(base_url, str):
+        return False
+    try:
+        parsed = urlsplit(base_url)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.casefold() == "https"
+        and parsed.hostname is not None
+        and parsed.hostname.casefold() == "api.openai.com"
+        and port in {None, 443}
+        and parsed.path.rstrip("/") == "/v1"
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.username is None
+        and parsed.password is None
+    )
+
+
+def _uses_openai_max_completion_tokens(model: str) -> bool:
+    normalized = model.strip().casefold()
+    return (
+        len(normalized) >= 2
+        and normalized[0] == "o"
+        and normalized[1].isdigit()
+        and (len(normalized) == 2 or normalized[2] in {"-", "."})
+    )
+
+
+def _validate_openai_prompt_capabilities(
+    model: str,
+    options: Mapping[str, Any],
+    *,
+    return_format: dict[str, Any] | None,
+) -> None:
+    """Reject only documented conflicts for known models on the official API."""
+    if not _uses_official_openai_endpoint(options.get("base_url")):
+        return
+    normalized = model.strip().casefold()
+    if normalized in _MODEL_DIMS:
+        raise ValueError(f"OpenAI model {model!r} supports Embed, not Prompt")
+    use_chat_completions = bool(options.get("use_chat_completions", False))
+    if use_chat_completions and normalized in _OPENAI_RESPONSES_ONLY_MODELS:
+        raise ValueError(f"OpenAI model {model!r} is available through the Responses API only")
+    if not use_chat_completions and normalized in _OPENAI_CHAT_COMPLETIONS_ONLY_MODELS:
+        raise ValueError(f"OpenAI model {model!r} is available through Chat Completions only")
+    if return_format is not None and _openai_structured_outputs_capability(model) == "unsupported":
+        raise ValueError(f"OpenAI model {model!r} does not support structured Prompt output")
 
 
 def _decode_openai_embedding_base64(value: str) -> np.ndarray:
@@ -79,9 +172,102 @@ def _get_input_token_limit(model: str) -> int:
     return _MODEL_INPUT_TOKEN_LIMITS.get(model, _DEFAULT_INPUT_TOKEN_LIMIT)
 
 
-def _chunk_text(text: str, char_size: int) -> list[str]:
-    """Split *text* into character-level chunks of at most *char_size*."""
-    return [text[i : i + char_size] for i in range(0, len(text), char_size)]
+class _TokenEstimator:
+    def __init__(self, encoding: Any | None = None) -> None:
+        self.encoding = encoding
+        self._max_token_bytes: int | None = None
+
+    def __call__(self, value: str) -> int:
+        if self.encoding is None:
+            return len(value.encode("utf-8"))
+        return len(self.encoding.encode_ordinary(value))
+
+    def max_token_bytes(self) -> int | None:
+        if self.encoding is None or not isinstance(getattr(self.encoding, "n_vocab", None), int):
+            return None
+        if self._max_token_bytes is None:
+            lengths: list[int] = []
+            for token in range(self.encoding.n_vocab):
+                try:
+                    lengths.append(len(self.encoding.decode_single_token_bytes(token)))
+                except KeyError:
+                    continue
+            self._max_token_bytes = max(lengths)
+        return self._max_token_bytes
+
+
+def _build_token_estimator(model: str, *, use_openai_tokenizer: bool) -> _TokenEstimator:
+    """Return one estimator shared by request batching and input chunking."""
+    if not use_openai_tokenizer:
+        return _TokenEstimator()
+
+    import tiktoken
+
+    return _TokenEstimator(tiktoken.encoding_for_model(model))
+
+
+def _chunk_tokenized_text(text: str, limit: int, estimate_tokens: _TokenEstimator) -> list[str]:
+    """Split with tokenizer guidance while preserving Unicode boundaries."""
+    encoding = estimate_tokens.encoding
+    assert encoding is not None
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        tokens = encoding.encode_ordinary(remaining)
+        if len(tokens) <= limit:
+            chunks.append(remaining)
+            break
+
+        guided_bytes = b"".join(encoding.decode_single_token_bytes(token) for token in tokens[:limit])
+        candidate = guided_bytes.decode("utf-8", errors="ignore")
+        while candidate and estimate_tokens(candidate) > limit:
+            candidate = candidate[:-1]
+
+        if not candidate:
+            byte_budget = estimate_tokens.max_token_bytes()
+            max_bytes = byte_budget * limit if byte_budget is not None else None
+            prefix_bytes = 0
+            for end, character in enumerate(remaining, start=1):
+                prefix_bytes += len(character.encode("utf-8"))
+                if max_bytes is not None and prefix_bytes > max_bytes:
+                    break
+                prefix = remaining[:end]
+                if estimate_tokens(prefix) <= limit:
+                    candidate = prefix
+                    break
+
+        if not candidate:
+            raise ValueError(
+                "OpenAI embedding token limit is too small for one input character; increase the configured limit"
+            )
+        chunks.append(candidate)
+        remaining = remaining[len(candidate) :]
+    return chunks
+
+
+def _chunk_text_by_token_limit(text: str, limit: int, estimate_tokens: Any) -> list[str]:
+    """Split text on character boundaries without exceeding a token estimate."""
+    if isinstance(estimate_tokens, _TokenEstimator) and estimate_tokens.encoding is not None:
+        return _chunk_tokenized_text(text, limit, estimate_tokens)
+
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        if estimate_tokens(text[start : start + 1]) > limit:
+            raise ValueError(
+                "OpenAI embedding token limit is too small for one input character; increase the configured limit"
+            )
+        low = start + 1
+        high = len(text)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if estimate_tokens(text[start:middle]) <= limit:
+                low = middle
+            else:
+                high = middle - 1
+        chunks.append(text[start:low])
+        start = low
+    return chunks
 
 
 def _is_embedding_capability_error(exc: Exception) -> bool:
@@ -163,46 +349,37 @@ class OpenAIProvider(Provider):
     DEFAULT_TEXT_EMBEDDER = "text-embedding-3-small"
     DEFAULT_PROMPTER_MODEL = "gpt-4o-mini"
 
-    def __init__(self, name: str | None = None, **options: Any):
+    def __init__(self, name: str | None = None):
         self._name = name or "openai"
-        self._options: dict[str, Any] = options
 
     @property
     def name(self) -> str:
         return self._name
 
-    _CLIENT_KEYS = {"api_key", "base_url", "organization", "timeout", "max_retries"}
-    _PROMPT_CLIENT_KEYS = {"api_key", "base_url", "organization", "timeout"}
-    _EMBED_CLIENT_KEYS = _CLIENT_KEYS - {"max_retries"}
-    _EMBED_REQUEST_KEYS = {"encoding_format", "batch_token_limit", "input_text_token_limit"}
+    _EMBED_OPTIONS = {"base_url", "timeout", "encoding_format", "batch_token_limit", "input_text_token_limit"}
+    _PROMPT_OPTIONS = {
+        "base_url",
+        "timeout",
+        "use_chat_completions",
+        "temperature",
+        "max_output_tokens",
+        "top_p",
+        "stop_sequences",
+    }
 
     def get_text_embedder(
         self,
         model: str | None = None,
         dimensions: int | None = None,
-        **options: Any,
+        *,
+        options: Mapping[str, Any] | None = None,
     ) -> TextEmbedderDescriptor:
-        merged = {**self._options, **options}
-        unknown = sorted(set(merged) - self._EMBED_CLIENT_KEYS - self._EMBED_REQUEST_KEYS)
-        if unknown:
-            raise TypeError(f"Unsupported OpenAI Embed option(s): {', '.join(unknown)}")
-        validate_embed_options(
-            "openai",
-            {
-                key: value
-                for key, value in merged.items()
-                if key in self._EMBED_REQUEST_KEYS or key in {"base_url", "timeout"}
-            },
-            relation=False,
-        )
-        provider_opts = {key: value for key, value in merged.items() if key in self._EMBED_CLIENT_KEYS}
-        embed_opts = {key: value for key, value in merged.items() if key in self._EMBED_REQUEST_KEYS}
+        resolved_options = dict(options or {})
         return OpenAITextEmbedderDescriptor(
             provider_name=self._name,
-            provider_options=provider_opts,
             model_name=model or self.DEFAULT_TEXT_EMBEDDER,
             dimensions=dimensions,
-            embed_options=embed_opts,
+            options=resolved_options,
         )
 
     def get_prompter(
@@ -211,31 +388,17 @@ class OpenAIProvider(Provider):
         system_message: str | None = None,
         return_format: dict[str, Any] | None = None,
         return_raw_response: bool = False,
-        **options: Any,
+        *,
+        options: Mapping[str, Any] | None = None,
     ) -> PrompterDescriptor:
-        provider_opts = {key: value for key, value in self._options.items() if key in self._PROMPT_CLIENT_KEYS}
-        prompt_options = {key: value for key, value in self._options.items() if key not in self._PROMPT_CLIENT_KEYS}
-        prompt_options.update(options)
-        validation_options = {key: value for key, value in provider_opts.items() if key in {"base_url", "timeout"}}
-        validation_options.update(prompt_options)
-        validate_prompt_options("openai", validation_options, relation=False)
-        for key in ("base_url", "timeout"):
-            if key in prompt_options:
-                value = prompt_options.pop(key)
-                if value is None:
-                    provider_opts.pop(key, None)
-                else:
-                    provider_opts[key] = value
-        use_chat_completions = prompt_options.pop("use_chat_completions", False)
+        resolved_options = dict(options or {})
         return OpenAIPrompterDescriptor(
             provider_name=self._name,
-            provider_options=provider_opts,
             model_name=model or self.DEFAULT_PROMPTER_MODEL,
             system_message=system_message,
-            use_chat_completions=use_chat_completions,
             return_format=return_format,
             return_raw_response=return_raw_response,
-            prompt_options=prompt_options,
+            options=resolved_options,
         )
 
 
@@ -249,36 +412,48 @@ class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
     """Serializable factory for an OpenAI text embedder."""
 
     provider_name: str = "openai"
-    provider_options: dict[str, Any] = field(default_factory=dict)
     model_name: str = "text-embedding-3-small"
     dimensions: int | None = None
-    embed_options: dict[str, Any] = field(default_factory=dict)
+    options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        unknown = sorted(set(self.embed_options) - OpenAIProvider._EMBED_REQUEST_KEYS)
+        if not isinstance(self.model_name, str) or not self.model_name.strip():
+            raise ValueError("OpenAI embedding model must be a non-empty string")
+        unknown = sorted(set(self.options) - OpenAIProvider._EMBED_OPTIONS)
         if unknown:
             raise TypeError(f"Unsupported OpenAI Embed option(s): {', '.join(unknown)}")
+        validated_options = validate_embed_options("openai", self.options, relation=False)
+        normalized_model = self.model_name.strip().casefold()
+        official_endpoint = _uses_official_openai_endpoint(validated_options.get("base_url"))
+        if official_endpoint and _is_known_openai_prompt_model(normalized_model):
+            raise ValueError(f"OpenAI model {self.model_name!r} supports Prompt, not Embed")
         if self.dimensions is not None and (
             isinstance(self.dimensions, bool) or not isinstance(self.dimensions, int) or self.dimensions <= 0
         ):
             raise ValueError("Embedding dimensions must be a positive integer")
         if (
-            self.dimensions is not None
-            and self.model_name in _MODEL_DIMS
-            and self.model_name not in _DIMENSION_OVERRIDABLE
+            official_endpoint
+            and self.dimensions is not None
+            and normalized_model in _MODEL_DIMS
+            and normalized_model not in _DIMENSION_OVERRIDABLE
         ):
             raise ValueError(f"Model {self.model_name!r} does not support custom dimensions")
         if (
-            self.dimensions is not None
-            and self.model_name in _DIMENSION_OVERRIDABLE
-            and self.dimensions > _MODEL_DIMS[self.model_name]
+            official_endpoint
+            and self.dimensions is not None
+            and normalized_model in _DIMENSION_OVERRIDABLE
+            and self.dimensions > _MODEL_DIMS[normalized_model]
         ):
             raise ValueError(
-                f"Model {self.model_name!r} supports at most {_MODEL_DIMS[self.model_name]} dimensions, "
+                f"Model {self.model_name!r} supports at most {_MODEL_DIMS[normalized_model]} dimensions, "
                 f"got {self.dimensions}"
             )
-        self.provider_options = _wrap_openai_options(self.provider_options)
-        self.embed_options = _wrap_openai_options(self.embed_options)
+        if not official_endpoint and self.dimensions is None:
+            raise ValueError(
+                f"Cannot determine embedding dimensions for OpenAI-compatible model {self.model_name!r} "
+                "from trusted local metadata; pass dimensions=... explicitly"
+            )
+        self.options = _wrap_openai_options(validated_options)
 
     def get_provider(self) -> str:
         return self.provider_name
@@ -287,43 +462,31 @@ class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
         return self.model_name
 
     def get_options(self) -> Options:
-        return dict(self.embed_options)
+        return dict(self.options)
 
     def get_dimensions(self) -> EmbeddingDimensions:
         if self.dimensions is not None:
             return EmbeddingDimensions(size=self.dimensions, dtype=pa.float32())
-        if self.model_name in _MODEL_DIMS:
-            return EmbeddingDimensions(size=_MODEL_DIMS[self.model_name], dtype=pa.float32())
+        normalized_model = self.model_name.strip().casefold()
+        if _uses_official_openai_endpoint(self.options.get("base_url")) and normalized_model in _MODEL_DIMS:
+            return EmbeddingDimensions(size=_MODEL_DIMS[normalized_model], dtype=pa.float32())
         raise ValueError(
             f"Cannot determine embedding dimensions for OpenAI-compatible model {self.model_name!r} "
             "from trusted local metadata; pass dimensions=... explicitly"
         )
 
     def get_udf_options(self) -> UDFOptions:
-        return UDFOptions(
-            batch_size=64,
-            max_retries=3,
-            on_error="raise",
-            actor_number=None,
-            num_gpus=0,
-        )
+        return UDFOptions(num_gpus=0)
 
     def is_async(self) -> bool:
         return True
 
     def instantiate(self) -> TextEmbedder:
-        provider_options = dict(self.provider_options)
-        # Embed retries belong to Vane's row-aware wrapper. Disable SDK retry
-        # stacking so max_retries has one deterministic meaning.
-        provider_options["max_retries"] = 0
         return OpenAITextEmbedder(
-            provider_options=provider_options,
+            options=self.options,
             provider_name=self.provider_name,
             model=self.model_name,
             dimensions=self.dimensions,
-            encoding_format=self.embed_options.get("encoding_format", "float"),
-            batch_token_limit=self.embed_options.get("batch_token_limit", 300_000),
-            input_text_token_limit=self.embed_options.get("input_text_token_limit", None),
         )
 
 
@@ -335,43 +498,47 @@ class OpenAITextEmbedder:
     * **batch_token_limit** — max estimated tokens per API request (default 300k).
     * **input_text_token_limit** — max tokens for a single input text.
       Texts exceeding this are split into character chunks, embedded
-      separately, and recombined via length-weighted averaging + L2
-      normalisation.  The estimation is conservative: ``ceil(len(text) / 3)``
-      (≈ 1 token per 3 chars), which is O(1) and avoids a tiktoken
-      dependency.
+      separately, and recombined via token-weighted averaging + L2
+      normalisation. Known OpenAI embedding models use their model-specific
+      tokenizer; unknown compatible models use UTF-8 byte length as a safe
+      upper bound.
     """
 
     def __init__(
         self,
-        provider_options: dict[str, Any],
+        options: dict[str, Any],
         model: str,
         dimensions: int | None = None,
-        encoding_format: str = "float",
-        batch_token_limit: int = 300_000,
-        input_text_token_limit: int | None = None,
         provider_name: str = "openai",
     ):
         from openai import AsyncOpenAI
 
+        options = unwrap_sensitive_options(options)
+        encoding_format = options.get("encoding_format", "float")
         if encoding_format not in {"float", "base64"}:
             raise ValueError("encoding_format must be 'float' or 'base64'")
-        # Restore plaintext credentials sealed by the descriptor; plain dicts
-        # from direct callers pass through unchanged.
-        provider_options = unwrap_sensitive_options(provider_options)
         self._provider_name = provider_name
         self._model = model
         self._dimensions = dimensions
         self._encoding_format = encoding_format
-        self._batch_token_limit = batch_token_limit
+        self._batch_token_limit = options.get("batch_token_limit", 300_000)
+        input_text_token_limit = options.get("input_text_token_limit")
         self._input_text_token_limit = (
             input_text_token_limit if input_text_token_limit is not None else _get_input_token_limit(model)
         )
-        # Filter out non-OpenAI keys before passing to client
+        self._estimate_tokens = _build_token_estimator(
+            model,
+            use_openai_tokenizer=(
+                model in _MODEL_INPUT_TOKEN_LIMITS and _uses_official_openai_endpoint(options.get("base_url"))
+            ),
+        )
         client_opts = {
-            k: v
-            for k, v in provider_options.items()
-            if k in {"api_key", "base_url", "organization", "timeout", "max_retries"}
+            "base_url": options.get("base_url") or _OPENAI_DEFAULT_BASE_URL,
+            **({"timeout": options["timeout"]} if options.get("timeout") is not None else {}),
         }
+        # Retries belong to Vane's row-aware wrapper, so the SDK must not
+        # stack its own retries underneath the public max_retries contract.
+        client_opts["max_retries"] = 0
         self._client = AsyncOpenAI(**client_opts)
 
     async def aclose(self) -> None:
@@ -382,10 +549,7 @@ class OpenAITextEmbedder:
         embeddings: list[Embedding] = []
         batch: list[str] = []
         batch_tokens = 0
-        approx_chars_per_token = 3
-
-        def estimate_tokens(value: str) -> int:
-            return (len(value) + approx_chars_per_token - 1) // approx_chars_per_token
+        estimate_tokens = self._estimate_tokens
 
         async def flush() -> None:
             nonlocal batch, batch_tokens
@@ -406,8 +570,7 @@ class OpenAITextEmbedder:
                 # Oversized single input — flush pending batch, chunk, embed,
                 # then recombine via weighted average + L2 normalisation.
                 await flush()
-                chunk_char_size = single_input_limit * approx_chars_per_token
-                chunks = _chunk_text(item, chunk_char_size)
+                chunks = _chunk_text_by_token_limit(item, single_input_limit, estimate_tokens)
                 chunk_embeddings: list[Embedding] = []
                 chunk_batch: list[str] = []
                 chunk_batch_tokens = 0
@@ -422,7 +585,7 @@ class OpenAITextEmbedder:
                 if chunk_batch:
                     chunk_embeddings.extend(await self._embed_batch(chunk_batch))
                 chunk_lens = np.array(
-                    [len(c) for c in chunks],
+                    [estimate_tokens(c) for c in chunks],
                     dtype=np.float64,
                 )
                 avg = np.average(chunk_embeddings, axis=0, weights=chunk_lens)
@@ -508,26 +671,29 @@ class OpenAIPrompterDescriptor(PrompterDescriptor):
     """Serializable factory for a basic text/image OpenAI prompter."""
 
     provider_name: str = "openai"
-    provider_options: dict[str, Any] = field(default_factory=dict)
     model_name: str = "gpt-4o-mini"
     system_message: str | None = None
-    use_chat_completions: bool = False
     return_format: dict[str, Any] | None = None
     return_raw_response: bool = False
-    prompt_options: dict[str, Any] = field(default_factory=dict)
+    options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("OpenAI prompt model must be a non-empty string")
-        validation_options = {
-            key: value for key, value in self.provider_options.items() if key in {"base_url", "timeout"}
-        }
-        validation_options.update(self.prompt_options)
-        validate_prompt_options("openai", validation_options, relation=False)
-        if self.prompt_options.get("stop_sequences") is not None and not self.use_chat_completions:
+        unknown = sorted(set(self.options) - OpenAIProvider._PROMPT_OPTIONS)
+        if unknown:
+            raise TypeError(f"Unsupported OpenAI Prompt option(s): {', '.join(unknown)}")
+        validated_options = validate_prompt_options("openai", self.options, relation=False)
+        if validated_options.get("stop_sequences") is not None and not validated_options.get(
+            "use_chat_completions", False
+        ):
             raise ValueError("OpenAI stop_sequences requires use_chat_completions=True")
-        self.provider_options = _wrap_openai_options(self.provider_options)
-        self.prompt_options = _wrap_openai_options(self.prompt_options)
+        _validate_openai_prompt_capabilities(
+            self.model_name,
+            validated_options,
+            return_format=self.return_format,
+        )
+        self.options = _wrap_openai_options(validated_options)
 
     def get_provider(self) -> str:
         return self.provider_name
@@ -536,27 +702,31 @@ class OpenAIPrompterDescriptor(PrompterDescriptor):
         return self.model_name
 
     def get_options(self) -> Options:
-        return dict(self.prompt_options)
+        return dict(self.options)
+
+    def supports_strict_structured_outputs(self) -> bool:
+        return _uses_official_openai_endpoint(self.options.get("base_url")) and _uses_openai_strict_structured_outputs(
+            self.model_name
+        )
+
+    def supports_image_inputs(self) -> bool:
+        return not (
+            _uses_official_openai_endpoint(self.options.get("base_url"))
+            and self.model_name.strip().casefold() in _OPENAI_TEXT_ONLY_PROMPT_MODELS
+        )
 
     def get_udf_options(self) -> UDFOptions:
-        return UDFOptions(
-            max_retries=self.prompt_options.get("max_retries", 3),
-            actor_number=self.prompt_options.get("actor_number", 1),
-            num_gpus=0,
-            batch_size=self.prompt_options.get("batch_size", 32),
-            max_concurrency_per_actor=self.prompt_options.get("max_concurrency_per_actor", 32),
-        )
+        return UDFOptions(num_gpus=0)
 
     def instantiate(self) -> Prompter:
         return OpenAIPrompter(
-            provider_options=self.provider_options,
+            options=self.options,
             provider_name=self.provider_name,
             model=self.model_name,
             system_message=self.system_message,
-            use_chat_completions=self.use_chat_completions,
             return_format=self.return_format,
             return_raw_response=self.return_raw_response,
-            **self.prompt_options,
+            strict_structured_outputs=self.supports_strict_structured_outputs(),
         )
 
 
@@ -565,34 +735,37 @@ class OpenAIPrompter:
 
     def __init__(
         self,
-        provider_options: dict[str, Any],
+        options: dict[str, Any],
         model: str,
         system_message: str | None = None,
-        use_chat_completions: bool = False,
         return_format: dict[str, Any] | None = None,
         return_raw_response: bool = False,
         provider_name: str = "openai",
-        **options: Any,
+        strict_structured_outputs: bool | None = None,
     ) -> None:
         from openai import AsyncOpenAI
 
-        # Restore plaintext credentials sealed by the descriptor; plain dicts
-        # from direct callers pass through unchanged.
-        provider_options = unwrap_sensitive_options(provider_options)
         options = unwrap_sensitive_options(options)
         self._provider_name = provider_name
         self._model = model
         self._system_message = system_message
-        self._use_chat_completions = use_chat_completions
+        self._use_chat_completions = bool(options.get("use_chat_completions", False))
         self._return_format = return_format
         self._return_raw_response = return_raw_response
+        self._official_openai_endpoint = _uses_official_openai_endpoint(options.get("base_url"))
+        self._strict_structured_outputs = (
+            self._official_openai_endpoint and _uses_openai_strict_structured_outputs(model)
+            if strict_structured_outputs is None
+            else strict_structured_outputs
+        )
         self._options = {
             key: value
             for key, value in options.items()
             if key in {"temperature", "max_output_tokens", "top_p", "stop_sequences"} and value is not None
         }
         client_opts = {
-            k: v for k, v in provider_options.items() if k in {"api_key", "base_url", "organization", "timeout"}
+            "base_url": options.get("base_url") or _OPENAI_DEFAULT_BASE_URL,
+            **({"timeout": options["timeout"]} if options.get("timeout") is not None else {}),
         }
         client_opts["max_retries"] = 0
         self._client = AsyncOpenAI(**client_opts)
@@ -665,19 +838,30 @@ class OpenAIPrompter:
     def _chat_completions_options(self) -> dict[str, Any]:
         options = dict(self._options)
         if "max_output_tokens" in options:
-            options["max_tokens"] = options["max_output_tokens"]
+            token_limit_name = (
+                "max_completion_tokens"
+                if getattr(self, "_official_openai_endpoint", False) and _uses_openai_max_completion_tokens(self._model)
+                else "max_tokens"
+            )
+            options[token_limit_name] = options["max_output_tokens"]
         options.pop("max_output_tokens", None)
         if "stop_sequences" in options:
             options["stop"] = options.pop("stop_sequences")
         return_format = getattr(self, "_return_format", None)
         if return_format is not None:
+            json_schema = {
+                "name": _structured_output_name(return_format),
+                "schema": return_format,
+            }
+            if getattr(
+                self,
+                "_strict_structured_outputs",
+                _uses_openai_strict_structured_outputs(self._model),
+            ):
+                json_schema["strict"] = True
             options["response_format"] = {
                 "type": "json_schema",
-                "json_schema": {
-                    "name": _structured_output_name(return_format),
-                    "schema": return_format,
-                    "strict": True,
-                },
+                "json_schema": json_schema,
             }
         return options
 
@@ -685,14 +869,18 @@ class OpenAIPrompter:
         options = dict(self._options)
         return_format = getattr(self, "_return_format", None)
         if return_format is not None:
-            options["text"] = {
-                "format": {
-                    "type": "json_schema",
-                    "name": _structured_output_name(return_format),
-                    "schema": return_format,
-                    "strict": True,
-                }
+            response_format = {
+                "type": "json_schema",
+                "name": _structured_output_name(return_format),
+                "schema": return_format,
             }
+            if getattr(
+                self,
+                "_strict_structured_outputs",
+                _uses_openai_strict_structured_outputs(self._model),
+            ):
+                response_format["strict"] = True
+            options["text"] = {"format": response_format}
         return options
 
     async def _prompt_chat_completions(self, messages: list[dict[str, Any]]) -> str | None:

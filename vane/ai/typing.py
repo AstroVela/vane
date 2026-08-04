@@ -58,15 +58,13 @@ class Descriptor(ABC, Generic[T]):
         ...
 
     def get_udf_options(self) -> UDFOptions:
-        """Extract UDF execution options from the provider options."""
-        opts = self.get_options()
-        return UDFOptions(
-            actor_number=opts.get("actor_number"),
-            num_gpus=opts.get("num_gpus"),
-            max_retries=opts.get("max_retries", 3),
-            on_error=opts.get("on_error", "raise"),
-            batch_size=opts.get("batch_size"),
-        )
+        """Return descriptor-derived resource requirements, if any.
+
+        Prompt and Embed execution options are normalized from their closed
+        call-level option mappings. Descriptors must not provide a second set
+        of execution defaults.
+        """
+        return UDFOptions()
 
 
 @dataclass(frozen=True)

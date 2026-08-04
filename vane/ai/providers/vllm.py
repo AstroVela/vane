@@ -104,14 +104,14 @@ def _split_native_vllm_secrets(value: Any, secrets: list[Any], path: str = "opti
     return value
 
 
-def _build_native_vllm_options_argument(options: Mapping[str, Any]) -> str | dict[str, Any]:
-    """Encode sealed native options without exposing them as structured plan fields.
+def _build_native_vllm_options_argument(options: Mapping[str, Any]) -> dict[str, Any]:
+    """Encode native options in the single versioned STRUCT wire format.
 
-    Plans without credentials retain the legacy JSON representation. Credential-
-    bearing plans use a versioned STRUCT envelope: public options remain JSON,
-    while plaintext values are confined to an opaque BLOB. Opaque here means
-    excluded from structured plan rendering, not encrypted. The runtime decodes
-    the BLOB with strict JSON rather than executable pickle data.
+    Public options remain JSON while sealed plaintext values are confined to an
+    opaque BLOB. Opaque here means excluded from structured plan rendering, not
+    encrypted. The runtime decodes the BLOB with strict JSON rather than
+    executable pickle data. Plans without credentials use the same envelope
+    with an empty values payload.
     """
     canonical = _canonicalize_native_plan_json(options)
     assert isinstance(canonical, dict)
@@ -123,9 +123,6 @@ def _build_native_vllm_options_argument(options: Mapping[str, Any]) -> str | dic
     secrets: list[Any] = []
     public_options = _split_native_vllm_secrets(canonical, secrets)
     public_options_json = _serialize_native_vllm_options(public_options)
-    if not secrets:
-        return public_options_json
-
     secret_payload = _dump_vllm_protocol_json(
         {
             _NATIVE_SECRET_PAYLOAD_VERSION_KEY: _NATIVE_OPTIONS_PAYLOAD_VERSION,
@@ -144,9 +141,8 @@ class VLLMProvider(Provider):
 
     DEFAULT_MODEL = "Qwen/Qwen3-1.7B"
 
-    def __init__(self, name: str | None = None, **options: Any):
+    def __init__(self, name: str | None = None):
         self._name = name or "vllm"
-        self._options: dict[str, Any] = options
 
     @property
     def name(self) -> str:
@@ -158,12 +154,12 @@ class VLLMProvider(Provider):
         system_message: str | None = None,
         return_format: dict[str, Any] | None = None,
         return_raw_response: bool = False,
-        **options: Any,
+        *,
+        options: Mapping[str, Any] | None = None,
     ) -> NativeVLLMPromptPlan:
         if return_raw_response:
             raise ValueError("Provider 'vllm' does not support return_raw_response")
-        merged = {**self._options, **options}
-        validate_prompt_options("vllm", merged, relation=False)
+        prepared = validate_prompt_options("vllm", options or {}, relation=False)
         model_name = model or self.DEFAULT_MODEL
         if not isinstance(model_name, str) or not model_name.strip():
             raise ValueError("vLLM prompt model must be a non-empty string")
@@ -172,7 +168,7 @@ class VLLMProvider(Provider):
             model_name=model_name,
             system_message=system_message,
             return_format=return_format,
-            vllm_options=merged,
+            vllm_options=prepared,
         )
 
 
@@ -196,7 +192,6 @@ class NativeVLLMPromptPlan(NativePrompterPlan):
     def __post_init__(self) -> None:
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("vLLM prompt model must be a non-empty string")
-        validate_prompt_options("vllm", self.vllm_options, relation=False)
         self.vllm_options = wrap_sensitive_options(self.vllm_options)
 
     def get_provider(self) -> str:

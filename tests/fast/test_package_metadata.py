@@ -106,7 +106,7 @@ def test_distribution_declares_alpha_version_and_apache_license_expression():
 
 
 def test_provider_extras_match_provider_import_errors():
-    assert _requirements_for_extra("openai") == {"openai"}
+    assert _requirements_for_extra("openai") == {"openai", "tiktoken"}
     assert _requirements_for_extra("anthropic") == {"anthropic"}
     assert _requirements_for_extra("google") == {"google-genai"}
     assert {"sentence-transformers", "torch", "transformers"} <= _requirements_for_extra("transformers")

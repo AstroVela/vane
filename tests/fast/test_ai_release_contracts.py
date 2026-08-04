@@ -86,8 +86,12 @@ def test_anthropic_zero_token_structured_contract_without_optional_sdk():
     return_format = compile_return_format(schema)
 
     with pytest.raises(ValueError, match="max_tokens=0.*structured"):
-        provider.get_prompter(model="claude-test", return_format=return_format, max_tokens=0)
-    assert provider.get_prompter(model="claude-test", max_tokens=0).prompt_options["max_tokens"] == 0
+        provider.get_prompter(
+            model="claude-test",
+            return_format=return_format,
+            options={"max_tokens": 0},
+        )
+    assert provider.get_prompter(model="claude-test", options={"max_tokens": 0}).options["max_tokens"] == 0
 
 
 def test_non_pydantic_schema_class_is_rejected_without_optional_dependency(monkeypatch):
@@ -134,6 +138,7 @@ def test_non_capability_provider_failures_are_safe_before_execution_wires(monkey
     embedder._encoding_format = "float"
     embedder._batch_token_limit = 100
     embedder._input_text_token_limit = 100
+    embedder._estimate_tokens = lambda value: len(value.encode("utf-8"))
 
     class EmbedDescriptor:
         def get_provider(self):

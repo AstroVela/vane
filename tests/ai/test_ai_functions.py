@@ -123,7 +123,7 @@ class MockProvider(Provider):
     def name(self) -> str:
         return "mock"
 
-    def get_text_embedder(self, model=None, dimensions=None, **_options) -> TextEmbedderDescriptor:
+    def get_text_embedder(self, model=None, dimensions=None, *, options=None) -> TextEmbedderDescriptor:
         return MockTextEmbedderDescriptor(dim=dimensions or 4)
 
     def get_text_classifier(self, model=None, **_options) -> TextClassifierDescriptor:
@@ -300,7 +300,7 @@ class TestGoogleProviderEmbedPlanning:
     def test_get_text_embedder_uses_builtin_default(self):
         from vane.ai.providers.google import GoogleProvider
 
-        descriptor = GoogleProvider(api_key="test").get_text_embedder()
+        descriptor = GoogleProvider().get_text_embedder()
 
         assert descriptor.model_name == "gemini-embedding-2"
         assert descriptor.get_dimensions().size == 3072
@@ -309,7 +309,7 @@ class TestGoogleProviderEmbedPlanning:
         from vane.ai.providers.google import GoogleProvider
 
         with pytest.raises(ValueError, match=r"gemini-embedding-2.*task_type"):
-            GoogleProvider(api_key="test").get_text_embedder(task_type="RETRIEVAL_QUERY")
+            GoogleProvider().get_text_embedder(options={"task_type": "RETRIEVAL_QUERY"})
 
     @pytest.mark.parametrize("model", ["gemini-embedding-2", "models/gemini-embedding-2"])
     @pytest.mark.parametrize(
@@ -323,14 +323,29 @@ class TestGoogleProviderEmbedPlanning:
         from vane.ai.providers.google import GoogleTextEmbedderDescriptor
 
         with pytest.raises(ValueError, match=r"gemini-embedding-2.*task_type|title"):
-            GoogleTextEmbedderDescriptor(model_name=model, embed_options=embed_options)
+            GoogleTextEmbedderDescriptor(model_name=model, options=embed_options)
 
     def test_embedding_2_accepts_explicit_null_request_options(self):
         from vane.ai.providers.google import GoogleProvider
 
-        descriptor = GoogleProvider(api_key="test").get_text_embedder(task_type=None, title=None)
+        descriptor = GoogleProvider().get_text_embedder(options={"task_type": None, "title": None})
 
         assert descriptor.model_name == "gemini-embedding-2"
+
+    def test_embedding_dimension_priority_is_call_then_builtin_then_unknown_metadata(self):
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider(embedding_dimensions=512)
+        builtin = provider.get_text_embedder()
+        explicit = provider.get_text_embedder(dimensions=256)
+        unknown = GoogleProvider(
+            embedding_model="custom-fixed-model",
+            embedding_dimensions=128,
+        ).get_text_embedder()
+
+        assert (builtin.get_dimensions().size, builtin.request_dimensions) == (3072, None)
+        assert (explicit.get_dimensions().size, explicit.request_dimensions) == (256, 256)
+        assert (unknown.get_dimensions().size, unknown.request_dimensions) == (128, None)
 
     @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
     def test_provider_dimension_metadata_is_not_sent_as_request_override(self):
@@ -368,7 +383,7 @@ class TestGoogleProviderEmbedPlanning:
         from vane.ai.providers.google import GoogleTextEmbedder
 
         with patch("google.genai.Client") as client:
-            GoogleTextEmbedder(provider_options={"api_key": "test"}, model="embedding-model")
+            GoogleTextEmbedder(options={}, model="embedding-model")
 
         retry_options = client.call_args.kwargs["http_options"].retry_options
         assert retry_options.attempts == 1
@@ -390,7 +405,7 @@ class TestGoogleEmbeddingRowPreservation:
 
         with patch("google.genai.Client"):
             embedder = GoogleTextEmbedder(
-                provider_options={"api_key": "test"},
+                options={},
                 model="gemini-embedding-2",
             )
         embed_content = AsyncMock(return_value=SimpleNamespace(embeddings=embeddings))
@@ -571,20 +586,12 @@ class TestGoogleEmbeddingBatching:
             assert call["config"]["output_dimensionality"] == 256
             assert call["config"]["task_type"] == "RETRIEVAL_QUERY"
 
-    def test_udf_batch_size_defaults_to_request_cap(self):
-        """The descriptor's UDF batch size defaults to the per-request cap."""
+    def test_descriptor_only_reports_resource_requirements(self):
         from vane.ai.providers.google import GoogleTextEmbedderDescriptor
 
         desc = GoogleTextEmbedderDescriptor(model_name="gemini-embedding-001")
-        assert desc.get_udf_options().batch_size == 100
-
-    def test_udf_batch_size_cap_applies_to_aggregating_model(self):
-        """Per-Content encoding keeps gemini-embedding-2 row-preserving at
-        full chunk size, so it gets the same default cap as other models."""
-        from vane.ai.providers.google import GoogleTextEmbedderDescriptor
-
-        desc = GoogleTextEmbedderDescriptor(model_name="gemini-embedding-2")
-        assert desc.get_udf_options().batch_size == 100
+        assert desc.get_udf_options().batch_size is None
+        assert desc.get_udf_options().num_gpus == 0
 
     def test_descriptor_rejects_legacy_batch_size_override(self):
         from vane.ai.providers.google import GoogleTextEmbedderDescriptor
@@ -592,7 +599,7 @@ class TestGoogleEmbeddingBatching:
         with pytest.raises(TypeError, match="batch_size"):
             GoogleTextEmbedderDescriptor(
                 model_name="gemini-embedding-001",
-                embed_options={"batch_size": 25},
+                options={"batch_size": 25},
             )
 
 
@@ -1227,22 +1234,122 @@ class TestOpenAITokenLimits:
         assert _get_input_token_limit("custom-embed-model") == 8192
 
     def test_chunk_text_basic(self):
-        from vane.ai.providers.openai import _chunk_text
+        from vane.ai.providers.openai import _chunk_text_by_token_limit
 
-        result = _chunk_text("abcdefgh", 3)
+        result = _chunk_text_by_token_limit("abcdefgh", 3, len)
         assert result == ["abc", "def", "gh"]
 
     def test_chunk_text_exact(self):
-        from vane.ai.providers.openai import _chunk_text
+        from vane.ai.providers.openai import _chunk_text_by_token_limit
 
-        result = _chunk_text("abcdef", 3)
+        result = _chunk_text_by_token_limit("abcdef", 3, len)
         assert result == ["abc", "def"]
 
     def test_chunk_text_short(self):
-        from vane.ai.providers.openai import _chunk_text
+        from vane.ai.providers.openai import _chunk_text_by_token_limit
 
-        result = _chunk_text("ab", 10)
+        result = _chunk_text_by_token_limit("ab", 10, len)
         assert result == ["ab"]
+
+    def test_known_openai_model_uses_model_specific_tokenizer_for_chunking(self, monkeypatch):
+        import sys
+        from types import SimpleNamespace
+
+        from vane.ai.providers.openai import _build_token_estimator, _chunk_text_by_token_limit
+
+        requested_models = []
+
+        class FakeEncoding:
+            def __init__(self):
+                self.token_bytes = {}
+
+            def encode_ordinary(self, value):
+                weights = {"a": 1, "汉": 2, "🚀": 3}
+                tokens = []
+                token = 0
+                for character in value:
+                    raw = character.encode("utf-8")
+                    weight = weights[character]
+                    for index in range(weight):
+                        end = len(raw) * (index + 1) // weight
+                        start = len(raw) * index // weight
+                        self.token_bytes[token] = raw[start:end]
+                        tokens.append(token)
+                        token += 1
+                return tokens
+
+            def decode_single_token_bytes(self, token):
+                return self.token_bytes[token]
+
+        def encoding_for_model(model):
+            requested_models.append(model)
+            return FakeEncoding()
+
+        monkeypatch.setitem(sys.modules, "tiktoken", SimpleNamespace(encoding_for_model=encoding_for_model))
+        estimate = _build_token_estimator("text-embedding-3-small", use_openai_tokenizer=True)
+
+        assert estimate("a汉🚀") == 6
+        assert _chunk_text_by_token_limit("a汉🚀", 3, estimate) == ["a汉", "🚀"]
+        assert requested_models == ["text-embedding-3-small"]
+
+    def test_model_token_chunking_handles_nonmonotonic_unicode_prefixes(self):
+        from vane.ai.providers.openai import _chunk_text_by_token_limit, _TokenEstimator
+
+        class PhraseEncoding:
+            phrases = {"删除": 1, " 데이터": 2}
+            split_token_bytes = {3: b" \xed", 4: b"\x84", 5: b"\xb0", 6: "터".encode("utf-8")}
+
+            def encode_ordinary(self, value):
+                tokens = []
+                index = 0
+                while index < len(value):
+                    if value.startswith(" 터", index):
+                        tokens.extend((3, 4, 5))
+                        index += 2
+                        continue
+                    if value.startswith("터", index):
+                        tokens.append(6)
+                        index += 1
+                        continue
+                    phrase = next((item for item in self.phrases if value.startswith(item, index)), None)
+                    if phrase is not None:
+                        tokens.append(self.phrases[phrase])
+                        index += len(phrase)
+                        continue
+                    for byte in value[index].encode("utf-8"):
+                        tokens.append(1_000 + byte)
+                    index += 1
+                return tokens
+
+            def decode_single_token_bytes(self, token):
+                if token in self.split_token_bytes:
+                    return self.split_token_bytes[token]
+                for phrase, phrase_token in self.phrases.items():
+                    if token == phrase_token:
+                        return phrase.encode("utf-8")
+                return bytes([token - 1_000])
+
+        estimate = _TokenEstimator(PhraseEncoding())
+
+        for text in ("删除x", " 데이터x"):
+            chunks = _chunk_text_by_token_limit(text, 1, estimate)
+            assert chunks == [text[:-1], "x"]
+            assert "".join(chunks) == text
+            assert all(estimate(chunk) <= 1 for chunk in chunks)
+
+        split_unicode = _chunk_text_by_token_limit(" 터", 1, estimate)
+        assert split_unicode == [" ", "터"]
+        assert "".join(split_unicode) == " 터"
+        assert all(estimate(chunk) <= 1 for chunk in split_unicode)
+
+    def test_unknown_compatible_model_uses_utf8_byte_upper_bound_for_chunking(self):
+        from vane.ai.providers.openai import _build_token_estimator, _chunk_text_by_token_limit
+
+        estimate = _build_token_estimator("custom-embed-model", use_openai_tokenizer=False)
+
+        assert estimate("汉") == 3
+        assert estimate("🚀") == 4
+        assert _chunk_text_by_token_limit("汉🚀a", 4, estimate) == ["汉", "🚀", "a"]
 
     def test_oversized_input_gets_chunked(self):
         """An input exceeding input_text_token_limit is chunked and averaged."""
@@ -1270,7 +1377,8 @@ class TestOpenAITokenLimits:
         embedder._model = "text-embedding-3-small"
         embedder._dimensions = None
         embedder._batch_token_limit = 300_000
-        embedder._input_text_token_limit = 10  # 10 tokens → 30 chars
+        embedder._input_text_token_limit = 10
+        embedder._estimate_tokens = lambda value: (len(value) + 2) // 3
         mock_client = AsyncMock()
         mock_client.embeddings.create = mock_create
         embedder._client = mock_client
@@ -1285,6 +1393,45 @@ class TestOpenAITokenLimits:
         # Result is L2-normalised
         norm = np.linalg.norm(result[0])
         np.testing.assert_allclose(norm, 1.0, atol=1e-6)
+
+    def test_oversized_input_uses_token_weighted_average(self, monkeypatch):
+        """Chunk recombination weights embeddings by tokens, not characters."""
+        import asyncio
+
+        from vane.ai.providers import openai as openai_provider
+        from vane.ai.providers.openai import OpenAITextEmbedder
+
+        chunks = ["ascii", "汉"]
+
+        def estimate_tokens(value):
+            if value == "oversized":
+                return 20
+            return {"ascii": 1, "汉": 10}[value]
+
+        monkeypatch.setattr(
+            openai_provider,
+            "_chunk_text_by_token_limit",
+            lambda _text, _limit, _estimate: chunks,
+        )
+
+        async def mock_embed_batch(texts):
+            vectors = {
+                "ascii": np.array([1.0, 0.0]),
+                "汉": np.array([0.0, 1.0]),
+            }
+            return [vectors[text] for text in texts]
+
+        embedder = OpenAITextEmbedder.__new__(OpenAITextEmbedder)
+        embedder._batch_token_limit = 100
+        embedder._input_text_token_limit = 10
+        embedder._estimate_tokens = estimate_tokens
+        embedder._embed_batch = mock_embed_batch
+
+        result = asyncio.run(embedder.embed_text(["oversized"]))
+
+        expected = np.array([1.0, 10.0])
+        expected /= np.linalg.norm(expected)
+        np.testing.assert_allclose(result[0], expected)
 
     def test_oversized_input_chunks_still_respect_batch_token_limit(self):
         """Chunks from one long input are split across bounded requests."""
@@ -1303,6 +1450,7 @@ class TestOpenAITokenLimits:
         embedder._dimensions = 2
         embedder._batch_token_limit = 5
         embedder._input_text_token_limit = 3
+        embedder._estimate_tokens = lambda value: (len(value) + 2) // 3
         embedder._embed_batch = mock_embed_batch
 
         result = asyncio.run(embedder.embed_text(["a" * 60]))
@@ -1338,6 +1486,7 @@ class TestOpenAITokenLimits:
         embedder._dimensions = None
         embedder._batch_token_limit = 300_000
         embedder._input_text_token_limit = 8191
+        embedder._estimate_tokens = lambda value: (len(value) + 2) // 3
         mock_client = AsyncMock()
         mock_client.embeddings.create = mock_create
         embedder._client = mock_client
@@ -1375,8 +1524,9 @@ class TestOpenAITokenLimits:
         embedder = OpenAITextEmbedder.__new__(OpenAITextEmbedder)
         embedder._model = "test-model"
         embedder._dimensions = None
-        embedder._batch_token_limit = 5  # very small: 5 tokens ≈ 15 chars
+        embedder._batch_token_limit = 5
         embedder._input_text_token_limit = 100
+        embedder._estimate_tokens = lambda value: (len(value) + 2) // 3
         mock_client = AsyncMock()
         mock_client.embeddings.create = mock_create
         embedder._client = mock_client
@@ -1413,7 +1563,8 @@ class TestOpenAITokenLimits:
         embedder._model = "test-model"
         embedder._dimensions = None
         embedder._batch_token_limit = 300_000
-        embedder._input_text_token_limit = 10  # 10 tokens → 30 chars
+        embedder._input_text_token_limit = 10
+        embedder._estimate_tokens = lambda value: (len(value) + 2) // 3
         mock_client = AsyncMock()
         mock_client.embeddings.create = mock_create
         embedder._client = mock_client
@@ -1438,15 +1589,17 @@ class TestOpenAITokenLimits:
         from vane.ai.providers.openai import OpenAITextEmbedderDescriptor
 
         desc = OpenAITextEmbedderDescriptor(
-            provider_options={"api_key": "test"},
             model_name="text-embedding-3-small",
-            embed_options={
+            options={
                 "batch_token_limit": 100_000,
                 "input_text_token_limit": 4096,
             },
         )
 
-        with patch("openai.AsyncOpenAI"):
+        with (
+            patch("openai.AsyncOpenAI"),
+            patch("vane.ai.providers.openai._build_token_estimator", return_value=len),
+        ):
             embedder = desc.instantiate()
 
         assert embedder._batch_token_limit == 100_000
@@ -1459,11 +1612,13 @@ class TestOpenAITokenLimits:
         from vane.ai.providers.openai import OpenAITextEmbedderDescriptor
 
         desc = OpenAITextEmbedderDescriptor(
-            provider_options={"api_key": "test"},
             model_name="text-embedding-3-small",
         )
 
-        with patch("openai.AsyncOpenAI"):
+        with (
+            patch("openai.AsyncOpenAI"),
+            patch("vane.ai.providers.openai._build_token_estimator", return_value=len),
+        ):
             embedder = desc.instantiate()
 
         assert embedder._batch_token_limit == 300_000
@@ -1726,21 +1881,12 @@ class TestEmbedProviderCapabilityErrors:
         with pytest.raises(ValueError, match=name):
             vane.ai.embed(vane.col("text"), dimensions=4, **{name: None})
 
-    @pytest.mark.parametrize(
-        "base_url",
-        [
-            "file:///tmp/embed",
-            "https://user:provider-url-secret-sentinel@example.test/v1",
-            "https://example.test/v1?organization=provider-url-secret-sentinel",
-        ],
-    )
-    def test_openai_provider_preset_reuses_safe_base_url_validation(self, base_url):
+    @pytest.mark.parametrize("option", ["base_url", "api_key", "organization", "timeout"])
+    def test_openai_provider_rejects_legacy_constructor_options(self, option):
         from vane.ai.providers.openai import OpenAIProvider
 
-        with pytest.raises(ValueError) as exc_info:
-            vane.ai.embed(vane.col("text"), provider=OpenAIProvider(base_url=base_url), dimensions=4)
-
-        assert "provider-url-secret-sentinel" not in str(exc_info.value)
+        with pytest.raises(TypeError, match=option):
+            OpenAIProvider(**{option: "legacy-value"})
 
     @pytest.mark.parametrize(
         "options",
@@ -1750,11 +1896,11 @@ class TestEmbedProviderCapabilityErrors:
             {"revision": "   "},
         ],
     )
-    def test_transformers_provider_preset_reuses_embed_value_validation(self, options):
+    def test_transformers_provider_rejects_legacy_constructor_options(self, options):
         from vane.ai.providers.transformers import TransformersProvider
 
-        with pytest.raises(ValueError):
-            vane.ai.embed(vane.col("text"), provider=TransformersProvider(**options))
+        with pytest.raises(TypeError):
+            TransformersProvider(**options)
 
     @pytest.mark.parametrize("status_code", [404, 405, 501])
     def test_openai_dynamic_endpoint_error_preserves_capability_context(self, monkeypatch, status_code):
@@ -2165,7 +2311,7 @@ class TestWrapperRetry:
         assert result.column("emb").length() == 1
         assert len(calls) == 2
 
-    @pytest.mark.parametrize("status_code", [None, 400, 401, 403, 404, 405, 422, 501])
+    @pytest.mark.parametrize("status_code", [None, 400, 401, 403, 404, 405, 422])
     def test_embed_does_not_retry_nontransient_http_error(self, status_code):
         from vane.ai.functions import _EmbedTextBatch
 
@@ -2246,23 +2392,6 @@ class TestWrapperRetry:
 # ---------------------------------------------------------------------------
 
 
-def test_prompt_descriptor_execution_defaults():
-    from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
-    from vane.ai.providers.google import GooglePrompterDescriptor
-    from vane.ai.providers.openai import OpenAIPrompterDescriptor
-
-    openai = OpenAIPrompterDescriptor().get_udf_options()
-    anthropic = AnthropicPrompterDescriptor(
-        model_name="claude-test",
-        prompt_options={"max_tokens": 64},
-    ).get_udf_options()
-    google = GooglePrompterDescriptor(model_name="gemini-test").get_udf_options()
-
-    assert (openai.batch_size, openai.actor_number, openai.max_concurrency_per_actor) == (32, 1, 32)
-    assert (anthropic.batch_size, anthropic.actor_number, anthropic.max_concurrency_per_actor) == (32, 1, 16)
-    assert (google.batch_size, google.actor_number, google.max_concurrency_per_actor) == (32, 1, 16)
-
-
 def test_openai_responses_request_mapping_preserves_part_order():
     import asyncio
     from types import SimpleNamespace
@@ -2303,9 +2432,9 @@ def test_openai_responses_rejects_stop_sequences_during_planning():
     from vane.ai.providers.openai import OpenAIPrompterDescriptor, OpenAIProvider
 
     with pytest.raises(ValueError, match="use_chat_completions=True"):
-        OpenAIProvider().get_prompter(stop_sequences=["END"])
+        OpenAIProvider().get_prompter(options={"stop_sequences": ["END"]})
     with pytest.raises(ValueError, match="use_chat_completions=True"):
-        OpenAIPrompterDescriptor(prompt_options={"stop_sequences": ["END"]})
+        OpenAIPrompterDescriptor(options={"stop_sequences": ["END"]})
 
 
 def test_openai_chat_request_maps_max_output_tokens_and_stop_sequences():
@@ -2320,6 +2449,7 @@ def test_openai_chat_request_maps_max_output_tokens_and_stop_sequences():
     prompter._model = "chat-model"
     prompter._system_message = None
     prompter._use_chat_completions = True
+    prompter._official_openai_endpoint = True
     prompter._options = {"max_output_tokens": 11, "stop_sequences": ["STOP"]}
     response = SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="chat answer"))],
@@ -2333,6 +2463,24 @@ def test_openai_chat_request_maps_max_output_tokens_and_stop_sequences():
     assert kwargs["max_tokens"] == 11
     assert kwargs["stop"] == ["STOP"]
     assert "max_output_tokens" not in kwargs
+
+
+@pytest.mark.parametrize(
+    ("official_endpoint", "expected_name"),
+    [(True, "max_completion_tokens"), (False, "max_tokens")],
+)
+def test_openai_o_series_chat_request_uses_endpoint_capability(official_endpoint, expected_name):
+    from vane.ai.providers.openai import OpenAIPrompter
+
+    prompter = OpenAIPrompter.__new__(OpenAIPrompter)
+    prompter._model = "o3-mini"
+    prompter._official_openai_endpoint = official_endpoint
+    prompter._options = {"max_output_tokens": 11}
+    prompter._return_format = None
+
+    options = prompter._chat_completions_options()
+
+    assert options == {expected_name: 11}
 
 
 def test_anthropic_request_mapping_preserves_text_image_order():
@@ -2531,17 +2679,27 @@ def test_provider_capability_error_never_stringifies_unbounded_upstream_text():
     assert original not in error.__dict__.values()
 
 
-def test_prompt_batch_retry_and_row_isolation():
+def test_prompt_batch_retry_and_row_isolation(monkeypatch):
+    import asyncio
+
     from vane.ai.functions import _PromptBatch
 
     attempts = {}
+
+    class TransientError(RuntimeError):
+        status_code = 503
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
 
     class Prompter:
         async def prompt(self, messages):
             key = messages[0]
             attempts[key] = attempts.get(key, 0) + 1
             if key == "retry" and attempts[key] == 1:
-                raise RuntimeError("temporary")
+                raise TransientError("temporary")
             if key == "fail":
                 raise RuntimeError("permanent")
             return f"answer:{key}"
@@ -2566,4 +2724,111 @@ def test_prompt_batch_retry_and_row_isolation():
         None,
         None,
     ]
-    assert attempts == {"ok": 1, "retry": 2, "fail": 2}
+    assert attempts == {"ok": 1, "retry": 2, "fail": 1}
+
+
+@pytest.mark.parametrize("status_code", [None, 400, 401, 403, 404, 422])
+def test_prompt_does_not_retry_permanent_provider_errors(status_code):
+    from vane.ai.functions import _PromptBatch
+
+    attempts = 0
+
+    class PermanentError(RuntimeError):
+        pass
+
+    error = PermanentError("permanent")
+    if status_code is not None:
+        error.status_code = status_code
+
+    class Prompter:
+        async def prompt(self, _messages):
+            nonlocal attempts
+            attempts += 1
+            raise error
+
+    class Descriptor:
+        def instantiate(self):
+            return Prompter()
+
+    wrapper = _PromptBatch(
+        Descriptor(),
+        ["message"],
+        "response",
+        max_concurrency_per_actor=1,
+        max_retries=3,
+        on_error="ignore",
+    )
+
+    result = _drive(wrapper, pa.table({"message": ["fail"]}))
+
+    assert result.column("response").to_pylist() == [None]
+    assert attempts == 1
+
+
+@pytest.mark.parametrize(
+    ("location", "status"),
+    [
+        ("status_code", 408),
+        ("status_code", 409),
+        ("status_code", 425),
+        ("status_code", 429),
+        ("status_code", 500),
+        ("status_code", 501),
+        ("status_code", 599),
+        ("code", 429),
+        ("code", 503),
+        ("response.status_code", 503),
+        ("response.status", 429),
+    ],
+)
+def test_prompt_retries_transient_provider_errors(monkeypatch, location, status):
+    import asyncio
+    from types import SimpleNamespace
+
+    from vane.ai.functions import _PromptBatch
+
+    attempts = 0
+
+    class TransientError(RuntimeError):
+        pass
+
+    error = TransientError("temporary")
+    if location == "status_code":
+        error.status_code = status
+    elif location == "code":
+        error.code = status
+    elif location == "response.status_code":
+        error.response = SimpleNamespace(status_code=status)
+    else:
+        error.response = SimpleNamespace(status=status)
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+    class Prompter:
+        async def prompt(self, _messages):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise error
+            return "recovered"
+
+    class Descriptor:
+        def instantiate(self):
+            return Prompter()
+
+    wrapper = _PromptBatch(
+        Descriptor(),
+        ["message"],
+        "response",
+        max_concurrency_per_actor=1,
+        max_retries=1,
+        on_error="raise",
+    )
+
+    result = _drive(wrapper, pa.table({"message": ["retry"]}))
+
+    assert result.column("response").to_pylist() == ["recovered"]
+    assert attempts == 2

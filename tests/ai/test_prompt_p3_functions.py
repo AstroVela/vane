@@ -89,7 +89,8 @@ class ContractProvider(Provider):
         system_message: str | None = None,
         return_format: dict[str, Any] | None = None,
         return_raw_response: bool = False,
-        **options: Any,
+        *,
+        options: dict[str, Any] | None = None,
     ) -> PrompterDescriptor:
         return ContractPrompterDescriptor(
             structured=return_format is not None,

@@ -3,13 +3,24 @@
 
 from __future__ import annotations
 
-import json
 import threading
 from collections import deque
 
 import pytest
 
 pa = pytest.importorskip("pyarrow")
+
+_EMPTY_NATIVE_VLLM_OPTIONS_SQL = """struct_pack(
+    __vane_vllm_payload_version := 1,
+    __vane_vllm_public_options_json := '{}',
+    __vane_vllm_secret_payload := encode('{"payload_version":1,"values":[]}')
+)"""
+
+
+def _packed_native_vllm_options(options):
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
+    return _build_native_vllm_options_argument(options)
 
 
 class _RecordingExecutor:
@@ -117,12 +128,10 @@ def _run_recording_sql(monkeypatch, prompts, options, *, executor=None, threads=
                 }
             ),
         )
-        encoded = json.dumps(options, separators=(",", ":"))
+        packed = _packed_native_vllm_options(options)
         rows = con.execute(
-            "SELECT id, prompt, vllm(prompt, 'recording-model', '"
-            + encoded
-            + "') AS generated FROM vllm_input"
-            + query_suffix
+            "SELECT id, prompt, vllm(prompt, 'recording-model', ?) AS generated FROM vllm_input" + query_suffix,
+            [packed],
         ).fetchall()
         return executor, rows
     finally:
@@ -174,9 +183,11 @@ def test_native_vllm_all_null_prompts_do_not_build_an_executor(monkeypatch):
                 }
             ),
         )
-        rows = con.execute(
-            "SELECT id, vllm(prompt, 'recording-model') AS generated FROM vllm_input ORDER BY id"
-        ).fetchall()
+        rows = con.execute(f"""
+            SELECT id, vllm(prompt, 'recording-model', {_EMPTY_NATIVE_VLLM_OPTIONS_SQL}) AS generated
+            FROM vllm_input
+            ORDER BY id
+        """).fetchall()
     finally:
         con.close()
 
@@ -217,7 +228,7 @@ def test_native_bridge_rejects_zero_batch_size_even_if_python_normalization_is_b
     import duckdb
     import duckdb.execution.vllm as vllm
 
-    invalid = vllm.normalize_options({})
+    invalid = vllm.normalize_options(_packed_native_vllm_options({}))
     invalid["batch_size"] = 0
     monkeypatch.setattr(vllm, "normalize_options", lambda _options: invalid)
     monkeypatch.setattr(vllm, "build_executor", lambda *_args, **_kwargs: _RecordingExecutor())
@@ -225,12 +236,12 @@ def test_native_bridge_rejects_zero_batch_size_even_if_python_normalization_is_b
     con = duckdb.connect()
     try:
         with pytest.raises(Exception, match="batch_size"):
-            con.execute("SELECT vllm('hello', 'recording-model')").fetchall()
+            con.execute(f"SELECT vllm('hello', 'recording-model', {_EMPTY_NATIVE_VLLM_OPTIONS_SQL})").fetchall()
     finally:
         con.close()
 
 
-def test_native_bridge_normalizes_decimal_struct_options(monkeypatch):
+def test_native_bridge_normalizes_json_numeric_options(monkeypatch):
     import duckdb
     import duckdb.execution.vllm as vllm
 
@@ -250,13 +261,14 @@ def test_native_bridge_normalizes_decimal_struct_options(monkeypatch):
             SELECT vllm(
                 'hello',
                 'recording-model',
-                struct_pack(
-                    prefix_match_threshold := 0.33,
-                    gpus_per_actor := 0.25,
-                    engine_init_timeout_s := 1.5
-                )
+                ?
             )
-            """
+            """,
+            [
+                _packed_native_vllm_options(
+                    {"prefix_match_threshold": 0.33, "gpus_per_actor": 0.25, "engine_init_timeout_s": 1.5}
+                )
+            ],
         ).fetchone()
     finally:
         con.close()
@@ -270,7 +282,7 @@ def test_native_bridge_normalizes_decimal_struct_options(monkeypatch):
     assert type(normalized["engine_init_timeout_s"]) is float
 
 
-def test_native_bridge_preserves_sql_boolean_struct_options(monkeypatch):
+def test_native_bridge_preserves_json_boolean_options(monkeypatch):
     import duckdb
     import duckdb.execution.vllm as vllm
 
@@ -297,15 +309,10 @@ def test_native_bridge_preserves_sql_boolean_struct_options(monkeypatch):
             SELECT vllm(
                 'hello',
                 'recording-model',
-                struct_pack(
-                    do_prefix_routing := FALSE,
-                    use_ray := FALSE,
-                    use_threading := FALSE,
-                    require_ray_worker := FALSE,
-                    ray_worker_only := FALSE
-                )
+                ?
             )
-            """
+            """,
+            [_packed_native_vllm_options(dict.fromkeys(option_names, False))],
         ).fetchone()
     finally:
         con.close()
@@ -334,7 +341,10 @@ def test_native_bridge_rejects_non_boolean_execution_options(monkeypatch, name):
     con = duckdb.connect()
     try:
         with pytest.raises(Exception, match=rf"vllm {name} must be a boolean"):
-            con.execute(f"SELECT vllm('hello', 'recording-model', struct_pack({name} := 'false'))").fetchall()
+            con.execute(
+                "SELECT vllm('hello', 'recording-model', ?)",
+                [_packed_native_vllm_options({name: "false"})],
+            ).fetchall()
     finally:
         con.close()
 
@@ -409,30 +419,83 @@ def test_distributed_collection_keeps_explicit_pool_names_query_scoped():
     con = duckdb.connect()
     try:
         explicit_pool_name = "explicit-shared-vllm-pool"
-        options = json.dumps(
-            {"use_ray": True, "ray_actor_pool_name": explicit_pool_name},
-            separators=(",", ":"),
-        )
+        options = _packed_native_vllm_options({"use_ray": True, "ray_actor_pool_name": explicit_pool_name})
 
         def collect_node(query_id):
-            relation = con.sql(
-                "SELECT vllm(prompt, 'model', '" + options + "') AS generated FROM (VALUES ('hello')) input(prompt)"
-            )
+            source = con.sql("SELECT prompt FROM (VALUES ('hello')) input(prompt)")
+            generated = duckdb.FunctionExpression(
+                "vllm",
+                duckdb.ColumnExpression("prompt"),
+                duckdb.ConstantExpression("model"),
+                duckdb.ConstantExpression(options),
+            ).alias("generated")
+            relation = source.select(generated)
             plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, query_id).to_physical_plan(con)
             nodes = plan.collect_vllm_nodes(conn=con)
             assert len(nodes) == 1
             return nodes[0]
 
-        first = collect_node("query-a")
-        second = collect_node("query-b")
+        # These IDs have the same readable sanitized form. Their raw-ID hash
+        # must still keep independently configured actor pools isolated.
+        first = collect_node("query/a")
+        second = collect_node("query?a")
 
         assert first["pool_name"] != explicit_pool_name
         assert second["pool_name"] != explicit_pool_name
         assert first["pool_name"] != second["pool_name"]
-        assert json.loads(first["options"])["ray_actor_pool_name"] == first["pool_name"]
-        assert json.loads(second["options"])["ray_actor_pool_name"] == second["pool_name"]
+        assert first["options"]["ray_actor_pool_name"] == first["pool_name"]
+        assert second["options"]["ray_actor_pool_name"] == second["pool_name"]
     finally:
         con.close()
+
+
+def test_native_vllm_rejects_bare_json_options_at_bind_time():
+    import duckdb
+
+    con = duckdb.connect()
+    try:
+        with pytest.raises(Exception, match="versioned STRUCT envelope"):
+            con.execute("SELECT vllm('hello', 'model', '{}')")
+    finally:
+        con.close()
+
+
+def test_native_vllm_rejects_missing_or_null_options_at_bind_time():
+    import duckdb
+
+    con = duckdb.connect()
+    try:
+        with pytest.raises(Exception, match="vllm"):
+            con.execute("SELECT vllm('hello', 'model')")
+        with pytest.raises(Exception, match="options cannot be NULL"):
+            con.execute("SELECT vllm('hello', 'model', NULL)")
+    finally:
+        con.close()
+
+
+def test_distributed_collection_preserves_the_versioned_envelope():
+    import duckdb
+    from duckdb.execution.vllm import normalize_options
+
+    con = duckdb.connect()
+    try:
+        relation = con.sql(
+            f"SELECT vllm(prompt, 'model', {_EMPTY_NATIVE_VLLM_OPTIONS_SQL}) FROM (VALUES ('hello')) input(prompt)"
+        )
+        plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "default-options").to_physical_plan(con)
+        nodes = plan.collect_vllm_nodes(conn=con)
+    finally:
+        con.close()
+
+    assert len(nodes) == 1
+    options = nodes[0]["options"]
+    assert options["__vane_vllm_payload_version"] == 1
+    assert options["__vane_vllm_public_options_json"] == "{}"
+    assert options["__vane_vllm_secret_payload"] == b'{"payload_version":1,"values":[]}'
+    normalized = normalize_options(options)
+    assert normalized["use_ray"] is True
+    assert normalized["ray_worker_only"] is True
+    assert normalized["ray_actor_pool_name"] == nodes[0]["pool_name"]
 
 
 @pytest.mark.parametrize(
@@ -461,18 +524,23 @@ def test_native_finalizer_has_scheduler_wakeup_in_materialized_and_nested_contex
     con = duckdb.connect()
     try:
         con.register("vllm_input", pa.table({"prompt": ["hello"]}))
-        expression = "vllm(prompt, 'recording-model')"
+        expression = f"vllm(prompt, 'recording-model', {_EMPTY_NATIVE_VLLM_OPTIONS_SQL})"
         if context == "ctas":
             con.execute(f"CREATE TABLE vllm_output AS SELECT {expression} AS generated FROM vllm_input")
         elif context == "insert_select":
             con.execute("CREATE TABLE vllm_output(generated VARCHAR)")
             con.execute(f"INSERT INTO vllm_output SELECT {expression} FROM vllm_input")
         elif context == "scalar_subquery":
-            con.execute("SELECT (SELECT vllm('hello', 'recording-model'))").fetchall()
+            con.execute(
+                f"SELECT (SELECT vllm('hello', 'recording-model', {_EMPTY_NATIVE_VLLM_OPTIONS_SQL}))"
+            ).fetchall()
         elif context == "explain_analyze":
             con.execute(f"EXPLAIN ANALYZE SELECT {expression} FROM vllm_input").fetchall()
         else:
-            con.execute("PREPARE vllm_statement AS SELECT vllm(CAST($1 AS VARCHAR), 'recording-model')")
+            con.execute(
+                "PREPARE vllm_statement AS SELECT "
+                f"vllm(CAST($1 AS VARCHAR), 'recording-model', {_EMPTY_NATIVE_VLLM_OPTIONS_SQL})"
+            )
             con.execute("EXECUTE vllm_statement('hello')").fetchall()
     finally:
         con.close()
@@ -497,6 +565,6 @@ def test_native_bridge_rejects_executor_without_wakeup_callback(monkeypatch):
     con = duckdb.connect()
     try:
         with pytest.raises(Exception, match="vllm executor must implement register_wakeup_callback"):
-            con.execute("SELECT vllm('hello', 'model')").fetchall()
+            con.execute(f"SELECT vllm('hello', 'model', {_EMPTY_NATIVE_VLLM_OPTIONS_SQL})").fetchall()
     finally:
         con.close()

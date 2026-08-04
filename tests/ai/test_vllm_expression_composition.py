@@ -10,6 +10,12 @@ import pytest
 import duckdb
 import vane
 
+_EMPTY_NATIVE_VLLM_OPTIONS_SQL = """struct_pack(
+    __vane_vllm_payload_version := 1,
+    __vane_vllm_public_options_json := '{}',
+    __vane_vllm_secret_payload := encode('{"payload_version":1,"values":[]}')
+)"""
+
 
 class _ImmediateVLLMExecutor:
     def __init__(self, model: str) -> None:
@@ -175,11 +181,12 @@ def test_sql_ai_prompt_supports_multiple_calls_nested_in_eager_expressions(monke
     ("expression", "source"),
     [
         (
-            "CASE WHEN flag THEN vllm(chunk, 'conditional-model') ELSE 'skipped' END",
+            f"CASE WHEN flag THEN vllm(chunk, 'conditional-model', {_EMPTY_NATIVE_VLLM_OPTIONS_SQL}) "
+            "ELSE 'skipped' END",
             "(VALUES (false, 'secret')) source(flag, chunk)",
         ),
         (
-            "coalesce('ready', vllm(chunk, 'conditional-model'))",
+            f"coalesce('ready', vllm(chunk, 'conditional-model', {_EMPTY_NATIVE_VLLM_OPTIONS_SQL}))",
             "(VALUES ('secret')) source(chunk)",
         ),
     ],

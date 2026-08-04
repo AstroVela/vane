@@ -52,18 +52,30 @@ def test_logical_plan_captures_connection_scoped_vane_session(monkeypatch):
 
 
 def test_vllm_named_actor_pool_identity_includes_connection_session():
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
     ray_cxx = _require_ray_cxx()
     connection_a = duckdb.connect()
     connection_b = duckdb.connect()
     query_id = "reused-query-id"
-    options = '{"use_ray":true}'
+    options = _build_native_vllm_options_argument({"use_ray": True})
+
+    def build_relation(connection):
+        source = connection.sql("SELECT 'hello' AS prompt")
+        generated = duckdb.FunctionExpression(
+            "vllm",
+            duckdb.ColumnExpression("prompt"),
+            duckdb.ConstantExpression("test-model"),
+            duckdb.ConstantExpression(options),
+        ).alias("generated")
+        return source.select(generated)
 
     plan_a = ray_cxx.PyLogicalPlan.from_duckdb_relation(
-        connection_a.sql(f"SELECT vllm('hello', 'test-model', '{options}')"),
+        build_relation(connection_a),
         query_id,
     ).to_physical_plan(connection_a)
     plan_b = ray_cxx.PyLogicalPlan.from_duckdb_relation(
-        connection_b.sql(f"SELECT vllm('hello', 'test-model', '{options}')"),
+        build_relation(connection_b),
         query_id,
     ).to_physical_plan(connection_b)
 

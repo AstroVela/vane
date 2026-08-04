@@ -162,11 +162,11 @@ class RetryAfterError(Exception):
                 setattr(self, name, value)
 
 
-_TRANSIENT_EMBED_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+_TRANSIENT_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429})
 
 
-def _is_transient_embed_error(exc: Exception) -> bool:
-    """Whether an idempotent Embed request failed for a transient reason."""
+def _is_transient_provider_error(exc: Exception) -> bool:
+    """Whether a provider request failed for a transient reason."""
 
     if isinstance(exc, RetryAfterError):
         return True
@@ -182,9 +182,10 @@ def _is_transient_embed_error(exc: Exception) -> bool:
             getattr(current, "status_code", None),
             getattr(current, "code", None),
             getattr(getattr(current, "response", None), "status_code", None),
+            getattr(getattr(current, "response", None), "status", None),
         ):
             if isinstance(status, int) and not isinstance(status, bool):
-                if status in _TRANSIENT_EMBED_HTTP_STATUS_CODES:
+                if status in _TRANSIENT_HTTP_STATUS_CODES or 500 <= status <= 599:
                     return True
 
         # OpenAI connection errors retain their underlying httpx transport
@@ -196,6 +197,14 @@ def _is_transient_embed_error(exc: Exception) -> bool:
             pass
         else:
             if isinstance(current, httpx.TransportError):
+                return True
+
+        try:
+            import aiohttp
+        except ImportError:
+            pass
+        else:
+            if isinstance(current, aiohttp.ClientConnectionError):
                 return True
 
         current = current.__cause__
@@ -283,6 +292,7 @@ async def _retry_call_async(
     on_error: _OnError = "raise",
     default: Any = None,
     on_awaitable: Any = None,
+    retry_if: Any = None,
     **kwargs: Any,
 ) -> Any:
     """Async variant of :func:`_retry_call`.
@@ -306,6 +316,8 @@ async def _retry_call_async(
                 exc,
                 (ProviderCapabilityError, _ProviderResultError, OutputValidationError, RawResponseSerializationError),
             ):
+                break
+            if retry_if is not None and not retry_if(exc):
                 break
             if attempt < max_retries:
                 if isinstance(exc, RetryAfterError):
@@ -371,29 +383,6 @@ def _embedding_provider_family(provider: Any) -> str | None:
     return None
 
 
-_BUILTIN_EMBED_PROVIDER_SENSITIVE_FIELDS = {
-    "vane.ai.providers.openai": frozenset({"api_key", "organization"}),
-    "vane.ai.providers.google": frozenset({"api_key"}),
-}
-
-
-def _reject_builtin_embed_provider_credentials(provider: Provider) -> None:
-    """Keep built-in Provider presets containing secrets out of Embed plans."""
-
-    sensitive_fields = _BUILTIN_EMBED_PROVIDER_SENSITIVE_FIELDS.get(type(provider).__module__)
-    configured = getattr(provider, "_options", None)
-    if sensitive_fields is None or not isinstance(configured, dict):
-        return
-    offending = sorted(field for field in sensitive_fields if configured.get(field) is not None)
-    if not offending:
-        return
-    label = "field" if len(offending) == 1 else "fields"
-    raise ValueError(
-        f"Embed provider configuration cannot include inline credential or sensitive {label}: "
-        f"{', '.join(offending)}; configure credentials through the environment or runtime secret management"
-    )
-
-
 def _validate_embedding_dimension(value: Any) -> int | None:
     if value is None:
         return None
@@ -427,7 +416,7 @@ def _prepare_embed_call(
     options: dict[str, Any],
     *,
     relation: bool,
-) -> tuple[Any, int, UDFOptions, bool, int | None, int, str | None, bool]:
+) -> tuple[Any, int, UDFOptions, bool, int | None, int, str | None]:
     """Resolve one Embed call without performing network or model I/O."""
 
     if provider is None:
@@ -441,17 +430,12 @@ def _prepare_embed_call(
     resolved_provider = _resolve_provider(provider, "openai")
     if not isinstance(resolved_provider, Provider):
         raise TypeError("provider must be a provider name or Provider object")
-    _reject_builtin_embed_provider_credentials(resolved_provider)
-    prepared = validate_embed_options(
-        _embedding_provider_family(resolved_provider),
-        options,
-        relation=relation,
-    )
+    family = _embedding_provider_family(resolved_provider)
+    prepared = validate_embed_options(family, options, relation=relation)
     normalize = prepared.pop("normalize", False)
     execution_backend = prepared.pop("execution_backend", None)
     max_chunk_chars = prepared.pop("max_chunk_chars", None)
     chunk_overlap_chars = prepared.pop("chunk_overlap_chars", 200)
-    actor_number_explicit = "actor_number" in prepared
     batch_size = prepared.pop("batch_size", None)
     max_retries = prepared.pop("max_retries", None)
     actor_number = prepared.pop("actor_number", None)
@@ -460,21 +444,21 @@ def _prepare_embed_call(
         descriptor = resolved_provider.get_text_embedder(
             model=model,
             dimensions=explicit_dimensions,
-            **prepared,
+            options=prepared,
         )
     except NotImplementedError as exc:
         provider_name = getattr(resolved_provider, "name", type(resolved_provider).__name__)
         raise ValueError(f"Provider {provider_name!r} is not an embedding provider") from exc
 
     resolved_dimensions = _resolve_embedding_dimension(descriptor, explicit_dimensions)
-    udf_options = descriptor.get_udf_options()
-    udf_options.on_error = on_error
-    if batch_size is not None:
-        udf_options.batch_size = batch_size
-    if max_retries is not None:
-        udf_options.max_retries = max_retries
-    if actor_number is not None:
-        udf_options.actor_number = actor_number
+    descriptor_resources = descriptor.get_udf_options()
+    udf_options = UDFOptions(
+        actor_number=actor_number if actor_number is not None else 1,
+        num_gpus=descriptor_resources.num_gpus,
+        max_retries=max_retries if max_retries is not None else 3,
+        on_error=on_error,
+        batch_size=batch_size if batch_size is not None else 64,
+    )
 
     return (
         descriptor,
@@ -484,7 +468,6 @@ def _prepare_embed_call(
         max_chunk_chars,
         chunk_overlap_chars,
         execution_backend,
-        actor_number_explicit,
     )
 
 
@@ -757,7 +740,7 @@ class _EmbedTextBatch:
                 on_error="raise",
                 run_async=self._require_run_async(),
                 on_awaitable=self._mark_loop_bound,
-                retry_if=_is_transient_embed_error,
+                retry_if=_is_transient_provider_error,
             )
         except _MissingAsyncRuntimeError:
             raise
@@ -1112,6 +1095,7 @@ class _PromptBatch:
                     max_retries=max_retries,
                     on_error=on_error,
                     on_awaitable=self._mark_loop_bound,
+                    retry_if=_is_transient_provider_error,
                 )
             except ProviderCapabilityError as exc:
                 capability_error = exc
@@ -1246,6 +1230,16 @@ def _validated_embed_text(text: Any) -> Any:
     return duckdb.FunctionExpression("__vane_ai_embed", text)
 
 
+def _star_excluding_existing_output_column(rel: Any, output_column: str) -> Any:
+    existing_output_column = next(
+        (column for column in rel.columns if column.casefold() == output_column.casefold()),
+        None,
+    )
+    if existing_output_column is None:
+        return duckdb.StarExpression()
+    return duckdb.StarExpression(exclude=[existing_output_column])
+
+
 def _embed_expression(
     text: Any,
     *,
@@ -1257,7 +1251,7 @@ def _embed_expression(
 ) -> Any:
     if not is_expression(text):
         raise TypeError("vane.ai.embed expression API requires a text Expression")
-    descriptor, resolved_dimensions, udf_opts, normalize, _, _, _, _ = _prepare_embed_call(
+    descriptor, resolved_dimensions, udf_opts, normalize, _, _, _ = _prepare_embed_call(
         provider,
         model,
         dimensions,
@@ -1311,7 +1305,6 @@ def _embed_relation(
         max_chunk_chars,
         chunk_overlap_chars,
         execution_backend,
-        actor_number_explicit,
     ) = _prepare_embed_call(
         provider,
         model,
@@ -1340,9 +1333,9 @@ def _embed_relation(
         udf_opts=udf_opts,
         name="ai_embed",
         execution_backend=execution_backend,
-        force_actor=actor_number_explicit,
     ).cast(output_type)
-    return rel.select(duckdb.StarExpression(), expression.alias(output_column))
+    star = _star_excluding_existing_output_column(rel, output_column)
+    return rel.select(star, expression.alias(output_column))
 
 
 _EMBED_ARGUMENT_UNSET: Any = object()
@@ -1535,31 +1528,6 @@ def _prompt_provider_family(provider: Any) -> str | None:
     return None
 
 
-_BUILTIN_PROMPT_PROVIDER_SENSITIVE_FIELDS = {
-    "vane.ai.providers.openai": ("_options", frozenset({"api_key", "organization"})),
-    "vane.ai.providers.anthropic": ("_client_options", frozenset({"api_key"})),
-    "vane.ai.providers.google": ("_options", frozenset({"api_key"})),
-}
-
-
-def _reject_builtin_prompt_provider_credentials(provider: Provider) -> None:
-    configured_rule = _BUILTIN_PROMPT_PROVIDER_SENSITIVE_FIELDS.get(type(provider).__module__)
-    if configured_rule is None:
-        return
-    attribute, sensitive_fields = configured_rule
-    configured = getattr(provider, attribute, None)
-    if not isinstance(configured, dict):
-        return
-    offending = sorted(field for field in sensitive_fields if configured.get(field) is not None)
-    if not offending:
-        return
-    label = "field" if len(offending) == 1 else "fields"
-    raise ValueError(
-        f"Prompt provider configuration cannot include inline credential or sensitive {label}: "
-        f"{', '.join(offending)}; configure credentials through the environment or runtime secret management"
-    )
-
-
 def _prepare_prompt_call(
     provider: Any,
     model: str | None,
@@ -1588,7 +1556,6 @@ def _prepare_prompt_call(
     resolved_provider = _resolve_provider(provider, "openai")
     if not isinstance(resolved_provider, Provider):
         raise TypeError("provider must be a provider name or Provider object")
-    _reject_builtin_prompt_provider_credentials(resolved_provider)
     family = _prompt_provider_family(resolved_provider)
     prepared = validate_prompt_options(family, options, relation=relation)
 
@@ -1606,16 +1573,12 @@ def _prepare_prompt_call(
         prepared["max_retries"] = max_retries if max_retries is not None else 0
 
     try:
-        contract_options: dict[str, Any] = {}
-        if structured_output is not None:
-            contract_options["return_format"] = structured_output.schema
-        if return_raw_response:
-            contract_options["return_raw_response"] = True
         descriptor = resolved_provider.get_prompter(
             model=model,
             system_message=system_message,
-            **contract_options,
-            **prepared,
+            return_format=structured_output.schema if structured_output is not None else None,
+            return_raw_response=return_raw_response,
+            options=prepared,
         )
     except NotImplementedError as exc:
         provider_name = getattr(resolved_provider, "name", type(resolved_provider).__name__)
@@ -1627,20 +1590,31 @@ def _prepare_prompt_call(
     if isinstance(descriptor, NativePrompterPlan):
         return descriptor, UDFOptions(on_error=on_error), execution_backend, structured_output
 
-    if family == "openai" and structured_output is not None:
+    if (
+        family == "openai"
+        and structured_output is not None
+        and type(descriptor).__module__ == "vane.ai.providers.openai"
+        and descriptor.supports_strict_structured_outputs()
+    ):
         structured_output.validate_openai_gpt_contract(descriptor.get_model())
 
-    udf_options = descriptor.get_udf_options()
-    udf_options.on_error = on_error
-    udf_options.actor_number = actor_number if actor_number is not None else 1
-    udf_options.batch_size = batch_size if batch_size is not None else 32
-    udf_options.max_retries = max_retries if max_retries is not None else 3
-    if max_concurrency is not None:
-        udf_options.max_concurrency_per_actor = max_concurrency
-    elif udf_options.max_concurrency_per_actor is None:
-        udf_options.max_concurrency_per_actor = (
-            32 if family == "openai" else 16 if family in {"anthropic", "google"} else None
-        )
+    descriptor_resources = descriptor.get_udf_options()
+    udf_options = UDFOptions(
+        actor_number=actor_number if actor_number is not None else 1,
+        num_gpus=descriptor_resources.num_gpus,
+        max_retries=max_retries if max_retries is not None else 3,
+        on_error=on_error,
+        batch_size=batch_size if batch_size is not None else 32,
+        max_concurrency_per_actor=(
+            max_concurrency
+            if max_concurrency is not None
+            else 32
+            if family == "openai"
+            else 16
+            if family in {"anthropic", "google"}
+            else None
+        ),
+    )
     return descriptor, udf_options, execution_backend, structured_output
 
 
@@ -1755,12 +1729,15 @@ def _prompt_relation(
                 gpus=0,
             ).cast(structured_output.duckdb_type)
         expression = expression.alias(output_column)
-        star = (
-            duckdb.StarExpression(exclude=[output_column]) if output_column in rel.columns else duckdb.StarExpression()
-        )
+        star = _star_excluding_existing_output_column(rel, output_column)
         return rel.select(star, expression)
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
+    if not descriptor.supports_image_inputs() and any(value != "VARCHAR" for value in message_types):
+        raise ValueError(
+            f"Provider {descriptor.get_provider()!r} model {descriptor.get_model()!r} "
+            "does not support Prompt image inputs"
+        )
 
     input_names = [f"message_{index}" for index in range(len(message_expressions))]
     wrapper = _PromptBatch(
@@ -1786,7 +1763,7 @@ def _prompt_relation(
         name="ai_prompt",
         execution_backend=execution_backend,
     ).cast(output_type)
-    star = duckdb.StarExpression(exclude=[output_column]) if output_column in rel.columns else duckdb.StarExpression()
+    star = _star_excluding_existing_output_column(rel, output_column)
     return rel.select(star, expression.alias(output_column))
 
 
@@ -1838,7 +1815,10 @@ def _prompt_expression(
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
 
     input_names = [f"message_{index}" for index in range(len(message_expressions))]
-    validated_messages = [_validated_prompt_message(message) for message in message_expressions]
+    validated_messages = [
+        _validated_prompt_message(message, text_only=not descriptor.supports_image_inputs())
+        for message in message_expressions
+    ]
     wrapper = _PromptBatch(
         descriptor,
         input_names,

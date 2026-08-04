@@ -2,21 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib
-import json
 import os
 
 import pytest
 from ray_test_profile import ray_test_object_store_bytes
 
 pytestmark = [pytest.mark.real_ray, pytest.mark.ray_cluster_owner, pytest.mark.gpu]
-
-
-def _explain_text(con, sql):
-    explain_rows = con.sql("EXPLAIN " + sql).fetchall()
-    return "\n".join(
-        row[1] if isinstance(row, tuple) and len(row) > 1 else row[0] if isinstance(row, tuple) else str(row)
-        for row in explain_rows
-    )
 
 
 def _assert_explain_contains(explain_text, keyword):
@@ -49,6 +40,7 @@ def test_vllm_e2e_basic():
     )
 
     import duckdb
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
 
     timeout_s = int(os.getenv("VLLM_E2E_TIMEOUT", "300"))
     try:
@@ -87,15 +79,28 @@ def test_vllm_e2e_basic():
             "(3, 'DuckDB 是什么类型的数据库')"
         )
 
-        sql = (
-            "SELECT id, prompt, "
-            "vllm('请用简洁中文回答：' || prompt, '" + model + "', '" + json.dumps(options) + "') AS out "
-            "FROM prompts ORDER BY id"
+        packed_options = _build_native_vllm_options_argument(options)
+        input_prompt = duckdb.FunctionExpression(
+            "concat",
+            duckdb.ConstantExpression("请用简洁中文回答："),
+            duckdb.ColumnExpression("prompt"),
         )
-        explain_text = _explain_text(con, sql)
+        generated = duckdb.FunctionExpression(
+            "vllm",
+            input_prompt,
+            duckdb.ConstantExpression(model),
+            duckdb.ConstantExpression(packed_options),
+        ).alias("out")
+        relation = con.table("prompts").select(
+            duckdb.ColumnExpression("id"),
+            duckdb.ColumnExpression("prompt"),
+            generated,
+        )
+        relation = relation.order("id")
+        explain_text = relation.explain()
         _assert_explain_contains(explain_text, "VLLM")
 
-        rows = con.execute(sql).fetchall()
+        rows = relation.fetchall()
         assert len(rows) == 3
         for row in rows:
             print(f"vllm_e2e: id={row[0]} prompt={row[1]!r} output={row[2]!r}")

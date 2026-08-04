@@ -152,7 +152,6 @@ def test_vllm_prompt_expression_real_provider() -> None:
     max_tokens = int(os.getenv("VANE_E2E_VLLM_MAX_TOKENS", "16"))
     gpu_memory_utilization = os.getenv("VANE_E2E_VLLM_GPU_MEMORY_UTILIZATION")
     engine_args = {
-        "trust_remote_code": True,
         "max_model_len": max_model_len,
     }
     if gpu_memory_utilization:

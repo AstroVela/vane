@@ -116,19 +116,47 @@ class MockProvider(Provider):
         self,
         model: str | None = None,
         dimensions: int | None = None,
-        **options: object,
+        *,
+        options: dict[str, object] | None = None,
     ) -> TextEmbedderDescriptor:
-        return MockTextEmbedderDescriptor(
-            dim=dimensions or 4,
-            actor_number=options.get("actor_number"),
-        )
+        return MockTextEmbedderDescriptor(dim=dimensions or 4)
 
-    def get_prompter(self, model: str | None = None, **options: object) -> PrompterDescriptor:
-        return MockPrompterDescriptor(
-            actor_number=options.get("actor_number"),
-            max_concurrency_per_actor=options.get("max_concurrency_per_actor"),
-            num_gpus=options.get("num_gpus", options.get("gpus_per_actor", 0)),
-        )
+    def get_prompter(
+        self,
+        model: str | None = None,
+        system_message: str | None = None,
+        return_format: dict[str, Any] | None = None,
+        return_raw_response: bool = False,
+        *,
+        options: dict[str, object] | None = None,
+    ) -> PrompterDescriptor:
+        return MockPrompterDescriptor()
+
+
+def test_prompt_and_embed_ignore_descriptor_execution_defaults():
+    from vane.ai.functions import _prepare_embed_call, _prepare_prompt_call
+
+    _, _, embed_options, _, _, _, _ = _prepare_embed_call(
+        MockProvider(),
+        None,
+        None,
+        "raise",
+        {},
+        relation=False,
+    )
+    _, prompt_options, _, _ = _prepare_prompt_call(
+        MockProvider(),
+        None,
+        None,
+        None,
+        False,
+        "raise",
+        {},
+        relation=False,
+    )
+
+    assert (embed_options.batch_size, embed_options.actor_number, embed_options.max_retries) == (64, 1, 3)
+    assert (prompt_options.batch_size, prompt_options.actor_number, prompt_options.max_retries) == (32, 1, 3)
 
 
 class _RecordingNativeVLLMExecutor:
@@ -247,7 +275,7 @@ def test_ai_embed_literal_null_is_fixed_type_without_runtime_calls(monkeypatch):
 
 
 def test_ai_embed_four_public_entries_are_equivalent(monkeypatch):
-    monkeypatch.setitem(provider_registry.PROVIDERS, "mock_embed_contract", lambda name=None, **options: MockProvider())
+    monkeypatch.setitem(provider_registry.PROVIDERS, "mock_embed_contract", lambda name=None: MockProvider())
     conn = vane.connect()
     rel = conn.sql("SELECT * FROM (VALUES (1, 'abc'::VARCHAR), (2, NULL::VARCHAR)) AS t(row_id, text)")
 
@@ -328,7 +356,7 @@ def test_ai_embed_uses_trusted_builtin_dimensions_without_execution(provider, mo
 
 
 def test_ai_embed_accepts_registered_embedding_provider_name(monkeypatch):
-    monkeypatch.setitem(provider_registry.PROVIDERS, "mock_ai", lambda name=None, **options: MockProvider())
+    monkeypatch.setitem(provider_registry.PROVIDERS, "mock_ai", lambda name=None: MockProvider())
 
     expr = vane.ai.embed(vane.col("text"), provider="mock_ai")
 
@@ -372,27 +400,15 @@ def test_ai_embed_rejects_inline_credentials(option):
         ("google", "api_key"),
     ],
 )
-def test_ai_embed_rejects_credentials_from_builtin_provider_presets(provider_kind, field):
+def test_builtin_provider_constructors_reject_legacy_credentials(provider_kind, field):
     from vane.ai.providers.google import GoogleProvider
     from vane.ai.providers.openai import OpenAIProvider
 
     secret = "embed-provider-secret-sentinel"
-    if provider_kind == "openai":
-        provider = OpenAIProvider(**{field: secret})
-        model = None
-        dimensions = 4
-    else:
-        provider = GoogleProvider(**{field: secret})
-        model = "gemini-embedding-001"
-        dimensions = 128
+    provider_type = OpenAIProvider if provider_kind == "openai" else GoogleProvider
 
-    with pytest.raises(ValueError, match=field) as exc_info:
-        vane.ai.embed(
-            vane.col("text"),
-            provider=provider,
-            model=model,
-            dimensions=dimensions,
-        )
+    with pytest.raises(TypeError, match=field) as exc_info:
+        provider_type(**{field: secret})
     assert secret not in str(exc_info.value)
 
 
@@ -562,7 +578,7 @@ def test_ai_embed_accepts_valid_provider_specific_options():
         vane.ai.embed(
             vane.col("text"),
             provider=TransformersProvider(),
-            revision="reviewed-commit",
+            revision="0123456789abcdef0123456789abcdef01234567",
             trust_remote_code=True,
         )
         is not None
@@ -601,7 +617,7 @@ def test_ai_embed_explicit_dimensions_skip_provider_dimension_lookup():
             raise AssertionError("dimension lookup must not run")
 
     class ExplicitProvider(MockProvider):
-        def get_text_embedder(self, model=None, dimensions=None, **options):
+        def get_text_embedder(self, model=None, dimensions=None, *, options=None):
             return Descriptor(dim=dimensions or 99)
 
     rel = vane.connect().sql("select 'abc'::VARCHAR as text")
@@ -801,6 +817,206 @@ def test_anthropic_zero_tokens_rejects_structured_python_entries():
         vane.ai.prompt(relation, message, **common)
     with pytest.raises(ValueError, match="max_tokens=0.*structured"):
         relation.prompt(message, **common)
+
+
+@pytest.mark.parametrize(
+    ("model", "options"),
+    [
+        ("gpt-4o", {}),
+        ("gpt-4o-2024-08-06", {}),
+        ("o3-mini", {}),
+        ("gpt-5.1", {}),
+        ("gpt-5.1-2025-11-13", {}),
+        ("gpt-4o", {"base_url": "https://api.openai.com/v1/"}),
+    ],
+)
+def test_openai_known_structured_output_models_enforce_strict_schema(model, options):
+    from vane.ai._schema import SchemaValidationError
+    from vane.ai.providers.openai import OpenAIProvider
+
+    loose_schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+    }
+
+    with pytest.raises(SchemaValidationError, match="additionalProperties"):
+        vane.ai.prompt(
+            vane.col("message"),
+            provider=OpenAIProvider(),
+            model=model,
+            return_format=loose_schema,
+            **options,
+        )
+
+
+def test_openai_environment_base_url_cannot_change_static_capability(monkeypatch):
+    from vane.ai._schema import SchemaValidationError
+    from vane.ai.providers.openai import OpenAIProvider
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://compatible.example.test/v1")
+    loose_schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+    }
+
+    with pytest.raises(SchemaValidationError, match="additionalProperties"):
+        vane.ai.prompt(
+            vane.col("message"),
+            provider=OpenAIProvider(),
+            model="gpt-4o",
+            return_format=loose_schema,
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "options"),
+    [
+        ("gpt-4o", {"base_url": "https://compatible.example.test/v1"}),
+        ("gateway/gpt-4o", {}),
+        ("compatible-unknown-model", {}),
+        ("gpt-4o-audio-preview", {}),
+        ("gpt-4o-realtime-preview", {}),
+        ("gpt-4o-2024-05-13", {}),
+        ("o3-deep-research", {}),
+    ],
+)
+def test_openai_compatible_models_do_not_get_static_strict_schema_enforcement(model, options):
+    from vane.ai.providers.openai import OpenAIProvider
+
+    loose_schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+    }
+
+    expression = vane.ai.prompt(
+        vane.col("message"),
+        provider=OpenAIProvider(),
+        model=model,
+        return_format=loose_schema,
+        **options,
+    )
+
+    assert expression is not None
+
+
+@pytest.mark.parametrize("model", ["o1-mini", "o1-mini-2024-09-12"])
+def test_openai_known_unsupported_structured_output_models_fail_during_planning(model):
+    from vane.ai.providers.openai import OpenAIProvider
+
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+
+    with pytest.raises(ValueError, match="does not support structured Prompt output"):
+        vane.ai.prompt(
+            vane.col("message"),
+            provider=OpenAIProvider(),
+            model=model,
+            return_format=schema,
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "options", "message"),
+    [
+        ("o3-pro", {"use_chat_completions": True}, "Responses API only"),
+        ("gpt-4o-search-preview", {}, "Chat Completions only"),
+    ],
+)
+def test_openai_known_model_api_conflicts_fail_during_planning(model, options, message):
+    from vane.ai.providers.openai import OpenAIProvider
+
+    with pytest.raises(ValueError, match=message):
+        vane.ai.prompt(
+            vane.col("message"),
+            provider=OpenAIProvider(),
+            model=model,
+            **options,
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "options"),
+    [
+        ("o3-pro", {"use_chat_completions": True}),
+        ("gpt-4o-search-preview", {}),
+    ],
+)
+def test_openai_compatible_endpoints_do_not_inherit_official_api_path_restrictions(model, options):
+    from vane.ai.providers.openai import OpenAIProvider
+
+    expression = vane.ai.prompt(
+        vane.col("message"),
+        provider=OpenAIProvider(),
+        model=model,
+        base_url="https://compatible.example.test/v1",
+        **options,
+    )
+
+    assert expression is not None
+
+
+@pytest.mark.parametrize(
+    ("model", "options"),
+    [
+        ("o1-mini", {}),
+        ("o1-mini-2024-09-12", {}),
+        ("o1-preview", {}),
+        ("o1-preview-2024-09-12", {}),
+        ("o3-mini", {}),
+        ("o3-mini-2025-01-31", {}),
+        ("gpt-4o-search-preview", {"use_chat_completions": True}),
+        ("gpt-4o-search-preview-2025-03-11", {"use_chat_completions": True}),
+        ("gpt-4o-mini-search-preview", {"use_chat_completions": True}),
+        ("gpt-4o-mini-search-preview-2025-03-11", {"use_chat_completions": True}),
+    ],
+)
+@pytest.mark.parametrize("entry_point", ["relation", "expression", "sql"])
+def test_openai_known_text_only_models_reject_images_during_planning(model, options, entry_point):
+    from vane.ai._sql import build_ai_prompt_sql_spec
+
+    if entry_point == "sql":
+        with pytest.raises(ValueError, match="does not support Prompt image inputs"):
+            build_ai_prompt_sql_spec(model=model, image_input=True, options=options)
+        return
+
+    relation = vane.connect().sql("select 'question'::VARCHAR as question, '\\x89504e470d0a1a0a'::BLOB as image")
+    if entry_point == "relation":
+        with pytest.raises(ValueError, match="does not support Prompt image inputs"):
+            vane.ai.prompt(
+                relation,
+                [vane.col("question"), vane.col("image")],
+                provider="openai",
+                model=model,
+                **options,
+            )
+        return
+
+    expression = vane.ai.prompt(
+        [vane.col("question"), vane.col("image")],
+        provider="openai",
+        model=model,
+        **options,
+    )
+    with pytest.raises(Exception, match="VARCHAR"):
+        relation.select(expression).types
+
+
+def test_openai_compatible_endpoint_does_not_inherit_official_text_only_capability():
+    relation = vane.connect().sql("select 'question'::VARCHAR as question, '\\x89504e470d0a1a0a'::BLOB as image")
+
+    result = vane.ai.prompt(
+        relation,
+        [vane.col("question"), vane.col("image")],
+        provider="openai",
+        model="o1-mini",
+        base_url="https://compatible.example.test/v1",
+    )
+
+    assert str(result.types[-1]) == "VARCHAR"
 
 
 def test_ai_prompt_four_public_entries_are_equivalent():

@@ -208,6 +208,8 @@ def test_pydantic_model_and_equivalent_json_schema_compile_identically():
 
 
 def test_non_pydantic_class_with_schema_method_is_rejected():
+    pytest.importorskip("pydantic")
+
     class FakeModel:
         @classmethod
         def model_json_schema(cls):

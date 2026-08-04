@@ -2292,35 +2292,32 @@ def _unit_interval_option(name: str, value: Any) -> float:
     return result
 
 
+class _NormalizedVLLMOptions(dict[str, Any]):
+    """Internal marker preventing a second native-wire decode."""
+
+
 def normalize_options(options: Any | None) -> dict[str, Any]:
-    merged = dict(_DEFAULTS)
-    if isinstance(options, str):
-        try:
-            parsed = json.loads(options)
-        except json.JSONDecodeError as exc:
-            raise ValueError("vllm options JSON could not be parsed") from exc
-        if not isinstance(parsed, dict):
-            raise ValueError("vllm options JSON must decode to a dict")
-        options = parsed
-    elif options is not None and not isinstance(options, dict):
+    if isinstance(options, _NormalizedVLLMOptions):
+        return options
+
+    merged = _NormalizedVLLMOptions(_DEFAULTS)
+    if options is None or isinstance(options, str):
+        raise ValueError("vllm options must use the versioned envelope; bare JSON is not supported")
+    elif not isinstance(options, dict):
         try:
             options = dict(options)
         except Exception as exc:
-            raise TypeError("vllm options must be a dict or JSON string") from exc
+            raise TypeError("vllm options must use the versioned envelope") from exc
 
-    if options is not None:
-        options = _unpack_native_options_envelope(options)
+    options = _unpack_native_options_envelope(options)
 
-    if options is not None and options.get("ray_address") is not None:
+    if options.get("ray_address") is not None:
         raise ValueError("vLLM ray_address has been removed; configure RayRunner instead")
 
-    if options is not None:
-        unknown = sorted(
-            str(name) for name in options if not isinstance(name, str) or name not in _ALLOWED_VLLM_OPTIONS
-        )
-        if unknown:
-            raise ValueError(f"unknown vllm option(s): {', '.join(unknown)}")
-        merged.update(options)
+    unknown = sorted(str(name) for name in options if not isinstance(name, str) or name not in _ALLOWED_VLLM_OPTIONS)
+    if unknown:
+        raise ValueError(f"unknown vllm option(s): {', '.join(unknown)}")
+    merged.update(options)
     merged["concurrency"] = _integer_option("concurrency", merged["concurrency"], minimum=1)
     merged["gpus_per_actor"] = _fractional_gpu_option(merged["gpus_per_actor"])
     for name in (

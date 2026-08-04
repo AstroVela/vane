@@ -16,7 +16,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal
 
 import pyarrow as pa
 
@@ -92,6 +92,73 @@ _UNSUPPORTED_CONSTRAINTS = frozenset(
 )
 _BIGINT_MIN = -(2**63)
 _BIGINT_MAX = 2**63 - 1
+_OPENAI_STRUCTURED_OUTPUT_MODELS = frozenset(
+    {
+        "gpt-4o",
+        "gpt-4o-2024-08-06",
+        "gpt-4o-2024-11-20",
+        "gpt-4o-mini",
+        "gpt-4o-mini-2024-07-18",
+        "gpt-4o-search-preview",
+        "gpt-4o-search-preview-2025-03-11",
+        "gpt-4o-mini-search-preview",
+        "gpt-4o-mini-search-preview-2025-03-11",
+        "gpt-4.1",
+        "gpt-4.1-2025-04-14",
+        "gpt-4.1-mini",
+        "gpt-4.1-mini-2025-04-14",
+        "gpt-4.1-nano",
+        "gpt-4.1-nano-2025-04-14",
+        "o1",
+        "o1-2024-12-17",
+        "o1-preview",
+        "o1-preview-2024-09-12",
+        "o1-pro",
+        "o1-pro-2025-03-19",
+        "o3",
+        "o3-2025-04-16",
+        "o3-mini",
+        "o3-mini-2025-01-31",
+        "o3-pro",
+        "o3-pro-2025-06-10",
+        "o4-mini",
+        "o4-mini-2025-04-16",
+        "gpt-5",
+        "gpt-5-2025-08-07",
+        "gpt-5-mini",
+        "gpt-5-mini-2025-08-07",
+        "gpt-5-nano",
+        "gpt-5-nano-2025-08-07",
+        "gpt-5-pro",
+        "gpt-5-pro-2025-10-06",
+        "gpt-5-chat-latest",
+        "gpt-5.1",
+        "gpt-5.1-2025-11-13",
+    }
+)
+_OPENAI_UNSUPPORTED_STRUCTURED_OUTPUT_MODELS = frozenset(
+    {
+        "o1-mini",
+        "o1-mini-2024-09-12",
+    }
+)
+
+
+def _openai_structured_outputs_capability(model: str) -> Literal["supported", "unsupported", "unknown"]:
+    normalized = model.strip().casefold()
+    if normalized in _OPENAI_STRUCTURED_OUTPUT_MODELS:
+        return "supported"
+    if normalized in _OPENAI_UNSUPPORTED_STRUCTURED_OUTPUT_MODELS:
+        return "unsupported"
+    return "unknown"
+
+
+def _is_known_openai_prompt_model(model: str) -> bool:
+    return _openai_structured_outputs_capability(model) != "unknown"
+
+
+def _uses_openai_strict_structured_outputs(model: str) -> bool:
+    return _openai_structured_outputs_capability(model) == "supported"
 
 
 def _schema_error(path: str, message: str) -> SchemaValidationError:
@@ -270,21 +337,20 @@ class StructuredOutputSpec:
             raise OutputValidationError("Prompt structured output is not strict JSON") from None
 
     def validate_openai_gpt_contract(self, model: str) -> None:
-        """Enforce the stricter object rules required by OpenAI GPT models."""
-        normalized = model.strip().casefold()
-        if not (normalized.startswith("gpt-") or "/gpt-" in normalized):
+        """Enforce object rules for known OpenAI Structured Outputs models."""
+        if not _uses_openai_strict_structured_outputs(model):
             return
         for node in self.root.iter_objects():
             names = {prop.name for prop in node.properties}
             required = {prop.name for prop in node.properties if prop.required}
             if node.additional_properties:
                 raise SchemaValidationError(
-                    "OpenAI GPT structured output requires additionalProperties=false on every object"
+                    "OpenAI structured output requires additionalProperties=false on every object"
                 )
             if required != names:
                 missing = ", ".join(sorted(names - required))
                 raise SchemaValidationError(
-                    "OpenAI GPT structured output requires every property to be required"
+                    "OpenAI structured output requires every property to be required"
                     + (f"; missing: {missing}" if missing else "")
                 )
 

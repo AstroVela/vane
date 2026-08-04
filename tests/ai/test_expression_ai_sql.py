@@ -124,7 +124,8 @@ class MockProvider(Provider):
         self,
         model: str | None = None,
         dimensions: int | None = None,
-        **options: object,
+        *,
+        options: dict[str, object] | None = None,
     ) -> MockTextEmbedderDescriptor:
         return MockTextEmbedderDescriptor(dimensions or 4, model or "mock-embedding")
 
@@ -134,7 +135,8 @@ class MockProvider(Provider):
         system_message: str | None = None,
         return_format: dict[str, object] | None = None,
         return_raw_response: bool = False,
-        **options: object,
+        *,
+        options: dict[str, object] | None = None,
     ) -> MockPrompterDescriptor:
         return MockPrompterDescriptor(
             model or "topic",
@@ -189,7 +191,7 @@ def mock_ai_provider(monkeypatch):
     monkeypatch.setitem(
         provider_registry.PROVIDERS,
         "mock_ai_sql",
-        lambda name=None, **options: MockProvider(),
+        lambda name=None: MockProvider(),
     )
 
 
@@ -849,7 +851,8 @@ def test_ai_sql_helper_builds_closed_native_vllm_spec():
             "generate_args": {"sampling_params": {"max_tokens": Decimal(8)}},
         },
     )
-    native = json.loads(spec["options_json"])
+    options_envelope = spec["options"]
+    native = json.loads(options_envelope["__vane_vllm_public_options_json"])
 
     assert spec["execution_kind"] == "native_vllm"
     assert spec["model"] == "model-a"
@@ -859,6 +862,10 @@ def test_ai_sql_helper_builds_closed_native_vllm_spec():
     assert native["batch_size"] == 4
     assert native["generate_args"]["sampling_params"]["max_tokens"] == 8
     assert native["on_error"] == "null"
+    assert json.loads(options_envelope["__vane_vllm_secret_payload"]) == {
+        "payload_version": 1,
+        "values": [],
+    }
 
 
 def test_ai_embed_sql_fixed_dimensions_and_null_contract_are_preserved():

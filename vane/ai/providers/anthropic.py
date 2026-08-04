@@ -17,12 +17,14 @@ from vane.ai.provider import Provider, ProviderCapabilityError
 from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from vane.ai.protocols import Prompter
     from vane.ai.typing import Options
 
 
 _REQUEST_OPTIONS = frozenset({"max_tokens", "temperature", "top_p", "top_k", "stop_sequences"})
-_EXECUTION_OPTIONS = frozenset({"batch_size", "actor_number", "max_concurrency_per_actor", "max_retries"})
+_PROMPT_OPTIONS = _REQUEST_OPTIONS | frozenset({"base_url", "timeout"})
 _STRUCTURED_OUTPUT_TOOL = "vane_structured_output"
 
 
@@ -60,33 +62,19 @@ def _is_prompt_capability_error(exc: Exception) -> bool:
 class AnthropicProvider(Provider):
     """Provider backed by the Anthropic Messages API.
 
-    Anthropic has no Vane default model or ``max_tokens`` value. Configure
-    them on the provider or supply them on each Prompt call.
+    Anthropic has no Vane default model or ``max_tokens`` value. Configure a
+    model as provider metadata or pass one per call; ``max_tokens`` is always
+    a call-level option.
     """
 
     def __init__(
         self,
         name: str | None = None,
         *,
-        api_key: str | None = None,
-        base_url: str | None = None,
-        timeout: Any = None,
-        max_retries: int | None = None,
         prompt_model: str | None = None,
-        max_tokens: int | None = None,
     ) -> None:
         self._name = name or "anthropic"
         self._prompt_model = prompt_model
-        self._client_options = {
-            key: value
-            for key, value in {"api_key": api_key, "base_url": base_url, "timeout": timeout}.items()
-            if value is not None
-        }
-        self._options: dict[str, Any] = {}
-        if max_retries is not None:
-            self._options["max_retries"] = max_retries
-        if max_tokens is not None:
-            self._options["max_tokens"] = max_tokens
 
     @property
     def name(self) -> str:
@@ -98,7 +86,8 @@ class AnthropicProvider(Provider):
         system_message: str | None = None,
         return_format: dict[str, Any] | None = None,
         return_raw_response: bool = False,
-        **options: Any,
+        *,
+        options: Mapping[str, Any] | None = None,
     ) -> PrompterDescriptor:
         model_name = model if model is not None else self._prompt_model
         if not isinstance(model_name, str) or not model_name.strip():
@@ -107,35 +96,15 @@ class AnthropicProvider(Provider):
                 "Pass model=... or configure AnthropicProvider(prompt_model=...)."
             )
 
-        prompt_options = {**self._options, **options}
-        validation_options = {
-            key: value for key, value in self._client_options.items() if key in {"base_url", "timeout"}
-        }
-        validation_options.update(prompt_options)
-        validate_prompt_options("anthropic", validation_options, relation=False)
-        if prompt_options.get("max_tokens") is None:
-            raise ValueError(
-                "No max_tokens configured for the Anthropic provider. "
-                "Pass max_tokens=... or configure AnthropicProvider(max_tokens=...)."
-            )
-
-        provider_options = dict(self._client_options)
-        for key in ("base_url", "timeout"):
-            if key in prompt_options:
-                value = prompt_options.pop(key)
-                if value is None:
-                    provider_options.pop(key, None)
-                else:
-                    provider_options[key] = value
+        resolved_options = dict(options or {})
 
         return AnthropicPrompterDescriptor(
             provider_name=self._name,
-            provider_options=provider_options,
             model_name=model_name,
             system_message=system_message,
             return_format=return_format,
             return_raw_response=return_raw_response,
-            prompt_options=prompt_options,
+            options=resolved_options,
         )
 
 
@@ -145,29 +114,25 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
 
     model_name: str
     provider_name: str = "anthropic"
-    provider_options: dict[str, Any] = field(default_factory=dict)
     system_message: str | None = None
     return_format: dict[str, Any] | None = None
     return_raw_response: bool = False
-    prompt_options: dict[str, Any] = field(default_factory=dict)
+    options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("Anthropic prompt model must be a non-empty string")
-        validation_options = {
-            key: value for key, value in self.provider_options.items() if key in {"base_url", "timeout"}
-        }
-        validation_options.update(self.prompt_options)
-        validate_prompt_options("anthropic", validation_options, relation=False)
-        if self.prompt_options.get("max_tokens") is None:
+        unknown = sorted(set(self.options) - _PROMPT_OPTIONS)
+        if unknown:
+            raise TypeError(f"Unsupported Anthropic Prompt option(s): {', '.join(unknown)}")
+        validated_options = validate_prompt_options("anthropic", self.options, relation=False)
+        if validated_options.get("max_tokens") is None:
             raise ValueError(
-                "No max_tokens configured for the Anthropic provider. "
-                "Pass max_tokens=... or configure AnthropicProvider(max_tokens=...)."
+                "No max_tokens configured for the Anthropic provider. Pass max_tokens=... on the Prompt call."
             )
-        if self.prompt_options["max_tokens"] == 0 and self.return_format is not None:
+        if validated_options["max_tokens"] == 0 and self.return_format is not None:
             raise ValueError("Anthropic max_tokens=0 cannot be used with structured Prompt output")
-        self.provider_options = wrap_sensitive_options(self.provider_options)
-        self.prompt_options = wrap_sensitive_options(self.prompt_options)
+        self.options = wrap_sensitive_options(validated_options)
 
     def get_provider(self) -> str:
         return self.provider_name
@@ -176,26 +141,19 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
         return self.model_name
 
     def get_options(self) -> Options:
-        return dict(self.prompt_options)
+        return dict(self.options)
 
     def get_udf_options(self) -> UDFOptions:
-        return UDFOptions(
-            max_retries=self.prompt_options.get("max_retries", 3),
-            actor_number=self.prompt_options.get("actor_number", 1),
-            num_gpus=0,
-            batch_size=self.prompt_options.get("batch_size", 32),
-            max_concurrency_per_actor=self.prompt_options.get("max_concurrency_per_actor", 16),
-        )
+        return UDFOptions(num_gpus=0)
 
     def instantiate(self) -> Prompter:
         return AnthropicPrompter(
-            provider_options=self.provider_options,
+            options=self.options,
             provider_name=self.provider_name,
             model=self.model_name,
             system_message=self.system_message,
             return_format=self.return_format,
             return_raw_response=self.return_raw_response,
-            **self.prompt_options,
         )
 
 
@@ -204,17 +162,15 @@ class AnthropicPrompter:
 
     def __init__(
         self,
-        provider_options: dict[str, Any],
+        options: dict[str, Any],
         model: str,
         system_message: str | None = None,
         return_format: dict[str, Any] | None = None,
         return_raw_response: bool = False,
         provider_name: str = "anthropic",
-        **options: Any,
     ) -> None:
         from anthropic import AsyncAnthropic
 
-        provider_options = unwrap_sensitive_options(provider_options)
         options = unwrap_sensitive_options(options)
         self._provider_name = provider_name
         self._model = model
@@ -222,9 +178,7 @@ class AnthropicPrompter:
         self._return_format = return_format
         self._return_raw_response = return_raw_response
         self._options = {key: value for key, value in options.items() if key in _REQUEST_OPTIONS and value is not None}
-        client_options = {
-            key: value for key, value in provider_options.items() if key in {"api_key", "base_url", "timeout"}
-        }
+        client_options = {key: options[key] for key in ("base_url", "timeout") if options.get(key) is not None}
         client_options["max_retries"] = 0
         self._client = AsyncAnthropic(**client_options)
 

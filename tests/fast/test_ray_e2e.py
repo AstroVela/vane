@@ -442,6 +442,8 @@ def test_ray_scan_filter_projection(ray_runner, duckdb_conn, parquet_path):
 
 @pytest.mark.gpu
 def test_ray_vllm_distributed(ray_runner, duckdb_conn):
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
     pytest.importorskip("pyarrow")
     try:
         __import__("vllm")
@@ -483,10 +485,8 @@ def test_ray_vllm_distributed(ray_runner, duckdb_conn):
             }
         },
     }
-    sql = (
-        "SELECT id, prompt, "
-        "vllm('Answer briefly: ' || prompt, '" + model + "', '" + json.dumps(options) + "') AS out "
-        "FROM (VALUES "
+    source = duckdb_conn.sql(
+        "SELECT id, prompt FROM (VALUES "
         "(1, 'What is the capital of China?'), "
         "(2, 'What is the highest mountain in the world?'), "
         "(3, 'What type of database is DuckDB?')"
@@ -495,7 +495,22 @@ def test_ray_vllm_distributed(ray_runner, duckdb_conn):
 
     # Avoid EXPLAIN here: it executes locally and can trigger vLLM init on the driver.
 
-    df = duckdb_conn.sql(sql)
+    input_prompt = duckdb.FunctionExpression(
+        "concat",
+        duckdb.ConstantExpression("Answer briefly: "),
+        duckdb.ColumnExpression("prompt"),
+    )
+    generated = duckdb.FunctionExpression(
+        "vllm",
+        input_prompt,
+        duckdb.ConstantExpression(model),
+        duckdb.ConstantExpression(_build_native_vllm_options_argument(options)),
+    ).alias("out")
+    df = source.select(
+        duckdb.ColumnExpression("id"),
+        duckdb.ColumnExpression("prompt"),
+        generated,
+    )
     _log_builder_info(df)
     _log_distributed_plan(df, label)
     parts = _run_iter_tables(ray_runner, df, label, timeout_s=timeout_s)

@@ -30,7 +30,7 @@ class _RawBody:
         return {key: value for key, value in self.body.items() if key not in excluded}
 
 
-def _openai_prompter(*, chat: bool, raw: bool):
+def _openai_prompter(*, chat: bool, raw: bool, strict: bool = True):
     from vane.ai.providers.openai import OpenAIPrompter
 
     prompter = OpenAIPrompter.__new__(OpenAIPrompter)
@@ -40,6 +40,7 @@ def _openai_prompter(*, chat: bool, raw: bool):
     prompter._use_chat_completions = chat
     prompter._return_format = SCHEMA
     prompter._return_raw_response = raw
+    prompter._strict_structured_outputs = strict
     prompter._options = {}
     prompter._client = MagicMock()
     return prompter
@@ -83,6 +84,30 @@ def test_openai_chat_completions_uses_json_schema_response_format():
         "type": "json_schema",
         "json_schema": {"name": "Answer", "schema": SCHEMA, "strict": True},
     }
+
+
+@pytest.mark.parametrize("chat", [False, True])
+def test_openai_compatible_endpoint_omits_strict_schema_flag(chat):
+    prompter = _openai_prompter(chat=chat, raw=False, strict=False)
+    if chat:
+        prompter._client.chat.completions.create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"answer":"ok"}'))],
+                usage=None,
+            )
+        )
+    else:
+        prompter._client.responses.create = AsyncMock(
+            return_value=SimpleNamespace(output_text='{"answer":"ok"}', usage=None)
+        )
+
+    asyncio.run(prompter.prompt(("question",)))
+
+    if chat:
+        schema = prompter._client.chat.completions.create.await_args.kwargs["response_format"]["json_schema"]
+    else:
+        schema = prompter._client.responses.create.await_args.kwargs["text"]["format"]
+    assert "strict" not in schema
 
 
 def test_anthropic_structured_tool_and_raw_body_contracts():

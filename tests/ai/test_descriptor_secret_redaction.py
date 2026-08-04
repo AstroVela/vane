@@ -1,12 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Provider descriptors seal credentials at construction and unseal only at execution.
-
-Covers vane#105 for descriptor families that still accept provider credentials.
-P2 Prompt uses a stricter boundary: credentials are environment-only and
-sensitive prompt option keys are rejected during planning.
-"""
+"""Provider descriptors reject inline credentials and keep option rendering safe."""
 
 from __future__ import annotations
 
@@ -17,8 +12,6 @@ import traceback
 from types import SimpleNamespace
 
 import pytest
-
-from vane.ai._redaction import REDACTED_PLACEHOLDER
 
 API_KEY = "sk-PLAINTEXT-API-KEY-SENTINEL-0123456789"
 ORGANIZATION = "org-PLAINTEXT-ORG-SENTINEL-0123456789"
@@ -40,20 +33,36 @@ def _openai_embedder_descriptor():
     from vane.ai.providers.openai import OpenAITextEmbedderDescriptor
 
     return OpenAITextEmbedderDescriptor(
-        provider_options={"api_key": API_KEY, "organization": ORGANIZATION, "base_url": "https://api.example"},
         model_name="text-embedding-3-small",
         dimensions=512,
-        embed_options={"encoding_format": "base64"},
+        options={"base_url": "https://api.example", "encoding_format": "base64"},
     )
+
+
+def _openai_embedder_descriptor_with_options(options):
+    from vane.ai.providers.openai import OpenAITextEmbedderDescriptor
+
+    return OpenAITextEmbedderDescriptor(options=options)
+
+
+def _openai_provider_embedder_descriptor(options):
+    from vane.ai.providers.openai import OpenAIProvider
+
+    return OpenAIProvider().get_text_embedder(options=options)
+
+
+def _openai_provider_prompt_descriptor(options):
+    from vane.ai.providers.openai import OpenAIProvider
+
+    return OpenAIProvider().get_prompter(options=options)
 
 
 def _google_embedder_descriptor():
     from vane.ai.providers.google import GoogleTextEmbedderDescriptor
 
     return GoogleTextEmbedderDescriptor(
-        provider_options={"api_key": API_KEY},
         model_name="gemini-embedding-001",
-        embed_options={"task_type": "RETRIEVAL_QUERY"},
+        options={"task_type": "RETRIEVAL_QUERY"},
     )
 
 
@@ -62,7 +71,7 @@ def _transformers_embedder_descriptor():
 
     return TransformersTextEmbedderDescriptor(
         model="sentence-transformers/all-MiniLM-L6-v2",
-        embed_options={"revision": "pinned"},
+        options={"revision": "pinned"},
     )
 
 
@@ -78,19 +87,25 @@ def _transformers_classifier_descriptor():
 def _openai_prompt_descriptor(options):
     from vane.ai.providers.openai import OpenAIPrompterDescriptor
 
-    return OpenAIPrompterDescriptor(prompt_options=options)
+    return OpenAIPrompterDescriptor(options=options)
 
 
 def _anthropic_prompt_descriptor(options):
     from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 
-    return AnthropicPrompterDescriptor(model_name="claude-test", prompt_options=options)
+    return AnthropicPrompterDescriptor(model_name="claude-test", options=options)
+
+
+def _anthropic_provider_prompt_descriptor(options):
+    from vane.ai.providers.anthropic import AnthropicProvider
+
+    return AnthropicProvider(prompt_model="claude-test").get_prompter(options=options)
 
 
 def _google_prompt_descriptor(options):
     from vane.ai.providers.google import GooglePrompterDescriptor
 
-    return GooglePrompterDescriptor(model_name="gemini-test", prompt_options=options)
+    return GooglePrompterDescriptor(model_name="gemini-test", options=options)
 
 
 def _vllm_prompt_plan(options):
@@ -162,7 +177,6 @@ class TestDescriptorReprRedaction:
         descriptor = factory()
         for rendered in (repr(descriptor), str(descriptor), f"{descriptor}", "{!r}".format(descriptor)):
             _assert_no_plaintext(rendered)
-            assert REDACTED_PLACEHOLDER in rendered
 
     @pytest.mark.parametrize("factory", ALL_DESCRIPTOR_FACTORIES)
     def test_repr_keeps_non_sensitive_fields_readable(self, factory):
@@ -187,11 +201,6 @@ class TestDescriptorReprRedaction:
                 {"credentials": API_KEY},
                 id="google",
             ),
-            pytest.param(
-                _vllm_prompt_plan,
-                {"engine_args": {"hf_token": HUB_TOKEN}},
-                id="vllm",
-            ),
         ],
     )
     def test_prompt_descriptors_reject_sensitive_options(self, factory, options):
@@ -199,13 +208,17 @@ class TestDescriptorReprRedaction:
             factory(options)
         _assert_no_plaintext(str(exc_info.value))
 
+    def test_internal_vllm_plan_seals_sensitive_values(self):
+        plan = _vllm_prompt_plan({"engine_args": {"hf_token": HUB_TOKEN}})
+
+        _assert_no_plaintext(repr(plan))
+        _assert_no_plaintext(repr(plan.get_options()))
+
     def test_credential_kwarg_cannot_land_in_embed_options(self):
         from vane.ai.providers.google import GoogleProvider
 
-        with pytest.raises(TypeError, match="auth_token") as exc_info:
-            GoogleProvider(api_key=API_KEY).get_text_embedder(
-                model="gemini-embedding-001", auth_token=API_KEY, task_type="RETRIEVAL_QUERY"
-            )
+        with pytest.raises(TypeError, match="api_key") as exc_info:
+            GoogleProvider(api_key=API_KEY)
         assert API_KEY not in str(exc_info.value)
 
     def test_transformers_embedder_rejects_hub_token(self):
@@ -214,9 +227,53 @@ class TestDescriptorReprRedaction:
         with pytest.raises(TypeError, match="token") as exc_info:
             TransformersTextEmbedderDescriptor(
                 model="sentence-transformers/all-MiniLM-L6-v2",
-                embed_options={"revision": "pinned", "token": HUB_TOKEN},
+                options={"revision": "pinned", "token": HUB_TOKEN},
             )
         assert HUB_TOKEN not in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        ("factory", "base_options"),
+        [
+            pytest.param(
+                _openai_provider_embedder_descriptor,
+                {},
+                id="openai-provider-embed",
+            ),
+            pytest.param(
+                _openai_provider_prompt_descriptor,
+                {},
+                id="openai-provider-prompt",
+            ),
+            pytest.param(
+                _openai_embedder_descriptor_with_options,
+                {},
+                id="openai-descriptor-embed",
+            ),
+            pytest.param(
+                _openai_prompt_descriptor,
+                {},
+                id="openai-descriptor-prompt",
+            ),
+            pytest.param(
+                _anthropic_provider_prompt_descriptor,
+                {"max_tokens": 64},
+                id="anthropic-provider",
+            ),
+            pytest.param(
+                _anthropic_prompt_descriptor,
+                {"max_tokens": 64},
+                id="anthropic-descriptor",
+            ),
+        ],
+    )
+    def test_credential_bearing_base_url_is_rejected_at_descriptor_boundary(self, factory, base_options):
+        credential_url = f"https://user:{API_KEY}@api.example/v1"
+        options = {**base_options, "base_url": credential_url}
+
+        with pytest.raises(ValueError, match="cannot contain credentials") as exc_info:
+            factory(options)
+
+        _assert_no_plaintext(str(exc_info.value))
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +303,6 @@ class TestLoggingRedaction:
             logger.info("descriptor is %r", descriptor)
         assert len(caplog.records) == 2
         _assert_no_plaintext(caplog.text)
-        assert REDACTED_PLACEHOLDER in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -276,19 +332,30 @@ class TestExceptionRedaction:
 # ---------------------------------------------------------------------------
 
 
-class TestUnwrapAtExecutionBoundary:
-    def test_openai_embedder_client_receives_plaintext(self, monkeypatch):
+class TestOptionsAtExecutionBoundary:
+    def test_openai_embedder_client_receives_non_sensitive_client_options(self, monkeypatch):
         client = _fresh_recording_client()
         _install_fake_openai(monkeypatch, client)
         _openai_embedder_descriptor().instantiate()
         assert client.calls == [
             {
-                "api_key": API_KEY,
-                "organization": ORGANIZATION,
                 "base_url": "https://api.example",
                 "max_retries": 0,
             }
         ]
+
+    @pytest.mark.parametrize("kind", ["embed", "prompt"])
+    def test_openai_default_endpoint_ignores_sdk_environment_override(self, monkeypatch, kind):
+        from vane.ai.providers.openai import OpenAIPrompterDescriptor, OpenAITextEmbedderDescriptor
+
+        client = _fresh_recording_client()
+        _install_fake_openai(monkeypatch, client)
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://compatible.example.test/v1")
+
+        descriptor = OpenAITextEmbedderDescriptor() if kind == "embed" else OpenAIPrompterDescriptor()
+        descriptor.instantiate()
+
+        assert client.calls == [{"base_url": "https://api.openai.com/v1", "max_retries": 0}]
 
     def test_openai_unknown_dimensions_do_not_probe_with_plaintext(self, monkeypatch):
         from vane.ai.providers.openai import OpenAITextEmbedderDescriptor
@@ -303,20 +370,19 @@ class TestUnwrapAtExecutionBoundary:
                 )
 
         _install_fake_openai(monkeypatch, _fresh_recording_client(), sync_client=FakeProbeClient)
-        descriptor = OpenAITextEmbedderDescriptor(
-            provider_options={"api_key": API_KEY, "base_url": "https://api.example"},
-            model_name="custom-served-model",
-        )
         with pytest.raises(ValueError, match="pass dimensions"):
-            descriptor.get_dimensions()
+            OpenAITextEmbedderDescriptor(
+                model_name="custom-served-model",
+                options={"base_url": "https://api.example"},
+            )
         assert probe_calls == []
 
-    def test_google_embedder_client_receives_plaintext(self, monkeypatch):
+    def test_google_embedder_client_uses_environment_credentials(self, monkeypatch):
         client = _fresh_recording_client()
         _install_fake_google(monkeypatch, client)
         _google_embedder_descriptor().instantiate()
         assert len(client.calls) == 1
-        assert client.calls[0]["api_key"] == API_KEY
+        assert "api_key" not in client.calls[0]
         assert client.calls[0]["http_options"].retry_options.attempts == 1
 
     def test_transformers_get_dimensions_uses_static_metadata_without_loading_config(self, monkeypatch):
@@ -350,7 +416,12 @@ class TestUnwrapAtExecutionBoundary:
         assert calls == [
             (
                 "sentence-transformers/all-MiniLM-L6-v2",
-                {"trust_remote_code": False, "backend": "torch", "revision": "pinned"},
+                {
+                    "trust_remote_code": False,
+                    "backend": "torch",
+                    "revision": "pinned",
+                    "device": "cpu",
+                },
             )
         ]
 
@@ -370,14 +441,16 @@ class TestUnwrapAtExecutionBoundary:
             )
         ]
 
-    def test_runtime_classes_accept_plain_dicts_unchanged(self, monkeypatch):
-        """Directly-constructed runtime objects with plain dicts keep working."""
+    def test_runtime_classes_accept_non_sensitive_options_mapping(self, monkeypatch):
         from vane.ai.providers.openai import OpenAITextEmbedder
 
         client = _fresh_recording_client()
         _install_fake_openai(monkeypatch, client)
-        OpenAITextEmbedder(provider_options={"api_key": "plain-key"}, model="text-embedding-3-small")
-        assert client.calls == [{"api_key": "plain-key"}]
+        OpenAITextEmbedder(
+            options={"base_url": "https://api.example"},
+            model="text-embedding-3-small",
+        )
+        assert client.calls == [{"base_url": "https://api.example", "max_retries": 0}]
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +463,6 @@ class TestPickleRoundTrip:
     def test_repr_stays_redacted_after_pickle(self, factory):
         restored = pickle.loads(pickle.dumps(factory()))
         _assert_no_plaintext(repr(restored))
-        assert REDACTED_PLACEHOLDER in repr(restored)
 
     def test_openai_pickled_descriptor_still_builds_working_client(self, monkeypatch):
         client = _fresh_recording_client()
@@ -399,8 +471,6 @@ class TestPickleRoundTrip:
         restored.instantiate()
         assert client.calls == [
             {
-                "api_key": API_KEY,
-                "organization": ORGANIZATION,
                 "base_url": "https://api.example",
                 "max_retries": 0,
             }

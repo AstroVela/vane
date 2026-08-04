@@ -147,14 +147,14 @@ def build_ai_prompt_sql_spec(
     # vLLM already has a native, relation-scoped physical operator. Keep its
     # executor alive across every input batch and let PhysicalVLLM send the
     # single terminal signal when the relation is exhausted.
-    from vane.ai.providers.vllm import NativeVLLMPromptPlan, _serialize_native_vllm_options
+    from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_options_argument
 
     if isinstance(descriptor, NativeVLLMPromptPlan):
         if image_input:
             raise ValueError("native vLLM ai_prompt does not support image inputs")
 
         native_options = descriptor.build_physical_vllm_options()
-        options_json = _serialize_native_vllm_options(native_options)
+        options_argument = _build_native_vllm_options_argument(native_options)
 
         spec = {
             "execution_kind": "native_vllm",
@@ -163,7 +163,7 @@ def build_ai_prompt_sql_spec(
             "model": descriptor.get_model(),
             "return_type": structured_output.duckdb_type if structured_output is not None else "VARCHAR",
             "system_message": descriptor.system_message,
-            "options_json": options_json,
+            "options": options_argument,
         }
         if structured_output is not None:
             validator = _ValidateStructuredOutputBatch(
@@ -193,6 +193,11 @@ def build_ai_prompt_sql_spec(
         return spec
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
+    if image_input and not descriptor.supports_image_inputs():
+        raise ValueError(
+            f"Provider {descriptor.get_provider()!r} model {descriptor.get_model()!r} "
+            "does not support Prompt image inputs"
+        )
 
     input_names = ["message_0", "message_1"] if image_input else ["message_0"]
     wrapper = _PromptBatch(
@@ -232,7 +237,7 @@ def build_ai_embed_sql_spec(
     options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     opts = _normalize_sql_options(options)
-    descriptor, resolved_dimensions, udf_opts, normalize, _, _, _, _ = _prepare_embed_call(
+    descriptor, resolved_dimensions, udf_opts, normalize, _, _, _ = _prepare_embed_call(
         provider,
         model,
         dimensions,

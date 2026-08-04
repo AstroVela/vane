@@ -103,13 +103,21 @@ class MockProvider(Provider):
     def name(self) -> str:
         return "mock"
 
-    def get_text_embedder(self, model=None, dimensions=None, **options):
+    def get_text_embedder(self, model=None, dimensions=None, *, options=None):
         return MockTextEmbedderDescriptor(dim=dimensions or 4)
 
     def get_text_classifier(self, model=None, **options):
         return MockTextClassifierDescriptor()
 
-    def get_prompter(self, model=None, system_message=None, **options):
+    def get_prompter(
+        self,
+        model=None,
+        system_message=None,
+        return_format=None,
+        return_raw_response=False,
+        *,
+        options=None,
+    ):
         return MockPrompterDescriptor()
 
 
@@ -132,6 +140,15 @@ class TestRelationPatch:
         for row in rows:
             assert row[0] in {"hello", "world"}
             assert len(row[1]) == 4
+
+    def test_embed_replaces_existing_output_column_case_insensitively(self):
+        conn = duckdb.connect()
+        rel = conn.sql("SELECT 'hello' AS text, [42, 42, 42, 42]::FLOAT[4] AS Embedding")
+
+        result = rel.embed(vane.col("text"), provider=MockProvider())
+
+        assert result.columns == ["text", "embedding"]
+        assert result.fetchone() == ("hello", (5.0, 5.0, 5.0, 5.0))
 
     def test_classify_text_on_relation(self):
         """rel.classify_text() produces labels."""
@@ -160,6 +177,15 @@ class TestRelationPatch:
     def test_prompt_replaces_existing_output_column(self):
         conn = vane.connect()
         rel = conn.sql("SELECT 'hello' AS text, 'old' AS response")
+
+        result = rel.prompt(vane.col("text"), provider=MockProvider())
+
+        assert result.columns == ["text", "response"]
+        assert result.fetchone() == ("hello", "prompt:hello")
+
+    def test_prompt_replaces_existing_output_column_case_insensitively(self):
+        conn = vane.connect()
+        rel = conn.sql("SELECT 'hello' AS text, 'old' AS Response")
 
         result = rel.prompt(vane.col("text"), provider=MockProvider())
 

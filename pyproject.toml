@@ -64,7 +64,7 @@ Issues = "https://github.com/AstroVela/vane/issues"
 Changelog = "https://github.com/AstroVela/vane/releases"
 
 [project.optional-dependencies]
-openai = ["openai"]
+openai = ["openai", "tiktoken"]
 anthropic = ["anthropic>=0.117.0"] # floor matches the Messages.create option surface validated in vane/ai/providers/anthropic.py
 google = ["google-genai>=1.22.0"] # floor adds GenerateContentConfig.response_json_schema
 transformers = [
@@ -89,6 +89,7 @@ all = [ # Cloud providers and dataframe/filesystem integrations; local model run
     "ipython", # used in query_graph
     "fsspec",  # used in filesystem support
     "openai",
+    "tiktoken",
     "pandas",  # used for pandas dataframes
     "adbc-driver-manager", # for the adbc driver
     "pillow>=10", # used for image inputs and video frames
@@ -398,6 +399,8 @@ test = [ # dependencies used for running tests
     "pytest-reraise",
     "pytest-timeout",
     "pytest-timestamper",
+    "pydantic>=2",
+    "tiktoken",
     "coverage",
     "gcovr",
     "gcsfs; sys_platform != 'win32' or platform_machine != 'ARM64'",

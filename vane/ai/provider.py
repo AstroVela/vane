@@ -17,7 +17,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     from vane.ai.protocols import (
         NativePrompterPlan,
@@ -164,47 +164,47 @@ class _ProviderResultError(TypeError):
 # ---------------------------------------------------------------------------
 
 
-def _load_transformers(name: str | None = None, **options: Any) -> Provider:
+def _load_transformers(name: str | None = None) -> Provider:
     try:
         from vane.ai.providers.transformers import TransformersProvider
 
-        return TransformersProvider(name, **options)
+        return TransformersProvider(name)
     except ImportError as e:
         raise ProviderImportError("transformers") from e
 
 
-def _load_openai(name: str | None = None, **options: Any) -> Provider:
+def _load_openai(name: str | None = None) -> Provider:
     try:
         from vane.ai.providers.openai import OpenAIProvider
 
-        return OpenAIProvider(name, **options)
+        return OpenAIProvider(name)
     except ImportError as e:
         raise ProviderImportError("openai") from e
 
 
-def _load_vllm(name: str | None = None, **options: Any) -> Provider:
+def _load_vllm(name: str | None = None) -> Provider:
     try:
         from vane.ai.providers.vllm import VLLMProvider
 
-        return VLLMProvider(name, **options)
+        return VLLMProvider(name)
     except ImportError as e:
         raise ProviderImportError("vllm") from e
 
 
-def _load_anthropic(name: str | None = None, **options: Any) -> Provider:
+def _load_anthropic(name: str | None = None) -> Provider:
     try:
         from vane.ai.providers.anthropic import AnthropicProvider
 
-        return AnthropicProvider(name, **options)
+        return AnthropicProvider(name)
     except ImportError as e:
         raise ProviderImportError("anthropic") from e
 
 
-def _load_google(name: str | None = None, **options: Any) -> Provider:
+def _load_google(name: str | None = None) -> Provider:
     try:
         from vane.ai.providers.google import GoogleProvider
 
-        return GoogleProvider(name, **options)
+        return GoogleProvider(name)
     except ImportError as e:
         raise ProviderImportError("google") from e
 
@@ -218,14 +218,12 @@ PROVIDERS: dict[str, Callable[..., Provider]] = {
 }
 
 
-def load_provider(provider: str, name: str | None = None, **options: Any) -> Provider:
+def load_provider(provider: str, name: str | None = None) -> Provider:
     """Load a provider by name.
 
     Args:
         provider: One of the registered provider names (e.g. ``"transformers"``).
         name: Optional display name override.
-        **options: Forwarded to the provider constructor.
-
     Raises:
         ValueError: If the provider name is not registered.
         ProviderImportError: If the provider's dependencies are missing.
@@ -233,7 +231,7 @@ def load_provider(provider: str, name: str | None = None, **options: Any) -> Pro
     factory = PROVIDERS.get(provider)
     if factory is None:
         raise ValueError(f"Provider {provider!r} is not supported. Available: {sorted(PROVIDERS)}")
-    return factory(name, **options)
+    return factory(name)
 
 
 def _not_implemented(provider: Provider, method: str) -> NotImplementedError:
@@ -264,7 +262,8 @@ class Provider(ABC):
         self,
         model: str | None = None,
         dimensions: int | None = None,
-        **options: Any,
+        *,
+        options: Mapping[str, Any] | None = None,
     ) -> TextEmbedderDescriptor:
         raise _not_implemented(self, "embed_text")
 
@@ -281,6 +280,7 @@ class Provider(ABC):
         system_message: str | None = None,
         return_format: dict[str, Any] | None = None,
         return_raw_response: bool = False,
-        **options: Any,
+        *,
+        options: Mapping[str, Any] | None = None,
     ) -> PrompterDescriptor | NativePrompterPlan:
         raise _not_implemented(self, "prompt")
