@@ -14,6 +14,7 @@ from duckdb.runners.ray.fragment_registry import (
 from duckdb.runners.ray.fte_fragment_scheduler import (
     _fte_retry_remaining_delay_s,
     _mark_fte_worker_failed,
+    _query_ids_owned_by_fte_workers,
     _worker_actor_death_confirms_quiescence,
     _worker_failure_payload,
 )
@@ -68,41 +69,58 @@ def retire_fte_worker_for_failure(
 
 
 def mark_fte_worker_failed_for_event(event: Any) -> list[tuple[str, str, list[Any], list[Any]]]:
-    manager_instance_id = event.manager_instance_id
-    worker_incarnation_id = event.worker_incarnation_id
+    manager_instance_id = str(event.manager_instance_id)
+    worker_incarnation_id = str(event.worker_incarnation_id)
     failure = _worker_failure_payload(
         event.worker_id,
         event.error,
         worker_incarnation_id=worker_incarnation_id,
     )
+    event_query_id = str(event.query_id)
     with _FTE_REGISTRY_LOCK:
-        query_closing = str(event.query_id) in _FTE_CLOSING_QUERIES
-        scheduler = _FTE_SCHEDULERS.get(event.query_id)
-    if scheduler is not None and not scheduler.is_owned_by_manager_instance(manager_instance_id):
+        event_scheduler = _FTE_SCHEDULERS.get(event_query_id)
+    if event_scheduler is not None and not event_scheduler.is_owned_by_manager_instance(manager_instance_id):
         return []
     quarantine_fte_worker(
         event.worker_id,
         manager_instance_id=manager_instance_id,
         worker_incarnation_id=worker_incarnation_id,
     )
-    reconcile_query = scheduler is not None and not query_closing
-    if reconcile_query:
-        reconcile_query = scheduler.record_worker_failure(
+    affected_query_ids = _query_ids_owned_by_fte_workers(
+        {str(event.worker_id)},
+        {str(event.worker_id): worker_incarnation_id},
+    )
+    affected_query_ids.add(event_query_id)
+    reconciliation_schedulers = {}
+    for query_id in sorted(affected_query_ids):
+        with _FTE_REGISTRY_LOCK:
+            if query_id in _FTE_CLOSING_QUERIES:
+                continue
+            scheduler = _FTE_SCHEDULERS.get(query_id)
+        if scheduler is None or not scheduler.is_owned_by_manager_instance(manager_instance_id):
+            continue
+        if scheduler.record_worker_failure(
             event.worker_id,
             worker_incarnation_id=worker_incarnation_id,
+        ):
+            reconciliation_schedulers[query_id] = scheduler
+    reconciliation_query_ids = set(reconciliation_schedulers)
+    try:
+        scheduled_by_stage = _mark_fte_worker_failed(
+            event.worker_id,
+            failure,
+            query_id_filters=reconciliation_query_ids,
+            manager_instance_id=manager_instance_id,
+            worker_incarnation_id=worker_incarnation_id,
+            primary_worker_process_terminated=_worker_actor_death_confirms_quiescence(event.error),
+            reconcile_query=bool(reconciliation_query_ids),
         )
-    scheduled_by_stage = _mark_fte_worker_failed(
-        event.worker_id,
-        failure,
-        query_id_filter=event.query_id,
-        manager_instance_id=manager_instance_id,
-        worker_incarnation_id=worker_incarnation_id,
-        primary_worker_process_terminated=_worker_actor_death_confirms_quiescence(event.error),
-        reconcile_query=reconcile_query,
-    )
-    if not reconcile_query:
-        return []
-    delay_s = _fte_retry_remaining_delay_s(event.query_id)
-    if delay_s > 0:
-        scheduler.arm_retry_delay(delay_s)
+    except BaseException as exc:
+        for scheduler in reconciliation_schedulers.values():
+            scheduler.fail(f"FTE worker failure handling failed: {exc}")
+        raise
+    for query_id, scheduler in reconciliation_schedulers.items():
+        delay_s = _fte_retry_remaining_delay_s(query_id)
+        if delay_s > 0:
+            scheduler.arm_retry_delay(delay_s)
     return scheduled_by_stage

@@ -905,6 +905,20 @@ class FteFragmentExecution:
                     return True
             return False
 
+    def running_attempt_worker_incarnation(
+        self,
+        attempt_id: FteTaskAttemptId | str | Mapping[str, Any],
+    ) -> tuple[str, str] | None:
+        attempt = FteTaskAttemptId.coerce(attempt_id)
+        with self._state_lock:
+            partition = self.partitions.get(attempt.partition_id)
+            if partition is None:
+                return None
+            running = partition.running_attempts.get(attempt.attempt_id)
+            if running is None:
+                return None
+            return running.worker_id, running.worker_incarnation_id
+
     def _create_attempt_after_admission(self, partition: FteTaskPartition) -> ScheduledAttempt | None:
         partition.mark_waiting_for_node()
         if self.worker_reservation_callback is not None:

@@ -2354,7 +2354,7 @@ def _running_partition_requirements_on_fte_workers(
     worker_ids: set[str],
     *,
     worker_incarnation_ids: Mapping[str, str],
-    query_id_filter: str | None = None,
+    query_id_filters: set[str] | None = None,
 ) -> dict[
     tuple[str, str, int],
     tuple[int | None, FteTaskExecutionClass, NodeRequirements | None],
@@ -2363,7 +2363,7 @@ def _running_partition_requirements_on_fte_workers(
         fragment_execution_items = [
             item
             for item in _FTE_FRAGMENT_EXECUTIONS.items()
-            if query_id_filter is None or item[0][0] == query_id_filter
+            if query_id_filters is None or item[0][0] in query_id_filters
         ]
     normalized_incarnation_ids = {
         str(worker_id): str(incarnation_id) for worker_id, incarnation_id in worker_incarnation_ids.items()
@@ -2416,7 +2416,7 @@ def _mark_fte_worker_failed(
     worker_id: str,
     failure: Mapping[str, Any],
     *,
-    query_id_filter: str | None = None,
+    query_id_filters: set[str] | None = None,
     manager_instance_id: str,
     worker_incarnation_id: str,
     primary_worker_process_terminated: bool = False,
@@ -2426,8 +2426,10 @@ def _mark_fte_worker_failed(
     if not worker_id:
         raise ValueError("worker_id must be non-empty")
     failure = _normalize_failure_payload(failure)
-    if query_id_filter is not None:
-        query_id_filter = str(query_id_filter)
+    if query_id_filters is not None:
+        query_id_filters = {str(query_id) for query_id in query_id_filters}
+        if not all(query_id_filters):
+            raise ValueError("query_id_filters must contain only non-empty query ids")
     normalized_manager_instance_id = str(manager_instance_id).strip()
     failed_worker_ids = {worker_id}
     worker_incarnation_id = str(worker_incarnation_id)
@@ -2487,7 +2489,7 @@ def _mark_fte_worker_failed(
         _running_partition_requirements_on_fte_workers(
             failed_worker_ids,
             worker_incarnation_ids=failed_worker_incarnation_ids,
-            query_id_filter=query_id_filter,
+            query_id_filters=query_id_filters,
         )
         if reconcile_query
         else {}
@@ -2500,8 +2502,8 @@ def _mark_fte_worker_failed(
         failed_worker_ids,
         failed_worker_incarnation_ids,
     )
-    if query_id_filter is not None:
-        affected_query_ids.add(query_id_filter)
+    if query_id_filters is not None:
+        affected_query_ids.update(query_id_filters)
     handles_to_kill: list[RayWorkerActorHandle] = []
     for failed_worker_id, failed_handle in failed_handles.items():
         if primary_worker_process_terminated and failed_worker_id == worker_id:
@@ -2561,7 +2563,7 @@ def _mark_fte_worker_failed(
                     handles_to_kill.append(captured_handle)
             if reconcile_query:
                 for owner_key, owner in list(_FTE_PARTITION_OWNERS.items()):
-                    if query_id_filter is not None and owner_key[0] != query_id_filter:
+                    if query_id_filters is not None and owner_key[0] not in query_id_filters:
                         continue
                     if not _worker_matches_failure_incarnation(
                         owner,
@@ -2582,7 +2584,7 @@ def _mark_fte_worker_failed(
                 fragment_execution_items = [
                     item
                     for item in _FTE_FRAGMENT_EXECUTIONS.items()
-                    if query_id_filter is None or item[0][0] == query_id_filter
+                    if query_id_filters is None or item[0][0] in query_id_filters
                 ]
             else:
                 fragment_execution_items = []

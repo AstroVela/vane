@@ -784,6 +784,16 @@ class FteQueryScheduler:
             self._failed_worker_incarnations.add(failure_identity)
             return True
 
+    def worker_failure_is_recorded(
+        self,
+        worker_id: str,
+        *,
+        worker_incarnation_id: str,
+    ) -> bool:
+        failure_identity = (str(worker_id), str(worker_incarnation_id))
+        with self._lock:
+            return failure_identity in self._failed_worker_incarnations
+
     def retry_delay_generation(self) -> int:
         with self._lock:
             return self._retry_delay_generation

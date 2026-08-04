@@ -56,6 +56,9 @@ if TYPE_CHECKING:
 
 
 class FteWorkerLifecycleMixin:
+    if TYPE_CHECKING:
+        _handles_for_worker_failed_event: Any
+
     def _drop_fragment_registration_state(self, query_id: str) -> None:
         query_key = str(query_id or "").strip()
         if not query_key:
@@ -343,6 +346,24 @@ class FteWorkerLifecycleMixin:
         )
         query_ids = fte_fragment_execution_query_ids()
         query_ids.update(_FTE_SCHEDULERS.query_ids())
+        owned_query_ids = []
+        for query_id in sorted(query_ids):
+            if fte_registry_query_is_closing(query_id):
+                continue
+            scheduler = _FTE_SCHEDULERS.get(query_id)
+            if scheduler is None or not scheduler.is_owned_by_manager_instance(self.manager_instance_id):
+                continue
+            owned_query_ids.append(query_id)
+        if owned_query_ids:
+            return self._handles_for_worker_failed_event(
+                WorkerFailed(
+                    query_id=owned_query_ids[0],
+                    worker_id=failed_worker_id,
+                    worker_incarnation_id=worker_incarnation_id,
+                    manager_instance_id=self.manager_instance_id,
+                    error=failure,
+                )
+            )
         if query_ids:
             retire_fte_worker_for_failure(
                 failed_worker_id,
@@ -350,27 +371,7 @@ class FteWorkerLifecycleMixin:
                 manager_instance_id=self.manager_instance_id,
                 worker_incarnation_id=worker_incarnation_id,
             )
-        handles: list[Any] = []
-        for query_id in sorted(query_ids):
-            if fte_registry_query_is_closing(query_id):
-                continue
-            scheduler = _FTE_SCHEDULERS.get(query_id)
-            if scheduler is None:
-                continue
-            if not scheduler.is_owned_by_manager_instance(self.manager_instance_id):
-                continue
-            self._bind_fte_scheduler_handlers(scheduler)
-            scheduler.enqueue(
-                WorkerFailed(
-                    query_id=query_id,
-                    worker_id=failed_worker_id,
-                    worker_incarnation_id=worker_incarnation_id,
-                    manager_instance_id=self.manager_instance_id,
-                    error=failure,
-                )
-            )
-            handles.extend(scheduler.drain())
-        return handles
+        return []
 
     def handle_fte_task_status(self, status: Mapping[str, Any]) -> list[Any]:
         attempt_id = FteTaskAttemptId.coerce(status.get("task_id") or status.get("task_id_string") or status)

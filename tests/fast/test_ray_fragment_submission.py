@@ -1193,7 +1193,7 @@ def test_fte_worker_command_dispatch_preserves_healthy_tail_and_new_outbox_comma
         assert failed_a._fte_healthy is False
         assert failed_b._fte_healthy is False
         assert healthy._fte_healthy is True
-        assert scheduler.stats().event_counts.get("WorkerFailed", 0) == 2
+        assert scheduler.stats().failed_worker_count == 2
     finally:
         fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
 
@@ -1300,7 +1300,7 @@ def test_fte_worker_command_dispatch_publishes_only_successful_healthy_creates(m
             str(attempt.attempt_id) for attempt in dispatch.scheduled_attempts
         }
         assert healthy.fte_pressure_stats()["running_attempt_count"] == 1
-        assert scheduler.stats().event_counts.get("WorkerFailed", 0) == 2
+        assert scheduler.stats().failed_worker_count == 2
     finally:
         fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
 
@@ -8502,7 +8502,7 @@ def test_fte_worker_failure_does_not_invert_attempt_start_lock_order(monkeypatch
                 "error_code": "WORKER_LOST",
                 "message": "worker lost during attempt start",
             },
-            query_id_filter=query_id,
+            query_id_filters={query_id},
             manager_instance_id=failed.manager_instance_id,
             worker_incarnation_id=failed.worker_incarnation_id,
         )
@@ -8570,8 +8570,8 @@ def test_fte_worker_failure_replays_descriptor_on_new_owner(monkeypatch):
     assert stats["event_counts"] == {
         "SplitEventsSubmitted": 1,
         "WorkerReservationCompleted": 2,
-        "WorkerFailed": 1,
     }
+    assert stats["failed_worker_count"] == 1
 
 
 def test_manager_shutdown_defers_primary_actor_kill_until_finish(monkeypatch):
@@ -8839,6 +8839,99 @@ def test_fte_worker_failure_event_uses_confirmed_actor_death_without_prepare(mon
     assert "worker-0" not in worker_handle_mod._FTE_WORKER_HANDLES
 
 
+def test_fte_status_worker_failure_reconciles_all_queries_before_canceled_status(monkeypatch):
+    quiescence = Future()
+    quiescence_started = threading.Event()
+
+    class _BlockingPrepare:
+        def remote(self):
+            quiescence_started.set()
+            return SimpleNamespace(future=lambda: quiescence)
+
+    failed_actor = _FakeActor()
+    failed_actor.prepare_shutdown = _BlockingPrepare()
+    replacement_actor = _FakeActor()
+    failed = RayWorkerActorHandle(
+        failed_actor,
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:0",
+        manager_instance_id="manager-a",
+    )
+    replacement = RayWorkerActorHandle(
+        replacement_actor,
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-b:0",
+        manager_instance_id="manager-a",
+    )
+    replacement._fte_healthy = False
+    tasks = [
+        _FakeTask(
+            name=f"scan-task-{suffix}",
+            context={"query_id": f"query-shared-worker-{suffix}", "node_id": "7"},
+            inputs={"7": {"kind": "scan_task", "data": suffix.encode()}},
+            plan={"plan": "scan-template"},
+        )
+        for suffix in ("a", "b")
+    ]
+    first_handles = [failed.submit_tasks([task])[0] for task in tasks]
+    replacement._fte_healthy = True
+    failure_result = []
+    failure_errors = []
+
+    def report_status_failure():
+        try:
+            failure_result.extend(
+                replacement._handles_for_worker_failed_event(
+                    WorkerFailed(
+                        query_id="query-shared-worker-a",
+                        worker_id=failed.worker_id,
+                        worker_incarnation_id=failed.worker_incarnation_id,
+                        manager_instance_id=failed.manager_instance_id,
+                        error=RuntimeError("planned status watcher failure"),
+                    )
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failure_errors.append(exc)
+
+    failure_thread = threading.Thread(target=report_status_failure)
+    failure_thread.start()
+    assert quiescence_started.wait(timeout=1.0)
+
+    canceled_handles = replacement.handle_fte_task_status(
+        {
+            "state": FteTaskState.CANCELED.value,
+            "task_id": first_handles[1].task_id.to_dict(),
+            "failure": {"error_code": "GENERIC_INTERNAL_ERROR", "message": "worker shutdown"},
+        }
+    )
+    query_b_stage = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[
+        ("query-shared-worker-b", "query-shared-worker-b:node:7")
+    ]
+    assert canceled_handles == []
+    assert query_b_stage.failed is False
+    assert query_b_stage.partitions[0].running_attempt is not None
+    assert query_b_stage.partitions[0].running_attempt.remote_handle is failed
+
+    quiescence.set_result(None)
+    failure_thread.join(timeout=2.0)
+
+    assert not failure_thread.is_alive()
+    assert failure_errors == []
+    assert {handle.task_id.query_id for handle in failure_result} == {
+        "query-shared-worker-a",
+        "query-shared-worker-b",
+    }
+    assert all(handle.worker_handle is replacement for handle in failure_result)
+    assert query_b_stage.failed is False
+    assert query_b_stage.partitions[0].running_attempt is not None
+    assert query_b_stage.partitions[0].running_attempt.remote_handle is replacement
+    for suffix in ("a", "b"):
+        scheduler = worker_handle_mod._FTE_SCHEDULERS.get(f"query-shared-worker-{suffix}")
+        assert scheduler is not None
+        assert scheduler.stats().failed_worker_count == 1
+
+
 def test_worker_quiescence_requires_terminal_actor_death():
     assert fte_fragment_scheduler_mod._worker_actor_death_confirms_quiescence(ray.exceptions.ActorDiedError())
     assert not fte_fragment_scheduler_mod._worker_actor_death_confirms_quiescence(
@@ -9015,9 +9108,9 @@ def test_fte_worker_failure_retry_waits_for_scheduling_delayer(monkeypatch):
     assert stats["event_counts"] == {
         "SplitEventsSubmitted": 1,
         "WorkerReservationCompleted": 2,
-        "WorkerFailed": 1,
         "RetryDelayExpired": 1,
     }
+    assert stats["failed_worker_count"] == 1
 
 
 def test_fte_split_append_control_failure_replays_on_replacement(monkeypatch):
@@ -9072,8 +9165,8 @@ def test_fte_split_append_control_failure_replays_on_replacement(monkeypatch):
     assert stats["event_counts"] == {
         "SplitEventsSubmitted": 2,
         "WorkerReservationCompleted": 2,
-        "WorkerFailed": 1,
     }
+    assert stats["failed_worker_count"] == 1
 
 
 def test_fte_control_quiescence_failure_does_not_skip_later_worker_retirement():
@@ -11700,8 +11793,8 @@ def test_fte_input_stream_exhausted_control_failure_replays_sealed_descriptor(mo
         "SplitEventsSubmitted": 1,
         "WorkerReservationCompleted": 2,
         "SourceInputExhausted": 1,
-        "WorkerFailed": 1,
     }
+    assert stats["failed_worker_count"] == 1
 
 
 def test_fte_empty_input_creates_task_instead_of_empty_sentinel(monkeypatch):
