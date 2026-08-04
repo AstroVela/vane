@@ -55,6 +55,12 @@ def test_base_distribution_requires_pyarrow_14_or_newer():
     assert pyarrow_requirement.specifier == SpecifierSet(">=14.0.0")
 
 
+def test_base_distribution_requires_botocore_1_38_or_newer():
+    botocore_requirement = _base_requirements()["botocore"]
+
+    assert botocore_requirement.specifier == SpecifierSet(">=1.38.0,<2")
+
+
 def test_artifact_mode_imports_installed_python_packages():
     if os.environ.get("VANE_FAST_TEST_ARTIFACT_MODE") != "1":
         pytest.skip("only applies to artifact-backed fast-test jobs")

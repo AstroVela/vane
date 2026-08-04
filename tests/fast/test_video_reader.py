@@ -40,9 +40,12 @@ _S3_ENV_NAMES = (
     "AWS_ROLE_ARN",
     "AWS_ROLE_SESSION_NAME",
     "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_DEFAULT_PROFILE",
     "AWS_REGION",
     "AWS_DEFAULT_REGION",
     "AWS_ENDPOINT_URL",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
 )
 
 
@@ -56,7 +59,8 @@ def recording_s3_filesystem(monkeypatch):
         def __init__(self, **kwargs):
             recorded["kwargs"] = kwargs
 
-        def get_file_info(self, _path):
+        def get_file_info(self, path):
+            recorded["file_info_path"] = path
             return type("FileInfo", (), {"size": len(b"video-bytes")})()
 
         def open_input_file(self, path):
@@ -70,17 +74,31 @@ def recording_s3_filesystem(monkeypatch):
 def _clear_s3_environment(monkeypatch):
     for name in _S3_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_CONFIG_FILE", os.devnull)
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", os.devnull)
 
 
-def test_video_s3_reader_uses_default_aws_sdk_chain(
+def _source_identity(video_reader, video_path):
+    source_path = video_reader._video_source_path(video_path)
+    return source_path, video_reader._video_source_id(source_path)
+
+
+def test_video_s3_reader_uses_default_aws_sdk_chain_and_exact_locator(
     monkeypatch,
     recording_s3_filesystem,
     tmp_path,
 ):
+    import duckdb.datasource.video_reader as video_reader
+
     _clear_s3_environment(monkeypatch)
+    monkeypatch.setattr(
+        video_reader,
+        "_video_source_id",
+        lambda _path: pytest.fail("materialization must not depend on provenance identity"),
+    )
 
     with _materialize_video_path(
-        "s3://media-bucket/clips/example.mp4",
+        "s3://MEDIA-BUCKET/clips/Example.mp4",
         max_remote_video_bytes=1024,
         remote_temp_dir=str(tmp_path),
     ) as local_path:
@@ -89,7 +107,8 @@ def test_video_s3_reader_uses_default_aws_sdk_chain(
     assert result == b"video-bytes"
     assert recording_s3_filesystem == {
         "kwargs": {},
-        "path": "media-bucket/clips/example.mp4",
+        "file_info_path": "MEDIA-BUCKET/clips/Example.mp4",
+        "path": "MEDIA-BUCKET/clips/Example.mp4",
     }
 
 
@@ -293,11 +312,12 @@ def test_remote_video_tempfile_errors_are_not_classified_as_bad_input(
     assert not isinstance(raised.value, video_reader.VideoReadError)
 
 
-def test_video_source_identity_distinguishes_same_basename_sources():
+def test_video_source_identity_distinguishes_same_basename_sources(monkeypatch):
     import duckdb.datasource.video_reader as video_reader
 
-    path_a, source_id_a = video_reader._video_source_identity("s3://bucket-a/train/clip.mp4")
-    path_b, source_id_b = video_reader._video_source_identity("s3://bucket-b/eval/clip.mp4")
+    _clear_s3_environment(monkeypatch)
+    path_a, source_id_a = _source_identity(video_reader, "s3://bucket-a/train/clip.mp4")
+    path_b, source_id_b = _source_identity(video_reader, "s3://bucket-b/eval/clip.mp4")
 
     assert path_a == "s3://bucket-a/train/clip.mp4"
     assert path_b == "s3://bucket-b/eval/clip.mp4"
@@ -306,12 +326,18 @@ def test_video_source_identity_distinguishes_same_basename_sources():
     assert source_id_a != source_id_b
 
 
-def test_video_source_identity_preserves_s3_object_key_semantics():
+def test_video_source_identity_preserves_exact_s3_locator_and_case(monkeypatch):
     import duckdb.datasource.video_reader as video_reader
 
-    path, _ = video_reader._video_source_identity("s3://MEDIA-BUCKET/a//../clip.mp4")
+    _clear_s3_environment(monkeypatch)
+    path, source_id = _source_identity(video_reader, "s3://MEDIA-BUCKET/a//../Clip.mp4")
+    _, lowercase_source_id = _source_identity(video_reader, "s3://media-bucket/a//../Clip.mp4")
+    _, lowercase_key_source_id = _source_identity(video_reader, "s3://MEDIA-BUCKET/a//../clip.mp4")
 
-    assert path == "s3://media-bucket/a//../clip.mp4"
+    assert path == "s3://MEDIA-BUCKET/a//../Clip.mp4"
+    assert source_id == "c03d65babeea00c996c154794fd9f7087c4fbd8f7dc8ec4135f291154bfa9833"
+    assert source_id != lowercase_source_id
+    assert source_id != lowercase_key_source_id
 
 
 def test_video_source_identity_resolves_symlink_before_parent_component(tmp_path):
@@ -327,8 +353,8 @@ def test_video_source_identity_resolves_symlink_before_parent_component(tmp_path
     link = tmp_path / "link"
     link.symlink_to(decoded_dir, target_is_directory=True)
 
-    canonical_path, source_id = video_reader._video_source_identity(str(link / ".." / "clip.mp4"))
-    direct_path, direct_source_id = video_reader._video_source_identity(str(direct_video))
+    canonical_path, source_id = _source_identity(video_reader, str(link / ".." / "clip.mp4"))
+    direct_path, direct_source_id = _source_identity(video_reader, str(direct_video))
 
     assert canonical_path == str(decoded_video.resolve())
     assert direct_path == str(direct_video.resolve())
@@ -496,6 +522,173 @@ def test_video_s3_reader_normalizes_endpoint_override(
     assert recording_s3_filesystem["kwargs"] == expected_kwargs
 
 
+def test_video_s3_source_identity_is_versioned_and_endpoint_scoped(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    _clear_s3_environment(monkeypatch)
+    path = "s3://MEDIA-BUCKET/a//../Clip.mp4"
+
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "HTTPS://OBJECTS.EXAMPLE.TEST:443/prefix")
+    source_path, first_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv("AWS_REGION", "future-moon-1")
+    _, arbitrary_region_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://objects.example.test./another-prefix")
+    _, absolute_dns_name_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "objects.example.test/another-prefix")
+    _, equivalent_endpoint_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://other.example.test")
+    _, other_endpoint_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://objects.example.test")
+    _, other_scheme_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://objects.example.test:9443")
+    _, other_port_source_id = _source_identity(video_reader, path)
+
+    assert source_path == path
+    assert first_source_id == "39874672dd4d30134572b88928574d43945bdfe2207847eabad0408b9e46debf"
+    assert absolute_dns_name_source_id == first_source_id
+    assert arbitrary_region_source_id == first_source_id
+    assert equivalent_endpoint_source_id == first_source_id
+    assert other_endpoint_source_id != first_source_id
+    assert other_scheme_source_id != first_source_id
+    assert other_port_source_id != first_source_id
+
+
+def test_video_s3_source_identity_canonicalizes_ipv6_endpoint_literals(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    _clear_s3_environment(monkeypatch)
+    path = "s3://media-bucket/clips/example.mp4"
+
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://[2001:db8::1]")
+    _, compressed_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv(
+        "AWS_ENDPOINT_URL",
+        "https://[2001:0DB8:0000:0000:0000:0000:0000:0001]:443/prefix",
+    )
+    _, expanded_source_id = _source_identity(video_reader, path)
+
+    assert expanded_source_id == compressed_source_id
+
+
+def test_video_s3_default_source_identity_is_partition_scoped(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    _clear_s3_environment(monkeypatch)
+    path = "s3://shared-name/clips/example.mp4"
+
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    _, standard_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv("AWS_REGION", "eu-west-1")
+    _, other_standard_region_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv("AWS_REGION", "cn-north-1")
+    _, china_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv("AWS_REGION", "us-gov-west-1")
+    _, govcloud_source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv("AWS_REGION", "eusc-de-east-1")
+    _, sovereign_cloud_source_id = _source_identity(video_reader, path)
+
+    assert other_standard_region_source_id == standard_source_id
+    assert len({standard_source_id, china_source_id, govcloud_source_id, sovereign_cloud_source_id}) == 4
+
+
+def test_video_s3_profile_region_is_reused_for_identity_and_io(
+    monkeypatch,
+    recording_s3_filesystem,
+    tmp_path,
+):
+    import duckdb.datasource.video_reader as video_reader
+
+    _clear_s3_environment(monkeypatch)
+    config_path = tmp_path / "aws-config"
+    config_path.write_text("[profile sovereign]\nregion = eusc-de-east-1\n", encoding="utf-8")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(config_path))
+    monkeypatch.setenv("AWS_PROFILE", "sovereign")
+
+    source_path = video_reader._video_source_path("s3://shared-name/clips/example.mp4")
+    settings = video_reader._s3_endpoint_settings()
+    profile_source_id = video_reader._video_source_id(source_path, endpoint_settings=settings)
+
+    monkeypatch.setenv("AWS_REGION", "eusc-de-east-1")
+    _, environment_source_id = _source_identity(video_reader, source_path)
+    video_reader._s3_filesystem(settings)
+
+    assert settings.region == "eusc-de-east-1"
+    assert settings.partition == "aws-eusc"
+    assert settings.namespace == "aws-eusc"
+    assert profile_source_id == environment_source_id
+    assert recording_s3_filesystem["kwargs"] == {"region": "eusc-de-east-1"}
+
+
+def test_video_s3_region_snapshot_is_reused_after_environment_changes(
+    monkeypatch,
+    recording_s3_filesystem,
+):
+    import duckdb.datasource.video_reader as video_reader
+
+    _clear_s3_environment(monkeypatch)
+    source_path = video_reader._video_source_path("s3://shared-name/clips/example.mp4")
+    monkeypatch.setenv("AWS_REGION", "cn-north-1")
+    settings = video_reader._s3_endpoint_settings()
+    china_source_id = video_reader._video_source_id(source_path, endpoint_settings=settings)
+
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    _, standard_source_id = _source_identity(video_reader, source_path)
+    video_reader._s3_filesystem(settings)
+
+    assert settings.region == "cn-north-1"
+    assert settings.partition == "aws-cn"
+    assert china_source_id != standard_source_id
+    assert video_reader._video_source_id(source_path, endpoint_settings=settings) == china_source_id
+    assert recording_s3_filesystem["kwargs"] == {"region": "cn-north-1"}
+
+
+def test_video_s3_unknown_default_region_fails_closed(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    _clear_s3_environment(monkeypatch)
+    monkeypatch.setenv("AWS_REGION", "future-moon-1")
+
+    with pytest.raises(ValueError, match="cannot determine the AWS partition"):
+        _source_identity(video_reader, "s3://shared-name/clips/example.mp4")
+
+
+def test_video_s3_source_identity_excludes_credentials_and_request_options(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    _clear_s3_environment(monkeypatch)
+    path = "s3://media-bucket/clips/example.mp4"
+    _, source_id = _source_identity(video_reader, path)
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "temporary-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "temporary-secret-key")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "temporary-session-token")
+    monkeypatch.setenv("AWS_REGION", "eu-west-1")
+    monkeypatch.setenv("S3FS_ANON", "true")
+
+    assert _source_identity(video_reader, path)[1] == source_id
+
+
+def test_video_s3_endpoint_rejects_embedded_credentials(monkeypatch):
+    import duckdb.datasource.video_reader as video_reader
+
+    _clear_s3_environment(monkeypatch)
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://user:secret@objects.example.test")
+
+    with pytest.raises(ValueError, match="AWS_ENDPOINT_URL must not include credentials"):
+        _source_identity(video_reader, "s3://media-bucket/clips/example.mp4")
+
+
 def test_video_s3_reader_does_not_enable_anonymous_mode_when_explicitly_disabled(
     monkeypatch,
     recording_s3_filesystem,
@@ -593,6 +786,22 @@ def test_video_frame_source_manifest_groups_paths_like_ray_read_tasks():
     assert "max_source_frame_bytes::BIGINT" in sql
     assert "max_source_path_bytes::BIGINT" in sql
     assert "on_error::VARCHAR" in sql
+
+
+def test_video_frame_source_manifest_preserves_exact_s3_locator(monkeypatch, duckdb_cursor):
+    import duckdb.datasource.video_reader as video_reader
+
+    source_path = "s3://MEDIA-BUCKET/a//../Clip.mp4"
+    source = VideoFrameSource([source_path], height=8, width=8)
+    monkeypatch.setattr(
+        video_reader,
+        "_video_source_id",
+        lambda _path: pytest.fail("manifest construction must not depend on provenance identity"),
+    )
+
+    manifest = duckdb_cursor.sql(_video_frame_source_manifest_sql(source)).to_arrow_table()
+
+    assert manifest.column("video_paths").to_pylist() == [[source_path]]
 
 
 @pytest.mark.parametrize("on_error", ["", "ignore", "warn"])
@@ -740,7 +949,7 @@ def test_video_decode_batches_do_not_mutate_emitted_arrow_buffers(monkeypatch):
         lambda _path, **_kwargs: [FakeFrame(i) for i in range(5)],
     )
     monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 1)
-    source_path, _ = video_reader._video_source_identity("clip.avi")
+    source_path = video_reader._video_source_path("clip.avi")
     max_partition_bytes = video_reader._video_output_batch_bytes(
         1,
         height=2,
@@ -761,7 +970,7 @@ def test_video_decode_batches_do_not_mutate_emitted_arrow_buffers(monkeypatch):
 
     values = [batch.column("frame").to_numpy_ndarray()[:, 0, 0, 0].tolist() for batch in batches]
     assert values == [[0, 1], [2, 3], [4]]
-    expected_path, expected_source_id = video_reader._video_source_identity("clip.avi")
+    expected_path, expected_source_id = _source_identity(video_reader, "clip.avi")
     assert batches[0].column("video_path").to_pylist() == [expected_path, expected_path]
     assert batches[0].column("source_id").to_pylist() == [expected_source_id, expected_source_id]
 
@@ -902,7 +1111,7 @@ def test_video_decode_aligns_narrow_decord_output_before_exact_resize(monkeypatc
         )
     )
 
-    source_path, _ = video_reader._video_source_identity("clip.avi")
+    source_path = video_reader._video_source_path("clip.avi")
     assert calls == [(source_path, {"width": 32, "height": 2, "source_path": source_path})]
     assert batches[0].column("frame").type.shape == [2, 2, 3]
 
@@ -953,6 +1162,8 @@ def test_remote_video_decode_uses_temporary_path_and_preserves_remote_identity(
 ):
     import duckdb.datasource.video_reader as video_reader
 
+    _clear_s3_environment(monkeypatch)
+
     class FakeFrame:
         def asnumpy(self):
             return np.zeros((2, 32, 3), dtype=np.uint8)
@@ -970,11 +1181,23 @@ def test_remote_video_decode_uses_temporary_path_and_preserves_remote_identity(
         decoder_paths.append(decoder_path)
         return [FakeFrame()]
 
-    monkeypatch.setattr(video_reader, "_open_decord_reader", fake_open_decoder)
+    remote_path = "s3://media-bucket/clips/example.mp4"
+    source_path, source_id = _source_identity(video_reader, remote_path)
+    endpoint_settings = video_reader._s3_endpoint_settings()
+    endpoint_setting_calls = 0
 
+    def endpoint_settings_snapshot():
+        nonlocal endpoint_setting_calls
+        endpoint_setting_calls += 1
+        if endpoint_setting_calls > 1:
+            pytest.fail("decode must reuse one endpoint snapshot for provenance and I/O")
+        return endpoint_settings
+
+    monkeypatch.setattr(video_reader, "_open_decord_reader", fake_open_decoder)
+    monkeypatch.setattr(video_reader, "_s3_endpoint_settings", endpoint_settings_snapshot)
     batches = list(
         _decode_video_batches(
-            "s3://media-bucket/clips/example.mp4",
+            remote_path,
             height=2,
             width=2,
             max_partition_bytes=1024,
@@ -983,12 +1206,12 @@ def test_remote_video_decode_uses_temporary_path_and_preserves_remote_identity(
         )
     )
 
-    source_path, source_id = video_reader._video_source_identity("s3://media-bucket/clips/example.mp4")
     assert len(decoder_paths) == 1
     assert not decoder_paths[0].exists()
     assert batches[0].column("video_path").to_pylist() == [source_path]
     assert batches[0].column("source_id").to_pylist() == [source_id]
     assert recording_s3_filesystem["path"] == "media-bucket/clips/example.mp4"
+    assert endpoint_setting_calls == 1
 
 
 def test_remote_video_decode_cleans_temporary_path_when_consumer_stops_early(
@@ -1014,7 +1237,7 @@ def test_remote_video_decode_cleans_temporary_path_when_consumer_stops_early(
         return [FakeFrame(), FakeFrame(), FakeFrame()]
 
     monkeypatch.setattr(video_reader, "_open_decord_reader", fake_open_decoder)
-    source_path, _ = video_reader._video_source_identity("s3://media-bucket/clips/example.mp4")
+    source_path = video_reader._video_source_path("s3://media-bucket/clips/example.mp4")
     max_partition_bytes = video_reader._video_output_batch_bytes(
         1,
         height=2,
@@ -1063,7 +1286,7 @@ def test_video_decode_keeps_raw_resize_window_bounded(monkeypatch):
     )
     monkeypatch.setattr(video_reader, "_resize_frame_batch", fake_resize)
     monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 3)
-    source_path, _ = video_reader._video_source_identity("clip.avi")
+    source_path = video_reader._video_source_path("clip.avi")
     max_partition_bytes = video_reader._video_output_batch_bytes(
         8,
         height=2,
@@ -1419,7 +1642,7 @@ def test_video_frame_source_map_batches_skips_bad_file_and_continues(
         pass
 
     def fake_decode(video_path, **_kwargs):
-        source_path, source_id = video_reader._video_source_identity(video_path)
+        source_path, source_id = _source_identity(video_reader, video_path)
         row_count = 1 if video_path == "bad.avi" else 2
         yield pa.record_batch(
             {
@@ -1461,8 +1684,8 @@ def test_video_frame_source_map_batches_skips_bad_file_and_continues(
     with caplog.at_level(logging.WARNING, logger=video_reader.__name__):
         tables = list(_video_frame_source_map_batches(manifest))
 
-    bad_path, _ = video_reader._video_source_identity("bad.avi")
-    good_path, _ = video_reader._video_source_identity("good.avi")
+    bad_path = video_reader._video_source_path("bad.avi")
+    good_path = video_reader._video_source_path("good.avi")
     assert [table.column("video_path").to_pylist() for table in tables] == [[bad_path, good_path, good_path]]
     assert f"Skipping unreadable video source={bad_path!r}" in caplog.text
 
@@ -1497,7 +1720,7 @@ def test_video_read_error_mode_raise_preserves_decoder_boundary_failure(monkeypa
         )
 
     assert raised.value.__cause__ is failure
-    expected_path, _ = video_reader._video_source_identity("bad.avi")
+    expected_path = video_reader._video_source_path("bad.avi")
     assert raised.value.video_path == expected_path
 
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 import logging
 import os
 import tempfile
@@ -27,9 +28,13 @@ import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import lru_cache
+from ipaddress import ip_address
 from itertools import repeat
 from types import ModuleType
 from typing import Any, cast
+from urllib.parse import urlparse
 
 import numpy as np
 import numpy.typing as npt
@@ -58,6 +63,11 @@ _DEFAULT_MAX_SOURCE_FRAME_BYTES = int(os.environ.get("VANE_VIDEO_MAX_SOURCE_FRAM
 _REMOTE_VIDEO_READ_CHUNK_BYTES = 8 * 1024**2
 _VIDEO_DECODER_MEMORY_HEADROOM_BYTES = 128 * 1024**2
 _DEFAULT_MAX_SOURCE_PATH_BYTES = 4096
+# This version covers both the structured fields and their normalization. Bump
+# it whenever either changes so a source ID never silently changes meaning.
+_S3_SOURCE_IDENTITY_VERSION = 1
+_S3_DEFAULT_AWS_PARTITION = "aws"
+_S3_DEFAULT_TRANSPORT_SCHEME = "https"
 _SOURCE_ID_BYTES = hashlib.sha256().digest_size * 2
 _ARROW_STRING_OFFSET_BYTES = np.dtype(np.int32).itemsize
 _FRAME_INDEX_BYTES = np.dtype(np.int64).itemsize
@@ -74,6 +84,15 @@ _VIDEO_DECODE_THREADS = 1
 _VIDEO_DECODE_WIDTH_ALIGNMENT = 32
 _VIDEO_ERROR_MODES = frozenset({"raise", "skip"})
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _S3EndpointSettings:
+    scheme_override: str | None
+    endpoint_override: str | None
+    namespace: str
+    region: str | None
+    partition: str | None
 
 
 class VideoReadError(RuntimeError):
@@ -308,28 +327,117 @@ def _wait_for_memory() -> None:
             return
 
 
-def _s3_filesystem_kwargs() -> dict[str, str | bool]:
-    """Build explicit S3 overrides without bypassing the AWS SDK defaults."""
-    from urllib.parse import urlparse
-
-    kwargs: dict[str, str | bool] = {}
-
-    endpoint_url = _read_optional_text_env(("AWS_ENDPOINT_URL",))
-    if endpoint_url is not None:
-        # Treat a scheme-less value as an authority so paths are discarded
-        # consistently from endpoint_override.
-        parse_target = endpoint_url
-        if "://" not in parse_target and not parse_target.startswith("//"):
-            parse_target = f"//{parse_target}"
-        parsed = urlparse(parse_target)
-        endpoint = parsed.netloc or parsed.path.rstrip("/")
-        if parsed.scheme:
-            kwargs["scheme"] = parsed.scheme
-        kwargs["endpoint_override"] = endpoint
-
+def _configured_s3_region() -> str | None:
+    """Resolve the region that will be passed explicitly to PyArrow."""
     region = _read_optional_text_env(("AWS_REGION", "AWS_DEFAULT_REGION"))
     if region is not None:
-        kwargs["region"] = region
+        return region
+
+    # Match the standard AWS configuration chain for profile/shared-config
+    # regions, then pass the result explicitly to PyArrow so provenance and I/O
+    # cannot resolve different regions.
+    from botocore.exceptions import ProfileNotFound  # type: ignore[import-not-found]
+    from botocore.session import Session  # type: ignore[import-not-found]
+
+    try:
+        configured_region = Session().get_config_variable("region")
+    except ProfileNotFound:
+        # Preserve the existing contract that profile validation belongs to
+        # the AWS SDK during I/O; a credentials-only or missing profile does
+        # not itself define a different source namespace.
+        return None
+    if configured_region is None:
+        return None
+    region = str(configured_region).strip()
+    return region or None
+
+
+@lru_cache(maxsize=None)
+def _aws_partition_for_region(region: str) -> str:
+    """Resolve an AWS region to a partition using Botocore endpoint metadata."""
+    from botocore.exceptions import UnknownRegionError
+    from botocore.session import Session
+
+    try:
+        partition = str(Session().get_partition_for_region(region)).strip()
+    except UnknownRegionError as exc:
+        raise ValueError(
+            f"cannot determine the AWS partition for region {region!r}; "
+            "update botocore or set AWS_ENDPOINT_URL explicitly"
+        ) from exc
+    if not partition:
+        raise ValueError(f"botocore returned an empty AWS partition for region {region!r}")
+    return partition
+
+
+def _s3_endpoint_settings() -> _S3EndpointSettings:
+    """Return one region/endpoint snapshot and its stable source namespace."""
+    region = _configured_s3_region()
+    endpoint_url = _read_optional_text_env(("AWS_ENDPOINT_URL",))
+    if endpoint_url is None:
+        partition = _S3_DEFAULT_AWS_PARTITION if region is None else _aws_partition_for_region(region)
+        return _S3EndpointSettings(
+            scheme_override=None,
+            endpoint_override=None,
+            namespace=partition,
+            region=region,
+            partition=partition,
+        )
+
+    # Treat a scheme-less value as an authority so paths are discarded
+    # consistently from endpoint_override.
+    parse_target = endpoint_url
+    if "://" not in parse_target and not parse_target.startswith("//"):
+        parse_target = f"//{parse_target}"
+    parsed = urlparse(parse_target)
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("AWS_ENDPOINT_URL must not include credentials")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError(f"AWS_ENDPOINT_URL must include an endpoint host, got {endpoint_url!r}")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"invalid AWS_ENDPOINT_URL port in {endpoint_url!r}") from exc
+
+    scheme_override = parsed.scheme.lower() or None
+    effective_scheme = scheme_override or _S3_DEFAULT_TRANSPORT_SCHEME
+    if effective_scheme not in {"http", "https"}:
+        raise ValueError(f"AWS_ENDPOINT_URL scheme must be http or https, got {effective_scheme!r}")
+
+    endpoint_override = parsed.netloc
+    try:
+        namespace_host = ip_address(hostname).compressed
+    except ValueError:
+        # A terminal dot only makes a DNS hostname absolute; it does not
+        # identify a different endpoint. Exclude it from the namespace.
+        namespace_host = hostname.lower().removesuffix(".")
+    if ":" in namespace_host:
+        namespace_host = f"[{namespace_host}]"
+    default_port = (effective_scheme == "http" and port == 80) or (effective_scheme == "https" and port == 443)
+    namespace_authority = namespace_host if port is None or default_port else f"{namespace_host}:{port}"
+    endpoint_namespace = f"{effective_scheme}://{namespace_authority}"
+    return _S3EndpointSettings(
+        scheme_override=scheme_override,
+        endpoint_override=endpoint_override,
+        namespace=endpoint_namespace,
+        region=region,
+        partition=None,
+    )
+
+
+def _s3_filesystem_kwargs(endpoint_settings: _S3EndpointSettings | None = None) -> dict[str, str | bool]:
+    """Build explicit S3 overrides without bypassing the AWS SDK defaults."""
+    kwargs: dict[str, str | bool] = {}
+
+    settings = endpoint_settings if endpoint_settings is not None else _s3_endpoint_settings()
+    if settings.endpoint_override is not None:
+        if settings.scheme_override is not None:
+            kwargs["scheme"] = settings.scheme_override
+        kwargs["endpoint_override"] = settings.endpoint_override
+
+    if settings.region is not None:
+        kwargs["region"] = settings.region
 
     if _read_bool_env("S3FS_ANON", False):
         kwargs["anonymous"] = True
@@ -337,26 +445,53 @@ def _s3_filesystem_kwargs() -> dict[str, str | bool]:
     return kwargs
 
 
-def _video_source_identity(video_path: str) -> tuple[str, str]:
-    """Return a stable provenance path and collision-resistant source ID."""
+def _parse_s3_video_path(video_path: str) -> tuple[str, str, str]:
+    """Validate an S3 video locator without changing bucket or key spelling."""
+    if not video_path.startswith("s3://"):
+        raise ValueError(f"invalid S3 video path: {video_path!r}")
+    object_path = video_path[len("s3://") :]
+    bucket, separator, key = object_path.partition("/")
+    if not bucket or not separator or not key:
+        raise ValueError(f"invalid S3 video path: {video_path!r}")
+    return bucket, key, object_path
+
+
+def _video_source_path(video_path: str) -> str:
+    """Return the exact S3 locator or resolved local path used for execution."""
     if video_path.startswith("s3://"):
-        object_path = video_path[len("s3://") :]
-        bucket, separator, key = object_path.partition("/")
-        if not bucket or not separator or not key:
-            raise ValueError(f"invalid S3 video path: {video_path!r}")
-        canonical_path = f"s3://{bucket.lower()}/{key}"
-    else:
-        # Resolve components in filesystem order.  Lexically collapsing
-        # ``link/..`` before following ``link`` can identify a different file
-        # from the one the decoder opens.
-        canonical_path = os.path.realpath(video_path)
-    source_id = hashlib.sha256(canonical_path.encode("utf-8")).hexdigest()
-    return canonical_path, source_id
+        _parse_s3_video_path(video_path)
+        return video_path
+    # Resolve components in filesystem order.  Lexically collapsing
+    # ``link/..`` before following ``link`` can identify a different file
+    # from the one the decoder opens.
+    return os.path.realpath(video_path)
+
+
+def _s3_video_source_id(bucket: str, key: str, endpoint_namespace: str) -> str:
+    """Hash a versioned, endpoint-scoped identity for an exact S3 object locator."""
+    identity = {
+        "version": _S3_SOURCE_IDENTITY_VERSION,
+        "scheme": "s3",
+        "endpoint_namespace": endpoint_namespace,
+        "bucket": bucket,
+        "key": key,
+    }
+    serialized = json.dumps(identity, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def _video_source_id(source_path: str, *, endpoint_settings: _S3EndpointSettings | None = None) -> str:
+    """Return the provenance ID for an already resolved execution locator."""
+    if source_path.startswith("s3://"):
+        bucket, key, _ = _parse_s3_video_path(source_path)
+        settings = endpoint_settings if endpoint_settings is not None else _s3_endpoint_settings()
+        return _s3_video_source_id(bucket, key, settings.namespace)
+    return hashlib.sha256(source_path.encode("utf-8")).hexdigest()
 
 
 def _video_source_path_bytes(video_path: str) -> int:
-    canonical_path, _ = _video_source_identity(video_path)
-    return len(canonical_path.encode("utf-8"))
+    source_path = _video_source_path(video_path)
+    return len(source_path.encode("utf-8"))
 
 
 def _max_video_source_path_bytes(video_paths: list[str]) -> int:
@@ -370,10 +505,10 @@ def _safe_video_suffix(video_path: str) -> str:
     return suffix
 
 
-def _s3_filesystem() -> Any:
+def _s3_filesystem(endpoint_settings: _S3EndpointSettings | None = None) -> Any:
     import pyarrow.fs as pa_fs
 
-    return pa_fs.S3FileSystem(**_s3_filesystem_kwargs())
+    return pa_fs.S3FileSystem(**_s3_filesystem_kwargs(endpoint_settings))
 
 
 @contextmanager
@@ -382,6 +517,7 @@ def _materialize_video_path(
     *,
     max_remote_video_bytes: int,
     remote_temp_dir: str | None,
+    endpoint_settings: _S3EndpointSettings | None = None,
 ) -> Iterator[str]:
     """Yield a local decoder path while keeping remote heap use constant."""
     if not video_path.startswith("s3://"):
@@ -390,18 +526,17 @@ def _materialize_video_path(
     if max_remote_video_bytes <= 0:
         raise ValueError("max_remote_video_bytes must be positive")
 
-    canonical_path, _ = _video_source_identity(video_path)
-    object_path = canonical_path[len("s3://") :]
-    fs = _s3_filesystem()
+    _, _, object_path = _parse_s3_video_path(video_path)
+    fs = _s3_filesystem(endpoint_settings) if endpoint_settings is not None else _s3_filesystem()
     try:
         file_info = fs.get_file_info(object_path)
     except OSError as exc:
-        raise _video_read_error(canonical_path, exc) from exc
+        raise _video_read_error(video_path, exc) from exc
     object_size_value = file_info.size
     object_size = None if object_size_value is None else int(object_size_value)
     if object_size is not None and object_size >= 0 and object_size > max_remote_video_bytes:
         raise RemoteVideoTooLargeError(
-            canonical_path,
+            video_path,
             f"remote object size {object_size} exceeds limit {max_remote_video_bytes}",
         )
 
@@ -418,20 +553,20 @@ def _materialize_video_path(
             try:
                 source = fs.open_input_file(object_path)
             except OSError as exc:
-                raise _video_read_error(canonical_path, exc) from exc
+                raise _video_read_error(video_path, exc) from exc
             with source:
                 copied_bytes = 0
                 while True:
                     try:
                         chunk = source.read(_REMOTE_VIDEO_READ_CHUNK_BYTES)
                     except OSError as exc:
-                        raise _video_read_error(canonical_path, exc) from exc
+                        raise _video_read_error(video_path, exc) from exc
                     if not chunk:
                         break
                     copied_bytes += len(chunk)
                     if copied_bytes > max_remote_video_bytes:
                         raise RemoteVideoTooLargeError(
-                            canonical_path,
+                            video_path,
                             f"remote object exceeded limit {max_remote_video_bytes} while downloading",
                         )
                     temporary.write(chunk)
@@ -592,7 +727,9 @@ def _decode_video_batches(
     if max_source_frame_bytes <= 0:
         raise ValueError("max_source_frame_bytes must be positive")
 
-    source_path, source_id = _video_source_identity(video_path)
+    source_path = _video_source_path(video_path)
+    endpoint_settings = _s3_endpoint_settings() if source_path.startswith("s3://") else None
+    source_id = _video_source_id(source_path, endpoint_settings=endpoint_settings)
     source_path_bytes = len(source_path.encode("utf-8"))
     if max_source_path_bytes is None:
         max_source_path_bytes = source_path_bytes
@@ -600,7 +737,7 @@ def _decode_video_batches(
         max_source_path_bytes = int(max_source_path_bytes)
         if max_source_path_bytes < source_path_bytes:
             raise ValueError(
-                f"max_source_path_bytes {max_source_path_bytes} is smaller than canonical path size {source_path_bytes}"
+                f"max_source_path_bytes {max_source_path_bytes} is smaller than source path size {source_path_bytes}"
             )
 
     decoder_width, decoder_height = _video_decoder_dimensions(width=width, height=height)
@@ -686,6 +823,7 @@ def _decode_video_batches(
         source_path,
         max_remote_video_bytes=max_remote_video_bytes,
         remote_temp_dir=remote_temp_dir,
+        endpoint_settings=endpoint_settings,
     ) as decoder_path:
         # Bound Decord's materialized frame shape at reader construction rather
         # than discovering an oversized frame after iteration begins. The
@@ -847,7 +985,7 @@ def _video_max_output_rows(max_source_path_bytes: int) -> int:
         raise ValueError("max_source_path_bytes must be non-negative")
     if max_source_path_bytes > _ARROW_STRING_DATA_MAX_BYTES:
         raise ValueError(
-            f"canonical video path requires {max_source_path_bytes} bytes, "
+            f"video source path requires {max_source_path_bytes} bytes, "
             f"exceeding Arrow's {_ARROW_STRING_DATA_MAX_BYTES}-byte UTF-8 offset limit"
         )
     path_limit = (
@@ -1108,7 +1246,7 @@ def _video_frame_source_manifest_sql(source: VideoFrameSource) -> str:
     max_source_path_bytes = _max_video_source_path_bytes(source.paths)
     rows = ", ".join(
         "("
-        f"list_value({', '.join(_sql_string_literal(_video_source_identity(path)[0]) for path in paths)}), "
+        f"list_value({', '.join(_sql_string_literal(_video_source_path(path)) for path in paths)}), "
         f"{int(source.height)}, "
         f"{int(source.width)}, "
         f"{int(source.max_partition_bytes)}, "
@@ -1378,9 +1516,12 @@ class VideoFrameSource(DataSource):
     """DataSource that streams video frames from local or S3 video files.
 
     Each video file becomes an independent task. Frames are decoded using
-    decord and resized to (height, width). Output rows contain the canonical
+    decord and resized to (height, width). Output rows contain the execution
     ``video_path``, its SHA-256 ``source_id``, ``frame_index``, and the frame
-    tensor. S3 objects are copied to a bounded task-local temporary file before
+    tensor. Local paths are resolved with ``realpath``; S3 paths preserve the
+    exact bucket and key spelling supplied by the caller. S3 ``source_id``
+    values hash a versioned identity containing the endpoint namespace, bucket,
+    and key. S3 objects are copied to a bounded task-local temporary file before
     decoding.
 
     ``on_error="raise"`` fails the query on an unreadable file.
