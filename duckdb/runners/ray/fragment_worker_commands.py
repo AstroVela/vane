@@ -25,6 +25,7 @@ from duckdb.runners.ray.fragment_registry import (
 )
 from duckdb.runners.ray.fragment_worker_failures import quarantine_fte_worker
 from duckdb.runners.ray.fte_fragment_scheduler import (
+    _sync_write_sink_unit_for_fragment,
     _store_fte_result_handles,
     begin_fte_registry_operation,
     end_fte_registry_operation,
@@ -287,6 +288,10 @@ class FteWorkerCommandMixin:
         self,
         fragment_execution: FteFragmentExecution,
     ) -> FteWorkerCommandDispatchResult:
+        # Worker failure reconciliation mutates fragment state before commands
+        # are placed in the outbox.  Publish that state even when the mutation
+        # produced no retry command (for example, the final failed sink input).
+        _sync_write_sink_unit_for_fragment(fragment_execution)
         return self._execute_fte_fragment_execution_worker_commands(
             fragment_execution,
             fragment_execution.pop_worker_commands(),
@@ -297,6 +302,10 @@ class FteWorkerCommandMixin:
         fragment_execution: FteFragmentExecution,
         result: Any,
     ) -> FteWorkerCommandDispatchResult:
+        # Assignment can seal the dynamic partition set without scheduling a
+        # task.  Synchronize before dispatch so a terminal write-sink unit still
+        # advances query-resource allocation in that zero-command case.
+        _sync_write_sink_unit_for_fragment(fragment_execution)
         return self._execute_fte_fragment_execution_worker_commands(
             fragment_execution,
             list(result.worker_commands),

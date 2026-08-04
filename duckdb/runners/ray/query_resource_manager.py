@@ -10,7 +10,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from duckdb.runners.ray.admission_ledger import BoundedSet
@@ -48,6 +48,7 @@ _RESOURCE_FIELDS = ("cpu", "gpu", "heap_bytes", "object_store_bytes")
 _EPSILON = 1e-9
 _TERMINAL_IDENTITY_REPLAY_CAPACITY = 65_536
 _SOFT_RESERVATION_WARNING_DELAY_S = 60.0
+_DOWNSTREAM_PLACEMENT_SEARCH_STATE_LIMIT = 8_192
 
 logger = logging.getLogger(__name__)
 
@@ -328,6 +329,7 @@ class RayQueryResourceManager:
         allocation: QueryAllocation,
         *,
         admission_open: bool = True,
+        debt_neutral_only: bool = False,
         reservation_ratio: float = 0.5,
         on_change: Callable[[], None] | None = None,
         on_eligible_units_change: Callable[[tuple[str, ...]], None] | None = None,
@@ -335,13 +337,18 @@ class RayQueryResourceManager:
         ratio = float(reservation_ratio)
         if not math.isfinite(ratio) or ratio <= 0 or ratio > 1:
             raise ValueError("reservation_ratio must be in (0, 1]")
+        if debt_neutral_only and not admission_open:
+            raise ValueError("debt-neutral admission requires admission_open")
         graph.validate_allocation(
             allocation,
-            eligible_unit_ids=(graph.eligible_resource_unit_ids(set()) if admission_open else ()),
+            eligible_unit_ids=(
+                graph.eligible_resource_unit_ids(set()) if admission_open and not debt_neutral_only else ()
+            ),
         )
         self.graph = graph
         self.allocation = allocation
         self._allocation_admission_open = bool(admission_open)
+        self._allocation_debt_neutral_only = bool(debt_neutral_only)
         self.reservation_ratio = ratio
         self._on_change = on_change
         self._on_eligible_units_change = on_eligible_units_change
@@ -427,6 +434,8 @@ class RayQueryResourceManager:
         self._external_consumer_waiting = False
         self._soft_allocation_debt_since: float | None = None
         self._soft_allocation_warning_emitted = False
+        self._failed = False
+        self._failure_reason = ""
         self._cancelled = False
         self._cancel_reason = ""
 
@@ -466,6 +475,8 @@ class RayQueryResourceManager:
             unit = self._units.get(unit_key)
             if unit is None:
                 raise KeyError(f"unit is not registered: {unit_key}")
+            if unit.completed and not bool(completed):
+                raise RuntimeError(f"completed resource unit cannot become incomplete: {unit_key}")
             before = (
                 unit.runnable,
                 unit.actor_ready,
@@ -495,6 +506,7 @@ class RayQueryResourceManager:
                     # Preserve live leases, but fence every new grant from the
                     # old generation during that handoff.
                     self._allocation_admission_open = False
+                    self._allocation_debt_neutral_only = False
                 self._publish_change_locked()
                 if bool(completed) and not before[-1]:
                     eligible_callback = self._on_eligible_units_change
@@ -517,6 +529,7 @@ class RayQueryResourceManager:
             # handoff so downstream work cannot consume the previous phase's
             # reservation; live tasks and output leases continue unchanged.
             self._allocation_admission_open = False
+            self._allocation_debt_neutral_only = False
             self._publish_change_locked()
             eligible_callback = self._on_eligible_units_change
             eligible_unit_ids = self._eligible_resource_unit_ids_locked()
@@ -529,6 +542,8 @@ class RayQueryResourceManager:
             return self._eligible_resource_unit_ids_locked()
 
     def _eligible_resource_unit_ids_locked(self) -> tuple[str, ...]:
+        if self._cancelled:
+            return ()
         return tuple(
             resource_unit_id
             for resource_unit_id in self.graph.eligible_resource_unit_ids(self._completed_materialization_barrier_ids)
@@ -674,6 +689,8 @@ class RayQueryResourceManager:
 
         if self._cancelled:
             return "query_cancelled", None, None, 0
+        if self._failed:
+            return "query_failed", None, None, 0
         if str(request.query_id) != self.graph.query_id:
             return "query_id_mismatch", None, None, 0
         unit = self._units.get(str(request.producer_unit_id))
@@ -765,6 +782,13 @@ class RayQueryResourceManager:
                 for candidate_unit_id, actor_index in self._submitted_actor_slots
                 if candidate_unit_id == unit_key
             }
+            if normalized:
+                if self._cancelled:
+                    raise RuntimeError(f"cannot submit actor slots for a cancelled query: {unit_key}")
+                if self._failed:
+                    raise RuntimeError(f"cannot submit actor slots for a failed query: {unit_key}")
+                if unit_key not in self._eligible_resource_unit_ids_locked():
+                    raise RuntimeError(f"cannot submit actor slots outside the current execution phase: {unit_key}")
             if before == normalized:
                 return
             if unit_key in self._retiring_actor_unit_ids:
@@ -809,6 +833,13 @@ class RayQueryResourceManager:
                 if not node_id:
                     raise ValueError(f"actor {unit_key}/{actor_index} node_id must be non-empty")
                 normalized[actor_index] = node_id
+            if normalized:
+                if self._cancelled:
+                    raise RuntimeError(f"cannot publish ready actor slots for a cancelled query: {unit_key}")
+                if unit_key not in self._eligible_resource_unit_ids_locked():
+                    raise RuntimeError(
+                        f"cannot publish ready actor slots outside the current execution phase: {unit_key}"
+                    )
             submitted = {
                 actor_index
                 for candidate_unit_id, actor_index in self._submitted_actor_slots
@@ -839,6 +870,64 @@ class RayQueryResourceManager:
             )
             unit.actor_ready = bool(normalized)
             self._publish_change_locked()
+
+    def reconcile_actor_runtime_node(
+        self,
+        resource_unit_id: str,
+        actor_index: int,
+        node_id: str,
+    ) -> tuple[str, ...]:
+        """Move one reconstructed actor slot and its live calls atomically.
+
+        Ray may reconstruct an unpinned actor on another node.  The actor
+        process is the execution slot, so every active or prefetched call on
+        that slot must follow its new physical node before it can publish more
+        output.  Existing output leases stay where they were produced.
+        """
+
+        unit_key = str(resource_unit_id)
+        if isinstance(actor_index, bool):
+            raise TypeError("actor index must be an integer")
+        slot_index = int(actor_index)
+        node_key = str(node_id or "").strip()
+        if not node_key:
+            raise ValueError("reconstructed actor node_id must be non-empty")
+        with self._lock:
+            unit = self._units.get(unit_key)
+            if unit is None:
+                raise KeyError(f"unit is not registered: {unit_key}")
+            if unit.spec.backend != "ray_actor":
+                raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
+            if slot_index < 0 or slot_index >= unit.spec.actor_pool_size:
+                raise ValueError(f"actor index is outside pool {unit_key}: {slot_index}")
+            slot_key = (unit_key, slot_index)
+            if slot_key not in self._submitted_actor_slots:
+                raise RuntimeError(f"reconstructed actor slot was not submitted: {unit_key}/{slot_index}")
+            if slot_key not in self._actor_node_by_slot:
+                raise RuntimeError(f"reconstructed actor slot was not ready: {unit_key}/{slot_index}")
+            if self._cancelled:
+                raise RuntimeError(f"cannot move an actor slot for a cancelled query: {unit_key}/{slot_index}")
+            if unit_key not in self._eligible_resource_unit_ids_locked():
+                raise RuntimeError(
+                    f"cannot move an actor slot outside the current execution phase: {unit_key}/{slot_index}"
+                )
+            if unit_key in self._retiring_actor_unit_ids:
+                raise RuntimeError(f"cannot move a retiring actor pool: {unit_key}")
+
+            moved_lease_ids: list[str] = []
+            for lease_id, lease in tuple(self._task_leases.items()):
+                if lease.resource_unit_id != unit_key or lease.actor_index != slot_index:
+                    continue
+                if lease.node_id != node_key:
+                    self._task_leases[lease_id] = replace(lease, node_id=node_key)
+                    moved_lease_ids.append(lease_id)
+
+            changed = self._actor_node_by_slot[slot_key] != node_key or bool(moved_lease_ids)
+            self._actor_node_by_slot[slot_key] = node_key
+            unit.actor_ready = True
+            if changed:
+                self._publish_change_locked()
+            return tuple(sorted(moved_lease_ids))
 
     def begin_actor_pool_retirement(self, resource_unit_id: str) -> bool:
         """Atomically fence and uncharge one completed-phase actor pool.
@@ -911,8 +1000,11 @@ class RayQueryResourceManager:
         allocation: QueryAllocation,
         *,
         admission_open: bool,
+        debt_neutral_only: bool = False,
     ) -> None:
         with self._lock:
+            if debt_neutral_only and not admission_open:
+                raise ValueError("debt-neutral admission requires admission_open")
             if allocation.generation <= self.allocation.generation:
                 raise ValueError(
                     "allocation generation must increase: "
@@ -920,10 +1012,13 @@ class RayQueryResourceManager:
                 )
             self.graph.validate_allocation(
                 allocation,
-                eligible_unit_ids=(self._eligible_resource_unit_ids_locked() if admission_open else ()),
+                eligible_unit_ids=(
+                    self._eligible_resource_unit_ids_locked() if admission_open and not debt_neutral_only else ()
+                ),
             )
             self.allocation = allocation
-            self._allocation_admission_open = bool(admission_open)
+            self._allocation_admission_open = bool(admission_open) and not self._failed and not self._cancelled
+            self._allocation_debt_neutral_only = bool(debt_neutral_only) and self._allocation_admission_open
             self._publish_change_locked()
 
     def close_admission(self) -> None:
@@ -932,6 +1027,7 @@ class RayQueryResourceManager:
             if not self._allocation_admission_open:
                 return
             self._allocation_admission_open = False
+            self._allocation_debt_neutral_only = False
             self._publish_change_locked()
 
     def try_acquire_task(self, request: TaskRequest) -> TaskGrant:
@@ -1163,6 +1259,8 @@ class RayQueryResourceManager:
         empty_plan = _TaskAdmissionPlan()
         if self._cancelled:
             return "query_cancelled", True, empty_plan
+        if self._failed:
+            return "query_failed", True, empty_plan
         if str(request.query_id) != self.graph.query_id:
             return "query_id_mismatch", True, empty_plan
         unit = self._units.get(str(request.resource_unit_id))
@@ -1223,22 +1321,24 @@ class RayQueryResourceManager:
         )
         hard_commitment = _hard_resources(commitment)
         if hard_commitment.exceeded_dimensions(_hard_resources(self.allocation.resources)):
+            if self._allocation_debt_neutral_only:
+                return "allocation_debt", False, empty_plan
             return "task_exceeds_query_allocation", True, empty_plan
 
         execution_usage = self._query_usage_locked()
-        execution_debt = _hard_positive_difference(
-            execution_usage,
-            self.allocation.resources,
-        )
-        if not execution_debt.is_zero():
-            # Capacity shrink never revokes live task/continuation leases, but
-            # it fences another process request until those leases drain.
-            return "allocation_debt", False, empty_plan
+        execution_debt = _hard_positive_difference(execution_usage, self.allocation.resources)
         # Submitted actor processes are charged once for their full lifetime.
         # Their invocations add no CPU/GPU/heap. A process request beyond the
         # resulting query share is a soft block eligible for one bounded
         # liveness escape; Ray Core remains the physical resource authority.
         query_usage = self._soft_allocation_usage_locked()
+        coordinator_debt_still_live = (
+            self._allocation_debt_neutral_only
+            and not _hard_positive_difference(
+                query_usage,
+                self.allocation.resources,
+            ).is_zero()
+        )
         borrowed_credit = self._available_continuation_credit_locked(
             unit.spec,
             requested_node_id=request.node_id,
@@ -1269,6 +1369,14 @@ class RayQueryResourceManager:
                 idle_output_excess,
             )
 
+        incremental_hard = _hard_resources(admission_commitment)
+        if (coordinator_debt_still_live or not execution_debt.is_zero()) and not incremental_hard.is_zero():
+            # Capacity shrink never revokes live work, but it does fence every
+            # new Ray process request until the debt drains. Zero-increment
+            # native work and calls on an existing actor remain admissible so
+            # they can consume outputs and make that drain possible.
+            return "allocation_debt", False, empty_plan
+
         usage_after = query_usage + admission_commitment
         execution_hard_exceeded = _incremental_hard_exceeded_dimensions(
             execution_usage,
@@ -1293,6 +1401,7 @@ class RayQueryResourceManager:
             and usage_after.object_store_bytes > self.allocation.resources.object_store_bytes
         )
         downstream_reservations = self._downstream_reservations_locked(unit.spec)
+        placement_reservations = downstream_reservations
         downstream_reservation_soft_blocked = False
         if downstream_reservations:
             remaining = _positive_difference(
@@ -1302,6 +1411,10 @@ class RayQueryResourceManager:
             reservation_total = self._downstream_reservation_total(downstream_reservations)
             if not reservation_total.fits_within(remaining):
                 downstream_reservation_soft_blocked = True
+                # No node placement can repair a globally insufficient vector.
+                # Keep constructing a concrete plan for the bounded liveness
+                # escape, but avoid an unnecessary combinatorial search.
+                placement_reservations = ()
 
         new_credit_plan: _NewContinuationCreditPlan | None = None
         if credit_template is not None:
@@ -1311,9 +1424,9 @@ class RayQueryResourceManager:
                 hard_commitment,
                 credit_resources,
                 allow_unallocated_task_node=unit.spec.backend == "ray_worker",
-                downstream_reservations=downstream_reservations,
+                downstream_reservations=placement_reservations,
             )
-            if node_blocked_reason == "continuation_node_capacity" and downstream_reservations:
+            if node_blocked_reason == "continuation_node_capacity" and placement_reservations:
                 node_id, credit_node_id, node_blocked_reason, node_fatal = self._select_task_and_credit_nodes_locked(
                     request.node_id,
                     hard_commitment,
@@ -1361,9 +1474,9 @@ class RayQueryResourceManager:
                     _hard_resources(admission_commitment),
                     allowed_node_ids=allowed_node_ids,
                     allow_unallocated_node=unit.spec.backend == "ray_worker",
-                    downstream_reservations=downstream_reservations,
+                    downstream_reservations=placement_reservations,
                 )
-                if node_blocked_reason == "continuation_node_capacity" and downstream_reservations:
+                if node_blocked_reason == "continuation_node_capacity" and placement_reservations:
                     node_id, node_blocked_reason, node_fatal = self._select_task_node_locked(
                         request.node_id,
                         _hard_resources(admission_commitment),
@@ -1456,17 +1569,19 @@ class RayQueryResourceManager:
         if not static_candidates:
             return "", "task_does_not_fit_allocated_node", True
 
-        available_candidates: list[tuple[str, ResourceVector]] = []
+        available_candidates: list[tuple[str, ResourceVector, bool]] = []
         debt_detected = False
         for node_id in static_candidates:
             capacity = allocation_by_node.get(node_id, ResourceVector())
-            usage = _hard_resources(self._node_usage_locked(node_id))
+            usage = self._node_hard_scheduling_usage_locked(node_id)
             if not usage.fits_within(capacity):
                 debt_detected = True
+                if commitment.is_zero():
+                    available_candidates.append((node_id, ResourceVector(), True))
                 continue
             remaining = capacity - usage
             if commitment.fits_within(remaining):
-                available_candidates.append((node_id, remaining))
+                available_candidates.append((node_id, remaining, False))
         if not available_candidates:
             return "", "node_allocation_debt" if debt_detected else "node_capacity", False
 
@@ -1485,9 +1600,10 @@ class RayQueryResourceManager:
                 return "", "continuation_node_capacity", False
             available_candidates = safe_candidates
 
-        node_id, _ = min(
+        node_id, _, _ = min(
             available_candidates,
             key=lambda item: (
+                item[2],
                 item[1].gpu - commitment.gpu,
                 item[1].cpu - commitment.cpu,
                 item[1].heap_bytes - commitment.heap_bytes,
@@ -1537,13 +1653,13 @@ class RayQueryResourceManager:
         for task_node_id in task_nodes:
             for credit_node_id in credit_nodes:
                 proposed: dict[str, ResourceVector] = {}
-                if task_node_id in allocation_by_node:
+                if task_node_id in allocation_by_node and not task_commitment.is_zero():
                     proposed[task_node_id] = task_commitment
                 proposed[credit_node_id] = proposed.get(credit_node_id, ResourceVector()) + credit_resources
                 remaining_by_node: dict[str, ResourceVector] = {}
                 feasible = True
                 for node_id, capacity in allocation_by_node.items():
-                    usage = _hard_resources(self._node_usage_locked(node_id))
+                    usage = self._node_hard_scheduling_usage_locked(node_id)
                     if not usage.fits_within(capacity):
                         if node_id in proposed:
                             debt_detected = True
@@ -1590,7 +1706,7 @@ class RayQueryResourceManager:
     ) -> bool:
         remaining_by_node: dict[str, ResourceVector] = {}
         for node_id, capacity in allocation_by_node.items():
-            usage = _hard_resources(self._node_usage_locked(node_id))
+            usage = self._node_hard_scheduling_usage_locked(node_id)
             if node_id == parent_node_id:
                 usage = usage + parent_commitment
             if usage.fits_within(capacity):
@@ -1606,6 +1722,15 @@ class RayQueryResourceManager:
         remaining_by_node: dict[str, ResourceVector],
         reservations: tuple[_DownstreamReservation, ...],
     ) -> bool:
+        """Prefer a feasible node layout without unbounded work under the lock.
+
+        Vector bin packing is NP-hard.  These reservations are deliberately
+        soft, so an exhaustive proof is neither required for correctness nor
+        safe on the admission hot path.  Accept the common best-fit layout in
+        linear time, then search a bounded number of alternate layouts before
+        conservatively applying soft backpressure.  The normal one-task
+        liveness escape still guarantees progress after a conservative miss.
+        """
         if not reservations:
             return True
 
@@ -1622,14 +1747,11 @@ class RayQueryResourceManager:
             )
         )
         initial = tuple(remaining_by_node[node_id] for node_id in node_ids)
-        failed_states: set[tuple[int, tuple[ResourceVector, ...]]] = set()
 
-        def place(index: int, remaining: tuple[ResourceVector, ...]) -> bool:
-            if index >= len(ordered):
-                return True
-            state = (index, remaining)
-            if state in failed_states:
-                return False
+        def candidate_states(
+            index: int,
+            remaining: tuple[ResourceVector, ...],
+        ) -> list[tuple[ResourceVector, ...]]:
             reservation = ordered[index]
             candidates: list[tuple[int, ResourceVector]] = []
             for node_id in reservation.allowed_node_ids:
@@ -1649,15 +1771,47 @@ class RayQueryResourceManager:
                     node_ids[item[0]],
                 )
             )
+            result: list[tuple[ResourceVector, ...]] = []
             for position, capacity_after in candidates:
                 updated = list(remaining)
                 updated[position] = capacity_after
-                if place(index + 1, tuple(updated)):
-                    return True
-            failed_states.add(state)
-            return False
+                result.append(tuple(updated))
+            return result
 
-        return place(0, initial)
+        # Most layouts succeed with deterministic best-fit-decreasing.  Run
+        # that path without retaining alternate states so thousands of latent
+        # downstream UDFs remain cheap and cannot overflow Python's stack.
+        greedy_remaining = initial
+        for index in range(len(ordered)):
+            candidates = candidate_states(index, greedy_remaining)
+            if not candidates:
+                break
+            greedy_remaining = candidates[0]
+        else:
+            return True
+
+        # Greedy can miss a feasible multi-dimensional layout.  Preserve the
+        # previous exact behavior for ordinary graphs, but cap pathological
+        # searches because the result controls only a soft reservation.
+        search_limit = max(
+            _DOWNSTREAM_PLACEMENT_SEARCH_STATE_LIMIT,
+            len(ordered) + 1,
+        )
+        pending: list[tuple[int, tuple[ResourceVector, ...]]] = [(0, initial)]
+        visited: set[tuple[int, tuple[ResourceVector, ...]]] = set()
+        while pending and len(visited) < search_limit:
+            index, remaining = pending.pop()
+            state = (index, remaining)
+            if state in visited:
+                continue
+            visited.add(state)
+            if index >= len(ordered):
+                return True
+            # Reverse the preferred order for the LIFO stack.
+            for candidate in reversed(candidate_states(index, remaining)):
+                pending.append((index + 1, candidate))
+
+        return False
 
     def _actor_slot_lease_count_locked(self, slot: tuple[str, int]) -> int:
         return int(slot in self._active_actor_slots) + len(self._queued_actor_slot_leases.get(slot, ()))
@@ -1793,7 +1947,7 @@ class RayQueryResourceManager:
                 incremental,
                 self.allocation.resources,
             )
-            node_usage = _hard_resources(self._node_usage_locked(credit.node_id))
+            node_usage = self._node_hard_scheduling_usage_locked(credit.node_id)
             node_exceeded = _hard_resources(node_usage + incremental).exceeded_dimensions(
                 allocation_by_node[credit.node_id]
             )
@@ -2249,21 +2403,23 @@ class RayQueryResourceManager:
         soft = [item for item in evaluations if not item.fatal and item.reason in _SOFT_TASK_BLOCK_REASONS]
         if not soft:
             return None
-        if self._active_liveness_task_lease_id is not None:
-            path_candidates = [
-                item
-                for item in soft
-                if self._continues_active_liveness_path_locked(
+        path_candidates = [
+            item
+            for item in soft
+            if self._active_tasks_allow_liveness_locked(
+                str(item.request.resource_unit_id),
+                item.plan,
+            )
+            and (
+                self._active_liveness_task_lease_id is None
+                or self._continues_active_liveness_path_locked(
                     str(item.request.resource_unit_id),
                     item.plan,
                 )
-                and self._active_tasks_allow_liveness_locked(
-                    str(item.request.resource_unit_id),
-                    item.plan,
-                )
-            ]
-            if path_candidates:
-                soft = path_candidates
+            )
+        ]
+        if path_candidates:
+            soft = path_candidates
         soft_unit_ids = {str(item.request.resource_unit_id) for item in soft}
         ordered_unit_ids = [
             resource_unit_id
@@ -2314,6 +2470,7 @@ class RayQueryResourceManager:
     def _preferred_liveness_unit_locked(self) -> str | None:
         if self._waiting_task_inputs:
             waiting_candidates: list[str] = []
+            path_candidates: list[str] = []
             for resource_unit_id in self.graph.reverse_topological_unit_ids():
                 for request, _ in self._waiting_task_inputs.values():
                     if str(request.resource_unit_id) != resource_unit_id:
@@ -2322,19 +2479,25 @@ class RayQueryResourceManager:
                         request,
                         hypothetical=True,
                     )
-                    path_allowed = self._active_liveness_task_lease_id is None or (
-                        self._continues_active_liveness_path_locked(
-                            resource_unit_id,
-                            plan,
-                        )
-                        and self._active_tasks_allow_liveness_locked(
+                    path_allowed = self._active_tasks_allow_liveness_locked(
+                        resource_unit_id,
+                        plan,
+                    ) and (
+                        self._active_liveness_task_lease_id is None
+                        or self._continues_active_liveness_path_locked(
                             resource_unit_id,
                             plan,
                         )
                     )
-                    if not fatal and reason in _SOFT_TASK_BLOCK_REASONS and path_allowed:
+                    if not fatal and reason in _SOFT_TASK_BLOCK_REASONS:
                         waiting_candidates.append(resource_unit_id)
+                        if path_allowed:
+                            path_candidates.append(resource_unit_id)
                         break
+            if path_candidates:
+                waiting_candidates = path_candidates
+            elif self._active_liveness_task_lease_id is not None:
+                return None
             if not waiting_candidates:
                 return None
             starving = [
@@ -2345,6 +2508,7 @@ class RayQueryResourceManager:
             ]
             return (starving or waiting_candidates)[0]
         runnable_candidates: list[str] = []
+        path_candidates = []
         for resource_unit_id in self.graph.reverse_topological_unit_ids():
             unit = self._units[resource_unit_id]
             if not unit.runnable or unit.completed:
@@ -2361,18 +2525,24 @@ class RayQueryResourceManager:
                 request,
                 hypothetical=True,
             )
-            path_allowed = self._active_liveness_task_lease_id is None or (
-                self._continues_active_liveness_path_locked(
-                    resource_unit_id,
-                    plan,
-                )
-                and self._active_tasks_allow_liveness_locked(
+            path_allowed = self._active_tasks_allow_liveness_locked(
+                resource_unit_id,
+                plan,
+            ) and (
+                self._active_liveness_task_lease_id is None
+                or self._continues_active_liveness_path_locked(
                     resource_unit_id,
                     plan,
                 )
             )
-            if not fatal and reason in _SOFT_TASK_BLOCK_REASONS and path_allowed:
+            if not fatal and reason in _SOFT_TASK_BLOCK_REASONS:
                 runnable_candidates.append(resource_unit_id)
+                if path_allowed:
+                    path_candidates.append(resource_unit_id)
+        if path_candidates:
+            runnable_candidates = path_candidates
+        elif self._active_liveness_task_lease_id is not None:
+            return None
         if not runnable_candidates:
             return None
         starving = [
@@ -2729,17 +2899,22 @@ class RayQueryResourceManager:
             if not soft_blocked:
                 return None, None
 
-            _, request, _, _ = min(soft_blocked, key=lambda item: item[0])
             if self._active_liveness_output_lease_id is not None:
+                _, request, _, _ = min(soft_blocked, key=lambda item: item[0])
                 return request, OutputBlockGrant(
                     False,
                     blocked_reason="liveness_output_active",
                 )
-            if not self._output_consumer_starving_locked(request.producer_unit_id):
+            liveness_candidates = [
+                item for item in soft_blocked if self._output_consumer_starving_locked(item[1].producer_unit_id)
+            ]
+            if not liveness_candidates:
+                _, request, _, _ = min(soft_blocked, key=lambda item: item[0])
                 return request, OutputBlockGrant(
                     False,
                     blocked_reason="output_liveness_not_needed",
                 )
+            _, request, _, _ = min(liveness_candidates, key=lambda item: item[0])
             return request, self._grant_output_block_locked(
                 request,
                 liveness=True,
@@ -2818,6 +2993,8 @@ class RayQueryResourceManager:
             unit = self._units[resource_unit_id]
             if not unit.runnable or unit.completed:
                 continue
+            if not self._output_consumer_starving_locked(resource_unit_id):
+                continue
             if resource_unit_id != str(current_request.producer_unit_id) and unit.queued_output_bytes <= 0:
                 continue
             if resource_unit_id == str(current_request.producer_unit_id):
@@ -2852,8 +3029,13 @@ class RayQueryResourceManager:
     def _output_consumer_starving_locked(self, producer_unit_id: str) -> bool:
         if self._external_consumer_waiting:
             return True
+        eligible_unit_ids = set(self._eligible_resource_unit_ids_locked())
         downstream_ids = [
-            unit.resource_unit_id for unit in self.graph.units if str(producer_unit_id) in unit.input_unit_ids
+            unit.resource_unit_id
+            for unit in self.graph.units
+            if str(producer_unit_id) in unit.input_unit_ids
+            and unit.resource_unit_id in eligible_unit_ids
+            and not self._units[unit.resource_unit_id].completed
         ]
         if not downstream_ids:
             return False
@@ -2862,7 +3044,7 @@ class RayQueryResourceManager:
         # batch can be admitted.  Requiring queued_input_bytes == 0 creates a
         # cross-lease deadlock when the producer's sole liveness lease is the
         # partial bundle already waiting downstream.
-        return all(
+        return any(
             self._active_task_count_for_unit_locked(resource_unit_id) == 0 for resource_unit_id in downstream_ids
         )
 
@@ -2958,6 +3140,7 @@ class RayQueryResourceManager:
             self._continuation_credit_by_borrower.clear()
             self._active_attempt_leases.clear()
             self._submitted_actor_slots.clear()
+            self._retiring_actor_unit_ids.clear()
             self._actor_node_by_slot.clear()
             self._active_actor_slots.clear()
             self._queued_actor_slot_leases.clear()
@@ -2978,10 +3161,35 @@ class RayQueryResourceManager:
                 if unit.spec.backend == "ray_actor":
                     unit.actor_ready = False
             self._allocation_admission_open = False
+            self._allocation_debt_neutral_only = False
             self._cancelled = True
             self._cancel_reason = str(reason)
             self._publish_change_locked()
             return {"task_lease_count": task_count, "output_lease_count": output_count}
+
+    def fail(self, reason: str) -> dict[str, int]:
+        """Fence terminally failed work without releasing physical ownership.
+
+        A driver-side protocol or actor failure is not proof that already
+        submitted Ray work has stopped.  Keep every task, output, continuation,
+        and actor-process lease charged until ordered query teardown supplies
+        that proof; only new task/output/actor submission becomes fatal.
+        """
+
+        failure_reason = str(reason or "query_failed")
+        with self._lock:
+            counts = {
+                "task_lease_count": len(self._task_leases),
+                "output_lease_count": len(self._output_leases),
+            }
+            if self._cancelled or self._failed:
+                return counts
+            self._failed = True
+            self._failure_reason = failure_reason
+            self._allocation_admission_open = False
+            self._allocation_debt_neutral_only = False
+            self._publish_change_locked()
+            return counts
 
     def _active_task_count_for_unit_locked(self, resource_unit_id: str) -> int:
         return sum(1 for lease in self._task_leases.values() if lease.resource_unit_id == resource_unit_id)
@@ -3283,6 +3491,23 @@ class RayQueryResourceManager:
         )
         return total
 
+    def _node_hard_scheduling_usage_locked(self, node_id: str) -> ResourceVector:
+        """Return known physical process usage that competes on one node.
+
+        Submitted actors without a READY location can only be charged to the
+        query-wide soft allocation. Once Ray reports a concrete node, their
+        resident CPU/GPU/heap must also constrain node-affine task placement;
+        otherwise a task can be pinned behind its own actor while another
+        allocated node remains idle.
+        """
+
+        return _hard_resources(
+            self._node_usage_locked(node_id)
+            + self._actor_resident_usage_locked(
+                node_id=str(node_id),
+            )
+        )
+
     def _unit_usage_locked(
         self,
         resource_unit_id: str,
@@ -3416,6 +3641,7 @@ class RayQueryResourceManager:
                     usage.object_store_bytes - self.allocation.resources.object_store_bytes,
                 ),
                 "allocation_admission_open": self._allocation_admission_open,
+                "allocation_debt_neutral_only": self._allocation_debt_neutral_only,
                 "admission_epoch": int(self._admission_epoch),
                 "node_usage": {node_id: resources.to_dict() for node_id, resources in node_usage.items()},
                 "node_allocation_debt": {
@@ -3445,6 +3671,8 @@ class RayQueryResourceManager:
                 },
                 "cancelled": self._cancelled,
                 "cancel_reason": self._cancel_reason,
+                "failed": self._failed,
+                "failure_reason": self._failure_reason,
                 "external_consumer_waiting": self._external_consumer_waiting,
                 "liveness": {
                     "active_task_lease_id": self._active_liveness_task_lease_id,

@@ -353,6 +353,116 @@ def test_driver_connection_applies_duckdb_execution_width(monkeypatch):
     assert statements == ["SET threads=7"]
 
 
+def test_driver_reconciles_reconstructed_actor_location_and_public_leases():
+    from duckdb.runners.ray.query_resource_graph import (
+        NodeResourceAllocation,
+        QueryAllocation,
+        QueryResourceGraph,
+        ResourceUnitSpec,
+        ResourceVector,
+    )
+    from duckdb.runners.ray.query_resource_manager import TaskRequest
+    from duckdb.runners.ray.query_resource_runtime import (
+        register_query_resource_graph,
+        release_query_resource_manager,
+    )
+
+    cls, runner = _make_local_query_driver_actor()
+    runner._ensure_query_resource_admission_state()
+    query_id = "query-reconstructed-actor-location"
+    resource_unit_id = "resource:query-reconstructed-actor-location:actor"
+    resources = ResourceVector(cpu=2, heap_bytes=8, object_store_bytes=20)
+    unit = ResourceUnitSpec(
+        query_id=query_id,
+        resource_unit_id=resource_unit_id,
+        physical_node_id="7",
+        unit_kind="ray_actor_pool",
+        backend="ray_actor",
+        input_unit_ids=(),
+        per_task=ResourceVector(object_store_bytes=1),
+        target_output_block_bytes=1,
+        generator_buffer_blocks=2,
+        max_concurrency=None,
+        resident_per_actor=ResourceVector(cpu=1, heap_bytes=4),
+        actor_pool_size=1,
+        actor_prefetch_depth=1,
+    )
+    graph = QueryResourceGraph(
+        query_id=query_id,
+        plan_digest="sha256:reconstructed-actor-location",
+        units=(unit,),
+        terminal_unit_ids=(resource_unit_id,),
+    )
+    allocation = QueryAllocation(
+        resources=resources,
+        node_allocations=(
+            NodeResourceAllocation(
+                node_id="node-a",
+                resources=ResourceVector(cpu=1, heap_bytes=4, object_store_bytes=10),
+            ),
+            NodeResourceAllocation(
+                node_id="node-b",
+                resources=ResourceVector(cpu=1, heap_bytes=4, object_store_bytes=10),
+            ),
+        ),
+        generation=1,
+    )
+    manager = register_query_resource_graph(graph, allocation)
+    try:
+        manager.set_submitted_actor_slots(resource_unit_id, {0})
+        manager.set_ready_actor_slots(resource_unit_id, {0: "node-a"})
+        manager.update_unit_state(resource_unit_id, runnable=True)
+        grant = manager.try_acquire_task(
+            TaskRequest(
+                query_id=query_id,
+                resource_unit_id=resource_unit_id,
+                task_id="task:actor:0",
+                attempt_id="attempt:0",
+                node_id=None,
+                retained_input_bytes=1,
+            )
+        )
+        assert grant.granted
+        pool = SimpleNamespace(
+            _vane_retired=False,
+            _vane_location_nonce="pool-nonce",
+            actors=[object()],
+            actor_node_ids=["node-a"],
+            _confirmed_ready={0},
+        )
+        runner._active_udf_actor_by_unit = {query_id: {resource_unit_id: pool}}
+        generation_capability = runner._issue_query_task_admission_capability(query_id)
+        runner._query_task_lease_requests["public-request"] = {
+            "manager_lease_id": grant.lease.lease_id,
+            "lease": {"node_id": "node-a"},
+        }
+
+        result = asyncio.run(
+            cls.report_query_udf_actor_location(
+                runner,
+                {
+                    "query_id": query_id,
+                    "resource_unit_id": resource_unit_id,
+                    "actor_index": 0,
+                    "pool_nonce": "pool-nonce",
+                    "node_id": "node-b",
+                },
+                generation_capability,
+            )
+        )
+
+        assert result == {
+            "accepted": True,
+            "node_id": "node-b",
+            "moved_task_lease_count": 1,
+        }
+        assert pool.actor_node_ids == ["node-b"]
+        assert manager.snapshot()["task_leases"][grant.lease.lease_id]["node_id"] == "node-b"
+        assert runner._query_task_lease_requests["public-request"]["lease"]["node_id"] == "node-b"
+    finally:
+        release_query_resource_manager(query_id, reason="test complete")
+
+
 @pytest.mark.parametrize(
     ("lease_timeout", "heartbeat_interval", "message"),
     [

@@ -192,19 +192,16 @@ class RemoteUDFActorReadinessMixin:
             future = future_method() if callable(future_method) else None
             if future is not None and future.done():
                 resolved_node_id = str(self._resolve_object_ref(init_ref) or "").strip()
-                if resolved_node_id != node_key:
-                    raise RuntimeError(
-                        "UDF actor lease slot/node mismatch after readiness resolution: "
-                        f"actor_index={actor_idx} runtime_node={resolved_node_id} leased_node={node_key}"
-                    )
                 self._actor_node_ids[actor_idx] = resolved_node_id
                 self._actors_obj.actor_node_ids[actor_idx] = resolved_node_id
                 self._mark_actor_ready(actor_idx)
         if self._actor_node_ids[actor_idx] != node_key:
-            raise RuntimeError(
-                "UDF actor lease slot/node mismatch: "
-                f"actor_index={actor_idx} expected_node={self._actor_node_ids[actor_idx]} leased_node={node_key}"
-            )
+            # The signed query lease is newer than this executor's immutable
+            # activation snapshot when Ray has reconstructed the actor on
+            # another node. The actor itself synchronously reconciles a stale
+            # prefetch lease before running user code.
+            self._actor_node_ids[actor_idx] = node_key
+            self._actors_obj.actor_node_ids[actor_idx] = node_key
         if actor_idx not in self._ready_actor_set:
             raise RuntimeError(f"UDF actor lease targets actor_index={actor_idx}, but that actor is not ready")
         return actor_idx, self.actors[actor_idx]

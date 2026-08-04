@@ -1137,8 +1137,9 @@ def _is_write_sink_fragment(fragment_execution: Any) -> bool:
 
 def _write_sink_has_input(fragment_execution: Any) -> tuple[bool, bool]:
     partitions = getattr(fragment_execution, "partitions", {}) or {}
+    no_more_partitions = bool(getattr(fragment_execution, "no_more_partitions", False))
     if not partitions:
-        return False, False
+        return False, no_more_partitions
     all_terminal = True
     for partition in partitions.values():
         finished = bool(getattr(partition, "finished", False))
@@ -1154,15 +1155,22 @@ def _write_sink_has_input(fragment_execution: Any) -> tuple[bool, bool]:
             or getattr(partition, "node_wait_started_at", None) is not None
         ):
             return True, False
-    return False, all_terminal
+    # Dynamic exchange/scan inputs can append partitions after every currently
+    # known partition has finished.  ``completed`` is a permanent resource-unit
+    # transition, so publish it only after the fragment's partition set is
+    # sealed as well as terminal.
+    return False, no_more_partitions and all_terminal
 
 
 def _sync_write_sink_unit_for_fragment(fragment_execution: Any) -> str | None:
     from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
 
+    # Most FTE fragments are not terminal write sinks.  Check that immutable
+    # identity before touching the concrete execution's state lock so generic
+    # event-path test doubles (and non-sink fragments) need no sink lifecycle.
+    if not _is_write_sink_fragment(fragment_execution):
+        return None
     with fragment_execution._state_lock:
-        if not _is_write_sink_fragment(fragment_execution):
-            return None
         resource_query_id, resource_unit_id = resource_identity_from_context(fragment_execution.context)
         has_input, all_terminal = _write_sink_has_input(fragment_execution)
     get_query_resource_manager(resource_query_id).update_unit_state(
@@ -1243,6 +1251,7 @@ def _acquire_fte_partition_task_lease(
     fragment_id: str,
     partition_id: int,
     node_id: str,
+    retain_probe_on_node_local_denial: bool = False,
 ) -> Any:
     from duckdb.runners.ray.query_resource_manager import TaskRequest
     from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
@@ -1303,6 +1312,11 @@ def _acquire_fte_partition_task_lease(
     if grant.granted:
         lease = grant.lease
         if lease is None:
+            release_fte_partition_submission(
+                query_id,
+                fragment_id,
+                partition_id,
+            )
             raise RuntimeError("QRM granted an FTE task without returning its lease")
         resolve_fte_partition_submission(
             query_id,
@@ -1325,15 +1339,21 @@ def _acquire_fte_partition_task_lease(
         partition_id,
         grant.blocked_reason,
     )
-    resolve_fte_partition_submission(
-        query_id,
-        fragment_id,
-        partition_id,
-        granted=False,
-        blocked_reason=grant.blocked_reason,
-        fatal=grant.fatal,
-        admission_epoch=getattr(grant, "admission_epoch", None),
-    )
+    node_local_denial = grant.blocked_reason in {
+        "node_allocation_debt",
+        "node_capacity",
+        "continuation_node_capacity",
+    }
+    if not (retain_probe_on_node_local_denial and node_local_denial and not grant.fatal):
+        resolve_fte_partition_submission(
+            query_id,
+            fragment_id,
+            partition_id,
+            granted=False,
+            blocked_reason=grant.blocked_reason,
+            fatal=grant.fatal,
+            admission_epoch=getattr(grant, "admission_epoch", None),
+        )
     if grant.fatal:
         raise RuntimeError(
             f"fatal FTE task lease rejection for {query_id}/{fragment_id}/{partition_id}: {grant.blocked_reason}"
@@ -1344,6 +1364,7 @@ def _acquire_fte_partition_task_lease(
         partition_id=int(partition_id),
         memory_requirement_bytes=0,
         blocked_reason=grant.blocked_reason,
+        admission_epoch=getattr(grant, "admission_epoch", None),
     )
 
 
@@ -2049,6 +2070,7 @@ class FteWorkerPlacementManager:
                     owner = None
 
             excluded_worker_ids: set[str] = set()
+            deferred_node_denial: FteWorkerReservationUnavailable | None = None
             while owner is None:
                 try:
                     owner = self.coordinator._select_fte_worker(
@@ -2066,6 +2088,17 @@ class FteWorkerPlacementManager:
                         fragment_id,
                         partition_id,
                     )
+                    # A preceding node-local QRM denial deliberately keeps the
+                    # resource-unit probe while alternate workers are tried.
+                    # Worker selection can still fail independently (for
+                    # example while inspecting a stale worker handle); that
+                    # terminal path must not strand the retained probe and
+                    # block every later descriptor for the resource unit.
+                    release_fte_partition_submission(
+                        query_id,
+                        fragment_id,
+                        partition_id,
+                    )
                     raise
                 if owner is None:
                     _release_fte_partition_task_lease_for_key(
@@ -2073,11 +2106,24 @@ class FteWorkerPlacementManager:
                         fragment_id,
                         partition_id,
                     )
+                    if deferred_node_denial is not None:
+                        resolve_fte_partition_submission(
+                            query_id,
+                            fragment_id,
+                            partition_id,
+                            granted=False,
+                            blocked_reason=deferred_node_denial.blocked_reason,
+                            admission_epoch=deferred_node_denial.admission_epoch,
+                        )
                     raise FteWorkerReservationUnavailable(
                         query_id=query_id,
                         fragment_id=fragment_id,
                         partition_id=partition_id,
                         memory_requirement_bytes=_memory_requirement_bytes(memory_requirement_bytes),
+                        blocked_reason=("" if deferred_node_denial is None else deferred_node_denial.blocked_reason),
+                        admission_epoch=(
+                            None if deferred_node_denial is None else deferred_node_denial.admission_epoch
+                        ),
                     )
                 try:
                     task_lease = _acquire_fte_partition_task_lease(
@@ -2086,10 +2132,16 @@ class FteWorkerPlacementManager:
                         fragment_id=fragment_id,
                         partition_id=partition_id,
                         node_id=owner.node_id,
+                        retain_probe_on_node_local_denial=True,
                     )
                 except FteWorkerReservationUnavailable as exc:
-                    if exc.blocked_reason != "node_capacity":
+                    if exc.blocked_reason not in {
+                        "node_allocation_debt",
+                        "node_capacity",
+                        "continuation_node_capacity",
+                    }:
                         raise
+                    deferred_node_denial = exc
                     excluded_worker_ids.add(str(owner.worker_id))
                     owner = None
                     continue

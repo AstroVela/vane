@@ -30,7 +30,11 @@ from duckdb.runners.ray.fragment_worker_reservations import (
     fte_worker_reservation_event_state,
     remove_pending_fte_worker_reservation_if_current,
 )
-from duckdb.runners.ray.fte_fragment_scheduler import FteWorkerPlacementManager, request_fte_pending_task_drain
+from duckdb.runners.ray.fte_fragment_scheduler import (
+    FteWorkerPlacementManager,
+    _sync_write_sink_unit_for_fragment,
+    request_fte_pending_task_drain,
+)
 
 if TYPE_CHECKING:
     from duckdb.runners.fte.fte_events import ExchangeSelectorUpdated, TaskStatusChanged, WorkerReservationCompleted
@@ -263,7 +267,13 @@ class FteWorkerEventHandlingMixin:
                     raise
         finally:
             if terminal:
-                handles.extend(request_fte_pending_task_drain())
+                try:
+                    # A terminal status can leave no pending descriptor for the
+                    # admission scanner to revisit.  Publish the sink lifecycle
+                    # directly before waking work made eligible by completion.
+                    _sync_write_sink_unit_for_fragment(fragment_execution)
+                finally:
+                    handles.extend(request_fte_pending_task_drain())
         return handles
 
     def _handles_for_exchange_selector_updated_event(self, event: ExchangeSelectorUpdated) -> list[Any]:

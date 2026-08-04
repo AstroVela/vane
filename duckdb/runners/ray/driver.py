@@ -53,6 +53,11 @@ from duckdb.runners.ray.ray_env import (
     reject_node_local_ray_runtime_env,
     scrub_shared_runtime_session_env,
 )
+from duckdb.runners.ray.query_runtime_protocol import (
+    RAY_QUERY_RUNTIME_ACTOR_NAMESPACE,
+    query_runtime_actor_name,
+    ray_runtime_job_id,
+)
 from duckdb.runners.ray.safe_get import QueryDeadlineExceeded, resolve_object_refs_blocking
 from duckdb.runners.ray.worker import WorkerTaskMetadata
 
@@ -70,8 +75,6 @@ _DEFAULT_CLIENT_HEARTBEAT_INTERVAL_S = 10.0
 _TASK_COMPLETION_CLEANUP_RETRY_MIN_S = 0.01
 _TASK_COMPLETION_CLEANUP_RETRY_MAX_S = 1.0
 _QUERY_ADMISSION_BATCH_SIZE = 64
-RAY_QUERY_RUNTIME_ACTOR_NAMESPACE = "vane"
-RAY_QUERY_RUNTIME_ACTOR_NAME_PREFIX = "vane-query-runtime-"
 
 
 def _query_udf_actor_lifecycle_lock(owner: Any, query_id: str) -> threading.RLock:
@@ -450,12 +453,7 @@ def _normalize_session_config(config: Mapping[str, Any]) -> dict[str, str]:
 
 
 def _ray_runtime_job_id(runtime_context: Any) -> str:
-    job_id_obj = runtime_context.get_job_id()
-    job_id_hex = getattr(job_id_obj, "hex", None)
-    job_id = str(job_id_hex() if callable(job_id_hex) else job_id_obj).strip()
-    if not job_id:
-        raise RuntimeError("Ray runtime context returned an empty job identity")
-    return job_id
+    return ray_runtime_job_id(runtime_context)
 
 
 async def _to_thread_with_owned_side_effects(callback: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
@@ -2272,20 +2270,19 @@ class RayQueryDriverActor:
                 raise RuntimeError(f"coordinator lost registered query {query_id}")
             allocation = QueryAllocation.from_dict(query_snapshot["allocation"])
             manager = get_query_resource_manager(query_id)
+            state = str(query_snapshot.get("state") or "")
+            if state not in {"RUNNING", "PENDING_RESOURCES", "ALLOCATION_DEBT"}:
+                raise RuntimeError(f"coordinator returned invalid query state for {query_id}: {state!r}")
             graph.validate_allocation(
                 allocation,
-                eligible_unit_ids=(
-                    manager.current_eligible_resource_unit_ids()
-                    if str(query_snapshot.get("state") or "") == "RUNNING"
-                    else ()
-                ),
+                eligible_unit_ids=(manager.current_eligible_resource_unit_ids() if state == "RUNNING" else ()),
             )
             current = self._query_allocations[query_id]
             if allocation.generation > current.generation:
-                state = str(query_snapshot.get("state") or "")
                 manager.update_allocation(
                     allocation,
-                    admission_open=(state == "RUNNING"),
+                    admission_open=state in {"RUNNING", "ALLOCATION_DEBT"},
+                    debt_neutral_only=state == "ALLOCATION_DEBT",
                 )
                 self._query_allocations[query_id] = allocation
 
@@ -2373,7 +2370,7 @@ class RayQueryDriverActor:
             node_capacities = tuple(self._query_node_capacities)
             for query_id in sorted(self._query_resource_graphs):
                 manager = get_query_resource_manager(query_id)
-                observed_usage[query_id] = ResourceVector.from_dict(manager.snapshot()["usage"])
+                observed_usage[query_id] = ResourceVector.from_dict(manager.snapshot()["soft_allocation_usage"])
                 generations[query_id] = self._query_allocations[query_id].generation
                 demands[query_id] = build_query_demand(
                     self._query_resource_graphs[query_id],
@@ -2780,7 +2777,11 @@ class RayQueryDriverActor:
                     get_query_resource_manager,
                 )
 
-                get_query_resource_manager(query_key).cancel(message)
+                # The failed admission pump is terminal for the query, but it
+                # is not proof that already submitted Ray work has stopped.
+                # Fence new work while retaining every live lease until the
+                # normal teardown path quiesces its physical owner.
+                get_query_resource_manager(query_key).fail(message)
             except KeyError:
                 pass
             self._fail_query_admission_requests(query_key)
@@ -4752,17 +4753,22 @@ class RayQueryDriverActor:
                 tuple(self._query_node_capacities),
             )
             allocation = self._query_resource_coordinator.register_query(demand)
-            coordinator_state = self._query_resource_coordinator.query_state(
-                graph.query_id,
-                allocation.generation,
-            )
             manager_registered = False
             try:
+                coordinator_state = self._query_resource_coordinator.query_state(
+                    graph.query_id,
+                    allocation.generation,
+                )
+                if coordinator_state not in {"RUNNING", "PENDING_RESOURCES", "ALLOCATION_DEBT"}:
+                    raise RuntimeError(
+                        f"coordinator returned invalid query state for {graph.query_id}: {coordinator_state!r}"
+                    )
                 self._synchronize_query_allocations()
                 manager = register_query_resource_graph(
                     graph,
                     allocation,
-                    admission_open=(coordinator_state == "RUNNING"),
+                    admission_open=coordinator_state in {"RUNNING", "ALLOCATION_DEBT"},
+                    debt_neutral_only=coordinator_state == "ALLOCATION_DEBT",
                     reservation_ratio=float(os.environ.get("VANE_QUERY_RESOURCE_RESERVATION_RATIO", "0.5")),
                     on_change=lambda: self._signal_query_resource_change(graph.query_id),
                     on_eligible_units_change=lambda eligible: self._transition_query_execution_phase(
@@ -4920,7 +4926,7 @@ class RayQueryDriverActor:
                     tuple(self._query_node_capacities),
                     eligible_unit_ids=eligible,
                 )
-                observed_usage = manager.snapshot()["usage"]
+                observed_usage = manager.snapshot()["soft_allocation_usage"]
                 from duckdb.runners.ray.query_resource_graph import ResourceVector
 
                 self._query_resource_coordinator.refresh_query(
@@ -5246,7 +5252,7 @@ class RayQueryDriverActor:
             pool._vane_readiness_futures = []
             pool._vane_init_errors = {}
 
-            phase_activation_error: RuntimeError | None = None
+            phase_activation_error: BaseException | None = None
             with self._session_lock:
                 if (
                     query_id not in self._query_udf_actor_nodes
@@ -5264,16 +5270,20 @@ class RayQueryDriverActor:
                             f"Ray actor UDF pool was activated concurrently: {resource_unit_id}"
                         )
                     else:
-                        active_by_unit[resource_unit_id] = pool
-                        self._active_udf_actors.append(pool)
-                        self._active_udf_actors_by_plan.setdefault(plan_id, []).append(pool)
                         # Publish submission in the same ownership critical section.
                         # A phase transition can now see either no pool or a fully
                         # registered pool, never the half-registered state.
-                        manager.set_submitted_actor_slots(
-                            resource_unit_id,
-                            set(range(len(pool.actors))),
-                        )
+                        try:
+                            manager.set_submitted_actor_slots(
+                                resource_unit_id,
+                                set(range(len(pool.actors))),
+                            )
+                        except BaseException as exc:
+                            phase_activation_error = exc
+                        else:
+                            active_by_unit[resource_unit_id] = pool
+                            self._active_udf_actors.append(pool)
+                            self._active_udf_actors_by_plan.setdefault(plan_id, []).append(pool)
             if phase_activation_error is not None:
                 _shutdown_unregistered_udf_actor_pools(
                     self,
@@ -5381,7 +5391,11 @@ class RayQueryDriverActor:
                 )
                 with self._query_resource_lock:
                     self._query_terminal_errors.setdefault(query_id, message)
-                manager.cancel(message)
+                # A failed pending actor makes the fixed pool unusable, but
+                # other actors/tasks may still be live.  Preserve their QRM
+                # charges until ordered plan teardown kills the pool and
+                # observes task termination.
+                manager.fail(message)
                 return
 
             with self._session_lock:
@@ -5410,6 +5424,87 @@ class RayQueryDriverActor:
             future.add_done_callback(lambda done, _actor_index=actor_index: actor_ready(_actor_index, done))
             readiness_futures.append(future)
         pool._vane_readiness_futures = readiness_futures
+
+    async def report_query_udf_actor_location(
+        self,
+        payload: dict[str, Any],
+        query_generation_capability: str,
+    ) -> dict[str, Any]:
+        """Rebind a transparently reconstructed actor to its current Ray node."""
+
+        from duckdb.runners.ray.query_resource_runtime import get_query_resource_manager
+
+        if not isinstance(payload, dict):
+            raise TypeError("Ray actor location report must be a dict")
+        expected_fields = {
+            "query_id",
+            "resource_unit_id",
+            "actor_index",
+            "pool_nonce",
+            "node_id",
+        }
+        if set(payload) != expected_fields:
+            raise ValueError("Ray actor location report fields do not match the query protocol")
+        query_id = str(payload["query_id"] or "").strip()
+        resource_unit_id = str(payload["resource_unit_id"] or "").strip()
+        pool_nonce = str(payload["pool_nonce"] or "").strip()
+        node_id = str(payload["node_id"] or "").strip()
+        raw_actor_index = payload["actor_index"]
+        if any(not value for value in (query_id, resource_unit_id, pool_nonce, node_id)):
+            raise ValueError("Ray actor location report string fields must be non-empty")
+        if isinstance(raw_actor_index, bool) or not isinstance(raw_actor_index, int) or raw_actor_index < 0:
+            raise ValueError("Ray actor location report actor_index must be a non-negative integer")
+        actor_index = int(raw_actor_index)
+        generation_id = self._verify_query_task_admission_capability(
+            capability=str(query_generation_capability or ""),
+            query_id=query_id,
+        )
+        if generation_id is None or self._capability_targets_inactive_query_generation(query_id, generation_id):
+            return {"accepted": False, "node_id": node_id, "moved_task_lease_count": 0}
+
+        lifecycle_lock = _query_udf_actor_lifecycle_lock(self, query_id)
+        with lifecycle_lock:
+            with self._session_lock:
+                pool = self._active_udf_actor_by_unit.get(query_id, {}).get(resource_unit_id)
+                if pool is None or bool(getattr(pool, "_vane_retired", False)):
+                    return {"accepted": False, "node_id": node_id, "moved_task_lease_count": 0}
+                if str(getattr(pool, "_vane_location_nonce", "")) != pool_nonce:
+                    return {"accepted": False, "node_id": node_id, "moved_task_lease_count": 0}
+                if actor_index >= len(pool.actors):
+                    raise ValueError(
+                        f"Ray actor location report index is outside pool {resource_unit_id}: {actor_index}"
+                    )
+            try:
+                manager = get_query_resource_manager(query_id)
+            except KeyError:
+                return {"accepted": False, "node_id": node_id, "moved_task_lease_count": 0}
+            moved_manager_lease_ids = manager.reconcile_actor_runtime_node(
+                resource_unit_id,
+                actor_index,
+                node_id,
+            )
+            with self._session_lock:
+                active_pool = self._active_udf_actor_by_unit.get(query_id, {}).get(resource_unit_id)
+                if active_pool is not pool or bool(getattr(pool, "_vane_retired", False)):
+                    raise RuntimeError("Ray actor pool changed during location reconciliation")
+                pool.actor_node_ids[actor_index] = node_id
+                pool._confirmed_ready.add(actor_index)
+
+            moved_set = set(moved_manager_lease_ids)
+            if moved_set:
+                with self._query_task_lease_condition:
+                    for state in self._query_task_lease_requests.values():
+                        if state.get("manager_lease_id") not in moved_set:
+                            continue
+                        public_lease = state.get("lease")
+                        if isinstance(public_lease, dict):
+                            public_lease["node_id"] = node_id
+                    self._query_task_lease_condition.notify_all()
+            return {
+                "accepted": True,
+                "node_id": node_id,
+                "moved_task_lease_count": len(moved_manager_lease_ids),
+            }
 
     async def activate_query_udf_actor_pool(
         self,
@@ -5444,23 +5539,51 @@ class RayQueryDriverActor:
             )
 
         key = (query_id, normalized["resource_unit_id"])
-        task = self._query_udf_actor_activation_tasks.get(key)
-        if task is None:
-            task = asyncio.create_task(
-                _to_thread_with_owned_side_effects(
-                    self._activate_query_udf_actor_pool_sync,
-                    normalized,
-                    str(query_generation_capability),
-                ),
-                name=f"vane-activate-udf-actor:{query_id}:{normalized['resource_unit_id']}",
-            )
-            self._query_udf_actor_activation_tasks[key] = task
-        try:
-            return dict(await asyncio.shield(task))
-        except BaseException:
-            if self._query_udf_actor_activation_tasks.get(key) is task:
-                self._query_udf_actor_activation_tasks.pop(key, None)
-            raise
+        lifecycle_lock = _query_udf_actor_lifecycle_lock(self, query_id)
+        while True:
+            task = self._query_udf_actor_activation_tasks.get(key)
+            if task is None:
+                task = asyncio.create_task(
+                    _to_thread_with_owned_side_effects(
+                        self._activate_query_udf_actor_pool_sync,
+                        normalized,
+                        str(query_generation_capability),
+                    ),
+                    name=f"vane-activate-udf-actor:{query_id}:{normalized['resource_unit_id']}",
+                )
+                self._query_udf_actor_activation_tasks[key] = task
+            try:
+                result = dict(await asyncio.shield(task))
+            except asyncio.CancelledError:
+                # shield() deliberately leaves the shared, side-effecting
+                # activation alive. Keep it discoverable so a retried worker
+                # cannot create a second actor pool concurrently.
+                raise
+            except BaseException:
+                if task.done() and self._query_udf_actor_activation_tasks.get(key) is task:
+                    self._query_udf_actor_activation_tasks.pop(key, None)
+                raise
+
+            with lifecycle_lock:
+                current_manager = get_query_resource_manager(query_id)
+                eligible = normalized["resource_unit_id"] in current_manager.current_eligible_resource_unit_ids()
+                with self._session_lock:
+                    pool = self._active_udf_actor_by_unit.get(query_id, {}).get(normalized["resource_unit_id"])
+                    pool_active = pool is not None and not bool(getattr(pool, "_vane_retired", False))
+                if eligible and pool_active:
+                    return result
+                if self._query_udf_actor_activation_tasks.get(key) is task:
+                    self._query_udf_actor_activation_tasks.pop(key, None)
+                if not eligible:
+                    raise RuntimeError(
+                        "query phase ended while resolving Ray actor UDF pool: "
+                        f"{query_id}/{normalized['resource_unit_id']}"
+                    )
+                # A resource unit can leave the frontier behind one barrier and
+                # later re-enter through another DAG branch. Its completed
+                # activation task then refers to a pool that phase retirement
+                # has already killed. Drop that stale result and create a new
+                # query-owned pool for the current frontier.
 
     def _precreate_vllm_actors(
         self,
@@ -7025,7 +7148,7 @@ class RayQueryDriverClient:
             soft=False,
         )
         runner_options = {
-            "name": f"{RAY_QUERY_RUNTIME_ACTOR_NAME_PREFIX}{self._ray_job_id}",
+            "name": query_runtime_actor_name(self._ray_job_id),
             "namespace": RAY_QUERY_RUNTIME_ACTOR_NAMESPACE,
             "get_if_exists": True,
             "scheduling_strategy": scheduling,

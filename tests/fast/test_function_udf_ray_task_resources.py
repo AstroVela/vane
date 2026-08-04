@@ -447,6 +447,7 @@ def test_materialized_task_publishes_unsplittable_row_for_soft_liveness():
 
 def test_actor_pool_requests_logical_memory_and_initializes_eagerly(monkeypatch):
     from duckdb.execution.udf_ray_actor_pool import UDFActorPoolBase
+    from duckdb.runners.ray.query_runtime_protocol import RAY_ACTOR_INDEX_ENV
 
     actor_options = []
     init_calls = []
@@ -520,6 +521,7 @@ def test_actor_pool_requests_logical_memory_and_initializes_eagerly(monkeypatch)
         "VANE_TORCH_INTEROP_THREADS": "1",
         "VANE_RAY_ACTOR_THREAD_POLICY": "managed",
         "EXPLICIT_ACTOR_ENV": "yes",
+        RAY_ACTOR_INDEX_ENV: "0",
     }
     assert actor_options[0]["scheduling_strategy"].node_id == _NODE_ID
     assert actor_options[0]["scheduling_strategy"].soft is False
@@ -649,6 +651,7 @@ def test_actor_pool_thread_env_uses_payload_cpu_allocation(monkeypatch):
 
 def test_actor_pool_default_thread_policy_defers_thread_env_to_ray(monkeypatch):
     from duckdb.execution.udf_ray_actor_pool import UDFActorPoolBase
+    from duckdb.runners.ray.query_runtime_protocol import RAY_ACTOR_INDEX_ENV
 
     actor_options = []
 
@@ -703,6 +706,7 @@ def test_actor_pool_default_thread_policy_defers_thread_env_to_ray(monkeypatch):
     assert env_vars == {
         "EXPLICIT_ACTOR_ENV": "yes",
         "VANE_RAY_ACTOR_THREAD_POLICY": "ray_native",
+        RAY_ACTOR_INDEX_ENV: "0",
     }
 
 

@@ -17,6 +17,24 @@ from types import SimpleNamespace
 import pytest
 
 _QUERY_GENERATION_CAPABILITY = "test-query-generation-capability"
+_TEST_QUERY_ID = "query:test"
+
+
+def _assert_actor_location_runtime_env(env_vars, resource_unit_id):
+    from duckdb.runners.ray import ray_env
+    from duckdb.runners.ray.query_runtime_protocol import (
+        RAY_ACTOR_GENERATION_CAPABILITY_ENV,
+        RAY_ACTOR_POOL_NONCE_ENV,
+        RAY_ACTOR_QUERY_ID_ENV,
+        RAY_ACTOR_RESOURCE_UNIT_ID_ENV,
+    )
+
+    values = dict(env_vars)
+    assert values.pop(RAY_ACTOR_QUERY_ID_ENV) == _TEST_QUERY_ID
+    assert values.pop(RAY_ACTOR_RESOURCE_UNIT_ID_ENV) == resource_unit_id
+    assert values.pop(RAY_ACTOR_GENERATION_CAPABILITY_ENV) == _QUERY_GENERATION_CAPABILITY
+    assert values.pop(RAY_ACTOR_POOL_NONCE_ENV)
+    assert values == ray_env.build_session_runtime_env_vars({})
 
 
 class _FakePlan:
@@ -705,6 +723,7 @@ def test_precreate_udf_actors_enable_generic_async_for_distributed_pool(
                 "payload": {
                     "udf_name": "decode_images",
                     "execution_backend": "ray_actor",
+                    "query_id": _TEST_QUERY_ID,
                     "resource_unit_id": "resource:test:actor",
                 },
             }
@@ -777,6 +796,7 @@ def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name
                 "payload": {
                     "udf_name": "decode_images",
                     "execution_backend": "ray_actor",
+                    "query_id": _TEST_QUERY_ID,
                     "resource_unit_id": "resource:test:actor",
                 },
             }
@@ -798,15 +818,17 @@ def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name
     assert calls[0]["payload"] == {
         "udf_name": "decode_images",
         "execution_backend": "ray_actor",
+        "query_id": _TEST_QUERY_ID,
         "resource_unit_id": "resource:test:actor",
     }
     assert calls[0]["concurrency"] == 2
     assert calls[0]["gpus_per_actor"] == 0.0
     assert calls[0]["actor_node_ids"] == ["node-a", "node-b"]
     assert calls[0]["ray_options"]["num_cpus"] == 1.0
-    from duckdb.runners.ray import ray_env
-
-    assert calls[0]["ray_options"]["runtime_env"]["env_vars"] == ray_env.build_session_runtime_env_vars({})
+    _assert_actor_location_runtime_env(
+        calls[0]["ray_options"]["runtime_env"]["env_vars"],
+        "resource:test:actor",
+    )
     assert handles_map["7"]["actor_handles"] == ["actor-0", "actor-1"]
     assert handles_map["7"]["query_driver_handle"] is query_driver_handle
     assert "ray_actor_pool_name" not in handles_map["7"]
@@ -866,6 +888,7 @@ def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_
                     "stateful": True,
                     "side_effects": True,
                     "actor_number": 1,
+                    "query_id": _TEST_QUERY_ID,
                     "resource_unit_id": "resource:test:stateful",
                 },
             }
@@ -891,6 +914,7 @@ def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_
                 "stateful": True,
                 "side_effects": True,
                 "actor_number": 1,
+                "query_id": _TEST_QUERY_ID,
                 "resource_unit_id": "resource:test:stateful",
             },
             "concurrency": 1,
@@ -942,6 +966,7 @@ def test_ensure_actor_pools_for_plan_disables_retries_for_side_effecting_udf(mon
                     "execution_backend": "ray_actor",
                     "stateful": False,
                     "side_effects": True,
+                    "query_id": _TEST_QUERY_ID,
                     "resource_unit_id": "resource:test:side-effects",
                 },
             }
@@ -969,12 +994,14 @@ def test_ensure_actor_pools_for_plan_disables_retries_for_side_effecting_udf(mon
             "execution_backend": "ray_actor",
             "stateful": False,
             "side_effects": False,
+            "query_id": _TEST_QUERY_ID,
             "resource_unit_id": "resource:test:retry-policy",
         },
         {
             "udf_name": "ai_prompt",
             "execution_backend": "ray_actor",
             "ai_operation": "prompt",
+            "query_id": _TEST_QUERY_ID,
             "resource_unit_id": "resource:test:retry-policy",
         },
     ],
@@ -1140,6 +1167,7 @@ def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):
             "payload": {
                 "udf_name": "decode_images",
                 "execution_backend": "ray_actor",
+                "query_id": _TEST_QUERY_ID,
                 "resource_unit_id": "resource:test:actor",
             },
         }
@@ -1162,15 +1190,17 @@ def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):
     assert calls[0]["payload"] == {
         "udf_name": "decode_images",
         "execution_backend": "ray_actor",
+        "query_id": _TEST_QUERY_ID,
         "resource_unit_id": "resource:test:actor",
     }
     assert calls[0]["concurrency"] == 2
     assert calls[0]["gpus_per_actor"] == 0.0
     assert calls[0]["actor_node_ids"] == ["node-a", "node-b"]
     assert calls[0]["ray_options"]["num_cpus"] == 1.0
-    from duckdb.runners.ray import ray_env
-
-    assert calls[0]["ray_options"]["runtime_env"]["env_vars"] == ray_env.build_session_runtime_env_vars({})
+    _assert_actor_location_runtime_env(
+        calls[0]["ray_options"]["runtime_env"]["env_vars"],
+        "resource:test:actor",
+    )
     assert handles_map["9"]["actor_handles"] == ["actor-0", "actor-1"]
     assert injected == [handles_map]
 
@@ -1272,6 +1302,7 @@ def test_prepare_actor_pools_publishes_handles_before_waiting_for_init(monkeypat
                 "payload": {
                     "udf_name": "embed",
                     "execution_backend": "ray_actor",
+                    "query_id": _TEST_QUERY_ID,
                     "resource_unit_id": "resource:test:deferred-ready",
                 },
             }
@@ -1396,7 +1427,7 @@ def test_driver_publishes_later_actor_slots_as_ray_core_schedules_them():
     ]
 
 
-def test_later_actor_init_failure_cancels_query_instead_of_shrinking_pool():
+def test_later_actor_init_failure_fences_query_without_releasing_live_owners():
     from concurrent.futures import Future
 
     from duckdb.runners.ray.driver import RayQueryDriverActor
@@ -1419,10 +1450,10 @@ def test_later_actor_init_failure_cancels_query_instead_of_shrinking_pool():
         _vane_init_errors={},
         _vane_readiness_futures=[],
     )
-    cancellations = []
+    failures = []
     manager = SimpleNamespace(
         set_ready_actor_slots=lambda *_args: pytest.fail("a failed actor must not join the ready set"),
-        cancel=cancellations.append,
+        fail=failures.append,
     )
     runner = SimpleNamespace(
         _session_lock=threading.RLock(),
@@ -1441,9 +1472,9 @@ def test_later_actor_init_failure_cancels_query_instead_of_shrinking_pool():
     pending_future.set_exception(RuntimeError("warmup failed"))
 
     assert isinstance(pool._vane_init_errors[1], RuntimeError)
-    assert cancellations == [runner._query_terminal_errors["q1"]]
-    assert "resource:q1:actor/actor-1" in cancellations[0]
-    assert "warmup failed" in cancellations[0]
+    assert failures == [runner._query_terminal_errors["q1"]]
+    assert "resource:q1:actor/actor-1" in failures[0]
+    assert "warmup failed" in failures[0]
 
 
 def test_retired_pool_ignores_late_actor_init_failure():
@@ -1469,10 +1500,10 @@ def test_retired_pool_ignores_late_actor_init_failure():
         _vane_init_errors={},
         _vane_readiness_futures=[],
     )
-    cancellations = []
+    failures = []
     manager = SimpleNamespace(
         set_ready_actor_slots=lambda *_args: pytest.fail("a retired actor must not join the ready set"),
-        cancel=cancellations.append,
+        fail=failures.append,
     )
     runner = SimpleNamespace(
         _session_lock=threading.RLock(),
@@ -1494,7 +1525,7 @@ def test_retired_pool_ignores_late_actor_init_failure():
 
     assert pool._vane_init_errors == {}
     assert runner._query_terminal_errors == {}
-    assert cancellations == []
+    assert failures == []
 
 
 def test_stale_execution_phase_callback_does_not_retire_current_actor_pool(
@@ -1766,6 +1797,202 @@ def test_actor_activation_rechecks_phase_after_slow_pool_creation(monkeypatch):
     assert submitted == []
     assert shutdowns == ["shutdown"]
     assert runner._active_udf_actor_by_unit["q1"] == {}
+
+
+def test_actor_activation_cleans_up_when_atomic_slot_publication_is_fenced(monkeypatch):
+    import duckdb.execution.udf_ray as udf_ray
+    import duckdb.runners.ray.query_resource_runtime as resource_runtime
+    from duckdb.runners.ray.driver import RayQueryDriverActor
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    resource_unit_id = "resource:q1:actor"
+
+    class _Manager:
+        @staticmethod
+        def current_eligible_resource_unit_ids():
+            return (resource_unit_id,)
+
+        @staticmethod
+        def set_submitted_actor_slots(_unit_id, _actor_indices):
+            raise RuntimeError("query was cancelled during actor creation")
+
+    monkeypatch.setattr(
+        resource_runtime,
+        "get_query_resource_manager",
+        lambda _query_id: _Manager(),
+    )
+    shutdowns = []
+    pool = SimpleNamespace(
+        actors=["actor-0"],
+        shutdown=lambda: shutdowns.append("shutdown"),
+    )
+    monkeypatch.setattr(
+        udf_ray,
+        "prepare_actor_pools_for_nodes",
+        lambda *_args, **_kwargs: (
+            [pool],
+            {
+                "node-1": {
+                    "actor_handles": ["actor-0"],
+                    "actor_node_ids": [""],
+                    "actor_dispatch_indices": [],
+                    "actor_init_refs": [],
+                }
+            },
+        ),
+    )
+    runner = SimpleNamespace(
+        _query_resource_lock=threading.RLock(),
+        _session_lock=threading.RLock(),
+        _query_resource_graphs={
+            "q1": SimpleNamespace(unit_by_id=lambda _unit_id: SimpleNamespace(backend="ray_actor"))
+        },
+        _query_allocations={"q1": object()},
+        _query_udf_actor_nodes={
+            "q1": {
+                resource_unit_id: {
+                    "node_id": "node-1",
+                }
+            }
+        },
+        _query_udf_session_configs={"q1": {}},
+        _plan_session_ids={"q1": "session-1"},
+        _active_udf_actor_by_unit={"q1": {}},
+        _active_udf_actors=[],
+        _active_udf_actors_by_plan={},
+        _driver_handle=object(),
+    )
+
+    with pytest.raises(RuntimeError, match="cancelled during actor creation"):
+        runner_cls._activate_query_udf_actor_pool_sync(
+            runner,
+            {
+                "query_id": "q1",
+                "resource_unit_id": resource_unit_id,
+                "physical_node_id": "node-1",
+            },
+            _QUERY_GENERATION_CAPABILITY,
+        )
+
+    assert shutdowns == ["shutdown"]
+    assert runner._active_udf_actor_by_unit["q1"] == {}
+    assert runner._active_udf_actors == []
+    assert runner._active_udf_actors_by_plan == {}
+
+
+def test_actor_activation_recreates_retired_pool_after_phase_reentry(monkeypatch):
+    import duckdb.runners.ray.query_resource_runtime as resource_runtime
+    from duckdb.runners.ray.driver import RayQueryDriverActor
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    resource_unit_id = "resource:q1:actor"
+    manager = SimpleNamespace(current_eligible_resource_unit_ids=lambda: (resource_unit_id,))
+    monkeypatch.setattr(resource_runtime, "get_query_resource_manager", lambda _query_id: manager)
+
+    runner = SimpleNamespace(
+        _session_lock=threading.RLock(),
+        _query_udf_actor_lifecycle_locks={},
+        _query_udf_actor_activation_tasks={},
+        _active_udf_actor_by_unit={"q1": {}},
+        _verify_query_task_admission_capability=lambda **_kwargs: "generation-1",
+        _capability_targets_inactive_query_generation=lambda *_args: False,
+    )
+    activations = []
+
+    def activate_sync(_locator, _capability):
+        pool = SimpleNamespace(_vane_retired=False)
+        with runner._session_lock:
+            runner._active_udf_actor_by_unit["q1"][resource_unit_id] = pool
+        activations.append(pool)
+        return {"actor_handles": [f"actor-{len(activations)}"]}
+
+    runner._activate_query_udf_actor_pool_sync = activate_sync
+    locator = {
+        "query_id": "q1",
+        "resource_unit_id": resource_unit_id,
+        "physical_node_id": "node-1",
+    }
+
+    async def scenario():
+        stale = asyncio.create_task(asyncio.sleep(0, result={"actor_handles": ["retired-actor"]}))
+        await stale
+        runner._query_udf_actor_activation_tasks[("q1", resource_unit_id)] = stale
+        return await runner_cls.activate_query_udf_actor_pool(
+            runner,
+            locator,
+            _QUERY_GENERATION_CAPABILITY,
+        )
+
+    assert asyncio.run(scenario()) == {"actor_handles": ["actor-1"]}
+    assert len(activations) == 1
+    assert runner._active_udf_actor_by_unit["q1"][resource_unit_id] is activations[0]
+
+
+def test_cancelled_actor_activation_waiter_keeps_shared_creation_cached(monkeypatch):
+    import duckdb.runners.ray.query_resource_runtime as resource_runtime
+    from duckdb.runners.ray.driver import RayQueryDriverActor
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    resource_unit_id = "resource:q1:actor"
+    manager = SimpleNamespace(current_eligible_resource_unit_ids=lambda: (resource_unit_id,))
+    monkeypatch.setattr(resource_runtime, "get_query_resource_manager", lambda _query_id: manager)
+
+    runner = SimpleNamespace(
+        _session_lock=threading.RLock(),
+        _query_udf_actor_lifecycle_locks={},
+        _query_udf_actor_activation_tasks={},
+        _active_udf_actor_by_unit={"q1": {}},
+        _verify_query_task_admission_capability=lambda **_kwargs: "generation-1",
+        _capability_targets_inactive_query_generation=lambda *_args: False,
+    )
+    activation_started = threading.Event()
+    release_activation = threading.Event()
+    activation_count = 0
+
+    def activate_sync(_locator, _capability):
+        nonlocal activation_count
+        activation_count += 1
+        activation_started.set()
+        assert release_activation.wait(timeout=5)
+        with runner._session_lock:
+            runner._active_udf_actor_by_unit["q1"][resource_unit_id] = SimpleNamespace(_vane_retired=False)
+        return {"actor_handles": ["actor-1"]}
+
+    runner._activate_query_udf_actor_pool_sync = activate_sync
+    locator = {
+        "query_id": "q1",
+        "resource_unit_id": resource_unit_id,
+        "physical_node_id": "node-1",
+    }
+
+    async def scenario():
+        waiter = asyncio.create_task(
+            runner_cls.activate_query_udf_actor_pool(
+                runner,
+                locator,
+                _QUERY_GENERATION_CAPABILITY,
+            )
+        )
+        assert await asyncio.to_thread(activation_started.wait, 5)
+        shared_task = runner._query_udf_actor_activation_tasks[("q1", resource_unit_id)]
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert runner._query_udf_actor_activation_tasks[("q1", resource_unit_id)] is shared_task
+        assert not shared_task.done()
+        release_activation.set()
+        await shared_task
+        return await runner_cls.activate_query_udf_actor_pool(
+            runner,
+            locator,
+            _QUERY_GENERATION_CAPABILITY,
+        )
+
+    try:
+        assert asyncio.run(scenario()) == {"actor_handles": ["actor-1"]}
+    finally:
+        release_activation.set()
+    assert activation_count == 1
 
 
 def test_phase_retirement_cancels_pending_actor_readiness_without_deadlock(
@@ -2255,6 +2482,7 @@ def test_ensure_actor_pools_for_plan_does_not_fail_fast_on_cluster_resource_snap
                 "payload": {
                     "udf_name": "decode_images",
                     "execution_backend": "ray_actor",
+                    "query_id": _TEST_QUERY_ID,
                     "resource_unit_id": "resource:test:actor",
                     "cpus": 1.0,
                 },
@@ -2389,6 +2617,7 @@ def test_ensure_actor_pools_for_plan_propagates_actor_creation_errors(monkeypatc
                 "gpus": 0.0,
                 "payload": {
                     "execution_backend": "ray_actor",
+                    "query_id": _TEST_QUERY_ID,
                     "resource_unit_id": "resource:test:actor",
                 },
             }
@@ -2755,6 +2984,7 @@ def test_ensure_actor_pools_for_plan_uses_coordinator_actor_nodes(monkeypatch):
                 "gpus": 1.0,
                 "payload": {
                     "execution_backend": "ray_actor",
+                    "query_id": _TEST_QUERY_ID,
                     "resource_unit_id": "resource:test:actor",
                     "gpus": 1.0,
                 },
@@ -2836,6 +3066,7 @@ def test_ensure_actor_pools_waits_for_init_refs_before_ready_lookup(monkeypatch)
                 "gpus": 0.0,
                 "payload": {
                     "execution_backend": "ray_actor",
+                    "query_id": _TEST_QUERY_ID,
                     "resource_unit_id": "resource:test:actor",
                     "gpus": 0.0,
                 },

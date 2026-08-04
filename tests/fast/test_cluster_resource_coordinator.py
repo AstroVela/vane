@@ -481,6 +481,35 @@ def test_indivisible_gpu_task_bundle_must_fit_one_node_not_cluster_aggregate():
     assert coordinator.snapshot()["queries"]["gpu-task"]["state"] == "PENDING_RESOURCES"
 
 
+def test_task_bundle_matching_reassigns_an_earlier_best_fit():
+    coordinator = ClusterQueryResourceCoordinator(
+        (
+            _node("cpu-node", cpu=2, gpu=0.5),
+            _node("shared-node", cpu=2, gpu=1),
+            _node("gpu-node", cpu=1, gpu=2),
+        ),
+    )
+    cpu_bundle = _r(cpu=2)
+    mixed_bundle = _r(cpu=1.5, gpu=0.25)
+    gpu_bundle = _r(cpu=1, gpu=1)
+    minimum = cpu_bundle + mixed_bundle + gpu_bundle
+
+    allocation = coordinator.register_query(
+        QueryDemand(
+            query_id="alternating-path",
+            minimum=minimum,
+            desired=minimum,
+            task_bundles=(cpu_bundle, mixed_bundle, gpu_bundle),
+        ),
+        now=0,
+    )
+
+    assert coordinator.query_state("alternating-path", allocation.generation) == "RUNNING"
+    by_node = {item.node_id: item.resources for item in allocation.node_allocations}
+    assert by_node["gpu-node"] == gpu_bundle
+    assert {by_node["cpu-node"], by_node["shared-node"]} == {cpu_bundle, mixed_bundle}
+
+
 def test_minimum_task_vector_must_fit_one_node_not_cross_node_dimensions():
     coordinator = ClusterQueryResourceCoordinator(
         (

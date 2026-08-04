@@ -19,6 +19,7 @@ def register_query_resource_graph(
     allocation: QueryAllocation,
     *,
     admission_open: bool = True,
+    debt_neutral_only: bool = False,
     reservation_ratio: float = 0.5,
     on_change: Callable[[], None] | None = None,
     on_eligible_units_change: Callable[[tuple[str, ...]], None] | None = None,
@@ -28,14 +29,17 @@ def register_query_resource_graph(
     # Fixed Ray actor pools are submitted to Ray Core and may remain pending;
     # their process resources are soft phase usage, not placement admission.
     # Ray tasks still require one concrete runnable bundle in the allocation.
+    if debt_neutral_only and not admission_open:
+        raise ValueError("debt-neutral admission requires admission_open")
     graph.validate_allocation(
         allocation,
-        eligible_unit_ids=(graph.eligible_resource_unit_ids(set()) if admission_open else ()),
+        eligible_unit_ids=(graph.eligible_resource_unit_ids(set()) if admission_open and not debt_neutral_only else ()),
     )
     manager = RayQueryResourceManager(
         graph,
         allocation,
         admission_open=admission_open,
+        debt_neutral_only=debt_neutral_only,
         reservation_ratio=reservation_ratio,
         on_change=on_change,
         on_eligible_units_change=on_eligible_units_change,

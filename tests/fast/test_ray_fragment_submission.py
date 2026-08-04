@@ -1202,6 +1202,34 @@ def test_fte_worker_command_dispatch_preserves_healthy_tail_and_new_outbox_comma
         fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
 
 
+def test_fte_worker_command_wrappers_publish_write_sink_state_without_commands(monkeypatch):
+    coordinator = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-command-sink-sync",
+    )
+    fragment_execution = SimpleNamespace(pop_worker_commands=lambda: [])
+    mutation_result = FragmentExecutionMutationResult.from_attempts([], [])
+    sink_syncs = []
+    dispatches = []
+    sentinel = object()
+    monkeypatch.setattr(
+        worker_commands_mod,
+        "_sync_write_sink_unit_for_fragment",
+        lambda execution: sink_syncs.append(execution),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_execute_fte_fragment_execution_worker_commands",
+        lambda execution, commands: dispatches.append((execution, list(commands))) or sentinel,
+    )
+
+    assert coordinator._execute_fte_fragment_execution_outbox(fragment_execution) is sentinel
+    assert coordinator._execute_fte_fragment_execution_mutation_result(fragment_execution, mutation_result) is sentinel
+    assert sink_syncs == [fragment_execution, fragment_execution]
+    assert dispatches == [(fragment_execution, []), (fragment_execution, [])]
+
+
 def test_fte_worker_command_dispatch_publishes_only_successful_healthy_creates(monkeypatch):
     query_id = "query-command-create-outcomes"
     coordinator = RayWorkerActorHandle(
@@ -7120,6 +7148,174 @@ def test_fte_denied_descriptor_is_not_registered_and_block_is_removed_when_aband
     assert stats["resource_unit_submission_block_count"] == 0
 
 
+def test_fte_node_local_denial_keeps_probe_while_trying_another_worker(monkeypatch):
+    from duckdb.runners.ray.query_resource_manager import TaskGrant, TaskLease
+
+    query_id = "query-node-local-retry"
+    fragment_id = _install_manual_test_fragment(query_id, "8")
+    manager = get_query_resource_manager(query_id)
+    resource_unit_id = native_fragment_unit_id_for_fragment(query_id, fragment_id)
+    requests = []
+    lease = TaskLease(
+        lease_id="lease-node-b",
+        query_id=query_id,
+        resource_unit_id=resource_unit_id,
+        task_id="task-node-b",
+        attempt_id="attempt-node-b",
+        node_id="node-b",
+        execution_slot_id="ray_worker:node-b",
+        actor_index=None,
+        resources=ResourceVector(),
+        output_window_bytes=1,
+        liveness=False,
+        allocation_generation=1,
+    )
+
+    def try_descriptor(request):
+        requests.append(request)
+        if request.node_id == "node-a":
+            return TaskGrant(
+                False,
+                blocked_reason="node_capacity",
+                admission_epoch=manager.admission_epoch(),
+            )
+        return TaskGrant(
+            True,
+            lease=lease,
+            admission_epoch=manager.admission_epoch(),
+        )
+
+    monkeypatch.setattr(manager, "try_acquire_task_descriptor", try_descriptor)
+
+    with pytest.raises(FteWorkerReservationUnavailable) as exc_info:
+        worker_handle_mod._acquire_fte_partition_task_lease(
+            query_id=query_id,
+            fragment_execution_id=7,
+            fragment_id=fragment_id,
+            partition_id=0,
+            node_id="node-a",
+            retain_probe_on_node_local_denial=True,
+        )
+
+    assert exc_info.value.blocked_reason == "node_capacity"
+    assert exc_info.value.admission_epoch == manager.admission_epoch()
+    stats = worker_handle_mod.fte_registry_stats()
+    assert stats["resource_unit_submission_probe_count"] == 1
+    assert stats["resource_unit_submission_block_count"] == 0
+
+    granted = worker_handle_mod._acquire_fte_partition_task_lease(
+        query_id=query_id,
+        fragment_execution_id=7,
+        fragment_id=fragment_id,
+        partition_id=0,
+        node_id="node-b",
+        retain_probe_on_node_local_denial=True,
+    )
+
+    assert granted is lease
+    assert [request.node_id for request in requests] == ["node-a", "node-b"]
+    stats = worker_handle_mod.fte_registry_stats()
+    assert stats["resource_unit_submission_probe_count"] == 0
+    assert stats["resource_unit_submission_block_count"] == 0
+
+
+def test_fte_node_local_denials_block_only_after_all_workers_are_tried(monkeypatch):
+    from duckdb.runners.ray.query_resource_manager import TaskGrant
+
+    query_id = "query-node-local-exhausted"
+    fragment_id = _install_manual_test_fragment(query_id, "8")
+    manager = get_query_resource_manager(query_id)
+    requests = []
+
+    def try_descriptor(request):
+        requests.append(request)
+        return TaskGrant(
+            False,
+            blocked_reason="node_capacity",
+            admission_epoch=manager.admission_epoch(),
+        )
+
+    monkeypatch.setattr(manager, "try_acquire_task_descriptor", try_descriptor)
+
+    class _Worker:
+        _fte_healthy = True
+
+        def __init__(self, worker_id, node_id):
+            self.worker_id = worker_id
+            self.node_id = node_id
+
+    worker_a = _Worker("worker-a", "node-a")
+    worker_b = _Worker("worker-b", "node-b")
+
+    class _Coordinator:
+        def _select_fte_worker(self, *, exclude, **_kwargs):
+            return next(
+                (worker for worker in (worker_a, worker_b) if worker.worker_id not in exclude),
+                None,
+            )
+
+    placement = worker_handle_mod.FteWorkerPlacementManager(_Coordinator())
+
+    with pytest.raises(FteWorkerReservationUnavailable) as exc_info:
+        placement.acquire(
+            query_id=query_id,
+            fragment_id=fragment_id,
+            partition_id=0,
+        )
+
+    assert exc_info.value.blocked_reason == "node_capacity"
+    assert [request.node_id for request in requests] == ["node-a", "node-b"]
+    stats = worker_handle_mod.fte_registry_stats()
+    assert stats["resource_unit_submission_probe_count"] == 0
+    assert stats["resource_unit_submission_block_count"] == 1
+
+
+def test_fte_worker_selection_error_releases_retained_node_local_probe(monkeypatch):
+    from duckdb.runners.ray.query_resource_manager import TaskGrant
+
+    query_id = "query-node-local-selection-error"
+    fragment_id = _install_manual_test_fragment(query_id, "8")
+    manager = get_query_resource_manager(query_id)
+
+    monkeypatch.setattr(
+        manager,
+        "try_acquire_task_descriptor",
+        lambda _request: TaskGrant(
+            False,
+            blocked_reason="node_capacity",
+            admission_epoch=manager.admission_epoch(),
+        ),
+    )
+
+    class _Worker:
+        _fte_healthy = True
+        worker_id = "worker-a"
+        node_id = "node-a"
+
+    selection_count = 0
+
+    class _Coordinator:
+        def _select_fte_worker(self, **_kwargs):
+            nonlocal selection_count
+            selection_count += 1
+            if selection_count == 1:
+                return _Worker()
+            raise RuntimeError("worker registry changed")
+
+    placement = worker_handle_mod.FteWorkerPlacementManager(_Coordinator())
+
+    with pytest.raises(RuntimeError, match="worker registry changed"):
+        placement.acquire(
+            query_id=query_id,
+            fragment_id=fragment_id,
+            partition_id=0,
+        )
+
+    stats = worker_handle_mod.fte_registry_stats()
+    assert stats["resource_unit_submission_probe_count"] == 0
+    assert stats["resource_unit_submission_block_count"] == 0
+
+
 def test_fte_worker_capacity_tracks_all_node_waiters_without_a_second_cap(monkeypatch):
     monkeypatch.setattr(
         RayWorkerActorHandle,
@@ -10810,10 +11006,16 @@ def test_fte_status_handler_keeps_watcher_until_terminal_status(monkeypatch):
     handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
     watcher = _Watcher()
     fragment_execution = _FragmentExecution()
+    sink_syncs = []
     monkeypatch.setattr(
         worker_events_mod,
         "fragment_execution_key_for_fte_attempt",
         lambda _attempt_id: (query_id, fragment_id),
+    )
+    monkeypatch.setattr(
+        worker_events_mod,
+        "_sync_write_sink_unit_for_fragment",
+        lambda execution: sink_syncs.append(execution),
     )
     monkeypatch.setattr(handle, "_drain_fte_pending_tasks", lambda **_kwargs: [])
     worker_handle_mod._FTE_STATUS_WATCHERS[str(attempt_id)] = watcher
@@ -10828,6 +11030,7 @@ def test_fte_status_handler_keeps_watcher_until_terminal_status(monkeypatch):
         )
         assert watcher.stop_count == 0
         assert fragment_execution.statuses[-1]["task_stats"]["processed_input_rows"] == 5
+        assert sink_syncs == []
 
         handle._handles_for_task_status_changed_event(
             TaskStatusChanged.from_status(
@@ -10841,6 +11044,7 @@ def test_fte_status_handler_keeps_watcher_until_terminal_status(monkeypatch):
             "RUNNING",
             "FINISHED",
         ]
+        assert sink_syncs == [fragment_execution]
     finally:
         worker_handle_mod._FTE_STATUS_WATCHERS.pop(str(attempt_id), None)
         worker_handle_mod._FTE_FRAGMENT_EXECUTIONS.pop((query_id, fragment_id), None)

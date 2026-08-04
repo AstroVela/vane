@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import os
+import secrets
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +22,13 @@ from duckdb.execution.udf_threading import (
     ray_actor_thread_policy,
 )
 from duckdb.runners.ray.ray_env import build_session_runtime_env_vars
+from duckdb.runners.ray.query_runtime_protocol import (
+    RAY_ACTOR_GENERATION_CAPABILITY_ENV,
+    RAY_ACTOR_INDEX_ENV,
+    RAY_ACTOR_POOL_NONCE_ENV,
+    RAY_ACTOR_QUERY_ID_ENV,
+    RAY_ACTOR_RESOURCE_UNIT_ID_ENV,
+)
 from duckdb.runners.ray.safe_get import (
     configured_ray_get_timeout_s,
     resolve_object_refs_blocking,
@@ -134,6 +142,12 @@ class UDFActorPoolBase:
                 }
                 for node_id in normalized_node_ids
             ]
+        for actor_index, actor_option in enumerate(actor_options):
+            runtime_env = dict(actor_option.get("runtime_env") or {})
+            env_vars = dict(runtime_env.get("env_vars") or {})
+            env_vars[RAY_ACTOR_INDEX_ENV] = str(actor_index)
+            runtime_env["env_vars"] = env_vars
+            actor_option["runtime_env"] = runtime_env
         self._owns_actors = True
         self.actor_node_ids: list[str] = [""] * concurrency if normalized_node_ids is None else normalized_node_ids
         self._payload = payload
@@ -646,6 +660,9 @@ def _create_actor_pools_for_nodes(
             resource_unit_id = str(payload.get("resource_unit_id") or "").strip()
             if not resource_unit_id:
                 raise RuntimeError(f"Ray actor UDF node {node_id} is missing resource_unit_id")
+            query_id = str(payload.get("query_id") or "").strip()
+            if not query_id:
+                raise RuntimeError(f"Ray actor UDF node {node_id} is missing query_id")
             concurrency = required_positive_int(node, "actor_pool_size")
             _validate_stateful_actor_pool_contract(payload, concurrency)
             assigned_node_ids = tuple(actor_node_ids_by_unit.get(resource_unit_id, ()))
@@ -656,10 +673,17 @@ def _create_actor_pools_for_nodes(
                     f"got {len(assigned_node_ids)}"
                 )
             cpus = resolve_actor_num_cpus(payload)
+            actor_location_nonce = secrets.token_urlsafe(32)
             ray_options = {
                 "num_cpus": cpus,
                 "runtime_env": {
-                    "env_vars": session_runtime_env_vars,
+                    "env_vars": {
+                        **session_runtime_env_vars,
+                        RAY_ACTOR_QUERY_ID_ENV: query_id,
+                        RAY_ACTOR_RESOURCE_UNIT_ID_ENV: resource_unit_id,
+                        RAY_ACTOR_POOL_NONCE_ENV: actor_location_nonce,
+                        RAY_ACTOR_GENERATION_CAPABILITY_ENV: generation_capability,
+                    },
                 },
             }
 
@@ -678,6 +702,7 @@ def _create_actor_pools_for_nodes(
                 ray_options=ray_options,
                 **fault_tolerance_options,
             )
+            actors_obj._vane_location_nonce = actor_location_nonce
             created.append(actors_obj)
             if wait_for_ready:
                 _resolve_actor_pool_init_refs(ray, actors_obj)

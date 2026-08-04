@@ -72,10 +72,13 @@ def _unit(
             "ray_actor": "ray_actor_pool",
         }[backend]
     )
+    default_physical_node_id = resource_unit_id.rsplit(":", 1)[-1]
+    if backend == "ray_worker":
+        default_physical_node_id = f"node:{default_physical_node_id}:native-fragment"
     return ResourceUnitSpec(
         query_id="q1",
         resource_unit_id=resource_unit_id,
-        physical_node_id=physical_node_id or resource_unit_id.rsplit(":", 1)[-1],
+        physical_node_id=physical_node_id or default_physical_node_id,
         unit_kind=resolved_unit_kind,
         backend=backend,
         input_unit_ids=inputs,
@@ -137,6 +140,19 @@ def test_resource_vector_arithmetic_is_component_wise_and_non_mutating():
     assert left == _resources(cpu=1.5, gpu=0.25, heap_bytes=10, object_store_bytes=20)
 
 
+def test_resource_vector_tolerates_fractional_cpu_gpu_rounding():
+    capacity = _resources(cpu=0.3, gpu=0.3, heap_bytes=0)
+    summed = _resources(cpu=0.1, gpu=0.1, heap_bytes=0) + _resources(
+        cpu=0.2,
+        gpu=0.2,
+        heap_bytes=0,
+    )
+
+    assert summed.fits_within(capacity)
+    assert summed.exceeded_dimensions(capacity) == ()
+    assert capacity - summed == ResourceVector()
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -182,7 +198,7 @@ def test_graph_orders_units_deterministically_and_preserves_one_unit_identity_fo
         cpu_udf.resource_unit_id,
         scan.resource_unit_id,
     )
-    assert graph.unit_id_for_physical_node("scan") == scan.resource_unit_id
+    assert graph.unit_id_for_physical_node("node:scan:native-fragment") == scan.resource_unit_id
     assert graph.task_identity(scan.resource_unit_id, partition_id=0, attempt_id="a1") == (
         "task:resource:fragment-1:scan:partition:0:attempt:a1"
     )
@@ -207,8 +223,8 @@ def test_completed_barrier_retires_old_phase_before_next_phase_becomes_eligible(
         max_concurrency=4,
     )
     sink = _unit("resource:q1:sink", inputs=(second.resource_unit_id,))
-    first_barrier = _barrier("first", first)
-    second_barrier = _barrier("second", second)
+    first_barrier = _barrier("first-barrier", first)
+    second_barrier = _barrier("second-barrier", second)
     graph = _graph(
         scan,
         first,
@@ -234,6 +250,44 @@ def test_completed_barrier_retires_old_phase_before_next_phase_becomes_eligible(
     )
 
 
+def test_directly_adjacent_barrier_waits_for_upstream_materialized_output():
+    scan = _unit("resource:q1:scan", backend="ray_worker", max_concurrency=4)
+    first = _unit(
+        "resource:q1:first-barrier",
+        inputs=(scan.resource_unit_id,),
+        backend="ray_worker",
+        max_concurrency=4,
+    )
+    second = _unit(
+        "resource:q1:second-barrier",
+        inputs=(first.resource_unit_id,),
+        backend="ray_worker",
+        max_concurrency=4,
+    )
+    sink = _unit("resource:q1:sink", inputs=(second.resource_unit_id,))
+    first_barrier = _barrier("first-barrier", first)
+    second_barrier = _barrier("second-barrier", second)
+    graph = _graph(
+        scan,
+        first,
+        second,
+        sink,
+        terminals=(sink.resource_unit_id,),
+        barriers=(first_barrier, second_barrier),
+    )
+
+    assert graph.eligible_resource_unit_ids(set()) == (
+        scan.resource_unit_id,
+        first.resource_unit_id,
+    )
+    assert graph.frontier_materialization_barriers(set()) == (first_barrier,)
+    assert graph.eligible_resource_unit_ids({first_barrier.barrier_id}) == (
+        first.resource_unit_id,
+        second.resource_unit_id,
+    )
+    assert graph.frontier_materialization_barriers({first_barrier.barrier_id}) == (second_barrier,)
+
+
 def test_parallel_first_barriers_share_one_execution_phase_union():
     scan = _unit("resource:q1:scan", backend="ray_worker", max_concurrency=4)
     left = _unit(
@@ -249,8 +303,8 @@ def test_parallel_first_barriers_share_one_execution_phase_union():
         max_concurrency=4,
     )
     join = _unit("resource:q1:join", inputs=(left.resource_unit_id, right.resource_unit_id))
-    left_barrier = _barrier("left", left)
-    right_barrier = _barrier("right", right)
+    left_barrier = _barrier("left-barrier", left)
+    right_barrier = _barrier("right-barrier", right)
     graph = _graph(
         scan,
         left,
@@ -304,8 +358,8 @@ def test_completed_parallel_barrier_opens_its_streaming_branch_before_sibling_ba
         "resource:q1:join",
         inputs=(left_stream.resource_unit_id, right_barrier_unit.resource_unit_id),
     )
-    left_barrier = _barrier("left", left_barrier_unit)
-    right_barrier = _barrier("right", right_barrier_unit)
+    left_barrier = _barrier("left-barrier", left_barrier_unit)
+    right_barrier = _barrier("right-barrier", right_barrier_unit)
     graph = _graph(
         left_scan,
         left_barrier_unit,
@@ -367,6 +421,69 @@ def test_asymmetric_barrier_switches_from_materialized_to_deferred_input_branch(
     assert graph.eligible_resource_unit_ids({barrier.barrier_id}) == (
         probe_scan.resource_unit_id,
         probe_udf.resource_unit_id,
+        broadcast_join.resource_unit_id,
+        sink.resource_unit_id,
+    )
+
+
+def test_nested_deferred_barrier_materializes_in_parallel_without_reviving_retired_input():
+    build_scan = _unit("resource:q1:build-scan", backend="ray_worker", max_concurrency=4)
+    probe_scan = _unit("resource:q1:probe-scan", backend="ray_worker", max_concurrency=4)
+    probe_barrier_unit = _unit(
+        "resource:q1:probe-barrier",
+        inputs=(probe_scan.resource_unit_id,),
+        backend="ray_worker",
+        max_concurrency=4,
+    )
+    probe_stream = _unit(
+        "resource:q1:probe-stream",
+        inputs=(probe_barrier_unit.resource_unit_id,),
+    )
+    broadcast_join = _unit(
+        "resource:q1:broadcast-join",
+        inputs=(build_scan.resource_unit_id, probe_stream.resource_unit_id),
+        backend="ray_worker",
+        max_concurrency=4,
+    )
+    sink = _unit("resource:q1:sink", inputs=(broadcast_join.resource_unit_id,))
+    probe_barrier = _barrier("probe-barrier", probe_barrier_unit)
+    broadcast_barrier = _barrier(
+        "broadcast-join",
+        broadcast_join,
+        materialized_inputs=(build_scan.resource_unit_id,),
+    )
+    graph = _graph(
+        build_scan,
+        probe_scan,
+        probe_barrier_unit,
+        probe_stream,
+        broadcast_join,
+        sink,
+        terminals=(sink.resource_unit_id,),
+        barriers=(probe_barrier, broadcast_barrier),
+    )
+
+    assert graph.eligible_resource_unit_ids(set()) == (
+        build_scan.resource_unit_id,
+        probe_scan.resource_unit_id,
+        probe_barrier_unit.resource_unit_id,
+        broadcast_join.resource_unit_id,
+    )
+    assert graph.frontier_materialization_barriers(set()) == (
+        probe_barrier,
+        broadcast_barrier,
+    )
+    assert graph.eligible_resource_unit_ids({probe_barrier.barrier_id}) == (
+        build_scan.resource_unit_id,
+        broadcast_join.resource_unit_id,
+    )
+    assert graph.eligible_resource_unit_ids({broadcast_barrier.barrier_id}) == (
+        probe_scan.resource_unit_id,
+        probe_barrier_unit.resource_unit_id,
+    )
+    assert graph.eligible_resource_unit_ids({probe_barrier.barrier_id, broadcast_barrier.barrier_id}) == (
+        probe_barrier_unit.resource_unit_id,
+        probe_stream.resource_unit_id,
         broadcast_join.resource_unit_id,
         sink.resource_unit_id,
     )
@@ -452,6 +569,29 @@ def test_graph_rejects_barrier_id_for_a_different_physical_node():
     )
 
     with pytest.raises(ValueError, match="invalid materialization barrier identity"):
+        _graph(scan, sink, terminals=(sink.resource_unit_id,), barriers=(barrier,))
+
+
+def test_graph_rejects_barrier_for_a_different_materializer_physical_node():
+    scan = _unit("resource:q1:scan", backend="ray_worker", max_concurrency=1)
+    sink = _unit(
+        "resource:q1:sink",
+        inputs=(scan.resource_unit_id,),
+        physical_node_id="node:actual-sink:native-fragment",
+        backend="ray_worker",
+        target_output_block_bytes=0,
+        generator_buffer_blocks=0,
+        max_concurrency=1,
+    )
+    barrier = MaterializationBarrierSpec(
+        query_id="q1",
+        barrier_id="barrier:q1:node:reported-sink",
+        physical_node_id="reported-sink",
+        materializer_unit_id=sink.resource_unit_id,
+        materialized_input_unit_ids=(scan.resource_unit_id,),
+    )
+
+    with pytest.raises(ValueError, match="does not match materializer"):
         _graph(scan, sink, terminals=(sink.resource_unit_id,), barriers=(barrier,))
 
 

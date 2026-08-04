@@ -165,7 +165,7 @@ def test_native_barrier_event_advances_driver_local_execution_phase_once():
     upstream = ResourceUnitSpec(
         query_id="q",
         resource_unit_id="resource:q:upstream",
-        physical_node_id="upstream",
+        physical_node_id="node:upstream:native-fragment",
         unit_kind="native_fragment",
         backend="ray_worker",
         input_unit_ids=(),
@@ -177,7 +177,7 @@ def test_native_barrier_event_advances_driver_local_execution_phase_once():
     materializer = ResourceUnitSpec(
         query_id="q",
         resource_unit_id="resource:q:materializer",
-        physical_node_id="materializer",
+        physical_node_id="node:materializer:native-fragment",
         unit_kind="native_fragment",
         backend="ray_worker",
         input_unit_ids=(upstream.resource_unit_id,),
@@ -207,7 +207,7 @@ def test_native_barrier_event_advances_driver_local_execution_phase_once():
             MaterializationBarrierSpec(
                 query_id="q",
                 barrier_id="barrier:q:node:materializer",
-                physical_node_id=materializer.physical_node_id,
+                physical_node_id="materializer",
                 materializer_unit_id=materializer.resource_unit_id,
                 materialized_input_unit_ids=(upstream.resource_unit_id,),
             ),

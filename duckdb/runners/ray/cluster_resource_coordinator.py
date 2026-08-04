@@ -7,6 +7,7 @@ import copy
 import math
 import threading
 import time
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -476,25 +477,40 @@ class ClusterQueryResourceCoordinator:
         bundles: Sequence[ResourceVector],
         remaining: Mapping[str, ResourceVector],
     ) -> tuple[dict[str, ResourceVector], dict[str, ResourceVector]] | None:
-        """Place indivisible minima without depending on greedy node order.
+        """Match indivisible capability envelopes to distinct Ray nodes.
 
-        A heterogeneous execution phase can require more than one capability
-        envelope.  Best-fit placement is a useful ordering heuristic, but a
-        locally valid first node can hide the only node available to a later
-        bundle.  The bounded backtracking below finds the deterministic
-        feasible assignment that the graph builder established from concrete
-        node capacities.
+        The graph builder emits at most one envelope for each concrete source
+        node: if one node could run two task-shape groups, it would have merged
+        them into one component-wise envelope.  Placement is therefore a
+        bipartite matching problem, not multidimensional bin packing.  An
+        augmenting-path matcher avoids both greedy false negatives and
+        exponential backtracking when a large query is currently infeasible.
         """
 
         original = dict(remaining)
         if not bundles:
             return original, {}
-        ordered = tuple(
-            bundle
-            for _index, bundle in sorted(
+        node_ids = tuple(sorted(original))
+        candidates_by_bundle = {
+            bundle_index: tuple(
+                sorted(
+                    (node_id for node_id in node_ids if bundle.fits_within(original[node_id])),
+                    key=lambda node_id: (
+                        original[node_id].gpu - bundle.gpu,
+                        original[node_id].cpu - bundle.cpu,
+                        original[node_id].heap_bytes - bundle.heap_bytes,
+                        node_id,
+                    ),
+                )
+            )
+            for bundle_index, bundle in enumerate(bundles)
+        }
+        ordered_bundle_indices = tuple(
+            bundle_index
+            for bundle_index, bundle in sorted(
                 enumerate(bundles),
                 key=lambda item: (
-                    sum(item[1].fits_within(capacity) for capacity in original.values()),
+                    len(candidates_by_bundle[item[0]]),
                     -item[1].gpu,
                     -item[1].cpu,
                     -item[1].heap_bytes,
@@ -502,53 +518,57 @@ class ClusterQueryResourceCoordinator:
                 ),
             )
         )
-        node_ids = tuple(sorted(original))
-        failed: set[tuple[int, tuple[tuple[str, ResourceVector], ...]]] = set()
+        bundle_by_node: dict[str, int] = {}
+        node_by_bundle: dict[int, str] = {}
 
-        def search(
-            bundle_index: int,
-            current: dict[str, ResourceVector],
-        ) -> dict[str, ResourceVector] | None:
-            if bundle_index == len(ordered):
-                return current
-            state_key = (
-                bundle_index,
-                tuple((node_id, current[node_id]) for node_id in node_ids),
-            )
-            if state_key in failed:
+        def augment(root_bundle_index: int) -> bool:
+            pending = deque((root_bundle_index,))
+            visited_bundle_indices = {root_bundle_index}
+            parent_bundle_by_node: dict[str, int] = {}
+            terminal_node_id: str | None = None
+            while pending and terminal_node_id is None:
+                bundle_index = pending.popleft()
+                for node_id in candidates_by_bundle[bundle_index]:
+                    if node_id in parent_bundle_by_node:
+                        continue
+                    parent_bundle_by_node[node_id] = bundle_index
+                    incumbent = bundle_by_node.get(node_id)
+                    if incumbent is None:
+                        terminal_node_id = node_id
+                        break
+                    if incumbent not in visited_bundle_indices:
+                        visited_bundle_indices.add(incumbent)
+                        pending.append(incumbent)
+            if terminal_node_id is None:
+                return False
+
+            # Reverse the alternating path. Iteration keeps this safe for
+            # clusters larger than Python's recursion limit.
+            node_id = terminal_node_id
+            while True:
+                bundle_index = parent_bundle_by_node[node_id]
+                previous_node_id = node_by_bundle.get(bundle_index)
+                bundle_by_node[node_id] = bundle_index
+                node_by_bundle[bundle_index] = node_id
+                if previous_node_id is None:
+                    return True
+                node_id = previous_node_id
+
+        for bundle_index in ordered_bundle_indices:
+            if not augment(bundle_index):
                 return None
-            bundle = ordered[bundle_index]
-            candidates = sorted(
-                (node_id for node_id in node_ids if bundle.fits_within(current[node_id])),
-                key=lambda node_id: (
-                    current[node_id].gpu - bundle.gpu,
-                    current[node_id].cpu - bundle.cpu,
-                    current[node_id].heap_bytes - bundle.heap_bytes,
-                    node_id,
-                ),
-            )
-            for node_id in candidates:
-                # Keep the single-bundle primitive as the mutation authority;
-                # tests also fault-inject it to verify registration rollback.
-                selected_remaining = {node_id: current[node_id]}
-                if self._place_bundle(bundle, selected_remaining) is None:
-                    raise RuntimeError("selected task bundle unexpectedly became unplaceable")
-                trial = dict(current)
-                trial[node_id] = selected_remaining[node_id]
-                placed = search(bundle_index + 1, trial)
-                if placed is not None:
-                    return placed
-            failed.add(state_key)
-            return None
 
-        placed_remaining = search(0, original)
-        if placed_remaining is None:
-            return None
-        allocations = {
-            node_id: original[node_id] - placed_remaining[node_id]
-            for node_id in node_ids
-            if original[node_id] != placed_remaining[node_id]
-        }
+        placed_remaining = dict(original)
+        allocations: dict[str, ResourceVector] = {}
+        for node_id, bundle_index in sorted(bundle_by_node.items()):
+            bundle = bundles[bundle_index]
+            # Keep the single-bundle primitive as the mutation authority;
+            # tests also fault-inject it to verify registration rollback.
+            selected_remaining = {node_id: placed_remaining[node_id]}
+            if self._place_bundle(bundle, selected_remaining) is None:
+                raise RuntimeError("matched task bundle unexpectedly became unplaceable")
+            placed_remaining[node_id] = selected_remaining[node_id]
+            allocations[node_id] = bundle
         return placed_remaining, allocations
 
     @staticmethod

@@ -1339,12 +1339,12 @@ TEST_CASE("Exchange: ShuffleCache write/read", "[distributed][exchange]") {
 	REQUIRE(files.total_bytes >= file.bytes);
 
 	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
-	REQUIRE(ShuffleCacheRegistry::Instance().Register("stage_1", cache, "cache-basic-query").is_ok());
-	ScopedShuffleCacheRegistration registration("stage_1");
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("exchange_1", cache, "cache-basic-query").is_ok());
+	ScopedShuffleCacheRegistration registration("exchange_1");
 	FlightExchangeConfig source_config;
 	source_config.node_id = "node_1";
 	source_config.expected_types = types;
-	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_1", "node_1", 1)});
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("exchange_1", "node_1", 1)});
 	RequireTwoColumnRows(rows, ids, names);
 }
 
@@ -1379,12 +1379,12 @@ TEST_CASE("Exchange: ShuffleCache flushes large BLOB buffers by actual allocatio
 	vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::BLOB};
 	REQUIRE(cache->FlushAll(context, {"id", "payload"}).is_ok());
 	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
-	REQUIRE(ShuffleCacheRegistry::Instance().Register("stage_large_blob", cache, "cache-blob-query").is_ok());
-	ScopedShuffleCacheRegistration registration("stage_large_blob");
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("exchange_large_blob", cache, "cache-blob-query").is_ok());
+	ScopedShuffleCacheRegistration registration("exchange_large_blob");
 	FlightExchangeConfig source_config;
 	source_config.node_id = "node_blob";
 	source_config.expected_types = types;
-	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_large_blob", "node_blob", 0)});
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("exchange_large_blob", "node_blob", 0)});
 	REQUIRE(rows.size() == ids.size());
 }
 
@@ -1580,12 +1580,12 @@ TEST_CASE("Exchange: ShuffleCache empty partition handling", "[distributed][exch
 	REQUIRE(cache->EnsureSchemaFile(context, types, {"id", "name"}).is_ok());
 	REQUIRE(cache->FlushAll(context, {"id", "name"}).is_ok());
 	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
-	REQUIRE(ShuffleCacheRegistry::Instance().Register("stage_empty", cache, "cache-empty-query").is_ok());
-	ScopedShuffleCacheRegistration registration("stage_empty");
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("exchange_empty", cache, "cache-empty-query").is_ok());
+	ScopedShuffleCacheRegistration registration("exchange_empty");
 	FlightExchangeConfig source_config;
 	source_config.node_id = "node_empty";
 	source_config.expected_types = types;
-	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_empty", "node_empty", 0)});
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("exchange_empty", "node_empty", 0)});
 	REQUIRE(rows.empty());
 
 	vector<int32_t> ids = {9};
@@ -1627,12 +1627,13 @@ TEST_CASE("Exchange: ShuffleCache multiple chunks to same partition", "[distribu
 
 	REQUIRE(cache->FlushAll(context, cache->BufferedNames()).is_ok());
 	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
-	REQUIRE(ShuffleCacheRegistry::Instance().Register("stage_multi_chunk", cache, "cache-multi-chunk-query").is_ok());
-	ScopedShuffleCacheRegistration registration("stage_multi_chunk");
+	REQUIRE(
+	    ShuffleCacheRegistry::Instance().Register("exchange_multi_chunk", cache, "cache-multi-chunk-query").is_ok());
+	ScopedShuffleCacheRegistration registration("exchange_multi_chunk");
 	FlightExchangeConfig source_config;
 	source_config.node_id = "node_1";
 	source_config.expected_types = types;
-	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_multi_chunk", "node_1", 0)});
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("exchange_multi_chunk", "node_1", 0)});
 	REQUIRE(rows.size() == 5);
 
 	// All rows should be present
@@ -1671,22 +1672,22 @@ TEST_CASE("Exchange: ShuffleCache write to multiple partitions", "[distributed][
 
 	REQUIRE(cache->FlushAll(context, cache->BufferedNames()).is_ok());
 	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
-	REQUIRE(ShuffleCacheRegistry::Instance().Register("stage_multi_part", cache, "cache-multi-part-query").is_ok());
-	ScopedShuffleCacheRegistration registration("stage_multi_part");
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("exchange_multi_part", cache, "cache-multi-part-query").is_ok());
+	ScopedShuffleCacheRegistration registration("exchange_multi_part");
 	FlightExchangeConfig source_config;
 	source_config.node_id = "node_1";
 	source_config.expected_types = types;
 
 	// Partition 0 should have 2 rows
-	auto rows0 = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_multi_part", "node_1", 0)});
+	auto rows0 = ReadSourceRows(context, source_config, {MakeSourceHandle("exchange_multi_part", "node_1", 0)});
 	RequireTwoColumnRows(rows0, ids0, names0);
 
 	// Partition 1 should be empty
-	auto rows1 = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_multi_part", "node_1", 1)});
+	auto rows1 = ReadSourceRows(context, source_config, {MakeSourceHandle("exchange_multi_part", "node_1", 1)});
 	REQUIRE(rows1.empty());
 
 	// Partition 2 should have 1 row
-	auto rows2 = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_multi_part", "node_1", 2)});
+	auto rows2 = ReadSourceRows(context, source_config, {MakeSourceHandle("exchange_multi_part", "node_1", 2)});
 	RequireTwoColumnRows(rows2, ids2, names2);
 }
 

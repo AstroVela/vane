@@ -1922,7 +1922,7 @@ def test_metadata_transition_is_atomic_with_concurrent_capacity_refresh(
         collector.shutdown()
 
 
-def test_inflight_block_keeps_item_capacity_from_read_admission():
+def test_inflight_block_survives_temporary_downstream_backpressure():
     fake_ray = _FakeRay()
     driver = _Driver()
     holder = {}
@@ -1959,9 +1959,8 @@ def test_inflight_block_keeps_item_capacity_from_read_admission():
             time.sleep(0.005)
         assert holder["generator"].read_count == 1
 
-        # The pair is already in flight. A temporary downstream backpressure
-        # update may prevent delivery, but it cannot retroactively revoke the
-        # item-size admission under which the block was consumed.
+        # The pair is already in flight. Temporary downstream backpressure may
+        # prevent delivery, but restoring capacity must resume it.
         assert collector.drain_results(zero_capacity) == []
         fake_ray.make_ready(holder["metadata_ref"])
         zero_capacity_events = []
@@ -3367,7 +3366,7 @@ def test_pending_output_control_futures_do_not_withhold_task_or_stream_cleanup()
         collector.shutdown()
 
 
-def test_block_larger_than_declared_item_capacity_fails_instead_of_stalling_queue():
+def test_block_larger_than_soft_item_target_uses_one_bounded_delivery():
     fake_ray = _FakeRay()
     driver = _Driver()
 
@@ -3389,13 +3388,13 @@ def test_block_larger_than_declared_item_capacity_fails_instead_of_stalling_queu
         events = _drain_until(
             collector,
             {7: {"rows": 1, "bytes": 128, "item_bytes": 128}},
-            predicate=lambda values: any(item[2] == "error" for item in values),
+            predicate=lambda values: any(item[2] in {"complete", "error"} for item in values),
         )
-        assert len(events) == 1
-        assert events[0][2] == "error"
-        assert "exceeds downstream item capacity" in events[0][3]
-        assert driver.acquire_query_output_block_lease.calls == []
-        assert len(driver.release_query_task_lease_after_completion.calls) == 1
+        assert [item[2] for item in events] == ["data", "complete"]
+        assert len(driver.acquire_query_output_block_lease.calls) == 1
+        request = driver.acquire_query_output_block_lease.calls[0][0][0]
+        assert request["size_bytes"] == 129
+        assert len(driver.release_query_task_lease.calls) == 1
     finally:
         collector.shutdown()
 

@@ -115,12 +115,14 @@ class FteWorkerReservationUnavailable(RuntimeError):
         partition_id: int,
         memory_requirement_bytes: int | None,
         blocked_reason: str = "",
+        admission_epoch: int | None = None,
     ) -> None:
         self.query_id = str(query_id)
         self.fragment_id = str(fragment_id)
         self.partition_id = int(partition_id)
         self.memory_requirement_bytes = memory_requirement_bytes
         self.blocked_reason = str(blocked_reason)
+        self.admission_epoch = None if admission_epoch is None else int(admission_epoch)
         super().__init__(
             "no FTE worker reservation available for "
             f"{self.query_id}/{self.fragment_id}/{self.partition_id} "

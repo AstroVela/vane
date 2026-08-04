@@ -345,6 +345,7 @@ def test_actor_gpu_reservation_follows_resolved_backend(
     monkeypatch.setattr(udf_ray, "_is_vane_worker_process", lambda: False)
     monkeypatch.setattr(udf_ray, "UDFActorPool", FakeRayPool)
     resource_unit_id = f"resource:test:gpu-order:{decorator_runner}:{resolved_runner}"
+    payload["query_id"] = f"query:test:gpu-order:{decorator_runner}:{resolved_runner}"
     payload["resource_unit_id"] = resource_unit_id
 
     with warnings.catch_warnings():
@@ -461,6 +462,7 @@ def test_stateless_ray_actor_pool_size_and_gpu_options_follow_physical_payload(m
     monkeypatch.setattr(udf_ray, "UDFActorPool", FakeRayPool)
 
     resource_unit_id = "resource:test:stateless-three-actor"
+    nodes[0]["payload"]["query_id"] = "query:test:stateless-three-actor"
     nodes[0]["payload"]["resource_unit_id"] = resource_unit_id
     pools, _ = udf_ray.ensure_actor_pools_for_nodes(
         nodes,

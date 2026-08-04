@@ -16,6 +16,17 @@ _RESOURCE_UNIT_KIND_BY_BACKEND = {
     "ray_task": "ray_task_udf",
     "ray_actor": "ray_actor_pool",
 }
+_RESOURCE_ABS_TOLERANCE = 1e-12
+_RESOURCE_REL_TOLERANCE = 1e-12
+
+
+def _float_resource_leq(value: float, capacity: float) -> bool:
+    return value <= capacity or math.isclose(
+        value,
+        capacity,
+        rel_tol=_RESOURCE_REL_TOLERANCE,
+        abs_tol=_RESOURCE_ABS_TOLERANCE,
+    )
 
 
 def _strict_fields(payload: Mapping[str, Any], expected: tuple[str, ...], type_name: str) -> None:
@@ -87,12 +98,17 @@ class ResourceVector:
             "heap_bytes": self.heap_bytes - other.heap_bytes,
             "object_store_bytes": self.object_store_bytes - other.object_store_bytes,
         }
-        underflow = [name for name, value in values.items() if value < 0]
+        underflow = [name for name in ("heap_bytes", "object_store_bytes") if values[name] < 0]
+        underflow.extend(
+            name
+            for name in ("cpu", "gpu")
+            if not _float_resource_leq(float(getattr(other, name)), float(getattr(self, name)))
+        )
         if underflow:
             raise ValueError(f"resource subtraction underflow: {', '.join(underflow)}")
         return ResourceVector(
-            cpu=values["cpu"],
-            gpu=values["gpu"],
+            cpu=max(0.0, values["cpu"]),
+            gpu=max(0.0, values["gpu"]),
             heap_bytes=int(values["heap_bytes"]),
             object_store_bytes=int(values["object_store_bytes"]),
         )
@@ -109,10 +125,23 @@ class ResourceVector:
         )
 
     def fits_within(self, capacity: ResourceVector) -> bool:
-        return all(getattr(self, name) <= getattr(capacity, name) for name in self._FIELDS)
+        return (
+            _float_resource_leq(self.cpu, capacity.cpu)
+            and _float_resource_leq(self.gpu, capacity.gpu)
+            and self.heap_bytes <= capacity.heap_bytes
+            and self.object_store_bytes <= capacity.object_store_bytes
+        )
 
     def exceeded_dimensions(self, capacity: ResourceVector) -> tuple[str, ...]:
-        return tuple(name for name in self._FIELDS if getattr(self, name) > getattr(capacity, name))
+        return tuple(
+            name
+            for name in self._FIELDS
+            if (
+                not _float_resource_leq(float(getattr(self, name)), float(getattr(capacity, name)))
+                if name in {"cpu", "gpu"}
+                else getattr(self, name) > getattr(capacity, name)
+            )
+        )
 
     def dominant_share(self, capacity: ResourceVector) -> float:
         shares: list[float] = []
@@ -500,8 +529,15 @@ class QueryResourceGraph:
                 raise ValueError(f"barrier {barrier_id} physical_node_id must be non-empty")
             if materializer_unit_id not in by_id:
                 raise ValueError(f"barrier {barrier_id} references missing materializer unit {materializer_unit_id}")
-            if by_id[materializer_unit_id].backend != "ray_worker":
+            materializer = by_id[materializer_unit_id]
+            if materializer.backend != "ray_worker":
                 raise ValueError(f"barrier {barrier_id} materializer must be a native fragment unit")
+            expected_materializer_physical_node_id = f"node:{physical_node_id}:native-fragment"
+            if materializer.physical_node_id != expected_materializer_physical_node_id:
+                raise ValueError(
+                    f"barrier {barrier_id} physical node {physical_node_id!r} does not match "
+                    f"materializer {materializer_unit_id} physical node {materializer.physical_node_id!r}"
+                )
             materialized_input_unit_ids = tuple(
                 str(resource_unit_id).strip() for resource_unit_id in barrier.materialized_input_unit_ids
             )
@@ -509,7 +545,7 @@ class QueryResourceGraph:
                 raise ValueError(f"barrier {barrier_id} must materialize at least one input unit")
             if len(set(materialized_input_unit_ids)) != len(materialized_input_unit_ids):
                 raise ValueError(f"barrier {barrier_id} has duplicate materialized input units")
-            materializer_inputs = set(by_id[materializer_unit_id].input_unit_ids)
+            materializer_inputs = set(materializer.input_unit_ids)
             for input_unit_id in materialized_input_unit_ids:
                 if input_unit_id not in materializer_inputs:
                     raise ValueError(
@@ -687,6 +723,7 @@ class QueryResourceGraph:
         pending = tuple(
             barrier for barrier in self.ordered_materialization_barriers() if barrier.barrier_id not in completed
         )
+        pending_materializer_unit_ids = {barrier.materializer_unit_id for barrier in pending}
 
         direct_downstream: dict[str, set[str]] = {resource_unit_id: set() for resource_unit_id in ordered}
         for unit in self.units:
@@ -705,9 +742,23 @@ class QueryResourceGraph:
             blocked.add(resource_unit_id)
             todo.extend(direct_downstream[resource_unit_id])
 
-        # Every first unfinished barrier is a target for the current phase.
+        # Every unfinished barrier whose materialized side is reachable is a
+        # target for the current phase.  The materializer itself can be
+        # structurally downstream of another barrier through a deferred input
+        # (for example, a broadcast build whose probe side contains a sort),
+        # while its independent materialized side is already executable.
+        # Treating the whole materializer as blocked would serialize those two
+        # materializations and would not match the task streams spawned by the
+        # distributed executor.
+        targets = {
+            barrier.materializer_unit_id
+            for barrier in pending
+            if not any(
+                input_unit_id in blocked or input_unit_id in pending_materializer_unit_ids
+                for input_unit_id in barrier.materialized_input_unit_ids
+            )
+        }
         # A terminal is also a target when no unfinished barrier withholds it.
-        targets = {barrier.materializer_unit_id for barrier in pending if barrier.materializer_unit_id not in blocked}
         targets.update(
             terminal_unit_id for terminal_unit_id in self.terminal_unit_ids if terminal_unit_id not in blocked
         )
@@ -716,12 +767,20 @@ class QueryResourceGraph:
         # unblocked side of every blocked edge eligible so that branch can
         # stream up to the join's bounded input instead of being retired until
         # the other branch catches up.
-        targets.update(
-            input_unit_id
-            for blocked_unit_id in blocked
-            for input_unit_id in by_id[blocked_unit_id].input_unit_ids
-            if input_unit_id not in blocked
-        )
+        for blocked_unit_id in blocked:
+            unit = by_id[blocked_unit_id]
+            barrier = barrier_by_materializer.get(blocked_unit_id)
+            if barrier is not None and barrier.barrier_id not in completed:
+                # A pending barrier's pre-materialization work is represented
+                # by targeting the materializer above.  Its deferred inputs do
+                # not execute until the barrier completes.
+                continue
+            retired_inputs = set() if barrier is None else set(barrier.materialized_input_unit_ids)
+            targets.update(
+                input_unit_id
+                for input_unit_id in unit.input_unit_ids
+                if input_unit_id not in blocked and input_unit_id not in retired_inputs
+            )
 
         eligible: set[str] = set()
         todo = list(targets)

@@ -7,6 +7,7 @@ import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -495,8 +496,25 @@ def test_fte_write_sink_updates_registered_unit_state_instead_of_registering_an_
         fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
         assert manager.snapshot()["units"][resource_unit_id]["runnable"] is True
         assert fragment_id == f"{query_id}:node:sink"
+
+        fragment_execution.partitions[0].finished = True
+        fragment_execution.partitions[0].ready_for_scheduling = False
+        fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
+        unit_state = manager.snapshot()["units"][resource_unit_id]
+        assert unit_state["runnable"] is False
+        assert unit_state["completed"] is False
+
+        fragment_execution.no_more_partitions = True
+        fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
+        assert manager.snapshot()["units"][resource_unit_id]["completed"] is True
     finally:
         _cleanup_fte_query(query_id)
+
+
+def test_fte_write_sink_treats_a_sealed_empty_partition_set_as_completed():
+    fragment_execution = SimpleNamespace(partitions={}, no_more_partitions=True)
+
+    assert fte_fragment_scheduler._write_sink_has_input(fragment_execution) == (False, True)
 
 
 def test_fte_write_sink_unit_snapshot_owns_fragment_state_lock():

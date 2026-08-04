@@ -122,7 +122,6 @@ class _StreamRecord:
     metadata_ref: Any | None = None
     terminal_ref: Any | None = None
     metadata: dict[str, Any] | None = None
-    block_item_capacity_bytes: int | None = None
     output_request_id: str = ""
     output_request: dict[str, Any] | None = None
     output_submit_future: Any | None = None
@@ -414,12 +413,22 @@ class UDFStreamResultCollector:
                         if capacity.bytes is not None:
                             if capacity.bytes <= delivered_bytes:
                                 break
-                            if delivered_bytes + event.size_bytes > capacity.bytes:
+                            if delivered_rows > 0 and delivered_bytes + event.size_bytes > capacity.bytes:
                                 break
                         if capacity.item_bytes is not None and capacity.item_bytes <= 0:
                             break
-                        if capacity.item_bytes is not None and event.size_bytes > capacity.item_bytes:
+                        if (
+                            capacity.item_bytes is not None
+                            and delivered_rows > 0
+                            and event.size_bytes > capacity.item_bytes
+                        ):
                             break
+                        # The byte windows are soft backpressure targets. Let
+                        # one complete block cross either target when the slot
+                        # is otherwise empty, then report zero residual
+                        # capacity until C++ hands that block downstream. This
+                        # is the same bounded full-block liveness escape used
+                        # by Ray Data and by Vane's local subprocess budget.
                         delivered_rows += 1
                         delivered_bytes += event.size_bytes
                     results.append(ready.popleft().as_tuple())
@@ -1739,11 +1748,6 @@ class UDFStreamResultCollector:
                 capacity = self._capacity_by_slot.get(record.slot_id)
                 if capacity is None:
                     raise RuntimeError("Ray UDF block read was scheduled without downstream capacity")
-                # Consuming the block ObjectRef is the admission point for the
-                # whole block/metadata pair. Keep its per-item limit stable;
-                # downstream capacity may legitimately fall to zero before the
-                # metadata ObjectRef becomes ready.
-                record.block_item_capacity_bytes = capacity.item_bytes
                 record.next_ref_ready = False
                 record.ready_sequence = None
                 block_admitted = True
@@ -1981,17 +1985,6 @@ class UDFStreamResultCollector:
             )
         validated = validate_stream_block_metadata(metadata)
         self._validate_task_identity(record, validated)
-        item_capacity_bytes = record.block_item_capacity_bytes
-        if item_capacity_bytes is not None and int(validated["size_bytes"]) > item_capacity_bytes:
-            raise RuntimeError(
-                "Ray UDF block exceeds downstream item capacity: "
-                f"query={validated['query_id']} "
-                f"resource_unit={validated['producer_unit_id']} "
-                f"task_lease={validated['task_lease_id']} "
-                f"block={validated['block_id']} "
-                f"size_bytes={validated['size_bytes']} "
-                f"item_capacity_bytes={item_capacity_bytes}"
-            )
         driver = record.adapter.driver
         if driver is None:
             raise RuntimeError("Ray UDF stream has no query resource driver")
@@ -2185,7 +2178,6 @@ class UDFStreamResultCollector:
                     record.phase = "block"
                     record.block_ref = None
                     record.metadata = None
-                    record.block_item_capacity_bytes = None
                     record.output_request_id = ""
                     record.output_request = None
                     record.output_lease_ref = None
