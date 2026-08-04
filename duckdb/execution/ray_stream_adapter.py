@@ -145,7 +145,7 @@ class TaskLeaseObjectRefGenerator:
             admission.release()
             raise
         # Stream-contract validation belongs to RayStreamAdapter, which is
-        # constructed by AsyncResultCollector under its durable cleanup-ticket
+        # constructed by UDFStreamResultCollector under its durable cleanup-ticket
         # owner.  Once remote work exists, this constructor must not discover a
         # post-submit error that has no scheduler available to retain an
         # asynchronous driver handoff.

@@ -472,6 +472,9 @@ def test_native_dispatcher_terminal_shutdown_uses_one_aggregate_collector_deadli
             def set_wakeup_callback(self, callback):
                 self._wakeup = callback
 
+            def fatal_error(self):
+                return None
+
             def track_generator_ref(self, _slot_id, _submit_id, _source, _error_context):
                 global tracked_count
                 with state_lock:
@@ -553,7 +556,7 @@ def test_native_dispatcher_terminal_shutdown_uses_one_aggregate_collector_deadli
 
 
         udf_exec.build_executor = build_executor
-        collector_mod.AsyncResultCollector = FakeCollector
+        collector_mod.UDFStreamResultCollector = FakeCollector
         connections = [duckdb.connect() for _ in range(slot_count)]
         relations = [
             connection.sql("select 1::BIGINT as x").map_batches(
@@ -647,6 +650,9 @@ def test_native_dispatcher_terminal_shutdown_closes_executor_after_pending_colle
             def set_wakeup_callback(self, callback):
                 self._wakeup = callback
 
+            def fatal_error(self):
+                return None
+
             def track_generator_ref(self, slot_id, submit_id, _source, _error_context):
                 self._events.append((int(slot_id), int(submit_id), "complete", None))
                 tracked.set()
@@ -722,7 +728,7 @@ def test_native_dispatcher_terminal_shutdown_closes_executor_after_pending_colle
 
 
         udf_exec.build_executor = build_executor
-        collector_mod.AsyncResultCollector = FakeCollector
+        collector_mod.UDFStreamResultCollector = FakeCollector
         connection = duckdb.connect()
         relation = connection.sql("select 1::BIGINT as x").map_batches(
             passthrough,
@@ -767,6 +773,195 @@ def test_native_dispatcher_terminal_shutdown_closes_executor_after_pending_colle
             **os.environ,
             "VANE_UDF_UNREGISTER_TIMEOUT_MS": "50",
         },
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_native_dispatcher_rebuilds_failed_ray_stream_collector():
+    """A fatal collector error must not poison later Ray UDF queries."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        from __future__ import annotations
+
+        import threading
+
+        import duckdb
+        import duckdb.execution.udf as udf_exec
+        import duckdb.execution.udf_stream_result_collector as collector_mod
+        import pyarrow as pa
+        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+
+        collector_instances = []
+        first_collector_shutdown = threading.Event()
+
+
+        class FakeSource:
+            def __init__(self, value):
+                self.value = int(value)
+
+
+        class FakeCollector:
+            def __init__(self):
+                self._index = len(collector_instances)
+                self._wakeup = None
+                self._fatal_error = None
+                self._events = {}
+                self._cancelled = set()
+                collector_instances.append(self)
+
+            def set_wakeup_callback(self, callback):
+                self._wakeup = callback
+
+            def fatal_error(self):
+                return self._fatal_error
+
+            def track_generator_ref(self, slot_id, submit_id, source, _error_context):
+                slot_id = int(slot_id)
+                submit_id = int(submit_id)
+                if self._index == 0:
+                    self._fatal_error = RuntimeError("planned fatal collector failure")
+                else:
+                    payload = make_local_shm_ref_bundle_result(pa.table({"y": [source.value]}))
+                    self._events[slot_id] = [
+                        (
+                            slot_id,
+                            submit_id,
+                            "data",
+                            payload,
+                            "output-request:recovered",
+                            "output-lease:recovered",
+                        ),
+                        (slot_id, submit_id, "complete", None),
+                    ]
+                if self._wakeup is not None:
+                    self._wakeup()
+
+            def discard_generator_ref(self, _slot_id, _source):
+                return None
+
+            def drain_results(self, capacities):
+                if self._fatal_error is not None:
+                    raise RuntimeError(f"Ray UDF stream multiplexer failed: {self._fatal_error}")
+                results = []
+                for slot_id in list(self._events):
+                    if int(capacities.get(slot_id, {}).get("rows", 0)) <= 0:
+                        continue
+                    results.extend(self._events.pop(slot_id))
+                return results
+
+            def handoff_output_block_lease(self, _request_id, _lease_id):
+                return True
+
+            def release_output_block_lease(self, _request_id, _lease_id):
+                return True
+
+            def cancel_slot(self, slot_id):
+                slot_id = int(slot_id)
+                self._cancelled.add(slot_id)
+                self._events.pop(slot_id, None)
+
+            def slot_has_pending(self, _slot_id):
+                return False
+
+            def retire_slot(self, _slot_id):
+                return None
+
+            def shutdown(self):
+                self._events.clear()
+                if self._index == 0:
+                    first_collector_shutdown.set()
+
+
+        class FakeExecutor:
+            def __init__(self):
+                self._wakeup = None
+                self._admission_state = "idle"
+                self._retained_input_bytes = 0
+
+            def register_wakeup(self, callback):
+                self._wakeup = callback
+
+            def request_task_admission(self, retained_input_bytes):
+                self._retained_input_bytes = int(retained_input_bytes)
+                self._admission_state = "ready"
+                return True
+
+            def task_admission_state(self):
+                return {
+                    "state": self._admission_state,
+                    "available": self._admission_state == "ready",
+                    "retained_input_bytes": self._retained_input_bytes,
+                }
+
+            def submit_with_id(self, _submit_id, table):
+                self._admission_state = "idle"
+                return FakeSource(table.column(0).to_pylist()[0])
+
+            def take_ready_result(self):
+                return None
+
+            def finished_submitting(self):
+                return None
+
+            def all_tasks_finished(self):
+                return False
+
+            def close(self):
+                return None
+
+
+        def build_executor(_payload, options=None):
+            del options
+            return FakeExecutor()
+
+
+        def passthrough(table):
+            return pa.table({"y": table.column(0)})
+
+
+        udf_exec.build_executor = build_executor
+        collector_mod.UDFStreamResultCollector = FakeCollector
+        failed_connection = duckdb.connect()
+        recovered_connection = duckdb.connect()
+        failed_relation = failed_connection.sql("select 1::BIGINT as x").map_batches(
+            passthrough,
+            schema={"y": duckdb.sqltypes.BIGINT},
+            execution_backend="ray_task",
+        )
+        recovered_relation = recovered_connection.sql("select 2::BIGINT as x").map_batches(
+            passthrough,
+            schema={"y": duckdb.sqltypes.BIGINT},
+            execution_backend="ray_task",
+        )
+        try:
+            try:
+                failed_relation.fetchall()
+            except BaseException as exc:
+                assert "planned fatal collector failure" in str(exc), exc
+            else:
+                raise AssertionError("poisoned collector query unexpectedly succeeded")
+
+            assert first_collector_shutdown.wait(timeout=5), "failed collector was not shut down"
+            assert recovered_relation.fetchall() == [(2,)]
+            assert len(collector_instances) == 2, len(collector_instances)
+        finally:
+            failed_connection.close()
+            recovered_connection.close()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env={**os.environ},
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
@@ -976,6 +1171,9 @@ def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped(failure_ph
             def set_wakeup_callback(self, callback):
                 self._wakeup = callback
 
+            def fatal_error(self):
+                return None
+
             def discard_generator_ref(self, _slot_id, ref):
                 assert ref is submitted_ref
                 discarded.set()
@@ -1057,7 +1255,7 @@ def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped(failure_ph
 
 
         udf_exec.build_executor = build_executor
-        collector_mod.AsyncResultCollector = FakeCollector
+        collector_mod.UDFStreamResultCollector = FakeCollector
         connection = duckdb.connect()
         relation = connection.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
             passthrough,
@@ -1162,6 +1360,9 @@ def test_pending_ray_slot_cleanup_does_not_spin_or_block_healthy_slot():
 
             def set_wakeup_callback(self, callback):
                 self._wakeup = callback
+
+            def fatal_error(self):
+                return None
 
             def track_generator_ref(self, slot_id, submit_id, source, _error_context):
                 slot_id = int(slot_id)
@@ -1283,7 +1484,7 @@ def test_pending_ray_slot_cleanup_does_not_spin_or_block_healthy_slot():
 
 
         udf_exec.build_executor = build_executor
-        collector_mod.AsyncResultCollector = FakeCollector
+        collector_mod.UDFStreamResultCollector = FakeCollector
         slow_connection = duckdb.connect()
         healthy_connection = duckdb.connect()
         slow_relation = slow_connection.sql("select 1::BIGINT as x").map_batches(
@@ -1409,6 +1610,9 @@ def test_output_lease_callback_failure_isolated_to_owning_ray_slot():
             def set_wakeup_callback(self, callback):
                 self._wakeup = callback
 
+            def fatal_error(self):
+                return None
+
             def track_generator_ref(self, slot_id, submit_id, source, _error_context):
                 slot_id = int(slot_id)
                 submit_id = int(submit_id)
@@ -1529,7 +1733,7 @@ def test_output_lease_callback_failure_isolated_to_owning_ray_slot():
 
 
         udf_exec.build_executor = build_executor
-        collector_mod.AsyncResultCollector = FakeCollector
+        collector_mod.UDFStreamResultCollector = FakeCollector
         bad_connection = duckdb.connect()
         good_connection = duckdb.connect()
         bad_relation = bad_connection.sql("select 1::BIGINT as x").map_batches(
