@@ -27,6 +27,7 @@ from duckdb.runners.ray.fragment_registry import (
     _FTE_SCHEDULERS,
     _FTE_WORKER_HANDLES,
 )
+from duckdb.runners.ray.fragment_worker_failures import retire_fte_worker_for_failure
 from duckdb.runners.ray.fragment_worker_results import (
     fte_query_status,
     pop_fte_result_handles,
@@ -55,6 +56,9 @@ if TYPE_CHECKING:
 
 
 class FteWorkerLifecycleMixin:
+    if TYPE_CHECKING:
+        _handles_for_worker_failed_event: Any
+
     def _drop_fragment_registration_state(self, query_id: str) -> None:
         query_key = str(query_id or "").strip()
         if not query_key:
@@ -322,35 +326,52 @@ class FteWorkerLifecycleMixin:
         scheduler.enqueue(SourceInputExhausted.from_source_node_ids(query_id, exhausted_sources))
         return scheduler.drain()
 
-    def mark_fte_worker_failed(self, worker_id: str | None = None, error: Any = None) -> list[Any]:
-        failed_worker_id = str(worker_id or self.worker_id or "")
+    def mark_fte_worker_failed(
+        self,
+        worker_id: str,
+        error: Any,
+        *,
+        worker_incarnation_id: str,
+    ) -> list[Any]:
+        failed_worker_id = str(worker_id)
         if not failed_worker_id:
-            return []
-        failure = _worker_failure_payload(failed_worker_id, error)
-        failed_worker_ids = frozenset({failed_worker_id})
+            raise ValueError("worker_id must be non-empty")
+        worker_incarnation_id = str(worker_incarnation_id)
+        if not worker_incarnation_id:
+            raise ValueError("worker_incarnation_id must be non-empty")
+        failure = _worker_failure_payload(
+            failed_worker_id,
+            error,
+            worker_incarnation_id=worker_incarnation_id,
+        )
         query_ids = fte_fragment_execution_query_ids()
         query_ids.update(_FTE_SCHEDULERS.query_ids())
-        handles: list[Any] = []
+        owned_query_ids = []
         for query_id in sorted(query_ids):
             if fte_registry_query_is_closing(query_id):
                 continue
             scheduler = _FTE_SCHEDULERS.get(query_id)
-            if scheduler is None:
+            if scheduler is None or not scheduler.is_owned_by_manager_instance(self.manager_instance_id):
                 continue
-            if not scheduler.is_owned_by_manager_instance(self.manager_instance_id):
-                continue
-            self._bind_fte_scheduler_handlers(scheduler)
-            scheduler.enqueue(
+            owned_query_ids.append(query_id)
+        if owned_query_ids:
+            return self._handles_for_worker_failed_event(
                 WorkerFailed(
-                    query_id,
-                    failed_worker_id,
-                    failure,
-                    failed_worker_ids=failed_worker_ids,
+                    query_id=owned_query_ids[0],
+                    worker_id=failed_worker_id,
+                    worker_incarnation_id=worker_incarnation_id,
                     manager_instance_id=self.manager_instance_id,
+                    error=failure,
                 )
             )
-            handles.extend(scheduler.drain())
-        return handles
+        if query_ids:
+            retire_fte_worker_for_failure(
+                failed_worker_id,
+                error,
+                manager_instance_id=self.manager_instance_id,
+                worker_incarnation_id=worker_incarnation_id,
+            )
+        return []
 
     def handle_fte_task_status(self, status: Mapping[str, Any]) -> list[Any]:
         attempt_id = FteTaskAttemptId.coerce(status.get("task_id") or status.get("task_id_string") or status)
@@ -454,17 +475,19 @@ class FteWorkerLifecycleMixin:
         self._fte_pressure.drop_query(query_id)
 
     def _begin_worker_shutdown(self) -> None:
-        if getattr(self, "_worker_shutdown_started", False):
-            return
-        self._worker_shutdown_started = True
-        if self.worker_id:
-            with _FTE_REGISTRY_LOCK:
+        with _FTE_REGISTRY_LOCK:
+            if getattr(self, "_worker_shutdown_started", False):
+                return
+            self._worker_shutdown_started = True
+            if self.worker_id:
                 if _FTE_WORKER_HANDLES.get(str(self.worker_id)) is not self:
                     return
+        if self.worker_id:
             try:
                 self.mark_fte_worker_failed(
                     self.worker_id,
                     RuntimeError(f"FTE worker shutdown: {self.worker_id}"),
+                    worker_incarnation_id=self.worker_incarnation_id,
                 )
             except Exception:
                 pass
@@ -476,6 +499,10 @@ class FteWorkerLifecycleMixin:
     def prepare_shutdown(self) -> None:
         """Fence and drain this worker without stopping its Flight service."""
         self._begin_worker_shutdown()
+        self.prepare_failed_worker_shutdown()
+
+    def prepare_failed_worker_shutdown(self) -> None:
+        """Fence and drain a failed worker without publishing failure recursively."""
         prepare_method = getattr(self.actor_handle, "prepare_shutdown", None)
         if prepare_method is None:
             raise RuntimeError("Ray worker actor does not expose prepare_shutdown")

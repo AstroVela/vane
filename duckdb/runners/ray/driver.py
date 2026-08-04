@@ -705,7 +705,8 @@ class FteWorkerTaskHandle:
 
     def __post_init__(self) -> None:
         self.task_id = FteTaskAttemptId.coerce(self.task_id)
-        self.worker_id = getattr(self.worker_handle, "worker_id", None)
+        self.worker_id = str(self.worker_handle.worker_id)
+        self.worker_incarnation_id = str(self.worker_handle.worker_incarnation_id)
         self.task_context_info = dict(self.task_context_info or {})
         self.query_task_lease = dict(self.query_task_lease or {})
         for method_name in (
@@ -719,8 +720,10 @@ class FteWorkerTaskHandle:
         ):
             if not callable(getattr(self.worker_handle, method_name, None)):
                 raise RuntimeError(f"FTE worker handle must provide {method_name}")
-        if not str(self.worker_id or ""):
+        if not self.worker_id:
             raise RuntimeError("FTE worker handle must provide non-empty worker_id")
+        if not self.worker_incarnation_id:
+            raise RuntimeError("FTE worker handle must provide non-empty worker_incarnation_id")
         if self.status_wait_timeout_s <= 0:
             self.status_wait_timeout_s = fte_status_wait_timeout_s()
 
@@ -819,6 +822,7 @@ class FteWorkerTaskHandle:
             self.worker_handle.mark_fte_worker_failed,
             self.worker_id,
             contextual_error,
+            worker_incarnation_id=self.worker_incarnation_id,
         )
 
     async def _finalize_status_watch_failure(

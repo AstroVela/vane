@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, overload
 
 if TYPE_CHECKING:
     from duckdb.runners.fte.fte_descriptor import TaskDescriptor
@@ -23,7 +23,8 @@ class ReadyTask:
 @dataclass(frozen=True)
 class RunningAttempt:
     attempt_id: FteTaskAttemptId
-    worker_id: str | None = None
+    worker_incarnation_id: str
+    worker_id: str
     remote_handle: Any = None
     sink_instance: Any = None
     started_at: float = field(default_factory=time.time)
@@ -34,8 +35,9 @@ class ScheduledAttempt:
     attempt_id: FteTaskAttemptId
     descriptor: TaskDescriptor
     request: dict[str, Any]
+    worker_id: str
+    worker_incarnation_id: str
     sink_instance: Any = None
-    worker_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -65,13 +67,19 @@ class FragmentExecutionMutationResult(Sequence[ScheduledAttempt]):
     scheduled_attempts: tuple[ScheduledAttempt, ...] = ()
     worker_commands: tuple[Any, ...] = ()
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[ScheduledAttempt]:
         return iter(self.scheduled_attempts)
 
     def __len__(self) -> int:
         return len(self.scheduled_attempts)
 
-    def __getitem__(self, index):
+    @overload
+    def __getitem__(self, index: int) -> ScheduledAttempt: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[ScheduledAttempt, ...]: ...
+
+    def __getitem__(self, index: int | slice) -> ScheduledAttempt | tuple[ScheduledAttempt, ...]:
         return self.scheduled_attempts[index]
 
     def __eq__(self, other: object) -> bool:

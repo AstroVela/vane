@@ -53,7 +53,15 @@ def test_event_scheduler_dispatches_events_in_order():
             {"state": "FINISHED"},
         )
     )
-    scheduler.enqueue(WorkerFailed("query-event", "worker-a", "lost"))
+    scheduler.enqueue(
+        WorkerFailed(
+            query_id="query-event",
+            worker_id="worker-a",
+            worker_incarnation_id="incarnation-a",
+            manager_instance_id="manager-a",
+            error="lost",
+        )
+    )
     scheduler.enqueue(MemoryPressureDetected("query-event", 2))
     scheduler.enqueue(ResourceAdmissionChanged("query-event"))
     scheduler.enqueue(WorkerReservationCompleted("query-event", 0, "f0", 3, 1, "worker-b"))
@@ -605,6 +613,8 @@ def test_event_scheduler_retry_delay_timer_records_handler_failure():
 def test_attempt_status_watcher_enqueues_terminal_status_event():
     class _Worker:
         worker_id = "worker-a"
+        worker_incarnation_id = "incarnation-a"
+        manager_instance_id = "manager-a"
 
         def fte_wait_task_status(self, task_id, min_version, timeout_s):
             return {
@@ -640,6 +650,8 @@ def test_attempt_status_watcher_enqueues_terminal_status_event():
 def test_attempt_status_watcher_enqueues_running_progress_before_terminal():
     class _Worker:
         worker_id = "worker-progress"
+        worker_incarnation_id = "incarnation-progress"
+        manager_instance_id = "manager-a"
 
         def __init__(self):
             self.min_versions = []
@@ -697,6 +709,8 @@ def test_attempt_status_watcher_enqueues_running_progress_before_terminal():
 def test_attempt_status_watcher_marks_scheduler_failed_when_handler_fails():
     class _Worker:
         worker_id = "worker-handler-failure"
+        worker_incarnation_id = "incarnation-handler-failure"
+        manager_instance_id = "manager-a"
 
         def fte_wait_task_status(self, task_id, min_version, timeout_s):
             return {
@@ -748,6 +762,8 @@ def test_attempt_status_watcher_requires_status_wait_protocol():
 def test_attempt_status_watcher_reports_malformed_status():
     class _Worker:
         worker_id = "worker-malformed"
+        worker_incarnation_id = "incarnation-malformed"
+        manager_instance_id = "manager-a"
 
         def fte_wait_task_status(self, task_id, min_version, timeout_s):
             return "not-a-status-dict"
@@ -781,6 +797,8 @@ def test_attempt_status_watcher_reports_malformed_status():
 def test_attempt_status_watcher_reports_unknown_task_state_as_worker_failure():
     class _Worker:
         worker_id = "worker-unknown-state"
+        worker_incarnation_id = "incarnation-unknown-state"
+        manager_instance_id = "manager-a"
 
         def fte_wait_task_status(self, task_id, min_version, timeout_s):
             return {
@@ -821,6 +839,8 @@ def test_attempt_status_watcher_reports_unknown_task_state_as_worker_failure():
 def test_attempt_status_watcher_treats_query_deadline_as_hard_failure():
     class _Worker:
         worker_id = "worker-query-deadline"
+        worker_incarnation_id = "incarnation-query-deadline"
+        manager_instance_id = "manager-a"
 
         def fte_wait_task_status(self, task_id, min_version, timeout_s):
             raise QueryDeadlineExceeded("query deadline expired before Ray ObjectRef get")
@@ -862,6 +882,8 @@ def test_attempt_status_watcher_reports_failure_with_unprintable_message():
 
     class _Worker:
         worker_id = "worker-unprintable-failure"
+        worker_incarnation_id = "incarnation-unprintable-failure"
+        manager_instance_id = "manager-a"
 
         def fte_wait_task_status(self, task_id, min_version, timeout_s):
             raise error
@@ -894,6 +916,8 @@ def test_attempt_status_watcher_join_observes_real_thread_lifecycle():
 
     class _Worker:
         worker_id = "worker-slow-status"
+        worker_incarnation_id = "incarnation-slow-status"
+        manager_instance_id = "manager-a"
 
         def fte_wait_task_status(self, task_id, min_version, timeout_s):
             entered.set()

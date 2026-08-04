@@ -1312,10 +1312,11 @@ def test_fte_query_status_handles_multiple_running_attempts():
     stage = _fte_fragment_execution(query_id, 0, fragment_id=fragment_id, max_attempts=2)
     partition = stage.add_partition(0)
     partition.seal()
-    partition.start_attempt(worker_id="worker-a")
+    partition.start_attempt(worker_id="worker-a", worker_incarnation_id="incarnation-worker-a")
     loser_attempt = FteTaskAttemptId(partition.task_id, 1)
     partition.running_attempts[loser_attempt.attempt_id] = RunningAttempt(
         loser_attempt,
+        worker_incarnation_id="incarnation-worker-b",
         worker_id="worker-b",
         remote_handle=None,
     )
@@ -2080,6 +2081,7 @@ def test_two_stage_query_dag_worker_loss_uses_selected_attempt_for_final_result(
             "error_code": "WORKER_LOST",
             "message": "host lost before status was observed",
         },
+        worker_incarnation_id="incarnation-worker-a",
     )
     assert len(retries) == 1
     retry = retries[0]
@@ -2138,7 +2140,9 @@ def test_two_stage_query_dag_worker_loss_uses_selected_attempt_for_final_result(
     ],
 )
 def test_fte_worker_failure_payload_uses_structured_exception_type(error, expected_code):
-    failure = fte_fragment_scheduler._worker_failure_payload("worker-a", error)
+    failure = fte_fragment_scheduler._worker_failure_payload(
+        "worker-a", error, worker_incarnation_id="incarnation-worker-a"
+    )
 
     assert failure["error_code"] == expected_code
 
@@ -2147,7 +2151,9 @@ def test_fte_worker_failure_payload_reads_structured_exception_chain():
     error = RuntimeError("worker RPC failed")
     error.__cause__ = fte_fragment_scheduler.ray.exceptions.OutOfMemoryError("ray node exhausted memory")
 
-    failure = fte_fragment_scheduler._worker_failure_payload("worker-a", error)
+    failure = fte_fragment_scheduler._worker_failure_payload(
+        "worker-a", error, worker_incarnation_id="incarnation-worker-a"
+    )
 
     assert failure["error_code"] == "OUT_OF_MEMORY"
 
@@ -2159,6 +2165,7 @@ def test_fte_worker_failure_payload_preserves_normalized_structured_code():
             "error_code": "out-of-memory",
             "message": "Ray node exhausted memory",
         },
+        worker_incarnation_id="incarnation-worker-a",
     )
 
     assert failure["error_code"] == "OUT_OF_MEMORY"
@@ -2166,12 +2173,15 @@ def test_fte_worker_failure_payload_preserves_normalized_structured_code():
 
 def test_fte_worker_failure_payload_rejects_unstructured_text():
     with pytest.raises(TypeError, match="exception or structured failure payload"):
-        fte_fragment_scheduler._worker_failure_payload("worker-a", "out of memory")
+        fte_fragment_scheduler._worker_failure_payload(
+            "worker-a", "out of memory", worker_incarnation_id="incarnation-worker-a"
+        )
 
 
 class _FakeLiveWorker:
     def __init__(self, worker_id="worker-a"):
         self.worker_id = worker_id
+        self.worker_incarnation_id = f"incarnation-{worker_id}"
         self.calls = []
         self.statuses = {}
 
@@ -2501,6 +2511,7 @@ def test_fte_worker_command_executor_requires_split_queue_wait_protocol():
         query_id="q",
         fragment_id="q:node:scan",
         worker_id="worker-a",
+        worker_incarnation_id="incarnation-worker-a",
         worker=object(),
         attempt_id=attempt_id,
         source_node_id="7",
@@ -2527,6 +2538,7 @@ def test_fte_worker_command_executor_requires_single_ordered_enqueue_protocol():
         query_id="q",
         fragment_id="q:node:scan",
         worker_id="worker-a",
+        worker_incarnation_id="incarnation-worker-a",
         worker=_Worker(),
         attempt_id=attempt_id,
         source_node_id="7",
@@ -2563,6 +2575,7 @@ def test_fte_worker_command_executor_waits_for_slow_split_consumer():
         query_id=attempt_id.query_id,
         fragment_id="q-slow-consumer:node:scan",
         worker_id="worker-a",
+        worker_incarnation_id="incarnation-worker-a",
         worker=worker,
         attempt_id=attempt_id,
         source_node_id="7",
@@ -2602,6 +2615,7 @@ def test_fte_worker_command_executor_split_wait_is_cancellable():
         query_id=attempt_id.query_id,
         fragment_id="q-cancel-splits:node:scan",
         worker_id="worker-a",
+        worker_incarnation_id="incarnation-worker-a",
         worker=_Worker(),
         attempt_id=attempt_id,
         source_node_id="7",
@@ -2632,6 +2646,7 @@ def test_fte_worker_command_executor_close_wins_capacity_to_enqueue_race():
         query_id=attempt_id.query_id,
         fragment_id="q-close-enqueue-race:node:scan",
         worker_id="worker-a",
+        worker_incarnation_id="incarnation-worker-a",
         worker=_Worker(),
         attempt_id=attempt_id,
         source_node_id="7",
@@ -2670,6 +2685,7 @@ def test_fte_worker_command_executor_cancels_ordered_add_after_capacity():
         query_id=attempt_id.query_id,
         fragment_id="q-close-blocked-add:node:scan",
         worker_id="worker-a",
+        worker_incarnation_id="incarnation-worker-a",
         worker=_Worker(),
         attempt_id=attempt_id,
         source_node_id="7",
@@ -2701,6 +2717,7 @@ def test_fte_worker_command_executor_preserves_query_deadline():
         query_id=attempt_id.query_id,
         fragment_id="q-deadline-splits:node:scan",
         worker_id="worker-a",
+        worker_incarnation_id="incarnation-worker-a",
         worker=_Worker(),
         attempt_id=attempt_id,
         source_node_id="7",
@@ -2732,6 +2749,7 @@ def test_fte_worker_command_executor_reports_terminal_task_during_split_wait():
         query_id=attempt_id.query_id,
         fragment_id="q-terminal-splits:node:scan",
         worker_id="worker-a",
+        worker_incarnation_id="incarnation-worker-a",
         worker=_Worker(),
         attempt_id=attempt_id,
         source_node_id="7",
@@ -2759,6 +2777,7 @@ def test_fte_add_splits_command_success_accounts_count_and_bytes_atomically():
         query_id="q",
         fragment_id="q:node:scan",
         worker_id="worker-a",
+        worker_incarnation_id="incarnation-worker-a",
         worker=worker,
         attempt_id=attempt_id,
         source_node_id="7",
@@ -2779,13 +2798,13 @@ def test_fte_add_splits_command_success_accounts_count_and_bytes_atomically():
 def test_fte_fragment_execution_requires_fragment_registration_protocol():
     class _Worker:
         worker_id = "worker-a"
+        worker_incarnation_id = "incarnation-worker-a"
 
     stage = _fte_fragment_execution(
         "q",
         31,
         fragment_id="q:node:scan",
         worker=_Worker(),
-        worker_id="worker-a",
     )
 
     with pytest.raises(AttributeError, match="ensure_fragment_registered"):
@@ -2807,6 +2826,7 @@ def test_fte_fragment_execution_requires_fragment_registration_protocol():
 def test_fte_fragment_execution_does_not_probe_a_sync_control_fallback():
     class _Worker:
         worker_id = "worker-a"
+        worker_incarnation_id = "incarnation-worker-a"
 
         def ensure_fragment_registered(self, _query_id, _fragment_id, _fragment_plan):
             return None
@@ -2816,7 +2836,6 @@ def test_fte_fragment_execution_does_not_probe_a_sync_control_fallback():
         32,
         fragment_id="q:node:scan",
         worker=_Worker(),
-        worker_id="worker-a",
         source_node_ids={"7"},
     )
     stage.apply_assignment_result(
@@ -2862,7 +2881,6 @@ def test_fte_fragment_execution_assignment_creates_task_and_sends_later_updates(
         3,
         fragment_id="q:node:scan",
         worker=worker,
-        worker_id=worker.worker_id,
         source_node_ids={"7"},
         dynamic_scan_source_node_ids={"7"},
     )
@@ -2951,7 +2969,6 @@ def test_fte_fragment_execution_uses_worker_command_executor_for_create_and_upda
         32,
         fragment_id="q:node:scan",
         worker=worker,
-        worker_id=worker.worker_id,
         source_node_ids={"7"},
         dynamic_scan_source_node_ids={"7"},
     )
@@ -3016,7 +3033,6 @@ def test_fte_fragment_execution_task_update_before_create_is_replayed_in_create_
         34,
         fragment_id="q:node:scan",
         worker=worker,
-        worker_id=worker.worker_id,
         source_node_ids={"7"},
     )
 
@@ -3056,7 +3072,6 @@ def test_fte_fragment_execution_task_update_running_attempt_uses_update_command(
         35,
         fragment_id="q:node:scan",
         worker=worker,
-        worker_id=worker.worker_id,
         source_node_ids={"7"},
         dynamic_scan_source_node_ids={"7"},
     )
@@ -3105,7 +3120,6 @@ def test_fte_fragment_execution_ignores_stale_output_buffer_update_for_running_a
         36,
         fragment_id="q:node:scan",
         worker=worker,
-        worker_id=worker.worker_id,
         source_node_ids={"7"},
         dynamic_scan_source_node_ids={"7"},
     )
@@ -3159,7 +3173,6 @@ def test_fte_fragment_execution_appends_descriptor_before_add_splits_command_fai
         33,
         fragment_id="q:node:scan",
         worker=worker,
-        worker_id=worker.worker_id,
         source_node_ids={"7"},
         dynamic_scan_source_node_ids={"7"},
     )
@@ -3209,6 +3222,7 @@ def test_fte_worker_control_failure_preserves_unprintable_cause():
 
     failure = FteWorkerControlFailure(
         worker_id="worker-unprintable-control",
+        worker_incarnation_id="incarnation-worker-unprintable-control",
         attempt_id=attempt_id,
         method_name="fte_add_splits",
         cause=cause,
@@ -3220,6 +3234,7 @@ def test_fte_worker_control_failure_preserves_unprintable_cause():
         fte_fragment_scheduler._worker_failure_payload(
             failure.worker_id,
             failure,
+            worker_incarnation_id=failure.worker_incarnation_id,
         )["error_code"]
         == "WORKER_LOST"
     )
@@ -3260,7 +3275,6 @@ def test_fte_fragment_execution_backpressures_until_split_queue_recovers():
         37,
         fragment_id="q:node:scan",
         worker=worker,
-        worker_id=worker.worker_id,
         source_node_ids={"7"},
         dynamic_scan_source_node_ids={"7"},
     )
@@ -3310,7 +3324,6 @@ def test_fte_fragment_execution_revoke_unsealed_speculative_waits_for_seal():
         31,
         fragment_id="q:node:speculative",
         worker=worker,
-        worker_id=worker.worker_id,
         context={"task_execution_class": "SPECULATIVE"},
         source_node_ids={"7"},
         dynamic_scan_source_node_ids={"7"},
@@ -3361,7 +3374,6 @@ def test_fte_fragment_execution_seal_transitions_running_speculative_to_standard
         32,
         fragment_id="q:node:speculative-seal",
         worker=worker,
-        worker_id=worker.worker_id,
         context={"task_execution_class": "SPECULATIVE"},
         source_node_ids={"7"},
         dynamic_scan_source_node_ids={"7"},
@@ -3399,7 +3411,6 @@ def test_fte_fragment_execution_dynamic_exchange_defaults_to_speculative_until_s
         33,
         fragment_id="q:node:dynamic-exchange",
         worker=worker,
-        worker_id=worker.worker_id,
         source_node_ids={"3"},
         dynamic_exchange_source_node_ids={"3"},
     )
@@ -3436,7 +3447,6 @@ def test_fte_fragment_execution_dynamic_exchange_keeps_explicit_standard_class()
         34,
         fragment_id="q:node:dynamic-exchange-standard",
         worker=worker,
-        worker_id=worker.worker_id,
         context={"task_execution_class": "STANDARD"},
         source_node_ids={"3"},
         dynamic_exchange_source_node_ids={"3"},
@@ -3474,7 +3484,6 @@ def test_fte_fragment_execution_attempt_admission_defers_speculative_until_allow
         35,
         fragment_id="q:node:dynamic-exchange-admission",
         worker=worker,
-        worker_id=worker.worker_id,
         attempt_admission_callback=admit,
         source_node_ids={"3"},
         dynamic_exchange_source_node_ids={"3"},
@@ -3521,7 +3530,6 @@ def test_fte_fragment_execution_execution_admission_defers_ready_until_released(
         36,
         fragment_id="q:node:execution-admission",
         worker=worker,
-        worker_id=worker.worker_id,
         execution_admission_callback=admit,
         source_node_ids={"7"},
         dynamic_scan_source_node_ids={"7"},
@@ -3879,7 +3887,6 @@ def test_fte_fragment_execution_finish_cancels_unselected_running_attempts():
         61,
         fragment_id="q:node:selected",
         worker=winner_worker,
-        worker_id=winner_worker.worker_id,
         exchange=exchange,
         max_attempts=2,
     )
@@ -3893,6 +3900,7 @@ def test_fte_fragment_execution_finish_cancels_unselected_running_attempts():
     loser_sink = exchange.instantiate_sink(partition.sink_handle, loser_attempt.attempt_id)
     partition.running_attempts[loser_attempt.attempt_id] = RunningAttempt(
         loser_attempt,
+        worker_incarnation_id=loser_worker.worker_incarnation_id,
         worker_id=loser_worker.worker_id,
         remote_handle=loser_worker,
         sink_instance=loser_sink,
@@ -4244,6 +4252,7 @@ def test_fte_fragment_execution_worker_lost_uses_retry_attempt_as_durable_output
             "error_code": "WORKER_LOST",
             "message": "actor died before status was observed",
         },
+        worker_incarnation_id="incarnation-worker-a",
     )
     _execute_stage_commands(stage)
 

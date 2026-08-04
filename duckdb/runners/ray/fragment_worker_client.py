@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import threading
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from duckdb.runners.ray.fragment_registry import (
@@ -68,6 +69,7 @@ class RayWorkerActorHandle(
             raise ValueError("host must be non-empty")
         self.actor_handle = actor_handle
         self.worker_id = worker_id
+        self._worker_incarnation_id = uuid.uuid4().hex
         self.node_id = node_id
         self.host = host
         self.manager_instance_id = str(manager_instance_id or "").strip()
@@ -91,11 +93,16 @@ class RayWorkerActorHandle(
         self._fte_prepare_terminal_errors: dict[str, BaseException] = {}
         self._fragment_drop_incomplete_queries: set[str] = set()
         self._worker_shutdown_started = False
+        self._fte_failure_retirement_completed = False
         with _FTE_REGISTRY_LOCK:
             current = _FTE_WORKER_HANDLES.get(worker_id)
             if current is not None and current is not self:
                 raise RuntimeError(f"FTE worker id is already registered: {worker_id}")
             _FTE_WORKER_HANDLES[worker_id] = self
+
+    @property
+    def worker_incarnation_id(self) -> str:
+        return self._worker_incarnation_id
 
     def close_session(self, session_id: str) -> None:
         import ray

@@ -67,9 +67,9 @@ class TaskStatusChanged(FteEvent):
 @dataclass(frozen=True)
 class WorkerFailed(FteEvent):
     worker_id: str
+    worker_incarnation_id: str
+    manager_instance_id: str
     error: Any = None
-    failed_worker_ids: frozenset[str] | None = None
-    manager_instance_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -138,8 +138,15 @@ class QueryAbort(FteEvent):
 class FteWorkerCommand:
     query_id: str
     fragment_id: str
-    worker_id: str | None
+    worker_id: str
+    worker_incarnation_id: str
     worker: Any
+
+    def __post_init__(self) -> None:
+        if not self.worker_id:
+            raise ValueError("FTE worker command requires a non-empty worker_id")
+        if not self.worker_incarnation_id:
+            raise ValueError("FTE worker command requires a non-empty worker_incarnation_id")
 
     @property
     def command_type(self) -> str:
@@ -154,6 +161,7 @@ class FteCreateTaskCommand(FteWorkerCommand):
     scheduled_attempt: ScheduledAttempt = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if self.scheduled_attempt.attempt_id != self.attempt_id:
             raise ValueError(
                 "FTE create command scheduled attempt mismatch: "
@@ -161,11 +169,16 @@ class FteCreateTaskCommand(FteWorkerCommand):
             )
         if self.scheduled_attempt.request is not self.request:
             raise ValueError("FTE create command must own its scheduled attempt request")
-        if str(self.scheduled_attempt.worker_id or "") != str(self.worker_id or ""):
+        if self.scheduled_attempt.worker_id != self.worker_id:
             raise ValueError(
                 "FTE create command scheduled worker mismatch: "
-                f"command={self.worker_id or '<unknown>'} "
-                f"scheduled={self.scheduled_attempt.worker_id or '<unknown>'}"
+                f"command={self.worker_id} scheduled={self.scheduled_attempt.worker_id}"
+            )
+        if self.scheduled_attempt.worker_incarnation_id != self.worker_incarnation_id:
+            raise ValueError(
+                "FTE create command scheduled worker incarnation mismatch: "
+                f"command={self.worker_incarnation_id} "
+                f"scheduled={self.scheduled_attempt.worker_incarnation_id}"
             )
 
 

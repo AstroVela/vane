@@ -24,7 +24,6 @@ from duckdb.runners.ray.fragment_registry import (
 from duckdb.runners.ray.fragment_worker_exchange import apply_exchange_selector_update
 from duckdb.runners.ray.fragment_worker_failures import (
     mark_fte_worker_failed_for_event,
-    quarantine_fte_worker,
 )
 from duckdb.runners.ray.fragment_worker_ordering import fragment_execution_key_for_fte_attempt
 from duckdb.runners.ray.fragment_worker_reservations import (
@@ -57,44 +56,21 @@ class FteWorkerEventHandlingMixin:
     ) -> list[Any]:
         """Fence a failed worker before queued work can observe it as live."""
 
-        failed_worker_ids = quarantine_fte_worker(
-            failure.worker_id,
-            manager_instance_id=self.manager_instance_id,
-        )
-        query_ids = set(_FTE_SCHEDULERS.query_ids())
-        query_ids.add(failure.attempt_id.task_id.query_id)
-        schedulers = []
-        for query_id in sorted(query_ids):
-            with _FTE_REGISTRY_LOCK:
-                if query_id in _FTE_CLOSING_QUERIES:
-                    continue
-            scheduler = _FTE_SCHEDULERS.get(query_id)
-            if scheduler is None:
-                continue
-            if not scheduler.is_owned_by_manager_instance(self.manager_instance_id):
-                continue
-            self._bind_fte_scheduler_handlers(scheduler)
-            scheduler.enqueue(
+        try:
+            return self._handles_for_worker_failed_event(
                 WorkerFailed(
-                    query_id,
-                    failure.worker_id,
-                    failure,
-                    failed_worker_ids=failed_worker_ids,
+                    query_id=failure.attempt_id.task_id.query_id,
+                    worker_id=failure.worker_id,
+                    worker_incarnation_id=failure.worker_incarnation_id,
                     manager_instance_id=self.manager_instance_id,
-                ),
-                # Control failures happen inside an active drain.  Reconcile
-                # them before reservation completions already in that queue.
-                priority=True,
+                    error=failure,
+                )
             )
-            schedulers.append(scheduler)
-
-        handles: list[Any] = []
-        for scheduler in schedulers:
-            try:
-                handles.extend(scheduler.drain())
-            except Exception as exc:
+        except Exception as exc:
+            scheduler = _FTE_SCHEDULERS.get(failure.attempt_id.task_id.query_id)
+            if scheduler is not None and scheduler.is_owned_by_manager_instance(self.manager_instance_id):
                 scheduler.fail(f"FTE worker failure handling failed: {exc}")
-        return handles
+            return request_fte_pending_task_drain()
 
     def _handles_for_marked_fte_worker_failed(
         self,
@@ -120,9 +96,6 @@ class FteWorkerEventHandlingMixin:
         return handles
 
     def _handles_for_worker_failed_event(self, event: WorkerFailed) -> list[Any]:
-        with _FTE_REGISTRY_LOCK:
-            if str(event.query_id) in _FTE_CLOSING_QUERIES:
-                return []
         handles: list[Any] = []
         try:
             scheduled_by_stage = mark_fte_worker_failed_for_event(event)
@@ -251,6 +224,21 @@ class FteWorkerEventHandlingMixin:
             fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get(fragment_execution_key)
         if fragment_execution is None:
             return []
+        if state in {FteTaskState.CANCELED, FteTaskState.ABORTED}:
+            worker_incarnation = fragment_execution.running_attempt_worker_incarnation(event.attempt_id)
+            scheduler = _FTE_SCHEDULERS.get(query_id)
+            if (
+                worker_incarnation is not None
+                and scheduler is not None
+                and scheduler.worker_failure_is_recorded(
+                    worker_incarnation[0],
+                    worker_incarnation_id=worker_incarnation[1],
+                )
+            ):
+                # Worker quiescence cancels every task on the shared actor.
+                # The globally claimed worker-failure transition owns these
+                # attempts and will reconcile them after the barrier completes.
+                return request_fte_pending_task_drain()
         handles: list[Any] = []
         try:
             scheduled = fragment_execution.handle_task_status(
