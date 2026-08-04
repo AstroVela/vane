@@ -125,9 +125,10 @@ class UDFActorPoolBase:
         )
         actor_options: list[dict[str, Any]] = []
         if normalized_node_ids is None:
-            # Ray Core owns actual actor placement. If a fixed pool does not
-            # fit immediately, handles remain PENDING instead of making the
-            # query-wide reservation a hard admission gate.
+            # Ray Core owns actual actor placement. Query admission proves that
+            # at least one actor of this shape can run on a concrete node; the
+            # remaining fixed-pool handles may stay PENDING instead of turning
+            # full pool multiplicity into a hard admission gate.
             actor_options = [dict(options) for _ in range(concurrency)]
         else:
             from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy

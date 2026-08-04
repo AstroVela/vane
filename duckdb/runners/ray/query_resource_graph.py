@@ -842,18 +842,26 @@ class QueryResourceGraph:
             raise ValueError(f"allocation validation references unknown eligible unit: {unknown[0]}")
         hard_capacity = _hard_resources(allocation.resources)
         for unit in self.units:
-            task_commitment = _hard_resources(unit.per_task)
-            if unit.backend == "ray_task" and unit.resource_unit_id in eligible:
-                exceeded = task_commitment.exceeded_dimensions(hard_capacity)
-                if exceeded:
-                    raise ValueError(
-                        f"unit {unit.resource_unit_id} maximum task exceeds query allocation for {', '.join(exceeded)}"
-                    )
-                if not task_commitment.is_zero() and not any(
-                    task_commitment.fits_within(_hard_resources(node_allocation.resources))
-                    for node_allocation in allocation.node_allocations
-                ):
-                    raise ValueError(f"unit {unit.resource_unit_id} maximum task does not fit any allocated Ray node")
+            if unit.resource_unit_id not in eligible:
+                continue
+            if unit.backend == "ray_task":
+                process_commitment = _hard_resources(unit.per_task)
+                commitment_name = "maximum task"
+            elif unit.backend == "ray_actor":
+                process_commitment = _hard_resources(unit.resident_per_actor)
+                commitment_name = "actor process"
+            else:
+                continue
+            exceeded = process_commitment.exceeded_dimensions(hard_capacity)
+            if exceeded:
+                raise ValueError(
+                    f"unit {unit.resource_unit_id} {commitment_name} exceeds query allocation for {', '.join(exceeded)}"
+                )
+            if not process_commitment.is_zero() and not any(
+                process_commitment.fits_within(_hard_resources(node_allocation.resources))
+                for node_allocation in allocation.node_allocations
+            ):
+                raise ValueError(f"unit {unit.resource_unit_id} {commitment_name} does not fit any allocated Ray node")
 
     def normalized_digest(self) -> str:
         payload = self.to_dict()

@@ -939,7 +939,7 @@ def test_current_phase_allocation_does_not_reserve_a_task_behind_a_barrier():
         graph.validate_allocation(current)
 
 
-def test_runtime_allocation_validation_can_leave_actor_pool_to_ray_core():
+def test_allocation_validation_requires_one_actor_shape_only_in_the_current_phase():
     actor = _unit(
         "resource:fragment-1:actor",
         backend="ray_actor",
@@ -956,7 +956,27 @@ def test_runtime_allocation_validation_can_leave_actor_pool_to_ray_core():
         generation=2,
     )
 
-    graph.validate_allocation(pending)
+    with pytest.raises(ValueError, match="actor process exceeds query allocation"):
+        graph.validate_allocation(pending)
+
+    fragmented = QueryAllocation(
+        resources=_resources(cpu=1, heap_bytes=300),
+        node_allocations=(
+            NodeResourceAllocation(
+                node_id="cpu-only",
+                resources=_resources(cpu=1, heap_bytes=0),
+            ),
+            NodeResourceAllocation(
+                node_id="memory-only",
+                resources=_resources(cpu=0, heap_bytes=300),
+            ),
+        ),
+        generation=2,
+    )
+    with pytest.raises(ValueError, match="actor process does not fit any allocated Ray node"):
+        graph.validate_allocation(fragmented)
+
+    graph.validate_allocation(pending, eligible_unit_ids=())
 
 
 def test_query_allocation_round_trip_requires_exact_per_node_sum():

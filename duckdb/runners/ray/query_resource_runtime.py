@@ -26,9 +26,10 @@ def register_query_resource_graph(
 ) -> RayQueryResourceManager:
     """Validate and atomically publish the only resource manager for a query."""
 
-    # Fixed Ray actor pools are submitted to Ray Core and may remain pending;
-    # their process resources are soft phase usage, not placement admission.
-    # Ray tasks still require one concrete runnable bundle in the allocation.
+    # Registration proves that one concrete node can run every distinct Ray
+    # task/actor shape in the current phase. Fixed actor-pool multiplicity is
+    # still elastic: all handles may be submitted to Ray Core and remain
+    # pending, while their process resources are charged as soft phase usage.
     if debt_neutral_only and not admission_open:
         raise ValueError("debt-neutral admission requires admission_open")
     graph.validate_allocation(

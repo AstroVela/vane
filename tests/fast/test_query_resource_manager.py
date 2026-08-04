@@ -685,10 +685,18 @@ def test_persistent_soft_actor_debt_warns_once_after_ray_data_delay(monkeypatch,
         terminal_unit_ids=(actor.resource_unit_id,),
     )
     allocation = _allocation(
-        _r(cpu=0.5, gpu=0.5, heap=50, store=200),
+        _r(cpu=1, gpu=1, heap=100, store=200),
     )
     manager = RayQueryResourceManager(graph, allocation)
     manager.set_submitted_actor_slots(actor.resource_unit_id, {0})
+    manager.update_allocation(
+        _allocation(
+            _r(cpu=0.5, gpu=0.5, heap=50, store=200),
+            generation=2,
+        ),
+        admission_open=True,
+        debt_neutral_only=True,
+    )
     clock = [100.0]
     monkeypatch.setattr(manager_module.time, "monotonic", lambda: clock[0])
 
@@ -826,12 +834,20 @@ def test_actor_process_soft_debt_does_not_recharge_existing_actor_invocations():
         terminal_unit_ids=(actor.resource_unit_id,),
     )
     allocation = _allocation(
-        _r(cpu=0.5, gpu=0.5, heap=50, store=100),
+        _r(cpu=1, gpu=1, heap=100, store=100),
     )
     manager = RayQueryResourceManager(graph, allocation)
     manager.set_submitted_actor_slots(actor.resource_unit_id, {0})
     manager.set_ready_actor_slots(actor.resource_unit_id, {0: "node-a"})
     manager.update_unit_state(actor.resource_unit_id, runnable=True)
+    manager.update_allocation(
+        _allocation(
+            _r(cpu=0.5, gpu=0.5, heap=50, store=100),
+            generation=2,
+        ),
+        admission_open=True,
+        debt_neutral_only=True,
+    )
 
     first = manager.try_acquire_task(_task(actor.resource_unit_id, 0))
     second = manager.try_acquire_task(_task(actor.resource_unit_id, 1))
