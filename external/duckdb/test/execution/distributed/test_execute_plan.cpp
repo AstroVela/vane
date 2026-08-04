@@ -75,13 +75,13 @@ TEST_CASE("Pipeline produce_tasks: basic pipeline (scan->proj->filter)", "[distr
 	    empty_plan->Make<duckdb::PhysicalDummyScan>(std::vector<duckdb::LogicalType> {duckdb::LogicalType::BIGINT}, 1);
 	empty_plan->SetRoot(dummy);
 
-	SchemaRef scan_schema = std::make_shared<LogicalType>(LogicalType::BIGINT);
+	SchemaRef scan_schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::BIGINT});
 	std::vector<ScanTaskDescriptor> scan_tasks;
 	auto scan_impl = std::make_shared<ScanSourceNode>(PipelineNodeContext(0, "", 1, "scan"), empty_plan, scan_tasks,
 	                                                  scan_schema, DuckDBExecutionConfigRef(), false);
 	ExpressionRef proj_expr = std::make_shared<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(42));
 	std::vector<std::string> proj_names;
-	SchemaRef proj_schema = std::make_shared<LogicalType>(LogicalType::INTEGER);
+	SchemaRef proj_schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::INTEGER});
 	auto proj_impl =
 	    std::make_shared<ProjectionNode>(2, scan_impl, std::vector<ExpressionRef> {proj_expr}, proj_names, proj_schema);
 	ExpressionRef pred_expr = std::make_shared<duckdb::BoundConstantExpression>(duckdb::Value::BOOLEAN(true));
@@ -115,13 +115,13 @@ TEST_CASE("Pipeline produce_tasks yields a task with a printable plan", "[distri
 	    empty_plan->Make<duckdb::PhysicalDummyScan>(std::vector<duckdb::LogicalType> {duckdb::LogicalType::BIGINT}, 1);
 	empty_plan->SetRoot(dummy);
 
-	SchemaRef scan_schema = std::make_shared<LogicalType>(LogicalType::BIGINT);
+	SchemaRef scan_schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::BIGINT});
 	std::vector<ScanTaskDescriptor> scan_tasks;
 	auto scan_impl = std::make_shared<ScanSourceNode>(PipelineNodeContext(0, "", 1, "scan"), empty_plan, scan_tasks,
 	                                                  scan_schema, DuckDBExecutionConfigRef(), false);
 	ExpressionRef proj_expr = std::make_shared<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(42));
 	std::vector<std::string> proj_names;
-	SchemaRef proj_schema = std::make_shared<LogicalType>(LogicalType::INTEGER);
+	SchemaRef proj_schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::INTEGER});
 	auto proj_impl =
 	    std::make_shared<ProjectionNode>(2, scan_impl, std::vector<ExpressionRef> {proj_expr}, proj_names, proj_schema);
 	ExpressionRef pred_expr = std::make_shared<duckdb::BoundConstantExpression>(duckdb::Value::BOOLEAN(true));

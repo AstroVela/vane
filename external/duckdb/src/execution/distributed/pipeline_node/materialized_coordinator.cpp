@@ -21,21 +21,11 @@ static std::string MakeCoordinatorExchangeId(const PipelineNodeContext &context)
 }
 
 static DuckDBResult<vector<LogicalType>> ResolveSchemaTypes(const SchemaRef &schema) {
-	vector<LogicalType> types;
 	if (!schema) {
 		return DuckDBResult<vector<LogicalType>>::err(
 		    DuckDBError::invalid_state_error("materialized coordinator requires an output schema"));
 	}
-	if (schema->id() == duckdb::LogicalTypeId::STRUCT) {
-		const auto &children = duckdb::StructType::GetChildTypes(*schema);
-		types.reserve(children.size());
-		for (const auto &child : children) {
-			types.push_back(child.second);
-		}
-	} else {
-		types.push_back(*schema);
-	}
-	return DuckDBResult<vector<LogicalType>>::ok(std::move(types));
+	return DuckDBResult<vector<LogicalType>>::ok(GetSchemaTypes(schema));
 }
 
 static vector<std::string> CollectCoordinatorSourceNodes(const std::vector<ExchangeSourceHandle> &handles) {

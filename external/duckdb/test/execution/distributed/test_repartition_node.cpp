@@ -13,7 +13,7 @@ using namespace duckdb;
 using namespace duckdb::distributed;
 
 TEST_CASE("RepartitionNode: basic creation and properties (unittest)", "[distributed]") {
-	SchemaRef schema = std::make_shared<LogicalType>(LogicalType::INTEGER);
+	SchemaRef schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::INTEGER});
 	auto proj_impl = std::make_shared<ProjectionNode>(1, nullptr, std::vector<ExpressionRef> {},
 	                                                  std::vector<std::string> {}, schema);
 	auto child = std::make_shared<DistributedPipelineNode>(proj_impl);

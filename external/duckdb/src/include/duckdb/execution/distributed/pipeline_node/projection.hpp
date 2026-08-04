@@ -73,23 +73,6 @@ public:
 				    }
 			    }
 
-			    auto schema_types = [&](const SchemaRef &schema) -> duckdb::vector<duckdb::LogicalType> {
-				    duckdb::vector<duckdb::LogicalType> types;
-				    if (!schema) {
-					    return types;
-				    }
-				    if (schema->id() == duckdb::LogicalTypeId::STRUCT) {
-					    const auto &children = duckdb::StructType::GetChildTypes(*schema);
-					    types.reserve(children.size());
-					    for (const auto &child : children) {
-						    types.push_back(child.second);
-					    }
-				    } else {
-					    types.push_back(*schema);
-				    }
-				    return types;
-			    };
-
 			    std::function<void(duckdb::Expression &, const duckdb::vector<duckdb::LogicalType> &)> fix_ref_types;
 			    fix_ref_types = [&](duckdb::Expression &expr,
 			                        const duckdb::vector<duckdb::LogicalType> &types) -> void {
@@ -128,7 +111,7 @@ public:
 			    // Build select_list and output types from projection expressions
 			    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
 			    duckdb::vector<duckdb::LogicalType> out_types;
-			    auto expected_types = schema_types(schema);
+			    auto expected_types = duckdb::distributed::GetSchemaTypes(schema);
 			    idx_t expected_count = 0;
 			    for (auto &expr_ref : projection) {
 				    if (expr_ref) {
