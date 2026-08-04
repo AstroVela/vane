@@ -61,6 +61,21 @@ _MODEL_INPUT_TOKEN_LIMITS: dict[str, int] = {
 }
 _DEFAULT_INPUT_TOKEN_LIMIT = 8192
 _OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+_OPENAI_OFFICIAL_API_HOSTS = frozenset(
+    {
+        "ae.api.openai.com",
+        "api.openai.com",
+        "au.api.openai.com",
+        "ca.api.openai.com",
+        "eu.api.openai.com",
+        "gb.api.openai.com",
+        "in.api.openai.com",
+        "jp.api.openai.com",
+        "kr.api.openai.com",
+        "sg.api.openai.com",
+        "us.api.openai.com",
+    }
+)
 
 _EMBED_CAPABILITY_ERROR_PARAMS = frozenset({"model", "dimensions", "encoding_format"})
 _EMBED_CAPABILITY_ERROR_CODES = frozenset(
@@ -121,7 +136,7 @@ def _uses_official_openai_endpoint(base_url: Any) -> bool:
     return (
         parsed.scheme.casefold() == "https"
         and parsed.hostname is not None
-        and parsed.hostname.casefold() == "api.openai.com"
+        and parsed.hostname.casefold() in _OPENAI_OFFICIAL_API_HOSTS
         and port in {None, 443}
         and parsed.path.rstrip("/") == "/v1"
         and not parsed.query

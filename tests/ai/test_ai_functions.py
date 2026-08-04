@@ -2484,6 +2484,36 @@ def test_openai_chat_request_uses_model_and_endpoint_capability(model, official_
     assert options == {expected_name: 11}
 
 
+@pytest.mark.parametrize(
+    ("base_url", "expected_name"),
+    [
+        ("https://api.openai.com/v1", "max_completion_tokens"),
+        ("https://us.api.openai.com/v1", "max_completion_tokens"),
+        ("https://eu.api.openai.com/v1", "max_completion_tokens"),
+        ("https://au.api.openai.com/v1", "max_completion_tokens"),
+        ("https://ca.api.openai.com/v1", "max_completion_tokens"),
+        ("https://jp.api.openai.com/v1", "max_completion_tokens"),
+        ("https://in.api.openai.com/v1", "max_completion_tokens"),
+        ("https://sg.api.openai.com/v1", "max_completion_tokens"),
+        ("https://kr.api.openai.com/v1", "max_completion_tokens"),
+        ("https://gb.api.openai.com/v1", "max_completion_tokens"),
+        ("https://ae.api.openai.com/v1", "max_completion_tokens"),
+        ("https://compatible.example.test/v1", "max_tokens"),
+        ("https://unknown.api.openai.com/v1", "max_tokens"),
+    ],
+)
+def test_openai_chat_token_limit_mapping_follows_documented_endpoint(base_url, expected_name):
+    from vane.ai.providers.openai import OpenAIPrompter, _uses_official_openai_endpoint
+
+    prompter = OpenAIPrompter.__new__(OpenAIPrompter)
+    prompter._model = "o3"
+    prompter._official_openai_endpoint = _uses_official_openai_endpoint(base_url)
+    prompter._options = {"max_output_tokens": 11}
+    prompter._return_format = None
+
+    assert prompter._chat_completions_options() == {expected_name: 11}
+
+
 def test_anthropic_request_mapping_preserves_text_image_order():
     import asyncio
     from types import SimpleNamespace
