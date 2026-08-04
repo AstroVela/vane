@@ -2383,6 +2383,31 @@ def _mark_fte_worker_failed(
             failed_handle._fte_healthy = False
             failed_handles[failed_worker_id] = failed_handle
 
+    def _retire_captured_handle_locked(
+        failed_worker_id: str,
+        failed_handle: RayWorkerActorHandle,
+    ) -> bool:
+        if _FTE_WORKER_HANDLES.get(failed_worker_id) is not failed_handle:
+            return False
+        if (
+            normalized_manager_instance_id is not None
+            and str(getattr(failed_handle, "manager_instance_id", "")) != normalized_manager_instance_id
+        ):
+            return False
+        failed_handle._fte_healthy = False
+        retire_from_manager = getattr(failed_handle, "_retire_from_manager_for_failure", None)
+        if callable(retire_from_manager):
+            failure_recovery_owns_shutdown = bool(retire_from_manager())
+        else:
+            failure_recovery_owns_shutdown = failed_worker_id != worker_id or not getattr(
+                failed_handle,
+                "_worker_shutdown_started",
+                False,
+            )
+        failed_handle._fte_failure_retirement_completed = True
+        _FTE_WORKER_HANDLES.pop(failed_worker_id, None)
+        return failure_recovery_owns_shutdown
+
     # Owner cleanup can race while the worker barrier is in flight. Preserve
     # every affected running partition's placement requirements before that
     # cleanup so losing the owner entry cannot silently make the retry fatal.
@@ -2397,6 +2422,7 @@ def _mark_fte_worker_failed(
     affected_query_ids = _query_ids_owned_by_fte_workers(failed_worker_ids)
     if query_id_filter is not None:
         affected_query_ids.add(query_id_filter)
+    handles_to_kill: list[RayWorkerActorHandle] = []
     for failed_worker_id, failed_handle in failed_handles.items():
         if primary_worker_process_terminated and failed_worker_id == worker_id:
             # The original RPC observed this actor's terminal death. Do not
@@ -2412,12 +2438,23 @@ def _mark_fte_worker_failed(
             if _worker_actor_death_confirms_quiescence(exc):
                 continue
             affected_query_ids.update(_query_ids_owned_by_fte_workers(failed_worker_ids))
-            _fail_queries_after_worker_quiescence_error(affected_query_ids, exc)
+            try:
+                _fail_queries_after_worker_quiescence_error(affected_query_ids, exc)
+            finally:
+                with _FTE_REGISTRY_LOCK:
+                    for captured_worker_id in sorted(failed_handles):
+                        handle_to_retire = failed_handles[captured_worker_id]
+                        if _retire_captured_handle_locked(captured_worker_id, handle_to_retire):
+                            handles_to_kill.append(handle_to_retire)
+                for handle in handles_to_kill:
+                    try:
+                        ray.kill(handle.actor_handle)
+                    except Exception:
+                        pass
             raise RuntimeError(
                 f"failed to quiesce FTE worker {failed_worker_id} before retry: {_safe_failure_message(exc)}"
             ) from exc
 
-    handles_to_kill: list[RayWorkerActorHandle] = []
     pending_worker_reservation_futures_to_cancel: list[FteWorkerReservationFuture] = []
     retryable_by_owner_key: dict[tuple[str, str, int], bool] = {}
     failed_owner_items: list[
@@ -2429,29 +2466,10 @@ def _mark_fte_worker_failed(
     ] = []
     try:
         with _FTE_REGISTRY_LOCK:
-            for failed_worker_id in sorted(failed_worker_ids):
-                failed_handle = _FTE_WORKER_HANDLES.get(failed_worker_id)
-                if failed_handle is None or failed_handle is not failed_handles.get(failed_worker_id):
-                    continue
-                failed_handle_manager_instance_id = str(getattr(failed_handle, "manager_instance_id", ""))
-                if normalized_manager_instance_id is None:
-                    normalized_manager_instance_id = failed_handle_manager_instance_id
-                elif failed_handle_manager_instance_id != normalized_manager_instance_id:
-                    continue
-                failed_handle._fte_healthy = False
-                retire_from_manager = getattr(failed_handle, "_retire_from_manager_for_failure", None)
-                if callable(retire_from_manager):
-                    failure_recovery_owns_shutdown = bool(retire_from_manager())
-                else:
-                    failure_recovery_owns_shutdown = failed_worker_id != worker_id or not getattr(
-                        failed_handle,
-                        "_worker_shutdown_started",
-                        False,
-                    )
-                failed_handle._fte_failure_retirement_completed = True
-                _FTE_WORKER_HANDLES.pop(failed_worker_id, None)
-                if failure_recovery_owns_shutdown:
-                    handles_to_kill.append(failed_handle)
+            for failed_worker_id in sorted(failed_handles):
+                captured_handle = failed_handles[failed_worker_id]
+                if _retire_captured_handle_locked(failed_worker_id, captured_handle):
+                    handles_to_kill.append(captured_handle)
             for owner_key, owner in list(_FTE_PARTITION_OWNERS.items()):
                 if query_id_filter is not None and owner_key[0] != query_id_filter:
                     continue

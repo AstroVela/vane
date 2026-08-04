@@ -8457,6 +8457,8 @@ def test_fte_worker_failure_without_confirmed_quiescence_fails_closed(monkeypatc
     actor0 = _FakeActor()
     actor0.prepare_shutdown = _FailingPrepare()
     actor1 = _FakeActor()
+    kill_calls = []
+    monkeypatch.setattr(worker_handle_mod.ray, "kill", lambda actor: kill_calls.append(actor))
     handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-0")
     handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-1")
     task = _FakeTask(
@@ -8504,7 +8506,8 @@ def test_fte_worker_failure_without_confirmed_quiescence_fails_closed(monkeypatc
     scheduler = worker_handle_mod._FTE_SCHEDULERS.get("query-copy-quiescence-failed")
     assert scheduler is not None
     assert scheduler.stats().state == "FAILED"
-    assert "worker-0" in worker_handle_mod._FTE_WORKER_HANDLES
+    assert "worker-0" not in worker_handle_mod._FTE_WORKER_HANDLES
+    assert kill_calls == [actor0]
     assert stage.partitions[0].running_attempts == {}
 
 
