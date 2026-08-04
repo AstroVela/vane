@@ -2371,7 +2371,10 @@ def test_fte_fragment_without_native_heap_requirement_omits_request_memory():
     )
     partition = stage.add_partition(0)
 
-    scheduled = partition.start_attempt()
+    scheduled = partition.start_attempt(
+        worker_id="worker-a",
+        worker_incarnation_id="incarnation-worker-a",
+    )
 
     assert partition.memory_requirement_bytes is None
     assert "memory_requirement_bytes" not in scheduled.request
