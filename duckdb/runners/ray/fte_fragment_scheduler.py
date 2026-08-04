@@ -2438,7 +2438,14 @@ def _mark_fte_worker_failed(
                     continue
                 _FTE_WORKER_HANDLES.pop(failed_worker_id, None)
                 failed_handle._fte_healthy = False
-                if failed_worker_id != worker_id:
+                # A manager-driven shutdown owns the primary worker's later
+                # finish phase. Failure recovery has no such owner, so release
+                # the successfully quiesced actor's Ray resources here.
+                if failed_worker_id != worker_id or not getattr(
+                    failed_handle,
+                    "_worker_shutdown_started",
+                    False,
+                ):
                     handles_to_kill.append(failed_handle)
         for owner_key, owner in list(_FTE_PARTITION_OWNERS.items()):
             if query_id_filter is not None and owner_key[0] != query_id_filter:

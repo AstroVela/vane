@@ -8243,7 +8243,7 @@ def test_fte_worker_failure_replays_descriptor_on_new_owner(monkeypatch):
     assert retry_request["fragment_plan"] is None
     assert retry_request["initial_splits"]["7"][0]["data"] == b"a"
     assert actor0.shutdown_calls == ["prepare"]
-    assert kill_calls == []
+    assert kill_calls == [actor0]
     assert "worker-0" not in worker_handle_mod._FTE_WORKER_HANDLES
     stats = handle1.fte_registry_stats()["event_schedulers"]["query-fte-worker-lost"]
     assert stats["event_counts"] == {
@@ -8251,6 +8251,38 @@ def test_fte_worker_failure_replays_descriptor_on_new_owner(monkeypatch):
         "WorkerReservationCompleted": 2,
         "WorkerFailed": 1,
     }
+
+
+def test_manager_shutdown_defers_primary_actor_kill_until_finish(monkeypatch):
+    monkeypatch.setattr(
+        RayWorkerActorHandle,
+        "_fte_task_handle_cls",
+        staticmethod(lambda: _FakeFteTaskHandle),
+    )
+    actor0 = _FakeActor()
+    actor1 = _FakeActor()
+    kill_calls = []
+    monkeypatch.setattr(worker_handle_mod.ray, "kill", lambda actor: kill_calls.append(actor))
+    handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-0")
+    RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-1")
+    task = _FakeTask(
+        name="copy-task",
+        context={
+            "query_id": "query-manager-worker-shutdown",
+            "node_id": "copy",
+            "copy_output_base": "s3://bucket/output",
+            "copy_output_run_id": "run-manager-shutdown",
+        },
+        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        plan={"plan": "copy-template"},
+    )
+    handle0.submit_tasks([task])
+
+    handle0.prepare_shutdown()
+
+    assert actor0.shutdown_calls == ["prepare", "prepare"]
+    assert [call for call in actor1.fte_calls if call[0] == "create"]
+    assert kill_calls == []
 
 
 def test_fte_worker_failure_waits_for_worker_quiescence_before_retry(monkeypatch):
@@ -8270,6 +8302,8 @@ def test_fte_worker_failure_waits_for_worker_quiescence_before_retry(monkeypatch
     actor0 = _FakeActor()
     actor0.prepare_shutdown = _DeferredPrepare()
     actor1 = _FakeActor()
+    kill_calls = []
+    monkeypatch.setattr(worker_handle_mod.ray, "kill", lambda actor: kill_calls.append(actor))
     handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-0")
     handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-1")
     task = _FakeTask(
@@ -8299,6 +8333,7 @@ def test_fte_worker_failure_waits_for_worker_quiescence_before_retry(monkeypatch
 
     assert failure_thread.is_alive()
     assert [call for call in actor1.fte_calls if call[0] == "create"] == []
+    assert kill_calls == []
     stage = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[("query-copy-worker-lost", "query-copy-worker-lost:node:copy")]
     assert stage.partitions[0].running_attempt.worker_id == "worker-0"
     with worker_handle_mod._FTE_REGISTRY_LOCK:
@@ -8316,6 +8351,7 @@ def test_fte_worker_failure_waits_for_worker_quiescence_before_retry(monkeypatch
     assert len(retries) == 1
     assert retries[0].worker_handle is handle1
     assert [call for call in actor1.fte_calls if call[0] == "create"]
+    assert kill_calls == [actor0]
 
 
 def test_fte_worker_failure_without_confirmed_quiescence_fails_closed(monkeypatch):
