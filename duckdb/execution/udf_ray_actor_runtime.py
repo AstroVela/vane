@@ -113,7 +113,7 @@ def _actor_class(
             self._payload: dict[str, Any] | None = None
             self.executor: RuntimeUDFExecutor | None = None  # lazy init on first streaming submission
 
-        def init_payload(self, payload: dict[str, Any]) -> None:
+        def init_payload(self, payload: dict[str, Any]) -> str:
             """Inject payload after construction to avoid Ray object-store GC issues."""
             self._payload = payload
             _actor_debug_log("init_payload", self._payload)
@@ -128,6 +128,12 @@ def _actor_class(
                 if _eager_actor_warm_up_enabled(self._payload):
                     executor.warm_up()
                 _actor_debug_log("executor_init_done", self._payload, path="init_payload")
+            import ray
+
+            node_id = str(ray.get_runtime_context().get_node_id() or "").strip()
+            if not node_id:
+                raise RuntimeError("Ray actor runtime did not expose node_id after initialization")
+            return node_id
 
         def _ensure_executor(self, effective_payload: dict[str, Any]) -> RuntimeUDFExecutor:
             executor = self.executor

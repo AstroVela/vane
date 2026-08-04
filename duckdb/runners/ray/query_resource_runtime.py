@@ -18,17 +18,27 @@ def register_query_resource_graph(
     graph: QueryResourceGraph,
     allocation: QueryAllocation,
     *,
+    admission_open: bool = True,
     reservation_ratio: float = 0.5,
     on_change: Callable[[], None] | None = None,
+    on_eligible_units_change: Callable[[tuple[str, ...]], None] | None = None,
 ) -> RayQueryResourceManager:
     """Validate and atomically publish the only resource manager for a query."""
 
-    graph.validate_allocation(allocation)
+    # Fixed Ray actor pools are submitted to Ray Core and may remain pending;
+    # their process resources are soft phase usage, not placement admission.
+    # Ray tasks still require one concrete runnable bundle in the allocation.
+    graph.validate_allocation(
+        allocation,
+        eligible_unit_ids=(graph.eligible_resource_unit_ids(set()) if admission_open else ()),
+    )
     manager = RayQueryResourceManager(
         graph,
         allocation,
+        admission_open=admission_open,
         reservation_ratio=reservation_ratio,
         on_change=on_change,
+        on_eligible_units_change=on_eligible_units_change,
     )
     query_id = graph.query_id
     with _LOCK:
@@ -58,6 +68,16 @@ def query_resource_manager_snapshot(query_id: str) -> dict[str, Any]:
     return {} if manager is None else manager.snapshot()
 
 
+def mark_materialization_barrier_completed(query_id: str, physical_node_id: str) -> bool:
+    """Advance one driver-local query phase from a native barrier event."""
+
+    query_key = str(query_id or "").strip()
+    node_key = str(physical_node_id or "").strip()
+    if not query_key or not node_key:
+        raise ValueError("materialization barrier completion requires query_id and physical_node_id")
+    return get_query_resource_manager(query_key).mark_materialization_barrier_completed_for_node(node_key)
+
+
 def release_query_resource_manager(query_id: str, *, reason: str) -> dict[str, Any]:
     query_key = str(query_id or "").strip()
     if not query_key:
@@ -84,6 +104,7 @@ def clear_query_resource_managers() -> None:
 __all__ = [
     "clear_query_resource_managers",
     "get_query_resource_manager",
+    "mark_materialization_barrier_completed",
     "query_resource_manager_snapshot",
     "register_query_resource_graph",
     "release_query_resource_manager",

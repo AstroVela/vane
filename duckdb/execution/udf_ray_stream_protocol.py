@@ -152,7 +152,7 @@ def iter_bounded_stream_blocks(
     table: pa.Table,
     payload: dict[str, Any],
 ) -> Iterator[pa.Table]:
-    """Split one producer result under its hard byte and row targets."""
+    """Split one producer result around its soft byte and hard row targets."""
     block = ensure_table(table)
     target_bytes = _output_block_target_bytes(payload)
     size_bytes = max(1, int(estimate_table_bytes(block)))
@@ -160,12 +160,11 @@ def iter_bounded_stream_blocks(
         yield block
         return
     if block.num_rows <= 1:
-        query_id, resource_unit_id, task_lease_id, attempt_id = _stream_identity(payload)
-        raise RuntimeError(
-            "Ray UDF single output row exceeds the pre-publication block target: "
-            f"query={query_id} resource_unit={resource_unit_id} task_lease={task_lease_id} "
-            f"attempt={attempt_id} size_bytes={size_bytes} target_bytes={target_bytes}"
-        )
+        # One row is the smallest publishable Arrow block. Let the query
+        # resource manager account its exact size and use the bounded
+        # full-block liveness escape when it exceeds the soft target.
+        yield block
+        return
 
     offset = 0
     while offset < block.num_rows:
@@ -187,14 +186,9 @@ def iter_bounded_stream_blocks(
 
         if best_block is None:
             single_row = block.slice(offset, 1)
-            single_row_bytes = max(1, int(estimate_table_bytes(single_row)))
-            query_id, resource_unit_id, task_lease_id, attempt_id = _stream_identity(payload)
-            raise RuntimeError(
-                "Ray UDF single output row exceeds the pre-publication block target: "
-                f"query={query_id} resource_unit={resource_unit_id} task_lease={task_lease_id} "
-                f"attempt={attempt_id} row={offset} size_bytes={single_row_bytes} "
-                f"target_bytes={target_bytes}"
-            )
+            yield single_row
+            offset += 1
+            continue
         yield best_block
         offset += best_rows
 

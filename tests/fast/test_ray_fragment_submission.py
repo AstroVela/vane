@@ -423,7 +423,6 @@ def _register_test_query_resource_graph(query_id, fragment_ids, *, max_concurren
                     resources=allocation_resources,
                 ),
             ),
-            actor_placements=(),
             generation=1,
         ),
     )
@@ -7088,7 +7087,6 @@ def test_fte_denied_descriptor_is_not_registered_and_block_is_removed_when_aband
         QueryAllocation(
             resources=ResourceVector(),
             node_allocations=(),
-            actor_placements=(),
             generation=2,
         ),
         admission_open=False,

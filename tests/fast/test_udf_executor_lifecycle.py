@@ -8571,14 +8571,14 @@ def test_subprocess_executor_close_releases_queued_ref_bundle_results():
     assert all(ref._closed for ref in refs)
 
 
-def test_ray_actor_init_has_default_timeout(monkeypatch):
+def test_ray_actor_init_waits_for_ray_core_capacity_without_default_timeout(monkeypatch):
     import duckdb.execution.udf_ray_actor_pool as actor_pool_mod
 
     monkeypatch.delenv("VANE_QUERY_DEADLINE_EPOCH_S", raising=False)
     monkeypatch.delenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", raising=False)
     monkeypatch.delenv("VANE_RAY_ACTOR_INIT_TIMEOUT_S", raising=False)
 
-    assert actor_pool_mod._actor_init_timeout_s() > 0.0
+    assert actor_pool_mod._actor_init_timeout_s() is None
 
 
 def test_subprocess_close_kill_releases_active_local_shm_leases(monkeypatch):

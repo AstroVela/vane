@@ -322,12 +322,13 @@ def test_actor_gpu_reservation_follows_resolved_backend(
             max_restarts=None,
             max_task_retries=None,
         ):
+            self.actor_node_ids = list(actor_node_ids)
             ray_pool_calls.append(
                 {
                     "payload": dict(payload),
                     "concurrency": concurrency,
                     "gpus_per_actor": gpus_per_actor,
-                    "actor_node_ids": list(actor_node_ids),
+                    "actor_node_ids": list(self.actor_node_ids),
                     "ray_options": ray_options,
                     "max_restarts": max_restarts,
                     "max_task_retries": max_task_retries,
@@ -438,12 +439,13 @@ def test_stateless_ray_actor_pool_size_and_gpu_options_follow_physical_payload(m
             actor_node_ids,
             ray_options=None,
         ):
+            self.actor_node_ids = list(actor_node_ids)
             calls.append(
                 {
                     "payload": dict(payload),
                     "concurrency": concurrency,
                     "gpus_per_actor": gpus_per_actor,
-                    "actor_node_ids": list(actor_node_ids),
+                    "actor_node_ids": list(self.actor_node_ids),
                     "ray_options": ray_options,
                 }
             )

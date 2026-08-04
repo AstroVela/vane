@@ -19,13 +19,13 @@ from duckdb.execution.ray_stream_adapter import (
     RayStreamCleanupWait,
     TaskLeaseObjectRefGenerator,
 )
+from duckdb.execution.udf_ray_stream_protocol import validate_stream_block_metadata
 from duckdb.execution.udf_stream_result_collector import (
     UDFStreamResultCollector,
     _OutputLeaseToken,
     _ReadyEvent,
     _StreamRecord,
 )
-from duckdb.execution.udf_ray_stream_protocol import validate_stream_block_metadata
 from duckdb.execution.udf_task_admission import TaskAdmission
 
 _CLEANUP_SUBMISSION_SCOPE = "query:test-cleanup"

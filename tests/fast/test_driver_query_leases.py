@@ -54,11 +54,10 @@ def _graph(query_id: str) -> QueryResourceGraph:
 
 
 def _allocation() -> QueryAllocation:
-    resources = ResourceVector(cpu=1, heap_bytes=101, object_store_bytes=20)
+    resources = ResourceVector(cpu=1, heap_bytes=101, object_store_bytes=40)
     return QueryAllocation(
         resources=resources,
         node_allocations=(NodeResourceAllocation(node_id="node-a", resources=resources),),
-        actor_placements=(),
         generation=1,
     )
 
@@ -288,6 +287,7 @@ def test_late_output_controls_transfer_to_fenced_query_teardown():
         runner_cls, runner = _runner(asyncio.get_running_loop())
         manager = register_query_resource_graph(graph, _allocation())
         manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
+        manager.set_external_consumer_waiting(True)
         task_request = _task_request(
             runner,
             query_id,
@@ -354,7 +354,7 @@ def test_late_output_controls_transfer_to_fenced_query_teardown():
     asyncio.run(scenario())
 
 
-def test_driver_resource_change_evaluates_only_the_selected_task_waiter():
+def test_driver_resource_change_batches_until_the_first_blocked_waiter():
     async def scenario():
         query_id = "query-single-admission-pump"
         graph = _graph(query_id)
@@ -393,7 +393,10 @@ def test_driver_resource_change_evaluates_only_the_selected_task_waiter():
             active["lease"]["lease_id"],
             active["lease"]["attempt_id"],
         )
-        assert evaluated_task_ids == [f"task:pending:{index}" for index in range(6)]
+        assert evaluated_task_ids == [
+            *(f"task:pending:{index}" for index in range(6)),
+            *(f"task:pending:{index}" for index in range(1, 6)),
+        ]
         done, _ = await asyncio.wait(
             pending_tasks,
             timeout=1,
@@ -485,7 +488,7 @@ def test_driver_pending_task_lease_can_be_cancelled_without_a_polling_wakeup():
         assert not pending.done()
         waiting_unit = manager.snapshot()["units"][graph.units[0].resource_unit_id]
         assert waiting_unit["pending_task_count"] == 1
-        assert waiting_unit["queued_input_bytes"] == 1
+        assert waiting_unit["queued_input_bytes"] == 0
 
         cancelled = await runner_cls.cancel_query_task_lease_request(
             runner,
@@ -1225,7 +1228,7 @@ def test_driver_output_cancel_after_grant_releases_late_lease_and_restores_budge
     asyncio.run(scenario())
 
 
-def test_driver_output_pump_evaluates_each_waiter_once_per_state_transition():
+def test_driver_output_pump_does_not_spin_after_soft_blocking():
     async def scenario():
         query_id = "query-single-output-admission-pump"
         graph = _graph(query_id)
@@ -1284,28 +1287,22 @@ def test_driver_output_pump_evaluates_each_waiter_once_per_state_transition():
         for _ in range(10):
             await asyncio.sleep(0)
 
-        assert len([task for task in output_tasks if task.done()]) == 1
-        await runner_cls.release_query_output_block_lease(
-            runner,
-            owned[1][0]["request_id"],
-            owned[1][1]["lease"]["lease_id"],
-        )
+        assert all(not task.done() for task in output_tasks)
+        expected_evaluations = [f"blocked-output:{index}" for index in range(6)] * 2
+        assert evaluated_block_ids == expected_evaluations
         for _ in range(10):
             await asyncio.sleep(0)
-
-        granted_tasks = [task for task in output_tasks if task.done()]
-        assert len(granted_tasks) == 2
-        assert set(evaluated_block_ids) == {
-            *(f"blocked-output:{index}" for index in range(6)),
-        }
+        assert evaluated_block_ids == expected_evaluations
 
         for request, pending in zip(output_requests, output_tasks):
             if pending.done():
                 continue
-            assert await runner_cls.cancel_query_output_block_lease_request(
+            cancellation = await runner_cls.cancel_query_output_block_lease_request(
                 runner,
                 request,
-            ) == {"cancelled": True, "released": False}
+            )
+            assert cancellation["cancelled"] is True
+            assert isinstance(cancellation["released"], bool)
         results = await asyncio.gather(*output_tasks)
         for request, result in zip(output_requests, results):
             if result["granted"]:
@@ -1316,6 +1313,12 @@ def test_driver_output_pump_evaluates_each_waiter_once_per_state_transition():
                 ) == {"released": True}
             else:
                 assert result["blocked_reason"] == "output_lease_request_cancelled"
+
+        await runner_cls.release_query_output_block_lease(
+            runner,
+            owned[1][0]["request_id"],
+            owned[1][1]["lease"]["lease_id"],
+        )
 
         assert await runner_cls.release_query_task_lease(
             runner,
@@ -2409,6 +2412,11 @@ def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
             assert demand == "demand"
             return allocation
 
+        def query_state(self, registered_query_id, generation):
+            assert registered_query_id == query_id
+            assert generation == allocation.generation
+            return "RUNNING"
+
         def release_query(self, released_query_id, generation):
             released.append((released_query_id, generation))
             return True
@@ -2479,6 +2487,11 @@ def test_query_registration_retains_failed_coordinator_release_for_retry(monkeyp
 
         def register_query(self, _demand):
             return allocation
+
+        def query_state(self, registered_query_id, generation):
+            assert registered_query_id == query_id
+            assert generation == allocation.generation
+            return "RUNNING"
 
         def release_query(self, released_query_id, generation):
             assert released_query_id == query_id
@@ -2813,6 +2826,179 @@ def test_query_resource_signals_are_coalesced_before_event_loop_dispatch():
 
         assert task_pumps == ["query-coalesced"]
         assert output_pumps == ["query-coalesced"]
+
+    asyncio.run(scenario())
+
+
+def test_task_admission_pump_drains_a_bounded_batch_per_event_loop_turn():
+    async def scenario():
+        query_id = "query-task-batch"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_resource_graph(graph, _allocation())
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
+
+        active_request = _task_request(
+            runner,
+            query_id,
+            "request:batch:active",
+            "task:batch:active",
+        )
+        active = await runner_cls.acquire_query_task_lease(
+            runner,
+            active_request,
+        )
+        pending_requests = [
+            _task_request(
+                runner,
+                query_id,
+                f"request:batch:{index}",
+                f"task:batch:{index}",
+            )
+            for index in range(9)
+        ]
+        pending_tasks = [
+            asyncio.create_task(runner_cls.acquire_query_task_lease(runner, request)) for request in pending_requests
+        ]
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not any(task.done() for task in pending_tasks)
+
+        resources = ResourceVector(
+            cpu=10,
+            heap_bytes=1_000,
+            object_store_bytes=200,
+        )
+        manager.update_allocation(
+            QueryAllocation(
+                resources=resources,
+                node_allocations=(
+                    NodeResourceAllocation(
+                        node_id="node-a",
+                        resources=resources,
+                    ),
+                ),
+                generation=2,
+            ),
+            admission_open=True,
+        )
+        runner_cls._run_query_task_admission_pump(runner, query_id)
+
+        assert all(
+            runner._query_task_lease_requests[request["request_id"]]["status"] == "granted"
+            for request in pending_requests
+        )
+        grants = await asyncio.gather(*pending_tasks)
+        assert all(grant["granted"] for grant in grants)
+
+        for request, grant in zip(pending_requests, grants):
+            assert await runner_cls.release_query_task_lease(
+                runner,
+                request["request_id"],
+                grant["lease"]["lease_id"],
+                grant["lease"]["attempt_id"],
+            ) == {"released": True}
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            active_request["request_id"],
+            active["lease"]["lease_id"],
+            active["lease"]["attempt_id"],
+        ) == {"released": True}
+
+    asyncio.run(scenario())
+
+
+def test_output_admission_pump_drains_a_bounded_batch_per_event_loop_turn():
+    async def scenario():
+        query_id = "query-output-batch"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        initial_resources = ResourceVector(
+            cpu=1,
+            heap_bytes=101,
+            object_store_bytes=1,
+        )
+        manager = register_query_resource_graph(
+            graph,
+            QueryAllocation(
+                resources=initial_resources,
+                node_allocations=(
+                    NodeResourceAllocation(
+                        node_id="node-a",
+                        resources=initial_resources,
+                    ),
+                ),
+                generation=1,
+            ),
+        )
+        manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
+        task_request = _task_request(
+            runner,
+            query_id,
+            "request:output-batch:task",
+            "task:output-batch",
+        )
+        task = await runner_cls.acquire_query_task_lease(runner, task_request)
+
+        output_requests = [
+            {
+                "request_id": f"request:output-batch:{index}",
+                "query_id": query_id,
+                "producer_unit_id": graph.units[0].resource_unit_id,
+                "task_lease_id": task["lease"]["lease_id"],
+                "attempt_id": task["lease"]["attempt_id"],
+                "block_id": f"block:output-batch:{index}",
+                "size_bytes": 1,
+            }
+            for index in range(9)
+        ]
+        output_tasks = [
+            asyncio.create_task(runner_cls.acquire_query_output_block_lease(runner, request))
+            for request in output_requests
+        ]
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not any(task.done() for task in output_tasks)
+
+        expanded_resources = ResourceVector(
+            cpu=1,
+            heap_bytes=101,
+            object_store_bytes=100,
+        )
+        manager.update_allocation(
+            QueryAllocation(
+                resources=expanded_resources,
+                node_allocations=(
+                    NodeResourceAllocation(
+                        node_id="node-a",
+                        resources=expanded_resources,
+                    ),
+                ),
+                generation=2,
+            ),
+            admission_open=True,
+        )
+        runner_cls._run_query_output_admission_pump(runner, query_id)
+
+        assert all(
+            runner._query_output_lease_requests[request["request_id"]]["status"] == "granted"
+            for request in output_requests
+        )
+        grants = await asyncio.gather(*output_tasks)
+        assert all(grant["granted"] for grant in grants)
+
+        for request, grant in zip(output_requests, grants):
+            assert await runner_cls.release_query_output_block_lease(
+                runner,
+                request["request_id"],
+                grant["lease"]["lease_id"],
+            ) == {"released": True}
+        assert await runner_cls.release_query_task_lease(
+            runner,
+            task_request["request_id"],
+            task["lease"]["lease_id"],
+            task["lease"]["attempt_id"],
+        ) == {"released": True}
 
     asyncio.run(scenario())
 

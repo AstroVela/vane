@@ -33,6 +33,30 @@ BoundLimitNode CopyBoundLimitNode(const BoundLimitNode &node) {
 	return BoundLimitNode();
 }
 
+bool LimitNode::is_materialization_barrier() const {
+	return ChildHasMultiplePartitions(child_);
+}
+
+std::vector<NodeID> LimitNode::materialized_input_node_ids() const {
+	return is_materialization_barrier() && child_ ? std::vector<NodeID> {child_->node_id()} : std::vector<NodeID> {};
+}
+
+bool StreamingLimitNode::is_materialization_barrier() const {
+	return ChildHasMultiplePartitions(child_);
+}
+
+std::vector<NodeID> StreamingLimitNode::materialized_input_node_ids() const {
+	return is_materialization_barrier() && child_ ? std::vector<NodeID> {child_->node_id()} : std::vector<NodeID> {};
+}
+
+bool LimitPercentNode::is_materialization_barrier() const {
+	return ChildHasMultiplePartitions(child_);
+}
+
+std::vector<NodeID> LimitPercentNode::materialized_input_node_ids() const {
+	return is_materialization_barrier() && child_ ? std::vector<NodeID> {child_->node_id()} : std::vector<NodeID> {};
+}
+
 namespace {
 using PlanBuilder = MaterializedPlanBuilder;
 using PerTaskBuilderFactory = PerTaskMaterializedPlanBuilderFactory;

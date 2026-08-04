@@ -455,17 +455,20 @@ def _validate_fte_output_publication(
     partition_metadatas: list[PartitionMetadata],
     query_task_lease: dict[str, Any],
 ) -> tuple[int, ...]:
-    """Validate all FTE result bytes before the worker publishes any ObjectRef."""
+    """Validate FTE result metadata before the worker publishes ObjectRefs.
+
+    ``target_output_block_bytes`` and ``output_window_bytes`` are pending-output
+    estimates used by query admission. Native execution materializes its
+    result before its exact size is known, so either value may be exceeded (or
+    be zero for a sink). The manager replaces the estimate with these exact
+    bytes after publication and applies soft backpressure to subsequent work.
+    """
     lease_id = str(query_task_lease.get("lease_id") or "").strip()
     query_id = str(query_task_lease.get("query_id") or "").strip()
     resource_unit_id = str(query_task_lease.get("resource_unit_id") or "").strip()
     attempt_id = str(query_task_lease.get("attempt_id") or "").strip()
-    target_bytes = int(query_task_lease.get("target_output_block_bytes") or 0)
-    window_bytes = int(query_task_lease.get("output_window_bytes") or 0)
     if not lease_id or not query_id or not resource_unit_id or not attempt_id:
         raise RuntimeError("FTE output publication requires a complete query task lease identity")
-    if target_bytes <= 0 or window_bytes <= 0:
-        raise RuntimeError("FTE output publication requires positive target_output_block_bytes and output_window_bytes")
 
     normalized_sizes: list[int] = []
     for index, metadata in enumerate(partition_metadatas):
@@ -477,19 +480,7 @@ def _validate_fte_output_publication(
                 f"query={query_id} resource_unit={resource_unit_id} attempt={attempt_id}"
             )
         size_bytes = max(1, raw_size)
-        if size_bytes > target_bytes:
-            raise RuntimeError(
-                f"FTE output block {index} size {size_bytes} exceeds target {target_bytes}: "
-                f"query={query_id} resource_unit={resource_unit_id} task_lease={lease_id} attempt={attempt_id}"
-            )
         normalized_sizes.append(size_bytes)
-
-    total_bytes = sum(normalized_sizes)
-    if total_bytes > window_bytes:
-        raise RuntimeError(
-            f"FTE total output bytes {total_bytes} exceed task window {window_bytes}: "
-            f"query={query_id} resource_unit={resource_unit_id} task_lease={lease_id} attempt={attempt_id}"
-        )
     return tuple(normalized_sizes)
 
 

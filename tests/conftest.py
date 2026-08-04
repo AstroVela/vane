@@ -309,11 +309,17 @@ def _ray_local_cluster():
                 for name, value in env_vars.items():
                     monkeypatch.setenv(name, value)
                 resources = ResourceAndLabelSpec().resolve(is_head=True)
+                object_store_options = ray_test_object_store_options()
+                # Cluster.add_node() substitutes a fixed 150 MiB test default
+                # when this argument is absent. Use the value produced by Ray's
+                # normal node resource resolver so this shared cluster follows
+                # the host/cgroup capacity just like ray.init(address="local").
+                object_store_options.setdefault("object_store_memory", resources.object_store_memory)
                 cluster.add_node(
                     include_dashboard=False,
                     num_cpus=resources.num_cpus,
                     num_gpus=resources.num_gpus,
-                    **ray_test_object_store_options(),
+                    **object_store_options,
                 )
 
         yield ray, cluster.address, env_vars

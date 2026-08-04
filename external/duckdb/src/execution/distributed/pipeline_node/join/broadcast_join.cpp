@@ -113,6 +113,10 @@ std::vector<PipelineNodeRef> BroadcastJoinNode::children() const {
 	return result;
 }
 
+std::vector<NodeID> BroadcastJoinNode::materialized_input_node_ids() const {
+	return broadcaster_ ? std::vector<NodeID> {broadcaster_->node_id()} : std::vector<NodeID> {};
+}
+
 std::vector<std::string> BroadcastJoinNode::multiline_display(bool /*verbose*/) const {
 	std::vector<std::string> res;
 	res.push_back("Broadcast Join");
@@ -433,6 +437,13 @@ SubmittableTaskStream<WorkerTask> BroadcastJoinNode::produce_tasks(PlanExecution
 		exchange->AllRequiredSinksFinished();
 		auto broadcast_handles = exchange->GetSourceHandles();
 		auto source_nodes = CollectSourceNodes(broadcast_handles);
+		auto barrier_result = fte_task_submitter->materialization_barrier_completed(self_shared->context().query_id(),
+		                                                                            self_shared->node_id());
+		if (barrier_result.is_err()) {
+			result_tx_ptr->close();
+			exchange->Close();
+			return DuckDBResult<void>::err(barrier_result.error());
+		}
 
 		while (true) {
 			auto receiver_task = BroadcastJoinNode::PollNextWithWait(*receiver_ptr);

@@ -5,18 +5,11 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-from duckdb.runners.ray.ray_env import build_session_runtime_env_vars
-from duckdb.runners.ray.safe_get import (
-    configured_ray_get_timeout_s,
-    resolve_object_refs_blocking,
-)
-
-_DEFAULT_RAY_ACTOR_INIT_TIMEOUT_S = 60.0
 
 from duckdb.execution.udf_ray_config import (
     MAX_ACTOR_RESTARTS,
@@ -26,6 +19,11 @@ from duckdb.execution.udf_threading import (
     RAY_ACTOR_THREAD_POLICY_ENV,
     ray_actor_thread_env,
     ray_actor_thread_policy,
+)
+from duckdb.runners.ray.ray_env import build_session_runtime_env_vars
+from duckdb.runners.ray.safe_get import (
+    configured_ray_get_timeout_s,
+    resolve_object_refs_blocking,
 )
 
 
@@ -85,7 +83,7 @@ class UDFActorPoolBase:
         payload: dict[str, Any],
         concurrency: int,
         gpus_per_actor: float,
-        actor_node_ids: list[str],
+        actor_node_ids: list[str] | None,
         ray_options: dict[str, Any] | None = None,
         max_restarts: int = MAX_ACTOR_RESTARTS,
         max_task_retries: int = MAX_ACTOR_TASK_RETRIES,
@@ -99,7 +97,7 @@ class UDFActorPoolBase:
         Actor = self._actor_class(max_restarts, max_task_retries)
         options = dict(ray_options or {})
         if "scheduling_strategy" in options:
-            raise ValueError("UDF actor scheduling_strategy is owned by the query coordinator")
+            raise ValueError("UDF actor scheduling_strategy is owned by Vane")
         options["num_cpus"] = self._resolve_actor_num_cpus(payload)
         options["num_gpus"] = gpus_per_actor
         options.pop("memory", None)
@@ -117,13 +115,16 @@ class UDFActorPoolBase:
             actor_node_ids,
             expected_count=concurrency,
         )
-        if normalized_node_ids is None or any(not str(node_id).strip() for node_id in normalized_node_ids):
-            raise ValueError("every UDF actor requires a coordinator-selected Ray node_id")
-        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+        actor_options: list[dict[str, Any]] = []
+        if normalized_node_ids is None:
+            # Ray Core owns actual actor placement. If a fixed pool does not
+            # fit immediately, handles remain PENDING instead of making the
+            # query-wide reservation a hard admission gate.
+            actor_options = [dict(options) for _ in range(concurrency)]
+        else:
+            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-        actor_options = []
-        for node_id in normalized_node_ids:
-            actor_options.append(
+            actor_options = [
                 {
                     **options,
                     "scheduling_strategy": NodeAffinitySchedulingStrategy(
@@ -131,9 +132,10 @@ class UDFActorPoolBase:
                         soft=False,
                     ),
                 }
-            )
+                for node_id in normalized_node_ids
+            ]
         self._owns_actors = True
-        self.actor_node_ids: list[str] | None = normalized_node_ids
+        self.actor_node_ids: list[str] = [""] * concurrency if normalized_node_ids is None else normalized_node_ids
         self._payload = payload
 
         import ray
@@ -161,6 +163,9 @@ class UDFActorPoolBase:
                 ) from creation_error
             raise
         self._confirmed_ready: set[int] = set()
+        self._vane_retired = False
+        self._vane_readiness_futures: list[Any] = []
+        self._vane_init_errors: dict[int, BaseException] = {}
 
     @staticmethod
     def _actor_class(max_restarts: int, max_task_retries: int) -> Any:
@@ -194,6 +199,7 @@ class UDFActorPoolBase:
         payload: dict[str, Any] | None = None,
         actor_node_ids: list[str] | None = None,
         actor_dispatch_indices: list[int] | tuple[int, ...] | set[int] | None = None,
+        actor_init_refs: list[Any] | tuple[Any, ...] | None = None,
     ) -> UDFActorPoolBase:
         _validate_stateful_actor_pool_contract(payload, len(actors))
         if actor_dispatch_indices is None:
@@ -210,10 +216,22 @@ class UDFActorPoolBase:
         if invalid:
             raise ValueError(f"actor_dispatch_indices contains out-of-range indices: {invalid}")
         instance._confirmed_ready = set(parsed_dispatch_indices)
+        instance._vane_retired = False
+        instance._vane_readiness_futures = []
+        instance._vane_init_errors = {}
         instance._payload = payload or {}
         instance._payload_ref = None
-        instance._init_refs = []
-        instance.actor_node_ids = cls._normalize_actor_node_ids(actor_node_ids, expected_count=len(actors))
+        init_refs = [] if actor_init_refs is None else list(actor_init_refs)
+        if init_refs and len(init_refs) != len(actors):
+            raise ValueError("actor_init_refs count must match actor handle count")
+        instance._init_refs = init_refs
+        if actor_node_ids is None:
+            instance.actor_node_ids = [""] * len(actors)
+        else:
+            parsed_node_ids = [str(node_id or "").strip() for node_id in actor_node_ids]
+            if len(parsed_node_ids) != len(actors):
+                raise ValueError("actor node IDs count must match actor handle count")
+            instance.actor_node_ids = parsed_node_ids
         return instance
 
     def shutdown(self, *, kill: bool = False) -> None:
@@ -239,12 +257,13 @@ def apply_actor_node_options(
     actors: UDFActorPoolBase,
     *,
     options: dict[str, Any],
-    normalize_actor_node_ids: Callable[..., list[str] | None],
 ) -> UDFActorPoolBase:
-    normalized_node_ids = normalize_actor_node_ids(
-        options.get("actor_node_ids"),
-        expected_count=len(actors.actors),
-    )
+    raw_node_ids = options.get("actor_node_ids")
+    if not isinstance(raw_node_ids, list | tuple):
+        raise TypeError("actor_node_ids must be a list or tuple")
+    normalized_node_ids = [str(node_id or "").strip() for node_id in raw_node_ids]
+    if len(normalized_node_ids) != len(actors.actors):
+        raise ValueError("actor node IDs count must match actor handle count")
     actors.actor_node_ids = normalized_node_ids
     return actors
 
@@ -264,9 +283,7 @@ def _positive_float_env(name: str, default: float | None = None) -> float | None
 
 
 def _actor_init_timeout_s() -> float | None:
-    return configured_ray_get_timeout_s(
-        _positive_float_env("VANE_RAY_ACTOR_INIT_TIMEOUT_S", _DEFAULT_RAY_ACTOR_INIT_TIMEOUT_S)
-    )
+    return configured_ray_get_timeout_s(_positive_float_env("VANE_RAY_ACTOR_INIT_TIMEOUT_S"))
 
 
 def _is_timeout_error(exc: BaseException) -> bool:
@@ -306,9 +323,12 @@ def _resolve_actor_pool_init_refs(ray: Any, actors_obj: Any) -> None:
     try:
         timeout_s = _actor_init_timeout_s()
         if timeout_s is None:
-            resolve_object_refs_blocking(refs)
+            resolved_node_ids = resolve_object_refs_blocking(refs)
         else:
-            resolve_object_refs_blocking(refs, timeout=timeout_s)
+            resolved_node_ids = resolve_object_refs_blocking(refs, timeout=timeout_s)
+        node_ids = [str(node_id or "").strip() for node_id in resolved_node_ids]
+        if len(node_ids) != len(actors) or any(not node_id for node_id in node_ids):
+            raise RuntimeError("UDF actor initialization did not return one Ray node_id per actor")
     except Exception as exc:
         if _is_timeout_error(exc):
             timeout_desc = "query deadline" if timeout_s is None else f"{timeout_s:.3f}s"
@@ -328,7 +348,85 @@ def _resolve_actor_pool_init_refs(ray: Any, actors_obj: Any) -> None:
                 creation_error=readiness_error,
             ) from exc
         raise readiness_error from exc
+    actors_obj.actor_node_ids = node_ids
     actors_obj._confirmed_ready.update(range(len(actors)))
+
+
+def wait_for_first_actor_pool_ready(actors_obj: UDFActorPoolBase) -> dict[int, str]:
+    """Wait until at least one actor is usable, leaving the rest pending.
+
+    Actor CPU/GPU/declared heap are Ray Core resources.  A pool larger than
+    the currently free cluster capacity therefore starts incrementally: the
+    first successfully initialized actor opens execution while remaining
+    handles stay pending and may join later.
+    """
+
+    refs = list(getattr(actors_obj, "_init_refs", ()))
+    actors = list(getattr(actors_obj, "actors", ()))
+    if len(refs) != len(actors) or not refs or any(ref is None for ref in refs):
+        raise RuntimeError("UDF actor pool has incomplete init readiness refs")
+
+    import ray
+
+    pending = list(refs)
+    actor_index_by_ref = {ref: actor_index for actor_index, ref in enumerate(refs)}
+    timeout_s = _actor_init_timeout_s()
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    failures: list[BaseException] = []
+    try:
+        while pending:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            ready, pending = ray.wait(
+                pending,
+                num_returns=1,
+                timeout=remaining,
+            )
+            if not ready:
+                timeout_desc = "query deadline" if timeout_s is None else f"{timeout_s:.3f}s"
+                raise RuntimeError(
+                    "UDF actor pool initialization timed out "
+                    f"after {timeout_desc} while waiting for its first ready actor"
+                )
+            ready_refs = list(ready)
+            if pending:
+                immediately_ready, pending = ray.wait(
+                    pending,
+                    num_returns=len(pending),
+                    timeout=0,
+                )
+                ready_refs.extend(immediately_ready)
+            ready_nodes: dict[int, str] = {}
+            for ref in ready_refs:
+                actor_index = actor_index_by_ref[ref]
+                try:
+                    node_id = str(resolve_object_refs_blocking(ref) or "").strip()
+                    if not node_id:
+                        raise RuntimeError("UDF actor initialization returned an empty Ray node_id")
+                except BaseException as exc:
+                    failures.append(exc)
+                    continue
+                actors_obj.actor_node_ids[actor_index] = node_id
+                actors_obj._confirmed_ready.add(actor_index)
+                ready_nodes[actor_index] = node_id
+            if ready_nodes:
+                return ready_nodes
+        if failures:
+            raise RuntimeError(
+                "all UDF actors failed during initialization: "
+                + "; ".join(f"{type(exc).__name__}: {exc}" for exc in failures[:3])
+            ) from failures[0]
+        raise RuntimeError("all UDF actors finished initialization without becoming ready")
+    except BaseException as readiness_error:
+        try:
+            _shutdown_owned_actors(ray, actors_obj)
+        except BaseException as cleanup_error:
+            raise _OwnedUDFActorPoolsError(
+                "UDF actor pool initialization failed and actor cleanup also failed: "
+                f"initialization={readiness_error}; cleanup={type(cleanup_error).__name__}: {cleanup_error}",
+                owned_actor_pools=[actors_obj],
+                creation_error=readiness_error,
+            ) from readiness_error
+        raise
 
 
 def ensure_actor_pools_for_plan(
@@ -447,6 +545,42 @@ def ensure_actor_pools_for_nodes(
     )
 
 
+def prepare_actor_pools_for_nodes(
+    udf_nodes: Any,
+    *,
+    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
+    query_driver_handle: Any,
+    query_generation_capability: str,
+    session_config: dict[str, str],
+    set_handles: Callable[[dict[str, Any]], None] | None = None,
+    actor_pool_cls: type[UDFActorPoolBase],
+    is_vane_worker_process: Callable[[], bool],
+    requires_actor_pool_fn: Callable[[dict[str, Any]], bool],
+    normalize_actor_pool_payload: Callable[..., dict[str, Any]],
+    payload_num_gpus: Callable[[dict[str, Any]], float],
+    required_positive_int: Callable[[dict[str, Any], str], int],
+    resolve_actor_num_cpus: Callable[[dict[str, Any]], float],
+    build_udf_executor_options: Callable[..., dict[str, Any]],
+) -> tuple[list[UDFActorPoolBase], dict[str, Any]]:
+    return _create_actor_pools_for_nodes(
+        udf_nodes,
+        actor_node_ids_by_unit=actor_node_ids_by_unit,
+        query_driver_handle=query_driver_handle,
+        query_generation_capability=query_generation_capability,
+        session_config=session_config,
+        set_handles=set_handles,
+        actor_pool_cls=actor_pool_cls,
+        is_vane_worker_process=is_vane_worker_process,
+        requires_actor_pool_fn=requires_actor_pool_fn,
+        normalize_actor_pool_payload=normalize_actor_pool_payload,
+        payload_num_gpus=payload_num_gpus,
+        required_positive_int=required_positive_int,
+        resolve_actor_num_cpus=resolve_actor_num_cpus,
+        build_udf_executor_options=build_udf_executor_options,
+        wait_for_ready=False,
+    )
+
+
 def _create_actor_pools_for_nodes(
     udf_nodes: Any,
     *,
@@ -515,9 +649,10 @@ def _create_actor_pools_for_nodes(
             concurrency = required_positive_int(node, "actor_pool_size")
             _validate_stateful_actor_pool_contract(payload, concurrency)
             assigned_node_ids = tuple(actor_node_ids_by_unit.get(resource_unit_id, ()))
-            if len(assigned_node_ids) != concurrency:
+            if assigned_node_ids and len(assigned_node_ids) != concurrency:
                 raise RuntimeError(
-                    f"Ray actor UDF resource unit {resource_unit_id} requires {concurrency} coordinator placements, "
+                    f"Ray actor UDF resource unit {resource_unit_id} requires either no fixed placement or "
+                    f"{concurrency} explicit placements, "
                     f"got {len(assigned_node_ids)}"
                 )
             cpus = resolve_actor_num_cpus(payload)
@@ -539,20 +674,21 @@ def _create_actor_pools_for_nodes(
                 payload=payload,
                 concurrency=concurrency,
                 gpus_per_actor=gpus,
-                actor_node_ids=list(assigned_node_ids),
+                actor_node_ids=(list(assigned_node_ids) if assigned_node_ids else None),
                 ray_options=ray_options,
                 **fault_tolerance_options,
             )
             created.append(actors_obj)
             if wait_for_ready:
                 _resolve_actor_pool_init_refs(ray, actors_obj)
-            actor_node_ids = list(assigned_node_ids)
-            actor_dispatch_indices = set(range(len(actors_obj.actors)))
+            actor_node_ids = list(actors_obj.actor_node_ids)
+            actor_dispatch_indices = set(actors_obj._confirmed_ready)
             executor_options.update(
                 build_udf_executor_options(
                     actor_handles=list(actors_obj.actors),
                     actor_node_ids=actor_node_ids,
                     actor_dispatch_indices=actor_dispatch_indices,
+                    actor_init_refs=list(actors_obj._init_refs),
                 )
             )
 

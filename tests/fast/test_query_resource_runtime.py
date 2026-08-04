@@ -4,15 +4,18 @@
 import pytest
 
 from duckdb.runners.ray.query_resource_graph import (
+    MaterializationBarrierSpec,
     NodeResourceAllocation,
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
     ResourceVector,
 )
+from duckdb.runners.ray.query_resource_manager import TaskRequest
 from duckdb.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
     get_query_resource_manager,
+    mark_materialization_barrier_completed,
     query_resource_manager_snapshot,
     register_query_resource_graph,
     release_query_resource_manager,
@@ -47,7 +50,6 @@ def _allocation(generation=1):
     return QueryAllocation(
         resources=resources,
         node_allocations=(NodeResourceAllocation(node_id="node-a", resources=resources),),
-        actor_placements=(),
         generation=generation,
     )
 
@@ -87,13 +89,63 @@ def test_runtime_graph_validation_finishes_before_registry_visibility():
     too_small = QueryAllocation(
         resources=too_small_resources,
         node_allocations=(NodeResourceAllocation(node_id="node-a", resources=too_small_resources),),
-        actor_placements=(),
         generation=1,
     )
 
     with pytest.raises(ValueError, match="heap_bytes"):
         register_query_resource_graph(graph, too_small)
     assert query_resource_manager_snapshot("q") == {}
+
+
+def test_runtime_can_publish_pending_query_before_minimum_bundle_is_feasible():
+    unit = ResourceUnitSpec(
+        query_id="q",
+        resource_unit_id="resource:f:udf",
+        physical_node_id="udf",
+        unit_kind="ray_task_udf",
+        backend="ray_task",
+        input_unit_ids=(),
+        per_task=ResourceVector(cpu=1, heap_bytes=100),
+        target_output_block_bytes=10,
+        generator_buffer_blocks=2,
+        max_concurrency=None,
+    )
+    graph = QueryResourceGraph("q", "sha256:pending", (unit,), (unit.resource_unit_id,))
+    pending = QueryAllocation(
+        resources=ResourceVector(),
+        node_allocations=(),
+        generation=1,
+    )
+
+    manager = register_query_resource_graph(
+        graph,
+        pending,
+        admission_open=False,
+    )
+
+    assert manager.snapshot()["allocation_admission_open"] is False
+    manager.update_unit_state(unit.resource_unit_id, runnable=True)
+    blocked = manager.try_acquire_task(
+        TaskRequest(
+            query_id="q",
+            resource_unit_id=unit.resource_unit_id,
+            task_id="task:pending",
+            attempt_id="0",
+            node_id=None,
+        )
+    )
+    assert blocked.blocked_reason == "allocation_pending"
+
+    manager.update_allocation(_allocation(generation=2), admission_open=True)
+    assert manager.try_acquire_task(
+        TaskRequest(
+            query_id="q",
+            resource_unit_id=unit.resource_unit_id,
+            task_id="task:running",
+            attempt_id="0",
+            node_id=None,
+        )
+    ).granted
 
 
 def test_runtime_release_cancels_and_removes_manager_idempotently():
@@ -107,3 +159,70 @@ def test_runtime_release_cancels_and_removes_manager_idempotently():
     assert first["output_lease_count"] == 0
     assert second == {"released": False, "task_lease_count": 0, "output_lease_count": 0}
     assert query_resource_manager_snapshot("q") == {}
+
+
+def test_native_barrier_event_advances_driver_local_execution_phase_once():
+    upstream = ResourceUnitSpec(
+        query_id="q",
+        resource_unit_id="resource:q:upstream",
+        physical_node_id="upstream",
+        unit_kind="native_fragment",
+        backend="ray_worker",
+        input_unit_ids=(),
+        per_task=ResourceVector(),
+        target_output_block_bytes=10,
+        generator_buffer_blocks=2,
+        max_concurrency=4,
+    )
+    materializer = ResourceUnitSpec(
+        query_id="q",
+        resource_unit_id="resource:q:materializer",
+        physical_node_id="materializer",
+        unit_kind="native_fragment",
+        backend="ray_worker",
+        input_unit_ids=(upstream.resource_unit_id,),
+        per_task=ResourceVector(),
+        target_output_block_bytes=10,
+        generator_buffer_blocks=2,
+        max_concurrency=4,
+    )
+    downstream = ResourceUnitSpec(
+        query_id="q",
+        resource_unit_id="resource:q:downstream",
+        physical_node_id="downstream",
+        unit_kind="ray_task_udf",
+        backend="ray_task",
+        input_unit_ids=(materializer.resource_unit_id,),
+        per_task=ResourceVector(cpu=1),
+        target_output_block_bytes=10,
+        generator_buffer_blocks=2,
+        max_concurrency=None,
+    )
+    graph = QueryResourceGraph(
+        "q",
+        "sha256:barrier",
+        (upstream, materializer, downstream),
+        (downstream.resource_unit_id,),
+        (
+            MaterializationBarrierSpec(
+                query_id="q",
+                barrier_id="barrier:q:node:materializer",
+                physical_node_id=materializer.physical_node_id,
+                materializer_unit_id=materializer.resource_unit_id,
+                materialized_input_unit_ids=(upstream.resource_unit_id,),
+            ),
+        ),
+    )
+    manager = register_query_resource_graph(graph, _allocation())
+
+    assert manager.current_eligible_resource_unit_ids() == (
+        upstream.resource_unit_id,
+        materializer.resource_unit_id,
+    )
+    assert mark_materialization_barrier_completed("q", "materializer") is True
+    assert mark_materialization_barrier_completed("q", "materializer") is False
+    assert manager.current_eligible_resource_unit_ids() == (
+        materializer.resource_unit_id,
+        downstream.resource_unit_id,
+    )
+    assert manager.snapshot()["allocation_admission_open"] is False

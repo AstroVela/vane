@@ -31,14 +31,17 @@ def _strict_fields(payload: Mapping[str, Any], expected: tuple[str, ...], type_n
 
 @dataclass(frozen=True)
 class ResourceVector:
-    """Resources owned by a query, resource unit, task, or output window.
+    """Resources requested by work or attributed to a soft query budget.
 
     CPU and GPU are Ray logical resources and may be fractional. Byte resources
-    use integer accounting units. Query allocations treat CPU, GPU, and heap as
-    hard ownership while object-store bytes are a flow-control budget: live
-    ObjectRefs may temporarily exceed it under the bounded liveness policy and
-    Ray Core may spill them. A vector is never allowed to carry negative
-    capacity; subtraction that would underflow is a control-plane bug.
+    use integer accounting units. On a concrete task or actor, CPU, GPU, and
+    declared heap become real Ray Core scheduling requests. On a
+    ``QueryAllocation`` all four fields are soft admission/reservation shares:
+    existing work is not revoked after an overage, and one bounded liveness
+    path may escape a soft block. Object-store bytes additionally describe
+    spillable flow rather than process memory. A vector is never allowed to
+    carry negative capacity; subtraction that would underflow is a
+    control-plane bug.
     """
 
     cpu: float = 0.0
@@ -151,11 +154,12 @@ class ResourceVector:
 class NodeResourceAllocation:
     """One query's allocation attribution on one Ray node.
 
-    CPU, GPU, and heap are enforced when a task or actor is placed on this
-    node. The object-store component contributes to the query-wide soft
-    flow-control budget; per-node object-store debt is observable but is not a
-    separate QRM admission limit. Ray Core remains responsible for node-local
-    spill and OOM protection.
+    QRM uses CPU, GPU, and heap attribution to choose a feasible logical slot
+    before submission; Ray Core remains the physical placement authority and
+    actors are not pinned to these nodes. The object-store component contributes
+    only to the query-wide soft flow-control budget. Per-node debt is
+    observable, while Ray Core remains responsible for node-local spill and OOM
+    protection.
     """
 
     node_id: str
@@ -184,48 +188,6 @@ class NodeResourceAllocation:
         )
 
 
-@dataclass(frozen=True)
-class ActorPlacement:
-    """Coordinator-selected placement for one query-owned Ray actor."""
-
-    resource_unit_id: str
-    actor_index: int
-    node_id: str
-
-    _FIELDS: ClassVar[tuple[str, ...]] = ("resource_unit_id", "actor_index", "node_id")
-
-    def __post_init__(self) -> None:
-        resource_unit_id = str(self.resource_unit_id).strip()
-        node_id = str(self.node_id).strip()
-        actor_index = int(self.actor_index)
-        if not resource_unit_id:
-            raise ValueError("actor placement resource_unit_id must be non-empty")
-        if actor_index < 0:
-            raise ValueError("actor placement actor_index must be >= 0")
-        if not node_id:
-            raise ValueError("actor placement node_id must be non-empty")
-        object.__setattr__(self, "resource_unit_id", resource_unit_id)
-        object.__setattr__(self, "actor_index", actor_index)
-        object.__setattr__(self, "node_id", node_id)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "resource_unit_id": self.resource_unit_id,
-            "actor_index": self.actor_index,
-            "node_id": self.node_id,
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> ActorPlacement:
-        values = dict(payload)
-        _strict_fields(values, cls._FIELDS, cls.__name__)
-        return cls(
-            resource_unit_id=str(values["resource_unit_id"]),
-            actor_index=int(values["actor_index"]),
-            node_id=str(values["node_id"]),
-        )
-
-
 def _resource_vectors_equivalent(left: ResourceVector, right: ResourceVector) -> bool:
     return (
         math.isclose(left.cpu, right.cpu, rel_tol=0.0, abs_tol=1e-9)
@@ -248,13 +210,11 @@ def _hard_resources(resources: ResourceVector) -> ResourceVector:
 class QueryAllocation:
     resources: ResourceVector
     node_allocations: tuple[NodeResourceAllocation, ...]
-    actor_placements: tuple[ActorPlacement, ...]
     generation: int
 
     _FIELDS: ClassVar[tuple[str, ...]] = (
         "resources",
         "node_allocations",
-        "actor_placements",
         "generation",
     )
 
@@ -263,7 +223,6 @@ class QueryAllocation:
         if generation <= 0:
             raise ValueError("generation must be > 0")
         node_allocations = tuple(self.node_allocations)
-        actor_placements = tuple(self.actor_placements)
         node_ids = [allocation.node_id for allocation in node_allocations]
         if len(set(node_ids)) != len(node_ids):
             raise ValueError("query allocation contains duplicate node_id entries")
@@ -272,36 +231,13 @@ class QueryAllocation:
             aggregate = aggregate + node_allocation.resources
         if not _resource_vectors_equivalent(aggregate, self.resources):
             raise ValueError("query allocation resources must equal the sum of node_allocations")
-        placement_keys = [(placement.resource_unit_id, placement.actor_index) for placement in actor_placements]
-        if len(set(placement_keys)) != len(placement_keys):
-            raise ValueError("query allocation contains duplicate actor placements")
-        unknown_nodes = sorted({placement.node_id for placement in actor_placements} - set(node_ids))
-        if unknown_nodes:
-            raise ValueError("actor placement references unallocated node_id: " + ", ".join(unknown_nodes))
         object.__setattr__(self, "generation", generation)
         object.__setattr__(self, "node_allocations", node_allocations)
-        object.__setattr__(self, "actor_placements", actor_placements)
-
-    def resources_for_node(self, node_id: str) -> ResourceVector:
-        node_key = str(node_id)
-        for allocation in self.node_allocations:
-            if allocation.node_id == node_key:
-                return allocation.resources
-        raise KeyError(f"query has no allocation on Ray node {node_key!r}")
-
-    def actor_node_ids_for_unit(self, resource_unit_id: str) -> tuple[str, ...]:
-        unit_key = str(resource_unit_id)
-        placements = sorted(
-            (placement for placement in self.actor_placements if placement.resource_unit_id == unit_key),
-            key=lambda placement: placement.actor_index,
-        )
-        return tuple(placement.node_id for placement in placements)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "resources": self.resources.to_dict(),
             "node_allocations": [allocation.to_dict() for allocation in self.node_allocations],
-            "actor_placements": [placement.to_dict() for placement in self.actor_placements],
             "generation": self.generation,
         }
 
@@ -312,8 +248,66 @@ class QueryAllocation:
         return cls(
             resources=ResourceVector.from_dict(values["resources"]),
             node_allocations=tuple(NodeResourceAllocation.from_dict(item) for item in values["node_allocations"]),
-            actor_placements=tuple(ActorPlacement.from_dict(item) for item in values["actor_placements"]),
             generation=int(values["generation"]),
+        )
+
+
+@dataclass(frozen=True)
+class MaterializationBarrierSpec:
+    """A true distributed boundary inside one physical materializer node.
+
+    Barriers are execution events, not resource-owning operators.  The
+    materializer remains a normal native resource unit so its managed object
+    flow can be accounted without inventing a separate Stage abstraction.
+    Before completion only ``materialized_input_unit_ids`` feed that node;
+    after completion the same node may emit final work from its remaining
+    inputs before downstream execution continues.
+    """
+
+    query_id: str
+    barrier_id: str
+    physical_node_id: str
+    materializer_unit_id: str
+    materialized_input_unit_ids: tuple[str, ...]
+
+    _FIELDS: ClassVar[tuple[str, ...]] = (
+        "query_id",
+        "barrier_id",
+        "physical_node_id",
+        "materializer_unit_id",
+        "materialized_input_unit_ids",
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "query_id", str(self.query_id).strip())
+        object.__setattr__(self, "barrier_id", str(self.barrier_id).strip())
+        object.__setattr__(self, "physical_node_id", str(self.physical_node_id).strip())
+        object.__setattr__(self, "materializer_unit_id", str(self.materializer_unit_id).strip())
+        object.__setattr__(
+            self,
+            "materialized_input_unit_ids",
+            tuple(str(item).strip() for item in self.materialized_input_unit_ids),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "query_id": self.query_id,
+            "barrier_id": self.barrier_id,
+            "physical_node_id": self.physical_node_id,
+            "materializer_unit_id": self.materializer_unit_id,
+            "materialized_input_unit_ids": list(self.materialized_input_unit_ids),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> MaterializationBarrierSpec:
+        values = dict(payload)
+        _strict_fields(values, cls._FIELDS, cls.__name__)
+        return cls(
+            query_id=str(values["query_id"]),
+            barrier_id=str(values["barrier_id"]),
+            physical_node_id=str(values["physical_node_id"]),
+            materializer_unit_id=str(values["materializer_unit_id"]),
+            materialized_input_unit_ids=tuple(str(item) for item in values["materialized_input_unit_ids"]),
         )
 
 
@@ -356,6 +350,23 @@ class ResourceUnitSpec:
         "actor_pool_size",
         "actor_prefetch_depth",
     )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "query_id", str(self.query_id).strip())
+        object.__setattr__(self, "resource_unit_id", str(self.resource_unit_id).strip())
+        object.__setattr__(self, "physical_node_id", str(self.physical_node_id).strip())
+        object.__setattr__(self, "unit_kind", str(self.unit_kind).strip())
+        object.__setattr__(self, "backend", str(self.backend).strip())
+        object.__setattr__(self, "input_unit_ids", tuple(str(item).strip() for item in self.input_unit_ids))
+        object.__setattr__(self, "target_output_block_bytes", int(self.target_output_block_bytes))
+        object.__setattr__(self, "generator_buffer_blocks", int(self.generator_buffer_blocks))
+        object.__setattr__(
+            self,
+            "max_concurrency",
+            None if self.max_concurrency is None else int(self.max_concurrency),
+        )
+        object.__setattr__(self, "actor_pool_size", int(self.actor_pool_size))
+        object.__setattr__(self, "actor_prefetch_depth", int(self.actor_prefetch_depth))
 
     @property
     def output_window_bytes(self) -> int:
@@ -408,11 +419,13 @@ class QueryResourceGraph:
     plan_digest: str
     units: tuple[ResourceUnitSpec, ...]
     terminal_unit_ids: tuple[str, ...]
+    materialization_barriers: tuple[MaterializationBarrierSpec, ...] = ()
 
     _FIELDS: ClassVar[tuple[str, ...]] = (
         "query_id",
         "plan_digest",
         "units",
+        "materialization_barriers",
         "terminal_unit_ids",
     )
 
@@ -420,7 +433,8 @@ class QueryResourceGraph:
         object.__setattr__(self, "query_id", str(self.query_id).strip())
         object.__setattr__(self, "plan_digest", str(self.plan_digest).strip())
         object.__setattr__(self, "units", tuple(self.units))
-        object.__setattr__(self, "terminal_unit_ids", tuple(str(item) for item in self.terminal_unit_ids))
+        object.__setattr__(self, "materialization_barriers", tuple(self.materialization_barriers))
+        object.__setattr__(self, "terminal_unit_ids", tuple(str(item).strip() for item in self.terminal_unit_ids))
         self._validate()
 
     def _validate(self) -> None:
@@ -467,6 +481,50 @@ class QueryResourceGraph:
         ordered = self._topological_order(by_id, downstream)
         if len(ordered) != len(by_id):
             raise ValueError("query resource graph contains a cycle")
+
+        barrier_ids: set[str] = set()
+        barrier_nodes: set[str] = set()
+        barrier_units: set[str] = set()
+        for barrier in self.materialization_barriers:
+            if str(barrier.query_id).strip() != self.query_id:
+                raise ValueError(
+                    f"barrier {barrier.barrier_id or '<empty>'} query_id {barrier.query_id!r} "
+                    f"does not match {self.query_id!r}"
+                )
+            barrier_id = str(barrier.barrier_id).strip()
+            physical_node_id = str(barrier.physical_node_id).strip()
+            materializer_unit_id = str(barrier.materializer_unit_id).strip()
+            if barrier_id != f"barrier:{self.query_id}:node:{physical_node_id}":
+                raise ValueError(f"invalid materialization barrier identity: {barrier_id!r}")
+            if not physical_node_id:
+                raise ValueError(f"barrier {barrier_id} physical_node_id must be non-empty")
+            if materializer_unit_id not in by_id:
+                raise ValueError(f"barrier {barrier_id} references missing materializer unit {materializer_unit_id}")
+            if by_id[materializer_unit_id].backend != "ray_worker":
+                raise ValueError(f"barrier {barrier_id} materializer must be a native fragment unit")
+            materialized_input_unit_ids = tuple(
+                str(resource_unit_id).strip() for resource_unit_id in barrier.materialized_input_unit_ids
+            )
+            if not materialized_input_unit_ids:
+                raise ValueError(f"barrier {barrier_id} must materialize at least one input unit")
+            if len(set(materialized_input_unit_ids)) != len(materialized_input_unit_ids):
+                raise ValueError(f"barrier {barrier_id} has duplicate materialized input units")
+            materializer_inputs = set(by_id[materializer_unit_id].input_unit_ids)
+            for input_unit_id in materialized_input_unit_ids:
+                if input_unit_id not in materializer_inputs:
+                    raise ValueError(
+                        f"barrier {barrier_id} materialized input {input_unit_id} "
+                        f"is not a direct input of {materializer_unit_id}"
+                    )
+            if barrier_id in barrier_ids:
+                raise ValueError(f"duplicate materialization barrier_id: {barrier_id}")
+            if physical_node_id in barrier_nodes:
+                raise ValueError(f"duplicate materialization barrier physical_node_id: {physical_node_id}")
+            if materializer_unit_id in barrier_units:
+                raise ValueError(f"duplicate materialization barrier unit: {materializer_unit_id}")
+            barrier_ids.add(barrier_id)
+            barrier_nodes.add(physical_node_id)
+            barrier_units.add(materializer_unit_id)
 
         for terminal in self.terminal_unit_ids:
             if downstream[terminal]:
@@ -596,6 +654,109 @@ class QueryResourceGraph:
     def reverse_topological_unit_ids(self) -> tuple[str, ...]:
         return tuple(reversed(self.topological_unit_ids()))
 
+    def barrier_for_physical_node(self, physical_node_id: str) -> MaterializationBarrierSpec:
+        key = str(physical_node_id)
+        for barrier in self.materialization_barriers:
+            if barrier.physical_node_id == key:
+                return barrier
+        raise KeyError(f"unknown materialization barrier physical_node_id {key!r}")
+
+    def ordered_materialization_barriers(self) -> tuple[MaterializationBarrierSpec, ...]:
+        rank = {resource_unit_id: index for index, resource_unit_id in enumerate(self.topological_unit_ids())}
+        return tuple(
+            sorted(
+                self.materialization_barriers,
+                key=lambda barrier: (rank[barrier.materializer_unit_id], barrier.barrier_id),
+            )
+        )
+
+    def eligible_resource_unit_ids(self, completed_barrier_ids: set[str] | frozenset[str]) -> tuple[str, ...]:
+        """Return units not hidden behind an unfinished true barrier.
+
+        The returned set is the current execution phase, not the set of tasks
+        that happen to be running.  Parallel branches up to their respective
+        first unfinished barriers remain eligible together.  Once a barrier
+        completes, reverse traversal stops at that boundary so the preceding
+        phase is retired instead of being reserved again.
+        """
+
+        completed = {str(barrier_id) for barrier_id in completed_barrier_ids}
+        ordered = self.topological_unit_ids()
+        by_id = {unit.resource_unit_id: unit for unit in self.units}
+        barrier_by_materializer = {barrier.materializer_unit_id: barrier for barrier in self.materialization_barriers}
+        pending = tuple(
+            barrier for barrier in self.ordered_materialization_barriers() if barrier.barrier_id not in completed
+        )
+
+        direct_downstream: dict[str, set[str]] = {resource_unit_id: set() for resource_unit_id in ordered}
+        for unit in self.units:
+            for input_unit_id in unit.input_unit_ids:
+                direct_downstream[input_unit_id].add(unit.resource_unit_id)
+        blocked: set[str] = set()
+        todo = [
+            downstream_unit_id
+            for barrier in pending
+            for downstream_unit_id in direct_downstream[barrier.materializer_unit_id]
+        ]
+        while todo:
+            resource_unit_id = todo.pop()
+            if resource_unit_id in blocked:
+                continue
+            blocked.add(resource_unit_id)
+            todo.extend(direct_downstream[resource_unit_id])
+
+        # Every first unfinished barrier is a target for the current phase.
+        # A terminal is also a target when no unfinished barrier withholds it.
+        targets = {barrier.materializer_unit_id for barrier in pending if barrier.materializer_unit_id not in blocked}
+        targets.update(
+            terminal_unit_id for terminal_unit_id in self.terminal_unit_ids if terminal_unit_id not in blocked
+        )
+        # A pending barrier on one branch can also block a downstream join fed
+        # by a branch whose own barrier has already completed.  Keep the
+        # unblocked side of every blocked edge eligible so that branch can
+        # stream up to the join's bounded input instead of being retired until
+        # the other branch catches up.
+        targets.update(
+            input_unit_id
+            for blocked_unit_id in blocked
+            for input_unit_id in by_id[blocked_unit_id].input_unit_ids
+            if input_unit_id not in blocked
+        )
+
+        eligible: set[str] = set()
+        todo = list(targets)
+        while todo:
+            resource_unit_id = todo.pop()
+            if resource_unit_id in eligible:
+                continue
+            eligible.add(resource_unit_id)
+            unit = by_id[resource_unit_id]
+            barrier = barrier_by_materializer.get(resource_unit_id)
+            if barrier is None:
+                todo.extend(unit.input_unit_ids)
+            elif barrier.barrier_id in completed:
+                materialized_inputs = set(barrier.materialized_input_unit_ids)
+                todo.extend(
+                    input_unit_id for input_unit_id in unit.input_unit_ids if input_unit_id not in materialized_inputs
+                )
+            else:
+                todo.extend(barrier.materialized_input_unit_ids)
+        return tuple(resource_unit_id for resource_unit_id in ordered if resource_unit_id in eligible)
+
+    def frontier_materialization_barriers(
+        self,
+        completed_barrier_ids: set[str] | frozenset[str],
+    ) -> tuple[MaterializationBarrierSpec, ...]:
+        """Return all unfinished barriers on the current parallel frontier."""
+
+        completed = {str(barrier_id) for barrier_id in completed_barrier_ids}
+        eligible = set(self.eligible_resource_unit_ids(completed))
+        return tuple(
+            barrier
+            for barrier in self.ordered_materialization_barriers()
+            if barrier.barrier_id not in completed and barrier.materializer_unit_id in eligible
+        )
+
     def task_identity(self, resource_unit_id: str, *, partition_id: int | str, attempt_id: int | str) -> str:
         unit = self.unit_by_id(resource_unit_id)
         partition = str(partition_id).strip()
@@ -610,78 +771,30 @@ class QueryResourceGraph:
         self,
         allocation: QueryAllocation,
         *,
-        require_full_minimum: bool = True,
+        eligible_unit_ids: tuple[str, ...] | None = None,
     ) -> None:
+        eligible = (
+            {unit.resource_unit_id for unit in self.units}
+            if eligible_unit_ids is None
+            else {str(resource_unit_id) for resource_unit_id in eligible_unit_ids}
+        )
+        unknown = sorted(eligible - {unit.resource_unit_id for unit in self.units})
+        if unknown:
+            raise ValueError(f"allocation validation references unknown eligible unit: {unknown[0]}")
         hard_capacity = _hard_resources(allocation.resources)
         for unit in self.units:
             task_commitment = _hard_resources(unit.per_task)
-            actor_resident = unit.resident_per_actor if unit.backend == "ray_actor" else ResourceVector()
-            placement_commitment = actor_resident + task_commitment
-            exceeded = placement_commitment.exceeded_dimensions(hard_capacity)
-            if require_full_minimum and exceeded:
-                raise ValueError(
-                    f"unit {unit.resource_unit_id} maximum task exceeds query allocation for {', '.join(exceeded)}"
-                )
-            if (
-                require_full_minimum
-                and not task_commitment.is_zero()
-                and not any(
-                    placement_commitment.fits_within(_hard_resources(node_allocation.resources))
+            if unit.backend == "ray_task" and unit.resource_unit_id in eligible:
+                exceeded = task_commitment.exceeded_dimensions(hard_capacity)
+                if exceeded:
+                    raise ValueError(
+                        f"unit {unit.resource_unit_id} maximum task exceeds query allocation for {', '.join(exceeded)}"
+                    )
+                if not task_commitment.is_zero() and not any(
+                    task_commitment.fits_within(_hard_resources(node_allocation.resources))
                     for node_allocation in allocation.node_allocations
-                )
-            ):
-                raise ValueError(f"unit {unit.resource_unit_id} maximum task does not fit any allocated Ray node")
-            if unit.backend == "ray_actor":
-                actor_pool = actor_resident.scale(unit.actor_pool_size)
-                exceeded_actor = actor_pool.exceeded_dimensions(hard_capacity)
-                if require_full_minimum and exceeded_actor:
-                    raise ValueError(
-                        f"unit {unit.resource_unit_id} actor pool exceeds query allocation for {', '.join(exceeded_actor)}"
-                    )
-                placements = [
-                    placement
-                    for placement in allocation.actor_placements
-                    if placement.resource_unit_id == unit.resource_unit_id
-                ]
-                if require_full_minimum and len(placements) != unit.actor_pool_size:
-                    raise ValueError(
-                        f"unit {unit.resource_unit_id} requires exactly {unit.actor_pool_size} actor placements"
-                    )
-                expected_indices = set(range(unit.actor_pool_size))
-                placement_indices = {placement.actor_index for placement in placements}
-                if placements and placement_indices != expected_indices:
-                    raise ValueError(
-                        f"unit {unit.resource_unit_id} actor placement indices must be contiguous from zero"
-                    )
-                for placement in placements:
-                    if not placement_commitment.fits_within(
-                        _hard_resources(allocation.resources_for_node(placement.node_id))
-                    ):
-                        raise ValueError(
-                            f"unit {unit.resource_unit_id} actor {placement.actor_index} does not fit "
-                            f"allocated Ray node {placement.node_id}"
-                        )
-
-        known_actor_unit_ids = {unit.resource_unit_id for unit in self.units if unit.backend == "ray_actor"}
-        unknown_actor_units = sorted(
-            {placement.resource_unit_id for placement in allocation.actor_placements} - known_actor_unit_ids
-        )
-        if unknown_actor_units:
-            raise ValueError("actor placement references non-actor unit: " + ", ".join(unknown_actor_units))
-        if require_full_minimum:
-            actor_commitment_by_node: dict[str, ResourceVector] = {}
-            for placement in allocation.actor_placements:
-                unit = self.unit_by_id(placement.resource_unit_id)
-                actor_commitment_by_node[placement.node_id] = (
-                    actor_commitment_by_node.get(
-                        placement.node_id,
-                        ResourceVector(),
-                    )
-                    + unit.resident_per_actor
-                )
-            for node_id, commitment in actor_commitment_by_node.items():
-                if not commitment.fits_within(_hard_resources(allocation.resources_for_node(node_id))):
-                    raise ValueError(f"cumulative actor placements do not fit allocated Ray node {node_id}")
+                ):
+                    raise ValueError(f"unit {unit.resource_unit_id} maximum task does not fit any allocated Ray node")
 
     def normalized_digest(self) -> str:
         payload = self.to_dict()
@@ -694,6 +807,7 @@ class QueryResourceGraph:
             "query_id": self.query_id,
             "plan_digest": self.plan_digest,
             "units": [unit.to_dict() for unit in self.units],
+            "materialization_barriers": [barrier.to_dict() for barrier in self.materialization_barriers],
             "terminal_unit_ids": list(self.terminal_unit_ids),
         }
 
@@ -705,12 +819,15 @@ class QueryResourceGraph:
             query_id=str(values["query_id"]),
             plan_digest=str(values["plan_digest"]),
             units=tuple(ResourceUnitSpec.from_dict(item) for item in values["units"]),
+            materialization_barriers=tuple(
+                MaterializationBarrierSpec.from_dict(item) for item in values["materialization_barriers"]
+            ),
             terminal_unit_ids=tuple(str(item) for item in values["terminal_unit_ids"]),
         )
 
 
 __all__ = [
-    "ActorPlacement",
+    "MaterializationBarrierSpec",
     "NodeResourceAllocation",
     "QueryAllocation",
     "QueryResourceGraph",

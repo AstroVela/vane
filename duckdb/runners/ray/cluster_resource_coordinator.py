@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from duckdb.runners.ray.query_resource_graph import (
-    ActorPlacement,
     NodeResourceAllocation,
     QueryAllocation,
     ResourceVector,
@@ -20,36 +19,6 @@ from duckdb.runners.ray.query_resource_graph import (
 from duckdb.runners.ray.worker_memory import build_ray_node_memory_layout
 
 _EPSILON = 1e-9
-
-
-class ElasticGpuDemandError(ValueError):
-    code = "ELASTIC_GPU_UNSUPPORTED"
-
-    def __init__(
-        self,
-        query_id: str,
-        minimum_gpu: float,
-        desired_gpu: float,
-    ) -> None:
-        self.query_id = str(query_id)
-        self.minimum_gpu = float(minimum_gpu)
-        self.desired_gpu = float(desired_gpu)
-        super().__init__(self.query_id, self.minimum_gpu, self.desired_gpu)
-
-    def __str__(self) -> str:
-        return (
-            f"query {self.query_id} GPU resources cannot be elastic: "
-            f"minimum={self.minimum_gpu:g}, desired={self.desired_gpu:g}"
-        )
-
-    def to_dict(self) -> dict[str, str | float]:
-        return {
-            "code": self.code,
-            "query_id": self.query_id,
-            "resource": "gpu",
-            "minimum": self.minimum_gpu,
-            "desired": self.desired_gpu,
-        }
 
 
 def _sum_resources(resources: Sequence[ResourceVector]) -> ResourceVector:
@@ -104,27 +73,6 @@ class NodeCapacity:
 
 
 @dataclass(frozen=True)
-class ActorResourceBundle:
-    resource_unit_id: str
-    actor_index: int
-    resources: ResourceVector
-
-    def __post_init__(self) -> None:
-        resource_unit_id = str(self.resource_unit_id).strip()
-        actor_index = int(self.actor_index)
-        if not resource_unit_id:
-            raise ValueError("actor resource bundle resource_unit_id must be non-empty")
-        if actor_index < 0:
-            raise ValueError("actor resource bundle actor_index must be >= 0")
-        if self.resources.is_zero():
-            raise ValueError("actor resource bundle must own non-zero resources")
-        if self.resources.object_store_bytes != 0:
-            raise ValueError("actor resource bundles may not hard-reserve object-store bytes")
-        object.__setattr__(self, "resource_unit_id", resource_unit_id)
-        object.__setattr__(self, "actor_index", actor_index)
-
-
-@dataclass(frozen=True)
 class QueryDemand:
     """Hard placement minimum plus elastic resource targets.
 
@@ -139,7 +87,6 @@ class QueryDemand:
     desired: ResourceVector
     weight: float = 1.0
     priority: int = 0
-    actor_bundles: tuple[ActorResourceBundle, ...] = ()
     task_bundles: tuple[ResourceVector, ...] = ()
 
     def __post_init__(self) -> None:
@@ -149,37 +96,22 @@ class QueryDemand:
         if not self.minimum.fits_within(self.desired):
             exceeded = self.minimum.exceeded_dimensions(self.desired)
             raise ValueError(f"minimum query demand exceeds desired demand for {', '.join(exceeded)}")
-        if not math.isclose(self.minimum.gpu, self.desired.gpu, rel_tol=0.0, abs_tol=_EPSILON):
-            raise ElasticGpuDemandError(
-                query_id=query_id,
-                minimum_gpu=self.minimum.gpu,
-                desired_gpu=self.desired.gpu,
-            )
         weight = float(self.weight)
         if not math.isfinite(weight) or weight <= 0:
             raise ValueError("weight must be finite and > 0")
-        actor_bundles = tuple(self.actor_bundles)
         task_bundles = tuple(self.task_bundles)
         if self.minimum.object_store_bytes != 0:
             raise ValueError("minimum query resources may not hard-reserve object-store bytes")
         if any(bundle.object_store_bytes != 0 for bundle in task_bundles):
             raise ValueError("task resource bundles may not hard-reserve object-store bytes")
-        actor_keys = [(bundle.resource_unit_id, bundle.actor_index) for bundle in actor_bundles]
-        if len(set(actor_keys)) != len(actor_keys):
-            raise ValueError("actor resource bundles contain duplicate resource-unit/index identities")
-        actor_total = _sum_resources([bundle.resources for bundle in actor_bundles])
         task_total = _sum_resources(task_bundles)
-        bundle_total = actor_total + task_total
-        if bundle_total != self.minimum:
-            raise ValueError("actor_bundles plus task_bundles must exactly equal minimum query resources")
-        if not bundle_total.fits_within(self.desired):
+        if task_total != self.minimum:
+            raise ValueError("task_bundles must exactly equal minimum query resources")
+        if not task_total.fits_within(self.desired):
             raise ValueError("minimum placement bundles exceed desired query resources")
-        if actor_total.gpu > self.desired.gpu + _EPSILON:
-            raise ValueError("actor bundles exceed desired GPU resources")
         object.__setattr__(self, "query_id", query_id)
         object.__setattr__(self, "weight", weight)
         object.__setattr__(self, "priority", int(self.priority))
-        object.__setattr__(self, "actor_bundles", actor_bundles)
         object.__setattr__(self, "task_bundles", task_bundles)
 
 
@@ -192,16 +124,13 @@ class _QueryState:
         default_factory=lambda: QueryAllocation(
             resources=ResourceVector(),
             node_allocations=(),
-            actor_placements=(),
             generation=1,
         )
     )
     node_allocations: dict[str, ResourceVector] = field(default_factory=dict)
-    actor_placements: tuple[ActorPlacement, ...] = ()
     allocation_debt: ResourceVector = field(default_factory=ResourceVector)
     state: str = "PENDING_RESOURCES"
     rejection_reason: str = ""
-    actor_placement_lost: bool = False
     expires_at: float = 0.0
 
 
@@ -354,6 +283,7 @@ class ClusterQueryResourceCoordinator:
         *,
         observed_usage_by_query: Mapping[str, ResourceVector],
         generations: Mapping[str, int],
+        demands_by_query: Mapping[str, QueryDemand] | None = None,
         now: float | None = None,
     ) -> dict[str, QueryAllocation]:
         """Atomically refresh every live query from one coordinator snapshot.
@@ -367,8 +297,15 @@ class ClusterQueryResourceCoordinator:
         timestamp = time.monotonic() if now is None else float(now)
         usage = {str(query_id): value for query_id, value in observed_usage_by_query.items()}
         generation_by_query = {str(query_id): int(generation) for query_id, generation in generations.items()}
+        demands = (
+            None
+            if demands_by_query is None
+            else {str(query_id): demand for query_id, demand in demands_by_query.items()}
+        )
         if set(usage) != set(generation_by_query):
             raise ValueError("refresh query usage and generation sets must match")
+        if demands is not None and set(demands) != set(usage):
+            raise ValueError("refresh query demand and usage sets must match")
         with self._lock:
             expected = set(self._queries)
             if set(usage) != expected:
@@ -385,8 +322,16 @@ class ClusterQueryResourceCoordinator:
                 self._require_generation(state, generation_by_query[query_id])
                 if not isinstance(usage[query_id], ResourceVector):
                     raise TypeError(f"observed usage for query {query_id} must be ResourceVector")
+                if demands is not None:
+                    demand = demands[query_id]
+                    if not isinstance(demand, QueryDemand):
+                        raise TypeError(f"demand for query {query_id} must be QueryDemand")
+                    if demand.query_id != query_id:
+                        raise ValueError(f"refresh demand query_id mismatch for query {query_id}")
             for query_id in sorted(expected):
                 state = self._queries[query_id]
+                if demands is not None:
+                    state.demand = demands[query_id]
                 state.observed_usage = usage[query_id]
                 state.expires_at = timestamp + self._heartbeat_timeout_s
             if expected:
@@ -403,6 +348,22 @@ class ClusterQueryResourceCoordinator:
             self._require_generation(state, generation)
             state.expires_at = timestamp + self._heartbeat_timeout_s
             return state.allocation
+
+    def query_state(self, query_id: str, generation: int) -> str:
+        """Return one generation-fenced query scheduling state.
+
+        Registration needs this small control-plane value before the query-local
+        manager exists. Exposing it directly avoids constructing and traversing
+        the coordinator's full diagnostic snapshot on every query start.
+        """
+
+        query_key = str(query_id)
+        with self._lock:
+            state = self._queries.get(query_key)
+            if state is None:
+                raise KeyError(f"query is not registered: {query_key}")
+            self._require_generation(state, generation)
+            return str(state.state)
 
     def release_query(self, query_id: str, generation: int) -> bool:
         query_key = str(query_id)
@@ -450,46 +411,7 @@ class ClusterQueryResourceCoordinator:
         generation = self._generation
         remaining = {node_id: node.resources for node_id, node in self._nodes.items()}
         node_allocations_by_query: dict[str, dict[str, ResourceVector]] = {query_id: {} for query_id in self._queries}
-        actor_placements_by_query: dict[str, tuple[ActorPlacement, ...]] = {query_id: () for query_id in self._queries}
         admitted: list[_QueryState] = []
-
-        # Eager actor placements become non-preemptible as soon as admission
-        # publishes them.  The driver creates actors immediately after this
-        # allocation, so moving the placement during the startup gap would make
-        # the virtual lease disagree with Ray's hard NodeAffinity placement.
-        pinned_query_ids: set[str] = set()
-        lost_actor_placement_query_ids: set[str] = set()
-        for state in sorted(self._queries.values(), key=lambda item: (item.sequence, item.demand.query_id)):
-            if state.actor_placement_lost:
-                lost_actor_placement_query_ids.add(state.demand.query_id)
-                continue
-            if not state.actor_placements:
-                continue
-            trial_remaining = dict(remaining)
-            placement_valid = True
-            actor_bundles = {
-                (bundle.resource_unit_id, bundle.actor_index): bundle.resources for bundle in state.demand.actor_bundles
-            }
-            pinned_allocations: dict[str, ResourceVector] = {}
-            for placement in state.actor_placements:
-                vector = actor_bundles.get((placement.resource_unit_id, placement.actor_index))
-                capacity = trial_remaining.get(placement.node_id)
-                if vector is None or capacity is None or not vector.fits_within(capacity):
-                    placement_valid = False
-                    break
-                trial_remaining[placement.node_id] = capacity - vector
-                pinned_allocations[placement.node_id] = (
-                    pinned_allocations.get(placement.node_id, ResourceVector()) + vector
-                )
-            if not placement_valid:
-                state.actor_placement_lost = True
-                lost_actor_placement_query_ids.add(state.demand.query_id)
-                continue
-            query_id = state.demand.query_id
-            remaining = trial_remaining
-            pinned_query_ids.add(query_id)
-            actor_placements_by_query[query_id] = state.actor_placements
-            node_allocations_by_query[query_id] = pinned_allocations
 
         ordered = sorted(
             self._queries.values(),
@@ -497,41 +419,10 @@ class ClusterQueryResourceCoordinator:
         )
         for state in ordered:
             query_id = state.demand.query_id
-            if query_id in lost_actor_placement_query_ids:
+            placement = self._place_task_bundles(state.demand.task_bundles, remaining)
+            if placement is None:
                 continue
-            trial_remaining = dict(remaining)
-            trial_allocations: dict[str, ResourceVector] = dict(node_allocations_by_query[query_id])
-            if query_id not in pinned_query_ids:
-                actor_ok = True
-                new_actor_placements: list[ActorPlacement] = []
-                for actor_bundle in state.demand.actor_bundles:
-                    node_id = self._place_bundle(actor_bundle.resources, trial_remaining)
-                    if node_id is None:
-                        actor_ok = False
-                        break
-                    new_actor_placements.append(
-                        ActorPlacement(
-                            resource_unit_id=actor_bundle.resource_unit_id,
-                            actor_index=actor_bundle.actor_index,
-                            node_id=node_id,
-                        )
-                    )
-                    trial_allocations[node_id] = (
-                        trial_allocations.get(node_id, ResourceVector()) + actor_bundle.resources
-                    )
-                if not actor_ok:
-                    continue
-                actor_placements_by_query[query_id] = tuple(new_actor_placements)
-
-            task_ok = True
-            for task_bundle in state.demand.task_bundles:
-                node_id = self._place_bundle(task_bundle, trial_remaining)
-                if node_id is None:
-                    task_ok = False
-                    break
-                trial_allocations[node_id] = trial_allocations.get(node_id, ResourceVector()) + task_bundle
-            if not task_ok:
-                continue
+            trial_remaining, trial_allocations = placement
 
             remaining = trial_remaining
             node_allocations_by_query[query_id] = trial_allocations
@@ -541,8 +432,9 @@ class ClusterQueryResourceCoordinator:
         extra_capacity = _sum_resources(list(remaining.values()))
         extras = self._weighted_drf_extras(admitted, extra_capacity, total_capacity)
 
-        # Place the aggregate DRF result onto concrete nodes. GPU demand is
-        # fixed in the bundles above; only CPU and memory extras are divisible.
+        # Place the aggregate DRF result onto concrete nodes. Extra allocations
+        # are soft scheduling attribution; Ray Core still places concrete work
+        # and enforces its real CPU/GPU/memory request.
         for state in admitted:
             query_id = state.demand.query_id
             extra = extras.get(query_id, ResourceVector())
@@ -560,9 +452,6 @@ class ClusterQueryResourceCoordinator:
             if query_id in admitted_ids:
                 state.state = "RUNNING"
                 state.rejection_reason = ""
-            elif query_id in lost_actor_placement_query_ids:
-                state.state = "ACTOR_PLACEMENT_LOST"
-                state.rejection_reason = "allocated Ray actor node is no longer available"
             else:
                 state.state = "PENDING_RESOURCES"
                 state.rejection_reason = "minimum query resource bundles are not currently feasible"
@@ -574,15 +463,93 @@ class ClusterQueryResourceCoordinator:
                     for node_id, vector in sorted(node_allocations_by_query[query_id].items())
                     if not vector.is_zero()
                 ),
-                actor_placements=actor_placements_by_query[query_id],
                 generation=generation,
             )
             state.node_allocations = node_allocations_by_query[query_id]
-            state.actor_placements = actor_placements_by_query[query_id]
             state.allocation_debt = _hard_positive_difference(state.observed_usage, resources)
-            if not state.allocation_debt.is_zero() and state.state != "ACTOR_PLACEMENT_LOST":
+            if not state.allocation_debt.is_zero():
                 state.state = "ALLOCATION_DEBT"
                 state.rejection_reason = "live query hard-resource leases exceed the current allocation"
+
+    def _place_task_bundles(
+        self,
+        bundles: Sequence[ResourceVector],
+        remaining: Mapping[str, ResourceVector],
+    ) -> tuple[dict[str, ResourceVector], dict[str, ResourceVector]] | None:
+        """Place indivisible minima without depending on greedy node order.
+
+        A heterogeneous execution phase can require more than one capability
+        envelope.  Best-fit placement is a useful ordering heuristic, but a
+        locally valid first node can hide the only node available to a later
+        bundle.  The bounded backtracking below finds the deterministic
+        feasible assignment that the graph builder established from concrete
+        node capacities.
+        """
+
+        original = dict(remaining)
+        if not bundles:
+            return original, {}
+        ordered = tuple(
+            bundle
+            for _index, bundle in sorted(
+                enumerate(bundles),
+                key=lambda item: (
+                    sum(item[1].fits_within(capacity) for capacity in original.values()),
+                    -item[1].gpu,
+                    -item[1].cpu,
+                    -item[1].heap_bytes,
+                    item[0],
+                ),
+            )
+        )
+        node_ids = tuple(sorted(original))
+        failed: set[tuple[int, tuple[tuple[str, ResourceVector], ...]]] = set()
+
+        def search(
+            bundle_index: int,
+            current: dict[str, ResourceVector],
+        ) -> dict[str, ResourceVector] | None:
+            if bundle_index == len(ordered):
+                return current
+            state_key = (
+                bundle_index,
+                tuple((node_id, current[node_id]) for node_id in node_ids),
+            )
+            if state_key in failed:
+                return None
+            bundle = ordered[bundle_index]
+            candidates = sorted(
+                (node_id for node_id in node_ids if bundle.fits_within(current[node_id])),
+                key=lambda node_id: (
+                    current[node_id].gpu - bundle.gpu,
+                    current[node_id].cpu - bundle.cpu,
+                    current[node_id].heap_bytes - bundle.heap_bytes,
+                    node_id,
+                ),
+            )
+            for node_id in candidates:
+                # Keep the single-bundle primitive as the mutation authority;
+                # tests also fault-inject it to verify registration rollback.
+                selected_remaining = {node_id: current[node_id]}
+                if self._place_bundle(bundle, selected_remaining) is None:
+                    raise RuntimeError("selected task bundle unexpectedly became unplaceable")
+                trial = dict(current)
+                trial[node_id] = selected_remaining[node_id]
+                placed = search(bundle_index + 1, trial)
+                if placed is not None:
+                    return placed
+            failed.add(state_key)
+            return None
+
+        placed_remaining = search(0, original)
+        if placed_remaining is None:
+            return None
+        allocations = {
+            node_id: original[node_id] - placed_remaining[node_id]
+            for node_id in node_ids
+            if original[node_id] != placed_remaining[node_id]
+        }
+        return placed_remaining, allocations
 
     @staticmethod
     def _place_bundle(bundle: ResourceVector, remaining: dict[str, ResourceVector]) -> str | None:
@@ -606,11 +573,9 @@ class ClusterQueryResourceCoordinator:
         request: ResourceVector,
         remaining: dict[str, ResourceVector],
     ) -> dict[str, ResourceVector] | None:
-        if request.gpu > _EPSILON:
-            raise AssertionError("divisible placement received fixed GPU resources")
         trial_remaining = dict(remaining)
         allocations = {node_id: ResourceVector() for node_id in remaining}
-        for field_name in ("cpu", "heap_bytes", "object_store_bytes"):
+        for field_name in ("cpu", "gpu", "heap_bytes", "object_store_bytes"):
             needed = float(getattr(request, field_name))
             if needed <= _EPSILON:
                 continue
@@ -623,7 +588,7 @@ class ClusterQueryResourceCoordinator:
                 if available <= _EPSILON:
                     continue
                 amount = min(needed, available)
-                if field_name != "cpu":
+                if field_name not in {"cpu", "gpu"}:
                     amount = int(amount)
                 if amount <= 0:
                     continue
@@ -957,9 +922,7 @@ class ClusterQueryResourceCoordinator:
 
 
 __all__ = [
-    "ActorResourceBundle",
     "ClusterQueryResourceCoordinator",
-    "ElasticGpuDemandError",
     "NodeCapacity",
     "QueryDemand",
     "read_ray_node_capacities",

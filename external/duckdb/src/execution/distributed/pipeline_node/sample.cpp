@@ -40,6 +40,10 @@ std::vector<PipelineNodeRef> ReservoirSampleNode::children() const {
 	return {child_};
 }
 
+std::vector<NodeID> ReservoirSampleNode::materialized_input_node_ids() const {
+	return is_materialization_barrier() && child_ ? std::vector<NodeID> {child_->node_id()} : std::vector<NodeID> {};
+}
+
 SubmittableTaskStream<WorkerTask> ReservoirSampleNode::produce_tasks(PlanExecutionContext &plan_context) {
 	auto options_template = std::shared_ptr<SampleOptions>(options_ ? options_->Copy().release() : nullptr);
 	auto output_types = std::make_shared<vector<LogicalType>>(output_types_.begin(), output_types_.end());

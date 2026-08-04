@@ -28,6 +28,10 @@ public:
 	const PipelineNodeConfig &config() const override {
 		return config_;
 	}
+	bool is_materialization_barrier() const override {
+		return options_ && !options_->is_percentage;
+	}
+	std::vector<NodeID> materialized_input_node_ids() const override;
 
 	std::vector<PipelineNodeRef> children() const override;
 	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override;

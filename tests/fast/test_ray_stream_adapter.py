@@ -215,6 +215,28 @@ def test_stream_blocks_never_exceed_duckdb_vector_size():
     assert [block.num_rows for block in blocks] == [DUCKDB_STANDARD_VECTOR_SIZE, 37]
 
 
+def test_stream_blocks_keep_unsplittable_rows_as_complete_soft_target_blocks():
+    pa = pytest.importorskip("pyarrow")
+    from duckdb.execution._common import estimate_table_bytes
+    from duckdb.execution.udf_ray_stream_protocol import iter_bounded_stream_blocks
+
+    target_bytes = 32
+    payload = {
+        "query_id": "q1",
+        "resource_unit_id": "resource:q1:udf:node:1",
+        "task_lease_id": "lease-1",
+        "attempt_id": "attempt-1",
+        "udf_output_target_max_bytes": target_bytes,
+        "output_window_bytes": target_bytes * 2,
+    }
+    values = ["a", "x" * 1024, "b"]
+
+    blocks = list(iter_bounded_stream_blocks(pa.table({"value": values}), payload))
+
+    assert [block.column("value").to_pylist() for block in blocks] == [["a"], [values[1]], ["b"]]
+    assert estimate_table_bytes(blocks[1]) > target_bytes
+
+
 def test_adapter_advances_generator_asynchronously_and_never_gets_data_ref():
     fake_ray = _FakeRay()
     block_ref = _Ref("large-block")

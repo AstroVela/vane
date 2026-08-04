@@ -982,6 +982,28 @@ DuckDBResult<void> RayWorkerManager::task_input_stream_exhausted_for_query(
 	return DuckDBResult<void>::ok();
 }
 
+DuckDBResult<void> RayWorkerManager::materialization_barrier_completed(const string &query_id,
+                                                                       duckdb::distributed::NodeID node_id) {
+	if (query_id.empty()) {
+		return DuckDBResult<void>::err(
+		    DuckDBError::value_error("materialization barrier completion requires non-empty query_id"));
+	}
+	OperationGuard operation(*this);
+	if (!operation) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("Ray worker manager is shut down"));
+	}
+
+	try {
+		duckdb::PythonGILWrapper gil;
+		py::module_ resource_runtime = py::module_::import("duckdb.runners.ray.query_resource_runtime");
+		resource_runtime.attr("mark_materialization_barrier_completed")(query_id, std::to_string(node_id));
+	} catch (const std::exception &e) {
+		return DuckDBResult<void>::err(
+		    DuckDBError(string("Python error during materialization_barrier_completed: ") + e.what()));
+	}
+	return DuckDBResult<void>::ok();
+}
+
 DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>
 RayWorkerManager::wait_fte_query(const string &query_id, double timeout_s) {
 	return wait_fte_query(query_id, timeout_s, {});

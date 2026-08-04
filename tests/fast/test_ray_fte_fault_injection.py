@@ -325,7 +325,6 @@ def _register_fault_query(tasks) -> None:
                     resources=allocation_resources,
                 ),
             ),
-            actor_placements=(),
             generation=1,
         ),
     )
@@ -376,11 +375,19 @@ def _init_ray_for_fault_test(monkeypatch) -> None:
     # during session finalization, before its JUnit report is written.
     cluster = Cluster(shutdown_at_exit=False)
     try:
+        from ray._private.resource_and_label_spec import ResourceAndLabelSpec
+
+        resources = ResourceAndLabelSpec().resolve(is_head=True)
+        object_store_options = ray_test_object_store_options()
+        object_store_options.setdefault(
+            "object_store_memory",
+            resources.object_store_memory,
+        )
         cluster.add_node(
             include_dashboard=False,
             num_cpus=int(os.environ.get("VANE_TEST_RAY_NUM_CPUS", "4")),
             num_gpus=0,
-            **ray_test_object_store_options(),
+            **object_store_options,
         )
         ray.init(
             address=cluster.address,

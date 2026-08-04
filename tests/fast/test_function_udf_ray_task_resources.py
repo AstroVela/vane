@@ -422,7 +422,7 @@ def test_materialized_task_splits_every_block_before_generator_publication():
     assert all(item["size_bytes"] <= 20 for item in metadata)
 
 
-def test_materialized_task_rejects_unsplittable_row_before_first_yield():
+def test_materialized_task_publishes_unsplittable_row_for_soft_liveness():
     import duckdb.execution.udf_ray as fur
     from duckdb import pickle as duckdb_pickle
 
@@ -438,10 +438,11 @@ def test_materialized_task_rejects_unsplittable_row_before_first_yield():
         output_window_bytes=64,
     )
     oversized = pa.table({"value": ["x" * 1024]})
-    stream = fur._iter_materialized_task_outputs(payload, [oversized])
+    outputs = list(fur._iter_materialized_task_outputs(payload, [oversized]))
 
-    with pytest.raises(RuntimeError, match="single output row.*32"):
-        next(stream)
+    assert outputs[0].equals(oversized)
+    assert outputs[1]["size_bytes"] > 32
+    assert outputs[1]["block_id"] == "block:lease-oversized:0"
 
 
 def test_actor_pool_requests_logical_memory_and_initializes_eagerly(monkeypatch):

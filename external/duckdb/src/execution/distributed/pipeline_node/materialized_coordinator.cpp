@@ -79,6 +79,11 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 		return DuckDBResult<void>::err(
 		    DuckDBError::invalid_state_error("materialized coordinator requires an ExchangeManager"));
 	}
+	if (!node->is_materialization_barrier()) {
+		result_tx->close();
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
+		    "materialized coordinator requires a node declared as a materialization barrier"));
+	}
 
 	auto types_res = ResolveSchemaTypes(materialized_schema ? materialized_schema : node->config().schema());
 	if (types_res.is_err()) {
@@ -133,6 +138,14 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 		result_tx->close();
 		exchange->Close();
 		return DuckDBResult<void>::err(DuckDBError::internal_error(ex.what()));
+	}
+
+	auto barrier_result =
+	    fte_task_submitter->materialization_barrier_completed(node->context().query_id(), node->node_id());
+	if (barrier_result.is_err()) {
+		result_tx->close();
+		exchange->Close();
+		return DuckDBResult<void>::err(barrier_result.error());
 	}
 
 	auto source_handles = exchange->GetSourceHandles();

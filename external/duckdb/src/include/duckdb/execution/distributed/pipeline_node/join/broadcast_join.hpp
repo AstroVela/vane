@@ -49,6 +49,10 @@ public:
 		return config_;
 	}
 	std::vector<PipelineNodeRef> children() const override;
+	bool is_materialization_barrier() const override {
+		return true;
+	}
+	std::vector<NodeID> materialized_input_node_ids() const override;
 	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override;
 	std::vector<std::string> multiline_display(bool verbose) const override;
 

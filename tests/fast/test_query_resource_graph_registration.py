@@ -7,7 +7,11 @@ import uuid
 import pytest
 
 import duckdb
-from duckdb.runners.ray.query_resource_graph_builder import build_query_resource_graph, udf_unit_id_for_node
+from duckdb.runners.ray.query_resource_graph_builder import (
+    build_query_resource_graph,
+    native_fragment_unit_id_for_node,
+    udf_unit_id_for_node,
+)
 
 
 def _physical_plan(relation, con, prefix):
@@ -39,6 +43,79 @@ def test_physical_plan_exports_complete_deterministic_resource_unit_metadata(tmp
         assert graph.query_id == plan.idx()
         assert all(node["node_id"] for node in first["nodes"])
         assert all(node["num_partitions"] >= 1 for node in first["nodes"])
+        assert all(
+            bool(node["materialized_input_node_ids"]) == node["is_materialization_barrier"] for node in first["nodes"]
+        )
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize(
+    ("transform", "expected_nodes"),
+    [
+        (lambda relation: relation.repartition(4), {"Repartition": False}),
+        (
+            lambda relation: relation.repartition(4).order("x"),
+            {"Repartition": False, "OrderBy": True},
+        ),
+        (
+            lambda relation: relation.repartition(4).limit(3),
+            {"Repartition": False, "StreamingLimit": True},
+        ),
+    ],
+)
+def test_physical_plan_marks_only_true_materialization_barriers(tmp_path, transform, expected_nodes):
+    con = duckdb.connect()
+    try:
+        plan = _physical_plan(transform(_parquet_relation(con, tmp_path)), con, "graph-barrier")
+        metadata = plan.collect_query_resource_graph_metadata(conn=con)
+        barrier_by_name = {
+            node["node_name"]: node["is_materialization_barrier"]
+            for node in metadata["nodes"]
+            if node["node_name"] in expected_nodes
+        }
+
+        assert barrier_by_name == expected_nodes
+        for node in metadata["nodes"]:
+            if node["node_name"] not in expected_nodes:
+                continue
+            assert bool(node["materialized_input_node_ids"]) == expected_nodes[node["node_name"]]
+            assert set(node["materialized_input_node_ids"]).issubset(node["input_node_ids"])
+        graph = build_query_resource_graph(metadata, env={})
+        assert {barrier.physical_node_id for barrier in graph.materialization_barriers} == {
+            node["node_id"] for node in metadata["nodes"] if node["is_materialization_barrier"]
+        }
+    finally:
+        con.close()
+
+
+def test_broadcast_join_barrier_materializes_only_broadcaster_input(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "broadcast")
+    monkeypatch.setenv("VANE_DISTRIBUTED_BROADCAST_JOIN_RECEIVER_REPARTITION", "0")
+    con = duckdb.connect()
+    try:
+        path = tmp_path / "broadcast_input.parquet"
+        con.execute(f"COPY (SELECT i::BIGINT AS x FROM range(8) tbl(i)) TO '{path}' (FORMAT PARQUET)")
+        relation = con.sql(f"SELECT l.x FROM read_parquet('{path}') l JOIN read_parquet('{path}') r ON l.x = r.x")
+        plan = _physical_plan(relation, con, "graph-broadcast")
+        metadata = plan.collect_query_resource_graph_metadata(conn=con)
+        broadcast = next(node for node in metadata["nodes"] if node["node_name"] == "BroadcastJoin")
+
+        assert len(broadcast["input_node_ids"]) == 2
+        assert len(broadcast["materialized_input_node_ids"]) == 1
+        assert set(broadcast["materialized_input_node_ids"]).issubset(broadcast["input_node_ids"])
+
+        graph = build_query_resource_graph(metadata, env={})
+        barrier = graph.barrier_for_physical_node(broadcast["node_id"])
+        assert barrier.materialized_input_unit_ids == (
+            native_fragment_unit_id_for_node(
+                graph.query_id,
+                broadcast["materialized_input_node_ids"][0],
+            ),
+        )
     finally:
         con.close()
 

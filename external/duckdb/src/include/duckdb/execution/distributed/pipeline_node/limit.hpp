@@ -34,6 +34,8 @@ public:
 	std::vector<PipelineNodeRef> children() const override {
 		return {child_};
 	}
+	bool is_materialization_barrier() const override;
+	std::vector<NodeID> materialized_input_node_ids() const override;
 	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override;
 	std::vector<std::string> multiline_display(bool verbose) const override;
 
@@ -67,6 +69,8 @@ public:
 	std::vector<PipelineNodeRef> children() const override {
 		return {child_};
 	}
+	bool is_materialization_barrier() const override;
+	std::vector<NodeID> materialized_input_node_ids() const override;
 	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override;
 	std::vector<std::string> multiline_display(bool verbose) const override;
 
@@ -101,6 +105,8 @@ public:
 	std::vector<PipelineNodeRef> children() const override {
 		return {child_};
 	}
+	bool is_materialization_barrier() const override;
+	std::vector<NodeID> materialized_input_node_ids() const override;
 	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override;
 	std::vector<std::string> multiline_display(bool verbose) const override;
 

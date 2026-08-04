@@ -1,21 +1,18 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-import pickle
 from types import SimpleNamespace
 
 import pytest
 
 from duckdb.runners.ray import cluster_resource_coordinator as coordinator_module
 from duckdb.runners.ray.cluster_resource_coordinator import (
-    ActorResourceBundle,
     ClusterQueryResourceCoordinator,
-    ElasticGpuDemandError,
     NodeCapacity,
     QueryDemand,
     read_ray_node_capacities,
 )
-from duckdb.runners.ray.query_resource_graph import ActorPlacement, ResourceVector
+from duckdb.runners.ray.query_resource_graph import ResourceVector
 
 
 def _r(
@@ -46,32 +43,14 @@ def _demand(
     desired: ResourceVector,
     weight: float = 1,
     priority: int = 0,
-    actor_bundles: tuple[ResourceVector, ...] = (),
 ) -> QueryDemand:
-    tagged_actor_bundles = tuple(
-        ActorResourceBundle(
-            resource_unit_id="resource:actor",
-            actor_index=index,
-            resources=bundle,
-        )
-        for index, bundle in enumerate(actor_bundles)
-    )
-    actor_total = _r()
-    for bundle in actor_bundles:
-        actor_total = actor_total + bundle
-    task_bundles = ()
-    if actor_total.fits_within(minimum):
-        remainder = minimum - actor_total
-        if not remainder.is_zero():
-            task_bundles = (remainder,)
     return QueryDemand(
         query_id=query_id,
         minimum=minimum,
         desired=desired,
         weight=weight,
         priority=priority,
-        actor_bundles=tagged_actor_bundles,
-        task_bundles=task_bundles,
+        task_bundles=() if minimum.is_zero() else (minimum,),
     )
 
 
@@ -172,6 +151,12 @@ def test_soft_only_query_gets_node_allocation_without_native_hard_minimum():
     assert allocation.resources == _r(store=400)
     assert allocation.node_allocations[0].node_id == "node-a"
     assert allocation.node_allocations[0].resources == _r(store=400)
+    assert coordinator.query_state("native-only", allocation.generation) == "RUNNING"
+
+    with pytest.raises(ValueError, match="stale allocation generation"):
+        coordinator.query_state("native-only", allocation.generation + 1)
+    with pytest.raises(KeyError, match="query is not registered"):
+        coordinator.query_state("missing", allocation.generation)
 
 
 @pytest.mark.parametrize(
@@ -181,7 +166,6 @@ def test_soft_only_query_gets_node_allocation_without_native_hard_minimum():
         pytest.param("copy", "deepcopy", 1, id="state-staging"),
         pytest.param("coordinator", "_rebalance_locked", 1, id="rebalance-entry"),
         pytest.param("coordinator", "_place_bundle", 1, id="minimum-placement"),
-        pytest.param("module", "ActorPlacement", 1, id="actor-placement"),
         pytest.param("coordinator", "_weighted_drf_extras", 1, id="fair-share"),
         pytest.param("coordinator", "_place_divisible", 1, id="divisible-placement"),
         pytest.param("module", "NodeResourceAllocation", 1, id="allocation-publication"),
@@ -229,7 +213,6 @@ def test_register_query_failure_is_atomic_across_rebalance_phases(
                 "failed",
                 minimum=actor_bundle,
                 desired=_r(cpu=3, gpu=1, heap=300),
-                actor_bundles=(actor_bundle,),
             ),
             now=5,
         )
@@ -424,7 +407,7 @@ def test_query_desired_resources_are_downward_caps_not_capacity_overrides():
     assert allocation.resources == _r(cpu=3, heap=300, store=400)
 
 
-def test_query_demand_rejects_object_store_hard_minimum_and_placement_bundles():
+def test_query_demand_rejects_object_store_hard_minimum_and_task_bundles():
     with pytest.raises(ValueError, match="minimum query resources may not hard-reserve object-store bytes"):
         QueryDemand(
             query_id="minimum-store",
@@ -441,42 +424,27 @@ def test_query_demand_rejects_object_store_hard_minimum_and_placement_bundles():
             task_bundles=(_r(cpu=1, store=1),),
         )
 
-    with pytest.raises(ValueError, match="actor resource bundles may not hard-reserve object-store bytes"):
-        ActorResourceBundle(
-            resource_unit_id="resource:actor-store",
-            actor_index=0,
-            resources=_r(cpu=1, store=1),
-        )
 
-
-def test_query_demand_rejects_elastic_gpu_headroom_before_registration():
+def test_query_demand_allocates_gpu_headroom_as_a_soft_divisible_share():
     minimum = _r(cpu=1, gpu=1, heap=100)
+    desired = _r(cpu=4, gpu=4, heap=400)
+    coordinator = ClusterQueryResourceCoordinator(
+        (_node("gpu-node", cpu=4, gpu=4, heap=400),),
+    )
 
-    with pytest.raises(
-        ElasticGpuDemandError,
-        match=r"GPU resources cannot be elastic: minimum=1, desired=4",
-    ) as raised:
+    allocation = coordinator.register_query(
         _demand(
             "elastic-gpu",
             minimum=minimum,
-            desired=_r(cpu=4, gpu=4, heap=400),
-            actor_bundles=(minimum,),
-        )
+            desired=desired,
+        ),
+        now=0,
+    )
 
-    assert raised.value.to_dict() == {
-        "code": "ELASTIC_GPU_UNSUPPORTED",
-        "query_id": "elastic-gpu",
-        "resource": "gpu",
-        "minimum": 1.0,
-        "desired": 4.0,
-    }
-    restored = pickle.loads(pickle.dumps(raised.value))
-    assert isinstance(restored, ElasticGpuDemandError)
-    assert str(restored) == str(raised.value)
-    assert restored.to_dict() == raised.value.to_dict()
+    assert allocation.resources == desired
 
 
-def test_fixed_gpu_bundle_receives_only_divisible_cpu_and_memory_headroom():
+def test_gpu_task_bundle_receives_divisible_soft_headroom():
     coordinator = ClusterQueryResourceCoordinator(
         (_node("gpu-node", cpu=4, gpu=1, heap=400, store=400),),
     )
@@ -488,66 +456,11 @@ def test_fixed_gpu_bundle_receives_only_divisible_cpu_and_memory_headroom():
             "fixed-gpu",
             minimum=fixed_gpu_bundle,
             desired=desired,
-            actor_bundles=(fixed_gpu_bundle,),
         ),
         now=0,
     )
 
     assert allocation.resources == desired
-    assert allocation.actor_placements == (
-        ActorPlacement(resource_unit_id="resource:actor", actor_index=0, node_id="gpu-node"),
-    )
-
-
-def test_fractional_gpu_actor_bundles_are_placed_whole_on_heterogeneous_nodes():
-    coordinator = ClusterQueryResourceCoordinator(
-        (
-            _node("half-gpu", cpu=2, gpu=0.5, heap=200),
-            _node("quarter-gpu", cpu=1, gpu=0.25, heap=100),
-        )
-    )
-    bundle = _r(cpu=1, gpu=0.25, heap=100)
-    fixed_pool = bundle.scale(3)
-
-    allocation = coordinator.register_query(
-        _demand(
-            "fractional-gpu",
-            minimum=fixed_pool,
-            desired=fixed_pool,
-            actor_bundles=(bundle, bundle, bundle),
-        ),
-        now=0,
-    )
-
-    assert allocation.resources == fixed_pool
-    assert allocation.actor_placements == (
-        ActorPlacement(resource_unit_id="resource:actor", actor_index=0, node_id="quarter-gpu"),
-        ActorPlacement(resource_unit_id="resource:actor", actor_index=1, node_id="half-gpu"),
-        ActorPlacement(resource_unit_id="resource:actor", actor_index=2, node_id="half-gpu"),
-    )
-
-
-def test_indivisible_gpu_actor_bundle_must_fit_one_node_not_cluster_aggregate():
-    coordinator = ClusterQueryResourceCoordinator(
-        (
-            _node("n1", cpu=4, gpu=0.5, heap=1_000, store=1_000),
-            _node("n2", cpu=4, gpu=0.5, heap=1_000, store=1_000),
-        )
-    )
-    bundle = _r(cpu=1, gpu=1, heap=100)
-
-    allocation = coordinator.register_query(
-        _demand(
-            "gpu",
-            minimum=bundle,
-            desired=bundle,
-            actor_bundles=(bundle,),
-        ),
-        now=0,
-    )
-
-    assert allocation.resources.is_zero()
-    assert coordinator.snapshot()["queries"]["gpu"]["state"] == "PENDING_RESOURCES"
 
 
 def test_indivisible_gpu_task_bundle_must_fit_one_node_not_cluster_aggregate():
@@ -587,19 +500,7 @@ def test_minimum_task_vector_must_fit_one_node_not_cross_node_dimensions():
     assert coordinator.snapshot()["queries"]["coherent-task"]["state"] == "PENDING_RESOURCES"
 
 
-def test_actor_bundle_resources_must_be_part_of_query_minimum():
-    bundle = _r(cpu=2, gpu=1, heap=200)
-
-    with pytest.raises(ValueError, match="exactly equal"):
-        _demand(
-            "gpu",
-            minimum=_r(cpu=1, gpu=1, heap=100),
-            desired=bundle,
-            actor_bundles=(bundle,),
-        )
-
-
-def test_gpu_actor_pools_use_priority_then_fifo_without_partial_bundle_grants():
+def test_gpu_task_minima_use_priority_then_fifo():
     coordinator = ClusterQueryResourceCoordinator(
         (
             _node("n1", cpu=4, gpu=1, heap=1_000, store=1_000),
@@ -607,9 +508,9 @@ def test_gpu_actor_pools_use_priority_then_fifo_without_partial_bundle_grants():
         )
     )
     bundle = _r(cpu=1, gpu=1, heap=100)
-    low = _demand("low", minimum=bundle, desired=bundle, priority=0, actor_bundles=(bundle,))
-    high_old = _demand("high-old", minimum=bundle, desired=bundle, priority=10, actor_bundles=(bundle,))
-    high_new = _demand("high-new", minimum=bundle, desired=bundle, priority=10, actor_bundles=(bundle,))
+    low = _demand("low", minimum=bundle, desired=bundle, priority=0)
+    high_old = _demand("high-old", minimum=bundle, desired=bundle, priority=10)
+    high_new = _demand("high-new", minimum=bundle, desired=bundle, priority=10)
 
     coordinator.register_query(high_old, now=0)
     coordinator.register_query(high_new, now=1)
@@ -622,7 +523,7 @@ def test_gpu_actor_pools_use_priority_then_fifo_without_partial_bundle_grants():
     assert sum(snapshot[query_id]["allocation"]["resources"]["gpu"] for query_id in snapshot) == 2
 
 
-def test_running_gpu_actor_pool_is_not_preempted_by_later_high_priority_query():
+def test_live_usage_becomes_debt_when_priority_reassigns_soft_allocation():
     coordinator = ClusterQueryResourceCoordinator((_node("n1", cpu=4, gpu=1, heap=1_000, store=1_000),))
     bundle = _r(cpu=1, gpu=1, heap=100)
     low = coordinator.register_query(
@@ -631,7 +532,6 @@ def test_running_gpu_actor_pool_is_not_preempted_by_later_high_priority_query():
             minimum=bundle,
             desired=bundle,
             priority=0,
-            actor_bundles=(bundle,),
         ),
         now=0,
     )
@@ -648,16 +548,17 @@ def test_running_gpu_actor_pool_is_not_preempted_by_later_high_priority_query():
             minimum=bundle,
             desired=bundle,
             priority=100,
-            actor_bundles=(bundle,),
         ),
         now=2,
     )
     queries = coordinator.snapshot()["queries"]
 
     assert low.resources == bundle
-    assert high.resources.is_zero()
-    assert queries["low-running"]["state"] == "RUNNING"
-    assert queries["high-pending"]["state"] == "PENDING_RESOURCES"
+    assert high.resources == bundle
+    assert queries["low-running"]["state"] == "ALLOCATION_DEBT"
+    assert queries["low-running"]["allocation"]["resources"] == _r().to_dict()
+    assert queries["low-running"]["allocation_debt"] == bundle.to_dict()
+    assert queries["high-pending"]["state"] == "RUNNING"
 
 
 def test_capacity_shrink_preserves_observed_usage_as_debt_and_stops_new_admission():
@@ -838,7 +739,6 @@ def test_node_allocations_never_exceed_any_node_capacity():
             "gpu",
             minimum=bundle,
             desired=_r(cpu=3, gpu=1, heap=300, store=300),
-            actor_bundles=(bundle,),
         ),
         now=0,
     )
@@ -858,67 +758,3 @@ def test_node_allocations_never_exceed_any_node_capacity():
             used_by_node[node_id] = used_by_node[node_id] + ResourceVector.from_dict(payload)
     for node_id, payload in snapshot["nodes"].items():
         assert used_by_node[node_id].fits_within(ResourceVector.from_dict(payload["resources"]))
-
-
-def test_actor_placement_is_never_silently_migrated_after_node_loss():
-    actor = _r(cpu=1, gpu=1, heap=100)
-    coordinator = ClusterQueryResourceCoordinator(
-        (
-            _node("n1", cpu=2, gpu=1, heap=200),
-            _node("n2", cpu=2, gpu=1, heap=200),
-        )
-    )
-    first = coordinator.register_query(
-        _demand(
-            "actor-query",
-            minimum=actor,
-            desired=actor,
-            actor_bundles=(actor,),
-        )
-    )
-    assert first.actor_placements[0].node_id == "n1"
-
-    coordinator.update_node_capacities((_node("n2", cpu=2, gpu=1, heap=200),))
-    lost = coordinator.snapshot()["queries"]["actor-query"]
-
-    assert lost["state"] == "ACTOR_PLACEMENT_LOST"
-    assert lost["allocation"]["resources"] == _r().to_dict()
-    assert lost["allocation"]["actor_placements"] == []
-    assert lost["can_admit_new_tasks"] is False
-    assert "no longer available" in lost["rejection_reason"]
-
-    # Loss is terminal for this query generation. Returning capacity cannot
-    # make an already-running actor-backed executor appear migrated.
-    coordinator.update_node_capacities(
-        (
-            _node("n1", cpu=2, gpu=1, heap=200),
-            _node("n2", cpu=2, gpu=1, heap=200),
-        )
-    )
-    assert coordinator.snapshot()["queries"]["actor-query"]["state"] == "ACTOR_PLACEMENT_LOST"
-
-
-def test_pinned_actor_allocation_remains_valid_when_task_minimum_is_temporarily_unavailable():
-    actor = _r(cpu=1, gpu=1, heap=100)
-    task = _r(cpu=1, heap=100)
-    minimum = actor + task
-    coordinator = ClusterQueryResourceCoordinator((_node("n1", cpu=2, gpu=1, heap=200),))
-    coordinator.register_query(
-        _demand(
-            "actor-and-task",
-            minimum=minimum,
-            desired=minimum,
-            actor_bundles=(actor,),
-        )
-    )
-
-    coordinator.update_node_capacities((_node("n1", cpu=1, gpu=1, heap=100),))
-    pending = coordinator.snapshot()["queries"]["actor-and-task"]
-
-    assert pending["state"] == "PENDING_RESOURCES"
-    assert pending["allocation"]["resources"] == actor.to_dict()
-    assert pending["allocation"]["node_allocations"] == [{"node_id": "n1", "resources": actor.to_dict()}]
-    assert pending["allocation"]["actor_placements"] == [
-        {"resource_unit_id": "resource:actor", "actor_index": 0, "node_id": "n1"}
-    ]
-    assert pending["can_admit_new_tasks"] is False

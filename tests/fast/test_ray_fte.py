@@ -271,7 +271,6 @@ def _register_fte_query(query_id: str, node_id: str, *, partitions: int, task_sl
                     resources=allocation_resources,
                 ),
             ),
-            actor_placements=(),
             generation=1,
         ),
     )

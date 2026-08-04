@@ -30,7 +30,13 @@ from duckdb.runners.ray.worker import (
 
 
 @contextmanager
-def _registered_low_level_plan(plan, con, *, node_id=None):
+def _registered_low_level_plan(
+    plan,
+    con,
+    *,
+    node_id=None,
+    refresh_phase_allocation=False,
+):
     """Exercise the internal C++ runner under the mandatory graph contract."""
     from duckdb.runners.ray.query_resource_graph import (
         NodeResourceAllocation,
@@ -65,6 +71,28 @@ def _registered_low_level_plan(plan, con, *, node_id=None):
         heap_bytes=1 << 50,
         object_store_bytes=1 << 50,
     )
+    generation = 1
+    manager_holder = {}
+
+    def _refresh_phase_allocation(_eligible_unit_ids):
+        nonlocal generation
+        if not refresh_phase_allocation:
+            return
+        generation += 1
+        manager_holder["manager"].update_allocation(
+            QueryAllocation(
+                resources=allocation_resources,
+                node_allocations=(
+                    NodeResourceAllocation(
+                        node_id=node_id,
+                        resources=allocation_resources,
+                    ),
+                ),
+                generation=generation,
+            ),
+            admission_open=True,
+        )
+
     manager = register_query_resource_graph(
         graph,
         QueryAllocation(
@@ -75,15 +103,15 @@ def _registered_low_level_plan(plan, con, *, node_id=None):
                     resources=allocation_resources,
                 ),
             ),
-            actor_placements=(),
             generation=1,
         ),
+        on_eligible_units_change=_refresh_phase_allocation,
     )
+    manager_holder["manager"] = manager
     for unit in graph.units:
         manager.update_unit_state(
             unit.resource_unit_id,
             runnable=True,
-            actor_ready=True,
         )
     try:
         yield graph
@@ -225,6 +253,12 @@ def _make_local_query_driver_actor():
     runner.plan_runner = None
     runner._active_udf_actors = []
     runner._active_udf_actors_by_plan = {}
+    runner._active_udf_actor_by_unit = {}
+    runner._query_udf_actor_lifecycle_locks = {}
+    runner._query_udf_actor_nodes = {}
+    runner._query_udf_session_configs = {}
+    runner._query_udf_actor_activation_tasks = {}
+    runner._query_resource_admission_loop = None
     runner._active_vllm_actors = []
     runner._active_vllm_actors_by_plan = {}
     runner._plan_runner_lifecycle_lock = threading.RLock()
@@ -508,7 +542,6 @@ def _bind_test_query_resource_owner(
         QueryAllocation(
             resources=resources,
             node_allocations=(NodeResourceAllocation(node_id="node-a", resources=resources),),
-            actor_placements=(),
             generation=1,
         ),
     )
@@ -613,7 +646,6 @@ def test_query_driver_run_plan_cancellation_waits_for_startup_and_tears_down(mon
         plan,
         plan_id,
         _graph,
-        _allocation,
         _query_connection,
         _session_config,
     ):
@@ -681,7 +713,6 @@ def test_session_close_does_not_block_actor_loop_during_stream_startup(monkeypat
         "_register_query_resources",
         _query_registration_stub("slow-stream-startup"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
 
     def _cleanup(_self, plan_id):
         runner.curr_plans.pop(plan_id, None)
@@ -732,7 +763,6 @@ def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(mon
         _self,
         _plan,
         _graph,
-        _allocation,
         *,
         query_connection,
         session_config,
@@ -753,7 +783,6 @@ def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(mon
         "_register_query_resources",
         _query_registration_stub("copy-plan"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda _self, _graph: None)
     monkeypatch.setattr(
         cls,
         "_drop_query_fragments_sync",
@@ -780,7 +809,7 @@ def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(mon
     assert captured["lifecycle"] == ["snapshot", "teardown"]
 
 
-def test_query_driver_committed_copy_preserves_terminal_actor_placement_warning(monkeypatch):
+def test_query_driver_committed_copy_preserves_late_actor_initialization_warning(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     physical_plan = _FakePhysicalPlanWithoutPlanAttr("copy-plan-terminal")
     logical_plan = _FakeLogicalPlan(physical_plan)
@@ -788,7 +817,7 @@ def test_query_driver_committed_copy_preserves_terminal_actor_placement_warning(
 
     class _PlanRunner:
         def run_copy_plan(self, _plan, _conn):
-            runner._query_terminal_errors["copy-query-terminal"] = "fixed Ray actor placement was lost"
+            runner._query_terminal_errors["copy-query-terminal"] = "Ray actor UDF pool initialization failed"
             return _committed_copy_result(ok=True)
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
@@ -799,7 +828,6 @@ def test_query_driver_committed_copy_preserves_terminal_actor_placement_warning(
         "_register_query_resources",
         _query_registration_stub("copy-query-terminal"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
 
     def _teardown(_self, plan_id, query_id, *, drop_fragments):
         teardown_calls.append((plan_id, query_id, drop_fragments))
@@ -814,7 +842,7 @@ def test_query_driver_committed_copy_preserves_terminal_actor_placement_warning(
     ]
     assert outcome.write_state == "committed"
     assert outcome.cleanup_state == "complete"
-    assert any("fixed Ray actor placement was lost" in warning for warning in outcome.cleanup_warnings)
+    assert any("Ray actor UDF pool initialization failed" in warning for warning in outcome.cleanup_warnings)
 
 
 def test_query_driver_copy_progress_failure_returns_committed_warning(monkeypatch):
@@ -834,7 +862,6 @@ def test_query_driver_copy_progress_failure_returns_committed_warning(monkeypatc
         "_register_query_resources",
         _query_registration_stub("copy-progress-contract-failure"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(
         cls,
         "_build_local_progress_snapshot",
@@ -861,194 +888,6 @@ def test_query_driver_copy_progress_failure_returns_committed_warning(monkeypatc
     assert outcome.final_progress_snapshot is None
     assert len(outcome.cleanup_warnings) == 1
     assert "progress finalization failed: RuntimeError: invalid progress topology" in outcome.cleanup_warnings[0]
-
-
-def test_query_driver_failure_immediately_after_commit_replays_success(monkeypatch):
-    import duckdb.runners.ray.fte_fragment_scheduler as scheduler_mod
-
-    cls, runner = _make_local_query_driver_actor()
-    plan_id = "copy-failure-immediately-after-commit"
-    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
-    plan_finished = threading.Event()
-    plan_calls = 0
-    teardown_calls = []
-
-    class _PlanRunner:
-        def run_copy_plan(self, _plan, _conn):
-            nonlocal plan_calls
-            plan_calls += 1
-            plan_finished.set()
-            return _committed_copy_result(rows_copied=5)
-
-    def _fail_after_commit(_self, _actors):
-        assert plan_finished.wait(timeout=2.0)
-        raise RuntimeError("injected immediately-after-commit failure")
-
-    def _teardown(_self, actual_plan_id, query_id, *, drop_fragments):
-        teardown_calls.append((actual_plan_id, query_id, drop_fragments))
-        cls._release_plan_session_state(runner, actual_plan_id)
-
-    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
-    monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", _fail_after_commit)
-    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
-    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
-    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
-    monkeypatch.setattr(
-        scheduler_mod,
-        "wait_for_fte_query_progress_topology",
-        lambda *_args, **_kwargs: plan_finished.wait(timeout=2.0),
-    )
-
-    first = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
-    replayed = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
-
-    assert first == replayed
-    assert first.write_state == "committed"
-    assert first.cleanup_state == "complete"
-    assert first.final_progress_snapshot is None
-    assert any("injected immediately-after-commit failure" in warning for warning in first.cleanup_warnings), (
-        first.cleanup_warnings
-    )
-    assert plan_calls == 1
-    assert teardown_calls == [(plan_id, plan_id, True)]
-
-
-def test_query_driver_concurrent_startup_failure_preserves_unknown_copy_outcome(monkeypatch):
-    import duckdb.runners.ray.fte_fragment_scheduler as scheduler_mod
-
-    cls, runner = _make_local_query_driver_actor()
-    plan_id = "copy-startup-failure-outcome-unknown"
-    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
-    plan_finished = threading.Event()
-    plan_calls = 0
-    teardown_calls = []
-    unknown_result = {
-        "rows_copied": 5,
-        "copy_output_committed": False,
-        "copy_output_outcome_unknown": True,
-        "copy_output_outcome_error": "committed-marker readback was inconclusive",
-        "copy_output_base_path": "s3://bucket/out",
-        "copy_output_run_id": "run-startup-unknown",
-        "copy_output_manifest_path": "s3://bucket/out.duckdb_commit/run-startup-unknown/manifest.txt",
-        "copy_output_committed_marker_path": "s3://bucket/out.duckdb_commit/run-startup-unknown/committed",
-    }
-
-    class _PlanRunner:
-        def run_copy_plan(self, _plan, _conn):
-            nonlocal plan_calls
-            plan_calls += 1
-            plan_finished.set()
-            return unknown_result
-
-    def _fail_after_copy(_self, _actors):
-        assert plan_finished.wait(timeout=2.0)
-        raise RuntimeError("injected concurrent COPY startup failure")
-
-    def _teardown(_self, actual_plan_id, query_id, *, drop_fragments):
-        teardown_calls.append((actual_plan_id, query_id, drop_fragments))
-        cls._release_plan_session_state(runner, actual_plan_id)
-
-    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
-    monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", _fail_after_copy)
-    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
-    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
-    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
-    monkeypatch.setattr(
-        scheduler_mod,
-        "wait_for_fte_query_progress_topology",
-        lambda *_args, **_kwargs: plan_finished.wait(timeout=2.0),
-    )
-
-    for _ in range(2):
-        with pytest.raises(driver.CopyOutcomeUnknownError) as error:
-            asyncio.run(_run_actor_copy_plan(runner, logical_plan))
-        assert error.value.run_id == "run-startup-unknown"
-        assert any("injected concurrent COPY startup failure" in warning for warning in error.value.cleanup_warnings)
-        assert "injected concurrent COPY startup failure" in str(error.value)
-        assert error.value.safe_to_retry is False
-
-    assert plan_calls == 1
-    assert teardown_calls == [(plan_id, plan_id, True)]
-
-
-def test_query_driver_postcommit_startup_drain_cancellation_replays_success(monkeypatch):
-    import duckdb.runners.ray.fte_fragment_scheduler as scheduler_mod
-
-    cls, runner = _make_local_query_driver_actor()
-    plan_id = "copy-postcommit-startup-drain-cancellation"
-    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
-    plan_finished = threading.Event()
-    topology_started = threading.Event()
-    topology_release = threading.Event()
-    teardown_finished = threading.Event()
-    startup_drain_started = threading.Event()
-    plan_calls = 0
-    original_gather = asyncio.gather
-
-    class _PlanRunner:
-        @staticmethod
-        def run_copy_plan(_plan, _conn):
-            nonlocal plan_calls
-            plan_calls += 1
-            plan_finished.set()
-            return _committed_copy_result(rows_copied=19)
-
-    def _fail_actor_barrier(_self, _actors):
-        assert plan_finished.wait(timeout=2.0)
-        raise RuntimeError("actor barrier failed after commit")
-
-    def _wait_for_topology(*_args, **_kwargs):
-        topology_started.set()
-        assert topology_release.wait(timeout=2.0)
-
-    def _teardown(_self, actual_plan_id, _query_id, *, drop_fragments):
-        assert actual_plan_id == plan_id
-        assert drop_fragments is True
-        cls._release_plan_session_state(runner, actual_plan_id)
-        teardown_finished.set()
-
-    def _tracked_gather(*args, **kwargs):
-        startup_drain_started.set()
-        return original_gather(*args, **kwargs)
-
-    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
-    monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", _fail_actor_barrier)
-    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
-    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
-    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
-    monkeypatch.setattr(driver.asyncio, "gather", _tracked_gather)
-    monkeypatch.setattr(
-        scheduler_mod,
-        "wait_for_fte_query_progress_topology",
-        _wait_for_topology,
-    )
-
-    async def _cancel_during_startup_drain():
-        copy_task = asyncio.create_task(_run_actor_copy_plan(runner, logical_plan))
-        assert await asyncio.to_thread(topology_started.wait, 1.0)
-        assert await asyncio.to_thread(teardown_finished.wait, 1.0)
-        assert await asyncio.to_thread(startup_drain_started.wait, 1.0)
-        operation_task = runner._copy_operations_inflight[plan_id].task
-        operation_task.cancel()
-        await asyncio.sleep(0)
-        topology_release.set()
-        outcome = await asyncio.wait_for(copy_task, timeout=1.0)
-        replayed = await _run_actor_copy_plan(runner, logical_plan)
-        return outcome, replayed
-
-    outcome, replayed = asyncio.run(_cancel_during_startup_drain())
-
-    assert outcome == replayed
-    assert outcome.write_state == "committed"
-    assert outcome.result["rows_copied"] == 19
-    assert any("actor barrier failed after commit" in warning for warning in outcome.cleanup_warnings)
-    assert plan_calls == 1
 
 
 def test_query_driver_concurrent_copy_retries_share_one_write(monkeypatch):
@@ -1080,7 +919,6 @@ def test_query_driver_concurrent_copy_retries_share_one_write(monkeypatch):
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
@@ -1123,7 +961,6 @@ def test_query_driver_copy_result_logging_failure_replays_committed_success(monk
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
     monkeypatch.setattr(
@@ -1168,7 +1005,6 @@ def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(m
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
@@ -1221,7 +1057,6 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
     for operation in (
@@ -1277,7 +1112,6 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
     for operation in (
@@ -1349,7 +1183,6 @@ def test_query_driver_evicted_copy_outcome_refuses_reexecution(monkeypatch):
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _register)
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
@@ -1517,7 +1350,6 @@ def test_query_driver_copy_progress_cancellation_waits_before_teardown(monkeypat
         "_register_query_resources",
         _query_registration_stub(plan_id),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", _build_snapshot)
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
@@ -1568,7 +1400,6 @@ def test_query_driver_copy_operation_cancellation_waits_for_native_commit(monkey
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
@@ -1622,7 +1453,6 @@ def test_query_driver_copy_teardown_cancellation_reports_cleanup_complete(monkey
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
@@ -1647,238 +1477,39 @@ def test_query_driver_copy_teardown_cancellation_reports_cleanup_complete(monkey
     assert not any("CancelledError" in warning for warning in outcome.cleanup_warnings)
 
 
-def test_query_driver_copy_opens_actor_unit_after_topology_and_actor_barriers(monkeypatch):
-    import duckdb.runners.ray.fte_fragment_scheduler as scheduler_mod
-
+def test_query_driver_copy_starts_without_eager_actor_or_topology_barriers(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
-    physical_plan = _FakePhysicalPlanWithoutPlanAttr("copy-startup-order")
-    logical_plan = _FakeLogicalPlan(physical_plan)
-    plan_started = threading.Event()
-    actor_unit_open = threading.Event()
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr("copy-lazy-actor-startup"))
     events: list[str] = []
 
     class _PlanRunner:
-        def run_copy_plan(self, _plan, _conn):
-            events.append("plan-started")
-            plan_started.set()
-            assert actor_unit_open.wait(timeout=2.0)
-            events.append("plan-finished")
-            return _committed_copy_result(ok=True)
+        @staticmethod
+        def run_copy_plan(_plan, _conn):
+            events.append("plan")
+            return _committed_copy_result(rows_copied=1)
 
-    def wait_for_topology(query_id, *, timeout_s):
-        assert query_id == "copy-startup-order"
-        assert timeout_s > 0
-        assert plan_started.wait(timeout=2.0)
-        events.append("topology-ready")
-
-    def wait_for_actors(_self, actor_pools):
-        assert actor_pools == ["actor-pool"]
-        events.append("actors-ready")
-
-    def mark_actor_units(_self, _graph):
-        events.append("actor-unit-open")
-        actor_unit_open.set()
-
-    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
-    monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", wait_for_actors)
+    monkeypatch.setattr(
+        cls,
+        "_precreate_udf_actors",
+        lambda *_args, **_kwargs: events.append("actor-locators") or [],
+    )
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
     monkeypatch.setattr(
         cls,
         "_register_query_resources",
-        _query_registration_stub("copy-startup-order"),
+        _query_registration_stub("copy-lazy-actor-startup"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", mark_actor_units)
+    monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
     monkeypatch.setattr(cls, "_teardown_plan_resources", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {})
-    monkeypatch.setattr(
-        scheduler_mod,
-        "wait_for_fte_query_progress_topology",
-        wait_for_topology,
-    )
 
     outcome = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
 
-    assert outcome.result["ok"] is True
+    assert outcome.result["rows_copied"] == 1
     assert outcome.write_state == "committed"
-    open_index = events.index("actor-unit-open")
-    assert events.index("topology-ready") < open_index
-    assert events.index("actors-ready") < open_index
-    assert open_index < events.index("plan-finished")
-
-
-def test_query_driver_copy_accepts_plan_success_before_startup_barriers(monkeypatch):
-    import duckdb.runners.ray.fte_fragment_scheduler as scheduler_mod
-
-    cls, runner = _make_local_query_driver_actor()
-    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr("copy-plan-before-startup-barriers"))
-    plan_finished = threading.Event()
-    release_barriers = threading.Event()
-    events: list[str] = []
-
-    class _PlanRunner:
-        def run_copy_plan(self, _plan, _conn):
-            events.append("plan-finished")
-            plan_finished.set()
-            return _committed_copy_result(rows_copied=0)
-
-    def wait_for_topology(query_id, *, timeout_s):
-        assert query_id == "copy-plan-before-startup-barriers"
-        assert timeout_s > 0
-        assert plan_finished.wait(timeout=2.0)
-        assert release_barriers.wait(timeout=2.0)
-        events.append("topology-ready")
-
-    def wait_for_actors(_self, actor_pools):
-        assert actor_pools == ["actor-pool"]
-        assert plan_finished.wait(timeout=2.0)
-        assert release_barriers.wait(timeout=2.0)
-        events.append("actors-ready")
-
-    def mark_actor_units(_self, _graph):
-        events.append("actor-unit-open")
-
-    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
-    monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", wait_for_actors)
-    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
-    monkeypatch.setattr(
-        cls,
-        "_register_query_resources",
-        _query_registration_stub("copy-plan-before-startup-barriers"),
-    )
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", mark_actor_units)
-    monkeypatch.setattr(cls, "_teardown_plan_resources", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {})
-    monkeypatch.setattr(
-        scheduler_mod,
-        "wait_for_fte_query_progress_topology",
-        wait_for_topology,
-    )
-
-    release_thread = threading.Thread(
-        target=lambda: (plan_finished.wait(timeout=2.0), release_barriers.set()),
-        daemon=True,
-    )
-    release_thread.start()
-    outcome = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
-    release_thread.join(timeout=2.0)
-
-    assert outcome.result["rows_copied"] == 0
-    assert outcome.write_state == "committed"
-    open_index = events.index("actor-unit-open")
-    assert events.index("plan-finished") < events.index("topology-ready") < open_index
-    assert events.index("plan-finished") < events.index("actors-ready") < open_index
-
-
-def test_query_driver_copy_plan_failure_interrupts_startup_barriers(monkeypatch):
-    import duckdb.runners.ray.fte_fragment_scheduler as scheduler_mod
-
-    cls, runner = _make_local_query_driver_actor()
-    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr("copy-plan-startup-failure"))
-    teardown_started = threading.Event()
-    marked_ready = []
-
-    class _PlanRunner:
-        def run_copy_plan(self, _plan, _conn):
-            raise ValueError("native plan startup failed")
-
-    def wait_until_teardown(*_args, **_kwargs):
-        assert teardown_started.wait(timeout=2.0)
-
-    def teardown(*_args, **_kwargs):
-        teardown_started.set()
-
-    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
-    monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", wait_until_teardown)
-    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
-    monkeypatch.setattr(
-        cls,
-        "_register_query_resources",
-        _query_registration_stub("copy-plan-startup-failure"),
-    )
-    monkeypatch.setattr(
-        cls,
-        "_mark_query_actor_units_ready",
-        lambda *_args: marked_ready.append(True),
-    )
-    monkeypatch.setattr(cls, "_teardown_plan_resources", teardown)
-    monkeypatch.setattr(
-        scheduler_mod,
-        "wait_for_fte_query_progress_topology",
-        wait_until_teardown,
-    )
-
-    with pytest.raises(ValueError, match="native plan startup failed"):
-        asyncio.run(_run_actor_copy_plan(runner, logical_plan))
-
-    assert teardown_started.is_set()
-    assert marked_ready == []
-
-
-@pytest.mark.parametrize(
-    ("failing_barrier", "error_type", "message"),
-    [
-        ("actor", RuntimeError, "actor init failed"),
-        ("topology", TimeoutError, "topology init timed out"),
-    ],
-)
-def test_query_driver_copy_startup_barrier_failure_tears_down_plan(
-    monkeypatch,
-    failing_barrier,
-    error_type,
-    message,
-):
-    import duckdb.runners.ray.fte_fragment_scheduler as scheduler_mod
-
-    cls, runner = _make_local_query_driver_actor()
-    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(f"copy-{failing_barrier}-barrier-failure"))
-    teardown_started = threading.Event()
-    marked_ready = []
-
-    class _PlanRunner:
-        def run_copy_plan(self, _plan, _conn):
-            assert teardown_started.wait(timeout=2.0)
-            return {"ok": True}
-
-    def wait_for_actors(*_args):
-        if failing_barrier == "actor":
-            raise RuntimeError(message)
-
-    def wait_for_topology(*_args, **_kwargs):
-        if failing_barrier == "topology":
-            raise TimeoutError(message)
-
-    def teardown(*_args, **_kwargs):
-        teardown_started.set()
-
-    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: ["actor-pool"])
-    monkeypatch.setattr(cls, "_wait_for_udf_actors_ready", wait_for_actors)
-    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
-    monkeypatch.setattr(
-        cls,
-        "_register_query_resources",
-        _query_registration_stub(f"copy-{failing_barrier}-barrier-failure"),
-    )
-    monkeypatch.setattr(
-        cls,
-        "_mark_query_actor_units_ready",
-        lambda *_args: marked_ready.append(True),
-    )
-    monkeypatch.setattr(cls, "_teardown_plan_resources", teardown)
-    monkeypatch.setattr(
-        scheduler_mod,
-        "wait_for_fte_query_progress_topology",
-        wait_for_topology,
-    )
-
-    with pytest.raises(error_type, match=message):
-        asyncio.run(_run_actor_copy_plan(runner, logical_plan))
-
-    assert teardown_started.is_set()
-    assert marked_ready == []
+    assert events == ["actor-locators", "plan"]
+    assert not hasattr(cls, "_wait_for_udf_actors_ready")
+    assert not hasattr(cls, "_mark_query_actor_units_ready")
 
 
 def test_ray_query_driver_client_copy_refreshes_progress_and_uses_final_snapshot(monkeypatch):
@@ -2814,7 +2445,6 @@ def test_query_driver_run_plan_passes_distributed_physical_plan_wrapper(monkeypa
         _self,
         _plan,
         _graph,
-        _allocation,
         *,
         query_connection,
         session_config,
@@ -2835,7 +2465,6 @@ def test_query_driver_run_plan_passes_distributed_physical_plan_wrapper(monkeypa
         "_register_query_resources",
         _query_registration_stub("stream-plan"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda _self, _graph: None)
     monkeypatch.setattr(
         cls,
         "_release_query_resources",
@@ -2877,7 +2506,6 @@ def test_query_driver_run_plan_start_failure_runs_complete_teardown(monkeypatch)
         "_register_query_resources",
         _query_registration_stub("failed-query"),
     )
-    monkeypatch.setattr(cls, "_mark_query_actor_units_ready", lambda *_args: None)
     monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", _cleanup_udf_actors)
     monkeypatch.setattr(
         cls,
@@ -4453,7 +4081,7 @@ def test_normalize_native_task_result_rejects_legacy_shapes():
         _normalize_native_task_result(([], [], None))
 
 
-def test_fte_output_publication_is_bounded_by_block_target_and_task_window():
+def test_fte_output_publication_validates_metadata_without_hard_estimate_caps():
     lease = {
         "lease_id": "lease-1",
         "query_id": "q",
@@ -4468,13 +4096,18 @@ def test_fte_output_publication_is_bounded_by_block_target_and_task_window():
         lease,
     ) == (10, 1)
 
-    with pytest.raises(RuntimeError, match="block 0.*11.*target 10"):
-        _validate_fte_output_publication([PartitionMetadata(1, 11)], lease)
-    with pytest.raises(RuntimeError, match="total output bytes 21.*window 20"):
+    assert _validate_fte_output_publication([PartitionMetadata(1, 11)], lease) == (11,)
+    assert _validate_fte_output_publication(
+        [PartitionMetadata(1, 10), PartitionMetadata(1, 10), PartitionMetadata(0, 0)],
+        lease,
+    ) == (10, 10, 1)
+    assert (
         _validate_fte_output_publication(
-            [PartitionMetadata(1, 10), PartitionMetadata(1, 10), PartitionMetadata(0, 0)],
-            lease,
+            [],
+            {**lease, "target_output_block_bytes": 0, "output_window_bytes": 0},
         )
+        == ()
+    )
     with pytest.raises(RuntimeError, match="missing positive size_bytes"):
         _validate_fte_output_publication([PartitionMetadata(1, 0)], lease)
 
@@ -5891,7 +5524,7 @@ def test_get_next_partition_rejects_non_metadata_aware_fragment():
         )
 
 
-def test_get_next_partition_surfaces_terminal_actor_placement_loss_before_delivery():
+def test_get_next_partition_surfaces_late_actor_initialization_failure_before_delivery():
     cls, runner = _make_local_query_driver_actor()
     plan_id = "plan-placement-lost"
     query_id = "query-placement-lost"
@@ -5899,7 +5532,7 @@ def test_get_next_partition_surfaces_terminal_actor_placement_loss_before_delive
     undelivered = object()
     runner.curr_streams[plan_id] = _DummyStream([undelivered])
     runner.curr_plans[plan_id] = object()
-    runner._query_terminal_errors[query_id] = "fixed Ray actor placement was lost"
+    runner._query_terminal_errors[query_id] = "Ray actor UDF pool initialization failed"
     teardown_calls = []
 
     def _teardown(actual_plan_id, actual_query_id, *, drop_fragments):
@@ -5908,7 +5541,7 @@ def test_get_next_partition_surfaces_terminal_actor_placement_loss_before_delive
 
     runner._teardown_plan_resources = _teardown
 
-    with pytest.raises(RuntimeError, match="fixed Ray actor placement was lost"):
+    with pytest.raises(RuntimeError, match="Ray actor UDF pool initialization failed"):
         asyncio.run(
             cls.get_next_partition(
                 runner,
@@ -6559,6 +6192,36 @@ def test_run_plan_uses_distributed_worker_path(tmp_path):
         payload = ray.get(parts[0].object_ref)
     assert isinstance(payload, pa.Table)
     assert payload.to_pylist() == [{"c0": 1}, {"c0": 2}, {"c0": 3}]
+    con.close()
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.usefixtures("ray_local")
+def test_run_plan_continues_with_final_tasks_after_order_by_barrier(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    ray = pytest.importorskip("ray")
+
+    con = duckdb.connect()
+    src = tmp_path / "barrier_order_input.parquet"
+    con.sql("SELECT i::BIGINT AS x FROM range(32) tbl(i)").write_parquet(str(src))
+    relation = con.read_parquet(str(src)).repartition(4).order("x DESC")
+    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation,
+        str(uuid.uuid4()),
+    ).to_physical_plan(con)
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+
+    with _registered_low_level_plan(
+        plan,
+        con,
+        refresh_phase_allocation=True,
+    ) as graph:
+        assert len(graph.materialization_barriers) == 1
+        parts = list(iter(runner.run_plan(plan, con)))
+        tables = ray.get([part.object_ref for part in parts])
+
+    assert all(isinstance(table, pa.Table) for table in tables)
+    assert [value for table in tables for value in table.column(0).to_pylist()] == list(reversed(range(32)))
     con.close()
 
 

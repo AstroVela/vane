@@ -3,7 +3,10 @@
 
 import pytest
 
-from duckdb.runners.ray.cluster_resource_coordinator import ActorResourceBundle
+from duckdb.runners.ray.cluster_resource_coordinator import (
+    ClusterQueryResourceCoordinator,
+    NodeCapacity,
+)
 from duckdb.runners.ray.query_resource_graph import ResourceVector
 from duckdb.runners.ray.query_resource_graph_builder import (
     build_query_demand,
@@ -17,6 +20,10 @@ GIB = 1024**3
 MIB = 1024**2
 
 
+def _single_node_cluster(resources: ResourceVector) -> tuple[NodeCapacity, ...]:
+    return (NodeCapacity("node-a", resources),)
+
+
 def _metadata():
     query_id = "query-7"
     return {
@@ -27,6 +34,8 @@ def _metadata():
                 "node_name": "ScanSource",
                 "input_node_ids": [],
                 "is_sink": False,
+                "is_materialization_barrier": False,
+                "materialized_input_node_ids": [],
                 "num_partitions": 36,
                 "udf_payload": None,
             },
@@ -35,6 +44,8 @@ def _metadata():
                 "node_name": "StreamingUDF",
                 "input_node_ids": ["1"],
                 "is_sink": False,
+                "is_materialization_barrier": False,
+                "materialized_input_node_ids": [],
                 "num_partitions": 36,
                 "udf_payload": {
                     "execution_backend": "ray_task",
@@ -51,6 +62,8 @@ def _metadata():
                 "node_name": "StreamingUDF",
                 "input_node_ids": ["2"],
                 "is_sink": False,
+                "is_materialization_barrier": False,
+                "materialized_input_node_ids": [],
                 "num_partitions": 1,
                 "udf_payload": {
                     "execution_backend": "ray_actor",
@@ -68,6 +81,8 @@ def _metadata():
                 "node_name": "CopyFinish",
                 "input_node_ids": ["3"],
                 "is_sink": True,
+                "is_materialization_barrier": False,
+                "materialized_input_node_ids": [],
                 "num_partitions": 1,
                 "udf_payload": None,
             },
@@ -152,7 +167,7 @@ def test_builder_uses_two_logical_output_blocks_for_all_streaming_units():
     assert gpu_udf.generator_buffer_blocks == 2
 
 
-def test_builder_sizes_upstream_retention_window_for_downstream_compute_batch():
+def test_builder_keeps_generator_buffer_independent_of_downstream_compute_batch():
     metadata = _metadata()
     producer = metadata["nodes"][1]["udf_payload"]
     consumer = metadata["nodes"][2]["udf_payload"]
@@ -163,8 +178,11 @@ def test_builder_sizes_upstream_retention_window_for_downstream_compute_batch():
     cpu_udf = graph.unit_by_id(udf_unit_id_for_node("query-7", "2"))
 
     assert cpu_udf.target_output_block_bytes == 1024
-    assert cpu_udf.generator_buffer_blocks == 64
-    assert cpu_udf.output_window_bytes == 64 * 1024
+    # The producer only shapes Ray's streaming-generator buffer. Downstream
+    # accumulation is represented by exact managed ObjectRefs, not by inflating
+    # every upstream task's pending-output estimate.
+    assert cpu_udf.generator_buffer_blocks == 2
+    assert cpu_udf.output_window_bytes == 2 * 1024
 
 
 def test_builder_leaves_udf_heap_unreserved_when_memory_is_not_declared():
@@ -178,9 +196,23 @@ def test_builder_leaves_udf_heap_unreserved_when_memory_is_not_declared():
     assert graph.unit_by_id(udf_unit_id_for_node("query-7", "3")).resident_per_actor.heap_bytes == 0
 
     cluster = ResourceVector(cpu=64, gpu=4, heap_bytes=64 * GIB, object_store_bytes=64 * GIB)
-    demand = build_query_demand(graph, cluster)
+    demand = build_query_demand(graph, _single_node_cluster(cluster))
     assert demand.minimum.heap_bytes == 0
     assert demand.desired.heap_bytes == 0
+
+
+def test_builder_maps_materialized_physical_input_to_its_output_resource_unit():
+    metadata = _metadata()
+    materializer = metadata["nodes"][3]
+    materializer["node_name"] = "OrderBy"
+    materializer["is_materialization_barrier"] = True
+    materializer["materialized_input_node_ids"] = ["3"]
+
+    graph = build_query_resource_graph(metadata, env={})
+
+    assert len(graph.materialization_barriers) == 1
+    barrier = graph.materialization_barriers[0]
+    assert barrier.materialized_input_unit_ids == (udf_unit_id_for_node("query-7", "3"),)
 
 
 def test_builder_requires_declared_heap_to_be_positive():
@@ -209,6 +241,23 @@ def test_builder_rejects_missing_or_mismatched_preannotated_udf_resource_unit_id
         (lambda payload: payload.update({"legacy_operators": []}), "unknown fields"),
         (lambda payload: payload.update({"terminal_node_ids": ["missing"]}), "terminal node"),
         (lambda payload: payload["nodes"][1].update({"input_node_ids": ["missing"]}), "input node"),
+        (
+            lambda payload: payload["nodes"][1].update({"is_materialization_barrier": True}),
+            "if and only if",
+        ),
+        (
+            lambda payload: payload["nodes"][1].update({"materialized_input_node_ids": ["1", "1"]}),
+            "duplicate materialized",
+        ),
+        (
+            lambda payload: payload["nodes"][1].update(
+                {
+                    "is_materialization_barrier": True,
+                    "materialized_input_node_ids": ["4"],
+                }
+            ),
+            "not a direct input",
+        ),
     ],
 )
 def test_builder_rejects_incomplete_or_legacy_metadata(mutation, message):
@@ -234,11 +283,11 @@ def test_plan_digest_is_stable_for_node_order_but_changes_with_resources():
     assert graph_a.plan_digest != graph_c.plan_digest
 
 
-def test_query_demand_reserves_only_remote_process_bundles():
+def test_query_demand_hard_reserves_one_ray_task_and_soft_accounts_actor_processes():
     graph = build_query_resource_graph(_metadata(), env={})
     cluster = ResourceVector(cpu=64, gpu=4, heap_bytes=64 * GIB, object_store_bytes=64 * GIB)
 
-    demand = build_query_demand(graph, cluster)
+    demand = build_query_demand(graph, _single_node_cluster(cluster))
 
     assert demand.query_id == graph.query_id
     assert demand.desired == ResourceVector(
@@ -247,22 +296,10 @@ def test_query_demand_reserves_only_remote_process_bundles():
         heap_bytes=64 * GIB,
         object_store_bytes=64 * GIB,
     )
-    assert demand.actor_bundles == (
-        ActorResourceBundle(
-            resource_unit_id="resource:query-7:udf:node:3",
-            actor_index=0,
-            resources=ResourceVector(
-                cpu=1,
-                gpu=1,
-                heap_bytes=3 * GIB,
-            ),
-        ),
-    )
     assert demand.task_bundles == (ResourceVector(cpu=1, heap_bytes=1536 * MIB),)
     assert demand.minimum == ResourceVector(
-        cpu=2,
-        gpu=1,
-        heap_bytes=3 * GIB + 1536 * MIB,
+        cpu=1,
+        heap_bytes=1536 * MIB,
     )
 
 
@@ -273,13 +310,12 @@ def test_pure_native_query_demands_only_a_soft_object_store_budget():
     graph = build_query_resource_graph(metadata, env={})
     cluster = ResourceVector(cpu=64, gpu=4, heap_bytes=64 * GIB, object_store_bytes=8 * GIB)
 
-    demand = build_query_demand(graph, cluster)
+    demand = build_query_demand(graph, _single_node_cluster(cluster))
 
     assert all(unit.backend == "ray_worker" for unit in graph.units)
     assert all(unit.per_task == ResourceVector() for unit in graph.units)
     assert demand.minimum == ResourceVector()
     assert demand.task_bundles == ()
-    assert demand.actor_bundles == ()
     assert demand.desired == ResourceVector(object_store_bytes=8 * GIB)
 
 
@@ -294,11 +330,10 @@ def test_query_demand_treats_pipeline_windows_as_soft_budget_regression_issue_38
         object_store_bytes=512 * MIB,
     )
 
-    demand = build_query_demand(graph, cluster)
+    demand = build_query_demand(graph, _single_node_cluster(cluster))
 
     assert demand.minimum.object_store_bytes == 0
     assert demand.desired.object_store_bytes == 512 * MIB
-    assert all(bundle.resources.object_store_bytes == 0 for bundle in demand.actor_bundles)
     assert all(bundle.object_store_bytes == 0 for bundle in demand.task_bundles)
 
 
@@ -308,15 +343,115 @@ def test_query_demand_reserves_gpu_ray_task_as_an_indivisible_task_bundle():
     graph = build_query_resource_graph(metadata, env={})
     cluster = ResourceVector(cpu=64, gpu=4, heap_bytes=64 * GIB, object_store_bytes=64 * GIB)
 
-    demand = build_query_demand(graph, cluster)
+    demand = build_query_demand(graph, _single_node_cluster(cluster))
 
-    assert demand.minimum.gpu == 2
-    assert demand.desired.gpu == 2
-    assert demand.actor_bundles[0].resources.gpu == 1
+    assert demand.minimum.gpu == 1
+    assert demand.desired.gpu == 4
     assert demand.task_bundles[0].gpu == 1
 
 
-def test_query_demand_reserves_every_fractional_gpu_actor_in_fixed_pool():
+def test_query_demand_uses_real_node_envelopes_for_heterogeneous_ray_tasks():
+    metadata = _metadata()
+    cpu_payload = metadata["nodes"][1]["udf_payload"]
+    cpu_payload["cpus"] = 4.0
+    cpu_payload.pop("memory_bytes")
+    gpu_payload = metadata["nodes"][2]["udf_payload"]
+    gpu_payload["execution_backend"] = "ray_task"
+    gpu_payload["cpus"] = 1.0
+    gpu_payload["gpus"] = 1.0
+    gpu_payload.pop("memory_bytes")
+    gpu_payload.pop("actor_pool_size")
+    graph = build_query_resource_graph(metadata, env={})
+    nodes = (
+        NodeCapacity(
+            "cpu-node",
+            ResourceVector(cpu=4, object_store_bytes=GIB),
+        ),
+        NodeCapacity(
+            "gpu-node",
+            ResourceVector(cpu=1, gpu=1, object_store_bytes=GIB),
+        ),
+    )
+
+    demand = build_query_demand(graph, nodes)
+
+    assert demand.task_bundles == (
+        ResourceVector(cpu=1, gpu=1),
+        ResourceVector(cpu=4),
+    )
+    assert demand.minimum == ResourceVector(cpu=5, gpu=1)
+    coordinator = ClusterQueryResourceCoordinator(nodes)
+    allocation = coordinator.register_query(demand, now=0)
+    assert coordinator.query_state(graph.query_id, allocation.generation) == "RUNNING"
+    graph.validate_allocation(allocation)
+
+
+def test_query_demand_collapses_heterogeneous_task_shapes_that_share_one_node():
+    metadata = _metadata()
+    cpu_payload = metadata["nodes"][1]["udf_payload"]
+    cpu_payload["cpus"] = 4.0
+    cpu_payload.pop("memory_bytes")
+    gpu_payload = metadata["nodes"][2]["udf_payload"]
+    gpu_payload["execution_backend"] = "ray_task"
+    gpu_payload["cpus"] = 1.0
+    gpu_payload["gpus"] = 1.0
+    gpu_payload.pop("memory_bytes")
+    gpu_payload.pop("actor_pool_size")
+    graph = build_query_resource_graph(metadata, env={})
+    nodes = (
+        NodeCapacity(
+            "combined-node",
+            ResourceVector(cpu=4, gpu=1, object_store_bytes=GIB),
+        ),
+    )
+
+    demand = build_query_demand(graph, nodes)
+
+    assert demand.task_bundles == (ResourceVector(cpu=4, gpu=1),)
+    assert demand.minimum == ResourceVector(cpu=4, gpu=1)
+
+
+def test_capacity_topology_change_rebuilds_task_capability_envelopes():
+    metadata = _metadata()
+    cpu_payload = metadata["nodes"][1]["udf_payload"]
+    cpu_payload["cpus"] = 4.0
+    cpu_payload.pop("memory_bytes")
+    gpu_payload = metadata["nodes"][2]["udf_payload"]
+    gpu_payload["execution_backend"] = "ray_task"
+    gpu_payload["cpus"] = 1.0
+    gpu_payload["gpus"] = 1.0
+    gpu_payload.pop("memory_bytes")
+    gpu_payload.pop("actor_pool_size")
+    graph = build_query_resource_graph(metadata, env={})
+    combined = (
+        NodeCapacity(
+            "combined-node",
+            ResourceVector(cpu=4, gpu=1, object_store_bytes=2 * GIB),
+        ),
+    )
+    split = (
+        NodeCapacity("cpu-node", ResourceVector(cpu=4, object_store_bytes=GIB)),
+        NodeCapacity("gpu-node", ResourceVector(cpu=1, gpu=1, object_store_bytes=GIB)),
+    )
+    coordinator = ClusterQueryResourceCoordinator(combined)
+    allocation = coordinator.register_query(build_query_demand(graph, combined), now=0)
+
+    coordinator.update_node_capacities(split, now=1)
+    pending = coordinator.snapshot()["queries"][graph.query_id]
+    assert pending["state"] == "PENDING_RESOURCES"
+
+    allocation = coordinator.refresh_queries(
+        observed_usage_by_query={graph.query_id: ResourceVector()},
+        generations={graph.query_id: pending["allocation"]["generation"]},
+        demands_by_query={graph.query_id: build_query_demand(graph, split)},
+        now=1,
+    )[graph.query_id]
+
+    assert coordinator.query_state(graph.query_id, allocation.generation) == "RUNNING"
+    graph.validate_allocation(allocation)
+
+
+def test_query_demand_does_not_turn_fixed_actor_pool_size_into_hard_admission():
     metadata = _metadata()
     actor_payload = metadata["nodes"][2]["udf_payload"]
     actor_payload["actor_pool_size"] = 3
@@ -324,14 +459,13 @@ def test_query_demand_reserves_every_fractional_gpu_actor_in_fixed_pool():
     graph = build_query_resource_graph(metadata, env={})
     cluster = ResourceVector(cpu=64, gpu=4, heap_bytes=64 * GIB, object_store_bytes=64 * GIB)
 
-    demand = build_query_demand(graph, cluster)
+    demand = build_query_demand(graph, _single_node_cluster(cluster))
     actor_unit = graph.unit_by_id(udf_unit_id_for_node("query-7", "3"))
 
     assert actor_unit.actor_pool_size == 3
-    assert [bundle.actor_index for bundle in demand.actor_bundles] == [0, 1, 2]
-    assert all(bundle.resources.gpu == 0.25 for bundle in demand.actor_bundles)
-    assert demand.minimum.gpu == 0.75
-    assert demand.desired.gpu == demand.minimum.gpu
+    assert actor_unit.resident_per_actor.gpu == 0.25
+    assert demand.minimum.gpu == 0
+    assert demand.desired.gpu == 0.75
 
 
 def test_fragment_identity_maps_directly_to_pre_registered_native_fragment_unit():

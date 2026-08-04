@@ -79,7 +79,6 @@ def test_progress_snapshot_includes_query_resource_manager():
                         resources=ResourceVector(cpu=1, heap_bytes=2, object_store_bytes=1),
                     ),
                 ),
-                actor_placements=(),
                 generation=1,
             ),
         )

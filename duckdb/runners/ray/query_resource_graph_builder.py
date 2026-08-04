@@ -3,16 +3,13 @@
 
 from __future__ import annotations
 
-import math
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
-from duckdb.runners.ray.cluster_resource_coordinator import (
-    ActorResourceBundle,
-    QueryDemand,
-)
+from duckdb.runners.ray.cluster_resource_coordinator import NodeCapacity, QueryDemand
 from duckdb.runners.ray.query_resource_graph import (
+    MaterializationBarrierSpec,
     QueryResourceGraph,
     ResourceUnitSpec,
     ResourceVector,
@@ -27,6 +24,8 @@ _NODE_FIELDS = (
     "node_name",
     "input_node_ids",
     "is_sink",
+    "is_materialization_barrier",
+    "materialized_input_node_ids",
     "num_partitions",
     "udf_payload",
 )
@@ -92,6 +91,14 @@ def udf_unit_id_for_node(query_id: str, node_id: str | int) -> str:
     return f"resource:{query}:udf:node:{node}"
 
 
+def materialization_barrier_id_for_node(query_id: str, node_id: str | int) -> str:
+    query = str(query_id).strip()
+    node = str(node_id).strip()
+    if not query or not node:
+        raise ValueError("query_id and node_id must be non-empty")
+    return f"barrier:{query}:node:{node}"
+
+
 def native_fragment_unit_id_for_fragment(query_id: str, fragment_id: str) -> str:
     query = str(query_id).strip()
     fragment = str(fragment_id).strip()
@@ -128,6 +135,15 @@ def _normalize_metadata(metadata: Mapping[str, Any]) -> tuple[str, dict[str, dic
         node["input_node_ids"] = tuple(str(item).strip() for item in node["input_node_ids"])
         node["num_partitions"] = _positive_int(node["num_partitions"], "num_partitions")
         node["is_sink"] = bool(node["is_sink"])
+        node["is_materialization_barrier"] = bool(node["is_materialization_barrier"])
+        node["materialized_input_node_ids"] = tuple(str(item).strip() for item in node["materialized_input_node_ids"])
+        if len(set(node["materialized_input_node_ids"])) != len(node["materialized_input_node_ids"]):
+            raise ValueError(f"resource unit node {node_id} has duplicate materialized input node ids")
+        if node["is_materialization_barrier"] != bool(node["materialized_input_node_ids"]):
+            raise ValueError(
+                f"resource unit node {node_id} must declare materialized inputs "
+                "if and only if it is a materialization barrier"
+            )
         if node["udf_payload"] is not None and not isinstance(node["udf_payload"], Mapping):
             raise TypeError(f"resource unit node {node_id} udf_payload must be a mapping or None")
         node["udf_payload"] = None if node["udf_payload"] is None else dict(node["udf_payload"])
@@ -137,6 +153,11 @@ def _normalize_metadata(metadata: Mapping[str, Any]) -> tuple[str, dict[str, dic
         for input_node_id in node["input_node_ids"]:
             if input_node_id not in nodes:
                 raise ValueError(f"resource unit node {node_id} references missing input node {input_node_id}")
+        for input_node_id in node["materialized_input_node_ids"]:
+            if input_node_id not in node["input_node_ids"]:
+                raise ValueError(
+                    f"resource unit node {node_id} materialized input {input_node_id} is not a direct input"
+                )
     terminal_node_ids = tuple(str(item).strip() for item in payload["terminal_node_ids"])
     if not terminal_node_ids:
         raise ValueError("resource unit metadata must contain terminal_node_ids")
@@ -151,8 +172,6 @@ def _udf_unit(
     node: Mapping[str, Any],
     input_unit_id: str,
     env: Mapping[str, str],
-    *,
-    downstream_input_window_bytes: int = 0,
 ) -> ResourceUnitSpec | None:
     payload = node["udf_payload"]
     if payload is None:
@@ -191,14 +210,6 @@ def _udf_unit(
             _env_positive_int(env, "VANE_TARGET_OUTPUT_BLOCK_BYTES", _DEFAULT_TARGET_OUTPUT_BLOCK_BYTES),
         ),
         "udf_task_input_max_bytes",
-    )
-    retention_window = max(
-        target * _GENERATOR_BUFFER_BLOCKS,
-        int(downstream_input_window_bytes),
-    )
-    retention_blocks = max(
-        _GENERATOR_BUFFER_BLOCKS,
-        math.ceil(retention_window / target),
     )
     if backend == "ray_actor":
         actor_size = _positive_int(payload.get("actor_pool_size"), "actor_pool_size")
@@ -239,7 +250,7 @@ def _udf_unit(
         input_unit_ids=(input_unit_id,),
         per_task=invocation_resources,
         target_output_block_bytes=target,
-        generator_buffer_blocks=retention_blocks,
+        generator_buffer_blocks=_GENERATOR_BUFFER_BLOCKS,
         max_concurrency=max_concurrency,
         resident_per_actor=resident_per_actor,
         actor_pool_size=actor_pool_size,
@@ -261,44 +272,6 @@ def build_query_resource_graph(
     )
 
     output_unit_by_node: dict[str, str] = {}
-    downstream_node_ids: dict[str, list[str]] = {node_id: [] for node_id in nodes}
-    for child_id, child in nodes.items():
-        for parent_id in child["input_node_ids"]:
-            downstream_node_ids[parent_id].append(child_id)
-
-    def remote_udf_submit_window(node_id: str) -> int | None:
-        payload = nodes[node_id]["udf_payload"]
-        if payload is None or str(payload.get("execution_backend") or "").strip() not in {
-            "ray_task",
-            "ray_actor",
-        }:
-            return None
-        default_window = payload.get(
-            "udf_output_target_max_bytes",
-            _env_positive_int(environment, "VANE_TARGET_OUTPUT_BLOCK_BYTES", _DEFAULT_TARGET_OUTPUT_BLOCK_BYTES),
-        )
-        return _positive_int(
-            payload.get("udf_task_input_max_bytes", default_window),
-            "udf_task_input_max_bytes",
-        )
-
-    downstream_input_windows: dict[str, int] = {}
-    for source_id in nodes:
-        pending = list(downstream_node_ids[source_id])
-        visited: set[str] = set()
-        windows: list[int] = []
-        while pending:
-            downstream_id = pending.pop()
-            if downstream_id in visited:
-                continue
-            visited.add(downstream_id)
-            window = remote_udf_submit_window(downstream_id)
-            if window is not None:
-                windows.append(window)
-                continue
-            pending.extend(downstream_node_ids[downstream_id])
-        downstream_input_windows[source_id] = max(windows, default=0)
-
     for node_id, node in nodes.items():
         udf_payload = node["udf_payload"]
         has_remote_udf = udf_payload is not None and str(udf_payload.get("execution_backend") or "").strip() in {
@@ -312,6 +285,7 @@ def build_query_resource_graph(
         )
 
     units: list[ResourceUnitSpec] = []
+    barriers: list[MaterializationBarrierSpec] = []
     for node_id in sorted(nodes, key=_node_sort_key):
         node = nodes[node_id]
         native_fragment_unit_id = native_fragment_unit_id_for_node(query_id, node_id)
@@ -335,12 +309,23 @@ def build_query_resource_graph(
                 max_concurrency=int(node["num_partitions"]),
             )
         )
+        if bool(node["is_materialization_barrier"]):
+            barriers.append(
+                MaterializationBarrierSpec(
+                    query_id=query_id,
+                    barrier_id=materialization_barrier_id_for_node(query_id, node_id),
+                    physical_node_id=node_id,
+                    materializer_unit_id=native_fragment_unit_id,
+                    materialized_input_unit_ids=tuple(
+                        output_unit_by_node[parent] for parent in node["materialized_input_node_ids"]
+                    ),
+                )
+            )
         udf_unit = _udf_unit(
             query_id,
             node,
             native_fragment_unit_id,
             environment,
-            downstream_input_window_bytes=downstream_input_windows[node_id],
         )
         if udf_unit is not None:
             units.append(udf_unit)
@@ -351,12 +336,14 @@ def build_query_resource_graph(
         plan_digest="sha256:pending",
         units=tuple(units),
         terminal_unit_ids=terminals,
+        materialization_barriers=tuple(barriers),
     )
     return QueryResourceGraph(
         query_id=query_id,
         plan_digest=preliminary.normalized_digest(),
         units=preliminary.units,
         terminal_unit_ids=preliminary.terminal_unit_ids,
+        materialization_barriers=preliminary.materialization_barriers,
     )
 
 
@@ -385,45 +372,143 @@ def _component_max(resources: list[ResourceVector]) -> ResourceVector:
     )
 
 
+def _sum_node_capacities(node_capacities: Sequence[NodeCapacity]) -> ResourceVector:
+    total = ResourceVector()
+    for node in node_capacities:
+        total = total + node.resources
+    return total
+
+
+def _resource_sort_key(resources: ResourceVector) -> tuple[float, float, int, int]:
+    return (
+        resources.gpu,
+        resources.cpu,
+        resources.heap_bytes,
+        resources.object_store_bytes,
+    )
+
+
+def _task_placement_bundles(
+    ray_tasks: list[ResourceVector],
+    node_capacities: Sequence[NodeCapacity],
+) -> tuple[ResourceVector, ...]:
+    """Return real node envelopes covering every eligible Ray task shape.
+
+    A component-wise maximum across the whole phase can invent a task that no
+    node can run (for example, 4 CPU from one UDF plus 1 GPU from another UDF
+    on a split CPU/GPU cluster).  Instead, each candidate envelope contains
+    only task shapes that fit one concrete node.  Multiple shapes that share a
+    node still collapse to one reusable liveness bundle; heterogeneous shapes
+    that require different nodes remain separate bundles.
+    """
+
+    task_shapes = tuple(sorted(set(ray_tasks), key=_resource_sort_key, reverse=True))
+    if not task_shapes:
+        return ()
+
+    candidates: list[tuple[str, ResourceVector, frozenset[int]]] = []
+    for node in sorted(node_capacities, key=lambda item: item.node_id):
+        covered = frozenset(index for index, task in enumerate(task_shapes) if task.fits_within(node.resources))
+        if not covered:
+            continue
+        envelope = _component_max([task_shapes[index] for index in covered])
+        candidates.append((node.node_id, envelope, covered))
+
+    uncovered = set(range(len(task_shapes)))
+    selected: list[tuple[str, ResourceVector, frozenset[int]]] = []
+    while uncovered:
+        usable = [candidate for candidate in candidates if candidate[2] & uncovered]
+        if not usable:
+            # Preserve the real unschedulable task shapes.  The coordinator
+            # will keep the query pending until a node capable of running them
+            # appears; never replace them with another fictional envelope.
+            selected.extend(("", task_shapes[index], frozenset((index,))) for index in sorted(uncovered))
+            break
+        candidate = min(
+            usable,
+            key=lambda item: (
+                -len(item[2] & uncovered),
+                -item[1].gpu,
+                -item[1].cpu,
+                -item[1].heap_bytes,
+                item[0],
+            ),
+        )
+        selected.append(candidate)
+        uncovered.difference_update(candidate[2])
+
+    def placement_order(item: tuple[str, ResourceVector, frozenset[int]]) -> tuple[int, float, float, int, str]:
+        node_id, envelope, _covered = item
+        fit_count = sum(envelope.fits_within(node.resources) for node in node_capacities)
+        return (
+            fit_count,
+            -envelope.gpu,
+            -envelope.cpu,
+            -envelope.heap_bytes,
+            node_id,
+        )
+
+    return tuple(item[1] for item in sorted(selected, key=placement_order))
+
+
 def build_query_demand(
     graph: QueryResourceGraph,
-    cluster_capacity: ResourceVector,
+    node_capacities: Sequence[NodeCapacity],
     *,
+    eligible_unit_ids: tuple[str, ...] | None = None,
     weight: float = 1.0,
     priority: int = 0,
 ) -> QueryDemand:
-    actor_bundles: list[ActorResourceBundle] = []
+    nodes = tuple(node_capacities)
+    if not nodes:
+        raise ValueError("node_capacities must contain at least one Ray node")
+    node_ids = [node.node_id for node in nodes]
+    if len(set(node_ids)) != len(node_ids):
+        raise ValueError("node_capacities contains duplicate Ray node IDs")
+    cluster_capacity = _sum_node_capacities(nodes)
+    eligible = set(graph.eligible_resource_unit_ids(set()) if eligible_unit_ids is None else eligible_unit_ids)
+    unknown_eligible = sorted(eligible - {unit.resource_unit_id for unit in graph.units})
+    if unknown_eligible:
+        raise ValueError(f"query demand references unknown eligible unit: {unknown_eligible[0]}")
     ray_tasks: list[ResourceVector] = []
+    actor_processes: list[ResourceVector] = []
     for unit in graph.units:
+        if unit.resource_unit_id not in eligible:
+            continue
         commitment = _hard_task_commitment(unit)
-        if unit.backend == "ray_actor":
-            actor_bundles.extend(
-                ActorResourceBundle(
-                    resource_unit_id=unit.resource_unit_id,
-                    actor_index=actor_index,
-                    resources=unit.resident_per_actor,
-                )
-                for actor_index in range(unit.actor_pool_size)
-            )
-        elif unit.backend == "ray_task":
+        if unit.backend == "ray_task":
             ray_tasks.append(commitment)
+        elif unit.backend == "ray_actor":
+            actor_processes.extend(unit.resident_per_actor for _actor_index in range(unit.actor_pool_size))
     minimum = ResourceVector()
-    for required_actor in actor_bundles:
-        minimum = minimum + required_actor.resources
-    task_bundles = tuple(bundle for bundle in (_component_max(ray_tasks),) if not bundle.is_zero())
+    task_bundles = _task_placement_bundles(ray_tasks, nodes)
     for task_bundle in task_bundles:
         minimum = minimum + task_bundle
+    actor_maximum = ResourceVector()
+    for actor_process in actor_processes:
+        actor_maximum = actor_maximum + actor_process
+
+    def elastic_target(field_name: str) -> int | float:
+        task_uses_dimension = any(getattr(task, field_name) > 0 for task in ray_tasks)
+        if task_uses_dimension:
+            return max(
+                getattr(minimum, field_name),
+                getattr(cluster_capacity, field_name),
+            )
+        return min(
+            getattr(actor_maximum, field_name),
+            getattr(cluster_capacity, field_name),
+        )
+
     desired = ResourceVector(
-        # Ray tasks can use elastic process headroom. Actor-only and pure
-        # native queries have no additional hard-process demand beyond their
-        # resident actor pool; native capacity is node-owned by DuckDB.
-        cpu=cluster_capacity.cpu if ray_tasks else minimum.cpu,
-        # GPU commitments remain fixed indivisible bundles. Only CPU and
-        # memory headroom participate in elastic DRF allocation.
-        gpu=minimum.gpu,
-        heap_bytes=(
-            cluster_capacity.heap_bytes if any(task.heap_bytes > 0 for task in ray_tasks) else minimum.heap_bytes
-        ),
+        # The smallest practical set of real-node task envelopes is the only
+        # hard query-level placement minimum.
+        # Fixed actor pools are elastic allocation demand: all handles may be
+        # submitted to Ray Core, while pending/running process resources are
+        # charged to the phase's soft reservation at runtime.
+        cpu=elastic_target("cpu"),
+        gpu=elastic_target("gpu"),
+        heap_bytes=int(elastic_target("heap_bytes")),
         object_store_bytes=cluster_capacity.object_store_bytes,
     )
     return QueryDemand(
@@ -432,7 +517,6 @@ def build_query_demand(
         desired=desired,
         weight=weight,
         priority=priority,
-        actor_bundles=tuple(actor_bundles),
         task_bundles=task_bundles,
     )
 
@@ -440,6 +524,7 @@ def build_query_demand(
 __all__ = [
     "build_query_demand",
     "build_query_resource_graph",
+    "materialization_barrier_id_for_node",
     "native_fragment_unit_id_for_fragment",
     "native_fragment_unit_id_for_node",
     "udf_unit_id_for_node",

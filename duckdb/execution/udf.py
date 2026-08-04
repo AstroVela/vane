@@ -20,8 +20,10 @@ _ALLOWED_OPTIONS = frozenset(
     {
         *_DEFAULTS,
         "actor_handles",
+        "actor_init_refs",
         "actor_node_ids",
         "actor_dispatch_indices",
+        "actor_pool_locator",
         "local_actor_pool",
         "query_driver_handle",
         "query_generation_capability",

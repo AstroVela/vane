@@ -664,6 +664,14 @@ struct PyPhysicalPlanWrapper {
 			}
 			metadata[py::str("input_node_ids")] = std::move(input_node_ids);
 			metadata[py::str("is_sink")] = py::bool_(node->is_sink());
+			metadata[py::str("is_materialization_barrier")] = py::bool_(node->is_materialization_barrier());
+			py::list materialized_input_node_ids;
+			auto materialized_inputs = node->materialized_input_node_ids();
+			std::sort(materialized_inputs.begin(), materialized_inputs.end());
+			for (auto input_node_id : materialized_inputs) {
+				materialized_input_node_ids.append(py::str(std::to_string(input_node_id)));
+			}
+			metadata[py::str("materialized_input_node_ids")] = std::move(materialized_input_node_ids);
 			metadata[py::str("num_partitions")] = py::int_(std::max<size_t>(1, node->num_partitions()));
 			auto udf_entry = udf_by_node.find(node->node_id());
 			if (udf_entry == udf_by_node.end()) {
@@ -1147,6 +1155,23 @@ public:
 		} catch (const std::exception &e) {
 			return DuckDBResult<void>::err(
 			    DuckDBError(string("Python backend task_input_stream_exhausted failed: ") + e.what()));
+		}
+	}
+
+	DuckDBResult<void> materialization_barrier_completed(const string &query_id,
+	                                                     duckdb::distributed::NodeID node_id) override {
+		if (query_id.empty()) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::value_error("materialization barrier completion requires non-empty query_id"));
+		}
+		try {
+			duckdb::PythonGILWrapper gil;
+			auto backend = backend_.get();
+			backend.attr("materialization_barrier_completed")(query_id, std::to_string(node_id));
+			return DuckDBResult<void>::ok();
+		} catch (const std::exception &e) {
+			return DuckDBResult<void>::err(
+			    DuckDBError(string("Python backend materialization_barrier_completed failed: ") + e.what()));
 		}
 	}
 

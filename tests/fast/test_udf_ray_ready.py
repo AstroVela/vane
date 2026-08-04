@@ -222,6 +222,42 @@ def test_existing_actor_handles_require_explicit_dispatch_eligibility():
     assert executor._actor_init_errors[0] == "ray actor does not expose __ray_ready__ readiness probe"
 
 
+def test_pending_actor_learns_runtime_node_and_joins_dispatch_set():
+    from concurrent.futures import Future
+
+    from duckdb.execution.udf_ray import RemoteUDFExecutor, UDFActorPool
+
+    class _Ref:
+        def __init__(self, future):
+            self._future = future
+
+        def future(self):
+            return self._future
+
+    actors = [_Actor(), _Actor()]
+    first_future = Future()
+    second_future = Future()
+    pool = UDFActorPool._from_handles(
+        actors,
+        payload=_payload(actor_pool_size=2),
+        actor_node_ids=["node-a", ""],
+        actor_dispatch_indices={0},
+        actor_init_refs=[_Ref(first_future), _Ref(second_future)],
+    )
+    executor = RemoteUDFExecutor(
+        pool,
+        _payload(actor_pool_size=2),
+        query_driver_handle=object(),
+        query_generation_capability="test-query-generation-capability",
+    )
+
+    second_future.set_result("node-b")
+    executor._refresh_actor_readiness()
+
+    assert executor._actor_node_ids == ["node-a", "node-b"]
+    assert executor._ready_actor_set == {0, 1}
+
+
 def test_actor_executor_uses_explicit_query_driver_handle():
     from duckdb.execution.udf_ray import _build_ray_actor_executor
 
@@ -267,11 +303,19 @@ def test_actor_executor_uses_explicit_query_driver_handle():
     assert executor._task_admission._driver is query_driver_handle
 
 
-def test_actor_executor_options_reject_missing_or_invalid_coordinator_identity():
+def test_actor_executor_options_allow_pending_identity_but_require_it_for_ready_slots():
     from duckdb.execution.udf_ray import _build_udf_executor_options
 
     actor = _Actor()
-    with pytest.raises(ValueError, match="actor node IDs are required"):
+    pending = _build_udf_executor_options(
+        actor_handles=[actor],
+        actor_node_ids=None,
+        actor_dispatch_indices=set(),
+        actor_init_refs=[object()],
+    )
+    assert pending["actor_node_ids"] == [""]
+    assert pending["actor_dispatch_indices"] == []
+    with pytest.raises(ValueError, match="dispatch-ready actors require runtime node IDs"):
         _build_udf_executor_options(
             actor_handles=[actor],
             actor_node_ids=None,
