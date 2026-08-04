@@ -195,6 +195,40 @@ void SerializePreStrictRemoteExchangeSource(Serializer &serializer) {
 	serializer.WriteList(198, "children", 0, [](Serializer::List &, idx_t) {});
 }
 
+void SerializeRemoteExchangeSourceWithoutReadTimeout(Serializer &serializer) {
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	vector<idx_t> partition_indices = {0};
+	vector<string> source_nodes = {"node-1"};
+	vector<idx_t> handle_partition_ids = {0};
+	vector<string> handle_node_ids = {"node-1"};
+	vector<string> handle_paths = {"shuffle-stage__sink_0__attempt_0"};
+	vector<int> handle_flight_ports = {6123};
+	vector<idx_t> handle_attempt_ids = {0};
+	vector<string> local_dirs = {"/tmp/vane-shuffle"};
+	vector<string> handle_server_epochs = {"epoch-1"};
+	vector<string> handle_flight_hosts = {"flight-node-1.internal"};
+	vector<idx_t> handle_task_partition_ids = {0};
+	serializer.WriteProperty(100, "type", PhysicalOperatorType::EXCHANGE_SOURCE);
+	serializer.WriteProperty(101, "types", types);
+	serializer.WriteProperty<idx_t>(102, "estimated_cardinality", 0);
+	serializer.WriteProperty(103, "shuffle_stage_id", string("shuffle-stage"));
+	serializer.WriteProperty(104, "partition_indices", partition_indices);
+	serializer.WriteProperty(105, "source_nodes", source_nodes);
+	serializer.WriteProperty<double>(106, "flight_timeout_seconds", 7.5);
+	serializer.WriteProperty(107, "source_handle_partition_ids", handle_partition_ids);
+	serializer.WriteProperty(108, "source_handle_node_ids", handle_node_ids);
+	serializer.WriteProperty(109, "source_handle_paths", handle_paths);
+	serializer.WriteProperty(110, "source_handle_flight_ports", handle_flight_ports);
+	serializer.WritePropertyWithDefault(111, "runtime_source_node_id", optional_idx(), optional_idx());
+	serializer.WriteProperty(112, "source_handle_attempt_ids", handle_attempt_ids);
+	serializer.WriteProperty(113, "local_dirs", local_dirs);
+	serializer.WriteProperty(114, "source_handle_flight_server_epochs", handle_server_epochs);
+	serializer.WriteProperty(115, "source_catalog_handles_explicit", true);
+	serializer.WriteProperty(116, "source_handle_flight_hosts", handle_flight_hosts);
+	serializer.WriteProperty(117, "source_handle_task_partition_ids", handle_task_partition_ids);
+	serializer.WriteList(198, "children", 0, [](Serializer::List &, idx_t) {});
+}
+
 string SerializeSinkDescriptorWithoutFlightHost() {
 	MemoryStream stream(Allocator::DefaultAllocator());
 	BinarySerializer serializer(stream);
@@ -1918,6 +1952,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	distributed::FlightExchangeConfig flight_config;
 	flight_config.node_id = "node-1";
 	flight_config.flight_timeout_seconds = 7.5;
+	flight_config.flight_read_timeout_seconds = 3.25;
 	auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
 
 	auto &source = plan.Make<PhysicalRemoteExchangeSource>(types, 456, "shuffle_stage", partition_indices,
@@ -1974,6 +2009,31 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	    std::dynamic_pointer_cast<distributed::FlightExchangeManager>(source_ptr->GetExchangeManager());
 	REQUIRE(roundtrip_manager != nullptr);
 	REQUIRE(roundtrip_manager->config().flight_timeout_seconds == 7.5);
+	REQUIRE(roundtrip_manager->config().flight_read_timeout_seconds == 3.25);
+}
+
+TEST_CASE("PhysicalRemoteExchangeSource defaults a missing Flight read timeout",
+          "[serialization][physical_plan][exchange]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+	MemoryStream stream(allocator);
+	SerializationOptions options;
+	BinarySerializer serializer(stream, options);
+	serializer.Begin();
+	SerializeRemoteExchangeSourceWithoutReadTimeout(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Begin();
+	auto deserialized_op = PhysicalOperator::Deserialize(deserializer, plan);
+	REQUIRE(deserialized_op != nullptr);
+	auto source = dynamic_cast<PhysicalRemoteExchangeSource *>(deserialized_op.get());
+	REQUIRE(source != nullptr);
+	auto manager = std::dynamic_pointer_cast<distributed::FlightExchangeManager>(source->GetExchangeManager());
+	REQUIRE(manager != nullptr);
+	REQUIRE(manager->config().flight_read_timeout_seconds ==
+	        distributed::FlightExchangeConfig::DEFAULT_FLIGHT_READ_TIMEOUT_SECONDS);
 }
 
 TEST_CASE("Remote exchange plans reject pre-strict endpoint payloads", "[serialization][physical_plan][exchange]") {

@@ -31,17 +31,35 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 
 #include <arrow/c/bridge.h>
+#include <arrow/device.h>
 #include <arrow/flight/api.h>
+#include <arrow/flight/transport.h>
 #include <arrow/ipc/api.h>
+#include <arrow/util/uri.h>
 
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <iostream>
 #include <mutex>
 #include <sstream>
+#include <thread>
+
+// Arrow 24 exports this idempotent registration hook, but does not install the
+// transport-specific header that declares it.
+namespace arrow {
+namespace flight {
+namespace transport {
+namespace grpc {
+ARROW_FLIGHT_EXPORT void InitializeFlightGrpcClient();
+} // namespace grpc
+} // namespace transport
+} // namespace flight
+} // namespace arrow
 
 namespace duckdb {
 namespace distributed {
@@ -275,19 +293,226 @@ DuckDBResult<void> ConvertArrowRecordBatchToChunk(ClientContext &context, const 
 	return DuckDBResult<void>::ok();
 }
 
-DuckDBResult<std::unique_ptr<arrow::flight::FlightClient>> ConnectFlightExchangeClient(const std::string &location) {
-	auto location_res = arrow::flight::Location::Parse(location);
+// FlightClient::DoGet reads the initial schema before returning its FlightStreamReader. Use Arrow's exported
+// transport stream directly so the watchdog can obtain a cancellation handle before the first blocking read.
+DuckDBResult<std::unique_ptr<arrow::flight::internal::ClientTransport>>
+ConnectFlightExchangeTransport(const std::string &location_string) {
+	auto location_res = arrow::flight::Location::Parse(location_string);
 	if (!location_res.ok()) {
-		return DuckDBResult<std::unique_ptr<arrow::flight::FlightClient>>::err(
+		return DuckDBResult<std::unique_ptr<arrow::flight::internal::ClientTransport>>::err(
 		    FlightExchangeArrowToError(location_res.status(), "parse flight location"));
 	}
-	auto client_res = arrow::flight::FlightClient::Connect(std::move(location_res).ValueOrDie());
-	if (!client_res.ok()) {
-		return DuckDBResult<std::unique_ptr<arrow::flight::FlightClient>>::err(
-		    FlightExchangeArrowToError(client_res.status(), "connect flight client"));
+	auto location = std::move(location_res).ValueOrDie();
+	arrow::flight::transport::grpc::InitializeFlightGrpcClient();
+
+	auto uri_res = arrow::util::Uri::FromString(location.ToString());
+	if (!uri_res.ok()) {
+		return DuckDBResult<std::unique_ptr<arrow::flight::internal::ClientTransport>>::err(
+		    FlightExchangeArrowToError(uri_res.status(), "parse flight transport URI"));
 	}
-	return DuckDBResult<std::unique_ptr<arrow::flight::FlightClient>>::ok(std::move(client_res).ValueOrDie());
+	auto transport_res = arrow::flight::internal::GetDefaultTransportRegistry()->MakeClient(location.scheme());
+	if (!transport_res.ok()) {
+		return DuckDBResult<std::unique_ptr<arrow::flight::internal::ClientTransport>>::err(
+		    FlightExchangeArrowToError(transport_res.status(), "create flight client transport"));
+	}
+	auto transport = std::move(transport_res).ValueOrDie();
+	auto uri = std::move(uri_res).ValueOrDie();
+	auto init_status = transport->Init(arrow::flight::FlightClientOptions::Defaults(), location, uri);
+	if (!init_status.ok()) {
+		return DuckDBResult<std::unique_ptr<arrow::flight::internal::ClientTransport>>::err(
+		    FlightExchangeArrowToError(init_status, "connect flight client transport"));
+	}
+	return DuckDBResult<std::unique_ptr<arrow::flight::internal::ClientTransport>>::ok(std::move(transport));
 }
+
+class FlightExchangeIpcMessageReader final : public arrow::ipc::MessageReader {
+public:
+	FlightExchangeIpcMessageReader(std::shared_ptr<arrow::flight::internal::ClientDataStream> stream,
+	                               std::shared_ptr<arrow::MemoryManager> memory_manager)
+	    : stream_(std::move(stream)), memory_manager_(std::move(memory_manager)) {
+	}
+
+	arrow::Result<std::unique_ptr<arrow::ipc::Message>> ReadNextMessage() override {
+		if (finished_) {
+			return nullptr;
+		}
+		while (true) {
+			arrow::flight::internal::FlightData data;
+			if (!stream_->ReadData(&data)) {
+				finished_ = true;
+				auto status = stream_->Finish(arrow::Status::OK());
+				if (!status.ok()) {
+					return status;
+				}
+				return nullptr;
+			}
+			if (!data.metadata) {
+				continue;
+			}
+			if (data.body) {
+				auto body_res = arrow::Buffer::ViewOrCopy(data.body, memory_manager_);
+				if (!body_res.ok()) {
+					return body_res.status();
+				}
+				data.body = std::move(body_res).ValueOrDie();
+			}
+			return data.OpenMessage();
+		}
+	}
+
+private:
+	std::shared_ptr<arrow::flight::internal::ClientDataStream> stream_;
+	std::shared_ptr<arrow::MemoryManager> memory_manager_;
+	bool finished_ = false;
+};
+
+} // namespace
+
+enum class FlightWatchdogStopReason : uint8_t { NONE = 0, INTERRUPTED = 1, READ_TIMEOUT = 2 };
+
+class FlightStreamWatchdog {
+public:
+	FlightStreamWatchdog(ClientContext &context, double read_timeout_seconds)
+	    : context_(context), read_timeout_seconds_(read_timeout_seconds), watchdog_thread_([this]() { Run(); }) {
+	}
+
+	~FlightStreamWatchdog() {
+		Stop();
+	}
+
+	FlightWatchdogStopReason Arm() {
+		arrow::flight::internal::ClientDataStream *stream = nullptr;
+		FlightWatchdogStopReason reason = FlightWatchdogStopReason::NONE;
+		{
+			std::lock_guard<std::mutex> guard(mutex_);
+			if (stop_reason_ != FlightWatchdogStopReason::NONE || stopping_) {
+				return stop_reason_;
+			}
+			operation_active_ = true;
+			operation_generation_++;
+			if (read_timeout_seconds_ > 0.0) {
+				deadline_ = Clock::now() + std::chrono::duration_cast<Clock::duration>(
+				                               std::chrono::duration<double>(read_timeout_seconds_));
+			}
+			if (context_.IsInterrupted()) {
+				reason = FlightWatchdogStopReason::INTERRUPTED;
+				stop_reason_ = reason;
+				operation_active_ = false;
+				operation_generation_++;
+				stream = stream_;
+			}
+		}
+		condition_.notify_all();
+		if (reason != FlightWatchdogStopReason::NONE) {
+			RequestCancellation(stream);
+		}
+		return reason;
+	}
+
+	FlightWatchdogStopReason Disarm() {
+		std::lock_guard<std::mutex> guard(mutex_);
+		operation_active_ = false;
+		operation_generation_++;
+		condition_.notify_all();
+		return stop_reason_;
+	}
+
+	void SetStream(arrow::flight::internal::ClientDataStream *stream) {
+		bool cancel_stream = false;
+		{
+			std::lock_guard<std::mutex> guard(mutex_);
+			stream_ = stream;
+			cancel_stream = stream_ && stop_reason_ != FlightWatchdogStopReason::NONE;
+		}
+		if (cancel_stream) {
+			stream->TryCancel();
+		}
+	}
+
+	void Stop() {
+		{
+			std::lock_guard<std::mutex> guard(mutex_);
+			stopping_ = true;
+			operation_active_ = false;
+			operation_generation_++;
+		}
+		condition_.notify_all();
+		if (watchdog_thread_.joinable()) {
+			watchdog_thread_.join();
+		}
+	}
+
+private:
+	using Clock = std::chrono::steady_clock;
+	static constexpr std::chrono::milliseconds INTERRUPT_POLL_INTERVAL {25};
+
+	void RequestCancellation(arrow::flight::internal::ClientDataStream *stream) {
+		if (stream) {
+			stream->TryCancel();
+		}
+	}
+
+	void Run() {
+		std::unique_lock<std::mutex> guard(mutex_);
+		while (!stopping_) {
+			if (!operation_active_) {
+				condition_.wait(guard, [&]() { return stopping_ || operation_active_; });
+				continue;
+			}
+
+			const auto generation = operation_generation_;
+			auto wake_at = Clock::now() + INTERRUPT_POLL_INTERVAL;
+			if (read_timeout_seconds_ > 0.0 && deadline_ < wake_at) {
+				wake_at = deadline_;
+			}
+			condition_.wait_until(guard, wake_at);
+			if (stopping_ || !operation_active_ || generation != operation_generation_) {
+				continue;
+			}
+
+			FlightWatchdogStopReason reason = FlightWatchdogStopReason::NONE;
+			if (context_.IsInterrupted()) {
+				reason = FlightWatchdogStopReason::INTERRUPTED;
+			} else if (read_timeout_seconds_ > 0.0 && Clock::now() >= deadline_) {
+				reason = FlightWatchdogStopReason::READ_TIMEOUT;
+			}
+			if (reason == FlightWatchdogStopReason::NONE) {
+				continue;
+			}
+
+			stop_reason_ = reason;
+			operation_active_ = false;
+			operation_generation_++;
+			auto *stream = stream_;
+			guard.unlock();
+			RequestCancellation(stream);
+			guard.lock();
+		}
+	}
+
+	ClientContext &context_;
+	double read_timeout_seconds_;
+	std::mutex mutex_;
+	std::condition_variable condition_;
+	Clock::time_point deadline_;
+	arrow::flight::internal::ClientDataStream *stream_ = nullptr;
+	FlightWatchdogStopReason stop_reason_ = FlightWatchdogStopReason::NONE;
+	uint64_t operation_generation_ = 0;
+	bool operation_active_ = false;
+	bool stopping_ = false;
+	std::thread watchdog_thread_;
+};
+
+DuckDBError FlightWatchdogError(FlightWatchdogStopReason reason, const char *operation, double read_timeout_seconds) {
+	if (reason == FlightWatchdogStopReason::INTERRUPTED) {
+		return DuckDBError::external_error(std::string(operation) + " canceled by query interruption");
+	}
+	std::ostringstream message;
+	message << operation << " timed out after " << read_timeout_seconds << " seconds";
+	return DuckDBError::external_error(message.str());
+}
+
+namespace {
 
 DuckDBResult<void> EnsureLocalFlightServerStartedInternal(const FlightServiceConfig &config) {
 	auto advertise_host_res = ParseFlightHost(config.advertise_host);
@@ -965,6 +1190,20 @@ DuckDBResult<void> FlightExchangeSink::EnsureSchema(ClientContext &context, cons
 struct FlightExchangeSource::PartitionStreamState {
 	enum class Kind : uint8_t { LOCAL_FILES = 1, FLIGHT = 2 };
 
+	~PartitionStreamState() {
+		if (flight_watchdog) {
+			flight_watchdog->Stop();
+		}
+		if (flight_data_stream) {
+			flight_data_stream->TryCancel();
+		}
+		flight_reader.reset();
+		flight_data_stream.reset();
+		if (flight_transport) {
+			(void)flight_transport->Close();
+		}
+	}
+
 	Kind kind = Kind::LOCAL_FILES;
 	vector<LogicalType> expected_types;
 
@@ -974,8 +1213,10 @@ struct FlightExchangeSource::PartitionStreamState {
 	std::shared_ptr<arrow::io::InputStream> current_input;
 	std::shared_ptr<arrow::ipc::RecordBatchStreamReader> current_ipc_reader;
 
-	std::unique_ptr<arrow::flight::FlightClient> flight_client;
-	std::unique_ptr<arrow::flight::FlightStreamReader> flight_reader;
+	std::unique_ptr<arrow::flight::internal::ClientTransport> flight_transport;
+	std::shared_ptr<arrow::flight::internal::ClientDataStream> flight_data_stream;
+	std::shared_ptr<arrow::ipc::RecordBatchStreamReader> flight_reader;
+	unique_ptr<FlightStreamWatchdog> flight_watchdog;
 
 	unique_ptr<ArrowTableSchema> arrow_table;
 	vector<LogicalType> arrow_types;
@@ -1119,11 +1360,11 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 		    ": " + files_res.error().what()));
 	}
 	auto location = BuildFlightLocation(source_flight_host, source_flight_port);
-	auto client_res = ConnectFlightExchangeClient(location);
-	if (client_res.is_err()) {
-		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(client_res.error());
+	auto transport_res = ConnectFlightExchangeTransport(location);
+	if (transport_res.is_err()) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(transport_res.error());
 	}
-	stream->flight_client = std::move(client_res.value());
+	stream->flight_transport = std::move(transport_res.value());
 
 	arrow::flight::Ticket flight_ticket;
 	FlightExchangeTicket ticket;
@@ -1138,19 +1379,53 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 	if (config_.flight_timeout_seconds > 0.0) {
 		call_options.timeout = arrow::flight::TimeoutDuration(config_.flight_timeout_seconds);
 	}
-	auto reader_res = stream->flight_client->DoGet(call_options, flight_ticket);
+	stream->flight_watchdog = make_uniq<FlightStreamWatchdog>(*context_, config_.flight_read_timeout_seconds);
+	auto watchdog_reason = stream->flight_watchdog->Arm();
+	if (watchdog_reason != FlightWatchdogStopReason::NONE) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
+		    FlightWatchdogError(watchdog_reason, "flight do_get", config_.flight_read_timeout_seconds));
+	}
+	std::unique_ptr<arrow::flight::internal::ClientDataStream> data_stream;
+	auto do_get_status = stream->flight_transport->DoGet(call_options, flight_ticket, &data_stream);
+	if (data_stream) {
+		stream->flight_data_stream = std::move(data_stream);
+		stream->flight_watchdog->SetStream(stream->flight_data_stream.get());
+	}
+	watchdog_reason = stream->flight_watchdog->Disarm();
+	if (watchdog_reason != FlightWatchdogStopReason::NONE) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
+		    FlightWatchdogError(watchdog_reason, "flight do_get", config_.flight_read_timeout_seconds));
+	}
+	if (!do_get_status.ok()) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
+		    FlightExchangeArrowToError(do_get_status, "flight do_get"));
+	}
+	if (!stream->flight_data_stream) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
+		    DuckDBError::external_error("flight do_get returned no data stream"));
+	}
+	watchdog_reason = stream->flight_watchdog->Arm();
+	if (watchdog_reason != FlightWatchdogStopReason::NONE) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
+		    FlightWatchdogError(watchdog_reason, "flight get schema", config_.flight_read_timeout_seconds));
+	}
+	auto memory_manager = call_options.memory_manager;
+	if (!memory_manager) {
+		memory_manager = arrow::CPUDevice::Instance()->default_memory_manager();
+	}
+	auto message_reader = std::make_unique<FlightExchangeIpcMessageReader>(stream->flight_data_stream, memory_manager);
+	auto reader_res = arrow::ipc::RecordBatchStreamReader::Open(std::move(message_reader), call_options.read_options);
+	watchdog_reason = stream->flight_watchdog->Disarm();
+	if (watchdog_reason != FlightWatchdogStopReason::NONE) {
+		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
+		    FlightWatchdogError(watchdog_reason, "flight get schema", config_.flight_read_timeout_seconds));
+	}
 	if (!reader_res.ok()) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
-		    FlightExchangeArrowToError(reader_res.status(), "flight do_get"));
+		    FlightExchangeArrowToError(reader_res.status(), "flight get schema"));
 	}
 	stream->flight_reader = std::move(reader_res).ValueOrDie();
-	auto schema_res = stream->flight_reader->GetSchema();
-	if (!schema_res.ok()) {
-		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
-		    FlightExchangeArrowToError(schema_res.status(), "flight get schema"));
-	}
-	auto converter_res =
-	    BuildArrowBatchConverter(*context_, std::move(schema_res).ValueOrDie(), stream->expected_types);
+	auto converter_res = BuildArrowBatchConverter(*context_, stream->flight_reader->schema(), stream->expected_types);
 	if (converter_res.is_err()) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(converter_res.error());
 	}
@@ -1169,20 +1444,30 @@ DuckDBResult<bool> FlightExchangeSource::ReadStreamChunk(DataChunk &chunk) {
 	}
 	if (stream_state_->kind == PartitionStreamState::Kind::FLIGHT) {
 		while (true) {
-			auto next_res = stream_state_->flight_reader->Next();
-			if (!next_res.ok()) {
-				return DuckDBResult<bool>::err(FlightExchangeArrowToError(next_res.status(), "flight read batch"));
+			auto watchdog_reason = stream_state_->flight_watchdog->Arm();
+			if (watchdog_reason != FlightWatchdogStopReason::NONE) {
+				return DuckDBResult<bool>::err(
+				    FlightWatchdogError(watchdog_reason, "flight read batch", config_.flight_read_timeout_seconds));
 			}
-			auto flight_chunk = std::move(next_res).ValueOrDie();
-			if (!flight_chunk.data) {
+			std::shared_ptr<arrow::RecordBatch> batch;
+			auto next_status = stream_state_->flight_reader->ReadNext(&batch);
+			watchdog_reason = stream_state_->flight_watchdog->Disarm();
+			if (watchdog_reason != FlightWatchdogStopReason::NONE) {
+				return DuckDBResult<bool>::err(
+				    FlightWatchdogError(watchdog_reason, "flight read batch", config_.flight_read_timeout_seconds));
+			}
+			if (!next_status.ok()) {
+				return DuckDBResult<bool>::err(FlightExchangeArrowToError(next_status, "flight read batch"));
+			}
+			if (!batch) {
 				return DuckDBResult<bool>::ok(false);
 			}
-			if (flight_chunk.data->num_rows() == 0) {
+			if (batch->num_rows() == 0) {
 				continue;
 			}
-			auto convert_res = ConvertArrowRecordBatchToChunk(*context_, *stream_state_->arrow_table,
-			                                                  stream_state_->arrow_types, stream_state_->output_types,
-			                                                  stream_state_->needs_cast, flight_chunk.data, chunk);
+			auto convert_res =
+			    ConvertArrowRecordBatchToChunk(*context_, *stream_state_->arrow_table, stream_state_->arrow_types,
+			                                   stream_state_->output_types, stream_state_->needs_cast, batch, chunk);
 			if (convert_res.is_err()) {
 				return DuckDBResult<bool>::err(convert_res.error());
 			}
@@ -1253,6 +1538,9 @@ DuckDBResult<bool> FlightExchangeSource::ReadStreamChunk(DataChunk &chunk) {
 
 bool FlightExchangeSource::ReadChunk(DataChunk &chunk) {
 	chunk.Reset();
+	if (context_ && context_->IsInterrupted()) {
+		throw InterruptException();
+	}
 	if (closed_ || current_handle_idx_ >= handles_.size()) {
 		return false;
 	}
@@ -1261,6 +1549,9 @@ bool FlightExchangeSource::ReadChunk(DataChunk &chunk) {
 		if (!stream_state_) {
 			auto stream_res = OpenPartitionStream(handles_[current_handle_idx_]);
 			if (stream_res.is_err()) {
+				if (context_ && context_->IsInterrupted()) {
+					throw InterruptException();
+				}
 				throw std::runtime_error(stream_res.error().what());
 			}
 			stream_state_ = std::move(stream_res.value());
@@ -1268,6 +1559,9 @@ bool FlightExchangeSource::ReadChunk(DataChunk &chunk) {
 
 		auto read_res = ReadStreamChunk(chunk);
 		if (read_res.is_err()) {
+			if (context_ && context_->IsInterrupted()) {
+				throw InterruptException();
+			}
 			throw std::runtime_error(read_res.error().what());
 		}
 		if (read_res.value() && chunk.size() > 0) {
