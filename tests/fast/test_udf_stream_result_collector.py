@@ -3054,7 +3054,7 @@ def test_remote_provider_capability_error_preserves_safe_details():
         block, metadata = make_stream_error_pair(payload, error)
         return _Generator([_Ref(block, is_block=True), _Ref(metadata)])
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         10,
         101,
