@@ -3,49 +3,59 @@
 
 """Monkey-patch AI convenience methods onto DuckDBPyRelation.
 
-This module adds ``.embed_text()``, ``.classify_text()``, and ``.prompt()``
+This module adds ``.embed()``, ``.classify_text()``, and ``.prompt()``
 directly to :class:`duckdb.DuckDBPyRelation` so users can write::
 
-    rel.embed_text("text_col", provider="transformers")
+    rel.embed(vane.col("text_col"), provider="transformers")
 
 instead of the functional form::
 
-    from vane.ai import embed_text
+    from vane.ai import embed
 
-    embed_text(rel, "text_col", provider="transformers")
+    embed(rel, vane.col("text_col"), provider="transformers")
 
 The patch is applied once when this module is imported.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
-from duckdb import DuckDBPyRelation
+from typing_extensions import Unpack
+
+from duckdb import DuckDBPyRelation, Expression
+from vane.ai.options import EmbedOptions, PromptOptions
+from vane.ai.provider import Provider
+from vane.ai.typing import JSONSchema
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel  # type: ignore[import-not-found]
+else:
+    BaseModel = Any
 
 
-def _embed_text(
+def _embed(
     self: DuckDBPyRelation,
-    column: str,
+    text: Expression,
     *,
-    provider: Any = None,
+    provider: str | Provider = "openai",
     model: str | None = None,
     dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
     output_column: str = "embedding",
-    execution_backend: str | None = None,
-    **options: Any,
+    **options: Unpack[EmbedOptions],
 ) -> DuckDBPyRelation:
-    """Embed a text column. See :func:`vane.ai.embed_text` for details."""
-    from vane.ai.functions import embed_text
+    """Append a fixed-size embedding column. See :func:`vane.ai.embed`."""
+    from vane.ai.functions import embed
 
-    return embed_text(
+    return embed(
         self,
-        column,
+        text,
         provider=provider,
         model=model,
         dimensions=dimensions,
+        on_error=on_error,
         output_column=output_column,
-        execution_backend=execution_backend,
         **options,
     )
 
@@ -78,43 +88,42 @@ def _classify_text(
 
 def _prompt(
     self: DuckDBPyRelation,
-    column: str,
+    messages: Expression | list[Expression],
     *,
-    image_columns: list[str] | None = None,
-    provider: Any = None,
-    model: str | None = None,
+    return_format: type[BaseModel] | JSONSchema | None = None,
     system_message: str | None = None,
-    return_format: Any | None = None,
-    use_chat_completions: bool = True,
+    provider: str | Provider = "openai",
+    model: str | None = None,
+    return_raw_response: bool = False,
+    on_error: Literal["raise", "ignore"] = "raise",
     output_column: str = "response",
-    execution_backend: str | None = None,
-    **options: Any,
+    **options: Unpack[PromptOptions],
 ) -> DuckDBPyRelation:
-    """Generate LLM responses. See :func:`vane.ai.prompt` for details."""
+    """Append text, structured, or raw Prompt responses. See :func:`vane.ai.prompt`."""
     from vane.ai.functions import prompt
 
     return prompt(
         self,
-        column,
-        image_columns=image_columns,
+        messages,
+        return_format=return_format,
+        system_message=system_message,
         provider=provider,
         model=model,
-        system_message=system_message,
-        return_format=return_format,
-        use_chat_completions=use_chat_completions,
+        return_raw_response=return_raw_response,
+        on_error=on_error,
         output_column=output_column,
-        execution_backend=execution_backend,
         **options,
     )
 
 
 def _patch() -> None:
     """Apply AI methods to DuckDBPyRelation (idempotent)."""
-    if hasattr(DuckDBPyRelation, "embed_text"):
-        return
-    DuckDBPyRelation.embed_text = _embed_text  # type: ignore[attr-defined]
-    DuckDBPyRelation.classify_text = _classify_text  # type: ignore[attr-defined]
-    DuckDBPyRelation.prompt = _prompt  # type: ignore[attr-defined]
+    if not hasattr(DuckDBPyRelation, "embed"):
+        DuckDBPyRelation.embed = _embed  # type: ignore[attr-defined]
+    if not hasattr(DuckDBPyRelation, "classify_text"):
+        DuckDBPyRelation.classify_text = _classify_text  # type: ignore[attr-defined]
+    if not hasattr(DuckDBPyRelation, "prompt"):
+        DuckDBPyRelation.prompt = _prompt  # type: ignore[attr-defined]
 
 
 _patch()

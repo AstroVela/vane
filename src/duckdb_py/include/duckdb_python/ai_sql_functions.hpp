@@ -7,9 +7,13 @@
 
 namespace duckdb {
 
+struct CreateMacroInfo;
+
 struct AISQLFunction {
-	static ScalarFunctionSet GetPromptFunctions();
-	static ScalarFunctionSet GetEmbedFunctions();
+	static ScalarFunctionSet GetPromptImplementationFunctions();
+	static unique_ptr<CreateMacroInfo> GetPromptMacro();
+	static ScalarFunctionSet GetEmbedImplementationFunctions();
+	static unique_ptr<CreateMacroInfo> GetEmbedMacro();
 };
 
 } // namespace duckdb

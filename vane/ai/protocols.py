@@ -14,7 +14,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from vane.ai.typing import Descriptor
+from vane.ai.typing import Descriptor, UDFOptions
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -62,6 +62,17 @@ class TextClassifier(Protocol):
 class TextClassifierDescriptor(Descriptor["TextClassifier"]):
     """Serializable factory for a :class:`TextClassifier`."""
 
+    def get_udf_options(self) -> UDFOptions:
+        """Preserve the legacy Classify execution-option contract."""
+        options = self.get_options()
+        return UDFOptions(
+            actor_number=options.get("actor_number"),
+            num_gpus=options.get("num_gpus"),
+            max_retries=options.get("max_retries", 3),
+            on_error=options.get("on_error", "raise"),
+            batch_size=options.get("batch_size"),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Prompting / chat completion
@@ -77,6 +88,10 @@ class Prompter(Protocol):
 
 class PrompterDescriptor(Descriptor["Prompter"]):
     """Serializable factory for a :class:`Prompter`."""
+
+    def supports_image_inputs(self) -> bool:
+        """Whether this descriptor's statically selected model accepts images."""
+        return True
 
 
 class NativePrompterPlan(ABC):

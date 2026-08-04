@@ -14,6 +14,8 @@ import pytest
 
 import vane
 
+pytestmark = pytest.mark.external_service
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -39,24 +41,16 @@ def _record(case: str, payload: Mapping[str, object]) -> None:
         f.write(json.dumps({"case": case, **payload}, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def _openai_provider_options() -> vane.ai.OpenAIProviderOptions:
+def _require_openai_credentials() -> None:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         pytest.skip("OPENAI_API_KEY is required for OpenAI-compatible E2E")
-    timeout = float(os.getenv("OPENAI_TIMEOUT", "60"))
-    return vane.ai.OpenAIProviderOptions(
-        api_key=api_key,
-        base_url=os.getenv("OPENAI_BASE_URL") or None,
-        organization=os.getenv("OPENAI_ORGANIZATION") or None,
-        timeout=timeout,
-        concurrency=1,
-        max_api_concurrency=2,
-    )
 
 
 def test_openai_prompt_expression_real_provider() -> None:
     _require_real_e2e("VANE_E2E_OPENAI")
     pytest.importorskip("openai")
+    _require_openai_credentials()
 
     model = os.getenv("VANE_E2E_OPENAI_PROMPT_MODEL", "gpt-4o-mini")
     use_chat = os.getenv("VANE_E2E_OPENAI_USE_CHAT_COMPLETIONS", "1").lower() not in {"0", "false", "no"}
@@ -69,14 +63,14 @@ def test_openai_prompt_expression_real_provider() -> None:
             vane.col("chunk"),
             provider="openai",
             model=model,
-            provider_options=_openai_provider_options(),
-            prompt_options=vane.ai.OpenAIPromptOptions(
-                use_chat_completions=use_chat,
-                max_tokens=32,
-                max_output_tokens=32,
-                temperature=0,
-            ),
             system_message="Return one concise English phrase.",
+            use_chat_completions=use_chat,
+            max_output_tokens=32,
+            temperature=0,
+            base_url=os.getenv("OPENAI_BASE_URL") or None,
+            timeout=float(os.getenv("OPENAI_TIMEOUT", "60")),
+            actor_number=1,
+            max_concurrency_per_actor=2,
         ).alias("answer")
 
         rows = rel.select(vane.col("id"), answer_expr).fetchall()
@@ -108,6 +102,7 @@ def test_openai_embed_expression_real_provider() -> None:
     dimensions_env = os.getenv("VANE_E2E_OPENAI_EMBED_DIMENSIONS")
     dimensions = int(dimensions_env) if dimensions_env else None
     started = time.monotonic()
+    _require_openai_credentials()
 
     conn = vane.connect()
     try:
@@ -116,9 +111,11 @@ def test_openai_embed_expression_real_provider() -> None:
             vane.col("chunk"),
             provider="openai",
             model=model,
-            provider_options=_openai_provider_options(),
-            embedding_options=vane.ai.OpenAIEmbeddingOptions(encoding_format="float"),
             dimensions=dimensions,
+            encoding_format="float",
+            base_url=os.getenv("OPENAI_BASE_URL") or None,
+            timeout=float(os.getenv("OPENAI_TIMEOUT", "60")),
+            actor_number=1,
             normalize=False,
         ).alias("embedding")
 
@@ -142,6 +139,7 @@ def test_openai_embed_expression_real_provider() -> None:
     )
 
 
+@pytest.mark.gpu
 def test_vllm_prompt_expression_real_provider() -> None:
     _require_real_e2e("VANE_E2E_VLLM")
     pytest.importorskip("vllm")
@@ -154,7 +152,6 @@ def test_vllm_prompt_expression_real_provider() -> None:
     max_tokens = int(os.getenv("VANE_E2E_VLLM_MAX_TOKENS", "16"))
     gpu_memory_utilization = os.getenv("VANE_E2E_VLLM_GPU_MEMORY_UTILIZATION")
     engine_args = {
-        "trust_remote_code": True,
         "max_model_len": max_model_len,
     }
     if gpu_memory_utilization:
@@ -168,21 +165,17 @@ def test_vllm_prompt_expression_real_provider() -> None:
             vane.col("chunk"),
             provider="vllm",
             model=model,
-            provider_options=vane.ai.VLLMProviderOptions(
-                engine_args=engine_args,
-                concurrency=1,
-                gpus_per_actor=1,
-            ),
-            prompt_options=vane.ai.VLLMPromptOptions(
-                generate_args={
-                    "sampling_params": {
-                        "temperature": 0,
-                        "top_p": 1.0,
-                        "max_tokens": max_tokens,
-                    }
-                }
-            ),
             system_message="Answer briefly.",
+            engine_args=engine_args,
+            generate_args={
+                "sampling_params": {
+                    "temperature": 0,
+                    "top_p": 1.0,
+                    "max_tokens": max_tokens,
+                }
+            },
+            actor_number=1,
+            gpus_per_actor=1,
         ).alias("answer")
 
         rows = rel.select(vane.col("id"), answer_expr).fetchall()

@@ -34,6 +34,7 @@
 #include "duckdb/main/relation/view_relation.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/parsed_data/create_macro_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -3070,15 +3071,23 @@ void InstantiateNewInstance(DuckDB &db) {
 	vllm_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	system_catalog.CreateFunction(transaction, vllm_info);
 
-	auto ai_prompt_set = AISQLFunction::GetPromptFunctions();
-	CreateScalarFunctionInfo ai_prompt_info(std::move(ai_prompt_set));
-	ai_prompt_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
-	system_catalog.CreateFunction(transaction, ai_prompt_info);
+	auto ai_prompt_implementation_set = AISQLFunction::GetPromptImplementationFunctions();
+	CreateScalarFunctionInfo ai_prompt_implementation_info(std::move(ai_prompt_implementation_set));
+	ai_prompt_implementation_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, ai_prompt_implementation_info);
 
-	auto ai_embed_set = AISQLFunction::GetEmbedFunctions();
-	CreateScalarFunctionInfo ai_embed_info(std::move(ai_embed_set));
-	ai_embed_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
-	system_catalog.CreateFunction(transaction, ai_embed_info);
+	auto ai_prompt_macro = AISQLFunction::GetPromptMacro();
+	ai_prompt_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, *ai_prompt_macro);
+
+	auto ai_embed_implementation_set = AISQLFunction::GetEmbedImplementationFunctions();
+	CreateScalarFunctionInfo ai_embed_implementation_info(std::move(ai_embed_implementation_set));
+	ai_embed_implementation_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, ai_embed_implementation_info);
+
+	auto ai_embed_macro = AISQLFunction::GetEmbedMacro();
+	ai_embed_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, *ai_embed_macro);
 }
 
 static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &database_path, DBConfig &config) {

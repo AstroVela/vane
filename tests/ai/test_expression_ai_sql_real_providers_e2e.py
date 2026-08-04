@@ -14,6 +14,8 @@ import pytest
 
 import vane
 
+pytestmark = pytest.mark.external_service
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -43,6 +45,19 @@ def _sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _sql_value(value: object) -> str:
+    if isinstance(value, dict):
+        fields = ", ".join(f"{key} := {_sql_value(item)}" for key, item in value.items())
+        return f"struct_pack({fields})"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return _sql_string(value)
+    if isinstance(value, (int, float)):
+        return str(value)
+    raise TypeError(f"unsupported SQL fixture value: {type(value).__name__}")
+
+
 def test_openai_prompt_sql_real_provider() -> None:
     _require_real_e2e("VANE_E2E_OPENAI")
     pytest.importorskip("openai")
@@ -58,17 +73,16 @@ def test_openai_prompt_sql_real_provider() -> None:
     rows = conn.sql(f"""
         SELECT ai_prompt(
             chunk,
-            struct_pack(
-                provider := 'openai',
-                model := {_sql_string(model)},
+            system_message := 'Return one concise English phrase.',
+            provider := 'openai',
+            model := {_sql_string(model)},
+            options := struct_pack(
                 base_url := {"NULL" if not base_url else _sql_string(base_url)},
                 timeout := {timeout},
-                concurrency := 1,
-                max_api_concurrency := 2,
-                max_tokens := 32,
                 max_output_tokens := 32,
                 temperature := 0,
-                system_message := 'Return one concise English phrase.'
+                actor_number := 1,
+                max_concurrency_per_actor := 2
             )
         ) AS answer
         FROM (SELECT 'DuckDB analytical database' AS chunk)
@@ -107,14 +121,14 @@ def test_openai_embed_sql_real_provider() -> None:
     rows = conn.sql(f"""
         SELECT ai_embed(
             chunk,
-            struct_pack(
-                provider := 'openai',
-                model := {_sql_string(model)},
+            provider := 'openai',
+            model := {_sql_string(model)},
+            dimensions := {dimensions_sql},
+            options := struct_pack(
                 base_url := {"NULL" if not base_url else _sql_string(base_url)},
-                dimensions := {dimensions_sql},
                 encoding_format := 'float',
                 normalize := false,
-                concurrency := 1
+                actor_number := 1
             )
         ) AS embedding
         FROM (SELECT 'vector database retrieval' AS chunk)
@@ -137,6 +151,7 @@ def test_openai_embed_sql_real_provider() -> None:
     )
 
 
+@pytest.mark.gpu
 def test_vllm_prompt_sql_real_provider() -> None:
     _require_real_e2e("VANE_E2E_VLLM")
     pytest.importorskip("vllm")
@@ -149,7 +164,6 @@ def test_vllm_prompt_sql_real_provider() -> None:
     max_tokens = int(os.getenv("VANE_E2E_VLLM_MAX_TOKENS", "16"))
     gpu_memory_utilization = os.getenv("VANE_E2E_VLLM_GPU_MEMORY_UTILIZATION")
     engine_args = {
-        "trust_remote_code": True,
         "max_model_len": max_model_len,
     }
     if gpu_memory_utilization:
@@ -167,14 +181,14 @@ def test_vllm_prompt_sql_real_provider() -> None:
     rows = conn.sql(f"""
         SELECT ai_prompt(
             chunk,
-            struct_pack(
-                provider := 'vllm',
-                model := {_sql_string(model)},
-                concurrency := 1,
+            system_message := 'Answer briefly.',
+            provider := 'vllm',
+            model := {_sql_string(model)},
+            options := struct_pack(
+                actor_number := 1,
                 gpus_per_actor := 1,
-                engine_args_json := {_sql_string(json.dumps(engine_args))},
-                generate_args_json := {_sql_string(json.dumps(generate_args))},
-                system_message := 'Answer briefly.'
+                engine_args := {_sql_value(engine_args)},
+                generate_args := {_sql_value(generate_args)}
             )
         ) AS answer
         FROM (SELECT 'What is DuckDB?' AS chunk)

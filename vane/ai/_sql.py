@@ -8,42 +8,41 @@ from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
 
-import pyarrow as pa
-
 from vane.ai._redaction import is_sensitive_option_key
 from vane.ai.functions import (
     _actor_number_or_one,
     _adapt_batch_wrapper_for_backend,
     _EmbedTextBatch,
     _gpus_or_zero,
+    _prepare_embed_call,
+    _prepare_prompt_call,
     _PromptBatch,
     _resolve_ai_batch_size,
-    _resolve_provider,
+    _ValidateStructuredOutputBatch,
 )
 from vane.ai.protocols import NativePrompterPlan
-
-
-def _drop_none(options: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in options.items() if value is not None}
-
 
 _INT_OPTION_NAMES = {
     "actor_number",
     "batch_size",
-    "concurrency",
+    "batch_token_limit",
     "dimensions",
-    "max_api_concurrency",
+    "inflight_limit",
+    "input_text_token_limit",
+    "load_balance_threshold",
+    "max_buffer_size",
+    "max_concurrency_per_actor",
     "max_output_tokens",
     "max_retries",
     "max_tokens",
+    "min_bucket_size",
     "top_k",
 }
 
 _FLOAT_OPTION_NAMES = {
-    "frequency_penalty",
+    "engine_init_timeout_s",
     "gpus_per_actor",
-    "gpu_memory_utilization",
-    "presence_penalty",
+    "prefix_match_threshold",
     "temperature",
     "timeout",
     "top_p",
@@ -103,105 +102,113 @@ def _normalize_option_value(value: Any, name: str | None = None) -> Any:
     return value
 
 
-def _int_or_none(value: Any, name: str) -> int | None:
-    if value is None:
-        return None
-    parsed = int(value)
-    if parsed <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return parsed
-
-
-def _pop_execution_options(opts: dict[str, Any]) -> tuple[int | None, int | None]:
-    """Remove UDF-execution options that must not reach provider API kwargs."""
-    batch_size = _int_or_none(opts.pop("batch_size", None), "batch_size")
-    raw_max_retries = opts.pop("max_retries", None)
-    max_retries: int | None = None
-    if raw_max_retries is not None:
-        max_retries = int(raw_max_retries)
-        if max_retries < 0:
-            raise ValueError("max_retries must be >= 0")
-    return batch_size, max_retries
-
-
-def _embedding_output_type(dimensions: int | None) -> str:
-    return "FLOAT[]" if dimensions is None else f"FLOAT[{dimensions}]"
-
-
-def _embedding_arrow_type(dimensions: int | None) -> pa.DataType:
-    return pa.list_(pa.float32()) if dimensions is None else pa.list_(pa.float32(), dimensions)
+def _embedding_output_type(dimensions: int) -> str:
+    return f"FLOAT[{dimensions}]"
 
 
 def _normalize_sql_options(options: dict[str, Any] | None) -> dict[str, Any]:
     _reject_inline_credentials(options or {})
-    opts = {key: _normalize_option_value(value, key) for key, value in _drop_none(dict(options or {})).items()}
-    concurrency = opts.pop("concurrency", None)
-    if concurrency is not None and "actor_number" not in opts:
-        opts["actor_number"] = _int_or_none(concurrency, "concurrency")
-
-    for source, target in (("engine_args_json", "engine_args"), ("generate_args_json", "generate_args")):
-        raw = opts.pop(source, None)
-        if raw is not None and target not in opts:
-            opts[target] = _normalize_option_value(json.loads(str(raw)), target)
+    # Preserve explicit NULL fields until the closed API validators see them.
+    # Dropping them here would let removed/unknown names and non-nullable
+    # values bypass planning-time validation.
+    opts = {key: _normalize_option_value(value, key) for key, value in dict(options or {}).items()}
     _reject_inline_credentials(opts)
     return opts
 
 
 def build_ai_prompt_sql_spec(
+    provider: str = "openai",
+    model: str | None = None,
+    system_message: str | None = None,
+    on_error: str = "raise",
     options: dict[str, Any] | None = None,
     image_input: bool = False,
+    return_format: str | dict[str, Any] | None = None,
+    return_raw_response: bool = False,
 ) -> dict[str, Any]:
     """Build the row-preserving SQL prompt UDF specification."""
     opts = _normalize_sql_options(options)
-    provider = opts.pop("provider", "openai")
-    model = opts.pop("model", None)
-    system_message = opts.pop("system_message", None)
-    batch_size, max_retries = _pop_execution_options(opts)
-
-    prov = _resolve_provider(provider, "openai")
-    try:
-        descriptor = prov.get_prompter(model=model, system_message=system_message, **opts)
-    except NotImplementedError as exc:
-        raise ValueError(f"Provider {provider!r} is not a prompt provider") from exc
+    if isinstance(return_format, str):
+        try:
+            return_format = json.loads(return_format)
+        except json.JSONDecodeError as exc:
+            raise ValueError("AI_PROMPT return_format must be valid JSON") from exc
+    descriptor, udf_opts, _, structured_output = _prepare_prompt_call(
+        provider,
+        model,
+        return_format,
+        system_message,
+        return_raw_response,
+        on_error,
+        opts,
+        relation=False,
+    )
 
     # vLLM already has a native, relation-scoped physical operator. Keep its
     # executor alive across every input batch and let PhysicalVLLM send the
     # single terminal signal when the relation is exhausted.
-    from vane.ai.providers.vllm import NativeVLLMPromptPlan, _serialize_native_vllm_options
+    from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_options_argument
 
     if isinstance(descriptor, NativeVLLMPromptPlan):
         if image_input:
             raise ValueError("native vLLM ai_prompt does not support image inputs")
-        if max_retries not in (None, 0):
-            raise ValueError("native vLLM ai_prompt does not support max_retries")
 
         native_options = descriptor.build_physical_vllm_options()
-        if batch_size is not None:
-            native_options["batch_size"] = batch_size
-        options_json = _serialize_native_vllm_options(native_options)
+        options_argument = _build_native_vllm_options_argument(native_options)
 
-        return {
+        spec = {
             "execution_kind": "native_vllm",
             "name": "ai_prompt",
             "provider": descriptor.get_provider(),
             "model": descriptor.get_model(),
-            "return_type": "VARCHAR",
+            "return_type": structured_output.duckdb_type if structured_output is not None else "VARCHAR",
             "system_message": descriptor.system_message,
-            "options_json": options_json,
+            "options": options_argument,
         }
+        if structured_output is not None:
+            validator = _ValidateStructuredOutputBatch(
+                structured_output,
+                "response",
+                "response",
+                udf_opts.on_error,
+            )
+            actor_callable = _adapt_batch_wrapper_for_backend(
+                validator,
+                "subprocess_actor",
+                force_actor=True,
+            )
+            spec["validation_spec"] = {
+                "function": actor_callable,
+                "name": "validate_vllm_structured_output",
+                "provider": descriptor.get_provider(),
+                "model": descriptor.get_model(),
+                "return_type": "VARCHAR",
+                "input_names": ["response"],
+                "schema": {"response": "VARCHAR"},
+                "batch_size": None,
+                "row_preserving": True,
+                "actor_number": 1,
+                "gpus": 0,
+            }
+        return spec
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
+    if image_input and not descriptor.supports_image_inputs():
+        raise ValueError(
+            f"Provider {descriptor.get_provider()!r} model {descriptor.get_model()!r} "
+            "does not support Prompt image inputs"
+        )
 
-    udf_opts = descriptor.get_udf_options()
-    resolved_max_retries = udf_opts.max_retries if max_retries is None else max_retries
+    input_names = ["message_0", "message_1"] if image_input else ["message_0"]
     wrapper = _PromptBatch(
         descriptor,
-        "messages",
+        input_names,
         "response",
-        udf_opts.max_api_concurrency,
-        image_columns=["images"] if image_input else None,
-        propagate_null_prompts=image_input,
-        max_retries=resolved_max_retries,
+        udf_opts.max_concurrency_per_actor,
+        single_message=True,
+        return_format=None if return_raw_response else structured_output,
+        return_raw_response=return_raw_response,
+        max_retries=udf_opts.max_retries,
         on_error=udf_opts.on_error,
     )
     actor_callable = _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True)
@@ -210,40 +217,42 @@ def build_ai_prompt_sql_spec(
         "name": "ai_prompt",
         "provider": descriptor.get_provider(),
         "model": descriptor.get_model(),
-        "return_type": "VARCHAR",
-        "input_names": ["messages", "images"] if image_input else ["messages"],
+        "return_type": (
+            structured_output.duckdb_type if structured_output is not None and not return_raw_response else "VARCHAR"
+        ),
+        "input_names": input_names,
         "schema": {"response": "VARCHAR"},
-        "batch_size": batch_size if batch_size is not None else _resolve_ai_batch_size(udf_opts),
+        "batch_size": _resolve_ai_batch_size(udf_opts),
         "row_preserving": True,
         "actor_number": _actor_number_or_one(udf_opts),
         "gpus": _gpus_or_zero(udf_opts),
     }
 
 
-def build_ai_embed_sql_spec(options: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_ai_embed_sql_spec(
+    provider: str = "openai",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: str = "raise",
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     opts = _normalize_sql_options(options)
-    provider = opts.pop("provider", "openai")
-    model = opts.pop("model", None)
-    dimensions = _int_or_none(opts.pop("dimensions", None), "dimensions")
-    normalize = bool(opts.pop("normalize", False))
-    batch_size, max_retries = _pop_execution_options(opts)
-
-    prov = _resolve_provider(provider, "openai")
-    try:
-        descriptor = prov.get_text_embedder(model=model, dimensions=dimensions, **opts)
-    except NotImplementedError as exc:
-        raise ValueError(f"Provider {provider!r} is not an embedding provider") from exc
-
-    udf_opts = descriptor.get_udf_options()
-    resolved_max_retries = udf_opts.max_retries if max_retries is None else max_retries
+    descriptor, resolved_dimensions, udf_opts, normalize, _, _, _ = _prepare_embed_call(
+        provider,
+        model,
+        dimensions,
+        on_error,
+        opts,
+        relation=False,
+    )
     wrapper = _EmbedTextBatch(
         descriptor,
         "text",
         "embedding",
-        max_retries=resolved_max_retries,
+        resolved_dimensions,
+        max_retries=udf_opts.max_retries,
         on_error=udf_opts.on_error,
         normalize=normalize,
-        arrow_type=_embedding_arrow_type(dimensions),
     )
     actor_callable = _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True)
     return {
@@ -251,11 +260,11 @@ def build_ai_embed_sql_spec(options: dict[str, Any] | None = None) -> dict[str, 
         "name": "ai_embed",
         "provider": descriptor.get_provider(),
         "model": descriptor.get_model(),
-        "dimensions": dimensions,
-        "return_type": _embedding_output_type(dimensions),
+        "dimensions": resolved_dimensions,
+        "return_type": _embedding_output_type(resolved_dimensions),
         "input_names": ["text"],
-        "schema": {"embedding": _embedding_output_type(dimensions)},
-        "batch_size": batch_size if batch_size is not None else _resolve_ai_batch_size(udf_opts),
+        "schema": {"embedding": _embedding_output_type(resolved_dimensions)},
+        "batch_size": _resolve_ai_batch_size(udf_opts),
         "row_preserving": True,
         "actor_number": _actor_number_or_one(udf_opts),
         "gpus": _gpus_or_zero(udf_opts),

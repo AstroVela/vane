@@ -8,6 +8,7 @@ from pathlib import Path
 import pyarrow as pa
 from vllm import LLM
 
+import duckdb
 import vane
 
 _CONFIG_SPEC = importlib.util.spec_from_file_location(
@@ -30,10 +31,8 @@ connect_vane = _CONFIG.connect_vane
 get_vane_naive_actor_count = _CONFIG.get_vane_naive_actor_count
 get_vane_naive_partition_count = _CONFIG.get_vane_naive_partition_count
 get_vllm_engine_args = _CONFIG.get_vllm_engine_args
-json_sql_literal = _CONFIG.json_sql_literal
 print_benchmark_results = _CONFIG.print_benchmark_results
 print_preview_rows = _CONFIG.print_preview_rows
-sql_literal = _CONFIG.sql_literal
 
 
 NAIVE_VLLM_SCHEMA = {
@@ -69,33 +68,31 @@ class NaiveVLLM:
         )
 
 
-def _native_vllm_query(*, do_prefix_routing: bool, sorted_by_prompt: bool) -> str:
-    input_sql = build_input_sql(sorted_by_prompt=sorted_by_prompt)
-    options_sql = json_sql_literal(
+def _native_vllm_relation(con, *, do_prefix_routing: bool, sorted_by_prompt: bool):
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
+    options = _build_native_vllm_options_argument(
         build_vane_native_vllm_options(
             do_prefix_routing=do_prefix_routing,
         )
     )
-    model_sql = sql_literal(MODEL_NAME)
-    return f"""
-WITH source AS (
-    {input_sql}
-),
-generated AS (
-    SELECT
-        id,
-        prompt,
-        vllm(prompt, '{model_sql}', '{options_sql}') AS output
-    FROM source
-)
-SELECT
-    id,
-    prompt,
-    output,
-    length(prompt) AS prompt_len,
-    length(output) AS output_len
-FROM generated
-"""
+    generated = con.sql(build_input_sql(sorted_by_prompt=sorted_by_prompt)).select(
+        duckdb.ColumnExpression("id"),
+        duckdb.ColumnExpression("prompt"),
+        duckdb.FunctionExpression(
+            "vllm",
+            duckdb.ColumnExpression("prompt"),
+            duckdb.ConstantExpression(MODEL_NAME),
+            duckdb.ConstantExpression(options),
+        ).alias("output"),
+    )
+    return generated.select(
+        duckdb.ColumnExpression("id"),
+        duckdb.ColumnExpression("prompt"),
+        duckdb.ColumnExpression("output"),
+        duckdb.FunctionExpression("length", duckdb.ColumnExpression("prompt")).alias("prompt_len"),
+        duckdb.FunctionExpression("length", duckdb.ColumnExpression("output")).alias("output_len"),
+    )
 
 
 def _run_relation_benchmark(script_name: str, rel, *, distributed: bool = False) -> None:
@@ -170,10 +167,9 @@ def run_vane_native_vllm_benchmark(
 ) -> None:
     print("Starting benchmark...")
     con = connect_vane()
-    rel = con.sql(
-        _native_vllm_query(
-            do_prefix_routing=do_prefix_routing,
-            sorted_by_prompt=sorted_by_prompt,
-        )
+    rel = _native_vllm_relation(
+        con,
+        do_prefix_routing=do_prefix_routing,
+        sorted_by_prompt=sorted_by_prompt,
     )
     _run_relation_benchmark(script_name, rel, distributed=distributed)

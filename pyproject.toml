@@ -32,6 +32,7 @@ dependencies = [
     "numpy",
     "pyarrow>=14.0.0",
     "ray>=2.53.0,<3",
+    "typing-extensions",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -63,16 +64,16 @@ Issues = "https://github.com/AstroVela/vane/issues"
 Changelog = "https://github.com/AstroVela/vane/releases"
 
 [project.optional-dependencies]
-openai = ["openai"]
+openai = ["openai>=1.66.0", "tiktoken"] # floor adds the Responses API used by the default Prompt path
 anthropic = ["anthropic>=0.117.0"] # floor matches the Messages.create option surface validated in vane/ai/providers/anthropic.py
-google = ["google-genai"]
+google = ["google-genai>=1.22.0"] # floor adds GenerateContentConfig.response_json_schema
 transformers = [
     "sentence-transformers",
     "torch",
     "transformers",
 ]
 vllm = [
-    "vllm; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "vllm>=0.11.0; platform_system == 'Linux' and platform_machine == 'x86_64'", # floor adds structured_outputs
 ]
 image = [ # ndarray image inputs for AI providers
     "pillow>=10",
@@ -84,10 +85,11 @@ video = [ # video data source; decord is gated to Vane's supported native platfo
 ]
 all = [ # Cloud providers and dataframe/filesystem integrations; local model runtimes stay opt-in.
     "anthropic>=0.117.0",
-    "google-genai",
+    "google-genai>=1.22.0",
     "ipython", # used in query_graph
     "fsspec",  # used in filesystem support
-    "openai",
+    "openai>=1.66.0",
+    "tiktoken",
     "pandas",  # used for pandas dataframes
     "adbc-driver-manager", # for the adbc driver
     "pillow>=10", # used for image inputs and video frames
@@ -205,6 +207,7 @@ include = [
     # stays in the repository and is intentionally not part of the PyPI sdist.
     "/tests/conftest.py",
     "/tests/ray_test_profile.py",
+    "/tests/fast/test_ai_release_contracts.py",
     "/tests/fast/test_package_metadata.py",
     "/tests/fast/test_ray_test_profile.py",
     "/tests/fast/test_transformers_provider_security.py",
@@ -212,6 +215,7 @@ include = [
     "/tests/fast/test_expression_udf_contracts.py",
     "/tests/fast/test_local_e2e.py",
     "/tests/fast/test_ray_cpp_bindings.py",
+    "/tests/fast/test_ray_remote_exceptions.py",
     "/tests/fast/test_ray_result_contract.py",
     "/tests/fast/test_fte_production_readiness.py",
     "/multimodal_inference_benchmarks/check_fte_production_readiness.py",
@@ -395,6 +399,8 @@ test = [ # dependencies used for running tests
     "pytest-reraise",
     "pytest-timeout",
     "pytest-timestamper",
+    "pydantic>=2",
+    "tiktoken",
     "coverage",
     "gcovr",
     "gcsfs; sys_platform != 'win32' or platform_machine != 'ARM64'",

@@ -19,6 +19,7 @@ else:
     Embedding: TypeAlias = Any
 
 Options = dict[str, Any]
+JSONSchema: TypeAlias = dict[str, Any]
 Label = str
 
 T = TypeVar("T")
@@ -57,15 +58,13 @@ class Descriptor(ABC, Generic[T]):
         ...
 
     def get_udf_options(self) -> UDFOptions:
-        """Extract UDF execution options from the provider options."""
-        opts = self.get_options()
-        return UDFOptions(
-            actor_number=opts.get("actor_number"),
-            num_gpus=opts.get("num_gpus"),
-            max_retries=opts.get("max_retries", 3),
-            on_error=opts.get("on_error", "raise"),
-            batch_size=opts.get("batch_size"),
-        )
+        """Return descriptor-derived resource requirements, if any.
+
+        Prompt and Embed execution options are normalized from their closed
+        call-level option mappings. Descriptors must not provide a second set
+        of execution defaults.
+        """
+        return UDFOptions()
 
 
 @dataclass(frozen=True)
@@ -88,4 +87,4 @@ class UDFOptions:
     max_retries: int = 3
     on_error: Literal["raise", "log", "ignore"] = "raise"
     batch_size: int | None = None
-    max_api_concurrency: int | None = None
+    max_concurrency_per_actor: int | None = None

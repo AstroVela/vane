@@ -10,17 +10,21 @@ import os
 import pathlib
 import typing
 import uuid
-from typing_extensions import Self
+from typing_extensions import Self, Unpack
 
 if typing.TYPE_CHECKING:
     import fsspec
     import numpy as np
     import polars
     import pandas
+    from pydantic import BaseModel as _PydanticModel  # type: ignore[import-not-found]
     import pyarrow.lib
     from collections.abc import Callable, Iterable, Sequence, Mapping
     from duckdb import sqltypes, func
     from builtins import list as lst  # needed to avoid mypy error on DuckDBPyRelation.list method shadowing
+    from vane.ai.options import EmbedOptions, PromptOptions
+    from vane.ai.provider import Provider
+    from vane.ai.typing import JSONSchema
 
     # the field_ids argument to to_parquet and write_parquet has a recursive structure
     ParquetFieldIdsType = Mapping[str, int | "ParquetFieldIdsType"]
@@ -561,6 +565,30 @@ class DuckDBPyRelation:
     def describe(self) -> DuckDBPyRelation: ...
     def df(self, *, date_as_object: bool = False) -> pandas.DataFrame: ...
     def distinct(self) -> DuckDBPyRelation: ...
+    def embed(
+        self,
+        text: Expression,
+        *,
+        provider: str | Provider = "openai",
+        model: str | None = None,
+        dimensions: int | None = None,
+        on_error: typing.Literal["raise", "ignore"] = "raise",
+        output_column: str = "embedding",
+        **options: Unpack[EmbedOptions],  # type: ignore[misc]
+    ) -> DuckDBPyRelation: ...
+    def prompt(
+        self,
+        messages: Expression | lst[Expression],
+        *,
+        return_format: typing.Type[_PydanticModel] | JSONSchema | None = None,
+        system_message: str | None = None,
+        provider: str | Provider = "openai",
+        model: str | None = None,
+        return_raw_response: bool = False,
+        on_error: typing.Literal["raise", "ignore"] = "raise",
+        output_column: str = "response",
+        **options: Unpack[PromptOptions],  # type: ignore[misc]
+    ) -> DuckDBPyRelation: ...
     def except_(self, other_rel: DuckDBPyRelation) -> DuckDBPyRelation: ...
     def execute(self) -> DuckDBPyRelation: ...
     def explain(self, type: ExplainType = ExplainType.STANDARD) -> str: ...

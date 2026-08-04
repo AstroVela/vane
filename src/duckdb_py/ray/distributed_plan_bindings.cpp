@@ -904,8 +904,8 @@ struct PyPhysicalPlanWrapper {
 				// Keep distributed vLLM pools scoped to one connection session
 				// and query. Cross-query reuse requires immutable configuration
 				// validation and explicit lifecycle ownership.
-				auto safe_session = duckdb::distributed::SanitizePoolComponent(session_id);
-				auto safe_query = duckdb::distributed::SanitizePoolComponent(query_id);
+				auto safe_session = duckdb::distributed::BuildUniquePoolComponent(session_id);
+				auto safe_query = duckdb::distributed::BuildUniquePoolComponent(query_id);
 				auto pool_name = "duckdb_vllm_" + safe_session + "_" + safe_query + "_" + std::to_string(node_id);
 
 				// Inject pool name into operator options so the translator

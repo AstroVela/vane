@@ -8,6 +8,7 @@ set -euo pipefail
 # Optional provider, benchmark, compatibility, and external-service suites run
 # separately because they need additional dependencies or infrastructure.
 release_tests=(
+  tests/fast/test_ai_release_contracts.py
   tests/fast/test_package_metadata.py
   tests/fast/test_ray_test_profile.py
   tests/fast/test_transformers_provider_security.py

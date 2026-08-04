@@ -16,7 +16,7 @@ This Vane version keeps the same shape:
 1. Load sample Common Crawl-shaped records, a local WET/WARC file, or a WET URL.
 2. Filter ``WARC-Type = conversion`` and decode ``warc_content`` as UTF-8.
 3. Parse ``warc_headers`` and keep English records.
-4. Sentence-chunk text and embed chunks with ``vane.ai.embed_text``.
+4. Sentence-chunk text and embed chunks with ``vane.ai.embed``.
 5. Write page, chunk, and embedding outputs.
 
 The default source is a built-in sample so the example can run without Common
@@ -41,7 +41,7 @@ import pyarrow.parquet as pq
 
 import duckdb
 import vane
-from vane.ai import embed_text
+from vane.ai import embed
 
 DEFAULT_EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_OUTPUT_DIR = Path("examples/output/common_crawl")
@@ -362,15 +362,6 @@ class ChunkTextBatch:
         )
 
 
-def append_embedding(base: pa.Table, embedding_rel: Any) -> pa.Table:
-    embeddings = collect_relation(embedding_rel)
-    if base.num_rows != embeddings.num_rows:
-        raise RuntimeError(f"Embedding row count mismatch: {embeddings.num_rows} vs {base.num_rows}")
-    if "embedding" not in embeddings.column_names:
-        raise RuntimeError("Embedding output column was not returned.")
-    return base.append_column("embedding", embeddings["embedding"])
-
-
 def embedding_dims(value: Any) -> int:
     try:
         return len(value)
@@ -543,16 +534,16 @@ def run(args: argparse.Namespace) -> None:
 
     embedded_table = None
     if not args.skip_embeddings:
-        embedded_only = embed_text(
+        embedded = embed(
             chunks,
-            "text",
+            vane.col("text"),
             provider="transformers",
             model=args.embedding_model_id,
             output_column="embedding",
             max_chunk_chars=args.max_chunk_chars,
             batch_size=args.embedding_batch_size,
         )
-        embedded_table = append_embedding(chunks_table, embedded_only)
+        embedded_table = collect_relation(embedded)
 
     output_dir = Path(args.output_dir)
     save_outputs(

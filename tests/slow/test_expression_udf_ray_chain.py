@@ -378,7 +378,7 @@ finally:
     assert "STATEFUL_BATCH_ROWS [1, 2048, 2048]" in result.stdout
 
 
-def test_ai_sql_mock_provider_options_execute_on_multi_actor_ray_pool():
+def test_ai_sql_closed_options_execute_on_multi_actor_ray_pool():
     script = r"""
 import pickle
 import tempfile
@@ -439,10 +439,10 @@ try:
             SELECT chunk, ai_prompt(
                 chunk,
                 image,
-                struct_pack(
-                    provider := 'mock_ai_sql',
-                    model := 'ray-model',
-                    concurrency := 3,
+                provider := 'mock_ai_sql',
+                model := 'ray-model',
+                options := struct_pack(
+                    actor_number := 3,
                     batch_size := 2
                 )
             ) AS response
@@ -451,12 +451,12 @@ try:
         embed_relation = con.sql(f'''
             SELECT chunk, ai_embed(
                 chunk,
-                struct_pack(
-                    provider := 'mock_ai_sql',
-                    model := 'ray-embedding-model',
-                    dimensions := 5,
+                provider := 'mock_ai_sql',
+                model := 'ray-embedding-model',
+                dimensions := 5,
+                options := struct_pack(
                     normalize := true,
-                    concurrency := 3,
+                    actor_number := 3,
                     batch_size := 2
                 )
             ) AS embedding
@@ -473,13 +473,16 @@ try:
         assert prompt_rows == [
             (
                 str(value),
-                f"ray-model:{value}:images=89504e47" if value % 2 == 0 else f"ray-model:{value}",
+                f"ray-model:{value}:89504e47" if value % 2 == 0 else f"ray-model:{value}",
             )
             for value in range(4)
         ]
         assert [len(vector) for _, vector in embedding_rows] == [5, 5, 5, 5]
         assert all(abs(float(np.linalg.norm(vector)) - 1.0) < 1e-6 for _, vector in embedding_rows)
-        print("AI_RAY_OPTIONS provider=mock_ai_sql model=ray-model dimensions=5 concurrency=3")
+        print(
+            "AI_RAY_OPTIONS provider=mock_ai_sql model=ray-model dimensions=5 "
+            "prompt_actor_number=3 embed_actor_number=3"
+        )
         print("AI_RAY_ACTOR_POOL 3")
 finally:
     runner.close()
@@ -499,7 +502,9 @@ finally:
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "AI_RAY_OPTIONS provider=mock_ai_sql model=ray-model dimensions=5 concurrency=3" in result.stdout
+    assert (
+        "AI_RAY_OPTIONS provider=mock_ai_sql model=ray-model dimensions=5 prompt_actor_number=3 embed_actor_number=3"
+    ) in result.stdout
     assert "AI_RAY_ACTOR_POOL 3" in result.stdout
 
 

@@ -69,6 +69,12 @@ def test_artifact_mode_imports_installed_python_packages():
         )
 
 
+def test_vane_distribution_declares_inline_types():
+    import vane
+
+    assert Path(vane.__file__).with_name("py.typed").is_file()
+
+
 def _requirements_for_extra(extra):
     selected = set()
     for raw_requirement in requires("vane-ai") or []:
@@ -76,6 +82,19 @@ def _requirements_for_extra(extra):
         if requirement.marker is not None and requirement.marker.evaluate({"extra": extra}):
             selected.add(canonicalize_name(requirement.name))
     return selected
+
+
+def _requirement_for_extra(extra, package, environment=None):
+    selected = []
+    marker_environment = {"extra": extra, **(environment or {})}
+    for raw_requirement in requires("vane-ai") or []:
+        requirement = Requirement(raw_requirement)
+        if canonicalize_name(requirement.name) != canonicalize_name(package):
+            continue
+        if requirement.marker is not None and requirement.marker.evaluate(marker_environment):
+            selected.append(requirement)
+    assert len(selected) == 1
+    return selected[0]
 
 
 def test_distribution_declares_alpha_version_and_apache_license_expression():
@@ -87,11 +106,25 @@ def test_distribution_declares_alpha_version_and_apache_license_expression():
 
 
 def test_provider_extras_match_provider_import_errors():
-    assert _requirements_for_extra("openai") == {"openai"}
+    assert _requirements_for_extra("openai") == {"openai", "tiktoken"}
     assert _requirements_for_extra("anthropic") == {"anthropic"}
     assert _requirements_for_extra("google") == {"google-genai"}
     assert {"sentence-transformers", "torch", "transformers"} <= _requirements_for_extra("transformers")
     assert "vllm" in _requirements_for_extra("vllm")
+
+
+def test_structured_provider_extras_require_supported_sdk_versions():
+    openai = _requirement_for_extra("openai", "openai")
+    google = _requirement_for_extra("google", "google-genai")
+    vllm = _requirement_for_extra(
+        "vllm",
+        "vllm",
+        {"platform_system": "Linux", "platform_machine": "x86_64"},
+    )
+
+    assert openai.specifier == SpecifierSet(">=1.66.0")
+    assert google.specifier == SpecifierSet(">=1.22.0")
+    assert vllm.specifier == SpecifierSet(">=0.11.0")
 
 
 def test_wheel_or_install_contains_primary_and_third_party_license_files():

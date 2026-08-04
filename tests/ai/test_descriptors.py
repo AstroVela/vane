@@ -31,22 +31,157 @@ class TestProviderLoading:
         provider = TransformersProvider()
         assert provider.name == "transformers"
 
-    def test_transformers_provider_merges_constructor_options(self):
+    def test_transformers_provider_accepts_only_call_level_embed_options(self):
         from vane.ai.providers.transformers import TransformersProvider
 
-        provider = TransformersProvider(batch_size=16, max_retries=2)
+        provider = TransformersProvider()
+        embedder = provider.get_text_embedder(options={"revision": "pinned-revision", "device": "cpu"})
 
-        embedder = provider.get_text_embedder(max_retries=4)
-        classifier = provider.get_text_classifier(on_error="ignore")
+        assert embedder.options == {"revision": "pinned-revision", "device": "cpu"}
 
-        assert embedder.embed_options == {"batch_size": 16, "max_retries": 4}
-        assert classifier.classify_options == {"batch_size": 16, "max_retries": 2, "on_error": "ignore"}
+        with pytest.raises(TypeError, match="batch_size"):
+            provider.get_text_embedder(options={"batch_size": 16})
+
+    @pytest.mark.parametrize(
+        ("provider", "legacy_option"),
+        [
+            ("openai", {"base_url": "https://example.test/v1"}),
+            ("google", {"api_key": "secret"}),
+            ("anthropic", {"max_tokens": 64}),
+            ("transformers", {"revision": "pinned"}),
+        ],
+    )
+    def test_builtin_provider_constructors_reject_legacy_execution_options(self, provider, legacy_option):
+        from vane.ai.providers.anthropic import AnthropicProvider
+        from vane.ai.providers.google import GoogleProvider
+        from vane.ai.providers.openai import OpenAIProvider
+        from vane.ai.providers.transformers import TransformersProvider
+
+        providers = {
+            "openai": OpenAIProvider,
+            "google": GoogleProvider,
+            "anthropic": AnthropicProvider,
+            "transformers": TransformersProvider,
+        }
+        with pytest.raises(TypeError):
+            providers[provider](**legacy_option)
 
     def test_load_openai_provider(self):
         from vane.ai.providers.openai import OpenAIProvider
 
         provider = OpenAIProvider()
         assert provider.name == "openai"
+
+    @pytest.mark.parametrize(
+        ("options", "message"),
+        [
+            pytest.param({"use_ray": True}, "Unsupported Prompt option", id="runtime-key"),
+            pytest.param(
+                {"generate_args": {"sampling_params": {"structured_outputs": {"json": {}}}}},
+                "cannot configure structured_outputs directly",
+                id="structured-output-override",
+            ),
+        ],
+    )
+    def test_vllm_provider_rejects_options_outside_closed_prompt_contract(self, options, message):
+        from vane.ai.providers.vllm import VLLMProvider
+
+        with pytest.raises((TypeError, ValueError), match=message):
+            VLLMProvider().get_prompter(options=options)
+
+    @pytest.mark.parametrize(
+        ("model", "options", "message"),
+        [
+            ("o3-pro", {"use_chat_completions": True}, "Responses API only"),
+            ("gpt-4o-search-preview", {}, "Chat Completions only"),
+        ],
+    )
+    def test_openai_provider_factory_rejects_known_api_path_conflicts(self, model, options, message):
+        from vane.ai.providers.openai import OpenAIProvider
+
+        with pytest.raises(ValueError, match=message):
+            OpenAIProvider().get_prompter(model=model, options=options)
+
+    @pytest.mark.parametrize(
+        ("operation", "options"),
+        [
+            ("embed", {"task_type": "BOGUS"}),
+            ("embed", {"task_type": "RETRIEVAL_DOCUMENT", "title": 123}),
+            ("prompt", {"temperature": "hot"}),
+            ("prompt", {"top_p": 2}),
+        ],
+    )
+    def test_google_provider_factories_apply_closed_option_value_validation(self, operation, options):
+        from vane.ai.providers.google import GoogleProvider
+
+        provider = GoogleProvider()
+        with pytest.raises(ValueError):
+            if operation == "embed":
+                provider.get_text_embedder(model="gemini-embedding-001", options=options)
+            else:
+                provider.get_prompter(model="gemini-test", options=options)
+
+    def test_known_models_cannot_be_used_with_the_wrong_operation(self):
+        from vane.ai.providers.google import GoogleProvider
+        from vane.ai.providers.openai import OpenAIProvider
+
+        factories = [
+            lambda: OpenAIProvider().get_prompter(model="text-embedding-3-small"),
+            lambda: OpenAIProvider().get_text_embedder(model="gpt-4o", dimensions=8),
+            lambda: GoogleProvider().get_prompter(model="gemini-embedding-2"),
+            lambda: GoogleProvider().get_text_embedder(model="gemini-3.6-flash", dimensions=8),
+        ]
+
+        for factory in factories:
+            with pytest.raises(ValueError, match="supports (Embed|Prompt), not (Prompt|Embed)"):
+                factory()
+
+    @pytest.mark.parametrize(
+        ("model", "dimensions"),
+        [
+            ("text-embedding-ada-002", 256),
+            ("text-embedding-3-small", 2048),
+        ],
+    )
+    def test_openai_compatible_endpoint_does_not_inherit_official_dimension_limits(self, model, dimensions):
+        from vane.ai.providers.openai import OpenAIProvider
+
+        descriptor = OpenAIProvider().get_text_embedder(
+            model=model,
+            dimensions=dimensions,
+            options={"base_url": "https://compatible.example.test/v1"},
+        )
+
+        assert descriptor.get_dimensions().size == dimensions
+
+    def test_openai_compatible_endpoint_requires_explicit_dimensions(self):
+        from vane.ai.providers.openai import OpenAIProvider
+
+        with pytest.raises(ValueError, match="pass dimensions"):
+            OpenAIProvider().get_text_embedder(
+                model="text-embedding-3-small",
+                options={"base_url": "https://compatible.example.test/v1"},
+            )
+
+    def test_openai_compatible_endpoint_can_remap_known_model_ids(self):
+        from vane.ai.providers.openai import OpenAIProvider
+
+        provider = OpenAIProvider()
+        assert (
+            provider.get_prompter(
+                model="text-embedding-3-small",
+                options={"base_url": "https://compatible.example.test/v1"},
+            )
+            is not None
+        )
+        assert (
+            provider.get_text_embedder(
+                model="gpt-4o",
+                dimensions=8,
+                options={"base_url": "https://compatible.example.test/v1"},
+            )
+            is not None
+        )
 
     def test_provider_registry_contains_expected(self):
         from vane.ai.provider import PROVIDERS
@@ -69,7 +204,7 @@ class TestTransformersDescriptorPickle:
         desc = TransformersTextEmbedderDescriptor(
             model="sentence-transformers/all-MiniLM-L6-v2",
             dimensions=128,
-            embed_options={"batch_size": 32},
+            options={"revision": "pinned-revision"},
         )
 
         # Pickle round-trip
@@ -78,7 +213,7 @@ class TestTransformersDescriptorPickle:
 
         assert restored.model == desc.model
         assert restored.dimensions == desc.dimensions
-        assert restored.embed_options == desc.embed_options
+        assert restored.options == desc.options
         assert restored.get_provider() == "transformers"
         assert restored.get_model() == "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -101,15 +236,13 @@ class TestTransformersDescriptorPickle:
 
 class TestOpenAIDescriptorPickle:
     def test_text_embedder_descriptor_roundtrip(self):
-        from vane.ai._redaction import Secret
         from vane.ai.providers.openai import OpenAITextEmbedderDescriptor
 
         desc = OpenAITextEmbedderDescriptor(
             provider_name="openai",
-            provider_options={"api_key": "test-key"},
             model_name="text-embedding-3-small",
             dimensions=512,
-            embed_options={"batch_size": 32},
+            options={"encoding_format": "base64"},
         )
 
         data = pickle.dumps(desc)
@@ -117,9 +250,7 @@ class TestOpenAIDescriptorPickle:
 
         assert restored.model_name == "text-embedding-3-small"
         assert restored.dimensions == 512
-        # Credentials stay sealed on the descriptor (vane#105); the round-trip
-        # preserves the real value, comparable only against another Secret.
-        assert restored.provider_options == {"api_key": Secret("test-key")}
+        assert restored.options == desc.options
         assert restored.get_provider() == "openai"
         assert restored.is_async() is True
 
@@ -129,7 +260,7 @@ class TestOpenAIDescriptorPickle:
         desc = OpenAIPrompterDescriptor(
             model_name="gpt-4o",
             system_message="You are a helpful assistant.",
-            prompt_options={"temperature": 0.7},
+            options={"temperature": 0.7},
         )
 
         data = pickle.dumps(desc)
@@ -137,7 +268,7 @@ class TestOpenAIDescriptorPickle:
 
         assert restored.model_name == "gpt-4o"
         assert restored.system_message == "You are a helpful assistant."
-        assert restored.prompt_options == {"temperature": 0.7}
+        assert restored.options == {"temperature": 0.7}
 
     def test_dimension_override_validation(self):
         from vane.ai.providers.openai import OpenAITextEmbedderDescriptor
@@ -167,29 +298,34 @@ class TestOpenAIDescriptorPickle:
 
 
 class TestDescriptorAPI:
-    def test_udf_options_from_transformers(self):
-        from vane.ai.providers.transformers import (
-            TransformersTextEmbedderDescriptor,
-        )
+    @pytest.mark.parametrize("options", [{}, {"device": None}])
+    def test_transformers_missing_or_null_device_is_explicit_cpu(self, options):
+        from vane.ai.providers.transformers import TransformersTextEmbedderDescriptor
 
-        desc = TransformersTextEmbedderDescriptor(
-            model="test-model",
-            embed_options={"batch_size": 16, "max_retries": 5},
-        )
+        desc = TransformersTextEmbedderDescriptor(model="test-model", options=options)
+
+        assert desc.options["device"] == "cpu"
+        assert desc.get_udf_options().num_gpus == 0
+
+    def test_transformers_explicit_cuda_device_reserves_gpu(self):
+        from vane.ai.providers.transformers import TransformersTextEmbedderDescriptor
+
+        desc = TransformersTextEmbedderDescriptor(model="test-model", options={"device": "cuda:0"})
         opts = desc.get_udf_options()
-        assert opts.batch_size == 16
-        assert opts.max_retries == 5
+
+        assert opts.batch_size is None
+        assert opts.num_gpus == 1
 
     def test_udf_options_from_openai(self):
         from vane.ai.providers.openai import OpenAITextEmbedderDescriptor
 
         desc = OpenAITextEmbedderDescriptor(
             model_name="text-embedding-3-small",
-            embed_options={"batch_size": 128},
+            options={"encoding_format": "float"},
         )
         opts = desc.get_udf_options()
-        assert opts.batch_size == 128
-        assert opts.max_retries == 0  # OpenAI client retries internally
+        assert opts.batch_size is None
+        assert opts.num_gpus == 0
 
     def test_embedding_dimensions_arrow_type(self):
         from vane.ai.typing import EmbeddingDimensions

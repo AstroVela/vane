@@ -23,6 +23,12 @@ pytest.importorskip("pyarrow")
 import pyarrow as pa
 
 
+def _packed_native_vllm_options(options):
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
+    return _build_native_vllm_options_argument(options)
+
+
 def test_subprocess_actor_warmup_attribute_error_fails_startup():
     import duckdb.execution.udf_subprocess as subprocess_exec
 
@@ -1494,7 +1500,7 @@ def test_vllm_ray_execution_requires_runner_owned_runtime(monkeypatch):
     monkeypatch.setattr(ray, "is_initialized", lambda: False)
 
     with pytest.raises(RuntimeError, match="initialized RayRunner runtime"):
-        vllm.build_executor("model", {"use_ray": True})
+        vllm.build_executor("model", _packed_native_vllm_options({"use_ray": True}))
 
 
 def test_vllm_remote_construction_base_exception_rolls_back_start_and_pool(monkeypatch):
@@ -1539,7 +1545,7 @@ def test_vllm_remote_construction_base_exception_rolls_back_start_and_pool(monke
     monkeypatch.setattr(vllm, "resolve_object_refs_blocking", resolve)
 
     with pytest.raises(KeyboardInterrupt, match="construction interrupted"):
-        vllm.build_executor("model", {"use_ray": True})
+        vllm.build_executor("model", _packed_native_vllm_options({"use_ray": True}))
 
     assert events == ["report-start", "cancel-start", "owner-shutdown"]
 
@@ -1588,7 +1594,7 @@ def test_vllm_remote_construction_cleanup_failures_preserve_base_exception(monke
     monkeypatch.setattr(vllm, "resolve_object_refs_blocking", resolve)
 
     with pytest.raises(KeyboardInterrupt) as exc_info:
-        vllm.build_executor("model", {"use_ray": True})
+        vllm.build_executor("model", _packed_native_vllm_options({"use_ray": True}))
 
     assert exc_info.value is primary_error
     assert events == ["report-start", "cancel-start", "owner-shutdown"]

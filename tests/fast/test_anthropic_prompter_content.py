@@ -32,7 +32,7 @@ def _make_prompter(monkeypatch, content):
 
     from vane.ai.providers.anthropic import AnthropicPrompter
 
-    return AnthropicPrompter(provider_options={}, model="claude-test")
+    return AnthropicPrompter(options={"max_tokens": 64}, model="claude-test")
 
 
 def _thinking_block(text="Let me think about this."):

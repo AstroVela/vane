@@ -8,14 +8,22 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 
 - Public governance, contribution, security, release, provenance, and third-party documentation.
 - Release artifact validation and a reproducible native dependency license bundle.
-- Added three-argument SQL `ai_prompt` overloads for per-row `BLOB` and
-  `BLOB[]` image inputs. NULL, zero-length BLOB, and empty BLOB[] inputs fall
-  back to text-only prompting, while the existing text-only signatures remain
-  unchanged.
+- Added one closed basic Prompt contract across the Python Expression,
+  functional Relation, Relation method, and typed SQL entry points. Ordered
+  `VARCHAR`, `BLOB`, and `BLOB[]` message parts support OpenAI, Anthropic, and
+  Google; native vLLM remains text-only. NULL image parts are omitted, while a
+  zero-length image follows the selected row-level `on_error` policy.
+- Added first-class Prompt `return_format` and `return_raw_response` parameters.
+  A portable finite JSON Schema subset maps to native DuckDB `STRUCT` values
+  and constrains OpenAI, Anthropic, Google, and vLLM requests. Raw mode returns
+  the provider SDK response body as JSON `VARCHAR`; vLLM rejects raw mode at
+  planning time.
 
 ### Changed
 
 - Positioned the current project as the Vane Data developer preview.
+- Prompt uses ordered `messages`, first-class call parameters, and the closed
+  `PromptOptions` keyword surface. OpenAI Responses is the default endpoint.
 - Defined `DuckDBPyRelation.map` exclusively as a row-wise scalar UDF with a
   required `return_type`; batch transforms use `map_batches` with an explicit
   output `schema`. The inherited pandas DataFrame-style DuckDB `map` contract
@@ -29,6 +37,11 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 
 - Released per-database runner cache entries after relation write failures
   without resetting the process-wide runner used by other queries.
+- Kept provider capability failures serializable and credential-safe across
+  local and Ray execution while preserving bounded upstream diagnostics.
+- Stopped Google Embed metadata dimensions and SDK retries from overriding the
+  public request contract, rejected Anthropic zero-token structured requests,
+  and restricted Pydantic structured formats to actual `BaseModel` subclasses.
 
 ### Security
 

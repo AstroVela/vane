@@ -41,8 +41,8 @@ Value EvaluateScalar(ClientContext &context, Expression &arg) {
 
 unique_ptr<FunctionData> VLLMBind(ClientContext &context, ScalarFunction &bound_function,
                                   vector<unique_ptr<Expression>> &arguments) {
-	if (arguments.size() < 2 || arguments.size() > 3) {
-		throw BinderException("vllm requires 2 or 3 arguments: vllm(prompt, model, options)");
+	if (arguments.size() != 3) {
+		throw BinderException("vllm requires 3 arguments: vllm(prompt, model, options)");
 	}
 	if (arguments[0]->return_type.id() != LogicalTypeId::VARCHAR) {
 		throw BinderException("vllm: prompt argument must be VARCHAR");
@@ -59,19 +59,18 @@ unique_ptr<FunctionData> VLLMBind(ClientContext &context, ScalarFunction &bound_
 	}
 	string model = StringValue::Get(model_value);
 
-	Value options;
-	if (arguments.size() == 3) {
-		auto &options_arg = *arguments[2];
-		ThrowIfNotConstant(options_arg, "options");
-		options = EvaluateScalar(context, options_arg);
-	} else {
-		options = Value();
+	auto &options_arg = *arguments[2];
+	ThrowIfNotConstant(options_arg, "options");
+	auto options = EvaluateScalar(context, options_arg);
+	if (options.IsNull()) {
+		throw BinderException("vllm: options cannot be NULL; pass a versioned STRUCT envelope");
+	}
+	if (options.type().id() != LogicalTypeId::STRUCT) {
+		throw BinderException("vllm: options must be a versioned STRUCT envelope, not %s", options.type().ToString());
 	}
 
 	// Remove model/options from runtime arguments, they are stored in bind info.
-	if (arguments.size() == 3) {
-		Function::EraseArgument(bound_function, arguments, 2);
-	}
+	Function::EraseArgument(bound_function, arguments, 2);
 	Function::EraseArgument(bound_function, arguments, 1);
 
 	bound_function.SetReturnType(LogicalType::VARCHAR);
@@ -107,16 +106,10 @@ unique_ptr<FunctionData> VLLMDeserialize(Deserializer &deserializer, ScalarFunct
 
 ScalarFunctionSet VLLMFunction::GetFunctions() {
 	ScalarFunctionSet set("vllm");
-	auto vllm_base =
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, VLLMExecute, VLLMBind,
-	                   nullptr, nullptr, nullptr, LogicalType::INVALID, FunctionStability::VOLATILE);
-	vllm_base.serialize = VLLMSerialize;
-	vllm_base.deserialize = VLLMDeserialize;
-	set.AddFunction(std::move(vllm_base));
-
 	auto vllm_with_options =
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::VARCHAR,
 	                   VLLMExecute, VLLMBind, nullptr, nullptr, nullptr, LogicalType::ANY, FunctionStability::VOLATILE);
+	vllm_with_options.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	vllm_with_options.serialize = VLLMSerialize;
 	vllm_with_options.deserialize = VLLMDeserialize;
 	set.AddFunction(std::move(vllm_with_options));

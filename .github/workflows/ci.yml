@@ -161,7 +161,9 @@ jobs:
             "ninja>=1.10" \
             "pybind11[global]>=3.0.0" \
             "scikit-build-core>=0.11.4" \
+            mypy \
             packaging \
+            "pydantic>=2" \
             pytest
 
       - name: Build and run native distributed tests
@@ -190,6 +192,15 @@ jobs:
 
       - name: Install the built wheel
         run: python -m pip install --force-reinstall dist/*.whl
+
+      - name: Verify the installed AI typing contract
+        if: matrix.python-version == '3.10'
+        run: |
+          cd "$RUNNER_TEMP"
+          python -m mypy \
+            --config-file "$GITHUB_WORKSPACE/tests/typing/ai_mypy.ini" \
+            "$GITHUB_WORKSPACE/tests/typing/ai_prompt.py" \
+            "$GITHUB_WORKSPACE/tests/typing/ai_embed.py"
 
       - name: Verify the base installation Quickstart outside the checkout
         env:

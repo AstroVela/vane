@@ -18,23 +18,67 @@ import pyarrow as pa
 import pytest
 
 
-def _packed_native_vllm_secret_options():
-    from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_options_argument
+def _packed_native_vllm_options(options):
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
 
-    descriptor = NativeVLLMPromptPlan(
-        model_name="secret-model",
-        vllm_options={
+    return _build_native_vllm_options_argument(options)
+
+
+def _native_vllm_envelope(public_options_json):
+    return {
+        "__vane_vllm_payload_version": 1,
+        "__vane_vllm_public_options_json": public_options_json,
+        "__vane_vllm_secret_payload": b'{"payload_version":1,"values":[]}',
+    }
+
+
+def _packed_native_vllm_secret_options():
+    from vane.ai._redaction import Secret
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
+    # P2 rejects plaintext credentials at the public Prompt boundary. Exercise
+    # the lower-level native envelope with already-sealed values so its runtime
+    # decoder remains covered for internal callers.
+    return _build_native_vllm_options_argument(
+        {
             "engine_args": {
-                "hf_token": "hf_OPAQUE-ENGINE-TOKEN",
+                "hf_token": Secret("hf_OPAQUE-ENGINE-TOKEN"),
                 "max_model_len": 2048,
             },
             "generate_args": {
-                "api_key": "sk-OPAQUE-GENERATE-KEY",
+                "api_key": Secret("sk-OPAQUE-GENERATE-KEY"),
                 "sampling_params": {"max_tokens": 16},
             },
-        },
+        }
     )
-    return _build_native_vllm_options_argument(descriptor.build_physical_vllm_options())
+
+
+def test_native_vllm_options_without_secrets_use_the_versioned_envelope():
+    from duckdb.execution.vllm import normalize_options
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
+    packed = _build_native_vllm_options_argument({"batch_size": 4})
+
+    assert packed["__vane_vllm_payload_version"] == 1
+    assert json.loads(packed["__vane_vllm_public_options_json"]) == {"batch_size": 4}
+    assert json.loads(packed["__vane_vllm_secret_payload"]) == {
+        "payload_version": 1,
+        "values": [],
+    }
+    normalized = normalize_options(packed)
+    assert normalized["batch_size"] == 4
+    assert normalize_options(normalized) is normalized
+
+
+def test_native_vllm_struct_wire_rejects_legacy_naked_options():
+    from duckdb.execution.vllm import normalize_options
+
+    with pytest.raises(ValueError, match="versioned envelope"):
+        normalize_options({"batch_size": 4})
+    with pytest.raises(ValueError, match="versioned envelope"):
+        normalize_options('{"batch_size":4}')
+    with pytest.raises(ValueError, match="versioned envelope"):
+        normalize_options(None)
 
 
 def test_vllm_control_rpc_timeout_is_configurable(monkeypatch):
@@ -69,14 +113,14 @@ def test_vllm_control_rpc_timeout_falls_back_for_invalid_values(monkeypatch, con
         ({"batch_size": 0}, "batch_size"),
         ({"batch_size": True}, "batch_size"),
         ({"batch_size": 1.5}, "batch_size"),
-        ({"prefix_match_threshold": float("nan")}, "prefix_match_threshold"),
-        ({"prefix_match_threshold": float("inf")}, "prefix_match_threshold"),
+        ({"prefix_match_threshold": float("nan")}, "strict JSON"),
+        ({"prefix_match_threshold": float("inf")}, "strict JSON"),
         ({"prefix_match_threshold": True}, "prefix_match_threshold"),
         ({"prefix_match_threshold": Decimal("1.01")}, "prefix_match_threshold"),
         ({"gpus_per_actor": 0}, "gpus_per_actor"),
         ({"gpus_per_actor": 1.5}, "gpus_per_actor"),
         ({"gpus_per_actor": True}, "gpus_per_actor"),
-        ({"gpus_per_actor": Decimal("NaN")}, "gpus_per_actor"),
+        ({"gpus_per_actor": Decimal("NaN")}, "strict JSON"),
         ({"gpus_per_actor": Decimal("1.5")}, "gpus_per_actor"),
         ({"concurrency": True}, "concurrency"),
         ({"do_prefix_routing": "false"}, "do_prefix_routing"),
@@ -88,24 +132,31 @@ def test_vllm_numeric_options_are_strict(options, message):
     from duckdb.execution.vllm import normalize_options
 
     with pytest.raises(ValueError, match=message):
-        normalize_options(options)
+        normalize_options(_native_vllm_envelope(json.dumps(options, default=float)))
 
 
 def test_vllm_fractional_gpu_option_is_preserved():
     from duckdb.execution.vllm import normalize_options
 
-    assert normalize_options({"gpus_per_actor": 0.25})["gpus_per_actor"] == pytest.approx(0.25)
+    assert normalize_options(_packed_native_vllm_options({"gpus_per_actor": 0.25}))["gpus_per_actor"] == pytest.approx(
+        0.25
+    )
 
 
 def test_vllm_decimal_options_are_normalized_to_floats():
     from duckdb.execution.vllm import normalize_options
 
     normalized = normalize_options(
-        {
-            "gpus_per_actor": Decimal("0.25"),
-            "prefix_match_threshold": Decimal("0.33"),
-            "engine_init_timeout_s": Decimal("1.5"),
-        }
+        _native_vllm_envelope(
+            json.dumps(
+                {
+                    "gpus_per_actor": Decimal("0.25"),
+                    "prefix_match_threshold": Decimal("0.33"),
+                    "engine_init_timeout_s": Decimal("1.5"),
+                },
+                default=float,
+            )
+        )
     )
 
     assert normalized["gpus_per_actor"] == pytest.approx(0.25)
@@ -130,16 +181,16 @@ def test_vllm_execution_boolean_options_are_strict(name):
     from duckdb.execution.vllm import normalize_options
 
     with pytest.raises(ValueError, match=rf"vllm {name} must be a boolean"):
-        normalize_options({name: "false"})
+        normalize_options(_packed_native_vllm_options({name: "false"}))
 
-    assert normalize_options({name: False})[name] is False
+    assert normalize_options(_packed_native_vllm_options({name: False}))[name] is False
 
 
 def test_vllm_unknown_top_level_options_are_rejected():
     from duckdb.execution.vllm import normalize_options
 
     with pytest.raises(ValueError, match=r"unknown vllm option.*gpus_per_actorr"):
-        normalize_options({"gpus_per_actorr": 0.25})
+        normalize_options(_packed_native_vllm_options({"gpus_per_actorr": 0.25}))
 
 
 def test_vllm_opaque_secrets_restore_only_when_local_executor_is_created(monkeypatch):
@@ -249,7 +300,7 @@ def test_vllm_opaque_secret_payload_is_strictly_validated(secret_payload, messag
 
 def test_native_descriptor_forces_background_loop_inside_ray_actor(monkeypatch):
     import duckdb.execution.vllm as vllm_executor
-    from vane.ai.providers.vllm import VLLMPrompterDescriptor
+    from vane.ai.providers.vllm import NativeVLLMPromptPlan
 
     fake_vllm = types.ModuleType("vllm")
 
@@ -266,12 +317,57 @@ def test_native_descriptor_forces_background_loop_inside_ray_actor(monkeypatch):
 
     monkeypatch.setattr(vllm_executor.LocalVLLMExecutor, "_run_event_loop", fake_run_event_loop)
 
-    options = VLLMPrompterDescriptor(vllm_options={"use_threading": False}).build_physical_vllm_options()
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
+    options = _build_native_vllm_options_argument(NativeVLLMPromptPlan().build_physical_vllm_options())
     executor = vllm_executor.build_executor("test-model", options)
 
     assert executor._ray_actor_mode is False
     assert executor.use_threading is True
     assert executor.loop_ready.is_set()
+
+
+def test_native_executor_materializes_structured_outputs_params(monkeypatch):
+    import duckdb.execution.vllm as vllm_executor
+
+    fake_vllm = types.ModuleType("vllm")
+    fake_sampling_params = types.ModuleType("vllm.sampling_params")
+
+    class StructuredOutputsParams:
+        def __init__(self, **options):
+            self.options = options
+
+    class SamplingParams:
+        def __init__(self, *, structured_outputs=None, **options):
+            self.structured_outputs = structured_outputs
+            self.options = options
+
+    fake_vllm.SamplingParams = SamplingParams
+    fake_sampling_params.StructuredOutputsParams = StructuredOutputsParams
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", fake_sampling_params)
+    monkeypatch.setattr(vllm_executor.LocalVLLMExecutor, "_detect_ray_actor", staticmethod(lambda: False))
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    }
+
+    executor = vllm_executor.LocalVLLMExecutor(
+        "test-model",
+        {},
+        {
+            "sampling_params": {
+                "max_tokens": 8,
+                "structured_outputs": {"json": schema},
+            }
+        },
+        use_threading=False,
+    )
+
+    assert isinstance(executor.sampling_params.structured_outputs, StructuredOutputsParams)
+    assert executor.sampling_params.structured_outputs.options == {"json": schema}
+    assert executor.sampling_params.options == {"max_tokens": 8}
 
 
 def test_ray_actor_releases_only_terminal_per_executor_state():

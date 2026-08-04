@@ -4,12 +4,12 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
-#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/crypto/md5.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/operator/projection/physical_vllm.hpp"
-#include "yyjson.hpp"
 
 #include <cctype>
 
@@ -34,114 +34,49 @@ inline std::string SanitizePoolComponent(const std::string &value) {
 	return result;
 }
 
+inline std::string BuildUniquePoolComponent(const std::string &value) {
+	MD5Context digest;
+	digest.Add(value);
+	return SanitizePoolComponent(value) + "_" + digest.FinishHex();
+}
+
 inline std::string BuildPoolName(const PipelineNodeContext &ctx, NodeID node_id) {
 	auto query_id = ctx.query_id();
 	if (query_id.empty()) {
 		query_id = std::to_string(ctx.query_idx());
 	}
-	auto safe_query = SanitizePoolComponent(query_id);
+	auto safe_query = BuildUniquePoolComponent(query_id);
 	return "duckdb_vllm_" + safe_query + "_" + std::to_string(node_id);
 }
 
-inline bool TryMergeJsonOptions(const std::string &json, const std::string &pool_name, std::string &out) {
-	using namespace duckdb_yyjson;
-	if (json.empty()) {
-		return false;
-	}
-	constexpr auto READ_FLAG = YYJSON_READ_ALLOW_INVALID_UNICODE;
-	yyjson_read_err err;
-	auto *doc = yyjson_read_opts(const_cast<char *>(json.data()), json.size(), READ_FLAG, nullptr, &err); // NOLINT
-	if (!doc) {
-		return false;
-	}
-	auto *root = yyjson_doc_get_root(doc);
-	if (!root || yyjson_get_type(root) != YYJSON_TYPE_OBJ) {
-		yyjson_doc_free(doc);
-		return false;
-	}
-	auto *mut_doc = yyjson_doc_mut_copy(doc, nullptr);
-	yyjson_doc_free(doc);
-	if (!mut_doc) {
-		return false;
-	}
-	auto *mut_root = yyjson_mut_doc_get_root(mut_doc);
-	if (!mut_root || !yyjson_mut_is_obj(mut_root)) {
-		yyjson_mut_doc_free(mut_doc);
-		return false;
-	}
-
-	auto put_bool = [&](const char *key, bool value) {
-		auto *k = yyjson_mut_str(mut_doc, key);
-		auto *v = value ? yyjson_mut_true(mut_doc) : yyjson_mut_false(mut_doc);
-		yyjson_mut_obj_put(mut_root, k, v);
-	};
-	auto put_str = [&](const char *key, const std::string &value) {
-		auto *k = yyjson_mut_str(mut_doc, key);
-		auto *v = yyjson_mut_strncpy(mut_doc, value.c_str(), value.size());
-		yyjson_mut_obj_put(mut_root, k, v);
-	};
-
-	put_bool("use_ray", true);
-	put_bool("ray_worker_only", true);
-	put_str("ray_actor_pool_name", pool_name);
-
-	yyjson_write_err write_err;
-	size_t len = 0;
-	constexpr auto WRITE_FLAG = YYJSON_WRITE_ALLOW_INVALID_UNICODE;
-	char *buf = yyjson_mut_val_write_opts(mut_root, WRITE_FLAG, nullptr, &len, &write_err);
-	if (!buf) {
-		yyjson_mut_doc_free(mut_doc);
-		return false;
-	}
-	out.assign(buf, len);
-	free(buf);
-	yyjson_mut_doc_free(mut_doc);
-	return true;
-}
-
 inline Value InjectDistributedOptions(const Value &options, const std::string &pool_name) {
+	child_list_t<Value> child_list;
 	if (options.IsNull()) {
-		child_list_t<Value> child_list = {
-		    {"use_ray", Value::BOOLEAN(true)},
-		    {"ray_worker_only", Value::BOOLEAN(true)},
-		    {"ray_actor_pool_name", Value(pool_name)},
-		};
-		return Value::STRUCT(std::move(child_list));
-	}
-
-	const auto type_id = options.type().id();
-	if (type_id == LogicalTypeId::STRUCT) {
-		child_list_t<Value> child_list;
+		throw InvalidInputException("vllm distributed options must use the versioned STRUCT envelope");
+	} else if (options.type().id() == LogicalTypeId::STRUCT) {
 		const auto &values = StructValue::GetChildren(options);
 		const auto child_count = StructType::GetChildCount(options.type());
 		child_list.reserve(child_count + 3);
 		for (idx_t i = 0; i < child_count; i++) {
 			child_list.emplace_back(StructType::GetChildName(options.type(), i), values[i]);
 		}
-		auto upsert = [&](const std::string &name, Value value) {
-			for (auto &entry : child_list) {
-				if (entry.first == name) {
-					entry.second = std::move(value);
-					return;
-				}
+	} else {
+		throw InvalidInputException("vllm distributed options must use the versioned STRUCT envelope");
+	}
+
+	auto upsert = [&](const std::string &name, Value value) {
+		for (auto &entry : child_list) {
+			if (entry.first == name) {
+				entry.second = std::move(value);
+				return;
 			}
-			child_list.emplace_back(name, std::move(value));
-		};
-		upsert("use_ray", Value::BOOLEAN(true));
-		upsert("ray_worker_only", Value::BOOLEAN(true));
-		upsert("ray_actor_pool_name", Value(pool_name));
-		return Value::STRUCT(std::move(child_list));
-	}
-
-	if (type_id == LogicalTypeId::VARCHAR || options.type().IsJSONType()) {
-		const auto &json = StringValue::Get(options);
-		std::string merged;
-		if (TryMergeJsonOptions(json, pool_name, merged)) {
-			return Value(merged);
 		}
-	}
-
-	return options;
+		child_list.emplace_back(name, std::move(value));
+	};
+	upsert("use_ray", Value::BOOLEAN(true));
+	upsert("ray_worker_only", Value::BOOLEAN(true));
+	upsert("ray_actor_pool_name", Value(pool_name));
+	return Value::STRUCT(std::move(child_list));
 }
 
 // Extract a pre-injected ray_actor_pool_name from options (if any).
@@ -166,30 +101,6 @@ inline std::string ExtractPoolNameFromOptions(const Value &options) {
 			}
 		}
 		return "";
-	}
-	if (type_id == LogicalTypeId::VARCHAR || options.type().IsJSONType()) {
-		// Quick JSON extraction via yyjson.
-		using namespace duckdb_yyjson;
-		const auto &json = StringValue::Get(options);
-		if (json.empty()) {
-			return "";
-		}
-		constexpr auto READ_FLAG = YYJSON_READ_ALLOW_INVALID_UNICODE;
-		yyjson_read_err err;
-		auto *doc = yyjson_read_opts(const_cast<char *>(json.data()), json.size(), READ_FLAG, nullptr, &err); // NOLINT
-		if (!doc) {
-			return "";
-		}
-		auto *root = yyjson_doc_get_root(doc);
-		std::string result;
-		if (root && yyjson_get_type(root) == YYJSON_TYPE_OBJ) {
-			auto *val = yyjson_obj_get(root, "ray_actor_pool_name");
-			if (val && yyjson_is_str(val)) {
-				result = yyjson_get_str(val);
-			}
-		}
-		yyjson_doc_free(doc);
-		return result;
 	}
 	return "";
 }

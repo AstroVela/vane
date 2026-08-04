@@ -33,6 +33,7 @@ from duckdb.execution._vllm_options_protocol import (
 )
 from duckdb.runners.ray.ray_env import build_session_runtime_env_vars, install_explicit_session_runtime_env
 from duckdb.runners.ray.safe_get import configured_ray_get_timeout_s, resolve_object_refs_blocking
+from vane.ai.provider import _safe_provider_execution_error, _SafeProviderError
 
 
 def _positive_float_env(name: str, default: float | None = None) -> float | None:
@@ -261,6 +262,12 @@ class LocalVLLMExecutor(VLLMExecutor):
                 except json.JSONDecodeError as exc:
                     raise ValueError("vllm sampling_params JSON could not be parsed") from exc
             if isinstance(sampling_params, dict):
+                structured_outputs = sampling_params.get("structured_outputs")
+                if isinstance(structured_outputs, Mapping):
+                    from vllm.sampling_params import StructuredOutputsParams
+
+                    sampling_params = dict(sampling_params)
+                    sampling_params["structured_outputs"] = StructuredOutputsParams(**structured_outputs)
                 self.sampling_params = SamplingParams(**sampling_params)
             else:
                 raise TypeError("vllm sampling_params must be a dict, JSON string, or SamplingParams instance")
@@ -340,11 +347,12 @@ class LocalVLLMExecutor(VLLMExecutor):
             args = AsyncEngineArgs(model=self.model, **self.engine_args)
             self.llm = AsyncLLMEngine.from_engine_args(args)
         except Exception as exc:
+            error_message = str(_safe_provider_execution_error("vllm", self.model, "engine initialization", exc))
             if self.on_error == "raise":
                 with self.error_lock:
                     if self.error_message is None:
-                        self.error_message = f"{type(exc).__name__}: {exc}"
-            self.engine_error_message = f"{type(exc).__name__}: {exc}"
+                        self.error_message = error_message
+            self.engine_error_message = error_message
         finally:
             self.engine_ready.set()
 
@@ -355,11 +363,12 @@ class LocalVLLMExecutor(VLLMExecutor):
             args = AsyncEngineArgs(model=self.model, **self.engine_args)
             self.llm = AsyncLLMEngine.from_engine_args(args)
         except Exception as exc:
+            error_message = str(_safe_provider_execution_error("vllm", self.model, "engine initialization", exc))
             if self.on_error == "raise":
                 with self.error_lock:
                     if self.error_message is None:
-                        self.error_message = f"{type(exc).__name__}: {exc}"
-            self.engine_error_message = f"{type(exc).__name__}: {exc}"
+                        self.error_message = error_message
+            self.engine_error_message = error_message
         finally:
             self.engine_ready.set()
 
@@ -391,9 +400,9 @@ class LocalVLLMExecutor(VLLMExecutor):
             if not self._ray_actor_mode and not self.engine_ready.is_set():
                 await self._wait_for_engine_ready_async()
             if self.engine_error_message is not None:
-                raise RuntimeError(f"vllm engine init failed: {self.engine_error_message}")
+                raise _SafeProviderError(f"vllm engine init failed: {self.engine_error_message}")
             if self.llm is None:
-                raise RuntimeError("vllm engine not initialized")
+                raise _SafeProviderError("vllm engine not initialized")
             with self.counter_lock:
                 request_id = str(self.counter)
                 self.counter += 1
@@ -406,7 +415,7 @@ class LocalVLLMExecutor(VLLMExecutor):
                 final_output = output
 
             if final_output is None or not final_output.outputs:
-                raise RuntimeError("vllm returned no outputs")
+                raise _SafeProviderError("vllm returned no outputs")
 
             output_text: str = final_output.outputs[0].text
             if executor_id:
@@ -416,7 +425,7 @@ class LocalVLLMExecutor(VLLMExecutor):
             self._notify_state_change()
         except Exception as exc:
             if self.on_error == "raise":
-                error_message = f"{type(exc).__name__}: {exc}"
+                error_message = str(_safe_provider_execution_error("vllm", self.model, "generation", exc))
                 if executor_id:
                     with self.task_count_lock:
                         self._per_executor_errors.setdefault(executor_id, error_message)
@@ -2283,35 +2292,32 @@ def _unit_interval_option(name: str, value: Any) -> float:
     return result
 
 
+class _NormalizedVLLMOptions(dict[str, Any]):
+    """Internal marker preventing a second native-wire decode."""
+
+
 def normalize_options(options: Any | None) -> dict[str, Any]:
-    merged = dict(_DEFAULTS)
-    if isinstance(options, str):
-        try:
-            parsed = json.loads(options)
-        except json.JSONDecodeError as exc:
-            raise ValueError("vllm options JSON could not be parsed") from exc
-        if not isinstance(parsed, dict):
-            raise ValueError("vllm options JSON must decode to a dict")
-        options = parsed
-    elif options is not None and not isinstance(options, dict):
+    if isinstance(options, _NormalizedVLLMOptions):
+        return options
+
+    merged = _NormalizedVLLMOptions(_DEFAULTS)
+    if options is None or isinstance(options, str):
+        raise ValueError("vllm options must use the versioned envelope; bare JSON is not supported")
+    elif not isinstance(options, dict):
         try:
             options = dict(options)
         except Exception as exc:
-            raise TypeError("vllm options must be a dict or JSON string") from exc
+            raise TypeError("vllm options must use the versioned envelope") from exc
 
-    if options is not None:
-        options = _unpack_native_options_envelope(options)
+    options = _unpack_native_options_envelope(options)
 
-    if options is not None and options.get("ray_address") is not None:
+    if options.get("ray_address") is not None:
         raise ValueError("vLLM ray_address has been removed; configure RayRunner instead")
 
-    if options is not None:
-        unknown = sorted(
-            str(name) for name in options if not isinstance(name, str) or name not in _ALLOWED_VLLM_OPTIONS
-        )
-        if unknown:
-            raise ValueError(f"unknown vllm option(s): {', '.join(unknown)}")
-        merged.update(options)
+    unknown = sorted(str(name) for name in options if not isinstance(name, str) or name not in _ALLOWED_VLLM_OPTIONS)
+    if unknown:
+        raise ValueError(f"unknown vllm option(s): {', '.join(unknown)}")
+    merged.update(options)
     merged["concurrency"] = _integer_option("concurrency", merged["concurrency"], minimum=1)
     merged["gpus_per_actor"] = _fractional_gpu_option(merged["gpus_per_actor"])
     for name in (

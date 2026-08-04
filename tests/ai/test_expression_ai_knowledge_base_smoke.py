@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import pyarrow as pa
-import pytest
 
 import vane
 from tests.ai.test_expression_ai_functions import MockProvider
@@ -29,7 +28,7 @@ def test_python_expression_knowledge_base_shape() -> None:
         words = text.split()
         return [" ".join(words[start : start + 2]) for start in range(0, len(words), 2)]
 
-    @vane.cls(actor_number=1, return_dtype="VARCHAR", name="kb_embed", gpus=0.25)
+    @vane.cls(actor_number=1, return_dtype="VARCHAR", name="kb_embed")
     class MockEmbedder:
         def __init__(self, marker: float) -> None:
             self.marker = marker
@@ -62,11 +61,7 @@ def test_python_expression_knowledge_base_shape() -> None:
         vane.ai.prompt(vane.col("chunk"), provider=MockProvider()).alias("topic"),
     ).order("chunk")
 
-    with pytest.warns(
-        RuntimeWarning,
-        match="gpus is not reserved by the local subprocess actor backend",
-    ):
-        rows = out.fetchall()
+    rows = out.fetchall()
     plan = out.explain()
 
     assert [row[0] for row in rows] == [1, 1, 1]
@@ -82,7 +77,6 @@ def test_python_expression_knowledge_base_shape() -> None:
         "topic:search systems",
     ]
     assert "subprocess_actor" in plan
-    assert "gpus:" in plan
 
 
 def test_batch_preprocessing_feeds_ai_embed_and_prompt() -> None:

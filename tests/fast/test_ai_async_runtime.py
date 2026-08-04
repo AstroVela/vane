@@ -267,6 +267,34 @@ class ConcurrencyTrackingPromptDescriptor:
         return self.prompter
 
 
+class FailingConcurrentPrompter:
+    """Wait for a sibling request, then fail and observe its cancellation."""
+
+    def __init__(self) -> None:
+        self.slow_started = asyncio.Event()
+        self.cancelled = 0
+
+    async def prompt(self, messages: tuple) -> str:
+        if messages[0] == "slow":
+            self.slow_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+        await self.slow_started.wait()
+        raise RuntimeError("row failed")
+
+
+class FailingConcurrentPromptDescriptor:
+    def __init__(self) -> None:
+        self.prompter: FailingConcurrentPrompter | None = None
+
+    def instantiate(self) -> FailingConcurrentPrompter:
+        self.prompter = FailingConcurrentPrompter()
+        return self.prompter
+
+
 class FlakyOncePrompter:
     """Fails the first call with a zero-wait retryable error, then succeeds."""
 
@@ -298,7 +326,7 @@ class FlakyOncePromptDescriptor:
 
 def test_embed_client_created_and_used_on_the_bound_loop(runtime) -> None:
     descriptor = LoopRecordingEmbedDescriptor()
-    wrapper = _EmbedTextBatch(descriptor, "text", "emb")
+    wrapper = _EmbedTextBatch(descriptor, "text", "emb", 2)
     wrapper.bind_async_runtime(runtime.run)
 
     wrapper(pa.table({"text": ["a"]}))
@@ -312,7 +340,7 @@ def test_embed_client_created_and_used_on_the_bound_loop(runtime) -> None:
 
 def test_prompt_batches_share_the_bound_loop(runtime) -> None:
     descriptor = LoopRecordingPromptDescriptor()
-    wrapper = _PromptBatch(descriptor, "text", "response")
+    wrapper = _PromptBatch(descriptor, ["text"], "response")
     wrapper.bind_async_runtime(runtime.run)
 
     first = wrapper(pa.table({"text": ["a", "b"]}))
@@ -325,7 +353,7 @@ def test_prompt_batches_share_the_bound_loop(runtime) -> None:
 
 def test_prompt_retry_reruns_on_the_same_loop(runtime) -> None:
     descriptor = FlakyOncePromptDescriptor()
-    wrapper = _PromptBatch(descriptor, "text", "response", max_retries=2)
+    wrapper = _PromptBatch(descriptor, ["text"], "response", max_retries=2)
     wrapper.bind_async_runtime(runtime.run)
 
     result = wrapper(pa.table({"text": ["q"]}))
@@ -337,7 +365,7 @@ def test_prompt_retry_reruns_on_the_same_loop(runtime) -> None:
 
 def test_prompt_semaphore_and_ordering_on_bound_loop(runtime) -> None:
     descriptor = ConcurrencyTrackingPromptDescriptor()
-    wrapper = _PromptBatch(descriptor, "text", "response", max_api_concurrency=2)
+    wrapper = _PromptBatch(descriptor, ["text"], "response", max_concurrency_per_actor=2)
     wrapper.bind_async_runtime(runtime.run)
 
     texts = [f"m{i}" for i in range(8)]
@@ -347,9 +375,26 @@ def test_prompt_semaphore_and_ordering_on_bound_loop(runtime) -> None:
     assert descriptor.prompter.peak <= 2
 
 
+def test_prompt_failure_cancels_and_drains_sibling_requests(runtime) -> None:
+    descriptor = FailingConcurrentPromptDescriptor()
+    wrapper = _PromptBatch(
+        descriptor,
+        ["text"],
+        "response",
+        max_concurrency_per_actor=2,
+        max_retries=0,
+    )
+    wrapper.bind_async_runtime(runtime.run)
+
+    with pytest.raises(RuntimeError, match="Prompt execution; upstream error: RuntimeError"):
+        wrapper(pa.table({"text": ["slow", "fail"]}))
+
+    assert descriptor.prompter.cancelled == 1
+
+
 def test_embed_chunking_drives_chunks_on_the_bound_loop(runtime) -> None:
     descriptor = LoopRecordingEmbedDescriptor()
-    wrapper = _EmbedTextBatch(descriptor, "text", "emb", max_chunk_chars=50, chunk_overlap_chars=10)
+    wrapper = _EmbedTextBatch(descriptor, "text", "emb", 2, max_chunk_chars=50, chunk_overlap_chars=10)
     wrapper.bind_async_runtime(runtime.run)
 
     result = wrapper(pa.table({"text": ["short", "a" * 200]}))
@@ -364,20 +409,20 @@ def test_embed_chunking_drives_chunks_on_the_bound_loop(runtime) -> None:
 
 
 def test_unbound_embed_wrapper_raises() -> None:
-    wrapper = _EmbedTextBatch(LoopRecordingEmbedDescriptor(), "text", "emb")
+    wrapper = _EmbedTextBatch(LoopRecordingEmbedDescriptor(), "text", "emb", 2)
     with pytest.raises(RuntimeError, match="bind_async_runtime"):
         wrapper(pa.table({"text": ["a"]}))
 
 
 def test_unbound_prompt_wrapper_raises() -> None:
-    wrapper = _PromptBatch(LoopRecordingPromptDescriptor(), "text", "response")
+    wrapper = _PromptBatch(LoopRecordingPromptDescriptor(), ["text"], "response")
     with pytest.raises(RuntimeError, match="bind_async_runtime"):
         wrapper(pa.table({"text": ["a"]}))
 
 
 def test_unbound_wrapper_raises_even_with_on_error_ignore() -> None:
     """A missing runtime is a programming error, not a provider failure."""
-    wrapper = _EmbedTextBatch(LoopRecordingEmbedDescriptor(), "text", "emb", max_retries=3, on_error="ignore")
+    wrapper = _EmbedTextBatch(LoopRecordingEmbedDescriptor(), "text", "emb", 2, max_retries=3, on_error="ignore")
     with pytest.raises(RuntimeError, match="bind_async_runtime"):
         wrapper(pa.table({"text": ["a"]}))
 
@@ -405,7 +450,7 @@ def test_retry_call_requires_runtime_for_awaitables_and_never_retries_it() -> No
 
 def test_close_releases_client_on_the_bound_loop(runtime) -> None:
     descriptor = LoopRecordingEmbedDescriptor()
-    wrapper = _EmbedTextBatch(descriptor, "text", "emb")
+    wrapper = _EmbedTextBatch(descriptor, "text", "emb", 2)
     wrapper.bind_async_runtime(runtime.run)
     wrapper(pa.table({"text": ["a"]}))
 
@@ -419,7 +464,7 @@ def test_close_releases_client_on_the_bound_loop(runtime) -> None:
 
 def test_close_before_first_batch_is_a_noop(runtime) -> None:
     descriptor = LoopRecordingEmbedDescriptor()
-    wrapper = _EmbedTextBatch(descriptor, "text", "emb")
+    wrapper = _EmbedTextBatch(descriptor, "text", "emb", 2)
     wrapper.bind_async_runtime(runtime.run)
 
     wrapper.close()
@@ -433,7 +478,7 @@ def test_close_retains_sync_provider(runtime) -> None:
     per invocation while the callable cache keeps the wrapper, so dropping it
     would reload the model per task."""
     descriptor = CountingSyncEmbedDescriptor()
-    wrapper = _EmbedTextBatch(descriptor, "text", "emb")
+    wrapper = _EmbedTextBatch(descriptor, "text", "emb", 2)
     wrapper.bind_async_runtime(runtime.run)
     wrapper(pa.table({"text": ["a"]}))
 
@@ -453,7 +498,7 @@ def test_close_drops_async_embedder_without_aclose(runtime) -> None:
     is loop-bound, so it is dropped at close and re-instantiated on the next
     (fresh-loop) batch rather than reused across loops."""
     descriptor = CountingAsyncEmbedDescriptor()
-    wrapper = _EmbedTextBatch(descriptor, "text", "emb")
+    wrapper = _EmbedTextBatch(descriptor, "text", "emb", 2)
     wrapper.bind_async_runtime(runtime.run)
     wrapper(pa.table({"text": ["a"]}))
 
@@ -472,7 +517,7 @@ def test_close_drops_async_prompter_without_aclose(runtime) -> None:
     """``Prompter.prompt`` is async by protocol: a prompter without ``aclose``
     is still loop-bound and dropped at close, then re-instantiated."""
     descriptor = CountingAsyncPromptDescriptor()
-    wrapper = _PromptBatch(descriptor, "text", "response")
+    wrapper = _PromptBatch(descriptor, ["text"], "response")
     wrapper.bind_async_runtime(runtime.run)
     wrapper(pa.table({"text": ["a"]}))
 
@@ -492,7 +537,7 @@ def test_close_drops_embedder_after_observed_awaitable(runtime) -> None:
     function, so static inspection cannot classify it; observing the awaitable
     at runtime still marks it loop-bound, so it is dropped at close."""
     descriptor = CountingAwaitableEmbedDescriptor()
-    wrapper = _EmbedTextBatch(descriptor, "text", "emb")
+    wrapper = _EmbedTextBatch(descriptor, "text", "emb", 2)
     wrapper.bind_async_runtime(runtime.run)
     wrapper(pa.table({"text": ["a"]}))  # observes the awaitable → marks loop-bound
 
@@ -512,7 +557,7 @@ def test_close_drops_prompter_after_observed_awaitable(runtime) -> None:
     awaitables: a plain ``def prompt`` returning an awaitable is marked
     loop-bound and dropped at close."""
     descriptor = CountingAwaitablePromptDescriptor()
-    wrapper = _PromptBatch(descriptor, "text", "response")
+    wrapper = _PromptBatch(descriptor, ["text"], "response")
     wrapper.bind_async_runtime(runtime.run)
     result = wrapper(pa.table({"text": ["a"]}))  # observes the awaitable
     assert result.column("response").to_pylist() == ["echo:a"]
@@ -534,7 +579,7 @@ def test_close_drops_prompter_after_observed_awaitable(runtime) -> None:
 
 
 def test_pickle_clears_client_and_capability(runtime) -> None:
-    wrapper = _EmbedTextBatch(PicklableEmbedDescriptor(), "text", "emb")
+    wrapper = _EmbedTextBatch(PicklableEmbedDescriptor(), "text", "emb", 2)
     wrapper.bind_async_runtime(runtime.run)
     wrapper(pa.table({"text": ["warm"]}))
 
@@ -556,7 +601,7 @@ def test_pickle_clears_client_and_capability(runtime) -> None:
 
 def test_prompt_pickle_clears_client_and_capability(runtime) -> None:
     descriptor = LoopRecordingPromptDescriptor()
-    wrapper = _PromptBatch(descriptor, "text", "response", max_api_concurrency=4)
+    wrapper = _PromptBatch(descriptor, ["text"], "response", max_concurrency_per_actor=4)
     wrapper.bind_async_runtime(runtime.run)
     wrapper(pa.table({"text": ["warm"]}))
 
@@ -564,7 +609,7 @@ def test_prompt_pickle_clears_client_and_capability(runtime) -> None:
 
     assert state["_run_async"] is None
     assert state["_prompter"] is None
-    assert state["_max_api_concurrency"] == 4
+    assert state["_max_concurrency_per_actor"] == 4
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +619,7 @@ def test_prompt_pickle_clears_client_and_capability(runtime) -> None:
 
 def test_actor_adapter_forwards_bind_and_close(runtime) -> None:
     descriptor = LoopRecordingEmbedDescriptor()
-    wrapper = _EmbedTextBatch(descriptor, "text", "emb")
+    wrapper = _EmbedTextBatch(descriptor, "text", "emb", 2)
     actor_cls = functions._adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor")
 
     actor = actor_cls()
@@ -590,7 +635,7 @@ def test_actor_adapter_forwards_bind_and_close(runtime) -> None:
 
 def test_task_adapter_carries_capability_hooks(runtime) -> None:
     descriptor = LoopRecordingEmbedDescriptor()
-    wrapper = _EmbedTextBatch(descriptor, "text", "emb")
+    wrapper = _EmbedTextBatch(descriptor, "text", "emb", 2)
     fn = functions._adapt_batch_wrapper_for_backend(wrapper, "subprocess_task")
 
     fn.bind_async_runtime(runtime.run)

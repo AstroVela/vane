@@ -387,6 +387,7 @@ def _check_wheel_record(artifact: WheelArtifact) -> None:
 def _check_wheel(artifact: WheelArtifact) -> None:
     names = artifact.names()
     required_suffixes = (
+        "/vane/py.typed",
         ".dist-info/licenses/LICENSE",
         ".dist-info/licenses/NOTICE",
         ".dist-info/licenses/LICENSES/DuckDB-MIT.txt",

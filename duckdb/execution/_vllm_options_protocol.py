@@ -13,7 +13,7 @@ The native vLLM path crosses two otherwise separate layers:
 Keeping the field names here gives both layers one protocol definition without
 making the execution layer import Vane's provider/planning classes.
 
-Secret-bearing options use a DuckDB STRUCT with this logical shape::
+Native options use a DuckDB STRUCT with this logical shape::
 
     {
         "__vane_vllm_payload_version": 1,
@@ -24,13 +24,13 @@ Secret-bearing options use a DuckDB STRUCT with this logical shape::
 The public JSON preserves the option tree but substitutes each sealed value
 with an integer reference into the secret payload. The secret payload is a BLOB
 so DuckDB does not render its contents as structured plan metadata. It contains
-strict JSON data, never pickle or executable Python objects.
+strict JSON data, never pickle or executable Python objects. When there are no
+sealed values, the same envelope carries an empty ``values`` list.
 
-Options without sealed values keep the legacy plain-JSON argument, so this
-envelope does not change existing non-secret plans. During distributed planning,
-C++ may add ``use_ray``, ``ray_worker_only``, and ``ray_actor_pool_name`` beside
-the three envelope fields. Those are separately whitelisted execution-routing
-fields rather than part of the secret-reference protocol.
+During distributed planning, C++ may add ``use_ray``, ``ray_worker_only``, and
+``ray_actor_pool_name`` beside the three envelope fields. Those are separately
+whitelisted execution-routing fields rather than part of the secret-reference
+protocol.
 
 ``opaque`` does not mean encrypted: callers with access to raw serialized plan
 bytes can still recover the payload. This protocol prevents accidental exposure
@@ -160,7 +160,7 @@ def _unpack_native_options_envelope(options: dict[str, Any]) -> dict[str, Any]:
     boundary.
     """
     if not _NATIVE_OPTIONS_ENVELOPE_KEYS.intersection(options):
-        return dict(options)
+        raise ValueError("vllm native options must use the versioned envelope")
 
     missing = _NATIVE_OPTIONS_ENVELOPE_KEYS.difference(options)
     if missing:

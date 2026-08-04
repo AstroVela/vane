@@ -4,11 +4,46 @@
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from vane.ai.providers.transformers import (
+    TransformersProvider,
     TransformersTextClassifier,
     TransformersTextEmbedder,
     TransformersTextEmbedderDescriptor,
 )
+
+_PINNED_REVISION = "0123456789abcdef0123456789abcdef01234567"
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(
+            lambda: TransformersProvider().get_text_embedder(options={"trust_remote_code": True}),
+            id="provider",
+        ),
+        pytest.param(
+            lambda: TransformersTextEmbedderDescriptor(
+                model="reviewed-model",
+                options={"trust_remote_code": True},
+            ),
+            id="descriptor",
+        ),
+    ],
+)
+def test_remote_code_requires_a_pinned_revision_at_descriptor_boundary(factory):
+    with pytest.raises(ValueError, match="requires a pinned revision"):
+        factory()
+
+
+@pytest.mark.parametrize("revision", ["main", "latest", "deadbee", "g" * 40])
+def test_remote_code_rejects_mutable_or_invalid_revisions(revision):
+    with pytest.raises(ValueError, match="full 40-character commit SHA"):
+        TransformersTextEmbedderDescriptor(
+            model="reviewed-model",
+            options={"revision": revision, "trust_remote_code": True},
+        )
 
 
 def test_sentence_transformer_remote_code_is_disabled_by_default(monkeypatch):
@@ -29,7 +64,7 @@ def test_sentence_transformer_remote_code_is_disabled_by_default(monkeypatch):
 
     TransformersTextEmbedder("trusted-model")
 
-    assert calls == [("trusted-model", {"trust_remote_code": False, "backend": "torch"})]
+    assert calls == [("trusted-model", {"trust_remote_code": False, "backend": "torch", "device": "cpu"})]
 
 
 def test_remote_code_requires_an_explicit_option(monkeypatch):
@@ -58,22 +93,23 @@ def test_remote_code_requires_an_explicit_option(monkeypatch):
 
     descriptor = TransformersTextEmbedderDescriptor(
         model="reviewed-model",
-        embed_options={"batch_size": 8, "revision": "pinned-revision", "trust_remote_code": True},
+        dimensions=384,
+        options={"revision": _PINNED_REVISION, "trust_remote_code": True},
     )
 
     assert descriptor.get_dimensions().size == 384
     descriptor.instantiate()
 
-    assert auto_config_calls == [
-        (
-            "reviewed-model",
-            {"trust_remote_code": True, "revision": "pinned-revision"},
-        )
-    ]
+    assert auto_config_calls == []
     assert sentence_transformer_calls == [
         (
             "reviewed-model",
-            {"trust_remote_code": True, "backend": "torch", "revision": "pinned-revision"},
+            {
+                "trust_remote_code": True,
+                "backend": "torch",
+                "revision": _PINNED_REVISION,
+                "device": "cpu",
+            },
         )
     ]
 

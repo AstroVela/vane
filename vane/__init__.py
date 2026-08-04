@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: F405  # DuckDB symbols are intentionally re-exported below.
 
 """Vane — Distributed DuckDB powered by Ray.
 
@@ -47,7 +48,7 @@ __version__ = __vane_version__
 # Vane-specific public API
 # ---------------------------------------------------------------------------
 
-# Patch DuckDBPyRelation with AI convenience methods (.embed_text(), etc.)
+# Patch DuckDBPyRelation with AI convenience methods (.embed(), etc.)
 import vane.ai._relation_patch  # noqa: E402,F401
 from vane._env import EnvRegistry, env  # noqa: E402
 from vane._expression_udf import attach_function, cls, detach_function, func  # noqa: E402

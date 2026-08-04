@@ -29,13 +29,3 @@ def test_missing_psutil_error_names_video_extra(monkeypatch):
     monkeypatch.setitem(sys.modules, "psutil", None)
     with pytest.raises(ImportError, match=r"vane-ai\[video\]"):
         video_reader._wait_for_memory()
-
-
-def test_provider_ndarray_without_pillow_names_image_extra(monkeypatch):
-    pytest.importorskip("openai")
-    from vane.ai.providers.openai import OpenAIPrompter
-
-    monkeypatch.setitem(sys.modules, "PIL", None)
-    frame = np.zeros((2, 2, 3), dtype=np.uint8)
-    with pytest.raises(ImportError, match=r"vane-ai\[image\]"):
-        OpenAIPrompter._process_ndarray(None, frame)
