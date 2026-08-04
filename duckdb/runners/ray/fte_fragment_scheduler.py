@@ -2399,6 +2399,19 @@ def _worker_actor_death_confirms_quiescence(error: BaseException) -> bool:
     return isinstance(actor_died_error_type, type) and _failure_exception_matches(error, (actor_died_error_type,))
 
 
+def _terminate_retired_fte_workers(handles: Iterable[RayWorkerActorHandle]) -> None:
+    failures: list[tuple[str, Exception]] = []
+    for handle in handles:
+        try:
+            ray.kill(handle.actor_handle)
+        except Exception as exc:
+            failures.append((str(handle.worker_id), exc))
+    if not failures:
+        return
+    details = "; ".join(f"{worker_id}: {_safe_failure_message(exc)}" for worker_id, exc in failures)
+    raise RuntimeError(f"failed to terminate {len(failures)} retired FTE worker(s): {details}") from failures[0][1]
+
+
 def _mark_fte_worker_failed(
     worker_id: str,
     failure: Mapping[str, Any],
@@ -2520,11 +2533,13 @@ def _mark_fte_worker_failed(
                             if _retire_captured_handle_locked(captured_worker_id, handle_to_retire):
                                 handles_to_kill.append(handle_to_retire)
                 finally:
-                    for handle in handles_to_kill:
-                        try:
-                            ray.kill(handle.actor_handle)
-                        except Exception:
-                            pass
+                    try:
+                        _terminate_retired_fte_workers(handles_to_kill)
+                    except Exception as termination_error:
+                        raise RuntimeError(
+                            f"failed to quiesce FTE worker {failed_worker_id} before retry: "
+                            f"{_safe_failure_message(exc)}; {_safe_failure_message(termination_error)}"
+                        ) from termination_error
             raise RuntimeError(
                 f"failed to quiesce FTE worker {failed_worker_id} before retry: {_safe_failure_message(exc)}"
             ) from exc
@@ -2575,11 +2590,7 @@ def _mark_fte_worker_failed(
         # Native retirement transfers actor termination ownership to this
         # failure path. Complete that handoff even if later retry bookkeeping
         # raises, otherwise neither the registry nor the manager can reap it.
-        for handle in handles_to_kill:
-            try:
-                ray.kill(handle.actor_handle)
-            except Exception:
-                pass
+        _terminate_retired_fte_workers(handles_to_kill)
 
     if not reconcile_query:
         return []

@@ -57,6 +57,7 @@ def _fte_worker_command_debug_fields(command: Any) -> dict[str, str]:
     worker = command.worker
     return {
         "worker_id": str(command.worker_id),
+        "worker_incarnation_id": str(command.worker_incarnation_id),
         "manager_instance_id": str(getattr(worker, "manager_instance_id", "") or ""),
         "node_id": str(getattr(worker, "node_id", "") or ""),
         "host": str(getattr(worker, "host", "") or ""),
@@ -84,8 +85,8 @@ class FteWorkerCommandDispatchResult:
     query_closed: bool = False
 
     @property
-    def failed_worker_ids(self) -> frozenset[str]:
-        return frozenset(failure.worker_id for failure in self.failures)
+    def failed_worker_incarnations(self) -> frozenset[tuple[str, str]]:
+        return frozenset((failure.worker_id, failure.worker_incarnation_id) for failure in self.failures)
 
 
 class FteWorkerCommandMixin:
@@ -105,7 +106,7 @@ class FteWorkerCommandMixin:
         commands = tuple(worker_commands)
         terminal_attempts: set[str] = set()
         successful_create_attempts: dict[str, Any] = {}
-        failed_worker_keys: set[tuple[str, Any]] = set()
+        failed_worker_incarnations: set[tuple[str, str]] = set()
         failures: list[FteWorkerControlFailure] = []
         query_closed = False
         abort_error: BaseException | None = None
@@ -118,9 +119,12 @@ class FteWorkerCommandMixin:
             worker_id = str(command.worker_id)
             if not worker_id:
                 raise ValueError("FTE worker command requires a non-empty worker_id")
-            worker_key: tuple[str, Any] = ("worker_id", worker_id)
+            worker_incarnation_id = str(command.worker_incarnation_id)
+            if not worker_incarnation_id:
+                raise ValueError("FTE worker command requires a non-empty worker_incarnation_id")
+            worker_incarnation = (worker_id, worker_incarnation_id)
             worker_debug_fields = _fte_worker_command_debug_fields(command)
-            if worker_key in failed_worker_keys:
+            if worker_incarnation in failed_worker_incarnations:
                 _fte_command_debug_log(
                     "execute_command_skipped_failed_worker",
                     command_index=command_index,
@@ -206,7 +210,7 @@ class FteWorkerCommandMixin:
                         **worker_debug_fields,
                     )
                     failure = fragment_execution.worker_control_failure_for_command(command, exc)
-                    failed_worker_keys.add(worker_key)
+                    failed_worker_incarnations.add(worker_incarnation)
                     failures.append(failure)
                     if failure.worker_id:
                         # Fence immediately, before another command or thread can
@@ -260,13 +264,16 @@ class FteWorkerCommandMixin:
         if abort_error is not None:
             raise abort_error
 
-        failed_worker_ids = frozenset(failure.worker_id for failure in failures)
         successful_scheduled_attempts: tuple[Any, ...] = ()
         if not query_closed:
             successful_scheduled_attempts = tuple(
                 scheduled_attempt
                 for scheduled_attempt in successful_create_attempts.values()
-                if scheduled_attempt.worker_id not in failed_worker_ids
+                if (
+                    scheduled_attempt.worker_id,
+                    scheduled_attempt.worker_incarnation_id,
+                )
+                not in failed_worker_incarnations
             )
 
         return FteWorkerCommandDispatchResult(

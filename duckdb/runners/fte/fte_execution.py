@@ -239,6 +239,7 @@ class FteTaskPartition:
             request=request,
             sink_instance=sink_instance,
             worker_id=worker_id,
+            worker_incarnation_id=worker_incarnation_id,
         )
 
     def mark_waiting_for_node(self) -> None:
@@ -830,6 +831,7 @@ class FteFragmentExecution:
                             query_id=self.query_id,
                             fragment_id=self.fragment_id,
                             worker_id=running.worker_id,
+                            worker_incarnation_id=running.worker_incarnation_id,
                             worker=worker,
                             attempt_id=running.attempt_id,
                             update=update_request.to_dict(),
@@ -1233,6 +1235,7 @@ class FteFragmentExecution:
                     query_id=self.query_id,
                     fragment_id=self.fragment_id,
                     worker_id=running_before_update.worker_id,
+                    worker_incarnation_id=running_before_update.worker_incarnation_id,
                     worker=worker,
                     attempt_id=running_before_update.attempt_id,
                     source_node_id=update.source_node_id,
@@ -1244,6 +1247,7 @@ class FteFragmentExecution:
                     query_id=self.query_id,
                     fragment_id=self.fragment_id,
                     worker_id=running_before_update.worker_id,
+                    worker_incarnation_id=running_before_update.worker_incarnation_id,
                     worker=worker,
                     attempt_id=running_before_update.attempt_id,
                     source_node_id=update.source_node_id,
@@ -1583,6 +1587,7 @@ class FteFragmentExecution:
             query_id=self.query_id,
             fragment_id=self.fragment_id,
             worker_id=worker_id,
+            worker_incarnation_id=worker.worker_incarnation_id,
             worker=worker,
             attempt_id=scheduled.attempt_id,
             partition_id=partition.task_id.partition_id,
@@ -1619,11 +1624,11 @@ class FteFragmentExecution:
         else:
             raise TypeError(f"unsupported FTE worker command: {type(command).__name__}")
         return FteWorkerControlFailure(
-            worker_id=str(command.worker.worker_id),
+            worker_id=command.worker_id,
             attempt_id=command.attempt_id,
             method_name=method_name,
             cause=exc,
-            worker_incarnation_id=command.worker.worker_incarnation_id,
+            worker_incarnation_id=command.worker_incarnation_id,
         )
 
     def _select_worker(self, partition: FteTaskPartition) -> tuple[str, Any]:

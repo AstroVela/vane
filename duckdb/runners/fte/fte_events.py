@@ -139,7 +139,14 @@ class FteWorkerCommand:
     query_id: str
     fragment_id: str
     worker_id: str
+    worker_incarnation_id: str
     worker: Any
+
+    def __post_init__(self) -> None:
+        if not self.worker_id:
+            raise ValueError("FTE worker command requires a non-empty worker_id")
+        if not self.worker_incarnation_id:
+            raise ValueError("FTE worker command requires a non-empty worker_incarnation_id")
 
     @property
     def command_type(self) -> str:
@@ -154,6 +161,7 @@ class FteCreateTaskCommand(FteWorkerCommand):
     scheduled_attempt: ScheduledAttempt = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if self.scheduled_attempt.attempt_id != self.attempt_id:
             raise ValueError(
                 "FTE create command scheduled attempt mismatch: "
@@ -165,6 +173,12 @@ class FteCreateTaskCommand(FteWorkerCommand):
             raise ValueError(
                 "FTE create command scheduled worker mismatch: "
                 f"command={self.worker_id} scheduled={self.scheduled_attempt.worker_id}"
+            )
+        if self.scheduled_attempt.worker_incarnation_id != self.worker_incarnation_id:
+            raise ValueError(
+                "FTE create command scheduled worker incarnation mismatch: "
+                f"command={self.worker_incarnation_id} "
+                f"scheduled={self.scheduled_attempt.worker_incarnation_id}"
             )
 
 

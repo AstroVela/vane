@@ -16,6 +16,7 @@ from duckdb.runners.ray.fragment_registry import (
     _FTE_CLOSING_QUERIES,
     _FTE_FRAGMENT_EXECUTIONS,
     _FTE_FRAGMENT_STATES,
+    _FTE_PARTITION_OWNERS,
     _FTE_PENDING_WORKER_RESERVATIONS,
     _FTE_REGISTRY_LOCK,
     _FTE_SCHEDULERS,
@@ -73,9 +74,19 @@ class FteWorkerEventHandlingMixin:
                 worker_incarnation_id=failure.worker_incarnation_id,
             )
         except Exception as exc:
-            scheduler = _FTE_SCHEDULERS.get(failure.attempt_id.task_id.query_id)
-            if scheduler is not None and scheduler.is_owned_by_manager_instance(self.manager_instance_id):
-                scheduler.fail(f"FTE worker failure handling failed: {exc}")
+            affected_query_ids = {failure.attempt_id.task_id.query_id}
+            with _FTE_REGISTRY_LOCK:
+                affected_query_ids.update(
+                    query_id
+                    for (query_id, _fragment_id, _partition_id), owner in _FTE_PARTITION_OWNERS.items()
+                    if str(owner.worker_id) == failure.worker_id
+                    and str(owner.worker_incarnation_id) == failure.worker_incarnation_id
+                    and str(owner.manager_instance_id) == self.manager_instance_id
+                )
+            for query_id in sorted(affected_query_ids):
+                scheduler = _FTE_SCHEDULERS.get(query_id)
+                if scheduler is not None and scheduler.is_owned_by_manager_instance(self.manager_instance_id):
+                    scheduler.fail(f"FTE worker failure handling failed: {exc}")
             return request_fte_pending_task_drain()
         schedulers = []
         for query_id in sorted(query_ids):

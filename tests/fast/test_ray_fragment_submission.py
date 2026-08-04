@@ -1073,6 +1073,7 @@ def test_fte_split_backpressure_remote_error_is_canceled_by_query_close():
         query_id=query_id,
         fragment_id=stage.fragment_id,
         worker_id="worker-split-wait-close",
+        worker_incarnation_id=handle.worker_incarnation_id,
         worker=_BackpressuredWorker(),
         attempt_id=attempt_id,
         source_node_id="7",
@@ -1130,6 +1131,7 @@ def test_fte_worker_command_dispatch_preserves_healthy_tail_and_new_outbox_comma
             query_id=query_id,
             fragment_id=stage.fragment_id,
             worker_id=worker.worker_id,
+            worker_incarnation_id=worker.worker_incarnation_id,
             worker=worker,
             attempt_id=FteTaskAttemptId(FteTaskId(query_id, 0, partition_id), 0),
             source_node_id="7",
@@ -1181,7 +1183,10 @@ def test_fte_worker_command_dispatch_preserves_healthy_tail_and_new_outbox_comma
             (failed_b.worker_id, 3),
             (healthy.worker_id, 4),
         ]
-        assert dispatch.failed_worker_ids == {failed_a.worker_id, failed_b.worker_id}
+        assert dispatch.failed_worker_incarnations == {
+            (failed_a.worker_id, failed_a.worker_incarnation_id),
+            (failed_b.worker_id, failed_b.worker_incarnation_id),
+        }
         assert len(dispatch.failures) == 2
         assert dispatch.query_closed is False
         assert [command.attempt_id.partition_id for command in stage._worker_command_outbox] == [5]
@@ -1237,6 +1242,7 @@ def test_fte_worker_command_dispatch_publishes_only_successful_healthy_creates(m
                 query_id=query_id,
                 fragment_id=stage.fragment_id,
                 worker_id=worker.worker_id,
+                worker_incarnation_id=worker.worker_incarnation_id,
                 worker=worker,
                 attempt_id=scheduled.attempt_id,
                 partition_id=partition_id,
@@ -1248,6 +1254,7 @@ def test_fte_worker_command_dispatch_publishes_only_successful_healthy_creates(m
         query_id=query_id,
         fragment_id=stage.fragment_id,
         worker_id=failed_after_create.worker_id,
+        worker_incarnation_id=failed_after_create.worker_incarnation_id,
         worker=failed_after_create,
         attempt_id=scheduled_attempts[1].attempt_id,
         source_node_id="7",
@@ -1284,13 +1291,101 @@ def test_fte_worker_command_dispatch_publishes_only_successful_healthy_creates(m
             ("FteAddSplitsCommand", failed_after_create.worker_id),
             ("FteCreateTaskCommand", healthy.worker_id),
         ]
-        assert dispatch.failed_worker_ids == {create_failed.worker_id, failed_after_create.worker_id}
+        assert dispatch.failed_worker_incarnations == {
+            (create_failed.worker_id, create_failed.worker_incarnation_id),
+            (failed_after_create.worker_id, failed_after_create.worker_incarnation_id),
+        }
         assert dispatch.scheduled_attempts == (scheduled_attempts[2],)
         assert str(scheduled_attempts[1].attempt_id) not in {
             str(attempt.attempt_id) for attempt in dispatch.scheduled_attempts
         }
         assert healthy.fte_pressure_stats()["running_attempt_count"] == 1
         assert scheduler.stats().event_counts.get("WorkerFailed", 0) == 2
+    finally:
+        fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
+
+
+def test_fte_worker_command_dispatch_isolates_reused_worker_id_incarnations(monkeypatch):
+    query_id = "query-command-reused-worker-id"
+    worker_id = "worker-command-reused"
+    coordinator = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-command-reused-coordinator",
+    )
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id=worker_id,
+    )
+    with worker_handle_mod._FTE_REGISTRY_LOCK:
+        assert worker_handle_mod._FTE_WORKER_HANDLES.pop(worker_id) is failed
+    replacement = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id=worker_id,
+    )
+    stage = FteFragmentExecution(
+        query_id,
+        0,
+        fragment_id=f"{query_id}:node:7",
+        task_memory_bytes=1,
+    )
+    failed_command = FteAddSplitsCommand(
+        query_id=query_id,
+        fragment_id=stage.fragment_id,
+        worker_id=failed.worker_id,
+        worker_incarnation_id=failed.worker_incarnation_id,
+        worker=failed,
+        attempt_id=FteTaskAttemptId(FteTaskId(query_id, 0, 0), 0),
+        source_node_id="7",
+        splits=({"sequence_id": 0, "kind": "scan_task", "data": b"old"},),
+    )
+    partition = stage.add_partition(1)
+    scheduled = partition.start_attempt(
+        worker_id=replacement.worker_id,
+        worker_incarnation_id=replacement.worker_incarnation_id,
+        remote_handle=replacement,
+    )
+    replacement_command = FteCreateTaskCommand(
+        query_id=query_id,
+        fragment_id=stage.fragment_id,
+        worker_id=replacement.worker_id,
+        worker_incarnation_id=replacement.worker_incarnation_id,
+        worker=replacement,
+        attempt_id=scheduled.attempt_id,
+        partition_id=1,
+        request=scheduled.request,
+        scheduled_attempt=scheduled,
+    )
+
+    fte_fragment_scheduler_mod.open_fte_registry_for_query(query_id)
+    scheduler = worker_commands_mod._FTE_SCHEDULERS.get_or_create(query_id)
+    executed = []
+
+    def execute(command, **_kwargs):
+        executed.append((command.worker_id, command.worker_incarnation_id))
+        if command is failed_command:
+            raise RuntimeError("planned stale-incarnation control failure")
+
+    monkeypatch.setattr(scheduler.worker_command_executor, "execute", execute)
+    monkeypatch.setattr(worker_commands_mod, "fte_partition_task_lease_payload", lambda *_args: {})
+
+    try:
+        dispatch = coordinator._execute_fte_fragment_execution_worker_commands(
+            stage,
+            [failed_command, replacement_command],
+        )
+
+        assert executed == [
+            (worker_id, failed.worker_incarnation_id),
+            (worker_id, replacement.worker_incarnation_id),
+        ]
+        assert dispatch.failed_worker_incarnations == {
+            (worker_id, failed.worker_incarnation_id),
+        }
+        assert dispatch.scheduled_attempts == (scheduled,)
+        assert replacement._fte_healthy is True
     finally:
         fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
 
@@ -1414,6 +1509,7 @@ def test_fte_split_backpressure_preserves_query_deadline():
         query_id=query_id,
         fragment_id=stage.fragment_id,
         worker_id="worker-split-wait-deadline",
+        worker_incarnation_id=handle.worker_incarnation_id,
         worker=_DeadlineWorker(),
         attempt_id=attempt_id,
         source_node_id="7",
@@ -1482,6 +1578,7 @@ def test_fte_split_backpressure_terminal_status_uses_task_status_path(monkeypatc
         query_id=query_id,
         fragment_id=stage.fragment_id,
         worker_id=handle.worker_id,
+        worker_incarnation_id=handle.worker_incarnation_id,
         worker=worker,
         attempt_id=attempt_id,
         source_node_id="7",
@@ -1491,6 +1588,7 @@ def test_fte_split_backpressure_terminal_status_uses_task_status_path(monkeypatc
         query_id=query_id,
         fragment_id=stage.fragment_id,
         worker_id=handle.worker_id,
+        worker_incarnation_id=handle.worker_incarnation_id,
         worker=worker,
         attempt_id=attempt_id,
         source_node_id="7",
@@ -1656,6 +1754,7 @@ def test_fte_late_add_splits_terminal_status_uses_task_status_path(
         query_id=query_id,
         fragment_id=stage.fragment_id,
         worker_id=handle.worker_id,
+        worker_incarnation_id=handle.worker_incarnation_id,
         worker=handle,
         attempt_id=attempt_id,
         source_node_id="7",
@@ -1665,6 +1764,7 @@ def test_fte_late_add_splits_terminal_status_uses_task_status_path(
         query_id=query_id,
         fragment_id=stage.fragment_id,
         worker_id=handle.worker_id,
+        worker_incarnation_id=handle.worker_incarnation_id,
         worker=handle,
         attempt_id=attempt_id,
         source_node_id="7",
@@ -4563,6 +4663,7 @@ def test_fte_split_ack_before_create_ack_is_merged_into_running_pressure(monkeyp
         query_id=query_id,
         fragment_id=fragment_id,
         worker_id=handle.worker_id,
+        worker_incarnation_id=handle.worker_incarnation_id,
         worker=handle,
         attempt_id=scheduled.attempt_id,
         partition_id=0,
@@ -4573,6 +4674,7 @@ def test_fte_split_ack_before_create_ack_is_merged_into_running_pressure(monkeyp
         query_id=query_id,
         fragment_id=fragment_id,
         worker_id=handle.worker_id,
+        worker_incarnation_id=handle.worker_incarnation_id,
         worker=handle,
         attempt_id=scheduled.attempt_id,
         source_node_id="7",
@@ -4860,6 +4962,7 @@ def test_fte_add_splits_ack_after_task_finish_does_not_revive_pressure():
         query_id=query_id,
         fragment_id=fragment_id,
         worker_id=handle.worker_id,
+        worker_incarnation_id=handle.worker_incarnation_id,
         worker=handle,
         attempt_id=finished_attempt.attempt_id,
         source_node_id="7",
@@ -5790,10 +5893,15 @@ def test_fte_worker_command_debug_fields_exposes_worker_topology():
         host="10.0.0.1",
         manager_instance_id="manager-a",
     )
-    command = SimpleNamespace(worker=handle, worker_id=worker_id)
+    command = SimpleNamespace(
+        worker=handle,
+        worker_id=worker_id,
+        worker_incarnation_id=handle.worker_incarnation_id,
+    )
 
     assert worker_commands_mod._fte_worker_command_debug_fields(command) == {
         "worker_id": worker_id,
+        "worker_incarnation_id": handle.worker_incarnation_id,
         "manager_instance_id": "manager-a",
         "node_id": "node-a",
         "host": "10.0.0.1",
@@ -6112,6 +6220,73 @@ def test_worker_failure_kills_retired_actor_when_retry_bookkeeping_raises(monkey
 
     assert failed.worker_id not in worker_handle_mod._FTE_WORKER_HANDLES
     assert kill_calls == [actor]
+
+
+def test_worker_failure_propagates_retired_actor_termination_failure(monkeypatch):
+    actor = _FakeActor()
+    failed = RayWorkerActorHandle(
+        actor,
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:termination-failure",
+        manager_instance_id="manager-a",
+    )
+    failed._retire_from_manager_for_failure = lambda: True
+
+    def fail_termination(target):
+        assert target is actor
+        raise RuntimeError("planned ray.kill failure")
+
+    monkeypatch.setattr(worker_handle_mod.ray, "kill", fail_termination)
+
+    with pytest.raises(RuntimeError, match="failed to terminate 1 retired FTE worker") as exc_info:
+        fte_fragment_scheduler_mod._mark_fte_worker_failed(
+            failed.worker_id,
+            {"error_code": "WORKER_LOST", "message": "planned failure"},
+            manager_instance_id="manager-a",
+            worker_incarnation_id=failed.worker_incarnation_id,
+        )
+
+    assert "planned ray.kill failure" in str(exc_info.value)
+    assert failed.worker_id not in worker_handle_mod._FTE_WORKER_HANDLES
+
+
+def test_worker_control_termination_failure_fails_every_owned_query(monkeypatch):
+    actor = _FakeActor()
+    failed = RayWorkerActorHandle(
+        actor,
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:control-termination-failure",
+        manager_instance_id="manager-a",
+    )
+    failed._retire_from_manager_for_failure = lambda: True
+    query_ids = ("query-control-termination-a", "query-control-termination-b")
+    schedulers = []
+    for query_id in query_ids:
+        scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create(query_id)
+        failed._bind_fte_scheduler_handlers(scheduler)
+        schedulers.append(scheduler)
+    with worker_handle_mod._FTE_REGISTRY_LOCK:
+        for index, query_id in enumerate(query_ids):
+            worker_handle_mod._FTE_PARTITION_OWNERS[(query_id, f"{query_id}:node:7", index)] = failed
+    failure = fte_execution_mod.FteWorkerControlFailure(
+        worker_id=failed.worker_id,
+        attempt_id=FteTaskAttemptId.coerce(f"{query_ids[0]}.0.0.0"),
+        method_name="fte_create_task",
+        cause=RuntimeError("planned control failure"),
+        worker_incarnation_id=failed.worker_incarnation_id,
+    )
+
+    def fail_termination(target):
+        assert target is actor
+        raise RuntimeError("planned ray.kill failure")
+
+    monkeypatch.setattr(worker_handle_mod.ray, "kill", fail_termination)
+
+    assert failed._handles_for_fte_worker_control_failure(failure) == []
+    for scheduler in schedulers:
+        stats = scheduler.stats()
+        assert stats.state == "FAILED"
+        assert "failed to terminate 1 retired FTE worker" in str(stats.failure_reason)
 
 
 def test_fte_non_remote_node_requirement_requires_matching_host(monkeypatch):

@@ -36,6 +36,7 @@ class ScheduledAttempt:
     descriptor: TaskDescriptor
     request: dict[str, Any]
     worker_id: str
+    worker_incarnation_id: str
     sink_instance: Any = None
 
 
