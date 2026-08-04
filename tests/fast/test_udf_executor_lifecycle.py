@@ -334,7 +334,7 @@ def test_timeout_env_parsers_reject_non_finite_negative_and_invalid(monkeypatch,
         elif env_name == "VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S":
             udf_subprocess._subprocess_shutdown_grace_s()
         elif env_name == "VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S":
-            udf_stream_result_collector.AsyncResultCollector(ray_module=object())
+            udf_stream_result_collector.UDFStreamResultCollector(ray_module=object())
 
 
 @pytest.mark.parametrize(
@@ -368,7 +368,7 @@ def test_positive_timeout_env_parsers_reject_zero(monkeypatch, env_name):
         elif env_name == "VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S":
             udf_subprocess._subprocess_shutdown_grace_s()
         elif env_name == "VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S":
-            udf_stream_result_collector.AsyncResultCollector(ray_module=object())
+            udf_stream_result_collector.UDFStreamResultCollector(ray_module=object())
 
 
 @pytest.mark.parametrize(

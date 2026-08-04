@@ -212,7 +212,7 @@ class _CleanupTicket:
             return () if self._error is None else (self._error,)
 
 
-class AsyncResultCollector:
+class UDFStreamResultCollector:
     """Capacity-aware scheduler for lease-owned Ray generator streams.
 
     ``_cv`` owns every published stream transition. Registration first starts
@@ -731,6 +731,11 @@ class AsyncResultCollector:
     def set_wakeup_callback(self, fn: Any) -> None:
         with self._cv:
             self._wakeup_fn = fn
+
+    def fatal_error(self) -> BaseException | None:
+        """Return the process-owner-visible scheduler failure, if any."""
+        with self._cv:
+            return self._thread_error
 
     def shutdown(self) -> None:
         """Stop the process-owned loop after the native submitter is quiescent."""
@@ -2310,4 +2315,4 @@ class AsyncResultCollector:
                     self._cv.notify_all()
 
 
-__all__ = ["AsyncResultCollector"]
+__all__ = ["UDFStreamResultCollector"]

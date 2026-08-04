@@ -20,7 +20,7 @@ from duckdb.execution.ray_stream_adapter import (
     TaskLeaseObjectRefGenerator,
 )
 from duckdb.execution.udf_stream_result_collector import (
-    AsyncResultCollector,
+    UDFStreamResultCollector,
     _OutputLeaseToken,
     _ReadyEvent,
     _StreamRecord,
@@ -385,7 +385,7 @@ def _capture_thread_error(errors, operation, *args):
 
 def test_collector_requires_task_lease_stream_and_has_no_raw_generator_fallback():
     fake_ray = _FakeRay()
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     try:
         with pytest.raises(TypeError, match="must return TaskLeaseObjectRefGenerator"):
             collector.track_generator_ref(1, 1, _Generator([]))
@@ -404,7 +404,7 @@ def test_event_loop_start_failure_prevents_submitted_stream_ownership(monkeypatc
 
     monkeypatch.setattr(threading.Thread, "start", fail_start)
     with pytest.raises(RuntimeError, match="planned thread start failure"):
-        AsyncResultCollector(ray_module=fake_ray)
+        UDFStreamResultCollector(ray_module=fake_ray)
 
     assert fake_ray.cancel_calls == []
 
@@ -414,7 +414,7 @@ def test_event_loop_start_timeout_rolls_back_started_thread(monkeypatch):
     monkeypatch.setenv("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S", "0.02")
     existing_threads = set(threading.enumerate())
 
-    class SlowStartCollector(AsyncResultCollector):
+    class SlowStartCollector(UDFStreamResultCollector):
         def _run_event_loop(self):
             # Stay blocked beyond both the startup deadline and the old
             # second bounded join. Construction must still reclaim this
@@ -432,7 +432,7 @@ def test_event_loop_start_timeout_rolls_back_started_thread(monkeypatch):
 def test_scheduler_failure_isolated_to_stream_does_not_poison_future_slots():
     fake_ray = _FailingWaitRay()
     driver = _Driver()
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         1,
         1,
@@ -488,7 +488,7 @@ def test_initial_waiter_registration_failure_unpublishes_and_cleans_stream():
     driver = _Driver()
     generator = _Generator([], completed=False)
     generator.completion_ref = _FailingFutureRef(None, ready=False)
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     try:
         with pytest.raises(RuntimeError, match="planned Future registration failure"):
             collector.track_generator_ref(
@@ -527,7 +527,7 @@ def test_invalid_submitted_stream_cleanup_does_not_block_healthy_stream():
         request_id="invalid-stream-delayed-handoff",
         submitter=lambda _lease: invalid_stream,
     )
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     errors = []
     track = threading.Thread(
         target=_capture_thread_error,
@@ -606,7 +606,7 @@ def test_midstream_waiter_registration_failure_is_isolated_to_its_stream():
             [_Ref("healthy-block", is_block=True), _Ref(_metadata(lease))],
         )
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         1,
         1,
@@ -657,7 +657,7 @@ def test_midstream_waiter_registration_failure_is_isolated_to_its_stream():
 def test_registration_is_not_visible_until_track_commits_it(monkeypatch):
     fake_ray = _FakeRay()
     driver = _Driver()
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector._ensure_started()
     collector.drain_results({1: {"rows": 1, "bytes": 128, "item_bytes": 128}})
     registration_paused = threading.Event()
@@ -726,7 +726,7 @@ def test_discarded_submitted_stream_enters_terminal_cleanup_ledger():
     fake_ray = _FakeRay()
     driver = _Driver()
     generator = _Generator([], completed=False)
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     try:
         collector.discard_generator_ref(
             9,
@@ -763,7 +763,7 @@ def test_slot_cancel_is_nonblocking_and_cleanup_completion_wakes_dispatcher():
         cleanup_response,
     )
     generator = _Generator([], completed=False)
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     cleanup_wakeup = threading.Event()
     collector.set_wakeup_callback(cleanup_wakeup.set)
     collector.discard_generator_ref(
@@ -812,7 +812,7 @@ def test_slot_cancel_hands_off_cleanup_before_blocking_record_future_cancel():
         ],
         completed=False,
     )
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         19,
         1,
@@ -862,7 +862,7 @@ def test_slot_cancel_hands_off_cleanup_before_blocking_record_future_cancel():
 def test_failure_wakeup_can_reenter_shutdown_after_cleanup_handoff():
     fake_ray = _FakeRay()
     driver = _Driver()
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         1,
         1,
@@ -892,7 +892,7 @@ def test_failure_wakeup_can_reenter_shutdown_after_cleanup_handoff():
 
 
 def test_cleanup_tickets_retry_transient_failure_without_starving_peer():
-    collector = AsyncResultCollector(ray_module=_FakeRay())
+    collector = UDFStreamResultCollector(ray_module=_FakeRay())
     attempts = 0
     order = []
 
@@ -934,7 +934,7 @@ def test_cleanup_tickets_retry_transient_failure_without_starving_peer():
 def test_cleanup_tickets_progress_when_loop_notification_fails(
     monkeypatch,
 ):
-    collector = AsyncResultCollector(ray_module=_FakeRay())
+    collector = UDFStreamResultCollector(ray_module=_FakeRay())
     operation_calls = []
     original_call_soon_threadsafe = collector._loop.call_soon_threadsafe
 
@@ -980,7 +980,7 @@ def test_cleanup_tickets_progress_when_loop_notification_fails(
 
 
 def test_cleanup_tickets_progress_after_event_loop_exits():
-    collector = AsyncResultCollector(ray_module=_FakeRay())
+    collector = UDFStreamResultCollector(ray_module=_FakeRay())
     operation_calls = []
     collector._request_event_loop_stop()
     collector._thread.join(timeout=1.0)
@@ -1012,7 +1012,7 @@ def test_cleanup_tickets_progress_after_event_loop_exits():
 
 
 def test_cleanup_ticket_preserves_incomplete_ownership_retry():
-    collector = AsyncResultCollector(ray_module=_FakeRay())
+    collector = UDFStreamResultCollector(ray_module=_FakeRay())
     attempts = 0
 
     def transfer_owner():
@@ -1053,7 +1053,7 @@ def test_cleanup_ticket_rejects_a_broken_future_callback_contract():
         def result(self):
             raise AssertionError("broken Future must never be resolved")
 
-    collector = AsyncResultCollector(ray_module=_FakeRay())
+    collector = UDFStreamResultCollector(ray_module=_FakeRay())
     tickets = collector._submit_cleanup_operations(
         (
             RayStreamCleanupOperation(
@@ -1096,7 +1096,7 @@ def test_slot_retirement_reports_async_cancellation_ticket_failure():
         assert allow_operation.wait(timeout=2)
         return _BrokenFuture()
 
-    collector = AsyncResultCollector(ray_module=_FakeRay())
+    collector = UDFStreamResultCollector(ray_module=_FakeRay())
     collector._submit_cleanup_operations(
         (
             RayStreamCleanupOperation(
@@ -1129,7 +1129,7 @@ def test_cleanup_ticket_retries_a_hung_control_response(monkeypatch):
         "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
         0.01,
     )
-    collector = AsyncResultCollector(ray_module=_FakeRay())
+    collector = UDFStreamResultCollector(ray_module=_FakeRay())
     attempts = []
 
     def transfer_owner():
@@ -1171,7 +1171,7 @@ def test_cleanup_ticket_accepts_late_ack_from_timed_out_attempt(monkeypatch):
         "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
         0.01,
     )
-    collector = AsyncResultCollector(ray_module=_FakeRay())
+    collector = UDFStreamResultCollector(ray_module=_FakeRay())
     attempts = []
     second_attempt_started = threading.Event()
 
@@ -1216,7 +1216,7 @@ def test_cleanup_ticket_ignores_invalid_late_ack(monkeypatch):
         "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
         0.01,
     )
-    collector = AsyncResultCollector(ray_module=_FakeRay())
+    collector = UDFStreamResultCollector(ray_module=_FakeRay())
     attempts = []
     second_attempt_started = threading.Event()
 
@@ -1263,7 +1263,7 @@ def test_cleanup_ticket_finishes_once_when_retried_acks_race(monkeypatch):
         "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
         0.01,
     )
-    collector = AsyncResultCollector(ray_module=_FakeRay())
+    collector = UDFStreamResultCollector(ray_module=_FakeRay())
     attempts = []
     second_attempt_started = threading.Event()
     completions = []
@@ -1332,7 +1332,7 @@ def test_cleanup_ticket_expands_slow_response_deadline(monkeypatch):
         "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_MAX_S",
         0.04,
     )
-    collector = AsyncResultCollector(ray_module=_FakeRay())
+    collector = UDFStreamResultCollector(ray_module=_FakeRay())
     attempts = []
     response_timers = []
 
@@ -1394,7 +1394,7 @@ def test_zero_capacity_does_not_consume_block_or_metadata_objects():
         holder["generator"] = generator
         return generator
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         1,
         10,
@@ -1426,7 +1426,7 @@ def test_ready_block_read_reserves_data_capacity_across_streams():
         generators.append(generator)
         return generator
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         1,
         10,
@@ -1479,7 +1479,7 @@ def test_ready_block_read_reserves_data_capacity_across_streams():
 
 def test_data_capacity_does_not_count_interleaved_control_events():
     fake_ray = _FakeRay()
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     token = _OutputLeaseToken(
         request_id="strict-consumer-request",
         lease_id="strict-consumer-lease",
@@ -1517,7 +1517,7 @@ def test_direct_block_pair_is_leased_and_large_block_is_never_fetched():
     def submitter(lease):
         return _Generator([block_ref, _Ref(_metadata(lease, size_bytes=64))])
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         2,
         20,
@@ -1581,7 +1581,7 @@ def test_output_lease_control_retries_until_driver_acknowledges_ownership(operat
         submit_id=20,
         size_bytes=64,
     )
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     key = (token.request_id, token.lease_id)
     with collector._cv:
         collector._active_output_leases[key] = token
@@ -1616,7 +1616,7 @@ def test_output_control_waits_on_one_inflight_driver_response():
         submit_id=21,
         size_bytes=64,
     )
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     key = (token.request_id, token.lease_id)
     with collector._cv:
         collector._active_output_leases[key] = token
@@ -1651,7 +1651,7 @@ def test_output_release_ticket_handoff_is_atomic_with_shutdown(monkeypatch):
         submit_id=22,
         size_bytes=64,
     )
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     key = (token.request_id, token.lease_id)
     with collector._cv:
         collector._active_output_leases[key] = token
@@ -1720,7 +1720,7 @@ def test_slot_cancel_reuses_an_already_claimed_output_release_ticket():
         submit_id=23,
         size_bytes=64,
     )
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     key = (token.request_id, token.lease_id)
     with collector._cv:
         collector._active_output_leases[key] = token
@@ -1782,7 +1782,7 @@ def test_metadata_transition_is_atomic_with_concurrent_capacity_refresh(
             ]
         )
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         2,
         23,
@@ -1833,7 +1833,7 @@ def test_inflight_block_keeps_item_capacity_from_read_admission():
         holder["generator"] = generator
         return generator
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         2,
         24,
@@ -1926,7 +1926,7 @@ def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
         return source, weakref.ref(source)
 
     source, source_ref = make_source()
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(2, 22, source)
     del source
     capacity = {2: {"rows": 1, "bytes": 128, "item_bytes": 128}}
@@ -1985,7 +1985,7 @@ def test_terminal_cleanup_handoff_failure_replans_owned_stream(monkeypatch):
         )
         return generator
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         2,
         22,
@@ -2049,7 +2049,7 @@ def test_blocked_output_admission_submission_does_not_stall_healthy_stream():
     driver.acquire_query_output_block_lease = _RemoteMethod(
         blocking_acquire_output,
     )
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         2,
         24,
@@ -2139,7 +2139,7 @@ def test_blocked_terminal_retirement_does_not_stall_healthy_stream(monkeypatch):
         "retire_operations",
         selectively_blocking_retire_operations,
     )
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         2,
         25,
@@ -2213,7 +2213,7 @@ def test_slot_cancel_observes_claimed_terminal_retirement_without_waiting(monkey
         )
 
     monkeypatch.setattr(RayStreamAdapter, "retire_operations", blocking_retire_operations)
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         4,
         41,
@@ -2258,7 +2258,7 @@ def test_completion_ready_before_final_metadata_does_not_fail_valid_pair():
         holder["generator"] = generator
         return generator
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         2,
         21,
@@ -2304,7 +2304,7 @@ def test_completion_ready_before_final_metadata_does_not_fail_valid_pair():
 def test_output_grant_transition_is_atomic_with_slot_cancellation():
     fake_ray = _FakeRay()
     driver = _Driver()
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         2,
         19,
@@ -2423,7 +2423,7 @@ def test_terminal_record_releases_completed_output_lease_with_exact_rpc_contract
         output_request_id=f"output-request:{metadata['block_id']}",
         output_lease_ref=_Ref(driver._acquire_output(output_request)),
     )
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     record.registered = True
     record.terminal = True
     with collector._cv:
@@ -2476,7 +2476,7 @@ def test_one_slow_stream_cannot_block_a_ready_stream():
     def fast_submitter(lease):
         return _Generator([fast_block, _Ref(_metadata(lease))])
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         3,
         30,
@@ -2522,7 +2522,7 @@ def test_capacity_one_selects_ready_stream_without_prefetching_slow_stream():
         generators["fast"] = generator
         return generator
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         3,
         32,
@@ -2564,7 +2564,7 @@ def test_capacity_one_schedules_ready_streams_in_round_robin_order():
             ]
         )
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     for submit_id in (37, 38):
         collector.track_generator_ref(
             3,
@@ -2603,7 +2603,7 @@ def test_ready_generator_without_capacity_is_not_dequeued_or_polled():
         holder["generator"] = generator
         return generator
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         3,
         34,
@@ -2623,7 +2623,7 @@ def test_ready_generator_without_capacity_is_not_dequeued_or_polled():
 def test_unready_generator_polling_uses_bounded_idle_backoff():
     fake_ray = _FakeRay()
     driver = _Driver()
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         3,
         39,
@@ -2685,7 +2685,7 @@ def test_local_eligibility_change_interrupts_idle_readiness_backoff():
         fast_generators.append(generator)
         return generator
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         3,
         35,
@@ -2734,7 +2734,7 @@ def test_readiness_probe_failure_is_reported_without_dequeuing():
         generators.append(generator)
         return generator
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         3,
         42,
@@ -2779,7 +2779,7 @@ def test_batch_wait_failure_isolates_one_bad_generator_from_healthy_slots():
         healthy_holder["generator"] = generator
         return generator
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         31,
         310,
@@ -2856,7 +2856,7 @@ def test_real_ray_generator_wait_is_non_consuming_and_preserves_pair_order():
         }
         return yield_pair.remote(metadata)
 
-    collector = AsyncResultCollector(ray_module=ray)
+    collector = UDFStreamResultCollector(ray_module=ray)
     collector.track_generator_ref(
         3,
         43,
@@ -2885,7 +2885,7 @@ def test_real_ray_generator_wait_is_non_consuming_and_preserves_pair_order():
 def test_empty_stream_completion_progresses_with_zero_data_capacity():
     fake_ray = _FakeRay()
     driver = _Driver()
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         4,
         40,
@@ -2913,7 +2913,7 @@ def test_generator_terminating_mid_pair_fails_without_fetching_block():
     driver = _Driver()
     orphan_block = _Ref("remote-error-or-orphan-block", is_block=True)
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         9,
         90,
@@ -2960,7 +2960,7 @@ def test_failed_completion_retires_without_cancelling_terminal_remote_work():
     completion_future = Future()
     completion_future.set_exception(RuntimeError("planned completion failure"))
     record.completion_future = completion_future
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector._records[(record.slot_id, record.submit_id)] = record
 
     try:
@@ -3008,7 +3008,7 @@ def test_explicit_remote_error_pair_preserves_cause_without_output_lease():
         holder["generator"] = generator
         return generator
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         10,
         100,
@@ -3038,7 +3038,7 @@ def test_malformed_metadata_fails_only_its_stream_without_output_admission():
     def submitter(_lease):
         return _Generator([_Ref("block", is_block=True), _Ref({"size_bytes": 1})])
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         5,
         50,
@@ -3070,7 +3070,7 @@ def test_stream_error_wakes_dispatcher_before_generator_cancellation():
     def submitter(_lease):
         return _Generator([_Ref("block", is_block=True), _Ref({"size_bytes": 1})])
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
 
     def notify():
         cancel_counts_at_wakeup.append(len(fake_ray.cancel_calls))
@@ -3129,7 +3129,7 @@ def test_many_cancellations_complete_on_the_cleanup_event_loop():
     fake_ray = _FakeRay()
     driver = _Driver()
     generators = []
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     for index in range(12):
         generator = _Generator([], completed=False)
         generators.append(generator)
@@ -3162,7 +3162,7 @@ def test_pending_output_control_futures_do_not_withhold_task_or_stream_cleanup()
     release_response = _Ref({"released": True}, ready=False)
     blocked_release = _DelayedAckRemoteMethod(release_response)
     driver.release_query_output_block_lease = blocked_release
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     output_tokens = [
         _OutputLeaseToken(
             request_id=f"output-request:blocked:{index}",
@@ -3226,7 +3226,7 @@ def test_block_larger_than_declared_item_capacity_fails_instead_of_stalling_queu
             ]
         )
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         7,
         70,
@@ -3257,7 +3257,7 @@ def test_slot_cancellation_recursively_cancels_stream_and_releases_output_lease(
             completed=False,
         )
 
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         6,
         60,
@@ -3283,7 +3283,7 @@ def test_slot_cancellation_recursively_cancels_stream_and_releases_output_lease(
 def test_shutdown_clears_callback_and_fully_joins_owned_thread():
     fake_ray = _FakeRay()
     driver = _Driver()
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.set_wakeup_callback(lambda: None)
     collector.track_generator_ref(
         8,
@@ -3320,7 +3320,7 @@ def test_shutdown_cleanup_handoff_failure_is_retryable(monkeypatch):
         ],
         completed=False,
     )
-    collector = AsyncResultCollector(ray_module=fake_ray)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         8,
         81,

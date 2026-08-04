@@ -1591,9 +1591,10 @@ private:
 				}
 			}
 
-			// Drain async sources whenever there are in-flight slots or tracked ObjectRefs in the async collector.
+			// Drain async sources whenever there are in-flight slots or tracked ObjectRefs in the UDF stream result
+			// collector.
 			bool has_async_inflight = false;
-			bool pending_commands_need_async_collector = false;
+			bool pending_commands_need_udf_stream_result_collector = false;
 			for (auto *slot : active) {
 				if (!slot) {
 					continue;
@@ -1607,11 +1608,11 @@ private:
 					continue;
 				}
 				if (PayloadUsesRayStreamCollector(sc->slot->payload)) {
-					pending_commands_need_async_collector = true;
+					pending_commands_need_udf_stream_result_collector = true;
 					break;
 				}
 			}
-			bool drain_async = (bool)async_collector || has_async_inflight;
+			bool drain_async = (bool)udf_stream_result_collector || has_async_inflight;
 
 			bool needs_gil =
 			    !pending_commands.empty() || has_pending_cleanup_cancel || drain_async || has_output_lease_releases;
@@ -1645,7 +1646,7 @@ private:
 			                          has_output_lease_releases || debug_loop_tick % 200 == 0)) {
 				UDFDebugLog(StringUtil::Format(
 				    "dispatcher_loop tick=%llu active_slots=%llu inflight_slots=%llu inflight_total=%llu "
-				    "pending_shutdown_slots=%llu command_slots=%llu command_count=%llu async_collector=%s "
+				    "pending_shutdown_slots=%llu command_slots=%llu command_count=%llu udf_stream_result_collector=%s "
 				    "has_async_inflight=%s drain_async=%s needs_gil=%s work_pending=%s wakeup_fired=%s",
 				    static_cast<unsigned long long>(debug_loop_tick),
 				    static_cast<unsigned long long>(debug_active_slots),
@@ -1653,20 +1654,25 @@ private:
 				    static_cast<unsigned long long>(debug_inflight_total),
 				    static_cast<unsigned long long>(debug_pending_shutdown_slots),
 				    static_cast<unsigned long long>(pending_commands.size()),
-				    static_cast<unsigned long long>(debug_command_count), async_collector ? "true" : "false",
-				    has_async_inflight ? "true" : "false", drain_async ? "true" : "false", needs_gil ? "true" : "false",
+				    static_cast<unsigned long long>(debug_command_count),
+				    udf_stream_result_collector ? "true" : "false", has_async_inflight ? "true" : "false",
+				    drain_async ? "true" : "false", needs_gil ? "true" : "false",
 				    work_pending.load() ? "true" : "false", python_wakeup_fired ? "true" : "false"));
 			}
 			// Phase 2: single GIL acquisition for all submits + async drain
 			if (needs_gil) {
 				PythonGILWrapper gil;
+				if (RecoverFailedUDFStreamResultCollector_WithGIL(active)) {
+					did_work = true;
+				}
 
-				// Ensure async collector exists for ObjectRef-based paths.
-				if ((bool)async_collector || pending_commands_need_async_collector) {
+				// Ensure UDF stream result collector exists for ObjectRef-based paths.
+				if ((bool)udf_stream_result_collector || pending_commands_need_udf_stream_result_collector) {
 					try {
-						EnsureAsyncCollector();
+						EnsureUDFStreamResultCollector();
 					} catch (const std::exception &ex) {
-						auto msg = StringUtil::Format("udf async collector initialization failed: %s", ex.what());
+						auto msg =
+						    StringUtil::Format("udf stream result collector initialization failed: %s", ex.what());
 						for (auto &sc : pending_commands) {
 							if (sc && sc->slot && PayloadUsesRayStreamCollector(sc->slot->payload) &&
 							    !sc->slot->abort_requested.load()) {
@@ -1760,7 +1766,7 @@ private:
 					}
 				}
 
-				// Drain completed results from async collector
+				// Drain completed results from UDF stream result collector
 				if (drain_async) {
 					did_work |= DrainAsyncResults_WithGIL(active);
 				}
@@ -1825,14 +1831,16 @@ private:
 		// then destroy slots after releasing it for the same reason as
 		// Unregister(): queued Arrow/PyArrow buffers can acquire the GIL.
 		std::unordered_map<uint64_t, shared_ptr<ExecutorSlot>> cleanup_slots;
-		unique_ptr<RegisteredObject> cleanup_async_collector;
+		unique_ptr<RegisteredObject> cleanup_udf_stream_result_collector;
+		unique_ptr<RegisteredObject> cleanup_failed_udf_stream_result_collector;
 		{
 			lock_guard<mutex> g(global_lock);
-			if (slots.empty() && !async_collector) {
+			if (slots.empty() && !udf_stream_result_collector && !failed_udf_stream_result_collector) {
 				return;
 			}
 			cleanup_slots.swap(slots);
-			cleanup_async_collector = std::move(async_collector);
+			cleanup_udf_stream_result_collector = std::move(udf_stream_result_collector);
+			cleanup_failed_udf_stream_result_collector = std::move(failed_udf_stream_result_collector);
 		}
 		if (!PythonRuntimeUsableForUDFTeardown()) {
 			for (auto &kv : cleanup_slots) {
@@ -1842,8 +1850,11 @@ private:
 				kv.second->actor_handles.reset();
 				MarkSlotCleanupComplete(*kv.second);
 			}
-			if (cleanup_async_collector) {
-				cleanup_async_collector.release();
+			if (cleanup_udf_stream_result_collector) {
+				cleanup_udf_stream_result_collector.release();
+			}
+			if (cleanup_failed_udf_stream_result_collector) {
+				cleanup_failed_udf_stream_result_collector.release();
 			}
 			return;
 		}
@@ -1865,16 +1876,21 @@ private:
 		} catch (const std::exception &ex) {
 			RecordDispatcherError(StringUtil::Format("udf output lease final release failed: %s", ex.what()));
 		}
-		if (cleanup_async_collector) {
+		auto shutdown_collector = [&](unique_ptr<RegisteredObject> &collector) {
+			if (!collector) {
+				return;
+			}
 			try {
-				cleanup_async_collector->obj.attr("shutdown")();
+				collector->obj.attr("shutdown")();
 			} catch (const py::error_already_set &ex) {
 				RecordDispatcherError(StringUtil::Format("udf dispatcher final cleanup failed: %s", ex.what()));
 			} catch (const std::exception &ex) {
 				RecordDispatcherError(StringUtil::Format("udf dispatcher final cleanup failed: %s", ex.what()));
 			}
-			cleanup_async_collector.reset();
-		}
+			collector.reset();
+		};
+		shutdown_collector(cleanup_udf_stream_result_collector);
+		shutdown_collector(cleanup_failed_udf_stream_result_collector);
 		for (auto &kv : cleanup_slots) {
 			MarkSlotCleanupComplete(*kv.second);
 		}
@@ -1889,7 +1905,7 @@ private:
 		slot.cleanup_cv.notify_all();
 	}
 
-	enum class AsyncCollectorSlotCancelStatus : uint8_t { COMPLETE, PENDING, RETRY };
+	enum class UDFStreamResultCollectorSlotCancelStatus : uint8_t { COMPLETE, PENDING, RETRY };
 
 	static std::chrono::milliseconds CollectorCleanupRetryDelay(idx_t retry_count) {
 		const auto exponent = MinValue<idx_t>(retry_count > 0 ? retry_count - 1 : 0, 7);
@@ -1933,12 +1949,12 @@ private:
 		{
 			PythonGILWrapper gil;
 			slot_ptr->cleanup_cancel_requested.store(true);
-			auto cancel_status = CancelAsyncCollectorSlot_WithGIL(*slot_ptr);
-			if (cancel_status != AsyncCollectorSlotCancelStatus::COMPLETE) {
+			auto cancel_status = CancelUDFStreamResultCollectorSlot_WithGIL(*slot_ptr);
+			if (cancel_status != UDFStreamResultCollectorSlotCancelStatus::COMPLETE) {
 				// A pending ticket owns its eventual wakeup. A synchronous
 				// ownership-handoff failure has no such event, so retain the
 				// slot and retry it on the dispatcher's bounded backoff clock.
-				if (cancel_status == AsyncCollectorSlotCancelStatus::RETRY) {
+				if (cancel_status == UDFStreamResultCollectorSlotCancelStatus::RETRY) {
 					ScheduleCollectorCleanupRetry(*slot_ptr);
 				} else {
 					ResetCollectorCleanupRetry(*slot_ptr);
@@ -2102,59 +2118,63 @@ private:
 		WakeupPipelineThread(slot);
 	}
 
-	AsyncCollectorSlotCancelStatus CancelAsyncCollectorSlot_WithGIL(ExecutorSlot &slot) {
+	UDFStreamResultCollectorSlotCancelStatus CancelUDFStreamResultCollectorSlot_WithGIL(ExecutorSlot &slot) {
 		if (terminal_collector_shutdown_owned.load()) {
-			return AsyncCollectorSlotCancelStatus::COMPLETE;
+			return UDFStreamResultCollectorSlotCancelStatus::COMPLETE;
 		}
-		if (!PayloadUsesRayStreamCollector(slot.payload) || !async_collector || slot.collector_retired.load()) {
-			return AsyncCollectorSlotCancelStatus::COMPLETE;
+		if (!PayloadUsesRayStreamCollector(slot.payload) || !udf_stream_result_collector ||
+		    slot.collector_retired.load()) {
+			return UDFStreamResultCollectorSlotCancelStatus::COMPLETE;
 		}
 		try {
-			async_collector->obj.attr("cancel_slot")(py::int_(slot.id));
+			udf_stream_result_collector->obj.attr("cancel_slot")(py::int_(slot.id));
 		} catch (const py::error_already_set &ex) {
-			PublishSlotError(slot, StringUtil::Format("udf async collector cancel_slot failed: %s", ex.what()));
-			return AsyncCollectorSlotCancelStatus::RETRY;
+			PublishSlotError(slot, StringUtil::Format("udf stream result collector cancel_slot failed: %s", ex.what()));
+			return UDFStreamResultCollectorSlotCancelStatus::RETRY;
 		} catch (const std::exception &ex) {
-			PublishSlotError(slot, StringUtil::Format("udf async collector cancel_slot failed: %s", ex.what()));
-			return AsyncCollectorSlotCancelStatus::RETRY;
+			PublishSlotError(slot, StringUtil::Format("udf stream result collector cancel_slot failed: %s", ex.what()));
+			return UDFStreamResultCollectorSlotCancelStatus::RETRY;
 		}
 		bool collector_pending;
 		try {
-			collector_pending = async_collector->obj.attr("slot_has_pending")(py::int_(slot.id)).cast<bool>();
+			collector_pending =
+			    udf_stream_result_collector->obj.attr("slot_has_pending")(py::int_(slot.id)).cast<bool>();
 		} catch (const py::error_already_set &ex) {
-			PublishSlotError(slot, StringUtil::Format("udf async collector slot_has_pending failed: %s", ex.what()));
-			return AsyncCollectorSlotCancelStatus::RETRY;
+			PublishSlotError(slot,
+			                 StringUtil::Format("udf stream result collector slot_has_pending failed: %s", ex.what()));
+			return UDFStreamResultCollectorSlotCancelStatus::RETRY;
 		} catch (const std::exception &ex) {
-			PublishSlotError(slot, StringUtil::Format("udf async collector slot_has_pending failed: %s", ex.what()));
-			return AsyncCollectorSlotCancelStatus::RETRY;
+			PublishSlotError(slot,
+			                 StringUtil::Format("udf stream result collector slot_has_pending failed: %s", ex.what()));
+			return UDFStreamResultCollectorSlotCancelStatus::RETRY;
 		}
 		if (collector_pending) {
-			return AsyncCollectorSlotCancelStatus::PENDING;
+			return UDFStreamResultCollectorSlotCancelStatus::PENDING;
 		}
 		try {
 			// Once the collector reports no ownership, this dispatcher generation
 			// is the last possible submitter, so its process-lifetime cancellation
 			// fence can go.
-			auto cleanup_error = async_collector->obj.attr("retire_slot")(py::int_(slot.id));
+			auto cleanup_error = udf_stream_result_collector->obj.attr("retire_slot")(py::int_(slot.id));
 			slot.collector_retired.store(true);
 			if (!cleanup_error.is_none()) {
-				PublishSlotError(slot, StringUtil::Format("udf async collector slot cleanup failed: %s",
+				PublishSlotError(slot, StringUtil::Format("udf stream result collector slot cleanup failed: %s",
 				                                          py::str(cleanup_error).cast<string>()));
 			}
 		} catch (const py::error_already_set &ex) {
-			PublishSlotError(slot, StringUtil::Format("udf async collector retire_slot failed: %s", ex.what()));
-			return AsyncCollectorSlotCancelStatus::RETRY;
+			PublishSlotError(slot, StringUtil::Format("udf stream result collector retire_slot failed: %s", ex.what()));
+			return UDFStreamResultCollectorSlotCancelStatus::RETRY;
 		} catch (const std::exception &ex) {
-			PublishSlotError(slot, StringUtil::Format("udf async collector retire_slot failed: %s", ex.what()));
-			return AsyncCollectorSlotCancelStatus::RETRY;
+			PublishSlotError(slot, StringUtil::Format("udf stream result collector retire_slot failed: %s", ex.what()));
+			return UDFStreamResultCollectorSlotCancelStatus::RETRY;
 		}
-		return AsyncCollectorSlotCancelStatus::COMPLETE;
+		return UDFStreamResultCollectorSlotCancelStatus::COMPLETE;
 	}
 
 	void CancelSlotForCleanup_WithGIL(ExecutorSlot &slot, bool cancel_collector = true) {
 		const bool first_cancel = !slot.cleanup_cancel_requested.exchange(true);
 		if (first_cancel && cancel_collector) {
-			if (CancelAsyncCollectorSlot_WithGIL(slot) == AsyncCollectorSlotCancelStatus::RETRY) {
+			if (CancelUDFStreamResultCollectorSlot_WithGIL(slot) == UDFStreamResultCollectorSlotCancelStatus::RETRY) {
 				ScheduleCollectorCleanupRetry(slot);
 			}
 		}
@@ -2196,13 +2216,14 @@ private:
 		if (first_abort && PythonRuntimeUsableForUDFTeardown()) {
 			try {
 				PythonGILWrapper gil;
-				if (CancelAsyncCollectorSlot_WithGIL(slot) == AsyncCollectorSlotCancelStatus::RETRY) {
+				if (CancelUDFStreamResultCollectorSlot_WithGIL(slot) ==
+				    UDFStreamResultCollectorSlotCancelStatus::RETRY) {
 					ScheduleCollectorCleanupRetry(slot);
 				}
 			} catch (const py::error_already_set &ex) {
-				SetSlotError(slot, StringUtil::Format("udf async collector cancel_slot failed: %s", ex.what()));
+				SetSlotError(slot, StringUtil::Format("udf stream result collector cancel_slot failed: %s", ex.what()));
 			} catch (const std::exception &ex) {
-				SetSlotError(slot, StringUtil::Format("udf async collector cancel_slot failed: %s", ex.what()));
+				SetSlotError(slot, StringUtil::Format("udf stream result collector cancel_slot failed: %s", ex.what()));
 			}
 		}
 	}
@@ -2543,7 +2564,7 @@ private:
 			return DrainSyncResults(slot, generation) || slot.has_error.load() != old_error;
 		} catch (const py::error_already_set &ex) {
 			if (IsActiveSlotGeneration(slot, generation)) {
-				SetSlotError(slot, StringUtil::Format("udf async collector failed: %s", ex.what()));
+				SetSlotError(slot, StringUtil::Format("udf stream result collector failed: %s", ex.what()));
 			}
 			return true;
 		} catch (const std::exception &ex) {
@@ -2637,10 +2658,10 @@ private:
 		if (ref.is_none()) {
 			return;
 		}
-		if (!async_collector) {
-			throw InvalidInputException("udf async collector is unavailable for stale submitted work");
+		if (!udf_stream_result_collector) {
+			throw InvalidInputException("udf stream result collector is unavailable for stale submitted work");
 		}
-		async_collector->obj.attr("discard_generator_ref")(py::int_(slot.id), ref);
+		udf_stream_result_collector->obj.attr("discard_generator_ref")(py::int_(slot.id), ref);
 	}
 
 	void TrackSubmittedPythonRef_WithGIL(ExecutorSlot &slot, idx_t submit_id, py::object &ref,
@@ -2661,8 +2682,8 @@ private:
 			    static_cast<long long>(slot.inflight_count.load())));
 			return;
 		}
-		if (!async_collector) {
-			throw InvalidInputException("udf async collector is unavailable");
+		if (!udf_stream_result_collector) {
+			throw InvalidInputException("udf stream result collector is unavailable");
 		}
 		py::object error_context = py::none();
 		if (py::hasattr(slot.py_executor->obj, "error_context")) {
@@ -2672,7 +2693,8 @@ private:
 			DiscardSubmittedPythonRef_WithGIL(slot, ref);
 			return;
 		}
-		async_collector->obj.attr("track_generator_ref")(py::int_(slot.id), py::int_(submit_id), ref, error_context);
+		udf_stream_result_collector->obj.attr("track_generator_ref")(py::int_(slot.id), py::int_(submit_id), ref,
+		                                                             error_context);
 		if (!IsActiveSlotGeneration(slot, generation)) {
 			return;
 		}
@@ -2866,7 +2888,7 @@ private:
 			return true;
 		};
 
-		if (async_collector && has_ray_collector_slot) {
+		if (udf_stream_result_collector && has_ray_collector_slot) {
 			try {
 				py::dict capacities;
 				idx_t debug_capacity_total = 0;
@@ -2923,7 +2945,7 @@ private:
 					capacities[py::int_(slot->id)] = std::move(capacity_obj);
 				}
 
-				auto results_list = async_collector->obj.attr("drain_results")(capacities);
+				auto results_list = udf_stream_result_collector->obj.attr("drain_results")(capacities);
 				auto results = results_list.cast<py::list>();
 				auto debug_result_count = static_cast<idx_t>(py::len(results));
 				auto debug_tick = g_udf_debug_drain_tick.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -2964,23 +2986,23 @@ private:
 							if (tuple_len == 6) {
 								if (event_kind != "data") {
 									throw InvalidInputException(
-									    "udf async collector returned lease identity for non-data event");
+									    "udf stream result collector returned lease identity for non-data event");
 								}
 								output_request_id = tup[4].cast<string>();
 								output_lease_id = tup[5].cast<string>();
 							}
 						} else {
-							throw InvalidInputException("udf async collector returned invalid result tuple");
+							throw InvalidInputException("udf stream result collector returned invalid result tuple");
 						}
 						std::function<void()> handoff_output_lease;
 						std::function<void()> release_output_lease;
 						if (event_kind == "data") {
 							if (tuple_len != 6 || output_request_id.empty() || output_lease_id.empty()) {
 								throw InvalidInputException(
-								    "udf async collector data event is missing output lease identity");
+								    "udf stream result collector data event is missing output lease identity");
 							}
-							auto callbacks = MakeCollectorOutputLeaseCallbacks(async_collector->obj, slot_id,
-							                                                   output_request_id, output_lease_id);
+							auto callbacks = MakeCollectorOutputLeaseCallbacks(
+							    udf_stream_result_collector->obj, slot_id, output_request_id, output_lease_id);
 							handoff_output_lease = std::move(callbacks.handoff);
 							release_output_lease = std::move(callbacks.release);
 						}
@@ -3040,8 +3062,8 @@ private:
 						} else {
 							event.kind = UDFOutputEventKind::ERROR;
 							event.submit_complete = true;
-							event.error = StringUtil::Format("udf async collector returned unknown output event '%s'",
-							                                 event_kind);
+							event.error = StringUtil::Format(
+							    "udf stream result collector returned unknown output event '%s'", event_kind);
 						}
 						if (!DeliverOutputEvent(*slot, std::move(event), slot_generation)) {
 							SetSlotError(*slot, "udf async: output consumer rejected capacity-aware delivery");
@@ -3050,14 +3072,16 @@ private:
 						continue;
 					} catch (const py::error_already_set &ex) {
 						if (slot && !slot->abort_requested.load() && IsActiveSlotGeneration(*slot, slot_generation)) {
-							SetSlotError(*slot, StringUtil::Format("udf async collector result failed: %s", ex.what()));
+							SetSlotError(
+							    *slot, StringUtil::Format("udf stream result collector result failed: %s", ex.what()));
 						} else if (!slot) {
-							fail_active_slots(StringUtil::Format("udf async collector failed: %s", ex.what()));
+							fail_active_slots(StringUtil::Format("udf stream result collector failed: %s", ex.what()));
 						}
 						did_work = true;
 					} catch (const std::exception &ex) {
 						if (slot && !slot->abort_requested.load() && IsActiveSlotGeneration(*slot, slot_generation)) {
-							SetSlotError(*slot, StringUtil::Format("udf async collector result failed: %s", ex.what()));
+							SetSlotError(
+							    *slot, StringUtil::Format("udf stream result collector result failed: %s", ex.what()));
 						} else if (!slot) {
 							fail_active_slots(StringUtil::Format("udf async result drain failed: %s", ex.what()));
 						}
@@ -3066,7 +3090,7 @@ private:
 				}
 
 			} catch (const py::error_already_set &ex) {
-				fail_active_slots(StringUtil::Format("udf async collector failed: %s", ex.what()));
+				fail_active_slots(StringUtil::Format("udf stream result collector failed: %s", ex.what()));
 			} catch (const std::exception &ex) {
 				fail_active_slots(StringUtil::Format("udf async result drain failed: %s", ex.what()));
 			}
@@ -3281,15 +3305,18 @@ private:
 		}
 	}
 
-	void EnsureAsyncCollector() {
-		if (async_collector) {
+	void EnsureUDFStreamResultCollector() {
+		if (failed_udf_stream_result_collector) {
+			throw InvalidInputException("udf stream result collector recovery failed; process restart required");
+		}
+		if (udf_stream_result_collector) {
 			return;
 		}
 		// Caller holds GIL
 		try {
 			auto module = py::module_::import("duckdb.execution.udf_stream_result_collector");
-			auto collector_obj = module.attr("AsyncResultCollector")();
-			// Wire wakeup callback: when async collector completes an await,
+			auto collector_obj = module.attr("UDFStreamResultCollector")();
+			// Wire wakeup callback: when UDF stream result collector completes an await,
 			// it calls this lambda which signals work_cv so the dispatcher
 			// wakes up immediately to drain results (no GIL spin).
 			auto wakeup_fn = py::cpp_function([this]() {
@@ -3297,12 +3324,69 @@ private:
 				work_cv.notify_one();
 			});
 			collector_obj.attr("set_wakeup_callback")(wakeup_fn);
-			async_collector = make_uniq<RegisteredObject>(std::move(collector_obj));
+			udf_stream_result_collector = make_uniq<RegisteredObject>(std::move(collector_obj));
 		} catch (const py::error_already_set &ex) {
-			throw InvalidInputException("udf async collector initialization failed: %s", ex.what());
+			throw InvalidInputException("udf stream result collector initialization failed: %s", ex.what());
 		} catch (const std::exception &ex) {
-			throw InvalidInputException("udf async collector initialization failed: %s", ex.what());
+			throw InvalidInputException("udf stream result collector initialization failed: %s", ex.what());
 		}
+	}
+
+	bool GetUDFStreamResultCollectorFatalError_WithGIL(string &failure) {
+		if (!udf_stream_result_collector) {
+			return false;
+		}
+		try {
+			auto error = udf_stream_result_collector->obj.attr("fatal_error")();
+			if (error.is_none()) {
+				return false;
+			}
+			failure = py::str(error).cast<string>();
+			return true;
+		} catch (const py::error_already_set &ex) {
+			failure = StringUtil::Format("collector health check failed: %s", ex.what());
+			return true;
+		} catch (const std::exception &ex) {
+			failure = StringUtil::Format("collector health check failed: %s", ex.what());
+			return true;
+		}
+	}
+
+	bool RecoverFailedUDFStreamResultCollector_WithGIL(vector<ExecutorSlot *> &active) {
+		string failure;
+		if (!GetUDFStreamResultCollectorFatalError_WithGIL(failure)) {
+			return false;
+		}
+		UDFDebugLog(StringUtil::Format("udf_stream_result_collector_recovery_start failure=%s", failure));
+		for (auto *slot : active) {
+			if (slot && PayloadUsesRayStreamCollector(slot->payload)) {
+				slot->collector_retired.store(true);
+			}
+		}
+		auto error = StringUtil::Format("udf stream result collector failed: %s", failure);
+		for (auto *slot : active) {
+			if (!slot || !PayloadUsesRayStreamCollector(slot->payload) || slot->abort_requested.load() ||
+			    !IsSlotActive(*slot)) {
+				continue;
+			}
+			SetSlotError(*slot, error);
+		}
+
+		auto failed_collector = std::move(udf_stream_result_collector);
+		try {
+			failed_collector->obj.attr("shutdown")();
+		} catch (const py::error_already_set &ex) {
+			failed_udf_stream_result_collector = std::move(failed_collector);
+			RecordDispatcherError(StringUtil::Format("udf stream result collector recovery failed: %s", ex.what()));
+			return true;
+		} catch (const std::exception &ex) {
+			failed_udf_stream_result_collector = std::move(failed_collector);
+			RecordDispatcherError(StringUtil::Format("udf stream result collector recovery failed: %s", ex.what()));
+			return true;
+		}
+		failed_collector.reset();
+		UDFDebugLog("udf_stream_result_collector_recovery_done");
+		return true;
 	}
 
 	// ── Members ──────────────────────────────────────────────────────────
@@ -3317,7 +3401,7 @@ private:
 	atomic<bool> stop {false};
 	atomic<bool> shutdown_requested {false};
 	atomic<bool> terminal_collector_shutdown_owned {false};
-	atomic<bool> wakeup_fired {false}; // set by async collector wakeup callback
+	atomic<bool> wakeup_fired {false}; // set by UDF stream result collector wakeup callback
 	atomic<bool> work_pending {false}; // set by all notify paths before signaling work_cv
 	mutex dispatcher_error_lock;
 	atomic<bool> has_dispatcher_error {false};
@@ -3326,7 +3410,8 @@ private:
 	bool thread_running = false;
 	mutex output_lease_release_lock;
 	std::deque<PendingCollectorOutputLeaseCallback> output_lease_releases;
-	unique_ptr<RegisteredObject> async_collector; // Python AsyncResultCollector
+	unique_ptr<RegisteredObject> udf_stream_result_collector; // Python UDFStreamResultCollector
+	unique_ptr<RegisteredObject> failed_udf_stream_result_collector;
 };
 
 struct CollectorOutputLeaseCallbackState {
