@@ -1243,10 +1243,14 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto source_handle_flight_hosts = deserializer.ReadProperty<vector<string>>(116, "source_handle_flight_hosts");
 		auto source_handle_task_partition_ids =
 		    deserializer.ReadProperty<vector<idx_t>>(117, "source_handle_task_partition_ids");
+		auto read_idle_timeout_seconds = deserializer.ReadPropertyWithExplicitDefault<double>(
+		    118, "flight_read_idle_timeout_seconds",
+		    distributed::FlightExchangeConfig::DEFAULT_FLIGHT_READ_IDLE_TIMEOUT_SECONDS);
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.node_id = distributed::ResolveFlightExchangeNodeIdFromEnv();
 		flight_config.flight_timeout_seconds = timeout_seconds;
+		flight_config.flight_read_idle_timeout_seconds = read_idle_timeout_seconds;
 		flight_config.expected_types = types;
 		flight_config.local_dirs = std::vector<std::string>(local_dirs.begin(), local_dirs.end());
 		auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));

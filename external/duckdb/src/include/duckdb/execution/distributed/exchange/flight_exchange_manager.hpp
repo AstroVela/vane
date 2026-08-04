@@ -22,6 +22,7 @@
 #include <string>
 #include <cstdlib>
 #include <chrono>
+#include <cmath>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -41,9 +42,13 @@ class ClientContext;
 namespace distributed {
 
 struct FlightExchangeConfig {
+	static constexpr double DEFAULT_FLIGHT_TIMEOUT_SECONDS = 3600.0;
+	static constexpr double DEFAULT_FLIGHT_READ_IDLE_TIMEOUT_SECONDS = 60.0;
+
 	std::vector<std::string> local_dirs; // shuffle directories for IPC files
 	std::string node_id;
-	double flight_timeout_seconds = 0.0;
+	double flight_timeout_seconds = DEFAULT_FLIGHT_TIMEOUT_SECONDS;
+	double flight_read_idle_timeout_seconds = DEFAULT_FLIGHT_READ_IDLE_TIMEOUT_SECONDS;
 	std::vector<LogicalType> expected_types;
 };
 
@@ -66,6 +71,23 @@ inline int ResolveFlightExchangeEnvInt(const char *name, int fallback) {
 	}
 	try {
 		return std::stoi(value);
+	} catch (...) {
+		return fallback;
+	}
+}
+
+inline double ResolveFlightExchangeEnvTimeoutSeconds(const char *name, double fallback) {
+	const char *value = std::getenv(name);
+	if (!value || !*value) {
+		return fallback;
+	}
+	try {
+		size_t parsed_length = 0;
+		auto parsed = std::stod(value, &parsed_length);
+		if (parsed_length != std::string(value).size() || !std::isfinite(parsed) || parsed < 0.0) {
+			return fallback;
+		}
+		return parsed;
 	} catch (...) {
 		return fallback;
 	}
@@ -181,6 +203,10 @@ inline FlightExchangeConfig ResolveFlightExchangeConfigFromEnv() {
 	FlightExchangeConfig config;
 	config.node_id = ResolveFlightExchangeNodeIdFromEnv();
 	config.local_dirs = ResolveFlightExchangeLocalDirsFromEnv();
+	config.flight_timeout_seconds = ResolveFlightExchangeEnvTimeoutSeconds(
+	    "VANE_FLIGHT_CALL_TIMEOUT_S", FlightExchangeConfig::DEFAULT_FLIGHT_TIMEOUT_SECONDS);
+	config.flight_read_idle_timeout_seconds = ResolveFlightExchangeEnvTimeoutSeconds(
+	    "VANE_FLIGHT_READ_IDLE_TIMEOUT_S", FlightExchangeConfig::DEFAULT_FLIGHT_READ_IDLE_TIMEOUT_SECONDS);
 	return config;
 }
 

@@ -119,6 +119,112 @@ private:
 	string exchange_id_;
 };
 
+class BlockingFlightState {
+public:
+	void MarkStarted() {
+		std::lock_guard<std::mutex> guard(mutex_);
+		started_ = true;
+		condition_.notify_all();
+	}
+
+	bool WaitUntilStarted(std::chrono::milliseconds timeout) {
+		std::unique_lock<std::mutex> guard(mutex_);
+		return condition_.wait_for(guard, timeout, [&]() { return started_; });
+	}
+
+	void WaitUntilReleased() {
+		std::unique_lock<std::mutex> guard(mutex_);
+		condition_.wait(guard, [&]() { return released_; });
+	}
+
+	bool WaitUntilReleased(std::chrono::milliseconds timeout) {
+		std::unique_lock<std::mutex> guard(mutex_);
+		return condition_.wait_for(guard, timeout, [&]() { return released_; });
+	}
+
+	void Release() {
+		std::lock_guard<std::mutex> guard(mutex_);
+		released_ = true;
+		condition_.notify_all();
+	}
+
+private:
+	std::mutex mutex_;
+	std::condition_variable condition_;
+	bool started_ = false;
+	bool released_ = false;
+};
+
+class BlockingRecordBatchReader final : public arrow::RecordBatchReader {
+public:
+	explicit BlockingRecordBatchReader(std::shared_ptr<BlockingFlightState> state)
+	    : state_(std::move(state)), schema_(arrow::schema({arrow::field("value", arrow::int32())})) {
+	}
+
+	std::shared_ptr<arrow::Schema> schema() const override {
+		return schema_;
+	}
+
+	arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override {
+		state_->MarkStarted();
+		state_->WaitUntilReleased();
+		*batch = nullptr;
+		return arrow::Status::OK();
+	}
+
+	arrow::Status Close() override {
+		state_->Release();
+		return arrow::Status::OK();
+	}
+
+private:
+	std::shared_ptr<BlockingFlightState> state_;
+	std::shared_ptr<arrow::Schema> schema_;
+};
+
+class BlockingReadFlightServer final : public arrow::flight::FlightServerBase {
+public:
+	explicit BlockingReadFlightServer(std::shared_ptr<BlockingFlightState> state) : state_(std::move(state)) {
+	}
+
+	arrow::Status DoGet(const arrow::flight::ServerCallContext &, const arrow::flight::Ticket &,
+	                    std::unique_ptr<arrow::flight::FlightDataStream> *stream) override {
+		auto reader = std::make_shared<BlockingRecordBatchReader>(state_);
+		*stream = std::unique_ptr<arrow::flight::RecordBatchStream>(new arrow::flight::RecordBatchStream(reader));
+		return arrow::Status::OK();
+	}
+
+private:
+	std::shared_ptr<BlockingFlightState> state_;
+};
+
+class BlockingDoGetFlightServer final : public arrow::flight::FlightServerBase {
+public:
+	explicit BlockingDoGetFlightServer(std::shared_ptr<BlockingFlightState> state) : state_(std::move(state)) {
+	}
+
+	arrow::Status DoGet(const arrow::flight::ServerCallContext &context, const arrow::flight::Ticket &,
+	                    std::unique_ptr<arrow::flight::FlightDataStream> *) override {
+		state_->MarkStarted();
+		while (!context.is_cancelled()) {
+			if (state_->WaitUntilReleased(std::chrono::milliseconds(5))) {
+				return arrow::Status::Cancelled("blocking DoGet test released");
+			}
+		}
+		return arrow::Status::Cancelled("blocking DoGet test canceled");
+	}
+
+private:
+	std::shared_ptr<BlockingFlightState> state_;
+};
+
+void StartTestFlightServer(arrow::flight::FlightServerBase &server) {
+	auto location = arrow::flight::Location::ForGrpcTcp("127.0.0.1", 0);
+	REQUIRE(location.ok());
+	arrow::flight::FlightServerOptions options(std::move(location).ValueOrDie());
+	REQUIRE(server.Init(options).ok());
+}
+
 using MaterializedRows = vector<vector<Value>>;
 
 ExchangeSourceHandle MakeSourceHandle(const string &output_location, const string &node_id, idx_t partition_id,
@@ -128,6 +234,14 @@ ExchangeSourceHandle MakeSourceHandle(const string &output_location, const strin
 	handle.attempt_id = attempt_id;
 	handle.node_id = node_id;
 	handle.files.push_back(ExchangeSourceFile(output_location, 0));
+	return handle;
+}
+
+ExchangeSourceHandle MakeRemoteSourceHandle(int port) {
+	auto handle = MakeSourceHandle("blocking-flight-test", "producer-node", 0);
+	handle.flight_host = "127.0.0.1";
+	handle.flight_port = port;
+	handle.flight_server_epoch = "blocking-flight-epoch";
 	return handle;
 }
 
@@ -378,6 +492,33 @@ TEST_CASE("Exchange: FlightExchangeTicket parse errors", "[distributed][exchange
 	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\nnode\n1\nnope").is_err());
 	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\nnode\n1x\n2").is_err());
 	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\nnode\n1\n2x").is_err());
+}
+
+TEST_CASE("Exchange: Flight timeouts resolve from the worker environment", "[distributed][exchange]") {
+	SECTION("configured values") {
+		ScopedEnvVar call_timeout("VANE_FLIGHT_CALL_TIMEOUT_S", "12.5");
+		ScopedEnvVar idle_timeout("VANE_FLIGHT_READ_IDLE_TIMEOUT_S", "3.25");
+		auto config = ResolveFlightExchangeConfigFromEnv();
+		REQUIRE(config.flight_timeout_seconds == Approx(12.5));
+		REQUIRE(config.flight_read_idle_timeout_seconds == Approx(3.25));
+	}
+
+	SECTION("zero explicitly disables a timeout") {
+		ScopedEnvVar call_timeout("VANE_FLIGHT_CALL_TIMEOUT_S", "0");
+		ScopedEnvVar idle_timeout("VANE_FLIGHT_READ_IDLE_TIMEOUT_S", "0");
+		auto config = ResolveFlightExchangeConfigFromEnv();
+		REQUIRE(config.flight_timeout_seconds == 0.0);
+		REQUIRE(config.flight_read_idle_timeout_seconds == 0.0);
+	}
+
+	SECTION("invalid values retain safe defaults") {
+		ScopedEnvVar call_timeout("VANE_FLIGHT_CALL_TIMEOUT_S", "not-a-timeout");
+		ScopedEnvVar idle_timeout("VANE_FLIGHT_READ_IDLE_TIMEOUT_S", "-1");
+		auto config = ResolveFlightExchangeConfigFromEnv();
+		REQUIRE(config.flight_timeout_seconds == FlightExchangeConfig::DEFAULT_FLIGHT_TIMEOUT_SECONDS);
+		REQUIRE(config.flight_read_idle_timeout_seconds ==
+		        FlightExchangeConfig::DEFAULT_FLIGHT_READ_IDLE_TIMEOUT_SECONDS);
+	}
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1003,6 +1144,160 @@ TEST_CASE("Exchange: process-local Flight shutdown is bounded and releases its s
 	REQUIRE(stopped_while_reader_open);
 	registry.RemoveAndCleanupByQuery(query_id);
 	REQUIRE(registry.RetireQuery(query_id).is_ok());
+}
+
+TEST_CASE("Exchange: Flight source idle watchdog cancels a stalled batch read", "[distributed][exchange]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto state = std::make_shared<BlockingFlightState>();
+	BlockingReadFlightServer server(state);
+	StartTestFlightServer(server);
+
+	FlightExchangeConfig config;
+	config.local_dirs = {TestCreatePath("flight_idle_watchdog")};
+	config.node_id = "reader-node";
+	config.expected_types = {LogicalType::INTEGER};
+	config.flight_timeout_seconds = 5.0;
+	config.flight_read_idle_timeout_seconds = 0.5;
+	auto handle = MakeRemoteSourceHandle(server.port());
+	auto read_future = std::async(std::launch::async, [&]() {
+		try {
+			ReadSourceRows(*conn.context, config, {std::move(handle)});
+			return string();
+		} catch (const std::exception &ex) {
+			return string(ex.what());
+		}
+	});
+
+	const bool read_started = state->WaitUntilStarted(std::chrono::seconds(2));
+	const bool read_stopped =
+	    read_started && read_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+	state->Release();
+	read_future.wait();
+	auto read_error = read_future.get();
+	auto shutdown_status = server.Shutdown();
+
+	REQUIRE(read_started);
+	REQUIRE(read_stopped);
+	REQUIRE_THAT(read_error, Catch::Matchers::Contains("flight read batch idle timeout"));
+	REQUIRE(shutdown_status.ok());
+}
+
+TEST_CASE("Exchange: Flight source idle watchdog cancels a stalled initial schema", "[distributed][exchange]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto state = std::make_shared<BlockingFlightState>();
+	BlockingDoGetFlightServer server(state);
+	StartTestFlightServer(server);
+
+	FlightExchangeConfig config;
+	config.local_dirs = {TestCreatePath("flight_schema_idle_watchdog")};
+	config.node_id = "reader-node";
+	config.expected_types = {LogicalType::INTEGER};
+	config.flight_timeout_seconds = 5.0;
+	config.flight_read_idle_timeout_seconds = 0.5;
+	auto handle = MakeRemoteSourceHandle(server.port());
+	auto read_future = std::async(std::launch::async, [&]() {
+		try {
+			ReadSourceRows(*conn.context, config, {std::move(handle)});
+			return string();
+		} catch (const std::exception &ex) {
+			return string(ex.what());
+		}
+	});
+
+	const bool do_get_started = state->WaitUntilStarted(std::chrono::seconds(2));
+	const bool read_stopped =
+	    do_get_started && read_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+	state->Release();
+	read_future.wait();
+	auto read_error = read_future.get();
+	auto shutdown_status = server.Shutdown();
+
+	REQUIRE(do_get_started);
+	REQUIRE(read_stopped);
+	REQUIRE_THAT(read_error, Catch::Matchers::Contains("flight get schema idle timeout"));
+	REQUIRE(shutdown_status.ok());
+}
+
+TEST_CASE("Exchange: Flight call deadline bounds a stalled initial schema", "[distributed][exchange]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto state = std::make_shared<BlockingFlightState>();
+	BlockingDoGetFlightServer server(state);
+	StartTestFlightServer(server);
+
+	FlightExchangeConfig config;
+	config.local_dirs = {TestCreatePath("flight_call_deadline")};
+	config.node_id = "reader-node";
+	config.expected_types = {LogicalType::INTEGER};
+	config.flight_timeout_seconds = 0.5;
+	config.flight_read_idle_timeout_seconds = 5.0;
+	auto handle = MakeRemoteSourceHandle(server.port());
+	auto read_future = std::async(std::launch::async, [&]() {
+		try {
+			ReadSourceRows(*conn.context, config, {std::move(handle)});
+			return string();
+		} catch (const std::exception &ex) {
+			return string(ex.what());
+		}
+	});
+
+	const bool do_get_started = state->WaitUntilStarted(std::chrono::seconds(2));
+	const bool read_stopped =
+	    do_get_started && read_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+	state->Release();
+	read_future.wait();
+	auto read_error = read_future.get();
+	auto shutdown_status = server.Shutdown();
+
+	REQUIRE(do_get_started);
+	REQUIRE(read_stopped);
+	REQUIRE_THAT(read_error, Catch::Matchers::Contains("Deadline Exceeded"));
+	REQUIRE(shutdown_status.ok());
+}
+
+TEST_CASE("Exchange: query interrupt cancels a stalled Flight DoGet", "[distributed][exchange]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto state = std::make_shared<BlockingFlightState>();
+	BlockingDoGetFlightServer server(state);
+	StartTestFlightServer(server);
+
+	FlightExchangeConfig config;
+	config.local_dirs = {TestCreatePath("flight_interrupt_watchdog")};
+	config.node_id = "reader-node";
+	config.expected_types = {LogicalType::INTEGER};
+	config.flight_timeout_seconds = 5.0;
+	config.flight_read_idle_timeout_seconds = 5.0;
+	auto handle = MakeRemoteSourceHandle(server.port());
+	auto read_future = std::async(std::launch::async, [&]() {
+		try {
+			ReadSourceRows(*conn.context, config, {std::move(handle)});
+			return string("completed");
+		} catch (const InterruptException &) {
+			return string("interrupted");
+		} catch (const std::exception &ex) {
+			return string(ex.what());
+		}
+	});
+
+	const bool do_get_started = state->WaitUntilStarted(std::chrono::seconds(2));
+	if (do_get_started) {
+		conn.context->Interrupt();
+	}
+	const bool read_stopped =
+	    do_get_started && read_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+	state->Release();
+	read_future.wait();
+	auto outcome = read_future.get();
+	conn.context->ClearInterrupt();
+	auto shutdown_status = server.Shutdown();
+
+	REQUIRE(do_get_started);
+	REQUIRE(read_stopped);
+	REQUIRE(outcome == "interrupted");
+	REQUIRE(shutdown_status.ok());
 }
 
 // ═══════════════════════════════════════════════════════════

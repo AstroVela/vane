@@ -353,6 +353,7 @@ void PhysicalRemoteExchangeSource::SerializeOperatorData(Serializer &serializer)
 	serializer.WriteProperty(115, "source_catalog_handles_explicit", true);
 	serializer.WriteProperty(116, "source_handle_flight_hosts", handle_flight_hosts);
 	serializer.WriteProperty(117, "source_handle_task_partition_ids", handle_source_task_partition_ids);
+	serializer.WriteProperty(118, "flight_read_idle_timeout_seconds", flight_config.flight_read_idle_timeout_seconds);
 }
 
 } // namespace duckdb
