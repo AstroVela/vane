@@ -201,7 +201,7 @@ void SerializeRemoteExchangeSourceWithoutReadTimeout(Serializer &serializer) {
 	vector<string> source_nodes = {"node-1"};
 	vector<idx_t> handle_partition_ids = {0};
 	vector<string> handle_node_ids = {"node-1"};
-	vector<string> handle_paths = {"shuffle-stage__sink_0__attempt_0"};
+	vector<string> handle_paths = {"exchange-id__sink_0__attempt_0"};
 	vector<int> handle_flight_ports = {6123};
 	vector<idx_t> handle_attempt_ids = {0};
 	vector<string> local_dirs = {"/tmp/vane-shuffle"};
@@ -211,7 +211,7 @@ void SerializeRemoteExchangeSourceWithoutReadTimeout(Serializer &serializer) {
 	serializer.WriteProperty(100, "type", PhysicalOperatorType::EXCHANGE_SOURCE);
 	serializer.WriteProperty(101, "types", types);
 	serializer.WriteProperty<idx_t>(102, "estimated_cardinality", 0);
-	serializer.WriteProperty(103, "shuffle_stage_id", string("shuffle-stage"));
+	serializer.WriteProperty(103, "exchange_id", string("exchange-id"));
 	serializer.WriteProperty(104, "partition_indices", partition_indices);
 	serializer.WriteProperty(105, "source_nodes", source_nodes);
 	serializer.WriteProperty<double>(106, "flight_timeout_seconds", 7.5);

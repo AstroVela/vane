@@ -2363,13 +2363,13 @@ def test_fte_worker_command_outbox_pop_owns_attempt_scheduling_lock():
 
 
 def test_fte_fragment_without_native_heap_requirement_omits_request_memory():
-    stage = FteFragmentExecution(
+    fragment = FteFragmentExecution(
         "query-duckdb-memory",
         0,
         fragment_id="query-duckdb-memory:node:1",
         task_memory_bytes=None,
     )
-    partition = stage.add_partition(0)
+    partition = fragment.add_partition(0)
 
     scheduled = partition.start_attempt(
         worker_id="worker-a",
