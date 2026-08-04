@@ -2469,11 +2469,12 @@ def test_openai_chat_request_maps_max_output_tokens_and_stop_sequences():
     ("official_endpoint", "expected_name"),
     [(True, "max_completion_tokens"), (False, "max_tokens")],
 )
-def test_openai_o_series_chat_request_uses_endpoint_capability(official_endpoint, expected_name):
+@pytest.mark.parametrize("model", ["o3-mini", "gpt-5", "gpt-5-mini", "gpt-5.1"])
+def test_openai_chat_request_uses_model_and_endpoint_capability(model, official_endpoint, expected_name):
     from vane.ai.providers.openai import OpenAIPrompter
 
     prompter = OpenAIPrompter.__new__(OpenAIPrompter)
-    prompter._model = "o3-mini"
+    prompter._model = model
     prompter._official_openai_endpoint = official_endpoint
     prompter._options = {"max_output_tokens": 11}
     prompter._return_format = None

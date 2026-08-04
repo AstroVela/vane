@@ -134,10 +134,14 @@ def _uses_official_openai_endpoint(base_url: Any) -> bool:
 def _uses_openai_max_completion_tokens(model: str) -> bool:
     normalized = model.strip().casefold()
     return (
-        len(normalized) >= 2
-        and normalized[0] == "o"
-        and normalized[1].isdigit()
-        and (len(normalized) == 2 or normalized[2] in {"-", "."})
+        normalized == "gpt-5"
+        or normalized.startswith(("gpt-5-", "gpt-5."))
+        or (
+            len(normalized) >= 2
+            and normalized[0] == "o"
+            and normalized[1].isdigit()
+            and (len(normalized) == 2 or normalized[2] in {"-", "."})
+        )
     )
 
 

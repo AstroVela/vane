@@ -114,6 +114,7 @@ def test_provider_extras_match_provider_import_errors():
 
 
 def test_structured_provider_extras_require_supported_sdk_versions():
+    openai = _requirement_for_extra("openai", "openai")
     google = _requirement_for_extra("google", "google-genai")
     vllm = _requirement_for_extra(
         "vllm",
@@ -121,6 +122,7 @@ def test_structured_provider_extras_require_supported_sdk_versions():
         {"platform_system": "Linux", "platform_machine": "x86_64"},
     )
 
+    assert openai.specifier == SpecifierSet(">=1.66.0")
     assert google.specifier == SpecifierSet(">=1.22.0")
     assert vllm.specifier == SpecifierSet(">=0.11.0")
 
