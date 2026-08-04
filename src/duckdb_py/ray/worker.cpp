@@ -284,3 +284,10 @@ void RayWorkerRuntime::AbortShutdown() {
 	duckdb::PythonGILWrapper gil;
 	ray_worker_handle_.attr("abort_shutdown")();
 }
+
+bool RayWorkerRuntime::InstallFailureRetirementCallback(py::object callback) {
+	duckdb::PythonGILWrapper gil;
+	ray_worker_handle_.attr("_retire_from_manager_for_failure") = std::move(callback);
+	return !py::hasattr(ray_worker_handle_, "_fte_failure_retirement_completed") ||
+	       !py::cast<bool>(ray_worker_handle_.attr("_fte_failure_retirement_completed"));
+}

@@ -5977,6 +5977,92 @@ def test_stale_worker_shutdown_does_not_fail_current_registry_owner(monkeypatch)
     assert current._fte_healthy is True
 
 
+def test_worker_failure_does_not_retire_replacement_registered_during_quiescence(monkeypatch):
+    worker_id = "manager-a:node-a:0"
+    actor = _FakeActor()
+    failed = RayWorkerActorHandle(
+        actor,
+        memory_capacity_bytes=1 << 60,
+        worker_id=worker_id,
+        manager_instance_id="manager-a",
+    )
+    retirement_calls = []
+    replacement = SimpleNamespace(
+        _fte_healthy=True,
+        _retire_from_manager_for_failure=lambda: retirement_calls.append(True) or True,
+        actor_handle=object(),
+        manager_instance_id="manager-a",
+    )
+
+    class _ReplaceRegistryOwnerOnPrepare:
+        def remote(self):
+            with worker_handle_mod._FTE_REGISTRY_LOCK:
+                assert worker_handle_mod._FTE_WORKER_HANDLES[worker_id] is failed
+                worker_handle_mod._FTE_WORKER_HANDLES[worker_id] = replacement
+            future = Future()
+            future.set_result(None)
+            return SimpleNamespace(future=lambda: future)
+
+    actor.prepare_shutdown = _ReplaceRegistryOwnerOnPrepare()
+    kill_calls = []
+    monkeypatch.setattr(worker_handle_mod.ray, "kill", lambda target: kill_calls.append(target))
+
+    scheduled = fte_fragment_scheduler_mod._mark_fte_worker_failed(
+        worker_id,
+        {"error_code": "WORKER_LOST", "message": "planned concurrent replacement"},
+        manager_instance_id="manager-a",
+    )
+
+    assert scheduled == []
+    assert worker_handle_mod._FTE_WORKER_HANDLES[worker_id] is replacement
+    assert replacement._fte_healthy is True
+    assert retirement_calls == []
+    assert kill_calls == []
+
+
+def test_worker_failure_kills_retired_actor_when_retry_bookkeeping_raises(monkeypatch):
+    actor = _FakeActor()
+    failed = RayWorkerActorHandle(
+        actor,
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:0",
+        manager_instance_id="manager-a",
+    )
+    failed._retire_from_manager_for_failure = lambda: True
+    monkeypatch.setattr(
+        fte_fragment_scheduler_mod,
+        "_running_partition_requirements_on_fte_workers",
+        lambda *_args, **_kwargs: {
+            ("query-retry-error", "fragment-retry-error", 0): (
+                None,
+                fte_fragment_scheduler_mod.FteTaskExecutionClass.STANDARD,
+                None,
+            )
+        },
+    )
+
+    def fail_replacement_selection(*_args, **_kwargs):
+        raise RuntimeError("planned replacement selection failure")
+
+    monkeypatch.setattr(
+        fte_fragment_scheduler_mod,
+        "_select_replacement_fte_worker",
+        fail_replacement_selection,
+    )
+    kill_calls = []
+    monkeypatch.setattr(worker_handle_mod.ray, "kill", lambda target: kill_calls.append(target))
+
+    with pytest.raises(RuntimeError, match="planned replacement selection failure"):
+        fte_fragment_scheduler_mod._mark_fte_worker_failed(
+            failed.worker_id,
+            {"error_code": "WORKER_LOST", "message": "planned failure"},
+            manager_instance_id="manager-a",
+        )
+
+    assert failed.worker_id not in worker_handle_mod._FTE_WORKER_HANDLES
+    assert kill_calls == [actor]
+
+
 def test_fte_non_remote_node_requirement_requires_matching_host(monkeypatch):
     actor0 = _FakeActor()
     actor1 = _FakeActor()

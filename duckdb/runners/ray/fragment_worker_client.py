@@ -91,6 +91,7 @@ class RayWorkerActorHandle(
         self._fte_prepare_terminal_errors: dict[str, BaseException] = {}
         self._fragment_drop_incomplete_queries: set[str] = set()
         self._worker_shutdown_started = False
+        self._fte_failure_retirement_completed = False
         with _FTE_REGISTRY_LOCK:
             current = _FTE_WORKER_HANDLES.get(worker_id)
             if current is not None and current is not self:

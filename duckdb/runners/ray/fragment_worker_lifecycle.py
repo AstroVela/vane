@@ -454,13 +454,14 @@ class FteWorkerLifecycleMixin:
         self._fte_pressure.drop_query(query_id)
 
     def _begin_worker_shutdown(self) -> None:
-        if getattr(self, "_worker_shutdown_started", False):
-            return
-        self._worker_shutdown_started = True
-        if self.worker_id:
-            with _FTE_REGISTRY_LOCK:
+        with _FTE_REGISTRY_LOCK:
+            if getattr(self, "_worker_shutdown_started", False):
+                return
+            self._worker_shutdown_started = True
+            if self.worker_id:
                 if _FTE_WORKER_HANDLES.get(str(self.worker_id)) is not self:
                     return
+        if self.worker_id:
             try:
                 self.mark_fte_worker_failed(
                     self.worker_id,

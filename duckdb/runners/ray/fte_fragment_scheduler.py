@@ -2427,46 +2427,60 @@ def _mark_fte_worker_failed(
             FteFragmentExecution | None,
         ]
     ] = []
-    with _FTE_REGISTRY_LOCK:
-        for failed_worker_id in sorted(failed_worker_ids):
-            failed_handle = _FTE_WORKER_HANDLES.get(failed_worker_id)
-            if failed_handle is not None:
+    try:
+        with _FTE_REGISTRY_LOCK:
+            for failed_worker_id in sorted(failed_worker_ids):
+                failed_handle = _FTE_WORKER_HANDLES.get(failed_worker_id)
+                if failed_handle is None or failed_handle is not failed_handles.get(failed_worker_id):
+                    continue
                 failed_handle_manager_instance_id = str(getattr(failed_handle, "manager_instance_id", ""))
                 if normalized_manager_instance_id is None:
                     normalized_manager_instance_id = failed_handle_manager_instance_id
                 elif failed_handle_manager_instance_id != normalized_manager_instance_id:
                     continue
-                _FTE_WORKER_HANDLES.pop(failed_worker_id, None)
                 failed_handle._fte_healthy = False
-                # A manager-driven shutdown owns the primary worker's later
-                # finish phase. Failure recovery has no such owner, so release
-                # the successfully quiesced actor's Ray resources here.
-                if failed_worker_id != worker_id or not getattr(
-                    failed_handle,
-                    "_worker_shutdown_started",
-                    False,
-                ):
+                retire_from_manager = getattr(failed_handle, "_retire_from_manager_for_failure", None)
+                if callable(retire_from_manager):
+                    failure_recovery_owns_shutdown = bool(retire_from_manager())
+                else:
+                    failure_recovery_owns_shutdown = failed_worker_id != worker_id or not getattr(
+                        failed_handle,
+                        "_worker_shutdown_started",
+                        False,
+                    )
+                failed_handle._fte_failure_retirement_completed = True
+                _FTE_WORKER_HANDLES.pop(failed_worker_id, None)
+                if failure_recovery_owns_shutdown:
                     handles_to_kill.append(failed_handle)
-        for owner_key, owner in list(_FTE_PARTITION_OWNERS.items()):
-            if query_id_filter is not None and owner_key[0] != query_id_filter:
-                continue
-            if str(owner.worker_id) not in failed_worker_ids:
-                continue
-            failed_owner_items.append(
-                (
-                    owner_key,
-                    owner,
-                    _FTE_FRAGMENT_EXECUTIONS.get((owner_key[0], owner_key[1])),
+            for owner_key, owner in list(_FTE_PARTITION_OWNERS.items()):
+                if query_id_filter is not None and owner_key[0] != query_id_filter:
+                    continue
+                if str(owner.worker_id) not in failed_worker_ids:
+                    continue
+                failed_owner_items.append(
+                    (
+                        owner_key,
+                        owner,
+                        _FTE_FRAGMENT_EXECUTIONS.get((owner_key[0], owner_key[1])),
+                    )
                 )
-            )
-            future = _FTE_PENDING_WORKER_RESERVATIONS.pop(owner_key, None)
-            if future is not None:
-                pending_worker_reservation_futures_to_cancel.append(future)
-        fragment_execution_items = [
-            item
-            for item in _FTE_FRAGMENT_EXECUTIONS.items()
-            if query_id_filter is None or item[0][0] == query_id_filter
-        ]
+                future = _FTE_PENDING_WORKER_RESERVATIONS.pop(owner_key, None)
+                if future is not None:
+                    pending_worker_reservation_futures_to_cancel.append(future)
+            fragment_execution_items = [
+                item
+                for item in _FTE_FRAGMENT_EXECUTIONS.items()
+                if query_id_filter is None or item[0][0] == query_id_filter
+            ]
+    finally:
+        # Native retirement transfers actor termination ownership to this
+        # failure path. Complete that handoff even if later retry bookkeeping
+        # raises, otherwise neither the registry nor the manager can reap it.
+        for handle in handles_to_kill:
+            try:
+                ray.kill(handle.actor_handle)
+            except Exception:
+                pass
 
     scheduling_requirements_by_owner_key: dict[
         tuple[str, str, int],
@@ -2516,11 +2530,6 @@ def _mark_fte_worker_failed(
             expected_owner=owner,
         )
 
-    for handle in handles_to_kill:
-        try:
-            ray.kill(handle.actor_handle)
-        except Exception:
-            pass
     for future in pending_worker_reservation_futures_to_cancel:
         future.cancel()
 

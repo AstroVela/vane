@@ -71,6 +71,9 @@ public:
 	void PrepareShutdown();
 	void FinishShutdown();
 	void AbortShutdown();
+	// Returns false when Python failure recovery retired the handle before the
+	// callback could be installed, so refresh must not commit this runtime.
+	bool InstallFailureRetirementCallback(py::object callback);
 
 	// worker interface
 	const WorkerId &Id() const {

@@ -5,6 +5,7 @@
 
 #include <unordered_map>
 #include <unordered_set>
+#include <atomic>
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
@@ -27,7 +28,8 @@ namespace ray {
 string SubmissionErrorOwnerQueryId(const std::vector<duckdb::distributed::WorkerTask> &tasks,
                                    const string &execution_query_id);
 
-class RayWorkerManager : public duckdb::distributed::WorkerManager {
+class RayWorkerManager : public duckdb::distributed::WorkerManager,
+                         public std::enable_shared_from_this<RayWorkerManager> {
 public:
 	RayWorkerManager();
 
@@ -68,6 +70,7 @@ private:
 		std::unordered_map<WorkerId, std::shared_ptr<RayWorkerRuntime>, WorkerIdHash, WorkerIdEqual> ray_workers;
 		std::pair<bool, std::chrono::steady_clock::time_point> last_refresh;
 		std::shared_ptr<WorkerRefreshFlight> worker_refresh;
+		idx_t worker_membership_version = 0;
 		std::unordered_map<string, std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>>>
 		    fte_result_handles_by_query;
 		std::unordered_map<string, std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>>>
@@ -106,6 +109,8 @@ private:
 
 	bool BeginOperation() const;
 	void EndOperation() const;
+	bool RetireWorkerForFailure(const string &worker_id, const std::shared_ptr<RayWorkerRuntime> &worker,
+	                            const std::shared_ptr<std::atomic<bool>> &retired) const;
 	WorkerSnapshotResult WorkerSnapshotsWithoutGIL() const;
 	static string QueryIdFromTaskEvents(const std::vector<duckdb::distributed::WorkerTask> &tasks);
 	void StoreFteResultHandles(const string &query_id,

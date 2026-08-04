@@ -73,6 +73,26 @@ void RayWorkerManager::EndOperation() const {
 	shutdown_cv_.notify_all();
 }
 
+bool RayWorkerManager::RetireWorkerForFailure(const string &worker_id, const std::shared_ptr<RayWorkerRuntime> &worker,
+                                              const std::shared_ptr<std::atomic<bool>> &retired) const {
+	std::shared_ptr<RayWorkerRuntime> retired_worker;
+	{
+		lock_guard<mutex> guard(mutex_);
+		if (state_.shutdown_started) {
+			return false;
+		}
+		retired->store(true);
+		auto entry = state_.ray_workers.find(duckdb::distributed::make_worker_id(worker_id));
+		if (entry != state_.ray_workers.end() && entry->second == worker) {
+			retired_worker = std::move(entry->second);
+			state_.ray_workers.erase(entry);
+			state_.worker_membership_version++;
+		}
+		state_.last_refresh = {};
+	}
+	return true;
+}
+
 std::string
 duckdb::distributed::python::ray::SubmissionErrorOwnerQueryId(const std::vector<duckdb::distributed::WorkerTask> &tasks,
                                                               const std::string &execution_query_id) {
@@ -517,6 +537,7 @@ RayWorkerManager::WorkerSnapshotResult RayWorkerManager::WorkerSnapshotsWithoutG
 	std::shared_ptr<WorkerRefreshFlight> refresh;
 	bool refresh_creator = false;
 	std::vector<string> existing_ids;
+	idx_t refresh_membership_version = 0;
 	{
 		lock_guard<mutex> guard(mutex_);
 		if (state_.shutdown_started) {
@@ -537,6 +558,7 @@ RayWorkerManager::WorkerSnapshotResult RayWorkerManager::WorkerSnapshotsWithoutG
 		if (state_.worker_refresh) {
 			refresh = state_.worker_refresh;
 		} else {
+			refresh_membership_version = state_.worker_membership_version;
 			existing_ids.reserve(state_.ray_workers.size());
 			for (auto &kv : state_.ray_workers) {
 				if (kv.first) {
@@ -564,7 +586,9 @@ RayWorkerManager::WorkerSnapshotResult RayWorkerManager::WorkerSnapshotsWithoutG
 
 	WorkerSnapshotResult refresh_result;
 	std::vector<std::shared_ptr<RayWorkerRuntime>> new_workers;
+	std::vector<std::shared_ptr<std::atomic<bool>>> new_worker_retirement_states;
 	bool worker_creation_succeeded = false;
+	auto weak_manager = weak_from_this();
 	{
 		duckdb::PythonGILWrapper gil;
 		try {
@@ -608,6 +632,24 @@ RayWorkerManager::WorkerSnapshotResult RayWorkerManager::WorkerSnapshotsWithoutG
 			if (!worker_validation_error.empty()) {
 				throw std::runtime_error(std::move(worker_validation_error));
 			}
+			for (auto &worker : new_workers) {
+				auto worker_id = *worker->Id();
+				auto weak_worker = std::weak_ptr<RayWorkerRuntime>(worker);
+				auto retired = std::make_shared<std::atomic<bool>>(false);
+				auto retire_callback = py::cpp_function([weak_manager, weak_worker, worker_id, retired]() {
+					auto manager = weak_manager.lock();
+					auto worker = weak_worker.lock();
+					if (!manager || !worker) {
+						retired->store(true);
+						return true;
+					}
+					return manager->RetireWorkerForFailure(worker_id, worker, retired);
+				});
+				if (!worker->InstallFailureRetirementCallback(std::move(retire_callback))) {
+					retired->store(true);
+				}
+				new_worker_retirement_states.push_back(std::move(retired));
+			}
 			worker_creation_succeeded = true;
 		} catch (const py::error_already_set &e) {
 			refresh_result = WorkerSnapshotResult::err(
@@ -624,14 +666,21 @@ RayWorkerManager::WorkerSnapshotResult RayWorkerManager::WorkerSnapshotsWithoutG
 	if (worker_creation_succeeded) {
 		try {
 			std::unordered_set<string> worker_ids;
-			std::vector<std::pair<WorkerId, std::shared_ptr<RayWorkerRuntime>>> new_entries;
+			struct NewWorkerEntry {
+				WorkerId id;
+				std::shared_ptr<RayWorkerRuntime> worker;
+				std::shared_ptr<std::atomic<bool>> retired;
+			};
+			std::vector<NewWorkerEntry> new_entries;
 			new_entries.reserve(new_workers.size());
-			for (auto &worker : new_workers) {
+			for (idx_t worker_idx = 0; worker_idx < new_workers.size(); worker_idx++) {
+				auto &worker = new_workers[worker_idx];
 				const auto &worker_id = *worker->Id();
 				if (!worker_ids.insert(worker_id).second) {
 					throw std::runtime_error("start_ray_workers returned duplicate worker id: " + worker_id);
 				}
-				new_entries.emplace_back(duckdb::distributed::make_worker_id(worker_id), worker);
+				new_entries.push_back(
+				    {duckdb::distributed::make_worker_id(worker_id), worker, new_worker_retirement_states[worker_idx]});
 			}
 
 			{
@@ -640,15 +689,23 @@ RayWorkerManager::WorkerSnapshotResult RayWorkerManager::WorkerSnapshotsWithoutG
 					refresh_result = WorkerSnapshotResult::err(
 					    DuckDBError::invalid_state_error("Ray worker manager shut down during worker refresh"));
 				} else {
+					const bool membership_changed = state_.worker_membership_version != refresh_membership_version;
 					auto updated_workers = state_.ray_workers;
+					idx_t inserted_workers = 0;
+					bool skipped_retired_worker = false;
 					for (auto &entry : new_entries) {
-						if (updated_workers.find(entry.first) != updated_workers.end()) {
-							throw std::runtime_error("start_ray_workers returned existing worker id: " + *entry.first);
+						if (entry.retired->load()) {
+							skipped_retired_worker = true;
+							continue;
 						}
-						auto inserted = updated_workers.emplace(entry.first, entry.second);
+						if (updated_workers.find(entry.id) != updated_workers.end()) {
+							throw std::runtime_error("start_ray_workers returned existing worker id: " + *entry.id);
+						}
+						auto inserted = updated_workers.emplace(entry.id, entry.worker);
 						if (!inserted.second) {
-							throw std::runtime_error("failed to stage worker id: " + *entry.first);
+							throw std::runtime_error("failed to stage worker id: " + *entry.id);
 						}
+						inserted_workers++;
 					}
 
 					std::vector<duckdb::distributed::WorkerSnapshot> snapshots;
@@ -658,7 +715,12 @@ RayWorkerManager::WorkerSnapshotResult RayWorkerManager::WorkerSnapshotsWithoutG
 						                       kv.second->TotalMemoryBytes());
 					}
 					state_.ray_workers.swap(updated_workers);
-					state_.last_refresh = std::make_pair(true, std::chrono::steady_clock::now());
+					if (inserted_workers > 0) {
+						state_.worker_membership_version++;
+					}
+					state_.last_refresh = membership_changed || skipped_retired_worker
+					                          ? std::pair<bool, std::chrono::steady_clock::time_point> {}
+					                          : std::make_pair(true, std::chrono::steady_clock::now());
 					refresh_result = WorkerSnapshotResult::ok(std::move(snapshots));
 				}
 			}

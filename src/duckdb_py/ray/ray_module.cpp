@@ -423,7 +423,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    return FteSplitQueueResultToDict(result);
 	    });
 
-	py::class_<RayWorkerManager>(m, "RayWorkerManager")
+	py::class_<RayWorkerManager, std::shared_ptr<RayWorkerManager>>(m, "RayWorkerManager")
 	    .def(py::init<>())
 	    .def("worker_snapshots",
 	         [](RayWorkerManager &self) {

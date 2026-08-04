@@ -14,7 +14,9 @@ import textwrap
 import threading
 import time
 import uuid
+from concurrent.futures import Future
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -2951,6 +2953,261 @@ def test_ray_worker_manager_instances_use_distinct_worker_scopes(monkeypatch):
 
     first_manager.shutdown()
     second_manager.shutdown()
+
+
+class _ImmediateShutdownRemote:
+    def __init__(self, actor, operation):
+        self.actor = actor
+        self.operation = operation
+
+    def remote(self):
+        future = Future()
+        if self.actor.killed:
+            future.set_exception(RuntimeError(f"{self.operation} reached killed actor"))
+        else:
+            self.actor.shutdown_calls.append(self.operation)
+            future.set_result(None)
+        return SimpleNamespace(future=lambda: future)
+
+
+class _FakeRayWorkerActor:
+    def __init__(self):
+        self.killed = False
+        self.shutdown_calls = []
+        self.prepare_shutdown = _ImmediateShutdownRemote(self, "prepare")
+        self.finish_shutdown = _ImmediateShutdownRemote(self, "finish")
+
+
+def test_ray_worker_manager_replaces_failure_retired_worker_before_shutdown(monkeypatch):
+    from duckdb.runners.ray.fragment_worker_client import RayWorkerActorHandle
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    start_calls = []
+    handles = []
+    actors = []
+
+    def start_ray_workers(existing_ids, manager_instance_id):
+        start_calls.append(tuple(existing_ids))
+        worker_id = f"{manager_instance_id}:node-a:0"
+        if worker_id in existing_ids:
+            return []
+        actor = _FakeRayWorkerActor()
+        handle = RayWorkerActorHandle(
+            actor,
+            memory_capacity_bytes=1024,
+            node_id="node-a",
+            worker_id=worker_id,
+            manager_instance_id=manager_instance_id,
+        )
+        actors.append(actor)
+        handles.append(handle)
+        return [duckdb.ray_cxx.RayWorkerRuntime(worker_id, handle, 1.0, 0.0, 1024)]
+
+    def kill_actor(actor, **_kwargs):
+        actor.killed = True
+
+    monkeypatch.setattr(ray_worker_handle, "start_ray_workers", start_ray_workers)
+    monkeypatch.setattr(ray_worker_handle.ray, "kill", kill_actor)
+    manager = duckdb.ray_cxx.RayWorkerManager()
+    shutdown_complete = False
+    try:
+        first_snapshots = manager.worker_snapshots()
+        assert len(first_snapshots) == 1
+        failed_worker_id = first_snapshots[0]["worker_id"]
+
+        assert (
+            ray_worker_handle._mark_fte_worker_failed(
+                failed_worker_id,
+                {"error_code": "WORKER_LOST", "message": "status RPC failed"},
+                manager_instance_id=handles[0].manager_instance_id,
+            )
+            == []
+        )
+        assert actors[0].killed
+
+        recovered_snapshots = manager.worker_snapshots()
+        assert [snapshot["worker_id"] for snapshot in recovered_snapshots] == [failed_worker_id]
+        assert start_calls == [(), ()]
+        assert len(handles) == 2
+
+        manager.shutdown()
+        shutdown_complete = True
+        assert actors[1].shutdown_calls == ["prepare", "finish"]
+        assert actors[1].killed
+    finally:
+        if not shutdown_complete:
+            try:
+                manager.shutdown()
+            except Exception:
+                pass
+
+
+@pytest.mark.parametrize("failure_timing", ["before_callback", "during_callback"])
+def test_ray_worker_manager_does_not_commit_worker_retired_during_refresh(monkeypatch, failure_timing):
+    from duckdb.runners.ray.fragment_worker_client import RayWorkerActorHandle
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    class FailWhenRetirementCallbackIsInstalled(RayWorkerActorHandle):
+        def __setattr__(self, name, value):
+            super().__setattr__(name, value)
+            if name != "_retire_from_manager_for_failure" or getattr(self, "_failure_published", False):
+                return
+            self._failure_published = True
+            ray_worker_handle._mark_fte_worker_failed(
+                self.worker_id,
+                {"error_code": "WORKER_LOST", "message": "failed during refresh"},
+                manager_instance_id=self.manager_instance_id,
+            )
+
+    start_calls = []
+    handles = []
+    actors = []
+
+    def start_ray_workers(existing_ids, manager_instance_id):
+        start_calls.append(tuple(existing_ids))
+        worker_id = f"{manager_instance_id}:node-a:0"
+        if worker_id in existing_ids:
+            return []
+        actor = _FakeRayWorkerActor()
+        handle_type = (
+            FailWhenRetirementCallbackIsInstalled
+            if not handles and failure_timing == "during_callback"
+            else RayWorkerActorHandle
+        )
+        handle = handle_type(
+            actor,
+            memory_capacity_bytes=1024,
+            node_id="node-a",
+            worker_id=worker_id,
+            manager_instance_id=manager_instance_id,
+        )
+        actors.append(actor)
+        handles.append(handle)
+        runtime = duckdb.ray_cxx.RayWorkerRuntime(worker_id, handle, 1.0, 0.0, 1024)
+        if len(handles) == 1 and failure_timing == "before_callback":
+            ray_worker_handle._mark_fte_worker_failed(
+                worker_id,
+                {"error_code": "WORKER_LOST", "message": "failed before callback installation"},
+                manager_instance_id=manager_instance_id,
+            )
+        return [runtime]
+
+    def kill_actor(actor, **_kwargs):
+        actor.killed = True
+
+    monkeypatch.setattr(ray_worker_handle, "start_ray_workers", start_ray_workers)
+    monkeypatch.setattr(ray_worker_handle.ray, "kill", kill_actor)
+    manager = duckdb.ray_cxx.RayWorkerManager()
+    shutdown_complete = False
+    try:
+        assert manager.worker_snapshots() == []
+        assert actors[0].shutdown_calls == ["prepare"]
+        assert actors[0].killed
+
+        recovered_snapshots = manager.worker_snapshots()
+        assert len(recovered_snapshots) == 1
+        assert start_calls == [(), ()]
+
+        manager.shutdown()
+        shutdown_complete = True
+        assert actors[1].shutdown_calls == ["prepare", "finish"]
+        assert actors[1].killed
+    finally:
+        if not shutdown_complete:
+            try:
+                manager.shutdown()
+            except Exception:
+                pass
+
+
+def test_ray_worker_failure_retirement_is_linearized_with_manager_shutdown(monkeypatch):
+    from duckdb.runners.ray.fragment_worker_client import RayWorkerActorHandle
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    actor = _FakeRayWorkerActor()
+    handles = []
+    kill_phases = []
+
+    def start_ray_workers(existing_ids, manager_instance_id):
+        worker_id = f"{manager_instance_id}:node-a:0"
+        if worker_id in existing_ids:
+            return []
+        handle = RayWorkerActorHandle(
+            actor,
+            memory_capacity_bytes=1024,
+            node_id="node-a",
+            worker_id=worker_id,
+            manager_instance_id=manager_instance_id,
+        )
+        handles.append(handle)
+        return [duckdb.ray_cxx.RayWorkerRuntime(worker_id, handle, 1.0, 0.0, 1024)]
+
+    def kill_actor(target, **_kwargs):
+        assert target is actor
+        kill_phases.append(tuple(actor.shutdown_calls))
+        actor.killed = True
+
+    monkeypatch.setattr(ray_worker_handle, "start_ray_workers", start_ray_workers)
+    monkeypatch.setattr(ray_worker_handle.ray, "kill", kill_actor)
+    manager = duckdb.ray_cxx.RayWorkerManager()
+    failed_worker_id = manager.worker_snapshots()[0]["worker_id"]
+    failed_handle = handles[0]
+    native_retire = failed_handle._retire_from_manager_for_failure
+    retirement_entered = threading.Event()
+    release_retirement = threading.Event()
+    shutdown_entered = threading.Event()
+    original_begin_shutdown = failed_handle._begin_worker_shutdown
+
+    def blocked_retire():
+        retirement_entered.set()
+        assert release_retirement.wait(timeout=5)
+        return native_retire()
+
+    def observed_begin_shutdown():
+        shutdown_entered.set()
+        return original_begin_shutdown()
+
+    failed_handle._retire_from_manager_for_failure = blocked_retire
+    failed_handle._begin_worker_shutdown = observed_begin_shutdown
+    failure_errors = []
+    shutdown_errors = []
+
+    def mark_failed():
+        try:
+            ray_worker_handle._mark_fte_worker_failed(
+                failed_worker_id,
+                {"error_code": "WORKER_LOST", "message": "status RPC failed"},
+                manager_instance_id=failed_handle.manager_instance_id,
+            )
+        except BaseException as exc:
+            failure_errors.append(exc)
+
+    def shutdown_manager():
+        try:
+            manager.shutdown()
+        except BaseException as exc:
+            shutdown_errors.append(exc)
+
+    failure_thread = threading.Thread(target=mark_failed, daemon=True)
+    shutdown_thread = threading.Thread(target=shutdown_manager, daemon=True)
+    failure_thread.start()
+    shutdown_thread_started = False
+    try:
+        assert retirement_entered.wait(timeout=5)
+        shutdown_thread.start()
+        shutdown_thread_started = True
+        assert shutdown_entered.wait(timeout=5)
+    finally:
+        release_retirement.set()
+        failure_thread.join(timeout=5)
+        if shutdown_thread_started:
+            shutdown_thread.join(timeout=5)
+
+    assert not failure_thread.is_alive()
+    assert not shutdown_thread_started or not shutdown_thread.is_alive()
+    assert failure_errors == []
+    assert shutdown_errors == []
+    assert kill_phases == [("prepare", "prepare", "finish")]
 
 
 def test_ray_worker_manager_worker_snapshot_refresh_is_single_flight(monkeypatch):
