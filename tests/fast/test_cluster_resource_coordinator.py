@@ -50,7 +50,7 @@ def _demand(
         desired=desired,
         weight=weight,
         priority=priority,
-        task_bundles=() if minimum.is_zero() else (minimum,),
+        placement_bundles=() if minimum.is_zero() else (minimum,),
     )
 
 
@@ -407,21 +407,21 @@ def test_query_desired_resources_are_downward_caps_not_capacity_overrides():
     assert allocation.resources == _r(cpu=3, heap=300, store=400)
 
 
-def test_query_demand_rejects_object_store_hard_minimum_and_task_bundles():
+def test_query_demand_rejects_object_store_hard_minimum_and_placement_bundles():
     with pytest.raises(ValueError, match="minimum query resources may not hard-reserve object-store bytes"):
         QueryDemand(
             query_id="minimum-store",
             minimum=_r(cpu=1, store=1),
             desired=_r(cpu=1, store=10),
-            task_bundles=(_r(cpu=1, store=1),),
+            placement_bundles=(_r(cpu=1, store=1),),
         )
 
-    with pytest.raises(ValueError, match="task resource bundles may not hard-reserve object-store bytes"):
+    with pytest.raises(ValueError, match="placement bundles may not hard-reserve object-store bytes"):
         QueryDemand(
             query_id="task-store",
             minimum=_r(cpu=1),
             desired=_r(cpu=1, store=10),
-            task_bundles=(_r(cpu=1, store=1),),
+            placement_bundles=(_r(cpu=1, store=1),),
         )
 
 
@@ -499,7 +499,7 @@ def test_task_bundle_matching_reassigns_an_earlier_best_fit():
             query_id="alternating-path",
             minimum=minimum,
             desired=minimum,
-            task_bundles=(cpu_bundle, mixed_bundle, gpu_bundle),
+            placement_bundles=(cpu_bundle, mixed_bundle, gpu_bundle),
         ),
         now=0,
     )
@@ -510,7 +510,7 @@ def test_task_bundle_matching_reassigns_an_earlier_best_fit():
     assert {by_node["cpu-node"], by_node["shared-node"]} == {cpu_bundle, mixed_bundle}
 
 
-def test_minimum_task_vector_must_fit_one_node_not_cross_node_dimensions():
+def test_minimum_placement_vector_must_fit_one_node_not_cross_node_dimensions():
     coordinator = ClusterQueryResourceCoordinator(
         (
             _node("cpu-node", cpu=2, heap=1, store=1),

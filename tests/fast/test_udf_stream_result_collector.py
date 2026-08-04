@@ -3146,7 +3146,7 @@ def test_remote_provider_capability_error_preserves_safe_details():
     def submitter(lease):
         payload = {
             "query_id": lease["query_id"],
-            "stage_id": lease["stage_id"],
+            "resource_unit_id": lease["resource_unit_id"],
             "task_lease_id": lease["lease_id"],
             "attempt_id": lease["attempt_id"],
         }

@@ -2675,7 +2675,7 @@ def test_provider_capability_error_redacts_upstream_credentials_and_round_trips(
     _, stream_metadata = make_stream_error_pair(
         {
             "query_id": "query",
-            "stage_id": "stage",
+            "resource_unit_id": "resource:query:node:1:udf",
             "task_lease_id": "lease",
             "attempt_id": "attempt",
         },

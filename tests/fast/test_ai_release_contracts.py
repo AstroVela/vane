@@ -197,7 +197,7 @@ def test_non_capability_provider_failures_are_safe_before_execution_wires(monkey
         _, ray_metadata = make_stream_error_pair(
             {
                 "query_id": "query",
-                "stage_id": "stage",
+                "resource_unit_id": "resource:query:node:1:udf",
                 "task_lease_id": "lease",
                 "attempt_id": "attempt",
             },

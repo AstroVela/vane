@@ -88,7 +88,7 @@ class QueryDemand:
     desired: ResourceVector
     weight: float = 1.0
     priority: int = 0
-    task_bundles: tuple[ResourceVector, ...] = ()
+    placement_bundles: tuple[ResourceVector, ...] = ()
 
     def __post_init__(self) -> None:
         query_id = str(self.query_id).strip()
@@ -100,20 +100,20 @@ class QueryDemand:
         weight = float(self.weight)
         if not math.isfinite(weight) or weight <= 0:
             raise ValueError("weight must be finite and > 0")
-        task_bundles = tuple(self.task_bundles)
+        placement_bundles = tuple(self.placement_bundles)
         if self.minimum.object_store_bytes != 0:
             raise ValueError("minimum query resources may not hard-reserve object-store bytes")
-        if any(bundle.object_store_bytes != 0 for bundle in task_bundles):
-            raise ValueError("task resource bundles may not hard-reserve object-store bytes")
-        task_total = _sum_resources(task_bundles)
-        if task_total != self.minimum:
-            raise ValueError("task_bundles must exactly equal minimum query resources")
-        if not task_total.fits_within(self.desired):
+        if any(bundle.object_store_bytes != 0 for bundle in placement_bundles):
+            raise ValueError("placement bundles may not hard-reserve object-store bytes")
+        placement_total = _sum_resources(placement_bundles)
+        if placement_total != self.minimum:
+            raise ValueError("placement_bundles must exactly equal minimum query resources")
+        if not placement_total.fits_within(self.desired):
             raise ValueError("minimum placement bundles exceed desired query resources")
         object.__setattr__(self, "query_id", query_id)
         object.__setattr__(self, "weight", weight)
         object.__setattr__(self, "priority", int(self.priority))
-        object.__setattr__(self, "task_bundles", task_bundles)
+        object.__setattr__(self, "placement_bundles", placement_bundles)
 
 
 @dataclass
@@ -420,7 +420,7 @@ class ClusterQueryResourceCoordinator:
         )
         for state in ordered:
             query_id = state.demand.query_id
-            placement = self._place_task_bundles(state.demand.task_bundles, remaining)
+            placement = self._place_bundles(state.demand.placement_bundles, remaining)
             if placement is None:
                 continue
             trial_remaining, trial_allocations = placement
@@ -472,12 +472,12 @@ class ClusterQueryResourceCoordinator:
                 state.state = "ALLOCATION_DEBT"
                 state.rejection_reason = "live query hard-resource leases exceed the current allocation"
 
-    def _place_task_bundles(
+    def _place_bundles(
         self,
         bundles: Sequence[ResourceVector],
         remaining: Mapping[str, ResourceVector],
     ) -> tuple[dict[str, ResourceVector], dict[str, ResourceVector]] | None:
-        """Match indivisible capability envelopes to distinct Ray nodes.
+        """Match indivisible task/actor capability envelopes to distinct Ray nodes.
 
         The graph builder emits at most one envelope for each concrete source
         node: if one node could run two task-shape groups, it would have merged
@@ -566,7 +566,7 @@ class ClusterQueryResourceCoordinator:
             # tests also fault-inject it to verify registration rollback.
             selected_remaining = {node_id: placed_remaining[node_id]}
             if self._place_bundle(bundle, selected_remaining) is None:
-                raise RuntimeError("matched task bundle unexpectedly became unplaceable")
+                raise RuntimeError("matched placement bundle unexpectedly became unplaceable")
             placed_remaining[node_id] = selected_remaining[node_id]
             allocations[node_id] = bundle
         return placed_remaining, allocations
