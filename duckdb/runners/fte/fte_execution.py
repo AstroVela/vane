@@ -55,7 +55,12 @@ from duckdb.runners.fte.fte_state import (
     fte_task_execution_class_from_metadata,
     fte_task_execution_class_metadata_present,
 )
-from duckdb.runners.fte.fte_types import FteTaskAttemptId, FteTaskId, _check_non_negative
+from duckdb.runners.fte.fte_types import (
+    FteTaskAttemptId,
+    FteTaskId,
+    _check_non_negative,
+    validate_fte_status_identity,
+)
 from duckdb.runners.fte.fte_update_batch import (
     _estimated_payload_bytes,
     fte_task_update_max_payload_bytes,
@@ -166,6 +171,9 @@ class FteTaskPartition:
         self.selected_attempt: int | None = None
         self.finished_attempts: dict[int, FinishedAttempt] = {}
         self.selected_output_stats: Any = None
+        self.finalizing_attempt: int | None = None
+        self._finalizing_output_stats: Any = None
+        self.revoking_attempts: set[int] = set()
         self.failures: list[dict[str, Any]] = []
         self.ready_for_scheduling = bool(self.sealed)
         self.execution_ready_deferred = False
@@ -182,6 +190,8 @@ class FteTaskPartition:
             return FtePartitionState.FINISHED
         if self.failed:
             return FtePartitionState.FAILED
+        if self.finalizing_attempt is not None:
+            return FtePartitionState.FINALIZING
         if self.running_attempts:
             return FtePartitionState.RUNNING
         if self.sealed:
@@ -304,36 +314,77 @@ class FteTaskPartition:
         self._invalidate_placement()
         return True
 
-    def mark_attempt_finished(
+    def begin_attempt_finalization(
         self,
         attempt_id: FteTaskAttemptId | str | Mapping[str, Any],
         output_stats: Any = None,
     ) -> bool:
         attempt = FteTaskAttemptId.coerce(attempt_id)
         self._validate_attempt_task(attempt)
+        if self.finished or self.failed or self.finalizing_attempt is not None:
+            return False
+        if attempt.attempt_id in self.revoking_attempts:
+            return False
+        if attempt.attempt_id not in self.running_attempts:
+            return False
+        self._invalidate_placement()
+        task_stats = self.running_task_stats.get(attempt.attempt_id)
+        self.finalizing_attempt = attempt.attempt_id
+        if isinstance(task_stats, Mapping) and isinstance(output_stats, Mapping):
+            selected = dict(task_stats)
+            selected.update(output_stats)
+            self._finalizing_output_stats = selected
+        elif output_stats is not None:
+            self._finalizing_output_stats = output_stats
+        else:
+            self._finalizing_output_stats = task_stats
+        return True
+
+    def commit_attempt_finalization(
+        self,
+        attempt_id: FteTaskAttemptId | str | Mapping[str, Any],
+    ) -> bool:
+        attempt = FteTaskAttemptId.coerce(attempt_id)
+        self._validate_attempt_task(attempt)
+        if self.finished or self.failed or self.finalizing_attempt != attempt.attempt_id:
+            return False
         running = self.running_attempts.pop(attempt.attempt_id, None)
         if running is None:
             return False
         self._invalidate_placement()
-        task_stats = self.running_task_stats.pop(attempt.attempt_id, None)
         self.finished = True
         self.failed = False
         self.selected_attempt = attempt.attempt_id
-        if isinstance(task_stats, Mapping) and isinstance(output_stats, Mapping):
-            selected = dict(task_stats)
-            selected.update(output_stats)
-            self.selected_output_stats = selected
-        elif output_stats is not None:
-            self.selected_output_stats = output_stats
-        else:
-            self.selected_output_stats = task_stats
+        self.selected_output_stats = self._finalizing_output_stats
         self.finished_attempts[attempt.attempt_id] = FinishedAttempt(
             attempt,
             sink_instance=running.sink_instance,
             output_stats=self.selected_output_stats,
         )
+        self.finalizing_attempt = None
+        self._finalizing_output_stats = None
         self.running_attempts.clear()
         self.running_task_stats.clear()
+        self.revoking_attempts.clear()
+        return True
+
+    def fail_attempt_finalization(
+        self,
+        attempt_id: FteTaskAttemptId | str | Mapping[str, Any],
+        error: Mapping[str, Any],
+    ) -> bool:
+        attempt = FteTaskAttemptId.coerce(attempt_id)
+        self._validate_attempt_task(attempt)
+        if self.finished or self.finalizing_attempt != attempt.attempt_id:
+            return False
+        self.failed = True
+        self.failure_observed = True
+        self.ready_for_scheduling = False
+        self.execution_ready_deferred = False
+        self.failures.append(dict(error))
+        self.finalizing_attempt = None
+        self._finalizing_output_stats = None
+        self._invalidate_placement()
         return True
 
     def mark_attempt_failed(
@@ -346,6 +397,16 @@ class FteTaskPartition:
         attempt = FteTaskAttemptId.coerce(attempt_id)
         self._validate_attempt_task(attempt)
         if self.finished:
+            return None
+        if self.finalizing_attempt is not None:
+            if attempt.attempt_id == self.finalizing_attempt:
+                return None
+            running = self.running_attempts.pop(attempt.attempt_id, None)
+            if running is None:
+                return None
+            self.running_task_stats.pop(attempt.attempt_id, None)
+            self.revoking_attempts.discard(attempt.attempt_id)
+            self._invalidate_placement()
             return None
         running = self.running_attempts.pop(attempt.attempt_id, None)
         if running is None:
@@ -388,6 +449,7 @@ class FteTaskPartition:
         if running is None:
             return None
         self._invalidate_placement()
+        self.revoking_attempts.discard(attempt.attempt_id)
 
         self.failure_observed = True
         self.failures.append(error)
@@ -534,6 +596,7 @@ class FteFragmentExecution:
         self.failed = False
         self.no_more_partitions = False
         self._state_lock = threading.RLock()
+        self._exchange_lock = threading.RLock()
         # Serialize validate/admit/commit while cross-fragment attempt admission
         # runs without the state lock.  The lock order is scheduling -> state.
         self._attempt_scheduling_lock = threading.RLock()
@@ -566,7 +629,11 @@ class FteFragmentExecution:
                 existing._invalidate_placement()
             return existing
         task_id = FteTaskId(self.query_id, self.fragment_execution_id, partition_id)
-        sink_handle = self.exchange.add_sink(partition_id) if self.exchange is not None else None
+        if self.exchange is None:
+            sink_handle = None
+        else:
+            with self._exchange_lock:
+                sink_handle = self.exchange.add_sink(partition_id)
         descriptor = TaskDescriptor(
             task_id,
             self.fragment_id,
@@ -1187,6 +1254,8 @@ class FteFragmentExecution:
         remote_handle: Any,
         attempt_id: FteTaskAttemptId,
     ) -> None:
+        if remote_handle is None:
+            return
         record_without_drain = getattr(
             remote_handle,
             "record_fte_task_result_ready_without_drain",
@@ -1202,6 +1271,8 @@ class FteFragmentExecution:
         remote_handle: Any,
         attempt_id: FteTaskAttemptId,
     ) -> None:
+        if remote_handle is None:
+            return
         record_without_drain = getattr(
             remote_handle,
             "record_fte_task_terminal_without_drain",
@@ -1309,12 +1380,15 @@ class FteFragmentExecution:
         attempt = FteTaskAttemptId.coerce(attempt_id)
         failure = _normalize_failure_payload(error)
         should_schedule = False
+        exchange_abort: tuple[Any, int] | None = None
         with self._state_lock:
             partition = self.partitions[attempt.partition_id]
+            if partition.finalizing_attempt == attempt.attempt_id:
+                return None
             running = partition.running_attempts.get(attempt.attempt_id)
             failure_retryable = retryable and _failure_allows_retry(failure)
             if self.exchange is not None and partition.sink_handle is not None:
-                self.exchange.sink_aborted(partition.sink_handle, attempt.attempt_id)
+                exchange_abort = (partition.sink_handle, attempt.attempt_id)
             ready = partition.mark_attempt_failed(attempt, failure, retryable=failure_retryable)
             if ready is not None and _is_memory_failure(failure):
                 partition.failed = True
@@ -1333,8 +1407,14 @@ class FteFragmentExecution:
                         partition.mark_ready_for_execution()
                         should_schedule = True
 
-        if running is not None:
-            self._record_task_terminal_without_drain(running.remote_handle, attempt)
+        try:
+            if exchange_abort is not None:
+                with self._exchange_lock:
+                    assert self.exchange is not None
+                    self.exchange.sink_aborted(*exchange_abort)
+        finally:
+            if running is not None:
+                self._record_task_terminal_without_drain(running.remote_handle, attempt)
         if not should_schedule or not schedule_retry:
             return None
         return self._schedule_partition_if_ready(attempt.partition_id)
@@ -1355,47 +1435,117 @@ class FteFragmentExecution:
             "SPECULATIVE_ATTEMPT_REVOKED",
             reason or "speculative task revoked",
         )
-        try:
-            with self._state_lock:
-                reached_limit = False
-                for partition in self.partitions.values():
-                    if partition.finished or partition.failed or not partition.execution_class.is_speculative:
+        candidates: list[tuple[FteTaskPartition, RunningAttempt]] = []
+        with self._state_lock:
+            for partition in self.partitions.values():
+                if (
+                    partition.finished
+                    or partition.failed
+                    or partition.finalizing_attempt is not None
+                    or not partition.execution_class.is_speculative
+                ):
+                    continue
+                for running in sorted(
+                    partition.running_attempts.values(), key=lambda value: value.attempt_id.attempt_id
+                ):
+                    if worker_id is not None and str(running.worker_id or "") != str(worker_id):
                         continue
-                    running_attempts = sorted(
-                        partition.running_attempts.values(), key=lambda running: running.attempt_id.attempt_id
-                    )
-                    for running in running_attempts:
-                        if worker_id is not None and str(running.worker_id or "") != str(worker_id):
-                            continue
-                        try:
-                            if running.remote_handle is not None:
-                                running.remote_handle.fte_cancel_task(running.attempt_id.to_dict())
-                        except Exception as exc:
-                            raise self._worker_control_failure(
-                                running,
-                                "fte_cancel_task",
-                                exc,
-                            ) from exc
-                        if self.exchange is not None and partition.sink_handle is not None:
-                            self.exchange.sink_aborted(partition.sink_handle, running.attempt_id.attempt_id)
-                        revoked_attempt = partition.revoke_attempt(
-                            running.attempt_id,
-                            failure,
-                        )
-                        if revoked_attempt is None:
-                            continue
-                        pressure_releases.append((running.remote_handle, running.attempt_id))
-                        revoked.append(revoked_attempt)
-                        self.failed = self.failed or partition.failed
-                        if limit is not None and len(revoked) >= limit:
-                            reached_limit = True
-                            break
-                    if reached_limit:
+                    if running.attempt_id.attempt_id in partition.revoking_attempts:
+                        continue
+                    partition.revoking_attempts.add(running.attempt_id.attempt_id)
+                    candidates.append((partition, running))
+                    if limit is not None and len(candidates) >= limit:
                         break
+                if limit is not None and len(candidates) >= limit:
+                    break
+
+        cancel_failures: list[FteWorkerControlFailure] = []
+        try:
+            quiesced, cancel_failures = self._cancel_running_attempts([running for _, running in candidates])
+            quiesced_ids = {str(running.attempt_id) for running in quiesced}
+            pressure_releases.extend((running.remote_handle, running.attempt_id) for running in quiesced)
+            for partition, running in candidates:
+                attempt_number = running.attempt_id.attempt_id
+                if str(running.attempt_id) not in quiesced_ids:
+                    continue
+                if self.exchange is not None and partition.sink_handle is not None:
+                    with self._exchange_lock:
+                        self.exchange.sink_aborted(partition.sink_handle, attempt_number)
+                with self._state_lock:
+                    if partition.finalizing_attempt is not None:
+                        continue
+                    revoked_attempt = partition.revoke_attempt(running.attempt_id, failure)
+                    if revoked_attempt is None:
+                        continue
+                    revoked.append(revoked_attempt)
+                    self.failed = self.failed or partition.failed
         finally:
+            with self._state_lock:
+                for partition, running in candidates:
+                    partition.revoking_attempts.discard(running.attempt_id.attempt_id)
             for remote_handle, attempt in pressure_releases:
                 self._record_task_terminal_without_drain(remote_handle, attempt)
+        if cancel_failures:
+            raise cancel_failures[0]
         return revoked
+
+    def _cancel_running_attempts(
+        self,
+        running_attempts: list[RunningAttempt],
+    ) -> tuple[list[RunningAttempt], list[FteWorkerControlFailure]]:
+        quiesced: list[RunningAttempt] = []
+        failures: list[FteWorkerControlFailure] = []
+        pending: list[tuple[RunningAttempt, Any, Any]] = []
+
+        for running in running_attempts:
+            worker = running.remote_handle
+            if worker is None:
+                failures.append(
+                    self._worker_control_failure(
+                        running,
+                        "fte_cancel_task",
+                        RuntimeError("running FTE loser is missing its mandatory worker control handle"),
+                    )
+                )
+                continue
+            try:
+                cancellation = worker.enqueue_fte_cancel_task(running.attempt_id.to_dict())
+                resolve = worker.resolve_fte_cancel_task
+            except Exception as exc:
+                failures.append(self._worker_control_failure(running, "fte_cancel_task", exc))
+            else:
+                pending.append((running, resolve, cancellation))
+
+        for running, resolve, cancellation in pending:
+            try:
+                status = resolve(cancellation)
+                self._validate_cancellation_status(running, status)
+            except Exception as exc:
+                failures.append(self._worker_control_failure(running, "fte_cancel_task", exc))
+            else:
+                quiesced.append(running)
+        return quiesced, failures
+
+    @staticmethod
+    def _validate_cancellation_status(running: RunningAttempt, status: Any) -> None:
+        if not isinstance(status, Mapping):
+            raise TypeError("fte_cancel_task must return a mapping")
+        validate_fte_status_identity(status, running.attempt_id)
+        raw_state = status.get("state")
+        try:
+            state = raw_state if isinstance(raw_state, FteTaskState) else FteTaskState(str(raw_state))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"unknown FTE task state in cancellation barrier: {raw_state!r}") from exc
+        if state not in {
+            FteTaskState.FINISHED,
+            FteTaskState.FAILED,
+            FteTaskState.CANCELED,
+            FteTaskState.ABORTED,
+        }:
+            raise RuntimeError(
+                f"FTE cancellation barrier did not reach a terminal task state: "
+                f"task={running.attempt_id} state={state.value}"
+            )
 
     def mark_worker_failed(
         self,
@@ -1438,36 +1588,63 @@ class FteFragmentExecution:
     ) -> bool:
         attempt = FteTaskAttemptId.coerce(attempt_id)
         pressure_releases: list[tuple[str, Any, FteTaskAttemptId]] = []
+        cancel_failure: FteWorkerControlFailure | None = None
+        partition: FteTaskPartition | None = None
         try:
             with self._state_lock:
                 partition = self.partitions[attempt.partition_id]
-                running_attempts = list(partition.running_attempts.values())
                 running = partition.running_attempts.get(attempt.attempt_id)
+                changed = partition.begin_attempt_finalization(attempt, output_stats)
+                if not changed:
+                    return False
+                running_attempts = list(partition.running_attempts.values())
                 unselected_running = [
                     item for item in running_attempts if item.attempt_id.attempt_id != attempt.attempt_id
                 ]
-                changed = partition.mark_attempt_finished(attempt, output_stats)
-                cancel_failure: FteWorkerControlFailure | None = None
-                if changed:
-                    if running is not None:
-                        pressure_releases.append(("result_ready", running.remote_handle, attempt))
-                    for loser in unselected_running:
-                        try:
-                            if loser.remote_handle is not None:
-                                loser.remote_handle.fte_cancel_task(loser.attempt_id.to_dict())
-                        except Exception as exc:
-                            if cancel_failure is None:
-                                cancel_failure = self._worker_control_failure(
-                                    loser,
-                                    "fte_cancel_task",
-                                    exc,
-                                )
-                        if self.exchange is not None and partition.sink_handle is not None:
-                            self.exchange.sink_aborted(partition.sink_handle, loser.attempt_id.attempt_id)
-                        pressure_releases.append(("terminal", loser.remote_handle, loser.attempt_id))
+            if running is not None:
+                pressure_releases.append(("result_ready", running.remote_handle, attempt))
+
+            quiesced, cancel_failures = self._cancel_running_attempts(unselected_running)
+            pressure_releases.extend(("terminal", loser.remote_handle, loser.attempt_id) for loser in quiesced)
+            with self._exchange_lock:
+                for loser in quiesced:
                     if self.exchange is not None and partition.sink_handle is not None:
+                        self.exchange.sink_aborted(partition.sink_handle, loser.attempt_id.attempt_id)
+
+            if cancel_failures:
+                cancel_failure = cancel_failures[0]
+                with self._state_lock:
+                    if partition.fail_attempt_finalization(
+                        attempt,
+                        _failure_payload(
+                            "LOSER_CANCELLATION_FAILED",
+                            str(cancel_failure),
+                        ),
+                    ):
+                        self.failed = True
+            else:
+                if self.exchange is not None and partition.sink_handle is not None:
+                    with self._exchange_lock:
                         self.exchange.sink_finished(partition.sink_handle, attempt.attempt_id)
-                    self.descriptor_storage.remove(partition.task_id)
+                with self._state_lock:
+                    if partition.failed or partition.finalizing_attempt != attempt.attempt_id:
+                        raise RuntimeError(f"FTE partition finalization lost ownership: {attempt}")
+                    changed = partition.commit_attempt_finalization(attempt)
+                if not changed:
+                    raise RuntimeError(f"FTE partition finalization lost ownership: {attempt}")
+                self.descriptor_storage.remove(partition.task_id)
+        except BaseException as exc:
+            if partition is not None:
+                with self._state_lock:
+                    if partition.fail_attempt_finalization(
+                        attempt,
+                        _failure_payload(
+                            "PARTITION_FINALIZATION_FAILED",
+                            str(exc) or type(exc).__name__,
+                        ),
+                    ):
+                        self.failed = True
+            raise
         finally:
             for release_kind, remote_handle, released_attempt in pressure_releases:
                 if release_kind == "result_ready":
@@ -1531,6 +1708,7 @@ class FteFragmentExecution:
                     {
                         "partition_id": int(partition_id),
                         "running": bool(partition.running_attempts),
+                        "finalizing": partition.finalizing_attempt is not None,
                         "failed": bool(partition.failed),
                         "finished": bool(partition.finished),
                         "selected_attempt": partition.selected_attempt,
@@ -1578,12 +1756,13 @@ class FteFragmentExecution:
             )
         worker_id, worker = self._select_worker(partition)
         if self.exchange is not None:
-            if partition.sink_handle is None:
-                partition.sink_handle = self.exchange.add_sink(partition.task_id.partition_id)
-            sink_instance = self.exchange.instantiate_sink(
-                partition.sink_handle,
-                partition.next_attempt_number(),
-            )
+            with self._exchange_lock:
+                if partition.sink_handle is None:
+                    partition.sink_handle = self.exchange.add_sink(partition.task_id.partition_id)
+                sink_instance = self.exchange.instantiate_sink(
+                    partition.sink_handle,
+                    partition.next_attempt_number(),
+                )
         scheduled = partition.start_attempt(
             sink_instance=sink_instance,
             worker_id=worker_id,

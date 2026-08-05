@@ -184,6 +184,7 @@ class _FakeActor:
         self.fte_ack_task_result = _FakeRemoteMethod(self._fte_ack_task_result)
         self.fte_release_task_result = _FakeRemoteMethod(self._fte_release_task_result)
         self.fte_cancel_task = _FakeRemoteMethod(self._fte_cancel_task)
+        self.fte_interrupt_query = _FakeRemoteMethod(self._fte_interrupt_query)
         self.fte_drop_query = _FakeRemoteMethod(self._fte_drop_query)
         self.fte_prepare_drop_query = _FakeRemoteMethod(self._fte_drop_query)
         self.fte_cleanup_query = _FakeRemoteMethod(self._fte_cleanup_query)
@@ -267,6 +268,10 @@ class _FakeActor:
     def _fte_cancel_task(self, task_id, dependency=None):
         self.fte_calls.append(("cancel", task_id))
         return self._control_status("fte_cancel_task", task_id, state="CANCELED")
+
+    def _fte_interrupt_query(self, query_id):
+        self.fte_calls.append(("interrupt_query", query_id))
+        return {"native_interrupt_errors": 0}
 
     def _fte_drop_query(self, query_id):
         self.fte_calls.append(("drop_query", query_id))
@@ -997,6 +1002,7 @@ def test_fte_worker_actor_handle_wraps_control_rpcs():
         "ack",
         "release",
         "cancel",
+        "interrupt_query",
         "drop_query",
         "cleanup_query",
     ]
@@ -1931,8 +1937,16 @@ def test_fte_control_ref_preserves_query_deadline_when_wait_expires(monkeypatch)
         pending.cancel()
 
 
-def test_fte_cancel_barrier_outlives_configured_control_timeouts(monkeypatch):
-    query_id = "query-cancel-barrier-timeout"
+@pytest.mark.parametrize(
+    ("expired_query_deadline", "expected_error"),
+    [(False, TimeoutError), (True, QueryDeadlineExceeded)],
+)
+def test_fte_cancel_barrier_times_out_but_retains_teardown_ownership(
+    monkeypatch,
+    expired_query_deadline,
+    expected_error,
+):
+    query_id = f"query-cancel-barrier-timeout-{int(expired_query_deadline)}"
     task_id = {
         "query_id": query_id,
         "fragment_execution_id": 0,
@@ -1953,23 +1967,30 @@ def test_fte_cancel_barrier_outlives_configured_control_timeouts(monkeypatch):
     handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
     monkeypatch.setenv("VANE_FTE_CONTROL_RPC_TIMEOUT_S", "0.05")
     monkeypatch.setenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", "0.05")
-    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", str(time.time() - 1.0))
-    cancel_results = []
+    if expired_query_deadline:
+        monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", str(time.time() - 1.0))
+    else:
+        monkeypatch.delenv("VANE_QUERY_DEADLINE_EPOCH_S", raising=False)
     cancel_errors = []
     cancel_started = threading.Event()
 
     def cancel_task():
         cancel_started.set()
         try:
-            cancel_results.append(handle.fte_cancel_task(task_id))
+            handle.fte_cancel_task(task_id)
         except BaseException as exc:  # pragma: no cover - asserted below
             cancel_errors.append(exc)
 
     cancel_thread = threading.Thread(target=cancel_task)
     cancel_thread.start()
     assert cancel_started.wait(timeout=1.0)
-    time.sleep(0.15)
-    outlived_control_timeout = cancel_thread.is_alive()
+    cancel_thread.join(timeout=1.0)
+    assert not cancel_thread.is_alive()
+    assert len(cancel_errors) == 1
+    assert isinstance(cancel_errors[0], expected_error)
+    task_key = str(FteTaskAttemptId.coerce(task_id))
+    assert task_key in handle._fte_control_tails_by_task
+
     pending.set_result(
         {
             "state": FteTaskState.CANCELED.value,
@@ -1978,12 +1999,98 @@ def test_fte_cancel_barrier_outlives_configured_control_timeouts(monkeypatch):
             "_fte_control_applied": True,
         }
     )
-    cancel_thread.join(timeout=2.0)
+    statuses = handle.close_and_flush_fte_controls(query_id)
 
-    assert outlived_control_timeout
-    assert not cancel_thread.is_alive()
-    assert cancel_errors == []
-    assert cancel_results[0]["state"] == FteTaskState.CANCELED.value
+    assert statuses[0]["state"] == FteTaskState.CANCELED.value
+    assert task_key not in handle._fte_control_tails_by_task
+
+
+def test_fte_teardown_rejects_nonterminal_cancel_control():
+    query_id = "query-nonterminal-cancel-barrier"
+    task_id = {
+        "query_id": query_id,
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 1,
+    }
+    pending = Future()
+
+    class _DeferredCancel:
+        def options(self, **_kwargs):
+            return self
+
+        def remote(self, *_args):
+            return SimpleNamespace(future=lambda: pending)
+
+    actor = _FakeActor()
+    actor.fte_cancel_task = _DeferredCancel()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    handle.enqueue_fte_cancel_task(task_id)
+    pending.set_result(
+        {
+            "state": FteTaskState.RUNNING.value,
+            "task_id": task_id,
+            "_fte_control_operation": "fte_cancel_task",
+            "_fte_control_applied": True,
+        }
+    )
+
+    with pytest.raises(
+        task_control_mod.FteControlBarrierTerminalError,
+        match="did not reach a terminal task state",
+    ):
+        handle.close_and_flush_fte_controls(query_id)
+
+    task_key = str(FteTaskAttemptId.coerce(task_id))
+    assert task_key not in handle._fte_control_tails_by_task
+
+
+def test_fte_prepare_drop_interrupts_before_draining_pending_cancel(monkeypatch):
+    query_id = "query-interrupt-before-cancel-drain"
+    task_id = {
+        "query_id": query_id,
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 1,
+    }
+    pending = Future()
+
+    class _DeferredCancel:
+        def options(self, **_kwargs):
+            return self
+
+        def remote(self, *_args):
+            return SimpleNamespace(future=lambda: pending)
+
+    actor = _FakeActor()
+    actor.fte_cancel_task = _DeferredCancel()
+
+    def interrupt_query(interrupted_query_id):
+        actor.fte_calls.append(("interrupt_query", interrupted_query_id))
+        pending.set_result(
+            {
+                "state": FteTaskState.CANCELED.value,
+                "task_id": task_id,
+                "_fte_control_operation": "fte_cancel_task",
+                "_fte_control_applied": True,
+            }
+        )
+        return {"native_interrupt_errors": 0}
+
+    actor.fte_interrupt_query = _FakeRemoteMethod(interrupt_query)
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    monkeypatch.setenv("VANE_FTE_CONTROL_RPC_TIMEOUT_S", "0.05")
+    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", str(time.time() - 1.0))
+
+    with pytest.raises(QueryDeadlineExceeded):
+        handle.fte_cancel_task(task_id)
+
+    result = handle.fte_prepare_drop_query(query_id)
+
+    assert result == {"tasks_removed": 1, "tasks_canceled": 0, "fragments_removed": 2}
+    operations = [call[0] for call in actor.fte_calls]
+    assert operations.index("interrupt_query") < operations.index("drop_query")
+    assert handle._has_fte_control_state_for_query(query_id) is False
 
 
 def test_ordered_add_ref_is_canceled_and_unowned_after_query_close(monkeypatch):
@@ -12933,9 +13040,13 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
     actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
     actor._shutdown_started = False
     actor._native_execution_condition = threading.Condition()
+    actor._native_execution_counts_by_task = {}
+    actor._native_task_query_ids = {}
     actor._active_native_cursors = set()
     actor._native_cursor_query_ids = {}
+    actor._native_cursor_task_ids = {}
     actor._closing_native_queries = set()
+    actor._closing_native_tasks = set()
     closed = []
 
     class _Cursor:
@@ -13000,6 +13111,182 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
     assert getattr(actor, "_native_query_cleanup_contexts", {}) == {}
 
 
+def test_worker_native_task_interrupt_is_attempt_scoped_and_fences_late_cursor():
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._native_execution_condition = threading.Condition()
+    actor._native_execution_count = 0
+    actor._native_execution_counts_by_query = {}
+    actor._native_execution_counts_by_task = {}
+    actor._native_task_query_ids = {}
+    actor._active_native_cursors = set()
+    actor._native_cursor_query_ids = {}
+    actor._native_cursor_task_ids = {}
+    actor._closing_native_queries = set()
+    actor._closing_native_tasks = set()
+    actor._shutdown_started = False
+    interrupted = []
+
+    class _Cursor:
+        def __init__(self, name):
+            self.name = name
+
+        def interrupt(self):
+            interrupted.append(self.name)
+
+    task_a = "query-task-interrupt.0.0.0"
+    task_b = "query-task-interrupt.0.1.0"
+    cursor_a = _Cursor("a")
+    cursor_b = _Cursor("b")
+    assert actor_cls._register_native_cursor(actor, cursor_a, "query-task-interrupt", task_a) is True
+    assert actor_cls._register_native_cursor(actor, cursor_b, "query-task-interrupt", task_b) is True
+
+    assert actor_cls._close_worker_native_task(actor, task_a) == []
+
+    late_a = _Cursor("late-a")
+    late_b = _Cursor("late-b")
+    assert actor_cls._register_native_cursor(actor, late_a, "query-task-interrupt", task_a) is False
+    assert actor_cls._register_native_cursor(actor, late_b, "query-task-interrupt", task_b) is True
+    assert interrupted == ["a"]
+    with pytest.raises(RuntimeError, match="native task is closing"):
+        actor_cls._begin_worker_native_execution(actor, "query-task-interrupt", task_a)
+    actor_cls._unregister_native_cursor(actor, cursor_a)
+    actor_cls._unregister_native_cursor(actor, cursor_b)
+    actor_cls._unregister_native_cursor(actor, late_a)
+    actor_cls._unregister_native_cursor(actor, late_b)
+    actor_cls._retire_worker_native_task(actor, task_a)
+    actor_cls._begin_worker_native_execution(actor, "query-task-interrupt", task_a)
+    actor_cls._end_worker_native_execution(actor, "query-task-interrupt", task_a)
+    assert (
+        actor_cls._register_native_cursor(
+            actor,
+            _Cursor("after-retire"),
+            "query-task-interrupt",
+            task_a,
+        )
+        is True
+    )
+
+
+def test_worker_fte_cancel_interrupts_attempt_before_waiting_for_barrier():
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    task_id = {
+        "query_id": "query-cancel-order",
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+    }
+    events = []
+
+    class _TaskManager:
+        async def cancel_task(self, canceled_task_id):
+            assert canceled_task_id == task_id
+            events.append("barrier")
+            return {"state": FteTaskState.CANCELED.value, "task_id": task_id}
+
+    class _Worker:
+        @staticmethod
+        def _close_worker_native_task(task_key):
+            assert task_key == str(FteTaskAttemptId.coerce(task_id))
+            events.append("interrupt")
+            return []
+
+        @staticmethod
+        def _get_fte_task_manager():
+            return _TaskManager()
+
+        @staticmethod
+        def _retire_worker_native_task(task_key):
+            assert task_key == str(FteTaskAttemptId.coerce(task_id))
+            events.append("retire")
+
+    status = asyncio.run(actor_cls.fte_cancel_task(_Worker(), task_id))
+
+    assert status["state"] == FteTaskState.CANCELED.value
+    assert events == ["interrupt", "barrier", "retire"]
+
+
+def test_worker_fte_cancel_reinterrupts_cursor_until_barrier_completes():
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    task_id = {
+        "query_id": "query-cancel-reinterrupt",
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+    }
+    barrier_release = asyncio.Event()
+
+    class _TaskManager:
+        async def cancel_task(self, canceled_task_id):
+            assert canceled_task_id == task_id
+            await barrier_release.wait()
+            return {"state": FteTaskState.CANCELED.value, "task_id": task_id}
+
+    class _Worker:
+        interrupt_count = 0
+
+        def _close_worker_native_task(self, task_key):
+            assert task_key == str(FteTaskAttemptId.coerce(task_id))
+            self.interrupt_count += 1
+            if self.interrupt_count >= 2:
+                barrier_release.set()
+            return []
+
+        @staticmethod
+        def _get_fte_task_manager():
+            return _TaskManager()
+
+        @staticmethod
+        def _retire_worker_native_task(task_key):
+            assert task_key == str(FteTaskAttemptId.coerce(task_id))
+
+    worker = _Worker()
+    status = asyncio.run(asyncio.wait_for(actor_cls.fte_cancel_task(worker, task_id), timeout=1.0))
+
+    assert status["state"] == FteTaskState.CANCELED.value
+    assert worker.interrupt_count >= 2
+
+
+def test_repeated_native_interrupt_barrier_retains_ownership_when_canceled():
+    async def run_cancel_race():
+        operation_started = asyncio.Event()
+        operation_release = asyncio.Event()
+        interrupt_errors = set()
+        interrupt_count = 0
+
+        async def operation():
+            operation_started.set()
+            await operation_release.wait()
+            return "terminal"
+
+        def interrupt():
+            nonlocal interrupt_count
+            interrupt_count += 1
+            return []
+
+        barrier = asyncio.create_task(
+            worker_mod._await_with_repeated_native_interrupts(
+                operation(),
+                interrupt,
+                interrupt_errors,
+            )
+        )
+        await operation_started.wait()
+        barrier.cancel()
+        await asyncio.sleep(0.03)
+        exposed_before_terminal = barrier.done()
+        operation_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await barrier
+        return exposed_before_terminal, interrupt_count, interrupt_errors
+
+    exposed_before_terminal, interrupt_count, interrupt_errors = asyncio.run(run_cancel_race())
+
+    assert exposed_before_terminal is False
+    assert interrupt_count > 0
+    assert interrupt_errors == set()
+
+
 def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
@@ -13009,9 +13296,13 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
     actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
     actor._shutdown_started = False
     actor._native_execution_condition = threading.Condition()
+    actor._native_execution_counts_by_task = {}
+    actor._native_task_query_ids = {}
     actor._active_native_cursors = set()
     actor._native_cursor_query_ids = {}
+    actor._native_cursor_task_ids = {}
     actor._closing_native_queries = set()
+    actor._closing_native_tasks = set()
     calls = []
 
     class _FakeCursor:
@@ -13484,9 +13775,13 @@ def test_execute_native_task_uses_session_database_for_fte():
     actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=16)
     actor._session_s3_configs = {}
     actor._native_execution_condition = threading.Condition()
+    actor._native_execution_counts_by_task = {}
+    actor._native_task_query_ids = {}
     actor._active_native_cursors = set()
     actor._native_cursor_query_ids = {}
+    actor._native_cursor_task_ids = {}
     actor._closing_native_queries = set()
+    actor._closing_native_tasks = set()
     calls = []
     closed = []
 

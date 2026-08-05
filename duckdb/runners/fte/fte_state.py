@@ -24,6 +24,7 @@ class FtePartitionState(str, Enum):
     OPEN = "OPEN"
     SEALED = "SEALED"
     RUNNING = "RUNNING"
+    FINALIZING = "FINALIZING"
     FINISHED = "FINISHED"
     FAILED = "FAILED"
 

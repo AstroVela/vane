@@ -145,9 +145,13 @@ def test_query_close_interrupts_only_owned_native_cursors():
     class DummyActor:
         _native_execution_condition = threading.Condition()
         _native_execution_counts_by_query: dict[str, int] = {}
+        _native_execution_counts_by_task: dict[str, int] = {}
+        _native_task_query_ids: dict[str, str] = {}
         _active_native_cursors: set[Cursor] = set()
         _native_cursor_query_ids: dict[Cursor, str] = {}
+        _native_cursor_task_ids: dict[Cursor, str] = {}
         _closing_native_queries: set[str] = set()
+        _closing_native_tasks: set[str] = set()
 
     actor = DummyActor()
     actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
@@ -206,7 +210,13 @@ def test_actor_shutdown_joins_native_threads_before_closing_runtime(monkeypatch)
         _native_execution_condition = threading.Condition()
         _native_execution_count = 1
         _native_execution_counts_by_query = {"query-a": 1}
+        _native_execution_counts_by_task: dict[str, int] = {}
+        _native_task_query_ids: dict[str, str] = {}
         _active_native_cursors = {Cursor()}
+        _native_cursor_query_ids: dict[Cursor, str] = {}
+        _native_cursor_task_ids: dict[Cursor, str] = {}
+        _closing_native_queries: set[str] = set()
+        _closing_native_tasks: set[str] = set()
         _shutdown_started = False
         _shutdown_prepared = False
         _shutdown_complete = False
@@ -280,9 +290,13 @@ def test_query_teardown_waits_for_pre_registration_native_admission():
         _native_execution_condition = threading.Condition()
         _native_execution_count = 0
         _native_execution_counts_by_query: dict[str, int] = {}
+        _native_execution_counts_by_task: dict[str, int] = {}
+        _native_task_query_ids: dict[str, str] = {}
         _active_native_cursors: set[object] = set()
         _native_cursor_query_ids: dict[object, str] = {}
+        _native_cursor_task_ids: dict[object, str] = {}
         _closing_native_queries: set[str] = set()
+        _closing_native_tasks: set[str] = set()
 
     actor = DummyActor()
     actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
@@ -476,9 +490,13 @@ def test_actor_shutdown_retries_failed_session_connection_close():
         _native_execution_condition = threading.Condition()
         _native_execution_count = 0
         _native_execution_counts_by_query: dict[str, int] = {}
+        _native_execution_counts_by_task: dict[str, int] = {}
+        _native_task_query_ids: dict[str, str] = {}
         _active_native_cursors: set[object] = set()
         _native_cursor_query_ids: dict[object, str] = {}
+        _native_cursor_task_ids: dict[object, str] = {}
         _closing_native_queries: set[str] = set()
+        _closing_native_tasks: set[str] = set()
         _shutdown_started = False
         _shutdown_prepared = False
         _shutdown_complete = False

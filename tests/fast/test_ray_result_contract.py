@@ -4013,15 +4013,22 @@ def test_run_plan_return_uses_native_completed_sink_descriptor(monkeypatch):
         _env_overrides: dict[str, str] = {}
 
         @staticmethod
-        def _begin_worker_native_execution(query_id):
+        def _begin_worker_native_execution(query_id, task_id=""):
+            assert task_id == ""
             events.append(("worker_begin", query_id))
 
         @staticmethod
-        def _end_worker_native_execution(query_id):
+        def _end_worker_native_execution(query_id, task_id=""):
+            assert task_id == ""
             events.append(("worker_end", query_id))
 
         @staticmethod
         def _worker_native_query_is_closing(_query_id):
+            return False
+
+        @staticmethod
+        def _worker_native_task_is_closing(task_id):
+            assert task_id == ""
             return False
 
         @staticmethod
@@ -4095,15 +4102,22 @@ def test_run_plan_return_cancellation_waits_for_native_execution(monkeypatch):
         _env_overrides: dict[str, str] = {}
 
         @staticmethod
-        def _begin_worker_native_execution(query_id):
+        def _begin_worker_native_execution(query_id, task_id=""):
+            assert task_id == ""
             events.append(("worker_begin", query_id))
 
         @staticmethod
-        def _end_worker_native_execution(query_id):
+        def _end_worker_native_execution(query_id, task_id=""):
+            assert task_id == ""
             events.append(("worker_end", query_id))
 
         @staticmethod
         def _worker_native_query_is_closing(_query_id):
+            return False
+
+        @staticmethod
+        def _worker_native_task_is_closing(task_id):
+            assert task_id == ""
             return False
 
         @staticmethod

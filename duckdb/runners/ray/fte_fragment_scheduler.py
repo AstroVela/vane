@@ -2761,6 +2761,7 @@ def _fte_partition_metrics(
             for attempt_id in [attempt.attempt_id.attempt_id]
         ],
         "running_count": len(partition.running_attempts),
+        "finalizing_attempt": partition.finalizing_attempt,
         "selected_attempt": partition.selected_attempt,
         "selected_output_stats": (
             dict(partition.selected_output_stats)

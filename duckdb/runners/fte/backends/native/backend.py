@@ -1446,10 +1446,16 @@ class NativeWorkerHandle:
     def fte_cancel_task(self, task_id: str | Mapping[str, Any]) -> dict[str, Any]:
         # A successful cancellation is a barrier for task-owned writes. The
         # normal operation timeout must not expose a still-running writer.
-        return _as_status(
-            "fte_cancel_task",
-            self._loop.run_owned_side_effects(self._manager.cancel_task(task_id)),
-        )
+        return self.resolve_fte_cancel_task(self.enqueue_fte_cancel_task(task_id))
+
+    def enqueue_fte_cancel_task(self, task_id: str | Mapping[str, Any]) -> Future[Any]:
+        return self._loop.submit(self._manager.cancel_task(task_id))
+
+    @staticmethod
+    def resolve_fte_cancel_task(cancellation: Future[Any]) -> dict[str, Any]:
+        # Native execution has no remote actor to retire. Keep the future owned
+        # until its synchronous side effects are terminal.
+        return _as_status("fte_cancel_task", cancellation.result())
 
     def fte_drop_query(self, query_id: str) -> dict[str, int]:
         # Query drop is also a barrier for task-owned writes and must not

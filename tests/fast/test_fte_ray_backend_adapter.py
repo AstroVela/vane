@@ -39,15 +39,13 @@ class _FakeWorkerHandle:
         self.calls.append(("fte_wait_task_status", (task_id, min_version, timeout_s)))
         return {"state": "RUNNING", "version": min_version}
 
-    def fte_cancel_task(self, task_id):
-        self.calls.append(("fte_cancel_task", (task_id,)))
-        return {
-            "state": "CANCELED",
-            "failure": {
-                "error_code": "TASK_CANCELED",
-                "message": "task canceled",
-            },
-        }
+    def enqueue_fte_cancel_task(self, task_id):
+        self.calls.append(("enqueue_fte_cancel_task", (task_id,)))
+        return ("cancel", task_id)
+
+    def resolve_fte_cancel_task(self, cancellation):
+        self.calls.append(("resolve_fte_cancel_task", (cancellation,)))
+        return {"state": "CANCELED", "cancellation": cancellation}
 
     def optional_method(self):
         return "delegated"
@@ -68,10 +66,13 @@ def test_ray_worker_handle_adapter_delegates_worker_protocol_methods():
     assert adapter.fte_wait_task_status("task.0", 3, 0.5) == {"state": "RUNNING", "version": 3}
     assert adapter.fte_cancel_task("task.0") == {
         "state": "CANCELED",
-        "failure": {
-            "error_code": "TASK_CANCELED",
-            "message": "task canceled",
-        },
+        "cancellation": ("cancel", "task.0"),
+    }
+    cancellation = adapter.enqueue_fte_cancel_task("task.1")
+    assert cancellation == ("cancel", "task.1")
+    assert adapter.resolve_fte_cancel_task(cancellation) == {
+        "state": "CANCELED",
+        "cancellation": ("cancel", "task.1"),
     }
     assert adapter.optional_method() == "delegated"
 
@@ -81,7 +82,10 @@ def test_ray_worker_handle_adapter_delegates_worker_protocol_methods():
         ("fte_no_more_splits", ("task.0", "source-a")),
         ("fte_update_task", ("task.0", {"x": 1})),
         ("fte_wait_task_status", ("task.0", 3, 0.5)),
-        ("fte_cancel_task", ("task.0",)),
+        ("enqueue_fte_cancel_task", ("task.0",)),
+        ("resolve_fte_cancel_task", (("cancel", "task.0"),)),
+        ("enqueue_fte_cancel_task", ("task.1",)),
+        ("resolve_fte_cancel_task", (("cancel", "task.1"),)),
     ]
 
 
