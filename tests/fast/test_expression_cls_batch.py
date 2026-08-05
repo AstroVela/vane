@@ -140,6 +140,19 @@ def test_vane_cls_batch_requires_return_dtype_and_rejects_old_options():
         vane.cls.batch(actor_number=1, return_dtype="INTEGER", row_preserving=True)
 
 
+def test_vane_cls_batch_rejects_async_call():
+    import pyarrow as pa
+
+    import vane
+
+    with pytest.raises(TypeError, match="requires a synchronous Python __call__"):
+
+        @vane.cls.batch(actor_number=1, return_dtype=pa.int32())
+        class AsyncBatch:
+            async def __call__(self, values):
+                return values
+
+
 def test_vane_cls_batch_rejects_variadic_call_protocol():
     import vane
 

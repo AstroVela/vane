@@ -538,13 +538,14 @@ shared_ptr<DuckDBPyExpression> DuckDBPyExpression::FunctionExpression(const stri
 shared_ptr<DuckDBPyExpression> DuckDBPyExpression::UDFMapExpression(const py::function &udf, const string &name,
                                                                     const shared_ptr<DuckDBPyType> &return_type,
                                                                     const string &execution_backend,
+                                                                    const Optional<py::object> &expression_id,
                                                                     const py::args &args) {
 	if (!return_type) {
 		throw InvalidInputException("return_dtype is required for expression UDF");
 	}
 	auto expressions = CopyExpressionArgs(args);
 	auto payload = BuildExpressionScalarUDFPayload(name, udf, return_type, execution_backend,
-	                                               ExpressionUDFDefaultParallelism(), args.size());
+	                                               ExpressionUDFDefaultParallelism(), args.size(), expression_id);
 	expressions.push_back(make_uniq<duckdb::ConstantExpression>(std::move(payload)));
 	return InternalFunctionExpression("udf", std::move(expressions));
 }

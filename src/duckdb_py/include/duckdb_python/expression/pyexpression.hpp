@@ -113,9 +113,9 @@ public:
 	static shared_ptr<DuckDBPyExpression> CaseExpression(const DuckDBPyExpression &condition,
 	                                                     const DuckDBPyExpression &value);
 	static shared_ptr<DuckDBPyExpression> FunctionExpression(const string &function_name, const py::args &args);
-	static shared_ptr<DuckDBPyExpression> UDFMapExpression(const py::function &udf, const string &name,
-	                                                       const shared_ptr<DuckDBPyType> &return_type,
-	                                                       const string &execution_backend, const py::args &args);
+	static shared_ptr<DuckDBPyExpression>
+	UDFMapExpression(const py::function &udf, const string &name, const shared_ptr<DuckDBPyType> &return_type,
+	                 const string &execution_backend, const Optional<py::object> &expression_id, const py::args &args);
 	static shared_ptr<DuckDBPyExpression>
 	UDFMapBatchesExpression(const py::function &udf, const string &name, const py::object &schema,
 	                        const string &execution_backend, const vector<string> &input_names,

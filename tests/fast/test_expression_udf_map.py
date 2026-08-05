@@ -48,6 +48,54 @@ def test_vane_function_scalar_map_expression_local():
     assert out.fetchall() == [(0, 1), (1, 2), (2, 3)]
 
 
+def test_vane_function_struct_unnest_executes_one_logical_call(tmp_path):
+    import pyarrow as pa
+
+    import duckdb
+    import vane
+
+    calls_path = tmp_path / "func_struct_calls"
+    result_type = pa.struct([pa.field("value", pa.int64()), pa.field("label", pa.string())])
+
+    @vane.func(return_dtype=result_type)
+    def describe(value):
+        with calls_path.open("a", encoding="utf-8") as calls:
+            calls.write("call\n")
+        return {"value": value, "label": f"value={value}"}
+
+    con = vane.connect()
+    relation = con.sql("SELECT 42::BIGINT AS value").select(
+        duckdb.FunctionExpression("unnest", describe(vane.col("value")))
+    )
+
+    assert relation.explain().count("STREAMING_UDF") == 1
+    assert relation.fetchall() == [(42, "value=42")]
+    assert calls_path.read_text(encoding="utf-8").splitlines() == ["call"]
+
+
+def test_vane_function_separate_struct_calls_have_separate_expression_ids():
+    import pyarrow as pa
+
+    import duckdb
+    import vane
+
+    result_type = pa.struct([pa.field("value", pa.int64())])
+
+    @vane.func(return_dtype=result_type)
+    def wrap(value):
+        return {"value": value}
+
+    con = vane.connect()
+    source = con.sql("SELECT 42::BIGINT AS value")
+    relation = source.select(
+        duckdb.FunctionExpression("unnest", wrap(vane.col("value"))),
+        duckdb.FunctionExpression("unnest", wrap(vane.col("value"))),
+    )
+
+    assert relation.explain().count("STREAMING_UDF") == 2
+    assert relation.fetchall() == [(42, 42)]
+
+
 def test_vane_function_expression_pickles_duckdb_type_annotations():
     import vane
 

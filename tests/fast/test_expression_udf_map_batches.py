@@ -38,6 +38,18 @@ def test_vane_function_batch_requires_return_dtype():
         vane.func.batch()
 
 
+def test_vane_function_batch_rejects_async_function():
+    import pyarrow as pa
+
+    import vane
+
+    with pytest.raises(TypeError, match="requires a synchronous Python function"):
+
+        @vane.func.batch(return_dtype=pa.int32())
+        async def identity(values):
+            return values
+
+
 def test_vane_function_batch_eager_array_and_chunked_array_inputs():
     import pyarrow as pa
     import pyarrow.compute as pc
@@ -58,6 +70,19 @@ def test_vane_function_batch_eager_array_and_chunked_array_inputs():
     assert multiple_chunks.to_pylist() == [11, 22]
     assert seen_types[0] == (pa.Int64Array, pa.Int64Array)
     assert seen_types[1] == (pa.ChunkedArray, pa.ChunkedArray)
+
+
+def test_vane_function_batch_eager_call_requires_an_input_column():
+    import pyarrow as pa
+
+    import vane
+
+    @vane.func.batch(return_dtype=pa.int32())
+    def no_inputs():
+        return pa.array([], type=pa.int32())
+
+    with pytest.raises(vane.InvalidInputException, match="batch UDFs require at least one input column"):
+        no_inputs()
 
 
 def test_vane_function_batch_rejects_non_arrow_column_inputs():

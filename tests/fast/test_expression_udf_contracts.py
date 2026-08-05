@@ -441,6 +441,7 @@ def test_stateless_ray_actor_pool_size_and_gpu_options_follow_physical_payload(m
     assert nodes[0]["actor_pool_size"] == 3
     assert nodes[0]["payload"]["actor_number"] == 3
     assert not nodes[0]["payload"].get("stateful", False)
+    assert nodes[0]["payload"]["expression_id"]
 
     calls = []
 

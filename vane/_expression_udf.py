@@ -292,7 +292,7 @@ def _batch_call_layout(
     keyword_input_names = tuple(kwargs)
     input_names = positional_input_names + keyword_input_names
     if not input_names:
-        raise _invalid_input("batch expression UDFs require at least one input column")
+        raise _invalid_input("batch UDFs require at least one input column")
     folded_names = [name.casefold() for name in input_names]
     if len(folded_names) != len(set(folded_names)):
         raise _invalid_input("batch UDF input names must be unique (case-insensitive)")
@@ -464,6 +464,7 @@ def _build_map_expression(
         name,
         _duckdb_type(return_dtype),
         _runner_to_task_backend(),
+        uuid.uuid4().hex,
         *expr_args,
     )
 
@@ -471,6 +472,7 @@ def _build_map_expression(
 @dataclass(frozen=True)
 class _ClassCallContract:
     signature: inspect.Signature
+    is_coroutine: bool
     positional_parameters: tuple[inspect.Parameter, ...]
     min_required_positional: int
     max_positional: int | None
@@ -524,6 +526,7 @@ def _class_call_contract(user_class: type) -> _ClassCallContract:
     )
     return _ClassCallContract(
         signature=signature,
+        is_coroutine=inspect.iscoroutinefunction(callable_object),
         positional_parameters=positional_parameters,
         min_required_positional=sum(
             parameter.default is inspect.Parameter.empty for parameter in positional_parameters
@@ -886,7 +889,6 @@ class VaneBatchFunction:
             batch_size=self.batch_size,
             row_preserving=True,
             gpus=self.gpus,
-            expression_id=uuid.uuid4().hex,
         )
         return _expand_batch_expression(expression, unnest=self.unnest)
 
@@ -1054,7 +1056,10 @@ class VaneClassBatch:
 
             if not pa.types.is_struct(return_arrow_dtype):
                 raise _invalid_input("unnest=True requires a Struct return_dtype")
-        signature = _class_call_contract(class_).signature
+        contract = _class_call_contract(class_)
+        if contract.is_coroutine:
+            raise TypeError("vane.cls.batch requires a synchronous Python __call__")
+        signature = contract.signature
         variadic = [
             parameter.name
             for parameter in signature.parameters.values()
@@ -1205,7 +1210,6 @@ class VaneClassBatchInstance:
             actor_number=self.actor_number,
             gpus=self.gpus,
             stateful=True,
-            expression_id=uuid.uuid4().hex,
         )
         return _expand_batch_expression(expression, unnest=self.unnest)
 
@@ -1329,7 +1333,6 @@ def _build_map_batches_expression(
     execution_backend: str | None = None,
     actor_number: int | None = None,
     stateful: bool = False,
-    expression_id: str | None = None,
 ) -> duckdb.Expression:
     input_names, exprs = _normalize_inputs(inputs)
     normalized_schema = _normalize_schema(schema)
@@ -1345,7 +1348,7 @@ def _build_map_batches_expression(
         gpus,
         actor_number,
         stateful,
-        expression_id,
+        uuid.uuid4().hex,
         *exprs,
     )
 
@@ -1361,7 +1364,6 @@ def _build_actor_map_batches_expression(
     actor_number: int,
     gpus: float | None,
     stateful: bool = False,
-    expression_id: str | None = None,
 ) -> duckdb.Expression:
     normalized_actor_number = (
         _validate_actor_number(actor_number) if stateful else _validate_positive_actor_number(actor_number)
@@ -1377,7 +1379,6 @@ def _build_actor_map_batches_expression(
         execution_backend=_runner_to_actor_backend(),
         actor_number=normalized_actor_number,
         stateful=stateful,
-        expression_id=expression_id,
     )
 
 

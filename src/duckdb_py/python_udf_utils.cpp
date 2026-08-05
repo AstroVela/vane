@@ -279,6 +279,20 @@ static Value PayloadWithAddedOrUpdatedFields(const Value &payload, child_list_t<
 
 	return Value::STRUCT(std::move(new_children));
 }
+
+static void AppendExpressionIdField(child_list_t<Value> &fields, const Optional<py::object> &expression_id) {
+	if (expression_id.is_none()) {
+		return;
+	}
+	if (!py::isinstance<py::str>(expression_id)) {
+		throw InvalidInputException("expression_id must be a non-empty string");
+	}
+	auto parsed_expression_id = py::cast<string>(expression_id);
+	if (parsed_expression_id.empty()) {
+		throw InvalidInputException("expression_id must be a non-empty string");
+	}
+	fields.emplace_back("expression_id", Value(std::move(parsed_expression_id)));
+}
 } // namespace
 
 static unique_ptr<Expression> LowerRegisteredExpressionUDFInternal(FunctionBindExpressionInput &input,
@@ -545,7 +559,8 @@ Value BuildScalarUDFPayload(const string &name, const py::function &udf, const s
 
 Value BuildExpressionScalarUDFPayload(const string &name, const py::function &udf,
                                       const shared_ptr<DuckDBPyType> &return_type, const string &execution_backend,
-                                      idx_t default_parallelism, idx_t scalar_arg_count) {
+                                      idx_t default_parallelism, idx_t scalar_arg_count,
+                                      const Optional<py::object> &expression_id) {
 	vector<LogicalType> passthrough_types;
 	auto payload = BuildScalarUDFPayload(name, udf, return_type, execution_backend, default_parallelism,
 	                                     passthrough_types, py::none(), py::none(), py::none(), py::none(),
@@ -556,6 +571,7 @@ Value BuildExpressionScalarUDFPayload(const string &name, const py::function &ud
 	fields.emplace_back("expression_udf", Value::BOOLEAN(true));
 	fields.emplace_back("method_return_type", Value(return_type->Type().ToString()));
 	fields.emplace_back("scalar_arg_count", Value::BIGINT(NumericCast<int64_t>(scalar_arg_count)));
+	AppendExpressionIdField(fields, expression_id);
 	return PayloadWithAddedOrUpdatedFields(payload, std::move(fields));
 }
 
@@ -581,16 +597,7 @@ Value BuildExpressionMapBatchesUDFPayload(const string &name, const py::function
 	fields.emplace_back("input_names", StringListValue(input_names));
 	fields.emplace_back("row_preserving", Value::BOOLEAN(row_preserving));
 	fields.emplace_back("prebatched_input", Value::BOOLEAN(false));
-	if (!expression_id.is_none()) {
-		if (!py::isinstance<py::str>(expression_id)) {
-			throw InvalidInputException("expression_id must be a non-empty string");
-		}
-		auto parsed_expression_id = py::cast<string>(expression_id);
-		if (parsed_expression_id.empty()) {
-			throw InvalidInputException("expression_id must be a non-empty string");
-		}
-		fields.emplace_back("expression_id", Value(parsed_expression_id));
-	}
+	AppendExpressionIdField(fields, expression_id);
 	if (stateful) {
 		fields.emplace_back("stateful", Value::BOOLEAN(true));
 	}

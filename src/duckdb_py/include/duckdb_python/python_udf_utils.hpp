@@ -38,7 +38,8 @@ Value BuildScalarUDFPayload(const string &name, const py::function &udf, const s
 
 Value BuildExpressionScalarUDFPayload(const string &name, const py::function &udf,
                                       const shared_ptr<DuckDBPyType> &return_type, const string &execution_backend,
-                                      idx_t default_parallelism, idx_t scalar_arg_count);
+                                      idx_t default_parallelism, idx_t scalar_arg_count,
+                                      const Optional<py::object> &expression_id);
 
 Value BuildExpressionMapBatchesUDFPayload(const string &name, const py::function &udf, const py::object &schema,
                                           const string &execution_backend, idx_t default_parallelism,

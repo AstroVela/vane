@@ -1169,6 +1169,7 @@ def _VaneUDFMapExpression(
     name: str,
     return_type: typing.Any,
     execution_backend: str,
+    expression_id: str | None = None,
     *args: Expression,
 ) -> Expression: ...
 def _VaneUDFMapBatchesExpression(
