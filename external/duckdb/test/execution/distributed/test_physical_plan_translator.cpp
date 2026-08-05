@@ -203,13 +203,7 @@ static unique_ptr<ColumnDataCollection> MakeSingleValueCollection(const vector<L
 }
 
 static idx_t SchemaColumnCount(const SchemaRef &schema) {
-	if (!schema) {
-		return 0;
-	}
-	if (schema->id() == LogicalTypeId::STRUCT) {
-		return StructType::GetChildTypes(*schema).size();
-	}
-	return 1;
+	return GetSchemaTypes(schema).size();
 }
 
 static std::string SQLStringLiteral(const std::string &value) {
@@ -329,18 +323,32 @@ static bool NodeDisplayContains(const DistributedPipelineNodeRef &node, const st
 	return false;
 }
 
-TEST_CASE("Streaming UDF passthrough schema preserves all output columns", "[distributed][udf]") {
-	vector<LogicalType> output_types = {LogicalType::BIGINT, LogicalType::VARCHAR};
-	StreamingUDFPassthroughNode node(1, nullptr, TableFunction {}, nullptr, vector<ColumnIndex> {}, vector<column_t> {},
-	                                 optional_idx(), output_types, 0);
+TEST_CASE("Streaming UDF passthrough schema preserves physical column boundaries", "[distributed][udf]") {
+	SECTION("multiple scalar columns") {
+		vector<LogicalType> output_types = {LogicalType::BIGINT, LogicalType::VARCHAR};
+		StreamingUDFPassthroughNode node(1, nullptr, TableFunction {}, nullptr, vector<ColumnIndex> {},
+		                                 vector<column_t> {}, optional_idx(), output_types, 0);
 
-	auto schema = node.config().schema();
-	REQUIRE(schema);
-	REQUIRE(schema->id() == LogicalTypeId::STRUCT);
-	const auto &columns = StructType::GetChildTypes(*schema);
-	REQUIRE(columns.size() == output_types.size());
-	REQUIRE(columns[0].second == output_types[0]);
-	REQUIRE(columns[1].second == output_types[1]);
+		auto schema_types = GetSchemaTypes(node.config().schema());
+		REQUIRE(schema_types == output_types);
+	}
+
+	SECTION("one struct column") {
+		child_list_t<LogicalType> fields;
+		fields.emplace_back("name", LogicalType::VARCHAR);
+		fields.emplace_back("score", LogicalType::DOUBLE);
+		auto struct_type = LogicalType::STRUCT(std::move(fields));
+		vector<LogicalType> output_types = {struct_type};
+		StreamingUDFPassthroughNode node(1, nullptr, TableFunction {}, nullptr, vector<ColumnIndex> {},
+		                                 vector<column_t> {}, optional_idx(), output_types, 0);
+
+		auto schema_types = GetSchemaTypes(node.config().schema());
+		REQUIRE(schema_types.size() == 1);
+		REQUIRE(schema_types[0] == struct_type);
+		REQUIRE(GetSchemaNames(node.config().schema()).empty());
+		const auto &struct_fields = StructType::GetChildTypes(schema_types[0]);
+		REQUIRE(struct_fields.size() == 2);
+	}
 }
 
 TEST_CASE("PhysicalPlanTranslator: simple projection", "[distributed]") {

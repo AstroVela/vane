@@ -182,10 +182,7 @@ public:
 
 private:
 	static SchemaRef BuildSchema(const duckdb::vector<LogicalType> &output_types) {
-		if (output_types.empty()) {
-			return nullptr;
-		}
-		return std::make_shared<duckdb::LogicalType>(output_types[0]);
+		return MakeSchemaRef(output_types);
 	}
 
 	PipelineNodeContext ctx_;

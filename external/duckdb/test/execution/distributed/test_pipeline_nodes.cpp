@@ -8,6 +8,8 @@
 #include "duckdb/execution/distributed/pipeline_node/projection.hpp"
 #include "duckdb/execution/distributed/pipeline_node/scan_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
+#include "duckdb/execution/distributed/pipeline_node/table_inout.hpp"
+#include "duckdb/execution/distributed/pipeline_node/vllm.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/execution/distributed/plan/physical_plan_helpers.hpp"
@@ -15,10 +17,40 @@
 using namespace duckdb;
 using namespace duckdb::distributed;
 
+TEST_CASE("PipelineSchema preserves explicit top-level columns", "[distributed]") {
+	child_list_t<LogicalType> fields;
+	fields.emplace_back("value", LogicalType::INTEGER);
+	fields.emplace_back("label", LogicalType::VARCHAR);
+	vector<LogicalType> types = {LogicalType::STRUCT(std::move(fields))};
+	vector<std::string> names = {"feature"};
+
+	auto schema = MakeSchemaRef(types, names);
+	REQUIRE(GetSchemaTypes(schema) == types);
+	REQUIRE(GetSchemaNames(schema) == names);
+
+	vector<LogicalType> two_types = {LogicalType::INTEGER, LogicalType::VARCHAR};
+	REQUIRE_THROWS_AS(MakeSchemaRef(two_types, names), std::invalid_argument);
+}
+
+TEST_CASE("Schema-changing nodes preserve every output type", "[distributed]") {
+	vector<LogicalType> output_types = {LogicalType::INTEGER, LogicalType::VARCHAR};
+
+	SECTION("table in-out") {
+		TableInOutNode node(1, nullptr, TableFunction {}, nullptr, vector<ColumnIndex> {}, vector<column_t> {},
+		                    optional_idx(), output_types, 0);
+		REQUIRE(GetSchemaTypes(node.config().schema()) == output_types);
+	}
+
+	SECTION("vLLM projection") {
+		VLLMProjectNode node(1, nullptr, nullptr, "", Value(), "output", output_types);
+		REQUIRE(GetSchemaTypes(node.config().schema()) == output_types);
+	}
+}
+
 TEST_CASE("ProjectionNode: construction and display", "[distributed]") {
 	// Create a dummy child scan source node with no scans
 	std::vector<DuckPhysicalPlanRef> plans;
-	SchemaRef schema = std::make_shared<LogicalType>(LogicalType::INTEGER);
+	SchemaRef schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::INTEGER});
 	std::vector<ScanTaskDescriptor> scan_tasks;
 	auto child = std::make_shared<ScanSourceNode>(PipelineNodeContext(0, "", 0, "scan"), DuckPhysicalPlanRef(),
 	                                              scan_tasks, schema, DuckDBExecutionConfigRef(), false);
@@ -38,7 +70,7 @@ TEST_CASE("ProjectionNode: construction and display", "[distributed]") {
 
 TEST_CASE("FilterNode: construction and display", "[distributed]") {
 	std::vector<DuckPhysicalPlanRef> plans;
-	SchemaRef schema = std::make_shared<LogicalType>(LogicalType::INTEGER);
+	SchemaRef schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::INTEGER});
 	std::vector<ScanTaskDescriptor> scan_tasks;
 	auto child = std::make_shared<ScanSourceNode>(PipelineNodeContext(0, "", 0, "scan"), DuckPhysicalPlanRef(),
 	                                              scan_tasks, schema, DuckDBExecutionConfigRef(), false);
@@ -56,7 +88,7 @@ TEST_CASE("ScanSourceNode: display", "[distributed]") {
 	// Create a simple in-memory plan and attach to ScanSourceNode
 	DuckPhysicalPlanRef p = duckdb::distributed::make_physical_plan_with_identity_projection({{1, 2, 3}});
 	std::vector<DuckPhysicalPlanRef> plans = {p};
-	SchemaRef schema = std::make_shared<LogicalType>(LogicalType::BIGINT);
+	SchemaRef schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::BIGINT});
 	std::vector<ScanTaskDescriptor> scan_tasks = {ScanTaskDescriptor {}};
 	auto node = ScanSourceNode(PipelineNodeContext(0, "", 3, "scan"), plans[0], scan_tasks, schema,
 	                           DuckDBExecutionConfigRef(), false);

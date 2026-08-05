@@ -94,25 +94,68 @@ using ExpressionRef = std::shared_ptr<duckdb::Expression>;
 using BoundExpr = ExpressionRef;
 using BoundAggExpr = ExpressionRef;
 
-/// Schema reference type (using LogicalType for now as placeholder for Schema)
-using SchemaRef = std::shared_ptr<duckdb::LogicalType>;
+/// Logical column schema carried between distributed pipeline nodes.
+///
+/// A schema owns the top-level column boundary explicitly. In particular, a
+/// single STRUCT column is represented as one entry in `types_`, rather than
+/// overloading STRUCT as an encoding for a multi-column row.
+class PipelineSchema {
+public:
+	PipelineSchema(duckdb::vector<LogicalType> types, duckdb::vector<std::string> names)
+	    : types_(std::move(types)), names_(std::move(names)) {
+		if (types_.empty()) {
+			throw std::invalid_argument("pipeline schema requires at least one column");
+		}
+		if (!names_.empty() && names_.size() != types_.size()) {
+			throw std::invalid_argument("pipeline schema names must match its columns");
+		}
+	}
+
+	const duckdb::vector<LogicalType> &types() const {
+		return types_;
+	}
+
+	const duckdb::vector<std::string> &names() const {
+		return names_;
+	}
+
+	std::string ToString() const {
+		if (types_.size() == 1 && names_.empty()) {
+			return types_[0].ToString();
+		}
+
+		child_list_t<LogicalType> children;
+		children.reserve(types_.size());
+		for (idx_t i = 0; i < types_.size(); i++) {
+			std::string name = names_.empty() ? ("c" + std::to_string(i)) : names_[i];
+			children.emplace_back(std::move(name), types_[i]);
+		}
+		return LogicalType::STRUCT(std::move(children)).ToString();
+	}
+
+private:
+	duckdb::vector<LogicalType> types_;
+	duckdb::vector<std::string> names_;
+};
+
+using SchemaRef = std::shared_ptr<const PipelineSchema>;
 
 template <class TypeList>
 inline SchemaRef MakeSchemaRefImpl(const TypeList &types, const std::vector<std::string> *names = nullptr) {
 	if (types.empty()) {
 		return nullptr;
 	}
-	const bool use_names = names && names->size() == types.size();
-	if (types.size() == 1 && !use_names) {
-		return std::make_shared<duckdb::LogicalType>(types[0]);
+	duckdb::vector<LogicalType> schema_types(types.begin(), types.end());
+	duckdb::vector<std::string> schema_names;
+	if (names && !names->empty()) {
+		schema_names.assign(names->begin(), names->end());
+	} else if (types.size() > 1) {
+		schema_names.reserve(types.size());
+		for (idx_t i = 0; i < types.size(); i++) {
+			schema_names.push_back("c" + std::to_string(i));
+		}
 	}
-	child_list_t<LogicalType> children;
-	children.reserve(types.size());
-	for (idx_t i = 0; i < types.size(); i++) {
-		std::string name = use_names ? (*names)[i] : ("c" + std::to_string(i));
-		children.emplace_back(std::move(name), types[i]);
-	}
-	return std::make_shared<duckdb::LogicalType>(LogicalType::STRUCT(std::move(children)));
+	return std::make_shared<const PipelineSchema>(std::move(schema_types), std::move(schema_names));
 }
 
 inline SchemaRef MakeSchemaRef(const std::vector<LogicalType> &types) {
@@ -132,18 +175,17 @@ inline SchemaRef MakeSchemaRef(const duckdb::vector<LogicalType> &types, const d
 }
 
 inline duckdb::vector<std::string> GetSchemaNames(const SchemaRef &schema) {
-	duckdb::vector<std::string> names;
 	if (!schema) {
-		return names;
+		return {};
 	}
-	if (schema->id() == duckdb::LogicalTypeId::STRUCT) {
-		const auto &children = duckdb::StructType::GetChildTypes(*schema);
-		names.reserve(children.size());
-		for (const auto &child : children) {
-			names.push_back(child.first);
-		}
+	return schema->names();
+}
+
+inline duckdb::vector<LogicalType> GetSchemaTypes(const SchemaRef &schema) {
+	if (!schema) {
+		return {};
 	}
-	return names;
+	return schema->types();
 }
 
 //------------------------------------------------------------------------------

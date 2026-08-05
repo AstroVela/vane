@@ -233,13 +233,17 @@ def _rows_from_partition(part, column_names=None):
     return [], column_names
 
 
-def _collect_result_rows(parts):
+def _collect_raw_result_rows(parts):
     all_rows = []
     column_names = None
     for part in parts:
         rows, column_names = _rows_from_partition(part, column_names)
         all_rows.extend(rows)
-    return [tuple(_stringify_value(val) for val in row) for row in all_rows]
+    return all_rows
+
+
+def _collect_result_rows(parts):
+    return [tuple(_stringify_value(val) for val in row) for row in _collect_raw_result_rows(parts)]
 
 
 def _expected_result_rows(con, sql):
@@ -2836,6 +2840,70 @@ def test_ray_row_preserving_batch_udf_limit_preserves_output_schema(
     assert len(rows) == 5
     assert all(len(row) == 2 for row in rows)
     assert all(int(y) == int(x) + 1 for x, y in rows)
+
+
+def test_ray_streaming_batch_udf_limit_preserves_single_struct_column(
+    ray_runner,
+    duckdb_conn,
+    tmp_path,
+    monkeypatch,
+):
+    pa = pytest.importorskip("pyarrow")
+
+    if ray is None:
+        pytest.skip("ray not installed")
+
+    label = "test_ray_e2e: one struct UDF column across streaming limit"
+    input_path = tmp_path / "streaming_struct_udf_limit"
+    shuffle_dir = tmp_path / "streaming_struct_udf_limit_shuffle"
+    monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+
+    duckdb_conn.execute(f"""
+        COPY (
+            SELECT
+                i::INTEGER AS x,
+                floor(i / 4)::INTEGER AS file_id
+            FROM range(0, 16) AS t(i)
+        ) TO '{input_path}' (FORMAT PARQUET, PARTITION_BY (file_id))
+    """)
+
+    feature_arrow_type = pa.struct([("value", pa.int32()), ("doubled", pa.int32())])
+
+    def make_feature(table):
+        values = table.column("x").to_pylist()
+        features = [{"value": value, "doubled": value * 2} for value in values]
+        return pa.table({"feature": pa.array(features, type=feature_arrow_type)})
+
+    base = duckdb_conn.sql(f"SELECT x FROM read_parquet('{input_path}/**/*.parquet')")
+    feature_type = duckdb.sqltype('STRUCT("value" INTEGER, doubled INTEGER)')
+    relation = base.map_batches(
+        make_feature,
+        schema={"feature": feature_type},
+        execution_backend="ray_task",
+        batch_size=4,
+    ).limit(5)
+
+    ray_cxx = getattr(duckdb, "ray_cxx", None)
+    if ray_cxx is None or not hasattr(ray_cxx, "PyLogicalPlan"):
+        pytest.skip("duckdb.ray_cxx.PyLogicalPlan not available in this environment")
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
+    distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
+    descriptor_counts = [len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values()]
+    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
+    assert distributed_plan.num_partitions() == 4
+    plan_text = distributed_plan.repr_ascii(False).upper()
+    assert "STREAMINGUDF" in plan_text
+    assert "STREAMINGLIMIT" in plan_text
+
+    parts = _run_iter_tables(ray_runner, relation, label, timeout_s=60.0)
+    rows = _collect_raw_result_rows(parts)
+
+    assert len(rows) == 5
+    assert all(len(row) == 1 for row in rows)
+    assert all(feature["doubled"] == feature["value"] * 2 for (feature,) in rows)
 
 
 def test_ray_python_stream_table_udf(ray_runner, duckdb_conn, parquet_path):
