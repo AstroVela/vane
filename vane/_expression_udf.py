@@ -1928,10 +1928,12 @@ def attach_function(
     effective ``return_dtype``. Raw batch callables retain the low-level
     ``pa.Table`` protocol and require ``input_names`` plus ``schema``.
 
-    Decorator return types, batch sizes, and GPU/actor settings cannot be
-    overridden at attach time. Row-oriented class expressions propagate SQL
-    NULL without invoking user code and accept only timezone-naive
-    ``TIMESTAMP`` output; eager calls retain ordinary Python semantics.
+    Decorator return types, GPU/actor settings, and decorator-configured batch
+    sizes cannot be overridden at attach time. A row-oriented ``vane.cls``
+    instance may set ``batch_size`` during attachment. Row-oriented class
+    expressions propagate SQL NULL without invoking user code and accept only
+    timezone-naive ``TIMESTAMP`` output; eager calls retain ordinary Python
+    semantics.
 
     ``replace=True`` atomically replaces an existing Vane alias owned by the
     same connection. Builtins, aliases owned by another connection, and
