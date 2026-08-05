@@ -1658,6 +1658,7 @@ class TestAnthropicTokenMetrics:
         mock_response = MagicMock()
         mock_response.usage = mock_usage
         mock_response.content = [mock_text_block]
+        mock_response.stop_reason = "end_turn"
 
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(return_value=mock_response)
@@ -2708,6 +2709,55 @@ def test_provider_capability_error_never_stringifies_unbounded_upstream_text():
 
     assert error.original_error_summary == "UnboundedError (status_code=503)"
     assert original not in error.__dict__.values()
+
+
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+def test_anthropic_terminal_result_obeys_prompt_error_policy(on_error):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from vane.ai.functions import _PromptBatch
+    from vane.ai.provider import _ProviderResultError
+    from vane.ai.providers.anthropic import AnthropicPrompter
+
+    prompter = AnthropicPrompter.__new__(AnthropicPrompter)
+    prompter._provider_name = "anthropic"
+    prompter._model = "claude-test"
+    prompter._system_message = None
+    prompter._return_format = None
+    prompter._return_raw_response = False
+    prompter._options = {"max_tokens": 64}
+    prompter._client = SimpleNamespace(
+        messages=SimpleNamespace(
+            create=AsyncMock(
+                return_value=SimpleNamespace(
+                    content=[],
+                    usage=None,
+                    stop_reason="refusal",
+                )
+            )
+        )
+    )
+
+    class Descriptor:
+        def instantiate(self):
+            return prompter
+
+    wrapper = _PromptBatch(
+        Descriptor(),
+        ["message"],
+        "response",
+        max_retries=3,
+        on_error=on_error,
+    )
+    table = pa.table({"message": ["hello"]})
+
+    if on_error == "raise":
+        with pytest.raises(_ProviderResultError, match="refused"):
+            _drive(wrapper, table)
+    else:
+        assert _drive(wrapper, table).column("response").to_pylist() == [None]
+    assert prompter._client.messages.create.await_count == 1
 
 
 def test_prompt_batch_retry_and_row_isolation(monkeypatch):

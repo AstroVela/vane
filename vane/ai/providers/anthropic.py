@@ -13,7 +13,7 @@ from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import OutputValidationError, serialize_raw_response
 from vane.ai.options import validate_prompt_options
 from vane.ai.protocols import PrompterDescriptor
-from vane.ai.provider import Provider, ProviderCapabilityError
+from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
 from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
@@ -270,12 +270,43 @@ class AnthropicPrompter:
         if getattr(self, "_return_raw_response", False):
             return serialize_raw_response(response)
 
-        if getattr(response, "stop_reason", None) == "max_tokens":
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason == "max_tokens":
             if self._options.get("max_tokens") == 0:
                 return None
-            raise ValueError(
+            raise _ProviderResultError(
                 f"Anthropic response from model {self._model!r} was truncated at "
                 f"max_tokens={self._options.get('max_tokens')}"
+            )
+        if stop_reason == "model_context_window_exceeded":
+            raise _ProviderResultError(
+                f"Anthropic response from model {self._model!r} was truncated at the model context window"
+            )
+        if stop_reason == "refusal":
+            raise _ProviderResultError(f"Anthropic model {self._model!r} refused the Prompt request")
+        if stop_reason == "pause_turn":
+            raise _ProviderResultError(
+                f"Anthropic response from model {self._model!r} paused before completion; "
+                "Vane Prompt does not support continuing paused turns"
+            )
+
+        if return_format is not None:
+            complete_stop_reasons = ("tool_use",)
+            output_mode = "structured"
+        else:
+            complete_stop_reasons = ("end_turn", "stop_sequence")
+            output_mode = "plain"
+        if stop_reason not in complete_stop_reasons:
+            if stop_reason is None:
+                received_stop_reason = "a missing stop_reason"
+            elif stop_reason in ("end_turn", "stop_sequence", "tool_use"):
+                received_stop_reason = f"stop_reason {stop_reason!r}"
+            else:
+                received_stop_reason = "an unsupported stop_reason"
+            expected_stop_reasons = " or ".join(repr(reason) for reason in complete_stop_reasons)
+            raise _ProviderResultError(
+                f"Anthropic response from model {self._model!r} returned {received_stop_reason} "
+                f"for {output_mode} Prompt output; expected {expected_stop_reasons}"
             )
 
         blocks = getattr(response, "content", None) or []

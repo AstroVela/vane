@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""AnthropicPrompter plain-text extraction across response content blocks.
+"""AnthropicPrompter terminal-state validation and plain-text extraction.
 
 Extended-thinking models return a leading ``thinking`` block (which has
 ``.thinking`` and no ``.text``), so ``prompt`` must concatenate the
@@ -12,13 +12,15 @@ import asyncio
 import sys
 from types import SimpleNamespace
 
+import pytest
 
-def _make_prompter(monkeypatch, content):
+
+def _make_prompter(monkeypatch, content, *, stop_reason="end_turn", max_tokens=64):
     """Build an AnthropicPrompter whose SDK client returns ``content``."""
 
     class FakeMessages:
         async def create(self, **kwargs):
-            return SimpleNamespace(content=content, usage=None)
+            return SimpleNamespace(content=content, usage=None, stop_reason=stop_reason)
 
     class FakeAsyncAnthropic:
         def __init__(self, **options):
@@ -32,7 +34,7 @@ def _make_prompter(monkeypatch, content):
 
     from vane.ai.providers.anthropic import AnthropicPrompter
 
-    return AnthropicPrompter(options={"max_tokens": 64}, model="claude-test")
+    return AnthropicPrompter(options={"max_tokens": max_tokens}, model="claude-test")
 
 
 def _thinking_block(text="Let me think about this."):
@@ -76,5 +78,70 @@ def test_prompt_returns_none_for_thinking_only_content(monkeypatch):
 
 def test_prompt_returns_none_for_empty_content(monkeypatch):
     prompter = _make_prompter(monkeypatch, [])
+
+    assert asyncio.run(prompter.prompt(("hello",))) is None
+
+
+def test_prompt_accepts_configured_stop_sequence(monkeypatch):
+    prompter = _make_prompter(
+        monkeypatch,
+        [_text_block("stopped as configured")],
+        stop_reason="stop_sequence",
+    )
+
+    assert asyncio.run(prompter.prompt(("hello",))) == "stopped as configured"
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "content", "message"),
+    [
+        ("max_tokens", [_text_block("partial answer")], "max_tokens=64"),
+        (
+            "model_context_window_exceeded",
+            [_text_block("partial answer")],
+            "model context window",
+        ),
+        ("refusal", [], "refused"),
+        ("pause_turn", [_text_block("partial answer")], "paused before completion"),
+    ],
+)
+def test_prompt_rejects_unsuccessful_terminal_reasons(monkeypatch, stop_reason, content, message):
+    from vane.ai.provider import _ProviderResultError
+
+    prompter = _make_prompter(monkeypatch, content, stop_reason=stop_reason)
+
+    with pytest.raises(_ProviderResultError, match=message):
+        asyncio.run(prompter.prompt(("hello",)))
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "message"),
+    [
+        (None, r"missing stop_reason.*plain Prompt output.*'end_turn'.*'stop_sequence'"),
+        (
+            "future_stop_reason",
+            r"unsupported stop_reason.*plain Prompt output.*'end_turn'.*'stop_sequence'",
+        ),
+        ("tool_use", r"stop_reason 'tool_use'.*plain Prompt output.*'end_turn'.*'stop_sequence'"),
+    ],
+)
+def test_plain_prompt_rejects_missing_or_unsupported_stop_reason(monkeypatch, stop_reason, message):
+    from vane.ai.provider import _ProviderResultError
+
+    prompter = _make_prompter(
+        monkeypatch,
+        [_text_block("must not be accepted")],
+        stop_reason=stop_reason,
+    )
+
+    with pytest.raises(_ProviderResultError, match=message) as exc_info:
+        asyncio.run(prompter.prompt(("hello",)))
+
+    if stop_reason == "future_stop_reason":
+        assert stop_reason not in str(exc_info.value)
+
+
+def test_zero_max_tokens_prewarm_remains_successful(monkeypatch):
+    prompter = _make_prompter(monkeypatch, [], stop_reason="max_tokens", max_tokens=0)
 
     assert asyncio.run(prompter.prompt(("hello",))) is None
