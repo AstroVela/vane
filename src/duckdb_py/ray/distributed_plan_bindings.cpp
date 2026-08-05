@@ -1207,6 +1207,7 @@ public:
 			bool finished = false;
 			bool canceled = false;
 			bool matched = true;
+			bool registration_pending = false;
 			string status_message;
 			try {
 				duckdb::PythonGILWrapper gil;
@@ -1236,6 +1237,7 @@ public:
 				canceled = OptionalStatusBool(status_obj, "canceled", false);
 				if (!task_contexts.empty()) {
 					matched = RequiredStatusBool(status_obj, "matched");
+					registration_pending = OptionalStatusBool(status_obj, "registration_pending", false);
 				}
 				selected_attempt_task_ids = SelectedAttemptTaskIds(status_obj);
 			} catch (const std::exception &e) {
@@ -1253,10 +1255,13 @@ public:
 				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 				    DuckDBError::external_error("Python backend FTE query canceled: " + status_message));
 			}
-			// Submission and fragment registration are concurrent. A scoped
-			// status lookup may legitimately miss for a short interval after
-			// submit_fte_task_events returns.
-			if (matched && finished) {
+			if (!task_contexts.empty() && !matched) {
+				if (!registration_pending) {
+					return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+					    DuckDBError::external_error(
+					        "Python backend FTE query scope did not match any registered fragment: " + status_message));
+				}
+			} else if (finished) {
 				break;
 			}
 			if (has_deadline && std::chrono::steady_clock::now() >= deadline) {

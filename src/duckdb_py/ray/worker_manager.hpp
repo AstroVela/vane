@@ -111,6 +111,7 @@ private:
 
 	bool BeginOperation() const;
 	void EndOperation() const;
+	bool ShutdownStarted() const;
 	bool RetireWorkerForFailure(const string &worker_id, const std::shared_ptr<RayWorkerRuntime> &worker,
 	                            const std::shared_ptr<std::atomic<bool>> &retired) const;
 	WorkerSnapshotResult WorkerSnapshotsWithoutGIL() const;

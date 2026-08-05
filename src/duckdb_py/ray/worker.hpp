@@ -33,6 +33,8 @@ public:
 		bool failed = false;
 		bool finished = false;
 		bool matched = true;
+		bool canceled = false;
+		bool registration_pending = false;
 		std::string message;
 		std::unordered_set<string> selected_attempt_task_ids;
 	};

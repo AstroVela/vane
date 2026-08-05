@@ -7,6 +7,8 @@ from collections.abc import Mapping
 from typing import Any
 
 from duckdb.runners.ray.fragment_registry import (
+    _FTE_ACTIVE_OPERATIONS_BY_QUERY,
+    _FTE_CLOSING_QUERIES,
     _FTE_FRAGMENT_EXECUTIONS,
     _FTE_REGISTRY_LOCK,
     _FTE_RESULT_HANDLES_BY_QUERY,
@@ -75,6 +77,8 @@ def fte_query_status(
         if None in scoped_contexts:
             raise ValueError("task_context_filter contains an invalid task context")
     with _FTE_REGISTRY_LOCK:
+        registration_pending = _FTE_ACTIVE_OPERATIONS_BY_QUERY.get(query_id, 0) > 0
+        canceled = query_id in _FTE_CLOSING_QUERIES
         all_fragment_execution_items = [
             (fragment_id, fragment_execution)
             for (fragment_execution_query_id, fragment_id), fragment_execution in sorted(
@@ -156,6 +160,8 @@ def fte_query_status(
         "finished_count": finished_count,
         "failed": failed,
         "finished": finished,
+        "canceled": canceled,
+        "registration_pending": registration_pending,
         "selected_attempt_task_ids": selected_attempt_task_ids,
         "fragment_executions": fragment_executions,
         "failed_partitions": failed_partitions,

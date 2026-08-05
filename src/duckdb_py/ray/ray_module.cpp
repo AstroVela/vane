@@ -477,6 +477,20 @@ void register_ray_bindings(py::module_ &mod) {
 		        }
 	        },
 	        py::arg("query_id"), py::arg("timeout_s") = 0.0)
+	    .def(
+	        "_wait_fte_query_scoped_for_test",
+	        [](RayWorkerManager &self, const string &query_id, double timeout_s) {
+		        std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
+		            task_contexts {duckdb::distributed::TaskContext::from_node_context(1, 2, 3)};
+		        auto res = [&]() {
+			        py::gil_scoped_release release;
+			        return self.wait_fte_query(query_id, timeout_s, task_contexts, {});
+		        }();
+		        if (res.is_err()) {
+			        throw duckdb::InternalException(res.error().what());
+		        }
+	        },
+	        py::arg("query_id"), py::arg("timeout_s") = 0.0)
 	    .def("fragment_stats",
 	         [](RayWorkerManager &self) { return BuildFragmentStatsSummary(self.fragment_stats_by_worker()); })
 	    .def("try_autoscale", [](RayWorkerManager &self, py::object bundles_obj) {

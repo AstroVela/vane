@@ -447,6 +447,8 @@ class FteWorkerLifecycleMixin:
             status = fte_query_status(query_id)
             if bool(status.get("failed")):
                 raise RuntimeError(f"FTE query {query_id} failed: {status}")
+            if bool(status.get("canceled")):
+                raise RuntimeError(f"FTE query {query_id} canceled: {status}")
             if bool(status.get("finished")):
                 return status
             if deadline is not None and time.monotonic() >= deadline:

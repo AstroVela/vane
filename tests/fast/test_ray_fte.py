@@ -1309,7 +1309,37 @@ def test_fte_query_status_reports_unmatched_task_scope():
 
     assert status["matched"] is False
     assert status["finished"] is False
+    assert status["registration_pending"] is False
+    assert status["canceled"] is False
     assert status["fragment_execution_count"] == 0
+
+
+def test_fte_query_status_distinguishes_pending_registration_and_query_close():
+    query_id = "q-status-unmatched-lifecycle"
+    task_context_filter = [
+        {
+            "query_idx": 1,
+            "last_node_id": 4,
+            "task_id": 5,
+            "node_ids": [4],
+        }
+    ]
+
+    assert fte_fragment_scheduler.begin_fte_registry_operation(query_id)
+    try:
+        pending_status = fte_query_status(query_id, task_context_filter)
+        fte_fragment_scheduler.close_fte_registry_for_query(query_id)
+        closing_status = fte_query_status(query_id, task_context_filter)
+    finally:
+        fte_fragment_scheduler.end_fte_registry_operation(query_id)
+        fte_fragment_scheduler.open_fte_registry_for_query(query_id)
+
+    assert pending_status["matched"] is False
+    assert pending_status["registration_pending"] is True
+    assert pending_status["canceled"] is False
+    assert closing_status["matched"] is False
+    assert closing_status["registration_pending"] is True
+    assert closing_status["canceled"] is True
 
 
 def test_fte_query_status_handles_multiple_running_attempts():

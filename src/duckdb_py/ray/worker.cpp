@@ -100,6 +100,18 @@ bool RequiredStatusBool(const py::dict &status, const char *field_name) {
 	return value.cast<bool>();
 }
 
+bool OptionalStatusBool(const py::dict &status, const char *field_name, bool default_value = false) {
+	auto key = py::str(field_name);
+	if (!status.contains(key)) {
+		return default_value;
+	}
+	auto value = py::reinterpret_borrow<py::object>(status[key]);
+	if (!py::isinstance<py::bool_>(value)) {
+		throw duckdb::InternalException("FTE query status field '%s' must be boolean", field_name);
+	}
+	return value.cast<bool>();
+}
+
 void FillSelectedAttemptTaskIds(const py::dict &status, RayWorkerRuntime::QueryStatus &result) {
 	auto key = py::str("selected_attempt_task_ids");
 	if (!status.contains(key)) {
@@ -129,6 +141,8 @@ RayWorkerRuntime::QueryStatus ParseFteQueryStatus(const py::object &status_obj, 
 	auto status = status_obj.cast<py::dict>();
 	result.failed = RequiredStatusBool(status, "failed");
 	result.finished = RequiredStatusBool(status, "finished");
+	result.canceled = OptionalStatusBool(status, "canceled");
+	result.registration_pending = OptionalStatusBool(status, "registration_pending");
 	if (scoped) {
 		result.matched = RequiredStatusBool(status, "matched");
 	}
