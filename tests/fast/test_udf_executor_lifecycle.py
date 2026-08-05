@@ -51,7 +51,6 @@ def test_subprocess_actor_warmup_attribute_error_fails_startup():
 def test_udf_resource_and_layout_validation_has_no_silent_fallbacks():
     from duckdb.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
     from duckdb.execution.udf_ray_config import payload_num_cpus, payload_num_gpus, stream_output_enabled
-    from duckdb.execution.udf_ray_env import normalize_actor_node_ids
     from duckdb.execution.udf_threading import payload_cpu_thread_count
 
     with pytest.raises(ValueError, match="cpus"):
@@ -66,8 +65,6 @@ def test_udf_resource_and_layout_validation_has_no_silent_fallbacks():
         stream_output_enabled({"stream_output": "true"})
     with pytest.raises(ValueError, match="cpus"):
         payload_cpu_thread_count({"cpus": "invalid"})
-    with pytest.raises(ValueError, match="actor node IDs"):
-        normalize_actor_node_ids(["node-a"], expected_count=2)
 
     def identity(table):
         return table
@@ -6729,7 +6726,6 @@ def test_ray_task_submit_with_id_uses_generator_remote_with_pregranted_lease(mon
     import duckdb.execution.udf_ray as udf_ray
 
     captured = {}
-    submitted_nodes = []
 
     class _Pregranted:
         def __init__(self, **kwargs):
@@ -6737,14 +6733,6 @@ def test_ray_task_submit_with_id_uses_generator_remote_with_pregranted_lease(mon
             self.generator = kwargs["submitter"](dict(kwargs["admission"].lease))
 
     monkeypatch.setattr(udf_ray, "TaskLeaseObjectRefGenerator", _Pregranted)
-    monkeypatch.setattr(
-        udf_ray,
-        "_submit_ray_remote",
-        lambda remote_fn, node_id, *args, **kwargs: (
-            submitted_nodes.append(str(node_id)),
-            remote_fn.remote(*args, **kwargs),
-        )[1],
-    )
     executor, run_stream, _ = _ray_task_executor(stream_result="generator")
     table = pa.table({"x": [1, 2]})
     lease = {
@@ -6752,7 +6740,8 @@ def test_ray_task_submit_with_id_uses_generator_remote_with_pregranted_lease(mon
         "resource_unit_id": "resource:query-submit:udf:node:1",
         "lease_id": "lease-42",
         "attempt_id": "attempt-42",
-        "node_id": "node-a",
+        "node_id": None,
+        "actor_index": None,
         "execution_slot_id": "ray_task:resource:query-submit:udf:node:1:lease-42",
         "output_window_bytes": 256 * 1024**2,
     }
@@ -6764,7 +6753,6 @@ def test_ray_task_submit_with_id_uses_generator_remote_with_pregranted_lease(mon
     assert isinstance(result, _Pregranted)
     assert result.generator == "generator"
     assert captured["admission"] is admission
-    assert submitted_nodes == ["node-a"]
     assert len(run_stream.calls) == 1
 
     args, kwargs = run_stream.calls[0]
@@ -6772,6 +6760,7 @@ def test_ray_task_submit_with_id_uses_generator_remote_with_pregranted_lease(mon
     assert args[0]["execution_backend"] == "ray_task"
     assert args[0]["task_lease_id"] == "lease-42"
     assert args[0]["attempt_id"] == "attempt-42"
+    assert "node_id" not in args[0]
     assert len(args[1]) == 1
     assert args[1][0].to_pydict() == {"x": [1, 2]}
 
@@ -6780,7 +6769,6 @@ def test_ray_task_submit_ref_bundle_with_id_uses_pregranted_lease(monkeypatch):
     import duckdb.execution.udf_ray as udf_ray
 
     captured = {}
-    submitted_nodes = []
 
     class _Pregranted:
         def __init__(self, **kwargs):
@@ -6788,21 +6776,14 @@ def test_ray_task_submit_ref_bundle_with_id_uses_pregranted_lease(monkeypatch):
             self.generator = kwargs["submitter"](dict(kwargs["admission"].lease))
 
     monkeypatch.setattr(udf_ray, "TaskLeaseObjectRefGenerator", _Pregranted)
-    monkeypatch.setattr(
-        udf_ray,
-        "_submit_ray_remote",
-        lambda remote_fn, node_id, *args, **kwargs: (
-            submitted_nodes.append(str(node_id)),
-            remote_fn.remote(*args, **kwargs),
-        )[1],
-    )
     executor, _, run_ref_stream = _ray_task_executor(ref_stream_result="ref-generator")
     lease = {
         "query_id": "query-submit",
         "resource_unit_id": "resource:query-submit:udf:node:1",
         "lease_id": "lease-7",
         "attempt_id": "attempt-7",
-        "node_id": "node-a",
+        "node_id": None,
+        "actor_index": None,
         "execution_slot_id": "ray_task:resource:query-submit:udf:node:1:lease-7",
         "output_window_bytes": 256 * 1024**2,
     }
@@ -6820,7 +6801,6 @@ def test_ray_task_submit_ref_bundle_with_id_uses_pregranted_lease(monkeypatch):
     assert isinstance(result, _Pregranted)
     assert result.generator == "ref-generator"
     assert captured["admission"] is admission
-    assert submitted_nodes == ["node-a"]
     assert len(run_ref_stream.calls) == 1
 
     args, kwargs = run_ref_stream.calls[0]
@@ -6828,6 +6808,7 @@ def test_ray_task_submit_ref_bundle_with_id_uses_pregranted_lease(monkeypatch):
     assert kwargs["payload"]["execution_backend"] == "ray_task"
     assert kwargs["payload"]["task_lease_id"] == "lease-7"
     assert kwargs["payload"]["attempt_id"] == "attempt-7"
+    assert "node_id" not in kwargs["payload"]
     assert kwargs["slices"] == [(0, 1)]
     assert kwargs["metadata"] == [{"num_rows": 1, "size_bytes": 8}]
     assert kwargs["names"] == ["x"]

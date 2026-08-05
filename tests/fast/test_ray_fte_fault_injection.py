@@ -32,7 +32,6 @@ from duckdb.runners.ray.fte_fragment_scheduler import (
     ensure_fte_fragment_progress_topology,
 )
 from duckdb.runners.ray.query_resource_graph import (
-    NodeResourceAllocation,
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
@@ -319,12 +318,6 @@ def _register_fault_query(tasks) -> None:
         ),
         QueryAllocation(
             resources=allocation_resources,
-            node_allocations=(
-                NodeResourceAllocation(
-                    node_id=str(ray.get_runtime_context().get_node_id()),
-                    resources=allocation_resources,
-                ),
-            ),
             generation=1,
         ),
     )

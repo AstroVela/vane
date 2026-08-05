@@ -13,7 +13,6 @@ import pytest
 
 from duckdb.runners.ray.admission_ledger import BoundedReplayMap
 from duckdb.runners.ray.query_resource_graph import (
-    NodeResourceAllocation,
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
@@ -57,7 +56,6 @@ def _allocation() -> QueryAllocation:
     resources = ResourceVector(cpu=1, heap_bytes=101, object_store_bytes=40)
     return QueryAllocation(
         resources=resources,
-        node_allocations=(NodeResourceAllocation(node_id="node-a", resources=resources),),
         generation=1,
     )
 
@@ -2872,12 +2870,6 @@ def test_task_admission_pump_drains_a_bounded_batch_per_event_loop_turn():
         manager.update_allocation(
             QueryAllocation(
                 resources=resources,
-                node_allocations=(
-                    NodeResourceAllocation(
-                        node_id="node-a",
-                        resources=resources,
-                    ),
-                ),
                 generation=2,
             ),
             admission_open=True,
@@ -2922,12 +2914,6 @@ def test_output_admission_pump_drains_a_bounded_batch_per_event_loop_turn():
             graph,
             QueryAllocation(
                 resources=initial_resources,
-                node_allocations=(
-                    NodeResourceAllocation(
-                        node_id="node-a",
-                        resources=initial_resources,
-                    ),
-                ),
                 generation=1,
             ),
         )
@@ -2968,12 +2954,6 @@ def test_output_admission_pump_drains_a_bounded_batch_per_event_loop_turn():
         manager.update_allocation(
             QueryAllocation(
                 resources=expanded_resources,
-                node_allocations=(
-                    NodeResourceAllocation(
-                        node_id="node-a",
-                        resources=expanded_resources,
-                    ),
-                ),
                 generation=2,
             ),
             admission_open=True,

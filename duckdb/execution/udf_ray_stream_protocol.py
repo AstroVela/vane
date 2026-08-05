@@ -18,19 +18,15 @@ RAY_UDF_GENERATOR_BACKPRESSURE_OBJECTS = RAY_UDF_STREAM_OBJECTS_PER_BLOCK * RAY_
 
 
 def validate_task_runtime_node(payload: dict[str, Any]) -> str:
-    expected_node_id = str(payload.get("node_id") or "").strip()
-    if not expected_node_id:
-        raise RuntimeError("distributed Ray UDF task payload is missing leased node_id")
+    if str(payload.get("execution_backend") or "").strip() != "ray_task":
+        raise RuntimeError("task runtime node discovery requires the ray_task backend")
+    if str(payload.get("node_id") or "").strip():
+        raise RuntimeError("Ray task payload must leave physical placement to Ray Core")
     import ray
 
     actual_node_id = str(ray.get_runtime_context().get_node_id() or "").strip()
     if not actual_node_id:
         raise RuntimeError("Ray runtime context did not expose the executing node_id")
-    if actual_node_id != expected_node_id:
-        raise RuntimeError(
-            "distributed Ray UDF executed outside its query lease: "
-            f"expected_node_id={expected_node_id} actual_node_id={actual_node_id}"
-        )
     return actual_node_id
 
 
@@ -83,13 +79,10 @@ def task_payload_with_lease(payload: dict[str, Any], lease: dict[str, Any]) -> d
     resource_unit_id = str(lease.get("resource_unit_id") or "").strip()
     lease_id = str(lease.get("lease_id") or "").strip()
     attempt_id = str(lease.get("attempt_id") or "").strip()
-    node_id = str(lease.get("node_id") or "").strip()
     execution_slot_id = str(lease.get("execution_slot_id") or "").strip()
     output_window_bytes = int(lease.get("output_window_bytes") or 0)
-    if not query_id or not resource_unit_id or not lease_id or not attempt_id or not node_id or not execution_slot_id:
-        raise ValueError(
-            "task lease is missing query, resource unit, lease, attempt, Ray node, or execution slot identity"
-        )
+    if not query_id or not resource_unit_id or not lease_id or not attempt_id or not execution_slot_id:
+        raise ValueError("task lease is missing query, resource unit, lease, attempt, or execution slot identity")
     if str(merged.get("query_id") or "").strip() != query_id:
         raise ValueError("UDF payload query_id does not match task lease")
     if str(merged.get("resource_unit_id") or "").strip() != resource_unit_id:
@@ -97,6 +90,9 @@ def task_payload_with_lease(payload: dict[str, Any], lease: dict[str, Any]) -> d
     backend = str(merged.get("execution_backend") or "").strip()
     raw_actor_index = lease.get("actor_index")
     if backend == "ray_actor":
+        node_id = str(lease.get("node_id") or "").strip()
+        if not node_id:
+            raise ValueError("Ray actor task lease is missing its runtime node")
         if isinstance(raw_actor_index, bool) or not isinstance(raw_actor_index, int) or raw_actor_index < 0:
             raise ValueError("Ray actor task lease is missing a valid actor_index")
         expected_slot_id = f"ray_actor:{resource_unit_id}:{raw_actor_index}"
@@ -106,6 +102,8 @@ def task_payload_with_lease(payload: dict[str, Any], lease: dict[str, Any]) -> d
                 f"slot={execution_slot_id} expected={expected_slot_id}"
             )
     elif backend == "ray_task":
+        if lease.get("node_id") is not None:
+            raise ValueError("Ray task lease must leave physical placement to Ray Core")
         if raw_actor_index is not None:
             raise ValueError("Ray task lease must not contain actor_index")
         expected_slot_id = f"ray_task:{resource_unit_id}:{lease_id}"
@@ -127,7 +125,10 @@ def task_payload_with_lease(payload: dict[str, Any], lease: dict[str, Any]) -> d
         )
     merged["task_lease_id"] = lease_id
     merged["attempt_id"] = attempt_id
-    merged["node_id"] = node_id
+    if backend == "ray_actor":
+        merged["node_id"] = node_id
+    else:
+        merged.pop("node_id", None)
     merged["execution_slot_id"] = execution_slot_id
     merged["actor_index"] = raw_actor_index
     merged["output_window_bytes"] = output_window_bytes

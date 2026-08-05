@@ -19,7 +19,6 @@ def _distributed_payload(**overrides):
         "execution_backend": "ray_task",
         "query_id": "q1",
         "resource_unit_id": "resource:q1:udf:node:1",
-        "node_id": _NODE_ID,
         "produce_ray_block_stream": True,
         "call_mode": "map_batches",
         "cpus": 1.0,
@@ -96,7 +95,7 @@ def test_task_payload_accepts_registered_downstream_retention_window_multiple():
         "query_id": payload["query_id"],
         "resource_unit_id": payload["resource_unit_id"],
         "attempt_id": "attempt-retention",
-        "node_id": _NODE_ID,
+        "node_id": None,
         "execution_slot_id": f"ray_task:{payload['resource_unit_id']}:lease-retention",
         "output_window_bytes": 64 * 1024,
     }
@@ -116,7 +115,7 @@ def test_task_payload_rejects_invalid_registered_retention_window(window):
         "query_id": payload["query_id"],
         "resource_unit_id": payload["resource_unit_id"],
         "attempt_id": "attempt-invalid-retention",
-        "node_id": _NODE_ID,
+        "node_id": None,
         "execution_slot_id": f"ray_task:{payload['resource_unit_id']}:lease-invalid-retention",
         "output_window_bytes": window,
     }
@@ -125,9 +124,7 @@ def test_task_payload_rejects_invalid_registered_retention_window(window):
         task_payload_with_lease(payload, lease)
 
 
-def test_ray_task_remote_keeps_options_available_for_lease_node_affinity():
-    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
+def test_ray_task_remote_keeps_regular_ray_remote_options_available():
     import duckdb.execution.udf_ray as fur
     from duckdb.runners.ray.ray_env import build_session_runtime_env_vars
 
@@ -136,12 +133,7 @@ def test_ray_task_remote_keeps_options_available_for_lease_node_affinity():
         fur._build_ref_bundle_stream_remote,
     ):
         remote_fn = builder(1.0, 0.0, 2 * _GIB, 2, {}, build_session_runtime_env_vars({}))
-        scheduled = remote_fn.options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=_NODE_ID,
-                soft=False,
-            )
-        )
+        scheduled = remote_fn.options(name="test-ray-task")
         assert callable(scheduled.remote)
 
 
@@ -251,7 +243,7 @@ def test_task_executor_consumes_pregranted_admission_with_exact_resources(monkey
         request_id="request-7",
         lease={
             "lease_id": "lease-7",
-            "node_id": _NODE_ID,
+            "node_id": None,
             "execution_slot_id": "ray_task:resource:q1:udf:node:1:lease-7",
         },
     )
@@ -276,9 +268,7 @@ def test_task_submission_starts_immediately_from_pregranted_lease(monkeypatch):
 
     class _Remote:
         def options(self, **options):
-            assert options["scheduling_strategy"].node_id == _NODE_ID
-            assert options["scheduling_strategy"].soft is False
-            return self
+            raise AssertionError(f"Ray task submission must not override placement: {options}")
 
         def remote(self, *args, **kwargs):
             submitted.append((args, kwargs))
@@ -297,7 +287,7 @@ def test_task_submission_starts_immediately_from_pregranted_lease(monkeypatch):
         "resource_unit_id": "resource:q1:udf:node:1",
         "lease_id": "lease-8",
         "attempt_id": "attempt-8",
-        "node_id": _NODE_ID,
+        "node_id": None,
         "execution_slot_id": "ray_task:resource:q1:udf:node:1:lease-8",
         "output_window_bytes": 2 * _DEFAULT_OUTPUT_TARGET,
     }
@@ -489,10 +479,6 @@ def test_actor_pool_requests_logical_memory_and_initializes_eagerly(monkeypatch)
                 "working_dir": "/tmp/actor-runtime",
             }
 
-        @staticmethod
-        def _normalize_actor_node_ids(node_ids, *, expected_count):
-            return node_ids
-
     fake_ray = SimpleNamespace(put=lambda value: ("payload-ref", value))
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
     _Pool(
@@ -503,7 +489,6 @@ def test_actor_pool_requests_logical_memory_and_initializes_eagerly(monkeypatch)
         },
         concurrency=1,
         gpus_per_actor=1.0,
-        actor_node_ids=[_NODE_ID],
     )
 
     assert actor_options[0]["num_cpus"] == 2.0
@@ -523,8 +508,7 @@ def test_actor_pool_requests_logical_memory_and_initializes_eagerly(monkeypatch)
         "EXPLICIT_ACTOR_ENV": "yes",
         RAY_ACTOR_INDEX_ENV: "0",
     }
-    assert actor_options[0]["scheduling_strategy"].node_id == _NODE_ID
-    assert actor_options[0]["scheduling_strategy"].soft is False
+    assert "scheduling_strategy" not in actor_options[0]
     assert len(init_calls) == 1
     assert len(init_calls[0]) == 1
 
@@ -564,10 +548,6 @@ def test_actor_pool_omits_undeclared_heap_and_removes_runtime_override(monkeypat
         def _build_actor_runtime_env(_options):
             return {}
 
-        @staticmethod
-        def _normalize_actor_node_ids(node_ids, *, expected_count):
-            return node_ids
-
     fake_ray = SimpleNamespace(put=lambda value: ("payload-ref", value))
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
     _Pool(
@@ -577,7 +557,6 @@ def test_actor_pool_omits_undeclared_heap_and_removes_runtime_override(monkeypat
         },
         concurrency=1,
         gpus_per_actor=0.0,
-        actor_node_ids=[_NODE_ID],
         ray_options={"memory": 3 * _GIB},
     )
 
@@ -620,10 +599,6 @@ def test_actor_pool_thread_env_uses_payload_cpu_allocation(monkeypatch):
         def _build_actor_runtime_env(_options):
             return {"env_vars": {"OMP_NUM_THREADS": "6"}}
 
-        @staticmethod
-        def _normalize_actor_node_ids(node_ids, *, expected_count):
-            return node_ids
-
     fake_ray = SimpleNamespace(put=lambda value: ("payload-ref", value))
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
     _Pool(
@@ -634,7 +609,6 @@ def test_actor_pool_thread_env_uses_payload_cpu_allocation(monkeypatch):
         },
         concurrency=1,
         gpus_per_actor=1.0,
-        actor_node_ids=[_NODE_ID],
     )
 
     env_vars = actor_options[0]["runtime_env"]["env_vars"]
@@ -686,10 +660,6 @@ def test_actor_pool_default_thread_policy_defers_thread_env_to_ray(monkeypatch):
         def _build_actor_runtime_env(_options):
             return {"env_vars": {"EXPLICIT_ACTOR_ENV": "yes"}}
 
-        @staticmethod
-        def _normalize_actor_node_ids(node_ids, *, expected_count):
-            return node_ids
-
     fake_ray = SimpleNamespace(put=lambda value: ("payload-ref", value))
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
     _Pool(
@@ -699,7 +669,6 @@ def test_actor_pool_default_thread_policy_defers_thread_env_to_ray(monkeypatch):
         },
         concurrency=1,
         gpus_per_actor=1.0,
-        actor_node_ids=[_NODE_ID],
     )
 
     env_vars = actor_options[0]["runtime_env"]["env_vars"]

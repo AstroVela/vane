@@ -39,7 +39,6 @@ def _registered_low_level_plan(
 ):
     """Exercise the internal C++ runner under the mandatory graph contract."""
     from duckdb.runners.ray.query_resource_graph import (
-        NodeResourceAllocation,
         QueryAllocation,
         ResourceVector,
     )
@@ -82,12 +81,6 @@ def _registered_low_level_plan(
         manager_holder["manager"].update_allocation(
             QueryAllocation(
                 resources=allocation_resources,
-                node_allocations=(
-                    NodeResourceAllocation(
-                        node_id=node_id,
-                        resources=allocation_resources,
-                    ),
-                ),
                 generation=generation,
             ),
             admission_open=True,
@@ -97,12 +90,6 @@ def _registered_low_level_plan(
         graph,
         QueryAllocation(
             resources=allocation_resources,
-            node_allocations=(
-                NodeResourceAllocation(
-                    node_id=node_id,
-                    resources=allocation_resources,
-                ),
-            ),
             generation=1,
         ),
         on_eligible_units_change=_refresh_phase_allocation,
@@ -355,7 +342,6 @@ def test_driver_connection_applies_duckdb_execution_width(monkeypatch):
 
 def test_driver_reconciles_reconstructed_actor_location_and_public_leases():
     from duckdb.runners.ray.query_resource_graph import (
-        NodeResourceAllocation,
         QueryAllocation,
         QueryResourceGraph,
         ResourceUnitSpec,
@@ -395,16 +381,6 @@ def test_driver_reconciles_reconstructed_actor_location_and_public_leases():
     )
     allocation = QueryAllocation(
         resources=resources,
-        node_allocations=(
-            NodeResourceAllocation(
-                node_id="node-a",
-                resources=ResourceVector(cpu=1, heap_bytes=4, object_store_bytes=10),
-            ),
-            NodeResourceAllocation(
-                node_id="node-b",
-                resources=ResourceVector(cpu=1, heap_bytes=4, object_store_bytes=10),
-            ),
-        ),
         generation=1,
     )
     manager = register_query_resource_graph(graph, allocation)
@@ -619,7 +595,6 @@ def _bind_test_query_resource_owner(
     query_id: str | None = None,
 ):
     from duckdb.runners.ray.query_resource_graph import (
-        NodeResourceAllocation,
         QueryAllocation,
         QueryResourceGraph,
         ResourceUnitSpec,
@@ -651,7 +626,6 @@ def _bind_test_query_resource_owner(
         graph,
         QueryAllocation(
             resources=resources,
-            node_allocations=(NodeResourceAllocation(node_id="node-a", resources=resources),),
             generation=1,
         ),
     )

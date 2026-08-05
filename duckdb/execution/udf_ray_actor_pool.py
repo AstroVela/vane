@@ -91,7 +91,6 @@ class UDFActorPoolBase:
         payload: dict[str, Any],
         concurrency: int,
         gpus_per_actor: float,
-        actor_node_ids: list[str] | None,
         ray_options: dict[str, Any] | None = None,
         max_restarts: int = MAX_ACTOR_RESTARTS,
         max_task_retries: int = MAX_ACTOR_TASK_RETRIES,
@@ -105,7 +104,7 @@ class UDFActorPoolBase:
         Actor = self._actor_class(max_restarts, max_task_retries)
         options = dict(ray_options or {})
         if "scheduling_strategy" in options:
-            raise ValueError("UDF actor scheduling_strategy is owned by Vane")
+            raise ValueError("UDF actor scheduling_strategy must leave placement to Ray Core")
         options["num_cpus"] = self._resolve_actor_num_cpus(payload)
         options["num_gpus"] = gpus_per_actor
         options.pop("memory", None)
@@ -119,30 +118,9 @@ class UDFActorPoolBase:
             payload,
         )
         options["runtime_env"] = runtime_env
-        normalized_node_ids = self._normalize_actor_node_ids(
-            actor_node_ids,
-            expected_count=concurrency,
-        )
-        actor_options: list[dict[str, Any]] = []
-        if normalized_node_ids is None:
-            # Ray Core owns actual actor placement. Query admission proves that
-            # at least one actor of this shape can run on a concrete node; the
-            # remaining fixed-pool handles may stay PENDING instead of turning
-            # full pool multiplicity into a hard admission gate.
-            actor_options = [dict(options) for _ in range(concurrency)]
-        else:
-            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
-            actor_options = [
-                {
-                    **options,
-                    "scheduling_strategy": NodeAffinitySchedulingStrategy(
-                        node_id=str(node_id),
-                        soft=False,
-                    ),
-                }
-                for node_id in normalized_node_ids
-            ]
+        # Submit the real actor requests without a Vane-selected node. Ray Core
+        # owns placement, pending demand, autoscaling, and reconstruction.
+        actor_options = [dict(options) for _ in range(concurrency)]
         for actor_index, actor_option in enumerate(actor_options):
             runtime_env = dict(actor_option.get("runtime_env") or {})
             env_vars = dict(runtime_env.get("env_vars") or {})
@@ -150,7 +128,7 @@ class UDFActorPoolBase:
             runtime_env["env_vars"] = env_vars
             actor_option["runtime_env"] = runtime_env
         self._owns_actors = True
-        self.actor_node_ids: list[str] = [""] * concurrency if normalized_node_ids is None else normalized_node_ids
+        self.actor_node_ids: list[str] = [""] * concurrency
         self._payload = payload
 
         import ray
@@ -197,14 +175,6 @@ class UDFActorPoolBase:
 
     @staticmethod
     def _build_actor_runtime_env(ray_options: dict[str, Any] | None) -> dict[str, Any]:
-        raise NotImplementedError
-
-    @staticmethod
-    def _normalize_actor_node_ids(
-        node_ids: list[str] | None,
-        *,
-        expected_count: int,
-    ) -> list[str] | None:
         raise NotImplementedError
 
     @classmethod
@@ -450,7 +420,6 @@ def ensure_actor_pools_for_plan(
     plan: Any,
     conn: Any = None,
     *,
-    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -466,7 +435,6 @@ def ensure_actor_pools_for_plan(
     udf_nodes = plan.collect_udf_nodes(conn=conn)
     return ensure_actor_pools_for_nodes(
         udf_nodes,
-        actor_node_ids_by_unit=actor_node_ids_by_unit,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -486,7 +454,6 @@ def prepare_actor_pools_for_plan(
     plan: Any,
     conn: Any = None,
     *,
-    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -509,7 +476,6 @@ def prepare_actor_pools_for_plan(
     udf_nodes = plan.collect_udf_nodes(conn=conn)
     return _create_actor_pools_for_nodes(
         udf_nodes,
-        actor_node_ids_by_unit=actor_node_ids_by_unit,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -529,7 +495,6 @@ def prepare_actor_pools_for_plan(
 def ensure_actor_pools_for_nodes(
     udf_nodes: Any,
     *,
-    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -545,7 +510,6 @@ def ensure_actor_pools_for_nodes(
 ) -> tuple[list[UDFActorPoolBase], dict[str, Any]]:
     return _create_actor_pools_for_nodes(
         udf_nodes,
-        actor_node_ids_by_unit=actor_node_ids_by_unit,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -565,7 +529,6 @@ def ensure_actor_pools_for_nodes(
 def prepare_actor_pools_for_nodes(
     udf_nodes: Any,
     *,
-    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -581,7 +544,6 @@ def prepare_actor_pools_for_nodes(
 ) -> tuple[list[UDFActorPoolBase], dict[str, Any]]:
     return _create_actor_pools_for_nodes(
         udf_nodes,
-        actor_node_ids_by_unit=actor_node_ids_by_unit,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -601,7 +563,6 @@ def prepare_actor_pools_for_nodes(
 def _create_actor_pools_for_nodes(
     udf_nodes: Any,
     *,
-    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -668,13 +629,6 @@ def _create_actor_pools_for_nodes(
                 raise RuntimeError(f"Ray actor UDF node {node_id} is missing query_id")
             concurrency = required_positive_int(node, "actor_pool_size")
             _validate_stateful_actor_pool_contract(payload, concurrency)
-            assigned_node_ids = tuple(actor_node_ids_by_unit.get(resource_unit_id, ()))
-            if assigned_node_ids and len(assigned_node_ids) != concurrency:
-                raise RuntimeError(
-                    f"Ray actor UDF resource unit {resource_unit_id} requires either no fixed placement or "
-                    f"{concurrency} explicit placements, "
-                    f"got {len(assigned_node_ids)}"
-                )
             cpus = resolve_actor_num_cpus(payload)
             actor_location_nonce = secrets.token_urlsafe(32)
             ray_options = {
@@ -701,7 +655,6 @@ def _create_actor_pools_for_nodes(
                 payload=payload,
                 concurrency=concurrency,
                 gpus_per_actor=gpus,
-                actor_node_ids=(list(assigned_node_ids) if assigned_node_ids else None),
                 ray_options=ray_options,
                 **fault_tolerance_options,
             )

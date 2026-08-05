@@ -39,29 +39,26 @@ def _node(
 def _demand(
     query_id: str,
     *,
-    minimum: ResourceVector,
     desired: ResourceVector,
     weight: float = 1,
     priority: int = 0,
 ) -> QueryDemand:
     return QueryDemand(
         query_id=query_id,
-        minimum=minimum,
         desired=desired,
         weight=weight,
         priority=priority,
-        placement_bundles=() if minimum.is_zero() else (minimum,),
     )
 
 
-def _inject_failure_once(monkeypatch, target, attribute, *, fail_on_call=1):
+def _inject_failure_once(monkeypatch, target, attribute):
     original = getattr(target, attribute)
-    calls = 0
+    called = False
 
     def fail_once(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == fail_on_call:
+        nonlocal called
+        if not called:
+            called = True
             raise RuntimeError(f"injected {attribute} failure")
         return original(*args, **kwargs)
 
@@ -134,60 +131,213 @@ def test_ray_capacity_never_uses_host_memory_or_cpu_fallback(monkeypatch):
     assert capacities[0].resources == _r(cpu=2, heap=180, store=200)
 
 
-def test_soft_only_query_gets_node_allocation_without_native_hard_minimum():
+def test_single_query_gets_aggregate_soft_budget_without_node_placement():
     coordinator = ClusterQueryResourceCoordinator(
-        (_node("node-a", cpu=8, heap=1_000, store=400),),
+        (
+            _node("node-a", cpu=4, gpu=1, heap=400, store=300),
+            _node("node-b", cpu=2, heap=200, store=100),
+        )
     )
 
     allocation = coordinator.register_query(
-        _demand(
-            "native-only",
-            minimum=_r(),
-            desired=_r(store=400),
-        ),
+        _demand("q", desired=_r(cpu=8, gpu=2, heap=800, store=800)),
         now=0,
     )
 
-    assert allocation.resources == _r(store=400)
-    assert allocation.node_allocations[0].node_id == "node-a"
-    assert allocation.node_allocations[0].resources == _r(store=400)
-    assert coordinator.query_state("native-only", allocation.generation) == "RUNNING"
+    assert allocation.resources == _r(cpu=6, gpu=1, heap=600, store=400)
+    assert allocation.to_dict() == {
+        "resources": _r(cpu=6, gpu=1, heap=600, store=400).to_dict(),
+        "generation": allocation.generation,
+    }
+    assert coordinator.query_state("q", allocation.generation) == "RUNNING"
+
+
+def test_zero_cluster_capacity_keeps_query_running_with_zero_soft_budget():
+    coordinator = ClusterQueryResourceCoordinator(())
+
+    allocation = coordinator.register_query(
+        _demand("q", desired=_r(cpu=1, gpu=1, heap=100, store=100)),
+        now=0,
+    )
+
+    assert allocation.resources.is_zero()
+    assert coordinator.query_state("q", allocation.generation) == "RUNNING"
+    assert coordinator.snapshot()["queries"]["q"]["state"] == "RUNNING"
+
+
+def test_query_shape_is_not_bin_packed_or_pre_admitted():
+    coordinator = ClusterQueryResourceCoordinator(
+        (
+            _node("gpu-a", cpu=4, gpu=1, store=100),
+            _node("gpu-b", cpu=4, gpu=1, store=100),
+        )
+    )
+
+    allocation = coordinator.register_query(
+        _demand("needs-two-gpus-per-task", desired=_r(cpu=1, gpu=2, store=200)),
+        now=0,
+    )
+
+    # No current node can run a 2-GPU task. The coordinator still publishes an
+    # aggregate soft budget and lets the real Ray request remain pending so the
+    # autoscaler can observe it.
+    assert allocation.resources == _r(cpu=1, gpu=2, store=200)
+    assert coordinator.query_state("needs-two-gpus-per-task", allocation.generation) == "RUNNING"
+
+
+def test_equal_weight_queries_share_every_contended_dimension():
+    coordinator = ClusterQueryResourceCoordinator((_node("n", cpu=8, gpu=2, heap=800, store=801),))
+    first = coordinator.register_query(
+        _demand("first", desired=_r(cpu=8, gpu=2, heap=800, store=801)),
+        now=0,
+    )
+    second = coordinator.register_query(
+        _demand("second", desired=_r(cpu=8, gpu=2, heap=800, store=801)),
+        now=0,
+    )
+
+    snapshot = coordinator.snapshot()["queries"]
+    first_resources = snapshot["first"]["allocation"]["resources"]
+    second_resources = snapshot["second"]["allocation"]["resources"]
+    assert first_resources == _r(cpu=4, gpu=1, heap=400, store=401).to_dict()
+    assert second_resources == _r(cpu=4, gpu=1, heap=400, store=400).to_dict()
+    assert first.generation < second.generation
+
+
+def test_weighted_queries_receive_weighted_max_min_shares():
+    coordinator = ClusterQueryResourceCoordinator((_node("n", cpu=9, gpu=3, heap=900, store=900),))
+    coordinator.register_query(
+        _demand("one", desired=_r(cpu=9, gpu=3, heap=900, store=900), weight=1),
+        now=0,
+    )
+    coordinator.register_query(
+        _demand("two", desired=_r(cpu=9, gpu=3, heap=900, store=900), weight=2),
+        now=0,
+    )
+
+    allocations = {
+        query_id: payload["allocation"]["resources"] for query_id, payload in coordinator.snapshot()["queries"].items()
+    }
+    assert allocations["one"] == _r(cpu=3, gpu=1, heap=300, store=300).to_dict()
+    assert allocations["two"] == _r(cpu=6, gpu=2, heap=600, store=600).to_dict()
+
+
+def test_noncompeting_resource_demands_each_use_the_full_dimension():
+    coordinator = ClusterQueryResourceCoordinator((_node("n", cpu=8, gpu=2, heap=800, store=600),))
+    coordinator.register_query(
+        _demand("cpu", desired=_r(cpu=8, heap=800)),
+        now=0,
+    )
+    coordinator.register_query(
+        _demand("gpu-store", desired=_r(gpu=2, store=600)),
+        now=0,
+    )
+
+    queries = coordinator.snapshot()["queries"]
+    assert queries["cpu"]["allocation"]["resources"] == _r(cpu=8, heap=800).to_dict()
+    assert queries["gpu-store"]["allocation"]["resources"] == _r(gpu=2, store=600).to_dict()
+
+
+def test_capacity_shrink_reduces_budget_but_records_only_soft_debt():
+    coordinator = ClusterQueryResourceCoordinator((_node("n", cpu=4, heap=400, store=400),))
+    allocation = coordinator.register_query(
+        _demand("q", desired=_r(cpu=4, heap=400, store=400)),
+        now=0,
+    )
+    allocation = coordinator.refresh_query(
+        "q",
+        observed_usage=_r(cpu=3, heap=300, store=250),
+        generation=allocation.generation,
+        now=1,
+    )
+
+    coordinator.update_node_capacities((_node("n", cpu=1, heap=100, store=100),))
+    query = coordinator.snapshot()["queries"]["q"]
+
+    assert query["state"] == "RUNNING"
+    assert query["allocation"]["resources"] == _r(cpu=1, heap=100, store=100).to_dict()
+    assert query["soft_allocation_debt"] == _r(cpu=2, heap=200, store=150).to_dict()
+    assert coordinator.query_state("q", query["allocation"]["generation"]) == "RUNNING"
+
+
+def test_capacity_recovery_expands_zero_budget_without_reregistering():
+    coordinator = ClusterQueryResourceCoordinator(())
+    allocation = coordinator.register_query(
+        _demand("q", desired=_r(cpu=2, heap=200, store=300)),
+        now=0,
+    )
+
+    coordinator.update_node_capacities((_node("new", cpu=2, heap=200, store=300),))
+    query = coordinator.snapshot()["queries"]["q"]
+
+    assert query["allocation"]["generation"] > allocation.generation
+    assert query["allocation"]["resources"] == _r(cpu=2, heap=200, store=300).to_dict()
+
+
+def test_refresh_queries_is_atomic_and_can_update_phase_demand():
+    coordinator = ClusterQueryResourceCoordinator((_node("n", cpu=4, heap=400, store=400),))
+    first = coordinator.register_query(_demand("first", desired=_r(cpu=4, heap=400)), now=0)
+    second = coordinator.register_query(_demand("second", desired=_r(store=400)), now=0)
+
+    before = coordinator.snapshot()
+    with pytest.raises(ValueError, match="generation sets must match"):
+        coordinator.refresh_queries(
+            observed_usage_by_query={"first": _r()},
+            generations={"second": second.generation},
+            now=1,
+        )
+    assert coordinator.snapshot() == before
+
+    generations = {query_id: payload["allocation"]["generation"] for query_id, payload in before["queries"].items()}
+    refreshed = coordinator.refresh_queries(
+        observed_usage_by_query={"first": _r(), "second": _r()},
+        generations=generations,
+        demands_by_query={
+            "first": _demand("first", desired=_r(store=400)),
+            "second": _demand("second", desired=_r(cpu=4, heap=400)),
+        },
+        now=2,
+    )
+
+    assert refreshed["first"].resources == _r(store=400)
+    assert refreshed["second"].resources == _r(cpu=4, heap=400)
+    assert first.generation < refreshed["first"].generation
+
+
+def test_generation_fencing_heartbeat_expiry_and_release():
+    coordinator = ClusterQueryResourceCoordinator(
+        (_node("n", cpu=1),),
+        heartbeat_timeout_s=10,
+    )
+    allocation = coordinator.register_query(_demand("q", desired=_r(cpu=1)), now=0)
 
     with pytest.raises(ValueError, match="stale allocation generation"):
-        coordinator.query_state("native-only", allocation.generation + 1)
-    with pytest.raises(KeyError, match="query is not registered"):
-        coordinator.query_state("missing", allocation.generation)
+        coordinator.heartbeat("q", allocation.generation + 1, now=1)
+    current = coordinator.heartbeat("q", allocation.generation, now=5)
+    assert coordinator.expire_queries(now=14.9) == ()
+    assert coordinator.expire_queries(now=15) == ("q",)
+    assert coordinator.release_query("q", current.generation) is False
+
+    replacement = coordinator.register_query(_demand("q", desired=_r(cpu=1)), now=20)
+    assert coordinator.release_query("q", replacement.generation + 1) is False
+    assert coordinator.release_query("q", replacement.generation) is True
 
 
 @pytest.mark.parametrize(
-    ("target_name", "attribute", "fail_on_call"),
+    ("target_name", "attribute"),
     [
-        pytest.param("module", "_QueryState", 1, id="state-construction"),
-        pytest.param("copy", "deepcopy", 1, id="state-staging"),
-        pytest.param("coordinator", "_rebalance_locked", 1, id="rebalance-entry"),
-        pytest.param("coordinator", "_place_bundle", 1, id="minimum-placement"),
-        pytest.param("coordinator", "_weighted_drf_extras", 1, id="fair-share"),
-        pytest.param("coordinator", "_place_divisible", 1, id="divisible-placement"),
-        pytest.param("module", "NodeResourceAllocation", 1, id="allocation-publication"),
-        pytest.param("module", "_hard_positive_difference", 2, id="debt-publication"),
+        pytest.param("module", "_QueryState", id="state-construction"),
+        pytest.param("copy", "deepcopy", id="state-staging"),
+        pytest.param("coordinator", "_rebalance_locked", id="rebalance"),
     ],
 )
-def test_register_query_failure_is_atomic_across_rebalance_phases(
-    monkeypatch,
-    target_name,
-    attribute,
-    fail_on_call,
-):
+def test_register_query_failure_is_atomic(monkeypatch, target_name, attribute):
     coordinator = ClusterQueryResourceCoordinator(
-        (_node("n1", cpu=8, gpu=1, heap=800, store=800),),
+        (_node("n", cpu=8, gpu=1, heap=800, store=800),),
         heartbeat_timeout_s=10,
     )
     coordinator.register_query(
-        _demand(
-            "existing",
-            minimum=_r(cpu=1, heap=100),
-            desired=_r(cpu=4, heap=400, store=400),
-        ),
+        _demand("existing", desired=_r(cpu=4, heap=400, store=400)),
         now=0,
     )
     before = coordinator.snapshot()
@@ -199,591 +349,24 @@ def test_register_query_failure_is_atomic_across_rebalance_phases(
         "copy": coordinator_module.copy,
         "coordinator": coordinator,
     }
-    _inject_failure_once(
-        monkeypatch,
-        targets[target_name],
-        attribute,
-        fail_on_call=fail_on_call,
-    )
+    _inject_failure_once(monkeypatch, targets[target_name], attribute)
 
-    actor_bundle = _r(cpu=1, gpu=1, heap=100)
     with pytest.raises(RuntimeError, match=f"injected {attribute} failure"):
         coordinator.register_query(
-            _demand(
-                "failed",
-                minimum=actor_bundle,
-                desired=_r(cpu=3, gpu=1, heap=300),
-            ),
+            _demand("failed", desired=_r(cpu=3, gpu=1, heap=300)),
             now=5,
         )
 
     assert coordinator.snapshot() == before
     assert coordinator._queries["existing"] is previous_state
     assert coordinator._next_sequence == previous_next_sequence
-
-    coordinator.register_query(
-        _demand(
-            "recovery",
-            minimum=_r(cpu=1, heap=100),
-            desired=_r(cpu=3, heap=300, store=300),
-        ),
-        now=6,
-    )
-    assert coordinator._queries["recovery"].sequence == previous_next_sequence
-    assert coordinator._next_sequence == previous_next_sequence + 1
-
-    registered = coordinator.snapshot()["queries"]
-    refreshed = coordinator.refresh_queries(
-        observed_usage_by_query={
-            "existing": _r(cpu=1, heap=100, store=100),
-            "recovery": _r(cpu=1, heap=100, store=100),
-        },
-        generations={query_id: query["allocation"]["generation"] for query_id, query in registered.items()},
-        now=7,
-    )
-    assert set(refreshed) == {"existing", "recovery"}
-    assert coordinator.expire_queries(now=16.9) == ()
-    assert coordinator.expire_queries(now=17) == ("existing", "recovery")
-    assert coordinator.snapshot()["queries"] == {}
+    assert "failed" not in coordinator._queries
 
 
-def test_equal_weight_queries_receive_equal_dominant_shares():
-    coordinator = ClusterQueryResourceCoordinator(
-        (_node("n1", cpu=12, heap=1_200, store=1_200),),
-        heartbeat_timeout_s=30,
-    )
-    demand_a = _demand(
-        "a",
-        minimum=_r(cpu=1, heap=100),
-        desired=_r(cpu=12, heap=1_200, store=1_200),
-    )
-    demand_b = _demand(
-        "b",
-        minimum=_r(cpu=1, heap=100),
-        desired=_r(cpu=12, heap=1_200, store=1_200),
-    )
-
-    coordinator.register_query(demand_a, now=0)
-    coordinator.register_query(demand_b, now=0)
-    snapshot = coordinator.snapshot()
-
-    allocation_a = ResourceVector.from_dict(snapshot["queries"]["a"]["allocation"]["resources"])
-    allocation_b = ResourceVector.from_dict(snapshot["queries"]["b"]["allocation"]["resources"])
-    total = _r(cpu=12, heap=1_200, store=1_200)
-    assert allocation_a.dominant_share(total) == pytest.approx(0.5, abs=0.01)
-    assert allocation_b.dominant_share(total) == pytest.approx(0.5, abs=0.01)
-    assert allocation_a + allocation_b == total
-
-
-def test_weighted_drf_accounts_for_unequal_hard_minimum_shares():
-    coordinator = ClusterQueryResourceCoordinator(
-        (_node("n1", cpu=10, heap=1_000),),
-        heartbeat_timeout_s=30,
-    )
-    coordinator.register_query(
-        _demand(
-            "large-minimum",
-            minimum=_r(cpu=8, heap=800),
-            desired=_r(cpu=10, heap=1_000),
-        ),
-        now=0,
-    )
-    coordinator.register_query(
-        _demand(
-            "small-minimum",
-            minimum=_r(cpu=1, heap=100),
-            desired=_r(cpu=10, heap=1_000),
-        ),
-        now=0,
-    )
-
-    queries = coordinator.snapshot()["queries"]
-    large = ResourceVector.from_dict(queries["large-minimum"]["allocation"]["resources"])
-    small = ResourceVector.from_dict(queries["small-minimum"]["allocation"]["resources"])
-
-    assert large == _r(cpu=8, heap=800)
-    assert small == _r(cpu=2, heap=200)
-
-
-def test_weighted_drf_fills_non_dominant_minimum_plateau_without_changing_fair_share():
-    coordinator = ClusterQueryResourceCoordinator(
-        (_node("n1", cpu=10, heap=1_000),),
-        heartbeat_timeout_s=30,
-    )
-    coordinator.register_query(
-        _demand(
-            "cpu-heavy",
-            minimum=_r(cpu=8),
-            desired=_r(cpu=8, heap=1_000),
-        ),
-        now=0,
-    )
-    coordinator.register_query(
-        _demand(
-            "heap-progress",
+def test_query_demand_rejects_removed_hard_admission_fields():
+    with pytest.raises(TypeError, match="minimum"):
+        QueryDemand(
+            query_id="q",
+            desired=_r(cpu=1),
             minimum=_r(cpu=1),
-            desired=_r(cpu=1, heap=1_000),
-        ),
-        now=0,
-    )
-
-    queries = coordinator.snapshot()["queries"]
-    cpu_heavy = ResourceVector.from_dict(queries["cpu-heavy"]["allocation"]["resources"])
-    heap_progress = ResourceVector.from_dict(queries["heap-progress"]["allocation"]["resources"])
-
-    assert cpu_heavy == _r(cpu=8, heap=200)
-    assert heap_progress == _r(cpu=1, heap=800)
-
-
-def test_weighted_dominant_fairness_gives_double_share_to_weight_two_query():
-    coordinator = ClusterQueryResourceCoordinator(
-        (_node("n1", cpu=12, heap=1_200, store=1_200),),
-        heartbeat_timeout_s=30,
-    )
-    coordinator.register_query(
-        _demand(
-            "weight-one",
-            minimum=_r(cpu=0.1, heap=10),
-            desired=_r(cpu=12, heap=1_200, store=1_200),
-            weight=1,
-        ),
-        now=0,
-    )
-    coordinator.register_query(
-        _demand(
-            "weight-two",
-            minimum=_r(cpu=0.1, heap=10),
-            desired=_r(cpu=12, heap=1_200, store=1_200),
-            weight=2,
-        ),
-        now=0,
-    )
-
-    queries = coordinator.snapshot()["queries"]
-    one = ResourceVector.from_dict(queries["weight-one"]["allocation"]["resources"])
-    two = ResourceVector.from_dict(queries["weight-two"]["allocation"]["resources"])
-
-    assert two.cpu / one.cpu == pytest.approx(2.0, rel=0.03)
-    assert two.heap_bytes / one.heap_bytes == pytest.approx(2.0, rel=0.03)
-    assert two.object_store_bytes / one.object_store_bytes == pytest.approx(2.0, rel=0.03)
-
-
-def test_object_store_budget_remains_fair_when_hard_minima_exhaust_cpu():
-    coordinator = ClusterQueryResourceCoordinator(
-        (_node("n1", cpu=2, heap=200, store=1_000),),
-        heartbeat_timeout_s=30,
-    )
-    for query_id in ("a", "b"):
-        coordinator.register_query(
-            _demand(
-                query_id,
-                minimum=_r(cpu=1, heap=100),
-                desired=_r(cpu=1, heap=100, store=1_000),
-            ),
-            now=0,
         )
-
-    queries = coordinator.snapshot()["queries"]
-    allocation_a = ResourceVector.from_dict(queries["a"]["allocation"]["resources"])
-    allocation_b = ResourceVector.from_dict(queries["b"]["allocation"]["resources"])
-
-    assert allocation_a == _r(cpu=1, heap=100, store=500)
-    assert allocation_b == _r(cpu=1, heap=100, store=500)
-
-
-def test_query_desired_resources_are_downward_caps_not_capacity_overrides():
-    coordinator = ClusterQueryResourceCoordinator(
-        (_node("n1", cpu=32, gpu=4, heap=32_000, store=32_000),),
-    )
-    allocation = coordinator.register_query(
-        _demand(
-            "capped",
-            minimum=_r(cpu=1, heap=100),
-            desired=_r(cpu=3, heap=300, store=400),
-        ),
-        now=0,
-    )
-
-    assert allocation.resources == _r(cpu=3, heap=300, store=400)
-
-
-def test_query_demand_rejects_object_store_hard_minimum_and_placement_bundles():
-    with pytest.raises(ValueError, match="minimum query resources may not hard-reserve object-store bytes"):
-        QueryDemand(
-            query_id="minimum-store",
-            minimum=_r(cpu=1, store=1),
-            desired=_r(cpu=1, store=10),
-            placement_bundles=(_r(cpu=1, store=1),),
-        )
-
-    with pytest.raises(ValueError, match="placement bundles may not hard-reserve object-store bytes"):
-        QueryDemand(
-            query_id="task-store",
-            minimum=_r(cpu=1),
-            desired=_r(cpu=1, store=10),
-            placement_bundles=(_r(cpu=1, store=1),),
-        )
-
-
-def test_query_demand_allocates_gpu_headroom_as_a_soft_divisible_share():
-    minimum = _r(cpu=1, gpu=1, heap=100)
-    desired = _r(cpu=4, gpu=4, heap=400)
-    coordinator = ClusterQueryResourceCoordinator(
-        (_node("gpu-node", cpu=4, gpu=4, heap=400),),
-    )
-
-    allocation = coordinator.register_query(
-        _demand(
-            "elastic-gpu",
-            minimum=minimum,
-            desired=desired,
-        ),
-        now=0,
-    )
-
-    assert allocation.resources == desired
-
-
-def test_gpu_task_bundle_receives_divisible_soft_headroom():
-    coordinator = ClusterQueryResourceCoordinator(
-        (_node("gpu-node", cpu=4, gpu=1, heap=400, store=400),),
-    )
-    fixed_gpu_bundle = _r(cpu=1, gpu=1, heap=100)
-    desired = _r(cpu=4, gpu=1, heap=400, store=400)
-
-    allocation = coordinator.register_query(
-        _demand(
-            "fixed-gpu",
-            minimum=fixed_gpu_bundle,
-            desired=desired,
-        ),
-        now=0,
-    )
-
-    assert allocation.resources == desired
-
-
-def test_indivisible_gpu_task_bundle_must_fit_one_node_not_cluster_aggregate():
-    coordinator = ClusterQueryResourceCoordinator(
-        (
-            _node("n1", cpu=4, gpu=0.5, heap=1_000, store=1_000),
-            _node("n2", cpu=4, gpu=0.5, heap=1_000, store=1_000),
-        )
-    )
-    bundle = _r(cpu=1, gpu=1, heap=100)
-
-    allocation = coordinator.register_query(
-        _demand("gpu-task", minimum=bundle, desired=bundle),
-        now=0,
-    )
-
-    assert allocation.resources.is_zero()
-    assert coordinator.snapshot()["queries"]["gpu-task"]["state"] == "PENDING_RESOURCES"
-
-
-def test_task_bundle_matching_reassigns_an_earlier_best_fit():
-    coordinator = ClusterQueryResourceCoordinator(
-        (
-            _node("cpu-node", cpu=2, gpu=0.5),
-            _node("shared-node", cpu=2, gpu=1),
-            _node("gpu-node", cpu=1, gpu=2),
-        ),
-    )
-    cpu_bundle = _r(cpu=2)
-    mixed_bundle = _r(cpu=1.5, gpu=0.25)
-    gpu_bundle = _r(cpu=1, gpu=1)
-    minimum = cpu_bundle + mixed_bundle + gpu_bundle
-
-    allocation = coordinator.register_query(
-        QueryDemand(
-            query_id="alternating-path",
-            minimum=minimum,
-            desired=minimum,
-            placement_bundles=(cpu_bundle, mixed_bundle, gpu_bundle),
-        ),
-        now=0,
-    )
-
-    assert coordinator.query_state("alternating-path", allocation.generation) == "RUNNING"
-    by_node = {item.node_id: item.resources for item in allocation.node_allocations}
-    assert by_node["gpu-node"] == gpu_bundle
-    assert {by_node["cpu-node"], by_node["shared-node"]} == {cpu_bundle, mixed_bundle}
-
-
-def test_minimum_placement_vector_must_fit_one_node_not_cross_node_dimensions():
-    coordinator = ClusterQueryResourceCoordinator(
-        (
-            _node("cpu-node", cpu=2, heap=1, store=1),
-            _node("memory-node", cpu=0, heap=199, store=199),
-        )
-    )
-    minimum = _r(cpu=2, heap=200)
-
-    allocation = coordinator.register_query(
-        _demand("coherent-task", minimum=minimum, desired=minimum),
-        now=0,
-    )
-
-    assert allocation.resources.is_zero()
-    assert allocation.node_allocations == ()
-    assert coordinator.snapshot()["queries"]["coherent-task"]["state"] == "PENDING_RESOURCES"
-
-
-def test_gpu_task_minima_use_priority_then_fifo():
-    coordinator = ClusterQueryResourceCoordinator(
-        (
-            _node("n1", cpu=4, gpu=1, heap=1_000, store=1_000),
-            _node("n2", cpu=4, gpu=1, heap=1_000, store=1_000),
-        )
-    )
-    bundle = _r(cpu=1, gpu=1, heap=100)
-    low = _demand("low", minimum=bundle, desired=bundle, priority=0)
-    high_old = _demand("high-old", minimum=bundle, desired=bundle, priority=10)
-    high_new = _demand("high-new", minimum=bundle, desired=bundle, priority=10)
-
-    coordinator.register_query(high_old, now=0)
-    coordinator.register_query(high_new, now=1)
-    coordinator.register_query(low, now=2)
-    snapshot = coordinator.snapshot()["queries"]
-
-    assert snapshot["high-old"]["state"] == "RUNNING"
-    assert snapshot["high-new"]["state"] == "RUNNING"
-    assert snapshot["low"]["state"] == "PENDING_RESOURCES"
-    assert sum(snapshot[query_id]["allocation"]["resources"]["gpu"] for query_id in snapshot) == 2
-
-
-def test_live_usage_becomes_debt_when_priority_reassigns_soft_allocation():
-    coordinator = ClusterQueryResourceCoordinator((_node("n1", cpu=4, gpu=1, heap=1_000, store=1_000),))
-    bundle = _r(cpu=1, gpu=1, heap=100)
-    low = coordinator.register_query(
-        _demand(
-            "low-running",
-            minimum=bundle,
-            desired=bundle,
-            priority=0,
-        ),
-        now=0,
-    )
-    low = coordinator.refresh_query(
-        "low-running",
-        observed_usage=bundle,
-        generation=low.generation,
-        now=1,
-    )
-
-    high = coordinator.register_query(
-        _demand(
-            "high-pending",
-            minimum=bundle,
-            desired=bundle,
-            priority=100,
-        ),
-        now=2,
-    )
-    queries = coordinator.snapshot()["queries"]
-
-    assert low.resources == bundle
-    assert high.resources == bundle
-    assert queries["low-running"]["state"] == "ALLOCATION_DEBT"
-    assert queries["low-running"]["allocation"]["resources"] == _r().to_dict()
-    assert queries["low-running"]["allocation_debt"] == bundle.to_dict()
-    assert queries["high-pending"]["state"] == "RUNNING"
-
-
-def test_capacity_shrink_preserves_observed_usage_as_debt_and_stops_new_admission():
-    coordinator = ClusterQueryResourceCoordinator(
-        (_node("n1", cpu=4, heap=400, store=400),),
-    )
-    allocation = coordinator.register_query(
-        _demand(
-            "q",
-            minimum=_r(cpu=1, heap=100),
-            desired=_r(cpu=4, heap=400, store=400),
-        ),
-        now=0,
-    )
-    coordinator.refresh_query(
-        "q",
-        observed_usage=_r(cpu=3, heap=300, store=300),
-        generation=allocation.generation,
-        now=1,
-    )
-
-    coordinator.update_node_capacities((_node("n1", cpu=2, heap=200, store=200),), now=2)
-    query = coordinator.snapshot()["queries"]["q"]
-
-    assert query["allocation"]["resources"] == _r(cpu=2, heap=200, store=200).to_dict()
-    assert query["observed_usage"] == _r(cpu=3, heap=300, store=300).to_dict()
-    assert query["allocation_debt"] == _r(cpu=1, heap=100).to_dict()
-    assert query["soft_object_store_debt_bytes"] == 100
-    assert query["can_admit_new_tasks"] is False
-
-
-def test_object_store_overage_is_soft_debt_and_does_not_close_query_admission():
-    coordinator = ClusterQueryResourceCoordinator(
-        (_node("n1", cpu=4, heap=400, store=400),),
-    )
-    allocation = coordinator.register_query(
-        _demand(
-            "q",
-            minimum=_r(cpu=1, heap=100),
-            desired=_r(cpu=4, heap=400, store=400),
-        ),
-        now=0,
-    )
-
-    coordinator.refresh_query(
-        "q",
-        observed_usage=_r(cpu=1, heap=100, store=450),
-        generation=allocation.generation,
-        now=1,
-    )
-    query = coordinator.snapshot()["queries"]["q"]
-
-    assert query["state"] == "RUNNING"
-    assert query["allocation_debt"] == _r().to_dict()
-    assert query["soft_object_store_debt_bytes"] == 50
-    assert query["can_admit_new_tasks"] is True
-
-
-def test_stale_generation_cannot_refresh_or_release_newer_query_lease():
-    coordinator = ClusterQueryResourceCoordinator((_node("n1", cpu=4, heap=400, store=400),))
-    first = coordinator.register_query(
-        _demand("q", minimum=_r(cpu=1, heap=100), desired=_r(cpu=4, heap=400)),
-        now=0,
-    )
-    second = coordinator.refresh_query(
-        "q",
-        observed_usage=_r(cpu=1, heap=100),
-        generation=first.generation,
-        now=1,
-    )
-
-    with pytest.raises(ValueError, match="stale allocation generation"):
-        coordinator.refresh_query(
-            "q",
-            observed_usage=_r(),
-            generation=first.generation,
-            now=2,
-        )
-    assert coordinator.release_query("q", first.generation) is False
-    assert coordinator.release_query("q", second.generation) is True
-    assert coordinator.snapshot()["queries"] == {}
-
-
-def test_heartbeat_expiry_reclaims_query_allocation_idempotently():
-    coordinator = ClusterQueryResourceCoordinator(
-        (_node("n1", cpu=4, heap=400, store=400),),
-        heartbeat_timeout_s=10,
-    )
-    coordinator.register_query(
-        _demand("q", minimum=_r(cpu=1, heap=100), desired=_r(cpu=4, heap=400)),
-        now=5,
-    )
-
-    assert coordinator.expire_queries(now=14.9) == ()
-    assert coordinator.expire_queries(now=15) == ("q",)
-    assert coordinator.expire_queries(now=100) == ()
-    assert coordinator.snapshot()["queries"] == {}
-
-
-def test_refresh_queries_updates_all_usage_and_heartbeats_atomically():
-    coordinator = ClusterQueryResourceCoordinator(
-        (_node("n1", cpu=8, heap=800, store=800),),
-        heartbeat_timeout_s=10,
-    )
-
-    def demand(query_id):
-        return _demand(
-            query_id,
-            minimum=_r(cpu=1, heap=100),
-            desired=_r(cpu=8, heap=800, store=800),
-        )
-
-    coordinator.register_query(demand("a"), now=0)
-    coordinator.register_query(demand("b"), now=0)
-    before = coordinator.snapshot()["queries"]
-
-    allocations = coordinator.refresh_queries(
-        observed_usage_by_query={
-            "a": _r(cpu=2, heap=200, store=150),
-            "b": _r(cpu=1, heap=120, store=100),
-        },
-        generations={query_id: query["allocation"]["generation"] for query_id, query in before.items()},
-        now=5,
-    )
-
-    after = coordinator.snapshot()["queries"]
-    assert set(allocations) == {"a", "b"}
-    assert len({allocation.generation for allocation in allocations.values()}) == 1
-    assert after["a"]["observed_usage"] == _r(cpu=2, heap=200, store=150).to_dict()
-    assert after["b"]["observed_usage"] == _r(cpu=1, heap=120, store=100).to_dict()
-    assert coordinator.expire_queries(now=14.9) == ()
-    assert coordinator.expire_queries(now=15) == ("a", "b")
-
-
-def test_refresh_queries_rejects_stale_batch_without_partial_mutation():
-    coordinator = ClusterQueryResourceCoordinator(
-        (_node("n1", cpu=8, heap=800, store=800),),
-        heartbeat_timeout_s=10,
-    )
-
-    def demand(query_id):
-        return _demand(
-            query_id,
-            minimum=_r(cpu=1, heap=100),
-            desired=_r(cpu=8, heap=800),
-        )
-
-    coordinator.register_query(demand("a"), now=0)
-    coordinator.register_query(demand("b"), now=0)
-    before = coordinator.snapshot()["queries"]
-
-    with pytest.raises(ValueError, match="stale allocation generation"):
-        coordinator.refresh_queries(
-            observed_usage_by_query={"a": _r(cpu=2), "b": _r(cpu=3)},
-            generations={
-                "a": before["a"]["allocation"]["generation"],
-                "b": before["b"]["allocation"]["generation"] - 1,
-            },
-            now=5,
-        )
-
-    after = coordinator.snapshot()["queries"]
-    assert after["a"]["observed_usage"] == before["a"]["observed_usage"]
-    assert after["b"]["observed_usage"] == before["b"]["observed_usage"]
-    assert coordinator.expire_queries(now=10) == ("a", "b")
-
-
-def test_node_allocations_never_exceed_any_node_capacity():
-    coordinator = ClusterQueryResourceCoordinator(
-        (
-            _node("n1", cpu=2, gpu=1, heap=200, store=300),
-            _node("n2", cpu=4, gpu=0, heap=500, store=600),
-        )
-    )
-    bundle = _r(cpu=1, gpu=1, heap=100)
-    coordinator.register_query(
-        _demand(
-            "gpu",
-            minimum=bundle,
-            desired=_r(cpu=3, gpu=1, heap=300, store=300),
-        ),
-        now=0,
-    )
-    coordinator.register_query(
-        _demand(
-            "cpu",
-            minimum=_r(cpu=1, heap=100),
-            desired=_r(cpu=4, heap=400, store=600),
-        ),
-        now=0,
-    )
-
-    snapshot = coordinator.snapshot()
-    used_by_node = {node_id: _r() for node_id in snapshot["nodes"]}
-    for query in snapshot["queries"].values():
-        for node_id, payload in query["node_allocations"].items():
-            used_by_node[node_id] = used_by_node[node_id] + ResourceVector.from_dict(payload)
-    for node_id, payload in snapshot["nodes"].items():
-        assert used_by_node[node_id].fits_within(ResourceVector.from_dict(payload["resources"]))

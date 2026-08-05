@@ -690,7 +690,6 @@ def test_precreate_udf_actors_enable_generic_async_for_distributed_pool(
             payload,
             concurrency,
             gpus_per_actor,
-            actor_node_ids,
             ray_options=None,
         ):
             calls.append(
@@ -698,13 +697,12 @@ def test_precreate_udf_actors_enable_generic_async_for_distributed_pool(
                     "payload": dict(payload),
                     "concurrency": concurrency,
                     "gpus_per_actor": gpus_per_actor,
-                    "actor_node_ids": list(actor_node_ids),
                     "ray_options": ray_options,
                 }
             )
             self.actors = [f"actor-{idx}" for idx in range(concurrency)]
             self._init_refs = []
-            self.actor_node_ids = list(actor_node_ids)
+            self.actor_node_ids = ["node-a"] * concurrency
             self._confirmed_ready = set(range(concurrency))
 
     fake_ray = types.ModuleType("ray")
@@ -732,7 +730,6 @@ def test_precreate_udf_actors_enable_generic_async_for_distributed_pool(
 
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_unit={"resource:test:actor": ("node-a", "node-b")},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -742,7 +739,6 @@ def test_precreate_udf_actors_enable_generic_async_for_distributed_pool(
     assert len(created) == 1
     assert "7" in handles_map
     assert len(calls) == 1
-    assert calls[0]["actor_node_ids"] == ["node-a", "node-b"]
 
 
 def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name(monkeypatch):
@@ -763,7 +759,6 @@ def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name
             payload,
             concurrency,
             gpus_per_actor,
-            actor_node_ids,
             ray_options=None,
         ):
             calls.append(
@@ -771,13 +766,12 @@ def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name
                     "payload": dict(payload),
                     "concurrency": concurrency,
                     "gpus_per_actor": gpus_per_actor,
-                    "actor_node_ids": list(actor_node_ids),
                     "ray_options": ray_options,
                 }
             )
             self.actors = [f"actor-{idx}" for idx in range(concurrency)]
             self._init_refs = []
-            self.actor_node_ids = list(actor_node_ids)
+            self.actor_node_ids = ["node-a"] * concurrency
             self._confirmed_ready = set(range(concurrency))
 
     fake_ray = types.ModuleType("ray")
@@ -806,7 +800,6 @@ def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name
     query_driver_handle = object()
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_unit={"resource:test:actor": ("node-a", "node-b")},
         query_driver_handle=query_driver_handle,
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -823,7 +816,6 @@ def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name
     }
     assert calls[0]["concurrency"] == 2
     assert calls[0]["gpus_per_actor"] == 0.0
-    assert calls[0]["actor_node_ids"] == ["node-a", "node-b"]
     assert calls[0]["ray_options"]["num_cpus"] == 1.0
     _assert_actor_location_runtime_env(
         calls[0]["ray_options"]["runtime_env"]["env_vars"],
@@ -851,7 +843,6 @@ def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_
             payload,
             concurrency,
             gpus_per_actor,
-            actor_node_ids,
             ray_options=None,
             max_restarts=None,
             max_task_retries=None,
@@ -860,14 +851,13 @@ def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_
                 {
                     "payload": dict(payload),
                     "concurrency": concurrency,
-                    "actor_node_ids": list(actor_node_ids),
                     "max_restarts": max_restarts,
                     "max_task_retries": max_task_retries,
                 }
             )
             self.actors = ["stateful-actor"]
             self._init_refs = []
-            self.actor_node_ids = list(actor_node_ids)
+            self.actor_node_ids = ["node-a"] * concurrency
             self._confirmed_ready = {0}
 
     fake_ray = types.ModuleType("ray")
@@ -897,7 +887,6 @@ def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_
 
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_unit={"resource:test:stateful": ("node-a",)},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -918,7 +907,6 @@ def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_
                 "resource_unit_id": "resource:test:stateful",
             },
             "concurrency": 1,
-            "actor_node_ids": ["node-a"],
             "max_restarts": 0,
             "max_task_retries": 0,
         }
@@ -938,7 +926,6 @@ def test_ensure_actor_pools_for_plan_disables_retries_for_side_effecting_udf(mon
             payload,
             concurrency,
             gpus_per_actor,
-            actor_node_ids,
             ray_options=None,
             max_restarts=MAX_ACTOR_RESTARTS,
             max_task_retries=None,
@@ -946,7 +933,7 @@ def test_ensure_actor_pools_for_plan_disables_retries_for_side_effecting_udf(mon
             calls.append((max_restarts, max_task_retries))
             self.actors = ["side-effecting-actor"]
             self._init_refs = []
-            self.actor_node_ids = list(actor_node_ids)
+            self.actor_node_ids = ["node-a"] * concurrency
             self._confirmed_ready = {0}
 
     fake_ray = types.ModuleType("ray")
@@ -975,7 +962,6 @@ def test_ensure_actor_pools_for_plan_disables_retries_for_side_effecting_udf(mon
 
     created, _ = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_unit={"resource:test:side-effects": ("node-a",)},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -1020,7 +1006,6 @@ def test_ensure_actor_pools_for_plan_keeps_default_retry_policy_for_non_stateful
             payload,
             concurrency,
             gpus_per_actor,
-            actor_node_ids,
             ray_options=None,
             max_restarts=MAX_ACTOR_RESTARTS,
             max_task_retries=MAX_ACTOR_TASK_RETRIES,
@@ -1028,7 +1013,7 @@ def test_ensure_actor_pools_for_plan_keeps_default_retry_policy_for_non_stateful
             calls.append((max_restarts, max_task_retries))
             self.actors = ["ordinary-actor"]
             self._init_refs = []
-            self.actor_node_ids = list(actor_node_ids)
+            self.actor_node_ids = ["node-a"] * concurrency
             self._confirmed_ready = {0}
 
     fake_ray = types.ModuleType("ray")
@@ -1050,7 +1035,6 @@ def test_ensure_actor_pools_for_plan_keeps_default_retry_policy_for_non_stateful
 
     created, _ = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_unit={"resource:test:retry-policy": ("node-a",)},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -1136,7 +1120,6 @@ def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):
             payload,
             concurrency,
             gpus_per_actor,
-            actor_node_ids,
             ray_options=None,
         ):
             calls.append(
@@ -1144,13 +1127,12 @@ def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):
                     "payload": dict(payload),
                     "concurrency": concurrency,
                     "gpus_per_actor": gpus_per_actor,
-                    "actor_node_ids": list(actor_node_ids),
                     "ray_options": ray_options,
                 }
             )
             self.actors = [f"actor-{idx}" for idx in range(concurrency)]
             self._init_refs = []
-            self.actor_node_ids = list(actor_node_ids)
+            self.actor_node_ids = ["node-a"] * concurrency
             self._confirmed_ready = set(range(concurrency))
 
     fake_ray = types.ModuleType("ray")
@@ -1178,7 +1160,6 @@ def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):
 
     created, handles_map = udf_ray.ensure_actor_pools_for_nodes(
         nodes,
-        actor_node_ids_by_unit={"resource:test:actor": ("node-a", "node-b")},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -1195,7 +1176,6 @@ def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):
     }
     assert calls[0]["concurrency"] == 2
     assert calls[0]["gpus_per_actor"] == 0.0
-    assert calls[0]["actor_node_ids"] == ["node-a", "node-b"]
     assert calls[0]["ray_options"]["num_cpus"] == 1.0
     _assert_actor_location_runtime_env(
         calls[0]["ray_options"]["runtime_env"]["env_vars"],
@@ -1235,7 +1215,6 @@ def test_ray_plan_injects_session_context_for_explicit_subprocess_backends(monke
 
     created, handles_map = udf_ray.ensure_actor_pools_for_nodes(
         nodes,
-        actor_node_ids_by_unit={},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config=session_config,
@@ -1276,12 +1255,11 @@ def test_prepare_actor_pools_publishes_handles_before_waiting_for_init(monkeypat
             payload,
             concurrency,
             gpus_per_actor,
-            actor_node_ids,
             ray_options=None,
         ):
             self.actors = [f"actor-{idx}" for idx in range(concurrency)]
             self._init_refs = [_InitRef(idx) for idx in range(concurrency)]
-            self.actor_node_ids = list(actor_node_ids)
+            self.actor_node_ids = ["node-a"] * concurrency
             self._confirmed_ready = set()
             self._owns_actors = True
 
@@ -1311,9 +1289,6 @@ def test_prepare_actor_pools_publishes_handles_before_waiting_for_init(monkeypat
 
     pools, handles = udf_ray.prepare_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_unit={
-            "resource:test:deferred-ready": ("node-a", "node-b"),
-        },
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -2351,17 +2326,11 @@ def test_udf_actor_pool_constructor_cleans_partial_actor_creation(monkeypatch):
         def _build_actor_runtime_env(_ray_options):
             return {}
 
-        @staticmethod
-        def _normalize_actor_node_ids(node_ids, *, expected_count):
-            assert len(node_ids) == expected_count
-            return list(node_ids)
-
     with pytest.raises(RuntimeError, match="planned actor creation failure"):
         _Pool(
             payload={},
             concurrency=2,
             gpus_per_actor=0,
-            actor_node_ids=["a" * 56, "b" * 56],
         )
 
     assert killed == [("actor-0", True)]
@@ -2416,17 +2385,11 @@ def test_udf_actor_pool_constructor_exposes_partial_actor_when_cleanup_fails(mon
         def _build_actor_runtime_env(_ray_options):
             return {}
 
-        @staticmethod
-        def _normalize_actor_node_ids(node_ids, *, expected_count):
-            assert len(node_ids) == expected_count
-            return list(node_ids)
-
     with pytest.raises(RuntimeError, match="partial actor cleanup also failed") as exc_info:
         _Pool(
             payload={},
             concurrency=2,
             gpus_per_actor=0,
-            actor_node_ids=["a" * 56, "b" * 56],
         )
 
     owned_pools = exc_info.value.owned_actor_pools
@@ -2450,7 +2413,6 @@ def test_ensure_actor_pools_for_plan_does_not_fail_fast_on_cluster_resource_snap
             payload,
             concurrency,
             gpus_per_actor,
-            actor_node_ids,
             ray_options=None,
         ):
             calls.append(
@@ -2458,13 +2420,12 @@ def test_ensure_actor_pools_for_plan_does_not_fail_fast_on_cluster_resource_snap
                     "payload": dict(payload),
                     "concurrency": concurrency,
                     "gpus_per_actor": gpus_per_actor,
-                    "actor_node_ids": list(actor_node_ids),
                     "ray_options": ray_options,
                 }
             )
             self.actors = [f"actor-{idx}" for idx in range(concurrency)]
             self._init_refs = []
-            self.actor_node_ids = list(actor_node_ids)
+            self.actor_node_ids = ["node-a"] * concurrency
             self._confirmed_ready = set(range(concurrency))
 
     fake_ray = types.ModuleType("ray")
@@ -2492,7 +2453,6 @@ def test_ensure_actor_pools_for_plan_does_not_fail_fast_on_cluster_resource_snap
 
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_unit={"resource:test:actor": ("node-a", "node-b")},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -2549,7 +2509,6 @@ def test_ensure_actor_pools_for_plan_publishes_driver_handle_for_ray_task(monkey
     query_driver_handle = object()
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_unit={},
         query_driver_handle=query_driver_handle,
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -2580,7 +2539,6 @@ def test_ensure_actor_pools_for_plan_propagates_collect_errors(monkeypatch):
     with pytest.raises(RuntimeError, match="collect failed"):
         udf_ray.ensure_actor_pools_for_plan(
             _BadPlan(),
-            actor_node_ids_by_unit={},
             query_driver_handle=object(),
             query_generation_capability=_QUERY_GENERATION_CAPABILITY,
             session_config={},
@@ -2627,7 +2585,6 @@ def test_ensure_actor_pools_for_plan_propagates_actor_creation_errors(monkeypatc
     with pytest.raises(RuntimeError, match="create failed"):
         udf_ray.ensure_actor_pools_for_plan(
             plan,
-            actor_node_ids_by_unit={"resource:test:actor": ("node-a", "node-b")},
             query_driver_handle=object(),
             query_generation_capability=_QUERY_GENERATION_CAPABILITY,
             session_config={},
@@ -2881,8 +2838,7 @@ def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
             {
                 "0": {
                     "actor_handles": ["actor-0"],
-                    "actor_node_ids": ["node-a"],
-                    "query_driver_handle": object(),
+                            "query_driver_handle": object(),
                     "query_generation_capability": "test-query-generation-capability",
                 }
             },
@@ -2943,7 +2899,7 @@ def test_physical_plan_rejects_legacy_list_executor_options(monkeypatch):
     assert build_call_count == 0
 
 
-def test_ensure_actor_pools_for_plan_uses_coordinator_actor_nodes(monkeypatch):
+def test_ensure_actor_pools_for_plan_publishes_runtime_actor_nodes(monkeypatch):
     import duckdb.execution.udf_ray as udf_ray
 
     class _FakeActorsObj:
@@ -2970,7 +2926,7 @@ def test_ensure_actor_pools_for_plan_uses_coordinator_actor_nodes(monkeypatch):
         def __init__(self, **kwargs):
             self.actors = actors
             self._init_refs = []
-            self.actor_node_ids = list(kwargs["actor_node_ids"])
+            self.actor_node_ids = ["node-a", "node-b"][: int(kwargs["concurrency"])]
             self._confirmed_ready = {0, 1}
 
     monkeypatch.setattr(udf_ray, "UDFActorPool", _FakeUDFActorPool)
@@ -2994,7 +2950,6 @@ def test_ensure_actor_pools_for_plan_uses_coordinator_actor_nodes(monkeypatch):
 
     created, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_unit={"resource:test:actor": ("node-a", "node-b")},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},
@@ -3052,7 +3007,7 @@ def test_ensure_actor_pools_waits_for_init_refs_before_ready_lookup(monkeypatch)
         def __init__(self, **kwargs):
             self.actors = actors
             self._init_refs = init_refs
-            self.actor_node_ids = list(kwargs["actor_node_ids"])
+            self.actor_node_ids = [""] * int(kwargs["concurrency"])
             self._confirmed_ready = set()
 
     monkeypatch.setattr(udf_ray, "UDFActorPool", _FakeUDFActorPool)
@@ -3076,7 +3031,6 @@ def test_ensure_actor_pools_waits_for_init_refs_before_ready_lookup(monkeypatch)
 
     _, handles_map = udf_ray.ensure_actor_pools_for_plan(
         plan,
-        actor_node_ids_by_unit={"resource:test:actor": ("node-a", "node-b")},
         query_driver_handle=object(),
         query_generation_capability=_QUERY_GENERATION_CAPABILITY,
         session_config={},

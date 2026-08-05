@@ -70,9 +70,6 @@ from duckdb.execution.udf_ray_env import (
     is_vane_worker_process as _is_vane_worker_process,
 )
 from duckdb.execution.udf_ray_env import (
-    normalize_actor_node_ids as _normalize_actor_node_ids,
-)
-from duckdb.execution.udf_ray_env import (
     normalize_actor_pool_payload as _normalize_actor_pool_payload,
 )
 from duckdb.execution.udf_ray_env import (
@@ -162,18 +159,10 @@ def _ray_payload_requires_block_stream(payload: dict[str, Any]) -> bool:
     return True
 
 
-def _submit_ray_remote(remote_fn: Any, node_id: str, *args: Any, **kwargs: Any) -> Any:
-    node_key = str(node_id).strip()
-    if not node_key:
-        raise RuntimeError("Ray task submission requires its leased node_id")
-    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+def _submit_ray_remote(remote_fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Submit the real request without preselecting a physical Ray node."""
 
-    return remote_fn.options(
-        scheduling_strategy=NodeAffinitySchedulingStrategy(
-            node_id=node_key,
-            soft=False,
-        )
-    ).remote(*args, **kwargs)
+    return remote_fn.remote(*args, **kwargs)
 
 
 def _ray_task_debug_enabled() -> bool:
@@ -323,14 +312,6 @@ class UDFActorPool(_UDFActorPoolBase):
     def _build_actor_runtime_env(ray_options: dict[str, Any] | None) -> dict[str, Any]:
         return _build_actor_runtime_env(ray_options)
 
-    @staticmethod
-    def _normalize_actor_node_ids(
-        node_ids: list[str] | None,
-        *,
-        expected_count: int,
-    ) -> list[str] | None:
-        return _normalize_actor_node_ids(node_ids, expected_count=expected_count)
-
 
 def _apply_actor_node_options(
     actors: _UDFActorPoolBase,
@@ -346,7 +327,6 @@ def _apply_actor_node_options(
 def ensure_actor_pools_for_plan(
     plan: Any,
     *,
-    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -355,7 +335,6 @@ def ensure_actor_pools_for_plan(
     return _ensure_actor_pools_for_plan_impl(
         plan,
         conn=conn,
-        actor_node_ids_by_unit=actor_node_ids_by_unit,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -373,7 +352,6 @@ def ensure_actor_pools_for_plan(
 def ensure_actor_pools_for_nodes(
     udf_nodes: Any,
     *,
-    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -381,7 +359,6 @@ def ensure_actor_pools_for_nodes(
 ) -> tuple[list[_UDFActorPoolBase], dict[str, Any]]:
     return _ensure_actor_pools_for_nodes_impl(
         udf_nodes,
-        actor_node_ids_by_unit=actor_node_ids_by_unit,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -400,7 +377,6 @@ def ensure_actor_pools_for_nodes(
 def prepare_actor_pools_for_nodes(
     udf_nodes: Any,
     *,
-    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -408,7 +384,6 @@ def prepare_actor_pools_for_nodes(
 ) -> tuple[list[_UDFActorPoolBase], dict[str, Any]]:
     return _prepare_actor_pools_for_nodes_impl(
         udf_nodes,
-        actor_node_ids_by_unit=actor_node_ids_by_unit,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -427,7 +402,6 @@ def prepare_actor_pools_for_nodes(
 def prepare_actor_pools_for_plan(
     plan: Any,
     *,
-    actor_node_ids_by_unit: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -436,7 +410,6 @@ def prepare_actor_pools_for_plan(
     return _prepare_actor_pools_for_plan_impl(
         plan,
         conn=conn,
-        actor_node_ids_by_unit=actor_node_ids_by_unit,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -724,7 +697,6 @@ class RayTaskUDFExecutor(TaskAdmissionExecutorMixin, UDFExecutor):
             admission=admission,
             submitter=lambda granted_lease: _submit_ray_remote(
                 self.run_bundle_stream,
-                granted_lease["node_id"],
                 task_payload_with_lease(self.payload, granted_lease),
                 [table],
             ),
@@ -756,7 +728,6 @@ class RayTaskUDFExecutor(TaskAdmissionExecutorMixin, UDFExecutor):
             admission=admission,
             submitter=lambda granted_lease: _submit_ray_remote(
                 self.run_ref_bundle_stream,
-                granted_lease["node_id"],
                 *task_block_refs,
                 payload=task_payload_with_lease(self.payload, granted_lease),
                 slices=list(slices or []),

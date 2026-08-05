@@ -317,18 +317,16 @@ def test_actor_gpu_reservation_follows_resolved_backend(
             payload,
             concurrency,
             gpus_per_actor,
-            actor_node_ids,
             ray_options=None,
             max_restarts=None,
             max_task_retries=None,
         ):
-            self.actor_node_ids = list(actor_node_ids)
+            self.actor_node_ids = ["node-a"] * concurrency
             ray_pool_calls.append(
                 {
                     "payload": dict(payload),
                     "concurrency": concurrency,
                     "gpus_per_actor": gpus_per_actor,
-                    "actor_node_ids": list(self.actor_node_ids),
                     "ray_options": ray_options,
                     "max_restarts": max_restarts,
                     "max_task_retries": max_task_retries,
@@ -352,7 +350,6 @@ def test_actor_gpu_reservation_follows_resolved_backend(
         warnings.simplefilter("error", RuntimeWarning)
         pools, _ = udf_ray.ensure_actor_pools_for_nodes(
             nodes,
-            actor_node_ids_by_unit={resource_unit_id: ("node-a",)},
             query_driver_handle=object(),
             query_generation_capability="test-query-generation-capability",
             session_config={},
@@ -362,7 +359,6 @@ def test_actor_gpu_reservation_follows_resolved_backend(
     assert len(ray_pool_calls) == 1
     assert ray_pool_calls[0]["concurrency"] == 1
     assert ray_pool_calls[0]["gpus_per_actor"] == gpus
-    assert ray_pool_calls[0]["actor_node_ids"] == ["node-a"]
     assert ray_pool_calls[0]["max_restarts"] == 0
     assert ray_pool_calls[0]["max_task_retries"] == 0
 
@@ -437,16 +433,14 @@ def test_stateless_ray_actor_pool_size_and_gpu_options_follow_physical_payload(m
             payload,
             concurrency,
             gpus_per_actor,
-            actor_node_ids,
             ray_options=None,
         ):
-            self.actor_node_ids = list(actor_node_ids)
+            self.actor_node_ids = ["node-a"] * concurrency
             calls.append(
                 {
                     "payload": dict(payload),
                     "concurrency": concurrency,
                     "gpus_per_actor": gpus_per_actor,
-                    "actor_node_ids": list(self.actor_node_ids),
                     "ray_options": ray_options,
                 }
             )
@@ -466,7 +460,6 @@ def test_stateless_ray_actor_pool_size_and_gpu_options_follow_physical_payload(m
     nodes[0]["payload"]["resource_unit_id"] = resource_unit_id
     pools, _ = udf_ray.ensure_actor_pools_for_nodes(
         nodes,
-        actor_node_ids_by_unit={resource_unit_id: ("node-a", "node-a", "node-a")},
         query_driver_handle=object(),
         query_generation_capability="test-query-generation-capability",
         session_config={},
@@ -475,4 +468,3 @@ def test_stateless_ray_actor_pool_size_and_gpu_options_follow_physical_payload(m
     assert len(pools) == 1
     assert calls[0]["concurrency"] == 3
     assert calls[0]["gpus_per_actor"] == 1.25
-    assert calls[0]["actor_node_ids"] == ["node-a", "node-a", "node-a"]

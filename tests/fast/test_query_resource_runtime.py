@@ -5,7 +5,6 @@ import pytest
 
 from duckdb.runners.ray.query_resource_graph import (
     MaterializationBarrierSpec,
-    NodeResourceAllocation,
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
@@ -49,7 +48,6 @@ def _allocation(generation=1):
     resources = ResourceVector(cpu=4, heap_bytes=1_000, object_store_bytes=1_000)
     return QueryAllocation(
         resources=resources,
-        node_allocations=(NodeResourceAllocation(node_id="node-a", resources=resources),),
         generation=generation,
     )
 
@@ -71,7 +69,7 @@ def test_runtime_registers_graph_atomically_and_rejects_every_duplicate():
         register_query_resource_graph(_graph("sha256:different"), _allocation())
 
 
-def test_runtime_graph_validation_finishes_before_registry_visibility():
+def test_runtime_accepts_a_soft_budget_smaller_than_one_concrete_task():
     unit = ResourceUnitSpec(
         query_id="q",
         resource_unit_id="resource:f:udf",
@@ -88,13 +86,13 @@ def test_runtime_graph_validation_finishes_before_registry_visibility():
     too_small_resources = ResourceVector(cpu=1, heap_bytes=99, object_store_bytes=1_000)
     too_small = QueryAllocation(
         resources=too_small_resources,
-        node_allocations=(NodeResourceAllocation(node_id="node-a", resources=too_small_resources),),
         generation=1,
     )
 
-    with pytest.raises(ValueError, match="heap_bytes"):
-        register_query_resource_graph(graph, too_small)
-    assert query_resource_manager_snapshot("q") == {}
+    manager = register_query_resource_graph(graph, too_small)
+
+    assert manager.allocation.resources == too_small_resources
+    assert query_resource_manager_snapshot("q")["ray_core_owns_placement"] is True
 
 
 def test_runtime_can_publish_pending_query_before_minimum_bundle_is_feasible():
@@ -113,7 +111,6 @@ def test_runtime_can_publish_pending_query_before_minimum_bundle_is_feasible():
     graph = QueryResourceGraph("q", "sha256:pending", (unit,), (unit.resource_unit_id,))
     pending = QueryAllocation(
         resources=ResourceVector(),
-        node_allocations=(),
         generation=1,
     )
 

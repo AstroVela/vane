@@ -2249,8 +2249,6 @@ class RayQueryDriverActor:
             object_store_fraction=object_store_fraction,
             heap_reserve_bytes_per_node=heap_reserve,
         )
-        if not capacities:
-            raise RuntimeError("Ray reports no alive nodes with schedulable query resources")
         self._query_node_capacities = capacities
         return ClusterQueryResourceCoordinator(
             capacities,
@@ -2264,25 +2262,17 @@ class RayQueryDriverActor:
 
         snapshot = self._query_resource_coordinator.snapshot()
         coordinator_queries = snapshot["queries"]
-        for query_id, graph in self._query_resource_graphs.items():
+        for query_id in self._query_resource_graphs:
             query_snapshot = coordinator_queries.get(query_id)
             if query_snapshot is None:
                 raise RuntimeError(f"coordinator lost registered query {query_id}")
             allocation = QueryAllocation.from_dict(query_snapshot["allocation"])
             manager = get_query_resource_manager(query_id)
-            state = str(query_snapshot.get("state") or "")
-            if state not in {"RUNNING", "PENDING_RESOURCES", "ALLOCATION_DEBT"}:
-                raise RuntimeError(f"coordinator returned invalid query state for {query_id}: {state!r}")
-            graph.validate_allocation(
-                allocation,
-                eligible_unit_ids=(manager.current_eligible_resource_unit_ids() if state == "RUNNING" else ()),
-            )
             current = self._query_allocations[query_id]
             if allocation.generation > current.generation:
                 manager.update_allocation(
                     allocation,
-                    admission_open=state in {"RUNNING", "ALLOCATION_DEBT"},
-                    debt_neutral_only=state == "ALLOCATION_DEBT",
+                    admission_open=True,
                 )
                 self._query_allocations[query_id] = allocation
 
@@ -2297,11 +2287,9 @@ class RayQueryDriverActor:
         Request start time orders overlapping reads so a slow older request
         cannot overwrite a later request that already committed.
         """
-        if not capacities:
-            raise RuntimeError("Ray reports no alive nodes with schedulable query resources")
         last_snapshot_started_at = float(getattr(self, "_query_resource_last_capacity_refresh_at", 0.0))
         cached_capacities = tuple(getattr(self, "_query_node_capacities", ()))
-        if cached_capacities and float(snapshot_started_at) < last_snapshot_started_at:
+        if float(snapshot_started_at) < last_snapshot_started_at:
             return self._sum_node_capacity(cached_capacities)
         self._query_resource_coordinator.update_node_capacities(capacities)
         self._query_node_capacities = capacities
@@ -2343,8 +2331,6 @@ class RayQueryDriverActor:
                 capacity_error = exc
                 capacities = ()
         capacities = tuple(capacities)
-        if capacity_error is None and not capacities:
-            raise RuntimeError("Ray reports no alive nodes with schedulable query resources")
 
         with self._query_resource_lock:
             if capacity_error is None:
@@ -2354,10 +2340,6 @@ class RayQueryDriverActor:
                 )
             else:
                 cached_capacities = tuple(self._query_node_capacities)
-                if not cached_capacities:
-                    raise RuntimeError(
-                        f"failed to refresh Ray capacity and no cached snapshot exists: {capacity_error}"
-                    ) from capacity_error
                 self._query_resource_coordinator.update_node_capacities(
                     cached_capacities,
                     now=timestamp,
@@ -4697,8 +4679,6 @@ class RayQueryDriverActor:
             raise ValueError(f"resource graph query_id mismatch: graph={graph.query_id!r} plan={plan_id!r}")
         capacity_snapshot_started_at = time.monotonic()
         capacities = self._read_query_node_capacities()
-        if not capacities:
-            raise RuntimeError("Ray reports no alive nodes with schedulable query resources")
         return _PreparedQueryResourceRegistration(
             graph=graph,
             node_capacities=tuple(capacities),
@@ -4755,20 +4735,11 @@ class RayQueryDriverActor:
             allocation = self._query_resource_coordinator.register_query(demand)
             manager_registered = False
             try:
-                coordinator_state = self._query_resource_coordinator.query_state(
-                    graph.query_id,
-                    allocation.generation,
-                )
-                if coordinator_state not in {"RUNNING", "PENDING_RESOURCES", "ALLOCATION_DEBT"}:
-                    raise RuntimeError(
-                        f"coordinator returned invalid query state for {graph.query_id}: {coordinator_state!r}"
-                    )
                 self._synchronize_query_allocations()
                 manager = register_query_resource_graph(
                     graph,
                     allocation,
-                    admission_open=coordinator_state in {"RUNNING", "ALLOCATION_DEBT"},
-                    debt_neutral_only=coordinator_state == "ALLOCATION_DEBT",
+                    admission_open=True,
                     reservation_ratio=float(os.environ.get("VANE_QUERY_RESOURCE_RESERVATION_RATIO", "0.5")),
                     on_change=lambda: self._signal_query_resource_change(graph.query_id),
                     on_eligible_units_change=lambda eligible: self._transition_query_execution_phase(
@@ -5212,9 +5183,6 @@ class RayQueryDriverActor:
             try:
                 pools, options_by_node = prepare_actor_pools_for_nodes(
                     [node],
-                    # Actor CPU/GPU/declared heap are real Ray Core requests. They
-                    # are intentionally not pinned to soft-reservation nodes.
-                    actor_node_ids_by_unit={},
                     query_driver_handle=self._driver_handle,
                     query_generation_capability=query_generation_capability,
                     session_config=session_config,

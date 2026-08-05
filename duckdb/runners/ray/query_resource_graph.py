@@ -179,54 +179,7 @@ class ResourceVector:
         )
 
 
-@dataclass(frozen=True)
-class NodeResourceAllocation:
-    """One query's allocation attribution on one Ray node.
-
-    QRM uses CPU, GPU, and heap attribution to choose a feasible logical slot
-    before submission; Ray Core remains the physical placement authority and
-    actors are not pinned to these nodes. The object-store component contributes
-    only to the query-wide soft flow-control budget. Per-node debt is
-    observable, while Ray Core remains responsible for node-local spill and OOM
-    protection.
-    """
-
-    node_id: str
-    resources: ResourceVector
-
-    _FIELDS: ClassVar[tuple[str, ...]] = ("node_id", "resources")
-
-    def __post_init__(self) -> None:
-        node_id = str(self.node_id).strip()
-        if not node_id:
-            raise ValueError("node allocation node_id must be non-empty")
-        if self.resources.is_zero():
-            raise ValueError(f"node allocation {node_id} must own non-zero resources")
-        object.__setattr__(self, "node_id", node_id)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"node_id": self.node_id, "resources": self.resources.to_dict()}
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> NodeResourceAllocation:
-        values = dict(payload)
-        _strict_fields(values, cls._FIELDS, cls.__name__)
-        return cls(
-            node_id=str(values["node_id"]),
-            resources=ResourceVector.from_dict(values["resources"]),
-        )
-
-
-def _resource_vectors_equivalent(left: ResourceVector, right: ResourceVector) -> bool:
-    return (
-        math.isclose(left.cpu, right.cpu, rel_tol=0.0, abs_tol=1e-9)
-        and math.isclose(left.gpu, right.gpu, rel_tol=0.0, abs_tol=1e-9)
-        and left.heap_bytes == right.heap_bytes
-        and left.object_store_bytes == right.object_store_bytes
-    )
-
-
-def _hard_resources(resources: ResourceVector) -> ResourceVector:
+def _process_resources(resources: ResourceVector) -> ResourceVector:
     """Return the non-spillable portion of a query resource vector."""
     return ResourceVector(
         cpu=resources.cpu,
@@ -237,13 +190,19 @@ def _hard_resources(resources: ResourceVector) -> ResourceVector:
 
 @dataclass(frozen=True)
 class QueryAllocation:
+    """One driver's aggregate soft budget for a query.
+
+    This is deliberately not a Ray placement claim. Concrete tasks and actors
+    carry their real resource requests to Ray Core, which owns node selection,
+    pending demand, and autoscaling. Vane uses this vector only to decide when
+    to apply query/operator backpressure.
+    """
+
     resources: ResourceVector
-    node_allocations: tuple[NodeResourceAllocation, ...]
     generation: int
 
     _FIELDS: ClassVar[tuple[str, ...]] = (
         "resources",
-        "node_allocations",
         "generation",
     )
 
@@ -251,22 +210,11 @@ class QueryAllocation:
         generation = int(self.generation)
         if generation <= 0:
             raise ValueError("generation must be > 0")
-        node_allocations = tuple(self.node_allocations)
-        node_ids = [allocation.node_id for allocation in node_allocations]
-        if len(set(node_ids)) != len(node_ids):
-            raise ValueError("query allocation contains duplicate node_id entries")
-        aggregate = ResourceVector()
-        for node_allocation in node_allocations:
-            aggregate = aggregate + node_allocation.resources
-        if not _resource_vectors_equivalent(aggregate, self.resources):
-            raise ValueError("query allocation resources must equal the sum of node_allocations")
         object.__setattr__(self, "generation", generation)
-        object.__setattr__(self, "node_allocations", node_allocations)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "resources": self.resources.to_dict(),
-            "node_allocations": [allocation.to_dict() for allocation in self.node_allocations],
             "generation": self.generation,
         }
 
@@ -276,7 +224,6 @@ class QueryAllocation:
         _strict_fields(values, cls._FIELDS, cls.__name__)
         return cls(
             resources=ResourceVector.from_dict(values["resources"]),
-            node_allocations=tuple(NodeResourceAllocation.from_dict(item) for item in values["node_allocations"]),
             generation=int(values["generation"]),
         )
 
@@ -617,7 +564,9 @@ class QueryResourceGraph:
             )
         if unit.max_concurrency is not None and int(unit.max_concurrency) <= 0:
             raise ValueError(f"unit {unit.resource_unit_id} max_concurrency must be > 0")
-        process_resources = unit.resident_per_actor if unit.backend == "ray_actor" else _hard_resources(unit.per_task)
+        process_resources = (
+            unit.resident_per_actor if unit.backend == "ray_actor" else _process_resources(unit.per_task)
+        )
         if unit.backend == "ray_worker":
             if not process_resources.is_zero():
                 raise ValueError(f"native fragment unit {unit.resource_unit_id} process resources are owned by DuckDB")
@@ -826,43 +775,6 @@ class QueryResourceGraph:
             raise ValueError("attempt_id must be non-empty")
         return f"task:{unit.resource_unit_id}:partition:{partition}:attempt:{attempt}"
 
-    def validate_allocation(
-        self,
-        allocation: QueryAllocation,
-        *,
-        eligible_unit_ids: tuple[str, ...] | None = None,
-    ) -> None:
-        eligible = (
-            {unit.resource_unit_id for unit in self.units}
-            if eligible_unit_ids is None
-            else {str(resource_unit_id) for resource_unit_id in eligible_unit_ids}
-        )
-        unknown = sorted(eligible - {unit.resource_unit_id for unit in self.units})
-        if unknown:
-            raise ValueError(f"allocation validation references unknown eligible unit: {unknown[0]}")
-        hard_capacity = _hard_resources(allocation.resources)
-        for unit in self.units:
-            if unit.resource_unit_id not in eligible:
-                continue
-            if unit.backend == "ray_task":
-                process_commitment = _hard_resources(unit.per_task)
-                commitment_name = "maximum task"
-            elif unit.backend == "ray_actor":
-                process_commitment = _hard_resources(unit.resident_per_actor)
-                commitment_name = "actor process"
-            else:
-                continue
-            exceeded = process_commitment.exceeded_dimensions(hard_capacity)
-            if exceeded:
-                raise ValueError(
-                    f"unit {unit.resource_unit_id} {commitment_name} exceeds query allocation for {', '.join(exceeded)}"
-                )
-            if not process_commitment.is_zero() and not any(
-                process_commitment.fits_within(_hard_resources(node_allocation.resources))
-                for node_allocation in allocation.node_allocations
-            ):
-                raise ValueError(f"unit {unit.resource_unit_id} {commitment_name} does not fit any allocated Ray node")
-
     def normalized_digest(self) -> str:
         payload = self.to_dict()
         payload["plan_digest"] = ""
@@ -895,7 +807,6 @@ class QueryResourceGraph:
 
 __all__ = [
     "MaterializationBarrierSpec",
-    "NodeResourceAllocation",
     "QueryAllocation",
     "QueryResourceGraph",
     "ResourceVector",

@@ -20,7 +20,6 @@ from duckdb.runners.progress import (
 from duckdb.runners.ray.fte import FteTaskExecution
 from duckdb.runners.ray.progress import ProgressRenderer, build_progress_snapshot, format_progress_snapshot
 from duckdb.runners.ray.query_resource_graph import (
-    NodeResourceAllocation,
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
@@ -73,12 +72,6 @@ def test_progress_snapshot_includes_query_resource_manager():
             ),
             QueryAllocation(
                 resources=ResourceVector(cpu=1, heap_bytes=2, object_store_bytes=1),
-                node_allocations=(
-                    NodeResourceAllocation(
-                        node_id="node-a",
-                        resources=ResourceVector(cpu=1, heap_bytes=2, object_store_bytes=1),
-                    ),
-                ),
                 generation=1,
             ),
         )

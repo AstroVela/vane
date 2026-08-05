@@ -16,7 +16,6 @@ from duckdb._ray_cxx import validate_plan_serialization_for_submission
 from duckdb._ray_errors import RemoteRayException
 from duckdb.runners.ray.cluster_resource_coordinator import NodeCapacity
 from duckdb.runners.ray.query_resource_graph import (
-    NodeResourceAllocation,
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
@@ -125,7 +124,6 @@ class _FakeCoordinator:
         )
         allocation = QueryAllocation(
             resources=resources,
-            node_allocations=(NodeResourceAllocation(node_id="node-a", resources=resources),),
             generation=7,
         )
         self.allocations[demand.query_id] = allocation
@@ -161,23 +159,22 @@ class _FakeCoordinator:
         }
 
 
-class _PendingCoordinator(_FakeCoordinator):
+class _ZeroBudgetCoordinator(_FakeCoordinator):
     def register_query(self, demand):
         self._events.append("coordinator_register")
         allocation = QueryAllocation(
             resources=ResourceVector(),
-            node_allocations=(),
             generation=7,
         )
         self.allocations[demand.query_id] = allocation
-        self.states[demand.query_id] = "PENDING_RESOURCES"
+        self.states[demand.query_id] = "RUNNING"
         return allocation
 
 
-class _InvalidStateCoordinator(_FakeCoordinator):
+class _QueryStateMustNotBeReadCoordinator(_FakeCoordinator):
     def query_state(self, query_id, generation):
-        super().query_state(query_id, generation)
-        return "INVALID_STATE"
+        del query_id, generation
+        raise AssertionError("aggregate soft-budget registration must not query a legacy admission state")
 
 
 def _metadata(query_id: str) -> dict:
@@ -354,9 +351,9 @@ def test_driver_starts_plan_runner_without_waiting_for_lazy_actor_pool():
     assert runner._active_vllm_actors_by_plan[query_id] == [vllm_pool]
 
 
-def test_driver_keeps_query_pending_until_minimum_bundle_becomes_feasible():
+def test_driver_opens_admission_with_a_zero_soft_budget_for_ray_core_liveness():
     events = []
-    coordinator = _PendingCoordinator(events)
+    coordinator = _ZeroBudgetCoordinator(events)
     runner_cls, runner = _runner(events, coordinator)
     runner._precreate_udf_actors = lambda *_args, **_kwargs: []
     query_id = "query-pending-minimum"
@@ -375,34 +372,32 @@ def test_driver_keeps_query_pending_until_minimum_bundle_becomes_feasible():
 
     snapshot = get_query_resource_manager(query_id).snapshot()
     assert snapshot["allocation"]["resources"] == ResourceVector().to_dict()
-    assert snapshot["allocation_admission_open"] is False
+    assert snapshot["allocation_admission_open"] is True
+    assert snapshot["ray_core_owns_placement"] is True
     assert runner.curr_streams[query_id] == "stream"
 
 
-def test_driver_rolls_back_cluster_allocation_when_coordinator_state_is_invalid():
+def test_driver_does_not_read_a_legacy_coordinator_admission_state():
     events = []
-    coordinator = _InvalidStateCoordinator(events)
+    coordinator = _QueryStateMustNotBeReadCoordinator(events)
     runner_cls, runner = _runner(events, coordinator)
     runner._precreate_udf_actors = lambda *_args, **_kwargs: []
     query_id = "query-invalid-coordinator-state"
     physical_plan = _FakePhysicalPlan(query_id, _metadata(query_id), events)
 
-    with pytest.raises(RuntimeError, match="coordinator returned invalid query state"):
-        asyncio.run(
-            runner_cls.run_plan(
-                runner,
-                _OWNER_ID,
-                _SESSION_ID,
-                _FakeLogicalPlan(physical_plan, events),
-            )
+    asyncio.run(
+        runner_cls.run_plan(
+            runner,
+            _OWNER_ID,
+            _SESSION_ID,
+            _FakeLogicalPlan(physical_plan, events),
         )
+    )
 
-    with pytest.raises(KeyError, match="query resource graph is not registered"):
-        get_query_resource_manager(query_id)
-    assert coordinator.released == [(query_id, 7)]
-    assert coordinator.allocations == {}
-    assert runner._query_resource_graphs == {}
-    assert runner._query_allocations == {}
+    assert get_query_resource_manager(query_id).allocation.generation == 7
+    assert coordinator.released == []
+    assert runner._query_resource_graphs[query_id].query_id == query_id
+    assert runner._query_allocations[query_id].generation == 7
 
 
 def test_run_plan_does_not_read_physical_plan_id_after_registration():
@@ -660,12 +655,6 @@ def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_
     )
     streaming_allocation = QueryAllocation(
         resources=streaming_resources,
-        node_allocations=(
-            NodeResourceAllocation(
-                node_id="node-a",
-                resources=streaming_resources,
-            ),
-        ),
         generation=1,
     )
     streaming_manager = register_query_resource_graph(
@@ -812,6 +801,29 @@ def test_registration_does_not_overwrite_a_newer_capacity_snapshot():
 
     assert capacity == newer.resources
     assert runner._query_node_capacities == (newer,)
+    assert runner._query_resource_last_capacity_refresh_at == 20.0
+    assert coordinator.capacity_updates == []
+
+
+def test_registration_does_not_overwrite_a_newer_empty_capacity_snapshot():
+    events: list[str] = []
+    coordinator = _FakeCoordinator(events)
+    runner_cls, runner = _runner(events, coordinator)
+    older = NodeCapacity(
+        "node-old",
+        ResourceVector(cpu=2, object_store_bytes=1 * _GIB),
+    )
+    runner._query_node_capacities = ()
+    runner._query_resource_last_capacity_refresh_at = 20.0
+
+    capacity = runner_cls._apply_query_capacity_snapshot(
+        runner,
+        (older,),
+        snapshot_started_at=10.0,
+    )
+
+    assert capacity == ResourceVector()
+    assert runner._query_node_capacities == ()
     assert runner._query_resource_last_capacity_refresh_at == 20.0
     assert coordinator.capacity_updates == []
 
@@ -991,7 +1003,36 @@ def test_driver_maintenance_refreshes_ray_capacity_usage_and_heartbeat_atomicall
     )
 
 
-def test_driver_reattributes_soft_reservation_when_capacity_moves_nodes():
+def test_driver_maintenance_reuses_a_valid_empty_capacity_snapshot_after_gcs_failure():
+    from duckdb.runners.ray.cluster_resource_coordinator import ClusterQueryResourceCoordinator
+    from duckdb.runners.ray.driver import RayQueryDriverActor
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    runner = object.__new__(runner_cls)
+    runner._query_resource_lock = threading.RLock()
+    runner._query_resource_coordinator = ClusterQueryResourceCoordinator(())
+    runner._query_resource_graphs = {}
+    runner._query_allocations = {}
+    runner._query_node_capacities = ()
+    runner._query_resource_last_capacity_refresh_at = 5.0
+
+    def _capacity_unavailable():
+        raise RuntimeError("GCS temporarily unavailable")
+
+    runner._read_query_node_capacities = _capacity_unavailable
+
+    result = runner_cls._maintain_query_resources_once(runner, now=10)
+
+    assert result == {
+        "query_count": 0,
+        "capacity_cached": True,
+        "capacity_error": "GCS temporarily unavailable",
+    }
+    assert runner._query_node_capacities == ()
+    assert runner._query_resource_last_capacity_refresh_at == 5.0
+
+
+def test_driver_keeps_aggregate_soft_reservation_when_capacity_moves_nodes():
     from duckdb.runners.ray.cluster_resource_coordinator import (
         ClusterQueryResourceCoordinator,
         NodeCapacity,
@@ -1043,13 +1084,15 @@ def test_driver_reattributes_soft_reservation_when_capacity_moves_nodes():
     snapshot = manager.snapshot()
     assert snapshot["cancelled"] is False
     assert snapshot["allocation_admission_open"] is True
-    assert snapshot["allocation"]["node_allocations"][0]["node_id"] == "node-b"
+    assert snapshot["allocation"]["resources"] == allocation.resources.to_dict()
+    assert "node_allocations" not in snapshot["allocation"]
+    assert snapshot["ray_core_owns_placement"] is True
     assert coordinator.snapshot()["queries"][query_id]["state"] == "RUNNING"
     assert runner._query_terminal_errors == {}
     assert dropped == []
 
 
-def test_driver_keeps_debt_neutral_drain_admission_open_during_allocation_debt():
+def test_driver_keeps_drain_admission_open_after_soft_budget_shrink():
     from duckdb.runners.ray.driver import RayQueryDriverActor
     from duckdb.runners.ray.query_resource_manager import TaskRequest
     from duckdb.runners.ray.query_resource_runtime import register_query_resource_graph
@@ -1090,25 +1133,22 @@ def test_driver_keeps_debt_neutral_drain_admission_open_during_allocation_debt()
     initial_resources = ResourceVector(cpu=2, heap_bytes=200)
     initial_allocation = QueryAllocation(
         resources=initial_resources,
-        node_allocations=(NodeResourceAllocation("node-a", initial_resources),),
         generation=1,
     )
     manager = register_query_resource_graph(graph, initial_allocation)
     manager.update_unit_state(ray_task.resource_unit_id, runnable=True)
     manager.update_unit_state(native.resource_unit_id, runnable=True)
     for index in range(2):
-        grant = manager.try_acquire_task(
-            TaskRequest(query_id, ray_task.resource_unit_id, f"ray-{index}", "0", "node-a")
-        )
+        grant = manager.try_acquire_task(TaskRequest(query_id, ray_task.resource_unit_id, f"ray-{index}", "0", None))
         assert grant.granted
 
-    debt_allocation = QueryAllocation(resources=ResourceVector(), node_allocations=(), generation=2)
+    debt_allocation = QueryAllocation(resources=ResourceVector(), generation=2)
     runner._query_resource_coordinator = SimpleNamespace(
         snapshot=lambda: {
             "queries": {
                 query_id: {
                     "allocation": debt_allocation.to_dict(),
-                    "state": "ALLOCATION_DEBT",
+                    "state": "RUNNING",
                 }
             }
         }
@@ -1120,8 +1160,8 @@ def test_driver_keeps_debt_neutral_drain_admission_open_during_allocation_debt()
 
     snapshot = manager.snapshot()
     assert snapshot["allocation_admission_open"] is True
-    assert snapshot["allocation_debt_neutral_only"] is True
+    assert snapshot["soft_allocation_debt"] == ResourceVector(cpu=2, heap_bytes=200).to_dict()
     blocked = manager.try_acquire_task(TaskRequest(query_id, ray_task.resource_unit_id, "ray-new", "0", None))
-    assert not blocked.granted and blocked.blocked_reason == "allocation_debt"
+    assert not blocked.granted and blocked.blocked_reason == "liveness_task_active"
     drain = manager.try_acquire_task(TaskRequest(query_id, native.resource_unit_id, "native-drain", "0", "node-a"))
     assert drain.granted and not drain.liveness

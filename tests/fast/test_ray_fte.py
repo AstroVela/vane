@@ -59,7 +59,6 @@ from duckdb.runners.ray.fte import (
 from duckdb.runners.ray.fte_attempts import RunningAttempt
 from duckdb.runners.ray.fte_events import FteAddSplitsCommand
 from duckdb.runners.ray.query_resource_graph import (
-    NodeResourceAllocation,
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
@@ -266,12 +265,6 @@ def _register_fte_query(query_id: str, node_id: str, *, partitions: int, task_sl
         graph,
         QueryAllocation(
             resources=allocation_resources,
-            node_allocations=(
-                NodeResourceAllocation(
-                    node_id="node-a",
-                    resources=allocation_resources,
-                ),
-            ),
             generation=1,
         ),
     )

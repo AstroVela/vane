@@ -347,12 +347,12 @@ def build_query_resource_graph(
     )
 
 
-def _hard_task_commitment(unit: ResourceUnitSpec) -> ResourceVector:
-    """Return resources that must be placed before a task can run.
+def _task_scheduling_request(unit: ResourceUnitSpec) -> ResourceVector:
+    """Return the concrete Ray Core request for one task invocation.
 
     Retained inputs and generator output windows are spillable pipeline data.
-    They are controlled dynamically by QRM against the query's object-store
-    budget instead of being reserved for every possible task at registration.
+    QRM accounts them dynamically instead of copying them into the process
+    request or a query-level placement model.
     """
     return ResourceVector(
         cpu=unit.per_task.cpu,
@@ -361,98 +361,11 @@ def _hard_task_commitment(unit: ResourceUnitSpec) -> ResourceVector:
     )
 
 
-def _component_max(resources: list[ResourceVector]) -> ResourceVector:
-    if not resources:
-        return ResourceVector()
-    return ResourceVector(
-        cpu=max(item.cpu for item in resources),
-        gpu=max(item.gpu for item in resources),
-        heap_bytes=max(item.heap_bytes for item in resources),
-        object_store_bytes=max(item.object_store_bytes for item in resources),
-    )
-
-
 def _sum_node_capacities(node_capacities: Sequence[NodeCapacity]) -> ResourceVector:
     total = ResourceVector()
     for node in node_capacities:
         total = total + node.resources
     return total
-
-
-def _resource_sort_key(resources: ResourceVector) -> tuple[float, float, int, int]:
-    return (
-        resources.gpu,
-        resources.cpu,
-        resources.heap_bytes,
-        resources.object_store_bytes,
-    )
-
-
-def _placement_bundles(
-    resource_shapes: list[ResourceVector],
-    node_capacities: Sequence[NodeCapacity],
-) -> tuple[ResourceVector, ...]:
-    """Return real-node envelopes covering every eligible task/actor shape.
-
-    A component-wise maximum across the whole phase can invent a task that no
-    node can run (for example, 4 CPU from one UDF plus 1 GPU from another UDF
-    on a split CPU/GPU cluster).  Instead, each candidate envelope contains
-    only execution shapes that fit one concrete node. Multiple shapes that
-    share a node still collapse to one reusable liveness bundle; heterogeneous
-    shapes that require different nodes remain separate bundles. Actor pool
-    multiplicity is deliberately excluded: one envelope proves that the first
-    actor can start, while the remaining fixed pool stays elastic in Ray Core.
-    """
-
-    execution_shapes = tuple(sorted(set(resource_shapes), key=_resource_sort_key, reverse=True))
-    if not execution_shapes:
-        return ()
-
-    candidates: list[tuple[str, ResourceVector, frozenset[int]]] = []
-    for node in sorted(node_capacities, key=lambda item: item.node_id):
-        covered = frozenset(
-            index for index, execution in enumerate(execution_shapes) if execution.fits_within(node.resources)
-        )
-        if not covered:
-            continue
-        envelope = _component_max([execution_shapes[index] for index in covered])
-        candidates.append((node.node_id, envelope, covered))
-
-    uncovered = set(range(len(execution_shapes)))
-    selected: list[tuple[str, ResourceVector, frozenset[int]]] = []
-    while uncovered:
-        usable = [candidate for candidate in candidates if candidate[2] & uncovered]
-        if not usable:
-            # Preserve the real unschedulable execution shapes. The coordinator
-            # will keep the query pending until a node capable of running them
-            # appears; never replace them with another fictional envelope.
-            selected.extend(("", execution_shapes[index], frozenset((index,))) for index in sorted(uncovered))
-            break
-        candidate = min(
-            usable,
-            key=lambda item: (
-                -len(item[2] & uncovered),
-                -item[1].gpu,
-                -item[1].cpu,
-                -item[1].heap_bytes,
-                item[0],
-            ),
-        )
-        selected.append(candidate)
-        uncovered.difference_update(candidate[2])
-
-    def placement_order(item: tuple[str, ResourceVector, frozenset[int]]) -> tuple[int, float, float, int, str]:
-        node_id, envelope, _covered = item
-        fit_count = sum(envelope.fits_within(node.resources) for node in node_capacities)
-        return (
-            fit_count,
-            -envelope.gpu,
-            -envelope.cpu,
-            -envelope.heap_bytes,
-            node_id,
-        )
-
-    return tuple(item[1] for item in sorted(selected, key=placement_order))
 
 
 def build_query_demand(
@@ -464,8 +377,6 @@ def build_query_demand(
     priority: int = 0,
 ) -> QueryDemand:
     nodes = tuple(node_capacities)
-    if not nodes:
-        raise ValueError("node_capacities must contain at least one Ray node")
     node_ids = [node.node_id for node in nodes]
     if len(set(node_ids)) != len(node_ids):
         raise ValueError("node_capacities contains duplicate Ray node IDs")
@@ -475,21 +386,15 @@ def build_query_demand(
     if unknown_eligible:
         raise ValueError(f"query demand references unknown eligible unit: {unknown_eligible[0]}")
     ray_tasks: list[ResourceVector] = []
-    actor_shapes: list[ResourceVector] = []
     actor_processes: list[ResourceVector] = []
     for unit in graph.units:
         if unit.resource_unit_id not in eligible:
             continue
-        commitment = _hard_task_commitment(unit)
+        commitment = _task_scheduling_request(unit)
         if unit.backend == "ray_task":
             ray_tasks.append(commitment)
         elif unit.backend == "ray_actor":
-            actor_shapes.append(unit.resident_per_actor)
             actor_processes.extend(unit.resident_per_actor for _actor_index in range(unit.actor_pool_size))
-    minimum = ResourceVector()
-    placement_bundles = _placement_bundles([*ray_tasks, *actor_shapes], nodes)
-    for placement_bundle in placement_bundles:
-        minimum = minimum + placement_bundle
     actor_maximum = ResourceVector()
     for actor_process in actor_processes:
         actor_maximum = actor_maximum + actor_process
@@ -503,17 +408,12 @@ def build_query_demand(
                 getattr(actor_maximum, field_name),
                 getattr(cluster_capacity, field_name),
             )
-        return max(
-            getattr(minimum, field_name),
-            elastic,
-        )
+        return elastic
 
     desired = ResourceVector(
-        # The smallest practical set of real-node task/actor envelopes is the
-        # only hard query-level placement minimum.
-        # Fixed actor pools are elastic allocation demand: all handles may be
-        # submitted to Ray Core, while pending/running process resources are
-        # charged to the phase's soft reservation at runtime.
+        # CPU/GPU/declared heap are aggregate soft targets only. Concrete UDF
+        # calls carry their real resource shape to Ray Core, including when a
+        # current cluster snapshot cannot fit that shape yet.
         cpu=elastic_target("cpu"),
         gpu=elastic_target("gpu"),
         heap_bytes=int(elastic_target("heap_bytes")),
@@ -521,11 +421,9 @@ def build_query_demand(
     )
     return QueryDemand(
         query_id=graph.query_id,
-        minimum=minimum,
         desired=desired,
         weight=weight,
         priority=priority,
-        placement_bundles=placement_bundles,
     )
 
 

@@ -5,7 +5,6 @@ import pytest
 
 from duckdb.runners.ray.query_resource_graph import (
     MaterializationBarrierSpec,
-    NodeResourceAllocation,
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
@@ -33,7 +32,6 @@ def _resources(
 def _allocation(resources: ResourceVector, *, generation: int) -> QueryAllocation:
     return QueryAllocation(
         resources=resources,
-        node_allocations=(NodeResourceAllocation(node_id="node-a", resources=resources),),
         generation=generation,
     )
 
@@ -798,208 +796,27 @@ def test_legacy_intermediate_resource_dimension_is_rejected():
         ResourceVector.from_dict(payload)
 
 
-def test_allocation_validation_keeps_heap_hard_and_object_windows_soft():
-    unit = _unit(
-        "resource:fragment-1:decode",
-        per_task=_resources(cpu=1, heap_bytes=300, object_store_bytes=50),
-        target_output_block_bytes=100,
-        generator_buffer_blocks=2,
-    )
-    graph = _graph(unit, terminals=(unit.resource_unit_id,))
-    allocation = _allocation(
-        _resources(
-            cpu=4,
-            heap_bytes=299,
-            object_store_bytes=250,
-        ),
-        generation=7,
-    )
+def test_query_allocation_is_an_aggregate_soft_budget():
+    resources = _resources(cpu=0.5, heap_bytes=128, object_store_bytes=400)
+    allocation = QueryAllocation(resources=resources, generation=9)
 
-    with pytest.raises(ValueError, match="heap_bytes"):
-        graph.validate_allocation(allocation)
-
-    graph.validate_allocation(
-        _allocation(
-            _resources(
-                cpu=4,
-                heap_bytes=300,
-                object_store_bytes=1,
-            ),
-            generation=7,
-        )
-    )
-
-
-def test_allocation_accepts_one_output_window_larger_than_soft_object_store_budget():
-    unit = _unit(
-        "resource:fragment-1:decode",
-        target_output_block_bytes=101,
-        generator_buffer_blocks=2,
-    )
-    graph = _graph(unit, terminals=(unit.resource_unit_id,))
-    allocation = _allocation(
-        _resources(cpu=4, heap_bytes=1024 * MIB, object_store_bytes=201),
-        generation=1,
-    )
-
-    graph.validate_allocation(allocation)
-
-
-def test_allocation_rejects_aggregate_resources_that_do_not_form_a_runnable_node():
-    unit = _unit(
-        "resource:fragment-1:decode",
-        per_task=_resources(cpu=2, heap_bytes=300, object_store_bytes=0),
-        target_output_block_bytes=100,
-        generator_buffer_blocks=2,
-    )
-    graph = _graph(unit, terminals=(unit.resource_unit_id,))
-    allocation = QueryAllocation(
-        resources=_resources(cpu=2, heap_bytes=300, object_store_bytes=200),
-        node_allocations=(
-            NodeResourceAllocation(
-                node_id="cpu-only",
-                resources=_resources(cpu=2, heap_bytes=1, object_store_bytes=1),
-            ),
-            NodeResourceAllocation(
-                node_id="memory-only",
-                resources=_resources(cpu=0, heap_bytes=299, object_store_bytes=199),
-            ),
-        ),
-        generation=1,
-    )
-
-    with pytest.raises(ValueError, match="does not fit any allocated Ray node"):
-        graph.validate_allocation(allocation)
-
-
-def test_allocation_validation_can_skip_tasks_outside_the_current_phase():
-    unit = _unit(
-        "resource:fragment-1:decode",
-        per_task=_resources(cpu=1, heap_bytes=300),
-        target_output_block_bytes=100,
-        generator_buffer_blocks=2,
-    )
-    graph = _graph(unit, terminals=(unit.resource_unit_id,))
-    pending = QueryAllocation(
-        resources=ResourceVector(),
-        node_allocations=(),
-        generation=2,
-    )
-
-    with pytest.raises(ValueError, match="maximum task exceeds query allocation"):
-        graph.validate_allocation(pending)
-
-    graph.validate_allocation(pending, eligible_unit_ids=())
-
-
-def test_current_phase_allocation_does_not_reserve_a_task_behind_a_barrier():
-    source = _unit(
-        "resource:q1:source",
-        backend="ray_worker",
-        per_task=ResourceVector(),
-        target_output_block_bytes=0,
-        generator_buffer_blocks=0,
-    )
-    materializer = _unit(
-        "resource:q1:materializer",
-        inputs=(source.resource_unit_id,),
-        backend="ray_worker",
-        per_task=ResourceVector(),
-        target_output_block_bytes=10,
-        generator_buffer_blocks=2,
-    )
-    future_task = _unit(
-        "resource:q1:future-task",
-        inputs=(materializer.resource_unit_id,),
-        per_task=_resources(cpu=2, heap_bytes=300),
-        target_output_block_bytes=10,
-        generator_buffer_blocks=2,
-    )
-    graph = _graph(
-        source,
-        materializer,
-        future_task,
-        terminals=(future_task.resource_unit_id,),
-        barriers=(_barrier("materializer", materializer),),
-    )
-    current = _allocation(
-        ResourceVector(object_store_bytes=20),
-        generation=1,
-    )
-
-    assert graph.eligible_resource_unit_ids(set()) == (
-        source.resource_unit_id,
-        materializer.resource_unit_id,
-    )
-    graph.validate_allocation(
-        current,
-        eligible_unit_ids=graph.eligible_resource_unit_ids(set()),
-    )
-    with pytest.raises(ValueError, match="maximum task exceeds query allocation"):
-        graph.validate_allocation(current)
-
-
-def test_allocation_validation_requires_one_actor_shape_only_in_the_current_phase():
-    actor = _unit(
-        "resource:fragment-1:actor",
-        backend="ray_actor",
-        per_task=_resources(object_store_bytes=100),
-        resident_per_actor=_resources(cpu=1, heap_bytes=300),
-        target_output_block_bytes=100,
-        generator_buffer_blocks=2,
-        actor_pool_size=2,
-    )
-    graph = _graph(actor, terminals=(actor.resource_unit_id,))
-    pending = QueryAllocation(
-        resources=ResourceVector(),
-        node_allocations=(),
-        generation=2,
-    )
-
-    with pytest.raises(ValueError, match="actor process exceeds query allocation"):
-        graph.validate_allocation(pending)
-
-    fragmented = QueryAllocation(
-        resources=_resources(cpu=1, heap_bytes=300),
-        node_allocations=(
-            NodeResourceAllocation(
-                node_id="cpu-only",
-                resources=_resources(cpu=1, heap_bytes=0),
-            ),
-            NodeResourceAllocation(
-                node_id="memory-only",
-                resources=_resources(cpu=0, heap_bytes=300),
-            ),
-        ),
-        generation=2,
-    )
-    with pytest.raises(ValueError, match="actor process does not fit any allocated Ray node"):
-        graph.validate_allocation(fragmented)
-
-    graph.validate_allocation(pending, eligible_unit_ids=())
-
-
-def test_query_allocation_round_trip_requires_exact_per_node_sum():
-    resources = _resources(cpu=3, heap_bytes=300, object_store_bytes=400)
-    allocation = QueryAllocation(
-        resources=resources,
-        node_allocations=(
-            NodeResourceAllocation(
-                node_id="node-a",
-                resources=_resources(cpu=1, heap_bytes=100, object_store_bytes=150),
-            ),
-            NodeResourceAllocation(
-                node_id="node-b",
-                resources=_resources(cpu=2, heap_bytes=200, object_store_bytes=250),
-            ),
-        ),
-        generation=9,
-    )
-
+    assert allocation.resources == resources
     assert QueryAllocation.from_dict(allocation.to_dict()) == allocation
-    with pytest.raises(ValueError, match="sum of node_allocations"):
-        QueryAllocation(
-            resources=resources,
-            node_allocations=allocation.node_allocations[:1],
-            generation=9,
-        )
+    assert allocation.to_dict() == {
+        "resources": resources.to_dict(),
+        "generation": 9,
+    }
+
+
+def test_query_allocation_accepts_zero_budget_for_real_ray_core_pending_demand():
+    allocation = QueryAllocation(resources=ResourceVector(), generation=1)
+
+    assert allocation.resources.is_zero()
+
+
+def test_query_allocation_rejects_removed_node_placement_fields():
+    payload = QueryAllocation(resources=ResourceVector(), generation=1).to_dict()
+    payload["node_allocations"] = []
+
+    with pytest.raises(ValueError, match="unknown fields: node_allocations"):
+        QueryAllocation.from_dict(payload)

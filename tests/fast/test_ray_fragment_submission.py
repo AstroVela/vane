@@ -52,7 +52,6 @@ from duckdb.runners.ray.fte_events import (
     WorkerReservationCompleted,
 )
 from duckdb.runners.ray.query_resource_graph import (
-    NodeResourceAllocation,
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
@@ -417,12 +416,6 @@ def _register_test_query_resource_graph(query_id, fragment_ids, *, max_concurren
         graph,
         QueryAllocation(
             resources=allocation_resources,
-            node_allocations=(
-                NodeResourceAllocation(
-                    node_id=_test_ray_node_id(),
-                    resources=allocation_resources,
-                ),
-            ),
             generation=1,
         ),
     )
@@ -7114,7 +7107,6 @@ def test_fte_denied_descriptor_is_not_registered_and_block_is_removed_when_aband
     manager.update_allocation(
         QueryAllocation(
             resources=ResourceVector(),
-            node_allocations=(),
             generation=2,
         ),
         admission_open=False,
@@ -7148,81 +7140,10 @@ def test_fte_denied_descriptor_is_not_registered_and_block_is_removed_when_aband
     assert stats["resource_unit_submission_block_count"] == 0
 
 
-def test_fte_node_local_denial_keeps_probe_while_trying_another_worker(monkeypatch):
-    from duckdb.runners.ray.query_resource_manager import TaskGrant, TaskLease
-
-    query_id = "query-node-local-retry"
-    fragment_id = _install_manual_test_fragment(query_id, "8")
-    manager = get_query_resource_manager(query_id)
-    resource_unit_id = native_fragment_unit_id_for_fragment(query_id, fragment_id)
-    requests = []
-    lease = TaskLease(
-        lease_id="lease-node-b",
-        query_id=query_id,
-        resource_unit_id=resource_unit_id,
-        task_id="task-node-b",
-        attempt_id="attempt-node-b",
-        node_id="node-b",
-        execution_slot_id="ray_worker:node-b",
-        actor_index=None,
-        resources=ResourceVector(),
-        output_window_bytes=1,
-        liveness=False,
-        allocation_generation=1,
-    )
-
-    def try_descriptor(request):
-        requests.append(request)
-        if request.node_id == "node-a":
-            return TaskGrant(
-                False,
-                blocked_reason="node_capacity",
-                admission_epoch=manager.admission_epoch(),
-            )
-        return TaskGrant(
-            True,
-            lease=lease,
-            admission_epoch=manager.admission_epoch(),
-        )
-
-    monkeypatch.setattr(manager, "try_acquire_task_descriptor", try_descriptor)
-
-    with pytest.raises(FteWorkerReservationUnavailable) as exc_info:
-        worker_handle_mod._acquire_fte_partition_task_lease(
-            query_id=query_id,
-            fragment_execution_id=7,
-            fragment_id=fragment_id,
-            partition_id=0,
-            node_id="node-a",
-            retain_probe_on_node_local_denial=True,
-        )
-
-    assert exc_info.value.blocked_reason == "node_capacity"
-    assert exc_info.value.admission_epoch == manager.admission_epoch()
-    stats = worker_handle_mod.fte_registry_stats()
-    assert stats["resource_unit_submission_probe_count"] == 1
-    assert stats["resource_unit_submission_block_count"] == 0
-
-    granted = worker_handle_mod._acquire_fte_partition_task_lease(
-        query_id=query_id,
-        fragment_execution_id=7,
-        fragment_id=fragment_id,
-        partition_id=0,
-        node_id="node-b",
-        retain_probe_on_node_local_denial=True,
-    )
-
-    assert granted is lease
-    assert [request.node_id for request in requests] == ["node-a", "node-b"]
-    stats = worker_handle_mod.fte_registry_stats()
-    assert stats["resource_unit_submission_probe_count"] == 0
-    assert stats["resource_unit_submission_block_count"] == 0
-
-
-def test_fte_node_local_denials_block_only_after_all_workers_are_tried(monkeypatch):
+def test_fte_aggregate_soft_denial_does_not_retry_a_different_worker(monkeypatch):
     from duckdb.runners.ray.query_resource_manager import TaskGrant
 
-    query_id = "query-node-local-exhausted"
+    query_id = "query-aggregate-soft-denial"
     fragment_id = _install_manual_test_fragment(query_id, "8")
     manager = get_query_resource_manager(query_id)
     requests = []
@@ -7231,61 +7152,11 @@ def test_fte_node_local_denials_block_only_after_all_workers_are_tried(monkeypat
         requests.append(request)
         return TaskGrant(
             False,
-            blocked_reason="node_capacity",
+            blocked_reason="query_soft_object_store_bytes",
             admission_epoch=manager.admission_epoch(),
         )
 
     monkeypatch.setattr(manager, "try_acquire_task_descriptor", try_descriptor)
-
-    class _Worker:
-        _fte_healthy = True
-
-        def __init__(self, worker_id, node_id):
-            self.worker_id = worker_id
-            self.node_id = node_id
-
-    worker_a = _Worker("worker-a", "node-a")
-    worker_b = _Worker("worker-b", "node-b")
-
-    class _Coordinator:
-        def _select_fte_worker(self, *, exclude, **_kwargs):
-            return next(
-                (worker for worker in (worker_a, worker_b) if worker.worker_id not in exclude),
-                None,
-            )
-
-    placement = worker_handle_mod.FteWorkerPlacementManager(_Coordinator())
-
-    with pytest.raises(FteWorkerReservationUnavailable) as exc_info:
-        placement.acquire(
-            query_id=query_id,
-            fragment_id=fragment_id,
-            partition_id=0,
-        )
-
-    assert exc_info.value.blocked_reason == "node_capacity"
-    assert [request.node_id for request in requests] == ["node-a", "node-b"]
-    stats = worker_handle_mod.fte_registry_stats()
-    assert stats["resource_unit_submission_probe_count"] == 0
-    assert stats["resource_unit_submission_block_count"] == 1
-
-
-def test_fte_worker_selection_error_releases_retained_node_local_probe(monkeypatch):
-    from duckdb.runners.ray.query_resource_manager import TaskGrant
-
-    query_id = "query-node-local-selection-error"
-    fragment_id = _install_manual_test_fragment(query_id, "8")
-    manager = get_query_resource_manager(query_id)
-
-    monkeypatch.setattr(
-        manager,
-        "try_acquire_task_descriptor",
-        lambda _request: TaskGrant(
-            False,
-            blocked_reason="node_capacity",
-            admission_epoch=manager.admission_epoch(),
-        ),
-    )
 
     class _Worker:
         _fte_healthy = True
@@ -7298,8 +7169,38 @@ def test_fte_worker_selection_error_releases_retained_node_local_probe(monkeypat
         def _select_fte_worker(self, **_kwargs):
             nonlocal selection_count
             selection_count += 1
-            if selection_count == 1:
-                return _Worker()
+            return _Worker()
+
+    placement = worker_handle_mod.FteWorkerPlacementManager(_Coordinator())
+
+    with pytest.raises(FteWorkerReservationUnavailable) as exc_info:
+        placement.acquire(
+            query_id=query_id,
+            fragment_id=fragment_id,
+            partition_id=0,
+        )
+
+    assert exc_info.value.blocked_reason == "query_soft_object_store_bytes"
+    assert selection_count == 1
+    assert [request.node_id for request in requests] == ["node-a"]
+    stats = worker_handle_mod.fte_registry_stats()
+    assert stats["resource_unit_submission_probe_count"] == 0
+    assert stats["resource_unit_submission_block_count"] == 1
+
+
+def test_fte_worker_selection_error_does_not_create_a_qrm_probe(monkeypatch):
+    query_id = "query-worker-selection-error"
+    fragment_id = _install_manual_test_fragment(query_id, "8")
+    manager = get_query_resource_manager(query_id)
+
+    monkeypatch.setattr(
+        manager,
+        "try_acquire_task_descriptor",
+        lambda _request: (_ for _ in ()).throw(AssertionError("QRM must not be consulted before a worker is selected")),
+    )
+
+    class _Coordinator:
+        def _select_fte_worker(self, **_kwargs):
             raise RuntimeError("worker registry changed")
 
     placement = worker_handle_mod.FteWorkerPlacementManager(_Coordinator())
