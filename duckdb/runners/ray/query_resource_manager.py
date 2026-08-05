@@ -426,9 +426,24 @@ class RayQueryResourceManager:
         barriers = self._frontier_materialization_barriers_locked()
         if not barriers:
             return ()
+        eligible = set(self._eligible_resource_unit_ids_locked())
         boundary: set[str] = set()
         for barrier in barriers:
-            boundary.update(barrier.materialized_input_unit_ids)
+            # A blocking materializer must be able to drain its complete input
+            # branch even after the direct input's accumulated bytes exceed the
+            # soft query budget.  Lifting the cap only on that direct input can
+            # deadlock a longer chain: the live materializer keeps a task lease
+            # while an upstream UDF needs another task to produce the remaining
+            # input, so the global-idle task escape cannot fire.  Follow only
+            # the explicitly materialized side upstream; deferred inputs such
+            # as a broadcast probe remain backpressured.
+            pending = list(barrier.materialized_input_unit_ids)
+            while pending:
+                resource_unit_id = pending.pop()
+                if resource_unit_id in boundary or resource_unit_id not in eligible:
+                    continue
+                boundary.add(resource_unit_id)
+                pending.extend(self._units[resource_unit_id].spec.input_unit_ids)
             boundary.add(barrier.materializer_unit_id)
         return tuple(
             resource_unit_id for resource_unit_id in self._topological_unit_ids if resource_unit_id in boundary

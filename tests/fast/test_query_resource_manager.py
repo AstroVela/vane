@@ -1281,9 +1281,16 @@ def test_frontier_materializer_disables_object_store_backpressure_for_input():
     assert snapshot["units"][upstream.resource_unit_id]["object_store_backpressure_disabled"] is True
 
 
-def test_asymmetric_frontier_lifts_object_store_cap_only_for_materialized_input():
+def test_asymmetric_frontier_lifts_object_store_cap_for_materialized_branch_only():
+    build_source = _unit(
+        "resource:f:broadcast-build-source",
+        resources=_r(cpu=1),
+        target=50,
+        blocks=2,
+    )
     build = _unit(
         "resource:f:broadcast-build",
+        inputs=(build_source.resource_unit_id,),
         resources=_r(cpu=1),
         target=50,
         blocks=2,
@@ -1316,6 +1323,7 @@ def test_asymmetric_frontier_lifts_object_store_cap_only_for_materialized_input(
         materialized_inputs=(build.resource_unit_id,),
     )
     manager = _manager(
+        build_source,
         build,
         probe,
         materializer,
@@ -1325,6 +1333,7 @@ def test_asymmetric_frontier_lifts_object_store_cap_only_for_materialized_input(
     )
     _ready(
         manager,
+        build_source.resource_unit_id,
         build.resource_unit_id,
         probe.resource_unit_id,
         materializer.resource_unit_id,
@@ -1333,11 +1342,33 @@ def test_asymmetric_frontier_lifts_object_store_cap_only_for_materialized_input(
 
     before = manager.snapshot()
     assert before["execution_phase"]["object_store_unlimited_unit_ids"] == [
+        build_source.resource_unit_id,
         build.resource_unit_id,
         materializer.resource_unit_id,
     ]
+    assert before["units"][build_source.resource_unit_id]["object_store_backpressure_disabled"] is True
     assert before["units"][build.resource_unit_id]["object_store_backpressure_disabled"] is True
     assert before["units"][probe.resource_unit_id]["object_store_backpressure_disabled"] is False
+
+    materializing_task = manager.try_acquire_task(_task(materializer.resource_unit_id, 0, node_id="node-a"))
+    build_task = manager.try_acquire_task(_task(build.resource_unit_id, 0))
+    build_output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            build.resource_unit_id,
+            build_task.lease.lease_id,
+            build_task.lease.attempt_id,
+            "accumulated-build-block",
+            100,
+        )
+    )
+    upstream_continuation = manager.try_acquire_task(_task(build_source.resource_unit_id, 0, retained=1))
+    deferred_probe = manager.try_acquire_task(_task(probe.resource_unit_id, 0, retained=1))
+
+    assert materializing_task.granted and build_task.granted and build_output.granted
+    assert upstream_continuation.granted and not upstream_continuation.liveness
+    assert not deferred_probe.granted
+    assert deferred_probe.blocked_reason == "materialization_barrier_pending"
 
     assert manager.mark_materialization_barrier_completed_for_node("broadcast-join")
     after = manager.snapshot()
